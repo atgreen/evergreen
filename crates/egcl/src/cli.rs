@@ -38891,8 +38891,7 @@ fn eval_defmethod(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     // the bytecode compiler). Everything else keeps tree-walking. A redefinition
     // drops any stale compiled body first.
     forget_compiled_method(method_id.0);
-    if std::env::var_os("EGCL_NO_METHOD_COMPILE").is_none() && !nested_in_binding {
-        let compile_ll = method_lambda_list_for_compile(*lambda_list);
+    if std::env::var_os("EGCL_NO_METHOD_COMPILE").is_none() {
         // Name the callable after its generic function, so profiles, the
         // tiering log and backtraces say which method ran instead of a bare
         // METHOD for every one of them.
@@ -38903,9 +38902,17 @@ fn eval_defmethod(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             _ => "",
         };
         let label = format!("(METHOD {name}{qualifier_text})");
-        if let Some(callable) = bytecode::compile_and_reify_lambda(&label, compile_ll, body, env)
-        {
-            METHOD_COMPILED.borrow_mut().insert(method_id.0, callable);
+        if nested_in_binding {
+            // Tree-walked for good: say so, as every other decline does
+            // (bliss-75b8v).
+            bytecode::log_not_compiled(&label, "method defined inside a lexical binding");
+        } else {
+            let compile_ll = method_lambda_list_for_compile(*lambda_list);
+            if let Some(callable) =
+                bytecode::compile_and_reify_lambda(&label, compile_ll, body, env)
+            {
+                METHOD_COMPILED.borrow_mut().insert(method_id.0, callable);
+            }
         }
     }
     // DEFMETHOD returns the method object (CLHS), the handle every method

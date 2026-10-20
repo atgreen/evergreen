@@ -242,6 +242,7 @@ fn a_captured_control_decline_explains_itself_in_the_t2_log() {
 /// A function blacklisted after repeated guard deopts used to say so only as a
 /// suffix on its last deopt line, without naming the guard. One summary line
 /// now names the function, where T0 resumed, and the speculation it disproved.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[test]
 fn a_deopt_blacklist_names_the_function_and_its_guard() {
     let program = "(progn (defun g (a b) (+ (* a a) (* b b))) (g 1 1) (g 2 2) \
@@ -264,7 +265,9 @@ fn a_deopt_blacklist_names_the_function_and_its_guard() {
     assert_eq!(summary.len(), 1, "exactly one blacklist summary:\n{log}");
     assert!(
         summary[0].contains("after 3 native guard deopts")
-            && summary[0].contains("guard resumed T0 at bytecode ")
+            // This deopt re-executes G from its entry, so the resume point is
+            // not the guard and must not read as one; the speculation names it.
+            && summary[0].contains("T0 resumed at function entry (bytecode 0, re-executed)")
             && summary[0].contains("Fixnum at bytecode 4, CallNamed *")
             && summary[0].ends_with("T1 and T2 are not retried"),
         "the summary must name the guard: {}",
@@ -283,4 +286,63 @@ fn a_deopt_blacklist_names_the_function_and_its_guard() {
         &[("EGCL_BACKEND", "tree-walker")],
     );
     assert_eq!(tree.trim(), out.trim());
+}
+
+/// A DEFMETHOD body the bytecode compiler cannot lower stays tree-walked, and
+/// that used to happen without a word: the reified method has no symbol for the
+/// tier ladder to report on (bliss-75b8v). The same body as a DEFUN already
+/// explained itself. A method defined inside a lexical binding is never
+/// compiled at all and now says so too.
+#[test]
+fn a_method_not_compiled_to_bytecode_explains_itself_in_the_t2_log() {
+    let program = "(progn (defgeneric gm (x)) (defgeneric gm2 (x)) (defgeneric gm3 (x)) \
+                    (defmethod gm ((x integer)) \
+                      (destructuring-bind (a &key (b 0)) (list x :b 2) (+ a b))) \
+                    (defmethod gm2 ((x integer)) (+ x (load-time-value 10))) \
+                    (let ((k 3)) (defmethod gm3 ((x integer)) (+ x k))) \
+                    (dotimes (i 50) (gm i) (gm2 i) (gm3 i)) \
+                    (format t \"~a ~a ~a~%\" (gm 1) (gm2 1) (gm3 1)))";
+    let (out, log) = run(
+        program,
+        &[("EGCL_T2_LOG", "stderr"), ("EGCL_T0_T1_THRESHOLD", "5")],
+    );
+    for (name, reason) in [
+        ("GM", "destructuring-bind:&KEY"),
+        ("GM2", "LOAD-TIME-VALUE needs eager evaluation"),
+        ("GM3", "method defined inside a lexical binding"),
+    ] {
+        let line = format!(
+            "[T2] (METHOD COMMON-LISP-USER::{name}): not compiled to bytecode ({reason}); T1 and T2 need bytecode"
+        );
+        assert_eq!(
+            log.matches(&line).count(),
+            1,
+            "{name} must explain itself once:\n{log}"
+        );
+    }
+    assert_eq!(out.trim(), "3 11 4", "{log}");
+    let (tree, _) = run(program, &[("EGCL_BACKEND", "tree-walker")]);
+    assert_eq!(tree, out);
+}
+
+/// SETF of a place the lowerer does not handle names the place by its
+/// operator. Its arguments are gensyms after SETF expansion, so printing them
+/// gave a reason that changed on every run (bliss-75b8v).
+#[test]
+fn an_unsupported_setf_place_is_named_without_gensyms() {
+    let program = "(progn (defun setget (s) (setf (get s 'zz) 3) (get s 'zz)) \
+                    (dotimes (i 50) (setget 'p)) \
+                    (format t \"~a~%\" (setget 'q)))";
+    let (out, log) = run(
+        program,
+        &[("EGCL_T2_LOG", "stderr"), ("EGCL_T0_T1_THRESHOLD", "5")],
+    );
+    assert_eq!(
+        log.matches("[T2] SETGET: not compiled to bytecode (setf:unsupported-place:(GET ...)); T1 and T2 need bytecode")
+            .count(),
+        1,
+        "{log}"
+    );
+    assert!(!log.contains("#:"), "no gensym in the reason:\n{log}");
+    assert_eq!(out.trim(), "3");
 }

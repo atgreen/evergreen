@@ -4002,8 +4002,18 @@ impl<'e> Lowerer<'e> {
                     self.pop_n(1);
                 }
             } else {
+                // Name the place by its operator only: after SETF expansion its
+                // arguments are often fresh gensyms, which would make the
+                // reason differ on every run (bliss-75b8v).
                 return Err(record_bail(|| {
-                    format!("setf:unsupported-place:{}", super::fmt_form_debug(place))
+                    let head = place
+                        .is_cons()
+                        .then(|| list_to_vec(place)[0])
+                        .filter(|head| head.is_symbol());
+                    match head {
+                        Some(head) => format!("setf:unsupported-place:({} ...)", super::fmt_form_debug(head)),
+                        None => format!("setf:unsupported-place:{}", super::fmt_form_debug(place)),
+                    }
                 }));
             }
         }
@@ -13705,19 +13715,38 @@ pub(super) fn compile_and_reify_lambda(
     // Trying complete lowering first also avoids compiling callback-heavy
     // methods twice during a library load. Retain opportunistic lowering for
     // bodies whose callbacks need host evaluation.
+    let mut load_time_value = false;
+    // The complete lowering's reason names the construct; the fallback below
+    // may bail without one, so keep it to report (bliss-75b8v).
+    let mut portable_reason = None;
     let bf = compile_function(label, lambda_list, body, env, true, false)
         // Live compilation has no FASL load plan to initialize pending cells;
         // in that case try the host-evaluation fallback instead.
-        .filter(|portable| !contains_load_time_values(portable))
+        .filter(|portable| {
+            load_time_value = contains_load_time_values(portable);
+            !load_time_value
+        })
         .or_else(|| {
+            portable_reason = last_bail_reason();
             reset_last_bail_reason();
             compile_function(label, lambda_list, body, env, false, false)
-        })?;
+        });
     // Portable lowering is also a live-compiler fallback, but only a FASL load
     // plan can initialize these pending cells. Never publish them uninitialized.
-    if contains_load_time_values(&bf) {
-        return None;
-    }
+    // Either way the method body stays tree-walked, so say why, as a DEFUN's
+    // decline does (bliss-75b8v).
+    let bf = match bf {
+        Some(bf) if !contains_load_time_values(&bf) => bf,
+        declined => {
+            let reason = if load_time_value || declined.is_some() {
+                Some("LOAD-TIME-VALUE needs eager evaluation".to_string())
+            } else {
+                portable_reason.or_else(last_bail_reason)
+            };
+            log_not_compiled(label, reason.as_deref().unwrap_or("bytecode lowering bailed; no reason recorded"));
+            return None;
+        }
+    };
     let bf = Arc::new(bf);
     egcl_rt::rooted!(_bytecode_root = ActiveBytecodeRoot::new(&bf));
     let sym = egcl_rt::symbols::make_uninterned(label);
@@ -21617,10 +21646,14 @@ fn note_native_deopt(sym: u32, code: Option<&NativeCode>, guard_bcp: Option<u32>
                 }
             ));
             // The blacklist is permanent and later dispatches decline T1 without
-            // a word, so summarize it once with the failing guard: where T0
-            // resumed and which speculations the deopt disproved (bliss-75b8v).
+            // a word, so summarize it once: where T0 resumed and which
+            // speculations the deopt disproved (bliss-75b8v). The resume point
+            // is the failing guard only for a mid-body resume; a deopt that
+            // re-executes the function from its entry resumes at bytecode 0,
+            // and then only the speculation list names the failing site.
             if threshold_hit && !phase_change {
                 let resumed = match (current.as_deref(), guard_bcp) {
+                    (Some(_), Some(0)) => "function entry (bytecode 0, re-executed)".to_string(),
                     (Some(body), Some(bcp)) => describe_guard(body, bcp),
                     _ => "an unrecorded position".to_string(),
                 };
@@ -21638,7 +21671,7 @@ fn note_native_deopt(sym: u32, code: Option<&NativeCode>, guard_bcp: Option<u32>
                     .unwrap_or_else(|| "no arithmetic speculation recorded".to_string());
                 t2_log_write(format_args!(
                     "{nm}: blacklisted at T0 after {n} native guard deopts \
-                     (guard resumed T0 at {resumed}; {speculated}); T1 and T2 are not retried"
+                     (T0 resumed at {resumed}; {speculated}); T1 and T2 are not retried"
                 ));
             }
         }
