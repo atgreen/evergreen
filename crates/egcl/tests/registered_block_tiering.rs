@@ -364,8 +364,15 @@ fn unregistered_blocks_and_tags_reach_t1_and_t2() {
             "{name} did not install at T2:\n{log}"
         );
     }
-    assert!(
-        !log.contains("needs an executing identity"),
-        "a corpus function still registers a block or tag:\n{log}"
-    );
+    // Closures that really exit to their block (FLET-H's handler, HC2's
+    // clause closure) may still decline for an executing identity; none of
+    // the elided shapes may.
+    for name in ELIDED {
+        let prefix = format!(" {name}: ");
+        assert!(
+            !log.lines().any(|line| line.contains(&prefix)
+                && line.contains("needs an executing identity")),
+            "{name} still registers a block or tag:\n{log}"
+        );
+    }
 }

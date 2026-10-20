@@ -2417,13 +2417,14 @@ fn t2_reduce_from_end_folds_correctly() {
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn structural_t1_decline_is_attempted_only_once() {
-    // The mapped emitter refuses a loop block a capturing closure could exit
-    // (it needs an executing identity); the checked emitter refuses THROW.
+    // The mapped emitter refuses a loop block a capturing closure names (the
+    // never-taken RETURN keeps it registered, so it needs an executing
+    // identity); the checked emitter refuses THROW.
     // This therefore declines at T1 and stays in the interpreter — where it
     // must still compute the right answer.
     let program = "\
         (defun thrower (&rest ns) (let ((n (car ns)) (r nil)) \
-          (dotimes (i 1) (push (lambda () n) r)) \
+          (dotimes (i 1) (push (lambda () (if (null n) (return) n)) r)) \
           (catch 'tag (if (> n 3) (throw 'tag (* 2 (funcall (car r)))) n)))) \
         (dotimes (i 300) (thrower i)) \
         (format t \"~a ~a~%\" (thrower 10) (egcl-ext:function-tier (quote thrower)))";
