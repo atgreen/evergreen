@@ -54,9 +54,10 @@ fn native_snapshots_recover_original_arguments_from_managed_homes() {
 #[test]
 fn overwritten_and_variadic_parameters_do_not_masquerade_as_original_arguments() {
     for (tier, installed) in [("t1", 1), ("t2", 2)] {
-        let interpreted_optional = cfg!(all(target_arch = "x86_64", target_os = "linux"));
-        let optional_tier = if interpreted_optional { 0 } else { installed };
-        let interpreted_optional = if interpreted_optional { "t" } else { "nil" };
+        // &optional bodies run natively too (bliss-shih7.27); their padded
+        // slots must not be reported as the original arguments either.
+        let optional_tier = installed;
+        let interpreted_optional = "nil";
         let program = format!(
             r#"
           (defun changed-native-argument (value)
