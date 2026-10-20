@@ -15679,6 +15679,23 @@ fn make_env_frame(
     Some(frame)
 }
 
+/// Enter a fresh child heap `EnvFrame` (`PushEnvChild`). The interpreter and
+/// mapped native code both move an activation's frame through these two.
+fn push_env_child(env_frame: &mut Option<Arc<SharedCell<EnvFrame>>>) {
+    let parent = env_frame.take();
+    *env_frame = Some(Arc::new(SharedCell::new(EnvFrame {
+        vars: super::VecMap::default(),
+        symbol_vars: super::VecMap::default(),
+        parent,
+    })));
+}
+
+/// Leave the current child heap `EnvFrame` (`PopEnvChild`).
+fn pop_env_child(env_frame: &mut Option<Arc<SharedCell<EnvFrame>>>) {
+    let parent = env_frame.as_ref().and_then(|frame| frame.borrow().parent.clone());
+    *env_frame = parent;
+}
+
 /// Define a captured parameter in an activation's heap environment. Keep the
 /// name and symbol-index maps in sync, just like `DefineEnvVar`.
 fn bind_boxed_param(env_frame: &Arc<SharedCell<EnvFrame>>, name: &str, value: EgclVal) {
@@ -16573,23 +16590,8 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                 }
                 borrowed.vars.insert(name, v);
             }
-            Instr::PushEnvChild => {
-                let act = &mut acts[top_idx];
-                let parent = act.env_frame.clone();
-                act.env_frame = Some(Arc::new(SharedCell::new(EnvFrame {
-                    vars: super::VecMap::default(),
-                    symbol_vars: super::VecMap::default(),
-                    parent,
-                })));
-            }
-            Instr::PopEnvChild => {
-                let act = &mut acts[top_idx];
-                let parent = act
-                    .env_frame
-                    .as_ref()
-                    .and_then(|f| f.borrow().parent.clone());
-                act.env_frame = parent;
-            }
+            Instr::PushEnvChild => push_env_child(&mut acts[top_idx].env_frame),
+            Instr::PopEnvChild => pop_env_child(&mut acts[top_idx].env_frame),
             Instr::MakeClosureEnv(idx) => {
                 let form = acts[top_idx].func.constants[idx as usize];
                 let ef = acts[top_idx]
@@ -24184,8 +24186,15 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     // sees the real values, not an empty &rest (bliss-32l). This only holds when
     // every param lives in a slot; a CAPTURING variadic function has boxed params
     // that T2's slot-only entry cannot reconstruct, so keep those at T1
-    // (egcl captured-variadic-param follow-up).
+    // (egcl captured-variadic-param follow-up). The x86-64 Linux managed entry
+    // binds both before native code runs: boxed parameters into the heap
+    // EnvFrame its body reaches through runtime helpers (bliss-shih7.27).
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let entry_binds_captures = native_transfer_entry::captured_activation_parameters(bf);
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+    let entry_binds_captures = false;
     if bf.variadic
+        && !entry_binds_captures
         && (bf.has_env
             || bf
                 .param_layout
@@ -24274,7 +24283,9 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
         && bf.code.iter().any(|op| matches!(op, Instr::PushCatch { .. } | Instr::PushUnwind { .. }
             | Instr::PushHandlerCase { .. } | Instr::PushHandlerBind { .. } | Instr::PushRestartCase { .. }
             | Instr::BindSpecial(_) | Instr::UnbindSpecial(_)
-            | Instr::MakeClosure { capture_env: false, .. }))
+            | Instr::MakeClosure { .. }
+            | Instr::LoadEnvVar(_) | Instr::StoreEnvVar(_) | Instr::DefineEnvVar(_)
+            | Instr::PushEnvChild | Instr::PopEnvChild))
     {
         egcl_compiler::t2::build::build_for_native_scope_optimization(bf, sym)
     } else if cfg!(all(target_arch = "x86_64", target_os = "linux"))

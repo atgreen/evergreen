@@ -2,15 +2,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 use std::{fs, process::Command};
 
-// Capturing MakeClosure and captured environment setup are not admitted by
-// Linux mapped entries yet; their portable bytecode implementation remains the
-// exact fallback. Non-capturing closures use a mapped helper (bliss-ku9w).
+// A factory whose own bindings its closures capture compiles natively on every
+// platform. Linux mapped entries build its EnvFrame and reach it through
+// runtime helpers (bliss-shih7.27); non-capturing closures use a mapped helper
+// too (bliss-ku9w).
 fn factory_tier() -> u8 {
-    if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
-        0
-    } else {
-        1
-    }
+    1
 }
 
 #[test]
@@ -196,8 +193,9 @@ fn saved_fasl_function_retains_bytecode_after_function_cell_replacement() {
 /// A function that only creates non-capturing closures reaches mapped T2 on
 /// Linux -- and plain T2 on ppc64le, whose framed emitter calls the closure
 /// adapter directly -- and every tier returns the same results with fresh
-/// closure identity (bliss-ku9w). A capturing closure still keeps the
-/// interpreter fallback everywhere.
+/// closure identity (bliss-ku9w). So does one that creates a closure over its
+/// own parameter on x86-64 Linux (bliss-shih7.27); elsewhere a capturing
+/// closure still keeps its creator below T2.
 #[test]
 fn noncapturing_lambda_outer_reaches_mapped_t2() {
     let definitions = r#"
@@ -249,7 +247,7 @@ fn noncapturing_lambda_outer_reaches_mapped_t2() {
     assert!(output.status.success(), "{stdout}\n{stderr}");
     assert!(stdout.contains(results), "{stdout}");
     if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
-        for name in ["S-NESTED-LAMBDA", "S-NOCAP", "S-MAKE"] {
+        for name in ["S-NESTED-LAMBDA", "S-NOCAP", "S-MAKE", "S-CLOSURE"] {
             assert!(
                 stderr.contains(&format!(
                     "{name}: optimized worker result installed with mapped T2 ABI"
@@ -257,11 +255,7 @@ fn noncapturing_lambda_outer_reaches_mapped_t2() {
                 "{name} must install mapped T2: {stderr}"
             );
         }
-        assert!(stdout.contains("TIERS=(2 2 2 0)"), "{stdout}\n{stderr}");
-        assert!(
-            !stderr.contains("S-CLOSURE: optimized worker result installed"),
-            "{stderr}"
-        );
+        assert!(stdout.contains("TIERS=(2 2 2 2)"), "{stdout}\n{stderr}");
     } else if cfg!(all(target_arch = "powerpc64", target_endian = "little")) {
         // No mapped entry here: the three non-capturing creators reach T2
         // through the checked ABI's closure adapter. S-CLOSURE captures, so it

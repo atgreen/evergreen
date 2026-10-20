@@ -142,6 +142,16 @@
   `POSITION-IF`, `REDUCE` and `PARSE-INTEGER` now reach T1 and then T2
   instead of staying in the interpreter
   ([#470](https://github.com/atgreen/evergreen/pull/470)).
+- Functions that create closures over their own parameters or local
+  variables now compile to native code on x86-64 Linux, for example
+  `REMOVE`, `REMOVE-IF` and any function that builds a `LAMBDA` over a `LET`
+  binding it later changes. Such functions used to stay in the interpreter.
+  The native entry now builds the shared closure environment the same way the
+  interpreter does, so closures still see and change the same bindings,
+  including after on-stack replacement into T2 and after deoptimization.
+  Closure bodies that read bindings from the function that created them still
+  run interpreted
+  ([#482](https://github.com/atgreen/evergreen/pull/482)).
 - `FLOOR`, `CEILING`, `TRUNCATE`, `ROUND`, `MOD` and `REM` on bignums divide
   once instead of going through exact rational arithmetic, which reduced
   `a/b` with a gcd first. A `MOD` of a 4096-bit number by a 2048-bit one is

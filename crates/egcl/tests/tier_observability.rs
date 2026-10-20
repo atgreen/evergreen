@@ -12,9 +12,9 @@
 
 use std::process::{Command, Output};
 
-// Mapped Linux admission still excludes captured entries, including a variadic
-// one whose parameters are boxed for a closure; &optional, and non-capturing
-// &rest/&key/&aux entries, are admitted (bliss-shih7.27). Checked
+// Mapped Linux admission excludes a body that reads bindings captured from an
+// enclosing scope; &optional, &rest/&key/&aux entries, and bodies whose own
+// bindings their closures capture, are admitted (bliss-shih7.27). Checked
 // primitive declarations have an ordinary native entry and validate at ingress.
 const MAPPED_LINUX: bool = cfg!(all(target_arch = "x86_64", target_os = "linux"));
 
@@ -1908,10 +1908,9 @@ fn t1_executes_captured_environment_bytecodes() {
           (captured-native 10))";
     let (out, ok) = run(prog, &[("EGCL_T1_THRESHOLD", "2")]);
     assert!(ok, "captured-environment T1 run failed: {out}");
-    assert_eq!(
-        out.lines().next(),
-        Some(if MAPPED_LINUX { "0 14" } else { "1 14" })
-    );
+    // The body owns every binding its closure captures, so the mapped Linux
+    // entry admits it too (bliss-shih7.27).
+    assert_eq!(out.lines().next(), Some("1 14"));
 
     let (tw, tw_ok) = run(prog, &[("EGCL_BACKEND", "tree-walker")]);
     assert!(tw_ok, "tree-walker captured-environment run failed: {tw}");
@@ -2418,12 +2417,15 @@ fn t2_reduce_from_end_folds_correctly() {
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn structural_t1_decline_is_attempted_only_once() {
-    // The mapped emitter refuses a captured environment; the checked emitter
-    // refuses THROW. This therefore declines at T1 and
-    // stays in the interpreter — where it must still compute the right answer.
+    // The mapped emitter refuses a loop block a capturing closure names (the
+    // never-taken RETURN keeps it registered, so it needs an executing
+    // identity); the checked emitter refuses THROW.
+    // This therefore declines at T1 and stays in the interpreter — where it
+    // must still compute the right answer.
     let program = "\
-        (defun thrower (&rest ns) (let ((n (car ns))) \
-          (catch 'tag (if (> n 3) (throw 'tag (funcall (lambda () (* n 2)))) n)))) \
+        (defun thrower (&rest ns) (let ((n (car ns)) (r nil)) \
+          (dotimes (i 1) (push (lambda () (if (null n) (return) n)) r)) \
+          (catch 'tag (if (> n 3) (throw 'tag (* 2 (funcall (car r)))) n)))) \
         (dotimes (i 300) (thrower i)) \
         (format t \"~a ~a~%\" (thrower 10) (egcl-ext:function-tier (quote thrower)))";
     let out = run_output(

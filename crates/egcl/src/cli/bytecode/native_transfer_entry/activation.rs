@@ -25,6 +25,11 @@ pub(super) struct ActivationState {
     pub(super) prepared_handler: Option<PreparedHandler>,
     pub(super) prepared_catch: Option<PreparedCatch>,
     pub(super) catch_base: usize,
+    /// The activation's current heap `EnvFrame` for captured variables, exactly
+    /// as the interpreter's `Activation::env_frame`: created at entry for a
+    /// capturing body and moved by its PushEnvChild/PopEnvChild. Resumption,
+    /// OSR and closure creation all read this one frame (bliss-shih7.27).
+    pub(super) env_frame: Option<Arc<SharedCell<EnvFrame>>>,
 }
 
 impl egcl_rt::gc::TraceHostRoots for ActivationState {
@@ -39,6 +44,11 @@ impl egcl_rt::gc::TraceHostRoots for ActivationState {
         self.prepared_handler.trace_host_roots(visit);
         self.prepared_catch.trace_host_roots(visit);
         self.restart_templates.trace_host_roots(visit);
+        if let Some(env_frame) = &self.env_frame {
+            crate::cli::with_env_visit_state(|state| {
+                crate::cli::visit_env_frame_roots(env_frame, state, visit);
+            });
+        }
     }
 }
 
@@ -162,6 +172,8 @@ impl ActivationState {
             snapshot.clear();
         }
         self.cluster_frames.clear();
+        // Closures created by the finished activation keep their own handle.
+        self.env_frame = None;
         let mut pool = code.state_pool.borrow_mut();
         if pool.len() < 4 {
             pool.push(self);
@@ -237,6 +249,7 @@ impl ActivationState {
             prepared_handler,
             prepared_catch,
             catch_base: env.catch_stack.len(),
+            env_frame: None,
         })
     }
 
@@ -265,6 +278,7 @@ impl ActivationState {
         ready.restart_cases = std::mem::take(&mut self.restart_cases);
         ready.dynamic_scopes = std::mem::take(&mut self.dynamic_scopes);
         ready.catch_base = self.catch_base;
+        ready.env_frame = self.env_frame.take();
         self.ready_osr.take().unwrap()
     }
 
@@ -312,6 +326,7 @@ impl ActivationState {
             dynamic_scopes: &mut self.dynamic_scopes,
             cluster_frames: &mut self.cluster_frames,
             prepared_handler: &mut self.prepared_handler,
+            env_frame: &mut self.env_frame,
             frame,
             body: code.body.as_ref(),
             catches: &mut self.catches,
