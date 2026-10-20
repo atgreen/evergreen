@@ -11,7 +11,7 @@
   Such functions never reach T2, and used to be absent from `EGCL_T2_LOG` or
   logged only as "mapped native entry unavailable". A mapped T2 decline now
   names the refused instruction too
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#462](https://github.com/atgreen/evergreen/pull/462)).
 - `EGCL-EXT:INFLATE` decompresses raw deflate, zlib and gzip data in the
   runtime, checking each format's trailer. EGCL's port of chipz uses it, so
   unpacking a package with `ocicl install` no longer runs chipz's inflate in
