@@ -18585,6 +18585,7 @@ extern "C" fn c2i_make_closure(form: u64) -> u64 {
 #[cfg(any(
     target_arch = "x86_64",
     target_arch = "s390x",
+    target_arch = "aarch64",
     all(target_arch = "powerpc64", target_endian = "little")
 ))]
 extern "C" fn c2i_make_bytecode_closure(nested: *const Arc<BytecodeFunction>, capture: u64) -> u64 {
@@ -24466,6 +24467,14 @@ fn describe_emit_error(e: &egcl_compiler::t2::emit::EmitError) -> String {
             if tag & 0xFFFF_0000 == egcl_compiler::t2::emit_s390x::S390X_DECLINE_TAG =>
         {
             format!(" [s390x emitter declined at emit_s390x.rs:{}]", tag & 0xFFFF)
+        }
+        EmitError::UnsupportedOp(tag)
+            if tag & 0xFFFF_0000 == egcl_compiler::t2::emit_a64::A64_DECLINE_TAG =>
+        {
+            format!(
+                " [aarch64 emitter declined at emit_a64.rs:{}]",
+                tag & 0xFFFF
+            )
         }
         EmitError::UnsupportedOp(tag) if tag & 0x1000 != 0 => {
             format!(" [refused Opcode #{} in t2/ir.rs]", tag & 0xFFF)

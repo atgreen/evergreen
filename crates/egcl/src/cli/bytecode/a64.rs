@@ -32,17 +32,19 @@
 //! could disagree with T0.
 
 use super::{
-    BytecodeFunction, DIRECT_CALL_GEN, NativeEmission, NativeEnvNames, c2i_alloc_cons, c2i_call_builtin,
-    c2i_call_slice, c2i_clear_mv, c2i_define_env, c2i_eval_host, c2i_load_env, c2i_load_function,
-    c2i_load_global, c2i_make_closure, c2i_osr_backedge, c2i_pop_env_child, c2i_push_env_child,
-    c2i_set_native_sigsegv_recovery, c2i_store_env, c2i_store_global, c2i_t1_backedge,
-    c2i_take_values, c2i_transfer_pending, c2i_typep_class, c2i_values_to_list,
-    call_site_profile_token, registry_get, resolve_sym, t2_backedge_threshold,
+    BytecodeFunction, DIRECT_CALL_GEN, NativeEmission, NativeEnvNames, c2i_alloc_cons,
+    c2i_call_builtin, c2i_call_slice, c2i_clear_mv, c2i_define_env, c2i_eval_host, c2i_load_env,
+    c2i_load_function, c2i_load_global, c2i_make_bytecode_closure, c2i_make_closure,
+    c2i_osr_backedge, c2i_pop_env_child, c2i_push_env_child, c2i_set_native_sigsegv_recovery,
+    c2i_store_env, c2i_store_global, c2i_t1_backedge, c2i_take_values, c2i_transfer_pending,
+    c2i_typep_class, c2i_values_to_list, call_site_profile_token, registry_get, resolve_sym,
+    t2_backedge_threshold,
 };
 use egcl_rt::asm::a64;
 use egcl_rt::asm::{Asm, Cc};
 use egcl_rt::bytecode::Instr;
 use egcl_rt::value::EgclVal;
+use std::sync::Arc;
 
 /// Frame slots; local `i` lives at `[SLOTS + 8*i]`.
 const SLOTS: a64::Reg = 19;
@@ -175,9 +177,11 @@ pub(super) fn emit_native_a64(
     let pop_env_addr = c2i_pop_env_child as extern "C" fn() as usize as u64;
     let eval_host_addr = c2i_eval_host as extern "C" fn(u64) -> u64 as usize as u64;
     let make_closure_addr = c2i_make_closure as extern "C" fn(u64) -> u64 as usize as u64;
+    let make_bytecode_closure_addr = c2i_make_bytecode_closure
+        as extern "C" fn(*const Arc<BytecodeFunction>, u64) -> u64
+        as usize as u64;
     let alloc_cons_addr = c2i_alloc_cons as extern "C" fn(u64, u64) -> u64 as usize as u64;
-    let take_values_addr =
-        c2i_take_values as extern "C" fn(u64, *mut EgclVal, u64) as usize as u64;
+    let take_values_addr = c2i_take_values as extern "C" fn(u64, *mut EgclVal, u64) as usize as u64;
     let values_to_list_addr = c2i_values_to_list as extern "C" fn(u64) -> u64 as usize as u64;
     let typep_class_addr = c2i_typep_class as extern "C" fn(u64, u64) -> u64 as usize as u64;
     let values_sym = resolve_sym("VALUES")?.as_symbol_index();
@@ -429,16 +433,53 @@ pub(super) fn emit_native_a64(
                     None => decline!("Br target {target} is out of range"),
                 });
             }
-            Instr::BrIfFalse(target) => {
+            Instr::BrIfFalse(target) | Instr::BrIfTrue(target) => {
+                // The two differ only in the sense of the test against NIL.
+                // Refusing BrIfTrue cost the whole function its native code
+                // for a branch the x86-64 and System Z emitters both handle.
                 emit_pop(&mut c, ACC);
                 emit_cmp_imm(&mut c, ACC, egcl_rt::value::NIL_BITS);
+                let taken = if matches!(instr, Instr::BrIfFalse(_)) {
+                    Cc::E
+                } else {
+                    Cc::Ne
+                };
                 c.jcc(
-                    Cc::E,
+                    taken,
                     match bcp_labels.get(*target as usize) {
                         Some(l) => *l,
-                        None => decline!("BrIfFalse target {target} is out of range"),
+                        None => decline!("branch target {target} is out of range"),
                     },
                 );
+            }
+            Instr::MemoryFence(kind) => {
+                // AArch64 is weakly ordered, so unlike x86-64 every kind needs
+                // a real barrier instruction.
+                c.word(a64::dmb(match kind {
+                    egcl_rt::bytecode::MemoryFenceKind::Read => a64::Barrier::Load,
+                    egcl_rt::bytecode::MemoryFenceKind::Write => a64::Barrier::Store,
+                    egcl_rt::bytecode::MemoryFenceKind::Full => a64::Barrier::Full,
+                }));
+                emit_mov_imm(&mut c, ACC, egcl_rt::value::NIL_BITS);
+                emit_push(&mut c);
+            }
+            Instr::MakeClosure { func, capture_env } => {
+                // The nested body is owned by this BytecodeFunction, which the
+                // installed code keeps alive, so its address is stable and can
+                // be baked in -- it is a Rust-side Arc, not a movable heap
+                // object like the constants slots above.
+                let Some(nested) = bf.nested_functions.get(*func as usize) else {
+                    decline!("nested function index {func} is out of range");
+                };
+                emit_mov_imm(&mut c, 0, nested as *const Arc<BytecodeFunction> as u64);
+                emit_mov_imm(&mut c, 1, u64::from(*capture_env));
+                emit_c2i_call(
+                    &mut c,
+                    make_bytecode_closure_addr,
+                    transfer_addr,
+                    recovery_toggle_addr,
+                )?;
+                emit_push(&mut c);
             }
             Instr::Return => {
                 emit_pop(&mut c, ACC);

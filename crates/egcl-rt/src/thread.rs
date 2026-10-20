@@ -155,19 +155,30 @@ impl FiberContinuation {
 /// Maximum number of TLS slots per fiber.
 pub const MAX_TLS: usize = 4096;
 
-/// Default CL stack size: 4 MiB on Linux x86-64 and s390x, 512 KiB elsewhere.
+/// Default CL stack size: 4 MiB on Linux x86-64, AArch64 and s390x, 512 KiB
+/// elsewhere.
 ///
 /// Linux x86-64 mapped native calls retain precise frames on this stack and
 /// fall back to flat bytecode execution at the native depth cap. Both paths
 /// therefore need managed stack capacity for ordinary deep recursion. On
-/// s390x, larger native frames exhaust the machine stack reserve sooner and
-/// the remaining bytecode activations likewise use this stack. Four MiB lets
-/// `(deep 50000)` compute while excessive recursion still signals
+/// s390x and AArch64, larger native frames exhaust the machine stack reserve
+/// sooner and the remaining bytecode activations likewise use this stack. Four
+/// MiB lets `(deep 50000)` compute while excessive recursion still signals
 /// STORAGE-CONDITION. The mapping is lazy: untouched pages cost no resident
 /// memory, and EGCL_STACK_SIZE remains an explicit override.
+///
+/// AArch64 Linux was left on the 512 KiB fallback when s390x was added, even
+/// though its T1 and T2 frames are the LARGEST of the three: the prologue
+/// saves x19-x28 unconditionally, because T1, T2 and the SIGSEGV recovery
+/// epilogue share one `JIT_SAVE_BYTES` layout. Measured on an AArch64 host,
+/// that fallback overflowed between `(deep 5000)` and `(deep 10000)`, so
+/// `deep_self_recursion_signals_rather_than_running_off_the_stack`'s shallow
+/// arm -- `(deep 50000)`, the depth the test calls "recursion that fits" --
+/// signalled a stack overflow there instead of computing.
 pub(crate) const DEFAULT_STACK_SIZE: usize = if cfg!(any(
     target_arch = "s390x",
-    all(target_arch = "x86_64", target_os = "linux")
+    all(target_arch = "x86_64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "linux")
 )) {
     4 * 1024 * 1024
 } else {

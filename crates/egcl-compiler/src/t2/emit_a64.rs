@@ -90,8 +90,13 @@
 //! shift deopts when the value does not survive the round trip. Fixnum
 //! comparisons are branchless (`csel`); add/sub use the overflow flag of
 //! `adds`/`subs`; multiply uses `smulh`/`mul` and requires the high half to
-//! equal the low half's sign extension. Anything else returns
-//! `UnsupportedOp(0xA64)`.
+//! equal the low half's sign extension. `GenericEq` — which `speculate.rs`
+//! also rewrites `NULL` and `NOT` into — is bit-equality plus a `csel`.
+//! `TypeCheck` and the simple-string layout guard read the header type-id
+//! byte; `MemoryFence` becomes a `dmb` of the matching kind.
+//!
+//! Anything else declines: a refused opcode carries `op_tag`, and a shape
+//! this emitter cannot encode carries [`A64_DECLINE_TAG`] with its line.
 //!
 //! # Deopt exits
 //!
@@ -102,7 +107,7 @@
 //! an instruction's guards pass. The adapter must root the stream before it
 //! allocates.
 
-use super::emit::{EmitError, FramedCode, RootSyncSite};
+use super::emit::{EmitError, FramedCode, RootSyncSite, op_tag};
 use super::emit_s390x::rematerialization_order;
 use super::frame_state::{FrameState, FrameStateId, RematOp, ValueSource};
 use super::ir::{
@@ -179,8 +184,22 @@ struct Emitter<'a> {
     transfer_exit: Option<egcl_rt::asm::Label>,
 }
 
-fn unsupported() -> EmitError {
-    EmitError::UnsupportedOp(0xA64)
+/// High bits of a structural decline code; the low 16 bits carry the line.
+pub const A64_DECLINE_TAG: u32 = 0x0A64_0000;
+
+/// A structural decline (a shape this emitter does not handle, as opposed to
+/// an opcode it refuses, which carries the opcode tag): names the line that
+/// declined, so the T2 log can say where. The runtime decodes it as
+/// `[aarch64 emitter declined at emit_a64.rs:LINE]`.
+///
+/// Every site used to share one `UnsupportedOp(0xA64)`, so a decline named
+/// neither the arm nor the opcode, and the only way to learn which shape a
+/// function tripped over was to bisect the emitter by hand. The System Z
+/// emitter solved this the same way (bliss-nlpd4); this is that fix here.
+macro_rules! unsupported {
+    () => {
+        EmitError::UnsupportedOp(A64_DECLINE_TAG | line!())
+    };
 }
 
 impl Emitter<'_> {
@@ -215,12 +234,12 @@ impl Emitter<'_> {
         base: a64::Reg,
         offset: i32,
     ) -> Result<(), EmitError> {
-        let scaled = u64::try_from(offset).map_err(|_| unsupported())?;
+        let scaled = u64::try_from(offset).map_err(|_| unsupported!())?;
         match a64::ldr_imm(register, base, scaled) {
             Some(word) => self.asm.word(word),
             None => {
                 if scaled % 8 != 0 {
-                    return Err(unsupported());
+                    return Err(unsupported!());
                 }
                 self.imm(ADDR, scaled / 8);
                 self.asm.word(a64::ldr_indexed(register, base, ADDR));
@@ -235,12 +254,12 @@ impl Emitter<'_> {
         base: a64::Reg,
         offset: i32,
     ) -> Result<(), EmitError> {
-        let scaled = u64::try_from(offset).map_err(|_| unsupported())?;
+        let scaled = u64::try_from(offset).map_err(|_| unsupported!())?;
         match a64::str_imm(register, base, scaled) {
             Some(word) => self.asm.word(word),
             None => {
                 if scaled % 8 != 0 {
-                    return Err(unsupported());
+                    return Err(unsupported!());
                 }
                 self.imm(ADDR, scaled / 8);
                 self.asm.word(a64::str_indexed(register, base, ADDR));
@@ -258,8 +277,8 @@ impl Emitter<'_> {
         base: a64::Reg,
         offset: i32,
     ) -> Result<(), EmitError> {
-        let value = u64::try_from(offset).map_err(|_| unsupported())?;
-        let word = a64::add_imm(register, base, value).ok_or_else(unsupported)?;
+        let value = u64::try_from(offset).map_err(|_| unsupported!())?;
+        let word = a64::add_imm(register, base, value).ok_or(unsupported!())?;
         self.asm.word(word);
         Ok(())
     }
@@ -270,12 +289,12 @@ impl Emitter<'_> {
     /// than the 12-bit field still works.
     fn adjust_stack(&mut self, bytes: i32, down: bool) -> Result<(), EmitError> {
         debug_assert_eq!(bytes % 16, 0, "the stack pointer must stay 16-byte aligned");
-        let mut remaining = u64::try_from(bytes).map_err(|_| unsupported())?;
+        let mut remaining = u64::try_from(bytes).map_err(|_| unsupported!())?;
         let mut steps = 0;
         while remaining > 0 {
             steps += 1;
             if steps > 2 {
-                return Err(unsupported());
+                return Err(unsupported!());
             }
             let step = if remaining >= 0x1000 {
                 remaining & !0xfff
@@ -287,7 +306,7 @@ impl Emitter<'_> {
             } else {
                 a64::add_imm(a64::SP, a64::SP, step)
             }
-            .ok_or_else(unsupported)?;
+            .ok_or(unsupported!())?;
             self.asm.word(word);
             remaining -= step;
         }
@@ -325,9 +344,9 @@ impl Emitter<'_> {
             // machine code.
             self.imm(ADDR, slot as u64);
             self.asm
-                .word(a64::ldr_imm(register, ADDR, 0).ok_or_else(unsupported)?);
+                .word(a64::ldr_imm(register, ADDR, 0).ok_or(unsupported!())?);
         } else {
-            match *self.homes.get(&value).ok_or_else(unsupported)? {
+            match *self.homes.get(&value).ok_or(unsupported!())? {
                 Home::Register(source) => self.mov(register, source),
                 Home::Stack(slot) => self.load_at(register, a64::SP, slot as i32 * 8)?,
             }
@@ -336,7 +355,7 @@ impl Emitter<'_> {
     }
 
     fn store(&mut self, value: Value, register: a64::Reg) -> Result<(), EmitError> {
-        match *self.homes.get(&value).ok_or_else(unsupported)? {
+        match *self.homes.get(&value).ok_or(unsupported!())? {
             Home::Register(destination) => self.mov(destination, register),
             Home::Stack(slot) => self.store_at(register, a64::SP, slot as i32 * 8)?,
         }
@@ -350,11 +369,11 @@ impl Emitter<'_> {
         // hand out, so the epilogue can restore the stack pointer from x29 alone
         // rather than trusting the body to have left it balanced.
         self.asm
-            .word(a64::stp_pre(a64::FP, a64::LR, a64::SP, -SAVE_BYTES).ok_or_else(unsupported)?);
+            .word(a64::stp_pre(a64::FP, a64::LR, a64::SP, -SAVE_BYTES).ok_or(unsupported!())?);
         self.asm.word(a64::mov_from_sp(a64::FP));
         for (index, (first, second)) in a64::JIT_SAVED_PAIRS.into_iter().enumerate() {
             self.asm.word(
-                a64::stp(first, second, a64::SP, 16 + index as i32 * 16).ok_or_else(unsupported)?,
+                a64::stp(first, second, a64::SP, 16 + index as i32 * 16).ok_or(unsupported!())?,
             );
         }
         let frame = self.frame_bytes;
@@ -369,11 +388,11 @@ impl Emitter<'_> {
         self.asm.word(a64::mov_to_sp(a64::FP));
         for (index, (first, second)) in a64::JIT_SAVED_PAIRS.into_iter().enumerate() {
             self.asm.word(
-                a64::ldp(first, second, a64::SP, 16 + index as i32 * 16).ok_or_else(unsupported)?,
+                a64::ldp(first, second, a64::SP, 16 + index as i32 * 16).ok_or(unsupported!())?,
             );
         }
         self.asm
-            .word(a64::ldp_post(a64::FP, a64::LR, a64::SP, SAVE_BYTES).ok_or_else(unsupported)?);
+            .word(a64::ldp_post(a64::FP, a64::LR, a64::SP, SAVE_BYTES).ok_or(unsupported!())?);
         self.asm.word(a64::ret());
         Ok(())
     }
@@ -381,9 +400,9 @@ impl Emitter<'_> {
     // ── guards ───────────────────────────────────────────────────
 
     fn deopt_label(&mut self, data: &InstData) -> Result<egcl_rt::asm::Label, EmitError> {
-        let state = data.frame_state.ok_or_else(unsupported)?;
+        let state = data.frame_state.ok_or(unsupported!())?;
         if self.function.frame_states.get(state).scopes.is_empty() {
-            return Err(unsupported());
+            return Err(unsupported!());
         }
         let label = self.asm.label();
         self.deopts.push((state, label));
@@ -417,6 +436,137 @@ impl Emitter<'_> {
             a64::cmp_imm(T0, egcl_rt::value::TAG_CONS).expect("1 is an add-immediate"),
         );
         self.asm.jcc(Cc::Ne, deopt);
+    }
+
+    /// Branch to `target` when W0 equals the tagged constant `bits`.
+    fn branch_if_equal_imm(&mut self, bits: u64, target: egcl_rt::asm::Label) {
+        self.imm(T0, bits);
+        self.compare(W0, T0);
+        self.asm.jcc(Cc::E, target);
+    }
+
+    /// Set the flags from comparing W0's low three bits against `tag`.
+    fn tag_equals(&mut self, tag: u64) {
+        self.asm
+            .word(a64::and_imm(T0, W0, 7).expect("7 is a logical immediate"));
+        self.asm
+            .word(a64::cmp_imm(T0, tag).expect("a tag is three bits"));
+    }
+
+    /// Branch to `target` when W0's low three bits equal `tag`.
+    fn branch_if_tag(&mut self, tag: u64, target: egcl_rt::asm::Label) {
+        self.tag_equals(tag);
+        self.asm.jcc(Cc::E, target);
+    }
+
+    /// Branch to `target` unless W0's low three bits equal `tag`.
+    fn branch_unless_tag(&mut self, tag: u64, target: egcl_rt::asm::Label) {
+        self.tag_equals(tag);
+        self.asm.jcc(Cc::Ne, target);
+    }
+
+    /// Load the header type id of the heap object in W0 into T0: clear the tag
+    /// bits to reach the header word and read its most significant byte.
+    /// `ObjectHeader::type_id` occupies bits 63:56, which is byte 7 on a
+    /// little-endian target — byte 0 is where big-endian System Z reads it.
+    fn load_type_id(&mut self) {
+        self.asm
+            .word(a64::and_imm(T0, W0, !7u64).expect("!7 is a logical immediate"));
+        self.asm
+            .word(a64::ldrb_imm(T0, T0, 7).expect("7 fits the byte-form offset"));
+    }
+
+    /// Branch to `target` when the type id loaded by [`Self::load_type_id`] is `id`.
+    fn branch_if_type_id(&mut self, id: u8, target: egcl_rt::asm::Label) {
+        self.asm
+            .word(a64::cmp_imm(T0, u64::from(id)).expect("a type id is one byte"));
+        self.asm.jcc(Cc::E, target);
+    }
+
+    /// A type predicate on the tagged value in W0, leaving T or NIL in W0.
+    /// Mirrors emit.rs's `emit_type_check` exactly, including what it DECLINES:
+    /// CONS and LIST (an interpreter closure is a cons that is not of type
+    /// LIST, bliss-74rl) and the STRING class (a complex string is a
+    /// COMPLEX_ARRAY, so the two simple layouts alone would answer NIL where
+    /// the other tiers answer T, bliss-c02n). `bits == STRING` is the layout
+    /// guard's form and keeps the simple-layout test. Declining keeps the
+    /// tiers bit-identical, which is the bliss-x5y.9 rule.
+    fn type_check(&mut self, first: Value, data: &InstData) -> Result<(), EmitError> {
+        use egcl_rt::bytecode::typep_class;
+        use egcl_rt::object::type_id;
+        use egcl_rt::value::{TAG_HEAP_OBJECT, TAG_SYMBOL};
+        let refused = || EmitError::UnsupportedOp(op_tag(Opcode::TypeCheck));
+        // A constant operand should have been folded to T/NIL upstream.
+        if self.constants.contains_key(&first) || self.heap_constants.contains_key(&first) {
+            return Err(refused());
+        }
+        let (bits, class) = match &data.aux {
+            AuxData::TypeTag(ty) => (ty.bits, None),
+            AuxData::TypepClass(class) => (TypeBits::BOTTOM, Some(*class)),
+            _ => return Err(refused()),
+        };
+        let found = self.asm.label();
+        let not_found = self.asm.label();
+        let done = self.asm.label();
+        let integer = TypeBits::FIXNUM.join(TypeBits::BIGNUM);
+        if class == Some(typep_class::BOOLEAN) {
+            self.branch_if_equal_imm(NIL.0, found);
+            self.branch_if_equal_imm(T.0, found);
+        } else if class == Some(typep_class::NULL) {
+            self.branch_if_equal_imm(NIL.0, found);
+        } else if bits == TypeBits::FIXNUM {
+            self.branch_if_tag(0, found);
+        } else if bits == TypeBits::SYMBOL || class == Some(typep_class::SYMBOL) {
+            self.branch_if_tag(TAG_SYMBOL, found);
+            self.branch_if_equal_imm(NIL.0, found); // NIL is a symbol
+            self.branch_if_equal_imm(T.0, found); // T is a symbol
+        } else if bits == integer {
+            self.branch_if_tag(0, found);
+            self.branch_unless_tag(TAG_HEAP_OBJECT, not_found);
+            self.load_type_id();
+            self.branch_if_type_id(type_id::BIGNUM, found);
+        } else if bits == TypeBits::STRING {
+            self.branch_unless_tag(TAG_HEAP_OBJECT, not_found);
+            self.load_type_id();
+            self.branch_if_type_id(type_id::SIMPLE_BASE_STRING, found);
+            self.branch_if_type_id(type_id::SIMPLE_CHARACTER_STRING, found);
+        } else if matches!(
+            class,
+            Some(typep_class::PACKAGE) | Some(typep_class::HASH_TABLE)
+        ) {
+            self.branch_unless_tag(TAG_HEAP_OBJECT, not_found);
+            self.load_type_id();
+            let id = if class == Some(typep_class::PACKAGE) {
+                type_id::PACKAGE
+            } else {
+                type_id::HASH_TABLE
+            };
+            self.branch_if_type_id(id, found);
+        } else {
+            return Err(refused());
+        }
+        self.asm.bind(not_found);
+        self.imm(W0, NIL.0);
+        self.asm.jmp(done);
+        self.asm.bind(found);
+        self.imm(W0, T.0);
+        self.asm.bind(done);
+        Ok(())
+    }
+
+    /// The simple-string layout guard on the value in W0 (emit.rs's
+    /// `guard_simple_string`): a heap object whose header type id is one of
+    /// the two simple string layouts, else deopt. W0 is left as it was, since
+    /// the guard's result is its operand under a refined identity.
+    fn guard_simple_string(&mut self, deopt: egcl_rt::asm::Label) {
+        use egcl_rt::object::type_id;
+        self.branch_unless_tag(egcl_rt::value::TAG_HEAP_OBJECT, deopt);
+        let layout_ok = self.asm.label();
+        self.load_type_id();
+        self.branch_if_type_id(type_id::SIMPLE_BASE_STRING, layout_ok);
+        self.branch_if_type_id(type_id::SIMPLE_CHARACTER_STRING, layout_ok);
+        self.asm.jmp(deopt);
+        self.asm.bind(layout_ok);
     }
 
     fn float_operand(
@@ -475,7 +625,7 @@ impl Emitter<'_> {
     fn edge(&mut self, edge: &BlockCall) -> Result<(), EmitError> {
         let parameters = self.function.block(edge.block).params.clone();
         if parameters.len() != edge.args.len() {
-            return Err(unsupported());
+            return Err(unsupported!());
         }
         // A parallel copy through private frame slots handles cycles and
         // overlapping register/spill homes without clobbering an edge input.
@@ -508,11 +658,7 @@ impl Emitter<'_> {
         instruction: Inst,
         data: Option<&InstData>,
     ) -> Result<(), EmitError> {
-        let roots = self
-            .roots
-            .get(&instruction)
-            .ok_or_else(unsupported)?
-            .clone();
+        let roots = self.roots.get(&instruction).ok_or(unsupported!())?.clone();
         let root_base = i32::from(self.activation_slots) * 8;
         let argument_base = root_base + i32::from(self.root_slots) * 8;
         // Clear the unused shadows as well: an earlier call may have had more live
@@ -529,7 +675,7 @@ impl Emitter<'_> {
             match data.opcode {
                 Opcode::Call => {
                     let AuxData::CallTarget(symbol) = data.aux else {
-                        return Err(unsupported());
+                        return Err(unsupported!());
                     };
                     for (index, &arg) in data.args.iter().enumerate() {
                         self.load(arg, W0)?;
@@ -543,10 +689,10 @@ impl Emitter<'_> {
                 }
                 Opcode::SymbolValue | Opcode::SymbolFunction | Opcode::SetSymbolValue => {
                     let AuxData::SymbolRef(symbol) = data.aux else {
-                        return Err(unsupported());
+                        return Err(unsupported!());
                     };
                     if data.opcode == Opcode::SetSymbolValue {
-                        self.load(*data.args.first().ok_or_else(unsupported)?, W1)?;
+                        self.load(*data.args.first().ok_or(unsupported!())?, W1)?;
                     }
                     self.imm(W0, u64::from(symbol));
                     match data.opcode {
@@ -563,27 +709,27 @@ impl Emitter<'_> {
                 }
                 Opcode::TakeValuesToLocals => {
                     let AuxData::ValuesLocals { nvars, slot_base } = data.aux else {
-                        return Err(unsupported());
+                        return Err(unsupported!());
                     };
                     if usize::from(nvars) != data.results.len()
                         || slot_base
                             .checked_add(nvars)
                             .is_none_or(|end| end > self.activation_slots)
                     {
-                        return Err(unsupported());
+                        return Err(unsupported!());
                     }
-                    self.load(*data.args.first().ok_or_else(unsupported)?, W0)?;
+                    self.load(*data.args.first().ok_or(unsupported!())?, W0)?;
                     self.address(W1, SLOTS, i32::from(slot_base) * 8)?;
                     self.imm(T0, u64::from(nvars));
                     self.runtime.multiple_values
                 }
-                _ => return Err(unsupported()),
+                _ => return Err(unsupported!()),
             }
         } else {
             self.runtime.poll
         };
         if helper == 0 {
-            return Err(unsupported());
+            return Err(unsupported!());
         }
         let offset = self.asm.here();
         self.imm(ADDR, helper);
@@ -621,7 +767,7 @@ impl Emitter<'_> {
             .filter(|value| matches!(self.homes.get(value), Some(Home::Register(_))))
             .count();
         self.root_sites.push(RootSyncSite {
-            code_offset: u32::try_from(offset).map_err(|_| unsupported())?,
+            code_offset: u32::try_from(offset).map_err(|_| unsupported!())?,
             live_roots: roots.len() as u16,
             register_roots: register_roots as u16,
             spill_roots: (roots.len() - register_roots) as u16,
@@ -665,6 +811,47 @@ impl Emitter<'_> {
                 }
                 return self.epilogue();
             }
+            MemoryFence => {
+                // AArch64 is weakly ordered, so unlike x86-64 — where only a
+                // store-load barrier costs anything — each kind needs a real
+                // instruction. Order the kinds precisely rather than taking
+                // the System Z route of a full barrier for all three.
+                let barrier = match data.aux {
+                    AuxData::MemoryFence(egcl_rt::bytecode::MemoryFenceKind::Read) => {
+                        a64::Barrier::Load
+                    }
+                    AuxData::MemoryFence(egcl_rt::bytecode::MemoryFenceKind::Write) => {
+                        a64::Barrier::Store
+                    }
+                    AuxData::MemoryFence(egcl_rt::bytecode::MemoryFenceKind::Full) => {
+                        a64::Barrier::Full
+                    }
+                    _ => return Err(EmitError::UnsupportedOp(op_tag(Opcode::MemoryFence))),
+                };
+                self.asm.word(a64::dmb(barrier));
+                if let Some(&value) = data.results.first() {
+                    self.imm(W0, NIL.0);
+                    self.store(value, W0)?;
+                }
+                return Ok(());
+            }
+            Trap => {
+                // A Trap ends a path that must not continue (bliss-wukf): the
+                // code after a call that never returns normally. As in emit.rs
+                // and emit_s390x.rs the GENERIC deopt suffices even though it
+                // re-runs the function — this is reachable only once a c2i
+                // helper has stashed an error, and run_native takes
+                // NATIVE_ERROR before it looks at NATIVE_DEOPT, so no
+                // committed side effect is repeated and no FrameState is
+                // needed. Refusing it cost the whole function its T2 code.
+                if self.runtime.deopt == 0 {
+                    return Err(unsupported!());
+                }
+                self.imm(ADDR, self.runtime.deopt);
+                self.call_register(ADDR);
+                self.imm(W0, NIL.0);
+                return self.epilogue();
+            }
             Jump if data.targets.len() == 1 => return self.edge(&data.targets[0]),
             Brif if data.args.len() == 1 && data.targets.len() == 2 => {
                 let otherwise = self.asm.label();
@@ -677,8 +864,18 @@ impl Emitter<'_> {
             }
             _ => {}
         }
-        let result = *data.results.first().ok_or_else(unsupported)?;
-        let first = *data.args.first().ok_or_else(unsupported)?;
+        // Past this point every remaining opcode is a value-producing one
+        // with at least one argument. Report the opcode, not the line: an
+        // operation reaching here with no result or no argument is refused
+        // *as that operation*, which is what a reader needs to see.
+        let result = *data
+            .results
+            .first()
+            .ok_or(EmitError::UnsupportedOp(op_tag(data.opcode)))?;
+        let first = *data
+            .args
+            .first()
+            .ok_or(EmitError::UnsupportedOp(op_tag(data.opcode)))?;
         self.load(first, W0)?;
         match data.opcode {
             Guard if matches!(&data.aux, AuxData::TypeTag(ty) if ty.bits == TypeBits::FIXNUM || ty.bits == TypeBits::SINGLE_FLOAT || ty.bits == TypeBits::CONS) =>
@@ -701,7 +898,7 @@ impl Emitter<'_> {
             FloatAdd | FloatSub | FloatMul => {
                 let deopt = self.deopt_label(data)?;
                 self.float_operand(first, W0, deopt)?;
-                self.float_operand(*data.args.get(1).ok_or_else(unsupported)?, W1, deopt)?;
+                self.float_operand(*data.args.get(1).ok_or(unsupported!())?, W1, deopt)?;
                 self.unbox_single(F0, W0);
                 self.unbox_single(F1, W1);
                 match data.opcode {
@@ -716,7 +913,7 @@ impl Emitter<'_> {
                 let deopt = self.deopt_label(data)?;
                 self.guard_fixnum(W0, deopt);
                 if data.opcode != FixnumNeg {
-                    self.load(*data.args.get(1).ok_or_else(unsupported)?, W1)?;
+                    self.load(*data.args.get(1).ok_or(unsupported!())?, W1)?;
                     self.guard_fixnum(W1, deopt);
                 }
                 match data.opcode {
@@ -751,6 +948,35 @@ impl Emitter<'_> {
                 }
                 self.asm.jcc(Cc::O, deopt);
             }
+            TypeCheck => {
+                self.type_check(first, data)?;
+                return self.store(result, W0);
+            }
+            Guard if matches!(&data.aux, AuxData::StringLayout) => {
+                // The layout refinement every simple-string fast path is
+                // predicated on. The guard passes its operand through.
+                let deopt = self.deopt_label(data)?;
+                self.guard_simple_string(deopt);
+            }
+            StringByteLength => {
+                // A layout-proven simple string keeps its byte length in the
+                // second header word, so this is one load once that guard has
+                // run; shifting by three tags the raw count as a fixnum.
+                // Refuse the guarded or effectful form exactly as emit.rs
+                // does: this is the fast path for a layout a dominating guard
+                // has already proved, and anything else needs the general one.
+                if data.args.len() != 1
+                    || data.flags.guard
+                    || data.flags.effectful
+                    || data.frame_state.is_some()
+                {
+                    return Err(EmitError::UnsupportedOp(op_tag(Opcode::StringByteLength)));
+                }
+                self.asm
+                    .word(a64::and_imm(W0, W0, !7u64).expect("!7 is a logical immediate"));
+                self.load_at(W0, W0, 8)?;
+                self.asm.word(a64::lsl_imm(W0, W0, 3));
+            }
             GenericEq => {
                 // Lisp EQ (and NULL / NOT, which speculate.rs rewrites to
                 // GenericEq(x, NIL)) is bit-equality of the two tagged words:
@@ -758,7 +984,7 @@ impl Emitter<'_> {
                 // front of every CAR/CDR whose operand may be NIL, so refusing
                 // it here cost almost every list-walking function its native
                 // code on this target (bliss-jmwqr).
-                self.load(*data.args.get(1).ok_or_else(unsupported)?, W1)?;
+                self.load(*data.args.get(1).ok_or(unsupported!())?, W1)?;
                 self.compare(W0, W1);
                 self.imm(T0, NIL.0);
                 self.imm(T1, T.0);
@@ -773,10 +999,10 @@ impl Emitter<'_> {
                 // a Car still carrying a guard, an effect or a FrameState needs
                 // the general path instead.
                 if data.flags.guard || data.flags.effectful || data.frame_state.is_some() {
-                    return Err(unsupported());
+                    return Err(unsupported!());
                 }
                 self.asm
-                    .word(a64::and_imm(W0, W0, !7u64).ok_or_else(unsupported)?);
+                    .word(a64::and_imm(W0, W0, !7u64).ok_or(unsupported!())?);
                 let offset = if data.opcode == Car { 0 } else { 8 };
                 self.load_at(W0, W0, offset)?;
             }
@@ -787,7 +1013,7 @@ impl Emitter<'_> {
                 // no retag, no overflow.
                 let deopt = self.deopt_label(data)?;
                 self.guard_fixnum(W0, deopt);
-                self.load(*data.args.get(1).ok_or_else(unsupported)?, W1)?;
+                self.load(*data.args.get(1).ok_or(unsupported!())?, W1)?;
                 self.guard_fixnum(W1, deopt);
                 match data.opcode {
                     LogAnd => self.asm.word(a64::and(W0, W0, W1)),
@@ -803,15 +1029,15 @@ impl Emitter<'_> {
                 self.guard_fixnum(W0, deopt);
                 self.asm.word(a64::mvn(W0, W0));
                 self.asm
-                    .word(a64::and_imm(W0, W0, !7u64).ok_or_else(unsupported)?);
+                    .word(a64::and_imm(W0, W0, !7u64).ok_or(unsupported!())?);
             }
             FixnumShl | FixnumShr => {
                 // (ash x n) for a CONSTANT n; a variable amount declines. The
                 // constants map holds TAGGED bits, so the shift count is
                 // recovered by untagging it.
                 let deopt = self.deopt_label(data)?;
-                let amount = *data.args.get(1).ok_or_else(unsupported)?;
-                let tagged = *self.constants.get(&amount).ok_or_else(unsupported)?;
+                let amount = *data.args.get(1).ok_or(unsupported!())?;
+                let tagged = *self.constants.get(&amount).ok_or(unsupported!())?;
                 let n = (tagged as i64) >> 3;
                 self.guard_fixnum(W0, deopt);
                 // DIRECTION, mirroring emit.rs and easy to get backwards: on
@@ -845,7 +1071,7 @@ impl Emitter<'_> {
                     // path produce a bignum.
                     let k = n as u32;
                     if k > 60 {
-                        return Err(unsupported());
+                        return Err(unsupported!());
                     }
                     self.asm.word(a64::lsl_imm(T0, W0, k));
                     self.asm.word(a64::asr_imm(T1, T0, k));
@@ -854,7 +1080,9 @@ impl Emitter<'_> {
                     self.asm.word(a64::mov(W0, T0));
                 }
             }
-            _ => return Err(unsupported()),
+            // Name the opcode rather than the line: this arm refuses a whole
+            // IR operation, and which one it was is the actionable fact.
+            _ => return Err(EmitError::UnsupportedOp(op_tag(data.opcode))),
         }
         // Do not overwrite any allocated home until every guard has passed: a
         // failing instruction must reconstruct its pre-instruction state.
@@ -881,7 +1109,7 @@ impl Emitter<'_> {
                 let offset = self.remat_base + id.0 as i32 * 8;
                 self.load_at(W0, a64::SP, offset)
             }
-            _ => Err(unsupported()),
+            _ => Err(unsupported!()),
         }
     }
 
@@ -891,7 +1119,7 @@ impl Emitter<'_> {
         for index in rematerialization_order(state)? {
             let recipe = &state.remat[index];
             if recipe.result_repr != ValueRepresentation::Tagged {
-                return Err(unsupported());
+                return Err(unsupported!());
             }
             match recipe.op {
                 RematOp::Const
@@ -900,14 +1128,14 @@ impl Emitter<'_> {
                 | RematOp::BoxFloat
                 | RematOp::UnboxFloat => {
                     if recipe.inputs.len() != 1 {
-                        return Err(unsupported());
+                        return Err(unsupported!());
                     }
                     let input = recipe.inputs[0].clone();
                     self.deopt_source(&input, state)?;
                 }
                 RematOp::FixnumAdd | RematOp::FixnumSub => {
                     if recipe.inputs.len() != 2 {
-                        return Err(unsupported());
+                        return Err(unsupported!());
                     }
                     let (left, right) = (recipe.inputs[0].clone(), recipe.inputs[1].clone());
                     self.deopt_source(&left, state)?;
@@ -998,7 +1226,7 @@ pub fn emit_framed_with_runtime(
             .insts
             .last()
             .copied()
-            .ok_or_else(unsupported)?;
+            .ok_or(unsupported!())?;
         if function
             .inst(terminator)
             .targets
@@ -1006,7 +1234,7 @@ pub fn emit_framed_with_runtime(
             .any(|target| positions.get(&target.block).is_none_or(|&t| t <= index))
         {
             if runtime.poll == 0 {
-                return Err(unsupported());
+                return Err(unsupported!());
             }
             polls.insert(terminator);
         }
@@ -1076,7 +1304,7 @@ pub fn emit_framed_with_runtime(
     for index in 0..function.num_values() {
         let value = Value(index as u32);
         if function.value(value).repr != ValueRepresentation::Tagged {
-            return Err(unsupported());
+            return Err(unsupported!());
         }
         if emitter.constants.contains_key(&value) || emitter.heap_constants.contains_key(&value) {
             continue;
@@ -1101,6 +1329,28 @@ pub fn emit_framed_with_runtime(
         emitter.homes.insert(value, home);
     }
 
+    // A value whose inferred type is confined to the immediate tags is never a
+    // heap pointer, so the collector can neither move it nor need to see it,
+    // and it needs no shadow root. The inference map assigns each SSA value
+    // the type it has from its definition on, so the fact holds wherever the
+    // value is live; BOTTOM (unreached) stays rooted. This mirrors emit.rs and
+    // emit_s390x.rs: it removes the shadow-slot store and reload around every
+    // runtime call in numeric code, and it is what lets a fixnum-recursive
+    // function's roots vanish entirely -- the precondition for a register
+    // entry and a direct self-call here, as it was on System Z.
+    let inference = super::infer::infer(function);
+    let proven_immediate = |value: Value| -> bool {
+        const IMMEDIATE: TypeBits = TypeBits(
+            TypeBits::FIXNUM.0
+                | TypeBits::SINGLE_FLOAT.0
+                | TypeBits::CHARACTER.0
+                | TypeBits::SYMBOL.0
+                | TypeBits::NULL.0,
+        );
+        let bits = inference.ty(value).bits;
+        !bits.is_bottom() && bits.meet(IMMEDIATE) == bits
+    };
+
     // The same precise regalloc2 ranges that chose homes determine the live roots
     // at each runtime call. Include dying arguments, and exclude results that do
     // not exist until the callback returns.
@@ -1111,7 +1361,7 @@ pub fn emit_framed_with_runtime(
         if !calls_runtime(function.inst(source).opcode) {
             continue;
         }
-        let after = u32::try_from(index).map_err(|_| unsupported())? * 2 + 1;
+        let after = u32::try_from(index).map_err(|_| unsupported!())? * 2 + 1;
         let data = function.inst(source);
         let mut roots: Vec<Value> = machine
             .value_locations
@@ -1127,6 +1377,7 @@ pub fn emit_framed_with_runtime(
                     .flat_map(|target| target.args.iter().copied()),
             )
             .filter(|value| emitter.homes.contains_key(value))
+            .filter(|value| !proven_immediate(*value))
             .collect();
         roots.sort_by_key(|value| value.0);
         roots.dedup();
@@ -1151,7 +1402,7 @@ pub fn emit_framed_with_runtime(
         {
             boundary -= 1;
         }
-        let point = u32::try_from(boundary).map_err(|_| unsupported())? * 2;
+        let point = u32::try_from(boundary).map_err(|_| unsupported!())? * 2;
         let data = function.inst(source);
         let mut roots: Vec<_> = machine
             .value_locations
@@ -1167,13 +1418,14 @@ pub fn emit_framed_with_runtime(
                     .flat_map(|target| target.args.iter().copied()),
             )
             .filter(|value| emitter.homes.contains_key(value))
+            .filter(|value| !proven_immediate(*value))
             .collect();
         roots.sort_by_key(|value| value.0);
         roots.dedup();
         emitter.roots.insert(source, roots);
     }
     emitter.root_slots = u16::try_from(emitter.roots.values().map(Vec::len).max().unwrap_or(0))
-        .map_err(|_| unsupported())?;
+        .map_err(|_| unsupported!())?;
     emitter.argument_slots = u16::try_from(
         function
             .block_order()
@@ -1185,14 +1437,14 @@ pub fn emit_framed_with_runtime(
             .max()
             .unwrap_or(0),
     )
-    .map_err(|_| unsupported())?;
+    .map_err(|_| unsupported!())?;
     let shadow_root_slots = emitter
         .root_slots
         .checked_add(emitter.argument_slots)
-        .ok_or_else(unsupported)?;
+        .ok_or(unsupported!())?;
     activation_slots
         .checked_add(shadow_root_slots)
-        .ok_or_else(unsupported)?;
+        .ok_or(unsupported!())?;
 
     let edge_words = function
         .block_order()
@@ -1224,7 +1476,7 @@ pub fn emit_framed_with_runtime(
     // Every frame access must remain reachable; beyond this the emitter would be
     // materialising an address for each one.
     if frame_words > 0x1000 {
-        return Err(unsupported());
+        return Err(unsupported!());
     }
     emitter.frame_bytes = (frame_words * 8) as i32;
     emitter.edge_base = spill_slots as i32 * 8;
@@ -1232,7 +1484,7 @@ pub fn emit_framed_with_runtime(
     emitter.remat_base = emitter.deopt_base + deopt_words as i32 * 8;
     emitter.result_offset = (frame_words as i32 - 1) * 8;
     if function.block(function.entry()).params.len() > activation_slots as usize {
-        return Err(unsupported());
+        return Err(unsupported!());
     }
 
     emitter.prologue()?;
