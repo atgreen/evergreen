@@ -104,6 +104,7 @@
   as `(ash (logand a #xFFFFFFFFFF) 30)`, returned a wrapped fixnum instead of
   the bignum result. It now checks the shift for overflow
   ([#456](https://github.com/atgreen/evergreen/pull/456)).
+
 - Compiled code calls another package's `LENGTH`, `FIRST`, `ELT` and the
   other functions the compiler calls directly, rather than the CL function
   of the same name. A generic function such as `(defgeneric my:length (x))`
