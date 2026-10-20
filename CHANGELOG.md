@@ -62,7 +62,7 @@
   stay in the interpreter there, because the native entry required every
   argument; it now fills in omitted optional arguments itself, so these
   functions reach T1 and then T2 like fixed-arity ones
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#457](https://github.com/atgreen/evergreen/pull/457)).
 - `FLOOR`, `CEILING`, `TRUNCATE`, `ROUND`, `MOD` and `REM` on bignums divide
   once instead of going through exact rational arithmetic, which reduced
   `a/b` with a gcd first. A `MOD` of a 4096-bit number by a 2048-bit one is
