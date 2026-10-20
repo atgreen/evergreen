@@ -93,7 +93,7 @@
   predecessors or each loop poll. A cold `(asdf:load-system :babel)` drops
   from about 44 s to 32 s (CPU time from 37.9 s to 26.0 s), which also
   undoes the slowdown that compiling more functions natively had caused
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#483](https://github.com/atgreen/evergreen/pull/483)).
 - `COUNT`, `COUNT-IF` and `COUNT-IF-NOT` compile to bytecode instead of being
   tree-walked on every call, and `FIND`, `FIND-IF`, `FIND-IF-NOT` and the
   `COUNT` family no longer build a closure for each call. Counting over a
