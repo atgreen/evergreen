@@ -1598,27 +1598,31 @@
           (dolist (x items acc)
             (setq acc (if from-end (funcall fn x acc) (funcall fn acc x))))))))
 
+;; The FIND and COUNT families test inline, like POSITION, rather than through
+;; a local FLET: a FLET that refers to PRED, KEY or SEQ is a closure, and a
+;; function that creates a capturing closure cannot leave the interpreter
+;; (bliss-15gms). The COUNT family iterates with LOOP rather than DO: DO is
+;; defined further down this file, so the COUNT family written with it never
+;; compiled to bytecode and stayed tree-walked however hot it ran.
 (defun find-if (pred seq &key key (start 0) end from-end)
   (let ((stop (or end (length seq))))
-    (flet ((matchp (e) (funcall pred (if key (funcall key e) e))))
-      (if from-end
-          (loop for i from (1- stop) downto start
-                for e = (elt seq i)
-                when (matchp e) return e)
-          (loop for i from start below stop
-                for e = (elt seq i)
-                when (matchp e) return e)))))
+    (if from-end
+        (loop for i from (1- stop) downto start
+              for e = (elt seq i)
+              when (funcall pred (if key (funcall key e) e)) return e)
+        (loop for i from start below stop
+              for e = (elt seq i)
+              when (funcall pred (if key (funcall key e) e)) return e))))
 
 (defun find-if-not (pred seq &key key (start 0) end from-end)
   (let ((stop (or end (length seq))))
-    (flet ((matchp (e) (not (funcall pred (if key (funcall key e) e)))))
-      (if from-end
-          (loop for i from (1- stop) downto start
-                for e = (elt seq i)
-                when (matchp e) return e)
-          (loop for i from start below stop
-                for e = (elt seq i)
-                when (matchp e) return e)))))
+    (if from-end
+        (loop for i from (1- stop) downto start
+              for e = (elt seq i)
+              unless (funcall pred (if key (funcall key e) e)) return e)
+        (loop for i from start below stop
+              for e = (elt seq i)
+              unless (funcall pred (if key (funcall key e) e)) return e))))
 
 (defun position-if (pred seq &key key (start 0) end from-end)
   (let ((stop (or end (length seq))))
@@ -1641,23 +1645,24 @@
               unless (funcall pred (if key (funcall key e) e)) return i))))
 
 (defun count-if (pred seq &key key (start 0) end from-end)
-  (let ((stop (or end (length seq))) (n 0))
-    (flet ((hit (i) (funcall pred (let ((e (elt seq i))) (if key (funcall key e) e)))))
-      (if from-end
-          (do ((i (1- stop) (1- i))) ((< i start) n)
-            (when (hit i) (setq n (1+ n))))
-          (do ((i start (1+ i))) ((>= i stop) n)
-            (when (hit i) (setq n (1+ n))))))))
+  (let ((stop (or end (length seq))))
+    (if from-end
+        (loop for i from (1- stop) downto start
+              for e = (elt seq i)
+              count (funcall pred (if key (funcall key e) e)))
+        (loop for i from start below stop
+              for e = (elt seq i)
+              count (funcall pred (if key (funcall key e) e))))))
 
 (defun count-if-not (pred seq &key key (start 0) end from-end)
-  (let ((stop (or end (length seq))) (n 0))
-    (flet ((miss (i)
-             (not (funcall pred (let ((e (elt seq i))) (if key (funcall key e) e))))))
-      (if from-end
-          (do ((i (1- stop) (1- i))) ((< i start) n)
-            (when (miss i) (setq n (1+ n))))
-          (do ((i start (1+ i))) ((>= i stop) n)
-            (when (miss i) (setq n (1+ n))))))))
+  (let ((stop (or end (length seq))))
+    (if from-end
+        (loop for i from (1- stop) downto start
+              for e = (elt seq i)
+              count (not (funcall pred (if key (funcall key e) e))))
+        (loop for i from start below stop
+              for e = (elt seq i)
+              count (not (funcall pred (if key (funcall key e) e)))))))
 
 ;; Walked with ENDP, not `loop for l on list` (bliss-b9dr). LOOP's `on` driver
 ;; terminates via ATOM, which is right for LOOP but wrong here: MEMBER-IF
@@ -1706,16 +1711,15 @@
   (let ((testfn (or test test-not #'eql))
         (neg (if test-not t nil))
         (stop (or end (length seq))))
-    (flet ((matchp (e)
-             (let ((r (funcall testfn item (if key (funcall key e) e))))
-               (if neg (not r) r))))
-      (if from-end
-          (loop for i from (1- stop) downto start
-                for e = (elt seq i)
-                when (matchp e) return e)
-          (loop for i from start below stop
-                for e = (elt seq i)
-                when (matchp e) return e)))))
+    (if from-end
+        (loop for i from (1- stop) downto start
+              for e = (elt seq i)
+              for matched = (funcall testfn item (if key (funcall key e) e))
+              when (if neg (not matched) matched) return e)
+        (loop for i from start below stop
+              for e = (elt seq i)
+              for matched = (funcall testfn item (if key (funcall key e) e))
+              when (if neg (not matched) matched) return e))))
 
 (defun position (item seq &key key test test-not (start 0) end from-end)
   (let ((testfn (or test test-not #'eql))
@@ -1739,16 +1743,16 @@
 (defun count (item seq &key key test test-not (start 0) end from-end)
   (let ((testfn (or test test-not #'eql))
         (neg (if test-not t nil))
-        (stop (or end (length seq)))
-        (n 0))
-    (flet ((matchp (e)
-             (let ((r (funcall testfn item (if key (funcall key e) e))))
-               (if neg (not r) r))))
-      (if from-end
-          (do ((i (1- stop) (1- i))) ((< i start) n)
-            (when (matchp (elt seq i)) (setq n (1+ n))))
-          (do ((i start (1+ i))) ((>= i stop) n)
-            (when (matchp (elt seq i)) (setq n (1+ n))))))))
+        (stop (or end (length seq))))
+    (if from-end
+        (loop for i from (1- stop) downto start
+              for e = (elt seq i)
+              for matched = (funcall testfn item (if key (funcall key e) e))
+              count (if neg (not matched) matched))
+        (loop for i from start below stop
+              for e = (elt seq i)
+              for matched = (funcall testfn item (if key (funcall key e) e))
+              count (if neg (not matched) matched)))))
 
 (defun delete-if (pred seq &rest keys) (apply #'remove-if pred seq keys))
 (defun delete-if-not (pred seq &rest keys) (apply #'remove-if-not pred seq keys))
