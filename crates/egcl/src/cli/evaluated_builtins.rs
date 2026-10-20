@@ -1035,6 +1035,59 @@ fn resolve(name: &str) -> Option<Handler> {
             env.clear_mv();
             egcl_stdlib::text_codec::call(args)
         }),
+        // Boot REPLACE's, SEARCH's and FILL's native vector cases. Boot checks
+        // the bounds before calling; T from %VECTOR-SEARCH and NIL from
+        // %VECTOR-REPLACE or %VECTOR-FILL mean "not a sequence this covers", and
+        // boot falls back to its element-by-element code.
+        "EGCL::%VECTOR-FILL" => Some(|_operator, args, env| {
+            env.clear_mv();
+            let [seq, item, start, end] = args else {
+                return Err(EgclError::ProgramError(
+                    "%VECTOR-FILL takes four arguments".into(),
+                ));
+            };
+            let handled = egcl_stdlib::sequences::fill_direct(
+                *seq,
+                *item,
+                index_arg(*start)?,
+                index_arg(*end)?,
+            )?;
+            Ok(if handled { T } else { NIL })
+        }),
+        "EGCL::%VECTOR-REPLACE" => Some(|_operator, args, env| {
+            env.clear_mv();
+            let [dst, src, start1, start2, count] = args else {
+                return Err(EgclError::ProgramError(
+                    "%VECTOR-REPLACE takes five arguments".into(),
+                ));
+            };
+            let handled = egcl_stdlib::sequences::replace_direct(
+                *dst,
+                index_arg(*start1)?,
+                *src,
+                index_arg(*start2)?,
+                index_arg(*count)?,
+            )?;
+            Ok(if handled { T } else { NIL })
+        }),
+        "EGCL::%VECTOR-SEARCH" => Some(|_operator, args, env| {
+            env.clear_mv();
+            let [pat, seq, start1, end1, start2, end2, from_end] = args else {
+                return Err(EgclError::ProgramError(
+                    "%VECTOR-SEARCH takes seven arguments".into(),
+                ));
+            };
+            Ok(egcl_stdlib::sequences::search_direct(
+                *pat,
+                index_arg(*start1)?,
+                index_arg(*end1)?,
+                *seq,
+                index_arg(*start2)?,
+                index_arg(*end2)?,
+                !from_end.is_nil(),
+            )?
+            .unwrap_or(T))
+        }),
         "EGCL::%POSIX" => Some(|_operator, args, env| {
             if env.sandbox {
                 return Err(EgclError::SandboxViolation("POSIX access denied".into()));
@@ -5492,4 +5545,16 @@ fn check_two_way_components(input: EgclVal, output: EgclVal) -> Result<(), EgclE
         });
     }
     Ok(())
+}
+
+/// A sequence index passed to an internal helper: a non-negative fixnum.
+fn index_arg(value: EgclVal) -> Result<usize, EgclError> {
+    if value.is_fixnum() && value.as_fixnum() >= 0 {
+        Ok(value.as_fixnum() as usize)
+    } else {
+        Err(EgclError::TypeError {
+            datum: value,
+            expected: "(INTEGER 0 *)".into(),
+        })
+    }
 }

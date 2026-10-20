@@ -3280,7 +3280,9 @@
 (defun fill (seq item &key (start 0) end)
   (%check-bounding-indices seq start end)
   (let ((stop (or end (length seq))) (i start))
-    (loop while (< i stop) do (setf (elt seq i) item) (incf i)))
+    ;; Simple vectors and simple strings are filled natively.
+    (unless (egcl::%vector-fill seq item start stop)
+      (loop while (< i stop) do (setf (elt seq i) item) (incf i))))
   seq)
 
 ;; When SEQ1 and SEQ2 are the same object with OVERLAPPING ranges, the result
@@ -3292,7 +3294,16 @@
 ;;
 ;; Snapshotting the source range is the whole fix, and it costs only the range
 ;; actually copied (ansi REPLACE-LIST.20, REPLACE-VECTOR/STRING/BIT-VECTOR.21).
+;; Simple vectors and simple strings with valid bounds are copied natively,
+;; overlap-safe, by %VECTOR-REPLACE; it returns NIL for any other pair.
 (defun replace (seq1 seq2 &key (start1 0) end1 (start2 0) end2)
+  (let ((e1 (or end1 (length seq1))) (e2 (or end2 (length seq2))))
+    (when (and (vectorp seq1) (vectorp seq2)
+               (integerp start1) (integerp e1) (integerp start2) (integerp e2)
+               (<= 0 start1 e1 (length seq1)) (<= 0 start2 e2 (length seq2))
+               (egcl::%vector-replace seq1 seq2 start1 start2
+                                      (min (- e1 start1) (- e2 start2))))
+      (return-from replace seq1)))
   (let* ((e1 (or end1 (length seq1))) (e2 (or end2 (length seq2)))
          (n (min (- e1 start1) (- e2 start2)))
          (src (make-array n))
@@ -3329,6 +3340,19 @@
                               (start1 0) end1 (start2 0) end2 from-end)
   (unless (or (listp seq2) (vectorp seq2))
     (error 'type-error :datum seq2 :expected-type 'sequence))
+  ;; With no key and the EQL test (or CHAR= or EQUAL, which agree with EQL on
+  ;; characters), simple vectors and simple strings with valid bounds are
+  ;; scanned natively by %VECTOR-SEARCH; it returns T for any other pair.
+  (when (and (vectorp seq1) (vectorp seq2) (null key) (null test-not)
+             (or (eq test #'eql) (eq test 'eql)
+                 (and (stringp seq1) (stringp seq2)
+                      (member test (list #'char= 'char= #'equal 'equal)))))
+    (let ((e1 (or end1 (length seq1))) (e2 (or end2 (length seq2))))
+      (when (and (integerp start1) (integerp e1) (integerp start2) (integerp e2)
+                 (<= 0 start1 e1 (length seq1)) (<= 0 start2 e2 (length seq2)))
+        (let ((found (egcl::%vector-search seq1 seq2 start1 e1 start2 e2 from-end)))
+          (unless (eq found t)
+            (return-from search found))))))
   (let* ((l1 (coerce seq1 'list))
          (e1 (or end1 (length l1))) (e2 (or end2 (length seq2)))
          (pat (subseq l1 start1 e1)) (plen (length pat))
