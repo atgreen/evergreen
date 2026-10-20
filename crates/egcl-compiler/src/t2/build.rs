@@ -888,6 +888,7 @@ impl<'a> Builder<'a> {
                 Instr::CallNamed { .. }
                 | Instr::SetValues(_)
                 | Instr::ValuesToList
+                | Instr::AllocCons
                 | Instr::Throw
                 | Instr::EvalHost(_)
                 | Instr::LoadFunction(_)
@@ -978,6 +979,7 @@ impl<'a> Builder<'a> {
                             }
                             | Instr::SetValues(_)
                             | Instr::ValuesToList
+                            | Instr::AllocCons
                             | Instr::CleanupReturn
                             | Instr::Throw
                     ))
@@ -1080,6 +1082,9 @@ impl<'a> Builder<'a> {
                 }
                 Instr::ValuesToList => {
                     push(i + 1, d, &mut depth_at, &mut work); // primary -> list
+                }
+                Instr::AllocCons => {
+                    push(i + 1, d - 1, &mut depth_at, &mut work); // car, cdr -> cons
                 }
                 Instr::ClearMv => {
                     push(i + 1, d, &mut depth_at, &mut work); // no operand-stack effect
@@ -1203,6 +1208,7 @@ impl<'a> Builder<'a> {
                             }
                             | Instr::SetValues(_)
                             | Instr::ValuesToList
+                            | Instr::AllocCons
                             | Instr::CleanupReturn
                             | Instr::Throw
                     ))
@@ -1439,6 +1445,7 @@ impl<'a> Builder<'a> {
                 Instr::CallNamed { .. }
                 | Instr::SetValues(_)
                 | Instr::ValuesToList
+                | Instr::AllocCons
                 | Instr::Throw
                 | Instr::EvalHost(_)
                 | Instr::LoadFunction(_)
@@ -1985,6 +1992,47 @@ impl<'a> Builder<'a> {
                                 safepoint: true,
                                 ..InstFlags::default()
                             },
+                            targets: vec![],
+                            frame_state: Some(fs),
+                            source_pos: 0,
+                        },
+                        &[(IRType::TOP, ValueRepresentation::Tagged)],
+                    );
+                    if self.native_cleanups {
+                        self.finish_native_invoke(
+                            block,
+                            inst,
+                            stack,
+                            results[0],
+                            i as u32,
+                            Some(end),
+                        )?;
+                        return Ok(());
+                    }
+                    stack.push(results[0]);
+                }
+                Instr::AllocCons => {
+                    // Backquote templates build their conses with AllocCons;
+                    // plain (cons a b) is already a CallNamed. Lower it as
+                    // that same call, like SetValues -> VALUES, so the cons
+                    // allocates through a rooted, safepointed runtime call
+                    // and the cold state keeps car and cdr on the stack
+                    // (bliss-elwvl).
+                    if stack.len() < 2 {
+                        return Err(BuildError::Unsupported("stack underflow (AllocCons)"));
+                    }
+                    let fs = self.build_frame_state(block, &stack, i as u32);
+                    let split = stack.len() - 2;
+                    let args: Vec<Value> = stack.split_off(split);
+                    let cons_sym = egcl_rt::symbols::intern("CONS");
+                    let (inst, results) = self.f.push_inst(
+                        block,
+                        InstData {
+                            opcode: Opcode::Call,
+                            args,
+                            results: vec![],
+                            aux: AuxData::CallTarget(cons_sym),
+                            flags: runtime_call_flags(),
                             targets: vec![],
                             frame_state: Some(fs),
                             source_pos: 0,
@@ -3755,6 +3803,49 @@ mod tests {
             assert!(
                 collects(&function, Opcode::Invoke),
                 "the helper must own an exceptional edge"
+            );
+        }
+    }
+
+    #[test]
+    fn alloc_cons_is_a_cons_call() {
+        let input = bf(
+            "alloc-cons",
+            vec![
+                Instr::LoadLocal(0),
+                Instr::LoadLocal(1),
+                Instr::AllocCons,
+                Instr::Return,
+            ],
+            vec![],
+            2,
+            2,
+            2,
+        );
+        let cons = egcl_rt::symbols::intern("CONS");
+        let calls_cons = |function: &Function, opcode: Opcode| {
+            function.block_order().iter().any(|&block| {
+                function.block(block).insts.iter().any(|&inst| {
+                    let data = function.inst(inst);
+                    data.opcode == opcode
+                        && matches!(data.aux, AuxData::CallTarget(symbol) if symbol == cons)
+                        && data.args.len() == 2
+                        && data.frame_state.is_some()
+                })
+            })
+        };
+        let plain = build_from_bytecode(&input).unwrap();
+        crate::t2::verify::verify(&plain).unwrap();
+        assert!(calls_cons(&plain, Opcode::Call));
+        for result in [
+            build_from_bytecode_for_transfers(&input),
+            build_from_bytecode_for_native_cleanups(&input),
+        ] {
+            let function = result.unwrap();
+            crate::t2::verify::verify(&function).unwrap();
+            assert!(
+                calls_cons(&function, Opcode::Invoke),
+                "the allocating call must own an exceptional edge"
             );
         }
     }

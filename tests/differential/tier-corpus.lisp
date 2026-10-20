@@ -208,6 +208,11 @@
 ;; leak to the caller as stale secondaries (bliss-6z1hh).
 (defun mvl-wrap () (multiple-value-list (five-vals)))
 (check :mv-list-no-leak (multiple-value-bind (a b) (mvl-wrap) (list a b)))
+;; A backquote returns exactly one value: an operand's tuple must not leak
+;; through the template's conses (bliss-elwvl).
+(defun qq-mv-wrap (a) `(,(values a 2)))
+(check :backquote-no-leak (multiple-value-list (qq-mv-wrap 1)))
+(check :backquote-shapes (list (qq-mv-wrap 3) (let ((l (list 1 2))) `(x ,@l . ,l))))
 
 ;;; ── discarded-but-must-still-signal ────────────────────────────────────
 
