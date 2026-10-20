@@ -400,6 +400,28 @@
 (check :optional-overflow (list (opt-overflow 1) (opt-overflow -1 -2)))
 (check :optional-too-many (opt-sp 1 2 3 4))
 
+;;; ── #'f function designators (bliss-j3fv8) ────────────────────────────
+
+(defun fd-apply (l) (apply #'+ l))
+(defun fd-mapcar (l) (mapcar #'1+ l))
+(defun fd-reduce (l) (reduce #'+ l))
+(defstruct fd-pt x y)
+(defun fd-struct-set (p) (setf (fd-pt-x p) (1+ (fd-pt-x p))))
+(defun fd-target (x) (list :old x))
+(defun fd-caller (x) (funcall #'fd-target (list x (make-list 3))))
+
+(check :fd-apply (fd-apply '(1 2 3)))
+(check :fd-mapcar (fd-mapcar '(1 2)))
+(check :fd-reduce (fd-reduce '(1 2 3)))
+(check :fd-struct-set
+       (let ((p (make-fd-pt :x 0 :y 0)))
+         (dotimes (i 30) (fd-struct-set p))
+         (list (fd-struct-set p) (fd-pt-x p))))
+(check :fd-redefined
+       (let ((before (fd-caller 1)))
+         (setf (symbol-function 'fd-target) (lambda (x) (list :new x)))
+         (list before (fd-caller 2))))
+
 ;;; ── epilogue: checksum + completion sentinel ───────────────────────────
 
 (note :checksum *hash*)

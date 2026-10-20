@@ -4,10 +4,6 @@
 use std::process::Command;
 
 fn check(program: &str, expected: &[&str]) {
-    check_t2_tier(program, expected, 2);
-}
-
-fn check_t2_tier(program: &str, expected: &[&str], linux_t2_tier: u8) {
     for (tier, native, installed) in [
         ("interp", "0", 0),
         ("t0", "0", 0),
@@ -30,15 +26,6 @@ fn check_t2_tier(program: &str, expected: &[&str], linux_t2_tier: u8) {
             .expect("run callable binding regression");
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
-        let installed = if tier == "t2" && cfg!(all(target_arch = "x86_64", target_os = "linux")) {
-            linux_t2_tier
-        } else {
-            installed
-        };
-        if tier == "t2" && installed == 1 {
-            assert!(stdout.contains("Mapped native transfer ABI — installed native code."),
-                "the writer must retain genuine mapped T1: {stdout}\n{stderr}");
-        }
         let tier_line = format!("TIER {installed}");
         assert!(
             out.status.success()
@@ -167,9 +154,9 @@ fn literal_memory_fence_observes_replaced_function() {
 
 #[test]
 fn class_writer_preserves_replacement_and_argument_order() {
-    // SETF lowers through LoadFunction: mapped T1 supports the exact callable
-    // lookup, while ordinary mapped T2 admission remains tracked by bliss-j3fv8.
-    check_t2_tier(
+    // SETF lowers through LoadFunction, which mapped T2 admits with the same
+    // exact callable lookup as mapped T1 (bliss-j3fv8).
+    check(
         r#"
       (defclass probe () ((value :initform 7 :accessor probe-accessor)))
       (defparameter *object* (make-instance 'probe))
@@ -191,7 +178,6 @@ fn class_writer_preserves_replacement_and_argument_order() {
             "WRITER (220 :WRITER)",
             "EFFECTS (:REPLACEMENT :VALUE :OBJECT) SLOT 7",
         ],
-        1,
     );
 }
 

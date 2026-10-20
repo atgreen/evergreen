@@ -79,6 +79,12 @@
   interpreter for good. Its failed fixnum guesses now recompile it from the
   types seen since, so it stays native and can reach T2
   ([#459](https://github.com/atgreen/evergreen/pull/459)).
+- On x86-64 Linux, a hot function that names another with `#'f` -- such as
+  `(apply #'+ l)`, `(mapcar #'1+ l)`, `(funcall #'f x)`, or a `SETF` of a
+  structure or class accessor -- is now compiled by the optimizing T2 tier
+  instead of stopping at T1. It still looks the function up on every call, so
+  redefining it takes effect as before
+  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
 
 ### Fixed
 

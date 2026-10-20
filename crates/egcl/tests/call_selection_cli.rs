@@ -102,17 +102,13 @@ fn unbinding_during_arguments_keeps_selected_capture_alive() {
 
 #[test]
 fn explicit_function_object_is_selected_before_later_arguments() {
-    // LoadFunction currently retains mapped T1 on Linux when T2 is requested.
-    let expected_t2 = if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
-        1
-    } else {
-        2
-    };
+    // LoadFunction reaches mapped T2 on Linux; the callable stays the one
+    // selected before the arguments redefine it (bliss-j3fv8).
     check_selection(
         "funcall #'selection-target",
         "(setf (symbol-function 'selection-target) *new-target*)",
         &["RESULT ((:OLD :OLD-CAPTURE 99 101) :OLD-MV)"],
-        expected_t2,
+        2,
     );
 }
 
