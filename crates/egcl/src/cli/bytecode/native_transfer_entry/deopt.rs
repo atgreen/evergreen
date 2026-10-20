@@ -91,9 +91,7 @@ fn note_segment_deopt(code: &TransferCode) {
         decay_failed_speculation(
             &code.body,
             None,
-            code.deopt_metadata
-                .as_ref()
-                .map(|m| m.speculations.as_slice()),
+            code.deopt_metadata.as_deref(),
         );
     }
     // Recompile only this cached version. Resumed T0 samples the retained
@@ -518,6 +516,7 @@ mod retained_guard_chain_tests {
         build::legalize_transfer_calls(&mut baseline, &scopes).unwrap();
         let metadata = Arc::new(T2InstalledMetadata {
             speculations: Vec::new(),
+            cold_guesses: Vec::new(),
             _roots: egcl_rt::CrossThreadRoot::new(T2InstalledBodies { bodies: vec![Arc::clone(&body)] }),
             deopt_bodies: [(symbol, Arc::clone(&body))].into_iter().collect(),
         });
@@ -704,6 +703,7 @@ mod retained_guard_chain_tests {
         build::legalize_transfer_calls(&mut baseline, &scopes).unwrap();
         let metadata = Arc::new(T2InstalledMetadata {
             speculations: Vec::new(),
+            cold_guesses: Vec::new(),
             _roots: egcl_rt::CrossThreadRoot::new(T2InstalledBodies { bodies: vec![Arc::clone(&body)] }),
             deopt_bodies: [(symbol, Arc::clone(&body))].into_iter().collect(),
         });
@@ -1928,6 +1928,7 @@ mod tests {
         egcl_compiler::t2::verify::verify(&ir).unwrap();
         let metadata = Arc::new(T2InstalledMetadata {
             speculations: vec![],
+            cold_guesses: Vec::new(),
             _roots: egcl_rt::CrossThreadRoot::new(T2InstalledBodies {
                 bodies: vec![Arc::clone(&body)],
             }),

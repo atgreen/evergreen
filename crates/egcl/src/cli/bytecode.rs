@@ -19646,7 +19646,9 @@ static PROMOTED_FRESH: egcl_rt::execution_local::ExecutionLocal<
 /// Per-site speculation types invalidated by the current native version's
 /// first deopt. Used to distinguish a supported numeric phase change from
 /// repeatedly failing the same specialization (for example, fixnum overflow).
-type FailedSpeculations = HashMap<u32, Vec<(u32, SpecType)>>;
+/// The flag marks a cold guess: the site had no profile when compiled, so
+/// its speculation was the optimistic fixnum default rather than evidence.
+type FailedSpeculations = HashMap<u32, Vec<(u32, SpecType, bool)>>;
 static LAST_FAILED_SPECULATION: egcl_rt::execution_local::ExecutionLocal<
     RefCell<FailedSpeculations>,
 > = unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(HashMap::new())) };
@@ -19660,13 +19662,13 @@ static LAST_FAILED_SPECULATION: egcl_rt::execution_local::ExecutionLocal<
 fn decay_failed_speculation(
     body: &Arc<BytecodeFunction>,
     forced: Option<SpecType>,
-    installed: Option<&[(u32, SpecType)]>,
-) -> Vec<(u32, SpecType)> {
+    installed: Option<&T2InstalledMetadata>,
+) -> Vec<(u32, SpecType, bool)> {
     if let Some(installed) = installed {
         let key = Arc::as_ptr(body) as usize;
         TYPE_PROFILE.with(|profiles| {
             let mut profiles = profiles.borrow_mut();
-            for &(bcp, kind) in installed {
+            for &(bcp, kind) in &installed.speculations {
                 if let Some(profile) = profiles.get_mut(&(key, bcp)) {
                     match kind {
                         SpecType::Fixnum => profile.fixnum = 0,
@@ -19675,7 +19677,11 @@ fn decay_failed_speculation(
                 }
             }
         });
-        return installed.to_vec();
+        return installed
+            .speculations
+            .iter()
+            .map(|&(bcp, kind)| (bcp, kind, installed.cold_guesses.contains(&bcp)))
+            .collect();
     }
     let mut failed = Vec::new();
     let func_ptr = Arc::as_ptr(body) as usize;
@@ -19692,7 +19698,7 @@ fn decay_failed_speculation(
                 // Missing profiles compile with an optimistic Fixnum guess.
                 // Remember its failure without manufacturing observations: an
                 // existing all-zero profile instead compiles without speculation.
-                failed.push((bcp as u32, forced.unwrap_or(SpecType::Fixnum)));
+                failed.push((bcp as u32, forced.unwrap_or(SpecType::Fixnum), true));
                 continue;
             };
             let spec = forced.or_else(|| p.speculation());
@@ -19701,7 +19707,7 @@ fn decay_failed_speculation(
                     SpecType::Fixnum => p.fixnum = 0,
                     SpecType::SingleFloat => p.single_float = 0,
                 }
-                failed.push((bcp as u32, spec));
+                failed.push((bcp as u32, spec, false));
             }
         }
     });
@@ -19711,6 +19717,12 @@ fn decay_failed_speculation(
 /// True when a guarded site changes to another supported numeric phase,
 /// including bignums that require generic arithmetic. This invalidates the old
 /// version; it does not show that native execution is unprofitable.
+///
+/// A disproved cold guess is also a phase change, whatever the site now sees
+/// (double floats included): the guess was made without evidence, so it says
+/// nothing about whether native code pays off. Recompiling reads the profile
+/// gathered since, so the site is no longer cold, and a second failure there
+/// falls under the strict rule and blacklists as before (bliss-fenm).
 fn supported_numeric_phase_change(sym: u32) -> bool {
     let failed = LAST_FAILED_SPECULATION.with(|m| m.borrow().get(&sym).cloned());
     let Some(failed) = failed else { return false };
@@ -19718,15 +19730,23 @@ fn supported_numeric_phase_change(sym: u32) -> bool {
         return false;
     };
     let func_ptr = Arc::as_ptr(&body) as usize;
-    failed.into_iter().any(|(bcp, old)| {
-        type_profile_at(func_ptr, bcp).is_some_and(|profile| {
-            profile.other == 0
-                && match old {
-                    SpecType::Fixnum => profile.single_float > 0 || profile.bignum > 0,
-                    SpecType::SingleFloat => profile.fixnum > 0 || profile.bignum > 0,
-                }
-        })
+    failed.into_iter().any(|(bcp, old, cold)| {
+        type_profile_at(func_ptr, bcp)
+            .is_some_and(|profile| failed_site_changed_phase(&profile, old, cold))
     })
+}
+
+/// Whether one failed speculation `old` at a site now profiled as `profile`
+/// marks a phase change (see `supported_numeric_phase_change`).
+fn failed_site_changed_phase(profile: &TypeProfile, old: SpecType, cold: bool) -> bool {
+    if cold && profile.total() > 0 && profile.speculation() != Some(old) {
+        return true;
+    }
+    profile.other == 0
+        && match old {
+            SpecType::Fixnum => profile.single_float > 0 || profile.bignum > 0,
+            SpecType::SingleFloat => profile.fixnum > 0 || profile.bignum > 0,
+        }
 }
 
 /// Record the operand types seen at call site `(func_ptr, bcp)`.
@@ -20255,6 +20275,9 @@ impl egcl_rt::gc::TraceHostRoots for T2CompileInput {
 /// handle separately protects the movable constants inside the indexed bodies.
 struct T2InstalledMetadata {
     speculations: Vec<(u32, SpecType)>,
+    /// Bytecode sites whose speculation was the optimistic guess for a site
+    /// with no profile when this version was compiled.
+    cold_guesses: Vec<u32>,
     _roots: egcl_rt::CrossThreadRoot<T2InstalledBodies>,
     deopt_bodies: HashMap<u32, Arc<BytecodeFunction>>,
 }
@@ -20285,6 +20308,7 @@ struct T2Artifact {
     mapped: Option<native_transfer_entry::PreparedT2>,
     checked: Option<CheckedT2Artifact>,
     speculations: Vec<(u32, SpecType)>,
+    cold_guesses: Vec<u32>,
     call_cells: Vec<Arc<egcl_rt::call_table::CallCell>>,
     rooted_bodies: Vec<Arc<BytecodeFunction>>,
     deopt_bodies: HashMap<u32, Arc<BytecodeFunction>>,
@@ -21128,6 +21152,7 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
     } else {
         Some(Arc::new(T2InstalledMetadata {
             speculations: std::mem::take(&mut artifact.speculations),
+            cold_guesses: std::mem::take(&mut artifact.cold_guesses),
             _roots: egcl_rt::CrossThreadRoot::new(T2InstalledBodies {
                 bodies: std::mem::take(&mut artifact.rooted_bodies),
             }),
@@ -21416,8 +21441,7 @@ fn note_native_deopt(sym: u32, code: Option<&NativeCode>) {
     let Some(code) = code else { return; };
     let bf = code.body.as_ref();
     let is_t2 = code.is_t2;
-    let speculations = code.t2_metadata.as_ref()
-        .map(|metadata| metadata.speculations.as_slice());
+    let metadata = code.t2_metadata.as_deref();
     let owner = bf.and_then(|body| CLOSURE_COMPILATION.with(|cache| {
         cache.borrow().get(&(Arc::as_ptr(body) as usize)).map(|state| state.owner)
     })).unwrap_or(sym);
@@ -21454,7 +21478,7 @@ fn note_native_deopt(sym: u32, code: Option<&NativeCode>) {
                 // T1's optimistic arithmetic templates are always Fixnum. T2
                 // follows the profile that was dominant when it was compiled.
                 let forced = (!is_t2).then_some(SpecType::Fixnum);
-                let failed = decay_failed_speculation(bf, forced, speculations);
+                let failed = decay_failed_speculation(bf, forced, metadata);
                 LAST_FAILED_SPECULATION.with(|m| {
                     m.borrow_mut().insert(sym, failed);
                 });
@@ -23840,6 +23864,8 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     // (no samples — e.g. a branch not taken during the brief profiling window)
     // optimistically guesses fixnum: the guard makes it safe (a wrong guess just
     // deopts), and it stops one cold branch from declining the whole function.
+    // Cold sites are remembered so a disproved guess recompiles, not blacklists.
+    let cold_guesses = RefCell::new(Vec::new());
     let profile = |bcp: u32| -> Option<egcl_compiler::t2::speculate::SpecType> {
         use egcl_compiler::t2::speculate::SpecType as Bc;
         match input.type_profiles.get(&bcp).copied() {
@@ -23847,7 +23873,14 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
                 SpecType::Fixnum => Bc::Fixnum,
                 SpecType::SingleFloat => Bc::SingleFloat,
             }),
-            None => Some(Bc::Fixnum), // cold: optimistic, guarded fixnum guess
+            None => {
+                // cold: optimistic, guarded fixnum guess
+                let mut cold = cold_guesses.borrow_mut();
+                if !cold.contains(&bcp) {
+                    cold.push(bcp);
+                }
+                Some(Bc::Fixnum)
+            }
         }
     };
 
@@ -24032,6 +24065,7 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
         mapped,
         checked,
         speculations,
+        cold_guesses: cold_guesses.into_inner(),
         call_cells: input
             .call_cells
             .iter()
@@ -26480,11 +26514,29 @@ mod jtc4_stack_map_tests {
         let empty = type_profile_at(key, 1).unwrap();
         let observed = type_profile_at(key, 2).unwrap();
         clear_bytecode_profiles(key);
-        assert_eq!(failed, vec![(0, SpecType::Fixnum), (2, SpecType::Fixnum)]);
+        assert_eq!(failed, vec![(0, SpecType::Fixnum, true), (2, SpecType::Fixnum, false)]);
         assert!(cold.is_none(), "failed cold guesses must not fabricate observations");
         assert_eq!(empty.total(), 0);
         assert_eq!(observed.fixnum, 0);
         assert_eq!(observed.single_float, 2, "retain the new phase's samples");
+    }
+
+    #[test]
+    fn disproved_cold_guess_is_a_phase_change_but_profiled_failure_is_not() {
+        let doubles = TypeProfile { other: 13, ..TypeProfile::default() };
+        // A cold fixnum guess later seeing double floats recompiles (bliss-fenm).
+        assert!(failed_site_changed_phase(&doubles, SpecType::Fixnum, true));
+        // The same observation against a profiled speculation stays unsupported.
+        assert!(!failed_site_changed_phase(&doubles, SpecType::Fixnum, false));
+        // A cold site that has since seen only fixnums confirmed the guess:
+        // its failures are overflow, not a new phase.
+        let fixnums = TypeProfile { fixnum: 13, ..TypeProfile::default() };
+        assert!(!failed_site_changed_phase(&fixnums, SpecType::Fixnum, true));
+        // No samples yet is no evidence either way.
+        assert!(!failed_site_changed_phase(&TypeProfile::default(), SpecType::Fixnum, true));
+        // The existing numeric rule is unchanged for profiled sites.
+        let floats = TypeProfile { single_float: 5, ..TypeProfile::default() };
+        assert!(failed_site_changed_phase(&floats, SpecType::Fixnum, false));
     }
 
     #[test]

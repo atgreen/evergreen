@@ -9,6 +9,7 @@ fn deopt_scope_count_is_bounded_before_allocation() {
     let _lock = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
     let metadata = Arc::new(T2InstalledMetadata {
         speculations: Vec::new(),
+        cold_guesses: Vec::new(),
         _roots: egcl_rt::CrossThreadRoot::new(T2InstalledBodies { bodies: Vec::new() }),
         deopt_bodies: Default::default(),
     });
@@ -53,6 +54,7 @@ fn deopt_outer_frame_has_room_for_the_resumed_body() {
     assert_eq!(body.max_stack, 1);
     let metadata = Arc::new(T2InstalledMetadata {
         speculations: Vec::new(),
+        cold_guesses: Vec::new(),
         _roots: egcl_rt::CrossThreadRoot::new(T2InstalledBodies {
             bodies: vec![Arc::clone(&body)],
         }),
@@ -136,6 +138,7 @@ fn deopt_scope_chain_matches_call_continuations() {
     assert_eq!(depths[4], Some(2), "its successor is reachable by the branch");
     let metadata = Arc::new(T2InstalledMetadata {
         speculations: Vec::new(),
+        cold_guesses: Vec::new(),
         _roots: egcl_rt::CrossThreadRoot::new(T2InstalledBodies {
             bodies: vec![Arc::clone(&parent), Arc::clone(&child), Arc::clone(&skipped)],
         }),
@@ -222,6 +225,7 @@ fn deopt_scope_headers_match_retained_bodies() {
         .expect("fixture must have a suspended call") as u64 + 1;
     let metadata = Arc::new(T2InstalledMetadata {
         speculations: Vec::new(),
+        cold_guesses: Vec::new(),
         _roots: egcl_rt::CrossThreadRoot::new(T2InstalledBodies {
             bodies: vec![Arc::clone(&body)],
         }),
@@ -285,6 +289,7 @@ fn malformed_inner_deopt_scope_preserves_outer_frame() {
     assert_eq!(body.n_locals, 1);
     let metadata = Arc::new(T2InstalledMetadata {
         speculations: Vec::new(),
+        cold_guesses: Vec::new(),
         _roots: egcl_rt::CrossThreadRoot::new(T2InstalledBodies {
             bodies: vec![Arc::clone(&body)],
         }),
@@ -472,6 +477,7 @@ fn deopt_resume_keeps_original_callable_heat() {
     registry_put(symbol, Arc::clone(&body));
     let metadata = Arc::new(T2InstalledMetadata {
         speculations: Vec::new(),
+        cold_guesses: Vec::new(),
         _roots: egcl_rt::CrossThreadRoot::new(T2InstalledBodies {
             bodies: vec![Arc::clone(&body)],
         }),

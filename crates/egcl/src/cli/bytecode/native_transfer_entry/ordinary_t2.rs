@@ -85,6 +85,7 @@ pub(in crate::cli::bytecode) fn install_ordinary_t2(
     deopt_bodies.insert(symbol, Arc::clone(body));
     let metadata = Arc::new(T2InstalledMetadata {
         speculations: artifact.speculations.clone(),
+        cold_guesses: artifact.cold_guesses.clone(),
         _roots: egcl_rt::CrossThreadRoot::new(T2InstalledBodies { bodies: owners }),
         deopt_bodies,
     });

@@ -67,6 +67,12 @@
   the optimizing T2 tier. Guard elimination left their IR failing verification,
   so such loops stayed at T1
   ([#458](https://github.com/atgreen/evergreen/pull/458)).
+- A function whose arithmetic first runs natively on a path it had not yet
+  taken, for example double-float code compiled before it was profiled or a
+  branch first reached with double floats, no longer drops back to the
+  interpreter for good. Its failed fixnum guesses now recompile it from the
+  types seen since, so it stays native and can reach T2
+  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
 
 ### Fixed
 

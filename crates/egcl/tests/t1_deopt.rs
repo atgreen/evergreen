@@ -429,6 +429,124 @@ fn repeated_deopts_blacklist_and_back_off_to_t0() {
     );
 }
 
+/// Run `program` and return its first stdout line plus all of stderr, for
+/// tests that read the `EGCL_T2_LOG=stderr` tier trace.
+fn eval_traced(program: &str, envs: &[(&str, &str)]) -> (String, String) {
+    let mut cmd = Command::new(BIN);
+    cmd.args(["--eval", program]);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("spawn egcl");
+    let stdout = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .to_string();
+    (stdout, String::from_utf8_lossy(&out.stderr).into_owned())
+}
+
+/// bliss-fenm: with T1 promotion before the first profiled call, every
+/// arithmetic site of a double-float function compiles to the cold fixnum
+/// guess and deopts. A disproved cold guess is a phase change, not evidence
+/// that native code is unprofitable: the function recompiles from the profile
+/// gathered since and reaches T2, rather than being blacklisted to T0.
+#[test]
+fn disproved_cold_double_guess_recompiles_to_t2() {
+    let program = "\
+        (defun s-double (a b) (declare (double-float a b)) (+ (* a b) 1d0)) \
+        (dotimes (i 200) (s-double 1.5d0 2d0)) \
+        (format t \"~a ~a~%\" (egcl-ext:function-tier (quote s-double)) \
+                (s-double 1.5d0 2d0))";
+    let (out, trace) = eval_traced(
+        program,
+        &[
+            ("EGCL_T0_T1_THRESHOLD", "5"),
+            ("EGCL_T2_THRESHOLD", "20"),
+            ("EGCL_T2_LOG", "stderr"),
+        ],
+    );
+    assert!(
+        !trace
+            .lines()
+            .any(|line| line.contains("::S-DOUBLE: native guard") && line.contains("blacklist")),
+        "a disproved cold guess must not blacklist:\n{trace}"
+    );
+    assert!(
+        trace
+            .lines()
+            .any(|line| line.contains("::S-DOUBLE: native guard")
+                && line.contains("supported numeric phase change => generic T1 + recompile")),
+        "the cold-guess failure recompiles:\n{trace}"
+    );
+    assert!(
+        trace.contains("S-DOUBLE: optimized worker result installed"),
+        "S-DOUBLE reaches T2:\n{trace}"
+    );
+    let fields: Vec<&str> = out.split_whitespace().collect();
+    assert_eq!(
+        fields.first().copied(),
+        Some("2"),
+        "S-DOUBLE is at T2: {out:?}"
+    );
+    let tw = eval(
+        "(defun s-double (a b) (declare (double-float a b)) (+ (* a b) 1d0)) \
+         (format t \"~a~%\" (s-double 1.5d0 2d0))",
+        &[("EGCL_BACKEND", "tree-walker")],
+    );
+    assert_eq!(tw, "4.0d0", "sanity: interpreter result");
+    assert_eq!(
+        fields.get(1).copied(),
+        Some(tw.as_str()),
+        "T2 matches interpretation"
+    );
+}
+
+/// bliss-fenm at default thresholds: a branch not taken while the function
+/// warmed up has no profile, so T1 guesses fixnum there. When the program
+/// later takes it with double floats, the guess fails; that recompiles the
+/// function rather than blacklisting it, and it stays native.
+#[test]
+fn cold_branch_double_recompiles_instead_of_blacklisting() {
+    let program = "\
+        (defun br (flag x) (if flag (+ x 1) (+ x 1d0))) \
+        (dotimes (i 50) (br t 1)) \
+        (dotimes (i 200) (br nil 2d0)) \
+        (format t \"~a ~a~%\" (egcl-ext:function-tier (quote br)) (br nil 2d0))";
+    let (out, trace) = eval_traced(
+        program,
+        &[
+            ("EGCL_DEOPT_BLACKLIST_THRESHOLD", "3"),
+            ("EGCL_T2_LOG", "stderr"),
+        ],
+    );
+    assert!(
+        trace.contains("::BR: native guard deopt #3 => resuming interpreted (threshold hit: supported numeric phase change"),
+        "the cold-branch failure recompiles:\n{trace}"
+    );
+    assert!(
+        !trace
+            .lines()
+            .any(|line| line.contains("::BR: native guard") && line.contains("blacklist")),
+        "BR must not be blacklisted:\n{trace}"
+    );
+    let fields: Vec<&str> = out.split_whitespace().collect();
+    assert!(
+        fields.first().is_some_and(|tier| *tier != "0"),
+        "BR stays native: {out:?}"
+    );
+    let tw = eval(
+        "(defun br (flag x) (if flag (+ x 1) (+ x 1d0))) (format t \"~a~%\" (br nil 2d0))",
+        &[("EGCL_BACKEND", "tree-walker")],
+    );
+    assert_eq!(tw, "3.0d0", "sanity: interpreter result");
+    assert_eq!(
+        fields.get(1).copied(),
+        Some(tw.as_str()),
+        "result matches interpretation"
+    );
+}
+
 /// Blacklisting is not triggered by a pure fixnum hot loop: it never deopts, so
 /// it stays at T1 indefinitely (bliss-jtc.27 — backoff only punishes functions
 /// whose speculation actually fails).
