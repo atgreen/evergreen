@@ -45,6 +45,12 @@
   running the writer method's body: about 12 us per write instead of 61 us.
   A value of the wrong type still signals the correctable `TYPE-ERROR`
   ([#452](https://github.com/atgreen/evergreen/pull/452)).
+- `MAKE-ARRAY` of a plain vector -- a fixnum length, at most
+  `:ELEMENT-TYPE` and either `:INITIAL-ELEMENT` or `:INITIAL-CONTENTS`, and
+  an element type that upgrades to T -- is built natively instead of through
+  the full option parsing: `(make-array 16)` takes about 12 us instead of
+  31 us, and a four-element vector from a list about 17 us instead of 88 us
+  ([#454](https://github.com/atgreen/evergreen/pull/454)).
 - `FLOOR`, `CEILING`, `TRUNCATE`, `ROUND`, `MOD` and `REM` on bignums divide
   once instead of going through exact rational arithmetic, which reduced
   `a/b` with a gcd first. A `MOD` of a 4096-bit number by a 2048-bit one is
