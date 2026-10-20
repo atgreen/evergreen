@@ -503,11 +503,10 @@
      nil))
 
 (defun egcl::%checked-structure-slot-value (value object slot)
-  ;; An inherited writer must honor the actual structure's narrowed type.
-  (let ((typespec (getf (get (class-name (class-of object))
-                            'egcl::%struct-slot-types)
-                       slot t)))
-    (if (typep value typespec)
+  ;; An inherited writer must honor the actual structure's narrowed type, so
+  ;; the type comes from OBJECT's own class, looked up natively.
+  (let ((typespec (egcl::%struct-slot-typespec object slot)))
+    (if (or (eq typespec t) (typep value typespec))
         value
         (%check-type-fail value typespec))))
 

@@ -1088,6 +1088,19 @@ fn resolve(name: &str) -> Option<Handler> {
             )?
             .unwrap_or(T))
         }),
+        // The declared type of SLOT in OBJECT's own structure class, or T.
+        // Boot's %CHECKED-STRUCTURE-SLOT-VALUE checks a typed structure's writer
+        // values against it; from interpreted code CLASS-OF, CLASS-NAME, GET and
+        // GETF each cost several microseconds, on every slot write.
+        "EGCL::%STRUCT-SLOT-TYPESPEC" => Some(|_operator, args, env| {
+            env.clear_mv();
+            let [object, slot] = args else {
+                return Err(EgclError::ProgramError(
+                    "%STRUCT-SLOT-TYPESPEC takes two arguments".into(),
+                ));
+            };
+            Ok(struct_slot_typespec(*object, *slot))
+        }),
         "EGCL::%POSIX" => Some(|_operator, args, env| {
             if env.sandbox {
                 return Err(EgclError::SandboxViolation("POSIX access denied".into()));
