@@ -240,6 +240,31 @@
          (dotimes (i 70 s)
            (setq s (* s 2))))) ; crosses the fixnum boundary mid-loop
 
+;;; LOOP steps through an (if first i (+ i 1)) merge (bliss-fva34); g-merge is
+;;; the same shape by hand.  Warm, then break the fixnum bound and overflow.
+(defun loop-collect-squares (n) (loop for i below n collect (* i i)))
+(defun loop-from-above (lo)
+  (loop for i from lo below (+ lo 5) collect (- i most-positive-fixnum)))
+(defun g-merge (n)
+  (let ((i 0) (s 0) (first t))
+    (tagbody
+     top
+       (setq i (if first i (+ i 1)))
+       (when (>= i n) (go end))
+       (setq s (+ s 1))
+       (setq first nil)
+       (go top)
+     end)
+    s))
+
+(dotimes (i 40)
+  (loop-collect-squares 6) (g-merge 9) (loop-from-above (- most-positive-fixnum 30)))
+(check :loop-collect-squares (loop-collect-squares 6))
+(check :loop-collect-float (loop-collect-squares 2.5))
+(check :g-merge (g-merge 9))
+(check :g-merge-float (g-merge 4.5))
+(check :loop-overflow (loop-from-above (- most-positive-fixnum 2)))
+
 ;;; ── CLOS dispatch ──────────────────────────────────────────────────────
 
 (defclass shape () ((name :initarg :name :accessor shape-name)))
