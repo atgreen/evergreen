@@ -29,6 +29,11 @@
   a 121-certificate CA bundle with pure-tls drops from 20 s to about 14 s,
   and zeroing a 1 KB octet buffer with `FILL` from 4.4 ms to 28 us
   ([#450](https://github.com/atgreen/evergreen/pull/450)).
+- Writing a slot of a structure that has typed slots stores through the
+  accessor fast path once the value satisfies the slot's type, instead of
+  running the writer method's body: about 12 us per write instead of 61 us.
+  A value of the wrong type still signals the correctable `TYPE-ERROR`
+  ([#452](https://github.com/atgreen/evergreen/pull/452)).
 - `FLOOR`, `CEILING`, `TRUNCATE`, `ROUND`, `MOD` and `REM` on bignums divide
   once instead of going through exact rational arithmetic, which reduced
   `a/b` with a gcd first. A `MOD` of a 4096-bit number by a 2048-bit one is
