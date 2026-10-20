@@ -64,10 +64,10 @@
 //!
 //! # Runtime calls and GC roots
 //!
-//! `Call`, `SymbolValue`, `SymbolFunction`, `SetSymbolValue`, `ClearMv` and
-//! `TakeValuesToLocals` go through the C-ABI adapters in [`RuntimeCalls`]. A
-//! `Call` whose callee resolves to a leaf builtin at compile time uses the
-//! direct slice adapter from the runtime's direct-builtin hooks instead, with
+//! `Call`, `SymbolValue`, `SymbolFunction`, `SetSymbolValue`, `ClearMv`,
+//! `TakeValuesToLocals`, `EnvironmentValue` and `SetEnvironmentValue` go
+//! through the C-ABI adapters in [`RuntimeCalls`]. A `Call` whose callee
+//! resolves to a leaf builtin at compile time uses the direct slice adapter from the runtime's direct-builtin hooks instead, with
 //! the table slot and invalidation generation baked in (bliss-flzmi). The
 //! collector moves objects and cannot see a home register or native spill
 //! slot, so `runtime_call` clears every shadow slot to NIL, writes each live
@@ -130,7 +130,11 @@
 //! value, where a negative `Shl` constant is a right shift and a left shift
 //! deopts if the value does not survive the round trip (bliss-2yews). `GenericEq`
 //! (EQ, and NULL/NOT via EQ against NIL) is a tagged-word compare selecting
-//! T/NIL (bliss-pig52). `TypeCheck` answers the fixnum, symbol, integer,
+//! T/NIL (bliss-pig52). `EnvironmentValue` and `SetEnvironmentValue` read and
+//! write a captured lexical through the runtime's name-indexed adapters, so a
+//! closure over an outer variable no longer costs its whole body T2 -- the
+//! only emitter decline the tier-differential corpus still reported here.
+//! `TypeCheck` answers the fixnum, symbol, integer,
 //! simple-string, package, hash-table, NULL and BOOLEAN predicates inline
 //! from the tag and the header's type-id byte, declining exactly the cases
 //! emit.rs declines (bliss-nlpd4). Everything
@@ -196,6 +200,11 @@ pub struct RuntimeCalls {
     /// when it was entered by a direct native call, and knows whether the
     /// activation owns the frame at fp; 0 means "the active code".
     pub code_id: u64,
+    /// Captured-lexical access: the retained name metadata of the root body
+    /// plus its load/store adapters. A zero `body` declines
+    /// `EnvironmentValue`/`SetEnvironmentValue`, so a closure that reads a
+    /// captured variable stays at its current tier.
+    pub environment: super::emit::EnvironmentCalls,
 }
 
 fn calls_runtime(opcode: Opcode) -> bool {
@@ -207,6 +216,8 @@ fn calls_runtime(opcode: Opcode) -> bool {
             | Opcode::SetSymbolValue
             | Opcode::ClearMv
             | Opcode::TakeValuesToLocals
+            | Opcode::EnvironmentValue
+            | Opcode::SetEnvironmentValue
     )
 }
 
@@ -497,6 +508,30 @@ impl Emitter<'_> {
                         Opcode::SymbolValue => self.runtime.load_global,
                         Opcode::SymbolFunction => self.runtime.load_function,
                         _ => self.runtime.store_global,
+                    }
+                }
+                Opcode::EnvironmentValue | Opcode::SetEnvironmentValue => {
+                    // `(body, name_index) -> value` and
+                    // `(body, name_index, value)`: the same C signatures the
+                    // x86 framed emitter calls. The stored value is staged in
+                    // r4 first, because materialising the body address and the
+                    // index writes r1, r2 and r3.
+                    let AuxData::EnvironmentName(index) = data.aux else {
+                        return Err(unsupported!());
+                    };
+                    let store = data.opcode == Opcode::SetEnvironmentValue;
+                    if self.runtime.environment.body == 0 {
+                        return Err(EmitError::UnsupportedOp(super::emit::op_tag(data.opcode)));
+                    }
+                    if store {
+                        self.load(*data.args.first().ok_or(unsupported!())?, 4)?;
+                    }
+                    self.asm.imm64(2, self.runtime.environment.body);
+                    self.asm.imm64(3, u64::from(index));
+                    if store {
+                        self.runtime.environment.store
+                    } else {
+                        self.runtime.environment.load
                     }
                 }
                 Opcode::ClearMv => {
@@ -2089,6 +2124,133 @@ mod tests {
                     if return_original { 0x5001 } else { 0x9001 }
                 );
                 FRAME.with(|frame| frame.set((std::ptr::null_mut(), 0)));
+            }
+        }
+    }
+
+    #[test]
+    fn environment_access_goes_through_the_rooted_name_indexed_adapters() {
+        // A captured-lexical read or write is an ordinary rooted runtime call:
+        // the adapters receive `(body, name_index)` and
+        // `(body, name_index, value)`, and every live tagged value is
+        // republished from its shadow slot afterwards, because the helper may
+        // intern a symbol and move the nursery (bliss: emit.rs does the same).
+        const BODY: u64 = 0x5eed_0000;
+        thread_local! {
+            static STORED: std::cell::Cell<(u64, u64, u64)> =
+                const { std::cell::Cell::new((0, 0, 0)) };
+            static FRAME: std::cell::Cell<(*mut u64, usize)> =
+                const { std::cell::Cell::new((std::ptr::null_mut(), 0)) };
+        }
+        extern "C" fn load_env(body: u64, index: u64) -> u64 {
+            FRAME.with(|frame| {
+                let (pointer, count) = frame.get();
+                // Simulate a moving collector updating every scanned slot.
+                for slot in unsafe { std::slice::from_raw_parts_mut(pointer, count) } {
+                    if *slot == 0x4001 {
+                        *slot = 0x5001;
+                    }
+                }
+            });
+            assert_eq!((body, index), (BODY, 7));
+            0x9001
+        }
+        extern "C" fn store_env(body: u64, index: u64, value: u64) {
+            STORED.with(|stored| stored.set((body, index, value)));
+        }
+
+        fn captured_body(return_loaded: bool) -> Function {
+            let mut f = Function::new("z-environment");
+            let block = f.entry();
+            let stored = f.add_block_param(block, IRType::TOP, ValueRepresentation::Tagged);
+            let survivor = f.add_block_param(block, IRType::TOP, ValueRepresentation::Tagged);
+            let call = |opcode, args, aux| InstData {
+                opcode,
+                args,
+                results: vec![],
+                aux,
+                flags: InstFlags {
+                    call: true,
+                    safepoint: true,
+                    effectful: true,
+                    ..Default::default()
+                },
+                targets: vec![],
+                frame_state: None,
+                source_pos: 0,
+            };
+            f.push_inst(
+                block,
+                call(
+                    Opcode::SetEnvironmentValue,
+                    vec![stored],
+                    AuxData::EnvironmentName(3),
+                ),
+                &[],
+            );
+            let (_, loaded) = f.push_inst(
+                block,
+                call(Opcode::EnvironmentValue, vec![], AuxData::EnvironmentName(7)),
+                &[(IRType::TOP, ValueRepresentation::Tagged)],
+            );
+            f.set_terminator(
+                block,
+                InstData {
+                    opcode: Opcode::Return,
+                    args: vec![if return_loaded { loaded[0] } else { survivor }],
+                    results: vec![],
+                    aux: AuxData::None,
+                    flags: InstFlags::default(),
+                    targets: vec![],
+                    frame_state: None,
+                    source_pos: 0,
+                },
+            );
+            f
+        }
+
+        // Without the adapters the opcode is still refused by name, so the
+        // function keeps its current tier instead of emitting a wild call.
+        assert!(matches!(
+            emit_framed_with_runtime(&captured_body(true), 0, 2, RuntimeCalls::default()),
+            Err(EmitError::UnsupportedOp(_))
+        ));
+
+        for return_loaded in [true, false] {
+            let runtime = RuntimeCalls {
+                environment: crate::t2::emit::EnvironmentCalls {
+                    body: BODY,
+                    load: load_env as *const () as u64,
+                    store: store_env as *const () as u64,
+                },
+                ..Default::default()
+            };
+            let compiled =
+                emit_framed_with_runtime(&captured_body(return_loaded), 0, 2, runtime).unwrap();
+            // Both accesses are safepoints that publish the live tagged
+            // values; the survivor is the one that outlives the load.
+            assert_eq!(compiled.emitted_safepoints, 2);
+            assert_eq!(compiled.root_sync_sites.len(), 2);
+            assert_eq!(
+                compiled.root_sync_sites[1].live_roots,
+                u16::from(!return_loaded)
+            );
+            assert!(compiled.shadow_root_slots >= 1);
+            #[cfg(all(target_arch = "s390x", unix))]
+            {
+                let code = egcl_rt::jit::JitBuffer::new(&compiled.code).unwrap();
+                // SAFETY: the buffer owns the generated C-ABI entry, and the
+                // activation includes every shadow slot advertised by it.
+                let entry: unsafe extern "C" fn(*mut u64) -> u64 =
+                    unsafe { std::mem::transmute(code.as_ptr()) };
+                let mut slots = vec![0x4001; 2 + compiled.shadow_root_slots as usize];
+                FRAME.with(|frame| frame.set((slots.as_mut_ptr(), slots.len())));
+                let result = unsafe { entry(slots.as_mut_ptr()) };
+                FRAME.with(|frame| frame.set((std::ptr::null_mut(), 0)));
+                // The store runs before the simulated collection, so it sees
+                // the pre-move word; the survivor comes back relocated.
+                assert_eq!(STORED.with(|stored| stored.get()), (BODY, 3, 0x4001));
+                assert_eq!(result, if return_loaded { 0x9001 } else { 0x5001 });
             }
         }
     }
