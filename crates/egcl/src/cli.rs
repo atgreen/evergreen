@@ -2436,12 +2436,23 @@ static METHOD_COMPILED: LazyLock<DefinitionTable<HashMap<u64, EgclVal>>> = LazyL
     ))
 });
 
+/// How the dispatch fast path may run a DEFCLASS-generated slot accessor. A
+/// typed structure's writer is `CheckedWrite`: its value must satisfy the slot's
+/// declared type in the instance's own class first (see
+/// [`struct_slot_typespec`]). In an image these are bytes 0, 1 and 2.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SlotAccess {
+    Read,
+    Write,
+    CheckedWrite,
+}
+
 /// The methods DEFCLASS generated for slot accessors, keyed by method identity:
-/// the slot's symbol index and whether the method is a writer. Read only when
+/// the slot's symbol index and how the method accesses it. Read only when
 /// the effective-method cache records a dispatch decision, so a call that
 /// selects one of these methods can read or store the slot directly
 /// (`try_single_primary_fast`) instead of running the method body.
-static ACCESSOR_METHODS: LazyLock<DefinitionTable<HashMap<u64, (u32, bool)>>> =
+static ACCESSOR_METHODS: LazyLock<DefinitionTable<HashMap<u64, (u32, SlotAccess)>>> =
     LazyLock::new(|| {
         DefinitionTable(OrderedMutex::new(
             LockLevel::GcWorld,
@@ -3794,10 +3805,14 @@ fn host_serialize_registries() -> Vec<u8> {
     {
         let accessors = ACCESSOR_METHODS.borrow();
         out.extend_from_slice(&(accessors.len() as u32).to_le_bytes());
-        for (&id, &(slot, writer)) in accessors.iter() {
+        for (&id, &(slot, access)) in accessors.iter() {
             out.extend_from_slice(&id.to_le_bytes());
             out.extend_from_slice(&slot.to_le_bytes());
-            out.push(u8::from(writer));
+            out.push(match access {
+                SlotAccess::Read => 0,
+                SlotAccess::Write => 1,
+                SlotAccess::CheckedWrite => 2,
+            });
         }
     }
     // The proclaimed specials (DEFVAR, DEFPARAMETER, DECLAIM SPECIAL). A
@@ -4431,9 +4446,14 @@ fn host_restore_registries(data: &[u8]) -> Result<(), EgclError> {
             let id = hr_get_u64(data, &mut off).ok_or_else(bad)?;
             let slot_bytes = data.get(off..off + 4).ok_or_else(bad)?;
             let slot = u32::from_le_bytes(slot_bytes.try_into().unwrap());
-            let writer = *data.get(off + 4).ok_or_else(bad)? != 0;
+            let access = match *data.get(off + 4).ok_or_else(bad)? {
+                0 => SlotAccess::Read,
+                1 => SlotAccess::Write,
+                2 => SlotAccess::CheckedWrite,
+                _ => return Err(bad()),
+            };
             off += 5;
-            accessor_methods.insert(id, (slot, writer));
+            accessor_methods.insert(id, (slot, access));
         }
     }
     *ACCESSOR_METHODS.borrow_mut() = accessor_methods;
@@ -8193,8 +8213,8 @@ struct GfEffective {
     primary: Vec<EgclVal>,
     after: Vec<EgclVal>,
     /// When the effective method is a single DEFCLASS-generated accessor:
-    /// its slot's symbol index and whether it writes. See ACCESSOR_METHODS.
-    accessor: Option<(u32, bool)>,
+    /// its slot's symbol index and how it accesses it. See ACCESSOR_METHODS.
+    accessor: Option<(u32, SlotAccess)>,
 }
 
 struct GfDispatchEntry {
@@ -8450,20 +8470,45 @@ fn try_single_primary_fast(
     // :AROUND/:BEFORE/:AFTER method or replacement method still takes over
     // (#202). An unbound, missing or class-allocated slot, or an obsolete
     // instance, falls through to the body for the full protocol.
-    if let Some((slot, writer)) = effective.accessor {
+    if let Some((slot, access)) = effective.accessor {
         let slot = EgclVal::from_symbol_index(slot);
-        if writer {
-            if args.len() == 2
-                && egcl_stdlib::set_slot_value_if_present(args[1], slot, args[0]).is_some()
-            {
-                env.clear_mv();
-                return Some(Ok(args[0]));
+        match access {
+            SlotAccess::Write if args.len() == 2 => {
+                if egcl_stdlib::set_slot_value_if_present(args[1], slot, args[0]).is_some() {
+                    env.clear_mv();
+                    return Some(Ok(args[0]));
+                }
             }
-        } else if args.len() == 1
-            && let Some(Ok(value)) = egcl_stdlib::slot_value_if_present(args[0], slot)
-        {
-            env.clear_mv();
-            return Some(Ok(value));
+            SlotAccess::CheckedWrite if args.len() == 2 => {
+                // A checked store needs a value the slot's type admits. TYPEP
+                // can expand a DEFTYPE and so collect, which this caller's ARGS
+                // would not survive, so once it may run the call finishes here,
+                // from rooted copies: a value the type rejects runs the writer
+                // body, which signals the correctable TYPE-ERROR. Fetch that
+                // body first, while declining still leaves ARGS valid.
+                let id = effective.primary[0];
+                let callable = METHOD_COMPILED.borrow().get(&id.0).copied()?;
+                egcl_rt::rooted!(callable = callable);
+                egcl_rt::rooted!(value = args[0]);
+                egcl_rt::rooted!(object = args[1]);
+                egcl_rt::rooted!(typespec = struct_slot_typespec(*object, slot));
+                let admitted =
+                    *typespec == T || matches!(typep_matches(env, *value, *typespec), Ok(true));
+                if admitted
+                    && egcl_stdlib::set_slot_value_if_present(*object, slot, *value).is_some()
+                {
+                    env.clear_mv();
+                    return Some(Ok(*value));
+                }
+                return Some(apply_function(*callable, &[*value, *object], env));
+            }
+            SlotAccess::Read if args.len() == 1 => {
+                if let Some(Ok(value)) = egcl_stdlib::slot_value_if_present(args[0], slot) {
+                    env.clear_mv();
+                    return Some(Ok(value));
+                }
+            }
+            _ => {}
         }
     }
     let id = effective.primary[0];
@@ -20216,6 +20261,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             | "EGCL::%VECTOR-REPLACE"
             | "EGCL::%VECTOR-SEARCH"
             | "EGCL::%VECTOR-FILL"
+            | "EGCL::%STRUCT-SLOT-TYPESPEC"
             | "EGCL::%MEMORY-FENCE"
             | "EGCL::%CAS-CAR"
             | "EGCL::%CAS-CDR"
@@ -31561,6 +31607,16 @@ fn symbol_plist_of(sym: EgclVal) -> EgclVal {
     }
 }
 
+/// The declared type of `slot` in `object`'s own structure class, or T. A typed
+/// structure's writers check against the instance's class rather than their
+/// own, so an inherited writer honors a type an :INCLUDE narrowed.
+fn struct_slot_typespec(object: EgclVal, slot: EgclVal) -> EgclVal {
+    let name = egcl_stdlib::clos::class_name(egcl_stdlib::clos::class_of(object));
+    let property = resolve_sym(STRUCT_SLOT_TYPES_PROPERTY).unwrap_or(NIL);
+    let types = plist_lookup(symbol_plist_of(name), property).unwrap_or(NIL);
+    plist_lookup(types, slot).unwrap_or(T)
+}
+
 /// Scan a property list for `key` (EQ on the indicator, per CLHS GET), returning
 /// the associated value or None.
 fn plist_lookup(plist: EgclVal, key: EgclVal) -> Option<EgclVal> {
@@ -39002,8 +39058,15 @@ fn install_slot_accessor_method(
     egcl_rt::rooted!(inner = arena_cons(*lambda_list_r, *body_tail));
     egcl_rt::rooted!(defmethod_cdr = arena_cons(*method_name_r, *inner));
     let method_id = eval_defmethod(*defmethod_cdr, env)?;
-    if !typed_writer && let Some(slot) = slot_sym.symbol_index() {
-        ACCESSOR_METHODS.borrow_mut().insert(method_id.0, (slot, is_writer));
+    if let Some(slot) = slot_sym.symbol_index() {
+        let access = match (is_writer, typed_writer) {
+            (false, _) => SlotAccess::Read,
+            (true, false) => SlotAccess::Write,
+            (true, true) => SlotAccess::CheckedWrite,
+        };
+        ACCESSOR_METHODS
+            .borrow_mut()
+            .insert(method_id.0, (slot, access));
     }
     Ok(())
 }
@@ -40324,6 +40387,7 @@ fn is_builtin_function(name: &str) -> bool {
             | "EGCL::%VECTOR-REPLACE"
             | "EGCL::%VECTOR-SEARCH"
             | "EGCL::%VECTOR-FILL"
+            | "EGCL::%STRUCT-SLOT-TYPESPEC"
             | "EGCL::%MEMORY-FENCE"
             | "EGCL::%CAS-CAR"
             | "EGCL::%CAS-CDR"
