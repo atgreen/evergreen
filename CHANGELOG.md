@@ -14,6 +14,12 @@
   file, never extracted to disk, and embedded `DT_NEEDED` dependencies are
   loaded the same way
   ([#445](https://github.com/atgreen/evergreen/pull/445)).
+- `EGCL-EXT:CRYPTO-SHA512-BLOCK`, `CRYPTO-SHA512-WORDS`, `CRYPTO-KECCAK-F1600`
+  and `CRYPTO-KECCAK-ABSORB`: native SHA-512/384 compression and Keccak
+  permutation for Ironclad, whose 64-bit words are bignums in Lisp. With the
+  EGCL fork of Ironclad, a repeated HTTPS request through pure-tls drops
+  from about 11 s to 7 s
+  ([#453](https://github.com/atgreen/evergreen/pull/453)).
 
 ### Performance
 
