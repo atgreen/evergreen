@@ -712,6 +712,22 @@ impl Function {
         b
     }
 
+    /// Allocate a fresh empty block placed in the layout immediately after
+    /// `after`. A pass that splits `after` keeps every definition ahead of its
+    /// uses in layout order, which block-order consumers such as
+    /// [`Function::inline_call`] rely on.
+    pub fn make_block_after(&mut self, after: Block) -> Block {
+        let b = Block(self.blocks.len() as u32);
+        self.blocks.push(BlockData::default());
+        let at = self
+            .block_order
+            .iter()
+            .position(|&existing| existing == after)
+            .map_or(self.block_order.len(), |p| p + 1);
+        self.block_order.insert(at, b);
+        b
+    }
+
     /// Drop `block` from the layout. Its arena entry remains, so handles stay
     /// valid; the caller must already have removed every edge into it.
     pub fn remove_from_layout(&mut self, block: Block) {
@@ -1191,36 +1207,38 @@ impl Function {
     }
 
     fn replace_value_everywhere(&mut self, from: Value, to: Value) {
-        for data in &mut self.insts {
-            for arg in &mut data.args {
-                if *arg == from {
-                    *arg = to;
-                }
+        self.replace_values(&std::collections::HashMap::from([(from, to)]));
+    }
+
+    /// Substitute every mapped value in one sweep over instruction operands,
+    /// edge arguments and FrameState sources (remat inputs included).
+    pub(crate) fn replace_values(&mut self, map: &std::collections::HashMap<Value, Value>) {
+        if map.is_empty() {
+            return;
+        }
+        let replace = |value: &mut Value| {
+            if let Some(&to) = map.get(value) {
+                *value = to;
             }
+        };
+        for data in &mut self.insts {
+            data.args.iter_mut().for_each(replace);
             for target in &mut data.targets {
-                for arg in &mut target.args {
-                    if *arg == from {
-                        *arg = to;
-                    }
-                }
+                target.args.iter_mut().for_each(replace);
             }
         }
         for state in self.frame_states.iter_mut() {
             for scope in &mut state.scopes {
                 for source in scope.locals.iter_mut().chain(&mut scope.stack) {
                     if let crate::t2::frame_state::ValueSource::Value { value, .. } = source {
-                        if *value == from {
-                            *value = to;
-                        }
+                        replace(value);
                     }
                 }
             }
             for recipe in &mut state.remat {
                 for source in &mut recipe.inputs {
                     if let crate::t2::frame_state::ValueSource::Value { value, .. } = source {
-                        if *value == from {
-                            *value = to;
-                        }
+                        replace(value);
                     }
                 }
             }

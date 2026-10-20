@@ -1089,7 +1089,7 @@ fn moving_gc_relocates_t2_roots_in_registers_and_native_spills() {
 
 #[cfg(all(target_arch = "x86_64", unix))]
 #[test]
-fn car_cdr_metadata_emit_guarded_field_loads_and_share_the_cons_proof() {
+fn car_cdr_metadata_emit_guarded_field_loads_with_a_nil_arm() {
     use std::sync::atomic::Ordering;
     use egcl_compiler::t2::emit::emit_framed;
     use egcl_compiler::t2::ir::{AuxData, Opcode, TypeBits};
@@ -1162,14 +1162,22 @@ fn car_cdr_metadata_emit_guarded_field_loads_and_share_the_cons_proof() {
         assert_eq!(EgclVal(run(frame.as_mut_ptr())), expected);
         assert!(!CONS_ACCESS_DEOPTED.load(Ordering::SeqCst));
 
+        // (CAR NIL) and (CDR NIL) are NIL on the native path (bliss-jmwqr);
+        // only a non-list operand reaches the deopt.
+        frame[0] = NIL.0;
+        CONS_ACCESS_DEOPTED.store(false, Ordering::SeqCst);
+        assert_eq!(EgclVal(run(frame.as_mut_ptr())), NIL);
+        assert!(!CONS_ACCESS_DEOPTED.load(Ordering::SeqCst));
+
         frame[0] = EgclVal::from_fixnum(7).0;
         CONS_ACCESS_DEOPTED.store(false, Ordering::SeqCst);
         let _ = run(frame.as_mut_ptr());
         assert!(CONS_ACCESS_DEOPTED.load(Ordering::SeqCst));
     }
 
-    // A CAR proof dominates the CDR expansion on the same value. The general
-    // guard pass forwards CDR's refined input to CAR's guard result.
+    // A CDR that directly follows a CAR of the same value shares its NIL test
+    // and its cons proof: both loads sit in one cons arm behind one guard
+    // (bliss-jmwqr), so the proof is shared as it was before the NIL arm.
     let both = bytecode_fn(
         "car-then-cdr",
         vec![
@@ -1200,7 +1208,11 @@ fn car_cdr_metadata_emit_guarded_field_loads_and_share_the_cons_proof() {
             })
             .count()
     };
-    assert_eq!(guard_count(&f, false), 2);
+    assert_eq!(
+        guard_count(&f, false),
+        1,
+        "one NIL test covers both accesses"
+    );
     assert_eq!(guard_count(&f, true), 0, "canonical CL bindings are fixed");
     let mut pm = PassManager::new();
     pm.add(Box::new(GuardElim));
@@ -1234,6 +1246,154 @@ fn car_cdr_metadata_emit_guarded_field_loads_and_share_the_cons_proof() {
     CONS_ACCESS_DEOPTED.store(false, Ordering::SeqCst);
     assert_eq!(EgclVal(run(frame.as_mut_ptr())), cell.cdr);
     assert!(!CONS_ACCESS_DEOPTED.load(Ordering::SeqCst));
+    frame[0] = NIL.0;
+    assert_eq!(EgclVal(run(frame.as_mut_ptr())), NIL);
+    assert!(!CONS_ACCESS_DEOPTED.load(Ordering::SeqCst));
+    frame[0] = EgclVal::from_fixnum(7).0;
+    let _ = run(frame.as_mut_ptr());
+    assert!(
+        CONS_ACCESS_DEOPTED.load(Ordering::SeqCst),
+        "the shared guard still sends a non-list to the deopt"
+    );
+
+    // A call between the two accesses could mutate the cell, so the CDR load
+    // must not move above it: each access keeps its own test and guard.
+    let opaque = egcl_rt::symbols::intern("CAR-CDR-OPAQUE-CALLEE");
+    let split = bytecode_fn(
+        "car-call-cdr",
+        vec![
+            Instr::LoadLocal(0),
+            Instr::CallNamed { sym: car, nargs: 1 },
+            Instr::Pop,
+            Instr::CallNamed {
+                sym: opaque,
+                nargs: 0,
+            },
+            Instr::Pop,
+            Instr::LoadLocal(0),
+            Instr::CallNamed { sym: cdr, nargs: 1 },
+            Instr::Return,
+        ],
+        vec![],
+        1,
+        1,
+        1,
+    );
+    let f = build_from_bytecode(&split).expect("build CAR, call, CDR");
+    verify(&f).expect("CAR, call, CDR verifies");
+    assert_eq!(guard_count(&f, false), 2, "a call keeps the accesses apart");
+}
+
+/// A branch that has already found the operand non-NIL makes the NIL arm
+/// dead, so the expansion keeps its plain guard and GuardElim can again share
+/// one cons proof between CAR and CDR (bliss-jmwqr). Only the edge a non-NIL
+/// value takes counts: CAR on the NIL side of the same test keeps its arm.
+#[test]
+fn car_cdr_behind_a_non_nil_branch_skip_the_nil_arm() {
+    use egcl_compiler::t2::ir::{AuxData, Function, Opcode, TypeBits};
+
+    let car = egcl_rt::symbols::intern("CAR");
+    let cdr = egcl_rt::symbols::intern("CDR");
+    let endp = egcl_rt::symbols::intern("ENDP");
+    let count = |f: &Function, wanted: &dyn Fn(&egcl_compiler::t2::ir::InstData) -> bool| {
+        f.block_order()
+            .iter()
+            .flat_map(|&b| f.block(b).insts.iter())
+            .filter(|&&i| wanted(f.inst(i)))
+            .count()
+    };
+    let cons_guards = |f: &Function| {
+        count(f, &|d| {
+            d.opcode == Opcode::Guard
+                && matches!(d.aux, AuxData::TypeTag(t) if t.bits == TypeBits::CONS)
+        })
+    };
+    let nil_tests = |f: &Function| count(f, &|d| d.opcode == Opcode::GenericEq);
+
+    // (if x (car x) nil)
+    let when_x = bytecode_fn(
+        "car-when-x",
+        vec![
+            Instr::LoadLocal(0),
+            Instr::BrIfFalse(5),
+            Instr::LoadLocal(0),
+            Instr::CallNamed { sym: car, nargs: 1 },
+            Instr::Return,
+            Instr::Const(0),
+            Instr::Return,
+        ],
+        vec![NIL],
+        1,
+        1,
+        1,
+    );
+    let f = build_from_bytecode(&when_x).expect("build CAR behind (IF X ...)");
+    verify(&f).expect("CAR behind a non-NIL branch verifies");
+    assert_eq!(
+        nil_tests(&f),
+        0,
+        "the true edge of (IF X ...) proves X non-NIL"
+    );
+    assert_eq!(cons_guards(&f), 1);
+
+    // (if (endp x) nil (progn (car x) (cdr x)))
+    let unless_endp = bytecode_fn(
+        "car-cdr-unless-endp",
+        vec![
+            Instr::LoadLocal(0),
+            Instr::CallNamed {
+                sym: endp,
+                nargs: 1,
+            },
+            Instr::BrIfTrue(9),
+            Instr::LoadLocal(0),
+            Instr::CallNamed { sym: car, nargs: 1 },
+            Instr::Pop,
+            Instr::LoadLocal(0),
+            Instr::CallNamed { sym: cdr, nargs: 1 },
+            Instr::Return,
+            Instr::Const(0),
+            Instr::Return,
+        ],
+        vec![NIL],
+        1,
+        1,
+        1,
+    );
+    let mut f = build_from_bytecode(&unless_endp).expect("build CAR/CDR behind ENDP");
+    assert_eq!(
+        nil_tests(&f),
+        0,
+        "the false edge of (ENDP X) proves X non-NIL"
+    );
+    assert_eq!(cons_guards(&f), 2);
+    let mut pm = PassManager::new();
+    pm.add(Box::new(GuardElim));
+    pm.add(Box::new(Dce));
+    pm.run(&mut f);
+    verify(&f).expect("shared proof behind ENDP verifies");
+    assert_eq!(cons_guards(&f), 1, "CAR and CDR share one cons proof again");
+
+    // (if x nil (car x)): CAR runs only when X is NIL.
+    let unless_x = bytecode_fn(
+        "car-unless-x",
+        vec![
+            Instr::LoadLocal(0),
+            Instr::BrIfTrue(5),
+            Instr::LoadLocal(0),
+            Instr::CallNamed { sym: car, nargs: 1 },
+            Instr::Return,
+            Instr::Const(0),
+            Instr::Return,
+        ],
+        vec![NIL],
+        1,
+        1,
+        1,
+    );
+    let f = build_from_bytecode(&unless_x).expect("build CAR on the NIL edge");
+    verify(&f).expect("CAR on the NIL edge verifies");
+    assert_eq!(nil_tests(&f), 1, "the NIL edge keeps its NIL arm");
 }
 
 #[test]
@@ -1316,7 +1476,7 @@ fn constant_typep_operands_execute_in_native_code() {
 
 #[cfg(all(target_arch = "x86_64", unix))]
 #[test]
-fn post_inline_guard_elimination_merges_independent_callee_proofs() {
+fn post_inline_guard_elimination_keeps_callee_proofs_in_their_nil_arms() {
     use std::sync::Arc;
     use egcl_compiler::t2::build::build_from_bytecode_with_inline_options;
     use egcl_compiler::t2::emit::emit_framed;
@@ -1387,10 +1547,12 @@ fn post_inline_guard_elimination_merges_independent_callee_proofs() {
     pm.add(Box::new(Dce));
     pm.run(&mut f);
     verify(&f).expect("post-inline guard elimination preserves valid SSA/deopt state");
+    // Each cloned proof is reached only past its own NIL test, so neither
+    // dominates the other (bliss-jmwqr).
     assert_eq!(
         cons_guard_count(&f),
-        1,
-        "the dominating proof eliminates the guard cloned by the second call"
+        2,
+        "a proof inside one callee's cons arm cannot eliminate the other's"
     );
 
     let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, 0,
@@ -1406,6 +1568,8 @@ fn post_inline_guard_elimination_merges_independent_callee_proofs() {
     let mut frame = vec![NIL.0; usize::from(caller_body.num_slots() + framed.shadow_root_slots)];
     frame[0] = cons.0;
     assert_eq!(EgclVal(run(frame.as_mut_ptr())), cell.car);
+    frame[0] = NIL.0;
+    assert_eq!(EgclVal(run(frame.as_mut_ptr())), NIL);
 }
 
 /// `(lambda () 42)` — the smallest real function: push a constant, return it.

@@ -131,6 +131,13 @@
   functions such as `UIOP:NORMALIZE-PATHNAME-DIRECTORY-COMPONENT` and
   `ASDF:MAKE-OPERATION` out of the interpreter
   ([#464](https://github.com/atgreen/evergreen/pull/464)).
+- Native code returns NIL for `CAR` or `CDR` of NIL instead of falling back
+  to the interpreter. Each such fallback counted as a failed speculation, so
+  functions that routinely reach the end of a list -- `CDDR`, `CADR`, or
+  ASDF's `ABSOLUTE-PATHNAME-P` on a pathname without a directory -- were sent
+  back to the interpreter for good after eight of them. They now keep their
+  native code and stay eligible for further tier-up
+  ([#472](https://github.com/atgreen/evergreen/pull/472)).
 
 ### Fixed
 

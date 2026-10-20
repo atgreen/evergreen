@@ -801,6 +801,7 @@ impl<'a> Builder<'a> {
         self.process_blocks()?;
         self.capture_osr_entries();
         self.simplify_trivial_phis();
+        admit_nil_list_loads(&mut self.f);
         Ok(self.f)
     }
 
@@ -2914,9 +2915,11 @@ impl<'a> Builder<'a> {
         if matches!(intrinsic, IntrinsicId::Car | IntrinsicId::Cdr) {
             // Keep the type proof as an ordinary SSA guard.  CAR and CDR use
             // the same proof identity, so the general dominator-based guard
-            // pass can reuse a CAR proof for a later CDR (and vice versa).
-            // NIL deliberately takes the deopt path: CL defines (CAR NIL) and
-            // (CDR NIL) as NIL, which the generic semantic path preserves.
+            // pass can reuse one proof where it dominates another.
+            // CL defines (CAR NIL) and (CDR NIL) as NIL; `admit_nil_list_loads`
+            // later routes NIL around this pair once the CFG is complete, so
+            // only a non-list operand reaches the deopt path. That puts each
+            // proof inside its own cons arm, where it rarely dominates another.
             let fs = self.build_frame_state(block, stack, bcp as u32);
             let cons = stack
                 .pop()
@@ -3236,6 +3239,299 @@ fn runtime_call_flags() -> InstFlags {
         call: true,
         safepoint: true,
         ..InstFlags::default()
+    }
+}
+
+/// Give every expanded CAR/CDR an explicit NIL arm (bliss-jmwqr).
+///
+/// The intrinsic expansion is `Guard(CONS)` immediately followed by its field
+/// load. NIL is an ordinary list operand -- `(CDDR '(1))` takes `(CDR NIL)` --
+/// but it fails that tag guard, and each deopt counts toward the per-function
+/// blacklist that returns the function to T0 for good. So split the block at
+/// every such pair:
+///
+/// ```text
+///   B:    ...; nil = ConstNil; t = GenericEq(x, nil); Brif t -> NilArm, ConsArm
+///   NilArm:  Jump Join(nil)
+///   ConsArm: g = Guard(x, CONS); r = Car/Cdr(g); Jump Join(r)
+///   Join(r'): <rest of B, uses of r renamed to r'>
+/// ```
+///
+/// The guard keeps its FrameState, so any other non-list operand still
+/// deopts to the generic CL call, which signals the type error. Runs on the
+/// finished CFG, where the guard has exactly one use and no later pass has
+/// shared its proof. An operand whose type excludes NULL, or which a
+/// dominating branch has already found non-NIL, keeps the plain guard (see
+/// `branch_proves_non_nil`), so loops that test `(NULL x)` or `(ENDP x)`
+/// first still share one cons proof among their accesses, and adjacent
+/// accesses to one operand share a single test and proof.
+/// New blocks are laid out after the split block, preserving the builder's
+/// defs-before-uses layout order.
+fn admit_nil_list_loads(f: &mut Function) {
+    let mut uses: HashMap<Value, usize> = HashMap::new();
+    let mut count = |value: Value| *uses.entry(value).or_insert(0) += 1;
+    for &block in f.block_order() {
+        for &inst in &f.block(block).insts {
+            let data = f.inst(inst);
+            data.args.iter().copied().for_each(&mut count);
+            for target in &data.targets {
+                target.args.iter().copied().for_each(&mut count);
+            }
+        }
+    }
+    for (_, state) in f.frame_states.iter() {
+        let sources = state
+            .scopes
+            .iter()
+            .flat_map(|scope| scope.locals.iter().chain(&scope.stack))
+            .chain(state.remat.iter().flat_map(|recipe| &recipe.inputs));
+        for source in sources {
+            if let ValueSource::Value { value, .. } = source {
+                count(*value);
+            }
+        }
+    }
+
+    let pair_at = |f: &Function, pair: &[Inst]| {
+        let (guard, load) = (f.inst(pair[0]), f.inst(pair[1]));
+        guard.opcode == Opcode::Guard
+            && guard.flags.guard
+            && matches!(guard.aux, AuxData::TypeTag(t) if t.bits == TypeBits::CONS)
+            && matches!(load.opcode, Opcode::Car | Opcode::Cdr)
+            && guard.results.len() == 1
+            && load.args == guard.results
+            && uses.get(&guard.results[0]) == Some(&1)
+            && f.value(guard.args[0]).ty.bits.contains(TypeBits::NULL)
+    };
+    // Decide every proof on the unsplit CFG. Splitting adds no paths, so a
+    // proof found here still holds wherever the guard ends up.
+    let mut proven = HashSet::new();
+    {
+        let dom = f.dominators();
+        let mut preds: HashMap<Block, Vec<Block>> = HashMap::new();
+        for &block in f.block_order() {
+            for succ in f.succs(block) {
+                preds.entry(succ).or_default().push(block);
+            }
+        }
+        for &block in f.block_order() {
+            for pair in f.block(block).insts.windows(2) {
+                if pair_at(f, pair) {
+                    let operand = f.inst(pair[0]).args[0];
+                    if branch_proves_non_nil(f, &dom, &preds, block, operand) {
+                        proven.insert(pair[0]);
+                    }
+                }
+            }
+        }
+    }
+    let site = |f: &Function, block: Block| {
+        f.block(block)
+            .insts
+            .windows(2)
+            .position(|pair| pair_at(f, pair) && !proven.contains(&pair[0]))
+    };
+    let mut renamed = HashMap::new();
+    let mut cons_exits = Vec::new();
+    let mut work: Vec<Block> = f.block_order().to_vec();
+    while let Some(block) = work.pop() {
+        let Some(pos) = site(f, block) else {
+            continue;
+        };
+        let insts = &f.block(block).insts;
+        let (guard, load) = (insts[pos], insts[pos + 1]);
+        let operand = f.inst(guard).args[0];
+        let source_pos = f.inst(load).source_pos;
+        // Later accesses to the same operand that follow with nothing in
+        // between but MV resets and constants share this NIL test and cons
+        // proof, as they shared the proof before the split: their loads move
+        // into the cons arm and read this guard's result, and their own
+        // guards are dropped, since a guard on the same value cannot fail once
+        // this one has passed. `(+ (car x) (cdr x))` pays one test and one
+        // guard. Only those instructions are skipped, so no load moves across
+        // a call or store that could mutate the cell.
+        let mut grouped = vec![pos];
+        let mut next = pos + 2;
+        while next < insts.len() {
+            let data = f.inst(insts[next]);
+            // ClearMv carries a FrameState, but it neither reads the heap
+            // nor names a load that has not run yet.
+            if matches!(
+                data.opcode,
+                Opcode::ClearMv
+                    | Opcode::ConstNil
+                    | Opcode::ConstT
+                    | Opcode::ConstFixnum
+                    | Opcode::ConstChar
+                    | Opcode::ConstSymbol
+            ) {
+                next += 1;
+            } else if next + 1 < insts.len()
+                && pair_at(f, &insts[next..next + 2])
+                && f.inst(insts[next]).args[0] == operand
+            {
+                grouped.push(next);
+                next += 2;
+            } else {
+                break;
+            }
+        }
+        let loads: Vec<Value> = grouped
+            .iter()
+            .map(|&at| f.inst(insts[at + 1]).results[0])
+            .collect();
+        // Inserted in reverse, so the layout reads B, NilArm, ConsArm, Join.
+        let join = f.make_block_after(block);
+        let cons_arm = f.make_block_after(block);
+        let nil_arm = f.make_block_after(block);
+        let proof = f.inst(guard).results[0];
+        let tail = f.block_mut(block).insts.split_off(pos);
+        let (mut moved, mut rest) = (Vec::new(), Vec::new());
+        for (index, inst) in tail.into_iter().enumerate() {
+            let at = pos + index;
+            if at == pos || at == pos + 1 {
+                moved.push(inst);
+            } else if grouped.contains(&(at - 1)) {
+                f.inst_mut(inst).args[0] = proof;
+                moved.push(inst);
+            } else if !grouped.contains(&at) {
+                rest.push(inst);
+            }
+        }
+        f.block_mut(join).insts = rest;
+        f.block_mut(cons_arm).insts = moved;
+        for &loaded in &loads {
+            let loaded_data = f.value(loaded).clone();
+            let merged = f.add_block_param(join, loaded_data.ty, loaded_data.repr);
+            renamed.insert(loaded, merged);
+        }
+
+        let tagged = |ty| (ty, ValueRepresentation::Tagged);
+        let at = |opcode, args| InstData {
+            opcode,
+            args,
+            results: vec![],
+            aux: AuxData::None,
+            flags: InstFlags::default(),
+            targets: vec![],
+            frame_state: None,
+            source_pos,
+        };
+        let (_, nil) = f.push_inst(
+            block,
+            at(Opcode::ConstNil, vec![]),
+            &[tagged(IRType::of(TypeBits::NULL))],
+        );
+        // Pinned so GVN keeps each test private to its own branch. A shared
+        // test would stay live from an earlier access, across a loop header
+        // whose FrameState does not name it (so that OSR entry is declined),
+        // and could no longer fuse into its Brif as a single cmp/jcc.
+        let pinned = InstFlags {
+            effectful: true,
+            ..InstFlags::default()
+        };
+        let (_, is_nil) = f.push_inst(
+            block,
+            InstData {
+                flags: pinned,
+                ..at(Opcode::GenericEq, vec![operand, nil[0]])
+            },
+            &[tagged(IRType::TOP)],
+        );
+        f.set_terminator(
+            block,
+            InstData {
+                source_pos,
+                ..brif(is_nil[0], nil_arm, cons_arm)
+            },
+        );
+        let to_join = |args| InstData {
+            source_pos,
+            targets: vec![crate::t2::ir::BlockCall { block: join, args }],
+            ..jump(join)
+        };
+        f.set_terminator(nil_arm, to_join(vec![nil[0]; loads.len()]));
+        // The cons edge must carry the loads' own results, so it is added only
+        // after the uses are renamed below.
+        cons_exits.push((cons_arm, to_join(loads)));
+        work.push(join);
+    }
+    f.replace_values(&renamed);
+    for (cons_arm, exit) in cons_exits {
+        f.set_terminator(cons_arm, exit);
+    }
+}
+
+/// Whether every path to `block` crossed a branch edge that only a non-NIL
+/// `operand` takes: the true edge of a branch on the value itself or on
+/// `(CONSP x)`, or the false edge of one on `(NULL x)`/`(NOT x)` (an `EQ` with
+/// NIL) or `(ENDP x)`. Walks the dominator chain, accepting an edge only into
+/// a block whose single predecessor is the branch. A wrong answer costs only
+/// speed: the cons guard stays, and NIL then deopts as it used to.
+fn branch_proves_non_nil(
+    f: &Function,
+    dom: &crate::t2::ir::DominatorTree,
+    preds: &HashMap<Block, Vec<Block>>,
+    block: Block,
+    operand: Value,
+) -> bool {
+    let is_nil = |value: Value| {
+        matches!(f.value(value).def, crate::t2::ir::ValueDef::Result { inst, .. }
+            if f.inst(inst).opcode == Opcode::ConstNil)
+    };
+    let tests = |cond: Value, taken: bool| {
+        if cond == operand {
+            return taken;
+        }
+        let crate::t2::ir::ValueDef::Result { inst, .. } = f.value(cond).def else {
+            return false;
+        };
+        let data = f.inst(inst);
+        match (data.opcode, &data.aux, data.args.as_slice()) {
+            (Opcode::GenericEq, _, &[a, b]) => {
+                !taken && ((a == operand && is_nil(b)) || (b == operand && is_nil(a)))
+            }
+            (Opcode::Call, AuxData::CallTarget(symbol), &[arg]) if arg == operand => {
+                match cl_function_name(*symbol).as_deref() {
+                    Some("ENDP") => !taken,
+                    Some("CONSP") => taken,
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    };
+    let mut current = block;
+    loop {
+        if let Some([branch]) = preds.get(&current).map(Vec::as_slice) {
+            if let Some(term) = f.terminator(*branch) {
+                let data = f.inst(term);
+                if data.opcode == Opcode::Brif && data.targets.len() == 2 {
+                    let (yes, no) = (data.targets[0].block, data.targets[1].block);
+                    if yes != no
+                        && (yes == current || no == current)
+                        && tests(data.args[0], yes == current)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        match dom.idom(current) {
+            Some(up) if up != current => current = up,
+            _ => return false,
+        }
+    }
+}
+
+/// The bare name of a COMMON-LISP function symbol, as `metadata_for_symbol`
+/// recognises one; `None` for a same-spelling symbol in another package.
+fn cl_function_name(sym: u32) -> Option<String> {
+    let name = crate::reader::symbol_name(sym)?;
+    match egcl_rt::symbols::split_registry_key(&name) {
+        None => Some(name),
+        Some(("CL" | "COMMON-LISP", bare)) => Some(bare.to_string()),
+        Some(_) => None,
     }
 }
 
@@ -3901,6 +4197,123 @@ mod tests {
         ] {
             assert!(code.unwrap_or_else(|error| panic!("{name}: {error:?}")).has_deopt,
                 "{name} must preserve a real deopt exit");
+        }
+    }
+
+    /// The NIL arm admit_nil_list_loads adds in front of CAR/CDR is built from
+    /// GenericEq, Brif and a join-block parameter. Every backend must emit it,
+    /// or a function using CAR/CDR loses its native code there: AArch64 once
+    /// refused GenericEq outright (bliss-jmwqr).
+    #[test]
+    fn nil_armed_list_access_emits_on_every_backend() {
+        use crate::t2::{emit, emit_a64, emit_ppc64le, emit_riscv64, emit_s390x};
+        let car = egcl_rt::symbols::intern("CAR");
+        let cdr = egcl_rt::symbols::intern("CDR");
+        for (name, code) in [
+            (
+                "car",
+                vec![
+                    Instr::LoadLocal(0),
+                    Instr::CallNamed { sym: car, nargs: 1 },
+                    Instr::Return,
+                ],
+            ),
+            (
+                "cddr",
+                vec![
+                    Instr::LoadLocal(0),
+                    Instr::CallNamed { sym: cdr, nargs: 1 },
+                    Instr::CallNamed { sym: cdr, nargs: 1 },
+                    Instr::Return,
+                ],
+            ),
+            // CAR then CDR of one value share a single NIL test, so the join
+            // carries one parameter per load.
+            (
+                "car-cdr",
+                vec![
+                    Instr::LoadLocal(0),
+                    Instr::CallNamed { sym: car, nargs: 1 },
+                    Instr::StoreLocal(1),
+                    Instr::LoadLocal(0),
+                    Instr::CallNamed { sym: cdr, nargs: 1 },
+                    Instr::Return,
+                ],
+            ),
+        ] {
+            let locals = if name == "car-cdr" { 2 } else { 1 };
+            let input = bf(name, code, vec![], locals, 1, 1);
+            let function = build_from_bytecode(&input).unwrap();
+            crate::t2::verify::verify(&function).unwrap();
+            assert!(
+                function.block_order().iter().any(|&block| function
+                    .block(block)
+                    .insts
+                    .iter()
+                    .any(|&inst| function.inst(inst).opcode == Opcode::GenericEq)),
+                "{name}: the fixture must carry the NIL test it is checking"
+            );
+            if name == "car-cdr" {
+                assert!(
+                    function.block_order().iter().any(|&block| function.block(block).params.len() >= 2),
+                    "car-cdr: the grouped loads must meet at a multi-parameter join"
+                );
+            }
+            let runtime = emit_s390x::RuntimeCalls {
+                multiple_values: 1,
+                ..Default::default()
+            };
+            for (backend, code) in [
+                (
+                    "x86",
+                    emit::emit_framed(&function, 1, 1, 0, 0, 0, 0, 0, 1, None),
+                ),
+                (
+                    "aarch64",
+                    emit_a64::emit_framed_with_runtime(
+                        &function,
+                        1,
+                        input.num_slots(),
+                        runtime.clone(),
+                    ),
+                ),
+                (
+                    "s390x",
+                    emit_s390x::emit_framed_with_runtime(
+                        &function,
+                        1,
+                        input.num_slots(),
+                        runtime.clone(),
+                    ),
+                ),
+                (
+                    "ppc64le",
+                    emit_ppc64le::emit_framed_with_runtime(
+                        &function,
+                        1,
+                        input.num_slots(),
+                        runtime,
+                    ),
+                ),
+                (
+                    "riscv64",
+                    emit_riscv64::emit_framed_with_runtime(
+                        &function,
+                        1,
+                        input.num_slots(),
+                        emit_riscv64::RuntimeCalls {
+                            multiple_values: 1,
+                            ..Default::default()
+                        },
+                    ),
+                ),
+            ] {
+                assert!(
+                    code.unwrap_or_else(|error| panic!("{name} on {backend}: {error:?}"))
+                        .has_deopt,
+                    "{name} on {backend}: a non-list operand must keep its deopt exit"
+                );
+            }
         }
     }
 
