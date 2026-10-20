@@ -4,6 +4,14 @@
 
 ### Added
 
+- `EGCL_T2_LOG` and the `compile` trace (`EGCL_LOG=compile=trace`) say why a
+  function never left the interpreter on x86-64 Linux: a captured closure
+  environment, an `&rest`/`&key`/`&aux` lambda list, a special or boxed
+  parameter, or the first bytecode instruction the native compiler refuses.
+  Such functions never reach T2, and used to be absent from `EGCL_T2_LOG` or
+  logged only as "mapped native entry unavailable". A mapped T2 decline now
+  names the refused instruction too
+  ([#462](https://github.com/atgreen/evergreen/pull/462)).
 - `EGCL-EXT:INFLATE` decompresses raw deflate, zlib and gzip data in the
   runtime, checking each format's trailer. EGCL's port of chipz uses it, so
   unpacking a package with `ocicl install` no longer runs chipz's inflate in

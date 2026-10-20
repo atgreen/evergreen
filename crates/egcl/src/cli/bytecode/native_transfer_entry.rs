@@ -373,6 +373,38 @@ pub(super) fn install_t1(
     install_baseline_code(symbol, code)
 }
 
+/// Why `install_t1` declined `body`, for the decline log only (bliss-s5r0c).
+/// It repeats `install_t1`'s and `compile_variant`'s checks in order, then
+/// rebuilds the IR to name the first instruction the builder refuses. Call it
+/// only when the reason will be printed: the rebuild is not free.
+pub(super) fn mapped_t1_decline_reason(body: &BytecodeFunction) -> String {
+    let kind = |op: &Instr| {
+        let full = format!("{op:?}");
+        full.find(['(', ' ', '{']).map_or(full.clone(), |i| full[..i].to_string())
+    };
+    if !native_transfer::is_supported() {
+        return "mapped transfer unsupported on this platform".into();
+    }
+    if body.has_env {
+        return "captured variables (closure environment)".into();
+    }
+    if body.variadic {
+        return "&rest, &key or &aux lambda list".into();
+    }
+    if !positional_tagged_parameters(body) {
+        return "a parameter is special or boxed, not a plain slot".into();
+    }
+    if let Some(op) = body.code.iter().find(|op| {
+        matches!(op, Instr::PushBlock { register: true, .. } | Instr::NamedTag { .. })
+    }) {
+        return format!("{} needs an executing identity", kind(op));
+    }
+    match egcl_compiler::t2::build::build_from_bytecode_for_native_cleanups(body) {
+        Err(error) => format!("IR builder: {error:?}"),
+        Ok(_) => "native emission declined".into(),
+    }
+}
+
 pub(super) fn install_baseline_code(symbol: u32, mut code: TransferCode) -> Option<Rc<NativeCode>> {
     code.set_installed_symbol(symbol);
     let body = Arc::clone(&code.body);
@@ -1737,48 +1769,58 @@ fn local_control_native_body(body: &BytecodeFunction, allow_values: bool, allow_
             .param_layout
             .iter()
             .all(|(_, location)| matches!(location, VarLoc::Slot(_)))
-        && body.code.iter().all(|op| {
-            // Nested tagged callees support MV; optimized/direct-recursive
-            // admission retains its existing restriction.
-            (allow_values && matches!(op,
-                Instr::SetValues(_) | Instr::TakeValuesToLocals { .. } | Instr::ValuesToList))
-            || (allow_primary_transport && matches!(op, Instr::TakeValuesToLocals { nvars: 1, .. }))
-            || (allow_local_scopes && matches!(op,
-                Instr::PushTag { .. } | Instr::Go { .. } | Instr::PushCatch { .. } | Instr::Throw
-                    | Instr::PushUnwind { .. } | Instr::EnterCleanupNormal { .. } | Instr::CleanupReturn
-                    | Instr::PushHandlerCase { .. } | Instr::PopHandlerCase
-                    | Instr::PushHandlerBind { .. } | Instr::PopHandlerBind
-                    | Instr::PushRestartCase { .. } | Instr::PopRestartCase
-                    | Instr::BindSpecial(_) | Instr::UnbindSpecial(_)
-                    // #'f lowers to an argument-free FunctionLookup Invoke. It
-                    // needs the native-cleanups transfer emitter that mapped T1
-                    // already uses; ordinary entries still decline it (bliss-j3fv8).
-                    | Instr::LoadFunction(_)))
-            || matches!(
-                op,
-                Instr::Const(_)
-                    | Instr::LoadLocal(_)
-                    | Instr::StoreLocal(_)
-                    | Instr::LoadGlobal(_) | Instr::StoreGlobal(_)
-                    | Instr::Pop
-                    | Instr::Dup
-                    | Instr::ClearMv
-                    // A result assertion preserves the primary and MV tuple;
-                    // unsupported assertion types still decline in T2 lowering.
-                    | Instr::CheckResult(_)
-                    | Instr::Br(_)
-                    | Instr::BrIfFalse(_)
-                    | Instr::BrIfTrue(_)
-                    | Instr::CallNamed { .. }
-                    | Instr::Return
-                    | Instr::PushBlock {
-                        register: false,
-                        ..
-                    }
-                    | Instr::PopHandler
-                    | Instr::ReturnFrom { .. }
-            )
-        })
+        && body.code.iter().all(|op| local_control_op(op, allow_values, allow_local_scopes, allow_primary_transport))
+}
+
+/// The first instruction `local_control_native_body` refuses under the same
+/// flags, named by its variant, for decline logs (bliss-s5r0c).
+pub(super) fn first_refused_local_control_op(body: &BytecodeFunction, allow_values: bool, allow_local_scopes: bool, allow_primary_transport: bool) -> Option<String> {
+    let op = body.code.iter().find(|op| !local_control_op(op, allow_values, allow_local_scopes, allow_primary_transport))?;
+    let full = format!("{op:?}");
+    Some(full.find(['(', ' ', '{']).map_or(full.clone(), |i| full[..i].to_string()))
+}
+
+fn local_control_op(op: &Instr, allow_values: bool, allow_local_scopes: bool, allow_primary_transport: bool) -> bool {
+    // Nested tagged callees support MV; optimized/direct-recursive
+    // admission retains its existing restriction.
+    (allow_values && matches!(op,
+        Instr::SetValues(_) | Instr::TakeValuesToLocals { .. } | Instr::ValuesToList))
+    || (allow_primary_transport && matches!(op, Instr::TakeValuesToLocals { nvars: 1, .. }))
+    || (allow_local_scopes && matches!(op,
+        Instr::PushTag { .. } | Instr::Go { .. } | Instr::PushCatch { .. } | Instr::Throw
+            | Instr::PushUnwind { .. } | Instr::EnterCleanupNormal { .. } | Instr::CleanupReturn
+            | Instr::PushHandlerCase { .. } | Instr::PopHandlerCase
+            | Instr::PushHandlerBind { .. } | Instr::PopHandlerBind
+            | Instr::PushRestartCase { .. } | Instr::PopRestartCase
+            | Instr::BindSpecial(_) | Instr::UnbindSpecial(_)
+            // #'f lowers to an argument-free FunctionLookup Invoke. It
+            // needs the native-cleanups transfer emitter that mapped T1
+            // already uses; ordinary entries still decline it (bliss-j3fv8).
+            | Instr::LoadFunction(_)))
+    || matches!(
+        op,
+        Instr::Const(_)
+            | Instr::LoadLocal(_)
+            | Instr::StoreLocal(_)
+            | Instr::LoadGlobal(_) | Instr::StoreGlobal(_)
+            | Instr::Pop
+            | Instr::Dup
+            | Instr::ClearMv
+            // A result assertion preserves the primary and MV tuple;
+            // unsupported assertion types still decline in T2 lowering.
+            | Instr::CheckResult(_)
+            | Instr::Br(_)
+            | Instr::BrIfFalse(_)
+            | Instr::BrIfTrue(_)
+            | Instr::CallNamed { .. }
+            | Instr::Return
+            | Instr::PushBlock {
+                register: false,
+                ..
+            }
+            | Instr::PopHandler
+            | Instr::ReturnFrom { .. }
+    )
 }
 
 fn recursive_definition_matches(symbol: u32, body: *const BytecodeFunction) -> bool {

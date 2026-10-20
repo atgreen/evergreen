@@ -86,3 +86,36 @@ fn a_declined_function_explains_itself_under_one_name() {
         "the trace still uses two spellings of one name:\n{log}"
     );
 }
+
+/// A function T1 declines never reaches the T2 queue on Linux, so it used to be
+/// absent from EGCL_T2_LOG and the compile trace said only "mapped native entry
+/// unavailable" for every shape (bliss-s5r0c). Both now name the reason under
+/// the function's plain name. If either shape learns to compile natively, point
+/// the case at another still-declined shape rather than deleting it.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn a_function_declined_at_t1_explains_itself_in_the_t2_log() {
+    let out = Command::new(BIN)
+        .args([
+            "--no-init",
+            "--eval",
+            "(progn (defun keyfn (a &key (b 1)) (+ a b)) \
+                    (defun capfn (n) (let ((f (lambda (x) (+ x n)))) (funcall f 1))) \
+                    (dotimes (i 50) (keyfn i) (capfn i)) \
+                    (values))",
+        ])
+        .env("EGCL_T2_LOG", "stderr")
+        .env("EGCL_T0_T1_THRESHOLD", "5")
+        .output()
+        .expect("run egcl");
+    let log = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{log}");
+    assert!(
+        log.contains("[T2] KEYFN: T1 declined (&rest, &key or &aux lambda list)"),
+        "the &key decline must be explained in the T2 log:\n{log}"
+    );
+    assert!(
+        log.contains("[T2] CAPFN: T1 declined (captured variables (closure environment))"),
+        "the closure decline must be explained in the T2 log:\n{log}"
+    );
+}

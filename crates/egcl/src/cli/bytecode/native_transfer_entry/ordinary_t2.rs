@@ -17,15 +17,19 @@ pub(in crate::cli::bytecode) fn prepare_ordinary_t2(
     input: &T2CompileInput,
     optimized: &Function,
 ) -> Option<PreparedT2> {
-    let decline = |reason| {
+    let decline = |reason: &str| {
         t2_log_write(format_args!(
             "{}: mapped T2 declined ({reason}); keep mapped T1 or interpreter",
             display_fn_name(&input.body.name)
         ));
         None
     };
-    if !positional_tagged_parameters(&input.body) || !local_control_native_body(&input.body, true, true, false) {
-        return decline("unsupported parameter or control-scope shape");
+    if !positional_tagged_parameters(&input.body) {
+        return decline("unsupported parameter shape");
+    }
+    if !local_control_native_body(&input.body, true, true, false) {
+        let op = first_refused_local_control_op(&input.body, true, true, false);
+        return decline(&format!("unsupported instruction {}", op.as_deref().unwrap_or("?")));
     }
     // Transfer capture currently reconstructs one logical frame. In particular,
     // never attach the root body's scope map to an inlined callee's bytecode PC.
@@ -45,15 +49,22 @@ pub(in crate::cli::bytecode) fn prepare_ordinary_t2(
     {
         return decline("unsupported raw representation or control scope");
     }
-    let scopes = egcl_compiler::control_scope::ScopeMap::analyze_function(&input.body).ok()?;
+    let scopes = match egcl_compiler::control_scope::ScopeMap::analyze_function(&input.body) {
+        Ok(scopes) => scopes,
+        Err(error) => return decline(&format!("control-scope analysis: {error:?}")),
+    };
     let mut mapped = optimized.clone();
     if has_raw {
         // Only this full-entry clone has raw homes. The worker retains its
         // tagged artifact and T1 OSR path; raw imports require separate recipes.
         mapped.osr_entries.clear();
     }
-    egcl_compiler::t2::build::legalize_transfer_calls(&mut mapped, &scopes).ok()?;
-    egcl_compiler::t2::verify::verify(&mapped).ok()?;
+    if let Err(error) = egcl_compiler::t2::build::legalize_transfer_calls(&mut mapped, &scopes) {
+        return decline(&format!("transfer-call legalization: {error:?}"));
+    }
+    if let Err(error) = egcl_compiler::t2::verify::verify(&mapped) {
+        return decline(&format!("verify after legalization: {error:?}"));
+    }
     Some(PreparedT2 {
         ir: mapped,
         ordinary_ir: optimized.clone(),
