@@ -78,11 +78,13 @@
 //!
 //! # Supported opcodes
 //!
-//! Everything the System Z emitter supports, plus: `Guard` for the CONS tag
+//! The System Z emitter's set apart from `TypeCheck`, plus: `Guard` for the CONS tag
 //! (build.rs emits one before every `Car`/`Cdr`, so refusing it cost whole
 //! functions their T2 code, bliss-2yews); unguarded, effect-free `Car`/`Cdr`
 //! by masking the low three bits of the headerless cons pointer; `LogAnd`,
 //! `LogOr`, `LogXor` directly on tagged bits; `LogNot` with the tag re-cleared;
+//! `GenericEq` (EQ, NULL, NOT, and the NIL test build.rs puts before CAR/CDR)
+//! as a tagged-word compare and `csel`;
 //! and `FixnumShl`/`FixnumShr` by a constant amount, where a negative `Shl`
 //! constant is a right shift (that is how `(ash x -2)` lowers) and a left
 //! shift deopts when the value does not survive the round trip. Fixnum
@@ -748,6 +750,19 @@ impl Emitter<'_> {
                     }
                 }
                 self.asm.jcc(Cc::O, deopt);
+            }
+            GenericEq => {
+                // Lisp EQ (and NULL / NOT, which speculate.rs rewrites to
+                // GenericEq(x, NIL)) is bit-equality of the two tagged words:
+                // no guard, any tagged operands. build.rs also puts one in
+                // front of every CAR/CDR whose operand may be NIL, so refusing
+                // it here cost almost every list-walking function its native
+                // code on this target (bliss-jmwqr).
+                self.load(*data.args.get(1).ok_or_else(unsupported)?, W1)?;
+                self.compare(W0, W1);
+                self.imm(T0, NIL.0);
+                self.imm(T1, T.0);
+                self.asm.word(a64::csel(W0, T1, T0, Cc::E));
             }
             Car | Cdr => {
                 // A cons cell is HEADERLESS and its tagged pointer differs from

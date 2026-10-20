@@ -1175,9 +1175,9 @@ fn car_cdr_metadata_emit_guarded_field_loads_with_a_nil_arm() {
         assert!(CONS_ACCESS_DEOPTED.load(Ordering::SeqCst));
     }
 
-    // Each expansion's cons proof sits in its own arm past a NIL test, so a
-    // CAR proof no longer dominates a later CDR on the same value: both guards
-    // survive the general guard pass (bliss-jmwqr).
+    // A CDR that directly follows a CAR of the same value shares its NIL test
+    // and its cons proof: both loads sit in one cons arm behind one guard
+    // (bliss-jmwqr), so the proof is shared as it was before the NIL arm.
     let both = bytecode_fn(
         "car-then-cdr",
         vec![
@@ -1208,7 +1208,11 @@ fn car_cdr_metadata_emit_guarded_field_loads_with_a_nil_arm() {
             })
             .count()
     };
-    assert_eq!(guard_count(&f, false), 2);
+    assert_eq!(
+        guard_count(&f, false),
+        1,
+        "one NIL test covers both accesses"
+    );
     assert_eq!(guard_count(&f, true), 0, "canonical CL bindings are fixed");
     let mut pm = PassManager::new();
     pm.add(Box::new(GuardElim));
@@ -1216,8 +1220,8 @@ fn car_cdr_metadata_emit_guarded_field_loads_with_a_nil_arm() {
     pm.run(&mut f);
     assert_eq!(
         guard_count(&f, false),
-        2,
-        "each cons proof stays inside its own NIL-checked arm"
+        1,
+        "CAR and CDR share one dominating cons guard"
     );
     assert_eq!(guard_count(&f, true), 0, "fixed bindings need no runtime binding guards");
     verify(&f).expect("optimized CAR/CDR IR verifies");
@@ -1245,6 +1249,39 @@ fn car_cdr_metadata_emit_guarded_field_loads_with_a_nil_arm() {
     frame[0] = NIL.0;
     assert_eq!(EgclVal(run(frame.as_mut_ptr())), NIL);
     assert!(!CONS_ACCESS_DEOPTED.load(Ordering::SeqCst));
+    frame[0] = EgclVal::from_fixnum(7).0;
+    let _ = run(frame.as_mut_ptr());
+    assert!(
+        CONS_ACCESS_DEOPTED.load(Ordering::SeqCst),
+        "the shared guard still sends a non-list to the deopt"
+    );
+
+    // A call between the two accesses could mutate the cell, so the CDR load
+    // must not move above it: each access keeps its own test and guard.
+    let opaque = egcl_rt::symbols::intern("CAR-CDR-OPAQUE-CALLEE");
+    let split = bytecode_fn(
+        "car-call-cdr",
+        vec![
+            Instr::LoadLocal(0),
+            Instr::CallNamed { sym: car, nargs: 1 },
+            Instr::Pop,
+            Instr::CallNamed {
+                sym: opaque,
+                nargs: 0,
+            },
+            Instr::Pop,
+            Instr::LoadLocal(0),
+            Instr::CallNamed { sym: cdr, nargs: 1 },
+            Instr::Return,
+        ],
+        vec![],
+        1,
+        1,
+        1,
+    );
+    let f = build_from_bytecode(&split).expect("build CAR, call, CDR");
+    verify(&f).expect("CAR, call, CDR verifies");
+    assert_eq!(guard_count(&f, false), 2, "a call keeps the accesses apart");
 }
 
 /// A branch that has already found the operand non-NIL makes the NIL arm
