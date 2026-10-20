@@ -285,16 +285,35 @@ fn natively_created_closure_keeps_inherited_nonlocal_exits() {
              (setq r :went)
            done)
           r))
+      ;; A same-named inner block must not hide the exit to the outer one.
+      (defun nlx-shadow (l)
+        (block b
+          (mapcar (lambda (x)
+                    (if (eql x 3)
+                        (nlx-call (lambda () (block b nil) (return-from b :escaped)))
+                        x))
+                  l)))
+      (defun nlx-shadow-deep (l)
+        (block b
+          (mapcar (lambda (x)
+                    (if (eql x 3)
+                        (nlx-call (lambda ()
+                                    (block b nil)
+                                    (nlx-call (lambda () (return-from b :deep)))))
+                        x))
+                  l)))
       (defun nlx-list (n at)
         (let ((l nil)) (dotimes (i n) (push (if (= i at) 3 0) l)) (nreverse l)))
     "#;
     let probe = r#"
       (let ((r nil))
         (dotimes (i 30)
-          (setq r (list (nlx-return (nlx-list 400 350)) (nlx-go (nlx-list 400 350)))))
+          (setq r (list (nlx-return (nlx-list 400 350)) (nlx-go (nlx-list 400 350))
+                        (nlx-shadow (nlx-list 400 350))
+                        (nlx-shadow-deep (nlx-list 400 350)))))
         (format t "NLX=~S~%" r))
     "#;
-    let expected = "NLX=(:ESCAPED :WENT)";
+    let expected = "NLX=(:ESCAPED :WENT :ESCAPED :DEEP)";
     for tier in ["t0", "t1", "t2"] {
         let out = run_case(
             &format!("inherited-nlx-{tier}"),
