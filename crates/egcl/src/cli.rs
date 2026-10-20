@@ -39357,8 +39357,16 @@ fn direct_builtin_table() -> &'static [&'static str] {
     .as_slice()
 }
 
-/// True when `sym` is the very symbol the direct-builtin table's `bare` names:
-/// the COMMON-LISP symbol, which holds the bare registry key.
+/// The symbol a direct-builtin table entry names: the COMMON-LISP symbol, which
+/// holds the bare registry key, or for the extension primitives with no such
+/// symbol (Ironclad's EGCL-EXT:CRYPTO-* block kernels), the EGCL-EXT one.
+fn direct_builtin_symbol_index(bare: &str) -> Option<u32> {
+    egcl_rt::symbols::find_index(bare)
+        .or_else(|| egcl_rt::symbols::find_index(&format!("EGCL-EXT:{bare}")))
+        .or_else(|| egcl_rt::symbols::find_index(&format!("EGCL-EXT::{bare}")))
+}
+
+/// True when `sym` is the very symbol the direct-builtin table's `bare` names.
 ///
 /// The table matches by name, so without this a same-named symbol of another
 /// package -- `(defgeneric other::length (x))` in a package that does not use
@@ -39366,7 +39374,7 @@ fn direct_builtin_table() -> &'static [&'static str] {
 /// it fills the symbol's function cell, which the callers refuse on; a generic
 /// function lives in the generic-function tables and leaves the cell empty.
 fn is_direct_builtin_symbol(sym: u32, bare: &str) -> bool {
-    egcl_rt::symbols::find_index(bare) == Some(sym)
+    direct_builtin_symbol_index(bare) == Some(sym)
 }
 
 /// EMIT TIME: the table slot for calling `sym` with `nargs` arguments, or
@@ -39473,7 +39481,7 @@ pub(super) fn direct_builtin_report() -> Vec<String> {
     direct_builtin_table()
         .iter()
         .map(|&name| {
-            let Some(idx) = egcl_rt::symbols::find_index(name) else {
+            let Some(idx) = direct_builtin_symbol_index(name) else {
                 return format!("{name}: no symbol");
             };
             let interp = egcl_rt::symbols::symbol_function(idx)

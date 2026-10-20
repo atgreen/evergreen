@@ -69,3 +69,44 @@ fn compiled_calls_reach_another_packages_generic_length_and_first() {
         assert!(stdout.contains(expected), "missing {expected:?} in:\n{stdout}");
     }
 }
+
+/// The table's EGCL-EXT entries resolve too. Ironclad's block kernels
+/// (`egcl-ext:crypto-ghash-mul` and the rest) have no COMMON-LISP symbol, so a
+/// check that accepted only the CL symbol for a name sent every compiled call
+/// to them the general way, ~10x slower per call.
+#[test]
+fn the_egcl_ext_crypto_primitives_stay_direct() {
+    let output = Command::new("timeout")
+        .args(["--kill-after=10", "120", env!("CARGO_BIN_EXE_egcl")])
+        // The symbols are interned when first read, as Ironclad's source reads them.
+        .args([
+            "--no-init",
+            "--eval",
+            "(cl:list 'egcl-ext::crypto-aes-encrypt-block 'egcl-ext::crypto-aes-decrypt-block \
+                      'egcl-ext::crypto-ghash-mul 'egcl-ext::crypto-sha256-block \
+                      'egcl-ext::crypto-sha256-words)",
+        ])
+        .env("EGCL_DIRECT_BUILTIN_STATS", "1")
+        .output()
+        .expect("run egcl");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    for name in [
+        "LENGTH",
+        "FIRST",
+        "CRYPTO-AES-ENCRYPT-BLOCK",
+        "CRYPTO-AES-DECRYPT-BLOCK",
+        "CRYPTO-GHASH-MUL",
+        "CRYPTO-SHA256-BLOCK",
+        "CRYPTO-SHA256-WORDS",
+    ] {
+        let line = stderr
+            .lines()
+            .find(|line| {
+                let entry = line.trim_start_matches("[direct-builtin]").trim_start();
+                entry.starts_with(&format!("{name}:"))
+            })
+            .unwrap_or_else(|| panic!("no report line for {name}:\n{stderr}"));
+        assert!(line.contains("direct=true"), "{name} is not direct: {line}");
+    }
+}
