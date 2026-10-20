@@ -39370,6 +39370,26 @@ fn direct_builtin_table() -> &'static [&'static str] {
     .as_slice()
 }
 
+/// The symbol a direct-builtin table entry names: the COMMON-LISP symbol, which
+/// holds the bare registry key, or for the extension primitives with no such
+/// symbol (Ironclad's EGCL-EXT:CRYPTO-* block kernels), the EGCL-EXT one.
+fn direct_builtin_symbol_index(bare: &str) -> Option<u32> {
+    egcl_rt::symbols::find_index(bare)
+        .or_else(|| egcl_rt::symbols::find_index(&format!("EGCL-EXT:{bare}")))
+        .or_else(|| egcl_rt::symbols::find_index(&format!("EGCL-EXT::{bare}")))
+}
+
+/// True when `sym` is the very symbol the direct-builtin table's `bare` names.
+///
+/// The table matches by name, so without this a same-named symbol of another
+/// package -- `(defgeneric other::length (x))` in a package that does not use
+/// COMMON-LISP -- was called as CL:LENGTH. A DEFUN of it was safe only because
+/// it fills the symbol's function cell, which the callers refuse on; a generic
+/// function lives in the generic-function tables and leaves the cell empty.
+fn is_direct_builtin_symbol(sym: u32, bare: &str) -> bool {
+    direct_builtin_symbol_index(bare) == Some(sym)
+}
+
 /// EMIT TIME: the table slot for calling `sym` with `nargs` arguments, or
 /// `None` if this site must go the general way.
 ///
@@ -39386,6 +39406,9 @@ fn direct_builtin_slot(sym: u32, nargs: usize) -> Option<u32> {
     let full = sym_name_uncached(EgclVal::from_symbol_index(sym));
     let bare = symbol_bare_name(&full);
     let slot = direct_builtin_table().iter().position(|&n| n == bare)?;
+    if !is_direct_builtin_symbol(sym, &bare) {
+        return None;
+    }
     // Arity must be one this builtin actually accepts, so a wrong-count call
     // still raises the PROGRAM-ERROR `apply_function`'s guard would raise
     // rather than reaching a kernel that ignores the extra arguments.
@@ -39471,7 +39494,7 @@ pub(super) fn direct_builtin_report() -> Vec<String> {
     direct_builtin_table()
         .iter()
         .map(|&name| {
-            let Some(idx) = egcl_rt::symbols::find_index(name) else {
+            let Some(idx) = direct_builtin_symbol_index(name) else {
                 return format!("{name}: no symbol");
             };
             let interp = egcl_rt::symbols::symbol_function(idx)
@@ -39494,6 +39517,9 @@ fn direct_builtin_resolve(sym: u32) -> BuiltinMemo {
     let Some(slot) = direct_builtin_table().iter().position(|&n| n == bare) else {
         return BuiltinMemo::No;
     };
+    if !is_direct_builtin_symbol(sym, &bare) {
+        return BuiltinMemo::No;
+    }
     // Arity range only where one is declared. `apply_function` applies its
     // PROGRAM-ERROR arity guard on exactly the same condition, so gating on a
     // declared arity would refuse the variadic builtins (+, AREF, EQ, MOD, …)
