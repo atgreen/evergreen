@@ -26,12 +26,16 @@ const PROGRAM: &str = r#"
 "#;
 
 fn depths(stack_size: Option<&str>) -> (u64, u64) {
+    depths_with(stack_size.map(|size| ("EGCL_STACK_SIZE", size)))
+}
+
+fn depths_with(env: Option<(&str, &str)>) -> (u64, u64) {
     let mut command = Command::new("timeout");
     command
         .args(["--kill-after=10", "300", env!("CARGO_BIN_EXE_egcl")])
         .args(["--no-init", "--eval", &format!("(progn {PROGRAM})")]);
-    if let Some(size) = stack_size {
-        command.env("EGCL_STACK_SIZE", size);
+    if let Some((name, value)) = env {
+        command.env(name, value);
     }
     let output = command.output().expect("run egcl");
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -66,5 +70,17 @@ fn egcl_stack_size_sizes_a_threads_stack() {
     assert!(
         large >= default * 2,
         "EGCL_STACK_SIZE=64m left a thread at {large} deep (default {default})"
+    );
+}
+
+/// An explicit thread stack size overrides `RUST_MIN_STACK`, so it is kept
+/// as a floor: a deployment that raised it still gets the larger stack.
+#[test]
+fn rust_min_stack_still_raises_a_threads_stack() {
+    let (_, default) = depths(None);
+    let (_, large) = depths_with(Some(("RUST_MIN_STACK", "67108864")));
+    assert!(
+        large >= default * 2,
+        "RUST_MIN_STACK=64 MiB left a thread at {large} deep (default {default})"
     );
 }

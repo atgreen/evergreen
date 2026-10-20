@@ -183,21 +183,31 @@ pub(crate) const DEFAULT_STACK_SIZE: usize = if cfg!(any(
 /// of a large script inside a deep object tree). Now `EGCL_STACK_SIZE` sizes
 /// it when set; otherwise the thread gets the main thread's soft
 /// `RLIMIT_STACK`, so the two can recurse alike; failing that, 8 MiB. Never
-/// below 1 MiB, which the runtime's own frames need.
+/// below 1 MiB, which the runtime's own frames need, nor below
+/// `RUST_MIN_STACK`, which an explicit size would otherwise override.
 fn native_thread_stack_size() -> usize {
     const FLOOR: usize = 1024 * 1024;
     const DEFAULT: usize = 8 * 1024 * 1024;
-    if std::env::var("EGCL_STACK_SIZE").is_ok() {
-        return default_stack_size().max(FLOOR);
-    }
-    #[cfg(unix)]
-    if let Ok(rl) = crate::syscall::getrlimit(crate::syscall::RLIMIT_STACK) {
-        let soft = rl.rlim_cur;
-        if soft != 0 && soft != crate::syscall::RLIM_INFINITY {
-            return (soft as usize).max(FLOOR);
+    let rust_min_stack = std::env::var("RUST_MIN_STACK")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    let size = (|| {
+        // A value that does not parse falls through, rather than to the
+        // fibers' small default.
+        if let Some(size) = env_stack_size() {
+            return size;
         }
-    }
-    DEFAULT
+        #[cfg(unix)]
+        if let Ok(rl) = crate::syscall::getrlimit(crate::syscall::RLIMIT_STACK) {
+            let soft = rl.rlim_cur;
+            if soft != 0 && soft != crate::syscall::RLIM_INFINITY {
+                return soft as usize;
+            }
+        }
+        DEFAULT
+    })();
+    size.max(FLOOR).max(rust_min_stack)
 }
 
 /// Usable `EgclStack` size for a fiber, honouring `EGCL_STACK_SIZE`
@@ -206,6 +216,11 @@ fn native_thread_stack_size() -> usize {
 /// Deep interpreted recursion is bounded by this size once CL activations live
 /// on the `EgclStack` (bliss-nmq): overflow raises `STORAGE-CONDITION` (R2.20).
 fn default_stack_size() -> usize {
+    env_stack_size().unwrap_or(DEFAULT_STACK_SIZE)
+}
+
+/// `EGCL_STACK_SIZE` as a positive byte count, or `None` when unset or unparseable.
+fn env_stack_size() -> Option<usize> {
     fn parse_size(s: &str) -> Option<usize> {
         let s = s.trim();
         if s.is_empty() {
@@ -223,7 +238,6 @@ fn default_stack_size() -> usize {
         .ok()
         .and_then(|v| parse_size(&v))
         .filter(|&n| n > 0)
-        .unwrap_or(DEFAULT_STACK_SIZE)
 }
 
 /// Unique identifier for an exposed one-to-one OS native thread.
