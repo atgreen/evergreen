@@ -1726,7 +1726,8 @@ fn packed_f64_native_body(body: &BytecodeFunction, ir: &egcl_compiler::t2::ir::F
                 | Instr::PushHandlerCase { .. } | Instr::PopHandlerCase
                 | Instr::PushHandlerBind { .. } | Instr::PopHandlerBind
                 | Instr::PushRestartCase { .. } | Instr::PopRestartCase
-                | Instr::BindSpecial(_) | Instr::UnbindSpecial(_)))
+                | Instr::BindSpecial(_) | Instr::UnbindSpecial(_)
+                | Instr::LoadFunction(_)))
 }
 
 fn local_control_native_body(body: &BytecodeFunction, allow_values: bool, allow_local_scopes: bool, allow_primary_transport: bool) -> bool {
@@ -1746,7 +1747,11 @@ fn local_control_native_body(body: &BytecodeFunction, allow_values: bool, allow_
                     | Instr::PushHandlerCase { .. } | Instr::PopHandlerCase
                     | Instr::PushHandlerBind { .. } | Instr::PopHandlerBind
                     | Instr::PushRestartCase { .. } | Instr::PopRestartCase
-                    | Instr::BindSpecial(_) | Instr::UnbindSpecial(_)))
+                    | Instr::BindSpecial(_) | Instr::UnbindSpecial(_)
+                    // #'f lowers to an argument-free FunctionLookup Invoke. It
+                    // needs the native-cleanups transfer emitter that mapped T1
+                    // already uses; ordinary entries still decline it (bliss-j3fv8).
+                    | Instr::LoadFunction(_)))
             || matches!(
                 op,
                 Instr::Const(_)

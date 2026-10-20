@@ -672,9 +672,9 @@ fn automatic_tiering_observably_progresses_t0_to_t1_to_t2() {
 }
 
 /// Reaching the T2 threshold is a request, not permission to discard working
-/// code. Linux uses a fixed-arity LoadFunction body: mapped T1 supports it,
-/// while ordinary T2 declines it (bliss-j3fv8). The checked backend uses
-/// a CAPTURING variadic body (its &rest is boxed for a closure) is
+/// code. Linux uses a fixed-arity left shift by 63: mapped T1 supports it,
+/// while the T2 emitters still refuse a shift count above 62. The checked
+/// backend uses a CAPTURING variadic body (its &rest is boxed for a closure) is
 /// unsupported by T2's slot-only entry, so it keeps its T1 entry (bliss-32l;
 /// non-capturing variadic functions do reach T2).
 #[test]
@@ -685,12 +685,15 @@ fn automatic_t2_decline_retains_t1() {
         (auto-rest 1) (auto-rest 1 2) (auto-rest 1 2 3) \
         (format t \"~a ~a~%\" \
           (egcl-ext:function-tier (quote auto-rest)) (auto-rest 1 2 3 4))";
-    let program = if MAPPED_LINUX {
-        "(defun auto-rest (x) (funcall #'identity x))
+    let (program, expected) = if MAPPED_LINUX {
+        (
+            "(defun auto-rest (x) (ash x 63))
          (dotimes (i 20) (auto-rest i))
-         (format t \"~a ~a~%\" (egcl-ext:function-tier 'auto-rest) (auto-rest 4))"
+         (format t \"~a ~a~%\" (egcl-ext:function-tier 'auto-rest) (auto-rest 4))",
+            "1 36893488147419103232",
+        )
     } else {
-        program
+        (program, "1 4")
     };
     let (out, ok) = run(
         program,
@@ -702,7 +705,7 @@ fn automatic_t2_decline_retains_t1() {
     assert!(ok, "T2-decline run failed: {out}");
     assert_eq!(
         out.lines().next(),
-        Some("1 4"),
+        Some(expected),
         "declined T2 must retain T1: {out}"
     );
 }
@@ -776,8 +779,8 @@ fn explicit_t2_disable_pins_hot_function_at_t1() {
 }
 
 /// Once a caller becomes native, its c2i calls still count and promote the
-/// callee. Linux uses a fixed-arity LoadFunction caller to retain actual mapped
-/// T1 execution (ordinary T2 admission remains bliss-j3fv8). The checked
+/// callee. Linux uses a fixed-arity LoadFunction caller, which itself reaches
+/// mapped T2 (bliss-j3fv8) and keeps calling the leaf natively. The checked
 /// backend uses a CAPTURING variadic caller deliberately stays T1 (its &rest is
 /// boxed for the closure, so it is declined from T2 — bliss-32l) so the
 /// fixed-arity leaf is reached through the native adapter long enough to become T2.
@@ -811,7 +814,7 @@ fn native_caller_continues_warming_callee_to_t2() {
     assert!(ok, "native-caller warmup failed: {out}");
     assert_eq!(
         out.lines().next(),
-        Some("1 2 35"),
+        Some(if MAPPED_LINUX { "2 2 35" } else { "1 2 35" }),
         "callee must reach T2: {out}"
     );
 }
