@@ -18614,6 +18614,37 @@ extern "C" fn c2i_make_bytecode_closure(nested: *const Arc<BytecodeFunction>, ca
     }
 }
 
+/// `CheckResult`: validate the primary against a declared result type.
+///
+/// The value stays where the emitter left it -- the T0 arm pops and pushes the
+/// same word -- so this takes it by value purely to inspect it, and returns
+/// nothing. On a violation it stashes the TYPE-ERROR `validate_declared_value`
+/// builds, and the caller's transfer check leaves the activation, exactly as
+/// an erroring call does.
+///
+/// Does NOT clear the MV state: a successful result assertion leaves the
+/// multiple-values tuple intact, which is what makes
+/// `(values acc :secondary)` keep its secondary value through a declared
+/// `ftype`. The `DeclaredType` is passed flattened because it has to cross an
+/// `extern "C"` boundary: `kind` is its discriminant and the bounds are read
+/// only for `FixnumRange`.
+#[cfg(all(target_arch = "aarch64", unix))]
+extern "C" fn c2i_check_result(value: u64, kind: u64, lower: i64, upper: i64) {
+    let declared = match kind {
+        1 => DeclaredType::Fixnum,
+        2 => DeclaredType::SingleFloat,
+        3 => DeclaredType::FixnumRange { lower, upper },
+        _ => DeclaredType::Any,
+    };
+    match guard_c2i(|| {
+        validate_declared_value(declared, EgclVal(value))?;
+        Ok(NIL)
+    }) {
+        Ok(_) => {}
+        Err(error) => stash_native_error(error),
+    }
+}
+
 extern "C" fn c2i_alloc_cons(car: u64, cdr: u64) -> u64 {
     match guard_c2i(|| {
         egcl_rt::rooted!(car = EgclVal(car));
