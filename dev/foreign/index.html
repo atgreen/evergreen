@@ -949,6 +949,34 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#embedded-libraries" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Embedded libraries
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Embedded libraries">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#replacing-embedded-libraries" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Replacing embedded libraries
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#foreign-call" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2118,6 +2146,34 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#embedded-libraries" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Embedded libraries
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Embedded libraries">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#replacing-embedded-libraries" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Replacing embedded libraries
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#foreign-call" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2297,39 +2353,104 @@ is distinct from a foreign pointer. Supplying the library to symbol lookup
 makes the lookup scope explicit; omitting it uses the default lookup scope.
 Close the library only when no code can call its symbols or use its data.
 Failures are reported through the FFI error interface.</p>
+<h3 id="embedded-libraries">Embedded libraries<a class="headerlink" href="#embedded-libraries" title="Permanent link">&para;</a></h3>
+<p><strong>Functions</strong></p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="p">(</span><span class="nv">egcl-ffi:embed-foreign-library</span><span class="w"> </span><span class="nv">path</span><span class="w"> </span><span class="k">&amp;key</span><span class="w"> </span><span class="nv">names</span><span class="p">)</span><span class="w">    </span><span class="c1">; name it is reported under</span>
+<a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="p">(</span><span class="nv">egcl-ffi:embedded-foreign-libraries</span><span class="p">)</span><span class="w">               </span><span class="c1">; list of names</span>
+<a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="p">(</span><span class="nv">egcl-ffi:embedded-foreign-library-p</span><span class="w"> </span><span class="nv">name</span><span class="p">)</span><span class="w">          </span><span class="c1">; generalized boolean</span>
+</code></pre></div>
+<p><code>embed-foreign-library</code> reads the shared object at <code>path</code> now, on the build
+host, and carries it in every image saved afterwards, including an
+<code>:executable</code> one. <code>load-foreign-library</code> then finds it on any host, without
+the file, under its ELF SONAME, under the absolute <code>path</code> it was embedded
+from, or under any string in <code>names</code>. An embedded library shadows a file of the
+same name. Embedding under a name already in use replaces that library. The
+return value is the SONAME, or the absolute path when the library has none.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="c1">;; Build time</span>
+<a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a><span class="p">(</span><span class="nv">egcl-ffi:embed-foreign-library</span><span class="w"> </span><span class="s">"/usr/lib64/libsqlite3.so.0"</span><span class="p">)</span>
+<a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a><span class="p">(</span><span class="nv">egcl-ext:save-lisp-and-die</span><span class="w"> </span><span class="s">"app"</span><span class="w"> </span><span class="ss">:executable</span><span class="w"> </span><span class="no">t</span><span class="p">)</span>
+<a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a>
+<a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a><span class="c1">;; Run time, on a host without libsqlite3</span>
+<a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a><span class="p">(</span><span class="nv">egcl-ffi:load-foreign-library</span><span class="w"> </span><span class="s">"libsqlite3.so.0"</span><span class="p">)</span>
+</code></pre></div>
+<p>The library is not extracted to disk. With the <code>c-ffi</code> backend on glibc Linux,
+its bytes are copied from the image into an anonymous in-memory file, which is
+sealed against change and checked against its CRC-32 before the system loader
+opens it. Debuggers, <code>perf</code> and <code>/proc/PID/maps</code>
+show it as <code>/memfd:SONAME</code>. Embedded libraries that it names as <code>DT_NEEDED</code>
+dependencies are loaded first, so they too come from the image. Dependencies
+that are not embedded, such as <code>libc.so.6</code>, are found by the usual search.</p>
+<p>The library must be built for the runtime's architecture, and the host must
+allow executable in-memory files: a kernel with <code>vm.memfd_noexec=2</code> refuses
+them, and <code>/proc</code> must be mounted. Because the loader keeps one library per
+SONAME, loading an embedded library is an error if a library with the same
+SONAME was already loaded from somewhere else, unless that is the very file it
+was embedded from, unchanged: then the loaded library is returned, so a build
+can load a library before embedding it. Embedding needs an ELF host (Linux).
+Other Linux builds, such as the default static musl one, can embed and save
+libraries but report an error when asked to load one. Embedding a library
+distributes it: check its license.</p>
+<h4 id="replacing-embedded-libraries">Replacing embedded libraries<a class="headerlink" href="#replacing-embedded-libraries" title="Permanent link">&para;</a></h4>
+<p>A saved executable is the runtime followed by a zip archive, and a core file
+that carries libraries is that archive alone. Zip readers skip the runtime in
+front, so standard tools list and edit the libraries, and the program needs no
+rebuild afterwards. Licenses such as the LGPL require that users can do this
+with their own builds of a library.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="gp">$ </span>unzip<span class="w"> </span>-l<span class="w"> </span>app
+<a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a><span class="go">  Length      Date    Time    Name</span>
+<a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a><span class="go">---------  ---------- -----   ----</span>
+<a id="__codelineno-7-4" name="__codelineno-7-4" href="#__codelineno-7-4"></a><span class="go">      196  01-01-1980 00:00   egcl/manifest</span>
+<a id="__codelineno-7-5" name="__codelineno-7-5" href="#__codelineno-7-5"></a><span class="go">  2736541  01-01-1980 00:00   egcl/core</span>
+<a id="__codelineno-7-6" name="__codelineno-7-6" href="#__codelineno-7-6"></a><span class="go">   969416  01-01-1980 00:00   lib/libsqlite3.so.0</span>
+<a id="__codelineno-7-7" name="__codelineno-7-7" href="#__codelineno-7-7"></a><span class="gp">$ </span>mkdir<span class="w"> </span>lib<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>cp<span class="w"> </span>~/build/sqlite/libsqlite3.so.0<span class="w"> </span>lib/
+<a id="__codelineno-7-8" name="__codelineno-7-8" href="#__codelineno-7-8"></a><span class="gp">$ </span>mv<span class="w"> </span>app<span class="w"> </span>app.zip<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>zip<span class="w"> </span>app.zip<span class="w"> </span>lib/libsqlite3.so.0<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>mv<span class="w"> </span>app.zip<span class="w"> </span>app
+</code></pre></div>
+<p>Each library is a member under <code>lib/</code>, named after its SONAME. A member
+replaced this way keeps the names the original answered to. A member added by
+hand answers to its file name, so name it after the library's SONAME; one
+removed is no longer embedded. Members may be stored or deflated, as <code>zip</code>
+does by default. Info-ZIP's <code>zip</code> only accepts an archive whose name ends in
+<code>.zip</code>, hence the renames. Python's <code>zipfile</code> also works. 7-Zip refuses an
+archive behind a runtime of more than a few megabytes.</p>
+<p><code>egcl/core</code> must stay stored (uncompressed), because it is mapped from the
+file in place. <code>zip</code> copies members it is not given unchanged, so this matters
+only when re-adding the core: use <code>zip -0</code> for it. <code>egcl/manifest</code> records
+each library's names and whether the executable is an application. Stripping
+the executable removes the archive, as it removes the image of any saved
+executable.</p>
 <h3 id="foreign-call"><code>egcl-ffi:foreign-call</code><a class="headerlink" href="#foreign-call" title="Permanent link">&para;</a></h3>
 <p><strong>Function</strong></p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="p">(</span><span class="nv">egcl-ffi:foreign-call</span><span class="w"> </span><span class="nv">pointer</span><span class="w"> </span><span class="nv">return-type</span><span class="w"> </span><span class="nv">argument-types</span><span class="w"> </span><span class="nv">arguments</span>
-<a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="w">                        </span><span class="k">&amp;optional</span><span class="w"> </span><span class="nv">fixed-count</span><span class="p">)</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="p">(</span><span class="nv">egcl-ffi:foreign-call</span><span class="w"> </span><span class="nv">pointer</span><span class="w"> </span><span class="nv">return-type</span><span class="w"> </span><span class="nv">argument-types</span><span class="w"> </span><span class="nv">arguments</span>
+<a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a><span class="w">                        </span><span class="k">&amp;optional</span><span class="w"> </span><span class="nv">fixed-count</span><span class="p">)</span>
 </code></pre></div>
 <p>Calls a foreign entry point. <code>argument-types</code> and <code>arguments</code> are corresponding
 lists: arguments are not supplied as Lisp rest arguments. For a variadic C
 function, supply the number of fixed arguments as the final parameter so the
 runtime can apply the appropriate ABI rules and promotions.</p>
 <p>For example, with a library exporting <code>int twice(int)</code>:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="p">(</span><span class="k">let</span><span class="w"> </span><span class="p">((</span><span class="nv">library</span><span class="w"> </span><span class="p">(</span><span class="nv">egcl-ffi:load-foreign-library</span><span class="w"> </span><span class="s">"./libexample.so"</span><span class="p">)))</span>
-<a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a><span class="w">  </span><span class="p">(</span><span class="k">unwind-protect</span>
-<a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a><span class="w">      </span><span class="p">(</span><span class="nv">egcl-ffi:foreign-call</span>
-<a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a><span class="w">        </span><span class="p">(</span><span class="nv">egcl-ffi:foreign-symbol-pointer</span><span class="w"> </span><span class="s">"twice"</span><span class="w"> </span><span class="nv">library</span><span class="p">)</span>
-<a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a><span class="w">        </span><span class="ss">:int</span><span class="w"> </span><span class="o">'</span><span class="p">(</span><span class="ss">:int</span><span class="p">)</span><span class="w"> </span><span class="o">'</span><span class="p">(</span><span class="mi">21</span><span class="p">))</span>
-<a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a><span class="w">    </span><span class="p">(</span><span class="nv">egcl-ffi:close-foreign-library</span><span class="w"> </span><span class="nv">library</span><span class="p">)))</span>
-<a id="__codelineno-6-7" name="__codelineno-6-7" href="#__codelineno-6-7"></a><span class="c1">;; =&gt; 42</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="p">(</span><span class="k">let</span><span class="w"> </span><span class="p">((</span><span class="nv">library</span><span class="w"> </span><span class="p">(</span><span class="nv">egcl-ffi:load-foreign-library</span><span class="w"> </span><span class="s">"./libexample.so"</span><span class="p">)))</span>
+<a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a><span class="w">  </span><span class="p">(</span><span class="k">unwind-protect</span>
+<a id="__codelineno-9-3" name="__codelineno-9-3" href="#__codelineno-9-3"></a><span class="w">      </span><span class="p">(</span><span class="nv">egcl-ffi:foreign-call</span>
+<a id="__codelineno-9-4" name="__codelineno-9-4" href="#__codelineno-9-4"></a><span class="w">        </span><span class="p">(</span><span class="nv">egcl-ffi:foreign-symbol-pointer</span><span class="w"> </span><span class="s">"twice"</span><span class="w"> </span><span class="nv">library</span><span class="p">)</span>
+<a id="__codelineno-9-5" name="__codelineno-9-5" href="#__codelineno-9-5"></a><span class="w">        </span><span class="ss">:int</span><span class="w"> </span><span class="o">'</span><span class="p">(</span><span class="ss">:int</span><span class="p">)</span><span class="w"> </span><span class="o">'</span><span class="p">(</span><span class="mi">21</span><span class="p">))</span>
+<a id="__codelineno-9-6" name="__codelineno-9-6" href="#__codelineno-9-6"></a><span class="w">    </span><span class="p">(</span><span class="nv">egcl-ffi:close-foreign-library</span><span class="w"> </span><span class="nv">library</span><span class="p">)))</span>
+<a id="__codelineno-9-7" name="__codelineno-9-7" href="#__codelineno-9-7"></a><span class="c1">;; =&gt; 42</span>
 </code></pre></div>
 <p>Build that example library on Linux with:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="kt">int</span><span class="w"> </span><span class="nf">twice</span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">value</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="n">value</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span><span class="w"> </span><span class="p">}</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a><span class="kt">int</span><span class="w"> </span><span class="nf">twice</span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">value</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="n">value</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span><span class="w"> </span><span class="p">}</span>
 </code></pre></div>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a>cc<span class="w"> </span>-shared<span class="w"> </span>-fPIC<span class="w"> </span>example.c<span class="w"> </span>-o<span class="w"> </span>libexample.so
+<div class="highlight"><pre><span></span><code><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a>cc<span class="w"> </span>-shared<span class="w"> </span>-fPIC<span class="w"> </span>example.c<span class="w"> </span>-o<span class="w"> </span>libexample.so
 </code></pre></div>
 <p>The C compiler and library must target the same architecture as the EGCL
 runtime doing the call. The sample filename and command are Linux-specific.</p>
 <h2 id="callbacks_1">Callbacks<a class="headerlink" href="#callbacks_1" title="Permanent link">&para;</a></h2>
 <h3 id="callbacks">Callback lifetime<a class="headerlink" href="#callbacks" title="Permanent link">&para;</a></h3>
 <p><strong>Functions</strong></p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="p">(</span><span class="nv">egcl-ffi:make-callback</span><span class="w"> </span><span class="k">function</span><span class="w"> </span><span class="nv">return-type</span><span class="w"> </span><span class="nv">argument-types</span><span class="p">)</span>
-<a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a><span class="p">(</span><span class="nv">egcl-ffi:callback-pointer</span><span class="w"> </span><span class="nv">callback</span><span class="p">)</span>
-<a id="__codelineno-9-3" name="__codelineno-9-3" href="#__codelineno-9-3"></a><span class="p">(</span><span class="nv">egcl-ffi:foreign-callback-p</span><span class="w"> </span><span class="nv">object</span><span class="p">)</span>
-<a id="__codelineno-9-4" name="__codelineno-9-4" href="#__codelineno-9-4"></a><span class="p">(</span><span class="nv">egcl-ffi:free-callback</span><span class="w"> </span><span class="nv">callback</span><span class="p">)</span>
-<a id="__codelineno-9-5" name="__codelineno-9-5" href="#__codelineno-9-5"></a><span class="p">(</span><span class="nv">egcl-ffi:callback-error</span><span class="w"> </span><span class="nv">callback</span><span class="p">)</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a><span class="p">(</span><span class="nv">egcl-ffi:make-callback</span><span class="w"> </span><span class="k">function</span><span class="w"> </span><span class="nv">return-type</span><span class="w"> </span><span class="nv">argument-types</span><span class="p">)</span>
+<a id="__codelineno-12-2" name="__codelineno-12-2" href="#__codelineno-12-2"></a><span class="p">(</span><span class="nv">egcl-ffi:callback-pointer</span><span class="w"> </span><span class="nv">callback</span><span class="p">)</span>
+<a id="__codelineno-12-3" name="__codelineno-12-3" href="#__codelineno-12-3"></a><span class="p">(</span><span class="nv">egcl-ffi:foreign-callback-p</span><span class="w"> </span><span class="nv">object</span><span class="p">)</span>
+<a id="__codelineno-12-4" name="__codelineno-12-4" href="#__codelineno-12-4"></a><span class="p">(</span><span class="nv">egcl-ffi:free-callback</span><span class="w"> </span><span class="nv">callback</span><span class="p">)</span>
+<a id="__codelineno-12-5" name="__codelineno-12-5" href="#__codelineno-12-5"></a><span class="p">(</span><span class="nv">egcl-ffi:callback-error</span><span class="w"> </span><span class="nv">callback</span><span class="p">)</span>
 </code></pre></div>
 <p><code>make-callback</code> returns a callback object; use <code>callback-pointer</code> to obtain the
 entry pointer passed to C. Keep the callback alive until all C references and
@@ -2341,12 +2462,12 @@ errors recorded on a foreign thread. Callback support must be checked for the
 target architecture separately from scalar foreign calls.</p>
 <p>On a runtime with callback support (x86-64 and s390x), a callback can be exercised through
 the same call interface before giving it to a C library:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a><span class="p">(</span><span class="k">let</span><span class="w"> </span><span class="p">((</span><span class="nv">callback</span><span class="w"> </span><span class="p">(</span><span class="nv">egcl-ffi:make-callback</span><span class="w"> </span><span class="p">(</span><span class="k">lambda</span><span class="w"> </span><span class="p">(</span><span class="nv">x</span><span class="p">)</span><span class="w"> </span><span class="p">(</span><span class="nb">+</span><span class="w"> </span><span class="nv">x</span><span class="w"> </span><span class="mi">1</span><span class="p">))</span><span class="w"> </span><span class="ss">:int</span><span class="w"> </span><span class="o">'</span><span class="p">(</span><span class="ss">:int</span><span class="p">))))</span>
-<a id="__codelineno-10-2" name="__codelineno-10-2" href="#__codelineno-10-2"></a><span class="w">  </span><span class="p">(</span><span class="k">unwind-protect</span>
-<a id="__codelineno-10-3" name="__codelineno-10-3" href="#__codelineno-10-3"></a><span class="w">      </span><span class="p">(</span><span class="nv">egcl-ffi:foreign-call</span><span class="w"> </span><span class="p">(</span><span class="nv">egcl-ffi:callback-pointer</span><span class="w"> </span><span class="nv">callback</span><span class="p">)</span>
-<a id="__codelineno-10-4" name="__codelineno-10-4" href="#__codelineno-10-4"></a><span class="w">                              </span><span class="ss">:int</span><span class="w"> </span><span class="o">'</span><span class="p">(</span><span class="ss">:int</span><span class="p">)</span><span class="w"> </span><span class="o">'</span><span class="p">(</span><span class="mi">41</span><span class="p">))</span>
-<a id="__codelineno-10-5" name="__codelineno-10-5" href="#__codelineno-10-5"></a><span class="w">    </span><span class="p">(</span><span class="nv">egcl-ffi:free-callback</span><span class="w"> </span><span class="nv">callback</span><span class="p">)))</span>
-<a id="__codelineno-10-6" name="__codelineno-10-6" href="#__codelineno-10-6"></a><span class="c1">;; =&gt; 42</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-13-1" name="__codelineno-13-1" href="#__codelineno-13-1"></a><span class="p">(</span><span class="k">let</span><span class="w"> </span><span class="p">((</span><span class="nv">callback</span><span class="w"> </span><span class="p">(</span><span class="nv">egcl-ffi:make-callback</span><span class="w"> </span><span class="p">(</span><span class="k">lambda</span><span class="w"> </span><span class="p">(</span><span class="nv">x</span><span class="p">)</span><span class="w"> </span><span class="p">(</span><span class="nb">+</span><span class="w"> </span><span class="nv">x</span><span class="w"> </span><span class="mi">1</span><span class="p">))</span><span class="w"> </span><span class="ss">:int</span><span class="w"> </span><span class="o">'</span><span class="p">(</span><span class="ss">:int</span><span class="p">))))</span>
+<a id="__codelineno-13-2" name="__codelineno-13-2" href="#__codelineno-13-2"></a><span class="w">  </span><span class="p">(</span><span class="k">unwind-protect</span>
+<a id="__codelineno-13-3" name="__codelineno-13-3" href="#__codelineno-13-3"></a><span class="w">      </span><span class="p">(</span><span class="nv">egcl-ffi:foreign-call</span><span class="w"> </span><span class="p">(</span><span class="nv">egcl-ffi:callback-pointer</span><span class="w"> </span><span class="nv">callback</span><span class="p">)</span>
+<a id="__codelineno-13-4" name="__codelineno-13-4" href="#__codelineno-13-4"></a><span class="w">                              </span><span class="ss">:int</span><span class="w"> </span><span class="o">'</span><span class="p">(</span><span class="ss">:int</span><span class="p">)</span><span class="w"> </span><span class="o">'</span><span class="p">(</span><span class="mi">41</span><span class="p">))</span>
+<a id="__codelineno-13-5" name="__codelineno-13-5" href="#__codelineno-13-5"></a><span class="w">    </span><span class="p">(</span><span class="nv">egcl-ffi:free-callback</span><span class="w"> </span><span class="nv">callback</span><span class="p">)))</span>
+<a id="__codelineno-13-6" name="__codelineno-13-6" href="#__codelineno-13-6"></a><span class="c1">;; =&gt; 42</span>
 </code></pre></div>
 <h2 id="conditions-and-sandboxing">Conditions and sandboxing<a class="headerlink" href="#conditions-and-sandboxing" title="Permanent link">&para;</a></h2>
 <p><code>egcl-ffi:ffi-error</code> is the public FFI condition. Invalid pointer ownership,

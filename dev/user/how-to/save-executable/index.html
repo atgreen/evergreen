@@ -2395,7 +2395,9 @@ only <code>+</code>, <code>&lt;</code>, <code>=</code>, <code>FUNCALL</code>, an
 </tr>
 </tbody>
 </table>
-<p>The executable totals include the 16-byte image trailer. These are a small
+<p>The executable totals include the zip archive's few hundred bytes of headers
+and directory; at that commit, executables ended with a 16-byte image trailer
+instead. These are a small
 fixture's measurements, not a promised size for other applications. The tests
 check omitted compiler and builtin symbols and execute with automatic tiering,
 forced-tier requests, and low promotion/OSR thresholds. Ordinary bootstrap
