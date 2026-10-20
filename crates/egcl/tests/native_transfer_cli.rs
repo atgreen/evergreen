@@ -810,3 +810,67 @@ fn backquote_alloc_cons_reaches_t2() {
         );
     }
 }
+
+/// An outer entry from the interpreter reuses the activation state a finished
+/// call left behind instead of rebuilding a capture snapshot per transfer site
+/// on every call (bliss-t9tzf). Reuse must not change results: calls that
+/// return, handle an error inside, let an error escape, and re-enter the same
+/// code through an interpreted closure all match the interpreter.
+#[test]
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn pooled_outer_activations_match_the_interpreter() {
+    let program = r#"
+        (defun pool-cell (a b) `(,a (,b . ,a) ,@(list b (vector a))))
+        (defun pool-guarded (a)
+          (handler-case (if (minusp a) (error "neg") `(,a ,(1+ a)))
+            (error () :err)))
+        (defun pool-raise (a) (if (oddp a) (error "odd ~a" a) `(:even ,a)))
+        (defun pool-reenter (a f) `(,(funcall f a) ,a))
+        ;; Closing over SEEN keeps the driver interpreted, so each callee
+        ;; above is entered from the interpreter rather than from native code.
+        (let ((seen 0))
+          (defun pool-drive (n)
+            (let ((acc nil))
+              (dotimes (i n)
+                (incf seen)
+                (push (pool-cell i (list i)) acc)
+                (push (pool-guarded (if (zerop (mod i 7)) (- -1 i) i)) acc)
+                (push (or (ignore-errors (pool-raise i)) :raised) acc)
+                (push (pool-reenter i (lambda (x)
+                                        (if (plusp x)
+                                            (pool-reenter (1- x) (lambda (y) (* y 10)))
+                                            x)))
+                      acc))
+              (list seen (length acc) (sxhash (format nil "~s" acc)) (subseq acc 0 8)))))
+        (let (last)
+          (dotimes (round 60) (setf last (pool-drive 25)))
+          (format t "~s~%" last))
+        (format t "TIERS ~s~%"
+                (mapcar (lambda (f) (>= (egcl-ext:function-tier f) 1))
+                        '(pool-cell pool-guarded pool-raise pool-reenter)))
+    "#;
+    let run = |force_interp: bool| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_egcl"));
+        command
+            .args(["--no-init", "--eval", program])
+            .env("EGCL_T0_T1_THRESHOLD", "5")
+            .env("EGCL_T2_THRESHOLD", "20");
+        if force_interp {
+            command.env("EGCL_FORCE_TIER", "interp");
+        }
+        let output = command.output().expect("run EGCL");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(
+            output.status.success(),
+            "stdout: {stdout}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        stdout
+    };
+    let tiered = run(false);
+    let interpreted = run(true);
+    assert!(tiered.contains("TIERS (T T T T)"), "{tiered}");
+    let result = |stdout: &str| stdout.lines().next().unwrap_or_default().to_string();
+    assert_eq!(result(&tiered), result(&interpreted));
+    assert!(result(&tiered).starts_with("(1500 100 "), "{tiered}");
+}

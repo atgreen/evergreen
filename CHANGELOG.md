@@ -85,6 +85,15 @@
   functions to native code, among them `MAKE-ACTION-STATUS`,
   `COMPUTE-ACTION-STATUS`, `TRUENAMIZE` and `FEATUREP`
   ([#481](https://github.com/atgreen/evergreen/pull/481)).
+- Calling a natively compiled function from interpreted code is cheaper on
+  x86-64 Linux. Each such call used to rebuild the activation state for every
+  call site in the function, which was one of the largest costs of loading
+  Babel; the state of a finished call is now reused. The T1 compiler also no
+  longer rescans the whole function for each removed trivial phi, each block's
+  predecessors or each loop poll. A cold `(asdf:load-system :babel)` drops
+  from about 43 s to 35 s (CPU time from 37.5 s to 26.5 s), which also
+  undoes the slowdown that compiling more functions natively had caused
+  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
 - `COUNT`, `COUNT-IF` and `COUNT-IF-NOT` compile to bytecode instead of being
   tree-walked on every call, and `FIND`, `FIND-IF`, `FIND-IF-NOT` and the
   `COUNT` family no longer build a closure for each call. Counting over a

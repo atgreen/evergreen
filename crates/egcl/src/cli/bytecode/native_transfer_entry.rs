@@ -31,6 +31,8 @@ use special_bindings::{SavedSpecial, validate_special_bindings, special_request}
 use condition_osr::{validate_condition_clusters, relocate_condition_clusters};
 #[cfg(test)]
 pub(super) use activation::fail_next_guard_reservation_for_test;
+#[cfg(test)]
+pub(super) use activation::take_fresh_prepares_for_test;
 use activation::ActivationState;
 mod deopt;
 #[cfg(test)]
@@ -738,6 +740,11 @@ impl TransferCode {
     }
 
     #[cfg(test)]
+    pub(super) fn pooled_states_for_test(&self) -> usize {
+        self.state_pool.borrow().len()
+    }
+
+    #[cfg(test)]
     pub(super) fn value_maps_for_test(&self) -> &Arc<egcl_compiler::t2::x64_calls::NativeCallSites> {
         &self._native_calls
     }
@@ -1434,11 +1441,11 @@ impl TransferCode {
         if osr_offset.is_none() {
             validate_declared_args(&self.body, &args)?;
         }
-        let mut state = match osr {
+        let mut state = activation::PooledActivation::new(self, match osr {
             Some(resume) => *resume.state,
-            None => ActivationState::prepare(self, env)?,
-        };
-        egcl_rt::rooted_ref!(_state = &mut state);
+            None => ActivationState::prepare_reusing(self, env)?,
+        });
+        egcl_rt::rooted_ref!(_state = &mut *state);
         let _depth = osr_offset.is_none().then(|| {
             NATIVE_DEPTH.with(|depth| depth.set(depth.get() + 1));
             NativeDepthGuard
