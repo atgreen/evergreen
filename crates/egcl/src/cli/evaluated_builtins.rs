@@ -58,7 +58,11 @@ fn resolve(name: &str) -> Option<Handler> {
         | "EGCL-EXT:CRYPTO-AES-DECRYPT-BLOCK"
         | "EGCL-EXT:CRYPTO-GHASH-MUL"
         | "EGCL-EXT:CRYPTO-SHA256-BLOCK"
-        | "EGCL-EXT:CRYPTO-SHA256-WORDS" => Some(|operator, args, _env| {
+        | "EGCL-EXT:CRYPTO-SHA256-WORDS"
+        | "EGCL-EXT:CRYPTO-SHA512-BLOCK"
+        | "EGCL-EXT:CRYPTO-SHA512-WORDS"
+        | "EGCL-EXT:CRYPTO-KECCAK-F1600"
+        | "EGCL-EXT:CRYPTO-KECCAK-ABSORB" => Some(|operator, args, _env| {
             let bare = operator.rsplit(':').next().unwrap_or(operator);
             egcl_stdlib::crypto::call(bare, args).expect("listed crypto primitive")
         }),
