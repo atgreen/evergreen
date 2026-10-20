@@ -26289,7 +26289,11 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             | "EGCL-EXT:CRYPTO-AES-DECRYPT-BLOCK"
             | "EGCL-EXT:CRYPTO-GHASH-MUL"
             | "EGCL-EXT:CRYPTO-SHA256-BLOCK"
-            | "EGCL-EXT:CRYPTO-SHA256-WORDS" => return eval_builtin_arguments(&name, cdr, env),
+            | "EGCL-EXT:CRYPTO-SHA256-WORDS"
+            | "EGCL-EXT:CRYPTO-SHA512-BLOCK"
+            | "EGCL-EXT:CRYPTO-SHA512-WORDS"
+            | "EGCL-EXT:CRYPTO-KECCAK-F1600"
+            | "EGCL-EXT:CRYPTO-KECCAK-ABSORB" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL-EXT:SHA256" => {
                 let args = eval_args(cdr, env)?;
                 if args.len() != 1 {
@@ -39379,6 +39383,10 @@ const DIRECT_FAST: &[&str] = &[
     "CRYPTO-GHASH-MUL",
     "CRYPTO-SHA256-BLOCK",
     "CRYPTO-SHA256-WORDS",
+    "CRYPTO-SHA512-BLOCK",
+    "CRYPTO-SHA512-WORDS",
+    "CRYPTO-KECCAK-F1600",
+    "CRYPTO-KECCAK-ABSORB",
     "AREF",
     "SVREF",
     "ROW-MAJOR-AREF",
@@ -40326,6 +40334,14 @@ fn is_builtin_function(name: &str) -> bool {
             | "EGCL-EXT::CRYPTO-SHA256-BLOCK"
             | "EGCL-EXT:CRYPTO-SHA256-WORDS"
             | "EGCL-EXT::CRYPTO-SHA256-WORDS"
+            | "EGCL-EXT:CRYPTO-SHA512-BLOCK"
+            | "EGCL-EXT::CRYPTO-SHA512-BLOCK"
+            | "EGCL-EXT:CRYPTO-SHA512-WORDS"
+            | "EGCL-EXT::CRYPTO-SHA512-WORDS"
+            | "EGCL-EXT:CRYPTO-KECCAK-F1600"
+            | "EGCL-EXT::CRYPTO-KECCAK-F1600"
+            | "EGCL-EXT:CRYPTO-KECCAK-ABSORB"
+            | "EGCL-EXT::CRYPTO-KECCAK-ABSORB"
             | "EGCL-EXT:GC"
             | "EGCL-EXT::GC"
             | "EGCL-EXT:DECLARATION-SPECIFIER"

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
 //! The EGCL-EXT block primitives Ironclad's EGCL port calls (AES, GHASH,
-//! SHA-256), through the full CLI: known answers from the standards, the same
+//! SHA-256, SHA-512, Keccak), through the full CLI: known answers from the standards, the same
 //! answers from a compiled caller, and argument checking.
 
 use std::process::Command;
@@ -117,4 +117,78 @@ fn primitives_are_fbound_and_check_their_arguments() {
                                                   (make-array 16 :initial-element 0)) \
            (type-error () :not-an-octet)))";
     assert_eq!(eval(program), "(T :ARITY :SHORT :NOT-AN-OCTET)");
+}
+
+/// SHA-512 of "abc" (FIPS 180-4) through both entry points. The registers are
+/// (unsigned-byte 64), so most are bignums in EGCL and the primitives must
+/// read and store them as such.
+#[test]
+fn sha512_block_and_words_agree_with_the_standard() {
+    let block = "(let ((b (make-array 128 :element-type '(unsigned-byte 8) :initial-element 0))) \
+                   (setf (aref b 0) 97 (aref b 1) 98 (aref b 2) 99 (aref b 3) #x80 (aref b 127) 24) b)";
+    let program = format!(
+        "(progn \
+           (defun fresh-regs () \
+             (make-array 8 :element-type '(unsigned-byte 64) :initial-contents \
+               '(#x6a09e667f3bcc908 #xbb67ae8584caa73b #x3c6ef372fe94f82b #xa54ff53a5f1d36f1 \
+                 #x510e527fade682d1 #x9b05688c2b3e6c1f #x1f83d9abfb41bd6b #x5be0cd19137e2179))) \
+           (defun words-digest (block) \
+             (let ((regs (fresh-regs)) (words (make-array 80 :element-type '(unsigned-byte 64) :initial-element 0))) \
+               (dotimes (i 16) \
+                 (let ((w 0)) (dotimes (k 8) (setf w (logior (ash w 8) (aref block (+ k (* 8 i)))))) \
+                   (setf (aref words i) w))) \
+               (egcl-ext:crypto-sha512-words regs words) \
+               regs)) \
+           (let ((block {block}) (regs (fresh-regs)) (agree t)) \
+             (egcl-ext:crypto-sha512-block regs block 0) \
+             (dotimes (i 50) (unless (equalp (words-digest block) regs) (setf agree nil))) \
+             (list agree (string-downcase (format nil \"~{{~16,'0x~}}\" (coerce regs 'list))))))"
+    );
+    assert_eq!(
+        eval(&program),
+        "(T \"ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a\
+2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f\")"
+    );
+}
+
+/// SHA3-256 of the empty message (FIPS 202): one padded 136-octet block
+/// absorbed into a zero state, read back little-endian from the first four
+/// lanes. Absorbing must equal XORing the block in and then permuting.
+#[test]
+fn keccak_absorb_and_permutation_agree_with_the_standard() {
+    let program = "(let ((block (make-array 136 :element-type '(unsigned-byte 8) :initial-element 0)) \
+               (absorbed (make-array 25 :element-type '(unsigned-byte 64) :initial-element 0)) \
+               (permuted (make-array 25 :element-type '(unsigned-byte 64) :initial-element 0))) \
+           (setf (aref block 0) 6 (aref block 135) #x80) \
+           (egcl-ext:crypto-keccak-absorb absorbed 136 block 0) \
+           (setf (aref permuted 0) 6 (aref permuted 16) (ash #x80 56)) \
+           (egcl-ext:crypto-keccak-f1600 permuted) \
+           (list (equalp absorbed permuted) \
+                 (string-downcase \
+                  (format nil \"~{~2,'0x~}\" \
+                          (loop for i below 32 \
+                                collect (ldb (byte 8 (* 8 (mod i 8))) (aref absorbed (floor i 8))))))))";
+    assert_eq!(
+        eval(program),
+        "(T \"a7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434a\")"
+    );
+}
+
+#[test]
+fn sixty_four_bit_primitives_check_their_arguments() {
+    let program = "(list (fboundp 'egcl-ext:crypto-keccak-f1600) \
+         (handler-case (egcl-ext:crypto-keccak-f1600) (program-error () :arity)) \
+         (handler-case (egcl-ext:crypto-keccak-f1600 (make-array 24 :initial-element 0)) \
+           (type-error () :short)) \
+         (handler-case (egcl-ext:crypto-keccak-f1600 (make-array 25 :initial-element -1)) \
+           (type-error () :negative-lane)) \
+         (handler-case (egcl-ext:crypto-keccak-f1600 (make-array 25 :initial-element (expt 2 64))) \
+           (type-error () :wide-lane)) \
+         (handler-case (egcl-ext:crypto-keccak-absorb (make-array 25 :initial-element 0) 12 \
+                                                      (make-array 200 :initial-element 0) 0) \
+           (type-error () :bad-rate)))";
+    assert_eq!(
+        eval(program),
+        "(T :ARITY :SHORT :NEGATIVE-LANE :WIDE-LANE :BAD-RATE)"
+    );
 }

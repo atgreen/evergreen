@@ -285,7 +285,15 @@ Returns the CRC-32 of `octets`, using the polynomial of ZIP, gzip and PNG.
 
 **Function** `(egcl-ext:crypto-sha256-words registers words)` → `nil`
 
-These are the inner functions of AES, GCM and SHA-256. EGCL's port of
+**Function** `(egcl-ext:crypto-sha512-block registers octets start)` → `nil`
+
+**Function** `(egcl-ext:crypto-sha512-words registers words)` → `nil`
+
+**Function** `(egcl-ext:crypto-keccak-f1600 state)` → `nil`
+
+**Function** `(egcl-ext:crypto-keccak-absorb state rate-octets octets start)` → `nil`
+
+These are the inner functions of AES, GCM, SHA-256, SHA-512 and SHA-3. EGCL's port of
 Ironclad calls them in place of its portable Lisp versions, the way Ironclad
 uses assembly routines on SBCL. Each one updates its destination in place,
 using Ironclad's data layout. Applications should normally call Ironclad
@@ -303,6 +311,16 @@ rather than these functions.
   `registers`, a vector of eight `(unsigned-byte 32)` words.
   `crypto-sha256-words` compresses a message block held as the first sixteen
   big-endian words of `words`.
+- `crypto-sha512-block` and `crypto-sha512-words` are the same for SHA-512 and
+  SHA-384: 128 octets, or sixteen words, compressed into eight
+  `(unsigned-byte 64)` registers.
+- `crypto-keccak-f1600` applies the Keccak-f[1600] permutation (FIPS 202) to
+  `state`, a vector of 25 `(unsigned-byte 64)` lanes indexed x + 5y.
+  `crypto-keccak-absorb` first XORs the `rate-octets` octets of `octets` from
+  `start` into the lanes, little-endian; `rate-octets` is a multiple of 8, at
+  most 200.
+- `(unsigned-byte 64)` values at or above 2^60 are bignums in EGCL, so the
+  SHA-512 and Keccak functions can allocate when they store their results.
 
 A destination or source that is too short signals `type-error`, and a wrong
 argument count signals `program-error`.

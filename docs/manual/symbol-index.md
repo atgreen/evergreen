@@ -45,8 +45,12 @@ alphabetized by unqualified name and display their package explicitly.
 | `egcl-ext:crypto-aes-decrypt-block` | [Dictionary entry](user/reference/extensions.md#crypto-block-primitives) |
 | `egcl-ext:crypto-aes-encrypt-block` | [Dictionary entry](user/reference/extensions.md#crypto-block-primitives) |
 | `egcl-ext:crypto-ghash-mul` | [Dictionary entry](user/reference/extensions.md#crypto-block-primitives) |
+| `egcl-ext:crypto-keccak-absorb` | [Dictionary entry](user/reference/extensions.md#crypto-block-primitives) |
+| `egcl-ext:crypto-keccak-f1600` | [Dictionary entry](user/reference/extensions.md#crypto-block-primitives) |
 | `egcl-ext:crypto-sha256-block` | [Dictionary entry](user/reference/extensions.md#crypto-block-primitives) |
 | `egcl-ext:crypto-sha256-words` | [Dictionary entry](user/reference/extensions.md#crypto-block-primitives) |
+| `egcl-ext:crypto-sha512-block` | [Dictionary entry](user/reference/extensions.md#crypto-block-primitives) |
+| `egcl-ext:crypto-sha512-words` | [Dictionary entry](user/reference/extensions.md#crypto-block-primitives) |
 | `egcl-thread:current-thread` | [Dictionary entry](concurrency.md#thread-observations) |
 | `egcl-ext:declaration-specifier` | [Dictionary entry](compiler.md#declaration-specifier) |
 | `egcl-ext:declaration-specifiers` | [Dictionary entry](compiler.md#declaration-specifiers) |
