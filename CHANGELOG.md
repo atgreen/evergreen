@@ -4,6 +4,12 @@
 
 ### Performance
 
+- A `(return-from NAME ...)` inside a `FLET` or `LABELS` function compiles to
+  bytecode: the compiler now establishes the implicit block named after the
+  local function, as the tree-walker does. Such a return used to send the
+  whole enclosing function to the tree-walker. chipz's inflate state machine
+  is one, and inflating a 2.7 KB gzip member drops from 50 s to 2.7 s
+  ([#449](https://github.com/atgreen/evergreen/pull/449)).
 - `FLOOR`, `CEILING`, `TRUNCATE`, `ROUND`, `MOD` and `REM` on bignums divide
   once instead of going through exact rational arithmetic, which reduced
   `a/b` with a gcd first. A `MOD` of a 4096-bit number by a 2048-bit one is
