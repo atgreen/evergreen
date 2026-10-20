@@ -51,6 +51,11 @@
   the full option parsing: `(make-array 16)` takes about 12 us instead of
   31 us, and a four-element vector from a list about 17 us instead of 88 us
   ([#454](https://github.com/atgreen/evergreen/pull/454)).
+- On x86-64, functions that multiply, left-shift or compare a fixnum by a
+  constant wider than 32 bits, such as `(* a 1000000000000)`, `(ash a 40)` or
+  `(< a 1000000000000)`, now reach the optimizing tier instead of stopping
+  one tier below it
+  ([#TBD](https://github.com/atgreen/evergreen/pull/TBD)).
 - `FLOOR`, `CEILING`, `TRUNCATE`, `ROUND`, `MOD` and `REM` on bignums divide
   once instead of going through exact rational arithmetic, which reduced
   `a/b` with a gcd first. A `MOD` of a 4096-bit number by a 2048-bit one is
@@ -60,6 +65,10 @@
 
 ### Fixed
 
+- On x86-64, a fully optimized function that left-shifted a masked value, such
+  as `(ash (logand a #xFFFFFFFFFF) 30)`, returned a wrapped fixnum instead of
+  the bignum result. It now checks the shift for overflow
+  ([#TBD](https://github.com/atgreen/evergreen/pull/TBD)).
 - Compiled code calls another package's `LENGTH`, `FIRST`, `ELT` and the
   other functions the compiler calls directly, rather than the CL function
   of the same name. A generic function such as `(defgeneric my:length (x))`

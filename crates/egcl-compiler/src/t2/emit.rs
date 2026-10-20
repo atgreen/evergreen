@@ -1408,14 +1408,23 @@ fn emit_arith_inst(
                 consts.get(&a0).map(|&c| (b0, c))
             };
             if let Some((var, c)) = folded {
-                // Fold the constant, or decline if it does not fit the imul immediate
-                // — the general two-register path uses rdx for the guard and cannot
-                // also host a materialised constant there.
-                let c32 =
-                    i32::try_from(c).map_err(|_| EmitError::UnsupportedOp(op_tag(data.opcode)))?;
+                // Fold the constant into the imul immediate. A constant wider than
+                // imm32 (bliss-mghob: `(* a 1000000000000)`) goes through rdx
+                // instead: this path guards only the variable, with `test r8, 7`, so
+                // unlike the general two-register path it leaves rdx free.
                 let range = f.value(var).ty.range;
                 let x = *reg.get(&var).ok_or(EmitError::UnsupportedOp(0xF2))?;
                 guard(a, var, x);
+                let Ok(c32) = i32::try_from(c) else {
+                    // The RAW constant: tagged(x)*c = tagged(x*c).
+                    mov_imm64(a, SCRATCH, c);
+                    mov_rr(a, dst, x);
+                    imul_rr(a, dst, SCRATCH);
+                    if !mul_cannot_overflow(range, c) {
+                        a.jcc(Cc::O, deopt);
+                    }
+                    return Ok(());
+                };
                 if mul_cannot_overflow(range, c) {
                     match lea_scale(c) {
                         Some(s) => lea_mul(a, dst, x, s),
@@ -1577,20 +1586,30 @@ fn emit_arith_inst(
             let x = framed_mat(a, reg, pool, consts, a0)?;
             guard(a, a0, x);
             if n >= 0 {
-                if n > 30 {
-                    return Err(EmitError::UnsupportedOp(op_tag(data.opcode))); // 2^n > imm32
+                if n > 62 {
+                    // 2^63 is negative as an i64; any nonzero x overflows anyway.
+                    return Err(EmitError::UnsupportedOp(op_tag(data.opcode)));
                 }
                 // If the operand's range proves x<<n stays in fixnum range, use a
                 // plain shift (no overflow trap) — e.g. after a mask. Otherwise the
-                // overflow-checked multiply by 2^n.
-                let safe = val_range.get(&a0).is_some_and(|&(lo, hi)| {
-                    lo >= 0 && hi.checked_shl(n as u32).is_some_and(|v| v <= FIXNUM_MAX)
-                });
+                // overflow-checked multiply by 2^n. Compare against FIXNUM_MAX>>n:
+                // `checked_shl` only rejects a shift count >= 64, not lost bits, so
+                // `(ash (logand a #xFFFFFFFFFF) 30)` used to wrap (bliss-mghob).
+                let safe = val_range
+                    .get(&a0)
+                    .is_some_and(|&(lo, hi)| lo >= 0 && n <= 60 && hi <= (FIXNUM_MAX >> n));
                 if safe {
                     mov_rr(a, dst, x);
                     shl_imm(a, dst, n as u8); // tagged(x)<<n = tagged(x<<n)
-                } else {
+                } else if n <= 30 {
                     imul_imm(a, dst, x, 1i32 << n); // dst = x * 2^n, with overflow check
+                    a.jcc(Cc::O, deopt);
+                } else {
+                    // 2^n does not fit imm32: multiply by it from rdx. `x` is never
+                    // rdx — a0 is not a constant (both-constant ops decline above).
+                    mov_imm64(a, SCRATCH, 1i64 << n);
+                    mov_rr(a, dst, x);
+                    imul_rr(a, dst, SCRATCH);
                     a.jcc(Cc::O, deopt);
                 }
             } else {
@@ -2664,9 +2683,17 @@ fn emit_fused_compare(
     let base =
         fixnum_cmp_cc(cmp_data.opcode).ok_or(EmitError::UnsupportedOp(op_tag(cmp_data.opcode)))?;
     let (l, r) = (cmp_data.args[0], cmp_data.args[1]);
-    let tagged32 = |c: i64| {
-        i32::try_from(egcl_rt::value::EgclVal::from_fixnum(c).0 as i64)
-            .map_err(|_| EmitError::UnsupportedOp(0xF4))
+    // `cmp r, tagged(c)`: an imm32 when the tagged constant fits, otherwise via rdx
+    // (`mov` sets no flags, and the operand registers are never rdx).
+    let cmp_const = |a: &mut Asm, r: u8, c: i64| {
+        let tagged = egcl_rt::value::EgclVal::from_fixnum(c).0 as i64;
+        match i32::try_from(tagged) {
+            Ok(t32) => alu_r_imm(a, 7, r, t32),
+            Err(_) => {
+                mov_imm64(a, SCRATCH, tagged);
+                cmp_rr(a, r, SCRATCH);
+            }
+        }
     };
     let guard = |a: &mut Asm, v: crate::t2::ir::Value, rr: u8| {
         if !proven.contains(&v) {
@@ -2677,13 +2704,13 @@ fn emit_fused_compare(
         (None, Some(c)) => {
             let lr = *reg.get(&l).ok_or(EmitError::UnsupportedOp(0xF2))?;
             guard(a, l, lr);
-            alu_r_imm(a, 7, lr, tagged32(c)?); // cmp lr, tagged
+            cmp_const(a, lr, c); // cmp lr, tagged
             Ok(base)
         }
         (Some(c), None) => {
             let rr = *reg.get(&r).ok_or(EmitError::UnsupportedOp(0xF2))?;
             guard(a, r, rr);
-            alu_r_imm(a, 7, rr, tagged32(c)?);
+            cmp_const(a, rr, c);
             Ok(cc_swapped(base)) // operands swapped
         }
         (None, None) => {
@@ -8861,6 +8888,152 @@ mod tests {
         frame[0] = EgclVal::from_fixnum(FIXNUM_MIN).0;
         let _ = function(frame.as_mut_ptr());
         assert!(OVERFLOWED.with(|seen| seen.get()), "MOV must preserve OF for deoptimization");
+    }
+
+    #[cfg(all(target_arch = "x86_64", unix))]
+    std::thread_local! {
+        static WIDE_DEOPTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    #[cfg(all(target_arch = "x86_64", unix))]
+    extern "C" fn wide_deopt() {
+        WIDE_DEOPTED.with(|seen| seen.set(true));
+    }
+
+    /// Run a one-parameter framed artifact on `x`: `Some(result)`, or `None` when
+    /// it deoptimised.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn run_wide(code: &[u8], x: egcl_rt::value::EgclVal) -> Option<egcl_rt::value::EgclVal> {
+        let buffer = egcl_rt::jit::JitBuffer::new(code).unwrap();
+        let function: extern "C" fn(*mut u64) -> u64 =
+            unsafe { std::mem::transmute(buffer.as_ptr()) };
+        let mut frame = [x.0, 0, 0, 0];
+        WIDE_DEOPTED.with(|seen| seen.set(false));
+        let r = function(frame.as_mut_ptr());
+        (!WIDE_DEOPTED.with(|seen| seen.get())).then_some(egcl_rt::value::EgclVal(r))
+    }
+
+    /// bliss-mghob: a multiplier wider than imm32 used to decline the whole
+    /// function out of T2. It now multiplies from rdx, still overflow-checked.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[test]
+    fn framed_fixnum_mul_by_wide_constant_runs_and_deopts() {
+        use crate::t2::ir::{Opcode, Range};
+        use egcl_rt::value::EgclVal;
+        for c in [1_000_000_000_000i64, 2_147_483_648, -1_000_000_000_000] {
+            for constant_on_left in [false, true] {
+                let code = add_sub_range_code(Opcode::FixnumMul, None, Ok(c), constant_on_left,
+                    Some(wide_deopt));
+                assert!(has_overflow_branch(&code), "unbounded * {c} must check overflow");
+                for x in [0i64, 7, -3, 1_000_000] {
+                    let r = run_wide(&code, EgclVal::from_fixnum(x));
+                    assert_eq!(r.map(|v| v.as_fixnum()), Some(x * c), "{x} * {c}");
+                }
+                assert!(run_wide(&code, EgclVal::from_fixnum(1 << 40)).is_none(),
+                    "(1<<40) * {c} overflows a fixnum and must deopt");
+                assert!(run_wide(&code, EgclVal::from_single_float(2.0)).is_none(),
+                    "a float operand must deopt");
+            }
+        }
+        let code = add_sub_range_code(Opcode::FixnumMul, Some(Range { lo: 0, hi: 100 }),
+            Ok(1_000_000_000_000), false, Some(wide_deopt));
+        assert!(!has_overflow_branch(&code), "a bounded operand cannot overflow");
+        for x in [0i64, 1, 100] {
+            assert_eq!(run_wide(&code, EgclVal::from_fixnum(x)).map(|v| v.as_fixnum()),
+                Some(x * 1_000_000_000_000));
+        }
+    }
+
+    /// A left shift by more than 30 multiplies by a 2^n that does not fit imm32.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[test]
+    fn framed_fixnum_shl_by_wide_amount_runs_and_deopts() {
+        use crate::t2::ir::Opcode;
+        use egcl_rt::value::EgclVal;
+        for n in [31i64, 40, 59, 62] {
+            let code = add_sub_range_code(Opcode::FixnumShl, None, Ok(n), false,
+                Some(wide_deopt));
+            for x in [0i64, 3, -1, 1 << 25] {
+                let expected = (x as i128) << n;
+                let r = run_wide(&code, EgclVal::from_fixnum(x));
+                if (FIXNUM_MIN as i128..=FIXNUM_MAX as i128).contains(&expected) {
+                    assert_eq!(r.map(|v| v.as_fixnum() as i128), Some(expected), "{x} << {n}");
+                } else {
+                    assert!(r.is_none(), "{x} << {n} overflows and must deopt");
+                }
+            }
+        }
+    }
+
+    /// `(ash (logand x #xFFFFFFFFFF) 30)`: the mask bounds x to [0, 2^40), which
+    /// does NOT prove x<<30 fits a fixnum. `checked_shl` reported it safe, so a
+    /// plain `shl` wrapped to a wrong fixnum instead of deoptimising to a bignum.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[test]
+    fn masked_left_shift_overflow_is_checked() {
+        use crate::t2::ir::{AuxData, IRType, InstData, InstFlags, Opcode, TypeBits,
+            ValueRepresentation};
+        use egcl_rt::value::EgclVal;
+        let build = |mask: i64, n: i64| {
+            let mut f = build_mul_ranged(mask, None);
+            let entry = f.entry();
+            let masked = f.block(entry).insts[1];
+            f.inst_mut(masked).opcode = Opcode::LogAnd;
+            let masked = f.inst(masked).results[0];
+            let fixnum = (IRType::of(TypeBits::FIXNUM), ValueRepresentation::Tagged);
+            let (_, amount) = f.push_inst(entry, InstData {
+                opcode: Opcode::ConstFixnum, args: vec![], results: vec![],
+                aux: AuxData::FixnumImm(n), flags: InstFlags::default(), targets: vec![],
+                frame_state: None, source_pos: 0,
+            }, &[fixnum]);
+            let (_, shifted) = f.push_inst(entry, InstData {
+                opcode: Opcode::FixnumShl, args: vec![masked, amount[0]], results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags { guard: true, effectful: true, ..Default::default() },
+                targets: vec![], frame_state: None, source_pos: 0,
+            }, &[fixnum]);
+            f.set_terminator(entry, InstData {
+                opcode: Opcode::Return, args: vec![shifted[0]], results: vec![],
+                aux: AuxData::None, flags: InstFlags::default(), targets: vec![],
+                frame_state: None, source_pos: 0,
+            });
+            emit_framed(&f, wide_deopt as *const () as usize as u64, 0, 0, 0, 0, 0, 0, 0, None)
+                .expect("emit masked shift").code
+        };
+        let code = build(0xFF_FFFF_FFFF, 30);
+        assert!(has_overflow_branch(&code), "a 40-bit mask shifted by 30 can overflow");
+        assert_eq!(run_wide(&code, EgclVal::from_fixnum(3)).map(|v| v.as_fixnum()),
+            Some(3 << 30));
+        assert!(run_wide(&code, EgclVal::from_fixnum(0xFF_FFFF_FFFF)).is_none(),
+            "2^70-scale result must deopt, not wrap");
+        // A mask that really does bound the result keeps the plain shift.
+        let code = build(0xFFFF, 30);
+        assert!(!has_overflow_branch(&code), "a 16-bit mask shifted by 30 cannot overflow");
+        assert_eq!(run_wide(&code, EgclVal::from_fixnum(-1)).map(|v| v.as_fixnum()),
+            Some(0xFFFF << 30));
+    }
+
+    /// A comparison against a constant whose tagged form exceeds imm32 compares
+    /// against rdx instead of declining.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[test]
+    fn fixnum_compare_with_wide_constant_produces_boolean() {
+        use crate::t2::ir::Opcode;
+        use egcl_rt::value::{EgclVal, NIL, T};
+        const BIG: i64 = 1_000_000_000_000;
+        for (opcode, constant_on_left, x, expected) in [
+            (Opcode::FixnumCmpLt, false, 3, T),
+            (Opcode::FixnumCmpLt, false, 2 * BIG, NIL),
+            (Opcode::FixnumCmpLt, true, 3, NIL), // (< BIG 3)
+            (Opcode::FixnumCmpLt, true, 2 * BIG, T),
+            (Opcode::FixnumCmpEq, false, BIG, T),
+            (Opcode::FixnumCmpEq, true, BIG + 1, NIL),
+            (Opcode::FixnumCmpGe, false, -BIG, NIL),
+        ] {
+            let code = add_sub_range_code(opcode, None, Ok(BIG), constant_on_left,
+                Some(wide_deopt));
+            assert_eq!(run_wide(&code, EgclVal::from_fixnum(x)), Some(expected),
+                "{opcode:?} swapped={constant_on_left} x={x}");
+        }
     }
 
     /// Range-proven-safe `* 5` strength-reduces to a single `lea` with no overflow

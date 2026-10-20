@@ -301,6 +301,27 @@
          (dotimes (i 64 acc)
            (setq acc (logxor (ash acc 1) (logand i 21) (logior i 5))))))
 
+;;; ── constants wider than imm32 (bliss-mghob) ───────────────────────────
+
+(defun wide-mul (a) (* a 1000000000000))
+(defun wide-mul-left (a) (* -1000000000000 a))
+(defun wide-ash (a) (ash a 40))
+(defun wide-cmp (a) (if (< a 1000000000000) :small :big))
+(defun wide-cmp-value (a) (list (< 1000000000000 a) (= a 1000000000000)))
+(defun masked-ash (a) (ash (logand a #xFFFFFFFFFF) 30))
+
+(check :wide-arith
+       (let ((acc nil))
+         (dotimes (i 40 (nreverse acc))
+           (push (list (wide-mul i) (wide-mul-left (- i)) (wide-ash i)
+                       (wide-cmp (* i 100000000000)) (wide-cmp-value (* i 50000000000))
+                       (masked-ash (+ i #xFFFFFFFFF0)))
+                 acc))))
+(check :wide-arith-overflow
+       (list (wide-mul (expt 2 50)) (wide-mul-left (expt 2 50)) (wide-ash (expt 2 25))
+             (wide-cmp 3) (wide-cmp 2000000000000) (wide-cmp-value 1000000000000)
+             (masked-ash #xFFFFFFFFFF) (masked-ash 3)))
+
 ;;; ── epilogue: checksum + completion sentinel ───────────────────────────
 
 (note :checksum *hash*)
