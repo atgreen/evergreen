@@ -162,6 +162,7 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                         AuxData::CallTarget(_)
                             | AuxData::HostEval(_)
                             | AuxData::FunctionLookup(_)
+                            | AuxData::ValuesToList
                             | AuxData::TransferThrow
                             | AuxData::CatchScope { .. }
                             | AuxData::HandlerScope { .. }
@@ -189,6 +190,16 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                 errors.push(VerifyError::new(
                     "V11 invoke-shape",
                     "host evaluation and function lookup require argument-free Invoke",
+                ));
+            }
+            if matches!(data.aux, AuxData::ValuesToList)
+                && (!matches!(data.opcode, Opcode::Call | Opcode::Invoke)
+                    || data.args.len() != 1
+                    || data.results.len() != 1)
+            {
+                errors.push(VerifyError::new(
+                    "V11 invoke-shape",
+                    "multiple-value list collection requires one primary and one result",
                 ));
             }
             if let AuxData::SpecialBinding { bcp, enter } = data.aux {

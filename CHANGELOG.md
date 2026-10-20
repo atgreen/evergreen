@@ -85,6 +85,18 @@
   instead of stopping at T1. It still looks the function up on every call, so
   redefining it takes effect as before
   ([#460](https://github.com/atgreen/evergreen/pull/460)).
+- Functions that use `MULTIPLE-VALUE-LIST` or `MULTIPLE-VALUE-PROG1` now
+  compile to native code on x86-64 Linux and reach the optimizing tier. They
+  used to stay in the bytecode interpreter
+  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+
+### Fixed
+
+- `MULTIPLE-VALUE-LIST` returns exactly one value once its function is
+  compiled. Compiled code used to leave the collected values behind as stale
+  secondary values, so `(multiple-value-bind (a b) (f))` around a function
+  ending in `MULTIPLE-VALUE-LIST` saw `b` as the second collected value instead
+  of `NIL` ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
 
 ### Fixed
 
