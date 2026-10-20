@@ -63,13 +63,77 @@ fn outer_activation_reuses_its_pooled_state() {
             "call {i} returned {}",
             super::super::super::format_val(*got)
         );
-        assert_eq!(super::super::super::cp(*got).0, *a, "call {i} must return its own argument");
+        assert_eq!(
+            super::super::super::cp(*got).0,
+            *a,
+            "call {i} must return its own argument"
+        );
     }
-    assert!(moved > 0, "a collection between calls must relocate an argument");
+    assert!(
+        moved > 0,
+        "a collection between calls must relocate an argument"
+    );
     assert_eq!(
         native_transfer_entry::take_fresh_prepares_for_test(),
         1,
         "only the first outer call may build an activation state"
     );
     assert_eq!(mapped.pooled_states_for_test(), 1);
+}
+
+/// `take_osr_state` moves an OSR source's ledgers to the destination and leaves
+/// the source with empty, zero-capacity Vecs. Before the capacity check in
+/// `recycle`, the source then went into its code's pool, and the next outer
+/// entry failed `catches.len() < catches.capacity()` inside a native helper
+/// (bliss-t9tzf review). The body needs catch, cleanup and handler scopes so
+/// that `prepare` reserves room that the hand-off can take away.
+#[test]
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn osr_source_state_is_not_pooled_without_its_reservations() {
+    let _lock = super::super::super::heap_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    let source = "(catch 'osr-pool
+                    (unwind-protect
+                        (handler-case (cons a (list b))
+                          (error () (throw 'osr-pool nil)))
+                      (setq b a)))";
+    super::super::super::read_eval_all_env(
+        &format!("(defun osr-pool-source-probe (a b) {source})"),
+        &mut env,
+    )
+    .unwrap();
+    egcl_rt::rooted!(params = reader::read_from_string("(a b)").unwrap().0);
+    egcl_rt::rooted!(forms = reader::read_from_string(&format!("({source})")).unwrap().0);
+    let symbol = egcl_rt::symbols::intern("OSR-POOL-SOURCE-PROBE");
+    let body = Arc::new(
+        compile_function("OSR-POOL-SOURCE-PROBE", *params, *forms, &env, false, false).unwrap(),
+    );
+    registry_put(symbol, Arc::clone(&body));
+    let code = native_transfer_entry::install_t1(symbol, body, false).expect("mapped T1");
+    publish_native(symbol, egcl_rt::symbols::symbol_function(symbol), &code);
+    let NativeCodeStorage::Mapped(mapped) = &code._storage else {
+        panic!("mapped T1 owner")
+    };
+    let before = mapped.pooled_states_for_test();
+    assert_eq!(
+        mapped.recycle_osr_source_for_test(&mut env).unwrap(),
+        0,
+        "an OSR source has lost its reserved ledgers and must not be pooled"
+    );
+    assert_eq!(mapped.pooled_states_for_test(), before);
+    // A pooled state, if one exists, must still enter normally.
+    egcl_rt::rooted!(function = egcl_rt::symbols::symbol_function(symbol).unwrap());
+    egcl_rt::rooted!(a = super::super::super::arena_cons(EgclVal::from_fixnum(7), NIL));
+    egcl_rt::rooted!(args = vec![*a, EgclVal::from_fixnum(9)]);
+    for _ in 0..3 {
+        egcl_rt::rooted!(got = mapped.run_callable(*function, &args, &mut env).unwrap());
+        assert_eq!(
+            super::super::super::format_val(*got),
+            "((7) 9)",
+            "re-entering the code after an OSR hand-off"
+        );
+    }
 }

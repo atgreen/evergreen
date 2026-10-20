@@ -91,7 +91,7 @@
   Babel; the state of a finished call is now reused. The T1 compiler also no
   longer rescans the whole function for each removed trivial phi, each block's
   predecessors or each loop poll. A cold `(asdf:load-system :babel)` drops
-  from about 43 s to 35 s (CPU time from 37.5 s to 26.5 s), which also
+  from about 42 s to 32 s (CPU time from 35.6 s to 24.9 s), which also
   undoes the slowdown that compiling more functions natively had caused
   ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
 - `COUNT`, `COUNT-IF` and `COUNT-IF-NOT` compile to bytecode instead of being

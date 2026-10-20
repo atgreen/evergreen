@@ -744,6 +744,20 @@ impl TransferCode {
         self.state_pool.borrow().len()
     }
 
+    /// Run the real OSR hand-off ledger move (`take_osr_state`) between two
+    /// states prepared for this code, then recycle the source the way its
+    /// outer activation does when it returns. Reports how many states that
+    /// added to the pool.
+    #[cfg(test)]
+    pub(super) fn recycle_osr_source_for_test(&self, env: &mut Env) -> Result<usize, EgclError> {
+        let mut source = ActivationState::prepare(self, env)?;
+        source.ready_osr = Some(Box::new(ActivationState::prepare(self, env)?));
+        drop(source.take_osr_state());
+        let before = self.state_pool.borrow().len();
+        source.recycle(self);
+        Ok(self.state_pool.borrow().len() - before)
+    }
+
     #[cfg(test)]
     pub(super) fn value_maps_for_test(&self) -> &Arc<egcl_compiler::t2::x64_calls::NativeCallSites> {
         &self._native_calls

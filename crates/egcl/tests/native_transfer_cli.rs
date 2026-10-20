@@ -815,7 +815,10 @@ fn backquote_alloc_cons_reaches_t2() {
 /// call left behind instead of rebuilding a capture snapshot per transfer site
 /// on every call (bliss-t9tzf). Reuse must not change results: calls that
 /// return, handle an error inside, let an error escape, and re-enter the same
-/// code through an interpreted closure all match the interpreter.
+/// code through an interpreted closure all match the interpreter. This is a
+/// differential check only: a CLI run cannot see the pool, so the lib tests in
+/// native_transfer_tests/outer_pool.rs assert that reuse actually happens and
+/// that an OSR source's drained state is never pooled.
 #[test]
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 fn pooled_outer_activations_match_the_interpreter() {

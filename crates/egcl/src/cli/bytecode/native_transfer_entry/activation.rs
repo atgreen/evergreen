@@ -207,7 +207,8 @@ impl ActivationState {
         if !(self.is_quiescent()
             && guard_idle
             && self.ready_osr.is_none()
-            && self.restart_templates.0.is_empty())
+            && self.restart_templates.0.is_empty()
+            && self.has_reserved_capacity(code))
         {
             return;
         }
@@ -221,6 +222,34 @@ impl ActivationState {
         if pool.len() < 4 {
             pool.push(self);
         }
+    }
+
+    /// Whether every ledger still holds the room `prepare` reserves for
+    /// `code`. Helpers entered from generated code rely on it (`catches.len() <
+    /// catches.capacity()` and the like) instead of growing a Vec. An OSR
+    /// source loses its ledgers to `take_osr_state`, which leaves empty Vecs
+    /// with no capacity, and an OSR destination owns ledgers reserved for the
+    /// source's code: neither may go into a pool and come back as if prepared
+    /// (bliss-t9tzf).
+    fn has_reserved_capacity(&self, code: &TransferCode) -> bool {
+        let scopes = code.body.handler_cases.len()
+            + code.body.handler_binds.len()
+            + code.body.restart_cases.len();
+        let guard_reserved = self.guard_resume.as_ref().is_none_or(|guard| {
+            guard.handlers.capacity() >= code.guard_handler_capacity
+                && guard.cleanup_conts.capacity() >= code.cleanup_depths.len()
+                && guard.dyn_binds.capacity() >= code.special_binds
+        });
+        self.snapshots.len() == code.sites.sites().count()
+            && self.specials.capacity() >= code.special_binds
+            && self.cleanups.capacity() >= code.cleanup_depths.len()
+            && self.catches.capacity() >= code.catch_pushes
+            && self.handlers.capacity() >= code.body.handler_cases.len()
+            && self.handler_binds.capacity() >= code.body.handler_binds.len()
+            && self.restart_cases.capacity() >= code.body.restart_cases.len()
+            && self.dynamic_scopes.capacity() >= scopes
+            && self.cluster_frames.capacity() >= scopes
+            && guard_reserved
     }
 
     pub(super) fn prepare(code: &TransferCode, env: &mut Env) -> Result<Self, EgclError> {
