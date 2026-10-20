@@ -205,6 +205,10 @@ pub struct RuntimeCalls {
     /// `EnvironmentValue`/`SetEnvironmentValue`, so a closure that reads a
     /// captured variable stays at its current tier.
     pub environment: super::emit::EnvironmentCalls,
+    /// Adapters for operations x86-64 reaches only through its mapped transfer
+    /// protocol. Shared with the ppc64le emitter, which re-exports this struct;
+    /// the System Z emitter does not read them yet, so each stays zero here.
+    pub portable: super::emit::PortableCalls,
 }
 
 /// Arguments a register entry accepts, one per ABI argument register the

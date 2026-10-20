@@ -185,14 +185,25 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                     "THROW requires an Invoke with tag and primary",
                 ));
             }
-            if matches!(
-                data.aux,
-                AuxData::HostEval(_) | AuxData::FunctionLookup(_) | AuxData::NestedClosure(_)
-            ) && (data.opcode != Opcode::Invoke || !data.args.is_empty())
+            if matches!(data.aux, AuxData::HostEval(_) | AuxData::FunctionLookup(_))
+                && (data.opcode != Opcode::Invoke || !data.args.is_empty())
             {
                 errors.push(VerifyError::new(
                     "V11 invoke-shape",
-                    "host evaluation, function lookup and closure creation require argument-free Invoke",
+                    "host evaluation and function lookup require argument-free Invoke",
+                ));
+            }
+            // Closure creation reaches a checked-ABI target as a target-free
+            // `Call` to a plain adapter rather than a mapped `Invoke`, so it
+            // admits either opcode. Argument-free either way: the nested body
+            // is named by the aux index, never passed on the operand stack.
+            if matches!(data.aux, AuxData::NestedClosure(_))
+                && (!matches!(data.opcode, Opcode::Invoke | Opcode::Call)
+                    || !data.args.is_empty())
+            {
+                errors.push(VerifyError::new(
+                    "V11 invoke-shape",
+                    "closure creation requires an argument-free Invoke or Call",
                 ));
             }
             if matches!(data.aux, AuxData::ValuesToList)

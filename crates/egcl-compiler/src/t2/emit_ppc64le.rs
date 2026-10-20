@@ -91,7 +91,10 @@
 //! (moved in with `mtvsrd` and converted to double format), `FixnumAdd/Sub/Mul/Neg` and the
 //! five comparisons (branchless via `isel`), all tag-guarded and deopting on
 //! overflow; `Guard` for CONS, `Car`/`Cdr` on a proven cons, `GenericEq`,
-//! `LogAnd/Or/Xor/Not` and `FixnumShl/Shr` by a constant. Anything else returns
+//! `LogAnd/Or/Xor/Not` and `FixnumShl/Shr` by a constant, and the builder's
+//! target-free `Call` for `MULTIPLE-VALUE-LIST` (`AuxData::ValuesToList`) and
+//! for non-capturing closure creation (`AuxData::NestedClosure`), both of which
+//! go through [`RuntimeCalls::portable`]. Anything else returns
 //! `UnsupportedOp(0x9C)`.
 //!
 //! # Deopt exits
@@ -465,6 +468,46 @@ impl Emitter<'_> {
         }
         let helper = if let Some(data) = data {
             match data.opcode {
+                // `(multiple-value-list form)`. The builder gives this the
+                // `Call` opcode with no call target: x86-64 turns it into an
+                // `Invoke` carrying TRANSFER_VALUES_TO_LIST_REQUEST, which only
+                // its mapped entry services, so a checked-ABI target used to
+                // see an `AuxData` the arm below rejects and declined the whole
+                // function to T1. The plain adapter reads the runtime tuple the
+                // argument's producer left and returns a fresh list.
+                Opcode::Call if matches!(data.aux, AuxData::ValuesToList) => {
+                    if data.args.len() != 1 || data.results.len() != 1 {
+                        return Err(unsupported());
+                    }
+                    self.load(*data.args.first().ok_or_else(unsupported)?, W0)?;
+                    self.runtime.portable.values_to_list
+                }
+                // `(lambda ...)` capturing nothing. Same story as
+                // `ValuesToList` above: x86-64 services this through its mapped
+                // TRANSFER_MAKE_CLOSURE_REQUEST, so a checked-ABI target needs
+                // the plain adapter and the address of the retained nested body.
+                Opcode::Call if matches!(data.aux, AuxData::NestedClosure(_)) => {
+                    let AuxData::NestedClosure(index) = data.aux else {
+                        return Err(unsupported());
+                    };
+                    if !data.args.is_empty() || data.results.len() != 1 {
+                        return Err(unsupported());
+                    }
+                    let body = *self
+                        .runtime
+                        .portable
+                        .nested_bodies
+                        .get(index as usize)
+                        .ok_or_else(unsupported)?;
+                    if body == 0 {
+                        return Err(unsupported());
+                    }
+                    self.asm.imm64(W0, body);
+                    // Never capture: a capturing closure needs an
+                    // activation-owned EnvFrame this emitter does not publish.
+                    self.asm.imm64(W1, 0);
+                    self.runtime.portable.make_closure
+                }
                 Opcode::Call => {
                     let AuxData::CallTarget(symbol) = data.aux else {
                         return Err(unsupported());

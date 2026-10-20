@@ -18344,7 +18344,11 @@ extern "C" fn c2i_make_closure(form: u64) -> u64 {
     c2i_eval_form_with_frame(EgclVal(form), true)
 }
 
-#[cfg(any(target_arch = "x86_64", target_arch = "s390x"))]
+#[cfg(any(
+    target_arch = "x86_64",
+    target_arch = "s390x",
+    all(target_arch = "powerpc64", target_endian = "little")
+))]
 extern "C" fn c2i_make_bytecode_closure(nested: *const Arc<BytecodeFunction>, capture: u64) -> u64 {
     match guard_c2i(|| {
         let env = NATIVE_ENV.with(|slot| slot.get());
@@ -24342,6 +24346,19 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
         // including when there are no heap constants.
         rooted_bodies.push(std::sync::Arc::clone(&input.body));
     }
+    // A checked-ABI closure creator bakes the address of a `nested_functions`
+    // entry of THIS snapshot (see `PortableCalls::nested_bodies`), so the code
+    // outliving the snapshot would leave the helper reading freed memory.
+    if bf
+        .code
+        .iter()
+        .any(|instruction| matches!(instruction, Instr::MakeClosure { .. }))
+        && !rooted_bodies
+            .iter()
+            .any(|body| std::sync::Arc::ptr_eq(body, &input.body))
+    {
+        rooted_bodies.push(std::sync::Arc::clone(&input.body));
+    }
     // The mapped emitter has not run yet, so derive constant-slot ownership
     // from its optimized IR, independently of checked emission. Include the
     // checked emitter's reported slots as well when it is the selected ABI.
@@ -24417,6 +24434,26 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     })
 }
 
+/// The closure adapter's address, or 0 where it is not compiled in. Emitters
+/// decline `AuxData::NestedClosure` on a zero, so a host without the helper
+/// keeps closure creators at T1 instead of calling into nothing.
+#[cfg(not(egcl_no_t2))]
+fn make_bytecode_closure_address() -> u64 {
+    #[cfg(any(
+        target_arch = "x86_64",
+        target_arch = "s390x",
+        all(target_arch = "powerpc64", target_endian = "little")
+    ))]
+    return c2i_make_bytecode_closure
+        as extern "C" fn(*const Arc<BytecodeFunction>, u64) -> u64 as usize as u64;
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        target_arch = "s390x",
+        all(target_arch = "powerpc64", target_endian = "little")
+    )))]
+    0
+}
+
 #[cfg(not(egcl_no_t2))]
 fn compile_checked_t2_artifact(
     input: &T2CompileInput,
@@ -24475,6 +24512,19 @@ fn compile_checked_t2_artifact(
             body: std::ptr::from_ref(&*env_names) as u64,
             load: c2i_load_env as extern "C" fn(*const NativeEnvNames, u64) -> u64 as usize as u64,
             store: c2i_store_env as extern "C" fn(*const NativeEnvNames, u64, u64) as usize as u64,
+        },
+        &egcl_compiler::t2::emit::PortableCalls {
+            values_to_list: c2i_values_to_list as extern "C" fn(u64) -> u64 as usize as u64,
+            make_closure: make_bytecode_closure_address(),
+            // Addresses INTO `input.body`: valid only because the caller pushes
+            // that exact Arc onto `rooted_bodies` whenever the body creates a
+            // closure. The worker snapshot has its own Arc identity, so rooting
+            // the installed root body instead would leave these dangling.
+            nested_bodies: bf
+                .nested_functions
+                .iter()
+                .map(|nested| std::ptr::from_ref(nested) as u64)
+                .collect(),
         },
     ) {
         Ok(fc) => fc,

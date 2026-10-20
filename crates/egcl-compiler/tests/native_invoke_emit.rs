@@ -526,6 +526,7 @@ fn guarded_leaf_without_poll_has_a_call_capable_deopt_frame() {
     assert_eq!(&emitted.code[deopts[0].return_offset - 2..deopts[0].return_offset], &[0xff, 0xd0]);
     let legacy = egcl_compiler::t2::emit::emit_framed_with_direct_natives(
         &ir, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 0, 1, None, &[], 1, &[], Default::default(),
+        &Default::default(),
     ).unwrap();
     let legacy_deopts: Vec<_> = legacy.native_calls.as_ref().unwrap().iter().filter(|site|
         matches!(site.origin, egcl_compiler::t2::x64_calls::NativeCallOrigin::Deopt(_))).collect();

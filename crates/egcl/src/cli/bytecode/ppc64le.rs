@@ -36,11 +36,12 @@
 use super::{
     BytecodeFunction, DIRECT_CALL_GEN, FixnumOp, NativeEmission, NativeEnvNames, UnaryFixnumOp, c2i_alloc_cons,
     c2i_call_builtin, c2i_call_slice, c2i_clear_mv, c2i_define_env, c2i_deopt_state, c2i_eval_host,
-    c2i_load_env, c2i_load_function, c2i_load_global, c2i_make_closure, c2i_osr_backedge,
+    c2i_load_env, c2i_load_function, c2i_load_global, c2i_make_bytecode_closure,
+    c2i_make_closure, c2i_osr_backedge,
     c2i_pop_env_child, c2i_push_env_child, c2i_store_env, c2i_store_global, c2i_t1_backedge,
     c2i_take_values, c2i_transfer_pending, c2i_typep_class, c2i_values_to_list,
     call_site_profile_token, inlinable_fixnum_op, inlinable_unary_fixnum_op, registry_get,
-    resolve_sym, t2_backedge_threshold,
+    resolve_sym, t2_backedge_threshold, t2_log_write,
 };
 use egcl_rt::asm::Cc;
 use egcl_rt::asm_ppc64le::{Asm, Label, frame};
@@ -79,6 +80,13 @@ pub(super) fn emit_native_ppc64le(
         ($($reason:tt)*) => {{
             egcl_rt::blog!("compile", egcl_rt::log::TRACE,
                 "[T1/ppc64le] {}: declined: {}", bf.name, format_args!($($reason)*));
+            // T2 is queued only from an installed T1, so this decline is also
+            // why the function never appears in EGCL_T2_LOG. x86-64 says so
+            // through `mapped_t1_decline_reason`; this emitter already knows
+            // the reason, so it writes its own line (bliss-s5r0c).
+            t2_log_write(format_args!(
+                "{}: T1 declined ({}); T2 needs an installed T1",
+                super::display_fn_name(&bf.name), format_args!($($reason)*)));
             return None;
         }};
     }
@@ -171,6 +179,8 @@ pub(super) fn emit_native_ppc64le(
     let pop_env_addr = c2i_pop_env_child as extern "C" fn() as usize as u64;
     let eval_host_addr = c2i_eval_host as extern "C" fn(u64) -> u64 as usize as u64;
     let make_closure_addr = c2i_make_closure as extern "C" fn(u64) -> u64 as usize as u64;
+    let make_bytecode_closure_addr = c2i_make_bytecode_closure
+        as extern "C" fn(*const std::sync::Arc<BytecodeFunction>, u64) -> u64 as usize as u64;
     let alloc_cons_addr = c2i_alloc_cons as extern "C" fn(u64, u64) -> u64 as usize as u64;
     let take_values_addr = c2i_take_values as extern "C" fn(u64, *mut EgclVal, u64) as usize as u64;
     let values_to_list_addr = c2i_values_to_list as extern "C" fn(u64) -> u64 as usize as u64;
@@ -326,6 +336,30 @@ pub(super) fn emit_native_ppc64le(
                 emit_pop(&mut c, 4)?;
                 emit_pop(&mut c, 3)?;
                 emit_c2i_call(&mut c, alloc_cons_addr, transfer_addr)?;
+                emit_push(&mut c)?;
+            }
+            Instr::MakeClosure { func, capture_env } => {
+                // `(lambda ...)`. Any MakeClosure used to decline the whole
+                // creating function, so a `(mapcar (lambda (x) ...) l)` never
+                // left the interpreter on POWER, and a closure factory stayed a
+                // tier below the one the other checked-ABI targets reach.
+                //
+                // The adapter is the one the other checked emitters call, with
+                // the same two arguments: the retained nested body and the
+                // capture flag. A capturing closure takes its environment from
+                // `NATIVE_ENV_FRAME`, which the dispatcher publishes for this
+                // activation exactly as it does for the lexical-access helpers
+                // this emitter already calls (`c2i_load_env`).
+                let Some(nested) = bf.nested_functions.get(*func as usize) else {
+                    decline!("nested function index {func} is out of range");
+                };
+                // Pass the ADDRESS of the retained `Arc`, not a copy: the
+                // executing NativeCode keeps this body alive, so the helper
+                // builds the closure from the original nested function even if
+                // the enclosing name is redefined meanwhile.
+                c.imm64(3, std::ptr::from_ref(nested) as u64);
+                c.imm64(4, u64::from(*capture_env));
+                emit_c2i_call(&mut c, make_bytecode_closure_addr, transfer_addr)?;
                 emit_push(&mut c)?;
             }
             Instr::EvalHost(index) | Instr::MakeClosureEnv(index) => {

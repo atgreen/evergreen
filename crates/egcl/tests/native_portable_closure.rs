@@ -194,8 +194,10 @@ fn saved_fasl_function_retains_bytecode_after_function_cell_replacement() {
 }
 
 /// A function that only creates non-capturing closures reaches mapped T2 on
-/// Linux, and every tier returns the same results with fresh closure identity
-/// (bliss-ku9w). A capturing closure still keeps the interpreter fallback.
+/// Linux -- and plain T2 on ppc64le, whose framed emitter calls the closure
+/// adapter directly -- and every tier returns the same results with fresh
+/// closure identity (bliss-ku9w). A capturing closure still keeps the
+/// interpreter fallback everywhere.
 #[test]
 fn noncapturing_lambda_outer_reaches_mapped_t2() {
     let definitions = r#"
@@ -256,6 +258,16 @@ fn noncapturing_lambda_outer_reaches_mapped_t2() {
             );
         }
         assert!(stdout.contains("TIERS=(2 2 2 0)"), "{stdout}\n{stderr}");
+        assert!(
+            !stderr.contains("S-CLOSURE: optimized worker result installed"),
+            "{stderr}"
+        );
+    } else if cfg!(all(target_arch = "powerpc64", target_endian = "little")) {
+        // No mapped entry here: the three non-capturing creators reach T2
+        // through the checked ABI's closure adapter. S-CLOSURE captures, so it
+        // stops at the baseline tier like the other checked targets
+        // (`factory_tier`) -- the T2 builder admits only `capture_env: false`.
+        assert!(stdout.contains("TIERS=(2 2 2 1)"), "{stdout}\n{stderr}");
         assert!(
             !stderr.contains("S-CLOSURE: optimized worker result installed"),
             "{stderr}"
