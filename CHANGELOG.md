@@ -56,7 +56,6 @@
   `(< a 1000000000000)`, now reach the optimizing tier instead of stopping
   one tier below it
   ([#456](https://github.com/atgreen/evergreen/pull/456)).
-
 - Functions whose lambda list has `&optional` parameters, but no `&rest`,
   `&key` or `&aux`, now compile to native code on x86-64 Linux. They used to
   stay in the interpreter there, because the native entry required every
