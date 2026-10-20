@@ -97,7 +97,7 @@
   defaults behave as before. Prelude functions such as `STRING-UPCASE`,
   `POSITION-IF`, `REDUCE` and `PARSE-INTEGER` now reach T1 and then T2
   instead of staying in the interpreter
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#470](https://github.com/atgreen/evergreen/pull/470)).
 - `FLOOR`, `CEILING`, `TRUNCATE`, `ROUND`, `MOD` and `REM` on bignums divide
   once instead of going through exact rational arithmetic, which reduced
   `a/b` with a gcd first. A `MOD` of a 4096-bit number by a 2048-bit one is
@@ -138,7 +138,7 @@
   `CATCH` in the interpreted caller reaches that catch. Once the caller had
   been called a few times, the throw escaped as an internal error such as
   `__THROW__:1758` instead
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#470](https://github.com/atgreen/evergreen/pull/470)).
 - On x86-64, a fully optimized function that left-shifted a masked value, such
   as `(ash (logand a #xFFFFFFFFFF) 30)`, returned a wrapped fixnum instead of
   the bignum result. It now checks the shift for overflow
