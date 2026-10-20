@@ -12,8 +12,9 @@
 
 use std::process::{Command, Output};
 
-// Mapped Linux admission still excludes captured entries and &rest/&key ones;
-// &optional-only entries are admitted (bliss-shih7.27). Checked
+// Mapped Linux admission still excludes captured entries, including a variadic
+// one whose parameters are boxed for a closure; &optional, and non-capturing
+// &rest/&key/&aux entries, are admitted (bliss-shih7.27). Checked
 // primitive declarations have an ordinary native entry and validate at ingress.
 const MAPPED_LINUX: bool = cfg!(all(target_arch = "x86_64", target_os = "linux"));
 
@@ -2019,8 +2020,9 @@ fn variadic_rest_stays_correct_under_t2() {
     assert!(ok, "variadic under T2 failed: {out}");
     let line = out.lines().next().unwrap_or("").to_string();
     assert!(line.ends_with(" 6"), "hot &rest result must be 6: {line:?}");
+    // The mapped Linux entry binds a non-capturing &rest too (bliss-shih7.27).
     assert!(
-        line.starts_with(if MAPPED_LINUX { "0 " } else { "2 " }),
+        line.starts_with("2 "),
         "unexpected admission tier for variadic entry: {line:?}"
     );
 
@@ -2401,11 +2403,8 @@ fn t2_reduce_from_end_folds_correctly() {
     assert!(ok, "run failed: {out}");
     assert_eq!(
         out.lines().next().unwrap_or_default().trim(),
-        if MAPPED_LINUX {
-            "0 (1 2 3 4) 6"
-        } else {
-            "2 (1 2 3 4) 6"
-        },
+        // REDUCE's &key entry is admitted on mapped Linux too (bliss-shih7.27).
+        "2 (1 2 3 4) 6",
         "REDUCE right-fold diverged (tier fold-cons fold-plus): {out}"
     );
 }
@@ -2419,11 +2418,12 @@ fn t2_reduce_from_end_folds_correctly() {
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn structural_t1_decline_is_attempted_only_once() {
-    // The mapped emitter refuses variadic entry; the checked emitter refuses THROW.
-    // This therefore declines at T1 and
+    // The mapped emitter refuses a captured environment; the checked emitter
+    // refuses THROW. This therefore declines at T1 and
     // stays in the interpreter — where it must still compute the right answer.
     let program = "\
-        (defun thrower (&rest ns) (let ((n (car ns))) (catch 'tag (if (> n 3) (throw 'tag (* n 2)) n)))) \
+        (defun thrower (&rest ns) (let ((n (car ns))) \
+          (catch 'tag (if (> n 3) (throw 'tag (funcall (lambda () (* n 2)))) n)))) \
         (dotimes (i 300) (thrower i)) \
         (format t \"~a ~a~%\" (thrower 10) (egcl-ext:function-tier (quote thrower)))";
     let out = run_output(
@@ -2457,7 +2457,7 @@ fn structural_t1_decline_is_attempted_only_once() {
 #[test]
 fn redefining_a_declined_function_allows_promotion_again() {
     let program = "\
-        (defun redef-target (&rest ns) (catch 'tag (throw 'tag (car ns)))) \
+        (defun redef-target (&rest ns) (catch 'tag (throw 'tag (funcall (lambda () (car ns)))))) \
         (dotimes (i 50) (redef-target i)) \
         (defun redef-target (n) (+ n 1)) \
         (dotimes (i 300) (redef-target i)) \

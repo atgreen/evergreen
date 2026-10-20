@@ -16633,7 +16633,11 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                                 let e = e.capture_backtrace();
                                 stack.pop_frame();
                                 drop(debug_call);
-                                initiate_unwind(acts, stack, env, Pending::Propagate(e))?;
+                                // A default form may THROW to a CATCH in this
+                                // very execution; route it there like any
+                                // other host-call transfer.
+                                let pending = error_to_pending(e, env);
+                                initiate_unwind(acts, stack, env, pending)?;
                                 continue;
                             }
                         } else {

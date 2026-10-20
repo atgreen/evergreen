@@ -193,8 +193,10 @@ fn osr_error_keeps_its_loop_frame_and_condition_type() {
 
 #[test]
 fn native_keyword_binding_error_keeps_its_callee() {
+    // The callee's &key binding fails in its native entry on every target
+    // (bliss-shih7.27); the error must still name that callee once.
     for (tier, installed) in [("t1", 1), ("t2", 2)] {
-        let callee_tier = if cfg!(all(target_arch = "x86_64", target_os = "linux")) { 0 } else { installed };
+        let callee_tier = installed;
         let program = format!(
             r#"
               (defun native-keyword-leaf (&key value) value)
