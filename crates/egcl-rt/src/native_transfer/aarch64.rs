@@ -17,7 +17,46 @@ const _: () = {
 };
 
 pub(super) fn is_supported() -> bool {
-    true
+    // Unknown hardening state is a refusal, not permission to reset a
+    // protected stack -- the same rule the x86-64 probe follows.
+    //
+    // The AArch64 hazard is the Guarded Control Stack. GCS validates every
+    // return against a kernel-maintained shadow stack, and this boundary
+    // resets SP and branches to a landing PC, so a segment transfer under an
+    // enabled GCS would fault. (BTI is not a hazard: the stubs emit `bti c`
+    // at every indirect target. PAC is not either, since nothing here signs
+    // or authenticates a return address.)
+    #[cfg(target_os = "linux")]
+    {
+        // PR_GET_SHADOW_STACK_STATUS, Linux 6.13's arm64 GCS interface. The
+        // remaining prctl arguments must be zero for this option.
+        const PR_GET_SHADOW_STACK_STATUS: libc::c_int = 74;
+        const PR_SHADOW_STACK_ENABLE: u64 = 1 << 0;
+        let mut status: u64 = 0;
+        let result = unsafe {
+            libc::prctl(
+                PR_GET_SHADOW_STACK_STATUS,
+                &mut status as *mut u64,
+                0usize,
+                0usize,
+                0usize,
+            )
+        };
+        if result == 0 {
+            // A successful query: proceed only with no shadow stack enabled.
+            return status & PR_SHADOW_STACK_ENABLE == 0;
+        }
+        // EINVAL means this kernel does not implement GCS at all, so none can
+        // be enabled for the process and the legacy expectations hold. Any
+        // other failure (a seccomp EPERM, say) leaves the state unknown, and
+        // unknown is a refusal.
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL)
+    }
+    // Non-Linux AArch64 (macOS arm64) has no GCS equivalent to query here.
+    #[cfg(not(target_os = "linux"))]
+    {
+        true
+    }
 }
 
 pub(super) unsafe fn enter(
@@ -45,12 +84,26 @@ pub unsafe extern "C" fn leave_native_segment(
 ) -> ! {
     core::arch::naked_asm!(
         // x0=anchor, x1=value, x2=NativeExit.
+        //
+        // The outcome slots are addressed from `saved_sp`, because they live
+        // in the fixed `enter_aarch64` frame that anchors the segment. The SP
+        // to LAND on is a separate question: `landing_sp`, when nonzero,
+        // overrides it. The ordinary register-ABI entry sets that field
+        // because its outgoing arguments make `saved_sp` dynamic, while
+        // `saved_sp` still has to identify the precise caller boundary for a
+        // native stack walk. Zero keeps the original fixed-frame convention.
+        // This mirrors the x86-64 leave's `cmovnz`; dropping it would land a
+        // register-entry transfer on the wrong stack pointer.
         "ldr x9, [x0, #0]",
         "str x1, [x9, #216]",
         "str x2, [x9, #224]",
-        "ldr x10, [x0, #8]",
+        "ldr x10, [x0, {landing_sp}]",
+        "cmp x10, #0",
+        "csel x9, x10, x9, ne",
+        "ldr x11, [x0, #8]",
         "mov sp, x9",
-        "br x10",
+        "br x11",
+        landing_sp = const std::mem::offset_of!(NativeSegment, landing_sp),
     );
 }
 
