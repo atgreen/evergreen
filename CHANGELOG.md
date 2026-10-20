@@ -59,6 +59,18 @@
   in the interpreter. A function also no longer establishes its implicit
   block when its only `RETURN-FROM` forms name other blocks
   ([#479](https://github.com/atgreen/evergreen/pull/479)).
+- On ppc64le, functions that use `MULTIPLE-VALUE-LIST` or
+  `MULTIPLE-VALUE-PROG1` now reach the optimizing tier instead of stopping one
+  tier below it, and functions that create a closure capturing no local
+  variables -- `(mapcar (lambda (x) (* x 2)) l)`, `(sort l (lambda ...))`,
+  `(remove-if (lambda ...) l)` -- compile to native code and reach the
+  optimizing tier instead of staying in the interpreter entirely. x86-64 Linux
+  gained these through its mapped native entry; POWER has no mapped entry, so
+  its emitters call the same runtime helpers directly. A function creating a
+  closure that *does* capture a variable now compiles to baseline native code
+  there as well, instead of staying in the interpreter; it still does not reach
+  the optimizing tier, as on x86-64
+  ([#478](https://github.com/atgreen/evergreen/pull/478)).
 - `COUNT`, `COUNT-IF` and `COUNT-IF-NOT` compile to bytecode instead of being
   tree-walked on every call, and `FIND`, `FIND-IF`, `FIND-IF-NOT` and the
   `COUNT` family no longer build a closure for each call. Counting over a

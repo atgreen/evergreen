@@ -1012,6 +1012,15 @@ impl<'a> Builder<'a> {
                 } if self.native_cleanups => {
                     push(i + 1, d + 1, &mut depth_at, &mut work);
                 }
+                // Same stack effect without the mapped protocol: a checked-ABI
+                // target lowers this to a plain adapter call (see the
+                // `AuxData::NestedClosure` arm below), so the depth walk must
+                // accept it rather than refuse the whole function.
+                Instr::MakeClosure {
+                    capture_env: false, ..
+                } => {
+                    push(i + 1, d + 1, &mut depth_at, &mut work); // -> closure
+                }
                 Instr::BindSpecial(_) if self.native_cleanups => {
                     if d < 1 { return Err(BuildError::Unsupported("special binding without value")); }
                     push(i + 1, d - 1, &mut depth_at, &mut work);
@@ -2087,6 +2096,35 @@ impl<'a> Builder<'a> {
                         )?;
                         return Ok(());
                     }
+                    stack.push(results[0]);
+                }
+                // Non-capturing closure creation for a CHECKED-ABI target.
+                // Under `native_cleanups` the mapped path above has already
+                // turned this into an `Invoke` and returned, so this arm runs
+                // only for the emitters that call a plain C adapter; the guard
+                // keeps x86-64's mapped IR byte-identical.
+                Instr::MakeClosure {
+                    func,
+                    capture_env: false,
+                } if !self.native_cleanups => {
+                    if self.bf.nested_functions.get(*func as usize).is_none() {
+                        return Err(BuildError::Unsupported("invalid nested function"));
+                    }
+                    let fs = self.build_frame_state(block, &stack, i as u32);
+                    let (_, results) = self.f.push_inst(
+                        block,
+                        InstData {
+                            opcode: Opcode::Call,
+                            args: vec![],
+                            results: vec![],
+                            aux: AuxData::NestedClosure(*func),
+                            flags: runtime_call_flags(),
+                            targets: vec![],
+                            frame_state: Some(fs),
+                            source_pos: 0,
+                        },
+                        &[(IRType::TOP, ValueRepresentation::Tagged)],
+                    );
                     stack.push(results[0]);
                 }
                 Instr::PushBlock { sp_restore, .. } | Instr::PushTag { sp_restore, .. } => {

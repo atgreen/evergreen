@@ -3429,6 +3429,7 @@ pub fn emit_framed_with_activation_slots(
         0,
         &[],
         EnvironmentCalls::default(),
+        &PortableCalls::default(),
     )
 }
 
@@ -3442,6 +3443,38 @@ pub struct EnvironmentCalls {
     pub body: u64,
     pub load: u64,
     pub store: u64,
+}
+
+/// Runtime adapters a *checked*-ABI emitter needs for operations x86-64
+/// reaches only through the mapped transfer protocol.
+///
+/// On x86-64 Linux `MULTIPLE-VALUE-LIST` becomes an `Invoke` carrying
+/// `TRANSFER_VALUES_TO_LIST_REQUEST`, which only the mapped entry can service;
+/// a target without that entry saw an `AuxData` its `Call` arm did not know and
+/// declined the whole function to T1 (bliss-3pw4m). Giving the checked emitters
+/// the plain C adapter instead costs one indirect call and keeps the body at T2.
+/// Every field is optional: zero declines just the operation that needs it, and
+/// the x86-64 emitter ignores the struct entirely.
+#[derive(Clone, Debug, Default)]
+pub struct PortableCalls {
+    /// `c2i_values_to_list(primary) -> list`: collect the primary and the
+    /// runtime multiple-value tuple into a fresh list, leaving the
+    /// multiple-value state inactive.
+    pub values_to_list: u64,
+    /// `c2i_make_bytecode_closure(*const Arc<BytecodeFunction>, capture) -> closure`:
+    /// build a non-capturing closure over a nested body and register its
+    /// control, exactly as the interpreter's `MakeClosure` does.
+    pub make_closure: u64,
+    /// One entry per `nested_functions` index: the address of the retained
+    /// `Arc<BytecodeFunction>` the runtime passes to `make_closure`, which
+    /// `AuxData::NestedClosure(i)` selects. The runtime MUST keep the owning
+    /// body alive for the life of the code; an index with no entry declines.
+    ///
+    /// The index is always the ROOT body's, never an inlined callee's: the
+    /// inline cost model's whitelist (`inlining::body_cost`) admits only
+    /// constants, locals, branches and pure non-allocating calls, so a body
+    /// containing `MakeClosure` can never be cloned into another one.
+    pub nested_bodies: Vec<u64>,
 }
 
 /// Execution-owned linkage slots resolved before background compilation.
@@ -3478,6 +3511,7 @@ pub fn emit_framed_with_direct_natives(
     code_id: u64,
     named_calls: &[NamedCallTarget],
     environment: EnvironmentCalls,
+    portable: &PortableCalls,
 ) -> Result<FramedCode, EmitError> {
     if cfg!(target_arch = "aarch64") {
         return super::emit_a64::emit_framed_with_runtime(
@@ -3498,6 +3532,7 @@ pub fn emit_framed_with_direct_natives(
                 direct_natives: Vec::new(),
                 code_id: 0,
                 environment: EnvironmentCalls::default(),
+                portable: portable.clone(),
             },
         );
     }
@@ -3520,6 +3555,7 @@ pub fn emit_framed_with_direct_natives(
                 direct_natives: Vec::new(),
                 code_id: 0,
                 environment: EnvironmentCalls::default(),
+                portable: portable.clone(),
             },
         );
     }
@@ -3558,6 +3594,7 @@ pub fn emit_framed_with_direct_natives(
                 direct_natives: direct_natives.to_vec(),
                 code_id,
                 environment,
+                portable: portable.clone(),
             },
         );
     }
