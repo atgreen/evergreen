@@ -43,9 +43,12 @@
 //!    `ir::OsrEntry` records the builder captures at empty-stack loop headers.
 //! 9. Native non-local transfer (opt-in, x86-64 Linux and ppc64le) —
 //!    [`transfer_capture`], [`transfer_map`], [`transfer_sites`],
-//!    [`native_transfer`], `native_transfer_ppc64le`: capturing a throw at the
-//!    throwing call, binding frame maps to emitted return PCs, and the machine
-//!    stubs for the transfer ABI.
+//!    [`native_transfer`], `native_transfer_ppc64le`,
+//!    [`native_transfer_s390x`]: capturing a throw at the throwing call,
+//!    binding frame maps to emitted return PCs, and the machine stubs for the
+//!    transfer ABI. System Z has the three stubs and the capture image; the
+//!    emitter and installer that would use them are still being built, so the
+//!    target stays on the checked ABI.
 //!
 //! # Cross-module invariants
 //!
@@ -107,6 +110,10 @@ pub mod native_return;
     target_os = "linux"
 ))]
 pub mod native_transfer_ppc64le;
+// Compiled on every host, like emit_s390x: the stubs are pure byte emission,
+// so building them everywhere keeps x86 CI type-checking them. Only the tests
+// that execute the bytes are target-gated.
+pub mod native_transfer_s390x;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub mod transfer_sites;
 
