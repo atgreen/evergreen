@@ -3085,7 +3085,11 @@ vector.</p>
 <p><strong>Function</strong> <code>(egcl-ext:crypto-ghash-mul accumulator hash-key)</code> → <code>nil</code></p>
 <p><strong>Function</strong> <code>(egcl-ext:crypto-sha256-block registers octets start)</code> → <code>nil</code></p>
 <p><strong>Function</strong> <code>(egcl-ext:crypto-sha256-words registers words)</code> → <code>nil</code></p>
-<p>These are the inner functions of AES, GCM and SHA-256. EGCL's port of
+<p><strong>Function</strong> <code>(egcl-ext:crypto-sha512-block registers octets start)</code> → <code>nil</code></p>
+<p><strong>Function</strong> <code>(egcl-ext:crypto-sha512-words registers words)</code> → <code>nil</code></p>
+<p><strong>Function</strong> <code>(egcl-ext:crypto-keccak-f1600 state)</code> → <code>nil</code></p>
+<p><strong>Function</strong> <code>(egcl-ext:crypto-keccak-absorb state rate-octets octets start)</code> → <code>nil</code></p>
+<p>These are the inner functions of AES, GCM, SHA-256, SHA-512 and SHA-3. EGCL's port of
 Ironclad calls them in place of its portable Lisp versions, the way Ironclad
 uses assembly routines on SBCL. Each one updates its destination in place,
 using Ironclad's data layout. Applications should normally call Ironclad
@@ -3103,6 +3107,16 @@ rather than these functions.</p>
   <code>registers</code>, a vector of eight <code>(unsigned-byte 32)</code> words.
   <code>crypto-sha256-words</code> compresses a message block held as the first sixteen
   big-endian words of <code>words</code>.</li>
+<li><code>crypto-sha512-block</code> and <code>crypto-sha512-words</code> are the same for SHA-512 and
+  SHA-384: 128 octets, or sixteen words, compressed into eight
+  <code>(unsigned-byte 64)</code> registers.</li>
+<li><code>crypto-keccak-f1600</code> applies the Keccak-f[1600] permutation (FIPS 202) to
+  <code>state</code>, a vector of 25 <code>(unsigned-byte 64)</code> lanes indexed x + 5y.
+  <code>crypto-keccak-absorb</code> first XORs the <code>rate-octets</code> octets of <code>octets</code> from
+  <code>start</code> into the lanes, little-endian; <code>rate-octets</code> is a multiple of 8, at
+  most 200.</li>
+<li><code>(unsigned-byte 64)</code> values at or above 2^60 are bignums in EGCL, so the
+  SHA-512 and Keccak functions can allocate when they store their results.</li>
 </ul>
 <p>A destination or source that is too short signals <code>type-error</code>, and a wrong
 argument count signals <code>program-error</code>.</p>
