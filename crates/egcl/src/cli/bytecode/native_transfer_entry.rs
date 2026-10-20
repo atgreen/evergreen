@@ -708,10 +708,7 @@ impl TransferCode {
     pub(super) fn compile_mapped_for_test(body: Arc<BytecodeFunction>) -> Option<Self> {
         let roots = retain_native_body(&body);
         let ir = egcl_compiler::t2::build::build_from_bytecode_for_native_cleanups(&body).ok()?;
-        let call_cells: Vec<_> = body.code.iter().filter_map(|instruction| {
-            let Instr::CallNamed { sym, .. } = instruction else { return None };
-            call_table::resolve(*sym).map(|cell| (*sym, cell))
-        }).collect();
+        let call_cells = named_call_cells(&body);
         Self::emit_prepared(body, roots, &ir, None, &call_cells, false, CompilationTier::T1)
     }
 
@@ -814,10 +811,7 @@ impl TransferCode {
         } else {
             (egcl_compiler::t2::build::build_from_bytecode_for_native_cleanups(&body).ok()?, None, None)
         };
-        let call_cells: Vec<_> = body.code.iter().filter_map(|instruction| {
-            let Instr::CallNamed { sym, .. } = instruction else { return None };
-            call_table::resolve(*sym).map(|cell| (*sym, cell))
-        }).collect();
+        let call_cells = named_call_cells(&body);
         Self::emit_prepared_with_ordinary(body, roots, &ir, ordinary_ir.as_ref(), deopt_metadata, &call_cells, allow_recursion, CompilationTier::T1)
     }
 
@@ -1539,6 +1533,7 @@ impl TransferCode {
                                 | Instr::LoadFunction(_)
                                 | Instr::ValuesToList
                                 | Instr::MakeClosure { capture_env: false, .. }
+                                | Instr::AllocCons
                                 | Instr::CleanupReturn
                                 | Instr::SetValues(_)
                                 | Instr::Throw
@@ -1740,6 +1735,29 @@ pub(super) fn positional_tagged_parameters(body: &BytecodeFunction) -> bool {
             .all(|(_, location)| matches!(location, VarLoc::Slot(_)))
 }
 
+/// The symbol a bytecode instruction calls through the T2 IR, if any. A
+/// backquote's AllocCons is built as a call to CONS (bliss-elwvl), so it needs
+/// that call cell like any CallNamed.
+fn named_call_symbol(instruction: &Instr) -> Option<u32> {
+    match instruction {
+        Instr::CallNamed { sym, .. } => Some(*sym),
+        Instr::AllocCons => Some(egcl_rt::symbols::intern("CONS")),
+        _ => None,
+    }
+}
+
+fn named_call_cells(body: &BytecodeFunction) -> Vec<(u32, Arc<egcl_rt::call_table::CallCell>)> {
+    let mut cells: Vec<(u32, Arc<egcl_rt::call_table::CallCell>)> = Vec::new();
+    for symbol in body.code.iter().filter_map(named_call_symbol) {
+        if !cells.iter().any(|(existing, _)| *existing == symbol)
+            && let Some(cell) = call_table::resolve(symbol)
+        {
+            cells.push((symbol, cell));
+        }
+    }
+    cells
+}
+
 fn scope_free_native_body(body: &BytecodeFunction, allow_values: bool) -> bool {
     local_control_native_body(body, allow_values, false, false)
 }
@@ -1818,6 +1836,7 @@ fn local_control_op(op: &Instr, allow_values: bool, allow_local_scopes: bool, al
             | Instr::BrIfFalse(_)
             | Instr::BrIfTrue(_)
             | Instr::CallNamed { .. }
+            | Instr::AllocCons
             | Instr::Return
             | Instr::PushBlock {
                 register: false,

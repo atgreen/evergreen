@@ -16404,6 +16404,10 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                 let mut car = acts[top_idx].pop_op();
                 egcl_rt::rooted_ref!(_cdr_root = &mut cdr);
                 egcl_rt::rooted_ref!(_car_root = &mut car);
+                // A backquote yields exactly one value, like the CONS call the
+                // compiled tiers make: a tuple left by a template operand
+                // must not leak out as its secondaries (bliss-elwvl).
+                env.clear_mv();
                 acts[top_idx].push_op(arena_cons(car, cdr));
             }
             Instr::TypeP(class) => {
@@ -18174,7 +18178,14 @@ extern "C" fn c2i_alloc_cons(car: u64, cdr: u64) -> u64 {
     match guard_c2i(|| {
         egcl_rt::rooted!(car = EgclVal(car));
         egcl_rt::rooted!(cdr = EgclVal(cdr));
-        Ok(arena_cons(*car, *cdr))
+        let cons = arena_cons(*car, *cdr);
+        // One value, matching the T0 AllocCons arm (bliss-elwvl).
+        let env_ptr = NATIVE_ENV.with(std::cell::Cell::get);
+        if !env_ptr.is_null() {
+            // SAFETY: as in `c2i_values_to_list`, NATIVE_ENV names the live Env.
+            unsafe { (*env_ptr).clear_mv() };
+        }
+        Ok(cons)
     }) {
         Ok(value) => value.0,
         Err(error) => {
@@ -20914,11 +20925,17 @@ fn snapshot_t2_input(sym: u32, priority: u64) -> Option<T2CompileInput> {
     if cfg!(target_arch = "x86_64") {
         for body in std::iter::once(&*root).chain(inline_bodies.iter().map(|saved| &*saved.body)) {
             for instruction in &body.code {
-                if let Instr::CallNamed { sym, .. } = instruction
-                    && !call_cells.iter().any(|(symbol, _)| symbol == sym)
-                    && let Some(cell) = call_table::resolve(*sym)
+                // A backquote's AllocCons is built as a call to CONS (bliss-elwvl).
+                let sym = match instruction {
+                    Instr::CallNamed { sym, .. } => Some(*sym),
+                    Instr::AllocCons => Some(egcl_rt::symbols::intern("CONS")),
+                    _ => None,
+                };
+                if let Some(sym) = sym
+                    && !call_cells.iter().any(|(symbol, _)| *symbol == sym)
+                    && let Some(cell) = call_table::resolve(sym)
                 {
-                    call_cells.push((*sym, cell));
+                    call_cells.push((sym, cell));
                 }
             }
         }

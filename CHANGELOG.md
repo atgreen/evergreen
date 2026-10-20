@@ -97,6 +97,12 @@
   compile to native code on x86-64 Linux and reach the optimizing tier. They
   used to stay in the bytecode interpreter
   ([#461](https://github.com/atgreen/evergreen/pull/461)).
+- Functions that build lists with backquote now compile to native code on
+  x86-64 Linux and can reach the optimizing tier; they used to stay in the
+  bytecode interpreter. In a cold `(asdf:load-system :babel)` this moves
+  functions such as `UIOP:NORMALIZE-PATHNAME-DIRECTORY-COMPONENT` and
+  `ASDF:MAKE-OPERATION` out of the interpreter
+  ([#464](https://github.com/atgreen/evergreen/pull/464)).
 
 ### Fixed
 
@@ -109,6 +115,10 @@
   secondary values, so `(multiple-value-bind (a b) (f))` around a function
   ending in `MULTIPLE-VALUE-LIST` saw `b` as the second collected value instead
   of `NIL` ([#461](https://github.com/atgreen/evergreen/pull/461)).
+- A backquote form returns exactly one value in the bytecode interpreter.
+  It used to pass on the values of its last evaluated operand, so
+  `` (multiple-value-list `(,(values 1 2))) `` returned `(1 2)` instead of
+  `((1))` ([#464](https://github.com/atgreen/evergreen/pull/464)).
 - Compiled code calls another package's `LENGTH`, `FIRST`, `ELT` and the
   other functions the compiler calls directly, rather than the CL function
   of the same name. A generic function such as `(defgeneric my:length (x))`

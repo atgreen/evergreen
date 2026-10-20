@@ -725,3 +725,88 @@ fn values_to_list_reaches_mapped_t2() {
         );
     }
 }
+
+/// Backquote templates build their conses with `AllocCons`. The T2 builder
+/// used to refuse it, so such functions never left the interpreter on x86-64
+/// Linux; they now reach T2 with interpreter-identical results, and the
+/// template's value carries no stale secondaries from an operand (bliss-elwvl).
+#[test]
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn backquote_alloc_cons_reaches_t2() {
+    let program = r#"
+        (defun qq-pair (a b) `(,a . ,b))
+        (defun qq-list (a b) `(head ,a ,b tail))
+        (defun qq-splice (a l) `(x ,a ,@l y))
+        (defun qq-nested (a) `(outer (inner ,a) ,(list a a)))
+        ;; Nursery operands that the cons allocations can relocate.
+        (defun qq-fresh (a) `(,(list a) ,(vector a) . ,(cons a a)))
+        (defun qq-mv (a) (multiple-value-list `(,(values a 2))))
+        (defun qq-handler (a)
+          (handler-case `(,a ,(if (minusp a) (error "neg") (1+ a)))
+            (error () :err)))
+        (defun qq-check (a)
+          (assert (equal (qq-pair a (* 2 a)) (cons a (* 2 a))))
+          (assert (equal (qq-list a "s") (list 'head a "s" 'tail)))
+          (assert (equal (qq-splice a (list 1 a)) (list 'x a 1 a 'y)))
+          (assert (equal (qq-nested a) (list 'outer (list 'inner a) (list a a))))
+          (assert (equalp (qq-fresh a) (list* (list a) (vector a) (cons a a))))
+          (assert (equal (qq-mv a) (list (list a))))
+          (assert (equal (multiple-value-list (qq-pair a a)) (list (cons a a))))
+          (assert (equal (qq-handler a) (list a (1+ a))))
+          (assert (eq (qq-handler (- -1 a)) :err)))
+        (defvar *qq-names*
+          '(qq-pair qq-list qq-splice qq-nested qq-fresh qq-mv qq-handler))
+        (let ((n 0))
+          (loop (qq-check (mod n 1000))
+                (incf n)
+                (when (or (> n 200000)
+                          (every (lambda (f) (= 2 (egcl-ext:function-tier f))) *qq-names*))
+                  (return)))
+          (dotimes (i 200) (qq-check i)))
+        (assert (every (lambda (f) (= 2 (egcl-ext:function-tier f))) *qq-names*))
+        (print (list (qq-pair 3 4) (qq-list 3 4) (qq-splice 3 '(5 6)) (qq-nested 3)
+                     (qq-fresh 3) (qq-mv 3) (qq-handler 3) (qq-handler -3)))
+        (format t "~%QQ-T2-OK~%")
+    "#;
+    let output = Command::new(env!("CARGO_BIN_EXE_egcl"))
+        .args(["--no-init", "--eval", program])
+        .env("EGCL_T0_T1_THRESHOLD", "5")
+        .env("EGCL_T2_THRESHOLD", "20")
+        .env("EGCL_T2_LOG", "stderr")
+        .output()
+        .expect("run EGCL");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(stdout.contains("QQ-T2-OK"), "{stdout}");
+    assert!(
+        stdout.contains(
+            "((3 . 4) (HEAD 3 4 TAIL) (X 3 5 6 Y) (OUTER (INNER 3) (3 3)) \
+             ((3) #(3) 3 . 3) ((3)) (3 4) :ERR)"
+        ),
+        "{stdout}"
+    );
+    for name in [
+        "QQ-PAIR",
+        "QQ-LIST",
+        "QQ-SPLICE",
+        "QQ-NESTED",
+        "QQ-FRESH",
+        "QQ-MV",
+        "QQ-HANDLER",
+    ] {
+        assert!(
+            stderr.contains(&format!(
+                "[T2] {name}: optimized worker result installed with"
+            )),
+            "{name} must install T2 code: {stderr}"
+        );
+        assert!(
+            !stderr.contains(&format!("[T1] {name}: declined")),
+            "{stderr}"
+        );
+    }
+}
