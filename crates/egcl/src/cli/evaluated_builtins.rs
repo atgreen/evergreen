@@ -1109,6 +1109,79 @@ fn resolve(name: &str) -> Option<Handler> {
             };
             Ok(struct_slot_typespec(*object, *slot))
         }),
+        // Boot MAKE-ARRAY's common case: LENGTH elements, no options but
+        // :ELEMENT-TYPE and either :INITIAL-ELEMENT or :INITIAL-CONTENTS, and
+        // an element type that upgrades to T -- which is a simple vector. NIL
+        // means another case, which boot parses in full.
+        "EGCL::%MAKE-SIMPLE-ARRAY" => Some(|_operator, args, env| {
+            env.clear_mv();
+            // Resolving a symbol can allocate, so do it before reading ARGS.
+            let element_type_key = resolve_sym(":ELEMENT-TYPE").unwrap_or(NIL);
+            let initial_element_key = resolve_sym(":INITIAL-ELEMENT").unwrap_or(NIL);
+            let initial_contents_key = resolve_sym(":INITIAL-CONTENTS").unwrap_or(NIL);
+            let types = SimpleVectorTypes::resolve();
+            let [length, options] = args else {
+                return Err(EgclError::ProgramError(
+                    "%MAKE-SIMPLE-ARRAY takes two arguments".into(),
+                ));
+            };
+            if !length.is_fixnum() || length.as_fixnum() < 0 {
+                return Ok(NIL);
+            }
+            let (mut element_type, mut initial_element, mut initial_contents) = (None, None, None);
+            let mut rest = *options;
+            while rest.is_cons() {
+                let (key, tail) = cp(rest);
+                if !tail.is_cons() {
+                    return Ok(NIL);
+                }
+                let (value, next) = cp(tail);
+                // The leftmost occurrence of a keyword wins (CLHS 3.4.1.4).
+                if key == element_type_key {
+                    element_type.get_or_insert(value);
+                } else if key == initial_element_key {
+                    initial_element.get_or_insert(value);
+                } else if key == initial_contents_key {
+                    initial_contents.get_or_insert(value);
+                } else {
+                    return Ok(NIL);
+                }
+                rest = next;
+            }
+            let Some(default) = types.default_element(element_type.unwrap_or(T)) else {
+                return Ok(NIL);
+            };
+            let length = length.as_fixnum() as usize;
+            let Some(contents) = initial_contents else {
+                return Ok(egcl_stdlib::build_filled_simple_vector(
+                    length,
+                    initial_element.unwrap_or(default),
+                ));
+            };
+            // Contents with an element, or of the wrong length, are errors the
+            // full parsing reports.
+            if initial_element.is_some() || initial_contents_length(contents) != Some(length) {
+                return Ok(NIL);
+            }
+            egcl_rt::rooted!(contents = contents);
+            egcl_rt::rooted!(vector = egcl_stdlib::build_filled_simple_vector(length, NIL));
+            if contents.is_cons() {
+                // Walk a list once; ELT on it would rescan from the head.
+                let mut rest = *contents;
+                for index in 0..length {
+                    let (element, tail) = cp(rest);
+                    egcl_stdlib::set_elt(*vector, index, element)?;
+                    rest = tail;
+                }
+                return Ok(*vector);
+            }
+            for index in 0..length {
+                // Reading a packed double-float element allocates.
+                let element = egcl_stdlib::elt(*contents, index)?;
+                egcl_stdlib::set_elt(*vector, index, element)?;
+            }
+            Ok(*vector)
+        }),
         "EGCL::%POSIX" => Some(|_operator, args, env| {
             if env.sandbox {
                 return Err(EgclError::SandboxViolation("POSIX access denied".into()));
@@ -5577,5 +5650,73 @@ fn index_arg(value: EgclVal) -> Result<usize, EgclError> {
             datum: value,
             expected: "(INTEGER 0 *)".into(),
         })
+    }
+}
+
+/// The length of MAKE-ARRAY :INITIAL-CONTENTS the fast path copies: a proper
+/// list or a vector. `None` for anything else, including a circular list.
+fn initial_contents_length(contents: EgclVal) -> Option<usize> {
+    if contents.is_nil() || contents.is_cons() {
+        let (mut length, mut rest, mut slow) = (0, contents, contents);
+        while rest.is_cons() {
+            length += 1;
+            rest = cp(rest).1;
+            if length % 2 == 0 {
+                slow = cp(slow).1;
+                if rest == slow && rest.is_cons() {
+                    return None;
+                }
+            }
+        }
+        return rest.is_nil().then_some(length);
+    }
+    if egcl_rt::types::vectorp(contents) && !egcl_rt::types::md_array_p(contents) {
+        return egcl_stdlib::length(contents).ok();
+    }
+    None
+}
+
+/// The standard type names MAKE-ARRAY's fast path recognizes, resolved
+/// before the request is read (resolving can allocate).
+struct SimpleVectorTypes {
+    fixnum: EgclVal,
+    integer: EgclVal,
+    unsigned_byte: EgclVal,
+    signed_byte: EgclVal,
+}
+
+impl SimpleVectorTypes {
+    fn resolve() -> Self {
+        let named = |name| resolve_sym(name).unwrap_or(NIL);
+        SimpleVectorTypes {
+            fixnum: named("FIXNUM"),
+            integer: named("INTEGER"),
+            unsigned_byte: named("UNSIGNED-BYTE"),
+            signed_byte: named("SIGNED-BYTE"),
+        }
+    }
+
+    /// The default element of a MAKE-ARRAY vector of ELEMENT-TYPE when that
+    /// type upgrades to T, as boot's MAKE-ARRAY chooses it: NIL for T, and 0
+    /// for the integer types EGCL stores in general vectors (FIXNUM, INTEGER,
+    /// and (UNSIGNED-BYTE n) or (SIGNED-BYTE n) for n of at least 2). `None`
+    /// for any other type: (UNSIGNED-BYTE 1) is BIT, which has its own
+    /// storage. Standard type names cannot be redefined by DEFTYPE, so
+    /// matching them is enough.
+    fn default_element(&self, element_type: EgclVal) -> Option<EgclVal> {
+        if element_type == T {
+            return Some(NIL);
+        }
+        if element_type == self.fixnum || element_type == self.integer {
+            return Some(EgclVal::from_fixnum(0));
+        }
+        if !element_type.is_cons() {
+            return None;
+        }
+        let (head, tail) = cp(element_type);
+        let (width, end) = if tail.is_cons() { cp(tail) } else { return None };
+        let byte_type = head == self.unsigned_byte || head == self.signed_byte;
+        (byte_type && end.is_nil() && width.is_fixnum() && width.as_fixnum() >= 2)
+            .then(|| EgclVal::from_fixnum(0))
     }
 }

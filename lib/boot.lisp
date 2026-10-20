@@ -2242,6 +2242,12 @@
            (length contents) size)))
 
 (defun make-array (dimensions &rest keys)
+  ;; A vector of fixnum length with at most :ELEMENT-TYPE and :INITIAL-ELEMENT,
+  ;; whose element type upgrades to T, is built natively without the option
+  ;; parsing below; %MAKE-SIMPLE-ARRAY returns NIL for every other request.
+  (let ((vector (egcl::%make-simple-array dimensions keys)))
+    (when vector
+      (return-from make-array vector)))
   ;; Each dimension must be a non-negative integer (a list of them for rank ≥ 2,
   ;; or a bare integer for a vector). An empty list falls through to the
   ;; existing rank-0 path.
