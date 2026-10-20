@@ -4437,7 +4437,8 @@ fn host_restore_registries(data: &[u8]) -> Result<(), EgclError> {
         }
     }
     *ACCESSOR_METHODS.borrow_mut() = accessor_methods;
-    // Older images lack SPCL; their valueless, un-earmuffed specials are lost.
+    // Version-11 images all carry SPCL (older ones fail the header check), so
+    // an absent block only means nothing to re-proclaim.
     // Only indices are stashed here: the names are read off the symbol tables
     // in the drain, once they are live.
     if data.get(off..off + 4) == Some(b"SPCL") {
