@@ -174,12 +174,53 @@ pub(crate) const DEFAULT_STACK_SIZE: usize = if cfg!(any(
     512 * 1024
 };
 
+/// The native stack of a thread made by `egcl-thread:make-thread`.
+///
+/// Without this the thread took Rust's default, 2 MiB, which `EGCL_STACK_SIZE`
+/// and `--stack-size` never reached: a thread could recurse about a quarter as
+/// deep as the main thread before STORAGE-CONDITION, and a server's worker
+/// threads overflowed on work the main thread finished (a Parenscript compile
+/// of a large script inside a deep object tree). Now `EGCL_STACK_SIZE` sizes
+/// it when set; otherwise the thread gets the main thread's soft
+/// `RLIMIT_STACK`, so the two can recurse alike; failing that, 8 MiB. Never
+/// below 1 MiB, which the runtime's own frames need, nor below
+/// `RUST_MIN_STACK`, which an explicit size would otherwise override.
+fn native_thread_stack_size() -> usize {
+    const FLOOR: usize = 1024 * 1024;
+    const DEFAULT: usize = 8 * 1024 * 1024;
+    let rust_min_stack = std::env::var("RUST_MIN_STACK")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    let size = (|| {
+        // A value that does not parse falls through, rather than to the
+        // fibers' small default.
+        if let Some(size) = env_stack_size() {
+            return size;
+        }
+        #[cfg(unix)]
+        if let Ok(rl) = crate::syscall::getrlimit(crate::syscall::RLIMIT_STACK) {
+            let soft = rl.rlim_cur;
+            if soft != 0 && soft != crate::syscall::RLIM_INFINITY {
+                return soft as usize;
+            }
+        }
+        DEFAULT
+    })();
+    size.max(FLOOR).max(rust_min_stack)
+}
+
 /// Usable `EgclStack` size for a fiber, honouring `EGCL_STACK_SIZE`
 /// (accepts a raw byte count or a `k`/`m`/`g` suffix), using the platform default.
 ///
 /// Deep interpreted recursion is bounded by this size once CL activations live
 /// on the `EgclStack` (bliss-nmq): overflow raises `STORAGE-CONDITION` (R2.20).
 fn default_stack_size() -> usize {
+    env_stack_size().unwrap_or(DEFAULT_STACK_SIZE)
+}
+
+/// `EGCL_STACK_SIZE` as a positive byte count, or `None` when unset or unparseable.
+fn env_stack_size() -> Option<usize> {
     fn parse_size(s: &str) -> Option<usize> {
         let s = s.trim();
         if s.is_empty() {
@@ -197,7 +238,6 @@ fn default_stack_size() -> usize {
         .ok()
         .and_then(|v| parse_size(&v))
         .filter(|&n| n > 0)
-        .unwrap_or(DEFAULT_STACK_SIZE)
 }
 
 /// Unique identifier for an exposed one-to-one OS native thread.
@@ -2429,7 +2469,10 @@ where
         .insert(id, Arc::clone(&thread));
 
     let running = Arc::clone(&thread);
-    let handle = match std::thread::Builder::new().name(name).spawn(move || {
+    let builder = std::thread::Builder::new()
+        .name(name)
+        .stack_size(native_thread_stack_size());
+    let handle = match builder.spawn(move || {
         install_current_native_thread(Arc::clone(&running));
         crate::safepoint::transition_native_state(&running, NativeThreadState::Running);
         // An unwinding entry must still publish completion: JOIN waits on
