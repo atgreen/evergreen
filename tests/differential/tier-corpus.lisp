@@ -438,6 +438,28 @@
        (let ((a (make-tagger)) (b (make-tagger)))
          (list (eq a b) (funcall a 1) (funcall b 2))))
 
+;; A hot nested lambda creating a closure that exits to a block/tag the
+;; enclosing function established (bliss-ku9w review).
+(defun nlx-call (f) (funcall f))
+(defun nlx-return (l)
+  (block b
+    (mapcar (lambda (x) (if (eql x 3) (nlx-call (lambda () (return-from b :escaped))) x)) l)))
+(defun nlx-go (l)
+  (let ((r :none))
+    (tagbody
+       (mapcar (lambda (x) (if (eql x 3) (nlx-call (lambda () (go out))) x)) l)
+       (setq r :fell-through)
+       (go done)
+     out
+       (setq r :went)
+     done)
+    r))
+
+(check :closure-inherited-exits
+       (let ((l (let ((v nil)) (dotimes (i 200 (nreverse v)) (push (if (= i 150) 3 0) v))))
+             (r nil))
+         (dotimes (i 30 r) (setq r (list (nlx-return l) (nlx-go l))))))
+
 ;;; ── epilogue: checksum + completion sentinel ───────────────────────────
 
 (note :checksum *hash*)

@@ -262,3 +262,57 @@ fn noncapturing_lambda_outer_reaches_mapped_t2() {
         );
     }
 }
+
+/// A hot nested lambda that inherits a block/tag from its enclosing function
+/// and creates a non-capturing closure exiting to it must keep that exit
+/// visible at every tier. A native activation does not publish inherited
+/// control, so such a creator stays at T0 (bliss-ku9w review).
+#[test]
+fn natively_created_closure_keeps_inherited_nonlocal_exits() {
+    let definitions = r#"
+      (defun nlx-call (f) (funcall f))
+      (defun nlx-return (l)
+        (block b
+          (mapcar (lambda (x) (if (eql x 3) (nlx-call (lambda () (return-from b :escaped))) x))
+                  l)))
+      (defun nlx-go (l)
+        (let ((r :none))
+          (tagbody
+             (mapcar (lambda (x) (if (eql x 3) (nlx-call (lambda () (go out))) x)) l)
+             (setq r :fell-through)
+             (go done)
+           out
+             (setq r :went)
+           done)
+          r))
+      (defun nlx-list (n at)
+        (let ((l nil)) (dotimes (i n) (push (if (= i at) 3 0) l)) (nreverse l)))
+    "#;
+    let probe = r#"
+      (let ((r nil))
+        (dotimes (i 30)
+          (setq r (list (nlx-return (nlx-list 400 350)) (nlx-go (nlx-list 400 350)))))
+        (format t "NLX=~S~%" r))
+    "#;
+    let expected = "NLX=(:ESCAPED :WENT)";
+    for tier in ["t0", "t1", "t2"] {
+        let out = run_case(
+            &format!("inherited-nlx-{tier}"),
+            definitions,
+            probe,
+            &[("EGCL_FORCE_TIER", tier)],
+        );
+        assert!(out.contains(expected), "{tier}: {out}");
+    }
+    let out = run_case(
+        "inherited-nlx-default",
+        definitions,
+        probe,
+        &[
+            ("EGCL_T0_T1_THRESHOLD", "5"),
+            ("EGCL_T2_THRESHOLD", "20"),
+            ("EGCL_T2_THREADS", "1"),
+        ],
+    );
+    assert!(out.contains(expected), "default: {out}");
+}

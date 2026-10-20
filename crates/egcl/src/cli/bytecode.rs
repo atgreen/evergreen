@@ -13355,6 +13355,51 @@ fn bf_escapes_to_control(
         .any(|n| bf_escapes_to_control(n, blocks, tags))
 }
 
+/// True if `bf` (a nested closure body) can perform a non-local exit to a
+/// block/tag it does not establish itself, i.e. one it must find in the
+/// lexical control captured when it was created. `blocks`/`tags` hold the
+/// names its enclosing nested bodies establish. Opaque source-form closures
+/// and host-evaluated forms count as escaping: they are not analysed here,
+/// and declining is always safe (bliss-ku9w).
+fn bf_has_free_control_exit(
+    bf: &BytecodeFunction,
+    blocks: &std::collections::HashSet<String>,
+    tags: &std::collections::HashSet<String>,
+) -> bool {
+    let mut blocks = blocks.clone();
+    let mut tags = tags.clone();
+    for instr in &bf.code {
+        match instr {
+            Instr::PushBlock { name_idx, .. } => {
+                blocks.insert(bf.names[*name_idx as usize].clone());
+            }
+            Instr::NamedTag { name_idx, .. } => {
+                tags.insert(bf.names[*name_idx as usize].clone());
+            }
+            _ => {}
+        }
+    }
+    for instr in &bf.code {
+        match instr {
+            Instr::ReturnFromNamed { name_idx } => {
+                if !blocks.contains(&bf.names[*name_idx as usize]) {
+                    return true;
+                }
+            }
+            Instr::GoNamed { name_idx } => {
+                if !tags.contains(&bf.names[*name_idx as usize]) {
+                    return true;
+                }
+            }
+            Instr::MakeClosureEnv(_) | Instr::EvalHost(_) => return true,
+            _ => {}
+        }
+    }
+    bf.nested_functions
+        .iter()
+        .any(|n| bf_has_free_control_exit(n, &blocks, &tags))
+}
+
 /// True if compiling `bf` to native (T1/T2) would break a closure's non-local
 /// exit. Native lowers `PushBlock`/`PushTag` to no-ops (local returns become
 /// jumps), so a block/tag this function establishes is never published on
@@ -13379,6 +13424,19 @@ fn native_would_lose_captured_control(bf: &BytecodeFunction) -> bool {
                 own_tags.insert(bf.names[*name_idx as usize].clone());
             }
             _ => {}
+        }
+    }
+    // A native activation does not publish the lexical control it inherited
+    // on `env.block_stack`/`env.tag_stack` (its entry guard moves them aside),
+    // so a closure it creates would snapshot an empty scope. Keep the body at
+    // T0 when such a closure exits to any block/tag it does not establish
+    // itself: the interpreter gives it the creator's full captured control.
+    let none = std::collections::HashSet::new();
+    for instr in &bf.code {
+        if let Instr::MakeClosure { func, .. } = instr {
+            if bf_has_free_control_exit(&bf.nested_functions[*func as usize], &none, &none) {
+                return true;
+            }
         }
     }
     if own_blocks.is_empty() && own_tags.is_empty() {
