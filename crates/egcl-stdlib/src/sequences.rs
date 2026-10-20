@@ -2002,6 +2002,109 @@ pub fn set_aref(sequence: EgclVal, index: usize, value: EgclVal) -> Result<(), E
     set_elt(sequence, index, value)
 }
 
+/// Whether every element of `v` is read and written in constant time without
+/// allocating: a simple vector (which includes `(unsigned-byte 8)` arrays) or a
+/// simple string. Boot's REPLACE and SEARCH hand only these to the native
+/// helpers below; anything else keeps their element-by-element Lisp path.
+fn direct_vector(v: EgclVal) -> bool {
+    is_vector(v) || v.is_string()
+}
+
+/// Boot REPLACE's native case: copy `count` elements of `src` from `start2`
+/// into `dst` from `start1`, the caller having checked the bounds. When `dst`
+/// and `src` are the same vector the copy runs in the direction that reads
+/// each source element before overwriting it, so overlapping ranges behave as
+/// if the source were copied first (CLHS REPLACE). Returns `false` without
+/// copying when either sequence is not a [`direct_vector`]. Nothing here
+/// allocates, so no value moves during the copy.
+pub fn replace_direct(
+    dst: EgclVal,
+    start1: usize,
+    src: EgclVal,
+    start2: usize,
+    count: usize,
+) -> Result<bool, EgclError> {
+    if !direct_vector(dst) || !direct_vector(src) {
+        return Ok(false);
+    }
+    let copy = |k: usize| set_elt(dst, start1 + k, elt(src, start2 + k)?);
+    if dst == src && start2 < start1 {
+        for k in (0..count).rev() {
+            copy(k)?;
+        }
+    } else {
+        for k in 0..count {
+            copy(k)?;
+        }
+    }
+    Ok(true)
+}
+
+/// Boot SEARCH's native case: the EQL test and no key, the caller having
+/// checked the bounds. Returns SEARCH's value -- the index in `seq` where
+/// `pat[start1..end1]` first matches within `seq[start2..end2]` (the last
+/// match with `from_end`), or NIL -- or `None` when either sequence is not a
+/// [`direct_vector`]. Two simple strings compare characters directly;
+/// otherwise elements compare with EQL. Nothing here allocates.
+pub fn search_direct(
+    pat: EgclVal,
+    start1: usize,
+    end1: usize,
+    seq: EgclVal,
+    start2: usize,
+    end2: usize,
+    from_end: bool,
+) -> Result<Option<EgclVal>, EgclError> {
+    if !direct_vector(pat) || !direct_vector(seq) {
+        return Ok(None);
+    }
+    let len = end1 - start1;
+    if len == 0 {
+        let at = if from_end { end2 } else { start2 };
+        return Ok(Some(EgclVal::from_fixnum(at as i64)));
+    }
+    if end2 < start2 + len {
+        return Ok(Some(NIL));
+    }
+    let last = end2 - len;
+    let mut positions: Box<dyn Iterator<Item = usize>> = if from_end {
+        Box::new((start2..=last).rev())
+    } else {
+        Box::new(start2..=last)
+    };
+    let found = if pat.is_string() && seq.is_string() {
+        let chars: Vec<char> = (start1..end1)
+            .map(|i| string_char_at(pat, i).expect("bounds checked by SEARCH"))
+            .collect();
+        positions.find(|&i| {
+            chars
+                .iter()
+                .enumerate()
+                .all(|(k, &c)| string_char_at(seq, i + k) == Some(c))
+        })
+    } else {
+        let elements = (start1..end1)
+            .map(|i| elt(pat, i))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut found = None;
+        for i in positions {
+            let mut matched = true;
+            for (k, &e) in elements.iter().enumerate() {
+                if !crate::equality::eql(e, elt(seq, i + k)?) {
+                    matched = false;
+                    break;
+                }
+            }
+            if matched {
+                found = Some(i);
+                break;
+            }
+        }
+        found
+    };
+    Ok(Some(found.map_or(NIL, |i| EgclVal::from_fixnum(i as i64))))
+}
+
 /// Copy a sequence (CL `COPY-SEQ`).
 pub fn copy_seq(sequence: EgclVal) -> Result<EgclVal, EgclError> {
     if is_double_float_sequence(sequence) {
