@@ -166,11 +166,13 @@ pub enum Instr {
         /// Publish `(name, token)` on `env.block_stack` so a `return-from` in
         /// ANOTHER function can find this block by name. A local `return-from`
         /// compiles to `ReturnFrom { block_id }` and never consults either, so
-        /// this is false whenever the block's body provably creates no closure
-        /// and performs no named return — the registration is then
-        /// unobservable, and it costs three heap allocations (a name clone, a
-        /// formatted token, and a clone of that token) on every entry to every
-        /// block, which includes every DEFUN's implicit block (bliss-htff).
+        /// this is false whenever no closure or restart clause created in the
+        /// block's body can name it and the body runs no tree-walked code — the
+        /// registration is then unobservable, and it costs three heap
+        /// allocations (a name clone, a formatted token, and a clone of that
+        /// token) on every entry to every block, which includes every DEFUN's
+        /// implicit block (bliss-htff). Native code requires it false
+        /// (bliss-1c3iw).
         register: bool,
     },
     /// Establish a `TAGBODY` handler keyed by the lexical `tagbody_id`.
@@ -195,7 +197,8 @@ pub enum Instr {
     Go { tagbody_id: u32, target_bcp: u32 },
     /// Register one named tag of the just-established (innermost) TAGBODY for
     /// non-local `GO`: names[name_idx] resumes at `tag_bcp`. Emitted right after
-    /// `PushTag`, only for a tagbody whose body captures a closure, so a `GO` in
+    /// `PushTag`, only for a tagbody whose body creates a closure or restart clause
+    /// that can `GO` to one of its tags, or runs tree-walked code, so a `GO` in
     /// that closure (`GoNamed`) can unwind here across the closure-call boundary.
     /// The first one establishes the tagbody's control token in `env.tag_stack`.
     /// Loops with no captured closure emit none, keeping the hot path untouched.

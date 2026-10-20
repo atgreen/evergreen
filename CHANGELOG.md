@@ -71,6 +71,16 @@
   there as well, instead of staying in the interpreter; it still does not reach
   the optimizing tier, as on x86-64
   ([#478](https://github.com/atgreen/evergreen/pull/478)).
+- A function whose `BLOCK` or `TAGBODY` contains `ASSERT`, `IGNORE-ERRORS`,
+  `HANDLER-CASE` or `RESTART-CASE` compiles to native code on x86-64 Linux. The compiler registered every such block and tag by name in
+  case a handler or restart reached it, which cost three allocations each time
+  the block was entered and made the native compiler decline the function with
+  "PushBlock needs an executing identity". A block or tag is now registered
+  only when a closure or restart clause created inside it really exits to it
+  by name. A cold Babel load now compiles six more ASDF and UIOP functions to
+  native code, among them `MAKE-ACTION-STATUS`, `COMPUTE-ACTION-STATUS`,
+  `TRUENAMIZE` and `FEATUREP`
+  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
 - `COUNT`, `COUNT-IF` and `COUNT-IF-NOT` compile to bytecode instead of being
   tree-walked on every call, and `FIND`, `FIND-IF`, `FIND-IF-NOT` and the
   `COUNT` family no longer build a closure for each call. Counting over a
