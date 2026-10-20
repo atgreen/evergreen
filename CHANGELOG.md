@@ -43,7 +43,7 @@
   about 2x faster. None of these functions is refused native compilation for
   a closure environment any more; their keyword arguments still keep them
   interpreted for now
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#465](https://github.com/atgreen/evergreen/pull/465)).
 - A `(return-from NAME ...)` inside a `FLET` or `LABELS` function compiles to
   bytecode: the compiler now establishes the implicit block named after the
   local function, as the tree-walker does. Such a return used to send the
