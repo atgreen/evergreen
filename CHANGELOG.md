@@ -65,8 +65,8 @@
 - `LOOP` clauses that step a numeric index (`for i below n`, `for i from a to
   b`, with `collect`, `append`, `nconc`, `sum`, `count` and the like) now reach
   the optimizing T2 tier. Guard elimination left their IR failing verification,
-  so every such loop stayed at T1
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  so such loops stayed at T1
+  ([#458](https://github.com/atgreen/evergreen/pull/458)).
 
 ### Fixed
 
