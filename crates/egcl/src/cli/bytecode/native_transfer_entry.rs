@@ -365,7 +365,7 @@ pub(super) fn install_t1(
     body: Arc<BytecodeFunction>,
     allow_speculation: bool,
 ) -> Option<Rc<NativeCode>> {
-    if !native_transfer::is_supported() || !fixed_tagged_parameters(&body) {
+    if !native_transfer::is_supported() || !positional_tagged_parameters(&body) {
         return None;
     }
     let code = TransferCode::compile_variant(Arc::clone(&body), allow_speculation, true)
@@ -865,7 +865,9 @@ impl TransferCode {
         // the identity check must leave a generation mismatch at entry.
         let recursive_generation = direct_call_gen();
         let recursive_symbol = super::super::resolve_sym(&body.name)
-            .filter(|_| allow_recursion && scope_free_native_body(&body, false))
+            // Recursive transfer reads exactly `arity` arguments; an optional
+            // body's self calls pad through the ordinary call path instead.
+            .filter(|_| allow_recursion && fixed_tagged_parameters(&body) && scope_free_native_body(&body, false))
             .map(EgclVal::as_symbol_index)
             .filter(|symbol| recursive_definition_matches(*symbol, Arc::as_ptr(&body)))
             .filter(|symbol| body.code.iter().any(|op| {
@@ -1254,7 +1256,10 @@ impl TransferCode {
         };
         egcl_rt::rooted!(args = args.to_vec());
         egcl_rt::rooted_ref!(_env = &mut *env);
-        if osr_offset.is_none() && args.len() != usize::from(self.body.arity) {
+        // `bind_params` pads omitted `&optional` arguments below.
+        if osr_offset.is_none()
+            && !(usize::from(self.body.min_args)..=usize::from(self.body.arity)).contains(&args.len())
+        {
             return Err(EgclError::ProgramError(
                 "native transfer entry: wrong argument count".into(),
             ));
@@ -1681,9 +1686,18 @@ fn invalid_capture() -> EgclError {
 }
 
 pub(super) fn fixed_tagged_parameters(body: &BytecodeFunction) -> bool {
+    body.min_args == body.arity && positional_tagged_parameters(body)
+}
+
+/// Fixed positional slot parameters, of which an `&optional` entry prologue's
+/// trailing `arity - min_args` may be omitted (bliss-shih7.27). The managed
+/// activation entry pads them with the unsupplied marker through `bind_params`;
+/// register entries, mapped callees and direct recursion still require
+/// `fixed_tagged_parameters`.
+pub(super) fn positional_tagged_parameters(body: &BytecodeFunction) -> bool {
     !body.has_env
         && !body.variadic
-        && body.min_args == body.arity
+        && body.min_args <= body.arity
         && body.max_args == Some(body.arity)
         && body.param_layout.len() == usize::from(body.arity)
         && body

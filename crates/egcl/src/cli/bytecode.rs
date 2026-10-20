@@ -8207,10 +8207,10 @@ pub(super) fn optional_range(body: &BytecodeFunction) -> bool {
 /// positionally instead of through the run-time lambda-list binder, which
 /// re-parsed the lambda list and tree-walked the defaults on every call.
 ///
-/// Such a function stays at T0 for now: the native ordinary entry checks an
-/// exact argument count, and the generic activation entry costs more per call
-/// than the interpreter saves for the small hot functions this applies to.
-/// Native promotion needs that entry to pad the omitted arguments itself.
+/// Such a function promotes through the managed mapped activation entry, which
+/// pads omitted arguments with the unsupplied marker (bliss-shih7.27). The
+/// ordinary register entry, mapped direct callees and direct recursion still
+/// require an exact argument count, so those calls take the checked dispatcher.
 ///
 /// `(lambda (a &optional (b (f a) b-p) c) . body)` becomes
 ///

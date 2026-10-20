@@ -375,6 +375,31 @@
 (check :double-loop-1000 (double-loop 1000))
 (check :double-loop-100000 (double-loop 100000))
 
+;;; ── &optional entry: omitted arguments padded at native entry ─────────
+
+(defun opt-sp (a &optional (b (* a 10) b-p) c)
+  (list a b b-p c))
+
+(defun opt-heap (a &optional (b (list a a)))
+  (list* a b))
+
+(defun opt-overflow (a &optional (b most-positive-fixnum))
+  (+ a b))
+
+(defun opt-sum (n &optional (acc 0))
+  (if (zerop n) acc (opt-sum (1- n) (+ acc n))))
+
+(defun opt-calls (i)
+  (list (opt-sp i) (opt-sp i nil) (opt-sp i 2 3) (opt-heap i) (opt-heap i :x)
+        (opt-overflow i) (opt-sum i) (opt-sum i 7)))
+
+(check :optional-hot
+       (let ((acc nil))
+         (dotimes (i 40 acc)
+           (setq acc (opt-calls i)))))
+(check :optional-overflow (list (opt-overflow 1) (opt-overflow -1 -2)))
+(check :optional-too-many (opt-sp 1 2 3 4))
+
 ;;; ── epilogue: checksum + completion sentinel ───────────────────────────
 
 (note :checksum *hash*)
