@@ -23644,9 +23644,22 @@ fn try_promote_to_t1_with_speculation(sym: u32, allow_speculation: bool) -> Opti
         return Some(mapped);
     }
     if !checked_native_installation_allowed() {
-        egcl_rt::blog!("compile", egcl_rt::log::TRACE,
-            "[T1] {}: declined: mapped native entry unavailable; retain interpreter",
-            display_fn_name(&bf.name));
+        // Linux queues T2 only from an installed T1, so this decline is also
+        // why the function never appears in EGCL_T2_LOG; say so there too
+        // (bliss-s5r0c). The reason rebuilds IR, so only compute it if printed.
+        let compile_trace = egcl_rt::log::enabled("compile", egcl_rt::log::TRACE);
+        if compile_trace || t2_log_target().is_some() {
+            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+            let reason = native_transfer_entry::mapped_t1_decline_reason(&bf);
+            #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+            let reason = "mapped native entry unavailable";
+            if compile_trace {
+                eprintln!("[compile] [T1] {}: declined: {reason}; retain interpreter",
+                    display_fn_name(&bf.name));
+            }
+            t2_log_write(format_args!("{}: T1 declined ({reason}); T2 needs an installed T1",
+                display_fn_name(&bf.name)));
+        }
         return None;
     }
     // Non-leaf functions promote too (bliss-x5y.4): a T1 function's CallNamed to
