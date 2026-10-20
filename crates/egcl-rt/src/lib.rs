@@ -59,6 +59,7 @@ pub mod ffi;
 pub mod python;
 
 // ── Image persistence ─────────────────────────────────────────────
+pub mod container;
 pub mod image;
 pub mod image_heap;
 pub mod image_relocation;

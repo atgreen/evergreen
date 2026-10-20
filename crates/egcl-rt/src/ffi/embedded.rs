@@ -1,38 +1,41 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-//! Shared libraries that travel with the image (bliss-rhsy4).
+//! Shared libraries that travel with a saved executable (bliss-rhsy4).
 //!
-//! `embed` reads a shared object on the BUILD host and records its bytes, its
-//! ELF `DT_SONAME` and `DT_NEEDED` entries, and a SHA-256. A save writes them
-//! into their own image section, outside the Lisp heap, with each library's
-//! bytes at a page-aligned offset. A restore does not copy them: an entry then
-//! refers to the image file through a descriptor retained for the purpose, and
-//! a later save copies the bytes forward.
+//! `embed` reads a shared object on the BUILD host and records its bytes and
+//! the names it answers to. A save stores each one as a `lib/` member of the
+//! executable's zip archive (`crate::container`), with its names in the
+//! archive's manifest. A restore does not copy them: an entry then refers to
+//! its member through a descriptor retained for the purpose, and a later save
+//! copies the bytes forward.
+//!
+//! The archive is an ordinary zip, so a user can replace, add or remove a
+//! library with zip tools, as the LGPL requires they can. Nothing about a
+//! library is therefore recorded at save time beyond its names: the SONAME and
+//! `DT_NEEDED` entries are read from the bytes when it loads.
 //!
 //! `load_foreign_library` consults this registry before the file system. An
-//! entry answers to its SONAME, to the absolute path it was embedded from, and
-//! to any extra names given at embed time. On glibc (the `c-ffi` backend) a
-//! library is loaded without touching the disk: its bytes go into a sealed
-//! memfd, the hash is checked after sealing, and the loader opens
-//! `/proc/self/fd/N`. Embedded libraries it names in `DT_NEEDED` are loaded
-//! first, so glibc finds them already loaded by SONAME instead of searching for
-//! them (bliss-rhsy4.2).
+//! entry answers to its SONAME, to the absolute path it was embedded from, to
+//! any extra names given at embed time, and to its member's file name. On glibc
+//! (the `c-ffi` backend) a library is loaded without touching the disk: its
+//! bytes go into a sealed memfd, the member's CRC-32 is checked after sealing,
+//! and the loader opens `/proc/self/fd/N`. Embedded libraries it names in
+//! `DT_NEEDED` are loaded first, so glibc finds them already loaded by SONAME
+//! instead of searching for them (bliss-rhsy4.2).
 
-use crate::digest::sha256;
+use crate::container::{self, Archive, Manifest};
 use crate::error::EgclError;
 use std::sync::{Arc, Mutex};
 
 /// One embedded shared object.
 #[derive(Clone)]
 struct Entry {
-    /// Names `load_foreign_library` matches exactly: the absolute source path,
-    /// the SONAME, then any aliases. The first is the one reported to Lisp.
+    /// Names `load_foreign_library` matches exactly. The first is the one
+    /// reported to Lisp.
     names: Vec<String>,
-    soname: Option<String>,
-    needed: Vec<String>,
-    sha256: [u8; 32],
-    len: u64,
+    /// The archive member it is saved as: `lib/` and its SONAME or file name.
+    member: String,
     source: Source,
     /// The sealed memfd this entry was loaded from, kept for the life of the
     /// process. Keeping it open also keeps its `/proc/self/fd/N` path unique:
@@ -46,51 +49,27 @@ struct Entry {
 enum Source {
     /// Read on this host and not yet saved.
     Bytes(Arc<[u8]>),
-    /// In the image this process was restored from, at a file offset.
-    Image {
+    /// A member of the archive this process was restored from.
+    Archive {
         file: Arc<std::fs::File>,
-        offset: u64,
+        member: container::Member,
     },
 }
 
 impl Source {
-    fn read_all(&self, len: u64) -> Result<Vec<u8>, EgclError> {
+    fn read_all(&self) -> Result<Vec<u8>, EgclError> {
         match self {
             Source::Bytes(bytes) => Ok(bytes.to_vec()),
-            Source::Image { file, offset } => {
-                let mut bytes = vec![0; usize::try_from(len).map_err(|_| too_large())?];
-                read_exact_at(file, &mut bytes, *offset)?;
-                Ok(bytes)
-            }
+            Source::Archive { file, member } => container::read_member(&**file, member),
         }
     }
-}
-
-#[cfg(unix)]
-fn read_exact_at(file: &std::fs::File, bytes: &mut [u8], offset: u64) -> Result<(), EgclError> {
-    use std::os::unix::fs::FileExt;
-    file.read_exact_at(bytes, offset)
-        .map_err(|e| EgclError::FfiError(format!("cannot read embedded library from image: {e}")))
-}
-
-#[cfg(not(unix))]
-fn read_exact_at(file: &std::fs::File, bytes: &mut [u8], offset: u64) -> Result<(), EgclError> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut file = file;
-    file.seek(SeekFrom::Start(offset))
-        .and_then(|_| file.read_exact(bytes))
-        .map_err(|e| EgclError::FfiError(format!("cannot read embedded library from image: {e}")))
-}
-
-fn too_large() -> EgclError {
-    EgclError::FfiError("embedded library is too large for this address space".into())
 }
 
 static REGISTRY: Mutex<Vec<Entry>> = Mutex::new(Vec::new());
 
 /// The registry key for a designator containing a separator: absolute, the
 /// normalisation embedded files use. A bare name such as `libz.so.1` is kept
-/// as given, because it is matched against SONAMEs.
+/// as given, because it is matched against SONAMEs and file names.
 fn normalize(name: &str) -> String {
     if !name.contains('/') {
         return name.to_owned();
@@ -99,6 +78,10 @@ fn normalize(name: &str) -> String {
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| name.to_owned());
     absolute.trim_end_matches('/').to_owned()
+}
+
+fn file_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
 }
 
 // ── ELF dynamic section ─────────────────────────────────────────────
@@ -277,10 +260,16 @@ fn host_elf_identity() -> Result<(u8, u8, u16), EgclError> {
 
 // ── Registry ────────────────────────────────────────────────────────
 
-/// Read the shared object at `path` now and carry it in the image. It answers
-/// to its SONAME, its absolute path and every name in `aliases`. Embedding
-/// under a name already in use replaces that entry. Returns the name it is
-/// reported under: the SONAME when it has one.
+fn push_unique(names: &mut Vec<String>, name: String) {
+    if !names.contains(&name) {
+        names.push(name);
+    }
+}
+
+/// Read the shared object at `path` now and carry it in saved executables. It
+/// answers to its SONAME, its absolute path and every name in `aliases`.
+/// Embedding under a name already in use replaces that entry. Returns the name
+/// it is reported under: the SONAME when it has one.
 pub fn embed(path: &str, aliases: &[String]) -> Result<String, EgclError> {
     let bytes = std::fs::read(path)
         .map_err(|e| EgclError::FfiError(format!("cannot embed '{path}': {e}")))?;
@@ -294,24 +283,27 @@ pub fn embed(path: &str, aliases: &[String]) -> Result<String, EgclError> {
             elf.machine, elf.class, elf.data, host.2, host.0, host.1
         )));
     }
+    let absolute = normalize(path);
     let mut names = Vec::new();
     for name in elf
         .soname
         .iter()
         .cloned()
-        .chain([normalize(path)])
+        .chain([absolute.clone()])
         .chain(aliases.iter().map(|a| normalize(a)))
     {
-        if !names.contains(&name) {
-            names.push(name);
-        }
+        push_unique(&mut names, name);
     }
+    let member = format!(
+        "{}{}",
+        container::LIBRARY_DIR,
+        elf.soname
+            .as_deref()
+            .unwrap_or_else(|| file_name(&absolute))
+    );
     let entry = Entry {
         names,
-        soname: elf.soname,
-        needed: elf.needed,
-        sha256: sha256(&bytes),
-        len: bytes.len() as u64,
+        member,
         source: Source::Bytes(bytes.into()),
         #[cfg(egcl_dlopen_embedded)]
         memfd: None,
@@ -345,208 +337,70 @@ fn find(registry: &[Entry], designator: &str) -> Option<usize> {
     registry.iter().position(|e| e.names.contains(&key))
 }
 
-// ── Image section ───────────────────────────────────────────────────
-//
-// Section layout (all integers little-endian, offsets section-relative):
-//
-//   "EGCLFLB\0"  u32 version  u32 count
-//   per entry:   u64 offset  u64 length  [u8; 32] sha256
-//                u32 name count, names   u8 has-soname, soname
-//                u32 needed count, needed names        (strings: u32 len, bytes)
-//   payloads, each at a page-aligned offset after the manifest
-//
-// The section is always written uncompressed (`SECTION_STORED`): the payloads
-// must be directly mappable and copyable from the file.
+// ── Archive members ─────────────────────────────────────────────────
 
-const SECTION_MAGIC: &[u8; 8] = b"EGCLFLB\0";
-const SECTION_VERSION: u32 = 1;
-const PAGE: u64 = 4096;
-
-fn align_page(offset: u64) -> u64 {
-    offset.div_ceil(PAGE) * PAGE
+/// One library as a save writes it.
+pub(crate) struct SavedLibrary {
+    pub member: String,
+    pub names: Vec<String>,
+    pub bytes: Vec<u8>,
 }
 
-/// Serialise every embedded library as the image's foreign-library section.
-/// Empty when nothing is embedded.
-pub(crate) fn serialize_section() -> Result<Vec<u8>, EgclError> {
+/// Every embedded library's bytes, for `container::build`. A library restored
+/// from an archive is read back from it, CRC-checked, so one damaged since is
+/// not carried forward.
+pub(crate) fn saved_libraries() -> Result<Vec<SavedLibrary>, EgclError> {
     let entries = REGISTRY.lock().unwrap().clone();
-    if entries.is_empty() {
-        return Ok(Vec::new());
-    }
-    let put_str = |out: &mut Vec<u8>, s: &str| {
-        out.extend_from_slice(&(s.len() as u32).to_le_bytes());
-        out.extend_from_slice(s.as_bytes());
-    };
-    // The manifest's length does not depend on the offsets it records, so
-    // write it once with placeholders and patch them after layout.
-    let mut out = Vec::new();
-    out.extend_from_slice(SECTION_MAGIC);
-    out.extend_from_slice(&SECTION_VERSION.to_le_bytes());
-    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-    let mut offset_slots = Vec::new();
-    for entry in &entries {
-        offset_slots.push(out.len());
-        out.extend_from_slice(&0u64.to_le_bytes());
-        out.extend_from_slice(&entry.len.to_le_bytes());
-        out.extend_from_slice(&entry.sha256);
-        out.extend_from_slice(&(entry.names.len() as u32).to_le_bytes());
-        for name in &entry.names {
-            put_str(&mut out, name);
-        }
-        out.push(entry.soname.is_some() as u8);
-        put_str(&mut out, entry.soname.as_deref().unwrap_or(""));
-        out.extend_from_slice(&(entry.needed.len() as u32).to_le_bytes());
-        for needed in &entry.needed {
-            put_str(&mut out, needed);
-        }
-    }
-    for (entry, slot) in entries.iter().zip(offset_slots) {
-        let offset = align_page(out.len() as u64);
-        out.resize(offset as usize, 0);
-        out[slot..slot + 8].copy_from_slice(&offset.to_le_bytes());
-        let bytes = entry.source.read_all(entry.len)?;
-        if sha256(&bytes) != entry.sha256 {
+    let mut saved: Vec<SavedLibrary> = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if saved.iter().any(|s| s.member == entry.member) {
             return Err(EgclError::FfiError(format!(
-                "embedded library '{}' changed since it was embedded",
-                entry.names[0]
+                "two embedded libraries would both be saved as '{}'; give one of them a \
+                 distinct SONAME or file name",
+                entry.member
             )));
         }
-        out.extend_from_slice(&bytes);
-    }
-    Ok(out)
-}
-
-/// A parsed foreign-library section, installed by `install_section` once the
-/// rest of the image has been restored.
-pub(crate) struct PendingSection(Vec<Entry>);
-
-/// Bounds-checked reads through a foreign-library section's manifest.
-struct Cursor<'a> {
-    bytes: &'a [u8],
-    pos: usize,
-}
-
-fn section_error(what: &str) -> EgclError {
-    EgclError::InvalidImage(format!("foreign-library section: {what}"))
-}
-
-impl<'a> Cursor<'a> {
-    fn take(&mut self, n: usize) -> Result<&'a [u8], EgclError> {
-        let bytes = self
-            .pos
-            .checked_add(n)
-            .and_then(|end| self.bytes.get(self.pos..end))
-            .ok_or_else(|| section_error("truncated"))?;
-        self.pos += n;
-        Ok(bytes)
-    }
-
-    fn u32(&mut self) -> Result<u32, EgclError> {
-        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
-    }
-
-    fn u64(&mut self) -> Result<u64, EgclError> {
-        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
-    }
-
-    fn string(&mut self) -> Result<String, EgclError> {
-        let n = self.u32()? as usize;
-        String::from_utf8(self.take(n)?.to_vec()).map_err(|_| section_error("name is not UTF-8"))
-    }
-
-    fn strings(&mut self) -> Result<Vec<String>, EgclError> {
-        let count = self.u32()?;
-        (0..count).map(|_| self.string()).collect()
-    }
-}
-
-/// Validate a foreign-library section. `backing` is the image file and the
-/// file offset of the section's first byte; without it (an image read into
-/// memory) the payloads are copied out of `section`.
-pub(crate) fn parse_section(
-    section: &[u8],
-    backing: Option<(&std::fs::File, u64)>,
-) -> Result<PendingSection, EgclError> {
-    if section.is_empty() {
-        return Ok(PendingSection(Vec::new()));
-    }
-    let mut cursor = Cursor {
-        bytes: section,
-        pos: 0,
-    };
-    if cursor.take(8)? != SECTION_MAGIC {
-        return Err(section_error("bad magic"));
-    }
-    if cursor.u32()? != SECTION_VERSION {
-        return Err(section_error("unsupported version"));
-    }
-    let count = cursor.u32()?;
-    let mut manifest = Vec::new();
-    for _ in 0..count {
-        let offset = cursor.u64()?;
-        let len = cursor.u64()?;
-        let digest: [u8; 32] = cursor.take(32)?.try_into().unwrap();
-        let names = cursor.strings()?;
-        let has_soname = cursor.take(1)?[0] != 0;
-        let soname = cursor.string()?;
-        let needed = cursor.strings()?;
-        if names.is_empty() {
-            return Err(section_error("entry has no names"));
-        }
-        manifest.push((
-            offset,
-            len,
-            digest,
-            names,
-            has_soname.then_some(soname),
-            needed,
-        ));
-    }
-    let manifest_end = cursor.pos as u64;
-    let file = backing
-        .map(|(file, _)| file.try_clone().map(Arc::new))
-        .transpose()
-        .map_err(|e| EgclError::InvalidImage(format!("cannot retain image file: {e}")))?;
-    let mut extents = Vec::new();
-    let mut entries = Vec::new();
-    for (offset, len, digest, names, soname, needed) in manifest {
-        let end = offset
-            .checked_add(len)
-            .ok_or_else(|| section_error("payload extent overflow"))?;
-        if len == 0 || offset < manifest_end || offset % PAGE != 0 || end > section.len() as u64 {
-            return Err(section_error("bad payload extent"));
-        }
-        extents.push((offset, end));
-        let source = match (&file, backing) {
-            (Some(file), Some((_, base))) => Source::Image {
-                file: Arc::clone(file),
-                offset: base
-                    .checked_add(offset)
-                    .ok_or_else(|| section_error("file offset overflow"))?,
-            },
-            _ => Source::Bytes(section[offset as usize..end as usize].into()),
-        };
-        entries.push(Entry {
-            names,
-            soname,
-            needed,
-            sha256: digest,
-            len,
-            source,
-            #[cfg(egcl_dlopen_embedded)]
-            memfd: None,
+        saved.push(SavedLibrary {
+            bytes: entry.source.read_all()?,
+            member: entry.member,
+            names: entry.names,
         });
     }
-    extents.sort_unstable();
-    if extents.windows(2).any(|pair| pair[0].1 > pair[1].0) {
-        return Err(section_error("overlapping payloads"));
-    }
-    Ok(PendingSection(entries))
+    Ok(saved)
 }
 
-/// Make a restored image's libraries the embedded set.
-pub(crate) fn install_section(pending: PendingSection) {
-    *REGISTRY.lock().unwrap() = pending.0;
+/// Make the `lib/` members of a restored archive the embedded set. A member
+/// answers to the names its manifest record gives, then to its file name; one
+/// added to the archive by hand has only its file name.
+pub fn install_archive(
+    file: &std::fs::File,
+    archive: &Archive,
+    manifest: &Manifest,
+) -> Result<(), EgclError> {
+    let file = Arc::new(file.try_clone().map_err(|e| {
+        EgclError::InvalidImage(format!(
+            "cannot retain the executable for its libraries: {e}"
+        ))
+    })?);
+    let entries = archive
+        .libraries()
+        .map(|member| {
+            let mut names = manifest.names_for(&member.name).to_vec();
+            push_unique(&mut names, file_name(&member.name).to_owned());
+            Entry {
+                names,
+                member: member.name.clone(),
+                source: Source::Archive {
+                    file: Arc::clone(&file),
+                    member: member.clone(),
+                },
+                #[cfg(egcl_dlopen_embedded)]
+                memfd: None,
+            }
+        })
+        .collect();
+    *REGISTRY.lock().unwrap() = entries;
+    Ok(())
 }
 
 // ── Loading through a sealed memfd (glibc, `c-ffi`) ─────────────────
@@ -554,7 +408,6 @@ pub(crate) fn install_section(pending: PendingSection) {
 #[cfg(egcl_dlopen_embedded)]
 mod memfd_loader {
     use super::*;
-    use crate::digest::Sha256;
     use std::ffi::CString;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
@@ -577,6 +430,10 @@ mod memfd_loader {
         EgclError::FfiError(format!("{what}: {}", std::io::Error::last_os_error()))
     }
 
+    fn fill_error(e: impl std::fmt::Display) -> EgclError {
+        EgclError::FfiError(format!("cannot fill embedded library memfd: {e}"))
+    }
+
     fn dlerror_text() -> String {
         // SAFETY: dlerror returns null or a NUL-terminated thread-local string.
         unsafe {
@@ -591,16 +448,10 @@ mod memfd_loader {
         }
     }
 
-    /// A sealed memfd holding exactly `entry`'s verified bytes.
-    fn materialise(entry: &Entry) -> Result<OwnedFd, EgclError> {
-        let label = entry.soname.clone().unwrap_or_else(|| {
-            entry.names[0]
-                .rsplit('/')
-                .next()
-                .unwrap_or("embedded")
-                .to_owned()
-        });
-        let label = CString::new(label)
+    /// A sealed memfd holding exactly `entry`'s verified bytes, and what its
+    /// ELF dynamic section says.
+    fn materialise(entry: &Entry) -> Result<(OwnedFd, ElfDynamic), EgclError> {
+        let label = CString::new(file_name(&entry.member))
             .map_err(|_| EgclError::FfiError("library name contains NUL".into()))?;
         let create = |flags: libc::c_uint| unsafe {
             libc::syscall(libc::SYS_memfd_create, label.as_ptr(), flags) as libc::c_int
@@ -615,7 +466,7 @@ mod memfd_loader {
         }
         // SAFETY: memfd_create returned a fresh descriptor this function owns.
         let memfd = unsafe { OwnedFd::from_raw_fd(fd) };
-        fill(&memfd, entry)?;
+        let len = fill(&memfd, entry)?;
         let seals = F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_SEAL;
         // SAFETY: plain fcntl on a descriptor we own.
         if unsafe { libc::fcntl(memfd.as_raw_fd(), F_ADD_SEALS, seals) } != 0 {
@@ -623,66 +474,73 @@ mod memfd_loader {
         }
         // Verify only after sealing: from here the contents cannot change
         // between the check and the loader mapping them.
-        if hash_fd(&memfd, entry.len)? != entry.sha256 {
-            return Err(EgclError::FfiError(format!(
-                "embedded library '{}' failed its SHA-256 check",
-                entry.names[0]
-            )));
-        }
-        Ok(memfd)
+        let elf = inspect(&memfd, len, entry)?;
+        Ok((memfd, elf))
     }
 
-    fn fill(memfd: &OwnedFd, entry: &Entry) -> Result<(), EgclError> {
+    /// Copy `entry`'s bytes into `memfd`; returns how many.
+    fn fill(memfd: &OwnedFd, entry: &Entry) -> Result<usize, EgclError> {
         use std::io::Write;
         // SAFETY: the File borrows the descriptor; ManuallyDrop keeps it open.
         let mut out =
             std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(memfd.as_raw_fd()) });
-        match &entry.source {
-            Source::Bytes(bytes) => out.write_all(bytes).map_err(|e| {
-                EgclError::FfiError(format!("cannot fill embedded library memfd: {e}"))
-            }),
-            Source::Image { file, offset } => {
-                // The kernel copies image pages straight into the memfd; the
-                // bytes never pass through a user-space buffer.
-                let mut position = *offset as libc::off_t;
-                let mut remaining = entry.len as usize;
-                while remaining > 0 {
-                    // SAFETY: both descriptors are open; `position` is ours.
-                    let sent = unsafe {
-                        libc::sendfile(
-                            memfd.as_raw_fd(),
-                            file.as_raw_fd(),
-                            &mut position,
-                            remaining,
-                        )
-                    };
-                    if sent < 0 {
-                        if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
-                        {
-                            continue;
-                        }
-                        // A file system without sendfile support: copy instead.
-                        let start = entry.len as usize - remaining;
-                        let mut rest = vec![0; remaining];
-                        read_exact_at(file, &mut rest, offset + start as u64)?;
-                        return out.write_all(&rest).map_err(|e| {
-                            EgclError::FfiError(format!("cannot fill embedded library memfd: {e}"))
-                        });
-                    }
-                    if sent == 0 {
-                        return Err(EgclError::FfiError(
-                            "image ended inside an embedded library".into(),
-                        ));
-                    }
-                    remaining -= sent as usize;
-                }
-                Ok(())
+        let (file, member) = match &entry.source {
+            Source::Archive { file, member } if member.method == container::STORED => {
+                (file, member)
             }
+            source => {
+                // In memory, or deflated in the archive.
+                let bytes = source.read_all()?;
+                out.write_all(&bytes).map_err(fill_error)?;
+                return Ok(bytes.len());
+            }
+        };
+        // Stored: the kernel copies the executable's pages straight into the
+        // memfd, never through a user-space buffer.
+        let len = usize::try_from(member.size).map_err(|_| too_large())?;
+        let mut position = member.data_offset as libc::off_t;
+        let mut remaining = len;
+        while remaining > 0 {
+            // SAFETY: both descriptors are open; `position` is ours.
+            let sent = unsafe {
+                libc::sendfile(
+                    memfd.as_raw_fd(),
+                    file.as_raw_fd(),
+                    &mut position,
+                    remaining,
+                )
+            };
+            if sent < 0 {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                // A file system without sendfile support: copy instead.
+                let mut rest = vec![0; remaining];
+                container::ReadAt::read_exact_at(&**file, &mut rest, position as u64)
+                    .map_err(fill_error)?;
+                out.write_all(&rest).map_err(fill_error)?;
+                break;
+            }
+            if sent == 0 {
+                return Err(fill_error("the executable ends inside an embedded library"));
+            }
+            remaining -= sent as usize;
         }
+        Ok(len)
     }
 
-    fn hash_fd(memfd: &OwnedFd, len: u64) -> Result<[u8; 32], EgclError> {
-        let len = usize::try_from(len).map_err(|_| too_large())?;
+    /// Check a sealed memfd against its archive member's CRC-32 and read its
+    /// ELF dynamic section, through one read-only mapping.
+    fn inspect(memfd: &OwnedFd, len: usize, entry: &Entry) -> Result<ElfDynamic, EgclError> {
+        let not_loadable = |why: String| {
+            EgclError::FfiError(format!(
+                "embedded library '{}' is not a loadable shared object: {why}",
+                entry.names[0]
+            ))
+        };
+        if len == 0 {
+            return Err(not_loadable("it is empty".into()));
+        }
         // SAFETY: a fresh read-only private mapping of a sealed file whose size
         // is exactly `len`; it is unmapped before returning.
         unsafe {
@@ -697,10 +555,20 @@ mod memfd_loader {
             if map == libc::MAP_FAILED {
                 return Err(os_error("cannot map an embedded library for verification"));
             }
-            let mut digest = Sha256::new();
-            digest.update(std::slice::from_raw_parts(map as *const u8, len));
+            let bytes = std::slice::from_raw_parts(map as *const u8, len);
+            let result = match &entry.source {
+                Source::Archive { member, .. }
+                    if len as u64 != member.size || container::crc32(bytes) != member.crc32 =>
+                {
+                    Err(EgclError::FfiError(format!(
+                        "embedded library '{}' failed its CRC-32 check",
+                        entry.names[0]
+                    )))
+                }
+                _ => parse_elf_dynamic(bytes).map_err(not_loadable),
+            };
             libc::munmap(map, len);
-            Ok(digest.finish())
+            result
         }
     }
 
@@ -731,9 +599,10 @@ mod memfd_loader {
         if let Some(memfd) = &entry.memfd {
             return dlopen_path(&proc_path(memfd), flags, &entry);
         }
+        let (memfd, elf) = materialise(&entry)?;
         // glibc keeps one object per SONAME. If a copy from elsewhere is
         // already loaded, DT_NEEDED would bind to it rather than to this one.
-        if let Some(soname) = &entry.soname {
+        if let Some(soname) = &elf.soname {
             let name = CString::new(soname.as_str()).unwrap();
             // SAFETY: RTLD_NOLOAD only probes; a hit is a reference we release.
             let existing =
@@ -752,13 +621,13 @@ mod memfd_loader {
         chain.push(index);
         let mut dependencies = Vec::new();
         let result = (|| {
-            for needed in &entry.needed {
+            for needed in &elf.needed {
                 let dependency = find(&REGISTRY.lock().unwrap(), needed);
                 if let Some(dependency) = dependency {
                     dependencies.push(open_entry(dependency, chain)?);
                 }
             }
-            let memfd = Arc::new(materialise(&entry)?);
+            let memfd = Arc::new(memfd);
             let handle = dlopen_path(&proc_path(&memfd), flags, &entry)?;
             if let Some(slot) = REGISTRY.lock().unwrap().get_mut(index) {
                 slot.memfd = Some(memfd);
@@ -794,6 +663,10 @@ mod memfd_loader {
             "cannot load embedded library '{}': {message}{hint}",
             entry.names[0]
         )))
+    }
+
+    fn too_large() -> EgclError {
+        EgclError::FfiError("embedded library is too large for this address space".into())
     }
 }
 
@@ -861,59 +734,51 @@ mod tests {
     }
 
     #[test]
-    fn a_saved_section_restores_as_references_into_the_image_file() {
-        let payloads: [&[u8]; 2] = [b"first library bytes", &[7u8; 5000]];
-        let entries: Vec<Entry> = payloads
-            .iter()
-            .enumerate()
-            .map(|(i, bytes)| Entry {
-                names: vec![format!("libtest{i}.so.1"), format!("/opt/libtest{i}.so.1")],
-                soname: Some(format!("libtest{i}.so.1")),
-                needed: if i == 1 {
-                    vec!["libtest0.so.1".into()]
-                } else {
-                    vec![]
-                },
-                sha256: sha256(bytes),
-                len: bytes.len() as u64,
-                source: Source::Bytes((*bytes).into()),
-                #[cfg(egcl_dlopen_embedded)]
-                memfd: None,
-            })
-            .collect();
-        *REGISTRY.lock().unwrap() = entries;
-        let section = serialize_section().unwrap();
-        *REGISTRY.lock().unwrap() = Vec::new();
-
-        // The section sits at a page-aligned offset inside a larger file.
+    fn a_restored_archive_installs_its_libraries_as_references_into_the_file() {
+        let manifest = Manifest {
+            application: false,
+            libraries: vec![(
+                "lib/libtest0.so.1".into(),
+                vec![
+                    "libtest0.so.1".into(),
+                    "/opt/libtest0.so.1".into(),
+                    "t0".into(),
+                ],
+            )],
+        };
+        let mut writer = container::Writer::new(vec![0xAB; 8192]);
+        writer
+            .add(
+                container::MANIFEST,
+                manifest.render().unwrap().as_bytes(),
+                1,
+                0o644,
+            )
+            .unwrap();
+        writer
+            .add("lib/libtest0.so.1", b"first library bytes", 16384, 0o755)
+            .unwrap();
+        // Added by hand, with no manifest record.
+        writer
+            .add("lib/libextra.so", &[7u8; 5000], 16384, 0o755)
+            .unwrap();
+        let bytes = writer.finish().unwrap();
         let path = std::env::temp_dir().join(format!("egcl-flb-{}", std::process::id()));
-        let mut file_bytes = vec![0xAB; 8192];
-        file_bytes.extend_from_slice(&section);
-        std::fs::write(&path, &file_bytes).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
         let file = std::fs::File::open(&path).unwrap();
-        let PendingSection(restored) = parse_section(&section, Some((&file, 8192))).unwrap();
+        let archive = container::read(&file).unwrap().unwrap();
+        install_archive(&file, &archive, &archive.manifest(&file).unwrap()).unwrap();
         std::fs::remove_file(&path).unwrap();
 
-        assert_eq!(restored.len(), 2);
-        for (entry, bytes) in restored.iter().zip(payloads) {
-            let Source::Image { offset, .. } = &entry.source else {
-                panic!("restored payload was copied instead of referenced");
-            };
-            assert_eq!(offset % PAGE, 0);
-            assert_eq!(entry.source.read_all(entry.len).unwrap(), bytes);
-        }
-        assert_eq!(restored[1].needed, ["libtest0.so.1"]);
-        assert_eq!(restored[1].names[1], "/opt/libtest1.so.1");
-
-        // Without a backing file the payloads are copied out of the section.
-        let PendingSection(copied) = parse_section(&section, None).unwrap();
-        assert!(matches!(copied[0].source, Source::Bytes(_)));
-
-        // A truncated or misaligned manifest rejects the image.
-        assert!(parse_section(&section[..40], None).is_err());
-        let mut bad = section.clone();
-        bad[16] = 1; // first payload offset no longer page aligned
-        assert!(parse_section(&bad, None).is_err());
+        assert_eq!(embedded_names(), ["libtest0.so.1", "libextra.so"]);
+        assert!(is_embedded("/opt/libtest0.so.1") && is_embedded("t0"));
+        let saved = saved_libraries().unwrap();
+        *REGISTRY.lock().unwrap() = Vec::new();
+        assert_eq!(saved[0].bytes, b"first library bytes");
+        assert_eq!(saved[0].names, manifest.libraries[0].1);
+        assert_eq!(saved[1].member, "lib/libextra.so");
+        assert_eq!(saved[1].names, ["libextra.so"]);
+        assert_eq!(saved[1].bytes, vec![7u8; 5000]);
     }
 
     #[test]

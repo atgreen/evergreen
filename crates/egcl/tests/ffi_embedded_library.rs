@@ -1,12 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-//! Shared libraries embedded in the image (bliss-rhsy4.1/.2). On glibc the
-//! `c-ffi` backend loads them through a sealed memfd: a saved executable runs
-//! its embedded libraries after the original files are gone, an embedded
-//! DT_NEEDED dependency is found by SONAME, a payload altered in the file is
-//! refused, and a SONAME already loaded from elsewhere is reported rather than
-//! silently shadowed.
+//! Shared libraries embedded in a saved executable (bliss-rhsy4.1/.2/.9). On
+//! glibc the `c-ffi` backend loads them through a sealed memfd: a saved
+//! executable runs its embedded libraries after the original files are gone,
+//! an embedded DT_NEEDED dependency is found by SONAME, a payload altered in
+//! the file is refused, and a SONAME already loaded from elsewhere is reported
+//! rather than silently shadowed. The executable is also a zip archive, so
+//! Info-ZIP can replace, remove and add libraries in it.
 #![cfg(all(target_os = "linux", target_env = "gnu"))]
 
 use std::path::{Path, PathBuf};
@@ -34,36 +35,47 @@ fn text(output: &Output) -> String {
 
 const MARKER: &str = "EGCL-EMBEDDED-DEP-MARKER";
 
-/// libegcldep.so.1, and libegclmain.so.1 which needs it.
-fn build_libraries(dir: &Path) -> (PathBuf, PathBuf) {
-    let _ = std::fs::remove_dir_all(dir);
+fn cc(dir: &Path, args: &[&str]) {
+    let status = Command::new("cc")
+        .current_dir(dir)
+        .args(args)
+        .status()
+        .expect("run cc");
+    assert!(status.success(), "cc {args:?} failed");
+}
+
+/// `dir/libegcldep.so.1`, whose `dep_value` returns `value`.
+fn build_dep(dir: &Path, value: i32) -> PathBuf {
     std::fs::create_dir_all(dir).unwrap();
     std::fs::write(
         dir.join("dep.c"),
-        format!("const char *dep_marker(void) {{ return \"{MARKER}\"; }}\nint dep_value(void) {{ return 41; }}\n"),
+        format!("const char *dep_marker(void) {{ return \"{MARKER}\"; }}\nint dep_value(void) {{ return {value}; }}\n"),
     )
     .unwrap();
+    cc(
+        dir,
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libegcldep.so.1",
+            "dep.c",
+            "-o",
+            "libegcldep.so.1",
+        ],
+    );
+    dir.join("libegcldep.so.1")
+}
+
+/// libegcldep.so.1, and libegclmain.so.1 which needs it.
+fn build_libraries(dir: &Path) -> (PathBuf, PathBuf) {
+    let _ = std::fs::remove_dir_all(dir);
+    build_dep(dir, 41);
     std::fs::write(
         dir.join("main.c"),
         "int dep_value(void);\nint main_value(void) { return dep_value() + 1; }\n",
     )
     .unwrap();
-    let cc = |args: &[&str]| {
-        let status = Command::new("cc")
-            .current_dir(dir)
-            .args(args)
-            .status()
-            .expect("run cc");
-        assert!(status.success(), "cc {args:?} failed");
-    };
-    cc(&[
-        "-shared",
-        "-fPIC",
-        "-Wl,-soname,libegcldep.so.1",
-        "dep.c",
-        "-o",
-        "libegcldep.so.1",
-    ]);
+    let cc = |args: &[&str]| cc(dir, args);
     cc(&[
         "-shared",
         "-fPIC",
@@ -164,7 +176,7 @@ fn an_embedded_library_altered_in_the_image_file_is_refused() {
     let output = egcl(&app, CALL_MAIN);
     let out = text(&output);
     assert!(!out.contains("MAIN 42"), "{out}");
-    assert!(out.contains("failed its SHA-256 check"), "{out}");
+    assert!(out.contains("failed its CRC-32 check"), "{out}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -189,5 +201,141 @@ fn a_soname_already_loaded_from_outside_the_image_is_reported() {
         out.contains("REFUSED") && out.contains("already loaded from outside the image"),
         "{out}"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Run Info-ZIP's `zip` on `app` from `dir`. It insists on a `.zip` name, so
+/// the executable is renamed for the duration. `None` when `zip` is absent.
+fn zip_tool(dir: &Path, app: &Path, args: &[&str]) -> Option<()> {
+    let archive = app.with_extension("zip");
+    std::fs::rename(app, &archive).unwrap();
+    let status = Command::new("zip")
+        .current_dir(dir)
+        .arg("-q")
+        .args(args.iter().map(|a| {
+            if *a == "{}" {
+                archive.as_os_str()
+            } else {
+                a.as_ref()
+            }
+        }))
+        .status();
+    std::fs::rename(&archive, app).unwrap();
+    match status {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        status => {
+            assert!(status.unwrap().success(), "zip {args:?} failed");
+            Some(())
+        }
+    }
+}
+
+fn unzip_listing(app: &Path) -> Option<String> {
+    let output = Command::new("unzip").arg("-v").arg(app).output().ok()?;
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+#[test]
+fn zip_tools_replace_remove_and_add_embedded_libraries() {
+    let dir = scratch("zip");
+    let (dep, main) = build_libraries(&dir.join("lib"));
+    let app = dir.join("app");
+    save_app(&dep, &main, &app);
+    std::fs::remove_dir_all(dir.join("lib")).unwrap();
+
+    // Replace libegcldep.so.1 with a build returning 98. Info-ZIP deflates it,
+    // so the runtime inflates it on the way into the memfd.
+    let stage = dir.join("stage");
+    build_dep(&stage.join("lib"), 98);
+    if zip_tool(&stage, &app, &["{}", "lib/libegcldep.so.1"]).is_none() {
+        eprintln!("skipping: Info-ZIP `zip` is not installed");
+        return;
+    }
+    if let Some(listing) = unzip_listing(&app) {
+        let line = listing
+            .lines()
+            .find(|l| l.ends_with("lib/libegcldep.so.1"))
+            .unwrap_or_else(|| panic!("{listing}"));
+        assert!(line.contains("Defl"), "{listing}");
+        assert!(listing.contains("egcl/core"), "{listing}");
+    }
+    let output = egcl(&app, CALL_MAIN);
+    let out = text(&output);
+    assert!(output.status.success(), "{out}");
+    assert!(out.contains("MAIN 99"), "{out}");
+    // The manifest still gives the replacement its recorded names.
+    assert!(out.contains("ALIAS 99"), "{out}");
+
+    // Remove libegclmain.so.1 and add a library the save never knew about.
+    std::fs::write(
+        stage.join("extra.c"),
+        "int extra_value(void) { return 7; }\n",
+    )
+    .unwrap();
+    cc(
+        &stage,
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libegclextra.so.1",
+            "extra.c",
+            "-o",
+            "lib/libegclextra.so.1",
+        ],
+    );
+    zip_tool(&stage, &app, &["-d", "{}", "lib/libegclmain.so.1"]).unwrap();
+    zip_tool(&stage, &app, &["{}", "lib/libegclextra.so.1"]).unwrap();
+    let output = egcl(
+        &app,
+        r#"(progn
+             (format t "EMBEDDED ~s~%" (egcl-ffi:embedded-foreign-libraries))
+             (format t "EXTRA ~d~%" (egcl-ffi:foreign-call
+                                      (egcl-ffi:foreign-symbol-pointer
+                                        "extra_value" (egcl-ffi:load-foreign-library "libegclextra.so.1"))
+                                      :int '() '()))
+             (format t "MAIN-EMBEDDED ~s~%" (egcl-ffi:embedded-foreign-library-p "libegclmain.so.1")))"#,
+    );
+    let out = text(&output);
+    assert!(output.status.success(), "{out}");
+    assert!(
+        out.contains(r#"EMBEDDED ("libegcldep.so.1" "libegclextra.so.1")"#),
+        "{out}"
+    );
+    assert!(out.contains("EXTRA 7"), "{out}");
+    assert!(out.contains("MAIN-EMBEDDED NIL"), "{out}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_core_file_carrying_libraries_is_an_archive_that_image_loads() {
+    let dir = scratch("core");
+    let (dep, main) = build_libraries(&dir.join("lib"));
+    let core = dir.join("app.core");
+    let output = egcl(
+        Path::new(env!("CARGO_BIN_EXE_egcl")),
+        &format!(
+            r#"(progn
+                 (egcl-ffi:embed-foreign-library {dep:?})
+                 (egcl-ffi:embed-foreign-library {main:?} :names '("egclmain"))
+                 (egcl-ext:save-lisp-and-die {core:?}))"#
+        ),
+    );
+    assert!(output.status.success(), "{}", text(&output));
+    std::fs::remove_dir_all(dir.join("lib")).unwrap();
+    assert_eq!(&std::fs::read(&core).unwrap()[..4], b"PK\x03\x04");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_egcl"))
+        .env(
+            "EGCL_INIT_FILE",
+            std::env::temp_dir().join("egcl-tests-nonexistent-init.lisp"),
+        )
+        .arg("--image")
+        .arg(&core)
+        .args(["--no-init", "--eval", CALL_MAIN])
+        .output()
+        .expect("run egcl");
+    let out = text(&output);
+    assert!(output.status.success(), "{out}");
+    assert!(out.contains("MAIN 42") && out.contains("ALIAS 42"), "{out}");
     let _ = std::fs::remove_dir_all(&dir);
 }

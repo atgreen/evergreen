@@ -43079,10 +43079,9 @@ fn load_init_file(env: &mut Env) {
 /// funcalls it when no explicit batch mode is requested.
 const IMAGE_TOPLEVEL_VAR: &str = "EGCL-INTERNAL::*IMAGE-TOPLEVEL*";
 
-/// Trailing marker appended after an embedded image in an `:executable` save:
-/// the 8-byte magic followed by the image length as a little-endian u64. A
-/// normal `egcl` binary has no such trailer, so startup detects a saved
-/// executable by reading just the final 16 bytes.
+/// Trailing marker that executables saved before the zip container
+/// (bliss-rhsy4.9) appended after their image: the 8-byte magic followed by
+/// the image length as a little-endian u64. Only stripped now, never written.
 // "EGCLEXE", NUL-padded to the eight bytes the trailer reserves. It read
 // b"TORCLEXE" before the rename, which was exactly eight; EGCL is one shorter, so
 // the pad restores the width. A deliberate trailer-magic change: an executable
@@ -43117,19 +43116,19 @@ fn current_runtime_bytes() -> std::io::Result<Vec<u8>> {
     std::fs::read(std::env::current_exe()?)
 }
 
-/// Wrap `image` into a standalone executable: the current runtime binary with
-/// the image and a locating trailer appended. The OS loader ignores trailing
-/// bytes after the executable, so the concatenation still runs as the original
-/// program, while [`embedded_image_header`] recovers the image at startup (the same
-/// runtime-plus-core scheme SBCL uses for `:executable t`).
-fn wrap_executable(image: &[u8], application: bool) -> std::io::Result<Vec<u8>> {
-    let mut bytes = current_runtime_bytes()?;
-    shake::remove_embedded_images(&mut bytes)?;
+/// Wrap `image` into a standalone executable: the current runtime binary
+/// followed by a zip archive holding the image and every embedded foreign
+/// library (`egcl_rt::container`). The OS loader ignores trailing bytes after
+/// the executable, so the concatenation still runs as the original program,
+/// while [`embedded_core`] recovers the image at startup (the same
+/// runtime-plus-core scheme SBCL uses for `:executable t`), and zip tools see
+/// an ordinary archive.
+fn wrap_executable(image: &[u8], application: bool) -> Result<Vec<u8>, EgclError> {
+    let mut bytes = current_runtime_bytes()
+        .and_then(|mut bytes| shake::remove_embedded_images(&mut bytes).map(|()| bytes))
+        .map_err(|e| EgclError::FileError(format!("%save-core :executable: {e}")))?;
     bytes.resize(bytes.len().div_ceil(4096) * 4096, 0);
-    bytes.extend_from_slice(image);
-    bytes.extend_from_slice(if application { APP_IMAGE_MAGIC } else { EXE_IMAGE_MAGIC });
-    bytes.extend_from_slice(&(image.len() as u64).to_le_bytes());
-    Ok(bytes)
+    egcl_rt::container::build(bytes, image, application)
 }
 
 /// Write a heap-snapshot CORE image and terminate (bliss-x0f2 M3). Captures the
@@ -43189,8 +43188,11 @@ fn save_core(path: &str, executable: bool, shake: bool, application: bool, env: 
         egcl_rt::image::save_image
     };
 
-    if executable {
-        // Serialize to a temp core file, then append its bytes to a runtime copy.
+    // Embedded foreign libraries live beside the core in a zip archive, so a
+    // core file that carries any is one too, with nothing in front.
+    let archive = executable || !egcl_rt::ffi::embedded::embedded_names().is_empty();
+    if archive || shake {
+        // Serialize to a temp core file, then wrap its bytes.
         let tmp = shake::TemporaryFile::new(std::path::Path::new(path))
             .map_err(|e| EgclError::FileError(format!("%save-core: {e}")))?;
         save_image(
@@ -43202,15 +43204,75 @@ fn save_core(path: &str, executable: bool, shake: bool, application: bool, env: 
         .map_err(|e| EgclError::FileError(format!("%save-core: {e}")))?;
         let core_bytes = std::fs::read(&tmp.path)
             .map_err(|e| EgclError::FileError(format!("%save-core: reread core: {e}")))?;
-        let exe_bytes = wrap_executable(&core_bytes, application)
-            .map_err(|e| EgclError::FileError(format!("%save-core :executable: {e}")))?;
-        shake::write_atomic(std::path::Path::new(path), &exe_bytes, true)
+        let bytes = if executable {
+            wrap_executable(&core_bytes, application)?
+        } else if archive && !shake {
+            egcl_rt::container::build(Vec::new(), &core_bytes, application)?
+        } else {
+            // The shake tool wraps the bare core with its own runtime.
+            core_bytes
+        };
+        shake::write_atomic(std::path::Path::new(path), &bytes, executable)
             .map_err(|e| EgclError::FileError(format!("%save-core: {e}")))?;
     } else {
         save_image(path, &opts).map_err(|e| EgclError::FileError(format!("%save-core: {e}")))?;
     }
 
     Ok(())
+}
+
+/// A saved core and where it lies: a bare EGCLIMG file, or the `egcl/core`
+/// member of a zip archive (an executable's, or a core file carrying foreign
+/// libraries), whose `lib/` members are then the embedded libraries.
+struct SavedCore {
+    file: std::fs::File,
+    offset: u64,
+    len: u64,
+    application: bool,
+    archive: Option<(egcl_rt::container::Archive, egcl_rt::container::Manifest)>,
+}
+
+impl SavedCore {
+    /// The core in `file` when it ends with an archive holding one.
+    fn in_archive(file: std::fs::File) -> Result<Option<SavedCore>, EgclError> {
+        let Some(archive) = egcl_rt::container::read(&file)? else {
+            return Ok(None);
+        };
+        let Some(core) = archive.core()?.cloned() else {
+            return Ok(None);
+        };
+        let manifest = archive.manifest(&file)?;
+        Ok(Some(SavedCore {
+            offset: core.data_offset,
+            len: core.size,
+            application: manifest.application,
+            file,
+            archive: Some((archive, manifest)),
+        }))
+    }
+
+    /// The core named by `--image`.
+    fn open(path: &str) -> Result<SavedCore, EgclError> {
+        use std::io::Read;
+        let error = |e: &dyn std::fmt::Display| EgclError::FileError(format!("--image {path}: {e}"));
+        let mut file = std::fs::File::open(path).map_err(|e| error(&e))?;
+        let len = file.metadata().map_err(|e| error(&e))?.len();
+        let mut magic = [0u8; 8];
+        if file.read_exact(&mut magic).is_ok() && u64::from_ne_bytes(magic) == egcl_rt::image::IMAGE_MAGIC {
+            return Ok(SavedCore { file, offset: 0, len, application: false, archive: None });
+        }
+        SavedCore::in_archive(file)?.ok_or_else(|| {
+            error(&"not an EGCL core: neither an EGCLIMG image nor an archive holding egcl/core")
+        })
+    }
+
+    fn load(&self, env: &mut Env) -> Result<(), EgclError> {
+        load_core_image(&self.file, self.offset, self.len, env)?;
+        if let Some((archive, manifest)) = &self.archive {
+            egcl_rt::ffi::embedded::install_archive(&self.file, archive, manifest)?;
+        }
+        Ok(())
+    }
 }
 
 /// Load a heap-snapshot CORE image into the (freshly initialized) runtime and
@@ -43343,29 +43405,28 @@ fn reopen_standard_streams() {
     set_global("*DEBUG-IO*", *terminal_io);
 }
 
-/// If the running binary has an image appended by an `:executable` save, return
-/// it. Only the 16-byte trailer is read unless the magic matches, so a normal
-/// launch pays almost nothing.
-fn embedded_image_header() -> Option<(std::fs::File, u64, bool)> {
+/// If the running binary is an `:executable` save, the core in its archive.
+/// A normal launch reads only the file's last 64 KiB, where a zip's end
+/// record would be. A binary that ends with an archive holding `egcl/core`
+/// but cannot be read is an error, not a plain runtime, and so is one
+/// carrying an image behind the trailer older executables used.
+fn embedded_core() -> Result<Option<SavedCore>, EgclError> {
     use std::io::{Read, Seek, SeekFrom};
-    let mut f = std::fs::File::open(std::env::current_exe().ok()?).ok()?;
-    let len = f.metadata().ok()?.len();
-    if len < 16 {
-        return None;
-    }
-    f.seek(SeekFrom::End(-16)).ok()?;
+    let Ok(mut file) = std::env::current_exe().and_then(std::fs::File::open) else {
+        return Ok(None);
+    };
     let mut trailer = [0u8; 16];
-    f.read_exact(&mut trailer).ok()?;
-    let application = &trailer[..8] == APP_IMAGE_MAGIC;
-    if !application && &trailer[..8] != EXE_IMAGE_MAGIC {
-        return None;
+    if file.seek(SeekFrom::End(-16)).is_ok()
+        && file.read_exact(&mut trailer).is_ok()
+        && [EXE_IMAGE_MAGIC, APP_IMAGE_MAGIC].contains(&&trailer[..8].try_into().unwrap())
+    {
+        return Err(EgclError::InvalidImage(
+            "this executable's image uses the format from before saved executables were zip \
+             archives; save it again with this EGCL runtime"
+                .into(),
+        ));
     }
-    let image_len = u64::from_le_bytes(trailer[8..16].try_into().ok()?);
-    if image_len == 0 || image_len >= len - 16 {
-        return None;
-    }
-    f.seek(SeekFrom::Start(len - 16 - image_len)).ok()?;
-    Some((f, image_len, application))
+    SavedCore::in_archive(file)
 }
 
 /// Extract the entry-point symbol from a `:toplevel` function designator. A
@@ -43434,7 +43495,9 @@ pub fn run(args: &[String]) -> Result<i32, EgclError> {
     egcl_stdlib::format::set_print_object_hook(Some(stdlib_print_object_hook));
     egcl_stdlib::format::set_pprint_dispatch_hook(Some(stdlib_pprint_dispatch_hook));
     egcl_stdlib::format::set_format_apply_hook(Some(stdlib_format_apply_hook));
-    let ca = if embedded_image_header().is_some_and(|(_, _, app)| app) {
+    // Looked up once: it decides how the arguments parse, then loads below.
+    let embedded = embedded_core();
+    let ca = if matches!(&embedded, Ok(Some(core)) if core.application) {
         let mut ca = CliArgs::parse(&[])?;
         ca.cl_args = args.to_vec();
         ca
@@ -43492,16 +43555,11 @@ pub fn run(args: &[String]) -> Result<i32, EgclError> {
     // already contains that world (env.frame is still empty here, so nothing is
     // stranded).
     let core_loaded = if let Some(ref image_path) = ca.image {
-        let file = std::fs::File::open(image_path)
-            .map_err(|e| EgclError::FileError(format!("--image {image_path}: {e}")))?;
-        let len = file.metadata().map_err(|e| EgclError::FileError(e.to_string()))?.len();
-        load_core_image(&file, 0, len, &mut env)?;
+        SavedCore::open(image_path)?.load(&mut env)?;
         true
     } else if ca.shake.is_none() {
-        if let Some((mut file, len, _)) = embedded_image_header() {
-            use std::io::Seek;
-            let offset = file.stream_position().map_err(|e| EgclError::FileError(e.to_string()))?;
-            load_core_image(&file, offset, len, &mut env)?;
+        if let Some(core) = embedded? {
+            core.load(&mut env)?;
             true
         } else {
             false

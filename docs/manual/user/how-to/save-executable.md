@@ -401,7 +401,9 @@ only `+`, `<`, `=`, `FUNCALL`, and `WRITE-LINE` remained in its builtin selectio
 | T1 | 5,128,024 | 246,167 | 5,374,207 |
 | T0 | 4,947,864 | 246,167 | 5,194,047 |
 
-The executable totals include the 16-byte image trailer. These are a small
+The executable totals include the zip archive's few hundred bytes of headers
+and directory; at that commit, executables ended with a 16-byte image trailer
+instead. These are a small
 fixture's measurements, not a promised size for other applications. The tests
 check omitted compiler and builtin symbols and execute with automatic tiering,
 forced-tier requests, and low promotion/OSR thresholds. Ordinary bootstrap

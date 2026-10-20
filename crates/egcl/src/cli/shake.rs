@@ -1052,9 +1052,8 @@ pub(super) fn run(args: &CliArgs, env: &mut Env) -> Result<i32, EgclError> {
         core.len()
     ));
     runtime.resize(runtime.len().div_ceil(4096) * 4096, 0);
-    runtime.extend_from_slice(&core);
-    runtime.extend_from_slice(EXE_IMAGE_MAGIC);
-    runtime.extend_from_slice(&(core.len() as u64).to_le_bytes());
+    let runtime =
+        egcl_rt::container::build(runtime, &core, false).map_err(|e| error(e.to_string()))?;
     write_atomic(&executable_stage.path, &runtime, true).map_err(|e| error(e.to_string()))?;
     report.push_str(&format!(
         "output-bytes = {}\n",
@@ -1087,9 +1086,18 @@ pub(super) fn run(args: &CliArgs, env: &mut Env) -> Result<i32, EgclError> {
     Ok(0)
 }
 
-/// Drop all historical payloads, including executables produced by older
-/// runtimes which appended new images without removing the preceding one.
+/// Drop all historical payloads: a saved executable's zip archive, and the
+/// trailer-located images of executables produced by older runtimes, which
+/// appended new images without removing the preceding one.
 pub(super) fn remove_embedded_images(bytes: &mut Vec<u8>) -> io::Result<()> {
+    if let Some(archive) = egcl_rt::container::read(&bytes[..]).map_err(|e| io::Error::other(e.to_string()))?
+        && archive.member(egcl_rt::container::CORE).is_some()
+    {
+        if archive.start == 0 {
+            return Err(io::Error::other("empty runtime or embedded image"));
+        }
+        bytes.truncate(archive.start as usize);
+    }
     while bytes.len() >= 16
         && [&EXE_IMAGE_MAGIC[..], &APP_IMAGE_MAGIC[..]]
             .contains(&&bytes[bytes.len() - 16..bytes.len() - 8])

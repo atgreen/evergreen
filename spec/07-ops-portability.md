@@ -118,8 +118,8 @@ Each entry in the section directory:
 
 | Offset | Size | Field |
 |--------|------|-------|
-| 0x00 | 4 | `section_type` — enum: Heap=1, Symbols=2, Packages=3, Code=4, Reloc=5, GcMeta=6, Settings=7, HostRegistries=8, OffHeap=9, ForeignLibraries=10 |
-| 0x04 | 4 | `flags` — per-section flags; bit 0 `STORED` means uncompressed even in a compressed image |
+| 0x00 | 4 | `section_type` — enum: Heap=1, Symbols=2, Packages=3, Code=4, Reloc=5, GcMeta=6, Settings=7, HostRegistries=8, OffHeap=9 |
+| 0x04 | 4 | `flags` — per-section flags (compression, alignment) |
 | 0x08 | 8 | `file_offset` — byte offset from start of file |
 | 0x10 | 8 | `size` — byte length in file (compressed size if applicable) |
 | 0x18 | 8 | `uncompressed_size` — original size; equals `size` when uncompressed |
@@ -226,18 +226,6 @@ preserved (R7.20).
 
 ---
 
-### 7.2.13  Foreign-Library Section
-
-An optional section (type 10, always `STORED`) carries shared libraries
-embedded with `egcl-ffi:embed-foreign-library`. It begins with `EGCLFLB\0`, a
-little-endian u32 version (1) and entry count. Each entry records a
-section-relative payload offset and length, the payload's SHA-256, the names it
-answers to, its ELF `DT_SONAME` and its `DT_NEEDED` names. Payloads start at
-4096-byte-aligned section offsets after the manifest and never overlap. The
-loader validates the manifest before restoring the heap and keeps payloads in
-the file rather than copying them. Runtimes that do not know the section skip
-it.
-
 ## 7.3  Image Save / Load Operations
 
 ### 7.3.1  Save (`EGCL-EXT:SAVE-IMAGE`)
@@ -291,34 +279,41 @@ creates copy-on-write pages; no write to the image file is needed
 
 ### 7.4.1  Standalone Executable
 
-A standalone executable is produced by concatenating:
+A standalone executable is the runtime binary, zero-padded to a 4096-byte
+boundary, followed by a zip archive:
 
 ```text
-[ runtime ELF/Mach-O binary ] [ .bimg payload ] [ 8-byte offset ]
+[ runtime ELF/Mach-O binary ] [ zip: egcl/manifest, egcl/core, lib/... ]
 ```
 
-The final 8 bytes store the byte offset from the end of the file to
-the start of the `.bimg` payload as a little-endian u64.  On startup,
-the runtime checks whether it carries an appended image by reading its
-own executable file:
+Zip readers locate an archive from its end-of-central-directory record and
+accept bytes before it, so the file both runs as the runtime and is an
+ordinary zip archive. Members:
 
-```rust
-fn find_appended_image(exe_path: &Path) -> Option<MappedImage> {
-    let file = File::open(exe_path)?;
-    let len = file.metadata()?.len();
-    let trailer: [u8; 8] = read_at(&file, len - 8)?;
-    let img_offset = u64::from_le_bytes(trailer);
-    if img_offset == 0 || img_offset >= len - 8 {
-        return None;
-    }
-    // Validate .bimg magic number at the computed offset before mmap.
-    let magic: [u8; 8] = read_at(&file, img_offset)?;
-    if u64::from_le_bytes(magic) != 0x544F5243_4C494D47 {
-        return None; // Not a valid .bimg payload
-    }
-    mmap_image(&file, img_offset)
-}
-```
+| Member | Contents |
+|--------|----------|
+| `egcl/manifest` | UTF-8 text. Line one is `egcl-container 1`; then tab-separated records: `application` marks an application executable, `library MEMBER NAME...` lists the names an embedded library answers to. Unknown records are ignored. |
+| `egcl/core` | The image (§7.2), stored uncompressed, at a 4096-byte-aligned file offset. |
+| `lib/FILE` | A shared library embedded with `egcl-ffi:embed-foreign-library`, stored or deflated. The writer names it after the library's SONAME and aligns it to a 16 KiB file offset with a zipalign-style (`0xD935`) local extra field. |
+
+The writer stores every member with no timestamps, so saving the same world
+is reproducible. On startup the runtime reads its own file's last 22 bytes,
+or 64 KiB when the archive has a comment, and recognises a saved executable by
+an archive containing `egcl/core`. Recorded offsets relative to the archive
+rather than the file are corrected, as `unzip` corrects them. ZIP64,
+multi-disk and encrypted archives are refused. A core file written while
+libraries are embedded is the same archive with no runtime in front, and
+`--image` accepts either form or a bare image.
+
+Embedded libraries are trusted only for their bytes: their SONAME and
+`DT_NEEDED` entries are read when they load, and each is checked against its
+member CRC-32. So a user can replace, add or remove `lib/` members with
+standard zip tools. A replaced member keeps the names its manifest record
+gives; an added one answers to its file name.
+
+An executable saved before this format ends with a 16-byte trailer instead
+(`EGCLEXE\0` or `EGCLAPP\0` and the image length). The runtime rejects such an
+executable rather than starting without its image.
 
 This enables single-file distribution of EGCL applications (R7.05).
 
