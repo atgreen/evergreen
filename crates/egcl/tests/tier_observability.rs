@@ -672,8 +672,8 @@ fn automatic_tiering_observably_progresses_t0_to_t1_to_t2() {
 }
 
 /// Reaching the T2 threshold is a request, not permission to discard working
-/// code. Linux uses a fixed-arity body with a bignum literal: mapped T1 supports
-/// it, while the mapped T2 emitter still refuses that constant. The checked
+/// code. Linux uses a fixed-arity left shift by 63: mapped T1 supports it,
+/// while the T2 emitters still refuse a shift count above 62. The checked
 /// backend uses a CAPTURING variadic body (its &rest is boxed for a closure) is
 /// unsupported by T2's slot-only entry, so it keeps its T1 entry (bliss-32l;
 /// non-capturing variadic functions do reach T2).
@@ -687,10 +687,10 @@ fn automatic_t2_decline_retains_t1() {
           (egcl-ext:function-tier (quote auto-rest)) (auto-rest 1 2 3 4))";
     let (program, expected) = if MAPPED_LINUX {
         (
-            "(defun auto-rest (x) (* x 1000000000000))
+            "(defun auto-rest (x) (ash x 63))
          (dotimes (i 20) (auto-rest i))
          (format t \"~a ~a~%\" (egcl-ext:function-tier 'auto-rest) (auto-rest 4))",
-            "1 4000000000000",
+            "1 36893488147419103232",
         )
     } else {
         (program, "1 4")
