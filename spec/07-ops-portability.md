@@ -118,8 +118,8 @@ Each entry in the section directory:
 
 | Offset | Size | Field |
 |--------|------|-------|
-| 0x00 | 4 | `section_type` — enum: Heap=1, Symbols=2, Packages=3, Code=4, Reloc=5, GcMeta=6, Settings=7 |
-| 0x04 | 4 | `flags` — per-section flags (compression, alignment) |
+| 0x00 | 4 | `section_type` — enum: Heap=1, Symbols=2, Packages=3, Code=4, Reloc=5, GcMeta=6, Settings=7, HostRegistries=8, OffHeap=9, ForeignLibraries=10 |
+| 0x04 | 4 | `flags` — per-section flags; bit 0 `STORED` means uncompressed even in a compressed image |
 | 0x08 | 8 | `file_offset` — byte offset from start of file |
 | 0x10 | 8 | `size` — byte length in file (compressed size if applicable) |
 | 0x18 | 8 | `uncompressed_size` — original size; equals `size` when uncompressed |
@@ -225,6 +225,18 @@ On failure, the temporary file is unlinked and the previous image is
 preserved (R7.20).
 
 ---
+
+### 7.2.13  Foreign-Library Section
+
+An optional section (type 10, always `STORED`) carries shared libraries
+embedded with `egcl-ffi:embed-foreign-library`. It begins with `EGCLFLB\0`, a
+little-endian u32 version (1) and entry count. Each entry records a
+section-relative payload offset and length, the payload's SHA-256, the names it
+answers to, its ELF `DT_SONAME` and its `DT_NEEDED` names. Payloads start at
+4096-byte-aligned section offsets after the manifest and never overlap. The
+loader validates the manifest before restoring the heap and keeps payloads in
+the file rather than copying them. Runtimes that do not know the section skip
+it.
 
 ## 7.3  Image Save / Load Operations
 

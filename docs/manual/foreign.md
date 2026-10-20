@@ -125,6 +125,48 @@ makes the lookup scope explicit; omitting it uses the default lookup scope.
 Close the library only when no code can call its symbols or use its data.
 Failures are reported through the FFI error interface.
 
+### Embedded libraries { #embedded-libraries }
+
+**Functions**
+
+```lisp
+(egcl-ffi:embed-foreign-library path &key names)    ; name it is reported under
+(egcl-ffi:embedded-foreign-libraries)               ; list of names
+(egcl-ffi:embedded-foreign-library-p name)          ; generalized boolean
+```
+
+`embed-foreign-library` reads the shared object at `path` now, on the build
+host, and carries it in every image saved afterwards, including an
+`:executable` one. `load-foreign-library` then finds it on any host, without
+the file, under its ELF SONAME, under the absolute `path` it was embedded
+from, or under any string in `names`. An embedded library shadows a file of the
+same name. Embedding under a name already in use replaces that library. The
+return value is the SONAME, or the absolute path when the library has none.
+
+```lisp
+;; Build time
+(egcl-ffi:embed-foreign-library "/usr/lib64/libsqlite3.so.0")
+(egcl-ext:save-lisp-and-die "app" :executable t)
+
+;; Run time, on a host without libsqlite3
+(egcl-ffi:load-foreign-library "libsqlite3.so.0")
+```
+
+The library is not extracted to disk. With the `c-ffi` backend on glibc Linux,
+its bytes are copied from the image into an anonymous in-memory file, which is
+sealed against change and checked against the SHA-256 recorded at embed time
+before the system loader opens it. Debuggers, `perf` and `/proc/PID/maps`
+show it as `/memfd:SONAME`. Embedded libraries that it names as `DT_NEEDED`
+dependencies are loaded first, so they too come from the image. Dependencies
+that are not embedded, such as `libc.so.6`, are found by the usual search.
+
+The library must be built for the runtime's architecture, and the host must
+allow executable in-memory files: a kernel with `vm.memfd_noexec=2` refuses
+them. Because the loader keeps one library per SONAME, loading an embedded
+library is an error if a library with the same SONAME was already loaded from
+somewhere else. Other builds report an error when asked to load an embedded
+library. Embedding a library distributes it: check its license.
+
 ### `egcl-ffi:foreign-call` { #foreign-call }
 
 **Function**

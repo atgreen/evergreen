@@ -425,6 +425,28 @@ pub fn library_call(args: &[EgclVal]) -> Result<EgclVal, EgclError> {
             Ok(NIL)
         }
         ("P", [value]) => Ok(if library_p(*value) { T } else { NIL }),
+        // (:embed path names) -- carry the shared object at PATH in the image
+        // under its SONAME, PATH and NAMES; returns the reported name.
+        ("EMBED", [path, names]) => {
+            let path = foreign_name(*path)?;
+            let names = foreign_list(*names)?
+                .into_iter()
+                .map(foreign_name)
+                .collect::<Result<Vec<_>, _>>()?;
+            let name = egcl_rt::ffi::embedded::embed(&path, &names)?;
+            Ok(egcl_rt::gc::alloc_character_string(&name))
+        }
+        ("EMBEDDED", []) => {
+            egcl_rt::rooted!(names = Vec::<EgclVal>::new());
+            for name in egcl_rt::ffi::embedded::embedded_names() {
+                let value = egcl_rt::gc::alloc_character_string(&name);
+                names.push(value);
+            }
+            Ok(crate::sequences::build_list(&names))
+        }
+        ("EMBEDDED-P", [name]) => Ok(
+            if egcl_rt::ffi::embedded::is_embedded(&foreign_name(*name)?) { T } else { NIL },
+        ),
         ("LOAD", [path]) => {
             let handle = egcl_rt::ffi::load_foreign_library(&foreign_name(*path)?)?;
             let Some(body) = egcl_rt::gc::alloc_typed(8, type_id::FOREIGN_LIBRARY) else {

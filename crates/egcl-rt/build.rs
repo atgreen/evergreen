@@ -48,6 +48,16 @@ fn main() {
     if unix_fibers || (arch == "x86_64" && target.contains("windows")) {
         println!("cargo:rustc-cfg=egcl_fibers");
     }
+    // Linux targets whose foreign libraries go through the system dlopen (the
+    // c-ffi feature, or an arch the static ELF loader lacks) load embedded
+    // libraries through a sealed memfd (bliss-rhsy4.2).
+    println!("cargo:rustc-check-cfg=cfg(egcl_dlopen_embedded)");
+    let c_ffi = std::env::var_os("CARGO_FEATURE_C_FFI").is_some();
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux")
+        && (c_ffi || !matches!(arch.as_str(), "x86_64" | "aarch64"))
+    {
+        println!("cargo:rustc-cfg=egcl_dlopen_embedded");
+    }
     if target == "aarch64-apple-darwin" {
         println!("cargo:rerun-if-changed=src/syscall/macos_context.c");
         cc::Build::new()
