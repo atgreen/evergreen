@@ -153,7 +153,10 @@ pub const IMAGE_MAGIC: u64 = u64::from_be_bytes(*b"EGCLIMG\0");
 // Older images discarded that lexical namespace and cannot reconstruct it.
 // Version 10 saves each macro's captured frame with its definition. Older
 // images dropped it, so a macro defined inside a LET lost its bindings.
-const FORMAT_VERSION: u32 = 10;
+// Version 11 records the proclaimed specials in the host registry. Older
+// images lost a valueless DEFVAR's specialness, and an older binary would
+// misread the new block and silently drop the SETF expanders after it.
+const FORMAT_VERSION: u32 = 11;
 
 /// Image file header (128 bytes). D7.01.
 #[derive(Clone, Copy)]
