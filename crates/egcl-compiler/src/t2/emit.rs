@@ -902,6 +902,12 @@ pub struct DirectNativeTarget {
     pub generation_addr: u64,
     /// The frame-header flag word for an ordinary call frame.
     pub frame_flags: u32,
+    /// The callee's register entry (`fn(a, b, c) -> value`: arguments in the
+    /// ABI argument registers, no activation and no EgclStack frame of its
+    /// own), or zero when it published none or its arity does not fit. s390x
+    /// enters it instead of building the callee's frame; the other emitters
+    /// ignore it, as they ignore the rest of this list.
+    pub register_entry: u64,
 }
 
 /// The branch condition a fixnum comparison opcode is true under. `None` for

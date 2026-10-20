@@ -21232,6 +21232,17 @@ fn direct_native_targets(
                 generation: baked_gen,
                 generation_addr,
                 frame_flags: FLAG_CALL,
+                // A register entry exists only for a body with no shadow
+                // roots (validate_t2_root_sync rejects that pair), so
+                // entering one without building a frame cannot hide a root.
+                register_entry: if cnc.compiled_entry != 0
+                    && usize::from(nargs)
+                        <= egcl_compiler::t2::emit_s390x::REGISTER_ENTRY_ARGS_MAX
+                {
+                    cnc.entry as u64 + cnc.compiled_entry as u64
+                } else {
+                    0
+                },
             });
             retained.push(cnc);
         }
