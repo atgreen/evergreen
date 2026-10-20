@@ -164,6 +164,7 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                             | AuxData::FunctionLookup(_)
                             | AuxData::ValuesToList
                             | AuxData::NestedClosure(_)
+                            | AuxData::LexicalEnvironment { .. }
                             | AuxData::TransferThrow
                             | AuxData::CatchScope { .. }
                             | AuxData::HandlerScope { .. }
@@ -224,6 +225,18 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                 if data.opcode != Opcode::Invoke || data.args.len() != usize::from(enter)
                     || !identity_matches {
                     errors.push(VerifyError::new("V11 invoke-shape", "special binding requires exact bytecode identity and entry value"));
+                }
+            }
+            if let AuxData::LexicalEnvironment { value, result, .. } = data.aux {
+                // No captured-variable operation both consumes and produces.
+                if data.opcode != Opcode::Invoke
+                    || data.args.len() != usize::from(value)
+                    || (value && result)
+                {
+                    errors.push(VerifyError::new(
+                        "V11 invoke-shape",
+                        "lexical environment access has invalid operands",
+                    ));
                 }
             }
             if let AuxData::GlobalValue { store, .. } = data.aux {

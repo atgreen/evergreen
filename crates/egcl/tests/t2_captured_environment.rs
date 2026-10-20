@@ -5,8 +5,10 @@
 
 use std::process::Command;
 
-// Captured entries are deliberately refused by mapped Linux fixed_tagged_parameters.
-// These branches assert fallback semantics; native shared-code/OSR acceptance stays open in bliss-shih7.27.
+// Mapped Linux admits a body whose own bindings its closures capture, but not a
+// closure body that reads its creator's bindings, as every lambda here does.
+// These branches assert fallback semantics; native shared-code/OSR acceptance
+// for such closure bodies stays open in bliss-shih7.27.
 const MAPPED_LINUX: bool = cfg!(target_os = "linux");
 
 fn assert_capture_fallback(trace: &str) {

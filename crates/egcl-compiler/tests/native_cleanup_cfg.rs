@@ -873,12 +873,76 @@ fn noncapturing_closure_is_an_argument_free_transfer_invoke() {
         build::build_from_bytecode_for_native_cleanups(&body).is_err(),
         "an out-of-range nested function must decline"
     );
+    // A capturing closure reaches the activation's EnvFrame through the
+    // runtime, identified by its exact bytecode PC (bliss-shih7.27).
     body.code[0] = Instr::MakeClosure {
         func: 0,
         capture_env: true,
     };
+    let ir = build::build_from_bytecode_for_native_cleanups(&body).unwrap();
+    verify::verify(&ir).unwrap();
+    assert!(
+        ir.block_order()
+            .iter()
+            .flat_map(|&block| &ir.block(block).insts)
+            .any(|&inst| {
+                ir.inst(inst).opcode == Opcode::Invoke
+                    && matches!(
+                        ir.inst(inst).aux,
+                        AuxData::LexicalEnvironment {
+                            bcp: 0,
+                            value: false,
+                            result: true
+                        }
+                    )
+            })
+    );
+}
+
+#[test]
+fn captured_variable_operations_are_pc_identified_transfer_invokes() {
+    let mut body = cleanup_body();
+    body.has_env = true;
+    body.names = vec!["X".into()];
+    body.code = vec![
+        Instr::PushEnvChild,
+        Instr::Const(0),
+        Instr::DefineEnvVar(0),
+        Instr::LoadEnvVar(0),
+        Instr::StoreEnvVar(0),
+        Instr::PopEnvChild,
+        Instr::Const(0),
+        Instr::Return,
+    ];
+    let ir = build::build_from_bytecode_for_native_cleanups(&body).unwrap();
+    verify::verify(&ir).unwrap();
+    let mut seen: Vec<_> = ir
+        .block_order()
+        .iter()
+        .flat_map(|&block| &ir.block(block).insts)
+        .filter_map(|&inst| match ir.inst(inst).aux {
+            AuxData::LexicalEnvironment { bcp, value, result } => {
+                assert_eq!(ir.inst(inst).opcode, Opcode::Invoke);
+                assert_eq!(ir.inst(inst).args.len(), usize::from(value));
+                Some((bcp, value, result))
+            }
+            _ => None,
+        })
+        .collect();
+    seen.sort();
+    assert_eq!(
+        seen,
+        [
+            (0, false, false),
+            (2, true, false),
+            (3, false, true),
+            (4, true, false),
+            (5, false, false)
+        ]
+    );
+    body.code[3] = Instr::LoadEnvVar(1);
     assert!(
         build::build_from_bytecode_for_native_cleanups(&body).is_err(),
-        "a capturing closure needs an activation EnvFrame"
+        "an unknown name must decline, not become an environment transfer"
     );
 }

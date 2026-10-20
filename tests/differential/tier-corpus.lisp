@@ -527,6 +527,50 @@
            (setq r (list (ie-return (list 1 i)) (ie-go (list 1 i)) (ie-dolist (list (list 1 3) (list i)))
                          (ie-deep (list 1 i)) (fe-shadow (list 1 2)) (fe-shadow (list 1 3 2)))))))
 
+;; Functions whose own bindings their closures capture: a mutated captured
+;; local, two closures sharing one binding, captured &optional/&key/&rest
+;; parameters, nested captured LETs and a captured loop accumulator
+;; (bliss-shih7.27).
+(defun cap-sum (n)
+  (let ((total 0))
+    (let ((add (lambda (x) (setq total (+ total x)))))
+      (dotimes (i n) (funcall add i)))
+    total))
+(defun cap-pair (seed)
+  (let ((cell seed))
+    (list (lambda (v) (setq cell v)) (lambda () cell))))
+(defun cap-param (a &optional (b 10) &key (c 1))
+  (let ((f (lambda () (setq a (+ a b c)))))
+    (funcall f) (funcall f)
+    a))
+(defun cap-rest (&rest xs)
+  (let ((g (lambda () (setq xs (cdr xs)) (length xs))))
+    (list (funcall g) xs)))
+(defun cap-nested (x)
+  (let ((a (list x)))
+    (let ((f (lambda () a)))
+      (let ((b (* x 2)))
+        (let ((g (lambda () (setq b (+ b 1)))))
+          (funcall g)
+          (list (funcall f) b))))))
+(defun cap-overflow (start n)
+  (let ((acc start))
+    (let ((peek (lambda () acc)))
+      (dotimes (i n) (setq acc (+ acc 1)))
+      (list acc (funcall peek)))))
+
+(check :captured-environments
+       (let ((r nil))
+         (dotimes (i 30 r)
+           (setq r (list (cap-sum 50)
+                         (let* ((p (cap-pair i)))
+                           (funcall (first p) (list i))
+                           (funcall (second p)))
+                         (cap-param i) (cap-param i 2 :c 3)
+                         (cap-rest) (cap-rest i 1 2)
+                         (cap-nested i)
+                         (cap-overflow (- most-positive-fixnum 20) 40))))))
+
 ;;; ── epilogue: checksum + completion sentinel ───────────────────────────
 
 (note :checksum *hash*)

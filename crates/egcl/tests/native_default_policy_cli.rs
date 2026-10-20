@@ -37,14 +37,17 @@ fn linux_default_installs_ordinary_register_calls() {
 
 #[test]
 fn linux_default_interprets_unsupported_parameters_and_preserves_transfers() {
-    // A &key parameter captured by a closure lives in a heap binding that the
-    // mapped entry cannot bind (bliss-shih7.27), so these stay interpreted.
+    // A body that reads its enclosing LET's binding depends on the callable
+    // instance's captured environment, which the mapped entry does not take
+    // over (bliss-shih7.27), so these stay interpreted.
     let output = run("(defun policy-key-leaf (x) (values (list x) 19))
-        (defun policy-key (x &key (y 1))
-          (funcall (lambda () (policy-key-leaf (+ x y)))))
-        (defun policy-escape (x &key (y 1))
-          (unwind-protect (throw 'policy-exit (values (funcall (lambda () (+ x y))) 23))
-            (incf *policy-cleanups*)))
+        (let ((one 1))
+          (defun policy-key (x &key (y 1))
+            (if (eql one 1) (funcall (lambda () (policy-key-leaf (+ x y)))) :never))
+          (defun policy-escape (x &key (y 1))
+            (unwind-protect
+                 (throw 'policy-exit (values (* one (funcall (lambda () (+ x y)))) 23))
+              (incf *policy-cleanups*))))
         (setq *policy-cleanups* 0)
         (dotimes (i 40)
           (assert (equal '((8) 19) (multiple-value-list (policy-key 7))))

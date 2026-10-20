@@ -2091,6 +2091,9 @@ fn emit_invoke_call(
         crate::t2::ir::AuxData::NestedClosure(index) => {
             (TRANSFER_MAKE_CLOSURE_REQUEST | u64::from(index), 0, false)
         }
+        crate::t2::ir::AuxData::LexicalEnvironment { bcp, value, .. } => {
+            (TRANSFER_LEXICAL_ENVIRONMENT_REQUEST | u64::from(bcp), u64::from(value), false)
+        }
         crate::t2::ir::AuxData::CleanupContinuation {
             cleanup_bcp,
             resume_bcp,
@@ -3657,6 +3660,9 @@ pub const TRANSFER_GLOBAL_STORE_REQUEST: u64 = 14_u64 << 32;
 pub const TRANSFER_VALUES_TO_LIST_REQUEST: u64 = 15_u64 << 32;
 /// Low word indexes the retained root body's `nested_functions`.
 pub const TRANSFER_MAKE_CLOSURE_REQUEST: u64 = 16_u64 << 32;
+/// Low word is the retained root body's PC of a captured-variable instruction,
+/// applied to the executing activation's heap EnvFrame.
+pub const TRANSFER_LEXICAL_ENVIRONMENT_REQUEST: u64 = 17_u64 << 32;
 
 /// Helper-v2 call request, live in the generated caller's temporary frame until
 /// normal return or completion of cold preparation. The args slice resides in
@@ -4475,6 +4481,7 @@ fn emit_transfer_function_with_storage(
                             | AuxData::FunctionLookup(_)
                             | AuxData::ValuesToList
                             | AuxData::NestedClosure(_)
+                            | AuxData::LexicalEnvironment { .. }
                             | AuxData::TransferThrow
                             | AuxData::CatchScope { .. }
                             | AuxData::HandlerScope { .. }
@@ -5306,7 +5313,9 @@ fn emit_framed_inner(
                 | crate::control_scope::ScopeKind::HandlerCase { .. }
                 | crate::control_scope::ScopeKind::HandlerBind { .. }
                 | crate::control_scope::ScopeKind::RestartCase { .. }
-                | crate::control_scope::ScopeKind::SpecialBinding { .. })
+                | crate::control_scope::ScopeKind::SpecialBinding { .. }
+                // The runtime moves the activation's EnvFrame with OSR state.
+                | crate::control_scope::ScopeKind::LexicalEnvironment)
     }));
     let resolve_poll = |point| {
         crate::t2::x64_frame::resolve_values_before(f, &machine, &layout, &const_tagged, point)
@@ -6117,6 +6126,7 @@ fn emit_framed_inner(
                         | AuxData::FunctionLookup(_)
                         | AuxData::ValuesToList
                         | AuxData::NestedClosure(_)
+                        | AuxData::LexicalEnvironment { .. }
                         | AuxData::TransferThrow
                         | AuxData::CatchScope { .. }
                         | AuxData::HandlerScope { .. }

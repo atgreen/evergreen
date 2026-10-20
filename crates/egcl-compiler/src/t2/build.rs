@@ -575,6 +575,20 @@ impl<'a> Builder<'a> {
             Instr::UnbindSpecial(_) => Some(AuxData::SpecialBinding { bcp: bcp as u32, enter: false }),
             Instr::LoadGlobal(symbol) => Some(AuxData::GlobalValue { symbol: *symbol, store: false }),
             Instr::StoreGlobal(symbol) => Some(AuxData::GlobalValue { symbol: *symbol, store: true }),
+            // Captured variables live in the activation's heap EnvFrame, which
+            // only the runtime owns; it decodes the instruction at this PC.
+            Instr::LoadEnvVar(index) | Instr::StoreEnvVar(index) | Instr::DefineEnvVar(index) => {
+                self.bf.names.get(*index as usize)?;
+                let value = !matches!(self.bf.code[bcp], Instr::LoadEnvVar(_));
+                Some(AuxData::LexicalEnvironment { bcp: bcp as u32, value, result: !value })
+            }
+            Instr::PushEnvChild | Instr::PopEnvChild => {
+                Some(AuxData::LexicalEnvironment { bcp: bcp as u32, value: false, result: false })
+            }
+            Instr::MakeClosure { func, capture_env: true } => {
+                self.bf.nested_functions.get(*func as usize)?;
+                Some(AuxData::LexicalEnvironment { bcp: bcp as u32, value: false, result: true })
+            }
             _ => None,
         }
     }
@@ -1024,6 +1038,16 @@ impl<'a> Builder<'a> {
                 Instr::BindSpecial(_) if self.native_cleanups => {
                     if d < 1 { return Err(BuildError::Unsupported("special binding without value")); }
                     push(i + 1, d - 1, &mut depth_at, &mut work);
+                }
+                Instr::DefineEnvVar(_) if self.native_cleanups => {
+                    if d < 1 { return Err(BuildError::Unsupported("environment binding without value")); }
+                    push(i + 1, d - 1, &mut depth_at, &mut work);
+                }
+                Instr::PushEnvChild | Instr::PopEnvChild if self.native_cleanups => {
+                    push(i + 1, d, &mut depth_at, &mut work);
+                }
+                Instr::MakeClosure { capture_env: true, .. } if self.native_cleanups => {
+                    push(i + 1, d + 1, &mut depth_at, &mut work);
                 }
                 Instr::UnbindSpecial(_) if self.native_cleanups => {
                     push(i + 1, d, &mut depth_at, &mut work);
@@ -1673,7 +1697,8 @@ impl<'a> Builder<'a> {
                 // The runtime commits only after all fallible preparation.
                 let fs = self.build_frame_state(block, &stack, i as u32);
                 let args = if matches!(aux, AuxData::SpecialBinding { enter: true, .. }
-                    | AuxData::GlobalValue { store: true, .. }) {
+                    | AuxData::GlobalValue { store: true, .. }
+                    | AuxData::LexicalEnvironment { value: true, .. }) {
                     vec![stack.pop().ok_or(BuildError::Unsupported("special operation without value"))?]
                 } else { vec![] };
                 let (inst, results) = self.f.push_inst(block, InstData {
@@ -2566,6 +2591,7 @@ impl<'a> Builder<'a> {
                 | AuxData::RestartCaseScope { .. }
                 | AuxData::SpecialBinding { .. }
                 | AuxData::GlobalValue { store: true, .. }
+                | AuxData::LexicalEnvironment { result: false, .. }
         ) {
             stack.push(projected);
         }

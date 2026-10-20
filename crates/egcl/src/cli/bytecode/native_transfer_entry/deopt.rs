@@ -181,7 +181,9 @@ unsafe fn take_guard_resume_state(
                     | ScopeKind::Cleanup { .. }
                     | ScopeKind::HandlerCase { .. }
                     | ScopeKind::HandlerBind { .. }
-                    | ScopeKind::RestartCase { .. } | ScopeKind::SpecialBinding { .. })
+                    | ScopeKind::RestartCase { .. } | ScopeKind::SpecialBinding { .. }
+                    // The resumed activation takes the state's EnvFrame.
+                    | ScopeKind::LexicalEnvironment)
     }) {
         return Err(invalid_capture());
     }
@@ -199,7 +201,7 @@ unsafe fn take_guard_resume_state(
             {
                 return Err(invalid_capture());
             }
-        } else if !matches!(scope.kind, ScopeKind::SpecialBinding { .. }) {
+        } else if !matches!(scope.kind, ScopeKind::SpecialBinding { .. } | ScopeKind::LexicalEnvironment) {
             handler_depth += 1;
         }
     }
@@ -282,7 +284,8 @@ unsafe fn take_guard_resume_state(
                 cleanup_bcp,
                 sp_restore: scope.sp_restore,
             },
-            ScopeKind::Cleanup { .. } | ScopeKind::SpecialBinding { .. } => continue,
+            ScopeKind::Cleanup { .. } | ScopeKind::SpecialBinding { .. }
+                | ScopeKind::LexicalEnvironment => continue,
             ScopeKind::Catch { resume_bcp } => Handler::Catch {
                 token: saved_catches.next().expect("validated catch order").token,
                 resume_bcp,
@@ -1726,7 +1729,10 @@ unsafe fn resume_guard_with_arguments(
                 egcl_rt::debug_stack::CallFrame::enter_managed_at(&code.body.name, arguments, frame)
             });
         }
-        resume_inlined_in_t0_with_state(scopes, metadata, None, state.take(), unsafe { &mut *env })
+        // The guarded activation's exact EnvFrame, including child frames it
+        // entered and bindings it wrote before the guard failed.
+        let env_frame = unsafe { (*(*context).env_frame).clone() };
+        resume_inlined_in_t0_with_state(scopes, metadata, env_frame, state.take(), unsafe { &mut *env })
     });
     // Fiber mounting establishes carrier compatibility before resumed Lisp or
     // Rust executes. Publish the value/transfer without another capability test.

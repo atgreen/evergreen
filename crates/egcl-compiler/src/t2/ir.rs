@@ -406,6 +406,12 @@ pub enum AuxData {
     /// Materialize `nested_functions[idx]` of the retained root body as a
     /// fresh non-capturing closure through the native-transfer bridge.
     NestedClosure(u32),
+    /// Captured-variable operation identified by its exact retained bytecode
+    /// PC: LoadEnvVar, StoreEnvVar, DefineEnvVar, PushEnvChild, PopEnvChild or
+    /// a capturing MakeClosure. The runtime decodes that instruction and applies
+    /// it to the executing activation's heap EnvFrame. `value` says whether it
+    /// consumes one operand and `result` whether it produces one.
+    LexicalEnvironment { bcp: u32, value: bool, result: bool },
     /// Binding operation identified by its exact retained bytecode PC. Exit
     /// decodes UnbindSpecial's count there; entry consumes one rooted value.
     SpecialBinding { bcp: u32, enter: bool },

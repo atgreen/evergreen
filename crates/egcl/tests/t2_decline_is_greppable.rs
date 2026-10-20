@@ -102,7 +102,7 @@ fn a_function_declined_at_t1_explains_itself_in_the_t2_log() {
             "--eval",
             "(progn (defun keyfn (a &key (b 1)) (+ a b)) \
                     (defun restfn (&rest r) (let ((g (lambda () r))) (funcall g))) \
-                    (defun capfn (n) (let ((f (lambda (x) (+ x n)))) (funcall f 1))) \
+                    (let ((k 3)) (defun capfn (n) (+ n k))) \
                     (dotimes (i 50) (keyfn i) (restfn i) (capfn i)) \
                     (values))",
         ])
@@ -112,19 +112,24 @@ fn a_function_declined_at_t1_explains_itself_in_the_t2_log() {
         .expect("run egcl");
     let log = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{log}");
-    // A plain &key lambda list enters mapped T1 now (bliss-shih7.27), so it
-    // must not be reported as declined; a variadic body that captures still is.
+    // A plain &key lambda list, and a body whose own bindings its closures
+    // capture, enter mapped T1 now (bliss-shih7.27), so neither may be
+    // reported as declined. A DEFUN that reads its enclosing LET's binding
+    // still is.
     assert!(
         !log.contains("[T2] KEYFN: T1 declined"),
         "a plain &key function must no longer decline T1:\n{log}"
     );
     assert!(
-        log.contains("[T2] RESTFN: T1 declined (captured variables (closure environment))"),
-        "the capturing &rest decline must be explained in the T2 log:\n{log}"
+        !log.contains("[T2] RESTFN: T1 declined"),
+        "a capturing &rest function must no longer decline T1:\n{log}"
     );
     assert!(
-        log.contains("[T2] CAPFN: T1 declined (captured variables (closure environment))"),
-        "the closure decline must be explained in the T2 log:\n{log}"
+        log.contains(
+            "[T2] CAPFN: T1 declined (captured variables (closure environment): \
+             reads bindings captured from an enclosing scope)"
+        ),
+        "the enclosing-capture decline must be explained in the T2 log:\n{log}"
     );
 }
 

@@ -449,8 +449,8 @@ pub(super) fn mapped_t1_decline_reason(symbol: u32, body: &Arc<BytecodeFunction>
     if !native_transfer::is_supported() {
         return "mapped transfer unsupported on this platform".into();
     }
-    if body.has_env {
-        return "captured variables (closure environment)".into();
+    if let Some(reason) = captured_environment_decline(body) {
+        return format!("captured variables (closure environment): {reason}");
     }
     if !activation_bound_parameters(body) {
         return if body.variadic {
@@ -770,8 +770,8 @@ impl TransferCode {
     pub(super) fn compile(body: Arc<BytecodeFunction>) -> Option<Self> {
         // The uninstalled segment cache runs without the callable whose
         // captured environment a variadic default may read; only installed
-        // entries bind variadic lambda lists.
-        if body.variadic {
+        // entries bind variadic lambda lists or capturing environments.
+        if body.variadic || body.has_env {
             return None;
         }
         Self::compile_variant(Arc::clone(&body), true, true, None)
@@ -839,8 +839,9 @@ impl TransferCode {
         allow_recursion: bool,
         symbol: Option<u32>,
     ) -> Result<Self, EmitDecline> {
-        // A non-capturing variadic body binds its slots in `run_activation`.
-        if body.has_env {
+        // A variadic body binds its slots, and a capturing body its heap
+        // EnvFrame, in `run_activation`.
+        if captured_environment_decline(&body).is_some() {
             return Err(EmitDecline::CapturedEnvironment);
         }
         // These scopes need executing identity, dynamic values or inherited
@@ -1253,6 +1254,7 @@ impl TransferCode {
                             | ScopeKind::HandlerBind { .. }
                             | ScopeKind::RestartCase { .. }
                             | ScopeKind::SpecialBinding { .. }
+                            | ScopeKind::LexicalEnvironment
                     )
             }) {
                 return Err(EmitDecline::TransferScope(scope.kind.clone(), scope.ownership));
@@ -1264,6 +1266,7 @@ impl TransferCode {
             scopes.before(bcp as u32)
         }).map(|active| active.iter().filter(|scope| !matches!(scope.kind,
             ScopeKind::Cleanup { .. } | ScopeKind::PendingCleanup { .. } | ScopeKind::SpecialBinding { .. }
+                | ScopeKind::LexicalEnvironment
         )).count()).max().unwrap_or(0);
         let mut cleanup_depths = std::collections::HashMap::new();
         for instruction in &body.code {
@@ -1471,21 +1474,29 @@ impl TransferCode {
                 )
             })? };
         frame_guard.0 = Some(frame);
+        if osr_offset.is_none() && (self.body.has_env || self.body.variadic) {
+            // The interpreter's environment, as in `run_with_binding`: a
+            // capturing body gets a fresh heap frame under the callable's
+            // captured one (or the caller's), shared with every closure it
+            // creates. The rooted state owns it from here; an OSR destination
+            // inherits it with the rest of the state (bliss-shih7.27).
+            let closure_env = closure_captured_env(*function);
+            state.env_frame = if self.body.has_env {
+                let parent = closure_env.clone().unwrap_or_else(|| Arc::clone(&env.frame));
+                make_env_frame(&self.body, parent).or(closure_env)
+            } else {
+                closure_env
+            };
+        }
         if osr_offset.is_none() && self.body.variadic {
             // Defaults may run arbitrary Lisp, collect or exit non-locally.
             // The frame's slots are still NIL, as at the entry poll below, and
             // no native scope, block stack or entry state is installed yet;
             // `frame_guard` pops the frame on an error, as the checked ABI does.
-            bind_variadic(
-                &self.body,
-                frame,
-                &args,
-                closure_captured_env(*function).as_ref(),
-                env,
-            )
-            .map_err(EgclError::capture_backtrace)?;
+            bind_variadic(&self.body, frame, &args, state.env_frame.as_ref(), env)
+                .map_err(EgclError::capture_backtrace)?;
         } else if osr_offset.is_none() {
-            bind_params(&self.body, frame, &args, None);
+            bind_params(&self.body, frame, &args, state.env_frame.as_ref());
         }
         let _dynamic_scope_guard = DynamicScopeGuard {
             env,
@@ -1683,7 +1694,12 @@ impl TransferCode {
                                 | Instr::EvalHost(_)
                                 | Instr::LoadFunction(_)
                                 | Instr::ValuesToList
-                                | Instr::MakeClosure { capture_env: false, .. }
+                                | Instr::MakeClosure { .. }
+                                | Instr::LoadEnvVar(_)
+                                | Instr::StoreEnvVar(_)
+                                | Instr::DefineEnvVar(_)
+                                | Instr::PushEnvChild
+                                | Instr::PopEnvChild
                                 | Instr::AllocCons
                                 | Instr::CleanupReturn
                                 | Instr::SetValues(_)
@@ -1753,7 +1769,9 @@ impl TransferCode {
             .map()
             .control_scopes
             .iter()
-            .filter(|scope| !matches!(scope.kind, ScopeKind::Cleanup { .. } | ScopeKind::SpecialBinding { .. }))
+            // A lexical environment is the activation's EnvFrame, not a handler.
+            .filter(|scope| !matches!(scope.kind, ScopeKind::Cleanup { .. }
+                | ScopeKind::SpecialBinding { .. } | ScopeKind::LexicalEnvironment))
             .map(|scope| match scope.kind {
                 ScopeKind::Block {
                     id,
@@ -1838,7 +1856,8 @@ impl TransferCode {
             handlers: restored_handlers,
             cleanup_conts: cleanups.drain(..).map(|saved| saved.continuation).collect(),
             dyn_binds: specials.drain(..).map(|saved| saved.binding).collect(),
-            env_frame: None,
+            // The exact frame, including child frames entered natively.
+            env_frame: unsafe { (*context.env_frame).clone() },
             fn_obj: None,
             sym: u32::MAX,
         }];
@@ -1915,7 +1934,71 @@ fn named_call_cells(body: &BytecodeFunction) -> Vec<(u32, Arc<egcl_rt::call_tabl
 /// entry seeds the same slot prefix. Only the managed entry admits the variadic
 /// shape; every exact-arity entry still requires `fixed_tagged_parameters`.
 pub(super) fn activation_bound_parameters(body: &BytecodeFunction) -> bool {
-    positional_tagged_parameters(body) || variadic_slot_parameters(body)
+    positional_tagged_parameters(body)
+        || variadic_slot_parameters(body)
+        || captured_activation_parameters(body)
+}
+
+/// A capturing body whose heap EnvFrame the managed activation entry builds
+/// exactly as `run_with_binding` does, binding its boxed parameters there and
+/// its slot parameters into the slot prefix T2's entry seeds (bliss-shih7.27).
+pub(super) fn captured_activation_parameters(body: &BytecodeFunction) -> bool {
+    body.has_env && captured_environment_decline(body).is_none()
+}
+
+/// Why the managed entry cannot own `body`'s captured environment, or `None`
+/// when it can or there is none. Native code reaches captured variables only
+/// through runtime helpers on the activation's own frame, so the body must
+/// define every binding it names: a closure body reading the bindings of its
+/// creator still depends on which callable instance is running, and stays
+/// interpreted (bliss-kg667 covers that shape).
+pub(super) fn captured_environment_decline(body: &BytecodeFunction) -> Option<&'static str> {
+    if !body.has_env {
+        return None;
+    }
+    if !body.variadic
+        && !(body.min_args <= body.arity
+            && body.max_args == Some(body.arity)
+            && body.param_layout.len() == usize::from(body.arity))
+    {
+        return Some("unsupported lambda-list shape");
+    }
+    // Boxed parameters take no slot. The remaining ones must be the slot
+    // prefix, in order, that the entry seeds from the activation.
+    let mut next_slot = 0u16;
+    for (_, location) in &body.param_layout {
+        if let VarLoc::Slot(slot) = location {
+            if *slot != next_slot || *slot >= body.n_locals {
+                return Some("a parameter slot is out of order");
+            }
+            next_slot += 1;
+        }
+    }
+    let boxed = || body.param_layout.iter().filter(|(_, location)| matches!(location, VarLoc::Boxed));
+    // Declared types align with parameters, not slots; T2 would check the
+    // wrong slot once a boxed parameter shifts the prefix.
+    if boxed().next().is_some() && body.param_types.iter().any(|ty| !ty.is_any()) {
+        return Some("a declared parameter type beside a captured parameter");
+    }
+    // Names are interned per body, so equal indexes are equal names.
+    let defined: std::collections::HashSet<u16> = body.code.iter()
+        .filter_map(|op| match op { Instr::DefineEnvVar(index) => Some(*index), _ => None })
+        .collect();
+    let own = |index: u16| {
+        defined.contains(&index)
+            || body.names.get(usize::from(index))
+                .is_some_and(|name| boxed().any(|(param, _)| param == name))
+    };
+    for op in &body.code {
+        match op {
+            Instr::LoadEnvVar(index) | Instr::StoreEnvVar(index) if !own(*index) => {
+                return Some("reads bindings captured from an enclosing scope");
+            }
+            Instr::MakeClosureEnv(_) => return Some("builds a closure from source (MakeClosureEnv)"),
+            _ => {}
+        }
+    }
+    None
 }
 
 fn variadic_slot_parameters(body: &BytecodeFunction) -> bool {
@@ -1928,7 +2011,7 @@ fn variadic_slot_parameters(body: &BytecodeFunction) -> bool {
 }
 
 fn scope_free_native_body(body: &BytecodeFunction, allow_values: bool) -> bool {
-    local_control_native_body(body, allow_values, false, false)
+    !body.has_env && local_control_native_body(body, allow_values, false, false)
 }
 
 // Raw numeric locals use the existing managed activation's local control scopes.
@@ -1949,15 +2032,20 @@ fn packed_f64_native_body(body: &BytecodeFunction, ir: &egcl_compiler::t2::ir::F
                 | Instr::PushRestartCase { .. } | Instr::PopRestartCase
                 | Instr::BindSpecial(_) | Instr::UnbindSpecial(_)
                 | Instr::LoadFunction(_)
-                | Instr::MakeClosure { .. }))
+                | Instr::MakeClosure { .. }
+                | Instr::LoadEnvVar(_) | Instr::StoreEnvVar(_) | Instr::DefineEnvVar(_)
+                | Instr::PushEnvChild | Instr::PopEnvChild))
 }
 
 fn local_control_native_body(body: &BytecodeFunction, allow_values: bool, allow_local_scopes: bool, allow_primary_transport: bool) -> bool {
-    (body.param_layout.len() == usize::from(body.arity) || variadic_slot_parameters(body))
+    // Captured variables are helper-v2 Invokes on the activation's EnvFrame,
+    // so a capturing body needs the local-scope (native cleanup) emitter.
+    ((body.param_layout.len() == usize::from(body.arity) || variadic_slot_parameters(body))
         && body
             .param_layout
             .iter()
             .all(|(_, location)| matches!(location, VarLoc::Slot(_)))
+        || allow_local_scopes && captured_activation_parameters(body))
         && body.code.iter().all(|op| local_control_op(op, allow_values, allow_local_scopes, allow_primary_transport))
 }
 
@@ -1975,9 +2063,12 @@ fn local_control_op(op: &Instr, allow_values: bool, allow_local_scopes: bool, al
     (allow_values && matches!(op,
         Instr::SetValues(_) | Instr::TakeValuesToLocals { .. } | Instr::ValuesToList))
     || (allow_primary_transport && matches!(op, Instr::TakeValuesToLocals { nvars: 1, .. }))
-    // A non-capturing closure is a helper-v2 Invoke that indexes the
-    // activation's retained body; capturing closures need an EnvFrame.
-    || (allow_local_scopes && matches!(op, Instr::MakeClosure { capture_env: false, .. }))
+    // A closure is a helper-v2 Invoke that indexes the activation's retained
+    // body; a capturing one, like every captured-variable access, also
+    // reaches the activation's EnvFrame (bliss-shih7.27).
+    || (allow_local_scopes && matches!(op, Instr::MakeClosure { .. }
+        | Instr::LoadEnvVar(_) | Instr::StoreEnvVar(_) | Instr::DefineEnvVar(_)
+        | Instr::PushEnvChild | Instr::PopEnvChild))
     || (allow_local_scopes && matches!(op,
         Instr::PushTag { .. } | Instr::Go { .. } | Instr::PushCatch { .. } | Instr::Throw
             | Instr::PushUnwind { .. } | Instr::EnterCleanupNormal { .. } | Instr::CleanupReturn
@@ -2517,6 +2608,59 @@ unsafe extern "C" fn call_or_throw(
     }
 }
 
+/// Run the captured-variable instruction at the request's PC against the
+/// executing activation's heap EnvFrame, exactly as the interpreter's arm for
+/// it does (bliss-shih7.27). The frame lives in the rooted activation state;
+/// take an Arc out of it before anything allocates, and hold no reference into
+/// the state while the collector may trace it.
+unsafe fn lexical_environment_request(
+    call: &egcl_compiler::t2::emit::TransferCallRequest,
+) -> Result<EgclVal, EgclError> {
+    let context = unsafe { &*CAPTURE.with(Cell::get) };
+    let body = unsafe { &*context.body };
+    let instruction = *body.code.get(call.symbol as u32 as usize).ok_or_else(invalid_capture)?;
+    let name = |index: u16| body.names.get(usize::from(index)).ok_or_else(invalid_capture);
+    let current = || unsafe { (*context.env_frame).clone() }.ok_or_else(invalid_capture);
+    match instruction {
+        Instr::LoadEnvVar(index) => {
+            assert_eq!(call.nargs, 0);
+            let name = name(index)?;
+            Env::lookup_frame(&current()?, name)
+                .ok_or_else(|| EgclError::UnboundVariable(resolve_sym(name).unwrap_or(NIL)))
+        }
+        Instr::StoreEnvVar(index) | Instr::DefineEnvVar(index) => {
+            assert_eq!(call.nargs, 1);
+            let (name, frame) = (name(index)?, current()?);
+            // The argument area stays rooted; neither store allocates Lisp.
+            let value = unsafe { *call.args };
+            if matches!(instruction, Instr::StoreEnvVar(_)) {
+                Env::set_frame_var(&frame, name, value);
+            } else {
+                bind_boxed_param(&frame, name, value);
+            }
+            Ok(NIL)
+        }
+        Instr::PushEnvChild => {
+            push_env_child(unsafe { &mut *context.env_frame });
+            Ok(NIL)
+        }
+        Instr::PopEnvChild => {
+            pop_env_child(unsafe { &mut *context.env_frame });
+            Ok(NIL)
+        }
+        Instr::MakeClosure { func, capture_env: true } => {
+            let nested = Arc::clone(body.nested_functions.get(func as usize).ok_or_else(invalid_capture)?);
+            let captured = unsafe { (*context.env_frame).clone() };
+            // As for a non-capturing closure: nothing allocates between its
+            // creation and the outcome write.
+            let closure = super::make_bytecode_closure(&nested, captured);
+            super::register_closure_control(closure, unsafe { &*NATIVE_ENV.with(Cell::get) });
+            Ok(closure)
+        }
+        _ => Err(invalid_capture()),
+    }
+}
+
 unsafe fn call_or_throw_unpublished(
     request: *mut u8,
     out: *mut egcl_rt::native_transfer::NativeOutcome,
@@ -2556,8 +2700,28 @@ unsafe fn call_or_throw_unpublished(
         TRANSFER_RESTART_CASE_ENTER_REQUEST, TRANSFER_RESTART_CASE_LEAVE_REQUEST,
         TRANSFER_HOST_EVAL_REQUEST, TRANSFER_FUNCTION_LOOKUP_REQUEST,
         TRANSFER_VALUES_TO_LIST_REQUEST,
-        TRANSFER_MAKE_CLOSURE_REQUEST,
+        TRANSFER_MAKE_CLOSURE_REQUEST, TRANSFER_LEXICAL_ENVIRONMENT_REQUEST,
     };
+    if request_kind == TRANSFER_LEXICAL_ENVIRONMENT_REQUEST {
+        let mut value = NIL;
+        if !native_error_pending() {
+            match guard_c2i(|| unsafe { lexical_environment_request(call) }) {
+                Ok(result) => value = result,
+                Err(error) => NATIVE_ERROR.with(|slot| slot.set_first(error)),
+            }
+        }
+        unsafe {
+            out.write(NativeOutcome {
+                value,
+                exit: if native_error_pending() {
+                    NativeExit::Transfer
+                } else {
+                    NativeExit::Returned
+                },
+            });
+        }
+        return;
+    }
     if request_kind == TRANSFER_VALUES_TO_LIST_REQUEST {
         // Same result as the T0 arm: the primary alone when no tuple is
         // active. args[0] lives in the mapped outgoing area; copy it into a
@@ -2742,7 +2906,10 @@ unsafe fn call_or_throw_unpublished(
                         assert!(cases.len() < cases.capacity());
                         let info = &body.restart_cases[*rc as usize];
                         let restart_base = env.restarts.len();
-                        let captured_frame = Arc::clone(&env.frame);
+                        // As T0: restart clauses see the activation's
+                        // captured variables when it has any.
+                        let captured_frame = unsafe { (*context.env_frame).clone() }
+                            .unwrap_or_else(|| Arc::clone(&env.frame));
                         let mut values = Vec::new();
                         values
                             .try_reserve(info.restarts.len().saturating_mul(5))
@@ -3203,7 +3370,9 @@ unsafe fn prepare_osr(image: *const SysvTransferCapture) -> bool {
             | ScopeKind::Tagbody { .. } | ScopeKind::Catch { .. }
             | ScopeKind::Unwind { .. } | ScopeKind::Cleanup { .. }
             | ScopeKind::HandlerCase { .. } | ScopeKind::HandlerBind { .. }
-            | ScopeKind::RestartCase { .. } | ScopeKind::SpecialBinding { .. }))
+            | ScopeKind::RestartCase { .. } | ScopeKind::SpecialBinding { .. }
+            // The state's EnvFrame moves with the OSR hand-off.
+            | ScopeKind::LexicalEnvironment))
     {
         return false;
     }
@@ -3219,7 +3388,7 @@ unsafe fn prepare_osr(image: *const SysvTransferCapture) -> bool {
             if saved.cleanup_bcp != cleanup_bcp || saved.continuation.handler_depth != handler_depth {
                 return false;
             }
-        } else if !matches!(scope.kind, ScopeKind::SpecialBinding { .. }) {
+        } else if !matches!(scope.kind, ScopeKind::SpecialBinding { .. } | ScopeKind::LexicalEnvironment) {
             handler_depth += 1;
         }
     }
@@ -3509,6 +3678,8 @@ struct CaptureContext {
     dynamic_scopes: *mut Vec<DynamicScope>,
     cluster_frames: *mut Vec<(u32, *mut Frame)>,
     prepared_handler: *mut Option<PreparedHandler>,
+    /// The owning `ActivationState::env_frame`.
+    env_frame: *mut Option<Arc<SharedCell<EnvFrame>>>,
     #[cfg(test)]
     unavailable_catch: Option<u32>,
     #[cfg(test)]
