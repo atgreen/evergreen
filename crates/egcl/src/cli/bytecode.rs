@@ -7109,7 +7109,9 @@ fn flet_def_block_forms(def: EgclVal) -> (EgclVal, EgclVal) {
     } else {
         return (params_form, fbody);
     };
-    let Some(block_sym) = resolve_sym("BLOCK") else {
+    // BLOCK always exists, so a lookup that cannot allocate finds it.
+    let Some(block_sym) = egcl_rt::symbols::find_index("BLOCK").map(EgclVal::from_symbol_index)
+    else {
         return (params_form, fbody);
     };
     let is_declaration = |form: EgclVal| {
