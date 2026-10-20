@@ -17,6 +17,16 @@
   error or a control scope a transfer site cannot recover -- instead of the
   generic "native emission declined"
   ([#469](https://github.com/atgreen/evergreen/pull/469)).
+- `EGCL_T2_LOG` now explains the remaining hot functions that stayed at T0
+  without a word. A function or `DEFMETHOD` body the bytecode compiler cannot
+  lower logs `NAME: not compiled to bytecode (REASON)`, naming the construct,
+  such as a special variable used as a lambda-list parameter, an unsupported
+  `SETF` place, or a method defined inside a lexical binding. A function whose
+  closure needs its captured `BLOCK`/`TAGBODY` logs a T1 decline, and a
+  function blacklisted after repeated guard deopts logs one summary line
+  naming where T0 resumed and the disproved speculation. Deopt lines
+  now use the same plain function name as the rest of the log
+  ([#480](https://github.com/atgreen/evergreen/pull/480)).
 - `EGCL-EXT:INFLATE` decompresses raw deflate, zlib and gzip data in the
   runtime, checking each format's trailer. EGCL's port of chipz uses it, so
   unpacking a package with `ocicl install` no longer runs chipz's inflate in
