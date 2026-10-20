@@ -491,6 +491,42 @@
              (r nil))
          (dotimes (i 30 r) (setq r (list (nlx-return l) (nlx-go l))))))
 
+;; Closures whose named exits stay inside the closure that creates them, so
+;; their creator can run natively (bliss-uebgs), beside a same-named block
+;; that does not enclose the creation and so must not excuse a free exit.
+(defun ie-return (l)
+  (mapcar (lambda (x) (block inner (nlx-call (lambda () (return-from inner (* x 10)))) :wrong)) l))
+(defun ie-go (l)
+  (mapcar (lambda (x)
+            (let ((r :none))
+              (tagbody
+                 (nlx-call (lambda () (go out)))
+                 (setq r :fell-through)
+                 (go done)
+               out
+                 (setq r (list :went x))
+               done)
+              r))
+          l))
+(defun ie-dolist (l)
+  (mapcar (lambda (x) (dolist (y x :none) (when (eql y 3) (nlx-call (lambda () (return y)))))) l))
+(defun ie-deep (l)
+  (mapcar (lambda (x)
+            (block b (nlx-call (lambda () (nlx-call (lambda () (return-from b (list :deep x))))))))
+          l))
+(defun fe-shadow (l)
+  (block b
+    (mapcar (lambda (x)
+              (block b nil)
+              (if (eql x 3) (nlx-call (lambda () (return-from b :outer))) x))
+            l)))
+
+(check :closure-internal-exits
+       (let ((r nil))
+         (dotimes (i 30 r)
+           (setq r (list (ie-return (list 1 i)) (ie-go (list 1 i)) (ie-dolist (list (list 1 3) (list i)))
+                         (ie-deep (list 1 i)) (fe-shadow (list 1 2)) (fe-shadow (list 1 3 2)))))))
+
 ;;; ── epilogue: checksum + completion sentinel ───────────────────────────
 
 (note :checksum *hash*)

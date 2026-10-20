@@ -7738,11 +7738,19 @@ fn body_uses_macrolet(body: EgclVal) -> bool {
     list_to_vec(body).into_iter().any(walk)
 }
 
-/// True if `body` (a list of forms) syntactically uses `RETURN-FROM` anywhere
-/// (outside quoted data). A conservative over-approximation used to decide
-/// whether a function needs its implicit block established.
-fn body_uses_return_from(body: EgclVal) -> bool {
-    fn walk(form: EgclVal) -> bool {
+/// True if `body` (a list of forms) syntactically uses `RETURN-FROM` to a block
+/// named `block` anywhere (outside quoted data). A conservative
+/// over-approximation used to decide whether a function needs its implicit
+/// block established. Blocks match by name, as the lowerer resolves them, and a
+/// `RETURN-FROM` with no symbol name counts as a use.
+///
+/// A `RETURN-FROM` to another block (the `(return-from inner …)` of a closure
+/// exiting its own `(block inner …)`, or a DOLIST's `(return-from nil …)`)
+/// cannot reach the implicit block. Establishing it anyway made the block a
+/// registered scope around every closure the body creates, which keeps the
+/// whole function off native code (bliss-uebgs).
+fn body_uses_return_from(body: EgclVal, block: &str) -> bool {
+    fn walk(form: EgclVal, block: &str) -> bool {
         if !form.is_cons() {
             return false;
         }
@@ -7750,15 +7758,22 @@ fn body_uses_return_from(body: EgclVal) -> bool {
         if car.is_symbol() {
             let n = sym_bare_name_rc(car);
             if n.as_ref() == "RETURN-FROM" {
-                return true;
+                if !cdr.is_cons() {
+                    return true;
+                }
+                let target = cp(cdr).0;
+                if !(target.is_symbol() || target.is_nil()) || sym_name(target) == block {
+                    return true;
+                }
+                return walk(cdr, block);
             }
             if n.as_ref() == "QUOTE" {
                 return false;
             }
         }
-        walk(car) || walk(cdr)
+        walk(car, block) || walk(cdr, block)
     }
-    list_to_vec(body).into_iter().any(walk)
+    list_to_vec(body).into_iter().any(|form| walk(form, block))
 }
 
 /// Append `let*` bindings that destructure `pattern` against the value held in
@@ -9137,16 +9152,18 @@ fn compile_function_forcing_boxed(
 
     // A named DEFUN/DEFMACRO body runs inside an implicit block named after the
     // function, so `(return-from NAME …)` exits it (directly or from a nested
-    // closure). Only establish it when the body actually uses RETURN-FROM, to
-    // avoid a per-call block handler for the common case. Lambdas ("<lambda>")
+    // closure). Only establish it when the body actually uses RETURN-FROM to
+    // that name, to avoid a per-call block handler for the common case and a
+    // registered scope around the closures it creates. Lambdas ("<lambda>")
     // have no implicit block.
-    if name != "<lambda>" && body_uses_return_from(*body) {
-        if let Some(block_sym) = resolve_sym(name) {
-            let block_op = resolve_sym("BLOCK")?;
-            let mut items = vec![block_op, block_sym];
-            items.extend(list_to_vec(*body));
-            *body = arena_cons(vec_to_list(&items), NIL);
-        }
+    if name != "<lambda>"
+        && let Some(block_sym) = resolve_sym(name)
+        && body_uses_return_from(*body, &sym_name(block_sym))
+    {
+        let block_op = resolve_sym("BLOCK")?;
+        let mut items = vec![block_op, block_sym];
+        items.extend(list_to_vec(*body));
+        *body = arena_cons(vec_to_list(&items), NIL);
     }
 
     // Body as an implicit progn producing the return value, with any free
@@ -13361,21 +13378,131 @@ fn bf_escapes_to_control(
 /// and host-evaluated forms count as escaping: they are not analysed here,
 /// and declining is always safe (bliss-ku9w).
 fn bf_has_free_control_exit(bf: &BytecodeFunction) -> bool {
-    // The compiler emits ReturnFromNamed/GoNamed only for a block or tag that
-    // is NOT lexically visible inside `bf` at that point, so every one is a
-    // free exit. A same-named block established elsewhere in `bf` must not
-    // excuse it (an inner `(block b nil)` beside a `(return-from b)` to an
-    // outer B), and neither may an enclosing nested body's: a closure made
-    // outside that body's block still targets the outer one.
-    bf.code.iter().any(|instr| {
-        matches!(
-            instr,
-            Instr::ReturnFromNamed { .. }
-                | Instr::GoNamed { .. }
-                | Instr::MakeClosureEnv(_)
-                | Instr::EvalHost(_)
-        )
-    }) || bf.nested_functions.iter().any(|n| bf_has_free_control_exit(n))
+    bf_free_control_exits(bf).is_none_or(|exits| !exits.is_empty())
+}
+
+/// Block and tag names that `bf` (a nested closure body) or a closure nested
+/// in it exits to by name OUTSIDE `bf`, or `None` when an opaque source-form
+/// closure or host-evaluated form makes them unknowable (bliss-uebgs).
+///
+/// The compiler emits ReturnFromNamed/GoNamed only for a block or tag that is
+/// NOT lexically visible inside the emitting body, so each one in `bf`'s own
+/// code is free. A nested closure's free exit is resolved inside `bf` only
+/// when `bf` establishes that name AROUND the MakeClosure creating it: at run
+/// time the closure snapshots exactly the registered scopes live at its
+/// creation, and within one activation those are the scopes whose code range
+/// contains that instruction. A same-named block established elsewhere in `bf`
+/// excuses nothing (an inner `(block b nil)` beside a closure that returns to
+/// an outer B).
+fn bf_free_control_exits(bf: &BytecodeFunction) -> Option<FreeControlExits> {
+    let mut exits = FreeControlExits::default();
+    let mut created = vec![false; bf.nested_functions.len()];
+    for (pc, instr) in bf.code.iter().enumerate() {
+        match instr {
+            Instr::ReturnFromNamed { name_idx } => {
+                exits.blocks.insert(bf.names.get(*name_idx as usize)?.clone());
+            }
+            Instr::GoNamed { name_idx } => {
+                exits.tags.insert(bf.names.get(*name_idx as usize)?.clone());
+            }
+            Instr::MakeClosureEnv(_) | Instr::EvalHost(_) => return None,
+            Instr::MakeClosure { func, .. } => {
+                let nested = bf.nested_functions.get(*func as usize)?;
+                created[*func as usize] = true;
+                let inner = bf_free_control_exits(nested)?;
+                for name in inner.blocks {
+                    if !block_scope_encloses(bf, pc, &name) {
+                        exits.blocks.insert(name);
+                    }
+                }
+                for name in inner.tags {
+                    if !tag_scope_encloses(bf, pc, &name) {
+                        exits.tags.insert(name);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    // A body no MakeClosure here creates, and a restart clause, has no
+    // creation point to resolve against: every exit it makes counts as free.
+    let unplaced = bf
+        .nested_functions
+        .iter()
+        .zip(&created)
+        .filter(|(_, created)| !**created)
+        .map(|(nested, _)| nested.as_ref())
+        .chain(bf.restart_cases.iter().flat_map(|table| {
+            table.restarts.iter().map(|restart| restart.function.as_ref())
+        }));
+    for nested in unplaced {
+        let inner = bf_free_control_exits(nested)?;
+        exits.blocks.extend(inner.blocks);
+        exits.tags.extend(inner.tags);
+    }
+    Some(exits)
+}
+
+#[derive(Default)]
+struct FreeControlExits {
+    blocks: std::collections::HashSet<String>,
+    tags: std::collections::HashSet<String>,
+}
+
+impl FreeControlExits {
+    fn is_empty(&self) -> bool {
+        self.blocks.is_empty() && self.tags.is_empty()
+    }
+}
+
+/// True if `bf` registers a block named `name` whose body contains `pc`.
+fn block_scope_encloses(bf: &BytecodeFunction, pc: usize, name: &str) -> bool {
+    bf.code[..pc].iter().any(|instr| {
+        matches!(instr, Instr::PushBlock { name_idx, resume_bcp, register: true, .. }
+            if pc < *resume_bcp as usize
+                && bf.names.get(*name_idx as usize).is_some_and(|n| n == name))
+    })
+}
+
+/// True if `bf` registers a tag named `name` in a TAGBODY whose body contains
+/// `pc`. A tagbody's NamedTag registrations follow its PushTag directly (an
+/// unregistered one is a fallthrough `Br`), and its scope ends at the
+/// PopHandler that balances the PushTag.
+fn tag_scope_encloses(bf: &BytecodeFunction, pc: usize, name: &str) -> bool {
+    bf.code[..pc].iter().enumerate().any(|(at, instr)| {
+        if !matches!(instr, Instr::PushTag { .. }) {
+            return false;
+        }
+        let registers = bf.code[at + 1..pc]
+            .iter()
+            .enumerate()
+            .map_while(|(offset, op)| match op {
+                Instr::NamedTag { name_idx, .. } => Some(bf.names.get(*name_idx as usize)),
+                Instr::Br(target) if *target as usize == at + offset + 2 => Some(None),
+                _ => None,
+            })
+            .any(|n| n.is_some_and(|n| n == name));
+        registers && handler_scope_end(&bf.code, at).is_some_and(|end| pc < end)
+    })
+}
+
+/// Index of the PopHandler that closes the handler scope pushed at `push`.
+/// Every PushBlock/PushTag/PushCatch/PushUnwind is closed by exactly one
+/// PopHandler emitted after its body, so the scopes nest linearly.
+fn handler_scope_end(code: &[Instr], push: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (at, instr) in code.iter().enumerate().skip(push + 1) {
+        match instr {
+            Instr::PushBlock { .. }
+            | Instr::PushTag { .. }
+            | Instr::PushCatch { .. }
+            | Instr::PushUnwind { .. } => depth += 1,
+            Instr::PopHandler if depth == 0 => return Some(at),
+            Instr::PopHandler => depth -= 1,
+            _ => {}
+        }
+    }
+    None
 }
 
 /// True if compiling `bf` to native (T1/T2) would break a closure's non-local

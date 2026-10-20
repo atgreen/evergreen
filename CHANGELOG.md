@@ -41,6 +41,14 @@
 
 ### Performance
 
+- On x86-64 Linux, a function whose `LAMBDA` makes a `RETURN-FROM`, `RETURN`
+  or `GO` to a block or tag that the `LAMBDA` itself establishes, such as
+  `(mapcar (lambda (x) (dolist (y x) (when (p y) (call (lambda () (return y))))))
+  list)`, is now compiled natively and can reach the optimizing tier. Only a
+  closure that exits past the `LAMBDA` it belongs to still keeps its creator
+  in the interpreter. A function also no longer establishes its implicit
+  block when its only `RETURN-FROM` forms name other blocks
+  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
 - `COUNT`, `COUNT-IF` and `COUNT-IF-NOT` compile to bytecode instead of being
   tree-walked on every call, and `FIND`, `FIND-IF`, `FIND-IF-NOT` and the
   `COUNT` family no longer build a closure for each call. Counting over a

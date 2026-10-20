@@ -335,3 +335,119 @@ fn natively_created_closure_keeps_inherited_nonlocal_exits() {
     );
     assert!(out.contains(expected), "default: {out}");
 }
+
+/// A creator whose closures' named exits all land on a block or tag those
+/// closures establish themselves is admitted to native code; one whose closure
+/// exits past it still declines with the logged reason, even beside a
+/// same-named block that does not enclose the exiting closure (bliss-uebgs).
+#[test]
+fn closure_internal_named_exits_admit_creator() {
+    let definitions = r#"
+      (defun ie-call (f) (funcall f))
+      (defun ie-return (l)
+        (mapcar (lambda (x) (block inner (ie-call (lambda () (return-from inner (* x 10)))) :wrong))
+                l))
+      (defun ie-go (l)
+        (mapcar (lambda (x)
+                  (let ((r :none))
+                    (tagbody
+                       (ie-call (lambda () (go out)))
+                       (setq r :fell-through)
+                       (go done)
+                     out
+                       (setq r (list :went x))
+                     done)
+                    r))
+                l))
+      (defun ie-dolist (l)
+        (mapcar (lambda (x) (dolist (y x :none) (when (eql y 3) (ie-call (lambda () (return y))))))
+                l))
+      (defun ie-deep (l)
+        (mapcar (lambda (x)
+                  (block b (ie-call (lambda () (ie-call (lambda () (return-from b (list :deep x))))))))
+                l))
+      (defun fe-own (l)
+        (block b
+          (mapcar (lambda (x) (if (eql x 3) (ie-call (lambda () (return-from b :escaped))) x)) l)))
+      (defun fe-shadow (l)
+        (block b
+          (mapcar (lambda (x)
+                    (block b nil)
+                    (if (eql x 3) (ie-call (lambda () (return-from b :outer))) x))
+                  l)))
+      (defun fe-shadow-deep (l)
+        (block b
+          (mapcar (lambda (x)
+                    (block b nil)
+                    (if (eql x 3) (ie-call (lambda () (ie-call (lambda () (return-from b :deep))))) x))
+                  l)))
+    "#;
+    let probe = r#"
+      (let ((r nil))
+        (dotimes (i 200)
+          (setq r (list (ie-return (list 1 2)) (ie-go (list 1 2)) (ie-dolist (list (list 1 3) (list 4)))
+                        (ie-deep (list 1 2)) (fe-own (list 1 3 2)) (fe-shadow (list 1 3 2))
+                        (fe-shadow-deep (list 1 3 2)) (fe-shadow (list 1 2)))))
+        (egcl-ext:gc)
+        (format t "RESULTS=~S~%" r))
+      (format t "TIERS=~S~%"
+              (mapcar #'egcl-ext:function-tier
+                      '(ie-return ie-go ie-dolist ie-deep fe-own fe-shadow fe-shadow-deep)))
+    "#;
+    let results = "RESULTS=((10 20) ((:WENT 1) (:WENT 2)) (3 :NONE) ((:DEEP 1) (:DEEP 2)) :ESCAPED :OUTER :DEEP (1 2))";
+    for tier in ["t0", "t1", "t2"] {
+        let out = run_case(
+            &format!("internal-exit-{tier}"),
+            definitions,
+            probe,
+            &[("EGCL_FORCE_TIER", tier)],
+        );
+        assert!(out.contains(results), "{tier}: {out}");
+    }
+    let dir =
+        std::env::temp_dir().join(format!("egcl-native-internal-exit-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("factory.lisp");
+    fs::write(&source, definitions).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_egcl"))
+        .env_remove("EGCL_FORCE_TIER")
+        .env("EGCL_T0_T1_THRESHOLD", "5")
+        .env("EGCL_T2_THRESHOLD", "20")
+        .env("EGCL_T2_THREADS", "1")
+        .env("EGCL_T2_LOG", "-")
+        .env("EGCL_LOG", "compile=trace")
+        .args([
+            "--no-init",
+            "--eval",
+            &format!("(load {source:?})\n{probe}"),
+        ])
+        .output()
+        .unwrap();
+    let _ = fs::remove_dir_all(&dir);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert!(stdout.contains(results), "{stdout}");
+    if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
+        for name in ["IE-RETURN", "IE-GO", "IE-DOLIST", "IE-DEEP"] {
+            assert!(
+                stderr.contains(&format!(
+                    "{name}: optimized worker result installed with mapped T2 ABI"
+                )),
+                "{name} must install mapped T2: {stderr}"
+            );
+        }
+        for name in ["FE-OWN", "FE-SHADOW", "FE-SHADOW-DEEP"] {
+            assert!(
+                stderr.contains(&format!(
+                    "{name}: declined: a closure it creates needs captured block/tag control"
+                )),
+                "{name} must decline with the logged reason: {stderr}"
+            );
+        }
+        assert!(
+            stdout.contains("TIERS=(2 2 2 2 0 0 0)"),
+            "{stdout}\n{stderr}"
+        );
+    }
+}
