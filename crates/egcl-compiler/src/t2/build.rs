@@ -3508,10 +3508,11 @@ fn branch_proves_non_nil(
                 let data = f.inst(term);
                 if data.opcode == Opcode::Brif && data.targets.len() == 2 {
                     let (yes, no) = (data.targets[0].block, data.targets[1].block);
-                    if yes != no && (yes == current || no == current) {
-                        if tests(data.args[0], yes == current) {
-                            return true;
-                        }
+                    if yes != no
+                        && (yes == current || no == current)
+                        && tests(data.args[0], yes == current)
+                    {
+                        return true;
                     }
                 }
             }
