@@ -84,7 +84,7 @@
   structure or class accessor -- is now compiled by the optimizing T2 tier
   instead of stopping at T1. It still looks the function up on every call, so
   redefining it takes effect as before
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#460](https://github.com/atgreen/evergreen/pull/460)).
 
 ### Fixed
 
