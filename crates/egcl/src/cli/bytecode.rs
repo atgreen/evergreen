@@ -2132,7 +2132,8 @@ fn bail_trace_on() -> bool {
 /// there is no cost unless EGCL_BAIL_TRACE is set. Returns `Bail` for
 /// `return Err(record_bail(...))` at bail sites.
 fn record_bail(reason: impl FnOnce() -> String) -> Bail {
-    if bail_trace_on() {
+    let histogram = bail_trace_on();
+    if histogram || bail_reason_wanted() {
         let reason = reason();
         // Keep the FIRST reason recorded since the last reset, not the last.
         // A bail propagates outwards and each enclosing form records its own, so
@@ -2145,13 +2146,22 @@ fn record_bail(reason: impl FnOnce() -> String) -> Bail {
                 *last = Some(reason.clone());
             }
         });
-        BAIL_LOG.with(|m| *m.borrow_mut().entry(reason).or_insert(0) += 1);
+        if histogram {
+            BAIL_LOG.with(|m| *m.borrow_mut().entry(reason).or_insert(0) += 1);
+        }
     }
     Bail
 }
 
+/// The first bail reason is also the reason a hot DEFUN stays tree-walked, so
+/// keep it when EGCL_T2_LOG or the compile trace will print that decline
+/// (bliss-75b8v). Both checks are cached, and bails are compile-time only.
+fn bail_reason_wanted() -> bool {
+    t2_log_target().is_some() || egcl_rt::log::enabled("compile", egcl_rt::log::TRACE)
+}
+
 fn reset_last_bail_reason() {
-    if bail_trace_on() {
+    if bail_trace_on() || bail_reason_wanted() {
         LAST_BAIL_REASON.with(|last| *last.borrow_mut() = None);
     }
 }
@@ -7811,7 +7821,9 @@ fn destructure_pattern(
                     mode = 2;
                     continue;
                 }
-                "&KEY" | "&AUX" | "&WHOLE" | "&ENVIRONMENT" => return Err(Bail),
+                keyword @ ("&KEY" | "&AUX" | "&WHOLE" | "&ENVIRONMENT") => {
+                    return Err(record_bail(|| format!("destructuring-bind:{keyword}")));
+                }
                 _ => {}
             }
         }
@@ -13442,6 +13454,24 @@ fn native_would_lose_captured_control(bf: &BytecodeFunction) -> bool {
     false
 }
 
+/// A function the bytecode compiler cannot lower stays in the tree-walker, so
+/// it never reaches T1 or T2 and used to be absent from EGCL_T2_LOG
+/// (bliss-75b8v). Name the construct the lowerer refused, in both the compile
+/// trace and the T2 log. Callers log once per definition.
+pub(super) fn log_not_compiled(name: &str, reason: &str) {
+    let compile_trace = egcl_rt::log::enabled("compile", egcl_rt::log::TRACE);
+    if !compile_trace && t2_log_target().is_none() {
+        return;
+    }
+    let name = display_fn_name(name);
+    if compile_trace {
+        eprintln!("[compile] [T0] {name}: not compiled to bytecode ({reason}); retain tree-walker");
+    }
+    t2_log_write(format_args!(
+        "{name}: not compiled to bytecode ({reason}); T1 and T2 need bytecode"
+    ));
+}
+
 /// Reset lazy-compile bookkeeping for a (re)defined DEFUN: drop any stale
 /// registry entry and the declined flag so the new body gets a fresh chance.
 pub(super) fn clear_lazy_state(sym: u32) {
@@ -13604,6 +13634,7 @@ fn compile_defun(
                 compile(true).map(Arc::new)
             }
         };
+    let load_time_value = compiled.as_deref().is_some_and(contains_load_time_values);
     match compiled.filter(|function| !contains_load_time_values(function)) {
         Some(bf) => publish_bytecode(sym, bf, Some(generation), *function) || is_registered(sym),
         None => {
@@ -13613,6 +13644,12 @@ fn compile_defun(
                 return registered;
             }
             trace_named(name, "lazy compile bailed", last_bail_reason().as_deref());
+            let reason = if load_time_value {
+                Some("LOAD-TIME-VALUE needs eager evaluation".to_string())
+            } else {
+                last_bail_reason()
+            };
+            log_not_compiled(name, reason.as_deref().unwrap_or("bytecode lowering bailed; no reason recorded"));
             LAZY_DECLINED.with(|s| s.borrow_mut().insert(sym));
             false
         }
@@ -19207,7 +19244,7 @@ extern "C" fn c2i_deopt_t2_inline(
     let code = own.as_deref().map(std::ptr::from_ref)
         .unwrap_or_else(|| ACTIVE_NATIVE_CODE.with(|slot| slot.get()));
     // SAFETY: own or the active native entry retains this exact code version.
-    note_native_deopt(sym, unsafe { code.as_ref() });
+    note_native_deopt(sym, unsafe { code.as_ref() }, Some(scopes[0].bcp));
     let env_ptr = NATIVE_ENV.with(|e| e.get());
     if env_ptr.is_null() {
         let stack = egcl_rt::current_stack();
@@ -21497,7 +21534,9 @@ impl Drop for BlockScopeGuard {
 /// Shared with the inline-resume adapter, which handles the deopt without
 /// returning to run_native (bliss-w6aki). An obsolete activation may still
 /// fail a guard; that counts, but must not retire the replacement's code.
-fn note_native_deopt(sym: u32, code: Option<&NativeCode>) {
+/// `guard_bcp` is the failing guard's position in the function's own bytecode
+/// when the caller knows it; it is used only to name the guard in EGCL_T2_LOG.
+fn note_native_deopt(sym: u32, code: Option<&NativeCode>, guard_bcp: Option<u32>) {
     DEOPT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     trace("native speculative deopt → interpreter");
     // An obsolete activation may still fail a guard. Resume its original
@@ -21565,9 +21604,8 @@ fn note_native_deopt(sym: u32, code: Option<&NativeCode>) {
             n as u64,
         );
         if t2_log_target().is_some() {
-            let nm = registry_get(sym)
-                .map(|b| b.name.clone())
-                .unwrap_or_default();
+            let current = registry_get(sym);
+            let nm = current.as_ref().map(|b| display_fn_name(&b.name).to_string()).unwrap_or_default();
             t2_log_write(format_args!(
                 "{nm}: native guard deopt #{n} => resuming interpreted{}",
                 if phase_change {
@@ -21578,6 +21616,31 @@ fn note_native_deopt(sym: u32, code: Option<&NativeCode>) {
                     ""
                 }
             ));
+            // The blacklist is permanent and later dispatches decline T1 without
+            // a word, so summarize it once with the failing guard: where T0
+            // resumed and which speculations the deopt disproved (bliss-75b8v).
+            if threshold_hit && !phase_change {
+                let resumed = match (current.as_deref(), guard_bcp) {
+                    (Some(body), Some(bcp)) => describe_guard(body, bcp),
+                    _ => "an unrecorded position".to_string(),
+                };
+                let speculated = current.as_deref().map(|body| {
+                    LAST_FAILED_SPECULATION.with(|m| {
+                        m.borrow().get(&sym).map(|failed| {
+                            failed.iter()
+                                .map(|&(bcp, kind, _)| format!("{kind:?} at {}", describe_guard(body, bcp)))
+                                .collect::<Vec<_>>()
+                                .join("; ")
+                        })
+                    })
+                }).flatten().filter(|text| !text.is_empty())
+                    .map(|text| format!("speculated {text}"))
+                    .unwrap_or_else(|| "no arithmetic speculation recorded".to_string());
+                t2_log_write(format_args!(
+                    "{nm}: blacklisted at T0 after {n} native guard deopts \
+                     (guard resumed T0 at {resumed}; {speculated}); T1 and T2 are not retried"
+                ));
+            }
         }
         if phase_change {
             // The current T2 assumptions are stale, but native execution itself
@@ -21609,6 +21672,20 @@ fn note_native_deopt(sym: u32, code: Option<&NativeCode>) {
             }
             trace("t1 speculation blacklisted → staying T0");
         }
+    }
+}
+
+/// Name a guard site for the deopt log: its bytecode position, instruction
+/// and, for a call, the callee.
+fn describe_guard(body: &BytecodeFunction, bcp: u32) -> String {
+    match body.code.get(bcp as usize) {
+        Some(Instr::CallNamed { sym, .. }) => format!("bytecode {bcp}, CallNamed {}", sym_label(*sym)),
+        Some(op) => {
+            let full = format!("{op:?}");
+            let kind = full.find(['(', ' ', '{']).map_or(full.as_str(), |i| &full[..i]);
+            format!("bytecode {bcp}, {kind}")
+        }
+        None => format!("bytecode {bcp}"),
     }
 }
 
@@ -21828,7 +21905,12 @@ fn run_native_callable(
     // kept as a fallback when no resume point was recorded; purity of every call
     // makes re-running from the top observably equivalent.)
     if deopt {
-        note_native_deopt(sym, Some(nc));
+        let guard_bcp = match &resume {
+            Some(NativeDeoptResume::Single { bcp, .. }) => Some(*bcp),
+            Some(NativeDeoptResume::Inlined { scopes, .. }) => scopes.first().map(|scope| scope.bcp),
+            None => None,
+        };
+        note_native_deopt(sym, Some(nc), guard_bcp);
         let entry = bf.ok_or_else(|| {
             EgclError::Internal("deopt: native code has no bytecode body".into())
         })?;
@@ -23693,6 +23775,12 @@ fn try_promote_to_t1_with_speculation(sym: u32, allow_speculation: bool) -> Opti
         egcl_rt::blog!("compile", egcl_rt::log::TRACE,
             "[T1] {}: declined: a closure it creates needs captured block/tag control; retain interpreter",
             display_fn_name(&bf.name));
+        // Like the mapped decline below, this is also why T2 never sees it.
+        if t2_log_target().is_some() {
+            t2_log_write(format_args!(
+                "{}: T1 declined (a closure it creates needs captured block/tag control); T2 needs an installed T1",
+                display_fn_name(&bf.name)));
+        }
         return None;
     }
     // Prefer the published native ABI for the shapes whose exact frame and
@@ -27216,7 +27304,7 @@ mod active_bytecode_root_tests {
         assert!(!Rc::ptr_eq(&old, &replacement));
         assert!(native_for_dispatch(a, None, u32::MAX, &body).is_none());
         assert!(PROMOTED_FRESH.with(|set| set.borrow().contains(&b)));
-        note_native_deopt(b, Some(&old));
+        note_native_deopt(b, Some(&old), None);
         assert!(PROMOTED_FRESH.with(|set| set.borrow().contains(&b)),
             "obsolete shared code must not decay the new version's feedback");
         assert_eq!(DEOPT_COUNTS.with(|counts| counts.borrow().get(&b).copied()), Some(0));

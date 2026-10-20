@@ -50,7 +50,7 @@ impl Drop for RestoreNativeFrame {
     }
 }
 
-fn note_segment_deopt(code: &TransferCode) {
+fn note_segment_deopt(code: &TransferCode, guard_bcp: u32) {
     let count = code.deopts.get().saturating_add(1);
     code.deopts.set(count);
     let installed = code.installed_symbol.and_then(|symbol| {
@@ -71,7 +71,7 @@ fn note_segment_deopt(code: &TransferCode) {
     // release the registry borrow before policy code retires or replaces it.
     if let Some((symbol, native)) = &installed {
         if !native.is_t2 {
-            note_native_deopt(*symbol, Some(native));
+            note_native_deopt(*symbol, Some(native), Some(guard_bcp));
             return;
         }
     }
@@ -1444,7 +1444,7 @@ unsafe fn resume_native_child_guard(
     )
     .map_err(|message| EgclError::Internal(message.into()))?;
     unsafe { retain_self_scope_callables(code, &scopes)?; }
-    note_segment_deopt(code);
+    note_segment_deopt(code, bcp);
     if let Some(arguments) = arguments.as_ref() {
         state
             .as_mut()
@@ -1715,7 +1715,7 @@ unsafe fn resume_guard_with_arguments(
         )
         .map_err(|message| EgclError::Internal(message.into()))?;
         unsafe { retain_self_scope_callables(code, &scopes)?; }
-        note_segment_deopt(code);
+        note_segment_deopt(code, bcp);
         // Every stream word is now in scanned slots. There is no mutable
         // CaptureContext reference or RefCell borrow across resumed Lisp.
         egcl_rt::rooted!(state = Some(unsafe {

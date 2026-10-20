@@ -469,13 +469,13 @@ fn disproved_cold_double_guess_recompiles_to_t2() {
     assert!(
         !trace
             .lines()
-            .any(|line| line.contains("::S-DOUBLE: native guard") && line.contains("blacklist")),
+            .any(|line| line.starts_with("[T2] S-DOUBLE:") && line.contains("blacklist")),
         "a disproved cold guess must not blacklist:\n{trace}"
     );
     assert!(
         trace
             .lines()
-            .any(|line| line.contains("::S-DOUBLE: native guard")
+            .any(|line| line.contains("[T2] S-DOUBLE: native guard")
                 && line.contains("supported numeric phase change => generic T1 + recompile")),
         "the cold-guess failure recompiles:\n{trace}"
     );
@@ -521,13 +521,13 @@ fn cold_branch_double_recompiles_instead_of_blacklisting() {
         ],
     );
     assert!(
-        trace.contains("::BR: native guard deopt #3 => resuming interpreted (threshold hit: supported numeric phase change"),
+        trace.contains("[T2] BR: native guard deopt #3 => resuming interpreted (threshold hit: supported numeric phase change"),
         "the cold-branch failure recompiles:\n{trace}"
     );
     assert!(
         !trace
             .lines()
-            .any(|line| line.contains("::BR: native guard") && line.contains("blacklist")),
+            .any(|line| line.starts_with("[T2] BR:") && line.contains("blacklist")),
         "BR must not be blacklisted:\n{trace}"
     );
     let fields: Vec<&str> = out.split_whitespace().collect();
