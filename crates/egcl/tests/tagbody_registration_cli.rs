@@ -112,8 +112,13 @@ fn portable_macro_hidden_go_keeps_its_tag() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// Each case is (name, body, expected result, keeps NamedTags). A tagbody
+/// keeps its NamedTags when a closure it creates GOes to one of its tags or
+/// can run a tree-walked body. A RESTART-CASE whose clauses do not name the
+/// tagbody, and a HANDLER-CASE whose clause GOes to it as inline code, need
+/// no registration (bliss-1c3iw) and compile natively at forced T1 and T2.
 #[test]
-fn captured_tags_preserve_lexical_scope_and_opaque_bodies() {
+fn captured_tags_preserve_lexical_scope_and_inline_clauses_need_none() {
     let cases = [
         (
             "shadowed",
@@ -125,6 +130,7 @@ fn captured_tags_preserve_lexical_scope_and_opaque_bodies() {
            done)
           n)"#,
             "3",
+            true,
         ),
         (
             "handler",
@@ -134,6 +140,7 @@ fn captured_tags_preserve_lexical_scope_and_opaque_bodies() {
           (return-from control-handler :bad)
          done) :ok"#,
             ":OK",
+            true,
         ),
         (
             "restart",
@@ -141,6 +148,7 @@ fn captured_tags_preserve_lexical_scope_and_opaque_bodies() {
           (restart-case (invoke-restart 'finish) (finish () :ok))
          done) :ok"#,
             ":OK",
+            false,
         ),
         (
             "handler-case",
@@ -149,6 +157,7 @@ fn captured_tags_preserve_lexical_scope_and_opaque_bodies() {
           (return-from control-handler-case :bad)
          done) :ok"#,
             ":OK",
+            false,
         ),
         (
             "labels",
@@ -159,22 +168,23 @@ fn captured_tags_preserve_lexical_scope_and_opaque_bodies() {
             finally (incf n 10))
           n)"#,
             "11",
+            true,
         ),
     ];
     let mut program = String::from("(defmacro hidden-go (tag) `(lambda () (go ,tag)))");
-    for (name, body, expected) in cases {
+    for (name, body, expected, _) in cases {
         program.push_str(&format!(
             "(defun control-{name} () {body})
-             (disassemble #'control-{name})
              (dotimes (i 32)
                (unless (equal (control-{name}) '{expected})
                  (error \"Control result changed: {name}\")))
+             (disassemble #'control-{name})
              (format t \"RESULT:{name}:~S~%\" (control-{name}))"
         ));
     }
     for tier in ["t0", "t1", "t2"] {
         let stdout = run(&program, tier);
-        for (name, _, expected) in cases {
+        for (name, _, expected, keeps_tags) in cases {
             assert!(
                 stdout.contains(&format!("RESULT:{name}:{expected}")),
                 "{tier}: {stdout}"
@@ -186,7 +196,16 @@ fn captured_tags_preserve_lexical_scope_and_opaque_bodies() {
                 .split(&format!("RESULT:{name}:"))
                 .next()
                 .unwrap();
-            assert!(section.contains("NamedTag"), "{tier}: {section}");
+            assert_eq!(
+                section.contains("NamedTag"),
+                keeps_tags,
+                "{tier}: {section}"
+            );
+            #[cfg(target_arch = "x86_64")]
+            if !keeps_tags {
+                let header = format!("; {} —", tier.to_uppercase());
+                assert!(section.contains(&header), "{tier}: {section}");
+            }
         }
     }
 }

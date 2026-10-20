@@ -4100,30 +4100,44 @@ impl<'e> Lowerer<'e> {
 
     // ── Non-local control flow lowering (nmq.4) ────────────────────
 
-    /// Whether an instruction could capture or use a control scope from outside
-    /// the function that established it. Local transfers already carry scope IDs
-    /// and do not need named registrations on the shared control-token stack.
+    /// Whether code emitted from `start` on could reach one of `blocks` or
+    /// `tags` BY NAME from outside this activation. That is the only way a
+    /// registration on `env.block_stack`/`env.tag_stack` is ever observed: a
+    /// local transfer carries its scope ID, and a function entry starts from
+    /// its own captured or empty stacks, so only a closure or restart clause
+    /// created in this range (which snapshots the stacks) or tree-walked code
+    /// run here can look a name up.
     ///
     /// Deliberately conservative — it answers "could", not "does" — and it is
-    /// applied to EMITTED code, so a closure a macro produced is included.
-    fn instr_may_capture_control(instr: &Instr) -> bool {
-        matches!(
-            instr,
-            // Closure construction, in each of the three shapes the lowerer emits:
-            // a nested bytecode body, an env-capturing one, and the opportunistic
-            // path that hands the lambda form back to the interpreter.
-            Instr::MakeClosure { .. }
+    /// applied to EMITTED code, so a closure a macro produced is included. It
+    /// looks inside the separately lowered bodies rather than treating every
+    /// one as opaque: ASSERT and IGNORE-ERRORS put a RESTART-CASE or
+    /// HANDLER-CASE in a DEFUN's implicit block, and registering that block
+    /// cost every call three allocations and kept the function off native code
+    /// although nothing could name it (bliss-1c3iw). HANDLER-CASE clauses are
+    /// inline code with local transfers; HANDLER-BIND handlers are closures
+    /// created by a `MakeClosure` that this scan already inspects.
+    fn code_may_reach_control(&self, start: usize, blocks: &[&str], tags: &[&str]) -> bool {
+        self.code[start..].iter().any(|instr| match instr {
+            Instr::MakeClosure { func, .. } => self
+                .nested_functions
+                .get(*func as usize)
+                .is_none_or(|nested| bf_may_reach_control(nested, blocks, tags)),
+            Instr::PushRestartCase { rc, .. } => {
+                self.restart_cases.get(*rc as usize).is_none_or(|info| {
+                    info.restarts
+                        .iter()
+                        .any(|restart| bf_may_reach_control(&restart.function, blocks, tags))
+                })
+            }
+            // Tree-walked forms are not analysed, and a named exit already in
+            // this body keeps the conservative registration it always had.
+            Instr::EvalHost(_)
             | Instr::MakeClosureEnv(_)
-            | Instr::EvalHost(_)
-            // A named return/go already present in this body.
             | Instr::ReturnFromNamed { .. }
-            | Instr::GoNamed { .. }
-            // Separately-lowered bodies (handler/restart clauses) are not part
-            // of this instruction stream, so treat establishing one as opaque.
-            | Instr::PushHandlerCase { .. }
-            | Instr::PushHandlerBind { .. }
-            | Instr::PushRestartCase { .. }
-        )
+            | Instr::GoNamed { .. } => true,
+            _ => false,
+        })
     }
 
     fn lower_block(&mut self, rest: EgclVal) -> LowerResult<()> {
@@ -4146,16 +4160,14 @@ impl<'e> Lowerer<'e> {
         let push_at = self.code.len() - 1;
         self.block_scope.push((name, block_id));
         self.lower_progn(body)?; // body value on stack (+1)
-        self.block_scope.pop();
+        let (name, _) = self.block_scope.pop().expect("this block's scope");
         self.emit(Instr::PopHandler);
         let after = self.code.len() as u32;
         // Decide registration from the code actually emitted, not from the
         // source form: a closure introduced by a macro expansion is invisible
         // to a syntactic pre-scan (the trap that made bliss-ptv4 bail), while
         // the instruction stream is post-expansion and therefore complete.
-        let register = self.code[push_at + 1..]
-            .iter()
-            .any(Self::instr_may_capture_control);
+        let register = self.code_may_reach_control(push_at + 1, &[&name], &[]);
         if let Instr::PushBlock {
             resume_bcp,
             register: reg,
@@ -4344,9 +4356,8 @@ impl<'e> Lowerer<'e> {
         }
 
         let scope = self.tag_scope.pop().unwrap();
-        let may_capture = self.code[body_start..]
-            .iter()
-            .any(Self::instr_may_capture_control);
+        let tag_names: Vec<&str> = tag_order.iter().map(String::as_str).collect();
+        let may_capture = self.code_may_reach_control(body_start, &[], &tag_names);
         if scoped {
             self.emit(Instr::PopHandler);
         }
@@ -13525,6 +13536,29 @@ fn handler_scope_end(code: &[Instr], push: usize) -> Option<usize> {
         }
     }
     None
+}
+
+/// True if `bf` (a closure or restart-clause body created in the scope of
+/// `blocks`/`tags`) or anything it creates could exit to one of them by name.
+/// Tree-walked forms are not analysed and count as reaching. Used by the
+/// lowerer to decide which blocks and tags must be registered (bliss-1c3iw).
+fn bf_may_reach_control(bf: &BytecodeFunction, blocks: &[&str], tags: &[&str]) -> bool {
+    bf.code.iter().any(|instr| match instr {
+        Instr::ReturnFromNamed { name_idx } => {
+            blocks.contains(&bf.names[*name_idx as usize].as_str())
+        }
+        Instr::GoNamed { name_idx } => tags.contains(&bf.names[*name_idx as usize].as_str()),
+        Instr::EvalHost(_) | Instr::MakeClosureEnv(_) => true,
+        _ => false,
+    }) || bf
+        .nested_functions
+        .iter()
+        .any(|nested| bf_may_reach_control(nested, blocks, tags))
+        || bf
+            .restart_cases
+            .iter()
+            .flat_map(|info| &info.restarts)
+            .any(|restart| bf_may_reach_control(&restart.function, blocks, tags))
 }
 
 /// True if compiling `bf` to native (T1/T2) would break a closure's non-local
