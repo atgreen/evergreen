@@ -6780,11 +6780,11 @@ impl<'e> Lowerer<'e> {
         for i in 0..defs.len() {
             let d = defs[i];
             if !d.is_cons() {
-                return Err(Bail);
+                return Err(record_bail(|| "flet:malformed-definition".to_string()));
             }
             let (name_form, _d_rest) = cp(d);
             if !name_form.is_symbol() {
-                return Err(Bail);
+                return Err(record_bail(|| "flet:non-symbol-name".to_string()));
             }
             // Capture the name before the allocating gensym below.
             let name = sym_name(name_form);
@@ -6852,7 +6852,9 @@ impl<'e> Lowerer<'e> {
                 .any(|u| enclosing.contains(u) && !params.contains(u) && !local_names.contains(u))
         });
         if is_capturing {
-            return Err(Bail);
+            return Err(record_bail(|| {
+                "flet:captures-enclosing-lexical".to_string()
+            }));
         }
 
         // If any local function is referenced as a VALUE (`#'localfn`) — in the
@@ -6865,7 +6867,7 @@ impl<'e> Lowerer<'e> {
                 references_local_fn_value(fbody, &local_names)
             })
         {
-            return Err(Bail);
+            return Err(record_bail(|| "flet:function-as-value".to_string()));
         }
 
         let saved_local_fns = self.local_fns.clone();
@@ -6885,7 +6887,7 @@ impl<'e> Lowerer<'e> {
         // from the rooted `defs` each iteration (compilation allocates).
         for i in 0..parsed.len() {
             let sym = parsed[i].1;
-            let (params_form, fbody) = flet_def_forms(defs[i]);
+            let (params_form, fbody) = flet_def_block_forms(defs[i]);
             let bf = compile_local_function(
                 sym,
                 &self.inline_policies,
@@ -6896,7 +6898,7 @@ impl<'e> Lowerer<'e> {
                 &body_local_fns,
                 self.portable,
             )
-            .ok_or(Bail)?;
+            .ok_or_else(|| record_bail(|| "flet:local-function-body".to_string()))?;
             // Give this noncapturing lexical definition the same source-free
             // callable identity as a loaded bytecode function. Native cold
             // calls and deoptimization must retain an object, not re-resolve
@@ -7045,7 +7047,7 @@ impl<'e> Lowerer<'e> {
         // Build each closure and store it in the child frame. Re-derive
         // params/fbody from the rooted `defs` each iteration (compilation allocates).
         for i in 0..parsed.len() {
-            let (params_form, fbody) = flet_def_forms(defs[i]);
+            let (params_form, fbody) = flet_def_block_forms(defs[i]);
             let bf = compile_capturing_local(
                 params_form,
                 fbody,
@@ -7059,7 +7061,7 @@ impl<'e> Lowerer<'e> {
                 self.portable,
                 self.loop_finish_tag.as_deref(),
             )
-            .ok_or(Bail)?;
+            .ok_or_else(|| record_bail(|| "flet:capturing-local-body".to_string()))?;
             let idx = self.nested_functions.len();
             if idx > u32::MAX as usize {
                 return Err(Bail);
@@ -7089,6 +7091,56 @@ impl<'e> Lowerer<'e> {
 fn flet_def_forms(def: EgclVal) -> (EgclVal, EgclVal) {
     let (_, d_rest) = cp(def);
     cp(d_rest)
+}
+
+/// [`flet_def_forms`] for compilation: the body goes inside the local
+/// function's implicit block (CLHS 3.1.2.1.2.2), as the tree-walker's
+/// `eval_flet` does, so `(return-from NAME ...)` in it lowers like any other
+/// block exit instead of sending the whole FLET/LABELS to the tree-walker.
+/// Leading declarations and a docstring stay outside the block, where they
+/// still apply to the parameters. A `(setf foo)` function's block is `foo`.
+fn flet_def_block_forms(def: EgclVal) -> (EgclVal, EgclVal) {
+    let (name_form, _) = cp(def);
+    let (params_form, fbody) = flet_def_forms(def);
+    let block_name = if name_form.is_symbol() {
+        name_form
+    } else if name_form.is_cons() && cp(cp(name_form).1).0.is_symbol() {
+        cp(cp(name_form).1).0
+    } else {
+        return (params_form, fbody);
+    };
+    // BLOCK always exists, so a lookup that cannot allocate finds it.
+    let Some(block_sym) = egcl_rt::symbols::find_index("BLOCK").map(EgclVal::from_symbol_index)
+    else {
+        return (params_form, fbody);
+    };
+    let is_declaration = |form: EgclVal| {
+        form.is_cons() && {
+            let head = cp(form).0;
+            head.is_symbol() && sym_bare_name_rc(head).as_ref() == "DECLARE"
+        }
+    };
+    let mut leading = Vec::new();
+    let mut forms = fbody;
+    while forms.is_cons() {
+        let (form, tail) = cp(forms);
+        if !(is_declaration(form) || (form.is_string() && tail.is_cons())) {
+            break;
+        }
+        leading.push(form);
+        forms = tail;
+    }
+    // Consing can collect; every value read from the definition is rooted.
+    egcl_rt::rooted!(params = params_form);
+    egcl_rt::rooted!(forms = forms);
+    egcl_rt::rooted!(leading = leading);
+    egcl_rt::rooted!(body = arena_cons(block_name, *forms));
+    *body = arena_cons(block_sym, *body);
+    *body = arena_cons(*body, NIL);
+    for i in (0..leading.len()).rev() {
+        *body = arena_cons(leading[i], *body);
+    }
+    (*params, *body)
 }
 
 /// Compile a local (flet/labels) function body to a [`BytecodeFunction`],
