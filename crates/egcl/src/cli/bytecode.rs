@@ -21657,7 +21657,7 @@ fn note_native_deopt(sym: u32, code: Option<&NativeCode>, guard_bcp: Option<u32>
                     (Some(body), Some(bcp)) => describe_guard(body, bcp),
                     _ => "an unrecorded position".to_string(),
                 };
-                let speculated = current.as_deref().map(|body| {
+                let speculated = current.as_deref().and_then(|body| {
                     LAST_FAILED_SPECULATION.with(|m| {
                         m.borrow().get(&sym).map(|failed| {
                             failed.iter()
@@ -21666,7 +21666,7 @@ fn note_native_deopt(sym: u32, code: Option<&NativeCode>, guard_bcp: Option<u32>
                                 .join("; ")
                         })
                     })
-                }).flatten().filter(|text| !text.is_empty())
+                }).filter(|text| !text.is_empty())
                     .map(|text| format!("speculated {text}"))
                     .unwrap_or_else(|| "no arithmetic speculation recorded".to_string());
                 t2_log_write(format_args!(
