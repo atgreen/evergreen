@@ -1386,6 +1386,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#inflate" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        egcl-ext:inflate
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#crypto-block-primitives" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2726,6 +2737,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#inflate" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        egcl-ext:inflate
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#crypto-block-primitives" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -3079,6 +3101,19 @@ vector.</p>
 <h3 id="crc32"><code>egcl-ext:crc32</code><a class="headerlink" href="#crc32" title="Permanent link">&para;</a></h3>
 <p><strong>Function</strong> <code>(egcl-ext:crc32 octets)</code> → integer</p>
 <p>Returns the CRC-32 of <code>octets</code>, using the polynomial of ZIP, gzip and PNG.</p>
+<h3 id="inflate"><code>egcl-ext:inflate</code><a class="headerlink" href="#inflate" title="Permanent link">&para;</a></h3>
+<p><strong>Function</strong> <code>(egcl-ext:inflate octets &amp;optional (format :deflate))</code> → octet vector</p>
+<p>Decompresses the whole of the sequence <code>octets</code> and returns the result as a
+fresh vector. <code>format</code> names the data's wrapper:</p>
+<ul>
+<li><code>:deflate</code>: a raw RFC 1951 deflate stream.</li>
+<li><code>:zlib</code>: an RFC 1950 stream, whose Adler-32 trailer is checked. Streams that
+  need a preset dictionary are not supported.</li>
+<li><code>:gzip</code>: one or more RFC 1952 members, whose CRC-32 and size trailers are
+  checked. Concatenated members decompress to the concatenation of their data.</li>
+</ul>
+<p>Corrupt or truncated data, or a failed check, signals <code>stream-error</code>. EGCL's
+port of chipz uses this function in place of its own inflate.</p>
 <h3 id="crypto-block-primitives">Block primitives<a class="headerlink" href="#crypto-block-primitives" title="Permanent link">&para;</a></h3>
 <p><strong>Function</strong> <code>(egcl-ext:crypto-aes-encrypt-block round-keys n-rounds in in-start out out-start)</code> → <code>nil</code></p>
 <p><strong>Function</strong> <code>(egcl-ext:crypto-aes-decrypt-block round-keys n-rounds in in-start out out-start)</code> → <code>nil</code></p>
