@@ -37,10 +37,8 @@ struct Entry {
     /// The archive member it is saved as: `lib/` and its SONAME or file name.
     member: String,
     source: Source,
-    /// The sealed memfd this entry was loaded from, kept for the life of the
-    /// process. Keeping it open also keeps its `/proc/self/fd/N` path unique:
-    /// glibc recognises an already-loaded object by the path it was opened
-    /// with, so a recycled descriptor number would alias another library.
+    /// The sealed memfd this entry was loaded from, so a second load reuses
+    /// it. The descriptor itself outlives the entry (see `MATERIALISED`).
     #[cfg(egcl_dlopen_embedded)]
     memfd: Option<Arc<std::os::fd::OwnedFd>>,
 }
@@ -66,6 +64,12 @@ impl Source {
 }
 
 static REGISTRY: Mutex<Vec<Entry>> = Mutex::new(Vec::new());
+
+/// Held across every embedded load and every change to the registry, taken
+/// before `REGISTRY`. A load addresses entries by position while it opens
+/// their dependencies, so no entry may be added, replaced or removed until
+/// it finishes.
+static LOAD_LOCK: Mutex<()> = Mutex::new(());
 
 /// The registry key for a designator containing a separator: absolute, the
 /// normalisation embedded files use. A bare name such as `libz.so.1` is kept
@@ -208,7 +212,7 @@ pub(crate) fn parse_elf_dynamic(bytes: &[u8]) -> Result<ElfDynamic, String> {
     let strtab_offset = loads
         .iter()
         .find(|(vaddr, _, filesz)| strtab >= *vaddr && strtab - vaddr < *filesz)
-        .map(|(vaddr, offset, _)| offset + (strtab - vaddr))
+        .and_then(|(vaddr, offset, _)| offset.checked_add(strtab - vaddr))
         .ok_or("DT_STRTAB is outside every loaded segment")?;
     let string = |index: u64| -> Result<String, String> {
         if index >= strsz {
@@ -309,6 +313,7 @@ pub fn embed(path: &str, aliases: &[String]) -> Result<String, EgclError> {
         memfd: None,
     };
     let primary = entry.names[0].clone();
+    let _serial = LOAD_LOCK.lock().unwrap();
     let mut registry = REGISTRY.lock().unwrap();
     // A name may designate one library only: whatever this one is called by,
     // an older embedding answering to any of the same names is replaced.
@@ -399,6 +404,7 @@ pub fn install_archive(
             }
         })
         .collect();
+    let _serial = LOAD_LOCK.lock().unwrap();
     *REGISTRY.lock().unwrap() = entries;
     Ok(())
 }
@@ -422,9 +428,20 @@ mod memfd_loader {
     const F_SEAL_GROW: libc::c_int = 0x0004;
     const F_SEAL_WRITE: libc::c_int = 0x0008;
 
-    /// Serialises embedded loads, so a library and its dependencies are
-    /// materialised once even when two threads ask at the same time.
-    static LOAD_LOCK: Mutex<()> = Mutex::new(());
+    /// Every memfd a library was loaded from, open for the life of the
+    /// process even after its entry is replaced. glibc recognises an
+    /// already-loaded object by the path it was opened with, so if a loaded
+    /// library's descriptor closed, the next memfd to reuse its number would
+    /// open as that library.
+    static MATERIALISED: Mutex<Vec<Arc<OwnedFd>>> = Mutex::new(Vec::new());
+
+    /// The start of glibc's `struct link_map`, as `RTLD_DI_LINKMAP` returns it.
+    #[repr(C)]
+    struct LinkMap {
+        l_addr: usize,
+        l_name: *const libc::c_char,
+    }
+    const RTLD_DI_LINKMAP: libc::c_int = 2;
 
     fn os_error(what: &str) -> EgclError {
         EgclError::FfiError(format!("{what}: {}", std::io::Error::last_os_error()))
@@ -579,9 +596,39 @@ mod memfd_loader {
     /// Open `designator` from the embedded set: `None` when it is not
     /// embedded, else a fresh `dlopen` reference.
     pub fn open(designator: &str) -> Option<Result<*mut libc::c_void, EgclError>> {
-        let index = find(&REGISTRY.lock().unwrap(), designator)?;
         let _serial = LOAD_LOCK.lock().unwrap();
+        let index = find(&REGISTRY.lock().unwrap(), designator)?;
         Some(open_entry(index, &mut Vec::new()))
+    }
+
+    /// True when `handle` was loaded from a file whose bytes are `entry`'s:
+    /// the library was loaded from disk and then embedded, as a build that
+    /// loads its libraries before embedding them does.
+    fn loaded_from_entry_file(handle: *mut libc::c_void, entry: &Entry) -> bool {
+        let mut map: *const LinkMap = std::ptr::null();
+        // SAFETY: RTLD_DI_LINKMAP stores a pointer to the handle's link_map,
+        // whose l_name is a NUL-terminated path while the handle is open.
+        let path = unsafe {
+            if libc::dlinfo(handle, RTLD_DI_LINKMAP, (&raw mut map).cast()) != 0 || map.is_null() {
+                return false;
+            }
+            std::ffi::CStr::from_ptr((*map).l_name)
+                .to_string_lossy()
+                .into_owned()
+        };
+        let Ok(loaded) = std::fs::canonicalize(&path) else {
+            return false;
+        };
+        let embedded_from = entry
+            .names
+            .iter()
+            .filter(|name| name.starts_with('/'))
+            .any(|name| std::fs::canonicalize(name).is_ok_and(|p| p == loaded));
+        embedded_from
+            && match (std::fs::read(&loaded), entry.source.read_all()) {
+                (Ok(on_disk), Ok(embedded)) => on_disk == embedded,
+                _ => false,
+            }
     }
 
     fn open_entry(index: usize, chain: &mut Vec<usize>) -> Result<*mut libc::c_void, EgclError> {
@@ -608,6 +655,11 @@ mod memfd_loader {
             let existing =
                 unsafe { libc::dlopen(name.as_ptr(), libc::RTLD_NOW | libc::RTLD_NOLOAD) };
             if !existing.is_null() {
+                if loaded_from_entry_file(existing, &entry) {
+                    // The same library, already loaded: that reference is the
+                    // answer, and the memfd is not needed.
+                    return Ok(existing);
+                }
                 unsafe { libc::dlclose(existing) };
                 return Err(EgclError::FfiError(format!(
                     "cannot load embedded '{soname}': a library with that SONAME is already \
@@ -629,9 +681,8 @@ mod memfd_loader {
             }
             let memfd = Arc::new(memfd);
             let handle = dlopen_path(&proc_path(&memfd), flags, &entry)?;
-            if let Some(slot) = REGISTRY.lock().unwrap().get_mut(index) {
-                slot.memfd = Some(memfd);
-            }
+            MATERIALISED.lock().unwrap().push(Arc::clone(&memfd));
+            REGISTRY.lock().unwrap()[index].memfd = Some(memfd);
             Ok(handle)
         })();
         chain.pop();
@@ -653,12 +704,14 @@ mod memfd_loader {
             return Ok(handle);
         }
         let message = dlerror_text();
-        let hint =
-            if message.contains("failed to map segment") || message.contains("Permission denied") {
-                " (the kernel may forbid executable memfds: see vm.memfd_noexec)"
-            } else {
-                ""
-            };
+        let hint = if !std::path::Path::new("/proc/self/fd").is_dir() {
+            " (/proc is not mounted, and embedded libraries are opened through /proc/self/fd)"
+        } else if message.contains("failed to map segment") || message.contains("Permission denied")
+        {
+            " (the kernel may forbid executable memfds: see vm.memfd_noexec)"
+        } else {
+            ""
+        };
         Err(EgclError::FfiError(format!(
             "cannot load embedded library '{}': {message}{hint}",
             entry.names[0]

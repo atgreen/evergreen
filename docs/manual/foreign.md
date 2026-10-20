@@ -162,10 +162,14 @@ that are not embedded, such as `libc.so.6`, are found by the usual search.
 
 The library must be built for the runtime's architecture, and the host must
 allow executable in-memory files: a kernel with `vm.memfd_noexec=2` refuses
-them. Because the loader keeps one library per SONAME, loading an embedded
-library is an error if a library with the same SONAME was already loaded from
-somewhere else. Other builds report an error when asked to load an embedded
-library. Embedding a library distributes it: check its license.
+them, and `/proc` must be mounted. Because the loader keeps one library per
+SONAME, loading an embedded library is an error if a library with the same
+SONAME was already loaded from somewhere else, unless that is the very file it
+was embedded from, unchanged: then the loaded library is returned, so a build
+can load a library before embedding it. Embedding needs an ELF host (Linux).
+Other Linux builds, such as the default static musl one, can embed and save
+libraries but report an error when asked to load one. Embedding a library
+distributes it: check its license.
 
 #### Replacing embedded libraries { #replacing-embedded-libraries }
 

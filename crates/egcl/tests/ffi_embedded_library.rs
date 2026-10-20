@@ -13,6 +13,16 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+/// The memfd loader needs the dlopen backend; a gnu build without
+/// `egcl-rt/c-ffi` uses the static ELF loader, which refuses embedded loads.
+fn dlopen_backend() -> bool {
+    let present = egcl_rt::image::RUNTIME_BUILD_FEATURES.contains(&"egcl-rt/c-ffi");
+    if !present {
+        eprintln!("skipping: built without egcl-rt/c-ffi");
+    }
+    present
+}
+
 fn egcl(binary: &Path, form: &str) -> Output {
     Command::new(binary)
         .env(
@@ -124,6 +134,9 @@ const CALL_MAIN: &str = r#"(progn
 
 #[test]
 fn saved_executable_loads_embedded_libraries_after_the_files_are_gone() {
+    if !dlopen_backend() {
+        return;
+    }
     let dir = scratch("run");
     let (dep, main) = build_libraries(&dir.join("lib"));
     let app = dir.join("app");
@@ -160,6 +173,9 @@ fn saved_executable_loads_embedded_libraries_after_the_files_are_gone() {
 
 #[test]
 fn an_embedded_library_altered_in_the_image_file_is_refused() {
+    if !dlopen_backend() {
+        return;
+    }
     let dir = scratch("tamper");
     let (dep, main) = build_libraries(&dir.join("lib"));
     let app = dir.join("app");
@@ -182,6 +198,9 @@ fn an_embedded_library_altered_in_the_image_file_is_refused() {
 
 #[test]
 fn a_soname_already_loaded_from_outside_the_image_is_reported() {
+    if !dlopen_backend() {
+        return;
+    }
     let dir = scratch("conflict");
     let (dep, _) = build_libraries(&dir.join("lib"));
     let elsewhere = dir.join("lib/copy-of-dep.so");
@@ -237,6 +256,9 @@ fn unzip_listing(app: &Path) -> Option<String> {
 
 #[test]
 fn zip_tools_replace_remove_and_add_embedded_libraries() {
+    if !dlopen_backend() {
+        return;
+    }
     let dir = scratch("zip");
     let (dep, main) = build_libraries(&dir.join("lib"));
     let app = dir.join("app");
@@ -308,6 +330,9 @@ fn zip_tools_replace_remove_and_add_embedded_libraries() {
 
 #[test]
 fn a_core_file_carrying_libraries_is_an_archive_that_image_loads() {
+    if !dlopen_backend() {
+        return;
+    }
     let dir = scratch("core");
     let (dep, main) = build_libraries(&dir.join("lib"));
     let core = dir.join("app.core");
@@ -337,5 +362,76 @@ fn a_core_file_carrying_libraries_is_an_archive_that_image_loads() {
     let out = text(&output);
     assert!(output.status.success(), "{out}");
     assert!(out.contains("MAIN 42") && out.contains("ALIAS 42"), "{out}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_replaced_entry_keeps_its_memfd_so_the_next_library_is_not_mistaken_for_it() {
+    if !dlopen_backend() {
+        return;
+    }
+    let dir = scratch("reuse");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("x.c"), "int x_value(void) { return 1; }\n").unwrap();
+    std::fs::write(dir.join("y.c"), "int y_value(void) { return 2; }\n").unwrap();
+    cc(&dir, &["-shared", "-fPIC", "x.c", "-o", "libx.so"]);
+    cc(
+        &dir,
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,liby.so.1",
+            "y.c",
+            "-o",
+            "liby.so",
+        ],
+    );
+    let (x, y) = (dir.join("libx.so"), dir.join("liby.so"));
+    // Loading x materialises a memfd; embedding x again replaces its entry.
+    // y's memfd must not get x's descriptor number, or glibc hands back x.
+    let output = egcl(
+        Path::new(env!("CARGO_BIN_EXE_egcl")),
+        &format!(
+            r#"(progn
+                 (egcl-ffi:embed-foreign-library {x:?})
+                 (egcl-ffi:load-foreign-library {x:?})
+                 (egcl-ffi:embed-foreign-library {x:?})
+                 (egcl-ffi:embed-foreign-library {y:?})
+                 (let ((y (egcl-ffi:load-foreign-library "liby.so.1")))
+                   (format t "Y ~d~%" (egcl-ffi:foreign-call
+                                        (egcl-ffi:foreign-symbol-pointer "y_value" y)
+                                        :int '() '()))))"#
+        ),
+    );
+    let out = text(&output);
+    assert!(output.status.success(), "{out}");
+    assert!(out.contains("Y 2"), "{out}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_library_loaded_from_disk_and_then_embedded_still_loads() {
+    if !dlopen_backend() {
+        return;
+    }
+    let dir = scratch("preloaded");
+    let (dep, _) = build_libraries(&dir.join("lib"));
+    let output = egcl(
+        Path::new(env!("CARGO_BIN_EXE_egcl")),
+        &format!(
+            r#"(progn
+                 (egcl-ffi:load-foreign-library {dep:?})
+                 (egcl-ffi:embed-foreign-library {dep:?})
+                 (dolist (name (list {dep:?} "libegcldep.so.1"))
+                   (format t "DEP ~d~%" (egcl-ffi:foreign-call
+                                          (egcl-ffi:foreign-symbol-pointer
+                                            "dep_value" (egcl-ffi:load-foreign-library name))
+                                          :int '() '()))))"#
+        ),
+    );
+    let out = text(&output);
+    assert!(output.status.success(), "{out}");
+    assert_eq!(out.matches("DEP 41").count(), 2, "{out}");
     let _ = std::fs::remove_dir_all(&dir);
 }
