@@ -26307,6 +26307,9 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             // CRC-32 (ZIP/PNG/gzip). A byte-at-a-time Lisp loop measured
             // 8641 ms over the 6.76 MB Android runtime -- the largest cost left
             // in a self-hosted APK build once hashing was native.
+            // Decompression for chipz's EGCL port: inflate in Lisp ran at a
+            // few KB/s, so unpacking a 7.7 MB package took about 25 minutes.
+            "EGCL-EXT:INFLATE" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL-EXT:CRC32" => {
                 let args = eval_args(cdr, env)?;
                 if args.len() != 1 {
@@ -40342,6 +40345,8 @@ fn is_builtin_function(name: &str) -> bool {
             | "EGCL-EXT::CRYPTO-KECCAK-F1600"
             | "EGCL-EXT:CRYPTO-KECCAK-ABSORB"
             | "EGCL-EXT::CRYPTO-KECCAK-ABSORB"
+            | "EGCL-EXT:INFLATE"
+            | "EGCL-EXT::INFLATE"
             | "EGCL-EXT:GC"
             | "EGCL-EXT::GC"
             | "EGCL-EXT:DECLARATION-SPECIFIER"

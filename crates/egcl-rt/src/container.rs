@@ -595,13 +595,25 @@ const DISTANCE_EXTRA: [u8; 30] = [
 
 /// Decode a raw deflate stream that must produce exactly `size` bytes.
 pub fn inflate(input: &[u8], size: usize) -> Result<Vec<u8>, String> {
+    let (out, _) = inflate_prefix(input, size)?;
+    if out.len() != size {
+        return Err("inflates to a different size than recorded".into());
+    }
+    Ok(out)
+}
+
+/// Decode the raw deflate stream at the start of `input`, producing at most
+/// `limit` bytes. Returns the output and the number of input bytes the stream
+/// occupied, so a caller can read a trailer that follows it.
+pub fn inflate_prefix(input: &[u8], limit: usize) -> Result<(Vec<u8>, usize), String> {
+    let size = limit;
     let mut bits = Bits {
         input,
         pos: 0,
         buffer: 0,
         count: 0,
     };
-    let mut out = Vec::with_capacity(size);
+    let mut out = Vec::with_capacity(size.min(input.len().saturating_mul(4)));
     loop {
         let last = bits.take(1)?;
         match bits.take(2)? {
@@ -685,10 +697,107 @@ pub fn inflate(input: &[u8], size: usize) -> Result<Vec<u8>, String> {
             break;
         }
     }
-    if out.len() != size {
-        return Err("inflates to a different size than recorded".into());
+    // Whole bytes read ahead into the bit buffer belong to what follows.
+    Ok((out, bits.pos - (bits.count / 8) as usize))
+}
+
+// ── Gzip and zlib members (RFC 1952, RFC 1950) ──────────────────────
+
+/// The wrapper around a deflate stream.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Compression {
+    /// A raw RFC 1951 stream.
+    Deflate,
+    /// RFC 1950: a two-byte header and an Adler-32 trailer.
+    Zlib,
+    /// RFC 1952: one or more members, each with a CRC-32 and size trailer.
+    Gzip,
+}
+
+/// Decompress all of `input` in the given format, checking every trailer.
+pub fn decompress(format: Compression, input: &[u8]) -> Result<Vec<u8>, String> {
+    match format {
+        Compression::Deflate => Ok(inflate_prefix(input, usize::MAX)?.0),
+        Compression::Zlib => zlib_decompress(input),
+        Compression::Gzip => gzip_decompress(input),
+    }
+}
+
+fn zlib_decompress(input: &[u8]) -> Result<Vec<u8>, String> {
+    let header = input.get(..2).ok_or("zlib stream ends early")?;
+    let (cmf, flg) = (header[0], header[1]);
+    if cmf & 0x0f != 8 || cmf >> 4 > 7 || (u16::from(cmf) << 8 | u16::from(flg)) % 31 != 0 {
+        return Err("not a zlib stream".into());
+    }
+    if flg & 0x20 != 0 {
+        return Err("zlib preset dictionaries are not supported".into());
+    }
+    let (out, used) = inflate_prefix(&input[2..], usize::MAX)?;
+    let trailer = input
+        .get(2 + used..2 + used + 4)
+        .ok_or("zlib stream ends early")?;
+    if u32::from_be_bytes(trailer.try_into().expect("four bytes")) != adler32(&out) {
+        return Err("zlib Adler-32 check failed".into());
     }
     Ok(out)
+}
+
+fn gzip_decompress(input: &[u8]) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    // Concatenated members decompress to the concatenation of their data.
+    loop {
+        let member = &input[pos..];
+        let header = member.get(..10).ok_or("gzip stream ends early")?;
+        if header[0] != 0x1f || header[1] != 0x8b || header[2] != 8 {
+            return Err("not a gzip stream".into());
+        }
+        let flags = header[3];
+        let mut at = 10;
+        if flags & 0x04 != 0 {
+            let extra = member.get(at..at + 2).ok_or("gzip stream ends early")?;
+            at += 2 + u16_at(extra, 0) as usize;
+        }
+        for flag in [0x08, 0x10] {
+            if flags & flag != 0 {
+                let name = member.get(at..).ok_or("gzip stream ends early")?;
+                at += 1 + name
+                    .iter()
+                    .position(|&b| b == 0)
+                    .ok_or("gzip stream ends early")?;
+            }
+        }
+        if flags & 0x02 != 0 {
+            at += 2;
+        }
+        let data = member.get(at..).ok_or("gzip stream ends early")?;
+        let (block, used) = inflate_prefix(data, usize::MAX)?;
+        let trailer = data.get(used..used + 8).ok_or("gzip stream ends early")?;
+        if u32_at(trailer, 0) != crc32(&block) {
+            return Err("gzip CRC-32 check failed".into());
+        }
+        if u32_at(trailer, 4) != block.len() as u32 {
+            return Err("gzip size check failed".into());
+        }
+        out.extend_from_slice(&block);
+        pos += at + used + 8;
+        if input.get(pos..pos + 2) != Some(&[0x1f, 0x8b][..]) {
+            return Ok(out);
+        }
+    }
+}
+
+fn adler32(bytes: &[u8]) -> u32 {
+    let (mut a, mut b) = (1u32, 0u32);
+    for chunk in bytes.chunks(5552) {
+        for &byte in chunk {
+            a += u32::from(byte);
+            b += a;
+        }
+        a %= 65521;
+        b %= 65521;
+    }
+    b << 16 | a
 }
 
 fn codes(
@@ -742,6 +851,27 @@ mod tests {
             .step_by(2)
             .map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap())
             .collect()
+    }
+
+    #[test]
+    fn decompresses_gzip_and_zlib_with_their_checks() {
+        let text: Vec<u8> = (0..200)
+            .flat_map(|i| format!("line {i} of the egcl gzip test\n").into_bytes())
+            .collect();
+        assert_eq!(decompress(Compression::Gzip, &hex("1f8b08000000000002ff85d8c96d1c411444c1bbac68133a6b2f7b881145602009e09c68bd20031875feb7c02c2febf9f1fb71ddd79f9fd7ebd7e37abcbf3daff7af8fbfd7ebf1f9faf1fc7f8c8e45c7aa63d3b1eb38749c3a2e1d37114c44a31029540a9942a7102a940aa942ab42abe2cf13ad0aad0aad0aad0aad0aad0aad0aad2aad2aadaabf7cb4aab4aab4aab4aab4aab4aab46ab46ab46ab46afea5a255a355a355a355a355a355a755a755a755a755f7cf3aad3aad3aad3aad3aad06ad06ad06ad06ad06ad86ff0369356835683568356935693569356935693569351d0cb49ab49ab45ab45ab45ab45ab45ab45ab45ab45aae2b5a2d5a6d5a6d5a6d5a6d5a6d5a6d5a6d5a6d5a6da7e8a1451da3b76bf4768edeeed1db417abb486f27e9ed26bd1da5b7d54e096fb543c41f2afe90f1878e3f84fca1e40f29ef968f633ee5b07cace69e8f833e2efa38e9e3a68fa33eaefa38ebe3ae4f3d0c46ab39ede3b68fe33eaefb38efe3be8f033f2efc38f1d30e3bdb6aaefc38f3e3ce8f433f2efd38f5e3d68f633faefdf4c3f384d51cfc71f1c7c91f377f1cfd71f5c7d91f777f1cfe1987571dabb9fde3f88feb3fceffb8ffe301102f807802c41b20f3f0186635cf807807c443205e02f11488b7403c06e23510cf81acc31ba2d5bc08e249106f827814c4ab209e05f12e888741bc0cb20f4fafdfa9fd0340331065ca170000")).unwrap(), text);
+        assert_eq!(decompress(Compression::Zlib, &hex("789c85d7c96ddc501445c1bda360083c9c7f3c425b16d0b00da8578ade70002aaedfaec0e1dce7c7efc7344f7f7e4eaf5f8fe9f1fef69cdebf3efe4eafc7e7ebc7f3ff311d171d571d371d771d0f1d4f1d2f1d07114c44a38814952253748a50512a5245ab85568b9f275a2db45a68b5d06aa1d542ab85560bad565aadb45afdf2d16aa5d54aab95562bad565aadb4da68b5d16aa3d5e62f15ad365a6db4da68b5d16aa3d54eab9d563bad765aedfeacd36aa7d54eab9d563bad0e5a1db43a6875d0eaa0d5e17f20ad0e5a1db43a6875d2eaa4d549ab935627ad4e5a9d0e065a9db43a6975d1eaa2d545ab8b5617ad2e5a5db4ba5c57b4ba6835683568356835683568356835683568359ca2372dea189d5da3b37374768fce0ed2d9453a3b496737e9ec289dad7697f056bb89f89b8abfc9f89b8ebf09f99b92bf4979b77c8ef95cf339e773cfe7a0cf459f933e377d8efa5cf539eb73d7e7b0cf659fd33eb77d8efb5cf739ef73dfe7c0cf859f133f377e8efc5cf939f373e7e7d0cfa59f533fb77e8efd5cfb39f773efe7e0cfc59f933f377f8efe5cfd39fb73f7e7f0cfe59fd33fb77f8eff5cff39ff73ffe7019017409e007903e4119057409e017907e4219097409e02790be43190d7409e03790fe4419017419e047913e4519057419e057917e4619097419e067dbb0dfe01f408e65e")).unwrap(), text);
+        // A member that records its file name, and two concatenated members.
+        assert_eq!(decompress(Compression::Gzip, &hex("1f8b08080000000002ff6e6f7465732e74787400cb4bcc4d4d51c84dcd4d4a2de20200e7d2f4ed0d000000")).unwrap(), b"named member\n");
+        assert_eq!(decompress(Compression::Gzip, &hex("1f8b08000000000002ff4bcb2c2a2ed10100d7364715060000001f8b08000000000002ff2b4e4dcecf4b010069111fb606000000")).unwrap(), b"first,second");
+        // The raw stream inside the zlib wrapper.
+        let raw = hex(
+            "789c85d7c96ddc501445c1bda360083c9c7f3c425b16d0b00da8578ade70002aaedfaec0e1dce7c7efc7344f7f7e4eaf5f8fe9f1fef69cdebf3efe4eafc7e7ebc7f3ff311d171d571d371d771d0f1d4f1d2f1d07114c44a38814952253748a50512a5245ab85568b9f275a2db45a68b5d06aa1d542ab85560bad565aadb45afdf2d16aa5d54aab95562bad565aadb4da68b5d16aa3d5e62f15ad365a6db4da68b5d16aa3d54eab9d563bad765aedfeacd36aa7d54eab9d563bad0e5a1db43a6875d0eaa0d5e17f20ad0e5a1db43a6875d2eaa4d549ab935627ad4e5a9d0e065a9db43a6975d1eaa2d545ab8b5617ad2e5a5db4ba5c57b4ba6835683568356835683568356835683568359ca2372dea189d5da3b37374768fce0ed2d9453a3b496737e9ec289dad7697f056bb89f89b8abfc9f89b8ebf09f99b92bf4979b77c8ef95cf339e773cfe7a0cf459f933e377d8efa5cf539eb73d7e7b0cf659fd33eb77d8efb5cf739ef73dfe7c0cf859f133f377e8efc5cf939f373e7e7d0cfa59f533fb77e8efd5cfb39f773efe7e0cfc59f933f377f8efe5cfd39fb73f7e7f0cfe59fd33fb77f8eff5cff39ff73ffe7019017409e007903e4119057409e017907e4219097409e02790be43190d7409e03790fe4419017419e047913e4519057419e057917e4619097419e067dbb0dfe01f408e65e",
+        );
+        assert_eq!(decompress(Compression::Deflate, &raw[2..]).unwrap(), text);
+        // A damaged CRC, a truncated stream, and the wrong wrapper are errors.
+        assert!(decompress(Compression::Gzip, &hex("1f8b08000000000002ff85d8c96d1c411444c1bbac68133a6b2f7b881145602009e09c68bd20031875feb7c02c2febf9f1fb71ddd79f9fd7ebd7e37abcbf3daff7af8fbfd7ebf1f9faf1fc7f8c8e45c7aa63d3b1eb38749c3a2e1d37114c44a31029540a9942a7102a940aa942ab42abe2cf13ad0aad0aad0aad0aad0aad0aad0aad2aad2aadaabf7cb4aab4aab4aab4aab4aab4aab46ab46ab46ab46afea5a255a355a355a355a355a355a755a755a755a755f7cf3aad3aad3aad3aad3aad06ad06ad06ad06ad06ad86ff0369356835683568356935693569356935693569351d0cb49ab49ab45ab45ab45ab45ab45ab45ab45ab45aae2b5a2d5a6d5a6d5a6d5a6d5a6d5a6d5a6d5a6d5a6da7e8a1451da3b76bf4768edeeed1db417abb486f27e9ed26bd1da5b7d54e096fb543c41f2afe90f1878e3f84fca1e40f29ef968f633ee5b07cace69e8f833e2efa38e9e3a68fa33eaefa38ebe3ae4f3d0c46ab39ede3b68fe33eaefb38efe3be8f033f2efc38f1d30e3bdb6aaefc38f3e3ce8f433f2efd38f5e3d68f633faefdf4c3f384d51cfc71f1c7c91f377f1cfd71f5c7d91f777f1cfe1987571dabb9fde3f88feb3fceffb8ffe301102f807802c41b20f3f0186635cf807807c443205e02f11488b7403c06e23510cf81acc31ba2d5bc08e249106f827814c4ab209e05f12e888741bc0cb20f4fafdfa9fd0340331165ca170000")).is_err());
+        assert!(decompress(Compression::Gzip, &hex("1f8b08000000000002ff85d8c96d1c411444c1bbac68133a6b2f7b881145602009e09c68bd20031875feb7c02c2febf9f1fb71ddd79f9fd7ebd7e37abcbf3daff7af8fbfd7ebf1f9faf1fc7f8c8e45c7aa63d3b1eb38749c3a2e1d37114c44a31029540a9942a7102a940aa942ab42abe2cf13ad0aad0aad0aad0aad0aad0aad0aad2aad2aadaabf7cb4aab4aab4aab4aab4aab4aab46ab46ab46ab46afea5a255a355a355a355a355a355a755a755a755a755f7cf3aad3aad3aad3aad3aad06ad06ad06ad06ad06ad86ff0369356835683568356935693569356935693569351d0cb49ab49ab45ab45ab45ab45ab45ab45ab45ab45aae2b5a2d5a6d5a6d5a6d5a6d5a6d5a6d5a6d5a6d5a6da7e8a1451da3b76bf4768edeeed1db417abb486f27e9ed26bd1da5b7d54e096fb543c41f2afe90f1878e3f84fca1e40f29ef968f633ee5b07cace69e8f833e2efa38e9e3a68fa33eaefa38ebe3ae4f3d0c46ab39ede3b68fe33eaefb38efe3be8f033f2efc38f1d30e3bdb6aaefc38f3e3ce8f433f2efd38f5e3d68f633faefdf4c3f384d51cfc71f1c7c91f377f1cfd71f5c7d91f777f1cfe1987571dabb9fde3f88feb3fceffb8ffe301102f807802c41b20f3f0186635cf807807c443205e02f11488b7403c06e23510cf81acc31ba2d5bc08e249106f827814c4ab209e05f12e888741bc0cb20f4fafdfa9fd03403310")).is_err());
+        assert!(decompress(Compression::Zlib, &hex("1f8b08000000000002ff85d8c96d1c411444c1bbac68133a6b2f7b881145602009e09c68bd20031875feb7c02c2febf9f1fb71ddd79f9fd7ebd7e37abcbf3daff7af8fbfd7ebf1f9faf1fc7f8c8e45c7aa63d3b1eb38749c3a2e1d37114c44a31029540a9942a7102a940aa942ab42abe2cf13ad0aad0aad0aad0aad0aad0aad0aad2aad2aadaabf7cb4aab4aab4aab4aab4aab4aab46ab46ab46ab46afea5a255a355a355a355a355a355a755a755a755a755f7cf3aad3aad3aad3aad3aad06ad06ad06ad06ad06ad86ff0369356835683568356935693569356935693569351d0cb49ab49ab45ab45ab45ab45ab45ab45ab45ab45aae2b5a2d5a6d5a6d5a6d5a6d5a6d5a6d5a6d5a6d5a6da7e8a1451da3b76bf4768edeeed1db417abb486f27e9ed26bd1da5b7d54e096fb543c41f2afe90f1878e3f84fca1e40f29ef968f633ee5b07cace69e8f833e2efa38e9e3a68fa33eaefa38ebe3ae4f3d0c46ab39ede3b68fe33eaefb38efe3be8f033f2efc38f1d30e3bdb6aaefc38f3e3ce8f433f2efd38f5e3d68f633faefdf4c3f384d51cfc71f1c7c91f377f1cfd71f5c7d91f777f1cfe1987571dabb9fde3f88feb3fceffb8ffe301102f807802c41b20f3f0186635cf807807c443205e02f11488b7403c06e23510cf81acc31ba2d5bc08e249106f827814c4ab209e05f12e888741bc0cb20f4fafdfa9fd0340331065ca170000")).is_err());
     }
 
     #[test]

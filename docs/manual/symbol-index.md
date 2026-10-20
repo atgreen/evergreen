@@ -104,6 +104,7 @@ alphabetized by unqualified name and display their package explicitly.
 | `java:implement` | [Dictionary entry](java.md#interface-adapters) |
 | `egcl-jvm:implement` | [Dictionary entry](java.md#descriptor-callbacks) |
 | `egcl-ffi:inc-pointer` | [Dictionary entry](foreign.md#pointers) |
+| `egcl-ext:inflate` | [Dictionary entry](user/reference/extensions.md#inflate) |
 | `egcl-ext:io-timeout` | [Dictionary entry](user/reference/extensions.md#io-timeout) |
 | `java:java-error` | [Dictionary entry](java.md#java-conditions) |
 | `egcl-jvm:java-error` | [Dictionary entry](java.md#java-conditions) |

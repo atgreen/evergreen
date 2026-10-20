@@ -51,6 +51,49 @@ pub fn crc32_of_sequence(sequence: EgclVal) -> Result<EgclVal, EgclError> {
     Ok(EgclVal::from_fixnum(i64::from(egcl_rt::digest::crc32(&bytes))))
 }
 
+/// `(egcl-ext:inflate octets &optional format)`: decompress a sequence of
+/// `(unsigned-byte 8)` values holding a raw deflate stream (`:deflate`, the
+/// default), a zlib stream (`:zlib`) or gzip members (`:gzip`), checking the
+/// wrapper's trailers. Returns a fresh simple vector of fixnums.
+pub fn inflate_sequence(args: &[EgclVal]) -> Result<EgclVal, EgclError> {
+    let (sequence, format) = match args {
+        [sequence] => (*sequence, None),
+        [sequence, format] => (*sequence, Some(*format)),
+        _ => {
+            return Err(EgclError::ProgramError(format!(
+                "EGCL-EXT:INFLATE takes one or two arguments, got {}",
+                args.len()
+            )));
+        }
+    };
+    // A symbol's name comes back package-qualified, as KEYWORD:GZIP.
+    let name = |f: EgclVal| {
+        let name = egcl_rt::symbols::symbol_name_of(f).unwrap_or_default();
+        name.rsplit(':').next().unwrap_or_default().to_owned()
+    };
+    let format = match format.map(|f| (f, name(f))) {
+        None => egcl_rt::container::Compression::Deflate,
+        Some((_, name)) if name == "DEFLATE" => egcl_rt::container::Compression::Deflate,
+        Some((_, name)) if name == "ZLIB" => egcl_rt::container::Compression::Zlib,
+        Some((_, name)) if name == "GZIP" => egcl_rt::container::Compression::Gzip,
+        Some((datum, _)) => {
+            return Err(EgclError::TypeError {
+                datum,
+                expected: "(MEMBER :DEFLATE :ZLIB :GZIP)".into(),
+            });
+        }
+    };
+    let out = egcl_rt::container::decompress(format, &sequence_bytes(sequence)?)
+        .map_err(|message| EgclError::StreamError(format!("EGCL-EXT:INFLATE: {message}")))?;
+    let vector = sequences::build_filled_simple_vector(out.len(), EgclVal::from_fixnum(0));
+    let (slots, _) = sequences::simple_vector_slots(vector).expect("a fresh simple vector");
+    // Fixnums only, and nothing allocates while the slot pointer is live.
+    for (index, &byte) in out.iter().enumerate() {
+        unsafe { *slots.add(index) = EgclVal::from_fixnum(i64::from(byte)) };
+    }
+    Ok(vector)
+}
+
 /// SHA-256 of a sequence of `(unsigned-byte 8)` values, as a fresh 32-element
 /// simple vector of fixnums.
 pub fn sha256_of_sequence(sequence: EgclVal) -> Result<EgclVal, EgclError> {
