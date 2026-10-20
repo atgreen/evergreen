@@ -154,6 +154,24 @@ const PROGRAM: &str = r#"
         (handler-bind ((warning (lambda (c) (declare (ignore c)) (return-from outer :warned))))
           (if x (warn "w") (error "e")))
       (error () :errored))))
+;; Shapes that might reach a block without an obvious closure in its body.
+;; EVAL runs in a null lexical environment, so B stays invisible to it and EV
+;; needs no registration. A macro- or MACROLET-generated closure, a FLET handler
+;; passed by #', and a closure that returns past a same-named inner block must
+;; each still reach the right block.
+(defmacro mk-exit (name val) `(lambda () (return-from ,name ,val)))
+(defun ev () (block b (handler-case (eval '(return-from b :seen)) (error () :unseen))))
+(defun mac () (block b (funcall (mk-exit b :mac)) :not-reached))
+(defun mlet () (block b (macrolet ((m () '(lambda () (return-from b :mlet)))) (funcall (m))) :not-reached))
+(defun flet-h ()
+  (block b
+    (flet ((hd (c) (declare (ignore c)) (return-from b :flet)))
+      (handler-bind ((error #'hd)) (error "x")))
+    :not-reached))
+(defun shadowed ()
+  (block b
+    (let ((f (lambda () (return-from b :outer))))
+      (block b (handler-case (funcall f) (error () :err)) :inner))))
 ;; A hot loop after ASSERT, entered once.
 (defun sum-to (n)
   (assert (integerp n))
@@ -183,6 +201,7 @@ const PROGRAM: &str = r#"
 (case30 (tb 6))
 (case30 (hc2 #'callit))
 (case30 (list (nested-hc t) (nested-hc nil)))
+(case30 (list (ev) (mac) (mlet) (flet-h) (shadowed)))
 (let ((r nil))
   (dotimes (i 40) (setq r (scale i)))
   (let ((before (egcl-ext:deopt-count)))
@@ -191,13 +210,13 @@ const PROGRAM: &str = r#"
 (prin1 (list (sum-to 5000) (sum-to 10))) (terpri)
 (format t "TIERS ~S~%"
   (mapcar #'egcl-ext:function-tier
-          '(mas tru signal-loop scale a1 ct rc tb sum-to h via-mapcar h2 h3 deep funarg in-handler
+          '(mas tru signal-loop scale a1 ct rc tb ev sum-to h via-mapcar h2 h3 deep funarg in-handler
             from-clause go-escape hc2 nested-hc)))
 (format t "DONE~%")
 "#;
 
 /// Functions whose blocks or tags used to be registered for nothing, in TIERS order.
-const ELIDED: [&str; 9] = [
+const ELIDED: [&str; 10] = [
     "MAS",
     "TRU",
     "SIGNAL-LOOP",
@@ -206,6 +225,7 @@ const ELIDED: [&str; 9] = [
     "CT",
     "RC",
     "TB",
+    "EV",
     "SUM-TO",
 ];
 
@@ -281,6 +301,7 @@ fn non_local_exits_match_the_interpreter_at_every_tier() {
         "((0 -1 2 -3 4 -5) NIL :TOP)",
         "(:CLAUSE-CLOSURE NIL :TOP)",
         "((:WARNED :ERRORED) NIL :TOP)",
+        "((:UNSEEN :MAC :MLET :FLET :OUTER) NIL :TOP)",
     ] {
         assert!(
             oracle.contains(expected),
