@@ -84,7 +84,7 @@
   `UNWIND-PROTECT` body. A cold Babel load compiles six more ASDF and UIOP
   functions to native code, among them `MAKE-ACTION-STATUS`,
   `COMPUTE-ACTION-STATUS`, `TRUENAMIZE` and `FEATUREP`
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#481](https://github.com/atgreen/evergreen/pull/481)).
 - `COUNT`, `COUNT-IF` and `COUNT-IF-NOT` compile to bytecode instead of being
   tree-walked on every call, and `FIND`, `FIND-IF`, `FIND-IF-NOT` and the
   `COUNT` family no longer build a closure for each call. Counting over a
