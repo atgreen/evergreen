@@ -168,8 +168,29 @@ pub fn resolve_values_before(
     constants: &HashMap<Value, u64>,
     machine_inst: usize,
 ) -> Result<FrameValues, FrameMapError> {
+    resolve_values_before_reading(
+        f,
+        machine,
+        homes,
+        constants,
+        machine_inst,
+        &machine.read_vregs(),
+    )
+}
+
+/// `resolve_values_before` with `machine.read_vregs()` computed once by the
+/// caller. That set covers the whole function, so rebuilding it for each of
+/// many poll points made frame mapping quadratic (bliss-t9tzf).
+pub fn resolve_values_before_reading(
+    f: &Function,
+    machine: &MachFunc,
+    homes: &FrameHomes,
+    constants: &HashMap<Value, u64>,
+    machine_inst: usize,
+    read_vregs: &HashSet<VReg>,
+) -> Result<FrameValues, FrameMapError> {
     let live = machine
-        .live_vregs_before(machine_inst, &machine.read_vregs())
+        .live_vregs_before(machine_inst, read_vregs)
         .ok_or(FrameMapError::InvalidSource(machine_inst))?;
     resolve_frame_values(f, machine, homes, constants, live)
 }

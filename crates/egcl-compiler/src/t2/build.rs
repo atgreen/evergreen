@@ -2831,22 +2831,37 @@ impl<'a> Builder<'a> {
     /// (bliss-fe8). Removing a parameter drops it from the block and drops the
     /// matching argument from every predecessor edge, keeping the two positionally
     /// consistent (the emitter correlates params↔args by position, not by id).
+    ///
+    /// Each sweep reads arguments through the substitutions found so far, so a
+    /// phi made trivial by an earlier removal is found without rewriting the
+    /// function first. Uses and parameters are then rewritten once. Rewriting
+    /// the whole function per removed phi made this quadratic in function size,
+    /// a large share of every T1 compile (bliss-t9tzf).
     fn simplify_trivial_phis(&mut self) {
+        fn resolve(subst: &HashMap<Value, Value>, mut value: Value) -> Value {
+            while let Some(&next) = subst.get(&value) {
+                value = next;
+            }
+            value
+        }
+        // Every value in `subst` maps to one that is not, so chains end.
+        let mut subst: HashMap<Value, Value> = HashMap::new();
         loop {
-            let mut found: Option<(Block, usize, Value, Value)> = None;
-            'outer: for &b in self.block_of.values() {
+            let mut changed = false;
+            for &b in self.block_of.values() {
                 let preds = match self.pred_edges.get(&b) {
-                    Some(p) if !p.is_empty() => p.clone(),
+                    Some(p) if !p.is_empty() => p,
                     _ => continue, // entry / unreachable: no incoming phi arguments
                 };
-                let nparams = self.f.block(b).params.len();
-                for pos in 0..nparams {
-                    let p = self.f.block(b).params[pos];
+                for (pos, &p) in self.f.block(b).params.iter().enumerate() {
+                    if subst.contains_key(&p) {
+                        continue;
+                    }
                     let mut other: Option<Value> = None;
                     let mut trivial = true;
-                    for &(pred, idx) in &preds {
+                    for &(pred, idx) in preds {
                         let term = self.terminator_inst[&pred];
-                        let arg = self.f.inst(term).targets[idx].args[pos];
+                        let arg = resolve(&subst, self.f.inst(term).targets[idx].args[pos]);
                         if arg == p {
                             continue; // self-reference: does not disqualify
                         }
@@ -2863,26 +2878,53 @@ impl<'a> Builder<'a> {
                     // undefined/dead cycle; leave it (a real definition never is).
                     if trivial {
                         if let Some(u) = other {
-                            found = Some((b, pos, p, u));
-                            break 'outer;
+                            subst.insert(p, u);
+                            changed = true;
                         }
                     }
                 }
             }
-            let Some((b, pos, p, u)) = found else { break };
-            self.replace_value(p, u);
-            self.f.block_mut(b).params.remove(pos);
+            if !changed {
+                break;
+            }
+        }
+        if subst.is_empty() {
+            return;
+        }
+        let resolved: HashMap<Value, Value> =
+            subst.keys().map(|&p| (p, resolve(&subst, p))).collect();
+        self.replace_values(&resolved);
+        let blocks: HashSet<Block> = self.block_of.values().copied().collect();
+        for b in blocks {
+            let removed: Vec<usize> = (self.f.block(b).params.iter().enumerate())
+                .filter(|(_, p)| resolved.contains_key(p))
+                .map(|(pos, _)| pos)
+                .collect();
+            if removed.is_empty() {
+                continue;
+            }
+            for &pos in removed.iter().rev() {
+                self.f.block_mut(b).params.remove(pos);
+            }
             for &(pred, idx) in &self.pred_edges[&b].clone() {
                 let term = self.terminator_inst[&pred];
-                self.f.inst_mut(term).targets[idx].args.remove(pos);
+                let args = &mut self.f.inst_mut(term).targets[idx].args;
+                for &pos in removed.iter().rev() {
+                    args.remove(pos);
+                }
             }
         }
     }
 
-    /// Replace every use of value `p` with `u` — in instruction operands, in edge
-    /// (block-call) arguments, and in deopt frame states — so a removed trivial
-    /// phi leaves no dangling reference.
-    fn replace_value(&mut self, p: Value, u: Value) {
+    /// Replace every use of each key of `subst` with its value — in instruction
+    /// operands, in edge (block-call) arguments, and in deopt frame states — so
+    /// a removed trivial phi leaves no dangling reference.
+    fn replace_values(&mut self, subst: &HashMap<Value, Value>) {
+        let rewrite = |a: &mut Value| {
+            if let Some(&u) = subst.get(a) {
+                *a = u;
+            }
+        };
         // Synthetic normal/cold call bridges also carry phi uses. Rewriting
         // only bytecode leaders leaves their edge arguments dangling.
         let blocks = self.f.block_order().to_vec();
@@ -2890,17 +2932,9 @@ impl<'a> Builder<'a> {
             let insts = self.f.block(b).insts.clone();
             for inst in insts {
                 let d = self.f.inst_mut(inst);
-                for a in d.args.iter_mut() {
-                    if *a == p {
-                        *a = u;
-                    }
-                }
+                d.args.iter_mut().for_each(rewrite);
                 for tc in d.targets.iter_mut() {
-                    for a in tc.args.iter_mut() {
-                        if *a == p {
-                            *a = u;
-                        }
-                    }
+                    tc.args.iter_mut().for_each(rewrite);
                 }
             }
         }
@@ -2912,9 +2946,7 @@ impl<'a> Builder<'a> {
             for scope in fs.scopes.iter_mut() {
                 for src in scope.locals.iter_mut().chain(scope.stack.iter_mut()) {
                     if let ValueSource::Value { value, .. } = src {
-                        if *value == p {
-                            *value = u;
-                        }
+                        rewrite(value);
                     }
                 }
             }

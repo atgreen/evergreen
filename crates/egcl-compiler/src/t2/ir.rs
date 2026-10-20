@@ -878,6 +878,22 @@ impl Function {
         preds
     }
 
+    /// `preds` of every block at once, indexed by block index, in the same
+    /// order. A loop that asks `preds` per block scans every terminator per
+    /// block; use this instead (bliss-t9tzf).
+    pub fn pred_lists(&self) -> Vec<Vec<Block>> {
+        let mut preds = vec![Vec::new(); self.blocks.len()];
+        for &b in &self.block_order {
+            for succ in self.succs(b) {
+                let list: &mut Vec<Block> = &mut preds[succ.index()];
+                if list.last() != Some(&b) {
+                    list.push(b);
+                }
+            }
+        }
+        preds
+    }
+
     /// Reverse postorder over the CFG from the entry block.
     pub fn reverse_postorder(&self) -> Vec<Block> {
         let mut visited = vec![false; self.blocks.len()];
@@ -1286,6 +1302,7 @@ impl DominatorTree {
             a
         };
 
+        let preds = f.pred_lists();
         let mut changed = true;
         while changed {
             changed = false;
@@ -1294,7 +1311,7 @@ impl DominatorTree {
                     continue;
                 }
                 let mut new_idom: Option<Block> = None;
-                for p in f.preds(b) {
+                for &p in &preds[b.index()] {
                     if idom[p.index()].is_none() {
                         continue; // not yet processed
                     }
