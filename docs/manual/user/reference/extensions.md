@@ -273,6 +273,22 @@ vector.
 
 Returns the CRC-32 of `octets`, using the polynomial of ZIP, gzip and PNG.
 
+### `egcl-ext:inflate` { #inflate }
+
+**Function** `(egcl-ext:inflate octets &optional (format :deflate))` → octet vector
+
+Decompresses the whole of the sequence `octets` and returns the result as a
+fresh vector. `format` names the data's wrapper:
+
+- `:deflate`: a raw RFC 1951 deflate stream.
+- `:zlib`: an RFC 1950 stream, whose Adler-32 trailer is checked. Streams that
+  need a preset dictionary are not supported.
+- `:gzip`: one or more RFC 1952 members, whose CRC-32 and size trailers are
+  checked. Concatenated members decompress to the concatenation of their data.
+
+Corrupt or truncated data, or a failed check, signals `stream-error`. EGCL's
+port of chipz uses this function in place of its own inflate.
+
 ### Block primitives { #crypto-block-primitives }
 
 **Function** `(egcl-ext:crypto-aes-encrypt-block round-keys n-rounds in in-start out out-start)` → `nil`

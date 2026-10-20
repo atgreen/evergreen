@@ -4,6 +4,11 @@
 
 ### Added
 
+- `EGCL-EXT:INFLATE` decompresses raw deflate, zlib and gzip data in the
+  runtime, checking each format's trailer. EGCL's port of chipz uses it, so
+  unpacking a package with `ocicl install` no longer runs chipz's inflate in
+  interpreted code: extracting a 120 KB tar archive takes 3 s instead of 23 s
+  ([#455](https://github.com/atgreen/evergreen/pull/455)).
 - Shared libraries can travel inside a saved executable.
   `egcl-ffi:embed-foreign-library` reads one on the build host, and
   `load-foreign-library` then finds it by SONAME, path or alias on any host.

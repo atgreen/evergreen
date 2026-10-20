@@ -1035,6 +1035,10 @@ fn resolve(name: &str) -> Option<Handler> {
                 args[0], slot, args[2], !args[3].is_nil(),
             )
         }),
+        "EGCL-EXT:INFLATE" => Some(|_operator, args, env| {
+            env.clear_mv();
+            egcl_stdlib::digest::inflate_sequence(args)
+        }),
         "EGCL::%TEXT-CODEC" => Some(|_operator, args, env| {
             env.clear_mv();
             egcl_stdlib::text_codec::call(args)
