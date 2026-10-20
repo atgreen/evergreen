@@ -3260,7 +3260,10 @@ fn runtime_call_flags() -> InstFlags {
 /// The guard keeps its FrameState, so any other non-list operand still
 /// deopts to the generic CL call, which signals the type error. Runs on the
 /// finished CFG, where the guard has exactly one use and no later pass has
-/// shared its proof; an operand whose type already excludes NULL is left alone.
+/// shared its proof. An operand whose type excludes NULL, or which a
+/// dominating branch has already found non-NIL, keeps the plain guard (see
+/// `branch_proves_non_nil`), so loops that test `(NULL x)` or `(ENDP x)`
+/// first still share one cons proof among their accesses.
 /// New blocks are laid out after the split block, preserving the builder's
 /// defs-before-uses layout order.
 fn admit_nil_list_loads(f: &mut Function) {
@@ -3288,19 +3291,44 @@ fn admit_nil_list_loads(f: &mut Function) {
         }
     }
 
+    let pair_at = |f: &Function, pair: &[Inst]| {
+        let (guard, load) = (f.inst(pair[0]), f.inst(pair[1]));
+        guard.opcode == Opcode::Guard
+            && guard.flags.guard
+            && matches!(guard.aux, AuxData::TypeTag(t) if t.bits == TypeBits::CONS)
+            && matches!(load.opcode, Opcode::Car | Opcode::Cdr)
+            && guard.results.len() == 1
+            && load.args == guard.results
+            && uses.get(&guard.results[0]) == Some(&1)
+            && f.value(guard.args[0]).ty.bits.contains(TypeBits::NULL)
+    };
+    // Decide every proof on the unsplit CFG. Splitting adds no paths, so a
+    // proof found here still holds wherever the guard ends up.
+    let mut proven = HashSet::new();
+    {
+        let dom = f.dominators();
+        let mut preds: HashMap<Block, Vec<Block>> = HashMap::new();
+        for &block in f.block_order() {
+            for succ in f.succs(block) {
+                preds.entry(succ).or_default().push(block);
+            }
+        }
+        for &block in f.block_order() {
+            for pair in f.block(block).insts.windows(2) {
+                if pair_at(f, pair) {
+                    let operand = f.inst(pair[0]).args[0];
+                    if branch_proves_non_nil(f, &dom, &preds, block, operand) {
+                        proven.insert(pair[0]);
+                    }
+                }
+            }
+        }
+    }
     let site = |f: &Function, block: Block| {
-        let insts = &f.block(block).insts;
-        insts.windows(2).position(|pair| {
-            let (guard, load) = (f.inst(pair[0]), f.inst(pair[1]));
-            guard.opcode == Opcode::Guard
-                && guard.flags.guard
-                && matches!(guard.aux, AuxData::TypeTag(t) if t.bits == TypeBits::CONS)
-                && matches!(load.opcode, Opcode::Car | Opcode::Cdr)
-                && guard.results.len() == 1
-                && load.args == guard.results
-                && uses.get(&guard.results[0]) == Some(&1)
-                && f.value(guard.args[0]).ty.bits.contains(TypeBits::NULL)
-        })
+        f.block(block)
+            .insts
+            .windows(2)
+            .position(|pair| pair_at(f, pair) && !proven.contains(&pair[0]))
     };
     let mut renamed = HashMap::new();
     let mut cons_exits = Vec::new();
@@ -3382,6 +3410,78 @@ fn admit_nil_list_loads(f: &mut Function) {
     f.replace_values(&renamed);
     for (cons_arm, exit) in cons_exits {
         f.set_terminator(cons_arm, exit);
+    }
+}
+
+/// Whether every path to `block` crossed a branch edge that only a non-NIL
+/// `operand` takes: the true edge of a branch on the value itself or on
+/// `(CONSP x)`, or the false edge of one on `(NULL x)`/`(NOT x)` (an `EQ` with
+/// NIL) or `(ENDP x)`. Walks the dominator chain, accepting an edge only into
+/// a block whose single predecessor is the branch. A wrong answer costs only
+/// speed: the cons guard stays, and NIL then deopts as it used to.
+fn branch_proves_non_nil(
+    f: &Function,
+    dom: &crate::t2::ir::DominatorTree,
+    preds: &HashMap<Block, Vec<Block>>,
+    block: Block,
+    operand: Value,
+) -> bool {
+    let is_nil = |value: Value| {
+        matches!(f.value(value).def, crate::t2::ir::ValueDef::Result { inst, .. }
+            if f.inst(inst).opcode == Opcode::ConstNil)
+    };
+    let tests = |cond: Value, taken: bool| {
+        if cond == operand {
+            return taken;
+        }
+        let crate::t2::ir::ValueDef::Result { inst, .. } = f.value(cond).def else {
+            return false;
+        };
+        let data = f.inst(inst);
+        match (data.opcode, &data.aux, data.args.as_slice()) {
+            (Opcode::GenericEq, _, &[a, b]) => {
+                !taken && ((a == operand && is_nil(b)) || (b == operand && is_nil(a)))
+            }
+            (Opcode::Call, AuxData::CallTarget(symbol), &[arg]) if arg == operand => {
+                match cl_function_name(*symbol).as_deref() {
+                    Some("ENDP") => !taken,
+                    Some("CONSP") => taken,
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    };
+    let mut current = block;
+    loop {
+        if let Some([branch]) = preds.get(&current).map(Vec::as_slice) {
+            if let Some(term) = f.terminator(*branch) {
+                let data = f.inst(term);
+                if data.opcode == Opcode::Brif && data.targets.len() == 2 {
+                    let (yes, no) = (data.targets[0].block, data.targets[1].block);
+                    if yes != no && (yes == current || no == current) {
+                        if tests(data.args[0], yes == current) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        match dom.idom(current) {
+            Some(up) if up != current => current = up,
+            _ => return false,
+        }
+    }
+}
+
+/// The bare name of a COMMON-LISP function symbol, as `metadata_for_symbol`
+/// recognises one; `None` for a same-spelling symbol in another package.
+fn cl_function_name(sym: u32) -> Option<String> {
+    let name = crate::reader::symbol_name(sym)?;
+    match egcl_rt::symbols::split_registry_key(&name) {
+        None => Some(name),
+        Some(("CL" | "COMMON-LISP", bare)) => Some(bare.to_string()),
+        Some(_) => None,
     }
 }
 

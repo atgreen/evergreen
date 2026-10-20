@@ -1247,6 +1247,118 @@ fn car_cdr_metadata_emit_guarded_field_loads_with_a_nil_arm() {
     assert!(!CONS_ACCESS_DEOPTED.load(Ordering::SeqCst));
 }
 
+/// A branch that has already found the operand non-NIL makes the NIL arm
+/// dead, so the expansion keeps its plain guard and GuardElim can again share
+/// one cons proof between CAR and CDR (bliss-jmwqr). Only the edge a non-NIL
+/// value takes counts: CAR on the NIL side of the same test keeps its arm.
+#[test]
+fn car_cdr_behind_a_non_nil_branch_skip_the_nil_arm() {
+    use egcl_compiler::t2::ir::{AuxData, Function, Opcode, TypeBits};
+
+    let car = egcl_rt::symbols::intern("CAR");
+    let cdr = egcl_rt::symbols::intern("CDR");
+    let endp = egcl_rt::symbols::intern("ENDP");
+    let count = |f: &Function, wanted: &dyn Fn(&egcl_compiler::t2::ir::InstData) -> bool| {
+        f.block_order()
+            .iter()
+            .flat_map(|&b| f.block(b).insts.iter())
+            .filter(|&&i| wanted(f.inst(i)))
+            .count()
+    };
+    let cons_guards = |f: &Function| {
+        count(f, &|d| {
+            d.opcode == Opcode::Guard
+                && matches!(d.aux, AuxData::TypeTag(t) if t.bits == TypeBits::CONS)
+        })
+    };
+    let nil_tests = |f: &Function| count(f, &|d| d.opcode == Opcode::GenericEq);
+
+    // (if x (car x) nil)
+    let when_x = bytecode_fn(
+        "car-when-x",
+        vec![
+            Instr::LoadLocal(0),
+            Instr::BrIfFalse(5),
+            Instr::LoadLocal(0),
+            Instr::CallNamed { sym: car, nargs: 1 },
+            Instr::Return,
+            Instr::Const(0),
+            Instr::Return,
+        ],
+        vec![NIL],
+        1,
+        1,
+        1,
+    );
+    let f = build_from_bytecode(&when_x).expect("build CAR behind (IF X ...)");
+    verify(&f).expect("CAR behind a non-NIL branch verifies");
+    assert_eq!(
+        nil_tests(&f),
+        0,
+        "the true edge of (IF X ...) proves X non-NIL"
+    );
+    assert_eq!(cons_guards(&f), 1);
+
+    // (if (endp x) nil (progn (car x) (cdr x)))
+    let unless_endp = bytecode_fn(
+        "car-cdr-unless-endp",
+        vec![
+            Instr::LoadLocal(0),
+            Instr::CallNamed {
+                sym: endp,
+                nargs: 1,
+            },
+            Instr::BrIfTrue(9),
+            Instr::LoadLocal(0),
+            Instr::CallNamed { sym: car, nargs: 1 },
+            Instr::Pop,
+            Instr::LoadLocal(0),
+            Instr::CallNamed { sym: cdr, nargs: 1 },
+            Instr::Return,
+            Instr::Const(0),
+            Instr::Return,
+        ],
+        vec![NIL],
+        1,
+        1,
+        1,
+    );
+    let mut f = build_from_bytecode(&unless_endp).expect("build CAR/CDR behind ENDP");
+    assert_eq!(
+        nil_tests(&f),
+        0,
+        "the false edge of (ENDP X) proves X non-NIL"
+    );
+    assert_eq!(cons_guards(&f), 2);
+    let mut pm = PassManager::new();
+    pm.add(Box::new(GuardElim));
+    pm.add(Box::new(Dce));
+    pm.run(&mut f);
+    verify(&f).expect("shared proof behind ENDP verifies");
+    assert_eq!(cons_guards(&f), 1, "CAR and CDR share one cons proof again");
+
+    // (if x nil (car x)): CAR runs only when X is NIL.
+    let unless_x = bytecode_fn(
+        "car-unless-x",
+        vec![
+            Instr::LoadLocal(0),
+            Instr::BrIfTrue(5),
+            Instr::LoadLocal(0),
+            Instr::CallNamed { sym: car, nargs: 1 },
+            Instr::Return,
+            Instr::Const(0),
+            Instr::Return,
+        ],
+        vec![NIL],
+        1,
+        1,
+        1,
+    );
+    let f = build_from_bytecode(&unless_x).expect("build CAR on the NIL edge");
+    verify(&f).expect("CAR on the NIL edge verifies");
+    assert_eq!(nil_tests(&f), 1, "the NIL edge keeps its NIL arm");
+}
+
 #[test]
 fn library_function_name_retains_its_call_and_deopt_state() {
     use egcl_compiler::t2::ir::{AuxData, Opcode};
