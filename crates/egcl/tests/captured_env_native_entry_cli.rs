@@ -11,8 +11,10 @@ use std::process::{Command, Output};
 /// Hot capturing functions: a mutated captured local, two closures sharing one
 /// binding, captured `&optional`, `&key` and `&rest` parameters, a fresh
 /// binding per iteration and one binding shared by every iteration, nested
-/// captured LETs, cleanup, restart, special-binding and error paths, and the
-/// installed-wrapper shape of bliss-kg667. Prints the results, then each tier.
+/// captured LETs, cleanup, restart, special-binding and error paths, and a
+/// caller of the installed-wrapper shape of bliss-kg667 (the wrapper itself
+/// stays interpreted; only its results are pinned). Prints the results, then
+/// each tier.
 const PROGRAM: &str = r#"
 (progn
   (defvar *cap-dyn* 0)
@@ -290,10 +292,11 @@ fn captured_loop_enters_t2_by_osr_and_deopts_on_its_frame() {
 }
 
 /// bliss-kg667: an installed anonymous wrapper that captured the original
-/// definition must keep finding it once it is hot. Such a closure body reads
-/// its creator's binding, so it stays interpreted; this pins its results.
+/// definition must keep finding it while its caller is hot. The wrapper's body
+/// reads its creator's binding, so it is declined and never runs natively;
+/// this pins the results across tier settings, not a native wrapper.
 #[test]
-fn installed_capturing_wrapper_keeps_its_binding_when_hot() {
+fn installed_capturing_wrapper_results_hold_while_it_stays_interpreted() {
     let program = r#"
 (progn
   (defun f (a b) (list a b))
@@ -322,4 +325,38 @@ fn installed_capturing_wrapper_keeps_its_binding_when_hot() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+}
+
+/// Ownership of a captured name is decided by name, not position: a function
+/// that reads an enclosing captured X and also binds its own captured X is
+/// admitted. Its reads before, inside and after the inner binding, and its
+/// writes to both, must match the interpreter once it is installed at T2.
+#[test]
+fn shadowing_captured_names_match_the_interpreter() {
+    let program = r#"
+(progn
+  (let ((x 5))
+    (defun shadow-a (k)
+      (list x (let ((x (+ k 1))) (funcall (lambda () x))) x
+            (let ((x (* k 3))) (setq x (+ x 1)) (let ((g (lambda () x))) (funcall g))) x))
+    (defun shadow-set (k)
+      (setq x (+ x k))
+      (list x (let ((x k)) (let ((h (lambda () (setq x (+ x 1))))) (funcall h) (list x (funcall h))))
+            (prog1 x (setq x 5)))))
+  (loop for i from 0 below 3000
+        do (shadow-a 2) (shadow-set 4)
+        until (and (eql (egcl-ext:function-tier 'shadow-a) 2)
+                   (eql (egcl-ext:function-tier 'shadow-set) 2)))
+  (print (list (shadow-a 7) (shadow-set 9)))
+  (terpri)
+  (format t "TIERS ~a ~a~%" (egcl-ext:function-tier 'shadow-a) (egcl-ext:function-tier 'shadow-set)))
+"#;
+    let tiered = egcl(program, THRESHOLDS);
+    let (results, tiers) = results_and_tiers(&tiered);
+    assert_eq!(results, "((5 8 5 22 5) (14 (10 11) 14))");
+    if MAPPED_LINUX {
+        assert_eq!(tiers, "2 2", "{}", String::from_utf8_lossy(&tiered.stderr));
+    }
+    let (oracle, _) = results_and_tiers(&egcl(program, &[("EGCL_FORCE_TIER", "interp")]));
+    assert_eq!(results, oracle);
 }

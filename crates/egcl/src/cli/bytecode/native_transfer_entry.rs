@@ -1948,19 +1948,23 @@ pub(super) fn captured_activation_parameters(body: &BytecodeFunction) -> bool {
 
 /// Why the managed entry cannot own `body`'s captured environment, or `None`
 /// when it can or there is none. Native code reaches captured variables only
-/// through runtime helpers on the activation's own frame, so the body must
-/// define every binding it names: a closure body reading the bindings of its
-/// creator still depends on which callable instance is running, and stays
-/// interpreted (bliss-kg667 covers that shape).
+/// through runtime helpers that walk the activation's frame chain exactly as
+/// the interpreter does; that frame's parent is the running callable's captured
+/// environment, so a read of an enclosing binding resolves the same way. A
+/// body that names a binding it never defines is still declined, conservatively
+/// (bliss-kg667 keeps closure bodies reading their creator's bindings
+/// interpreted). Ownership is by name, not by position: a body that reads an
+/// enclosing X and also binds its own captured X is admitted, and its reads
+/// before, inside and after the inner binding take the interpreter's chain walk
+/// (pinned by `shadowing_captured_names_match_the_interpreter`).
 pub(super) fn captured_environment_decline(body: &BytecodeFunction) -> Option<&'static str> {
     if !body.has_env {
         return None;
     }
-    if !body.variadic
-        && !(body.min_args <= body.arity
-            && body.max_args == Some(body.arity)
-            && body.param_layout.len() == usize::from(body.arity))
-    {
+    let exact_positional = body.min_args <= body.arity
+        && body.max_args == Some(body.arity)
+        && body.param_layout.len() == usize::from(body.arity);
+    if !(body.variadic || exact_positional) {
         return Some("unsupported lambda-list shape");
     }
     // Boxed parameters take no slot. The remaining ones must be the slot
