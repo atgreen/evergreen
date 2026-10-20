@@ -264,6 +264,15 @@ impl Asm {
         self.code.extend_from_slice(&[0x07, 0xfe]);
     }
 
+    /// BCR 15,reg: an unconditional branch through a register. Unlike
+    /// [`Self::call_reg`] (BASR) it leaves r14 alone, which is what a tail
+    /// jump to another stub needs when the caller's return address must
+    /// survive the branch.
+    pub fn jump_reg(&mut self, reg: u8) {
+        assert!(reg > 0 && reg < 16);
+        self.code.extend_from_slice(&[0x07, 0xf0 | reg]);
+    }
+
     /// Save r6-r15 in the caller's ABI save area and reserve the 160-byte
     /// outgoing save/argument area. Tagged Lisp roots live in EgclStack, never
     /// in this native save area across an allocating call.
