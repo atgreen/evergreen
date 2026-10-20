@@ -139,8 +139,10 @@ fn image_option_traversal_survives_relocation_during_value_evaluation() {
             "the fixture must relocate the exact unread option tail:\n{stderr}"
         );
         let image = image.expect("successful image save must create its destination");
+        let archive = egcl_rt::container::read(&image[..]).unwrap();
         assert!(
-            image.len() >= 16 && &image[image.len() - 16..image.len() - 8] == b"EGCLEXE\0",
+            image.starts_with(b"\x7fELF")
+                && archive.is_some_and(|a| a.member(egcl_rt::container::CORE).is_some()),
             "the option following the allocating value must still select an executable image"
         );
     }

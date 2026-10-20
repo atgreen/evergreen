@@ -9,6 +9,7 @@ use crate::bignum::{BigInt, bigint_from_val};
 use crate::error::EgclError;
 use crate::value::EgclVal;
 
+pub mod embedded;
 pub mod memory;
 
 #[cfg(all(egcl_tsan, not(feature = "c-ffi")))]
@@ -849,6 +850,12 @@ mod elf_backend {
     /// Load a shared library by path with `elf_loader`, resolving its undefined
     /// symbols against the host and running its constructors.
     pub fn load_foreign_library(name: &str) -> Result<*mut (), EgclError> {
+        if super::embedded::is_embedded(name) {
+            return Err(EgclError::FfiError(format!(
+                "'{name}' is an embedded foreign library, which this build cannot load yet; \
+                 embedded libraries need the c-ffi (dlopen) backend"
+            )));
+        }
         let host = SyntheticModule::new("__egcl_host", host_symbols());
         // elf_loader's raw pread bypasses MSan's initialized-byte tracking.
         // Instrumented reads and checked copies preserve shadow state without
@@ -1004,6 +1011,19 @@ static DYNAMIC_LIBRARIES: std::sync::Mutex<Vec<Option<std::sync::Arc<DynamicLibr
 ))]
 pub fn load_foreign_library(name: &str) -> Result<*mut (), EgclError> {
     use std::ffi::CString;
+    // An embedded library shadows the file system, as embedded files do.
+    #[cfg(egcl_dlopen_embedded)]
+    if let Some(handle) = embedded::open(name) {
+        let mut libraries = DYNAMIC_LIBRARIES.lock().unwrap();
+        libraries.push(Some(std::sync::Arc::new(DynamicLibrary(handle? as usize))));
+        return Ok(libraries.len() as *mut ());
+    }
+    #[cfg(not(egcl_dlopen_embedded))]
+    if embedded::is_embedded(name) {
+        return Err(EgclError::FfiError(format!(
+            "'{name}' is an embedded foreign library, which this platform cannot load yet"
+        )));
+    }
     let c_name = CString::new(name)
         .map_err(|_| EgclError::FfiError("library name contains null byte".into()))?;
 

@@ -80,8 +80,10 @@ fn saved_application_maps_its_image_without_reading_the_payload() {
         String::from_utf8_lossy(&saved.stderr)
     );
     let bytes = fs::read(&app).unwrap();
-    let image_len = u64::from_le_bytes(bytes[bytes.len() - 8..].try_into().unwrap());
-    assert_eq!((bytes.len() as u64 - 16 - image_len) % 4096, 0);
+    let archive = egcl_rt::container::read(&bytes[..]).unwrap().unwrap();
+    let core = archive.core().unwrap().unwrap();
+    assert_eq!(core.data_offset % 4096, 0);
+    let image_len = core.size;
     let output = Command::new(&app).output().unwrap();
     let _ = fs::remove_dir_all(&dir);
     assert!(

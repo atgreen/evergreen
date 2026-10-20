@@ -125,6 +125,86 @@ makes the lookup scope explicit; omitting it uses the default lookup scope.
 Close the library only when no code can call its symbols or use its data.
 Failures are reported through the FFI error interface.
 
+### Embedded libraries { #embedded-libraries }
+
+**Functions**
+
+```lisp
+(egcl-ffi:embed-foreign-library path &key names)    ; name it is reported under
+(egcl-ffi:embedded-foreign-libraries)               ; list of names
+(egcl-ffi:embedded-foreign-library-p name)          ; generalized boolean
+```
+
+`embed-foreign-library` reads the shared object at `path` now, on the build
+host, and carries it in every image saved afterwards, including an
+`:executable` one. `load-foreign-library` then finds it on any host, without
+the file, under its ELF SONAME, under the absolute `path` it was embedded
+from, or under any string in `names`. An embedded library shadows a file of the
+same name. Embedding under a name already in use replaces that library. The
+return value is the SONAME, or the absolute path when the library has none.
+
+```lisp
+;; Build time
+(egcl-ffi:embed-foreign-library "/usr/lib64/libsqlite3.so.0")
+(egcl-ext:save-lisp-and-die "app" :executable t)
+
+;; Run time, on a host without libsqlite3
+(egcl-ffi:load-foreign-library "libsqlite3.so.0")
+```
+
+The library is not extracted to disk. With the `c-ffi` backend on glibc Linux,
+its bytes are copied from the image into an anonymous in-memory file, which is
+sealed against change and checked against its CRC-32 before the system loader
+opens it. Debuggers, `perf` and `/proc/PID/maps`
+show it as `/memfd:SONAME`. Embedded libraries that it names as `DT_NEEDED`
+dependencies are loaded first, so they too come from the image. Dependencies
+that are not embedded, such as `libc.so.6`, are found by the usual search.
+
+The library must be built for the runtime's architecture, and the host must
+allow executable in-memory files: a kernel with `vm.memfd_noexec=2` refuses
+them, and `/proc` must be mounted. Because the loader keeps one library per
+SONAME, loading an embedded library is an error if a library with the same
+SONAME was already loaded from somewhere else, unless that is the very file it
+was embedded from, unchanged: then the loaded library is returned, so a build
+can load a library before embedding it. Embedding needs an ELF host (Linux).
+Other Linux builds, such as the default static musl one, can embed and save
+libraries but report an error when asked to load one. Embedding a library
+distributes it: check its license.
+
+#### Replacing embedded libraries { #replacing-embedded-libraries }
+
+A saved executable is the runtime followed by a zip archive, and a core file
+that carries libraries is that archive alone. Zip readers skip the runtime in
+front, so standard tools list and edit the libraries, and the program needs no
+rebuild afterwards. Licenses such as the LGPL require that users can do this
+with their own builds of a library.
+
+```console
+$ unzip -l app
+  Length      Date    Time    Name
+---------  ---------- -----   ----
+      196  01-01-1980 00:00   egcl/manifest
+  2736541  01-01-1980 00:00   egcl/core
+   969416  01-01-1980 00:00   lib/libsqlite3.so.0
+$ mkdir lib && cp ~/build/sqlite/libsqlite3.so.0 lib/
+$ mv app app.zip && zip app.zip lib/libsqlite3.so.0 && mv app.zip app
+```
+
+Each library is a member under `lib/`, named after its SONAME. A member
+replaced this way keeps the names the original answered to. A member added by
+hand answers to its file name, so name it after the library's SONAME; one
+removed is no longer embedded. Members may be stored or deflated, as `zip`
+does by default. Info-ZIP's `zip` only accepts an archive whose name ends in
+`.zip`, hence the renames. Python's `zipfile` also works. 7-Zip refuses an
+archive behind a runtime of more than a few megabytes.
+
+`egcl/core` must stay stored (uncompressed), because it is mapped from the
+file in place. `zip` copies members it is not given unchanged, so this matters
+only when re-adding the core: use `zip -0` for it. `egcl/manifest` records
+each library's names and whether the executable is an application. Stripping
+the executable removes the archive, as it removes the image of any saved
+executable.
+
 ### `egcl-ffi:foreign-call` { #foreign-call }
 
 **Function**

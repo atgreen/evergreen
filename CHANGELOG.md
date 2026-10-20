@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Added
+
+- Shared libraries can travel inside a saved executable.
+  `egcl-ffi:embed-foreign-library` reads one on the build host, and
+  `load-foreign-library` then finds it by SONAME, path or alias on any host.
+  The executable's appended data is now a zip archive, so `unzip -l app` lists
+  the embedded libraries and ordinary zip tools can extract, replace, add or
+  remove them, as the LGPL requires users to be able to. On glibc builds with
+  the `c-ffi` backend a library is loaded from a sealed, CRC-checked in-memory
+  file, never extracted to disk, and embedded `DT_NEEDED` dependencies are
+  loaded the same way
+  ([#445](https://github.com/atgreen/evergreen/pull/445)).
+
 ### Performance
 
 - `FLOOR`, `CEILING`, `TRUNCATE`, `ROUND`, `MOD` and `REM` on bignums divide

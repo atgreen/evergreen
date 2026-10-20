@@ -35,6 +35,14 @@ fn run(exe: &str, args: &[&str]) -> Output {
         .output()
         .unwrap()
 }
+/// Where a saved executable's core lies inside it: the `egcl/core` member of
+/// the zip archive after the runtime.
+fn core_extent(bytes: &[u8]) -> (usize, usize) {
+    let archive = egcl_rt::container::read(bytes).unwrap().expect("executable archive");
+    let core = archive.core().unwrap().expect("egcl/core member");
+    (core.data_offset as usize, core.size as usize)
+}
+
 fn ok(output: Output) -> String {
     assert!(
         output.status.success(),
@@ -583,9 +591,9 @@ fn shake_follows_only_reachable_compiled_closure_bodies_and_captures() {
     // The code must actually disappear from the serialized registry, not just
     // be ignored by analysis. A second shake has no orphan code to remove.
     let bytes = fs::read(&exe).unwrap();
-    let size = u64::from_le_bytes(bytes[bytes.len() - 8..].try_into().unwrap()) as usize;
+    let (core_start, size) = core_extent(&bytes);
     let reduced = f.path("reduced.core");
-    fs::write(&reduced, &bytes[bytes.len() - 16 - size..bytes.len() - 16]).unwrap();
+    fs::write(&reduced, &bytes[core_start..core_start + size]).unwrap();
     let again = ok(run(
         BIN,
         &[
@@ -648,9 +656,9 @@ fn shake_keeps_saved_macro_expanders_and_removes_unused_definitions() {
     }
     assert!(ok(run(&exe, &[])).contains("MACRO-HANDLES-OK"));
     let bytes = fs::read(&exe).unwrap();
-    let size = u64::from_le_bytes(bytes[bytes.len() - 8..].try_into().unwrap()) as usize;
+    let (core_start, size) = core_extent(&bytes);
     let reduced = f.path("reduced.core");
-    fs::write(&reduced, &bytes[bytes.len() - 16 - size..bytes.len() - 16]).unwrap();
+    fs::write(&reduced, &bytes[core_start..core_start + size]).unwrap();
     let again = ok(run(
         BIN,
         &[
@@ -744,9 +752,9 @@ fn shake_prunes_setf_writers_and_preserves_saved_writer_functions() {
         }
         assert!(ok(run(&exe, &[])).contains("WRITER-LIVE-OK"));
         let bytes = fs::read(&exe).unwrap();
-        let size = u64::from_le_bytes(bytes[bytes.len() - 8..].try_into().unwrap()) as usize;
+        let (core_start, size) = core_extent(&bytes);
         let reduced = f.path("reduced.core");
-        fs::write(&reduced, &bytes[bytes.len() - 16 - size..bytes.len() - 16]).unwrap();
+        fs::write(&reduced, &bytes[core_start..core_start + size]).unwrap();
         let again = ok(run(
             BIN,
             &[
@@ -1151,9 +1159,9 @@ fn shake_prunes_generic_owners_but_keeps_methods_and_class_accessors() {
     // Re-shake reads the serialized registries, so a removed generic or
     // method cannot survive unnoticed in a host-side metadata table.
     let bytes = fs::read(&exe).unwrap();
-    let size = u64::from_le_bytes(bytes[bytes.len() - 8..].try_into().unwrap()) as usize;
+    let (core_start, size) = core_extent(&bytes);
     let reduced = f.path("reduced-generics.core");
-    fs::write(&reduced, &bytes[bytes.len() - 16 - size..bytes.len() - 16]).unwrap();
+    fs::write(&reduced, &bytes[core_start..core_start + size]).unwrap();
     let second_exe = f.path("generics-again");
     let again = ok(run(
         BIN,
@@ -1255,13 +1263,13 @@ fn shake_traces_source_closures_only_from_reachable_handles() {
         .unwrap();
     assert!(removed > 0, "{report}");
     let bytes = fs::read(&exe).unwrap();
-    let size = u64::from_le_bytes(bytes[bytes.len() - 8..].try_into().unwrap()) as usize;
+    let (core_start, size) = core_extent(&bytes);
     assert!(
         fs::metadata(&core).unwrap().len() > size as u64 + 100000,
         "unreachable captured payload must leave the compacted image"
     );
     let reduced = f.path("reduced.core");
-    fs::write(&reduced, &bytes[bytes.len() - 16 - size..bytes.len() - 16]).unwrap();
+    fs::write(&reduced, &bytes[core_start..core_start + size]).unwrap();
     let again = ok(run(
         BIN,
         &[
@@ -1365,11 +1373,11 @@ fn resaving_an_executable_replaces_the_previous_embedded_image() {
             &format!("(egcl-ext:save-lisp-and-die {second:?} :executable t)"),
         ],
     ));
-    fn prefix(path: &str) -> usize {
+    fn prefix(path: &str) -> u64 {
         let bytes = fs::read(path).unwrap();
-        assert_eq!(&bytes[bytes.len() - 16..bytes.len() - 8], b"EGCLEXE\0");
-        let len = u64::from_le_bytes(bytes[bytes.len() - 8..].try_into().unwrap()) as usize;
-        bytes.len() - 16 - len
+        let archive = egcl_rt::container::read(&bytes[..]).unwrap().unwrap();
+        assert!(archive.member(egcl_rt::container::CORE).is_some());
+        archive.start
     }
     assert_eq!(
         prefix(&first),
@@ -1593,7 +1601,8 @@ fn shake_reduces_the_embedded_core_when_unused_code_has_large_constants() {
         &["--image", &image, "--shake", &spec, "--output", &exe],
     ));
     let bytes = fs::read(&exe).unwrap();
-    let core_size = u64::from_le_bytes(bytes[bytes.len() - 8..].try_into().unwrap());
+    let (core_start, core_size) = core_extent(&bytes);
+    let core_size = core_size as u64;
     let input_size = fs::metadata(&image).unwrap().len();
     let payload = b"unreachable payload unreachable payload";
     assert!(
@@ -1606,7 +1615,7 @@ fn shake_reduces_the_embedded_core_when_unused_code_has_large_constants() {
         !bytes.windows(payload.len()).any(|w| w == payload),
         "unused constant must be absent, including from the restored pinned heap (offset {:?}, core starts {}): {}",
         bytes.windows(payload.len()).position(|w| w == payload),
-        bytes.len() as u64 - 16 - core_size,
+        core_start,
         fs::read_to_string(format!("{exe}.manifest")).unwrap()
     );
     let wide_payload: Vec<u8> = payload

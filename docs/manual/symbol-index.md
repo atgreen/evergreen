@@ -56,8 +56,11 @@ alphabetized by unqualified name and display their package explicitly.
 | `egcl-ext:deopt-count` | [Dictionary entry](compiler.md#counters) |
 | `java:describe-class` | [Dictionary entry](java.md#bindings) |
 | `egcl-ext:embed-file` | [Dictionary entry](user/reference/images.md#embed-file) |
+| `egcl-ffi:embed-foreign-library` | [Dictionary entry](foreign.md#embedded-libraries) |
 | `egcl-ext:embedded-file-p` | [Dictionary entry](user/reference/images.md#embedded-file-p) |
 | `egcl-ext:embedded-files` | [Dictionary entry](user/reference/images.md#embedded-files) |
+| `egcl-ffi:embedded-foreign-libraries` | [Dictionary entry](foreign.md#embedded-libraries) |
+| `egcl-ffi:embedded-foreign-library-p` | [Dictionary entry](foreign.md#embedded-libraries) |
 | `java:error-message` | [Dictionary entry](java.md#java-conditions) |
 | `egcl-jvm:error-message` | [Dictionary entry](java.md#java-conditions) |
 | `egcl-ext:events-count` | [Dictionary entry](profiling.md#events) |

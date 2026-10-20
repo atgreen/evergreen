@@ -84,9 +84,9 @@ fn resaving_an_application_replaces_its_payload() {
     }
     let runtime_size = |path: &std::path::Path| {
         let bytes = fs::read(path).unwrap();
-        assert_eq!(&bytes[bytes.len() - 16..bytes.len() - 8], b"EGCLAPP\0");
-        let payload = u64::from_le_bytes(bytes[bytes.len() - 8..].try_into().unwrap()) as usize;
-        bytes.len() - 16 - payload
+        let archive = egcl_rt::container::read(&bytes[..]).unwrap().unwrap();
+        assert!(archive.manifest(&bytes[..]).unwrap().application);
+        archive.start
     };
     assert_eq!(runtime_size(&first), runtime_size(&second));
     let output = Command::new(&second).arg("--help").output().unwrap();

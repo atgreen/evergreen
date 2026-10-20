@@ -4659,6 +4659,8 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
                   "FOREIGN-TYPE-SIZE" "FOREIGN-TYPE-ALIGNMENT" "FFI-ERROR"
                   "MAKE-SHAREABLE-BYTE-VECTOR" "WITH-POINTER-TO-VECTOR-DATA"
                   "FOREIGN-LIBRARY" "FOREIGN-LIBRARY-P" "LOAD-FOREIGN-LIBRARY"
+                  "EMBED-FOREIGN-LIBRARY" "EMBEDDED-FOREIGN-LIBRARIES"
+                  "EMBEDDED-FOREIGN-LIBRARY-P"
                   "CLOSE-FOREIGN-LIBRARY" "FOREIGN-SYMBOL-POINTER" "FOREIGN-CALL"
                   "FOREIGN-CALL-BUFFERED"
                   "FOREIGN-CALLBACK" "FOREIGN-CALLBACK-P" "MAKE-CALLBACK"
@@ -4691,6 +4693,14 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
 (deftype egcl-ffi:foreign-library () '(satisfies egcl-ffi:foreign-library-p))
 (defun egcl-ffi:load-foreign-library (path) (egcl::%foreign-library :load path))
 (defun egcl-ffi:close-foreign-library (library) (egcl::%foreign-library :close library))
+;;; Shared objects carried by the image (bliss-rhsy4). LOAD-FOREIGN-LIBRARY
+;;; finds one by SONAME, by the path it was embedded from, or by an extra name,
+;;; before it looks at the file system.
+(defun egcl-ffi:embed-foreign-library (path &key names)
+  (egcl::%foreign-library :embed (namestring path) (mapcar #'namestring names)))
+(defun egcl-ffi:embedded-foreign-libraries () (egcl::%foreign-library :embedded))
+(defun egcl-ffi:embedded-foreign-library-p (name)
+  (egcl::%foreign-library :embedded-p (namestring name)))
 (defun egcl-ffi:foreign-symbol-pointer (name &optional library)
   (egcl::%foreign-library :symbol name library))
 (defun egcl-ffi:foreign-call (pointer return-type argument-types arguments &optional (fixed-count nil variadic-p))
