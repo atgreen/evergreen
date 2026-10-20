@@ -693,6 +693,18 @@ pub fn ret() -> u32 {
     0xD65F_0000 | ((LR as u32) << 5)
 }
 
+/// `BTI c` — a branch-target marker permitting an indirect CALL to land here.
+///
+/// This is AArch64's counterpart to x86-64's `ENDBR64`. On a kernel with
+/// branch-target identification active, an indirect branch into a page mapped
+/// with guarded control flow faults unless its target is such a marker, so
+/// every stub a generated `br`/`blr` can reach must start with one. It is a
+/// hint instruction, so it is simply a no-op where BTI is not enabled, which
+/// is why emitting it unconditionally is safe.
+pub fn bti_c() -> u32 {
+    0xD503_245F
+}
+
 /// Which memory accesses a [`dmb`] orders. The inner-shareable domain covers
 /// the cores of a single system, which is where a Lisp thread and the
 /// collector run; a full-system barrier would be stronger than any of these
@@ -888,6 +900,7 @@ mod tests {
     #[test]
     fn barriers_match_the_assembler() {
         check(&[
+            ("bti c", 0xD503245F, bti_c()),
             ("dmb ishld", 0xD50339BF, dmb(Barrier::Load)),
             ("dmb ishst", 0xD5033ABF, dmb(Barrier::Store)),
             ("dmb ish", 0xD5033BBF, dmb(Barrier::Full)),
