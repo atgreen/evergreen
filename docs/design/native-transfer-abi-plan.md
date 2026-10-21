@@ -1062,15 +1062,36 @@ cleanup capture, loop polling and local-exit admission remain open under
 remain in the final portability audit.
 
 The AArch64 runtime now has the corresponding AAPCS64 segment enter/leave
-boundary in `crates/egcl-rt/src/native_transfer/aarch64.rs`, with a QEMU probe
+boundary in `crates/egcl-rt/src/native_transfer/aarch64.rs`, with a probe
 covering normal return, direct transfer, anchor cleanup and host-stack
-restoration. The CLI has a narrow `EGCL_NATIVE_TRANSFER=1` entry for constant
-and identity T2 bodies: it supplies the nonallocating multiple-values adapter,
-publishes the active environment, and falls back before any Lisp call,
-deoptimization, handler, cleanup, or loop-polling operation. This does not
-claim general AArch64 activation; generated entry admission, deoptimization
-metadata, fault recovery, handlers and cleanup capture remain target-specific
-gates.
+restoration. That boundary refuses the segment ABI when the kernel reports an
+enabled Guarded Control Stack, and when a seccomp-denied query leaves the
+hardening state unknown, on the same "unknown is a refusal" rule as the
+x86-64 shadow-stack probe. `leave_native_segment` honours `landing_sp`, which
+the ordinary register entry will need. The CLI has a narrow
+`EGCL_NATIVE_TRANSFER=1` entry for constant and identity T2 bodies: it
+supplies the nonallocating multiple-values adapter, publishes the active
+environment, and falls back before any Lisp call, deoptimization, handler,
+cleanup, or loop-polling operation.
+
+The compiler-side machine stubs now exist too, in
+`crates/egcl-compiler/src/t2/native_transfer_aarch64.rs`: the helper veneer,
+the capture stub and `Aapcs64TransferCapture`, and the native landing stub,
+with execution tests on AArch64 hardware. Two AAPCS64 differences from SysV
+are settled there and should not be re-derived: the capture image takes no
+callee-saved FP registers, because AAPCS64 preserves only the low 64 bits of
+v8-v15 and `allocate_framed_a64` excludes that range from its pool entirely;
+and `caller_sp` takes no `+8` adjustment, because `BL` writes x30 rather than
+pushing a return address.
+
+This still does not claim general AArch64 activation. What the stubs do not
+yet have above them is the installer half: a frame-home provider and a
+transfer-site table for AAPCS64 (`transfer_map.rs` resolves homes through
+`x64_frame`), root publication, deoptimization metadata, fault recovery,
+native handler and cleanup capture, segment nesting, and the ordinary
+register ABI. `NativeCodeStorage::Mapped` and
+`checked_native_installation_allowed()` are still x86-64-Linux only, so
+AArch64 installs checked code exclusively.
 
 The s390x runtime now has the corresponding ELF64 segment enter/leave boundary
 in `crates/egcl-rt/src/native_transfer/s390x.S`, with a QEMU probe covering

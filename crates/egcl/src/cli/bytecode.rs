@@ -18585,6 +18585,7 @@ extern "C" fn c2i_make_closure(form: u64) -> u64 {
 #[cfg(any(
     target_arch = "x86_64",
     target_arch = "s390x",
+    target_arch = "aarch64",
     all(target_arch = "powerpc64", target_endian = "little")
 ))]
 extern "C" fn c2i_make_bytecode_closure(nested: *const Arc<BytecodeFunction>, capture: u64) -> u64 {
@@ -18610,6 +18611,37 @@ extern "C" fn c2i_make_bytecode_closure(nested: *const Arc<BytecodeFunction>, ca
             stash_native_error(error);
             NIL.0
         }
+    }
+}
+
+/// `CheckResult`: validate the primary against a declared result type.
+///
+/// The value stays where the emitter left it -- the T0 arm pops and pushes the
+/// same word -- so this takes it by value purely to inspect it, and returns
+/// nothing. On a violation it stashes the TYPE-ERROR `validate_declared_value`
+/// builds, and the caller's transfer check leaves the activation, exactly as
+/// an erroring call does.
+///
+/// Does NOT clear the MV state: a successful result assertion leaves the
+/// multiple-values tuple intact, which is what makes
+/// `(values acc :secondary)` keep its secondary value through a declared
+/// `ftype`. The `DeclaredType` is passed flattened because it has to cross an
+/// `extern "C"` boundary: `kind` is its discriminant and the bounds are read
+/// only for `FixnumRange`.
+#[cfg(all(target_arch = "aarch64", unix))]
+extern "C" fn c2i_check_result(value: u64, kind: u64, lower: i64, upper: i64) {
+    let declared = match kind {
+        1 => DeclaredType::Fixnum,
+        2 => DeclaredType::SingleFloat,
+        3 => DeclaredType::FixnumRange { lower, upper },
+        _ => DeclaredType::Any,
+    };
+    match guard_c2i(|| {
+        validate_declared_value(declared, EgclVal(value))?;
+        Ok(NIL)
+    }) {
+        Ok(_) => {}
+        Err(error) => stash_native_error(error),
     }
 }
 
@@ -24466,6 +24498,14 @@ fn describe_emit_error(e: &egcl_compiler::t2::emit::EmitError) -> String {
             if tag & 0xFFFF_0000 == egcl_compiler::t2::emit_s390x::S390X_DECLINE_TAG =>
         {
             format!(" [s390x emitter declined at emit_s390x.rs:{}]", tag & 0xFFFF)
+        }
+        EmitError::UnsupportedOp(tag)
+            if tag & 0xFFFF_0000 == egcl_compiler::t2::emit_a64::A64_DECLINE_TAG =>
+        {
+            format!(
+                " [aarch64 emitter declined at emit_a64.rs:{}]",
+                tag & 0xFFFF
+            )
         }
         EmitError::UnsupportedOp(tag) if tag & 0x1000 != 0 => {
             format!(" [refused Opcode #{} in t2/ir.rs]", tag & 0xFFF)

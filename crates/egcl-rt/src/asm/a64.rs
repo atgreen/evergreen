@@ -508,6 +508,43 @@ pub fn ldr_pre(t: Reg, n: Reg, offset: i32) -> Option<u32> {
     load_store_unscaled(0xF840_0C00, t, n, offset)
 }
 
+/// `LDRB Wt, [Xn, #offset]` — a zero-extending byte load. The unsigned-offset
+/// form is unscaled for a byte access, so any `offset` below 4096 encodes.
+/// Reading a heap object's header type-id byte is what needs this.
+pub fn ldrb_imm(t: Reg, n: Reg, offset: u64) -> Option<u32> {
+    load_store_byte(0x3940_0000, t, n, offset)
+}
+
+/// `STRB Wt, [Xn, #offset]` — the store counterpart of [`ldrb_imm`].
+pub fn strb_imm(t: Reg, n: Reg, offset: u64) -> Option<u32> {
+    load_store_byte(0x3900_0000, t, n, offset)
+}
+
+fn load_store_byte(base: u32, t: Reg, n: Reg, offset: u64) -> Option<u32> {
+    if offset >= 0x1000 {
+        return None;
+    }
+    Some(base | ((offset as u32) << 10) | ((n as u32) << 5) | t as u32)
+}
+
+/// `LDRH Wt, [Xn, #offset]` — a zero-extending halfword load, scaled by two.
+pub fn ldrh_imm(t: Reg, n: Reg, offset: u64) -> Option<u32> {
+    load_store_half(0x7940_0000, t, n, offset)
+}
+
+/// `STRH Wt, [Xn, #offset]` — a 16-bit store, scaled by two. A frame header's
+/// `num_locals` is a `u16`: a wider store would clobber the fields past it.
+pub fn strh_imm(t: Reg, n: Reg, offset: u64) -> Option<u32> {
+    load_store_half(0x7900_0000, t, n, offset)
+}
+
+fn load_store_half(base: u32, t: Reg, n: Reg, offset: u64) -> Option<u32> {
+    if offset % 2 != 0 || offset / 2 >= 0x1000 {
+        return None;
+    }
+    Some(base | (((offset / 2) as u32) << 10) | ((n as u32) << 5) | t as u32)
+}
+
 /// `LDR Xt, [Xn, Xm, LSL #3]` — indexed by a word-scaled register, the shape of
 /// a stack-slot or vector element access.
 pub fn ldr_indexed(t: Reg, n: Reg, m: Reg) -> u32 {
@@ -656,6 +693,44 @@ pub fn ret() -> u32 {
     0xD65F_0000 | ((LR as u32) << 5)
 }
 
+/// `BTI c` — a branch-target marker permitting an indirect CALL to land here.
+///
+/// This is AArch64's counterpart to x86-64's `ENDBR64`. On a kernel with
+/// branch-target identification active, an indirect branch into a page mapped
+/// with guarded control flow faults unless its target is such a marker, so
+/// every stub a generated `br`/`blr` can reach must start with one. It is a
+/// hint instruction, so it is simply a no-op where BTI is not enabled, which
+/// is why emitting it unconditionally is safe.
+pub fn bti_c() -> u32 {
+    0xD503_245F
+}
+
+/// Which memory accesses a [`dmb`] orders. The inner-shareable domain covers
+/// the cores of a single system, which is where a Lisp thread and the
+/// collector run; a full-system barrier would be stronger than any of these
+/// call sites needs.
+#[derive(Clone, Copy, Eq, PartialEq, Debug)]
+pub enum Barrier {
+    /// `ISHLD` — orders loads against later loads and stores.
+    Load,
+    /// `ISHST` — orders stores against later stores.
+    Store,
+    /// `ISH` — orders every access against every later access.
+    Full,
+}
+
+/// `DMB <option>` — a data memory barrier. AArch64 is weakly ordered, so
+/// unlike x86-64 — where only a store-load barrier costs anything — every
+/// kind needs a real instruction here.
+pub fn dmb(barrier: Barrier) -> u32 {
+    let crm = match barrier {
+        Barrier::Load => 0b1001,
+        Barrier::Store => 0b1010,
+        Barrier::Full => 0b1011,
+    };
+    0xD503_3000 | (crm << 8) | 0xBF
+}
+
 /// `NOP`. Padding must still be instruction-shaped: a zero word is `UDF`.
 pub fn nop() -> u32 {
     0xD503_201F
@@ -789,6 +864,47 @@ mod tests {
             "encodings disagree:\n{}",
             wrong.join("\n")
         );
+    }
+
+    #[test]
+    fn sub_word_accesses_match_the_assembler() {
+        // Verified against GNU as on an AArch64 host, read back with
+        // `objdump -d`. The byte form's offset is UNSCALED and the halfword
+        // form's is scaled by two — getting that backwards silently reads the
+        // wrong field of a heap header, which is why each case pins a nonzero
+        // offset and the top of each field's range.
+        check(&[
+            ("ldrb w0, [x1]", 0x39400020, ldrb_imm(0, 1, 0).unwrap()),
+            ("ldrb w2, [x3, #17]", 0x39404462, ldrb_imm(2, 3, 17).unwrap()),
+            (
+                "ldrb w4, [x5, #4095]",
+                0x397FFCA4,
+                ldrb_imm(4, 5, 4095).unwrap(),
+            ),
+            ("strb w0, [x1, #7]", 0x39001C20, strb_imm(0, 1, 7).unwrap()),
+            ("ldrh w0, [x1]", 0x79400020, ldrh_imm(0, 1, 0).unwrap()),
+            ("ldrh w2, [x3, #34]", 0x79404462, ldrh_imm(2, 3, 34).unwrap()),
+            (
+                "strh w4, [x5, #8190]",
+                0x793FFCA4,
+                strh_imm(4, 5, 8190).unwrap(),
+            ),
+        ]);
+        // Out of range, or misaligned for the scaled forms: decline rather
+        // than truncate into a neighbouring field.
+        assert_eq!(ldrb_imm(0, 1, 4096), None);
+        assert_eq!(ldrh_imm(0, 1, 1), None);
+        assert_eq!(strh_imm(0, 1, 8192), None);
+    }
+
+    #[test]
+    fn barriers_match_the_assembler() {
+        check(&[
+            ("bti c", 0xD503245F, bti_c()),
+            ("dmb ishld", 0xD50339BF, dmb(Barrier::Load)),
+            ("dmb ishst", 0xD5033ABF, dmb(Barrier::Store)),
+            ("dmb ish", 0xD5033BBF, dmb(Barrier::Full)),
+        ]);
     }
 
     #[test]
