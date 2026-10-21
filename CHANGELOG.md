@@ -356,7 +356,8 @@
   code, keyword-heavy functions hit it; pure-tls's TLS handshake signalled
   `The value :CLIENT-PRIVATE-KEY is not of type FIXNUM`, so every HTTPS
   download in `ocicl install` failed. These loads now use a 32-bit
-  displacement when they need one.
+  displacement when they need one
+  ([#509](https://github.com/atgreen/evergreen/pull/509)).
 
 - Deep recursion no longer signals a spurious `STORAGE-CONDITION` on Linux
   AArch64. That target used a 512 KiB control stack, the fallback for
