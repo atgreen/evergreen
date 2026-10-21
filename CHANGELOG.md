@@ -303,6 +303,18 @@
   name: `GQ:|:X|`, which is how an exported symbol named `":X"` prints, reads
   back as that symbol instead of as `GQ::X`
   ([#493](https://github.com/atgreen/evergreen/pull/493)).
+- `--heap-size` and `EGCL_HEAP_SIZE` size the heap. Both were parsed and then
+  ignored, so the heap stayed at 512 MB unless `EGCL_HEAP_MB` was set.
+  `--heap-size` takes precedence over `EGCL_HEAP_SIZE`, which takes precedence
+  over `EGCL_HEAP_MB`. A heap smaller than 256 MB gets a nursery of a quarter of
+  the heap rather than a fixed 64 MB, and a restored image that does not fit the
+  requested heap grows it to three times the image's data instead of failing
+  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+- When live data outgrows the heap, a minor collection signals
+  `STORAGE-CONDITION` instead of panicking with "GC minor evacuation exhausted
+  regions". Nothing moves when the survivors cannot be placed, and the program
+  can handle the condition, drop data and continue
+  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
 - A `THROW` from the default form of a `&key` or `&aux` parameter to a
   `CATCH` in the interpreted caller reaches that catch. Once the caller had
   been called a few times, the throw escaped as an internal error such as

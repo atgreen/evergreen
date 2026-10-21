@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Once, OnceLock, RwLock};
 use std::thread::ThreadId;
 // ── Region model ───────────────────────────────────────────────────
@@ -409,6 +409,14 @@ impl HeapAllocator {
     /// has room, lazily converts a Free region to Nursery. Returns OOM once the
     /// budget is full; the collecting slow path uses that result as its trigger.
     fn refill_tlab(&mut self) -> Result<(), EgclError> {
+        self.refill_tlab_within(false)
+    }
+
+    /// [`refill_tlab`](Self::refill_tlab), optionally past the nursery budget
+    /// into the regions [`emergency_reserve_regions`] holds back. Only the
+    /// allocation that a short collection failed uses the reserve, so the
+    /// mutator can reach its next poll and signal STORAGE-CONDITION.
+    fn refill_tlab_within(&mut self, emergency: bool) -> Result<(), EgclError> {
         let mut guard = heap_state().lock().unwrap();
         let state = guard
             .as_mut()
@@ -443,7 +451,7 @@ impl HeapAllocator {
             .filter(|region| region.header.kind == RegionKind::Nursery)
             .count();
         let nursery_region_limit = state.config.nursery_size.div_ceil(self.region_size);
-        if nursery_regions < nursery_region_limit {
+        if emergency || nursery_regions < nursery_region_limit {
             for (idx, region) in state.regions.iter_mut().enumerate() {
                 if region.header.kind != RegionKind::Free {
                     continue;
@@ -577,8 +585,21 @@ impl Allocator for HeapAllocator {
             }
             self.tlab.cursor = std::ptr::null_mut();
             self.tlab.limit = std::ptr::null();
-            HeapCollector::new().minor_gc()?;
-            self.refill_tlab()?;
+            match HeapCollector::new().minor_gc() {
+                Ok(()) => self.refill_tlab()?,
+                Err(EgclError::Oom) => {
+                    // The collection could not place the nursery's survivors
+                    // and left the heap as it was (GitHub #471). Have this
+                    // execution signal STORAGE-CONDITION at its next poll, and
+                    // let it get there on the emergency reserve; allocation
+                    // sites cannot all report failure themselves.
+                    crate::thread::post_current_pending_signal(
+                        crate::thread::PendingSignal::HeapExhausted,
+                    );
+                    self.refill_tlab_within(true)?;
+                }
+                Err(err) => return Err(err),
+            }
         }
 
         // Retry fast-path allocation after refill.
@@ -1864,6 +1885,97 @@ impl HeapCollector {
         Self::allocate_target_region(state, kind, gen_age)
     }
 
+    /// Whether a minor collection can place every marked, unpinned nursery
+    /// object. It replays the evacuation loop's placement — the current
+    /// destination, then the first region of the kind with room, then a Free
+    /// region — over a copy of the region rooms, so it agrees with the copy
+    /// that follows. When enough regions are Free that even an all-live nursery
+    /// fits, the replay is skipped.
+    fn evacuation_fits(
+        state: &HeapState,
+        nursery_indices: &[usize],
+        pinned_indices: &[usize],
+        nursery_index: &NurseryObjectMap,
+        survivor_idx: Option<usize>,
+        promotion_threshold: u8,
+    ) -> bool {
+        let region_size = state.config.region_size;
+        let largest_object = state.config.tlab_size;
+        // Free regions evacuation may take; the emergency reserve is not one.
+        let free = state
+            .regions
+            .iter()
+            .filter(|r| r.header.kind == RegionKind::Free)
+            .count()
+            .saturating_sub(emergency_reserve_regions(state));
+        let evacuated = nursery_indices
+            .iter()
+            .filter(|idx| !pinned_indices.contains(idx))
+            .count();
+        // Every destination region but the two open ones is filled to within
+        // one object of its end, so an all-live nursery needs at most this many.
+        if largest_object < region_size {
+            let worst_case = (evacuated * region_size).div_ceil(region_size - largest_object) + 2;
+            if free >= worst_case {
+                return true;
+            }
+        }
+
+        let mut kinds: Vec<RegionKind> = state.regions.iter().map(|r| r.header.kind).collect();
+        let mut room: Vec<usize> = state
+            .regions
+            .iter()
+            .map(|r| (r.header.alloc_limit as usize).saturating_sub(r.header.alloc_top as usize))
+            .collect();
+        // [survivor, old-generation] destinations, as in the evacuation loop.
+        let mut current = [survivor_idx, None];
+        let mut fresh = 0usize;
+        for &nursery_idx in nursery_indices {
+            if pinned_indices.contains(&nursery_idx) {
+                continue;
+            }
+            let (kind, slot) = if state.regions[nursery_idx].header.gen_age >= promotion_threshold {
+                (RegionKind::OldGen, 1)
+            } else {
+                (RegionKind::Survivor, 0)
+            };
+            for body_addr in nursery_index.marked_bodies(nursery_idx) {
+                let header_ptr = (body_addr - OBJECT_HEADER_SIZE) as *const u8;
+                let (_, body_size) = unsafe { read_object_header(header_ptr) };
+                let size = align_up(OBJECT_HEADER_SIZE + body_size as usize, OBJECT_ALIGNMENT);
+                if let Some(idx) = current[slot]
+                    && room[idx] >= size
+                {
+                    room[idx] -= size;
+                    continue;
+                }
+                let existing = (0..kinds.len()).find(|&idx| {
+                    kinds[idx] == kind && !state.pinned_hosts.contains(&idx) && room[idx] >= size
+                });
+                let target = existing.or_else(|| {
+                    if fresh == free {
+                        return None;
+                    }
+                    fresh += 1;
+                    let idx = kinds.iter().position(|&k| k == RegionKind::Free)?;
+                    kinds[idx] = kind;
+                    let region = &state.regions[idx];
+                    room[idx] =
+                        (region.header.alloc_limit as usize).saturating_sub(region.base as usize);
+                    Some(idx)
+                });
+                match target {
+                    Some(idx) if room[idx] >= size => {
+                        room[idx] -= size;
+                        current[slot] = Some(idx);
+                    }
+                    _ => return false,
+                }
+            }
+        }
+        true
+    }
+
     /// Start a fresh evacuation destination. Major collections must not copy
     /// into another source region that may itself be evacuated and freed.
     fn allocate_target_region(
@@ -2181,6 +2293,25 @@ impl HeapCollector {
             }
         }
 
+        // Nothing has moved yet. If the survivors cannot all be placed, stop
+        // here with the heap intact and report exhaustion, rather than panic
+        // halfway through evacuation (GitHub #471 part 3).
+        if !Self::evacuation_fits(
+            state,
+            &nursery_indices,
+            &pinned_indices,
+            &nursery_index,
+            survivor_idx,
+            promotion_threshold,
+        ) {
+            MINOR_OBJECT_MAP.with(|s| *s.borrow_mut() = std::mem::take(&mut nursery_index));
+            MINOR_WORKLIST.with(|s| *s.borrow_mut() = std::mem::take(&mut mark_worklist));
+            // Nothing changed the older generation, so its scan lists and
+            // armed dirty pages stay valid for the retry.
+            old_scan.put_back();
+            return Err(EgclError::Oom);
+        }
+
         // Everything above these tops after evacuation is a copy made below.
         old_scan.snapshot_tops(state);
         for &nursery_idx in &nursery_indices {
@@ -2264,9 +2395,8 @@ impl HeapCollector {
                     panic!(
                         "GC minor evacuation exhausted regions: live object at {body_addr:#x} \
                          (type {type_id}, {total_size} bytes, target {target_kind:?}) cannot be \
-                         placed; {free_regions} free of {} regions [{}]. Increase EGCL_HEAP_MB, \
-                         or report a bead: the old-occupancy major-GC trigger should have \
-                         prevented this (bliss-wc4t).",
+                         placed; {free_regions} free of {} regions [{}]. Report a bead: \
+                         evacuation_fits approved this collection (GitHub #471, bliss-wc4t).",
                         state.regions.len(),
                         Self::region_census(state),
                     );
@@ -2591,6 +2721,26 @@ impl HeapCollector {
             region.header.alloc_top = region.base;
             region.header.live_bytes = 0;
             region.header.gen_age = 0;
+        }
+
+        // Return regions an exhausted heap lent the nursery from the emergency
+        // reserve (GitHub #471), now that its survivors have found room.
+        let nursery_region_limit = state.config.nursery_size.div_ceil(state.config.region_size);
+        let mut nursery_regions = state
+            .regions
+            .iter()
+            .filter(|region| region.header.kind == RegionKind::Nursery)
+            .count();
+        for &nursery_idx in nursery_indices.iter().rev() {
+            if nursery_regions <= nursery_region_limit {
+                break;
+            }
+            if pinned_indices.contains(&nursery_idx) {
+                continue;
+            }
+            state.regions[nursery_idx].header.kind = RegionKind::Free;
+            state.stats.regions_free += 1;
+            nursery_regions -= 1;
         }
 
         // The nursery is empty, so no older object refers into it: start
@@ -5153,34 +5303,98 @@ mod rooted_tests {
 // collector traces registered evaluator/stdlib roots, evacuates survivors, and
 // reuses the nursery for short-lived allocation.
 
+/// Heap size requested on the command line (`--heap-size`), in bytes; 0 when
+/// none was given. Set by the CLI before the heap is first initialized.
+static HEAP_SIZE_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
+
+/// Default T0 heap size when nothing selects one.
+const T0_DEFAULT_HEAP_SIZE: usize = 512 * 1024 * 1024;
+/// Smallest T0 heap accepted; smaller requests are raised to it.
+const T0_MIN_HEAP_SIZE: usize = 16 * 1024 * 1024;
+/// Largest nursery a T0 heap uses; smaller heaps get a quarter of the heap.
+const T0_MAX_NURSERY_SIZE: usize = 64 * 1024 * 1024;
+const T0_REGION_SIZE: usize = 1024 * 1024;
+
+/// Free regions held back from nursery growth and minor-collection
+/// evacuation: about 1/64 of the heap, at least two regions. When a minor
+/// collection cannot place its survivors, the failed allocation continues into
+/// this reserve so the program can reach a poll and signal STORAGE-CONDITION
+/// rather than fail at an allocation site that cannot report it (GitHub #471).
+fn emergency_reserve_regions(state: &HeapState) -> usize {
+    (state.regions.len() / 64).max(2)
+}
+
+/// Request a heap of `bytes` for the lazily initialized T0 heap (`--heap-size`,
+/// GitHub #471). It takes precedence over `EGCL_HEAP_SIZE` and `EGCL_HEAP_MB`.
+/// Returns false when the heap was already initialized, so the request came too
+/// late to have any effect.
+pub fn set_default_heap_size(bytes: usize) -> bool {
+    HEAP_SIZE_OVERRIDE.store(bytes, Ordering::Release);
+    heap_state()
+        .lock()
+        .map(|guard| guard.is_none())
+        .unwrap_or(false)
+}
+
+/// The T0 heap size, by precedence: `--heap-size` (see
+/// [`set_default_heap_size`]), then `EGCL_HEAP_SIZE` (a size such as `2g`),
+/// then the older `EGCL_HEAP_MB` (MiB), then 512 MiB. Before GitHub #471 only
+/// `EGCL_HEAP_MB` was read here, so the documented knobs were silently ignored.
+fn t0_requested_heap_size() -> usize {
+    let override_bytes = HEAP_SIZE_OVERRIDE.load(Ordering::Acquire);
+    if override_bytes != 0 {
+        return override_bytes;
+    }
+    // The CLI rejects a malformed EGCL_HEAP_SIZE at startup; an embedder that
+    // never parsed it falls through to the next source.
+    if let Some(bytes) = std::env::var("EGCL_HEAP_SIZE")
+        .ok()
+        .and_then(|s| crate::runtime::parse_size(&s, "EGCL_HEAP_SIZE").ok())
+        .filter(|&bytes| bytes != 0)
+    {
+        return bytes;
+    }
+    std::env::var("EGCL_HEAP_MB")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .and_then(|mb| mb.checked_mul(1024 * 1024))
+        .filter(|&bytes| bytes != 0)
+        .unwrap_or(T0_DEFAULT_HEAP_SIZE)
+}
+
 /// Default heap for a standalone T0 evaluator, with survivor/old-generation
 /// reserve left outside the nursery so moving collections always have space.
 fn t0_default_config() -> GcConfig {
-    // `EGCL_HEAP_MB` overrides the total heap size (MiB); useful with
-    // `EGCL_GC_DISABLE` to reserve enough headroom to run to completion without
-    // ever collecting.
-    let heap_size = std::env::var("EGCL_HEAP_MB")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .map(|mb| mb * 1024 * 1024)
-        .unwrap_or(512 * 1024 * 1024);
+    t0_config_for_heap_size(t0_requested_heap_size())
+}
+
+/// T0 heap configuration for a requested total size: rounded up to whole
+/// regions, at least [`T0_MIN_HEAP_SIZE`], with a nursery of a quarter of the
+/// heap capped at 64 MiB so a small heap still leaves room to evacuate into.
+fn t0_config_for_heap_size(requested: usize) -> GcConfig {
+    let heap_size = requested
+        .max(T0_MIN_HEAP_SIZE)
+        .checked_next_multiple_of(T0_REGION_SIZE)
+        .unwrap_or(usize::MAX / T0_REGION_SIZE * T0_REGION_SIZE);
     // `EGCL_GC_DISABLE` makes the whole heap a single nursery so a minor GC is
     // never triggered until the heap is exhausted — a diagnostic for isolating
     // GC/heap-corruption bugs (bliss-6b2): if a workload that intermittently
     // corrupts memory runs cleanly with the collector effectively off, the fault
-    // is in the collector/write-barrier, not the mutator.
+    // is in the collector/write-barrier, not the mutator. Pair it with a large
+    // heap (`--heap-size`, `EGCL_HEAP_SIZE` or `EGCL_HEAP_MB`) to run to
+    // completion without ever collecting.
     let gc_disabled = std::env::var_os("EGCL_GC_DISABLE").is_some();
     let nursery_size = if gc_disabled {
         heap_size
     } else {
-        64 * 1024 * 1024
+        (heap_size / 4 / T0_REGION_SIZE * T0_REGION_SIZE).min(T0_MAX_NURSERY_SIZE)
     };
     GcConfig {
         heap_size,
         heap_max: heap_size,
         nursery_size,
         tlab_size: 256 * 1024,
-        region_size: 1024 * 1024,
+        region_size: T0_REGION_SIZE,
         promotion_threshold: 3,
         pause_target_ms: 10,
         gc_workers: 1,
@@ -7214,13 +7428,31 @@ pub unsafe fn restore_heap_regions(
             * config.region_size;
         occupied = occupied.checked_add(span).ok_or_else(invalid)?;
     }
-    let required = occupied
-        .checked_add(config.nursery_size)
+    // The restored data, a nursery, as much again for the first minor
+    // collection's survivors, and the emergency reserve. A configured heap
+    // (`--heap-size`) smaller than that grows rather than refusing an image the
+    // process can hold (GitHub #471): the image, not the flag, fixes how much
+    // is live at start. It grows to three times the restored data: room to run
+    // and not only to start, with the data under the default 45% occupancy
+    // trigger so that not every minor collection is followed by a major one.
+    let required = config
+        .nursery_size
+        .checked_mul(2)
+        .and_then(|reserve| occupied.checked_add(reserve))
+        .and_then(|bytes| bytes.checked_next_multiple_of(config.region_size))
+        .and_then(|bytes| {
+            let emergency = (bytes / config.region_size / 63 + 1).max(2);
+            bytes.checked_add(emergency * config.region_size)
+        })
         .ok_or_else(invalid)?;
-    config.heap_size = config.heap_size.max(required);
-    if config.heap_size > config.heap_max {
-        return Err(EgclError::Oom);
+    if config.heap_size < required {
+        config.heap_size = occupied
+            .checked_mul(3)
+            .and_then(|bytes| bytes.checked_next_multiple_of(config.region_size))
+            .ok_or_else(invalid)?
+            .max(required);
     }
+    config.heap_max = config.heap_max.max(config.heap_size);
     if let Some((file, offset)) = backing {
         let end = offset.checked_add(data.len() as u64).ok_or_else(invalid)?;
         let file_len = file
@@ -8493,6 +8725,153 @@ mod evacuation_target_tests {
                 "{live_bytes} bytes of live conses need {target_regions} regions, not {searches} searches (promotion threshold {promotion_threshold})"
             );
         }
+    }
+}
+
+// ── Heap exhaustion during a minor collection (GitHub #471) ─────────
+
+#[cfg(test)]
+mod evacuation_exhaustion_tests {
+    use super::*;
+    use crate::value::NIL;
+
+    /// Cons `car` onto the list in the rooted `cdr` slot, which is read only
+    /// after the allocation: a collection there may move the list.
+    fn cons_onto(
+        alloc: &mut HeapAllocator,
+        car: i64,
+        cdr: *const EgclVal,
+    ) -> Result<EgclVal, EgclError> {
+        let body = match alloc.alloc_fast(16) {
+            Some(body) => body,
+            None => alloc.alloc_slow(16)?,
+        };
+        unsafe {
+            write_object_header(
+                body.sub(OBJECT_HEADER_SIZE),
+                crate::object::type_id::CONS,
+                16,
+            );
+            *(body as *mut EgclVal) = EgclVal::from_fixnum(car);
+            *((body as *mut EgclVal).add(1)) = *cdr;
+        }
+        Ok(EgclVal(body as u64 | crate::value::TAG_CONS))
+    }
+
+    fn list_length_descending(mut cursor: EgclVal) -> i64 {
+        let mut count = 0;
+        while cursor != NIL {
+            let body = (cursor.0 & !crate::value::TAG_MASK) as *const EgclVal;
+            unsafe {
+                count += 1;
+                cursor = *body.add(1);
+                // Built by pushing 0, 1, 2, ...: the cell below holds one less.
+                let next = if cursor == NIL { None } else { Some(cursor) };
+                if let Some(next) = next {
+                    let here = *body;
+                    let below = *((next.0 & !crate::value::TAG_MASK) as *const EgclVal);
+                    assert_eq!(below.as_fixnum() + 1, here.as_fixnum());
+                }
+            }
+        }
+        count
+    }
+
+    /// A heap whose live data outgrows it used to panic mid-evacuation ("GC
+    /// minor evacuation exhausted regions"). The collection must instead leave
+    /// every live object where it was, let the failed allocation proceed into
+    /// the emergency reserve, post a HeapExhausted signal, and recover once the
+    /// data is dropped.
+    #[test]
+    fn minor_collection_reports_exhaustion_instead_of_panicking() {
+        const CHILD: &str = "EGCL_TEST_EVACUATION_EXHAUSTION_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "gc::evacuation_exhaustion_tests::minor_collection_reports_exhaustion_instead_of_panicking", "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let region_size = 8192;
+        let config = GcConfig {
+            heap_size: 64 * region_size,
+            heap_max: 64 * region_size,
+            nursery_size: 16 * region_size,
+            tlab_size: 4096,
+            region_size,
+            promotion_threshold: 15,
+            pause_target_ms: 10,
+            gc_workers: 1,
+            satb_buffer_size: 64,
+            old_occupancy_trigger: 0.99,
+        };
+        init_heap(&config).unwrap();
+        let mut alloc = HeapAllocator::new().unwrap();
+        crate::rooted!(list = NIL);
+        // 64 regions of 8 KiB hold at most 16,384 conses of 32 bytes.
+        let mut pushed = 0i64;
+        let mut exhausted = false;
+        while pushed < 100_000 {
+            match cons_onto(&mut alloc, pushed, &*list) {
+                Ok(cell) => {
+                    *list = cell;
+                    pushed += 1;
+                }
+                Err(EgclError::Oom) => {
+                    exhausted = true;
+                    break;
+                }
+                Err(error) => panic!("unexpected allocation error: {error:?}"),
+            }
+        }
+        assert!(
+            exhausted,
+            "{pushed} live conses never exhausted a 512 KiB heap"
+        );
+        assert_eq!(
+            crate::thread::take_current_pending_signal(),
+            Some(crate::thread::PendingSignal::HeapExhausted)
+        );
+        // Nothing live was dropped or moved out from under the root.
+        assert_eq!(list_length_descending(*list), pushed);
+
+        // Once the data is garbage, collections succeed again and the regions
+        // lent to the nursery go back to the reserve.
+        *list = NIL;
+        for i in 0..50_000 {
+            *list = cons_onto(&mut alloc, i % 1000, &NIL).expect("allocation after recovery");
+        }
+        let guard = heap_state().lock().unwrap();
+        let state = guard.as_ref().unwrap();
+        let nursery = state
+            .regions
+            .iter()
+            .filter(|region| region.header.kind == RegionKind::Nursery)
+            .count();
+        assert!(nursery <= 16, "{nursery} nursery regions after recovery");
+    }
+
+    #[test]
+    fn t0_heap_configuration_scales_the_nursery_with_the_heap() {
+        let large = t0_config_for_heap_size(8 << 30);
+        assert_eq!((large.heap_size, large.heap_max), (8 << 30, 8 << 30));
+        assert_eq!(large.nursery_size, 64 << 20);
+        let small = t0_config_for_heap_size(32 << 20);
+        assert_eq!((small.heap_size, small.nursery_size), (32 << 20, 8 << 20));
+        // Raised to the minimum, and rounded up to whole regions.
+        assert_eq!(t0_config_for_heap_size(1).heap_size, T0_MIN_HEAP_SIZE);
+        assert_eq!(
+            t0_config_for_heap_size((100 << 20) + 1).heap_size,
+            101 << 20
+        );
     }
 }
 

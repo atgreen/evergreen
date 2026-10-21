@@ -265,6 +265,9 @@ pub enum PendingSignal {
     Arithmetic,
     Pipe,
     Timeout,
+    /// A collection could not make room for an allocation (GitHub #471); the
+    /// evaluator signals STORAGE-CONDITION.
+    HeapExhausted,
 }
 
 impl PendingSignal {
@@ -277,6 +280,7 @@ impl PendingSignal {
             PendingSignal::Arithmetic => 1 << 4,
             PendingSignal::Pipe => 1 << 5,
             PendingSignal::Timeout => 1 << 6,
+            PendingSignal::HeapExhausted => 1 << 7,
         }
     }
 
@@ -289,6 +293,8 @@ impl PendingSignal {
             Some(PendingSignal::NullGuard)
         } else if bits & PendingSignal::StackGuard.bit() != 0 {
             Some(PendingSignal::StackGuard)
+        } else if bits & PendingSignal::HeapExhausted.bit() != 0 {
+            Some(PendingSignal::HeapExhausted)
         } else if bits & PendingSignal::Arithmetic.bit() != 0 {
             Some(PendingSignal::Arithmetic)
         } else if bits & PendingSignal::Pipe.bit() != 0 {

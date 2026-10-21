@@ -15,6 +15,30 @@ Losing the last Lisp wrapper is not a request to free storage that C may still
 retain. Use `foreign-free` after the foreign lifetime ends. See
 [Foreign pointers and storage](foreign.md#foreign-alloc).
 
+## Heap size
+
+The Lisp heap is reserved once, at startup, and does not grow while the
+program runs. Its size comes from the first of these that is set:
+
+1. `--heap-size SIZE` on the command line, for example `--heap-size 2G`.
+2. The `EGCL_HEAP_SIZE` environment variable, with the same syntax
+   (`512m`, `2g`, or a byte count).
+3. The older `EGCL_HEAP_MB` environment variable, a whole number of MiB.
+4. Otherwise, 512 MiB.
+
+Sizes round up to whole 1 MiB regions, with a minimum of 16 MiB. The nursery
+is a quarter of the heap, up to 64 MiB. The reservation is committed lazily, so
+a large heap costs little memory until it is used.
+
+A saved world restored with `--image`, or embedded in an executable, takes the
+heap size of the process that restores it, not the one that saved it. A heap
+too small for the restored data grows to three times the size of that data.
+
+When live data outgrows the heap, the allocation that needed the space signals
+`storage-condition`. The collector moves nothing in that case, and a program
+that handles the condition and drops data can continue. Restart with a larger
+`--heap-size` when the data is meant to be live.
+
 ## Explicit collection
 
 ### `egcl-ext:gc` { #gc }

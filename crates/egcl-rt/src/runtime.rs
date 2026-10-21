@@ -153,7 +153,9 @@ fn available_parallelism() -> usize {
         .unwrap_or(1)
 }
 
-fn parse_size(value: &str, context: &str) -> Result<usize, EgclError> {
+/// Parse a size such as `512m`, `2G` or `65536` (bytes; `k`, `m` and `g` suffixes
+/// are binary multiples, case-insensitive).
+pub fn parse_size(value: &str, context: &str) -> Result<usize, EgclError> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return Err(EgclError::Internal(format!(
