@@ -2618,12 +2618,15 @@ fn t2_loop_carried_fixnums_are_checked_on_entry_not_per_iteration() {
 /// once never reaches its own tier threshold. Once T1 has declined the shared
 /// body through any instance, later instances must run it as bytecode without
 /// re-entering tier dispatch, which `EGCL_LOG=compile=trace` reports as one
-/// "dispatch at invocation" line per call (bliss-nkzx6, GitHub #474).
+/// "dispatch at invocation" line per call (bliss-nkzx6, GitHub #474). The
+/// never-taken RETURN-FROM past the closure's own LAMBDA keeps T1 declining
+/// the body now that captured reads alone are admitted (#494).
 #[test]
 fn fresh_closures_of_a_declined_body_skip_tier_dispatch() {
     let program = "\
 (progn
-  (defun fresh-closure-site (k) (lambda (x) (+ x k)))
+  (defun fresh-closure-site (k)
+    (block site (lambda (x) (if (eql x :never) (return-from site nil) (+ x k)))))
   (let ((fresh 0) (one (fresh-closure-site 7)) (same 0))
     (dotimes (i 2000)
       (setq fresh (+ fresh (funcall (fresh-closure-site i) 1)))
@@ -2638,12 +2641,15 @@ fn fresh_closures_of_a_declined_body_skip_tier_dispatch() {
         stderr.contains("CLOSURE: decline recorded"),
         "the probe's closure body must actually be declined by T1:\n{stderr}"
     );
+    // Instances made before T1 declines the body each dispatch once; none may
+    // dispatch after it.
     let dispatches = stderr
         .lines()
+        .skip_while(|line| !line.contains("CLOSURE: decline recorded"))
         .filter(|line| line.contains("CLOSURE: dispatch at invocation"))
         .count();
-    assert!(
-        dispatches < 200,
-        "{dispatches} of 4000 closure calls re-entered tier dispatch after the decline"
+    assert_eq!(
+        dispatches, 0,
+        "{dispatches} closure calls re-entered tier dispatch after the decline:\n{stderr}"
     );
 }
