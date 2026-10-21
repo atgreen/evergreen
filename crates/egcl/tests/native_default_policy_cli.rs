@@ -36,10 +36,11 @@ fn linux_default_installs_ordinary_register_calls() {
 }
 
 #[test]
-fn linux_default_interprets_unsupported_parameters_and_preserves_transfers() {
-    // A body that reads its enclosing LET's binding depends on the callable
-    // instance's captured environment, which the mapped entry does not take
-    // over (bliss-shih7.27), so these stay interpreted.
+fn linux_default_compiles_enclosing_let_bodies_and_preserves_transfers() {
+    // A body that reads its enclosing LET's binding runs under the callable
+    // instance's captured environment, which the mapped entry now builds its
+    // frame under (bliss-6fim1): it promotes and keeps MV, THROW and the
+    // UNWIND-PROTECT cleanup intact.
     let output = run("(defun policy-key-leaf (x) (values (list x) 19))
         (let ((one 1))
           (defun policy-key (x &key (y 1))
@@ -56,7 +57,7 @@ fn linux_default_interprets_unsupported_parameters_and_preserves_transfers() {
         (format t \"POLICY-KEY=~D CLEANUPS=~D~%\"
           (egcl-ext:function-tier 'policy-key) *policy-cleanups*)
         (disassemble 'policy-key)");
-    assert!(output.contains("POLICY-KEY=0 CLEANUPS=40"), "{output}");
+    assert!(output.contains("POLICY-KEY=1 CLEANUPS=40"), "{output}");
     assert!(!output.contains("Legacy checked ABI"), "{output}");
 }
 
