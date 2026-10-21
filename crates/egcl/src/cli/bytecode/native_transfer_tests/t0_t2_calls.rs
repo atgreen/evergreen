@@ -184,6 +184,75 @@ fn a_mapped_caller_enters_an_ordinary_t2_callee_through_its_lean_root() {
     assert!(direct >= calls as usize, "only {direct} of {calls} calls left the &key body directly");
 }
 
+/// Calls that left an ordinary T2 body for the runtime: named builtin
+/// adapters and cold calls.
+fn take_ordinary_outcalls() -> usize {
+    super::super::native_transfer_entry::ordinary_calls::take_named_entries_for_test()
+        + super::super::native_transfer_entry::ordinary_calls::take_cold_calls_for_test()
+}
+
+/// `(ELT s i)` on a simple string is read inline by T2 code: neither an
+/// ordinary nor a mapped (&key) body calls out for it. Any other operand still
+/// reaches the real ELT, through the same calls as before (GitHub #487). ELT
+/// stands in for CHAR here: CHAR is defined by the boot image, which these
+/// tests do not load; `t0_native_call_cli` covers it.
+#[test]
+fn t2_elt_reads_simple_strings_inline_and_calls_elt_for_anything_else() {
+    let _lock = super::super::super::heap_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    super::super::super::read_eval_all_env(
+        "(defun t0-t2-str-elt (s i) (elt s i)) (defun t0-t2-kw-elt (s &key (start 0)) (elt s start))",
+        &mut env,
+    ).unwrap();
+    let (leaf, _) = super::ordinary_t2::install("T0-T2-STR-ELT", "(s i)", "((elt s i))", &mut env);
+    let (keyed, keyed_code) = super::ordinary_t2::install(
+        "T0-T2-KW-ELT", "(s &key (start 0))", "((elt s start))", &mut env);
+    let NativeCodeStorage::Mapped(mapped) = &keyed_code._storage else {
+        panic!("the &key probe needs mapped T2 code")
+    };
+    assert!(mapped.ordinary_entry.is_none(), "a &key body keeps the mapped ABI");
+    let calls = 200;
+    let sum = |text: &str| -> i64 {
+        (0..calls).map(|i| text.chars().nth((i % 5) as usize).unwrap() as i64).sum()
+    };
+    let take_mapped_calls = || super::super::native_transfer_entry::take_published_checked_calls_for_test()
+        + super::super::native_transfer_entry::take_nested_entries();
+    // "hello" is a base string; the second literal needs 32-bit characters.
+    for (text, callee) in [("hello", "(t0-t2-str-elt s (mod i 5))"),
+                           ("hλllo", "(t0-t2-kw-elt s :start (mod i 5))")] {
+        let forms = format!(
+            "((let ((s \"{text}\") (sum 0)) (dotimes (i n sum) (setq sum (+ sum (char-code {callee}))))))");
+        take_ordinary_outcalls();
+        take_mapped_calls();
+        let result = run_caller("T0-T2-ELT-STRING-CALLER", &forms, calls, &mut env).unwrap();
+        let outcalls = take_ordinary_outcalls();
+        let mapped_calls = take_mapped_calls();
+        assert_eq!(result, EgclVal::from_fixnum(sum(text)), "{callee}");
+        assert_eq!((outcalls, mapped_calls), (0, 0), "{callee} called out for a simple string");
+    }
+    // A list, a vector, an index past the end and a non-sequence reach ELT.
+    let mut outcalls = 0;
+    for (callee, expected) in [("(t0-t2-str-elt '(1 2 3) 1)", 2), ("(t0-t2-kw-elt '(1 2 3) :start 1)", 2),
+                               ("(t0-t2-str-elt (vector 4 5) 1)", 5), ("(t0-t2-str-elt \"ab\" 5)", -1),
+                               ("(t0-t2-kw-elt \"ab\" :start -1)", -1), ("(t0-t2-kw-elt 7)", -1)] {
+        let forms = format!(
+            "((let ((r nil)) (dotimes (i n r) (setq r (handler-case {callee} (error () -1))))))");
+        take_ordinary_outcalls();
+        take_mapped_calls();
+        let value = run_caller("T0-T2-ELT-SLOW-CALLER", &forms, 50, &mut env).unwrap();
+        outcalls += take_ordinary_outcalls() + take_mapped_calls();
+        assert_eq!(value, EgclVal::from_fixnum(expected), "{callee}");
+    }
+    for symbol in [leaf, keyed] {
+        egcl_rt::symbols::set_symbol_function(symbol, NIL);
+        registry_remove(symbol);
+    }
+    assert!(outcalls >= 6 * 50, "only {outcalls} of 300 other operands called ELT");
+}
+
 fn collect_at_ordinary_entry() {
     use egcl_rt::Collector;
     egcl_rt::HeapCollector::new().full_gc().unwrap();

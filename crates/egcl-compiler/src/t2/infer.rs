@@ -422,6 +422,7 @@ fn eval(opcode: Opcode, aux: &AuxData, ops: &[IRType]) -> IRType {
         }
 
         AllocCons => IRType::of(TypeBits::CONS),
+        StringCharOrNil => IRType::of(TypeBits::CHARACTER.join(TypeBits::NULL)),
 
         // Everything else (loads, calls, generic memory) is unconstrained.
         _ => IRType::TOP,

@@ -98,6 +98,16 @@
   `&key` argument whose body calls `CHAR` fell from about 3.8 us to 2.4 us,
   which is still slower than the 1.5 us it costs interpreted
   ([#502](https://github.com/atgreen/evergreen/pull/502)).
+- On x86-64 Linux, optimized (T2) code reads `CHAR`, `SCHAR` and `ELT` of a
+  simple string inline instead of calling the function. Any other argument,
+  such as a list, a string with a fill pointer, or an index out of range,
+  still calls the function, with the same result or error as before. A call
+  from a `COMPILE-FILE`d loop that stays in the interpreter to
+  `(defun kw (s &key (start 0)) (char s start))` fell from about 2.6 us to
+  0.9 us net of the loop, about half its 1.7 us cost with `KW` left
+  interpreted. `CHAR` itself, which is defined with `ELT`, is cheaper to call
+  from interpreted code once compiled than left interpreted
+  ([#506](https://github.com/atgreen/evergreen/pull/506)).
 - On x86-64 Linux, a closure that reads or sets variables captured from the
   function or `LET` that created it -- `(lambda (y) (+ x y k))`, a counter's
   `(lambda () (incf n))`, or a wrapper such as `(lambda (&rest a) (apply

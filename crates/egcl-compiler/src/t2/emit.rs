@@ -3307,6 +3307,94 @@ fn emit_string_ascii_char_at(
     Ok(())
 }
 
+/// `(CHAR string index)` for a simple string and an in-range fixnum index,
+/// answering NIL for every other operand so the caller can branch to the real
+/// call. Simple strings are `header | char_len @8 | data @16`, one byte per
+/// character for `SIMPLE_BASE_STRING` and a native-endian `u32` per character
+/// for `SIMPLE_CHARACTER_STRING`. Uses only `dst` and the reserved `SCRATCH`;
+/// both operands stay intact for the fallback call.
+fn emit_string_char_or_nil(
+    a: &mut Asm,
+    data: &crate::t2::ir::InstData,
+    reg: &mut std::collections::HashMap<crate::t2::ir::Value, u8>,
+    pool: &mut Vec<u8>,
+    const_tagged: &std::collections::HashMap<crate::t2::ir::Value, u64>,
+) -> Result<(), EmitError> {
+    use crate::t2::ir::Opcode;
+    use egcl_rt::object::type_id;
+    if data.args.len() != 2
+        || data.results.len() != 1
+        || data.flags.guard
+        || data.frame_state.is_some()
+    {
+        return Err(EmitError::UnsupportedOp(op_tag(Opcode::StringCharOrNil)));
+    }
+    let dst = framed_alloc(reg, pool, data.results[0])?;
+    if dst == SCRATCH {
+        return Err(EmitError::UnsupportedOp(op_tag(Opcode::StringCharOrNil)));
+    }
+    let fail = a.label();
+    let done = a.label();
+    // An immediate operand is never a heap string.
+    let Some(&xr) = reg.get(&data.args[0]) else {
+        if const_tagged.contains_key(&data.args[0]) {
+            mov_imm64(a, dst, egcl_rt::value::NIL.0 as i64);
+            return Ok(());
+        }
+        return Err(EmitError::UnsupportedOp(0xF2));
+    };
+    // Heap tag, then SCRATCH = untagged object.
+    mov_rr(a, SCRATCH, xr);
+    alu_r_imm(a, 4 /* AND */, SCRATCH, 7);
+    alu_r_imm(a, 7 /* CMP */, SCRATCH, egcl_rt::value::TAG_HEAP_OBJECT as i32);
+    a.jcc(Cc::Ne, fail);
+    mov_rr(a, SCRATCH, xr);
+    alu_r_imm(a, 4 /* AND */, SCRATCH, -8);
+    // dst = the untagged index, a fixnum in [0, char_len).
+    let index = data.args[1];
+    if let Some(&tagged) = const_tagged.get(&index) {
+        mov_imm64(a, dst, tagged as i64);
+    } else {
+        let ir = *reg.get(&index).ok_or(EmitError::UnsupportedOp(0xF2))?;
+        mov_rr(a, dst, ir);
+    }
+    a.push(rex_w(0, dst));
+    a.extend_from_slice(&[0xF7, 0xC0 | (dst & 7)]); // test dst, 7
+    a.extend_from_slice(&7i32.to_le_bytes());
+    a.jcc(Cc::Ne, fail);
+    alu_r_imm(a, 7 /* CMP */, dst, 0);
+    a.jcc(Cc::L, fail);
+    sar_imm(a, dst, 3);
+    cmp_mem64_disp8(a, dst, SCRATCH, 8);
+    a.jcc(Cc::Ge, fail);
+    // The SIB byte addressing [SCRATCH + dst*scale + 16].
+    // REX.R and REX.X both name `dst`; REX.B names SCRATCH. No REX.W: the
+    // 32-bit destination zero-extends.
+    let rex = 0x40 | ((dst >> 3) & 1) << 2 | ((dst >> 3) & 1) << 1 | ((SCRATCH >> 3) & 1);
+    let modrm = 0x44 | ((dst & 7) << 3); // mod=01, rm=100 (SIB)
+    let sib = |scale: u8| (scale << 6) | ((dst & 7) << 3) | (SCRATCH & 7);
+    let wide = a.label();
+    let loaded = a.label();
+    a.extend_from_slice(&[0x80, 0x7A, 0x07, type_id::SIMPLE_BASE_STRING]); // cmp byte [SCRATCH+7]
+    a.jcc(Cc::Ne, wide);
+    // movzx dst32, byte [SCRATCH + dst + 16]
+    a.extend_from_slice(&[rex, 0x0F, 0xB6, modrm, sib(0), 16]);
+    a.jmp(loaded);
+    a.bind(wide);
+    a.extend_from_slice(&[0x80, 0x7A, 0x07, type_id::SIMPLE_CHARACTER_STRING]);
+    a.jcc(Cc::Ne, fail);
+    // mov dst32, dword [SCRATCH + dst*4 + 16]; zero-extends.
+    a.extend_from_slice(&[rex, 0x8B, modrm, sib(2), 16]);
+    a.bind(loaded);
+    shl_imm(a, dst, 3);
+    or_imm8(a, dst, egcl_rt::value::TAG_CHARACTER as u8);
+    a.jmp(done);
+    a.bind(fail);
+    mov_imm64(a, dst, egcl_rt::value::NIL.0 as i64);
+    a.bind(done);
+    Ok(())
+}
+
 fn is_fixnum_producing_op(op: crate::t2::ir::Opcode) -> bool {
     use crate::t2::ir::Opcode::*;
     matches!(
@@ -4522,6 +4610,7 @@ fn emit_transfer_function_with_storage(
                     | Opcode::TypeCheck
                     | Opcode::Car
                     | Opcode::Cdr
+                    | Opcode::StringCharOrNil
                     | Opcode::MemoryFence
             ) {
                 return Err(EmitError::UnsupportedOp(op_tag(f.inst(inst).opcode)));
@@ -5639,6 +5728,7 @@ fn emit_framed_inner(
                             | Opcode::TypeCheck
                             | Opcode::Car
                             | Opcode::Cdr
+                            | Opcode::StringCharOrNil
                             | Opcode::SymbolValue
                             | Opcode::SymbolFunction
                             | Opcode::SetSymbolValue
@@ -6448,6 +6538,8 @@ fn emit_framed_inner(
                 emit_cons_field_load(&mut a, &d, &mut inst_reg, &mut inst_pool)?;
             } else if d.opcode == Opcode::StringByteLength {
                 emit_string_byte_length(&mut a, &d, &mut inst_reg, &mut inst_pool)?;
+            } else if d.opcode == Opcode::StringCharOrNil {
+                emit_string_char_or_nil(&mut a, &d, &mut inst_reg, &mut inst_pool, &const_tagged)?;
             } else if d.opcode == Opcode::StringAsciiCharAt {
                 let label = inst_deopt.get(&inst).copied().unwrap_or(deopt);
                 emit_string_ascii_char_at(
