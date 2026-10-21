@@ -16450,6 +16450,7 @@ fn pending_signal_error_for_current_execution() -> Option<EgclError> {
         egcl_rt::PendingSignal::Pipe => Some(EgclError::StreamError("broken pipe".into())),
         egcl_rt::PendingSignal::Interrupt => Some(EgclError::Interrupt),
         egcl_rt::PendingSignal::Timeout => Some(EgclError::Timeout),
+        egcl_rt::PendingSignal::HeapExhausted => Some(EgclError::Oom),
     }
 }
 

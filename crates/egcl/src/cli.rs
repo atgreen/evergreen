@@ -988,6 +988,7 @@ fn pending_signal_error_for_current_execution() -> Option<EgclError> {
         egcl_rt::PendingSignal::Pipe => Some(EgclError::StreamError("broken pipe".into())),
         egcl_rt::PendingSignal::Interrupt => Some(EgclError::Interrupt),
         egcl_rt::PendingSignal::Timeout => Some(EgclError::Timeout),
+        egcl_rt::PendingSignal::HeapExhausted => Some(EgclError::Oom),
     }
 }
 
@@ -43823,6 +43824,14 @@ pub fn run(args: &[String]) -> Result<i32, EgclError> {
         print_help();
         return Ok(0);
     }
+    // `--heap-size` sizes the lazily initialized heap, ahead of EGCL_HEAP_SIZE
+    // and EGCL_HEAP_MB (GitHub #471: it used to be parsed and then ignored).
+    if let Some(size) = &ca.heap_size {
+        let bytes = egcl_rt::gc::parse_heap_size(size, "--heap-size")?;
+        if !egcl_rt::gc::set_default_heap_size(bytes) {
+            eprintln!("egcl: warning: --heap-size arrived after the heap was initialized; ignored");
+        }
+    }
     if ca.runtime_info {
         print!("{}", native_runtime::contract().encode());
         return Ok(0);
@@ -44320,7 +44329,7 @@ pub fn help_text() -> &'static str {
         "  --bootstrap          Deprecated; the prelude now loads by default\n",
         "  --no-bootstrap       Skip the bootstrap prelude (raw evaluator)\n",
         "  --workers N          Number of worker threads\n",
-        "  --heap-size SIZE     Heap size (e.g. 512M, 1G)\n",
+        "  --heap-size SIZE     Heap size (e.g. 512M, 1G); overrides EGCL_HEAP_SIZE\n",
         "  --tlab-size SIZE     Per-thread TLAB size\n",
         "  --nursery-size SIZE  Nursery size\n",
         "  --stack-size SIZE    CL stack size per green thread\n",

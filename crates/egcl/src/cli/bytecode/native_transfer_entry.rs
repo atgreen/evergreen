@@ -3975,6 +3975,37 @@ unsafe fn prepare_unpublished(capture: *mut SysvTransferCapture) {
         capture.request = std::ptr::from_mut(&mut context.dispatch).cast();
         return;
     }
+    // A poll can deliver a pending signal (an interrupt, or STORAGE-CONDITION
+    // when the heap is exhausted, GitHub #471) at a return PC the compiler
+    // gave no transfer site, such as a straight-line poll. When the activation
+    // is quiescent, with no live handler, catch, restart, cleanup or dynamic
+    // binding (as `ActivationState::is_quiescent` requires to return), nothing
+    // in it can receive the error or needs unwinding: leave it as an ordinary
+    // segment escape does, and let the caller signal the error. One with live
+    // scopes still needs a site (bliss-q5846).
+    if unsafe { &*context.sites }
+        .lookup(context.code_base, capture.return_pc as usize)
+        .is_none()
+        && NATIVE_ERROR.with(|slot| slot.is_some())
+        && context.completed_cleanup.is_none()
+        && unsafe {
+            (*context.dynamic_scopes).is_empty()
+                && (*context.handlers).is_empty()
+                && (*context.handler_binds).is_empty()
+                && (*context.restart_cases).is_empty()
+                && (*context.catches).is_empty()
+                && (*context.cleanups).is_empty()
+                && (*context.specials).is_empty()
+                && (*context.prepared_handler).is_none()
+                && (*context.prepared_catch).is_none()
+        }
+        && egcl_rt::current_stack().fp() == context.frame
+    {
+        native_frames::retire_children(context);
+        context.recursive_escape = true;
+        capture.request = std::ptr::from_mut(&mut context.dispatch).cast();
+        return;
+    }
     let mut expected_frame = context.frame;
     let mut frames_valid = true;
     let cluster_frames = unsafe { &mut *context.cluster_frames };

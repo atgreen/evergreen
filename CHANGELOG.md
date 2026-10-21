@@ -303,6 +303,23 @@
   name: `GQ:|:X|`, which is how an exported symbol named `":X"` prints, reads
   back as that symbol instead of as `GQ::X`
   ([#493](https://github.com/atgreen/evergreen/pull/493)).
+- `--heap-size` and `EGCL_HEAP_SIZE` size the heap. Both were parsed and then
+  ignored, so the heap stayed at 512 MB unless `EGCL_HEAP_MB` was set.
+  `--heap-size` takes precedence over `EGCL_HEAP_SIZE`, which takes precedence
+  over `EGCL_HEAP_MB`. A heap smaller than 256 MB gets a nursery of a quarter of
+  the heap rather than a fixed 64 MB, and a restored image that does not fit the
+  requested heap grows it to three times the image's data instead of failing.
+  A size of 0 is rejected, and a heap the system cannot reserve is reported as
+  such at startup instead of panicking at the first allocation
+  ([#498](https://github.com/atgreen/evergreen/pull/498)).
+- When live data outgrows the heap, the program gets a `STORAGE-CONDITION`
+  instead of a panic with "GC minor evacuation exhausted regions", in
+  interpreted and compiled code alike. Nothing moves when the survivors cannot
+  be placed, and a major collection runs before the condition is signalled, so a
+  program that handles it and drops its data can continue. Compiled code that
+  has a handler, `UNWIND-PROTECT` or dynamic binding of its own active at that
+  moment can still report "invalid native transfer capture" instead
+  ([#498](https://github.com/atgreen/evergreen/pull/498)).
 - A `THROW` from the default form of a `&key` or `&aux` parameter to a
   `CATCH` in the interpreted caller reaches that catch. Once the caller had
   been called a few times, the throw escaped as an internal error such as
