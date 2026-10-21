@@ -224,7 +224,8 @@
   that came with the image reports the tier its native code runs at.
   `egcl-ext:function-tier` used to answer 0 for it by name and by object after
   its T1 or T2 code was installed and running, and its invocation count kept
-  advancing; functions defined after the restore were unaffected. The saved
+  advancing after its T2 code was installed; functions defined after the
+  restore were unaffected. The saved
   image no longer carries a second copy of each such function's body
   ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
 - A `THROW` from the default form of a `&key` or `&aux` parameter to a
