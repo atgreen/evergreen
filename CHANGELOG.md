@@ -227,7 +227,7 @@
   advancing after its T2 code was installed; functions defined after the
   restore were unaffected. The saved
   image no longer carries a second copy of each such function's body
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#490](https://github.com/atgreen/evergreen/pull/490)).
 - A `THROW` from the default form of a `&key` or `&aux` parameter to a
   `CATCH` in the interpreted caller reaches that catch. Once the caller had
   been called a few times, the throw escaped as an internal error such as
