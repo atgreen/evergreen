@@ -331,7 +331,10 @@ pub(super) struct TransferCode {
     catch_pushes: usize,
     /// Buffers of finished activations, reused by later calls of this code so
     /// a call does not rebuild them. Only quiescent states with no Lisp value
-    /// left in them are kept; see `ActivationState::recycle`.
+    /// left in them are kept; see `ActivationState::recycle`. Each state is
+    /// boxed so taking one out and returning it moves a pointer, not the
+    /// whole struct (bliss-nkzx6).
+    #[allow(clippy::vec_box)]
     state_pool: std::cell::RefCell<Vec<Box<ActivationState>>>,
     /// The callable root this code's ordinary segment last retained. Code runs
     /// for the same function on nearly every call, so `callable_root` hands the
