@@ -85,7 +85,7 @@
   `EGCL-EXT:FUNCTION-TIER` returned `NIL` for them. A closure that calls a
   local function of its creator's `FLET` or `LABELS`, or that sees a local
   `SPECIAL` declaration, still runs in the interpreter
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#497](https://github.com/atgreen/evergreen/pull/497)).
 - A minor collection's pause no longer grows with the old generation on
   Linux. To find references into the nursery the collector traced every
   older object twice per minor collection, about 3-5 ms per MB of live
