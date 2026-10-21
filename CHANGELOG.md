@@ -321,7 +321,7 @@
   keyword names into the generic function and reject such a method as not
   congruent. Keywords declared by `defgeneric` are still required of every
   method, and a call still rejects a keyword no applicable method accepts
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#510](https://github.com/atgreen/evergreen/pull/510)).
 
 - Deep recursion no longer signals a spurious `STORAGE-CONDITION` on Linux
   AArch64. That target used a 512 KiB control stack, the fallback for
