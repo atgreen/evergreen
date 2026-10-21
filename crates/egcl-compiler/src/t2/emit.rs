@@ -259,18 +259,12 @@ fn pop_reg(a: &mut Asm, r: u8) {
 /// `mov dst, [base + 8*i]` — load an argument/local from its interpreter frame
 /// slot. `base` is the slots-pointer register (rdi in the frame-less fast path,
 /// or r14 when a frame is set up).
+///
+/// Slot 16 and above are 128 bytes or more from `base`, past what a
+/// sign-extended disp8 reaches, so they take a disp32.
 fn mov_from_frame(a: &mut Asm, dst: u8, base: u8, i: usize) {
-    let mut rex = 0x48; // REX.W
-    if dst >= 8 {
-        rex |= 0x04; // REX.R
-    }
-    if base >= 8 {
-        rex |= 0x01; // REX.B
-    }
-    a.push(rex);
-    a.push(0x8B); // mov r64, r/m64
-    a.push(0x40 | ((dst & 7) << 3) | (base & 7)); // mod=01(disp8), rm=base
-    a.push((8 * i) as u8);
+    let disp = i32::try_from(8 * i).expect("frame slot displacement fits in i32");
+    load_mem64_disp(a, dst, base, disp);
 }
 
 /// `mov dst, qword ptr [base + disp8]` for bases other than rsp/r12.
