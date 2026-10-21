@@ -74,6 +74,7 @@ impl DirtyPages {
         false
     }
 
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn reset(&mut self, heap_base: usize, heap_size: usize, page_shift: u32) {
         self.heap_base = heap_base;
         self.heap_end = heap_base + heap_size;
@@ -242,6 +243,7 @@ mod imp {
     }
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn page_shift() -> u32 {
     crate::syscall::page_size().trailing_zeros()
 }

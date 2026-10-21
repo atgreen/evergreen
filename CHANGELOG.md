@@ -84,7 +84,8 @@
   previous minor collection (soft-dirty tracking) and scans only those. The
   same minor collections take 44-68 ms with 0-250 MB retained, and 48-50 ms
   with 0-150 MB of fixnum vectors (previously up to 174 ms). Tracking costs
-  one page fault per nursery page per cycle, so it starts only once the old
+  a page fault on the first write to each page of the process after every
+  collection, mostly nursery pages, so it starts only once the old
   generation reaches a quarter of the nursery's size (16 MB by default);
   `EGCL_GC_SOFT_DIRTY=1` uses it always and `EGCL_GC_SOFT_DIRTY=0` never.
   Kernels without soft-dirty support and other systems keep the full scan
