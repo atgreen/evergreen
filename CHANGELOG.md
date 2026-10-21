@@ -61,6 +61,21 @@
 
 ### Performance
 
+- On x86-64 Linux, a closure that reads or sets variables captured from the
+  function or `LET` that created it -- `(lambda (y) (+ x y k))`, a counter's
+  `(lambda () (incf n))`, or a wrapper such as `(lambda (&rest a) (apply
+  original a))` installed with `(setf (symbol-function 'f) ...)` -- now
+  compiles to native code and can reach the optimizing tier, including by
+  on-stack replacement of a running loop, instead of staying in the
+  interpreter. All closures made by one `LAMBDA` share one compiled body. This
+  applies when the creating code is itself compiled, as it is for files
+  built with `COMPILE-FILE` or ASDF and for functions called often enough to
+  compile.
+  `EGCL-EXT:FUNCTION-TIER` now reports the tier such a closure runs at. A
+  closure whose `&optional` or `&key` default reads a variable of its
+  creator, such as `(lambda (x &key (off base)) ...)`, no longer signals
+  `UNBOUND-VARIABLE` when the creator is compiled
+  ([#494](https://github.com/atgreen/evergreen/pull/494)).
 - On x86-64 Linux, a function whose `LAMBDA` makes a `RETURN-FROM`, `RETURN`
   or `GO` to a block or tag that the `LAMBDA` itself establishes, such as
   `(mapcar (lambda (x) (dolist (y x) (when (p y) (call (lambda () (return y))))))

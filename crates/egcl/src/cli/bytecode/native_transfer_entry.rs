@@ -522,9 +522,15 @@ pub(super) fn refresh_installed(expected: &NativeCode) -> Option<Rc<NativeCode>>
     }
     let symbol = code.installed_symbol?;
     let body = Arc::clone(expected.body.as_ref()?);
+    // A closure template's code is owned by an instance's private symbol,
+    // whose function cell holds no function; the registry alone names its
+    // definition.
+    let callable = || egcl_rt::symbols::symbol_function(symbol)
+        .filter(|&value| egcl_rt::function::is_interpreted_function(value));
+    let closure = egcl_rt::symbols::is_uninterned(symbol) && callable().is_none();
     let current = || {
         registry_get(symbol).is_some_and(|current| Arc::ptr_eq(&current, &body))
-            && recursive_definition_matches(symbol, Arc::as_ptr(&body))
+            && (closure || recursive_definition_matches(symbol, Arc::as_ptr(&body)))
             && NATIVE_REGISTRY.with(|registry| {
                 registry
                     .borrow()
@@ -535,7 +541,11 @@ pub(super) fn refresh_installed(expected: &NativeCode) -> Option<Rc<NativeCode>>
     if !current() {
         return None;
     }
-    egcl_rt::rooted!(function = egcl_rt::symbols::symbol_function(symbol)?);
+    let function = callable();
+    if function.is_none() && !closure {
+        return None;
+    }
+    egcl_rt::rooted!(function = function);
     // Ordinary T2 versions retire to an honest non-speculating mapped baseline.
     // The next dispatch can queue optimized worker compilation again; this
     // local baseline frontend must not replace it under a T2 tier label.
@@ -550,11 +560,11 @@ pub(super) fn refresh_installed(expected: &NativeCode) -> Option<Rc<NativeCode>>
     })?;
     // Compilation can collect and reenter runtime services. Never let a stale
     // invocation replace code published for a newer version or callable.
-    if !current() || egcl_rt::symbols::symbol_function(symbol) != Some(*function) {
+    if !current() || callable() != *function {
         return None;
     }
     let replacement = install_baseline_code(symbol, replacement)?;
-    publish_native(symbol, Some(*function), &replacement);
+    publish_native(symbol, *function, &replacement);
     Some(replacement)
 }
 
@@ -1970,14 +1980,15 @@ pub(super) fn captured_activation_parameters(body: &BytecodeFunction) -> bool {
 /// Why the managed entry cannot own `body`'s captured environment, or `None`
 /// when it can or there is none. Native code reaches captured variables only
 /// through runtime helpers that walk the activation's frame chain exactly as
-/// the interpreter does; that frame's parent is the running callable's captured
-/// environment, so a read of an enclosing binding resolves the same way. A
-/// body that names a binding it never defines is still declined, conservatively
-/// (bliss-kg667 keeps closure bodies reading their creator's bindings
-/// interpreted). Ownership is by name, not by position: a body that reads an
-/// enclosing X and also binds its own captured X is admitted, and its reads
-/// before, inside and after the inner binding take the interpreter's chain walk
-/// (pinned by `shadowing_captured_names_match_the_interpreter`).
+/// the interpreter does. That frame's parent is the captured environment of the
+/// callable actually invoked (`run_activation` receives the instance, never a
+/// name to look up), so a closure body reading or writing its creator's
+/// bindings resolves them the same way, and many instances of one template
+/// share the compiled body while each activation gets its own frame chain
+/// (bliss-6fim1; the installed wrapper of bliss-kg667 runs natively). Bindings
+/// are found by name: a body that reads an enclosing X and also binds its own
+/// captured X takes the interpreter's chain walk before, inside and after the
+/// inner binding (pinned by `shadowing_captured_names_match_the_interpreter`).
 pub(super) fn captured_environment_decline(body: &BytecodeFunction) -> Option<&'static str> {
     if !body.has_env {
         return None;
@@ -2005,23 +2016,8 @@ pub(super) fn captured_environment_decline(body: &BytecodeFunction) -> Option<&'
     if boxed().next().is_some() && body.param_types.iter().any(|ty| !ty.is_any()) {
         return Some("a declared parameter type beside a captured parameter");
     }
-    // Names are interned per body, so equal indexes are equal names.
-    let defined: std::collections::HashSet<u16> = body.code.iter()
-        .filter_map(|op| match op { Instr::DefineEnvVar(index) => Some(*index), _ => None })
-        .collect();
-    let own = |index: u16| {
-        defined.contains(&index)
-            || body.names.get(usize::from(index))
-                .is_some_and(|name| boxed().any(|(param, _)| param == name))
-    };
-    for op in &body.code {
-        match op {
-            Instr::LoadEnvVar(index) | Instr::StoreEnvVar(index) if !own(*index) => {
-                return Some("reads bindings captured from an enclosing scope");
-            }
-            Instr::MakeClosureEnv(_) => return Some("builds a closure from source (MakeClosureEnv)"),
-            _ => {}
-        }
+    if body.code.iter().any(|op| matches!(op, Instr::MakeClosureEnv(_))) {
+        return Some("builds a closure from source (MakeClosureEnv)");
     }
     None
 }
@@ -2137,6 +2133,16 @@ fn recursive_definition_matches(symbol: u32, body: *const BytecodeFunction) -> b
         return false;
     };
     callable_definition_matches(symbol, function, body)
+}
+
+/// True when `function` is an instance of the closure template whose shared
+/// code is installed under the owning instance's private `symbol` with `body`.
+/// That symbol has no function cell, and the running instance need not be the
+/// owner: every instance of one template runs the same code (bliss-6fim1).
+fn closure_code_matches(symbol: u32, function: EgclVal, body: *const BytecodeFunction) -> bool {
+    egcl_rt::symbols::is_uninterned(symbol)
+        && super::closure_template_matches(function, body)
+        && super::registry_get(symbol).is_some_and(|owned| std::ptr::eq(Arc::as_ptr(&owned), body))
 }
 
 fn callable_definition_matches(symbol: u32, function: EgclVal, body: *const BytecodeFunction) -> bool {
@@ -3373,8 +3379,10 @@ unsafe fn prepare_osr(image: *const SysvTransferCapture) -> bool {
     let Some(next) = NATIVE_REGISTRY.with(|registry| registry.borrow().get(&symbol).cloned()) else {
         return false;
     };
+    let running = unsafe { (*context.frame).function };
     if !next.is_t2 || next.body.as_ref().is_none_or(|body| !Arc::ptr_eq(body, &code.body))
-        || !recursive_definition_matches(symbol, Arc::as_ptr(&code.body))
+        || !(recursive_definition_matches(symbol, Arc::as_ptr(&code.body))
+            || closure_code_matches(symbol, running, Arc::as_ptr(&code.body)))
         || !matches!(&next._storage, NativeCodeStorage::Mapped(_))
     {
         return false;
@@ -3553,9 +3561,15 @@ fn record_loop_heat() {
     // frame value, then validate one binding snapshot; a concurrent setter
     // cannot redirect this increment to a replacement or a nonfunction.
     egcl_rt::rooted!(function = function);
-    if egcl_rt::symbols::symbol_function(symbol) != Some(*function)
-        || !callable_definition_matches(symbol, *function, body)
-    {
+    // A closure template's code is installed under its owning instance's
+    // private symbol, which has no function cell; any instance of that
+    // template heats the shared code (bliss-6fim1).
+    let installed = if egcl_rt::symbols::symbol_function(symbol) == Some(*function) {
+        callable_definition_matches(symbol, *function, body)
+    } else {
+        closure_code_matches(symbol, *function, body)
+    };
+    if !installed {
         return;
     }
     #[cfg(test)]
