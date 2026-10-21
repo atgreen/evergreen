@@ -89,7 +89,7 @@
   generation reaches a quarter of the nursery's size (16 MB by default);
   `EGCL_GC_SOFT_DIRTY=1` uses it always and `EGCL_GC_SOFT_DIRTY=0` never.
   Kernels without soft-dirty support and other systems keep the full scan
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#491](https://github.com/atgreen/evergreen/pull/491)).
 - On x86-64 Linux, a function whose `LAMBDA` makes a `RETURN-FROM`, `RETURN`
   or `GO` to a block or tag that the `LAMBDA` itself establishes, such as
   `(mapcar (lambda (x) (dolist (y x) (when (p y) (call (lambda () (return y))))))
