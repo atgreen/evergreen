@@ -16,8 +16,12 @@ mod ordinary;
 pub(super) use ordinary::{active_ordinary_directory, enter_ordinary_segment};
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub(super) use ordinary::OrdinaryCodeDirectory;
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub(super) use ordinary::RootIdentity;
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 pub(super) use ordinary::ordinary_segment_depth_for_test;
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+pub(super) use ordinary::take_root_identities_for_test;
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 pub(super) use ordinary::assert_guarded_callable_publication_for_test;
 
@@ -727,6 +731,12 @@ fn invoke_builtin(cell: u64, args: &[EgclVal]) -> u64 {
 thread_local! {
     static TARGET_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static GENERAL_DISPATCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Native entries and tier dispatches recorded on this thread since the last call.
+#[cfg(test)]
+pub(super) fn take_target_lookups_for_test() -> usize {
+    TARGET_LOOKUPS.with(|count| count.replace(0))
 }
 
 #[cfg(test)]

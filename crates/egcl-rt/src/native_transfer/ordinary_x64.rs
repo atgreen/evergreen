@@ -117,7 +117,13 @@ unsafe extern "C" fn enter(
         "mov rcx, [rsp]", "mov qword ptr [rcx + {sp}], 0",
         "mov qword ptr [rcx + {landing}], 0", "mov qword ptr [rcx + {entry_pc}], 0",
         "mov qword ptr [rcx + {landing_sp}], 0",
-        "ldmxcsr [rsp + 24]", "fldcw [rsp + 28]", "cld",
+        // Reloading a control word is slow (LDMXCSR and FLDCW are
+        // microcoded) and nearly always redundant: generated code rarely
+        // changes either. Reload only one that differs (GitHub #487).
+        "stmxcsr [rsp + 32]", "mov ecx, [rsp + 32]", "cmp ecx, [rsp + 24]", "je 11f",
+        "ldmxcsr [rsp + 24]", "11:",
+        "fnstcw [rsp + 36]", "mov cx, [rsp + 36]", "cmp cx, [rsp + 28]", "je 12f",
+        "fldcw [rsp + 28]", "12:", "cld",
         "add rsp, 40", ".cfi_def_cfa_offset 56",
         "pop r15", ".cfi_def_cfa_offset 48", ".cfi_restore r15",
         "pop r14", ".cfi_def_cfa_offset 40", ".cfi_restore r14",

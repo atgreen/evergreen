@@ -258,17 +258,23 @@ pub struct SegmentUnavailable;
 pub fn is_supported() -> bool {
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     {
-        let mut features = 0u64;
-        // Linux x86-64 arch_prctl(ARCH_SHSTK_STATUS, &features). Deliberately
-        // accept only a successful query reporting no enabled shadow-stack bits.
-        // Older kernels and seccomp-denied queries retain the legacy ABI.
-        let result =
-            unsafe { crate::syscall::syscall2(158, 0x5005, &mut features as *mut u64 as usize) };
-        // -EINVAL means the kernel was built without user shadow-stack support
-        // (CONFIG_X86_USER_SHADOW_STACK), so no shadow stack can be enabled for
-        // this process: the legacy ABI applies. Any other failure (e.g. a
-        // seccomp -EPERM) leaves the hardening state unknown and stays a refusal.
-        (result == 0 && features == 0) || result == -22
+        // Every interpreter-to-native call enters a segment, so this query ran
+        // once per call; the syscall alone cost ~0.3 us, more than the plain
+        // T0 call it was gating (GitHub #487). Shadow-stack state belongs to
+        // the OS thread and is fixed before Lisp code runs on it (the loader
+        // enables it at startup and new threads inherit it), so the answer is
+        // cached per carrier thread. Fibers that migrate are revalidated on
+        // their new carrier, which has its own cache.
+        thread_local! {
+            static SUPPORTED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+        }
+        SUPPORTED.with(|cached| {
+            cached.get().unwrap_or_else(|| {
+                let supported = query_shadow_stack_disabled();
+                cached.set(Some(supported));
+                supported
+            })
+        })
     }
     #[cfg(all(target_arch = "x86_64", windows))]
     {
@@ -308,6 +314,45 @@ pub fn is_supported() -> bool {
     {
         false
     }
+}
+
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+thread_local! {
+    static SHADOW_STACK_QUERIES: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Each carrier thread asks the kernel once; every later native entry on it
+/// reuses the answer (GitHub #487: the query was a syscall per call).
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn shadow_stack_status_is_queried_once_per_thread() {
+    std::thread::spawn(|| {
+        let first = is_supported();
+        for _ in 0..1000 {
+            assert_eq!(is_supported(), first);
+        }
+        assert_eq!(SHADOW_STACK_QUERIES.with(Cell::get), 1);
+    })
+    .join()
+    .unwrap();
+}
+
+/// Uncached x86-64 Linux hardening query behind [`is_supported`].
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn query_shadow_stack_disabled() -> bool {
+    #[cfg(test)]
+    SHADOW_STACK_QUERIES.with(|count| count.set(count.get() + 1));
+    let mut features = 0u64;
+    // Linux x86-64 arch_prctl(ARCH_SHSTK_STATUS, &features). Deliberately
+    // accept only a successful query reporting no enabled shadow-stack bits.
+    // Older kernels and seccomp-denied queries retain the legacy ABI.
+    let result =
+        unsafe { crate::syscall::syscall2(158, 0x5005, &mut features as *mut u64 as usize) };
+    // -EINVAL means the kernel was built without user shadow-stack support
+    // (CONFIG_X86_USER_SHADOW_STACK), so no shadow stack can be enabled for
+    // this process: the legacy ABI applies. Any other failure (e.g. a
+    // seccomp -EPERM) leaves the hardening state unknown and stays a refusal.
+    (result == 0 && features == 0) || result == -22
 }
 
 #[cfg(any(

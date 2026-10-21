@@ -213,6 +213,7 @@ impl CallCell {
         // before the dedicated entry slot is cleared.
         self.revision.store(revision, Ordering::Release);
         self.ordinary_entry.store(0, Ordering::Release);
+        ORDINARY_EPOCH.fetch_add(1, Ordering::AcqRel);
         self.ordinary_heat.store(0, Ordering::Release);
         self.register_entry
             .store(self.cold_register, Ordering::Release);
@@ -269,6 +270,7 @@ impl Table {
         cell.ordinary_heat.store(heat, Ordering::Release);
         cell.ordinary_entry
             .store(descriptor as *const _ as usize, Ordering::Release);
+        ORDINARY_EPOCH.fetch_add(1, Ordering::AcqRel);
         true
     }
 
@@ -283,6 +285,17 @@ impl Table {
 }
 
 static TABLE: OnceLock<Mutex<Table>> = OnceLock::new();
+
+/// Bumped after every change to any cell's published ordinary entry. A
+/// directory that saw no change since its last sweep has nothing to retire.
+static ORDINARY_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// The current ordinary publication epoch. Read it BEFORE inspecting the
+/// slots it summarizes: a change racing that inspection then shows up as a
+/// newer epoch on the next read.
+pub fn ordinary_epoch() -> u64 {
+    ORDINARY_EPOCH.load(Ordering::Acquire)
+}
 
 /// Assign a dense ordinal once for an interned function name, including forward
 /// references. Unknown and collectable uninterned symbols use ordinary dispatch.

@@ -33,6 +33,7 @@ mod ordinary_mixed_entries;
 mod ordinary_guard;
 mod ordinary_guard_roots;
 mod ordinary_tail;
+mod t0_t2_calls;
 mod packed_f64;
 mod payloads;
 mod recursion;
