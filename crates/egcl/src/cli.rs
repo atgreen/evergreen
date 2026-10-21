@@ -38611,6 +38611,35 @@ fn check_generic_call_arguments(
     Ok(())
 }
 
+/// The lambda list of a generic function created implicitly by DEFMETHOD
+/// (CLHS 7.6.1): the method's required and optional parameter names, its &REST
+/// parameter, and &KEY with no keyword names.  Defaults, supplied-p variables,
+/// keyword parameters, &ALLOW-OTHER-KEYS and &AUX are dropped, so the
+/// congruence rule of CLHS 7.6.4 point 4 imposes no names on later methods.
+fn implicit_generic_lambda_list(method_lambda_list: EgclVal) -> EgclVal {
+    egcl_rt::rooted!(items = Vec::<EgclVal>::new());
+    let mut cursor = method_lambda_list;
+    while cursor.is_cons() {
+        let (item, next) = cp(cursor);
+        cursor = next;
+        if item.is_symbol() {
+            match sym_bare_name_rc(item).as_ref() {
+                "&KEY" => {
+                    items.push(item);
+                    break;
+                }
+                "&AUX" => break,
+                _ => {}
+            }
+            items.push(item);
+        } else if item.is_cons() {
+            // An &OPTIONAL parameter with a default: keep only its variable.
+            items.push(cp(item).0);
+        }
+    }
+    vec_to_list(&items)
+}
+
 const GENERIC_LAMBDA_LIST_PROPERTY: &str = "EGCL::%GENERIC-LAMBDA-LIST";
 
 fn store_generic_lambda_list(name_form: EgclVal, lambda_list: EgclVal) {
@@ -38938,7 +38967,9 @@ fn eval_defmethod(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     egcl_rt::rooted!(lambda_list = vec_to_list(&plain_params));
     // CLHS 7.6.4: the method's lambda list must be congruent with the generic
     // function's (ansi defmethod.error.*, defgeneric.error.12/13). An implicit
-    // generic function takes the first method's lambda list.
+    // generic function takes a lambda list derived from the first method's,
+    // with &KEY but no keyword names (CLHS 7.6.1), so later methods may accept
+    // different keywords (GH #507).
     match stored_generic_lambda_list(name_form) {
         Some(generic_lambda_list) => {
             if !method_lambda_list_congruent(generic_lambda_list, *lambda_list) {
@@ -38947,7 +38978,10 @@ fn eval_defmethod(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 )));
             }
         }
-        None => store_generic_lambda_list(name_form, *lambda_list),
+        None => {
+            egcl_rt::rooted!(implicit = implicit_generic_lambda_list(*lambda_list));
+            store_generic_lambda_list(name_form, *implicit);
+        }
     }
 
     let generic_function = if let Some(generic) = env.generics.borrow().get(&name).cloned() {

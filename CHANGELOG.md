@@ -315,6 +315,14 @@
 
 ### Fixed
 
+- A generic function created implicitly by `defmethod` now has `&key` with
+  no keyword names in its lambda list, as CLHS 7.6.1 specifies, so a later
+  method may accept different keywords. EGCL used to copy the first method's
+  keyword names into the generic function and reject such a method as not
+  congruent. Keywords declared by `defgeneric` are still required of every
+  method, and a call still rejects a keyword no applicable method accepts
+  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+
 - Deep recursion no longer signals a spurious `STORAGE-CONDITION` on Linux
   AArch64. That target used a 512 KiB control stack, the fallback for
   platforms without native compilation, although its native frames are the
