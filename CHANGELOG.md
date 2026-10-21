@@ -104,7 +104,7 @@
   a declined `(lambda ...)`, is no longer re-checked for tier-up on each call,
   and `EGCL_LOG=compile=trace` logs that decline instead of a dispatch line per
   call
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#495](https://github.com/atgreen/evergreen/pull/495)).
 - On x86-64 Linux, a function whose `LAMBDA` makes a `RETURN-FROM`, `RETURN`
   or `GO` to a block or tag that the `LAMBDA` itself establishes, such as
   `(mapcar (lambda (x) (dolist (y x) (when (p y) (call (lambda () (return y))))))
