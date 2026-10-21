@@ -65,7 +65,7 @@
   closure whose `&optional` or `&key` default reads a variable of its
   creator, such as `(lambda (x &key (off base)) ...)`, no longer signals
   `UNBOUND-VARIABLE` when the creator is compiled
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#494](https://github.com/atgreen/evergreen/pull/494)).
 - On x86-64 Linux, a function whose `LAMBDA` makes a `RETURN-FROM`, `RETURN`
   or `GO` to a block or tag that the `LAMBDA` itself establishes, such as
   `(mapcar (lambda (x) (dolist (y x) (when (p y) (call (lambda () (return y))))))
