@@ -5,22 +5,11 @@
 
 use std::process::Command;
 
-// Mapped Linux admits a body whose own bindings its closures capture, but not a
-// closure body that reads its creator's bindings, as every lambda here does.
-// These branches assert fallback semantics; native shared-code/OSR acceptance
-// for such closure bodies stays open in bliss-shih7.27.
+// Mapped Linux runs these closure bodies natively too (bliss-6fim1), but its
+// mapped emitter and deopt path log differently from the checked ABI: a
+// failed guard is observed through EGCL-EXT:DEOPT-COUNT rather than the
+// checked ABI's "native guard deopt" and "[deopt-path]" lines.
 const MAPPED_LINUX: bool = cfg!(target_os = "linux");
-
-fn assert_capture_fallback(trace: &str) {
-    assert!(
-        !trace.lines().any(is_closure_t2_publication),
-        "captured code must not claim mapped native installation: {trace}"
-    );
-    assert!(
-        !trace.contains("native guard deopt"),
-        "interpreted captured code must not claim native guard execution: {trace}"
-    );
-}
 
 fn is_closure_t2_publication(line: &str) -> bool {
     line.contains("<flet-closure>: background T2 result published")
@@ -92,10 +81,6 @@ fn captured_callbacks_promote_preserve_shared_state_and_survive_gc() {
                 .split("CAPTURE-T2-END")
                 .next()
                 .unwrap();
-            if MAPPED_LINUX {
-                assert_capture_fallback(warmup);
-                continue;
-            }
             assert!(warmup.lines().any(is_closure_t2_publication), "{warmup}");
             assert!(
                 !warmup.contains("UnsupportedInstr(\"LoadEnvVar\")"),
@@ -148,10 +133,6 @@ fn instances_of_one_lambda_reuse_native_compilation() {
         .split("SHARED-CODE-END")
         .next()
         .unwrap();
-    if MAPPED_LINUX {
-        assert_capture_fallback(trace);
-        return;
-    }
     let installations = trace
         .lines()
         .filter(|line| is_closure_t2_publication(line))
@@ -160,11 +141,13 @@ fn instances_of_one_lambda_reuse_native_compilation() {
         installations, 1,
         "one lambda template should publish once: {trace}"
     );
+    let emitted = if MAPPED_LINUX {
+        "<flet-closure>: mapped T2 emitted"
+    } else {
+        "<flet-closure>: T2 EMITTED"
+    };
     assert_eq!(
-        trace
-            .lines()
-            .filter(|line| line.contains("<flet-closure>: T2 EMITTED"))
-            .count(),
+        trace.lines().filter(|line| line.contains(emitted)).count(),
         1,
         "one lambda template should compile once: {trace}"
     );
@@ -181,7 +164,7 @@ fn shared_template_feedback_preserves_numeric_phase_recovery() {
           (dotimes (i 40) (assert (= (funcall b big) (+ big 2))))
           (dotimes (i 40) (assert (= (funcall a big) (+ big 1)))))
         (format *error-output* "SHARED-PHASE-END~%"))
-      (format t "SHARED-PHASE-OK~%")
+      (format t "SHARED-PHASE-OK DEOPTS ~a~%" (egcl-ext:deopt-count))
     "#;
     let output = Command::new(env!("CARGO_BIN_EXE_egcl"))
         .args(["--no-init", "--eval", program])
@@ -201,17 +184,28 @@ fn shared_template_feedback_preserves_numeric_phase_recovery() {
         .split("SHARED-PHASE-END")
         .next()
         .unwrap();
+    assert!(
+        !trace.contains("uninstall + blacklist"),
+        "sibling feedback must preserve phase recovery: {trace}"
+    );
     if MAPPED_LINUX {
-        assert_capture_fallback(trace);
+        // 80 bignum calls: the speculating version deopts until the backoff
+        // retires it, then a generic T2 version handles the rest natively.
+        let deopts: usize = stdout
+            .split("DEOPTS ")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|count| count.parse().ok())
+            .expect("deopt count");
+        assert!((1..80).contains(&deopts), "{deopts}: {trace}");
+        assert_eq!(trace.lines().filter(|line| is_closure_t2_publication(line)).count(), 2,
+            "the stale version must recover through native recompilation: {trace}");
+        assert!(trace.contains("<flet-closure>: 0 speculatable sites"), "{trace}");
         return;
     }
     assert!(
         trace.contains("native guard deopt"),
         "probe must fail a compiled guard: {trace}"
-    );
-    assert!(
-        !trace.contains("uninstall + blacklist"),
-        "sibling feedback must preserve phase recovery: {trace}"
     );
     assert!(
         trace.contains("supported numeric phase change => generic T1 + recompile"),
@@ -272,10 +266,6 @@ fn active_shared_code_survives_owner_collection_and_replacement() {
         .split("EVICTION-END")
         .next()
         .unwrap();
-    if MAPPED_LINUX {
-        assert_capture_fallback(trace);
-        return;
-    }
     assert_eq!(
         trace
             .lines()
@@ -284,6 +274,11 @@ fn active_shared_code_survives_owner_collection_and_replacement() {
         2,
         "the collected owner must be replaced while its code is active: {trace}"
     );
+    if MAPPED_LINUX {
+        // The active sibling's activation retains the obsolete mapped code and
+        // finishes on it; the program's assertions pin its answers.
+        return;
+    }
     let obsolete = trace
         .split("REPLACEMENT-READY")
         .nth(1)
@@ -347,14 +342,6 @@ fn shared_t1_loop_enters_t2_and_deopts_into_the_calling_capture() {
         .split("SHARED-OSR-END")
         .next()
         .unwrap();
-    if MAPPED_LINUX {
-        assert!(
-            stdout.lines().any(|line| line == "RESULT 1152921504607846975 DEOPTS 0"),
-            "interpreted capture must preserve the exact result without native deopts: {stdout}"
-        );
-        assert_capture_fallback(trace);
-        return;
-    }
     assert_eq!(
         trace
             .lines()
@@ -364,6 +351,13 @@ fn shared_t1_loop_enters_t2_and_deopts_into_the_calling_capture() {
         "loop heat must install one shared T2 version: {trace}"
     );
     assert!(trace.contains("osr_entries=1"), "{trace}");
+    if MAPPED_LINUX {
+        assert!(
+            !stdout.contains("DEOPTS 0\n"),
+            "the running loop must enter T2 and fail its numeric guard: {stdout}\n{trace}"
+        );
+        return;
+    }
     assert!(
         trace.contains("[deopt-path] Inlined"),
         "the running loop must enter T2 and fail its numeric guard: {trace}"

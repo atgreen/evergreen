@@ -26043,7 +26043,11 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 let d = eval_form(f_form, env)?;
                 bytecode::poll_background_compilation();
                 return Ok(resolve_tiered_fn(d)
-                    .map(|f| EgclVal::from_fixnum(egcl_rt::function::tier(f) as i64))
+                    .map(|f| {
+                        let own = egcl_rt::function::tier(f) as i64;
+                        let shared = bytecode::installed_closure_tier(f).map_or(0, i64::from);
+                        EgclVal::from_fixnum(own.max(shared))
+                    })
                     .unwrap_or(NIL));
             }
             // Tier-aware engine profile (bliss-4q30, profiling epic bliss-bfxm):

@@ -12,9 +12,8 @@ use std::process::{Command, Output};
 /// binding, captured `&optional`, `&key` and `&rest` parameters, a fresh
 /// binding per iteration and one binding shared by every iteration, nested
 /// captured LETs, cleanup, restart, special-binding and error paths, and a
-/// caller of the installed-wrapper shape of bliss-kg667 (the wrapper itself
-/// stays interpreted; only its results are pinned). Prints the results, then
-/// each tier.
+/// caller of the installed-wrapper shape of bliss-kg667. Prints the results,
+/// then each tier.
 const PROGRAM: &str = r#"
 (progn
   (defvar *cap-dyn* 0)
@@ -292,38 +291,249 @@ fn captured_loop_enters_t2_by_osr_and_deopts_on_its_frame() {
 }
 
 /// bliss-kg667: an installed anonymous wrapper that captured the original
-/// definition must keep finding it while its caller is hot. The wrapper's body
-/// reads its creator's binding, so it is declined and never runs natively;
-/// this pins the results across tier settings, not a native wrapper.
+/// definition must keep finding it once the wrapper itself is hot. The wrapper
+/// is created by a compiled function, so it is a bytecode closure whose body
+/// reads its creator's ORIGINAL; it now enters mapped native code, and the
+/// environment it reads is the invoked instance's, never one found by looking
+/// up the name it was installed under. A second wrapper of the same template
+/// installed over a different function shares the compiled body and must still
+/// reach its own ORIGINAL.
 #[test]
-fn installed_capturing_wrapper_results_hold_while_it_stays_interpreted() {
+fn installed_capturing_wrapper_runs_natively_with_its_own_binding() {
     let program = r#"
 (progn
   (defun f (a b) (list a b))
-  (let ((original (symbol-function 'f)))
-    (setf (symbol-function 'f) (lambda (&rest a) (cons :wrapped (apply original a)))))
-  (defun drive (i) (f i (* i 2)))
+  (defun g (a b) (list :g a b))
+  (defun install (sym)
+    (let ((original (symbol-function sym)))
+      (setf (symbol-function sym) (lambda (&rest a) (cons :wrapped (apply original a))))))
+  (install 'f)
+  (install 'g)
+  (defun drive (i) (list (f i (* i 2)) (g i i)))
   (let ((r nil))
     (dotimes (i 5000) (setq r (drive i)))
-    (format t "RESULT ~s ~s~%" r (f 1 2))))
+    (format t "RESULT ~s ~s ~s~%" r (f 1 2) (g 3 4))
+    (format t "TIERS ~a ~a~%" (egcl-ext:function-tier 'f) (egcl-ext:function-tier 'g))))
 "#;
-    for envs in [
-        &[
-            ("EGCL_T0_T1_THRESHOLD", "2"),
-            ("EGCL_T1_T2_INVOKE_THRESHOLD", "5"),
-            ("EGCL_T2_LOG", "stderr"),
-        ][..],
-        &[][..],
-        &[("EGCL_FORCE_TIER", "interp")][..],
-    ] {
+    let lazy_off = [("EGCL_LAZY_COMPILE", "0")];
+    let mut low = THRESHOLDS.to_vec();
+    low.extend(lazy_off);
+    for envs in [&low[..], &lazy_off[..], &[][..], &[("EGCL_FORCE_TIER", "interp")][..]] {
         let output = egcl(program, envs);
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
             output.status.success()
-                && stdout.contains("RESULT (:WRAPPED 4999 9998) (:WRAPPED 1 2)"),
+                && stdout.contains(
+                    "RESULT ((:WRAPPED 4999 9998) (:WRAPPED :G 4999 4999)) \
+                     (:WRAPPED 1 2) (:WRAPPED :G 3 4)"
+                ),
             "{envs:?}: {stdout}\n{}",
             String::from_utf8_lossy(&output.stderr)
         );
+        if MAPPED_LINUX && envs.len() > 1 {
+            assert!(stdout.contains("TIERS 2 2"), "{envs:?}: {stdout}");
+        }
+    }
+}
+
+/// Closure bodies that read and write bindings captured from an enclosing
+/// scope (bliss-6fim1): fifty instances of one template with fifty different
+/// environments, sibling closures and their creator sharing a mutated binding,
+/// a closure in a function cell, closures made in loops, three levels of
+/// nesting, `&key`/`&optional` defaults that read a captured binding, multiple
+/// values, non-local exits, errors and dynamic bindings. Creators are compiled
+/// eagerly so every closure is a bytecode closure. Prints results, then tiers.
+const CLOSURE_PROGRAM: &str = r#"
+(progn
+  (defvar *dd* 1)
+  (defun make-adder (n) (lambda (x) (+ x n)))
+  (defun make-counter ()
+    (let ((n 0))
+      (list (lambda () (incf n)) (lambda () n) (lambda (v) (setq n v))
+            (lambda () (list :creator n)))))
+  (defun install-cell (base)
+    (setf (symbol-function 'cell-fn) (lambda (x) (+ x base)))
+    (lambda (b) (setq base b)))
+  (defun loop-fns (n)
+    (let ((acc nil)) (dotimes (i n) (let ((j i)) (push (lambda (x) (* x j)) acc))) acc))
+  (defun lvl1 (a)
+    (lambda (b) (lambda (c) (lambda (d) (setq a (+ a 1)) (list a b c d)))))
+  (defun mkkey (base) (lambda (x &key (scale 1) (off base)) (+ (* x scale) off)))
+  (defun mkopt (base) (lambda (x &optional (y base)) (list x y)))
+  (defun mvc (k) (lambda (x) (values x k (+ x k))))
+  (defun mkthrow (k) (lambda (x) (if (> x k) (throw 'tag (list :thrown x k)) x)))
+  (defun mkerr (k) (lambda (x) (if (= x k) (error "bad ~a ~a" x k) (* x k))))
+  (defun mkdyn (y) (lambda () (list y *dd*)))
+  (defvar *adders*) (defvar *counters*) (defvar *setter*) (defvar *loop-fns*)
+  (defvar *deep*) (defvar *key*) (defvar *opt*) (defvar *mv*) (defvar *throw*)
+  (defvar *err*) (defvar *dyn*) (defvar *probes*)
+  ;; Fresh instances of every template; the answers below come from instances
+  ;; made after warm-up, which share the bodies compiled for the first ones.
+  (defun setup ()
+    (setq *adders* (loop for i below 50 collect (make-adder i))
+          *counters* (loop repeat 4 collect (make-counter))
+          *setter* (install-cell 100)
+          *loop-fns* (loop-fns 20)
+          *deep* (funcall (funcall (lvl1 10) 20) 30)
+          *key* (mkkey 7)
+          *opt* (mkopt 9)
+          *mv* (mvc 4)
+          *throw* (mkthrow 5)
+          *err* (mkerr 3)
+          *dyn* (mkdyn :y))
+    (setq *probes*
+          (list (first *adders*) (first (first *counters*)) (second (first *counters*))
+                (symbol-function 'cell-fn) (first *loop-fns*) *deep* *key* *opt* *mv*
+                *throw* *err* *dyn*)))
+  (setup)
+  (defun all-calls (i)
+    (list (loop for f in *adders* sum (funcall f i))
+          (progn (dolist (c *counters*) (funcall (first c)))
+                 (mapcar (lambda (c) (funcall (second c))) *counters*))
+          (cell-fn i)
+          (loop for f in *loop-fns* sum (funcall f i))
+          (funcall *deep* i)
+          (list (funcall *key* i :scale 2) (funcall *key* i :off 1))
+          (list (funcall *opt* i) (funcall *opt* i i))
+          (multiple-value-list (funcall *mv* i))
+          (catch 'tag (dotimes (k 10) (funcall *throw* (+ i k))))
+          (handler-case (loop for k below 5 sum (funcall *err* (+ k (mod i 4))))
+            (error (e) (princ-to-string e)))
+          (let ((*dd* i)) (funcall *dyn*))))
+  (loop for i from 0 below 3000
+        do (all-calls i)
+        until (every (lambda (f) (eql (egcl-ext:function-tier f) 2)) *probes*))
+  (setup)
+  (print (all-calls 7))
+  (funcall (third (first *counters*)) 1000)
+  (funcall *setter* 1)
+  (print (list (funcall (fourth (first *counters*))) (funcall (second (second *counters*)))
+               (cell-fn 5) (all-calls 2)))
+  (terpri)
+  (format t "TIERS ~{~a~^ ~}~%" (mapcar #'egcl-ext:function-tier *probes*)))
+"#;
+
+#[test]
+fn closure_bodies_reading_enclosing_bindings_reach_t2_with_identical_results() {
+    let mut envs = THRESHOLDS.to_vec();
+    envs.push(("EGCL_LAZY_COMPILE", "0"));
+    let tiered = egcl(CLOSURE_PROGRAM, &envs);
+    let (results, tiers) = results_and_tiers(&tiered);
+    // Pin the semantics, so an oracle drifting with the code cannot hide it.
+    assert_eq!(
+        results,
+        "(1575 (1 1 1 1) 107 1330 (11 20 30 7) (21 8) ((7 9) (7 7)) (7 4 11) (:THROWN 7 5) \
+         \"bad 3 3\" (:Y 7)) \n((:CREATOR 1000) 1 6 (1325 (1001 2 2 2) 3 380 (12 20 30 2) \
+         (11 3) ((2 9) (2 2)) (2 4 6) (:THROWN 6 5) \"bad 3 3\" (:Y 2)))"
+    );
+    if MAPPED_LINUX {
+        // Instances made after warm-up run the bodies their templates' first
+        // instances compiled.
+        assert_eq!(
+            tiers,
+            "2 2 2 2 2 2 2 2 2 2 2 2",
+            "{}",
+            String::from_utf8_lossy(&tiered.stderr)
+        );
+    }
+    for other in [
+        &[("EGCL_FORCE_TIER", "interp")][..],
+        &[("EGCL_LAZY_COMPILE", "0"), ("EGCL_DISABLE_T2", "1"), ("EGCL_T0_T1_THRESHOLD", "2")][..],
+        &[][..],
+    ] {
+        let (oracle, _) = results_and_tiers(&egcl(CLOSURE_PROGRAM, other));
+        assert_eq!(results, oracle, "results differ under {other:?}");
+    }
+}
+
+/// The same closures under a collection on every allocation with freed nursery
+/// poisoned. Captured bindings live in heap EnvFrames the collector updates in
+/// place; a value read through one by native code, and held in a native slot
+/// across a later allocation, must be the moved object.
+#[test]
+fn closure_bodies_survive_gc_stress() {
+    let mut envs = THRESHOLDS.to_vec();
+    envs.push(("EGCL_LAZY_COMPILE", "0"));
+    let (plain, _) = results_and_tiers(&egcl(CLOSURE_PROGRAM, &envs));
+    envs.extend([
+        ("EGCL_GC_STRESS", "1"),
+        ("EGCL_GC_POISON", "1"),
+        ("EGCL_GC_STRESS_AFTER_INIT", "1"),
+    ]);
+    let (stressed, _) = results_and_tiers(&egcl(CLOSURE_PROGRAM, &envs));
+    assert_eq!(plain, stressed);
+    // A fresh cons stored into a captured binding is in the nursery; the next
+    // allocation evacuates it while the native body still holds it in a slot.
+    let program = r#"
+(progn
+  (defun mk (n)
+    (let ((cell (list n)))
+      (lambda (k)
+        (setq cell (cons k cell))
+        (let ((before cell)) (make-list 3) (list (eq before cell) (car cell) (length cell))))))
+  (defun drive (f n) (let ((r nil)) (dotimes (i n) (setq r (funcall f i))) r))
+  (let ((fs (loop for i below 3 collect (mk i))))
+    (print (loop for f in fs collect (drive f 30)))
+    (terpri)
+    (format t "TIERS ~{~a~^ ~}~%" (mapcar #'egcl-ext:function-tier fs))))
+"#;
+    let (results, tiers) = results_and_tiers(&egcl(program, &envs));
+    assert_eq!(results, "((T 29 31) (T 29 31) (T 29 31))");
+    if MAPPED_LINUX {
+        assert_eq!(tiers, "2 2 2");
+    }
+}
+
+/// A closure whose loop writes a captured binding enters T2 by OSR with the
+/// instance's environment; a fixnum overflow in that loop deoptimizes into the
+/// interpreter on the same frame chain. Two instances of the template keep
+/// separate totals.
+#[test]
+fn closure_loop_osr_and_deopt_keep_the_instance_environment() {
+    let program = r#"
+(progn
+  (defun mkacc (base)
+    (let ((tot base))
+      (list (lambda (n) (dotimes (i n) (setq tot (+ tot 1))) tot) (lambda () tot))))
+  (let ((a (mkacc 0)) (b (mkacc (- most-positive-fixnum 100000))))
+    (dotimes (i 4) (funcall (first a) 1) (funcall (first b) 0))
+    (let ((d0 (egcl-ext:deopt-count)))
+      (format t "R1 ~a~%" (funcall (first a) 200000))
+      (format t "R2 ~a ~a~%" (funcall (first b) 200000) (funcall (second b)))
+      (format t "R3 ~a~%" (funcall (second a)))
+      (format t "DEOPTS ~a TIER ~a~%" (- (egcl-ext:deopt-count) d0)
+              (egcl-ext:function-tier (first a))))))
+"#;
+    let run = |envs: &[(&str, &str)]| {
+        let output = egcl(program, envs);
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(
+            output.status.success(),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        stdout
+    };
+    let tiered = run(&[
+        ("EGCL_LAZY_COMPILE", "0"),
+        ("EGCL_T0_T1_THRESHOLD", "2"),
+        ("EGCL_T1_T2_INVOKE_THRESHOLD", "100000000"),
+        ("EGCL_T1_T2_BACKEDGE_THRESHOLD", "1000"),
+        ("EGCL_T2_THREADS", "1"),
+    ]);
+    let oracle = run(&[("EGCL_FORCE_TIER", "interp")]);
+    let results = |out: &str| {
+        out.lines()
+            .filter(|line| line.starts_with('R'))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(results(&tiered), results(&oracle), "{tiered}");
+    assert!(oracle.contains("R1 200004"), "{oracle}");
+    assert!(oracle.contains("R3 200004"), "{oracle}");
+    if MAPPED_LINUX {
+        assert!(tiered.contains("TIER 2"), "the loop must OSR into T2: {tiered}");
+        assert!(!tiered.contains("DEOPTS 0 "), "the overflow must deopt: {tiered}");
     }
 }
 

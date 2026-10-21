@@ -6542,6 +6542,11 @@ impl<'e> Lowerer<'e> {
             .filter(|n| !n.starts_with('&'))
             .collect();
         let mut used = std::collections::HashSet::new();
+        // An `&optional`/`&key`/`&aux` init form is evaluated in the closure's
+        // defining scope too, so a name it reads is captured even when the body
+        // never mentions it (`(lambda (x &key (off base)) …)`): otherwise the
+        // closure carries no environment and the default signals UNBOUND-VARIABLE.
+        collect_lambda_list_init_names(params_form, &mut used);
         for f in list_to_vec(body) {
             collect_symbol_names(f, &mut used);
         }
@@ -20919,6 +20924,38 @@ fn has_t2_body(sym: u32, body: &Arc<BytecodeFunction>) -> bool {
         registry.borrow().get(&owner).is_some_and(|code| {
             code.is_t2 && code.body.as_ref().is_some_and(|saved| Arc::ptr_eq(saved, body))
         })
+    })
+}
+
+/// True when `function` is an instance of the closure template `body`.
+pub(super) fn closure_template_matches(function: EgclVal, body: *const BytecodeFunction) -> bool {
+    egcl_rt::function::is_interpreted_function(function)
+        && closure_bodies()
+            .borrow()
+            .get(&egcl_rt::function::definition_index(function))
+            .is_some_and(|template| std::ptr::eq(Arc::as_ptr(template), body))
+}
+
+/// The tier of the native code a closure instance runs, if any. Instances of
+/// one template share a single compiled version, installed under one owning
+/// instance's private symbol, so a background T2 publication cannot mark every
+/// instance's own tier word; the registry is authoritative.
+pub(super) fn installed_closure_tier(function: EgclVal) -> Option<u8> {
+    if !egcl_rt::function::is_interpreted_function(function) {
+        return None;
+    }
+    let sym = egcl_rt::function::definition_index(function);
+    if !egcl_rt::symbols::is_uninterned(sym) {
+        return None;
+    }
+    let body = closure_bodies().borrow().get(&sym).cloned()?;
+    let owner = CLOSURE_COMPILATION
+        .with(|cache| cache.borrow().get(&(Arc::as_ptr(&body) as usize)).map(|state| state.owner))
+        .unwrap_or(sym);
+    NATIVE_REGISTRY.with(|registry| {
+        registry.borrow().get(&owner)
+            .filter(|code| code.body.as_ref().is_some_and(|saved| Arc::ptr_eq(saved, &body)))
+            .map(|code| if code.is_t2 { 2 } else { 1 })
     })
 }
 

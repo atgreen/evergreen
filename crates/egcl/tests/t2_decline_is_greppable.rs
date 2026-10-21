@@ -103,7 +103,9 @@ fn a_function_declined_at_t1_explains_itself_in_the_t2_log() {
             "(progn (defun keyfn (a &key (b 1)) (+ a b)) \
                     (defun restfn (&rest r) (let ((g (lambda () r))) (funcall g))) \
                     (let ((k 3)) (defun capfn (n) (+ n k))) \
-                    (dotimes (i 50) (keyfn i) (restfn i) (capfn i)) \
+                    (defun typedcap (n) (declare (fixnum n)) \
+                      (let ((g (lambda () n))) (funcall g))) \
+                    (dotimes (i 50) (keyfn i) (restfn i) (capfn i) (typedcap i)) \
                     (values))",
         ])
         .env("EGCL_T2_LOG", "stderr")
@@ -112,24 +114,22 @@ fn a_function_declined_at_t1_explains_itself_in_the_t2_log() {
         .expect("run egcl");
     let log = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{log}");
-    // A plain &key lambda list, and a body whose own bindings its closures
-    // capture, enter mapped T1 now (bliss-shih7.27), so neither may be
-    // reported as declined. A DEFUN that reads its enclosing LET's binding
-    // still is.
-    assert!(
-        !log.contains("[T2] KEYFN: T1 declined"),
-        "a plain &key function must no longer decline T1:\n{log}"
-    );
-    assert!(
-        !log.contains("[T2] RESTFN: T1 declined"),
-        "a capturing &rest function must no longer decline T1:\n{log}"
-    );
+    // A plain &key lambda list, a body whose own bindings its closures
+    // capture (bliss-shih7.27), and a DEFUN that reads its enclosing LET's
+    // binding (bliss-6fim1) all enter mapped T1 now, so none may be reported
+    // as declined. A declared type on a captured parameter still is.
+    for name in ["KEYFN", "RESTFN", "CAPFN"] {
+        assert!(
+            !log.contains(&format!("[T2] {name}: T1 declined")),
+            "{name} must no longer decline T1:\n{log}"
+        );
+    }
     assert!(
         log.contains(
-            "[T2] CAPFN: T1 declined (captured variables (closure environment): \
-             reads bindings captured from an enclosing scope)"
+            "[T2] TYPEDCAP: T1 declined (captured variables (closure environment): \
+             a declared parameter type beside a captured parameter)"
         ),
-        "the enclosing-capture decline must be explained in the T2 log:\n{log}"
+        "the captured-environment decline must be explained in the T2 log:\n{log}"
     );
 }
 

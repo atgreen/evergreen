@@ -12,9 +12,9 @@
 
 use std::process::{Command, Output};
 
-// Mapped Linux admission excludes a body that reads bindings captured from an
-// enclosing scope; &optional, &rest/&key/&aux entries, and bodies whose own
-// bindings their closures capture, are admitted (bliss-shih7.27). Checked
+// Mapped Linux admits &optional, &rest/&key/&aux entries, bodies whose own
+// bindings their closures capture (bliss-shih7.27), and closure bodies that
+// read bindings captured from an enclosing scope (bliss-6fim1). Checked
 // primitive declarations have an ordinary native entry and validate at ingress.
 const MAPPED_LINUX: bool = cfg!(all(target_arch = "x86_64", target_os = "linux"));
 
