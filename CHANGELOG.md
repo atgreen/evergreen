@@ -311,7 +311,7 @@
   requested heap grows it to three times the image's data instead of failing.
   A size of 0 is rejected, and a heap the system cannot reserve is reported as
   such at startup instead of panicking at the first allocation
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#498](https://github.com/atgreen/evergreen/pull/498)).
 - When live data outgrows the heap, the program gets a `STORAGE-CONDITION`
   instead of a panic with "GC minor evacuation exhausted regions", in
   interpreted and compiled code alike. Nothing moves when the survivors cannot
@@ -319,7 +319,7 @@
   program that handles it and drops its data can continue. Compiled code that
   has a handler, `UNWIND-PROTECT` or dynamic binding of its own active at that
   moment can still report "invalid native transfer capture" instead
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#498](https://github.com/atgreen/evergreen/pull/498)).
 - A `THROW` from the default form of a `&key` or `&aux` parameter to a
   `CATCH` in the interpreted caller reaches that catch. Once the caller had
   been called a few times, the throw escaped as an internal error such as
