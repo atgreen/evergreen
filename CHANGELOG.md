@@ -86,7 +86,7 @@
   again or prepares an unusable call frame on every call. A call with one
   `&key` argument whose body calls `CHAR` fell from about 3.8 us to 2.4 us,
   which is still slower than the 1.5 us it costs interpreted
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#502](https://github.com/atgreen/evergreen/pull/502)).
 - On x86-64 Linux, a closure that reads or sets variables captured from the
   function or `LET` that created it -- `(lambda (y) (+ x y k))`, a counter's
   `(lambda () (incf n))`, or a wrapper such as `(lambda (&rest a) (apply
