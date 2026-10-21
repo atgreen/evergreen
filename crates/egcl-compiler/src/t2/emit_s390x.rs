@@ -401,7 +401,7 @@ pub fn emit_native_call_entry(spec: &NativeCallEntry) -> Result<Vec<u8>, EmitErr
     a.branch(6, slow);
     a.imm64(1, spec.depth);
     a.load_u32(0, 1, 0);
-    a.compare_imm(0, spec.depth_cap as i16);
+    a.compare_imm(0, spec.depth_cap as i16); // checked above
     a.branch(10, slow); // at or above the cap
     a.imm64(1, spec.stack);
     a.load(0, 1, bs_cap);

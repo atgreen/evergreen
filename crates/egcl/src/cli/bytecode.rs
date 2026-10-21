@@ -124,6 +124,11 @@ pub(super) fn initialize_native_callable_entries() {
 pub(super) use native_callable::invoke as invoke_native_callable;
 #[cfg(all(target_arch = "x86_64", unix))]
 mod call_table_native;
+// Same name, same API, System Z machine code: the shared linkage plumbing in
+// call_table.rs names one module and does not care which target supplied it.
+#[cfg(all(target_arch = "s390x", target_os = "linux"))]
+#[path = "bytecode/call_table_native_s390x.rs"]
+mod call_table_native;
 #[cfg(all(target_arch = "x86_64", unix))]
 mod call_table_funcall;
 use super::control_payload::ControlPayload;

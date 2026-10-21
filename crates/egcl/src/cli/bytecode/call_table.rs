@@ -87,7 +87,7 @@ struct State {
     // across fiber migration. Read the cell at entry, not the Env it held when
     // this target was resolved: nested native activations replace that Env.
     native_env: *const std::cell::Cell<*mut Env>,
-    #[cfg(all(target_arch = "x86_64", unix))]
+    #[cfg(any(all(target_arch = "x86_64", unix), all(target_arch = "s390x", target_os = "linux")))]
     #[allow(clippy::vec_box)] // generated entries embed stable descriptor addresses
     versions: RefCell<Vec<Box<super::call_table_native::NativeEntry>>>,
     #[cfg(all(target_arch = "x86_64", unix))]
@@ -164,7 +164,7 @@ pub(super) fn resolve(symbol: u32) -> Option<Arc<CallCell>> {
                 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
                 mapped: RefCell::new(None),
                 native_env: NATIVE_ENV.with(std::ptr::from_ref),
-                #[cfg(all(target_arch = "x86_64", unix))]
+                #[cfg(any(all(target_arch = "x86_64", unix), all(target_arch = "s390x", target_os = "linux")))]
                 versions: RefCell::new(Vec::new()),
                 #[cfg(all(target_arch = "x86_64", unix))]
                 funcall: RefCell::new(None),
@@ -192,10 +192,11 @@ pub(super) unsafe fn scan(visit: &mut dyn FnMut(*mut EgclVal)) {
         SLOTS.scan(|slots| {
             for state in slots.borrow().iter().flatten() {
                 #[cfg(all(target_arch = "x86_64", unix))]
+                if let Some(cache) = state.funcall.borrow_mut().as_mut() {
+                    cache.scan();
+                }
+                #[cfg(any(all(target_arch = "x86_64", unix), all(target_arch = "s390x", target_os = "linux")))]
                 {
-                    if let Some(cache) = state.funcall.borrow_mut().as_mut() {
-                        cache.scan();
-                    }
                     let mut versions = state.versions.borrow_mut();
                     versions.retain(|version| version.keep(&state.cell));
                     for version in versions.iter_mut() {
@@ -479,7 +480,7 @@ fn publish_target(state: &State, revision: u64, target: Option<Target>) {
         } else {
             [entries[2], entries[3]]
         };
-        #[cfg(all(target_arch = "x86_64", unix))]
+        #[cfg(any(all(target_arch = "x86_64", unix), all(target_arch = "s390x", target_os = "linux")))]
         if let Some(Target::Native {
             function,
             code,
@@ -531,7 +532,7 @@ fn publish_target(state: &State, revision: u64, target: Option<Target>) {
         if super::native_transfer_entry::ordinary_primitives::is_private(state.symbol) {
             adapter::ensure(state);
         }
-        #[cfg(all(target_arch = "x86_64", unix))]
+        #[cfg(any(all(target_arch = "x86_64", unix), all(target_arch = "s390x", target_os = "linux")))]
         state
             .versions
             .borrow_mut()
