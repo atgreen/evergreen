@@ -76,6 +76,19 @@
   creator, such as `(lambda (x &key (off base)) ...)`, no longer signals
   `UNBOUND-VARIABLE` when the creator is compiled
   ([#494](https://github.com/atgreen/evergreen/pull/494)).
+- A minor collection's pause no longer grows with the old generation on
+  Linux. To find references into the nursery the collector traced every
+  older object twice per minor collection, about 3-5 ms per MB of live
+  conses: with 150 MB of conses retained, each minor collection took
+  0.4-0.8 s. It now asks the kernel which pages were written since the
+  previous minor collection (soft-dirty tracking) and scans only those. The
+  same minor collections take 44-68 ms with 0-250 MB retained, and 48-50 ms
+  with 0-150 MB of fixnum vectors (previously up to 174 ms). Tracking costs
+  one page fault per nursery page per cycle, so it starts only once the old
+  generation reaches a quarter of the nursery's size (16 MB by default);
+  `EGCL_GC_SOFT_DIRTY=1` uses it always and `EGCL_GC_SOFT_DIRTY=0` never.
+  Kernels without soft-dirty support and other systems keep the full scan
+  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
 - On x86-64 Linux, a function whose `LAMBDA` makes a `RETURN-FROM`, `RETURN`
   or `GO` to a block or tag that the `LAMBDA` itself establishes, such as
   `(mapcar (lambda (x) (dolist (y x) (when (p y) (call (lambda () (return y))))))

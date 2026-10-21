@@ -42,6 +42,7 @@ pub mod value;
 
 // ── Memory / GC ───────────────────────────────────────────────────
 pub mod gc;
+pub(crate) mod gc_soft_dirty;
 pub mod jit;
 pub mod jit_debug;
 pub mod lock_order;

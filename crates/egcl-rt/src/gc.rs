@@ -1346,6 +1346,219 @@ unsafe fn trace_object(
     }
 }
 
+// ── Old-generation scan for minor collections (bliss-3uwzg) ───────
+//
+// A minor collection must find every older slot that refers into the nursery.
+// Not every reference store runs the write barrier, so without help the
+// collector has to trace the whole old generation (GitHub #471: ~2.9 ms per MB
+// of live conses per minor collection). With kernel soft-dirty tracking armed
+// (`gc_soft_dirty`), only pages written since the previous minor collection can
+// hold such a slot: the scan visits the objects overlapping those pages and,
+// within them, only the slots on dirty pages. Objects whose trace reaches
+// off-heap storage (a stream's state block, an interpreted function's captured
+// environment) can change without a heap write, so they are traced on every
+// collection from a per-region list kept between collections.
+
+/// Whether `trace_object` reaches slots outside the object's own heap words for
+/// this type — storage whose changes no heap page records.
+#[inline]
+fn traces_off_heap(type_id: u8) -> bool {
+    use crate::object::type_id as tid;
+    matches!(type_id, tid::STREAM | tid::FUNCTION_INTERPRETED)
+}
+
+/// Older-generation scan state kept across minor collections.
+#[derive(Default)]
+struct OldGenScan {
+    dirty: crate::gc_soft_dirty::DirtyPages,
+    ranges: Vec<(usize, usize)>,
+    /// Older slots (heap or off-heap) that referred into the nursery; the
+    /// relocation pass rewrites exactly these.
+    slots: Vec<usize>,
+    /// Headers of older forwarding stubs (CHANGE-CLASS) whose target is young.
+    stubs: Vec<usize>,
+    /// Each region's `alloc_top` before evacuation; objects above it were
+    /// copied by this collection and need their fields relocated.
+    pre_tops: Vec<usize>,
+    /// Per region: headers of `traces_off_heap` objects, and the (kind, top)
+    /// the list was built for. Valid only for the heap in `cache_heap`.
+    off_heap: Vec<Vec<usize>>,
+    seen: Vec<Option<(RegionKind, usize)>>,
+    cache_heap: (usize, usize),
+    /// Diagnostics for `EGCL_GC_REGION_LOG`: regions walked and objects traced.
+    walked_regions: u64,
+    traced_objects: u64,
+}
+
+/// Global, not thread-local: whichever thread collects next must see the lists
+/// the previous collection left.
+static OLD_GEN_SCAN: std::sync::Mutex<Option<OldGenScan>> = std::sync::Mutex::new(None);
+
+/// Bytes a whole-generation minor scan would walk.
+fn old_generation_bytes(state: &HeapState) -> usize {
+    state
+        .regions
+        .iter()
+        .filter(|r| is_old_scan_kind(r.header.kind))
+        .map(|r| (r.header.alloc_top as usize).saturating_sub(r.base as usize))
+        .sum()
+}
+
+#[inline]
+fn is_old_scan_kind(kind: RegionKind) -> bool {
+    matches!(
+        kind,
+        RegionKind::OldGen | RegionKind::Survivor | RegionKind::LargeObject
+    )
+}
+
+impl OldGenScan {
+    fn take() -> OldGenScan {
+        OLD_GEN_SCAN
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .unwrap_or_default()
+    }
+
+    /// Rebuild every region's list after a major collection moved older
+    /// objects, so the next minor collection need not walk the whole old
+    /// generation to find them again. One header walk, in the major pause.
+    fn rebuild_regions(state: &HeapState) {
+        let mut guard = OLD_GEN_SCAN.lock().unwrap_or_else(|e| e.into_inner());
+        let scan = guard.get_or_insert_with(OldGenScan::default);
+        scan.cache_heap = (state.heap_base as usize, state.config.heap_size);
+        scan.off_heap.resize_with(state.regions.len(), Vec::new);
+        scan.seen.resize(state.regions.len(), None);
+        for (idx, region) in state.regions.iter().enumerate() {
+            let kind = region.header.kind;
+            if !is_old_scan_kind(kind) {
+                scan.forget_region(idx);
+                continue;
+            }
+            scan.start_region(idx);
+            let top = region.header.alloc_top as usize;
+            let mut cursor = region.base as usize;
+            while cursor + OBJECT_HEADER_SIZE <= top {
+                let header_ptr = cursor as *const u8;
+                // SAFETY: walking valid object headers below the region top.
+                let (type_id, body_size) = unsafe { read_object_header(header_ptr) };
+                if body_size == 0 && type_id == 0 {
+                    break;
+                }
+                if !unsafe { header_is_forwarded(header_ptr) } {
+                    scan.note_object(idx, cursor, type_id);
+                }
+                cursor += unsafe { header_total_bytes(header_ptr) };
+            }
+            scan.finish_region(idx, kind, top);
+        }
+    }
+
+    fn put_back(self) {
+        *OLD_GEN_SCAN.lock().unwrap_or_else(|e| e.into_inner()) = Some(self);
+    }
+
+    /// Reset per-collection scratch and size the per-region lists. Returns
+    /// true when the dirty pages of every older region are known, i.e. the
+    /// scan may be limited to them.
+    fn begin(&mut self, state: &HeapState) -> bool {
+        let heap = (state.heap_base as usize, state.config.heap_size);
+        let count = state.regions.len();
+        self.slots.clear();
+        self.stubs.clear();
+        self.walked_regions = 0;
+        self.traced_objects = 0;
+        if self.cache_heap != heap || self.seen.len() != count {
+            self.cache_heap = heap;
+            self.off_heap.clear();
+            self.off_heap.resize_with(count, Vec::new);
+            self.seen.clear();
+            self.seen.resize(count, None);
+        }
+        self.ranges.clear();
+        for region in state.regions.iter() {
+            let base = region.base as usize;
+            let top = region.header.alloc_top as usize;
+            if !is_old_scan_kind(region.header.kind) || top <= base {
+                continue;
+            }
+            match self.ranges.last_mut() {
+                Some((_, end)) if *end == base => *end = top,
+                _ => self.ranges.push((base, top)),
+            }
+        }
+        crate::gc_soft_dirty::read_dirty_pages(heap.0, heap.1, &self.ranges, &mut self.dirty)
+    }
+
+    /// Record the off-heap-tracing object at `header` in region `idx`.
+    fn note_object(&mut self, idx: usize, header: usize, type_id: u8) {
+        if traces_off_heap(type_id) {
+            self.off_heap[idx].push(header);
+        }
+    }
+
+    /// Start (re)building region `idx`'s list during a walk of the region.
+    fn start_region(&mut self, idx: usize) {
+        self.off_heap[idx].clear();
+    }
+
+    fn finish_region(&mut self, idx: usize, kind: RegionKind, top: usize) {
+        self.seen[idx] = Some((kind, top));
+    }
+
+    /// Forget every region the scan did not walk or validate.
+    fn forget_region(&mut self, idx: usize) {
+        self.off_heap[idx].clear();
+        self.seen[idx] = None;
+    }
+
+    /// After evacuation: extend each region's list over the objects this
+    /// collection copied into it, so a region that only received copies (which
+    /// leave no dirty page) is not walked again by the next collection.
+    fn note_copies(&mut self, state: &HeapState) {
+        for (idx, region) in state.regions.iter().enumerate() {
+            let kind = region.header.kind;
+            let base = region.base as usize;
+            let top = region.header.alloc_top as usize;
+            let Some(&before) = self.pre_tops.get(idx) else {
+                continue;
+            };
+            if !is_old_scan_kind(kind) || top <= before {
+                continue;
+            }
+            match self.seen[idx] {
+                Some((seen_kind, seen_top)) if seen_kind == kind && seen_top == before => {}
+                None if before == base => self.off_heap[idx].clear(),
+                _ => continue,
+            }
+            let mut cursor = before;
+            while cursor + OBJECT_HEADER_SIZE <= top {
+                let header_ptr = cursor as *const u8;
+                // SAFETY: objects this collection copied below the region top.
+                let (type_id, body_size) = unsafe { read_object_header(header_ptr) };
+                if body_size == 0 && type_id == 0 {
+                    break;
+                }
+                self.note_object(idx, cursor, type_id);
+                cursor += unsafe { header_total_bytes(header_ptr) };
+            }
+            self.seen[idx] = Some((kind, top));
+        }
+    }
+
+    fn snapshot_tops(&mut self, state: &HeapState) {
+        self.pre_tops.clear();
+        self.pre_tops.extend(state.regions.iter().map(|r| {
+            if r.header.kind == RegionKind::Free {
+                r.base as usize
+            } else {
+                r.header.alloc_top as usize
+            }
+        }));
+    }
+}
+
 impl HeapCollector {
     /// Precise CL-stack roots (nmq.3): mark exactly the heap references held in
     /// every live CL frame of every green thread. Each frame slot is a tagged
@@ -1415,6 +1628,151 @@ impl HeapCollector {
             }
             if let Some(fp) = crate::thread::fiber_published_fp(id) {
                 relocate_from(fp);
+            }
+        }
+    }
+
+    /// Soft-dirty half of a minor collection's old-generation scan
+    /// (bliss-3uwzg): hand `visit` every older reference slot that may have
+    /// been written since the previous minor collection. Regions with no
+    /// dirty page cost only their off-heap-tracing objects; in a region with
+    /// dirty pages, objects that overlap one are traced, restricted to the
+    /// slots on dirty pages. Young targets of forwarding stubs on dirty pages
+    /// are marked through `visit` as well, and the stubs recorded for
+    /// relocation.
+    fn scan_dirty_old_generation(
+        state: &HeapState,
+        scan: &mut OldGenScan,
+        mut visit: impl FnMut(*mut EgclVal, &mut OldGenScan),
+    ) {
+        let dirty = std::mem::take(&mut scan.dirty);
+        for (idx, region) in state.regions.iter().enumerate() {
+            let kind = region.header.kind;
+            if !is_old_scan_kind(kind) {
+                scan.forget_region(idx);
+                continue;
+            }
+            let base = region.base as usize;
+            let top = region.header.alloc_top as usize;
+            if scan.seen[idx] == Some((kind, top)) && !dirty.any_dirty(base, top) {
+                // Unwritten since the last scan: only off-heap storage can
+                // have changed.
+                for i in 0..scan.off_heap[idx].len() {
+                    let header_ptr = scan.off_heap[idx][i] as *const u8;
+                    // SAFETY: recorded live object headers in an unwritten region.
+                    let (type_id, body_size) = unsafe { read_object_header(header_ptr) };
+                    let body = unsafe { header_ptr.add(body_offset(header_ptr)) } as *mut u8;
+                    unsafe {
+                        trace_object(body, type_id, body_size as usize, |slot| visit(slot, scan))
+                    };
+                }
+                continue;
+            }
+            scan.start_region(idx);
+            scan.walked_regions += 1;
+            let mut cursor = base;
+            while cursor + OBJECT_HEADER_SIZE <= top {
+                let header_ptr = cursor as *const u8;
+                // SAFETY: walking valid object headers below the region top.
+                let (type_id, body_size) = unsafe { read_object_header(header_ptr) };
+                if body_size == 0 && type_id == 0 {
+                    break;
+                }
+                let total_size = unsafe { header_total_bytes(header_ptr) };
+                let written = dirty.any_dirty(cursor, cursor + total_size);
+                if unsafe { header_is_forwarded(header_ptr) } {
+                    if written {
+                        // A CHANGE-CLASS stub: its forwarding word is a raw
+                        // body pointer that may name a young object.
+                        let mut stub = EgclVal(cursor as u64 | crate::value::TAG_HEAP_OBJECT);
+                        let before = scan.slots.len();
+                        visit(&mut stub as *mut EgclVal, scan);
+                        if scan.slots.len() > before {
+                            scan.slots.truncate(before);
+                            scan.stubs.push(cursor);
+                        }
+                    }
+                } else {
+                    scan.note_object(idx, cursor, type_id);
+                    let off_heap = traces_off_heap(type_id);
+                    if written || off_heap {
+                        scan.traced_objects += 1;
+                        let body = unsafe { header_ptr.add(body_offset(header_ptr)) } as *mut u8;
+                        unsafe {
+                            trace_object(body, type_id, body_size as usize, |slot| {
+                                if off_heap || dirty.is_dirty(slot as usize) {
+                                    visit(slot, scan);
+                                }
+                            })
+                        };
+                    }
+                }
+                cursor += total_size;
+            }
+            scan.finish_region(idx, kind, top);
+        }
+        scan.dirty = dirty;
+    }
+
+    /// Relocation half of a soft-dirty minor collection (bliss-3uwzg): rewrite
+    /// the older slots and stubs the scan found, the fields of every object
+    /// this collection copied, and the fields of retained (pinned) regions —
+    /// the only places outside the roots that can still refer into the nursery.
+    fn relocate_minor_targets(
+        state: &HeapState,
+        scan: &OldGenScan,
+        pinned: &[usize],
+        heap_base: usize,
+        heap_end: usize,
+    ) {
+        for &slot in &scan.slots {
+            // SAFETY: slots recorded by this collection's scan; the world is
+            // stopped, so they are still live reference slots.
+            unsafe { relocate_slot(slot as *mut EgclVal, heap_base, heap_end) };
+        }
+        for &stub in &scan.stubs {
+            let header_ptr = stub as *mut u8;
+            // SAFETY: a forwarded older object recorded by the scan.
+            unsafe {
+                let target = header_forwarding_addr(header_ptr) as usize;
+                let mut v =
+                    EgclVal((target - OBJECT_HEADER_SIZE) as u64 | crate::value::TAG_HEAP_OBJECT);
+                relocate_slot(&mut v, heap_base, heap_end);
+                *(header_ptr.add(body_offset(header_ptr)) as *mut usize) = ref_body_addr(v);
+            }
+        }
+        let relocate_range = |start: usize, top: usize| {
+            let mut cursor = start;
+            while cursor + OBJECT_HEADER_SIZE <= top {
+                let header_ptr = cursor as *mut u8;
+                // SAFETY: objects copied or retained by this collection.
+                let (type_id, body_size) = unsafe { read_object_header(header_ptr) };
+                if body_size == 0 && type_id == 0 {
+                    break;
+                }
+                let total = unsafe { header_total_bytes(header_ptr) };
+                if !unsafe { header_is_forwarded(header_ptr) } {
+                    let body = unsafe { header_ptr.add(body_offset(header_ptr)) };
+                    unsafe {
+                        trace_object(body, type_id, body_size as usize, |slot| {
+                            relocate_slot(slot, heap_base, heap_end);
+                        });
+                    }
+                }
+                cursor += total;
+            }
+        };
+        for (idx, region) in state.regions.iter().enumerate() {
+            if !is_old_scan_kind(region.header.kind) {
+                continue;
+            }
+            let top = region.header.alloc_top as usize;
+            if pinned.contains(&idx) {
+                relocate_range(region.base as usize, top);
+            } else if let Some(&before) = scan.pre_tops.get(idx) {
+                if top > before {
+                    relocate_range(before, top);
+                }
             }
         }
     }
@@ -1704,17 +2062,46 @@ impl HeapCollector {
             }
         }
 
-        // Scan every non-nursery object for young references.  The remembered
-        // set is the fast-path record of old-to-young stores, but a complete
-        // collection must also cover objects constructed before a barrier was
-        // available and survivor-to-nursery edges.
-        for region in state.regions.iter() {
+        // Scan non-nursery objects for young references.  The remembered set
+        // is the fast-path record of old-to-young stores, but not every store
+        // runs the barrier, and survivor-to-nursery edges need the same cover.
+        // With soft-dirty tracking armed, only pages written since the previous
+        // minor collection are scanned (bliss-3uwzg); otherwise every older
+        // object is traced, as before.
+        let mut old_scan = OldGenScan::take();
+        let dirty_scan = old_scan.begin(state);
+        #[cfg(test)]
+        if dirty_scan {
+            old_scan_tests::DIRTY_SCANS.with(|count| count.set(count.get() + 1));
+        }
+        if dirty_scan {
+            Self::scan_dirty_old_generation(state, &mut old_scan, |slot, scan| {
+                // SAFETY: the scan hands out live, readable reference slots.
+                let v = unsafe { *slot };
+                if !is_heap_ref(v) {
+                    return;
+                }
+                let target = ref_body_addr(resolve_forwarded(v));
+                if nursery_index.position(target).is_some() {
+                    scan.slots.push(slot as usize);
+                    if nursery_index.mark(target) {
+                        mark_worklist.push(target);
+                    }
+                }
+            });
+        }
+        for (region_idx, region) in state.regions.iter().enumerate() {
+            if dirty_scan {
+                break;
+            }
             if !matches!(
                 region.header.kind,
                 RegionKind::OldGen | RegionKind::Survivor | RegionKind::LargeObject
             ) {
+                old_scan.forget_region(region_idx);
                 continue;
             }
+            old_scan.start_region(region_idx);
             let mut cursor = region.base as usize;
             let top = region.header.alloc_top as usize;
             while cursor + OBJECT_HEADER_SIZE <= top {
@@ -1731,6 +2118,7 @@ impl HeapCollector {
                 // object.
                 let total_size = unsafe { header_total_bytes(header_ptr) };
                 if !unsafe { header_is_forwarded(header_ptr) } {
+                    old_scan.note_object(region_idx, cursor, type_id);
                     let body_off = unsafe { body_offset(header_ptr) };
                     unsafe {
                         trace_object(
@@ -1743,6 +2131,21 @@ impl HeapCollector {
                 }
                 cursor += total_size;
             }
+            old_scan.finish_region(region_idx, region.header.kind, top);
+        }
+
+        if gc_region_log_enabled() {
+            crate::syscall::dbg_write(if dirty_scan {
+                b"[gc-regions] minor old scan: dirty pages, walked "
+            } else {
+                b"[gc-regions] minor old scan: whole old generation, walked "
+            });
+            write_decimal(old_scan.walked_regions);
+            crate::syscall::dbg_write(b" regions, traced ");
+            write_decimal(old_scan.traced_objects);
+            crate::syscall::dbg_write(b" objects, ");
+            write_decimal(old_scan.slots.len() as u64);
+            crate::syscall::dbg_write(b" young refs\n");
         }
 
         // A pinned nursery region stays in place as a unit.  Treat every object
@@ -1778,6 +2181,8 @@ impl HeapCollector {
             }
         }
 
+        // Everything above these tops after evacuation is a copy made below.
+        old_scan.snapshot_tops(state);
         for &nursery_idx in &nursery_indices {
             if pinned_indices.contains(&nursery_idx) {
                 continue; // Retained in place (pinned) — do not evacuate.
@@ -1881,6 +2286,8 @@ impl HeapCollector {
             // discipline (egcl-jtc.7f).
         }
 
+        old_scan.note_copies(state);
+
         // Promote retained (pinned) nursery regions to old-gen in place, before
         // the relocation passes, so their objects' fields are traced and any
         // references they hold to just-evacuated objects are rewritten. The
@@ -1939,7 +2346,19 @@ impl HeapCollector {
         // survivor copies and must be rewritten to their evacuated targets. This
         // also covers old→young fields of typed objects; the remembered set above
         // additionally covers barrier-recorded slots in untyped objects.
-        Self::relocate_object_fields(state, heap_base_addr, heap_end);
+        if dirty_scan {
+            // Only the slots the scan found, this collection's copies, and the
+            // retained regions can refer into the nursery (bliss-3uwzg).
+            Self::relocate_minor_targets(
+                state,
+                &old_scan,
+                &pinned_indices,
+                heap_base_addr,
+                heap_end,
+            );
+        } else {
+            Self::relocate_object_fields(state, heap_base_addr, heap_end);
+        }
 
         // Complete the young-object root set (bliss-jtc.17): a nursery object may
         // also be reachable only from a CL-stack frame or the entry continuation.
@@ -2174,6 +2593,16 @@ impl HeapCollector {
             region.header.gen_age = 0;
         }
 
+        // The nursery is empty, so no older object refers into it: start
+        // recording writes for the next minor collection's scan (bliss-3uwzg).
+        old_scan.put_back();
+        crate::gc_soft_dirty::rearm(
+            heap_base_addr,
+            state.config.heap_size,
+            old_generation_bytes(state),
+            state.config.nursery_size,
+        );
+
         // Update stats.
         state.stats.nursery_regions_retained += regions_retained;
         state.stats.nursery_regions_evacuated += regions_evacuated;
@@ -2346,6 +2775,9 @@ impl HeapCollector {
         // A standalone major collection must first drain nursery state so
         // nursery deaths trigger finalizers and weak-reference clearing too.
         self.minor_gc_stw_body()?;
+        // Until this collection completes (and re-arms the tracker below), the
+        // next minor collection must scan the whole old generation.
+        crate::gc_soft_dirty::disarm();
 
         // Set marking flag (§3.6.2: SATB barrier only fires when marking active).
         set_gc_marking_in_progress(true);
@@ -2952,6 +3384,17 @@ impl HeapCollector {
         // the next cycle resets it before use.
         MAJOR_OBJECT_MAP.with(|s| *s.borrow_mut() = std::mem::take(&mut object_map));
         MAJOR_WORKLIST.with(|s| *s.borrow_mut() = std::mem::take(&mut scan_worklist));
+
+        // The nursery is still empty (the minor collection above drained it),
+        // so no older object refers into it. Objects moved: rebuild every
+        // region's off-heap-tracing list (bliss-3uwzg).
+        OldGenScan::rebuild_regions(state);
+        crate::gc_soft_dirty::rearm(
+            heap_base_addr,
+            heap_size,
+            old_generation_bytes(state),
+            state.config.nursery_size,
+        );
 
         // Clear marking flag.
         drop(guard);
@@ -6120,6 +6563,8 @@ fn install_heap_state(state: HeapState) {
         state.heap_base as usize + state.config.heap_size,
         std::sync::atomic::Ordering::Relaxed,
     );
+    // A new heap has no record of its writes yet (bliss-3uwzg).
+    crate::gc_soft_dirty::disarm();
     *heap_state().lock().unwrap() = Some(state);
     HEAP_IDENTITY_EPOCH.fetch_add(1, Ordering::Release);
     GC_MOVE_EPOCH.fetch_add(1, Ordering::Release);
@@ -6913,6 +7358,7 @@ pub fn restore_heap(data: &[u8]) -> Result<(), EgclError> {
         .as_mut()
         .ok_or_else(|| EgclError::Internal("heap not initialized".into()))?;
     HEAP_IDENTITY_EPOCH.fetch_add(1, Ordering::Release);
+    crate::gc_soft_dirty::disarm();
     clear_heap_objects(state);
     // The pre-restore region set is gone: every cached per-thread T0 allocator
     // still holds a TLAB carved from it, and the reset region alloc_tops will
@@ -7770,6 +8216,196 @@ mod nursery_scan_tests {
             reads < OBJECTS + 256,
             "{OBJECTS} nursery objects required {reads} header reads"
         );
+    }
+}
+
+#[cfg(test)]
+mod old_scan_tests {
+    use super::*;
+    use crate::value::NIL;
+
+    thread_local! {
+        pub(super) static DIRTY_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn alloc_object(alloc: &mut HeapAllocator, type_id: u8, body_len: usize) -> *mut u8 {
+        let body = alloc
+            .alloc_fast(body_len)
+            .or_else(|| alloc.alloc_slow(body_len).ok())
+            .unwrap();
+        unsafe { write_object_header(body.sub(OBJECT_HEADER_SIZE), type_id, body_len as u32) };
+        body
+    }
+
+    fn cons(alloc: &mut HeapAllocator, car: EgclVal, cdr: EgclVal) -> EgclVal {
+        let body = alloc_object(alloc, crate::object::type_id::CONS, 16);
+        unsafe {
+            *(body as *mut EgclVal) = car;
+            *(body as *mut EgclVal).add(1) = cdr;
+        }
+        EgclVal(body as u64 | crate::value::TAG_CONS)
+    }
+
+    fn vector(alloc: &mut HeapAllocator, len: usize, fill: EgclVal) -> EgclVal {
+        let body = alloc_object(alloc, crate::object::type_id::SIMPLE_VECTOR, 8 * (len + 1));
+        unsafe {
+            *(body as *mut u64) = len as u64;
+            for i in 0..len {
+                *(body as *mut EgclVal).add(1 + i) = fill;
+            }
+            EgclVal::from_heap_ptr(body.sub(OBJECT_HEADER_SIZE))
+        }
+    }
+
+    fn slot(v: EgclVal, index: usize) -> *mut EgclVal {
+        (ref_body_addr(v) as *mut EgclVal).wrapping_add(index)
+    }
+
+    /// GitHub #471 / bliss-3uwzg: a minor collection used to walk and trace
+    /// every older object twice, so its pause grew with the old generation.
+    /// With soft-dirty tracking it reads only the headers of written pages,
+    /// and old-to-young stores that bypass the write barrier — as compiled
+    /// code and most of the runtime's stores do — are still found.
+    #[test]
+    fn minor_gc_scans_only_written_old_pages() {
+        const CHILD: &str = "EGCL_TEST_DIRTY_OLD_SCAN_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "gc::old_scan_tests::minor_gc_scans_only_written_old_pages",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env_remove("EGCL_GC_VERIFY")
+                .env_remove("EGCL_GC_STRESS")
+                .env_remove("EGCL_GC_STRESS_AT")
+                .env("EGCL_GC_SOFT_DIRTY", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        init_heap(&GcConfig {
+            heap_size: 16 * 1024 * 1024,
+            heap_max: 16 * 1024 * 1024,
+            nursery_size: 2 * 1024 * 1024,
+            tlab_size: 4096,
+            region_size: 64 * 1024,
+            promotion_threshold: 0,
+            pause_target_ms: 10,
+            gc_workers: 1,
+            satb_buffer_size: 64,
+            old_occupancy_trigger: 0.9,
+        })
+        .unwrap();
+        let mut alloc = HeapAllocator::new().unwrap();
+
+        // An old generation of OLD conses (promotion_threshold 0 promotes on
+        // the first minor collection), a vector spanning several pages, and a
+        // stub-to-be followed by a holder on a later page.
+        const OLD: usize = 20_000;
+        crate::rooted!(list = NIL);
+        for i in 0..OLD {
+            let next = cons(&mut alloc, EgclVal::from_fixnum(i as i64), *list);
+            *list = next;
+        }
+        crate::rooted!(vec = vector(&mut alloc, 2048, NIL));
+        let stub = vector(&mut alloc, 600, NIL);
+        crate::rooted!(holder = cons(&mut alloc, stub, NIL));
+        HeapCollector::new().minor_gc().unwrap();
+        let old_first = (list.0 & !crate::value::TAG_MASK) as usize;
+        assert!(
+            heap_kind_of(old_first) == Some(RegionKind::OldGen),
+            "the list must have been promoted"
+        );
+
+        // Nothing older was written: the scan must not walk the old generation.
+        DIRTY_SCANS.with(|count| count.set(0));
+        nursery_scan_tests::HEADER_READS.with(|count| count.set(0));
+        HeapCollector::new().minor_gc().unwrap();
+        let reads = nursery_scan_tests::HEADER_READS.with(|count| count.get());
+        if DIRTY_SCANS.with(|count| count.get()) == 0 {
+            eprintln!("soft-dirty tracking unavailable on this kernel; skipping");
+            return;
+        }
+        eprintln!("{OLD} old conses, nothing written: {reads} header reads");
+        assert!(
+            reads < OLD / 10,
+            "an unwritten old generation of {OLD} conses cost {reads} header reads"
+        );
+
+        // Old-to-young stores with no write barrier: into an old cons, into a
+        // vector element several pages past its header, and a CHANGE-CLASS
+        // style forwarding stub whose holder sits on an unwritten page.
+        let mut alloc = HeapAllocator::new().unwrap();
+        let young = cons(&mut alloc, EgclVal::from_fixnum(777), NIL);
+        let mut target_cons = *list;
+        for _ in 0..OLD / 2 {
+            target_cons = unsafe { *slot(target_cons, 1) };
+        }
+        unsafe {
+            *slot(target_cons, 0) = young;
+            *slot(*vec, 1 + 1500) = young;
+        }
+        let replacement = vector(&mut alloc, 1, EgclVal::from_fixnum(4242));
+        unsafe { forward_object_to(stub, replacement) };
+
+        DIRTY_SCANS.with(|count| count.set(0));
+        HeapCollector::new().minor_gc().unwrap();
+        assert_eq!(DIRTY_SCANS.with(|count| count.get()), 1);
+
+        let moved = unsafe { *slot(target_cons, 0) };
+        assert_ne!(moved, young, "the young cons must have been evacuated");
+        assert_eq!(unsafe { *slot(moved, 0) }, EgclVal::from_fixnum(777));
+        assert_eq!(unsafe { *slot(*vec, 1 + 1500) }, moved);
+        assert_eq!(unsafe { *slot(*vec, 1 + 1499) }, NIL);
+
+        let held = unsafe { *slot(*holder, 0) };
+        assert_eq!(
+            held, stub,
+            "the holder's page was not written, so not rewritten"
+        );
+        let resolved = resolve_forwarded(held);
+        assert_ne!(resolved, replacement, "the stub's target must have moved");
+        assert_eq!(
+            unsafe { *slot(resolved, 0) },
+            EgclVal(1),
+            "raw vector length"
+        );
+        assert_eq!(unsafe { *slot(resolved, 1) }, EgclVal::from_fixnum(4242));
+
+        // The list itself is intact.
+        let mut cursor = *list;
+        for i in (0..OLD).rev() {
+            let car = unsafe { *slot(cursor, 0) };
+            if cursor == target_cons {
+                assert_eq!(car, moved);
+            } else {
+                assert_eq!(car, EgclVal::from_fixnum(i as i64));
+            }
+            cursor = unsafe { *slot(cursor, 1) };
+        }
+        assert_eq!(cursor, NIL);
+    }
+
+    fn heap_kind_of(addr: usize) -> Option<RegionKind> {
+        let guard = heap_state().lock().unwrap();
+        let state = guard.as_ref()?;
+        state
+            .regions
+            .iter()
+            .find(|r| {
+                let base = r.base as usize;
+                addr >= base && addr < base + state.config.region_size
+            })
+            .map(|r| r.header.kind)
     }
 }
 
