@@ -74,7 +74,7 @@
   is still slightly slower from interpreted code. A call with one `&key`
   argument fell from about 6.3 us to 3.8 us, against about 1.5 us
   interpreted, and `FUNCALL` of a closure from about 9 us to 6 us
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#499](https://github.com/atgreen/evergreen/pull/499)).
 - On x86-64 Linux, a closure that reads or sets variables captured from the
   function or `LET` that created it -- `(lambda (y) (+ x y k))`, a counter's
   `(lambda () (incf n))`, or a wrapper such as `(lambda (&rest a) (apply
