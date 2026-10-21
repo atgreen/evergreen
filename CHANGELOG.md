@@ -244,13 +244,15 @@
   image no longer carries a second copy of each such function's body
   ([#490](https://github.com/atgreen/evergreen/pull/490)).
 - A foreign library handle from `egcl-ffi:load-foreign-library` saved in an
-  image works again after `--image` or in a saved executable. Restoring an
+  image is now usable after `--image` or in a saved executable. Restoring an
   image reopens its libraries in load order under the same handles, as SBCL
-  does, so `cffi:reload-foreign-libraries` and `cl+ssl:reload` work in a saved
-  image. A handle whose library cannot be reopened is dead: a symbol lookup
-  through it names the library and the reason, and closing it does nothing.
-  Before, every saved handle was reset to null, so lookups signalled "null
-  library handle" and closing one signalled an error
+  does. A handle whose library cannot be reopened is dead: a symbol lookup
+  through it names the library and the reason, closing it does nothing, and
+  saving the image again keeps it so a later restore retries the library.
+  Before, image save reset every handle to null, so lookups signalled "null
+  library handle" and closing one signalled an error, which broke reload code
+  that closes a library before loading it again. Images now use format version
+  12; images saved by older releases must be rebuilt
   ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
 - A `THROW` from the default form of a `&key` or `&aux` parameter to a
   `CATCH` in the interpreted caller reaches that catch. Once the caller had

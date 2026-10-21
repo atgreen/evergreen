@@ -42,9 +42,12 @@ fn closed_handle() -> EgclError {
 }
 
 fn dead_library(name: &str, reason: &str) -> EgclError {
-    EgclError::FfiError(format!(
-        "foreign library '{name}' from the saved image could not be reopened: {reason}"
-    ))
+    // Loader errors usually name the library already; say it once.
+    EgclError::FfiError(if reason.contains(name) {
+        format!("a foreign library from the saved image could not be reopened: {reason}")
+    } else {
+        format!("foreign library '{name}' from the saved image could not be reopened: {reason}")
+    })
 }
 
 impl<L: Clone> LibraryRegistry<L> {
@@ -71,8 +74,12 @@ impl<L: Clone> LibraryRegistry<L> {
         }
         match self.slots.lock().unwrap().get(token as usize - 1) {
             Some(Slot::Open { library, .. }) => Ok(library.clone()),
-            Some(Slot::Dead { name, reason, .. }) => Err(dead_library(name, reason)),
-            Some(Slot::Closed) | None => Err(closed_handle()),
+            Some(Slot::Dead {
+                name,
+                reason,
+                closed: false,
+            }) => Err(dead_library(name, reason)),
+            Some(Slot::Dead { closed: true, .. } | Slot::Closed) | None => Err(closed_handle()),
         }
     }
 
@@ -215,6 +222,10 @@ pub(crate) fn decode_names(bytes: &[u8]) -> Result<Vec<Option<String>>, EgclErro
 mod tests {
     use super::*;
 
+    fn tok(n: usize) -> *mut () {
+        std::ptr::without_provenance_mut(n)
+    }
+
     #[test]
     fn names_round_trip_and_slots_keep_their_tokens() {
         let names = vec![
@@ -233,20 +244,28 @@ mod tests {
                 Err(EgclError::FfiError("gone".into()))
             }
         });
-        assert_eq!(registry.get(1 as *mut ()).unwrap(), 7);
-        assert!(registry.get(2 as *mut ()).is_err());
-        let dead = registry.get(3 as *mut ()).unwrap_err().to_string();
+        assert_eq!(registry.get(tok(1)).unwrap(), 7);
+        assert!(registry.get(tok(2)).is_err());
+        let dead = registry.get(tok(3)).unwrap_err().to_string();
         assert!(dead.contains("/x/é.so") && dead.contains("gone"), "{dead}");
+        // A reason that already names the library does not get it twice.
+        let named = dead_library("libz.so", "cannot load 'libz.so': gone").to_string();
+        assert_eq!(named.matches("libz.so").count(), 1, "{named}");
         // A dead token closes as a no-op, repeatedly, and is then not saved.
-        assert!(registry.take(3 as *mut ()).unwrap().is_none());
-        assert!(registry.take(3 as *mut ()).unwrap().is_none());
+        assert!(registry.take(tok(3)).unwrap().is_none());
+        assert!(registry.take(tok(3)).unwrap().is_none());
+        // Once closed, a dead token reports itself closed like any other.
+        assert_eq!(
+            registry.get(tok(3)).unwrap_err().to_string(),
+            closed_handle().to_string()
+        );
         assert_eq!(
             registry.saved_names(),
             vec![Some("libm.so.6".to_owned()), None, None]
         );
         // New loads never reuse a restored token.
         assert_eq!(registry.insert("new", 9) as usize, 4);
-        assert_eq!(registry.take(1 as *mut ()).unwrap(), Some(7));
-        assert!(registry.take(1 as *mut ()).is_err());
+        assert_eq!(registry.take(tok(1)).unwrap(), Some(7));
+        assert!(registry.take(tok(1)).is_err());
     }
 }

@@ -148,6 +148,7 @@ fn a_library_missing_at_restore_leaves_a_dead_handle_that_closes_quietly() {
              (try "LOOKUP" '(egcl-ffi:foreign-symbol-pointer "egcl_first" *first*))
              (try "CLOSE" '(egcl-ffi:close-foreign-library *first*))
              (try "CLOSE-AGAIN" '(egcl-ffi:close-foreign-library *first*))
+             (try "LOOKUP-CLOSED" '(egcl-ffi:foreign-symbol-pointer "egcl_first" *first*))
              (try "THIRD" '(egcl-ffi:foreign-call
                              (egcl-ffi:foreign-symbol-pointer "egcl_third" *third*) :int '() '())))"#,
     ]);
@@ -160,7 +161,108 @@ fn a_library_missing_at_restore_leaves_a_dead_handle_that_closes_quietly() {
     );
     assert!(out.contains("CLOSE NIL"), "{out}");
     assert!(out.contains("CLOSE-AGAIN NIL"), "{out}");
+    // Once closed, the dead handle reports itself closed, not unreopenable.
+    assert!(
+        out.contains("LOOKUP-CLOSED (:ERROR \"invalid or closed library handle\")"),
+        "{out}"
+    );
     // A later library in load order is unaffected.
     assert!(out.contains("THIRD 99"), "{out}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A dead handle saved again is retried by the next restore (GitHub #440): an
+/// image restored while a library is missing, then saved, reopens that library
+/// once it is back, under the same handle.
+#[test]
+fn a_dead_handle_saved_again_is_reopened_when_the_library_returns() {
+    let dir = scratch("chain");
+    let (core, first, _) = save_core(&dir);
+    let hidden = dir.join("libfirst.so.hidden");
+    std::fs::rename(&first, &hidden).unwrap();
+    let second = dir.join("again.core");
+    let output = egcl(&[
+        "--image",
+        core.to_str().unwrap(),
+        "--no-init",
+        "--eval",
+        TRY,
+        "--eval",
+        &format!(
+            r#"(progn
+                 (try "DEAD" '(egcl-ffi:foreign-symbol-pointer "egcl_first" *first*))
+                 (egcl-ext:save-lisp-and-die {second:?}))"#
+        ),
+    ]);
+    let out = text(&output);
+    assert!(output.status.success(), "{out}");
+    assert!(out.contains("could not be reopened"), "{out}");
+
+    std::fs::rename(&hidden, &first).unwrap();
+    let output = egcl(&[
+        "--image",
+        second.to_str().unwrap(),
+        "--no-init",
+        "--eval",
+        TRY,
+        "--eval",
+        r#"(progn
+             (try "FIRST" '(egcl-ffi:foreign-call
+                             (egcl-ffi:foreign-symbol-pointer "egcl_first" *first*) :int '() '()))
+             (try "THIRD" '(egcl-ffi:foreign-call
+                             (egcl-ffi:foreign-symbol-pointer "egcl_third" *third*) :int '() '())))"#,
+    ]);
+    let out = text(&output);
+    assert!(output.status.success(), "{out}");
+    assert!(out.contains("FIRST 42"), "{out}");
+    assert!(out.contains("THIRD 99"), "{out}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A saved executable reopens its libraries too, and a library loaded by its
+/// bare soname (the reporter's `libm.so.6`) is reopened by that soname when the
+/// backend can load it at all (dlopen; the static ELF loader declines it).
+#[test]
+fn a_saved_executable_reopens_its_library_handles() {
+    let dir = scratch("exe");
+    let library = build_library(&dir, "libexe", "egcl_exe", 17);
+    let app = dir.join("app");
+    let output = egcl(&[
+        "--no-init",
+        "--eval",
+        &format!(
+            r#"(progn
+                 (defvar *exe* (egcl-ffi:load-foreign-library {library:?}))
+                 (defvar *libm* (ignore-errors (egcl-ffi:load-foreign-library "libm.so.6")))
+                 (egcl-ext:save-lisp-and-die {app:?} :executable t))"#
+        ),
+    ]);
+    assert!(output.status.success(), "{}", text(&output));
+    let output = Command::new(&app)
+        .env(
+            "EGCL_INIT_FILE",
+            std::env::temp_dir().join("egcl-tests-nonexistent-init.lisp"),
+        )
+        .args([
+            "--no-init",
+            "--eval",
+            TRY,
+            "--eval",
+            r#"(progn
+                 (try "EXE" '(egcl-ffi:foreign-call
+                               (egcl-ffi:foreign-symbol-pointer "egcl_exe" *exe*) :int '() '()))
+                 (try "LIBM" '(if *libm*
+                                  (and (egcl-ffi:foreign-symbol-pointer "cos" *libm*) t)
+                                  :unavailable)))"#,
+        ])
+        .output()
+        .expect("run saved executable");
+    let out = text(&output);
+    assert!(output.status.success(), "{out}");
+    assert!(out.contains("EXE 17"), "{out}");
+    assert!(
+        out.contains("LIBM T") || out.contains("LIBM :UNAVAILABLE"),
+        "{out}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -156,7 +156,11 @@ pub const IMAGE_MAGIC: u64 = u64::from_be_bytes(*b"EGCLIMG\0");
 // Version 11 records the proclaimed specials in the host registry. Older
 // images lost a valueless DEFVAR's specialness, and an older binary would
 // misread the new block and silently drop the SETF expanders after it.
-const FORMAT_VERSION: u32 = 11;
+// Version 12 keeps each FOREIGN-LIBRARY's registry token and records the
+// libraries to reopen in a ForeignLibraries section. Older images zeroed the
+// tokens; an older binary would skip the section and then hand the saved
+// tokens to unrelated libraries it loads later (GitHub #440).
+const FORMAT_VERSION: u32 = 12;
 
 /// Image file header (128 bytes). D7.01.
 #[derive(Clone, Copy)]
@@ -208,8 +212,9 @@ pub enum SectionType {
     OffHeap = 9,
     /// Foreign libraries to reopen at restore, by name, in load order and in
     /// the token slots the heap's FOREIGN-LIBRARY objects hold (GitHub #440).
-    /// Older runtimes skip it as an unknown section; images saved by them carry
-    /// null tokens.
+    /// Introduced with format version 12: an older runtime must not accept
+    /// these images, because it would skip this section and later reuse the
+    /// saved tokens for unrelated libraries.
     ForeignLibraries = 10,
 }
 
