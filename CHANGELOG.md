@@ -13,7 +13,7 @@
   milliseconds. `get-macro-character` now returns a function for a
   dispatching macro character made with `make-dispatch-macro-character`
   instead of `nil`
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#489](https://github.com/atgreen/evergreen/pull/489)).
 - `EGCL_T2_LOG` and the `compile` trace (`EGCL_LOG=compile=trace`) say why a
   function never left the interpreter on x86-64 Linux: a captured closure
   environment, an `&rest`/`&key`/`&aux` lambda list, a special or boxed
