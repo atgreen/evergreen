@@ -2299,7 +2299,7 @@ fn parse_token_with_base(
     // which pass ':|A|'-style designators).
     if has_escape && marker == Some(0) {
         if let Some(kw_name) = name.strip_prefix(':') {
-            let full = format!("KEYWORD:{}", kw_name);
+            let full = egcl_rt::symbols::keyword_registry_key(kw_name);
             let idx = intern_symbol(&full);
             return Ok(EgclVal::from_symbol_index(idx));
         }
@@ -2336,7 +2336,10 @@ fn parse_token_with_base(
             if kw_name.is_empty() {
                 return Err(EgclError::StreamError("empty keyword".into()));
             }
-            let full = format!("KEYWORD:{}", kw_name);
+            // An unescaped `::NAME` is the keyword NAME, as in SBCL; only an
+            // ESCAPED leading colon (`:|:NAME|`) is part of the name.
+            let kw_name = kw_name.strip_prefix(':').unwrap_or(kw_name);
+            let full = egcl_rt::symbols::keyword_registry_key(kw_name);
             let idx = intern_symbol(&full);
             return Ok(EgclVal::from_symbol_index(idx));
         }
@@ -2356,7 +2359,7 @@ fn parse_token_with_base(
     // branch, since membership compares KEYWORD:T against T. #+nil still skips
     // its datum: :NIL is no more present in *FEATURES* than NIL was.
     if FEATURE_EXPRESSION.with(|f| f.get()) {
-        let full = format!("KEYWORD:{}", name);
+        let full = egcl_rt::symbols::keyword_registry_key(name);
         return Ok(EgclVal::from_symbol_index(intern_symbol(&full)));
     }
     // It's a symbol. An escape only suppresses case folding and number
@@ -2407,7 +2410,8 @@ pub fn read_symbol_token(name: &str) -> Result<Option<EgclVal>, EgclError> {
         if kw_name.is_empty() {
             return Ok(None);
         }
-        let full = format!("KEYWORD:{}", kw_name);
+        let kw_name = kw_name.strip_prefix(':').unwrap_or(kw_name);
+        let full = egcl_rt::symbols::keyword_registry_key(kw_name);
         return Ok(Some(EgclVal::from_symbol_index(intern_symbol(&full))));
     }
     // A token that parses as a number is not a symbol (mirrors the reader
@@ -2525,7 +2529,7 @@ fn try_package_qualified(name: &str, colon_pos: usize) -> Result<Option<EgclVal>
                 Ok(Some(EgclVal::from_symbol_index(idx)))
             }
             "KEYWORD" => {
-                let full = format!("KEYWORD:{}", sym_name);
+                let full = egcl_rt::symbols::keyword_registry_key(sym_name);
                 let idx = intern_symbol(&full);
                 Ok(Some(EgclVal::from_symbol_index(idx)))
             }
@@ -3887,10 +3891,9 @@ fn feature_symbol_name(val: EgclVal) -> String {
 /// feature matching is by the feature symbol's own name, not its home package.
 fn feature_symbol_bare_name(val: EgclVal) -> String {
     let name = feature_symbol_name(val);
-    let name = name.strip_prefix("KEYWORD:").unwrap_or(&name);
-    egcl_rt::symbols::split_registry_key(name)
-        .map(|(_, bare)| bare)
-        .unwrap_or(name)
+    egcl_rt::symbols::keyword_key_name(&name)
+        .or_else(|| egcl_rt::symbols::split_registry_key(&name).map(|(_, bare)| bare))
+        .unwrap_or(&name)
         .trim()
         .to_string()
 }

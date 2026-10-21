@@ -254,6 +254,13 @@
   that closes a library before loading it again. Images now use format version
   12; images saved by older releases must be rebuilt
   ([#492](https://github.com/atgreen/evergreen/pull/492)).
+- `INTERN` into the `KEYWORD` package keeps a colon in its string as part of
+  the symbol's name. `(intern ":DECK" :keyword)` used to name `DECK` and
+  `(intern "A:B" :keyword)` named `B`; they now name `":DECK"` and `"A:B"`,
+  print as `:|:DECK|` and `:|A:B|`, read back as the same symbols, and survive
+  `COMPILE-FILE` and `LOAD`. `FIND-SYMBOL`, `SYMBOL-NAME` and the printer agree
+  with them, and `:|:DECK|` reads as the keyword named `":DECK"`
+  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
 - A `THROW` from the default form of a `&key` or `&aux` parameter to a
   `CATCH` in the interpreted caller reaches that catch. Once the caller had
   been called a few times, the throw escaped as an internal error such as

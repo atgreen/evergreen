@@ -318,6 +318,34 @@ pub fn split_registry_key(key: &str) -> Option<(&str, &str)> {
     Some((&key[..colon], &key[colon + marker_len..]))
 }
 
+/// The registry key of the keyword whose NAME is `name`, verbatim.
+///
+/// Keywords are keyed `KEYWORD:NAME`. The legacy `KEYWORD::NAME` spelling also
+/// names the keyword NAME (see [`keyword_key_name`]), so a name that itself
+/// begins with a colon cannot use the single marker — `KEYWORD::DECK` would
+/// read back as the name `DECK`. Such a name takes the double marker instead:
+/// the keyword named `":DECK"` is keyed `KEYWORD:::DECK` (GitHub #468).
+pub fn keyword_registry_key(name: &str) -> String {
+    if name.starts_with(':') {
+        format!("KEYWORD::{name}")
+    } else {
+        format!("KEYWORD:{name}")
+    }
+}
+
+/// The verbatim symbol NAME of a keyword registry key, or `None` when `key` is
+/// not a keyword key.
+///
+/// Everything after the package marker is the name, colons included: the
+/// keyword named `"A:B"` is keyed `KEYWORD:A:B` and its name is `"A:B"`, not
+/// `"B"` (GitHub #468). The marker is the first colon run of at most two, the
+/// same rule as [`split_registry_key`], which is what keeps the inverse of
+/// [`keyword_registry_key`] exact.
+pub fn keyword_key_name(key: &str) -> Option<&str> {
+    let rest = key.strip_prefix("KEYWORD:")?;
+    Some(rest.strip_prefix(':').unwrap_or(rest))
+}
+
 /// The exact registry key an interned symbol was created under (bliss-jtc.23).
 /// `intern(registry_key(idx))` returns `idx`, so this is a faithful,
 /// round-trippable identity for cross-process bytecode references. Returns
