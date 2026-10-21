@@ -11078,7 +11078,7 @@ fn print_val_inner(val: EgclVal, out: &mut String) {
         // list they print) only the name's characters appear: no package
         // prefix, keyword colon, `#:` or bars (ansi print.cons.1, print-length.5).
         let escape = PRINT_ESCAPE.with(|c| c.get());
-        if let Some(bare) = name.strip_prefix("KEYWORD:") {
+        if let Some(bare) = egcl_rt::symbols::keyword_key_name(&name) {
             if escape {
                 out.push(':');
             }
@@ -11490,7 +11490,7 @@ fn princ_val(val: EgclVal, out: &mut String) {
         // PRINC prints a symbol without escapes: no package prefix, no bars,
         // and *PRINT-CASE* applied (ansi print.symbol.1, print-length.5).
         let name = sym_name(val);
-        if let Some(bare) = name.strip_prefix("KEYWORD:") {
+        if let Some(bare) = egcl_rt::symbols::keyword_key_name(&name) {
             out.push_str(&egcl_stdlib::format::print_symbol_name(bare, false));
         } else if val
             .symbol_index()
@@ -14295,11 +14295,11 @@ fn prompt_package_name(name: &str) -> &str {
 /// alone (bliss-mwpb profiling). Symbol names are short and almost always
 /// already-uppercase ASCII, so scan bytes directly.
 ///
-/// The result is identical to the old expression, including its edge cases:
-/// a `"::"` anywhere wins over an earlier single `':'` (so `"A:B::C"` still
-/// yields `"C"`), and `"KEYWORD:KEYWORD:FOO"` still yields `"FOO"` — the old
-/// `trim_start_matches` stripped both prefixes, and stripping only the first
-/// leaves `"KEYWORD:FOO"`, whose single `':'` split removes the rest.
+/// For a non-keyword spelling a `"::"` anywhere wins over an earlier single
+/// `':'` (so `"A:B::C"` yields `"C"`). A keyword registry key is different:
+/// everything after its marker is the name, verbatim, so `"KEYWORD:A:B"` yields
+/// `"A:B"` and `"KEYWORD:::DECK"` yields `":DECK"` (GitHub #468; see
+/// `egcl_rt::symbols::keyword_key_name`).
 fn symbol_bare_name(name: &str) -> String {
     let (base, needs_upcasing) = symbol_bare_slice(name);
     if needs_upcasing {
@@ -14330,7 +14330,16 @@ fn symbol_bare_name_is(name: &str, bare: &str) -> bool {
 /// uppercasing — the overwhelmingly common case — so callers skip the
 /// conversion entirely.
 fn symbol_bare_slice(name: &str) -> (&str, bool) {
-    let without_keyword = name.strip_prefix("KEYWORD:").unwrap_or(name);
+    // A keyword's name is everything after its marker, colons included: the
+    // keyword named "A:B" is keyed `KEYWORD:A:B`, and splitting that again at
+    // its second colon made it "B" (GitHub #468).
+    if let Some(base) = egcl_rt::symbols::keyword_key_name(name) {
+        let needs_upcasing = !base
+            .bytes()
+            .all(|b| b.is_ascii() && !b.is_ascii_lowercase());
+        return (base, needs_upcasing);
+    }
+    let without_keyword = name;
     let bytes = without_keyword.as_bytes();
     // One pass: remember the first ':' and stop at the first "::".
     let (mut first_single, mut first_double) = (None, None);
@@ -14367,7 +14376,10 @@ fn symbol_bare_slice(name: &str) -> (&str, bool) {
 fn string_designator_name(v: EgclVal) -> String {
     if v.is_symbol() {
         let full = sym_name_rc(v);
-        let without_keyword = full.strip_prefix("KEYWORD:").unwrap_or(&full);
+        if let Some(name) = egcl_rt::symbols::keyword_key_name(&full) {
+            return name.to_string();
+        }
+        let without_keyword: &str = &full;
         without_keyword
             .split_once("::")
             .map(|(_, tail)| tail)
@@ -14415,7 +14427,12 @@ unsafe fn c_string_to_lisp(ptr: u64) -> EgclVal {
 /// The bare `symbol-name` (CL `SYMBOL-NAME` / `STRING` of a symbol): strips any
 /// package prefix but preserves case, unlike `symbol_bare_name` which upper-cases.
 fn symbol_name_string(name: &str) -> String {
-    let without_keyword = name.strip_prefix("KEYWORD:").unwrap_or(name);
+    // A keyword's name is everything after its marker, colons included
+    // (GitHub #468): `KEYWORD:A:B` names "A:B".
+    if let Some(name) = egcl_rt::symbols::keyword_key_name(name) {
+        return name.to_string();
+    }
+    let without_keyword = name;
     without_keyword
         .split_once("::")
         .map(|(_, tail)| tail)
@@ -14485,7 +14502,7 @@ fn intern_into_package(env: &mut Env, pkg_name: &str, bare_name: &str) -> EgclVa
             // STRING into the package tables (SYMBOLP nil), which broke
             // WITH-PACKAGE-ITERATOR.1-4 over a universe-loaded CL-USER.
             let key = if pkg_name == "KEYWORD" {
-                format!("KEYWORD:{bare_name}")
+                egcl_rt::symbols::keyword_registry_key(&bare_name)
             } else {
                 format!("{pkg_name}::{bare_name}")
             };
@@ -14592,7 +14609,7 @@ fn present_symbol_with_status(
         // reported :EXTERNAL where CLHS requires NIL and no side effect
         // (bliss-2evi). `find_symbol_index` is the same non-interning lookup the
         // COMMON-LISP arm above uses.
-        return reader::find_symbol_index(&format!("KEYWORD:{bare_upper}"))
+        return reader::find_symbol_index(&egcl_rt::symbols::keyword_registry_key(bare_upper))
             .map(|idx| (EgclVal::from_symbol_index(idx), "EXTERNAL"));
     }
     // Borrow the package briefly: resolve the symbol directly. Cloning the
@@ -33369,7 +33386,7 @@ fn extract_params(params_form: EgclVal) -> Vec<String> {
 /// Bare (KEYWORD:-stripped) name of a symbol.
 fn key_bare(sym: EgclVal) -> String {
     let n = sym_name(sym);
-    n.strip_prefix("KEYWORD:").unwrap_or(&n).to_string()
+    egcl_rt::symbols::keyword_key_name(&n).unwrap_or(&n).to_string()
 }
 
 /// Parse an &optional/&aux element: `var` | `(var [default [supplied-p]])`.
@@ -45950,17 +45967,48 @@ mod macro_stream_environment_tests {
 mod symbol_bare_name_tests {
     use super::symbol_bare_name;
 
-    /// The original expression `symbol_bare_name` was rewritten from. The
-    /// rewrite is a pure optimization (bliss-mwpb), so the two must agree on
-    /// every input.
+    /// The original expression `symbol_bare_name` was rewritten from, for keys
+    /// outside KEYWORD. The rewrite is a pure optimization (bliss-mwpb), so the
+    /// two must agree on every such input. Keyword keys are checked separately,
+    /// against the encoder, in `keyword_keys_give_back_the_interned_name`.
     fn reference(name: &str) -> String {
-        let without_keyword = name.trim_start_matches("KEYWORD:");
-        let base = without_keyword
+        let base = name
             .split_once("::")
             .map(|(_, tail)| tail)
-            .or_else(|| without_keyword.split_once(':').map(|(_, tail)| tail))
-            .unwrap_or(without_keyword);
+            .or_else(|| name.split_once(':').map(|(_, tail)| tail))
+            .unwrap_or(name);
         base.to_uppercase()
+    }
+
+    /// A keyword's bare name is the name it was interned under, colons and
+    /// all (GitHub #468): decoding must invert `keyword_registry_key` exactly.
+    #[test]
+    fn keyword_keys_give_back_the_interned_name() {
+        for name in [
+            "FOO",
+            "foo",
+            "A:B",
+            ":DECK",
+            "::DECK",
+            ":::X",
+            "KEYWORD:FOO",
+            ":",
+            "::",
+            "",
+            "\u{e9}t\u{e9}",
+        ] {
+            let key = egcl_rt::symbols::keyword_registry_key(name);
+            assert_eq!(symbol_bare_name(&key), name.to_uppercase(), "{key:?}");
+        }
+        // Raw keys as written by hand or by older code: the legacy `KEYWORD::`
+        // spelling still names FOO, and a doubled prefix is now the keyword
+        // whose name is "KEYWORD:FOO" rather than being stripped to FOO.
+        assert_eq!(symbol_bare_name("KEYWORD:FOO"), "FOO");
+        assert_eq!(symbol_bare_name("KEYWORD::FOO"), "FOO");
+        assert_eq!(symbol_bare_name("KEYWORD:KEYWORD:FOO"), "KEYWORD:FOO");
+        assert_eq!(symbol_bare_name("KEYWORD:A:B"), "A:B");
+        assert_eq!(symbol_bare_name("KEYWORD:::DECK"), ":DECK");
+        assert_eq!(symbol_bare_name("KEYWORD:"), "");
     }
 
     #[test]
@@ -45971,11 +46019,6 @@ mod symbol_bare_name_tests {
             "COMMON-LISP:CAR",
             "COMMON-LISP::CAR",
             "EGCL-EXT::FOO",
-            // Keyword spellings, including the doubled prefix that the old
-            // `trim_start_matches` stripped repeatedly.
-            "KEYWORD:FOO",
-            "KEYWORD:KEYWORD:FOO",
-            "KEYWORD::FOO",
             // A single ':' appearing BEFORE a "::" — "::" must still win.
             "A:B::C",
             "A:B:C",
@@ -45988,7 +46031,6 @@ mod symbol_bare_name_tests {
             "A::",
             ":A",
             "::A",
-            "KEYWORD:",
             // Case folding, including non-ASCII which needs the Unicode path.
             "car",
             "Car",

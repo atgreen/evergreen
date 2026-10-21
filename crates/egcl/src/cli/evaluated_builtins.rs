@@ -5470,7 +5470,7 @@ fn resolve(name: &str) -> Option<Handler> {
             // The registry key is the VERBATIM name: INTERN is
             // case-sensitive, so `(intern "abc" :keyword)` must name `:|abc|`.
             if pkg_name == "KEYWORD" {
-                let key = format!("KEYWORD:{name_str}");
+                let key = egcl_rt::symbols::keyword_registry_key(&name_str);
                 let existed = reader::find_symbol_index(&key).is_some();
                 let sym = EgclVal::from_symbol_index(reader::intern_symbol(&key));
                 let status = if existed {
