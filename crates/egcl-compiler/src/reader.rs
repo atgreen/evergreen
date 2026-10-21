@@ -4694,6 +4694,79 @@ pub fn get_dispatch_macro_character(
     Ok(None)
 }
 
+/// The `#` sub-characters the standard reader handles in Rust, for which
+/// GET-DISPATCH-MACRO-CHARACTER reports a boot.lisp stand-in function.
+pub const STANDARD_SHARP_SUB_CHARS: &str = "'(*:.BOXRCASP=#+-|\\";
+
+/// One macro-character candidate of a readtable, as
+/// [`readtable_macro_character_candidates`] reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MacroCharacterCandidate {
+    pub ch: char,
+    /// For a dispatching macro character, every sub-character that may have a
+    /// function (stored upcased, as SET-DISPATCH-MACRO-CHARACTER stores it);
+    /// `None` for a character that is not a dispatching macro character.
+    pub sub_chars: Option<Vec<char>>,
+}
+
+/// Every character that can be a macro character of `readtable`, sorted by
+/// code, without walking the character space: the standard macro characters,
+/// the readtable's SET-MACRO-CHARACTER / MAKE-DISPATCH-MACRO-CHARACTER entries,
+/// and the characters SET-SYNTAX-FROM-CHAR gave macro syntax.
+///
+/// This is a superset: a candidate whose entry was deleted (SET-MACRO-CHARACTER
+/// with NIL) or whose sub-character has no function is still listed. Callers
+/// filter through GET-MACRO-CHARACTER / GET-DISPATCH-MACRO-CHARACTER, so what
+/// they report is by construction what those functions report — and no
+/// character outside this set has a macro function in `readtable`. Allocates no
+/// heap object.
+pub fn readtable_macro_character_candidates(readtable: EgclVal) -> Vec<MacroCharacterCandidate> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let key = readtable_key(readtable);
+    let mut chars: BTreeSet<char> = ['"', '\'', '(', ')', ',', ';', '`', '#']
+        .into_iter()
+        .collect();
+    // Each table is locked on its own, in lock-level order, never nested.
+    if let Some(table) = MACRO_CHARS.lock().unwrap().as_ref() {
+        chars.extend(table.keys().filter(|&&(k, _)| k == key).map(|&(_, c)| c));
+    }
+    let mut dispatch: BTreeSet<char> = ['#'].into_iter().collect();
+    if let Some(table) = DISPATCH_CHARS.lock().unwrap().as_ref() {
+        dispatch.extend(table.keys().filter(|&&(k, _)| k == key).map(|&(_, c)| c));
+    }
+    let mut subs: BTreeMap<char, BTreeSet<char>> = BTreeMap::new();
+    subs.entry('#')
+        .or_default()
+        .extend(STANDARD_SHARP_SUB_CHARS.chars());
+    if let Some(table) = DISPATCH_SUB_CHARS.lock().unwrap().as_ref() {
+        for &(k, disp, sub) in table.keys() {
+            if k == key {
+                subs.entry(disp).or_default().insert(sub);
+            }
+        }
+    }
+    if let Some(table) = CHAR_SYNTAX.lock().unwrap().as_ref() {
+        chars.extend(
+            table
+                .iter()
+                .filter(|&(&(k, _), &(code, _))| k == key && matches!(code, 2 | 3))
+                .map(|(&(_, c), _)| c),
+        );
+    }
+    chars.extend(dispatch.iter().copied());
+    chars
+        .into_iter()
+        .map(|ch| MacroCharacterCandidate {
+            ch,
+            sub_chars: is_dispatch_macro_character(readtable, ch).then(|| {
+                subs.get(&ch)
+                    .map(|set| set.iter().copied().collect())
+                    .unwrap_or_default()
+            }),
+        })
+        .collect()
+}
+
 /// Whether `ch` is a dispatch macro character in `readtable` (built-in `#`, or
 /// one made via `make-dispatch-macro-character`).
 pub fn is_dispatch_macro_character(readtable: EgclVal, ch: char) -> bool {

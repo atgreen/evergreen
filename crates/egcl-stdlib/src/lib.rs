@@ -60,6 +60,9 @@ pub mod offheap_image;
 pub mod pathnames;
 pub mod embedded_files;
 
+// ── Readtables ────────────────────────────────────────────────────
+pub mod readtables;
+
 // ── Developer tools ───────────────────────────────────────────────
 pub mod devtools;
 

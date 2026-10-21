@@ -1338,6 +1338,52 @@
   (egcl::%set-readtable-base-char-preference preference readtable)
   preference)
 (export '(egcl-ext::readtable-base-char-preference) :egcl-ext)
+
+;;; The reader-macro function GET-MACRO-CHARACTER reports for a dispatching
+;;; macro character made by MAKE-DISPATCH-MACRO-CHARACTER, whose dispatching
+;;; reader is in Rust: an optional decimal argument, the sub-character, then
+;;; that sub-character's function in the current readtable.
+(defun egcl::%dispatch-macro-reader (stream char)
+  (let ((arg nil) (sub nil))
+    (loop (let ((c (read-char stream t nil t)))
+            (if (digit-char-p c)
+                (setq arg (+ (* 10 (or arg 0)) (digit-char-p c)))
+                (progn (setq sub c) (return)))))
+    (let ((function (get-dispatch-macro-character char sub)))
+      (if function
+          (funcall function stream sub arg)
+          (error 'reader-error :stream stream)))))
+
+;;; Enumerate a readtable's macro characters without probing every one of the
+;;; CHAR-CODE-LIMIT codes (GitHub #473). The Rust side lists a small superset
+;;; of candidates; each is reported only when GET-MACRO-CHARACTER (and, for a
+;;; sub-character, GET-DISPATCH-MACRO-CHARACTER) gives it a function, so the
+;;; result always agrees with those functions.
+(defun egcl-ext::map-readtable-macro-characters (function readtable)
+  "Call FUNCTION with (CHAR READER-FUNCTION NON-TERMINATING-P DISPATCH-ALIST)
+once for each character with a reader-macro function in READTABLE (NIL means
+the standard readtable), in order of character code. READER-FUNCTION and
+NON-TERMINATING-P are what GET-MACRO-CHARACTER returns. DISPATCH-ALIST is NIL
+unless CHAR is a dispatching macro character, when it is a fresh list of
+(SUB-CHAR . FUNCTION) for every sub-character GET-DISPATCH-MACRO-CHARACTER
+gives a function, listing an ASCII letter in upper case only.
+Returns NIL."
+  (let ((readtable (if (null readtable) (copy-readtable nil) readtable)))
+    (check-type readtable readtable)
+    (dolist (entry (egcl::%readtable-macro-character-candidates readtable) nil)
+      (let ((char (if (consp entry) (car entry) entry)))
+        (multiple-value-bind (reader-function non-terminating-p)
+            (get-macro-character char readtable)
+          (when reader-function
+            (let ((alist nil))
+              (when (consp entry)
+                (dolist (sub (cdr entry))
+                  (let ((sub-function (get-dispatch-macro-character char sub readtable)))
+                    (when sub-function
+                      (push (cons sub sub-function) alist)))))
+              (funcall function char reader-function non-terminating-p
+                       (nreverse alist)))))))))
+(export '(egcl-ext::map-readtable-macro-characters) :egcl-ext)
 ;; The default pathname merged against by MERGE-PATHNAMES and friends; ANSI
 ;; requires it to be bound to a pathname. Initialize to the startup directory.
 (defvar *default-pathname-defaults* (truename "."))

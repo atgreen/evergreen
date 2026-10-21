@@ -654,7 +654,7 @@ fn resolve(name: &str) -> Option<Handler> {
             // feature expression back to the standard #+ reader) gets a
             // callable function rather than NIL.
             if args[0].as_char() == '#'
-                && "'(*:.BOXRCASP=#+-|".contains(args[1].as_char().to_ascii_uppercase())
+                && reader::STANDARD_SHARP_SUB_CHARS.contains(args[1].as_char().to_ascii_uppercase())
             {
                 let name = resolve_sym("EGCL::%STANDARD-DISPATCH-READER-MACRO").unwrap();
                 return Ok(symbol_function_object(env, name).unwrap_or(NIL));
@@ -782,6 +782,13 @@ fn resolve(name: &str) -> Option<Handler> {
             let (func, non_term) = reader::get_macro_character(rt, ch)?;
             let (f, nt) = match func {
                 Some(f) if f != T => (f, non_term),
+                // A dispatching macro character made by
+                // MAKE-DISPATCH-MACRO-CHARACTER (stored as T) dispatches in
+                // Rust; report the boot.lisp function that does the same.
+                Some(_) if ch != '#' && reader::is_dispatch_macro_character(rt, ch) => {
+                    let name = resolve_sym("EGCL::%DISPATCH-MACRO-READER").unwrap();
+                    (symbol_function_object(env, name).unwrap_or(NIL), non_term)
+                }
                 // No custom handler: report the built-in macro function for a
                 // standard macro character as an fbound placeholder symbol
                 // (get-macro-character.1/.3 only check functionp/fboundp).
@@ -864,6 +871,18 @@ fn resolve(name: &str) -> Option<Handler> {
                     _ => resolve_sym(":SYMBOLS").unwrap_or(NIL),
                 },
             )
+        }),
+
+        "EGCL::%READTABLE-MACRO-CHARACTER-CANDIDATES" => Some(|_operator, args, _env| {
+            // (egcl::%readtable-macro-character-candidates rt) => list of CHAR or
+            // (DISP-CHAR SUB-CHAR...); MAP-READTABLE-MACRO-CHARACTERS filters it.
+            if args.len() != 1 || !egcl_rt::types::readtablep(args[0]) {
+                return Err(EgclError::TypeError {
+                    datum: args.first().copied().unwrap_or(NIL),
+                    expected: "READTABLE".into(),
+                });
+            }
+            Ok(egcl_stdlib::readtables::macro_character_candidates(args[0]))
         }),
 
         "EGCL::%SET-READTABLE-BASE-CHAR-PREFERENCE" => Some(|_operator, args, _env| {

@@ -20212,7 +20212,9 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             "EGCL::%COPY-READTABLE" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::%READTABLE-CASE" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::%SET-READTABLE-CASE" => return eval_builtin_arguments(&name, cdr, env),
-            "EGCL::%READTABLE-BASE-CHAR-PREFERENCE" | "EGCL::%SET-READTABLE-BASE-CHAR-PREFERENCE" => {
+            "EGCL::%READTABLE-BASE-CHAR-PREFERENCE"
+            | "EGCL::%SET-READTABLE-BASE-CHAR-PREFERENCE"
+            | "EGCL::%READTABLE-MACRO-CHARACTER-CANDIDATES" => {
                 return eval_builtin_arguments(&name, cdr, env);
             }
             "EGCL::%PRUNE-CLOSURES" => {
