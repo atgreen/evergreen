@@ -293,7 +293,7 @@
   The interpreter was already correct; compiled code was wrong at every tier.
   Such functions can now also use the optimizing tier's direct-call entry,
   which cuts the cost of calling them from native code by about 40%
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#500](https://github.com/atgreen/evergreen/pull/500)).
 - `COMPILE-FILE` compiles a file whose top-level `MACROLET` expands to
   `(defgeneric (setf NAME) ...)`, as zpb-ttf's `bounding-box.lisp` does. It
   used to warn "could not pre-read this file (PROGRAM-ERROR)" and write a
