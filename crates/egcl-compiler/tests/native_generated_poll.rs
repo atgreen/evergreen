@@ -98,6 +98,7 @@ fn generated_loop_poll_checks_each_pending_source_and_reloads_moved_roots() {
         min_args: 1,
         max_args: Some(1),
         variadic: false,
+        binder_cache: Default::default(),
     };
     let mut function =
         egcl_compiler::t2::build::build_from_bytecode_for_transfers(&source).unwrap();

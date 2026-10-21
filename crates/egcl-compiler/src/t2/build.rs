@@ -3734,6 +3734,7 @@ mod tests {
             min_args: arity,
             max_args: Some(arity),
             variadic: false,
+            binder_cache: Default::default(),
         }
     }
 

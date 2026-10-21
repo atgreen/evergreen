@@ -44,6 +44,7 @@ fn bytecode_fn() -> BytecodeFunction {
         min_args: 0,
         max_args: Some(0),
         variadic: false,
+        binder_cache: Default::default(),
     }
 }
 
@@ -70,6 +71,7 @@ fn legacy_bytecode_fn() -> BytecodeFunction {
         min_args: 0,
         max_args: Some(0),
         variadic: false,
+        binder_cache: Default::default(),
     }
 }
 
@@ -106,6 +108,7 @@ fn call_free_loop_fn() -> BytecodeFunction {
         min_args: 0,
         max_args: Some(0),
         variadic: false,
+        binder_cache: Default::default(),
     }
 }
 

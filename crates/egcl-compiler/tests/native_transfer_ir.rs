@@ -49,6 +49,7 @@ fn body() -> BytecodeFunction {
         min_args: 2,
         max_args: Some(2),
         variadic: false,
+        binder_cache: Default::default(),
     }
 }
 

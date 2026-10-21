@@ -39,11 +39,11 @@ pub(super) struct ActivationState {
 /// before anything that roots or points into the state, so it drops last.
 pub(super) struct PooledActivation<'a> {
     code: &'a TransferCode,
-    state: Option<ActivationState>,
+    state: Option<Box<ActivationState>>,
 }
 
 impl<'a> PooledActivation<'a> {
-    pub(super) fn new(code: &'a TransferCode, state: ActivationState) -> Self {
+    pub(super) fn new(code: &'a TransferCode, state: Box<ActivationState>) -> Self {
         Self {
             code,
             state: Some(state),
@@ -176,10 +176,12 @@ impl ActivationState {
         Ok(Some(state))
     }
 
-    pub(super) fn prepare_reusing(code: &TransferCode, env: &mut Env) -> Result<Self, EgclError> {
+    /// Boxed, like the pool, so taking a state out of it and handing it back
+    /// moves a pointer rather than the whole state (bliss-nkzx6).
+    pub(super) fn prepare_reusing(code: &TransferCode, env: &mut Env) -> Result<Box<Self>, EgclError> {
         let pooled = code.state_pool.borrow_mut().pop();
         let Some(mut state) = pooled else {
-            return Self::prepare(code, env);
+            return Self::prepare(code, env).map(Box::new);
         };
         // A pooled activation may have had its guard reservation consumed by a
         // deopt before it was recycled. Restore it here, where failing is still
@@ -197,7 +199,7 @@ impl ActivationState {
     /// saved specials, prepared transfer, OSR hand-off or restart templates --
     /// and its snapshots are cleared first, so nothing in the pool holds a
     /// Lisp value that the collector would need to trace.
-    pub(super) fn recycle(mut self, code: &TransferCode) {
+    pub(super) fn recycle(mut self: Box<Self>, code: &TransferCode) {
         let guard_idle = self.guard_resume.as_ref().is_none_or(|guard| {
             guard.debug_call.is_none()
                 && guard.handlers.is_empty()

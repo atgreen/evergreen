@@ -44698,6 +44698,7 @@ mod env_gc_root_tests {
             min_args: 1,
             max_args: Some(1),
             variadic: false,
+            binder_cache: Default::default(),
         };
         let nested = Arc::new(nested);
         for _ in 0..128 {
