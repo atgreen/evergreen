@@ -1003,7 +1003,10 @@ pub(super) fn serialize_registry_unit() -> Vec<u8> {
                 && egcl_rt::symbols::symbol_function(symbol) == Some(definition.function)
             {
                 let private = egcl_rt::function::definition_index(definition.function);
-                if entries.get(&private).is_some_and(|owned| Arc::ptr_eq(owned, body)) {
+                if entries
+                    .get(&private)
+                    .is_some_and(|owned| Arc::ptr_eq(owned, body))
+                {
                     entries.remove(&private);
                 }
             }
