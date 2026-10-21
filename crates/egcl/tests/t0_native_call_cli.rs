@@ -1,0 +1,93 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
+//! A bytecode caller calling T2 callees (GitHub #487). Each scenario runs a
+//! caller that executes once, so it stays bytecode, against callees that are
+//! promoted to T2 first, and must print exactly what the interpreter prints.
+
+#![cfg(all(target_arch = "x86_64", target_os = "linux"))]
+
+use std::process::Command;
+
+const PROGRAM: &str = r#"
+(defvar *k* 10)
+(defun leaf (a b) (+ a b))
+(defun mv-leaf (a b) (values (+ a b) (- a b)))
+(defun thrower (x) (if (> x 5) (throw :t0-native (* x 100)) x))
+(defun car-leaf (x) (car x))
+(defun special-leaf (x) (+ x *k*))
+(defun special-binder (x) (let ((*k* x)) (special-leaf 1)))
+(defun cons-leaf (a) (list a a))
+(defun warm ()
+  (dotimes (i 40)
+    (leaf i 1) (mv-leaf i 1) (thrower 1) (car-leaf '(1)) (special-leaf i)
+    (special-binder i) (cons-leaf i)))
+(warm)
+(defun caller ()
+  (let ((sum 0) (mvs nil) (errors 0) (conses 0))
+    (dotimes (i 2000) (setq sum (leaf sum i)))
+    (dotimes (i 3) (push (multiple-value-list (mv-leaf i 10)) mvs))
+    (format t "SUM ~D~%MV ~S~%" sum mvs)
+    (format t "THROW ~D~%" (catch :t0-native (dotimes (i 10) (thrower i)) :none))
+    (dotimes (i 6)
+      (handler-case (car-leaf (if (evenp i) (list i) i))
+        (type-error () (incf errors))))
+    (format t "ERRORS ~D~%" errors)
+    (format t "SPECIAL ~D ~D ~D~%" (special-leaf 1)
+            (let ((*k* 1000)) (special-leaf 1)) (special-binder 7))
+    (format t "AFTER ~D~%" *k*)
+    (dotimes (i 20000) (incf conses (length (cons-leaf i))))
+    (format t "CONSES ~D~%" conses)
+    ;; Values the warm-up never showed: a guard failure inside the leaf.
+    (format t "DEOPT ~S ~S ~S~%" (leaf most-positive-fixnum 1) (leaf 1.5 2) (leaf 1/2 1/3))
+    (format t "MVAFTER ~S~%" (multiple-value-list (leaf 1 2)))))
+(caller)
+(format t "TIERS ~D ~D~%" (egcl-ext:function-tier 'mv-leaf) (egcl-ext:function-tier 'caller))
+"#;
+
+fn run(force_interp: bool) -> String {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_egcl"));
+    command
+        .args(["--no-init", "--eval", PROGRAM])
+        .env_remove("EGCL_NATIVE_TRANSFER")
+        .env_remove("EGCL_FORCE_TIER")
+        // Promote every warmed callee to T2 synchronously; CALLER runs once.
+        .env("EGCL_T2", "1")
+        .env("EGCL_T0_T1_THRESHOLD", "2")
+        .env("EGCL_T2_THRESHOLD", "4");
+    if force_interp {
+        command.env("EGCL_FORCE_TIER", "interp");
+    }
+    let output = command.output().expect("spawn egcl");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        output.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    stdout
+}
+
+#[test]
+fn bytecode_callers_see_t2_callees_exactly_as_interpreted_ones() {
+    let native = run(false);
+    let interpreted = run(true);
+    assert!(native.contains("TIERS 2 0"), "callees must be T2 and the caller bytecode: {native}");
+    let strip = |text: &str| -> String {
+        text.lines().filter(|line| !line.starts_with("TIERS")).collect::<Vec<_>>().join("\n")
+    };
+    assert_eq!(strip(&native), strip(&interpreted));
+    for expected in [
+        "SUM 1999000",
+        "MV ((12 -8) (11 -9) (10 -10))",
+        "THROW 600",
+        "ERRORS 3",
+        "SPECIAL 11 1001 8",
+        "AFTER 10",
+        "CONSES 40000",
+        "DEOPT 1152921504606846976 3.5 5/6",
+        "MVAFTER (3)",
+    ] {
+        assert!(native.contains(expected), "missing {expected:?} in {native}");
+    }
+}

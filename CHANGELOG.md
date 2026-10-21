@@ -61,6 +61,20 @@
 
 ### Performance
 
+- On x86-64 Linux, interpreted code calling a function that has been compiled
+  to native code no longer pays for a system call on every call: the runtime
+  asked the kernel for the thread's shadow-stack status each time it entered
+  native code, and now asks once per thread. Such a call also skips work
+  that cannot change its outcome -- the tier bookkeeping for a callee
+  already at T2, a fresh root for the callee's identity, and reloading
+  unchanged floating-point control registers. A two-argument fixnum `+`
+  called from a `COMPILE-FILE`d loop that stays in the interpreter fell from
+  about 2.5 us to 1.0 us per call net of the loop; the same call with the
+  callee left in the interpreter costs about 0.8 us, so a compiled callee
+  is still slightly slower from interpreted code. A call with one `&key`
+  argument fell from about 6.3 us to 3.8 us, against about 1.5 us
+  interpreted, and `FUNCALL` of a closure from about 9 us to 6 us
+  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
 - On x86-64 Linux, a closure that reads or sets variables captured from the
   function or `LET` that created it -- `(lambda (y) (+ x y k))`, a counter's
   `(lambda () (incf n))`, or a wrapper such as `(lambda (&rest a) (apply

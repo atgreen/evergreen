@@ -341,6 +341,14 @@ pub(super) struct TransferCode {
     /// same root back instead of registering a fresh cross-thread root -- a
     /// global lock and hash insert, then another to remove it -- per call.
     last_callable: std::cell::RefCell<Option<Arc<egcl_rt::CrossThreadRoot<EgclVal>>>>,
+    /// Address bits of `last_callable`'s value when that value is an
+    /// interpreted function object, else 0. Those objects are pinned and the
+    /// root keeps this one alive, so the bits stay its identity and a matching
+    /// call needs no GC-gated read of the root.
+    last_callable_pinned: Cell<u64>,
+    /// The ordinary root identity the last activation of this code retained,
+    /// once its segment released it, for the next activation to reuse.
+    spare_root_identity: std::cell::RefCell<Option<Rc<super::call_table::RootIdentity>>>,
     #[cfg(test)]
     unavailable_catch: Option<u32>,
     #[cfg(test)]
@@ -1405,6 +1413,8 @@ impl TransferCode {
             catch_pushes,
             state_pool: std::cell::RefCell::new(Vec::new()),
             last_callable: std::cell::RefCell::new(None),
+            last_callable_pinned: Cell::new(0),
+            spare_root_identity: std::cell::RefCell::new(None),
         })
     }
 
@@ -1415,15 +1425,59 @@ impl TransferCode {
         function: EgclVal,
     ) -> Arc<egcl_rt::CrossThreadRoot<EgclVal>> {
         egcl_rt::rooted!(function = function);
-        let previous = self.last_callable.borrow().clone();
-        if let Some(root) = previous {
-            if root.with_gc_stable_mutator(|value| *value == *function) {
-                return root;
-            }
+        if let Some(root) = self.cached_callable_root(&function) {
+            return root;
         }
         let root = Arc::new(egcl_rt::CrossThreadRoot::new(*function));
         *self.last_callable.borrow_mut() = Some(Arc::clone(&root));
+        // Recorded with the root, never separately: the bits name the object
+        // only while this root keeps it alive.
+        self.last_callable_pinned.set(
+            if egcl_rt::function::is_interpreted_function(*function) { function.0 } else { 0 });
         root
+    }
+
+    /// The previous activation's callable root, when it still names the
+    /// function in `function`, which the caller keeps rooted: a GC-gated read
+    /// may park, and the value is reread after it.
+    pub(super) fn cached_callable_root(
+        &self,
+        function: &EgclVal,
+    ) -> Option<Arc<egcl_rt::CrossThreadRoot<EgclVal>>> {
+        // Clone out of the cell before the GC-gated read, which may park.
+        let previous = self.last_callable.borrow().clone()?;
+        // An interpreted function object never moves, and `previous` holds it
+        // alive, so equal bits are equal identity without the gate. That is
+        // every steady-state call of a named function (GitHub #487).
+        let pinned = self.last_callable_pinned.get();
+        if pinned != 0 && pinned == function.0 {
+            return Some(previous);
+        }
+        previous.with_gc_stable_mutator(|value| *value == *function).then_some(previous)
+    }
+
+    /// Apply `inspect` to the previous activation's callable root, without
+    /// cloning it, when that root holds exactly the pinned function `function`.
+    /// `inspect` must not park or allocate: it runs under the cell's borrow.
+    pub(super) fn with_pinned_callable_root<R>(
+        &self,
+        function: EgclVal,
+        inspect: impl FnOnce(&Arc<egcl_rt::CrossThreadRoot<EgclVal>>) -> R,
+    ) -> Option<R> {
+        let pinned = self.last_callable_pinned.get();
+        if pinned == 0 || pinned != function.0 {
+            return None;
+        }
+        self.last_callable.borrow().as_ref().map(inspect)
+    }
+
+    pub(super) fn take_spare_root_identity(&self) -> Option<Rc<super::call_table::RootIdentity>> {
+        self.spare_root_identity.borrow_mut().take()
+    }
+
+    pub(super) fn store_spare_root_identity(&self, identity: Rc<super::call_table::RootIdentity>) {
+        // Dropping a replaced spare frees host memory only; it runs no Lisp.
+        *self.spare_root_identity.borrow_mut() = Some(identity);
     }
 
     pub(super) fn run(&self, args: &[EgclVal], env: &mut Env) -> Result<EgclVal, EgclError> {
@@ -1456,7 +1510,10 @@ impl TransferCode {
             base: osr.as_ref().map_or(env.catch_stack.len(), |resume| resume.state.catch_base),
             env,
         };
-        egcl_rt::rooted!(args = args.to_vec());
+        // Root a copy of the actuals without a heap allocation for the common
+        // arities: this runs on every interpreter-to-native call (GitHub #487).
+        egcl_rt::rooted!(entry_args = EntryArgs::new(args));
+        let args: &[EgclVal] = entry_args.as_slice();
         egcl_rt::rooted_ref!(_env = &mut *env);
         // `bind_params` pads omitted `&optional` arguments below, and
         // `bind_variadic` parses a `&rest`/`&key` tail.
@@ -1466,7 +1523,7 @@ impl TransferCode {
             ));
         }
         if osr_offset.is_none() {
-            validate_declared_args(&self.body, &args)?;
+            validate_declared_args(&self.body, args)?;
         }
         let mut state = activation::PooledActivation::new(self, match osr {
             Some(resume) => resume.state,
@@ -1527,10 +1584,10 @@ impl TransferCode {
             // The frame's slots are still NIL, as at the entry poll below, and
             // no native scope, block stack or entry state is installed yet;
             // `frame_guard` pops the frame on an error, as the checked ABI does.
-            bind_variadic(&self.body, frame, &args, state.env_frame.as_ref(), env)
+            bind_variadic(&self.body, frame, args, state.env_frame.as_ref(), env)
                 .map_err(EgclError::capture_backtrace)?;
         } else if osr_offset.is_none() {
-            bind_params(&self.body, frame, &args, state.env_frame.as_ref());
+            bind_params(&self.body, frame, args, state.env_frame.as_ref());
         }
         let _dynamic_scope_guard = DynamicScopeGuard {
             env,
@@ -1552,7 +1609,7 @@ impl TransferCode {
         let mut entry = EntryGuard {
             env: NATIVE_ENV.with(|slot| slot.replace(env)),
             capture: CAPTURE.with(|slot| slot.replace(&mut context)),
-            error: NATIVE_ERROR.with(|slot| slot.take()),
+            error: take_native_error(),
         };
         egcl_rt::rooted_ref!(_entry = &mut entry);
         // An enclosing legacy recovery PC describes its own machine frame,
@@ -1611,7 +1668,7 @@ impl TransferCode {
                     #[cfg(test)]
                     if let Some(observe) = ORDINARY_ENTRY_HOOK.with(|hook| hook.take()) { observe(); }
                     native_transfer::invoke_ordinary_native_segment(
-                        self.code.as_ptr().add(offset), execution, NIL, &args, stack)
+                        self.code.as_ptr().add(offset), execution, NIL, args, stack)
                 })
             }.map(|returned| returned.outcome)
         } else {
@@ -1622,8 +1679,18 @@ impl TransferCode {
         }.map_err(|_| EgclError::Internal("native segment is unavailable".into()))?;
         // No Lisp allocation between the machine return and rooting its value
         // or taking ownership of the execution-local error.
-        egcl_rt::rooted!(primary = outcome.value);
-        egcl_rt::rooted!(error = NATIVE_ERROR.with(|slot| slot.take()));
+        let primary = outcome.value;
+        let error = take_native_error();
+        // The common outcome: a plain return. Nothing remains to unwind and
+        // nothing below allocates before the value is returned, so it needs
+        // neither root nor the checks below (GitHub #487).
+        if outcome.exit == NativeExit::Returned && error.is_none() && context.failure.is_none()
+            && context.osr.is_none() && context.selected.is_none() && state.is_quiescent()
+        {
+            return Ok(primary);
+        }
+        egcl_rt::rooted!(primary = primary);
+        egcl_rt::rooted!(error = error);
         if context.failure.is_some() {
             return Err(invalid_capture());
         }
@@ -2343,6 +2410,43 @@ impl Drop for CapturePause {
     }
 }
 
+/// The actuals of one native entry, copied so the collector can update them,
+/// without a heap allocation for common arities.
+struct EntryArgs {
+    inline: [EgclVal; crate::cli::ROOTED_ARGS_INLINE],
+    len: usize,
+    spill: Vec<EgclVal>,
+}
+
+impl EntryArgs {
+    fn new(args: &[EgclVal]) -> Self {
+        let mut inline = [NIL; crate::cli::ROOTED_ARGS_INLINE];
+        let spill = if args.len() <= inline.len() {
+            inline[..args.len()].copy_from_slice(args);
+            Vec::new()
+        } else {
+            args.to_vec()
+        };
+        Self { inline, len: args.len(), spill }
+    }
+
+    fn as_slice(&self) -> &[EgclVal] {
+        if self.len <= self.inline.len() { &self.inline[..self.len] } else { &self.spill }
+    }
+}
+
+impl egcl_rt::gc::TraceHostRoots for EntryArgs {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
+        let len = self.len.min(self.inline.len());
+        for value in &mut self.inline[..len] {
+            visit(value);
+        }
+        for value in &mut self.spill {
+            visit(value);
+        }
+    }
+}
+
 struct FaultRecoveryGuard {
     null: usize,
     stack: usize,
@@ -2411,9 +2515,13 @@ struct DynamicScopeGuard {
 }
 impl Drop for DynamicScopeGuard {
     fn drop(&mut self) {
+        let scopes = unsafe { &mut *self.scopes };
+        // Most activations establish no dynamic scope: skip the stack lookup.
+        if scopes.is_empty() {
+            return;
+        }
         let stack = egcl_rt::current_stack();
         let env = unsafe { &mut *self.env };
-        let scopes = unsafe { &mut *self.scopes };
         while let Some(scope) = scopes.pop() {
             match scope {
                 DynamicScope::HandlerCase {
@@ -3865,7 +3973,7 @@ impl Drop for EntryGuard {
     fn drop(&mut self) {
         NATIVE_ENV.with(|slot| slot.set(self.env));
         CAPTURE.with(|slot| slot.set(self.capture));
-        NATIVE_ERROR.with(|slot| slot.replace(self.error.take()));
+        restore_native_error(self.error.take());
     }
 }
 

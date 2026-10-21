@@ -30,6 +30,10 @@ struct RetainedEntries<C> {
     // publication/redefinition grows this directory.
     #[allow(clippy::vec_box)]
     entries: Vec<Box<RetainedEntry<C>>>,
+    /// The publication epoch and entry count the last completed sweep saw.
+    /// While both are unchanged a sweep would find every entry still
+    /// published, so the outermost segment exit skips it (GitHub #487).
+    swept: Option<(u64, usize)>,
 }
 
 impl<C> Default for RetainedEntries<C> {
@@ -37,6 +41,7 @@ impl<C> Default for RetainedEntries<C> {
         Self {
             segments: 0,
             entries: Vec::new(),
+            swept: None,
         }
     }
 }
@@ -54,7 +59,9 @@ impl<C> RetainedEntries<C> {
             .segments
             .checked_sub(1)
             .expect("unbalanced native segment retirement");
-        self.sweep();
+        if self.swept != Some((linkage::ordinary_epoch(), self.entries.len())) {
+            self.sweep();
+        }
     }
 
     #[cfg(test)]
@@ -100,11 +107,13 @@ impl<C> RetainedEntries<C> {
         if self.segments != 0 {
             return;
         }
+        let epoch = linkage::ordinary_epoch();
         self.entries.retain(|entry| {
             let published =
                 unsafe { &*entry.cell.ordinary_entry_address() }.load(Ordering::Acquire);
             published == std::ptr::from_ref(&entry.descriptor) as usize
         });
+        self.swept = Some((epoch, self.entries.len()));
     }
 
     fn code_for_pc(&self, pc: usize) -> Option<Rc<C>> {
@@ -118,7 +127,7 @@ impl<C> RetainedEntries<C> {
 /// Borrow only for the duration of lookup. The explicit handle may be read by
 /// a collector/debugger while its owning execution is stopped, just like the
 /// existing PublishedBoundary owner; it must not be read concurrently with it.
-struct RootIdentity {
+pub(in crate::cli::bytecode) struct RootIdentity {
     owner: *const TransferCode,
     start: usize,
     len: usize,
@@ -157,6 +166,22 @@ impl OrdinaryCodeDirectory {
     /// Clone handles under the directory borrow; every GC-gated read happens
     /// afterward because a Running mutator may park while acquiring that gate.
     fn accepts_callable(&self, code: &TransferCode, function: egcl_rt::value::EgclVal) -> bool {
+        self.accepts_callable_root(code, function, None)
+    }
+
+    /// [`Self::accepts_callable`], given `callable`, a root already known to
+    /// hold `function`. A handle that IS that root agrees without a GC-gated
+    /// read, so the steady state of one function calling through its own
+    /// published code takes no lock and allocates nothing (GitHub #487).
+    fn accepts_callable_root(
+        &self,
+        code: &TransferCode,
+        function: egcl_rt::value::EgclVal,
+        callable: Option<&Arc<egcl_rt::CrossThreadRoot<egcl_rt::value::EgclVal>>>,
+    ) -> bool {
+        if callable.is_some_and(|callable| self.held_only_by(code, callable)) {
+            return true;
+        }
         egcl_rt::rooted!(function = function);
         let mut retained: Vec<_> = self.retained.borrow().entries.iter()
             .filter(|entry| std::ptr::eq(Rc::as_ptr(&entry.code), code))
@@ -167,6 +192,21 @@ impl OrdinaryCodeDirectory {
             .map(|root| Some(Arc::clone(&root.callable))));
         retained.into_iter().all(|root| root.is_some_and(|root|
             root.with_gc_stable_mutator(|value| *value == *function)))
+    }
+
+    /// Whether every handle constraining `code`'s identity is `callable`
+    /// itself. Pointer comparisons only: no gate, no allocation, no parking.
+    fn held_only_by(
+        &self,
+        code: &TransferCode,
+        callable: &Arc<egcl_rt::CrossThreadRoot<egcl_rt::value::EgclVal>>,
+    ) -> bool {
+        self.retained.borrow().entries.iter()
+            .filter(|entry| std::ptr::eq(Rc::as_ptr(&entry.code), code))
+            .all(|entry| entry.callable.as_ref().is_some_and(|root| Arc::ptr_eq(root, callable)))
+            && self.roots.borrow().iter()
+                .filter(|root| std::ptr::eq(root.owner, code))
+                .all(|root| Arc::ptr_eq(&root.callable, callable))
     }
 
     pub(in crate::cli::bytecode) fn callable_for_pc(
@@ -213,14 +253,26 @@ pub(in crate::cli::bytecode) struct OrdinarySegmentGuard {
 /// Retain its callable independently of named-cell publication or replacement.
 pub(in crate::cli::bytecode) struct OrdinaryRootGuard<'a> {
     directory: Rc<OrdinaryCodeDirectory>,
-    identity: Rc<RootIdentity>,
-    _code: std::marker::PhantomData<&'a TransferCode>,
+    identity: Option<Rc<RootIdentity>>,
+    code: &'a TransferCode,
 }
 
 impl Drop for OrdinaryRootGuard<'_> {
     fn drop(&mut self) {
-        self.directory.roots.borrow_mut()
-            .retain(|root| !Rc::ptr_eq(root, &self.identity));
+        let Some(identity) = self.identity.take() else { return };
+        {
+            let mut roots = self.directory.roots.borrow_mut();
+            // Guards nest, so this is nearly always the newest root.
+            if roots.last().is_some_and(|root| Rc::ptr_eq(root, &identity)) {
+                roots.pop();
+            } else {
+                roots.retain(|root| !Rc::ptr_eq(root, &identity));
+            }
+        }
+        // No longer a root of this directory: keep it for the next call.
+        if Rc::strong_count(&identity) == 1 {
+            self.code.store_spare_root_identity(identity);
+        }
     }
 }
 
@@ -228,19 +280,47 @@ impl OrdinarySegmentGuard {
     pub(in crate::cli::bytecode) fn retain_root<'a>(
         &self, code: &'a TransferCode, function: egcl_rt::value::EgclVal,
     ) -> Option<OrdinaryRootGuard<'a>> {
-        egcl_rt::rooted!(function = function);
-        if !self.directory.accepts_callable(code, *function) { return None; }
         let (start, len) = code.ordinary_code_bounds()?;
-        let identity = Rc::new(RootIdentity {
-            owner: std::ptr::from_ref(code),
-            start,
-            len,
-            callable: code.callable_root(*function),
-        });
+        // Steady state: the same pinned function as the previous activation,
+        // whose released identity is still spare. Pointer checks only, so no
+        // root, gate, reference count or allocation (GitHub #487).
+        let reused = code.with_pinned_callable_root(function, |callable| {
+            if !self.directory.held_only_by(code, callable) {
+                return None;
+            }
+            code.take_spare_root_identity().filter(|identity| std::ptr::eq(identity.owner, code)
+                && identity.start == start && identity.len == len
+                && Arc::ptr_eq(&identity.callable, callable))
+        }).flatten();
+        if let Some(identity) = reused {
+            self.directory.roots.borrow_mut().push(Rc::clone(&identity));
+            return Some(OrdinaryRootGuard {
+                directory: Rc::clone(&self.directory), identity: Some(identity), code,
+            });
+        }
+        egcl_rt::rooted!(function = function);
+        let cached = code.cached_callable_root(&function);
+        if !self.directory.accepts_callable_root(code, *function, cached.as_ref()) { return None; }
+        let callable = cached.unwrap_or_else(|| code.callable_root(*function));
+        // The previous activation's identity, when it names the same root and
+        // code range, saves an allocation and free on every call.
+        let identity = code.take_spare_root_identity()
+            .filter(|identity| std::ptr::eq(identity.owner, code)
+                && identity.start == start && identity.len == len
+                && Arc::ptr_eq(&identity.callable, &callable))
+            .unwrap_or_else(|| {
+                #[cfg(test)]
+                ROOT_IDENTITIES.with(|count| count.set(count.get() + 1));
+                Rc::new(RootIdentity {
+                    owner: std::ptr::from_ref(code),
+                    start,
+                    len,
+                    callable,
+                })
+            });
         self.directory.roots.borrow_mut().push(Rc::clone(&identity));
         Some(OrdinaryRootGuard {
-            directory: Rc::clone(&self.directory), identity,
-            _code: std::marker::PhantomData,
+            directory: Rc::clone(&self.directory), identity: Some(identity), code,
         })
     }
 
@@ -300,7 +380,9 @@ pub(in crate::cli::bytecode) unsafe fn publish_ordinary_with_heat(
         {
             return false;
         }
-        let callable = Arc::new(egcl_rt::CrossThreadRoot::new(*function));
+        // Share the code's own callable root, so ordinary entries for the same
+        // function recognize this published identity by pointer.
+        let callable = code.callable_root(*function);
         let pointer =
             directory
                 .retained
@@ -335,6 +417,17 @@ pub(super) unsafe fn sweep_all() {
     unsafe {
         DIRECTORY.scan(|directory| directory.retained.borrow_mut().sweep());
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static ROOT_IDENTITIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Root identities allocated by `retain_root` on this thread since the last call.
+#[cfg(test)]
+pub(in crate::cli::bytecode) fn take_root_identities_for_test() -> usize {
+    ROOT_IDENTITIES.with(|count| count.replace(0))
 }
 
 #[cfg(test)]

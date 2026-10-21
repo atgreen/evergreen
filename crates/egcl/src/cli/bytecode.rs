@@ -16940,22 +16940,30 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                         // Only this dispatch owns the count for an admitted
                         // bytecode/native call. Cold and arity-mismatch fallbacks
                         // are counted by apply_function below.
-                        if !profiling_disabled()
-                            && let Some(cell) = *fn_obj
-                            && !has_t2_body(callee_sym, &callee)
-                        {
-                            egcl_rt::function::record_invocation(cell);
-                        }
-                        // Installed native code → call via the i2c adapter.
-                        // Unified tiering (bliss-jtc.3): the function object's
-                        // FnMeta is the single tiering record — invoke counter
-                        // (bumped below T2), current tier, and the
-                        // active compiled entry. Promotion is driven by that
-                        // counter and, on success, tier + entry are recorded on
-                        // the object. Anonymous compiled lambdas (gensyms) have no
-                        // function object, so they keep the INVOKE_COUNTS fallback.
-                        let count = dispatch_invoke_count(callee_sym, *fn_obj);
-                        let native = native_for_dispatch(callee_sym, *fn_obj, count, &callee);
+                        // A named callee already at T2 has no tier decision left:
+                        // it is not counted, and dispatch would only find this
+                        // same code again (GitHub #487).
+                        let native = match installed_t2_for_named(callee_sym, *fn_obj, &callee) {
+                            Some(code) => Some(code),
+                            None => {
+                                if !profiling_disabled()
+                                    && let Some(cell) = *fn_obj
+                                    && !has_t2_body(callee_sym, &callee)
+                                {
+                                    egcl_rt::function::record_invocation(cell);
+                                }
+                                // Installed native code → call via the i2c adapter.
+                                // Unified tiering (bliss-jtc.3): the function object's
+                                // FnMeta is the single tiering record — invoke counter
+                                // (bumped below T2), current tier, and the
+                                // active compiled entry. Promotion is driven by that
+                                // counter and, on success, tier + entry are recorded on
+                                // the object. Anonymous compiled lambdas (gensyms) have no
+                                // function object, so they keep the INVOKE_COUNTS fallback.
+                                let count = dispatch_invoke_count(callee_sym, *fn_obj);
+                                native_for_dispatch(callee_sym, *fn_obj, count, &callee)
+                            }
+                        };
                         // Run native only while under the depth cap (bliss-x5y.4);
                         // once the native call stack is deep, dispatch the callee
                         // through the flat T0 path below instead of pushing yet
@@ -19028,6 +19036,28 @@ static NATIVE_ERROR: egcl_rt::execution_local::ExecutionLocal<PendingError<'stat
     egcl_rt::execution_local::ExecutionLocal::new(|| PendingError::new(&PENDING_NATIVE_ERRORS))
 };
 
+/// Take this execution's pending native error. The process-wide occupancy
+/// count is zero on nearly every call, so check it before paying for the
+/// execution-local lookup and the `RefCell` swap of a large `Option<EgclError>`
+/// (GitHub #487: the native entry did this three times per call). A zero
+/// count proves this execution's slot is empty: its own writes precede the load.
+fn take_native_error() -> Option<EgclError> {
+    if PENDING_NATIVE_ERRORS.load(AtomicOrdering::Relaxed) == 0 {
+        return None;
+    }
+    NATIVE_ERROR.with(|slot| slot.take())
+}
+
+/// Restore `error` as this execution's pending native error, dropping any
+/// error still in the slot. Free when both are empty, as with
+/// [`take_native_error`].
+fn restore_native_error(error: Option<EgclError>) {
+    if error.is_none() && PENDING_NATIVE_ERRORS.load(AtomicOrdering::Relaxed) == 0 {
+        return;
+    }
+    NATIVE_ERROR.with(|slot| slot.replace(error));
+}
+
 fn native_error_pending() -> bool {
     // The current execution is the sole writer of its slot. Its own writes
     // happen before this load; fiber migration supplies the scheduler handoff.
@@ -21096,6 +21126,32 @@ fn t2_backedge_threshold() -> u32 {
     })
 }
 
+/// The installed T2 code for `body` when it is the definition of an interned
+/// name: exactly what `native_for_dispatch` would select for it, without the
+/// counting and tier bookkeeping that cannot change that answer. `None` sends
+/// the caller through ordinary dispatch, which owns every other case:
+/// closures (their owner and counts live in `CLOSURE_COMPILATION`), profiler
+/// pins, disabled profiling, T1 and no native code at all. The function
+/// object's tier word is only a filter that keeps calls to bytecode callees
+/// from paying for the registry lookup; the registry decides.
+fn installed_t2_for_named(
+    sym: u32,
+    function: Option<EgclVal>,
+    body: &Arc<BytecodeFunction>,
+) -> Option<Rc<NativeCode>> {
+    if function.is_none_or(|function| egcl_rt::function::tier(function) != 2)
+        || egcl_rt::symbols::is_uninterned(sym) || profiling_disabled() || is_profile_pinned(sym)
+    {
+        return None;
+    }
+    NATIVE_REGISTRY.with(|registry| {
+        registry.borrow().get(&sym)
+            .filter(|code| code.is_t2
+                && code.body.as_ref().is_some_and(|saved| Arc::ptr_eq(saved, body)))
+            .cloned()
+    })
+}
+
 /// Whether this execution has optimized code for this exact body. Closure
 /// instances may share a representative without sharing their object tier.
 fn has_t2_body(sym: u32, body: &Arc<BytecodeFunction>) -> bool {
@@ -22164,15 +22220,20 @@ fn run_native_callable(
     args: &[EgclVal],
     env: &mut Env,
 ) -> Result<EgclVal, EgclError> {
-    egcl_rt::rooted!(function = function);
     egcl_rt::rooted!(_active_callable_root = ActiveCallableRoot(sym));
     #[cfg(test)]
     call_table::record_target_lookup();
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     if let NativeCodeStorage::Mapped(code) = &nc._storage {
+        // Nothing has allocated since the caller handed `function` over, and
+        // the entry roots it before anything can.
         if !code.needs_recompile() {
-            return code.run_callable(*function, args, env);
+            return code.run_callable(function, args, env);
         }
+    }
+    egcl_rt::rooted!(function = function);
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    if let NativeCodeStorage::Mapped(code) = &nc._storage {
         egcl_rt::rooted!(args = args.to_vec());
         egcl_rt::rooted_ref!(_env = &mut *env);
         let replacement = native_transfer_entry::refresh_installed(nc);
