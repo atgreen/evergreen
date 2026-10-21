@@ -2215,3 +2215,110 @@ fn standard_intrinsic_identity_does_not_consume_shadowed_user_calls() {
         }
     }
 }
+
+/// `(CHAR s i)` reads a simple string's character inline and calls CHAR for
+/// every other operand (GitHub #487). Strings are built by hand in their heap
+/// layout: header, character count at 8, data at 16, one byte per character
+/// for a base string and a `u32` for a character string.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn simple_string_char_runs_inline_and_calls_char_otherwise() {
+    use egcl_compiler::t2::emit::emit_framed;
+    use egcl_compiler::t2::ir::Opcode;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    static CLEARS: AtomicUsize = AtomicUsize::new(0);
+    extern "C" fn call(sym: u64, n: u64, _: u64, _: u64, _: u64, _: u64) -> u64 {
+        assert_eq!(sym, u64::from(egcl_rt::symbols::intern("CHAR")));
+        assert_eq!(n, 2);
+        CALLS.fetch_add(1, Ordering::Relaxed);
+        EgclVal::from_char('?').0
+    }
+    extern "C" fn clear(_primary: u64, _dst: *mut EgclVal, count: u64) {
+        assert_eq!(count, 0);
+        CLEARS.fetch_add(1, Ordering::Relaxed);
+    }
+    fn string(tid: u8, chars: &[char]) -> Vec<u64> {
+        let width = if tid == type_id::SIMPLE_CHARACTER_STRING { 4 } else { 1 };
+        let words = (16 + chars.len() * width).div_ceil(8);
+        let mut object = vec![0u64; words.max(3)];
+        object[0] = ObjectHeader::new(tid, words as u16).0;
+        object[1] = chars.len() as u64;
+        let data = unsafe { (object.as_mut_ptr() as *mut u8).add(16) };
+        for (i, &c) in chars.iter().enumerate() {
+            unsafe {
+                if width == 4 {
+                    *(data as *mut u32).add(i) = c as u32;
+                } else {
+                    *data.add(i) = c as u8;
+                }
+            }
+        }
+        object
+    }
+    let tagged = |object: &Vec<u64>| EgclVal(object.as_ptr() as u64 | egcl_rt::value::TAG_HEAP_OBJECT);
+    let char_sym = egcl_rt::symbols::intern("CHAR");
+    let emit = |code: Vec<Instr>, constants: Vec<EgclVal>, arity: u16| {
+        let input = bytecode_fn("inline-char", code, constants, arity, 2, arity);
+        let function = build_from_bytecode(&input).expect("build CHAR");
+        verify(&function).expect("split CHAR verifies");
+        assert!(function.block_order().iter().flat_map(|&b| function.block(b).insts.iter())
+            .any(|&inst| function.inst(inst).opcode == Opcode::StringCharOrNil));
+        let native = emit_framed(&function, 0, 0, call as *const () as u64, 0, 0, 0, 0,
+            clear as *const () as u64, None).expect("emit CHAR");
+        egcl_rt::jit::JitBuffer::new(&native.code).expect("mmap")
+    };
+    let general = emit(vec![
+        Instr::LoadLocal(0), Instr::LoadLocal(1),
+        Instr::CallNamed { sym: char_sym, nargs: 2 }, Instr::Return,
+    ], vec![], 2);
+    let run: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(general.as_ptr()) };
+    let base = string(type_id::SIMPLE_BASE_STRING, &['h', 'é', 'l', 'l', 'o']);
+    let wide = string(type_id::SIMPLE_CHARACTER_STRING, &['a', 'λ', '😀']);
+    let other = string(type_id::SIMPLE_VECTOR, &['a']);
+    let fix = EgclVal::from_fixnum;
+    let fast = [
+        (tagged(&base), fix(0), 'h'), (tagged(&base), fix(1), 'é'), (tagged(&base), fix(4), 'o'),
+        (tagged(&wide), fix(0), 'a'), (tagged(&wide), fix(1), 'λ'), (tagged(&wide), fix(2), '😀'),
+    ];
+    for (s, i, expected) in fast {
+        let mut frame = [s.0, i.0, 0, 0];
+        assert_eq!(EgclVal(run(frame.as_mut_ptr())), EgclVal::from_char(expected), "{i:?}");
+    }
+    assert_eq!(CALLS.swap(0, Ordering::Relaxed), 0, "every simple-string read stays inline");
+    assert_eq!(CLEARS.swap(0, Ordering::Relaxed), fast.len(), "each inline read resets values");
+    let slow = [
+        (tagged(&base), fix(5)), (tagged(&base), fix(-1)), (tagged(&wide), fix(3)),
+        (tagged(&base), EgclVal::from_char('a')), (tagged(&base), NIL),
+        (tagged(&other), fix(0)), (fix(3), fix(0)), (NIL, fix(0)), (T, fix(0)),
+        (EgclVal::from_char('a'), fix(0)),
+    ];
+    for (s, i) in slow {
+        let mut frame = [s.0, i.0, 0, 0];
+        assert_eq!(EgclVal(run(frame.as_mut_ptr())), EgclVal::from_char('?'), "{s:?} {i:?}");
+    }
+    assert_eq!(CALLS.swap(0, Ordering::Relaxed), slow.len(), "everything else calls CHAR");
+    assert_eq!(CLEARS.swap(0, Ordering::Relaxed), 0);
+
+    // A constant index and a constant (immediate) string.
+    let constant = emit(vec![
+        Instr::LoadLocal(0), Instr::Const(0),
+        Instr::CallNamed { sym: char_sym, nargs: 2 }, Instr::Return,
+    ], vec![fix(2)], 1);
+    let run: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(constant.as_ptr()) };
+    let mut frame = [tagged(&wide).0, 0, 0, 0];
+    assert_eq!(EgclVal(run(frame.as_mut_ptr())), EgclVal::from_char('😀'));
+    let mut frame = [tagged(&base).0, 0, 0, 0];
+    assert_eq!(EgclVal(run(frame.as_mut_ptr())), EgclVal::from_char('l'));
+    assert_eq!(CALLS.swap(0, Ordering::Relaxed), 0);
+    let immediate = emit(vec![
+        Instr::Const(0), Instr::LoadLocal(0),
+        Instr::CallNamed { sym: char_sym, nargs: 2 }, Instr::Return,
+    ], vec![NIL], 1);
+    let run: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(immediate.as_ptr()) };
+    let mut frame = [fix(0).0, 0, 0, 0];
+    assert_eq!(EgclVal(run(frame.as_mut_ptr())), EgclVal::from_char('?'));
+    assert_eq!(CALLS.swap(0, Ordering::Relaxed), 1);
+    drop((base, wide, other));
+}

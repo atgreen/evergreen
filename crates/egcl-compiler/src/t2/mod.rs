@@ -94,6 +94,7 @@ pub mod opt_gvn; // global value numbering / CSE
 pub mod opt_licm; // loop-invariant code motion
 pub mod regalloc; // regalloc2 adapter + stack maps
 pub mod speculate; // profile-guided single-type speculative lowering
+mod string_char; // inline CHAR/SCHAR/ELT fast path on simple strings
 
 // ── Machine-code emission ─────────────────────────────────────────
 pub mod emit; // MachFunc → executable x86-64 bytes

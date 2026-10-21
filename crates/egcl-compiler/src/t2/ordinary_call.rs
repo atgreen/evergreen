@@ -565,7 +565,8 @@ pub fn emit_framed_ordinary_function_with_self_call_facts(
                 | Opcode::TypeCheck | Opcode::LogAnd | Opcode::LogOr | Opcode::LogXor
                 | Opcode::LogNot | Opcode::Jump | Opcode::Brif
                 | Opcode::Car | Opcode::Cdr | Opcode::ConstHeapObj
-                | Opcode::StringByteLength | Opcode::StringAsciiCharAt | Opcode::MemoryFence => {}
+                | Opcode::StringByteLength | Opcode::StringAsciiCharAt | Opcode::StringCharOrNil
+                | Opcode::MemoryFence => {}
                 _ => return Err(EmitError::UnsupportedOp(super::op_tag(data.opcode))),
             }
         }

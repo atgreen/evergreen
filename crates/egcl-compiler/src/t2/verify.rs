@@ -44,7 +44,9 @@
 //! * **V8 layout-proof / layout-guard-contract** — `StringByteLength` and
 //!   `StringAsciiCharAt` consume the result of a `Guard` carrying
 //!   `StringLayout`; the former is a pure load (no guard, effect, or frame
-//!   state), the latter remains an ordered deopt guard.
+//!   state), the latter remains an ordered deopt guard. `StringCharOrNil`
+//!   takes any operands, answers NIL for every case it does not handle, and
+//!   so is an effectful two-operand load with no guard or frame state.
 //! * **V10 succ-exists / reducibility** — every successor block exists, and
 //!   every retreating edge targets a block that dominates its source.
 //! * **V11 invoke-shape / invoke-result** — an `Invoke` has two distinct
@@ -610,6 +612,27 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                         "V8 layout-guard-contract",
                         format!(
                             "block{bi} character load {:?} is not an effectful guard",
+                            data.opcode
+                        ),
+                    ));
+                }
+
+                // V8 — StringCharOrNil answers NIL instead of failing, so it
+                // must not carry guard or deopt state, and stays ordered after
+                // stores (effectful) without being a call or safepoint.
+                if data.opcode == Opcode::StringCharOrNil
+                    && (data.args.len() != 2
+                        || data.results.len() != 1
+                        || data.flags.guard
+                        || !data.flags.effectful
+                        || data.flags.call
+                        || data.flags.safepoint
+                        || data.frame_state.is_some())
+                {
+                    errors.push(VerifyError::new(
+                        "V8 layout-guard-contract",
+                        format!(
+                            "block{bi} {:?} is not an effectful, unguarded two-operand load",
                             data.opcode
                         ),
                     ));

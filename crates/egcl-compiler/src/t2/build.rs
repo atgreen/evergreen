@@ -540,6 +540,9 @@ struct Builder<'a> {
     /// Build exceptional cleanup predecessors before SSA sealing. Kept behind
     /// its own entry while native landing maps and cursor dispatch are wired.
     native_cleanups: bool,
+    /// `CHAR`/`SCHAR`/`ELT` calls that receive an inline simple-string path
+    /// once the CFG is complete (`string_char::admit_string_char_calls`).
+    string_char_calls: HashSet<Inst>,
 }
 
 #[derive(Clone, Copy)]
@@ -745,6 +748,7 @@ impl<'a> Builder<'a> {
             root_symbol,
             transfer_mode: false,
             native_cleanups: false,
+            string_char_calls: HashSet::new(),
         }
     }
 
@@ -816,6 +820,7 @@ impl<'a> Builder<'a> {
         self.capture_osr_entries();
         self.simplify_trivial_phis();
         admit_nil_list_loads(&mut self.f);
+        super::string_char::admit_string_char_calls(&mut self.f, &self.string_char_calls);
         Ok(self.f)
     }
 
@@ -2295,6 +2300,13 @@ impl<'a> Builder<'a> {
                         },
                         &[(IRType::TOP, ValueRepresentation::Tagged)],
                     );
+                    if !self.native_cleanups
+                        && n == 2
+                        && self.inline_options.policy_at(bcp) != InlinePolicy::NotInline
+                        && super::string_char::is_string_char_accessor(*sym)
+                    {
+                        self.string_char_calls.insert(inst);
+                    }
                     if self.native_cleanups {
                         self.finish_native_invoke(
                             block,

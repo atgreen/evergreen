@@ -676,6 +676,8 @@ unsafe extern "C" fn checked_call_published(
     target: u64,
     record: *mut egcl_compiler::t2::native_transfer::MappedCallRecord,
 ) {
+    #[cfg(test)]
+    PUBLISHED_CHECKED_CALLS.with(|count| count.set(count.get() + 1));
     unsafe {
         root_publication::published_mapped(record, || {
             if !call_lean_target(target, record) {
@@ -747,6 +749,17 @@ thread_local! {
 #[cfg(test)]
 pub(super) fn take_lean_target_calls_for_test() -> usize {
     LEAN_TARGET_CALLS.with(|count| count.replace(0))
+}
+
+#[cfg(test)]
+thread_local! {
+    static PUBLISHED_CHECKED_CALLS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Mapped named calls that left generated code for `checked_call_published`.
+#[cfg(test)]
+pub(super) fn take_published_checked_calls_for_test() -> usize {
+    PUBLISHED_CHECKED_CALLS.with(|count| count.replace(0))
 }
 
 static PUBLISHED_ENTRIES: OnceLock<Option<[root_publication::PublishedAdapter; 2]>> = OnceLock::new();

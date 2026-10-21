@@ -683,7 +683,9 @@ fn lower_inst(lo: &mut Lowering, inst: Inst) {
 
         // ── memory loads (may be effectful) ──
         Load | Car | Cdr | VecRef | PackedF64Ref => un_or_bin(lo, inst, op::LOAD, defs, uses),
-        StringByteLength | StringAsciiCharAt => lo.emit_annotated(inst, op::LOAD, defs, uses),
+        StringByteLength | StringAsciiCharAt | StringCharOrNil => {
+            lo.emit_annotated(inst, op::LOAD, defs, uses)
+        }
         // A global read/write is emitted as a c2i helper CALL
         // (c2i_load_global / c2i_store_global), which clobbers every
         // caller-saved register — modelling it as a plain load/store let the

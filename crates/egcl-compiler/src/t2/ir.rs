@@ -335,6 +335,13 @@ pub enum Opcode {
     /// Both are effectful helper calls; reads cannot be hoisted over mutation.
     EnvironmentValue,
     SetEnvironmentValue,
+    /// `(CHAR string index)` when `string` is a simple string and every byte
+    /// through `index` is ASCII: the character, or NIL for any other operand
+    /// (a non-string, a complex string, a non-fixnum or out-of-range index, a
+    /// non-ASCII prefix). Never signals, allocates or deoptimizes; the caller
+    /// branches on NIL to the real call, which supplies every other result and
+    /// error. Effectful only to keep it ordered after stores to the string.
+    StringCharOrNil,
 }
 
 impl Opcode {
