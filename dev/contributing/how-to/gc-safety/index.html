@@ -1952,6 +1952,19 @@ stress plus poisoning:</p>
 </code></pre></div>
 <p>Compare the output as well as the exit status. A value can be lost before it is
 stored and produce a quietly wrong result instead of a poisoned-pointer crash.</p>
+<p>On Linux, once the old generation reaches a quarter of the nursery's size, a
+minor collection scans only the old-generation pages the kernel reports as
+written since the previous minor collection (soft-dirty tracking). A small
+reproducer stays below that size; set <code>EGCL_GC_SOFT_DIRTY=1</code> to exercise the
+tracked scan anyway.
+A change that adds a new kind of off-heap storage reachable from a heap object
+must be traced on every minor collection, not only when its holder's page is
+written: see <code>traces_off_heap</code> in <code>crates/egcl-rt/src/gc.rs</code>. To tell a
+scanning fault from a rooting fault, rerun with <code>EGCL_GC_SOFT_DIRTY=0</code>, which
+scans the whole old generation, and with <code>EGCL_GC_VERIFY=1</code>, which checks after
+every minor collection that no older object still refers into the nursery.
+<code>EGCL_GC_REGION_LOG=1</code> prints each minor collection's scan mode, the regions it
+walked and the young references it found.</p>
 <h2 id="read-the-failure-correctly">Read the failure correctly<a class="headerlink" href="#read-the-failure-correctly" title="Permanent link">&para;</a></h2>
 <table>
 <thead>
