@@ -308,12 +308,17 @@
   `--heap-size` takes precedence over `EGCL_HEAP_SIZE`, which takes precedence
   over `EGCL_HEAP_MB`. A heap smaller than 256 MB gets a nursery of a quarter of
   the heap rather than a fixed 64 MB, and a restored image that does not fit the
-  requested heap grows it to three times the image's data instead of failing
+  requested heap grows it to three times the image's data instead of failing.
+  A size of 0 is rejected, and a heap the system cannot reserve is reported as
+  such at startup instead of panicking at the first allocation
   ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
-- When live data outgrows the heap, a minor collection signals
-  `STORAGE-CONDITION` instead of panicking with "GC minor evacuation exhausted
-  regions". Nothing moves when the survivors cannot be placed, and the program
-  can handle the condition, drop data and continue
+- When live data outgrows the heap, the program gets a `STORAGE-CONDITION`
+  instead of a panic with "GC minor evacuation exhausted regions", in
+  interpreted and compiled code alike. Nothing moves when the survivors cannot
+  be placed, and a major collection runs before the condition is signalled, so a
+  program that handles it and drops its data can continue. Compiled code that
+  has a handler, `UNWIND-PROTECT` or dynamic binding of its own active at that
+  moment can still report "invalid native transfer capture" instead
   ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
 - A `THROW` from the default form of a `&key` or `&aux` parameter to a
   `CATCH` in the interpreted caller reaches that catch. Once the caller had

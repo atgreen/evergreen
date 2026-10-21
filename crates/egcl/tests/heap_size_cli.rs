@@ -88,6 +88,106 @@ fn exhausted_heap_signals_storage_condition_and_recovers() {
     assert!(out.contains("100000"), "{out}");
 }
 
+#[test]
+fn heap_size_zero_and_unreservable_sizes_are_reported() {
+    let out = egcl(&["--heap-size", "0", "--eval", "1"], &[]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("heap size must be greater than 0"),
+        "{out:?}"
+    );
+    let out = egcl(&["--eval", "1"], &[("EGCL_HEAP_SIZE", "0")]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("heap size must be greater than 0"),
+        "{out:?}"
+    );
+    // A pebibyte is beyond any x86-64 address space, so the reservation fails
+    // on every machine. It used to panic in whatever allocated first.
+    let out = egcl(&["--heap-size", "1048576G", "--eval", "1"], &[]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cannot reserve 1125899906842624 bytes for the heap"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("panicked"), "{stderr}");
+}
+
+#[test]
+fn exhaustion_in_compiled_code_signals_storage_condition() {
+    // BUILD is called enough times to run as native code before the call that
+    // exhausts the heap. The pending signal then arrives at a poll inside
+    // native code; it surfaced as "invalid native transfer capture".
+    let build = "(defun build (n)
+                   (let ((l nil)) (dotimes (i n) (setq l (cons i l))) l))";
+    let warm = "(dotimes (i 20) (build 10))";
+    let program = "(print (handler-case (length (build 10000000))
+                     (storage-condition (c) (list :caught (type-of c)))))";
+    let out = stdout_of(&egcl(
+        &[
+            "--heap-size",
+            "64M",
+            "--eval",
+            build,
+            "--eval",
+            warm,
+            "--eval",
+            program,
+        ],
+        &[],
+    ));
+    assert!(out.contains("(:CAUGHT STORAGE-CONDITION)"), "{out}");
+
+    // Exhaustion while calling the compiled function from a loop, with
+    // recovery afterwards.
+    let program = "(progn
+       (print (handler-case (let ((acc nil)) (loop (push (build 100000) acc)))
+                (storage-condition (c) (list :caught (type-of c)))))
+       (print (length (build 100000))))";
+    for heap in ["16M", "64M"] {
+        let out = stdout_of(&egcl(
+            &[
+                "--heap-size",
+                heap,
+                "--eval",
+                build,
+                "--eval",
+                warm,
+                "--eval",
+                program,
+            ],
+            &[],
+        ));
+        assert!(out.contains("(:CAUGHT STORAGE-CONDITION)"), "{heap}: {out}");
+        assert!(out.contains("100000"), "{heap}: {out}");
+    }
+}
+
+#[test]
+fn heap_recovers_when_handled_data_is_dropped_in_a_small_heap() {
+    // After the handler drops the data, the old generation is garbage and the
+    // nursery holds the next large allocation's live list. A minor collection
+    // cannot place it until a major collection frees the old regions; it used
+    // to report out-of-memory again instead of collecting.
+    let program = "(progn
+       (print (handler-case
+                  (let ((l nil)) (loop (push (make-list 500 :initial-element 1) l)))
+                (storage-condition (c) (list :caught (type-of c)))))
+       (print (length (make-list 100000))))";
+    for heap in ["16M", "32M"] {
+        let out = stdout_of(&egcl(
+            &["--heap-size", heap, "--eval", program],
+            &[
+                ("EGCL_T0_T1_THRESHOLD", "4000000000"),
+                ("EGCL_OSR_THRESHOLD", "4000000000"),
+            ],
+        ));
+        assert!(out.contains("(:CAUGHT STORAGE-CONDITION)"), "{heap}: {out}");
+        assert!(out.contains("100000"), "{heap}: {out}");
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn restored_image_takes_its_heap_size_from_the_restoring_process() {

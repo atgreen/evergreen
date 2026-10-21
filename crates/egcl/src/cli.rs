@@ -43827,7 +43827,7 @@ pub fn run(args: &[String]) -> Result<i32, EgclError> {
     // `--heap-size` sizes the lazily initialized heap, ahead of EGCL_HEAP_SIZE
     // and EGCL_HEAP_MB (GitHub #471: it used to be parsed and then ignored).
     if let Some(size) = &ca.heap_size {
-        let bytes = egcl_rt::runtime::parse_size(size, "--heap-size")?;
+        let bytes = egcl_rt::gc::parse_heap_size(size, "--heap-size")?;
         if !egcl_rt::gc::set_default_heap_size(bytes) {
             eprintln!("egcl: warning: --heap-size arrived after the heap was initialized; ignored");
         }

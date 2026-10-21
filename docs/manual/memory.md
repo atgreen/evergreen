@@ -26,18 +26,31 @@ program runs. Its size comes from the first of these that is set:
 3. The older `EGCL_HEAP_MB` environment variable, a whole number of MiB.
 4. Otherwise, 512 MiB.
 
-Sizes round up to whole 1 MiB regions, with a minimum of 16 MiB. The nursery
-is a quarter of the heap, up to 64 MiB. The reservation is committed lazily, so
-a large heap costs little memory until it is used.
+Sizes round up to whole 1 MiB regions, with a minimum of 16 MiB; a size of 0
+is an error. The nursery is a quarter of the heap, up to 64 MiB.
+`--nursery-size`, `EGCL_NURSERY_SIZE` and `--tlab-size` are accepted but do not
+yet change it.
+
+The reservation is committed lazily, so memory the program never uses is not
+backed by RAM. The whole size must still be reservable: under Linux's default
+overcommit policy a heap larger than RAM plus swap is refused, and egcl stops at
+startup with "cannot reserve N bytes for the heap".
 
 A saved world restored with `--image`, or embedded in an executable, takes the
 heap size of the process that restores it, not the one that saved it. A heap
 too small for the restored data grows to three times the size of that data.
 
-When live data outgrows the heap, the allocation that needed the space signals
-`storage-condition`. The collector moves nothing in that case, and a program
-that handles the condition and drops data can continue. Restart with a larger
-`--heap-size` when the data is meant to be live.
+When live data outgrows the heap, egcl first collects the whole heap. If the
+data still does not fit, the program receives a `storage-condition` at its
+next safepoint, shortly after the allocation that needed the space. The
+collector moves nothing in that case, and a program that handles the condition
+and drops the data can continue. Restart with a larger `--heap-size` when the
+data is meant to be live.
+
+Compiled code receives the condition too. One case can still report "invalid
+native transfer capture" instead: compiled code whose own `handler-case`,
+`handler-bind`, `restart-case`, `catch`, `unwind-protect` or special binding is
+active when the heap runs out.
 
 ## Explicit collection
 

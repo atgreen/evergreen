@@ -242,7 +242,7 @@ impl RuntimeConfig {
     pub fn from_env() -> Result<Self, EgclError> {
         let heap_size = std::env::var("EGCL_HEAP_SIZE")
             .ok()
-            .map(|s| parse_size(&s, "EGCL_HEAP_SIZE"))
+            .map(|s| crate::gc::parse_heap_size(&s, "EGCL_HEAP_SIZE"))
             .transpose()?
             .unwrap_or(512 * 1024 * 1024);
         let tlab_size = std::env::var("EGCL_TLAB_SIZE")
@@ -334,7 +334,7 @@ impl RuntimeConfig {
                             "--heap-size requires an argument".into(),
                         ));
                     }
-                    self.heap_size = parse_size(&args[i + 1], "--heap-size")?;
+                    self.heap_size = crate::gc::parse_heap_size(&args[i + 1], "--heap-size")?;
                     i += 2;
                 }
                 "--tlab-size" => {
