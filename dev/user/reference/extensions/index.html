@@ -1536,6 +1536,34 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#readtables" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Readtables
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Readtables">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#map-readtable-macro-characters" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        egcl-ext:map-readtable-macro-characters
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#internal-functions" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2887,6 +2915,34 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#readtables" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Readtables
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Readtables">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#map-readtable-macro-characters" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        egcl-ext:map-readtable-macro-characters
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#internal-functions" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2925,7 +2981,7 @@
 <h1 id="operating-system-interface">Operating-system interface<a class="headerlink" href="#operating-system-interface" title="Permanent link">&para;</a></h1>
 <p>These extensions expose process state, synchronous subprocess execution,
 clocks, text encoding, package-local nicknames, funcallable instances,
-digests and cipher blocks, and atomic operations. They are in <code>EGCL-EXT</code>. Their signatures differ from some
+digests and cipher blocks, atomic operations, and readtable enumeration. They are in <code>EGCL-EXT</code>. Their signatures differ from some
 similarly named SBCL extensions; use this dictionary rather than substituting
 package names in an SBCL call.</p>
 <h2 id="environment">Environment<a class="headerlink" href="#environment" title="Permanent link">&para;</a></h2>
@@ -3276,6 +3332,53 @@ operation and the address.</p>
 none, as for a host name that did not resolve. usocket's EGCL backend uses it
 to signal <code>usocket:address-in-use-error</code> and the other errno-specific
 conditions.</p>
+<h2 id="readtables">Readtables<a class="headerlink" href="#readtables" title="Permanent link">&para;</a></h2>
+<h3 id="map-readtable-macro-characters"><code>egcl-ext:map-readtable-macro-characters</code><a class="headerlink" href="#map-readtable-macro-characters" title="Permanent link">&para;</a></h3>
+<p><strong>Function</strong> <code>(egcl-ext:map-readtable-macro-characters function readtable)</code> → <code>nil</code></p>
+<p>Calls <code>function</code> with four arguments, <code>(char reader-function
+non-terminating-p dispatch-alist)</code>, once for each character that has a
+reader-macro function in <code>readtable</code>, in order of character code. A
+<code>readtable</code> of <code>nil</code> means the standard readtable.</p>
+<p><code>reader-function</code> and <code>non-terminating-p</code> are the values
+<code>get-macro-character</code> returns for <code>char</code>; for a standard macro character that
+is the same object <code>get-macro-character</code> reports, not a copy. <code>dispatch-alist</code>
+is <code>nil</code> unless <code>char</code> is a dispatching macro character. For one, it is a
+fresh list of <code>(sub-char . function)</code>, with <code>function</code> as
+<code>get-dispatch-macro-character</code> returns it, for every sub-character that has
+one. An ASCII letter is listed only in upper case, since
+<code>set-dispatch-macro-character</code> treats both cases as one. A dispatching
+character with no sub-characters also gets <code>nil</code>; call
+<code>get-dispatch-macro-character</code> once to tell it from a non-dispatching one.</p>
+<p>The function lists only what <code>get-macro-character</code> and
+<code>get-dispatch-macro-character</code> report, but never looks at every character:
+the cost depends on the number of macro characters, not on
+<code>char-code-limit</code> (1,114,112). Probing every code with <code>get-macro-character</code>
+instead, as portable libraries do, takes seconds. A character whose macro was
+removed with <code>(set-macro-character char nil)</code> is not listed.</p>
+<p>A <code>#+egcl</code> readtable iterator for named-readtables, in the shape its
+<code>%make-readtable-iterator</code> returns, needs only this function. With it,
+<code>merge-readtables-into</code> takes a few milliseconds rather than about 9 seconds:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="o">#+</span><span class="nv">egcl</span>
+<a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a><span class="p">(</span><span class="nb">defun</span><span class="w"> </span><span class="nv">%make-readtable-iterator</span><span class="w"> </span><span class="p">(</span><span class="nc">readtable</span><span class="p">)</span>
+<a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a><span class="w">  </span><span class="p">(</span><span class="k">let</span><span class="w"> </span><span class="p">((</span><span class="nv">entries</span><span class="w"> </span><span class="o">'</span><span class="p">()))</span>
+<a id="__codelineno-7-4" name="__codelineno-7-4" href="#__codelineno-7-4"></a><span class="w">    </span><span class="p">(</span><span class="nv">egcl-ext:map-readtable-macro-characters</span>
+<a id="__codelineno-7-5" name="__codelineno-7-5" href="#__codelineno-7-5"></a><span class="w">     </span><span class="p">(</span><span class="k">lambda</span><span class="w"> </span><span class="p">(</span><span class="nb">char</span><span class="w"> </span><span class="nv">reader-fn</span><span class="w"> </span><span class="nv">non-terminating-p</span><span class="w"> </span><span class="nv">alist</span><span class="p">)</span>
+<a id="__codelineno-7-6" name="__codelineno-7-6" href="#__codelineno-7-6"></a><span class="w">       </span><span class="p">(</span><span class="k">declare</span><span class="w"> </span><span class="p">(</span><span class="k">ignore</span><span class="w"> </span><span class="nv">non-terminating-p</span><span class="p">))</span>
+<a id="__codelineno-7-7" name="__codelineno-7-7" href="#__codelineno-7-7"></a><span class="w">       </span><span class="p">(</span><span class="nb">push</span><span class="w"> </span><span class="p">(</span><span class="nb">list</span><span class="w"> </span><span class="nb">char</span><span class="w"> </span><span class="nv">reader-fn</span>
+<a id="__codelineno-7-8" name="__codelineno-7-8" href="#__codelineno-7-8"></a><span class="w">                   </span><span class="p">(</span><span class="nb">or</span><span class="w"> </span><span class="p">(</span><span class="nb">and</span><span class="w"> </span><span class="nv">alist</span><span class="w"> </span><span class="no">t</span><span class="p">)</span>
+<a id="__codelineno-7-9" name="__codelineno-7-9" href="#__codelineno-7-9"></a><span class="w">                       </span><span class="p">(</span><span class="nb">handler-case</span>
+<a id="__codelineno-7-10" name="__codelineno-7-10" href="#__codelineno-7-10"></a><span class="w">                           </span><span class="p">(</span><span class="k">progn</span><span class="w"> </span><span class="p">(</span><span class="nb">get-dispatch-macro-character</span><span class="w"> </span><span class="nb">char</span><span class="w"> </span><span class="sc">#\A</span><span class="w"> </span><span class="nc">readtable</span><span class="p">)</span><span class="w"> </span><span class="no">t</span><span class="p">)</span>
+<a id="__codelineno-7-11" name="__codelineno-7-11" href="#__codelineno-7-11"></a><span class="w">                         </span><span class="p">(</span><span class="nb">error</span><span class="w"> </span><span class="p">()</span><span class="w"> </span><span class="no">nil</span><span class="p">)))</span>
+<a id="__codelineno-7-12" name="__codelineno-7-12" href="#__codelineno-7-12"></a><span class="w">                   </span><span class="nv">alist</span><span class="p">)</span>
+<a id="__codelineno-7-13" name="__codelineno-7-13" href="#__codelineno-7-13"></a><span class="w">             </span><span class="nv">entries</span><span class="p">))</span>
+<a id="__codelineno-7-14" name="__codelineno-7-14" href="#__codelineno-7-14"></a><span class="w">     </span><span class="nc">readtable</span><span class="p">)</span>
+<a id="__codelineno-7-15" name="__codelineno-7-15" href="#__codelineno-7-15"></a><span class="w">    </span><span class="p">(</span><span class="k">setq</span><span class="w"> </span><span class="nv">entries</span><span class="w"> </span><span class="p">(</span><span class="nb">nreverse</span><span class="w"> </span><span class="nv">entries</span><span class="p">))</span>
+<a id="__codelineno-7-16" name="__codelineno-7-16" href="#__codelineno-7-16"></a><span class="w">    </span><span class="p">(</span><span class="k">lambda</span><span class="w"> </span><span class="p">()</span>
+<a id="__codelineno-7-17" name="__codelineno-7-17" href="#__codelineno-7-17"></a><span class="w">      </span><span class="p">(</span><span class="k">if</span><span class="w"> </span><span class="nv">entries</span>
+<a id="__codelineno-7-18" name="__codelineno-7-18" href="#__codelineno-7-18"></a><span class="w">          </span><span class="p">(</span><span class="nb">destructuring-bind</span><span class="w"> </span><span class="p">(</span><span class="nb">char</span><span class="w"> </span><span class="nv">reader-fn</span><span class="w"> </span><span class="nv">disp?</span><span class="w"> </span><span class="nv">alist</span><span class="p">)</span><span class="w"> </span><span class="p">(</span><span class="nb">pop</span><span class="w"> </span><span class="nv">entries</span><span class="p">)</span>
+<a id="__codelineno-7-19" name="__codelineno-7-19" href="#__codelineno-7-19"></a><span class="w">            </span><span class="p">(</span><span class="nb">values</span><span class="w"> </span><span class="no">t</span><span class="w"> </span><span class="nb">char</span><span class="w"> </span><span class="nv">reader-fn</span><span class="w"> </span><span class="nv">disp?</span><span class="w"> </span><span class="nv">alist</span><span class="p">))</span>
+<a id="__codelineno-7-20" name="__codelineno-7-20" href="#__codelineno-7-20"></a><span class="w">          </span><span class="p">(</span><span class="nb">values</span><span class="w"> </span><span class="no">nil</span><span class="w"> </span><span class="no">nil</span><span class="w"> </span><span class="no">nil</span><span class="w"> </span><span class="no">nil</span><span class="w"> </span><span class="no">nil</span><span class="p">)))))</span>
+</code></pre></div>
 <h2 id="internal-functions">Internal functions<a class="headerlink" href="#internal-functions" title="Permanent link">&para;</a></h2>
 <p>These functions are implementation details used by EGCL's bootstrap and its
 bundled ASDF. Their names begin with <code>%</code>, and they may change or disappear
