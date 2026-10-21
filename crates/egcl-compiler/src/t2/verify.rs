@@ -1449,6 +1449,98 @@ mod tests {
         }));
     }
 
+    /// `block_order` is the code LAYOUT, and a pass may leave a block ahead of
+    /// one that dominates it -- `admit_nil_list_loads` does exactly that when
+    /// it splits a block twice, which is how a ppc64le T2 worker came to abort
+    /// on a missing value-map entry. Cloning an inlined callee must follow
+    /// dominance, not layout, or an edge argument gets translated before the
+    /// definition it names.
+    ///
+    /// The callee here is valid SSA: `test` dominates both arms and the join,
+    /// and both arms pass a value `test` defines. Only its layout disagrees.
+    #[test]
+    fn inlining_follows_dominance_when_the_layout_disagrees() {
+        let mut callee = Function::new("nil-armed-callee");
+        let entry = callee.entry();
+        let operand = callee.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+        // Allocated -- and so laid out -- before the block that dominates them.
+        let nil_arm = callee.make_block();
+        let cons_arm = callee.make_block();
+        let join = callee.make_block();
+        let test = callee.make_block();
+        assert_eq!(
+            callee.block_order(),
+            [entry, nil_arm, cons_arm, join, test],
+            "the regression needs the dominator laid out last"
+        );
+
+        callee.set_terminator(entry, jump(test, vec![]));
+        let (_, nil) = callee.push_inst(
+            test,
+            inst(Opcode::ConstNil),
+            &[(
+                IRType::of(TypeBits::NULL),
+                ValueRepresentation::Tagged,
+            )],
+        );
+        let (_, is_nil) = callee.push_inst(
+            test,
+            InstData {
+                args: vec![operand, nil[0]],
+                ..inst(Opcode::GenericEq)
+            },
+            &[(IRType::TOP, ValueRepresentation::Tagged)],
+        );
+        callee.set_terminator(
+            test,
+            InstData {
+                args: vec![is_nil[0]],
+                targets: vec![
+                    BlockCall {
+                        block: nil_arm,
+                        args: vec![],
+                    },
+                    BlockCall {
+                        block: cons_arm,
+                        args: vec![],
+                    },
+                ],
+                ..inst(Opcode::Brif)
+            },
+        );
+        let merged = callee.add_block_param(join, IRType::TOP, ValueRepresentation::Tagged);
+        // Both arms name `nil`, which `test` defines: the forward reference
+        // that layout-order cloning could not resolve.
+        callee.set_terminator(nil_arm, jump(join, vec![nil[0]]));
+        callee.set_terminator(cons_arm, jump(join, vec![nil[0]]));
+        callee.set_terminator(join, ret(vec![merged]));
+        for index in 0..callee.num_insts() {
+            callee
+                .inst_mut(crate::t2::ir::Inst(index as u32))
+                .source_pos = 0;
+        }
+        assert!(verify(&callee).is_ok(), "callee: {:?}", verify(&callee));
+
+        let mut caller = Function::new("nil-armed-caller");
+        let caller_entry = caller.entry();
+        let input = caller.add_block_param(caller_entry, IRType::TOP, ValueRepresentation::Tagged);
+        let (call, result) = caller.push_inst(
+            caller_entry,
+            InstData {
+                args: vec![input],
+                aux: AuxData::CallTarget(11),
+                source_pos: 0,
+                ..inst(Opcode::Call)
+            },
+            &[(IRType::TOP, ValueRepresentation::Tagged)],
+        );
+        caller.set_terminator(caller_entry, ret(result));
+        caller
+            .inline_call(call, &callee, &[])
+            .expect("a callee whose layout is not reverse postorder still inlines");
+        assert!(verify(&caller).is_ok(), "caller: {:?}", verify(&caller));
+    }
+
     // ── Positive: a valid single-block function verifies clean ──────────
 
     #[test]

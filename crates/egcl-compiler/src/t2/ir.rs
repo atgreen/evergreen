@@ -1040,15 +1040,32 @@ impl Function {
 
         // Allocate the cloned CFG and bind the callee entry parameters to the
         // caller's SSA arguments. Other block parameters are cloned normally.
+        //
+        // REVERSE POSTORDER, not `block_order`. Cloning needs every definition
+        // mapped before the operand that reads it, and `block_order` is only
+        // the code LAYOUT -- a pass is free to leave a block ahead of one that
+        // dominates it. `admit_nil_list_loads` does exactly that when it splits
+        // a block twice: the second split's test block lands after the first
+        // split's arms, which it dominates, so the NIL arm's edge argument was
+        // read before its `ConstNil` had been cloned and the T2 worker thread
+        // panicked on a missing map entry (bliss, found on ppc64le -- x86-64
+        // never reached it because only the non-x86 builder path inlines).
+        // Dominance guarantees reverse postorder puts a definition first, so
+        // this order is correct whatever layout a pass leaves behind.
+        //
+        // Unreachable callee blocks are absent from reverse postorder and so
+        // are simply not cloned: nothing can target them, and copying them
+        // would leave terminator-less blocks in the caller.
+        let clone_order = callee.reverse_postorder();
         let mut block_map: HashMap<Block, Block> = HashMap::new();
-        for &old in callee.block_order() {
+        for &old in &clone_order {
             block_map.insert(old, self.make_block());
         }
         let mut value_map: HashMap<Value, Value> = HashMap::new();
         for (&param, &arg) in callee_entry_params.iter().zip(&call_data.args) {
             value_map.insert(param, arg);
         }
-        for &old_block in callee.block_order() {
+        for &old_block in &clone_order {
             if old_block == callee.entry() {
                 continue;
             }
@@ -1104,12 +1121,43 @@ impl Function {
             }
         }
 
-        // Clone in block order. SSA definitions precede their uses, so the
-        // value map is complete whenever an operand is encountered.
-        for &old_block in callee.block_order() {
+        // Clone in reverse postorder (see `clone_order` above), so the value
+        // map is complete whenever an operand is encountered. Every lookup
+        // below still reports a miss instead of indexing: a malformed callee
+        // must decline this inline, not abort the compiler thread.
+        for &old_block in &clone_order {
             let new_block = block_map[&old_block];
             for &old_inst in &callee.block(old_block).insts {
                 let old = callee.inst(old_inst);
+                // Reverse postorder maps every dominating definition before the
+                // operand that reads it, so a miss here means the callee is not
+                // the shape cloning requires. Decline the inline -- build.rs
+                // turns the error into `BuildError::Unsupported` and discards
+                // this half-built function, leaving the caller at its current
+                // tier -- rather than index the map and abort the T2 worker.
+                // An Invoke's own results may appear on its normal edge, and
+                // are mapped right after it is created, so they count as read.
+                let mapped = |v: &Value| value_map.contains_key(v) || old.results.contains(v);
+                let mut unmapped = old.args.iter().any(|v| !mapped(v))
+                    || old
+                        .targets
+                        .iter()
+                        .flat_map(|target| &target.args)
+                        .any(|v| !mapped(v));
+                if let Some(state) = old.frame_state.map(|id| callee.frame_states.get(id)) {
+                    unmapped |= state
+                        .scopes
+                        .iter()
+                        .flat_map(|scope| scope.locals.iter().chain(&scope.stack))
+                        .chain(state.remat.iter().flat_map(|recipe| &recipe.inputs))
+                        .any(|source| match source {
+                            ValueSource::Value { value, .. } => !mapped(value),
+                            _ => false,
+                        });
+                }
+                if unmapped {
+                    return Err("inline callee reads a value before its definition");
+                }
                 if old.opcode == Opcode::Return {
                     let returned = value_map[&old.args[0]];
                     self.set_terminator(
