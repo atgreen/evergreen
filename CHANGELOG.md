@@ -76,6 +76,16 @@
   creator, such as `(lambda (x &key (off base)) ...)`, no longer signals
   `UNBOUND-VARIABLE` when the creator is compiled
   ([#494](https://github.com/atgreen/evergreen/pull/494)).
+- A closure whose creator has not been compiled -- a function called only
+  once, such as `(defun outer (x) (let ((k 3)) (lambda (y) (+ x y k))))`, or
+  a toplevel `LET` that installs a wrapper with `(setf (symbol-function 'f)
+  ...)` -- is now compiled itself once it has been called a few times, and
+  can then reach native code and the optimizing tier. Such closures used to
+  run in the interpreter however hot they became, and
+  `EGCL-EXT:FUNCTION-TIER` returned `NIL` for them. A closure that calls a
+  local function of its creator's `FLET` or `LABELS`, or that sees a local
+  `SPECIAL` declaration, still runs in the interpreter
+  ([#497](https://github.com/atgreen/evergreen/pull/497)).
 - A minor collection's pause no longer grows with the old generation on
   Linux. To find references into the nursery the collector traced every
   older object twice per minor collection, about 3-5 ms per MB of live
