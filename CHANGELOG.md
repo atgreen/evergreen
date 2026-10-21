@@ -61,6 +61,17 @@
 
 ### Performance
 
+- Linux AArch64 compiles more code natively. Its optimising compiler refused
+  the type predicates (`TYPEP`, `SYMBOLP`, `INTEGERP`, `STRINGP`,
+  `HASH-TABLE-P`), `LENGTH` on a simple string, memory fences, and the
+  unreachable path after a call that never returns; its baseline compiler
+  refused closure creation, memory fences, one of the two conditional
+  branches, and the result check a declared `FTYPE` ends in. A refused
+  operation does not merely run slowly -- it costs the WHOLE function its
+  native code, so a declared return type or a single closure kept a function
+  interpreted. Over the tier-differential corpus, 75 functions now reach the
+  optimising tier where 59 did. Numeric code also stops saving and reloading
+  values the collector can never move around each runtime call ([#501](https://github.com/atgreen/evergreen/pull/501)).
 - On x86-64 Linux, interpreted code calling a function that has been compiled
   to native code no longer pays for a system call on every call: the runtime
   asked the kernel for the thread's shadow-stack status each time it entered
@@ -294,6 +305,18 @@
 
 ### Fixed
 
+- Deep recursion no longer signals a spurious `STORAGE-CONDITION` on Linux
+  AArch64. That target used a 512 KiB control stack, the fallback for
+  platforms without native compilation, although its native frames are the
+  largest of any supported target. Recursion overflowed somewhere between
+  5,000 and 10,000 deep, where x86-64 and IBM Z manage 50,000; AArch64 now
+  gets the same 4 MiB they do. `EGCL_STACK_SIZE` still overrides it, and the
+  mapping stays lazy, so untouched pages cost no resident memory ([#501](https://github.com/atgreen/evergreen/pull/501)).
+- `EGCL_T2_LOG` and the `compile` trace now say why the AArch64 compilers
+  refused a function. Every refusal shared one opaque code, so the log named
+  neither the operation nor the place that declined it; a decline now names
+  the refused operation, or the exact emitter line for a shape peculiar to
+  that target ([#501](https://github.com/atgreen/evergreen/pull/501)).
 - Compiled code no longer returns stale multiple values from a form that
   yields one value. When one arm of an `IF`, `WHEN`, `UNLESS` or `AND` could
   return several values and the other could not, the single-valued arm
