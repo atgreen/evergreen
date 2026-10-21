@@ -263,7 +263,7 @@
   package, an escaped colon right after a single package marker is part of the
   name: `GQ:|:X|`, which is how an exported symbol named `":X"` prints, reads
   back as that symbol instead of as `GQ::X`
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#493](https://github.com/atgreen/evergreen/pull/493)).
 - A `THROW` from the default form of a `&key` or `&aux` parameter to a
   `CATCH` in the interpreted caller reaches that catch. Once the caller had
   been called a few times, the throw escaped as an internal error such as
