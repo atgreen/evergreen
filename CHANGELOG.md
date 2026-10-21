@@ -107,7 +107,7 @@
   0.9 us net of the loop, about half its 1.7 us cost with `KW` left
   interpreted. `CHAR` itself, which is defined with `ELT`, is cheaper to call
   from interpreted code once compiled than left interpreted
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#506](https://github.com/atgreen/evergreen/pull/506)).
 - On x86-64 Linux, a closure that reads or sets variables captured from the
   function or `LET` that created it -- `(lambda (y) (+ x y k))`, a counter's
   `(lambda () (incf n))`, or a wrapper such as `(lambda (&rest a) (apply
