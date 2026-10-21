@@ -126,11 +126,15 @@ fn environment_variables_map_to_runtime_config_and_defaults() {
             assert_eq!(cfg.heap_size, 512 * 1024 * 1024);
             assert_eq!(cfg.nursery_size, 64 * 1024 * 1024);
             assert_eq!(cfg.tlab_size, 2 * 1024 * 1024);
-            // Linux x86-64 mapped frames and s390x's earlier native fallback
-            // need managed stack capacity for ordinary deep recursion.
+            // Linux x86-64 mapped frames, and the larger native frames of
+            // s390x and AArch64, need managed stack capacity for ordinary
+            // deep recursion. Keep this in step with
+            // `egcl_rt::thread::DEFAULT_STACK_SIZE`, which is crate-private
+            // and so cannot be named from here.
             let default_stack = if cfg!(any(
                 target_arch = "s390x",
-                all(target_arch = "x86_64", target_os = "linux")
+                all(target_arch = "x86_64", target_os = "linux"),
+                all(target_arch = "aarch64", target_os = "linux")
             )) {
                 4 * 1024 * 1024
             } else {
