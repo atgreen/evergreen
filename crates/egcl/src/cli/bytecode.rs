@@ -13752,19 +13752,7 @@ fn compile_defun(
     let mut captures = std::collections::HashSet::new();
     if let Some(frame) = closure_captured_env(*function) {
         compile_env.frame = Arc::clone(&frame);
-        let mut current = Some(frame);
-        while let Some(frame) = current {
-            let frame = frame.borrow();
-            captures.extend(
-                frame.vars.keys().filter(|name| !is_special_name(name)).cloned(),
-            );
-            captures.extend(
-                frame.symbol_vars.keys()
-                    .map(|&index| sym_name(EgclVal::from_symbol_index(index)))
-                    .filter(|name| !is_special_name(name)),
-            );
-            current = frame.parent.clone();
-        }
+        captures = frame_capture_names(frame);
     }
     egcl_rt::rooted_ref!(_compile_env_root = &mut compile_env);
     let empty = std::collections::HashSet::new();
@@ -13863,6 +13851,118 @@ fn compile_defun(
             false
         }
     }
+}
+
+/// The lexical (non-special) names visible through a captured heap frame chain:
+/// a body compiled against that frame reaches each of them through the frame.
+fn frame_capture_names(frame: Arc<SharedCell<EnvFrame>>) -> std::collections::HashSet<String> {
+    let mut captures = std::collections::HashSet::new();
+    let mut current = Some(frame);
+    while let Some(frame) = current {
+        let frame = frame.borrow();
+        captures.extend(frame.vars.keys().filter(|name| !is_special_name(name)).cloned());
+        captures.extend(
+            frame.symbol_vars.keys()
+                .map(|&index| sym_name(EgclVal::from_symbol_index(index)))
+                .filter(|name| !is_special_name(name)),
+        );
+        current = frame.parent.clone();
+    }
+    captures
+}
+
+/// Compile a hot tree-walker closure `(EGCL::CLOSURE . id)` to bytecode and
+/// reify it as a callable object under a fresh private symbol (bliss-wojl9).
+///
+/// A closure made by a creator that has not been compiled yet (lazy
+/// compilation leaves a once-called DEFUN, and every toplevel form, in the
+/// tree-walker) is a tree-walker closure, so it never reached the tiering
+/// ladder however hot it was. Its captured variables live in a heap
+/// `EnvFrame`, which is exactly the representation a bytecode closure created
+/// by `MakeClosure` with a captured environment uses, so the body compiles
+/// against that frame with every visible lexical as a capture (as for a DEFUN
+/// inside a LET) and the result is the same kind of object a compiled creator
+/// would have returned. `compile_env` must already carry the closure's own
+/// lexical function namespace and frame. `blocks`/`tags` are the closure's
+/// lexically enclosing exit points: a RETURN-FROM or GO to one of them lowers
+/// to the named transfer and resolves against the snapshot registered here.
+pub(super) fn compile_tree_closure(
+    label: &str,
+    mut lambda_list: EgclVal,
+    mut body: EgclVal,
+    compile_env: &Env,
+    frame: Arc<SharedCell<EnvFrame>>,
+    blocks: &[(String, String)],
+    tags: &[(String, String)],
+) -> Option<EgclVal> {
+    if cfg!(egcl_no_tree_walker) {
+        return None;
+    }
+    egcl_rt::rooted_ref!(_lambda_list_root = &mut lambda_list);
+    egcl_rt::rooted_ref!(_body_root = &mut body);
+    let captures = frame_capture_names(Arc::clone(&frame));
+    let enclosing_blocks: std::collections::HashSet<String> =
+        blocks.iter().map(|(name, _)| name.clone()).collect();
+    let enclosing_tags: std::collections::HashSet<String> =
+        tags.iter().map(|(name, _)| name.clone()).collect();
+    let empty = std::collections::HashSet::new();
+    let compile = |portable| {
+        compile_function_in(
+            label,
+            lambda_list,
+            body,
+            compile_env,
+            &std::collections::HashMap::new(),
+            portable,
+            false,
+            &enclosing_blocks,
+            &enclosing_tags,
+            &empty,
+            &captures,
+            None,
+        )
+    };
+    // As for a lazily compiled DEFUN: the opportunistic lowering first, and
+    // the complete (portable) lowering when that left nested callbacks to the
+    // host evaluator or bailed.
+    reset_last_bail_reason();
+    let compiled: Option<Arc<BytecodeFunction>> = match compile(false) {
+        Some(fast) if contains_host_eval(&fast) => {
+            let fast = Arc::new(fast);
+            egcl_rt::rooted!(_fast_root = ActiveBytecodeRoot::new(&fast));
+            reset_last_bail_reason();
+            Some(compile(true).map(Arc::new).unwrap_or(fast))
+        }
+        Some(fast) => Some(Arc::new(fast)),
+        None => {
+            reset_last_bail_reason();
+            compile(true).map(Arc::new)
+        }
+    };
+    let Some(bf) = compiled.filter(|function| !contains_load_time_values(function)) else {
+        log_not_compiled(
+            label,
+            last_bail_reason().as_deref().unwrap_or("bytecode lowering bailed; no reason recorded"),
+        );
+        return None;
+    };
+    egcl_rt::rooted!(_bytecode_root = ActiveBytecodeRoot::new(&bf));
+    let sym = egcl_rt::symbols::make_uninterned("CLOSURE");
+    let sym_idx = sym.as_symbol_index();
+    closure_bodies().borrow_mut().insert(sym_idx, Arc::clone(&bf));
+    registry_put(sym_idx, Arc::clone(&bf));
+    closure_envs().borrow_mut().insert(sym_idx, frame);
+    if !blocks.is_empty() || !tags.is_empty() {
+        closure_controls()
+            .borrow_mut()
+            .insert(sym_idx, (blocks.to_vec(), tags.to_vec()));
+    }
+    // Keep the source as the object's fallback body, as a reified method does.
+    let function = egcl_rt::function::alloc_interpreted(lambda_list, body, NIL, sym);
+    // The tiering counters are found through the private symbol's function
+    // cell (see compile_and_reify_lambda); nothing can name the symbol.
+    egcl_rt::symbols::set_symbol_function(sym_idx, function);
+    Some(function)
 }
 
 fn contains_load_time_values(function: &BytecodeFunction) -> bool {

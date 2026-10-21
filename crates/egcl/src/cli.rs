@@ -9435,6 +9435,10 @@ fn scan_evaluator_roots(visit: &mut dyn FnMut(*mut EgclVal), root_definitions: b
         for value in generic_wrapper_cache().borrow_mut().values.values_mut() {
             visit(value);
         }
+        // Compiled forms of hot tree-walker closures (bliss-wojl9).
+        for tier in TREE_CLOSURE_TIERS.borrow_mut().values_mut() {
+            visit(&mut tier.compiled);
+        }
         MACROEXPAND_ENVIRONMENTS.scan(|environments| {
             for environment in environments.borrow_mut().values_mut() {
                 environment.visit_gc_roots(visit);
@@ -12307,6 +12311,105 @@ fn register_tree_closure(mut closure: Closure) -> EgclVal {
     *reference
 }
 
+/// Tiering state of one tree-walker closure (bliss-wojl9): calls counted so
+/// far, and once `settled`, the compiled object its calls dispatch to (NIL when
+/// compilation declined, so it is not retried on every call).
+#[derive(Clone, Copy)]
+struct TreeClosureTier {
+    calls: u32,
+    settled: bool,
+    compiled: EgclVal,
+}
+
+/// Keyed by closure id like the closure registry and pruned with it; each
+/// `compiled` object is visited by the global evaluator root scanner.
+static TREE_CLOSURE_TIERS: LazyLock<SharedCell<HashMap<u64, TreeClosureTier, egcl_rt::fxhash::FxBuildHasher>>> =
+    LazyLock::new(|| SharedCell::new(HashMap::default()));
+
+/// The compiled object behind a hot tree-walker closure, compiling it on the
+/// call that reaches the lazy-compile threshold.
+///
+/// Under lazy compilation a closure created by a creator that has not been
+/// compiled yet -- a once-called DEFUN, or any toplevel LET -- is a tree-walker
+/// closure `(EGCL::CLOSURE . id)`, which never reached bytecode and so never
+/// T1/T2 however hot it became. Compiling its LAMBDA against its captured heap
+/// frame yields the same kind of closure a compiled creator returns; later
+/// calls of the cons dispatch to it. A closure is compiled only when it is
+/// self-contained: no local SPECIAL declarations, and no captured FLET/LABELS
+/// namespace (a compiled named call cannot reach a tree-walker local function).
+fn tree_closure_tier_up(id: u64, env: &Env) -> Option<EgclVal> {
+    // The forced tree-walker (the differential oracle) never compiles.
+    if cfg!(egcl_no_tree_walker)
+        || bytecode::profiling_disabled()
+        || !bytecode::backend_is_bytecode()
+    {
+        return None;
+    }
+    {
+        let mut tiers = TREE_CLOSURE_TIERS.borrow_mut();
+        let entry = tiers.entry(id).or_insert(TreeClosureTier {
+            calls: 0,
+            settled: false,
+            compiled: NIL,
+        });
+        if entry.settled {
+            return (!entry.compiled.is_nil()).then_some(entry.compiled);
+        }
+        entry.calls += 1;
+        if entry.calls < bytecode::lazy_compile_threshold() {
+            return None;
+        }
+        // Claim the single compile attempt before releasing the table.
+        entry.settled = true;
+    }
+    let mut closure = env.closures.borrow().get(&id).cloned()?;
+    egcl_rt::rooted_ref!(_closure_root = &mut closure);
+    let funs = closure.captured_funs.clone()?;
+    if !closure.captured_specials.is_empty() || !funs.borrow().is_empty() {
+        return None;
+    }
+    let mut compile_env = env.clone();
+    egcl_rt::rooted_ref!(_compile_env_root = &mut compile_env);
+    compile_env.frame = Arc::clone(&closure.captured_frame);
+    compile_env.funs = funs;
+    compile_env.locally_specials = Vec::new();
+    // Local macros are lexical to the CALLER, not to the closure.
+    compile_env.macros = Rc::new(RefCell::new(HashMap::new()));
+    compile_env.symbol_macros = Rc::new(RefCell::new(HashMap::new()));
+    compile_env.block_stack = closure.captured_blocks.clone();
+    compile_env.tag_stack = closure.captured_tags.clone();
+    egcl_rt::rooted!(
+        compiled = bytecode::compile_tree_closure(
+            "<lambda>",
+            closure.params_form,
+            closure.body,
+            &compile_env,
+            Arc::clone(&closure.captured_frame),
+            &closure.captured_blocks,
+            &closure.captured_tags,
+        )?
+    );
+    if let Some(entry) = TREE_CLOSURE_TIERS.borrow_mut().get_mut(&id) {
+        entry.compiled = *compiled;
+    }
+    Some(*compiled)
+}
+
+/// The compiled object a tree-walker closure (or a reified one installed in a
+/// function cell) now dispatches to, if it has been compiled.
+fn tree_closure_compiled(val: EgclVal) -> Option<EgclVal> {
+    let source = reified_closure(val).unwrap_or(val);
+    if !is_closure_cons(source) {
+        return None;
+    }
+    let id = cp(source).1.as_fixnum() as u64;
+    TREE_CLOSURE_TIERS
+        .borrow()
+        .get(&id)
+        .map(|entry| entry.compiled)
+        .filter(|compiled| !compiled.is_nil())
+}
+
 thread_local! {
     /// Registry size at the last closure prune (amortized doubling trigger).
     static LAST_CLOSURE_PRUNE_LEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -12358,6 +12461,7 @@ fn prune_closure_registry() -> (usize, usize) {
         let reg = closure_registry();
         let before = reg.borrow().len();
         reg.borrow_mut().retain(|id, _| live.contains(id));
+        TREE_CLOSURE_TIERS.borrow_mut().retain(|id, _| live.contains(id));
         let after = reg.borrow().len();
         Some((before, after, live.len()))
     });
@@ -26061,7 +26165,15 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 let (f_form, _) = cp(cdr);
                 let d = eval_form(f_form, env)?;
                 bytecode::poll_background_compilation();
-                return Ok(resolve_tiered_fn(d)
+                // A tree-walker closure (or the reified object installed for
+                // one) runs as the object it compiled to (bliss-wojl9).
+                let compiled = tree_closure_compiled(d).or_else(|| {
+                    d.is_symbol()
+                        .then(|| global_fn(&sym_name(d)))
+                        .flatten()
+                        .and_then(tree_closure_compiled)
+                });
+                return Ok(compiled.or_else(|| resolve_tiered_fn(d))
                     .map(|f| {
                         let own = egcl_rt::function::tier(f) as i64;
                         let shared = bytecode::installed_closure_tier(f).map_or(0, i64::from);
@@ -40098,6 +40210,13 @@ fn apply_function_impl(
                 && let Some(res) = call_direct_builtin(slot, args, env)
             {
                 return res;
+            }
+            // A hot closure runs compiled from here on (bliss-wojl9). Builtin
+            // wrappers keep their by-name trampoline above.
+            if builtin_sym.is_none()
+                && let Some(compiled) = tree_closure_tier_up(id, env)
+            {
+                return apply_function_impl(compiled, args, env);
             }
             let closure = { env.closures.borrow().get(&id).cloned() };
             if let Some(closure) = closure {
