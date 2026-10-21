@@ -43445,11 +43445,12 @@ impl SavedCore {
     }
 
     fn load(&self, env: &mut Env) -> Result<(), EgclError> {
-        load_core_image(&self.file, self.offset, self.len, env)?;
+        // The embedded set goes first: restoring the core reopens the
+        // libraries it had loaded, and an embedded one is found only there.
         if let Some((archive, manifest)) = &self.archive {
             egcl_rt::ffi::embedded::install_archive(&self.file, archive, manifest)?;
         }
-        Ok(())
+        load_core_image(&self.file, self.offset, self.len, env)
     }
 }
 

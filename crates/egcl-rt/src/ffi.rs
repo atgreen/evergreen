@@ -11,6 +11,7 @@ use crate::value::EgclVal;
 
 pub mod embedded;
 pub mod memory;
+mod registry;
 
 #[cfg(all(egcl_tsan, not(feature = "c-ffi")))]
 mod tsan_mmap;
@@ -750,7 +751,7 @@ mod elf_backend {
         relocation::RelocationArch,
         tls::TlsResolver,
     };
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     /// A loaded foreign library, type-erased so the registry need not carry
     /// elf_loader's generic parameters.
@@ -773,9 +774,19 @@ mod elf_backend {
         }
     }
 
-    /// Non-reused 1-based tokens. Closed entries remain empty, so a stale token
-    /// cannot accidentally resolve into a later library.
-    static LIBS: Mutex<Vec<Option<Arc<dyn ForeignLib>>>> = Mutex::new(Vec::new());
+    /// Non-reused 1-based tokens; see `registry`.
+    static LIBS: super::registry::LibraryRegistry<Arc<dyn ForeignLib>> =
+        super::registry::LibraryRegistry::new();
+
+    /// The image record of the open libraries, in load order.
+    pub(crate) fn saved_library_names() -> Vec<Option<String>> {
+        LIBS.saved_names()
+    }
+
+    /// Reopen an image's libraries into their saved tokens.
+    pub(crate) fn restore_libraries(names: Vec<Option<String>>) {
+        LIBS.restore(names, open_library);
+    }
 
     /// Host symbols a loaded library may import from us — statically linked into
     /// this binary from musl. Deliberately minimal (the libc surface plugins
@@ -850,6 +861,11 @@ mod elf_backend {
     /// Load a shared library by path with `elf_loader`, resolving its undefined
     /// symbols against the host and running its constructors.
     pub fn load_foreign_library(name: &str) -> Result<*mut (), EgclError> {
+        let library = open_library(name)?;
+        Ok(LIBS.insert(name, library))
+    }
+
+    fn open_library(name: &str) -> Result<Arc<dyn ForeignLib>, EgclError> {
         if super::embedded::is_embedded(name) {
             return Err(EgclError::FfiError(format!(
                 "'{name}' is an embedded foreign library, which this build cannot load yet; \
@@ -881,9 +897,7 @@ mod elf_backend {
             .relocate::<()>()
             .map_err(|e| EgclError::FfiError(format!("cannot link '{name}': {e}")))?;
         // relocate() already ran the library's DT_INIT_ARRAY constructors.
-        let mut libs = LIBS.lock().unwrap();
-        libs.push(Some(Arc::new(lib)));
-        Ok(libs.len() as *mut ()) // 1-based handle
+        Ok(Arc::new(lib))
     }
 
     /// Look up a symbol in a previously loaded library.
@@ -900,13 +914,7 @@ mod elf_backend {
                 "symbol name contains null byte".into(),
             ));
         }
-        let lib = LIBS
-            .lock()
-            .unwrap()
-            .get(handle - 1)
-            .and_then(Option::as_ref)
-            .cloned()
-            .ok_or_else(|| EgclError::FfiError("invalid or closed library handle".into()))?;
+        let lib = LIBS.get(library)?;
         let symbol = lib
             .symbol(name)
             .ok_or_else(|| EgclError::FfiError(format!("symbol '{name}' not found")))?;
@@ -917,14 +925,7 @@ mod elf_backend {
     /// # Safety
     /// No foreign call, callback or retained symbol may use this library after close.
     pub unsafe fn close_foreign_library(library: *mut ()) -> Result<(), EgclError> {
-        let lib = {
-            let mut libs = LIBS.lock().unwrap();
-            (library as usize)
-                .checked_sub(1)
-                .and_then(|i| libs.get_mut(i))
-                .and_then(Option::take)
-                .ok_or_else(|| EgclError::FfiError("invalid or closed library handle".into()))?
-        };
+        let lib = LIBS.take(library)?;
         // Dropping LoadedCore runs DT_FINI_ARRAY and releases its mappings.
         // Never hold the registry lock while arbitrary C destructors execute.
         drop(lib);
@@ -940,7 +941,7 @@ mod elf_backend {
                 "symbol name contains null byte".into(),
             ));
         }
-        let libs: Vec<_> = LIBS.lock().unwrap().iter().flatten().cloned().collect();
+        let libs = LIBS.open_libraries();
         for lib in libs {
             if let Some(symbol) = lib.symbol(name) {
                 super::remember_foreign_symbol(symbol, name);
@@ -965,6 +966,12 @@ mod elf_backend {
 pub use elf_backend::{
     close_foreign_library, foreign_symbol, foreign_symbol_global, load_foreign_library,
 };
+#[cfg(all(
+    unix,
+    not(feature = "c-ffi"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+use elf_backend::{restore_libraries, saved_library_names};
 
 #[cfg(all(
     unix,
@@ -998,8 +1005,30 @@ impl Drop for DynamicLibrary {
         not(any(target_arch = "x86_64", target_arch = "aarch64"))
     )
 ))]
-static DYNAMIC_LIBRARIES: std::sync::Mutex<Vec<Option<std::sync::Arc<DynamicLibrary>>>> =
-    std::sync::Mutex::new(Vec::new());
+static DYNAMIC_LIBRARIES: registry::LibraryRegistry<std::sync::Arc<DynamicLibrary>> =
+    registry::LibraryRegistry::new();
+
+#[cfg(all(
+    unix,
+    any(
+        feature = "c-ffi",
+        not(any(target_arch = "x86_64", target_arch = "aarch64"))
+    )
+))]
+fn saved_library_names() -> Vec<Option<String>> {
+    DYNAMIC_LIBRARIES.saved_names()
+}
+
+#[cfg(all(
+    unix,
+    any(
+        feature = "c-ffi",
+        not(any(target_arch = "x86_64", target_arch = "aarch64"))
+    )
+))]
+fn restore_libraries(names: Vec<Option<String>>) {
+    DYNAMIC_LIBRARIES.restore(names, open_dynamic_library);
+}
 
 /// Load a shared library by name or path.
 #[cfg(all(
@@ -1010,13 +1039,23 @@ static DYNAMIC_LIBRARIES: std::sync::Mutex<Vec<Option<std::sync::Arc<DynamicLibr
     )
 ))]
 pub fn load_foreign_library(name: &str) -> Result<*mut (), EgclError> {
+    let library = open_dynamic_library(name)?;
+    Ok(DYNAMIC_LIBRARIES.insert(name, library))
+}
+
+#[cfg(all(
+    unix,
+    any(
+        feature = "c-ffi",
+        not(any(target_arch = "x86_64", target_arch = "aarch64"))
+    )
+))]
+fn open_dynamic_library(name: &str) -> Result<std::sync::Arc<DynamicLibrary>, EgclError> {
     use std::ffi::CString;
     // An embedded library shadows the file system, as embedded files do.
     #[cfg(egcl_dlopen_embedded)]
     if let Some(handle) = embedded::open(name) {
-        let mut libraries = DYNAMIC_LIBRARIES.lock().unwrap();
-        libraries.push(Some(std::sync::Arc::new(DynamicLibrary(handle? as usize))));
-        return Ok(libraries.len() as *mut ());
+        return Ok(std::sync::Arc::new(DynamicLibrary(handle? as usize)));
     }
     #[cfg(not(egcl_dlopen_embedded))]
     if embedded::is_embedded(name) {
@@ -1043,9 +1082,7 @@ pub fn load_foreign_library(name: &str) -> Result<*mut (), EgclError> {
             name, err
         )))
     } else {
-        let mut libraries = DYNAMIC_LIBRARIES.lock().unwrap();
-        libraries.push(Some(std::sync::Arc::new(DynamicLibrary(handle as usize))));
-        Ok(libraries.len() as *mut ())
+        Ok(std::sync::Arc::new(DynamicLibrary(handle as usize)))
     }
 }
 
@@ -1061,16 +1098,7 @@ pub fn load_foreign_library(name: &str) -> Result<*mut (), EgclError> {
     )
 ))]
 pub unsafe fn foreign_symbol(library: *mut (), name: &str) -> Result<*const (), EgclError> {
-    if library.is_null() {
-        return Err(EgclError::FfiError("null library handle".into()));
-    }
-    let library = DYNAMIC_LIBRARIES
-        .lock()
-        .unwrap()
-        .get(library as usize - 1)
-        .and_then(Option::as_ref)
-        .cloned()
-        .ok_or_else(|| EgclError::FfiError("invalid or closed library handle".into()))?;
+    let library = DYNAMIC_LIBRARIES.get(library)?;
     // SAFETY: the Arc retains a live dlopen reference through lookup.
     unsafe { dynamic_symbol(library.0 as *mut libc::c_void, name) }
 }
@@ -1116,14 +1144,7 @@ unsafe fn dynamic_symbol(library: *mut libc::c_void, name: &str) -> Result<*cons
     )
 ))]
 pub unsafe fn close_foreign_library(library: *mut ()) -> Result<(), EgclError> {
-    let library = {
-        let mut libraries = DYNAMIC_LIBRARIES.lock().unwrap();
-        (library as usize)
-            .checked_sub(1)
-            .and_then(|i| libraries.get_mut(i))
-            .and_then(Option::take)
-            .ok_or_else(|| EgclError::FfiError("invalid or closed library handle".into()))?
-    };
+    let library = DYNAMIC_LIBRARIES.take(library)?;
     // Destructors can reenter the loader, so release the registry lock first.
     drop(library);
     Ok(())
@@ -1160,6 +1181,21 @@ mod windows;
 pub use windows::{
     close_foreign_library, foreign_symbol, foreign_symbol_global, load_foreign_library,
 };
+#[cfg(windows)]
+use windows::{restore_libraries, saved_library_names};
+
+/// The image section recording every library a restored image must reopen.
+pub(crate) fn serialize_foreign_libraries() -> Vec<u8> {
+    registry::encode_names(&saved_library_names())
+}
+
+/// Reopen, in load order, the libraries a saved image recorded, so the tokens
+/// its heap holds name them again. A library that cannot be reopened leaves
+/// its token dead rather than failing the restore.
+pub(crate) fn restore_foreign_libraries(bytes: &[u8]) -> Result<(), EgclError> {
+    restore_libraries(registry::decode_names(bytes)?);
+    Ok(())
+}
 
 /// Cold symbolization of an active outbound call. The lookup itself is lock-free
 /// and loader-independent; returned text is owned so historical snapshots never

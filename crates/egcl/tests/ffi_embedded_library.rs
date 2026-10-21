@@ -435,3 +435,49 @@ fn a_library_loaded_from_disk_and_then_embedded_still_loads() {
     assert_eq!(out.matches("DEP 41").count(), 2, "{out}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A handle to an embedded library, saved in a core archive, is reopened from
+/// the archive at restore (GitHub #440): the embedded set is installed before
+/// the core reopens its libraries.
+#[test]
+fn a_saved_handle_to_an_embedded_library_is_reopened_from_the_archive() {
+    if !dlopen_backend() {
+        return;
+    }
+    let dir = scratch("handle");
+    let (dep, main) = build_libraries(&dir.join("lib"));
+    let core = dir.join("app.core");
+    let output = egcl(
+        Path::new(env!("CARGO_BIN_EXE_egcl")),
+        &format!(
+            r#"(progn
+                 (egcl-ffi:embed-foreign-library {dep:?})
+                 (egcl-ffi:embed-foreign-library {main:?} :names '("egclmain"))
+                 (defvar *main* (egcl-ffi:load-foreign-library "egclmain"))
+                 (egcl-ext:save-lisp-and-die {core:?}))"#
+        ),
+    );
+    assert!(output.status.success(), "{}", text(&output));
+    std::fs::remove_dir_all(dir.join("lib")).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_egcl"))
+        .env(
+            "EGCL_INIT_FILE",
+            std::env::temp_dir().join("egcl-tests-nonexistent-init.lisp"),
+        )
+        .arg("--image")
+        .arg(&core)
+        .args([
+            "--no-init",
+            "--eval",
+            r#"(format t "SAVED ~d~%" (egcl-ffi:foreign-call
+                                        (egcl-ffi:foreign-symbol-pointer "main_value" *main*)
+                                        :int '() '()))"#,
+        ])
+        .output()
+        .expect("run egcl");
+    let out = text(&output);
+    assert!(output.status.success(), "{out}");
+    assert!(out.contains("SAVED 42"), "{out}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
