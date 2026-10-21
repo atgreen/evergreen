@@ -221,8 +221,10 @@ pub(in crate::cli::bytecode) unsafe extern "C" fn named_entry(
     image: *mut SysvTransferCapture,
 ) {
     let request = request.cast::<OrdinaryArityRequest>();
+    // The adapter's entry data is its call cell (call_table_adapter::ensure).
+    let cell = unsafe { (*request).entry_data } as u64;
     #[cfg(test)]
-    if !ordinary_primitives::is_private(unsafe { (*request).entry_data } as u32) {
+    if !ordinary_primitives::is_private(unsafe { super::super::call_table::cell_symbol(cell) }) {
         NAMED_ENTRIES.with(|count| count.set(count.get() + 1));
     }
     unsafe {
@@ -233,17 +235,19 @@ pub(in crate::cli::bytecode) unsafe extern "C" fn named_entry(
                 let control = (*execution).active_native_control() as *mut NativeRecursiveControl;
                 let result = guard_c2i(|| {
                     if native_error_pending() { return Ok(NIL); }
-                    egcl_rt::rooted!(args = Vec::new());
                     let count = (*request).nargs;
-                    args.try_reserve_exact(count).map_err(|_| EgclError::Oom)?;
-                    args.extend_from_slice(&(&(*request).register_args)[..count.min(3)]);
-                    if count > 3 {
-                        args.extend_from_slice(std::slice::from_raw_parts((*request).overflow_args, count - 3));
-                    }
+                    let registers = &(&(*request).register_args)[..count.min(3)];
+                    let overflow = if count > 3 {
+                        std::slice::from_raw_parts((*request).overflow_args, count - 3)
+                    } else {
+                        &[]
+                    };
+                    // Common arities need no heap buffer (GitHub #487).
+                    egcl_rt::rooted!(args = EntryArgs::from_parts(registers, overflow));
                     let mut poll = NativeOutcome { value: NIL, exit: NativeExit::Returned };
                     poll_or_transfer_unpublished(std::ptr::null_mut(), &mut poll);
                     if poll.exit != NativeExit::Returned { return Ok(NIL); }
-                    super::super::call_table::ordinary_call((*request).entry_data as u32, &args)
+                    super::super::call_table::ordinary_call_cell(cell, args.as_slice())
                 });
                 refresh_control(control);
                 finish(result, out);

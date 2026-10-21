@@ -38,6 +38,9 @@ mod deopt;
 #[cfg(test)]
 pub(super) use deopt::with_ordinary_guard_resume_observer_for_test;
 mod native_frames;
+mod lean_root;
+#[cfg(test)]
+pub(super) use lean_root::take_lean_root_entries_for_test;
 pub(super) mod ordinary_calls;
 pub(super) mod ordinary_primitives;
 
@@ -675,13 +678,75 @@ unsafe extern "C" fn checked_call_published(
 ) {
     unsafe {
         root_publication::published_mapped(record, || {
-            call_table::checked_call(target, record);
+            if !call_lean_target(target, record) {
+                call_table::checked_call(target, record);
+            }
             if (*record).outcome.exit == NativeExit::Returned {
                 let env = NATIVE_ENV.with(Cell::get);
                 (*record).return_values = (*env).native_return_values();
             }
         })
     }
+}
+
+/// A mapped caller's named call whose warm target is installed ordinary T2
+/// code enters that code's lean root directly, as the checked call would after
+/// `warm` and `run_native_callable` selected it (GitHub #487). Returns `false`,
+/// having done nothing, for every other target.
+///
+/// # Safety
+/// As for `checked_call_published`, whose publication must be live.
+unsafe fn call_lean_target(
+    cell: u64,
+    record: *mut egcl_compiler::t2::native_transfer::MappedCallRecord,
+) -> bool {
+    let invocation = unsafe { &*(*record).context };
+    let Some((code, function, symbol, offset)) =
+        (unsafe { call_table::lean_native_target(cell, invocation.nargs) })
+    else {
+        return false;
+    };
+    let env = NATIVE_ENV.with(Cell::get);
+    if env.is_null() {
+        return false;
+    }
+    #[cfg(test)]
+    LEAN_TARGET_CALLS.with(|count| count.set(count.get() + 1));
+    // The caller's published, scanned activation owns these argument words.
+    let args = if invocation.nargs == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(invocation.args, invocation.nargs) }
+    };
+    let result = guard_c2i(|| {
+        egcl_rt::rooted!(_active_callable_root = super::ActiveCallableRoot(symbol));
+        code.run_ordinary_root(offset, function, args, unsafe { &mut *env })
+    });
+    let value = match result {
+        Ok(value) => value,
+        Err(error) => {
+            stash_native_error(error);
+            NIL
+        }
+    };
+    unsafe {
+        (*record).outcome = NativeOutcome {
+            value,
+            exit: if native_error_pending() { NativeExit::Transfer } else { NativeExit::Returned },
+        };
+    }
+    true
+}
+
+#[cfg(test)]
+thread_local! {
+    static LEAN_TARGET_CALLS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Mapped named calls that entered an ordinary callee's lean root directly.
+#[cfg(test)]
+pub(super) fn take_lean_target_calls_for_test() -> usize {
+    LEAN_TARGET_CALLS.with(|count| count.replace(0))
 }
 
 static PUBLISHED_ENTRIES: OnceLock<Option<[root_publication::PublishedAdapter; 2]>> = OnceLock::new();
@@ -1491,6 +1556,9 @@ impl TransferCode {
     }
 
     pub(super) fn run_callable(&self, function: EgclVal, args: &[EgclVal], env: &mut Env) -> Result<EgclVal, EgclError> {
+        if let Some(offset) = self.lean_root_entry() {
+            return self.run_ordinary_root(offset, function, args, env);
+        }
         self.run_activation(args, env, None, function)
     }
 
@@ -1501,7 +1569,6 @@ impl TransferCode {
         osr: Option<OsrResume>,
         function: EgclVal,
     ) -> Result<EgclVal, EgclError> {
-        egcl_rt::rooted!(function = function);
         let osr_offset = osr.as_ref().map(|resume| resume.offset);
         // Claim both inherited owners before preparation can fail or collect.
         // Tags remain in the rooted Env; the payload owns their exact tokens.
@@ -1510,11 +1577,7 @@ impl TransferCode {
             base: osr.as_ref().map_or(env.catch_stack.len(), |resume| resume.state.catch_base),
             env,
         };
-        // Root a copy of the actuals without a heap allocation for the common
-        // arities: this runs on every interpreter-to-native call (GitHub #487).
-        egcl_rt::rooted!(entry_args = EntryArgs::new(args));
-        let args: &[EgclVal] = entry_args.as_slice();
-        egcl_rt::rooted_ref!(_env = &mut *env);
+        // Nothing collects before every value below is rooted in `roots`.
         // `bind_params` pads omitted `&optional` arguments below, and
         // `bind_variadic` parses a `&rest`/`&key` tail.
         if osr_offset.is_none() && !super::arity_accepts(&self.body, args.len()) {
@@ -1529,7 +1592,20 @@ impl TransferCode {
             Some(resume) => resume.state,
             None => ActivationState::prepare_reusing(self, env)?,
         });
-        egcl_rt::rooted_ref!(_state = &mut *state);
+        let mut children = SegmentActivations::default();
+        // One host root for the callable, a copy of the actuals (inline for
+        // common arities), the Env, the state, the child ledger and the
+        // enclosing pending error, instead of a link for each (GitHub #487).
+        egcl_rt::rooted!(roots = lean_root::EntryRoots {
+            function,
+            args: EntryArgs::new(args),
+            env,
+            state: &mut *state,
+            children: &mut children,
+            entry: None,
+        });
+        // The rooted copy stays in place; the collector updates it there.
+        let args: &[EgclVal] = unsafe { &*std::ptr::from_ref(roots.args.as_slice()) };
         let _depth = osr_offset.is_none().then(|| {
             NATIVE_DEPTH.with(|depth| depth.set(depth.get() + 1));
             NativeDepthGuard
@@ -1538,8 +1614,8 @@ impl TransferCode {
         // preparation only copies words; no native frame survives into fallback.
         let stack = egcl_rt::current_stack();
         // Optimized metadata currently owns exactly one logical definition.
-        let frame_function = if egcl_rt::function::is_interpreted_function(*function) {
-            *function
+        let frame_function = if egcl_rt::function::is_interpreted_function(roots.function) {
+            roots.function
         } else {
             self.deopt_metadata.as_ref()
                 .and_then(|metadata| metadata.deopt_bodies.keys().next().copied())
@@ -1571,7 +1647,7 @@ impl TransferCode {
             // captured one (or the caller's), shared with every closure it
             // creates. The rooted state owns it from here; an OSR destination
             // inherits it with the rest of the state (bliss-shih7.27).
-            let closure_env = closure_captured_env(*function);
+            let closure_env = closure_captured_env(roots.function);
             state.env_frame = if self.body.has_env {
                 let parent = closure_env.clone().unwrap_or_else(|| Arc::clone(&env.frame));
                 make_env_frame(&self.body, parent).or(closure_env)
@@ -1593,8 +1669,6 @@ impl TransferCode {
             env,
             scopes: &mut state.dynamic_scopes,
         };
-        let mut children = SegmentActivations::default();
-        egcl_rt::rooted_ref!(_children = &mut children);
         let mut context = state.context(self, frame, &mut children, std::ptr::null_mut());
         let _scope = BlockScopeGuard {
             env,
@@ -1606,24 +1680,15 @@ impl TransferCode {
         }
         // Nested legacy callees and other executions must not overwrite this
         // invocation's capture pointer or an enclosing pending error.
-        let mut entry = EntryGuard {
-            env: NATIVE_ENV.with(|slot| slot.replace(env)),
-            capture: CAPTURE.with(|slot| slot.replace(&mut context)),
-            error: take_native_error(),
-        };
-        egcl_rt::rooted_ref!(_entry = &mut entry);
+        let _entry = roots.enter(env, &mut context);
         // An enclosing legacy recovery PC describes its own machine frame,
         // never this one or our Rust helpers. This entry has no fault maps yet.
-        let _recovery = FaultRecoveryGuard {
-            null: egcl_rt::runtime::current_sigsegv_null_guard_recovery_ip(),
-            stack: egcl_rt::runtime::current_sigsegv_stack_guard_recovery_ip(),
-        };
-        egcl_rt::runtime::set_sigsegv_recovery_ips(0, 0);
+        let _recovery = clear_fault_recovery();
         // The segment owns a rooted EgclStack frame and all host-side
         // execution state at this point, so this is a safe entry poll: a
         // moving GC may park and scan before generated code starts. Native
         // loop/back-edge polling remains a separate emitter gate.
-        if osr_offset.is_none() {
+        if osr_offset.is_none() && !current_poll_idle() {
             egcl_rt::thread::begin_current_execution_poll();
             egcl_rt::safepoint::poll_safepoint();
             let signal_error = pending_signal_error_for_current_execution();
@@ -1640,7 +1705,7 @@ impl TransferCode {
         // through normal transfer handling, rather than skipping their cleanup.
         let _ordinary_segment = super::call_table::enter_ordinary_segment();
         let _ordinary_root = if self.needs_callable_identity() {
-            Some(_ordinary_segment.retain_root(self, *function).ok_or_else(invalid_capture)?)
+            Some(_ordinary_segment.retain_root(self, roots.function).ok_or_else(invalid_capture)?)
         } else { None };
         let outcome = if let Some(offset) = self.ordinary_entry {
             assert!(osr_offset.is_none(), "ordinary entry is not an OSR destination");
@@ -2430,7 +2495,24 @@ impl EntryArgs {
         Self { inline, len: args.len(), spill }
     }
 
-    fn as_slice(&self) -> &[EgclVal] {
+    /// The actuals `first` followed by `rest`, as one argument list.
+    pub(super) fn from_parts(first: &[EgclVal], rest: &[EgclVal]) -> Self {
+        let len = first.len() + rest.len();
+        let mut inline = [NIL; crate::cli::ROOTED_ARGS_INLINE];
+        let spill = if len <= inline.len() {
+            inline[..first.len()].copy_from_slice(first);
+            inline[first.len()..len].copy_from_slice(rest);
+            Vec::new()
+        } else {
+            let mut spill = Vec::with_capacity(len);
+            spill.extend_from_slice(first);
+            spill.extend_from_slice(rest);
+            spill
+        };
+        Self { inline, len, spill }
+    }
+
+    pub(super) fn as_slice(&self) -> &[EgclVal] {
         if self.len <= self.inline.len() { &self.inline[..self.len] } else { &self.spill }
     }
 }
@@ -2450,6 +2532,19 @@ impl egcl_rt::gc::TraceHostRoots for EntryArgs {
 struct FaultRecoveryGuard {
     null: usize,
     stack: usize,
+}
+
+/// Clear this thread's legacy fault-recovery IPs for a native entry, and
+/// restore them when the guard drops. Nearly every entry finds both clear
+/// already, and then has nothing to save or restore.
+fn clear_fault_recovery() -> Option<FaultRecoveryGuard> {
+    match egcl_rt::runtime::current_sigsegv_recovery_ips() {
+        (0, 0) => None,
+        (null, stack) => {
+            egcl_rt::runtime::set_sigsegv_recovery_ips(0, 0);
+            Some(FaultRecoveryGuard { null, stack })
+        }
+    }
 }
 impl Drop for FaultRecoveryGuard {
     fn drop(&mut self) {
@@ -3611,11 +3706,39 @@ unsafe fn prepare_osr(image: *const SysvTransferCapture) -> bool {
     true
 }
 
+/// Nothing for a poll to service: no stop-the-world or interrupt request, no
+/// poll, yield or deadline armed for this execution, no process signal it has
+/// not drained, no posted signal and no pending native error. With all of
+/// these clear, an entry or helper poll is a no-op, so the native entries and
+/// their helpers test this first (GitHub #487).
+pub(in crate::cli::bytecode) fn entry_poll_idle(
+    execution: &egcl_rt::exec_context::LispExecutionContext,
+) -> bool {
+    egcl_rt::safepoint::global_poll_idle()
+        && !execution.poll_pending()
+        && !execution.yield_requested()
+        && !egcl_rt::runtime::process_signal_activity_pending()
+        && !egcl_rt::any_posted_pending_signal()
+        && !native_error_pending()
+        && !egcl_rt::sandbox_cpu_deadline_armed()
+}
+
+/// [`entry_poll_idle`] for the current execution; `false` without one.
+pub(in crate::cli::bytecode) fn current_poll_idle() -> bool {
+    egcl_rt::thread::current_execution_context_for_native()
+        .is_some_and(|execution| entry_poll_idle(unsafe { &*execution }))
+}
+
 pub(in crate::cli::bytecode) unsafe fn poll_or_transfer_unpublished(
     request: *mut u8,
     out: *mut egcl_rt::native_transfer::NativeOutcome,
 ) {
     use egcl_rt::native_transfer::{NativeExit, NativeOutcome};
+    // Most helper polls find nothing to do; skip the drain (GitHub #487).
+    if request as usize & 1 == 0 && current_poll_idle() {
+        unsafe { out.write(NativeOutcome { value: NIL, exit: NativeExit::Returned }); }
+        return;
+    }
     // Clear before inspecting authoritative sources. An arrival during this
     // drain must remain armed; refreshing control snapshots must never clear it.
     egcl_rt::thread::begin_current_execution_poll();

@@ -135,6 +135,8 @@ fn bridge_entries() -> Option<[usize; 6]> {
 }
 
 pub(super) fn resolve(symbol: u32) -> Option<Arc<CallCell>> {
+    #[cfg(test)]
+    RESOLVES.with(|count| count.set(count.get() + 1));
     let entries = bridge_entries()?;
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     let native = super::native_transfer_entry::published_entries()?;
@@ -551,6 +553,111 @@ pub(super) fn ordinary_call(symbol: u32, args: &[EgclVal]) -> Result<EgclVal, Eg
     if cell.is_cold() { cold(state, args) } else { warm(state, args) }
 }
 
+/// [`ordinary_call`] for a named adapter that already holds its call cell, so
+/// a compiled caller reaching a builtin or interpreted target does not
+/// resolve the symbol again on every call (GitHub #487).
+///
+/// # Safety
+/// `cell` must be a live call cell of this execution.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub(super) unsafe fn ordinary_call_cell(cell: u64, args: &[EgclVal]) -> Result<EgclVal, EgclError> {
+    let state = unsafe { state(cell) };
+    if let Some(result) = super::native_transfer_entry::ordinary_primitives::invoke(state.symbol, args) {
+        return result;
+    }
+    if state.cell.is_cold() {
+        return cold(state, args);
+    }
+    // A warm builtin, as `warm` runs it, without cloning the target or
+    // rooting a callable it does not have.
+    let builtin = match *state.target.borrow() {
+        Some(Target::Builtin { slot, nargs }) if nargs == args.len() => Some(slot),
+        _ => None,
+    };
+    if let Some(slot) = builtin {
+        let env = unsafe { (*state.native_env).get() };
+        if !env.is_null() {
+            return match super::super::call_direct_builtin(slot, args, unsafe { &mut *env }) {
+                Some(result) => result,
+                None => cold(state, args),
+            };
+        }
+    }
+    warm(state, args)
+}
+
+/// What `warm` would enter for this cell when that is installed T2 code with a
+/// lean ordinary root entry (see `native_transfer_entry::lean_root`): the code,
+/// its callable, the cell's symbol and the entry offset. `None` leaves every
+/// other case, and every tier or depth decision, to `warm`.
+///
+/// # Safety
+/// As for [`ordinary_call_cell`].
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub(super) unsafe fn lean_native_target(
+    cell: u64,
+    nargs: usize,
+) -> Option<(Rc<super::native_transfer_entry::TransferCode>, EgclVal, u32, usize)> {
+    let state = unsafe { state(cell) };
+    if state.cell.is_cold() {
+        return None;
+    }
+    let target = state.target.borrow();
+    let Some(Target::Native { code, function, promote: false }) = target.as_ref() else {
+        return None;
+    };
+    let NativeCodeStorage::Mapped(mapped) = &code._storage else {
+        return None;
+    };
+    // Only T2 code: `warm` counts invocations below T2.
+    if !code.is_t2
+        || mapped.needs_recompile()
+        || !code.body.as_ref().is_some_and(|body| arity_accepts(body, nargs))
+        || NATIVE_DEPTH.with(|depth| depth.get()) >= native_depth_cap()
+    {
+        return None;
+    }
+    let offset = mapped.lean_root_entry()?;
+    Some((Rc::clone(mapped), *function, state.symbol, offset))
+}
+
+/// The symbol a named adapter's cell dispatches.
+///
+/// # Safety
+/// As for [`ordinary_call_cell`].
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+pub(super) unsafe fn cell_symbol(cell: u64) -> u32 {
+    unsafe { state(cell) }.symbol
+}
+
+/// Whether [`mapped_callee`] is certain to decline this warm cell without
+/// compiling anything: a builtin, bytecode or function target, or installed
+/// code with no managed-slot entry (an ordinary-ABI body). The mapped-call
+/// entry then goes straight to the checked call instead of first preparing a
+/// child it cannot use (GitHub #487). FUNCALL and APPLY are never declined:
+/// their builtin cells have mapped forms of their own.
+///
+/// # Safety
+/// As for [`mapped_callee`].
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub(super) unsafe fn mapped_callee_declines(cell: u64) -> bool {
+    let state = unsafe { state(cell) };
+    if state.cell.is_cold() {
+        return false;
+    }
+    match state.target.borrow().as_ref() {
+        Some(Target::Builtin { .. }) => !super::call_table_funcall::names_funcall_or_apply(state.symbol),
+        Some(Target::Native { code, .. }) => match &code._storage {
+            NativeCodeStorage::Mapped(mapped) => mapped.mapped_entry().is_none(),
+            _ => false,
+        },
+        Some(Target::Bytecode { .. } | Target::Function(_)) => {
+            !super::call_table_funcall::names_funcall_or_apply(state.symbol)
+        }
+        None => false,
+    }
+}
+
 fn promotion_due(function: EgclVal) -> bool {
     egcl_rt::function::invoke_count(function).saturating_add(1) >= t2_invoke_threshold()
         || egcl_rt::function::back_edge_count(function) >= t2_backedge_threshold()
@@ -731,6 +838,17 @@ fn invoke_builtin(cell: u64, args: &[EgclVal]) -> u64 {
 thread_local! {
     static TARGET_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static GENERAL_DISPATCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+thread_local! {
+    static RESOLVES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Symbol-to-cell resolutions on this thread since the last call.
+#[cfg(test)]
+pub(super) fn take_resolves_for_test() -> usize {
+    RESOLVES.with(|count| count.replace(0))
 }
 
 /// Native entries and tier dispatches recorded on this thread since the last call.

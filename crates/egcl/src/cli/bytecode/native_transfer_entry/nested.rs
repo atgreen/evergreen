@@ -127,6 +127,19 @@ pub(super) fn take_capture_failure() -> bool {
 /// Called only by the explicit mapped-call veneer. A live outer segment alone
 /// is not evidence that an arbitrary Rust/legacy caller may use this entry.
 pub(super) unsafe extern "C" fn prepare_nested(cell: u64, record: *mut MappedCallRecord) {
+    // No child can serve this target. Decline as preparation would, without
+    // publishing or selecting first; the checked call does both. Pending
+    // work still takes the full path, whose poll services it at this call.
+    if unsafe { call_table::mapped_callee_declines(cell) } && current_poll_idle() {
+        unsafe {
+            (*record).entry = std::ptr::null();
+            (*record).activation = std::ptr::null_mut();
+            (*record).owner = std::ptr::null_mut();
+            (*record).forward = std::ptr::null();
+            (*record).outcome = NativeOutcome { value: NIL, exit: NativeExit::Returned };
+        }
+        return;
+    }
     prepare_call(record, || unsafe {
         let invocation = &mut *(*record).context;
         if call_table::is_builtin_funcall(cell) && invocation.nargs != 0 {
