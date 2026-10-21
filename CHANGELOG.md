@@ -16,7 +16,7 @@
   answers a `(setf name)` generic function instead of `nil`. The
   [closer-mop fork](docs/library-forks.md) imports these, so the `c2mop:` names
   work on EGCL
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#511](https://github.com/atgreen/evergreen/pull/511)).
 - `egcl-ext:map-readtable-macro-characters` calls a function once for each
   macro character of a readtable, with its reader function, whether it is
   non-terminating, and, for a dispatching character, its sub-characters and
