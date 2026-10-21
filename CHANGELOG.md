@@ -220,6 +220,13 @@
   source-only artifact that re-read the text at load time. A `:METHOD` option
   in such a `DEFGENERIC` now also sees the `MACROLET`'s local macros
   ([#488](https://github.com/atgreen/evergreen/pull/488)).
+- In an image restored with `--image` or a delivered executable, a function
+  that came with the image reports the tier its native code runs at.
+  `egcl-ext:function-tier` used to answer 0 for it by name and by object after
+  its T1 or T2 code was installed and running, and its invocation count kept
+  advancing; functions defined after the restore were unaffected. The saved
+  image no longer carries a second copy of each such function's body
+  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
 - A `THROW` from the default form of a `&key` or `&aux` parameter to a
   `CATCH` in the interpreted caller reaches that catch. Once the caller had
   been called a few times, the throw escaped as an internal error such as

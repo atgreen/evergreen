@@ -996,6 +996,17 @@ pub(super) fn serialize_registry_unit() -> Vec<u8> {
     for (&symbol, definition) in named_definitions().borrow().iter() {
         if let Some(body) = &definition.body {
             entries.insert(symbol, Arc::clone(body));
+            // The current object's private definition symbol names this same
+            // body. Restoring the named definition re-establishes that owner;
+            // a separate kind-10 tree would decode as a distinct copy (#466).
+            if egcl_rt::function::is_interpreted_function(definition.function)
+                && egcl_rt::symbols::symbol_function(symbol) == Some(definition.function)
+            {
+                let private = egcl_rt::function::definition_index(definition.function);
+                if entries.get(&private).is_some_and(|owned| Arc::ptr_eq(owned, body)) {
+                    entries.remove(&private);
+                }
+            }
         } else {
             entries.remove(&symbol);
         }
@@ -15335,6 +15346,16 @@ fn load_bbu_definitions(bytes: &[u8], env: &mut Env, restoring: bool) -> Result<
                         allocated
                     }
                 };
+                if restoring {
+                    // The restored object owns this exact body, as a fresh
+                    // DEFUN's would: native publication records a tier on the
+                    // object only when this entry is the installed code's body
+                    // (GitHub #466). Replace, never keep, any earlier entry.
+                    closure_bodies().borrow_mut().insert(
+                        egcl_rt::function::definition_index(fn_obj),
+                        Arc::clone(&function),
+                    );
+                }
                 publish_bytecode(sym, function, None, fn_obj);
                 // Keep the function object's tier metadata tied to this loaded
                 // definition; publication has already invalidated old native code.
