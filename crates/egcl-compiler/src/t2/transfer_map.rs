@@ -409,6 +409,7 @@ mod poll_scope_tests {
             min_args: 3,
             max_args: Some(3),
             variadic: false,
+            binder_cache: Default::default(),
         };
         let scopes = ScopeMap::analyze_function(&body).unwrap();
         let function = build::build_from_bytecode_for_native_cleanups(&body).unwrap();

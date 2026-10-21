@@ -99,7 +99,7 @@ struct ChildActivation {
     code: Rc<TransferCode>,
     parent: *mut CaptureContext,
     context: Option<CaptureContext>,
-    state: ActivationState,
+    state: Box<ActivationState>,
     frame: Option<*mut Frame>,
     previous_frame: *const Frame,
 }

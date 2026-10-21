@@ -248,6 +248,7 @@ fn function_with_scopes(code: Vec<Instr>) -> egcl_rt::bytecode::BytecodeFunction
         min_args: 0,
         max_args: Some(0),
         variadic: false,
+        binder_cache: Default::default(),
     }
 }
 

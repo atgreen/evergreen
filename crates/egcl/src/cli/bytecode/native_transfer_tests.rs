@@ -99,6 +99,7 @@ fn native_v2_recursive_body_is_admitted_for_outer_segment() {
         min_args: 0,
         max_args: Some(0),
         variadic: false,
+        binder_cache: Default::default(),
     };
     assert!(
         native_transfer_entry::TransferCode::compile(Arc::new(body)).is_some(),
@@ -149,6 +150,7 @@ fn native_v2_osr_loop_poll_preserves_native_segment_state() {
         min_args: 1,
         max_args: Some(1),
         variadic: false,
+        binder_cache: Default::default(),
     });
     let mut env = Env::new(false);
     egcl_rt::rooted_ref!(_env = &mut env);

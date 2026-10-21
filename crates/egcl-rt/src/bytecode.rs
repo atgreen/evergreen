@@ -314,6 +314,42 @@ pub struct BytecodeFunction {
     /// True when the lambda list has `&optional`/`&rest`/`&key`/`&aux`, so args
     /// are bound by the variadic binder rather than positionally.
     pub variadic: bool,
+    /// The call-time variadic binder's parsed form of `params_form`, built on
+    /// first use. Opaque to the runtime; see [`BinderCache`].
+    pub binder_cache: BinderCache,
+}
+
+/// A lazily built, per-body cache owned by the call-time lambda-list binder.
+///
+/// The runtime only stores it; the binder decides what it holds. It is
+/// derived from `params_form` alone, so a clone starts empty rather than
+/// inheriting a value that a rewritten copy might no longer match.
+#[derive(Default)]
+pub struct BinderCache(
+    std::sync::OnceLock<Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>>,
+);
+
+impl BinderCache {
+    /// The cached value, computing it with `init` on first use. `None` means
+    /// the binder found no cacheable form; that answer is cached too.
+    pub fn get_or_init(
+        &self,
+        init: impl FnOnce() -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+    ) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        self.0.get_or_init(init).as_deref()
+    }
+}
+
+impl Clone for BinderCache {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl std::fmt::Debug for BinderCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BinderCache")
+    }
 }
 
 impl BytecodeFunction {

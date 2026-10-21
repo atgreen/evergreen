@@ -331,8 +331,11 @@ pub(super) struct TransferCode {
     catch_pushes: usize,
     /// Buffers of finished activations, reused by later calls of this code so
     /// a call does not rebuild them. Only quiescent states with no Lisp value
-    /// left in them are kept; see `ActivationState::recycle`.
-    state_pool: std::cell::RefCell<Vec<ActivationState>>,
+    /// left in them are kept; see `ActivationState::recycle`. Each state is
+    /// boxed so taking one out and returning it moves a pointer, not the
+    /// whole struct (bliss-nkzx6).
+    #[allow(clippy::vec_box)]
+    state_pool: std::cell::RefCell<Vec<Box<ActivationState>>>,
     /// The callable root this code's ordinary segment last retained. Code runs
     /// for the same function on nearly every call, so `callable_root` hands the
     /// same root back instead of registering a fresh cross-thread root -- a
@@ -760,7 +763,7 @@ impl TransferCode {
     /// added to the pool.
     #[cfg(test)]
     pub(super) fn recycle_osr_source_for_test(&self, env: &mut Env) -> Result<usize, EgclError> {
-        let mut source = ActivationState::prepare(self, env)?;
+        let mut source = Box::new(ActivationState::prepare(self, env)?);
         source.ready_osr = Some(Box::new(ActivationState::prepare(self, env)?));
         drop(source.take_osr_state());
         let before = self.state_pool.borrow().len();
@@ -1466,7 +1469,7 @@ impl TransferCode {
             validate_declared_args(&self.body, &args)?;
         }
         let mut state = activation::PooledActivation::new(self, match osr {
-            Some(resume) => *resume.state,
+            Some(resume) => resume.state,
             None => ActivationState::prepare_reusing(self, env)?,
         });
         egcl_rt::rooted_ref!(_state = &mut *state);

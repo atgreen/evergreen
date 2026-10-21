@@ -90,6 +90,21 @@
   `EGCL_GC_SOFT_DIRTY=1` uses it always and `EGCL_GC_SOFT_DIRTY=0` never.
   Kernels without soft-dirty support and other systems keep the full scan
   ([#491](https://github.com/atgreen/evergreen/pull/491)).
+- A call to a function with `&optional`, `&rest`, `&key` or `&aux`
+  parameters no longer re-parses its lambda list and binds it through the
+  interpreter on every call. The lambda list is parsed once, and calls whose
+  omitted parameters default to constants bind straight into the frame; a
+  default that must be evaluated, `:allow-other-keys` in a call, or a
+  malformed keyword list still takes the general binder. A one-`&key` call from
+  bytecode into native code, which had become slower than the bytecode call it
+  replaced, is now about half its previous cost and faster than the bytecode
+  call; calls with several `&key` parameters are back to about the bytecode
+  call's cost, and every call from bytecode into native code is cheaper. A
+  function the baseline compiler declined, including every closure made from
+  a declined `(lambda ...)`, is no longer re-checked for tier-up on each call,
+  and `EGCL_LOG=compile=trace` logs that decline instead of a dispatch line per
+  call
+  ([#495](https://github.com/atgreen/evergreen/pull/495)).
 - On x86-64 Linux, a function whose `LAMBDA` makes a `RETURN-FROM`, `RETURN`
   or `GO` to a block or tag that the `LAMBDA` itself establishes, such as
   `(mapcar (lambda (x) (dolist (y x) (when (p y) (call (lambda () (return y))))))

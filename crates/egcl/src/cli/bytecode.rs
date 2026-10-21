@@ -93,6 +93,14 @@ mod native_env;
 use native_env::NativeEnvNames;
 mod pending_error;
 mod call_table;
+#[path = "bytecode/variadic_plan.rs"]
+mod variadic_plan;
+#[cfg(test)]
+#[path = "bytecode/variadic_plan_tests.rs"]
+mod variadic_plan_tests;
+#[cfg(test)]
+#[path = "bytecode/declined_dispatch_tests.rs"]
+mod declined_dispatch_tests;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 mod native_callable;
 #[path = "bytecode/self_calls.rs"]
@@ -1301,6 +1309,11 @@ pub fn call_registered(
             ))));
         }
         return None; // arg count outside the lambda list's range: tree-walker binds it
+    }
+    // T1 declined this body for good: it runs as bytecode, and there is no
+    // tier decision left to make or to log on this call (bliss-nkzx6).
+    if t1_declined(sym) || closure_body_declined(sym, &callee) {
+        return Some(run_with_sym(callee, args, *fn_val, sym, env));
     }
     let fn_obj = egcl_rt::function::is_interpreted_function(*fn_val).then_some(*fn_val);
     // The tree-walker already bumped named function objects in `callable_body`.
@@ -7267,6 +7280,7 @@ fn compile_local_function(
         min_args,
         max_args,
         variadic,
+        binder_cache: Default::default(),
     })
 }
 
@@ -7362,6 +7376,7 @@ fn compile_capturing_local(
         min_args,
         max_args,
         variadic,
+        binder_cache: Default::default(),
     })
 }
 
@@ -8014,6 +8029,7 @@ fn compile_restart_clause(
         min_args,
         max_args,
         variadic,
+        binder_cache: Default::default(),
     })
 }
 
@@ -9269,6 +9285,7 @@ fn compile_function_forcing_boxed(
         min_args,
         max_args,
         variadic,
+        binder_cache: Default::default(),
     };
 
     // Turn a self-tail call into a jump back to the entry (bliss-ieajy.3). Done
@@ -9496,6 +9513,7 @@ fn compile_thunk(form: EgclVal, env: &Env, portable: bool) -> Option<BytecodeFun
         min_args: 0,
         max_args: Some(0),
         variadic: false,
+        binder_cache: Default::default(),
     })
 }
 
@@ -13066,6 +13084,7 @@ fn decode_bbu_function(
         min_args: encoded.arity_min,
         max_args: (encoded.arity_max != u16::MAX).then_some(encoded.arity_max),
         variadic,
+        binder_cache: Default::default(),
     })
 }
 
@@ -15878,6 +15897,16 @@ fn bind_variadic(
     env_frame: Option<&Arc<SharedCell<EnvFrame>>>,
     env: &mut Env,
 ) -> Result<(), EgclError> {
+    // The common shapes bind from a plan cached on the body; any call it does
+    // not model falls through, untouched, to the general binder (bliss-nkzx6).
+    if variadic_plan::VariadicPlan::of(func)
+        .is_some_and(|plan| plan.bind(func, frame, args, env_frame))
+    {
+        env.clear_mv();
+        return Ok(());
+    }
+    #[cfg(test)]
+    variadic_plan::GENERAL_BINDS.with(|count| count.set(count.get() + 1));
     // Defaults are evaluated in a child of the CALLEE's environment, not the
     // caller's: an init form that names an enclosing lexical must find the
     // binding the function was DEFINED in (CLHS 3.1.2.1.1). `env_frame` is this
@@ -20497,13 +20526,44 @@ static T2_DECLINED: egcl_rt::execution_local::ExecutionLocal<
 /// T2 above), so every dispatch past the threshold re-ran the whole T1 front
 /// end just to fail at the same instruction: CTAK re-declined 127,213 times
 /// in one benchmark run (bliss-yy9m). Redefining the function clears this.
+///
+/// A private closure symbol is recorded alongside its compilation owner, so a
+/// later call of that closure stops at this one lookup in `call_registered`
+/// instead of re-walking the owner, completion and native registries on every
+/// invocation (bliss-nkzx6). Collected closures are swept with the registries.
 static T1_DECLINED: egcl_rt::execution_local::ExecutionLocal<
-    RefCell<std::collections::HashSet<u32>>,
+    RefCell<std::collections::HashSet<u32, egcl_rt::fxhash::FxBuildHasher>>,
 > = unsafe {
     egcl_rt::execution_local::ExecutionLocal::new(
-        || RefCell::new(std::collections::HashSet::new()),
+        || RefCell::new(std::collections::HashSet::default()),
     )
 };
+
+fn t1_declined(sym: u32) -> bool {
+    T1_DECLINED.with(|declined| declined.borrow().contains(&sym))
+}
+
+/// Whether `sym` is a closure instance whose shared body T1 has declined
+/// through another instance, its compilation owner. Every `(lambda ...)`
+/// evaluation makes a fresh instance, and one called fewer than
+/// `t1_threshold()` times never reaches `native_for_dispatch` to inherit the
+/// decline there, so this consults the owner directly (bliss-nkzx6). It uses
+/// the validity checks `closure_compilation_owner` applies to a previous owner.
+fn closure_body_declined(sym: u32, body: &Arc<BytecodeFunction>) -> bool {
+    if !egcl_rt::symbols::is_uninterned(sym) {
+        return false;
+    }
+    let Some(owner) = CLOSURE_COMPILATION.with(|cache| {
+        cache.borrow().get(&(Arc::as_ptr(body) as usize)).map(|state| state.owner)
+    }) else {
+        return false;
+    };
+    owner != sym
+        && t1_declined(owner)
+        && !is_profile_pinned(owner)
+        && !is_profile_pinned(sym)
+        && registry_get(owner).is_some_and(|entry| Arc::ptr_eq(&entry, body))
+}
 /// The native code of the direct callees a queued T2 job was resolved
 /// against, keyed by the caller and its registry generation (bliss-6j6pk).
 /// Retained from the moment the targets are baked: a callee promoted to T2
@@ -21693,6 +21753,12 @@ fn mark_fresh_promotion(sym: u32) {
     });
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Calls that reached the tier state machine, for the decline tests.
+    static TIER_DISPATCHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// Drive the shipping tier state machine for one invocation.  A function with
 /// no native entry may only transition to T1 during this dispatch; a later
 /// dispatch observes T1 and may independently transition to T2.  A T2 compiler
@@ -21705,10 +21771,13 @@ fn native_for_dispatch(
 ) -> Option<Rc<NativeCode>> {
     #[cfg(test)]
     call_table::record_target_lookup();
+    #[cfg(test)]
+    TIER_DISPATCHES.with(|count| count.set(count.get() + 1));
     if profiling_disabled() || is_profile_pinned(sym) {
         return None;
     }
     egcl_rt::rooted!(fn_obj = fn_obj);
+    let caller_sym = sym;
     let (owner, invoke_count) = closure_compilation_owner(sym, invoke_count);
     // A private representative has no public function cell to publish into.
     if owner != sym {
@@ -21724,7 +21793,10 @@ fn native_for_dispatch(
         if invoke_count < t1_threshold() {
             return None;
         }
-        if T1_DECLINED.with(|s| s.borrow().contains(&sym)) {
+        if t1_declined(sym) {
+            // Another closure of the same body was declined. The decline is a
+            // property of the shared body, so this closure inherits it.
+            T1_DECLINED.with(|s| s.borrow_mut().insert(caller_sym));
             return None;
         }
         let Some(nc) = try_promote_to_t1(sym) else {
@@ -21732,8 +21804,18 @@ fn native_for_dispatch(
             // also declines here, and `profile_unpin` promises the function may
             // tier up again — memoizing that would silently make the pin
             // permanent (bliss-yy9m).
-            if !is_profile_pinned(sym) {
-                T1_DECLINED.with(|s| s.borrow_mut().insert(sym));
+            if !is_profile_pinned(sym) && !is_profile_pinned(caller_sym) {
+                T1_DECLINED.with(|s| {
+                    let mut declined = s.borrow_mut();
+                    declined.insert(sym);
+                    declined.insert(caller_sym);
+                });
+                egcl_rt::blog!(
+                    "compile",
+                    egcl_rt::log::TRACE,
+                    "[T1] {}: decline recorded at invocation {invoke_count}; later calls run T0 without tier dispatch",
+                    sym_label(caller_sym)
+                );
             }
             return None;
         };
