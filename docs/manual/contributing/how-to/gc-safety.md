@@ -47,6 +47,20 @@ EGCL_GC_STRESS=1 EGCL_GC_POISON=1 \
 Compare the output as well as the exit status. A value can be lost before it is
 stored and produce a quietly wrong result instead of a poisoned-pointer crash.
 
+On Linux, once the old generation reaches a quarter of the nursery's size, a
+minor collection scans only the old-generation pages the kernel reports as
+written since the previous minor collection (soft-dirty tracking). A small
+reproducer stays below that size; set `EGCL_GC_SOFT_DIRTY=1` to exercise the
+tracked scan anyway.
+A change that adds a new kind of off-heap storage reachable from a heap object
+must be traced on every minor collection, not only when its holder's page is
+written: see `traces_off_heap` in `crates/egcl-rt/src/gc.rs`. To tell a
+scanning fault from a rooting fault, rerun with `EGCL_GC_SOFT_DIRTY=0`, which
+scans the whole old generation, and with `EGCL_GC_VERIFY=1`, which checks after
+every minor collection that no older object still refers into the nursery.
+`EGCL_GC_REGION_LOG=1` prints each minor collection's scan mode, the regions it
+walked and the young references it found.
+
 ## Read the failure correctly
 
 | Result | Meaning |
