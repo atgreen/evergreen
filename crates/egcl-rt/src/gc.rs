@@ -8368,9 +8368,13 @@ mod old_scan_tests {
         assert_eq!(unsafe { *slot(*vec, 1 + 1499) }, NIL);
 
         let held = unsafe { *slot(*holder, 0) };
-        assert_eq!(
-            held, stub,
-            "the holder's page was not written, so not rewritten"
+        // The holder's page was not written, so it is normally left pointing
+        // at the stub. A kernel may still report the page soft-dirty (a fresh
+        // or merged VMA reads as all dirty), and then the slot is collapsed to
+        // the stub's new target instead; either is correct.
+        assert!(
+            held == stub || held == resolve_forwarded(stub),
+            "the holder must keep the stub or its current target"
         );
         let resolved = resolve_forwarded(held);
         assert_ne!(resolved, replacement, "the stub's target must have moved");
