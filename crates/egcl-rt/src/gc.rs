@@ -6484,12 +6484,11 @@ pub unsafe fn snapshot_heap_regions(
             region.bytes[offset..offset + 8].copy_from_slice(&copied_header.0.to_ne_bytes());
             let body_offset = body as usize - saved_start;
             use crate::object::type_id as tid;
+            // A FOREIGN-LIBRARY keeps its registry token: the image records
+            // the library and restore reopens it into the same slot (#440).
             if matches!(
                 kind,
-                tid::FOREIGN_POINTER
-                    | tid::FOREIGN_LIBRARY
-                    | tid::FOREIGN_CALLBACK
-                    | tid::PYTHON_OBJECT
+                tid::FOREIGN_POINTER | tid::FOREIGN_CALLBACK | tid::PYTHON_OBJECT
             ) {
                 region.bytes[body_offset..body_offset + len].fill(0);
             } else if matches!(kind, tid::STREAM | tid::MUTEX | tid::CONDITION_VARIABLE) {
@@ -6618,7 +6617,6 @@ fn serialize_heap_objects_matching(mut retain: impl FnMut(*const u8) -> bool) ->
         if matches!(
             type_id,
             crate::object::type_id::FOREIGN_POINTER
-                | crate::object::type_id::FOREIGN_LIBRARY
                 | crate::object::type_id::FOREIGN_CALLBACK
                 // A PyObject address names an object in an interpreter that does
                 // not outlive this process, so it must be nulled rather than
@@ -6628,8 +6626,9 @@ fn serialize_heap_objects_matching(mut retain: impl FnMut(*const u8) -> bool) ->
                 | crate::object::type_id::PYTHON_OBJECT
         ) {
             // Neither native addresses nor allocation identities survive an
-            // image restart. Restore pointers as null and library tokens as
-            // invalid; a restored token must never name a new library.
+            // image restart. Restore pointers as null. A FOREIGN-LIBRARY token
+            // is kept: the image records its library, and restore reopens it
+            // into the same slot, so it never names a different library.
             out.resize(out.len() + size, 0);
         } else if matches!(
             type_id,

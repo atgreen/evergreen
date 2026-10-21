@@ -206,6 +206,11 @@ pub enum SectionType {
     /// real body is a Box'd Rust struct off the GC heap. Restored INSIDE
     /// `restore_heap`, between its two passes, so references to them relocate.
     OffHeap = 9,
+    /// Foreign libraries to reopen at restore, by name, in load order and in
+    /// the token slots the heap's FOREIGN-LIBRARY objects hold (GitHub #440).
+    /// Older runtimes skip it as an unknown section; images saved by them carry
+    /// null tokens.
+    ForeignLibraries = 10,
 }
 
 /// Host-crate registry serialization hooks (bliss-x0f2 M2). The `egcl` crate
@@ -553,7 +558,14 @@ fn save_image_impl(
     } else {
         settings_raw
     };
-    let section_count: u32 = 9;
+    let foreign_libraries_raw = crate::ffi::serialize_foreign_libraries();
+    let foreign_libraries_size = foreign_libraries_raw.len();
+    let foreign_libraries_data = if use_compression {
+        compress_data(&foreign_libraries_raw)
+    } else {
+        foreign_libraries_raw
+    };
+    let section_count: u32 = 10;
 
     // Page alignment constant (4 KiB) — §7.2.2 requires sections after
     // the directory to be page-aligned to allow mmap with MAP_FIXED (R7.02).
@@ -655,6 +667,15 @@ fn save_image_impl(
         uncompressed_size: settings_size as u64,
     };
 
+    current_offset = align_to_page(current_offset + settings_data.len());
+    let foreign_libraries_section = SectionEntry {
+        section_type: SectionType::ForeignLibraries as u32,
+        flags: 0,
+        file_offset: current_offset as u64,
+        size: foreign_libraries_data.len() as u64,
+        uncompressed_size: foreign_libraries_size as u64,
+    };
+
     // Get the actual heap base address for relocation tracking (R7.03).
     let original_base = crate::gc::heap_base_address();
     let gc_generation = crate::gc::gc_generation();
@@ -703,6 +724,7 @@ fn save_image_impl(
             host_section,
             offheap_section,
             settings_section,
+            foreign_libraries_section,
         ];
         for section in &sections {
             let section_bytes = struct_to_bytes(section);
@@ -714,7 +736,7 @@ fn save_image_impl(
         // Write section data with page-alignment padding between sections.
         // Each section's file_offset was computed with page alignment, so
         // we pad to match those offsets.
-        let section_data_slices: [&[u8]; 9] = [
+        let section_data_slices: [&[u8]; 10] = [
             &heap_data,
             &symbol_data,
             &package_data,
@@ -724,6 +746,7 @@ fn save_image_impl(
             &host_data,
             &offheap_data,
             &settings_data,
+            &foreign_libraries_data,
         ];
         let mut write_pos = section_dir_offset + sections.len() * SECTION_ENTRY_SIZE;
         for (idx, data) in section_data_slices.iter().enumerate() {
@@ -912,6 +935,7 @@ fn load_image_contents(file_data: &[u8], backing: Option<(&std::fs::File, u64)>)
     let mut gc_meta_entry: Option<SectionEntry> = None;
     let mut host_entry: Option<SectionEntry> = None;
     let mut offheap_entry: Option<SectionEntry> = None;
+    let mut foreign_libraries_entry: Option<SectionEntry> = None;
 
     let mut seen_sections = std::collections::HashSet::new();
     let mut extents = Vec::new();
@@ -943,6 +967,9 @@ fn load_image_contents(file_data: &[u8], backing: Option<(&std::fs::File, u64)>)
             t if t == SectionType::GcMeta as u32 => gc_meta_entry = Some(entry),
             t if t == SectionType::HostRegistries as u32 => host_entry = Some(entry),
             t if t == SectionType::OffHeap as u32 => offheap_entry = Some(entry),
+            t if t == SectionType::ForeignLibraries as u32 => {
+                foreign_libraries_entry = Some(entry)
+            }
             _ => {
                 // Unknown section type — skip for forward compatibility.
             }
@@ -1049,6 +1076,13 @@ fn load_image_contents(file_data: &[u8], backing: Option<(&std::fs::File, u64)>)
                 hook(&host_bytes)?;
             }
         }
+    }
+
+    // Reopen the saved foreign libraries into the tokens the heap holds. Last,
+    // so library constructors run in a fully restored world; a library that
+    // cannot be reopened leaves its token dead instead of failing the restore.
+    if let Some(entry) = foreign_libraries_entry {
+        crate::ffi::restore_foreign_libraries(&read_section_data(&entry)?)?;
     }
 
     // Store the restored entry continuation, remapped through the heap's old→new

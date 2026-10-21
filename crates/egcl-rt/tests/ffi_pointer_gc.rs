@@ -57,7 +57,9 @@ fn boxed_pointer_survives_moving_gc_and_serializes_without_native_addresses() {
             found = true;
         }
         if kind == egcl_rt::object::type_id::FOREIGN_LIBRARY {
-            assert!(body.iter().all(|byte| *byte == 0));
+            // A library token is kept: restore reopens its library into the
+            // same registry slot (GitHub #440).
+            assert_eq!(body, 0xfedcba9876543210u64.to_ne_bytes());
             library_found = true;
         }
         if kind == egcl_rt::object::type_id::FOREIGN_CALLBACK {
@@ -72,7 +74,7 @@ fn boxed_pointer_survives_moving_gc_and_serializes_without_native_addresses() {
     );
     assert!(
         library_found,
-        "foreign library must restore with an invalid token"
+        "foreign library must be serialized with its registry token"
     );
     assert!(
         callback_found,
