@@ -209,7 +209,7 @@
   used to warn "could not pre-read this file (PROGRAM-ERROR)" and write a
   source-only artifact that re-read the text at load time. A `:METHOD` option
   in such a `DEFGENERIC` now also sees the `MACROLET`'s local macros
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#488](https://github.com/atgreen/evergreen/pull/488)).
 - A `THROW` from the default form of a `&key` or `&aux` parameter to a
   `CATCH` in the interpreted caller reaches that catch. Once the caller had
   been called a few times, the throw escaped as an internal error such as
