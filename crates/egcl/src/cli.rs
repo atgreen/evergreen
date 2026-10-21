@@ -45967,20 +45967,48 @@ mod macro_stream_environment_tests {
 mod symbol_bare_name_tests {
     use super::symbol_bare_name;
 
-    /// The original expression `symbol_bare_name` was rewritten from. The
-    /// rewrite is a pure optimization (bliss-mwpb), so the two must agree on
-    /// every input.
+    /// The original expression `symbol_bare_name` was rewritten from, for keys
+    /// outside KEYWORD. The rewrite is a pure optimization (bliss-mwpb), so the
+    /// two must agree on every such input. Keyword keys are checked separately,
+    /// against the encoder, in `keyword_keys_give_back_the_interned_name`.
     fn reference(name: &str) -> String {
-        if let Some(rest) = name.strip_prefix("KEYWORD:") {
-            return rest.strip_prefix(':').unwrap_or(rest).to_uppercase();
-        }
-        let without_keyword = name;
-        let base = without_keyword
+        let base = name
             .split_once("::")
             .map(|(_, tail)| tail)
-            .or_else(|| without_keyword.split_once(':').map(|(_, tail)| tail))
-            .unwrap_or(without_keyword);
+            .or_else(|| name.split_once(':').map(|(_, tail)| tail))
+            .unwrap_or(name);
         base.to_uppercase()
+    }
+
+    /// A keyword's bare name is the name it was interned under, colons and
+    /// all (GitHub #468): decoding must invert `keyword_registry_key` exactly.
+    #[test]
+    fn keyword_keys_give_back_the_interned_name() {
+        for name in [
+            "FOO",
+            "foo",
+            "A:B",
+            ":DECK",
+            "::DECK",
+            ":::X",
+            "KEYWORD:FOO",
+            ":",
+            "::",
+            "",
+            "\u{e9}t\u{e9}",
+        ] {
+            let key = egcl_rt::symbols::keyword_registry_key(name);
+            assert_eq!(symbol_bare_name(&key), name.to_uppercase(), "{key:?}");
+        }
+        // Raw keys as written by hand or by older code: the legacy `KEYWORD::`
+        // spelling still names FOO, and a doubled prefix is now the keyword
+        // whose name is "KEYWORD:FOO" rather than being stripped to FOO.
+        assert_eq!(symbol_bare_name("KEYWORD:FOO"), "FOO");
+        assert_eq!(symbol_bare_name("KEYWORD::FOO"), "FOO");
+        assert_eq!(symbol_bare_name("KEYWORD:KEYWORD:FOO"), "KEYWORD:FOO");
+        assert_eq!(symbol_bare_name("KEYWORD:A:B"), "A:B");
+        assert_eq!(symbol_bare_name("KEYWORD:::DECK"), ":DECK");
+        assert_eq!(symbol_bare_name("KEYWORD:"), "");
     }
 
     #[test]
@@ -45991,11 +46019,6 @@ mod symbol_bare_name_tests {
             "COMMON-LISP:CAR",
             "COMMON-LISP::CAR",
             "EGCL-EXT::FOO",
-            // Keyword spellings, including the doubled prefix that the old
-            // `trim_start_matches` stripped repeatedly.
-            "KEYWORD:FOO",
-            "KEYWORD:KEYWORD:FOO",
-            "KEYWORD::FOO",
             // A single ':' appearing BEFORE a "::" — "::" must still win.
             "A:B::C",
             "A:B:C",
@@ -46008,7 +46031,6 @@ mod symbol_bare_name_tests {
             "A::",
             ":A",
             "::A",
-            "KEYWORD:",
             // Case folding, including non-ASCII which needs the Unicode path.
             "car",
             "Car",
@@ -46021,13 +46043,7 @@ mod symbol_bare_name_tests {
             // the byte scan ('9' is 0x39, ';' is 0x3B, ':' is 0x3A).
             "9;9",
             "A9::B;",
-            // Keyword names containing colons (GitHub #468).
-            "KEYWORD:A:B",
-            "KEYWORD:::DECK",
-            "KEYWORD:::::DECK",
         ];
-        assert_eq!(symbol_bare_name("KEYWORD:A:B"), "A:B");
-        assert_eq!(symbol_bare_name("KEYWORD:::DECK"), ":DECK");
         for name in corpus {
             assert_eq!(
                 symbol_bare_name(name),

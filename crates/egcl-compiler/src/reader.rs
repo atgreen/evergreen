@@ -2069,6 +2069,17 @@ fn read_atom_with_base(
     parse_token_with_base(&token, has_escape, marker, read_base).map(|v| (v, end))
 }
 
+/// A token's package marker: the first UNESCAPED ':' (CLHS 2.3.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PackageMarker {
+    /// Byte offset of the marker's first ':' in the cased name.
+    at: usize,
+    /// The character right after it is an UNESCAPED ':' too, so the marker is
+    /// `::`. An escaped colon there (`PKG:|:X|`) is the name's first character,
+    /// which the name text alone cannot tell apart from `PKG::X`.
+    double: bool,
+}
+
 /// Scan one token, returning its readtable-cased name (`:upcase`: escaped chars
 /// keep their case, unescaped chars are upcased), the position just past it, and
 /// whether any escape was seen. The cased name is built directly here rather
@@ -2078,7 +2089,7 @@ fn read_atom_with_base(
 fn collect_token(
     chars: &mut ReaderInput<'_>,
     mut pos: usize,
-) -> Result<(String, usize, bool, Option<usize>), EgclError> {
+) -> Result<(String, usize, bool, Option<PackageMarker>), EgclError> {
     let case_mode = current_readtable_case_mode();
     // When SET-SYNTAX-FROM-CHAR has customised any readtable, the tokenizer must
     // consult per-character syntax (escape/constituent/delimiter) instead of the
@@ -2096,13 +2107,14 @@ fn collect_token(
     let mut invert_eligible: Vec<bool> = Vec::new();
     let mut in_multiple_escape = false;
     let mut had_escape = false;
-    // Byte offset in `name` of the first UNESCAPED ':'. A package marker is
-    // located among the unescaped characters only (CLHS 2.3.4) — a colon that
-    // came from inside bars or after a backslash is ordinary name text. Tracking
+    // The first UNESCAPED ':' in `name`, and whether it is doubled. A package
+    // marker is located among the unescaped characters only (CLHS 2.3.4) — a
+    // colon that came from inside bars or after a backslash is ordinary name
+    // text. Tracking
     // the position, rather than merely "the token starts with one", is what lets
     // `PY::|has space|` split into package PY and name "has space" instead of
     // collapsing into one symbol named "PY::has space" (bliss-i83w).
-    let mut first_unescaped_colon: Option<usize> = None;
+    let mut first_unescaped_colon: Option<PackageMarker> = None;
 
     while chars.has(pos)? {
         let c = chars.at(pos)?;
@@ -2172,8 +2184,8 @@ fn collect_token(
                             "invalid constituent character".into(),
                         ));
                     }
-                    if c == ':' && first_unescaped_colon.is_none() {
-                        first_unescaped_colon = Some(name.len());
+                    if c == ':' {
+                        note_unescaped_colon(&mut first_unescaped_colon, name.len());
                     }
                     name.push(fold_case_char(c, case_mode));
                     if case_mode == 3 {
@@ -2204,8 +2216,8 @@ fn collect_token(
             }
             c if is_delimiter(c) => break,
             c => {
-                if c == ':' && first_unescaped_colon.is_none() {
-                    first_unescaped_colon = Some(name.len());
+                if c == ':' {
+                    note_unescaped_colon(&mut first_unescaped_colon, name.len());
                 }
                 name.push(fold_case_char(c, case_mode));
                 if case_mode == 3 {
@@ -2228,7 +2240,7 @@ fn collect_token(
         // reads back as that symbol (ansi print.symbol.random.*).
         let chars: Vec<char> = name.chars().collect();
         let split = first_unescaped_colon
-            .map(|byte| name[..byte].chars().count())
+            .map(|m| name[..m.at].chars().count())
             .unwrap_or(chars.len());
         let mut inverted = String::with_capacity(name.len());
         for (lo, hi) in [(0, split), (split, chars.len())] {
@@ -2262,15 +2274,25 @@ fn collect_token(
     Ok((name, pos, had_escape, first_unescaped_colon))
 }
 
+/// Record an unescaped ':' found at byte offset `at` of the token's name: the
+/// first one is the package marker, and one immediately after it doubles it.
+fn note_unescaped_colon(marker: &mut Option<PackageMarker>, at: usize) {
+    match marker {
+        None => *marker = Some(PackageMarker { at, double: false }),
+        Some(m) if !m.double && m.at + 1 == at => m.double = true,
+        Some(_) => {}
+    }
+}
+
 /// Interpret an already readtable-cased token `name` as a number, keyword,
 /// package-qualified symbol, `NIL`/`T`, or bare symbol. `has_escape` records
 /// whether the token contained any escape (an escaped token is never a number).
 fn parse_token_with_base(
     name: &str,
     has_escape: bool,
-    // Byte offset of the first UNESCAPED ':' — the package marker, if any.
-    // Escaped colons are ordinary name characters (CLHS 2.3.4).
-    marker: Option<usize>,
+    // The first UNESCAPED ':' — the package marker, if any. Escaped colons
+    // are ordinary name characters (CLHS 2.3.4).
+    marker: Option<PackageMarker>,
     read_base: u32,
 ) -> Result<EgclVal, EgclError> {
     // A token of nothing but unescaped dots is a dot context error (CLHS 2.3.3;
@@ -2297,8 +2319,10 @@ fn parse_token_with_base(
     // escaped characters lose theirs: `:|A|` is :A, `:|foo bar|` a keyword
     // with a lowercase spaced name (ansi PACKAGE-NICKNAMES.3/UNUSE-PACKAGE.3,
     // which pass ':|A|'-style designators).
-    if has_escape && marker == Some(0) {
-        if let Some(kw_name) = name.strip_prefix(':') {
+    if let Some(m) = marker.filter(|m| has_escape && m.at == 0) {
+        // `::|X|` is :X like `::X`; only an escaped colon joins the name.
+        let skip = if m.double { 2 } else { 1 };
+        if let Some(kw_name) = name.get(skip..) {
             let full = egcl_rt::symbols::keyword_registry_key(kw_name);
             let idx = intern_symbol(&full);
             return Ok(EgclVal::from_symbol_index(idx));
@@ -2308,24 +2332,21 @@ fn parse_token_with_base(
     // ESCAPED characters lose theirs — so this is decided by the marker
     // position, not by `has_escape`. `PY::|has space|` is package PY plus the
     // name "has space" (bliss-i83w).
-    if let Some(colon) = marker.filter(|p| *p > 0) {
+    if let Some(m) = marker.filter(|m| m.at > 0) {
+        let colon = m.at;
         // A package marker must be followed by a symbol name (CLHS 2.3.4);
         // `PKG::` and `PKG:` are malformed. `PKG::||` is NOT — bars make an
         // empty name legitimate — so this rejects only an UNESCAPED empty
         // remainder, which is exactly what `has_escape` distinguishes
         // (bliss-gw2a). A bare `||` never reaches here: it has no unescaped
         // marker, so `marker` is None.
-        let marker_len = if name[colon..].starts_with("::") {
-            2
-        } else {
-            1
-        };
+        let marker_len = if m.double { 2 } else { 1 };
         if !has_escape && colon + marker_len >= name.len() {
             return Err(EgclError::StreamError(format!(
                 "package marker with no symbol name after it: {name}"
             )));
         }
-        if let Some(result) = try_package_qualified(name, colon)? {
+        if let Some(result) = try_package_qualified(name, colon, m.double)? {
             return Ok(result);
         }
     }
@@ -2400,7 +2421,10 @@ pub fn read_symbol_token(name: &str) -> Result<Option<EgclVal>, EgclError> {
     // package-qualified, keyword, numeric, then NIL/T, then bare symbol.
     if let Some(result) = upper
         .find(':')
-        .map(|colon| try_package_qualified(&upper, colon))
+        .map(|colon| {
+            let internal = upper[colon + 1..].starts_with(':');
+            try_package_qualified(&upper, colon, internal)
+        })
         .transpose()?
         .flatten()
     {
@@ -2496,9 +2520,16 @@ pub fn char_from_name(name: &str) -> Option<char> {
 }
 
 /// `colon_pos` is the byte offset of the token's package marker — the first
-/// UNESCAPED ':'. Callers that have no escape information pass `name.find(':')`,
-/// which is the same thing for an unescaped token.
-fn try_package_qualified(name: &str, colon_pos: usize) -> Result<Option<EgclVal>, EgclError> {
+/// UNESCAPED ':' — and `internal` says whether the next character is an
+/// UNESCAPED ':' as well (a `::` marker). Callers that have no escape
+/// information pass `name.find(':')` and whether a ':' follows it, which is the
+/// same thing for an unescaped token. `internal` cannot be recovered from the
+/// name text: `PKG:|:X|` names ":X" while `PKG::X` names "X".
+fn try_package_qualified(
+    name: &str,
+    colon_pos: usize,
+    internal: bool,
+) -> Result<Option<EgclVal>, EgclError> {
     // Check for PKG::SYM or PKG:SYM (but not :keyword which starts with :)
     if name.starts_with(':') {
         return Ok(None);
@@ -2506,11 +2537,7 @@ fn try_package_qualified(name: &str, colon_pos: usize) -> Result<Option<EgclVal>
     {
         let pkg = &name[..colon_pos];
         let rest = &name[colon_pos + 1..];
-        let (sym_name, _internal) = if let Some(stripped) = rest.strip_prefix(':') {
-            (stripped, true)
-        } else {
-            (rest, false)
-        };
+        let sym_name = if internal { &rest[1..] } else { rest };
         // A package-local nickname of the current package shadows every
         // global name (CDR 10), and only the interpreter knows the table:
         // ask it for the canonical name first, then match as before.

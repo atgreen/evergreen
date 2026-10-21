@@ -126,3 +126,29 @@ fn colon_names_survive_compile_file_and_load() {
     ]);
     assert!(stdout.lines().any(|line| line == "INTERN-PASS"), "{stdout}");
 }
+
+/// An escaped colon right after a single package marker is the first character
+/// of the name, not the second half of a `::` marker: `GQ:|:X|` (how an
+/// exported symbol named ":X" prints) names ":X", while `GQ::X` names "X".
+#[test]
+fn escaped_colon_after_a_single_marker_belongs_to_the_name() {
+    check(
+        r#"(progn
+          (defpackage :gh468-ext (:use))
+          (let ((x (intern ":X" :gh468-ext)))
+            (export x :gh468-ext)
+            (assert (string= (prin1-to-string x) "GH468-EXT:|:X|"))
+            (assert (eq (read-from-string (prin1-to-string x)) x))
+            (assert (eq (read-from-string "gh468-ext:|:X|") x))
+            (assert (eq (read-from-string "gh468-ext::|:X|") x))
+            (assert (string= (symbol-name (read-from-string "gh468-ext::x")) "X"))
+            (assert (not (eq (read-from-string "gh468-ext::x") x))))
+          (assert (eq (read-from-string "keyword:|:X|") (intern ":X" :keyword)))
+          (assert (eq (read-from-string "keyword:|::X|") (intern "::X" :keyword)))
+          (assert (eq (read-from-string "keyword::|:X|") (intern ":X" :keyword)))
+          (assert (eq (read-from-string "keyword::x") :x))
+          (assert (eq (read-from-string "::|X|") :x))
+          (assert (eq (read-from-string ":|:X|") (intern ":X" :keyword)))
+          (format t "INTERN-PASS~%"))"#,
+    );
+}

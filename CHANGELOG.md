@@ -259,7 +259,10 @@
   `(intern "A:B" :keyword)` named `B`; they now name `":DECK"` and `"A:B"`,
   print as `:|:DECK|` and `:|A:B|`, read back as the same symbols, and survive
   `COMPILE-FILE` and `LOAD`. `FIND-SYMBOL`, `SYMBOL-NAME` and the printer agree
-  with them, and `:|:DECK|` reads as the keyword named `":DECK"`
+  with them, and `:|:DECK|` reads as the keyword named `":DECK"`. In any
+  package, an escaped colon right after a single package marker is part of the
+  name: `GQ:|:X|`, which is how an exported symbol named `":X"` prints, reads
+  back as that symbol instead of as `GQ::X`
   ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
 - A `THROW` from the default form of a `&key` or `&aux` parameter to a
   `CATCH` in the interpreted caller reaches that catch. Once the caller had
