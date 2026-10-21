@@ -230,6 +230,14 @@ pub fn native_poll_flag_addresses() -> Option<(*const AtomicBool, *const AtomicB
 /// state: it cannot allocate, register a thread, park, yield, or consume work.
 /// A request arriving after an idle observation remains pending for the next
 /// poll; callers must preserve their existing poll cadence.
+/// Neither a stop-the-world request nor a SIGUSR1 interrupt is pending: the
+/// global half of [`poll_work_pending`], without its per-execution yield check,
+/// for a caller that already holds its execution context. A missing page
+/// conservatively reports work.
+pub fn global_poll_idle() -> bool {
+    PAGE.get().is_some_and(|page| !page.is_requested()) && !SIGUSR1_PENDING.load(Ordering::Relaxed)
+}
+
 pub fn poll_work_pending() -> bool {
     let Some(page) = PAGE.get() else {
         return true;

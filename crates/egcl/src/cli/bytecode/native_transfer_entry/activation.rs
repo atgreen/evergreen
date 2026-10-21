@@ -186,7 +186,7 @@ impl ActivationState {
         // A pooled activation may have had its guard reservation consumed by a
         // deopt before it was recycled. Restore it here, where failing is still
         // safe, rather than discovering it missing inside the deopt path.
-        if state.guard_resume.is_none() {
+        if state.guard_resume.is_none() && code.has_deopt {
             state.guard_resume = Self::reserve_guard_resume(code, code.special_binds)?;
         }
         Self::reserve_env(code, env)?;

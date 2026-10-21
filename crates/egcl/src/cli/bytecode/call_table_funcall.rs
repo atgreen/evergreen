@@ -216,6 +216,22 @@ pub(super) fn is_builtin(symbol: u32) -> bool {
         && super::super::installed_function(symbol).is_none()
 }
 
+/// Whether `symbol` is named FUNCALL or APPLY, whatever it is bound to. A
+/// conservative filter for paths that must leave both to their own dispatch.
+pub(super) fn names_funcall_or_apply(symbol: u32) -> bool {
+    thread_local! {
+        static NAMES: std::cell::RefCell<[egcl_rt::symbols::ResolvedSymbolName; 2]> =
+            std::cell::RefCell::new([
+                egcl_rt::symbols::ResolvedSymbolName::new("FUNCALL"),
+                egcl_rt::symbols::ResolvedSymbolName::new("APPLY"),
+            ]);
+    }
+    NAMES.with(|names| {
+        let mut names = names.borrow_mut();
+        names.iter_mut().any(|name| name.refreshed_index() == Some(symbol))
+    })
+}
+
 fn fallback_entries() -> Option<[usize; 2]> {
     static ENTRIES: std::sync::OnceLock<Option<[egcl_rt::jit::JitBuffer; 2]>> =
         std::sync::OnceLock::new();

@@ -41,6 +41,24 @@ pub(super) unsafe extern "C" fn initialize() -> *mut NativeRecursiveControl {
     let execution = egcl_rt::thread::current_execution_context_for_native()
         .expect("native segment has a registered execution");
     let depth = NATIVE_DEPTH.with(Cell::as_ptr);
+    unsafe { initialize_for(context, env, execution, depth) }
+}
+
+/// [`initialize`] for a root entry that has just installed `context` and `env`
+/// as this execution's CAPTURE and NATIVE_ENV and already holds its execution
+/// and depth cell, so it need not look each up again (GitHub #487).
+///
+/// # Safety
+/// `context` and `env` must be the values CAPTURE and NATIVE_ENV hold now;
+/// `execution` and `depth` must be the current execution's context and its
+/// NATIVE_DEPTH cell.
+pub(super) unsafe fn initialize_for(
+    context: *mut CaptureContext,
+    env: *mut Env,
+    execution: *const egcl_rt::exec_context::LispExecutionContext,
+    depth: *mut u32,
+) -> *mut NativeRecursiveControl {
+    debug_assert!(!context.is_null() && !env.is_null());
     let control = NativeRecursiveControl {
         execution,
         depth,

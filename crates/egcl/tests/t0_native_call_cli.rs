@@ -18,10 +18,19 @@ const PROGRAM: &str = r#"
 (defun special-leaf (x) (+ x *k*))
 (defun special-binder (x) (let ((*k* x)) (special-leaf 1)))
 (defun cons-leaf (a) (list a a))
+;; Lean root entries reached through builtins and mapped (&key) callers.
+(defun elt-leaf (s i) (elt s i))
+(defun kw-char (s &key (start 0)) (char s start))
+(defun kw-add (a &key (b 1)) (leaf a b))
+(defun kw-car (x &key) (car-leaf x))
+(defun kw-throw (x &key) (thrower x))
+(defun fib (n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))
+(defun rleaf (a b) (+ a b))
 (defun warm ()
   (dotimes (i 40)
     (leaf i 1) (mv-leaf i 1) (thrower 1) (car-leaf '(1)) (special-leaf i)
-    (special-binder i) (cons-leaf i)))
+    (special-binder i) (cons-leaf i) (elt-leaf "abc" 1) (kw-char "abc" :start 1)
+    (kw-add i :b 1) (kw-car '(1)) (kw-throw 1) (fib 3) (rleaf i 1)))
 (warm)
 (defun caller ()
   (let ((sum 0) (mvs nil) (errors 0) (conses 0))
@@ -40,9 +49,28 @@ const PROGRAM: &str = r#"
     (format t "CONSES ~D~%" conses)
     ;; Values the warm-up never showed: a guard failure inside the leaf.
     (format t "DEOPT ~S ~S ~S~%" (leaf most-positive-fixnum 1) (leaf 1.5 2) (leaf 1/2 1/3))
-    (format t "MVAFTER ~S~%" (multiple-value-list (leaf 1 2)))))
+    (format t "MVAFTER ~S~%" (multiple-value-list (leaf 1 2)))
+    (let ((chars nil) (caught 0))
+      (dotimes (i 3) (push (kw-char "hello" :start i) chars))
+      (push (elt-leaf '(a b c) 2) chars)
+      (dotimes (i 4)
+        (handler-case (kw-char "hi" :start (* i 2)) (error () (incf caught)))
+        (handler-case (elt-leaf "hi" (+ i 1)) (error () (incf caught))))
+      (format t "CHARS ~S ~D~%" chars caught))
+    (format t "KWDEOPT ~S ~S~%" (kw-add most-positive-fixnum) (kw-add 1/2 :b 1/2))
+    (let ((caught 0))
+      (dotimes (i 4) (handler-case (kw-car (if (evenp i) (list i) i)) (type-error () (incf caught))))
+      (format t "KWERRORS ~D~%" caught))
+    (format t "KWTHROW ~D~%" (catch :t0-native (dotimes (i 10) (kw-throw i)) :none))
+    (format t "FIB ~D~%" (fib 20))
+    (format t "REDEF ~D " (rleaf 6 7))
+    (setf (symbol-function 'rleaf) (lambda (a b) (* a b)))
+    (format t "~D~%" (rleaf 6 7))))
 (caller)
 (format t "TIERS ~D ~D~%" (egcl-ext:function-tier 'mv-leaf) (egcl-ext:function-tier 'caller))
+(format t "LEAN-TIERS ~D ~D ~D ~D~%" (egcl-ext:function-tier 'elt-leaf)
+        (egcl-ext:function-tier 'kw-char) (egcl-ext:function-tier 'kw-add)
+        (egcl-ext:function-tier 'fib))
 "#;
 
 fn run(force_interp: bool) -> String {
@@ -73,8 +101,9 @@ fn bytecode_callers_see_t2_callees_exactly_as_interpreted_ones() {
     let native = run(false);
     let interpreted = run(true);
     assert!(native.contains("TIERS 2 0"), "callees must be T2 and the caller bytecode: {native}");
+    assert!(native.contains("LEAN-TIERS 2 2 2 2"), "the new callees must be T2: {native}");
     let strip = |text: &str| -> String {
-        text.lines().filter(|line| !line.starts_with("TIERS")).collect::<Vec<_>>().join("\n")
+        text.lines().filter(|line| !line.contains("TIERS")).collect::<Vec<_>>().join("\n")
     };
     assert_eq!(strip(&native), strip(&interpreted));
     for expected in [
@@ -87,6 +116,12 @@ fn bytecode_callers_see_t2_callees_exactly_as_interpreted_ones() {
         "CONSES 40000",
         "DEOPT 1152921504606846976 3.5 5/6",
         "MVAFTER (3)",
+        "CHARS (C #\\l #\\e #\\h) 6",
+        "KWDEOPT 1152921504606846976 1",
+        "KWERRORS 2",
+        "KWTHROW 600",
+        "FIB 6765",
+        "REDEF 13 42",
     ] {
         assert!(native.contains(expected), "missing {expected:?} in {native}");
     }

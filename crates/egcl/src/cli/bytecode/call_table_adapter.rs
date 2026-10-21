@@ -46,9 +46,11 @@ pub(super) fn ensure(state: &State) {
     let (code, code_len) = if let Some(previous) = adapters.first() {
         (Rc::clone(&previous._code), previous.descriptor.code_len)
     } else {
+        // The adapter carries its call cell, which outlives it: the state
+        // owns both, so the helper need not resolve the symbol per call.
         let bytes = egcl_compiler::t2::native_transfer::emit_ordinary_entry_veneer(
             super::super::native_transfer_entry::ordinary_calls::named_entry,
-            state.symbol as usize,
+            Arc::as_ptr(&state.cell) as usize,
         );
         let Some(code) = egcl_rt::jit::JitBuffer::new(&bytes) else {
             return;

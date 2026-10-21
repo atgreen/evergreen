@@ -75,6 +75,18 @@
   argument fell from about 6.3 us to 3.8 us, against about 1.5 us
   interpreted, and `FUNCALL` of a closure from about 9 us to 6 us
   ([#499](https://github.com/atgreen/evergreen/pull/499)).
+- On x86-64 Linux, a call from interpreted code to a function compiled to
+  the optimizing tier's direct native calling convention takes a shorter
+  entry path, so such a call is now cheaper than calling the same function
+  interpreted. A two-argument fixnum `+` called from a `COMPILE-FILE`d loop
+  that stays in the interpreter fell from about 0.95 us to 0.7 us per call
+  net of the loop, against about 0.8 us with the callee interpreted.
+  Compiled code calling a builtin such as `ELT`, or a compiled `&key`
+  function calling a function such as `CHAR`, no longer looks the callee up
+  again or prepares an unusable call frame on every call. A call with one
+  `&key` argument whose body calls `CHAR` fell from about 3.8 us to 2.4 us,
+  which is still slower than the 1.5 us it costs interpreted
+  ([#502](https://github.com/atgreen/evergreen/pull/502)).
 - On x86-64 Linux, a closure that reads or sets variables captured from the
   function or `LET` that created it -- `(lambda (y) (+ x y k))`, a counter's
   `(lambda () (incf n))`, or a wrapper such as `(lambda (&rest a) (apply

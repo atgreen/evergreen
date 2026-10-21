@@ -980,6 +980,23 @@ pub fn current_sigsegv_stack_guard_recovery_ip() -> usize {
     sigsegv_stack_guard_recovery_ip_for_tid(crate::syscall::cached_tid() as usize)
 }
 
+/// Both of this thread's recovery IPs, `(null guard, stack guard)`, as the two
+/// readers above return them, with one slot lookup instead of two linear scans
+/// when this thread already owns a slot. A native entry saves both on every
+/// call (GitHub #487).
+pub fn current_sigsegv_recovery_ips() -> (usize, usize) {
+    if let Ok(cached) = SIGSEGV_SLOT_CACHE.try_with(|c| c.get())
+        && cached != 0
+    {
+        let slot = cached - 1;
+        return (
+            SIGSEGV_NULL_GUARD_RECOVERY_IPS[slot].load(std::sync::atomic::Ordering::Acquire),
+            SIGSEGV_STACK_GUARD_RECOVERY_IPS[slot].load(std::sync::atomic::Ordering::Acquire),
+        );
+    }
+    (current_sigsegv_null_guard_recovery_ip(), current_sigsegv_stack_guard_recovery_ip())
+}
+
 /// Fault state belongs to an execution, while signal handlers find the mounted
 /// execution through its carrier's existing allocation-free TID slot.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
