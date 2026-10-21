@@ -282,6 +282,18 @@
 
 ### Fixed
 
+- Compiled code no longer returns stale multiple values from a form that
+  yields one value. When one arm of an `IF`, `WHEN`, `UNLESS` or `AND` could
+  return several values and the other could not, the single-valued arm
+  returned its value together with the values of an earlier call:
+  `(let ((r (floor 7 2))) (if neg (not r) r))` returned 3 and 1, and
+  `(multiple-value-list (if neg (g n) 5))` could give `(3 1)` instead of
+  `(5)`. `TAGBODY` likewise returned its last statement's values instead of
+  `NIL`, and `THROW` of a single-valued form transferred stale values with it.
+  The interpreter was already correct; compiled code was wrong at every tier.
+  Such functions can now also use the optimizing tier's direct-call entry,
+  which cuts the cost of calling them from native code by about 40%
+  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
 - `COMPILE-FILE` compiles a file whose top-level `MACROLET` expands to
   `(defgeneric (setf NAME) ...)`, as zpb-ttf's `bounding-box.lisp` does. It
   used to warn "could not pre-read this file (PROGRAM-ERROR)" and write a

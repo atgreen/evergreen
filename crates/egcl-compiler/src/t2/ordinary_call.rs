@@ -406,7 +406,25 @@ pub fn emit_framed_ordinary_function_with_self_calls(
 /// `(if (listp x) x (list x))`. Every other instruction and frame state is
 /// kept, so call sites and their targets are unchanged. Returns `None` when no
 /// join qualifies.
+///
+/// Repeated until no join remains: rewriting one join turns a block that only
+/// forwarded its parameter to it into a new `return p` join, as in a nested
+/// `(if a (if b (call) x) y)` or `(and a b (call))`, whose arms reach the
+/// return through two jumps.
 fn duplicate_join_returns(f: &Function) -> Option<Function> {
+    let mut rewritten: Option<Function> = None;
+    // Each round removes the joins it rewrites; the bound only guards
+    // against a malformed graph.
+    for _ in 0..16 {
+        match duplicate_join_returns_once(rewritten.as_ref().unwrap_or(f)) {
+            Some(next) => rewritten = Some(next),
+            None => break,
+        }
+    }
+    rewritten
+}
+
+fn duplicate_join_returns_once(f: &Function) -> Option<Function> {
     let mut joins = Vec::new();
     for &block in f.block_order() {
         let data = f.block(block);
@@ -414,17 +432,22 @@ fn duplicate_join_returns(f: &Function) -> Option<Function> {
         let ret = f.inst(data.insts[0]);
         let [returned] = ret.args[..] else { continue };
         if ret.opcode != Opcode::Return { continue; }
-        if let Some(param) = data.params.iter().position(|&p| p == returned) {
-            joins.push((block, param, data.insts[0]));
-        }
+        // A returned block parameter takes each edge's argument. A value
+        // defined elsewhere dominates the block, and so every predecessor:
+        // a jump returns it directly (`(call x)` followed by an empty jump).
+        let param = data.params.iter().position(|&p| p == returned);
+        joins.push((block, param, returned, data.insts[0]));
     }
     let mut copy: Option<Function> = None;
-    for (join, param, ret) in joins {
+    for (join, param, returned, ret) in joins {
         let source = copy.as_ref().unwrap_or(f);
-        // Every (terminator, edge index) that enters the join.
+        // Every (terminator, edge index) that enters the join. A join that
+        // returns a dominating value is copied only into jumps: a branch
+        // edge would gain a block identical to the join itself.
         let edges: Vec<(Inst, usize)> = source.preds(join).into_iter().filter_map(|pred| {
             source.terminator(pred)
-        }).flat_map(|term| {
+        }).filter(|&term| param.is_some() || source.inst(term).opcode == Opcode::Jump)
+        .flat_map(|term| {
             source.inst(term).targets.iter().enumerate()
                 .filter(|(_, edge)| edge.block == join)
                 .map(move |(index, _)| (term, index))
@@ -433,7 +456,10 @@ fn duplicate_join_returns(f: &Function) -> Option<Function> {
         if edges.is_empty() { continue; }
         let g = copy.get_or_insert_with(|| f.clone());
         for (term, index) in edges {
-            let value = g.inst(term).targets[index].args[param];
+            let value = match param {
+                Some(param) => g.inst(term).targets[index].args[param],
+                None => returned,
+            };
             if g.inst(term).opcode == Opcode::Jump {
                 let source_pos = g.inst(ret).source_pos;
                 let data = g.inst_mut(term);
@@ -451,7 +477,17 @@ fn duplicate_join_returns(f: &Function) -> Option<Function> {
                 edge.args.clear();
             }
         }
-        if g.preds(join).is_empty() { g.remove_from_layout(join); }
+        if g.preds(join).is_empty() {
+            g.remove_from_layout(join);
+            if param.is_none() {
+                // The verifier still checks the unlisted block: give its
+                // orphaned return a parameter of its own to name, since the
+                // returned value no longer dominates a block nothing reaches.
+                let (ty, repr) = (g.value(returned).ty, g.value(returned).repr);
+                let own = g.add_block_param(join, ty, repr);
+                g.inst_mut(ret).args = vec![own];
+            }
+        }
     }
     copy
 }
@@ -1018,6 +1054,75 @@ mod join_return_tests {
         assert_eq!(g.inst(g.terminator(taken).unwrap()).args, vec![x]);
         assert!(!g.block_order().contains(&join));
         assert!(crate::t2::verify::verify(&g).is_ok());
+    }
+
+    /// `(and a b (call))`: the call's arm jumps to an inner join that only
+    /// forwards its parameter to the returning join. Both levels are copied,
+    /// so the call is followed directly by its return.
+    #[test]
+    fn a_join_reached_through_a_forwarding_join_is_copied_too() {
+        let mut f = Function::new("and-call");
+        let entry = f.entry();
+        let x = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+        let (second, call_arm, nil_arm, inner_join, outer_nil, join) = (f.make_block(),
+            f.make_block(), f.make_block(), f.make_block(), f.make_block(), f.make_block());
+        let (_, nil) = f.push_inst(entry, inst(Opcode::ConstNil, vec![], vec![]), &[TAGGED]);
+        f.set_terminator(entry, inst(Opcode::Brif, vec![x],
+            vec![edge(second, vec![]), edge(outer_nil, vec![])]));
+        f.set_terminator(second, inst(Opcode::Brif, vec![x],
+            vec![edge(call_arm, vec![]), edge(nil_arm, vec![])]));
+        let (call, result) = f.push_inst(call_arm, inst(Opcode::Call, vec![x], vec![]), &[TAGGED]);
+        f.set_terminator(call_arm, inst(Opcode::Jump, vec![], vec![edge(inner_join, vec![result[0]])]));
+        f.set_terminator(nil_arm, inst(Opcode::Jump, vec![], vec![edge(inner_join, vec![nil[0]])]));
+        let forwarded = f.add_block_param(inner_join, IRType::TOP, ValueRepresentation::Tagged);
+        f.set_terminator(inner_join, inst(Opcode::Jump, vec![], vec![edge(join, vec![forwarded])]));
+        f.set_terminator(outer_nil, inst(Opcode::Jump, vec![], vec![edge(join, vec![nil[0]])]));
+        let merged = f.add_block_param(join, IRType::TOP, ValueRepresentation::Tagged);
+        f.set_terminator(join, inst(Opcode::Return, vec![merged], vec![]));
+
+        let g = duplicate_join_returns(&f).expect("the joins qualify");
+        assert!(!g.block_order().contains(&join));
+        assert!(!g.block_order().contains(&inner_join));
+        let tail = |block| g.inst(g.terminator(block).unwrap()).clone();
+        assert_eq!(tail(call_arm).opcode, Opcode::Return);
+        assert_eq!(tail(call_arm).args, result);
+        assert_eq!(*g.block(call_arm).insts.first().unwrap(), call);
+        assert_eq!(tail(outer_nil).opcode, Opcode::Return);
+        assert!(crate::t2::verify::verify(&g).is_ok());
+    }
+
+    /// A call whose block jumps to a block returning the call's own result
+    /// (not a parameter) returns it directly. A branch into that block is left
+    /// alone rather than given an identical copy.
+    #[test]
+    fn a_jump_to_a_return_of_a_dominating_value_returns_directly() {
+        let mut f = Function::new("flet-call");
+        let entry = f.entry();
+        let x = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+        let ret_block = f.make_block();
+        let (call, result) = f.push_inst(entry, inst(Opcode::Call, vec![x], vec![]), &[TAGGED]);
+        f.set_terminator(entry, inst(Opcode::Jump, vec![], vec![edge(ret_block, vec![])]));
+        f.set_terminator(ret_block, inst(Opcode::Return, vec![result[0]], vec![]));
+
+        let g = duplicate_join_returns(&f).expect("the jump qualifies");
+        let tail = g.inst(g.terminator(entry).unwrap()).clone();
+        assert_eq!(tail.opcode, Opcode::Return);
+        assert_eq!(tail.args, result);
+        assert_eq!(*g.block(entry).insts.first().unwrap(), call);
+        assert!(!g.block_order().contains(&ret_block));
+        assert_eq!(crate::t2::verify::verify(&g).map_err(|e| format!("{e:?}")), Ok(()));
+
+        let mut branching = Function::new("branch-to-return");
+        let entry = branching.entry();
+        let x = branching.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+        let (ret_block, other) = (branching.make_block(), branching.make_block());
+        let (_, result) =
+            branching.push_inst(entry, inst(Opcode::Call, vec![x], vec![]), &[TAGGED]);
+        branching.set_terminator(entry, inst(Opcode::Brif, vec![x],
+            vec![edge(ret_block, vec![]), edge(other, vec![])]));
+        branching.set_terminator(ret_block, inst(Opcode::Return, vec![result[0]], vec![]));
+        branching.set_terminator(other, inst(Opcode::Return, vec![x], vec![]));
+        assert!(duplicate_join_returns(&branching).is_none());
     }
 
     #[test]

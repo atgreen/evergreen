@@ -2982,6 +2982,13 @@ impl<'e> Lowerer<'e> {
         if parts.len() < 2 || parts.len() > 3 {
             return Err(Bail);
         }
+        // When one arm may produce multiple values the IF as a whole may, so no
+        // enclosing form truncates its result. The other arm must then leave
+        // the multiple-values state inactive itself, or it returns its single
+        // value with values left by an earlier producer:
+        // `(let ((r (floor 7 2))) (if neg (not r) r))` returned 3 and 1.
+        let then_may = self.may_produce_multiple_values(parts[1]);
+        let else_may = parts.len() == 3 && self.may_produce_multiple_values(parts[2]);
         // test
         self.lower_test(parts[0])?;
         self.emit(Instr::BrIfFalse(0)); // patched
@@ -2989,6 +2996,9 @@ impl<'e> Lowerer<'e> {
         self.pop_n(1);
         // then
         self.lower_expr(parts[1])?;
+        if else_may && !then_may {
+            self.emit(Instr::ClearMv);
+        }
         self.emit(Instr::Br(0)); // patched
         let br_at = self.code.len() - 1;
         self.pop_n(1); // then-value is conceptually the result; model branches independently
@@ -3000,6 +3010,9 @@ impl<'e> Lowerer<'e> {
             let c = self.add_const(NIL);
             self.emit(Instr::Const(c));
             self.push_n(1);
+        }
+        if then_may && !else_may {
+            self.emit(Instr::ClearMv);
         }
         let end_pc = self.code.len() as u32;
         self.code[br_if_false_at] = Instr::BrIfFalse(else_pc);
@@ -3020,6 +3033,9 @@ impl<'e> Lowerer<'e> {
         let (test, mut body) = cp(rest);
         egcl_rt::rooted_ref!(_body_root = &mut body);
         let base = self.cur_stack;
+        // The implicit NIL result is single-valued; when the body may produce
+        // multiple values nothing outside truncates it (see lower_if).
+        let body_may = self.body_tail_may_produce(body);
         self.lower_test(test)?;
         if negate {
             // UNLESS: run the body when the test is NIL. Branch on the test:
@@ -3030,6 +3046,9 @@ impl<'e> Lowerer<'e> {
             let c = self.add_const(NIL);
             self.emit(Instr::Const(c));
             self.push_n(1);
+            if body_may {
+                self.emit(Instr::ClearMv);
+            }
             self.emit(Instr::Br(0));
             let to_end = self.code.len() - 1;
             let body_pc = self.code.len() as u32;
@@ -3049,6 +3068,9 @@ impl<'e> Lowerer<'e> {
             let c = self.add_const(NIL);
             self.emit(Instr::Const(c));
             self.push_n(1);
+            if body_may {
+                self.emit(Instr::ClearMv);
+            }
             let end = self.code.len() as u32;
             self.code[to_else] = Instr::BrIfFalse(else_pc);
             self.code[to_end] = Instr::Br(end);
@@ -3089,6 +3111,10 @@ impl<'e> Lowerer<'e> {
         let false_pc = self.code.len() as u32;
         let c = self.add_const(NIL);
         self.emit(Instr::Const(c));
+        // The short-circuit NIL is single-valued (see lower_if).
+        if self.may_produce_multiple_values(args[n - 1]) {
+            self.emit(Instr::ClearMv);
+        }
         let end = self.code.len() as u32;
         for j in false_jumps {
             self.code[j] = Instr::BrIfFalse(false_pc);
@@ -4299,7 +4325,13 @@ impl<'e> Lowerer<'e> {
         // bliss-wlf).
         egcl_rt::rooted_ref!(_val_root = &mut val_form);
         self.lower_expr(tag_form)?; // tag
+        let val_may_produce = self.may_produce_multiple_values(val_form);
         self.lower_expr(val_form)?; // value (on top)
+        if !val_may_produce {
+            // As for RETURN-FROM: a single-valued result transfers one value,
+            // not values left by an earlier producer.
+            self.emit(Instr::ClearMv);
+        }
         self.emit(Instr::Throw);
         self.pop_n(2);
         self.push_n(1);
@@ -4421,7 +4453,10 @@ impl<'e> Lowerer<'e> {
             }
         }
 
-        // TAGBODY returns NIL.
+        // TAGBODY returns NIL, a single value: its last statement's values
+        // must not survive as the form's (`(tagbody (floor 1 2))` returned 0
+        // and 1).
+        self.emit(Instr::ClearMv);
         let c = self.add_const(NIL);
         self.emit(Instr::Const(c));
         self.push_n(1);
