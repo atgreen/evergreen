@@ -3658,6 +3658,90 @@ pub fn argument_precedence_order(name: EgclVal) -> Vec<usize> {
     order
 }
 
+/// One required-parameter specializer of a method, as
+/// [`applicable_methods_using_classes`] reads it.
+#[derive(Clone, Copy, Debug)]
+pub enum ClassSpecializer {
+    /// Unspecialized: the class T.
+    Any,
+    /// A class specializer, as a class metaobject.
+    Class(EgclVal),
+    /// An EQL specializer, given as the class of its object: whether it applies
+    /// cannot be decided from classes alone when an instance of an argument
+    /// class could be that object.
+    EqlOfClass(EgclVal),
+}
+
+/// AMOP COMPUTE-APPLICABLE-METHODS-USING-CLASSES over `methods` (method
+/// handle and per-required-parameter specializers, in definition order) for
+/// arguments of the given `classes`.
+///
+/// `None` is the AMOP second value NIL: some method has an EQL specializer an
+/// instance of the corresponding class could satisfy, so applicability depends
+/// on the actual arguments. Otherwise the applicable methods, most specific
+/// first, compared one argument at a time in `precedence` order (positions
+/// into the required parameters; empty means left to right), as CLHS 7.6.6.1.2
+/// orders them for dispatch.
+///
+/// Reads class precedence lists only; allocates nothing on the Lisp heap.
+pub fn applicable_methods_using_classes(
+    methods: &[(EgclVal, Vec<ClassSpecializer>)],
+    classes: &[EgclVal],
+    precedence: &[usize],
+) -> Option<Vec<EgclVal>> {
+    let cpls: Vec<Vec<EgclVal>> = classes
+        .iter()
+        .map(|&class| compute_class_precedence_list(class).unwrap_or_else(|_| vec![class]))
+        .collect();
+    let mut applicable: Vec<(Vec<usize>, EgclVal)> = Vec::new();
+    'methods: for (method, specializers) in methods {
+        if specializers.len() > classes.len() {
+            continue;
+        }
+        let mut distances = Vec::with_capacity(specializers.len());
+        for (i, specializer) in specializers.iter().enumerate() {
+            match *specializer {
+                ClassSpecializer::Any => distances.push(UNSPECIALIZED_DISTANCE),
+                ClassSpecializer::Class(class) => {
+                    match cpls[i].iter().position(|&c| c == class) {
+                        Some(position) => distances.push(position),
+                        // T is at the end of every list; a class specializer of
+                        // T that is not found still applies to everything.
+                        None if is_t_class(class) => distances.push(UNSPECIALIZED_DISTANCE),
+                        None => continue 'methods,
+                    }
+                }
+                ClassSpecializer::EqlOfClass(object_class) => {
+                    // An instance of classes[i] could be the EQL object exactly
+                    // when the object's class is classes[i] or a subclass of it.
+                    let object_cpl = compute_class_precedence_list(object_class)
+                        .unwrap_or_else(|_| vec![object_class]);
+                    if object_cpl.contains(&classes[i]) {
+                        return None;
+                    }
+                    continue 'methods;
+                }
+            }
+        }
+        let key = if precedence.is_empty() {
+            distances
+        } else {
+            precedence
+                .iter()
+                .map(|&i| distances.get(i).copied().unwrap_or(UNSPECIALIZED_DISTANCE))
+                .collect()
+        };
+        applicable.push((key, *method));
+    }
+    // Stable, so methods equally specific keep definition order.
+    applicable.sort_by(|a, b| a.0.cmp(&b.0));
+    Some(applicable.into_iter().map(|(_, method)| method).collect())
+}
+
+fn is_t_class(class: EgclVal) -> bool {
+    with_state(|st| class == st.t_class_val)
+}
+
 /// Compute the applicable methods for given arguments.
 ///
 /// Filters the generic function's methods to those whose specializers

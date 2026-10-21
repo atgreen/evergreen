@@ -71,8 +71,13 @@ Do not submit upstream patches or PRs without new authorization.
 ## Closer-MOP
 
 `check-closer-mop.lisp` loads the pinned fork through ocicl, checks inherited
-slot names, and calls a funcallable instance. Run it from this directory with
+slot names, calls a funcallable instance, and reads generic functions and
+methods through `c2mop:` — `specializer-direct-generic-functions`,
+`specializer-direct-methods`, `method-specializers`,
+`method-generic-function`, `generic-function-lambda-list`,
+`generic-function-name` and `compute-applicable-methods-using-classes`,
+including after `remove-method`. `scripts/test-library-forks.sh` runs it. Run it from this directory with
 `EGCL_PORT_RUNTIME` and `EGCL_PORT_CACHE` set as above; a development EGCL
-binary additionally needs `--bootstrap`. The same test runs on SBCL. This
-adapter exposes EGCL's existing slot and callable-instance APIs; it does not
-claim complete MOP support.
+binary additionally needs `--bootstrap`. The same test runs on SBCL. The
+adapter imports what `EGCL-MOP` provides; it does not claim complete MOP
+support.

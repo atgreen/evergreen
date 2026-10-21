@@ -133,50 +133,217 @@ fn egcl_mop_provides_the_introspection_and_an_effective_metaclass() {
     }
 }
 
-/// METHOD-SPECIALIZERS deliberately STAYS unowned, and this pins that so the
-/// next person does not "finish" the move without the piece it needs.
+/// CLASS-PRECEDENCE-LIST is owned by EGCL-MOP, which is what stops a library's
+/// own DEFUN of that name from redefining ours (#370). The piece that made it
+/// safe is dispatching the EGCL-MOP spelling as well, so the exported symbol is
+/// the builtin itself.
 ///
-/// CLASS-PRECEDENCE-LIST no longer does: it is owned by EGCL-MOP now, which is
-/// what stops a library's own DEFUN of that name from redefining ours (#370).
-/// The piece that made it safe is dispatching the EGCL-MOP spelling as well, so
-/// the exported symbol is the builtin itself.
-///
-/// They are name-dispatched Rust builtins: the dispatch matches the bare symbol
-/// name and ignores the package, so moving the symbol out of COMMON-LISP does
-/// not stop a library's own DEFUN of that name from overriding the
-/// implementation's for every caller. Measured: with the symbol moved, a
-/// `(defun class-precedence-list ...)` in an unrelated package still made the
-/// implementation's own call answer the library's value. Fixing that is
-/// bliss-7l7cn, not this change -- and exporting the names from EGCL-MOP before
-/// then interned fresh FUNCTIONLESS symbols that shadowed the real builtins and
-/// made (class-precedence-list ...) undefined in COMMON-LISP-USER.
+/// METHOD-SPECIALIZERS is owned by EGCL-MOP too since GitHub #508, as a real
+/// function over a %-entry point. The bare builtin of that name stays in
+/// COMMON-LISP, internal, and is what a (:use :cl) package's bare read still
+/// reaches: those builtins dispatch by bare name and ignore the package, so a
+/// library's DEFUN of it still replaces the builtin for every caller -- that is
+/// bliss-7l7cn. What this pins is that EGCL-MOP's reader is not reached by it.
 #[test]
-fn the_builtin_mop_names_stay_in_common_lisp_until_dispatch_respects_packages() {
+fn egcl_mop_owns_its_mop_readers_and_a_library_defun_cannot_reach_them() {
     let program = r#"
+      (defgeneric owned-gf (x))
+      (defmethod owned-gf ((x integer)) x)
       (format t "CPL-HOME ~a~%" (package-name (symbol-package 'class-precedence-list)))
       (format t "MS-HOME ~a~%" (package-name (symbol-package 'method-specializers)))
       (format t "CPL-CALLABLE ~a~%"
               (and (mapcar #'class-name (class-precedence-list (find-class 'standard-object))) t))
-      (format t "NOT-EXPORTED ~a~%"
+      (format t "EXPORTED ~a~%"
               (list (nth-value 1 (find-symbol "CLASS-PRECEDENCE-LIST" :egcl-mop))
                     (nth-value 1 (find-symbol "METHOD-SPECIALIZERS" :egcl-mop))))
+      ;; A library package that only uses CL, defining METHOD-SPECIALIZERS. Its
+      ;; own symbol, and EGCL-MOP's reader still answers the implementation's
+      ;; value. A FILE, because in-package affects only SUBSEQUENT reads.
+      (with-open-file (o "MSPROBE" :direction :output :if-exists :supersede)
+        (write-line "(defpackage :ms-clob (:use :cl))" o)
+        (write-line "(in-package :ms-clob)" o)
+        (write-line "(defun method-specializers (m) (list :mine m))" o)
+        (write-line "(in-package :cl-user)" o))
+      (load "MSPROBE")
+      (delete-file "MSPROBE")
+      (format t "MS-OWN ~a~%"
+              (not (eq (find-symbol "METHOD-SPECIALIZERS" :ms-clob) 'egcl-mop:method-specializers)))
+      (format t "MS-IMPL-INTACT ~a~%"
+              (mapcar #'class-name
+                      (egcl-mop:method-specializers
+                       (first (egcl-mop:generic-function-methods #'owned-gf)))))
     "#;
+    let probe = std::env::temp_dir().join(format!("egcl-ms-probe-{}.lisp", std::process::id()));
+    let program = program.replace("MSPROBE", &probe.display().to_string());
     let output = Command::new(BIN)
-        .args(["--no-init", "--eval", program])
+        .args(["--no-init", "--eval", &program])
         .output()
         .expect("run egcl");
+    let _ = std::fs::remove_file(&probe);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(output.status.success(), "{stdout}");
-    assert!(stdout.contains("CPL-HOME EGCL-MOP"), "{stdout}");
-    assert!(stdout.contains("MS-HOME COMMON-LISP"), "{stdout}");
-    assert!(stdout.contains("CPL-CALLABLE T"), "{stdout}");
-    // Not accessible in EGCL-MOP at all. They are INTERNAL symbols of
-    // COMMON-LISP, so (:use :common-lisp) never inherited them either -- the
-    // leak #370 reports comes from the bare-read bootstrap-identity rule, not
-    // from package inheritance. What matters here is that EGCL-MOP does not
-    // intern its own: listing them in its :export did, and those functionless
-    // symbols shadowed the real builtins in COMMON-LISP-USER.
-    // CPL is EXTERNAL in EGCL-MOP now; METHOD-SPECIALIZERS is still not
-    // accessible there at all.
-    assert!(stdout.contains("NOT-EXPORTED (EXTERNAL NIL)"), "{stdout}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    for expected in [
+        "CPL-HOME EGCL-MOP",
+        "MS-HOME EGCL-MOP",
+        "CPL-CALLABLE T",
+        "EXPORTED (EXTERNAL EXTERNAL)",
+        "MS-OWN T",
+        "MS-IMPL-INTACT (INTEGER)",
+    ] {
+        assert!(stdout.contains(expected), "missing {expected:?} in:\n{stdout}");
+    }
+}
+
+/// Generic function and method introspection (GitHub #508): what a library
+/// needs to find every generic function with a method on some class, and to
+/// write a congruent method of its own on each -- a geometry kernel binding
+/// installs a locking :AROUND method that way. Answers come from the registry
+/// dispatch uses, so REMOVE-METHOD and redefinition show through.
+const GF_PROGRAM: &str = r#"
+  (defclass k () ())
+  (defclass k2 (k) ())
+  (defgeneric g (x &key tol))
+  (defmethod g ((x k) &key tol) tol)
+  (defmethod g ((x (eql 5)) &key tol) tol)
+  (defgeneric h (a b) (:argument-precedence-order b a))
+  (defmethod h ((a k) b) 1)
+  (defmethod h (a (b k2)) 2)
+  (defmethod (setf sx) (v (o k)) v)
+  (defun names (gfs) (mapcar #'egcl-mop:generic-function-name gfs))
+
+  ;; The issue's example.
+  ;; In method definition order.
+  (format t "SDGF ~s~%" (names (egcl-mop:specializer-direct-generic-functions (find-class 'k))))
+  (format t "SDGF-EQ ~s~%"
+          (equal (egcl-mop:specializer-direct-generic-functions (find-class 'k))
+                 (list #'g #'h #'(setf sx))))
+  (format t "SDM ~s~%" (length (egcl-mop:specializer-direct-methods (find-class 'k))))
+  (format t "MS ~s~%"
+          (mapcar (lambda (m)
+                    (mapcar (lambda (s) (if (consp s) s (class-name s)))
+                            (egcl-mop:method-specializers m)))
+                  (egcl-mop:generic-function-methods #'g)))
+  (format t "LL ~s~%" (egcl-mop:generic-function-lambda-list #'g))
+  ;; A generic function DEFMETHOD created: &KEY with no keyword names (#507).
+  (defmethod implicit-gf ((x k2) &key p) p)
+  (format t "IMPLICIT-LL ~s ~s~%" (egcl-mop:generic-function-lambda-list #'implicit-gf)
+          (egcl-mop:generic-function-lambda-list #'(setf sx)))
+  (format t "NAME ~s ~s~%" (egcl-mop:generic-function-name #'g)
+          (egcl-mop:generic-function-name #'(setf sx)))
+  (format t "APO ~s ~s~%" (egcl-mop:generic-function-argument-precedence-order #'h)
+          (egcl-mop:generic-function-argument-precedence-order #'g))
+  (format t "MGF ~s ~s~%"
+          (eq #'g (egcl-mop:method-generic-function (first (egcl-mop:generic-function-methods #'g))))
+          (eq #'(setf sx) (egcl-mop:method-generic-function
+                           (first (egcl-mop:generic-function-methods #'(setf sx))))))
+  (format t "MLL ~s~%" (mapcar #'egcl-mop:method-lambda-list (egcl-mop:generic-function-methods #'g)))
+  ;; An EQL specializer, as INTERN-EQL-SPECIALIZER makes it.
+  (format t "EQL-SDM ~s~%"
+          (names (mapcar #'egcl-mop:method-generic-function
+                         (egcl-mop:specializer-direct-methods (egcl-mop:intern-eql-specializer 5)))))
+  (format t "EQL-OBJ ~s~%" (egcl-mop:eql-specializer-object (egcl-mop:intern-eql-specializer 5)))
+  ;; An unspecialized parameter's specializer is the class T.
+  (format t "T-SDM ~s~%"
+          (and (member (find-if (lambda (m) (equal (egcl-mop:method-specializers m)
+                                                   (list (find-class t) (find-class 'k2))))
+                                (egcl-mop:generic-function-methods #'h))
+                       (egcl-mop:specializer-direct-methods (find-class t)))
+               t))
+
+  ;; COMPUTE-APPLICABLE-METHODS-USING-CLASSES: two values, AMOP.
+  (defun spec-names (ms)
+    (mapcar (lambda (m) (mapcar (lambda (s) (if (consp s) s (class-name s)))
+                                (egcl-mop:method-specializers m)))
+            ms))
+  (format t "CAMUC-K ~s~%"
+          (multiple-value-bind (ms ok)
+              (egcl-mop:compute-applicable-methods-using-classes #'g (list (find-class 'k)))
+            (list (spec-names ms) ok)))
+  ;; An INTEGER could be 5, so the classes do not decide it.
+  (format t "CAMUC-INT ~s~%"
+          (multiple-value-list
+           (egcl-mop:compute-applicable-methods-using-classes #'g (list (find-class 'integer)))))
+  ;; A STRING cannot, so nothing applies and that is definitive.
+  (format t "CAMUC-STR ~s~%"
+          (multiple-value-list
+           (egcl-mop:compute-applicable-methods-using-classes #'g (list (find-class 'string)))))
+  ;; Ordered as dispatch orders them, in the argument precedence order (B A).
+  (format t "CAMUC-H ~s~%"
+          (multiple-value-bind (ms ok)
+              (egcl-mop:compute-applicable-methods-using-classes
+               #'h (list (find-class 'k2) (find-class 'k2)))
+            (list (spec-names ms) ok)))
+  (format t "CAM-H ~s~%"
+          (spec-names (compute-applicable-methods #'h (list (make-instance 'k2) (make-instance 'k2)))))
+
+  ;; REMOVE-METHOD and redefinition show through.
+  (remove-method #'g (find-if (lambda (m) (equal (egcl-mop:method-specializers m)
+                                                 (list (find-class 'k))))
+                              (egcl-mop:generic-function-methods #'g)))
+  (format t "AFTER-REMOVE ~s~%"
+          (names (egcl-mop:specializer-direct-generic-functions (find-class 'k))))
+  (defmethod h ((a k) b) 3)
+  (format t "AFTER-REDEF ~s~%" (length (egcl-mop:specializer-direct-methods (find-class 'k))))
+  (format t "GF-INTROSPECTION-OK~%")
+"#;
+
+const GF_EXPECTED: &[&str] = &[
+    "SDGF (G H (SETF SX))",
+    "SDGF-EQ T",
+    "SDM 3",
+    "MS ((K) ((EQL 5)))",
+    "LL (X &KEY TOL)",
+    "IMPLICIT-LL (X &KEY) (V O)",
+    "NAME G (SETF SX)",
+    "APO (B A) (X)",
+    "MGF T T",
+    "MLL ((X &KEY TOL) (X &KEY TOL))",
+    "EQL-SDM (G)",
+    "EQL-OBJ 5",
+    "T-SDM T",
+    "CAMUC-K (((K)) T)",
+    "CAMUC-INT (NIL NIL)",
+    "CAMUC-STR (NIL T)",
+    "CAMUC-H (((T K2) (K T)) T)",
+    "CAM-H ((T K2) (K T))",
+    "AFTER-REMOVE (H (SETF SX))",
+    "AFTER-REDEF 2",
+    "GF-INTROSPECTION-OK",
+];
+
+fn run_gf_program(stress: bool) -> String {
+    let mut command = Command::new(BIN);
+    command.args(["--no-init", "--eval", GF_PROGRAM]);
+    if stress {
+        command
+            .env("EGCL_GC_STRESS", "1")
+            .env("EGCL_GC_STRESS_AFTER_INIT", "1")
+            .env("EGCL_GC_POISON", "1");
+    }
+    let output = command.output().expect("run egcl");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    for expected in GF_EXPECTED {
+        assert!(stdout.contains(expected), "missing {expected:?} in:\n{stdout}");
+    }
+    stdout
+        .lines()
+        .filter(|line| !line.starts_with("[gc-stress]"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn egcl_mop_introspects_generic_functions_and_methods() {
+    run_gf_program(false);
+}
+
+/// The new readers allocate result lists while holding values read from the
+/// method registry; a forced minor collection on every allocation must not
+/// change any answer.
+#[test]
+fn egcl_mop_generic_function_introspection_under_gc_stress() {
+    assert_eq!(run_gf_program(true), run_gf_program(false));
 }
