@@ -5056,6 +5056,15 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
            ;; has said yet what its instances look like.
            #:forward-referenced-class
            #:generic-function-methods
+           ;; Generic function and method introspection (GitHub #508). The
+           ;; METHOD-* readers are real functions here over the builtins of the
+           ;; same names, so these symbols are the package's own.
+           #:generic-function-name #:generic-function-lambda-list
+           #:generic-function-argument-precedence-order
+           #:method-specializers #:method-generic-function #:method-lambda-list
+           #:specializer-direct-methods #:specializer-direct-generic-functions
+           #:compute-applicable-methods-using-classes
+           #:eql-specializer-object
            #:intern-eql-specializer #:validate-superclass
            #:slot-definition-name #:slot-definition-initargs
            #:slot-definition-initform #:slot-definition-allocation
@@ -5155,6 +5164,81 @@ is still only a forward reference, which is an error (spec R9.39)."
   "The EQL specializer for OBJECT, in the shape METHOD-SPECIALIZERS answers it,
 so the two compare with EQUAL as they do on other hosts."
   (list 'eql object))
+
+;;; Generic function and method introspection (GitHub #508): what a library
+;;; needs to find every generic function with a method on some class, and to
+;;; write a congruent method of its own on each. Read from the registry dispatch
+;;; uses, so a method REMOVE-METHOD took out, or a DEFMETHOD replaced, is gone
+;;; from every answer.
+;;;
+;;; The METHOD-* readers answer what the builtins of the same names do, through
+;;; %-entry points: those builtins dispatch by bare name, so a library's DEFUN of
+;;; METHOD-SPECIALIZERS in a (:use :cl) package still replaces them for every
+;;; caller (bliss-7l7cn), but cannot reach these.
+
+(defun egcl-mop:method-specializers (method)
+  "The specializers of METHOD's required parameters: class metaobjects, and
+(EQL object) for an EQL specializer, as INTERN-EQL-SPECIALIZER makes them."
+  (egcl-internal::%method-specializers method))
+
+(defun egcl-mop:method-generic-function (method)
+  "The generic function METHOD belongs to, EQ to #'name; NIL once removed."
+  (egcl-internal::%method-generic-function method))
+
+(defun egcl-mop:method-lambda-list (method)
+  "METHOD's lambda list with the specializers stripped."
+  (egcl-internal::%method-lambda-list method))
+
+(defun egcl-mop:generic-function-name (generic-function)
+  "The name GENERIC-FUNCTION was defined under: a symbol or a (SETF name) list."
+  (egcl-internal::%generic-function-name generic-function))
+
+(defun egcl-mop:generic-function-lambda-list (generic-function)
+  "The lambda list of GENERIC-FUNCTION, against which DEFMETHOD checks a method
+for congruence: DEFGENERIC's, or for a generic function only DEFMETHOD created,
+the one it derived from the first method."
+  (egcl-internal::%generic-function-lambda-list generic-function))
+
+(defun egcl-mop:generic-function-argument-precedence-order (generic-function)
+  "The required parameters of GENERIC-FUNCTION in the order dispatch compares
+them: DEFGENERIC's :argument-precedence-order, or left to right."
+  (let* ((lambda-list (egcl-mop:generic-function-lambda-list generic-function))
+         (required (loop for parameter in lambda-list
+                         until (member parameter lambda-list-keywords)
+                         collect parameter))
+         (name (egcl-mop:generic-function-name generic-function))
+         (order (and (symbolp name)
+                     (get name 'egcl::%argument-precedence-order))))
+    (if order
+        (mapcar (lambda (position) (nth position required)) order)
+        required)))
+
+(defun egcl-mop:specializer-direct-methods (specializer)
+  "Every method, of any generic function, that has SPECIALIZER among its
+specializers. SPECIALIZER is a class, or an EQL specializer from
+INTERN-EQL-SPECIALIZER."
+  (egcl-internal::%specializer-direct-methods specializer))
+
+(defun egcl-mop:specializer-direct-generic-functions (specializer)
+  "The generic functions of the methods SPECIALIZER-DIRECT-METHODS answers,
+each once."
+  (let ((generic-functions '()))
+    (dolist (method (egcl-mop:specializer-direct-methods specializer))
+      (let ((generic-function (egcl-mop:method-generic-function method)))
+        (when generic-function
+          (pushnew generic-function generic-functions))))
+    (nreverse generic-functions)))
+
+(defun egcl-mop:compute-applicable-methods-using-classes (generic-function classes)
+  "AMOP: the methods of GENERIC-FUNCTION applicable to arguments of CLASSES,
+most specific first, and T. When an EQL specializer makes the answer depend on
+the arguments themselves rather than their classes, NIL and NIL."
+  (values-list (egcl-internal::%compute-applicable-methods-using-classes
+                generic-function classes)))
+
+(defun egcl-mop:eql-specializer-object (eql-specializer)
+  "The object of an EQL specializer from INTERN-EQL-SPECIALIZER."
+  (second eql-specializer))
 
 (defgeneric egcl-mop:validate-superclass (class superclass)
   (:documentation "Whether CLASS may inherit from SUPERCLASS. T by default; a

@@ -19,3 +19,24 @@
   (c2mop:set-funcallable-instance-function instance (lambda (x) (+ x (slot-value instance 'value))))
   (assert (= 12 (funcall instance 5))))
 (format t "CLOSER-MOP-OK~%")
+
+;;;; Generic function and method introspection (GitHub #508): find every
+;;;; generic function with a method on a class, and what a congruent method on
+;;;; each needs -- its name, lambda list and the method's specializers.
+(defclass mop-kernel () ())
+(defgeneric mop-probe (x &key tol))
+(defmethod mop-probe ((x mop-kernel) &key tol) tol)
+(let ((method (first (c2mop:generic-function-methods #'mop-probe))))
+  (assert (member #'mop-probe (c2mop:specializer-direct-generic-functions (find-class 'mop-kernel))))
+  (assert (member method (c2mop:specializer-direct-methods (find-class 'mop-kernel))))
+  (assert (equal (c2mop:method-specializers method) (list (find-class 'mop-kernel))))
+  (assert (eq (c2mop:method-generic-function method) #'mop-probe))
+  (assert (equal (c2mop:generic-function-lambda-list #'mop-probe) '(x &key tol)))
+  (assert (eq (c2mop:generic-function-name #'mop-probe) 'mop-probe))
+  (multiple-value-bind (methods definitive)
+      (c2mop:compute-applicable-methods-using-classes #'mop-probe (list (find-class 'mop-kernel)))
+    (assert definitive)
+    (assert (equal methods (list method))))
+  (remove-method #'mop-probe method)
+  (assert (not (member #'mop-probe (c2mop:specializer-direct-generic-functions (find-class 'mop-kernel))))))
+(format t "CLOSER-MOP-GF-OK~%")

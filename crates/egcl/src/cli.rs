@@ -21417,6 +21417,116 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     .unwrap_or_default();
                 return Ok(vec_to_list(&ids));
             }
+            // The method readers under names no library can DEFUN over: the
+            // bare builtins dispatch by name alone, so a (:use :cl) package's
+            // own DEFUN of METHOD-SPECIALIZERS still replaces them for every
+            // caller (bliss-7l7cn). EGCL-MOP's readers call these instead, so
+            // that cannot reach them (GitHub #508).
+            "EGCL-INTERNAL::%METHOD-SPECIALIZERS"
+            | "EGCL-INTERNAL:%METHOD-SPECIALIZERS"
+            | "%METHOD-SPECIALIZERS" => {
+                return eval_builtin_arguments("METHOD-SPECIALIZERS", cdr, env);
+            }
+            "EGCL-INTERNAL::%METHOD-GENERIC-FUNCTION"
+            | "EGCL-INTERNAL:%METHOD-GENERIC-FUNCTION"
+            | "%METHOD-GENERIC-FUNCTION" => {
+                return eval_builtin_arguments("METHOD-GENERIC-FUNCTION", cdr, env);
+            }
+            "EGCL-INTERNAL::%METHOD-LAMBDA-LIST"
+            | "EGCL-INTERNAL:%METHOD-LAMBDA-LIST"
+            | "%METHOD-LAMBDA-LIST" => {
+                return eval_builtin_arguments("METHOD-LAMBDA-LIST", cdr, env);
+            }
+            // (%generic-function-name gf) -- the name the generic function was
+            // defined under: a symbol, or a (SETF NAME) list (GitHub #508).
+            "EGCL-INTERNAL::%GENERIC-FUNCTION-NAME"
+            | "EGCL-INTERNAL:%GENERIC-FUNCTION-NAME"
+            | "%GENERIC-FUNCTION-NAME" => {
+                let (af, _) = cp(cdr);
+                let gf = eval_form(af, env)?;
+                return generic_function_name_form(env, gf);
+            }
+            // (%generic-function-lambda-list gf) -- the lambda list DEFGENERIC
+            // gave it, or the one an implicit generic function took from its
+            // first DEFMETHOD; both are what DEFMETHOD checks congruence
+            // against (GitHub #508).
+            "EGCL-INTERNAL::%GENERIC-FUNCTION-LAMBDA-LIST"
+            | "EGCL-INTERNAL:%GENERIC-FUNCTION-LAMBDA-LIST"
+            | "%GENERIC-FUNCTION-LAMBDA-LIST" => {
+                let (af, _) = cp(cdr);
+                let gf = eval_form(af, env)?;
+                egcl_rt::rooted!(name_form = generic_function_name_form(env, gf)?);
+                if let Some(lambda_list) = stored_generic_lambda_list(*name_form) {
+                    return Ok(lambda_list);
+                }
+                // A (SETF NAME) generic has no symbol to carry the property.
+                // Derive it from the first method the way an implicit generic
+                // function's is derived (CLHS 7.6.1).
+                let key = function_name_key(*name_form);
+                let first = env
+                    .methods
+                    .borrow()
+                    .get(&key)
+                    .and_then(|defs| defs.first().map(|def| def.lambda_list));
+                return Ok(match first {
+                    Some(lambda_list) => implicit_generic_lambda_list(lambda_list),
+                    None => NIL,
+                });
+            }
+            // (%specializer-direct-methods specializer) -- every method, of any
+            // generic function, that has SPECIALIZER among its specializers
+            // (AMOP). SPECIALIZER is a class designator, or an (EQL object)
+            // specializer as INTERN-EQL-SPECIALIZER and METHOD-SPECIALIZERS
+            // spell it. Read from the live registry, so a removed or redefined
+            // method drops out (GitHub #508).
+            "EGCL-INTERNAL::%SPECIALIZER-DIRECT-METHODS"
+            | "EGCL-INTERNAL:%SPECIALIZER-DIRECT-METHODS"
+            | "%SPECIALIZER-DIRECT-METHODS" => {
+                let (af, _) = cp(cdr);
+                egcl_rt::rooted!(specializer = eval_form(af, env)?);
+                let ids = specializer_direct_method_ids(env, *specializer)?;
+                return Ok(vec_to_list(&ids));
+            }
+            // (%compute-applicable-methods-using-classes gf classes) -- AMOP's
+            // two values as the list (METHODS DEFINITIVE-P); boot.lisp spreads
+            // it with VALUES-LIST (GitHub #508).
+            "EGCL-INTERNAL::%COMPUTE-APPLICABLE-METHODS-USING-CLASSES"
+            | "EGCL-INTERNAL:%COMPUTE-APPLICABLE-METHODS-USING-CLASSES"
+            | "%COMPUTE-APPLICABLE-METHODS-USING-CLASSES" => {
+                let (af, rest) = cp(cdr);
+                egcl_rt::rooted!(gf = eval_form(af, env)?);
+                let classes_list = eval_form(cp(rest).0, env)?;
+                egcl_rt::rooted!(classes = list_to_vec(classes_list));
+                for i in 0..classes.len() {
+                    let class = resolve_class_metaobject(env, classes[i])?;
+                    classes[i] = class;
+                }
+                let Some(gf_name) = generic_function_name_of(env, *gf) else {
+                    return Err(EgclError::TypeError {
+                        datum: *gf,
+                        expected: "GENERIC-FUNCTION".into(),
+                    });
+                };
+                let methods = method_class_specializers(env, &gf_name);
+                let precedence = egcl_rt::symbols::find_index(&gf_name)
+                    .map(|idx| {
+                        egcl_stdlib::clos::argument_precedence_order(EgclVal::from_symbol_index(
+                            idx,
+                        ))
+                    })
+                    .unwrap_or_default();
+                let result = egcl_stdlib::clos::applicable_methods_using_classes(
+                    &methods,
+                    &classes,
+                    &precedence,
+                );
+                let (ids, definitive) = match result {
+                    Some(ids) => (ids, T),
+                    None => (Vec::new(), NIL),
+                };
+                egcl_rt::rooted!(methods_list = vec_to_list(&ids));
+                return Ok(vec_to_list(&[*methods_list, definitive]));
+            }
             "EGCL-INTERNAL::%CLASS-METACLASS"
             | "EGCL-INTERNAL:%CLASS-METACLASS"
             | "%CLASS-METACLASS" => {
@@ -38364,6 +38474,186 @@ fn method_specializer_list(specializers: &[MethodSpecializer]) -> EgclVal {
         items.push(value);
     }
     vec_to_list(&items)
+}
+
+/// The name form of a generic function designator: the symbol, or the
+/// `(SETF NAME)` list, it was defined under (AMOP GENERIC-FUNCTION-NAME).
+fn generic_function_name_form(env: &Env, gf: EgclVal) -> Result<EgclVal, EgclError> {
+    let not_generic = || EgclError::TypeError {
+        datum: gf,
+        expected: "GENERIC-FUNCTION".into(),
+    };
+    let key = generic_function_name_of(env, gf).ok_or_else(not_generic)?;
+    if !env.generics.borrow().contains_key(&key) && !env.methods.borrow().contains_key(&key) {
+        return Err(not_generic());
+    }
+    Ok(generic_name_form_for_key(env, &key))
+}
+
+/// The name form of the generic function registered under `key`: the symbol or
+/// `(SETF NAME)` list `make_generic_function` recorded, which keeps the
+/// symbol's real package and a SETF name's list shape. A generic restored from
+/// an image without that record falls back to parsing its registry key.
+fn generic_name_form_for_key(env: &Env, key: &str) -> EgclVal {
+    let generic = env.generics.borrow().get(key).map(|generic| generic.generic_function);
+    if let Some(name) = generic.and_then(egcl_stdlib::clos::generic_function_name)
+        && !name.is_nil()
+    {
+        return name;
+    }
+    if let Some(inner) = key.strip_prefix("(SETF ").and_then(|s| s.strip_suffix(')')) {
+        egcl_rt::rooted!(accessor = resolve_sym(inner).unwrap_or(NIL));
+        egcl_rt::rooted!(setf = resolve_sym("SETF").unwrap_or(NIL));
+        return vec_to_list(&[*setf, *accessor]);
+    }
+    resolve_sym(key).unwrap_or(NIL)
+}
+
+/// Each method of `gf_name` with its required-parameter specializers as class
+/// metaobjects, in definition order, for COMPUTE-APPLICABLE-METHODS-USING-CLASSES.
+/// An EQL specializer is given as its object's class.
+fn method_class_specializers(
+    env: &Env,
+    gf_name: &str,
+) -> Vec<(EgclVal, Vec<egcl_stdlib::clos::ClassSpecializer>)> {
+    use egcl_stdlib::clos::ClassSpecializer;
+    enum Pending {
+        Any,
+        Class(String),
+        Eql(usize),
+    }
+    // Copied out under the registry borrow, which no allocation may outlive.
+    // The EQL objects are heap values the resolution below could see moved, so
+    // they go in a rooted vector and are referred to by index.
+    let mut eql_objects: Vec<EgclVal> = Vec::new();
+    let pending: Vec<(EgclVal, Vec<Pending>)> = env
+        .methods
+        .borrow()
+        .get(gf_name)
+        .map(|defs| {
+            defs.iter()
+                .map(|def| {
+                    let specializers = def
+                        .specializers
+                        .iter()
+                        .map(|specializer| match specializer {
+                            MethodSpecializer::Any => Pending::Any,
+                            MethodSpecializer::Class(name) => Pending::Class(name.clone()),
+                            MethodSpecializer::Eql(object) => {
+                                eql_objects.push(*object);
+                                Pending::Eql(eql_objects.len() - 1)
+                            }
+                        })
+                        .collect();
+                    (def.method_id, specializers)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    egcl_rt::rooted_ref!(_eql_root = &mut eql_objects);
+    pending
+        .into_iter()
+        .map(|(method, specializers)| {
+            let specializers = specializers
+                .into_iter()
+                .map(|specializer| match specializer {
+                    Pending::Any => ClassSpecializer::Any,
+                    Pending::Class(name) => {
+                        let symbol = resolve_sym(&name).unwrap_or(NIL);
+                        // Class metaobjects are pinned, so the value stays put.
+                        ClassSpecializer::Class(
+                            resolve_class_metaobject(env, symbol).unwrap_or(symbol),
+                        )
+                    }
+                    Pending::Eql(index) => {
+                        ClassSpecializer::EqlOfClass(class_of_value(eql_objects[index]))
+                    }
+                })
+                .collect();
+            (method, specializers)
+        })
+        .collect()
+}
+
+/// The methods, of every generic function, that have `specializer` among their
+/// specializers (AMOP SPECIALIZER-DIRECT-METHODS). `specializer` is a class
+/// designator or an `(EQL object)` list. An unspecialized parameter's
+/// specializer is the class T, as METHOD-SPECIALIZERS reports it.
+fn specializer_direct_method_ids(
+    env: &Env,
+    specializer: EgclVal,
+) -> Result<Vec<EgclVal>, EgclError> {
+    let eql_object = if specializer.is_cons() && !is_closure_cons(specializer) {
+        let (head, tail) = cp(specializer);
+        if head.is_symbol() && sym_bare_name_rc(head).as_ref() == "EQL" && tail.is_cons() {
+            Some(cp(tail).0)
+        } else {
+            return Err(EgclError::TypeError {
+                datum: specializer,
+                expected: "SPECIALIZER".into(),
+            });
+        }
+    } else {
+        None
+    };
+    // Every live method, in definition order (method ids are minted in
+    // increasing order), so the answer does not depend on hash order. A method
+    // REMOVE-METHOD detached belongs to no generic function and is skipped.
+    fn sorted_live(map: &HashMap<String, Vec<MethodDef>>) -> impl Iterator<Item = &MethodDef> {
+        let mut defs: Vec<&MethodDef> = map
+            .iter()
+            .filter(|(name, _)| name.as_str() != DETACHED_METHODS_KEY)
+            .flat_map(|(_, defs)| defs.iter())
+            .collect();
+        defs.sort_by_key(|def| {
+            if def.method_id.is_meta_handle() { def.method_id.as_meta_handle_id() } else { i64::MAX }
+        });
+        defs.into_iter()
+    }
+    if let Some(object) = eql_object {
+        // No allocation: compared under the borrow.
+        let map = env.methods.borrow();
+        let ids = sorted_live(&map)
+            .filter(|def| {
+                def.specializers.iter().any(|s| {
+                    matches!(s, MethodSpecializer::Eql(o) if egcl_stdlib::equality::eql(*o, object))
+                })
+            })
+            .map(|def| def.method_id)
+            .collect();
+        return Ok(ids);
+    }
+    let class = resolve_class_metaobject(env, specializer)?;
+    let is_t = resolve_sym("T").and_then(egcl_stdlib::find_class) == Some(class);
+    // Names only, copied under the borrow; resolved after it is released.
+    let candidates: Vec<(EgclVal, Vec<Option<String>>)> = sorted_live(&env.methods.borrow())
+        .map(|def| {
+            let names = def
+                .specializers
+                .iter()
+                .filter_map(|s| match s {
+                    MethodSpecializer::Any => Some(None),
+                    MethodSpecializer::Class(name) => Some(Some(name.clone())),
+                    MethodSpecializer::Eql(_) => None,
+                })
+                .collect();
+            (def.method_id, names)
+        })
+        .collect();
+    let mut ids = Vec::new();
+    for (method, names) in candidates {
+        let specialized = names.iter().any(|name| match name {
+            None => is_t,
+            Some(name) => {
+                let symbol = resolve_sym(name).unwrap_or(NIL);
+                resolve_class_metaobject(env, symbol).unwrap_or(symbol) == class
+            }
+        });
+        if specialized {
+            ids.push(method);
+        }
+    }
+    Ok(ids)
 }
 
 /// `(required, optional, rest-or-key, key)` of an ordinary lambda list, the

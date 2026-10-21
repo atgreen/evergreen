@@ -4,6 +4,19 @@
 
 ### Added
 
+- `EGCL-MOP` reads generic functions and methods:
+  `generic-function-name`, `generic-function-lambda-list`,
+  `generic-function-argument-precedence-order`, `method-specializers`,
+  `method-generic-function`, `method-lambda-list`,
+  `specializer-direct-methods`, `specializer-direct-generic-functions`,
+  `compute-applicable-methods-using-classes` (AMOP's two values) and
+  `eql-specializer-object`. A program can find every generic function with a
+  method on a class and write a congruent method of its own on each; answers
+  follow `remove-method` and redefinition. `method-generic-function` now also
+  answers a `(setf name)` generic function instead of `nil`. The
+  [closer-mop fork](docs/library-forks.md) imports these, so the `c2mop:` names
+  work on EGCL
+  ([#511](https://github.com/atgreen/evergreen/pull/511)).
 - `egcl-ext:map-readtable-macro-characters` calls a function once for each
   macro character of a readtable, with its reader function, whether it is
   non-terminating, and, for a dispatching character, its sub-characters and

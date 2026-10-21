@@ -3891,11 +3891,14 @@ fn resolve(name: &str) -> Option<Handler> {
                     if owner == DETACHED_METHODS_KEY {
                         return Ok(NIL);
                     }
-                    let Some(name_sym) = resolve_sym(&owner) else {
+                    // The recorded name form, so a (SETF NAME) generic -- whose
+                    // registry key is no symbol's name -- answers too (#508).
+                    egcl_rt::rooted!(name_form = generic_name_form_for_key(env, &owner));
+                    if name_form.is_nil() {
                         return Ok(NIL);
-                    };
-                    egcl_rt::rooted!(function_form =
-                        vec_to_list(&[resolve_sym("FUNCTION").unwrap_or(NIL), name_sym]));
+                    }
+                    egcl_rt::rooted!(function_sym = resolve_sym("FUNCTION").unwrap_or(NIL));
+                    egcl_rt::rooted!(function_form = vec_to_list(&[*function_sym, *name_form]));
                     eval_form(*function_form, env)
                 }
             }

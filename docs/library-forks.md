@@ -31,7 +31,7 @@ exercises these forks:
 | atomics (CAS operations) | https://github.com/atgreen/atomics | `738ddccd7a6f3c44e83335ac5e3615e76972dfd2` |
 | cl-fad (environment lookup) | https://github.com/atgreen/cl-fad | `6e415a049a2936e614f52108274d7cc016e55694` |
 | precise-time | https://github.com/atgreen/precise-time | `045df7c4cddc84d775610cbecf47b462aaea29d6` |
-| closer-mop (slot inspection and callable instances) | https://github.com/atgreen/closer-mop | `e9f6d94ff7bb91768841339c87a89bf70b52b95f` |
+| closer-mop (class, slot, generic-function and method introspection; callable instances) | https://github.com/atgreen/closer-mop | `5539e9c926b8185d64eefe546257f466e7801630` |
 | ironclad (branch `egcl`: native AES, GHASH and SHA-256 block functions; needs EGCL with PR #410) | https://github.com/atgreen/ironclad | `57db5ee19708a72b9b7a405e5b620bb39f7439b2` |
 | pure-tls (branch `egcl`: environment lookup, cached trust stores, native text conversion) | https://github.com/atgreen/pure-tls | `480bbab6635d65cb74aa6c66f19f0d249beeb537` |
 | chipz (branch `egcl`: decompressing streams on EGCL's Gray streams) | https://github.com/atgreen/chipz | `a48e6e741a353a14ab4430eb1519e2f3d5b94aef` |
