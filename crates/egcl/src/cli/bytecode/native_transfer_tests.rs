@@ -15,6 +15,7 @@ mod live_signaling;
 mod linkage;
 mod nested;
 mod ordinary_osr;
+mod outer_pool;
 pub(super) mod ordinary_catch_osr;
 pub(super) mod ordinary_cleanup_osr;
 pub(super) mod ordinary_condition_osr;

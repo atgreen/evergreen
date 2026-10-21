@@ -75,11 +75,12 @@ pub fn single_value_state_after_normalized_calls(
     f: &Function, single_entry: bool, normalized_calls: &HashSet<Inst>,
 ) -> HashSet<Inst> {
     let blocks = f.block_order();
-    let incoming = |b, outgoing: &HashMap<_, bool>| {
+    let pred_lists = f.pred_lists();
+    let incoming = |b: crate::t2::ir::Block, outgoing: &HashMap<_, bool>| {
         if f.osr_entries.iter().any(|entry| entry.block == b) {
             return false;
         }
-        let preds = f.preds(b);
+        let preds = &pred_lists[b.index()];
         let entry = b == f.entry();
         (if entry { single_entry } else { !preds.is_empty() })
             && preds.iter().all(|pred| outgoing[pred])

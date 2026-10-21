@@ -32,6 +32,49 @@ pub(super) struct ActivationState {
     pub(super) env_frame: Option<Arc<SharedCell<EnvFrame>>>,
 }
 
+/// An outer activation's state, handed back to its code's pool when the
+/// activation ends, as `finish_nested` does for a child. Preparing a fresh
+/// state reserves a capture snapshot for every transfer site, and an outer
+/// entry from the interpreter did that on every call (bliss-t9tzf). Declare it
+/// before anything that roots or points into the state, so it drops last.
+pub(super) struct PooledActivation<'a> {
+    code: &'a TransferCode,
+    state: Option<ActivationState>,
+}
+
+impl<'a> PooledActivation<'a> {
+    pub(super) fn new(code: &'a TransferCode, state: ActivationState) -> Self {
+        Self {
+            code,
+            state: Some(state),
+        }
+    }
+}
+
+impl std::ops::Deref for PooledActivation<'_> {
+    type Target = ActivationState;
+    fn deref(&self) -> &ActivationState {
+        self.state.as_ref().expect("pooled activation state")
+    }
+}
+
+impl std::ops::DerefMut for PooledActivation<'_> {
+    fn deref_mut(&mut self) -> &mut ActivationState {
+        self.state.as_mut().expect("pooled activation state")
+    }
+}
+
+impl Drop for PooledActivation<'_> {
+    fn drop(&mut self) {
+        // `recycle` keeps only a quiescent state and clears its snapshots.
+        if let Some(state) = self.state.take() {
+            if !std::thread::panicking() {
+                state.recycle(self.code);
+            }
+        }
+    }
+}
+
 impl egcl_rt::gc::TraceHostRoots for ActivationState {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
         if let Some(ready) = &mut self.ready_osr {
@@ -164,7 +207,8 @@ impl ActivationState {
         if !(self.is_quiescent()
             && guard_idle
             && self.ready_osr.is_none()
-            && self.restart_templates.0.is_empty())
+            && self.restart_templates.0.is_empty()
+            && self.has_reserved_capacity(code))
         {
             return;
         }
@@ -180,7 +224,37 @@ impl ActivationState {
         }
     }
 
+    /// Whether every ledger still holds the room `prepare` reserves for
+    /// `code`. Helpers entered from generated code rely on it (`catches.len() <
+    /// catches.capacity()` and the like) instead of growing a Vec. An OSR
+    /// source loses its ledgers to `take_osr_state`, which leaves empty Vecs
+    /// with no capacity, and an OSR destination owns ledgers reserved for the
+    /// source's code: neither may go into a pool and come back as if prepared
+    /// (bliss-t9tzf).
+    fn has_reserved_capacity(&self, code: &TransferCode) -> bool {
+        let scopes = code.body.handler_cases.len()
+            + code.body.handler_binds.len()
+            + code.body.restart_cases.len();
+        let guard_reserved = self.guard_resume.as_ref().is_none_or(|guard| {
+            guard.handlers.capacity() >= code.guard_handler_capacity
+                && guard.cleanup_conts.capacity() >= code.cleanup_depths.len()
+                && guard.dyn_binds.capacity() >= code.special_binds
+        });
+        self.snapshots.len() == code.sites.sites().count()
+            && self.specials.capacity() >= code.special_binds
+            && self.cleanups.capacity() >= code.cleanup_depths.len()
+            && self.catches.capacity() >= code.catch_pushes
+            && self.handlers.capacity() >= code.body.handler_cases.len()
+            && self.handler_binds.capacity() >= code.body.handler_binds.len()
+            && self.restart_cases.capacity() >= code.body.restart_cases.len()
+            && self.dynamic_scopes.capacity() >= scopes
+            && self.cluster_frames.capacity() >= scopes
+            && guard_reserved
+    }
+
     pub(super) fn prepare(code: &TransferCode, env: &mut Env) -> Result<Self, EgclError> {
+        #[cfg(test)]
+        FRESH_PREPARES.with(|count| count.set(count.get() + 1));
         let special_capacity = code.special_binds;
         let mut specials = Vec::new();
         specials.try_reserve(special_capacity).map_err(|_| EgclError::Oom)?;
@@ -363,6 +437,18 @@ thread_local! {
 #[cfg(test)]
 pub(in crate::cli::bytecode) fn fail_next_guard_reservation_for_test() {
     FAIL_GUARD_RESERVATION.with(|fail| fail.set(true));
+}
+
+#[cfg(test)]
+thread_local! {
+    static FRESH_PREPARES: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Activation states built from scratch, rather than taken from a pool, since
+/// the last call.
+#[cfg(test)]
+pub(in crate::cli::bytecode) fn take_fresh_prepares_for_test() -> usize {
+    FRESH_PREPARES.with(|count| count.replace(0))
 }
 
 impl Drop for ActivationState {

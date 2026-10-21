@@ -5318,7 +5318,7 @@ fn emit_framed_inner(
                 | crate::control_scope::ScopeKind::LexicalEnvironment)
     }));
     let resolve_poll = |point| {
-        crate::t2::x64_frame::resolve_values_before(f, &machine, &layout, &const_tagged, point)
+        crate::t2::x64_frame::resolve_values_before_reading(f, &machine, &layout, &const_tagged, point, &read_vregs)
             .map_err(|_| EmitError::UnsupportedOp(0xFE))
     };
     let loop_maps: HashMap<_, _> = loop_points.iter()

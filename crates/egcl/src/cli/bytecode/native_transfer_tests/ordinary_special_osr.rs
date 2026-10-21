@@ -481,6 +481,44 @@ fn exercise_special_osr(guard: bool, throws: bool, repeated: bool) {
         before_scopes
     );
     assert_eq!(NATIVE_DEPTH.with(Cell::get), before_depth);
+    // The T1 code was the OSR source: its ledgers moved to the T2 activation.
+    // Entering it again must not reuse that drained state (bliss-t9tzf review).
+    native_transfer_entry::root_publication::OBSERVE.with(|hook| hook.set(None));
+    SPECIAL_OBSERVATION.with(|state| *state.borrow_mut() = SpecialObservation::default());
+    egcl_rt::rooted!(
+        marker = super::super::super::arena_cons(EgclVal::from_fixnum(0), EgclVal::from_fixnum(0))
+    );
+    egcl_rt::rooted!(setup = super::super::super::arena_cons(EgclVal::from_fixnum(0), NIL));
+    egcl_rt::rooted!(seen = super::super::super::arena_cons(NIL, NIL));
+    egcl_rt::rooted!(
+        cleanup = super::super::super::arena_cons(EgclVal::from_fixnum(0), EgclVal::from_fixnum(0))
+    );
+    let again = run_native(
+        &first,
+        symbol,
+        &[
+            *marker,
+            *setup,
+            *seen,
+            *cleanup,
+            *tag,
+            *current,
+            EgclVal::from_fixnum(3),
+            EgclVal::from_single_float(1.25),
+            *intermediate,
+        ],
+        &mut env,
+    );
+    assert!(
+        again.is_ok(),
+        "re-entering T1 after it was an OSR source: {:?}",
+        again.err()
+    );
+    assert_eq!(
+        super::super::super::cp(*cleanup),
+        (EgclVal::from_fixnum(1), EgclVal::from_fixnum(1)),
+        "re-entered cleanups execute exactly once"
+    );
 }
 
 #[test]
