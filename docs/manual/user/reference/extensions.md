@@ -2,7 +2,7 @@
 
 These extensions expose process state, synchronous subprocess execution,
 clocks, text encoding, package-local nicknames, funcallable instances,
-digests and cipher blocks, and atomic operations. They are in `EGCL-EXT`. Their signatures differ from some
+digests and cipher blocks, atomic operations, and readtable enumeration. They are in `EGCL-EXT`. Their signatures differ from some
 similarly named SBCL extensions; use this dictionary rather than substituting
 package names in an SBCL call.
 
@@ -459,6 +459,62 @@ Returns the operating system's error number for the failure, such as 98
 none, as for a host name that did not resolve. usocket's EGCL backend uses it
 to signal `usocket:address-in-use-error` and the other errno-specific
 conditions.
+
+## Readtables
+
+### `egcl-ext:map-readtable-macro-characters` { #map-readtable-macro-characters }
+
+**Function** `(egcl-ext:map-readtable-macro-characters function readtable)` → `nil`
+
+Calls `function` with four arguments, `(char reader-function
+non-terminating-p dispatch-alist)`, once for each character that has a
+reader-macro function in `readtable`, in order of character code. A
+`readtable` of `nil` means the standard readtable.
+
+`reader-function` and `non-terminating-p` are the values
+`get-macro-character` returns for `char`; for a standard macro character that
+is the same object `get-macro-character` reports, not a copy. `dispatch-alist`
+is `nil` unless `char` is a dispatching macro character. For one, it is a
+fresh list of `(sub-char . function)`, with `function` as
+`get-dispatch-macro-character` returns it, for every sub-character that has
+one. An ASCII letter is listed only in upper case, since
+`set-dispatch-macro-character` treats both cases as one. A dispatching
+character with no sub-characters also gets `nil`; call
+`get-dispatch-macro-character` once to tell it from a non-dispatching one.
+
+The function lists only what `get-macro-character` and
+`get-dispatch-macro-character` report, but never looks at every character:
+the cost depends on the number of macro characters, not on
+`char-code-limit` (1,114,112). Probing every code with `get-macro-character`
+instead, as portable libraries do, takes seconds. A character whose macro was
+removed with `(set-macro-character char nil)` is not listed.
+
+A `#+egcl` readtable iterator for named-readtables, in the shape its
+`%make-readtable-iterator` returns, needs only this function. With it,
+`merge-readtables-into` takes a few milliseconds rather than about 9 seconds:
+
+```lisp
+#+egcl
+(defun %make-readtable-iterator (readtable)
+  (let ((entries '()))
+    (egcl-ext:map-readtable-macro-characters
+     (lambda (char reader-fn non-terminating-p alist)
+       (declare (ignore non-terminating-p))
+       (push (list char reader-fn
+                   (or (and alist t)
+                       (handler-case
+                           (progn (get-dispatch-macro-character char #\A readtable) t)
+                         (error () nil)))
+                   alist)
+             entries))
+     readtable)
+    (setq entries (nreverse entries))
+    (lambda ()
+      (if entries
+          (destructuring-bind (char reader-fn disp? alist) (pop entries)
+            (values t char reader-fn disp? alist))
+          (values nil nil nil nil nil)))))
+```
 
 ## Internal functions { #internal-functions }
 

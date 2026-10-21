@@ -124,6 +124,7 @@ alphabetized by unqualified name and display their package explicitly.
 | `egcl-thread:make-mutex` | [Dictionary entry](concurrency.md#make-mutex) |
 | `egcl-ffi:make-pointer` | [Dictionary entry](foreign.md#pointers) |
 | `egcl-thread:make-thread` | [Dictionary entry](concurrency.md#make-thread) |
+| `egcl-ext:map-readtable-macro-characters` | [Dictionary entry](user/reference/extensions.md#map-readtable-macro-characters) |
 | `egcl-ffi:mem-ref` | [Dictionary entry](foreign.md#mem-ref) |
 | `egcl-ffi:mem-set` | [Dictionary entry](foreign.md#mem-ref) |
 | `egcl-ext:memory-barrier` | [Dictionary entry](user/reference/extensions.md#memory-barriers) |

@@ -4,6 +4,16 @@
 
 ### Added
 
+- `egcl-ext:map-readtable-macro-characters` calls a function once for each
+  macro character of a readtable, with its reader function, whether it is
+  non-terminating, and, for a dispatching character, its sub-characters and
+  their functions. Libraries such as named-readtables no longer need to probe
+  all 1,114,112 character codes, which took about 9 seconds per
+  `merge-readtables-into`; with this function a merge takes a few
+  milliseconds. `get-macro-character` now returns a function for a
+  dispatching macro character made with `make-dispatch-macro-character`
+  instead of `nil`
+  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
 - `EGCL_T2_LOG` and the `compile` trace (`EGCL_LOG=compile=trace`) say why a
   function never left the interpreter on x86-64 Linux: a captured closure
   environment, an `&rest`/`&key`/`&aux` lambda list, a special or boxed
