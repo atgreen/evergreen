@@ -97,11 +97,13 @@
   default that must be evaluated, `:allow-other-keys` in a call, or a
   malformed keyword list still takes the general binder. A one-`&key` call from
   bytecode into native code, which had become slower than the bytecode call it
-  replaced, is now about half its previous cost and faster than before native
-  `&key` entry existed, and every call from bytecode into native code is
-  cheaper. A function the baseline compiler declined is no longer re-checked
-  for tier-up on each call, and `EGCL_LOG=compile=trace` logs that decline
-  once instead of a dispatch line per call
+  replaced, is now about half its previous cost and faster than the bytecode
+  call; calls with several `&key` parameters are back to about the bytecode
+  call's cost, and every call from bytecode into native code is cheaper. A
+  function the baseline compiler declined, including every closure made from
+  a declined `(lambda ...)`, is no longer re-checked for tier-up on each call,
+  and `EGCL_LOG=compile=trace` logs that decline instead of a dispatch line per
+  call
   ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
 - On x86-64 Linux, a function whose `LAMBDA` makes a `RETURN-FROM`, `RETURN`
   or `GO` to a block or tag that the `LAMBDA` itself establishes, such as

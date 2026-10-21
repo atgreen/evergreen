@@ -299,14 +299,17 @@ impl VariadicPlan {
             return false;
         }
 
-        // Root everything that must survive the `&rest` list's allocation.
+        // The `&rest` list is the only allocation: root the arguments across
+        // it, and only on calls that build one. Nothing after it allocates,
+        // so neither `rest` nor `kept` needs a root once it is built.
         let mut rest = NIL;
-        egcl_rt::rooted_ref!(_rest = &mut rest);
         let mut kept: Vec<EgclVal> = Vec::new();
-        egcl_rt::rooted_ref!(_kept = &mut kept);
         let args = if self.rest {
             kept.extend_from_slice(args);
-            rest = super::super::vec_to_list(&kept[tail_start..]);
+            {
+                egcl_rt::rooted_ref!(_kept = &mut kept);
+                rest = super::super::vec_to_list(&kept[tail_start..]);
+            }
             &kept[..]
         } else {
             args

@@ -1312,7 +1312,7 @@ pub fn call_registered(
     }
     // T1 declined this body for good: it runs as bytecode, and there is no
     // tier decision left to make or to log on this call (bliss-nkzx6).
-    if t1_declined(sym) {
+    if t1_declined(sym) || closure_body_declined(sym, &callee) {
         return Some(run_with_sym(callee, args, *fn_val, sym, env));
     }
     let fn_obj = egcl_rt::function::is_interpreted_function(*fn_val).then_some(*fn_val);
@@ -20541,6 +20541,28 @@ static T1_DECLINED: egcl_rt::execution_local::ExecutionLocal<
 
 fn t1_declined(sym: u32) -> bool {
     T1_DECLINED.with(|declined| declined.borrow().contains(&sym))
+}
+
+/// Whether `sym` is a closure instance whose shared body T1 has declined
+/// through another instance, its compilation owner. Every `(lambda ...)`
+/// evaluation makes a fresh instance, and one called fewer than
+/// `t1_threshold()` times never reaches `native_for_dispatch` to inherit the
+/// decline there, so this consults the owner directly (bliss-nkzx6). It uses
+/// the validity checks `closure_compilation_owner` applies to a previous owner.
+fn closure_body_declined(sym: u32, body: &Arc<BytecodeFunction>) -> bool {
+    if !egcl_rt::symbols::is_uninterned(sym) {
+        return false;
+    }
+    let Some(owner) = CLOSURE_COMPILATION.with(|cache| {
+        cache.borrow().get(&(Arc::as_ptr(body) as usize)).map(|state| state.owner)
+    }) else {
+        return false;
+    };
+    owner != sym
+        && t1_declined(owner)
+        && !is_profile_pinned(owner)
+        && !is_profile_pinned(sym)
+        && registry_get(owner).is_some_and(|entry| Arc::ptr_eq(&entry, body))
 }
 /// The native code of the direct callees a queued T2 job was resolved
 /// against, keyed by the caller and its registry generation (bliss-6j6pk).
