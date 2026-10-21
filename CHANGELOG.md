@@ -253,7 +253,7 @@
   library handle" and closing one signalled an error, which broke reload code
   that closes a library before loading it again. Images now use format version
   12; images saved by older releases must be rebuilt
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#492](https://github.com/atgreen/evergreen/pull/492)).
 - A `THROW` from the default form of a `&key` or `&aux` parameter to a
   `CATCH` in the interpreted caller reaches that catch. Once the caller had
   been called a few times, the throw escaped as an internal error such as
