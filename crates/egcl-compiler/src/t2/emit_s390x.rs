@@ -487,7 +487,7 @@ pub fn emit_native_call_entry(spec: &NativeCallEntry) -> Result<Vec<u8>, EmitErr
     a.bind(slow);
     a.imm64(1, spec.fallback);
     a.jump_reg(1);
-    a.finish().ok_or_else(|| unsupported!())
+    a.finish().ok_or(unsupported!())
 }
 
 /// Order shared recipes before their users without recursive host calls or
@@ -2694,7 +2694,7 @@ mod tests {
     /// baked helper is visible in the result rather than silently slower.
     #[test]
     fn a_named_call_branches_through_the_cell_and_follows_a_later_redirect() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::atomic::AtomicUsize;
         const SENTINEL: u64 = 0x5ced_0002;
         const CELL: u64 = 0x5ced_0003;
         static SLOT: AtomicUsize = AtomicUsize::new(0);
@@ -2702,18 +2702,6 @@ mod tests {
         extern "C" fn baked(_: u64, _: u64, _: *const EgclVal, _: u64) -> u64 {
             SENTINEL
         }
-        // Both bridges speak the slice ABI: (cell, nargs, args, 0) in r2-r5.
-        extern "C" fn first(cell: u64, nargs: u64, args: *const EgclVal, _: u64) -> u64 {
-            assert_eq!((cell, nargs), (CELL, 1));
-            // SAFETY: the emitter points r4 at the activation argument area.
-            unsafe { (*args).0 + 1 }
-        }
-        extern "C" fn second(cell: u64, nargs: u64, args: *const EgclVal, _: u64) -> u64 {
-            assert_eq!((cell, nargs), (CELL, 1));
-            // SAFETY: as above.
-            unsafe { (*args).0 + 2 }
-        }
-
         let mut f = Function::new("z-named-cell");
         let block = f.entry();
         let x = f.add_block_param(block, IRType::TOP, ValueRepresentation::Tagged);
@@ -2769,6 +2757,18 @@ mod tests {
         assert_eq!(compiled.emitted_safepoints, 1);
         #[cfg(all(target_arch = "s390x", unix))]
         {
+            use std::sync::atomic::Ordering;
+            // Both bridges speak the slice ABI: (cell, nargs, args, 0) in r2-r5.
+            extern "C" fn first(cell: u64, nargs: u64, args: *const EgclVal, _: u64) -> u64 {
+                assert_eq!((cell, nargs), (CELL, 1));
+                // SAFETY: the emitter points r4 at the activation argument area.
+                unsafe { (*args).0 + 1 }
+            }
+            extern "C" fn second(cell: u64, nargs: u64, args: *const EgclVal, _: u64) -> u64 {
+                assert_eq!((cell, nargs), (CELL, 1));
+                // SAFETY: as above.
+                unsafe { (*args).0 + 2 }
+            }
             let code = egcl_rt::jit::JitBuffer::new(&compiled.code).unwrap();
             // SAFETY: the buffer owns the generated activation entry, and the
             // slots include every shadow word the emitter advertised.
@@ -2896,7 +2896,7 @@ mod tests {
         // A frame this size is reachable: num_slots is a u16, and
         // 8 * 65535 already exceeds the displacement on its own.
         assert!(matches!(
-            emit_native_call_entry(&spec(u16::max_value())),
+            emit_native_call_entry(&spec(u16::MAX)),
             Err(EmitError::UnsupportedOp(_))
         ));
         // One that fits still emits.
