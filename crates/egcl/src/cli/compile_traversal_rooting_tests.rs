@@ -81,7 +81,7 @@ fn check_relocated_tail(seed: bool) {
     let before = *tail;
     with_eval_context(&mut env, EvalContext::CompileFile, |env| {
         if seed {
-            seed_compile_time_definitions(*form, env);
+            seed_compile_time_definitions(*form, env)?;
         } else {
             process_compile_toplevel_form(*form, env)?;
         }

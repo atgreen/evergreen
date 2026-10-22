@@ -189,3 +189,30 @@ fn nested_compile_file_failure_does_not_fail_the_outer_compile() {
         "{stdout}\n{stderr}"
     );
 }
+
+/// A handler that answers the expander's error with a non-local exit leaves
+/// COMPILE-FILE: the compile-time passes that tolerate a failed expansion must
+/// not swallow the transfer.
+#[test]
+fn handler_exit_from_a_failed_expansion_leaves_compile_file() {
+    let dir = scratch("compile-file-macroexpansion-handler-exit");
+    let source = dir.join("exit.lisp");
+    std::fs::write(
+        &source,
+        format!("{SIGNALLING_MACRO}(errs-at-compile-time)\n"),
+    )
+    .unwrap();
+    let output = egcl(&format!(
+        r#"(format t "~&EXIT ~s~%"
+             (block out
+               (handler-bind ((error (lambda (c) (return-from out (princ-to-string c)))))
+                 (compile-file "{}")
+                 :completed)))"#,
+        source.display()
+    ));
+    let (stdout, stderr) = text(&output);
+    assert!(
+        stdout.contains("EXIT \"expanded at compile time, as it should be\""),
+        "{stdout}\n{stderr}"
+    );
+}

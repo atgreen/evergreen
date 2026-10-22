@@ -2255,12 +2255,9 @@ fn take_file_expansion_errors() -> Vec<String> {
 }
 
 /// Whether `error` is a failure of the expansion itself, as opposed to a control
-/// transfer passing through it or a request to stop the process.
+/// transfer passing through it, a request to stop, or storage exhaustion.
 fn is_reportable_expansion_error(error: &EgclError) -> bool {
-    !matches!(
-        error,
-        EgclError::Interrupt | EgclError::Shutdown | EgclError::Timeout | EgclError::Oom
-    ) && !matches!(error, EgclError::Internal(message) if message.starts_with("__"))
+    !super::must_escape_best_effort(error) && !matches!(error, EgclError::Oom)
 }
 
 /// Record that expanding `form` failed with `error` during COMPILE-FILE, and
