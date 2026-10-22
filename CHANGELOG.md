@@ -346,6 +346,16 @@
   `eval` used to return normally after the handler ran. Test harnesses such as
   LIFT reported a correct run-time `defclass`/`define-object` test as failing
   ([#515](https://github.com/atgreen/evergreen/pull/515)).
+- `compile-file` reports an error a macro's expander signals while the file is
+  compiled, as SBCL and CCL do: it prints a `caught ERROR` note naming the
+  definition and the form to `*error-output*`, returns `t` for both
+  `warnings-p` and `failure-p`, and compiles the form into code that signals a
+  `program-error` ("Execution of a form compiled with errors") when it is
+  reached. EGCL used to print nothing, return `nil` for both, and expand the
+  macro again at run time, so a function compiled this way behaved differently
+  from the rest of its fasl. Macros used in `defmethod` bodies are still
+  expanded when the method is loaded
+  ([#517](https://github.com/atgreen/evergreen/pull/517)).
 - A generic function created implicitly by `defmethod` now has `&key` with
   no keyword names in its lambda list, as CLHS 7.6.1 specifies, so a later
   method may accept different keywords. EGCL used to copy the first method's

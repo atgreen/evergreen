@@ -2202,6 +2202,128 @@ fn last_bail_reason() -> Option<String> {
     LAST_BAIL_REASON.with(|last| last.borrow().clone())
 }
 
+/// Macroexpansion errors met while COMPILE-FILE lowers one top-level form
+/// (GitHub #514). `Some` only for the extent of that form's lowering in
+/// [`build_bbu_from_forms`]; `None` everywhere else, so an opportunistic
+/// (runtime) compile keeps bailing to the tree-walker, which signals the
+/// expander's error itself when the form runs.
+///
+/// A failed expansion used to be an ordinary bail: the form fell through to the
+/// load-source fallback and the macro was expanded again at RUN time, in
+/// whatever dynamic environment it found then, with no report and with
+/// COMPILE-FILE returning `failure-p` NIL. CLHS 3.2.2.2 makes that expansion a
+/// compile-time act and 3.2.5 an error in it a compile-time error, so — as SBCL
+/// and CCL do — it is now reported, counted as a failure, and the offending
+/// form is compiled into code that signals a PROGRAM-ERROR when it is reached.
+static FILE_EXPANSION_ERRORS: egcl_rt::execution_local::ExecutionLocal<
+    RefCell<Option<Vec<String>>>,
+> = unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| const { RefCell::new(None) }) };
+
+/// Restores the enclosing collector state on drop (see [`FILE_EXPANSION_ERRORS`]).
+struct FileExpansionErrorsScope(Option<Option<Vec<String>>>);
+
+impl Drop for FileExpansionErrorsScope {
+    fn drop(&mut self) {
+        if let Some(previous) = self.0.take() {
+            FILE_EXPANSION_ERRORS.with(|cell| *cell.borrow_mut() = previous);
+        }
+    }
+}
+
+/// Collect expansion errors for one COMPILE-FILE top-level form.
+fn collect_file_expansion_errors() -> FileExpansionErrorsScope {
+    let previous = FILE_EXPANSION_ERRORS.with(|cell| cell.borrow_mut().replace(Vec::new()));
+    FileExpansionErrorsScope(Some(previous))
+}
+
+/// Stop collecting while a macro expander (user code) runs: anything it compiles
+/// is a live compilation, not part of the file being compiled.
+fn suspend_file_expansion_errors() -> FileExpansionErrorsScope {
+    let previous = FILE_EXPANSION_ERRORS.with(|cell| cell.borrow_mut().take());
+    FileExpansionErrorsScope(Some(previous))
+}
+
+/// The errors collected so far for the current form, deduplicated (a form may
+/// be lowered more than once while the file compiler tries its strategies).
+fn take_file_expansion_errors() -> Vec<String> {
+    FILE_EXPANSION_ERRORS.with(|cell| {
+        cell.borrow_mut()
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
+    })
+}
+
+/// Whether `error` is a failure of the expansion itself, as opposed to a control
+/// transfer passing through it, a request to stop, or storage exhaustion.
+fn is_reportable_expansion_error(error: &EgclError) -> bool {
+    !super::must_escape_best_effort(error) && !matches!(error, EgclError::Oom)
+}
+
+/// Record that expanding `form` failed with `error` during COMPILE-FILE, and
+/// return the form to compile in its place: one that signals a PROGRAM-ERROR
+/// naming the form and the compile-time error when it is evaluated. `None` when
+/// no file compilation is collecting or the error is not an expansion failure;
+/// the caller then bails as before.
+fn file_expansion_failure(form: EgclVal, error: &EgclError) -> Option<EgclVal> {
+    let collecting = FILE_EXPANSION_ERRORS.with(|cell| cell.borrow().is_some());
+    if !collecting || !is_reportable_expansion_error(error) {
+        return None;
+    }
+    // Compute every string before allocating: `form` is the caller's (rooted)
+    // value, but nothing below needs it once printed.
+    let printed = super::fmt_form_debug(form);
+    let report = format!("during macroexpansion of {printed}:\n{error}");
+    let message = format!(
+        "Execution of a form compiled with errors.\nForm:\n  {printed}\nCompilation error: {report}"
+    );
+    FILE_EXPANSION_ERRORS.with(|cell| {
+        if let Some(errors) = cell.borrow_mut().as_mut()
+            && !errors.contains(&report)
+        {
+            errors.push(report);
+        }
+    });
+    // (error 'simple-program-error :format-control "~A" :format-arguments '("…"))
+    // SIMPLE-PROGRAM-ERROR is the PROGRAM-ERROR that carries a report, as the
+    // evaluator's own program errors are (bliss-kk0i); SBCL's equivalent is its
+    // COMPILED-PROGRAM-ERROR.
+    let error_sym = resolve_sym("ERROR")?;
+    let program_error = resolve_sym("SIMPLE-PROGRAM-ERROR")?;
+    let control_key = resolve_sym(":FORMAT-CONTROL")?;
+    let arguments_key = resolve_sym(":FORMAT-ARGUMENTS")?;
+    let quote = resolve_sym("QUOTE")?;
+    egcl_rt::rooted!(text = arena_str(&message));
+    egcl_rt::rooted!(arguments = arena_cons(*text, NIL));
+    egcl_rt::rooted!(quoted_arguments = arena_cons(*arguments, NIL));
+    *quoted_arguments = arena_cons(quote, *quoted_arguments);
+    egcl_rt::rooted!(tail = arena_cons(*quoted_arguments, NIL));
+    *tail = arena_cons(arguments_key, *tail);
+    egcl_rt::rooted!(control = arena_str("~A"));
+    *tail = arena_cons(*control, *tail);
+    *tail = arena_cons(control_key, *tail);
+    egcl_rt::rooted!(quoted_type = arena_cons(program_error, NIL));
+    *quoted_type = arena_cons(quote, *quoted_type);
+    *tail = arena_cons(*quoted_type, *tail);
+    Some(arena_cons(error_sym, *tail))
+}
+
+/// "DEFUN NAME" for a top-level definition, else the (truncated) form itself:
+/// where a COMPILE-FILE error report says the error was found.
+fn toplevel_form_context(form: EgclVal) -> String {
+    if form.is_cons() {
+        let (head, rest) = cp(form);
+        if head.is_symbol() && rest.is_cons() {
+            let operator = sym_bare_name_rc(head);
+            if operator.starts_with("DEF") {
+                let name: String = super::fmt_form_debug(cp(rest).0).chars().take(120).collect();
+                return format!("{operator} {name}");
+            }
+        }
+    }
+    super::fmt_form_debug(form)
+}
+
 /// Snapshot of the bail histogram, most frequent first (bliss-x5y.1).
 pub fn bail_report() -> Vec<(String, u32)> {
     let mut v: Vec<(String, u32)> =
@@ -3535,10 +3657,24 @@ impl<'e> Lowerer<'e> {
         let menv = scoped
             .as_ref()
             .unwrap_or_else(|| self.macro_env.as_ref().unwrap());
+        let suspended = suspend_file_expansion_errors();
         let expanded = match compiler_macroexpand::macroexpand_all(form, menv) {
-            Ok(expanded) => expanded,
-            Err(_) => {
+            Ok(expanded) => {
+                drop(suspended);
+                expanded
+            }
+            Err(error) => {
+                drop(suspended);
                 self.leave_body_declarations(declarations);
+                // COMPILE-FILE: a user expander signalled inside the MACROLET
+                // body (GitHub #514). `Internal` also carries the local-macro
+                // mini-evaluator's own limits, which the tree-walker handles,
+                // so those still bail.
+                if !matches!(error, EgclError::Internal(_))
+                    && let Some(replacement) = file_expansion_failure(form, &error)
+                {
+                    return self.lower_expr(replacement);
+                }
                 return Err(record_bail(|| "macroexpand:macrolet".to_string()));
             }
         };
@@ -3629,8 +3765,21 @@ impl<'e> Lowerer<'e> {
             let menv = scoped
                 .as_ref()
                 .unwrap_or_else(|| self.macro_env.as_ref().unwrap());
-            match compiler_macroexpand::macroexpand_1(form, menv) {
+            let suspended = suspend_file_expansion_errors();
+            let expansion = compiler_macroexpand::macroexpand_1(form, menv);
+            drop(suspended);
+            match expansion {
                 Ok((expanded, true)) => return self.lower_expr(expanded),
+                // COMPILE-FILE: an expander that signals is a compile-time
+                // error, reported by the file compiler; the form becomes code
+                // that signals when reached instead of expanding at run time
+                // (GitHub #514).
+                Err(error) => {
+                    if let Some(replacement) = file_expansion_failure(form, &error) {
+                        return self.lower_expr(replacement);
+                    }
+                    return Err(record_bail(|| format!("macroexpand:{name}")));
+                }
                 _ => return Err(record_bail(|| format!("macroexpand:{name}"))),
             }
         }
@@ -3648,10 +3797,13 @@ impl<'e> Lowerer<'e> {
         let menv = scoped
             .as_ref()
             .unwrap_or_else(|| self.macro_env.as_ref().unwrap());
-        if !self_calls::notinline(op.as_symbol_index(), &self.inline_policies)
-            && let Ok((expanded, true)) = compiler_macroexpand::compiler_macroexpand_1(form, menv)
-        {
-            return self.lower_expr(expanded);
+        if !self_calls::notinline(op.as_symbol_index(), &self.inline_policies) {
+            let suspended = suspend_file_expansion_errors();
+            let expansion = compiler_macroexpand::compiler_macroexpand_1(form, menv);
+            drop(suspended);
+            if let Ok((expanded, true)) = expansion {
+                return self.lower_expr(expanded);
+            }
         }
         // Keep function calls intact here: source-level builtin and accessor
         // substitutions erased bindings that can change after compilation.
@@ -9173,7 +9325,10 @@ fn compile_function_forcing_boxed(
         // (bliss-9u6d).
         let mut menv = super::macroexpand_environment_from_cli(env);
         egcl_rt::rooted_ref!(_menv_root = &mut menv);
-        match compiler_macroexpand::macroexpand_all(progn, &menv) {
+        let suspended = suspend_file_expansion_errors();
+        let expansion = compiler_macroexpand::macroexpand_all(progn, &menv);
+        drop(suspended);
+        match expansion {
             Ok(mut expanded) => {
                 egcl_rt::rooted_ref!(_expanded_root = &mut expanded);
                 // Remove our synthetic PROGN so leading declarations remain
@@ -9186,9 +9341,18 @@ fn compile_function_forcing_boxed(
                 }
             }
             Err(err) => {
-                // A macrolet body that will not expand cannot be lowered; a
-                // capture-expand failure is best-effort — keep the raw body.
-                if uses_macrolet {
+                // COMPILE-FILE: a user expander signalled inside a MACROLET in
+                // this body. Compile the body as one that signals that error
+                // (GitHub #514); see lower_macrolet for why `Internal` bails.
+                if uses_macrolet
+                    && !matches!(err, EgclError::Internal(_))
+                    && let Some(replacement) = file_expansion_failure(progn, &err)
+                {
+                    egcl_rt::rooted!(replacement = replacement);
+                    *body = arena_cons(*replacement, NIL);
+                } else if uses_macrolet {
+                    // A macrolet body that will not expand cannot be lowered; a
+                    // capture-expand failure is best-effort — keep the raw body.
                     let _ = record_bail(|| format!("macroexpand:macrolet:{err}"));
                     return None;
                 }
@@ -11041,6 +11205,7 @@ pub fn build_bbu_from_forms(
     src_path: &str,
     source: &str,
     env: &Env,
+    expansion_errors: &mut Vec<String>,
 ) -> Result<Option<Vec<u8>>, EgclError> {
     if forms.len() != definition_packages.len() {
         return Err(bbu_error("compile-file form/package metadata mismatch"));
@@ -11072,6 +11237,9 @@ pub fn build_bbu_from_forms(
         egcl_rt::rooted_ref!(_form_root = &mut form);
         let mut done = false;
         reset_last_bail_reason();
+        // Every lowering attempt below for this form reports a failed
+        // macroexpansion here; drained once the form is done (GitHub #514).
+        let _expansion_errors_scope = collect_file_expansion_errors();
 
         // IN-PACKAGE changes dynamic state observed by later EXPORT/INTERN
         // and *PACKAGE* reads, even though symbol literals are fully qualified.
@@ -11249,6 +11417,16 @@ pub fn build_bbu_from_forms(
                     }
                 }
             }
+        }
+
+        let form_errors = take_file_expansion_errors();
+        if !form_errors.is_empty() {
+            let context = toplevel_form_context(form);
+            expansion_errors.extend(
+                form_errors
+                    .into_iter()
+                    .map(|error| format!("in: {context}\n{error}")),
+            );
         }
 
         if !done {

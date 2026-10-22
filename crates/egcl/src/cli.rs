@@ -10887,7 +10887,13 @@ pub(super) fn fmt_form_debug(val: EgclVal) -> String {
     let mut s = String::new();
     print_val(val, &mut s);
     if s.len() > 300 {
-        s.truncate(300);
+        // Cut on a character boundary: a form printing a non-ASCII string or
+        // symbol near the limit would otherwise panic here.
+        let mut end = 300;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
         s.push('…');
     }
     s
@@ -13547,7 +13553,7 @@ fn read_forms_for_compile(
             // package, so its target symbol's home package is not necessarily
             // the package in which the expander was defined.
             let definition_package = env.current_package.clone();
-            seed_compile_time_definitions(val, env);
+            seed_compile_time_definitions(val, env)?;
             // A compile-time effect that FAILS is a failed compilation, not a
             // footnote. This used to discard the error, mentioning it only under
             // EGCL_BFASL_TRACE, so a file whose whole body was
@@ -13604,16 +13610,23 @@ fn read_forms_for_compile(
 /// Best-effort seeding precedes actual compile-time execution. Raw probe
 /// failures remain ordinary Err results; actual evaluation signals normally.
 /// The mode travels with Env (and its children), including across fiber yields.
-fn probe_compile_time_value(form: EgclVal, env: &mut Env) -> Option<EgclVal> {
+///
+/// A control transfer, or a request to stop, passing through the probe is not
+/// a failed probe: it propagates (`must_escape_best_effort`).
+fn probe_compile_time_value(form: EgclVal, env: &mut Env) -> Result<Option<EgclVal>, EgclError> {
     let previous = std::mem::replace(&mut env.speculative_evaluation, true);
     match eval_form(form, env) {
         Ok(value) => {
             env.speculative_evaluation = previous;
-            Some(value)
+            Ok(Some(value))
         }
-        Err(_) => {
+        Err(error) => {
             env.speculative_evaluation = previous;
-            None
+            if must_escape_best_effort(&error) {
+                Err(error)
+            } else {
+                Ok(None)
+            }
         }
     }
 }
@@ -13623,9 +13636,9 @@ mod compile_traversal_rooting_tests;
 #[cfg(test)]
 mod search_rooting_tests;
 
-fn seed_compile_time_definitions(form: EgclVal, env: &mut Env) {
+fn seed_compile_time_definitions(form: EgclVal, env: &mut Env) -> Result<(), EgclError> {
     if !form.is_cons() {
-        return;
+        return Ok(());
     }
     let (op, cdr) = cp(form);
     if op.is_symbol() {
@@ -13633,7 +13646,7 @@ fn seed_compile_time_definitions(form: EgclVal, env: &mut Env) {
         match symbol_leaf_name(&op_name) {
             // Top-level processing proclaims variables special in order.
             // Their initializers run only when the form is actually evaluated.
-            "DEFVAR" | "DEFPARAMETER" => return,
+            "DEFVAR" | "DEFPARAMETER" => return Ok(()),
             "DEFCONSTANT" => {
                 // CLHS 3.2.2.3: a DEFCONSTANT compiled in a file is recognised as
                 // a constant for the rest of that compilation, so seeding its
@@ -13648,7 +13661,7 @@ fn seed_compile_time_definitions(form: EgclVal, env: &mut Env) {
                 // `((defconstant) …)`, whose "name" is NIL. Neither NIL nor T
                 // can be a DEFCONSTANT name, and seeding them panicked.
                 if !cdr.is_cons() {
-                    return;
+                    return Ok(());
                 }
                 let (symbol, rest) = cp(cdr);
                 if symbol.is_symbol() && symbol != NIL && symbol != T {
@@ -13656,7 +13669,7 @@ fn seed_compile_time_definitions(form: EgclVal, env: &mut Env) {
                         // An init form that cannot be evaluated yet seeds
                         // nothing. A seeded NIL would become
                         // a permanent constant (bliss-2pmq).
-                        if let Some(value) = probe_compile_time_value(cp(rest).0, env) {
+                        if let Some(value) = probe_compile_time_value(cp(rest).0, env)? {
                             seed_compile_time_binding(env, symbol, value);
                             mark_constant_name(symbol);
                         }
@@ -13665,19 +13678,20 @@ fn seed_compile_time_definitions(form: EgclVal, env: &mut Env) {
                         mark_constant_name(symbol);
                     }
                 }
-                return;
+                return Ok(());
             }
-            "QUOTE" | "FUNCTION" => return,
+            "QUOTE" | "FUNCTION" => return Ok(()),
             _ => {}
         }
     }
     egcl_rt::rooted!(cursor = form);
     while cursor.is_cons() {
         let item = cp(*cursor).0;
-        seed_compile_time_definitions(item, env);
+        seed_compile_time_definitions(item, env)?;
         // Recursive evaluation may relocate the entire list, including its tail.
         *cursor = cp(*cursor).1;
     }
+    Ok(())
 }
 
 /// Record SYMBOL as a DEFCONSTANT name, so CONSTANTP answers for it. The same
@@ -13868,28 +13882,32 @@ fn eval_when_has_situation(
     Ok(found)
 }
 
-fn expand_compile_toplevel_form(form: EgclVal, env: &mut Env) -> EgclVal {
+fn expand_compile_toplevel_form(form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     // Macro expansion allocates. Keep the current expansion rooted so each
     // iteration observes its post-GC address rather than a stale nursery copy.
     egcl_rt::rooted!(form = form);
     for _ in 0..256 {
         if !form.is_cons() {
-            return *form;
+            return Ok(*form);
         }
         let (op, rest) = cp(*form);
         if !op.is_symbol() {
-            return *form;
+            return Ok(*form);
         }
         let name = sym_name(op);
         let Some(mdef) = lookup_macro(env, &name) else {
-            return *form;
+            return Ok(*form);
         };
         match expand_macro(&mdef, rest, env, *form) {
             Ok(expanded) if expanded != *form => *form = expanded,
-            _ => return *form,
+            Err(error) if must_escape_best_effort(&error) => return Err(error),
+            // A failed expansion keeps the macro call; lowering it repeats the
+            // expansion, reports the error and compiles the form to code that
+            // signals it (GitHub #514).
+            _ => return Ok(*form),
         }
     }
-    *form
+    Ok(*form)
 }
 
 /// Format a UNIX timestamp as SBCL's compile-note date, e.g. "16 AUG 2026
@@ -13942,7 +13960,7 @@ fn compile_file_load_forms(form: EgclVal, env: &mut Env) -> Result<Vec<EgclVal>,
             return Ok(vec![*form]);
         }
     }
-    *form = expand_compile_toplevel_form(*form, env);
+    *form = expand_compile_toplevel_form(*form, env)?;
     if !form.is_cons() {
         return Ok(vec![*form]);
     }
@@ -14222,13 +14240,20 @@ fn process_compile_toplevel_form_at(
             }
             // A macro call is expanded, then its expansion processed.
             if let Some(mdef) = lookup_macro(env, &name) {
-                if let Ok(mut expanded) = expand_macro(&mdef, cdr, env, form) {
-                    egcl_rt::rooted_ref!(_expanded_root = &mut expanded);
-                    return process_compile_toplevel_form_at(expanded, env, depth + 1);
+                match expand_macro(&mdef, cdr, env, form) {
+                    Ok(mut expanded) => {
+                        egcl_rt::rooted_ref!(_expanded_root = &mut expanded);
+                        return process_compile_toplevel_form_at(expanded, env, depth + 1);
+                    }
+                    // A handler's non-local exit (or a request to stop) leaving
+                    // the expander is not a failed expansion.
+                    Err(error) if must_escape_best_effort(&error) => return Err(error),
+                    // An expander that fails here has no compile-time effect
+                    // to process. The form stays in the file, and the file
+                    // compiler reports the error when it lowers the form,
+                    // compiling it to code that signals instead (GitHub #514).
+                    Err(_) => return Ok(()),
                 }
-                // An expander that fails here is left to the ordinary load-time
-                // path, exactly as `macroexpand_all` does.
-                return Ok(());
             }
         }
     }
@@ -18207,6 +18232,40 @@ fn load_bfasl_into_env(bytes: &[u8], env: &mut Env) -> Result<EgclVal, EgclError
     with_eval_context(env, EvalContext::Load, |env| read_eval_all_env(&src, env))
 }
 
+/// Compile-time ERRORs the current COMPILE-FILE has reported (GitHub #514).
+/// COMPILE-FILE saves and zeroes it around its own compilation, so a nested
+/// COMPILE-FILE (from a macro or an EVAL-WHEN) does not fail its caller.
+static COMPILE_FILE_ERROR_COUNT: egcl_rt::execution_local::ExecutionLocal<std::cell::Cell<usize>> =
+    unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| const { std::cell::Cell::new(0) }) };
+
+/// Swap the COMPILE-FILE error count for `count`, returning the previous one.
+fn replace_compile_file_error_count(count: usize) -> usize {
+    COMPILE_FILE_ERROR_COUNT.with(|cell| cell.replace(count))
+}
+
+/// Print each compile-time error COMPILE-FILE found to `*ERROR-OUTPUT*`, in the
+/// `; caught ERROR:` style SBCL uses, and count it so COMPILE-FILE returns
+/// WARNINGS-P and FAILURE-P true (CLHS 3.2.5).
+fn report_compile_file_errors(src_path: &str, errors: &[String], env: &mut Env) {
+    if errors.is_empty() {
+        return;
+    }
+    let mut text = format!("; file: {src_path}\n");
+    for error in errors {
+        text.push_str(";\n; caught ERROR:\n");
+        for line in error.lines() {
+            text.push_str(";   ");
+            text.push_str(line);
+            text.push('\n');
+        }
+    }
+    let stream = env.lookup_var("*ERROR-OUTPUT*").unwrap_or(NIL);
+    if stream.is_nil() || write_str_to(stream, &text, env).is_err() {
+        eprint!("{text}");
+    }
+    COMPILE_FILE_ERROR_COUNT.with(|cell| cell.set(cell.get() + errors.len()));
+}
+
 /// Compile a source unit to a source-independent `.bfasl` byte image. New
 /// writers emit only the authoritative BBU plus source/debug metadata; if any
 /// load-time form cannot be represented as bytecode, compilation fails rather
@@ -18234,9 +18293,7 @@ fn build_bfasl_from_source(
             // A control-transfer token (see read_forms_for_compile) is not a
             // file that cannot be pre-read: the transfer is in progress and
             // writing a source-only artifact would swallow it.
-            Err(e) if matches!(&e, EgclError::Internal(message) if message.starts_with("__")) => {
-                return Err(e);
-            }
+            Err(e) if must_escape_best_effort(&e) => return Err(e),
             Err(e) => {
                 // This downgrade IS load-bearing — iterate installs its `#L` reader
                 // macro from a mid-file eval-when the upfront pass cannot honour — but
@@ -18270,7 +18327,18 @@ fn build_bfasl_from_source(
             }
         };
     egcl_rt::rooted_ref!(_forms_root = &mut forms);
-    match bytecode::build_bbu_from_forms(&forms, &definition_packages, src_path, source, env)? {
+    let mut expansion_errors = Vec::new();
+    let unit = bytecode::build_bbu_from_forms(
+        &forms,
+        &definition_packages,
+        src_path,
+        source,
+        env,
+        &mut expansion_errors,
+    );
+    // Report before propagating any later failure: these were found first.
+    report_compile_file_errors(src_path, &expansion_errors, env);
+    match unit? {
         Some(bytecode_unit) => Ok(egcl_rt::bfasl::BfaslBuilder::new()
             .content_hash(egcl_rt::bfasl::content_hash(source.as_bytes()))
             .section(egcl_rt::bfasl::section::BYTECODE_UNIT, bytecode_unit)

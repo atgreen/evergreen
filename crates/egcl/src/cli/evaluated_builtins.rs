@@ -4686,6 +4686,9 @@ fn resolve(name: &str) -> Option<Handler> {
                 _compile_package_binding =
                     DynBind::establish(compile_package_symbol, compile_dynamic_package)
             );
+            // This compilation's own compile-time errors (GitHub #514); the
+            // caller's count, if this COMPILE-FILE is nested, is restored below.
+            let outer_error_count = replace_compile_file_error_count(0);
             let image = {
                 // Bind BEFORE reading: #.*COMPILE-FILE-PATHNAME* must
                 // capture the source, even when ASDF redirects the output.
@@ -4703,6 +4706,7 @@ fn resolve(name: &str) -> Option<Handler> {
                 );
                 build_bfasl_from_source(&source, &src_path, env)
             };
+            let error_count = replace_compile_file_error_count(outer_error_count);
             if env.current_package != saved_package {
                 env.current_package = saved_package.clone();
                 env.define_local("*PACKAGE*", package_object(&saved_package));
@@ -4736,7 +4740,10 @@ fn resolve(name: &str) -> Option<Handler> {
                 );
             }
             let (out_pn, _) = egcl_stdlib::parse_namestring(arena_str(&out_path), None, None)?;
-            env.set_mv(vec![out_pn, NIL, NIL]);
+            // An ERROR reported during compilation makes both WARNINGS-P and
+            // FAILURE-P true (CLHS COMPILE-FILE, 3.2.5).
+            let failed = if error_count > 0 { T } else { NIL };
+            env.set_mv(vec![out_pn, failed, failed]);
             Ok(out_pn)
         }),
 
