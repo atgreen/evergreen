@@ -301,6 +301,195 @@ macro_rules! unsupported {
     };
 }
 
+/// The largest displacement a System Z long-displacement operand encodes.
+/// The framed emitter applies the same bound to its own frame.
+const MAX_DISPLACEMENT: i32 = 524_287;
+
+/// Everything a standalone native call entry needs to know about its callee
+/// and the execution that owns it. Every address is runtime-owned and must
+/// outlive the emitted bytes; the emitter bakes them as immediates.
+#[derive(Clone, Debug)]
+pub struct NativeCallEntry {
+    /// The owning execution's `EgclStack`.
+    pub stack: u64,
+    /// That execution's `NATIVE_DEPTH` counter, a `u32`.
+    pub depth: u64,
+    /// The value `native_depth_cap()` returns. At or above it the entry
+    /// declines, exactly as the interpreter's dispatch does.
+    pub depth_cap: u16,
+    /// This entry's own activity counter, a `usize`. The runtime keeps the
+    /// version alive while it is nonzero.
+    pub active: u64,
+    /// The callee's activation entry, `fn(slots, egcl_stack) -> value`.
+    pub entry: u64,
+    /// The callee's `CodeInfo`, stored in the frame header.
+    pub code_info: u64,
+    /// The frame-header flag word for an ordinary call frame.
+    pub frame_flags: u32,
+    /// The callee's activation size in tagged words.
+    pub num_slots: u16,
+    /// The activation slot each parameter binds, in parameter order.
+    pub params: Vec<u16>,
+    /// The nonallocating multiple-value reset the callee's contract expects.
+    pub clear_mv: u64,
+    /// The Rust bridge a declined guard tail-jumps to, with the incoming
+    /// arguments untouched.
+    pub fallback: u64,
+}
+
+/// Emit the per-callee entry a linkage cell publishes: the slice form
+/// `(cell, nargs, args, 0)` in r2-r5, returning the callee's value in r2.
+///
+/// `direct_native_call` emits this same sequence inline at a call site the
+/// runtime could resolve when the CALLER was compiled. Most named calls are
+/// not resolvable then -- mutual recursion, a callee compiled in the same
+/// background batch, one that tiers up later -- so the cell needs a copy that
+/// belongs to the callee instead, reachable by any caller through the cell's
+/// entry word (bliss-9va4r).
+///
+/// Three guards run before the entry claims a frame, so a decline tail-jumps
+/// to `fallback` with r2-r5 exactly as received and no frame to unwind: the
+/// supplied argument count must equal the callee's arity, the native depth
+/// must be under the cap, and the callee's frame must fit the EgclStack.
+///
+/// The frame's `function` word is NIL, as the inline path already leaves it:
+/// baking a callable into the instruction stream would hand the collector a
+/// pointer it cannot update. A backtrace through one of these frames
+/// identifies the callee by its `code_info`, not by that word.
+pub fn emit_native_call_entry(spec: &NativeCallEntry) -> Result<Vec<u8>, EmitError> {
+    let bs_base = egcl_rt::EgclStack::OFFSET_BASE as i32;
+    let bs_sp = egcl_rt::EgclStack::OFFSET_SP_OFFSET as i32;
+    let bs_fp = egcl_rt::EgclStack::OFFSET_FP as i32;
+    let bs_cap = egcl_rt::EgclStack::OFFSET_CAPACITY as i32;
+    let f_prev = core::mem::offset_of!(egcl_rt::Frame, prev_fp) as i32;
+    let f_ret = core::mem::offset_of!(egcl_rt::Frame, return_pc) as i32;
+    let f_func = core::mem::offset_of!(egcl_rt::Frame, function) as i32;
+    let f_ci = core::mem::offset_of!(egcl_rt::Frame, code_info) as i32;
+    let f_flags = core::mem::offset_of!(egcl_rt::Frame, flags) as i32;
+    let f_nloc = core::mem::offset_of!(egcl_rt::Frame, num_locals) as i32;
+    let hdr = core::mem::size_of::<egcl_rt::Frame>() as i32;
+    let nslots = i32::from(spec.num_slots);
+    let frame_bytes = hdr + 8 * nslots;
+    if spec.params.len() > usize::from(spec.num_slots)
+        || spec.params.iter().any(|slot| i32::from(*slot) >= nslots)
+        || spec.entry == 0
+        || spec.fallback == 0
+        || spec.clear_mv == 0
+        || i16::try_from(spec.params.len()).is_err()
+        || i16::try_from(spec.depth_cap).is_err()
+        // Every slot and the frame size itself are reached by a signed 20-bit
+        // displacement. A callee whose activation does not fit declines here,
+        // because the assembler would otherwise assert -- and a panic inside
+        // the compiler is a process abort, not a tier decline.
+        || frame_bytes > MAX_DISPLACEMENT
+    {
+        return Err(unsupported!());
+    }
+    // Above the 160-byte linkage area: the caller's frame pointer and stack
+    // offset, the incoming argument slice, and the callee's result.
+    const OLD_FP: i32 = 160;
+    const OLD_SP: i32 = 168;
+    const ARGS: i32 = 176;
+    const RESULT: i32 = 184;
+    const EXTRA: i32 = 32;
+
+    let mut a = Asm::new();
+    let slow = a.label();
+    // ── Guards, all before the frame: r0 and r1 are the only scratch, so a
+    // decline leaves r2-r5 and r14 exactly as they arrived.
+    a.compare_imm(3, spec.params.len() as i16);
+    a.branch(6, slow);
+    a.imm64(1, spec.depth);
+    a.load_u32(0, 1, 0);
+    a.compare_imm(0, spec.depth_cap as i16);
+    a.branch(10, slow); // at or above the cap
+    a.imm64(1, spec.stack);
+    a.load(0, 1, bs_cap);
+    a.load(1, 1, bs_sp);
+    a.address(1, 1, frame_bytes);
+    a.compare(1, 0);
+    a.branch(2, slow); // the callee's frame would not fit
+
+    a.prologue_with(EXTRA);
+    a.store(4, 15, ARGS);
+    a.imm64(1, spec.stack);
+    a.load(6, 1, bs_base);
+    a.load(7, 1, bs_sp);
+    a.store(7, 15, OLD_SP);
+    a.load(8, 1, bs_fp);
+    a.store(8, 15, OLD_FP);
+    a.address(9, 7, frame_bytes); // the new stack offset
+    a.mov(10, 6);
+    a.add(10, 7); // the callee's frame start
+    // ── Frame header.
+    a.store(8, 10, f_prev);
+    a.imm64(0, 0);
+    a.store(0, 10, f_ret);
+    a.imm64(0, NIL.0);
+    a.store(0, 10, f_func);
+    a.imm64(0, spec.code_info);
+    a.store(0, 10, f_ci);
+    a.imm64(0, u64::from(spec.frame_flags));
+    a.store_u32(0, 10, f_flags);
+    a.imm64(0, spec.num_slots as u64);
+    a.store_u16(0, 10, f_nloc);
+    // ── Every slot starts NIL, then the arguments land in theirs. Filling
+    // first costs a store per bound slot and removes the question of which
+    // slots a parameter list leaves untouched.
+    a.imm64(0, NIL.0);
+    for slot in 0..nslots {
+        a.store(0, 10, hdr + 8 * slot);
+    }
+    a.load(11, 15, ARGS);
+    for (index, &slot) in spec.params.iter().enumerate() {
+        a.load(0, 11, 8 * index as i32);
+        a.store(0, 10, hdr + 8 * i32::from(slot));
+    }
+    // ── Publish the completed frame before anything can collect.
+    a.store(10, 1, bs_fp);
+    a.store(9, 1, bs_sp);
+    a.imm64(1, spec.active);
+    a.load(0, 1, 0);
+    a.add_imm(0, 1);
+    a.store(0, 1, 0);
+    a.imm64(1, spec.depth);
+    a.load_u32(0, 1, 0);
+    a.add_imm(0, 1);
+    a.store_u32(0, 1, 0);
+    // A nonallocating leaf: the callee's contract is a fresh value context.
+    a.imm64(1, spec.clear_mv);
+    a.call_reg(1);
+    // ── Enter the callee: r2 = its activation slots, r3 = the EgclStack.
+    a.imm64(1, spec.stack);
+    a.load(2, 1, bs_fp);
+    a.address(2, 2, hdr);
+    a.mov(3, 1);
+    a.imm64(1, spec.entry);
+    a.call_reg(1);
+    a.store(2, 15, RESULT);
+    // ── Pop the frame and release the version.
+    a.imm64(1, spec.stack);
+    a.load(0, 15, OLD_FP);
+    a.store(0, 1, bs_fp);
+    a.load(0, 15, OLD_SP);
+    a.store(0, 1, bs_sp);
+    a.imm64(1, spec.depth);
+    a.load_u32(0, 1, 0);
+    a.add_imm(0, -1);
+    a.store_u32(0, 1, 0);
+    a.imm64(1, spec.active);
+    a.load(0, 1, 0);
+    a.add_imm(0, -1);
+    a.store(0, 1, 0);
+    a.load(2, 15, RESULT);
+    a.epilogue_with(EXTRA);
+
+    a.bind(slow);
+    a.imm64(1, spec.fallback);
+    a.jump_reg(1);
+    a.finish().ok_or_else(|| unsupported!())
+}
+
 /// Order shared recipes before their users without recursive host calls or
 /// exponential re-emission. Public emitter callers may supply unverified IR,
 /// so reject missing dependencies and cycles here as well as in the verifier.
@@ -2594,6 +2783,124 @@ mod tests {
             SLOT.store(second as *const () as usize, Ordering::Release);
             assert_eq!(unsafe { entry(slots.as_mut_ptr()) }, 12);
         }
+    }
+
+    /// The per-callee entry a linkage cell publishes, executed on hardware:
+    /// it must bind the slice arguments into the callee's activation, hand
+    /// the callee a published frame, and leave the EgclStack, the depth and
+    /// its own activity counter exactly as it found them. Each guard must
+    /// decline to the fallback with nothing half-built.
+    #[cfg(all(target_arch = "s390x", unix))]
+    #[test]
+    fn a_published_native_call_entry_binds_a_frame_and_restores_the_stack() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        const SENTINEL: u64 = 0x5ced_0004;
+        const CODE_INFO: u64 = 0x5ced_0005;
+        static CLEARED: AtomicU64 = AtomicU64::new(0);
+
+        // The callee's activation entry: (slots, egcl_stack) -> value.
+        extern "C" fn callee(slots: *mut u64, _stack: *const u64) -> u64 {
+            // SAFETY: the entry hands over its freshly published activation.
+            unsafe { *slots + 1 }
+        }
+        extern "C" fn clear_mv() {
+            CLEARED.fetch_add(1, Ordering::Relaxed);
+        }
+        extern "C" fn fallback(_: u64, _: u64, _: *const u64, _: u64) -> u64 {
+            SENTINEL
+        }
+
+        let base = egcl_rt::EgclStack::OFFSET_BASE / 8;
+        let sp = egcl_rt::EgclStack::OFFSET_SP_OFFSET / 8;
+        let fp = egcl_rt::EgclStack::OFFSET_FP / 8;
+        let capacity = egcl_rt::EgclStack::OFFSET_CAPACITY / 8;
+        // The emitted code reads and writes only these four header words and
+        // the arena they describe, so a zeroed buffer laid out at the
+        // published offsets stands in for a whole EgclStack here.
+        let mut header = vec![0u64; 64];
+        let mut arena = vec![0u64; 1024];
+        header[base] = arena.as_mut_ptr() as u64;
+        header[sp] = 0;
+        header[fp] = 0;
+        header[capacity] = (arena.len() * 8) as u64;
+        let mut depth: u32 = 0;
+        let mut active: u64 = 0;
+
+        let spec = NativeCallEntry {
+            stack: header.as_mut_ptr() as u64,
+            depth: std::ptr::from_mut(&mut depth) as u64,
+            depth_cap: 64,
+            active: std::ptr::from_mut(&mut active) as u64,
+            entry: callee as *const () as u64,
+            code_info: CODE_INFO,
+            frame_flags: 0x21,
+            num_slots: 3,
+            params: vec![0],
+            clear_mv: clear_mv as *const () as u64,
+            fallback: fallback as *const () as u64,
+        };
+        let code = egcl_rt::jit::JitBuffer::new(&emit_native_call_entry(&spec).unwrap()).unwrap();
+        // SAFETY: the buffer owns the slice-form entry just emitted.
+        let entry: extern "C" fn(u64, u64, *const u64, u64) -> u64 =
+            unsafe { std::mem::transmute(code.as_ptr()) };
+
+        let args = [41u64];
+        assert_eq!(entry(0xcafe, 1, args.as_ptr(), 0), 42, "argument bound");
+        assert_eq!(CLEARED.load(Ordering::Relaxed), 1, "values were reset");
+        // The frame is popped: the collector must not keep scanning it.
+        assert_eq!(header[sp], 0, "stack offset restored");
+        assert_eq!(header[fp], 0, "frame pointer restored");
+        assert_eq!(depth, 0, "native depth restored");
+        assert_eq!(active, 0, "the version was released");
+        // The callee really ran on a frame this entry built.
+        let header_words = core::mem::size_of::<egcl_rt::Frame>() / 8;
+        assert_eq!(
+            arena[core::mem::offset_of!(egcl_rt::Frame, code_info) / 8],
+            CODE_INFO
+        );
+        assert_eq!(arena[header_words], 41, "slot 0 held the argument");
+        assert_eq!(arena[header_words + 1], NIL.0, "unbound slots are NIL");
+
+        // Each guard declines without building anything.
+        assert_eq!(entry(0xcafe, 2, args.as_ptr(), 0), SENTINEL, "wrong arity");
+        depth = 64;
+        assert_eq!(entry(0xcafe, 1, args.as_ptr(), 0), SENTINEL, "at the cap");
+        depth = 0;
+        header[capacity] = 8;
+        assert_eq!(entry(0xcafe, 1, args.as_ptr(), 0), SENTINEL, "no room");
+        header[capacity] = (arena.len() * 8) as u64;
+        assert_eq!(CLEARED.load(Ordering::Relaxed), 1, "no guard ran the body");
+        assert_eq!((header[sp], header[fp], depth, active), (0, 0, 0, 0));
+    }
+
+    /// A callee whose activation outruns a signed 20-bit displacement must
+    /// DECLINE, not assert. The assembler panics on an out-of-range operand,
+    /// and a panic inside the compiler is a process abort rather than a tier
+    /// decline, so the bound belongs in the admission test.
+    #[test]
+    fn an_oversized_callee_activation_declines_instead_of_asserting() {
+        extern "C" fn stub() {}
+        let spec = |num_slots: u16| NativeCallEntry {
+            stack: 0x1000,
+            depth: 0x2000,
+            depth_cap: 64,
+            active: 0x3000,
+            entry: stub as *const () as u64,
+            code_info: 0x4000,
+            frame_flags: 0x21,
+            num_slots,
+            params: vec![0],
+            clear_mv: stub as *const () as u64,
+            fallback: stub as *const () as u64,
+        };
+        // A frame this size is reachable: num_slots is a u16, and
+        // 8 * 65535 already exceeds the displacement on its own.
+        assert!(matches!(
+            emit_native_call_entry(&spec(u16::max_value())),
+            Err(EmitError::UnsupportedOp(_))
+        ));
+        // One that fits still emits.
+        assert!(emit_native_call_entry(&spec(64)).is_ok());
     }
 
     #[test]
