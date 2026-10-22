@@ -1465,9 +1465,22 @@ Returns NIL."
                       ((null stream) *standard-input*)
                       (t stream)))
         (result '()))
-    (do ((c (peek-char t stream t nil t) (peek-char t stream t nil t)))
-        ((char= c char) (read-char stream t nil t) (nreverse result))
-      (push (read stream t nil t) result))))
+    ;; Walked with TAGBODY rather than DO, like PSETQ below and for the same
+    ;; reason: DO is a macro defined further down this file, so a function up
+    ;; here that uses it is lowered before the expander exists. The bytecode
+    ;; compiler then refuses the form (special:DO), and because that verdict
+    ;; belongs to the body it was built for, the function stays in the
+    ;; tree-walker for the life of the image -- no later call can lift it.
+    ;; MEMBER-IF, measured at 32x its COUNT-IF equivalent, is what found this.
+    (tagbody
+      scan
+        (when (char= (peek-char t stream t nil t) char)
+          (read-char stream t nil t)
+          (go done))
+        (push (read stream t nil t) result)
+        (go scan)
+      done)
+    (nreverse result)))
 
 ;;; READ-CHAR-NO-HANG is a builtin wired to the stdlib stream protocol, which
 ;;; knows how to poll a pipe or socket without blocking; it cannot be written
@@ -1717,17 +1730,35 @@ Returns NIL."
 ;; cases and stays quiet when a match is found before the bad tail, matching
 ;; SBCL: (member-if #'identity '(1 . 2)) => (1 . 2) but
 ;; (member-if #'null '(1 . 2)) and (member-if #'identity 7) both signal.
+;; TAGBODY rather than DO, for the reason READ-DELIMITED-LIST explains above:
+;; DO's expander is defined further down this file, so using it here pinned
+;; both functions to the tree-walker permanently. MEMBER-IF then cost 51 s
+;; where the equivalent COUNT-IF cost 1.6 s on the same 2000-element list.
 (defun member-if (pred list &key key)
-  (do ((l list (cdr l)))
-      ((endp l) nil)
-    (when (funcall pred (if key (funcall key (car l)) (car l)))
-      (return l))))
+  (let ((l list) (found nil))
+    (tagbody
+      scan
+        (when (endp l) (go done))
+        (when (funcall pred (if key (funcall key (car l)) (car l)))
+          (setq found l)
+          (go done))
+        (setq l (cdr l))
+        (go scan)
+      done)
+    found))
 
 (defun member-if-not (pred list &key key)
-  (do ((l list (cdr l)))
-      ((endp l) nil)
-    (unless (funcall pred (if key (funcall key (car l)) (car l)))
-      (return l))))
+  (let ((l list) (found nil))
+    (tagbody
+      scan
+        (when (endp l) (go done))
+        (unless (funcall pred (if key (funcall key (car l)) (car l)))
+          (setq found l)
+          (go done))
+        (setq l (cdr l))
+        (go scan)
+      done)
+    found))
 
 ;; Each alist entry must be a cons or NIL; NIL entries are skipped, but a
 ;; non-NIL atom is a type-error (ansi-test assoc-if.error.12). The DOLIST
