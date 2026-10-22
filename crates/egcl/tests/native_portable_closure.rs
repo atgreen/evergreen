@@ -127,7 +127,21 @@ fn captured_nonlocal_exit_keeps_safe_fallback() {
 
 #[test]
 fn closure_creation_survives_osr_entry() {
-    let comparison = if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
+    // The invocation gate is out of reach here, so OSR is the only route into
+    // native code. x86-64 Linux keeps this shape interpreted and so neither
+    // OSRs nor deopts; every other backend compiles the loop on its back edge.
+    let osr = if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
+        "="
+    } else {
+        ">"
+    };
+    // Whether the OSR-entered loop then has to bail out is a property of the
+    // backend, not of closure creation. ppc64le runs it to completion, so
+    // require it NOT to deopt -- a change that reintroduced one would be a
+    // real loss. x86-64 never enters, so it cannot deopt either.
+    let deopts = if cfg!(all(target_arch = "x86_64", target_os = "linux"))
+        || cfg!(all(target_arch = "powerpc64", target_endian = "little"))
+    {
         "="
     } else {
         ">"
@@ -136,8 +150,8 @@ fn closure_creation_survives_osr_entry() {
         r#"
       (let ((before (egcl-ext:deopt-count)))
         (assert (= (closure-loop 1000000) 499999500000))
-        (assert ({comparison} (egcl-ext:deopt-count) before)))
-      (assert ({comparison} (egcl-ext:function-osr-count 'closure-loop) 0))
+        (assert ({deopts} (egcl-ext:deopt-count) before)))
+      (assert ({osr} (egcl-ext:function-osr-count 'closure-loop) 0))
       (format t "CLOSURE-OSR-OK~%")
     "#
     );
