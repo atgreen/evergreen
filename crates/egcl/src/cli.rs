@@ -19377,7 +19377,7 @@ fn fixed_arity_builtin(bare: &str) -> Option<(usize, usize)> {
         }
         "DECLARATION-SPECIFIER" | "DECLARATION-SPECIFIERS" => Some((2, 2)),
         "PROCLAIMED-DECLARATIONS" | "PROCLAIMED-OPTIMIZE" => Some((0, 0)),
-        "HASH-TABLE-WEAKNESS" => Some((1, 1)),
+        "HASH-TABLE-WEAKNESS" | "HASH-TABLE-SYNCHRONIZED-P" => Some((1, 1)),
         // Array functions (ansi arrays *.error.*: a wrong argument count is a
         // PROGRAM-ERROR, not a TYPE-ERROR about a missing argument).
         "ARRAY-RANK" | "ARRAY-DIMENSIONS" | "ARRAY-TOTAL-SIZE" | "ARRAY-ELEMENT-TYPE"
@@ -26301,6 +26301,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             "EGCL-EXT:DECLARATION-SPECIFIERS" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL-EXT:PROCLAIMED-DECLARATIONS" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL-EXT:HASH-TABLE-WEAKNESS" => return eval_builtin_arguments(&name, cdr, env),
+            "EGCL-EXT:HASH-TABLE-SYNCHRONIZED-P" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::%ADD-PACKAGE-LOCAL-NICKNAME"
             | "EGCL::%REMOVE-PACKAGE-LOCAL-NICKNAME"
             | "EGCL::%PACKAGE-LOCAL-NICKNAMES"
@@ -41098,6 +41099,8 @@ fn is_builtin_function(name: &str) -> bool {
             | "EGCL-EXT::PROCLAIMED-OPTIMIZE"
             | "EGCL-EXT:HASH-TABLE-WEAKNESS"
             | "EGCL-EXT::HASH-TABLE-WEAKNESS"
+            | "EGCL-EXT:HASH-TABLE-SYNCHRONIZED-P"
+            | "EGCL-EXT::HASH-TABLE-SYNCHRONIZED-P"
             // Owned by EGCL-MOP (GitHub #370). Recognised by that identity so a
             // BARE read of the name inside an unrelated package no longer
             // reaches the builtin bare-intern path in reader_symbol_resolver.

@@ -345,9 +345,10 @@ is idempotent.
 `:SYNCHRONIZED T` requests internal reader/writer locking. `:WEAKNESS` accepts
 `:KEY`, `:VALUE`, `:KEY-AND-VALUE`, or `:KEY-OR-VALUE`.
 `WITH-LOCKED-HASH-TABLE` holds the table's exclusive recursive lock for the
-dynamic extent. The current `MAKE-HASH-TABLE` accepts extra keyword pairs but
-only `:TEST` affects the constructed table, so the extended options remain
-specified-only.
+dynamic extent. The current `MAKE-HASH-TABLE` honours `:TEST`, `:SYNCHRONIZED`
+and `:WEAKNESS`, and accepts but ignores the other keyword pairs.
+`HASH-TABLE-SYNCHRONIZED-P` and `HASH-TABLE-WEAKNESS` are implemented;
+`WITH-LOCKED-HASH-TABLE` remains specified-only.
 
 ### Images, exit, timeout, and pathname helpers
 

@@ -216,3 +216,50 @@ const CONCURRENT_READERS: &str = "(progn \
          (two (egcl-thread:make-thread 'read-every-key))) \
      (loop repeat 200 do (egcl-ext:gc)) \
      (list (egcl-thread:join-thread one) (egcl-thread:join-thread two))))";
+
+/// GitHub #518: MAKE-HASH-TABLE dropped `:synchronized`, so every such table
+/// was unlocked. The option must reach the table however the call is made,
+/// including from a compiled function.
+#[test]
+fn make_hash_table_honours_synchronized() {
+    let out = eval(
+        "(progn \
+           (defun make-locked () (make-hash-table :test 'equal :synchronized t)) \
+           (dotimes (i 20) (make-locked)) \
+           (mapcar #'egcl-ext:hash-table-synchronized-p \
+                   (list (make-hash-table :synchronized t) \
+                         (funcall #'make-hash-table :synchronized t) \
+                         (apply #'make-hash-table '(:test equalp :synchronized t)) \
+                         (make-locked) \
+                         (make-hash-table :synchronized nil) \
+                         (make-hash-table))))",
+    );
+    assert_eq!(out, "(T T T T NIL NIL)");
+}
+
+/// GitHub #518: threads that miss and then store into one synchronized table
+/// must leave exactly one entry per key, each with its own value. Unlocked,
+/// this lost writes and kept hundreds of duplicate vector keys per run.
+#[test]
+fn concurrent_writers_keep_a_synchronized_table_consistent() {
+    let out = eval(CONCURRENT_WRITERS);
+    assert_eq!(out, "(0 0)");
+}
+
+const CONCURRENT_WRITERS: &str = "(progn \
+   (defun intern-key (table k) \
+     (multiple-value-bind (v found) (gethash (vector k) table) \
+       (if found v (setf (gethash (vector k) table) (+ k 2))))) \
+   (let ((extra 0) (wrong 0)) \
+     (dotimes (round 3) \
+       (let* ((table (make-hash-table :test 'equalp :synchronized t)) \
+              (threads (loop for r below 4 collect \
+                         (let ((offset (* r 7))) \
+                           (egcl-thread:make-thread \
+                            (lambda () \
+                              (dotimes (c 4000) \
+                                (intern-key table (mod (+ offset c) 1500))))))))) \
+         (mapc #'egcl-thread:join-thread threads) \
+         (incf extra (- (hash-table-count table) 1500)) \
+         (maphash (lambda (k v) (unless (eql v (+ (aref k 0) 2)) (incf wrong))) table))) \
+     (list extra wrong)))";
