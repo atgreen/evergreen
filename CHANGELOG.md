@@ -345,6 +345,12 @@
 
 ### Fixed
 
+- `(make-hash-table :synchronized t)` now makes a synchronized table. The
+  option was ignored, so threads sharing such a table could corrupt it:
+  `gethash` returned another key's value, and the table kept duplicate keys
+  and lost writes. `egcl-ext:hash-table-synchronized-p`, documented but
+  missing, now reports the option
+  ([#524](https://github.com/atgreen/evergreen/pull/524)).
 - `eval` of a `defun` or `defmethod` whose body `setf`s an accessor (or any
   `(setf name)` function) no longer signals a spurious `program-error` to the
   caller's `handler-bind` handlers. A handler that answers a genuine

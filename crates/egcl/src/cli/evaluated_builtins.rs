@@ -4838,6 +4838,16 @@ fn resolve(name: &str) -> Option<Handler> {
             )))
         }),
 
+        "EGCL-EXT:HASH-TABLE-SYNCHRONIZED-P" => Some(|_operator, args, _env| {
+            if args.len() != 1 {
+                return Err(EgclError::ProgramError(format!(
+                    "EGCL-EXT:HASH-TABLE-SYNCHRONIZED-P requires one argument; got {}",
+                    args.len()
+                )));
+            }
+            Ok(if egcl_stdlib::hash_table_synchronized_p(args[0])? { T } else { NIL })
+        }),
+
         // ── Package-local nicknames (CDR 10) ──
         //
         // The registry primitives behind the EGCL-EXT functions that

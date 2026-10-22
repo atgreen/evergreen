@@ -1634,6 +1634,13 @@ pub fn hash_table_weakness(table: EgclVal) -> Result<Option<Weakness>, EgclError
     Ok(unsafe { (*ptr).weakness })
 }
 
+/// Whether `table` was made with `:synchronized t` (EGCL-EXT:HASH-TABLE-SYNCHRONIZED-P).
+pub fn hash_table_synchronized_p(table: EgclVal) -> Result<bool, EgclError> {
+    let ptr = get_table_inner(table)?;
+    // Safety: `synchronized` never changes after construction.
+    Ok(unsafe { (*ptr).synchronized })
+}
+
 /// Get the hash table size (capacity).
 pub fn hash_table_size(table: EgclVal) -> Result<usize, EgclError> {
     let ptr = get_table_inner(table)?;

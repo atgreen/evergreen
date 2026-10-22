@@ -19377,7 +19377,7 @@ fn fixed_arity_builtin(bare: &str) -> Option<(usize, usize)> {
         }
         "DECLARATION-SPECIFIER" | "DECLARATION-SPECIFIERS" => Some((2, 2)),
         "PROCLAIMED-DECLARATIONS" | "PROCLAIMED-OPTIMIZE" => Some((0, 0)),
-        "HASH-TABLE-WEAKNESS" => Some((1, 1)),
+        "HASH-TABLE-WEAKNESS" | "HASH-TABLE-SYNCHRONIZED-P" => Some((1, 1)),
         // Array functions (ansi arrays *.error.*: a wrong argument count is a
         // PROGRAM-ERROR, not a TYPE-ERROR about a missing argument).
         "ARRAY-RANK" | "ARRAY-DIMENSIONS" | "ARRAY-TOTAL-SIZE" | "ARRAY-ELEMENT-TYPE"
@@ -24115,10 +24115,12 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             }
             "NTH" => return eval_builtin_arguments(&name, cdr, env),
             "MAKE-HASH-TABLE" => {
-                // (make-hash-table &key test size ...) — honor :test, evaluate
-                // and ignore the rest. Backed by the real stdlib hash table.
+                // (make-hash-table &key test size ...) — honor :test, :weakness
+                // and :synchronized; evaluate and ignore the rest. Backed by the
+                // real stdlib hash table.
                 let mut test = egcl_stdlib::HashTest::Eql;
                 let mut weakness: Option<egcl_stdlib::Weakness> = None;
+                let mut synchronized = false;
                 egcl_rt::rooted!(c = cdr);
                 while c.is_cons() {
                     let (kw_form, r) = cp(*c);
@@ -24159,6 +24161,11 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                                 };
                             }
                         }
+                        // Dropping this left every :synchronized table unlocked,
+                        // so concurrent writers corrupted it (GitHub #518).
+                        if kn.strip_prefix("KEYWORD:").unwrap_or(&kn) == "SYNCHRONIZED" {
+                            synchronized = !v.is_nil();
+                        }
                         if kn.strip_prefix("KEYWORD:").unwrap_or(&kn) == "TEST" {
                             // :test accepts a function DESIGNATOR — the symbol
                             // (eq/eql/equal/equalp) OR the function `#'equal`,
@@ -24179,6 +24186,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 let opts = egcl_stdlib::MakeHashTableOptions {
                     test,
                     weakness,
+                    synchronized,
                     ..Default::default()
                 };
                 return egcl_stdlib::make_hash_table(&opts);
@@ -26293,6 +26301,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             "EGCL-EXT:DECLARATION-SPECIFIERS" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL-EXT:PROCLAIMED-DECLARATIONS" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL-EXT:HASH-TABLE-WEAKNESS" => return eval_builtin_arguments(&name, cdr, env),
+            "EGCL-EXT:HASH-TABLE-SYNCHRONIZED-P" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::%ADD-PACKAGE-LOCAL-NICKNAME"
             | "EGCL::%REMOVE-PACKAGE-LOCAL-NICKNAME"
             | "EGCL::%PACKAGE-LOCAL-NICKNAMES"
@@ -41090,6 +41099,8 @@ fn is_builtin_function(name: &str) -> bool {
             | "EGCL-EXT::PROCLAIMED-OPTIMIZE"
             | "EGCL-EXT:HASH-TABLE-WEAKNESS"
             | "EGCL-EXT::HASH-TABLE-WEAKNESS"
+            | "EGCL-EXT:HASH-TABLE-SYNCHRONIZED-P"
+            | "EGCL-EXT::HASH-TABLE-SYNCHRONIZED-P"
             // Owned by EGCL-MOP (GitHub #370). Recognised by that identity so a
             // BARE read of the name inside an unrelated package no longer
             // reaches the builtin bare-intern path in reader_symbol_resolver.
