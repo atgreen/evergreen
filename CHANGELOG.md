@@ -346,6 +346,19 @@
   method, and a call still rejects a keyword no applicable method accepts
   ([#510](https://github.com/atgreen/evergreen/pull/510)).
 
+- A function with more than 16 parameters no longer reads garbage for its
+  17th and later parameters once it is compiled to native code on x86-64.
+  Native entry loaded parameter *i* from `[rdi + 8*i]` with an 8-bit
+  displacement, so the 17th parameter's offset of 128 wrapped to -128 and
+  read the caller's stack: stale values, function objects or raw words.
+  Loop entry (OSR) into a function with more than 16 locals read the same
+  wrong slots. Since `&optional`, `&rest` and `&key` functions enter native
+  code, keyword-heavy functions hit it; pure-tls's TLS handshake signalled
+  `The value :CLIENT-PRIVATE-KEY is not of type FIXNUM`, so every HTTPS
+  download in `ocicl install` failed. These loads now use a 32-bit
+  displacement when they need one
+  ([#509](https://github.com/atgreen/evergreen/pull/509)).
+
 - Deep recursion no longer signals a spurious `STORAGE-CONDITION` on Linux
   AArch64. That target used a 512 KiB control stack, the fallback for
   platforms without native compilation, although its native frames are the
