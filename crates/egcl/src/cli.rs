@@ -10887,7 +10887,13 @@ pub(super) fn fmt_form_debug(val: EgclVal) -> String {
     let mut s = String::new();
     print_val(val, &mut s);
     if s.len() > 300 {
-        s.truncate(300);
+        // Cut on a character boundary: a form printing a non-ASCII string or
+        // symbol near the limit would otherwise panic here.
+        let mut end = 300;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
         s.push('…');
     }
     s
@@ -13886,6 +13892,9 @@ fn expand_compile_toplevel_form(form: EgclVal, env: &mut Env) -> EgclVal {
         };
         match expand_macro(&mdef, rest, env, *form) {
             Ok(expanded) if expanded != *form => *form = expanded,
+            // A failed expansion keeps the macro call; lowering it repeats the
+            // expansion, reports the error and compiles the form to code that
+            // signals it (GitHub #514).
             _ => return *form,
         }
     }
@@ -14226,8 +14235,10 @@ fn process_compile_toplevel_form_at(
                     egcl_rt::rooted_ref!(_expanded_root = &mut expanded);
                     return process_compile_toplevel_form_at(expanded, env, depth + 1);
                 }
-                // An expander that fails here is left to the ordinary load-time
-                // path, exactly as `macroexpand_all` does.
+                // An expander that fails here has no compile-time effect to
+                // process. The form stays in the file, and the file compiler
+                // reports the error when it lowers the form, compiling it to
+                // code that signals instead (GitHub #514).
                 return Ok(());
             }
         }
@@ -18207,6 +18218,40 @@ fn load_bfasl_into_env(bytes: &[u8], env: &mut Env) -> Result<EgclVal, EgclError
     with_eval_context(env, EvalContext::Load, |env| read_eval_all_env(&src, env))
 }
 
+/// Compile-time ERRORs the current COMPILE-FILE has reported (GitHub #514).
+/// COMPILE-FILE saves and zeroes it around its own compilation, so a nested
+/// COMPILE-FILE (from a macro or an EVAL-WHEN) does not fail its caller.
+static COMPILE_FILE_ERROR_COUNT: egcl_rt::execution_local::ExecutionLocal<std::cell::Cell<usize>> =
+    unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| const { std::cell::Cell::new(0) }) };
+
+/// Swap the COMPILE-FILE error count for `count`, returning the previous one.
+fn replace_compile_file_error_count(count: usize) -> usize {
+    COMPILE_FILE_ERROR_COUNT.with(|cell| cell.replace(count))
+}
+
+/// Print each compile-time error COMPILE-FILE found to `*ERROR-OUTPUT*`, in the
+/// `; caught ERROR:` style SBCL uses, and count it so COMPILE-FILE returns
+/// WARNINGS-P and FAILURE-P true (CLHS 3.2.5).
+fn report_compile_file_errors(src_path: &str, errors: &[String], env: &mut Env) {
+    if errors.is_empty() {
+        return;
+    }
+    let mut text = format!("; file: {src_path}\n");
+    for error in errors {
+        text.push_str(";\n; caught ERROR:\n");
+        for line in error.lines() {
+            text.push_str(";   ");
+            text.push_str(line);
+            text.push('\n');
+        }
+    }
+    let stream = env.lookup_var("*ERROR-OUTPUT*").unwrap_or(NIL);
+    if stream.is_nil() || write_str_to(stream, &text, env).is_err() {
+        eprint!("{text}");
+    }
+    COMPILE_FILE_ERROR_COUNT.with(|cell| cell.set(cell.get() + errors.len()));
+}
+
 /// Compile a source unit to a source-independent `.bfasl` byte image. New
 /// writers emit only the authoritative BBU plus source/debug metadata; if any
 /// load-time form cannot be represented as bytecode, compilation fails rather
@@ -18270,7 +18315,18 @@ fn build_bfasl_from_source(
             }
         };
     egcl_rt::rooted_ref!(_forms_root = &mut forms);
-    match bytecode::build_bbu_from_forms(&forms, &definition_packages, src_path, source, env)? {
+    let mut expansion_errors = Vec::new();
+    let unit = bytecode::build_bbu_from_forms(
+        &forms,
+        &definition_packages,
+        src_path,
+        source,
+        env,
+        &mut expansion_errors,
+    );
+    // Report before propagating any later failure: these were found first.
+    report_compile_file_errors(src_path, &expansion_errors, env);
+    match unit? {
         Some(bytecode_unit) => Ok(egcl_rt::bfasl::BfaslBuilder::new()
             .content_hash(egcl_rt::bfasl::content_hash(source.as_bytes()))
             .section(egcl_rt::bfasl::section::BYTECODE_UNIT, bytecode_unit)
