@@ -24115,10 +24115,12 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             }
             "NTH" => return eval_builtin_arguments(&name, cdr, env),
             "MAKE-HASH-TABLE" => {
-                // (make-hash-table &key test size ...) — honor :test, evaluate
-                // and ignore the rest. Backed by the real stdlib hash table.
+                // (make-hash-table &key test size ...) — honor :test, :weakness
+                // and :synchronized; evaluate and ignore the rest. Backed by the
+                // real stdlib hash table.
                 let mut test = egcl_stdlib::HashTest::Eql;
                 let mut weakness: Option<egcl_stdlib::Weakness> = None;
+                let mut synchronized = false;
                 egcl_rt::rooted!(c = cdr);
                 while c.is_cons() {
                     let (kw_form, r) = cp(*c);
@@ -24159,6 +24161,11 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                                 };
                             }
                         }
+                        // Dropping this left every :synchronized table unlocked,
+                        // so concurrent writers corrupted it (GitHub #518).
+                        if kn.strip_prefix("KEYWORD:").unwrap_or(&kn) == "SYNCHRONIZED" {
+                            synchronized = !v.is_nil();
+                        }
                         if kn.strip_prefix("KEYWORD:").unwrap_or(&kn) == "TEST" {
                             // :test accepts a function DESIGNATOR — the symbol
                             // (eq/eql/equal/equalp) OR the function `#'equal`,
@@ -24179,6 +24186,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 let opts = egcl_stdlib::MakeHashTableOptions {
                     test,
                     weakness,
+                    synchronized,
                     ..Default::default()
                 };
                 return egcl_stdlib::make_hash_table(&opts);
