@@ -5065,6 +5065,9 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
            #:specializer-direct-methods #:specializer-direct-generic-functions
            #:compute-applicable-methods-using-classes
            #:eql-specializer-object
+           #:method-function
+           #:generic-function-method-combination #:find-method-combination
+           #:generic-function-method-class #:generic-function-declarations
            #:intern-eql-specializer #:validate-superclass
            #:slot-definition-name #:slot-definition-initargs
            #:slot-definition-initform #:slot-definition-allocation
@@ -5239,6 +5242,85 @@ the arguments themselves rather than their classes, NIL and NIL."
 (defun egcl-mop:eql-specializer-object (eql-specializer)
   "The object of an EQL specializer from INTERN-EQL-SPECIALIZER."
   (second eql-specializer))
+
+;;; The rest of the generic-function readers, and METHOD-FUNCTION (GitHub #508).
+
+(defclass egcl-mop::standard-method-combination (method-combination)
+  ((name :initarg :name :reader egcl-mop::method-combination-name)
+   (options :initarg :options :reader egcl-mop::method-combination-options))
+  (:documentation "A method combination as a generic function uses it: the
+combination type's NAME, such as STANDARD or +, and the OPTIONS DEFGENERIC gave
+it, such as (:MOST-SPECIFIC-LAST). One object per name and options, so two
+generic functions combining methods the same way answer EQ objects."))
+
+(defmethod print-object ((combination egcl-mop::standard-method-combination) stream)
+  (print-unreadable-object (combination stream :type t)
+    (format stream "~S~{ ~S~}" (egcl-mop::method-combination-name combination)
+            (egcl-mop::method-combination-options combination))))
+
+(defvar egcl-mop::*method-combinations* (make-hash-table :test 'equal :synchronized t)
+  "(NAME . OPTIONS) -> the method combination metaobject for it.")
+
+(defun egcl-mop::intern-method-combination (name options)
+  (let ((key (cons name options)))
+    (or (gethash key egcl-mop::*method-combinations*)
+        (setf (gethash key egcl-mop::*method-combinations*)
+              (make-instance 'egcl-mop::standard-method-combination
+                             :name name :options options)))))
+
+(defun egcl-mop:find-method-combination (generic-function type-name options)
+  "AMOP: the method combination metaobject for the combination TYPE-NAME with
+OPTIONS -- the one GENERIC-FUNCTION-METHOD-COMBINATION answers for a generic
+function defined with (:method-combination TYPE-NAME . OPTIONS). EGCL knows
+STANDARD and the built-in short forms (+, AND, APPEND, LIST, MAX, MIN, NCONC, OR,
+PROGN); any other TYPE-NAME is an error."
+  (declare (ignore generic-function))
+  (unless (member type-name '(standard + and append list max min nconc or progn))
+    (error "FIND-METHOD-COMBINATION: no method combination named ~S" type-name))
+  (egcl-mop::intern-method-combination type-name options))
+
+(defun egcl-mop:generic-function-method-combination (generic-function)
+  "The method combination metaobject GENERIC-FUNCTION's dispatch uses: from
+DEFGENERIC's (:method-combination name [order]), else STANDARD. It prints as
+#<STANDARD-METHOD-COMBINATION name options...>, and is EQ to what
+FIND-METHOD-COMBINATION answers for the same name and options."
+  (let ((spec (egcl-internal::%generic-function-method-combination generic-function)))
+    (egcl-mop::intern-method-combination (car spec) (cdr spec))))
+
+(defun egcl-mop:generic-function-method-class (generic-function)
+  "The class DEFGENERIC named with (:method-class name), else STANDARD-METHOD.
+EGCL records the option and answers it here; DEFMETHOD still makes
+STANDARD-METHODs whatever it says."
+  (find-class (or (egcl-internal::%generic-function-method-class generic-function)
+                  'standard-method)))
+
+(defun egcl-mop:generic-function-declarations (generic-function)
+  "The declaration specifiers of GENERIC-FUNCTION's DEFGENERIC (declare ...)
+options, in order; NIL for a generic function DEFGENERIC gave none, or that only
+DEFMETHOD created."
+  (egcl-internal::%generic-function-declarations generic-function))
+
+(defvar egcl-mop::*method-functions*
+  (make-hash-table :test 'eq :weakness :key :synchronized t)
+  "Method -> its METHOD-FUNCTION, so each method answers one function.")
+
+(defun egcl-mop:method-function (method)
+  "AMOP: METHOD's function, of two arguments (ARGS NEXT-METHODS). ARGS is the
+list of arguments to run METHOD's body on, bound by its lambda list.
+NEXT-METHODS is a list of methods, most specific first, that CALL-NEXT-METHOD
+in the body runs in turn (with NEXT-METHOD-P answering whether one remains), as
+the effective method of a standard generic function would chain primary methods.
+The body's values are the function's values. Further arguments are ignored,
+as closer-mop's method functions on other hosts take them. Repeated calls answer
+the same function."
+  (or (gethash method egcl-mop::*method-functions*)
+      (progn
+        ;; Rejects a non-method before a function is made for it.
+        (egcl-mop:method-specializers method)
+        (setf (gethash method egcl-mop::*method-functions*)
+              (lambda (args next-methods &rest more-args)
+                (declare (ignore more-args))
+                (egcl-internal::%call-method method args next-methods))))))
 
 (defgeneric egcl-mop:validate-superclass (class superclass)
   (:documentation "Whether CLASS may inherit from SUPERCLASS. T by default; a

@@ -11112,8 +11112,9 @@ fn print_val_inner(val: EgclVal, out: &mut String) {
             }
         }
     } else if egcl_rt::function::is_interpreted_function(val) || is_closure_cons(val) {
-        // Reified function objects and legacy source closures print alike.
-        out.push_str("#<FUNCTION>");
+        // Reified function objects and legacy source closures print alike; a
+        // generic function names itself (GitHub #508).
+        out.push_str(&egcl_stdlib::format::function_representation(val));
     } else if val.is_cons() {
         // *PRINT-LEVEL*: past the depth limit, a nested list prints as `#`.
         let depth = PRINT_DEPTH.with(|d| d.get());
@@ -13371,6 +13372,7 @@ fn read_eval_all_env(source: &str, env: &mut Env) -> Result<EgclVal, EgclError> 
     egcl_stdlib::format::set_print_object_hook(Some(stdlib_print_object_hook));
     egcl_stdlib::format::set_pprint_dispatch_hook(Some(stdlib_pprint_dispatch_hook));
     egcl_stdlib::format::set_format_apply_hook(Some(stdlib_format_apply_hook));
+    egcl_stdlib::format::set_function_print_hook(Some(generic_function_print_hook));
     let chars: Vec<char> = source.chars().collect();
     register_declared_packages(&chars);
     // Nesting is checked once for the whole buffer; each form is then read from
@@ -19079,6 +19081,27 @@ fn generic_wrapper_name(v: EgclVal) -> Option<String> {
         .cloned()
 }
 
+/// The printer's view of a generic function (GitHub #508): `#'gf`, and the
+/// wrapper `#'(setf gf)` or FDEFINITION hands back, print as
+/// `#<STANDARD-GENERIC-FUNCTION name>`, the name written as PRIN1 would in the
+/// current package. Installed as the stdlib printer's function hook; reads the
+/// wrapper cache and the symbol table only, so it allocates nothing.
+fn generic_function_print_hook(v: EgclVal) -> Option<String> {
+    let v = reified_closure(v).unwrap_or(v);
+    let key = generic_wrapper_name(v)?;
+    let symbol_text = |name: &str| match egcl_rt::symbols::find_index(name) {
+        Some(index) => {
+            egcl_stdlib::format::print_symbol_for_output(EgclVal::from_symbol_index(index), true)
+        }
+        None => name.to_string(),
+    };
+    let name = match key.strip_prefix("(SETF ").and_then(|s| s.strip_suffix(')')) {
+        Some(place) => format!("({} {})", symbol_text("SETF"), symbol_text(place)),
+        None => symbol_text(&key),
+    };
+    Some(format!("#<STANDARD-GENERIC-FUNCTION {name}>"))
+}
+
 /// If `v` is a reified builtin wrapper closure `(EGCL::CLOSURE . id)` produced by
 /// [`builtin_fn_wrapper`], return the underlying builtin's bare name. Lets code
 /// that must recognise a function DESIGNATOR by name (e.g. MAKE-HASH-TABLE's
@@ -21526,6 +21549,76 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 };
                 egcl_rt::rooted!(methods_list = vec_to_list(&ids));
                 return Ok(vec_to_list(&[*methods_list, definitive]));
+            }
+            // (%generic-function-method-combination gf) -- the combination
+            // dispatch uses, as (NAME . OPTIONS): DEFGENERIC's
+            // :method-combination, else (STANDARD). boot.lisp interns the
+            // metaobject for it (GitHub #508).
+            "EGCL-INTERNAL::%GENERIC-FUNCTION-METHOD-COMBINATION"
+            | "EGCL-INTERNAL:%GENERIC-FUNCTION-METHOD-COMBINATION"
+            | "%GENERIC-FUNCTION-METHOD-COMBINATION" => {
+                let (af, _) = cp(cdr);
+                egcl_rt::rooted!(gf = eval_form(af, env)?);
+                generic_function_name_form(env, *gf)?;
+                let key = generic_function_name_of(env, *gf).unwrap_or_default();
+                let (combination, most_specific_last) = env
+                    .generics
+                    .borrow()
+                    .get(&key)
+                    .map(|generic| (generic.combination, generic.most_specific_last))
+                    .unwrap_or((egcl_stdlib::MethodCombinationType::Standard, false));
+                let mut parts =
+                    vec![resolve_sym(method_combination_name(combination)).unwrap_or(NIL)];
+                if most_specific_last {
+                    parts.push(resolve_sym(":MOST-SPECIFIC-LAST").unwrap_or(NIL));
+                }
+                return Ok(vec_to_list(&parts));
+            }
+            // (%generic-function-method-class gf) -- DEFGENERIC's :method-class
+            // name, or NIL; (%generic-function-declarations gf) -- its (declare
+            // ...) specifiers (GitHub #508).
+            "EGCL-INTERNAL::%GENERIC-FUNCTION-METHOD-CLASS"
+            | "EGCL-INTERNAL:%GENERIC-FUNCTION-METHOD-CLASS"
+            | "%GENERIC-FUNCTION-METHOD-CLASS"
+            | "EGCL-INTERNAL::%GENERIC-FUNCTION-DECLARATIONS"
+            | "EGCL-INTERNAL:%GENERIC-FUNCTION-DECLARATIONS"
+            | "%GENERIC-FUNCTION-DECLARATIONS" => {
+                let property = if name.ends_with("METHOD-CLASS") {
+                    GENERIC_METHOD_CLASS_PROPERTY
+                } else {
+                    GENERIC_DECLARATIONS_PROPERTY
+                };
+                let (af, _) = cp(cdr);
+                let gf = eval_form(af, env)?;
+                egcl_rt::rooted!(name_form = generic_function_name_form(env, gf)?);
+                return Ok(stored_generic_option(*name_form, property).unwrap_or(NIL));
+            }
+            // (%call-method method args next-methods) -- run METHOD's body on the
+            // argument list ARGS, with CALL-NEXT-METHOD and NEXT-METHOD-P seeing
+            // the methods in NEXT-METHODS, most specific first: the calling
+            // convention of AMOP's METHOD-FUNCTION (GitHub #508).
+            "EGCL-INTERNAL::%CALL-METHOD" | "EGCL-INTERNAL:%CALL-METHOD" | "%CALL-METHOD" => {
+                let argv = eval_args(cdr, env)?;
+                let [method, args_list, next_list] =
+                    [0, 1, 2].map(|i| argv.get(i).copied().unwrap_or(NIL));
+                let not_method = |datum| EgclError::TypeError {
+                    datum,
+                    expected: "METHOD".into(),
+                };
+                let Some((_, mut method_def)) = method_def_by_id(env, method) else {
+                    return Err(not_method(method));
+                };
+                let mut next_defs = Vec::new();
+                for next in list_to_vec(next_list) {
+                    let Some((_, def)) = method_def_by_id(env, next) else {
+                        return Err(not_method(next));
+                    };
+                    next_defs.push(def);
+                }
+                egcl_rt::rooted_ref!(_method_root = &mut method_def);
+                egcl_rt::rooted!(args = list_to_vec(args_list));
+                let next = NextMethod::Primary { primary: next_defs };
+                return invoke_method(env, &method_def, &args, Some(next));
             }
             "EGCL-INTERNAL::%CLASS-METACLASS"
             | "EGCL-INTERNAL:%CLASS-METACLASS"
@@ -38938,9 +39031,46 @@ fn store_generic_lambda_list(name_form: EgclVal, lambda_list: EgclVal) {
     }
 }
 
+/// DEFGENERIC's `(:method-class name)`, NIL when it gave none (GitHub #508).
+const GENERIC_METHOD_CLASS_PROPERTY: &str = "EGCL::%GENERIC-METHOD-CLASS";
+/// DEFGENERIC's `(declare ...)` specifiers, as one list (GitHub #508).
+const GENERIC_DECLARATIONS_PROPERTY: &str = "EGCL::%GENERIC-DECLARATIONS";
+
+/// The symbol whose property list carries a generic function's DEFGENERIC
+/// options: the name itself, or for a `(SETF NAME)` generic the symbol its
+/// registry key interns, which the `#'(setf name)` wrapper is made over too.
+/// Properties survive a saved image with the symbol.
+fn generic_option_holder(name_form: EgclVal) -> Option<EgclVal> {
+    if name_form.is_cons() {
+        let key = function_name_key(name_form);
+        return Some(EgclVal::from_symbol_index(reader::intern_symbol(&key)));
+    }
+    name_form.symbol_index().map(|_| name_form)
+}
+
+fn store_generic_option(name_form: EgclVal, property: &str, value: EgclVal) {
+    egcl_rt::rooted!(value = value);
+    if let (Some(holder), Some(indicator)) =
+        (generic_option_holder(name_form), resolve_sym(property))
+    {
+        symbol_plist_put(holder, indicator, *value);
+    }
+}
+
+/// The DEFGENERIC option `property` recorded for the generic function named
+/// `name_form`, if any. Reads the property list only; allocates nothing.
+fn stored_generic_option(name_form: EgclVal, property: &str) -> Option<EgclVal> {
+    plist_symbol_property(generic_option_holder(name_form)?, property)
+}
+
 fn stored_generic_lambda_list(name_form: EgclVal) -> Option<EgclVal> {
-    let idx = name_form.symbol_index()?;
-    let indicator = resolve_sym(GENERIC_LAMBDA_LIST_PROPERTY)?;
+    plist_symbol_property(name_form, GENERIC_LAMBDA_LIST_PROPERTY)
+}
+
+/// The value of the property named `property` on `symbol`'s property list.
+fn plist_symbol_property(symbol: EgclVal, property: &str) -> Option<EgclVal> {
+    let idx = symbol.symbol_index()?;
+    let indicator = resolve_sym(property)?;
     let mut cursor = egcl_rt::symbols::symbol_plist(idx).unwrap_or(NIL);
     while cursor.is_cons() {
         let (key, after_key) = cp(cursor);
@@ -38980,6 +39110,12 @@ fn eval_defgeneric(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     // method; collect their tails so they can be registered after the generic
     // function exists (with its method combination already known).
     egcl_rt::rooted!(method_options = Vec::<EgclVal>::new());
+    // `(:method-class name)` and the `(declare ...)` specifiers, which
+    // GENERIC-FUNCTION-METHOD-CLASS and GENERIC-FUNCTION-DECLARATIONS answer
+    // (GitHub #508).
+    let mut method_class = NIL;
+    egcl_rt::rooted_ref!(_method_class_root = &mut method_class);
+    egcl_rt::rooted!(declarations = Vec::<EgclVal>::new());
     // CLHS DEFGENERIC: the name must not name an ordinary function, macro or
     // special operator (ansi defgeneric.error.1-3) ...
     {
@@ -39056,6 +39192,15 @@ fn eval_defgeneric(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     }
                     "ARGUMENT-PRECEDENCE-ORDER" => precedence_names = option_rest,
                     "METHOD" => method_options.push(option_rest),
+                    "METHOD-CLASS" => method_class = cp(option_rest).0,
+                    "DECLARE" => {
+                        let mut specifiers = option_rest;
+                        while specifiers.is_cons() {
+                            let (specifier, more) = cp(specifiers);
+                            declarations.push(specifier);
+                            specifiers = more;
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -39102,6 +39247,11 @@ fn eval_defgeneric(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     env.methods.borrow_mut().entry(name.clone()).or_default();
     store_argument_precedence_order(name_form, &precedence);
     store_generic_lambda_list(name_form, lambda_list);
+    // Every DEFGENERIC records both, so a redefinition without the option
+    // forgets the earlier one.
+    egcl_rt::rooted!(declaration_list = vec_to_list(&declarations));
+    store_generic_option(name_form, GENERIC_METHOD_CLASS_PROPERTY, method_class);
+    store_generic_option(name_form, GENERIC_DECLARATIONS_PROPERTY, *declaration_list);
 
     // Register each :method option by delegating to DEFMETHOD: the option tail
     // `(qualifier* specialized-lambda-list body...)` is exactly a DEFMETHOD cdr
@@ -44135,6 +44285,7 @@ pub fn run(args: &[String]) -> Result<i32, EgclError> {
     egcl_stdlib::format::set_print_object_hook(Some(stdlib_print_object_hook));
     egcl_stdlib::format::set_pprint_dispatch_hook(Some(stdlib_pprint_dispatch_hook));
     egcl_stdlib::format::set_format_apply_hook(Some(stdlib_format_apply_hook));
+    egcl_stdlib::format::set_function_print_hook(Some(generic_function_print_hook));
     // Looked up once: it decides how the arguments parse, then loads below.
     let embedded = embedded_core();
     let ca = if matches!(&embedded, Ok(Some(core)) if core.application) {

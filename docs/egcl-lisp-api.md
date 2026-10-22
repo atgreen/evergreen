@@ -35,7 +35,7 @@ below have been refreshed for the current implementation.
 | `EGCL-THREAD` | OS-backed native threads and synchronization objects | Native thread and mutex operations available; see the manual for the implemented subset | Use the EGCL public names |
 | `EGCL-THREADS` | Nickname for `EGCL-THREAD` | Available | Prefer the canonical name |
 | `EGCL-FIBER` | Lightweight M:N fibers and scheduler groups | Specified | Deliberately distinct from native threads |
-| `EGCL-MOP` | Metaobject protocol | Specified public package; not installed by the bootstrap | Planned EGCL namespace |
+| `EGCL-MOP` | Metaobject protocol | Installed by the bootstrap with the introspection subset listed under [Metaobject protocol](#metaobject-protocol); `COMMON-LISP-USER` uses it | The closer-mop fork imports it as `c2mop:` |
 | `EGCL-CLTL2` | Compile-time environment inspection | Package available; see the manual for the implemented subset | Use the EGCL public names |
 | `EGCL-GRAY-STREAMS` | Gray stream classes and generic functions | Public classes and elemental protocol available; bulk protocol incomplete | Import from this package |
 | `EGCL-FFI` | Typed foreign calls and callbacks | Partial Rust runtime; Lisp package not yet installed | CFFI/SB-ALIEN migration surface |
@@ -795,10 +795,67 @@ compile-time environment.
 
 ## Metaobject protocol
 
-The `EGCL-MOP` surface below is **Specified**. The bootstrap has CLOS
-internals but does not install this public package. When exposed, the public
-protocol belongs in EGCL's own package, not an alias in another
-implementation's package. This inventory is not an availability guarantee.
+The bootstrap installs the `EGCL-MOP` package with the **Available**
+introspection subset below. `COMMON-LISP-USER` uses it; a library package that
+only uses `COMMON-LISP` does not inherit these names, so its own `DEFUN` of one
+cannot replace EGCL's. The [closer-mop fork](library-forks.md) imports them, so
+the `c2mop:` names are these functions. The rest of this section, from
+[Class introspection and metaclasses](#class-introspection-and-metaclasses) on,
+is the **Specified** inventory: a name listed there and not below is not
+callable yet.
+
+### Available in EGCL-MOP
+
+Classes and slots. Where AMOP takes a class metaobject, these also accept a
+class name.
+
+| Function | Result |
+| --- | --- |
+| `class-precedence-list`, `class-direct-superclasses`, `class-direct-subclasses` | Class metaobjects |
+| `class-slots`, `class-direct-slots` | Effective / direct slot-definition objects |
+| `class-finalized-p`, `finalize-inheritance` | Finalization state; finalizing |
+| `slot-definition-name`, `-initargs`, `-initform`, `-allocation`, `-readers`, `-writers` | The slot-definition's property |
+| `slot-definition-type` | Always `T`: `DEFCLASS` does not record `:type` yet |
+| `validate-superclass` | Generic function; `T` by default |
+| `forward-referenced-class` | Metaclass of a class named as a superclass before it is defined |
+
+Generic functions:
+
+| Function | Result |
+| --- | --- |
+| `generic-function-name` | The symbol or `(setf name)` list it was defined under |
+| `generic-function-methods` | Its methods |
+| `generic-function-lambda-list` | `DEFGENERIC`'s lambda list, or for a generic function only `DEFMETHOD` created, the one derived from its first method |
+| `generic-function-argument-precedence-order` | The required parameters in dispatch order |
+| `generic-function-method-combination` | A method-combination metaobject, printed `#<STANDARD-METHOD-COMBINATION + :MOST-SPECIFIC-LAST>`: from `(:method-combination name [order])`, else `STANDARD`. One object per name and options |
+| `find-method-combination` | `(gf type-name options)`: the same object for `STANDARD` or a built-in short form (`+ and append list max min nconc or progn`) |
+| `generic-function-method-class` | The class `(:method-class name)` named, else `STANDARD-METHOD`. The option is recorded only: `DEFMETHOD` still makes `STANDARD-METHOD`s |
+| `generic-function-declarations` | The specifiers of `DEFGENERIC`'s `(declare ...)` options, else `NIL` |
+
+Methods and specializers:
+
+| Function | Result |
+| --- | --- |
+| `method-specializers` | Class metaobjects, with `(eql object)` for an EQL specializer and the class `T` for an unspecialized parameter |
+| `method-generic-function` | The generic function, `EQ` to `#'name`; `NIL` once removed |
+| `method-lambda-list` | The lambda list with specializers stripped |
+| `method-function` | A function of `(args next-methods)`, below |
+| `intern-eql-specializer`, `eql-specializer-object` | An EQL specializer is the list `(eql object)` |
+| `specializer-direct-methods`, `specializer-direct-generic-functions` | Every method, and the generic functions of those methods, with the specializer among its specializers |
+| `compute-applicable-methods-using-classes` | `(gf classes)` -> applicable methods most specific first, and `T`; `NIL`, `NIL` when an EQL specializer makes the answer depend on the arguments themselves |
+
+`(funcall (method-function m) args next-methods)` runs `m`'s body on the
+argument list `args`, bound by its lambda list. `next-methods` is a list of
+methods, most specific first: `call-next-method` in the body runs the first
+with the rest after it, and `next-method-p` answers whether one remains, as in
+a standard generic function's chain of primary methods. The body's values are
+the call's values. Each method answers one function, so repeated calls are
+`EQ`.
+
+Every answer is read from the registry dispatch uses, so `remove-method`,
+`add-method` and redefinition show through. A generic function prints as
+`#<STANDARD-GENERIC-FUNCTION name>`, the name written as `prin1` would write
+it, including `(SETF name)`; other functions still print as `#<FUNCTION>`.
 
 ### Class introspection and metaclasses
 
