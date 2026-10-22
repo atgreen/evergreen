@@ -72,8 +72,8 @@
 //! control-flow-hardening support, and publish complete call-site coverage
 //! before any of this code runs.
 
+use egcl_rt::asm::Cc;
 use egcl_rt::asm::a64::{self, LR, SP};
-use egcl_rt::asm::{Asm, Cc};
 use egcl_rt::native_transfer::{NativeExit, NativeOutcome};
 
 /// Scratch for an address or a loaded word. IP0/IP1 are reserved by the
@@ -135,11 +135,35 @@ pub struct Aapcs64NativeLanding {
     pub entry: *const u8,
 }
 
-/// Load a 64-bit absolute address into `register`.
-fn load_address(a: &mut Asm, register: a64::Reg, address: u64) {
-    let mut words = Vec::new();
-    a64::mov_imm64(register, address, &mut words);
-    a.words(&words);
+/// The emitted instruction stream.
+///
+/// This is a plain word buffer rather than [`egcl_rt::asm::Asm`], because
+/// `Asm`'s AArch64 label and branch fixups only exist when the HOST is
+/// AArch64, which would stop x86 CI from type-checking this module. The
+/// `a64` encoders are pure functions available everywhere, and these stubs
+/// are straight-line apart from one conditional branch whose displacement is
+/// known from the layout, so nothing here needs a fixup table.
+#[derive(Default)]
+struct Words(Vec<u32>);
+
+impl Words {
+    fn push(&mut self, word: u32) {
+        self.0.push(word);
+    }
+
+    /// Load a 64-bit absolute address into `register`.
+    fn address(&mut self, register: a64::Reg, address: u64) {
+        a64::mov_imm64(register, address, &mut self.0);
+    }
+
+    /// Instructions emitted so far — the unit a branch displacement counts in.
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn finish(self) -> Vec<u8> {
+        self.0.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
 }
 
 /// Emit a callable AAPCS64 adapter around a Rust helper.
@@ -167,32 +191,40 @@ pub fn emit_helper_veneer(helper: NativeHelperV2, cold_entry: *const u8) -> Vec<
     const OUTCOME: u64 = 16;
     const REQUEST: u64 = 32;
 
-    let mut a = Asm::new();
-    let exceptional = a.label();
-    a.word(a64::bti_c());
-    a.word(a64::stp_pre(29, LR, SP, -FRAME).expect("48 is a pair offset"));
-    a.word(a64::mov_from_sp(29));
-    a.word(a64::str_imm(0, SP, REQUEST).expect("32 is a scaled offset"));
-    a.word(a64::add_imm(1, SP, OUTCOME).expect("16 is an add immediate"));
-    load_address(&mut a, SCRATCH, helper as usize as u64);
-    a.word(a64::blr(SCRATCH));
-    a.word(a64::ldr_imm(2, SP, OUTCOME).expect("16 is a scaled offset"));
-    a.word(a64::ldr_imm(3, SP, OUTCOME + 8).expect("24 is a scaled offset"));
-    a.word(a64::ldr_imm(0, SP, REQUEST).expect("32 is a scaled offset"));
-    a.word(a64::ldp_post(29, LR, SP, FRAME).expect("48 is a pair offset"));
+    let mut a = Words::default();
+    a.push(a64::bti_c());
+    a.push(a64::stp_pre(29, LR, SP, -FRAME).expect("48 is a pair offset"));
+    a.push(a64::mov_from_sp(29));
+    a.push(a64::str_imm(0, SP, REQUEST).expect("32 is a scaled offset"));
+    a.push(a64::add_imm(1, SP, OUTCOME).expect("16 is an add immediate"));
+    a.address(SCRATCH, helper as usize as u64);
+    a.push(a64::blr(SCRATCH));
+    a.push(a64::ldr_imm(2, SP, OUTCOME).expect("16 is a scaled offset"));
+    a.push(a64::ldr_imm(3, SP, OUTCOME + 8).expect("24 is a scaled offset"));
+    a.push(a64::ldr_imm(0, SP, REQUEST).expect("32 is a scaled offset"));
+    a.push(a64::ldp_post(29, LR, SP, FRAME).expect("48 is a pair offset"));
     // Test the exit word, never the Lisp value.
-    a.word(a64::cmp_imm(3, 0).expect("0 is an add immediate"));
-    a.jcc(Cc::Ne, exceptional);
-    a.word(a64::mov(0, 2));
-    a.word(a64::ret());
-    a.bind(exceptional);
+    a.push(a64::cmp_imm(3, 0).expect("0 is an add immediate"));
+    // The only branch in these stubs. Its target is the two instructions
+    // after it -- the normal return's `mov` and `ret` -- so the displacement
+    // is known without a fixup table.
+    const OVER_NORMAL_RETURN: i32 = 3 * 4;
+    a.push(a64::b_cond(Cc::Ne, OVER_NORMAL_RETURN).expect("a three-instruction branch"));
+    let branch = a.len();
+    a.push(a64::mov(0, 2));
+    a.push(a64::ret());
+    debug_assert_eq!(
+        a.len() - branch + 1,
+        OVER_NORMAL_RETURN as usize / 4,
+        "the exceptional branch must land just past the normal return"
+    );
     // (request, value, exit) in x0-x2. x0 already holds the request; move
     // value before exit, or the exit would overwrite the value's source.
-    a.word(a64::mov(1, 2));
-    a.word(a64::mov(2, 3));
-    load_address(&mut a, SCRATCH, cold_entry as usize as u64);
-    a.word(a64::br(SCRATCH));
-    a.finish().expect("local helper veneer label")
+    a.push(a64::mov(1, 2));
+    a.push(a64::mov(2, 3));
+    a.address(SCRATCH, cold_entry as usize as u64);
+    a.push(a64::br(SCRATCH));
+    a.finish()
 }
 
 /// Emit the cold entry for a helper veneer.
@@ -219,41 +251,41 @@ pub fn emit_capture_stub(prepare: NativeTransferPrepare, dispatch: *const u8) ->
     let caller_sp = offset_of!(Aapcs64TransferCapture, caller_sp) as u64;
     let return_pc = offset_of!(Aapcs64TransferCapture, return_pc) as u64;
 
-    let mut a = Asm::new();
-    a.word(a64::bti_c());
-    a.word(a64::stp_pre(29, LR, SP, -16).expect("16 is a pair offset"));
-    a.word(a64::mov_from_sp(29));
-    a.word(a64::sub_imm(SP, SP, IMAGE as u64).expect("the image fits an add immediate"));
+    let mut a = Words::default();
+    a.push(a64::bti_c());
+    a.push(a64::stp_pre(29, LR, SP, -16).expect("16 is a pair offset"));
+    a.push(a64::mov_from_sp(29));
+    a.push(a64::sub_imm(SP, SP, IMAGE as u64).expect("the image fits an add immediate"));
     for (register, offset) in [(0, request), (1, value), (2, exit)] {
-        a.word(a64::str_imm(register, SP, offset).expect("a header offset is scaled"));
+        a.push(a64::str_imm(register, SP, offset).expect("a header offset is scaled"));
     }
     for (index, register) in PRESERVED.into_iter().enumerate() {
         let offset = preserved + index as u64 * 8;
-        a.word(a64::str_imm(register, SP, offset).expect("a preserved offset is scaled"));
+        a.push(a64::str_imm(register, SP, offset).expect("a preserved offset is scaled"));
     }
     // The SP this stub was entered with IS the caller's SP at the call: no
     // return address was pushed. It sits one frame record above our x29.
-    a.word(a64::add_imm(SCRATCH2, 29, 16).expect("16 is an add immediate"));
-    a.word(a64::str_imm(SCRATCH2, SP, caller_sp).expect("a header offset is scaled"));
+    a.push(a64::add_imm(SCRATCH2, 29, 16).expect("16 is an add immediate"));
+    a.push(a64::str_imm(SCRATCH2, SP, caller_sp).expect("a header offset is scaled"));
     // The caller's x30, which BL left as the return address, saved by our stp.
-    a.word(a64::ldr_imm(SCRATCH2, 29, 8).expect("8 is a scaled offset"));
-    a.word(a64::str_imm(SCRATCH2, SP, return_pc).expect("a header offset is scaled"));
-    a.word(a64::mov_from_sp(0));
-    load_address(&mut a, SCRATCH, prepare as usize as u64);
+    a.push(a64::ldr_imm(SCRATCH2, 29, 8).expect("8 is a scaled offset"));
+    a.push(a64::str_imm(SCRATCH2, SP, return_pc).expect("a header offset is scaled"));
+    a.push(a64::mov_from_sp(0));
+    a.address(SCRATCH, prepare as usize as u64);
     // Every Rust frame returns before the dispatch branch below.
-    a.word(a64::blr(SCRATCH));
+    a.push(a64::blr(SCRATCH));
     for (index, register) in PRESERVED.into_iter().enumerate() {
         let offset = preserved + index as u64 * 8;
-        a.word(a64::ldr_imm(register, SP, offset).expect("a preserved offset is scaled"));
+        a.push(a64::ldr_imm(register, SP, offset).expect("a preserved offset is scaled"));
     }
     for (register, offset) in [(0, request), (1, value), (2, exit)] {
-        a.word(a64::ldr_imm(register, SP, offset).expect("a header offset is scaled"));
+        a.push(a64::ldr_imm(register, SP, offset).expect("a header offset is scaled"));
     }
-    a.word(a64::add_imm(SP, SP, IMAGE as u64).expect("the image fits an add immediate"));
-    a.word(a64::ldp_post(29, LR, SP, 16).expect("16 is a pair offset"));
-    load_address(&mut a, SCRATCH, dispatch as usize as u64);
-    a.word(a64::br(SCRATCH));
-    a.finish().expect("capture stub has no unresolved labels")
+    a.push(a64::add_imm(SP, SP, IMAGE as u64).expect("the image fits an add immediate"));
+    a.push(a64::ldp_post(29, LR, SP, 16).expect("16 is a pair offset"));
+    a.address(SCRATCH, dispatch as usize as u64);
+    a.push(a64::br(SCRATCH));
+    a.finish()
 }
 
 /// Tail adapter from `(landing_packet in x0, primary in x1)` to a landing pad.
@@ -275,15 +307,15 @@ pub fn emit_native_landing_stub() -> Vec<u8> {
         assert!(offset_of!(Aapcs64NativeLanding, stack_pointer) == 0);
         assert!(offset_of!(Aapcs64NativeLanding, entry) == 8);
     }
-    let mut a = Asm::new();
-    a.word(a64::bti_c());
+    let mut a = Words::default();
+    a.push(a64::bti_c());
     // Read both packet fields before x0 is overwritten with the primary.
-    a.word(a64::ldr_imm(SCRATCH, 0, 8).expect("8 is a scaled offset"));
-    a.word(a64::ldr_imm(SCRATCH2, 0, 0).expect("0 is a scaled offset"));
-    a.word(a64::mov(0, 1));
-    a.word(a64::mov_to_sp(SCRATCH2));
-    a.word(a64::br(SCRATCH));
-    a.finish().expect("landing stub has no unresolved labels")
+    a.push(a64::ldr_imm(SCRATCH, 0, 8).expect("8 is a scaled offset"));
+    a.push(a64::ldr_imm(SCRATCH2, 0, 0).expect("0 is a scaled offset"));
+    a.push(a64::mov(0, 1));
+    a.push(a64::mov_to_sp(SCRATCH2));
+    a.push(a64::br(SCRATCH));
+    a.finish()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -373,5 +405,102 @@ impl Aapcs64CaptureLocation {
                     .write(word)
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// These run on EVERY host, which is the point of emitting words rather
+    /// than going through `Asm`: the execution tests in
+    /// tests/native_transfer_aarch64.rs can only run on AArch64, so without
+    /// something here a change that broke the encoding would reach an x86
+    /// developer's CI green and fail only on the port.
+    ///
+    /// They check structure, not behaviour — what a reader can verify from
+    /// the architecture manual without a CPU to hand.
+    fn words(code: &[u8]) -> Vec<u32> {
+        assert_eq!(code.len() % 4, 0, "A64 code is a whole number of words");
+        assert!(!code.is_empty(), "a stub must emit something");
+        code.chunks_exact(4)
+            .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+            .collect()
+    }
+
+    unsafe extern "C" fn helper(_request: *mut u8, _out: *mut NativeOutcome) {}
+    unsafe extern "C" fn prepare(_capture: *mut Aapcs64TransferCapture) {}
+
+    /// Every stub is an indirect branch target, so each must open with the
+    /// marker or it faults where branch-target identification is enforced.
+    #[test]
+    fn every_stub_begins_with_a_branch_target_marker() {
+        for (name, code) in [
+            ("veneer", emit_helper_veneer(helper, 0x1000 as *const u8)),
+            ("capture", emit_capture_stub(prepare, 0x2000 as *const u8)),
+            ("landing", emit_native_landing_stub()),
+        ] {
+            assert_eq!(
+                words(&code)[0],
+                a64::bti_c(),
+                "{name} must start with BTI c"
+            );
+        }
+    }
+
+    /// The veneer's one branch. Its displacement is computed by hand rather
+    /// than fixed up by a label, so this pins where it lands: exactly past
+    /// the two-instruction normal return, onto the cold route's first `mov`.
+    #[test]
+    fn the_veneer_branches_exactly_past_its_normal_return() {
+        let code = words(&emit_helper_veneer(helper, 0x1000 as *const u8));
+        let branches: Vec<usize> = (0..code.len())
+            .filter(|&i| code[i] & 0xFF00_0010 == 0x5400_0000)
+            .collect();
+        assert_eq!(branches.len(), 1, "the veneer has exactly one b.cond");
+        let at = branches[0];
+        assert_eq!(code[at], a64::b_cond(Cc::Ne, 12).unwrap(), "b.ne +12");
+        // +12 bytes is three instructions on from the branch, so the two
+        // instructions it skips must be the normal return.
+        assert_eq!(code[at + 1], a64::mov(0, 2), "skipped: mov x0, x2");
+        assert_eq!(code[at + 2], a64::ret(), "skipped: ret");
+        // And the landing instruction is the cold route's first move.
+        assert_eq!(code[at + 3], a64::mov(1, 2), "target: mov x1, x2");
+    }
+
+    /// Both tail-dispatching stubs must END by branching through the scratch
+    /// register: a `ret` there would return to the wrong frame.
+    #[test]
+    fn the_tail_dispatching_stubs_end_in_an_indirect_branch() {
+        for (name, code) in [
+            ("veneer", emit_helper_veneer(helper, 0x1000 as *const u8)),
+            ("capture", emit_capture_stub(prepare, 0x2000 as *const u8)),
+            ("landing", emit_native_landing_stub()),
+        ] {
+            let code = words(&code);
+            assert_eq!(
+                *code.last().unwrap(),
+                a64::br(SCRATCH),
+                "{name} must tail-branch through the scratch register"
+            );
+        }
+    }
+
+    /// The capture image's layout is a contract with the capture stub, which
+    /// addresses these fields by constant offset.
+    #[test]
+    fn the_capture_image_has_the_layout_the_stub_assumes() {
+        use std::mem::{offset_of, size_of};
+        assert_eq!(size_of::<Aapcs64TransferCapture>(), 120);
+        assert_eq!(offset_of!(Aapcs64TransferCapture, request), 0);
+        assert_eq!(offset_of!(Aapcs64TransferCapture, value), 8);
+        assert_eq!(offset_of!(Aapcs64TransferCapture, exit), 16);
+        assert_eq!(offset_of!(Aapcs64TransferCapture, preserved), 24);
+        // x19..x28 inclusive: ten callee-saved GPRs, and nothing else can
+        // hold an exception-live value.
+        assert_eq!(PRESERVED.len(), 10);
+        assert_eq!(PRESERVED[0], 19);
+        assert_eq!(PRESERVED[9], 28);
+        assert_eq!(size_of::<Aapcs64NativeLanding>(), 16);
     }
 }

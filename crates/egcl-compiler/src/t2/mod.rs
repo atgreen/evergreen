@@ -115,10 +115,9 @@ pub mod native_transfer_ppc64le;
 // so building them everywhere keeps x86 CI type-checking them. Only the tests
 // that execute the bytes are target-gated.
 pub mod native_transfer_s390x;
-// Host-gated, unlike the System Z stubs above: these go through
-// `egcl_rt::asm::Asm`, whose AArch64 branch and label fixups only exist when
-// the HOST is AArch64.
-#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+// Compiled on every host, like native_transfer_s390x: pure byte emission, so
+// building it everywhere keeps x86 CI type-checking it. Only the tests that
+// execute the bytes are target-gated.
 pub mod native_transfer_aarch64;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub mod transfer_sites;
