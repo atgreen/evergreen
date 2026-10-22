@@ -5764,6 +5764,24 @@ fn signal_raw_error_in_context(env: &mut Env, mut error: EgclError) -> EgclError
     }
 }
 
+/// True when an error caught by a best-effort internal attempt (definition-time
+/// macroexpansion, an opportunistic compile, …) must still propagate instead of
+/// being absorbed by its fallback: a transfer of control that a handler, or the
+/// code itself, initiated (RETURN-FROM, GO, THROW, a HANDLER-CASE clause,
+/// INVOKE-RESTART — all `__`-prefixed tokens or registered control values), or
+/// an asynchronous request to stop. A fallback that swallowed one of these made
+/// a handler's non-local exit silently do nothing (GH #513).
+pub(crate) fn must_escape_best_effort(error: &EgclError) -> bool {
+    match error {
+        EgclError::Internal(token) => {
+            token.starts_with("__")
+                || CONTROL_VALUES.with(|values| values.borrow().contains_key(token))
+        }
+        EgclError::Shutdown | EgclError::Interrupt | EgclError::Timeout => true,
+        _ => false,
+    }
+}
+
 fn condition_matches_type_spec(env: &Env, condition: EgclVal, type_spec: EgclVal) -> bool {
     if type_spec.is_nil() {
         return false;
@@ -33348,7 +33366,7 @@ fn eval_defun(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     // re-gensyms) it on every call (bliss-lb6.11). This is a best-effort,
     // conservative pass: anything it leaves unexpanded is still handled by the
     // lazy expansion in `eval_list`, so it can only ever under-expand.
-    body = mx_each(body, env, 0);
+    body = mx_each(body, env, 0)?;
     if name_form.is_symbol() {
         // Ordinary global function → the symbol's heap function cell
         // (bliss-jtc.6.8). Redefinition installs a NEW function object.
@@ -35794,7 +35812,7 @@ const MACROEXPAND_ALL_MAX_DEPTH: u32 = 400;
 /// atoms pass through untouched; only genuine sub-forms are expanded. The list
 /// spine is walked iteratively so a long body cannot overflow the Rust stack;
 /// only *nesting* recurses (bounded by `MACROEXPAND_ALL_MAX_DEPTH`).
-fn mx_each(list: EgclVal, env: &mut Env, depth: u32) -> EgclVal {
+fn mx_each(list: EgclVal, env: &mut Env, depth: u32) -> Result<EgclVal, EgclError> {
     mx_each_scoped(list, env, depth, &HashSet::new())
 }
 
@@ -35803,7 +35821,7 @@ fn mx_each_scoped(
     env: &mut Env,
     depth: u32,
     local_functions: &HashSet<u32>,
-) -> EgclVal {
+) -> Result<EgclVal, EgclError> {
     let mut items = Vec::new();
     let mut c = list;
     while c.is_cons() {
@@ -35818,10 +35836,10 @@ fn mx_each_scoped(
     egcl_rt::rooted_ref!(_items_root = &mut items);
     egcl_rt::rooted_ref!(_out_root = &mut out);
     for i in (0..items.len()).rev() {
-        let expanded = macroexpand_all(items[i], env, depth, local_functions);
+        let expanded = macroexpand_all(items[i], env, depth, local_functions)?;
         out = arena_cons(expanded, out);
     }
-    out
+    Ok(out)
 }
 
 /// Expand every macro call reachable in *evaluated position* within `form`,
@@ -35831,16 +35849,18 @@ fn mx_each_scoped(
 /// data, type specifiers, local-macro scopes (MACROLET/SYMBOL-MACROLET), the
 /// LOOP sublanguage, and binding *names* are left verbatim; a form we are unsure
 /// about is returned unchanged and handled by the lazy expansion in `eval_list`
-/// at call time. An expander error also leaves the form verbatim. Thus the pass
-/// can only ever *under*-expand, never miscompile.
+/// at call time. An expander error also leaves the form verbatim, unless a
+/// handler answered it with a transfer of control, which propagates (see
+/// `must_escape_best_effort`). Thus the pass can only ever *under*-expand,
+/// never miscompile.
 fn macroexpand_all(
     form: EgclVal,
     env: &mut Env,
     depth: u32,
     local_functions: &HashSet<u32>,
-) -> EgclVal {
+) -> Result<EgclVal, EgclError> {
     if depth >= MACROEXPAND_ALL_MAX_DEPTH || !form.is_cons() {
-        return form;
+        return Ok(form);
     }
     let d = depth + 1;
     let (car, cdr) = cp(form);
@@ -35849,12 +35869,12 @@ fn macroexpand_all(
     if car.is_cons() {
         // Root across the allocating recursive expansions (moving GC; bliss-8qf).
         egcl_rt::rooted!(cdr_r = cdr);
-        egcl_rt::rooted!(new_car = macroexpand_all(car, env, d, local_functions));
-        let tail = mx_each_scoped(*cdr_r, env, d, local_functions);
-        return arena_cons(*new_car, tail);
+        egcl_rt::rooted!(new_car = macroexpand_all(car, env, d, local_functions)?);
+        let tail = mx_each_scoped(*cdr_r, env, d, local_functions)?;
+        return Ok(arena_cons(*new_car, tail));
     }
     if !car.is_symbol() {
-        return form;
+        return Ok(form);
     }
     let name = sym_name(car);
     // A local function suppresses macro lookup, but its argument forms still
@@ -35863,16 +35883,16 @@ fn macroexpand_all(
         .symbol_index()
         .is_some_and(|index| local_functions.contains(&index))
     {
-        return arena_cons(car, mx_each_scoped(cdr, env, d, local_functions));
+        return Ok(arena_cons(car, mx_each_scoped(cdr, env, d, local_functions)?));
     }
     if matches!(
         symbol_bare_name(&name).as_str(),
         "ATOMIC-INCF" | "ATOMIC-DECF"
     ) {
-        return form;
+        return Ok(form);
     }
 
-    // 1. Macro call → expand once, then recurse into the expansion. On any
+    // 1. Macro call → expand once, then recurse into the expansion. On an
     //    expander error, leave the original form for the lazy path.
     if let Some(mdef) = lookup_macro(env, &name) {
         // Root the original form across the allocating expansion: the Err path
@@ -35880,12 +35900,20 @@ fn macroexpand_all(
         egcl_rt::rooted!(form_r = form);
         return match expand_macro(&mdef, cdr, env, form) {
             Ok(expanded) => macroexpand_all(expanded, env, d, local_functions),
-            Err(_) => *form_r,
+            // The expander ran in the caller's dynamic context, so its error has
+            // already been offered to the user's handlers. A handler that
+            // transferred control (RETURN-FROM, GO, THROW, a HANDLER-CASE clause,
+            // INVOKE-RESTART) must leave: dropping the transfer here made EVAL of
+            // the DEFUN return normally after the handler ran (GH #513). Any
+            // other failure stays best-effort and leaves the form for the lazy
+            // expansion at call time.
+            Err(error) if must_escape_best_effort(&error) => Err(error),
+            Err(_) => Ok(*form_r),
         };
     }
 
     // 2. Special forms that must NOT be walked generically.
-    match name.as_str() {
+    Ok(match name.as_str() {
         // Data / sublanguages / local-macro scopes: leave the whole form.
         "QUOTE" | "EGCL::QUASIQUOTE" | "MACROLET" | "SYMBOL-MACROLET" | "LOOP" | "DOTIMES"
         | "DOLIST" | "DECLARE" | "GO" => form,
@@ -35899,15 +35927,15 @@ fn macroexpand_all(
         "LET" | "LET*" => {
             let (bindings, body) = cp(cdr);
             egcl_rt::rooted!(body = body);
-            egcl_rt::rooted!(new_bindings = mx_bindings(bindings, env, d, local_functions));
-            let new_body = mx_each_scoped(*body, env, d, local_functions);
+            egcl_rt::rooted!(new_bindings = mx_bindings(bindings, env, d, local_functions)?);
+            let new_body = mx_each_scoped(*body, env, d, local_functions)?;
             arena_cons(car, arena_cons(*new_bindings, new_body))
         }
         "LAMBDA" => {
             // (lambda lambda-list body...) — keep the lambda list, expand body.
             let (ll, body) = cp(cdr);
             egcl_rt::rooted!(ll = ll);
-            let new_body = mx_each_scoped(body, env, d, local_functions);
+            let new_body = mx_each_scoped(body, env, d, local_functions)?;
             arena_cons(car, arena_cons(*ll, new_body))
         }
         "FLET" | "LABELS" => {
@@ -35933,8 +35961,8 @@ fn macroexpand_all(
                 local_functions
             };
             egcl_rt::rooted!(body = body);
-            egcl_rt::rooted!(new_defs = mx_local_fns(defs, env, d, definition_scope));
-            let new_body = mx_each_scoped(*body, env, d, &inner_functions);
+            egcl_rt::rooted!(new_defs = mx_local_fns(defs, env, d, definition_scope)?);
+            let new_body = mx_each_scoped(*body, env, d, &inner_functions)?;
             arena_cons(car, arena_cons(*new_defs, new_body))
         }
         "MULTIPLE-VALUE-BIND" => {
@@ -35943,8 +35971,8 @@ fn macroexpand_all(
             let (value_form, body) = cp(rest);
             egcl_rt::rooted!(vars = vars);
             egcl_rt::rooted!(body = body);
-            egcl_rt::rooted!(new_value = macroexpand_all(value_form, env, d, local_functions));
-            let new_body = mx_each_scoped(*body, env, d, local_functions);
+            egcl_rt::rooted!(new_value = macroexpand_all(value_form, env, d, local_functions)?);
+            let new_body = mx_each_scoped(*body, env, d, local_functions)?;
             // Build inside out: copying *vars into an outer call's arguments
             // before allocating the inner tail leaves that copy stale if GC
             // relocates the binding list (bliss-ohwle.2).
@@ -35958,8 +35986,8 @@ fn macroexpand_all(
             let (value_form, body) = cp(rest);
             egcl_rt::rooted!(pattern = pattern);
             egcl_rt::rooted!(body = body);
-            egcl_rt::rooted!(new_value = macroexpand_all(value_form, env, d, local_functions));
-            let new_body = mx_each_scoped(*body, env, d, local_functions);
+            egcl_rt::rooted!(new_value = macroexpand_all(value_form, env, d, local_functions)?);
+            let new_body = mx_each_scoped(*body, env, d, local_functions)?;
             // As for MVB, re-read the rooted pattern after allocating the tail.
             let tail = arena_cons(*new_value, new_body);
             let tail = arena_cons(*pattern, tail);
@@ -35980,7 +36008,7 @@ fn macroexpand_all(
                 let (clause, rest) = cp(c);
                 c = rest;
                 clauses.push(if clause.is_cons() {
-                    mx_each_scoped(clause, env, d, local_functions)
+                    mx_each_scoped(clause, env, d, local_functions)?
                 } else {
                     clause
                 });
@@ -35994,11 +36022,18 @@ fn macroexpand_all(
         }
         "FUNCTION" => {
             // (function (lambda ...)) — expand the lambda; (function name) — leave.
+            // A `(setf name)` function name is a cons too, but it is a NAME, not
+            // a form: walking it called the SETF macro with one argument, which
+            // signalled a PROGRAM-ERROR into the user's handlers for every
+            // DEFUN whose body SETFs an accessor (GH #513).
             let (target, _) = cp(cdr);
-            if target.is_cons() {
+            if target.is_cons()
+                && cp(target).0.is_symbol()
+                && sym_bare_name_rc(cp(target).0).as_ref() == "LAMBDA"
+            {
                 arena_cons(
                     car,
-                    arena_cons(macroexpand_all(target, env, d, local_functions), NIL),
+                    arena_cons(macroexpand_all(target, env, d, local_functions)?, NIL),
                 )
             } else {
                 form
@@ -36010,8 +36045,8 @@ fn macroexpand_all(
         // RETURN-FROM, UNWIND-PROTECT, EVAL-WHEN, …) and ordinary function
         // calls — expand each argument independently. Symbols in argument
         // position (tags, block names, setq/setf place symbols) pass through.
-        _ => arena_cons(car, mx_each_scoped(cdr, env, d, local_functions)),
-    }
+        _ => arena_cons(car, mx_each_scoped(cdr, env, d, local_functions)?),
+    })
 }
 
 /// Expand the init-forms of a LET/LET* binding list, preserving each binding's
@@ -36021,7 +36056,7 @@ fn mx_bindings(
     env: &mut Env,
     depth: u32,
     local_functions: &HashSet<u32>,
-) -> EgclVal {
+) -> Result<EgclVal, EgclError> {
     let mut out_items = Vec::new();
     let mut c = bindings;
     // Spine cursor, collected bindings, and the per-binding variable name all
@@ -36036,7 +36071,7 @@ fn mx_bindings(
             let (var, init) = cp(b);
             egcl_rt::rooted!(var = var);
             // Keep `var`; expand every init-form after it.
-            let new_init = mx_each_scoped(init, env, depth, local_functions);
+            let new_init = mx_each_scoped(init, env, depth, local_functions)?;
             arena_cons(*var, new_init)
         } else {
             b
@@ -36048,7 +36083,7 @@ fn mx_bindings(
     for i in (0..out_items.len()).rev() {
         out = arena_cons(out_items[i], out);
     }
-    out
+    Ok(out)
 }
 
 /// Expand the bodies of FLET/LABELS local functions, preserving each name and
@@ -36058,7 +36093,7 @@ fn mx_local_fns(
     env: &mut Env,
     depth: u32,
     local_functions: &HashSet<u32>,
-) -> EgclVal {
+) -> Result<EgclVal, EgclError> {
     let mut out_items = Vec::new();
     let mut c = defs;
     // Root everything held across the allocating body expansion: the spine
@@ -36076,8 +36111,11 @@ fn mx_local_fns(
                 let (ll, fbody) = cp(after_name);
                 egcl_rt::rooted!(fname = fname);
                 egcl_rt::rooted!(ll = ll);
-                let new_body = mx_each_scoped(fbody, env, depth, local_functions);
-                arena_cons(*fname, arena_cons(*ll, new_body))
+                let new_body = mx_each_scoped(fbody, env, depth, local_functions)?;
+                // Inside out, so the rooted name is read after the inner
+                // allocation rather than copied before it (bliss-ohwle.2).
+                let tail = arena_cons(*ll, new_body);
+                arena_cons(*fname, tail)
             } else {
                 def
             }
@@ -36091,7 +36129,7 @@ fn mx_local_fns(
     for i in (0..out_items.len()).rev() {
         out = arena_cons(out_items[i], out);
     }
-    out
+    Ok(out)
 }
 
 fn expand_macro(
@@ -39352,7 +39390,7 @@ fn eval_defmethod(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     // Expand while the definition's lexical macros are still visible, just as
     // DEFUN does. Methods can outlive an enclosing MACROLET; saving only its
     // unexpanded body loses those macros before the method is invoked.
-    body = mx_each(body, env, 0);
+    body = mx_each(body, env, 0)?;
     let method_id = next_stdlib_class_id();
 
     // Parse the specialized lambda list. Required parameters (before any
