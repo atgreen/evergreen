@@ -4,6 +4,16 @@
 
 ### Added
 
+- `EGCL-MOP` adds `method-function` (AMOP's function of `args` and
+  `next-methods`, whose `call-next-method` runs those methods in turn),
+  `generic-function-method-combination` and `find-method-combination` (a
+  method-combination object for `standard` or a built-in short form, as
+  `defgeneric`'s `:method-combination` chose it), `generic-function-method-class`
+  and `generic-function-declarations`. Generic functions now print as
+  `#<STANDARD-GENERIC-FUNCTION name>`, including `(setf name)` ones, instead of
+  `#<FUNCTION>`. The [closer-mop fork](docs/library-forks.md) imports the new
+  names
+  ([#512](https://github.com/atgreen/evergreen/pull/512)).
 - `EGCL-MOP` reads generic functions and methods:
   `generic-function-name`, `generic-function-lambda-list`,
   `generic-function-argument-precedence-order`, `method-specializers`,

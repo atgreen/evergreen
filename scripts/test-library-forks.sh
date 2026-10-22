@@ -36,6 +36,7 @@ grep -Fxq 'FSET-EGCL-OK' fset.log
 # function and method introspection (GitHub #508).
 "$repo/scripts/egcl-limited.sh" "$egcl" --no-init --load check-closer-mop.lisp >closer-mop.log 2>&1
 grep -Fxq 'CLOSER-MOP-GF-OK' closer-mop.log
+grep -Fxq 'CLOSER-MOP-GF-REST-OK' closer-mop.log
 if grep -qi 'compiling file' cached.log; then
     echo "Cached load unexpectedly compiled source; see $work/cached.log" >&2
     exit 1
@@ -69,5 +70,6 @@ if [[ -n ${SBCL_BIN:-} ]]; then
         --noinform --no-sysinit --no-userinit --non-interactive --load check-closer-mop.lisp \
         >closer-mop-sbcl.log 2>&1
     grep -Fxq 'CLOSER-MOP-GF-OK' closer-mop-sbcl.log
+    grep -Fxq 'CLOSER-MOP-GF-REST-OK' closer-mop-sbcl.log
 fi
 echo "LIBRARY-FORKS-PASS: cold and cached loads, multibyte UTF-8, fset locks, closer-mop; artifacts in $work"

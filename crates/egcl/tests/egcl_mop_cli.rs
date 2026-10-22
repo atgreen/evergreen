@@ -347,3 +347,136 @@ fn egcl_mop_introspects_generic_functions_and_methods() {
 fn egcl_mop_generic_function_introspection_under_gc_stress() {
     assert_eq!(run_gf_program(true), run_gf_program(false));
 }
+
+/// The rest of the generic-function readers, METHOD-FUNCTION, and how a
+/// generic function prints (GitHub #508). METHOD-FUNCTION's calling convention
+/// is AMOP's: (ARGS NEXT-METHODS), CALL-NEXT-METHOD running NEXT-METHODS in turn.
+const GF_REST_PROGRAM: &str = r#"
+  (defclass k () ())
+  (defgeneric g (x &key tol)
+    (declare (optimize (speed 1)))
+    (declare (optimize (debug 2))))
+  (defmethod g ((x k) &key tol) (list :k tol (next-method-p)))
+  (defmethod g ((x t) &key tol) (list :t tol))
+  (defgeneric h (a) (:method-combination + :most-specific-last))
+  (defmethod h + ((a integer)) a)
+  (defclass my-method (standard-method) ())
+  (defgeneric mc (x) (:method-class my-method))
+  (defmethod (setf sx) (v (o k)) v)
+  (defpackage :gf-print-pkg (:use :cl))
+  (defgeneric gf-print-pkg::zork (x))
+  (defun mc-name (gf)
+    (let ((c (egcl-mop:generic-function-method-combination gf)))
+      (list (egcl-mop::method-combination-name c) (egcl-mop::method-combination-options c))))
+
+  (format t "MC ~s ~s ~s~%" (mc-name #'g) (mc-name #'h) (mc-name #'(setf sx)))
+  (format t "MC-EQ ~s ~s~%"
+          (eq (egcl-mop:generic-function-method-combination #'g)
+              (egcl-mop:generic-function-method-combination #'mc))
+          (eq (egcl-mop:generic-function-method-combination #'g)
+              (egcl-mop:find-method-combination #'g 'standard nil)))
+  (format t "MC-PRINT ~a~%" (egcl-mop:generic-function-method-combination #'h))
+  (format t "MCLASS ~s ~s~%"
+          (class-name (egcl-mop:generic-function-method-class #'g))
+          (class-name (egcl-mop:generic-function-method-class #'mc)))
+  (format t "DECL ~s ~s~%" (egcl-mop:generic-function-declarations #'g)
+          (egcl-mop:generic-function-declarations #'h))
+  ;; A redefinition without the options forgets them.
+  (defgeneric mc (x))
+  (format t "MCLASS-REDEF ~s~%" (class-name (egcl-mop:generic-function-method-class #'mc)))
+  (format t "NOT-GF ~s~%"
+          (handler-case (egcl-mop:generic-function-method-combination #'car)
+            (type-error () :type-error)))
+
+  ;; METHOD-FUNCTION.
+  (defun method-on (gf class)
+    (find (find-class class) (egcl-mop:generic-function-methods gf)
+          :key (lambda (m) (first (egcl-mop:method-specializers m)))))
+  (let ((mk (method-on #'g 'k)) (mt (method-on #'g t)))
+    (format t "MF-EQ ~s~%" (eq (egcl-mop:method-function mk) (egcl-mop:method-function mk)))
+    (format t "MF-NEXT ~s~%"
+            (funcall (egcl-mop:method-function mk) (list (make-instance 'k) :tol 3) (list mt)))
+    (format t "MF-LAST ~s~%"
+            (funcall (egcl-mop:method-function mk) (list (make-instance 'k) :tol 4) nil))
+    (format t "MF-T ~s~%" (funcall (egcl-mop:method-function mt) (list 1 :tol 5) nil)))
+  (defmethod chain ((x integer)) (cons :integer (call-next-method)))
+  (defmethod chain ((x rational)) (cons :rational (call-next-method (* 2 x))))
+  (defmethod chain ((x number)) (list :number x))
+  (let ((ms (list (method-on #'chain 'integer) (method-on #'chain 'rational)
+                  (method-on #'chain 'number))))
+    (format t "MF-CHAIN ~s~%" (funcall (egcl-mop:method-function (first ms)) (list 5) (rest ms)))
+    (format t "MF-EXHAUSTED ~s~%"
+            (handler-case (funcall (egcl-mop:method-function (first ms)) (list 5) nil)
+              (error () :no-next-method))))
+  (format t "MF-NOT-METHOD ~s~%"
+          (handler-case (egcl-mop:method-function 3) (type-error () :type-error)))
+
+  ;; Printing.
+  (format t "PRINT ~a ~s ~a~%" #'g #'(setf sx) (list #'gf-print-pkg::zork))
+  (format t "PRINC ~a~%" (princ-to-string #'h))
+  (format t "PRIN1 ~a~%" (prin1-to-string (fdefinition '(setf sx))))
+  (format t "PLAIN ~a ~s ~a~%" #'car (lambda (x) x) (princ-to-string #'method-on))
+  (format t "GF-REST-OK~%")
+"#;
+
+const GF_REST_EXPECTED: &[&str] = &[
+    "MC (STANDARD NIL) (+ (:MOST-SPECIFIC-LAST)) (STANDARD NIL)",
+    "MC-EQ T T",
+    "MC-PRINT #<STANDARD-METHOD-COMBINATION + :MOST-SPECIFIC-LAST>",
+    "MCLASS STANDARD-METHOD MY-METHOD",
+    "DECL ((OPTIMIZE (SPEED 1)) (OPTIMIZE (DEBUG 2))) NIL",
+    "MCLASS-REDEF STANDARD-METHOD",
+    "NOT-GF :TYPE-ERROR",
+    "MF-EQ T",
+    "MF-NEXT (:K 3 T)",
+    "MF-LAST (:K 4 NIL)",
+    "MF-T (:T 5)",
+    "MF-CHAIN (:INTEGER :RATIONAL :NUMBER 10)",
+    "MF-EXHAUSTED :NO-NEXT-METHOD",
+    "MF-NOT-METHOD :TYPE-ERROR",
+    "PRINT #<STANDARD-GENERIC-FUNCTION G> #<STANDARD-GENERIC-FUNCTION (SETF SX)> \
+     (#<STANDARD-GENERIC-FUNCTION GF-PRINT-PKG::ZORK>)",
+    "PRINC #<STANDARD-GENERIC-FUNCTION H>",
+    "PRIN1 #<STANDARD-GENERIC-FUNCTION (SETF SX)>",
+    "PLAIN #<FUNCTION> #<FUNCTION> #<FUNCTION>",
+    "GF-REST-OK",
+];
+
+fn run_gf_rest_program(stress: bool) -> String {
+    let mut command = Command::new(BIN);
+    command.args(["--no-init", "--eval", GF_REST_PROGRAM]);
+    if stress {
+        command
+            .env("EGCL_GC_STRESS", "1")
+            .env("EGCL_GC_STRESS_AFTER_INIT", "1")
+            .env("EGCL_GC_POISON", "1");
+    }
+    let output = command.output().expect("run egcl");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    for expected in GF_REST_EXPECTED {
+        assert!(
+            stdout.contains(expected),
+            "missing {expected:?} in:\n{stdout}"
+        );
+    }
+    stdout
+        .lines()
+        .filter(|line| !line.starts_with("[gc-stress]"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn egcl_mop_method_function_combination_class_declarations_and_gf_printing() {
+    run_gf_rest_program(false);
+}
+
+/// DEFGENERIC now records its options on a property list and %CALL-METHOD
+/// runs a method body over looked-up method records; a forced minor collection
+/// on every allocation must not change any answer.
+#[test]
+fn egcl_mop_method_function_and_gf_options_under_gc_stress() {
+    assert_eq!(run_gf_rest_program(true), run_gf_rest_program(false));
+}

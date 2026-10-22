@@ -76,7 +76,10 @@ methods through `c2mop:` — `specializer-direct-generic-functions`,
 `specializer-direct-methods`, `method-specializers`,
 `method-generic-function`, `generic-function-lambda-list`,
 `generic-function-name` and `compute-applicable-methods-using-classes`,
-including after `remove-method`. `scripts/test-library-forks.sh` runs it. Run it from this directory with
+including after `remove-method`; calls a `method-function`; and reads
+`generic-function-method-combination` (against `find-method-combination`),
+`generic-function-method-class`, `generic-function-declarations` and how a
+generic function prints. `scripts/test-library-forks.sh` runs it. Run it from this directory with
 `EGCL_PORT_RUNTIME` and `EGCL_PORT_CACHE` set as above; a development EGCL
 binary additionally needs `--bootstrap`. The same test runs on SBCL. The
 adapter imports what `EGCL-MOP` provides; it does not claim complete MOP

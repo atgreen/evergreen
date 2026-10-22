@@ -40,3 +40,17 @@
   (remove-method #'mop-probe method)
   (assert (not (member #'mop-probe (c2mop:specializer-direct-generic-functions (find-class 'mop-kernel))))))
 (format t "CLOSER-MOP-GF-OK~%")
+
+;;;; METHOD-FUNCTION and the remaining generic-function readers (GitHub #508).
+(defgeneric mop-options (x)
+  (declare (optimize (speed 1))))
+(defmethod mop-options ((x mop-kernel)) (list :kernel (next-method-p)))
+(let ((method (first (c2mop:generic-function-methods #'mop-options))))
+  (assert (equal (funcall (c2mop:method-function method) (list (make-instance 'mop-kernel)) '())
+                 '(:kernel nil)))
+  (assert (eq (c2mop:generic-function-method-combination #'mop-options)
+              (c2mop:find-method-combination #'mop-options 'standard nil)))
+  (assert (eq (c2mop:generic-function-method-class #'mop-options) (find-class 'standard-method)))
+  (assert (equal (c2mop:generic-function-declarations #'mop-options) '((optimize (speed 1)))))
+  (assert (eql 0 (search "#<STANDARD-GENERIC-FUNCTION " (prin1-to-string #'mop-options)))))
+(format t "CLOSER-MOP-GF-REST-OK~%")

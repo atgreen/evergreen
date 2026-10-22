@@ -99,6 +99,38 @@ fn run_iteration_body(
     Ok(())
 }
 
+/// The printed representation of a function object the interpreter knows more
+/// about than this crate does: a generic function prints as
+/// `#<STANDARD-GENERIC-FUNCTION name>` (GitHub #508). Installed by the
+/// interpreter, which owns the generic-function registry; `None` for any other
+/// function. Must not allocate on the Lisp heap.
+pub type FunctionPrintHook = fn(EgclVal) -> Option<String>;
+static FUNCTION_PRINT_HOOK: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+pub fn set_function_print_hook(hook: Option<FunctionPrintHook>) {
+    FUNCTION_PRINT_HOOK.store(
+        hook.map_or(0, |h| h as usize),
+        std::sync::atomic::Ordering::Release,
+    );
+}
+
+/// How a function object prints: `#<STANDARD-GENERIC-FUNCTION name>` for a
+/// generic function, else `#<FUNCTION>`. Shared with the interpreter's own
+/// printer so WRITE and FORMAT agree.
+pub fn function_representation(v: EgclVal) -> String {
+    let raw = FUNCTION_PRINT_HOOK.load(std::sync::atomic::Ordering::Acquire);
+    if raw != 0 {
+        // SAFETY: the cell only ever holds 0 or a `FunctionPrintHook` stored above.
+        let hook: FunctionPrintHook =
+            unsafe { std::mem::transmute::<usize, FunctionPrintHook>(raw) };
+        if let Some(text) = hook(v) {
+            return text;
+        }
+    }
+    "#<FUNCTION>".to_string()
+}
+
 pub type PprintDispatchHook = fn(EgclVal, bool) -> Option<String>;
 static PPRINT_DISPATCH_HOOK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -1555,7 +1587,7 @@ fn egclval_to_print_inner(mut v: EgclVal, escapep: bool) -> String {
     // Reified function objects and legacy source closures share the same
     // opaque function representation (matches cli print_val).
     if egcl_rt::function::is_interpreted_function(v) || is_closure_cons(v) {
-        return "#<FUNCTION>".to_string();
+        return function_representation(v);
     }
     if v.is_cons() {
         // *PRINT-LEVEL*: past the depth limit, a nested list prints as `#`.
