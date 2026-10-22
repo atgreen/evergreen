@@ -84,6 +84,13 @@
 
 ### Performance
 
+- `MEMBER-IF`, `MEMBER-IF-NOT` and `READ-DELIMITED-LIST` leave the
+  interpreter. All three used `DO`, whose expander is defined later in the
+  same prelude file, so the bytecode compiler refused their bodies and no
+  later call could lift them -- they ran tree-walked for the life of the
+  image. Scanning a 2000-element list 300 times with `MEMBER-IF` drops from
+  50.3 s to 0.9 s, and it is now faster than the equivalent `COUNT-IF`
+  ([#523](https://github.com/atgreen/evergreen/pull/523)).
 - Linux AArch64 compiles more code natively. Its optimising compiler refused
   the type predicates (`TYPEP`, `SYMBOLP`, `INTEGERP`, `STRINGP`,
   `HASH-TABLE-P`), `LENGTH` on a simple string, memory fences, and the
