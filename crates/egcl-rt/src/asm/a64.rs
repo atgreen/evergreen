@@ -678,6 +678,39 @@ pub fn cset(d: Reg, cc: Cc) -> u32 {
 // ---------------------------------------------------------------------------
 // Branches to a register, and the no-op
 
+/// `B.cond #offset` — a PC-relative conditional branch. `offset` is in BYTES
+/// from this instruction, and must be a multiple of four within +/-1 MiB;
+/// anything else returns `None` rather than truncating into the condition
+/// field.
+///
+/// [`Asm`](crate::asm::Asm) resolves conditional branches to labels, but only
+/// when the HOST is AArch64, because its fixup table is host-gated. A stub
+/// emitter that must compile on every host — so that x86 CI type-checks it —
+/// computes its own displacement and uses this instead.
+pub fn b_cond(cc: Cc, offset: i32) -> Option<u32> {
+    let imm19 = branch_words(offset, 19)?;
+    Some(0x5400_0000 | (imm19 << 5) | cc.a64_cond())
+}
+
+/// `B #offset` — a PC-relative unconditional branch, in BYTES, within
+/// +/-128 MiB.
+pub fn b(offset: i32) -> Option<u32> {
+    Some(0x1400_0000 | branch_words(offset, 26)?)
+}
+
+/// A branch displacement in instructions, as an unsigned `bits`-wide field.
+fn branch_words(offset: i32, bits: u32) -> Option<u32> {
+    if offset % 4 != 0 {
+        return None;
+    }
+    let words = offset / 4;
+    let limit = 1i32 << (bits - 1);
+    if words < -limit || words >= limit {
+        return None;
+    }
+    Some(words as u32 & ((1 << bits) - 1))
+}
+
 /// `BR Xn` — an indirect jump, for a tail call or a jump table.
 pub fn br(n: Reg) -> u32 {
     0xD61F_0000 | ((n as u32) << 5)
@@ -895,6 +928,30 @@ mod tests {
         assert_eq!(ldrb_imm(0, 1, 4096), None);
         assert_eq!(ldrh_imm(0, 1, 1), None);
         assert_eq!(strh_imm(0, 1, 8192), None);
+    }
+
+    #[test]
+    fn pc_relative_branches_match_the_assembler() {
+        // Verified against GNU as on an AArch64 host. The displacement is in
+        // BYTES here but encodes as INSTRUCTIONS; getting that wrong scales
+        // every branch by four and still assembles.
+        check(&[
+            ("b.ne .+8", 0x54000041, b_cond(Cc::Ne, 8).unwrap()),
+            ("b.eq .+4", 0x54000020, b_cond(Cc::E, 4).unwrap()),
+            ("b.ne .-16", 0x54FFFF81, b_cond(Cc::Ne, -16).unwrap()),
+            (
+                "b.ne .+1048572",
+                0x547FFFE1,
+                b_cond(Cc::Ne, 1048572).unwrap(),
+            ),
+            ("b .+8", 0x14000002, b(8).unwrap()),
+        ]);
+        // Out of range or not instruction-aligned: decline, never truncate
+        // into the condition field.
+        assert_eq!(b_cond(Cc::Ne, 2), None);
+        assert_eq!(b_cond(Cc::Ne, 1 << 20), None);
+        assert_eq!(b_cond(Cc::Ne, -(1 << 20) - 4), None);
+        assert_eq!(b(1 << 27), None);
     }
 
     #[test]
