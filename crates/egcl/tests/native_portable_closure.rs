@@ -136,11 +136,14 @@ fn closure_creation_survives_osr_entry() {
         ">"
     };
     // Whether the OSR-entered loop then has to bail out is a property of the
-    // backend, not of closure creation. ppc64le runs it to completion, so
-    // require it NOT to deopt -- a change that reintroduced one would be a
-    // real loss. x86-64 never enters, so it cannot deopt either.
+    // backend, not of closure creation. ppc64le and AArch64 both run it to
+    // completion -- measured, `DEOPTS=0 OSR=1` -- so require them NOT to
+    // deopt: a change that reintroduced one would be a real loss. x86-64
+    // Linux never enters, so it cannot deopt either. The remaining targets
+    // still bail out once, and no hardware was to hand to re-check them.
     let deopts = if cfg!(all(target_arch = "x86_64", target_os = "linux"))
         || cfg!(all(target_arch = "powerpc64", target_endian = "little"))
+        || cfg!(all(target_arch = "aarch64", unix))
     {
         "="
     } else {
