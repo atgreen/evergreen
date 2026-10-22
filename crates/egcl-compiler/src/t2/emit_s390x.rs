@@ -138,6 +138,11 @@
 //! simple-string, package, hash-table, NULL and BOOLEAN predicates inline
 //! from the tag and the header's type-id byte, declining exactly the cases
 //! emit.rs declines (bliss-nlpd4). Everything
+//! The builder's target-free `Call` for `MULTIPLE-VALUE-LIST`
+//! (`AuxData::ValuesToList`) and for non-capturing closure creation
+//! (`AuxData::NestedClosure`) go through [`RuntimeCalls::portable`], as they
+//! do on ppc64le; without them a function that merely creates a
+//! `(lambda ...)` lost its whole optimized version. Everything
 //! else, including `StringByteLength`, variable shift amounts and any unboxed
 //! representation, returns `UnsupportedOp(0x390)` and the function stays at its
 //! current tier, naming the opcode in the T2 log; structural declines (an
@@ -642,6 +647,47 @@ impl Emitter<'_> {
         let mut entry_slot: Option<u64> = None;
         let helper = if let Some(data) = data {
             match data.opcode {
+                // `(multiple-value-list form)`. The builder gives this the
+                // `Call` opcode with NO call target: x86-64 turns it into an
+                // `Invoke` carrying TRANSFER_VALUES_TO_LIST_REQUEST, which only
+                // its mapped entry services, so a checked-ABI target saw an
+                // `AuxData` the general arm below rejects and declined the
+                // whole function to T1. The plain adapter reads the runtime
+                // tuple the argument's producer left and returns a fresh list.
+                Opcode::Call if matches!(data.aux, AuxData::ValuesToList) => {
+                    if data.args.len() != 1 || data.results.len() != 1 {
+                        return Err(unsupported!());
+                    }
+                    self.load(*data.args.first().ok_or(unsupported!())?, 2)?;
+                    self.runtime.portable.values_to_list
+                }
+                // `(lambda ...)` capturing nothing -- the ordinary
+                // `(mapcar (lambda ..) ..)` shape. Same story as
+                // `ValuesToList`: x86-64 services it through its mapped
+                // TRANSFER_MAKE_CLOSURE_REQUEST, so a checked-ABI target needs
+                // the plain adapter plus the address of the retained nested
+                // body. Never capture: a capturing closure needs an
+                // activation-owned EnvFrame this emitter does not publish.
+                Opcode::Call if matches!(data.aux, AuxData::NestedClosure(_)) => {
+                    let AuxData::NestedClosure(index) = data.aux else {
+                        return Err(unsupported!());
+                    };
+                    if !data.args.is_empty() || data.results.len() != 1 {
+                        return Err(unsupported!());
+                    }
+                    let body = *self
+                        .runtime
+                        .portable
+                        .nested_bodies
+                        .get(index as usize)
+                        .ok_or(unsupported!())?;
+                    if body == 0 {
+                        return Err(unsupported!());
+                    }
+                    self.asm.imm64(2, body);
+                    self.asm.imm64(3, 0);
+                    self.runtime.portable.make_closure
+                }
                 Opcode::Call => {
                     let AuxData::CallTarget(symbol) = data.aux else {
                         return Err(unsupported!());
@@ -2865,6 +2911,10 @@ mod tests {
         assert_eq!(entry(0xcafe, 2, args.as_ptr(), 0), SENTINEL, "wrong arity");
         depth = 64;
         assert_eq!(entry(0xcafe, 1, args.as_ptr(), 0), SENTINEL, "at the cap");
+        // Only the emitted code reads this counter, through the address baked
+        // into it, so assert the decline left it alone -- and give Rust a read
+        // it can see, which the workspace lint gate requires.
+        assert_eq!(depth, 64, "a declined entry must not bump the depth");
         depth = 0;
         header[capacity] = 8;
         assert_eq!(entry(0xcafe, 1, args.as_ptr(), 0), SENTINEL, "no room");
@@ -2901,6 +2951,111 @@ mod tests {
         ));
         // One that fits still emits.
         assert!(emit_native_call_entry(&spec(64)).is_ok());
+    }
+
+    /// The builder's two target-free `Call` shapes reach their plain
+    /// adapters with the System Z argument convention: `make_closure` takes
+    /// the retained nested body in r2 and a zero capture in r3,
+    /// `values_to_list` takes the primary in r2, and each returns its value
+    /// in r2. Before these arms the general `Call` arm rejected the `AuxData`
+    /// and the whole function lost its optimized version.
+    #[test]
+    fn the_portable_call_arms_reach_their_adapters_with_the_right_arguments() {
+        const BODY: u64 = 0x5ced_0010;
+        const CLOSURE: u64 = 0x5ced_0011;
+
+        extern "C" fn make_closure(body: u64, capture: u64) -> u64 {
+            assert_eq!((body, capture), (BODY, 0), "body in r2, no capture in r3");
+            CLOSURE
+        }
+        extern "C" fn values_to_list(primary: u64) -> u64 {
+            primary + 1
+        }
+        extern "C" fn unexpected_slice(_: u64, _: u64, _: *const EgclVal, _: u64) -> u64 {
+            unreachable!("a portable Call must not reach the slice adapter")
+        }
+
+        // `aux` decides which adapter the one `Call` uses; `args` follows it.
+        let build = |aux: AuxData, arity: usize| {
+            let mut f = Function::new("z-portable-call");
+            let block = f.entry();
+            let args: Vec<_> = (0..arity)
+                .map(|_| f.add_block_param(block, IRType::TOP, ValueRepresentation::Tagged))
+                .collect();
+            let (_, result) = f.push_inst(
+                block,
+                InstData {
+                    opcode: Opcode::Call,
+                    args: args.clone(),
+                    results: vec![],
+                    aux,
+                    flags: InstFlags {
+                        call: true,
+                        safepoint: true,
+                        effectful: true,
+                        ..Default::default()
+                    },
+                    targets: vec![],
+                    frame_state: None,
+                    source_pos: 0,
+                },
+                &[(IRType::TOP, ValueRepresentation::Tagged)],
+            );
+            f.set_terminator(
+                block,
+                InstData {
+                    opcode: Opcode::Return,
+                    args: vec![result[0]],
+                    results: vec![],
+                    aux: AuxData::None,
+                    flags: InstFlags::default(),
+                    targets: vec![],
+                    frame_state: None,
+                    source_pos: 0,
+                },
+            );
+            f
+        };
+        let runtime = RuntimeCalls {
+            call_slice: unexpected_slice as *const () as u64,
+            portable: crate::t2::emit::PortableCalls {
+                values_to_list: values_to_list as *const () as u64,
+                make_closure: make_closure as *const () as u64,
+                nested_bodies: vec![BODY],
+            },
+            ..Default::default()
+        };
+
+        // A nested-body index with no entry must decline rather than call
+        // through whatever happens to sit at that offset.
+        assert!(matches!(
+            emit_framed_with_runtime(&build(AuxData::NestedClosure(7), 0), 0, 1, runtime.clone()),
+            Err(EmitError::UnsupportedOp(_))
+        ));
+
+        for (aux, arity, expected) in [
+            (AuxData::NestedClosure(0), 0, CLOSURE),
+            (AuxData::ValuesToList, 1, 41),
+        ] {
+            let compiled =
+                emit_framed_with_runtime(&build(aux, arity), 0, 1, runtime.clone()).unwrap();
+            assert_eq!(compiled.emitted_safepoints, 1);
+            // Only System Z can run the bytes, so keep the expected result
+            // used on every host: a binding live in one cfg arm alone fails
+            // the workspace lint gate on the others.
+            let _ = expected;
+            #[cfg(all(target_arch = "s390x", unix))]
+            {
+                let code = egcl_rt::jit::JitBuffer::new(&compiled.code).unwrap();
+                // SAFETY: the buffer owns the generated activation entry, and
+                // the slots include every shadow word it advertised.
+                let entry: unsafe extern "C" fn(*mut u64) -> u64 =
+                    unsafe { std::mem::transmute(code.as_ptr()) };
+                let mut slots = vec![0u64; 1 + compiled.shadow_root_slots as usize];
+                slots[0] = 40;
+                assert_eq!(unsafe { entry(slots.as_mut_ptr()) }, expected);
+            }
+        }
     }
 
     #[test]
