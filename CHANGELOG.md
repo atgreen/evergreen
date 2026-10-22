@@ -345,6 +345,10 @@
 
 ### Fixed
 
+- `print-unreadable-object` with `:identity t` prints the object's address, so
+  different objects print differently. It printed `sxhash`, which is the same
+  for every standard object, so all instances shared one identity
+  ([#526](https://github.com/atgreen/evergreen/pull/526)).
 - `make-instance` called through `#'make-instance` (with `apply` or `funcall`)
   inside an `initialize-instance :after` method of an instance that was itself
   made that way no longer signals "no applicable method for generic function

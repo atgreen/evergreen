@@ -21697,6 +21697,20 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 egcl_rt::rooted!(name_form = generic_function_name_form(env, gf)?);
                 return Ok(stored_generic_option(*name_form, property).unwrap_or(NIL));
             }
+            // (%object-address object) -- OBJECT's current address, or for an
+            // immediate its bits: PRINT-UNREADABLE-OBJECT's :IDENTITY. SXHASH
+            // cannot serve, since it is one value for every standard object
+            // (GitHub #520). A moving collection may change the address.
+            "EGCL-INTERNAL::%OBJECT-ADDRESS" | "EGCL-INTERNAL:%OBJECT-ADDRESS" | "%OBJECT-ADDRESS" => {
+                let (af, _) = cp(cdr);
+                let object = eval_form(af, env)?;
+                let bits = if object.is_cons() || object.is_heap_object() {
+                    (unsafe { object.as_ptr() }) as u64
+                } else {
+                    object.0
+                };
+                return Ok(EgclVal::from_fixnum((bits & ((1 << 60) - 1)) as i64));
+            }
             // (%call-method method args next-methods) -- run METHOD's body on the
             // argument list ARGS, with CALL-NEXT-METHOD and NEXT-METHOD-P seeing
             // the methods in NEXT-METHODS, most specific first: the calling

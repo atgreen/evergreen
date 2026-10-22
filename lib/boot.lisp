@@ -1453,7 +1453,7 @@ Returns NIL."
          (when (or (not ,show-type) ,(not (null body)))
            (write-char #\Space ,out))
          (let ((*print-base* 16) (*print-radix* nil))
-           (princ (sxhash ,obj) ,out)))
+           (princ (egcl-internal::%object-address ,obj) ,out)))
        (write-char #\> ,out)
        nil)))
 

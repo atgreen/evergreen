@@ -19592,6 +19592,12 @@ fn print_unreadable_object_macro() {
             r##"(progn (defclass unreadable-probe () ()) (defmethod print-object ((obj unreadable-probe) s) (print-unreadable-object (obj s :type t) (write-string "value=7" s))) (princ-to-string (make-instance 'unreadable-probe)))"##,
             "\"#<UNREADABLE-PROBE value=7>\"",
         ),
+        // GitHub #520: :identity told no two standard objects apart, because
+        // it printed SXHASH, which is one value for every instance.
+        (
+            r##"(progn (defclass identity-probe () ()) (defclass identity-other () ()) (flet ((show (o) (with-output-to-string (s) (print-unreadable-object (o s :type t :identity t))))) (let ((a (make-instance 'identity-probe)) (b (make-instance 'identity-probe)) (c (make-instance 'identity-other))) (list (string= (show a) (show b)) (string= (show a) (show a)) (string= (subseq (show a) 17) (subseq (show c) 17))))))"##,
+            "(NIL T NIL)",
+        ),
     ]);
 }
 
