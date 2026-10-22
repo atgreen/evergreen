@@ -13,7 +13,7 @@
   `#<STANDARD-GENERIC-FUNCTION name>`, including `(setf name)` ones, instead of
   `#<FUNCTION>`. The [closer-mop fork](docs/library-forks.md) imports the new
   names
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#512](https://github.com/atgreen/evergreen/pull/512)).
 - `EGCL-MOP` reads generic functions and methods:
   `generic-function-name`, `generic-function-lambda-list`,
   `generic-function-argument-precedence-order`, `method-specializers`,
