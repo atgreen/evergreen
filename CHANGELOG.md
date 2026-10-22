@@ -345,6 +345,12 @@
 
 ### Fixed
 
+- `make-instance` called through `#'make-instance` (with `apply` or `funcall`)
+  inside an `initialize-instance :after` method of an instance that was itself
+  made that way no longer signals "no applicable method for generic function
+  MAKE-INSTANCE". flexi-streams makes its streams this way, so
+  `(flex:make-flexi-stream s :external-format :utf-8)` failed
+  ([#525](https://github.com/atgreen/evergreen/pull/525)).
 - `(make-hash-table :synchronized t)` now makes a synchronized table. The
   option was ignored, so threads sharing such a table could corrupt it:
   `gethash` returned another key's value, and the table kept duplicate keys

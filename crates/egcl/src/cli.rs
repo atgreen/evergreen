@@ -8112,6 +8112,24 @@ fn builtin_fallback_active(name: &str) -> bool {
     BUILTIN_FALLBACK_NAME.with(|cell| cell.borrow().as_deref() == Some(name))
 }
 
+/// Whether this operator-position dispatch of `name` is the one
+/// [`builtin_generic_fallback`] synthesized, consuming the mark if so. Only
+/// that dispatch takes the built-in path: calls made while the built-in runs,
+/// such as a MAKE-INSTANCE inside an INITIALIZE-INSTANCE :after method, must
+/// dispatch normally, or their own fallback is refused and they signal
+/// no-applicable-method (GitHub #519).
+fn take_builtin_fallback(name: &str) -> bool {
+    BUILTIN_FALLBACK_NAME.with(|cell| {
+        let mut cell = cell.borrow_mut();
+        if cell.as_deref() == Some(name) {
+            *cell = None;
+            true
+        } else {
+            false
+        }
+    })
+}
+
 /// Build and signal a catchable error condition for a failed generic-function
 /// dispatch (`no-applicable-method`, R5.??). Returns the terminal error when no
 /// handler transfers control.
@@ -23463,7 +23481,8 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 // User methods on MAKE-INSTANCE take part in dispatch (ansi
                 // make-instance.1/2 and :around methods); the built-in
                 // instantiation is the fallback for other classes.
-                if env.methods.contains_key(&name) && !builtin_fallback_active(&name) {
+                let fallback = take_builtin_fallback(&name);
+                if env.methods.contains_key(&name) && !fallback {
                     let args = eval_args(cdr, env)?;
                     return invoke_generic_function(&name, &args, env);
                 }
@@ -25987,7 +26006,8 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             "CLASS-NAME" => {
                 // A user method on CLASS-NAME takes part in dispatch; the built-in
                 // behaviour is the fallback for classes without one (ansi class-name.2).
-                if env.methods.contains_key(&name) && !builtin_fallback_active(&name) {
+                let fallback = take_builtin_fallback(&name);
+                if env.methods.contains_key(&name) && !fallback {
                     let args = eval_args(cdr, env)?;
                     return invoke_generic_function(&name, &args, env);
                 }
@@ -28303,7 +28323,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         // including around methods and later method redefinitions. A slot-name
         // mapping alone cannot justify bypassing the applicable methods.
         if (env.generics.contains_key(&name) || env.methods.contains_key(&name))
-            && !builtin_fallback_active(&name)
+            && !take_builtin_fallback(&name)
         {
             let args = eval_args(cdr, env)?;
             return invoke_generic_function(&name, &args, env);
