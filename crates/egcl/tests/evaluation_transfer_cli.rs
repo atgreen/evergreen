@@ -168,3 +168,84 @@ fn instance_defaults_use_already_evaluated_initarg_keys() {
         );
     }
 }
+
+/// GH #513: EVAL of a DEFUN whose body SETFs an accessor walked `#'(setf
+/// accessor)` as a SETF call and signalled an internal PROGRAM-ERROR to the
+/// caller's handlers, and the definition-time expansion swallowed any handler's
+/// transfer of control out of a genuine expander error.
+#[test]
+fn definition_time_expansion_signals_nothing_and_honours_handler_exits() {
+    for tier in ["interp", "t0", "t1"] {
+        passes(
+            run(
+                r#"
+          (defclass holder () ((cache :initform nil :accessor holder-cache)))
+          (defgeneric (setf gf-acc) (value object))
+          (defmethod (setf gf-acc) (value (object holder)) (setf (holder-cache object) value))
+          (defvar *seen* '())
+          (defun try-it (form)
+            (setq *seen* '())
+            (block b
+              (handler-bind ((error (lambda (e)
+                                      (push (type-of e) *seen*)
+                                      (return-from b :handler-exited))))
+                (eval form)
+                :eval-returned)))
+          (dolist (form '((defun put-cache (c) (setf (holder-cache c) 1))
+                          (defun put-gf (c) (setf (gf-acc c) 2))
+                          (defun put-undefined (c) (setf (no-such-accessor c) 3))
+                          (defun put-loop (c) (dotimes (i 3) (setf (holder-cache c) i)))
+                          (defmethod put-method ((c holder)) (setf (holder-cache c) 4))
+                          (lambda (c) (setf (holder-cache c) 5))))
+            (assert (eq :eval-returned (try-it form)) () "~s did not return" form)
+            (assert (null *seen*) () "~s signalled ~s" form *seen*))
+          (assert (= 1 (put-cache (make-instance 'holder))))
+          (assert (= 2 (holder-cache (let ((h (make-instance 'holder))) (put-gf h) h))))
+          (assert (= 4 (put-method (make-instance 'holder))))
+          (assert (eq :not-caught
+                      (handler-case (progn (eval '(defun put-cache-2 (c) (setf (holder-cache c) 2)))
+                                           :not-caught)
+                        (error (e) (list :caught (type-of e))))))
+
+          ;; A genuine expander error inside EVAL of a definition reaches the
+          ;; handlers, and their transfer of control wins.
+          (defmacro always-bad () (error "always bad"))
+          (dolist (definition '((defun bad-1 () (always-bad))
+                                (defun bad-2 () (dotimes (i 2) (always-bad)))
+                                (defmethod bad-3 ((x t)) (always-bad))))
+            (assert (eq :handler-exited (try-it definition)) () "return-from lost: ~s" definition)
+            (assert (equal '(simple-error) *seen*))
+            (assert (eq :thrown
+                        (catch 'escape
+                          (handler-bind ((error (lambda (e) (declare (ignore e)) (throw 'escape :thrown))))
+                            (eval definition)
+                            :eval-returned)))
+                    () "throw lost: ~s" definition)
+            (assert (eq :went
+                        (block done
+                          (tagbody
+                             (handler-bind ((error (lambda (e) (declare (ignore e)) (go out))))
+                               (eval definition))
+                             (return-from done :fell-through)
+                           out
+                             (return-from done :went))))
+                    () "go lost: ~s" definition)
+            (assert (equal '(:caught simple-error)
+                           (handler-case (progn (eval definition) :not-caught)
+                             (error (e) (list :caught (type-of e)))))
+                    () "handler-case lost: ~s" definition)
+            (assert (eq :restarted
+                        (restart-case
+                            (handler-bind ((error (lambda (e) (declare (ignore e)) (invoke-restart 'skip))))
+                              (eval definition)
+                              :eval-returned)
+                          (skip () :restarted)))
+                    () "restart lost: ~s" definition))
+          (format t "DEFINITION-EXPANSION-TRANSFER-OK~%")
+        "#,
+                tier,
+            ),
+            "DEFINITION-EXPANSION-TRANSFER-OK",
+        );
+    }
+}

@@ -338,6 +338,14 @@
 
 ### Fixed
 
+- `eval` of a `defun` or `defmethod` whose body `setf`s an accessor (or any
+  `(setf name)` function) no longer signals a spurious `program-error` to the
+  caller's `handler-bind` handlers. A handler that answers a genuine
+  macro-expansion error during such an `eval` with `return-from`, `go`,
+  `throw`, a `handler-case` clause or `invoke-restart` now leaves as it should;
+  `eval` used to return normally after the handler ran. Test harnesses such as
+  LIFT reported a correct run-time `defclass`/`define-object` test as failing
+  ([#515](https://github.com/atgreen/evergreen/pull/515)).
 - A generic function created implicitly by `defmethod` now has `&key` with
   no keyword names in its lambda list, as CLHS 7.6.1 specifies, so a later
   method may accept different keywords. EGCL used to copy the first method's
