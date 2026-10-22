@@ -355,7 +355,7 @@
   macro again at run time, so a function compiled this way behaved differently
   from the rest of its fasl. Macros used in `defmethod` bodies are still
   expanded when the method is loaded
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#517](https://github.com/atgreen/evergreen/pull/517)).
 - A generic function created implicitly by `defmethod` now has `&key` with
   no keyword names in its lambda list, as CLHS 7.6.1 specifies, so a later
   method may accept different keywords. EGCL used to copy the first method's
