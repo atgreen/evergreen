@@ -6171,12 +6171,28 @@ impl<'e> Lowerer<'e> {
         egcl_rt::rooted_ref!(_restartable_form_root = &mut restartable_form);
         egcl_rt::rooted!(clauses = list_to_vec(clauses_form));
 
+        // Each completed clause function goes straight into this form's slot
+        // of `restart_cases`, which the Lowerer's root scan traces: compiling a
+        // later clause allocates, and a Rust-local Vec of the finished ones was
+        // invisible to the collector (bliss-1gzex). A bail drops the slot again.
+        let rc = self.restart_cases.len();
+        self.restart_cases.push(RestartCaseInfo { restarts: Vec::new() });
+        let compiled = self.compile_restart_clauses(rc, &clauses);
+        if compiled.is_err() {
+            self.restart_cases.truncate(rc);
+        }
+        compiled?;
+        self.lower_restart_case_body(rc as u32, restartable_form)
+    }
+
+    /// Compile each RESTART-CASE clause in `clauses` into `restart_cases[rc]`.
+    fn compile_restart_clauses(&mut self, rc: usize, clauses: &[EgclVal]) -> LowerResult<()> {
         let enclosing_locals: std::collections::HashSet<String> =
             self.scopes.iter().flat_map(|s| s.keys().cloned()).collect();
-
-        let mut restarts = Vec::new();
-        for i in 0..clauses.len() {
-            let (name_form, clause_rest) = cp(clauses[i]);
+        // Each element is read only when its turn comes, after the previous
+        // clause's allocations, from the caller's rooted vector.
+        for &clause in clauses {
+            let (name_form, clause_rest) = cp(clause);
             if !name_form.is_symbol() {
                 return Err(Bail);
             }
@@ -6229,14 +6245,16 @@ impl<'e> Lowerer<'e> {
                 self.portable,
             )
             .ok_or(Bail)?;
-            restarts.push(RestartClauseInfo {
+            self.restart_cases[rc].restarts.push(RestartClauseInfo {
                 name,
                 function: Box::new(function),
             });
         }
+        Ok(())
+    }
 
-        let rc = self.restart_cases.len() as u32;
-        self.restart_cases.push(RestartCaseInfo { restarts });
+    /// Emit the RESTART-CASE form whose clauses `restart_cases[rc]` holds.
+    fn lower_restart_case_body(&mut self, rc: u32, restartable_form: EgclVal) -> LowerResult<()> {
         let sp_restore = self.cur_stack;
         self.emit(Instr::PushRestartCase {
             rc,
