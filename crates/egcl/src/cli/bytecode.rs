@@ -26379,12 +26379,7 @@ fn form_contains_atomic_update(form: EgclVal) -> bool {
         return false;
     }
     let (head, mut tail) = cp(form);
-    if head.is_symbol()
-        && matches!(
-            symbol_bare_name(&sym_name(head)).as_str(),
-            "ATOMIC-INCF" | "ATOMIC-DECF"
-        )
-    {
+    if super::is_atomic_update_operator(head) {
         return true;
     }
     if head.is_symbol() && symbol_bare_name(&sym_name(head)) == "QUOTE" {
