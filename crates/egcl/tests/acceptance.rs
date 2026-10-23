@@ -17842,13 +17842,12 @@ fn character_comparisons_keep_their_arity_and_type_rules() {
             "(handler-case (char-downcase #\\a #\\a) (program-error () :pe))",
             ":PE",
         ),
-        // Case handling is ASCII-only and must stay CONSISTENT with
-        // LOWER-CASE-P: ansi CHAR-UPCASE.2 walks all 65536 code points
+        // Case handling uses the Unicode 1:1 mapping and stays CONSISTENT
+        // with LOWER-CASE-P: ansi CHAR-UPCASE.2 walks all 65536 code points
         // asserting that anything CHAR-UPCASE changes is a character
-        // LOWER-CASE-P calls lower. A Unicode CHAR-UPCASE over an ASCII
-        // LOWER-CASE-P breaks that (see the separate Unicode-case bead).
-        ("(char-upcase (code-char 233))", "#\\\u{e9}"),
-        ("(lower-case-p (code-char 233))", "NIL"),
+        // LOWER-CASE-P calls lower (bliss-ne14). SBCL gives the same answers.
+        ("(char-upcase (code-char 233))", "#\\\u{c9}"),
+        ("(lower-case-p (code-char 233))", "T"),
         ("(char-code #\\a)", "97"),
         ("(code-char 97)", "#\\a"),
         // Reachable as functions, not just in operator position -- these are

@@ -269,8 +269,8 @@ fn vector_elements_equalp(a: EgclVal, b: EgclVal, i: usize) -> bool {
 /// vector of the same characters); structures of one type compare slot by
 /// slot; hash tables by test, count and EQUALP values.
 ///
-/// Case is folded for ASCII only, the same rule CHAR-EQUAL uses (see
-/// `characters::ascii_upcase` for why).
+/// Case is folded with the Unicode 1:1 mapping CHAR-EQUAL uses (see
+/// `characters::char_upcase`).
 pub fn equalp(a: EgclVal, b: EgclVal) -> bool {
     if a == b {
         return true;
@@ -282,7 +282,7 @@ pub fn equalp(a: EgclVal, b: EgclVal) -> bool {
         return number_equal(a, b);
     }
     if a.is_character() && b.is_character() {
-        return a.as_char().eq_ignore_ascii_case(&b.as_char());
+        return crate::characters::char_equal(a.as_char(), b.as_char());
     }
     if !a.is_heap_object() || !b.is_heap_object() {
         return false;
@@ -296,7 +296,7 @@ pub fn equalp(a: EgclVal, b: EgclVal) -> bool {
         return x.chars().count() == y.chars().count()
             && x.chars()
                 .zip(y.chars())
-                .all(|(p, q)| p.eq_ignore_ascii_case(&q));
+                .all(|(p, q)| crate::characters::char_equal(p, q));
     }
     if vectorp(a) && vectorp(b) {
         let (Ok(n), Ok(m)) = (crate::sequences::length(a), crate::sequences::length(b)) else {

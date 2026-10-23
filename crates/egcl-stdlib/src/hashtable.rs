@@ -719,7 +719,7 @@ fn equalp_number_hash(v: EgclVal) -> Option<u64> {
 
 /// EQUALP hash of a character, case-folded the way EQUALP compares.
 fn equalp_char_hash(c: char) -> u64 {
-    hash_u64(c.to_ascii_lowercase() as u64)
+    hash_u64(crate::characters::char_upcase(c) as u64)
 }
 
 /// Seed for [`KeyHasher::identity`]'s per-type SXHASH value.
