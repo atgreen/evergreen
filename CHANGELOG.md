@@ -369,7 +369,7 @@
   binding was dynamic, so a local `special` declaration leaked into nested
   bindings and the functions they called. The standard and built-in special
   variables are still special
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#579](https://github.com/atgreen/evergreen/pull/579)).
 - A macro named `atomic-incf` or `atomic-decf` in any package runs its own
   expansion. Such calls ran `egcl-ext:atomic-incf`/`atomic-decf` instead,
   matched by name, which broke the Atomics library and AllegroServe
