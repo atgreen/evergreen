@@ -13750,7 +13750,11 @@ fn read_eval_all_env(source: &str, env: &mut Env) -> Result<EgclVal, EgclError> 
     // (lib/asdf.lisp) load in tens of seconds (bliss-lb6.5).
     reader::check_nesting(&chars)?;
     let mut pos = 0;
+    // The previous form's value is returned once the reader reaches EOF, and
+    // reaching it can allocate (a trailing comment, a reader macro), so keep it
+    // rooted between forms.
     let mut last = NIL;
+    egcl_rt::rooted_ref!(_last_root = &mut last);
     let trace = std::env::var("EGCL_LOAD_TRACE").is_ok();
     let timeit = std::env::var("EGCL_LOAD_TIMING").is_ok();
     let mut form_no = 0usize;
@@ -18473,6 +18477,14 @@ fn resolve_load_path(path: &str) -> Result<String, EgclError> {
 }
 
 fn load_path_into_env(path: &str, env: &mut Env) -> Result<EgclVal, EgclError> {
+    // Root the Env for the whole load, before the first allocation below
+    // (interning, the *LOAD-PATHNAME* namestring and pathname, the readtable
+    // binding). The CLI's --load enters here with an Env no caller has rooted,
+    // so a collection in that prologue relocated objects the Env still
+    // referenced without updating it; read_eval_all_env's own root
+    // came too late and EGCL_GC_VERIFY flagged the stale slots at the first
+    // collection inside the reader (bliss-md2ec).
+    egcl_rt::rooted_ref!(_env_root = &mut *env);
     // ANSI LOAD binds *PACKAGE* (and *READTABLE*) for the dynamic extent of the
     // load, so a file's IN-PACKAGE forms don't leak into the caller — e.g. after
     // `(load "lib/asdf.lisp")` the REPL returns to CL-USER, not ASDF/FOOTER. We
@@ -18534,14 +18546,20 @@ fn load_path_into_env(path: &str, env: &mut Env) -> Result<EgclVal, EgclError> {
         // Bind *LOAD-PATHNAME*/*LOAD-TRUENAME* to an absolute pathname for the
         // file now that its real on-disk location is known. Keep the guards alive
         // through parsing and evaluation; dropping them restores the caller.
-        let _load_path_bindings = load_pathname_value(&resolved_path).and_then(|pathname| {
+        // The guards hold the caller's values until the load returns, across
+        // every allocation of the load, so they are rooted like the readtable
+        // and package bindings above; the pathname is rooted across the symbol
+        // lookups that precede its binding.
+        let mut load_path_bindings = load_pathname_value(&resolved_path).and_then(|pathname| {
+            egcl_rt::rooted!(pathname = pathname);
             let load_pathname = resolve_sym("*LOAD-PATHNAME*")?;
             let load_truename = resolve_sym("*LOAD-TRUENAME*")?;
             Some((
-                DynBind::establish(load_pathname, pathname),
-                DynBind::establish(load_truename, pathname),
+                DynBind::establish(load_pathname, *pathname),
+                DynBind::establish(load_truename, *pathname),
             ))
         });
+        egcl_rt::rooted_ref!(_load_path_bindings_root = &mut load_path_bindings);
         let bytes = match egcl_stdlib::embedded_files::contents(&resolved_path) {
             Some(bytes) => bytes,
             None => std::fs::read(&resolved_path).map_err(|e| {

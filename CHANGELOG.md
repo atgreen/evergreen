@@ -358,6 +358,10 @@
 
 ### Fixed
 
+- `egcl --load FILE` no longer leaves stale heap pointers in the top-level
+  environment when a garbage collection runs while the load is starting.
+  Under `EGCL_GC_VERIFY` with `EGCL_GC_STRESS`, every `--load` failed
+  verification ([#564](https://github.com/atgreen/evergreen/pull/564)).
 - `compile-file` compiles a top-level `(defgeneric (setf name) ...)` again.
   Since #538 it signalled a `program-error` with no message, so usocket, and
   everything built on it, no longer compiled
