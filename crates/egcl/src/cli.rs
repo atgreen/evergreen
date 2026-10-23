@@ -7749,7 +7749,7 @@ fn bind_method_params(
     // with implicit &allow-other-keys, since keyword validation for a generic
     // call is against the union of all applicable methods' keywords, not this
     // one method's (CLHS 7.6.5; bliss-lb6.14).
-    bind_lambda_list_ex(method.lambda_list, args, env, true)
+    bind_lambda_list_ex(method.lambda_list, args, env, true, None)
 }
 
 fn invoke_method(
@@ -11179,21 +11179,11 @@ fn eval_lambda_call_ex(
         )),
     };
     let result = with_child_frame(env, parent, |env| {
-        bind_lambda_list(*params_form, args, env)?;
-        bytecode::validate_declared_lambda_args(*params_form, *body, args)?;
-        // Arguments are a single-value context; a producer evaluated as an
-        // argument (or an &optional/&key default) must not leak its extra values
-        // into the body. The body's tail form establishes this call's values.
-        env.clear_mv();
         // `(declare (special v))` at the head of the body (CLHS 3.3.4;
         // bliss-g97k). A name this lambda list BOUND becomes a *dynamic*
         // binding carrying the argument value, so a callee can see it; a name it
         // did not bind is a *free* declaration that only redirects references.
-        // Either way the body's own references read the dynamic cell. The
-        // lambda-list init-forms have already run, above and outside this scope:
-        // a free declaration applies to the body, not to the init-forms, which
-        // is what makes `(defun f (&aux (y x)) (declare (special x)) …)` see the
-        // lexical X in Y's init and the dynamic X in the body (ansi DEFUN.5/6/7).
+        // Either way the body's own references read the dynamic cell.
         let inner_body = body_through_implicit_block(*body);
         let mut specials = let_body_special_decls(inner_body);
         // A parameter whose NAME is special binds dynamically too, exactly like a
@@ -11203,14 +11193,43 @@ fn eval_lambda_call_ex(
                 specials.push(idx);
             }
         }
+        // A special PARAMETER is dynamic from the moment it is bound, so the
+        // init forms after it see the new value (ansi LAMBDA.64). A free
+        // declaration still applies only to the body, not to the init forms,
+        // which is what makes `(defun f (&aux (y x)) (declare (special x)) …)`
+        // see the lexical X in Y's init and the dynamic X in the body (ansi
+        // DEFUN.5/6/7): only names the lambda list binds are bound early.
+        egcl_rt::rooted!(dyn_binds = Vec::<DynBind>::new());
+        let early_bound = if specials.is_empty() {
+            bind_lambda_list(*params_form, args, env)?;
+            Vec::new()
+        } else {
+            let mut early = EarlySpecials {
+                specials: &specials,
+                binds: &mut dyn_binds,
+                bound: Vec::new(),
+            };
+            bind_lambda_list_ex(*params_form, args, env, false, Some(&mut early))?;
+            early.bound
+        };
+        bytecode::validate_declared_lambda_args(*params_form, *body, args)?;
+        // Arguments are a single-value context; a producer evaluated as an
+        // argument (or an &optional/&key default) must not leak its extra values
+        // into the body. The body's tail form establishes this call's values.
+        env.clear_mv();
         let declarations = enter_body_declarations(env, inner_body);
         if specials.is_empty() {
             let result = eval_progn(*body, env);
             leave_body_declarations(env, declarations);
             return result;
         }
-        egcl_rt::rooted!(dyn_binds = Vec::<DynBind>::new());
-        let saved_locally = enter_body_special_decls(env, specials, &mut dyn_binds);
+        let late: Vec<u32> = specials
+            .iter()
+            .copied()
+            .filter(|idx| !early_bound.contains(idx))
+            .collect();
+        let saved_locally = enter_body_special_decls(env, late, &mut dyn_binds);
+        env.locally_specials.extend(early_bound);
         let result = eval_progn(*body, env);
         env.locally_specials = saved_locally;
         leave_body_declarations(env, declarations);
@@ -23630,10 +23649,11 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                                 // copies a compiler macro from one name to another
                                 // that way (bliss-vhr6e).
                                 let sym = eval_form(tgt_form, env)?;
-                                if !sym.is_symbol() {
+                                if !sym.is_symbol() && setf_function_name_symbol(sym).is_none() {
                                     return Err(EgclError::TypeError {
                                         datum: sym,
-                                        expected: "SYMBOL".to_string(),
+                                        expected: "(OR SYMBOL (CONS (EQL SETF) (CONS SYMBOL NULL)))"
+                                            .to_string(),
                                     });
                                 }
                                 install_compiler_macro_function(env, sym, *val)?;
@@ -34744,7 +34764,47 @@ fn bind_lambda_list(
     args: &[EgclVal],
     env: &mut Env,
 ) -> Result<(), EgclError> {
-    bind_lambda_list_ex(params_form, args, env, false)
+    bind_lambda_list_ex(params_form, args, env, false, None)
+}
+
+/// The parameters of a lambda list that are special, by a SPECIAL declaration
+/// at the head of its body or by proclamation, and the dynamic bindings made
+/// for them so far. A special parameter's binding is dynamic from the moment
+/// it is made (CLHS 3.3.4), so a later `&optional`, `&key` or `&aux` init form
+/// -- or a function it calls -- sees the new value (ansi-test LAMBDA.64).
+struct EarlySpecials<'a> {
+    specials: &'a [u32],
+    binds: &'a mut Vec<DynBind>,
+    bound: Vec<u32>,
+}
+
+impl EarlySpecials<'_> {
+    /// Make `symbol`'s binding to `value` dynamic if it is special. Does not
+    /// allocate, so `value` cannot move before the binding owns it.
+    fn bind(&mut self, symbol: EgclVal, value: EgclVal) {
+        if !symbol.is_symbol() {
+            return;
+        }
+        let index = symbol.as_symbol_index();
+        if self.specials.contains(&index) && !self.bound.contains(&index) {
+            self.binds.push(DynBind::establish(symbol, value));
+            self.bound.push(index);
+        }
+    }
+}
+
+fn bind_parameter(
+    env: &mut Env,
+    name: &str,
+    value: EgclVal,
+    early: &mut Option<&mut EarlySpecials<'_>>,
+) {
+    bind_lexical_parameter(env, name, value);
+    if let Some(early) = early.as_deref_mut()
+        && let Some(index) = egcl_rt::symbols::find_index(name)
+    {
+        early.bind(EgclVal::from_symbol_index(index), value);
+    }
 }
 
 /// Bind a lambda list to `args`. `force_allow_other_keys` makes an unrecognised
@@ -34765,6 +34825,7 @@ fn bind_lambda_list_ex(
     args: &[EgclVal],
     env: &mut Env,
     force_allow_other_keys: bool,
+    mut early: Option<&mut EarlySpecials<'_>>,
 ) -> Result<(), EgclError> {
     #[derive(PartialEq)]
     enum Mode {
@@ -34839,14 +34900,17 @@ fn bind_lambda_list_ex(
                 arg_i += 1;
                 env.define_local_symbol(elem, v);
                 shadow_locally_special(env, elem);
+                if let Some(early) = early.as_deref_mut() {
+                    early.bind(elem, v);
+                }
             }
             Mode::Opt => {
                 let (var, default_form, supp) = parse_var_spec(elem);
                 if arg_i < args.len() {
-                    bind_lexical_parameter(env, &var, args[arg_i]);
+                    bind_parameter(env, &var, args[arg_i], &mut early);
                     arg_i += 1;
                     if let Some(sp) = supp {
-                        bind_lexical_parameter(env, &sp, T);
+                        bind_parameter(env, &sp, T, &mut early);
                     }
                 } else {
                     let dv = if default_form == NIL {
@@ -34854,9 +34918,9 @@ fn bind_lambda_list_ex(
                     } else {
                         eval_form(default_form, env)?
                     };
-                    bind_lexical_parameter(env, &var, dv);
+                    bind_parameter(env, &var, dv, &mut early);
                     if let Some(sp) = supp {
-                        bind_lexical_parameter(env, &sp, NIL);
+                        bind_parameter(env, &sp, NIL, &mut early);
                     }
                 }
             }
@@ -34867,7 +34931,7 @@ fn bind_lambda_list_ex(
                     ));
                 }
                 let remaining = args.get(arg_i..).unwrap_or(&[]);
-                bind_lexical_parameter(env, &sym_name(elem), vec_to_list(remaining));
+                bind_parameter(env, &sym_name(elem), vec_to_list(remaining), &mut early);
                 key_start.get_or_insert(arg_i);
                 rest_bound = true;
             }
@@ -34925,16 +34989,16 @@ fn bind_lambda_list_ex(
 
         for (kw_bare, var, default_idx, supp) in &key_specs {
             if let Some(v) = find_key_arg(tail, kw_bare) {
-                bind_lexical_parameter(env, var, v);
+                bind_parameter(env, var, v, &mut early);
                 if let Some(sp) = supp {
-                    bind_lexical_parameter(env, sp, T);
+                    bind_parameter(env, sp, T, &mut early);
                 }
             } else {
                 let df = key_default_forms[*default_idx];
                 let dv = if df == NIL { NIL } else { eval_form(df, env)? };
-                bind_lexical_parameter(env, var, dv);
+                bind_parameter(env, var, dv, &mut early);
                 if let Some(sp) = supp {
-                    bind_lexical_parameter(env, sp, NIL);
+                    bind_parameter(env, sp, NIL, &mut early);
                 }
             }
         }
@@ -34968,7 +35032,7 @@ fn bind_lambda_list_ex(
     for i in 0..aux_vars.len() {
         let df = aux_default_forms[i];
         let dv = if df == NIL { NIL } else { eval_form(df, env)? };
-        bind_lexical_parameter(env, &aux_vars[i], dv);
+        bind_parameter(env, &aux_vars[i], dv, &mut early);
     }
 
     Ok(())
@@ -36314,11 +36378,18 @@ fn eval_define_symbol_macro(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, Egcl
 }
 
 fn eval_define_compiler_macro(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
-    let (name, rest) = cp(cdr);
+    let (mut name, rest) = cp(cdr);
     let (mut params_form, mut body) = cp(rest);
-    if !name.is_symbol() {
+    // The implicit block is named by the function name's symbol, which for
+    // `(setf foo)` is FOO (CLHS 5.1.2.9; ansi define-compiler-macro.4).
+    let block_name = if name.is_symbol() {
+        name
+    } else if let Some(symbol) = setf_function_name_symbol(name) {
+        symbol
+    } else {
         return Ok(name);
-    }
+    };
+    egcl_rt::rooted_ref!(_name_root = &mut name);
     egcl_rt::rooted_ref!(_params_root = &mut params_form);
     egcl_rt::rooted_ref!(_body_root = &mut body);
     // CLHS DEFINE-COMPILER-MACRO: the body is enclosed in an implicit BLOCK
@@ -36326,7 +36397,7 @@ fn eval_define_compiler_macro(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, Eg
     // (ansi define-compiler-macro.2) -- the same wrap DEFMACRO performs. The
     // special-declaration scan looks through the implicit block, as for DEFUN.
     {
-        egcl_rt::rooted!(block_body = arena_cons(name, body));
+        egcl_rt::rooted!(block_body = arena_cons(block_name, body));
         egcl_rt::rooted!(block_form = arena_cons(resolve_sym("BLOCK").unwrap_or(NIL), *block_body));
         body = arena_cons(*block_form, NIL);
     }
@@ -36488,6 +36559,23 @@ fn invoke_lisp_macroexpand_hook(
 #[cfg(test)]
 mod macroexpand_hook_rooting_tests;
 
+/// The arguments a compiler macro's lambda list destructures from FORM. For a
+/// `(funcall #'name . args)` form they are ARGS, not the FUNCALL's operands
+/// (CLHS 3.2.2.1.1); otherwise they are FORM's cdr. &WHOLE still gets FORM.
+fn compiler_macro_operands(form: EgclVal) -> EgclVal {
+    let (head, rest) = cp(form);
+    if head.is_symbol() && sym_bare_name_rc(head).as_ref() == "FUNCALL" && rest.is_cons() {
+        let (function_form, arguments) = cp(rest);
+        if function_form.is_cons() {
+            let (operator, _) = cp(function_form);
+            if operator.is_symbol() && sym_bare_name_rc(operator).as_ref() == "FUNCTION" {
+                return arguments;
+            }
+        }
+    }
+    rest
+}
+
 fn invoke_compiler_macro_function(
     args: &[EgclVal],
     caller: &mut Env,
@@ -36521,7 +36609,7 @@ fn invoke_compiler_macro_function(
     env.current_package = package;
     env.define_local("*PACKAGE*", *package_value);
     egcl_rt::symbols::set_symbol_value(package_symbol.as_symbol_index(), *package_value);
-    egcl_rt::rooted!(operands = list_to_vec(cp(args[1]).1));
+    egcl_rt::rooted!(operands = list_to_vec(compiler_macro_operands(args[1])));
     if egcl_rt::function::is_interpreted_function(args[0]) {
         return bytecode::run_compiler_macro_function(
             args[0], &operands, args[1], args[2], &mut env,
@@ -36559,7 +36647,7 @@ fn invoke_compiler_macro_function(
             env,
             None,
             Some(args[1]),
-            Some(cp(args[1]).1),
+            Some(compiler_macro_operands(args[1])),
             Some(args[2]),
         )?;
         eval_expander_body(closure.params_form, closure.body, env)
@@ -36571,10 +36659,34 @@ fn invoke_compiler_macro_function(
 /// saved image, so the function object stays rooted without a second registry.
 const COMPILER_MACRO_FUNCTION_PROPERTY: &str = "EGCL::%COMPILER-MACRO-FUNCTION";
 
+/// Indicator for the compiler macro of the function name `(setf NAME)`, kept
+/// on NAME. It is only reported and replaced: call sites are never expanded
+/// with it, because calls to NAME itself must not see a `(setf NAME)` macro.
+const SETF_COMPILER_MACRO_FUNCTION_PROPERTY: &str = "EGCL::%SETF-COMPILER-MACRO-FUNCTION";
+
+/// The symbol NAME of a function name `(setf NAME)`, else None.
+fn setf_function_name_symbol(name: EgclVal) -> Option<EgclVal> {
+    if !name.is_cons() {
+        return None;
+    }
+    let (head, rest) = cp(name);
+    if !(head.is_symbol() && sym_bare_name_rc(head).as_ref() == "SETF") || !rest.is_cons() {
+        return None;
+    }
+    let (symbol, tail) = cp(rest);
+    (symbol.is_symbol() && tail.is_nil()).then_some(symbol)
+}
+
 /// NAME's compiler macro when it was installed as a function, else None.
+/// NAME is a symbol or `(setf symbol)`.
 pub(crate) fn installed_compiler_macro_function(name: EgclVal) -> Option<EgclVal> {
-    resolve_sym(COMPILER_MACRO_FUNCTION_PROPERTY)
-        .and_then(|indicator| plist_lookup(symbol_plist_of(name), indicator))
+    let (symbol, indicator) = match setf_function_name_symbol(name) {
+        Some(symbol) => (symbol, SETF_COMPILER_MACRO_FUNCTION_PROPERTY),
+        None if name.is_symbol() => (name, COMPILER_MACRO_FUNCTION_PROPERTY),
+        None => return None,
+    };
+    resolve_sym(indicator)
+        .and_then(|indicator| plist_lookup(symbol_plist_of(symbol), indicator))
         .filter(|function| !function.is_nil())
 }
 
@@ -36591,6 +36703,21 @@ fn install_compiler_macro_function(
     function: EgclVal,
 ) -> Result<(), EgclError> {
     egcl_rt::rooted!(function = function);
+    if let Some(symbol) = setf_function_name_symbol(name) {
+        egcl_rt::rooted!(symbol = symbol);
+        let Some(indicator) = resolve_sym(SETF_COMPILER_MACRO_FUNCTION_PROPERTY) else {
+            return Err(EgclError::Internal(
+                "SETF COMPILER-MACRO-FUNCTION: indicator symbol is unavailable".into(),
+            ));
+        };
+        let installed = if function.is_nil() {
+            NIL
+        } else {
+            coerce_installed_function(env, *function)
+        };
+        symbol_plist_put(*symbol, indicator, installed);
+        return Ok(());
+    }
     let Some(indicator) = resolve_sym(COMPILER_MACRO_FUNCTION_PROPERTY) else {
         return Err(EgclError::Internal(
             "SETF COMPILER-MACRO-FUNCTION: indicator symbol is unavailable".into(),

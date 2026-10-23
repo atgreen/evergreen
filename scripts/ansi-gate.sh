@@ -54,7 +54,10 @@ set -u
 # symbols added 2026-10-23: ok (1145/1145) once SETF SYMBOL-FUNCTION of a
 # non-symbol signalled TYPE-ERROR (symbol-function.error.4) and a LET of an
 # earmuffed name nobody proclaimed special became lexical (set.2, bliss-c3gyu).
-ENABLED_CHAPTERS=(cons data-and-control-flow hash-tables characters strings conditions misc files environment sequences symbols)
+# eval-and-compile added 2026-10-23: ok (318/318) once a special lambda
+# parameter was dynamic before the later init forms ran (lambda.64) and a
+# (setf name) compiler macro was kept and reported (define-compiler-macro.4).
+ENABLED_CHAPTERS=(cons data-and-control-flow hash-tables characters strings conditions misc files environment sequences symbols eval-and-compile)
 
 ANSI_TEST_DIR="${ANSI_TEST_DIR:-$HOME/git/ansi-test}"
 EGCL_BIN="${EGCL_BIN:-target/x86_64-unknown-linux-musl/debug/egcl}"

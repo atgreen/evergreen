@@ -1730,7 +1730,6 @@ fn resolve(name: &str) -> Option<Handler> {
             Ok(args
                 .first()
                 .copied()
-                .filter(|name| name.is_symbol())
                 .and_then(super::installed_compiler_macro_function)
                 .unwrap_or(NIL))
         }),

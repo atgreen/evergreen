@@ -367,6 +367,14 @@
   accessor place work in compiled functions and `compile`d lambdas. They
   signalled "not a structure-slot accessor"
   ([#580](https://github.com/atgreen/evergreen/pull/580)).
+- A lambda parameter declared or proclaimed special is bound dynamically as
+  soon as it is bound, so later `&optional`, `&key` and `&aux` init forms, and
+  the functions they call, see its new value.
+  `define-compiler-macro` accepts a `(setf name)` function name, and
+  `compiler-macro-function` returns it. A compiler macro called on a
+  `(funcall #'name ...)` form destructures the arguments after the function,
+  as the standard requires
+  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
 - A `let` of a variable whose name has earmuffs, such as `*x*`, is lexical
   unless the variable was proclaimed special by `defvar`, `defparameter`,
   `declaim` or a `special` declaration, as the standard requires. Every such
