@@ -363,6 +363,13 @@
 
 ### Fixed
 
+- A `let` of a variable whose name has earmuffs, such as `*x*`, is lexical
+  unless the variable was proclaimed special by `defvar`, `defparameter`,
+  `declaim` or a `special` declaration, as the standard requires. Every such
+  binding was dynamic, so a local `special` declaration leaked into nested
+  bindings and the functions they called. The standard and built-in special
+  variables are still special
+  ([#579](https://github.com/atgreen/evergreen/pull/579)).
 - A macro named `atomic-incf` or `atomic-decf` in any package runs its own
   expansion. Such calls ran `egcl-ext:atomic-incf`/`atomic-decf` instead,
   matched by name, which broke the Atomics library and AllegroServe
