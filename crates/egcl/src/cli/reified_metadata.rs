@@ -238,6 +238,7 @@ pub(super) fn restore(
                         // Lexical macros are not persisted; a restored local
                         // function inherits its caller's, as before bliss-9uimd.
                         defining_macros: None,
+                        labels_scope: None,
                     },
                 )
                 .is_some()

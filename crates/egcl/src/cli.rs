@@ -2628,7 +2628,17 @@ struct FunDef {
     /// written (see `Closure::captured_macros`; bliss-9uimd). `None` for a
     /// global function, which inherits the caller's as before.
     defining_macros: Option<LexicalMacros>,
+    /// For a LABELS function, the LABELS form's own function namespace, which
+    /// its body resolves its siblings and itself through. Calling it with the
+    /// caller's namespace instead lost them under an inner MACROLET of the
+    /// same name, which shadows the function there (bliss-yp2w5). Weak: the
+    /// namespace holds this FunDef, so a strong handle would be a cycle. While
+    /// the LABELS body runs, or an escaped `#'name` closure holds the
+    /// namespace, it upgrades.
+    labels_scope: Option<LabelsScope>,
 }
+
+type LabelsScope = std::sync::Weak<SharedCell<HashMap<String, FunDef>>>;
 
 type LexicalExitNames = (Vec<(String, String)>, Vec<(String, String)>);
 type LexicalExitScope<'a> = (&'a [(String, String)], &'a [(String, String)]);
@@ -2650,6 +2660,7 @@ impl FunDef {
             defining_frame: None,
             defining_specials: Vec::new(),
             defining_macros: None,
+            labels_scope: None,
         }
     }
 }
@@ -10921,7 +10932,11 @@ fn eval_named_call_ex(
     // A local function's body expands the MACROLETs of its definition site,
     // not the caller's (bliss-9uimd); restored after the call.
     let def_macros = definition.as_ref().and_then(|f| f.defining_macros.clone());
-    let def_scope = definition.and_then(|f| f.def_funs);
+    // FLET: the enclosing namespace. LABELS: the form's own (bliss-yp2w5).
+    let def_scope = definition.and_then(|f| {
+        f.def_funs
+            .or_else(|| f.labels_scope.as_ref().and_then(std::sync::Weak::upgrade))
+    });
     egcl_rt::rooted!(
         saved_macros = def_macros.and_then(|macros| install_lexical_macros(env, &macros))
     );
@@ -33860,7 +33875,10 @@ fn local_fn_closure(env: &mut Env, name: &str) -> Option<EgclVal> {
             f.params_form,
             f.body,
             f.closure_ref,
-            f.def_funs.clone(),
+            // A LABELS function's own namespace, while it is live (bliss-yp2w5).
+            f.def_funs
+                .clone()
+                .or_else(|| f.labels_scope.as_ref().and_then(std::sync::Weak::upgrade)),
             f.defining_blocks.clone(),
             f.defining_frame.clone(),
             f.defining_specials.clone(),
@@ -34042,16 +34060,22 @@ fn eval_flet(cdr: EgclVal, env: &mut Env, recursive: bool) -> Result<EgclVal, Eg
                     // FLET: the macros visible around the form. LABELS: filled
                     // in below, once every binding has shadowed its name.
                     defining_macros: flet_macros.clone(),
+                    labels_scope: None,
                 },
             );
         }
     }
     if recursive {
         let labels_macros = capture_lexical_macros(&child_env);
+        // Settle copy-on-write first, so the namespace the functions point back
+        // to is the one they are stored in (bliss-yp2w5).
+        drop(child_env.funs_mut());
+        let labels_scope = Arc::downgrade(&child_env.funs);
         let mut funs = child_env.funs_mut();
         for name in &bound_names {
             if let Some(definition) = funs.get_mut(name) {
                 definition.defining_macros = Some(Arc::clone(&labels_macros));
+                definition.labels_scope = Some(labels_scope.clone());
             }
         }
     }
@@ -46195,6 +46219,7 @@ mod env_gc_root_tests {
                         }),
                         defining_specials: Vec::new(),
                         defining_macros: None,
+                        labels_scope: None,
                     },
                 )])))),
                 captured_macros: None,
