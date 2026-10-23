@@ -3914,7 +3914,44 @@ impl<'e> Lowerer<'e> {
             return Err(Bail);
         }
         let name = sym_name(var);
-        match self.lookup_local(&name) {
+        // A name only DECLARED special (LOCALLY, or a binding form's DECLARE)
+        // is stored in its dynamic value, even where a lexical binding of the
+        // same name encloses the declaration (bliss-35xxb). STORE-GLOBAL cannot
+        // say so: at run time it writes a frame variable of that name when one
+        // exists, which is exactly the shadowed lexical binding a closure or
+        // restart clause captured. So store through SET, which writes the
+        // symbol's value whatever the frame holds.
+        if self.declared_special.contains_key(&name) && !is_special_name(&name) {
+            let set = symbol_index_of("SET").ok_or(Bail)?;
+            let tmp = self.next_local;
+            self.next_local += 1;
+            if self.next_local > self.n_locals {
+                self.n_locals = self.next_local;
+            }
+            self.emit(Instr::StoreLocal(tmp));
+            self.pop_n(1);
+            let symbol = self.add_const(var);
+            self.emit(Instr::Const(symbol));
+            self.push_n(1);
+            self.emit(Instr::LoadLocal(tmp));
+            self.push_n(1);
+            self.emit(Instr::CallNamed { sym: set, nargs: 2 });
+            self.pop_n(1);
+            self.emit(Instr::ClearMv);
+            if !last {
+                self.emit(Instr::Pop);
+                self.pop_n(1);
+            }
+            return Ok(());
+        }
+        // A proclaimed special is stored where it is read (see the symbol arm
+        // of `lower_expr`), never in a lexical slot of the same name.
+        let location = if is_special_name(&name) {
+            None
+        } else {
+            self.lookup_local(&name)
+        };
+        match location {
             Some(VarLoc::Slot(slot)) => {
                 self.emit(Instr::StoreLocal(slot));
                 self.pop_n(1);
@@ -3937,8 +3974,9 @@ impl<'e> Lowerer<'e> {
             None => {
                 // Assigning a name bound to an enclosing function's unboxed slot
                 // (revealed post-macro-expansion) cannot be represented here; bail
-                // rather than clobber a global of the same name (bliss-9u6d).
-                if self.enclosing_slots.contains(&name) {
+                // rather than clobber a global of the same name (bliss-9u6d). A
+                // special name is not that slot, so it stores globally.
+                if !is_special_name(&name) && self.enclosing_slots.contains(&name) {
                     return Err(Bail);
                 }
                 let sym = var.as_symbol_index();
