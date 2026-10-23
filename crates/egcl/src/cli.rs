@@ -24167,6 +24167,25 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     }
                 };
                 egcl_rt::rooted!(func = func);
+                // (compile 'name) of a global interpreted function compiles it
+                // now, as reaching the lazy-compile threshold would, keeping the
+                // same function object. It used to return success and leave the
+                // function tree-walked (bliss-h5htg).
+                if args.len() < 2
+                    && name.is_symbol()
+                    && !name.is_nil()
+                    && egcl_rt::function::is_interpreted_function(*func)
+                    && reified_closure(*func).is_none()
+                    && !egcl_rt::function::body(*func).is_nil()
+                {
+                    let index = name.as_symbol_index();
+                    let params = egcl_rt::function::lambda_list(*func);
+                    let body = egcl_rt::function::body(*func);
+                    bytecode::lazy_compile_defun(index, &sym_name(*name), params, body, env);
+                    let primary = *name;
+                    env.set_mv(vec![primary, NIL, NIL]);
+                    return Ok(primary);
+                }
                 if name.is_symbol() && !name.is_nil() {
                     let fnval = coerce_installed_function(env, *func);
                     egcl_rt::symbols::set_symbol_function(name.as_symbol_index(), fnval);
