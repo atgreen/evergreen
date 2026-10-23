@@ -14082,27 +14082,7 @@ fn compile_file_load_forms(form: EgclVal, env: &mut Env) -> Result<Vec<EgclVal>,
             // recursively expands. Keep its forms, optional function, bytecode,
             // and captured frame rooted until it is restored.
             egcl_rt::rooted_ref!(_saved_definitions_root = &mut saved_definitions);
-            for def in list_to_vec(defs_form) {
-                if !def.is_cons() {
-                    continue;
-                }
-                let (name_form, rest) = cp(def);
-                if !name_form.is_symbol() || !rest.is_cons() {
-                    continue;
-                }
-                let (params_form, macro_body) = cp(rest);
-                let name = sym_name(name_form);
-                let mdef = MacroDef {
-                    params_form,
-                    body: macro_body,
-                    captured_frame: Arc::clone(&env.frame),
-                    bytecode: None,
-                    function: None,
-                };
-                let prev = env.macros_mut().insert(name.clone(), mdef);
-                saved_names.push(name);
-                saved_definitions.push(prev);
-            }
+            bind_toplevel_macrolet(defs_form, env, &mut saved_names, &mut saved_definitions);
             egcl_rt::rooted!(nested_forms = list_to_vec(body));
             let mut result = Vec::new();
             egcl_rt::rooted_ref!(_result_root = &mut result);
@@ -14124,22 +14104,62 @@ fn compile_file_load_forms(form: EgclVal, env: &mut Env) -> Result<Vec<EgclVal>,
                 }
                 Ok::<(), EgclError>(())
             })();
-            for index in (0..saved_names.len()).rev() {
-                let name = std::mem::take(&mut saved_names[index]);
-                let prev = saved_definitions[index].take();
-                match prev {
-                    Some(p) => {
-                        env.macros_mut().insert(name, p);
-                    }
-                    None => {
-                        env.macros_mut().remove(&name);
-                    }
-                }
-            }
+            restore_toplevel_macrolet(env, &mut saved_names, &mut saved_definitions);
             nested_result?;
             Ok(result)
         }
         _ => Ok(vec![*form]),
+    }
+}
+
+/// Establish a top-level MACROLET's local macros in `env`, recording each
+/// name and the definition it shadows in `saved_names`/`saved_definitions`
+/// for `restore_toplevel_macrolet`. The caller roots `saved_definitions`.
+fn bind_toplevel_macrolet(
+    defs_form: EgclVal,
+    env: &mut Env,
+    saved_names: &mut Vec<String>,
+    saved_definitions: &mut Vec<Option<MacroDef>>,
+) {
+    for def in list_to_vec(defs_form) {
+        if !def.is_cons() {
+            continue;
+        }
+        let (name_form, rest) = cp(def);
+        if !name_form.is_symbol() || !rest.is_cons() {
+            continue;
+        }
+        let (params_form, macro_body) = cp(rest);
+        let name = sym_name(name_form);
+        let mdef = MacroDef {
+            params_form,
+            body: macro_body,
+            captured_frame: Arc::clone(&env.frame),
+            bytecode: None,
+            function: None,
+        };
+        let prev = env.macros_mut().insert(name.clone(), mdef);
+        saved_names.push(name);
+        saved_definitions.push(prev);
+    }
+}
+
+/// Undo `bind_toplevel_macrolet`, innermost binding first.
+fn restore_toplevel_macrolet(
+    env: &mut Env,
+    saved_names: &mut [String],
+    saved_definitions: &mut [Option<MacroDef>],
+) {
+    for index in (0..saved_names.len()).rev() {
+        let name = std::mem::take(&mut saved_names[index]);
+        match saved_definitions[index].take() {
+            Some(p) => {
+                env.macros_mut().insert(name, p);
+            }
+            None => {
+                env.macros_mut().remove(&name);
+            }
+        }
     }
 }
 
@@ -14265,6 +14285,42 @@ fn process_compile_toplevel_form_at(
                 }
                 "DEFINE-PACKAGE" => {
                     eval_defpackage(cdr, env)?;
+                    return Ok(());
+                }
+                // A top-level MACROLET's body forms are top-level forms
+                // processed with its local macros in effect (CLHS 3.2.3.1), so
+                // an EVAL-WHEN (:COMPILE-TOPLEVEL) one of them expands into
+                // runs now, as at plain top level (GH #527).
+                "MACROLET" => {
+                    let (defs_form, body) = cp(cdr);
+                    let mut saved_names = Vec::new();
+                    let mut saved_definitions = Vec::<Option<MacroDef>>::new();
+                    egcl_rt::rooted_ref!(_saved_definitions_root = &mut saved_definitions);
+                    bind_toplevel_macrolet(defs_form, env, &mut saved_names, &mut saved_definitions);
+                    let mut rest = body;
+                    egcl_rt::rooted_ref!(_rest_root = &mut rest);
+                    let mut outcome = Ok(());
+                    while rest.is_cons() {
+                        let sub = cp(rest).0;
+                        outcome = process_compile_toplevel_form_at(sub, env, depth + 1);
+                        if outcome.is_err() {
+                            break;
+                        }
+                        rest = cp(rest).1;
+                    }
+                    restore_toplevel_macrolet(env, &mut saved_names, &mut saved_definitions);
+                    return outcome;
+                }
+                // So are a top-level LOCALLY's; its declarations have no
+                // compile-time effect here.
+                "LOCALLY" => {
+                    let mut rest = cdr;
+                    egcl_rt::rooted_ref!(_rest_root = &mut rest);
+                    while rest.is_cons() {
+                        let sub = cp(rest).0;
+                        process_compile_toplevel_form_at(sub, env, depth + 1)?;
+                        rest = cp(rest).1;
+                    }
                     return Ok(());
                 }
                 // A top-level PROGN's subforms are top-level forms.
