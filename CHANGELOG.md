@@ -88,6 +88,9 @@
 
 ### Performance
 
+- A function whose `restart-case` clause does a `go` to an enclosing `tagbody`
+  tag or a `return-from` to an enclosing `block` now compiles; it ran in the
+  interpreter ([#555](https://github.com/atgreen/evergreen/pull/555)).
 - `MEMBER-IF`, `MEMBER-IF-NOT` and `READ-DELIMITED-LIST` leave the
   interpreter. All three used `DO`, whose expander is defined later in the
   same prelude file, so the bytecode compiler refused their bodies and no
