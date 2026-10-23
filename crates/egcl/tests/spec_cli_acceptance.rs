@@ -1026,6 +1026,12 @@ fn loop_it_anaphor_binds_conditional_test_value() {
         "((1 . 1) (2 . 2))"
     );
     assert_eq!(eval_ok("(loop for x in '(1 2 3) if (* x 10) sum it)"), "60");
+    // Only that bare operand is the anaphor: an IT nested in a compound form is
+    // an ordinary reference to the enclosing lexical variable (SBCL agrees).
+    assert_eq!(
+        eval_ok("(let ((it :outer)) (loop for x in '(1 nil 2) when x collect (list it x)))"),
+        "((:OUTER 1) (:OUTER 2))"
+    );
 }
 
 #[test]

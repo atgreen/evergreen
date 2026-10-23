@@ -5295,7 +5295,7 @@ impl<'e> Lowerer<'e> {
                     parse_loop_selectable(
                         &forms, &mut i, &kw, &mut bindings, &mut list_acc,
                         &mut sum_acc, &mut count_acc, &mut nsym, id,
-                        &mut body, &mut explicit_result,
+                        &mut body, &mut explicit_result, None,
                     )?;
                 }
                 Some("COLLECT") | Some("COLLECTING") | Some("APPEND") | Some("APPENDING")
@@ -7756,31 +7756,18 @@ fn parse_loop_accumulations(
 /// (`{collect|append|nconc|sum|count} EXPR`), lazily creating the shared
 /// accumulator on first use. Bails on an unrecognised operator.
 #[allow(clippy::too_many_arguments)]
-/// Replace every symbol whose *bare name* is "IT" (so both `it` and the keyword
-/// `:it` — LOOP matches the `when`/`if`/`unless` anaphor by name, CLHS 6.1.5)
-/// with `repl`, everywhere in `form` except inside quoted data or a nested
-/// `loop` (which rebinds its own `it`). Used to wire the anaphor to a fresh temp
-/// bound to the conditional's test value.
-fn subst_loop_it(form: EgclVal, repl: EgclVal) -> EgclVal {
-    if form.is_symbol() && sym_bare_name_rc(form).as_ref() == "IT" {
-        return repl;
+/// Resolve the `it` anaphor of a LOOP conditional (CLHS 6.1.6). `anaphor` is
+/// the temp bound to the conditional's test value; it is `Some` only for the
+/// operand that directly follows the keyword of the FIRST clause after the test.
+/// There, a bare symbol named `IT` (so `it` or `:it` -- LOOP matches clause
+/// tokens by name) stands for the test value. Every other form is ordinary
+/// code: an `it` nested inside a compound form, quoted, or in a later AND/ELSE
+/// clause is a normal variable reference, as in SBCL and lib/loop.lisp.
+fn loop_anaphor(form: EgclVal, anaphor: Option<EgclVal>) -> EgclVal {
+    match anaphor {
+        Some(temp) if form.is_symbol() && sym_bare_name_rc(form).as_ref() == "IT" => temp,
+        _ => form,
     }
-    if !form.is_cons() {
-        return form;
-    }
-    let (car, cdr) = cp(form);
-    if car.is_symbol() {
-        let n = sym_bare_name_rc(car);
-        if n.as_ref() == "QUOTE" || n.as_ref() == "LOOP" {
-            return form;
-        }
-    }
-    // Rebuilding the car can move the source cdr; rebuilding the cdr can
-    // move the newly built car. Root both sides of this recursive allocation.
-    egcl_rt::rooted!(cdr = cdr);
-    egcl_rt::rooted!(car = subst_loop_it(car, repl));
-    let cdr = subst_loop_it(*cdr, repl);
-    arena_cons(*car, cdr)
 }
 
 // Explicit output buffers belong to separate phases of LOOP lowering.
@@ -7862,15 +7849,24 @@ fn parse_loop_selectable(
     id: u32,
     out: &mut Vec<EgclVal>,
     explicit_result: &mut bool,
+    anaphor: Option<EgclVal>,
 ) -> LowerResult<()> {
     let s = |n: &str| resolve_sym(n).ok_or(Bail);
+    // Only the first clause's operand may name the enclosing conditional's IT;
+    // clauses chained with AND see ordinary variables.
+    let mut anaphor = anaphor;
     loop {
+        let it = anaphor.take();
         let op = kw(*forms.get(*i).ok_or(Bail)?).ok_or(Bail)?;
         match op.as_str() {
             "WHEN" | "IF" | "UNLESS" => {
                 let negate = op == "UNLESS";
-                egcl_rt::rooted!(test = *forms.get(*i + 1).ok_or(Bail)?);
+                egcl_rt::rooted!(test = loop_anaphor(*forms.get(*i + 1).ok_or(Bail)?, it));
                 *i += 2;
+                // Each conditional evaluates its test once and owns its IT
+                // binding, offered only to the first clause of its THEN part.
+                *nsym += 1;
+                let it_temp = s(&format!("%LG-IT{id}_{}", *nsym))?;
                 egcl_rt::rooted!(then_forms = Vec::<EgclVal>::new());
                 parse_loop_selectable(
                     forms,
@@ -7884,6 +7880,7 @@ fn parse_loop_selectable(
                     id,
                     &mut then_forms,
                     explicit_result,
+                    Some(it_temp),
                 )?;
                 if then_forms.is_empty() {
                     return Err(Bail);
@@ -7903,24 +7900,16 @@ fn parse_loop_selectable(
                         id,
                         &mut else_forms,
                         explicit_result,
+                        None,
                     )?;
                 }
                 if kw(*forms.get(*i).unwrap_or(&NIL)).as_deref() == Some("END") {
                     *i += 1;
                 }
-                // Each conditional evaluates its test once and owns its IT
-                // binding. Recursive parsing rewrites nested IT references
-                // first, so an outer condition cannot capture them.
-                *nsym += 1;
-                let it_temp = s(&format!("%LG-IT{id}_{}", *nsym))?;
                 egcl_rt::rooted!(then_progn = vec![s("PROGN")?]);
-                for index in 0..then_forms.len() {
-                    then_progn.push(subst_loop_it(then_forms[index], it_temp));
-                }
+                then_progn.extend_from_slice(&then_forms[..]);
                 egcl_rt::rooted!(else_progn = vec![s("PROGN")?]);
-                for index in 0..else_forms.len() {
-                    else_progn.push(subst_loop_it(else_forms[index], it_temp));
-                }
+                else_progn.extend_from_slice(&else_forms[..]);
                 egcl_rt::rooted!(then_body = form_list(&then_progn));
                 egcl_rt::rooted!(else_body = form_list(&else_progn));
                 let conditional_op = s("IF")?;
@@ -7943,14 +7932,15 @@ fn parse_loop_selectable(
                 }
             }
             "RETURN" => {
-                let e = *forms.get(*i + 1).ok_or(Bail)?;
+                let mut e = loop_anaphor(*forms.get(*i + 1).ok_or(Bail)?, it);
+                egcl_rt::rooted_ref!(_e_root = &mut e);
                 out.push(form_list(&[s("RETURN")?, e]));
                 *explicit_result = true;
                 *i += 2;
             }
             "COLLECT" | "COLLECTING" | "APPEND" | "APPENDING" | "NCONC" | "NCONCING" | "SUM"
             | "SUMMING" | "COUNT" | "COUNTING" => {
-                let expr = *forms.get(*i + 1).ok_or(Bail)?;
+                let expr = loop_anaphor(*forms.get(*i + 1).ok_or(Bail)?, it);
                 *i += 2;
                 if kw(*forms.get(*i).unwrap_or(&NIL)).as_deref() == Some("INTO") {
                     return Err(Bail); // `into` not supported yet
