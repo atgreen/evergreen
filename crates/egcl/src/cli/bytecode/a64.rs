@@ -40,6 +40,7 @@ use super::{
     c2i_take_values, c2i_transfer_pending, c2i_typep_class, c2i_values_to_list,
     call_site_profile_token, registry_get, resolve_sym, t2_backedge_threshold,
 };
+use egcl_rt::bytecode::VarLoc;
 use egcl_rt::asm::a64;
 use egcl_rt::asm::{Asm, Cc};
 use egcl_rt::bytecode::Instr;
@@ -100,11 +101,21 @@ pub(super) fn emit_native_a64(
     // signal-only helper and whose entry points are the loop headers rather than
     // the function's start.
     let is_osr = sym == u32::MAX;
-    if bf.arity > bf.num_slots() {
+    // Every parameter the dispatcher writes into the activation has to land
+    // inside it. `arity` is the wrong quantity to compare against
+    // `num_slots()`: a parameter that a closure captures is `VarLoc::Boxed`,
+    // and `bind_params` puts it in the heap `EnvFrame`, taking no activation
+    // slot at all. So `(defun f (a b c d e) (lambda () (list a b c d e)))` has
+    // arity 5 and one slot, and declined for want of four slots it never uses
+    // -- keeping every wide closure factory at T0. Check the slots actually
+    // bound. Same fix as ppc64le's in #505.
+    if let Some((parameter, slot)) = bf.param_layout.iter().find_map(|(name, loc)| match loc {
+        VarLoc::Slot(slot) if *slot >= bf.n_locals => Some((name, *slot)),
+        _ => None,
+    }) {
         decline!(
-            "required arity {} exceeds activation slots {}",
-            bf.arity,
-            bf.num_slots()
+            "parameter {parameter} binds slot {slot}, outside the {} local slot(s)",
+            bf.n_locals
         );
     }
     let n_locals = bf.n_locals as i32;
