@@ -25577,7 +25577,14 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     // The same candidate carries raw double-float arithmetic (bliss-thcbb):
     // double sites expand to unboxed IR and `unbox_f64` keeps the values raw
     // between operations. The tagged artifact leaves those sites generic.
-    let mut packed = if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
+    //
+    // s390x joins x86-64 here: its emitter now homes a raw double as eight
+    // bytes and keeps it out of the root set, so the checked path below can
+    // try the packed candidate before falling back to the tagged artifact.
+    let mut packed = if cfg!(any(
+        all(target_arch = "x86_64", target_os = "linux"),
+        target_arch = "s390x"
+    )) {
         let mut candidate = f.clone();
         let packed_sites = egcl_compiler::t2::packed_f64::specialize(&mut candidate);
         let speculated = egcl_compiler::t2::speculate::speculate_with(
@@ -25673,7 +25680,18 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     // Linux publishes only mapped code. Do not make a usable mapped worker
     // artifact depend on an emitter for a calling convention we cannot install.
     let (checked, mut heap_constant_slots) = if checked_native_installation_allowed() {
-        let (code, slots) = compile_checked_t2_artifact(input, &f, &name)?;
+        // Prefer the packed candidate when its emitter accepts it: it keeps
+        // the doubles of a closed array expression in raw eight-byte homes
+        // instead of boxing each intermediate. Its admission is strictly
+        // narrower -- it declines any function whose deopt stream would name
+        // a raw value -- so the tagged artifact remains the fallback.
+        let (code, slots) = match packed
+            .as_ref()
+            .and_then(|candidate| compile_checked_t2_artifact(input, candidate, &name))
+        {
+            Some(packed_artifact) => packed_artifact,
+            None => compile_checked_t2_artifact(input, &f, &name)?,
+        };
         (Some(code), slots)
     } else {
         (None, Vec::new())

@@ -1362,6 +1362,78 @@ impl Emitter<'_> {
         Ok(())
     }
 
+    /// Leave the address of packed element `index` of `array` in r1, or
+    /// deopt. Mirrors emit.rs's packed_f64_element_address guard for guard,
+    /// reading the header as a whole word rather than at byte offsets, since
+    /// the type id is the high byte and the size class the low halfword --
+    /// positions that differ by byte order.
+    ///
+    /// r1 ends as the element address; r2-r5 are scratch. The array and index
+    /// operands are read but never modified: either may sit in a permanent
+    /// callee-saved home.
+    fn packed_f64_element_address(
+        &mut self,
+        array: Value,
+        index: Value,
+        deopt: Label,
+    ) -> Result<(), EmitError> {
+        use egcl_rt::object::{ElementTypeTag, type_id};
+        self.load(array, 2)?;
+        // A heap object, or this is not an array at all.
+        self.asm.mov(4, 2);
+        self.asm.imm64(5, 7);
+        self.asm.and(4, 5);
+        self.asm.imm64(5, egcl_rt::value::TAG_HEAP_OBJECT);
+        self.asm.compare(4, 5);
+        self.asm.branch(6, deopt);
+        // r1 = the header address; r4 = the header word.
+        self.asm.mov(1, 2);
+        self.asm.imm64(5, !7u64);
+        self.asm.and(1, 5);
+        self.asm.load(4, 1, 0);
+        // Type id is bits 63:56.
+        self.asm.shift_right_logical(5, 4, 56);
+        self.asm.imm64(3, u64::from(type_id::SIMPLE_ARRAY));
+        self.asm.compare(5, 3);
+        self.asm.branch(6, deopt);
+        // The body follows an eight-byte header, or a sixteen-byte one when
+        // the size class is the 0xFFFF large-object sentinel. 0xFFFF does not
+        // fit CGHI's signed halfword, so compare against a register.
+        let large = self.asm.label();
+        let body = self.asm.label();
+        self.asm.imm64(5, 0xffff);
+        self.asm.and(4, 5);
+        self.asm.compare(4, 5);
+        self.asm.branch(8, large);
+        self.asm.address(1, 1, 8);
+        self.asm.branch(15, body);
+        self.asm.bind(large);
+        self.asm.address(1, 1, 16);
+        self.asm.bind(body);
+        // The element-type byte is at body offset zero on every target.
+        self.asm.load_u8(4, 1, 0);
+        self.asm.compare_imm(4, ElementTypeTag::DoubleFloat as i16);
+        self.asm.branch(6, deopt);
+        // A fixnum index, in range.
+        self.load(index, 3)?;
+        self.asm.mov(4, 3);
+        self.asm.imm64(5, 7);
+        self.asm.and(4, 5);
+        self.asm.compare_imm(4, egcl_rt::value::TAG_FIXNUM as i16);
+        self.asm.branch(6, deopt);
+        self.asm.shift_right_signed(4, 3, 3);
+        self.asm.compare_imm(4, 0);
+        self.asm.branch(4, deopt);
+        self.asm.load(5, 1, egcl_rt::packed_f64::LENGTH_OFFSET as i32);
+        self.asm.compare(4, 5);
+        self.asm.branch(10, deopt);
+        // address = body + DATA_OFFSET + index * 8
+        self.asm.shift_left(4, 4, 3);
+        self.asm.add(1, 4);
+        self.asm.address(1, 1, egcl_rt::packed_f64::DATA_OFFSET as i32);
+        Ok(())
+    }
+
     fn guard_cons(&mut self, register: u8, deopt: Label) {
         self.load_tag(register);
         self.asm.compare_imm(4, egcl_rt::value::TAG_CONS as i16);
@@ -1502,6 +1574,32 @@ impl Emitter<'_> {
                 }
                 return Ok(());
             }
+            // A packed element access. PackedF64Set produces no value, so
+            // both arms belong here, ahead of the result requirement below.
+            PackedF64Ref | PackedF64Set => {
+                let deopt = self.deopt_label(data)?;
+                let array = *data.args.first().ok_or(unsupported!())?;
+                let index = *data.args.get(1).ok_or(unsupported!())?;
+                if data.opcode == PackedF64Set {
+                    // Park the stored value in the frame before computing the
+                    // address, which needs r1-r5. A callee-saved register is
+                    // NOT available as scratch here: prologue_from saves only
+                    // from `first_saved` up, so a function whose homes start
+                    // above r6 never saves it and would return it clobbered.
+                    self.load(*data.args.get(2).ok_or(unsupported!())?, 2)?;
+                    self.asm.store(2, 15, self.result_offset);
+                }
+                self.packed_f64_element_address(array, index, deopt)?;
+                if data.opcode == PackedF64Set {
+                    self.asm.load(2, 15, self.result_offset);
+                    self.asm.store(2, 1, 0);
+                    return Ok(());
+                }
+                self.asm.load(2, 1, 0);
+                let result = *data.results.first().ok_or(unsupported!())?;
+                self.store(result, 2)?;
+                return Ok(());
+            }
             Trap => {
                 // A Trap ends a path that must not continue (bliss-wukf): the
                 // code after a call that never returns normally. As in
@@ -1546,6 +1644,23 @@ impl Emitter<'_> {
                     AuxData::TypeTag(ty) if ty.bits == TypeBits::CONS => self.guard_cons(2, deopt),
                     _ => self.guard_single_float(2, deopt),
                 }
+            }
+            // A raw double: operands and result are IEEE bits in ordinary
+            // homes, moved to FPRs only for the operation itself (LDGR/LGDR),
+            // which is how the x86 emitter treats them too.
+            FloatAdd | FloatSub | FloatMul
+                if self.function.value(result).repr == ValueRepresentation::UnboxedF64 =>
+            {
+                self.load(first, 2)?;
+                self.load(*data.args.get(1).ok_or(unsupported!())?, 3)?;
+                self.asm.load_float_bits(0, 2);
+                self.asm.load_float_bits(2, 3);
+                match data.opcode {
+                    FloatAdd => self.asm.add_double(0, 2),
+                    FloatSub => self.asm.sub_double(0, 2),
+                    _ => self.asm.multiply_double(0, 2),
+                }
+                self.asm.store_float_bits(2, 0);
             }
             FloatAdd | FloatSub | FloatMul => {
                 let deopt = self.deopt_label(data)?;
@@ -1966,10 +2081,38 @@ pub fn emit_framed_with_runtime(
             emitter.constants.insert(result, bits);
         }
     }
+    // A deopt stream is a list of tagged words. x86-64 reboxes a raw value
+    // on the way out (deopt.rs Rebox::ReboxF64); this emitter does not, so a
+    // frame state naming one would hand the adapter an IEEE bit pattern to
+    // treat as a Lisp object. Refuse the function instead -- its caller still
+    // holds the fully tagged artifact to fall back on.
+    for (_, state) in function.frame_states.iter() {
+        let raw = |source: &ValueSource| {
+            matches!(source, ValueSource::Value { repr, .. } if *repr != ValueRepresentation::Tagged)
+        };
+        if state
+            .scopes
+            .iter()
+            .flat_map(|scope| scope.locals.iter().chain(scope.stack.iter()))
+            .any(raw)
+            || state
+                .remat
+                .iter()
+                .any(|recipe| recipe.inputs.iter().any(raw))
+        {
+            return Err(unsupported!());
+        }
+    }
     let mut spill_slots = machine.num_spill_slots;
     for index in 0..function.num_values() {
         let value = Value(index as u32);
-        if function.value(value).repr != ValueRepresentation::Tagged {
+        // A raw double lives in an ordinary eight-byte home holding its IEEE
+        // bits, as it does on x86-64; only arithmetic moves it to an FPR.
+        // Every other representation still declines.
+        if !matches!(
+            function.value(value).repr,
+            ValueRepresentation::Tagged | ValueRepresentation::UnboxedF64
+        ) {
             return Err(unsupported!());
         }
         if emitter.constants.contains_key(&value) || emitter.heap_constants.contains_key(&value) {
@@ -2049,6 +2192,11 @@ pub fn emit_framed_with_runtime(
             .map(|v| Value(v.num))
             .filter(|value| emitter.homes.contains_key(value))
             .filter(|value| !proven_immediate(*value))
+            // A raw double's home holds IEEE bits. Publishing it as a root
+            // would hand the collector a bit pattern to trace as an object.
+            .filter(|value| {
+                function.value(*value).repr == ValueRepresentation::Tagged
+            })
             .collect();
         roots.sort_by_key(|value| value.0);
         roots.dedup();
@@ -2090,6 +2238,11 @@ pub fn emit_framed_with_runtime(
             )
             .filter(|value| emitter.homes.contains_key(value))
             .filter(|value| !proven_immediate(*value))
+            // A raw double's home holds IEEE bits. Publishing it as a root
+            // would hand the collector a bit pattern to trace as an object.
+            .filter(|value| {
+                function.value(*value).repr == ValueRepresentation::Tagged
+            })
             .collect();
         roots.sort_by_key(|value| value.0);
         roots.dedup();
@@ -3834,6 +3987,163 @@ mod tests {
                     [1, 0, 0, 1, 0, EgclVal::from_single_float(2.0).0]
                 );
             });
+        }
+    }
+
+    /// Raw doubles: a packed array element is loaded into an ordinary
+    /// eight-byte home, added to itself in an FPR, and stored back. The
+    /// guards on the way in are the real ones -- heap object, SIMPLE_ARRAY
+    /// header, DOUBLE-FLOAT element type, fixnum index, in range -- so this
+    /// also pins the big-endian header reads (type id is the high byte of
+    /// the header word, the size class its low halfword).
+    #[test]
+    fn packed_double_elements_load_add_and_store_through_raw_homes() {
+        let tagged = |f: &mut Function, block| {
+            f.add_block_param(block, IRType::TOP, ValueRepresentation::Tagged)
+        };
+        let mut f = Function::new("z-packed-f64");
+        let block = f.entry();
+        let array = tagged(&mut f, block);
+        let index = tagged(&mut f, block);
+        // Frame states name only the tagged parameters, which is what the
+        // emitter requires: it cannot rebox a raw slot for the interpreter.
+        let state = f.frame_states.add(FrameState {
+            scopes: vec![FrameScope {
+                function: 0,
+                bcp: 0,
+                locals: vec![
+                    ValueSource::Value {
+                        value: array,
+                        repr: ValueRepresentation::Tagged,
+                    },
+                    ValueSource::Value {
+                        value: index,
+                        repr: ValueRepresentation::Tagged,
+                    },
+                ],
+                stack: vec![],
+            }],
+            remat: vec![],
+        });
+        let guarded = |opcode, args, results| InstData {
+            opcode,
+            args,
+            results,
+            aux: AuxData::None,
+            flags: InstFlags {
+                guard: true,
+                ..Default::default()
+            },
+            targets: vec![],
+            frame_state: Some(state),
+            source_pos: 0,
+        };
+        let (_, loaded) = f.push_inst(
+            block,
+            guarded(Opcode::PackedF64Ref, vec![array, index], vec![]),
+            &[(
+                IRType::of(TypeBits::DOUBLE_FLOAT),
+                ValueRepresentation::UnboxedF64,
+            )],
+        );
+        let (_, doubled) = f.push_inst(
+            block,
+            InstData {
+                opcode: Opcode::FloatAdd,
+                args: vec![loaded[0], loaded[0]],
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags::default(),
+                targets: vec![],
+                frame_state: None,
+                source_pos: 0,
+            },
+            &[(
+                IRType::of(TypeBits::DOUBLE_FLOAT),
+                ValueRepresentation::UnboxedF64,
+            )],
+        );
+        f.push_inst(
+            block,
+            guarded(
+                Opcode::PackedF64Set,
+                vec![array, index, doubled[0]],
+                vec![],
+            ),
+            &[],
+        );
+        f.set_terminator(
+            block,
+            InstData {
+                opcode: Opcode::Return,
+                args: vec![array],
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags {
+                    terminator: true,
+                    ..Default::default()
+                },
+                targets: vec![],
+                frame_state: None,
+                source_pos: 0,
+            },
+        );
+
+        thread_local! {
+            static DEOPTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        }
+        extern "C" fn deopt(_: u64, _: u64, _: *const u64, _: u64) -> u64 {
+            DEOPTED.with(|flag| flag.set(true));
+            NIL.0
+        }
+        let compiled = emit_framed(&f, deopt as *const () as u64, 2)
+            .expect("a packed load/add/store emits");
+        assert!(!compiled.code.is_empty(), "the packed arms emit code");
+        #[cfg(all(target_arch = "s390x", unix))]
+        {
+            use egcl_rt::object::{ElementTypeTag, type_id};
+
+            // A rank-one packed array: header word (type id in the high byte,
+            // a size class that is not the 0xFFFF large-object sentinel),
+            // then the body -- element-type byte, length, elements.
+            let mut object = vec![0u64; 6];
+            object[0] = (u64::from(type_id::SIMPLE_ARRAY) << 56) | 1;
+            object[1] = u64::from(ElementTypeTag::DoubleFloat as u8) << 56;
+            object[2] = 2;
+            object[3] = 1.5f64.to_bits();
+            object[4] = 9.0f64.to_bits();
+            // Provenance must cover the whole object: the generated code
+            // writes elements through this pointer, not just the header.
+            let array_value = object.as_mut_ptr() as u64 | egcl_rt::value::TAG_HEAP_OBJECT;
+
+            let code = egcl_rt::jit::JitBuffer::new(&compiled.code).unwrap();
+            // SAFETY: the buffer owns the generated activation entry.
+            let entry: unsafe extern "C" fn(*mut u64) -> u64 =
+                unsafe { std::mem::transmute(code.as_ptr()) };
+            let mut slots = vec![0u64; 2 + compiled.shadow_root_slots as usize];
+
+            slots[0] = array_value;
+            slots[1] = EgclVal::from_fixnum(1).0;
+            assert_eq!(unsafe { entry(slots.as_mut_ptr()) }, array_value);
+            assert!(!DEOPTED.with(std::cell::Cell::get), "no guard should fail");
+            assert_eq!(f64::from_bits(object[4]), 18.0, "element 1 doubled");
+            assert_eq!(f64::from_bits(object[3]), 1.5, "element 0 untouched");
+
+            // Out of range, and then a non-fixnum index: both deopt rather
+            // than reading past the elements.
+            for bad in [EgclVal::from_fixnum(2).0, NIL.0] {
+                DEOPTED.with(|flag| flag.set(false));
+                slots[0] = array_value;
+                slots[1] = bad;
+                assert_eq!(unsafe { entry(slots.as_mut_ptr()) }, NIL.0);
+                assert!(DEOPTED.with(std::cell::Cell::get), "index {bad:#x} must deopt");
+            }
+            // A non-array operand deopts on the header guard.
+            DEOPTED.with(|flag| flag.set(false));
+            slots[0] = EgclVal::from_fixnum(3).0;
+            slots[1] = EgclVal::from_fixnum(0).0;
+            assert_eq!(unsafe { entry(slots.as_mut_ptr()) }, NIL.0);
+            assert!(DEOPTED.with(std::cell::Cell::get), "a fixnum is not an array");
         }
     }
 }
