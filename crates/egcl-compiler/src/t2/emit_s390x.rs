@@ -231,6 +231,10 @@ pub struct RuntimeCalls {
 /// own live values. r2-r5 are volatile and never homes.
 pub const REGISTER_ENTRY_ARGS_MAX: usize = 4;
 
+/// Back edges between full runtime polls. A power of two, so the counter
+/// test is one TMLL; 64 matches the interval emit.rs uses on x86-64.
+const POLL_INTERVAL: u16 = 64;
+
 fn calls_runtime(opcode: Opcode) -> bool {
     matches!(
         opcode,
@@ -280,6 +284,9 @@ struct Emitter<'a> {
     /// came in through the register entry and so has no EgclStack frame of
     /// its own; the deopt stubs pass it to the runtime (bliss-w6aki).
     entry_kind_offset: i32,
+    /// Frame word counting back edges, so the poll runs on a cadence rather
+    /// than on every one. Zeroed by each entry prologue.
+    poll_counter_offset: i32,
     polls: HashSet<Inst>,
     transfer_exit: Option<Label>,
     /// The register entry, when this function qualifies for direct self-calls.
@@ -956,6 +963,14 @@ impl Emitter<'_> {
         Ok(())
     }
 
+    /// Reset the back-edge counter for a fresh activation. Uses r0, the one
+    /// scratch register the register entry has spare: r2-r5 hold its
+    /// arguments at that point.
+    fn zero_poll_counter(&mut self) {
+        self.asm.imm64(0, 0);
+        self.asm.store(0, 15, self.poll_counter_offset);
+    }
+
     fn prologue(&mut self) {
         self.asm.prologue_from(self.first_saved);
         self.asm.address(15, 15, -self.frame_bytes);
@@ -969,6 +984,7 @@ impl Emitter<'_> {
         // direct call published): a deopt may resume on it.
         self.asm.imm64(2, self.runtime.code_id);
         self.asm.store(2, 15, self.entry_kind_offset);
+        self.zero_poll_counter();
     }
 
     /// The listed native callee for `symbol` at this arity, if any.
@@ -1519,8 +1535,24 @@ impl Emitter<'_> {
         use Opcode::*;
         if self.polls.contains(&instruction) {
             // Every selected backward-edge terminator reaches the existing
-            // root-synchronizing poll before its edge moves.
+            // root-synchronizing poll before its edge moves -- but only on
+            // every POLL_INTERVAL'th crossing. The poll is a call into Rust
+            // AND a full shadow-root synchronisation of every live value, so
+            // paying it per iteration set this backend's loop floor; x86-64
+            // polls on an interval too (emit.rs POLL_INTERVAL). Skipping the
+            // other crossings bounds, rather than removes, the latency of
+            // everything the poll services -- a stop-the-world request, a
+            // signal, a fiber yield -- which is why this is a cadence change
+            // and not an inline flag test: no condition the runtime poll
+            // reports can be missed, only deferred by at most 63 iterations.
+            let skip = self.asm.label();
+            self.asm.load(0, 15, self.poll_counter_offset);
+            self.asm.add_imm(0, 1);
+            self.asm.store(0, 15, self.poll_counter_offset);
+            self.asm.test_mask_low(0, POLL_INTERVAL - 1);
+            self.asm.branch(7, skip);
             self.runtime_call(instruction, None)?;
+            self.asm.bind(skip);
         }
         if calls_runtime(data.opcode) {
             return self.runtime_call(instruction, Some(data));
@@ -2042,6 +2074,7 @@ pub fn emit_framed_with_runtime(
         roots: HashMap::new(),
         root_sites: Vec::new(),
         result_offset: 0,
+        poll_counter_offset: 0,
         stack_offset: 0,
         saved_fp_offset: 0,
         saved_sp_offset: 0,
@@ -2319,7 +2352,7 @@ pub fn emit_framed_with_runtime(
         0
     };
     let frame_words =
-        spill_slots as usize + edge_words + deopt_words + remat_words + self_args_words + 5;
+        spill_slots as usize + edge_words + deopt_words + remat_words + self_args_words + 6;
     // Every load/store and frame adjustment must fit a signed 20-bit address.
     if frame_words > (524280 - 160) / 8 {
         return Err(unsupported!());
@@ -2329,11 +2362,12 @@ pub fn emit_framed_with_runtime(
     emitter.deopt_base = emitter.edge_base + edge_words as i32 * 8;
     emitter.remat_base = emitter.deopt_base + deopt_words as i32 * 8;
     emitter.self_args_base = emitter.remat_base + remat_words as i32 * 8;
-    emitter.result_offset = 160 + (frame_words as i32 - 5) * 8;
+    emitter.result_offset = 160 + (frame_words as i32 - 6) * 8;
     emitter.stack_offset = emitter.result_offset + 8;
     emitter.saved_fp_offset = emitter.stack_offset + 8;
     emitter.saved_sp_offset = emitter.saved_fp_offset + 8;
     emitter.entry_kind_offset = emitter.saved_sp_offset + 8;
+    emitter.poll_counter_offset = emitter.entry_kind_offset + 8;
     if function.block(function.entry()).params.len() > activation_slots as usize {
         return Err(unsupported!());
     }
@@ -2368,6 +2402,7 @@ pub fn emit_framed_with_runtime(
         // No frame of its own (r13 is the caller's): a deopt must push one.
         emitter.asm.imm64(2, emitter.runtime.code_id | (1 << 63));
         emitter.asm.store(2, 15, emitter.entry_kind_offset);
+        emitter.zero_poll_counter();
         if !entry_is_next {
             emitter.asm.branch(15, emitter.blocks[&function.entry()]);
         }
@@ -3442,6 +3477,19 @@ mod tests {
         assert_eq!(compiled.osr_entries.len(), 1);
         assert_eq!(compiled.root_sync_sites.len(), 1);
         assert_eq!(compiled.root_sync_sites[0].live_roots, 20);
+        // The poll runs on a cadence, so the back edge tests the low bits of
+        // its counter: TMLL r0, POLL_INTERVAL-1. Without that the loop would
+        // call into Rust and synchronise all twenty roots every iteration.
+        let cadence_test = [
+            0xa7,
+            0x01,
+            ((POLL_INTERVAL - 1) >> 8) as u8,
+            (POLL_INTERVAL - 1) as u8,
+        ];
+        assert!(
+            compiled.code.windows(4).any(|w| w == cadence_test),
+            "the back edge must test the poll counter"
+        );
         #[cfg(target_arch = "s390x")]
         {
             let buffer = egcl_rt::jit::JitBuffer::new(&compiled.code).unwrap();
