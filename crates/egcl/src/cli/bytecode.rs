@@ -6235,6 +6235,21 @@ impl<'e> Lowerer<'e> {
                     Some(VarLoc::Slot(_)) => return Err(Bail),
                 }
             }
+            // A clause runs within the RESTART-CASE's dynamic extent, so it may
+            // RETURN-FROM or GO to any enclosing block or tag, by name, as a
+            // closure does (bliss-38r94).
+            let enclosing_blocks: std::collections::HashSet<String> = self
+                .block_scope
+                .iter()
+                .map(|(n, _)| n.clone())
+                .chain(self.enclosing_blocks.iter().cloned())
+                .collect();
+            let enclosing_tags: std::collections::HashSet<String> = self
+                .tag_scope
+                .iter()
+                .flat_map(|s| s.tags.keys().cloned())
+                .chain(self.enclosing_tags.iter().cloned())
+                .collect();
             let function = compile_restart_clause(
                 params_form,
                 body,
@@ -6242,6 +6257,8 @@ impl<'e> Lowerer<'e> {
                 &captures,
                 &self.declared_special,
                 &self.enclosing_slot_names(),
+                &enclosing_blocks,
+                &enclosing_tags,
                 self.portable,
             )
             .ok_or(Bail)?;
@@ -8235,6 +8252,7 @@ fn destructure_pattern(
 /// Compile a `RESTART-CASE` clause as a nested function. `captures` names
 /// bindings in the establishing activation; they are resolved through the
 /// child function's parent heap environment rather than copied as source.
+#[allow(clippy::too_many_arguments)]
 fn compile_restart_clause(
     mut params_form: EgclVal,
     mut body: EgclVal,
@@ -8242,6 +8260,8 @@ fn compile_restart_clause(
     captures: &std::collections::HashSet<String>,
     inherited_specials: &std::collections::HashMap<String, u32>,
     enclosing_slots: &std::collections::HashSet<String>,
+    enclosing_blocks: &std::collections::HashSet<String>,
+    enclosing_tags: &std::collections::HashSet<String>,
     portable: bool,
 ) -> Option<BytecodeFunction> {
     // Root the source subforms across the allocating lowering (moving GC; bliss-wlf).
@@ -8261,6 +8281,8 @@ fn compile_restart_clause(
     egcl_rt::rooted_ref!(_const_guard = &mut lo);
     lo.portable = portable;
     lo.captured_names = compute_captured_names(body);
+    lo.enclosing_blocks = enclosing_blocks.clone();
+    lo.enclosing_tags = enclosing_tags.clone();
     lo.enclosing_slots = enclosing_slots
         .iter()
         .filter(|name| !captures.contains(*name) && !param_names.contains(name))
@@ -16639,6 +16661,25 @@ pub(super) fn run(
     run_with_sym(entry, args, entry_fn_val, u32::MAX, env)
 }
 
+thread_local! {
+    /// Set by [`run_in_current_scope`] for the next activation only.
+    static INHERIT_CONTROL_SCOPE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// [`run`], keeping the caller's current BLOCK/TAGBODY scope rather than
+/// starting fresh. A RESTART-CASE clause runs with the exits visible where its
+/// restart was established, which the caller has just installed; `run` would
+/// clear them, and a GO or RETURN-FROM to an enclosing tag or block then found
+/// nothing (bliss-38r94).
+pub(super) fn run_in_current_scope(
+    entry: Arc<BytecodeFunction>,
+    args: &[EgclVal],
+    env: &mut Env,
+) -> Result<EgclVal, EgclError> {
+    INHERIT_CONTROL_SCOPE.with(|flag| flag.set(true));
+    run(entry, args, NIL, env)
+}
+
 /// [`run`], with the callee's registry symbol threaded explicitly for OSR
 /// keying. The main dispatch path (`call_registered`) passes the function
 /// OBJECT as `entry_fn_val` — deliberately, for closure-environment and alias
@@ -16710,6 +16751,8 @@ fn run_with_binding(
     macro_lambda_list: bool,
     context: MacroCallContext<'_>,
 ) -> Result<EgclVal, EgclError> {
+    // Consumed first, so no nested activation can see it.
+    let inherit_scope = INHERIT_CONTROL_SCOPE.with(|flag| flag.replace(false));
     let MacroCallContext {
         whole: mut macro_whole,
         environment: mut explicit_environment,
@@ -16826,6 +16869,7 @@ fn run_with_binding(
             std::mem::replace(&mut env.block_stack, blocks),
             std::mem::replace(&mut env.tag_stack, tags),
         ),
+        None if inherit_scope => (env.block_stack.clone(), env.tag_stack.clone()),
         None => (
             std::mem::take(&mut env.block_stack),
             std::mem::take(&mut env.tag_stack),

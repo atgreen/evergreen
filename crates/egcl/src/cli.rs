@@ -7866,7 +7866,7 @@ fn invoke_restart_function_in(
                     std::mem::replace(&mut env.tag_stack, tags.to_vec()),
                 )
             });
-            let result = bytecode::run(function, args, NIL, env);
+            let result = bytecode::run_in_current_scope(function, args, env);
             if let Some((blocks, tags)) = saved_scope {
                 env.block_stack = blocks;
                 env.tag_stack = tags;
