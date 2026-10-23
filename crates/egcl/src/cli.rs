@@ -43125,6 +43125,9 @@ fn eval_handler_case(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> 
                 // rooted Vec: a compound clause type runs TYPEP, which can
                 // allocate.
                 let mut selected = None;
+                // Index rather than iterate: a shared borrow of the rooted Vec
+                // must not be held across the collection TYPEP can trigger.
+                #[allow(clippy::needless_range_loop)]
                 for index in 0..installed.len() {
                     if handler_entry_matches(env, condition, &installed[index])? {
                         selected = Some(index);
@@ -46191,8 +46194,10 @@ mod env_gc_root_tests {
                             Arc::new(SharedCell::new(frame))
                         }),
                         defining_specials: Vec::new(),
+                        defining_macros: None,
                     },
                 )])))),
+                captured_macros: None,
             },
         );
         env.method_context.push(MethodContext {
