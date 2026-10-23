@@ -295,6 +295,38 @@ fn format_directive_tilde_f_fixed_float() {
     );
 }
 
+// ~wF without d: the fraction digits fill the width but carry no trailing
+// zeros, even when rounding a value just off a short decimal produced them
+// (CLHS 22.3.3.1; issue #533). Expected strings are SBCL 2.x output.
+#[test]
+fn format_tilde_w_f_drops_trailing_fraction_zeros() {
+    for (control, number, expected) in [
+        ("~8F", -112.400000000001, "  -112.4"),
+        ("~8F", -112.4, "  -112.4"),
+        ("~8F", -81.1999999999999, "   -81.2"),
+        ("~8F", 97.400000000001, "    97.4"),
+        ("~8F", 22.095000000000997, "  22.095"),
+        ("~4F", 1.0, " 1.0"),
+        ("~4F", 9.9999999, "10.0"),
+        ("~6F", 9.9999999, "  10.0"),
+        ("~5F", 1.00001, "  1.0"),
+        ("~6F", 0.10000001, "   0.1"),
+        ("~4F", 0.0001, " 0.0"),
+        ("~8F", 1e-10, "     0.0"),
+        ("~5F", 123.0001, "123.0"),
+        ("~6F", 1.0001, "1.0001"),
+        // An explicit d keeps its zeros; no width keeps the shortest decimal.
+        ("~8,3F", -112.400000000001, "-112.400"),
+        ("~F", -112.400000000001, "-112.400000000001"),
+    ] {
+        egcl_rt::rooted!(float = egcl_rt::gc::alloc_double_float(number));
+        assert_eq!(format_nil_string(control, &[*float]), expected, "{control} {number:?}");
+    }
+    let single = EgclVal::from_single_float(-112.399994f32);
+    assert_eq!(format_nil_string("~8F", &[single]), "  -112.4");
+    assert_eq!(format_nil_string("~8F", &[EgclVal::from_single_float(100.0)]), "   100.0");
+}
+
 // ~E — exponential float
 #[test]
 fn format_directive_tilde_e_exponential() {

@@ -345,6 +345,10 @@
 
 ### Fixed
 
+- `~wF` with a width and no digit count no longer keeps the zeros left by
+  rounding a value just off a short decimal: `(format nil "~8F"
+  -112.400000000001d0)` prints `"  -112.4"`, not `"-112.400"`, as in SBCL
+  ([#534](https://github.com/atgreen/evergreen/pull/534)).
 - `print-unreadable-object` with `:identity t` prints the object's address, so
   different objects print differently. It printed `sxhash`, which is the same
   for every standard object, so all instances shared one identity
