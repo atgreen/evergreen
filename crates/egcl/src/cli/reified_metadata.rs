@@ -235,6 +235,9 @@ pub(super) fn restore(
                         defining_blocks,
                         defining_frame,
                         defining_specials,
+                        // Lexical macros are not persisted; a restored local
+                        // function inherits its caller's, as before bliss-9uimd.
+                        defining_macros: None,
                     },
                 )
                 .is_some()
