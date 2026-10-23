@@ -557,7 +557,42 @@ fn scan_bytecode_roots(visit: &mut dyn FnMut(*mut EgclVal)) {
     }
 }
 
+/// Private closure bodies published since the last major collection.
+static PRIVATE_CLOSURES_SINCE_MAJOR: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// Private closures to publish before requesting a major collection.
+static PRIVATE_CLOSURE_MAJOR_BUDGET: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(MIN_PRIVATE_CLOSURE_MAJOR_BUDGET);
+/// About 15 MB of side-table state at the ~0.9 KB a captured FLET costs.
+const MIN_PRIVATE_CLOSURE_MAJOR_BUDGET: usize = 16 * 1024;
+
+/// Account for one newly published private closure identity (bliss-5ndk).
+///
+/// Its function object is pinned, so minor collections promote it rather than
+/// free it, and its side-table entries are released only by
+/// [`sweep_function_captures`] during a major collection. Nothing else
+/// triggers that collection for host-side growth, so request one once the
+/// closures minted since the last sweep reach the budget. The budget tracks
+/// the survivors of the previous sweep, so a program that keeps many closures
+/// alive pays for each major collection with as many new ones.
+fn note_private_closure_published() {
+    use std::sync::atomic::Ordering;
+    let minted = PRIVATE_CLOSURES_SINCE_MAJOR.fetch_add(1, Ordering::Relaxed) + 1;
+    if minted >= PRIVATE_CLOSURE_MAJOR_BUDGET.load(Ordering::Relaxed) {
+        egcl_rt::gc::request_major_gc();
+    }
+}
+
 fn sweep_function_captures(names: &[EgclVal]) {
+    use std::sync::atomic::Ordering;
+    sweep_dead_function_captures(names);
+    // Rearm the major-collection request from this sweep's survivors.
+    let live = closure_bodies().borrow().len();
+    PRIVATE_CLOSURE_MAJOR_BUDGET.store(live.max(MIN_PRIVATE_CLOSURE_MAJOR_BUDGET), Ordering::Relaxed);
+    PRIVATE_CLOSURES_SINCE_MAJOR.store(0, Ordering::Relaxed);
+}
+
+fn sweep_dead_function_captures(names: &[EgclVal]) {
     let mut dead: std::collections::HashSet<u32> = names
         .iter()
         .filter_map(|name| name.symbol_index())
@@ -1159,6 +1194,7 @@ fn publish_bytecode(sym: u32, f: Arc<BytecodeFunction>, expected: Option<u64>, f
     register_bytecode_roots(&f);
     let private = egcl_rt::symbols::is_uninterned(sym);
     let generation = if private {
+        note_private_closure_published();
         let current = REGISTRY_GENERATION.with(|g| g.borrow().get(&sym).copied().unwrap_or(0));
         if expected.is_some_and(|generation| generation != current) {
             return false;
@@ -13536,6 +13572,9 @@ pub(super) fn make_bytecode_closure(
     egcl_rt::rooted!(sym = egcl_rt::symbols::make_uninterned("CLOSURE"));
     let sym_idx = sym.as_symbol_index();
     egcl_rt::rooted!(_callable_root = ActiveCallableRoot(sym_idx));
+    // Short-lived closures only die in a major collection (bliss-5ndk).
+    egcl_rt::gc::collect_if_major_requested()
+        .expect("GC failed while making a closure");
     let lambda_list = if nested.variadic {
         nested.params_form
     } else {
@@ -14268,6 +14307,9 @@ pub(super) fn compile_tree_closure(
         return None;
     };
     egcl_rt::rooted!(_bytecode_root = ActiveBytecodeRoot::new(&bf));
+    // Short-lived closures only die in a major collection (bliss-5ndk).
+    egcl_rt::gc::collect_if_major_requested()
+        .expect("GC failed while making a closure");
     let sym = egcl_rt::symbols::make_uninterned("CLOSURE");
     let sym_idx = sym.as_symbol_index();
     closure_bodies().borrow_mut().insert(sym_idx, Arc::clone(&bf));

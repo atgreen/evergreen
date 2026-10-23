@@ -2903,7 +2903,8 @@ impl Collector for HeapCollector {
             // ("unbound variable: CONS" after enough stress-mode collections).
             // Honor the knob: when the non-Free region fraction crosses it,
             // run a major collection to sweep old-gen garbage back to Free.
-            Self::occupancy_exceeds_trigger()
+            let requested = MAJOR_GC_REQUESTED.swap(false, Ordering::AcqRel);
+            requested || Self::occupancy_exceeds_trigger()
         };
         // Outside the admission gate: major_gc acquires it itself.
         // No retrigger loop: major_gc drains the nursery via
@@ -2968,6 +2969,9 @@ impl HeapCollector {
         // KeepNursery instead traces through the nursery where it stands and
         // leaves its deaths to the minor collection that follows.
         if !keep_nursery {
+            // This collection runs the function-capture sweep, which is what
+            // an outstanding request asked for.
+            MAJOR_GC_REQUESTED.store(false, Ordering::Release);
             self.minor_gc_stw_body()?;
         }
         // Until this collection completes (and re-arms the tracker below), the
@@ -6491,6 +6495,44 @@ static FUNCTION_CAPTURE_SWEEP_FN: OnceLock<FunctionCaptureSweepFn> = OnceLock::n
 /// Function objects are pinned, so nursery collection cannot end their lifetime.
 pub fn set_function_capture_sweep_fn(sweep: FunctionCaptureSweepFn) {
     let _ = FUNCTION_CAPTURE_SWEEP_FN.set(sweep);
+}
+
+/// Set by [`request_major_gc`]; consumed by the next minor collection.
+static MAJOR_GC_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Ask for a major collection at the next minor collection's safepoint.
+///
+/// For owners of host-side state that only a major collection can release.
+/// Private closure identities are the case in point: their function objects
+/// are pinned, so minor collections promote them, and their side-table
+/// entries (bytecode body, captured frame, tiering state) are swept only when
+/// a major collection finds the function dead. That host memory is invisible
+/// to the region-occupancy trigger, so a loop that creates short-lived FLET
+/// closures grew without bound until an explicit full GC (bliss-5ndk). This
+/// only sets a flag: it never collects, allocates or blocks, so it is safe to
+/// call from any non-allocating context.
+pub fn request_major_gc() {
+    MAJOR_GC_REQUESTED.store(true, Ordering::Release);
+}
+
+/// Run the major collection asked for by [`request_major_gc`], if any.
+///
+/// The request is otherwise honored at the next minor collection, but a
+/// workload whose only allocations are pinned (closure function objects and
+/// their uninterned names) never fills the nursery, so no minor collection
+/// comes. Callers invoke this at a point where an allocation could collect:
+/// every live reference they hold must be rooted. A minor collection consumes
+/// the request and escalates to the major one.
+pub fn collect_if_major_requested() -> Result<(), EgclError> {
+    if !MAJOR_GC_REQUESTED.load(Ordering::Acquire)
+        || std::env::var_os("EGCL_GC_DISABLE").is_some()
+    {
+        return Ok(());
+    }
+    if heap_state().lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+        return Ok(());
+    }
+    HeapCollector::new().minor_gc()
 }
 
 /// Callback that traces the heap references reachable from a STREAM handle.
