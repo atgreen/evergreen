@@ -760,8 +760,8 @@ fn format_to_string_output_stream() {
     // Extract what was written to the stream and verify the content
     let output = get_output_stream_string(stream).expect("should retrieve output stream string");
     assert_eq!(
-        output,
-        make_lisp_string("Hello, world!"),
+        output.as_string(),
+        "Hello, world!",
         "format output via stream should be 'Hello, world!'"
     );
 }
@@ -776,8 +776,8 @@ fn format_integer_directive() {
     assert!(!result.is_nil());
     // Verify the output contains the expected formatted content
     assert_eq!(
-        result,
-        make_lisp_string("The answer is 42."),
+        result.as_string(),
+        "The answer is 42.",
         "format ~D should produce 'The answer is 42.'"
     );
 }
@@ -790,8 +790,8 @@ fn format_newline_directive() {
     assert!(!result.is_nil());
     // The result should contain a newline between line1 and line2
     assert_eq!(
-        result,
-        make_lisp_string("line1\nline2"),
+        result.as_string(),
+        "line1\nline2",
         "format ~% should produce a newline"
     );
 }
@@ -809,8 +809,8 @@ fn format_to_stream_destination() {
     // Extract what was written and verify the content
     let output = get_output_stream_string(stream).expect("should retrieve output stream string");
     assert_eq!(
-        output,
-        make_lisp_string("value=7"),
+        output.as_string(),
+        "value=7",
         "format to stream should produce 'value=7'"
     );
 }
@@ -825,7 +825,7 @@ fn stream_write_chars_and_get_string() {
     stream_write_char(stream, EgclVal::from_char('i')).unwrap();
 
     let output = get_output_stream_string(stream).unwrap();
-    assert_eq!(output, make_lisp_string("Hi"), "output should contain 'Hi'");
+    assert_eq!(output.as_string(), "Hi", "output should contain 'Hi'");
 }
 
 /// Write a string to a stream and retrieve the output.
@@ -840,8 +840,8 @@ fn stream_write_string_and_get_output() {
 
     let output = get_output_stream_string(stream).unwrap();
     assert_eq!(
-        output,
-        make_lisp_string("Hello, streams!"),
+        output.as_string(),
+        "Hello, streams!",
         "output should contain 'Hello, streams!'"
     );
 }
@@ -905,16 +905,19 @@ fn broadcast_stream_writes_to_all() {
     stream_write_string(broadcast, make_lisp_string("broadcast"), 0, None).unwrap();
 
     // Both component streams should have received the data
-    let out1 = get_output_stream_string(s1).expect("should get output from stream 1");
-    let out2 = get_output_stream_string(s2).expect("should get output from stream 2");
+    // Decode each fresh result before the next allocation can move it.
+    let out1 = get_output_stream_string(s1)
+        .expect("should get output from stream 1")
+        .as_string();
+    let out2 = get_output_stream_string(s2)
+        .expect("should get output from stream 2")
+        .as_string();
     assert_eq!(
-        out1,
-        make_lisp_string("broadcast"),
+        out1, "broadcast",
         "stream 1 should have received 'broadcast'"
     );
     assert_eq!(
-        out2,
-        make_lisp_string("broadcast"),
+        out2, "broadcast",
         "stream 2 should have received 'broadcast'"
     );
 }
@@ -932,8 +935,8 @@ fn format_multiple_directives() {
     let output = result.unwrap();
     assert!(!output.is_nil());
     assert_eq!(
-        output,
-        make_lisp_string("Name: Alice, Age: 30\n"),
+        output.as_string(),
+        "Name: Alice, Age: 30\n",
         "format with multiple directives should produce correct output"
     );
 }
@@ -1159,8 +1162,8 @@ fn format_condition_message() {
     assert!(formatted.is_ok());
     let output = formatted.unwrap();
     assert_eq!(
-        output,
-        make_lisp_string("Error: unexpected token at position 42"),
+        output.as_string(),
+        "Error: unexpected token at position 42",
         "formatted condition message should contain the error details"
     );
 }

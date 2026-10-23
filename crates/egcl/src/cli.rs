@@ -816,7 +816,9 @@ fn write_str_to(stream: EgclVal, s: &str, env: &mut Env) -> Result<(), EgclError
     let mut stream = stream;
     egcl_rt::rooted_ref!(_stream_root = &mut stream);
     check_pending_sigpipe_for_output()?;
-    egcl_rt::rooted!(sv = egcl_stdlib::make_lisp_string(s));
+    // Fresh, not interned: an interned string is never reclaimed, so every
+    // distinct text written would leak (bliss-4due).
+    egcl_rt::rooted!(sv = egcl_stdlib::make_lisp_string_fresh(s));
     if is_gray_stream(stream) {
         invoke_generic_function(
             "STREAM-WRITE-STRING",

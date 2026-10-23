@@ -36,6 +36,12 @@ fn lisp_text(val: EgclVal) -> String {
     unsafe { egcl_rt::object::read_simple_string(val.as_ptr()) }
 }
 
+/// FORMAT, decoding a string result to text (FORMAT NIL returns a fresh
+/// string, so results are compared by content).
+fn format_text(dest: EgclVal, control: &str, args: &[EgclVal]) -> Result<String, EgclError> {
+    format(dest, control, args).map(lisp_text)
+}
+
 fn keyword(name: &str) -> EgclVal {
     let mut h: u64 = 0x517cc1b727220a95;
     for b in name.bytes() {
@@ -99,15 +105,16 @@ fn heap_string(val: EgclVal) -> String {
 fn format_accepts_nil_and_stream_destinations_and_rejects_other_values() {
     // Per R5.156, FORMAT accepts NIL and output streams as destinations.
     let rendered = format(NIL, "Hello, ~A", &[make_lisp_string("world")]).expect("format nil");
-    assert_eq!(rendered, make_lisp_string("Hello, world"));
+    // FORMAT NIL returns a fresh string, so compare text, not identity.
+    assert_eq!(lisp_text(rendered), "Hello, world");
 
     let stream = make_string_output_stream(NIL).expect("string output stream");
     let stream_result =
         format(stream, "~D bottles", &[EgclVal::from_fixnum(3)]).expect("stream format");
     assert_eq!(stream_result, NIL);
     assert_eq!(
-        get_output_stream_string(stream).expect("stream contents"),
-        make_lisp_string("3 bottles")
+        lisp_text(get_output_stream_string(stream).expect("stream contents")),
+        "3 bottles"
     );
 
     let err = format(EgclVal::from_fixnum(7), "~A", &[]).expect_err("invalid destination");
@@ -137,17 +144,17 @@ fn format_supports_modifiers_v_and_hash_parameters_and_is_thread_safe() {
     let threads: Vec<_> = (0..8)
         .map(|i| {
             thread::spawn(move || {
-                format(NIL, "[~D]", &[EgclVal::from_fixnum(i)]).expect("concurrent format")
+                // Decode in the thread: the fresh result string is unrooted.
+                format_text(NIL, "[~D]", &[EgclVal::from_fixnum(i)]).expect("concurrent format")
             })
         })
         .collect();
-    let mut outputs = threads
+    let outputs = threads
         .into_iter()
         .map(|h| h.join().expect("thread join"))
         .collect::<Vec<_>>();
-    outputs.sort_by_key(|v| format!("{:?}", v));
     for i in 0..8 {
-        assert!(outputs.contains(&make_lisp_string(&format!("[{}]", i))));
+        assert!(outputs.contains(&format!("[{}]", i)));
     }
 }
 
@@ -157,7 +164,7 @@ fn format_exercises_recursive_conditional_iteration_and_plural_directives() {
     // and plural directives produce observable output through FORMAT.
     let recursive_args = list(&[EgclVal::from_fixnum(4), EgclVal::from_fixnum(5)]);
     assert_eq!(
-        format(
+        format_text(
             NIL,
             "~? / ~@?",
             &[
@@ -168,11 +175,11 @@ fn format_exercises_recursive_conditional_iteration_and_plural_directives() {
             ]
         )
         .expect("recursive directives"),
-        make_lisp_string("4+5 / 6")
+        "4+5 / 6"
     );
 
     assert_eq!(
-        format(
+        format_text(
             NIL,
             "~[zero~;one~;two~] ~:[no~;yes~] ~@[kept=~D~] ~{~A~^, ~} ~D item~:P",
             &[
@@ -188,7 +195,7 @@ fn format_exercises_recursive_conditional_iteration_and_plural_directives() {
             ]
         )
         .expect("conditionals and iteration"),
-        make_lisp_string("two yes kept=9 a, b, c 3 items")
+        "two yes kept=9 a, b, c 3 items"
     );
 }
 

@@ -204,7 +204,7 @@ pub fn call(args: &[EgclVal]) -> Result<EgclVal, EgclError> {
             egcl_rt::rooted!(values = Vec::<EgclVal>::new());
             for index in 0..frames.len() {
                 let text = crate::devtools::format_logical_frame(&frames[index])?;
-                values.push(crate::streams::make_lisp_string(&text));
+                values.push(crate::streams::make_lisp_string_fresh(&text));
             }
             Ok(crate::sequences::build_simple_vector(&values))
         }
