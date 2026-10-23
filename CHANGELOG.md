@@ -374,6 +374,16 @@
   loaded `lib/asdf.lisp` from the build's source tree; it now falls back to a
   copy of ASDF compiled into the binary. `EGCL_ASDF_FILE` names a different
   ASDF to load ([#573](https://github.com/atgreen/evergreen/pull/573)).
+- Strings a program produces are garbage-collected. `format nil`,
+  `get-output-stream-string`, `with-output-to-string`, `read-line` and
+  `princ-to-string` used to keep every distinct result forever, so a
+  long-running program that produced strings grew without bound, about 14 MB
+  per 100,000 short strings. These functions now return fresh strings: two
+  `read-line` results with the same text are no longer `eq`, and modifying one
+  no longer changes the other. A finalizer on a string now runs once the
+  string is unreachable, and a weak hash table now drops a dead key that had
+  survived several collections
+  ([#577](https://github.com/atgreen/evergreen/pull/577)).
 - `typep` against a `(mod n)` type handles bignums: a bignum object in range
   answered NIL, and a bignum modulus crashed the runtime
   ([#572](https://github.com/atgreen/evergreen/pull/572)).
