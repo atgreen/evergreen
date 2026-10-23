@@ -96,7 +96,7 @@
   its class, and slot type checks behave as before. A `(setf place)` writer
   installed with `(setf fdefinition)` or `defun` is now also used when a
   compiled `setf` of that place calls it by name, as `#'(setf place)` already
-  did ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  did ([#588](https://github.com/atgreen/evergreen/pull/588)).
 - A function containing `load-time-value` compiles in the running image, with
   each `load-time-value` form evaluated once when the function is compiled. It
   stayed in the interpreter and evaluated the forms on every call, so
