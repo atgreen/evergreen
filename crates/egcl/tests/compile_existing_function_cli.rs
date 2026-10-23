@@ -40,3 +40,35 @@ fn compile_compiles_an_existing_interpreted_function() {
     assert!(stdout.contains("SQ —"), "{stdout}");
     assert!(!stdout.contains("not a compiled"), "{stdout}");
 }
+
+/// `(compile nil '(lambda ...))` expands the lambda's macros during COMPILE
+/// (CLHS 3.2.2.2), not at its first call (bliss-bd6r2). The expected list is
+/// SBCL 2.6.9's.
+#[test]
+fn compile_expands_the_macros_of_a_lambda_expression() {
+    let program = r#"(progn
+      (defvar *flag* nil)
+      (defmacro setflag () (setq *flag* t) 1)
+      (let ((f (compile nil '(lambda () (setflag)))))
+        (format t "~&RESULT ~s~%"
+                (list *flag* (funcall f)
+                      (progn (setq *flag* nil) (funcall f) *flag*)
+                      (functionp f) (compiled-function-p f)
+                      (funcall (compile nil '(lambda (x &optional (y 2) &key (z 3))
+                                               "doc" (declare (ignorable x)) (list x y z)))
+                               1 5 :z 9)
+                      (progn (compile 'named-c '(lambda (n) (loop for i below n collect (setflag))))
+                             (named-c 3))
+                      (funcall (compile nil '(lambda (&rest r) (apply #'+ r))) 1 2 3)))))"#;
+    let output = Command::new(env!("CARGO_BIN_EXE_egcl"))
+        .args(["--no-init", "--eval", program])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("RESULT (T 1 NIL T T (1 5 9) (1 1 1) 6)"),
+        "{stdout}\n{stderr}"
+    );
+}

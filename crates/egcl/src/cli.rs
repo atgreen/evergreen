@@ -24104,8 +24104,22 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                         && cp(*def).0.is_symbol()
                         && sym_name(cp(*def).0) == "LAMBDA"
                     {
-                        // A lambda expression: compile it by evaluating the form.
-                        eval_form(*def, env)?
+                        // A lambda expression: compile it to bytecode, which
+                        // expands its macros now (CLHS 3.2.2.2). Evaluating the
+                        // form made a function that expanded them at its first
+                        // call (bliss-bd6r2). A body the compiler declines is
+                        // still evaluated into a function.
+                        let label = if name.is_symbol() && !name.is_nil() {
+                            sym_name(*name)
+                        } else {
+                            "<compiled lambda>".to_string()
+                        };
+                        let (_, rest) = cp(*def);
+                        let (lambda_list, body) = cp(rest);
+                        match bytecode::compile_and_reify_lambda(&label, lambda_list, body, env) {
+                            Some(function) => function,
+                            None => eval_form(*def, env)?,
+                        }
                     } else {
                         return Err(EgclError::TypeError {
                             datum: *def,
