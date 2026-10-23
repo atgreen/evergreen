@@ -7,7 +7,7 @@
 - `egcl-ext:with-locked-hash-table` is implemented. It was documented but
   undefined. It runs its body holding a recursive lock of the table's own, so
   the bodies of `with-locked-hash-table` forms on one table exclude each
-  other, as in SBCL ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  other, as in SBCL ([#547](https://github.com/atgreen/evergreen/pull/547)).
 - `EGCL-MOP` adds `method-function` (AMOP's function of `args` and
   `next-methods`, whose `call-next-method` runs those methods in turn),
   `generic-function-method-combination` and `find-method-combination` (a
