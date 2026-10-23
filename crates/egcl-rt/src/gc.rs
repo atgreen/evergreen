@@ -369,6 +369,11 @@ pub struct HeapAllocator {
     /// Configuration snapshot (region_size, tlab_size, etc.).
     region_size: usize,
     tlab_size: usize,
+    /// Bytes allocated from the current TLAB and not yet added to its
+    /// region's `live_bytes` and the heap stats. Counting them here keeps the
+    /// global heap lock off the allocation fast path; [`Self::flush_pending`]
+    /// publishes them when the TLAB retires (bliss-xyt4l).
+    pending_bytes: usize,
 }
 
 // Safety: HeapAllocator owns its TLAB and only the owning thread uses it.
@@ -402,6 +407,7 @@ impl HeapAllocator {
             },
             region_size,
             tlab_size,
+            pending_bytes: 0,
         })
     }
 
@@ -515,21 +521,50 @@ impl HeapAllocator {
     }
 
     fn retire_tlab(&mut self) {
+        self.flush_pending();
         self.publish_tlab_tail();
         self.tlab.cursor = self.tlab.limit as *mut u8;
     }
 
-    /// Update live_bytes for the nursery region that contains the TLAB
-    /// after a successful allocation of `bytes` bytes.
-    fn update_nursery_live_bytes(&self, bytes: usize) {
+    /// Count `bytes` allocated from the current TLAB. The region and the heap
+    /// stats learn of them in [`Self::flush_pending`]: taking the global heap
+    /// lock here, once per allocation, cost more than the allocation itself
+    /// and serialised allocating threads (bliss-xyt4l).
+    #[inline]
+    fn update_nursery_live_bytes(&mut self, bytes: usize) {
+        self.pending_bytes += bytes;
+    }
+
+    /// Add the pending byte count to the TLAB's nursery region and the heap
+    /// stats. Called while the TLAB's region is still the one it was carved
+    /// from: when the TLAB retires, and when stats are read.
+    pub(crate) fn flush_pending(&mut self) {
+        if self.pending_bytes == 0 {
+            return;
+        }
+        let bytes = std::mem::take(&mut self.pending_bytes);
         let mut guard = heap_state().lock().unwrap();
         if let Some(state) = guard.as_mut() {
             let idx = self.tlab.region_idx as usize;
             if idx < state.regions.len() {
-                state.regions[idx].header.live_bytes += bytes as u32;
+                let region = &mut state.regions[idx].header;
+                region.live_bytes = region.live_bytes.saturating_add(bytes as u32);
                 state.stats.bytes_allocated += bytes as u64;
                 state.stats.nursery_used += bytes as u64;
             }
+        }
+    }
+
+    /// Drop the pending count of an allocator whose nursery has since been
+    /// collected: its region was reset, so only the cumulative
+    /// `bytes_allocated` still wants the bytes.
+    fn discard_pending_after_collection(&mut self) {
+        if self.pending_bytes == 0 {
+            return;
+        }
+        let bytes = std::mem::take(&mut self.pending_bytes);
+        if let Some(state) = heap_state().lock().unwrap().as_mut() {
+            state.stats.bytes_allocated += bytes as u64;
         }
     }
 }
@@ -5879,6 +5914,9 @@ pub fn alloc_typed(body_size: usize, type_id: u8) -> Option<*mut u8> {
         }
         let epoch = GC_MOVE_EPOCH.load(Ordering::Acquire);
         if guard.as_ref().is_none_or(|(seen, _)| *seen != epoch) {
+            if let Some((_, stale)) = guard.as_mut() {
+                stale.discard_pending_after_collection();
+            }
             *guard = HeapAllocator::without_tlab()
                 .map_err(|error| note_allocation_failure(&error))
                 .ok()
@@ -7001,6 +7039,18 @@ fn install_heap_state(state: HeapState) {
 /// Query the current heap stats. Returns default (zeroed) stats if the
 /// heap has not been initialized yet.
 pub fn heap_stats() -> GcStats {
+    // This thread's allocator counts its TLAB's bytes privately; publish them
+    // so the stats include its own allocations. Other threads' counts join
+    // when their TLABs retire, at most one TLAB each. A borrowed allocator is
+    // collecting from alloc_slow, which already retired (and flushed) it.
+    let _ = T0_ALLOCATOR.try_with(|cell| {
+        if let Ok(mut guard) = cell.try_borrow_mut()
+            && let Some((epoch, allocator)) = guard.as_mut()
+            && *epoch == GC_MOVE_EPOCH.load(Ordering::Acquire)
+        {
+            allocator.flush_pending();
+        }
+    });
     let guard = heap_state().lock().unwrap();
     match &*guard {
         Some(state) => state.stats.clone(),
@@ -8222,6 +8272,7 @@ mod allocation_size_tests {
             },
             region_size: 64,
             tlab_size: 32,
+            pending_bytes: 0,
         };
         for size in [MAX_OBJECT_BODY_SIZE + 1, u32::MAX as usize, usize::MAX] {
             assert!(allocator.alloc_fast(size).is_none());
