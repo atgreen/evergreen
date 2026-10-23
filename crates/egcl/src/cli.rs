@@ -36670,7 +36670,7 @@ fn setf_function_name_symbol(name: EgclVal) -> Option<EgclVal> {
         return None;
     }
     let (head, rest) = cp(name);
-    if !(head.is_symbol() && sym_bare_name_rc(head).as_ref() == "SETF") || !rest.is_cons() {
+    if !(head.is_symbol() && sym_bare_name_rc(head).as_ref() == "SETF" && rest.is_cons()) {
         return None;
     }
     let (symbol, tail) = cp(rest);

@@ -374,7 +374,7 @@
   `compiler-macro-function` returns it. A compiler macro called on a
   `(funcall #'name ...)` form destructures the arguments after the function,
   as the standard requires
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#581](https://github.com/atgreen/evergreen/pull/581)).
 - A `let` of a variable whose name has earmuffs, such as `*x*`, is lexical
   unless the variable was proclaimed special by `defvar`, `defparameter`,
   `declaim` or a `special` declaration, as the standard requires. Every such
