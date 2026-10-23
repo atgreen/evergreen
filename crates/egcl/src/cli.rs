@@ -29005,6 +29005,30 @@ impl egcl_rt::gc::TraceHostRoots for LoopClause {
 struct LoopParser {
     toks: Vec<EgclVal>,
     pos: usize,
+    /// The (pinned) `LOOP_IT_VAR` symbol.
+    it_var: EgclVal,
+    /// `it_var` while the next clause is the first one after a conditional's
+    /// test: only that clause's operand may be the anaphor (`parse_clause`).
+    anaphor: Option<EgclVal>,
+}
+
+/// Name of the hidden variable that carries a LOOP conditional's test value
+/// to its `it` anaphor. One name serves every conditional: an anaphoric
+/// operand is always the first thing evaluated after its own conditional
+/// binds the variable, before any nested conditional can rebind it.
+const LOOP_IT_VAR: &str = "%LOOP-IT-ANAPHOR";
+
+/// The `LOOP_IT_VAR` symbol, interning it on first use. Symbols are pinned, so
+/// the result never moves; `form` is rooted across the interning allocation.
+fn loop_it_var(form: &mut EgclVal) -> EgclVal {
+    let index = match egcl_rt::symbols::find_index(LOOP_IT_VAR) {
+        Some(index) => index,
+        None => {
+            egcl_rt::rooted_ref!(_form_root = form);
+            egcl_rt::symbols::intern(LOOP_IT_VAR)
+        }
+    };
+    EgclVal::from_symbol_index(index)
 }
 
 impl LoopParser {
@@ -29112,6 +29136,19 @@ impl LoopParser {
             .peek_kw()
             .ok_or_else(|| EgclError::Internal("LOOP: expected a clause keyword".into()))?;
         self.advance();
+        // CLHS 6.1.6: within the first clause after a WHEN/IF/UNLESS test, a
+        // bare `it` (or `:it`) written as the clause's operand denotes the test
+        // value. Rewrite only that token; an `it` nested in a compound form, or
+        // in a later AND/ELSE clause, stays an ordinary variable reference.
+        if let Some(anaphor) = self.anaphor.take() {
+            if kw != "DO" && kw != "DOING" {
+                if let Some(token) = self.toks.get_mut(self.pos) {
+                    if token.is_symbol() && sym_bare_name_rc(*token).as_ref() == "IT" {
+                        *token = anaphor;
+                    }
+                }
+            }
+        }
         match kw.as_str() {
             "COLLECT" | "COLLECTING" => {
                 let e = self.read_form()?;
@@ -29166,7 +29203,9 @@ impl LoopParser {
     }
     fn parse_cond(&mut self, negate: bool) -> Result<LoopClause, EgclError> {
         let test = self.read_form()?;
+        self.anaphor = Some(self.it_var);
         let mut then = vec![self.parse_clause()?];
+        self.anaphor = None;
         while self.at_kw("AND") {
             self.advance();
             then.push(self.parse_clause()?);
@@ -29594,21 +29633,6 @@ fn loop_exec_clauses(
     Ok(())
 }
 
-/// Evaluate a LOOP clause value-form, honouring the `it` anaphor (CLHS 6.1.5):
-/// inside the selected branch of a `when`/`if`/`unless`, the bare token `it`
-/// (symbol `it` or keyword `:it` — LOOP matches anaphora by name) stands for the
-/// value of the conditional test, which the `Cond` executor has bound to the
-/// lexical variable `IT`. A nested `it` (e.g. `collect (list it)`) resolves via
-/// that same binding through the normal evaluator.
-fn loop_it_eval(expr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
-    if expr.is_symbol() && sym_bare_name_rc(expr).as_ref() == "IT" {
-        if let Some(v) = env.lookup_var("IT") {
-            return Ok(v);
-        }
-    }
-    eval_form(expr, env)
-}
-
 /// Write an `into` accumulator's running value back to its lexical variable so
 /// the loop body and `finally` see it updated each iteration (CLHS 6.1.3):
 /// `count x into foo collect foo` collects the running counts (LOOP.10.12), and
@@ -29641,7 +29665,7 @@ fn loop_exec_clause(
                 if ret.is_some() {
                     break;
                 }
-                loop_it_eval(*f, env)?;
+                eval_form(*f, env)?;
             }
         }
         LoopClause::Return(e) => {
@@ -29649,7 +29673,7 @@ fn loop_exec_clause(
             // (`loop ... return (values a b)` yields two — LOOP.15.32) and
             // bypasses any `finally` clause (CLHS 6.1.4). It unwinds the loop's
             // own block (nil or named), carried on LOOP_RETURN_TOKENS.
-            let value = loop_it_eval(*e, env)?;
+            let value = eval_form(*e, env)?;
             if let Some(token) = LOOP_RETURN_TOKENS.with(|s| s.borrow().last().cloned()) {
                 store_control_mv(&token, value, env);
                 return Err(EgclError::Internal(token));
@@ -29657,50 +29681,50 @@ fn loop_exec_clause(
             *ret = Some(value);
         }
         LoopClause::ThereIs(e) => {
-            let v = loop_it_eval(*e, env)?;
+            let v = eval_form(*e, env)?;
             if !v.is_nil() {
                 *ret = Some(v);
             }
         }
         LoopClause::Always(e) => {
             accs.bool_default.get_or_insert(T);
-            if loop_it_eval(*e, env)?.is_nil() {
+            if eval_form(*e, env)?.is_nil() {
                 *ret = Some(NIL);
             }
         }
         LoopClause::Never(e) => {
             accs.bool_default.get_or_insert(T);
-            if !loop_it_eval(*e, env)?.is_nil() {
+            if !eval_form(*e, env)?.is_nil() {
                 *ret = Some(NIL);
             }
         }
         LoopClause::Sum(e, into, _) => {
-            let v = loop_it_eval(*e, env)?;
+            let v = eval_form(*e, env)?;
             accs.sum(into.clone(), v)?;
             loop_sync_into(accs, into, env);
         }
         LoopClause::Count(e, into) => {
-            let truthy = !loop_it_eval(*e, env)?.is_nil();
+            let truthy = !eval_form(*e, env)?.is_nil();
             accs.count(into.clone(), truthy)?;
             loop_sync_into(accs, into, env);
         }
         LoopClause::Maximize(e, into) => {
-            let v = loop_it_eval(*e, env)?;
+            let v = eval_form(*e, env)?;
             accs.maximize(into.clone(), v)?;
             loop_sync_into(accs, into, env);
         }
         LoopClause::Minimize(e, into) => {
-            let v = loop_it_eval(*e, env)?;
+            let v = eval_form(*e, env)?;
             accs.minimize(into.clone(), v)?;
             loop_sync_into(accs, into, env);
         }
         LoopClause::Collect(e, into) => {
-            let v = loop_it_eval(*e, env)?;
+            let v = eval_form(*e, env)?;
             accs.collect(into.clone(), v);
             loop_sync_into(accs, into, env);
         }
         LoopClause::Append(e, into) => {
-            let v = loop_it_eval(*e, env)?;
+            let v = eval_form(*e, env)?;
             accs.append(into.clone(), v);
             loop_sync_into(accs, into, env);
         }
@@ -29723,10 +29747,10 @@ fn loop_exec_clause(
             let t = eval_form(*test, env)?;
             let take = !t.is_nil() ^ *negate;
             if take {
-                // Bind the `it` anaphor (CLHS 6.1.5) to the test value for the
-                // selected branch, so `when TEST collect it` collects TEST's
-                // value (and a nested `it` resolves through this same binding).
-                env.define_local("IT", t);
+                // Bind the hidden anaphor variable that `parse_clause`
+                // substituted for this conditional's `it` (CLHS 6.1.6). User
+                // code never names it, so an enclosing lexical IT is untouched.
+                env.define_local(LOOP_IT_VAR, t);
                 loop_exec_clauses(then, env, accs, ret, terminate)?;
             } else {
                 loop_exec_clauses(els, env, accs, ret, terminate)?;
@@ -30048,12 +30072,20 @@ fn eval_loop_extended(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError>
 }
 
 fn eval_loop_extended_body(
-    cdr: EgclVal,
+    mut cdr: EgclVal,
     env: &mut Env,
     finish_token: &str,
 ) -> Result<EgclVal, EgclError> {
+    // Intern the anaphor variable before snapshotting the clause tokens, so
+    // the parser can substitute it without allocating.
+    let it_var = loop_it_var(&mut cdr);
     let toks = list_to_vec(cdr);
-    let mut p = LoopParser { toks, pos: 0 };
+    let mut p = LoopParser {
+        toks,
+        pos: 0,
+        it_var,
+        anaphor: None,
+    };
     let mut with_bindings: Vec<(EgclVal, EgclVal)> = Vec::new();
     let mut for_clauses: Vec<ForClause> = Vec::new();
     let mut initially: Vec<EgclVal> = Vec::new();

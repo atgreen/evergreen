@@ -345,6 +345,15 @@
 
 ### Fixed
 
+- In compiled code, a LOOP's `it` now means the conditional's test value only
+  as the bare operand of the first clause after `when`, `if` or `unless`, as
+  in `when x collect it`. Before, every `it` in that branch got the test
+  value. This included an `it` inside a compound form, which hid an enclosing
+  variable named `it`, and an `it` in a later `and` or `else` clause. As a
+  result, `(loop for x in '(1 nil 2) when x collect (cons it it))` returned
+  `((1 . 1) (2 . 2))` instead of signalling an unbound-variable error, as SBCL
+  and the interpreter do
+  ([#545](https://github.com/atgreen/evergreen/pull/545)).
 - A `labels` function called from inside a `macrolet` that defines a macro of
   the same name as one of its siblings now calls that sibling, as in SBCL. It
   signalled an undefined-function error, because the function looked up its
