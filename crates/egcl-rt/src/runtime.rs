@@ -671,12 +671,34 @@ static SIGSEGV_NULL_GUARD_RECEIVED: std::sync::atomic::AtomicBool =
 static SIGSEGV_STACK_GUARD_RECEIVED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 const SIGSEGV_RECOVERY_SLOTS: usize = 128;
+
+/// A value alone on its cache line (128 bytes covers adjacent-line prefetch).
+///
+/// Each thread writes its own recovery slot on every native call and every
+/// thread reads [`PROCESS_SIGNAL_ACTIVITY`] at every poll. Packed, eight
+/// threads' slots shared a line, and the first ones shared a line with that
+/// activity word, so every native call on one thread invalidated the line all
+/// the others were polling: four allocating threads ran at about one thread's
+/// throughput (bliss-sstfj).
+#[repr(align(128))]
+struct CacheLine<T>(T);
+
+impl<T> std::ops::Deref for CacheLine<T> {
+    type Target = T;
+    #[inline]
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
 static SIGSEGV_RECOVERY_TIDS: [std::sync::atomic::AtomicUsize; SIGSEGV_RECOVERY_SLOTS] =
     [const { std::sync::atomic::AtomicUsize::new(0) }; SIGSEGV_RECOVERY_SLOTS];
-static SIGSEGV_NULL_GUARD_RECOVERY_IPS: [std::sync::atomic::AtomicUsize; SIGSEGV_RECOVERY_SLOTS] =
-    [const { std::sync::atomic::AtomicUsize::new(0) }; SIGSEGV_RECOVERY_SLOTS];
-static SIGSEGV_STACK_GUARD_RECOVERY_IPS: [std::sync::atomic::AtomicUsize; SIGSEGV_RECOVERY_SLOTS] =
-    [const { std::sync::atomic::AtomicUsize::new(0) }; SIGSEGV_RECOVERY_SLOTS];
+static SIGSEGV_NULL_GUARD_RECOVERY_IPS: [CacheLine<std::sync::atomic::AtomicUsize>;
+    SIGSEGV_RECOVERY_SLOTS] =
+    [const { CacheLine(std::sync::atomic::AtomicUsize::new(0)) }; SIGSEGV_RECOVERY_SLOTS];
+static SIGSEGV_STACK_GUARD_RECOVERY_IPS: [CacheLine<std::sync::atomic::AtomicUsize>;
+    SIGSEGV_RECOVERY_SLOTS] =
+    [const { CacheLine(std::sync::atomic::AtomicUsize::new(0)) }; SIGSEGV_RECOVERY_SLOTS];
 /// Per-thread delivery of the two recoverable SIGSEGV kinds, parallel to the
 /// recovery-IP slots above.
 ///
@@ -686,10 +708,12 @@ static SIGSEGV_STACK_GUARD_RECOVERY_IPS: [std::sync::atomic::AtomicUsize; SIGSEG
 /// instead of signalling. A stack overflow in one thread could be swallowed by
 /// another (egcl-2mqf). The globals remain as a fallback for threads that never
 /// armed recovery and therefore own no slot.
-static SIGSEGV_STACK_GUARD_RECEIVED_SLOTS: [std::sync::atomic::AtomicBool; SIGSEGV_RECOVERY_SLOTS] =
-    [const { std::sync::atomic::AtomicBool::new(false) }; SIGSEGV_RECOVERY_SLOTS];
-static SIGSEGV_NULL_GUARD_RECEIVED_SLOTS: [std::sync::atomic::AtomicBool; SIGSEGV_RECOVERY_SLOTS] =
-    [const { std::sync::atomic::AtomicBool::new(false) }; SIGSEGV_RECOVERY_SLOTS];
+static SIGSEGV_STACK_GUARD_RECEIVED_SLOTS: [CacheLine<std::sync::atomic::AtomicBool>;
+    SIGSEGV_RECOVERY_SLOTS] =
+    [const { CacheLine(std::sync::atomic::AtomicBool::new(false)) }; SIGSEGV_RECOVERY_SLOTS];
+static SIGSEGV_NULL_GUARD_RECEIVED_SLOTS: [CacheLine<std::sync::atomic::AtomicBool>;
+    SIGSEGV_RECOVERY_SLOTS] =
+    [const { CacheLine(std::sync::atomic::AtomicBool::new(false)) }; SIGSEGV_RECOVERY_SLOTS];
 const SIGSEGV_STACK_GUARD_SLOTS: usize = 128;
 struct StackGuardChunk {
     addresses: [std::sync::atomic::AtomicUsize; SIGSEGV_STACK_GUARD_SLOTS],
@@ -811,7 +835,9 @@ pub fn classify_sigsegv_address(addr: usize) -> SigsegvFaultKind {
 /// A's `run_native` returned a value where it should have signalled
 /// STACK-OVERFLOW (egcl-2mqf). Each thread now compares against the last count
 /// it drained, so no thread can consume another's notification.
-static PROCESS_SIGNAL_ACTIVITY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// On its own cache line: every thread reads it at every poll (bliss-sstfj).
+static PROCESS_SIGNAL_ACTIVITY: CacheLine<std::sync::atomic::AtomicU64> =
+    CacheLine(std::sync::atomic::AtomicU64::new(0));
 
 thread_local! {
     /// Arrival count this thread has already drained.
@@ -830,7 +856,7 @@ pub fn mark_process_signal_activity() {
 /// by writing this word. Compare against `current_seen_signal_activity()` from
 /// the same carrier, refreshing that copied value after carrier migration.
 pub fn process_signal_activity_address() -> *const std::sync::atomic::AtomicU64 {
-    std::ptr::addr_of!(PROCESS_SIGNAL_ACTIVITY)
+    std::ptr::addr_of!(PROCESS_SIGNAL_ACTIVITY.0)
 }
 
 /// Copy this carrier's acknowledged epoch without draining or acknowledging it.

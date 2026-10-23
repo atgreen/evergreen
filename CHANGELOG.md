@@ -363,6 +363,12 @@
 
 ### Fixed
 
+- Allocation no longer takes the global heap lock on every object: each
+  thread counts its allocations privately and publishes them when its
+  allocation buffer is retired. A cons-heavy loop runs about 20% faster, and
+  threads that allocate no longer serialise on that lock or on a cache line
+  shared between the signal-activity word and per-thread recovery slots
+  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
 - `(make-pathname :directory '(:relative))` keeps its `(:relative)`
   directory instead of turning it into NIL, so as a `pathname-match-p`
   wildcard it no longer matches every directory
