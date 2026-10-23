@@ -1792,7 +1792,11 @@ fn sandbox_cpu_timeout_is_catchable_timeout_condition() {
         .spawn()
         .expect("spawn egcl sandbox timeout check");
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    // The 25 ms CPU budget, not this deadline, is what is under test: without
+    // the timeout the loop never ends, so any generous bound detects that. The
+    // deadline also covers process startup, which alone took ~2 s of wall time
+    // on a loaded host and made a 2 s bound fail spuriously (bliss-r1xyv).
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
         if let Some(status) = child.try_wait().expect("poll egcl timeout child") {
             let output = child
@@ -1819,7 +1823,7 @@ fn sandbox_cpu_timeout_is_catchable_timeout_condition() {
             let _ = child.kill();
             let output = child.wait_with_output().expect("collect killed child");
             panic!(
-                "sandbox runaway loop was not interrupted within 2s; stdout={} stderr={}",
+                "sandbox runaway loop was not interrupted within 30s; stdout={} stderr={}",
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
