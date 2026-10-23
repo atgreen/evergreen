@@ -14,7 +14,11 @@ pub enum Sexp {
 }
 
 fn arb_symbol_name() -> impl Strategy<Value = String> {
-    "[A-Z][A-Z0-9-]{0,7}".prop_map(|name| name.to_string())
+    // The symbol named NIL reads as NIL, which Sexp::Nil already generates;
+    // as a Sexp::Symbol it cannot round-trip (bliss-stz9).
+    "[A-Z][A-Z0-9-]{0,7}"
+        .prop_filter("NIL reads as Sexp::Nil", |name| name != "NIL")
+        .prop_map(|name| name.to_string())
 }
 
 fn arb_string_atom() -> impl Strategy<Value = String> {
