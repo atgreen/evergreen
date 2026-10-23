@@ -92,7 +92,7 @@
   each `load-time-value` form evaluated once when the function is compiled. It
   stayed in the interpreter and evaluated the forms on every call, so
   CL-UNICODE rebuilt a literal cl-ppcre scanner per call
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#566](https://github.com/atgreen/evergreen/pull/566)).
 - On x86-64 Linux, a hot function that calls a small helper that can
   deoptimize, such as `(defun pick (x y) (car y))`, now reaches the
   optimizing T2 tier. Inlining the helper used to make T2 refuse the caller,
