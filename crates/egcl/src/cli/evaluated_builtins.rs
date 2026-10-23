@@ -2789,10 +2789,10 @@ fn resolve(name: &str) -> Option<Handler> {
             let sym = args.first().copied().unwrap_or(NIL);
             let val = args.get(1).copied().unwrap_or(NIL);
             if !sym.is_symbol() {
-                return Err(EgclError::Internal(format!(
-                    "SET-SYMBOL-FUNCTION: expected a symbol, got {}",
-                    format_val(sym)
-                )));
+                return Err(EgclError::TypeError {
+                    datum: sym,
+                    expected: "SYMBOL".to_string(),
+                });
             }
             let fnval = coerce_installed_function(env, val);
             egcl_rt::symbols::set_symbol_function(sym.as_symbol_index(), fnval);
