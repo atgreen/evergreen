@@ -20166,6 +20166,8 @@ fn eval_atomic_update_form(
     let delta_form = forms.get(1).copied();
 
     if place.is_symbol() {
+        // As for %ATOMIC-UPDATE-SYMBOL: NIL and T have no cell (bliss-6rl1j).
+        reject_assignment_to_constant(place)?;
         egcl_rt::rooted!(delta = match delta_form {
             Some(form) => eval_form(form, env)?,
             None => EgclVal::from_fixnum(1),
@@ -21758,6 +21760,9 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                         expected: "SYMBOL".to_string(),
                     });
                 }
+                // A constant cannot be made unbound: (makunbound 'pi) left PI
+                // unbound (bliss-6rl1j).
+                reject_assignment_to_constant(sym)?;
                 if let Some(idx) = sym.symbol_index() {
                     egcl_rt::symbols::set_symbol_value(idx, egcl_rt::value::UNBOUND);
                 }
