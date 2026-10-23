@@ -9034,6 +9034,35 @@ fn format_fixed_float_directive() {
     }
 }
 
+/// Regression (issue #533): ~wF with no d picks fraction digits to fill the
+/// width with no trailing zeros, so a value a hair off a short decimal prints
+/// like the decimal ("  -112.4", not "-112.400"), as in SBCL. cl-pdf writes
+/// path coordinates this way.
+#[test]
+fn format_fixed_width_drops_trailing_fraction_zeros() {
+    let cases = [
+        ("(format nil \"~8F\" -112.400000000001d0)", "\"  -112.4\""),
+        ("(format nil \"~8F\" -81.1999999999999d0)", "\"   -81.2\""),
+        ("(format nil \"~8F\" 97.400000000001d0)", "\"    97.4\""),
+        ("(format nil \"~8F\" 22.095000000000997d0)", "\"  22.095\""),
+        ("(format nil \"~8F\" -112.399994)", "\"  -112.4\""),
+        ("(format nil \"~4F\" 9.9999999d0)", "\"10.0\""),
+        ("(format nil \"~8,3F\" -112.400000000001d0)", "\"-112.400\""),
+    ];
+    for (expr, expected) in cases {
+        let out = egcl_bin()
+            .args(["--eval", expr])
+            .output()
+            .expect("run egcl");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains(expected),
+            "{expr} => expected {expected}, got: {stdout}"
+        );
+    }
+}
+
 /// Regression: FORMAT ~D honors its 3rd/4th params (comma character and comma
 /// interval); previously both were ignored and it always grouped by 3 with ','.
 /// (bliss-ycv8)

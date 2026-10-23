@@ -3075,7 +3075,16 @@ fn format_impl(
                     (_, Some(dd)) => fixed_digits(dd),
                     (Some(w), None) => {
                         let room = (w as i64 - sign.len() as i64 - int_len as i64 - 1).max(0) as usize;
-                        fixed_digits(room.min(shortest_frac.max(1)))
+                        // Rounding a value just off a short decimal to the
+                        // room can leave zeros (-112.400000000001 -> "112.400");
+                        // the width-chosen fraction has no trailing zero digits
+                        // (CLHS 22.3.3.1), though it keeps one ("10.0").
+                        let mut t = fixed_digits(room.min(shortest_frac.max(1)));
+                        if let Some(dot) = t.find('.') {
+                            let keep = t.trim_end_matches('0').len().max(dot + 2).min(t.len());
+                            t.truncate(keep);
+                        }
+                        t
                     }
                     (None, None) => {
                         let mut t = shortest_abs.clone();
