@@ -365,7 +365,7 @@
 
 - `(setf (symbol-function x) f)` signals a `type-error` when `x` is not a
   symbol, as the standard requires. It signalled a `simple-error`
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#575](https://github.com/atgreen/evergreen/pull/575)).
 - `(require :asdf)` works on machines other than the one that built egcl. It
   loaded `lib/asdf.lisp` from the build's source tree; it now falls back to a
   copy of ASDF compiled into the binary. `EGCL_ASDF_FILE` names a different
