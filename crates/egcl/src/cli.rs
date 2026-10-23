@@ -31226,8 +31226,9 @@ fn gc_alloc_obj(total_size: usize, type_id: u8) -> *mut u8 {
     match egcl_rt::gc::alloc_typed(body_size, type_id) {
         // SAFETY: alloc_typed returns a pointer past an 8-byte header.
         Some(body) => unsafe { body.sub(hdr) },
-        None => std::alloc::handle_alloc_error(
-            std::alloc::Layout::from_size_align(total_size.max(hdr), hdr).unwrap(),
+        None => panic!(
+            "{}",
+            egcl_rt::gc::allocation_failure_message(&format!("a {total_size}-byte object"))
         ),
     }
 }

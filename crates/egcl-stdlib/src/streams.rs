@@ -2562,7 +2562,7 @@ fn alloc_stream(
     // unreachable — closing the fd and warning if it was an unclosed file
     // stream (R5.121, egcl-jtc.7a).
     let body = egcl_rt::gc::alloc_typed(8, type_id::STREAM)
-        .expect("GC heap unavailable for stream handle");
+        .unwrap_or_else(|| panic!("{}", egcl_rt::gc::allocation_failure_message("stream handle")));
     // The handle is now the traceable owner. Publish any component forwarding
     // performed while it was being allocated before exposing the handle.
     for (component, root) in boxed.components.iter_mut().zip(component_roots.iter()) {
