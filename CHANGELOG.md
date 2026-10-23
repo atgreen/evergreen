@@ -363,6 +363,16 @@
 
 ### Fixed
 
+- Character case follows Unicode instead of covering ASCII only.
+  `char-upcase`, `char-downcase`, `upper-case-p`, `lower-case-p`,
+  `both-case-p`, the `string-upcase`, `string-downcase` and
+  `string-capitalize` families, `char-equal` and `string-equal` and their
+  ordering relatives, `equalp`, `equalp` hash tables and the `~(` format
+  directive all agree, as in SBCL: `(char-upcase #\é)` is `#\É` and
+  `(string-upcase "ö")` is `"Ö"`. A character has case only when its mapping
+  is one-to-one, so `#\ß`, whose uppercase is two characters, is returned
+  unchanged, and `~:@(` no longer turns `"straße"` into `"STRASSE"`
+  ([#570](https://github.com/atgreen/evergreen/pull/570)).
 - `apply` signals a `type-error` when its last argument is not a proper list;
   `(apply #'list 1 2)` returned `(1)`. `(/= #c(1 2))` returns T instead of
   signalling. `defpackage` signals a `package-error` for `:import-from` a

@@ -1990,12 +1990,16 @@ Returns NIL."
 ;; EQ. A defun here would SHADOW the builtin (the function cell wins over the
 ;; operator-position arm), so this must stay a comment, not a definition.
 
-(defun upper-case-p (c) (and (>= (char-code c) 65) (<= (char-code c) 90)))
-(defun lower-case-p (c) (and (>= (char-code c) 97) (<= (char-code c) 122)))
-;; CHAR-UPCASE / CHAR-DOWNCASE are Rust builtins (bliss-7oa5). The definitions
-;; here did ASCII +/-32 arithmetic, which was both slow (three builtin
-;; dispatches per call, 16us) and wrong for every non-ASCII cased character;
-;; the builtin uses the real Unicode 1:1 mapping.
+;; CHAR-UPCASE / CHAR-DOWNCASE are Rust builtins (bliss-7oa5) using the
+;; Unicode 1:1 case mapping in egcl-stdlib::characters. The case predicates are
+;; DEFINED from those conversions rather than restating a rule of their own, so
+;; the ansi CHAR-UPCASE.2 / CHAR-DOWNCASE.2 invariant -- a character the
+;; conversion changes is one the predicate classifies -- holds by construction
+;; for every code point (bliss-ne14). CHAR-DOWNCASE also type-checks C.
+(defun upper-case-p (c) (char/= (char-downcase c) c))
+(defun lower-case-p (c) (char/= (char-upcase c) c))
+;; Every character with case is a letter, but not the reverse: uncased letters
+;; (U+00DF, CJK) are still missing here, a known gap.
 (defun alpha-char-p (c) (or (upper-case-p c) (lower-case-p c)))
 (defun digit-char-p (c &optional (radix 10))
   ;; Weight of C as a digit in RADIX (0-9, then A-Z / a-z = 10-35), or NIL.

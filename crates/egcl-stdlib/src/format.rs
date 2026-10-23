@@ -3854,14 +3854,17 @@ fn format_impl(
                 i = skip_close_directive(&chars, body_end);
                 let mut inner = String::new();
                 format_impl(&body, args, arg_idx, &mut inner)?;
+                // Character by character with the CHAR-UPCASE/CHAR-DOWNCASE
+                // mapping, as STRING-UPCASE does: Rust's string case mapping
+                // is not 1:1 ("ß" would upcase to "SS"). bliss-ne14.
                 if colon && at_sign {
-                    output.push_str(&inner.to_uppercase());
+                    output.extend(inner.chars().map(crate::characters::char_upcase));
                 } else if colon {
                     output.push_str(&capitalize_words(&inner));
                 } else if at_sign {
                     output.push_str(&capitalize_first(&inner));
                 } else {
-                    output.push_str(&inner.to_lowercase());
+                    output.extend(inner.chars().map(crate::characters::char_downcase));
                 }
             }
             ')' => {
@@ -4493,10 +4496,10 @@ fn capitalize_words(s: &str) -> String {
             result.push(c);
             cap_next = true;
         } else if cap_next {
-            result.push(c.to_uppercase().next().unwrap());
+            result.push(crate::characters::char_upcase(c));
             cap_next = false;
         } else {
-            result.push(c.to_lowercase().next().unwrap());
+            result.push(crate::characters::char_downcase(c));
         }
     }
     result
@@ -4507,10 +4510,10 @@ fn capitalize_first(s: &str) -> String {
     let mut done = false;
     for c in s.chars() {
         if !done && c.is_alphabetic() {
-            result.push(c.to_uppercase().next().unwrap());
+            result.push(crate::characters::char_upcase(c));
             done = true;
         } else if done {
-            result.push(c.to_lowercase().next().unwrap());
+            result.push(crate::characters::char_downcase(c));
         } else {
             result.push(c);
         }

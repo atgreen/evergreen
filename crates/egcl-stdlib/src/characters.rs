@@ -35,8 +35,8 @@ pub enum CharKey {
     /// CHAR-UPCASE -- fold UP, not down. The two differ for characters whose
     /// up- and down-case mappings are not symmetric, so the direction matters.
     ///
-    /// Folds with the SAME ASCII rule `convert_case` uses; see the note there
-    /// on why this is not Unicode-aware.
+    /// Folds with [`char_upcase`], the same Unicode 1:1 mapping CHAR-UPCASE
+    /// uses, so the two always agree.
     Folded,
 }
 
@@ -69,7 +69,7 @@ fn char_key(v: EgclVal, key: CharKey) -> Result<u32, CharCmpError> {
     let c = v.as_char();
     Ok(match key {
         CharKey::Exact => c as u32,
-        CharKey::Folded => ascii_upcase(c) as u32,
+        CharKey::Folded => char_upcase(c) as u32,
     })
 }
 
@@ -131,49 +131,186 @@ pub fn compare2(
     Ok(ordered(ka, kb, cmp))
 }
 
-/// ASCII-only case mapping, matching UPPER-CASE-P / LOWER-CASE-P.
-///
-/// Deliberately NOT Unicode. CLHS ties CHAR-UPCASE to which characters HAVE
-/// case, and in egcl that is decided by UPPER-CASE-P / LOWER-CASE-P, which are
-/// boot.lisp defuns testing the ASCII ranges only. Using Rust's Unicode mapping
-/// here made the two disagree: for a character like U+00E9, LOWER-CASE-P said
-/// NIL while CHAR-UPCASE still changed it, breaking the ansi CHAR-UPCASE.2
-/// invariant `(or (lower-case-p x) (eql (char-upcase x) x))` over all 65536
-/// code points -- CHAR-UPCASE.2 / CHAR-DOWNCASE.2.
-///
-/// Making the whole case system Unicode-aware is a real improvement, but it is
-/// a semantics change that belongs with UPPER-CASE-P/LOWER-CASE-P/BOTH-CASE-P,
-/// not smuggled in with a perf fix. Tracked separately.
+/// The one character `it` yields, or `None` when it yields none or several.
 #[inline]
-fn ascii_upcase(c: char) -> char {
-    if c.is_ascii_lowercase() {
-        ((c as u8) - 32) as char
+fn single(mut it: impl Iterator<Item = char>) -> Option<char> {
+    let c = it.next()?;
+    if it.next().is_some() {
+        None
     } else {
-        c
+        Some(c)
     }
 }
 
+/// Characters Unicode gives case mappings to that are not letters: the Roman
+/// numerals (U+2160..U+217F, category Nl) and the circled Latin letters
+/// (U+24B6..U+24E9, category So). CLHS 13.1.4.3 makes the characters with case
+/// a subset of the alphabetic characters, and SBCL treats both blocks as
+/// having no case, so they are excluded here too. Each block holds both
+/// members of every pair, so excluding them keeps the mapping symmetric.
 #[inline]
-fn ascii_downcase(c: char) -> char {
-    if c.is_ascii_uppercase() {
-        ((c as u8) + 32) as char
-    } else {
-        c
+fn non_letter_with_case(c: char) -> bool {
+    matches!(c as u32, 0x2160..=0x217F | 0x24B6..=0x24E9)
+}
+
+/// `CHAR-UPCASE` on a Rust `char`: the Unicode simple uppercase mapping of a
+/// lowercase character with case, or `c` itself.
+///
+/// CLHS 13.1.4.3 requires a character with case to map one-to-one onto its
+/// counterpart, so a mapping is used only when it yields exactly one
+/// character AND that character's lowercase mapping is `c` again. That rules
+/// out U+00DF (sharp s, whose uppercase is "SS"), U+00B5 (micro sign, whose
+/// uppercase U+039C lowercases to U+03BC), U+0131 (dotless i, uppercased to an
+/// I that lowercases to i) and the titlecase digraphs such as U+01C5. All of
+/// those have no case and are returned unchanged.
+///
+/// UPPER-CASE-P, LOWER-CASE-P, BOTH-CASE-P, the CHAR-EQUAL family, EQUALP and
+/// the string case operators are all defined from this function and
+/// [`char_downcase`], so they cannot disagree: ansi CHAR-UPCASE.2 /
+/// CHAR-DOWNCASE.2 check exactly that over every code point (bliss-ne14).
+#[inline]
+pub fn char_upcase(c: char) -> char {
+    if c.is_ascii() {
+        return c.to_ascii_uppercase();
     }
+    match single(c.to_uppercase()) {
+        Some(u) if u != c && single(u.to_lowercase()) == Some(c) && !non_letter_with_case(c) => u,
+        _ => c,
+    }
+}
+
+/// `CHAR-DOWNCASE` on a Rust `char`; the mirror image of [`char_upcase`].
+#[inline]
+pub fn char_downcase(c: char) -> char {
+    if c.is_ascii() {
+        return c.to_ascii_lowercase();
+    }
+    match single(c.to_lowercase()) {
+        Some(l) if l != c && single(l.to_uppercase()) == Some(c) && !non_letter_with_case(c) => l,
+        _ => c,
+    }
+}
+
+/// `UPPER-CASE-P`: `c` has case and is the uppercase member of its pair.
+#[inline]
+pub fn upper_case_p(c: char) -> bool {
+    char_downcase(c) != c
+}
+
+/// `LOWER-CASE-P`: `c` has case and is the lowercase member of its pair.
+#[inline]
+pub fn lower_case_p(c: char) -> bool {
+    char_upcase(c) != c
+}
+
+/// `BOTH-CASE-P`: `c` is a character with case.
+#[inline]
+pub fn both_case_p(c: char) -> bool {
+    upper_case_p(c) || lower_case_p(c)
+}
+
+/// `CHAR-EQUAL` on two Rust `char`s: equal after folding both up.
+#[inline]
+pub fn char_equal(a: char, b: char) -> bool {
+    a == b || char_upcase(a) == char_upcase(b)
 }
 
 /// `CHAR-UPCASE` / `CHAR-DOWNCASE`.
 ///
 /// CLHS: a character with no case, or already in the requested case, is
-/// returned unchanged. ASCII-only, for the reason on `ascii_upcase`.
+/// returned unchanged. See [`char_upcase`] for which characters have case.
 pub fn convert_case(v: EgclVal, up: bool) -> Result<EgclVal, CharCmpError> {
     if !v.is_character() {
         return Err(CharCmpError::NotACharacter(v));
     }
     let c = v.as_char();
     Ok(EgclVal::from_char(if up {
-        ascii_upcase(c)
+        char_upcase(c)
     } else {
-        ascii_downcase(c)
+        char_downcase(c)
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ch(code: u32) -> char {
+        char::from_u32(code).unwrap()
+    }
+
+    /// Spot values produced by SBCL (bliss-ne14).
+    #[test]
+    fn case_mapping_matches_sbcl() {
+        // (char-upcase e-acute) => E-acute and back; Greek and Cyrillic pairs.
+        assert_eq!(char_upcase(ch(0xE9)), ch(0xC9));
+        assert_eq!(char_downcase(ch(0xC9)), ch(0xE9));
+        assert_eq!(char_upcase(ch(0xFF)), ch(0x178));
+        assert_eq!(char_upcase('ω'), 'Ω');
+        assert_eq!(char_downcase('Ж'), 'ж');
+        assert!(lower_case_p(ch(0xE9)) && !upper_case_p(ch(0xE9)));
+        assert!(upper_case_p(ch(0xC9)) && !lower_case_p(ch(0xC9)));
+        assert!(char_equal(ch(0xE9), ch(0xC9)));
+        // No 1:1 counterpart, so no case: sharp s, micro sign, dotless i,
+        // dotted capital I, Kelvin sign, Roman numerals, circled letters.
+        for code in [
+            0xDF, 0xB5, 0x131, 0x130, 0x212A, 0x2160, 0x2170, 0x24B6, 0x24D0,
+        ] {
+            let c = ch(code);
+            assert_eq!(char_upcase(c), c, "{code:#x}");
+            assert_eq!(char_downcase(c), c, "{code:#x}");
+            assert!(!both_case_p(c), "{code:#x}");
+        }
+        assert!(!char_equal(ch(0xDF), 'S'));
+        assert!(!char_equal(ch(0x212A), 'k'));
+        // Uncased characters are untouched.
+        for c in ['1', ' ', '漢', '-'] {
+            assert_eq!(char_upcase(c), c);
+            assert!(!both_case_p(c));
+        }
+    }
+
+    /// The titlecase digraphs (U+01C5 and friends) have no 1:1 counterpart:
+    /// upcasing and downcasing lead to two different characters. SBCL maps
+    /// them anyway and calls them BOTH-CASE-P while neither UPPER- nor
+    /// LOWER-CASE-P, which breaks the ansi CHAR-UPCASE.2 invariant; egcl
+    /// gives them no case.
+    #[test]
+    fn titlecase_digraphs_have_no_case() {
+        for code in [0x1C5, 0x1C8, 0x1CB, 0x1F2] {
+            let c = ch(code);
+            assert_eq!(char_upcase(c), c, "{code:#x}");
+            assert_eq!(char_downcase(c), c, "{code:#x}");
+        }
+    }
+
+    /// The CLHS 13.1.4.3 contract over every code point: the mapping is a
+    /// bijection between the upper- and lowercase characters, and the
+    /// predicates agree with the conversions.
+    #[test]
+    fn case_mapping_is_one_to_one_everywhere() {
+        let mut lower = 0;
+        for code in 0..=0x10FFFFu32 {
+            let Some(c) = char::from_u32(code) else {
+                continue;
+            };
+            let (u, d) = (char_upcase(c), char_downcase(c));
+            assert!(!(upper_case_p(c) && lower_case_p(c)), "{code:#x}");
+            assert_eq!(char_upcase(u), u, "{code:#x}");
+            assert_eq!(char_downcase(d), d, "{code:#x}");
+            assert!(char_equal(u, d), "{code:#x}");
+            if lower_case_p(c) {
+                lower += 1;
+                assert!(upper_case_p(u), "{code:#x}");
+                assert_eq!(char_downcase(u), c, "{code:#x}");
+            }
+            if upper_case_p(c) {
+                assert!(lower_case_p(d), "{code:#x}");
+                assert_eq!(char_upcase(d), c, "{code:#x}");
+            }
+        }
+        // SBCL counts 1,354 lowercase characters under its Unicode version;
+        // later Unicode versions only add pairs.
+        assert!(lower >= 1354, "{lower}");
+    }
 }
