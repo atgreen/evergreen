@@ -358,6 +358,12 @@
 
 ### Fixed
 
+- `compile-file` no longer installs a file's `defgeneric` and `defmethod`
+  forms while compiling it, as SBCL does not; they take effect when the fasl
+  is loaded. A method compiled into the running image could run before the
+  rest of its file had loaded: ASDF-FLV's `asdf:perform :around` method found
+  its own `defvar` unbound, which stopped pure-tls's tests from loading
+  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
 - `egcl --load FILE` no longer leaves stale heap pointers in the top-level
   environment when a garbage collection runs while the load is starting.
   Under `EGCL_GC_VERIFY` with `EGCL_GC_STRESS`, every `--load` failed

@@ -14484,6 +14484,12 @@ fn compile_file_in_package_name(form: EgclVal) -> Option<String> {
 ///
 /// SETQ and SETF were on this list too and are gone with it: an assignment has
 /// no compile-time semantics.
+///
+/// So are DEFGENERIC and DEFMETHOD (bliss-459lt): CLHS gives them no
+/// compile-time effect, and installing a method while compiling changed the
+/// running image. ASDF-FLV defines an ASDF:PERFORM :AROUND method next to the
+/// DEFVAR it reads; compiled first, that method ran for the very next load
+/// operation, before the DEFVAR had been loaded, and found it unbound.
 fn compile_toplevel_form_has_effect(form: EgclVal, env: &Env) -> bool {
     if !form.is_cons() {
         return false;
@@ -14506,8 +14512,6 @@ fn compile_toplevel_form_has_effect(form: EgclVal, env: &Env) -> bool {
             | "GET-SETF-EXPANSION"
             | "DEFCLASS"
             | "DEFSTRUCT"
-            | "DEFGENERIC"
-            | "DEFMETHOD"
             | "DEFPACKAGE"
             | "DEFINE-PACKAGE"
             | "IN-PACKAGE"
