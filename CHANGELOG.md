@@ -358,6 +358,9 @@
 
 ### Fixed
 
+- Sandbox mode refuses `egcl::%socket-listen` and `egcl::%socket-accept`, as
+  it already refused `egcl::%socket-connect`. A sandboxed program could open a
+  listening socket ([#560](https://github.com/atgreen/evergreen/pull/560)).
 - `(compile nil '(lambda ...))` and `(compile 'name '(lambda ...))` compile
   the lambda expression to bytecode, expanding its macros during `compile`.
   The result expanded them at its first call, so a macro with a compile-time

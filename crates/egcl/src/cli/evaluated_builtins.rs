@@ -1255,7 +1255,12 @@ fn resolve(name: &str) -> Option<Handler> {
                 .unwrap_or(NIL))
         }),
 
-        "EGCL::%SOCKET-LISTEN" => Some(|_operator, args, _env| {
+        "EGCL::%SOCKET-LISTEN" => Some(|_operator, args, env| {
+            // Sandbox mode denies network access: a listener is refused before
+            // it binds, as %SOCKET-CONNECT refuses a connection (bliss-hyw5y).
+            if env.sandbox {
+                return Err(EgclError::SandboxViolation("network access denied".into()));
+            }
             let args = RootedVals::new(args.to_vec());
 
             // (%socket-listen &optional host port backlog reuse-address) → listener-id
@@ -1472,7 +1477,10 @@ fn resolve(name: &str) -> Option<Handler> {
             egcl_stdlib::streams::socket_stream_peer_name(args[0])
         }),
 
-        "EGCL::%SOCKET-ACCEPT" => Some(|_operator, args, _env| {
+        "EGCL::%SOCKET-ACCEPT" => Some(|_operator, args, env| {
+            if env.sandbox {
+                return Err(EgclError::SandboxViolation("network access denied".into()));
+            }
             let args = RootedVals::new(args.to_vec());
 
             // (%socket-accept listener-id) → connection stream (blocks)
