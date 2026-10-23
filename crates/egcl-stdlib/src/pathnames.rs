@@ -1082,7 +1082,7 @@ pub fn parse_namestring(
     if egcl_rt::types::streamp(thing) {
         // The opening path survives CLOSE. Copy the Rust-owned string before
         // constructing a pathname, so no stream borrow spans Lisp allocation.
-        let opening_path = crate::streams::file_namestring(thing)?;
+        let opening_path = crate::streams::opening_namestring(thing)?;
         let parsed = parse_namestring_model(&opening_path, None)?;
         if let Some(requested) = host.filter(|value| *value != NIL) {
             let requested = component_string(requested);
@@ -2081,6 +2081,15 @@ pub fn translated_physical(val: EgclVal) -> Result<Option<EgclVal>, EgclError> {
     }
     let logical = make_record_value(build_record_from_namestring(parsed, None));
     translate_logical_pathname(logical).map(Some)
+}
+
+/// The namestring of VAL when it is a logical pathname, else None. Pure Rust
+/// text: it allocates nothing on the Lisp heap.
+pub(crate) fn logical_namestring_of(val: EgclVal) -> Option<String> {
+    let rec = get_record(val)?;
+    rec.parsed
+        .is_logical
+        .then(|| record_namestring(&rec).into_owned())
 }
 
 pub(crate) fn extract_path_string(val: EgclVal) -> Result<String, EgclError> {

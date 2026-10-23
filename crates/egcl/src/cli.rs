@@ -25702,8 +25702,15 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 if is_string_value(norm) {
                     return egcl_stdlib::logical_pathname_from_string(&val_as_str(norm));
                 }
-                // Streams and every other value: egcl has no logical-pathname
-                // streams, so this is a TYPE-ERROR.
+                // A file stream designates the pathname OPEN was given, which
+                // is logical when the file was opened through a logical
+                // pathname (bliss-ssc6w).
+                if egcl_rt::types::streamp(thing)
+                    && let Ok((pathname, _)) = egcl_stdlib::parse_namestring(thing, None, None)
+                    && egcl_stdlib::is_logical_pathname(pathname)
+                {
+                    return Ok(pathname);
+                }
                 return Err(EgclError::TypeError {
                     datum: thing,
                     expected: "logical pathname, string, or stream".to_string(),
