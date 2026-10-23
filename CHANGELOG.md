@@ -345,6 +345,11 @@
 
 ### Fixed
 
+- `typep` with an `or`, `and` or `complex` type specifier whose earlier part
+  runs a `satisfies` predicate or `deftype` expander that allocates now tests
+  the later parts correctly. A collection during the earlier test could leave
+  the later parts read from moved memory, and the test answered wrongly
+  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
 - A `defun` that `compile-file` keeps as source, such as one whose body
   contains a `defclass`, `defmethod` or `defmacro`, has its macros expanded at
   compile time. Loading the fasl expanded them again, where
