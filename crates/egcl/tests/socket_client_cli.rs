@@ -7,10 +7,13 @@ use std::net::TcpListener;
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
-// Stress + verification scans the heap at every bootstrap allocation. A
-// startup-only probe took 355s on the development host, before any socket I/O.
-// Allow bootstrap headroom while retaining the peer's separate 10s deadlines.
-const STRESS_TIMEOUT_SECONDS: u64 = 600;
+// Stress + verification would scan the heap at every bootstrap allocation: a
+// startup-only probe took 355s on an idle development host, before any socket
+// I/O, and a loaded host ran out the old 600s budget (bliss-qiomv). Stressing
+// from the first --eval form (EGCL_GC_STRESS_AFTER_INIT) keeps the socket
+// exchange under stress and verification without stressing the bootstrap. The
+// peer keeps its separate 10s deadlines.
+const STRESS_TIMEOUT_SECONDS: u64 = 300;
 
 fn run(form: &str, extra: &[&str], stress: bool) -> Output {
     let mut command = Command::new("timeout");
@@ -23,6 +26,7 @@ fn run(form: &str, extra: &[&str], stress: bool) -> Output {
     if stress {
         command
             .env("EGCL_GC_STRESS", "1")
+            .env("EGCL_GC_STRESS_AFTER_INIT", "1")
             .env("EGCL_GC_POISON", "1")
             .env("EGCL_GC_VERIFY", "1");
     }
