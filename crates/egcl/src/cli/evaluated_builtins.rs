@@ -1657,7 +1657,11 @@ fn resolve(name: &str) -> Option<Handler> {
             if s.is_symbol() {
                 let name = sym_name(s);
                 let bare = symbol_bare_name(&name);
-                let mdef = lookup_macro(env, &name).or_else(|| lookup_macro(env, &bare));
+                // A keyword never names a standard macro: (macro-function :loop)
+                // is NIL (GH #528).
+                let keyword = egcl_rt::symbols::keyword_key_name(&name).is_some();
+                let mdef = lookup_macro(env, &name)
+                    .or_else(|| (!keyword).then(|| lookup_macro(env, &bare)).flatten());
                 if let Some(mdef) = &mdef {
                     // A first-class expander installed via
                     // (setf (macro-function name) fn) round-trips (bliss-fo0o).
@@ -1674,7 +1678,7 @@ fn resolve(name: &str) -> Option<Handler> {
                 // PROGRAM-ERROR (ansi AND/OR/WHEN/COND/RETURN/DEFUN/MULTIPLE-
                 // VALUE-*/…-ERROR.1/2). Standard special OPERATORS that are not
                 // macros (IF, PROGN, LET, QUOTE, …) are excluded and return NIL.
-                if is_ansi_standard_macro(&bare) {
+                if !keyword && is_ansi_standard_macro(&bare) {
                     return synthesize_macro_expander(env, s);
                 }
             }

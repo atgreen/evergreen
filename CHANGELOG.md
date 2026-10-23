@@ -345,6 +345,13 @@
 
 ### Fixed
 
+- A `restart-case` clause whose restart is named `:loop` no longer makes
+  `compile-file` fail with `Unsupported LOOP action "NIL"`, and defining such
+  a function no longer signals that error to the caller's handlers. Restart
+  and `handler-case` clauses, and `handler-bind` types, are no longer walked
+  as code when a function body is macroexpanded, so a clause type such as
+  `(or error storage-condition)` in a `defun` also matches. `(macro-function
+  :loop)` is NIL ([#536](https://github.com/atgreen/evergreen/pull/536)).
 - `handler-case` and `handler-bind` clauses whose type is a compound type
   specifier, such as `(or error storage-condition)` or
   `(and error (not warning))`, now match a condition of that type, as `typep`
