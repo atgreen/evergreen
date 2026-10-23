@@ -404,6 +404,10 @@ enum StreamInner {
         buffer: Vec<u8>,
         line: u64,
         col: u64,
+        /// The stream was made with an element type that is a subtype of
+        /// BASE-CHAR, so GET-OUTPUT-STREAM-STRING answers a BASE-STRING
+        /// (CLHS MAKE-STRING-OUTPUT-STREAM; ansi WITH-OUTPUT-TO-STRING.8).
+        base: bool,
     },
     FileInput {
         file: StreamHandle,
@@ -444,8 +448,11 @@ enum StreamInner {
     Concatenated { cursor: usize },
     /// Components: `[input, output]`.
     TwoWay,
-    /// Components: `[input, output]`.
-    Echo,
+    /// Components: `[input, output]`. `unread` holds a character given back
+    /// with UNREAD-CHAR. It was echoed when first read, so the next read takes
+    /// it from here and does not echo it again (CLHS MAKE-ECHO-STREAM; ansi
+    /// UNREAD-CHAR.3).
+    Echo { unread: Option<char> },
     /// Components: `[symbol]`.
     Synonym,
     /// The process standard input, connected to the real terminal / pipe.
@@ -474,7 +481,7 @@ impl StreamMutableState {
             return Ok(());
         }
         match &mut self.inner {
-            StreamInner::StringOutput { buffer, line, col } => {
+            StreamInner::StringOutput { buffer, line, col, .. } => {
                 buffer.extend_from_slice(octets);
                 advance_line_col(octets, line, col);
                 Ok(())
@@ -529,7 +536,7 @@ impl StreamMutableState {
             StreamInner::Broadcast => StreamDirection::Output,
             StreamInner::Concatenated { .. } => StreamDirection::Input,
             StreamInner::TwoWay => StreamDirection::Io,
-            StreamInner::Echo => StreamDirection::Io,
+            StreamInner::Echo { .. } => StreamDirection::Io,
             // A synonym stream has the direction of the stream its symbol
             // currently names (ansi make-synonym-stream.1/.3).
             StreamInner::Synonym => match resolve_synonym(self.components()[0]) {
@@ -1348,7 +1355,10 @@ impl GrayStream for StreamMutableState {
                 let inp = comps[0];
                 crate::streams::stream_read_char(inp)
             }
-            StreamInner::Echo => {
+            StreamInner::Echo { unread } => {
+                if let Some(c) = unread.take() {
+                    return Ok(EgclVal::from_char(c));
+                }
                 let inp = comps[0];
                 let result = crate::streams::stream_read_char(inp)?;
                 if result != EOF {
@@ -1433,8 +1443,10 @@ impl GrayStream for StreamMutableState {
                 }
                 Ok(())
             }
-            StreamInner::TwoWay | StreamInner::Echo => {
-                crate::streams::stream_unread_char(comps[0], ch)
+            StreamInner::TwoWay => crate::streams::stream_unread_char(comps[0], ch),
+            StreamInner::Echo { unread } => {
+                *unread = Some(c);
+                Ok(())
             }
             StreamInner::Concatenated { cursor } => {
                 if let Some(&s) = comps.get(*cursor) {
@@ -1499,7 +1511,7 @@ impl GrayStream for StreamMutableState {
             // Composite streams read bytes from their binary components (ansi
             // make-two-way-stream.12/.13, make-concatenated-stream.22).
             StreamInner::TwoWay => crate::streams::stream_read_byte(comps[0]),
-            StreamInner::Echo => {
+            StreamInner::Echo { .. } => {
                 let mut byte = crate::streams::stream_read_byte(comps[0])?;
                 // Root BYTE across the echo write. On a wide element type the
                 // value is a heap bignum, and the write allocates (buffering,
@@ -1544,7 +1556,7 @@ impl GrayStream for StreamMutableState {
         let mut comps = self.components().to_vec();
         egcl_rt::rooted_ref!(_components_root = &mut comps);
         match &mut self.inner {
-            StreamInner::StringOutput { buffer, line, col } => {
+            StreamInner::StringOutput { buffer, line, col, .. } => {
                 let mut buf = [0u8; 4];
                 let encoded = c.encode_utf8(&mut buf);
                 buffer.extend_from_slice(encoded.as_bytes());
@@ -1606,7 +1618,7 @@ impl GrayStream for StreamMutableState {
                 }
                 Ok(())
             }
-            StreamInner::TwoWay | StreamInner::Echo => {
+            StreamInner::TwoWay | StreamInner::Echo { .. } => {
                 crate::streams::stream_write_char(comps[1], ch)
             }
             StreamInner::Synonym => {
@@ -1655,7 +1667,7 @@ impl GrayStream for StreamMutableState {
                     }
                     return Ok(());
                 }
-                StreamInner::TwoWay | StreamInner::Echo => {
+                StreamInner::TwoWay | StreamInner::Echo { .. } => {
                     return crate::streams::stream_write_byte(comps[1], byte);
                 }
                 StreamInner::Synonym => {
@@ -1684,7 +1696,7 @@ impl GrayStream for StreamMutableState {
         let mut comps = self.components().to_vec();
         egcl_rt::rooted_ref!(_components_root = &mut comps);
         match &mut self.inner {
-            StreamInner::StringOutput { buffer, line, col } => {
+            StreamInner::StringOutput { buffer, line, col, .. } => {
                 buffer.push(b);
                 if b == b'\n' {
                     *line += 1;
@@ -1781,7 +1793,7 @@ impl GrayStream for StreamMutableState {
         let mut comps = self.components().to_vec();
         egcl_rt::rooted_ref!(_components_root = &mut comps);
         match &mut self.inner {
-            StreamInner::StringOutput { buffer, line, col } => {
+            StreamInner::StringOutput { buffer, line, col, .. } => {
                 buffer.extend_from_slice(slice);
                 for c in str_slice.chars() {
                     if c == '\n' {
@@ -1859,7 +1871,7 @@ impl GrayStream for StreamMutableState {
                 }
                 Ok(())
             }
-            StreamInner::TwoWay | StreamInner::Echo => {
+            StreamInner::TwoWay | StreamInner::Echo { .. } => {
                 crate::streams::stream_write_string(comps[1], string, start, Some(actual_end))
             }
             StreamInner::Synonym => {
@@ -1987,7 +1999,8 @@ impl GrayStream for StreamMutableState {
                     .map_err(|e| EgclError::StreamError(format!("listen: {e}")))
             }
             StreamInner::Concatenated { cursor } => Ok(*cursor < comps.len()),
-            StreamInner::TwoWay | StreamInner::Echo => crate::streams::stream_listen(comps[0]),
+            StreamInner::Echo { unread: Some(_) } => Ok(true),
+            StreamInner::TwoWay | StreamInner::Echo { .. } => crate::streams::stream_listen(comps[0]),
             StreamInner::Synonym => {
                 let target = resolve_synonym(comps[0])?;
                 crate::streams::stream_listen(target)
@@ -2058,22 +2071,11 @@ impl GrayStream for StreamMutableState {
                 );
             }
         }
-        // For string streams, if exhausted return NIL -- but a character pushed
-        // back with UNREAD-CHAR is available even at the end of the string, so
-        // it must be consulted first. Ignoring it made NO-HANG (and so LISTEN)
-        // answer "nothing available" for a character the caller had just
-        // unread, which is ansi streams listen.6.
-        if let StreamInner::StringInput {
-            position,
-            end,
-            unread,
-            ..
-        } = &self.inner
-        {
-            if unread.is_none() && *position >= *end {
-                return Ok(NIL);
-            }
-        }
+        // A string stream never waits: an exhausted one is at END OF FILE, so
+        // it answers EOF (and READ-CHAR-NO-HANG applies its eof conventions,
+        // ansi READ-CHAR-NO-HANG.6 and .ERROR.2-4), never NIL for "nothing
+        // available yet". A character pushed back with UNREAD-CHAR is still
+        // read first (ansi listen.6); `stream_read_char` does both.
         // The process standard input carries no handle of its own, so ask the
         // descriptor whether a read would block. When stdin is a pipe, socket or
         // terminal with nothing buffered yet, NO-HANG must answer NIL instead of
@@ -2090,6 +2092,15 @@ impl GrayStream for StreamMutableState {
 
     fn stream_peek_char(&mut self) -> Result<EgclVal, EgclError> {
         self.check_input()?;
+        // Peeking an echo stream looks at its input without echoing: only a
+        // character actually read is echoed (ansi PEEK-CHAR.17).
+        if let StreamInner::Echo { unread } = &self.inner {
+            if let Some(c) = *unread {
+                return Ok(EgclVal::from_char(c));
+            }
+            let input = self.components()[0];
+            return crate::streams::stream_peek_char(input);
+        }
         let ch = self.stream_read_char()?;
         if ch != EOF {
             self.stream_unread_char(ch)?;
@@ -3216,12 +3227,20 @@ pub fn make_string_input_stream(
 }
 
 pub fn make_string_output_stream(_element_type: EgclVal) -> Result<EgclVal, EgclError> {
+    make_string_output_stream_of(false)
+}
+
+/// A string output stream whose GET-OUTPUT-STREAM-STRING answers a
+/// SIMPLE-BASE-STRING when `base` (its element type is a subtype of BASE-CHAR)
+/// and a CHARACTER string otherwise.
+pub fn make_string_output_stream_of(base: bool) -> Result<EgclVal, EgclError> {
     Ok(alloc_stream(
         StreamElementType::Character,
         StreamInner::StringOutput {
             buffer: Vec::new(),
             line: 0,
             col: 0,
+            base,
         },
         vec![],
         None,
@@ -3230,13 +3249,19 @@ pub fn make_string_output_stream(_element_type: EgclVal) -> Result<EgclVal, Egcl
 
 pub fn get_output_stream_string(stream: EgclVal) -> Result<EgclVal, EgclError> {
     with_stream(stream, |guard| match &mut guard.inner {
-        StreamInner::StringOutput { buffer, col, line } => {
+        StreamInner::StringOutput { buffer, col, line, base } => {
             let s = std::str::from_utf8(buffer)
                 .map_err(|_| EgclError::StreamError("invalid UTF-8 in output buffer".into()))?;
             // A fresh heap string: CLHS requires a new string, and an interned
             // one lived off-heap forever, leaking every distinct result
-            // (bliss-4due).
-            let result = make_lisp_string_fresh(s);
+            // (bliss-4due). It keeps the stream's element type: a BASE-CHAR
+            // stream answers a SIMPLE-BASE-STRING (ansi WITH-OUTPUT-TO-STRING.8),
+            // as long as everything written to it really is a base char.
+            let result = if *base && egcl_rt::object::is_all_base_char(s) {
+                make_lisp_base_string_fresh(s)
+            } else {
+                make_lisp_string_fresh(s)
+            };
             buffer.clear();
             *col = 0;
             *line = 0;
@@ -3276,7 +3301,7 @@ pub fn make_two_way_stream(input: EgclVal, output: EgclVal) -> Result<EgclVal, E
 pub fn make_echo_stream(input: EgclVal, output: EgclVal) -> Result<EgclVal, EgclError> {
     Ok(alloc_stream(
         StreamElementType::Character,
-        StreamInner::Echo,
+        StreamInner::Echo { unread: None },
         vec![input, output],
         None,
     ))
@@ -3381,7 +3406,7 @@ pub fn stream_class_name(stream: EgclVal) -> Option<&'static str> {
         StreamInner::Broadcast => "BROADCAST-STREAM",
         StreamInner::Concatenated { .. } => "CONCATENATED-STREAM",
         StreamInner::TwoWay => "TWO-WAY-STREAM",
-        StreamInner::Echo => "ECHO-STREAM",
+        StreamInner::Echo { .. } => "ECHO-STREAM",
         StreamInner::Synonym => "SYNONYM-STREAM",
         #[allow(unreachable_patterns)]
         _ => return None,
@@ -3462,7 +3487,10 @@ fn composite_read_char(stream: EgclVal) -> Result<EgclVal, EgclError> {
             let comps = guard.components();
             match &guard.inner {
                 StreamInner::TwoWay => CompositeByteRead::Delegate(comps[0]),
-                StreamInner::Echo => CompositeByteRead::Echo(comps[0], comps[1]),
+                // A character given back with UNREAD-CHAR was echoed when it
+                // was first read; return it without echoing it again.
+                StreamInner::Echo { unread: Some(_) } => CompositeByteRead::InMutex,
+                StreamInner::Echo { .. } => CompositeByteRead::Echo(comps[0], comps[1]),
                 StreamInner::Synonym => {
                     CompositeByteRead::Delegate(resolve_synonym(comps[0])?)
                 }
@@ -3553,7 +3581,7 @@ fn composite_read_byte(stream: EgclVal) -> Result<EgclVal, EgclError> {
                 // it on the original path.
                 (_, StreamElementType::Integer { .. }) => CompositeByteRead::InMutex,
                 (StreamInner::TwoWay, _) => CompositeByteRead::Delegate(comps[0]),
-                (StreamInner::Echo, _) => CompositeByteRead::Echo(comps[0], comps[1]),
+                (StreamInner::Echo { .. }, _) => CompositeByteRead::Echo(comps[0], comps[1]),
                 (StreamInner::Synonym, _) => {
                     CompositeByteRead::Delegate(resolve_synonym(comps[0])?)
                 }
@@ -3626,7 +3654,7 @@ pub fn is_binary_stream(stream: EgclVal) -> bool {
         Ok((
             guard.element_type.is_binary(),
             match &guard.inner {
-                StreamInner::TwoWay | StreamInner::Echo => comps.first().copied(),
+                StreamInner::TwoWay | StreamInner::Echo { .. } => comps.first().copied(),
                 StreamInner::Concatenated { cursor } => {
                     comps.get(*cursor).copied().or_else(|| comps.first().copied())
                 }
@@ -3694,8 +3722,39 @@ pub fn stream_read_char_no_hang(stream: EgclVal) -> Result<EgclVal, EgclError> {
     with_stream(stream, |guard| guard.stream_read_char_no_hang())
 }
 
+/// The next character of STREAM without consuming it, or EOF.
+///
+/// A composite stream peeks with its state mutex released, the way
+/// `composite_read_char` reads, so a component that parks does not hold the
+/// composite's lock. An ECHO stream peeks its input stream and echoes nothing:
+/// only a character actually read is echoed (ansi PEEK-CHAR.17).
 pub fn stream_peek_char(stream: EgclVal) -> Result<EgclVal, EgclError> {
-    with_stream(stream, |guard| guard.stream_peek_char())
+    egcl_rt::rooted!(stream = stream);
+    if get_stream_alloc(*stream)?.components.is_empty() {
+        return with_stream(*stream, |guard| guard.stream_peek_char());
+    }
+    // An echo stream answers (Some(pending character), _) or (None, Some(its
+    // input stream)); any other composite (None, None).
+    let peek = with_stream(*stream, |guard| {
+        guard.check_input()?;
+        Ok(match &guard.inner {
+            StreamInner::Echo { unread: Some(c) } => (Some(EgclVal::from_char(*c)), None),
+            StreamInner::Echo { unread: None } => (None, Some(guard.components()[0])),
+            _ => (None, None),
+        })
+    })?;
+    match peek {
+        (Some(pending), _) => Ok(pending),
+        (None, Some(input)) => stream_peek_char(input),
+        (None, None) => {
+            let mut ch = stream_read_char(*stream)?;
+            egcl_rt::rooted_ref!(_ch_root = &mut ch);
+            if ch != EOF {
+                stream_unread_char(*stream, ch)?;
+            }
+            Ok(ch)
+        }
+    }
 }
 
 pub fn stream_read_line(stream: EgclVal) -> Result<(EgclVal, bool), EgclError> {
@@ -4768,7 +4827,7 @@ pub fn synonym_stream_symbol(stream: EgclVal) -> Option<EgclVal> {
 pub fn two_way_stream_input_stream(stream: EgclVal) -> Option<EgclVal> {
     with_stream(stream, |guard| {
         Ok(
-            if matches!(guard.inner, StreamInner::TwoWay | StreamInner::Echo) {
+            if matches!(guard.inner, StreamInner::TwoWay | StreamInner::Echo { .. }) {
                 guard.components().first().copied()
             } else {
                 None
@@ -4783,7 +4842,7 @@ pub fn two_way_stream_input_stream(stream: EgclVal) -> Option<EgclVal> {
 pub fn two_way_stream_output_stream(stream: EgclVal) -> Option<EgclVal> {
     with_stream(stream, |guard| {
         Ok(
-            if matches!(guard.inner, StreamInner::TwoWay | StreamInner::Echo) {
+            if matches!(guard.inner, StreamInner::TwoWay | StreamInner::Echo { .. }) {
                 guard.components().get(1).copied()
             } else {
                 None

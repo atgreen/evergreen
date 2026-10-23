@@ -522,6 +522,13 @@ fn effective_char_syntax(rt: EgclVal, c: char) -> (u8, char) {
     standard_char_syntax(c)
 }
 
+/// True when `c` has whitespace[2] syntax in the current readtable, which is
+/// what PEEK-CHAR with a peek type of T skips (CLHS PEEK-CHAR; ansi
+/// PEEK-CHAR.20/.21).
+pub fn is_whitespace_syntax(c: char) -> bool {
+    effective_char_syntax(current_readtable_value(), c).0 == 1
+}
+
 /// SET-SYNTAX-FROM-CHAR: give `to_char` (in `to_rt`) the syntax `from_char` has
 /// in `from_rt`, including any reader-macro function. Returns nothing useful (CL
 /// returns T).

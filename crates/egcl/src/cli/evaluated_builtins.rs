@@ -1837,7 +1837,8 @@ fn resolve(name: &str) -> Option<Handler> {
 
             let stream = if !args.is_empty() { args[0] } else { NIL };
             let eof_error_p = if args.len() > 1 { args[1] } else { T };
-            let in_stream = resolve_input_stream(stream, env);
+            let mut in_stream = resolve_input_stream(stream, env);
+            egcl_rt::rooted_ref!(_stream_root = &mut in_stream);
             let (result, at_eof) = if is_gray_stream(in_stream) {
                 let r = invoke_generic_function("STREAM-READ-CHAR", &[in_stream], env)?;
                 let eof = !r.is_character();
@@ -1853,7 +1854,7 @@ fn resolve(name: &str) -> Option<Handler> {
                     // (allocating) read (bliss-6b2 #2).
                     return Ok(if args.len() > 2 { args[2] } else { NIL });
                 }
-                return Err(EgclError::StreamError("end of file on READ-CHAR".into()));
+                return Err(end_of_file_error(env, in_stream, "READ-CHAR"));
             }
             Ok(result)
         }),
@@ -1870,7 +1871,8 @@ fn resolve(name: &str) -> Option<Handler> {
             //  blocks and cannot implement this.
             let stream = if !args.is_empty() { args[0] } else { NIL };
             let eof_error_p = if args.len() > 1 { args[1] } else { T };
-            let in_stream = resolve_input_stream(stream, env);
+            let mut in_stream = resolve_input_stream(stream, env);
+            egcl_rt::rooted_ref!(_stream_root = &mut in_stream);
             let (result, at_eof) = if is_gray_stream(in_stream) {
                 let r = invoke_generic_function("STREAM-READ-CHAR-NO-HANG", &[in_stream], env)?;
                 // A Gray stream answers NIL for "nothing available yet"; only a
@@ -1888,9 +1890,7 @@ fn resolve(name: &str) -> Option<Handler> {
                     // (allocating) read (bliss-6b2 #2).
                     return Ok(if args.len() > 2 { args[2] } else { NIL });
                 }
-                return Err(EgclError::StreamError(
-                    "end of file on READ-CHAR-NO-HANG".into(),
-                ));
+                return Err(end_of_file_error(env, in_stream, "READ-CHAR-NO-HANG"));
             }
             Ok(result)
         }),
@@ -1915,36 +1915,43 @@ fn resolve(name: &str) -> Option<Handler> {
                 None
             };
             loop {
-                // Read one character (gray-stream aware, like READ-CHAR).
-                let (c, at_eof) = if is_gray_stream(in_stream) {
+                // Look at the next character. A built-in stream peeks without
+                // consuming (an echo stream must not echo a peeked character,
+                // ansi PEEK-CHAR.17); a Gray stream reads and puts it back.
+                let gray = is_gray_stream(in_stream);
+                let (c, at_eof) = if gray {
                     let r = invoke_generic_function("STREAM-READ-CHAR", &[in_stream], env)?;
                     (r, !r.is_character())
                 } else {
-                    let r = egcl_stdlib::stream_read_char(in_stream)?;
+                    let r = egcl_stdlib::stream_peek_char(in_stream)?;
                     (r, r == EOF)
                 };
                 if at_eof {
                     if eof_error_p.is_nil() {
                         return Ok(args.get(3).copied().unwrap_or(NIL));
                     }
-                    return Err(EgclError::StreamError("end of file on PEEK-CHAR".into()));
+                    return Err(end_of_file_error(env, in_stream, "PEEK-CHAR"));
                 }
                 let ch = c.as_char();
+                // Peek type T skips whitespace[2] as the CURRENT READTABLE
+                // defines it, not a fixed character set (ansi PEEK-CHAR.20/.21).
                 let stop = match (skip_ws, until) {
-                    (true, _) => !ch.is_whitespace(),
+                    (true, _) => !reader::is_whitespace_syntax(ch),
                     (false, Some(u)) => ch == u,
                     (false, None) => true,
                 };
                 if stop {
-                    // Put the peeked character back and return it.
-                    if is_gray_stream(in_stream) {
+                    if gray {
+                        // Put the peeked character back and return it.
                         invoke_generic_function("STREAM-UNREAD-CHAR", &[in_stream, c], env)?;
-                    } else {
-                        egcl_stdlib::stream_unread_char(in_stream, c)?;
                     }
                     return Ok(c);
                 }
-                // Otherwise the character is consumed; keep scanning.
+                // Otherwise the character is consumed (and, on an echo
+                // stream, echoed); keep scanning.
+                if !gray {
+                    egcl_stdlib::stream_read_char(in_stream)?;
+                }
             }
         }),
 

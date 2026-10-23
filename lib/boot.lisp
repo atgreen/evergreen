@@ -1427,8 +1427,9 @@ Returns NIL."
                  (let ((,out (get-output-stream-string ,var)))
                    (loop for ,ch across ,out do (vector-push-extend ,ch ,target)))))))
         `(progn
-           ,@element-type-forms
-           (let ((,var (make-string-output-stream)))
+           (let ((,var (make-string-output-stream
+                        ,@(when element-type-forms
+                            `(:element-type ,element-type-form)))))
              ,@declarations
              ,@forms
              (get-output-stream-string ,var))))))
@@ -5674,19 +5675,27 @@ had none, as for a host name that did not resolve."
             (t (format *query-io* "~&Please answer yes or no.~%"))))))
 
 ;; A file stream's external format is the one it was opened with (UTF-8,
-;; LATIN-1 or ASCII); every other stream answers :UTF-8, the image's own.
+;; LATIN-1 or ASCII); every other stream answers :UTF-8, the image's own. A
+;; broadcast stream answers for its last component, and :DEFAULT when it has
+;; none (CLHS BROADCAST-STREAM; ansi MAKE-BROADCAST-STREAM.8).
 (defun stream-external-format (stream)
   (check-type stream stream)
-  (egcl::%stream-external-format stream))
+  (if (typep stream 'broadcast-stream)
+      (let ((last (car (last (broadcast-stream-streams stream)))))
+        (if last (stream-external-format last) :default))
+      (egcl::%stream-external-format stream)))
 
 ;; FILE-STRING-LENGTH (CLHS 21.2): the octets OBJECT occupies on STREAM, whose
-;; external format is UTF-8; 1 for a broadcast stream (CLHS BROADCAST-STREAM).
+;; external format is UTF-8. A broadcast stream answers for its last
+;; component, and 1 when it has none (CLHS BROADCAST-STREAM; ansi
+;; BROADCAST-STREAM-STREAMS.3/.4).
 (defun file-string-length (stream object)
   (check-type stream stream)
   (let ((text (if (characterp object) (string object) object)))
     (check-type text string)
     (if (typep stream 'broadcast-stream)
-        1
+        (let ((last (car (last (broadcast-stream-streams stream)))))
+          (if last (file-string-length last object) 1))
         (loop for ch across text
               sum (let ((code (char-code ch)))
                     (cond ((< code #x80) 1)
