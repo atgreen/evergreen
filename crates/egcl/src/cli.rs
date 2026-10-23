@@ -4742,7 +4742,7 @@ fn lookup_macro_with_scope(env: &Env, name: &str) -> Option<(MacroDef, bool)> {
             return Some((def, true));
         }
     }
-    let leaf = symbol_leaf_name(name);
+    let leaf = macro_leaf_name(name);
     if leaf != name {
         if let Some(def) = env.macros.borrow().get(leaf).cloned() {
             return Some((def, true));
@@ -4768,6 +4768,17 @@ fn lookup_global_macro_def(name: &str, alias: Option<&str>, leaf: &str) -> Optio
     }
 }
 
+/// The package-stripped spelling a macro lookup falls back to. A keyword has
+/// none: `:LOOP` is not the LOOP macro, and resolving it as one expanded a
+/// RESTART-CASE clause named `:LOOP` as a LOOP form (GH #528).
+fn macro_leaf_name(name: &str) -> &str {
+    if egcl_rt::symbols::keyword_key_name(name).is_some() {
+        name
+    } else {
+        symbol_leaf_name(name)
+    }
+}
+
 /// True if `name` names a macro visible in `env` (lexical or global).
 fn macro_defined(env: &Env, name: &str) -> bool {
     if env.macros.borrow().contains_key(name) {
@@ -4780,7 +4791,7 @@ fn macro_defined(env: &Env, name: &str) -> bool {
     {
         return true;
     }
-    let leaf = symbol_leaf_name(name);
+    let leaf = macro_leaf_name(name);
     if leaf != name && env.macros.borrow().contains_key(leaf) {
         return true;
     }
@@ -36172,6 +36183,34 @@ fn macroexpand_all(
             }
             arena_cons(car, out)
         }
+        // (restart-case form clause...) / (handler-case form clause...): a
+        // clause is not a form. Its head (a restart name or a type specifier)
+        // and lambda list stay verbatim, so a restart named :LOOP or a clause
+        // type such as (OR ERROR WARNING) is never expanded as a macro call
+        // (GH #528); only the clause bodies are code.
+        "RESTART-CASE" | "HANDLER-CASE" => {
+            let (protected, clauses) = cp(cdr);
+            egcl_rt::rooted!(clauses = clauses);
+            egcl_rt::rooted!(new_protected = macroexpand_all(protected, env, d, local_functions)?);
+            let new_clauses = mx_case_clauses(
+                *clauses,
+                name == "RESTART-CASE",
+                env,
+                d,
+                local_functions,
+            )?;
+            let tail = arena_cons(*new_protected, new_clauses);
+            arena_cons(car, tail)
+        }
+        // (handler-bind ((type handler)...) body...): a binding has the shape
+        // of a LET binding, a verbatim type followed by a handler form.
+        "HANDLER-BIND" => {
+            let (bindings, body) = cp(cdr);
+            egcl_rt::rooted!(body = body);
+            egcl_rt::rooted!(new_bindings = mx_bindings(bindings, env, d, local_functions)?);
+            let new_body = mx_each_scoped(*body, env, d, local_functions)?;
+            arena_cons(car, arena_cons(*new_bindings, new_body))
+        }
         "FUNCTION" => {
             // (function (lambda ...)) — expand the lambda; (function name) — leave.
             // A `(setf name)` function name is a cons too, but it is a NAME, not
@@ -36199,6 +36238,68 @@ fn macroexpand_all(
         // position (tags, block names, setq/setf place symbols) pass through.
         _ => arena_cons(car, mx_each_scoped(cdr, env, d, local_functions)?),
     })
+}
+
+/// Expand the bodies of RESTART-CASE or HANDLER-CASE clauses, preserving each
+/// clause's head and lambda list and, for RESTART-CASE, its leading
+/// `:report`/`:interactive`/`:test` options. A clause too short to have a body
+/// passes through unchanged.
+fn mx_case_clauses(
+    clauses: EgclVal,
+    restart_options: bool,
+    env: &mut Env,
+    depth: u32,
+    local_functions: &HashSet<u32>,
+) -> Result<EgclVal, EgclError> {
+    let mut out_items = Vec::new();
+    let mut c = clauses;
+    egcl_rt::rooted_ref!(_out_items_root = &mut out_items);
+    egcl_rt::rooted_ref!(_c_root = &mut c);
+    while c.is_cons() {
+        let (clause, rest) = cp(c);
+        c = rest;
+        // The verbatim elements before the body: head and lambda list.
+        let mut prefix = Vec::new();
+        let mut body = clause;
+        while prefix.len() < 2 && body.is_cons() {
+            let (element, tail) = cp(body);
+            prefix.push(element);
+            body = tail;
+        }
+        if prefix.len() < 2 {
+            out_items.push(clause);
+            continue;
+        }
+        while restart_options && body.is_cons() {
+            let (option, tail) = cp(body);
+            let is_option = option.is_symbol()
+                && tail.is_cons()
+                && matches!(
+                    egcl_rt::symbols::keyword_key_name(&sym_name(option)),
+                    Some("REPORT" | "INTERACTIVE" | "TEST")
+                );
+            if !is_option {
+                break;
+            }
+            let (value, after) = cp(tail);
+            prefix.push(option);
+            prefix.push(value);
+            body = after;
+        }
+        egcl_rt::rooted_ref!(_prefix_root = &mut prefix);
+        let mut new_clause = mx_each_scoped(body, env, depth, local_functions)?;
+        egcl_rt::rooted_ref!(_new_clause_root = &mut new_clause);
+        for i in (0..prefix.len()).rev() {
+            new_clause = arena_cons(prefix[i], new_clause);
+        }
+        out_items.push(new_clause);
+    }
+    let mut out = c;
+    egcl_rt::rooted_ref!(_out_root = &mut out);
+    for i in (0..out_items.len()).rev() {
+        out = arena_cons(out_items[i], out);
+    }
+    Ok(out)
 }
 
 /// Expand the init-forms of a LET/LET* binding list, preserving each binding's
