@@ -363,6 +363,9 @@
 
 ### Fixed
 
+- `typep` against a `(mod n)` type handles bignums: a bignum object in range
+  answered NIL, and a bignum modulus crashed the runtime
+  ([#572](https://github.com/atgreen/evergreen/pull/572)).
 - Character case follows Unicode instead of covering ASCII only.
   `char-upcase`, `char-downcase`, `upper-case-p`, `lower-case-p`,
   `both-case-p`, the `string-upcase`, `string-downcase` and
