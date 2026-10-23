@@ -10919,24 +10919,11 @@ fn serialize_bbu_loadable_function(
     load_actions: &mut Vec<(u8, u8, u32, u32, u32)>,
     env: &Env,
 ) -> Option<u32> {
-    fn collect(function: &BytecodeFunction, pending: &mut Vec<EgclVal>) {
-        for &(slot, form) in &function.load_time_values {
-            pending.extend([function.constants[slot as usize], form]);
-        }
-        for nested in &function.nested_functions {
-            collect(nested, pending);
-        }
-        for table in &function.restart_cases {
-            for restart in &table.restarts {
-                collect(&restart.function, pending);
-            }
-        }
-    }
 
     let bf = Arc::new(bf);
     egcl_rt::rooted!(_function_root = ActiveBytecodeRoot::new(&bf));
     egcl_rt::rooted!(pending = Vec::<EgclVal>::new());
-    collect(&bf, &mut pending);
+    collect_load_time_cells(&bf, &mut pending);
     let original_functions = functions.len();
     let original_actions = load_actions.len();
     let result = (|| {
@@ -14160,7 +14147,10 @@ fn compile_defun(
             }
         };
     let load_time_value = compiled.as_deref().is_some_and(contains_load_time_values);
-    match compiled.filter(|function| !contains_load_time_values(function)) {
+    let compiled = compiled.filter(|function| {
+        !contains_load_time_values(function) || initialize_live_load_time_values(function, env)
+    });
+    match compiled {
         Some(bf) => publish_bytecode(sym, bf, Some(generation), *function) || is_registered(sym),
         None => {
             let registered = is_registered(sym);
@@ -14267,7 +14257,10 @@ pub(super) fn compile_tree_closure(
             compile(true).map(Arc::new)
         }
     };
-    let Some(bf) = compiled.filter(|function| !contains_load_time_values(function)) else {
+    let Some(bf) = compiled.filter(|function| {
+        !contains_load_time_values(function)
+            || initialize_live_load_time_values(function, compile_env)
+    }) else {
         log_not_compiled(
             label,
             last_bail_reason().as_deref().unwrap_or("bytecode lowering bailed; no reason recorded"),
@@ -14291,6 +14284,46 @@ pub(super) fn compile_tree_closure(
     // cell (see compile_and_reify_lambda); nothing can name the symbol.
     egcl_rt::symbols::set_symbol_function(sym_idx, function);
     Some(function)
+}
+
+/// Each LOAD-TIME-VALUE cell of `function` and its nested and restart-clause
+/// functions, followed by the form that initializes it.
+fn collect_load_time_cells(function: &BytecodeFunction, pending: &mut Vec<EgclVal>) {
+    for &(slot, form) in &function.load_time_values {
+        pending.extend([function.constants[slot as usize], form]);
+    }
+    for nested in &function.nested_functions {
+        collect_load_time_cells(nested, pending);
+    }
+    for table in &function.restart_cases {
+        for restart in &table.restarts {
+            collect_load_time_cells(&restart.function, pending);
+        }
+    }
+}
+
+/// Evaluate a live-compiled function's LOAD-TIME-VALUE forms once, now, in a
+/// null lexical environment, into their cells. Compiling in the running image
+/// is its load time; a FASL defers the same forms to its load plan. Without
+/// this the function could not be published and stayed tree-walked,
+/// re-evaluating each form on every call (bliss-jz86). False, with the
+/// function left unpublished, if a form signals.
+fn initialize_live_load_time_values(function: &Arc<BytecodeFunction>, env: &super::Env) -> bool {
+    egcl_rt::rooted!(_function_root = ActiveBytecodeRoot::new(function));
+    egcl_rt::rooted!(pending = Vec::<EgclVal>::new());
+    collect_load_time_cells(function, &mut pending);
+    let mut initializer_env = env.null_lexical_child();
+    egcl_rt::rooted_ref!(_env_root = &mut initializer_env);
+    for index in (0..pending.len()).step_by(2) {
+        let Ok(value) = super::eval_form(pending[index + 1], &mut initializer_env) else {
+            return false;
+        };
+        // The cell is re-read from the rooted vector after the evaluation.
+        if super::store_cons_field(pending[index], value, true).is_err() {
+            return false;
+        }
+    }
+    true
 }
 
 fn contains_load_time_values(function: &BytecodeFunction) -> bool {
@@ -14342,39 +14375,25 @@ pub(super) fn compile_and_reify_lambda(
     // Trying complete lowering first also avoids compiling callback-heavy
     // methods twice during a library load. Retain opportunistic lowering for
     // bodies whose callbacks need host evaluation.
-    let mut load_time_value = false;
     // The complete lowering's reason names the construct; the fallback below
     // may bail without one, so keep it to report (bliss-75b8v).
     let mut portable_reason = None;
-    let bf = compile_function(label, lambda_list, body, env, true, false)
-        // Live compilation has no FASL load plan to initialize pending cells;
-        // in that case try the host-evaluation fallback instead.
-        .filter(|portable| {
-            load_time_value = contains_load_time_values(portable);
-            !load_time_value
-        })
-        .or_else(|| {
-            portable_reason = last_bail_reason();
-            reset_last_bail_reason();
-            compile_function(label, lambda_list, body, env, false, false)
-        });
-    // Portable lowering is also a live-compiler fallback, but only a FASL load
-    // plan can initialize these pending cells. Never publish them uninitialized.
-    // Either way the method body stays tree-walked, so say why, as a DEFUN's
-    // decline does (bliss-75b8v).
-    let bf = match bf {
-        Some(bf) if !contains_load_time_values(&bf) => bf,
-        declined => {
-            let reason = if load_time_value || declined.is_some() {
-                Some("LOAD-TIME-VALUE needs eager evaluation".to_string())
-            } else {
-                portable_reason.or_else(last_bail_reason)
-            };
-            log_not_compiled(label, reason.as_deref().unwrap_or("bytecode lowering bailed; no reason recorded"));
-            return None;
-        }
+    let bf = compile_function(label, lambda_list, body, env, true, false).or_else(|| {
+        portable_reason = last_bail_reason();
+        reset_last_bail_reason();
+        compile_function(label, lambda_list, body, env, false, false)
+    });
+    let Some(bf) = bf else {
+        let reason = portable_reason.or_else(last_bail_reason);
+        log_not_compiled(label, reason.as_deref().unwrap_or("bytecode lowering bailed; no reason recorded"));
+        return None;
     };
     let bf = Arc::new(bf);
+    // A body's LOAD-TIME-VALUE forms are evaluated once, now (bliss-jz86).
+    if contains_load_time_values(&bf) && !initialize_live_load_time_values(&bf, env) {
+        log_not_compiled(label, "a LOAD-TIME-VALUE form signalled while compiling");
+        return None;
+    }
     egcl_rt::rooted!(_bytecode_root = ActiveBytecodeRoot::new(&bf));
     let sym = egcl_rt::symbols::make_uninterned(label);
     let sym_idx = sym.as_symbol_index();
