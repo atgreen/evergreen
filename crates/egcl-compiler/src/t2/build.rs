@@ -438,11 +438,18 @@ fn self_inline_cost(body: &BytecodeFunction) -> Option<u32> {
         || body.code.iter().any(|op| !matches!(op,
             Instr::Const(_) | Instr::LoadLocal(_) | Instr::StoreLocal(_)
             | Instr::Pop | Instr::Dup | Instr::Br(_) | Instr::BrIfFalse(_)
-            | Instr::BrIfTrue(_) | Instr::CallNamed { .. } | Instr::Return))
+            | Instr::BrIfTrue(_) | Instr::CallNamed { .. } | Instr::Return
+            // A tested call's value-clearing marker (#419). It only drops
+            // values and T2 removes it after a single-valued test, so it is not
+            // charged. `body_cost` still refuses it: admitting it there lets
+            // cross-function bodies inline into callers whose multi-frame
+            // recovery the runtime does not yet admit (bliss-5ydhx).
+            | Instr::ClearMv))
     {
         return None;
     }
-    u32::try_from(body.code.len()).ok()?.checked_add(
+    let charged = body.code.iter().filter(|op| !matches!(op, Instr::ClearMv)).count();
+    u32::try_from(charged).ok()?.checked_add(
         u32::try_from(body.param_types.iter().filter(|ty| !ty.is_any()).count()).ok()?,
     )
 }
@@ -4790,6 +4797,26 @@ mod tests {
             .with_policy(1, InlinePolicy::NotInline);
         let notinline = build_from_bytecode_with_inline_options(&input, notinline).unwrap();
         assert!(has_call(&notinline), "NOTINLINE must override hotness");
+    }
+
+    #[test]
+    fn self_inline_cost_admits_a_tested_calls_clear_mv_without_charging_it() {
+        let less = egcl_rt::symbols::intern("<");
+        let with_test = |clear: bool| {
+            let mut code = vec![Instr::LoadLocal(0), Instr::Const(0),
+                Instr::CallNamed { sym: less, nargs: 2 }];
+            if clear {
+                code.push(Instr::ClearMv);
+            }
+            code.extend([Instr::BrIfFalse(code.len() as u32 + 3), Instr::LoadLocal(0),
+                Instr::Return, Instr::Const(0), Instr::Return]);
+            let mut body = bf("SELF-INLINE-CLEAR-MV", code, vec![EgclVal::from_fixnum(1)], 1, 1, 2);
+            body.param_layout = vec![("N".into(), VarLoc::Slot(0))];
+            body
+        };
+        let plain = self_inline_cost(&with_test(false)).expect("plain test body is eligible");
+        assert_eq!(self_inline_cost(&with_test(true)), Some(plain),
+            "the IF test's ClearMv (#419) must not disqualify or enlarge the body");
     }
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]

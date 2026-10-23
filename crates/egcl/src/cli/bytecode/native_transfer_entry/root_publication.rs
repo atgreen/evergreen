@@ -1541,6 +1541,11 @@ mod tests {
             .lock().unwrap_or_else(|error| error.into_inner());
         let mut env = Env::new(false);
         egcl_rt::rooted_ref!(_env = &mut env);
+        // Publication of native caller roots belongs to the mapped ABI's native
+        // child frames, counted by its c2i recursive entries. #420 admits this
+        // body onto the ordinary ABI, where self-calls go direct, so ask for the
+        // mapped variant explicitly, as #430 did for the sibling fixtures.
+        let _mapped = crate::cli::bytecode::native_transfer_entry::MappedOnlyForTest::new();
         let name = "ORDINARY-T2-PRIVATE-RECURSIVE-ROOTS";
         let form = "(if (= n 0)
             (ordinary-t2-private-root-leaf)
@@ -1621,6 +1626,11 @@ mod tests {
             .lock().unwrap_or_else(|error| error.into_inner());
         let mut env = Env::new(false);
         egcl_rt::rooted_ref!(_env = &mut env);
+        // Publication of native caller roots belongs to the mapped ABI's native
+        // child frames, counted by its c2i recursive entries. #420 admits this
+        // body onto the ordinary ABI, where self-calls go direct, so ask for the
+        // mapped variant explicitly, as #430 did for the sibling fixtures.
+        let _mapped = crate::cli::bytecode::native_transfer_entry::MappedOnlyForTest::new();
         let name = "ORDINARY-T2-NATIVE-TRACE";
         let form = "(if (= n 0) (ordinary-t2-native-trace-leaf)
             (let ((answer (ordinary-t2-native-trace (- n 1) marker)))
