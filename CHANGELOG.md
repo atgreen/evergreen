@@ -363,6 +363,10 @@
 
 ### Fixed
 
+- `(require :asdf)` works on machines other than the one that built egcl. It
+  loaded `lib/asdf.lisp` from the build's source tree; it now falls back to a
+  copy of ASDF compiled into the binary. `EGCL_ASDF_FILE` names a different
+  ASDF to load ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
 - `typep` against a `(mod n)` type handles bignums: a bignum object in range
   answered NIL, and a bignum modulus crashed the runtime
   ([#572](https://github.com/atgreen/evergreen/pull/572)).

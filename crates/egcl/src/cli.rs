@@ -14706,12 +14706,21 @@ fn process_compile_toplevel_form_at(
     Ok(())
 }
 
-fn bundled_asdf_path() -> String {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../lib/asdf.lisp")
-        .to_string_lossy()
-        .into_owned()
+/// The on-disk ASDF that REQUIRE loads, if there is one: EGCL_ASDF_FILE when
+/// set, else the source tree the binary was built from. That build-time path
+/// only exists on the build machine, so a binary run anywhere else finds
+/// nothing here and REQUIRE falls back to EMBEDDED_ASDF_LISP (bliss-bp4q).
+/// An empty EGCL_ASDF_FILE selects the embedded copy.
+fn bundled_asdf_path() -> Option<String> {
+    if let Ok(path) = std::env::var("EGCL_ASDF_FILE") {
+        return (!path.is_empty()).then_some(path);
+    }
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lib/asdf.lisp");
+    path.is_file().then(|| path.to_string_lossy().into_owned())
 }
+
+/// ASDF, embedded so (require :asdf) works wherever the binary runs.
+const EMBEDDED_ASDF_LISP: &str = include_str!("../../../lib/asdf.lisp");
 
 /// The bootstrap prelude, embedded at compile time so it is always available
 /// regardless of where the binary runs from.
@@ -18914,7 +18923,12 @@ fn require_module(module: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> 
         return Ok(NIL);
     }
     if normalized == "ASDF" {
-        load_path_into_env(&bundled_asdf_path(), env)?;
+        match bundled_asdf_path() {
+            Some(path) => {
+                load_path_into_env(&path, env)?;
+            }
+            None => load_embedded_lisp(EMBEDDED_ASDF_LISP, env)?,
+        }
         // asdf.lisp PROVIDEs itself; belt-and-suspenders in case it did not.
         record_module(env, &normalized);
         return Ok(T);
