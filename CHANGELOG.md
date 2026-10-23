@@ -366,7 +366,7 @@
 - `disassemble` of a closure object that has been compiled, such as a `lambda`
   or a `labels` function taken with `#'`, shows its compiled code. It reported
   "not a compiled EGCL function" although `egcl-ext:function-tier` gave its
-  tier ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  tier ([#567](https://github.com/atgreen/evergreen/pull/567)).
 - `compile-file` no longer installs a file's `defgeneric` and `defmethod`
   forms while compiling it, as SBCL does not; they take effect when the fasl
   is loaded. A method compiled into the running image could run before the
