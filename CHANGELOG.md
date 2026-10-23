@@ -367,6 +367,25 @@
   directory instead of turning it into NIL, so as a `pathname-match-p`
   wildcard it no longer matches every directory
   ([#585](https://github.com/atgreen/evergreen/pull/585)).
+- Several stream functions now follow the standard more closely:
+  - `read-char-no-hang` on an exhausted string stream returns the eof value
+    or signals `end-of-file`, instead of returning `nil`. It also rejects a
+    fifth argument with a `program-error`.
+  - The `end-of-file` that `read-char`, `read-char-no-hang` and `peek-char`
+    signal now carries the stream that ran out, so `stream-error-stream`
+    returns that stream.
+  - An echo stream echoes each character only once. A character returned by
+    `unread-char` is not echoed again when it is read, and `peek-char` does
+    not echo the character it peeks.
+  - `peek-char` with a peek type of `t` skips the characters the current
+    readtable treats as whitespace.
+  - A broadcast stream's `stream-external-format` and `file-string-length`
+    come from its last component. With no components they are `:default`
+    and 1.
+  - A string output stream made with a `base-char` element type, including
+    one from `with-output-to-string`, returns a `simple-base-string`.
+
+  ([#586](https://github.com/atgreen/evergreen/pull/586))
 - A file stream opened through a logical pathname reports that pathname:
   `pathname` of the stream returns it, and `logical-pathname` accepts the
   stream. `pathname` returned the translated physical pathname, and

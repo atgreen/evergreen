@@ -5904,6 +5904,19 @@ fn signal_and_raise(env: &mut Env, condition: EgclVal, msg: String) -> EgclError
     }
 }
 
+/// Signal END-OF-FILE for `stream` from the input function `operator`. The
+/// condition carries the stream that ran out, so STREAM-ERROR-STREAM answers it
+/// (ansi STREAM-ERROR-STREAM.1); a raw `StreamError` could only attach a
+/// synthesized stand-in.
+fn end_of_file_error(env: &mut Env, stream: EgclVal, operator: &str) -> EgclError {
+    egcl_rt::rooted!(stream = stream);
+    let stream_slot = resolve_sym("STREAM").unwrap_or(NIL);
+    match build_condition_instance(env, "END-OF-FILE", &[stream_slot, *stream]) {
+        Ok(condition) => signal_and_raise(env, condition, format!("end of file on {operator}")),
+        Err(error) => error,
+    }
+}
+
 /// bliss-9kc: signal a RAW evaluator error (a `TYPE-ERROR` from `(car 5)`,
 /// `UNBOUND-VARIABLE`, arithmetic, … — one that unwound the Rust stack *without*
 /// passing through `signal_condition_object`) through the live handler stack,
@@ -19940,7 +19953,9 @@ fn fixed_arity_builtin(bare: &str) -> Option<(usize, usize)> {
         "FILE-POSITION" | "UNREAD-CHAR" | "WRITE-CHAR" => Some((1, 2)),
         "READ-BYTE" => Some((1, 3)),
         "PEEK-CHAR" => Some((0, 5)),
-        "READ-CHAR" | "READ-LINE" | "READ-PRESERVING-WHITESPACE" | "READ" => Some((0, 4)),
+        "READ-CHAR" | "READ-CHAR-NO-HANG" | "READ-LINE" | "READ-PRESERVING-WHITESPACE" | "READ" => {
+            Some((0, 4))
+        }
         "WRITE-STRING" | "WRITE-LINE" => Some((1, 65)),
         "TERPRI" | "FRESH-LINE" | "FINISH-OUTPUT" | "FORCE-OUTPUT" | "CLEAR-OUTPUT" => {
             Some((0, 1))
@@ -20923,13 +20938,27 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             "WRITE-CHAR" => return eval_builtin_arguments(&name, cdr, env),
             "MAKE-STRING" => return eval_builtin_arguments(&name, cdr, env),
             "MAKE-STRING-OUTPUT-STREAM" => {
-                // (make-string-output-stream &key element-type): the element
-                // type is accepted (strings here hold any character) and the
-                // keywords are validated (ansi make-string-output-stream.*).
+                // (make-string-output-stream &key element-type): the keywords
+                // are validated (ansi make-string-output-stream.*). A
+                // BASE-CHAR element type (or any non-empty subtype of it)
+                // makes GET-OUTPUT-STREAM-STRING answer a SIMPLE-BASE-STRING
+                // (ansi WITH-OUTPUT-TO-STRING.8); any other type, a CHARACTER
+                // string.
                 let args = list_to_vec(cdr);
                 let vals = eval_forms(args.iter().copied(), env)?;
                 check_keyword_args("MAKE-STRING-OUTPUT-STREAM", &vals[..], &["ELEMENT-TYPE"])?;
-                return egcl_stdlib::make_string_output_stream(NIL);
+                let element_type = vals
+                    .chunks_exact(2)
+                    .find(|pair| {
+                        pair[0].is_symbol() && sym_bare_name_rc(pair[0]).as_ref() == "ELEMENT-TYPE"
+                    })
+                    .map(|pair| pair[1]);
+                let base = element_type.is_some_and(|et| {
+                    !et.is_nil()
+                        && resolve_sym("BASE-CHAR")
+                            .is_some_and(|base_char| subtypep_relation(et, base_char).0)
+                });
+                return egcl_stdlib::streams::make_string_output_stream_of(base);
             }
             "MAKE-BROADCAST-STREAM" => return eval_builtin_arguments(&name, cdr, env),
             "MAKE-CONCATENATED-STREAM" => return eval_builtin_arguments(&name, cdr, env),
