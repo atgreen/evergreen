@@ -51,7 +51,10 @@ set -u
 # sequences added 2026-10-17: ok (3287/3287) once BASE-CHAR became the element
 # type of an 8-bit base string at every constructor and copy (its last two
 # failures were LENGTH.STRING.6 and MAP.SPECIALIZED-STRING.3).
-ENABLED_CHAPTERS=(cons data-and-control-flow hash-tables characters strings conditions misc files environment sequences)
+# symbols added 2026-10-23: ok (1145/1145) once SETF SYMBOL-FUNCTION of a
+# non-symbol signalled TYPE-ERROR (symbol-function.error.4) and a LET of an
+# earmuffed name nobody proclaimed special became lexical (set.2, bliss-c3gyu).
+ENABLED_CHAPTERS=(cons data-and-control-flow hash-tables characters strings conditions misc files environment sequences symbols)
 
 ANSI_TEST_DIR="${ANSI_TEST_DIR:-$HOME/git/ansi-test}"
 EGCL_BIN="${EGCL_BIN:-target/x86_64-unknown-linux-musl/debug/egcl}"

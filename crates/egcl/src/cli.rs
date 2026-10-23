@@ -33541,6 +33541,34 @@ fn leave_body_declarations(env: &mut Env, mark: usize) {
     env.active_declarations.truncate(mark);
 }
 
+/// While the image boots, a name spelled `*…*` is special by that spelling
+/// alone: the runtime seeds the standard and built-in specials in Rust, with
+/// no DEFVAR to proclaim them. [`end_earmuff_convention`] proclaims every such
+/// symbol and turns the convention off, after which only a proclamation or a
+/// SPECIAL declaration makes a binding dynamic. CLHS has no spelling rule: a
+/// LET of an earmuffed name nobody proclaimed is lexical (bliss-c3gyu).
+static EARMUFF_CONVENTION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+fn earmuff_convention_active() -> bool {
+    EARMUFF_CONVENTION.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Proclaim every interned symbol spelled `*…*` special, then stop treating
+/// the spelling as a proclamation. Called once the image has booted.
+fn end_earmuff_convention() {
+    if !earmuff_convention_active() {
+        return;
+    }
+    for (_, name) in egcl_rt::symbols::interned_names() {
+        let bare = symbol_bare_name(&name);
+        let bare = bare.as_bytes();
+        if bare.len() > 2 && bare[0] == b'*' && bare[bare.len() - 1] == b'*' {
+            PROCLAIMED_SPECIAL.borrow_mut().insert(name);
+        }
+    }
+    EARMUFF_CONVENTION.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Register `sym` as globally special (idempotent). No-op for non-symbols.
 fn proclaim_special(sym: EgclVal) {
     if sym.is_symbol() {
@@ -33573,7 +33601,7 @@ fn is_special_var(sym: EgclVal) -> bool {
     let full = sym_name_rc(sym);
     let bare = symbol_bare_name(&full);
     let b = bare.as_bytes();
-    if b.len() > 2 && b[0] == b'*' && b[b.len() - 1] == b'*' {
+    if b.len() > 2 && b[0] == b'*' && b[b.len() - 1] == b'*' && earmuff_convention_active() {
         return true;
     }
     // A name proclaimed special (declaim/proclaim) is special even without
@@ -45468,6 +45496,8 @@ pub fn run(args: &[String]) -> Result<i32, EgclError> {
         ))]
         read_eval_all_env(include_str!("../../../lib/disassembler.lisp"), &mut env)?;
     }
+
+    end_earmuff_convention();
 
     if core_loaded {
         // A saved pathname default belongs to the builder's process. Refresh

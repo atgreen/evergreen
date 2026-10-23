@@ -8452,7 +8452,7 @@ fn closure_fn_binding_key(name: &str) -> String {
 fn is_special_name(name: &str) -> bool {
     let bare = name.rsplit(':').next().unwrap_or(name);
     let b = bare.as_bytes();
-    if b.len() > 2 && b[0] == b'*' && b[b.len() - 1] == b'*' {
+    if b.len() > 2 && b[0] == b'*' && b[b.len() - 1] == b'*' && super::earmuff_convention_active() {
         return true;
     }
     // A name proclaimed special (declaim/proclaim) is dynamic even without
