@@ -363,6 +363,9 @@
 
 ### Fixed
 
+- Iterating the symbols of a package that does not exist, with `loop` or
+  `with-package-iterator`, signals `package-error` instead of iterating
+  nothing ([#589](https://github.com/atgreen/evergreen/pull/589)).
 - Allocation no longer takes the global heap lock on every object: each
   thread counts its allocations privately and publishes them when its
   allocation buffer is retired. A cons-heavy loop runs about 20% faster, and

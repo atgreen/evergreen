@@ -67,6 +67,20 @@
                               (common-lisp:symbol-value
                                'common-lisp-user::*ansi-test-dir*)))
 
+;; The note definitions, loaded as gclload1.lsp does. None is disabled by
+;; default, so this changes nothing on its own.
+(common-lisp:load
+ (common-lisp:merge-pathnames "notes.lsp"
+                              (common-lisp:symbol-value
+                               'common-lisp-user::*ansi-test-dir*)))
+
+;; Notes ansi-test marks as assumptions beyond the standard, which EGCL, like
+;; SBCL, does not make. :LOOP-ITERATION-VALUES-IN-FINALLY assumes an
+;; arithmetic LOOP variable is never stepped past its limit before FINALLY
+;; (LOOP.1.39-43); CLHS leaves that value unspecified, and EGCL deliberately
+;; matches SBCL, where (loop for x from 1 to 5 finally (return x)) is 6.
+(rt:disable-note :loop-iteration-values-in-finally)
+
 (common-lisp:load
  (common-lisp:merge-pathnames
   (common-lisp:concatenate 'common-lisp:string

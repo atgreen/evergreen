@@ -1031,7 +1031,9 @@
   (let ((pkgs (if (listp packages) packages (list packages)))
         (result nil))
     (dolist (pd pkgs result)
-      (let* ((p (find-package pd)))
+      ;; A designator that names no package is a PACKAGE-ERROR, as for LOOP's
+      ;; package paths (CLHS 6.1.2.1.7; ansi LOOP.7.18-20), not an empty list.
+      (let* ((p (or (find-package pd) (error 'package-error :package pd))))
         (when p
           (let ((present (egcl-internal::package-symbols p nil))
                 (external (egcl-internal::package-symbols p :external))

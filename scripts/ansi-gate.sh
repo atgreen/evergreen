@@ -61,7 +61,11 @@ set -u
 # version (parse-namestring.5), a stream remembered the logical pathname it was
 # opened with (logical-pathname.3) and (:relative) stayed a specified directory
 # (pathname-match-p.4).
-ENABLED_CHAPTERS=(cons data-and-control-flow hash-tables characters strings conditions misc files environment sequences symbols eval-and-compile pathnames)
+# iteration added 2026-10-23 once a package path over a missing package
+# signalled PACKAGE-ERROR (loop.7.18-20). LOOP.1.39-43 assume the
+# :LOOP-ITERATION-VALUES-IN-FINALLY note, which EGCL (like SBCL) does not
+# meet; scripts/ansi-chapter.lisp disables that note.
+ENABLED_CHAPTERS=(cons data-and-control-flow hash-tables characters strings conditions misc files environment sequences symbols eval-and-compile pathnames iteration)
 
 ANSI_TEST_DIR="${ANSI_TEST_DIR:-$HOME/git/ansi-test}"
 EGCL_BIN="${EGCL_BIN:-target/x86_64-unknown-linux-musl/debug/egcl}"
