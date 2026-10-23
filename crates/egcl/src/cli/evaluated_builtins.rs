@@ -3390,7 +3390,9 @@ fn resolve(name: &str) -> Option<Handler> {
                 )));
             }
             let pathname = coerce_pathname_designator(args[0])?;
-            Ok(egcl_stdlib::pathname_version(pathname))
+            Ok(super::lisp_pathname_component(egcl_stdlib::pathname_version(
+                pathname,
+            )))
         }),
 
         "WILD-PATHNAME-P" => Some(|_operator, args, _env| {
