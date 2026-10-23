@@ -368,7 +368,7 @@
   allocation buffer is retired. A cons-heavy loop runs about 20% faster, and
   threads that allocate no longer serialise on that lock or on a cache line
   shared between the signal-activity word and per-thread recovery slots
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#587](https://github.com/atgreen/evergreen/pull/587)).
 - `(make-pathname :directory '(:relative))` keeps its `(:relative)`
   directory instead of turning it into NIL, so as a `pathname-match-p`
   wildcard it no longer matches every directory
