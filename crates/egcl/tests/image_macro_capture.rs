@@ -72,3 +72,34 @@ fn saved_macros_preserve_their_captured_frames() {
         String::from_utf8_lossy(&restored.stdout), String::from_utf8_lossy(&restored.stderr));
     assert!(String::from_utf8_lossy(&restored.stdout).contains("RESTORED-MACRO-CAPTURES-OK"));
 }
+
+/// A closure keeps the MACROLET definitions of its definition site across a
+/// saved image (bliss-q5acx). #539 made closures and local functions capture
+/// them, but the image did not record them, so a restored closure calling a
+/// local macro found no such macro.
+#[test]
+fn saved_closures_keep_their_captured_macrolets() {
+    let dir = std::env::temp_dir().join(format!("egcl-closure-macrolet-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let _fixture = Fixture(dir.clone());
+    let core = dir.join("closure-macrolet.core");
+    let source = format!(r#"
+      (defvar *lambda* (eval '(macrolet ((m () :local)) (lambda () (m)))))
+      (defvar *flet* (eval '(macrolet ((m () :local)) (flet ((h () (m))) #'h))))
+      ;; The expansion refers to a variable of the closure's own frame.
+      (defvar *lexical* (eval '(let ((y (list 1 2))) (macrolet ((m () '(reverse y))) (lambda () (m))))))
+      (egcl-ext:save-lisp-and-die {core:?})
+    "#);
+    let built = Command::new(env!("CARGO_BIN_EXE_egcl"))
+        .args(["--no-init", "--eval", &source]).output().unwrap();
+    assert!(built.status.success(), "{}", String::from_utf8_lossy(&built.stderr));
+    let restored = Command::new(env!("CARGO_BIN_EXE_egcl"))
+        .args(["--no-init", "--image"]).arg(&core)
+        .args(["--eval", r#"(format t "~&RESULT ~s~%"
+             (list (funcall *lambda*) (funcall *flet*) (funcall *lexical*)
+                   (macrolet ((m () :caller)) (funcall *lambda*))))"#])
+        .output().unwrap();
+    let stdout = String::from_utf8_lossy(&restored.stdout);
+    assert!(restored.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&restored.stderr));
+    assert!(stdout.contains("RESULT (:LOCAL :LOCAL (2 1) :LOCAL)"), "{stdout}");
+}
