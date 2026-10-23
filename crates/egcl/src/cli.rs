@@ -17724,17 +17724,22 @@ fn typep_matches(
             }
             Ok(true)
         }
+        // Index the rooted operand vector after each recursive check: a DEFTYPE
+        // expander or SATISFIES predicate can allocate and move a later operand
+        // (bliss-m0mwt).
         "OR" => {
-            for spec in list_to_vec(args) {
-                if typep_matches(env, object, spec)? {
+            egcl_rt::rooted!(specs = list_to_vec(args));
+            for index in 0..specs.len() {
+                if typep_matches(env, object, specs[index])? {
                     return Ok(true);
                 }
             }
             Ok(false)
         }
         "AND" => {
-            for spec in list_to_vec(args) {
-                if !typep_matches(env, object, spec)? {
+            egcl_rt::rooted!(specs = list_to_vec(args));
+            for index in 0..specs.len() {
+                if !typep_matches(env, object, specs[index])? {
                     return Ok(false);
                 }
             }
@@ -17831,16 +17836,22 @@ fn typep_matches(
             if !egcl_rt::types::complexp(object) {
                 return Ok(false);
             }
-            let specs = list_to_vec(args);
-            let Some(&spec) = specs.first() else {
+            let Some(spec) = list_to_vec(args).first().copied() else {
                 return Ok(true);
             };
             if spec.is_symbol() && sym_bare_name_rc(spec).as_ref() == "*" {
                 return Ok(true);
             }
+            // The first check can move the spec and the complex (bliss-m0mwt):
+            // keep the spec rooted, and read the imaginary part from the rooted
+            // object afterwards.
+            egcl_rt::rooted!(spec = spec);
             let re = egcl_rt::types::complex_realpart(object).unwrap_or(NIL);
+            if !typep_matches(env, re, *spec)? {
+                return Ok(false);
+            }
             let im = egcl_rt::types::complex_imagpart(object).unwrap_or(NIL);
-            Ok(typep_matches(env, re, spec)? && typep_matches(env, im, spec)?)
+            typep_matches(env, im, *spec)
         }
         "MEMBER" => Ok(list_to_vec(args)
             .into_iter()
