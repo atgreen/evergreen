@@ -363,7 +363,7 @@
   is loaded. A method compiled into the running image could run before the
   rest of its file had loaded: ASDF-FLV's `asdf:perform :around` method found
   its own `defvar` unbound, which stopped pure-tls's tests from loading
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#565](https://github.com/atgreen/evergreen/pull/565)).
 - `egcl --load FILE` no longer leaves stale heap pointers in the top-level
   environment when a garbage collection runs while the load is starting.
   Under `EGCL_GC_VERIFY` with `EGCL_GC_STRESS`, every `--load` failed
