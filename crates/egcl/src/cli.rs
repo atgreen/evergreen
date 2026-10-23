@@ -36351,7 +36351,7 @@ fn macroexpand_all(
 /// expanded now: COMPILE-FILE expands macros at compile time, and the loader
 /// must not expand them again (CLHS 3.2.2.2; GitHub #530). Best-effort, like
 /// the definition-time walk, so a form it cannot expand stays as written.
-pub(crate) fn expand_load_source_form(form: EgclVal, env: &Env) -> Result<EgclVal, EgclError> {
+fn expand_load_source_form(form: EgclVal, env: &Env) -> Result<EgclVal, EgclError> {
     let mut walk_env = env.child();
     egcl_rt::rooted_ref!(_walk_env_root = &mut walk_env);
     macroexpand_all(form, &mut walk_env, 0, &HashSet::new())
