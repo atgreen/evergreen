@@ -349,7 +349,7 @@
   contains a `defclass`, `defmethod` or `defmacro`, has its macros expanded at
   compile time. Loading the fasl expanded them again, where
   `*compile-file-pathname*` is NIL, so LIFT's `deftestsuite` inside a function
-  failed to load ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  failed to load ([#538](https://github.com/atgreen/evergreen/pull/538)).
 - `compile-file` processes the body of a top-level `macrolet` or `locally` as
   top-level forms, so an `(eval-when (:compile-toplevel) ...)` that a
   `macrolet`'s macros expand into runs during compilation, not only when the
