@@ -2894,8 +2894,10 @@ impl<'e> Lowerer<'e> {
             // not in the captured heap frame). It reaches here only when macro
             // expansion revealed it after the boxing pre-scan, so bail the
             // compile to the tree-walker rather than mis-resolve it as a global
-            // (bliss-9u6d).
+            // (bliss-9u6d). Ask the enclosing compile to retry with the name
+            // boxed, so the reference compiles next time (bliss-uamr7).
             if self.enclosing_slots.contains(&name) {
+                request_boxing([name]);
                 return Err(Bail);
             }
             // A global / special / symbol-macro reference. Symbol-macros must
@@ -3977,6 +3979,7 @@ impl<'e> Lowerer<'e> {
                 // rather than clobber a global of the same name (bliss-9u6d). A
                 // special name is not that slot, so it stores globally.
                 if !is_special_name(&name) && self.enclosing_slots.contains(&name) {
+                    request_boxing([name]);
                     return Err(Bail);
                 }
                 let sym = var.as_symbol_index();
@@ -6188,9 +6191,21 @@ impl<'e> Lowerer<'e> {
                 .collect();
             let mut used = std::collections::HashSet::new();
             collect_symbol_names(body, &mut used);
+            // Every boxed local in scope is reachable too, as for a closure: a
+            // clause can name one only through a macro expansion, which this
+            // scan of its raw source cannot see (bliss-uamr7).
             let captures = used
                 .into_iter()
                 .filter(|u| enclosing_locals.contains(u) && !params.contains(u))
+                .chain(
+                    self.scopes
+                        .iter()
+                        .flat_map(|scope| scope.iter())
+                        .filter(|(name, loc)| {
+                            matches!(loc, VarLoc::Boxed) && !params.contains(*name)
+                        })
+                        .map(|(name, _)| name.clone()),
+                )
                 .collect::<std::collections::HashSet<_>>();
             // Every captured local must already be boxed. `captured_names` is a
             // syntactic pre-scan of the UNEXPANDED body, so a restart-case
@@ -6204,9 +6219,16 @@ impl<'e> Lowerer<'e> {
                     Some(VarLoc::Slot(_)) => return Err(Bail),
                 }
             }
-            let function =
-                compile_restart_clause(params_form, body, self.env, &captures, self.portable)
-                    .ok_or(Bail)?;
+            let function = compile_restart_clause(
+                params_form,
+                body,
+                self.env,
+                &captures,
+                &self.declared_special,
+                &self.enclosing_slot_names(),
+                self.portable,
+            )
+            .ok_or(Bail)?;
             restarts.push(RestartClauseInfo {
                 name,
                 function: Box::new(function),
@@ -8200,6 +8222,8 @@ fn compile_restart_clause(
     mut body: EgclVal,
     env: &Env,
     captures: &std::collections::HashSet<String>,
+    inherited_specials: &std::collections::HashMap<String, u32>,
+    enclosing_slots: &std::collections::HashSet<String>,
     portable: bool,
 ) -> Option<BytecodeFunction> {
     // Root the source subforms across the allocating lowering (moving GC; bliss-wlf).
@@ -8207,9 +8231,23 @@ fn compile_restart_clause(
     egcl_rt::rooted_ref!(_body_root = &mut body);
     let (param_names, min_args, max_args, variadic) = parse_lambda_list(params_form)?;
     let mut lo = Lowerer::new(env);
+    // As for a capturing local function (`compile_capturing_local`): the clause sees the
+    // enclosing SPECIAL declarations, and an enclosing local it reaches only
+    // through a macro expansion -- which the capture scan of its raw source
+    // cannot see -- is an unboxed slot it cannot represent, so it bails rather
+    // than resolve the name globally (bliss-uamr7).
+    lo.declared_special = inherited_specials.clone();
+    for name in &param_names {
+        lo.declared_special.remove(name);
+    }
     egcl_rt::rooted_ref!(_const_guard = &mut lo);
     lo.portable = portable;
     lo.captured_names = compute_captured_names(body);
+    lo.enclosing_slots = enclosing_slots
+        .iter()
+        .filter(|name| !captures.contains(*name) && !param_names.contains(name))
+        .cloned()
+        .collect();
     if !captures.is_empty() {
         lo.has_env = true;
         for name in captures {
