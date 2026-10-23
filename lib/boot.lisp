@@ -6052,3 +6052,42 @@ no parameter names take their defaults."
 
 (defmacro untrace (&rest names)
   `(egcl::%untrace-functions ',names))
+
+;;; ---------------------------------------------------------------------------
+;;; WITH-LOCKED-HASH-TABLE (bliss-im7wv). Each table gets its own recursive
+;;; mutex on first use, recorded in a weak table so it lives as long as the
+;;; table. As in SBCL, the bodies of WITH-LOCKED-HASH-TABLE on one table exclude
+;;; each other; every individual operation on a :SYNCHRONIZED table is atomic
+;;; as before. The table's internal lock is a spin lock whose holder may not run
+;;; Lisp code, so it cannot be held across BODY, and accesses outside any
+;;; WITH-LOCKED-HASH-TABLE are not excluded by it.
+;;; ---------------------------------------------------------------------------
+
+(defvar egcl::*hash-table-locks* nil
+  "Hash table -> its WITH-LOCKED-HASH-TABLE mutex, created on first use.")
+
+(defvar egcl::*hash-table-locks-mutex* nil
+  "Guards creating an entry of EGCL::*HASH-TABLE-LOCKS*, created on first use.")
+
+(defun egcl::%hash-table-lock (table)
+  (unless (hash-table-p table)
+    (error 'type-error :datum table :expected-type 'hash-table))
+  ;; Created lazily, so the boot image holds no native mutex; CAS keeps one.
+  (unless egcl::*hash-table-locks-mutex*
+    (egcl-ext:cas egcl::*hash-table-locks-mutex* nil
+                  (egcl-thread:make-mutex :name "hash table locks")))
+  (egcl-thread:with-mutex (egcl::*hash-table-locks-mutex*)
+    (let ((locks (or egcl::*hash-table-locks*
+                     (setq egcl::*hash-table-locks*
+                           (make-hash-table :test 'eq :weakness :key :synchronized t)))))
+      (or (gethash table locks)
+          (setf (gethash table locks)
+                (egcl-thread:make-mutex :name "hash table" :recursive t))))))
+
+(defmacro egcl-ext:with-locked-hash-table ((table) &body body)
+  "Run BODY holding TABLE's recursive lock, excluding every other
+WITH-LOCKED-HASH-TABLE on TABLE for its dynamic extent."
+  `(egcl-thread:with-mutex ((egcl::%hash-table-lock ,table))
+     ,@body))
+
+(export 'egcl-ext:with-locked-hash-table :egcl-ext)

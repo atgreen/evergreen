@@ -344,11 +344,13 @@ is idempotent.
 
 `:SYNCHRONIZED T` requests internal reader/writer locking. `:WEAKNESS` accepts
 `:KEY`, `:VALUE`, `:KEY-AND-VALUE`, or `:KEY-OR-VALUE`.
-`WITH-LOCKED-HASH-TABLE` holds the table's exclusive recursive lock for the
-dynamic extent. The current `MAKE-HASH-TABLE` honours `:TEST`, `:SYNCHRONIZED`
-and `:WEAKNESS`, and accepts but ignores the other keyword pairs.
-`HASH-TABLE-SYNCHRONIZED-P` and `HASH-TABLE-WEAKNESS` are implemented;
-`WITH-LOCKED-HASH-TABLE` remains specified-only.
+`WITH-LOCKED-HASH-TABLE` holds a recursive lock of the table's own for the
+dynamic extent of its body, so the bodies of `WITH-LOCKED-HASH-TABLE` forms on
+one table exclude each other, as in SBCL. Every single operation on a
+`:SYNCHRONIZED` table is atomic in any case, but the lock does not hold off an
+access outside `WITH-LOCKED-HASH-TABLE`: wrap every access that must not
+interleave. The current `MAKE-HASH-TABLE` honours `:TEST`, `:SYNCHRONIZED` and
+`:WEAKNESS`, and accepts but ignores the other keyword pairs.
 
 ### Images, exit, timeout, and pathname helpers
 
