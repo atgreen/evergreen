@@ -15909,13 +15909,8 @@ fn restore_handler_env(current: &mut HandlerEnv, saved: &HandlerEnv) {
 fn env_frame_ancestor(frame: &HandlerEnv, levels: usize) -> HandlerEnv {
     let mut frame = frame.clone();
     for _ in 0..levels {
-        frame = match frame {
-            Some(child) => {
-                let parent = child.borrow().parent.clone();
-                parent
-            }
-            None => return None,
-        };
+        let child = frame?;
+        frame = child.borrow().parent.clone();
     }
     frame
 }
