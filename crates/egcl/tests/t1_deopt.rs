@@ -451,7 +451,8 @@ fn eval_traced(program: &str, envs: &[(&str, &str)]) -> (String, String) {
 /// arithmetic site of a double-float function compiles to the cold fixnum
 /// guess and deopts. A disproved cold guess is a phase change, not evidence
 /// that native code is unprofitable: the function recompiles from the profile
-/// gathered since and reaches T2, rather than being blacklisted to T0.
+/// gathered since and reaches T2, rather than being blacklisted to T0. Since
+/// bliss-9bw59 it does so once the site is profiled, not after the threshold.
 #[test]
 fn disproved_cold_double_guess_recompiles_to_t2() {
     let program = "\
@@ -477,7 +478,7 @@ fn disproved_cold_double_guess_recompiles_to_t2() {
         trace
             .lines()
             .any(|line| line.contains("[T2] S-DOUBLE: native guard")
-                && line.contains("supported numeric phase change => generic T1 + recompile")),
+                && line.contains("cold fixnum guess disproved => generic T1 + recompile")),
         "the cold-guess failure recompiles:\n{trace}"
     );
     assert!(
@@ -521,10 +522,14 @@ fn cold_branch_double_recompiles_instead_of_blacklisting() {
             ("EGCL_T2_LOG", "stderr"),
         ],
     );
+    // The disproved guess recompiles as soon as the branch has a profile,
+    // without waiting for the blacklist threshold (bliss-9bw59).
     assert!(
-        trace.contains("[T2] BR: native guard deopt #3 => resuming interpreted (threshold hit: supported numeric phase change"),
+        trace.lines().any(|line| line.starts_with("[T2] BR: native guard deopt #")
+            && line.contains("(cold fixnum guess disproved => generic T1 + recompile)")),
         "the cold-branch failure recompiles:\n{trace}"
     );
+    assert!(!trace.contains("[T2] BR: native guard deopt #3"), "before the threshold:\n{trace}");
     assert!(
         !trace
             .lines()
