@@ -18321,20 +18321,20 @@ fn typep_matches(
             egcl_stdlib::numbers::byte_type_p(object, width, op.as_ref() == "SIGNED-BYTE")
         }
         "MOD" => {
-            if !object.is_fixnum() {
+            // (mod n) is (integer 0 (n)). Either may be a bignum: the fixnum-only
+            // check answered NIL for a bignum object and panicked on a bignum
+            // modulus (bliss-tgt4). Compare exactly, as the INTEGER arm does.
+            if !egcl_rt::types::integerp(object) {
                 return Ok(false);
             }
-            let value = object.as_fixnum();
-            let bounds = list_to_vec(args);
-            // The size/modulus argument may be omitted or `*` (wild).
-            let size = bounds.first().copied().and_then(|b| {
-                if b.is_symbol() && sym_bare_name_rc(b).as_ref() == "*" {
-                    None
-                } else {
-                    Some(b.as_fixnum())
-                }
-            });
-            Ok(size.map(|n| value >= 0 && value < n).unwrap_or(false))
+            let Some(&size) = list_to_vec(args).first() else {
+                return Ok(false);
+            };
+            if !egcl_rt::types::integerp(size) {
+                return Ok(false);
+            }
+            Ok(numeric_cmp(object, EgclVal::from_fixnum(0))? != Ordering::Less
+                && numeric_cmp(object, size)? == Ordering::Less)
         }
         "SATISFIES" => {
             let (predicate, _) = cp(args);
