@@ -349,6 +349,10 @@
 
 ### Fixed
 
+- In a file compiled with `compile-file`, a `restart-case` clause that names
+  an enclosing local variable only through a macro now reads and sets that
+  local, as in SBCL. It used the global value instead
+  ([#552](https://github.com/atgreen/evergreen/pull/552)).
 - In compiled code, a `setq` or `setf` of a variable declared special by an
   enclosing `locally` or binding form's `declare` now sets the dynamic value,
   as in SBCL. When a lexical binding of the same name enclosed the
