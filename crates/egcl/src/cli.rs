@@ -36150,6 +36150,46 @@ fn macroexpand_all(
             let new_body = mx_each_scoped(*body, env, d, local_functions)?;
             arena_cons(car, arena_cons(*new_bindings, new_body))
         }
+        // (defun name lambda-list body...) — keep the name and lambda list; a
+        // parameter or its default is not a call. A DEFMACRO's lambda list and
+        // body run at expansion time, so it is left whole.
+        "DEFUN" => {
+            let (fname, rest) = cp(cdr);
+            let (ll, body) = cp(rest);
+            egcl_rt::rooted!(fname = fname);
+            egcl_rt::rooted!(ll = ll);
+            let new_body = mx_each_scoped(body, env, d, local_functions)?;
+            let tail = arena_cons(*ll, new_body);
+            let tail = arena_cons(*fname, tail);
+            arena_cons(car, tail)
+        }
+        "DEFMACRO" | "DEFINE-COMPILER-MACRO" => form,
+        // (defmethod name qualifier... specialized-lambda-list body...)
+        "DEFMETHOD" => {
+            let mut prefix = Vec::new();
+            let mut body = cdr;
+            egcl_rt::rooted_ref!(_prefix_root = &mut prefix);
+            if body.is_cons() {
+                let (fname, tail) = cp(body);
+                prefix.push(fname);
+                body = tail;
+            }
+            // Qualifiers are atoms; the lambda list is the first list.
+            while body.is_cons() {
+                let (element, tail) = cp(body);
+                prefix.push(element);
+                body = tail;
+                if element.is_cons() || element.is_nil() {
+                    break;
+                }
+            }
+            let mut new_form = mx_each_scoped(body, env, d, local_functions)?;
+            egcl_rt::rooted_ref!(_new_form_root = &mut new_form);
+            for i in (0..prefix.len()).rev() {
+                new_form = arena_cons(prefix[i], new_form);
+            }
+            arena_cons(car, new_form)
+        }
         "LAMBDA" => {
             // (lambda lambda-list body...) — keep the lambda list, expand body.
             let (ll, body) = cp(cdr);
@@ -36294,6 +36334,16 @@ fn macroexpand_all(
         // position (tags, block names, setq/setf place symbols) pass through.
         _ => arena_cons(car, mx_each_scoped(cdr, env, d, local_functions)?),
     })
+}
+
+/// A top-level form the file compiler keeps as source, with its macros
+/// expanded now: COMPILE-FILE expands macros at compile time, and the loader
+/// must not expand them again (CLHS 3.2.2.2; GitHub #530). Best-effort, like
+/// the definition-time walk, so a form it cannot expand stays as written.
+pub(crate) fn expand_load_source_form(form: EgclVal, env: &Env) -> Result<EgclVal, EgclError> {
+    let mut walk_env = env.child();
+    egcl_rt::rooted_ref!(_walk_env_root = &mut walk_env);
+    macroexpand_all(form, &mut walk_env, 0, &HashSet::new())
 }
 
 /// Expand the bodies of RESTART-CASE or HANDLER-CASE clauses, preserving each
