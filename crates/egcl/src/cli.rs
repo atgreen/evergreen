@@ -16133,9 +16133,11 @@ fn require_stream(v: EgclVal) -> Result<(), EgclError> {
 
 /// A pathname component as Lisp sees it: the stdlib's internal wild sentinel
 /// becomes the real `:WILD` keyword (ansi pathname-name.*, directory.*).
-fn lisp_pathname_component(component: EgclVal) -> EgclVal {
+pub(super) fn lisp_pathname_component(component: EgclVal) -> EgclVal {
     if egcl_stdlib::pathnames::is_wild_sentinel(component) {
         resolve_sym(":WILD").unwrap_or(component)
+    } else if egcl_stdlib::pathnames::is_newest_sentinel(component) {
+        resolve_sym(":NEWEST").unwrap_or(component)
     } else {
         component
     }
@@ -42554,7 +42556,10 @@ fn apply_builtin_fast(
         }
         "PATHNAME-VERSION" if args.len() == 1 => {
             env.clear_mv();
-            Some(coerce_pathname_designator(args[0]).map(egcl_stdlib::pathname_version))
+            Some(
+                coerce_pathname_designator(args[0])
+                    .map(|p| lisp_pathname_component(egcl_stdlib::pathname_version(p))),
+            )
         }
         "PATHNAME-HOST" if args.len() == 1 => {
             env.clear_mv();

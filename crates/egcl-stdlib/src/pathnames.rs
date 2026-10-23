@@ -36,6 +36,37 @@ enum ComponentSpec {
     Wild,
 }
 
+/// A pathname's version as parsed from, and rendered into, a logical
+/// namestring (CLHS 19.3.1): `NEWEST`, `*` or a positive integer. Physical
+/// namestrings carry no version.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum VersionSpec {
+    Newest,
+    Wild,
+    Number(u64),
+}
+
+fn version_from_val(val: EgclVal) -> Option<VersionSpec> {
+    if is_keyword(val, "NEWEST") {
+        Some(VersionSpec::Newest)
+    } else if is_wild(val) {
+        Some(VersionSpec::Wild)
+    } else if val.is_fixnum() && val.as_fixnum() > 0 {
+        Some(VersionSpec::Number(val.as_fixnum() as u64))
+    } else {
+        None
+    }
+}
+
+fn version_to_val(version: Option<VersionSpec>) -> EgclVal {
+    match version {
+        None => NIL,
+        Some(VersionSpec::Newest) => EgclVal::from_raw(keyword_hash("NEWEST")),
+        Some(VersionSpec::Wild) => EgclVal::from_raw(keyword_hash("WILD")),
+        Some(VersionSpec::Number(n)) => EgclVal::from_fixnum(n as i64),
+    }
+}
+
 #[derive(Clone, Debug)]
 struct ParsedPathname {
     is_logical: bool,
@@ -45,6 +76,7 @@ struct ParsedPathname {
     directory: Option<DirectorySpec>,
     name: Option<ComponentSpec>,
     type_field: Option<ComponentSpec>,
+    version: Option<VersionSpec>,
 }
 
 #[derive(Clone)]
@@ -336,6 +368,12 @@ pub fn is_wild_sentinel(val: EgclVal) -> bool {
     val.0 == keyword_hash("WILD")
 }
 
+/// True for the stdlib's internal `:NEWEST` sentinel, the version a logical
+/// namestring's `NEWEST` field parses to (bliss-3kcwz).
+pub fn is_newest_sentinel(val: EgclVal) -> bool {
+    val.0 == keyword_hash("NEWEST")
+}
+
 fn alloc_pathname(rec: PathnameRecord) -> EgclVal {
     install_pathname_global_root_scanner();
     // A pathname is a REAL heap object carrying the PATHNAME type_id in its
@@ -553,6 +591,7 @@ fn parse_physical_namestring(s: &str) -> Result<ParsedPathname, EgclError> {
             directory: None,
             name: None,
             type_field: None,
+            version: None,
         });
     }
 
@@ -611,6 +650,7 @@ fn parse_physical_namestring(s: &str) -> Result<ParsedPathname, EgclError> {
         directory,
         name,
         type_field,
+        version: None,
     })
 }
 
@@ -661,11 +701,22 @@ fn parse_logical_namestring(
         })
     };
 
+    let mut version = None;
     let (name, type_field) = if let Some(segment) = final_segment {
         let upper = segment.to_uppercase();
         let pieces: Vec<&str> = upper.split('.').collect();
         let name_piece = pieces.first().copied().unwrap_or("");
         let type_piece = pieces.get(1).copied().unwrap_or("");
+        version = match pieces.get(2).copied() {
+            Some("NEWEST") => Some(VersionSpec::Newest),
+            Some("*") => Some(VersionSpec::Wild),
+            Some(digits) => digits
+                .parse::<u64>()
+                .ok()
+                .filter(|n| *n > 0 && *n <= i64::MAX as u64 >> 4)
+                .map(VersionSpec::Number),
+            None => None,
+        };
         (
             nil_if_empty(name_piece.to_string()).map(|value| {
                 if value == "*" {
@@ -693,6 +744,7 @@ fn parse_logical_namestring(
         directory,
         name,
         type_field,
+        version,
     })
 }
 
@@ -848,6 +900,13 @@ fn render_namestring_from_parsed(parsed: &ParsedPathname) -> String {
                 ComponentSpec::Literal(text) => out.push_str(text),
                 ComponentSpec::Wild => out.push('*'),
             }
+            // A version needs a type before it (CLHS 19.3.1).
+            match parsed.version {
+                Some(VersionSpec::Newest) => out.push_str(".NEWEST"),
+                Some(VersionSpec::Wild) => out.push_str(".*"),
+                Some(VersionSpec::Number(n)) => out.push_str(&format!(".{n}")),
+                None => {}
+            }
         }
         out
     } else {
@@ -934,6 +993,11 @@ fn normalize_record(
         directory: directory_spec,
         name: component_from_val(name, is_logical),
         type_field: component_from_val(type_field, is_logical),
+        version: if is_logical {
+            version_from_val(version)
+        } else {
+            None
+        },
     };
 
     #[cfg(windows)]
@@ -984,7 +1048,11 @@ fn build_record_from_namestring(
         directory,
         name,
         type_field,
-        version: NIL,
+        version: if parsed.is_logical {
+            version_to_val(parsed.version)
+        } else {
+            NIL
+        },
         parsed,
         namestring,
     }
@@ -1198,6 +1266,7 @@ pub fn merge_pathnames(
                 .type_field
                 .clone()
                 .or_else(|| def.parsed.type_field.clone()),
+            version: version_from_val(version),
         },
         namestring: None,
     };
@@ -1782,6 +1851,7 @@ fn translate_pathname_with_patterns(
                 &captures.type_fragments,
             ),
         },
+        version: to_pattern.parsed.version.or(source.parsed.version),
     };
     Ok(build_record_from_namestring(
         parsed,
@@ -2615,6 +2685,7 @@ fn pn_get_parsed(data: &[u8], off: &mut usize) -> Option<ParsedPathname> {
         directory,
         name,
         type_field,
+        version: None,
     })
 }
 
@@ -2753,6 +2824,7 @@ mod windows_image_tests {
             }),
             name: Some(ComponentSpec::Literal("demo".into())),
             type_field: Some(ComponentSpec::Literal("lisp".into())),
+            version: None,
         };
         let mut bytes = Vec::new();
         pn_put_parsed(&mut bytes, &legacy);
@@ -2784,6 +2856,10 @@ pub fn populate_pathnames(remap: &dyn Fn(u64) -> u64) {
         let directory = stringify_directory(&parsed.directory, parsed.is_logical);
         #[cfg(not(windows))]
         let directory = resolve(&slots[2]);
+        let version = resolve(&slots[5]);
+        if parsed.is_logical {
+            parsed.version = version_from_val(version);
+        }
         let rec = PathnameRecord {
             host: resolve(&slots[0]),
             device: parsed
@@ -2794,7 +2870,7 @@ pub fn populate_pathnames(remap: &dyn Fn(u64) -> u64) {
             directory,
             name: resolve(&slots[3]),
             type_field: resolve(&slots[4]),
-            version: resolve(&slots[5]),
+            version,
             parsed,
             namestring,
         };
