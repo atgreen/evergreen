@@ -253,6 +253,10 @@ pub const IF_DOES_NOT_EXIST_CREATE_VAL: EgclVal = EgclVal(5 << 3);
 struct StreamAlloc {
     /// Opening namestring, retained after CLOSE; absent for non-file streams.
     file_namestring: Option<String>,
+    /// The logical namestring OPEN was given, when it was given a logical
+    /// pathname: PATHNAME of the stream is that pathname, not its translation
+    /// (CLHS PATHNAME; ansi LOGICAL-PATHNAME.3; bliss-ssc6w).
+    logical_namestring: std::sync::OnceLock<String>,
     /// Immutable component references of a composite stream (broadcast /
     /// concatenated components, two-way/echo input+output, synonym symbol), or
     /// empty for non-composite streams. Stored OUTSIDE the per-stream mutex so
@@ -2543,6 +2547,7 @@ fn alloc_stream(
     // to it for the composite op arms.
     let mut boxed = Box::new(StreamAlloc {
         file_namestring,
+        logical_namestring: std::sync::OnceLock::new(),
         components: components.into_boxed_slice(),
         // Two orders per stream, state first so it takes the LARGER value and
         // `input` the smaller: the pair must be acquirable as input -> state,
@@ -2721,6 +2726,15 @@ fn get_stream_alloc(stream: EgclVal) -> Result<&'static StreamAlloc, EgclError> 
 }
 
 /// Copy a file stream's immutable opening namestring without taking its I/O lock.
+/// The namestring of the pathname a file stream was opened with: its logical
+/// namestring when OPEN was given a logical pathname, else the physical one.
+pub(crate) fn opening_namestring(stream: EgclVal) -> Result<String, EgclError> {
+    if let Some(logical) = get_stream_alloc(stream)?.logical_namestring.get() {
+        return Ok(logical.clone());
+    }
+    file_namestring(stream)
+}
+
 pub(crate) fn file_namestring(stream: EgclVal) -> Result<String, EgclError> {
     get_stream_alloc(stream)?
         .file_namestring
@@ -2884,6 +2898,33 @@ fn missing_file_policy(if_does_not_exist: EgclVal, path_str: &str) -> Result<(),
 }
 
 pub fn open(
+    pathname: EgclVal,
+    direction: StreamDirection,
+    element_type_val: EgclVal,
+    if_exists: EgclVal,
+    if_does_not_exist: EgclVal,
+    external_format: ExternalFormat,
+) -> Result<EgclVal, EgclError> {
+    // Read before opening: the namestring is Rust text, so no Lisp value has
+    // to survive the allocations below.
+    let logical = crate::pathnames::logical_namestring_of(pathname);
+    let stream = open_file(
+        pathname,
+        direction,
+        element_type_val,
+        if_exists,
+        if_does_not_exist,
+        external_format,
+    )?;
+    if let Some(logical) = logical
+        && stream != NIL
+    {
+        let _ = get_stream_alloc(stream)?.logical_namestring.set(logical);
+    }
+    Ok(stream)
+}
+
+fn open_file(
     pathname: EgclVal,
     direction: StreamDirection,
     element_type_val: EgclVal,
