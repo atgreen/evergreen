@@ -349,6 +349,10 @@
 
 ### Fixed
 
+- A closure saved in an image keeps the `macrolet` definitions of the place it
+  was written. After the image was restored, a closure that called such a
+  local macro signalled an error
+  ([#548](https://github.com/atgreen/evergreen/pull/548)).
 - A user method on `make-instance` can `call-next-method` into the built-in
   behaviour, and `next-method-p` is true there. It signalled that
   CALL-NEXT-METHOD was undefined. `(make-instance 'name ...)` also now runs

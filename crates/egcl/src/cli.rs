@@ -3486,6 +3486,10 @@ fn hr_get_u64(data: &[u8], off: &mut usize) -> Option<u64> {
 /// Runs after a stop-the-world major GC (no mutator allocation); only reads raw
 /// tagged pointers, so it is GC-safe. Only source-bearing macros are emitted
 /// (bytecode expanders recompile on demand and their bodies are `NIL`).
+/// A saved macro definition: its name, raw lambda list and body words, and the
+/// id of its captured frame.
+type HostMacroRecord = (String, u64, u64, u32);
+
 fn host_serialize_registries() -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(b"HREG");
@@ -3535,9 +3539,23 @@ fn host_serialize_registries() -> Vec<u8> {
         });
         let mut frame_ids: HashMap<usize, u32> = HashMap::new();
         let mut frames: Vec<Arc<SharedCell<EnvFrame>>> = Vec::new();
+        // The frames of closures' captured MACROLET definitions (bliss-q5acx).
+        let captured_macro_frames: Vec<Arc<SharedCell<EnvFrame>>> = reg
+            .values()
+            .filter_map(|c| c.captured_macros.as_ref())
+            .flat_map(|macros| {
+                macros
+                    .borrow()
+                    .values()
+                    .filter(|d| d.bytecode.is_none() && d.function.is_none())
+                    .map(|d| Arc::clone(&d.captured_frame))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
         let roots: Vec<Arc<SharedCell<EnvFrame>>> = reg
             .values()
             .map(|c| Arc::clone(&c.captured_frame))
+            .chain(captured_macro_frames)
             .chain(bc_env.iter().map(|(_, f)| Arc::clone(f)))
             .chain(method_frames)
             .chain(macro_frames)
@@ -3883,6 +3901,45 @@ fn host_serialize_registries() -> Vec<u8> {
             out.extend_from_slice(&(closure.captured_specials.len() as u32).to_le_bytes());
             for &symbol in &closure.captured_specials {
                 out.extend_from_slice(&symbol.to_le_bytes());
+            }
+        }
+    }
+    // Each closure's captured MACROLET definitions (bliss-q5acx), written like
+    // the global macros above. Without them a restored closure that calls a
+    // local macro of its definition site found no such macro.
+    out.extend_from_slice(b"CMAC");
+    {
+        let registry = closure_registry();
+        let closures = registry.borrow();
+        let records: Vec<(u64, Vec<HostMacroRecord>)> = closures
+            .iter()
+            .filter_map(|(&id, closure)| {
+                let macros = closure.captured_macros.as_ref()?;
+                let defs: Vec<HostMacroRecord> = macros
+                    .borrow()
+                    .iter()
+                    .filter(|(_, d)| d.bytecode.is_none() && d.function.is_none())
+                    .map(|(name, d)| {
+                        (
+                            name.clone(),
+                            d.params_form.to_raw(),
+                            d.body.to_raw(),
+                            frame_id_of(Some(&d.captured_frame)),
+                        )
+                    })
+                    .collect();
+                (!defs.is_empty()).then_some((id, defs))
+            })
+            .collect();
+        out.extend_from_slice(&(records.len() as u32).to_le_bytes());
+        for (id, defs) in &records {
+            out.extend_from_slice(&id.to_le_bytes());
+            out.extend_from_slice(&(defs.len() as u32).to_le_bytes());
+            for (name, params_raw, body_raw, frame_id) in defs {
+                hr_put_str(&mut out, name);
+                out.extend_from_slice(&params_raw.to_le_bytes());
+                out.extend_from_slice(&body_raw.to_le_bytes());
+                out.extend_from_slice(&frame_id.to_le_bytes());
             }
         }
     }
@@ -4471,6 +4528,45 @@ fn host_restore_registries(data: &[u8]) -> Result<(), EgclError> {
             }
             if let Some(closure) = registry.borrow_mut().get_mut(&id) {
                 closure.captured_specials = declarations;
+            }
+        }
+    }
+    // Closures' captured MACROLETs (bliss-q5acx); absent from older images.
+    if off + 4 <= data.len() && &data[off..off + 4] == b"CMAC" {
+        off += 4;
+        let bad = || EgclError::InvalidImage("host registry: truncated captured macros".into());
+        let frames = PENDING_CLSR_FRAMES.with(|frames| frames.borrow().clone());
+        let count = hr_get_u32(data, &mut off).ok_or_else(bad)?;
+        let registry = closure_registry();
+        for _ in 0..count {
+            let id = hr_get_u64(data, &mut off).ok_or_else(bad)?;
+            let n_defs = hr_get_u32(data, &mut off).ok_or_else(bad)?;
+            let mut defs = HashMap::new();
+            for _ in 0..n_defs {
+                let name = hr_get_str(data, &mut off).ok_or_else(bad)?;
+                let params = hr_get_u64(data, &mut off).ok_or_else(bad)?;
+                let body = hr_get_u64(data, &mut off).ok_or_else(bad)?;
+                let fid = hr_get_u32(data, &mut off).ok_or_else(bad)?;
+                let captured_frame = frames.get(fid as usize).cloned().unwrap_or_else(|| {
+                    Arc::new(SharedCell::new(EnvFrame {
+                        vars: VecMap::default(),
+                        symbol_vars: VecMap::default(),
+                        parent: None,
+                    }))
+                });
+                defs.insert(
+                    name,
+                    MacroDef {
+                        params_form: EgclVal::from_raw(remap(params)),
+                        body: EgclVal::from_raw(remap(body)),
+                        captured_frame,
+                        bytecode: None,
+                        function: None,
+                    },
+                );
+            }
+            if let Some(closure) = registry.borrow_mut().get_mut(&id) {
+                closure.captured_macros = Some(Arc::new(SharedCell::new(defs)));
             }
         }
     }
