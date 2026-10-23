@@ -390,6 +390,7 @@ mod tests {
             env.handlers.push(HandlerCluster {
                 entries: vec![HandlerEntry {
                     type_name: "TYPE-ERROR".into(),
+                    compound_type: NIL,
                     handler: HandlerImpl::Function(resolve_sym(name).unwrap()),
                 }],
             });

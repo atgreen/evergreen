@@ -3105,6 +3105,7 @@ unsafe fn call_or_throw_unpublished(
                             let handler_value = unsafe { *call.args.add(index) };
                             entries.push(HandlerEntry {
                                 type_name: try_clone_string(type_name)?,
+                                compound_type: NIL,
                                 handler: HandlerImpl::Function(handler_value),
                             });
                             values.push(type_symbol);
@@ -3316,6 +3317,7 @@ unsafe fn call_or_throw_unpublished(
                         let token = try_control_token("__HANDLER_CASE__")?;
                         entries.push(HandlerEntry {
                             type_name: try_clone_string(&clause.type_name)?,
+                            compound_type: NIL,
                             handler: HandlerImpl::HandlerCase {
                                 token: try_clone_string(&token)?,
                                 var_name: None,

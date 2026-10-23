@@ -2820,8 +2820,44 @@ struct RestartInvoked {
 
 #[derive(Clone)]
 struct HandlerEntry {
+    /// The clause's type when it is a symbol, as a name string; the empty
+    /// string when the clause names a compound type.
     type_name: String,
+    /// A clause's type specifier when it is not a symbol — `(or error
+    /// storage-condition)`, `(and error (not warning))`, … — and NIL otherwise.
+    /// Any type specifier is legal in HANDLER-CASE / HANDLER-BIND (CLHS 9.2);
+    /// such a clause matches exactly when TYPEP would (GH #532). A heap form, so
+    /// it is traced with the entry.
+    compound_type: EgclVal,
     handler: HandlerImpl,
+}
+
+/// The clause type fields for a HANDLER-CASE / HANDLER-BIND type form: a symbol
+/// keeps its name for the fast hierarchy match; anything else is kept as the
+/// type specifier itself, to be tested with TYPEP.
+fn handler_clause_type(type_form: EgclVal) -> (String, EgclVal) {
+    if type_form.is_symbol() || type_form.is_nil() {
+        (sym_name(type_form), NIL)
+    } else {
+        (String::new(), type_form)
+    }
+}
+
+/// Whether `condition` is of the type a handler clause names. A symbol clause
+/// uses the condition-hierarchy match; a compound type specifier is a full TYPEP
+/// test, so OR / AND / NOT / MEMBER / SATISFIES and DEFTYPEs all mean what they
+/// mean everywhere else. TYPEP can allocate (and a SATISFIES predicate can run
+/// arbitrary code), so the condition and specifier are rooted inside
+/// `typep_matches`; callers must hold `entry` in a traced container.
+fn handler_entry_matches(
+    env: &mut Env,
+    condition: EgclVal,
+    entry: &HandlerEntry,
+) -> Result<bool, EgclError> {
+    if entry.compound_type.is_nil() {
+        return Ok(condition_matches_handler(env, condition, &entry.type_name));
+    }
+    typep_matches(env, condition, entry.compound_type)
 }
 
 /// The set of handlers established by a single HANDLER-BIND or HANDLER-CASE
@@ -5648,8 +5684,11 @@ fn run_handler_cluster(env: &mut Env, condition: EgclVal, ci: usize) -> Result<(
     }
     egcl_rt::rooted!(condition = condition);
     egcl_rt::rooted!(entries = env.handlers[ci].entries.clone());
-    for entry in entries.iter() {
-        if condition_matches_handler(env, *condition, &entry.type_name) {
+    for index in 0..entries.len() {
+        // A compound clause type is tested with TYPEP, which can allocate; the
+        // entries stay in the rooted Vec so its specifier is traced meanwhile.
+        if handler_entry_matches(env, *condition, &entries[index])? {
+            let entry = &entries[index];
             let mut tail = env.handlers.split_off(ci);
             egcl_rt::rooted_ref!(_tail = &mut tail);
             // A raw evaluator error from the callback is a fresh signal in
@@ -5782,7 +5821,7 @@ pub(crate) fn must_escape_best_effort(error: &EgclError) -> bool {
     }
 }
 
-fn condition_matches_type_spec(env: &Env, condition: EgclVal, type_spec: EgclVal) -> bool {
+fn condition_matches_type_spec(env: &mut Env, condition: EgclVal, type_spec: EgclVal) -> bool {
     if type_spec.is_nil() {
         return false;
     }
@@ -5792,25 +5831,25 @@ fn condition_matches_type_spec(env: &Env, condition: EgclVal, type_spec: EgclVal
     if type_spec.is_symbol() {
         return condition_matches_handler(env, condition, &sym_name(type_spec));
     }
-    let Ok(class) = resolve_class_metaobject(env, type_spec) else {
-        return false;
-    };
-    egcl_stdlib::compute_class_precedence_list(egcl_stdlib::class_of(condition))
-        .map(|cpl| cpl.into_iter().any(|entry| entry == class))
-        .unwrap_or(false)
+    // Any other type specifier — a compound one such as `(or error warning)`,
+    // or a class object — means what TYPEP says it means (GH #532).
+    matches!(typep_matches(env, condition, type_spec), Ok(true))
 }
 
 fn maybe_break_on_signals(condition: EgclVal, env: &mut Env) -> Result<(), EgclError> {
     let Some(type_spec) = env.lookup_var("*BREAK-ON-SIGNALS*") else {
         return Ok(());
     };
-    if !condition_matches_type_spec(env, condition, type_spec) {
+    // A compound specifier's TYPEP can allocate; it is restored below.
+    egcl_rt::rooted!(type_spec = type_spec);
+    egcl_rt::rooted!(condition = condition);
+    if !condition_matches_type_spec(env, *condition, *type_spec) {
         return Ok(());
     }
 
     env.set_var("*BREAK-ON-SIGNALS*", NIL);
-    let debugger_result = egcl_stdlib::invoke_debugger(condition);
-    env.set_var("*BREAK-ON-SIGNALS*", type_spec);
+    let debugger_result = egcl_stdlib::invoke_debugger(*condition);
+    env.set_var("*BREAK-ON-SIGNALS*", *type_spec);
     match debugger_result {
         Ok(()) | Err(_) => Ok(()),
     }
@@ -9330,6 +9369,7 @@ impl egcl_rt::gc::TraceHostRoots for HandlerCluster {
 
 impl egcl_rt::gc::TraceHostRoots for HandlerEntry {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
+        visit(&mut self.compound_type);
         with_env_visit_state(|state| visit_handler_roots(&mut self.handler, state, visit));
     }
 }
@@ -9774,6 +9814,7 @@ impl Env {
         }
         for cluster in &mut self.handlers {
             for entry in &mut cluster.entries {
+                visit(&mut entry.compound_type);
                 visit_handler_roots(&mut entry.handler, state, visit);
             }
         }
@@ -42592,8 +42633,10 @@ fn eval_handler_case(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> 
         } else {
             None
         };
+        let (type_name, compound_type) = handler_clause_type(type_form);
         let entry = HandlerEntry {
-            type_name: sym_name(type_form),
+            type_name,
+            compound_type,
             handler: HandlerImpl::HandlerCase {
                 token: token.clone(),
                 var_name: var_name.clone(),
@@ -42644,6 +42687,17 @@ fn eval_handler_case(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> 
             // A condition signalled through HANDLER-CASE's own handlers arrives as
             // a control token naming the selected clause.
             if let Some(token) = handler_case_token(&error) {
+                // The token may name a clause of an ENCLOSING HANDLER-CASE that
+                // matched while this one declined; it is only passing through.
+                // Leave its stashed condition for that owner — taking it here
+                // handed the outer clause NIL as its condition (GH #532).
+                let owned = installed.iter().any(|entry| {
+                    matches!(&entry.handler,
+                        HandlerImpl::HandlerCase { token: entry_token, .. } if *entry_token == token)
+                });
+                if !owned {
+                    return Err(error);
+                }
                 let condition = take_control_value(&token);
                 for handler in installed {
                     if let HandlerImpl::HandlerCase {
@@ -42692,7 +42746,18 @@ fn eval_handler_case(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> 
             // (control-flow tokens, Shutdown) yield None and propagate unchanged.
             if let Some(mut condition) = egcl_error_to_condition(env, &error)? {
                 egcl_rt::rooted_ref!(_condition_root = &mut condition);
-                for handler in installed {
+                // Find the first matching clause while `installed` is still the
+                // rooted Vec: a compound clause type runs TYPEP, which can
+                // allocate.
+                let mut selected = None;
+                for index in 0..installed.len() {
+                    if handler_entry_matches(env, condition, &installed[index])? {
+                        selected = Some(index);
+                        break;
+                    }
+                }
+                if let Some(index) = selected {
+                    let handler = installed.swap_remove(index);
                     if let HandlerImpl::HandlerCase {
                         var_name,
                         body,
@@ -42700,31 +42765,29 @@ fn eval_handler_case(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> 
                         ..
                     } = handler.handler
                     {
-                        if condition_matches_handler(env, condition, &handler.type_name) {
-                            let mut handler_env = env.child_with_parent(captured_frame);
-                            // Root the handler env for the clause body — its
-                            // frame holds the condition variable, which a body
-                            // GC would otherwise leave dangling (bliss-5jwg).
-                            egcl_rt::rooted_ref!(_handler_env_root = &mut handler_env);
-                            egcl_rt::rooted!(dyn_binds = Vec::<DynBind>::new());
-                            if let Some(name) = var_name {
-                                bind_handler_case_variable(
-                                    &mut handler_env, &name, condition, body, &mut dyn_binds,
-                                );
-                            }
-                            let r = eval_progn(body, &mut handler_env)?;
-                            // Propagate the handler's multiple-value state to the
-                            // caller. The handler body runs in a CHILD env, so a
-                            // `(values …)` in it set handler_env.mv, not env.mv;
-                            // without this the secondary values are lost — e.g.
-                            // IGNORE-ERRORS' `(values nil c)` dropped the condition
-                            // (bliss-xy7t). GC-safe: no allocation between
-                            // eval_progn returning and moving the value vector, so
-                            // `r` and the mv values stay put.
-                            env.mv = std::mem::take(&mut handler_env.mv);
-                            env.mv_active = handler_env.mv_active;
-                            return Ok(r);
+                        let mut handler_env = env.child_with_parent(captured_frame);
+                        // Root the handler env for the clause body — its
+                        // frame holds the condition variable, which a body
+                        // GC would otherwise leave dangling (bliss-5jwg).
+                        egcl_rt::rooted_ref!(_handler_env_root = &mut handler_env);
+                        egcl_rt::rooted!(dyn_binds = Vec::<DynBind>::new());
+                        if let Some(name) = var_name {
+                            bind_handler_case_variable(
+                                &mut handler_env, &name, condition, body, &mut dyn_binds,
+                            );
                         }
+                        let r = eval_progn(body, &mut handler_env)?;
+                        // Propagate the handler's multiple-value state to the
+                        // caller. The handler body runs in a CHILD env, so a
+                        // `(values …)` in it set handler_env.mv, not env.mv;
+                        // without this the secondary values are lost — e.g.
+                        // IGNORE-ERRORS' `(values nil c)` dropped the condition
+                        // (bliss-xy7t). GC-safe: no allocation between
+                        // eval_progn returning and moving the value vector, so
+                        // `r` and the mv values stay put.
+                        env.mv = std::mem::take(&mut handler_env.mv);
+                        env.mv_active = handler_env.mv_active;
+                        return Ok(r);
                     }
                 }
             }
@@ -42740,25 +42803,33 @@ fn eval_handler_bind(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> 
     let base_len = env.handlers.len();
 
     // Parse all bindings into one cluster (this HANDLER-BIND form), in source
-    // order. Establishing the cluster is a single push.
+    // order. Establishing the cluster is a single push. Each handler form is
+    // evaluated before the next binding is read, and evaluation can collect:
+    // the binding forms and the entries built so far — their handler functions
+    // and compound clause types (GH #532) — are rooted until the cluster owns
+    // them.
+    egcl_rt::rooted!(binding_forms = list_to_vec(bindings_form));
     let mut entries = Vec::new();
-    let mut c = bindings_form;
-    while c.is_cons() {
-        let (binding, rest) = cp(c);
-        let (type_form, handler_rest) = cp(binding);
+    egcl_rt::rooted_ref!(_entries_root = &mut entries);
+    for index in 0..binding_forms.len() {
+        let (_, handler_rest) = cp(binding_forms[index]);
         let (handler_form, _) = cp(handler_rest);
         // Per ANSI, each handler spec is a FORM evaluated (in this lexical
         // environment) to produce the handler function — e.g. `#'(lambda (c) …)`
         // must become a closure that captures its surroundings, not the raw
         // `(FUNCTION (LAMBDA …))` list (which apply cannot call). Evaluate it now.
         let handler_fn = eval_form(handler_form, env)?;
+        let (type_name, compound_type) = handler_clause_type(cp(binding_forms[index]).0);
         entries.push(HandlerEntry {
-            type_name: sym_name(type_form),
+            type_name,
+            compound_type,
             handler: HandlerImpl::Function(handler_fn),
         });
-        c = rest;
     }
-    env.handlers.push(HandlerCluster { entries });
+    // Move the entries out, leaving the rooted place empty rather than stale.
+    env.handlers.push(HandlerCluster {
+        entries: std::mem::take(&mut entries),
+    });
     let cluster_index = base_len;
 
     let result = eval_progn(body, env);
@@ -45693,10 +45764,12 @@ mod env_gc_root_tests {
             entries: vec![
                 HandlerEntry {
                     type_name: "T".into(),
+                    compound_type: NIL,
                     handler: HandlerImpl::Function(marker(22)),
                 },
                 HandlerEntry {
                     type_name: "T".into(),
+                    compound_type: NIL,
                     handler: HandlerImpl::HandlerCase {
                         token: "ROOT-HANDLER".into(),
                         var_name: None,

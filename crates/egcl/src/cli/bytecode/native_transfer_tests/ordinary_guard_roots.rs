@@ -47,6 +47,7 @@ fn ordinary_foreign_guard_error_preserves_caller_identity_after_collection() {
     let (symbol, caller, child) = install_chain(&mut env);
     env.handlers.push(HandlerCluster { entries: vec![HandlerEntry {
         type_name: "TYPE-ERROR".into(),
+        compound_type: NIL,
         handler: HandlerImpl::Function(resolve_sym("ORDINARY-GUARD-ROOTS-HANDLER").unwrap()),
     }] });
     HeapCollector::new().minor_gc().unwrap();
