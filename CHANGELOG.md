@@ -99,6 +99,15 @@
   `(setf car)` / `(setf cdr)` now cost about 1 µs instead of 3-27 µs.
   `equal` hash tables with string keys hash and compare the keys in place
   ([#610](https://github.com/atgreen/evergreen/pull/610)).
+- On s390x, a loop whose entry carries a hoisted fixnum proof can be entered
+  mid-loop at T2. Such loops previously installed optimized code with no
+  on-stack-replacement entry to land on, so they could only be replaced into
+  T1. Measured on a z16, one counted integer loop runs at about 0.022 µs per
+  iteration entered at T2 against about 0.088 µs entered at T1; across the
+  tier-differential corpus 24 more functions now publish at least one
+  on-stack-replacement entry. A loop in a function that never reaches T2 at
+  all is unaffected
+  ([#611](https://github.com/atgreen/evergreen/pull/611)).
 - `substitute`, `substitute-if` and `substitute-if-not` on a whole list
   without `:count` or `:from-end` make one pass over the list, as `remove`
   does since #607. Substituting in an 8-element list drops from about 207 µs to

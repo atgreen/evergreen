@@ -2267,10 +2267,17 @@ pub fn emit_framed_with_runtime(
     }
     let mut osr_entries = Vec::new();
     for osr in &function.osr_entries {
-        // Imported values this entry must type-check are only tested by the
-        // x86-64 framed emitter; without the test the loop's proofs would not
-        // hold for an interpreter value, so decline the entry (bliss-5yz5h).
-        if !osr.checks.is_empty() {
+        // Imported values bypass the preheader guards, so the entry must
+        // establish each proof itself: every check has to be a fixnum fact
+        // about a homed value, or the entry is declined (bliss-5yz5h). The
+        // blanket decline this replaces cost every loop with a loop-entry
+        // fixnum proof its T2 OSR entry, so such a loop could only ever OSR
+        // into T1 -- measured at 4.1x the T2 loop's cost (bliss-7rlys).
+        if !osr.checks.iter().all(|&(value, ty)| {
+            !ty.bits.is_bottom()
+                && ty.bits.meet(TypeBits::FIXNUM) == ty.bits
+                && emitter.homes.contains_key(&value)
+        }) {
             continue;
         }
         let state = function.frame_states.get(osr.frame_state);
@@ -2320,11 +2327,31 @@ pub fn emit_framed_with_runtime(
         {
             continue;
         }
+        // A checked value that is not imported here never reaches the loop
+        // through this entry, so there is nothing to test; decline.
+        if osr
+            .checks
+            .iter()
+            .any(|(value, _)| !imports.iter().any(|(_, imported)| imported == value))
+        {
+            continue;
+        }
         let offset = emitter.asm.here();
         emitter.prologue();
         for (slot, value) in imports {
             emitter.asm.load(2, 13, slot as i32 * 8);
             emitter.store(value, 2)?;
+        }
+        // Establish the proofs the loop relies on for imported values: a
+        // non-fixnum deoptimises to the header state before any iteration,
+        // so the loop body's unguarded fixnum arithmetic stays sound.
+        if !osr.checks.is_empty() {
+            let deopt = emitter.asm.label();
+            emitter.deopts.push((osr.frame_state, deopt));
+            for &(value, _) in &osr.checks {
+                emitter.load(value, 2)?;
+                emitter.guard_fixnum(2, deopt);
+            }
         }
         emitter.asm.branch(15, emitter.blocks[&osr.block]);
         osr_entries.push((osr.bcp, offset));
@@ -3704,6 +3731,108 @@ mod tests {
             DEOPT.with(|out| {
                 assert_eq!(*out.borrow(), [1, 71, 9, 1, 2, input, input, 8]);
                 out.borrow_mut().clear();
+            });
+        }
+    }
+
+    /// A checked OSR entry imports the loop header's live values, proves each
+    /// one is a fixnum, and only then enters the loop -- so a loop whose
+    /// preheader guard was hoisted can still be entered mid-flight. Before
+    /// this the emitter declined every such entry, which left those loops
+    /// able to OSR into T1 but never into T2 (bliss-7rlys, bliss-5yz5h).
+    #[test]
+    fn a_checked_osr_entry_proves_its_imports_and_deopts_when_one_is_not_a_fixnum() {
+        use crate::t2::ir::OsrEntry;
+
+        thread_local! {
+            static RECONSTRUCTED: std::cell::RefCell<Vec<u64>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+        }
+        // On System Z the deopt adapter resumes the callee locally and hands
+        // its value back, so this one returns a value where riscv64's is void.
+        extern "C" fn reconstruct(nscopes: u64, nwords: u64, words: *const u64, _: u64) -> u64 {
+            // SAFETY: the deopt exit passes its own serialisation buffer.
+            let words = unsafe { std::slice::from_raw_parts(words, nwords as usize) };
+            RECONSTRUCTED.with(|out| {
+                let mut out = out.borrow_mut();
+                out.push(nscopes);
+                out.extend_from_slice(words);
+            });
+            NIL.0
+        }
+
+        let mut f = Function::new("z-osr-only-guard");
+        let entry = f.entry();
+        let x = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+        f.set_terminator(
+            entry,
+            InstData {
+                opcode: Opcode::Return,
+                args: vec![x],
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags {
+                    terminator: true,
+                    ..Default::default()
+                },
+                targets: vec![],
+                frame_state: None,
+                source_pos: 0,
+            },
+        );
+        let frame_state = f.frame_states.add(FrameState {
+            scopes: vec![FrameScope {
+                function: 0,
+                bcp: 0,
+                locals: vec![ValueSource::Value {
+                    value: x,
+                    repr: ValueRepresentation::Tagged,
+                }],
+                stack: vec![],
+            }],
+            remat: vec![],
+        });
+        f.osr_entries.push(OsrEntry {
+            control_scopes: Vec::new(),
+            bcp: 0,
+            block: entry,
+            frame_state,
+            checks: vec![(x, IRType::of(TypeBits::FIXNUM))],
+        });
+        crate::t2::verify::verify(&f).expect("OSR identity IR verifies");
+        let framed = emit_framed(&f, reconstruct as *const () as usize as u64, 1)
+            .expect("emit OSR identity");
+        let _ = &RECONSTRUCTED;
+        assert_eq!(framed.osr_entries.len(), 1, "checked OSR entry is emitted");
+        assert!(
+            framed.has_deopt,
+            "an OSR guard needs deopt source snapshots even without instruction guards"
+        );
+        #[cfg(all(target_arch = "s390x", unix))]
+        {
+            let buffer = egcl_rt::jit::JitBuffer::new(&framed.code).expect("mmap");
+            // SAFETY: the OSR entry is a C-ABI entry inside the buffer, at the
+            // offset the emitter published for it.
+            let osr: extern "C" fn(*mut u64) -> u64 =
+                unsafe { std::mem::transmute(buffer.as_ptr().add(framed.osr_entries[0].1)) };
+            let mut slots = [EgclVal::from_fixnum(7).0];
+            assert_eq!(osr(slots.as_mut_ptr()), slots[0], "a fixnum import enters");
+            RECONSTRUCTED.with(|out| assert!(out.borrow().is_empty(), "no deopt"));
+            // A non-fixnum import fails the entry guard before any iteration:
+            // the exit hands the header frame (function 0, bcp 0, 1 local,
+            // 0 stack, then x) to the adapter and returns NIL, as every
+            // home-based backend does.
+            slots[0] = EgclVal::from_single_float(2.0).0;
+            assert_eq!(
+                osr(slots.as_mut_ptr()),
+                NIL.0,
+                "a non-fixnum deopts, returning what the adapter resumed with"
+            );
+            RECONSTRUCTED.with(|out| {
+                assert_eq!(
+                    *out.borrow(),
+                    [1, 0, 0, 1, 0, EgclVal::from_single_float(2.0).0]
+                );
             });
         }
     }
