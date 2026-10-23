@@ -349,7 +349,7 @@
   the same name as one of its siblings now calls that sibling, as in SBCL. It
   signalled an undefined-function error, because the function looked up its
   siblings where it was called rather than where it was defined
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#544](https://github.com/atgreen/evergreen/pull/544)).
 - Compiled code now leaves a `let` correctly on a non-local exit when a closure
   captures one of its variables. This covers a `throw` to a `catch`, a
   `return-from`, a `go`, an `unwind-protect` cleanup and a `handler-case`
