@@ -12419,6 +12419,20 @@ fn list_to_vec(val: EgclVal) -> Vec<EgclVal> {
 /// in NIL; any other tail means the argument was improper (dotted) or not a
 /// list at all. Callers that must honour ENDP semantics — DOLIST, LOOP's `in`
 /// driver — check that tail and signal a TYPE-ERROR (bliss-p9qk).
+/// APPLY's spreadable last argument as a vector of arguments. CLHS requires
+/// a proper list; a non-list or dotted list used to be spread silently, so
+/// `(apply #'list 1 2)` returned (1) (bliss-0qbf).
+fn apply_spread_list(val: EgclVal) -> Result<Vec<EgclVal>, EgclError> {
+    let (items, tail) = list_to_vec_with_tail(val);
+    if !tail.is_nil() {
+        return Err(EgclError::TypeError {
+            datum: val,
+            expected: "LIST".to_string(),
+        });
+    }
+    Ok(items)
+}
+
 fn list_to_vec_with_tail(val: EgclVal) -> (Vec<EgclVal>, EgclVal) {
     let mut result = Vec::new();
     let mut c = val;
@@ -23269,18 +23283,13 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                                 // this way (bliss-omw).
                                 egcl_rt::rooted!(seq_r = eval_form(tgt_form, env)?);
                                 let (start_form, rest2) = cp(cp(*aargs).1);
+                                // Bounds are fixnums or NIL, held as plain data.
                                 let start_v = eval_form(start_form, env)?;
-                                let start = if start_v.is_fixnum() {
-                                    start_v.as_fixnum().max(0) as usize
-                                } else {
-                                    0
-                                };
-                                let end = if rest2.is_cons() {
+                                let end_v = if rest2.is_cons() {
                                     let (end_form, _) = cp(rest2);
-                                    let ev = eval_form(end_form, env)?;
-                                    ev.is_fixnum().then(|| ev.as_fixnum().max(0) as usize)
+                                    eval_form(end_form, env)?
                                 } else {
-                                    None
+                                    NIL
                                 };
                                 // ANSI order: the new value is evaluated after the
                                 // sequence, start and end subforms (SUBSEQ.ORDER.3/4).
@@ -23290,8 +23299,46 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                                 }
                                 let seq = *seq_r;
                                 let dst_len = egcl_stdlib::length(seq)?;
+                                // START and END must bound a subsequence of SEQ, as
+                                // for SUBSEQ itself. Bad bounds were coerced: a
+                                // non-integer start became 0, a negative one was
+                                // clamped and an end past the length truncated
+                                // (bliss-9zfj).
+                                if !start_v.is_fixnum() {
+                                    return Err(EgclError::TypeError {
+                                        datum: start_v,
+                                        expected: "(INTEGER 0 *)".into(),
+                                    });
+                                }
+                                if !end_v.is_nil() && !end_v.is_fixnum() {
+                                    return Err(EgclError::TypeError {
+                                        datum: end_v,
+                                        expected: "(OR NULL (INTEGER 0 *))".into(),
+                                    });
+                                }
+                                let start_i = start_v.as_fixnum();
+                                let end_i = if end_v.is_nil() {
+                                    dst_len as i64
+                                } else {
+                                    end_v.as_fixnum()
+                                };
+                                // As SBCL's BOUNDING-INDICES-BAD-ERROR, a TYPE-ERROR
+                                // naming the offending index.
+                                if start_i < 0 || start_i > dst_len as i64 {
+                                    return Err(EgclError::TypeError {
+                                        datum: start_v,
+                                        expected: format!("(INTEGER 0 {dst_len})"),
+                                    });
+                                }
+                                if end_i < start_i || end_i > dst_len as i64 {
+                                    return Err(EgclError::TypeError {
+                                        datum: end_v,
+                                        expected: format!("(INTEGER {start_i} {dst_len})"),
+                                    });
+                                }
+                                let start = start_i as usize;
                                 let src_len = egcl_stdlib::length(*val)?;
-                                let limit = end.unwrap_or(dst_len).min(dst_len);
+                                let limit = end_i as usize;
                                 let n = limit.saturating_sub(start).min(src_len);
                                 if seq.is_cons() {
                                     // (setf (subseq list start end) new): set_elt
@@ -24268,7 +24315,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     *rest = *r;
                     if is_last {
                         // Last arg is a list to spread.
-                        args.extend(list_to_vec(v));
+                        args.extend(apply_spread_list(v)?);
                     } else {
                         args.push(v);
                     }
@@ -32339,7 +32386,9 @@ fn eval_not_equal(args: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         ));
     }
     if v.len() == 1 {
-        numeric_cmp(v[0], v[0])?;
+        // Any NUMBER is valid alone, complexes included; NUMERIC-CMP accepts
+        // only reals (ansi /=.1; bliss-cbjz).
+        numeric_equal(v[0], v[0])?;
         return Ok(T);
     }
     for i in 0..v.len() {
@@ -42370,7 +42419,10 @@ fn apply_builtin_fast(
             let mut spread: Vec<EgclVal> = Vec::with_capacity(rest.len());
             for (i, &v) in rest.iter().enumerate() {
                 if i + 1 == rest.len() {
-                    spread.extend(list_to_vec(v));
+                    match apply_spread_list(v) {
+                        Ok(items) => spread.extend(items),
+                        Err(error) => return Some(Err(error)),
+                    }
                 } else {
                     spread.push(v);
                 }
@@ -44437,6 +44489,15 @@ fn eval_defpackage(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         // A repeated source spelling, nickname, or reexport may designate the
         // same symbol. Different same-named symbols are still a conflict, even
         // for shadowing imports; reject before creating or mutating the package.
+        // CLHS DEFPACKAGE: :IMPORT-FROM a package that does not exist is a
+        // PACKAGE-ERROR. It interned fresh symbols instead (bliss-g9i8).
+        for (from, _, _) in &import_from {
+            if egcl_stdlib::find_package(&resolve_package_name(env, from)).is_none() {
+                return Err(EgclError::PackageError(format!(
+                    "DEFPACKAGE: there is no package named {from} to import from"
+                )));
+            }
+        }
         let mut imported = std::collections::HashMap::new();
         for (from, name, shadowing) in &import_from {
             let symbol = find_symbol_in_package(env, from, name).map(|(symbol, _)| symbol);
