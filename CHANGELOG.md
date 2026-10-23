@@ -363,6 +363,10 @@
 
 ### Fixed
 
+- `egcl-ext:atomic-incf` and `egcl-ext:atomic-decf` on a structure or CLOS
+  accessor place work in compiled functions and `compile`d lambdas. They
+  signalled "not a structure-slot accessor"
+  ([#580](https://github.com/atgreen/evergreen/pull/580)).
 - A `let` of a variable whose name has earmuffs, such as `*x*`, is lexical
   unless the variable was proclaimed special by `defvar`, `defparameter`,
   `declaim` or a `special` declaration, as the standard requires. Every such

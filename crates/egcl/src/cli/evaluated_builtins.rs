@@ -1046,13 +1046,14 @@ fn resolve(name: &str) -> Option<Handler> {
                 )));
             }
             let args = RootedVals::new(args.to_vec());
-            let accessor = symbol_bare_name(&sym_name(args[1]));
-            let slot = accessor_slot_symbol_cached_by_name(env, args[0], &accessor)
-                .ok_or_else(|| {
-                    EgclError::ProgramError(format!(
-                        "{} is not a structure-slot accessor",
-                        accessor
-                    ))
+            // The accessor arrives as its own symbol, as for %CAS-ACCESSOR. It
+            // used to be a keyword re-resolved by name, which found no slot in
+            // compiled code (bliss-n824t).
+            let slot = accessor_slot_symbol_cached(env, args[0], args[1]).ok_or_else(|| {
+                EgclError::ProgramError(format!(
+                    "{} is not a structure-slot accessor",
+                    sym_name(args[1])
+                ))
             })?;
             egcl_stdlib::clos::atomic_update_slot_value(
                 args[0], slot, args[2], !args[3].is_nil(),
