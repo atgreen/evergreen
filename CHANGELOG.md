@@ -385,7 +385,7 @@
   - A string output stream made with a `base-char` element type, including
     one from `with-output-to-string`, returns a `simple-base-string`.
 
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR))
+  ([#586](https://github.com/atgreen/evergreen/pull/586))
 - A file stream opened through a logical pathname reports that pathname:
   `pathname` of the stream returns it, and `logical-pathname` accepts the
   stream. `pathname` returned the translated physical pathname, and
