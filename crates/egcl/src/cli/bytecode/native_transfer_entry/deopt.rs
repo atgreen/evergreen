@@ -266,23 +266,29 @@ unsafe fn take_guard_resume_state(
     let mut saved_handlers = unsafe { &mut *context.handlers }.drain(..);
     let mut saved_binds = unsafe { &mut *context.handler_binds }.drain(..);
     let mut saved_restarts = unsafe { &mut *context.restart_cases }.drain(..);
-    for scope in active {
+    // The resumed activation takes the guard site's frame; each handler keeps
+    // the frame it was established in (bliss-uhsp5).
+    let site_env_frame = unsafe { (*context.env_frame).clone() };
+    for (scope, scope_env) in active.iter().zip(scope_env_frames(active, &site_env_frame)) {
         let handler = match scope.kind {
             ScopeKind::Block { id, resume_bcp, register: false } => Handler::Block {
                 block_id: id,
                 token: String::new(),
                 resume_bcp,
                 sp_restore: scope.sp_restore,
+                env: scope_env,
             },
             ScopeKind::Tagbody { id } => Handler::Tag {
                 tagbody_id: id,
                 sp_restore: scope.sp_restore,
                 token: None,
                 tag_bcps: Vec::new(),
+                env: scope_env,
             },
             ScopeKind::Unwind { cleanup_bcp } => Handler::Unwind {
                 cleanup_bcp,
                 sp_restore: scope.sp_restore,
+                env: scope_env,
             },
             ScopeKind::Cleanup { .. } | ScopeKind::SpecialBinding { .. }
                 | ScopeKind::LexicalEnvironment => continue,
@@ -290,6 +296,7 @@ unsafe fn take_guard_resume_state(
                 token: saved_catches.next().expect("validated catch order").token,
                 resume_bcp,
                 sp_restore: scope.sp_restore,
+                env: scope_env,
             },
             ScopeKind::HandlerCase { .. } => {
                 let saved = saved_handlers.next().expect("validated handler-case order");
@@ -298,6 +305,7 @@ unsafe fn take_guard_resume_state(
                     sp_restore: scope.sp_restore,
                     cluster_base: saved.cluster_base,
                     cluster_frame: saved.cluster_frame,
+                    env: scope_env,
                 }
             }
             ScopeKind::HandlerBind { .. } => {
@@ -314,6 +322,7 @@ unsafe fn take_guard_resume_state(
                     resume_bcp,
                     sp_restore: scope.sp_restore,
                     cluster_frame: saved.cluster_frame,
+                    env: scope_env,
                 }
             }
             _ => unreachable!("validated local guard scopes"),
@@ -1412,11 +1421,13 @@ unsafe fn resume_native_child_guard(
         else {
             return Err(invalid_capture());
         };
+        // A native child resumes with no EnvFrame of its own.
         state.handlers.push(Handler::Block {
             block_id: id,
             token: String::new(),
             resume_bcp,
             sp_restore: scope.sp_restore,
+            env: None,
         });
     }
     egcl_rt::rooted!(state = Some(state));

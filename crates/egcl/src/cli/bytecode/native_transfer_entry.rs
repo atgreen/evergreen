@@ -1944,14 +1944,19 @@ impl TransferCode {
             unsafe { slot_set(frame, index as u16, *value) };
         }
         let specials = unsafe { &mut *context.specials };
+        // The frame current at the site, which the activation resumes in.
+        let site_env_frame = unsafe { (*context.env_frame).clone() };
         let restored_handlers = site
             .map()
             .control_scopes
             .iter()
+            // Each handler resumes in the frame it was established in, not in
+            // a child frame entered natively after it (bliss-uhsp5).
+            .zip(scope_env_frames(&site.map().control_scopes, &site_env_frame))
             // A lexical environment is the activation's EnvFrame, not a handler.
-            .filter(|scope| !matches!(scope.kind, ScopeKind::Cleanup { .. }
+            .filter(|(scope, _)| !matches!(scope.kind, ScopeKind::Cleanup { .. }
                 | ScopeKind::SpecialBinding { .. } | ScopeKind::LexicalEnvironment))
-            .map(|scope| match scope.kind {
+            .map(|(scope, scope_env)| match scope.kind {
                 ScopeKind::Block {
                     id,
                     resume_bcp,
@@ -1961,16 +1966,19 @@ impl TransferCode {
                     token: String::new(),
                     resume_bcp,
                     sp_restore: scope.sp_restore,
+                    env: scope_env,
                 },
                 ScopeKind::Tagbody { id } => Handler::Tag {
                     tagbody_id: id,
                     sp_restore: scope.sp_restore,
                     token: None,
                     tag_bcps: Vec::new(),
+                    env: scope_env,
                 },
                 ScopeKind::Unwind { cleanup_bcp } => Handler::Unwind {
                     cleanup_bcp,
                     sp_restore: scope.sp_restore,
+                    env: scope_env,
                 },
                 ScopeKind::HandlerCase { .. } => {
                     let saved = handlers
@@ -1982,6 +1990,7 @@ impl TransferCode {
                         sp_restore: scope.sp_restore,
                         cluster_base: saved.cluster_base,
                         cluster_frame: saved.cluster_frame,
+                        env: scope_env,
                     }
                 }
                 ScopeKind::HandlerBind { .. } => {
@@ -2004,6 +2013,7 @@ impl TransferCode {
                         resume_bcp,
                         sp_restore: scope.sp_restore,
                         cluster_frame: saved.cluster_frame,
+                        env: scope_env,
                     }
                 }
                 ScopeKind::Catch { resume_bcp } => Handler::Catch {
@@ -2015,6 +2025,7 @@ impl TransferCode {
                         .clone(),
                     resume_bcp,
                     sp_restore: scope.sp_restore,
+                    env: scope_env,
                 },
                 _ => unreachable!("admission checked all scope records"),
             })
@@ -2036,7 +2047,7 @@ impl TransferCode {
             cleanup_conts: cleanups.drain(..).map(|saved| saved.continuation).collect(),
             dyn_binds: specials.drain(..).map(|saved| saved.binding).collect(),
             // The exact frame, including child frames entered natively.
-            env_frame: unsafe { (*context.env_frame).clone() },
+            env_frame: site_env_frame,
             fn_obj: None,
             sym: u32::MAX,
         }];

@@ -15801,6 +15801,7 @@ enum Handler {
         token: String,
         resume_bcp: u32,
         sp_restore: u16,
+        env: HandlerEnv,
     },
     /// `BLOCK`: keyed by a lexical compile-time id (compiled `return-from`) and
     /// a control token registered in `env.block_stack` (tree-walker `return-from`).
@@ -15809,6 +15810,7 @@ enum Handler {
         token: String,
         resume_bcp: u32,
         sp_restore: u16,
+        env: HandlerEnv,
     },
     /// `TAGBODY`: keyed by a lexical compile-time id; a local `GO` targets a tag
     /// PC. For a tagbody whose body captures a closure, `NamedTag` instructions
@@ -15820,9 +15822,14 @@ enum Handler {
         sp_restore: u16,
         token: Option<String>,
         tag_bcps: Vec<(String, u32)>,
+        env: HandlerEnv,
     },
     /// `UNWIND-PROTECT`: a cleanup to run on any unwind through this point.
-    Unwind { cleanup_bcp: u32, sp_restore: u16 },
+    Unwind {
+        cleanup_bcp: u32,
+        sp_restore: u16,
+        env: HandlerEnv,
+    },
     /// `HANDLER-CASE`: a cluster of condition-typed clauses. `cluster_base` is
     /// the `env.handlers` length before this cluster was pushed.
     HandlerCase {
@@ -15830,6 +15837,7 @@ enum Handler {
         sp_restore: u16,
         cluster_base: usize,
         cluster_frame: *mut Frame,
+        env: HandlerEnv,
     },
     /// `HANDLER-BIND`: handlers already registered in `env.handlers`. On a raw
     /// structured error unwinding through here, the handlers get their turn.
@@ -15844,7 +15852,133 @@ enum Handler {
         resume_bcp: u32,
         sp_restore: u16,
         cluster_frame: *mut Frame,
+        env: HandlerEnv,
     },
+}
+
+
+/// The activation's heap `EnvFrame` at the moment a handler was established.
+///
+/// Every handler that can resume its activation — a CATCH, BLOCK or TAGBODY
+/// landing, an UNWIND-PROTECT cleanup, a HANDLER-CASE clause or a RESTART-CASE
+/// return — resumes code lowered OUTSIDE any LET entered after the handler, so
+/// it must also resume in that LET's enclosing frame. A non-local exit skips the
+/// LET's `PopEnvChild`; without this record the activation kept the inner
+/// child frame, so a later read of a shadowed name saw the inner binding and a
+/// later closure captured the wrong frame (bliss-uhsp5).
+///
+/// The recorded frame is always an ancestor of (or equal to) the activation's
+/// current frame while the handler is live, so tracing the current chain
+/// already reaches it; `Activation` traces it explicitly anyway.
+type HandlerEnv = Option<Arc<SharedCell<EnvFrame>>>;
+
+impl Handler {
+    /// The `EnvFrame` recorded when this handler was established, for the
+    /// handlers that can resume their activation.
+    fn env(&self) -> Option<&HandlerEnv> {
+        match self {
+            Handler::Catch { env, .. }
+            | Handler::Block { env, .. }
+            | Handler::Tag { env, .. }
+            | Handler::Unwind { env, .. }
+            | Handler::HandlerCase { env, .. }
+            | Handler::RestartCase { env, .. } => Some(env),
+            Handler::HandlerBind { .. } => None,
+        }
+    }
+}
+
+/// Re-enter the `EnvFrame` a landing handler recorded (bliss-uhsp5). Leaves
+/// `current` untouched when it already is that frame, so the common case — no
+/// LET was crossed — costs a pointer comparison.
+fn restore_handler_env(current: &mut HandlerEnv, saved: &HandlerEnv) {
+    let same = match (current.as_ref(), saved.as_ref()) {
+        (Some(current), Some(saved)) => Arc::ptr_eq(current, saved),
+        (None, None) => true,
+        _ => false,
+    };
+    if !same {
+        *current = saved.clone();
+    }
+}
+
+/// The frame `levels` lexical children above `frame` — the frame a handler
+/// recorded when `levels` lexical environments were entered after it. Used to
+/// rebuild handler records for an activation reconstructed at a mid-function
+/// PC from native code, which knows only the innermost frame.
+fn env_frame_ancestor(frame: &HandlerEnv, levels: usize) -> HandlerEnv {
+    let mut frame = frame.clone();
+    for _ in 0..levels {
+        frame = match frame {
+            Some(child) => {
+                let parent = child.borrow().parent.clone();
+                parent
+            }
+            None => return None,
+        };
+    }
+    frame
+}
+
+/// Whether a local `Go` / `ReturnFrom` in `bf` leaves a lexical child
+/// `EnvFrame` entered after its target tagbody / block (bliss-uhsp5). Bytecode
+/// is structured, so the textual PushEnvChild/PopEnvChild count before a PC is
+/// its lexical depth.
+fn local_exit_crosses_env_frame(bf: &BytecodeFunction) -> bool {
+    if !bf.code.iter().any(|instr| matches!(instr, Instr::PushEnvChild)) {
+        return false;
+    }
+    let mut depth = 0usize;
+    let mut targets: Vec<(bool, u32, usize)> = Vec::new();
+    let target_depth = |targets: &[(bool, u32, usize)], tag: bool, id: u32| {
+        targets
+            .iter()
+            .rev()
+            .find(|&&(is_tag, target, _)| is_tag == tag && target == id)
+            .map(|&(_, _, depth)| depth)
+    };
+    for instr in &bf.code {
+        match instr {
+            Instr::PushEnvChild => depth += 1,
+            Instr::PopEnvChild => depth = depth.saturating_sub(1),
+            Instr::PushBlock { block_id, .. } => targets.push((false, *block_id, depth)),
+            Instr::PushTag { tagbody_id, .. } => targets.push((true, *tagbody_id, depth)),
+            Instr::ReturnFrom { block_id } => {
+                if target_depth(&targets, false, *block_id).is_none_or(|target| target < depth) {
+                    return true;
+                }
+            }
+            Instr::Go { tagbody_id, .. } => {
+                if target_depth(&targets, true, *tagbody_id).is_none_or(|target| target < depth) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// For a native site's control scopes (outermost first) and the activation's
+/// frame AT that site, the `EnvFrame` each scope was established in: `current`
+/// minus the lexical environments entered after it. Allocates nothing, so the
+/// deopt paths can call it after their last fallible step (bliss-uhsp5).
+fn scope_env_frames<'a>(
+    scopes: &'a [egcl_compiler::control_scope::ControlScope],
+    current: &'a HandlerEnv,
+) -> impl Iterator<Item = HandlerEnv> + 'a {
+    use egcl_compiler::control_scope::ScopeKind;
+    let is_env = |scope: &egcl_compiler::control_scope::ControlScope| {
+        matches!(scope.kind, ScopeKind::LexicalEnvironment)
+    };
+    let total = scopes.iter().filter(|scope| is_env(scope)).count();
+    let mut entered = 0;
+    scopes.iter().map(move |scope| {
+        if is_env(scope) {
+            entered += 1;
+        }
+        env_frame_ancestor(current, total - entered)
+    })
 }
 
 /// A live `handler-case` clause: its control token (shared with `env.handlers`),
@@ -16019,7 +16153,25 @@ impl egcl_rt::gc::TraceHostRoots for Activation {
                 super::visit_env_frame_roots(env_frame, state, visit);
             });
         }
+        trace_handler_envs(&self.handlers, visit);
     }
+}
+
+/// Trace the `EnvFrame`s recorded by live handlers (bliss-uhsp5). Each is an
+/// ancestor of its activation's current frame, so the shared per-pass visit
+/// state normally stops at the first lookup; tracing them keeps a handler's
+/// frame current even if that invariant were ever broken.
+fn trace_handler_envs(handlers: &[Handler], visit: &mut dyn FnMut(*mut EgclVal)) {
+    if !handlers.iter().any(|handler| matches!(handler.env(), Some(Some(_)))) {
+        return;
+    }
+    super::with_env_visit_state(|state| {
+        for handler in handlers {
+            if let Some(Some(frame)) = handler.env() {
+                super::visit_env_frame_roots(frame, state, visit);
+            }
+        }
+    });
 }
 
 impl Drop for Activation {
@@ -17375,10 +17527,12 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                 let tag = acts[top_idx].pop_op();
                 let token = next_control_token("__THROW__");
                 env.catch_stack.push((tag, token.clone()));
+                let handler_env = acts[top_idx].env_frame.clone();
                 acts[top_idx].handlers.push(Handler::Catch {
                     token,
                     resume_bcp,
                     sp_restore,
+                    env: handler_env,
                 });
             }
             Instr::PushBlock {
@@ -17415,22 +17569,26 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                     // `String::new()` does not allocate.
                     String::new()
                 };
+                let handler_env = acts[top_idx].env_frame.clone();
                 acts[top_idx].handlers.push(Handler::Block {
                     block_id,
                     token,
                     resume_bcp,
                     sp_restore,
+                    env: handler_env,
                 });
             }
             Instr::PushTag {
                 tagbody_id,
                 sp_restore,
             } => {
+                let handler_env = acts[top_idx].env_frame.clone();
                 acts[top_idx].handlers.push(Handler::Tag {
                     tagbody_id,
                     sp_restore,
                     token: None,
                     tag_bcps: Vec::new(),
+                    env: handler_env,
                 });
             }
             Instr::NamedTag { name_idx, tag_bcp } => {
@@ -17459,9 +17617,11 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                 cleanup_bcp,
                 sp_restore,
             } => {
+                let handler_env = acts[top_idx].env_frame.clone();
                 acts[top_idx].handlers.push(Handler::Unwind {
                     cleanup_bcp,
                     sp_restore,
+                    env: handler_env,
                 });
             }
             Instr::PopHandler => match acts[top_idx].handlers.pop() {
@@ -17747,11 +17907,13 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                 egcl_rt::rooted_ref!(_cluster_values_root = &mut cluster_values);
                 let cluster_frame = push_condition_cluster_frame(stack, &cluster_values)?;
                 env.handlers.push(HandlerCluster { entries });
+                let handler_env = acts[top_idx].env_frame.clone();
                 acts[top_idx].handlers.push(Handler::HandlerCase {
                     clauses: runtime_clauses,
                     sp_restore,
                     cluster_base,
                     cluster_frame,
+                    env: handler_env,
                 });
             }
             Instr::PopHandlerCase => {
@@ -17856,11 +18018,13 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                 }
                 egcl_rt::rooted_ref!(_cluster_values_root = &mut cluster_values);
                 let cluster_frame = push_condition_cluster_frame(stack, &cluster_values)?;
+                let handler_env = acts[top_idx].env_frame.clone();
                 acts[top_idx].handlers.push(Handler::RestartCase {
                     restart_base,
                     resume_bcp,
                     sp_restore,
                     cluster_frame,
+                    env: handler_env,
                 });
             }
             Instr::PopRestartCase => {
@@ -17949,8 +18113,13 @@ fn initiate_unwind(
                 Some(Handler::Tag {
                     tagbody_id,
                     sp_restore,
+                    env: tag_env,
                     ..
-                }) if tagbody_id == tid => Some((*sp_restore, *target_bcp)),
+                }) if tagbody_id == tid => {
+                    // A GO out of a capturing LET skipped its PopEnvChild.
+                    restore_handler_env(&mut act.env_frame, tag_env);
+                    Some((*sp_restore, *target_bcp))
+                }
                 _ => None,
             }
         } else {
@@ -17967,9 +18136,13 @@ fn initiate_unwind(
             Some(Handler::Unwind {
                 cleanup_bcp,
                 sp_restore,
+                env: handler_env,
             }) => {
                 let act = &mut acts[top];
                 act.handlers.pop();
+                // The cleanup forms were lowered outside every LET the
+                // transfer is leaving.
+                restore_handler_env(&mut act.env_frame, &handler_env);
                 act.sp_top = sp_restore;
                 act.cleanup_conts.push(CleanupCont {
                     handler_depth: act.handlers.len(),
@@ -17989,6 +18162,7 @@ fn initiate_unwind(
                 token,
                 resume_bcp,
                 sp_restore,
+                env: handler_env,
             }) => {
                 let matched = matches!(&pending, Pending::Token(t) if *t == token);
                 acts[top].handlers.pop();
@@ -17996,6 +18170,7 @@ fn initiate_unwind(
                 if matched {
                     let v = super::take_control_mv(&token, env);
                     let act = &mut acts[top];
+                    restore_handler_env(&mut act.env_frame, &handler_env);
                     act.sp_top = sp_restore;
                     act.bcp = resume_bcp as usize;
                     act.push_op(v);
@@ -18008,6 +18183,7 @@ fn initiate_unwind(
                 token,
                 resume_bcp,
                 sp_restore,
+                env: handler_env,
             }) => {
                 acts[top].handlers.pop();
                 env.block_stack.retain(|(_, t)| *t != token);
@@ -18031,6 +18207,7 @@ fn initiate_unwind(
                 };
                 if let Some(v) = matched {
                     let act = &mut acts[top];
+                    restore_handler_env(&mut act.env_frame, &handler_env);
                     act.sp_top = sp_restore;
                     act.bcp = resume_bcp as usize;
                     act.push_op(v);
@@ -18042,6 +18219,7 @@ fn initiate_unwind(
                 sp_restore,
                 token,
                 tag_bcps,
+                env: handler_env,
             }) => {
                 if let Pending::Go {
                     tagbody_id: tid,
@@ -18051,6 +18229,7 @@ fn initiate_unwind(
                     if *tid == tagbody_id {
                         // Keep the tag handler live — tags can be re-targeted.
                         let act = &mut acts[top];
+                        restore_handler_env(&mut act.env_frame, &handler_env);
                         act.sp_top = sp_restore;
                         act.bcp = *target_bcp as usize;
                         return Ok(());
@@ -18066,6 +18245,7 @@ fn initiate_unwind(
                         if let Some((_, bcp)) = tag_bcps.iter().find(|(n, _)| *n == tag_name) {
                             let bcp = *bcp;
                             let act = &mut acts[top];
+                            restore_handler_env(&mut act.env_frame, &handler_env);
                             act.sp_top = sp_restore;
                             act.bcp = bcp as usize;
                             return Ok(());
@@ -18083,6 +18263,7 @@ fn initiate_unwind(
                 sp_restore,
                 cluster_base,
                 cluster_frame,
+                env: handler_env,
             }) => {
                 acts[top].handlers.pop();
                 env.handlers.truncate(cluster_base);
@@ -18125,6 +18306,7 @@ fn initiate_unwind(
                         unsafe { slot_set(acts[top].frame, slot, cond) };
                     }
                     let act = &mut acts[top];
+                    restore_handler_env(&mut act.env_frame, &handler_env);
                     act.sp_top = sp_restore;
                     act.bcp = clause.body_bcp as usize;
                     return Ok(());
@@ -18165,6 +18347,7 @@ fn initiate_unwind(
                 resume_bcp,
                 sp_restore,
                 cluster_frame,
+                env: handler_env,
             }) => {
                 acts[top].handlers.pop();
                 // A restart invoked by a handler unwinds to here; NOW apply its
@@ -18205,6 +18388,7 @@ fn initiate_unwind(
                 };
                 if let Some(v) = delivered {
                     let act = &mut acts[top];
+                    restore_handler_env(&mut act.env_frame, &handler_env);
                     act.sp_top = sp_restore;
                     act.bcp = resume_bcp as usize;
                     act.push_op(v);
@@ -22739,7 +22923,7 @@ fn resume_in_t0(
     let entry_fn_val = EgclVal::from_symbol_index(sym);
     let fn_obj = Some(entry_fn_val).filter(|&v| egcl_rt::function::is_interpreted_function(v));
 
-    let handlers = rebuild_resume_handlers(&entry, bcp, env);
+    let handlers = rebuild_resume_handlers(&entry, bcp, &env_frame, env);
 
     let n_locals = entry.n_locals;
     let mut acts: Vec<Activation> = vec![Activation {
@@ -22765,10 +22949,25 @@ fn resume_in_t0(
     result
 }
 
-fn rebuild_resume_handlers(entry: &BytecodeFunction, bcp: u32, env: &mut Env) -> Vec<Handler> {
+/// `env_frame` is the activation's frame AT `bcp`; each rebuilt handler records
+/// the ancestor it was established in, counting the lexical environments
+/// entered after it (bliss-uhsp5).
+fn rebuild_resume_handlers(
+    entry: &BytecodeFunction,
+    bcp: u32,
+    env_frame: &HandlerEnv,
+    env: &mut Env,
+) -> Vec<Handler> {
     let mut handlers = Vec::new();
+    // Lexical env depth at each handler's establishment, relative to the
+    // function's base frame. Bytecode is structured, so the textual count of
+    // PushEnvChild/PopEnvChild before a PC is its lexical depth.
+    let mut env_depth = 0usize;
+    let mut handler_depths: Vec<usize> = Vec::new();
     for instr in entry.code[..bcp as usize].iter() {
         match instr {
+            Instr::PushEnvChild => env_depth += 1,
+            Instr::PopEnvChild => env_depth = env_depth.saturating_sub(1),
             Instr::PushBlock {
                 block_id,
                 name_idx,
@@ -22792,7 +22991,9 @@ fn rebuild_resume_handlers(entry: &BytecodeFunction, bcp: u32, env: &mut Env) ->
                     token,
                     resume_bcp: *resume_bcp,
                     sp_restore: *sp_restore,
+                    env: None,
                 });
+                handler_depths.push(env_depth);
             }
             Instr::PushTag {
                 tagbody_id,
@@ -22803,7 +23004,9 @@ fn rebuild_resume_handlers(entry: &BytecodeFunction, bcp: u32, env: &mut Env) ->
                     sp_restore: *sp_restore,
                     token: None,
                     tag_bcps: Vec::new(),
+                    env: None,
                 });
+                handler_depths.push(env_depth);
             }
             Instr::NamedTag { name_idx, tag_bcp } => {
                 // Re-establish the named-tag registration so a resumed activation
@@ -22821,18 +23024,27 @@ fn rebuild_resume_handlers(entry: &BytecodeFunction, bcp: u32, env: &mut Env) ->
                     env.tag_stack.push((name, tok));
                 }
             }
-            Instr::PopHandler => match handlers.pop() {
-                Some(Handler::Block { token, .. }) => {
-                    env.block_stack.retain(|(_, t)| *t != token);
+            Instr::PopHandler => {
+                handler_depths.pop();
+                match handlers.pop() {
+                    Some(Handler::Block { token, .. }) => {
+                        env.block_stack.retain(|(_, t)| *t != token);
+                    }
+                    Some(Handler::Tag {
+                        token: Some(tok), ..
+                    }) => {
+                        env.tag_stack.retain(|(_, t)| *t != tok);
+                    }
+                    _ => {}
                 }
-                Some(Handler::Tag {
-                    token: Some(tok), ..
-                }) => {
-                    env.tag_stack.retain(|(_, t)| *t != tok);
-                }
-                _ => {}
-            },
+            }
             _ => {}
+        }
+    }
+    for (handler, depth) in handlers.iter_mut().zip(handler_depths) {
+        let frame = env_frame_ancestor(env_frame, env_depth.saturating_sub(depth));
+        if let Handler::Block { env, .. } | Handler::Tag { env, .. } = handler {
+            *env = frame;
         }
     }
     handlers
@@ -22874,6 +23086,7 @@ impl egcl_rt::gc::TraceHostRoots for OuterResumeState {
         for cleanup in &mut self.cleanup_conts {
             egcl_rt::gc::TraceHostRoots::trace_host_roots(cleanup, visit);
         }
+        trace_handler_envs(&self.handlers, visit);
     }
 }
 
@@ -22894,7 +23107,16 @@ fn resume_inlined_in_t0_with_state(
         let mut state = if index == 0 { outer_state.take() } else { None }
             .unwrap_or_else(|| OuterResumeState {
                 debug_call: None,
-                handlers: rebuild_resume_handlers(&entry, scope.bcp, env),
+                handlers: rebuild_resume_handlers(
+                    &entry,
+                    scope.bcp,
+                    &if index == 0 {
+                        outer_env_frame.as_ref().map(|frame| Arc::clone(&frame.0))
+                    } else {
+                        None
+                    },
+                    env,
+                ),
                 cleanup_conts: Vec::new(),
                 dyn_binds: Vec::new(),
             });
@@ -24480,6 +24702,14 @@ fn emit_native_t1(
     backedge_counter: u64,
     allow_traps: bool,
 ) -> Option<NativeEmission> {
+    // The baseline emitters compile a local GO / RETURN-FROM as a plain jump.
+    // Out of a capturing LET that jump would skip the LET's PopEnvChild and
+    // leave the activation in the inner EnvFrame (bliss-uhsp5). The mapped T2
+    // builder declines the same shape ("direct exit requires dynamic
+    // unwinding"); decline it here too so T0's unwind restores the frame.
+    if local_exit_crosses_env_frame(bf) {
+        return None;
+    }
     #[cfg(all(target_arch = "aarch64", unix))]
     return a64::emit_native_a64(bf, allow_speculation, sym, backedge_counter, allow_traps);
     #[cfg(all(target_arch = "powerpc64", target_endian = "little", unix))]
