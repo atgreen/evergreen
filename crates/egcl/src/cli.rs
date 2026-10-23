@@ -27034,6 +27034,20 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 unsafe { std::env::remove_var(&name) };
                 return Ok(NIL);
             }
+            "EGCL-EXT:%STRING-TABLE-COUNTS" => {
+                // Diagnostic (bliss-4due): entry counts of the pathname string
+                // registry (value -> text), its reverse map (text -> value),
+                // and the off-heap interned-string table. All three must stay
+                // bounded by LIVE or constant strings, never by every string a
+                // program has produced.
+                let (forward, reverse) = egcl_stdlib::pathnames::string_registry_counts();
+                let interned = egcl_stdlib::streams::interned_string_count();
+                return Ok(vec_to_list(&[
+                    EgclVal::from_fixnum(forward as i64),
+                    EgclVal::from_fixnum(reverse as i64),
+                    EgclVal::from_fixnum(interned as i64),
+                ]));
+            }
             "EGCL-EXT:%BUILD-FINGERPRINT" => {
                 // A short hex tag that changes iff the running egcl binary
                 // changes (its size xor mtime-nanos), for segregating the ASDF

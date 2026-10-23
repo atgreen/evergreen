@@ -2289,6 +2289,14 @@ pub fn make_lisp_string(s: &str) -> EgclVal {
     val
 }
 
+/// Number of entries in the interned-string table. Interned strings live off
+/// the GC heap and are never reclaimed, so this must stay bounded by the
+/// program's distinct constant texts, not grow with the data it processes
+/// (bliss-4due).
+pub fn interned_string_count() -> usize {
+    string_intern_table().lock().unwrap().len()
+}
+
 /// Create a fresh (non-interned) EgclVal string.
 /// Two calls with the same content produce distinct EgclVal objects,
 /// preserving identity semantics for mutable strings. Issue #6.

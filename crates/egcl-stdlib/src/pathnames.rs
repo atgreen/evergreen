@@ -248,6 +248,15 @@ pub fn register_string(val: EgclVal, s: &str) {
     });
 }
 
+/// Entry counts of the forward (value -> text) and reverse (text -> value)
+/// string registries. A diagnostic for the weak-ownership invariant: both
+/// must stay bounded by the number of LIVE registered strings (bliss-4due).
+pub fn string_registry_counts() -> (usize, usize) {
+    let forward = with_string_registry(|reg| reg.len());
+    let reverse = with_string_reverse_registry(|rev| rev.len());
+    (forward, reverse)
+}
+
 pub fn registered_string(val: EgclVal) -> Option<String> {
     if !any_registered_string() {
         return None;
