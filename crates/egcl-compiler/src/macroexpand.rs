@@ -991,6 +991,18 @@ thread_local! {
     static MACROEXPAND_HOOK: Cell<MacroexpandHook> = const { Cell::new(default_hook as MacroexpandHook) };
 }
 
+/// Recognises EGCL-EXT:ATOMIC-INCF and EGCL-EXT:ATOMIC-DECF, which
+/// `macroexpand_all` leaves for the evaluator. The packages that decide symbol
+/// identity live above this crate, so the CLI installs the test; a same-named
+/// macro in another package expands normally (GH #576).
+static ATOMIC_UPDATE_OPERATOR: std::sync::OnceLock<fn(EgclVal) -> bool> =
+    std::sync::OnceLock::new();
+
+/// Install the test `macroexpand_all` uses for the atomic update operators.
+pub fn set_atomic_update_operator_test(test: fn(EgclVal) -> bool) {
+    let _ = ATOMIC_UPDATE_OPERATOR.set(test);
+}
+
 /// Set the macroexpand hook.
 pub fn set_macroexpand_hook(hook: MacroexpandHook) {
     MACROEXPAND_HOOK.with(|cell| cell.set(hook));
@@ -1379,12 +1391,10 @@ fn is_lambda_expression(val: EgclVal) -> bool {
 pub fn macroexpand_all(form: EgclVal, env: &Environment) -> Result<EgclVal, EgclError> {
     if form.is_cons() {
         let operator = unsafe { cons_car(form) };
-        if get_symbol_name(operator).is_some_and(|name| {
-            matches!(
-                name.rsplit(':').next().unwrap_or(&name),
-                "ATOMIC-INCF" | "ATOMIC-DECF"
-            )
-        }) {
+        if ATOMIC_UPDATE_OPERATOR
+            .get()
+            .is_some_and(|is_atomic_update| is_atomic_update(operator))
+        {
             return Ok(form);
         }
     }

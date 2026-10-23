@@ -10165,6 +10165,7 @@ impl Env {
         bytecode::initialize_native_callable_entries();
         compiler_macroexpand::set_local_macro_evaluator(eval_compiler_local_macro);
         compiler_macroexpand::set_macroexpand_hook(invoke_lisp_macroexpand_hook);
+        compiler_macroexpand::set_atomic_update_operator_test(is_atomic_update_operator);
         install_evaluator_global_root_scanner();
         if reset_clos {
             let _ = egcl_stdlib::bootstrap_clos();
@@ -20220,6 +20221,23 @@ fn eval_builtin_arguments(
     resignal_print_error(result)
 }
 
+/// True for EGCL-EXT:ATOMIC-INCF and EGCL-EXT:ATOMIC-DECF themselves, which
+/// the evaluator runs directly. A macro of the same name in another package is
+/// a different symbol and expands normally (GH #576). The name test comes
+/// first: it is cheap, and this runs for every operator the evaluator sees.
+pub(super) fn is_atomic_update_operator(operator: EgclVal) -> bool {
+    if !operator.is_symbol() || operator.is_nil() || operator == T {
+        return false;
+    }
+    let bare = sym_bare_name_rc(operator);
+    if !matches!(bare.as_ref(), "ATOMIC-INCF" | "ATOMIC-DECF") {
+        return false;
+    }
+    egcl_stdlib::find_package("EGCL-EXT")
+        .and_then(|package| egcl_stdlib::find_present_symbol(package, &bare))
+        == Some(operator)
+}
+
 fn eval_atomic_update_form(
     name: &str,
     forms: EgclVal,
@@ -20367,10 +20385,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     || macros.contains_key(&*raw)
                     || macros.contains_key(&*bare))
         };
-        if matches!(
-            symbol_bare_name(&name).as_str(),
-            "ATOMIC-INCF" | "ATOMIC-DECF"
-        ) {
+        if is_atomic_update_operator(car) {
             return eval_atomic_update_form(&name, cdr, env);
         }
         if !shadowed_by_lexical_function
@@ -36674,10 +36689,7 @@ fn macroexpand_all(
     {
         return Ok(arena_cons(car, mx_each_scoped(cdr, env, d, local_functions)?));
     }
-    if matches!(
-        symbol_bare_name(&name).as_str(),
-        "ATOMIC-INCF" | "ATOMIC-DECF"
-    ) {
+    if is_atomic_update_operator(car) {
         return Ok(form);
     }
 

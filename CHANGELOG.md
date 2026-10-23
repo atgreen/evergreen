@@ -363,6 +363,10 @@
 
 ### Fixed
 
+- A macro named `atomic-incf` or `atomic-decf` in any package runs its own
+  expansion. Such calls ran `egcl-ext:atomic-incf`/`atomic-decf` instead,
+  matched by name, which broke the Atomics library and AllegroServe
+  ([#578](https://github.com/atgreen/evergreen/pull/578)).
 - `(setf (symbol-function x) f)` signals a `type-error` when `x` is not a
   symbol, as the standard requires. It signalled a `simple-error`
   ([#575](https://github.com/atgreen/evergreen/pull/575)).
