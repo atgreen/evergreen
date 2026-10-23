@@ -349,6 +349,13 @@
 
 ### Fixed
 
+- In compiled code, a `setq` or `setf` of a variable declared special by an
+  enclosing `locally` or binding form's `declare` now sets the dynamic value,
+  as in SBCL. When a lexical binding of the same name enclosed the
+  declaration, the store went to that lexical binding instead; inside a
+  closure or `restart-case` clause this happened in every tier. `set` now
+  changes the symbol's value cell, never a lexical binding of the same name
+  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
 - A closure saved in an image keeps the `macrolet` definitions of the place it
   was written. After the image was restored, a closure that called such a
   local macro signalled an error

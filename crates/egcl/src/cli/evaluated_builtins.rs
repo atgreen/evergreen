@@ -1972,7 +1972,14 @@ fn resolve(name: &str) -> Option<Handler> {
                     expected: "SYMBOL".to_string(),
                 });
             }
-            env.set_var_symbol(sym, *val);
+            // SET changes the symbol's value cell, never a lexical binding of
+            // the same name (CLHS SET): a frame-first store wrote a shadowing
+            // LET's variable instead (bliss-35xxb).
+            let _ = env;
+            // NIL, T, keywords and constants are rejected first; NIL and T have
+            // no symbol index to write.
+            super::reject_assignment_to_constant(sym)?;
+            egcl_rt::symbols::set_symbol_value_checked(sym.as_symbol_index(), *val)?;
             Ok(*val)
         }),
 
