@@ -7660,6 +7660,11 @@ fn invoke_method(
     args: &[EgclVal],
     next: Option<NextMethod>,
 ) -> Result<EgclVal, EgclError> {
+    if method.method_id.is_nil() && method.body.is_symbol() {
+        let name = sym_name(method.body);
+        return builtin_generic_fallback(&name, args, env)
+            .unwrap_or_else(|| Err(no_applicable_method_error(env, &name)));
+    }
     // If the body compiled to bytecode (no captured lexicals, no
     // call-next-method — bliss-x5y.20), dispatch it through apply_function so it
     // runs as tiered bytecode/native. The compiled body binds its own params and
@@ -8362,6 +8367,12 @@ struct GfEffective {
     /// When the effective method is a single DEFCLASS-generated accessor:
     /// its slot's symbol index and how it accesses it. See ACCESSOR_METHODS.
     accessor: Option<(u32, SlotAccess)>,
+    /// Whether `try_single_primary_fast` may call the single primary method's
+    /// compiled body directly, with no next-method context. Not when the body
+    /// mentions CALL-NEXT-METHOD or NEXT-METHOD-P, which read that context (the
+    /// enclosing method's, otherwise), nor for a built-in generic, whose
+    /// built-in behaviour is the method's next method (bliss-y3tk7).
+    single_primary_direct: bool,
 }
 
 struct GfDispatchEntry {
@@ -8607,7 +8618,8 @@ fn try_single_primary_fast(
     if !(effective.around.is_empty()
         && effective.before.is_empty()
         && effective.after.is_empty()
-        && effective.primary.len() == 1)
+        && effective.primary.len() == 1
+        && effective.single_primary_direct)
     {
         return None;
     }
@@ -8680,11 +8692,63 @@ fn run_standard_from_ids(
     ) else {
         return Ok(None);
     };
+    // A built-in generic's own behaviour is the least specific primary method:
+    // CALL-NEXT-METHOD from the last user method reaches it, as it reaches the
+    // standard method in other implementations (bliss-y3tk7).
+    if is_builtin_function(&symbol_bare_name(name)) {
+        if let Some(symbol) = resolve_sym(name) {
+            primary.push(builtin_next_method(symbol));
+        }
+    }
     egcl_rt::rooted_ref!(_around_root = &mut around);
     egcl_rt::rooted_ref!(_before_root = &mut before);
     egcl_rt::rooted_ref!(_primary_root = &mut primary);
     egcl_rt::rooted_ref!(_after_root = &mut after);
     invoke_standard_methods(env, &around, &before, &primary, &after, args).map(Some)
+}
+
+/// The stand-in primary method for a built-in generic's own behaviour: no
+/// method id, and the generic's name as its body. `invoke_method` recognizes
+/// it and runs `builtin_generic_fallback`.
+fn builtin_next_method(generic: EgclVal) -> MethodDef {
+    MethodDef {
+        method_id: NIL,
+        captured_frame: None,
+        specializers: Vec::new(),
+        lambda_list: NIL,
+        qualifier: egcl_stdlib::MethodQualifier::Primary,
+        combination: None,
+        body: generic,
+    }
+}
+
+/// Whether `form` mentions CALL-NEXT-METHOD or NEXT-METHOD-P anywhere, so a
+/// compiled body containing it needs its next-method context published.
+/// Conservative: a quoted occurrence counts too.
+fn mentions_next_method(form: EgclVal) -> bool {
+    let mut pending = vec![form];
+    let mut visited = 0usize;
+    while let Some(item) = pending.pop() {
+        visited += 1;
+        // A pathological or circular body is treated as mentioning it.
+        if visited > 100_000 {
+            return true;
+        }
+        if item.is_cons() {
+            let (car, cdr) = cp(item);
+            pending.push(cdr);
+            pending.push(car);
+        } else if item.is_symbol()
+            && !item.is_nil()
+            && matches!(
+                sym_bare_name_rc(item).as_ref(),
+                "CALL-NEXT-METHOD" | "NEXT-METHOD-P" | "%CALL-NEXT-METHOD" | "%NEXT-METHOD-P"
+            )
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// True if `name` is a slot reader/accessor on some class. Used to preserve the
@@ -8970,12 +9034,19 @@ fn invoke_generic_function_inner(
             } else {
                 None
             };
+            let single_primary_direct = primary_ids.len() == 1
+                && !is_builtin_function(&symbol_bare_name(name))
+                && !ordered
+                    .iter()
+                    .find(|method| method.method_id == primary_ids[0])
+                    .is_some_and(|method| mentions_next_method(method.body));
             let effective = Rc::new(GfEffective {
                 around: around_ids,
                 before: before_ids,
                 primary: primary_ids,
                 after: after_ids,
                 accessor,
+                single_primary_direct,
             });
             if let Some(key) = dispatch_key {
                 GF_DISPATCH_CACHE.with(|c| {
@@ -23733,6 +23804,28 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 if env.methods.contains_key(&name) && !fallback {
                     let args = eval_args(cdr, env)?;
                     return invoke_generic_function(&name, &args, env);
+                }
+                // The standard method on SYMBOL is (apply #'make-instance
+                // (find-class name) initargs), so methods specialized on the
+                // class object run for a call that names the class
+                // (bliss-y3tk7). The fallback passes its arguments quoted.
+                if fallback && env.methods.contains_key(&name) {
+                    let (first, _) = cp(cdr);
+                    let named = first.is_cons() && cp(first).0 == quote_sym() && {
+                        let quoted = cp(cp(first).1).0;
+                        quoted.is_symbol() && !quoted.is_nil()
+                    };
+                    if named {
+                        let args = eval_args(cdr, env)?;
+                        if let Some(class) = egcl_stdlib::find_class(args[0]) {
+                            let mut redispatch = args.to_vec();
+                            redispatch[0] = class;
+                            // No allocation between building and handing over:
+                            // RootedVals keeps the call's arguments rooted.
+                            let redispatch = RootedVals::new(redispatch);
+                            return invoke_generic_function(&name, &redispatch, env);
+                        }
+                    }
                 }
                 return eval_make_instance(cdr, env);
             }

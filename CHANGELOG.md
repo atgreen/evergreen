@@ -345,6 +345,13 @@
 
 ### Fixed
 
+- A user method on `make-instance` can `call-next-method` into the built-in
+  behaviour, and `next-method-p` is true there. It signalled that
+  CALL-NEXT-METHOD was undefined. `(make-instance 'name ...)` also now runs
+  methods specialized on the class object, as `(make-instance (find-class
+  'name) ...)` does. A method that is the only applicable one now sees its own
+  `next-method-p`, not an enclosing method's
+  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
 - In compiled code, a LOOP's `it` now means the conditional's test value only
   as the bare operand of the first clause after `when`, `if` or `unless`, as
   in `when x collect it`. Before, every `it` in that branch got the test
