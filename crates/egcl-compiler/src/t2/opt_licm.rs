@@ -303,6 +303,9 @@ fn opcode_hoist_safe(op: Opcode) -> bool {
             | FixnumCmpGe
             | FloatCmpEq
             | FloatCmpLt
+            | FloatCmpLe
+            | FloatCmpGt
+            | FloatCmpGe
             | GenericEq
             | GenericEqual
             | TypeCheck

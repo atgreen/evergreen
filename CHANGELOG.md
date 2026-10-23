@@ -97,6 +97,16 @@
   installed with `(setf fdefinition)` or `defun` is now also used when a
   compiled `setf` of that place calls it by name, as `#'(setf place)` already
   did ([#588](https://github.com/atgreen/evergreen/pull/588)).
+- On x86-64 Linux, single-float code compiles natively. A function with a
+  single-float literal, such as `(defun f1 (x) (+ x 1.0))`, used to stay in
+  the interpreter; now single-float `+`, `-`, `*` and the comparisons `<`,
+  `<=`, `>`, `>=` and `=` run as native code in the T1 and T2 tiers, with the
+  interpreter's results. A single-float Fibonacci, `(ffib 27.0)`, drops from
+  about 2.1 s to 0.02 s, and `(+ x 1.0)` called ten million times from about
+  21 s to 5.5 s, the same as its fixnum version. A cold call site that was
+  guessed to be fixnum now recompiles after its first wrong guess instead of
+  after eight deoptimizations
+  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
 - A function containing `load-time-value` compiles in the running image, with
   each `load-time-value` form evaluated once when the function is compiled. It
   stayed in the interpreter and evaluated the forms on every call, so

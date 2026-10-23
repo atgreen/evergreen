@@ -669,6 +669,9 @@ fn lower_inst(lo: &mut Lowering, inst: Inst) {
         FixnumCmpGe => cmp!(op::CMP, op::SETGE),
         FloatCmpEq => cmp!(op::UCOMIS, op::SETE),
         FloatCmpLt => cmp!(op::UCOMIS, op::SETL),
+        FloatCmpLe => cmp!(op::UCOMIS, op::SETLE),
+        FloatCmpGt => cmp!(op::UCOMIS, op::SETG),
+        FloatCmpGe => cmp!(op::UCOMIS, op::SETGE),
 
         // ── generic (megamorphic) arith / equality → runtime helper ──
         GenericAdd | GenericSub | GenericMul | GenericDiv | GenericEq | GenericEqual => {

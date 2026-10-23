@@ -25712,7 +25712,8 @@ fn t2_numeric_speculations(
                 | FixnumCmpEq | FixnumCmpLt | FixnumCmpLe | FixnumCmpGt | FixnumCmpGe => {
                     SpecType::Fixnum
                 }
-                FloatAdd | FloatSub | FloatMul | FloatDiv | FloatCmpEq | FloatCmpLt => {
+                FloatAdd | FloatSub | FloatMul | FloatDiv | FloatCmpEq | FloatCmpLt
+                | FloatCmpLe | FloatCmpGt | FloatCmpGe => {
                     SpecType::SingleFloat
                 }
                 _ => continue,

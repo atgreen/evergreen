@@ -666,7 +666,14 @@ fn float_operand_to_xmm(
         mov_imm32(a, SCRATCH, bits);
         movd_xmm_r32(a, xmm, SCRATCH);
     } else if let Some(&c) = consts.get(&v) {
-        mov_imm32(a, SCRATCH, (c as f32).to_bits());
+        // The interpreter combines a fixnum with a single-float in double
+        // precision and rounds once; that equals the single-precision operation
+        // only when the fixnum is exactly a single-float. Decline otherwise.
+        let single = c as f32;
+        if single as i64 != c {
+            return Err(EmitError::UnsupportedOp(0xF4));
+        }
+        mov_imm32(a, SCRATCH, single.to_bits());
         movd_xmm_r32(a, xmm, SCRATCH);
     } else {
         let r = *reg.get(&v).ok_or(EmitError::UnsupportedOp(0xF2))?;
@@ -2863,6 +2870,68 @@ fn emit_fixnum_cmp_value(
     Ok(())
 }
 
+/// Is `op` a typed single-float comparison?
+fn is_float_cmp(op: crate::t2::ir::Opcode) -> bool {
+    use crate::t2::ir::Opcode::*;
+    matches!(op, FloatCmpEq | FloatCmpLt | FloatCmpLe | FloatCmpGt | FloatCmpGe)
+}
+
+/// Emit a speculated single-float comparison producing `T`/`NIL` (bliss-9bw59).
+/// Each variable operand is guarded to be a single-float (else deopt), as
+/// `FloatAdd` does. An unordered compare (either operand a NaN) also deopts:
+/// the interpreter's NaN ordering is not IEEE's, so native code must not
+/// decide it. Ordered results are exact IEEE comparisons, which is what the
+/// interpreter computes for two single-floats or a single-float and an exactly
+/// representable fixnum (other fixnum constants decline in
+/// `float_operand_to_xmm`).
+///
+/// `ucomiss x, y` sets CF for x<y and ZF for x=y, so `a<b` is `ucomiss b,a;
+/// seta`, `a<=b` is `ucomiss b,a; setae`, and `>`/`>=` keep operand order.
+/// RAX and RDX are scratch here, as in the float arithmetic arm.
+#[allow(clippy::too_many_arguments)]
+fn emit_float_cmp_value(
+    a: &mut Asm,
+    data: &crate::t2::ir::InstData,
+    reg: &mut std::collections::HashMap<crate::t2::ir::Value, u8>,
+    pool: &mut Vec<u8>,
+    consts: &std::collections::HashMap<crate::t2::ir::Value, i64>,
+    float_consts: &std::collections::HashMap<crate::t2::ir::Value, u32>,
+    proven_single_float: &std::collections::HashSet<crate::t2::ir::Value>,
+    deopt: egcl_rt::asm::Label,
+) -> Result<(), EmitError> {
+    use crate::t2::ir::Opcode;
+    if data.results.len() != 1 || data.args.len() != 2 {
+        return Err(EmitError::UnsupportedOp(op_tag(data.opcode)));
+    }
+    for (xmm, &value) in data.args.iter().enumerate() {
+        float_operand_to_xmm(a, xmm as u8, value, reg, consts, float_consts,
+            proven_single_float, deopt)?;
+    }
+    // (first ucomiss operand, second, setcc opcode byte)
+    let (x, y, setcc) = match data.opcode {
+        Opcode::FloatCmpEq => (0, 1, 0x94), // sete
+        Opcode::FloatCmpLt => (1, 0, 0x97), // b > a: seta
+        Opcode::FloatCmpLe => (1, 0, 0x93), // b >= a: setae
+        Opcode::FloatCmpGt => (0, 1, 0x97), // a > b: seta
+        Opcode::FloatCmpGe => (0, 1, 0x93), // a >= b: setae
+        other => return Err(EmitError::UnsupportedOp(op_tag(other))),
+    };
+    a.extend_from_slice(&[0x0F, 0x2E, modrm_rr(x, y)]); // ucomiss xmm_x, xmm_y
+    a.extend_from_slice(&[0x0F, 0x9A, 0xC2]); // setp dl
+    a.extend_from_slice(&[0x0F, setcc, 0xC0]); // set<cc> al
+    a.extend_from_slice(&[0x84, 0xD2]); // test dl, dl
+    a.jcc(Cc::Ne, deopt); // unordered: let the interpreter decide
+    // Allocate after every operand read, as `emit_fixnum_cmp_value` does.
+    let dst = framed_alloc(reg, pool, data.results[0])?;
+    mov_imm64(a, dst, egcl_rt::value::T.0 as i64);
+    a.extend_from_slice(&[0x84, 0xC0]); // test al, al
+    let done = a.label();
+    a.jcc(Cc::Ne, done);
+    mov_imm64(a, dst, egcl_rt::value::NIL.0 as i64);
+    a.bind(done);
+    Ok(())
+}
+
 /// Emit `TypeCheck` type-predicate intrinsics as inline tests producing
 /// `T`/`NIL` — no runtime call. Single-tag predicates
 /// (fixnum tag 000, cons tag 001) are one `and`+`cmp`; `symbolp` also accepts
@@ -4589,6 +4658,18 @@ fn emit_transfer_function_with_storage(
             {
                 continue;
             }
+            // Tagged single-float arithmetic and comparisons guard their operands
+            // and resume through the same precise deopt veneer (bliss-9bw59).
+            // Raw double arithmetic was admitted above.
+            if deopt_veneer.is_some()
+                && (matches!(data.opcode, Opcode::FloatAdd | Opcode::FloatSub | Opcode::FloatMul)
+                    || is_float_cmp(data.opcode))
+                && data.frame_state.is_some()
+                && data.args.iter().chain(&data.results).all(|&value|
+                    f.value(value).repr == crate::t2::ir::ValueRepresentation::Tagged)
+            {
+                continue;
+            }
             if !matches!(
                 f.inst(inst).opcode,
                 Opcode::Invoke
@@ -4598,6 +4679,7 @@ fn emit_transfer_function_with_storage(
                     | Opcode::Jump
                     | Opcode::Brif
                     | Opcode::ConstFixnum
+                    | Opcode::ConstFloat
                     | Opcode::ConstNil
                     | Opcode::ConstT
                     | Opcode::ConstSymbol
@@ -6491,6 +6573,18 @@ fn emit_framed_inner(
                 emit_generic_eq(&mut a, &d, &mut inst_reg, &mut inst_pool, &const_tagged)?;
             } else if d.opcode == Opcode::TypeCheck {
                 emit_type_check(&mut a, &d, &mut inst_reg, &mut inst_pool, &const_tagged)?;
+            } else if is_float_cmp(d.opcode) {
+                let label = inst_deopt.get(&inst).copied().unwrap_or(deopt);
+                emit_float_cmp_value(
+                    &mut a,
+                    &d,
+                    &mut inst_reg,
+                    &mut inst_pool,
+                    &consts,
+                    &float_consts,
+                    &declared_single_floats,
+                    label,
+                )?;
             } else if fixnum_cmp_cc(d.opcode).is_some() {
                 // A comparison the branch did not fuse: produce T/NIL.
                 let label = inst_deopt.get(&inst).copied().unwrap_or(deopt);

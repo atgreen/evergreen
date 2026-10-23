@@ -269,9 +269,10 @@ fn non_fixnum_operands_deoptimize() {
     }
 }
 
-/// The literal-float loop remains interpreted when mapped compilation declines
-/// it on Linux. Platforms retaining the checked emitter still exercise its
-/// speculative deoptimization; both paths must preserve the exact float result.
+/// The literal-float loop compiles natively under the Linux mapped emitter,
+/// which now speculates the single-float accumulator (bliss-9bw59), so it runs
+/// at T1 without a deopt. Platforms retaining the checked emitter still exercise
+/// its speculative deoptimization; both paths must preserve the exact result.
 #[test]
 fn single_float_loop_obeys_native_admission_and_stays_correct() {
     let program = "\
@@ -289,12 +290,12 @@ fn single_float_loop_obeys_native_admission_and_stays_correct() {
     if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
         assert_eq!(
             deopts, 0,
-            "unsupported mapped loop must remain interpreted: {out:?}"
+            "the speculated single-float loop must not deopt: {out:?}"
         );
         assert_eq!(
             fields.get(2).copied(),
-            Some("0"),
-            "checked code must not be installed: {out:?}"
+            Some("1"),
+            "the literal-float loop must install mapped T1 code: {out:?}"
         );
     } else {
         assert!(
