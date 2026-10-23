@@ -25194,6 +25194,11 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
 
     let mut inline_options =
         egcl_compiler::t2::inlining::InlineOptions::default().with_root_symbol(sym);
+    // Mapped transfer (the only installable T2 where checked installation is
+    // refused) reconstructs one logical frame per deopt point and declines any
+    // caller holding an inlined callee's deopt point. Do not inline those
+    // callees there: the caller would stay at T1 (bliss-6988n).
+    inline_options.config.cross_function_recovery = checked_native_installation_allowed();
     for saved in &input.inline_bodies {
         inline_options = inline_options.with_body(saved.symbol, std::sync::Arc::clone(&saved.body));
         for &(bcp, calls) in &saved.call_sites {

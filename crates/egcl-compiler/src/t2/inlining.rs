@@ -36,6 +36,9 @@
 //!   nodes, always profitable), `max_depth` (6), `node_budget` (500 nodes of
 //!   post-inline growth per compilation), and `hot_frequency_percent` (80:
 //!   calls per 100 caller invocations needed to count a site as hot).
+//!   `cross_function_recovery` (default true) says whether deopt can rebuild
+//!   an inlined callee's frame; when false only bodies whose built IR has no
+//!   deopt point (no FrameState) are cloned.
 //! * [`decide`] returns [`InlineDecision`]: `Expand(IntrinsicId)` or
 //!   `Decline(DeclineReason)`.
 //!
@@ -237,6 +240,13 @@ pub struct InlineConfig {
     /// Opt-in bound for source-proven self expansion. Zero keeps it disabled
     /// until the embedding runtime admits nested recovery for this compilation.
     pub self_inline_depth: u8,
+    /// Whether the embedding runtime can reconstruct a suspended caller frame
+    /// plus a different function's inlined frame at a deopt point. When false,
+    /// a saved body is cloned only if no reachable instruction of its built IR
+    /// carries a FrameState, so every surviving FrameState keeps exactly one
+    /// logical frame (the root). Mapped x86-64 transfer declines any other
+    /// shape; inlining into it would only leave the caller at T1 (bliss-6988n).
+    pub cross_function_recovery: bool,
     pub node_budget: u32,
     /// Minimum calls per 100 profiled caller invocations for a call site to
     /// receive the larger, budget-limited hot-site allowance.
@@ -249,6 +259,7 @@ impl Default for InlineConfig {
             small_threshold: 30,
             max_depth: 6,
             self_inline_depth: 0,
+            cross_function_recovery: true,
             node_budget: 500,
             hot_frequency_percent: 80,
         }

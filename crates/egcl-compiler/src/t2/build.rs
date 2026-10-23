@@ -405,6 +405,12 @@ fn build_with_saved_bodies(
                 &body, options, Some(symbol), depth + 1, &mut callee_budget, active, false,
             )?;
             active.remove(&symbol);
+            // Every cloned FrameState is prefixed with the suspended caller,
+            // so a callee deopt point would need two logical frames. Keep the
+            // call when the runtime cannot rebuild them (bliss-6988n).
+            if !options.config.cross_function_recovery && has_deopt_point(&callee) {
+                continue;
+            }
             *remaining_budget = remaining_budget.saturating_sub(cost);
             callee
         };
@@ -422,6 +428,14 @@ fn build_with_saved_bodies(
             .map_err(BuildError::Unsupported)?;
     }
     Ok(f)
+}
+
+/// Whether any reachable instruction can deoptimize, i.e. carries a FrameState
+/// that `Function::inline_call` would clone with the caller's scopes prefixed.
+fn has_deopt_point(f: &Function) -> bool {
+    f.reverse_postorder().iter().any(|&block| {
+        f.block(block).insts.iter().any(|&inst| f.inst(inst).frame_state.is_some())
+    })
 }
 
 /// Local, fixed-argument bodies need no captured or dynamic scope reconstruction.
@@ -4721,6 +4735,80 @@ mod tests {
             .inlined_at
             .is_some());
         crate::t2::verify::verify(&f).expect("nested metadata verifies");
+    }
+
+    /// Without cross-function recovery, a saved body that can deoptimize stays a
+    /// call (so every FrameState keeps one logical frame), while one with no
+    /// deopt point is still cloned (bliss-6988n).
+    #[test]
+    fn single_frame_recovery_keeps_deoptimizing_body_as_a_call() {
+        let car = egcl_rt::symbols::intern("CAR");
+        let guarded = egcl_rt::symbols::intern("SINGLE-FRAME-CAR-HELPER");
+        let plain = egcl_rt::symbols::intern("SINGLE-FRAME-IDENTITY-HELPER");
+        let caller = egcl_rt::symbols::intern("SINGLE-FRAME-CALLER");
+        let guarded_body = Arc::new(bf(
+            "SINGLE-FRAME-CAR-HELPER",
+            vec![
+                Instr::LoadLocal(0),
+                Instr::CallNamed { sym: car, nargs: 1 },
+                Instr::Return,
+            ],
+            vec![],
+            1,
+            1,
+            1,
+        ));
+        let plain_body = Arc::new(bf(
+            "SINGLE-FRAME-IDENTITY-HELPER",
+            vec![Instr::LoadLocal(0), Instr::Return],
+            vec![],
+            1,
+            1,
+            1,
+        ));
+        let input = bf(
+            "SINGLE-FRAME-CALLER",
+            vec![
+                Instr::LoadLocal(0),
+                Instr::CallNamed { sym: plain, nargs: 1 },
+                Instr::CallNamed { sym: guarded, nargs: 1 },
+                Instr::Return,
+            ],
+            vec![],
+            1,
+            1,
+            1,
+        );
+        let base = InlineOptions::default()
+            .with_root_symbol(caller)
+            .with_body(guarded, guarded_body)
+            .with_body(plain, plain_body);
+        let calls = |f: &Function| -> Vec<u32> {
+            f.block_order()
+                .iter()
+                .flat_map(|&b| f.block(b).insts.iter().copied())
+                .filter_map(|i| match (f.inst(i).opcode, &f.inst(i).aux) {
+                    (Opcode::Call, AuxData::CallTarget(symbol)) => Some(*symbol),
+                    _ => None,
+                })
+                .collect()
+        };
+        let single_frame = |f: &Function| {
+            f.frame_states
+                .iter()
+                .all(|(_, state)| state.scopes.len() == 1 && state.scopes[0].function == caller)
+        };
+
+        let nested = build_from_bytecode_with_inline_options(&input, base.clone()).unwrap();
+        assert!(calls(&nested).is_empty(), "default recovery clones both bodies");
+        assert!(!single_frame(&nested), "the cloned CAR guard needs two frames");
+
+        let mut restricted = base;
+        restricted.config.cross_function_recovery = false;
+        let f = build_from_bytecode_with_inline_options(&input, restricted).unwrap();
+        assert_eq!(calls(&f), vec![guarded], "only the deoptimizing body stays a call");
+        assert!(single_frame(&f), "every FrameState reconstructs one logical frame");
+        crate::t2::verify::verify(&f).expect("restricted inline verifies");
     }
 
     #[test]
