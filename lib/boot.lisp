@@ -5577,9 +5577,7 @@ had none, as for a host name that did not resolve."
                           (not (eq (car reader) 'quote))
                           (null (cddr reader)))
                      `(egcl::%atomic-update-accessor
-                        ,(cadr reader)
-                        ,(intern (symbol-name (car reader)) :keyword)
-                        ,amount ,subtract))
+                        ,(cadr reader) ',(car reader) ,amount ,subtract))
                     (t (error "~a does not support the place ~s"
                               operation place)))))))))
 
