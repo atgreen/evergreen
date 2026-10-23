@@ -363,6 +363,10 @@
 
 ### Fixed
 
+- `(make-pathname :directory '(:relative))` keeps its `(:relative)`
+  directory instead of turning it into NIL, so as a `pathname-match-p`
+  wildcard it no longer matches every directory
+  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
 - A file stream opened through a logical pathname reports that pathname:
   `pathname` of the stream returns it, and `logical-pathname` accepts the
   stream. `pathname` returned the translated physical pathname, and

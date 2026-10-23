@@ -12294,6 +12294,11 @@ fn directory_designator_to_namestring(dir: EgclVal) -> Option<String> {
                     out.push('/');
                     start = 1;
                 }
+                // `(:relative)` alone is a specified, empty relative
+                // directory, distinct from an unspecified (NIL) one: render it
+                // as "./", since "" would parse back as NIL (bliss-p5p5b; ansi
+                // PATHNAME-MATCH-P.4).
+                "RELATIVE" if items.len() == 1 => return Some("./".to_string()),
                 "RELATIVE" => start = 1,
                 _ => {}
             }
