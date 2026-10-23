@@ -106,7 +106,7 @@
   21 s to 5.5 s, the same as its fixnum version. A cold call site that was
   guessed to be fixnum now recompiles after its first wrong guess instead of
   after eight deoptimizations
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#590](https://github.com/atgreen/evergreen/pull/590)).
 - A function containing `load-time-value` compiles in the running image, with
   each `load-time-value` form evaluated once when the function is compiled. It
   stayed in the interpreter and evaluated the forms on every call, so
