@@ -358,6 +358,10 @@
 
 ### Fixed
 
+- `(compile 'name)` of a function defined with `defun` compiles it to bytecode
+  now, keeping the same function object. It returned success and left the
+  function interpreted until enough calls made it hot
+  ([#558](https://github.com/atgreen/evergreen/pull/558)).
 - `makunbound`, `egcl-ext:cas` and `egcl-ext:atomic-incf`/`atomic-decf` signal
   an error for a constant (`nil`, `t`, a keyword or a `defconstant` name).
   `(makunbound 'pi)` made `pi` unbound, `cas` could replace `pi`'s value, and
