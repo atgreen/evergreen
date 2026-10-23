@@ -355,7 +355,7 @@
   declaration, the store went to that lexical binding instead; inside a
   closure or `restart-case` clause this happened in every tier. `set` now
   changes the symbol's value cell, never a lexical binding of the same name
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#551](https://github.com/atgreen/evergreen/pull/551)).
 - A closure saved in an image keeps the `macrolet` definitions of the place it
   was written. After the image was restored, a closure that called such a
   local macro signalled an error
