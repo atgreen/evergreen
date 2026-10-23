@@ -365,7 +365,7 @@
 
 - `type-of` a pathname returns `pathname`, and of a logical pathname
   `logical-pathname`. Both returned `t`
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#582](https://github.com/atgreen/evergreen/pull/582)).
 - `egcl-ext:atomic-incf` and `egcl-ext:atomic-decf` on a structure or CLOS
   accessor place work in compiled functions and `compile`d lambdas. They
   signalled "not a structure-slot accessor"
