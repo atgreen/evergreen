@@ -345,6 +345,13 @@
 
 ### Fixed
 
+- Compiled code now leaves a `let` correctly on a non-local exit when a closure
+  captures one of its variables. This covers a `throw` to a `catch`, a
+  `return-from`, a `go`, an `unwind-protect` cleanup and a `handler-case`
+  clause. Before, the code after the exit kept that `let`'s bindings. A
+  variable the `let` shadowed read the inner value, and a closure created
+  afterwards captured the inner binding. The interpreter was already correct
+  ([#542](https://github.com/atgreen/evergreen/pull/542)).
 - A closure or `flet`/`labels` function run by the source evaluator (`eval`,
   or a form `compile-file` keeps as source) expands local macros with the
   `macrolet`s where it was written, not the caller's. A `(loop-finish)` in a
