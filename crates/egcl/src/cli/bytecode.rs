@@ -21763,6 +21763,25 @@ pub(super) fn closure_template_matches(function: EgclVal, body: *const BytecodeF
 /// one template share a single compiled version, installed under one owning
 /// instance's private symbol, so a background T2 publication cannot mark every
 /// instance's own tier word; the registry is authoritative.
+/// The registry symbol whose bytecode and native code a compiled closure
+/// object runs: its shared body's compilation owner, or its own private
+/// symbol. DISASSEMBLE uses it, since closure instances sharing one body are
+/// not themselves registered (bliss-v8res).
+pub(super) fn closure_listing_symbol(function: EgclVal) -> Option<u32> {
+    if !egcl_rt::function::is_interpreted_function(function) {
+        return None;
+    }
+    let sym = egcl_rt::function::definition_index(function);
+    if !egcl_rt::symbols::is_uninterned(sym) {
+        return None;
+    }
+    let body = closure_bodies().borrow().get(&sym).cloned()?;
+    let owner = CLOSURE_COMPILATION
+        .with(|cache| cache.borrow().get(&(Arc::as_ptr(&body) as usize)).map(|state| state.owner))
+        .unwrap_or(sym);
+    [owner, sym].into_iter().find(|&candidate| registry_get(candidate).is_some())
+}
+
 pub(super) fn installed_closure_tier(function: EgclVal) -> Option<u8> {
     if !egcl_rt::function::is_interpreted_function(function) {
         return None;

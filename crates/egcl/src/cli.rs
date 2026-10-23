@@ -28976,7 +28976,22 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             // CLHS takes an extended function designator, so a FUNCTION OBJECT
             // is as valid as a symbol: `(disassemble #'f)` must work, and used
             // to report `#'f` as "not a compiled EGCL function" (bliss-3jkz).
+            // A tree-walker closure that has tiered up dispatches to a separate
+            // compiled object; show that rather than calling the closure
+            // uncompiled (bliss-v8res).
             bytecode::disassemble_function_with_lisp(arg, env)
+                .or_else(|| {
+                    tree_closure_compiled(arg).and_then(|compiled| {
+                        bytecode::disassemble_function_with_lisp(compiled, env).or_else(|| {
+                            bytecode::closure_listing_symbol(compiled)
+                                .and_then(|sym| bytecode::disassemble_symbol_with_lisp(sym, env))
+                        })
+                    })
+                })
+                .or_else(|| {
+                    bytecode::closure_listing_symbol(arg)
+                        .and_then(|sym| bytecode::disassemble_symbol_with_lisp(sym, env))
+                })
         } else {
             None
         };
