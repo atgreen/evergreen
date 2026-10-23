@@ -366,7 +366,7 @@
 - A logical pathname keeps its version. `(parse-namestring
   "host:temp.dat.newest")` has version `:newest` and the namestring
   `"HOST:TEMP.DAT.NEWEST"`; the version was dropped
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#583](https://github.com/atgreen/evergreen/pull/583)).
 - `type-of` a pathname returns `pathname`, and of a logical pathname
   `logical-pathname`. Both returned `t`
   ([#582](https://github.com/atgreen/evergreen/pull/582)).
