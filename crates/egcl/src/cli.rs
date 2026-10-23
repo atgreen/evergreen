@@ -8818,6 +8818,26 @@ fn builtin_next_method(generic: EgclVal) -> MethodDef {
     }
 }
 
+/// Whether `form` mentions THE anywhere. Conservative: a quoted THE counts.
+fn mentions_the(form: EgclVal) -> bool {
+    let mut pending = vec![form];
+    let mut visited = 0usize;
+    while let Some(item) = pending.pop() {
+        visited += 1;
+        if visited > 100_000 {
+            return true;
+        }
+        if item.is_cons() {
+            let (car, cdr) = cp(item);
+            pending.push(cdr);
+            pending.push(car);
+        } else if item.is_symbol() && !item.is_nil() && sym_bare_name_rc(item).as_ref() == "THE" {
+            return true;
+        }
+    }
+    false
+}
+
 /// Whether `form` mentions CALL-NEXT-METHOD or NEXT-METHOD-P anywhere, so a
 /// compiled body containing it needs its next-method context published.
 /// Conservative: a quoted occurrence counts too.
@@ -24173,21 +24193,32 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                         && cp(*def).0.is_symbol()
                         && sym_name(cp(*def).0) == "LAMBDA"
                     {
-                        // A lambda expression: compile it to bytecode, which
-                        // expands its macros now (CLHS 3.2.2.2). Evaluating the
-                        // form made a function that expanded them at its first
-                        // call (bliss-bd6r2). A body the compiler declines is
-                        // still evaluated into a function.
+                        // A lambda expression: its macros are expanded now
+                        // (CLHS 3.2.2.2); evaluating the form made a function
+                        // that expanded them at its first call (bliss-bd6r2).
+                        // The expansion is compiled to bytecode, unless it
+                        // asserts a type with THE: compiled code does not yet
+                        // check THE (bliss-q34s8.2), and a COMPILE'd
+                        // (the (integer 0 9) 99) must still signal. Such a body,
+                        // or one the compiler declines, is evaluated.
+                        egcl_rt::rooted!(
+                            expanded = macroexpand_all(*def, env, 0, &HashSet::new())?
+                        );
                         let label = if name.is_symbol() && !name.is_nil() {
                             sym_name(*name)
                         } else {
                             "<compiled lambda>".to_string()
                         };
-                        let (_, rest) = cp(*def);
+                        let (_, rest) = cp(*expanded);
                         let (lambda_list, body) = cp(rest);
-                        match bytecode::compile_and_reify_lambda(&label, lambda_list, body, env) {
+                        let compiled = if mentions_the(body) {
+                            None
+                        } else {
+                            bytecode::compile_and_reify_lambda(&label, lambda_list, body, env)
+                        };
+                        match compiled {
                             Some(function) => function,
-                            None => eval_form(*def, env)?,
+                            None => eval_form(*expanded, env)?,
                         }
                     } else {
                         return Err(EgclError::TypeError {
