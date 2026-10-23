@@ -358,6 +358,11 @@
 
 ### Fixed
 
+- `(compile nil '(lambda ...))` and `(compile 'name '(lambda ...))` compile
+  the lambda expression to bytecode, expanding its macros during `compile`.
+  The result expanded them at its first call, so a macro with a compile-time
+  effect had not run when `compile` returned
+  ([#559](https://github.com/atgreen/evergreen/pull/559)).
 - `(compile 'name)` of a function defined with `defun` compiles it to bytecode
   now, keeping the same function object. It returned success and left the
   function interpreted until enough calls made it hot
