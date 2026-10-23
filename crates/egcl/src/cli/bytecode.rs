@@ -3877,6 +3877,29 @@ impl<'e> Lowerer<'e> {
                 return Err(record_bail(|| format!("call:{name}")));
             }
         }
+        // `(funcall #'(setf ACC) v obj)` is how SETF expands an accessor place.
+        // Through FUNCALL, a writer generic -- which has no function object --
+        // was reached by name on every call. Call the writer's own name
+        // instead, as `generic_setf_writer_place` does, so its call cell can
+        // take the accessor fast path (bliss-u31om). The binding is still
+        // looked up at run time; only argument forms that cannot run code are
+        // accepted, so it is looked up at the same point FUNCALL's FUNCTION
+        // form would have done.
+        if name == "FUNCALL"
+            && let Some(writer) = self.funcall_accessor_writer(rest)
+        {
+            egcl_rt::rooted!(args = list_to_vec(cp(rest).1));
+            for i in 0..args.len() {
+                self.lower_expr(args[i])?;
+            }
+            self.emit(Instr::CallNamed {
+                sym: writer,
+                nargs: 2,
+            });
+            self.pop_n(2);
+            self.push_n(1);
+            return Ok(());
+        }
         egcl_rt::rooted!(args = list_to_vec(rest));
         let nargs = args.len();
         if nargs > u16::MAX as usize {
@@ -4328,6 +4351,55 @@ impl<'e> Lowerer<'e> {
         }
         super::accessor_slot_name(self.env, &sym_name(items[0]))?;
         Some((items[1], items[0]))
+    }
+
+    /// The writer symbol for `(FUNCALL (FUNCTION (SETF acc)) value object)`
+    /// when `(SETF acc)` is a global slot-writer generic (not a lexical
+    /// function) and both arguments are lexical slot reads or self-evaluating
+    /// constants, which cannot run code or observe a redefinition. `rest` is
+    /// the FUNCALL's argument list.
+    fn funcall_accessor_writer(&self, rest: EgclVal) -> Option<u32> {
+        let items = list_to_vec(rest);
+        let [designator, value, object] = items[..] else {
+            return None;
+        };
+        let function = list_to_vec(designator);
+        let [function_op, target] = function[..] else {
+            return None;
+        };
+        if !function_op.is_symbol() || sym_name(function_op) != "FUNCTION" {
+            return None;
+        }
+        let name = list_to_vec(target);
+        let [setf, accessor] = name[..] else {
+            return None;
+        };
+        if !setf.is_symbol() || sym_bare_name_rc(setf).as_ref() != "SETF" || !accessor.is_symbol()
+        {
+            return None;
+        }
+        let pure = |form: EgclVal| {
+            if form.is_nil() || form == T || form.is_fixnum() {
+                return true;
+            }
+            if !form.is_symbol() {
+                return false;
+            }
+            let var = sym_name(form);
+            !is_special_name(&var)
+                && !self.declared_special.contains_key(&var)
+                && matches!(self.lookup_local(&var), Some(VarLoc::Slot(_)))
+        };
+        if !pure(value) || !pure(object) {
+            return None;
+        }
+        let key = super::function_name_key(target);
+        if self.local_fns.contains_key(&key) || self.closure_fns.contains(&key) {
+            return None;
+        }
+        // Nothing above allocates; the forms are not used after interning.
+        let writer = reader::intern_symbol(&key);
+        super::names_accessor_generic(writer).then_some(writer)
     }
 
     /// Recognise a `(f a b …)` place whose accessor `f` has a user

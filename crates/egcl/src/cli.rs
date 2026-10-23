@@ -1478,6 +1478,17 @@ fn setf_writer_function_object(env: &mut Env, place: EgclVal) -> Option<EgclVal>
     None
 }
 
+/// The writer function installed for the synthetic `(SETF place)` function
+/// name `name`, if any: `(setf fdefinition)` and DEFUN put a `(setf place)`
+/// writer on the mangled %SETF-WRITER-place symbol, and that writer takes over
+/// from a `(SETF place)` generic. `#'(setf place)` already looked here first
+/// (`symbol_function_object_ex`); a named call of the synthetic symbol must
+/// agree. Does not allocate on the Lisp heap.
+fn setf_writer_replacement(name: &str) -> Option<EgclVal> {
+    let place = name.strip_prefix("(SETF ")?.strip_suffix(')')?;
+    global_fn(&setf_writer_symbol_name(place))
+}
+
 pub(super) fn setf_writer_symbol_name(place_name: &str) -> String {
     format!(
         "EGCL-INTERNAL::%SETF-WRITER-{}",
@@ -8707,6 +8718,241 @@ fn methods_by_ids(env: &Env, name: &str, ids: &[EgclVal]) -> Option<Vec<MethodDe
     Some(out)
 }
 
+// ── Accessor inline cache (bliss-fskhm, bliss-u31om) ─────────────
+//
+// A compiled `(ball-x b)` or `(setf (ball-x b) v)` names a generic function,
+// which has no function object, so its call cell never warmed: every call
+// re-entered the cold path, dispatched by NAME and only then reached the
+// accessor fast path in `try_single_primary_fast` -- ~3.2us for a load and
+// ~5us for a store, against ~0.2us for a builtin such as SVREF.
+//
+// A cell whose symbol names a slot-accessor generic now publishes an accessor
+// target (`call_table::Target::Accessor`) that calls `accessor_call`. That
+// keeps a small cache keyed by (generic symbol, instance layout) and holding
+// the slot's inline index, so a hit is a layout compare and a load or store.
+//
+// The cache holds only what full dispatch itself decided. An entry is
+// recorded only when this cell's own call dispatched straight to the generic
+// (no function object, writer function or lexical definition in the way) and
+// the effective method was a single generated accessor whose fast path ran.
+// A user method of any qualifier, a redefinition of the generic, the class or
+// the accessor, and any new function or writer definition bump one of the two
+// generations every entry is stamped with, and a redefinition or CHANGE-CLASS
+// gives an instance a different layout. Anything else -- an unbound slot, an
+// obsolete instance, a value a typed slot does not obviously admit, a
+// non-instance -- misses and takes the full call.
+
+/// How a cached store checks its value against a typed structure slot. Only
+/// types whose membership is a tag test are cached; any other declared type
+/// keeps every store on the full path, which signals the TYPE-ERROR.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CachedSlotCheck {
+    Any,
+    Fixnum,
+    Integer,
+    Real,
+    Number,
+    Float,
+}
+
+impl CachedSlotCheck {
+    /// The check for slot type `typespec`, if it is one of the cached ones.
+    /// Looks the type names up without interning, so it cannot allocate.
+    fn for_typespec(typespec: EgclVal) -> Option<Self> {
+        if typespec == T {
+            return Some(Self::Any);
+        }
+        let idx = typespec.symbol_index()?;
+        let name = egcl_rt::symbols::registry_key(idx)?;
+        Some(match name.as_ref() {
+            "FIXNUM" => Self::Fixnum,
+            "INTEGER" => Self::Integer,
+            "REAL" => Self::Real,
+            "NUMBER" => Self::Number,
+            "FLOAT" => Self::Float,
+            _ => return None,
+        })
+    }
+
+    #[inline]
+    fn admits(self, value: EgclVal) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Fixnum => value.is_fixnum(),
+            Self::Integer => egcl_rt::types::integerp(value),
+            Self::Real => egcl_rt::types::realp(value),
+            Self::Number => egcl_rt::types::numberp(value),
+            Self::Float => egcl_rt::types::floatp(value),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct AccessorCacheEntry {
+    gf_generation: u64,
+    call_generation: u64,
+    layout: usize,
+    symbol: u32,
+    index: u32,
+    write: bool,
+    check: CachedSlotCheck,
+}
+
+/// What `try_single_primary_fast` reports for a requested fill.
+#[derive(Clone, Copy)]
+struct AccessorFill {
+    layout: usize,
+    index: usize,
+    write: bool,
+    check: CachedSlotCheck,
+}
+
+const ACCESSOR_CACHE_SIZE: usize = 256;
+
+thread_local! {
+    /// The generic symbol whose next dispatch should report an accessor fill.
+    /// Taken by the first dispatch that runs (`invoke_generic_function_inner`).
+    static ACCESSOR_FILL_REQUEST: std::cell::Cell<Option<u32>> =
+        const { std::cell::Cell::new(None) };
+    static ACCESSOR_FILL_RESULT: std::cell::Cell<Option<AccessorFill>> =
+        const { std::cell::Cell::new(None) };
+    /// Direct-mapped; a collision just evicts. Holds no heap references, so
+    /// the collector need not see it.
+    static ACCESSOR_CACHE: [std::cell::Cell<Option<AccessorCacheEntry>>; ACCESSOR_CACHE_SIZE] =
+        const { [const { std::cell::Cell::new(None) }; ACCESSOR_CACHE_SIZE] };
+}
+
+#[inline]
+fn accessor_cache_slot(symbol: u32, layout: usize) -> usize {
+    let mixed = (layout >> 4) ^ (symbol as usize).wrapping_mul(0x9E37_79B9);
+    (mixed ^ (mixed >> 8)) % ACCESSOR_CACHE_SIZE
+}
+
+/// Report, for a dispatch that asked for it, where the accessor it just ran
+/// found its slot. Does not allocate.
+fn record_accessor_fill(instance: EgclVal, slot: EgclVal, write: bool, check: CachedSlotCheck) {
+    if let Some((layout, index)) = egcl_stdlib::clos::slot_layout_location(instance, slot) {
+        ACCESSOR_FILL_RESULT.with(|result| {
+            result.set(Some(AccessorFill {
+                layout,
+                index,
+                write,
+                check,
+            }))
+        });
+    }
+}
+
+/// Whether `symbol` names a generic function with a generated slot-accessor
+/// method -- the cells worth giving an accessor target. Only a hint: every
+/// call through such a target still validates against full dispatch.
+fn names_accessor_generic(symbol: u32) -> bool {
+    if installed_function(symbol).is_some() || egcl_rt::symbols::is_uninterned(symbol) {
+        return false;
+    }
+    let name = sym_name_rc(EgclVal::from_symbol_index(symbol));
+    if setf_writer_replacement(&name).is_some() {
+        return false;
+    }
+    let ids: Vec<u64> = match METHOD_DEFINITIONS.borrow().get(&*name) {
+        Some(methods) => methods.iter().map(|method| method.method_id.0).collect(),
+        None => return false,
+    };
+    let accessors = ACCESSOR_METHODS.borrow();
+    ids.iter().any(|id| accessors.contains_key(id))
+}
+
+/// Call the accessor generic `symbol` on `args` from a compiled call site:
+/// the cached slot load or store when this layout has one, otherwise the
+/// full call (see the section comment above).
+fn accessor_call(
+    symbol: u32,
+    args: &[EgclVal],
+    env: &mut Env,
+) -> Result<EgclVal, EgclError> {
+    if let Some(value) = accessor_cache_hit(symbol, args) {
+        env.clear_mv();
+        return Ok(value);
+    }
+    accessor_call_miss(symbol, args, env)
+}
+
+#[inline]
+fn accessor_cache_hit(symbol: u32, args: &[EgclVal]) -> Option<EgclVal> {
+    let (instance, value) = match *args {
+        [instance] => (instance, None),
+        [value, instance] => (instance, Some(value)),
+        _ => return None,
+    };
+    let layout = egcl_stdlib::clos::instance_layout_key(instance)?;
+    let entry = ACCESSOR_CACHE
+        .with(|cache| cache[accessor_cache_slot(symbol, layout)].get())?;
+    if entry.symbol != symbol
+        || entry.layout != layout
+        || entry.write != value.is_some()
+        || entry.gf_generation != GF_DISPATCH_GENERATION.load(AtomicOrdering::Acquire)
+        || entry.call_generation != bytecode::direct_call_gen()
+    {
+        return None;
+    }
+    let index = entry.index as usize;
+    match value {
+        None => egcl_stdlib::clos::slot_at_layout(instance, layout, index),
+        Some(value) => (entry.check.admits(value)
+            && egcl_stdlib::clos::set_slot_at_layout(instance, layout, index, value))
+        .then_some(value),
+    }
+}
+
+#[cold]
+fn accessor_call_miss(
+    symbol: u32,
+    args: &[EgclVal],
+    env: &mut Env,
+) -> Result<EgclVal, EgclError> {
+    let symbol_val = EgclVal::from_symbol_index(symbol);
+    let gf_generation = GF_DISPATCH_GENERATION.load(AtomicOrdering::Acquire);
+    let call_generation = bytecode::direct_call_gen();
+    // Ask for a fill only when nothing can run between this call and the
+    // generic's own dispatch: the same order `apply_function_impl` resolves a
+    // symbol in, so the first dispatch to run is this generic's.
+    let name = sym_name_rc(symbol_val);
+    let direct = (args.len() == 1 || args.len() == 2)
+        && installed_function(symbol).is_none()
+        && setf_writer_replacement(&name).is_none()
+        && named_call_target(env, &name, Some(symbol), true).is_none()
+        && (env.generics.contains_key(&name) || env.methods.contains_key(&name));
+    if !direct {
+        return apply_function(symbol_val, args, env);
+    }
+    ACCESSOR_FILL_RESULT.with(|result| result.set(None));
+    ACCESSOR_FILL_REQUEST.with(|request| request.set(Some(symbol)));
+    let result = apply_function(symbol_val, args, env);
+    ACCESSOR_FILL_REQUEST.with(|request| request.set(None));
+    let fill = ACCESSOR_FILL_RESULT.with(std::cell::Cell::take);
+    if result.is_ok()
+        && let Some(fill) = fill
+        && fill.write == (args.len() == 2)
+        && let Ok(index) = u32::try_from(fill.index)
+        && gf_generation == GF_DISPATCH_GENERATION.load(AtomicOrdering::Acquire)
+        && call_generation == bytecode::direct_call_gen()
+    {
+        let entry = AccessorCacheEntry {
+            gf_generation,
+            call_generation,
+            layout: fill.layout,
+            symbol,
+            index,
+            write: fill.write,
+            check: fill.check,
+        };
+        ACCESSOR_CACHE.with(|cache| {
+            cache[accessor_cache_slot(symbol, fill.layout)].set(Some(entry));
+        });
+    }
+    result
+}
+
 /// Reconstruct the standard-combination method roles from cached/computed
 /// `method_id` lists and run them. Returns `Ok(None)` if any id is missing (a
 /// stale cache entry), so the caller recomputes from scratch.
@@ -8725,6 +8971,7 @@ fn try_single_primary_fast(
     env: &mut Env,
     effective: &GfEffective,
     args: &[EgclVal],
+    fill: bool,
 ) -> Option<Result<EgclVal, EgclError>> {
     if !(effective.around.is_empty()
         && effective.before.is_empty()
@@ -8745,6 +8992,9 @@ fn try_single_primary_fast(
         match access {
             SlotAccess::Write if args.len() == 2 => {
                 if egcl_stdlib::set_slot_value_if_present(args[1], slot, args[0]).is_some() {
+                    if fill {
+                        record_accessor_fill(args[1], slot, true, CachedSlotCheck::Any);
+                    }
                     env.clear_mv();
                     return Some(Ok(args[0]));
                 }
@@ -8767,6 +9017,12 @@ fn try_single_primary_fast(
                 if admitted
                     && egcl_stdlib::set_slot_value_if_present(*object, slot, *value).is_some()
                 {
+                    if fill
+                        && let Some(check) = CachedSlotCheck::for_typespec(*typespec)
+                        && check.admits(*value)
+                    {
+                        record_accessor_fill(*object, slot, true, check);
+                    }
                     env.clear_mv();
                     return Some(Ok(*value));
                 }
@@ -8774,6 +9030,9 @@ fn try_single_primary_fast(
             }
             SlotAccess::Read if args.len() == 1 => {
                 if let Some(Ok(value)) = egcl_stdlib::slot_value_if_present(args[0], slot) {
+                    if fill {
+                        record_accessor_fill(args[0], slot, false, CachedSlotCheck::Any);
+                    }
                     env.clear_mv();
                     return Some(Ok(value));
                 }
@@ -8930,6 +9189,9 @@ fn invoke_generic_function_inner(
     env: &mut Env,
 ) -> Result<EgclVal, EgclError> {
     let gf_idx = egcl_rt::symbols::find_index(name);
+    // Taken here, by whichever dispatch runs first, so no nested call can
+    // answer a request meant for this one (see `accessor_call`).
+    let fill = ACCESSOR_FILL_REQUEST.with(std::cell::Cell::take).is_some_and(|gf| Some(gf) == gf_idx);
     let generation = GF_DISPATCH_GENERATION.load(AtomicOrdering::Acquire);
     // Per-generic metadata memo (bliss-fy37 #3): (combination, cacheable) is a
     // pure function of the generic's definition + its method set, both of which
@@ -9086,7 +9348,7 @@ fn invoke_generic_function_inner(
             )?;
             // Single-primary fast path (bliss-fy37 #2): the common case skips the
             // general standard-combination machinery entirely.
-            if let Some(fast) = try_single_primary_fast(env, &m, args) {
+            if let Some(fast) = try_single_primary_fast(env, &m, args, fill) {
                 return fast;
             }
             if let Some(result) =
@@ -9192,7 +9454,7 @@ fn invoke_generic_function_inner(
             }
             // Single-primary fast path (bliss-fy37 #2), now that the decision is
             // cached for subsequent calls.
-            if let Some(fast) = try_single_primary_fast(env, &effective, args) {
+            if let Some(fast) = try_single_primary_fast(env, &effective, args, fill) {
                 return fast;
             }
             match run_standard_from_ids(
@@ -19791,11 +20053,7 @@ fn symbol_function_object_ex(
     // Bytecode represents FUNCTION (SETF name) with the same synthetic name
     // used by generic writer calls. Ordinary writers keep their function cell
     // under a separate internal symbol; return that actual function object.
-    if let Some(place) = fn_name
-        .strip_prefix("(SETF ")
-        .and_then(|name| name.strip_suffix(')'))
-        && let Some(function) = global_fn(&setf_writer_symbol_name(place))
-    {
+    if let Some(function) = setf_writer_replacement(&fn_name) {
         return Some(function);
     }
     // Use the symbol's identity for both interned and uninterned names, and
@@ -34320,6 +34578,10 @@ fn eval_defun(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             m.borrow_mut()
                 .insert(name, FunDef::plain(params, params_form, body))
         });
+        // A writer function now takes this name over from any (SETF place)
+        // generic. Cached accessor stores are stamped with the dispatch
+        // generation, so they must not outlive that change (`accessor_call`).
+        invalidate_gf_dispatch_cache();
         // Also install the writer as an ordinary function on the mangled
         // %SETF-WRITER-place symbol. GLOBAL_SETF_FNS serves the interpreted SETF
         // path, but the bytecode lowerer emits a COMPILED `(setf (place …) v)`
@@ -41649,7 +41911,11 @@ fn apply_function_impl(
     // caller FLET/LABELS metadata must never be paired with its global body.
     if fn_val.is_symbol() {
         let name = sym_name_rc(fn_val);
-        if let Some(function) = fn_val.symbol_index().and_then(installed_function) {
+        // A `(SETF place)` name resolves as `#'(setf place)` does: a writer
+        // function installed for it wins over a writer generic.
+        if let Some(function) = setf_writer_replacement(&name) {
+            fn_val = function;
+        } else if let Some(function) = fn_val.symbol_index().and_then(installed_function) {
             fn_val = function;
         } else if let Some(target) = named_call_target(env, &name, fn_val.symbol_index(), true) {
             match target {
