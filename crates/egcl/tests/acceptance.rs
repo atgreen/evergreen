@@ -16377,12 +16377,8 @@ fn funcall_and_apply_dispatch_on_evaluated_arguments() {
             "(handler-case (funcall 'quote 1) (error () :not-a-function))",
             ":NOT-A-FUNCTION",
         ),
-        // NOTE: (apply #'+ 1 2) answers 1 rather than signalling on a non-list
-        // last argument. That is pre-existing -- identical on a binary built
-        // before this change, because the operator-position handler does the
-        // same list_to_vec -- and is tracked separately (bliss-0qbf). Asserted
-        // only to catch a DIVERGENCE between the two paths, not as correct.
-        ("(apply #'+ 1 2)", "1"),
+        // A non-list last argument is a TYPE-ERROR on both paths (bliss-0qbf).
+        ("(handler-case (apply #'+ 1 2) (type-error () :te))", ":TE"),
     ];
     run_expression_cases_batched(&cases);
 }
