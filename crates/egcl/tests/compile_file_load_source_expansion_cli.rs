@@ -73,3 +73,43 @@ fn loading_a_fasl_does_not_expand_a_source_kept_defun_again() {
     );
     assert!(loaded.contains("EXPANSIONS NIL"), "{loaded}");
 }
+
+/// Expanding a source-kept form at compile time must not walk a definer's
+/// names as code: `(defgeneric (setf name) ...)` was walked as a call to SETF,
+/// whose expander signalled a message-less PROGRAM-ERROR, so usocket's
+/// `option.lisp` stopped compiling (GitHub #561).
+#[test]
+fn setf_named_definers_compile_and_load() {
+    let dir = scratch("setf-named-definers");
+    let source = dir.join("setf-definers.lisp");
+    std::fs::write(
+        &source,
+        r#"(defgeneric (setf socket-option) (new-value socket option &key)
+  (:documentation "Set a socket's internal options"))
+(defgeneric (setf sd-b) (new obj))
+(defgeneric (setf sd-c) (new obj &key))
+(defmethod (setf sd-d) (new (obj t)) new)
+(defun (setf sd-e) (new obj) (declare (ignore obj)) new)
+(defgeneric sd-f (obj option &key) (:documentation "doc"))
+(defmethod (setf socket-option) (new (obj cons) option &key)
+  (setf (car obj) (list option new)))
+(defun use-them ()
+  (let ((c (list 1)))
+    (setf (socket-option c :opt) 5)
+    (list c (setf (sd-e nil) 7) (setf (sd-d 3) 9))))
+"#,
+    )
+    .unwrap();
+    let compiled = run(&format!(
+        r#"(format t "~&RESULT ~s~%"
+             (handler-case (cdr (multiple-value-list (compile-file "{}")))
+               (error (e) (list :error (type-of e)))))"#,
+        source.display()
+    ));
+    assert!(compiled.contains("RESULT (NIL NIL)"), "{compiled}");
+    let loaded = run(&format!(
+        r#"(progn (load "{}") (format t "~&RESULT ~s~%" (use-them)))"#,
+        dir.join("setf-definers.fasl").display()
+    ));
+    assert!(loaded.contains("RESULT (((:OPT 5)) 7 9)"), "{loaded}");
+}

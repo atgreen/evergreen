@@ -358,6 +358,10 @@
 
 ### Fixed
 
+- `compile-file` compiles a top-level `(defgeneric (setf name) ...)` again.
+  Since #538 it signalled a `program-error` with no message, so usocket, and
+  everything built on it, no longer compiled
+  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
 - Sandbox mode refuses `egcl::%socket-listen` and `egcl::%socket-accept`, as
   it already refused `egcl::%socket-connect`. A sandboxed program could open a
   listening socket ([#560](https://github.com/atgreen/evergreen/pull/560)).

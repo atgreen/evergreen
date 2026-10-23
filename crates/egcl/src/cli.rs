@@ -36603,6 +36603,13 @@ fn macroexpand_all(
             arena_cons(car, tail)
         }
         "DEFMACRO" | "DEFINE-COMPILER-MACRO" => form,
+        // Definers whose arguments are names, lambda lists and specifications
+        // rather than forms: a generic function named (SETF NAME) was walked
+        // as a call to SETF, whose expander signalled a PROGRAM-ERROR into the
+        // caller's handlers during COMPILE-FILE (GitHub #561). Left whole; any
+        // code inside them is still expanded when it runs.
+        "DEFGENERIC" | "DEFCLASS" | "DEFSTRUCT" | "DEFINE-CONDITION" | "DEFTYPE" | "DEFSETF"
+        | "DEFINE-SETF-EXPANDER" | "DEFINE-METHOD-COMBINATION" | "DEFPACKAGE" => form,
         // (defmethod name qualifier... specialized-lambda-list body...)
         "DEFMETHOD" => {
             let mut prefix = Vec::new();
