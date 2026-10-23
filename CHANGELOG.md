@@ -351,7 +351,7 @@
   methods specialized on the class object, as `(make-instance (find-class
   'name) ...)` does. A method that is the only applicable one now sees its own
   `next-method-p`, not an enclosing method's
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#546](https://github.com/atgreen/evergreen/pull/546)).
 - In compiled code, a LOOP's `it` now means the conditional's test value only
   as the bare operand of the first clause after `when`, `if` or `unless`, as
   in `when x collect it`. Before, every `it` in that branch got the test
