@@ -367,7 +367,7 @@
   `pathname` of the stream returns it, and `logical-pathname` accepts the
   stream. `pathname` returned the translated physical pathname, and
   `logical-pathname` rejected every stream
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#584](https://github.com/atgreen/evergreen/pull/584)).
 - A logical pathname keeps its version. `(parse-namestring
   "host:temp.dat.newest")` has version `:newest` and the namestring
   `"HOST:TEMP.DAT.NEWEST"`; the version was dropped
