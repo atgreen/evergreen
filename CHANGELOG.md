@@ -368,6 +368,7 @@
   signalling. `defpackage` signals a `package-error` for `:import-from` a
   package that does not exist, before making the package. `(setf subseq)`
   signals a `type-error` for a non-integer or out-of-range bound instead of
+  clamping it ([#569](https://github.com/atgreen/evergreen/pull/569)).
   clamping it ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
 - A loop that evaluates a capturing `flet` or `labels` no longer grows
   without bound. Each closure's code and captured variables were released
