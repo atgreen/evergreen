@@ -86,37 +86,9 @@ fn scan_pathname_global_roots(visit: &mut dyn FnMut(*mut EgclVal)) {
             visit(&mut record.version);
         }
     }
-    // The string registries are keyed by (or hold) raw value bits of GC-heap
-    // strings from make_string_bv. A moving GC invalidates those bits: a stale
-    // forward-registry key falsely matches whatever object is later allocated
-    // at the recycled address (format/sequences then treat an unrelated value
-    // as that string), and a stale reverse-registry value hands out a dangling
-    // pointer. Visit each key/value as a root — pinning the string live and
-    // letting the relocation pass rewrite the slot — then rebuild the forward
-    // map under the post-move bits (bliss-a27). Off-heap pathname keys
-    // (make_record_value) are outside the managed heap and pass through
-    // untouched.
-    let mut registry = STRING_REGISTRY
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(registry) = registry.as_mut() {
-        let mut entries: Vec<(EgclVal, String)> = registry
-            .drain()
-            .map(|(bits, s)| (EgclVal(bits), s))
-            .collect();
-        for (key, _) in entries.iter_mut() {
-            visit(key);
-        }
-        registry.extend(entries.into_iter().map(|(key, s)| (key.0, s)));
-    }
-    let mut reverse = STRING_REVERSE_REGISTRY
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(reverse) = reverse.as_mut() {
-        for value in reverse.values_mut() {
-            visit(value);
-        }
-    }
+    // The string registries are deliberately NOT scanned here: they are weak
+    // (see `process_string_registries_weak`), so a registered string dies when
+    // nothing else references it (bliss-4due).
     let mut translations = LOGICAL_TRANSLATIONS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -129,7 +101,46 @@ fn scan_pathname_global_roots(visit: &mut dyn FnMut(*mut EgclVal)) {
 
 fn install_pathname_global_root_scanner() {
     static INSTALL: Once = Once::new();
-    INSTALL.call_once(|| egcl_rt::gc::register_root_scanner(scan_pathname_global_roots));
+    INSTALL.call_once(|| {
+        egcl_rt::gc::register_root_scanner(scan_pathname_global_roots);
+        egcl_rt::gc::register_weak_container_hook(process_string_registries_weak);
+    });
+}
+
+/// Weak-container hook for the string registries (bliss-4due).
+///
+/// The forward map is keyed by, and the reverse map holds, the raw bits of
+/// registered strings. Scanning them as strong roots kept every registered
+/// string -- each string literal the evaluator ever saw, every interned
+/// namestring -- alive forever, so neither the string nor its cached text was
+/// ever reclaimed and a finalizer on such a string could never fire.
+///
+/// Instead the collector resolves each slot: a survivor that moved is
+/// relocated in place (the forward map is rebuilt under the new bits, so a
+/// stale key can never match an unrelated object later allocated at the old
+/// address -- bliss-a27), and an entry whose string died is dropped. Values
+/// outside the managed heap (off-heap interned strings, registered test
+/// sentinels) are left untouched and stay registered.
+fn process_string_registries_weak(resolve: &dyn Fn(*mut EgclVal) -> bool) {
+    let mut registry = STRING_REGISTRY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(registry) = registry.as_mut() {
+        let entries: Vec<(u64, String)> = registry.drain().collect();
+        for (bits, text) in entries {
+            let mut key = EgclVal(bits);
+            if resolve(&mut key) {
+                registry.insert(key.0, text);
+            }
+        }
+    }
+    drop(registry);
+    let mut reverse = STRING_REVERSE_REGISTRY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(reverse) = reverse.as_mut() {
+        reverse.retain(|_, value| resolve(value));
+    }
 }
 
 fn with_pathname_store<F, R>(f: F) -> R
@@ -246,6 +257,15 @@ pub fn register_string(val: EgclVal, s: &str) {
     with_string_reverse_registry(|rev| {
         rev.entry(s.to_string()).or_insert(val);
     });
+}
+
+/// Entry counts of the forward (value -> text) and reverse (text -> value)
+/// string registries. A diagnostic for the weak-ownership invariant: both
+/// must stay bounded by the number of LIVE registered strings (bliss-4due).
+pub fn string_registry_counts() -> (usize, usize) {
+    let forward = with_string_registry(|reg| reg.len());
+    let reverse = with_string_reverse_registry(|rev| rev.len());
+    (forward, reverse)
 }
 
 pub fn registered_string(val: EgclVal) -> Option<String> {

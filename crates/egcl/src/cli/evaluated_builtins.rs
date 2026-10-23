@@ -3343,7 +3343,7 @@ fn resolve(name: &str) -> Option<Handler> {
                     for c in comps {
                         elems.push(match c {
                             egcl_stdlib::PathDirComp::Name(s) => {
-                                egcl_stdlib::make_lisp_string(&s)
+                                egcl_stdlib::make_lisp_string_fresh(&s)
                             }
                             egcl_stdlib::PathDirComp::Up => kw(":UP"),
                             egcl_stdlib::PathDirComp::Wild => kw(":WILD"),

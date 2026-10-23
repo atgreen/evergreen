@@ -3281,7 +3281,18 @@ impl HeapCollector {
             // liveness; the post-evacuation pass below does the relocating.
             process_weak_containers(&|slot: *mut EgclVal| {
                 // SAFETY: as for the minor pass above.
-                !dead_set.contains(&unsafe { *slot }.to_raw())
+                let value = unsafe { *slot };
+                // `dead_set` holds untagged body addresses for heap objects
+                // (and tagged values for symbols), so normalize a tagged heap
+                // reference before asking. Comparing the tagged word never
+                // matched, so no weak entry died in a major collection
+                // (bliss-4due).
+                let key = if is_heap_ref(value) {
+                    ref_body_addr(value) as u64
+                } else {
+                    value.to_raw()
+                };
+                !dead_set.contains(&key)
             });
         }
 

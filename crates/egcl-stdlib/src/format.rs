@@ -2491,7 +2491,9 @@ pub fn format(
         print!("{}", output);
         Ok(NIL)
     } else if to_string {
-        Ok(make_egcl_string(&output))
+        // FORMAT NIL returns a fresh string (CLHS 22.3). An interned string
+        // lived off-heap forever, leaking every distinct result (bliss-4due).
+        Ok(crate::streams::make_lisp_string_fresh(&output))
     } else if to_stream {
         // Write each character to the stream using the Gray streams API.
         for ch in output.chars() {

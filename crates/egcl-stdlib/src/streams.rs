@@ -868,7 +868,7 @@ fn file_read_line_buffered(
         if c == '\n' {
             *line += 1;
             *col = 0;
-            return Ok((make_lisp_string(""), false));
+            return Ok((make_lisp_string_fresh(""), false));
         }
         encode_char(format, c, &mut line_bytes)?;
     }
@@ -885,7 +885,7 @@ fn file_read_line_buffered(
                 }
                 let s = decode(line_bytes)?;
                 *col += s.chars().count() as u64;
-                return Ok((make_lisp_string(&s), true));
+                return Ok((make_lisp_string_fresh(&s), true));
             }
             *buf_pos = 0;
             *buf_fill = n;
@@ -898,7 +898,7 @@ fn file_read_line_buffered(
                 *line += 1;
                 *col = 0;
                 let s = decode(line_bytes)?;
-                return Ok((make_lisp_string(&s), false));
+                return Ok((make_lisp_string_fresh(&s), false));
             }
             None => {
                 line_bytes.extend_from_slice(slice);
@@ -2130,12 +2130,12 @@ impl GrayStream for StreamMutableState {
                     return Ok((EOF, true));
                 }
                 let s: String = chars.into_iter().collect();
-                return Ok((make_lisp_string(&s), true));
+                return Ok((make_lisp_string_fresh(&s), true));
             }
             let c = ch.as_char();
             if c == '\n' {
                 let s: String = chars.into_iter().collect();
-                return Ok((make_lisp_string(&s), false));
+                return Ok((make_lisp_string_fresh(&s), false));
             }
             chars.push(c);
         }
@@ -2277,6 +2277,11 @@ fn string_intern_table() -> &'static OrderedMutex<InternTable> {
 /// Create a EgclVal representing a Lisp string.
 /// Strings are interned so equal content produces equal EgclVal.
 /// For mutable or identity-sensitive strings, use `make_lisp_string_fresh`.
+///
+/// An interned string lives off the GC heap and is NEVER reclaimed, so use
+/// this only for a bounded set of texts (names, constants). A string built from
+/// program data -- FORMAT output, a line read, a printed object -- must be
+/// fresh, or every distinct value leaks (bliss-4due).
 pub fn make_lisp_string(s: &str) -> EgclVal {
     let bytes = s.as_bytes();
     let mut table = string_intern_table().lock().unwrap();
@@ -2287,6 +2292,14 @@ pub fn make_lisp_string(s: &str) -> EgclVal {
     let val = unsafe { EgclVal::from_heap_ptr(ptr) };
     table.insert(bytes.to_vec(), val);
     val
+}
+
+/// Number of entries in the interned-string table. Interned strings live off
+/// the GC heap and are never reclaimed, so this must stay bounded by the
+/// program's distinct constant texts, not grow with the data it processes
+/// (bliss-4due).
+pub fn interned_string_count() -> usize {
+    string_intern_table().lock().unwrap().len()
 }
 
 /// Create a fresh (non-interned) EgclVal string.
@@ -3179,7 +3192,10 @@ pub fn get_output_stream_string(stream: EgclVal) -> Result<EgclVal, EgclError> {
         StreamInner::StringOutput { buffer, col, line } => {
             let s = std::str::from_utf8(buffer)
                 .map_err(|_| EgclError::StreamError("invalid UTF-8 in output buffer".into()))?;
-            let result = make_lisp_string(s);
+            // A fresh heap string: CLHS requires a new string, and an interned
+            // one lived off-heap forever, leaking every distinct result
+            // (bliss-4due).
+            let result = make_lisp_string_fresh(s);
             buffer.clear();
             *col = 0;
             *line = 0;

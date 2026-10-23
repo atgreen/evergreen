@@ -330,8 +330,7 @@ fn get_output_stream_string_reflects_written_content() {
     let result = get_output_stream_string(stream).unwrap();
     // The result should represent the string "Hi".
     // Since we're working with EgclVal, compare against a lisp string.
-    let expected = make_lisp_string("Hi");
-    assert_eq!(result, expected);
+    assert_eq!(result.as_string(), "Hi");
 }
 
 #[test]
@@ -339,8 +338,7 @@ fn get_output_stream_string_empty_stream() {
     let stream = make_string_output_stream(NIL).unwrap();
     let result = get_output_stream_string(stream).unwrap();
     // Empty output stream should yield an empty string.
-    let expected = make_lisp_string("");
-    assert_eq!(result, expected);
+    assert_eq!(result.as_string(), "");
 }
 
 // ── Stream constructors: open/close ───────────────────────────────
@@ -778,20 +776,14 @@ fn element_type_for_two_way_stream() {
 fn write_string_with_start_end_substring() {
     let s = make_string_output_stream(NIL).unwrap();
     stream_write_string(s, make_lisp_string("hello world"), 6, Some(11)).unwrap();
-    assert_eq!(
-        get_output_stream_string(s).unwrap(),
-        make_lisp_string("world")
-    );
+    assert_eq!(get_output_stream_string(s).unwrap().as_string(), "world");
 }
 
 #[test]
 fn write_string_with_start_only() {
     let s = make_string_output_stream(NIL).unwrap();
     stream_write_string(s, make_lisp_string("abcdef"), 3, None).unwrap();
-    assert_eq!(
-        get_output_stream_string(s).unwrap(),
-        make_lisp_string("def")
-    );
+    assert_eq!(get_output_stream_string(s).unwrap().as_string(), "def");
 }
 
 #[test]

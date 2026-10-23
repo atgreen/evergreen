@@ -657,7 +657,7 @@ pub fn backtrace_call(args: &[EgclVal]) -> Result<EgclVal, EgclError> {
         let lines = format_backtrace(&frames[start..], count);
         egcl_rt::rooted!(values = Vec::<EgclVal>::new());
         for line in lines {
-            let value = crate::streams::make_lisp_string(&line);
+            let value = crate::streams::make_lisp_string_fresh(&line);
             values.push(value);
         }
         return Ok(values_to_list(&values));

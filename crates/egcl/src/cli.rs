@@ -816,7 +816,9 @@ fn write_str_to(stream: EgclVal, s: &str, env: &mut Env) -> Result<(), EgclError
     let mut stream = stream;
     egcl_rt::rooted_ref!(_stream_root = &mut stream);
     check_pending_sigpipe_for_output()?;
-    egcl_rt::rooted!(sv = egcl_stdlib::make_lisp_string(s));
+    // Fresh, not interned: an interned string is never reclaimed, so every
+    // distinct text written would leak (bliss-4due).
+    egcl_rt::rooted!(sv = egcl_stdlib::make_lisp_string_fresh(s));
     if is_gray_stream(stream) {
         invoke_generic_function(
             "STREAM-WRITE-STRING",
@@ -27033,6 +27035,20 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 // SAFETY: as EGCL-EXT:SETENV above.
                 unsafe { std::env::remove_var(&name) };
                 return Ok(NIL);
+            }
+            "EGCL-EXT:%STRING-TABLE-COUNTS" => {
+                // Diagnostic (bliss-4due): entry counts of the pathname string
+                // registry (value -> text), its reverse map (text -> value),
+                // and the off-heap interned-string table. All three must stay
+                // bounded by LIVE or constant strings, never by every string a
+                // program has produced.
+                let (forward, reverse) = egcl_stdlib::pathnames::string_registry_counts();
+                let interned = egcl_stdlib::streams::interned_string_count();
+                return Ok(vec_to_list(&[
+                    EgclVal::from_fixnum(forward as i64),
+                    EgclVal::from_fixnum(reverse as i64),
+                    EgclVal::from_fixnum(interned as i64),
+                ]));
             }
             "EGCL-EXT:%BUILD-FINGERPRINT" => {
                 // A short hex tag that changes iff the running egcl binary
