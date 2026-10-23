@@ -49,6 +49,7 @@ fn native_v2_live_handlers_select_before_native_cleanup_and_outer_fallback() {
         env.handlers.push(HandlerCluster {
             entries: vec![HandlerEntry {
                 type_name: "TYPE-ERROR".into(),
+                compound_type: NIL,
                 handler: HandlerImpl::Function(handler),
             }],
         });
@@ -189,6 +190,7 @@ fn native_v2_handler_replacement_signals_only_older_clusters_before_cleanup() {
         env.handlers.push(HandlerCluster {
             entries: vec![HandlerEntry {
                 type_name: "TYPE-ERROR".into(),
+                compound_type: NIL,
                 handler: HandlerImpl::Function(resolve_sym(name).unwrap()),
             }],
         });

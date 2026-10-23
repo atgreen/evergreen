@@ -345,6 +345,14 @@
 
 ### Fixed
 
+- `handler-case` and `handler-bind` clauses whose type is a compound type
+  specifier, such as `(or error storage-condition)` or
+  `(and error (not warning))`, now match a condition of that type, as `typep`
+  does. They never matched, so the condition went on to outer handlers. A
+  `*break-on-signals*` set to a compound type is also tested with `typep`. An
+  outer `handler-case` that catches a condition an inner one declined now
+  receives the condition; it received NIL
+  ([#535](https://github.com/atgreen/evergreen/pull/535)).
 - `~wF` with a width and no digit count no longer keeps the zeros left by
   rounding a value just off a short decimal: `(format nil "~8F"
   -112.400000000001d0)` prints `"  -112.4"`, not `"-112.400"`, as in SBCL

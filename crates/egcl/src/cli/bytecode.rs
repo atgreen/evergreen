@@ -17718,6 +17718,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                     let token = next_control_token("__HANDLER_CASE__");
                     entries.push(HandlerEntry {
                         type_name: clause.type_name.clone(),
+                        compound_type: NIL,
                         handler: HandlerImpl::HandlerCase {
                             token: token.clone(),
                             var_name: None,
@@ -17782,6 +17783,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                     };
                     entries.push(HandlerEntry {
                         type_name: type_name.clone(),
+                        compound_type: NIL,
                         handler: HandlerImpl::Function(handler_value),
                     });
                     cluster_values.push(type_symbol);
