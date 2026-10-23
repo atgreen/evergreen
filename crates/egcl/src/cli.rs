@@ -1341,6 +1341,7 @@ mod reified_closure_rooting_tests {
             captured_blocks: Vec::new(),
             captured_tags: Vec::new(),
             captured_funs: Some(Arc::clone(&env.funs)),
+            captured_macros: None,
         }));
         egcl_rt::rooted!(function = coerce_installed_function(&env, *source));
         let before = reified_closure(*function).expect("retain source closure").to_raw();
@@ -2151,6 +2152,63 @@ struct Closure {
     /// `None` means "inherit the caller's namespace". Image persistence retains
     /// both this distinction and shared namespace identity through CFUN.
     captured_funs: Option<Arc<SharedCell<HashMap<String, FunDef>>>>,
+    /// The lexical MACROLET definitions visible where this closure was written,
+    /// captured for the same reason as `captured_funs`: a local macro is
+    /// LEXICAL, so a closure's body must expand it with the definitions of its
+    /// own definition site, not with whichever MACROLETs are active where the
+    /// closure is later called. LOOP binds LOOP-FINISH with MACROLET, so
+    /// without this a closure written in an outer LOOP and called from an inner
+    /// one finished the inner loop (bliss-9uimd). `None` means "inherit the
+    /// caller's lexical macros" (reified builtins, expanders, restored images).
+    captured_macros: Option<LexicalMacros>,
+}
+
+/// An immutable snapshot of an `Env`'s lexical MACROLET definitions, shared by
+/// the closures and local functions written in that scope.
+type LexicalMacros = Arc<SharedCell<HashMap<String, MacroDef>>>;
+
+/// Snapshot `env`'s lexical macros for a closure or local function defined
+/// there. Most scopes have none; they all share one empty map.
+fn capture_lexical_macros(env: &Env) -> LexicalMacros {
+    static EMPTY: std::sync::OnceLock<LexicalMacros> = std::sync::OnceLock::new();
+    let macros = env.macros.borrow();
+    if macros.is_empty() {
+        return Arc::clone(EMPTY.get_or_init(|| Arc::new(SharedCell::new(HashMap::new()))));
+    }
+    Arc::new(SharedCell::new(macros.clone()))
+}
+
+/// Install a closure's or local function's captured lexical macros as `env`'s,
+/// returning the caller's map (to restore after the call) when they differ.
+/// The caller must keep the returned map rooted while it is displaced.
+fn install_lexical_macros(
+    env: &mut Env,
+    captured: &LexicalMacros,
+) -> Option<SuspendedMacrosRoot> {
+    let definitions = captured.borrow().clone();
+    if definitions.is_empty() && env.macros.borrow().is_empty() {
+        return None;
+    }
+    Some(SuspendedMacrosRoot(std::mem::replace(
+        &mut env.macros,
+        Rc::new(RefCell::new(definitions)),
+    )))
+}
+
+/// Visit one captured lexical-macro map, at most once per root-scan pass.
+fn visit_lexical_macros_roots(
+    macros: &LexicalMacros,
+    state: &mut EnvRootVisitState,
+    visit: &mut dyn FnMut(*mut EgclVal),
+) {
+    if let Ok(mut map) = macros.try_borrow_mut() {
+        if fun_map_scan_claimed(Arc::as_ptr(macros) as usize) {
+            return;
+        }
+        for def in map.values_mut() {
+            visit_macro_def_roots(def, state, visit);
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2566,6 +2624,10 @@ struct FunDef {
     /// independently of the frame in which this name is called or referenced.
     defining_frame: Option<Arc<SharedCell<EnvFrame>>>,
     defining_specials: Vec<u32>,
+    /// The lexical MACROLET definitions visible where this local function was
+    /// written (see `Closure::captured_macros`; bliss-9uimd). `None` for a
+    /// global function, which inherits the caller's as before.
+    defining_macros: Option<LexicalMacros>,
 }
 
 type LexicalExitNames = (Vec<(String, String)>, Vec<(String, String)>);
@@ -2587,6 +2649,7 @@ impl FunDef {
             defining_blocks: None,
             defining_frame: None,
             defining_specials: Vec::new(),
+            defining_macros: None,
         }
     }
 }
@@ -2963,13 +3026,16 @@ static CONTROL_VALUES: egcl_rt::execution_local::ExecutionLocal<
 static LOOP_RETURN_TOKENS: egcl_rt::execution_local::ExecutionLocal<RefCell<Vec<String>>> = unsafe {
     egcl_rt::execution_local::ExecutionLocal::new(|| const { RefCell::new(Vec::new()) })
 };
-/// Stack of the innermost-enclosing extended-LOOP's `loop-finish` token.
-/// `(loop-finish)` stops iteration of that loop and proceeds to its
-/// `finally` clause + accumulated result (CLHS: local macro established by
-/// LOOP), distinct from `return` which skips `finally`.
-static LOOP_FINISH_TOKENS: egcl_rt::execution_local::ExecutionLocal<RefCell<Vec<String>>> = unsafe {
-    egcl_rt::execution_local::ExecutionLocal::new(|| const { RefCell::new(Vec::new()) })
-};
+/// Reserved `env.block_stack` name under which an extended LOOP records its
+/// `loop-finish` exit token. `(loop-finish)` stops iteration of that loop and
+/// proceeds to its `finally` clause + accumulated result (CLHS: a local macro
+/// established by LOOP), distinct from `return` which skips `finally`. Keeping
+/// the token on the block stack gives LOOP-FINISH the same LEXICAL scope as
+/// BLOCK: closures capture it with their other exit points, so a closure
+/// written inside an outer loop finishes that loop even when invoked from an
+/// inner one (bliss-9uimd). The NUL prefix keeps it disjoint from every
+/// symbol-named block.
+const LOOP_FINISH_BLOCK: &str = "\u{0}LOOP-FINISH";
 static MACROEXPAND_ENVIRONMENTS: egcl_rt::execution_local::ExecutionLocal<
     RefCell<HashMap<u64, MacroexpandEnv>>,
 > = unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(HashMap::new())) };
@@ -4344,6 +4410,7 @@ fn host_restore_registries(data: &[u8]) -> Result<(), EgclError> {
                     captured_specials: Vec::new(),
                     // Filled from the shared function-scope graph below.
                     captured_funs: None,
+                    captured_macros: None,
                     captured_blocks,
                     captured_tags,
                 },
@@ -5095,24 +5162,6 @@ fn store_control_mv(token: &str, primary: EgclVal, env: &Env) {
     };
     egcl_rt::rooted!(list = vec_to_list(&values));
     store_control_value(&format!("{token}\u{0}MV"), arena_cons(T, *list));
-}
-
-/// RAII guard for the current extended-LOOP's `loop-finish` token: pushes on
-/// creation, pops on drop (covering every early return in eval_loop_extended).
-struct LoopFinishGuard(String);
-impl LoopFinishGuard {
-    fn new() -> Self {
-        let t = next_control_token("__LOOP_FINISH__");
-        LOOP_FINISH_TOKENS.with(|s| s.borrow_mut().push(t.clone()));
-        LoopFinishGuard(t)
-    }
-}
-impl Drop for LoopFinishGuard {
-    fn drop(&mut self) {
-        LOOP_FINISH_TOKENS.with(|s| {
-            s.borrow_mut().pop();
-        });
-    }
 }
 
 /// Retrieve a control-token value stored by `store_control_mv`, republishing
@@ -9131,6 +9180,9 @@ fn visit_fun_def_roots(
     if let Some(frame) = &def.defining_frame {
         visit_env_frame_roots(frame, state, visit);
     }
+    if let Some(macros) = &def.defining_macros {
+        visit_lexical_macros_roots(macros, state, visit);
+    }
     // The cached `#'name` cons (bliss-1e8t). Visiting it is what keeps its
     // closure-registry entry live: prune_closure_registry decides liveness by
     // walking the heap for reachable `(EGCL::CLOSURE . id)` conses.
@@ -9563,6 +9615,9 @@ fn scan_evaluator_roots(visit: &mut dyn FnMut(*mut EgclVal), root_definitions: b
                 if let Some(funs) = &closure.captured_funs {
                     visit_fun_map_roots(funs, state, visit);
                 }
+                if let Some(macros) = &closure.captured_macros {
+                    visit_lexical_macros_roots(macros, state, visit);
+                }
             }
             // Keep each method's compiled body object live (bliss-x5y.20).
             for callable in METHOD_COMPILED.borrow_mut().values_mut() {
@@ -9854,6 +9909,9 @@ impl Env {
                 // collector (bliss-5q20).
                 if let Some(funs) = &closure.captured_funs {
                     visit_fun_map_roots(funs, state, visit);
+                }
+                if let Some(macros) = &closure.captured_macros {
+                    visit_lexical_macros_roots(macros, state, visit);
                 }
             }
         }
@@ -10709,6 +10767,22 @@ impl egcl_rt::gc::TraceHostRoots for SuspendedFunsRoot {
     }
 }
 
+/// The caller's lexical macros displaced by a closure or local-function call
+/// that installs its captured ones (bliss-9uimd), kept scanned while displaced.
+struct SuspendedMacrosRoot(Rc<RefCell<HashMap<String, MacroDef>>>);
+
+impl egcl_rt::gc::TraceHostRoots for SuspendedMacrosRoot {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
+        if let Ok(mut map) = self.0.try_borrow_mut() {
+            with_env_visit_state(|state| {
+                for def in map.values_mut() {
+                    visit_macro_def_roots(def, state, visit);
+                }
+            });
+        }
+    }
+}
+
 fn with_child_frame<T>(
     env: &mut Env,
     parent: Arc<SharedCell<EnvFrame>>,
@@ -10844,8 +10918,14 @@ fn eval_named_call_ex(
         .and_then(|f| f.defining_frame.clone()).unwrap_or(parent);
     let specials = definition.as_ref()
         .map(|f| f.defining_specials.clone()).unwrap_or_default();
+    // A local function's body expands the MACROLETs of its definition site,
+    // not the caller's (bliss-9uimd); restored after the call.
+    let def_macros = definition.as_ref().and_then(|f| f.defining_macros.clone());
     let def_scope = definition.and_then(|f| f.def_funs);
-    with_special_declarations(env, specials, |env| {
+    egcl_rt::rooted!(
+        saved_macros = def_macros.and_then(|macros| install_lexical_macros(env, &macros))
+    );
+    let result = with_special_declarations(env, specials, |env| {
         match def_scope {
             Some(scope) => {
                 egcl_rt::rooted!(saved = SuspendedFunsRoot(std::mem::replace(&mut env.funs, scope)));
@@ -10859,7 +10939,11 @@ fn eval_named_call_ex(
             }
             None => eval_lambda_call_ex(env, params_form, body, args, parent, control),
         }
-    })
+    });
+    if let Some(previous) = saved_macros.as_ref() {
+        env.macros = Rc::clone(&previous.0);
+    }
+    result
 }
 
 fn eval_lambda_call_ex(
@@ -12390,6 +12474,9 @@ impl egcl_rt::gc::TraceHostRoots for Closure {
             if let Some(funs) = &self.captured_funs {
                 visit_fun_map_roots(funs, state, visit);
             }
+            if let Some(macros) = &self.captured_macros {
+                visit_lexical_macros_roots(macros, state, visit);
+            }
         });
     }
 }
@@ -12469,8 +12556,14 @@ fn tree_closure_tier_up(id: u64, env: &Env) -> Option<EgclVal> {
     compile_env.frame = Arc::clone(&closure.captured_frame);
     compile_env.funs = funs;
     compile_env.locally_specials = Vec::new();
-    // Local macros are lexical to the CALLER, not to the closure.
-    compile_env.macros = Rc::new(RefCell::new(HashMap::new()));
+    // Local macros are lexical to the closure's definition site (bliss-9uimd).
+    compile_env.macros = Rc::new(RefCell::new(
+        closure
+            .captured_macros
+            .as_ref()
+            .map(|macros| macros.borrow().clone())
+            .unwrap_or_default(),
+    ));
     compile_env.symbol_macros = Rc::new(RefCell::new(HashMap::new()));
     compile_env.block_stack = closure.captured_blocks.clone();
     compile_env.tag_stack = closure.captured_tags.clone();
@@ -19220,6 +19313,7 @@ fn named_apply_wrapper(env: &mut Env, name_sym: EgclVal) -> EgclVal {
         captured_blocks: env.block_stack.clone(),
         captured_tags: env.tag_stack.clone(),
         captured_funs: Some(Arc::clone(&env.funs)),
+        captured_macros: None,
     })
 }
 
@@ -20235,12 +20329,18 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             }
             "LOOP" => return eval_loop(cdr, env),
             "LOOP-FINISH" => {
-                // (loop-finish) — stop the innermost enclosing extended LOOP's
-                // iteration and run its `finally` clause / accumulated result
-                // (CLHS). Unwinds to the loop driver via its finish token; an
-                // occurrence outside any LOOP is a PROGRAM-ERROR.
-                if let Some(token) = LOOP_FINISH_TOKENS.with(|s| s.borrow().last().cloned()) {
-                    return Err(EgclError::Internal(token));
+                // (loop-finish) — stop the LEXICALLY innermost enclosing
+                // extended LOOP's iteration and run its `finally` clause /
+                // accumulated result (CLHS). Unwinds to the loop driver via its
+                // finish token, found on the lexical block stack (captured by
+                // closures); an occurrence outside any LOOP is a PROGRAM-ERROR.
+                if let Some((_, token)) = env
+                    .block_stack
+                    .iter()
+                    .rev()
+                    .find(|(block_name, _)| block_name == LOOP_FINISH_BLOCK)
+                {
+                    return Err(EgclError::Internal(token.clone()));
                 }
                 return Err(EgclError::ProgramError(
                     "LOOP-FINISH used outside of a LOOP".into(),
@@ -23694,6 +23794,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                             captured_blocks: env.block_stack.clone(),
                             captured_tags: env.tag_stack.clone(),
                             captured_funs: Some(Arc::clone(&env.funs)),
+                            captured_macros: Some(capture_lexical_macros(env)),
                         };
                         return Ok(register_tree_closure(closure));
                     }
@@ -23716,6 +23817,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     captured_blocks: env.block_stack.clone(),
                     captured_tags: env.tag_stack.clone(),
                     captured_funs: Some(Arc::clone(&env.funs)),
+                    captured_macros: Some(capture_lexical_macros(env)),
                 };
                 return Ok(register_tree_closure(closure));
             }
@@ -29919,10 +30021,22 @@ fn eval_loop_repeat_remaining(
 }
 
 fn eval_loop_extended(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
-    // Establish this loop's `loop-finish` token for the whole extent (the guard
-    // pops it on every return path). `(loop-finish)` in the body unwinds here.
-    let _finish_guard = LoopFinishGuard::new();
-    let finish_token = _finish_guard.0.clone();
+    // Establish this loop's `loop-finish` exit point on the lexical block stack
+    // for the loop's extent. `(loop-finish)` in the body -- or in a closure
+    // created there -- unwinds to the driver with this token.
+    let finish_token = next_control_token("__LOOP_FINISH__");
+    env.block_stack
+        .push((LOOP_FINISH_BLOCK.to_string(), finish_token.clone()));
+    let result = eval_loop_extended_body(cdr, env, &finish_token);
+    env.block_stack.pop();
+    result
+}
+
+fn eval_loop_extended_body(
+    cdr: EgclVal,
+    env: &mut Env,
+    finish_token: &str,
+) -> Result<EgclVal, EgclError> {
     let toks = list_to_vec(cdr);
     let mut p = LoopParser { toks, pos: 0 };
     let mut with_bindings: Vec<(EgclVal, EgclVal)> = Vec::new();
@@ -32187,6 +32301,7 @@ fn snapshot_macro_expander(env: &Env, definition: &MacroDef) -> EgclVal {
             captured_blocks: env.block_stack.clone(),
             captured_tags: env.tag_stack.clone(),
             captured_funs: Some(Arc::clone(&env.funs)),
+            captured_macros: None,
         })
     });
     make_expander_function(*descriptor, NIL, None)
@@ -33731,18 +33846,27 @@ fn local_fn_closure(env: &mut Env, name: &str) -> Option<EgclVal> {
     // the recursive scope this `#'` is being taken in. Capturing the right one
     // is what lets the closure still resolve its own name after it escapes the
     // binding form (bliss-5q20).
-    let (params_form, body, cached, flet_scope, defining_blocks, defining_frame, defining_specials) =
-        env.funs.borrow().get(name).map(|f| {
-            (
-                f.params_form,
-                f.body,
-                f.closure_ref,
-                f.def_funs.clone(),
-                f.defining_blocks.clone(),
-                f.defining_frame.clone(),
-                f.defining_specials.clone(),
-            )
-        })?;
+    let (
+        params_form,
+        body,
+        cached,
+        flet_scope,
+        defining_blocks,
+        defining_frame,
+        defining_specials,
+        defining_macros,
+    ) = env.funs.borrow().get(name).map(|f| {
+        (
+            f.params_form,
+            f.body,
+            f.closure_ref,
+            f.def_funs.clone(),
+            f.defining_blocks.clone(),
+            f.defining_frame.clone(),
+            f.defining_specials.clone(),
+            f.defining_macros.clone(),
+        )
+    })?;
     if let Some(existing) = cached {
         return Some(existing);
     }
@@ -33763,6 +33887,7 @@ fn local_fn_closure(env: &mut Env, name: &str) -> Option<EgclVal> {
             .map(|(_, tags)| tags.clone())
             .unwrap_or_else(|| env.tag_stack.clone()),
         captured_funs,
+        captured_macros: Some(defining_macros.unwrap_or_else(|| capture_lexical_macros(env))),
     };
     #[cfg(test)]
     let closure = {
@@ -33823,6 +33948,11 @@ fn eval_flet(cdr: EgclVal, env: &mut Env, recursive: bool) -> Result<EgclVal, Eg
     } else {
         Some(Arc::clone(&env.funs))
     };
+    // The lexical macros a FLET function's body sees are those around the FLET
+    // form; a LABELS body sees its own scope's, captured after the loop below
+    // once every binding has shadowed any same-named macro (bliss-9uimd).
+    let flet_macros = (!recursive).then(|| capture_lexical_macros(env));
+    let mut bound_names: Vec<String> = Vec::new();
     let mut child_env = env.child();
     // Root the forked child Env as a GC root BEFORE building the local functions,
     // not just before the body: each `FunDef` we insert carries a freshly
@@ -33890,6 +34020,7 @@ fn eval_flet(cdr: EgclVal, env: &mut Env, recursive: bool) -> Result<EgclVal, Eg
             // it `(macrolet ((%f () :bad)) (flet ((%f () :good)) (%f)))` expanded
             // the outer macro (ansi MACROLET.37; bliss-9pqw).
             child_env.macros_mut().remove(&name);
+            bound_names.push(name.clone());
             child_env.funs_mut().insert(
                 name,
                 FunDef {
@@ -33908,8 +34039,20 @@ fn eval_flet(cdr: EgclVal, env: &mut Env, recursive: bool) -> Result<EgclVal, Eg
                     defining_blocks: Some((env.block_stack.clone(), env.tag_stack.clone())),
                     defining_frame: Some(Arc::clone(&env.frame)),
                     defining_specials: env.locally_specials.clone(),
+                    // FLET: the macros visible around the form. LABELS: filled
+                    // in below, once every binding has shadowed its name.
+                    defining_macros: flet_macros.clone(),
                 },
             );
+        }
+    }
+    if recursive {
+        let labels_macros = capture_lexical_macros(&child_env);
+        let mut funs = child_env.funs_mut();
+        for name in &bound_names {
+            if let Some(definition) = funs.get_mut(name) {
+                definition.defining_macros = Some(Arc::clone(&labels_macros));
+            }
         }
     }
     // child_env was registered as a GC root above (before the defs loop), so its
@@ -35722,6 +35865,7 @@ fn eval_define_compiler_macro(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, Eg
             captured_blocks: env.block_stack.clone(),
             captured_tags: env.tag_stack.clone(),
             captured_funs: Some(Arc::clone(&env.funs)),
+            captured_macros: None,
         })
     );
     // Keep lexical symbol macros in Lisp data, so the expander's snapshot is
@@ -41124,6 +41268,16 @@ fn apply_function_impl(
                         SuspendedFunsRoot(std::mem::replace(&mut env.funs, Arc::clone(funs)))
                     })
                 );
+                // ...and its captured lexical MACROLETs: a local macro in the
+                // body (LOOP's LOOP-FINISH among them) expands as it was defined
+                // where the closure was written, not where it is called
+                // (bliss-9uimd).
+                egcl_rt::rooted!(
+                    saved_macros = closure
+                        .captured_macros
+                        .as_ref()
+                        .and_then(|macros| install_lexical_macros(env, macros))
+                );
                 let result = with_special_declarations(env, closure.captured_specials.clone(), |env| {
                     eval_lambda_call_ex(
                         env, closure.params_form, closure.body, args,
@@ -41133,6 +41287,9 @@ fn apply_function_impl(
                 });
                 if let Some(previous) = saved_funs.as_ref() {
                     env.funs = Arc::clone(&previous.0);
+                }
+                if let Some(previous) = saved_macros.as_ref() {
+                    env.macros = Rc::clone(&previous.0);
                 }
                 return result;
             }
@@ -45762,6 +45919,7 @@ mod env_gc_root_tests {
                 captured_blocks: vec![],
                 captured_tags: vec![],
                 captured_funs: None,
+                captured_macros: None,
             })
         );
         let id = cp(*reference).1.as_fixnum() as u64;

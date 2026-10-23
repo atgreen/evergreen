@@ -345,6 +345,12 @@
 
 ### Fixed
 
+- A closure or `flet`/`labels` function run by the source evaluator (`eval`,
+  or a form `compile-file` keeps as source) expands local macros with the
+  `macrolet`s where it was written, not the caller's. A `(loop-finish)` in a
+  closure now ends the loop that lexically contains it: inside an inner loop
+  it used to end that inner loop, or signal `GO: no such tag`
+  ([#539](https://github.com/atgreen/evergreen/pull/539)).
 - `typep` with an `or`, `and` or `complex` type specifier whose earlier part
   runs a `satisfies` predicate or `deftype` expander that allocates now tests
   the later parts correctly. A collection during the earlier test could leave
