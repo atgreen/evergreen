@@ -263,3 +263,37 @@ const CONCURRENT_WRITERS: &str = "(progn \
          (incf extra (- (hash-table-count table) 1500)) \
          (maphash (lambda (k v) (unless (eql v (+ (aref k 0) 2)) (incf wrong))) table))) \
      (list extra wrong)))";
+
+/// EGCL-EXT:WITH-LOCKED-HASH-TABLE (bliss-im7wv) excludes other bodies on the
+/// same table, so a read-modify-write inside it is atomic. Without the lock,
+/// four threads of 2000 increments each kept about 2500. It is recursive,
+/// releases on a non-local exit, and rejects a non-table.
+#[test]
+fn with_locked_hash_table_serializes_bodies() {
+    let out = eval(
+        "(flet ((hammer (table) \
+                  (let ((threads \
+                          (loop repeat 4 collect \
+                            (egcl-thread:make-thread \
+                              (lambda () \
+                                (dotimes (i 2000) \
+                                  (egcl-ext:with-locked-hash-table (table) \
+                                    (let ((v (gethash :k table 0))) \
+                                      (when (zerop (mod i 7)) (egcl-thread:thread-yield)) \
+                                      (setf (gethash :k table) (1+ v)))))))))) \
+                    (mapc #'egcl-thread:join-thread threads) \
+                    (gethash :k table)))) \
+           (let ((h (make-hash-table))) \
+             (list (hammer (make-hash-table :synchronized t)) \
+                   (hammer (make-hash-table)) \
+                   (egcl-ext:with-locked-hash-table (h) \
+                     (egcl-ext:with-locked-hash-table (h) \
+                       (setf (gethash 1 h) :in))) \
+                   (catch 'out \
+                     (egcl-ext:with-locked-hash-table (h) (throw 'out :thrown))) \
+                   (egcl-ext:with-locked-hash-table (h) :reacquired) \
+                   (handler-case (egcl-ext:with-locked-hash-table (42) :no) \
+                     (type-error () :type-error)))))",
+    );
+    assert_eq!(out, "(8000 8000 :IN :THROWN :REACQUIRED :TYPE-ERROR)");
+}
