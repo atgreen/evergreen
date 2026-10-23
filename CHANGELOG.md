@@ -88,6 +88,12 @@
 
 ### Performance
 
+- On x86-64 Linux, a hot function that calls a small helper that can
+  deoptimize, such as `(defun pick (x y) (car y))`, now reaches the
+  optimizing T2 tier. Inlining the helper used to make T2 refuse the caller,
+  which then stayed at T1. A loop that calls such a helper 2,000,000 times
+  drops from about 6.6 s to 1.2 s
+  ([#557](https://github.com/atgreen/evergreen/pull/557)).
 - A function whose `restart-case` clause does a `go` to an enclosing `tagbody`
   tag or a `return-from` to an enclosing `block` now compiles; it ran in the
   interpreter ([#555](https://github.com/atgreen/evergreen/pull/555)).
