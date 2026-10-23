@@ -28868,6 +28868,10 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     "CONS"
                 } else if is_string_value(v) {
                     "SIMPLE-BASE-STRING"
+                } else if egcl_stdlib::pathnames::is_logical_pathname(v) {
+                    "LOGICAL-PATHNAME"
+                } else if egcl_stdlib::pathnames::is_pathname(v) {
+                    "PATHNAME"
                 } else {
                     "T"
                 };
