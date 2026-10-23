@@ -363,6 +363,12 @@
 
 ### Fixed
 
+- A loop that evaluates a capturing `flet` or `labels` no longer grows
+  without bound. Each closure's code and captured variables were released
+  only by a full garbage collection, which nothing triggered, so 600,000
+  evaluations of `(let ((x i)) (flet ((f () x)) (f)))` held 584 MB. Memory now
+  stays at about 40 MB without an explicit `(egcl-ext:gc :full t)`
+  ([#568](https://github.com/atgreen/evergreen/pull/568)).
 - `disassemble` of a closure object that has been compiled, such as a `lambda`
   or a `labels` function taken with `#'`, shows its compiled code. It reported
   "not a compiled EGCL function" although `egcl-ext:function-tier` gave its
