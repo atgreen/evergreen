@@ -349,7 +349,7 @@
   top-level forms, so an `(eval-when (:compile-toplevel) ...)` that a
   `macrolet`'s macros expand into runs during compilation, not only when the
   fasl is loaded. CFFI's `types.lisp` compiles again
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#537](https://github.com/atgreen/evergreen/pull/537)).
 - A `restart-case` clause whose restart is named `:loop` no longer makes
   `compile-file` fail with `Unsupported LOOP action "NIL"`, and defining such
   a function no longer signals that error to the caller's handlers. Restart
