@@ -966,6 +966,9 @@ fn resolve(name: &str) -> Option<Handler> {
                     "{operator} requires a symbol, old value, and new value"
                 )));
             }
+            // A constant's value never changes, and NIL and T have no value
+            // cell to address (bliss-6rl1j).
+            super::reject_assignment_to_constant(args[0])?;
             egcl_rt::symbols::compare_exchange_symbol_value(
                 args[0].as_symbol_index(),
                 args[1],
@@ -1015,6 +1018,7 @@ fn resolve(name: &str) -> Option<Handler> {
                     "{operator} requires a symbol, delta, and subtraction flag"
                 )));
             }
+            super::reject_assignment_to_constant(args[0])?;
             egcl_rt::symbols::atomic_update_symbol_value(
                 args[0].as_symbol_index(),
                 args[1],

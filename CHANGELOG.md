@@ -349,6 +349,11 @@
 
 ### Fixed
 
+- `makunbound`, `egcl-ext:cas` and `egcl-ext:atomic-incf`/`atomic-decf` signal
+  an error for a constant (`nil`, `t`, a keyword or a `defconstant` name).
+  `(makunbound 'pi)` made `pi` unbound, `cas` could replace `pi`'s value, and
+  `cas` or `atomic-incf` on `nil` or `t` panicked in the runtime
+  ([#554](https://github.com/atgreen/evergreen/pull/554)).
 - In a file compiled with `compile-file`, a `restart-case` clause that names
   an enclosing local variable only through a macro now reads and sets that
   local, as in SBCL. It used the global value instead
