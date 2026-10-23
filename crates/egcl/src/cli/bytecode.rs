@@ -11445,7 +11445,11 @@ pub fn build_bbu_from_forms(
             // for constructs the bytecode backend doesn't yet cover (e.g.
             // alexandria's `length=`), at the cost of that one form running
             // interpreted.
-            if let Some(form_ref) = pool.value(form) {
+            // Its macros are expanded now, in the compilation environment, so
+            // the loader does not expand them again in its own (GitHub #530).
+            // An expansion the pool cannot externalize keeps the source form.
+            egcl_rt::rooted!(expanded = super::expand_load_source_form(form, env)?);
+            if let Some(form_ref) = pool.value(*expanded).or_else(|| pool.value(form)) {
                 load_actions.push((9, 0, form_ref, BBU_NO_INDEX, BBU_NO_INDEX));
                 done = true;
             }
