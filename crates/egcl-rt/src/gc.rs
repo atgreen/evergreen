@@ -5828,6 +5828,27 @@ fn maybe_gc_stress() {
     }
 }
 
+thread_local! {
+    /// Why this thread's last `alloc_typed` failed, for the callers that can
+    /// only panic. `alloc_typed` answers `None`, which dropped the collector's
+    /// own error and left "GC heap unavailable" with no cause (bliss-wyt5n).
+    static LAST_ALLOCATION_FAILURE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn note_allocation_failure(error: &EgclError) {
+    LAST_ALLOCATION_FAILURE.with(|cell| *cell.borrow_mut() = Some(error.to_string()));
+}
+
+/// The message for an allocation of `what` that `alloc_typed` refused, naming
+/// the collector's error when it reported one.
+pub fn allocation_failure_message(what: &str) -> String {
+    match LAST_ALLOCATION_FAILURE.with(|cell| cell.borrow_mut().take()) {
+        Some(cause) => format!("GC heap unavailable for {what}: {cause}"),
+        None => format!("GC heap unavailable for {what}"),
+    }
+}
+
 /// Return `None` for an empty body or a footprint that exceeds the runtime's
 /// u32 size metadata, without initializing the heap or attempting collection.
 pub fn alloc_typed(body_size: usize, type_id: u8) -> Option<*mut u8> {
@@ -5844,14 +5865,18 @@ pub fn alloc_typed(body_size: usize, type_id: u8) -> Option<*mut u8> {
         let epoch = GC_MOVE_EPOCH.load(Ordering::Acquire);
         if guard.as_ref().is_none_or(|(seen, _)| *seen != epoch) {
             *guard = HeapAllocator::without_tlab()
+                .map_err(|error| note_allocation_failure(&error))
                 .ok()
                 .map(|allocator| (epoch, allocator));
         }
         let body = {
             let alloc = &mut guard.as_mut()?.1;
-            alloc
-                .alloc_fast(body_size)
-                .or_else(|| alloc.alloc_slow(body_size).ok())?
+            alloc.alloc_fast(body_size).or_else(|| {
+                alloc
+                    .alloc_slow(body_size)
+                    .map_err(|error| note_allocation_failure(&error))
+                    .ok()
+            })?
         };
         // The slow path may have collected and then refilled this allocator.
         // Publish its new epoch so the next allocation reuses that fresh TLAB.
@@ -5888,7 +5913,7 @@ pub fn body_header_offset(body_size: usize) -> usize {
 
 pub fn alloc_double_float(value: f64) -> EgclVal {
     let body = alloc_typed(8, crate::object::type_id::DOUBLE_FLOAT)
-        .expect("GC heap unavailable for double-float");
+        .unwrap_or_else(|| panic!("{}", allocation_failure_message("double-float")));
     // SAFETY: `body` is a freshly allocated 8-byte DOUBLE_FLOAT body; the header
     // precedes it by OBJECT_HEADER_SIZE, so the tagged value is `body - 8`.
     unsafe {
@@ -5917,7 +5942,7 @@ pub fn alloc_character_string(s: &str) -> EgclVal {
     let padded = crate::object::character_string_alloc_size(s);
     let body_size = padded - OBJECT_HEADER_SIZE;
     let body = alloc_typed(body_size, crate::object::type_id::SIMPLE_CHARACTER_STRING)
-        .expect("GC heap unavailable for character-string");
+        .unwrap_or_else(|| panic!("{}", allocation_failure_message("character-string")));
     unsafe {
         // payload+0 = char_len, payload+8 = u32 data (mirrors reader alloc_string).
         *(body as *mut u64) = char_len as u64;
@@ -5940,7 +5965,7 @@ pub fn alloc_base_string_bytes(bytes: &[u8]) -> EgclVal {
     let padded = crate::object::simple_string_size(bytes.len(), 1);
     let body_size = padded - OBJECT_HEADER_SIZE;
     let body = alloc_typed(body_size, crate::object::type_id::SIMPLE_BASE_STRING)
-        .expect("GC heap unavailable for base-string");
+        .unwrap_or_else(|| panic!("{}", allocation_failure_message("base-string")));
     unsafe {
         *(body as *mut u64) = bytes.len() as u64;
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), body.add(8), bytes.len());
@@ -9594,5 +9619,24 @@ mod region_snapshot_tests {
             next_image = saved_again.encode().unwrap();
         }
         std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod allocation_failure_message_tests {
+    use super::*;
+
+    /// A refused allocation names the collector's error once, then the next
+    /// message without a recorded cause stays generic (bliss-wyt5n).
+    #[test]
+    fn names_the_recorded_cause_once() {
+        note_allocation_failure(&EgclError::Internal("safepoint handshake failed".into()));
+        let message = allocation_failure_message("double-float");
+        assert!(message.starts_with("GC heap unavailable for double-float: "), "{message}");
+        assert!(message.contains("safepoint handshake failed"), "{message}");
+        assert_eq!(
+            allocation_failure_message("double-float"),
+            "GC heap unavailable for double-float"
+        );
     }
 }
