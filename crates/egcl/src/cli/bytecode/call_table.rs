@@ -41,6 +41,12 @@ enum Target {
         slot: u32,
         nargs: usize,
     },
+    /// A slot-accessor generic: `accessor_call` with its inline cache, which
+    /// falls back to the full call itself (bliss-fskhm). Runs through the
+    /// builtin bridges, since it too has no callable object.
+    Accessor {
+        nargs: usize,
+    },
     Function(EgclVal),
 }
 
@@ -50,7 +56,7 @@ impl Target {
             Self::Native { function, .. }
             | Self::Bytecode { function, .. }
             | Self::Function(function) => *function,
-            Self::Builtin { .. } => NIL,
+            Self::Builtin { .. } | Self::Accessor { .. } => NIL,
         }
     }
 
@@ -59,7 +65,7 @@ impl Target {
             Self::Native { function, .. }
             | Self::Bytecode { function, .. }
             | Self::Function(function) => visit(function),
-            Self::Builtin { .. } => {}
+            Self::Builtin { .. } | Self::Accessor { .. } => {}
         }
     }
 }
@@ -300,6 +306,11 @@ fn select_target(symbol: u32, nargs: usize) -> Option<Target> {
     if let Some(slot) = super::super::direct_builtin_slot_memoized(symbol, nargs) {
         return Some(Target::Builtin { slot, nargs });
     }
+    // A slot-accessor generic. Changing its function cell invalidates this
+    // cell, and `accessor_call` revalidates everything else per call.
+    if (nargs == 1 || nargs == 2) && super::super::names_accessor_generic(symbol) {
+        return Some(Target::Accessor { nargs });
+    }
     egcl_rt::function::is_interpreted_function(function).then_some(Target::Function(function))
 }
 
@@ -475,7 +486,7 @@ fn publish_target(state: &State, revision: u64, target: Option<Target>) {
     if target.is_some() {
         let entries = bridge_entries().expect("resolved cell owns installed bridges");
         #[allow(unused_mut)]
-        let mut native = if matches!(target, Some(Target::Builtin { .. })) {
+        let mut native = if matches!(target, Some(Target::Builtin { .. } | Target::Accessor { .. })) {
             [entries[4], entries[5]]
         } else {
             [entries[2], entries[3]]
@@ -572,13 +583,18 @@ pub(super) unsafe fn ordinary_call_cell(cell: u64, args: &[EgclVal]) -> Result<E
     // A warm builtin, as `warm` runs it, without cloning the target or
     // rooting a callable it does not have.
     let builtin = match *state.target.borrow() {
-        Some(Target::Builtin { slot, nargs }) if nargs == args.len() => Some(slot),
+        Some(Target::Builtin { slot, nargs }) if nargs == args.len() => Some(Some(slot)),
+        Some(Target::Accessor { nargs }) if nargs == args.len() => Some(None),
         _ => None,
     };
     if let Some(slot) = builtin {
         let env = unsafe { (*state.native_env).get() };
         if !env.is_null() {
-            return match super::super::call_direct_builtin(slot, args, unsafe { &mut *env }) {
+            let env = unsafe { &mut *env };
+            let Some(slot) = slot else {
+                return super::super::accessor_call(state.symbol, args, env);
+            };
+            return match super::super::call_direct_builtin(slot, args, env) {
                 Some(result) => result,
                 None => cold(state, args),
             };
@@ -648,6 +664,7 @@ pub(super) unsafe fn mapped_callee_declines(cell: u64) -> bool {
     }
     match state.target.borrow().as_ref() {
         Some(Target::Builtin { .. }) => !super::call_table_funcall::names_funcall_or_apply(state.symbol),
+        Some(Target::Accessor { .. }) => true,
         Some(Target::Native { code, .. }) => match &code._storage {
             NativeCodeStorage::Mapped(mapped) => mapped.mapped_entry().is_none(),
             _ => false,
@@ -727,6 +744,12 @@ fn warm(state: &State, args: &[EgclVal]) -> Result<EgclVal, EgclError> {
                 Some(result) => result,
                 None => cold(state, args),
             }
+        }
+        Target::Accessor { nargs } => {
+            if nargs != args.len() {
+                return cold(state, args);
+            }
+            super::super::accessor_call(state.symbol, args, env)
         }
         Target::Function(_) => apply_function(*function, args, env),
     }
@@ -811,7 +834,8 @@ fn invoke_builtin(cell: u64, args: &[EgclVal]) -> u64 {
         // Copy just the builtin metadata and release its borrow before any
         // allocation or Lisp reentry. Builtins have no callable object to root.
         let builtin = match *state.target.borrow() {
-            Some(Target::Builtin { slot, nargs }) => Some((slot, nargs)),
+            Some(Target::Builtin { slot, nargs }) => Some((Some(slot), nargs)),
+            Some(Target::Accessor { nargs }) => Some((None, nargs)),
             _ => None,
         };
         let Some((slot, nargs)) = builtin else {
@@ -825,6 +849,13 @@ fn invoke_builtin(cell: u64, args: &[EgclVal]) -> u64 {
         if env.is_null() {
             return NIL.0;
         }
+        let Some(slot) = slot else {
+            return finish_c2i_call(super::super::accessor_call(
+                state.symbol,
+                args,
+                unsafe { &mut *env },
+            ));
+        };
         match super::super::call_direct_builtin(slot, args, unsafe { &mut *env }) {
             Some(result) => finish_c2i_call(result),
             None => finish_c2i_call(cold(state, args)),

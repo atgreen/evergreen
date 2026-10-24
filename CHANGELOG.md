@@ -88,6 +88,15 @@
 
 ### Performance
 
+- Compiled calls to structure accessors and to class `:reader`, `:writer` and
+  `:accessor` functions read or store the slot directly. A read such as
+  `(point-x p)` drops from about 3.2 µs to 0.2 µs, and a store such as
+  `(setf (point-x p) v)` from about 5 µs to 0.2 µs, on x86-64 Linux in a hot
+  function. User methods on the accessor, redefinitions of the accessor or
+  its class, and slot type checks behave as before. A `(setf place)` writer
+  installed with `(setf fdefinition)` or `defun` is now also used when a
+  compiled `setf` of that place calls it by name, as `#'(setf place)` already
+  did ([#588](https://github.com/atgreen/evergreen/pull/588)).
 - A function containing `load-time-value` compiles in the running image, with
   each `load-time-value` form evaluated once when the function is compiled. It
   stayed in the interpreter and evaluated the forms on every call, so

@@ -3340,6 +3340,67 @@ pub fn set_slot_value_if_present(
     }
 }
 
+/// Where `slot_name` lives in `instance`: its layout's identity and the inline
+/// slot index under that layout. `None` for a non-instance, an obsolete
+/// instance, or a slot the layout does not hold inline (a class-allocated or
+/// missing slot).
+///
+/// The identity is the address of the instance's current class wrapper. A
+/// wrapper's layout is frozen and never freed, and a redefinition or
+/// CHANGE-CLASS gives the instance a different wrapper, so the pair stays valid
+/// for every instance that reports the same identity. Callers use it as an
+/// inline-cache key with [`slot_at_layout`] and [`set_slot_at_layout`]; it does
+/// not allocate.
+pub fn slot_layout_location(instance: EgclVal, slot_name: EgclVal) -> Option<(usize, usize)> {
+    let key = instance_layout_key(instance)?;
+    let idx = unsafe { instance_slot_index(resolve_forwarding(instance), slot_name)? };
+    Some((key, idx))
+}
+
+/// The identity of `instance`'s current, non-obsolete layout (its class
+/// wrapper's address), or `None` for a non-instance or an obsolete instance.
+/// See [`slot_layout_location`].
+#[inline]
+pub fn instance_layout_key(instance: EgclVal) -> Option<usize> {
+    if !is_instance(instance) {
+        return None;
+    }
+    unsafe {
+        let w = instance_wrapper(instance);
+        if w.is_null() || (*w).state.load(Ordering::Acquire) == WRAPPER_OBSOLETE {
+            return None;
+        }
+        Some(w as usize)
+    }
+}
+
+/// Read inline slot `idx` of `instance` if the instance's layout is still
+/// `key` (see [`slot_layout_location`]). `None` when the layout differs, the
+/// instance is obsolete, or the slot is unbound: the caller takes its full
+/// path, which signals or migrates as required. Does not allocate.
+#[inline]
+pub fn slot_at_layout(instance: EgclVal, key: usize, idx: usize) -> Option<EgclVal> {
+    if instance_layout_key(instance)? != key {
+        return None;
+    }
+    let v = unsafe { *slot_cell(resolve_forwarding(instance), idx) };
+    (v != UNBOUND).then_some(v)
+}
+
+/// Store `new_value` in inline slot `idx` of `instance` if its layout is still
+/// `key` (see [`slot_layout_location`]). Returns whether it stored. Does not
+/// allocate.
+#[inline]
+pub fn set_slot_at_layout(instance: EgclVal, key: usize, idx: usize, new_value: EgclVal) -> bool {
+    if instance_layout_key(instance) != Some(key) {
+        return false;
+    }
+    unsafe {
+        *slot_cell(resolve_forwarding(instance), idx) = new_value;
+    }
+    true
+}
+
 /// Atomically compare and exchange an inline instance slot.
 pub fn compare_exchange_slot_value(
     instance: EgclVal,
