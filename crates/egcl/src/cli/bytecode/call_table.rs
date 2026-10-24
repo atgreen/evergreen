@@ -593,7 +593,59 @@ pub(super) fn ordinary_call(symbol: u32, args: &[EgclVal]) -> Result<EgclVal, Eg
         return c2i_call_result(u64::from(symbol), args, 0);
     };
     let state = unsafe { state(Arc::as_ptr(&cell) as u64) };
+    if let Some(result) = ordinary_funcall_fast(state, args) {
+        return result;
+    }
     if cell.is_cold() { cold(state, args) } else { warm(state, args) }
+}
+
+/// FUNCALL or APPLY reached from an ordinary-ABI caller (bliss-6m6ca). The
+/// builtin FUNCALL cell stays cold so that its mapped callers keep their
+/// per-callable entries; without this, every such call would evaluate the
+/// call generically through `cold` and republish that cell. Instead apply the
+/// function object the way the ordinary callable veneer does: through the
+/// per-execution selection cache when it holds a current target, and a symbol
+/// designator through `apply_function_impl`. Both ordinary helpers that
+/// reach here are published, have polled and pass rooted arguments, as that
+/// veneer does, so `Admit::Any` holds.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn ordinary_funcall_fast(state: &State, args: &[EgclVal]) -> Option<Result<EgclVal, EgclError>> {
+    if args.is_empty() || !super::call_table_funcall::names_funcall_or_apply(state.symbol) {
+        return None;
+    }
+    let env = NATIVE_ENV.with(|env| env.get());
+    if env.is_null() {
+        return None;
+    }
+    let env = unsafe { &mut *env };
+    // `call` is the function and its actuals, in scanned storage: a missed
+    // selection may collect, so read the function from it again afterwards.
+    let apply = |call: &[EgclVal], env: &mut super::super::Env| {
+        let (&function, rest) = call.split_first()?;
+        let admit = super::native_transfer_entry::funcall_fast::Admit::Any;
+        if let Some(result) = super::native_transfer_entry::funcall_fast::apply(function, rest, env, admit) {
+            return Some(result);
+        }
+        // A symbol names its global function, which the cache never holds;
+        // `cold` would evaluate it generically and republish. A function
+        // object that missed keeps the general path, whose selection the
+        // next call then finds in the cache.
+        call[0].is_symbol().then(|| super::super::apply_function_impl(call[0], &call[1..], env))
+    };
+    if super::call_table_funcall::is_builtin(state.symbol) {
+        return apply(args, env);
+    }
+    if args.len() < 2 || !unsafe { is_builtin_apply(Arc::as_ptr(&state.cell) as u64) } {
+        return None;
+    }
+    // The evaluator's spreading. A dotted final list keeps the general path,
+    // which signals its error. Collecting the list does not allocate Lisp
+    // objects; root the spread copy before anything can.
+    let (&last, leading) = args.split_last()?;
+    let spread = super::super::apply_spread_list(last).ok()?;
+    egcl_rt::rooted!(values = leading.to_vec());
+    values.extend(spread);
+    apply(&values, env)
 }
 
 /// [`ordinary_call`] for a named adapter that already holds its call cell, so
@@ -606,6 +658,9 @@ pub(super) fn ordinary_call(symbol: u32, args: &[EgclVal]) -> Result<EgclVal, Eg
 pub(super) unsafe fn ordinary_call_cell(cell: u64, args: &[EgclVal]) -> Result<EgclVal, EgclError> {
     let state = unsafe { state(cell) };
     if let Some(result) = super::native_transfer_entry::ordinary_primitives::invoke(state.symbol, args) {
+        return result;
+    }
+    if let Some(result) = ordinary_funcall_fast(state, args) {
         return result;
     }
     if state.cell.is_cold() {

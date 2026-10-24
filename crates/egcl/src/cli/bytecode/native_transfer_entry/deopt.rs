@@ -1420,22 +1420,27 @@ unsafe fn resume_native_child_guard(
         .try_reserve(active.len())
         .map_err(|_| EgclError::Oom)?;
     for scope in active {
-        let ScopeKind::Block {
-            id,
-            resume_bcp,
-            register: false,
-        } = scope.kind
-        else {
-            return Err(invalid_capture());
+        // A native child resumes with no EnvFrame of its own. Its local
+        // BLOCK and TAGBODY records carry no token: nothing outside this
+        // activation can name them (see `ordinary_native_body`).
+        let handler = match scope.kind {
+            ScopeKind::Block { id, resume_bcp, register: false } => Handler::Block {
+                block_id: id,
+                token: String::new(),
+                resume_bcp,
+                sp_restore: scope.sp_restore,
+                env: None,
+            },
+            ScopeKind::Tagbody { id } if scope.ownership == Ownership::Local => Handler::Tag {
+                tagbody_id: id,
+                sp_restore: scope.sp_restore,
+                token: None,
+                tag_bcps: Vec::new(),
+                env: None,
+            },
+            _ => return Err(invalid_capture()),
         };
-        // A native child resumes with no EnvFrame of its own.
-        state.handlers.push(Handler::Block {
-            block_id: id,
-            token: String::new(),
-            resume_bcp,
-            sp_restore: scope.sp_restore,
-            env: None,
-        });
+        state.handlers.push(handler);
     }
     egcl_rt::rooted!(state = Some(state));
     let _capture_pause = CapturePause(CAPTURE.with(|slot| slot.replace(std::ptr::null_mut())));
@@ -1506,7 +1511,7 @@ pub(super) unsafe fn resume_ordinary_guard(request: *mut u8) -> Result<EgclVal, 
     if boundary.owner.is_null() || boundary.context != context { return Err(invalid_capture()); }
     let code = unsafe { &*boundary.owner };
     if code.ordinary_entry.is_none() || !code.has_deopt
-        || !scope_free_native_body(&code.body, false)
+        || !ordinary_native_body(&code.body)
     { return Err(invalid_capture()); }
     let base = code.code.as_ptr() as usize;
     let offset = boundary.cursor.pc.checked_sub(base).ok_or_else(invalid_capture)?;

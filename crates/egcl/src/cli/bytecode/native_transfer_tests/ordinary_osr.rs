@@ -227,12 +227,14 @@ fn exercise_ordinary_osr(inherited_scopes: bool, fail_entry_guard: bool, replace
         panic!("ordinary T2 loop must retain mapped OSR entries");
     };
     assert!(next.is_t2);
-    assert!(!next.osr_entries.is_empty());
+    // An ordinary T2 entry keeps its loop headers in a mapped companion.
+    let next_headers = next_mapped.osr_target_headers();
+    assert!(!next_headers.is_empty());
     assert!(Arc::ptr_eq(next.body.as_ref().unwrap(), &next_body));
     assert_eq!(Arc::ptr_eq(&body, &next_body), !replace_definition);
     if replace_definition {
         assert!(
-            next.osr_entries.keys().any(|header| {
+            next_headers.iter().any(|header| {
                 body.code.iter().enumerate().any(|(index, instruction)| {
                     matches!(instruction, Instr::Br(target) | Instr::BrIfFalse(target)
                     | Instr::BrIfTrue(target) | Instr::Go { target_bcp: target, .. }
@@ -243,7 +245,7 @@ fn exercise_ordinary_osr(inherited_scopes: bool, fail_entry_guard: bool, replace
         );
     }
 
-    let next_owner = Rc::as_ptr(next_mapped) as usize;
+    let next_owner = next_mapped.osr_target() as usize;
     let next_code = Rc::clone(next_mapped);
     let before_deopts = next_code.deopt_count();
     // Deterministic worker completion: publish the already-built replacement

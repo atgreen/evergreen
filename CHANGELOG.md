@@ -88,6 +88,15 @@
 
 ### Performance
 
+- On x86-64 Linux, a function whose body loops (`dotimes`, `dolist`, `do`,
+  `loop` or a `tagbody`) now calls other compiled functions with a direct
+  machine call once it is optimized, instead of building a managed activation
+  for each call, and its loop no longer calls into the runtime on every
+  iteration. A warmed call to a two-argument function from such a loop drops
+  from about 690 ns to 12 ns. Calls to functions with `&optional` or `&key`
+  parameters, and `apply`, also get cheaper: `apply` of a function object from
+  a loop drops from about 1.8 µs to 0.75 µs and `funcall` of a symbol from
+  2.7 µs to 1.6 µs ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
 - More than 50 builtins called from compiled code no longer rebuild and
   re-evaluate their call form each time. They include `evenp`, `oddp`, `/`,
   `member` and `assoc` with `:test` or `:key`, `mapcar`, `map`, `format`,
