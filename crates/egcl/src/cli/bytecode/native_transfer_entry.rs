@@ -1008,7 +1008,8 @@ impl TransferCode {
                     Some(profile) => match profile.speculation() {
                         Some(SpecType::Fixnum) => Some(CompilerType::Fixnum),
                         Some(SpecType::SingleFloat) => Some(CompilerType::SingleFloat),
-                        None => None,
+                        // Mapped T1 keeps tagged homes only; raw doubles are T2's.
+                        Some(SpecType::DoubleFloat) | None => None,
                     },
                 }
             };
@@ -3499,6 +3500,46 @@ unsafe fn call_or_throw_unpublished(
 /// T2 entry may return before publication when there is no pending work.
 /// Baseline code uses `poll_or_transfer`; already-published Rust callers use
 /// `poll_or_transfer_unpublished`.
+/// Box a raw double for mapped T2 code (bliss-thcbb). The request word is the
+/// double's IEEE bits, not a pointer. The allocation can collect, so the
+/// calling frame is published for its extent; generated code records the exact
+/// map of its live values at this call's return address.
+unsafe extern "C" fn box_double(
+    request: *mut u8,
+    out: *mut egcl_rt::native_transfer::NativeOutcome,
+    image: *mut SysvTransferCapture,
+) {
+    let bits = request as u64;
+    let value = unsafe {
+        root_publication::published(image, || egcl_rt::gc::alloc_double_float(f64::from_bits(bits)))
+    };
+    // Nothing collects between the allocation and the veneer's return.
+    unsafe { out.write(NativeOutcome { value, exit: NativeExit::Returned }) };
+}
+
+/// Install the process-lifetime box veneer used by raw double code
+/// (bliss-thcbb). The helper always returns normally, so its cold entry, a
+/// shared capture stub, is never taken; both buffers live for the process.
+pub(super) fn install_box_double_veneer() {
+    static VENEER: OnceLock<usize> = OnceLock::new();
+    let address = *VENEER.get_or_init(|| {
+        let Some(capture) = JitBuffer::new(&emit_capture_stub(prepare, dispatch as *const u8)) else {
+            return 0;
+        };
+        let Some(veneer) = JitBuffer::new(&egcl_compiler::t2::native_transfer::emit_published_helper_veneer(
+            box_double,
+            capture.as_ptr(),
+        )) else {
+            return 0;
+        };
+        let address = veneer.as_ptr() as usize;
+        std::mem::forget(capture);
+        std::mem::forget(veneer);
+        address
+    });
+    egcl_compiler::t2::emit::install_box_double_veneer(address as u64);
+}
+
 unsafe extern "C" fn poll_t2_or_transfer(
     request: *mut u8,
     out: *mut egcl_rt::native_transfer::NativeOutcome,

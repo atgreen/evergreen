@@ -128,3 +128,5 @@ pub mod opt_fold; // constant folding + strength reduction
 
 /// Guarded packed-double closed-expression specialization.
 pub mod packed_f64;
+/// Raw double-float representation cleanup after double speculation.
+pub mod unbox_f64;

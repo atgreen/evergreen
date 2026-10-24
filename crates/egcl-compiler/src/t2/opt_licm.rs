@@ -270,6 +270,7 @@ fn opcode_hoist_safe(op: Opcode) -> bool {
             | ConstNil
             | ConstT
             | ConstHeapObj
+            | ConstDouble
             | FixnumAdd
             | FixnumSub
             | FixnumMul

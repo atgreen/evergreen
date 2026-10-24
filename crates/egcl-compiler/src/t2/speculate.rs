@@ -96,8 +96,12 @@
 //!
 //! # Limits
 //!
-//! * Two speculation types, fixnum and single-float; no double-float, no
-//!   bignum fallback.
+//! * Three speculation types: fixnum, single-float and (with
+//!   [`SpeculateOptions::double_float`], x86-64 only) double-float; no bignum
+//!   fallback. A double site expands to raw `UnboxedF64` IR: guarded
+//!   `UnboxFloat` (or `ConstDouble`) operands, a raw `Float*` op and a
+//!   `BoxFloat` of the result, which `unbox_f64` then elides where the value
+//!   does not escape (bliss-thcbb).
 //! * Variadic arithmetic (`(+ a b c)`) and unary `+`/`*` stay generic.
 //! * Float negation has no native encoder yet; float comparisons only on x86-64.
 //! * Constant operands are recognised from `ConstFixnum` definitions only;
@@ -112,6 +116,18 @@ use std::collections::HashMap;
 pub enum SpecType {
     Fixnum,
     SingleFloat,
+    /// Boxed double-float operands, computed raw (bliss-thcbb). Produced only
+    /// when [`SpeculateOptions::double_float`] admits it.
+    DoubleFloat,
+}
+
+/// Which speculation families a caller can emit.
+#[derive(Copy, Clone, Default, Debug)]
+pub struct SpeculateOptions {
+    /// Expand double-float sites into raw `UnboxedF64` IR. Only the x86-64
+    /// Linux mapped emitter consumes that representation, so the tagged
+    /// artifact leaves these sites generic.
+    pub double_float: bool,
 }
 
 #[derive(Copy, Clone)]
@@ -204,6 +220,9 @@ enum ExtraArg {
     ReplaceSecondWithFixnum(i64),
     /// Replace a literal keyword argument with an ordered native fence.
     Fence(egcl_rt::bytecode::MemoryFenceKind),
+    /// A double-float site: expand into raw operands, a raw operation and,
+    /// for arithmetic, a `BoxFloat` of its result (see `expand_double_site`).
+    DoubleFloat,
 }
 
 /// Literal keyword accepted by the native fence specialization. The caller
@@ -274,12 +293,18 @@ fn typed_cmp_opcode(c: Cmp, s: SpecType) -> Option<Opcode> {
         (Cmp::Le, SpecType::Fixnum) => FixnumCmpLe,
         (Cmp::Ge, SpecType::Fixnum) => FixnumCmpGe,
         (Cmp::Eq, SpecType::Fixnum) => FixnumCmpEq,
-        (_, SpecType::SingleFloat) if !cfg!(target_arch = "x86_64") => return None,
+        (_, SpecType::SingleFloat | SpecType::DoubleFloat) if !cfg!(target_arch = "x86_64") => {
+            return None
+        }
         (Cmp::Lt, SpecType::SingleFloat) => FloatCmpLt,
         (Cmp::Gt, SpecType::SingleFloat) => FloatCmpGt,
         (Cmp::Le, SpecType::SingleFloat) => FloatCmpLe,
         (Cmp::Ge, SpecType::SingleFloat) => FloatCmpGe,
-        (Cmp::Eq, SpecType::SingleFloat) => FloatCmpEq,
+        (Cmp::Eq, SpecType::SingleFloat | SpecType::DoubleFloat) => FloatCmpEq,
+        (Cmp::Lt, SpecType::DoubleFloat) => FloatCmpLt,
+        (Cmp::Gt, SpecType::DoubleFloat) => FloatCmpGt,
+        (Cmp::Le, SpecType::DoubleFloat) => FloatCmpLe,
+        (Cmp::Ge, SpecType::DoubleFloat) => FloatCmpGe,
     })
 }
 
@@ -293,6 +318,9 @@ fn typed_opcode(a: Arith, s: SpecType) -> Opcode {
         (Arith::Add, SpecType::SingleFloat) => FloatAdd,
         (Arith::Sub, SpecType::SingleFloat) => FloatSub,
         (Arith::Mul, SpecType::SingleFloat) => FloatMul,
+        (Arith::Add, SpecType::DoubleFloat) => FloatAdd,
+        (Arith::Sub, SpecType::DoubleFloat) => FloatSub,
+        (Arith::Mul, SpecType::DoubleFloat) => FloatMul,
     }
 }
 
@@ -300,6 +328,7 @@ fn result_type(s: SpecType) -> IRType {
     IRType::of(match s {
         SpecType::Fixnum => TypeBits::FIXNUM,
         SpecType::SingleFloat => TypeBits::SINGLE_FLOAT,
+        SpecType::DoubleFloat => TypeBits::DOUBLE_FLOAT,
     })
 }
 
@@ -346,6 +375,282 @@ fn statically_proven_spec_type(f: &Function, args: &[crate::t2::ir::Value]) -> O
     (all_single_numeric && has_single).then_some(SpecType::SingleFloat)
 }
 
+/// The IEEE bits of `value` when it is a compile-time double-float operand: a
+/// `ConstDouble`, or a `ConstHeapObj` whose literal is a double. The literal is
+/// read through its rooted pool slot; T2 compilation runs GC-stable, so the
+/// object cannot move or be collected while it is read here.
+pub(crate) fn double_literal_bits(f: &Function, value: Value) -> Option<u64> {
+    let crate::t2::ir::ValueDef::Result { inst, .. } = f.value(value).def else {
+        return None;
+    };
+    let data = f.inst(inst);
+    match (data.opcode, &data.aux) {
+        (Opcode::ConstDouble, AuxData::DoubleImm(bits)) => Some(*bits),
+        (Opcode::ConstHeapObj, AuxData::HeapLiteral { slot })
+            if f.value(value).ty.bits == TypeBits::DOUBLE_FLOAT =>
+        {
+            // SAFETY: the builder types a heap literal DOUBLE_FLOAT only after
+            // reading a double through this same live constant-pool slot.
+            let literal = unsafe { *(*slot as *const egcl_rt::value::EgclVal) };
+            literal.is_double_float().then(|| literal.as_double_float().to_bits())
+        }
+        _ => None,
+    }
+}
+
+/// The exact double a compile-time operand contributes to a double-float
+/// operation, as the interpreter converts it (float contagion): a fixnum
+/// constant rounds to nearest like `BigRat::to_f64`, a single-float widens
+/// exactly. `comparison` keeps only fixnums that are exactly doubles, since
+/// the interpreter may compare a rational exactly rather than by converting it.
+fn double_constant_operand(
+    f: &Function,
+    value: Value,
+    consts: &HashMap<Value, i64>,
+    comparison: bool,
+) -> Option<u64> {
+    if let Some(bits) = double_literal_bits(f, value) {
+        return Some(bits);
+    }
+    if let Some(&k) = consts.get(&value) {
+        if comparison && k.unsigned_abs() > 1 << 53 {
+            return None;
+        }
+        return Some((k as f64).to_bits());
+    }
+    let crate::t2::ir::ValueDef::Result { inst, .. } = f.value(value).def else {
+        return None;
+    };
+    match (f.inst(inst).opcode, &f.inst(inst).aux) {
+        (Opcode::ConstFloat, AuxData::FloatImm(x)) => Some((*x as f64).to_bits()),
+        _ => None,
+    }
+}
+
+/// Whether every operand of a site can take part in a native double-float
+/// operation: a compile-time double (literal, fixnum or single-float constant)
+/// or a variable that may be a boxed double. At least one operand must be a
+/// variable; two constants stay with the generic call.
+fn double_operands_admissible(
+    f: &Function,
+    args: &[Value],
+    consts: &HashMap<Value, i64>,
+    comparison: bool,
+) -> bool {
+    // Arithmetic also takes a fixnum variable beside a double (contagion).
+    let variable_bits = if comparison {
+        TypeBits::DOUBLE_FLOAT
+    } else {
+        TypeBits::DOUBLE_FLOAT.join(TypeBits::FIXNUM)
+    };
+    let may_be_double = |arg: Value| {
+        double_literal_bits(f, arg).is_some() || {
+            let bits = f.value(arg).ty.bits;
+            double_constant_operand(f, arg, consts, comparison).is_none()
+                && !bits.is_bottom()
+                && !bits.meet(TypeBits::DOUBLE_FLOAT).is_bottom()
+        }
+    };
+    args.len() == 2
+        && args.iter().all(|&arg| {
+            double_constant_operand(f, arg, consts, comparison).is_some() || {
+                let bits = f.value(arg).ty.bits;
+                !bits.is_bottom() && !bits.meet(variable_bits).is_bottom()
+            }
+        })
+        && args
+            .iter()
+            .any(|&arg| double_constant_operand(f, arg, consts, comparison).is_none())
+        && args.iter().any(|&arg| may_be_double(arg))
+}
+
+/// A double-float site proven from operand types alone: every operand is a
+/// compile-time double constant or an SSA value typed exactly DOUBLE-FLOAT.
+fn statically_proven_double(
+    f: &Function,
+    args: &[Value],
+    consts: &HashMap<Value, i64>,
+    comparison: bool,
+) -> bool {
+    double_operands_admissible(f, args, consts, comparison)
+        && args.iter().all(|&arg| {
+            double_constant_operand(f, arg, consts, comparison).is_some()
+                || f.value(arg).ty.bits == TypeBits::DOUBLE_FLOAT
+        })
+}
+
+/// The site's speculation once double-float operands are considered
+/// (bliss-thcbb). A known double operand (a literal such as `1d0`) can never
+/// pass a fixnum or single-float guard, so such a site speculates double-float
+/// when `options` admit it and every operand can take part; otherwise the
+/// later operand reconciliation keeps it generic. A profiled double site is
+/// kept only when admitted, with operands that can all take part.
+fn reconcile_double(
+    f: &Function,
+    args: &[Value],
+    consts: &HashMap<Value, i64>,
+    comparison: bool,
+    spec: SpecType,
+    options: SpeculateOptions,
+) -> Option<SpecType> {
+    let admitted = options.double_float
+        && cfg!(target_arch = "x86_64")
+        && double_operands_admissible(f, args, consts, comparison);
+    let known_double = args.iter().any(|&arg| {
+        f.value(arg).ty.bits == TypeBits::DOUBLE_FLOAT || double_literal_bits(f, arg).is_some()
+    });
+    match spec {
+        SpecType::DoubleFloat => admitted.then_some(SpecType::DoubleFloat),
+        _ if known_double && admitted => Some(SpecType::DoubleFloat),
+        other => Some(other),
+    }
+}
+
+fn is_float_compare(op: Opcode) -> bool {
+    matches!(
+        op,
+        Opcode::FloatCmpEq | Opcode::FloatCmpLt | Opcode::FloatCmpLe | Opcode::FloatCmpGt
+            | Opcode::FloatCmpGe
+    )
+}
+
+/// Insert `data` immediately before `site` in its block; return its result.
+fn insert_before_site(
+    f: &mut Function,
+    site: Inst,
+    data: crate::t2::ir::InstData,
+    result: (IRType, crate::t2::ir::ValueRepresentation),
+) -> Value {
+    let block = f
+        .block_order()
+        .iter()
+        .copied()
+        .find(|&b| f.block(b).insts.contains(&site))
+        .expect("site is in a block");
+    let (inst, results) = f.push_inst(block, data, &[result]);
+    let insts = &mut f.block_mut(block).insts;
+    let appended = insts.pop();
+    debug_assert_eq!(appended, Some(inst));
+    let position = insts.iter().position(|&i| i == site).expect("site is in its block");
+    insts.insert(position, inst);
+    results[0]
+}
+
+/// `UnboxFloat` auxiliary data for an arithmetic operand that may also be a
+/// fixnum, converted to the nearest double exactly as the interpreter's float
+/// contagion does (`BigRat::to_f64` and `cvtsi2sd` both round to nearest). A
+/// second operand names the other variable: when both are fixnums the
+/// interpreter's answer is an integer, so that guard deopts (bliss-thcbb).
+pub fn contagion_unbox_aux() -> AuxData {
+    AuxData::TypeTag(IRType::of(TypeBits::FIXNUM.join(TypeBits::DOUBLE_FLOAT)))
+}
+
+/// Whether an `UnboxFloat` accepts a fixnum operand (see [`contagion_unbox_aux`]).
+pub fn unbox_accepts_fixnum(aux: &AuxData) -> bool {
+    matches!(aux, AuxData::TypeTag(ty)
+        if ty.bits == TypeBits::FIXNUM.join(TypeBits::DOUBLE_FLOAT))
+}
+
+/// Expand a double-float site into raw IR (bliss-thcbb). Each variable operand
+/// is unboxed by a guarded `UnboxFloat` that deopts, at the site's own
+/// bytecode position, on anything but a boxed double or, for arithmetic, a
+/// fixnum joining the double by contagion; a compile-time operand becomes a
+/// `ConstDouble` converted exactly as the interpreter's contagion would.
+/// Arithmetic then computes into a fresh raw value, and the site itself
+/// becomes the `BoxFloat` producing its original tagged result. A comparison
+/// keeps the site (now `FloatCmp*` over raw operands, deopting on NaN); its
+/// operands must be doubles, since the interpreter compares a fixnum with a
+/// double exactly rather than by converting it.
+fn expand_double_site(f: &mut Function, site: Inst, opcode: Opcode, consts: &HashMap<Value, i64>) {
+    use crate::t2::ir::{InstData, ValueRepresentation};
+    let comparison = is_float_compare(opcode);
+    let data = f.inst(site).clone();
+    let state = data.frame_state.expect("double site keeps its frame state");
+    let raw_double = (IRType::of(TypeBits::DOUBLE_FLOAT), ValueRepresentation::UnboxedF64);
+    let constant = |f: &Function, value: Value| double_constant_operand(f, value, consts, comparison);
+    // A double partner (literal or proven) makes the result a double whatever
+    // this operand is. Beside a fixnum or single-float constant the variable
+    // must itself be a double: the interpreter's answer would otherwise be
+    // an integer or a single-float. Two unproven variables check the pair.
+    let proven_double = |f: &Function, value: Value| {
+        double_literal_bits(f, value).is_some() || f.value(value).ty.bits == TypeBits::DOUBLE_FLOAT
+    };
+    let mut raw = Vec::with_capacity(data.args.len());
+    for (index, &arg) in data.args.iter().enumerate() {
+        let partner = data.args[1 - index];
+        let (aux, args) = if comparison {
+            (AuxData::None, vec![arg])
+        } else if proven_double(f, partner) {
+            (contagion_unbox_aux(), vec![arg])
+        } else if constant(f, partner).is_some() {
+            (AuxData::None, vec![arg])
+        } else if index == 1 && !proven_double(f, arg) {
+            (contagion_unbox_aux(), vec![arg, partner])
+        } else {
+            (contagion_unbox_aux(), vec![arg])
+        };
+        let value = if let Some(bits) = constant(f, arg) {
+            insert_before_site(
+                f,
+                site,
+                InstData {
+                    opcode: Opcode::ConstDouble,
+                    args: vec![],
+                    results: vec![],
+                    aux: AuxData::DoubleImm(bits),
+                    flags: InstFlags::default(),
+                    targets: vec![],
+                    frame_state: None,
+                    source_pos: data.source_pos,
+                },
+                raw_double,
+            )
+        } else {
+            let guard_state = f.frame_states.add(f.frame_states.get(state).clone());
+            insert_before_site(
+                f,
+                site,
+                InstData {
+                    opcode: Opcode::UnboxFloat,
+                    args,
+                    results: vec![],
+                    aux,
+                    flags: InstFlags {
+                        guard: true,
+                        effectful: true,
+                        ..InstFlags::default()
+                    },
+                    targets: vec![],
+                    frame_state: Some(guard_state),
+                    source_pos: data.source_pos,
+                },
+                raw_double,
+            )
+        };
+        raw.push(value);
+    }
+    if comparison {
+        f.inst_mut(site).args = raw;
+        return;
+    }
+    let result = insert_before_site(
+        f,
+        site,
+        InstData {
+            opcode,
+            args: raw,
+            results: vec![],
+            aux: AuxData::None,
+            flags: InstFlags::default(),
+            targets: vec![],
+            frame_state: None,
+            source_pos: data.source_pos,
+        },
+        raw_double,
+    );
+    f.inst_mut(site).args = vec![result];
+}
+
 /// Correct a profiled (or cold-guessed) type against operands whose SSA type
 /// already rules it out (bliss-9bw59). A literal `2.0` can never pass a fixnum
 /// guard, so a cold fixnum guess at `(- n 2.0)` only bought a certain deopt and,
@@ -358,6 +663,9 @@ fn reconcile_with_operands(
     args: &[crate::t2::ir::Value],
     spec: SpecType,
 ) -> Option<SpecType> {
+    if spec == SpecType::DoubleFloat {
+        return Some(spec);
+    }
     let numeric = TypeBits::FIXNUM.join(TypeBits::SINGLE_FLOAT);
     let known = |arg: &crate::t2::ir::Value| {
         let bits = f.value(*arg).ty.bits;
@@ -382,6 +690,15 @@ fn reconcile_with_operands(
 /// or `None` to leave generic).
 /// Returns the number of sites speculated.
 pub fn speculate(f: &mut Function, profile: &impl Fn(u32) -> Option<SpecType>) -> usize {
+    speculate_with(f, profile, SpeculateOptions::default())
+}
+
+/// [`speculate`], optionally expanding double-float sites (bliss-thcbb).
+pub fn speculate_with(
+    f: &mut Function,
+    profile: &impl Fn(u32) -> Option<SpecType>,
+    options: SpeculateOptions,
+) -> usize {
     // Read phase: collect the calls to rewrite (keeps the borrow off `f` for the
     // mutation phase).
     let mut work: Vec<(Inst, Opcode, IRType, ExtraArg)> = Vec::new();
@@ -435,11 +752,38 @@ pub fn speculate(f: &mut Function, profile: &impl Fn(u32) -> Option<SpecType>) -
             // The site's bcp is on the Call's FrameState (P1 anchors it there).
             let Some(fs) = data.frame_state else { continue };
             let bcp = frame_state_bcp(f, fs);
-            let Some(spec) = statically_proven_spec_type(f, &data.args)
-                .or_else(|| profile(bcp).and_then(|spec| reconcile_with_operands(f, &data.args, spec)))
+            let comparison = cmp_of(sym).is_some();
+            let proven_double = options.double_float
+                && cfg!(target_arch = "x86_64")
+                && (arith_of(sym).is_some() || comparison)
+                && statically_proven_double(f, &data.args, &consts, comparison);
+            let Some(spec) = proven_double
+                .then_some(SpecType::DoubleFloat)
+                .or_else(|| statically_proven_spec_type(f, &data.args))
+                .or_else(|| {
+                    profile(bcp)
+                        .and_then(|spec| {
+                            reconcile_double(f, &data.args, &consts, comparison, spec, options)
+                        })
+                        .and_then(|spec| reconcile_with_operands(f, &data.args, spec))
+                })
             else {
                 continue;
             };
+            if spec == SpecType::DoubleFloat {
+                // Only binary arithmetic and comparisons have a raw double form.
+                let opcode = match (arith_of(sym), cmp_of(sym)) {
+                    (Some(arith), _) if argc == 2 => typed_opcode(arith, spec),
+                    (_, Some(cmp)) if argc == 2 => match typed_cmp_opcode(cmp, spec) {
+                        Some(op) => op,
+                        None => continue,
+                    },
+                    _ => continue,
+                };
+                let ty = if comparison { boolean_type() } else { result_type(spec) };
+                work.push((inst, opcode, ty, ExtraArg::DoubleFloat));
+                continue;
+            }
             if let Some(arith) = arith_of(sym) {
                 match (arith, argc) {
                     // Binary arithmetic: the typed op's result is the numeric type.
@@ -549,10 +893,13 @@ pub fn speculate(f: &mut Function, profile: &impl Fn(u32) -> Option<SpecType>) -
         };
         super::builtin_binding::insert(f, block, position, state, binding);
         n += 1;
+        if extra == ExtraArg::DoubleFloat {
+            expand_double_site(f, inst, opcode, &consts);
+        }
         // Materialise the appended constant operand (1+/1- → const 1; NOT →
         // const NIL) as a const inst placed immediately before the site.
         let extra_value = match extra {
-            ExtraArg::None | ExtraArg::Fence(_) => None,
+            ExtraArg::None | ExtraArg::Fence(_) | ExtraArg::DoubleFloat => None,
             ExtraArg::FixnumOne => Some(push_const_before(
                 f,
                 inst,
@@ -588,7 +935,18 @@ pub fn speculate(f: &mut Function, profile: &impl Fn(u32) -> Option<SpecType>) -
                     data.args.push(v);
                 }
             }
-            if opcode == Opcode::GenericEq {
+            if extra == ExtraArg::DoubleFloat && !is_float_compare(opcode) {
+                // The site itself is now the escape box of the raw result: the
+                // operand guards and raw operation precede it. It cannot deopt;
+                // it allocates, so it stays ordered and pinned.
+                data.opcode = Opcode::BoxFloat;
+                data.aux = AuxData::None;
+                data.flags = InstFlags {
+                    effectful: true,
+                    ..InstFlags::default()
+                };
+                data.frame_state = None;
+            } else if opcode == Opcode::GenericEq {
                 // (eq x nil) is PURE and total: no guard, no deopt state, no
                 // safepoint. The separate return effect retains its own state.
                 data.flags = InstFlags::default();
@@ -1544,6 +1902,91 @@ mod tests {
             assert_eq!(speculate(&mut g, &|_| Some(guess)), 0, "{guess:?}");
             assert_eq!(g.inst(call).opcode, f.inst(call).opcode);
         }
+    }
+
+    const DOUBLE_FLOAT: SpeculateOptions = SpeculateOptions { double_float: true };
+
+    /// The opcodes of the entry block, in order.
+    fn entry_opcodes(f: &Function) -> Vec<Opcode> {
+        f.block(f.entry()).insts.iter().map(|&inst| f.inst(inst).opcode).collect()
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn profiled_double_site_expands_to_raw_ir_only_when_admitted() {
+        use crate::t2::ir::ValueRepresentation as Repr;
+        let (f, call) = build_star();
+        // The tagged artifact never sees a double speculation.
+        let mut tagged = f.clone();
+        assert_eq!(speculate(&mut tagged, &|_| Some(SpecType::DoubleFloat)), 0);
+        assert_eq!(tagged.inst(call).opcode, Opcode::Call);
+
+        let mut raw = f.clone();
+        assert_eq!(speculate_with(&mut raw, &|_| Some(SpecType::DoubleFloat), DOUBLE_FLOAT), 1);
+        let ops = entry_opcodes(&raw);
+        let unboxes: Vec<Inst> = raw.block(raw.entry()).insts.iter().copied()
+            .filter(|&inst| raw.inst(inst).opcode == Opcode::UnboxFloat)
+            .collect();
+        assert_eq!(unboxes.len(), 2, "{ops:?}");
+        for &unbox in &unboxes {
+            let data = raw.inst(unbox);
+            assert!(data.flags.guard && data.frame_state.is_some());
+            assert!(unbox_accepts_fixnum(&data.aux), "arithmetic takes fixnum contagion");
+            assert_eq!(raw.value(data.results[0]).repr, Repr::UnboxedF64);
+        }
+        // The second of two unproven variables checks the pair for fixnums.
+        assert_eq!(raw.inst(unboxes[0]).args.len(), 1);
+        assert_eq!(raw.inst(unboxes[1]).args.len(), 2);
+        let multiply = *raw.block(raw.entry()).insts.iter()
+            .find(|&&inst| raw.inst(inst).opcode == Opcode::FloatMul)
+            .expect("raw multiply");
+        assert!(raw.inst(multiply).frame_state.is_none());
+        assert_eq!(raw.value(raw.inst(multiply).results[0]).repr, Repr::UnboxedF64);
+        // The site itself boxes the raw result into its original value.
+        assert_eq!(raw.inst(call).opcode, Opcode::BoxFloat);
+        assert_eq!(raw.inst(call).args, raw.inst(multiply).results);
+        assert_eq!(raw.value(raw.inst(call).results[0]).repr, Repr::Tagged);
+        assert_eq!(raw.value(raw.inst(call).results[0]).ty.bits, TypeBits::DOUBLE_FLOAT);
+        assert!(crate::t2::verify::verify(&raw).is_ok());
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn declared_double_operands_speculate_without_a_profile() {
+        let (mut f, call) = build_star();
+        for param in f.block(f.entry()).params.clone() {
+            f.refine_type(param, IRType::of(TypeBits::DOUBLE_FLOAT));
+        }
+        assert_eq!(speculate_with(&mut f, &|_| None, DOUBLE_FLOAT), 1);
+        assert_eq!(f.inst(call).opcode, Opcode::BoxFloat);
+        // Proven doubles need no fixnum pair check.
+        assert!(f.block(f.entry()).insts.iter()
+            .filter(|&&inst| f.inst(inst).opcode == Opcode::UnboxFloat)
+            .all(|&inst| f.inst(inst).args.len() == 1));
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn known_double_operand_overrides_a_fixnum_guess_when_admitted() {
+        let (mut f, call) = build_star();
+        let second = f.block(f.entry()).params[1];
+        f.refine_type(second, IRType::of(TypeBits::DOUBLE_FLOAT));
+        assert_eq!(speculate_with(&mut f, &|_| Some(SpecType::Fixnum), DOUBLE_FLOAT), 1);
+        assert_eq!(f.inst(call).opcode, Opcode::BoxFloat);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn double_profile_beside_two_fixnums_stays_generic() {
+        let (mut f, call) = build_star();
+        for param in f.block(f.entry()).params.clone() {
+            f.refine_type(param, IRType::of(TypeBits::FIXNUM));
+        }
+        // Two proven fixnums are integer arithmetic whatever the profile says.
+        let mut g = f.clone();
+        speculate_with(&mut g, &|_| Some(SpecType::DoubleFloat), DOUBLE_FLOAT);
+        assert_ne!(g.inst(call).opcode, Opcode::BoxFloat);
+        assert!(!g.block(g.entry()).insts.iter().any(|&inst| g.inst(inst).opcode == Opcode::UnboxFloat));
     }
 
     #[test]

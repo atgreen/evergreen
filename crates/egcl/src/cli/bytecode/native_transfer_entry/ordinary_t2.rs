@@ -113,6 +113,17 @@ pub(in crate::cli::bytecode) fn install_ordinary_t2(
     ) {
         Ok(code) => code,
         Err(decline) => {
+            if let Some((tagged, speculations)) = artifact.mapped_fallback.take() {
+                // A raw double candidate declined; install the tagged artifact
+                // with its own speculation metadata instead (bliss-thcbb).
+                t2_log_write(format_args!(
+                    "{}: raw double T2 emission declined ({decline}); installing tagged T2",
+                    display_fn_name(&body.name)
+                ));
+                artifact.mapped = Some(tagged);
+                artifact.speculations = speculations;
+                return install_ordinary_t2(symbol, body, artifact);
+            }
             t2_log_write(format_args!(
                 "{}: mapped T2 emission declined ({decline}); keep mapped T1 or interpreter",
                 display_fn_name(&body.name)
