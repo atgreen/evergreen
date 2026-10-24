@@ -386,9 +386,12 @@ impl VariadicPlan {
     }
 }
 
+// The ordinary x86-64 Lisp entry is the only caller of what follows.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 /// The most bound values an ordinary `&key` entry passes in registers.
 pub(super) const NATIVE_KEYWORD_VALUES: usize = 3;
 
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 impl VariadicPlan {
     /// The plan for `func` when every call it can bind needs no evaluation:
     /// required, `&optional` and `&key` parameters with constant defaults,
@@ -481,6 +484,7 @@ impl VariadicPlan {
 /// `plan` comes from [`VariadicPlan::native_keywords`] for a body its code
 /// retains; the argument areas hold `count` words and `out` holds the plan's
 /// value count. Called from generated code before the entry's frame exists.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub(super) unsafe extern "C" fn native_keyword_bind(
     plan: *const VariadicPlan,
     registers: *const EgclVal,
@@ -501,6 +505,7 @@ pub(super) unsafe extern "C" fn native_keyword_bind(
 }
 
 /// The number of values `plan` binds, for the ordinary entry's arity.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub(super) fn bound_values(plan: &VariadicPlan) -> usize {
     plan.values
 }
