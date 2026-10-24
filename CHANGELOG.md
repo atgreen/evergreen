@@ -511,6 +511,11 @@
 
 ### Fixed
 
+- A function whose optimized code arrives while one of its loops is still
+  running inside a call from another function no longer crashes with
+  "ordinary entry is not an OSR destination". The running loop now jumps into
+  the optimized code at the right place, as it already did for an outermost
+  call ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
 - A garbage collection no longer fails because another thread is late to
   stop for it. A thread compiling a large function to native code checks for a
   pending collection only when the compile finishes, which under load could

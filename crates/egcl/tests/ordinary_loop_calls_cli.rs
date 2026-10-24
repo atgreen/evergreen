@@ -490,3 +490,26 @@ fn funcall_of_a_named_function_enters_its_ordinary_entry() {
          (19999 20000) (:THROWN 50 1) 300 100 300 100)",
     );
 }
+
+/// A callee whose ordinary T2 entry is installed while a child activation of
+/// it is still looping, so that loop's OSR selects code with an ordinary
+/// entry. The transfer must enter the mapped companion that keeps the loop
+/// headers, as the root activation's OSR already did; it panicked with
+/// "ordinary entry is not an OSR destination" (bliss-3n3eh).
+#[test]
+fn a_child_loop_osr_enters_the_mapped_companion_of_ordinary_code() {
+    let program = "(progn
+      (defun build-ordinary (n)
+        (let ((acc nil) (x (list :a :b)))
+          (dotimes (i n) (setq acc (cons (cons i x) acc)))
+          acc))
+      (defun check-ordinary (n)
+        (let ((l (build-ordinary n)) (k (1- n)) (ok t))
+          (dolist (e l)
+            (unless (and (eql (car e) k) (equal (cdr e) '(:a :b))) (setq ok nil))
+            (decf k))
+          (list ok (length l))))
+      (dotimes (k 40) (check-ordinary 50))
+      (format t \"RESULT ~s~%\" (check-ordinary 50000)))";
+    check_all_tiers(program, "RESULT (T 50000)");
+}

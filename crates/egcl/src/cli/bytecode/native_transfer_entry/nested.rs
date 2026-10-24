@@ -441,6 +441,11 @@ unsafe fn resume_nested_published(record: *mut MappedCallRecord) {
                 let NativeCodeStorage::Mapped(next_code) = &next._storage else {
                     return Err(invalid_capture());
                 };
+                // `offset` indexes the OSR destination's entries: code with an
+                // ordinary entry keeps its loop headers in a mapped companion,
+                // as the root activation's OSR transfer also enters
+                // (bliss-3n3eh).
+                let next_code = next_code.osr_destination();
                 // The parent stays published by the cold adapter. Transfer the
                 // child's managed frame exactly once; the new entry owns it
                 // even if preparation fails before machine execution begins.
