@@ -1289,6 +1289,7 @@ fn install_local_definition(sym: u32, body: Option<Arc<BytecodeFunction>>, gener
     DEOPT_BLACKLIST.with(|s| s.borrow_mut().remove(&sym));
     PROMOTED_FRESH.with(|s| s.borrow_mut().remove(&sym));
     LAST_FAILED_SPECULATION.with(|m| m.borrow_mut().remove(&sym));
+    DECAYED_EVIDENCE.with(|m| m.borrow_mut().remove(&sym));
 }
 
 /// Call a registered GLOBAL bytecode function `sym` from the tree-walker,
@@ -20912,6 +20913,67 @@ fn supported_numeric_phase_change(sym: u32) -> bool {
     })
 }
 
+/// Profile counts behind an installed version's evidence-based (not cold)
+/// speculations, saved before the first deopt decays them (bliss-9bw59).
+type DecayedEvidence = HashMap<u32, Vec<(usize, u32, SpecType, u32)>>;
+static DECAYED_EVIDENCE: egcl_rt::execution_local::ExecutionLocal<RefCell<DecayedEvidence>> =
+    unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(HashMap::new())) };
+
+/// The counts `decay_failed_speculation` is about to zero at `installed`'s
+/// evidence-based sites.
+fn profiled_speculation_counts(
+    body: &Arc<BytecodeFunction>,
+    installed: &T2InstalledMetadata,
+) -> Vec<(usize, u32, SpecType, u32)> {
+    let key = Arc::as_ptr(body) as usize;
+    installed.speculations.iter()
+        .filter(|(bcp, _)| !installed.cold_guesses.contains(bcp))
+        .filter_map(|&(bcp, kind)| {
+            let profile = type_profile_at(key, bcp)?;
+            let count = match kind {
+                SpecType::Fixnum => profile.fixnum,
+                SpecType::SingleFloat => profile.single_float,
+            };
+            (count > 0).then_some((key, bcp, kind, count))
+        })
+        .collect()
+}
+
+/// Give back the counts saved by `profiled_speculation_counts` for `sym`.
+fn restore_decayed_evidence(sym: u32) {
+    let Some(evidence) = DECAYED_EVIDENCE.with(|m| m.borrow_mut().remove(&sym)) else {
+        return;
+    };
+    TYPE_PROFILE.with(|profiles| {
+        let mut profiles = profiles.borrow_mut();
+        for (key, bcp, kind, count) in evidence {
+            let profile = profiles.entry((key, bcp)).or_default();
+            let slot = match kind {
+                SpecType::Fixnum => &mut profile.fixnum,
+                SpecType::SingleFloat => &mut profile.single_float,
+            };
+            *slot = slot.saturating_add(count);
+        }
+    });
+}
+
+/// True when a site the current version speculated as a cold fixnum guess has
+/// since been profiled as something else. Recompiling then reads that profile,
+/// so the site is no longer cold and each such recompile retires at least one
+/// cold guess; a later failure there falls under the threshold rule.
+fn cold_guess_disproved(sym: u32) -> bool {
+    let failed = LAST_FAILED_SPECULATION.with(|m| m.borrow().get(&sym).cloned());
+    let Some(failed) = failed else { return false };
+    let Some(body) = registry_get(sym) else {
+        return false;
+    };
+    let func_ptr = Arc::as_ptr(&body) as usize;
+    failed.into_iter().any(|(bcp, old, cold)| {
+        cold && type_profile_at(func_ptr, bcp)
+            .is_some_and(|profile| profile.total() > 0 && profile.speculation() != Some(old))
+    })
+}
+
 /// Whether one failed speculation `old` at a site now profiled as `profile`
 /// marks a phase change (see `supported_numeric_phase_change`).
 fn failed_site_changed_phase(profile: &TypeProfile, old: SpecType, cold: bool) -> bool {
@@ -22620,6 +22682,7 @@ fn wait_for_t2(sym: u32) -> Option<Rc<NativeCode>> {
 fn mark_fresh_promotion(sym: u32) {
     PROMOTED_FRESH.with(|s| s.borrow_mut().insert(sym));
     LAST_FAILED_SPECULATION.with(|m| m.borrow_mut().remove(&sym));
+    DECAYED_EVIDENCE.with(|m| m.borrow_mut().remove(&sym));
     DEOPT_COUNTS.with(|m| {
         m.borrow_mut().insert(sym, 0);
     });
@@ -22803,14 +22866,30 @@ fn note_native_deopt(sym: u32, code: Option<&NativeCode>, guard_bcp: Option<u32>
                 // T1's optimistic arithmetic templates are always Fixnum. T2
                 // follows the profile that was dominant when it was compiled.
                 let forced = (!is_t2).then_some(SpecType::Fixnum);
+                let evidence = metadata.map(|installed| profiled_speculation_counts(bf, installed));
                 let failed = decay_failed_speculation(bf, forced, metadata);
                 LAST_FAILED_SPECULATION.with(|m| {
                     m.borrow_mut().insert(sym, failed);
                 });
+                DECAYED_EVIDENCE.with(|m| match evidence {
+                    Some(evidence) => { m.borrow_mut().insert(sym, evidence); }
+                    None => { m.borrow_mut().remove(&sym); }
+                });
             }
         }
         let threshold_hit = n >= deopt_blacklist_threshold();
-        let phase_change = threshold_hit && supported_numeric_phase_change(sym);
+        // A disproved cold guess needs no threshold: it was made without
+        // evidence, and the site now has some (bliss-9bw59). Waiting for the
+        // threshold re-ran a float recursion through eight deopts first.
+        let cold_disproved = !threshold_hit && cold_guess_disproved(sym);
+        let phase_change =
+            cold_disproved || (threshold_hit && supported_numeric_phase_change(sym));
+        if cold_disproved {
+            // Only the guess was wrong; the decay above also erased the
+            // evidence behind this version's other speculations. Restore it so
+            // the recompile keeps them instead of compiling them generic.
+            restore_decayed_evidence(sym);
+        }
         // JFR-style event stream (bliss-ai8n): a speculation guard failed.
         // Record the classified reason + running per-function count.
         super::events::record(
@@ -22830,7 +22909,9 @@ fn note_native_deopt(sym: u32, code: Option<&NativeCode>, guard_bcp: Option<u32>
             let nm = current.as_ref().map(|b| display_fn_name(&b.name).to_string()).unwrap_or_default();
             t2_log_write(format_args!(
                 "{nm}: native guard deopt #{n} => resuming interpreted{}",
-                if phase_change {
+                if cold_disproved {
+                    " (cold fixnum guess disproved => generic T1 + recompile)"
+                } else if phase_change {
                     " (threshold hit: supported numeric phase change => generic T1 + recompile)"
                 } else if threshold_hit {
                     " (threshold hit: uninstall + blacklist => T0)"
@@ -22879,6 +22960,7 @@ fn note_native_deopt(sym: u32, code: Option<&NativeCode>, guard_bcp: Option<u32>
             DEOPT_COUNTS.with(|m| m.borrow_mut().insert(sym, 0));
             PROMOTED_FRESH.with(|s| s.borrow_mut().remove(&sym));
             LAST_FAILED_SPECULATION.with(|m| m.borrow_mut().remove(&sym));
+            DECAYED_EVIDENCE.with(|m| m.borrow_mut().remove(&sym));
             let fn_obj = egcl_rt::symbols::symbol_function(sym)
                 .filter(|&value| egcl_rt::function::is_interpreted_function(value));
             if let Some(fallback) = try_promote_to_t1_with_speculation(sym, false) {
@@ -25712,7 +25794,8 @@ fn t2_numeric_speculations(
                 | FixnumCmpEq | FixnumCmpLt | FixnumCmpLe | FixnumCmpGt | FixnumCmpGe => {
                     SpecType::Fixnum
                 }
-                FloatAdd | FloatSub | FloatMul | FloatDiv | FloatCmpEq | FloatCmpLt => {
+                FloatAdd | FloatSub | FloatMul | FloatDiv | FloatCmpEq | FloatCmpLt
+                | FloatCmpLe | FloatCmpGt | FloatCmpGe => {
                     SpecType::SingleFloat
                 }
                 _ => continue,

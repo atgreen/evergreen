@@ -539,33 +539,15 @@ fn numeric_phase_changes_recompile_t2_instead_of_blacklisting() {
     );
     assert!(ok, "numeric phase-change program failed: {out}");
     assert!(out.lines().any(|line| line == "initial=2"), "{out}");
-    assert!(
-        out.lines().any(|line| line
-            == if MAPPED_LINUX {
-                "float=12.5 tier=1"
-            } else {
-                "float=12.5 tier=2"
-            }),
-        "{out}"
-    );
-    assert!(
-        out.lines().any(|line| line
-            == if MAPPED_LINUX {
-                "fixnum=35 tier=1"
-            } else {
-                "fixnum=35 tier=2"
-            }),
-        "{out}"
-    );
+    // The Linux mapped emitter compiles single-float code too (bliss-9bw59),
+    // so every x86-64 platform now reaches a float T2 version.
+    assert!(out.lines().any(|line| line == "float=12.5 tier=2"), "{out}");
+    assert!(out.lines().any(|line| line == "fixnum=35 tier=2"), "{out}");
     assert!(out.contains("; T2 — profile-guided native"), "{out}");
-    if MAPPED_LINUX {
-        assert!(out.contains("; T1 — tagged baseline native"), "{out}");
-    } else {
-        assert!(
-            out.contains("mulss xmm0,xmm1"),
-            "missing float T2 version:\n{out}"
-        );
-    }
+    assert!(
+        out.contains("mulss xmm0,xmm1"),
+        "missing float T2 version:\n{out}"
+    );
     assert!(
         out.lines().any(|line| line.contains("imul ")),
         "missing fixnum T2 version:\n{out}"
@@ -632,12 +614,7 @@ fn bignum_with_single_float_recovers_to_generic_t2() {
     let (out, ok) = run(program, &[("EGCL_FORCE_TIER", "t2")]);
     assert!(ok, "mixed bignum/float result was incorrect: {out}");
     assert!(
-        out.lines().any(|line| line
-            == if MAPPED_LINUX {
-                "float-bignum=0"
-            } else {
-                "float-bignum=2"
-            }),
+        out.lines().any(|line| line == "float-bignum=2"),
         "{out}"
     );
 }
@@ -1705,23 +1682,14 @@ fn declared_single_float_parameter_removes_arithmetic_type_guard() {
         out.contains("checked parameter declarations: X: SINGLE-FLOAT"),
         "{out}"
     );
-    if MAPPED_LINUX {
-        assert!(out.contains("; T1 — tagged baseline native"), "{out}");
-        assert!(!out.contains("Mapped native transfer ABI"), "{out}");
-    } else {
-        assert!(
-            out.contains("checked parameter declarations: X: SINGLE-FLOAT"),
-            "{out}"
-        );
-        assert!(
-            out.contains("mulss xmm0,xmm1"),
-            "expected direct declared float multiply:\n{out}"
-        );
-        assert!(
-            !out.contains("cmp dl,4"),
-            "declaration proof should remove the float tag guard:\n{out}"
-        );
-    }
+    assert!(
+        out.contains("mulss xmm0,xmm1"),
+        "expected direct declared float multiply:\n{out}"
+    );
+    assert!(
+        !out.contains("cmp dl,4"),
+        "declaration proof should remove the float tag guard:\n{out}"
+    );
     assert!(out.lines().any(|line| line == "TYPE-ERROR"), "{out}");
 }
 

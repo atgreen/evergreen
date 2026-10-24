@@ -407,7 +407,7 @@ fn eval(opcode: Opcode, aux: &AuxData, ops: &[IRType]) -> IRType {
 
         // Comparisons and predicates yield a CL boolean.
         FixnumCmpEq | FixnumCmpLt | FixnumCmpLe | FixnumCmpGt | FixnumCmpGe | FloatCmpEq
-        | FloatCmpLt | GenericEq | GenericEqual | InstanceOf => boolean(),
+        | FloatCmpLt | FloatCmpLe | FloatCmpGt | FloatCmpGe | GenericEq | GenericEqual | InstanceOf => boolean(),
 
         // A type check narrows its operand to the checked tag (spec R4.63).
         // A Guard VALUE does the same for its passed-through result: it exists

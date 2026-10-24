@@ -647,8 +647,9 @@ fn framed_alloc(
 
 /// Load one operand of a float op into `xmm`. A fixnum constant is coerced to
 /// single-float at compile time (float contagion — `(* 2.5 5)` = `12.5`) and
-/// materialised; a variable is guarded to be a single-float, then its f32 bits
-/// (high dword of the tagged value) are unpacked into the XMM register.
+/// materialised; a variable is guarded to be a single-float (or, with
+/// `accept_fixnum`, an exactly representable fixnum, converted), then its f32
+/// bits (high dword of the tagged value) are unpacked into the XMM register.
 // Keep the emitter's separate operand maps borrowed; bundling them solely for
 // argument count would obscure which parts of the allocation state are read.
 #[allow(clippy::too_many_arguments)]
@@ -660,23 +661,106 @@ fn float_operand_to_xmm(
     consts: &std::collections::HashMap<crate::t2::ir::Value, i64>,
     float_consts: &std::collections::HashMap<crate::t2::ir::Value, u32>,
     proven_single_float: &std::collections::HashSet<crate::t2::ir::Value>,
+    accept_fixnum: bool,
     deopt: egcl_rt::asm::Label,
 ) -> Result<(), EmitError> {
     if let Some(&bits) = float_consts.get(&v) {
         mov_imm32(a, SCRATCH, bits);
         movd_xmm_r32(a, xmm, SCRATCH);
     } else if let Some(&c) = consts.get(&v) {
-        mov_imm32(a, SCRATCH, (c as f32).to_bits());
+        // The interpreter combines a fixnum with a single-float in double
+        // precision and rounds once; that equals the single-precision operation
+        // only when the fixnum is exactly a single-float. Decline otherwise.
+        let single = c as f32;
+        if single as i64 != c {
+            return Err(EmitError::UnsupportedOp(0xF4));
+        }
+        mov_imm32(a, SCRATCH, single.to_bits());
         movd_xmm_r32(a, xmm, SCRATCH);
     } else {
         let r = *reg.get(&v).ok_or(EmitError::UnsupportedOp(0xF2))?;
-        if !proven_single_float.contains(&v) {
+        if proven_single_float.contains(&v) {
+            single_float_to_xmm(a, xmm, r);
+        } else if accept_fixnum {
+            // Float contagion with a fixnum VARIABLE (bliss-9bw59): `(+ x y)`
+            // with x a single-float and y a fixnum profiles as single-float.
+            // Convert an exactly representable fixnum, as for a constant; any
+            // other operand deopts.
+            let single = a.label();
+            let done = a.label();
+            alu_rr(a, 0x89, SCRATCH, r); // mov rdx, r
+            a.extend_from_slice(&[0x80, 0xE2, 0x07]); // and dl, 7
+            a.extend_from_slice(&[0x80, 0xFA, 0x04]); // cmp dl, 4
+            a.jcc(Cc::E, single);
+            a.extend_from_slice(&[0x84, 0xD2]); // test dl, dl (fixnum tag 000)
+            a.jcc(Cc::Ne, deopt);
+            mov_rr(a, SCRATCH, r);
+            sar_imm(a, SCRATCH, 3); // the fixnum's integer value
+            // cvtsi2ss xmm, rdx
+            a.extend_from_slice(&[0xF3, 0x48 | (((xmm >> 3) & 1) << 2), 0x0F, 0x2A,
+                modrm_rr(xmm, SCRATCH)]);
+            // Round-trip through RAX, preserved in xmm2: cvttss2si rax, xmm
+            // gives the integer back only when the conversion was exact.
+            a.extend_from_slice(&[0x66, 0x48, 0x0F, 0x6E, modrm_rr(2, RAX)]); // movq xmm2, rax
+            a.extend_from_slice(&[0xF3, 0x48 | ((xmm >> 3) & 1), 0x0F, 0x2C,
+                modrm_rr(RAX, xmm)]);
+            cmp_rr(a, RAX, SCRATCH);
+            a.extend_from_slice(&[0x66, 0x48, 0x0F, 0x7E, modrm_rr(2, RAX)]); // movq rax, xmm2
+            a.jcc(Cc::Ne, deopt);
+            a.jmp(done);
+            a.bind(single);
+            single_float_to_xmm(a, xmm, r);
+            a.bind(done);
+        } else {
             guard_single_float(a, r, deopt);
+            single_float_to_xmm(a, xmm, r);
         }
-        // Preserve the tagged SSA value for later uses and deopt reconstruction.
-        mov_rr(a, SCRATCH, r);
-        shr_imm(a, SCRATCH, 32); // low dword now holds the f32 bits
-        movd_xmm_r32(a, xmm, SCRATCH);
+    }
+    Ok(())
+}
+
+/// Unpack a tagged single-float in `r` into `xmm`, preserving `r` for later
+/// uses and deopt reconstruction.
+fn single_float_to_xmm(a: &mut Asm, xmm: u8, r: u8) {
+    mov_rr(a, SCRATCH, r);
+    shr_imm(a, SCRATCH, 32); // low dword now holds the f32 bits
+    movd_xmm_r32(a, xmm, SCRATCH);
+}
+
+/// Load both operands of a binary single-float operation into xmm0/xmm1. A
+/// variable operand may be an exactly representable fixnum (contagion) when
+/// the other operand can be a single-float; when both are variables, a
+/// fixnum pair deopts first, since the interpreter's answer is then an
+/// integer, not a float.
+#[allow(clippy::too_many_arguments)]
+fn float_operands_to_xmm(
+    a: &mut Asm,
+    args: &[crate::t2::ir::Value],
+    reg: &std::collections::HashMap<crate::t2::ir::Value, u8>,
+    consts: &std::collections::HashMap<crate::t2::ir::Value, i64>,
+    float_consts: &std::collections::HashMap<crate::t2::ir::Value, u32>,
+    proven_single_float: &std::collections::HashSet<crate::t2::ir::Value>,
+    deopt: egcl_rt::asm::Label,
+) -> Result<(), EmitError> {
+    let [lhs, rhs] = args else {
+        return Err(EmitError::UnsupportedOp(0xF3));
+    };
+    let variable = |v: &crate::t2::ir::Value| {
+        !float_consts.contains_key(v) && !consts.contains_key(v) && !proven_single_float.contains(v)
+    };
+    if variable(lhs) && variable(rhs) {
+        let l = *reg.get(lhs).ok_or(EmitError::UnsupportedOp(0xF2))?;
+        let r = *reg.get(rhs).ok_or(EmitError::UnsupportedOp(0xF2))?;
+        mov_rr(a, SCRATCH, l);
+        alu_rr(a, 0x09, SCRATCH, r); // or rdx, r
+        a.extend_from_slice(&[0x80, 0xE2, 0x07]); // and dl, 7
+        a.jcc(Cc::E, deopt); // both fixnum-tagged
+    }
+    for (xmm, (value, other)) in [(lhs, rhs), (rhs, lhs)].into_iter().enumerate() {
+        // A fixnum constant partner would make a fixnum variable a fixnum pair.
+        let accept_fixnum = !consts.contains_key(other);
+        float_operand_to_xmm(a, xmm as u8, *value, reg, consts, float_consts,
+            proven_single_float, accept_fixnum, deopt)?;
     }
     Ok(())
 }
@@ -1620,26 +1704,8 @@ fn emit_arith_inst(
             }
         }
         Opcode::FloatMul | Opcode::FloatAdd | Opcode::FloatSub => {
-            float_operand_to_xmm(
-                a,
-                0,
-                data.args[0],
-                reg,
-                consts,
-                float_consts,
-                proven_single_float,
-                deopt,
-            )?;
-            float_operand_to_xmm(
-                a,
-                1,
-                data.args[1],
-                reg,
-                consts,
-                float_consts,
-                proven_single_float,
-                deopt,
-            )?;
+            float_operands_to_xmm(a, &data.args, reg, consts, float_consts,
+                proven_single_float, deopt)?;
             let sub = match data.opcode {
                 Opcode::FloatAdd => 0x58,
                 Opcode::FloatMul => 0x59,
@@ -2858,6 +2924,65 @@ fn emit_fixnum_cmp_value(
     mov_imm64(a, dst, egcl_rt::value::T.0 as i64);
     let done = a.label();
     a.jcc(cc, done);
+    mov_imm64(a, dst, egcl_rt::value::NIL.0 as i64);
+    a.bind(done);
+    Ok(())
+}
+
+/// Is `op` a typed single-float comparison?
+fn is_float_cmp(op: crate::t2::ir::Opcode) -> bool {
+    use crate::t2::ir::Opcode::*;
+    matches!(op, FloatCmpEq | FloatCmpLt | FloatCmpLe | FloatCmpGt | FloatCmpGe)
+}
+
+/// Emit a speculated single-float comparison producing `T`/`NIL` (bliss-9bw59).
+/// Each variable operand is guarded to be a single-float (else deopt), as
+/// `FloatAdd` does. An unordered compare (either operand a NaN) also deopts:
+/// the interpreter's NaN ordering is not IEEE's, so native code must not
+/// decide it. Ordered results are exact IEEE comparisons, which is what the
+/// interpreter computes for two single-floats or a single-float and an exactly
+/// representable fixnum (other fixnum constants decline in
+/// `float_operand_to_xmm`).
+///
+/// `ucomiss x, y` sets CF for x<y and ZF for x=y, so `a<b` is `ucomiss b,a;
+/// seta`, `a<=b` is `ucomiss b,a; setae`, and `>`/`>=` keep operand order.
+/// RAX and RDX are scratch here, as in the float arithmetic arm.
+#[allow(clippy::too_many_arguments)]
+fn emit_float_cmp_value(
+    a: &mut Asm,
+    data: &crate::t2::ir::InstData,
+    reg: &mut std::collections::HashMap<crate::t2::ir::Value, u8>,
+    pool: &mut Vec<u8>,
+    consts: &std::collections::HashMap<crate::t2::ir::Value, i64>,
+    float_consts: &std::collections::HashMap<crate::t2::ir::Value, u32>,
+    proven_single_float: &std::collections::HashSet<crate::t2::ir::Value>,
+    deopt: egcl_rt::asm::Label,
+) -> Result<(), EmitError> {
+    use crate::t2::ir::Opcode;
+    if data.results.len() != 1 || data.args.len() != 2 {
+        return Err(EmitError::UnsupportedOp(op_tag(data.opcode)));
+    }
+    float_operands_to_xmm(a, &data.args, reg, consts, float_consts, proven_single_float, deopt)?;
+    // (first ucomiss operand, second, setcc opcode byte)
+    let (x, y, setcc) = match data.opcode {
+        Opcode::FloatCmpEq => (0, 1, 0x94), // sete
+        Opcode::FloatCmpLt => (1, 0, 0x97), // b > a: seta
+        Opcode::FloatCmpLe => (1, 0, 0x93), // b >= a: setae
+        Opcode::FloatCmpGt => (0, 1, 0x97), // a > b: seta
+        Opcode::FloatCmpGe => (0, 1, 0x93), // a >= b: setae
+        other => return Err(EmitError::UnsupportedOp(op_tag(other))),
+    };
+    a.extend_from_slice(&[0x0F, 0x2E, modrm_rr(x, y)]); // ucomiss xmm_x, xmm_y
+    a.extend_from_slice(&[0x0F, 0x9A, 0xC2]); // setp dl
+    a.extend_from_slice(&[0x0F, setcc, 0xC0]); // set<cc> al
+    a.extend_from_slice(&[0x84, 0xD2]); // test dl, dl
+    a.jcc(Cc::Ne, deopt); // unordered: let the interpreter decide
+    // Allocate after every operand read, as `emit_fixnum_cmp_value` does.
+    let dst = framed_alloc(reg, pool, data.results[0])?;
+    mov_imm64(a, dst, egcl_rt::value::T.0 as i64);
+    a.extend_from_slice(&[0x84, 0xC0]); // test al, al
+    let done = a.label();
+    a.jcc(Cc::Ne, done);
     mov_imm64(a, dst, egcl_rt::value::NIL.0 as i64);
     a.bind(done);
     Ok(())
@@ -4589,6 +4714,18 @@ fn emit_transfer_function_with_storage(
             {
                 continue;
             }
+            // Tagged single-float arithmetic and comparisons guard their operands
+            // and resume through the same precise deopt veneer (bliss-9bw59).
+            // Raw double arithmetic was admitted above.
+            if deopt_veneer.is_some()
+                && (matches!(data.opcode, Opcode::FloatAdd | Opcode::FloatSub | Opcode::FloatMul)
+                    || is_float_cmp(data.opcode))
+                && data.frame_state.is_some()
+                && data.args.iter().chain(&data.results).all(|&value|
+                    f.value(value).repr == crate::t2::ir::ValueRepresentation::Tagged)
+            {
+                continue;
+            }
             if !matches!(
                 f.inst(inst).opcode,
                 Opcode::Invoke
@@ -4598,6 +4735,7 @@ fn emit_transfer_function_with_storage(
                     | Opcode::Jump
                     | Opcode::Brif
                     | Opcode::ConstFixnum
+                    | Opcode::ConstFloat
                     | Opcode::ConstNil
                     | Opcode::ConstT
                     | Opcode::ConstSymbol
@@ -6491,6 +6629,18 @@ fn emit_framed_inner(
                 emit_generic_eq(&mut a, &d, &mut inst_reg, &mut inst_pool, &const_tagged)?;
             } else if d.opcode == Opcode::TypeCheck {
                 emit_type_check(&mut a, &d, &mut inst_reg, &mut inst_pool, &const_tagged)?;
+            } else if is_float_cmp(d.opcode) {
+                let label = inst_deopt.get(&inst).copied().unwrap_or(deopt);
+                emit_float_cmp_value(
+                    &mut a,
+                    &d,
+                    &mut inst_reg,
+                    &mut inst_pool,
+                    &consts,
+                    &float_consts,
+                    &declared_single_floats,
+                    label,
+                )?;
             } else if fixnum_cmp_cc(d.opcode).is_some() {
                 // A comparison the branch did not fuse: produce T/NIL.
                 let label = inst_deopt.get(&inst).copied().unwrap_or(deopt);

@@ -73,6 +73,7 @@ pub fn emit_framed_ordinary_leaf(
             }
             match data.opcode {
                 Opcode::ConstFixnum
+                | Opcode::ConstFloat
                 | Opcode::ConstNil
                 | Opcode::ConstT
                 | Opcode::ConstSymbol

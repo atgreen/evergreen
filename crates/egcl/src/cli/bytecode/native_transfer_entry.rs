@@ -1003,9 +1003,12 @@ impl TransferCode {
                         }
                         Some(CompilerType::Fixnum)
                     }
+                    // A single-float site speculates natively too: the mapped
+                    // emitter guards and computes it (bliss-9bw59).
                     Some(profile) => match profile.speculation() {
                         Some(SpecType::Fixnum) => Some(CompilerType::Fixnum),
-                        _ => None,
+                        Some(SpecType::SingleFloat) => Some(CompilerType::SingleFloat),
+                        None => None,
                     },
                 }
             };

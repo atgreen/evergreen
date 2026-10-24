@@ -536,10 +536,13 @@ fn native_v2_installed_child_rebuilds_failed_guard_version() {
             EgclVal::from_single_float(2.5)
         );
     }
-    assert_eq!(
-        old.deopt_count(),
-        deopt_blacklist_threshold(),
-        "future child entries must replace the failed installed version"
+    // The installed version's fixnum guard was a cold guess, which the
+    // single-float argument disproves, so it is replaced at its first such
+    // deopt rather than after the blacklist threshold (bliss-9bw59).
+    assert!(
+        (1..deopt_blacklist_threshold()).contains(&old.deopt_count()),
+        "future child entries must replace the failed installed version early: {} deopts",
+        old.deopt_count()
     );
     let symbol = egcl_rt::symbols::intern("CHILD-INSTALLED-PHASE");
     let replacement = NATIVE_REGISTRY

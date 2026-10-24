@@ -41,8 +41,8 @@
 //! * `+ - *` with two arguments → `Fixnum{Add,Sub,Mul}` / `Float{Add,Sub,Mul}`;
 //!   unary `-` → `FixnumNeg` (fixnum only); other arities stay generic.
 //! * `1+` / `1-` (fixnum) → binary op with a materialised `ConstFixnum 1`.
-//! * `< > <= >= =` → typed fixnum compare. Float comparisons stay generic
-//!   because their typed comparison opcodes have no native emitter.
+//! * `< > <= >= =` → typed fixnum compare, or on x86-64 a typed single-float
+//!   compare (`FloatCmp*`) that deopts on an unordered (NaN) operand.
 //! * `LOGAND LOGIOR LOGXOR LOGNOT` (fixnum) → `Log*`; exact on the tagged
 //!   representation, so no overflow and no untag/retag.
 //! * `MOD` by a constant positive power of two (fixnum) → `LogAnd` with the
@@ -99,7 +99,7 @@
 //! * Two speculation types, fixnum and single-float; no double-float, no
 //!   bignum fallback.
 //! * Variadic arithmetic (`(+ a b c)`) and unary `+`/`*` stay generic.
-//! * Float negation and comparisons have no native encoder yet.
+//! * Float negation has no native encoder yet; float comparisons only on x86-64.
 //! * Constant operands are recognised from `ConstFixnum` definitions only;
 //!   this runs before folding, so `(mod x (* 2 4))` is not a mask.
 
@@ -263,8 +263,9 @@ fn cmp_of(sym: u32) -> Option<Cmp> {
 }
 
 /// The typed comparison opcode for `(kind, speculated-type)`. Fixnum supports all
-/// five. Float comparison opcodes have no emitter, so keep their ordinary calls
-/// rather than producing IR that would force the entire function out of T2.
+/// five on every backend. Single-float comparisons have an emitter only on
+/// x86-64 (bliss-9bw59); elsewhere keep their ordinary calls rather than
+/// producing IR that would force the entire function out of T2.
 fn typed_cmp_opcode(c: Cmp, s: SpecType) -> Option<Opcode> {
     use Opcode::*;
     Some(match (c, s) {
@@ -273,7 +274,12 @@ fn typed_cmp_opcode(c: Cmp, s: SpecType) -> Option<Opcode> {
         (Cmp::Le, SpecType::Fixnum) => FixnumCmpLe,
         (Cmp::Ge, SpecType::Fixnum) => FixnumCmpGe,
         (Cmp::Eq, SpecType::Fixnum) => FixnumCmpEq,
-        (_, SpecType::SingleFloat) => return None,
+        (_, SpecType::SingleFloat) if !cfg!(target_arch = "x86_64") => return None,
+        (Cmp::Lt, SpecType::SingleFloat) => FloatCmpLt,
+        (Cmp::Gt, SpecType::SingleFloat) => FloatCmpGt,
+        (Cmp::Le, SpecType::SingleFloat) => FloatCmpLe,
+        (Cmp::Ge, SpecType::SingleFloat) => FloatCmpGe,
+        (Cmp::Eq, SpecType::SingleFloat) => FloatCmpEq,
     })
 }
 
@@ -340,6 +346,37 @@ fn statically_proven_spec_type(f: &Function, args: &[crate::t2::ir::Value]) -> O
     (all_single_numeric && has_single).then_some(SpecType::SingleFloat)
 }
 
+/// Correct a profiled (or cold-guessed) type against operands whose SSA type
+/// already rules it out (bliss-9bw59). A literal `2.0` can never pass a fixnum
+/// guard, so a cold fixnum guess at `(- n 2.0)` only bought a certain deopt and,
+/// worse, a fixnum guard on a constant that no emitter accepts, costing the
+/// whole function its native code. Such a site speculates single-float when an
+/// operand is known to be one (fixnum operands join it through contagion), and
+/// stays generic when an operand is known to be neither type.
+fn reconcile_with_operands(
+    f: &Function,
+    args: &[crate::t2::ir::Value],
+    spec: SpecType,
+) -> Option<SpecType> {
+    let numeric = TypeBits::FIXNUM.join(TypeBits::SINGLE_FLOAT);
+    let known = |arg: &crate::t2::ir::Value| {
+        let bits = f.value(*arg).ty.bits;
+        (!bits.is_bottom() && bits != TypeBits::TOP).then_some(bits)
+    };
+    if args.iter().filter_map(known).any(|bits| bits.meet(numeric).is_bottom()) {
+        return None;
+    }
+    let single = |bits: TypeBits| bits.meet(TypeBits::SINGLE_FLOAT) == bits;
+    match spec {
+        SpecType::Fixnum
+            if args.iter().filter_map(known).any(|bits| bits.meet(TypeBits::FIXNUM).is_bottom()) =>
+        {
+            args.iter().filter_map(known).any(single).then_some(SpecType::SingleFloat)
+        }
+        _ => Some(spec),
+    }
+}
+
 /// Rewrite generic arithmetic `Call`s into single guarded typed ops guided by
 /// static SSA proof first, then `profile` (site `bcp` → the one speculated type,
 /// or `None` to leave generic).
@@ -398,7 +435,8 @@ pub fn speculate(f: &mut Function, profile: &impl Fn(u32) -> Option<SpecType>) -
             // The site's bcp is on the Call's FrameState (P1 anchors it there).
             let Some(fs) = data.frame_state else { continue };
             let bcp = frame_state_bcp(f, fs);
-            let Some(spec) = statically_proven_spec_type(f, &data.args).or_else(|| profile(bcp))
+            let Some(spec) = statically_proven_spec_type(f, &data.args)
+                .or_else(|| profile(bcp).and_then(|spec| reconcile_with_operands(f, &data.args, spec)))
             else {
                 continue;
             };
@@ -1482,6 +1520,30 @@ mod tests {
             Opcode::FloatMul,
             "* speculated float → FloatMul"
         );
+    }
+
+    #[test]
+    fn known_float_operand_overrides_a_fixnum_guess() {
+        // `(* x 2.0)` with a cold (fixnum-guessed) profile: the literal can
+        // never pass a fixnum guard, so the site speculates single-float.
+        let (mut f, call) = build_star();
+        let second = f.block(f.entry()).params[1];
+        f.refine_type(second, IRType::of(TypeBits::SINGLE_FLOAT));
+        let n = speculate(&mut f, &|_| Some(SpecType::Fixnum));
+        assert_eq!(n, 1);
+        assert_eq!(f.inst(call).opcode, Opcode::FloatMul);
+    }
+
+    #[test]
+    fn known_non_numeric_operand_keeps_the_site_generic() {
+        let (mut f, call) = build_star();
+        let second = f.block(f.entry()).params[1];
+        f.refine_type(second, IRType::of(TypeBits::DOUBLE_FLOAT));
+        for guess in [SpecType::Fixnum, SpecType::SingleFloat] {
+            let mut g = f.clone();
+            assert_eq!(speculate(&mut g, &|_| Some(guess)), 0, "{guess:?}");
+            assert_eq!(g.inst(call).opcode, f.inst(call).opcode);
+        }
     }
 
     #[test]

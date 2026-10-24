@@ -190,6 +190,7 @@ fn emit_ordinary_call_body(
             !(matches!(
                 f.inst(i).opcode,
                 Opcode::ConstFixnum
+                    | Opcode::ConstFloat
                     | Opcode::ConstNil
                     | Opcode::ConstT
                     | Opcode::ConstSymbol
@@ -228,7 +229,7 @@ fn emit_ordinary_call_body(
         for &inst in &insts[call_position + 1..insts.len() - 1] {
             let data = f.inst(inst);
             match data.opcode {
-                Opcode::ConstFixnum | Opcode::ConstNil | Opcode::ConstT
+                Opcode::ConstFixnum | Opcode::ConstFloat | Opcode::ConstNil | Opcode::ConstT
                 | Opcode::ConstSymbol | Opcode::ConstChar | Opcode::ClearMv => {}
                 Opcode::Guard | Opcode::FixnumAdd | Opcode::FixnumSub | Opcode::FixnumMul => {
                     let state = f.frame_states.get(data.frame_state.ok_or_else(bad)?);
@@ -337,7 +338,8 @@ pub fn emit_framed_ordinary_two_calls(
         || ret.args != f.inst(last).results
     { return Err(bad()); }
     let immediate = |inst: Inst| matches!(f.inst(inst).opcode,
-        Opcode::ConstFixnum | Opcode::ConstNil | Opcode::ConstT | Opcode::ConstSymbol | Opcode::ConstChar);
+        Opcode::ConstFixnum | Opcode::ConstFloat | Opcode::ConstNil | Opcode::ConstT
+            | Opcode::ConstSymbol | Opcode::ConstChar);
     if insts[..first_position].iter().any(|&inst| !immediate(inst))
         || insts[first_position + 1..last_position].iter()
             .any(|&inst| !immediate(inst) && f.inst(inst).opcode != Opcode::ClearMv)
@@ -553,12 +555,15 @@ pub fn emit_framed_ordinary_function_with_self_call_facts(
                     { return Err(declined("return of possibly multiple values")); }
                 }
                 Opcode::Guard | Opcode::FixnumAdd | Opcode::FixnumSub | Opcode::FixnumMul
-                | Opcode::FixnumNeg | Opcode::FixnumShl | Opcode::FixnumShr => {
+                | Opcode::FixnumNeg | Opcode::FixnumShl | Opcode::FixnumShr
+                | Opcode::FloatAdd | Opcode::FloatSub | Opcode::FloatMul
+                | Opcode::FloatCmpEq | Opcode::FloatCmpLt | Opcode::FloatCmpLe
+                | Opcode::FloatCmpGt | Opcode::FloatCmpGe => {
                     if data.frame_state.is_none() {
                         return Err(declined("guarded operation without a frame state"));
                     }
                 }
-                Opcode::ConstFixnum | Opcode::ConstNil | Opcode::ConstT
+                Opcode::ConstFixnum | Opcode::ConstFloat | Opcode::ConstNil | Opcode::ConstT
                 | Opcode::ConstSymbol | Opcode::ConstChar | Opcode::ClearMv
                 | Opcode::FixnumCmpEq | Opcode::FixnumCmpLt | Opcode::FixnumCmpLe
                 | Opcode::FixnumCmpGt | Opcode::FixnumCmpGe | Opcode::GenericEq
