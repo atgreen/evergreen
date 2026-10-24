@@ -2918,29 +2918,7 @@ pub fn allocate_instance(class: EgclVal) -> Result<EgclVal, EgclError> {
     }
     // Fetch the wrapper + slot count as Copy values, finalising the layout if
     // the class has none yet, then allocate outside the state borrow.
-    let (wrapper, slot_count) = with_state_mut(|st| {
-        let mut w = st
-            .class_meta
-            .get(&class)
-            .and_then(|m| m.wrapper)
-            .map(|wrapper| wrapper as *const ClassWrapper as *mut ClassWrapper)
-            .unwrap_or(std::ptr::null_mut());
-        if w.is_null() {
-            finalize_class_layout(st, class);
-            w = st
-                .class_meta
-                .get(&class)
-                .and_then(|m| m.wrapper)
-                .map(|wrapper| wrapper as *const ClassWrapper as *mut ClassWrapper)
-                .unwrap_or(std::ptr::null_mut());
-        }
-        let n = if w.is_null() {
-            0
-        } else {
-            unsafe { (*w).slot_count as usize }
-        };
-        (w, n)
-    });
+    let (wrapper, slot_count) = class_wrapper_and_slot_count(class);
     if wrapper.is_null() {
         return Err(EgclError::Internal(
             "cannot allocate an instance of a class with no slot layout".into(),
@@ -2979,6 +2957,38 @@ pub fn allocate_instance(class: EgclVal) -> Result<EgclVal, EgclError> {
     }
 }
 
+/// `class`'s current wrapper and slot count, finalising its layout first if it
+/// has none yet. Pure Rust values: the caller allocates outside the state lock.
+///
+/// The common case only reads, so it takes the shared accessor. The mutable
+/// one clears the class-precedence cache, and taking it on every allocation
+/// made each MAKE-INSTANCE and structure constructor discard every cached CPL
+/// (bliss-mnkee).
+fn class_wrapper_and_slot_count(class: EgclVal) -> (*mut ClassWrapper, usize) {
+    fn current(st: &ClosState, class: EgclVal) -> *mut ClassWrapper {
+        st.class_meta
+            .get(&class)
+            .and_then(|m| m.wrapper)
+            .map(|wrapper| wrapper as *const ClassWrapper as *mut ClassWrapper)
+            .unwrap_or(std::ptr::null_mut())
+    }
+    let mut w = with_state(|st| current(st, class));
+    if w.is_null() {
+        w = with_state_mut(|st| {
+            if current(st, class).is_null() {
+                finalize_class_layout(st, class);
+            }
+            current(st, class)
+        });
+    }
+    let n = if w.is_null() {
+        0
+    } else {
+        unsafe { (*w).slot_count as usize }
+    };
+    (w, n)
+}
+
 /// Allocate a CLOS instance of `class` on the shared GC heap and pin it, so the
 /// collector never moves or frees it (bliss-4v8 / D5.13). Used for the immortal
 /// STORAGE-CONDITION pool: its preallocated instances must keep their addresses
@@ -2986,29 +2996,7 @@ pub fn allocate_instance(class: EgclVal) -> Result<EgclVal, EgclError> {
 /// identical to [`allocate_instance`]; only the backing store (GC heap, pinned)
 /// differs.
 pub fn allocate_instance_pinned_gc(class: EgclVal) -> Result<EgclVal, EgclError> {
-    let (wrapper, slot_count) = with_state_mut(|st| {
-        let mut w = st
-            .class_meta
-            .get(&class)
-            .and_then(|m| m.wrapper)
-            .map(|wrapper| wrapper as *const ClassWrapper as *mut ClassWrapper)
-            .unwrap_or(std::ptr::null_mut());
-        if w.is_null() {
-            finalize_class_layout(st, class);
-            w = st
-                .class_meta
-                .get(&class)
-                .and_then(|m| m.wrapper)
-                .map(|wrapper| wrapper as *const ClassWrapper as *mut ClassWrapper)
-                .unwrap_or(std::ptr::null_mut());
-        }
-        let n = if w.is_null() {
-            0
-        } else {
-            unsafe { (*w).slot_count as usize }
-        };
-        (w, n)
-    });
+    let (wrapper, slot_count) = class_wrapper_and_slot_count(class);
     if wrapper.is_null() {
         return Err(EgclError::Internal(
             "cannot allocate an instance of a class with no slot layout".into(),
@@ -3059,8 +3047,11 @@ pub fn allocate_instance_pinned_gc(class: EgclVal) -> Result<EgclVal, EgclError>
 /// reverse of what a struct constructor wants; walking the CPL backwards and
 /// collecting each class's direct slots reproduces DEFSTRUCT's order exactly.
 pub fn struct_slot_order(class: EgclVal) -> Vec<EgclVal> {
-    with_state_mut(|st| {
-        let cpl = c3_linearize(st, class).unwrap_or_else(|_| vec![class]);
+    // A read: take the shared accessor and the cached precedence list. The
+    // mutable accessor cleared that cache, so every constructor call relinearized
+    // its class and discarded every other cached CPL (bliss-mnkee).
+    let cpl = compute_class_precedence_list(class).unwrap_or_else(|_| vec![class]);
+    with_state(|st| {
         let mut order: Vec<EgclVal> = Vec::new();
         for c in cpl.iter().rev() {
             if let Some(meta) = st.class_meta.get(c) {
