@@ -284,6 +284,10 @@ struct Emitter<'a> {
     transfer_exit: Option<Label>,
     /// The register entry, when this function qualifies for direct self-calls.
     reg_entry: Option<Label>,
+    /// The block emitted immediately after the one being emitted. An edge in
+    /// tail position whose target is this block needs no branch at all: the
+    /// parallel copies run and control falls through.
+    next_block: Option<Block>,
     /// The lowest callee-saved register the prologue saves: the lowest home
     /// register in use, or r13 when none is below it. Homes are handed out
     /// from r12 downward so this range is as short as the function allows.
@@ -1407,7 +1411,13 @@ impl Emitter<'_> {
         self.asm.mov(2, 3);
     }
 
-    fn edge(&mut self, edge: &BlockCall) -> Result<(), EmitError> {
+    /// Emit an edge's parallel copies, then the branch to its target.
+    ///
+    /// `tail` says this is the last thing the block emits, which is the only
+    /// position where falling through is sound: a `Brif`'s first edge is
+    /// followed by its `otherwise` label, so omitting its branch would run
+    /// the other arm.
+    fn edge_with(&mut self, edge: &BlockCall, tail: bool) -> Result<(), EmitError> {
         let parameters = self.function.block(edge.block).params.clone();
         if parameters.len() != edge.args.len() {
             return Err(unsupported!());
@@ -1422,8 +1432,15 @@ impl Emitter<'_> {
             self.asm.load(2, 15, self.edge_base + index as i32 * 8);
             self.store(destination, 2)?;
         }
-        self.asm.branch(15, self.blocks[&edge.block]);
+        // Branch unless the target is simply the next block in layout.
+        if !(tail && self.next_block == Some(edge.block)) {
+            self.asm.branch(15, self.blocks[&edge.block]);
+        }
         Ok(())
+    }
+
+    fn edge(&mut self, edge: &BlockCall) -> Result<(), EmitError> {
+        self.edge_with(edge, false)
     }
 
     fn instruction(&mut self, instruction: Inst, data: &InstData) -> Result<(), EmitError> {
@@ -1464,7 +1481,7 @@ impl Emitter<'_> {
                 self.epilogue();
                 return Ok(());
             }
-            Jump if data.targets.len() == 1 => return self.edge(&data.targets[0]),
+            Jump if data.targets.len() == 1 => return self.edge_with(&data.targets[0], true),
             Brif if data.args.len() == 1 && data.targets.len() == 2 => {
                 let otherwise = self.asm.label();
                 self.load(data.args[0], 2)?;
@@ -1473,7 +1490,7 @@ impl Emitter<'_> {
                 self.asm.branch(8, otherwise);
                 self.edge(&data.targets[0])?;
                 self.asm.bind(otherwise);
-                return self.edge(&data.targets[1]);
+                return self.edge_with(&data.targets[1], true);
             }
             MemoryFence => {
                 // A full fence for every kind (see bytecode_s390x.rs); the
@@ -1917,6 +1934,7 @@ pub fn emit_framed_with_runtime(
         polls,
         transfer_exit: None,
         reg_entry: None,
+        next_block: None,
         first_saved: 6,
         self_args_base: 0,
     };
@@ -2195,12 +2213,18 @@ pub fn emit_framed_with_runtime(
     if function.block(function.entry()).params.len() > activation_slots as usize {
         return Err(unsupported!());
     }
+    // The body begins with the first block in layout order; a prologue that
+    // runs straight into it needs no branch. Only the ordinary entry can be
+    // separated from it, by the register entry emitted in between.
+    let entry_is_next = function.block_order().first() == Some(&function.entry());
     emitter.prologue();
     for (index, &parameter) in function.block(function.entry()).params.iter().enumerate() {
         emitter.asm.load(2, 13, index as i32 * 8);
         emitter.store(parameter, 2)?;
     }
-    emitter.asm.branch(15, emitter.blocks[&function.entry()]);
+    if has_reg_entry || !entry_is_next {
+        emitter.asm.branch(15, emitter.blocks[&function.entry()]);
+    }
     // The register entry's offset, published as FramedCode::compiled_entry so
     // the install log and its tests can see it (0 = no register entry).
     let mut compiled_entry = 0;
@@ -2220,10 +2244,14 @@ pub fn emit_framed_with_runtime(
         // No frame of its own (r13 is the caller's): a deopt must push one.
         emitter.asm.imm64(2, emitter.runtime.code_id | (1 << 63));
         emitter.asm.store(2, 15, emitter.entry_kind_offset);
-        emitter.asm.branch(15, emitter.blocks[&function.entry()]);
+        if !entry_is_next {
+            emitter.asm.branch(15, emitter.blocks[&function.entry()]);
+        }
     }
     let mut bcp_offsets = Vec::new();
-    for &block in function.block_order() {
+    let order = function.block_order().to_vec();
+    for (position, &block) in order.iter().enumerate() {
+        emitter.next_block = order.get(position + 1).copied();
         emitter.asm.bind(emitter.blocks[&block]);
         for &instruction in &function.block(block).insts {
             let data = function.inst(instruction);
@@ -3076,6 +3104,75 @@ mod tests {
                 slots[0] = 40;
                 assert_eq!(unsafe { entry(slots.as_mut_ptr()) }, expected);
             }
+        }
+    }
+
+    /// An edge in tail position whose target is the next block emits no
+    /// branch. BRCL with mask 15 and a displacement of three halfwords is
+    /// exactly "jump to the following instruction": six bytes and a
+    /// predicted-taken branch that could simply have fallen through.
+    #[test]
+    fn a_tail_edge_to_the_next_block_falls_through_instead_of_branching() {
+        const JUMP_TO_NEXT: [u8; 6] = [0xc0, 0xf4, 0, 0, 0, 3];
+
+        // entry: jump to tail; tail: return its parameter.
+        let mut f = Function::new("z-fallthrough");
+        let entry = f.entry();
+        let x = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+        let tail = f.make_block();
+        let y = f.add_block_param(tail, IRType::TOP, ValueRepresentation::Tagged);
+        f.set_terminator(
+            entry,
+            InstData {
+                opcode: Opcode::Jump,
+                args: vec![],
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags {
+                    terminator: true,
+                    ..Default::default()
+                },
+                targets: vec![BlockCall {
+                    block: tail,
+                    args: vec![x],
+                }],
+                frame_state: None,
+                source_pos: 0,
+            },
+        );
+        f.set_terminator(
+            tail,
+            InstData {
+                opcode: Opcode::Return,
+                args: vec![y],
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags {
+                    terminator: true,
+                    ..Default::default()
+                },
+                targets: vec![],
+                frame_state: None,
+                source_pos: 0,
+            },
+        );
+        let compiled = emit_framed(&f, 0, 1).expect("two-block identity emits");
+        assert!(
+            !compiled.code.windows(6).any(|w| w == JUMP_TO_NEXT),
+            "a branch to the following instruction survived"
+        );
+        #[cfg(all(target_arch = "s390x", unix))]
+        {
+            let code = egcl_rt::jit::JitBuffer::new(&compiled.code).unwrap();
+            // SAFETY: the buffer owns the generated activation entry.
+            let entry: unsafe extern "C" fn(*mut u64) -> u64 =
+                unsafe { std::mem::transmute(code.as_ptr()) };
+            let mut slots = [EgclVal::from_fixnum(11).0];
+            assert_eq!(
+                unsafe { entry(slots.as_mut_ptr()) },
+                slots[0],
+                "falling through still runs the edge's parallel copies"
+            );
         }
     }
 
