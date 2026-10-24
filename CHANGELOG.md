@@ -128,7 +128,7 @@
   Ten million iterations of `(setq s (+ s 1d0))` drop from about 2.9 s to
   0.05 s, the same as the fixnum loop, and a double-float Fibonacci,
   `(ffib 27d0)`, from about 3.2 s to 0.15 s
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#602](https://github.com/atgreen/evergreen/pull/602)).
 - A function containing `load-time-value` compiles in the running image, with
   each `load-time-value` form evaluated once when the function is compiled. It
   stayed in the interpreter and evaluated the forms on every call, so
