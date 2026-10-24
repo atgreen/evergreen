@@ -458,7 +458,7 @@
   meanwhile failed with "safepoint handshake failed", and could then abort the
   process. The collector now waits up to 60 seconds
   (`EGCL_SAFEPOINT_TIMEOUT_MS`), and prints a note if a wait exceeds 5
-  seconds ([#PR](https://github.com/atgreen/evergreen/pull/PR), #609).
+  seconds ([#617](https://github.com/atgreen/evergreen/pull/617), #609).
 - Compiled code calls `vector`, `string`, `find-package` and `gensym`
   directly, and compiled `(setf (aref ...))`, `(setf (elt ...))` and
   `(setf (car|cdr ...))` store directly. Each used to be rebuilt as a form
