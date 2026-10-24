@@ -125,6 +125,21 @@ pub fn eql(a: EgclVal, b: EgclVal) -> bool {
 /// The characters of any string -- simple, fill-pointer, adjustable,
 /// displaced, or a registry-backed sentinel -- or `None` for a non-string. A
 /// pathname is never a string, even when its namestring is registered.
+/// The object pointer of `v` when it is a real SIMPLE-BASE-STRING or
+/// SIMPLE-CHARACTER-STRING, for comparing or hashing it in place. A
+/// registry-backed sentinel (whose bits are not a pointer) is never one.
+pub(crate) fn simple_string_ptr(v: EgclVal) -> Option<*const u8> {
+    if !v.is_heap_object() || crate::pathnames::is_registered_string(v) {
+        return None;
+    }
+    // Safety: not a sentinel, so a heap-tagged value points at a live header.
+    let ptr = unsafe { v.as_ptr() } as *const u8;
+    let tid = unsafe { (*(ptr as *const egcl_rt::object::ObjectHeader)).type_id() };
+    (tid == egcl_rt::object::type_id::SIMPLE_BASE_STRING
+        || tid == egcl_rt::object::type_id::SIMPLE_CHARACTER_STRING)
+        .then_some(ptr)
+}
+
 pub(crate) fn string_text(v: EgclVal) -> Option<String> {
     if crate::pathnames::is_pathname(v) {
         return None;
@@ -218,6 +233,14 @@ pub fn equal(a: EgclVal, b: EgclVal) -> bool {
     }
     if !a.is_heap_object() || !b.is_heap_object() {
         return false;
+    }
+    // Two simple strings, the usual EQUAL hash-table key: compare in place.
+    // Neither is a pathname, so the general path below would reach the same
+    // character comparison after two pathname-registry lookups and decoding
+    // both into fresh `String`s (bliss-a2bso).
+    if let (Some(x), Some(y)) = (simple_string_ptr(a), simple_string_ptr(b)) {
+        // Safety: both are live simple strings; nothing here allocates.
+        return unsafe { egcl_rt::object::simple_strings_eq(x, y) };
     }
     if crate::pathnames::is_pathname(a) || crate::pathnames::is_pathname(b) {
         return crate::pathnames::is_pathname(a)

@@ -123,9 +123,9 @@ pub use packages::{
     find_package_from, find_present_symbol, find_symbol, import, intern, intern_present,
     is_external_symbol, is_package, list_all_packages, local_nickname_target, make_package,
     package_local_nicknames, package_locally_nicknamed_by_list, package_name, package_name_eq,
-    package_nicknames, package_shadowing_symbols, package_use_list, present_symbols,
-    remove_package_local_nickname, rename_package, seed_ansi_symbols, shadow, shadowing_import,
-    unexport, unintern, unuse_package, use_package, use_package_by_name,
+    package_nicknames, package_shadowing_symbols, package_use_list, package_used_by_list,
+    present_symbols, remove_package_local_nickname, rename_package, seed_ansi_symbols, shadow,
+    shadowing_import, unexport, unintern, unuse_package, use_package, use_package_by_name,
 };
 pub use pathnames::translated_physical;
 pub use pathnames::{

@@ -88,6 +88,17 @@
 
 ### Performance
 
+- `(require :asdf)` takes about half as long: 6.4 s instead of 11.8 s on an
+  x86-64 Linux release build, which shortens every start whose `~/.egclrc`
+  loads ASDF. UIOP's `define-package` spent most of that time in symbol and
+  package lookups. `find-symbol`, `intern`, `export`, `import`, `unintern`,
+  `symbol-package`, `package-use-list` and `package-used-by-list` no longer
+  scan every symbol of a package, or of every package, to find one symbol,
+  and they no longer allocate a string for each lookup. Called from compiled
+  code, these functions and `string`, `list`, `gethash` stores and
+  `(setf car)` / `(setf cdr)` now cost about 1 µs instead of 3-27 µs.
+  `equal` hash tables with string keys hash and compare the keys in place
+  ([#610](https://github.com/atgreen/evergreen/pull/610)).
 - `substitute`, `substitute-if` and `substitute-if-not` on a whole list
   without `:count` or `:from-end` make one pass over the list, as `remove`
   does since #607. Substituting in an 8-element list drops from about 207 µs to

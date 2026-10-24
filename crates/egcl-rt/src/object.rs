@@ -397,6 +397,80 @@ pub unsafe fn simple_string_set_char(ptr: *mut u8, index: usize, ch: char) -> bo
     }
 }
 
+/// The characters of a simple string, decoded in place. Each is what
+/// [`read_simple_string`] would push, so the two always agree.
+///
+/// # Safety
+/// `ptr` must be a live simple-string object, and must stay live and unmoved
+/// while the iterator is used: no allocation may happen until it is dropped.
+pub unsafe fn simple_string_chars(ptr: *const u8) -> impl Iterator<Item = char> {
+    unsafe {
+        let len = simple_string_char_count(ptr);
+        let wide = (*(ptr as *const ObjectHeader)).type_id() == type_id::SIMPLE_CHARACTER_STRING;
+        let data = ptr.add(simple_string_payload_offset(ptr) + 8);
+        (0..len).map(move |i| {
+            if wide {
+                char::from_u32(*(data.add(i * 4) as *const u32)).unwrap_or('\u{FFFD}')
+            } else {
+                *data.add(i) as char
+            }
+        })
+    }
+}
+
+/// Do two simple strings hold the same characters? Compared in place.
+///
+/// # Safety
+/// Both must be live simple-string objects.
+pub unsafe fn simple_strings_eq(a: *const u8, b: *const u8) -> bool {
+    unsafe {
+        let len = simple_string_char_count(a);
+        if len != simple_string_char_count(b) {
+            return false;
+        }
+        let narrow = |p: *const u8| {
+            (*(p as *const ObjectHeader)).type_id() != type_id::SIMPLE_CHARACTER_STRING
+        };
+        if narrow(a) && narrow(b) {
+            let da = a.add(simple_string_payload_offset(a) + 8);
+            let db = b.add(simple_string_payload_offset(b) + 8);
+            return std::slice::from_raw_parts(da, len) == std::slice::from_raw_parts(db, len);
+        }
+        simple_string_chars(a).eq(simple_string_chars(b))
+    }
+}
+
+/// Does the simple string at `ptr` hold exactly the characters of `text`?
+/// Compares in place, so a lookup keyed by Rust text decodes and allocates
+/// nothing (what [`read_simple_string`] followed by `==` would cost).
+///
+/// # Safety
+/// `ptr` must be a live simple-string object.
+pub unsafe fn simple_string_eq_str(ptr: *const u8, text: &str) -> bool {
+    unsafe {
+        let len = simple_string_char_count(ptr);
+        let tid = (*(ptr as *const ObjectHeader)).type_id();
+        let data = ptr.add(simple_string_payload_offset(ptr) + 8);
+        if tid != type_id::SIMPLE_CHARACTER_STRING && text.is_ascii() {
+            // One byte per character on both sides: a plain memory compare.
+            return len == text.len() && std::slice::from_raw_parts(data, len) == text.as_bytes();
+        }
+        let mut chars = text.chars();
+        for i in 0..len {
+            let cp = if tid == type_id::SIMPLE_CHARACTER_STRING {
+                *(data.add(i * 4) as *const u32)
+            } else {
+                *data.add(i) as u32
+            };
+            match chars.next() {
+                Some(c) if c as u32 == cp => {}
+                _ => return false,
+            }
+        }
+        chars.next().is_none()
+    }
+}
+
 /// Decode a simple string into an owned Rust `String`. Width from `type_id`.
 ///
 /// # Safety
