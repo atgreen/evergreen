@@ -47,7 +47,19 @@ enum Target {
     Accessor {
         nargs: usize,
     },
+    /// MAKE-INSTANCE with no methods on it: `make_instance_call`, which takes
+    /// the class's instance plan and falls back to the full call itself
+    /// (bliss-ih7pa). Any argument count; it too has no callable object.
+    MakeInstance,
     Function(EgclVal),
+}
+
+/// What a target with no callable object runs through the builtin bridges.
+#[derive(Clone, Copy)]
+enum BridgeCall {
+    Builtin(u32),
+    Accessor,
+    MakeInstance,
 }
 
 impl Target {
@@ -56,7 +68,7 @@ impl Target {
             Self::Native { function, .. }
             | Self::Bytecode { function, .. }
             | Self::Function(function) => *function,
-            Self::Builtin { .. } | Self::Accessor { .. } => NIL,
+            Self::Builtin { .. } | Self::Accessor { .. } | Self::MakeInstance => NIL,
         }
     }
 
@@ -65,7 +77,22 @@ impl Target {
             Self::Native { function, .. }
             | Self::Bytecode { function, .. }
             | Self::Function(function) => visit(function),
-            Self::Builtin { .. } | Self::Accessor { .. } => {}
+            Self::Builtin { .. } | Self::Accessor { .. } | Self::MakeInstance => {}
+        }
+    }
+
+    fn is_bridge(&self) -> bool {
+        matches!(self, Self::Builtin { .. } | Self::Accessor { .. } | Self::MakeInstance)
+    }
+
+    /// The bridge call for `nargs` arguments, or `None` when this is not a
+    /// bridge target or the call has the wrong argument count for it.
+    fn bridge_call(&self, nargs: usize) -> Option<BridgeCall> {
+        match *self {
+            Self::Builtin { slot, nargs: n } if n == nargs => Some(BridgeCall::Builtin(slot)),
+            Self::Accessor { nargs: n } if n == nargs => Some(BridgeCall::Accessor),
+            Self::MakeInstance => Some(BridgeCall::MakeInstance),
+            _ => None,
         }
     }
 }
@@ -311,6 +338,10 @@ fn select_target(symbol: u32, nargs: usize) -> Option<Target> {
     if (nargs == 1 || nargs == 2) && super::super::names_accessor_generic(symbol) {
         return Some(Target::Accessor { nargs });
     }
+    // CL:MAKE-INSTANCE. `make_instance_call` revalidates per call.
+    if nargs >= 1 && super::super::names_builtin_make_instance(symbol) {
+        return Some(Target::MakeInstance);
+    }
     egcl_rt::function::is_interpreted_function(function).then_some(Target::Function(function))
 }
 
@@ -486,7 +517,7 @@ fn publish_target(state: &State, revision: u64, target: Option<Target>) {
     if target.is_some() {
         let entries = bridge_entries().expect("resolved cell owns installed bridges");
         #[allow(unused_mut)]
-        let mut native = if matches!(target, Some(Target::Builtin { .. } | Target::Accessor { .. })) {
+        let mut native = if target.as_ref().is_some_and(Target::is_bridge) {
             [entries[4], entries[5]]
         } else {
             [entries[2], entries[3]]
@@ -582,25 +613,35 @@ pub(super) unsafe fn ordinary_call_cell(cell: u64, args: &[EgclVal]) -> Result<E
     }
     // A warm builtin, as `warm` runs it, without cloning the target or
     // rooting a callable it does not have.
-    let builtin = match *state.target.borrow() {
-        Some(Target::Builtin { slot, nargs }) if nargs == args.len() => Some(Some(slot)),
-        Some(Target::Accessor { nargs }) if nargs == args.len() => Some(None),
-        _ => None,
-    };
-    if let Some(slot) = builtin {
+    let call = state
+        .target
+        .borrow()
+        .as_ref()
+        .and_then(|target| target.bridge_call(args.len()));
+    if let Some(call) = call {
         let env = unsafe { (*state.native_env).get() };
         if !env.is_null() {
-            let env = unsafe { &mut *env };
-            let Some(slot) = slot else {
-                return super::super::accessor_call(state.symbol, args, env);
-            };
-            return match super::super::call_direct_builtin(slot, args, env) {
-                Some(result) => result,
-                None => cold(state, args),
-            };
+            return run_bridge_call(call, state, args, unsafe { &mut *env });
         }
     }
     warm(state, args)
+}
+
+/// Run a bridge target. Call only with no borrow of the cell held.
+fn run_bridge_call(
+    call: BridgeCall,
+    state: &State,
+    args: &[EgclVal],
+    env: &mut super::super::Env,
+) -> Result<EgclVal, EgclError> {
+    match call {
+        BridgeCall::Builtin(slot) => match super::super::call_direct_builtin(slot, args, env) {
+            Some(result) => result,
+            None => cold(state, args),
+        },
+        BridgeCall::Accessor => super::super::accessor_call(state.symbol, args, env),
+        BridgeCall::MakeInstance => super::super::make_instance_call(state.symbol, args, env),
+    }
 }
 
 /// What `warm` would enter for this cell when that is installed T2 code with a
@@ -664,7 +705,7 @@ pub(super) unsafe fn mapped_callee_declines(cell: u64) -> bool {
     }
     match state.target.borrow().as_ref() {
         Some(Target::Builtin { .. }) => !super::call_table_funcall::names_funcall_or_apply(state.symbol),
-        Some(Target::Accessor { .. }) => true,
+        Some(Target::Accessor { .. } | Target::MakeInstance) => true,
         Some(Target::Native { code, .. }) => match &code._storage {
             NativeCodeStorage::Mapped(mapped) => mapped.mapped_entry().is_none(),
             _ => false,
@@ -736,20 +777,11 @@ fn warm(state: &State, args: &[EgclVal]) -> Result<EgclVal, EgclError> {
             }
             run_with_sym(body, args, *function, state.symbol, env)
         }
-        Target::Builtin { slot, nargs } => {
-            if nargs != args.len() {
-                return cold(state, args);
-            }
-            match super::super::call_direct_builtin(slot, args, env) {
-                Some(result) => result,
+        Target::Builtin { .. } | Target::Accessor { .. } | Target::MakeInstance => {
+            match target.bridge_call(args.len()) {
+                Some(call) => run_bridge_call(call, state, args, env),
                 None => cold(state, args),
             }
-        }
-        Target::Accessor { nargs } => {
-            if nargs != args.len() {
-                return cold(state, args);
-            }
-            super::super::accessor_call(state.symbol, args, env)
         }
         Target::Function(_) => apply_function(*function, args, env),
     }
@@ -833,33 +865,20 @@ fn invoke_builtin(cell: u64, args: &[EgclVal]) -> u64 {
         let state = unsafe { state(cell) };
         // Copy just the builtin metadata and release its borrow before any
         // allocation or Lisp reentry. Builtins have no callable object to root.
-        let builtin = match *state.target.borrow() {
-            Some(Target::Builtin { slot, nargs }) => Some((Some(slot), nargs)),
-            Some(Target::Accessor { nargs }) => Some((None, nargs)),
-            _ => None,
-        };
-        let Some((slot, nargs)) = builtin else {
+        let call = state
+            .target
+            .borrow()
+            .as_ref()
+            .and_then(|target| target.bridge_call(args.len()));
+        let Some(call) = call else {
             return finish_c2i_call(cold(state, args));
         };
-        if nargs != args.len() {
-            return finish_c2i_call(cold(state, args));
-        }
         // The owning execution cannot retire while one of its calls is active.
         let env = unsafe { (*state.native_env).get() };
         if env.is_null() {
             return NIL.0;
         }
-        let Some(slot) = slot else {
-            return finish_c2i_call(super::super::accessor_call(
-                state.symbol,
-                args,
-                unsafe { &mut *env },
-            ));
-        };
-        match super::super::call_direct_builtin(slot, args, unsafe { &mut *env }) {
-            Some(result) => finish_c2i_call(result),
-            None => finish_c2i_call(cold(state, args)),
-        }
+        finish_c2i_call(run_bridge_call(call, state, args, unsafe { &mut *env }))
     })) {
         Ok(value) => value,
         Err(payload) => finish_c2i_call(Err(c2i_panic_error(payload))),

@@ -3365,6 +3365,21 @@ pub fn instance_layout_key(instance: EgclVal) -> Option<usize> {
     }
 }
 
+/// The identity of the layout a new instance of `class` gets: the address of
+/// the class's current, non-obsolete wrapper, the same value
+/// [`instance_layout_key`] reports for such an instance. `None` when the class
+/// has no layout yet, its wrapper is obsolete, or `class` is not a class.
+///
+/// Unlike allocation, this never finalizes a layout, so it neither allocates
+/// nor takes the mutable state accessor. A redefinition gives the class a new
+/// wrapper, and wrappers are never freed or reused, so the address is a stable
+/// per-layout cache key.
+pub fn class_layout_key(class: EgclVal) -> Option<usize> {
+    let wrapper = with_state(|st| st.class_meta.get(&class).and_then(|m| m.wrapper))?;
+    (wrapper.state.load(Ordering::Acquire) != WRAPPER_OBSOLETE)
+        .then_some(wrapper as *const ClassWrapper as usize)
+}
+
 /// Read inline slot `idx` of `instance` if the instance's layout is still
 /// `key` (see [`slot_layout_location`]). `None` when the layout differs, the
 /// instance is obsolete, or the slot is unbound: the caller takes its full
