@@ -98,7 +98,7 @@
   100,000 elements run two to four times faster, and `sort` with a `lambda`
   predicate about twice as fast. Argument-count and keyword
   errors, multiple values, non-local exits and redefinition behave as before
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#604](https://github.com/atgreen/evergreen/pull/604)).
 - `make-instance` of a class reuses what it worked out for the class's
   previous instances: which slots each initarg fills, the default initargs and
   initforms to run, and the `:after` methods on `initialize-instance` and
