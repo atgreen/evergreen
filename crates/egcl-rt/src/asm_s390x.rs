@@ -96,6 +96,23 @@ impl Asm {
         self.rre(0xb30b, dst, src);
     }
 
+    /// ADBR: long (double) BFP add, `dst += src`. The short forms above
+    /// operate on a single-float in the high half of the register; these take
+    /// the whole 64-bit IEEE double.
+    pub fn add_double(&mut self, dst: u8, src: u8) {
+        self.rre(0xb31a, dst, src);
+    }
+
+    /// SDBR: long BFP subtract, `dst -= src`.
+    pub fn sub_double(&mut self, dst: u8, src: u8) {
+        self.rre(0xb31b, dst, src);
+    }
+
+    /// MDBR: long BFP multiply, `dst *= src`.
+    pub fn multiply_double(&mut self, dst: u8, src: u8) {
+        self.rre(0xb31c, dst, src);
+    }
+
     pub fn multiply_single(&mut self, dst: u8, src: u8) {
         self.rre(0xb317, dst, src);
     }
