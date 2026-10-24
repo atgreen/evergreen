@@ -96,7 +96,7 @@
   13 µs and `(make-list 50)` about 9 µs instead of 20 µs, and consing a double
   computed in the loop drops from 0.38 µs to 0.035 µs. Collections and
   `EGCL_GC_STRESS` behave as before; `EGCL_INLINE_ALLOC=0` turns inline
-  allocation off ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  allocation off ([#625](https://github.com/atgreen/evergreen/pull/625)).
 - On x86-64 Linux, a function whose body loops (`dotimes`, `dolist`, `do`,
   `loop` or a `tagbody`) now calls other compiled functions with a direct
   machine call once it is optimized, instead of building a managed activation
