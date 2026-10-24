@@ -416,7 +416,7 @@
   method found": the standard method is its primary method. A user
   `make-instance` method with `&key` parameters no longer makes every other
   initarg an invalid keyword argument. Classes with no such methods keep the
-  fast path ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  fast path ([#600](https://github.com/atgreen/evergreen/pull/600)).
 - Allocating an instance or a structure no longer discards every cached
   class precedence list, and a structure constructor no longer recomputes
   its class's precedence list on each call
