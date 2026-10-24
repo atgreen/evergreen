@@ -108,7 +108,7 @@
     about 880 ns to 180 ns, most of which is boxing the argument and the
     result.
 
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR))
+  ([#623](https://github.com/atgreen/evergreen/pull/623))
 - More than 50 builtins called from compiled code no longer rebuild and
   re-evaluate their call form each time. They include `evenp`, `oddp`, `/`,
   `member` and `assoc` with `:test` or `:key`, `mapcar`, `map`, `format`,
