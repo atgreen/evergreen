@@ -2158,17 +2158,8 @@ pub fn emit_framed_with_runtime(
     // what lets a fixnum-recursive function reach the direct self-call: its
     // roots vanish entirely.
     let inference = super::infer::infer(function);
-    let proven_immediate = |value: Value| -> bool {
-        const IMMEDIATE: TypeBits = TypeBits(
-            TypeBits::FIXNUM.0
-                | TypeBits::SINGLE_FLOAT.0
-                | TypeBits::CHARACTER.0
-                | TypeBits::SYMBOL.0
-                | TypeBits::NULL.0,
-        );
-        let bits = inference.ty(value).bits;
-        !bits.is_bottom() && bits.meet(IMMEDIATE) == bits
-    };
+    let proven_immediate =
+        |value: Value| super::register_entry::proven_immediate(&inference, value);
     // The same precise regalloc2 ranges that choose native homes determine
     // roots at each actual runtime call. Include dying early arguments, and
     // exclude results that do not exist until the callback returns.
@@ -2267,47 +2258,27 @@ pub fn emit_framed_with_runtime(
     // slots at all; nothing in its body then touches r13, which is what makes
     // the activation-less register entry sound.
     let entry_params = &function.block(function.entry()).params;
-    let instructions = || {
-        function
-            .block_order()
-            .iter()
-            .flat_map(|&block| &function.block(block).insts)
-            .map(|&inst| function.inst(inst))
-    };
-    // Self-calls pass their arguments in r2-r5; any other call stages them in
+    // Self-calls pass their arguments in r2-r4; any other call stages them in
     // this frame's call-argument area (see the module docs).
-    let is_self_call = |data: &InstData| matches!(data.aux, AuxData::CallTarget(symbol) if Some(symbol) == emitter.runtime.self_sym);
-    let calls_fit_register_entry = instructions().all(|data| {
-        data.opcode != Opcode::Call
-            || (is_self_call(data) && data.args.len() <= REGISTER_ENTRY_ARGS_MAX)
-            || (matches!(data.aux, AuxData::CallTarget(_)) && data.args.len() <= CALL_ARGS_MAX)
+    // Who may carry a register entry is pure IR analysis, shared with the
+    // other framed backends (register_entry.rs) so a port adds the machine
+    // half rather than re-deriving the contract. The activation-less
+    // contract it enforces -- no shadow roots, so nothing in the body needs
+    // the caller's r13 -- is re-checked by install-time validation before
+    // these bytes ever run.
+    let plan = super::register_entry::plan(&super::register_entry::RegisterEntryQuery {
+        function,
+        entry_params,
+        self_sym: emitter.runtime.self_sym,
+        call_slice_rooted: emitter.runtime.call_slice_rooted,
+        root_slots: emitter.root_slots,
+        args_max: REGISTER_ENTRY_ARGS_MAX,
+        call_args_max: CALL_ARGS_MAX,
+        // `in_frame` staging below handles a non-self call.
+        stages_other_calls_in_frame: true,
     });
-    let other_call_words = instructions()
-        .filter(|data| data.opcode == Opcode::Call && !is_self_call(data))
-        .map(|data| data.args.len())
-        .max()
-        .unwrap_or(0);
-    // Publishing the entry makes a body use the in-frame staging form for
-    // its own calls (see `in_frame`), which costs `call_slice_rooted` and
-    // the direct-builtin shortcut. For a self-caller that trade already paid
-    // for itself; for a body the runtime merely resolves, take it only when
-    // the body makes no calls at all, so the broader publication is free
-    // (bliss-y1rx3). Leaf accessors and predicates are the hot case anyway.
-    let makes_calls = instructions().any(|data| data.opcode == Opcode::Call);
-    // What gates the entry either way is the activation-less contract -- no
-    // shadow roots, so nothing in the body needs the caller's r13 -- which
-    // install-time validation re-checks before these bytes ever run.
-    let has_reg_entry = (emitter.runtime.self_sym.is_some() || !makes_calls)
-        && std::env::var_os("EGCL_NO_DIRECT_SELF_CALL").is_none()
-        && !function.is_variadic()
-        && entry_params.len() <= REGISTER_ENTRY_ARGS_MAX
-        && !entry_params
-            .iter()
-            .any(|&param| function.is_entry_param_checked(param))
-        && emitter.root_slots == 0
-        && calls_fit_register_entry
-        && (other_call_words == 0 || emitter.runtime.call_slice_rooted != 0)
-        && instructions().all(|data| data.opcode != Opcode::TakeValuesToLocals);
+    let other_call_words = plan.other_call_words;
+    let has_reg_entry = plan.eligible;
     if has_reg_entry {
         emitter.argument_slots = 0;
     }
