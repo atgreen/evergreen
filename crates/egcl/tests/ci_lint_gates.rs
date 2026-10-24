@@ -55,6 +55,7 @@ fi
             "python3 scripts/test_spec_coverage.py\n",
             "python3 scripts/spec-coverage.py --gate --debt-baseline spec/coverage-debt.json\n",
             "make clippy\n",
+            "make clippy-ports\n",
             "bash scripts/gc-root-lint.sh\n",
             "cargo test -p egcl --test spec_validation_infra ansi_expected_failures_and_ci_contracts\n"
         ), "case={failing}: every check must execute");
