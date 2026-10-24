@@ -404,6 +404,19 @@
   by about 1.5 KB per thread, down from 88 KB, so a thread-per-connection
   server no longer leaks most of that per connection
   ([#598](https://github.com/atgreen/evergreen/pull/598)).
+- `make-instance` calls `allocate-instance` and `initialize-instance` as
+  generic functions, and `initialize-instance`'s standard method calls
+  `shared-initialize`, as CLHS 7.1 requires. User primary, `:before` and
+  `:around` methods on `initialize-instance` and `shared-initialize`, and
+  methods on `allocate-instance`, used to be skipped; only `:after` methods
+  ran. A primary method that does not call the next method now leaves the
+  slots uninitialized, as in other implementations. A `make-instance`,
+  `allocate-instance` or other standard generic function with only `:around`,
+  `:before` or `:after` methods of the user's no longer signals "no primary
+  method found": the standard method is its primary method. A user
+  `make-instance` method with `&key` parameters no longer makes every other
+  initarg an invalid keyword argument. Classes with no such methods keep the
+  fast path ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
 - Allocating an instance or a structure no longer discards every cached
   class precedence list, and a structure constructor no longer recomputes
   its class's precedence list on each call

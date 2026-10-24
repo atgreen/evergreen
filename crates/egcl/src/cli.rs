@@ -8411,18 +8411,16 @@ fn no_applicable_method_error(env: &mut Env, name: &str) -> EgclError {
     }
 }
 
-/// Run user-defined auxiliary methods of a given qualifier on an initialization
-/// generic function (`initialize-instance` / `shared-initialize`) during
-/// MAKE-INSTANCE. The built-in slot initialization stands in for the default
-/// primary method, so this covers the canonical `:after` construction hook.
-/// `:after` methods run least-specific-first per standard method combination.
-fn run_initialization_aux_methods(
+/// Run the :after methods of an initialization generic function
+/// (`initialize-instance` / `shared-initialize`) applicable to `args`, as
+/// MAKE-INSTANCE's built-in initialization does when it stands in for the rest
+/// of the effective method (see [`select_initialization_after_methods`]).
+fn run_initialization_after_methods(
     env: &mut Env,
     gf_name: &str,
     args: &[EgclVal],
-    qualifier: egcl_stdlib::MethodQualifier,
 ) -> Result<(), EgclError> {
-    let mut ordered = select_initialization_aux_methods(env, gf_name, args, qualifier);
+    let (mut ordered, _) = select_initialization_after_methods(env, gf_name, args);
     egcl_rt::rooted_ref!(_ordered_root = &mut ordered);
     // Do not hold an iterator borrow while Lisp invokes a moving collection.
     #[allow(clippy::needless_range_loop)]
@@ -8432,34 +8430,47 @@ fn run_initialization_aux_methods(
     Ok(())
 }
 
-/// The methods [`run_initialization_aux_methods`] runs, in the order it runs
-/// them. Selection can allocate but runs no user methods. The caller must root
-/// the result before it allocates again.
-fn select_initialization_aux_methods(
+/// The :after methods of the initialization generic `gf_name` applicable to
+/// `args`, in the order they run (least specific first), and whether they are
+/// all of its effective method apart from the standard primary method.
+///
+/// When that is so, MAKE-INSTANCE's built-in slot initialization can stand in
+/// for the standard method and the generic function call: the two do the same
+/// thing. Any other applicable method (a user primary, :before or :around
+/// method) makes it false, and MAKE-INSTANCE must call the generic function
+/// (CLHS 7.1.7, bliss-uchht). Selection can allocate but runs no user methods.
+/// The caller must root the result before it allocates again.
+fn select_initialization_after_methods(
     env: &mut Env,
     gf_name: &str,
     args: &[EgclVal],
-    qualifier: egcl_stdlib::MethodQualifier,
-) -> Vec<MethodDef> {
+) -> (Vec<MethodDef>, bool) {
     let mut methods = match env.methods.borrow().get(gf_name).cloned() {
         Some(methods) if !methods.is_empty() => methods,
-        _ => return Vec::new(),
+        _ => return (Vec::new(), true),
     };
     egcl_rt::rooted_ref!(_methods_root = &mut methods);
     let precedence = egcl_rt::symbols::find_index(gf_name)
         .map(|idx| egcl_stdlib::clos::argument_precedence_order(EgclVal::from_symbol_index(idx)))
         .unwrap_or_default();
     let mut applicable: Vec<(usize, Vec<usize>)> = Vec::new();
+    let mut standard = true;
     // Re-read the rooted vector after callbacks that may relocate its values.
     #[allow(clippy::needless_range_loop)]
     for index in 0..methods.len() {
-        if methods[index].qualifier != qualifier {
+        let after = methods[index].qualifier == egcl_stdlib::MethodQualifier::After;
+        // Only a method that would change the answer needs its applicability.
+        if !after && (!standard || is_standard_initialization_method(&methods[index])) {
             continue;
         }
         let mut method = methods[index].clone();
         egcl_rt::rooted_ref!(_method_root = &mut method);
         if let Some(key) = method_specificity_vector(env, &method, args) {
-            applicable.push((index, precedence_ordered_key(key, &precedence)));
+            if after {
+                applicable.push((index, precedence_ordered_key(key, &precedence)));
+            } else {
+                standard = false;
+            }
         }
     }
     applicable.sort_by(|a, b| a.1.cmp(&b.1));
@@ -8468,10 +8479,54 @@ fn select_initialization_aux_methods(
         .into_iter()
         .map(|(index, _)| methods[index].clone())
         .collect();
-    if qualifier == egcl_stdlib::MethodQualifier::After {
-        ordered.reverse();
+    ordered.reverse();
+    (ordered, standard)
+}
+
+/// Whether `method` is one of boot.lisp's standard primary methods on
+/// INITIALIZE-INSTANCE or SHARED-INITIALIZE: its body is the single call to
+/// the internal function implementing it. A method that replaces one (same
+/// specializers and qualifiers) has a different body, so it is not.
+fn is_standard_initialization_method(method: &MethodDef) -> bool {
+    if method.qualifier != egcl_stdlib::MethodQualifier::Primary {
+        return false;
     }
-    ordered
+    // DEFMETHOD stores the body as ((BLOCK name form...)).
+    let body = method.body;
+    if !body.is_cons() || !cp(body).1.is_nil() {
+        return false;
+    }
+    let block = cp(body).0;
+    if !block.is_cons() || !cp(block).1.is_cons() {
+        return false;
+    }
+    let mut forms = cp(cp(block).1).1;
+    let mut call = None;
+    while forms.is_cons() {
+        let (form, rest) = cp(forms);
+        forms = rest;
+        let declaration =
+            form.is_cons() && cp(form).0.is_symbol() && sym_bare_name_rc(cp(form).0).as_ref() == "DECLARE";
+        if declaration {
+            continue;
+        }
+        if call.is_some() {
+            return false;
+        }
+        call = Some(form);
+    }
+    let Some(call) = call.filter(|call| call.is_cons()) else {
+        return false;
+    };
+    let head = cp(call).0;
+    head.is_symbol()
+        && matches!(
+            sym_name(head).as_str(),
+            "EGCL-INTERNAL::%STANDARD-SHARED-INITIALIZE"
+                | "EGCL-INTERNAL:%STANDARD-SHARED-INITIALIZE"
+                | "EGCL-INTERNAL::%STANDARD-INITIALIZE-INSTANCE"
+                | "EGCL-INTERNAL:%STANDARD-INITIALIZE-INSTANCE"
+        )
 }
 
 /// True if the generic `name` has at least one method applicable to `args`.
@@ -9450,7 +9505,16 @@ fn invoke_generic_function_inner(
     egcl_rt::rooted_ref!(_method_ids_root = &mut method_ids);
     check_generic_call_arguments(env, gf_idx, name, args, Some(&mut method_ids.iter().copied()))?;
 
-    let effective = egcl_stdlib::compute_effective_method(NIL, combination, &method_ids)?;
+    // A built-in generic's own behaviour is its standard primary method (see
+    // `run_standard_from_ids`), so :around, :before or :after methods alone
+    // still have a primary to run: a MAKE-INSTANCE :around method's
+    // CALL-NEXT-METHOD reaches the built-in instantiation (bliss-agqzs).
+    let effective = egcl_stdlib::clos::compute_effective_method_with_standard_primary(
+        NIL,
+        combination,
+        &method_ids,
+        is_builtin_function(&symbol_bare_name(name)),
+    )?;
     match combination {
         egcl_stdlib::MethodCombinationType::Standard => {
             let Some((around_ids, before_ids, primary_ids, after_ids)) =
@@ -40381,6 +40445,26 @@ fn lambda_list_key_info(lambda_list: EgclVal) -> LambdaKeyInfo {
     info
 }
 
+/// Whether `name` is a standard generic function whose CLHS lambda list ends
+/// in `&key &allow-other-keys`, such as `(make-instance class &rest initargs
+/// &key &allow-other-keys)`. The lambda list an implicit generic function takes
+/// from the first DEFMETHOD loses that, so a user method with `&key` made every
+/// other initarg an invalid keyword argument. Their initargs are checked by the
+/// initialization protocol instead (CLHS 7.1.2).
+fn standard_generic_allows_other_keys(name: &str) -> bool {
+    matches!(
+        name,
+        "MAKE-INSTANCE"
+            | "ALLOCATE-INSTANCE"
+            | "INITIALIZE-INSTANCE"
+            | "REINITIALIZE-INSTANCE"
+            | "SHARED-INITIALIZE"
+            | "UPDATE-INSTANCE-FOR-DIFFERENT-CLASS"
+            | "UPDATE-INSTANCE-FOR-REDEFINED-CLASS"
+            | "CHANGE-CLASS"
+    )
+}
+
 /// CLHS 7.6.4 for a method: a congruent shape, and when the generic function
 /// mentions &KEY names, the method accepts each of them explicitly, through
 /// &ALLOW-OTHER-KEYS, or through &REST without &KEY (ansi defmethod.error.10,
@@ -40452,7 +40536,11 @@ fn check_generic_call_arguments(
         return Ok(());
     };
     let generic = lambda_list_key_info(generic_lambda_list);
-    if !generic.has_key || generic.allow_other_keys || args.len() <= generic.positional {
+    if !generic.has_key
+        || generic.allow_other_keys
+        || args.len() <= generic.positional
+        || standard_generic_allows_other_keys(name)
+    {
         return Ok(());
     }
     let tail = &args[generic.positional..];
@@ -41278,20 +41366,20 @@ fn make_instance_of_class(
     if !cpl_checked {
         egcl_stdlib::compute_class_precedence_list(*class)?;
     }
-    let result = make_instance_general(*class, initargs, env);
-    if result.is_ok() {
-        note_make_instance_class(*class, generation, env);
-    }
-    result
+    let (instance, standard) = make_instance_general(*class, initargs, env)?;
+    note_make_instance_class(*class, generation, standard, env);
+    Ok(instance)
 }
 
 /// The full MAKE-INSTANCE initialization protocol on evaluated initargs, for
-/// any class and any state of the initialization generic functions.
+/// any class and any state of the initialization generic functions. Also
+/// answers whether the instance was made by the standard methods alone, as
+/// [`make_instance_allocate_and_initialize`] reports it.
 fn make_instance_general(
     mut class: EgclVal,
     supplied: &[EgclVal],
     env: &mut Env,
-) -> Result<EgclVal, EgclError> {
+) -> Result<(EgclVal, bool), EgclError> {
     egcl_rt::rooted_ref!(_class_root = &mut class);
     let class_name = class_name_for_instance_class(class);
     if supplied.len() % 2 != 0 {
@@ -41369,50 +41457,101 @@ fn make_instance_general(
         &["INITIALIZE-INSTANCE", "SHARED-INITIALIZE", "ALLOCATE-INSTANCE"],
     )?;
 
-    // `initargs` stays rooted across make_instance, the initforms, and the user
-    // :after methods below — all of which allocate (bliss-6b2 #2).
+    make_instance_allocate_and_initialize(
+        class,
+        &class_name,
+        &initargs,
+        &supplied_initargs,
+        env,
+    )
+}
+
+/// What MAKE-INSTANCE does once its initargs are defaulted and validated
+/// (CLHS 7.1.7): call ALLOCATE-INSTANCE, then INITIALIZE-INSTANCE, as generic
+/// functions with `protocol_initargs`. `initargs` is the same list keyed by
+/// slot, as the built-in slot filling takes it.
+///
+/// The standard methods run built in. ALLOCATE-INSTANCE's is the allocation
+/// itself, used when no method of the user's applies. INITIALIZE-INSTANCE's
+/// standard method calls SHARED-INITIALIZE, whose standard method fills the
+/// slots from the initargs and then from the initforms. While the only other
+/// applicable methods of those two are :after methods, the slot filling runs
+/// here directly, followed by SHARED-INITIALIZE's :after methods (which run
+/// inside INITIALIZE-INSTANCE's primary) and then INITIALIZE-INSTANCE's. Any
+/// other method calls the generic function, so user primary, :before and
+/// :around methods and CALL-NEXT-METHOD take part (bliss-uchht).
+///
+/// Returns the instance, and whether only standard methods and those :after
+/// methods took part: the case a MAKE-INSTANCE plan reproduces.
+fn make_instance_allocate_and_initialize(
+    mut class: EgclVal,
+    class_name: &str,
+    initargs: &[EgclVal],
+    protocol_initargs: &[EgclVal],
+    env: &mut Env,
+) -> Result<(EgclVal, bool), EgclError> {
+    egcl_rt::rooted_ref!(_class_root = &mut class);
+    rooted_args!(initargs = initargs);
+    let mut alloc_args = Vec::with_capacity(protocol_initargs.len() + 1);
+    alloc_args.push(class);
+    alloc_args.extend_from_slice(protocol_initargs);
+    egcl_rt::rooted_ref!(_alloc_args_root = &mut alloc_args);
+    let user_allocation = env.methods.contains_key("ALLOCATE-INSTANCE")
+        && has_applicable_method(env, "ALLOCATE-INSTANCE", &alloc_args);
+    let mut instance = if user_allocation {
+        invoke_generic_function("ALLOCATE-INSTANCE", &alloc_args, env)?
+    } else {
+        egcl_stdlib::make_instance(class, &[])?
+    };
+    // Initforms and initialization methods can move the instance. Their local
+    // roots do not update this caller's copy, which is returned to Lisp.
+    egcl_rt::rooted_ref!(_instance_root = &mut instance);
+    // initialize-instance is called as (instance &rest initargs);
+    // shared-initialize as (instance slot-names &rest initargs) with
+    // slot-names T (all slots).
+    let mut ii_args = Vec::with_capacity(alloc_args.len());
+    ii_args.push(instance);
+    ii_args.extend_from_slice(&alloc_args[1..]);
+    egcl_rt::rooted_ref!(_iig = &mut ii_args);
+    let mut si_args = Vec::with_capacity(alloc_args.len() + 1);
+    si_args.push(instance);
+    si_args.push(T);
+    si_args.extend_from_slice(&alloc_args[1..]);
+    egcl_rt::rooted_ref!(_sig = &mut si_args);
+    let (mut shared_after, shared_standard) =
+        select_initialization_after_methods(env, "SHARED-INITIALIZE", &si_args);
+    egcl_rt::rooted_ref!(_shared_after_root = &mut shared_after);
+    let (mut initialize_after, initialize_standard) = if shared_standard {
+        select_initialization_after_methods(env, "INITIALIZE-INSTANCE", &ii_args)
+    } else {
+        (Vec::new(), false)
+    };
+    egcl_rt::rooted_ref!(_initialize_after_root = &mut initialize_after);
+    if !(shared_standard && initialize_standard) {
+        invoke_generic_function("INITIALIZE-INSTANCE", &ii_args, env)?;
+        return Ok((instance, false));
+    }
     let explicit_slots: Vec<String> = initargs
         .chunks_exact(2)
         .map(|pair| sym_bare_name_rc(pair[0]).to_string())
         .collect();
-    let (instance_initargs, class_initargs) = split_initargs_for_class(env, &class_name, &initargs);
-    let mut instance = egcl_stdlib::make_instance(class, &instance_initargs)?;
-    // Initforms and initialization hooks can move the instance. Their local
-    // roots do not update this caller's copy, which is returned to Lisp.
-    egcl_rt::rooted_ref!(_instance_root = &mut instance);
+    let (instance_initargs, class_initargs) = split_initargs_for_class(env, class_name, &initargs);
+    egcl_rt::rooted!(instance_initargs = instance_initargs);
+    egcl_stdlib::initialize_instance(instance, &instance_initargs)?;
     for (slot_name, value) in class_initargs {
-        write_class_slot_value(env, &class_name, &slot_name, Some(value));
+        write_class_slot_value(env, class_name, &slot_name, Some(value));
     }
-    apply_class_initforms(instance, &class_name, env, None, &explicit_slots)?;
-
-    // Run user-defined :after methods on the initialization protocol so the
-    // canonical `(defmethod initialize-instance :after ...)` hook fires. Per
-    // ANSI, shared-initialize's :after methods run inside the initialize-instance
-    // primary, hence before initialize-instance's own :after methods.
-    // initialize-instance is called as (instance &rest initargs); shared-initialize
-    // as (instance slot-names &rest initargs) with slot-names = T (all slots).
-    let mut ii_args = Vec::with_capacity(supplied_initargs.len() + 1);
-    ii_args.push(instance);
-    ii_args.extend_from_slice(&supplied_initargs);
-    egcl_rt::rooted_ref!(_iig = &mut ii_args);
-    let mut si_args = Vec::with_capacity(supplied_initargs.len() + 2);
-    si_args.push(instance);
-    si_args.push(T);
-    si_args.extend_from_slice(&supplied_initargs);
-    egcl_rt::rooted_ref!(_sig = &mut si_args);
-    run_initialization_aux_methods(
-        env,
-        "SHARED-INITIALIZE",
-        &si_args,
-        egcl_stdlib::MethodQualifier::After,
-    )?;
-    run_initialization_aux_methods(
-        env,
-        "INITIALIZE-INSTANCE",
-        &ii_args,
-        egcl_stdlib::MethodQualifier::After,
-    )?;
-    Ok(instance)
+    apply_class_initforms(instance, class_name, env, None, &explicit_slots)?;
+    // Do not hold an iterator borrow while Lisp invokes a moving collection.
+    #[allow(clippy::needless_range_loop)]
+    for index in 0..shared_after.len() {
+        invoke_method(env, &shared_after[index], &si_args, None)?;
+    }
+    #[allow(clippy::needless_range_loop)]
+    for index in 0..initialize_after.len() {
+        invoke_method(env, &initialize_after[index], &ii_args, None)?;
+    }
+    Ok((instance, !user_allocation))
 }
 
 // ── MAKE-INSTANCE plans (bliss-ih7pa) ────────────────────────────
@@ -41445,16 +41584,21 @@ fn make_instance_general(
 // not cover takes the general path instead:
 //
 //   * user methods on MAKE-INSTANCE: such a call dispatches the generic, and
-//     reaches here only through its built-in fallback, when no method applies;
+//     reaches here through its built-in fallback, when no method applies or
+//     a method calls the next method;
+//   * any applicable user method on ALLOCATE-INSTANCE, and any on
+//     INITIALIZE-INSTANCE or SHARED-INITIALIZE other than an :after method:
+//     the general path calls those generic functions, and the class gets no
+//     plan (bliss-uchht);
 //   * a class with an :allocation :class slot, a class the evaluator did not
 //     define, or a default initarg that fills no slot or is not valid: no plan;
 //   * an initarg that fills no slot (one only a method's &KEY accepts, or
 //     :ALLOW-OTHER-KEYS), is not valid, or is not a symbol, and an odd-length
 //     list: that call goes the general way, before anything is evaluated.
 //
-// If the generation moves during a call (an initform that runs DEFMETHOD),
-// the remaining steps fall back to the general helpers, which read the
-// definitions afresh.
+// If the generation moves during a call (a default-initarg form or initform
+// that runs DEFMETHOD), the remaining steps fall back to the general helpers,
+// which read the definitions afresh.
 
 const MAKE_INSTANCE_INIT_GENERICS: [&str; 3] =
     ["INITIALIZE-INSTANCE", "SHARED-INITIALIZE", "ALLOCATE-INSTANCE"];
@@ -41594,8 +41738,12 @@ fn make_instance_plan_for(class: EgclVal) -> Option<Arc<MakeInstancePlan>> {
 }
 
 /// Record that the general path just made an instance of `class` in
-/// `generation`, and make a plan the second time it does.
-fn note_make_instance_class(class: EgclVal, generation: u64, env: &mut Env) {
+/// `generation`, and make a plan the second time it does. `standard` says
+/// whether only the standard methods (and :after methods) took part; a plan
+/// reproduces only that, so otherwise the class gets none in this generation.
+/// Which methods apply depends only on the class: ALLOCATE-INSTANCE's argument
+/// is the class, and a fresh instance matches no EQL specializer.
+fn note_make_instance_class(class: EgclVal, generation: u64, standard: bool, env: &mut Env) {
     if GF_DISPATCH_GENERATION.load(AtomicOrdering::Acquire) != generation {
         return;
     }
@@ -41611,6 +41759,12 @@ fn note_make_instance_class(class: EgclVal, generation: u64, env: &mut Env) {
             // Every entry is stale; dropping them keeps the table bounded.
             plans.generation = generation;
             plans.entries.clear();
+        }
+        if !standard {
+            plans
+                .entries
+                .insert(layout, MakeInstancePlanEntry::Declined);
+            return;
         }
         match plans.entries.get(&layout) {
             Some(MakeInstancePlanEntry::Seen(seen)) => *seen == generation,
@@ -41841,23 +41995,24 @@ fn make_instance_planned_run(
         defaulted.push(EgclVal::from_symbol_index(default.keyword));
         defaulted.push(value);
     }
-    // Every initarg a plan accepts is valid; recheck only if a default's form
-    // changed the definitions.
+    // Every initarg a plan accepts is valid. If a default's form changed the
+    // definitions, recheck, and let the general path decide which methods
+    // allocate and initialize the instance.
     if !make_instance_plan_current(plan) {
         egcl_rt::rooted!(all = [supplied, &defaulted[..]].concat());
         check_initargs_valid(env, &plan.class_name, &all, &MAKE_INSTANCE_INIT_GENERICS)?;
+        let (instance, _) =
+            make_instance_allocate_and_initialize(class, &plan.class_name, initargs, &all, env)?;
+        return Ok(instance);
     }
     // `egcl_stdlib::make_instance` without its built-in-class check, which
     // linearizes the class afresh on every call: the class was not built-in
     // when the general path made this plan, and redefining it retires the
-    // plan. `initargs` is rooted by the caller.
-    let mut instance = if make_instance_plan_current(plan) {
-        let instance = egcl_stdlib::allocate_instance(class)?;
-        egcl_stdlib::initialize_instance(instance, initargs)?;
-        instance
-    } else {
-        egcl_stdlib::make_instance(class, initargs)?
-    };
+    // plan. No user method applies to ALLOCATE-INSTANCE, INITIALIZE-INSTANCE
+    // or SHARED-INITIALIZE but the latter two's :after methods, or the plan
+    // would not exist. `initargs` is rooted by the caller.
+    let mut instance = egcl_stdlib::allocate_instance(class)?;
+    egcl_stdlib::initialize_instance(instance, initargs)?;
     egcl_rt::rooted_ref!(_instance_root = &mut instance);
     if make_instance_plan_current(plan) {
         let first = plan.defaults.len();
@@ -41883,7 +42038,7 @@ fn make_instance_planned_run(
     Ok(instance)
 }
 
-/// `run_initialization_aux_methods` for the :after methods of `gf_name`, with
+/// `run_initialization_after_methods` for `gf_name`, with
 /// the selection cached in `plan` while it is current.
 fn run_planned_after_methods(
     env: &mut Env,
@@ -41918,21 +42073,20 @@ fn run_planned_after_methods(
     args.extend_from_slice(supplied);
     args.extend_from_slice(defaulted);
     egcl_rt::rooted!(args = args);
-    let qualifier = egcl_stdlib::MethodQualifier::After;
     if !current {
-        return run_initialization_aux_methods(env, gf_name, &args, qualifier);
+        return run_initialization_after_methods(env, gf_name, &args);
     }
     let mut methods = match cached {
         Some(ids) => match methods_by_ids(env, gf_name, &ids) {
             Some(methods) => methods,
-            None => return run_initialization_aux_methods(env, gf_name, &args, qualifier),
+            None => return run_initialization_after_methods(env, gf_name, &args),
         },
         None => {
             // Applicability depends only on the instance's class: the
             // remaining required argument is always T, and a fresh instance
             // can match no EQL specializer. So one selection serves every
             // instance with this layout.
-            let methods = select_initialization_aux_methods(env, gf_name, &args, qualifier);
+            let (methods, _) = select_initialization_after_methods(env, gf_name, &args);
             let ids: Box<[EgclVal]> = methods.iter().map(|method| method.method_id).collect();
             if make_instance_plan_current(plan) && ids.iter().all(|id| !id.is_heap_object()) {
                 *lock_ignoring_poison(cache) = Some(ids);
