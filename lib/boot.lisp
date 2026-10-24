@@ -919,6 +919,28 @@
   ;; list view and returns a fresh sequence of the same type as SEQ.  When
   ;; :count limits removals, :from-end selects the trailing matches rather than
   ;; the leading ones (CLHS 17.3).  See bliss-0l1.
+  ;;
+  ;; A whole list with no :count or :from-end -- nearly every call -- is one
+  ;; forward pass applying the test in order, which is what the general path
+  ;; below does for it too, without building a vector of the list and a list
+  ;; of matching positions and then searching that list once per element.
+  ;; That general path cost ~190 us to remove from an 8-element list.
+  ;; TAGBODY rather than DO/DOLIST: see MEMBER-IF below.
+  (when (and (listp seq) (eql start 0) (null end) (null count) (null from-end))
+    (let ((testfn (or test test-not #'eql))
+          (result nil)
+          (l seq))
+      (tagbody
+        scan
+          (when (endp l) (go done))
+          (let* ((x (car l))
+                 (r (funcall testfn item (if key (funcall key x) x))))
+            (when (if test-not r (not r))
+              (push x result)))
+          (setq l (cdr l))
+          (go scan)
+        done)
+      (return-from remove (nreverse result))))
   (let* ((items (coerce seq 'list))
          (testfn (or test test-not #'eql))
          (neg (if test-not t nil))
@@ -942,6 +964,20 @@
 ;; semantics — including that :FROM-END selects the TRAILING matches and applies
 ;; the predicate back-to-front — cannot drift between the two.
 (defun remove-if (pred seq &key key (start 0) end count from-end)
+  ;; The same whole-list fast path as REMOVE.
+  (when (and (listp seq) (eql start 0) (null end) (null count) (null from-end))
+    (let ((result nil)
+          (l seq))
+      (tagbody
+        scan
+          (when (endp l) (go done))
+          (let ((x (car l)))
+            (unless (funcall pred (if key (funcall key x) x))
+              (push x result)))
+          (setq l (cdr l))
+          (go scan)
+        done)
+      (return-from remove-if (nreverse result))))
   (let* ((items (coerce seq 'list))
          (chosen (%match-positions
                   (lambda (x) (funcall pred (if key (funcall key x) x)))
