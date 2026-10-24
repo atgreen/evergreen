@@ -90,14 +90,14 @@
 //! immediates (so no shadow roots), whose self-calls pass at most three
 //! arguments and whose other calls at most [`CALL_ARGS_MAX`], and which needs
 //! no activation-backed instruction, also gets a REGISTER entry after the
-//! ordinary one: the same prologue, but the arguments arrive in r2-r4 instead
+//! ordinary one: the same prologue, but the arguments arrive in r2-r5 instead
 //! of activation slots and r13 is left as the caller's. Such a body never
 //! touches r13: a non-self call stages its arguments in this frame's
 //! call-argument area and goes through `call_slice_rooted`, which copies them
 //! into rooted storage before the callee can allocate, or enters a resolved
 //! native callee directly, which copies them into the callee's published
 //! frame first; the direct-builtin shortcut is not taken there, since a
-//! builtin reads the area while it may allocate (bliss-of8kz). A self-call then moves its arguments into r2-r4 and `BRASL`s to
+//! builtin reads the area while it may allocate (bliss-of8kz). A self-call then moves its arguments into r2-r5 and `BRASL`s to
 //! that entry, skipping c2i dispatch entirely (bliss-hx5xb; measured 0.78 us
 //! per generic call on a z17 against 77 ns per loop iteration). The site first
 //! compares r15 with the published native stack limit and takes the ordinary
@@ -224,7 +224,12 @@ pub struct RuntimeCalls {
 
 /// Arguments a register entry accepts, one per ABI argument register the
 /// entry prologue moves home. Beyond this a caller must use the activation.
-pub const REGISTER_ENTRY_ARGS_MAX: usize = 3;
+///
+/// Four, not the ELF ABI's five: the fifth argument register is r6, which is
+/// also the lowest callee-saved register and therefore a possible value home
+/// here, so a caller staging an argument into it would overwrite one of its
+/// own live values. r2-r5 are volatile and never homes.
+pub const REGISTER_ENTRY_ARGS_MAX: usize = 4;
 
 fn calls_runtime(opcode: Opcode) -> bool {
     matches!(
@@ -545,14 +550,14 @@ impl Emitter<'_> {
         let AuxData::CallTarget(symbol) = data.aux else {
             return Err(unsupported!());
         };
-        if data.args.len() > 3 {
+        if data.args.len() > REGISTER_ENTRY_ARGS_MAX {
             return Err(unsupported!());
         }
         let slow = self.asm.label();
         let join = self.asm.label();
         // A self-call with the wrong argument count must reach the generic
         // adapter, which raises PROGRAM-ERROR; the register entry binds
-        // whatever is in r2-r4 (bliss-w6aki: `(g 0 0)` in a one-parameter G
+        // whatever is in r2-r5 (bliss-w6aki: `(g 0 0)` in a one-parameter G
         // answered 0 at T2). Only the slow path is emitted for it.
         let arity_matches =
             data.args.len() == self.function.block(self.function.entry()).params.len();
@@ -564,7 +569,7 @@ impl Emitter<'_> {
             // past the limit.
             self.asm.compare(15, 1);
             self.asm.branch(12, slow);
-            // Fast path: arguments in r2-r4 (no overlap with the r6-r12 homes),
+            // Fast path: arguments in r2-r5 (no overlap with the r6-r12 homes),
             // then a relative call to the register entry; the result is in r2.
             for (index, &argument) in data.args.iter().enumerate() {
                 self.load(argument, 2 + index as u8)?;
@@ -2098,12 +2103,12 @@ pub fn emit_framed_with_runtime(
             .flat_map(|&block| &function.block(block).insts)
             .map(|&inst| function.inst(inst))
     };
-    // Self-calls pass their arguments in r2-r4; any other call stages them in
+    // Self-calls pass their arguments in r2-r5; any other call stages them in
     // this frame's call-argument area (see the module docs).
     let is_self_call = |data: &InstData| matches!(data.aux, AuxData::CallTarget(symbol) if Some(symbol) == emitter.runtime.self_sym);
     let calls_fit_register_entry = instructions().all(|data| {
         data.opcode != Opcode::Call
-            || (is_self_call(data) && data.args.len() <= 3)
+            || (is_self_call(data) && data.args.len() <= REGISTER_ENTRY_ARGS_MAX)
             || (matches!(data.aux, AuxData::CallTarget(_)) && data.args.len() <= CALL_ARGS_MAX)
     });
     let other_call_words = instructions()
@@ -2200,7 +2205,7 @@ pub fn emit_framed_with_runtime(
     // the install log and its tests can see it (0 = no register entry).
     let mut compiled_entry = 0;
     if has_reg_entry {
-        // Register entry: the same frame, but the arguments arrive in r2-r4 and
+        // Register entry: the same frame, but the arguments arrive in r2-r5 and
         // r13 stays the caller's. Move the arguments home before writing the
         // entry-kind word, since that write uses r2 as scratch.
         let label = emitter.asm.label();
@@ -2645,89 +2650,105 @@ mod tests {
             SENTINEL
         }
 
-        let mut f = Function::new("z-direct-register");
-        let block = f.entry();
-        let x = f.add_block_param(block, IRType::TOP, ValueRepresentation::Tagged);
-        let (_, result) = f.push_inst(
-            block,
-            InstData {
-                opcode: Opcode::Call,
-                args: vec![x],
-                results: vec![],
-                aux: AuxData::CallTarget(71),
-                flags: InstFlags {
-                    call: true,
-                    safepoint: true,
-                    effectful: true,
+        // Every admitted arity: r2-r5 are the argument registers, and r5 is
+        // the last one that is never a value home (r6 is both the ABI's fifth
+        // argument register and the lowest callee-saved one).
+        for arity in 1..=REGISTER_ENTRY_ARGS_MAX {
+            let mut f = Function::new("z-direct-register");
+            let block = f.entry();
+            let args: Vec<_> = (0..arity)
+                .map(|_| f.add_block_param(block, IRType::TOP, ValueRepresentation::Tagged))
+                .collect();
+            let (_, result) = f.push_inst(
+                block,
+                InstData {
+                    opcode: Opcode::Call,
+                    args: args.clone(),
+                    results: vec![],
+                    aux: AuxData::CallTarget(71),
+                    flags: InstFlags {
+                        call: true,
+                        safepoint: true,
+                        effectful: true,
+                        ..Default::default()
+                    },
+                    targets: vec![],
+                    frame_state: None,
+                    source_pos: 0,
+                },
+                &[(IRType::TOP, ValueRepresentation::Tagged)],
+            );
+            f.set_terminator(
+                block,
+                InstData {
+                    opcode: Opcode::Return,
+                    args: vec![result[0]],
+                    results: vec![],
+                    aux: AuxData::None,
+                    flags: InstFlags::default(),
+                    targets: vec![],
+                    frame_state: None,
+                    source_pos: 0,
+                },
+            );
+
+            // The callee honours the register-entry convention and nothing
+            // else: it sums its arguments from r2.. into r2 and returns, so a
+            // argument landing in the wrong register shows up in the answer.
+            let callee = {
+                let mut a = Asm::new();
+                for index in 1..arity {
+                    a.add(2, 2 + index as u8);
+                }
+                a.ret();
+                a.finish().unwrap()
+            };
+            #[cfg(all(target_arch = "s390x", unix))]
+            let callee = egcl_rt::jit::JitBuffer::new(&callee).unwrap();
+            let callee_address = callee.as_ptr() as u64;
+
+            let target = crate::t2::emit::DirectNativeTarget {
+                symbol: 71,
+                nargs: arity as u16,
+                entry: 0,
+                code_info: 0,
+                num_slots: arity as u16,
+                generation: GENERATION,
+                generation_addr: std::ptr::from_ref(&BAKED_GENERATION) as u64,
+                frame_flags: 0,
+                register_entry: callee_address,
+            };
+            let compiled = emit_framed_with_runtime(
+                &f,
+                0,
+                arity as u16,
+                RuntimeCalls {
+                    call_slice: slice as *const () as u64,
+                    direct_natives: vec![target],
                     ..Default::default()
                 },
-                targets: vec![],
-                frame_state: None,
-                source_pos: 0,
-            },
-            &[(IRType::TOP, ValueRepresentation::Tagged)],
-        );
-        f.set_terminator(
-            block,
-            InstData {
-                opcode: Opcode::Return,
-                args: vec![result[0]],
-                results: vec![],
-                aux: AuxData::None,
-                flags: InstFlags::default(),
-                targets: vec![],
-                frame_state: None,
-                source_pos: 0,
-            },
-        );
-
-        // The callee honours the register-entry convention and nothing else:
-        // one argument in r2, its result in r2, no frame of its own.
-        let callee = {
-            let mut a = Asm::new();
-            a.add_imm(2, 1);
-            a.ret();
-            a.finish().unwrap()
-        };
-        #[cfg(all(target_arch = "s390x", unix))]
-        let callee = egcl_rt::jit::JitBuffer::new(&callee).unwrap();
-        let callee_address = callee.as_ptr() as u64;
-
-        let target = crate::t2::emit::DirectNativeTarget {
-            symbol: 71,
-            nargs: 1,
-            entry: 0,
-            code_info: 0,
-            num_slots: 1,
-            generation: GENERATION,
-            generation_addr: std::ptr::from_ref(&BAKED_GENERATION) as u64,
-            frame_flags: 0,
-            register_entry: callee_address,
-        };
-        let compiled = emit_framed_with_runtime(
-            &f,
-            0,
-            1,
-            RuntimeCalls {
-                call_slice: slice as *const () as u64,
-                direct_natives: vec![target],
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        // The site keeps its guarded fallback, so the slice adapter is still
-        // reachable; what must not happen is reaching it on the fast path.
-        assert_eq!(compiled.emitted_safepoints, 1);
-        #[cfg(all(target_arch = "s390x", unix))]
-        {
-            let code = egcl_rt::jit::JitBuffer::new(&compiled.code).unwrap();
-            // SAFETY: the buffer owns the generated activation entry, and the
-            // slots include every shadow word the emitter advertised.
-            let entry: unsafe extern "C" fn(*mut u64) -> u64 =
-                unsafe { std::mem::transmute(code.as_ptr()) };
-            let mut slots = vec![0u64; 1 + compiled.shadow_root_slots as usize];
-            slots[0] = 41;
-            assert_eq!(unsafe { entry(slots.as_mut_ptr()) }, 42);
+            )
+            .unwrap();
+            assert_eq!(compiled.emitted_safepoints, 1);
+            #[cfg(all(target_arch = "s390x", unix))]
+            {
+                let code = egcl_rt::jit::JitBuffer::new(&compiled.code).unwrap();
+                // SAFETY: the buffer owns the generated activation entry, and
+                // the slots include every shadow word it advertised.
+                let entry: unsafe extern "C" fn(*mut u64) -> u64 =
+                    unsafe { std::mem::transmute(code.as_ptr()) };
+                let mut slots = vec![0u64; arity + compiled.shadow_root_slots as usize];
+                let mut expected = 0u64;
+                for index in 0..arity {
+                    slots[index] = 1 << (index + 1);
+                    expected += slots[index];
+                }
+                assert_eq!(
+                    unsafe { entry(slots.as_mut_ptr()) },
+                    expected,
+                    "arity {arity}: every argument reached its register"
+                );
+            }
         }
     }
 
