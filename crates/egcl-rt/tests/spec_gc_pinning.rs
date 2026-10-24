@@ -349,3 +349,65 @@ fn pinned_large_object_survives_a_major_gc_with_no_references() {
         "a pinned large object was subtracted from large-object accounting — freed"
     );
 }
+
+#[test]
+fn unrooted_pinned_nursery_object_stays_put_and_reused_nursery_reads_as_zero() {
+    // bliss-xyt4l: a minor collection finds retained regions from the pins it
+    // was told about rather than by walking every nursery object, and leaves
+    // evacuated regions unzeroed until their memory is handed out again.
+    let _g = lock().lock().unwrap_or_else(|e| e.into_inner());
+    init_heap(&gc_config()).expect("init_heap");
+    let mut alloc = HeapAllocator::new().expect("allocator");
+
+    // Garbage with non-zero words across several regions, then a pinned
+    // object nothing references.
+    let mut garbage = Vec::new();
+    for i in 0..200 {
+        let filler = EgclVal::from_fixnum(0x7777 + i);
+        garbage.push(make_cons(&mut alloc, filler, filler));
+    }
+    let p = make_cons(
+        &mut alloc,
+        EgclVal::from_fixnum(4242),
+        EgclVal::from_fixnum(17),
+    );
+    pin(p);
+    let p_addr = p.0 & !TAG_MASK;
+
+    HeapCollector::new().minor_gc().expect("minor_gc");
+
+    // The pinned object's region was retained in place, contents intact.
+    assert_eq!(car(p).as_fixnum(), 4242, "pinned object intact");
+    assert_eq!(cdr(p).as_fixnum(), 17, "pinned object intact");
+    let header = unsafe { &*((p_addr - 8) as *const ObjectHeader) };
+    assert!(header.is_pinned() && !header.is_forwarded());
+
+    // Fresh allocations reuse the evacuated garbage's addresses, and read as
+    // zero there before the caller initializes them.
+    let reused: std::collections::HashSet<u64> = garbage.iter().map(|v| v.0 & !TAG_MASK).collect();
+    let mut alloc = HeapAllocator::new().expect("allocator after GC");
+    let mut hits = 0;
+    for _ in 0..400 {
+        let body = alloc
+            .alloc_fast(16)
+            .or_else(|| alloc.alloc_slow(16).ok())
+            .expect("cons alloc");
+        let words = unsafe { std::slice::from_raw_parts(body as *const u64, 2) };
+        assert_eq!(
+            words,
+            [0, 0],
+            "reused nursery memory at {body:p} is not zero"
+        );
+        if reused.contains(&(body as u64)) {
+            hits += 1;
+        }
+        // Make the words non-zero again, as an initializing caller would.
+        unsafe { *(body as *mut u64) = 0x5555 };
+    }
+    assert!(hits > 0, "the probe never reused a collected address");
+    // Had its region been reclaimed, the allocations above would have reused
+    // and overwritten it.
+    assert_eq!(car(p).as_fixnum(), 4242, "pinned region was reclaimed");
+    assert_eq!(cdr(p).as_fixnum(), 17, "pinned region was reclaimed");
+    egcl_rt::gc::unpin(p);
+}
