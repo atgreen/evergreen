@@ -140,6 +140,7 @@ fn options(arity: usize) -> OrdinaryLispEntryOptions {
     OrdinaryLispEntryOptions {
         arity,
         arity_error_veneer: ordinary_arity_observer as *const () as u64,
+        binding: None,
     }
 }
 

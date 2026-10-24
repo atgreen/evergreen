@@ -147,7 +147,8 @@ use crate::t2::x64_frame::{select_frame_homes, ValueHome as FramedHome, GPR_X86}
 #[path = "ordinary_leaf.rs"]
 mod ordinary_leaf;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-pub use ordinary_leaf::{emit_framed_ordinary_leaf, OrdinaryLispEntryOptions};
+pub use ordinary_leaf::{emit_framed_ordinary_leaf, OrdinaryArgumentBinding, OrdinaryKeywordArguments,
+    OrdinaryLispEntryOptions, OrdinaryOptionalArguments};
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[path = "ordinary_call.rs"]
 mod ordinary_call;
@@ -235,6 +236,10 @@ fn alu_rr(a: &mut Asm, opcode: u8, dst: u8, src: u8) {
     a.push(opcode);
     a.push(modrm_rr(src, dst));
 }
+
+/// Stack an ordinary `&key` entry reserves below its entry RSP for binding.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+const KEYWORD_BIND_STACK: usize = 4096;
 
 fn mov_rr(a: &mut Asm, dst: u8, src: u8) {
     if dst != src {
@@ -780,6 +785,10 @@ pub struct FramedCode {
     /// Distinct ordinary Lisp ABI entry; never a legacy or managed adapter.
     /// Installation also requires validated runtime admission and ownership.
     pub ordinary_entry: Option<usize>,
+    /// A `&key` ordinary entry's body entry, past binding: the ordinary ABI
+    /// with the bound parameter values as its fixed arguments. Only the
+    /// managed activation, which has bound them itself, enters here.
+    pub ordinary_bound_entry: Option<usize>,
     /// Maximum stack use below ordinary entry RSP, including phi snapshots.
     pub ordinary_stack_required: Option<usize>,
     /// Private same-owner native entry; requires the retained control pointer.
@@ -6315,15 +6324,90 @@ fn emit_framed_inner(
     let ordinary_self_specializations = ordinary.zip(ordinary_call).map_or_else(Vec::new,
         |(options, calls)| ordinary_prefix::specialize(f, options.arity, &single_returns, calls.self_calls));
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let mut ordinary_bound_entry = None;
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+    let ordinary_bound_entry = None;
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     let ordinary_entry = if let Some(options) = ordinary {
         jump_to_shared_body(&mut a, block_label[&entry]); // legacy entry skips new prologue
         let offset = a.here();
         let accepted = a.label();
+        if let Some(OrdinaryArgumentBinding::Keywords(keywords)) = options.binding {
+            // Every count needs binding, even one equal to `arity`. The bind
+            // helper is a noncollecting, nonsignalling C leaf: nothing here
+            // is a safepoint, and callee-saved registers (R13 included) keep
+            // the caller's values across it. 56 bytes keep the call aligned:
+            // [0,24) actual register arguments, [24,48) bound values, [48]
+            // the count. Overflow arguments stay above the return address.
+            if options.arity > 3 {
+                return Err(EmitError::UnsupportedOp(0xFA));
+            }
+            let declined = a.label();
+            alu_r_imm(&mut a, 5, 4, 56); // sub rsp,56
+            for (index, reg) in [7u8, 6, 2].into_iter().enumerate() {
+                store_to_rsp(&mut a, reg, index as i32 * 8);
+            }
+            store_to_rsp(&mut a, 1, 48);
+            mov_imm64(&mut a, 7, keywords.plan as i64);
+            mov_rr(&mut a, 6, 4); // rsi = actual register arguments
+            a.extend_from_slice(&[0x48, 0x8d, 0x54, 0x24, 64]); // lea rdx,[rsp+64]: overflow
+            a.extend_from_slice(&[0x4c, 0x8d, 0x44, 0x24, 24]); // lea r8,[rsp+24]: bound values
+            mov_imm64(&mut a, RAX, keywords.bind as i64);
+            a.extend_from_slice(&[0xff, 0xd0]); // call rax
+            a.extend_from_slice(&[0x48, 0x85, 0xc0]); // test rax,rax
+            a.jcc(Cc::E, declined);
+            for (index, reg) in [7u8, 6, 2].into_iter().enumerate() {
+                load_from_rsp(&mut a, reg, 24 + index as i32 * 8);
+            }
+            alu_r_imm(&mut a, 0, 4, 56); // add rsp,56
+            mov_imm64(&mut a, 1, options.arity as i64);
+            mov_imm64(&mut a, RAX, egcl_rt::value::NIL.0 as i64);
+            a.jmp(accepted);
+            a.bind(declined);
+            for (index, reg) in [7u8, 6, 2].into_iter().enumerate() {
+                load_from_rsp(&mut a, reg, index as i32 * 8);
+            }
+            load_from_rsp(&mut a, 1, 48);
+            alu_r_imm(&mut a, 0, 4, 56); // add rsp,56
+            mov_imm64(&mut a, RAX, egcl_rt::value::NIL.0 as i64);
+            mov_imm64(&mut a, 11, keywords.decline as i64);
+            a.extend_from_slice(&[0x41, 0xFF, 0xE3]); // jmp r11, all incoming values intact
+        } else {
         alu_r_imm(&mut a, 7, 1, options.arity as i32); // cmp rcx, supplied arity
         a.jcc(Cc::E, accepted);
+        if let Some(OrdinaryArgumentBinding::Optional(optional)) = options.binding {
+            // A shorter supplied count binds each omitted trailing parameter
+            // to the unsupplied marker, as the managed entry's bind_params
+            // does. Every accepted argument is a register argument, so no
+            // caller-owned stack slot is ever missing.
+            if optional.min_arity >= options.arity || options.arity > 3 {
+                return Err(EmitError::UnsupportedOp(0xFA));
+            }
+            let rejected = a.label();
+            alu_r_imm(&mut a, 7, 1, optional.min_arity as i32);
+            a.jcc(Cc::L, rejected); // the count is a small nonnegative integer
+            alu_r_imm(&mut a, 7, 1, options.arity as i32);
+            a.jcc(Cc::G, rejected);
+            for (index, reg) in [7u8, 6, 2].into_iter().enumerate()
+                .take(options.arity).skip(optional.min_arity)
+            {
+                let supplied = a.label();
+                alu_r_imm(&mut a, 7, 1, index as i32);
+                a.jcc(Cc::G, supplied); // count > index: argument `index` arrived
+                mov_imm64(&mut a, reg, optional.unsupplied as i64);
+                a.bind(supplied);
+            }
+            // Past this point the entry sees a full-arity call.
+            mov_imm64(&mut a, 1, options.arity as i64);
+            a.jmp(accepted);
+            a.bind(rejected);
+        }
         mov_imm64(&mut a, 11, options.arity_error_veneer as i64);
         a.extend_from_slice(&[0x41, 0xFF, 0xE3]); // jmp r11, all incoming values intact
+        }
         a.bind(accepted);
+        ordinary_bound_entry = matches!(options.binding, Some(OrdinaryArgumentBinding::Keywords(_)))
+            .then(|| a.here());
         a.bind(ordinary_self_entry);
         ordinary_prefix::emit(&mut a, f, options.arity, &single_returns);
         emit_prologue(&mut a);
@@ -7666,8 +7750,9 @@ fn emit_framed_inner(
             call.stack_adjust = call.stack_adjust.checked_add(
                 u32::try_from(alloc).map_err(|_| EmitError::BadBranch)?)
                 .ok_or(EmitError::BadBranch)?;
+            // Ordinary recovery reboxes these raw payload words (bliss-k4psf).
             native_value_maps.insert(call.return_offset, NativeCallValues::Deoptimizing {
-                native_slots: native_spill_slots, f64_slots: Box::new([]),
+                native_slots: native_spill_slots, f64_slots: f64_slots.clone().into_boxed_slice(),
             });
             native_calls.push(call.site(NativeCallOrigin::Deopt(fsid), NativeStackBase::Body));
             // The ordinary helper already returned the complete result tuple.
@@ -8027,7 +8112,11 @@ fn emit_framed_inner(
                 .ok_or(EmitError::BadBranch)?;
             leaf_bound.max(frame_bytes.checked_add(72.max(guard_bytes).max(outgoing_bytes))
                 .ok_or(EmitError::BadBranch)?)
-        } else { leaf_bound })
+        } else { leaf_bound }.max(if ordinary_bound_entry.is_some() {
+            // The keyword entry's 56-byte area, its call's return address and
+            // the bind helper's own Rust frame, which this bounds generously.
+            KEYWORD_BIND_STACK
+        } else { 0 }))
     } else {
         None
     };
@@ -8044,6 +8133,7 @@ fn emit_framed_inner(
     Ok(FramedCode {
         frame_entry: (!ordinary_call_mode).then_some(0),
         ordinary_entry,
+        ordinary_bound_entry,
         ordinary_stack_required,
         native_recursive_entry,
         native_entry_kind_slot: if native_frame_mode { entry_kind_home.and_then(|home| match home { FramedHome::Stack(slot) => Some(slot), _ => None }) } else { None },

@@ -790,7 +790,7 @@ mod retained_guard_chain_tests {
         // These nonzero addresses are emitted only, never executed.
         let emit = |function: &egcl_compiler::t2::ir::Function| {
             emit::emit_framed_ordinary_function_with_poll(function,
-                emit::OrdinaryLispEntryOptions { arity: 2, arity_error_veneer: 1 }, &targets,
+                emit::OrdinaryLispEntryOptions { arity: 2, arity_error_veneer: 1, binding: None }, &targets,
                 emit::OrdinaryCallFlags { gc_requested: 1, sigusr1_pending: 1, posted_signal: 1,
                     native_errors: 1, signal_epoch: 1 }, 1,
                 emit::OrdinaryGuardOptions { veneer: 1, multiple_values: 1 }, 1)
@@ -1518,8 +1518,8 @@ pub(super) unsafe fn resume_ordinary_guard(request: *mut u8) -> Result<EgclVal, 
     if !code._native_calls.get(offset).is_some_and(|site| matches!(site.origin, NativeCallOrigin::Deopt(_))) {
         return Err(invalid_capture());
     }
-    let native_slots = match code._native_calls.value_map(offset) {
-        Some(NativeCallValues::Deoptimizing { native_slots, f64_slots }) if f64_slots.is_empty() => *native_slots,
+    let (native_slots, f64_slots) = match code._native_calls.value_map(offset) {
+        Some(NativeCallValues::Deoptimizing { native_slots, f64_slots }) => (*native_slots, f64_slots),
         _ => return Err(invalid_capture()),
     };
     let read_word = |address: usize| {
@@ -1553,7 +1553,7 @@ pub(super) unsafe fn resume_ordinary_guard(request: *mut u8) -> Result<EgclVal, 
     }
     let count = usize::from(code.native_argument_count);
     let argument_slot = code.native_argument_base.ok_or_else(invalid_capture)?;
-    if count != usize::from(code.body.arity)
+    if count != code.ordinary_parameter_count()
         || argument_slot.checked_add(count as u32).is_none_or(|end| end > native_slots)
     { return Err(invalid_capture()); }
     // An empty argument range may begin exactly at the end of the native
@@ -1569,12 +1569,36 @@ pub(super) unsafe fn resume_ordinary_guard(request: *mut u8) -> Result<EgclVal, 
     let mut adapted = TransferDeoptRequest { n_scopes: request.n_scopes, n_words: request.n_words,
         words: request.words, activation: std::ptr::null_mut() };
     let bcp = unsafe { validate_guard_stream_slots(&adapted, code, code.body.num_slots(), &metadata) }?;
+    // Raw doubles are reboxed in place below; their indexes describe one
+    // logical frame's payload (bliss-k4psf).
+    if !f64_slots.is_empty() && request.n_scopes != 1 {
+        return Err(invalid_capture());
+    }
+    let payload_ranges = || deopt_payload_ranges(unsafe {
+        std::slice::from_raw_parts(request.words, request.n_words as usize)
+    }, request.n_scopes);
     let mut roots = NativeDeoptRoots { payload: request.words.cast_mut().cast(),
-        payload_ranges: deopt_payload_ranges(unsafe {
-            std::slice::from_raw_parts(request.words, request.n_words as usize)
-        }, request.n_scopes)?, arguments, argument_count: count };
+        // Never scan raw F64 words as tagged: the reboxer roots the tagged
+        // words while it allocates, and this owner the arguments.
+        payload_ranges: if f64_slots.is_empty() { payload_ranges()? } else { Vec::new() },
+        arguments, argument_count: count };
     egcl_rt::rooted_ref!(_roots = &mut roots);
-    egcl_rt::rooted!(original_arguments = Some(unsafe { std::slice::from_raw_parts(arguments, count) }.to_vec()));
+    if !f64_slots.is_empty() {
+        // SAFETY: the request is proven inside this live native frame, and its
+        // exact return-PC metadata describes the emitted word representations.
+        unsafe {
+            egcl_compiler::t2::deopt::rebox_f64_payload(
+                std::slice::from_raw_parts_mut(request.words.add(4).cast_mut(), request.n_words as usize - 4),
+                f64_slots,
+                egcl_rt::gc::alloc_double_float,
+            )
+        }.map_err(|_| invalid_capture())?;
+        roots.payload_ranges = payload_ranges()?;
+    }
+    // A `&key` body's native arguments are its bound slots, not the call's
+    // actuals; like its managed frame, it records no original arguments.
+    egcl_rt::rooted!(original_arguments = code.ordinary_bound_entry.is_none()
+        .then(|| unsafe { std::slice::from_raw_parts(arguments, count) }.to_vec()));
     let segment = boundary.segment;
     if segment.is_null() { return Err(invalid_capture()); }
     // Equal code owners can occur in different physical activations. Only the

@@ -298,6 +298,9 @@ pub(super) struct TransferCode {
     frame_entry: Option<usize>,
     pub(super) ordinary_entry: Option<usize>,
     ordinary_stack_required: Option<usize>,
+    /// A `&key` entry's body entry past binding; see `run_activation`.
+    ordinary_bound_entry: Option<usize>,
+    _ordinary_keywords: Option<JitBuffer>,
     _ordinary_arity: Option<JitBuffer>,
     _ordinary_cold: Option<JitBuffer>,
     pub(super) has_deopt: bool,
@@ -807,6 +810,16 @@ impl TransferCode {
             && (self.has_deopt || !self.body.self_call_sites.is_empty())
     }
 
+    /// Arguments the ordinary entry's body receives: a `&key` body's bound
+    /// slots, otherwise its fixed parameters.
+    pub(super) fn ordinary_parameter_count(&self) -> usize {
+        if self.ordinary_bound_entry.is_some() {
+            self.body.param_layout.len()
+        } else {
+            usize::from(self.body.arity)
+        }
+    }
+
     pub(super) fn mapped_entry(&self) -> Option<*const u8> {
         let offset = self.frame_entry.filter(|offset| *offset < self.code_len)?;
         Some(self.code.as_ptr().wrapping_add(offset))
@@ -836,7 +849,13 @@ impl TransferCode {
             kind: ORDINARY_X64_LISP_KIND, version: ORDINARY_X64_LISP_VERSION, revision,
             entry: (self.code.as_ptr() as usize).checked_add(offset)?,
             code_start: self.code.as_ptr() as usize, code_len: self.code_len,
-            arity: usize::from(self.body.arity), environment: ORDINARY_ENV_NONE,
+            // An `&optional` entry checks its own count range.
+            arity: if self.body.min_args < self.body.arity || self.body.variadic {
+                egcl_rt::call_table::ORDINARY_ARITY_ANY
+            } else {
+                usize::from(self.body.arity)
+            },
+            environment: ORDINARY_ENV_NONE,
             owner: self as *const Self as usize, stack_required: self.ordinary_stack_required?,
         })
     }
@@ -1214,8 +1233,9 @@ impl TransferCode {
         } else { None };
         let mut ordinary_arity = None;
         let mut ordinary_cold = None;
+        let mut ordinary_keywords = None;
         let ordinary = ordinary_ir.filter(|ir| !ordinary_admission_suppressed()
-            && fixed_tagged_parameters(&body)
+            && ordinary_entry_parameters(&body)
             && ordinary_native_body(&body)
             && ordinary_single_frame_states(&body, ir))
             .and_then(|ir| {
@@ -1227,10 +1247,35 @@ impl TransferCode {
                 let mut call_cells = call_cells.to_vec();
                 ordinary_primitives::lower(&mut ir, &mut call_cells)?;
                 egcl_compiler::t2::opt_clear_mv::eliminate_redundant(&mut ir, true);
+                use egcl_compiler::t2::emit::OrdinaryArgumentBinding;
+                let keyword_plan = body.variadic.then(|| super::variadic_plan::VariadicPlan::native_keywords(&body)).flatten();
+                let (entry_arity, binding) = if let Some(plan) = keyword_plan {
+                    // The body is a function of its bound slots, entered
+                    // with them as fixed arguments once the entry binds.
+                    ir.set_variadic(false);
+                    let decline = JitBuffer::new(&egcl_compiler::t2::native_transfer::emit_ordinary_entry_veneer(
+                        ordinary_calls::keyword_decline, Arc::as_ptr(&body) as usize))?;
+                    let binding = OrdinaryArgumentBinding::Keywords(egcl_compiler::t2::emit::OrdinaryKeywordArguments {
+                        bind: super::variadic_plan::native_keyword_bind as *const () as u64,
+                        plan: std::ptr::from_ref(plan) as u64,
+                        decline: decline.as_ptr() as u64,
+                    });
+                    ordinary_keywords = Some(decline);
+                    (super::variadic_plan::bound_values(plan), Some(binding))
+                } else if body.min_args < body.arity {
+                    (usize::from(body.arity), Some(OrdinaryArgumentBinding::Optional(
+                        egcl_compiler::t2::emit::OrdinaryOptionalArguments {
+                            min_arity: usize::from(body.min_args),
+                            unsupplied: super::unsupplied_marker().0,
+                        })))
+                } else {
+                    (usize::from(body.arity), None)
+                };
                 let arity = JitBuffer::new(&egcl_compiler::t2::native_transfer::emit_ordinary_arity_veneer(
-                    ordinary_calls::wrong_arity, usize::from(body.arity)))?;
+                    ordinary_calls::wrong_arity,
+                    ordinary_calls::expected_arguments(body.min_args, body.arity)))?;
                 let options = OrdinaryLispEntryOptions {
-                    arity: usize::from(body.arity), arity_error_veneer: arity.as_ptr() as u64,
+                    arity: entry_arity, arity_error_veneer: arity.as_ptr() as u64, binding,
                 };
                 let emitted = egcl_compiler::t2::emit::emit_framed_ordinary_leaf(&ir, options).ok()
                     .or_else(|| {
@@ -1248,7 +1293,7 @@ impl TransferCode {
                         let call_flags = OrdinaryCallFlags { gc_requested: flags.gc_requested,
                             sigusr1_pending: flags.sigusr1_pending, posted_signal: flags.posted_signal,
                             native_errors: flags.native_errors, signal_epoch: flags.signal_epoch };
-                        let self_calls = if matches!(tier, CompilationTier::T2) {
+                        let self_calls = if matches!(tier, CompilationTier::T2) && !body.variadic {
                             super::super::resolve_sym(&body.name)
                                 .map(|symbol| ordinary_t2::proven_self_calls(&ir, &body, symbol.as_symbol_index()))
                                 .unwrap_or_default()
@@ -1482,6 +1527,8 @@ impl TransferCode {
             frame_entry: emitted.frame_entry,
             ordinary_entry: emitted.ordinary_entry,
             ordinary_stack_required: emitted.ordinary_stack_required,
+            ordinary_bound_entry: emitted.ordinary_bound_entry,
+            _ordinary_keywords: ordinary_keywords,
             _ordinary_arity: ordinary_arity,
             _ordinary_cold: ordinary_cold,
             _native_calls: Arc::new(emitted.native_calls.ok_or(EmitDecline::NativeCallSites)?),
@@ -1746,7 +1793,20 @@ impl TransferCode {
         let _ordinary_root = if self.needs_callable_identity() {
             Some(_ordinary_segment.retain_root(self, roots.function).ok_or_else(invalid_capture)?)
         } else { None };
-        let outcome = if let Some(offset) = self.ordinary_entry {
+        // A `&key` body was bound into its frame above; enter past binding
+        // with those slots as the fixed arguments. The frame stays scanned.
+        let bound_args;
+        let (ordinary_offset, args) = match self.ordinary_bound_entry {
+            Some(offset) => {
+                // Every bound slot, including for a leaf body, which keeps no
+                // native argument homes.
+                let count = self.ordinary_parameter_count();
+                bound_args = unsafe { std::slice::from_raw_parts(frame.add(1).cast::<EgclVal>(), count) };
+                (Some(offset), bound_args)
+            }
+            None => (self.ordinary_entry, args),
+        };
+        let outcome = if let Some(offset) = ordinary_offset {
             assert!(osr_offset.is_none(), "ordinary entry is not an OSR destination");
             let control = unsafe { native_frames::initialize() };
             let execution = unsafe { &*(*control).execution };
@@ -2098,6 +2158,16 @@ impl TransferCode {
 
 fn invalid_capture() -> EgclError {
     EgclError::Internal("invalid native transfer capture".into())
+}
+
+/// Parameters the ordinary entry binds itself: fixed ones, or up to three
+/// positional parameters of which the trailing ones are `&optional`. The
+/// entry pads an omitted one with the unsupplied marker (bliss-6m6ca).
+fn ordinary_entry_parameters(body: &BytecodeFunction) -> bool {
+    fixed_tagged_parameters(body)
+        || (positional_tagged_parameters(body) && body.min_args < body.arity && body.arity <= 3)
+        || (body.variadic && !body.has_env && body.param_types.iter().all(|ty| ty.is_any())
+            && super::variadic_plan::VariadicPlan::native_keywords(body).is_some())
 }
 
 pub(super) fn fixed_tagged_parameters(body: &BytecodeFunction) -> bool {

@@ -43,8 +43,8 @@ fn a_mapped_caller_funcalls_an_installed_t2_object_through_its_fast_target() {
     let mut env = Env::new(false);
     egcl_rt::rooted_ref!(_env = &mut env);
     super::super::super::read_eval_all_env(
-        "(defun fc-inner (a b) (+ a b)) (defun fc-kw (f a &key (b 1)) (funcall f a b)) \
-         (defun fc-one (f a &key (b 1)) (funcall f a))",
+        "(defun fc-inner (a b) (+ a b)) (defun fc-kw (f a &key (b (1+ 0))) (funcall f a b)) \
+         (defun fc-one (f a &key (b (1+ 0))) (funcall f a))",
         &mut env,
     )
     .unwrap();
@@ -58,13 +58,13 @@ fn a_mapped_caller_funcalls_an_installed_t2_object_through_its_fast_target() {
         "the callee has a lean root entry"
     );
     let (outer, outer_code) =
-        super::ordinary_t2::install("FC-KW", "(f a &key (b 1))", "((funcall f a b))", &mut env);
+        super::ordinary_t2::install("FC-KW", "(f a &key (b (1+ 0)))", "((funcall f a b))", &mut env);
     let NativeCodeStorage::Mapped(mapped) = &outer_code._storage else {
         panic!("the caller needs mapped T2 code")
     };
     assert!(
         mapped.ordinary_entry.is_none(),
-        "a &key body keeps the mapped ABI"
+        "a &key body with an evaluated default keeps the mapped ABI"
     );
     let calls = 100;
     let result = run_caller(
@@ -79,7 +79,7 @@ fn a_mapped_caller_funcalls_an_installed_t2_object_through_its_fast_target() {
     // One argument short: the fast target declines and the general route
     // signals the standard argument-count error.
     let (one, _) =
-        super::ordinary_t2::install("FC-ONE", "(f a &key (b 1))", "((funcall f a))", &mut env);
+        super::ordinary_t2::install("FC-ONE", "(f a &key (b (1+ 0)))", "((funcall f a))", &mut env);
     funcall_fast::take_fast_calls_for_test();
     let error = run_caller("FC-ARITY-CALLER", "((fc-one #'fc-inner n))", 1, &mut env);
     let (declined, _) = funcall_fast::take_fast_calls_for_test();
@@ -113,14 +113,14 @@ fn apply_runs_the_fast_target_and_sees_a_redefinition() {
     egcl_rt::rooted_ref!(_env = &mut env);
     super::super::super::read_eval_all_env(
         "(defun fa-inner (a b) (+ a b)) \
-         (defun fa-kw (a &key (b 1)) (apply (symbol-function 'fa-inner) a b nil))",
+         (defun fa-kw (a &key (b (1+ 0))) (apply (symbol-function 'fa-inner) a b nil))",
         &mut env,
     )
     .unwrap();
     let (inner, _) = super::ordinary_t2::install("FA-INNER", "(a b)", "((+ a b))", &mut env);
     let (outer, _) = super::ordinary_t2::install(
         "FA-KW",
-        "(a &key (b 1))",
+        "(a &key (b (1+ 0)))",
         "((apply (symbol-function 'fa-inner) a b nil))",
         &mut env,
     );
@@ -158,13 +158,13 @@ fn a_collection_retires_fast_targets() {
     let mut env = Env::new(false);
     egcl_rt::rooted_ref!(_env = &mut env);
     super::super::super::read_eval_all_env(
-        "(defun fg-inner (a b) (+ a b)) (defun fg-kw (f a &key (b 1)) (funcall f a b))",
+        "(defun fg-inner (a b) (+ a b)) (defun fg-kw (f a &key (b (1+ 0))) (funcall f a b))",
         &mut env,
     )
     .unwrap();
     let (inner, _) = super::ordinary_t2::install("FG-INNER", "(a b)", "((+ a b))", &mut env);
     let (outer, _) =
-        super::ordinary_t2::install("FG-KW", "(f a &key (b 1))", "((funcall f a b))", &mut env);
+        super::ordinary_t2::install("FG-KW", "(f a &key (b (1+ 0)))", "((funcall f a b))", &mut env);
     let first = run_caller("FG-CALLER", "((fg-kw #'fg-inner n :b 2))", 5, &mut env).unwrap();
     let function = egcl_rt::symbols::symbol_function(inner).unwrap();
     let cached = funcall_fast::is_cached_for_test(function);

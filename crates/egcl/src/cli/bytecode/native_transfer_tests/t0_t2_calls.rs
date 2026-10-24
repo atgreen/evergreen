@@ -148,7 +148,7 @@ fn a_mapped_caller_enters_an_ordinary_t2_callee_through_its_lean_root() {
     let mut env = Env::new(false);
     egcl_rt::rooted_ref!(_env = &mut env);
     super::super::super::read_eval_all_env(
-        "(defun t0-t2-inner (a b) (+ a b)) (defun t0-t2-kw (a &key (b 1)) (t0-t2-inner a b))",
+        "(defun t0-t2-inner (a b) (+ a b)) (defun t0-t2-kw (a &key (b (1+ 0))) (t0-t2-inner a b))",
         &mut env,
     ).unwrap();
     let (inner, inner_code) = super::ordinary_t2::install("T0-T2-INNER", "(a b)", "((+ a b))", &mut env);
@@ -157,11 +157,11 @@ fn a_mapped_caller_enters_an_ordinary_t2_callee_through_its_lean_root() {
     };
     assert!(mapped.lean_root_entry().is_some(), "the callee has a lean root entry");
     let (outer, outer_code) = super::ordinary_t2::install(
-        "T0-T2-KW", "(a &key (b 1))", "((t0-t2-inner a b))", &mut env);
+        "T0-T2-KW", "(a &key (b (1+ 0)))", "((t0-t2-inner a b))", &mut env);
     let NativeCodeStorage::Mapped(mapped) = &outer_code._storage else {
         panic!("the caller needs mapped T2 code")
     };
-    assert!(mapped.ordinary_entry.is_none(), "a &key body keeps the mapped ABI");
+    assert!(mapped.ordinary_entry.is_none(), "a &key body with an evaluated default keeps the mapped ABI");
     let calls = 100;
     super::super::native_transfer_entry::take_nested_entries();
     super::super::native_transfer_entry::take_lean_target_calls_for_test();
@@ -204,16 +204,16 @@ fn t2_elt_reads_simple_strings_inline_and_calls_elt_for_anything_else() {
     let mut env = Env::new(false);
     egcl_rt::rooted_ref!(_env = &mut env);
     super::super::super::read_eval_all_env(
-        "(defun t0-t2-str-elt (s i) (elt s i)) (defun t0-t2-kw-elt (s &key (start 0)) (elt s start))",
+        "(defun t0-t2-str-elt (s i) (elt s i)) (defun t0-t2-kw-elt (s &key (start (1- 1))) (elt s start))",
         &mut env,
     ).unwrap();
     let (leaf, _) = super::ordinary_t2::install("T0-T2-STR-ELT", "(s i)", "((elt s i))", &mut env);
     let (keyed, keyed_code) = super::ordinary_t2::install(
-        "T0-T2-KW-ELT", "(s &key (start 0))", "((elt s start))", &mut env);
+        "T0-T2-KW-ELT", "(s &key (start (1- 1)))", "((elt s start))", &mut env);
     let NativeCodeStorage::Mapped(mapped) = &keyed_code._storage else {
         panic!("the &key probe needs mapped T2 code")
     };
-    assert!(mapped.ordinary_entry.is_none(), "a &key body keeps the mapped ABI");
+    assert!(mapped.ordinary_entry.is_none(), "a &key body with an evaluated default keeps the mapped ABI");
     let calls = 200;
     let sum = |text: &str| -> i64 {
         (0..calls).map(|i| text.chars().nth((i % 5) as usize).unwrap() as i64).sum()

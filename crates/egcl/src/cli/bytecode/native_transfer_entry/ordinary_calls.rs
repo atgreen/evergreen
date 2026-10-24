@@ -256,6 +256,62 @@ pub(in crate::cli::bytecode) unsafe extern "C" fn named_entry(
     }
 }
 
+/// Complete a call whose ordinary `&key` entry could not bind its arguments
+/// natively: a keyword it has not matched before, `:allow-other-keys`, or an
+/// argument error. The entry data is the body the code retains. The call
+/// runs through the general binder, which signals any error exactly as
+/// before and teaches the entry's binder the keywords used. The installed
+/// definition of this body enters its compiled code through the managed
+/// activation, which binds before entering; any other callable runs this
+/// exact body interpreted.
+pub(super) unsafe extern "C" fn keyword_decline(
+    request: *mut u8,
+    out: *mut OrdinaryHelperOutcome,
+    image: *mut SysvTransferCapture,
+) {
+    let request = request.cast::<OrdinaryArityRequest>();
+    unsafe {
+        with_entry_roots(request, || {
+            root_publication::published(image, || {
+                let execution = egcl_rt::thread::current_execution_context_for_native()
+                    .expect("ordinary keyword entry owns an execution");
+                let control = (*execution).active_native_control() as *mut NativeRecursiveControl;
+                let result = guard_c2i(|| {
+                    if native_error_pending() { return Ok(NIL); }
+                    // The retained code owns this body for as long as its
+                    // entry can be called.
+                    let body = (*request).entry_data as *const BytecodeFunction;
+                    Arc::increment_strong_count(body);
+                    let body = Arc::from_raw(body);
+                    let count = (*request).nargs;
+                    let registers = &(&(*request).register_args)[..count.min(3)];
+                    let overflow = if count > 3 {
+                        std::slice::from_raw_parts((*request).overflow_args, count - 3)
+                    } else {
+                        &[]
+                    };
+                    egcl_rt::rooted!(args = EntryArgs::from_parts(registers, overflow));
+                    let mut poll = NativeOutcome { value: NIL, exit: NativeExit::Returned };
+                    poll_or_transfer_unpublished(std::ptr::null_mut(), &mut poll);
+                    if poll.exit != NativeExit::Returned { return Ok(NIL); }
+                    let env = NATIVE_ENV.with(Cell::get);
+                    if env.is_null() { return Err(invalid_capture()); }
+                    let symbol = super::super::resolve_sym(&body.name)
+                        .map(EgclVal::as_symbol_index).ok_or_else(invalid_capture)?;
+                    egcl_rt::rooted!(function = egcl_rt::symbols::symbol_function(symbol).unwrap_or(NIL));
+                    if callable_definition_matches(symbol, *function, Arc::as_ptr(&body)) {
+                        super::super::super::apply_function_impl(*function, args.as_slice(), &mut *env)
+                    } else {
+                        super::super::run_with_sym(body, args.as_slice(), NIL, symbol, &mut *env)
+                    }
+                });
+                refresh_control(control);
+                finish(result, out);
+            });
+        });
+    }
+}
+
 /// Finish a precise guard continuation through the ordinary tuple protocol.
 pub(super) unsafe extern "C" fn guard(
     request: *mut u8,
@@ -270,6 +326,20 @@ pub(super) unsafe extern "C" fn guard(
             }
             finish(result, out);
         });
+    }
+}
+
+/// The arity veneer's entry data for an entry accepting `min..=max`
+/// arguments: the count itself for a fixed entry, as before.
+pub(super) fn expected_arguments(min: u16, max: u16) -> usize {
+    if min == max { usize::from(max) } else { (usize::from(min) + 1) << 32 | usize::from(max) }
+}
+
+fn expected_range(data: usize) -> (usize, usize) {
+    let max = data & 0xffff_ffff;
+    match data >> 32 {
+        0 => (max, max),
+        min => (min - 1, max),
     }
 }
 
@@ -305,11 +375,12 @@ pub(super) unsafe extern "C" fn wrong_arity(
                             count - 3,
                         ));
                     }
-                    Err(EgclError::ProgramError(format!(
-                        "wrong number of arguments: expected {}, got {}",
-                        (*request).entry_data,
-                        args.len()
-                    )))
+                    let (min, max) = expected_range((*request).entry_data);
+                    Err(EgclError::ProgramError(if min == max {
+                        format!("wrong number of arguments: expected {max}, got {}", args.len())
+                    } else {
+                        format!("wrong number of arguments: expected {min} to {max}, got {}", args.len())
+                    }))
                 });
                 finish(result, out);
             });
@@ -440,7 +511,7 @@ mod tests {
             &ir,
             egcl_compiler::t2::emit::OrdinaryLispEntryOptions {
                 arity: 1,
-                arity_error_veneer: code.as_ptr() as u64,
+                arity_error_veneer: code.as_ptr() as u64, binding: None,
             },
         )
         .unwrap();
@@ -592,7 +663,7 @@ mod tests {
             &ir,
             egcl_compiler::t2::emit::OrdinaryLispEntryOptions {
                 arity: 1,
-                arity_error_veneer: code.as_ptr() as u64,
+                arity_error_veneer: code.as_ptr() as u64, binding: None,
             },
         )
         .unwrap();

@@ -198,8 +198,11 @@ fn double_float_loops_and_recursion_run_raw_at_t2() {
     );
     for name in ["LOOP-DOUBLE-LITERAL", "LOOP-DOUBLE-ARG", "LOOP-DOUBLE-DECLARED", "DFIB"] {
         assert!(stderr.contains(&format!("{name}: raw double candidate: speculated")), "{name}\n{stderr}");
+        // Either ABI holds raw values: a raw body now usually gets the
+        // ordinary x86-64 Lisp entry (bliss-k4psf).
         let raw_emitted = stderr.lines().any(|line| {
-            line.starts_with(&format!("[T2] {name}: mapped T2 emitted"))
+            (line.starts_with(&format!("[T2] {name}: mapped T2 emitted"))
+                || line.starts_with(&format!("[T2] {name}: ordinary x86-64 Lisp T2 emitted")))
                 && !line.ends_with("raw_f64_values=0")
         });
         assert!(raw_emitted, "{name} must install raw f64 code\n{stderr}");

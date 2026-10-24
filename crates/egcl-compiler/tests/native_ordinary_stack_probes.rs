@@ -84,7 +84,7 @@ fn large_ordinary_frames_and_outgoing_areas_touch_each_stack_page() {
         &f,
         OrdinaryLispEntryOptions {
             arity: 1,
-            arity_error_veneer: 1,
+            arity_error_veneer: 1, binding: None,
         },
         &[(
             site,
