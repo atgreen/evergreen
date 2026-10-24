@@ -132,7 +132,7 @@
   nearest double, as before. `+`, `-` and `*` of three or more double-floats
   now also compute on unboxed doubles. GH #594's `step-plain` driver, which
   does both, drops from about 2.4 µs to 0.14 µs per call
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#627](https://github.com/atgreen/evergreen/pull/627)).
 - On x86-64 Linux, optimized code computes `sqrt`, unary `-` and `/` of
   double-floats natively on unboxed doubles instead of calling the builtin.
   The answers are unchanged: `sqrt` of a negative double still returns a
@@ -142,7 +142,7 @@
   from 3.7 s to 0.085 s, and one negating its sum from 4.2 s to 0.09 s.
   GH #594's `step-sqrt` driver drops from about 0.49 µs to 0.16 µs per call
   (2.7 µs before the previous change)
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#627](https://github.com/atgreen/evergreen/pull/627)).
 - More than 50 builtins called from compiled code no longer rebuild and
   re-evaluate their call form each time. They include `evenp`, `oddp`, `/`,
   `member` and `assoc` with `:test` or `:key`, `mapcar`, `map`, `format`,
