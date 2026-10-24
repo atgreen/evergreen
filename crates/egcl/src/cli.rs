@@ -12579,6 +12579,21 @@ fn symbol_package_value(env: &Env, sym: EgclVal) -> EgclVal {
             }
         }
     }
+    // The home package cell, when the symbol is still present there: what the
+    // name-based lookup below works out. For a COMMON-LISP symbol, whose
+    // registry key carries no package prefix, that lookup probes every
+    // package in the image, which made each SYMBOL-PACKAGE cost ~27us
+    // (bliss-a2bso).
+    if sym != NIL
+        && sym != T
+        && let Some(home) = sym
+            .symbol_index()
+            .and_then(egcl_rt::symbols::symbol_package)
+        && egcl_stdlib::is_package(home)
+        && egcl_stdlib::find_present_symbol(home, &symbol_name_of(sym)) == Some(sym)
+    {
+        return home;
+    }
     let pkg = symbol_home_package_name(sym);
     package_object(&resolve_package_name(env, &pkg))
 }
@@ -15509,6 +15524,13 @@ fn symbol_name_of(sym: EgclVal) -> String {
 }
 
 fn package_status_symbol(status: &str) -> EgclVal {
+    // The keyword already exists in the common case; look it up by its
+    // registry key before paying for the general token resolution.
+    if let Some(idx) =
+        reader::find_symbol_index(&egcl_rt::symbols::keyword_registry_key(status))
+    {
+        return EgclVal::from_symbol_index(idx);
+    }
     resolve_sym(&format!(":{}", status)).unwrap_or(NIL)
 }
 
@@ -20767,6 +20789,301 @@ fn find_package_value(env: &Env, designator: EgclVal) -> EgclVal {
     } else {
         NIL
     }
+}
+
+/// `PACKAGE-NAME` of an evaluated designator, shared by operator position and
+/// compiled calls (bliss-a2bso).
+fn package_name_value(env: &Env, v: EgclVal) -> Result<EgclVal, EgclError> {
+    // A package OBJECT: its registry name, or NIL if it has been
+    // DELETE-PACKAGEd (no longer registered — CLHS).
+    if egcl_rt::types::packagep(v) {
+        return Ok(egcl_stdlib::package_name(v)
+            .map(|n| arena_str(&n))
+            .unwrap_or(NIL));
+    }
+    // A non-designator (e.g. an integer) is a TYPE-ERROR (CLHS).
+    if !is_package_designator(v) {
+        return Err(package_designator_type_error(v));
+    }
+    // A string/char/symbol designator must name a live package;
+    // otherwise PACKAGE-NAME signals a PACKAGE-ERROR (CLHS).
+    let raw = string_designator_name(v);
+    let pkg_name = resolve_package_name(env, &raw);
+    if egcl_stdlib::find_package(&pkg_name).is_some()
+        || matches!(
+            pkg_name.as_str(),
+            "COMMON-LISP" | "COMMON-LISP-USER" | "KEYWORD"
+        )
+    {
+        return Ok(arena_str(&pkg_name));
+    }
+    Err(EgclError::PackageError(format!(
+        "there is no package named {pkg_name}"
+    )))
+}
+
+/// `PACKAGE-USE-LIST` of an evaluated designator, shared by operator position
+/// and compiled calls (bliss-a2bso). A live package object is used as is
+/// instead of being looked up again by its name.
+fn package_use_list_value(v: EgclVal) -> Result<EgclVal, EgclError> {
+    if !is_package_designator(v) {
+        return Err(package_designator_type_error(v));
+    }
+    let pkg = if egcl_stdlib::is_package(v) {
+        v
+    } else {
+        let pkg_name = normalize_package_name(&string_designator_name(v));
+        // A missing package is a PACKAGE-ERROR, not an empty use-list
+        // (#375).
+        package_or_package_error(&pkg_name, "PACKAGE-USE-LIST")?
+    };
+    Ok(vec_to_list(&egcl_stdlib::package_use_list(pkg)))
+}
+
+/// `PACKAGE-SHADOWING-SYMBOLS` of an evaluated designator (bliss-a2bso).
+fn package_shadowing_symbols_value(env: &Env, v: EgclVal) -> Result<EgclVal, EgclError> {
+    if !is_package_designator(v) {
+        return Err(package_designator_type_error(v));
+    }
+    let pkg = if egcl_stdlib::is_package(v) {
+        Some(v)
+    } else {
+        let raw = normalize_package_name(&string_designator_name(v));
+        egcl_stdlib::find_package(&resolve_package_name(env, &raw))
+    };
+    // Symbols are pinned, so the list may be built from them directly.
+    Ok(pkg.map_or(NIL, |pkg| {
+        vec_to_list(&egcl_stdlib::package_shadowing_symbols(pkg))
+    }))
+}
+
+/// `PACKAGE-USED-BY-LIST` of an evaluated designator: the packages that :USE
+/// it. Was stubbed to NIL, which broke UIOP's ensure-package reconciliation:
+/// ensure-exported walks (package-used-by-list from-package) to propagate an
+/// export into inheriting packages, so a NIL result left inheritors in an
+/// inconsistent state that ASDF then re-processed (bliss-nad).
+fn package_used_by_list_value(env: &Env, v: EgclVal) -> Result<EgclVal, EgclError> {
+    if !is_package_designator(v) {
+        return Err(package_designator_type_error(v));
+    }
+    let target_pkg = if egcl_stdlib::is_package(v) {
+        v
+    } else {
+        let raw = normalize_package_name(&string_designator_name(v));
+        let target = resolve_package_name(env, &raw);
+        match egcl_stdlib::find_package(&target) {
+            Some(p) => p,
+            None => return Ok(NIL),
+        }
+    };
+    Ok(vec_to_list(&egcl_stdlib::package_used_by_list(target_pkg)))
+}
+
+/// `FIND-SYMBOL` on evaluated arguments, shared by its evaluated entry and the
+/// two-argument fast arm. Case-SENSITIVE, verbatim name (CLHS; bliss-961p).
+///
+/// A live package object is looked in directly. It used to be printed to its
+/// name, resolved and found again by name -- three registry lookups -- before
+/// the symbol lookup itself (bliss-a2bso).
+fn find_symbol_values(
+    env: &mut Env,
+    name: EgclVal,
+    package: Option<EgclVal>,
+) -> Result<EgclVal, EgclError> {
+    let name = val_as_str(name);
+    let pkg = match package {
+        Some(designator) if egcl_stdlib::is_package(designator) => designator,
+        Some(designator) => {
+            let pkg_name = resolve_package_name(env, &string_designator_name(designator));
+            // A designator naming no package is a PACKAGE-ERROR, not "no such
+            // symbol": FIND-SYMBOL answered NIL for a package that did not
+            // exist, which is indistinguishable from the name simply being
+            // absent, so a typo read as a successful lookup (#375).
+            package_or_package_error(&pkg_name, "FIND-SYMBOL")?
+        }
+        None => package_or_package_error(&effective_package_name(env), "FIND-SYMBOL")?,
+    };
+    // KEYWORD's symbols live in the symbol registry rather than in its tables,
+    // which the general lookup knows. Every other package answers from its own
+    // tables and the external tables of its use-list, as that lookup does.
+    let found = if egcl_stdlib::package_name_eq(pkg, "KEYWORD") {
+        find_symbol_in_package_cased(env, "KEYWORD", &name, true)
+    } else {
+        egcl_stdlib::find_symbol(&name, pkg)?.map(|(sym, status)| {
+            let status = match status {
+                egcl_stdlib::InternStatus::Internal => "INTERNAL",
+                egcl_stdlib::InternStatus::External => "EXTERNAL",
+                egcl_stdlib::InternStatus::Inherited | egcl_stdlib::InternStatus::New => {
+                    "INHERITED"
+                }
+            };
+            (sym, status)
+        })
+    };
+    if let Some((sym, status)) = found {
+        env.set_mv(vec![sym, package_status_symbol(status)]);
+        return Ok(sym);
+    }
+    env.set_mv(vec![NIL, NIL]);
+    Ok(NIL)
+}
+
+/// `EXPORT`, `IMPORT` and `SHADOWING-IMPORT` on evaluated arguments, shared by
+/// operator position and compiled calls, which used to synthesize and
+/// re-evaluate a form for every call (bliss-a2bso).
+fn export_import_values(
+    operator: &str,
+    args: &[EgclVal],
+    env: &mut Env,
+) -> Result<EgclVal, EgclError> {
+    if args.is_empty() {
+        return Ok(T);
+    }
+    let symbols = args[0];
+    let pkg_name = if args.len() > 1 {
+        normalize_package_name(&string_designator_name(args[1]))
+    } else {
+        effective_package_name(env)
+    };
+    // The package must already exist: these are public package
+    // functions, not DEFPACKAGE (#375).
+    package_or_package_error(&pkg_name, operator)?;
+    // A string designator in the list moves if interning an earlier one
+    // collects, so the list's elements stay rooted while it is walked.
+    egcl_rt::rooted!(
+        sym_vals = if symbols.is_cons() {
+            list_to_vec(symbols)
+        } else if symbols.is_nil() {
+            Vec::new()
+        } else {
+            vec![symbols]
+        }
+    );
+    let export_mode = operator == "EXPORT";
+    let shadowing_mode = operator == "SHADOWING-IMPORT";
+    // Preserve the identity of the PASSED symbol: importing or
+    // (re-)exporting a symbol must make THAT symbol present in the
+    // package, not fork a fresh same-named one — otherwise a
+    // downstream package that inherits it sees a conflict with the
+    // imported one (bliss-lb6). Only a non-symbol designator (a bare
+    // string name) falls back to interning by name. Symbols are pinned, so
+    // the resolved ones need no rooting.
+    let mut resolved = Vec::with_capacity(sym_vals.len());
+    for i in 0..sym_vals.len() {
+        let sv = sym_vals[i];
+        let name = if sv.is_symbol() {
+            symbol_name_of(sv)
+        } else {
+            symbol_bare_name(&val_as_str(sv))
+        };
+        let sym = if sv.is_symbol() {
+            sv
+        } else {
+            intern_into_package(env, &pkg_name, &name)
+        };
+        resolved.push((name, sym));
+    }
+    // EXPORT requires every symbol to be ACCESSIBLE in the package
+    // (present or inherited); exporting an inaccessible symbol is a
+    // PACKAGE-ERROR (CLHS EXPORT; ansi-test EXPORT.4). IMPORT /
+    // SHADOWING-IMPORT legitimately make new symbols present, so they
+    // are exempt.
+    if export_mode {
+        let pkg = egcl_stdlib::find_package(&pkg_name);
+        // The packages that USE this one, found once for the whole call
+        // rather than once per symbol by walking every package.
+        let users = pkg.map(egcl_stdlib::package_used_by_list).unwrap_or_default();
+        for (name, sym) in &resolved {
+            let accessible = matches!(
+                find_symbol_in_package_cased(env, &pkg_name, name, true),
+                Some((found, _)) if found == *sym
+            );
+            if !accessible {
+                return Err(EgclError::PackageError(format!(
+                    "symbol {name} is not accessible in package {pkg_name}"
+                )));
+            }
+            // Re-exporting an external symbol changes nothing, so it cannot
+            // create a conflict: DEFINE-PACKAGE re-exports every export each
+            // time a package is redefined.
+            if pkg.is_some_and(|pkg| egcl_stdlib::is_external_symbol(pkg, name)) {
+                continue;
+            }
+            // Name-conflict check (CLHS EXPORT; ansi EXPORT.5): a
+            // package USING this one must not already see a
+            // DISTINCT same-named symbol (present or inherited),
+            // unless it shadows the name.
+            for &other in &users {
+                if Some(other) == pkg {
+                    continue;
+                }
+                let shadowed = egcl_stdlib::package_shadowing_symbols(other)
+                    .iter()
+                    .any(|s| symbol_name_of(*s) == *name);
+                if shadowed {
+                    continue;
+                }
+                let other_name = egcl_stdlib::package_name(other).unwrap_or_default();
+                if let Some((existing, _)) =
+                    find_symbol_in_package_cased(env, &other_name, name, true)
+                {
+                    if existing != *sym {
+                        return Err(EgclError::PackageError(format!(
+                            "exporting {name} from {pkg_name} conflicts with \
+                             a distinct {name} visible in {other_name}"
+                        )));
+                    }
+                }
+            }
+        }
+    }
+    // Make each symbol present in the package (EXPORT → external, so
+    // used packages inherit it; IMPORT/SHADOWING-IMPORT → internal).
+    // SHADOWING-IMPORT additionally records each name as a shadowing
+    // symbol and displaces any conflicting present symbol, so
+    // PACKAGE-SHADOWING-SYMBOLS reports it.
+    if let Some(pkg) = egcl_stdlib::find_package(&pkg_name) {
+        if shadowing_mode {
+            let syms: Vec<EgclVal> = resolved.iter().map(|(_, s)| *s).collect();
+            egcl_stdlib::shadowing_import(&syms, pkg)?;
+        } else {
+            // Name-conflict check (CLHS IMPORT; ansi
+            // IMPORT.ERROR.3): importing a symbol DISTINCT from a
+            // same-named symbol already PRESENT in the package is
+            // a PACKAGE-ERROR (SHADOWING-IMPORT is the resolving
+            // variant and takes the branch above).
+            if !export_mode {
+                for (name, sym) in &resolved {
+                    if let Some(existing) = egcl_stdlib::find_present_symbol(pkg, name) {
+                        if existing != *sym {
+                            return Err(EgclError::PackageError(format!(
+                                "importing {name} into {pkg_name} conflicts with \
+                                 a distinct present {name}"
+                            )));
+                        }
+                    }
+                }
+            }
+            for (name, sym) in resolved {
+                let _ = egcl_stdlib::add_symbol(pkg, &name, sym, export_mode);
+                // IMPORT of an UNINTERNED symbol also sets its home
+                // package (CLHS IMPORT; ansi IMPORT.5): the symbol
+                // becomes owned by the importing package, so
+                // SYMBOL-PACKAGE reports it.
+                if !export_mode {
+                    if let Some(idx) = sym.symbol_index() {
+                        if egcl_rt::symbols::symbol_package(idx).is_none_or(|p| p.is_nil()) {
+                            egcl_rt::symbols::set_symbol_package(
+                                idx,
+                                egcl_rt::packages::find_or_create(&pkg_name),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(T)
 }
 
 /// `GENSYM` of an optional evaluated argument, shared by operator position and
@@ -28539,39 +28856,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     NIL
                 });
             }
-            "PACKAGE-NAME" => {
-                let args = list_to_vec(cdr);
-                if args.is_empty() {
-                    return Ok(NIL);
-                }
-                let v = eval_form(args[0], env)?;
-                // A package OBJECT: its registry name, or NIL if it has been
-                // DELETE-PACKAGEd (no longer registered — CLHS).
-                if egcl_rt::types::packagep(v) {
-                    return Ok(egcl_stdlib::package_name(v)
-                        .map(|n| arena_str(&n))
-                        .unwrap_or(NIL));
-                }
-                // A non-designator (e.g. an integer) is a TYPE-ERROR (CLHS).
-                if !is_package_designator(v) {
-                    return Err(package_designator_type_error(v));
-                }
-                // A string/char/symbol designator must name a live package;
-                // otherwise PACKAGE-NAME signals a PACKAGE-ERROR (CLHS).
-                let raw = string_designator_name(v);
-                let pkg_name = resolve_package_name(env, &raw);
-                if egcl_stdlib::find_package(&pkg_name).is_some()
-                    || matches!(
-                        pkg_name.as_str(),
-                        "COMMON-LISP" | "COMMON-LISP-USER" | "KEYWORD"
-                    )
-                {
-                    return Ok(arena_str(&pkg_name));
-                }
-                return Err(EgclError::PackageError(format!(
-                    "there is no package named {pkg_name}"
-                )));
-            }
+            "PACKAGE-NAME" => return eval_builtin_arguments(&name, cdr, env),
             "PACKAGE-NAMES" => {
                 let args = list_to_vec(cdr);
                 if args.is_empty() {
@@ -28610,72 +28895,8 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     .collect();
                 return Ok(vec_to_list(&nicks));
             }
-            "PACKAGE-SHADOWING-SYMBOLS" => {
-                let args = list_to_vec(cdr);
-                if args.is_empty() {
-                    return Ok(NIL);
-                }
-                let v = eval_form(args[0], env)?;
-                if !is_package_designator(v) {
-                    return Err(package_designator_type_error(v));
-                }
-                let raw = normalize_package_name(&string_designator_name(v));
-                let name = resolve_package_name(env, &raw);
-                let syms = match egcl_stdlib::find_package(&name) {
-                    Some(pkg) => egcl_stdlib::package_shadowing_symbols(pkg),
-                    None => return Ok(NIL),
-                };
-                return Ok(vec_to_list(&syms));
-            }
-            "PACKAGE-USED-BY-LIST" => {
-                // The packages that :USE the given package. Was stubbed to NIL,
-                // which broke UIOP's ensure-package reconciliation: ensure-exported
-                // walks (package-used-by-list from-package) to propagate an export
-                // into inheriting packages, so a NIL result left inheritors in an
-                // inconsistent state that ASDF then re-processed (bliss-nad).
-                let args = list_to_vec(cdr);
-                if args.is_empty() {
-                    return Ok(NIL);
-                }
-                let v = eval_form(args[0], env)?;
-                if !is_package_designator(v) {
-                    return Err(package_designator_type_error(v));
-                }
-                let raw = normalize_package_name(&string_designator_name(v));
-                let target = resolve_package_name(env, &raw);
-                // Resolve the target to its canonical handle once, then match
-                // use-list entries by identity — comparing package *handles* is
-                // far cheaper than resolving and string-comparing each entry's
-                // name (this runs O(all-packages) per call, and ASDF calls it
-                // once per exported symbol during reconciliation).
-                let target_pkg = match egcl_stdlib::find_package(&target) {
-                    Some(p) => p,
-                    None => return Ok(NIL),
-                };
-                let mut result = Vec::new();
-                for p in egcl_stdlib::list_all_packages() {
-                    let uses_target = egcl_stdlib::package_use_list(p).contains(&target_pkg);
-                    if uses_target {
-                        result.push(p);
-                    }
-                }
-                return Ok(vec_to_list(&result));
-            }
-            "PACKAGE-USE-LIST" => {
-                let args = list_to_vec(cdr);
-                if args.is_empty() {
-                    return Ok(NIL);
-                }
-                let v = eval_form(args[0], env)?;
-                if !is_package_designator(v) {
-                    return Err(package_designator_type_error(v));
-                }
-                let pkg_name = normalize_package_name(&string_designator_name(v));
-                // A missing package is a PACKAGE-ERROR, not an empty use-list
-                // (#375).
-                let pkg = package_or_package_error(&pkg_name, "PACKAGE-USE-LIST")?;
-                let uses = egcl_stdlib::package_use_list(pkg);
-                return Ok(vec_to_list(&uses));
+            "PACKAGE-USED-BY-LIST" | "PACKAGE-USE-LIST" | "PACKAGE-SHADOWING-SYMBOLS" => {
+                return eval_builtin_arguments(&name, cdr, env);
             }
             "LIST-ALL-PACKAGES" => {
                 return Ok(vec_to_list(&egcl_stdlib::list_all_packages()));
@@ -28730,147 +28951,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             "INTERN" => return eval_builtin_arguments(&name, cdr, env),
             "FIND-SYMBOL" => return eval_builtin_arguments(&name, cdr, env),
             "EXPORT" | "IMPORT" | "SHADOWING-IMPORT" => {
-                let args = eval_args(cdr, env)?;
-                if args.is_empty() {
-                    return Ok(T);
-                }
-                let symbols = args[0];
-                let pkg_name = if args.len() > 1 {
-                    normalize_package_name(&string_designator_name(args[1]))
-                } else {
-                    effective_package_name(env)
-                };
-                // The package must already exist: these are public package
-                // functions, not DEFPACKAGE (#375).
-                package_or_package_error(&pkg_name, &sym_name(car))?;
-                let sym_vals: Vec<EgclVal> = if symbols.is_cons() {
-                    list_to_vec(symbols)
-                } else if symbols.is_nil() {
-                    Vec::new()
-                } else {
-                    vec![symbols]
-                };
-                let export_mode = car.is_symbol() && sym_name(car) == "EXPORT";
-                let shadowing_mode = car.is_symbol() && sym_name(car) == "SHADOWING-IMPORT";
-                // Preserve the identity of the PASSED symbol: importing or
-                // (re-)exporting a symbol must make THAT symbol present in the
-                // package, not fork a fresh same-named one — otherwise a
-                // downstream package that inherits it sees a conflict with the
-                // imported one (bliss-lb6). Only a non-symbol designator (a bare
-                // string name) falls back to interning by name.
-                let mut resolved = Vec::with_capacity(sym_vals.len());
-                for sv in sym_vals {
-                    let name = if sv.is_symbol() {
-                        symbol_name_of(sv)
-                    } else {
-                        symbol_bare_name(&val_as_str(sv))
-                    };
-                    let sym = if sv.is_symbol() {
-                        sv
-                    } else {
-                        intern_into_package(env, &pkg_name, &name)
-                    };
-                    resolved.push((name, sym));
-                }
-                // EXPORT requires every symbol to be ACCESSIBLE in the package
-                // (present or inherited); exporting an inaccessible symbol is a
-                // PACKAGE-ERROR (CLHS EXPORT; ansi-test EXPORT.4). IMPORT /
-                // SHADOWING-IMPORT legitimately make new symbols present, so they
-                // are exempt.
-                if export_mode {
-                    for (name, sym) in &resolved {
-                        let accessible = matches!(
-                            find_symbol_in_package_cased(env, &pkg_name, name, true),
-                            Some((found, _)) if found == *sym
-                        );
-                        if !accessible {
-                            return Err(EgclError::PackageError(format!(
-                                "symbol {name} is not accessible in package {pkg_name}"
-                            )));
-                        }
-                        // Name-conflict check (CLHS EXPORT; ansi EXPORT.5): a
-                        // package USING this one must not already see a
-                        // DISTINCT same-named symbol (present or inherited),
-                        // unless it shadows the name.
-                        if let Some(pkg) = egcl_stdlib::find_package(&pkg_name) {
-                            for other in egcl_stdlib::list_all_packages() {
-                                if other == pkg
-                                    || !egcl_stdlib::package_use_list(other).contains(&pkg)
-                                {
-                                    continue;
-                                }
-                                let shadowed = egcl_stdlib::package_shadowing_symbols(other)
-                                    .iter()
-                                    .any(|s| symbol_name_of(*s) == *name);
-                                if shadowed {
-                                    continue;
-                                }
-                                let other_name =
-                                    egcl_stdlib::package_name(other).unwrap_or_default();
-                                if let Some((existing, _)) =
-                                    find_symbol_in_package_cased(env, &other_name, name, true)
-                                {
-                                    if existing != *sym {
-                                        return Err(EgclError::PackageError(format!(
-                                            "exporting {name} from {pkg_name} conflicts with \
-                                             a distinct {name} visible in {other_name}"
-                                        )));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                // Make each symbol present in the package (EXPORT → external, so
-                // used packages inherit it; IMPORT/SHADOWING-IMPORT → internal).
-                // SHADOWING-IMPORT additionally records each name as a shadowing
-                // symbol and displaces any conflicting present symbol, so
-                // PACKAGE-SHADOWING-SYMBOLS reports it.
-                if let Some(pkg) = egcl_stdlib::find_package(&pkg_name) {
-                    if shadowing_mode {
-                        let syms: Vec<EgclVal> = resolved.iter().map(|(_, s)| *s).collect();
-                        egcl_stdlib::shadowing_import(&syms, pkg)?;
-                    } else {
-                        // Name-conflict check (CLHS IMPORT; ansi
-                        // IMPORT.ERROR.3): importing a symbol DISTINCT from a
-                        // same-named symbol already PRESENT in the package is
-                        // a PACKAGE-ERROR (SHADOWING-IMPORT is the resolving
-                        // variant and takes the branch above).
-                        if !export_mode {
-                            for (name, sym) in &resolved {
-                                if let Some(existing) = egcl_stdlib::find_present_symbol(pkg, name)
-                                {
-                                    if existing != *sym {
-                                        return Err(EgclError::PackageError(format!(
-                                            "importing {name} into {pkg_name} conflicts with \
-                                             a distinct present {name}"
-                                        )));
-                                    }
-                                }
-                            }
-                        }
-                        for (name, sym) in resolved {
-                            let _ = egcl_stdlib::add_symbol(pkg, &name, sym, export_mode);
-                            // IMPORT of an UNINTERNED symbol also sets its home
-                            // package (CLHS IMPORT; ansi IMPORT.5): the symbol
-                            // becomes owned by the importing package, so
-                            // SYMBOL-PACKAGE reports it.
-                            if !export_mode {
-                                if let Some(idx) = sym.symbol_index() {
-                                    if egcl_rt::symbols::symbol_package(idx)
-                                        .is_none_or(|p| p.is_nil())
-                                    {
-                                        egcl_rt::symbols::set_symbol_package(
-                                            idx,
-                                            egcl_rt::packages::find_or_create(&pkg_name),
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                return Ok(T);
+                return eval_builtin_arguments(&name, cdr, env);
             }
             "UNEXPORT" => return eval_builtin_arguments(&name, cdr, env),
             "SHADOW" => return eval_builtin_arguments(&name, cdr, env),
@@ -42550,6 +42631,40 @@ const DIRECT_FAST: &[&str] = &[
     "INTEGER-LENGTH",
     "LOGCOUNT",
     "GETHASH",
+    // The symbol and package functions UIOP's DEFINE-PACKAGE calls per
+    // symbol of every package it defines: ~45 of them made up most of a
+    // 5-12 s (require :asdf). Leaf -- they signal PACKAGE-ERROR or TYPE-ERROR
+    // by returning it and never call Lisp -- and each reaches the same
+    // evaluated-argument handler from operator position. Without an entry a
+    // compiled call stayed on the cold path, resolving the callee again on
+    // every call: 5-27 us a call against ~1 us for GETHASH (bliss-a2bso).
+    "STRING",
+    "SYMBOL-PACKAGE",
+    "FIND-SYMBOL",
+    "INTERN",
+    "FIND-PACKAGE",
+    "PACKAGE-NAME",
+    "PACKAGE-USE-LIST",
+    "PACKAGE-USED-BY-LIST",
+    "EXPORT",
+    "IMPORT",
+    "SHADOWING-IMPORT",
+    "UNEXPORT",
+    "UNINTERN",
+    "SHADOW",
+    "PACKAGE-SHADOWING-SYMBOLS",
+    // Leaf builtins `apply_builtin_fast` already runs on evaluated arguments
+    // that a load of ASDF still reached on the cold path, tens of thousands of
+    // times each: (setf gethash) and (setf cdr) stores, LIST and friends
+    // (bliss-a2bso). The internal store primitives are spelled with their
+    // package, since their symbols are not COMMON-LISP's.
+    "EGCL::PUT-GETHASH",
+    "EGCL::SET-CAR",
+    "EGCL::SET-CDR",
+    "LIST",
+    "GETF",
+    "APPEND",
+    "GENSYM",
 ];
 
 /// The direct-call table. The index into this slice is what a compiled call
@@ -42566,6 +42681,17 @@ fn direct_builtin_table() -> &'static [&'static str] {
         v
     })
     .as_slice()
+}
+
+/// The table slot naming the symbol whose registry key is `full` (bare name
+/// `bare`). An entry spelled with its package, such as `EGCL::PUT-GETHASH`,
+/// matches that key exactly and wins over a bare entry of the same name.
+fn direct_builtin_table_slot(full: &str, bare: &str) -> Option<usize> {
+    let table = direct_builtin_table();
+    table
+        .iter()
+        .position(|&n| n == full)
+        .or_else(|| table.iter().position(|&n| n == bare))
 }
 
 /// The symbol a direct-builtin table entry names: the COMMON-LISP symbol, which
@@ -42603,8 +42729,8 @@ fn direct_builtin_slot(sym: u32, nargs: usize) -> Option<u32> {
     }
     let full = sym_name_uncached(EgclVal::from_symbol_index(sym));
     let bare = symbol_bare_name(&full);
-    let slot = direct_builtin_table().iter().position(|&n| n == bare)?;
-    if !is_direct_builtin_symbol(sym, &bare) {
+    let slot = direct_builtin_table_slot(&full, &bare)?;
+    if !is_direct_builtin_symbol(sym, direct_builtin_table()[slot]) {
         return None;
     }
     // Arity must be one this builtin actually accepts, so a wrong-count call
@@ -42712,10 +42838,10 @@ fn direct_builtin_resolve(sym: u32) -> BuiltinMemo {
     }
     let full = sym_name_uncached(EgclVal::from_symbol_index(sym));
     let bare = symbol_bare_name(&full);
-    let Some(slot) = direct_builtin_table().iter().position(|&n| n == bare) else {
+    let Some(slot) = direct_builtin_table_slot(&full, &bare) else {
         return BuiltinMemo::No;
     };
-    if !is_direct_builtin_symbol(sym, &bare) {
+    if !is_direct_builtin_symbol(sym, direct_builtin_table()[slot]) {
         return BuiltinMemo::No;
     }
     // Arity range only where one is declared. `apply_function` applies its
@@ -44254,24 +44380,9 @@ fn apply_builtin_fast(
             Some(Ok(symbol_package_value(env, args[0])))
         }
         "FIND-SYMBOL" if args.len() == 2 => {
-            // Case-SENSITIVE, verbatim name (CLHS) — see the tree-walker arm and
-            // find_symbol_in_package_cased (bliss-961p).
-            let bare = val_as_str(args[0]);
-            let pkg_name = resolve_package_name(env, &string_designator_name(args[1]));
-            // This fast arm bypasses the FIND-SYMBOL builtin entirely, so the
-            // missing-package check has to be here TOO -- fixing only the
-            // builtin left (find-symbol "Z" "NOSUCH") still answering NIL,
-            // because a two-argument call never reaches it (#375).
-            if let Err(error) = package_or_package_error(&pkg_name, "FIND-SYMBOL") {
-                return Some(Err(error));
-            }
-            if let Some((sym, status)) = find_symbol_in_package_cased(env, &pkg_name, &bare, true) {
-                env.set_mv(vec![sym, package_status_symbol(status)]);
-                Some(Ok(sym))
-            } else {
-                env.set_mv(vec![NIL, NIL]);
-                Some(Ok(NIL))
-            }
+            // This fast arm bypasses the FIND-SYMBOL builtin entirely, so it
+            // shares that builtin's body, missing-package check included (#375).
+            Some(find_symbol_values(env, args[0], Some(args[1])))
         }
         // Integer division reached through funcall/apply or the c2i fallback.
         // Without these arms the general path below synthesizes `(MOD 'a 'b)`

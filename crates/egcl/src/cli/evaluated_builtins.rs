@@ -36,18 +36,45 @@ pub(super) fn call(
     } else {
         name
     };
-    let handler = resolve(name)?;
-    // A handler can call Lisp (MAPHASH, SOME, Gray stream methods). Only an
-    // actual multiple-value producer may expose those values to its caller.
-    // The source evaluator used to enforce this after the synthesized call.
-    let preserve = mv_operator_preserves(name)
-        || mv_operator_preserves(name.rsplit(':').next().unwrap_or(name));
+    let (handler, preserve) = resolved(name);
+    let handler = handler?;
     env.clear_mv();
     let result = handler(name, args, env);
     if result.is_ok() && !preserve {
         env.clear_mv();
     }
     Some(result)
+}
+
+/// [`resolve`] and the multiple-value rule for `name`, memoized per thread.
+///
+/// Both are fixed functions of the name, but each is a string match over
+/// hundreds of arms, and every builtin call from compiled code that reaches
+/// this module paid for both: `resolve` alone was 8% of a TYPEP loop's
+/// profile (bliss-a2bso).
+fn resolved(name: &str) -> (Option<Handler>, bool) {
+    type Memo = HashMap<Box<str>, (Option<Handler>, bool), egcl_rt::fxhash::FxBuildHasher>;
+    thread_local! {
+        static MEMO: RefCell<Memo> = RefCell::new(HashMap::default());
+    }
+    if let Some(hit) = MEMO.with(|memo| memo.borrow().get(name).copied()) {
+        return hit;
+    }
+    let handler = resolve(name);
+    // A handler can call Lisp (MAPHASH, SOME, Gray stream methods). Only an
+    // actual multiple-value producer may expose those values to its caller.
+    // The source evaluator used to enforce this after the synthesized call.
+    let preserve = mv_operator_preserves(name)
+        || mv_operator_preserves(name.rsplit(':').next().unwrap_or(name));
+    // Only names with a handler are kept, so a stream of arbitrary unknown
+    // names cannot grow the table.
+    if handler.is_some() {
+        MEMO.with(|memo| {
+            memo.borrow_mut()
+                .insert(name.into(), (handler, preserve))
+        });
+    }
+    (handler, preserve)
 }
 
 #[egcl_shake_macros::builtin_dispatch(name)]
@@ -5594,35 +5621,37 @@ fn resolve(name: &str) -> Option<Handler> {
         }),
 
         "FIND-SYMBOL" => Some(|_operator, args, env| {
-            let args = RootedVals::new(args.to_vec());
-
             if args.is_empty() {
                 return Err(EgclError::Internal("FIND-SYMBOL requires a name".into()));
             }
             // FIND-SYMBOL takes the name STRING verbatim (no readtable
             // upcasing, no package-prefix parsing — the package is the second
             // argument), and matches case-SENSITIVELY (CLHS): (find-symbol
-            // "car") is NIL, (find-symbol "CAR") finds CAR (bliss-961p). So do
-            // NOT run it through symbol_bare_name (which upcases + strips).
-            let name = val_as_str(args[0]);
-            // The package argument is optional and defaults to *PACKAGE*.
-            let pkg_name = if args.len() > 1 {
-                let pkg_raw = string_designator_name(args[1]);
-                resolve_package_name(env, &pkg_raw)
-            } else {
-                effective_package_name(env)
-            };
-            // A designator naming no package is a PACKAGE-ERROR, not "no such
-            // symbol": FIND-SYMBOL answered NIL for a package that did not
-            // exist, which is indistinguishable from the name simply being
-            // absent, so a typo read as a successful lookup (#375).
-            package_or_package_error(&pkg_name, "FIND-SYMBOL")?;
-            if let Some((sym, status)) = find_symbol_in_package_cased(env, &pkg_name, &name, true) {
-                env.set_mv(vec![sym, package_status_symbol(status)]);
-                return Ok(sym);
-            }
-            env.set_mv(vec![NIL, NIL]);
-            Ok(NIL)
+            // "car") is NIL, (find-symbol "CAR") finds CAR (bliss-961p).
+            super::find_symbol_values(env, args[0], args.get(1).copied())
+        }),
+
+        // The package functions UIOP's DEFINE-PACKAGE calls once per symbol.
+        // Compiled code reached each through a synthesized, re-evaluated form
+        // (bliss-a2bso).
+        "EXPORT" | "IMPORT" | "SHADOWING-IMPORT" => {
+            Some(super::export_import_values)
+        }
+        "PACKAGE-NAME" => Some(|_operator, args, env| {
+            args.first()
+                .map_or(Ok(NIL), |&v| super::package_name_value(env, v))
+        }),
+        "PACKAGE-USE-LIST" => Some(|_operator, args, _env| {
+            args.first()
+                .map_or(Ok(NIL), |&v| super::package_use_list_value(v))
+        }),
+        "PACKAGE-SHADOWING-SYMBOLS" => Some(|_operator, args, env| {
+            args.first()
+                .map_or(Ok(NIL), |&v| super::package_shadowing_symbols_value(env, v))
+        }),
+        "PACKAGE-USED-BY-LIST" => Some(|_operator, args, env| {
+            args.first()
+                .map_or(Ok(NIL), |&v| super::package_used_by_list_value(env, v))
         }),
 
         "UNEXPORT" => Some(|_operator, args, env| {

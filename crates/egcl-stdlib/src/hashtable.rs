@@ -574,6 +574,24 @@ fn hash_bytes(bytes: &[u8], case_fold: bool) -> u64 {
     h
 }
 
+/// [`hash_bytes`] of a simple string's UTF-8 encoding, computed in place.
+///
+/// # Safety
+/// `ptr` must be a live simple-string object.
+unsafe fn simple_string_hash(ptr: *const u8) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut h = FNV_OFFSET;
+    let mut buf = [0u8; 4];
+    for c in unsafe { egcl_rt::object::simple_string_chars(ptr) } {
+        for &byte in c.encode_utf8(&mut buf).as_bytes() {
+            h ^= byte as u64;
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+    }
+    h
+}
+
 fn combine_hashes(a: u64, b: u64) -> u64 {
     a.rotate_left(13) ^ b.rotate_right(7) ^ 0x9e37_79b9_7f4a_7c15
 }
@@ -791,6 +809,13 @@ impl KeyHasher {
             if let Some(name) = egcl_rt::symbols::symbol_name(object.as_symbol_index()) {
                 return hash_bytes(name.as_bytes(), false);
             }
+        }
+        // A simple string, the usual EQUAL key: hash its characters in place,
+        // exactly as the string branch below would after a pathname-registry
+        // lookup and decoding it into a fresh `String` (bliss-a2bso).
+        if let Some(ptr) = crate::equality::simple_string_ptr(object) {
+            // Safety: a live simple string, and hashing allocates nothing.
+            return unsafe { simple_string_hash(ptr) };
         }
         if object.is_heap_object() {
             // A pathname hashes by the SAME namestring `pathnames_equal` compares,
@@ -1386,6 +1411,98 @@ pub fn gethash(
         idx = (idx + 1) & (cap - 1);
     }
     Ok((default, false))
+}
+
+/// Does the string KEY stored in a table hold exactly `text`? Allocation-free
+/// for a real simple string; a registry-backed sentinel (whose bits are not a
+/// pointer) is resolved through the registry, as [`extract_string_bytes`] does.
+fn string_key_eq_str(key: EgclVal, text: &str) -> bool {
+    if !key.is_heap_object() {
+        return false;
+    }
+    if crate::pathnames::is_registered_string(key) {
+        return crate::pathnames::registered_string(key).is_some_and(|s| s == text);
+    }
+    // Safety: not a sentinel, so a heap-tagged value points at a live header.
+    unsafe {
+        let ptr = key.as_ptr();
+        let tid = (*(ptr as *const ObjectHeader)).type_id();
+        if tid != type_id::SIMPLE_BASE_STRING && tid != type_id::SIMPLE_CHARACTER_STRING {
+            return false;
+        }
+        egcl_rt::object::simple_string_eq_str(ptr, text)
+    }
+}
+
+/// `GETHASH` of the string whose characters are `text` in an EQUAL table,
+/// without making a Lisp string to probe with.
+///
+/// Package symbol tables are probed by name on every FIND-SYMBOL, INTERN,
+/// EXPORT and IMPORT. Probing through [`gethash`] needed a Lisp string key
+/// (the interned-string table: a global mutex and a SipHash of the name), then
+/// hashed and compared it by decoding both strings into fresh Rust `String`s,
+/// after first asking the pathname registries whether either was a pathname.
+/// This hashes the text exactly as an EQUAL string key is hashed and compares
+/// candidates in place, so it allocates nothing and cannot reach a safepoint.
+///
+/// Tables of any other test fall back to [`gethash`] with a fresh key.
+pub fn gethash_string(text: &str, table: EgclVal) -> Result<Option<EgclVal>, EgclError> {
+    let ptr = get_table_inner(table)?;
+    // Safety: `test` never changes after creation.
+    if unsafe { (*ptr).test } != HashTest::Equal {
+        let key = crate::streams::make_lisp_string_fresh(text);
+        return gethash(key, table, egcl_rt::value::NIL)
+            .map(|(value, present)| present.then_some(value));
+    }
+    let _lock = lock_table(ptr);
+    // Safety: as in `gethash`, a shared reference to a live table.
+    let inner = unsafe { &*ptr };
+    let buckets = match placed_buckets(inner) {
+        Lookup::Placed(buckets) => buckets,
+        Lookup::Unplaced(buckets) => {
+            return Ok(buckets
+                .entries
+                .iter()
+                .flatten()
+                .find(|entry| string_key_eq_str(entry.key, text))
+                .map(|entry| entry.value));
+        }
+    };
+    let cap = buckets.capacity();
+    let key_hash = hash_bytes(text.as_bytes(), false);
+    if cap >= MISS_FILTER_MIN_CAPACITY && !hash_may_be_present(&buckets.miss_filter, key_hash) {
+        return Ok(None);
+    }
+    let mut idx = probe_index(key_hash, cap);
+    for dist in 0..cap {
+        match &buckets.entries[idx] {
+            Some(entry) => {
+                if entry.probe_dist < dist {
+                    return Ok(None);
+                }
+                if string_key_eq_str(entry.key, text) {
+                    return Ok(Some(entry.value));
+                }
+            }
+            None => return Ok(None),
+        }
+        idx = (idx + 1) & (cap - 1);
+    }
+    Ok(None)
+}
+
+/// The values of a table's live entries, without its keys.
+pub fn hash_table_values(table: EgclVal) -> Result<Vec<EgclVal>, EgclError> {
+    let ptr = get_table_inner(table)?;
+    let _lock = lock_table(ptr);
+    // Safety: a shared reference; other threads may be reading the table too.
+    let inner = unsafe { &*ptr };
+    Ok(inner
+        .buckets()
+        .entries
+        .iter()
+        .filter_map(|slot| slot.map(|e| e.value))
+        .collect())
 }
 
 /// Resize the table when load factor exceeds threshold.

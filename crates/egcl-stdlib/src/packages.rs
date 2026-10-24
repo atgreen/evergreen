@@ -15,7 +15,7 @@ use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Arc;
 
 use crate::hashtable::{
-    HashTest, MakeHashTableOptions, gethash, hash_table_entries, make_hash_table, remhash,
+    HashTest, MakeHashTableOptions, hash_table_entries, make_hash_table, remhash,
     set_gethash,
 };
 use crate::streams::make_lisp_string;
@@ -166,9 +166,12 @@ fn make_package_symbol_table() -> Result<EgclVal, EgclError> {
 
 impl PackageSymbolTable {
     fn get(self, name: &str) -> Option<EgclVal> {
-        gethash(make_lisp_string(name), self.0, egcl_rt::value::NIL)
+        // Probe by the text itself: making a Lisp key interned `name` in the
+        // global string table (a mutex and a SipHash per probe), and every
+        // FIND-SYMBOL, INTERN and EXPORT probes here (bliss-a2bso).
+        crate::hashtable::gethash_string(name, self.0)
             .ok()
-            .and_then(|(value, present)| present.then_some(value))
+            .flatten()
     }
 
     fn contains_key(self, name: &str) -> bool {
@@ -198,11 +201,66 @@ impl PackageSymbolTable {
     }
 
     fn values(self) -> Vec<EgclVal> {
+        // Not through `entries`: decoding every key into a `String` only to
+        // drop it made each DO-SYMBOLS cost a string per symbol (bliss-a2bso).
+        crate::hashtable::hash_table_values(self.0)
+            .expect("package symbol table must remain a valid hash table")
+    }
+
+    /// The name `sym` is present under in this table, if it is present.
+    ///
+    /// A symbol is present under its own name, so probe that first; only a
+    /// symbol whose name cannot be derived that way pays for the full scan
+    /// by value that this lookup always used to be (bliss-a2bso).
+    fn name_of(self, sym: EgclVal) -> Option<String> {
+        if let Some(name) = symbol_table_name(sym)
+            && self.get(&name) == Some(sym)
+        {
+            return Some(name);
+        }
+        self.scan_name_of(sym)
+    }
+
+    /// Is `sym` present here under its own name? No scan.
+    fn holds(self, sym: EgclVal) -> bool {
+        symbol_table_name(sym).is_some_and(|name| self.get(&name) == Some(sym))
+    }
+
+    /// The name `sym` is filed under, found by walking every entry.
+    fn scan_name_of(self, sym: EgclVal) -> Option<String> {
         self.entries()
             .into_iter()
-            .map(|(_, symbol)| symbol)
-            .collect()
+            .find(|(_, value)| *value == sym)
+            .map(|(name, _)| name)
     }
+}
+
+/// The name a package's symbol table files `sym` under: its SYMBOL-NAME.
+///
+/// An interned symbol's name cell holds its registry key (`PKG::NAME`, a
+/// `KEYWORD:` key, or a bare COMMON-LISP name), so the package marker is
+/// stripped here, the same rule SHADOWING-IMPORT uses. Callers verify the
+/// table actually holds `sym` under this name and fall back to scanning, so a
+/// spelling this does not anticipate costs time, never correctness.
+fn symbol_table_name(sym: EgclVal) -> Option<String> {
+    if sym == egcl_rt::value::NIL {
+        return Some("NIL".to_string());
+    }
+    if sym == egcl_rt::value::T {
+        return Some("T".to_string());
+    }
+    let idx = sym.symbol_index()?;
+    let name = egcl_rt::symbols::symbol_name(idx)?;
+    if egcl_rt::symbols::is_uninterned(idx) {
+        return Some(name);
+    }
+    if let Some(bare) = egcl_rt::symbols::keyword_key_name(&name) {
+        return Some(bare.to_string());
+    }
+    Some(match egcl_rt::symbols::split_registry_key(&name) {
+        Some((_, bare)) => bare.to_string(),
+        None => name,
+    })
 }
 
 /// The shared heap-resident symbol for `bare_name` in package `pkg_name`
@@ -261,6 +319,24 @@ fn find_symbol_name_in_store(
     store: &PackageStore,
     sym: EgclVal,
 ) -> Result<Option<String>, EgclError> {
+    // Fast path: a symbol is present in its home package under its own name.
+    // The scan below walks every symbol of every package, which made each
+    // IMPORT cost the whole image (bliss-a2bso).
+    if let Some(name) = symbol_table_name(sym)
+        && let Some(home) = sym
+            .symbol_index()
+            .and_then(egcl_rt::symbols::symbol_package)
+        && let Some(package) = store.packages.get(&pkg_id(home))
+    {
+        let package = package
+            .read()
+            .map_err(|_| lock_poisoned_error("symbol lookup"))?;
+        if package.internal_symbols.get(&name) == Some(sym)
+            || package.external_symbols.get(&name) == Some(sym)
+        {
+            return Ok(Some(name));
+        }
+    }
     for package in store.packages.values() {
         let package = package
             .read()
@@ -853,22 +929,16 @@ pub fn export(symbols: &[EgclVal], package: EgclVal) -> Result<(), EgclError> {
     let package = package.write().map_err(|_| lock_poisoned_error("export"))?;
 
     for &sym in symbols {
-        let sym_name = package
-            .internal_symbols
-            .entries()
-            .into_iter()
-            .find(|(_, value)| *value == sym)
-            .map(|(name, _)| name);
-
-        if let Some(name) = sym_name {
+        // Already external under its own name: nothing to move. Checked
+        // first because re-exporting is what DEFINE-PACKAGE does to every
+        // export each time a package is redefined.
+        if package.external_symbols.holds(sym) {
+            continue;
+        }
+        if let Some(name) = package.internal_symbols.name_of(sym) {
             package.internal_symbols.remove(&name);
             package.external_symbols.insert(&name, sym);
-        } else if !package
-            .external_symbols
-            .values()
-            .into_iter()
-            .any(|v| v == sym)
-        {
+        } else if package.external_symbols.name_of(sym).is_none() {
             return Err(EgclError::PackageError(
                 "Symbol not accessible in package".to_string(),
             ));
@@ -890,13 +960,7 @@ pub fn unexport(symbols: &[EgclVal], package: EgclVal) -> Result<(), EgclError> 
         .map_err(|_| lock_poisoned_error("unexport"))?;
 
     for &sym in symbols {
-        let sym_name = package
-            .external_symbols
-            .entries()
-            .into_iter()
-            .find(|(_, value)| *value == sym)
-            .map(|(name, _)| name);
-        if let Some(name) = sym_name {
+        if let Some(name) = package.external_symbols.name_of(sym) {
             package.external_symbols.remove(&name);
             package.internal_symbols.insert(&name, sym);
         }
@@ -924,13 +988,14 @@ pub fn unintern(symbol: EgclVal, package: EgclVal) -> Result<bool, EgclError> {
         let target = target
             .read()
             .map_err(|_| lock_poisoned_error("unintern"))?;
-        let present = target
-            .internal_symbols
-            .entries()
-            .into_iter()
-            .chain(target.external_symbols.entries())
-            .find(|(_, value)| *value == symbol);
-        let Some((name, _)) = present else {
+        let present = symbol_table_name(symbol)
+            .filter(|name| {
+                target.internal_symbols.get(name) == Some(symbol)
+                    || target.external_symbols.get(name) == Some(symbol)
+            })
+            .or_else(|| target.internal_symbols.scan_name_of(symbol))
+            .or_else(|| target.external_symbols.scan_name_of(symbol));
+        let Some(name) = present else {
             return Ok(false);
         };
         let used = if target.shadowing_symbols.contains(&name) {
@@ -1226,6 +1291,28 @@ pub fn package_use_list(package: EgclVal) -> Vec<EgclVal> {
         let g = store.state.read().ok()?;
         let pkg = g.packages.get(&pkg_id(package))?;
         Some(pkg.read().ok()?.use_list.clone())
+    })()
+    .unwrap_or_default()
+}
+
+/// The packages whose use-list contains `package` (PACKAGE-USED-BY-LIST), in
+/// one pass under the registry lock. Walking `list_all_packages` and asking
+/// each for its use-list took two locks and a fresh vector per package, and
+/// UIOP's DEFINE-PACKAGE asks this once per exported symbol (bliss-a2bso).
+pub fn package_used_by_list(package: EgclVal) -> Vec<EgclVal> {
+    (|| -> Option<Vec<EgclVal>> {
+        let store = current_store().ok()?;
+        let g = store.state.read().ok()?;
+        // Same order as `list_all_packages`, which this replaces.
+        Some(
+            g.packages
+                .values()
+                .filter_map(|pkg| {
+                    let pkg = pkg.read().ok()?;
+                    pkg.use_list.contains(&package).then_some(pkg.object)
+                })
+                .collect(),
+        )
     })()
     .unwrap_or_default()
 }
