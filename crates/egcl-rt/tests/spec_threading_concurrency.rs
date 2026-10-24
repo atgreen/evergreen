@@ -118,6 +118,23 @@ fn slow_interruptible_entry() -> EgclVal {
     T
 }
 
+static LATE_THREAD_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// Runs without polling for 1.5 s, as a mutator compiling a large function to
+/// native code does, then polls until released.
+fn late_polling_entry() -> EgclVal {
+    LATE_THREAD_STARTED.store(true, Ordering::Release);
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_millis(1500) {
+        std::hint::spin_loop();
+    }
+    while !SAFETY_LOOP_EXIT.load(Ordering::Acquire) {
+        poll_safepoint();
+        std::thread::yield_now();
+    }
+    T
+}
+
 fn polling_entry() -> EgclVal {
     while !SAFETY_LOOP_EXIT.load(Ordering::Acquire) {
         POLL_ITERATIONS.fetch_add(1, Ordering::AcqRel);
@@ -478,7 +495,12 @@ fn failed_safepoint_handshake_is_reported_and_cleans_up() {
         std::thread::yield_now();
     }
 
+    // A late mutator is waited for (#609); only the budget makes it fail.
+    // SAFETY: serialize_global_runtime! keeps other tests from reading the
+    // environment concurrently.
+    unsafe { std::env::set_var("EGCL_SAFEPOINT_TIMEOUT_MS", "1000") };
     let err = wait_for_all_threads().expect_err("non-polling mutator must fail handshake");
+    unsafe { std::env::remove_var("EGCL_SAFEPOINT_TIMEOUT_MS") };
     assert!(
         format!("{err}").contains("safepoint handshake failed"),
         "unexpected safepoint error: {err}"
@@ -486,6 +508,30 @@ fn failed_safepoint_handshake_is_reported_and_cleans_up() {
 
     RELEASE_SLOW_THREAD.store(true, Ordering::Release);
     assert_eq!(join_thread(id).expect("join must succeed after cleanup"), T);
+}
+
+#[test]
+fn safepoint_handshake_waits_for_a_late_mutator() {
+    serialize_global_runtime!();
+    // #609: a mutator that polls only after a 2 s JIT compile made every
+    // collection requested meanwhile fail after ~1 s. A late thread must be
+    // waited for; only a mutator that never polls exhausts the budget.
+    install_signal_handlers().expect("signal handlers must install before SIGUSR1 nudging");
+    LATE_THREAD_STARTED.store(false, Ordering::Release);
+    SAFETY_LOOP_EXIT.store(false, Ordering::Release);
+    let id = make_thread(unsafe { fn_entry(late_polling_entry) }).expect("thread creation");
+    while !LATE_THREAD_STARTED.load(Ordering::Acquire) {
+        std::thread::yield_now();
+    }
+    let started = Instant::now();
+    wait_for_all_threads().expect("a late mutator must be waited for");
+    assert!(
+        started.elapsed() >= Duration::from_millis(1000),
+        "the handshake should have waited for the late thread"
+    );
+    resume_all_threads().expect("resume must succeed");
+    SAFETY_LOOP_EXIT.store(true, Ordering::Release);
+    assert_eq!(join_thread(id).expect("late thread must finish"), T);
 }
 
 #[test]
