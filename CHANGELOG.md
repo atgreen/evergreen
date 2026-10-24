@@ -98,7 +98,7 @@
   code, these functions and `string`, `list`, `gethash` stores and
   `(setf car)` / `(setf cdr)` now cost about 1 µs instead of 3-27 µs.
   `equal` hash tables with string keys hash and compare the keys in place
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#610](https://github.com/atgreen/evergreen/pull/610)).
 - `substitute`, `substitute-if` and `substitute-if-not` on a whole list
   without `:count` or `:from-end` make one pass over the list, as `remove`
   does since #607. Substituting in an 8-element list drops from about 207 µs to
