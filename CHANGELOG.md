@@ -88,6 +88,12 @@
 
 ### Performance
 
+- `remove`, `remove-if`, `remove-if-not`, `delete` and `delete-if` on a whole
+  list without `:count` or `:from-end` make one pass over the list, instead of
+  copying it into a vector, collecting the matching positions and then
+  searching those positions once per element. `(remove 1 nil)` drops from about
+  88 µs to 10 µs, and removing from an 8-element list from about 190 µs to
+  70 µs ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
 - `sort` and `stable-sort` called from compiled code no longer rebuild and
   re-evaluate their call form each time, and a builtin predicate or key such
   as `#'<` or `#'car` is called directly instead of through the general
