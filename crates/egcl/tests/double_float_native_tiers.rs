@@ -309,3 +309,156 @@ fn fixnum_contagion_and_variadic_arithmetic_run_raw_at_t2() {
     assert!(raw_emitted, "STEP-PLAIN must install raw f64 code\n{stderr}");
     assert!(!stderr.contains("STEP-PLAIN: raw double T2 emission declined"), "{stderr}");
 }
+
+/// Raw `SQRT`, unary `-` and `/` on doubles (bliss-lhy89), and fixnum
+/// contagion beside a double (bliss-thcbb.1). Pins the interpreter's
+/// answers: `(sqrt -0d0)` is -0.0d0, a negative operand has a complex root,
+/// the root of an integer is a single-float, `(- 0d0)` is
+/// -0.0d0, overflow and NaN propagate, a zero divisor of either sign signals,
+/// and a fixnum above 2^53 rounds to the nearest double.
+const DOUBLE_ONLY_PROGRAM: &str = "\
+    (progn \
+    (defun dsqrt (x) (declare (double-float x)) (sqrt x)) \
+    (defun dhyp (x y) (sqrt (+ (* x x) (* y y)))) \
+    (defun dneg (x) (- x)) \
+    (defun dnegsum (x y) (- (+ x y))) \
+    (defun ddiv (x y) (declare (double-float x y)) (/ x y)) \
+    (defun ddivk (x) (/ (* x 1d0) 3)) \
+    (defun dfixdiv (i x) (declare (fixnum i) (double-float x)) (/ i x)) \
+    (defun dcontag (i) (declare (fixnum i) (optimize (speed 3) (safety 0))) (* i 1d-3)) \
+    (defun dcontagv (i) (declare (fixnum i)) (+ i 0.5d0)) \
+    (defun step-sqrt (i) \
+    (declare (fixnum i) (optimize (speed 3) (safety 0))) \
+    (let ((px (* i 1d-3)) (py (* i 2d-3)) (pz 1.5d0)) \
+    (declare (double-float px py pz)) \
+    (sqrt (+ (* px px) (* py py) (* pz pz))))) \
+    (dotimes (i 60) \
+    (dsqrt 2d0) (dhyp 3d0 4d0) (dneg 1.5d0) (dnegsum 1d0 2d0) (ddiv 1d0 3d0) \
+    (ddivk 2d0) (dfixdiv i 2d0) (dcontag i) (dcontagv i) (step-sqrt i)) \
+    (let* ((inf (* 1d300 1d300)) (nan (- inf inf)) \
+    (err (lambda (thunk) (handler-case (funcall thunk) (error (e) (type-of e)))))) \
+    (format t \"RESULT ~S~%\" \
+    (list (dsqrt 4d0) (dsqrt 2d0) (dsqrt 0d0) (dsqrt -0d0) (dsqrt -4d0) (dsqrt nan) \
+    (dsqrt inf) (dsqrt (- inf)) (dsqrt 4.9406564584124654d-324) (dsqrt 1d300) \
+    (dhyp 3d0 4d0) (dhyp 0d0 -0d0) (dhyp 3 4) (dhyp 1/2 1d0) (dhyp nan 1d0) \
+    (dneg 1.5d0) (dneg 0d0) (dneg -0d0) (dneg inf) (dneg nan) (dneg 3) (dneg 1/2) (dneg 1.5) \
+    (dnegsum 1d0 2d0) (dnegsum -0d0 -0d0) (dnegsum 0d0 0d0) (dnegsum 1 2) \
+    (ddiv 1d0 3d0) (ddiv -1d0 3d0) (ddiv 1d300 1d-300) (ddiv 1d-300 1d300) (ddiv 1d0 inf) \
+    (ddiv 1d0 nan) (ddiv nan 2d0) (ddiv 0d0 5d0) (ddiv -0d0 5d0) \
+    (funcall err (lambda () (ddiv 1d0 0d0))) (funcall err (lambda () (ddiv 1d0 -0d0))) \
+    (funcall err (lambda () (ddiv 0d0 0d0))) (funcall err (lambda () (ddiv nan 0d0))) \
+    (ddivk 1d0) (ddivk 2d0) (ddivk 1) (ddivk 1/2) \
+    (dfixdiv 7 2d0) (dfixdiv most-positive-fixnum 1d0) (dfixdiv 9007199254740993 1d0) \
+    (dfixdiv 0 -1d0) (funcall err (lambda () (dfixdiv 1 0d0))) \
+    (dcontag 7) (dcontag 0) (dcontag -3) (dcontag 9007199254740993) (dcontag most-positive-fixnum) \
+    (dcontag most-negative-fixnum) \
+    (dcontagv 7) (dcontagv 9007199254740993) (dcontagv most-positive-fixnum) \
+    (step-sqrt 0) (step-sqrt 7) (step-sqrt 1000000)))))";
+
+const DOUBLE_ONLY_EXPECTED: &str = "\
+    RESULT (2.0d0 1.4142135623730951d0 0.0d0 -0.0d0 #C(0.0d0 2.0d0) NaN inf #C(0.0d0 inf) \
+    2.2227587494850775d-162 1.0d150 5.0d0 0.0d0 5.0 1.118033988749895d0 NaN -1.5d0 -0.0d0 \
+    0.0d0 -inf NaN -3 -1/2 -1.5 -3.0d0 -0.0d0 -0.0d0 -3 0.3333333333333333d0 \
+    -0.3333333333333333d0 inf 0.0d0 0.0d0 NaN NaN 0.0d0 -0.0d0 DIVISION-BY-ZERO \
+    DIVISION-BY-ZERO DIVISION-BY-ZERO DIVISION-BY-ZERO 0.3333333333333333d0 \
+    0.6666666666666666d0 0.3333333333333333d0 0.16666666666666666d0 3.5d0 \
+    1.152921504606847d18 9.007199254740992d15 -0.0d0 DIVISION-BY-ZERO 0.007d0 0.0d0 -0.003d0 \
+    9.007199254740992d12 1.152921504606847d15 -1.152921504606847d15 7.5d0 \
+    9.007199254740992d15 1.152921504606847d18 1.5d0 1.5000816644436397d0 \
+    2236.068480615028d0)";
+
+fn run_program(program: &str, envs: &[(&str, &str)]) -> String {
+    let mut command = Command::new(BIN);
+    command.args(["--no-init", "--eval", program]).env("EGCL_LAZY_COMPILE", "0");
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let out = command.output().expect("run egcl");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "egcl failed with {envs:?}\nstdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    stdout
+        .lines()
+        .find(|line| line.starts_with("RESULT"))
+        .unwrap_or_else(|| panic!("no RESULT line with {envs:?}: {stdout}"))
+        .to_string()
+}
+
+const PROMOTE_QUIET: [(&str, &str); 3] =
+    [("EGCL_T0_T1_THRESHOLD", "2"), ("EGCL_T2_THRESHOLD", "20"), ("EGCL_T2_THREADS", "1")];
+
+#[test]
+fn sqrt_negation_and_division_match_the_interpreter_at_every_tier() {
+    let interpreted = run_program(DOUBLE_ONLY_PROGRAM, &[("EGCL_BACKEND", "tree-walker")]);
+    assert_eq!(interpreted, DOUBLE_ONLY_EXPECTED);
+    for tier in ["t0", "t1", "t2"] {
+        let compiled = run_program(DOUBLE_ONLY_PROGRAM, &[("EGCL_FORCE_TIER", tier)]);
+        assert_eq!(compiled, interpreted, "tier {tier} differs from the interpreter");
+    }
+    let promoted = run_program(DOUBLE_ONLY_PROGRAM, &PROMOTE_QUIET);
+    assert_eq!(promoted, interpreted, "promoted tiers differ from the interpreter");
+}
+
+/// Under forced collections and nursery poisoning, the raw sqrt, negation and
+/// division programs (whose escape boxes and deopts allocate) answer as an
+/// unstressed run does.
+#[test]
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn sqrt_negation_and_division_survive_gc_stress() {
+    let expected = run_program(DOUBLE_ONLY_PROGRAM, &PROMOTE_QUIET);
+    let [threshold, t2, threads] = PROMOTE_QUIET;
+    let stressed = run_program(DOUBLE_ONLY_PROGRAM, &[
+        threshold, t2, threads,
+        ("EGCL_GC_STRESS", "1"),
+        ("EGCL_GC_POISON", "1"),
+        ("EGCL_GC_STRESS_AFTER_INIT", "1"),
+    ]);
+    assert_eq!(stressed, expected);
+}
+
+/// GH #594's STEP-SQRT and the other double-only shapes install raw T2 code
+/// and run it without a deopt; a zero divisor fails the native guard once,
+/// signals as the interpreter does, and retires that raw speculation.
+#[test]
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn sqrt_and_division_run_raw_and_retire_on_a_failed_guard() {
+    let program = "(progn \
+        (defun step-sqrt (i) (declare (fixnum i) (optimize (speed 3) (safety 0))) \
+          (let ((px (* i 1d-3)) (py (* i 2d-3)) (pz 1.5d0)) (declare (double-float px py pz)) \
+            (sqrt (+ (* px px) (* py py) (* pz pz))))) \
+        (defun hyp (x y) (sqrt (+ (* x x) (* y y)))) \
+        (defun quot (x y) (/ x y)) \
+        (defun neg (x) (- (* x 2d0))) \
+        (loop for j from 0 repeat 5000 \
+              until (every (lambda (f) (eql 2 (egcl-ext:function-tier f))) '(step-sqrt hyp quot neg)) \
+              do (step-sqrt j) (hyp 3d0 4d0) (quot 1d0 4d0) (neg 1.5d0)) \
+        (let ((before (egcl-ext:deopt-count))) \
+          (format t \"STEADY ~S ~S~%\" \
+            (list (step-sqrt 7) (hyp 3d0 4d0) (hyp -0d0 0d0) (quot 1d0 4d0) (quot 1d0 -2d0) \
+                  (quot (- (* 1d300 1d300) (* 1d300 1d300)) 1d0) (neg 0d0) (neg -1d0)) \
+            (- (egcl-ext:deopt-count) before))) \
+        (let ((before (egcl-ext:deopt-count))) \
+          (format t \"GUARD ~S ~S~%\" \
+            (handler-case (quot 1d0 0d0) (division-by-zero () :dbz)) \
+            (- (egcl-ext:deopt-count) before))))";
+    let (stdout, stderr) = run_logged(program, &PROMOTE);
+    assert!(
+        stdout.contains("STEADY (1.5000816644436397d0 5.0d0 0.0d0 0.25d0 -0.5d0 NaN -0.0d0 2.0d0) 0"),
+        "{stdout}\n{stderr}"
+    );
+    for name in ["STEP-SQRT", "HYP", "QUOT", "NEG"] {
+        let raw_emitted = stderr.lines().any(|line| {
+            (line.starts_with(&format!("[T2] {name}: mapped T2 emitted"))
+                || line.starts_with(&format!("[T2] {name}: ordinary x86-64 Lisp T2 emitted")))
+                && !line.ends_with("raw_f64_values=0")
+        });
+        assert!(raw_emitted, "{name} must install raw f64 code\n{stderr}");
+        assert!(!stderr.contains(&format!("{name}: raw double T2 emission declined")), "{stderr}");
+    }
+    assert!(stdout.contains("GUARD :DBZ 1"), "{stdout}\n{stderr}");
+    assert!(stderr.contains("QUOT: native guard deopt #1 => resuming interpreted (raw double speculation failed"),
+        "{stderr}");
+}

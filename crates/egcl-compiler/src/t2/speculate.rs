@@ -103,7 +103,9 @@
 //!   `BoxFloat` of the result, which `unbox_f64` then elides where the value
 //!   does not escape (bliss-thcbb).
 //! * Variadic arithmetic (`(+ a b c)`) and unary `+`/`*` stay generic.
-//! * Float negation has no native encoder yet; float comparisons only on x86-64.
+//! * Float comparisons only on x86-64. On the raw double candidate, `SQRT`,
+//!   unary `-` and binary `/` of statically known doubles become raw
+//!   `FloatSqrt`, `FloatNeg` and `FloatDiv` (bliss-lhy89).
 //! * Constant operands are recognised from `ConstFixnum` definitions only;
 //!   this runs before folding, so `(mod x (* 2 4))` is not a mask.
 
@@ -741,6 +743,196 @@ fn split_variadic_double_arithmetic(f: &mut Function, profile: &impl Fn(u32) -> 
     }
 }
 
+/// The raw double operation a double-only builtin names, with its arity:
+/// `SQRT`, unary `-` and binary `/` (bliss-lhy89).
+fn double_only_opcode(sym: u32, argc: usize) -> Option<Opcode> {
+    match (egcl_rt::symbols::symbol_name(sym).as_deref(), argc) {
+        (Some("SQRT"), 1) => Some(Opcode::FloatSqrt),
+        (Some("-"), 1) => Some(Opcode::FloatNeg),
+        (Some("/"), 2) => Some(Opcode::FloatDiv),
+        _ => None,
+    }
+}
+
+/// Whether `args` of a double-only site can compute raw. Without a profile
+/// the operands must be statically doubles: a unary operand typed exactly
+/// DOUBLE-FLOAT (or a double literal); for `/`, at least one proven double
+/// variable or literal, the other a compile-time number converted exactly or
+/// a fixnum variable beside the proven double (float contagion, rounded to
+/// nearest as the interpreter does). A site whose operands `observed` doubles
+/// (its profile chose DOUBLE-FLOAT) takes any operand that may be one, as
+/// the profiled arithmetic does; its guards then decline it on a miss. A
+/// division needs a variable operand and never a constant zero divisor
+/// (that always signals, so it stays generic).
+fn double_only_operands(
+    f: &Function,
+    opcode: Opcode,
+    args: &[Value],
+    consts: &HashMap<Value, i64>,
+    observed: bool,
+) -> bool {
+    let proven = |value: Value| {
+        double_literal_bits(f, value).is_some() || f.value(value).ty.bits == TypeBits::DOUBLE_FLOAT
+    };
+    let may_be_double = |value: Value| {
+        let bits = f.value(value).ty.bits;
+        !bits.is_bottom() && !bits.meet(TypeBits::DOUBLE_FLOAT).is_bottom()
+    };
+    let constant = |value: Value| double_constant_operand(f, value, consts, false);
+    if opcode != Opcode::FloatDiv {
+        return args.len() == 1
+            && (proven(args[0]) || (observed && constant(args[0]).is_none() && may_be_double(args[0])));
+    }
+    let fixnum = |value: Value| {
+        let bits = f.value(value).ty.bits;
+        !bits.is_bottom() && bits.meet(TypeBits::FIXNUM) == bits
+    };
+    let statically = args.len() == 2
+        && args.iter().any(|&arg| proven(arg))
+        && args.iter().all(|&arg| proven(arg) || constant(arg).is_some() || fixnum(arg))
+        && (0..2).all(|index| !fixnum(args[index]) || constant(args[index]).is_some()
+            || proven(args[1 - index]));
+    args.len() == 2
+        && args.iter().any(|&arg| constant(arg).is_none())
+        && constant(args[1]).is_none_or(|bits| f64::from_bits(bits) != 0.0)
+        && (statically || (observed && double_operands_admissible(f, args, consts, false)))
+}
+
+/// Compile `SQRT`, unary `-` and binary `/` of doubles to raw operations
+/// (bliss-lhy89): operands proven DOUBLE-FLOAT (a literal, or the result of
+/// a raw double site rewritten earlier in this pass or by the main rewrite),
+/// or operands the site's profile saw as doubles (see
+/// `double_only_operands`). Each site gets the same builtin-binding guard
+/// and multiple-value reset as a profiled site, guarded operand unboxing, and
+/// becomes the escape `BoxFloat` of the raw result. `SQRT` and negation
+/// unbox doubles only: `(sqrt 4)` is a single-float.
+///
+/// `FloatSqrt` deopts on a negative operand (its root is a complex) and
+/// `FloatDiv` on a zero divisor (DIVISION-BY-ZERO is signalled); both
+/// resume the original call in the interpreter. A failed guard declines the
+/// site (`profile` then answers `None` for it), so the replacement version
+/// keeps the call generic instead of deoptimizing again.
+fn speculate_double_only_sites(
+    f: &mut Function,
+    profile: &impl Fn(u32) -> Option<SpecType>,
+    consts: &HashMap<Value, i64>,
+) -> usize {
+    use crate::t2::ir::{InstData, ValueRepresentation};
+    let raw_double = (IRType::of(TypeBits::DOUBLE_FLOAT), ValueRepresentation::UnboxedF64);
+    let mut n = 0;
+    // Program order, so a site sees the refined type of an earlier one.
+    let sites: Vec<Inst> = f.block_order().iter()
+        .flat_map(|&block| f.block(block).insts.clone())
+        .collect();
+    for site in sites {
+        let data = f.inst(site).clone();
+        let AuxData::CallTarget(symbol) = data.aux else { continue };
+        if data.opcode != Opcode::Call || data.results.len() != 1 || !data.targets.is_empty() {
+            continue;
+        }
+        let Some(opcode) = double_only_opcode(symbol, data.args.len()) else { continue };
+        let Some(state) = data.frame_state else { continue };
+        // A declined site answers `None`; an unprofiled one a cold guess.
+        let observed = profile(frame_state_bcp(f, state));
+        if observed.is_none()
+            || !double_only_operands(f, opcode, &data.args, consts,
+                observed == Some(SpecType::DoubleFloat))
+        {
+            continue;
+        }
+        let Some(binding) = super::builtin_binding::snapshot(symbol) else { continue };
+        let Some((block, position)) = f.block_order().iter().find_map(|&block| {
+            f.block(block).insts.iter().position(|&candidate| candidate == site)
+                .map(|position| (block, position))
+        }) else { continue };
+        super::builtin_binding::insert(f, block, position, state, binding);
+        let guarded = InstFlags { guard: true, effectful: true, ..InstFlags::default() };
+        let raw = if opcode == Opcode::FloatDiv {
+            expand_double_site(f, site, opcode, consts);
+            let raw = f.inst(site).args[0];
+            let crate::t2::ir::ValueDef::Result { inst: divide, .. } = f.value(raw).def else {
+                unreachable!("the expansion defines the quotient");
+            };
+            let divide_state = f.frame_states.add(f.frame_states.get(state).clone());
+            let divide = f.inst_mut(divide);
+            divide.flags = guarded;
+            divide.frame_state = Some(divide_state);
+            raw
+        } else {
+            let operand = data.args[0];
+            let input = if let Some(bits) = double_literal_bits(f, operand) {
+                insert_before_site(f, site, InstData {
+                    opcode: Opcode::ConstDouble,
+                    args: vec![],
+                    results: vec![],
+                    aux: AuxData::DoubleImm(bits),
+                    flags: InstFlags::default(),
+                    targets: vec![],
+                    frame_state: None,
+                    source_pos: data.source_pos,
+                }, raw_double)
+            } else {
+                let guard_state = f.frame_states.add(f.frame_states.get(state).clone());
+                insert_before_site(f, site, InstData {
+                    opcode: Opcode::UnboxFloat,
+                    args: vec![operand],
+                    results: vec![],
+                    aux: AuxData::None,
+                    flags: guarded,
+                    targets: vec![],
+                    frame_state: Some(guard_state),
+                    source_pos: data.source_pos,
+                }, raw_double)
+            };
+            let (flags, frame_state) = if opcode == Opcode::FloatSqrt {
+                (guarded, Some(f.frame_states.add(f.frame_states.get(state).clone())))
+            } else {
+                (InstFlags::default(), None)
+            };
+            insert_before_site(f, site, InstData {
+                opcode,
+                args: vec![input],
+                results: vec![],
+                aux: AuxData::None,
+                flags,
+                targets: vec![],
+                frame_state,
+                source_pos: data.source_pos,
+            }, raw_double)
+        };
+        {
+            let site_data = f.inst_mut(site);
+            site_data.opcode = Opcode::BoxFloat;
+            site_data.args = vec![raw];
+            site_data.aux = AuxData::None;
+            site_data.flags = InstFlags { effectful: true, ..InstFlags::default() };
+            site_data.frame_state = None;
+        }
+        f.refine_type(data.results[0], IRType::of(TypeBits::DOUBLE_FLOAT));
+        // A successful builtin call resets the multiple values, as in the
+        // main rewrite.
+        let return_state = f.frame_states.add(f.frame_states.get(state).clone());
+        let (clear, _) = f.push_inst(block, InstData {
+            opcode: Opcode::ClearMv,
+            args: vec![],
+            results: vec![],
+            aux: AuxData::None,
+            flags: InstFlags { effectful: true, call: true, safepoint: true, ..InstFlags::default() },
+            targets: vec![],
+            frame_state: Some(return_state),
+            source_pos: data.source_pos,
+        }, &[]);
+        let insts = &mut f.block_mut(block).insts;
+        let appended = insts.pop();
+        debug_assert_eq!(appended, Some(clear));
+        let position = insts.iter().position(|&candidate| candidate == site)
+            .expect("speculation site remains in its block");
+        insts.insert(position + 1, clear);
+        n += 1;
+    }
+    n
+}
+
 /// Rewrite generic arithmetic `Call`s into single guarded typed ops guided by
 /// static SSA proof first, then `profile` (site `bcp` → the one speculated type,
 /// or `None` to leave generic).
@@ -1099,6 +1291,9 @@ pub fn speculate_with(
                 });
             }
         }
+    }
+    if options.double_float && cfg!(target_arch = "x86_64") {
+        n += speculate_double_only_sites(f, profile, &consts);
     }
     let self_sym = f
         .entry_frame_state
@@ -1805,10 +2000,16 @@ mod tests {
     // Build `(* a b)`: two params, a Call to `*` carrying a FrameState at bcp 2,
     // then a Return of the result. Returns (function, the call Inst).
     fn build_star() -> (Function, Inst) {
+        build_call("*", 2)
+    }
+
+    // `(name p0 .. pN-1)` over `argc` TOP parameters, returned.
+    fn build_call(name: &str, argc: usize) -> (Function, Inst) {
         let mut f = Function::new("m");
         let entry = f.entry();
-        let a = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
-        let b = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+        let params: Vec<Value> = (0..argc)
+            .map(|_| f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged))
+            .collect();
 
         let fs = f.frame_states.add(FrameState {
             scopes: vec![FrameScope {
@@ -1819,12 +2020,12 @@ mod tests {
             }],
             remat: vec![],
         });
-        let star = egcl_rt::symbols::intern("*");
+        let star = egcl_rt::symbols::intern(name);
         let (call, results) = f.push_inst(
             entry,
             crate::t2::ir::InstData {
                 opcode: Opcode::Call,
-                args: vec![a, b],
+                args: params,
                 results: vec![],
                 aux: AuxData::CallTarget(star),
                 flags: InstFlags {
@@ -2077,5 +2278,101 @@ mod tests {
             Opcode::Call,
             "polymorphic/cold site stays a Call"
         );
+    }
+
+    /// The raw operation feeding a rewritten site's escape box.
+    #[cfg(target_arch = "x86_64")]
+    fn raw_operation(f: &Function, site: Inst) -> &crate::t2::ir::InstData {
+        assert_eq!(f.inst(site).opcode, Opcode::BoxFloat);
+        let crate::t2::ir::ValueDef::Result { inst, .. } = f.value(f.inst(site).args[0]).def else {
+            panic!("the box takes an instruction result");
+        };
+        f.inst(inst)
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn proven_double_sqrt_becomes_a_guarded_raw_root() {
+        let (mut f, call) = build_call("SQRT", 1);
+        let x = f.block(f.entry()).params[0];
+        f.refine_type(x, IRType::of(TypeBits::DOUBLE_FLOAT));
+        // An unprofiled site answers a cold fixnum guess.
+        assert_eq!(speculate_with(&mut f, &|_| Some(SpecType::Fixnum), DOUBLE_FLOAT), 1);
+        let root = raw_operation(&f, call);
+        assert_eq!(root.opcode, Opcode::FloatSqrt);
+        assert!(root.flags.guard && root.frame_state.is_some(), "a negative operand deopts");
+        let crate::t2::ir::ValueDef::Result { inst: unbox, .. } = f.value(root.args[0]).def else {
+            panic!("unboxed operand");
+        };
+        assert_eq!(f.inst(unbox).opcode, Opcode::UnboxFloat);
+        assert!(!unbox_accepts_fixnum(&f.inst(unbox).aux), "(sqrt 4) is a single-float");
+        assert!(entry_opcodes(&f).contains(&Opcode::ClearMv));
+        assert!(crate::t2::verify::verify(&f).is_ok());
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn sqrt_needs_a_double_operand_and_an_undeclined_site() {
+        // Unknown operand, cold: stays generic.
+        let (mut f, call) = build_call("SQRT", 1);
+        assert_eq!(speculate_with(&mut f, &|_| Some(SpecType::Fixnum), DOUBLE_FLOAT), 0);
+        assert_eq!(f.inst(call).opcode, Opcode::Call);
+        // Unknown operand profiled as a double: raw.
+        let (mut f, call) = build_call("SQRT", 1);
+        assert_eq!(speculate_with(&mut f, &|_| Some(SpecType::DoubleFloat), DOUBLE_FLOAT), 1);
+        assert_eq!(raw_operation(&f, call).opcode, Opcode::FloatSqrt);
+        // A declined site (the profile answers None) stays generic.
+        let (mut f, call) = build_call("SQRT", 1);
+        let x = f.block(f.entry()).params[0];
+        f.refine_type(x, IRType::of(TypeBits::DOUBLE_FLOAT));
+        assert_eq!(speculate_with(&mut f, &|_| None, DOUBLE_FLOAT), 0);
+        assert_eq!(f.inst(call).opcode, Opcode::Call);
+        // The tagged artifact never compiles it raw.
+        let (mut f, call) = build_call("SQRT", 1);
+        let x = f.block(f.entry()).params[0];
+        f.refine_type(x, IRType::of(TypeBits::DOUBLE_FLOAT));
+        assert_eq!(speculate(&mut f, &|_| Some(SpecType::DoubleFloat)), 0);
+        assert_eq!(f.inst(call).opcode, Opcode::Call);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn double_negation_is_an_unguarded_sign_flip() {
+        let (mut f, call) = build_call("-", 1);
+        let x = f.block(f.entry()).params[0];
+        f.refine_type(x, IRType::of(TypeBits::DOUBLE_FLOAT));
+        assert_eq!(speculate_with(&mut f, &|_| Some(SpecType::Fixnum), DOUBLE_FLOAT), 1);
+        let negate = raw_operation(&f, call);
+        assert_eq!(negate.opcode, Opcode::FloatNeg);
+        assert!(!negate.flags.guard && negate.frame_state.is_none());
+        assert!(crate::t2::verify::verify(&f).is_ok());
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn double_division_guards_its_divisor() {
+        let (mut f, call) = build_call("/", 2);
+        for param in f.block(f.entry()).params.clone() {
+            f.refine_type(param, IRType::of(TypeBits::DOUBLE_FLOAT));
+        }
+        assert_eq!(speculate_with(&mut f, &|_| Some(SpecType::Fixnum), DOUBLE_FLOAT), 1);
+        let divide = raw_operation(&f, call);
+        assert_eq!(divide.opcode, Opcode::FloatDiv);
+        assert!(divide.flags.guard && divide.frame_state.is_some(), "a zero divisor deopts");
+        assert!(crate::t2::verify::verify(&f).is_ok());
+        // A declared fixnum dividend joins a double divisor by contagion.
+        let (mut f, call) = build_call("/", 2);
+        let params = f.block(f.entry()).params.clone();
+        f.refine_type(params[0], IRType::of(TypeBits::FIXNUM));
+        f.refine_type(params[1], IRType::of(TypeBits::DOUBLE_FLOAT));
+        assert_eq!(speculate_with(&mut f, &|_| Some(SpecType::Fixnum), DOUBLE_FLOAT), 1);
+        assert_eq!(raw_operation(&f, call).opcode, Opcode::FloatDiv);
+        // Two fixnums divide rationally, whatever the profile says.
+        let (mut f, call) = build_call("/", 2);
+        for param in f.block(f.entry()).params.clone() {
+            f.refine_type(param, IRType::of(TypeBits::FIXNUM));
+        }
+        assert_eq!(speculate_with(&mut f, &|_| Some(SpecType::DoubleFloat), DOUBLE_FLOAT), 0);
+        assert_eq!(f.inst(call).opcode, Opcode::Call);
     }
 }

@@ -350,6 +350,12 @@ pub enum Opcode {
     /// tagged value, so it is never a GC root (bliss-thcbb). Last, so earlier
     /// opcode indices named in decline logs keep their numbers.
     ConstDouble,
+    /// Raw double square root (`UnboxedF64` in and out). Guarded: a negative
+    /// operand deopts, since its root is a complex (bliss-lhy89).
+    FloatSqrt,
+    /// Raw double negation: flips the sign bit, so `(- 0d0)` is `-0d0` as in
+    /// the interpreter. Total; never deopts (bliss-lhy89).
+    FloatNeg,
 }
 
 impl Opcode {

@@ -293,7 +293,7 @@ fn eval(opcode: Opcode, aux: &AuxData, ops: &[IRType]) -> IRType {
         ConstT => return IRType::of(TypeBits::SYMBOL),
         ConstSymbol => return IRType::of(TypeBits::SYMBOL),
         ConstHeapObj => return IRType::TOP,
-        ConstDouble => return IRType::of(TypeBits::DOUBLE_FLOAT),
+        ConstDouble | FloatSqrt | FloatNeg => return IRType::of(TypeBits::DOUBLE_FLOAT),
         _ => {}
     }
 

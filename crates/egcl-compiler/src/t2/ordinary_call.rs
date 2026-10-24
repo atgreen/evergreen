@@ -563,8 +563,11 @@ pub fn emit_framed_ordinary_function_with_self_call_facts(
                         && (position == 0 || !returns.contains(&insts[position - 1])))
                     { return Err(declined("return of possibly multiple values")); }
                 }
-                // Arithmetic on raw doubles cannot fail and carries no guard.
+                // Raw double operations. Their shapes, including the deopt
+                // states of sqrt and division (bliss-lhy89), are checked by
+                // the raw representation validator.
                 Opcode::FloatAdd | Opcode::FloatSub | Opcode::FloatMul | Opcode::FloatDiv
+                | Opcode::FloatSqrt | Opcode::FloatNeg
                 | Opcode::FloatCmpEq | Opcode::FloatCmpLt | Opcode::FloatCmpLe
                 | Opcode::FloatCmpGt | Opcode::FloatCmpGe
                     if data.args.iter().all(|&v| f.value(v).repr == ValueRepresentation::UnboxedF64) => {}
