@@ -1906,12 +1906,9 @@ fn eval_sort_key_argument(
     name: &str,
 ) -> Result<Option<EgclVal>, EgclError> {
     egcl_rt::rooted_ref!(_rest_root = &mut rest);
-    egcl_rt::rooted!(key = NIL);
-    let mut have_key = false;
-    let mut allow_other_keys = false;
-    // Collect first so an unrecognized keyword is reported only after
+    // Evaluate first so an unrecognized keyword is reported only after
     // :allow-other-keys anywhere in the list has been seen (CLHS 3.4.1.4).
-    egcl_rt::rooted!(pairs = Vec::<(EgclVal, EgclVal)>::new());
+    egcl_rt::rooted!(values = Vec::<EgclVal>::new());
     while rest.is_cons() {
         let (kw, after_kw) = cp(rest);
         if !is_keyword_arg(kw) {
@@ -1925,24 +1922,38 @@ fn eval_sort_key_argument(
             )));
         }
         let (value_form, tail) = cp(after_kw);
+        values.push(kw);
         let value = eval_form(value_form, env)?;
-        pairs.push((kw, value));
+        values.push(value);
         rest = tail;
     }
-    for i in 0..pairs.len() {
-        let (kw, value) = pairs[i];
-        if sym_bare_name_rc(kw).as_ref() == "ALLOW-OTHER-KEYS" && !value.is_nil() {
+    sort_key_from_values(&values, name)
+}
+
+/// The :KEY of SORT/STABLE-SORT's evaluated keyword arguments, validated as
+/// [`eval_sort_key_argument`] documents. Allocation-free.
+fn sort_key_from_values(args: &[EgclVal], name: &str) -> Result<Option<EgclVal>, EgclError> {
+    if args.len() % 2 != 0 {
+        return Err(EgclError::ProgramError(format!(
+            "{name}: odd number of keyword arguments"
+        )));
+    }
+    let mut key = None;
+    let mut allow_other_keys = false;
+    for pair in args.chunks_exact(2) {
+        if !is_keyword_arg(pair[0]) {
+            return Err(EgclError::ProgramError(format!(
+                "{name}: a keyword argument name must be a keyword"
+            )));
+        }
+        if sym_bare_name_rc(pair[0]).as_ref() == "ALLOW-OTHER-KEYS" && !pair[1].is_nil() {
             allow_other_keys = true;
         }
     }
-    for i in 0..pairs.len() {
-        let (kw, value) = pairs[i];
-        match sym_bare_name_rc(kw).as_ref() {
+    for pair in args.chunks_exact(2) {
+        match sym_bare_name_rc(pair[0]).as_ref() {
             "KEY" => {
-                if !have_key {
-                    *key = value;
-                    have_key = true;
-                }
+                key.get_or_insert(pair[1]);
             }
             "ALLOW-OTHER-KEYS" => {}
             other => {
@@ -1954,11 +1965,20 @@ fn eval_sort_key_argument(
             }
         }
     }
-    Ok(if have_key && !key.is_nil() {
-        Some(*key)
-    } else {
-        None
-    })
+    Ok(key.filter(|key| !key.is_nil()))
+}
+
+/// SORT/STABLE-SORT on evaluated arguments.
+fn sort_values(name: &str, args: &[EgclVal], env: &mut Env) -> Result<EgclVal, EgclError> {
+    // SEQUENCE and PREDICATE are required; too few is a PROGRAM-ERROR, not a
+    // silent sort of NIL (ansi SORT.ERROR.1/2).
+    if args.len() < 2 {
+        return Err(EgclError::ProgramError(format!(
+            "{name} requires a sequence and a predicate"
+        )));
+    }
+    let key = sort_key_from_values(&args[2..], name)?;
+    sort_sequence(args[0], args[1], key, env)
 }
 
 fn is_keyword_arg(val: EgclVal) -> bool {
@@ -33738,39 +33758,103 @@ fn coerce_value(mut value: EgclVal, mut type_val: EgclVal) -> Result<EgclVal, Eg
 // bits, so `#'string<` and other real predicates produced wrong orders. This
 // runs in the evaluator, where functions can be called. Both SORT and
 // STABLE-SORT use this stable merge sort.
+/// The kernel slot of the builtin behind a SORT predicate or key that is a
+/// `#'name` wrapper, for `nargs` arguments. [`sort_call`] runs that kernel
+/// directly; the general route re-decodes the wrapper and enters the published
+/// callable entry on every comparison, which was most of a sort's cost
+/// (bliss-wfafo). Selected once per sort: the function object was evaluated
+/// before the sort began, so a definition installed for the name meanwhile
+/// does not change what it calls.
+fn sort_builtin_slot(function: EgclVal, nargs: usize) -> Option<u32> {
+    let closure = if function.is_cons() {
+        is_closure_cons(function).then_some(function)
+    } else {
+        reified_closure(function)
+    }?;
+    let id = cp(closure).1.as_fixnum() as u64;
+    if generic_wrapper_named(id) {
+        return None;
+    }
+    direct_builtin_slot_memoized(builtin_wrapper_symbol(id)?, nargs)
+}
+
+/// Call a SORT predicate or key, through its builtin's kernel when it has one.
+fn sort_call(
+    function: EgclVal,
+    slot: Option<u32>,
+    args: &[EgclVal],
+    env: &mut Env,
+) -> Result<EgclVal, EgclError> {
+    if let Some(slot) = slot {
+        // Kernels may allocate before they finish reading their arguments,
+        // so they get rooted copies, as from apply_function.
+        egcl_rt::rooted!(rooted = [NIL; 2]);
+        rooted[..args.len()].copy_from_slice(args);
+        // A kernel that declines has done nothing, so `function` is current.
+        if let Some(result) = call_direct_builtin(slot, &rooted[..args.len()], env) {
+            return result;
+        }
+    }
+    apply_function(function, args, env)
+}
+
+/// SORT's predicate and optional key, with their builtins' kernel slots.
+#[derive(Clone, Copy)]
+struct SortFns {
+    predicate: EgclVal,
+    predicate_slot: Option<u32>,
+    key: Option<EgclVal>,
+    key_slot: Option<u32>,
+}
+
+impl SortFns {
+    fn new(predicate: EgclVal, key: Option<EgclVal>) -> SortFns {
+        let key = key.filter(|key| !key.is_nil());
+        SortFns {
+            predicate,
+            predicate_slot: sort_builtin_slot(predicate, 2),
+            key,
+            key_slot: key.and_then(|key| sort_builtin_slot(key, 1)),
+        }
+    }
+}
+
+impl egcl_rt::gc::TraceHostRoots for SortFns {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
+        visit(&mut self.predicate);
+        if let Some(key) = &mut self.key {
+            visit(key);
+        }
+    }
+}
+
 fn sort_less(
-    mut predicate: EgclVal,
-    mut key: Option<EgclVal>,
+    fns: &SortFns,
     mut a: EgclVal,
     mut b: EgclVal,
     env: &mut Env,
 ) -> Result<bool, EgclError> {
-    // A callback can move both callable objects and the next comparison value.
-    // Roots in our caller do not update these by-value copies (bliss-99150).
-    egcl_rt::rooted_ref!(_predicate_root = &mut predicate);
-    egcl_rt::rooted_ref!(_key_root = &mut key);
+    // A callback can move the next comparison value. Roots in our caller do
+    // not update these by-value copies (bliss-99150); `fns` is rooted there.
     egcl_rt::rooted_ref!(_a_root = &mut a);
     egcl_rt::rooted_ref!(_b_root = &mut b);
-    let mut ka = match key {
-        Some(k) if !k.is_nil() => apply_function(k, &[a], env)?,
-        _ => a,
+    let mut ka = match fns.key {
+        Some(k) => sort_call(k, fns.key_slot, &[a], env)?,
+        None => a,
     };
     egcl_rt::rooted_ref!(_ka_root = &mut ka);
-    let kb = match key {
-        Some(k) if !k.is_nil() => apply_function(k, &[b], env)?,
-        _ => b,
+    let kb = match fns.key {
+        Some(k) => sort_call(k, fns.key_slot, &[b], env)?,
+        None => b,
     };
-    Ok(!apply_function(predicate, &[ka, kb], env)?.is_nil())
+    Ok(!sort_call(fns.predicate, fns.predicate_slot, &[ka, kb], env)?.is_nil())
 }
 
 fn merge_sort_pred(
     elems: &mut [EgclVal],
-    mut predicate: EgclVal,
-    mut key: Option<EgclVal>,
+    fns: &SortFns,
     env: &mut Env,
 ) -> Result<(), EgclError> {
-    egcl_rt::rooted_ref!(_predicate_root = &mut predicate);
-    egcl_rt::rooted_ref!(_key_root = &mut key);
     let n = elems.len();
     if n <= 1 {
         return Ok(());
@@ -33782,12 +33866,12 @@ fn merge_sort_pred(
     // comparison runs user code that can relocate these Vec-resident elements.
     egcl_rt::rooted_ref!(_lg = &mut left);
     egcl_rt::rooted_ref!(_rg = &mut right);
-    merge_sort_pred(&mut left, predicate, key, env)?;
-    merge_sort_pred(&mut right, predicate, key, env)?;
+    merge_sort_pred(&mut left, fns, env)?;
+    merge_sort_pred(&mut right, fns, env)?;
     let (mut i, mut j, mut k) = (0usize, 0usize, 0usize);
     while i < left.len() && j < right.len() {
         // Stable: keep left before right unless right is strictly less.
-        if sort_less(predicate, key, right[j], left[i], env)? {
+        if sort_less(fns, right[j], left[i], env)? {
             elems[k] = right[j];
             j += 1;
         } else {
@@ -33855,7 +33939,9 @@ fn sort_sequence(
         v
     };
     egcl_rt::rooted_ref!(_eg = &mut elems);
-    merge_sort_pred(&mut elems, predicate, key, env)?;
+    let mut fns = SortFns::new(predicate, key);
+    egcl_rt::rooted_ref!(_fns_root = &mut fns);
+    merge_sort_pred(&mut elems, &fns, env)?;
     if is_list {
         Ok(vec_to_list(&elems))
     } else {
@@ -49879,7 +49965,9 @@ mod sort_rooting_tests {
         egcl_rt::rooted!(a = arena_cons(EgclVal::from_fixnum(1), NIL));
         egcl_rt::rooted!(b = arena_cons(EgclVal::from_fixnum(2), NIL));
         let before_b = b.to_raw();
-        assert!(sort_less(predicate, Some(key), *a, *b, &mut env).unwrap());
+        let mut fns = SortFns::new(predicate, Some(key));
+        egcl_rt::rooted_ref!(_fns_root = &mut fns);
+        assert!(sort_less(&fns, *a, *b, &mut env).unwrap());
         assert_ne!(
             b.to_raw(),
             before_b,

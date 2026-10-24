@@ -1385,6 +1385,10 @@ fn resolve(name: &str) -> Option<Handler> {
             super::string_value(args[0])
         }),
         "VECTOR" => Some(|_operator, args, _env| Ok(egcl_stdlib::build_simple_vector(args))),
+        "SORT" | "STABLE-SORT" => Some(|operator, args, env| {
+            let operator = operator.rsplit(':').next().unwrap_or(operator);
+            super::sort_values(operator, args, env)
+        }),
         "FIND-PACKAGE" => Some(|_operator, args, env| {
             Ok(args
                 .first()
