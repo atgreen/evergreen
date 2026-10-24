@@ -88,6 +88,13 @@
 
 ### Performance
 
+- A minor garbage collection costs time in proportion to the data that
+  survives it, not to how much was allocated since the last one. It no longer
+  walks every object in the 64 MB nursery to find pinned objects, and no longer
+  clears every byte of the reclaimed space during the pause; the space is
+  cleared as it is handed out again. On x86-64 Linux a loop that allocates
+  heavily but keeps nothing alive pauses about 7 ms per collection instead of
+  about 48 ms ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
 - `funcall` and `apply` of a function object whose optimized native code is
   already installed run that code directly, instead of working out again on
   every call how to call the object. On x86-64 Linux, a warmed loop of
