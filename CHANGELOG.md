@@ -100,7 +100,7 @@
   of 28 µs. `type-of`, `boundp` and `string=` drop from 19–26 µs to about
   4.5 µs a call, `member` and `assoc` with `:test` from about 30 µs to 7 µs,
   and `mapcar` and `format nil` from about 32 µs to 14 µs
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#618](https://github.com/atgreen/evergreen/pull/618)).
 - `(require :asdf)` takes about half as long: 6.4 s instead of 11.8 s on an
   x86-64 Linux release build, which shortens every start whose `~/.egclrc`
   loads ASDF. UIOP's `define-package` spent most of that time in symbol and
