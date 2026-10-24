@@ -115,9 +115,9 @@ use super::ir::{
     ValueRepresentation,
 };
 use super::mach::{Location, RegClass};
-use std::collections::{HashMap, HashSet};
 use egcl_rt::asm::{Asm, Cc, a64};
-use egcl_rt::value::{NIL, T, EgclVal, UNBOUND};
+use egcl_rt::value::{EgclVal, NIL, T, UNBOUND};
+use std::collections::{HashMap, HashSet};
 
 /// Primary working register, and the C ABI's first argument and return register.
 const W0: a64::Reg = 0;
@@ -432,10 +432,46 @@ impl Emitter<'_> {
     fn guard_cons(&mut self, register: a64::Reg, deopt: egcl_rt::asm::Label) {
         self.asm
             .word(a64::and_imm(T0, register, 7).expect("7 is a logical immediate"));
-        self.asm.word(
-            a64::cmp_imm(T0, egcl_rt::value::TAG_CONS).expect("1 is an add-immediate"),
-        );
+        self.asm
+            .word(a64::cmp_imm(T0, egcl_rt::value::TAG_CONS).expect("1 is an add-immediate"));
         self.asm.jcc(Cc::Ne, deopt);
+    }
+
+    /// Bounds half of a fixnum guard, mirroring emit.rs's `emit_fixnum_guard`.
+    /// W0 holds the tagged operand and has already passed the tag check.
+    ///
+    /// Tagged fixnums preserve signed integer ordering, so the comparison can
+    /// be done on the tagged words directly -- the bounds are shifted into
+    /// the tagged domain rather than the operand being untagged. The range is
+    /// first intersected with what the tag can represent; an empty
+    /// intersection can never hold, so it deopts unconditionally.
+    fn guard_fixnum_range(
+        &mut self,
+        ty: &crate::t2::ir::IRType,
+        deopt: egcl_rt::asm::Label,
+    ) -> Result<(), EmitError> {
+        const FIXNUM_MAX: i64 = (1 << 60) - 1;
+        const FIXNUM_MIN: i64 = -(1 << 60);
+        let Some(range) = ty.range else {
+            return Ok(());
+        };
+        let lo = range.lo.max(FIXNUM_MIN);
+        let hi = range.hi.min(FIXNUM_MAX);
+        if lo > hi {
+            self.asm.jmp(deopt);
+            return Ok(());
+        }
+        if lo > FIXNUM_MIN {
+            self.imm(T0, (lo << 3) as u64);
+            self.compare(W0, T0);
+            self.asm.jcc(Cc::L, deopt);
+        }
+        if hi < FIXNUM_MAX {
+            self.imm(T0, (hi << 3) as u64);
+            self.compare(W0, T0);
+            self.asm.jcc(Cc::G, deopt);
+        }
+        Ok(())
     }
 
     /// Branch to `target` when W0 equals the tagged constant `bits`.
@@ -887,11 +923,19 @@ impl Emitter<'_> {
                 let deopt = self.deopt_label(data)?;
                 match &data.aux {
                     AuxData::TypeTag(ty) if ty.bits == TypeBits::FIXNUM => {
-                        self.guard_fixnum(W0, deopt)
+                        self.guard_fixnum(W0, deopt);
+                        // The tag alone is not the whole guard. A declared
+                        // `(integer lo hi)` reaches here as a FIXNUM TypeTag
+                        // carrying a RANGE, and dropping it does not merely
+                        // lose an optimisation -- it loses a check the program
+                        // can observe. `CheckResult` on a declared FTYPE
+                        // lowers to exactly this guard, so without the bounds
+                        // a function declared `(integer 0 100000)` quietly
+                        // returned 100001 where every other tier signals a
+                        // TYPE-ERROR.
+                        self.guard_fixnum_range(ty, deopt)?;
                     }
-                    AuxData::TypeTag(ty) if ty.bits == TypeBits::CONS => {
-                        self.guard_cons(W0, deopt)
-                    }
+                    AuxData::TypeTag(ty) if ty.bits == TypeBits::CONS => self.guard_cons(W0, deopt),
                     _ => self.guard_single_float(W0, deopt),
                 }
             }
