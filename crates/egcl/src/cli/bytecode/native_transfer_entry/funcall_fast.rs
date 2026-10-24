@@ -149,17 +149,17 @@ fn lookup(function: EgclVal) -> Option<Target> {
 }
 
 /// Select the target the general route would run, and remember it.
-/// May allocate (registry repair, lookups); the caller roots `function` and
-/// publishes any native caller.
+/// Selection reads Rust-side registries only and should never collect; if a
+/// collection does intervene, the selected target's callable may have moved,
+/// so this declines rather than run it, and the caller takes the general
+/// route. The caller roots `function` and publishes any native caller.
 fn fill(function: EgclVal, nargs: usize) -> Option<Target> {
     let collections = TABLE.with(|table| table.collections.get());
     let epoch = egcl_rt::call_table::invalidation_epoch();
     let target = select(function, nargs)?;
     TABLE.with(|table| {
-        // A collection during selection may have moved or freed the object
-        // whose bits name this entry.
         if table.collections.get() != collections {
-            return;
+            return None;
         }
         let index = table.next.get();
         table.next.set((index + 1) % table.entries.len());
@@ -168,8 +168,8 @@ fn fill(function: EgclVal, nargs: usize) -> Option<Target> {
         entry.revision.set(epoch);
         // The previous target, if any, drops here, in its own execution.
         drop(entry.target.replace(Some(target.clone())));
-    });
-    Some(target)
+        Some(target)
+    })
 }
 
 fn lookup_or_fill(function: EgclVal, nargs: usize) -> Option<Target> {
