@@ -399,7 +399,7 @@
   compiled are released once it has exited. The issue's joined churn now grows
   by about 1.5 KB per thread, down from 88 KB, so a thread-per-connection
   server no longer leaks most of that per connection
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#598](https://github.com/atgreen/evergreen/pull/598)).
 - Allocating an instance or a structure no longer discards every cached
   class precedence list, and a structure constructor no longer recomputes
   its class's precedence list on each call
