@@ -20706,7 +20706,7 @@ struct NativeEmission {
 /// which case the caller MUST reject installation (R4.46: no safepoint without a
 /// stack map). Every activation slot is a tagged EgclVal, so its ref bitmap
 /// marks all `num_slots` slots (an unboxed slot would clear its bit; the T1
-/// baseline emits none). The bitmap and entry table are leaked for the lifetime
+/// baseline emits none). The bitmap and CodeInfo are leaked for the lifetime
 /// of the installed code.
 fn install_stack_map(
     num_slots: u16,
@@ -20723,8 +20723,9 @@ fn install_stack_map(
         bytes: bitmap.as_ptr() as usize,
         len: bitmap.len(),
     };
-    let entries: &'static [StackMapEntry] = Box::leak(vec![entry].into_boxed_slice());
-    let ci = CodeInfo::new_jit(&[], entries, debug_info);
+    // `new_jit` copies the entry table into its own allocation, so leaking a
+    // second copy here only cost memory on every compile (bliss-orayb).
+    let ci = CodeInfo::new_jit(&[], &[entry], debug_info);
     // Validate the entry safepoint (pc 0) resolves to the installed map. A frame
     // with reference slots must have a non-empty map; a leaf frame with no
     // reference slots legitimately has none.

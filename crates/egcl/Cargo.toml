@@ -43,6 +43,11 @@ egcl-compiler.workspace = true
 egcl-stdlib.workspace = true
 iced-x86 = { version = "1.21.0", default-features = false, features = ["decoder", "nasm", "std"] }
 
+# The musl thread-cache allocator flushes an exiting thread's cache through a
+# pthread thread-specific-data destructor (bliss-orayb).
+[target.'cfg(target_env = "musl")'.dependencies]
+libc = "0.2"
+
 [target.'cfg(windows)'.dev-dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Diagnostics_Debug", "Win32_System_Kernel", "Win32_System_Threading"] }
 

@@ -226,6 +226,21 @@ struct Binding {
     cells: Vec<Weak<CallCell>>,
 }
 
+impl Binding {
+    /// Index one more execution's cell. Each execution (native thread or
+    /// fiber) owns its own cell for a name, and its retirement drops it, but a
+    /// dead `Weak` still pins the cell's allocation. Sweep them out before the
+    /// vector would grow, so a thread-per-task workload keeps this bounded by
+    /// about twice the live executions instead of growing with every thread
+    /// that ever ran (bliss-orayb). The sweep is amortized O(1) per push.
+    fn push_cell(&mut self, cell: &Arc<CallCell>) {
+        if self.cells.len() == self.cells.capacity() {
+            self.cells.retain(|weak| weak.strong_count() > 0);
+        }
+        self.cells.push(Arc::downgrade(cell));
+    }
+}
+
 #[derive(Default)]
 struct Table {
     by_symbol: HashMap<u32, usize, crate::fxhash::FxBuildHasher>,
@@ -321,7 +336,7 @@ pub fn register(cell: &Arc<CallCell>) {
         .unwrap();
     let binding = &mut table.bindings[cell.ordinal];
     cell.revision.store(binding.revision, Ordering::Release);
-    binding.cells.push(Arc::downgrade(cell));
+    binding.push_cell(cell);
 }
 
 /// Capture before resolving a cold target. Publication checks it under the
@@ -509,6 +524,24 @@ mod tests {
         assert!(binder.accepts(0, ORDINARY_ENV_NONE));
         assert!(binder.accepts(19, ORDINARY_ENV_NONE));
         assert!(!binder.accepts(19, ORDINARY_ENV_CLOSURE));
+    }
+
+    #[test]
+    fn retired_execution_cells_do_not_accumulate_in_their_binding() {
+        let mut table = Table::default();
+        let ordinal = table.ordinal(23);
+        let live = Arc::new(CallCell::new(ordinal, 11, 12));
+        table.bindings[ordinal].push_cell(&live);
+        // A thousand short-lived executions each register and drop a cell.
+        for _ in 0..1000 {
+            let retired = Arc::new(CallCell::new(ordinal, 11, 12));
+            table.bindings[ordinal].push_cell(&retired);
+        }
+        let cells = &table.bindings[ordinal].cells;
+        assert!(cells.len() <= 4, "dead cells kept: {}", cells.len());
+        assert!(cells.iter().any(|weak| weak.as_ptr() == Arc::as_ptr(&live)));
+        table.invalidate(ordinal);
+        assert_eq!(live.revision.load(Ordering::Acquire), 1);
     }
 
     #[test]

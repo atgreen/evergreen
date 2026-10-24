@@ -667,8 +667,8 @@ impl CodeInfo {
     /// Native debug identity comes from the same DWARF image used by GDB.
     /// The weak handle cannot extend code/debug registration lifetime.
     pub fn new_jit(
-        source_locations: &'static [SourceLocationEntry],
-        stack_maps: &'static [StackMapEntry],
+        source_locations: &[SourceLocationEntry],
+        stack_maps: &[StackMapEntry],
         debug_info: std::sync::Weak<crate::jit_debug::DwarfImage>,
     ) -> &'static Self {
         Box::leak(Box::new(Self {
