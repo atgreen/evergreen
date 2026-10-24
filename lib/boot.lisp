@@ -1639,26 +1639,71 @@ Returns NIL."
 ;;; ---------------------------------------------------------------------------
 
 (defun reduce (fn seq &key key from-end (start 0) end (initial-value nil ivp))
-  ;; A FUNCTION is not a sequence. REDUCE reaches its elements through
-  ;; (coerce seq 'list), and COERCE hands a function straight back rather than
-  ;; rejecting it, so the closure — structurally a cons — was then walked and
-  ;; the error blamed its cdr instead of the function (ansi REDUCE.ERROR.1).
-  ;; The COERCE gap itself is wider than this one caller; see bliss-hvfe.
+  ;; A FUNCTION is not a sequence (ansi REDUCE.ERROR.1); COERCE would hand a
+  ;; function straight back. See bliss-hvfe.
   (when (functionp seq)
     (error 'type-error :datum seq :expected-type 'sequence))
-  ;; NB: distinguish an explicit `:initial-value nil` from an omitted one via the
-  ;; supplied-p flag IVP — otherwise (reduce f seq :initial-value nil) on an empty
-  ;; sequence wrongly calls (f) with zero args (bliss-lb6.14: UIOP timestamps).
-  (let ((items (coerce seq 'list)))
-    (when (or (> start 0) end)
-      (setq items (subseq items start (or end (length items)))))
-    (when key (setq items (mapcar key items)))
-    (when from-end (setq items (reverse items)))
-    (if (null items)
+  ;; Walk the bounded range in place: index a vector, NTHCDR a list. The old
+  ;; definition coerced the WHOLE sequence to a list, copied the range with
+  ;; SUBSEQ and mapped KEY into a third list before reducing -- about 8 us
+  ;; per element on a large vector, whatever START and END said (bliss-kn680).
+  ;; IVP distinguishes an explicit `:initial-value nil` from an omitted one
+  ;; (bliss-lb6.14).
+  (let* ((len (length seq))
+         (stop (if end end len)))
+    (unless (and (integerp start) (<= 0 start len))
+      (error 'type-error :datum start :expected-type `(integer 0 ,len)))
+    (unless (and (integerp stop) (<= start stop len))
+      (error 'type-error :datum stop :expected-type `(integer ,start ,len)))
+    (if (= start stop)
         (if ivp initial-value (funcall fn))
-        (let ((acc (if ivp initial-value (pop items))))
-          (dolist (x items acc)
-            (setq acc (if from-end (funcall fn x acc) (funcall fn acc x))))))))
+        (if (listp seq)
+            (let* ((tail (nthcdr start seq))
+                   (count (- stop start))
+                   (items (if from-end
+                              (let ((acc nil))
+                                (dotimes (i count acc)
+                                  (push (car tail) acc)
+                                  (setq tail (cdr tail))))
+                              nil)))
+              (if from-end
+                  (let ((acc (if ivp
+                                 initial-value
+                                 (let ((e (pop items))) (if key (funcall key e) e)))))
+                    (dolist (x items acc)
+                      (setq acc (funcall fn (if key (funcall key x) x) acc))))
+                  (let ((acc (if ivp
+                                 initial-value
+                                 (let ((e (car tail)))
+                                   (setq tail (cdr tail) count (1- count))
+                                   (if key (funcall key e) e)))))
+                    (dotimes (i count acc)
+                      (let ((x (car tail)))
+                        (setq tail (cdr tail))
+                        (setq acc (funcall fn acc (if key (funcall key x) x))))))))
+            (if from-end
+                (let* ((i (1- stop))
+                       (acc (if ivp
+                                initial-value
+                                (let ((e (aref seq i)))
+                                  (setq i (1- i))
+                                  (if key (funcall key e) e)))))
+                  (loop while (>= i start)
+                        do (let ((x (aref seq i)))
+                             (setq acc (funcall fn (if key (funcall key x) x) acc))
+                             (setq i (1- i))))
+                  acc)
+                (let* ((i start)
+                       (acc (if ivp
+                                initial-value
+                                (let ((e (aref seq i)))
+                                  (setq i (1+ i))
+                                  (if key (funcall key e) e)))))
+                  (loop while (< i stop)
+                        do (let ((x (aref seq i)))
+                             (setq acc (funcall fn acc (if key (funcall key x) x)))
+                             (setq i (1+ i))))
+                  acc))))))
 
 ;; The FIND and COUNT families test inline, like POSITION, rather than through
 ;; a local FLET: a FLET that refers to PRED, KEY or SEQ is a closure, and a
