@@ -243,7 +243,9 @@ fn escape_boxes_survive_gc_stress() {
         (defun keep (v x) (let ((r (+ x 1d0))) (cons v r))) \
         (defun lerp3 (a b u) (list (+ a (* (- b a) u)) (- a u) (* a b))) \
         (defun acc (n x) (let ((s 0d0)) (dotimes (i n s) (setq s (+ s (* x 0.5d0)))))) \
-        (dotimes (i 3) (keep (cons 1 2) 1d0) (lerp3 1d0 3d0 0.5d0) (acc 5 1d0)) \
+        (loop repeat 200 \
+              until (every (lambda (f) (eql 2 (egcl-ext:function-tier f))) '(keep lerp3 acc)) \
+              do (keep (cons 1 2) 1d0) (lerp3 1d0 3d0 0.5d0) (acc 5 1d0)) \
         (format t \"TIERS ~S~%\" (mapcar #'egcl-ext:function-tier '(keep lerp3 acc))) \
         (format t \"RESULT ~S~%\" \
           (list (loop for i below 20 collect (keep (list i) (* i 1d0))) \
@@ -258,6 +260,8 @@ fn escape_boxes_survive_gc_stress() {
         ("EGCL_GC_POISON", "1"),
         ("EGCL_GC_STRESS_AFTER_INIT", "1"),
     ]);
+    assert!(stressed.contains("TIERS (2 2 2)"), "{stressed}
+{stderr}");
     let result = |out: &str| out.lines().find(|line| line.starts_with("RESULT")).map(str::to_owned);
     assert!(result(&expected).is_some(), "{expected}");
     assert_eq!(result(&stressed), result(&expected), "{stressed}\n{stderr}");

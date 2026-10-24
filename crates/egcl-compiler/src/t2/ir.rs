@@ -222,10 +222,6 @@ pub enum Opcode {
     ConstNil,
     ConstT,
     ConstHeapObj,
-    /// A raw `f64` constant (`AuxData::DoubleImm` bits) in the `UnboxedF64`
-    /// representation. Produced only by double-float speculation; never a
-    /// tagged value, so it is never a GC root (bliss-thcbb).
-    ConstDouble,
     // Cat 2 — arithmetic / logic
     FixnumAdd,
     FixnumSub,
@@ -349,6 +345,11 @@ pub enum Opcode {
     /// branches on NIL to the real call, which supplies every other result and
     /// error. Effectful only to keep it ordered after stores to the string.
     StringCharOrNil,
+    /// A raw `f64` constant (`AuxData::DoubleImm` bits) in the `UnboxedF64`
+    /// representation. Produced only by double-float speculation; never a
+    /// tagged value, so it is never a GC root (bliss-thcbb). Last, so earlier
+    /// opcode indices named in decline logs keep their numbers.
+    ConstDouble,
 }
 
 impl Opcode {

@@ -118,6 +118,17 @@
   guessed to be fixnum now recompiles after its first wrong guess instead of
   after eight deoptimizations
   ([#590](https://github.com/atgreen/evergreen/pull/590)).
+- On x86-64 Linux, double-float arithmetic compiles natively in the T2 tier.
+  `+`, `-` and `*` of two numbers, at least one of them a double-float, and
+  the comparisons `<`, `<=`, `>`, `>=` and `=` on double-floats now run on
+  unboxed doubles. A double stays in a register from one operation to the
+  next and across loop iterations, and is boxed only when it is returned,
+  passed to a call or stored. Results are the interpreter's, including
+  contagion with fixnums, signed zeros, infinities and comparisons with NaN.
+  Ten million iterations of `(setq s (+ s 1d0))` drop from about 2.9 s to
+  0.05 s, the same as the fixnum loop, and a double-float Fibonacci,
+  `(ffib 27d0)`, from about 3.2 s to 0.15 s
+  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
 - A function containing `load-time-value` compiles in the running image, with
   each `load-time-value` form evaluated once when the function is compiled. It
   stayed in the interpreter and evaluated the forms on every call, so
