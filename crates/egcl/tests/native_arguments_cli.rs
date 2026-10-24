@@ -214,11 +214,7 @@ fn original_arguments_survive_native_deoptimization() {
 
 #[test]
 fn osr_keeps_original_arguments_in_the_logical_frame() {
-    let comparison = if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
-        "="
-    } else {
-        ">"
-    };
+    let comparison = ">";
     let program = format!(
         r#"
       (defun osr-native-arguments (value)

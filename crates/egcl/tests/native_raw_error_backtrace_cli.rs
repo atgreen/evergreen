@@ -153,11 +153,7 @@ fn t2_direct_type_error_retains_the_original_call_chain() {
 
 #[test]
 fn osr_error_keeps_its_loop_frame_and_condition_type() {
-    let comparison = if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
-        "="
-    } else {
-        ">"
-    };
+    let comparison = ">";
     let program = format!(
         r#"
       (defun native-osr-failure ()

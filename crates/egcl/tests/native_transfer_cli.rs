@@ -222,11 +222,7 @@ fn t2_calls_stop_before_later_side_effects() {
 
 #[test]
 fn osr_calls_stop_before_later_side_effects() {
-    let comparison = if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
-        "="
-    } else {
-        ">"
-    };
+    let comparison = ">";
     let program = format!(
         r#"
         (defvar *after-transfer* 0)
@@ -390,14 +386,21 @@ fn osr_transfers_preserve_inherited_handlers_and_cleanup_order() {
     // unwinding GO must run cleanup exactly once, and outer GO must keep
     // the handler stack inherited from the interpreter consistent.
     let program = include_str!("fixtures/native-transfer-osr.lisp");
-    // Linux deliberately keeps these current-frame OSR shapes interpreted.
-    // Preserve every handler/cleanup oracle and require the counts to stay
-    // unchanged; other platforms retain the shared fixture's OSR assertions.
+    // Linux enters mapped code from T0 only when the activation holds no
+    // registered handler (bliss-s0v50), so a loop inside a HANDLER-CASE or a
+    // CATCH of its own function stays interpreted. Preserve every
+    // handler/cleanup oracle and require those counts to stay unchanged; the
+    // plain nested loop must still enter native code.
     let program = if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
-        program.replace(
-            "(> (egcl-ext:function-osr-count",
-            "(= (egcl-ext:function-osr-count",
-        )
+        program
+            .replace(
+                "(> (egcl-ext:function-osr-count 'jit-protected-loop",
+                "(= (egcl-ext:function-osr-count 'jit-protected-loop",
+            )
+            .replace(
+                "(> (egcl-ext:function-osr-count 'jit-expired-catch",
+                "(= (egcl-ext:function-osr-count 'jit-expired-catch",
+            )
     } else {
         program.to_owned()
     };

@@ -122,11 +122,55 @@ impl Pass for GuardElim {
             }
         }
 
+        // Any other guard result an OSR state imports carries a proof made
+        // outside the loop, on a path the entry skips: the lower tier's frame
+        // may hold a value the guard would have rejected (a T0 activation
+        // resumed by an earlier deopt does, bliss-s0v50). Check it at the
+        // entry too; a backend that cannot test the type declines the entry.
+        // The CFG is unchanged, so `dom` still holds.
+        changed |= check_imported_guard_results(f, &dom);
+
         if changed {
             // Value definitions moved / were forwarded; drop derived analyses.
             a.invalidate();
         }
     }
+}
+
+/// Add an entry check for each guard result an OSR entry imports whose guard
+/// does not run on the entry's path into the loop. Returns whether any was added.
+fn check_imported_guard_results(f: &mut Function, dom: &crate::t2::ir::DominatorTree) -> bool {
+    let inst_block = inst_block_map(f);
+    let mut added = false;
+    for index in 0..f.osr_entries.len() {
+        let header = f.osr_entries[index].block;
+        let state = f.frame_states.get(f.osr_entries[index].frame_state);
+        let imported: Vec<Value> = state.scopes.iter()
+            .flat_map(|scope| scope.locals.iter().chain(&scope.stack))
+            .filter_map(|source| match source {
+                ValueSource::Value { value, .. } => Some(*value),
+                _ => None,
+            })
+            .collect();
+        for value in imported {
+            let ValueDef::Result { inst, .. } = f.value(value).def else { continue };
+            let data = f.inst(inst);
+            let (Opcode::Guard, AuxData::TypeTag(ty)) = (data.opcode, &data.aux) else { continue };
+            let ty = *ty;
+            // A guard the header dominates runs again after the entry.
+            if inst_block.get(inst.index()).copied().flatten()
+                .is_some_and(|block| dom.dominates(header, block))
+            {
+                continue;
+            }
+            let checks = &mut f.osr_entries[index].checks;
+            if !checks.iter().any(|&(checked, _)| checked == value) {
+                checks.push((value, ty));
+                added = true;
+            }
+        }
+    }
+    added
 }
 
 // ── Transform 1: inference-proven guards ────────────────────────────

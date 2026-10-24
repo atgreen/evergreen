@@ -1971,7 +1971,7 @@ impl<'a> Builder<'a> {
                     self.emit_effect(block, Opcode::ClearMv, vec![], AuxData::None, Some(fs));
                 }
                 Instr::TakeValuesToLocals { nvars, slot_base } => {
-                    let fs = self.build_frame_state(block, &stack, i as u32);
+                    let fs = (*nvars != 1).then(|| self.build_frame_state(block, &stack, i as u32));
                     let primary = stack.pop().ok_or(BuildError::Unsupported(
                         "stack underflow (TakeValuesToLocals)",
                     ))?;
@@ -1979,6 +1979,15 @@ impl<'a> Builder<'a> {
                         return Err(BuildError::Unsupported(
                             "TakeValuesToLocals destination out of range",
                         ));
+                    }
+                    // A one-variable binder (SETF's store value, as PUSH and
+                    // DECF expand) stores the primary and leaves the MV state
+                    // alone, exactly as T0 runs it: a plain local write, which
+                    // keeps such bodies eligible for the ordinary entry
+                    // (bliss-z4dlm).
+                    if *nvars == 1 {
+                        self.write_var(Var::Local(*slot_base), block, primary);
+                        continue;
                     }
                     let result_types =
                         vec![(IRType::TOP, ValueRepresentation::Tagged); *nvars as usize];
@@ -1994,7 +2003,7 @@ impl<'a> Builder<'a> {
                             },
                             flags: runtime_call_flags(),
                             targets: vec![],
-                            frame_state: Some(fs),
+                            frame_state: fs,
                             source_pos: 0,
                         },
                         &result_types,

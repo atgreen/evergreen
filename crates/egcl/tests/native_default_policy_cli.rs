@@ -109,13 +109,15 @@ fn linux_default_compiles_optional_parameters_and_preserves_transfers() {
 }
 
 #[test]
-fn linux_default_keeps_hot_unsupported_loop_in_interpreter() {
-    // The closure captures SUM, so the mapped entry cannot bind it.
+fn linux_default_promotes_a_once_called_captured_loop_by_osr() {
+    // The closure captures the &KEY parameter SUM. Called once, the function
+    // never reaches the invocation gate: its loop enters mapped T1 by OSR
+    // (bliss-s0v50), carrying the captured binding with its activation.
     let output = run("(defun policy-loop (n &key (sum 0))
           (dotimes (i n (funcall (lambda () sum))) (incf sum i)))
         (assert (= 780 (policy-loop 40)))
         (format t \"POLICY-LOOP=~D OSR=~D~%\"
           (egcl-ext:function-tier 'policy-loop)
           (egcl-ext:function-osr-count 'policy-loop))");
-    assert!(output.contains("POLICY-LOOP=0 OSR=0"), "{output}");
+    assert!(output.contains("POLICY-LOOP=1 OSR=1"), "{output}");
 }

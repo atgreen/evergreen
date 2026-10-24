@@ -18016,6 +18016,24 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                 // is empty, finish the activation in native code instead of
                 // interpreting the rest of the loop.
                 match maybe_osr(&acts[top_idx], target_bcp, env) {
+                    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+                    Some(Ok(OsrOutcome::Retired(result))) => {
+                        // The mapped activation already popped this frame.
+                        let mut act = acts.pop().expect("the OSR source is the top activation");
+                        release_activation_handlers(&mut act, stack, env);
+                        drop(act);
+                        match result {
+                            Ok(v) => match acts.last_mut() {
+                                Some(caller) => caller.push_op(v),
+                                None => return Ok(v),
+                            },
+                            Err(e) if acts.is_empty() => return Err(e),
+                            Err(e) => {
+                                let pending = error_to_pending(e, env);
+                                initiate_unwind(acts, stack, env, pending)?;
+                            }
+                        }
+                    }
                     Some(Ok(OsrOutcome::Finished(v))) => {
                         release_activation_handlers(&mut acts[top_idx], stack, env);
                         stack.pop_frame();
@@ -26256,6 +26274,10 @@ fn compile_osr_code(bf: &Arc<BytecodeFunction>, sym: u32) -> Option<Rc<OsrCode>>
 /// and (peek-preserved) operands, so no value transfer is needed (`Deopt`).
 enum OsrOutcome {
     Finished(EgclVal),
+    /// Mapped code took over the activation's frame and retired it; the
+    /// activation is complete with this result (bliss-s0v50).
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    Retired(Result<EgclVal, EgclError>),
     Deopt {
         bcp: u32,
         sp_top: u16,
@@ -26367,8 +26389,161 @@ fn maybe_osr(
     target_bcp: u32,
     env: &mut Env,
 ) -> Option<Result<OsrOutcome, EgclError>> {
+    // Linux publishes only mapped entries: a hot loop enters the function's
+    // mapped code at its header instead (bliss-s0v50).
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    if let Some(outcome) = maybe_mapped_osr(act, target_bcp, env) {
+        return Some(outcome);
+    }
+    maybe_checked_osr(act, target_bcp, env)
+}
+
+/// `(body, header)` pairs a T0 activation may not leave by mapped OSR.
+/// Every reason is a property of that body and its installed code, so a
+/// declined loop is not re-examined on each later back-edge. The weak handle
+/// keeps a later body allocated at a freed one's address from matching.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+type MappedOsrDeclines = HashMap<(usize, u32), std::sync::Weak<BytecodeFunction>>;
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+static MAPPED_OSR_DECLINED: egcl_rt::execution_local::ExecutionLocal<RefCell<MappedOsrDeclines>> =
+    unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(HashMap::new())) };
+
+/// Bodies whose T0 activation is currently running in mapped code entered by
+/// OSR. A guard that fails there resumes the rest of the activation in a
+/// nested T0 run; entering native code again from that run would nest one
+/// more machine activation per deopt, so the resumed loop stays in T0.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+static MAPPED_OSR_ACTIVE: egcl_rt::execution_local::ExecutionLocal<RefCell<Vec<usize>>> =
+    unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(Vec::new())) };
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+struct MappedOsrActive(usize);
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+impl Drop for MappedOsrActive {
+    fn drop(&mut self) {
+        MAPPED_OSR_ACTIVE.with(|active| {
+            let mut active = active.borrow_mut();
+            if let Some(index) = active.iter().rposition(|body| *body == self.0) {
+                active.remove(index);
+            }
+        });
+    }
+}
+
+/// Enter published mapped code at a hot loop header of a T0 activation, so a
+/// loop in a function called only once leaves the interpreter (bliss-s0v50).
+/// The function is promoted to T1 here if it has no native code yet; from
+/// there its loop heat promotes it to T2 by the existing mapped OSR.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn maybe_mapped_osr(
+    act: &Activation,
+    target_bcp: u32,
+    env: &mut Env,
+) -> Option<Result<OsrOutcome, EgclError>> {
+    let fn_obj = act.fn_obj?;
+    if egcl_rt::function::back_edge_count(fn_obj) < osr_threshold() {
+        return None;
+    }
+    // The loop header state: a backward GO with an empty operand stack whose
+    // TAGBODY is already the innermost record, so the GO has nothing left to
+    // unwind, and no cleanup continuation or dynamic binding to carry.
+    if (target_bcp as usize) >= act.bcp || act.sp_top != 0
+        || !act.cleanup_conts.is_empty() || !act.dyn_binds.is_empty()
+    {
+        return None;
+    }
+    let Instr::Go { tagbody_id, .. } = act.func.code.get(act.bcp.checked_sub(1)?)? else {
+        return None;
+    };
+    if !matches!(act.handlers.last(), Some(Handler::Tag { tagbody_id: active, .. }) if active == tagbody_id) {
+        return None;
+    }
+    let body_ptr = Arc::as_ptr(&act.func) as usize;
+    let key = (body_ptr, target_bcp);
+    if MAPPED_OSR_DECLINED.with(|declined| declined.borrow().get(&key)
+        .and_then(std::sync::Weak::upgrade)
+        .is_some_and(|body| Arc::ptr_eq(&body, &act.func)))
+    {
+        return None;
+    }
+    if MAPPED_OSR_ACTIVE.with(|active| active.borrow().contains(&body_ptr)) {
+        return None;
+    }
+    let decline = || {
+        MAPPED_OSR_DECLINED.with(|declined| {
+            let mut declined = declined.borrow_mut();
+            declined.retain(|_, body| body.strong_count() > 0);
+            declined.insert(key, Arc::downgrade(&act.func));
+        });
+        egcl_rt::blog!("osr", egcl_rt::log::TRACE,
+            "[osr] {}: mapped OSR declined at header {target_bcp}", sym_label(act.sym));
+        None
+    };
+    let sym = act.sym;
+    if profiling_disabled() || is_profile_pinned(sym) {
+        return decline();
+    }
+    egcl_rt::rooted!(fn_obj = Some(fn_obj));
+    // Only the symbol's current definition: a redefined function's running
+    // loop finishes in the code it started in.
+    let current_definition = || {
+        egcl_rt::symbols::symbol_function(sym) == *fn_obj
+            && registry_get(sym).is_some_and(|body| Arc::ptr_eq(&body, &act.func))
+    };
+    if !current_definition() {
+        return decline();
+    }
+    // Mapped code keeps tagged homes: its double-float arithmetic is slower
+    // than T0's, and raw-double T2 code has no loop-header entries to move on
+    // to. A loop T0 has seen compute with doubles stays interpreted.
+    if (0..act.func.code.len() as u32)
+        .any(|bcp| type_profile_at(body_ptr, bcp).is_some_and(|profile| profile.double_float > 0))
+    {
+        return decline();
+    }
+    poll_t2_completions();
+    let installed = NATIVE_REGISTRY.with(|registry| registry.borrow().get(&sym).cloned());
+    let native = match installed {
+        Some(native) => native,
+        None => {
+            if t1_declined(sym) {
+                return decline();
+            }
+            let Some(native) = try_promote_to_t1(sym) else { return decline() };
+            // Compilation can collect and run Lisp; publish only for the
+            // definition this activation is running.
+            if !current_definition() || native.body.as_ref().is_none_or(|body| !Arc::ptr_eq(body, &act.func)) {
+                return decline();
+            }
+            mark_fresh_promotion(sym);
+            publish_native(sym, *fn_obj, &native);
+            native
+        }
+    };
+    if native.body.as_ref().is_none_or(|body| !Arc::ptr_eq(body, &act.func)) {
+        return decline();
+    }
+    MAPPED_OSR_ACTIVE.with(|active| active.borrow_mut().push(body_ptr));
+    let _active = MappedOsrActive(body_ptr);
+    match native_transfer_entry::interpreter_osr::enter(
+        &native, target_bcp, act.frame, &act.handlers, act.env_frame.clone(), env,
+    ) {
+        native_transfer_entry::interpreter_osr::InterpreterOsr::Declined => decline(),
+        native_transfer_entry::interpreter_osr::InterpreterOsr::Retired(result) => {
+            super::events::record(super::events::EventKind::Osr, sym, u64::from(target_bcp), 0);
+            Some(Ok(OsrOutcome::Retired(result)))
+        }
+    }
+}
+
+/// The checked-ABI OSR of platforms that still install checked native code.
+fn maybe_checked_osr(
+    act: &Activation,
+    target_bcp: u32,
+    env: &mut Env,
+) -> Option<Result<OsrOutcome, EgclError>> {
     // Legacy OSR stubs use the checked ABI independently of ordinary install.
-    // Keep this activation interpreted until mapped current-frame OSR exists.
     if !checked_native_installation_allowed() {
         return None;
     }

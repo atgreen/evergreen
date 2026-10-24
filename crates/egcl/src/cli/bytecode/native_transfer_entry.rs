@@ -26,6 +26,7 @@ use std::sync::OnceLock;
 pub(super) mod root_publication;
 mod activation;
 mod condition_osr;
+pub(super) mod interpreter_osr;
 mod special_bindings;
 use special_bindings::{SavedSpecial, validate_special_bindings, special_request};
 use condition_osr::{validate_condition_clusters, relocate_condition_clusters};
@@ -1236,10 +1237,30 @@ impl TransferCode {
         let mut ordinary_arity = None;
         let mut ordinary_cold = None;
         let mut ordinary_keywords = None;
-        let ordinary = ordinary_ir.filter(|ir| !ordinary_admission_suppressed()
-            && ordinary_entry_parameters(&body)
-            && ordinary_native_body(&body)
-            && ordinary_single_frame_states(&body, ir))
+        // Say which admission step keeps a body mapped-only (bliss-z4dlm);
+        // these refusals used to be silent.
+        let ordinary_declined = |reason: &dyn std::fmt::Display| t2_log_write(format_args!(
+            "{}: ordinary entry declined: {reason}", display_fn_name(&body.name)));
+        let ordinary = ordinary_ir.filter(|ir| {
+            let reason = if ordinary_admission_suppressed() {
+                return false;
+            } else if !ordinary_entry_parameters(&body) {
+                Some("parameter shape (ordinary_entry_parameters)".to_string())
+            } else if !ordinary_native_body(&body) {
+                Some(format!("instruction {} (ordinary_native_body)",
+                    first_refused_ordinary_op(&body).as_deref().unwrap_or("parameter slots")))
+            } else if !ordinary_primary_transport_eliminated(ir) {
+                Some("a primary-value binder survived specialization (TakeValuesToLocals)".to_string())
+            } else if !ordinary_single_frame_states(&body, ir) {
+                Some("a TAGBODY body with a multi-frame state (ordinary_single_frame_states)".to_string())
+            } else {
+                None
+            };
+            if let Some(reason) = &reason {
+                ordinary_declined(reason);
+            }
+            reason.is_none()
+        })
             .and_then(|ir| {
                 use egcl_compiler::t2::emit::{OrdinaryLispEntryOptions, OrdinaryCallTarget, OrdinaryCallFlags};
                 let mut ir = ir.clone();
@@ -1247,7 +1268,10 @@ impl TransferCode {
                 // retain separate descriptors and cannot constrain that proof.
                 ir.osr_entries.clear();
                 let mut call_cells = call_cells.to_vec();
-                ordinary_primitives::lower(&mut ir, &mut call_cells)?;
+                if ordinary_primitives::lower(&mut ir, &mut call_cells).is_none() {
+                    ordinary_declined(&"primitive lowering (ordinary_primitives::lower)");
+                    return None;
+                }
                 egcl_compiler::t2::opt_clear_mv::eliminate_redundant(&mut ir, true);
                 use egcl_compiler::t2::emit::OrdinaryArgumentBinding;
                 let keyword_plan = body.variadic.then(|| super::variadic_plan::VariadicPlan::native_keywords(&body)).flatten();
@@ -2315,10 +2339,34 @@ fn scope_free_native_body(body: &BytecodeFunction, allow_values: bool) -> bool {
 /// Deoptimization rebuilds the record from the exact scope map, as it does for
 /// a local BLOCK, so these bodies must not own more than one logical frame
 /// per guard (see `ordinary_single_frame_states`).
+///
+/// A SETF expansion such as PUSH or DECF binds its new value through a
+/// one-variable `TakeValuesToLocals` (the primary-value binder). Its T2
+/// specialization removes the binder, as `packed_f64_native_body` relies on;
+/// `ordinary_primary_transport_eliminated` checks that it did (bliss-z4dlm).
 pub(super) fn ordinary_native_body(body: &BytecodeFunction) -> bool {
     !body.has_env && slot_parameters(body, false)
-        && body.code.iter().all(|op| local_control_op(op, false, false, false)
-            || matches!(op, Instr::PushTag { .. } | Instr::Go { .. }))
+        && body.code.iter().all(ordinary_native_op)
+}
+
+fn ordinary_native_op(op: &Instr) -> bool {
+    local_control_op(op, false, false, true)
+        || matches!(op, Instr::PushTag { .. } | Instr::Go { .. })
+}
+
+/// Whether specialization removed every primary-value binder the body's
+/// bytecode contains, so the ordinary entry never needs multiple values.
+fn ordinary_primary_transport_eliminated(ir: &egcl_compiler::t2::ir::Function) -> bool {
+    ir.block_order().iter().all(|&block| ir.block(block).insts.iter().all(|&inst| {
+        ir.inst(inst).opcode != egcl_compiler::t2::ir::Opcode::TakeValuesToLocals
+    }))
+}
+
+/// The first instruction `ordinary_native_body` refuses, for its decline log.
+fn first_refused_ordinary_op(body: &BytecodeFunction) -> Option<String> {
+    let op = body.code.iter().find(|op| !ordinary_native_op(op))?;
+    let full = format!("{op:?}");
+    Some(full.find(['(', ' ', '{']).map_or(full.clone(), |i| full[..i].to_string()))
 }
 
 /// Whether a body uses the TAGBODY extension `ordinary_native_body` admits.

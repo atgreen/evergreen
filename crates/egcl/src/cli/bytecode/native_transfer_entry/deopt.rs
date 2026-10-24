@@ -50,6 +50,16 @@ impl Drop for RestoreNativeFrame {
     }
 }
 
+/// Make the loop a guard failure resumed in T0 re-warm before it may enter
+/// native code again by OSR (bliss-s0v50), as the checked OSR backs off. The
+/// resumed activation runs nested inside this machine activation, so entering
+/// again at once would nest one more machine activation per failed guard.
+fn back_off_interpreter_osr(function: EgclVal) {
+    if egcl_rt::function::is_interpreted_function(function) {
+        egcl_rt::function::reset_back_edge_count(function);
+    }
+}
+
 fn note_segment_deopt(code: &TransferCode, guard_bcp: u32) {
     let count = code.deopts.get().saturating_add(1);
     code.deopts.set(count);
@@ -1471,6 +1481,7 @@ unsafe fn resume_native_child_guard(
     .map_err(|message| EgclError::Internal(message.into()))?;
     unsafe { retain_self_scope_callables(code, &scopes)?; }
     note_segment_deopt(code, bcp);
+    back_off_interpreter_osr(*callable);
     if let Some(arguments) = arguments.as_ref() {
         state
             .as_mut()
@@ -1766,6 +1777,7 @@ unsafe fn resume_guard_with_arguments(
         .map_err(|message| EgclError::Internal(message.into()))?;
         unsafe { retain_self_scope_callables(code, &scopes)?; }
         note_segment_deopt(code, bcp);
+        back_off_interpreter_osr(unsafe { (*frame).function });
         // Every stream word is now in scanned slots. There is no mutable
         // CaptureContext reference or RefCell borrow across resumed Lisp.
         egcl_rt::rooted!(state = Some(unsafe {
