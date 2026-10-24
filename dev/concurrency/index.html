@@ -2156,6 +2156,9 @@ If the timeout expires, returns <code>nil, nil</code>. A worker that successfull
 <p>Timeouts are non-negative real seconds. Omitted or <code>nil</code> means no deadline.
 An invalid timeout signals a type error. Do not depend on repeated joins
 returning the same result; consume the worker's result once.</p>
+<p>A worker need not be joined. Once it finishes, its operating-system thread
+and stacks are released when another thread starts or finishes; only its
+name and its result remain until a join consumes them.</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="p">(</span><span class="k">let</span><span class="w"> </span><span class="p">((</span><span class="nv">worker</span><span class="w"> </span><span class="p">(</span><span class="nv">egcl-thread:make-thread</span><span class="w"> </span><span class="p">(</span><span class="k">lambda</span><span class="w"> </span><span class="p">()</span><span class="w"> </span><span class="p">(</span><span class="nb">+</span><span class="w"> </span><span class="mi">20</span><span class="w"> </span><span class="mi">22</span><span class="p">))</span>
 <a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="w">                                        </span><span class="ss">:name</span><span class="w"> </span><span class="s">"answer"</span><span class="p">)))</span>
 <a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="w">  </span><span class="p">(</span><span class="nb">multiple-value-list</span><span class="w"> </span><span class="p">(</span><span class="nv">egcl-thread:join-thread</span><span class="w"> </span><span class="nv">worker</span><span class="w"> </span><span class="ss">:timeout</span><span class="w"> </span><span class="mi">10</span><span class="p">)))</span>
