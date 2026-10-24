@@ -2767,9 +2767,9 @@ mod tests {
                     unsafe { std::mem::transmute(code.as_ptr()) };
                 let mut slots = vec![0u64; arity + compiled.shadow_root_slots as usize];
                 let mut expected = 0u64;
-                for index in 0..arity {
-                    slots[index] = 1 << (index + 1);
-                    expected += slots[index];
+                for (index, slot) in slots.iter_mut().take(arity).enumerate() {
+                    *slot = 1 << (index + 1);
+                    expected += *slot;
                 }
                 assert_eq!(
                     unsafe { entry(slots.as_mut_ptr()) },
