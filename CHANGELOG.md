@@ -409,7 +409,7 @@
   `(setf (car|cdr ...))` store directly. Each used to be rebuilt as a form
   and re-evaluated on every call: `(vector ...)` from compiled code went from
   about 16.6 µs to 3.3 µs
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#603](https://github.com/atgreen/evergreen/pull/603)).
 - `reduce` walks only its `:start`/`:end` range, in place. It copied the
   whole sequence into lists first, so it allocated in proportion to the
   sequence and ran about twice as slowly
