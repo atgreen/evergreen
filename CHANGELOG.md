@@ -91,11 +91,12 @@
 - `funcall` and `apply` of a function object whose optimized native code is
   already installed run that code directly, instead of working out again on
   every call how to call the object. On x86-64 Linux, a warmed loop of
-  `(funcall f s 1)` drops from about 2.1 µs to 0.62 µs a call for a `defun`'d
-  function, from 2.7 µs to 0.63 µs for a `lambda`, from 3.9 µs to 1.5 µs for a
-  closure, and from 0.95 µs to 0.29 µs for `#'+`. Higher-order functions
+  `(funcall f s 1)` drops from about 2.0 µs to 0.65 µs a call for a `defun`'d
+  function, from 2.5 µs to 0.63 µs for a `lambda`, from 4.0 µs to 1.6 µs for a
+  closure, and from 0.9 µs to 0.3 µs for `#'+`. Higher-order functions
   written in Lisp gain the same way: `reduce`, `find-if` and `mapcar` over
-  100,000 elements run two to four times faster. Argument-count and keyword
+  100,000 elements run two to four times faster, and `sort` with a `lambda`
+  predicate about twice as fast. Argument-count and keyword
   errors, multiple values, non-local exits and redefinition behave as before
   ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
 - `make-instance` of a class reuses what it worked out for the class's
