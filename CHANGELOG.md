@@ -393,6 +393,10 @@
 
 ### Fixed
 
+- `reduce` walks only its `:start`/`:end` range, in place. It copied the
+  whole sequence into lists first, so it allocated in proportion to the
+  sequence and ran about twice as slowly
+  ([#601](https://github.com/atgreen/evergreen/pull/601)).
 - A joined thread no longer keeps about 88 KB of memory on the default
   x86-64 musl build. The thread-caching allocator now gives an exiting
   thread's cached blocks back, and each thread's links to the functions it
