@@ -95,7 +95,7 @@
   elements drops from about 25 µs to 13 µs per element with a `lambda`
   predicate, from 16 µs to 6.3 µs with `#'<`, and from 28 µs to 2.3 µs for a
   vector sorted with `:key #'car`
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#606](https://github.com/atgreen/evergreen/pull/606)).
 - A minor garbage collection costs time in proportion to the data that
   survives it, not to how much was allocated since the last one. It no longer
   walks every object in the 64 MB nursery to find pinned objects, and no longer
