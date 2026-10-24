@@ -466,3 +466,36 @@ fn source_free_bfasl_retains_ftype_at_compile_and_load_time() {
     fs::remove_file(fasl).unwrap();
     fs::remove_dir(directory).unwrap();
 }
+
+/// A declared integer RANGE must be enforced at the optimising tier, not just
+/// its fixnum tag.
+///
+/// `CheckResult` on a declared `FTYPE` lowers to a T2 `Guard` carrying a
+/// FIXNUM `TypeTag` whose `range` holds the declared bounds. An emitter that
+/// matches on the tag and ignores the range does not lose an optimisation, it
+/// loses a check the program can observe: the function returns an
+/// out-of-range value where every other tier signals a `TYPE-ERROR`.
+///
+/// Forcing T2 is what makes this a real check — the shape is small enough
+/// that it would otherwise sit at a lower tier and pass for the wrong reason.
+/// It is written without recursion on purpose, so it pins the guard itself
+/// rather than the tail-call path that first exposed the gap on AArch64.
+#[test]
+fn a_declared_integer_range_is_enforced_at_the_optimising_tier() {
+    let output = run_with_env(
+        r#"
+        (declaim (ftype (function (fixnum) (integer 0 100)) ranged-result))
+        (defun ranged-result (n) (+ n 0))
+        (dotimes (i 50) (ranged-result 1))
+        (assert (= 100 (ranged-result 100)))
+        (assert (= 0 (ranged-result 0)))
+        (assert (handler-case (progn (ranged-result 101) nil)
+                  (type-error (c) (= 101 (type-error-datum c)))))
+        (assert (handler-case (progn (ranged-result -1) nil)
+                  (type-error (c) (= -1 (type-error-datum c)))))
+        (format t "RANGE-ENFORCED~%")
+    "#,
+        &[("EGCL_FORCE_TIER", "t2")],
+    );
+    assert!(output.contains("RANGE-ENFORCED"));
+}

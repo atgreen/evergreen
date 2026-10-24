@@ -28,8 +28,20 @@
 //! call therefore goes through c2i to the interpreter, which is what makes this
 //! slice correct by construction: arithmetic and calls produce exactly what
 //! interpretation produces, while dispatch and the operand stack run natively.
-//! Nothing here can deoptimize, so `has_deopt` is false and no guard exists that
-//! could disagree with T0.
+//! No guard here can disagree with T0, since nothing speculates. `has_deopt`
+//! is nevertheless true for a function with a loop back-edge: its poll can
+//! hand the activation to T2 and resume there, so the activation can leave
+//! mid-flight, and a caller's direct call must not assume otherwise.
+//!
+//! # Loop back-edges
+//!
+//! Two shapes reach the sampled poll that drives T1->T2 promotion and polls
+//! signals: a backward `Go` at operand depth zero, and the backward `Br` that
+//! `eliminate_self_tail_calls` leaves behind when it rewrites a self-tail
+//! call into a jump to the post-prologue entry. The second matters because
+//! such a function has no calls and no tagbody, so that `Br` is the only heat
+//! it can report -- without counting it, a tail-recursive function never
+//! promotes however hot, and never polls.
 
 use super::{
     BytecodeFunction, DIRECT_CALL_GEN, NativeEmission, NativeEnvNames, c2i_alloc_cons,
@@ -40,10 +52,10 @@ use super::{
     c2i_take_values, c2i_transfer_pending, c2i_typep_class, c2i_values_to_list,
     call_site_profile_token, registry_get, resolve_sym, t2_backedge_threshold,
 };
-use egcl_rt::bytecode::VarLoc;
 use egcl_rt::asm::a64;
 use egcl_rt::asm::{Asm, Cc};
 use egcl_rt::bytecode::Instr;
+use egcl_rt::bytecode::VarLoc;
 use egcl_rt::value::EgclVal;
 use std::sync::Arc;
 
@@ -123,6 +135,35 @@ pub(super) fn emit_native_a64(
     // leave the loop mid-flight. `has_deopt` must report that: a caller's direct
     // call cannot handle a callee that resumes elsewhere.
     let mut can_osr_to_t2 = false;
+
+    // Where a self-tail-call loop re-enters. `eliminate_self_tail_calls`
+    // rewrites `CallNamed{self} ; Return` into stores to the parameter slots
+    // followed by `Br(entry)`, where `entry` is past the prologue's PushBlocks
+    // -- the implicit BLOCK stays established across iterations. That Br is a
+    // LOOP BACK-EDGE, and it is the only loop a tail-recursive function has.
+    //
+    // It needs the same poll `Go` emits, for the same two reasons: without it
+    // the loop never accumulates the heat that promotes it to T2, and it polls
+    // no signals, so a hot tail-recursive function is neither optimised nor
+    // terminable and never reaches GC stop-the-world.
+    //
+    // Measured on an AArch64 host before this: `(defun rec (n acc) (if (= n 0)
+    // acc (rec (- n 1) (+ acc 1))))` driven 2000 x 200 deep -- 402,000
+    // invocations -- stayed at T1, because the TCO'd self-call is no longer a
+    // call and so bumped no invocation counter, while its back-edge bumped no
+    // loop counter either. Promotion tracked the OUTER call count alone: 5000
+    // shallow calls promoted, 402,000 recursive ones did not. x86-64 reaches
+    // T2 on the same program through the mapped ABI's own recursion path.
+    //
+    // Identifying the back-edge by its target is exact rather than a guess:
+    // the operand stack at `entry` is empty, so any backward Br that lands
+    // there is at depth zero, which is precisely the condition the `Go` arm
+    // checks before polling.
+    let entry_bcp = bf
+        .code
+        .iter()
+        .take_while(|i| matches!(i, Instr::PushBlock { .. }))
+        .count();
 
     // Where each block's RETURN-FROM resumes, and each tagbody's entry depth.
     let mut block_targets: std::collections::HashMap<u32, (u32, u16)> =
@@ -222,6 +263,57 @@ pub(super) fn emit_native_a64(
         emit_add_disp(c, OPSP, SLOTS, 8 * n_locals)
     };
     emit_prologue(&mut c)?;
+
+    // Sampled loop back-edge poll. This drives T1->T2 promotion and polls
+    // process signals, so a hot native loop stays terminable and still
+    // reaches GC stop-the-world (bliss-7rdu). Without it a promoted loop
+    // would spin past both. A non-zero return means leave through the
+    // epilogue.
+    //
+    // Only valid where the operand stack is empty: the loop-exit path returns
+    // the first operand slot, and a T2 hand-off OSR-enters at `target_bcp`
+    // from the activation slots. Both callers check that.
+    let emit_backedge_poll = |c: &mut Asm, target_bcp: u32, can_osr: &mut bool| -> Option<()> {
+        let keep = c.label();
+        emit_mov_imm(c, SCRATCH, backedge_counter);
+        // The counter is an AtomicU32, so these must be 32-bit accesses: a
+        // 64-bit one would touch the next four bytes.
+        c.word(a64::ldr_w_imm(SCRATCH2, SCRATCH, 0).expect("zero offset"));
+        c.word(a64::add_imm_w(SCRATCH2, SCRATCH2, 1).expect("increment of one"));
+        c.word(a64::str_w_imm(SCRATCH2, SCRATCH, 0).expect("zero offset"));
+        // The threshold is an arbitrary u32 (10,000 by default), so it gets a
+        // register rather than an immediate field: 10,000 is neither under
+        // 4096 nor a multiple of it, so the add-immediate form cannot hold it.
+        // The accumulator is dead here — neither caller has a live value in it
+        // — and the helper's arguments are set below, past this branch.
+        emit_mov_imm(c, ACC, u64::from(t2_backedge_threshold()));
+        c.word(a64::cmp_w(SCRATCH2, ACC));
+        c.jcc(Cc::L, keep);
+        // Reset the sample.
+        c.word(a64::str_w_imm(a64::XZR, SCRATCH, 0).expect("zero offset"));
+        let helper = if is_osr {
+            // Signal-only: an OSR loop has no T1 tier to promote from, but
+            // must still be terminable and still reach GC stop-the-world.
+            osr_backedge_addr
+        } else {
+            *can_osr = true;
+            emit_mov_imm(c, 0, u64::from(sym));
+            emit_mov_imm(c, 1, u64::from(target_bcp));
+            c.word(a64::mov(2, SLOTS));
+            emit_mov_imm(c, 3, std::ptr::from_ref(bf) as u64);
+            t2_backedge_addr
+        };
+        emit_c2i_call(c, helper, transfer_addr, recovery_toggle_addr)?;
+        emit_cmp_imm(c, ACC, 0);
+        c.jcc(Cc::E, keep);
+        // Leaving the loop: T2 finished, or a signal is pending. The shared
+        // epilogue returns the first operand slot; the Rust caller re-raises
+        // any stashed error before using it.
+        c.word(a64::ldr_imm(ACC, SLOTS, 8 * n_locals as u64)?);
+        emit_epilogue(c);
+        c.bind(keep);
+        Some(())
+    };
 
     for (bcp_idx, instr) in bf.code.iter().enumerate() {
         c.bind(bcp_labels[bcp_idx]);
@@ -440,6 +532,15 @@ pub(super) fn emit_native_a64(
                 emit_push(&mut c);
             }
             Instr::Br(target) => {
+                // The self-tail-call loop's back-edge (see `entry_bcp`). Any
+                // other backward Br is a branch inside a body whose operand
+                // depth this emitter does not track, so it is left alone.
+                if (*target as usize) < bcp_idx
+                    && *target as usize == entry_bcp
+                    && backedge_counter != 0
+                {
+                    emit_backedge_poll(&mut c, *target, &mut can_osr_to_t2)?;
+                }
                 c.jmp(match bcp_labels.get(*target as usize) {
                     Some(l) => *l,
                     None => decline!("Br target {target} is out of range"),
@@ -559,54 +660,7 @@ pub(super) fn emit_native_a64(
                 };
                 emit_add_disp(&mut c, OPSP, SLOTS, 8 * (n_locals + i32::from(sp)))?;
                 if (*target_bcp as usize) < bcp_idx && sp == 0 && backedge_counter != 0 {
-                    // Sampled loop back-edge poll. This drives T1→T2 promotion
-                    // and polls process signals, so a hot native loop stays
-                    // terminable and still reaches GC stop-the-world
-                    // (bliss-7rdu). Without it a promoted loop would spin past
-                    // both. A non-zero return means leave through the epilogue.
-                    let keep = c.label();
-                    emit_mov_imm(&mut c, SCRATCH, backedge_counter);
-                    // The counter is an AtomicU32, so these must be 32-bit
-                    // accesses: a 64-bit one would touch the next four bytes.
-                    c.word(a64::ldr_w_imm(SCRATCH2, SCRATCH, 0).expect("zero offset"));
-                    c.word(a64::add_imm_w(SCRATCH2, SCRATCH2, 1).expect("increment of one"));
-                    c.word(a64::str_w_imm(SCRATCH2, SCRATCH, 0).expect("zero offset"));
-                    // The threshold is an arbitrary u32 (10,000 by default), so
-                    // it gets a register rather than an immediate field: 10,000
-                    // is neither under 4096 nor a multiple of it, so the
-                    // add-immediate form cannot hold it. The accumulator is dead
-                    // here — Go yields no value — and the helper's arguments are
-                    // set below, past this branch.
-                    emit_mov_imm(&mut c, ACC, u64::from(t2_backedge_threshold()));
-                    c.word(a64::cmp_w(SCRATCH2, ACC));
-                    c.jcc(Cc::L, keep);
-                    // Reset the sample.
-                    c.word(a64::str_w_imm(a64::XZR, SCRATCH, 0).expect("zero offset"));
-                    let helper = if is_osr {
-                        // Signal-only: an OSR loop has no T1 tier to promote
-                        // from, but must still be terminable and still reach GC
-                        // stop-the-world.
-                        osr_backedge_addr
-                    } else {
-                        can_osr_to_t2 = true;
-                        emit_mov_imm(&mut c, 0, u64::from(sym));
-                        emit_mov_imm(&mut c, 1, u64::from(*target_bcp));
-                        c.word(a64::mov(2, SLOTS));
-                        emit_mov_imm(&mut c, 3, std::ptr::from_ref(bf) as u64);
-                        t2_backedge_addr
-                    };
-                    emit_c2i_call(&mut c, helper, transfer_addr, recovery_toggle_addr)?;
-                    emit_cmp_imm(&mut c, ACC, 0);
-                    c.jcc(Cc::E, keep);
-                    // Leaving the loop: T2 finished, or a signal is pending. The
-                    // shared epilogue returns the first operand slot; the Rust
-                    // caller re-raises any stashed error before using it.
-                    c.word(encode!(
-                        "first operand slot for the loop-exit epilogue",
-                        a64::ldr_imm(ACC, SLOTS, 8 * n_locals as u64)
-                    ));
-                    emit_epilogue(&mut c);
-                    c.bind(keep);
+                    emit_backedge_poll(&mut c, *target_bcp, &mut can_osr_to_t2)?;
                 }
                 c.jmp(match bcp_labels.get(*target_bcp as usize) {
                     Some(l) => *l,
