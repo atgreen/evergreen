@@ -437,7 +437,10 @@ impl HeapAllocator {
             let limit = region.header.alloc_limit as usize;
             let available = limit.saturating_sub(top);
             if available >= self.tlab_size {
-                // Carve out a TLAB from this region.
+                // Carve out a TLAB from this region, zeroing what a minor
+                // collection left in it (bliss-xyt4l).
+                // SAFETY: the TLAB span lies above alloc_top, holding no object.
+                unsafe { region.zero_for_reuse(top, top + self.tlab_size) };
                 self.tlab.cursor = region.header.alloc_top;
                 self.tlab.limit =
                     unsafe { region.header.alloc_top.add(self.tlab_size) } as *const u8;
@@ -478,6 +481,9 @@ impl HeapAllocator {
                 let limit = region.header.alloc_limit as usize;
                 let available = limit.saturating_sub(top);
                 if available >= self.tlab_size {
+                    // SAFETY: as above. A Free region is already zero, so this
+                    // only guards that invariant.
+                    unsafe { region.zero_for_reuse(top, top + self.tlab_size) };
                     self.tlab.cursor = region.header.alloc_top;
                     self.tlab.limit =
                         unsafe { region.header.alloc_top.add(self.tlab_size) } as *const u8;
@@ -738,6 +744,10 @@ pub struct HeapCollector {
 /// keep the bitmaps proportional to the nursery, not the reserved heap size.
 /// Body addresses are normalized to header addresses before indexing, just as
 /// the old nursery index keyed every object by header + OBJECT_HEADER_SIZE.
+///
+/// A minor collection indexes regions lazily ([`Self::reset_lazy`]): a
+/// region's objects are walked only when a candidate reference first lands in
+/// it, so a nursery of dead objects costs nothing to index (bliss-xyt4l).
 #[derive(Default)]
 struct NurseryObjectMap {
     heap_base: usize,
@@ -745,6 +755,11 @@ struct NurseryObjectMap {
     region_offsets: Vec<usize>,
     starts: Vec<u64>,
     marked: Vec<u64>,
+    /// Per region index, the `alloc_top` of a region whose starts are still to
+    /// be indexed by [`Self::ensure_indexed`]; 0 once indexed (or eager).
+    pending_tops: Vec<usize>,
+    /// Regions walked by [`Self::ensure_indexed`] during this collection.
+    lazily_indexed: u64,
 }
 
 impl NurseryObjectMap {
@@ -768,6 +783,77 @@ impl NurseryObjectMap {
         self.starts.fill(0);
         self.marked.resize(words, 0);
         self.marked.fill(0);
+        self.pending_tops.clear();
+        self.lazily_indexed = 0;
+    }
+
+    /// Like [`Self::reset`], but defer each region's object walk until a
+    /// candidate reference first falls inside it. Its bitmap words are cleared
+    /// then, too, so only the regions that live references reach are touched.
+    ///
+    /// # Safety
+    /// Until the next reset, every region in `nursery` must be stopped,
+    /// writable nursery memory holding valid objects up to its `tops` entry,
+    /// separated only by zero-filled gaps, exactly as for
+    /// [`Self::prepare_region`], and its headers must stay intact until it is
+    /// indexed. Indexing happens from [`Self::mark`] and
+    /// [`Self::ensure_indexed`], so marking must finish before evacuation
+    /// rewrites any header.
+    unsafe fn reset_lazy(
+        &mut self,
+        heap_base: usize,
+        region_size: usize,
+        region_count: usize,
+        nursery: &[usize],
+        tops: &[usize],
+    ) {
+        debug_assert_eq!(nursery.len(), tops.len());
+        self.heap_base = heap_base;
+        self.region_size = region_size;
+        self.region_offsets.resize(region_count, usize::MAX);
+        self.region_offsets.fill(usize::MAX);
+        self.pending_tops.resize(region_count, 0);
+        self.pending_tops.fill(0);
+        let words_per_region = (region_size / OBJECT_ALIGNMENT).div_ceil(64);
+        for (ordinal, (&region, &top)) in nursery.iter().zip(tops).enumerate() {
+            self.region_offsets[region] = ordinal * words_per_region;
+            self.pending_tops[region] = top;
+        }
+        // Stale words are cleared per region when it is indexed. A region
+        // never indexed is never read: lookups in a pending region fail.
+        let words = nursery.len() * words_per_region;
+        if self.starts.len() < words {
+            self.starts.resize(words, 0);
+            self.marked.resize(words, 0);
+        }
+        self.lazily_indexed = 0;
+    }
+
+    fn clear_region_words(&mut self, region: usize) {
+        let words = (self.region_size / OBJECT_ALIGNMENT).div_ceil(64);
+        let start = self.region_offsets[region];
+        self.starts[start..start + words].fill(0);
+        self.marked[start..start + words].fill(0);
+    }
+
+    /// Index `region` now if [`Self::reset_lazy`] deferred it. Returns whether
+    /// it holds a pinned object (false for a region already indexed).
+    fn ensure_indexed(&mut self, region: usize) -> bool {
+        if !self.is_pending(region) {
+            return false;
+        }
+        let top = std::mem::replace(&mut self.pending_tops[region], 0);
+        self.lazily_indexed += 1;
+        self.clear_region_words(region);
+        // SAFETY: `reset_lazy`'s contract: this region is stopped, walkable
+        // nursery memory through `top` whose headers are still intact.
+        unsafe { self.prepare_region(region, top) }
+    }
+
+    /// Whether a lazily reset region has not been indexed yet.
+    #[inline]
+    fn is_pending(&self, region: usize) -> bool {
+        self.pending_tops.get(region).is_some_and(|&top| top != 0)
     }
 
     #[inline]
@@ -793,17 +879,30 @@ impl NurseryObjectMap {
         self.starts[word] |= bit;
     }
 
+    /// The region index of a `body` that [`Self::position`] accepted.
     #[inline]
-    fn contains(&self, body: usize) -> bool {
-        self.position(body)
-            .is_some_and(|(word, bit)| self.starts[word] & bit != 0)
+    fn region_of(&self, body: usize) -> usize {
+        (body - self.heap_base - OBJECT_HEADER_SIZE) / self.region_size
     }
 
+    #[inline]
+    fn contains(&self, body: usize) -> bool {
+        self.position(body).is_some_and(|(word, bit)| {
+            !self.is_pending(self.region_of(body)) && self.starts[word] & bit != 0
+        })
+    }
+
+    /// Mark the exact object start `body`, first indexing its region if
+    /// [`Self::reset_lazy`] deferred it.
     #[inline]
     fn mark(&mut self, body: usize) -> bool {
         let Some((word, bit)) = self.position(body) else {
             return false;
         };
+        let region = self.region_of(body);
+        if self.is_pending(region) {
+            self.ensure_indexed(region);
+        }
         if self.starts[word] & bit == 0 || self.marked[word] & bit != 0 {
             return false;
         }
@@ -813,8 +912,9 @@ impl NurseryObjectMap {
 
     #[inline]
     fn is_marked(&self, body: usize) -> bool {
-        self.position(body)
-            .is_some_and(|(word, bit)| self.marked[word] & bit != 0)
+        self.position(body).is_some_and(|(word, bit)| {
+            !self.is_pending(self.region_of(body)) && self.marked[word] & bit != 0
+        })
     }
 
     /// Repair unretired TLAB tails, index exact starts, and detect pinning in
@@ -876,7 +976,12 @@ impl NurseryObjectMap {
     /// walk. Bits were set only for exact, non-forwarded object starts, before
     /// evacuation changed any header. No scratch allocation is needed.
     fn marked_bodies(&self, region: usize) -> impl Iterator<Item = usize> + '_ {
-        let words = (self.region_size / OBJECT_ALIGNMENT).div_ceil(64);
+        // A region never indexed holds no marks; its bitmap words are stale.
+        let words = if self.is_pending(region) {
+            0
+        } else {
+            (self.region_size / OBJECT_ALIGNMENT).div_ceil(64)
+        };
         let start = self.region_offsets[region];
         let base = self.heap_base + region * self.region_size;
         self.marked[start..start + words]
@@ -1041,6 +1146,96 @@ mod nursery_object_map_tests {
         }
         assert!(map.contains(base + LATER + OBJECT_HEADER_SIZE));
         assert!(!map.contains(base + LATER - 16 + OBJECT_HEADER_SIZE));
+    }
+
+    #[test]
+    fn lazy_reset_indexes_only_regions_that_marking_reaches() {
+        let mut memory = vec![0u128; 2 * REGION / OBJECT_ALIGNMENT];
+        let ptr = memory.as_mut_ptr() as *mut u8;
+        let base = ptr as usize;
+        let mut map = NurseryObjectMap::default();
+        // Leave stale bits from an earlier eager use: a lazy region must clear
+        // them before answering for it.
+        map.reset(base, REGION, 2, &[0, 1]);
+        map.insert(base + 64 + OBJECT_HEADER_SIZE);
+        map.insert(base + REGION + 64 + OBJECT_HEADER_SIZE);
+        unsafe {
+            write_object_header(ptr, crate::object::type_id::CONS, 16);
+            write_object_header(ptr.add(REGION), crate::object::type_id::CONS, 16);
+            map.reset_lazy(base, REGION, 2, &[0, 1], &[base + 32, base + REGION + 32]);
+        }
+        let first = base + OBJECT_HEADER_SIZE;
+        let second = base + REGION + OBJECT_HEADER_SIZE;
+        assert!(map.is_pending(0) && map.is_pending(1));
+        assert!(!map.contains(first) && !map.is_marked(first));
+        assert_eq!(map.marked_bodies(0).count(), 0);
+        // A non-start address still indexes the region, and is rejected.
+        assert!(!map.mark(second + 16));
+        assert!(!map.is_pending(1) && map.is_pending(0));
+        assert_eq!(map.lazily_indexed, 1);
+        assert!(!map.contains(base + REGION + 64 + OBJECT_HEADER_SIZE));
+        assert!(map.mark(second));
+        assert!(!map.mark(second));
+        assert_eq!(map.marked_bodies(1).collect::<Vec<_>>(), [second]);
+        // The other region was never read.
+        assert!(map.is_pending(0));
+        assert_eq!(map.lazily_indexed, 1);
+        // Explicit indexing reports pins, once.
+        unsafe { (*(ptr as *mut ObjectHeader)).set_pinned() };
+        assert!(map.ensure_indexed(0));
+        assert!(!map.ensure_indexed(0));
+        assert!(!map.contains(base + 64 + OBJECT_HEADER_SIZE));
+        assert!(map.contains(first));
+        // An eager reset leaves nothing pending.
+        map.reset(base, REGION, 2, &[0, 1]);
+        assert!(!map.is_pending(0) && !map.is_pending(1));
+    }
+
+    #[test]
+    fn reuse_zeroes_only_the_stale_part_of_a_handed_out_span() {
+        let mut memory = vec![0xA5A5_A5A5_A5A5_A5A5_A5A5_A5A5_A5A5_A5A5u128; 64];
+        let ptr = memory.as_mut_ptr() as *mut u8;
+        let base = ptr as usize;
+        let mut region = HeapRegion {
+            header: RegionHeader {
+                kind: RegionKind::Nursery,
+                gen_age: 0,
+                live_bytes: 0,
+                alloc_top: ptr,
+                alloc_limit: unsafe { ptr.add(1024) },
+                next_free: u32::MAX,
+                mark_bitmap_offset: 0,
+            },
+            base: ptr,
+            size: 1024,
+            dirty_end: base + 512,
+        };
+        let bytes = |memory: &[u128]| -> Vec<u8> {
+            memory.iter().flat_map(|word| word.to_ne_bytes()).collect()
+        };
+        unsafe { region.zero_for_reuse(base, base + 256) };
+        let now = bytes(&memory);
+        assert!(now[..256].iter().all(|&b| b == 0));
+        assert!(now[256..].iter().all(|&b| b == 0xA5));
+        assert_eq!(region.dirty_end, base + 512);
+        // A span crossing the stale end zeroes up to it and clears the record.
+        unsafe { region.zero_for_reuse(base + 256, base + 768) };
+        let now = bytes(&memory);
+        assert!(now[..512].iter().all(|&b| b == 0));
+        assert!(
+            now[512..].iter().all(|&b| b == 0xA5),
+            "fresh bytes untouched"
+        );
+        assert_eq!(region.dirty_end, base);
+        // Nothing stale: a no-op.
+        unsafe { region.zero_for_reuse(base + 768, base + 1024) };
+        assert!(bytes(&memory)[768..].iter().all(|&b| b == 0xA5));
+        // The tail above alloc_top is zeroed when the region leaves the nursery.
+        region.header.alloc_top = unsafe { ptr.add(128) };
+        region.dirty_end = base + 1024;
+        region.zero_stale_tail();
+        assert!(bytes(&memory).iter().all(|&b| b == 0));
+        assert_eq!(region.dirty_end, base);
     }
 }
 
@@ -2142,20 +2337,41 @@ impl HeapCollector {
 
         // Record exact starts while repairing TLAB gaps and finding retained
         // (pinned) regions. Headers remain intact until evacuation; one walk
-        // supplies all three facts without rereading every dead nursery object.
+        // per region supplies all three facts. Only regions that can hold a
+        // pinned object are walked up front; any other region is walked when
+        // marking first reaches it, so dead regions are never read
+        // (bliss-xyt4l). Every pin of a nursery object records its region in
+        // `nursery_pin_candidates` (see `note_nursery_pin`).
         let mut nursery_index = MINOR_OBJECT_MAP.with(|s| std::mem::take(&mut *s.borrow_mut()));
-        nursery_index.reset(
-            state.heap_base as usize,
-            state.config.region_size,
-            state.regions.len(),
-            &nursery_indices,
-        );
+        let nursery_tops: Vec<usize> = nursery_indices
+            .iter()
+            .map(|&idx| state.regions[idx].header.alloc_top as usize)
+            .collect();
+        // SAFETY: mutators are stopped and these are allocated nursery regions
+        // through their tops; marking (which indexes them) ends before
+        // evacuation, and prepare_region repairs their zero-filled TLAB gaps.
+        unsafe {
+            nursery_index.reset_lazy(
+                state.heap_base as usize,
+                state.config.region_size,
+                state.regions.len(),
+                &nursery_indices,
+                &nursery_tops,
+            );
+        }
+        let pin_candidates = std::mem::take(&mut state.nursery_pin_candidates);
+        // EGCL_GC_VERIFY walks every region, as before, and checks that the
+        // side list named each region a pin was found in.
+        let index_all = gc_verify_enabled();
         let mut pinned_indices = Vec::new();
         for &idx in &nursery_indices {
-            let top = state.regions[idx].header.alloc_top as usize;
-            // SAFETY: mutators are stopped and these are allocated nursery
-            // regions; prepare_region repairs their zero-filled TLAB gaps.
-            if unsafe { nursery_index.prepare_region(idx, top) } {
+            let candidate = pin_candidates.contains(&idx);
+            if (candidate || index_all) && nursery_index.ensure_indexed(idx) {
+                assert!(
+                    candidate,
+                    "gc-verify(pin-candidates): nursery region {idx} holds a pinned object \
+                     its pin never recorded (bliss-xyt4l)"
+                );
                 pinned_indices.push(idx);
             }
         }
@@ -2366,6 +2582,8 @@ impl HeapCollector {
             }
             MINOR_OBJECT_MAP.with(|s| *s.borrow_mut() = std::mem::take(&mut nursery_index));
             MINOR_WORKLIST.with(|s| *s.borrow_mut() = std::mem::take(&mut mark_worklist));
+            // The nursery stays as it was, pins included.
+            state.nursery_pin_candidates = pin_candidates;
             // Nothing changed the older generation, so its scan lists and
             // armed dirty pages stay valid for the retry.
             old_scan.put_back();
@@ -2484,6 +2702,10 @@ impl HeapCollector {
         // pinned objects themselves did not move (bliss-jtc.18).
         for &idx in &pinned_indices {
             let region = &mut state.regions[idx];
+            // Old-generation space above `alloc_top` is zero-filled, as pinned
+            // allocation into a pinned host relies on; this region may still
+            // hold bytes from an earlier nursery cycle there.
+            region.zero_stale_tail();
             let live = (region.header.alloc_top as usize).saturating_sub(region.base as usize);
             region.header.kind = RegionKind::OldGen;
             region.header.gen_age = 0;
@@ -2761,10 +2983,15 @@ impl HeapCollector {
             }
             regions_evacuated += 1;
             let region = &mut state.regions[nursery_idx];
-            // Zero the region memory so walk_heap doesn't see stale forwarding pointers.
+            // The region is not zeroed here: that cost the pause a memset of
+            // every byte the nursery allocated. Walkers stop at `alloc_top`,
+            // which is reset below, and each TLAB carved from the region is
+            // zeroed as it is handed out (`HeapRegion::zero_for_reuse`).
+            // `dirty_end` records how far the stale bytes reach (bliss-xyt4l).
             let region_used =
                 (region.header.alloc_top as usize).saturating_sub(region.base as usize);
-            if region_used > 0 {
+            region.dirty_end = region.dirty_end.max(region.header.alloc_top as usize);
+            if region_used > 0 && gc_poison_enabled() {
                 unsafe {
                     // bliss-6b2 #2 diagnostic: EGCL_GC_POISON fills reclaimed
                     // nursery with 0xFA instead of 0. As a EgclVal, 0xFAFA…FA
@@ -2774,8 +3001,7 @@ impl HeapCollector {
                     // dereference (SIGSEGV) instead of silently reading NIL from
                     // a zeroed slot. Run under gdb to get the backtrace at the
                     // offending deref, which names the missing GC root.
-                    let fill = if gc_poison_enabled() { 0xFA } else { 0x00 };
-                    std::ptr::write_bytes(region.base, fill, region_used);
+                    std::ptr::write_bytes(region.base, 0xFA, region_used);
                 }
             }
             region.header.alloc_top = region.base;
@@ -2798,6 +3024,8 @@ impl HeapCollector {
             if pinned_indices.contains(&nursery_idx) {
                 continue;
             }
+            // Free regions are zero-filled; this one holds stale nursery bytes.
+            state.regions[nursery_idx].zero_stale_tail();
             state.regions[nursery_idx].header.kind = RegionKind::Free;
             state.stats.regions_free += 1;
             nursery_regions -= 1;
@@ -2821,6 +3049,8 @@ impl HeapCollector {
             write_decimal(regions_retained);
             crate::syscall::dbg_write(b" evacuated ");
             write_decimal(regions_evacuated);
+            crate::syscall::dbg_write(b" indexed ");
+            write_decimal(nursery_index.lazily_indexed);
             crate::syscall::dbg_write(b"\n");
         }
         state.stats.minor_gc_count += 1;
@@ -3891,8 +4121,8 @@ fn set_pin_bit(v: EgclVal, pinned: bool) {
         return;
     }
     let body = ref_body_addr(v);
-    let guard = heap_state().lock().unwrap();
-    let Some(state) = guard.as_ref() else {
+    let mut guard = heap_state().lock().unwrap();
+    let Some(state) = guard.as_mut() else {
         return;
     };
     let base = state.heap_base as usize;
@@ -3901,13 +4131,15 @@ fn set_pin_bit(v: EgclVal, pinned: bool) {
     }
     // Large-object regions never move, so pinning within one is a no-op (and its
     // header sits at a different offset — never touch it here).
-    for region in &state.regions {
-        let rb = region.base as usize;
-        if body >= rb && body < rb + region.size {
-            if region.header.kind == RegionKind::LargeObject {
-                return;
+    let header_region = (body - OBJECT_HEADER_SIZE - base) / state.config.region_size;
+    if let Some(region) = state.regions.get(header_region) {
+        match region.header.kind {
+            RegionKind::LargeObject => return,
+            // The next minor collection must find this region to retain it.
+            RegionKind::Nursery if pinned => {
+                state.nursery_pin_candidates.insert(header_region);
             }
-            break;
+            _ => {}
         }
     }
     // SAFETY: `body` is a normal object body within the heap; its header
@@ -6827,10 +7059,45 @@ struct HeapRegion {
     /// Size of the backing memory allocation (retained for dealloc/walk).
     #[allow(dead_code)]
     size: usize,
+    /// End of the bytes a minor collection left behind in this nursery region
+    /// without zeroing them (bliss-xyt4l). Memory at or above `alloc_top` is
+    /// zero from here on; below it, it is zeroed as TLABs are carved.
+    /// `base` when nothing stale remains.
+    dirty_end: usize,
 }
 
 // Safety: HeapRegion is only accessed under the HeapState mutex.
 unsafe impl Send for HeapRegion {}
+
+impl HeapRegion {
+    /// Zero whatever stale bytes lie in `[start, end)`, where `start` is the
+    /// region's `alloc_top` and the span is about to be handed out.
+    ///
+    /// # Safety
+    /// `[start, end)` must lie in this region and hold no live object.
+    #[inline]
+    unsafe fn zero_for_reuse(&mut self, start: usize, end: usize) {
+        if start >= self.dirty_end {
+            return;
+        }
+        let stale_end = end.min(self.dirty_end);
+        // SAFETY: the caller hands out this unused span of the region.
+        unsafe { std::ptr::write_bytes(start as *mut u8, 0, stale_end - start) };
+        if end >= self.dirty_end {
+            self.dirty_end = self.base as usize;
+        }
+    }
+
+    /// Zero the stale bytes above `alloc_top`, so the region again satisfies
+    /// the zero-above-top invariant of the non-nursery kinds.
+    fn zero_stale_tail(&mut self) {
+        let top = self.header.alloc_top as usize;
+        let end = self.dirty_end;
+        // SAFETY: nothing above `alloc_top` is an object.
+        unsafe { self.zero_for_reuse(top, end.max(top)) };
+        self.dirty_end = self.base as usize;
+    }
+}
 
 /// Bootstrap heap state — stores the GC configuration, allocated regions,
 /// and stats so that queries can report capacity values after initialization.
@@ -6863,6 +7130,11 @@ struct HeapState {
     /// Dead pinned function/symbol slots, recorded after major-GC reachability.
     /// Each slot remains a walkable filler until reused; live objects never move.
     free_pinned_slots: Vec<(usize, usize)>,
+    /// Nursery regions an object has been pinned in since the last minor
+    /// collection (bliss-xyt4l). That collection walks only these regions to
+    /// find the pinned ones it must retain in place, instead of every nursery
+    /// object. A region stays listed after an unpin; the walk decides.
+    nursery_pin_candidates: std::collections::HashSet<usize>,
 }
 
 // Safety: HeapState is only accessed under the global mutex.
@@ -6992,6 +7264,7 @@ fn allocate_heap_state(config: &GcConfig) -> Result<HeapState, EgclError> {
             header,
             base: region_base,
             size: config.region_size,
+            dirty_end: region_base as usize,
         });
     }
 
@@ -7009,6 +7282,7 @@ fn allocate_heap_state(config: &GcConfig) -> Result<HeapState, EgclError> {
     let state = HeapState {
         pinned_hosts: std::collections::HashSet::new(),
         free_pinned_slots: Vec::new(),
+        nursery_pin_candidates: std::collections::HashSet::new(),
         config: config.clone(),
         stats,
         regions,
@@ -7199,8 +7473,10 @@ fn byte_store(name: &'static str) -> &'static OrderedMutex<Vec<u8>> {
 fn clear_heap_objects(state: &mut HeapState) {
     state.free_pinned_slots.clear();
     state.pinned_hosts.clear();
+    state.nursery_pin_candidates.clear();
     for region in &mut state.regions {
         let used = (region.header.alloc_top as usize).saturating_sub(region.base as usize);
+        region.zero_stale_tail();
         if used > 0 {
             unsafe {
                 std::ptr::write_bytes(region.base, 0, used);
@@ -7263,8 +7539,17 @@ fn append_serialized_object(
 
     let idx = target_idx.ok_or(EgclError::Oom)?;
     targets[target_slot] = Some(idx);
+    if desired_kind == RegionKind::Nursery {
+        // restore_heap pins every restored object (its Pass 2).
+        state.nursery_pin_candidates.insert(idx);
+    }
     let region = &mut state.regions[idx];
     let header_ptr = region.header.alloc_top;
+    {
+        let top = header_ptr as usize;
+        // SAFETY: the object is written into this unused span next.
+        unsafe { region.zero_for_reuse(top, top + total_size) };
+    }
     let body_addr = unsafe {
         let body_off = write_object_header(header_ptr, type_id, body.len() as u32);
         std::ptr::copy_nonoverlapping(body.as_ptr(), header_ptr.add(body_off), body.len());
