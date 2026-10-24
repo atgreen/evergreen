@@ -13161,6 +13161,10 @@ static TREE_CLOSURE_TIERS: LazyLock<SharedCell<HashMap<u64, TreeClosureTier, egc
 
 /// The compiled object a tree-walker closure's calls already dispatch to, when
 /// `tree_closure_tier_up` would return it without counting or compiling.
+#[cfg_attr(
+    not(all(target_arch = "x86_64", target_os = "linux")),
+    allow(dead_code)
+)]
 fn settled_tree_closure(id: u64) -> Option<EgclVal> {
     if cfg!(egcl_no_tree_walker)
         || bytecode::profiling_disabled()

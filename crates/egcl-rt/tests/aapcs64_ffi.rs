@@ -87,7 +87,7 @@ fn call(target: usize, ret: AlienType, types: &[AlienType], args: &[u64]) -> u64
 fn integers_fill_the_register_file_then_spill() {
     let args: Vec<u64> = (1..=10).collect();
     let types = vec![int(64); 10];
-    let result = call(ten_ints as usize, int(64), &types, &args);
+    let result = call(ten_ints as *const () as usize, int(64), &types, &args);
     // 1 + 2*2 + 3*3 + ... + 10*10
     let expected: i64 = (1..=10).map(|n| n * n).sum();
     assert_eq!(result as i64, expected);
@@ -97,7 +97,12 @@ fn integers_fill_the_register_file_then_spill() {
 fn doubles_fill_their_own_register_file_then_spill() {
     let args: Vec<u64> = (1..=10).map(|n| (n as f64).to_bits()).collect();
     let types = vec![AlienType::Double; 10];
-    let result = call(ten_doubles as usize, AlienType::Double, &types, &args);
+    let result = call(
+        ten_doubles as *const () as usize,
+        AlienType::Double,
+        &types,
+        &args,
+    );
     let expected: f64 = (1..=10).map(|n| (n * n) as f64).sum();
     assert_eq!(f64::from_bits(result), expected);
 }
@@ -112,7 +117,12 @@ fn integer_and_float_registers_are_allocated_independently() {
         AlienType::Float,
         int(64),
     ];
-    let result = call(mixed as usize, AlienType::Double, &types, &args);
+    let result = call(
+        mixed as *const () as usize,
+        AlienType::Double,
+        &types,
+        &args,
+    );
     assert_eq!(f64::from_bits(result), 7.0 + 2.5 + 30.0 + 50.0 + 4000.0);
 }
 
@@ -121,7 +131,7 @@ fn a_float_result_comes_back_from_d0() {
     // A Float result is f32 BITS zero-extended, exactly as the x86-64 adapter's
     // `movd eax, xmm0` produces and as unmarshal_from_c reads it back.
     let result = call(
-        halve as usize,
+        halve as *const () as usize,
         AlienType::Float,
         &[AlienType::Float],
         &[9.0f32.to_bits() as u64],
@@ -129,7 +139,7 @@ fn a_float_result_comes_back_from_d0() {
     assert_eq!(f32::from_bits(result as u32), 4.5);
 
     let result = call(
-        negate as usize,
+        negate as *const () as usize,
         AlienType::Double,
         &[AlienType::Double],
         &[1.25f64.to_bits()],
@@ -143,7 +153,7 @@ fn a_narrow_result_carries_exactly_its_declared_width() {
     // unmarshal_from_c masks to the declared width and sign-extends, so the
     // Lisp-visible value is -1; what must not happen is stray high bits from
     // whatever the callee left in X0.
-    let result = call(narrow as usize, int(32), &[int(32)], &[0u64]);
+    let result = call(narrow as *const () as usize, int(32), &[int(32)], &[0u64]);
     assert_eq!(result, 0xFFFF_FFFF, "0 - 1, zero-extended from 32 bits");
     assert_eq!(
         egcl_rt::ffi::unmarshal_from_c(result, &int(32))
@@ -158,7 +168,7 @@ fn a_narrow_result_carries_exactly_its_declared_width() {
 fn pointers_pass_as_integers() {
     let value: u64 = 0xfeed_face_dead_beef;
     let result = call(
-        through_pointer as usize,
+        through_pointer as *const () as usize,
         AlienType::Int {
             bits: 64,
             signed: false,
@@ -189,7 +199,7 @@ fn a_mixed_signature_reaches_the_system_math_library() {
             // SAFETY: ldexp(double, int) -> double is its declared signature.
             unsafe { egcl_rt::ffi::foreign_symbol(library, "ldexp") }.ok()
         })
-        .map_or(ldexp as usize, |symbol| symbol as usize);
+        .map_or(ldexp as *const () as usize, |symbol| symbol as usize);
     let result = call(
         target,
         AlienType::Double,

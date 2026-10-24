@@ -99,6 +99,10 @@ impl TransferSnapshot {
     /// Ready this buffer for another activation of the same code: forget the
     /// capture and every tagged word it copied, so a buffer that nothing
     /// traces never holds a Lisp value.
+    #[cfg_attr(
+        not(all(target_arch = "x86_64", target_os = "linux")),
+        allow(dead_code)
+    )]
     pub(crate) fn clear(&mut self) {
         self.captured = false;
         for slot in &mut self.saved {

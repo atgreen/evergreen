@@ -90,8 +90,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Install pinned toolchain
-        run: rustup show active-toolchain
+      - name: Install pinned toolchain and the non-x86 port targets
+        # `make clippy-ports` lints the code behind cfg(target_arch = ...) for
+        # the other ports, which the x86-64 gate never compiles. Only the std
+        # for each target is needed -- neither of these runs a cross C
+        # compiler (bliss-d2ter).
+        run: |
+          rustup show active-toolchain
+          rustup target add aarch64-unknown-linux-gnu riscv64gc-unknown-linux-gnu
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: lint

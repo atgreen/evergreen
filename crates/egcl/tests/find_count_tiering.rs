@@ -17,6 +17,7 @@ use std::process::Command;
 
 const BIN: &str = env!("CARGO_BIN_EXE_egcl");
 
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 const NAMES: [&str; 6] = [
     "FIND",
     "FIND-IF",

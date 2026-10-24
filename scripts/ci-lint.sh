@@ -24,6 +24,7 @@ check() {
 check 'coverage policy contracts' python3 scripts/test_spec_coverage.py
 check 'spec coverage' python3 scripts/spec-coverage.py --gate --debt-baseline spec/coverage-debt.json
 check 'strict Clippy' make clippy
+check 'strict Clippy, non-x86 ports' make clippy-ports
 check 'GC root lint' bash scripts/gc-root-lint.sh
 check 'validation contracts' cargo test -p egcl --test spec_validation_infra ansi_expected_failures_and_ci_contracts
 

@@ -8,6 +8,7 @@
 //! heat never promoted it past T1. A method whose body loops stayed there until
 //! its 4096th call, roughly 80x slower than the same body in a DEFUN.
 
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 use std::process::Command;
 
 #[test]

@@ -216,6 +216,7 @@ const PROGRAM: &str = r#"
 "#;
 
 /// Functions whose blocks or tags used to be registered for nothing, in TIERS order.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 const ELIDED: [&str; 10] = [
     "MAS",
     "TRU",
@@ -266,6 +267,7 @@ fn results(stdout: &str) -> String {
         .join("\n")
 }
 
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 fn tiers(stdout: &str) -> Vec<u32> {
     let line = stdout
         .lines()

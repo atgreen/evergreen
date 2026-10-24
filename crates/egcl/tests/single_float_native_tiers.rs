@@ -111,6 +111,7 @@ fn single_float_results_match_the_interpreter_at_every_tier() {
 }
 
 /// Run `program` and return (stdout, stderr).
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 fn run_logged(program: &str, envs: &[(&str, &str)]) -> (String, String) {
     let mut command = Command::new(BIN);
     command.args(["--no-init", "--eval", program]).env("EGCL_LAZY_COMPILE", "0");
