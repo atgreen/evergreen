@@ -146,6 +146,13 @@ fn remove_inference_proven(f: &mut Function) -> bool {
                 continue;
             };
             let Some(&v) = d.args.first() else { continue };
+            // A guard that also converts (an `UnboxFloat` taking a fixnum by
+            // contagion, say) cannot be forwarded to its tagged operand even
+            // when its check is proven: the result is a different value
+            // (bliss-thcbb.1).
+            if d.results.iter().any(|&result| f.value(result).repr != f.value(v).repr) {
+                continue;
+            }
             let got = inf.ty(v);
             if !got.bits.is_bottom()
                 && tau.bits.contains(got.bits)
@@ -1376,6 +1383,41 @@ mod tests {
 
         run(&mut f);
         assert_eq!(count_guards(&f), 1, "an unproven guard must survive");
+    }
+
+    #[test]
+    fn proven_contagion_unbox_is_a_conversion_not_a_redundant_guard() {
+        // `(* i 1d-3)` with `i` a declared fixnum (bliss-thcbb.1): the
+        // fixnum-accepting UnboxFloat's TypeTag covers `i`, but its raw
+        // result is the converted double, so it must not forward to `i`.
+        let mut f = Function::new("contagion");
+        let e = f.entry();
+        let i = f.add_block_param(e, fixnum(), ValueRepresentation::Tagged);
+        let state = f.frame_states.add(FrameState {
+            scopes: vec![FrameScope { function: 0, bcp: 3, locals: vec![], stack: vec![] }],
+            remat: vec![],
+        });
+        let (unbox, raw) = f.push_inst(
+            e,
+            InstData {
+                args: vec![i],
+                aux: crate::t2::speculate::contagion_unbox_aux(),
+                flags: InstFlags { guard: true, effectful: true, ..InstFlags::default() },
+                frame_state: Some(state),
+                ..base(Opcode::UnboxFloat)
+            },
+            &[(IRType::of(TypeBits::DOUBLE_FLOAT), ValueRepresentation::UnboxedF64)],
+        );
+        let (mul, _) = f.push_inst(
+            e,
+            InstData { args: vec![raw[0], raw[0]], ..base(Opcode::FloatMul) },
+            &[(IRType::of(TypeBits::DOUBLE_FLOAT), ValueRepresentation::UnboxedF64)],
+        );
+        f.set_terminator(e, ret());
+
+        run(&mut f);
+        assert!(f.block(e).insts.contains(&unbox), "the conversion stays");
+        assert_eq!(f.inst(mul).args, vec![raw[0], raw[0]], "operands stay raw");
     }
 
     // spec-covers: R4.63

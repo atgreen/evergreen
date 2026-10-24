@@ -126,6 +126,13 @@
   definition of a named function, now enters that function directly too:
   `(funcall #'f s 1)` in a loop drops from about 660 ns to 19 ns
   ([#624](https://github.com/atgreen/evergreen/pull/624)).
+- On x86-64 Linux, optimized double-float code no longer falls back to
+  generic arithmetic when it combines a declared fixnum with a double-float
+  under `(safety 0)`, as in `(* i 1d-3)`; the fixnum is converted to the
+  nearest double, as before. `+`, `-` and `*` of three or more double-floats
+  now also compute on unboxed doubles. GH #594's `step-plain` driver, which
+  does both, drops from about 2.4 µs to 0.14 µs per call
+  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
 - More than 50 builtins called from compiled code no longer rebuild and
   re-evaluate their call form each time. They include `evenp`, `oddp`, `/`,
   `member` and `assoc` with `:test` or `:key`, `mapcar`, `map`, `format`,

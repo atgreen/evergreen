@@ -458,9 +458,13 @@ fn double_operands_admissible(
                 !bits.is_bottom() && !bits.meet(variable_bits).is_bottom()
             }
         })
-        && args
+        // Two constants form a site only with a double literal among them,
+        // as `(* 1.5d0 1.5d0)` after a declared double is propagated; the raw
+        // operation computes exactly what the interpreter would.
+        && (args
             .iter()
             .any(|&arg| double_constant_operand(f, arg, consts, comparison).is_none())
+            || (!comparison && args.iter().any(|&arg| double_literal_bits(f, arg).is_some())))
         && args.iter().any(|&arg| may_be_double(arg))
 }
 
@@ -685,6 +689,58 @@ fn reconcile_with_operands(
     }
 }
 
+/// Split a `+`, `-` or `*` of three or more operands whose site profiled
+/// double-float into a left-to-right chain of binary calls (bliss-thcbb.1), so
+/// each link can take the binary raw double form. The interpreter folds the
+/// same way: `-` from its first operand, `*` onto a 1 seed that leaves a double
+/// unchanged, and `+` onto a +0.0 seed, whose only effect (turning a -0.0 sum
+/// into +0.0) every raw `FloatAdd` already reproduces. Each link deoptimizes
+/// with the whole call's frame state: arithmetic has no effects, so the
+/// interpreter simply evaluates the original call again.
+fn split_variadic_double_arithmetic(f: &mut Function, profile: &impl Fn(u32) -> Option<SpecType>) {
+    use crate::t2::ir::{InstData, ValueRepresentation};
+    let mut sites = Vec::new();
+    for &block in f.block_order() {
+        for &inst in &f.block(block).insts {
+            let data = f.inst(inst);
+            if data.opcode != Opcode::Call || data.args.len() < 3 || data.results.len() != 1 {
+                continue;
+            }
+            let AuxData::CallTarget(sym) = data.aux else { continue };
+            let Some(state) = data.frame_state else { continue };
+            if arith_of(sym).is_none() || profile(frame_state_bcp(f, state)) != Some(SpecType::DoubleFloat) {
+                continue;
+            }
+            sites.push(inst);
+        }
+    }
+    for site in sites {
+        let data = f.inst(site).clone();
+        let state = data.frame_state.expect("collected with a frame state");
+        let (last, leading) = data.args.split_last().expect("three or more operands");
+        let mut accumulated = leading[0];
+        for &operand in &leading[1..] {
+            let link_state = f.frame_states.add(f.frame_states.get(state).clone());
+            accumulated = insert_before_site(
+                f,
+                site,
+                InstData {
+                    opcode: Opcode::Call,
+                    args: vec![accumulated, operand],
+                    results: vec![],
+                    aux: data.aux.clone(),
+                    flags: data.flags,
+                    targets: vec![],
+                    frame_state: Some(link_state),
+                    source_pos: data.source_pos,
+                },
+                (IRType::TOP, ValueRepresentation::Tagged),
+            );
+        }
+        f.inst_mut(site).args = vec![accumulated, *last];
+    }
+}
+
 /// Rewrite generic arithmetic `Call`s into single guarded typed ops guided by
 /// static SSA proof first, then `profile` (site `bcp` → the one speculated type,
 /// or `None` to leave generic).
@@ -699,6 +755,9 @@ pub fn speculate_with(
     profile: &impl Fn(u32) -> Option<SpecType>,
     options: SpeculateOptions,
 ) -> usize {
+    if options.double_float && cfg!(target_arch = "x86_64") {
+        split_variadic_double_arithmetic(f, profile);
+    }
     // Read phase: collect the calls to rewrite (keeps the borrow off `f` for the
     // mutation phase).
     let mut work: Vec<(Inst, Opcode, IRType, ExtraArg)> = Vec::new();

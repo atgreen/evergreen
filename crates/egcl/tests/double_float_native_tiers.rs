@@ -271,3 +271,41 @@ fn escape_boxes_survive_gc_stress() {
     assert!(result(&expected).is_some(), "{expected}");
     assert_eq!(result(&stressed), result(&expected), "{stressed}\n{stderr}");
 }
+
+/// GH #594's STEP-PLAIN (bliss-thcbb.1): a declared fixnum times a double
+/// literal, products of a propagated double constant, and a three-operand
+/// `+` all compute raw. The fixnum's contagion guard survives guard
+/// elimination, and `+`, `-` and `*` of three or more operands split into
+/// binary raw links. Answers, including signed zeros and mixed operands that
+/// deopt, are the interpreter's.
+#[test]
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn fixnum_contagion_and_variadic_arithmetic_run_raw_at_t2() {
+    let program = "(progn \
+        (defun step-plain (i) (declare (fixnum i) (optimize (speed 3) (safety 0))) \
+          (let ((px (* i 1d-3)) (py (* i 2d-3)) (pz 1.5d0)) (declare (double-float px py pz)) \
+            (+ (* px px) (* py py) (* pz pz)))) \
+        (defun a3 (a b c) (+ a b c)) \
+        (defun s3 (a b c) (- a b c)) \
+        (defun m3 (a b c) (* a b c)) \
+        (loop for j from 0 repeat 5000 \
+              until (every (lambda (f) (eql 2 (egcl-ext:function-tier f))) '(step-plain a3 s3 m3)) \
+              do (step-plain j) (a3 1d0 2d0 3d0) (s3 1d0 2d0 3d0) (m3 1d0 2d0 3d0)) \
+        (format t \"RESULT ~S~%\" (list (step-plain 7) \
+          (a3 1d0 2d0 3d0) (a3 -0d0 -0d0 -0d0) (a3 1 2 3d0) (a3 1 2 3) (a3 1/2 1/3 1d0) (a3 0.1d0 0.2d0 0.3d0) \
+          (s3 1d0 2d0 3d0) (s3 -0d0 0d0 0d0) (s3 3 1 0.5d0) \
+          (m3 1d0 2d0 3d0) (m3 -0d0 1d0 1d0) (m3 2 3 0.5d0) (m3 2 3 4))))";
+    let expected = "RESULT (2.250245d0 6.0d0 0.0d0 6.0d0 6 1.8333333333333335d0 \
+        0.6000000000000001d0 -4.0d0 -0.0d0 1.5d0 6.0d0 -0.0d0 3.0d0 24)";
+    let (interpreted, _) = run_logged(program, &[("EGCL_BACKEND", "tree-walker")]);
+    assert!(interpreted.contains(expected), "{interpreted}");
+    let (stdout, stderr) = run_logged(program, &PROMOTE);
+    assert!(stdout.contains(expected), "{stdout}\n{stderr}");
+    let raw_emitted = stderr.lines().any(|line| {
+        (line.starts_with("[T2] STEP-PLAIN: mapped T2 emitted")
+            || line.starts_with("[T2] STEP-PLAIN: ordinary x86-64 Lisp T2 emitted"))
+            && !line.ends_with("raw_f64_values=0")
+    });
+    assert!(raw_emitted, "STEP-PLAIN must install raw f64 code\n{stderr}");
+    assert!(!stderr.contains("STEP-PLAIN: raw double T2 emission declined"), "{stderr}");
+}
