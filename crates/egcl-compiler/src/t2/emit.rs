@@ -3966,16 +3966,24 @@ pub fn emit_framed_with_direct_natives(
             super::emit_a64::RuntimeCalls {
                 deopt: c2i_deopt_addr,
                 call_slice: c2i_call_slice_addr,
-                call_slice_rooted: 0,
+                // A register-entry body owns no activation, so it stages its
+                // own calls in its frame and needs the adapter that copies
+                // them into storage the collector can see before the callee
+                // can allocate (bliss-of8kz).
+                call_slice_rooted: call_slice_rooted_addr(),
                 load_global: c2i_load_global_addr,
                 load_function: c2i_load_function_addr,
                 store_global: c2i_store_global_addr,
                 multiple_values: c2i_mv_addr,
                 transfer_pending: c2i_transfer_pending_addr,
                 poll: c2i_poll_addr,
-                self_sym: None,
+                // Enables the register entry and the direct self-call. Direct
+                // native-to-native calls to OTHER functions stay off: those
+                // need the resolved-callee list and its generation guard,
+                // which is a separate step.
+                self_sym,
                 direct_natives: Vec::new(),
-                code_id: 0,
+                code_id,
                 environment: EnvironmentCalls::default(),
                 portable: portable.clone(),
                 named_calls: Vec::new(),
@@ -5978,17 +5986,8 @@ fn emit_framed_inner(
     // entirely loses its frame_base_home — unlocking the direct self-call
     // fast path in emit_call.
     let inference = crate::t2::infer::infer(f);
-    let proven_immediate = |value: Value| -> bool {
-        const IMMEDIATE: TypeBits = TypeBits(
-            TypeBits::FIXNUM.0
-                | TypeBits::SINGLE_FLOAT.0
-                | TypeBits::CHARACTER.0
-                | TypeBits::SYMBOL.0
-                | TypeBits::NULL.0,
-        );
-        let bits = inference.ty(value).bits;
-        !bits.is_bottom() && bits.meet(IMMEDIATE) == bits
-    };
+    let proven_immediate =
+        |value: Value| super::register_entry::proven_immediate(&inference, value);
     let needs_shadow = |entry: &crate::t2::x64_frame::FrameValue| {
         entry.gc_home().is_some_and(|home| !published_native_roots || !home.survives_sysv_call())
     };
