@@ -16201,6 +16201,10 @@ fn local_exit_crosses_env_frame(bf: &BytecodeFunction) -> bool {
 /// frame AT that site, the `EnvFrame` each scope was established in: `current`
 /// minus the lexical environments entered after it. Allocates nothing, so the
 /// deopt paths can call it after their last fallible step (bliss-uhsp5).
+#[cfg_attr(
+    not(all(target_arch = "x86_64", target_os = "linux")),
+    allow(dead_code)
+)]
 fn scope_env_frames<'a>(
     scopes: &'a [egcl_compiler::control_scope::ControlScope],
     current: &'a HandlerEnv,
@@ -19744,6 +19748,10 @@ static NATIVE_ERROR: egcl_rt::execution_local::ExecutionLocal<PendingError<'stat
 /// execution-local lookup and the `RefCell` swap of a large `Option<EgclError>`
 /// (GitHub #487: the native entry did this three times per call). A zero
 /// count proves this execution's slot is empty: its own writes precede the load.
+#[cfg_attr(
+    not(all(target_arch = "x86_64", target_os = "linux")),
+    allow(dead_code)
+)]
 fn take_native_error() -> Option<EgclError> {
     if PENDING_NATIVE_ERRORS.load(AtomicOrdering::Relaxed) == 0 {
         return None;
@@ -19754,6 +19762,10 @@ fn take_native_error() -> Option<EgclError> {
 /// Restore `error` as this execution's pending native error, dropping any
 /// error still in the slot. Free when both are empty, as with
 /// [`take_native_error`].
+#[cfg_attr(
+    not(all(target_arch = "x86_64", target_os = "linux")),
+    allow(dead_code)
+)]
 fn restore_native_error(error: Option<EgclError>) {
     if error.is_none() && PENDING_NATIVE_ERRORS.load(AtomicOrdering::Relaxed) == 0 {
         return;
@@ -22000,6 +22012,10 @@ fn has_t2_body(sym: u32, body: &Arc<BytecodeFunction>) -> bool {
 }
 
 /// True when `function` is an instance of the closure template `body`.
+#[cfg_attr(
+    not(all(target_arch = "x86_64", target_os = "linux")),
+    allow(dead_code)
+)]
 pub(super) fn closure_template_matches(function: EgclVal, body: *const BytecodeFunction) -> bool {
     egcl_rt::function::is_interpreted_function(function)
         && closure_bodies()

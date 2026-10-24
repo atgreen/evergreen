@@ -898,12 +898,20 @@ thread_local! {
 
 /// Symbol-to-cell resolutions on this thread since the last call.
 #[cfg(test)]
+#[cfg_attr(
+    not(all(target_arch = "x86_64", target_os = "linux")),
+    allow(dead_code)
+)]
 pub(super) fn take_resolves_for_test() -> usize {
     RESOLVES.with(|count| count.replace(0))
 }
 
 /// Native entries and tier dispatches recorded on this thread since the last call.
 #[cfg(test)]
+#[cfg_attr(
+    not(all(target_arch = "x86_64", target_os = "linux")),
+    allow(dead_code)
+)]
 pub(super) fn take_target_lookups_for_test() -> usize {
     TARGET_LOOKUPS.with(|count| count.replace(0))
 }

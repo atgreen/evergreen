@@ -1926,6 +1926,10 @@ pub fn install_box_double_veneer(address: u64) {
     }
 }
 
+#[cfg_attr(
+    not(all(target_arch = "x86_64", target_os = "linux")),
+    allow(dead_code)
+)]
 fn box_double_veneer() -> Option<u64> {
     BOX_DOUBLE_VENEER.get().copied()
 }

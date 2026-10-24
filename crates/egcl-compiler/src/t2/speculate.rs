@@ -1904,9 +1904,11 @@ mod tests {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
     const DOUBLE_FLOAT: SpeculateOptions = SpeculateOptions { double_float: true };
 
     /// The opcodes of the entry block, in order.
+    #[cfg(target_arch = "x86_64")]
     fn entry_opcodes(f: &Function) -> Vec<Opcode> {
         f.block(f.entry()).insts.iter().map(|&inst| f.inst(inst).opcode).collect()
     }

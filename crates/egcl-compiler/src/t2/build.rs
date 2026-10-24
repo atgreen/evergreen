@@ -4284,12 +4284,29 @@ mod tests {
 
     #[test]
     fn folded_mutable_builtin_retains_binding_deopt_on_every_backend() {
-        use crate::t2::{emit, emit_a64, emit_ppc64le, emit_riscv64, emit_s390x};
+        #[cfg(target_arch = "x86_64")]
+        use crate::t2::emit;
+        #[cfg(target_arch = "aarch64")]
+        use crate::t2::emit_a64;
         use crate::t2::pass::PassManager;
+        use crate::t2::{emit_ppc64le, emit_riscv64, emit_s390x};
         let plus = egcl_rt::symbols::intern("+");
-        let input = bf("binding-fold", vec![
-            Instr::Const(0), Instr::Const(1), Instr::CallNamed { sym: plus, nargs: 2 }, Instr::Return,
-        ], vec![EgclVal::from_fixnum(10), EgclVal::from_fixnum(20)], 0, 0, 2);
+        let input = bf(
+            "binding-fold",
+            vec![
+                Instr::Const(0),
+                Instr::Const(1),
+                Instr::CallNamed {
+                    sym: plus,
+                    nargs: 2,
+                },
+                Instr::Return,
+            ],
+            vec![EgclVal::from_fixnum(10), EgclVal::from_fixnum(20)],
+            0,
+            0,
+            2,
+        );
         let mut function = build_from_bytecode(&input).unwrap();
         assert_eq!(crate::t2::speculate::speculate(&mut function, &|_| None), 1);
         // Standard CL arithmetic is fixed. Add an independent mutable binding
@@ -4297,42 +4314,125 @@ mod tests {
         // preservation, not whether canonical arithmetic needs a binding guard.
         let mutable = egcl_rt::symbols::intern("FOLDING-MUTABLE-BINDING-FIXTURE");
         let binding = crate::t2::builtin_binding::snapshot(mutable).unwrap();
-        assert!(matches!(binding, crate::t2::builtin_binding::Binding::Guarded { .. }));
+        assert!(matches!(
+            binding,
+            crate::t2::builtin_binding::Binding::Guarded { .. }
+        ));
         let block = function.entry();
-        let position = function.block(block).insts.iter().position(|&inst|
-            function.inst(inst).opcode == Opcode::FixnumAdd).unwrap();
+        let position = function
+            .block(block)
+            .insts
+            .iter()
+            .position(|&inst| function.inst(inst).opcode == Opcode::FixnumAdd)
+            .unwrap();
         let arithmetic = function.block(block).insts[position];
         let state = function.inst(arithmetic).frame_state.unwrap();
         crate::t2::builtin_binding::insert(&mut function, block, position, state, binding);
         let mut passes = PassManager::new();
-        passes.add(Box::new(crate::t2::opt_fold::ConstFold))
+        passes
+            .add(Box::new(crate::t2::opt_fold::ConstFold))
             .add(Box::new(crate::t2::opt_clear_mv::ClearMvElim))
             .add(Box::new(crate::t2::opt_dce::Dce));
         passes.run(&mut function);
         crate::t2::verify::verify(&function).unwrap();
-        let guards: Vec<_> = function.block_order().iter().flat_map(|&block|
-            function.block(block).insts.iter().map(|&inst| function.inst(inst)))
-            .filter(|data| matches!(data.aux, AuxData::BuiltinBinding { .. })).collect();
-        assert_eq!(guards.len(), 1, "folding must not erase binding sensitivity");
+        let guards: Vec<_> = function
+            .block_order()
+            .iter()
+            .flat_map(|&block| {
+                function
+                    .block(block)
+                    .insts
+                    .iter()
+                    .map(|&inst| function.inst(inst))
+            })
+            .filter(|data| matches!(data.aux, AuxData::BuiltinBinding { .. }))
+            .collect();
+        assert_eq!(
+            guards.len(),
+            1,
+            "folding must not erase binding sensitivity"
+        );
         let state = function.frame_states.get(guards[0].frame_state.unwrap());
         assert_eq!(state.scopes[0].bcp, 2);
-        assert_eq!(state.scopes[0].stack.len(), 2, "resume with the original arguments");
-        assert!(function.block_order().iter().all(|&block| function.block(block).insts.iter()
-            .all(|&inst| function.inst(inst).opcode != Opcode::FixnumAdd)),
-            "the arithmetic result must actually fold");
+        assert_eq!(
+            state.scopes[0].stack.len(),
+            2,
+            "resume with the original arguments"
+        );
+        assert!(
+            function.block_order().iter().all(|&block| function
+                .block(block)
+                .insts
+                .iter()
+                .all(|&inst| function.inst(inst).opcode != Opcode::FixnumAdd)),
+            "the arithmetic result must actually fold"
+        );
         // These artifacts are inspected, not executed. Supply the return-effect
         // adapter as well as the deopt address now that folding retains ClearMv.
-        let runtime = emit_s390x::RuntimeCalls { multiple_values: 1, ..Default::default() };
-        for (name, code) in [
-            ("x86", emit::emit_framed(&function, 1, 1, 0, 0, 0, 0, 0, 1, None)),
-            ("aarch64", emit_a64::emit_framed_with_runtime(&function, 1, input.num_slots(), runtime.clone())),
-            ("s390x", emit_s390x::emit_framed_with_runtime(&function, 1, input.num_slots(), runtime.clone())),
-            ("ppc64le", emit_ppc64le::emit_framed_with_runtime(&function, 1, input.num_slots(), runtime)),
-            ("riscv64", emit_riscv64::emit_framed_with_runtime(&function, 1, input.num_slots(),
-                emit_riscv64::RuntimeCalls { multiple_values: 1, ..Default::default() })),
-        ] {
-            assert!(code.unwrap_or_else(|error| panic!("{name}: {error:?}")).has_deopt,
-                "{name} must preserve a real deopt exit");
+        let runtime = emit_s390x::RuntimeCalls {
+            multiple_values: 1,
+            ..Default::default()
+        };
+        // emit.rs and emit_a64.rs both resolve branches through
+        // `egcl_rt::asm::Asm`, whose label fixups are the HOST's: on an
+        // AArch64 host the x86 emitter lays x86 bytes but resolves their
+        // displacements with AArch64 rules and returns BadBranch. Each of
+        // those two is therefore only meaningful on its own host. The
+        // System Z, POWER and RISC-V emitters carry their own
+        // host-independent assemblers and run everywhere (bliss-d2ter).
+        #[cfg_attr(
+            not(any(target_arch = "x86_64", target_arch = "aarch64")),
+            allow(unused_mut)
+        )]
+        let mut backends = vec![
+            (
+                "s390x",
+                emit_s390x::emit_framed_with_runtime(
+                    &function,
+                    1,
+                    input.num_slots(),
+                    runtime.clone(),
+                ),
+            ),
+            (
+                "ppc64le",
+                emit_ppc64le::emit_framed_with_runtime(
+                    &function,
+                    1,
+                    input.num_slots(),
+                    runtime.clone(),
+                ),
+            ),
+            (
+                "riscv64",
+                emit_riscv64::emit_framed_with_runtime(
+                    &function,
+                    1,
+                    input.num_slots(),
+                    emit_riscv64::RuntimeCalls {
+                        multiple_values: 1,
+                        ..Default::default()
+                    },
+                ),
+            ),
+        ];
+        #[cfg(target_arch = "x86_64")]
+        backends.push((
+            "x86",
+            emit::emit_framed(&function, 1, 1, 0, 0, 0, 0, 0, 1, None),
+        ));
+        #[cfg(target_arch = "aarch64")]
+        backends.push((
+            "aarch64",
+            emit_a64::emit_framed_with_runtime(&function, 1, input.num_slots(), runtime.clone()),
+        ));
+        let _ = &runtime;
+        for (name, code) in backends {
+            assert!(
+                code.unwrap_or_else(|error| panic!("{name}: {error:?}"))
+                    .has_deopt,
+                "{name} must preserve a real deopt exit"
+            );
         }
     }
 
@@ -4342,7 +4442,11 @@ mod tests {
     /// refused GenericEq outright (bliss-jmwqr).
     #[test]
     fn nil_armed_list_access_emits_on_every_backend() {
-        use crate::t2::{emit, emit_a64, emit_ppc64le, emit_riscv64, emit_s390x};
+        #[cfg(target_arch = "x86_64")]
+        use crate::t2::emit;
+        #[cfg(target_arch = "aarch64")]
+        use crate::t2::emit_a64;
+        use crate::t2::{emit_ppc64le, emit_riscv64, emit_s390x};
         let car = egcl_rt::symbols::intern("CAR");
         let cdr = egcl_rt::symbols::intern("CDR");
         for (name, code) in [
@@ -4391,7 +4495,10 @@ mod tests {
             );
             if name == "car-cdr" {
                 assert!(
-                    function.block_order().iter().any(|&block| function.block(block).params.len() >= 2),
+                    function
+                        .block_order()
+                        .iter()
+                        .any(|&block| function.block(block).params.len() >= 2),
                     "car-cdr: the grouped loads must meet at a multi-parameter join"
                 );
             }
@@ -4399,20 +4506,18 @@ mod tests {
                 multiple_values: 1,
                 ..Default::default()
             };
-            for (backend, code) in [
-                (
-                    "x86",
-                    emit::emit_framed(&function, 1, 1, 0, 0, 0, 0, 0, 1, None),
-                ),
-                (
-                    "aarch64",
-                    emit_a64::emit_framed_with_runtime(
-                        &function,
-                        1,
-                        input.num_slots(),
-                        runtime.clone(),
-                    ),
-                ),
+            // emit.rs and emit_a64.rs both resolve branches through
+            // `egcl_rt::asm::Asm`, whose label fixups are the HOST's: on an
+            // AArch64 host the x86 emitter lays x86 bytes but resolves their
+            // displacements with AArch64 rules and returns BadBranch. Each of
+            // those two is therefore only meaningful on its own host. The
+            // System Z, POWER and RISC-V emitters carry their own
+            // host-independent assemblers and run everywhere (bliss-d2ter).
+            #[cfg_attr(
+            not(any(target_arch = "x86_64", target_arch = "aarch64")),
+            allow(unused_mut)
+        )]
+        let mut backends = vec![
                 (
                     "s390x",
                     emit_s390x::emit_framed_with_runtime(
@@ -4428,7 +4533,7 @@ mod tests {
                         &function,
                         1,
                         input.num_slots(),
-                        runtime,
+                        runtime.clone(),
                     ),
                 ),
                 (
@@ -4443,7 +4548,24 @@ mod tests {
                         },
                     ),
                 ),
-            ] {
+            ];
+            #[cfg(target_arch = "x86_64")]
+            backends.push((
+                "x86",
+                emit::emit_framed(&function, 1, 1, 0, 0, 0, 0, 0, 1, None),
+            ));
+            #[cfg(target_arch = "aarch64")]
+            backends.push((
+                "aarch64",
+                emit_a64::emit_framed_with_runtime(
+                    &function,
+                    1,
+                    input.num_slots(),
+                    runtime.clone(),
+                ),
+            ));
+            let _ = &runtime;
+            for (backend, code) in backends {
                 assert!(
                     code.unwrap_or_else(|error| panic!("{name} on {backend}: {error:?}"))
                         .has_deopt,

@@ -21,7 +21,7 @@ RELEASE_BIN := target/x86_64-unknown-linux-musl/release/egcl
 EGCL_EXE := target/egcl
 
 .DEFAULT_GOAL := build
-.PHONY: build check test test-rt test-cli clippy fmt fmt-check clean release run \
+.PHONY: build check test test-rt test-cli clippy clippy-ports fmt fmt-check clean release run \
         help image pgo-image image-no-pgo test-pgo-build test-library-forks install uninstall
 
 ## build: compile the whole workspace (default target)
@@ -47,6 +47,24 @@ test-cli:
 ## clippy: lint the workspace, denying warnings
 clippy:
 	$(CARGO) clippy --workspace --all-targets -- -D warnings
+
+## clippy-ports: lint the non-x86 ports, which host clippy never compiles
+##
+## Code behind `cfg(target_arch = ...)` for another port is invisible to the
+## x86-64 gate, so a lint there reaches no one until someone builds on that
+## hardware. aarch64 had 37 such warnings and riscv64 nine, all of them errors
+## under -D warnings, none reported by CI (bliss-d2ter).
+##
+## These two targets need no cross C toolchain, only `rustup target add`.
+## ppc64le and s390x are deliberately absent: egcl-rt's build script probes a
+## target C compiler, so they would need powerpc64le-linux-gnu-gcc and
+## s390x-linux-gnu-gcc installed first.
+CLIPPY_PORT_TARGETS ?= aarch64-unknown-linux-gnu riscv64gc-unknown-linux-gnu
+clippy-ports:
+	@for target in $(CLIPPY_PORT_TARGETS); do \
+		echo "=== clippy $$target ==="; \
+		$(CARGO) clippy --workspace --all-targets --target "$$target" -- -D warnings || exit 1; \
+	done
 
 ## fmt: format all sources
 fmt:

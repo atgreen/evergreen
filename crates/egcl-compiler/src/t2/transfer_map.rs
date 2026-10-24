@@ -299,6 +299,10 @@ pub(crate) fn lower_resolved_transfer_maps(
 /// Reuse precise deopt descriptors for a cold OSR capture at an inserted poll.
 /// The poll's resolved values are authoritative for liveness and physical
 /// homes, including constants; absent dead locals have no import destination.
+#[cfg_attr(
+    not(all(target_arch = "x86_64", target_os = "linux")),
+    allow(dead_code)
+)]
 pub(crate) fn lower_poll_transfer_map(
     f: &Function,
     block: crate::t2::ir::Block,

@@ -144,6 +144,7 @@ fn double_float_results_match_the_interpreter_at_every_tier() {
 }
 
 /// Run `program` and return (stdout, stderr).
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 fn run_logged(program: &str, envs: &[(&str, &str)]) -> (String, String) {
     let mut command = Command::new(BIN);
     command.args(["--no-init", "--eval", program]).env("EGCL_LAZY_COMPILE", "0");
@@ -157,6 +158,7 @@ fn run_logged(program: &str, envs: &[(&str, &str)]) -> (String, String) {
     (stdout, stderr)
 }
 
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 const PROMOTE: [(&str, &str); 4] = [
     ("EGCL_T0_T1_THRESHOLD", "2"),
     ("EGCL_T2_THRESHOLD", "20"),
