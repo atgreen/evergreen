@@ -88,6 +88,10 @@
 
 ### Performance
 
+- `substitute`, `substitute-if` and `substitute-if-not` on a whole list
+  without `:count` or `:from-end` make one pass over the list, as `remove`
+  does since #607. Substituting in an 8-element list drops from about 207 µs to
+  90 µs ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
 - `remove`, `remove-if`, `remove-if-not`, `delete` and `delete-if` on a whole
   list without `:count` or `:from-end` make one pass over the list, instead of
   copying it into a vector, collecting the matching positions and then
