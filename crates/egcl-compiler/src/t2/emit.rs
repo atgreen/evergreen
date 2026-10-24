@@ -158,6 +158,10 @@ mod ordinary_call;
 mod ordinary_prefix;
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[path = "inline_alloc.rs"]
+mod inline_alloc;
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[path = "ordinary_primitives.rs"]
 mod ordinary_primitives;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -5132,6 +5136,32 @@ fn emit_framed_inner(
     let single_returns = if native_returns {
         crate::t2::opt_clear_mv::single_value_state_after_normalized_calls(f, true, &normalized_calls)
     } else { HashSet::new() };
+    // A call to CONS, LIST or LIST* returns one value and so empties the MV
+    // buffer, which its inline fast path preserves only from an empty buffer.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let inline_alloc_single = if ordinary_call_mode && native_returns {
+        let mut normalized = normalized_calls.clone();
+        normalized.extend(f.block_order().iter().flat_map(|&block| f.block(block).insts.iter().copied())
+            .filter(|&inst| f.inst(inst).opcode == Opcode::Call
+                && inline_alloc::list_shape(f.inst(inst)).is_some()));
+        crate::t2::opt_clear_mv::single_value_state_after_normalized_calls(f, true, &normalized)
+    } else { HashSet::new() };
+    // Mapped code empties the MV buffer only at explicit resets, so an inline
+    // CONS may also leave a state that nothing reads before the next one.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let inline_alloc_mv_free: HashSet<Inst> = if ordinary_call_mode { HashSet::new() } else {
+        let sites: HashSet<Inst> = f.block_order().iter()
+            .flat_map(|&block| f.block(block).insts.iter().copied())
+            .filter(|&inst| matches!(f.inst(inst).opcode, Opcode::Call | Opcode::Invoke)
+                && inline_alloc::list_shape(f.inst(inst)).is_some())
+            .collect();
+        if sites.is_empty() { HashSet::new() } else {
+            let mut free = crate::t2::opt_clear_mv::single_value_state_after_normalized_calls(f, false, &sites);
+            free.extend(crate::t2::opt_clear_mv::dead_after(f));
+            free.retain(|inst| sites.contains(inst));
+            free
+        }
+    };
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
     let transfer_mode = false;
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -6607,6 +6637,7 @@ fn emit_framed_inner(
                 let veneer = box_double_veneer().ok_or(EmitError::UnsupportedOp(op_tag(d.opcode)))?;
                 let input = *homes.get(&d.args[0]).ok_or(EmitError::UnsupportedOp(0xF2))?;
                 let result = *homes.get(&d.results[0]).ok_or(EmitError::UnsupportedOp(0xF2))?;
+                let inline_done = inline_alloc::emit_box_double_fast_path(&mut a, input, result);
                 let (call, values) = emit_mapped_box(
                     &mut a,
                     box_maps.get(&inst).ok_or(EmitError::UnsupportedOp(0xFE))?,
@@ -6619,6 +6650,7 @@ fn emit_framed_inner(
                 )?;
                 native_value_maps.insert(call.return_offset, NativeCallValues::Frame(values));
                 native_calls.push(call.site(NativeCallOrigin::StraightPoll(inst), NativeStackBase::Body));
+                if let Some(done) = inline_done { a.bind(done); }
                 continue;
             }
             if (is_const_opcode(d.opcode) && d.opcode != Opcode::ConstHeapObj)
@@ -6666,6 +6698,10 @@ fn emit_framed_inner(
                     })
                     .collect()
             });
+            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+            let inline_alloc_done = if !ordinary_call_mode && inline_alloc_mv_free.contains(&inst) {
+                inline_alloc::emit_framed_fast_path(&mut a, &d, &homes, &const_tagged, true)
+            } else { None };
             if let (Some(roots), Some(frame_base), Some(_)) =
                 (roots, frame_base_home, activation_slots)
             {
@@ -6717,7 +6753,9 @@ fn emit_framed_inner(
                     d.opcode == Opcode::FloatAdd && raw_add_needs_zero_fixup(f, &d.args));
             } else if ordinary_call_mode && d.opcode == Opcode::Call {
                 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-                { inst_calls = ordinary_call.unwrap().for_inst(inst).emit(&mut a, &d, &homes, &const_tagged,
+                { let inline_done = inline_alloc::emit_ordinary_fast_path(&mut a, &d, &homes,
+                    &const_tagged, inline_alloc_single.contains(&inst));
+                inst_calls = ordinary_call.unwrap().for_inst(inst).emit(&mut a, &d, &homes, &const_tagged,
                     ordinary_call::OrdinaryCallFrame { function: f, inference: &inference,
                         outgoing: outgoing_area,
                         control_home: native_control_home.unwrap(), self_entry: ordinary_self_entry,
@@ -6725,7 +6763,8 @@ fn emit_framed_inner(
                         self_specializations: &ordinary_self_specializations,
                         mv_known_empty: single_returns.contains(&inst),
                         self_stack_fixups: &mut ordinary_self_stack_fixups,
-                        emit_epilogue: &emit_epilogue })?; }
+                        emit_epilogue: &emit_epilogue })?;
+                if let Some(done) = inline_done { a.bind(done); } }
             } else if d.opcode == Opcode::ConstDouble {
                 let crate::t2::ir::AuxData::DoubleImm(bits) = d.aux else {
                     return Err(EmitError::UnsupportedOp(op_tag(d.opcode)));
@@ -7375,6 +7414,8 @@ fn emit_framed_inner(
                     .map_err(|_| EmitError::UnsupportedOp(0xFD))?,
                 });
             }
+            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+            if let Some(done) = inline_alloc_done { a.bind(done); }
         }
 
         if ordinary_returns_from_call { continue; }

@@ -88,6 +88,15 @@
 
 ### Performance
 
+- On x86-64 Linux, optimized code allocates conses and double-float boxes
+  itself, bumping the thread's allocation buffer, instead of calling the
+  runtime for each one. A warmed `(cons 1 2)` in a loop drops from about
+  0.26 µs to 0.013 µs, `(list a b c d)` from 0.52 µs to 0.044 µs and
+  `(list* a b c d)` from 6.2 µs to 0.063 µs; 50 `push`es take 2 µs instead of
+  13 µs and `(make-list 50)` about 9 µs instead of 20 µs, and consing a double
+  computed in the loop drops from 0.38 µs to 0.035 µs. Collections and
+  `EGCL_GC_STRESS` behave as before; `EGCL_INLINE_ALLOC=0` turns inline
+  allocation off ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
 - On x86-64 Linux, a function whose body loops (`dotimes`, `dolist`, `do`,
   `loop` or a `tagbody`) now calls other compiled functions with a direct
   machine call once it is optimized, instead of building a managed activation

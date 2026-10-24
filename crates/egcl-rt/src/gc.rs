@@ -4462,6 +4462,147 @@ fn acquire_gc_admission() -> std::sync::RwLockWriteGuard<'static, ()> {
     }
 }
 
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+mod native_tlab_tests {
+    use super::*;
+
+    /// What generated code does: bump the published window, or decline.
+    fn native_bump(bytes: usize) -> Option<usize> {
+        NATIVE_TLAB.with(|window| {
+            let cursor = window.cursor.get();
+            (window.epoch.get() == GC_MOVE_EPOCH.load(Ordering::Acquire)
+                && cursor + bytes <= window.limit.get())
+            .then(|| {
+                window.cursor.set(cursor + bytes);
+                cursor
+            })
+        })
+    }
+
+    fn native_cons(layout: NativeAllocLayout) -> Option<usize> {
+        let header = native_bump(layout.cons_footprint as usize)?;
+        // SAFETY: the window handed out these bytes of a zeroed TLAB.
+        unsafe {
+            *(header as *mut u64) = layout.cons_header;
+            *((header + 8) as *mut EgclVal) = EgclVal::from_fixnum(7);
+            *((header + 16) as *mut EgclVal) = crate::value::NIL;
+        }
+        Some(header)
+    }
+
+    /// Run `body` until no collection (here or on another test thread)
+    /// changes the epoch while it runs; the window is invalid across one.
+    fn without_collection<R>(mut body: impl FnMut() -> Option<R>) -> R {
+        for _ in 0..1000 {
+            let epoch = GC_MOVE_EPOCH.load(Ordering::Acquire);
+            if let Some(result) = body()
+                && epoch == GC_MOVE_EPOCH.load(Ordering::Acquire)
+            {
+                return result;
+            }
+        }
+        panic!("collections never paused long enough to observe the window");
+    }
+
+    #[test]
+    fn layout_describes_a_cons_and_a_double() {
+        let layout = native_alloc_layout().expect("x86-64 Linux supports inline allocation");
+        assert_eq!(layout.cons_footprint as usize, object_footprint(16).0);
+        assert_eq!(layout.double_footprint as usize, object_footprint(8).0);
+        let cons = ObjectHeader(layout.cons_header);
+        assert_eq!(cons.type_id(), crate::object::type_id::CONS);
+        let double = ObjectHeader(layout.double_header);
+        assert_eq!(double.type_id(), crate::object::type_id::DOUBLE_FLOAT);
+        assert_eq!(layout.epoch_address, GC_MOVE_EPOCH.as_ptr() as u64);
+    }
+
+    #[test]
+    fn every_thread_finds_its_window_at_the_same_offset() {
+        let expected = native_alloc_offset().map(i64::from);
+        assert!(expected.is_some());
+        let offsets: Vec<_> = (0..4)
+            .map(|_| std::thread::spawn(native_tlab_thread_offset))
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert!(offsets.iter().all(|offset| *offset == expected), "{offsets:?} vs {expected:?}");
+    }
+
+    #[test]
+    fn runtime_allocation_continues_past_inline_objects() {
+        let layout = native_alloc_layout().unwrap();
+        let (first, inline, next) = without_collection(|| {
+            let first = alloc_typed(16, crate::object::type_id::CONS)? as usize;
+            let inline = native_cons(layout)?;
+            let next = alloc_typed(16, crate::object::type_id::CONS)? as usize;
+            // A TLAB refill between the two runtime allocations proves
+            // nothing; try again.
+            let refilled = T0_ALLOCATOR.with(|cell| {
+                cell.borrow().as_ref().is_some_and(|(_, allocator)| {
+                    !(allocator.tlab.cursor as usize > first
+                        && (allocator.tlab.cursor as usize) - first < allocator.tlab_size)
+                })
+            });
+            (!refilled).then_some((first, inline, next))
+        });
+        // Bodies follow their one-word headers, each cons 32 bytes apart.
+        assert_eq!(inline, first - OBJECT_HEADER_SIZE + layout.cons_footprint as usize);
+        assert_eq!(next, inline + layout.cons_footprint as usize + OBJECT_HEADER_SIZE);
+        // SAFETY: the inline cons is still allocated and was not overwritten.
+        assert_eq!(unsafe { *(inline as *const u64) }, layout.cons_header);
+    }
+
+    #[test]
+    fn absorbing_the_window_counts_inline_bytes() {
+        let layout = native_alloc_layout().unwrap();
+        let counted = without_collection(|| {
+            alloc_typed(16, crate::object::type_id::CONS)?;
+            let before = T0_ALLOCATOR.with(|cell| cell.borrow().as_ref().map(|(_, a)| a.pending_bytes))?;
+            native_cons(layout)?;
+            native_cons(layout)?;
+            T0_ALLOCATOR.with(|cell| {
+                let mut guard = cell.borrow_mut();
+                let (epoch, allocator) = guard.as_mut()?;
+                absorb_native_tlab(allocator, *epoch);
+                Some(allocator.pending_bytes.checked_sub(before))
+            })?
+        });
+        // A flush in between (none expected) would only lower the count.
+        assert_eq!(counted, 2 * layout.cons_footprint as usize);
+    }
+
+    #[test]
+    fn safepoint_tail_filler_starts_after_inline_objects() {
+        let layout = native_alloc_layout().unwrap();
+        let (inline, cursor) = without_collection(|| {
+            alloc_typed(16, crate::object::type_id::CONS)?;
+            let inline = native_cons(layout)?;
+            publish_current_t0_tlab_for_safepoint();
+            let cursor = T0_ALLOCATOR.with(|cell| {
+                cell.borrow().as_ref().map(|(_, allocator)| allocator.tlab.cursor as usize)
+            })?;
+            Some((inline, cursor))
+        });
+        assert_eq!(cursor, inline + layout.cons_footprint as usize);
+        // SAFETY: both words lie in this thread's live TLAB.
+        unsafe {
+            assert_eq!(*(inline as *const u64), layout.cons_header);
+            assert_eq!(ObjectHeader(*(cursor as *const u64)).type_id(), 0, "tail filler");
+        }
+    }
+
+    #[test]
+    fn retiring_for_a_safepoint_disables_the_window() {
+        let layout = native_alloc_layout().unwrap();
+        without_collection(|| {
+            alloc_typed(16, crate::object::type_id::CONS)?;
+            native_cons(layout)?;
+            Some(())
+        });
+        retire_current_t0_tlab_for_safepoint();
+        assert!(native_bump(layout.cons_footprint as usize).is_none());
+    }
+}
+
 #[cfg(all(test, target_arch = "x86_64", any(unix, windows)))]
 mod allocator_admission_tests {
     use super::*;
@@ -6144,6 +6285,14 @@ pub fn alloc_typed(body_size: usize, type_id: u8) -> Option<*mut u8> {
         if guard.is_none() {
             ensure_heap_initialized();
         }
+        // Take back whatever generated code bumped from this TLAB first: its
+        // objects lie below the window's cursor, and the slow path below may
+        // retire the TLAB or collect (bliss-8yo5p).
+        if let Some((seen, allocator)) = guard.as_mut() {
+            absorb_native_tlab(allocator, *seen);
+        }
+        // Republished below on success; an early failure leaves it disabled.
+        disable_native_tlab();
         let epoch = GC_MOVE_EPOCH.load(Ordering::Acquire);
         if guard.as_ref().is_none_or(|(seen, _)| *seen != epoch) {
             if let Some((_, stale)) = guard.as_mut() {
@@ -6165,11 +6314,189 @@ pub fn alloc_typed(body_size: usize, type_id: u8) -> Option<*mut u8> {
         };
         // The slow path may have collected and then refilled this allocator.
         // Publish its new epoch so the next allocation reuses that fresh TLAB.
-        guard.as_mut()?.0 = GC_MOVE_EPOCH.load(Ordering::Acquire);
+        let epoch = GC_MOVE_EPOCH.load(Ordering::Acquire);
+        let (seen, allocator) = guard.as_mut()?;
+        *seen = epoch;
         // SAFETY: `body` is a freshly allocated object body of `body_size` bytes.
         unsafe { set_object_type_id(body, body_size, type_id) };
+        publish_native_tlab(allocator, epoch);
         Some(body)
     })
+}
+
+// ── Inline allocation from generated code (bliss-8yo5p) ────────────
+//
+// Generated code bump-allocates small objects from this thread's T0 TLAB
+// without calling the runtime. It reaches the TLAB through a per-thread
+// window at a fixed offset from the thread pointer (`%fs` on x86-64 Linux):
+// a carrier-local slot is exactly right here, because the TLAB itself is
+// per carrier and the fast path has no safepoint, so a fiber cannot migrate
+// in the middle of one.
+//
+// The window is a copy of the T0 allocator's cursor and limit plus the
+// GC_MOVE_EPOCH it was published under. While it is valid the window's cursor
+// is authoritative: every runtime site that reads or retires the T0 TLAB
+// first absorbs the window (advancing the allocator's cursor past the
+// objects generated code wrote and counting their bytes as pending), and
+// `alloc_typed` republishes it after allocating. Generated code checks
+// `cursor + size <= limit` and that the published epoch is still current; a
+// collection changes the epoch, so a window into a reset nursery is never
+// used. On failure generated code calls the ordinary runtime allocation,
+// which refills, collects or stress-collects as before.
+
+/// Byte offsets within [`NativeTlab`] that generated code uses.
+pub mod native_tlab_offsets {
+    /// Next free byte of the TLAB.
+    pub const CURSOR: i32 = 0;
+    /// End of the usable window; zero when generated code must not allocate.
+    pub const LIMIT: i32 = 8;
+    /// `GC_MOVE_EPOCH` under which the window was published.
+    pub const EPOCH: i32 = 16;
+}
+
+/// This thread's window onto its T0 TLAB for generated code.
+#[repr(C)]
+struct NativeTlab {
+    cursor: std::cell::Cell<usize>,
+    limit: std::cell::Cell<usize>,
+    epoch: std::cell::Cell<u64>,
+}
+
+thread_local! {
+    // Constant-initialized and without a destructor, so it lives in the
+    // executable's static TLS block at the same thread-pointer offset in
+    // every thread (checked when the window is published).
+    static NATIVE_TLAB: NativeTlab = const {
+        NativeTlab {
+            cursor: std::cell::Cell::new(0),
+            limit: std::cell::Cell::new(0),
+            epoch: std::cell::Cell::new(u64::MAX),
+        }
+    };
+}
+
+/// What generated code needs to bump-allocate a cons inline.
+#[derive(Clone, Copy, Debug)]
+pub struct NativeAllocLayout {
+    /// Offset of this thread's [`NativeTlab`] from the thread pointer.
+    pub tls_offset: i32,
+    /// Address of the `GC_MOVE_EPOCH` word.
+    pub epoch_address: u64,
+    /// Complete header word of a cons.
+    pub cons_header: u64,
+    /// Bytes one cons occupies, header included.
+    pub cons_footprint: u32,
+    /// Complete header word of a boxed DOUBLE-FLOAT.
+    pub double_header: u64,
+    /// Bytes one boxed DOUBLE-FLOAT occupies, header included.
+    pub double_footprint: u32,
+}
+
+/// The window budget while `EGCL_GC_STRESS` is active: a few objects, so
+/// generated code still allocates inline but reaches the stressing runtime
+/// allocation (and its forced collection) every few conses.
+const STRESS_WINDOW_BYTES: usize = 128;
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn native_tlab_thread_offset() -> Option<i64> {
+    let window = NATIVE_TLAB.try_with(|window| window as *const NativeTlab as usize).ok()?;
+    let thread_pointer: usize;
+    // SAFETY: on x86-64 Linux (glibc and musl) the word at %fs:0 is the
+    // thread pointer itself; reading it has no side effect.
+    unsafe {
+        std::arch::asm!("mov {}, qword ptr fs:[0]", out(reg) thread_pointer,
+            options(nostack, readonly, preserves_flags));
+    }
+    Some(window.wrapping_sub(thread_pointer) as i64)
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+fn native_tlab_thread_offset() -> Option<i64> {
+    None
+}
+
+fn native_alloc_offset() -> Option<i32> {
+    static OFFSET: OnceLock<Option<i32>> = OnceLock::new();
+    *OFFSET.get_or_init(|| {
+        if std::env::var("EGCL_INLINE_ALLOC").is_ok_and(|value| value == "0") {
+            return None;
+        }
+        native_tlab_thread_offset().and_then(|offset| i32::try_from(offset).ok())
+    })
+}
+
+/// The layout for inline cons allocation, or `None` when generated code must
+/// call the runtime for every allocation: off x86-64 Linux, with
+/// `EGCL_INLINE_ALLOC=0`, or when the window is not at a fixed thread-pointer
+/// offset.
+pub fn native_alloc_layout() -> Option<NativeAllocLayout> {
+    let tls_offset = native_alloc_offset()?;
+    let header = |type_id, body_size| {
+        let mut word = 0u64;
+        // SAFETY: a small object's header is one word, written into a local.
+        unsafe { write_object_header((&raw mut word).cast(), type_id, body_size) };
+        word
+    };
+    Some(NativeAllocLayout {
+        tls_offset,
+        epoch_address: GC_MOVE_EPOCH.as_ptr() as u64,
+        cons_header: header(crate::object::type_id::CONS, 16),
+        cons_footprint: object_footprint(16).0 as u32,
+        double_header: header(crate::object::type_id::DOUBLE_FLOAT, 8),
+        double_footprint: object_footprint(8).0 as u32,
+    })
+}
+
+/// Advance `allocator` past the objects generated code bump-allocated from its
+/// TLAB, counting their bytes. A window from another epoch, or one that does
+/// not lie within this TLAB, has nothing to give back.
+fn absorb_native_tlab(allocator: &mut HeapAllocator, epoch: u64) {
+    let _ = NATIVE_TLAB.try_with(|window| {
+        let cursor = window.cursor.get();
+        let start = allocator.tlab.cursor as usize;
+        if window.epoch.get() == epoch
+            && window.limit.get() != 0
+            && cursor > start
+            && cursor <= allocator.tlab.limit as usize
+        {
+            allocator.update_nursery_live_bytes(cursor - start);
+            allocator.tlab.cursor = cursor as *mut u8;
+        }
+    });
+}
+
+/// Hand this thread's TLAB to generated code. Disabled windows (limit zero)
+/// make every inline allocation take the runtime path.
+fn publish_native_tlab(allocator: &HeapAllocator, epoch: u64) {
+    let Some(expected) = native_alloc_offset() else { return };
+    let _ = NATIVE_TLAB.try_with(|window| {
+        let cursor = allocator.tlab.cursor as usize;
+        let mut limit = allocator.tlab.limit as usize;
+        if cursor == 0 || limit < cursor {
+            limit = 0;
+        } else if gc_stress_stride() != 0 || gc_stress_at() != 0 {
+            limit = limit.min(cursor + STRESS_WINDOW_BYTES);
+        }
+        // Checked at this thread's first publication (its epoch is still the
+        // initial sentinel); the offset is fixed for the thread's lifetime.
+        if window.epoch.get() == u64::MAX
+            && native_tlab_thread_offset() != Some(i64::from(expected))
+        {
+            // Generated code baked `expected`; a thread whose window lies
+            // elsewhere would bump through unrelated memory.
+            eprintln!("egcl: inline allocation window is not at a fixed thread offset");
+            std::process::abort();
+        }
+        window.cursor.set(cursor);
+        window.limit.set(limit);
+        window.epoch.set(epoch);
+    });
+}
+
+/// Stop generated code from allocating from this thread's TLAB until the
+/// runtime republishes it.
+fn disable_native_tlab() {
+    let _ = NATIVE_TLAB.try_with(|window| window.limit.set(0));
 }
 
 /// Allocate a heap DOUBLE-FLOAT boxing `value` and return it as a tagged
@@ -6420,6 +6747,8 @@ pub(crate) fn retire_current_t0_tlab_for_safepoint() {
             return;
         };
         if let Some((epoch, allocator)) = guard.as_mut() {
+            absorb_native_tlab(allocator, *epoch);
+            disable_native_tlab();
             if *epoch == GC_MOVE_EPOCH.load(Ordering::Acquire) {
                 allocator.retire_tlab();
             }
@@ -6435,6 +6764,10 @@ pub(crate) fn publish_current_t0_tlab_for_safepoint() {
     let _ = T0_ALLOCATOR.try_with(|cell| {
         if let Ok(mut guard) = cell.try_borrow_mut() {
             if let Some((epoch, allocator)) = guard.as_mut() {
+                // The filler must start past what generated code allocated.
+                // The window stays valid: like the next runtime allocation,
+                // the next inline one simply overwrites the filler.
+                absorb_native_tlab(allocator, *epoch);
                 // A previous blocked interval may have collected, with no
                 // intervening Lisp allocation to refresh this allocator yet.
                 if *epoch == GC_MOVE_EPOCH.load(Ordering::Acquire) {
@@ -7322,6 +7655,7 @@ pub fn heap_stats() -> GcStats {
             && let Some((epoch, allocator)) = guard.as_mut()
             && *epoch == GC_MOVE_EPOCH.load(Ordering::Acquire)
         {
+            absorb_native_tlab(allocator, *epoch);
             allocator.flush_pending();
         }
     });

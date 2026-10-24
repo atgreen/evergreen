@@ -255,6 +255,37 @@ pub fn calls_with_discarded_multiple_values(f: &Function) -> HashSet<Inst> {
     calls
 }
 
+/// Instructions after whose normal completion the MV state cannot reach a
+/// reader before a reset. For an `Invoke` only its normal continuation counts:
+/// this answers what a replacement for the call's successful return may leave
+/// behind, not what its exceptional edges observe.
+pub fn dead_after(f: &Function) -> HashSet<Inst> {
+    let live_in = live_at_block_entries(f);
+    let mut dead = HashSet::new();
+    for &block in f.block_order() {
+        let mut live = f.succs(block).iter().any(|successor| live_in[successor]);
+        if let Some(&last) = f.block(block).insts.last() {
+            let data = f.inst(last);
+            if data.opcode == Opcode::Invoke {
+                if let Some(normal) = data.targets.first() {
+                    if !live_in[&normal.block] {
+                        dead.insert(last);
+                    }
+                }
+            }
+        }
+        for &inst in f.block(block).insts.iter().rev() {
+            if !live && f.inst(inst).opcode != Opcode::Invoke { dead.insert(inst); }
+            if f.inst(inst).opcode == Opcode::ClearMv {
+                live = false;
+            } else if reads_mv(f, inst) {
+                live = true;
+            }
+        }
+    }
+    dead
+}
+
 /// Remove every dead `ClearMv`; returns how many were removed.
 pub fn eliminate(f: &mut Function) -> usize {
     let blocks: Vec<_> = f.block_order().to_vec();
@@ -605,4 +636,54 @@ mod tests {
         }
     }
 
+    #[test]
+    fn dead_after_stops_at_the_next_reader_or_reset() {
+        let mut f = Function::new("dead-after");
+        let entry = f.entry();
+        let (first, _) = f.push_inst(entry, call(), &[]);
+        let (second, _) = f.push_inst(entry, call(), &[]);
+        f.push_inst(entry, clear_mv(), &[]);
+        f.set_terminator(entry, base(Opcode::Return));
+        let dead = dead_after(&f);
+        // The second call reads what the first leaves; nothing reads what the
+        // second leaves before the reset.
+        assert!(!dead.contains(&first));
+        assert!(dead.contains(&second));
+    }
+
+    #[test]
+    fn dead_after_an_invoke_follows_only_its_normal_continuation() {
+        let mut f = Function::new("dead-after-invoke");
+        let entry = f.entry();
+        let normal = f.make_block();
+        let landing = f.make_block();
+        let invoke = f.set_terminator(entry, InstData {
+            flags: InstFlags { effectful: true, call: true, ..InstFlags::default() },
+            ..brif(normal, landing)
+        }.with_opcode(Opcode::Invoke));
+        f.push_inst(normal, clear_mv(), &[]);
+        f.set_terminator(normal, base(Opcode::Return));
+        f.set_terminator(landing, base(Opcode::Return));
+        assert!(dead_after(&f).contains(&invoke));
+        // A normal continuation that returns the state keeps it observable.
+        let mut g = Function::new("live-after-invoke");
+        let entry = g.entry();
+        let normal = g.make_block();
+        let landing = g.make_block();
+        let invoke = g.set_terminator(entry, brif(normal, landing).with_opcode(Opcode::Invoke));
+        g.set_terminator(normal, base(Opcode::Return));
+        g.push_inst(landing, clear_mv(), &[]);
+        g.set_terminator(landing, base(Opcode::Return));
+        assert!(!dead_after(&g).contains(&invoke));
+    }
+
+    trait WithOpcode {
+        fn with_opcode(self, opcode: Opcode) -> Self;
+    }
+
+    impl WithOpcode for InstData {
+        fn with_opcode(self, opcode: Opcode) -> Self {
+            InstData { opcode, ..self }
+        }
+    }
 }
