@@ -237,6 +237,14 @@ unsafe extern "C" fn ordinary_interpreted(
                             "ordinary callable has no environment".into(),
                         ));
                     }
+                    if let Some(result) = native_transfer_entry::funcall_fast::apply(
+                        (*request).closure,
+                        &args,
+                        &mut *env,
+                        native_transfer_entry::funcall_fast::Admit::Any,
+                    ) {
+                        return result;
+                    }
                     super::super::apply_function_impl((*request).closure, &args, &mut *env)
                 });
                 ordinary_calls::finish(result, out);
@@ -277,6 +285,14 @@ unsafe fn interpreted_published(target: u64, record: *mut MappedCallRecord) {
         }
         // Every native reentry reached through this Rust adapter creates its
         // own segment. It must never inherit the caller's capture context.
+        if let Some(result) = native_transfer_entry::funcall_fast::apply(
+            *function,
+            args,
+            unsafe { &mut *env },
+            native_transfer_entry::funcall_fast::Admit::Any,
+        ) {
+            return result;
+        }
         super::super::apply_function_impl(*function, args, unsafe { &mut *env })
     });
     let outcome = match result {

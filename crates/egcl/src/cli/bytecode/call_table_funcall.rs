@@ -211,9 +211,20 @@ pub(super) fn is_builtin(symbol: u32) -> bool {
     thread_local! {
         static FUNCALL: std::cell::RefCell<egcl_rt::symbols::ResolvedSymbolName> =
             std::cell::RefCell::new(egcl_rt::symbols::ResolvedSymbolName::new("FUNCALL"));
+        // (invalidation epoch, symbol, answer). Installing a function for a
+        // name invalidates it, so the answer holds until the epoch moves; this
+        // spares a symbol-registry read lock on every FUNCALL (bliss-vwgb0).
+        static ANSWER: Cell<(u64, u32, bool)> = const { Cell::new((u64::MAX, u32::MAX, false)) };
     }
-    FUNCALL.with(|name| name.borrow_mut().refreshed_index()) == Some(symbol)
-        && super::super::installed_function(symbol).is_none()
+    let epoch = egcl_rt::call_table::invalidation_epoch();
+    let (seen, seen_symbol, answer) = ANSWER.with(Cell::get);
+    if seen == epoch && seen_symbol == symbol {
+        return answer;
+    }
+    let answer = FUNCALL.with(|name| name.borrow_mut().refreshed_index()) == Some(symbol)
+        && super::super::installed_function(symbol).is_none();
+    ANSWER.with(|slot| slot.set((epoch, symbol, answer)));
+    answer
 }
 
 /// Whether `symbol` is named FUNCALL or APPLY, whatever it is bound to. A

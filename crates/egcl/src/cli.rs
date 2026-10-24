@@ -13139,6 +13139,20 @@ struct TreeClosureTier {
 static TREE_CLOSURE_TIERS: LazyLock<SharedCell<HashMap<u64, TreeClosureTier, egcl_rt::fxhash::FxBuildHasher>>> =
     LazyLock::new(|| SharedCell::new(HashMap::default()));
 
+/// The compiled object a tree-walker closure's calls already dispatch to, when
+/// `tree_closure_tier_up` would return it without counting or compiling.
+fn settled_tree_closure(id: u64) -> Option<EgclVal> {
+    if cfg!(egcl_no_tree_walker)
+        || bytecode::profiling_disabled()
+        || !bytecode::backend_is_bytecode()
+    {
+        return None;
+    }
+    let tiers = TREE_CLOSURE_TIERS.borrow();
+    let entry = tiers.get(&id)?;
+    (entry.settled && !entry.compiled.is_nil()).then_some(entry.compiled)
+}
+
 /// The compiled object behind a hot tree-walker closure, compiling it on the
 /// call that reaches the lazy-compile threshold.
 ///
@@ -19930,6 +19944,16 @@ fn tag_key(form: EgclVal) -> Option<String> {
         return Some(format!("#{}", format_val(form)));
     }
     None
+}
+
+/// The builtin a `#'name` wrapper closure dispatches to by name.
+fn builtin_wrapper_symbol(id: u64) -> Option<u32> {
+    builtin_wrapper_cache().borrow().symbols.get(&id).copied()
+}
+
+/// Whether a closure id is a generic function's wrapper.
+fn generic_wrapper_named(id: u64) -> bool {
+    generic_wrapper_cache().borrow().names.contains_key(&id)
 }
 
 #[derive(Default)]

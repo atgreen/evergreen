@@ -510,6 +510,8 @@ fn scan_bytecode_roots(visit: &mut dyn FnMut(*mut EgclVal)) {
         call_table::scan(visit);
         #[cfg(all(target_arch = "x86_64", unix))]
         call_table_funcall::scan_contexts(visit);
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        native_transfer_entry::funcall_fast::clear_for_collection();
         NATIVE_ERROR.scan(|error| {
             use egcl_rt::gc::TraceHostRoots;
             error.visit(|value| value.trace_host_roots(visit));
