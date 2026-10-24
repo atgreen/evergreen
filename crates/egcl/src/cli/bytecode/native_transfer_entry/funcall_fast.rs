@@ -118,6 +118,9 @@ pub(in crate::cli::bytecode) fn is_cached_for_test(function: EgclVal) -> bool {
 /// # Safety
 /// As for `ExecutionLocal::scan`: no execution may be using its table.
 pub(in crate::cli::bytecode) unsafe fn clear_for_collection() {
+    // Generated FUNCALL probes record this stamp with the raw object bits
+    // they compare; a collection retires every such entry at once.
+    COLLECTION_STAMP.fetch_add(1, std::sync::atomic::Ordering::Release);
     unsafe {
         TABLE.scan(|table| {
             table
@@ -130,6 +133,30 @@ pub(in crate::cli::bytecode) unsafe fn clear_for_collection() {
                 entry.revision.set(RETIRED);
             }
         });
+    }
+}
+
+/// Moved by every collection. See `collection_stamp_address`.
+static COLLECTION_STAMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The current collection stamp.
+pub(in crate::cli::bytecode) fn collection_stamp() -> u64 {
+    COLLECTION_STAMP.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// The collection stamp word, for the generated FUNCALL probe.
+pub(in crate::cli::bytecode) fn collection_stamp_address() -> usize {
+    COLLECTION_STAMP.as_ptr() as usize
+}
+
+/// The installed T2 code the general route runs for `function` with `nargs`
+/// actuals, when that is `function`'s own code (not a wrapper's or a
+/// tree-walker closure's compiled object), with the symbol owning it.
+/// Selection may fill the table; it does not collect.
+pub(in crate::cli::bytecode) fn native_target(function: EgclVal, nargs: usize) -> Option<(u32, Rc<TransferCode>)> {
+    match lookup_or_fill(function, nargs)? {
+        Target::Native { code, function: callable, symbol, .. } if callable == function => Some((symbol, code)),
+        _ => None,
     }
 }
 

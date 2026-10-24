@@ -105,13 +105,16 @@ fn native_raw_conditions_keep_their_type_and_signal_once() {
     }
 }
 
+/// Neither call is in tail position: a tail call replaces its caller's frame,
+/// and a compiled FUNCALL of a named function is now a direct transfer like a
+/// named call (bliss-6m6ca), so only non-tail calls keep the whole chain.
 fn check_native_direct_type_chain(tier: &str, installed: u8) {
     let program = format!(
         r#"
-      (defun native-type-leaf (value) (char-code value))
+      (defun native-type-leaf (value) (1+ (char-code value)))
       (defparameter *native-type-leaf* #'native-type-leaf)
-      (defun native-type-outer (value) (funcall *native-type-leaf* value))
-      (dotimes (i 100) (assert (= 65 (native-type-outer #\A))))
+      (defun native-type-outer (value) (1+ (funcall *native-type-leaf* value)))
+      (dotimes (i 100) (assert (= 67 (native-type-outer #\A))))
       (assert (= {installed} (egcl-ext:function-tier 'native-type-leaf)))
       (assert (= {installed} (egcl-ext:function-tier 'native-type-outer)))
       (format t "DIRECT-TIERS-CONFIRMED~%")

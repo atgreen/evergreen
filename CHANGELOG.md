@@ -109,6 +109,14 @@
     result.
 
   ([#623](https://github.com/atgreen/evergreen/pull/623))
+- On x86-64 Linux, optimized code also calls a function with declared
+  parameter types, such as `(declare (fixnum x))`, with a direct machine call;
+  the function's entry checks the declarations and signals the same
+  `type-error` as before. A warmed call from a loop drops from about 700 ns to
+  14 ns. `(funcall f ...)` from optimized code, where `f` is the current
+  definition of a named function, now enters that function directly too:
+  `(funcall #'f s 1)` in a loop drops from about 660 ns to 19 ns
+  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
 - More than 50 builtins called from compiled code no longer rebuild and
   re-evaluate their call form each time. They include `evenp`, `oddp`, `/`,
   `member` and `assoc` with `:test` or `:key`, `mapcar`, `map`, `format`,

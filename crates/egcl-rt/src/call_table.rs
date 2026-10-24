@@ -317,6 +317,12 @@ pub fn invalidation_epoch() -> u64 {
     INVALIDATION_EPOCH.load(Ordering::Acquire)
 }
 
+/// The address of the invalidation epoch word, for generated code that
+/// compares a recorded epoch with the current one.
+pub fn invalidation_epoch_address() -> usize {
+    INVALIDATION_EPOCH.as_ptr() as usize
+}
+
 /// The current ordinary publication epoch. Read it BEFORE inspecting the
 /// slots it summarizes: a change racing that inspection then shows up as a
 /// newer epoch on the next read.

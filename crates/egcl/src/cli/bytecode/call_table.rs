@@ -633,6 +633,9 @@ fn ordinary_funcall_fast(state: &State, args: &[EgclVal]) -> Option<Result<EgclV
         call[0].is_symbol().then(|| super::super::apply_function_impl(call[0], &call[1..], env))
     };
     if super::call_table_funcall::is_builtin(state.symbol) {
+        // Teach the cell's generated probe first: the call below may tier,
+        // collect or redefine, and the probe re-checks all of that.
+        adapter::record_funcall(state, args[0], args.len() - 1);
         return apply(args, env);
     }
     if args.len() < 2 || !unsafe { is_builtin_apply(Arc::as_ptr(&state.cell) as u64) } {

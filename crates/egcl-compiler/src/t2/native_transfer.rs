@@ -76,6 +76,7 @@ mod mapped_call;
 #[path = "native_transfer_ordinary.rs"]
 mod ordinary;
 pub use ordinary::{OrdinaryEntryRequest, emit_ordinary_entry_veneer, OrdinaryArityRequest, OrdinaryHelperOutcome, OrdinaryPublishedHelper, emit_ordinary_arity_veneer, emit_ordinary_published_veneer};
+pub use ordinary::{OrdinaryFuncallProbe, OrdinaryFuncallProbeEntry, ORDINARY_FUNCALL_PROBE_ENTRIES, emit_ordinary_funcall_probe};
 
 pub use mapped_call::{
     ADAPTER_FRAME_BYTES, MappedCallRecord, PublishedCallEntry, emit_published_call_entry,

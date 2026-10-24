@@ -789,6 +789,9 @@ pub struct FramedCode {
     /// with the bound parameter values as its fixed arguments. Only the
     /// managed activation, which has bound them itself, enters here.
     pub ordinary_bound_entry: Option<usize>,
+    /// The ordinary entry itself checks every declared parameter type, so
+    /// any caller may enter it (bliss-6m6ca).
+    pub ordinary_checks_params: bool,
     /// Maximum stack use below ordinary entry RSP, including phi snapshots.
     pub ordinary_stack_required: Option<usize>,
     /// Private same-owner native entry; requires the retained control pointer.
@@ -6325,6 +6328,10 @@ fn emit_framed_inner(
         |(options, calls)| ordinary_prefix::specialize(f, options.arity, &single_returns, calls.self_calls));
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     let mut ordinary_bound_entry = None;
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let mut ordinary_checks_params = false;
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+    let ordinary_checks_params = false;
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
     let ordinary_bound_entry = None;
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -6373,8 +6380,21 @@ fn emit_framed_inner(
             mov_imm64(&mut a, 11, keywords.decline as i64);
             a.extend_from_slice(&[0x41, 0xFF, 0xE3]); // jmp r11, all incoming values intact
         } else {
+        // Declared parameter types are checked here for every caller except
+        // proven self calls, which check at their call site and enter at
+        // `ordinary_self_entry`. A failed check reaches the same rooted
+        // veneer as a wrong count, with every incoming value intact; its
+        // runtime helper signals the declaration's TYPE-ERROR.
+        let checked: Vec<(usize, crate::t2::ir::IRType)> = f.block(entry).params.iter().enumerate()
+            .filter(|&(_, &param)| f.is_entry_param_checked(param))
+            .map(|(index, &param)| (index, f.value(param).ty))
+            .collect();
+        let checks = a.label();
         alu_r_imm(&mut a, 7, 1, options.arity as i32); // cmp rcx, supplied arity
-        a.jcc(Cc::E, accepted);
+        a.jcc(Cc::E, if checked.is_empty() { accepted } else { checks });
+        if !checked.is_empty() && options.binding.is_some() {
+            return Err(EmitError::UnsupportedOp(0xFA));
+        }
         if let Some(OrdinaryArgumentBinding::Optional(optional)) = options.binding {
             // A shorter supplied count binds each omitted trailing parameter
             // to the unsupplied marker, as the managed entry's bind_params
@@ -6402,8 +6422,43 @@ fn emit_framed_inner(
             a.jmp(accepted);
             a.bind(rejected);
         }
+        let rejected = a.label();
+        a.bind(rejected);
         mov_imm64(&mut a, 11, options.arity_error_veneer as i64);
         a.extend_from_slice(&[0x41, 0xFF, 0xE3]); // jmp r11, all incoming values intact
+        if !checked.is_empty() {
+            a.bind(checks);
+            for (index, ty) in checked {
+                // Only R10 and R11 change before the decision.
+                match index {
+                    0..=2 => mov_rr(&mut a, 10, [7u8, 6, 2][index]),
+                    _ => load_from_rsp(&mut a, 10, 8 + (index as i32 - 3) * 8),
+                }
+                if ty.bits == crate::t2::ir::TypeBits::FIXNUM {
+                    a.extend_from_slice(&[0x41, 0xf6, 0xc2, 0x07]); // test r10b,7
+                    a.jcc(Cc::Ne, rejected);
+                    if let Some(range) = ty.range {
+                        if range.lo < FIXNUM_MIN || range.hi > FIXNUM_MAX || range.lo > range.hi {
+                            return Err(EmitError::UnsupportedOp(0xFA));
+                        }
+                        mov_imm64(&mut a, 11, range.lo << 3);
+                        cmp_rr(&mut a, 10, 11);
+                        a.jcc(Cc::L, rejected);
+                        mov_imm64(&mut a, 11, range.hi << 3);
+                        cmp_rr(&mut a, 10, 11);
+                        a.jcc(Cc::G, rejected);
+                    }
+                } else if ty.bits == crate::t2::ir::TypeBits::SINGLE_FLOAT && ty.range.is_none() {
+                    mov_rr(&mut a, 11, 10);
+                    a.extend_from_slice(&[0x41, 0x80, 0xe3, 0x07]); // and r11b,7
+                    a.extend_from_slice(&[0x41, 0x80, 0xfb, 0x04]); // cmp r11b,4
+                    a.jcc(Cc::Ne, rejected);
+                } else {
+                    return Err(EmitError::UnsupportedOp(0xFA));
+                }
+            }
+            ordinary_checks_params = true;
+        }
         }
         a.bind(accepted);
         ordinary_bound_entry = matches!(options.binding, Some(OrdinaryArgumentBinding::Keywords(_)))
@@ -8134,6 +8189,7 @@ fn emit_framed_inner(
         frame_entry: (!ordinary_call_mode).then_some(0),
         ordinary_entry,
         ordinary_bound_entry,
+        ordinary_checks_params,
         ordinary_stack_required,
         native_recursive_entry,
         native_entry_kind_slot: if native_frame_mode { entry_kind_home.and_then(|home| match home { FramedHome::Stack(slot) => Some(slot), _ => None }) } else { None },
