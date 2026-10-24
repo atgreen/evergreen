@@ -20620,6 +20620,148 @@ fn check_env_var_name(operator: &str, name: &str) -> Result<(), EgclError> {
 
 /// Source calls evaluate their arguments once before entering the same library
 /// dispatcher used by compiled calls. Keep form evaluation outside that module.
+/// `EGCL::SET-AREF` / `EGCL::SET-ELT` on evaluated arguments (seq, index,
+/// value): the store primitives compiled `(setf (aref|elt ...))` lowers to.
+/// Shared by operator position and compiled calls, which used to reach it only
+/// by synthesizing and re-evaluating a form (bliss-qoy0k).
+fn set_aref_values(name: &str, args: &[EgclVal]) -> Result<EgclVal, EgclError> {
+    let args = RootedVals::new(args.to_vec());
+    let is_elt = name == "EGCL::SET-ELT";
+    let seq = args.first().copied().unwrap_or(NIL);
+    let idx = args.get(1).copied().unwrap_or(NIL);
+    let val = args.get(2).copied().unwrap_or(NIL);
+    if !idx.is_fixnum() || idx.as_fixnum() < 0 {
+        return Err(EgclError::TypeError {
+            datum: idx,
+            expected: "non-negative sequence index".into(),
+        });
+    }
+    let i = idx.as_fixnum() as usize;
+    if let Some(storage) = egcl_rt::types::md_array_storage(seq) {
+        // A multidimensional place lowered by aref_setf_place carries a
+        // single (row-major) index — store straight into the backing
+        // storage (bliss-rh0t).
+        egcl_stdlib::set_elt(storage, i, val)?;
+    } else if !egcl_stdlib::is_complex_vector(seq) && is_string_value(seq) {
+        // Char-typed complex vectors are STRINGP but store elements in
+        // the backing vector; only simple strings use string_set_char
+        // (bliss-9q4).
+        egcl_stdlib::string_set_char(seq, i, val)?;
+    } else if seq.is_cons() {
+        let mut cursor = seq;
+        for _ in 0..i {
+            cursor = cp(cursor).1;
+        }
+        if cursor.is_cons() && !is_closure_cons(cursor) {
+            unsafe {
+                let cell = cursor.as_ptr() as *mut ConsCell;
+                egcl_rt::gc::store_ref(std::ptr::addr_of_mut!((*cell).car), val);
+            }
+        } else {
+            // Past the end. This had NO else at all, so the store
+            // silently did nothing and the value was returned as if
+            // it had worked — the worst shape for a bug (ansi
+            // ELT.10). The datum is the INDEX against the valid
+            // range, so the error is checkable: ansi asserts a type
+            // error's datum does not satisfy its own expected-type.
+            let len = list_to_vec(seq).len();
+            return Err(EgclError::TypeError {
+                datum: EgclVal::from_fixnum(i as i64),
+                expected: format!("(integer 0 {})", len.saturating_sub(1)),
+            });
+        }
+    } else if is_elt {
+        egcl_stdlib::set_elt(seq, i, val)?;
+    } else {
+        egcl_stdlib::set_aref(seq, i, val)?;
+    }
+    // Re-read from the rooted args: the store may have allocated.
+    Ok(args.get(2).copied().unwrap_or(NIL))
+}
+
+/// `EGCL::SET-CAR` / `EGCL::SET-CDR` on evaluated arguments (cons, value),
+/// shared by operator position and compiled calls (bliss-qoy0k).
+fn set_cons_values(name: &str, args: &[EgclVal]) -> Result<EgclVal, EgclError> {
+    if args.len() < 2 {
+        return Err(EgclError::Internal(
+            "SET-CAR/SET-CDR needs cons and value".into(),
+        ));
+    }
+    store_cons_field(args[0], args[1], name == "EGCL::SET-CAR")?;
+    Ok(args[1])
+}
+
+/// `STRING` of an evaluated designator: a string as-is (EQ), a symbol's bare
+/// name, a character as a one-character string. Shared by operator position
+/// and compiled calls (bliss-qoy0k).
+fn string_value(v: EgclVal) -> Result<EgclVal, EgclError> {
+    if is_string_value(v) {
+        return Ok(v);
+    }
+    let s = if v.is_character() {
+        v.as_char().to_string()
+    } else if v.is_symbol() || v.is_nil() || v == T {
+        symbol_name_of(v)
+    } else {
+        val_as_str(v)
+    };
+    Ok(arena_str(&s))
+}
+
+/// `FIND-PACKAGE` of an evaluated designator, shared by operator position and
+/// compiled calls (bliss-qoy0k).
+fn find_package_value(env: &Env, designator: EgclVal) -> EgclVal {
+    let raw = string_designator_name(designator);
+    let pkg_name = resolve_package_name(env, &raw);
+    if egcl_stdlib::find_package(&pkg_name).is_some()
+        || matches!(
+            pkg_name.as_str(),
+            "COMMON-LISP" | "COMMON-LISP-USER" | "KEYWORD"
+        )
+    {
+        package_object(&pkg_name)
+    } else {
+        NIL
+    }
+}
+
+/// `GENSYM` of an optional evaluated argument, shared by operator position and
+/// compiled calls (bliss-qoy0k).
+fn gensym_value(env: &mut Env, arg: Option<EgclVal>) -> Result<EgclVal, EgclError> {
+    let (name, bump) = match arg {
+        None => {
+            let counter = read_gensym_counter(env)?;
+            (format!("G{}", format_val(counter)), Some(counter))
+        }
+        Some(a) if a.is_fixnum() && a.as_fixnum() >= 0 => (format!("G{}", a.as_fixnum()), None),
+        Some(a) if !a.is_fixnum() && bigint_from_val(a).is_some_and(|b| b.sign >= 0) => {
+            (format!("G{}", format_val(a)), None)
+        }
+        Some(a) if is_string_value(a) => {
+            let counter = read_gensym_counter(env)?;
+            (
+                format!("{}{}", val_as_str(a), format_val(counter)),
+                Some(counter),
+            )
+        }
+        Some(a) => {
+            return Err(EgclError::TypeError {
+                datum: a,
+                expected: "(OR STRING (INTEGER 0 *))".to_string(),
+            });
+        }
+    };
+    // The suffix (NAME) already captured the pre-increment counter, so
+    // the observable "increment after creating the symbol" ordering is
+    // preserved by NAME. Bump the counter FIRST — before the allocating
+    // make_uninterned_symbol — so no heap counter value (a bignum) is
+    // held live across that allocation (GC safety; gensym.3/9/10/11).
+    if let Some(counter) = bump {
+        bump_gensym_counter(env, counter)?;
+    }
+    Ok(reader::make_uninterned_symbol(&name))
+}
+
 fn eval_builtin_arguments(
     name: &str,
     forms: EgclVal,
@@ -25247,65 +25389,8 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             "GETHASH" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::PUT-GETHASH" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::SET-AREF" | "EGCL::SET-ELT" => {
-                // Store primitive for bytecode-lowered `(setf (aref|svref|char|
-                // schar|row-major-aref|elt seq index) value)`. Arguments arrive
-                // already evaluated (seq, index, value); the element is mutated in
-                // place and the value returned (SETF semantics). SET-AREF ignores
-                // the fill pointer on a complex vector (bounds against total size);
-                // SET-ELT respects it. They differ only at the vector store below
-                // (bliss-30be).
-                let is_elt = name == "EGCL::SET-ELT";
                 let args = eval_args(cdr, env)?;
-                let seq = args.first().copied().unwrap_or(NIL);
-                let idx = args.get(1).copied().unwrap_or(NIL);
-                let val = args.get(2).copied().unwrap_or(NIL);
-                if !idx.is_fixnum() || idx.as_fixnum() < 0 {
-                    return Err(EgclError::TypeError {
-                        datum: idx,
-                        expected: "non-negative sequence index".into(),
-                    });
-                }
-                let i = idx.as_fixnum() as usize;
-                if let Some(storage) = egcl_rt::types::md_array_storage(seq) {
-                    // A multidimensional place lowered by aref_setf_place carries a
-                    // single (row-major) index — store straight into the backing
-                    // storage (bliss-rh0t).
-                    egcl_stdlib::set_elt(storage, i, val)?;
-                } else if !egcl_stdlib::is_complex_vector(seq) && is_string_value(seq) {
-                    // Char-typed complex vectors are STRINGP but store elements in
-                    // the backing vector; only simple strings use string_set_char
-                    // (bliss-9q4).
-                    egcl_stdlib::string_set_char(seq, i, val)?;
-                } else if seq.is_cons() {
-                    let mut cursor = seq;
-                    for _ in 0..i {
-                        cursor = cp(cursor).1;
-                    }
-                    if cursor.is_cons() && !is_closure_cons(cursor) {
-                        unsafe {
-                            let cell = cursor.as_ptr() as *mut ConsCell;
-                            egcl_rt::gc::store_ref(std::ptr::addr_of_mut!((*cell).car), val);
-                        }
-                    } else {
-                        // Past the end. This had NO else at all, so the store
-                        // silently did nothing and the value was returned as if
-                        // it had worked — the worst shape for a bug (ansi
-                        // ELT.10). The datum is the INDEX against the valid
-                        // range, so the error is checkable: ansi asserts a type
-                        // error's datum does not satisfy its own expected-type.
-                        let len = list_to_vec(seq).len();
-                        return Err(EgclError::TypeError {
-                            datum: EgclVal::from_fixnum(i as i64),
-                            expected: format!("(integer 0 {})", len.saturating_sub(1)),
-                        });
-                    }
-                } else if is_elt {
-                    egcl_stdlib::set_elt(seq, i, val)?;
-                } else {
-                    egcl_stdlib::set_aref(seq, i, val)?;
-                }
-                // Re-read from the rooted args: the store may have allocated.
-                return Ok(args.get(2).copied().unwrap_or(NIL));
+                return set_aref_values(&name, &args);
             }
             "EGCL::SET-FDEFINITION" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::SET-SYMBOL-FUNCTION" => return eval_builtin_arguments(&name, cdr, env),
@@ -25318,17 +25403,8 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 // value)`. Arguments arrive already evaluated (cons, value)
                 // through apply_function's synthesize path; the target's car/cdr
                 // is written in place and the value is returned (SETF semantics).
-                let set_car = name == "EGCL::SET-CAR";
                 let args = eval_args(cdr, env)?;
-                if args.len() < 2 {
-                    return Err(EgclError::Internal(
-                        "SET-CAR/SET-CDR needs cons and value".into(),
-                    ));
-                }
-                let target = args[0];
-                let val = args[1];
-                store_cons_field(target, val, set_car)?;
-                return Ok(val);
+                return set_cons_values(&name, &args);
             }
             "REMHASH" => return eval_builtin_arguments(&name, cdr, env),
             "CLRHASH" => {
@@ -26228,17 +26304,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 }
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
-                if is_string_value(v) {
-                    return Ok(v);
-                }
-                let s = if v.is_character() {
-                    v.as_char().to_string()
-                } else if v.is_symbol() || v.is_nil() || v == T {
-                    symbol_name_of(v)
-                } else {
-                    val_as_str(v)
-                };
-                return Ok(arena_str(&s));
+                return string_value(v);
             }
             "WRITE-TO-STRING" => {
                 // The boot.lisp WRITE-TO-STRING defun honors the print-control
@@ -28411,20 +28477,8 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 if args.is_empty() {
                     return Ok(NIL);
                 }
-                let raw = string_designator_name(eval_form(args[0], env)?);
-                let pkg_name = resolve_package_name(env, &raw);
-                return Ok(
-                    if egcl_stdlib::find_package(&pkg_name).is_some()
-                        || matches!(
-                            pkg_name.as_str(),
-                            "COMMON-LISP" | "COMMON-LISP-USER" | "KEYWORD"
-                        )
-                    {
-                        package_object(&pkg_name)
-                    } else {
-                        NIL
-                    },
-                );
+                let designator = eval_form(args[0], env)?;
+                return Ok(find_package_value(env, designator));
             }
             "PACKAGEP" => {
                 let args = list_to_vec(cdr);
@@ -28848,42 +28902,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     let (arg_form, _) = cp(cdr);
                     Some(eval_form(arg_form, env)?)
                 };
-                let (name, bump) = match arg {
-                    None => {
-                        let counter = read_gensym_counter(env)?;
-                        (format!("G{}", format_val(counter)), Some(counter))
-                    }
-                    Some(a) if a.is_fixnum() && a.as_fixnum() >= 0 => {
-                        (format!("G{}", a.as_fixnum()), None)
-                    }
-                    Some(a)
-                        if !a.is_fixnum() && bigint_from_val(a).is_some_and(|b| b.sign >= 0) =>
-                    {
-                        (format!("G{}", format_val(a)), None)
-                    }
-                    Some(a) if is_string_value(a) => {
-                        let counter = read_gensym_counter(env)?;
-                        (
-                            format!("{}{}", val_as_str(a), format_val(counter)),
-                            Some(counter),
-                        )
-                    }
-                    Some(a) => {
-                        return Err(EgclError::TypeError {
-                            datum: a,
-                            expected: "(OR STRING (INTEGER 0 *))".to_string(),
-                        });
-                    }
-                };
-                // The suffix (NAME) already captured the pre-increment counter, so
-                // the observable "increment after creating the symbol" ordering is
-                // preserved by NAME. Bump the counter FIRST — before the allocating
-                // make_uninterned_symbol — so no heap counter value (a bignum) is
-                // held live across that allocation (GC safety; gensym.3/9/10/11).
-                if let Some(counter) = bump {
-                    bump_gensym_counter(env, counter)?;
-                }
-                return Ok(reader::make_uninterned_symbol(&name));
+                return gensym_value(env, arg);
             }
             "MAKE-SYMBOL" => {
                 // (make-symbol name) — a fresh uninterned symbol with that name.
