@@ -311,9 +311,14 @@ fn a_method_not_compiled_to_bytecode_explains_itself_in_the_t2_log() {
         program,
         &[("EGCL_T2_LOG", "stderr"), ("EGCL_T0_T1_THRESHOLD", "5")],
     );
+    // GM2's LOAD-TIME-VALUE method compiles since bliss-jz86 (#566), so it
+    // has nothing to explain.
+    assert!(
+        !log.contains("[T2] (METHOD COMMON-LISP-USER::GM2): not compiled to bytecode"),
+        "GM2 compiles now:\n{log}"
+    );
     for (name, reason) in [
         ("GM", "destructuring-bind:&KEY"),
-        ("GM2", "LOAD-TIME-VALUE needs eager evaluation"),
         ("GM3", "method defined inside a lexical binding"),
     ] {
         let line = format!(
