@@ -998,6 +998,22 @@ fn scan_execution_roots(visit: &mut dyn FnMut(*mut EgclVal)) {
     for thread in threads {
         thread.trace_execution_roots(visit);
     }
+    // A reclaimed, unjoined thread's result stays rooted until JOIN takes it.
+    let finished: Vec<Arc<ThreadResult>> = native_thread_registry()
+        .lock()
+        .unwrap()
+        .finished
+        .values()
+        .map(|thread| Arc::clone(&thread.result))
+        .collect();
+    for result in finished {
+        result
+            .completion
+            .lock()
+            .unwrap()
+            .value
+            .trace_host_roots(visit);
+    }
 
     let fibers: Vec<Arc<Fiber>> = fiber_registry().lock().unwrap().values().cloned().collect();
     for fiber in fibers {
@@ -1005,17 +1021,126 @@ fn scan_execution_roots(visit: &mut dyn FnMut(*mut EgclVal)) {
     }
 }
 
-fn native_thread_registry() -> &'static OrderedMutex<HashMap<NativeThreadId, Arc<NativeThread>>> {
-    static REGISTRY: OnceLock<OrderedMutex<HashMap<NativeThreadId, Arc<NativeThread>>>> =
-        OnceLock::new();
+/// What survives of a dedicated thread that finished and was reclaimed before
+/// anyone joined it (#591): enough for JOIN-THREAD, THREAD-NAME and
+/// THREAD-ALIVE-P. Its OS thread, Lisp stack, TLS vector and condition state
+/// are gone; the result cell stays, and stays a GC root until it is joined.
+struct FinishedNativeThread {
+    name: Option<String>,
+    result: Arc<ThreadResult>,
+}
+
+/// The native-thread registry. It dereferences to the map of registered
+/// threads; `finished` holds the reclaimed, not-yet-joined ones under the same
+/// lock, so a lookup never finds a thread in neither map while it moves.
+struct NativeThreadRegistry {
+    live: HashMap<NativeThreadId, Arc<NativeThread>>,
+    finished: HashMap<NativeThreadId, FinishedNativeThread>,
+}
+
+impl std::ops::Deref for NativeThreadRegistry {
+    type Target = HashMap<NativeThreadId, Arc<NativeThread>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.live
+    }
+}
+
+impl std::ops::DerefMut for NativeThreadRegistry {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.live
+    }
+}
+
+fn native_thread_registry() -> &'static OrderedMutex<NativeThreadRegistry> {
+    static REGISTRY: OnceLock<OrderedMutex<NativeThreadRegistry>> = OnceLock::new();
     REGISTRY.get_or_init(|| {
         OrderedMutex::new(
             LockLevel::ExecutionRegistry,
             1,
             "native thread registry",
-            HashMap::new(),
+            NativeThreadRegistry {
+                live: HashMap::new(),
+                finished: HashMap::new(),
+            },
         )
     })
+}
+
+/// Reclaim every dedicated thread that has finished but not been joined
+/// (#591). Each one's `JoinHandle` reports `is_finished`, so dropping it only
+/// detaches an OS thread whose entry closure has already returned: the C
+/// library frees its stack as it exits, and the last `Arc<NativeThread>` (its
+/// TLS registration) frees the Lisp stack and TLS vector with it. Nothing here
+/// blocks. Its name and result cell move to `finished` for a later join.
+///
+/// Only a Running GC participant may do this. A collection walks each
+/// registered thread's published stack outside the registry lock, and it does
+/// so only while every participant is stopped; JOIN-THREAD removes its entry
+/// under the same rule.
+fn reap_finished_native_threads() {
+    let Some(current) = current_native_thread_if_registered() else {
+        return;
+    };
+    if current.state() != NativeThreadState::Running || !current.gc_participates() {
+        return;
+    }
+    drop(current);
+    let reaped: Vec<(Arc<NativeThread>, std::thread::JoinHandle<()>)> = {
+        let mut registry = native_thread_registry().lock().unwrap();
+        let candidates: Vec<NativeThreadId> = registry
+            .live
+            .iter()
+            .filter(|(_, thread)| {
+                !thread.carrier
+                    && !thread.auto_registered
+                    && !thread.gc_participates()
+                    && thread.result.is_done()
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        let mut reaped = Vec::with_capacity(candidates.len());
+        for id in candidates {
+            let handle = {
+                let mut slot = registry.live[&id].join_handle.lock().unwrap();
+                if slot.as_ref().is_some_and(|handle| handle.is_finished()) {
+                    slot.take()
+                } else {
+                    None
+                }
+            };
+            let Some(handle) = handle else { continue };
+            let thread = registry
+                .live
+                .remove(&id)
+                .expect("reap candidate is registered");
+            registry.finished.insert(
+                id,
+                FinishedNativeThread {
+                    name: thread.name.clone(),
+                    result: Arc::clone(&thread.result),
+                },
+            );
+            reaped.push((thread, handle));
+        }
+        reaped
+    };
+    // Detach and release outside the registry lock.
+    drop(reaped);
+}
+
+/// Number of dedicated threads whose full per-thread state is still held:
+/// registered ones that are neither carriers nor auto-registered host threads.
+/// A diagnostic for reclamation tests (#591).
+#[doc(hidden)]
+pub fn dedicated_native_thread_record_count() -> usize {
+    native_thread_registry()
+        .lock()
+        .unwrap()
+        .live
+        .values()
+        .filter(|thread| !thread.carrier && !thread.auto_registered)
+        .count()
 }
 
 fn prune_inactive_auto_registered_threads(
@@ -2469,6 +2594,9 @@ pub fn make_thread_named_with_setup<F, G>(
 where
     F: FnOnce() -> G + Send + 'static,
 {
+    // Creating a thread is the natural point to reclaim those that finished
+    // unjoined: a thread-per-connection server never joins its workers.
+    reap_finished_native_threads();
     let id = NativeThreadId(NEXT_NATIVE_THREAD_ID.fetch_add(1, Ordering::Relaxed));
     let name = name.unwrap_or_else(|| format!("egcl-thread-{}", id.0));
     let result = Arc::new(ThreadResult::new());
@@ -2514,6 +2642,9 @@ where
                 id.0
             )))
         });
+        // While still a Running participant, reclaim siblings that finished
+        // before us, so a burst of workers need not wait for the next creation.
+        reap_finished_native_threads();
         running.stack.publish_top();
         // A finished thread reaches no further safepoint, so a signal still
         // posted to it can never be delivered. Drain it: each posted signal
@@ -2559,13 +2690,21 @@ pub fn join_thread_timeout(
             "a thread cannot join itself".into(),
         ));
     }
-    let thread = {
+    // A finished thread may already have been reclaimed (#591): then only its
+    // result cell remains, and there is no OS thread left to join.
+    let (thread, result) = {
         let mut registry = native_thread_registry().lock().unwrap();
         prune_inactive_auto_registered_threads(&mut registry);
-        registry
-            .get(&id)
-            .cloned()
-            .ok_or_else(|| EgclError::Internal(format!("no native thread with id {}", id.0)))?
+        if let Some(thread) = registry.live.get(&id) {
+            (Some(Arc::clone(thread)), Arc::clone(&thread.result))
+        } else if let Some(finished) = registry.finished.get(&id) {
+            (None, Arc::clone(&finished.result))
+        } else {
+            return Err(EgclError::Internal(format!(
+                "no native thread with id {}",
+                id.0
+            )));
+        }
     };
     #[cfg(test)]
     join_completion_tests::retained_result();
@@ -2574,9 +2713,9 @@ pub fn join_thread_timeout(
     let ready = {
         let _blocked = unsafe { crate::safepoint::NativeBlockingScope::enter() };
         match timeout {
-            Some(timeout) => thread.result.wait_until_ready_for(timeout),
+            Some(timeout) => result.wait_until_ready_for(timeout),
             None => {
-                thread.result.wait_until_ready();
+                result.wait_until_ready();
                 true
             }
         }
@@ -2584,8 +2723,7 @@ pub fn join_thread_timeout(
     if !ready {
         return Ok(None);
     }
-    let mut value = thread
-        .result
+    let mut value = result
         .completion
         .lock()
         .unwrap()
@@ -2597,14 +2735,22 @@ pub fn join_thread_timeout(
     crate::rooted_ref!(_value_root = &mut value);
     // OS teardown can outlast result publication. Keep the result rooted and
     // participate in GC while waiting, with no join-handle lock held.
-    let handle = thread.join_handle.lock().unwrap().take();
+    // A reaper may have detached it since the lookup; then the handle is gone.
+    let handle = thread
+        .as_ref()
+        .and_then(|thread| thread.join_handle.lock().unwrap().take());
     if let Some(handle) = handle {
         let _blocked = unsafe { crate::safepoint::NativeBlockingScope::enter() };
         handle
             .join()
             .map_err(|_| EgclError::Internal(format!("native thread {} panicked", id.0)))?;
     }
-    native_thread_registry().lock().unwrap().remove(&id);
+    {
+        let mut registry = native_thread_registry().lock().unwrap();
+        registry.live.remove(&id);
+        registry.finished.remove(&id);
+    }
+    drop(thread);
     drop(_value_root);
     value.map(Some)
 }
@@ -2657,7 +2803,13 @@ pub fn all_thread_ids() -> Vec<NativeThreadId> {
 pub fn thread_name(id: NativeThreadId) -> Option<String> {
     let mut registry = native_thread_registry().lock().unwrap();
     prune_inactive_auto_registered_threads(&mut registry);
-    registry.get(&id).and_then(|thread| thread.name.clone())
+    match registry.live.get(&id) {
+        Some(thread) => thread.name.clone(),
+        None => registry
+            .finished
+            .get(&id)
+            .and_then(|thread| thread.name.clone()),
+    }
 }
 
 /// Whether a registered native thread has not reached its terminal state.
@@ -2665,7 +2817,10 @@ pub fn thread_name(id: NativeThreadId) -> Option<String> {
 pub fn thread_alive(id: NativeThreadId) -> Option<bool> {
     let mut registry = native_thread_registry().lock().unwrap();
     prune_inactive_auto_registered_threads(&mut registry);
-    registry.get(&id).map(|thread| thread.is_alive())
+    match registry.live.get(&id) {
+        Some(thread) => Some(thread.is_alive()),
+        None => registry.finished.contains_key(&id).then_some(false),
+    }
 }
 
 /// Snapshot the registered threads that have not reached a terminal state.
@@ -2682,7 +2837,10 @@ pub fn live_thread_ids() -> Vec<NativeThreadId> {
 pub fn thread_is_carrier(id: NativeThreadId) -> Option<bool> {
     let mut registry = native_thread_registry().lock().unwrap();
     prune_inactive_auto_registered_threads(&mut registry);
-    registry.get(&id).map(|thread| thread.is_carrier())
+    match registry.live.get(&id) {
+        Some(thread) => Some(thread.is_carrier()),
+        None => registry.finished.contains_key(&id).then_some(false),
+    }
 }
 
 pub fn carrier_thread_ids() -> Vec<NativeThreadId> {
@@ -2692,9 +2850,17 @@ pub fn carrier_thread_ids() -> Vec<NativeThreadId> {
 pub fn interrupt_thread(id: NativeThreadId, condition: EgclVal) -> Result<(), EgclError> {
     let mut registry = native_thread_registry().lock().unwrap();
     prune_inactive_auto_registered_threads(&mut registry);
-    let thread = registry
-        .get(&id)
-        .ok_or_else(|| EgclError::Internal(format!("no native thread with id {}", id.0)))?;
+    let Some(thread) = registry.live.get(&id) else {
+        // A reclaimed thread has finished: as for a Dead one, nothing to post.
+        return if registry.finished.contains_key(&id) {
+            Ok(())
+        } else {
+            Err(EgclError::Internal(format!(
+                "no native thread with id {}",
+                id.0
+            )))
+        };
+    };
     if thread.state() != NativeThreadState::Dead {
         thread.post_interrupt(condition);
         // Posting reaches a thread that is RUNNING Lisp, because it polls. A
@@ -2764,9 +2930,16 @@ pub fn post_foreground_pending_signal(signal: PendingSignal) -> Result<(), EgclE
         FOREGROUND_NATIVE_THREAD => {
             let mut registry = native_thread_registry().lock().unwrap();
             prune_inactive_auto_registered_threads(&mut registry);
-            let thread = registry.get(&NativeThreadId(id)).ok_or_else(|| {
-                EgclError::Internal(format!("no foreground native thread with id {id}"))
-            })?;
+            let Some(thread) = registry.live.get(&NativeThreadId(id)) else {
+                // A reclaimed foreground thread can take no further signal.
+                return if registry.finished.contains_key(&NativeThreadId(id)) {
+                    Ok(())
+                } else {
+                    Err(EgclError::Internal(format!(
+                        "no foreground native thread with id {id}"
+                    )))
+                };
+            };
             thread.post_pending_signal(signal);
             Ok(())
         }
