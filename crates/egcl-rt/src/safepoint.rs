@@ -673,6 +673,9 @@ pub fn wait_for_all_threads() -> Result<(), EgclError> {
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(100);
+    let budget = std::time::Duration::from_millis(handshake_budget_ms());
+    let started = std::time::Instant::now();
+    let mut reported = false;
     let mut guard = coord.arrival_mutex.lock().unwrap();
     let mut timeouts = 0u32;
     while coord.arrived.load(Ordering::SeqCst) < other_count {
@@ -699,11 +702,30 @@ pub fn wait_for_all_threads() -> Result<(), EgclError> {
                     let _ = resume_all_threads();
                     return Err(error);
                 }
+            }
+            // Nudge again about once a second: a mutator that entered a
+            // syscall after the previous signal needs its own EINTR.
+            if timeouts % 10 == 1 {
                 let _ = crate::thread::signal_safepoint_participants(current);
+            }
+            let waited = started.elapsed();
+            // A late mutator is not a dead one. A thread compiling a large
+            // function to native code polls only when the compile finishes,
+            // which on a loaded machine took over a second and failed every
+            // collection requested meanwhile (#609). Wait, as HotSpot does
+            // for a slow safepoint, and say so once if it is unusually long.
+            if !reported && waited >= std::time::Duration::from_secs(5) && waited < budget {
+                reported = true;
+                eprintln!(
+                    "egcl: safepoint handshake waiting {:.1} s for {}/{} mutator threads",
+                    waited.as_secs_f64(),
+                    other_count - coord.arrived.load(Ordering::SeqCst).min(other_count),
+                    other_count
+                );
             }
             // In the bootstrap runtime the thread registry can contain
             // worker threads that never participate in safepoint polling.
-            if timeouts >= 10 {
+            if waited >= budget {
                 let arrived = coord.arrived.load(Ordering::SeqCst);
                 let _ = resume_all_threads();
                 return Err(EgclError::Internal(format!(
@@ -714,6 +736,17 @@ pub fn wait_for_all_threads() -> Result<(), EgclError> {
     }
 
     Ok(())
+}
+
+/// How long a collector waits for every mutator to reach a safepoint before
+/// giving up: `EGCL_SAFEPOINT_TIMEOUT_MS`, default 60 s. Read per handshake,
+/// so a test can shorten it for a mutator that never polls.
+fn handshake_budget_ms() -> u64 {
+    std::env::var("EGCL_SAFEPOINT_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(60_000)
 }
 
 /// Resume all threads after a safepoint operation (e.g. GC is done).
