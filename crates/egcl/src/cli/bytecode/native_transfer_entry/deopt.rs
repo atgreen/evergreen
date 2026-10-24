@@ -70,7 +70,14 @@ fn note_segment_deopt(code: &TransferCode, guard_bcp: u32) {
     // T0 blacklisting for unsupported domains. Retain this exact version and
     // release the registry borrow before policy code retires or replaces it.
     if let Some((symbol, native)) = &installed {
-        if !native.is_t2 {
+        // Raw double-float T2 follows the same policy (bliss-thcbb): its failed
+        // double guards retire that speculation instead of cycling through
+        // baseline recompiles that would speculate it again.
+        let raw_doubles = native.is_t2
+            && native.t2_metadata.as_ref().is_some_and(|installed| {
+                installed.speculations.iter().any(|&(_, kind)| kind == SpecType::DoubleFloat)
+            });
+        if !native.is_t2 || raw_doubles {
             note_native_deopt(*symbol, Some(native), Some(guard_bcp));
             return;
         }

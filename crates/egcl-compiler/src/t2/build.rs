@@ -3334,12 +3334,18 @@ impl<'a> Builder<'a> {
             )
         } else {
             // Cons / heap object / function: retain its GC-rewritten pool slot.
+            // A double literal keeps its tagged box but is typed, so double
+            // speculation can read it as a constant (bliss-thcbb).
             (
                 Opcode::ConstHeapObj,
                 AuxData::HeapLiteral {
                     slot: slot as *const _ as usize,
                 },
-                IRType::TOP,
+                if val.is_double_float() {
+                    IRType::of(TypeBits::DOUBLE_FLOAT)
+                } else {
+                    IRType::TOP
+                },
             )
         };
 

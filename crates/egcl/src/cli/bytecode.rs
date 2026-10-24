@@ -1491,11 +1491,12 @@ fn format_bytecode_listing(sym: u32, bf: &Arc<BytecodeFunction>) -> String {
                     let spec = match p.dominant() {
                         Some(SpecType::Fixnum) => " ⇒ speculate FIXNUM",
                         Some(SpecType::SingleFloat) => " ⇒ speculate SINGLE-FLOAT",
+                        Some(SpecType::DoubleFloat) => " ⇒ speculate DOUBLE-FLOAT",
                         None => " ⇒ generic (polymorphic / cold)",
                     };
                     format!(
-                        "[profile fix:{} float:{} bignum:{} other:{}{}]",
-                        p.fixnum, p.single_float, p.bignum, p.other, spec
+                        "[profile fix:{} float:{} double:{} bignum:{} other:{}{}]",
+                        p.fixnum, p.single_float, p.double_float, p.bignum, p.other, spec
                     )
                 })
                 .unwrap_or_default(),
@@ -19412,6 +19413,9 @@ extern "C" fn c2i_call_builtin_regs(
 /// lives in this crate, which depends on egcl-compiler, so the compiler cannot
 /// reach it directly (bliss-x5y.27).
 pub(super) fn install_direct_builtin_hooks() {
+    // Raw double-float code boxes escaping values through this veneer.
+    #[cfg(all(not(egcl_no_t2), target_arch = "x86_64", target_os = "linux"))]
+    native_transfer_entry::install_box_double_veneer();
     #[cfg(not(egcl_no_t2))]
     egcl_compiler::t2::emit::install_call_slice_rooted(
         c2i_call_slice_rooted as extern "C" fn(u64, u64, *const EgclVal, u64) -> u64 as usize
@@ -20750,6 +20754,8 @@ fn install_stack_map(
 pub enum SpecType {
     Fixnum,
     SingleFloat,
+    /// Boxed double-float operands; T2 computes them raw (bliss-thcbb).
+    DoubleFloat,
 }
 
 /// Observed operand-type distribution at one call site.
@@ -20757,14 +20763,21 @@ pub enum SpecType {
 pub struct TypeProfile {
     pub fixnum: u32,
     pub single_float: u32,
+    /// Double-floats, alone or with fixnums (float contagion), no single-float.
+    pub double_float: u32,
     /// Fixnum/bignum/single-float operands including a bignum; require generic arithmetic.
     pub bignum: u32,
     pub other: u32,
+    /// A raw double-float speculation here failed once (bliss-thcbb): later
+    /// versions keep the site generic. Decay zeroes counts, never this flag,
+    /// so a site that mixes doubles with other operands cannot alternate
+    /// between raw double and fixnum versions without end.
+    pub double_declined: bool,
 }
 
 impl TypeProfile {
     pub fn total(&self) -> u32 {
-        self.fixnum + self.single_float + self.bignum + self.other
+        self.fixnum + self.single_float + self.double_float + self.bignum + self.other
     }
     /// The dominant speculatable type, if the site is overwhelmingly consistent
     /// (≥90% one type over ≥`MIN` samples). `None` means "not enough data" or
@@ -20783,6 +20796,8 @@ impl TypeProfile {
             Some(SpecType::Fixnum)
         } else if self.single_float * 100 >= t * 90 {
             Some(SpecType::SingleFloat)
+        } else if self.double_float * 100 >= t * 90 {
+            Some(SpecType::DoubleFloat)
         } else {
             None
         }
@@ -20792,18 +20807,52 @@ impl TypeProfile {
     /// monomorphic sites. Share it with deopt feedback so generic sites are
     /// never mistaken for failed guards at another arithmetic operation.
     fn speculation(&self) -> Option<SpecType> {
-        self.dominant().or({
+        let choice = self.dominant().or({
             if self.other != 0 || self.bignum != 0 {
                 None
-            } else if self.single_float == 0 && self.fixnum > 0 {
+            } else if self.single_float == 0 && self.double_float == 0 && self.fixnum > 0 {
                 Some(SpecType::Fixnum)
-            } else if self.fixnum == 0 && self.single_float > 0 {
+            } else if self.fixnum == 0 && self.double_float == 0 && self.single_float > 0 {
                 Some(SpecType::SingleFloat)
+            } else if self.fixnum == 0 && self.single_float == 0 && self.double_float > 0 {
+                Some(SpecType::DoubleFloat)
             } else {
                 None
             }
-        })
+        });
+        choice.filter(|spec| !(self.double_declined && *spec == SpecType::DoubleFloat))
     }
+}
+
+/// Retire raw double-float speculation at the sites a failed guard names
+/// (bliss-thcbb). A guard at a double site declines that site; a guard at
+/// function entry (bytecode 0, a parameter unboxed for a raw loop variable)
+/// declines every double site of the version. The decayed evidence is given
+/// back, so the replacement compiles those sites generic instead of trusting
+/// the handful of samples taken since the deopt. Returns whether any site was
+/// declined; the caller then replaces the version at once.
+fn decline_failed_double_sites(
+    body: &Arc<BytecodeFunction>,
+    installed: &T2InstalledMetadata,
+    guard_bcp: u32,
+) -> bool {
+    let key = Arc::as_ptr(body) as usize;
+    let sites: Vec<u32> = installed
+        .speculations
+        .iter()
+        .filter(|&&(bcp, kind)| kind == SpecType::DoubleFloat && (guard_bcp == 0 || bcp == guard_bcp))
+        .map(|&(bcp, _)| bcp)
+        .collect();
+    if sites.is_empty() {
+        return false;
+    }
+    TYPE_PROFILE.with(|profiles| {
+        let mut profiles = profiles.borrow_mut();
+        for bcp in sites {
+            profiles.entry((key, bcp)).or_default().double_declined = true;
+        }
+    });
+    true
 }
 
 /// Whether `sym` names an op we would speculate a single numeric type for.
@@ -20851,6 +20900,7 @@ fn decay_failed_speculation(
                     match kind {
                         SpecType::Fixnum => profile.fixnum = 0,
                         SpecType::SingleFloat => profile.single_float = 0,
+                        SpecType::DoubleFloat => profile.double_float = 0,
                     }
                 }
             }
@@ -20884,6 +20934,7 @@ fn decay_failed_speculation(
                 match spec {
                     SpecType::Fixnum => p.fixnum = 0,
                     SpecType::SingleFloat => p.single_float = 0,
+                    SpecType::DoubleFloat => p.double_float = 0,
                 }
                 failed.push((bcp as u32, spec, false));
             }
@@ -20934,6 +20985,7 @@ fn profiled_speculation_counts(
             let count = match kind {
                 SpecType::Fixnum => profile.fixnum,
                 SpecType::SingleFloat => profile.single_float,
+                SpecType::DoubleFloat => profile.double_float,
             };
             (count > 0).then_some((key, bcp, kind, count))
         })
@@ -20952,6 +21004,7 @@ fn restore_decayed_evidence(sym: u32) {
             let slot = match kind {
                 SpecType::Fixnum => &mut profile.fixnum,
                 SpecType::SingleFloat => &mut profile.single_float,
+                SpecType::DoubleFloat => &mut profile.double_float,
             };
             *slot = slot.saturating_add(count);
         }
@@ -20983,8 +21036,14 @@ fn failed_site_changed_phase(profile: &TypeProfile, old: SpecType, cold: bool) -
     }
     profile.other == 0
         && match old {
+            // Doubles beside a fixnum or single-float speculation are not a
+            // supported phase: retrying them raw would alternate with the old
+            // type for as long as the site mixes both (bliss-thcbb).
             SpecType::Fixnum => profile.single_float > 0 || profile.bignum > 0,
             SpecType::SingleFloat => profile.fixnum > 0 || profile.bignum > 0,
+            SpecType::DoubleFloat => {
+                profile.fixnum > 0 || profile.single_float > 0 || profile.bignum > 0
+            }
         }
 }
 
@@ -21001,6 +21060,11 @@ fn record_type_profile(func_ptr: usize, bcp: u32, args: &[EgclVal]) {
     // constant, instead of looking polymorphic and staying generic.
     let numeric = args.iter().all(|a| a.is_fixnum() || a.is_single_float());
     let any_float = args.iter().any(|a| a.is_single_float());
+    // Double-float contagion with fixnums only (bliss-thcbb): T2 converts a
+    // fixnum constant exactly as the interpreter does. A single-float operand
+    // beside a double stays "other" so the site is not speculated.
+    let double = args.iter().all(|a| a.is_fixnum() || a.is_double_float())
+        && args.iter().any(|a| a.is_double_float());
     let bignum_numeric = !numeric
         && args.iter().all(|&a| a.is_single_float() || egcl_rt::types::integerp(a));
     TYPE_PROFILE.with(|m| {
@@ -21010,6 +21074,8 @@ fn record_type_profile(func_ptr: usize, bcp: u32, args: &[EgclVal]) {
             e.fixnum += 1;
         } else if numeric && any_float {
             e.single_float += 1;
+        } else if double {
+            e.double_float += 1;
         } else if bignum_numeric {
             e.bignum += 1;
         } else {
@@ -21576,6 +21642,10 @@ impl egcl_rt::gc::TraceHostRoots for T2InstalledBodies {
 struct T2Artifact {
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     mapped: Option<native_transfer_entry::PreparedT2>,
+    /// The tagged artifact and its speculations, installed when `mapped`
+    /// holds raw double values whose emission declines (bliss-thcbb).
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    mapped_fallback: Option<(native_transfer_entry::PreparedT2, Vec<(u32, SpecType)>)>,
     checked: Option<CheckedT2Artifact>,
     speculations: Vec<(u32, SpecType)>,
     cold_guesses: Vec<u32>,
@@ -22883,8 +22953,18 @@ fn note_native_deopt(sym: u32, code: Option<&NativeCode>, guard_bcp: Option<u32>
         // evidence, and the site now has some (bliss-9bw59). Waiting for the
         // threshold re-ran a float recursion through eight deopts first.
         let cold_disproved = !threshold_hit && cold_guess_disproved(sym);
-        let phase_change =
-            cold_disproved || (threshold_hit && supported_numeric_phase_change(sym));
+        // A failed raw double guard retires that speculation and recompiles
+        // at once, keeping the evidence (bliss-thcbb).
+        let double_declined = is_t2
+            && bf.zip(metadata).zip(guard_bcp).is_some_and(|((body, installed), bcp)| {
+                decline_failed_double_sites(body, installed, bcp)
+            });
+        let phase_change = cold_disproved
+            || double_declined
+            || (threshold_hit && supported_numeric_phase_change(sym));
+        if double_declined {
+            restore_decayed_evidence(sym);
+        }
         if cold_disproved {
             // Only the guess was wrong; the decay above also erased the
             // evidence behind this version's other speculations. Restore it so
@@ -22912,6 +22992,8 @@ fn note_native_deopt(sym: u32, code: Option<&NativeCode>, guard_bcp: Option<u32>
                 "{nm}: native guard deopt #{n} => resuming interpreted{}",
                 if cold_disproved {
                     " (cold fixnum guess disproved => generic T1 + recompile)"
+                } else if double_declined {
+                    " (raw double speculation failed => generic T1 + recompile)"
                 } else if phase_change {
                     " (threshold hit: supported numeric phase change => generic T1 + recompile)"
                 } else if threshold_hit {
@@ -25379,9 +25461,10 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     if t2_log_target().is_some() {
         for (bcp, p) in &input.type_profiles {
             t2_log!(
-                "{name}: site bcp={bcp} T0 samples fix={} float={} bignum={} other={} profile_choice={:?}",
+                "{name}: site bcp={bcp} T0 samples fix={} float={} double={} bignum={} other={} profile_choice={:?}",
                 p.fixnum,
                 p.single_float,
+                p.double_float,
                 p.bignum,
                 p.other,
                 p.speculation()
@@ -25415,6 +25498,7 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
             Some(p) => p.speculation().map(|spec| match spec {
                 SpecType::Fixnum => Bc::Fixnum,
                 SpecType::SingleFloat => Bc::SingleFloat,
+                SpecType::DoubleFloat => Bc::DoubleFloat,
             }),
             None => {
                 // cold: optimistic, guarded fixnum guess
@@ -25471,14 +25555,47 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     // expressions need the original calls before numeric speculation replaces
     // cold arithmetic with fixnum guesses. Only mapped full-entry code admits
     // the separate raw representation candidate.
+    //
+    // The same candidate carries raw double-float arithmetic (bliss-thcbb):
+    // double sites expand to unboxed IR and `unbox_f64` keeps the values raw
+    // between operations. The tagged artifact leaves those sites generic.
     let mut packed = if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
         let mut candidate = f.clone();
-        (egcl_compiler::t2::packed_f64::specialize(&mut candidate) != 0).then_some(candidate)
+        let packed_sites = egcl_compiler::t2::packed_f64::specialize(&mut candidate);
+        let speculated = egcl_compiler::t2::speculate::speculate_with(
+            &mut candidate,
+            &profile,
+            egcl_compiler::t2::speculate::SpeculateOptions { double_float: true },
+        );
+        let raw = egcl_compiler::t2::unbox_f64::has_raw_doubles(&candidate);
+        if raw && !egcl_compiler::t2::unbox_f64::optimize(&mut candidate) {
+            t2_log!("{name}: raw double candidate failed verification => tagged only");
+            None
+        } else if packed_sites == 0 && raw && {
+            // Raw code installs only with the mapped calling convention, whose
+            // calls cost about a microsecond more than the ordinary ABI's. A
+            // body that is mostly calls would lose more there than its few
+            // unboxed operations gain (bliss-k4psf); keep it tagged.
+            let (operations, calls) =
+                egcl_compiler::t2::unbox_f64::raw_operation_and_call_counts(&candidate);
+            calls > operations
+        } {
+            t2_log!("{name}: raw double candidate is call-dominated => tagged only");
+            None
+        } else if packed_sites != 0 || raw {
+            t2_log!(
+                "{name}: raw double candidate: speculated {speculated} site(s), {} packed",
+                packed_sites
+            );
+            Some(candidate)
+        } else {
+            None
+        }
     } else { None };
-    if let Some(candidate) = &mut packed {
-        egcl_compiler::t2::speculate::speculate(candidate, &profile);
-    }
-    let speculated = egcl_compiler::t2::speculate::speculate(&mut f, &profile);
+    let tagged_profile = |bcp: u32| {
+        profile(bcp).filter(|spec| *spec != egcl_compiler::t2::speculate::SpecType::DoubleFloat)
+    };
+    let speculated = egcl_compiler::t2::speculate::speculate(&mut f, &tagged_profile);
     let speculations = t2_numeric_speculations(&f, sym);
     // Speculation is an ENHANCEMENT, not the admission test for T2. Even with no
     // speculatable arithmetic site, T2's mid-end (const-fold + GVN + DCE) still
@@ -25511,18 +25628,28 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
         pm.add(Box::new(egcl_compiler::t2::opt_dce::Dce));
         pm.run(function);
     }
+    if let Some(candidate) = &mut packed {
+        egcl_compiler::t2::unbox_f64::remove_dead_boxes(candidate);
+    }
     if let Err(e) = egcl_compiler::t2::verify::verify(&f) {
         t2_log!("{name}: post-mid-end verify failed: {e:?} => stay T1");
         return None;
     }
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    let (mapped, speculations) = match packed.as_ref().and_then(|candidate| {
+    let (mapped, speculations, mapped_fallback) = match packed.as_ref().and_then(|candidate| {
         native_transfer_entry::prepare_ordinary_t2(input, candidate)
             .map(|prepared| (prepared, t2_numeric_speculations(candidate, sym)))
     }) {
-        Some((prepared, speculations)) => (Some(prepared), speculations),
-        None => (native_transfer_entry::prepare_ordinary_t2(input, &f), speculations),
+        // Raw emission can still decline at installation; keep the tagged
+        // artifact ready so the function does not lose T2 altogether.
+        Some((prepared, raw_speculations)) => (
+            Some(prepared),
+            raw_speculations,
+            native_transfer_entry::prepare_ordinary_t2(input, &f)
+                .map(|tagged| (tagged, speculations)),
+        ),
+        None => (native_transfer_entry::prepare_ordinary_t2(input, &f), speculations, None),
     };
 
     // Linux publishes only mapped code. Do not make a usable mapped worker
@@ -25627,6 +25754,8 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     Some(T2Artifact {
         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
         mapped,
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        mapped_fallback,
         checked,
         speculations,
         cold_guesses: cold_guesses.into_inner(),
@@ -25794,6 +25923,17 @@ fn t2_numeric_speculations(
                 | FixnumNeg | FixnumShl | FixnumShr | LogAnd | LogOr | LogXor | LogNot
                 | FixnumCmpEq | FixnumCmpLt | FixnumCmpLe | FixnumCmpGt | FixnumCmpGe => {
                     SpecType::Fixnum
+                }
+                // A raw double site deopts through its operand unboxing and,
+                // for a comparison, its NaN check (bliss-thcbb).
+                UnboxFloat => SpecType::DoubleFloat,
+                FloatCmpEq | FloatCmpLt | FloatCmpLe | FloatCmpGt | FloatCmpGe
+                    if data.args.iter().any(|&value| {
+                        f.value(value).repr
+                            == egcl_compiler::t2::ir::ValueRepresentation::UnboxedF64
+                    }) =>
+                {
+                    SpecType::DoubleFloat
                 }
                 FloatAdd | FloatSub | FloatMul | FloatDiv | FloatCmpEq | FloatCmpLt
                 | FloatCmpLe | FloatCmpGt | FloatCmpGe => {
@@ -28091,8 +28231,10 @@ mod jtc4_stack_map_tests {
             profiles.insert((key, 2), TypeProfile {
                 fixnum: 20,
                 single_float: 2,
+                double_float: 0,
                 bignum: 0,
                 other: 0,
+                double_declined: false,
             });
             // This site was already generic; its historical bignum samples
             // must not turn another site's overflow into a new numeric phase.

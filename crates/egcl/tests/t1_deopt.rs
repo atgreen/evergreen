@@ -505,11 +505,12 @@ fn disproved_cold_double_guess_recompiles_to_t2() {
 }
 
 /// bliss-fenm at default thresholds: a branch not taken while the function
-/// warmed up has no profile, so T1 guesses fixnum there. When the program
-/// later takes it with double floats, the guess fails; that recompiles the
-/// function rather than blacklisting it, and it stays native.
+/// warmed up has no profile. It used to get the cold fixnum guess, which the
+/// program then disproved with double floats. Since bliss-thcbb a double
+/// literal types its site, so no fixnum guess is made there: the branch stays
+/// generic, nothing deopts, the function is never blacklisted and stays native.
 #[test]
-fn cold_branch_double_recompiles_instead_of_blacklisting() {
+fn cold_double_literal_branch_never_deopts() {
     let program = "\
         (defun br (flag x) (if flag (+ x 1) (+ x 1d0))) \
         (dotimes (i 50) (br t 1)) \
@@ -522,14 +523,10 @@ fn cold_branch_double_recompiles_instead_of_blacklisting() {
             ("EGCL_T2_LOG", "stderr"),
         ],
     );
-    // The disproved guess recompiles as soon as the branch has a profile,
-    // without waiting for the blacklist threshold (bliss-9bw59).
     assert!(
-        trace.lines().any(|line| line.starts_with("[T2] BR: native guard deopt #")
-            && line.contains("(cold fixnum guess disproved => generic T1 + recompile)")),
-        "the cold-branch failure recompiles:\n{trace}"
+        !trace.lines().any(|line| line.starts_with("[T2] BR: native guard deopt #")),
+        "the double-literal branch takes no fixnum guess to disprove:\n{trace}"
     );
-    assert!(!trace.contains("[T2] BR: native guard deopt #3"), "before the threshold:\n{trace}");
     assert!(
         !trace
             .lines()

@@ -1065,7 +1065,7 @@ fn store_home(a: &mut Asm, home: FramedHome, src: u8, rsp_adjust: i32) {
 
 /// Keep raw results in their authoritative homes before the next IR boundary.
 /// Both operands are read before the store, including when homes overlap.
-fn emit_stack_float(a: &mut Asm, opcode: crate::t2::ir::Opcode, slots: [u32; 3]) {
+fn emit_stack_float(a: &mut Asm, opcode: crate::t2::ir::Opcode, slots: [u32; 3], zero_fixup: bool) {
     use crate::t2::ir::Opcode;
     let arithmetic = match opcode {
         Opcode::FloatAdd => 0x58,
@@ -1073,6 +1073,11 @@ fn emit_stack_float(a: &mut Asm, opcode: crate::t2::ir::Opcode, slots: [u32; 3])
         _ => unreachable!("stack float emission requires add or multiply"),
     };
     for (operation, slot) in [0x10, arithmetic, 0x11].into_iter().zip(slots) {
+        if operation == 0x11 && zero_fixup {
+            // See `raw_add_needs_zero_fixup`: a -0.0 sum becomes +0.0.
+            a.extend_from_slice(&[0x66, 0x0f, 0x57, 0xc9]); // xorpd xmm1, xmm1
+            a.extend_from_slice(&[0xf2, 0x0f, 0x58, 0xc1]); // addsd xmm0, xmm1
+        }
         // MOVSD XMM0,[RSP+disp32]; ADDSD/MULSD XMM0,[RSP+disp32];
         // MOVSD [RSP+disp32],XMM0. No XMM value survives this instruction.
         a.extend_from_slice(&[0xf2, 0x0f, operation, 0x84, 0x24]);
@@ -1350,6 +1355,73 @@ fn emit_mapped_poll(
         store_home(a, home, RAX, 0);
     }
     if let Some(idle) = idle { a.bind(idle); }
+    Ok((site, map))
+}
+
+/// Box the raw double in `input` into `result` through the published box
+/// veneer (bliss-thcbb). The allocation may collect, so the call site has
+/// the inserted-poll treatment: raw registers are parked in private native
+/// slots, tagged values in caller-saved homes are copied into the mapped
+/// spill area (`roots`), and the exact map of the values live before the box
+/// is returned for the runtime to publish. The veneer takes the IEEE bits as
+/// its request word in RDI and returns the tagged box in RAX.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[allow(clippy::too_many_arguments)]
+fn emit_mapped_box(
+    a: &mut Asm,
+    values: &crate::t2::x64_frame::FrameValues,
+    roots: &[crate::t2::ir::Value],
+    homes: &std::collections::HashMap<crate::t2::ir::Value, FramedHome>,
+    frame: &PollFrame,
+    veneer: u64,
+    input: FramedHome,
+    result: FramedHome,
+) -> Result<(CallReturn, std::sync::Arc<NativeFrameValues>), EmitError> {
+    for (index, home) in values.raw_registers().enumerate() {
+        load_home(a, RAX, home, 0);
+        store_home(a, FramedHome::Stack(frame.raw_spill_start + index as u32), RAX, 0);
+    }
+    let layout = NativeFrameLayout {
+        native_slots: frame.native_slots,
+        activation_base_slot: if frame.native_frame_mode { None } else { match frame.base {
+            FramedHome::Stack(slot) => Some(slot),
+            _ => return Err(EmitError::UnsupportedOp(0xFE)),
+        } },
+        activation_slots: if frame.native_frame_mode { 0 } else { frame
+            .activation_slots
+            .checked_add(frame.shadow_slots)
+            .ok_or(EmitError::UnsupportedOp(0xFE))? },
+    };
+    let map = std::sync::Arc::new(
+        NativeFrameValues::for_call_in_area(
+            values.values(),
+            roots,
+            frame.spill_area,
+            &[],
+            None,
+            layout,
+            Some(frame.raw_spill_start),
+            |_| false,
+        )
+        .and_then(|map| map.with_native_arguments(&frame.arguments, |_| false))
+        .map_err(|_| EmitError::UnsupportedOp(0xFE))?,
+    );
+    emit_call_root_sync(a, roots, homes, frame.base, frame.spill_area, frame.shadow_slots)?;
+    // The raw input is read from its own home after the copies above, which
+    // only store; the request word is the double's IEEE bits.
+    load_home(a, 7, input, 0);
+    mov_imm64(a, RAX, veneer as i64);
+    let site = emit_runtime_helper_call(a, 0, None);
+    // R11 is not a value home and the restores below use only RAX/RDX.
+    mov_rr(a, 11, RAX);
+    let restore = roots.iter().copied().collect();
+    emit_call_root_restore(a, roots, &restore, homes, frame.base, frame.spill_area)?;
+    for (index, home) in values.raw_registers().enumerate() {
+        load_home(a, RAX, FramedHome::Stack(frame.raw_spill_start + index as u32), 0);
+        store_home(a, home, RAX, 0);
+    }
+    // Last, so a dying input sharing the result's home cannot overwrite it.
+    store_home(a, result, 11, 0);
     Ok((site, map))
 }
 
@@ -1837,6 +1909,25 @@ fn call_slice_rooted_addr() -> u64 {
 
 pub fn install_direct_builtin_hooks(hooks: DirectBuiltinHooks) {
     let _ = DIRECT_BUILTIN.set(hooks);
+}
+
+/// The published helper veneer that boxes a raw double (bliss-thcbb).
+static BOX_DOUBLE_VENEER: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// Install the process-lifetime veneer mapped code calls to box a raw double.
+/// It is a published helper veneer (`native_transfer::emit_published_helper_veneer`)
+/// whose helper takes the IEEE bits as its request word, allocates the box
+/// with the calling frame published to the collector, and returns the tagged
+/// double as a normal outcome. Idempotent; later calls are ignored. Without
+/// it, raw-double code that must box an escaping value is declined.
+pub fn install_box_double_veneer(address: u64) {
+    if address != 0 {
+        let _ = BOX_DOUBLE_VENEER.set(address);
+    }
+}
+
+fn box_double_veneer() -> Option<u64> {
+    BOX_DOUBLE_VENEER.get().copied()
 }
 
 /// `(adapter address, table slot, generation to bake)` when this call site may
@@ -2929,6 +3020,21 @@ fn emit_fixnum_cmp_value(
     Ok(())
 }
 
+/// Whether a raw double `FloatAdd` must map a -0.0 sum to +0.0 to equal the
+/// interpreter, whose `+` folds its operands onto a +0.0 seed: `(+ -0d0 -0d0)`
+/// is `0.0d0` there. Under round-to-nearest a sum is -0.0 only when both
+/// addends are -0.0, so a constant addend other than -0.0 needs no fixup.
+fn raw_add_needs_zero_fixup(f: &Function, args: &[crate::t2::ir::Value]) -> bool {
+    use crate::t2::ir::{AuxData, Opcode, ValueDef};
+    !args.iter().any(|&value| match f.value(value).def {
+        ValueDef::Result { inst, .. } => matches!(
+            (f.inst(inst).opcode, &f.inst(inst).aux),
+            (Opcode::ConstDouble, AuxData::DoubleImm(bits)) if *bits != (-0.0f64).to_bits()
+        ),
+        ValueDef::Param { .. } => false,
+    })
+}
+
 /// Is `op` a typed single-float comparison?
 fn is_float_cmp(op: crate::t2::ir::Opcode) -> bool {
     use crate::t2::ir::Opcode::*;
@@ -2978,6 +3084,52 @@ fn emit_float_cmp_value(
     a.extend_from_slice(&[0x84, 0xD2]); // test dl, dl
     a.jcc(Cc::Ne, deopt); // unordered: let the interpreter decide
     // Allocate after every operand read, as `emit_fixnum_cmp_value` does.
+    let dst = framed_alloc(reg, pool, data.results[0])?;
+    mov_imm64(a, dst, egcl_rt::value::T.0 as i64);
+    a.extend_from_slice(&[0x84, 0xC0]); // test al, al
+    let done = a.label();
+    a.jcc(Cc::Ne, done);
+    mov_imm64(a, dst, egcl_rt::value::NIL.0 as i64);
+    a.bind(done);
+    Ok(())
+}
+
+/// Emit a raw double-float comparison producing `T`/`NIL` (bliss-thcbb). Both
+/// operands are raw `UnboxedF64` words, already guarded or constant. As for
+/// single-floats, an unordered compare (a NaN operand) deopts so that the
+/// interpreter, whose NaN ordering is not IEEE's (bliss-b4e4q), decides it;
+/// ordered results are exact IEEE comparisons, which equal the interpreter's.
+/// `ucomisd x, y` sets CF for x<y and ZF for x=y, as `ucomiss` does.
+fn emit_raw_double_cmp_value(
+    a: &mut Asm,
+    data: &crate::t2::ir::InstData,
+    reg: &mut std::collections::HashMap<crate::t2::ir::Value, u8>,
+    pool: &mut Vec<u8>,
+    deopt: egcl_rt::asm::Label,
+) -> Result<(), EmitError> {
+    use crate::t2::ir::Opcode;
+    if data.results.len() != 1 || data.args.len() != 2 {
+        return Err(EmitError::UnsupportedOp(op_tag(data.opcode)));
+    }
+    for (xmm, value) in data.args.iter().enumerate() {
+        let register = *reg.get(value).ok_or(EmitError::UnsupportedOp(0xF2))?;
+        // movq xmm, r64
+        a.extend_from_slice(&[0x66, rex_w(xmm as u8, register), 0x0f, 0x6e,
+            modrm_rr(xmm as u8, register)]);
+    }
+    let (x, y, setcc) = match data.opcode {
+        Opcode::FloatCmpEq => (0, 1, 0x94), // sete
+        Opcode::FloatCmpLt => (1, 0, 0x97), // b > a: seta
+        Opcode::FloatCmpLe => (1, 0, 0x93), // b >= a: setae
+        Opcode::FloatCmpGt => (0, 1, 0x97), // a > b: seta
+        Opcode::FloatCmpGe => (0, 1, 0x93), // a >= b: setae
+        other => return Err(EmitError::UnsupportedOp(op_tag(other))),
+    };
+    a.extend_from_slice(&[0x66, 0x0F, 0x2E, modrm_rr(x, y)]); // ucomisd xmm_x, xmm_y
+    a.extend_from_slice(&[0x0F, 0x9A, 0xC2]); // setp dl
+    a.extend_from_slice(&[0x0F, setcc, 0xC0]); // set<cc> al
+    a.extend_from_slice(&[0x84, 0xD2]); // test dl, dl
+    a.jcc(Cc::Ne, deopt); // unordered: let the interpreter decide
     let dst = framed_alloc(reg, pool, data.results[0])?;
     mov_imm64(a, dst, egcl_rt::value::T.0 as i64);
     a.extend_from_slice(&[0x84, 0xC0]); // test al, al
@@ -4507,11 +4659,22 @@ fn packed_f64_element_address(
     alu_rr(a, 0x01, SCRATCH, RAX);
 }
 
+/// Decline raw representation transport. `EGCL_RAW_DBG` names the reason on
+/// stderr (with the rendered IR printed once per checked function).
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn raw_reject(f: &Function, why: &str) -> bool {
+    if std::env::var_os("EGCL_RAW_DBG").is_some() {
+        eprintln!("[raw] {}: declined: {why}", f.name());
+    }
+    false
+}
+
 /// Admit raw F64 transport only where every collecting/cold boundary has an
 /// authoritative representation map. Raw entry arguments, ordinary helper or
 /// return operands, OSR imports, and other unboxed representations remain out
-/// of scope. Raw producers are guarded unboxing, packed loads, and explicit
-/// double arithmetic; packed stores consume raw words without boxing.
+/// of scope. Raw producers are guarded unboxing, packed loads, raw double
+/// constants and explicit double arithmetic; packed stores consume raw words
+/// without boxing, and escape boxes call the published box veneer.
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 fn native_representations_supported(
     f: &Function,
@@ -4521,6 +4684,9 @@ fn native_representations_supported(
 ) -> bool {
     use crate::t2::ir::{Opcode, TypeBits, Value, ValueRepresentation as Repr};
     let raw = |value| f.value(value).repr != Repr::Tagged;
+    if std::env::var_os("EGCL_RAW_DBG").is_some() && (0..f.num_values()).any(|i| raw(Value(i as u32))) {
+        eprintln!("[raw-ir] {}\n{}", f.name(), crate::t2::unbox_f64::render(f));
+    }
     let has_raw = (0..f.num_values()).any(|i| raw(Value(i as u32)));
     if has_raw && (roots != NativeRootPublication::PublishedHomes
         || storage != NativeCallStorage::NativeStack || !precise_deopt
@@ -4529,7 +4695,7 @@ fn native_representations_supported(
         || (0..f.num_values()).any(|i| !matches!(f.value(Value(i as u32)).repr,
             Repr::Tagged | Repr::UnboxedF64)))
     {
-        return false;
+        return raw_reject(f, "raw values need published homes, native storage, precise deopt, no OSR import or raw entry parameter");
     }
     for (_, state) in f.frame_states.iter() {
         let sources = state.scopes.iter().flat_map(|scope| scope.locals.iter().chain(&scope.stack))
@@ -4537,7 +4703,7 @@ fn native_representations_supported(
         for source in sources {
             if let crate::t2::frame_state::ValueSource::Value { value, repr } = source {
                 if value.0 as usize >= f.num_values() || f.value(*value).repr != *repr {
-                    return false;
+                    return raw_reject(f, "frame-state source representation mismatch");
                 }
             }
         }
@@ -4552,7 +4718,7 @@ fn native_representations_supported(
                 // ordered recovery contract for these operations.
                 continue;
             }
-            if matches!(data.opcode, Opcode::FloatAdd | Opcode::FloatMul)
+            if matches!(data.opcode, Opcode::FloatAdd | Opcode::FloatSub | Opcode::FloatMul)
                 && data.results.iter().copied().any(raw)
             {
                 if data.args.len() != 2 || data.results.len() != 1
@@ -4562,23 +4728,55 @@ fn native_representations_supported(
                     || data.flags != crate::t2::ir::InstFlags::default()
                     || data.frame_state.is_some()
                 {
-                    return false;
+                    return raw_reject(f, "raw double arithmetic shape");
+                }
+                continue;
+            }
+            // Raw double constants, comparisons and escape boxes (bliss-thcbb).
+            if data.opcode == Opcode::ConstDouble {
+                if !data.args.is_empty() || data.results.len() != 1
+                    || !matches!(data.aux, crate::t2::ir::AuxData::DoubleImm(_))
+                    || f.value(data.results[0]).repr != Repr::UnboxedF64
+                {
+                    return raw_reject(f, "raw double constant shape");
+                }
+                continue;
+            }
+            if is_float_cmp(data.opcode) && data.args.iter().copied().any(raw) {
+                if data.args.len() != 2 || data.results.len() != 1
+                    || data.args.iter().any(|&value| f.value(value).repr != Repr::UnboxedF64)
+                    || raw(data.results[0])
+                    || data.frame_state.is_none() || !data.flags.guard
+                {
+                    return raw_reject(f, "raw double comparison shape");
+                }
+                continue;
+            }
+            if data.opcode == Opcode::BoxFloat {
+                if box_double_veneer().is_none()
+                    || data.args.len() != 1 || data.results.len() != 1
+                    || f.value(data.args[0]).repr != Repr::UnboxedF64
+                    || raw(data.results[0])
+                {
+                    return raw_reject(f, "double box shape or no box veneer installed");
                 }
                 continue;
             }
             if data.args.iter().copied().any(raw) {
-                return false;
+                return raw_reject(f, "raw operand of an unsupported operation");
             }
             if data.opcode == Opcode::UnboxFloat {
-                if data.args.len() != 1 || data.results.len() != 1
+                let contagion = crate::t2::speculate::unbox_accepts_fixnum(&data.aux);
+                if !(data.args.len() == 1 || (contagion && data.args.len() == 2))
+                    || data.results.len() != 1
                     || f.value(data.results[0]).repr != Repr::UnboxedF64
                     || f.value(data.results[0]).ty.bits != TypeBits::DOUBLE_FLOAT
                     || !data.flags.guard || !data.flags.effectful || data.frame_state.is_none()
                 {
-                    return false;
+                    return raw_reject(f, "double unboxing shape");
                 }
             } else if data.results.iter().copied().any(raw) {
-                return false;
+                return raw_reject(f, "raw result of an unsupported operation");
             }
         }
     }
@@ -4631,10 +4829,13 @@ fn emit_transfer_function_with_storage(
     for &block in f.block_order() {
         for &inst in &f.block(block).insts {
             let data = f.inst(inst);
-            if matches!(data.opcode, Opcode::UnboxFloat | Opcode::PackedF64Ref | Opcode::PackedF64Set)
-                || (matches!(data.opcode, Opcode::FloatAdd | Opcode::FloatMul)
+            if matches!(data.opcode, Opcode::UnboxFloat | Opcode::PackedF64Ref | Opcode::PackedF64Set
+                | Opcode::ConstDouble | Opcode::BoxFloat)
+                || (matches!(data.opcode, Opcode::FloatAdd | Opcode::FloatSub | Opcode::FloatMul)
                     && data.results.len() == 1
                     && f.value(data.results[0]).repr == crate::t2::ir::ValueRepresentation::UnboxedF64)
+                || (is_float_cmp(data.opcode) && data.args.iter().any(|&value|
+                    f.value(value).repr == crate::t2::ir::ValueRepresentation::UnboxedF64))
             {
                 // Representation and operand contracts were checked above.
                 continue;
@@ -5461,13 +5662,30 @@ fn emit_framed_inner(
     let straight_poll_points: HashMap<crate::t2::ir::Inst, usize> = HashMap::new();
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
     let _straight_poll_sources: HashSet<crate::t2::ir::Inst> = HashSet::new();
+    // Escape boxes of raw doubles (bliss-thcbb) call the published box veneer.
+    // Like inserted polls they are invisible to register allocation, so each
+    // takes the poll treatment: an exact map of the values live before it.
+    let mut box_points: HashMap<Inst, usize> = HashMap::new();
+    for (mi, machine_inst) in machine.insts.iter().enumerate() {
+        let Some(source) = machine_inst.source_inst else { continue };
+        if f.inst(source).opcode == Opcode::BoxFloat {
+            box_points.entry(source).or_insert(mi);
+        }
+    }
+    if box_points.len() != blocks.iter()
+        .flat_map(|&block| f.block(block).insts.iter())
+        .filter(|&&inst| f.inst(inst).opcode == Opcode::BoxFloat)
+        .count()
+    {
+        return Err(EmitError::UnsupportedOp(op_tag(Opcode::BoxFloat)));
+    }
     // A branch-only result may still be live across a call or inserted poll,
     // or needed for recovery. It must be materialized before that boundary.
     let mut safepoint_values: HashSet<_> = machine.stack_maps.iter()
         .flat_map(|map| map.values.iter().map(|entry| Value(entry.vreg.num)))
         .collect();
     let read_vregs = machine.read_vregs();
-    for &point in loop_points.values().chain(straight_poll_points.values()) {
+    for &point in loop_points.values().chain(straight_poll_points.values()).chain(box_points.values()) {
         let live = machine.live_vregs_before(point, &read_vregs)
             .ok_or(EmitError::UnsupportedOp(0xFE))?;
         safepoint_values.extend(live.into_iter().map(|vreg| Value(vreg.num)));
@@ -5551,9 +5769,12 @@ fn emit_framed_inner(
     let straight_poll_maps: HashMap<_, _> = straight_poll_points.iter()
         .map(|(&inst, &point)| Ok((inst, resolve_poll(point)?)))
         .collect::<Result<_, EmitError>>()?;
+    let box_maps: HashMap<_, _> = box_points.iter()
+        .map(|(&inst, &point)| Ok((inst, resolve_poll(point)?)))
+        .collect::<Result<_, EmitError>>()?;
     let homes = layout.values;
     let mut next_stack = layout.stack_slots;
-    let raw_poll_spills = loop_maps.values().chain(straight_poll_maps.values())
+    let raw_poll_spills = loop_maps.values().chain(straight_poll_maps.values()).chain(box_maps.values())
         .map(|values| values.raw_registers().count()).max().unwrap_or(0);
     let raw_poll_spills = u32::try_from(raw_poll_spills)
         .map_err(|_| EmitError::UnsupportedOp(0xFE))?;
@@ -5700,11 +5921,14 @@ fn emit_framed_inner(
         .map(|(&block, values)| (block, poll_roots(values))).collect();
     let straight_poll_roots: HashMap<_, _> = straight_poll_maps.iter()
         .map(|(&inst, values)| (inst, poll_roots(values))).collect();
+    let box_roots: HashMap<_, _> = box_maps.iter()
+        .map(|(&inst, values)| (inst, poll_roots(values))).collect();
     let root_shadow_slots = safepoint_roots
         .values()
         .map(Vec::len)
         .chain(loop_roots.values().map(Vec::len))
         .chain(straight_poll_roots.values().map(Vec::len))
+        .chain(box_roots.values().map(Vec::len))
         .max()
         .unwrap_or(0);
     let root_shadow_slots =
@@ -5876,12 +6100,14 @@ fn emit_framed_inner(
                 {
                     continue;
                 }
-                if matches!(d.opcode, Opcode::FloatAdd | Opcode::FloatMul)
+                if (matches!(d.opcode, Opcode::FloatAdd | Opcode::FloatSub | Opcode::FloatMul)
                     && d.results.len() == 1
-                    && f.value(d.results[0]).repr == ValueRepresentation::UnboxedF64
+                    && f.value(d.results[0]).repr == ValueRepresentation::UnboxedF64)
+                    || matches!(d.opcode, Opcode::ConstDouble | Opcode::BoxFloat)
                 {
                     // Already-unboxed double arithmetic is total and emits no
                     // guard. Its input layout checks own the recovery states.
+                    // Raw constants and escape boxes cannot deopt either.
                     continue;
                 }
                 // Reaches emit_arith_inst → may emit a guard → needs a FrameState.
@@ -6221,6 +6447,25 @@ fn emit_framed_inner(
                 native_value_maps.insert(call.return_offset, NativeCallValues::Frame(values));
                 native_calls.push(call.site(NativeCallOrigin::StraightPoll(inst), NativeStackBase::Body));
             }
+            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+            if d.opcode == Opcode::BoxFloat {
+                let veneer = box_double_veneer().ok_or(EmitError::UnsupportedOp(op_tag(d.opcode)))?;
+                let input = *homes.get(&d.args[0]).ok_or(EmitError::UnsupportedOp(0xF2))?;
+                let result = *homes.get(&d.results[0]).ok_or(EmitError::UnsupportedOp(0xF2))?;
+                let (call, values) = emit_mapped_box(
+                    &mut a,
+                    box_maps.get(&inst).ok_or(EmitError::UnsupportedOp(0xFE))?,
+                    box_roots.get(&inst).ok_or(EmitError::UnsupportedOp(0xFE))?,
+                    &homes,
+                    poll_frame.as_ref().ok_or(EmitError::UnsupportedOp(0xFE))?,
+                    veneer,
+                    input,
+                    result,
+                )?;
+                native_value_maps.insert(call.return_offset, NativeCallValues::Frame(values));
+                native_calls.push(call.site(NativeCallOrigin::StraightPoll(inst), NativeStackBase::Body));
+                continue;
+            }
             if (is_const_opcode(d.opcode) && d.opcode != Opcode::ConstHeapObj)
                 || d.opcode == Opcode::CleanupLanding
                 || (d.opcode.is_terminator() && d.opcode != Opcode::Invoke)
@@ -6313,7 +6558,8 @@ fn emit_framed_inner(
             let mut inst_calls = Vec::new();
             let mut inst_pool = Vec::new();
             if let Some(slots) = stack_float {
-                emit_stack_float(&mut a, d.opcode, slots);
+                emit_stack_float(&mut a, d.opcode, slots,
+                    d.opcode == Opcode::FloatAdd && raw_add_needs_zero_fixup(f, &d.args));
             } else if ordinary_call_mode && d.opcode == Opcode::Call {
                 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
                 { inst_calls = ordinary_call.unwrap().for_inst(inst).emit(&mut a, &d, &homes, &const_tagged,
@@ -6325,6 +6571,13 @@ fn emit_framed_inner(
                         mv_known_empty: single_returns.contains(&inst),
                         self_stack_fixups: &mut ordinary_self_stack_fixups,
                         emit_epilogue: &emit_epilogue })?; }
+            } else if d.opcode == Opcode::ConstDouble {
+                let crate::t2::ir::AuxData::DoubleImm(bits) = d.aux else {
+                    return Err(EmitError::UnsupportedOp(op_tag(d.opcode)));
+                };
+                let result = *d.results.first().ok_or(EmitError::UnsupportedOp(0xF2))?;
+                let dst = *inst_reg.get(&result).ok_or(EmitError::UnsupportedOp(0xF2))?;
+                mov_imm64(&mut a, dst, bits as i64);
             } else if d.opcode == Opcode::ConstHeapObj {
                 let result = *d.results.first().ok_or(EmitError::UnsupportedOp(0xF2))?;
                 let dst = *inst_reg
@@ -6563,17 +6816,41 @@ fn emit_framed_inner(
                     mov_imm64(&mut a, dst, egcl_rt::value::NIL.0 as i64);
                 }
             } else if d.opcode == Opcode::UnboxFloat {
+                let contagion = crate::t2::speculate::unbox_accepts_fixnum(&d.aux);
                 if !published_native_roots || !native_call_storage
-                    || d.args.len() != 1 || d.results.len() != 1
-                    || f.value(d.args[0]).repr != ValueRepresentation::Tagged
+                    || !(d.args.len() == 1 || (contagion && d.args.len() == 2))
+                    || d.results.len() != 1
+                    || d.args.iter().any(|&value| f.value(value).repr != ValueRepresentation::Tagged)
                     || f.value(d.results[0]).repr != ValueRepresentation::UnboxedF64
                 {
                     return Err(EmitError::UnsupportedOp(op_tag(d.opcode)));
                 }
                 let label = *inst_deopt.get(&inst)
                     .ok_or(EmitError::UnsupportedOp(op_tag(d.opcode)))?;
-                let input = inst_reg[&d.args[0]];
+                let input = *inst_reg.get(&d.args[0]).ok_or(EmitError::UnsupportedOp(0xF2))?;
                 let dst = inst_reg[&d.results[0]];
+                let done = a.label();
+                if contagion {
+                    // Float contagion with a fixnum operand (bliss-thcbb): the
+                    // interpreter rounds the fixnum to the nearest double, as
+                    // cvtsi2sd does. Two fixnums would make an integer there.
+                    if let Some(partner) = d.args.get(1) {
+                        let partner = *inst_reg.get(partner).ok_or(EmitError::UnsupportedOp(0xF2))?;
+                        mov_rr(&mut a, SCRATCH, input);
+                        alu_rr(&mut a, 0x09, SCRATCH, partner); // or rdx, partner
+                        a.extend_from_slice(&[0xF6, 0xC2, 0x07]); // test dl, 7
+                        a.jcc(Cc::E, label); // both fixnum-tagged
+                    }
+                    let boxed = a.label();
+                    mov_rr(&mut a, SCRATCH, input);
+                    a.extend_from_slice(&[0xF6, 0xC2, 0x07]); // test dl, 7
+                    a.jcc(Cc::Ne, boxed);
+                    sar_imm(&mut a, SCRATCH, 3); // the fixnum's integer value
+                    a.extend_from_slice(&[0xF2, 0x48, 0x0F, 0x2A, 0xC2]); // cvtsi2sd xmm0, rdx
+                    a.extend_from_slice(&[0x66, rex_w(0, dst), 0x0f, 0x7e, modrm_rr(0, dst)]); // movq dst, xmm0
+                    a.jmp(done);
+                    a.bind(boxed);
+                }
                 mov_rr(&mut a, SCRATCH, input);
                 alu_r_imm(&mut a, 4, SCRATCH, 7);
                 alu_r_imm(&mut a, 7, SCRATCH, egcl_rt::value::TAG_HEAP_OBJECT as i32);
@@ -6584,6 +6861,7 @@ fn emit_framed_inner(
                 a.extend_from_slice(&[0x80, 0x7a, 0x07, egcl_rt::object::type_id::DOUBLE_FLOAT]);
                 a.jcc(Cc::Ne, label);
                 load_mem64_disp(&mut a, dst, SCRATCH, 8);
+                a.bind(done);
             } else if matches!(d.opcode, Opcode::PackedF64Ref | Opcode::PackedF64Set) {
                 if !published_native_roots || !native_call_storage {
                     return Err(EmitError::UnsupportedOp(op_tag(d.opcode)));
@@ -6607,7 +6885,7 @@ fn emit_framed_inner(
                     store_mem64_disp(&mut a, SCRATCH, egcl_rt::packed_f64::DATA_OFFSET as i32,
                         inst_reg[&d.args[2]]);
                 }
-            } else if matches!(d.opcode, Opcode::FloatAdd | Opcode::FloatMul)
+            } else if matches!(d.opcode, Opcode::FloatAdd | Opcode::FloatSub | Opcode::FloatMul)
                 && d.results.first().is_some_and(|&value|
                     f.value(value).repr == ValueRepresentation::UnboxedF64)
             {
@@ -6621,14 +6899,30 @@ fn emit_framed_inner(
                     a.extend_from_slice(&[0x66, rex_w(xmm as u8, register), 0x0f, 0x6e,
                         modrm_rr(xmm as u8, register)]);
                 }
-                a.extend_from_slice(&[0xf2, 0x0f,
-                    if d.opcode == Opcode::FloatAdd { 0x58 } else { 0x59 }, 0xc1]);
+                a.extend_from_slice(&[0xf2, 0x0f, match d.opcode {
+                    Opcode::FloatAdd => 0x58,
+                    Opcode::FloatSub => 0x5c,
+                    _ => 0x59,
+                }, 0xc1]);
+                if d.opcode == Opcode::FloatAdd && raw_add_needs_zero_fixup(f, &d.args) {
+                    // The interpreter adds onto a +0.0 seed, so the sum of two
+                    // -0.0 is +0.0 there; adding +0.0 maps exactly that -0.0
+                    // result to +0.0 and leaves every other sum unchanged.
+                    a.extend_from_slice(&[0x66, 0x0f, 0x57, 0xc9]); // xorpd xmm1, xmm1
+                    a.extend_from_slice(&[0xf2, 0x0f, 0x58, 0xc1]); // addsd xmm0, xmm1
+                }
                 let register = inst_reg[&d.results[0]];
                 a.extend_from_slice(&[0x66, rex_w(0, register), 0x0f, 0x7e, modrm_rr(0, register)]);
             } else if d.opcode == Opcode::GenericEq {
                 emit_generic_eq(&mut a, &d, &mut inst_reg, &mut inst_pool, &const_tagged)?;
             } else if d.opcode == Opcode::TypeCheck {
                 emit_type_check(&mut a, &d, &mut inst_reg, &mut inst_pool, &const_tagged)?;
+            } else if is_float_cmp(d.opcode) && d.args.iter().any(|&value|
+                f.value(value).repr == ValueRepresentation::UnboxedF64)
+            {
+                let label = *inst_deopt.get(&inst)
+                    .ok_or(EmitError::UnsupportedOp(op_tag(d.opcode)))?;
+                emit_raw_double_cmp_value(&mut a, &d, &mut inst_reg, &mut inst_pool, label)?;
             } else if is_float_cmp(d.opcode) {
                 let label = inst_deopt.get(&inst).copied().unwrap_or(deopt);
                 emit_float_cmp_value(

@@ -345,6 +345,11 @@ pub enum Opcode {
     /// branches on NIL to the real call, which supplies every other result and
     /// error. Effectful only to keep it ordered after stores to the string.
     StringCharOrNil,
+    /// A raw `f64` constant (`AuxData::DoubleImm` bits) in the `UnboxedF64`
+    /// representation. Produced only by double-float speculation; never a
+    /// tagged value, so it is never a GC root (bliss-thcbb). Last, so earlier
+    /// opcode indices named in decline logs keep their numbers.
+    ConstDouble,
 }
 
 impl Opcode {
@@ -389,6 +394,8 @@ pub enum AuxData {
     None,
     FixnumImm(i64),
     FloatImm(f32),
+    /// The IEEE bits of a raw double constant (`ConstDouble`).
+    DoubleImm(u64),
     CharImm(char),
     SymbolRef(u32),
     /// Address of the moving-GC value's owning constant-pool slot. Generated
