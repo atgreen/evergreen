@@ -1390,7 +1390,7 @@ fn ordinary_t2_diagnostics_report_sparse_speculation_and_actual_publication() {
     let success = format!("[T2] {name}: optimized worker result installed with ordinary x86-64 Lisp T2 ABI");
     let (bcp, mut unpublished) = make_completion();
     assert!(read_log().contains(&format!(
-        "[T2] {name}: site bcp={bcp} T0 samples fix=2 float=0 bignum=0 other=0 profile_choice=Some(Fixnum)"
+        "[T2] {name}: site bcp={bcp} T0 samples fix=2 float=0 double=0 bignum=0 other=0 profile_choice=Some(Fixnum)"
     )), "sparse monomorphic samples must report the actual worker choice");
     assert!(
         !read_log().contains(&success),

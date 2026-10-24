@@ -14,7 +14,7 @@ fn arithmetic(opcode: Opcode, slots: [u32; 3], memory: bool) -> egcl_rt::jit::Ji
     }
     if memory {
         let start = a.here();
-        emit_stack_float(&mut a, opcode, slots);
+        emit_stack_float(&mut a, opcode, slots, false);
         assert_eq!(
             a.here() - start,
             27,

@@ -1065,7 +1065,7 @@ fn store_home(a: &mut Asm, home: FramedHome, src: u8, rsp_adjust: i32) {
 
 /// Keep raw results in their authoritative homes before the next IR boundary.
 /// Both operands are read before the store, including when homes overlap.
-fn emit_stack_float(a: &mut Asm, opcode: crate::t2::ir::Opcode, slots: [u32; 3]) {
+fn emit_stack_float(a: &mut Asm, opcode: crate::t2::ir::Opcode, slots: [u32; 3], zero_fixup: bool) {
     use crate::t2::ir::Opcode;
     let arithmetic = match opcode {
         Opcode::FloatAdd => 0x58,
@@ -1073,6 +1073,11 @@ fn emit_stack_float(a: &mut Asm, opcode: crate::t2::ir::Opcode, slots: [u32; 3])
         _ => unreachable!("stack float emission requires add or multiply"),
     };
     for (operation, slot) in [0x10, arithmetic, 0x11].into_iter().zip(slots) {
+        if operation == 0x11 && zero_fixup {
+            // See `raw_add_needs_zero_fixup`: a -0.0 sum becomes +0.0.
+            a.extend_from_slice(&[0x66, 0x0f, 0x57, 0xc9]); // xorpd xmm1, xmm1
+            a.extend_from_slice(&[0xf2, 0x0f, 0x58, 0xc1]); // addsd xmm0, xmm1
+        }
         // MOVSD XMM0,[RSP+disp32]; ADDSD/MULSD XMM0,[RSP+disp32];
         // MOVSD [RSP+disp32],XMM0. No XMM value survives this instruction.
         a.extend_from_slice(&[0xf2, 0x0f, operation, 0x84, 0x24]);
@@ -6523,8 +6528,7 @@ fn emit_framed_inner(
             }
             let wide_call = d.opcode == Opcode::Call && d.args.len() > 3;
             let stack_float = if published_native_roots && native_call_storage
-                && (d.opcode == Opcode::FloatMul
-                    || (d.opcode == Opcode::FloatAdd && !raw_add_needs_zero_fixup(f, &d.args)))
+                && matches!(d.opcode, Opcode::FloatAdd | Opcode::FloatMul)
                 && d.args.len() == 2 && d.results.len() == 1
                 && d.args.iter().chain(&d.results).all(|&value|
                     f.value(value).repr == ValueRepresentation::UnboxedF64)
@@ -6554,7 +6558,8 @@ fn emit_framed_inner(
             let mut inst_calls = Vec::new();
             let mut inst_pool = Vec::new();
             if let Some(slots) = stack_float {
-                emit_stack_float(&mut a, d.opcode, slots);
+                emit_stack_float(&mut a, d.opcode, slots,
+                    d.opcode == Opcode::FloatAdd && raw_add_needs_zero_fixup(f, &d.args));
             } else if ordinary_call_mode && d.opcode == Opcode::Call {
                 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
                 { inst_calls = ordinary_call.unwrap().for_inst(inst).emit(&mut a, &d, &homes, &const_tagged,
