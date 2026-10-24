@@ -393,7 +393,7 @@
   memory. Its OS thread and stacks are now released when another thread starts
   or finishes. `join-thread` still returns its values once, and
   `thread-name` still answers until then
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#595](https://github.com/atgreen/evergreen/pull/595)).
 - Iterating the symbols of a package that does not exist, with `loop` or
   `with-package-iterator`, signals `package-error` instead of iterating
   nothing ([#589](https://github.com/atgreen/evergreen/pull/589)).
