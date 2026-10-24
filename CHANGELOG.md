@@ -94,7 +94,7 @@
   clears every byte of the reclaimed space during the pause; the space is
   cleared as it is handed out again. On x86-64 Linux a loop that allocates
   heavily but keeps nothing alive pauses about 7 ms per collection instead of
-  about 48 ms ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  about 48 ms ([#605](https://github.com/atgreen/evergreen/pull/605)).
 - `funcall` and `apply` of a function object whose optimized native code is
   already installed run that code directly, instead of working out again on
   every call how to call the object. On x86-64 Linux, a warmed loop of
