@@ -386,6 +386,14 @@
   class precedence list, and a structure constructor no longer recomputes
   its class's precedence list on each call
   ([#593](https://github.com/atgreen/evergreen/pull/593)).
+- A thread made with `egcl-thread:make-thread` that finishes without being
+  joined no longer keeps its memory. Each kept its OS thread stack, Lisp
+  stack and thread-local storage, about 90 KB of RSS, until a join that a
+  thread-per-connection server never makes, so such a server ran out of
+  memory. Its OS thread and stacks are now released when another thread starts
+  or finishes. `join-thread` still returns its values once, and
+  `thread-name` still answers until then
+  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
 - Iterating the symbols of a package that does not exist, with `loop` or
   `with-package-iterator`, signals `package-error` instead of iterating
   nothing ([#589](https://github.com/atgreen/evergreen/pull/589)).

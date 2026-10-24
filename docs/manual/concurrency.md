@@ -33,6 +33,10 @@ Timeouts are non-negative real seconds. Omitted or `nil` means no deadline.
 An invalid timeout signals a type error. Do not depend on repeated joins
 returning the same result; consume the worker's result once.
 
+A worker need not be joined. Once it finishes, its operating-system thread
+and stacks are released when another thread starts or finishes; only its
+name and its result remain until a join consumes them.
+
 ```lisp
 (let ((worker (egcl-thread:make-thread (lambda () (+ 20 22))
                                         :name "answer")))
