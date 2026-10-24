@@ -139,6 +139,18 @@ const F1: a64::Fpr = 1;
 /// recovery epilogue, which must be able to unwind either tier.
 const SAVE_BYTES: i32 = a64::JIT_SAVE_BYTES;
 
+/// Arguments a register entry accepts, one per ABI argument register its
+/// prologue moves home.
+///
+/// AAPCS64 passes the first eight in x0-x7, and none of x0-x3 is ever a value
+/// home here (the pool is x19-x27), so four would be reachable. Three is the
+/// count because `direct_self_call` needs one of them, x3, to hold the stack
+/// pointer for its limit compare. Raising this means finding that compare
+/// another scratch -- x17 is free -- and is a separate change. System Z
+/// carries four for the same reason it can: r2-r5 are volatile there and its
+/// self-call has r1 to work in.
+const REGISTER_ENTRY_ARGS_MAX: usize = 3;
+
 /// C-ABI runtime adapters used by optimized code, as the System Z emitter defines
 /// them. Re-exported rather than redefined so one call site fills both.
 pub use super::emit_s390x::RuntimeCalls;
@@ -173,6 +185,15 @@ struct Emitter<'a> {
     edge_base: i32,
     deopt_base: i32,
     remat_base: i32,
+    /// Where a register-entry body stages a call's arguments. It owns no
+    /// activation, so it cannot stage them there.
+    self_args_base: i32,
+    /// Frame word holding this code's identity, read by every deopt stub.
+    /// Bit 63 marks an activation entered through the register entry, which
+    /// owns no `EgclStack` frame, so a deopt must push one (bliss-w6aki).
+    entry_kind_offset: i32,
+    /// The register entry, when this function qualifies for direct self-calls.
+    reg_entry: Option<egcl_rt::asm::Label>,
     runtime: RuntimeCalls,
     activation_slots: u16,
     root_slots: u16,
@@ -365,6 +386,20 @@ impl Emitter<'_> {
     // ── frame ────────────────────────────────────────────────────
 
     fn prologue(&mut self) -> Result<(), EmitError> {
+        self.prologue_without_activation()?;
+        // The first argument is the frame-slots pointer, and it must survive the
+        // whole body, so it moves out of the working registers immediately.
+        self.mov(SLOTS, W0);
+        Ok(())
+    }
+
+    /// The frame, without claiming an activation.
+    ///
+    /// The register entry shares every word of the ordinary prologue but this
+    /// last move: x0 is its first ARGUMENT, and x28 keeps pointing at the
+    /// caller's activation, which such a body never touches. Keeping one
+    /// frame layout is what lets the single epilogue return from either entry.
+    fn prologue_without_activation(&mut self) -> Result<(), EmitError> {
         // One save area holding the frame record and every register the pool may
         // hand out, so the epilogue can restore the stack pointer from x29 alone
         // rather than trusting the body to have left it balanced.
@@ -377,11 +412,7 @@ impl Emitter<'_> {
             );
         }
         let frame = self.frame_bytes;
-        self.adjust_stack(frame, true)?;
-        // The first argument is the frame-slots pointer, and it must survive the
-        // whole body, so it moves out of the working registers immediately.
-        self.mov(SLOTS, W0);
-        Ok(())
+        self.adjust_stack(frame, true)
     }
 
     fn epilogue(&mut self) -> Result<(), EmitError> {
@@ -811,12 +842,112 @@ impl Emitter<'_> {
         Ok(())
     }
 
+    /// A call to this very function, entered through the register entry.
+    ///
+    /// This is the whole point of the register entry: a self-call moves its
+    /// arguments into x0-x2 and branches to a label in this same buffer,
+    /// skipping the generic dispatch that otherwise costs far more than the
+    /// body it surrounds.
+    ///
+    /// The published native stack limit is compared first. Once the stack
+    /// runs low the ordinary `call_slice` path is taken instead, whose
+    /// adapter enforces the native depth cap and raises a catchable
+    /// STORAGE-CONDITION -- so recursion that outruns the stack still
+    /// signals rather than faulting. A zero limit (never published) compares
+    /// false, leaving the guard inert.
+    fn direct_self_call(&mut self, data: &InstData) -> Result<(), EmitError> {
+        let reg_entry = self.reg_entry.ok_or(unsupported!())?;
+        let AuxData::CallTarget(symbol) = data.aux else {
+            return Err(unsupported!());
+        };
+        if data.args.len() > REGISTER_ENTRY_ARGS_MAX {
+            return Err(unsupported!());
+        }
+        let slow = self.asm.label();
+        let join = self.asm.label();
+        // A self-call with the WRONG argument count must reach the generic
+        // adapter, which raises PROGRAM-ERROR: the register entry would
+        // instead bind whatever happens to be in x0-x2 (bliss-w6aki). Only
+        // the slow path is emitted for it.
+        let arity_matches =
+            data.args.len() == self.function.block(self.function.entry()).params.len();
+        if arity_matches {
+            self.imm(ADDR, egcl_rt::stack::native_stack_limit_addr());
+            self.load_at(ADDR, ADDR, 0)?;
+            // Stack addresses are canonical and positive, so a signed compare
+            // is right. At or below the limit takes the slow path.
+            // T1 is x3, past the three argument registers this entry uses,
+            // so it is free here -- the arguments are loaded below.
+            self.asm.word(a64::mov_from_sp(T1));
+            self.compare(T1, ADDR);
+            self.asm.jcc(Cc::Le, slow);
+            // Fast path: the arguments in x0-x2. Those are the emitter's own
+            // working registers, never an allocated home, so loading them in
+            // order cannot clobber a later argument's source.
+            for (index, &argument) in data.args.iter().enumerate() {
+                self.load(argument, index as a64::Reg)?;
+            }
+            self.asm.call(reg_entry);
+            self.asm.jmp(join);
+        }
+        // Slow path: generic dispatch through the slice adapter, arguments
+        // staged in this frame. Eligibility proved no live tagged heap value
+        // crosses a call here, so nothing needs a shadow root.
+        self.asm.bind(slow);
+        let self_args_base = self.self_args_base;
+        for (index, &argument) in data.args.iter().enumerate() {
+            self.load(argument, W0)?;
+            self.store_at(W0, a64::SP, self_args_base + index as i32 * 8)?;
+        }
+        self.imm(W0, u64::from(symbol));
+        self.imm(W1, data.args.len() as u64);
+        self.address(T0, a64::SP, self_args_base)?;
+        self.imm(T1, 0);
+        let offset = self.asm.here();
+        self.imm(ADDR, self.runtime.call_slice);
+        self.call_register(ADDR);
+        self.asm.bind(join);
+        // Either path can leave a pending transfer -- a deopt, or an error
+        // raised inside the callee -- so propagate it exactly as
+        // `runtime_call` does.
+        let result_offset = self.result_offset;
+        self.store_at(W0, a64::SP, result_offset)?;
+        if self.runtime.transfer_pending != 0 {
+            self.imm(ADDR, self.runtime.transfer_pending);
+            self.call_register(ADDR);
+            self.compare_imm(W0, 0);
+            let exit = *self.transfer_exit.get_or_insert_with(|| self.asm.label());
+            self.asm.jcc(Cc::Ne, exit);
+        }
+        if let Some(&result) = data.results.first() {
+            self.load_at(W0, a64::SP, result_offset)?;
+            self.store(result, W0)?;
+        }
+        // The slow path is a runtime call like any other, and the collector
+        // must find the same (empty) root set there.
+        self.root_sites.push(RootSyncSite {
+            code_offset: u32::try_from(offset).map_err(|_| unsupported!())?,
+            live_roots: 0,
+            register_roots: 0,
+            spill_roots: 0,
+        });
+        Ok(())
+    }
+
     fn instruction(&mut self, instruction: Inst, data: &InstData) -> Result<(), EmitError> {
         use Opcode::*;
         if self.polls.contains(&instruction) {
             // Every selected backward-edge terminator reaches the existing
             // root-synchronizing poll before its edge moves.
             self.runtime_call(instruction, None)?;
+        }
+        // A call to this very function skips generic dispatch and branches to
+        // the register entry, when this body has one.
+        if data.opcode == Opcode::Call
+            && self.reg_entry.is_some()
+            && super::register_entry::is_self_call(data, self.runtime.self_sym)
+        {
+            return self.direct_self_call(data);
         }
         if calls_runtime(data.opcode) {
             return self.runtime_call(instruction, Some(data));
@@ -1221,13 +1352,18 @@ impl Emitter<'_> {
                 words += 1;
             }
         }
-        // The T0 resume adapter's ABI: scope count, total words, the buffer, and a
-        // reserved zero. It must root the stream before it allocates.
+        // The T0 resume adapter's ABI: scope count, total words, the buffer,
+        // and the entry-kind word. That last was a reserved zero until the
+        // register entry existed; it now carries this code's identity, with
+        // bit 63 set when the activation came in through the register entry
+        // and so owns no EgclStack frame for the resume to land in
+        // (bliss-w6aki). The frame word is written by whichever prologue ran.
         self.imm(W0, scopes.len() as u64);
         self.imm(W1, words as u64);
         let deopt_base = self.deopt_base;
         self.address(T0, a64::SP, deopt_base)?;
-        self.imm(T1, 0);
+        let entry_kind = self.entry_kind_offset;
+        self.load_at(T1, a64::SP, entry_kind)?;
         self.imm(ADDR, callback);
         self.call_register(ADDR);
         self.imm(W0, NIL.0);
@@ -1305,6 +1441,9 @@ pub fn emit_framed_with_runtime(
         edge_base: 0,
         deopt_base: 0,
         remat_base: 0,
+        self_args_base: 0,
+        entry_kind_offset: 0,
+        reg_entry: None,
         runtime,
         activation_slots,
         root_slots: 0,
@@ -1388,17 +1527,8 @@ pub fn emit_framed_with_runtime(
     // function's roots vanish entirely -- the precondition for a register
     // entry and a direct self-call here, as it was on System Z.
     let inference = super::infer::infer(function);
-    let proven_immediate = |value: Value| -> bool {
-        const IMMEDIATE: TypeBits = TypeBits(
-            TypeBits::FIXNUM.0
-                | TypeBits::SINGLE_FLOAT.0
-                | TypeBits::CHARACTER.0
-                | TypeBits::SYMBOL.0
-                | TypeBits::NULL.0,
-        );
-        let bits = inference.ty(value).bits;
-        !bits.is_bottom() && bits.meet(IMMEDIATE) == bits
-    };
+    let proven_immediate =
+        |value: Value| super::register_entry::proven_immediate(&inference, value);
 
     // The same precise regalloc2 ranges that chose homes determine the live roots
     // at each runtime call. Include dying arguments, and exclude results that do
@@ -1412,6 +1542,18 @@ pub fn emit_framed_with_runtime(
         }
         let after = u32::try_from(index).map_err(|_| unsupported!())? * 2 + 1;
         let data = function.inst(source);
+        // A value this instruction DEFINES does not exist until the callback
+        // returns, so it is not a root at the call -- the comment above has
+        // always said so, but the filter was missing, and regalloc2 reports a
+        // result's range as live from this very point. Rooting it cost two
+        // shadow slots on every self-recursive function, which is exactly the
+        // `root_slots == 0` that a register entry needs, so no such function
+        // could ever get one. System Z excludes defs here for the same reason.
+        let defines = |value: &Value| {
+            inst.defs
+                .iter()
+                .any(|def| def.class == RegClass::Gpr && def.num == value.0)
+        };
         let mut roots: Vec<Value> = machine
             .value_locations
             .iter()
@@ -1425,6 +1567,7 @@ pub fn emit_framed_with_runtime(
                     .iter()
                     .flat_map(|target| target.args.iter().copied()),
             )
+            .filter(|value| !defines(value))
             .filter(|value| emitter.homes.contains_key(value))
             .filter(|value| !proven_immediate(*value))
             .collect();
@@ -1487,6 +1630,33 @@ pub fn emit_framed_with_runtime(
             .unwrap_or(0),
     )
     .map_err(|_| unsupported!())?;
+    // Who may carry a register entry is shared IR analysis (register_entry.rs),
+    // so this port supplies only the machine half: a second prologue whose
+    // arguments arrive in x0-x2, and the direct self-call that branches to it.
+    let entry_params = &function.block(function.entry()).params;
+    let plan = super::register_entry::plan(&super::register_entry::RegisterEntryQuery {
+        function,
+        entry_params,
+        self_sym: emitter.runtime.self_sym,
+        call_slice_rooted: emitter.runtime.call_slice_rooted,
+        root_slots: emitter.root_slots,
+        args_max: REGISTER_ENTRY_ARGS_MAX,
+        call_args_max: super::emit_s390x::CALL_ARGS_MAX,
+        // This emitter has no in-frame staging yet, so an eligible body
+        // here is one whose only calls are to itself.
+        stages_other_calls_in_frame: false,
+    });
+    let has_reg_entry = plan.eligible;
+    if has_reg_entry {
+        // Such a body stages every call in its own frame instead, so it needs
+        // no argument shadow slots in an activation it does not own.
+        emitter.argument_slots = 0;
+    }
+    let self_args_words = if has_reg_entry {
+        REGISTER_ENTRY_ARGS_MAX.max(plan.other_call_words)
+    } else {
+        0
+    };
     let shadow_root_slots = emitter
         .root_slots
         .checked_add(emitter.argument_slots)
@@ -1519,9 +1689,17 @@ pub fn emit_framed_with_runtime(
         .map(|(_, state)| state.remat.len())
         .max()
         .unwrap_or(0);
-    // One extra word holds the call result. Round to a pair
+    // One word holds the call result and one the entry kind. Round to a pair
     // so the stack pointer stays 16-byte aligned, which AAPCS64 requires at a call.
-    let frame_words = (spill_slots as usize + edge_words + deopt_words + remat_words + 1 + 1) & !1;
+    let frame_words = (spill_slots as usize
+        + edge_words
+        + deopt_words
+        + remat_words
+        + self_args_words
+        + 1
+        + 1
+        + 1)
+        & !1;
     // Every frame access must remain reachable; beyond this the emitter would be
     // materialising an address for each one.
     if frame_words > 0x1000 {
@@ -1531,17 +1709,47 @@ pub fn emit_framed_with_runtime(
     emitter.edge_base = spill_slots as i32 * 8;
     emitter.deopt_base = emitter.edge_base + edge_words as i32 * 8;
     emitter.remat_base = emitter.deopt_base + deopt_words as i32 * 8;
+    emitter.self_args_base = emitter.remat_base + remat_words as i32 * 8;
+    emitter.entry_kind_offset = (frame_words as i32 - 2) * 8;
     emitter.result_offset = (frame_words as i32 - 1) * 8;
     if function.block(function.entry()).params.len() > activation_slots as usize {
         return Err(unsupported!());
     }
 
     emitter.prologue()?;
+    // This activation owns its EgclStack frame, so the entry kind is the bare
+    // identity. Written after the prologue, which has just claimed the frame.
+    let code_id = emitter.runtime.code_id;
+    let entry_kind = emitter.entry_kind_offset;
+    emitter.imm(W0, code_id);
+    emitter.store_at(W0, a64::SP, entry_kind)?;
     for (index, &parameter) in function.block(function.entry()).params.iter().enumerate() {
         emitter.load_at(W0, SLOTS, index as i32 * 8)?;
         emitter.store(parameter, W0)?;
     }
     emitter.asm.jmp(emitter.blocks[&function.entry()]);
+
+    // The register entry's offset, published as FramedCode::compiled_entry so
+    // the install log and its tests can see it (0 = no register entry).
+    let mut compiled_entry = 0;
+    if has_reg_entry {
+        // Register entry: the same frame, but the arguments arrive in x0-x2
+        // and x28 stays the CALLER's activation pointer -- this body never
+        // touches it. Move the arguments home before the entry-kind write,
+        // which needs a working register.
+        let label = emitter.asm.label();
+        emitter.asm.bind(label);
+        emitter.reg_entry = Some(label);
+        compiled_entry = emitter.asm.here();
+        emitter.prologue_without_activation()?;
+        for (index, &parameter) in entry_params.iter().enumerate() {
+            emitter.store(parameter, index as a64::Reg)?;
+        }
+        // No frame of its own: a deopt taken here must push one.
+        emitter.imm(W0, code_id | (1 << 63));
+        emitter.store_at(W0, a64::SP, entry_kind)?;
+        emitter.asm.jmp(emitter.blocks[&function.entry()]);
+    }
 
     let mut bcp_offsets = Vec::new();
     for &block in function.block_order() {
@@ -1653,7 +1861,7 @@ pub fn emit_framed_with_runtime(
         #[cfg(all(target_arch = "x86_64", windows))]
         windows_unwind: Vec::new(),
         code: emitter.asm.finish().ok_or(EmitError::BadBranch)?,
-        compiled_entry: 0,
+        compiled_entry,
         osr_entries,
         bcp_offsets,
         native_spill_slots: frame_words as u32,
