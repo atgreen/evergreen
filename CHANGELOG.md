@@ -126,6 +126,23 @@
   definition of a named function, now enters that function directly too:
   `(funcall #'f s 1)` in a loop drops from about 660 ns to 19 ns
   ([#624](https://github.com/atgreen/evergreen/pull/624)).
+- On x86-64 Linux, optimized double-float code no longer falls back to
+  generic arithmetic when it combines a declared fixnum with a double-float
+  under `(safety 0)`, as in `(* i 1d-3)`; the fixnum is converted to the
+  nearest double, as before. `+`, `-` and `*` of three or more double-floats
+  now also compute on unboxed doubles. GH #594's `step-plain` driver, which
+  does both, drops from about 2.4 µs to 0.14 µs per call
+  ([#627](https://github.com/atgreen/evergreen/pull/627)).
+- On x86-64 Linux, optimized code computes `sqrt`, unary `-` and `/` of
+  double-floats natively on unboxed doubles instead of calling the builtin.
+  The answers are unchanged: `sqrt` of a negative double still returns a
+  complex, `(sqrt -0d0)` and `(- 0d0)` are still `-0.0d0`, and dividing by
+  zero still signals `division-by-zero`. Over 10M iterations, a loop adding
+  `(sqrt (* x x))` drops from about 5.1 s to 0.09 s, one adding `(/ x 3d0)`
+  from 3.7 s to 0.085 s, and one negating its sum from 4.2 s to 0.09 s.
+  GH #594's `step-sqrt` driver drops from about 0.49 µs to 0.16 µs per call
+  (2.7 µs before the previous change)
+  ([#627](https://github.com/atgreen/evergreen/pull/627)).
 - More than 50 builtins called from compiled code no longer rebuild and
   re-evaluate their call form each time. They include `evenp`, `oddp`, `/`,
   `member` and `assoc` with `:test` or `:key`, `mapcar`, `map`, `format`,

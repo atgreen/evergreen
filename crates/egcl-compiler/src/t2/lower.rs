@@ -163,6 +163,8 @@ pub mod op {
     pub const FSUB: u32 = 0x0031;
     pub const FMUL: u32 = 0x0032;
     pub const FDIV: u32 = 0x0033;
+    pub const FSQRT: u32 = 0x0034;
+    pub const FNEG: u32 = 0x0035;
 
     // ── 0x40 tag manipulation (box / unbox) ──────────────────────────
     /// Box an unboxed fixnum into a tagged value (shift+tag) — modelled as one op.
@@ -648,6 +650,8 @@ fn lower_inst(lo: &mut Lowering, inst: Inst) {
         FloatSub => bin!(op::FSUB),
         FloatMul => bin!(op::FMUL),
         FloatDiv => bin!(op::FDIV),
+        FloatSqrt => un!(op::FSQRT),
+        FloatNeg => un!(op::FNEG),
 
         // ── logic ──
         LogAnd => bin!(op::AND),

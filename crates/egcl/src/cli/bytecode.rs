@@ -17565,7 +17565,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                 if registered_callee.is_some() {
                     record_call_site(func_ptr, call_bcp);
                 }
-                if is_arith_speculatable(sym) {
+                if is_arith_speculatable(sym) || is_double_profiled_builtin(sym) {
                     record_type_profile(func_ptr, call_bcp, args);
                 }
 
@@ -24935,6 +24935,18 @@ fn memoized_by_sym<T: Copy>(
     value
 }
 
+/// `SQRT` and `/` record operand types only so T2 can compile a double site
+/// raw (bliss-lhy89). They have no fixnum fast path, so they stay out of
+/// `is_arith_speculatable` and the cold-guess bookkeeping that goes with it.
+fn is_double_profiled_builtin(sym: u32) -> bool {
+    memoized_by_sym(&DOUBLE_PROFILED_MEMO, sym, |sym| {
+        matches!(egcl_rt::symbols::symbol_name(sym).as_deref(), Some("SQRT" | "/"))
+    })
+}
+
+static DOUBLE_PROFILED_MEMO: egcl_rt::execution_local::ExecutionLocal<RefCell<Vec<Option<bool>>>> =
+    unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| const { RefCell::new(Vec::new()) }) };
+
 static FIXNUM_OP_MEMO: egcl_rt::execution_local::ExecutionLocal<
     RefCell<Vec<Option<Option<FixnumOp>>>>,
 > = unsafe {
@@ -25963,7 +25975,9 @@ fn t2_numeric_speculations(
                 // A raw double site deopts through its operand unboxing and,
                 // for a comparison, its NaN check (bliss-thcbb).
                 UnboxFloat => SpecType::DoubleFloat,
-                FloatCmpEq | FloatCmpLt | FloatCmpLe | FloatCmpGt | FloatCmpGe
+                // Raw sqrt and division deopt on a negative operand or a zero
+                // divisor; failing either declines the site (bliss-lhy89).
+                FloatSqrt | FloatDiv | FloatCmpEq | FloatCmpLt | FloatCmpLe | FloatCmpGt | FloatCmpGe
                     if data.args.iter().any(|&value| {
                         f.value(value).repr
                             == egcl_compiler::t2::ir::ValueRepresentation::UnboxedF64

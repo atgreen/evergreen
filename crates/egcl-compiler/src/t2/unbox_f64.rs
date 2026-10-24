@@ -552,7 +552,8 @@ pub fn raw_operation_and_call_counts(f: &Function) -> (usize, usize) {
         for &inst in &f.block(block).insts {
             let data = f.inst(inst);
             match data.opcode {
-                Opcode::FloatAdd | Opcode::FloatSub | Opcode::FloatMul | Opcode::FloatCmpEq
+                Opcode::FloatAdd | Opcode::FloatSub | Opcode::FloatMul | Opcode::FloatDiv
+                | Opcode::FloatSqrt | Opcode::FloatNeg | Opcode::FloatCmpEq
                 | Opcode::FloatCmpLt | Opcode::FloatCmpLe | Opcode::FloatCmpGt
                 | Opcode::FloatCmpGe
                     if data.args.iter().any(|&value| f.value(value).repr == Repr::UnboxedF64) =>

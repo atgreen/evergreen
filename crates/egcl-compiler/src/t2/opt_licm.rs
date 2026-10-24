@@ -284,6 +284,7 @@ fn opcode_hoist_safe(op: Opcode) -> bool {
             | FloatSub
             | FloatMul
             | FloatDiv
+            | FloatNeg
             | GenericAdd
             | GenericSub
             | GenericMul

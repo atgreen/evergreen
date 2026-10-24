@@ -3066,6 +3066,58 @@ fn raw_add_needs_zero_fixup(f: &Function, args: &[crate::t2::ir::Value]) -> bool
     })
 }
 
+/// Emit raw double `FloatSqrt`, `FloatNeg` or `FloatDiv` on GPR homes
+/// (bliss-lhy89). Negation flips the sign bit, as the interpreter's `(- x)`
+/// does (`(- 0d0)` is `-0d0`). Square root deopts on an ordered negative
+/// operand, whose root is a complex; NaN, infinities and -0.0 match the
+/// interpreter's `f64::sqrt` bit for bit. Division deopts on a zero divisor
+/// of either sign (the interpreter signals DIVISION-BY-ZERO); a NaN divisor
+/// divides, as the interpreter does, and overflow is IEEE infinity there too.
+fn emit_raw_double_unary_or_div(
+    a: &mut Asm,
+    data: &crate::t2::ir::InstData,
+    reg: &std::collections::HashMap<crate::t2::ir::Value, u8>,
+    deopt: Option<egcl_rt::asm::Label>,
+) -> Result<(), EmitError> {
+    use crate::t2::ir::Opcode;
+    let result = *data.results.first().ok_or(EmitError::UnsupportedOp(0xF2))?;
+    let dst = *reg.get(&result).ok_or(EmitError::UnsupportedOp(0xF2))?;
+    let mut sources = Vec::with_capacity(data.args.len());
+    for value in &data.args {
+        sources.push(*reg.get(value).ok_or(EmitError::UnsupportedOp(0xF2))?);
+    }
+    if data.opcode == Opcode::FloatNeg {
+        let [source] = sources[..] else { return Err(EmitError::UnsupportedOp(op_tag(data.opcode))) };
+        mov_rr(a, dst, source);
+        // btc dst, 63
+        a.extend_from_slice(&[rex_w(0, dst), 0x0F, 0xBA, 0xF8 | (dst & 7), 63]);
+        return Ok(());
+    }
+    let deopt = deopt.ok_or(EmitError::UnsupportedOp(op_tag(data.opcode)))?;
+    for (xmm, &source) in sources.iter().enumerate() {
+        // movq xmm, r64
+        a.extend_from_slice(&[0x66, rex_w(xmm as u8, source), 0x0f, 0x6e, modrm_rr(xmm as u8, source)]);
+    }
+    let checked = sources.len() - 1; // the operand or the divisor
+    a.extend_from_slice(&[0x66, 0x0F, 0x57, 0xD2]); // xorpd xmm2, xmm2
+    a.extend_from_slice(&[0x66, 0x0F, 0x2E, modrm_rr(checked as u8, 2)]); // ucomisd xmm, xmm2
+    // Deopt only on an ORDERED negative operand or zero divisor: a NaN
+    // computes NaN, as in the interpreter. RAX and RDX are scratch here.
+    let (setcc, op, modrm) = match data.opcode {
+        Opcode::FloatSqrt => (0x92, 0x51, 0xC0), // setb al; sqrtsd xmm0, xmm0
+        Opcode::FloatDiv => (0x94, 0x5E, 0xC1),  // sete al; divsd xmm0, xmm1
+        other => return Err(EmitError::UnsupportedOp(op_tag(other))),
+    };
+    a.extend_from_slice(&[0x0F, setcc, 0xC0]); // set<cc> al
+    a.extend_from_slice(&[0x0F, 0x9B, 0xC2]); // setnp dl
+    a.extend_from_slice(&[0x84, 0xD0]); // test al, dl
+    a.jcc(Cc::Ne, deopt);
+    a.extend_from_slice(&[0xF2, 0x0F, op, modrm]);
+    // movq dst, xmm0
+    a.extend_from_slice(&[0x66, rex_w(0, dst), 0x0f, 0x7e, modrm_rr(0, dst)]);
+    Ok(())
+}
+
 /// Is `op` a typed single-float comparison?
 fn is_float_cmp(op: crate::t2::ir::Opcode) -> bool {
     use crate::t2::ir::Opcode::*;
@@ -4763,6 +4815,27 @@ fn native_representations_supported(
                 }
                 continue;
             }
+            // Raw sqrt, negation and division (bliss-lhy89). Sqrt and divide
+            // deopt (negative operand, zero divisor) with their own state.
+            if matches!(data.opcode, Opcode::FloatSqrt | Opcode::FloatNeg | Opcode::FloatDiv) {
+                let arity = if data.opcode == Opcode::FloatDiv { 2 } else { 1 };
+                let guarded = data.opcode != Opcode::FloatNeg;
+                let flags = if guarded {
+                    crate::t2::ir::InstFlags { guard: true, effectful: true,
+                        ..crate::t2::ir::InstFlags::default() }
+                } else {
+                    crate::t2::ir::InstFlags::default()
+                };
+                if data.args.len() != arity || data.results.len() != 1
+                    || data.args.iter().chain(&data.results).any(|&value|
+                        f.value(value).repr != Repr::UnboxedF64
+                            || f.value(value).ty.bits != TypeBits::DOUBLE_FLOAT)
+                    || data.flags != flags || data.frame_state.is_some() != guarded
+                {
+                    return raw_reject(f, "raw double sqrt, negation or division shape");
+                }
+                continue;
+            }
             // Raw double constants, comparisons and escape boxes (bliss-thcbb).
             if data.opcode == Opcode::ConstDouble {
                 if !data.args.is_empty() || data.results.len() != 1
@@ -4862,7 +4935,8 @@ fn emit_transfer_function_with_storage(
             let data = f.inst(inst);
             if matches!(data.opcode, Opcode::UnboxFloat | Opcode::PackedF64Ref | Opcode::PackedF64Set
                 | Opcode::ConstDouble | Opcode::BoxFloat)
-                || (matches!(data.opcode, Opcode::FloatAdd | Opcode::FloatSub | Opcode::FloatMul)
+                || (matches!(data.opcode, Opcode::FloatAdd | Opcode::FloatSub | Opcode::FloatMul
+                    | Opcode::FloatDiv | Opcode::FloatSqrt | Opcode::FloatNeg)
                     && data.results.len() == 1
                     && f.value(data.results[0]).repr == crate::t2::ir::ValueRepresentation::UnboxedF64)
                 || (is_float_cmp(data.opcode) && data.args.iter().any(|&value|
@@ -6157,7 +6231,8 @@ fn emit_framed_inner(
                 {
                     continue;
                 }
-                if (matches!(d.opcode, Opcode::FloatAdd | Opcode::FloatSub | Opcode::FloatMul)
+                if (matches!(d.opcode, Opcode::FloatAdd | Opcode::FloatSub | Opcode::FloatMul
+                    | Opcode::FloatNeg)
                     && d.results.len() == 1
                     && f.value(d.results[0]).repr == ValueRepresentation::UnboxedF64)
                     || matches!(d.opcode, Opcode::ConstDouble | Opcode::BoxFloat)
@@ -7079,6 +7154,14 @@ fn emit_framed_inner(
                     store_mem64_disp(&mut a, SCRATCH, egcl_rt::packed_f64::DATA_OFFSET as i32,
                         inst_reg[&d.args[2]]);
                 }
+            } else if matches!(d.opcode, Opcode::FloatSqrt | Opcode::FloatNeg | Opcode::FloatDiv)
+                && d.results.first().is_some_and(|&value|
+                    f.value(value).repr == ValueRepresentation::UnboxedF64)
+            {
+                if !published_native_roots || !native_call_storage {
+                    return Err(EmitError::UnsupportedOp(op_tag(d.opcode)));
+                }
+                emit_raw_double_unary_or_div(&mut a, &d, &inst_reg, inst_deopt.get(&inst).copied())?;
             } else if matches!(d.opcode, Opcode::FloatAdd | Opcode::FloatSub | Opcode::FloatMul)
                 && d.results.first().is_some_and(|&value|
                     f.value(value).repr == ValueRepresentation::UnboxedF64)
