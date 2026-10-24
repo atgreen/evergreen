@@ -93,6 +93,10 @@ pub mod opt_guard; // guard elimination + hoisting
 pub mod opt_gvn; // global value numbering / CSE
 pub mod opt_licm; // loop-invariant code motion
 pub mod regalloc; // regalloc2 adapter + stack maps
+// Shared by the framed backends: who may carry a register entry, and which
+// values need a shadow root. Pure IR analysis, so every port reads one
+// answer instead of re-deriving the contract.
+pub mod register_entry;
 pub mod speculate; // profile-guided single-type speculative lowering
 mod string_char; // inline CHAR/SCHAR/ELT fast path on simple strings
 
