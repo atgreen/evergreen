@@ -88,6 +88,19 @@
 
 ### Performance
 
+- More than 50 builtins called from compiled code no longer rebuild and
+  re-evaluate their call form each time. They include `evenp`, `oddp`, `/`,
+  `member` and `assoc` with `:test` or `:key`, `mapcar`, `map`, `format`,
+  `type-of`, `boundp`, `string=`, `make-hash-table`, `find-class`, `random`,
+  `concatenate`, `float`, `sqrt` and the other transcendental functions, and the
+  array, pathname and file predicates and accessors. A `:test`, `:key` or mapped
+  function that is a builtin, such as `#'equal` or `#'1+`, is called directly.
+  On x86-64 Linux, `(oddp e)` in a compiled loop drops from about 14 µs to
+  0.6 µs, so `(count-if #'oddp list)` costs about 2.9 µs per element instead
+  of 28 µs. `type-of`, `boundp` and `string=` drop from 19–26 µs to about
+  4.5 µs a call, `member` and `assoc` with `:test` from about 30 µs to 7 µs,
+  and `mapcar` and `format nil` from about 32 µs to 14 µs
+  ([#618](https://github.com/atgreen/evergreen/pull/618)).
 - `(require :asdf)` takes about half as long: 6.4 s instead of 11.8 s on an
   x86-64 Linux release build, which shortens every start whose `~/.egclrc`
   loads ASDF. UIOP's `define-package` spent most of that time in symbol and
