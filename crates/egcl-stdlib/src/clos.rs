@@ -3885,9 +3885,23 @@ pub fn compute_applicable_methods(generic_function: EgclVal, args: &[EgclVal]) -
 /// these would invoke each primary method and combine results via
 /// the operator (e.g., `+` for Plus, `and` for And).
 pub fn compute_effective_method(
+    generic_function: EgclVal,
+    combination: MethodCombinationType,
+    methods: &[EgclVal],
+) -> Result<EgclVal, EgclError> {
+    compute_effective_method_with_standard_primary(generic_function, combination, methods, false)
+}
+
+/// [`compute_effective_method`] for a generic function that has a standard
+/// primary method of its own outside `methods` when `standard_primary` is
+/// true: the caller runs that method after the last primary in `methods`, so a
+/// standard combination whose applicable methods are all auxiliary is not an
+/// error (CLHS 7.6.6.2).
+pub fn compute_effective_method_with_standard_primary(
     _generic_function: EgclVal,
     combination: MethodCombinationType,
     methods: &[EgclVal],
+    standard_primary: bool,
 ) -> Result<EgclVal, EgclError> {
     if methods.is_empty() {
         return Err(EgclError::Internal(
@@ -3947,7 +3961,7 @@ pub fn compute_effective_method(
                 ));
             }
 
-            if primary.is_empty() {
+            if primary.is_empty() && !standard_primary {
                 return Err(EgclError::Internal(
                     "no primary method found in standard combination".into(),
                 ));

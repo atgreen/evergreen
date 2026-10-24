@@ -625,11 +625,16 @@
   (apply #'shared-initialize instance nil initargs))
 
 ;; CLHS INITIALIZE-INSTANCE: the default method calls SHARED-INITIALIZE with
-;; slot-names T.  MAKE-INSTANCE's built-in slot initialization stands in for it
-;; and runs the user's :after methods itself, so this method is reached by a
-;; direct call and by a user :around method's CALL-NEXT-METHOD.
-(defmethod initialize-instance ((instance standard-object) &rest initargs)
+;; slot-names T.  While the only other applicable methods of INITIALIZE-INSTANCE
+;; and SHARED-INITIALIZE are :after methods, MAKE-INSTANCE's built-in slot
+;; initialization stands in for this method and runs those :after methods
+;; itself; otherwise MAKE-INSTANCE calls INITIALIZE-INSTANCE.  MAKE-INSTANCE
+;; recognizes this method and the SHARED-INITIALIZE one above by their bodies,
+;; a single call to the internal function, so keep them that way.
+(defun egcl-internal::%standard-initialize-instance (instance initargs)
   (apply #'shared-initialize instance t initargs))
+(defmethod initialize-instance ((instance standard-object) &rest initargs)
+  (egcl-internal::%standard-initialize-instance instance initargs))
 
 ;; CLHS NO-APPLICABLE-METHOD and NO-NEXT-METHOD: the default methods signal an
 ;; error.  The dispatcher signals its own conditions in those situations; these

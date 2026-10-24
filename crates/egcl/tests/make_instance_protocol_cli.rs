@@ -12,7 +12,9 @@
 //! redefinition and obsolete instances, subclasses, shared slots, closures over
 //! a DEFCLASS's lexical environment, funcallable instances and conditions.
 //!
-//! The expected lines were taken from the binary before this change.
+//! The expected lines of the first five programs were taken from the binary
+//! before that change. The later ones check the initialization protocol's
+//! generic functions (bliss-uchht, bliss-agqzs) against SBCL 2.6.9.
 
 use std::process::Command;
 
@@ -241,5 +243,253 @@ fn shared_slots_closures_funcallable_and_conditions() {
               (typep (mip-make-cond 1) 'error)))))
 "#,
         "RESULT 3000 2999 3000 (:TAG 2999) 4498500 40 4498500 3 T",
+    );
+}
+
+/// Every kind of method on MAKE-INSTANCE, ALLOCATE-INSTANCE,
+/// INITIALIZE-INSTANCE and SHARED-INITIALIZE, added after warm-up, runs in the
+/// standard combination's order, and CALL-NEXT-METHOD reaches the standard
+/// methods (bliss-uchht). The expected line is SBCL 2.6.9's, except for the
+/// first entry: SBCL's constructor for a constant class name does not run the
+/// :around method specialized on the SYMBOL, but MAKE-INSTANCE's standard
+/// method on a symbol calls MAKE-INSTANCE again (CLHS), so the method applies.
+#[test]
+fn initialization_generic_functions_method_order() {
+    check_all_tiers(
+        r#"
+(progn
+  (defvar *mio-log* nil)
+  (defun mio-note (x) (push x *mio-log*) x)
+  (defclass mio-a ()
+    ((x :initarg :x :initform (mio-note :x-initform))
+     (y :initarg :y)
+     (z :initform 'z)))
+  (defun mio-make (i) (make-instance 'mio-a :y i))
+  (defun mio-make-by (class &rest initargs) (apply #'make-instance class initargs))
+  (dotimes (i 3000) (mio-make i))
+  (defmethod make-instance :around ((c (eql 'mio-a)) &rest initargs)
+    (mio-note (list :mi-around (length initargs)))
+    (call-next-method))
+  (defmethod make-instance :before ((c (eql (find-class 'mio-a))) &rest initargs)
+    (mio-note (list :mi-before (length initargs))))
+  (defmethod make-instance :after ((c (eql (find-class 'mio-a))) &rest initargs)
+    (mio-note (list :mi-after (length initargs))))
+  (defmethod allocate-instance :around ((c (eql (find-class 'mio-a))) &rest initargs)
+    (mio-note (list :ai-around (length initargs)))
+    (call-next-method))
+  (defmethod allocate-instance :before ((c (eql (find-class 'mio-a))) &rest initargs)
+    (declare (ignore initargs))
+    (mio-note :ai-before))
+  (defmethod allocate-instance ((c (eql (find-class 'mio-a))) &rest initargs)
+    (declare (ignore initargs))
+    (mio-note :ai-primary)
+    (let ((o (call-next-method)))
+      (mio-note (list :ai-fresh (slot-boundp o 'x) (slot-boundp o 'y) (slot-boundp o 'z)))
+      o))
+  (defmethod allocate-instance :after ((c (eql (find-class 'mio-a))) &rest initargs)
+    (declare (ignore initargs))
+    (mio-note :ai-after))
+  (defmethod initialize-instance :around ((o mio-a) &rest initargs)
+    (mio-note (list :ii-around (length initargs)))
+    (let ((r (call-next-method)))
+      (mio-note :ii-around-done)
+      r))
+  (defmethod initialize-instance :before ((o mio-a) &key)
+    (mio-note (list :ii-before (slot-boundp o 'y))))
+  (defmethod initialize-instance ((o mio-a) &key y)
+    (mio-note (list :ii-primary y (next-method-p)))
+    (call-next-method)
+    (mio-note (list :ii-primary-done (slot-value o 'x) (slot-value o 'y))))
+  (defmethod initialize-instance :after ((o mio-a) &key)
+    (mio-note :ii-after))
+  (defmethod shared-initialize :around ((o mio-a) slots &rest initargs)
+    (mio-note (list :si-around slots (length initargs)))
+    (call-next-method))
+  (defmethod shared-initialize :before ((o mio-a) slots &key)
+    (mio-note (list :si-before slots)))
+  (defmethod shared-initialize ((o mio-a) slots &key y)
+    (mio-note (list :si-primary slots y))
+    (call-next-method))
+  (defmethod shared-initialize :after ((o mio-a) slots &key)
+    (mio-note (list :si-after slots (slot-value o 'z))))
+  (dotimes (i 3000) (mio-make i))
+  (setq *mio-log* nil)
+  (let* ((a (mio-make 7))
+         (l1 (reverse *mio-log*))
+         (b (progn (setq *mio-log* nil) (mio-make-by (find-class 'mio-a) :x 1 :y 2)))
+         (l2 (reverse *mio-log*)))
+    (let ((*print-pretty* nil)) (format t "RESULT ~S ~S ~S ~S~%"
+            l1 (list (slot-value a 'x) (slot-value a 'y) (slot-value a 'z))
+            l2 (list (slot-value b (quote x)) (slot-value b (quote y)))))))
+"#,
+        "RESULT ((:MI-AROUND 2) (:MI-BEFORE 2) (:AI-AROUND 2) :AI-BEFORE :AI-PRIMARY (:AI-FRESH NIL NIL NIL) :AI-AFTER (:II-AROUND 2) (:II-BEFORE NIL) (:II-PRIMARY 7 T) (:SI-AROUND T 2) (:SI-BEFORE T) (:SI-PRIMARY T 7) :X-INITFORM (:SI-AFTER T Z) (:II-PRIMARY-DONE :X-INITFORM 7) :II-AFTER :II-AROUND-DONE (:MI-AFTER 2)) (:X-INITFORM 7 Z) ((:MI-BEFORE 4) (:AI-AROUND 4) :AI-BEFORE :AI-PRIMARY (:AI-FRESH NIL NIL NIL) :AI-AFTER (:II-AROUND 4) (:II-BEFORE NIL) (:II-PRIMARY 2 T) (:SI-AROUND T 4) (:SI-BEFORE T) (:SI-PRIMARY T 2) (:SI-AFTER T Z) (:II-PRIMARY-DONE 1 2) :II-AFTER :II-AROUND-DONE (:MI-AFTER 4)) (1 2)",
+    );
+}
+
+/// A user primary method on INITIALIZE-INSTANCE or SHARED-INITIALIZE that does
+/// not call the next method leaves the slots uninitialized, an ALLOCATE-INSTANCE
+/// method makes the instance, and removing the methods brings the standard
+/// behaviour back. Expected output from SBCL 2.6.9.
+#[test]
+fn primary_methods_that_do_not_call_the_next_method() {
+    check_all_tiers(
+        r#"
+(progn
+  (defvar *mio-log* nil)
+  (defun mio-note (x) (push x *mio-log*) x)
+  (defclass mio-n () ((a :initarg :a :initform (mio-note :a-initform)) (b :initform 2)))
+  (defclass mio-s () ((a :initarg :a :initform (mio-note :a-initform)) (b :initform 2)))
+  (defclass mio-p () ((a :initarg :a :initform 1)))
+  (defun mio-make-n (i) (make-instance 'mio-n :a i))
+  (defun mio-make-s (i) (make-instance 'mio-s :a i))
+  (defun mio-make-p (i) (make-instance 'mio-p :a i))
+  (defun mio-bound (o) (list (slot-boundp o 'a) (and (slot-exists-p o 'b) (slot-boundp o 'b))))
+  (defun mio-warm () (dotimes (i 3000) (mio-make-n i) (mio-make-s i) (mio-make-p i)))
+  (mio-warm)
+  ;; A primary that does not call the next method: the standard method, and
+  ;; with it every slot's initialization, never runs.
+  (defmethod initialize-instance ((o mio-n) &key a)
+    (mio-note (list :ii-n a)))
+  (defmethod shared-initialize ((o mio-s) slots &key a)
+    (mio-note (list :si-s slots a)))
+  ;; An ALLOCATE-INSTANCE primary that returns its own instance.
+  (defmethod allocate-instance ((c (eql (find-class 'mio-p))) &rest initargs)
+    (mio-note (list :ai-p (length initargs)))
+    (let ((o (call-next-method)))
+      (setf (slot-value o 'a) :from-alloc)
+      o))
+  (mio-warm)
+  (setq *mio-log* nil)
+  (let* ((n (mio-make-n 5))
+         (s (mio-make-s 6))
+         (p (mio-make-p 7))
+         (p2 (make-instance 'mio-p))
+         (log (reverse *mio-log*)))
+    (setq *mio-log* nil)
+    ;; REINITIALIZE-INSTANCE goes through SHARED-INITIALIZE too.
+    (reinitialize-instance s :a 8)
+    (let ((relog (reverse *mio-log*)))
+      ;; Removing the methods brings the standard behaviour back.
+      (remove-method #'initialize-instance
+                     (find-method #'initialize-instance '() (list (find-class 'mio-n))))
+      (remove-method #'allocate-instance
+                     (find-method #'allocate-instance '()
+                                  (list (list 'eql (find-class 'mio-p)))))
+      (mio-warm)
+      (setq *mio-log* nil)
+      (let ((n2 (mio-make-n 9)) (p3 (mio-make-p 10)))
+        (let ((*print-pretty* nil))
+          (format t "RESULT ~S ~S ~S ~S ~S ~S ~S ~S ~S~%"
+                  log (mio-bound n) (mio-bound s)
+                  (slot-value p 'a) (slot-value p2 'a)
+                  relog (mio-bound n2) (slot-value p3 'a) (reverse *mio-log*)))))))
+"#,
+        "RESULT ((:II-N 5) (:SI-S T 6) (:AI-P 2) (:AI-P 0)) (NIL NIL) (NIL NIL) 7 :FROM-ALLOC ((:SI-S NIL 8)) (T T) 10 NIL",
+    );
+}
+
+/// The &KEY parameters of ALLOCATE-INSTANCE, INITIALIZE-INSTANCE and
+/// SHARED-INITIALIZE methods make initargs valid, those of MAKE-INSTANCE
+/// methods do not, and each method receives its keyword (CLHS 7.1.2). A
+/// MAKE-INSTANCE method with &KEY used to make every other initarg an invalid
+/// keyword argument. Expected output from SBCL 2.6.9.
+#[test]
+fn initarg_validity_from_method_keys() {
+    check_all_tiers(
+        r#"
+(progn
+  (defvar *mio-log* nil)
+  (defun mio-note (x) (push x *mio-log*) x)
+  (defclass mio-k () ((a :initarg :a)))
+  (defun mio-make-k (&rest initargs) (apply #'make-instance 'mio-k initargs))
+  (defun mio-try (&rest initargs)
+    (handler-case (progn (apply #'mio-make-k initargs) :ok)
+      (program-error () :program-error)))
+  (dotimes (i 3000) (mio-make-k :a i))
+  (let ((results nil))
+    (push (mio-try :alloc-key 1) results)
+    (defmethod allocate-instance :before ((c (eql (find-class 'mio-k))) &key alloc-key)
+      (mio-note (list :alloc-key alloc-key)))
+    (push (mio-try :alloc-key 1) results)
+    (push (mio-try :ii-key 2) results)
+    (defmethod initialize-instance :around ((o mio-k) &key ii-key)
+      (mio-note (list :ii-key ii-key))
+      (call-next-method))
+    (push (mio-try :ii-key 2) results)
+    (push (mio-try :si-key 3) results)
+    (defmethod shared-initialize ((o mio-k) slots &key si-key)
+      (mio-note (list :si-key slots si-key))
+      (call-next-method))
+    (push (mio-try :si-key 3) results)
+    (push (mio-try :mi-key 4) results)
+    (defmethod make-instance :before ((c (eql (find-class 'mio-k))) &key mi-key)
+      (mio-note (list :mi-key mi-key)))
+    (push (mio-try :mi-key 4) results)
+    (push (mio-try :bogus 5) results)
+    (push (mio-try :bogus 5 :allow-other-keys t) results)
+    (dotimes (i 3000) (mio-make-k :a i :alloc-key i :ii-key i :si-key i))
+    (setq *mio-log* nil)
+    (let ((k (mio-make-k :si-key 30 :ii-key 20 :alloc-key 10 :a 0)))
+      (let ((*print-pretty* nil))
+        (format t "RESULT ~S ~S ~S~%" (reverse results) (reverse *mio-log*) (slot-value k 'a))))))
+"#,
+        "RESULT (:PROGRAM-ERROR :OK :PROGRAM-ERROR :OK :PROGRAM-ERROR :OK :PROGRAM-ERROR :PROGRAM-ERROR :PROGRAM-ERROR :OK) ((:MI-KEY NIL) (:ALLOC-KEY 10) (:II-KEY 20) (:SI-KEY T 30)) 0",
+    );
+}
+
+/// A MAKE-INSTANCE :around method alone, specialized on the class object or on
+/// STANDARD-CLASS, reaches the standard method with CALL-NEXT-METHOD
+/// (bliss-agqzs), and CHANGE-CLASS calls SHARED-INITIALIZE through
+/// UPDATE-INSTANCE-FOR-DIFFERENT-CLASS. Expected output from SBCL 2.6.9.
+#[test]
+fn make_instance_around_methods_and_change_class() {
+    check_all_tiers(
+        r#"
+(progn
+  (defvar *mio-log* nil)
+  (defun mio-note (x) (push x *mio-log*) x)
+  (defclass mio-w () ((x :initarg :x :initform 0)))
+  (defclass mio-v () ((y :initarg :y :initform (mio-note :y-initform)) (x :initarg :x)))
+  (defun mio-make-w (i) (make-instance 'mio-w :x i))
+  (defun mio-make-w-class (i) (make-instance (find-class 'mio-w) :x i))
+  (dotimes (i 3000) (mio-make-w i) (mio-make-w-class i))
+  ;; Only :around methods apply: the standard method is the primary.
+  (defmethod make-instance :around ((c (eql (find-class 'mio-w))) &rest initargs)
+    (mio-note (list :mi-around-class initargs))
+    (let ((o (call-next-method)))
+      (mio-note (list :mi-around-class-done (slot-value o 'x)))
+      o))
+  (dotimes (i 3000) (mio-make-w i) (mio-make-w-class i))
+  (setq *mio-log* nil)
+  (let ((r1 (list (slot-value (mio-make-w 3) 'x) (slot-value (mio-make-w-class 4) 'x)
+                  (reverse *mio-log*))))
+    (defmethod make-instance :around ((c standard-class) &rest initargs)
+      (when (eq c (find-class 'mio-w))
+        (mio-note (list :mi-around-standard-class (length initargs))))
+      (call-next-method))
+    (setq *mio-log* nil)
+    (let ((r2 (list (slot-value (mio-make-w 5) 'x) (slot-value (mio-make-w-class 6) 'x)
+                    (reverse *mio-log*))))
+      ;; CHANGE-CLASS reaches SHARED-INITIALIZE through
+      ;; UPDATE-INSTANCE-FOR-DIFFERENT-CLASS.
+      (defmethod update-instance-for-different-class :before ((p mio-w) (c mio-v) &key y)
+        (mio-note (list :uifdc-before (slot-value p 'x) y)))
+      (defmethod shared-initialize :around ((o mio-v) slots &key y)
+        (mio-note (list :si-around slots y))
+        (call-next-method))
+      (setq *mio-log* nil)
+      (let ((o (mio-make-w 8)))
+        (setq *mio-log* nil)
+        (change-class o 'mio-v)
+        (let ((r3 (list (slot-value o 'x) (slot-value o 'y) (reverse *mio-log*))))
+          (setq *mio-log* nil)
+          (let ((o2 (mio-make-w 9)))
+            (setq *mio-log* nil)
+            (change-class o2 'mio-v :y 1)
+            (let ((r4 (list (slot-value o2 'y) (reverse *mio-log*))))
+              (let ((*print-pretty* nil))
+                (format t "RESULT ~S ~S ~S ~S~%" r1 r2 r3 r4)))))))))
+"#,
+        "RESULT (3 4 ((:MI-AROUND-CLASS (:X 3)) (:MI-AROUND-CLASS-DONE 3) (:MI-AROUND-CLASS (:X 4)) (:MI-AROUND-CLASS-DONE 4))) (5 6 ((:MI-AROUND-CLASS (:X 5)) (:MI-AROUND-STANDARD-CLASS 2) (:MI-AROUND-CLASS-DONE 5) (:MI-AROUND-CLASS (:X 6)) (:MI-AROUND-STANDARD-CLASS 2) (:MI-AROUND-CLASS-DONE 6))) (8 :Y-INITFORM ((:UIFDC-BEFORE 8 NIL) (:SI-AROUND (Y) NIL) :Y-INITFORM)) (1 ((:UIFDC-BEFORE 9 1) (:SI-AROUND (Y) 1)))",
     );
 }
