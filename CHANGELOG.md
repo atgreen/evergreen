@@ -98,7 +98,7 @@
   checking, default initargs, initforms, user methods, class redefinition and
   `make-instances-obsolete` behave as before; adding or removing a method or
   redefining a class makes the next call work everything out again
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#596](https://github.com/atgreen/evergreen/pull/596)).
 - Compiled calls to structure accessors and to class `:reader`, `:writer` and
   `:accessor` functions read or store the slot directly. A read such as
   `(point-x p)` drops from about 3.2 µs to 0.2 µs, and a store such as
