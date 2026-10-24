@@ -40,10 +40,16 @@ mod short_copy;
 ///   thread and freed on another is fine: it lands in the freeing thread's
 ///   cache and is reused there, or returned to `System`.
 /// * The thread-local is `const`-initialised and has no `Drop`. A `Drop` impl
-///   would register a TLS destructor, and registration itself can allocate —
-///   re-entering this allocator while it is mid-call. The cost is that a dying
-///   thread's cached blocks are not returned; that is bounded by
-///   `CLASSES * DEPTH * MAX_SIZE` per thread and the process has few threads.
+///   would register a Rust TLS destructor, and registration itself can
+///   allocate — re-entering this allocator while it is mid-call.
+/// * A dying thread still returns its cached blocks, through a POSIX
+///   thread-specific-data destructor instead (bliss-orayb). musl's
+///   `pthread_key_create` and `pthread_setspecific` use fixed tables and never
+///   call `malloc`, so arming the destructor from inside the allocator cannot
+///   re-enter it. Without this, every exited thread kept up to
+///   `CLASSES * DEPTH * MAX_SIZE` (~270 KB) of free blocks forever: measured
+///   at about 88 KB per joined thread on a thread-per-task workload whose
+///   threads promote functions to T1, against ~8 KB with T1 disabled.
 #[cfg(all(
     feature = "thread-cache-alloc",
     target_env = "musl",
@@ -73,14 +79,78 @@ mod tcache {
         };
     }
 
+    /// Whether this thread's cache may hold blocks, which is only once its
+    /// exit-time flush is armed.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum State {
+        /// No block cached yet; the flush is not armed.
+        Unarmed,
+        /// The thread-exit destructor will return every cached block.
+        Armed,
+        /// The flush has run, or could not be armed: never cache again, so a
+        /// block freed by a later destructor goes straight back to `System`.
+        Bypass,
+    }
+
     struct Cache {
         bins: [Bin; CLASSES],
+        state: State,
     }
 
     thread_local! {
         static CACHE: UnsafeCell<Cache> = const {
-            UnsafeCell::new(Cache { bins: [const { Bin::NEW }; CLASSES] })
+            UnsafeCell::new(Cache {
+                bins: [const { Bin::NEW }; CLASSES],
+                state: State::Unarmed,
+            })
         };
+    }
+
+    /// The process-wide key whose destructor flushes an exiting thread's cache,
+    /// or `None` if the key table was full.
+    fn flush_key() -> Option<libc::pthread_key_t> {
+        static KEY: std::sync::OnceLock<Option<libc::pthread_key_t>> =
+            std::sync::OnceLock::new();
+        *KEY.get_or_init(|| {
+            let mut key: libc::pthread_key_t = 0;
+            // SAFETY: `key` is a valid out-pointer and `flush_on_exit` has the
+            // destructor signature. musl allocates no memory here.
+            (unsafe { libc::pthread_key_create(&mut key, Some(flush_on_exit)) } == 0)
+                .then_some(key)
+        })
+    }
+
+    /// Arm the exit-time flush for the current thread. Returns the new state.
+    fn arm() -> State {
+        let Some(key) = flush_key() else {
+            return State::Bypass;
+        };
+        // Any non-null value makes the destructor run at thread exit. A
+        // thread that never caches a block never pays for this.
+        // SAFETY: `key` came from a successful `pthread_key_create`.
+        if unsafe { libc::pthread_setspecific(key, std::ptr::dangling::<u8>().cast()) } == 0 {
+            State::Armed
+        } else {
+            State::Bypass
+        }
+    }
+
+    /// Thread-specific-data destructor: return every cached block to `System`
+    /// and stop caching on this thread, since other destructors may still free.
+    unsafe extern "C" fn flush_on_exit(_: *mut libc::c_void) {
+        let _ = CACHE.try_with(|c| {
+            // SAFETY: the cache is thread-local; this destructor runs on its
+            // own thread, outside any allocator call, and `System.dealloc`
+            // does not re-enter this allocator.
+            let cache = unsafe { &mut *c.get() };
+            cache.state = State::Bypass;
+            for (class, bin) in cache.bins.iter_mut().enumerate() {
+                for &ptr in &bin.ptrs[..bin.len] {
+                    unsafe { System.dealloc(ptr, class_layout(class)) };
+                }
+                bin.len = 0;
+            }
+        });
     }
 
     /// The class index for a layout, or `None` if it must go to `System`.
@@ -141,8 +211,15 @@ mod tcache {
             };
             let stored = CACHE
                 .try_with(|c| {
-                    // SAFETY: as in `alloc`.
-                    let bin = unsafe { &mut (*c.get()).bins[class] };
+                    // SAFETY: as in `alloc`; `arm` does not allocate.
+                    let cache = unsafe { &mut *c.get() };
+                    if cache.state == State::Unarmed {
+                        cache.state = arm();
+                    }
+                    if cache.state != State::Armed {
+                        return false;
+                    }
+                    let bin = &mut cache.bins[class];
                     if bin.len == DEPTH {
                         return false;
                     }
