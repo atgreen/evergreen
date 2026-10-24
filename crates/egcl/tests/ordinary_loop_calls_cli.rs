@@ -399,3 +399,94 @@ fn double_float_bodies_call_and_deoptimize_through_the_ordinary_entry() {
          (3000 3000.0d0 1.0d0) 4.935362387624709d176 14.0d0)",
     );
 }
+
+/// A callee with declared parameter types gets a published ordinary entry,
+/// which checks each declaration itself and signals the same TYPE-ERROR as
+/// before when one fails, including from callers already at T2.
+#[test]
+fn typed_callees_check_their_declarations_in_the_ordinary_entry() {
+    check_all_tiers(
+        r#"
+(progn
+  (defun ot-1 (a b) (declare (fixnum a b)) (+ a b))
+  (defun ot-2 (a b) (declare (type (integer 0 100) a) (fixnum b)) (+ a b))
+  (defun ot-3 (x) (declare (single-float x)) (* x 2.0))
+  (defun ot-5 (a b c d e) (declare (fixnum a e)) (list a b c d e))
+  (defun ot-l1 (n) (let ((s 0)) (dotimes (i n s) (setq s (ot-1 s 1)))))
+  (defun ot-l2 (n) (let ((s 0)) (dotimes (i n s) (setq s (+ s (ot-2 (mod i 100) 1))))))
+  (defun ot-l3 (n) (let ((s 0.0)) (dotimes (i n s) (setq s (+ s (ot-3 1.5))))))
+  (defun ot-l5 (n) (let ((r nil)) (dotimes (i n r) (setq r (ot-5 i 2 3 4 i)))))
+  (defun ot-bad1 (x) (let ((r nil)) (dotimes (i 3 r) (setq r (ot-1 x 1)))))
+  (defun ot-bad2 (x) (let ((r nil)) (dotimes (i 3 r) (setq r (ot-2 x 1)))))
+  (defun ot-bad3 (x) (let ((r nil)) (dotimes (i 3 r) (setq r (ot-3 x)))))
+  (defun ot-bad5 (x) (let ((r nil)) (dotimes (i 3 r) (setq r (ot-5 1 2 3 4 x)))))
+  (defun ot-badf (f x) (let ((r nil)) (dotimes (i 3 r) (setq r (funcall f x 1)))))
+  (dotimes (j 60) (ot-l1 100) (ot-l2 100) (ot-l3 100) (ot-l5 10))
+  (loop repeat 20000
+        until (every (lambda (f) (eql 2 (egcl-ext:function-tier f)))
+                     '(ot-bad1 ot-bad2 ot-bad3 ot-bad5 ot-badf))
+        do (ot-bad1 1) (ot-bad2 5) (ot-bad3 1.0) (ot-bad5 1) (ot-badf #'ot-1 2))
+  (format t "RESULT ~S~%"
+          (list (ot-l1 1000) (ot-l2 1000) (ot-l3 100) (ot-l5 3)
+                (mapcar (lambda (thunk)
+                          (handler-case (funcall thunk)
+                            (type-error (e) (list :type-error (type-error-datum e)
+                                                  (type-error-expected-type e)))
+                            (error (e) (list :error (type-of e)))))
+                        (list (lambda () (ot-bad1 1.5)) (lambda () (ot-bad1 "x"))
+                              (lambda () (ot-bad2 101)) (lambda () (ot-bad2 -1))
+                              (lambda () (ot-bad3 1)) (lambda () (ot-bad3 1d0))
+                              (lambda () (ot-bad5 'q)) (lambda () (ot-badf #'ot-1 2.5)))))))
+"#,
+        "RESULT (1000 50500 300.0 (2 2 3 4 2) ((:TYPE-ERROR 1.5 FIXNUM) (:TYPE-ERROR \"x\" FIXNUM) \
+         (:TYPE-ERROR 101 (INTEGER 0 100)) (:TYPE-ERROR -1 (INTEGER 0 100)) \
+         (:TYPE-ERROR 1 SINGLE-FLOAT) (:TYPE-ERROR 1.0d0 SINGLE-FLOAT) (:TYPE-ERROR Q FIXNUM) \
+         (:TYPE-ERROR 2.5 FIXNUM)))",
+    );
+}
+
+/// FUNCALL of the current definition of a name, from an ordinary caller,
+/// enters that name's ordinary entry directly once recorded. Redefinition,
+/// guard failure, non-local exits, allocation, arity errors and the other
+/// designators keep their meaning.
+#[test]
+fn funcall_of_a_named_function_enters_its_ordinary_entry() {
+    check_all_tiers(
+        r#"
+(progn
+  (defun of-a (a b) (+ a b))
+  (defun of-o (a &optional (b 10)) (+ a b))
+  (defun of-z () 7)
+  (defun of-3 (a b c) (list a b c))
+  (defun of-add (a b) (+ a b))
+  (defun of-cons (a b) (cons b a))
+  (defun of-throw (a b) (if (= a 50) (throw 'of-out (list :thrown a b)) (+ a b)))
+  (defun of-rec (f n) (if (= n 0) 0 (+ 1 (funcall f f (- n 1)))))
+  (defun of-l (f n) (let ((s 0)) (dotimes (i n s) (setq s (funcall f s 1)))))
+  (defun of-l1 (f n) (let ((s 0)) (dotimes (i n s) (setq s (funcall f s)))))
+  (defun of-l0 (f n) (let ((s 0)) (dotimes (i n s) (setq s (+ s (funcall f))))))
+  (defun of-l3 (f n) (let ((r nil)) (dotimes (i n r) (setq r (funcall f i r 3)))))
+  (defun of-big (f n) (let ((s most-positive-fixnum)) (dotimes (i n s) (setq s (funcall f s 1)))))
+  (defun of-la (f n) (let ((s nil)) (dotimes (i n s) (setq s (funcall f s i)))))
+  (dotimes (j 60) (of-l #'of-a 100) (of-l1 #'of-o 100) (of-l0 #'of-z 100) (of-l3 #'of-3 3)
+    (of-l #'of-add 100) (of-big #'of-add 1) (of-la #'of-cons 100)
+    (catch 'of-out (of-l #'of-throw 10)) (of-rec #'of-rec 10))
+  (let ((old #'of-a)
+        (first (list (of-l #'of-a 1000) (of-l1 #'of-o 100) (of-l0 #'of-z 100) (length (of-l3 #'of-3 5)))))
+    (defun of-a (a b) (- a b))
+    (format t "RESULT ~S~%"
+            (list first (of-l old 100) (of-l #'of-a 100)
+                  (handler-case (of-l1 #'of-add 3) (program-error () :program-error)
+                    (error (e) (list :error (type-of e))))
+                  (of-l #'of-add 100)
+                  (let ((s 0.5)) (dotimes (i 10 s) (setq s (funcall #'of-add s 1))))
+                  (of-big #'of-add 10)
+                  (let ((l (of-la #'of-cons 20000))) (list (car l) (loop for x = l then (cdr x) while (consp x) count t)))
+                  (catch 'of-out (of-l #'of-throw 100))
+                  (of-rec #'of-rec 300)
+                  (of-l 'of-add 100) (of-l (let ((k 2)) (lambda (a b) (+ a b k))) 100) (of-l #'+ 100)))))
+"#,
+        "RESULT ((1000 1000 700 3) 100 -100 :PROGRAM-ERROR 100 10.5 1152921504606846985 \
+         (19999 20000) (:THROWN 50 1) 300 100 300 100)",
+    );
+}

@@ -153,3 +153,136 @@ fn emit(helper: OrdinaryPublishedHelper, expected: Option<usize>) -> Vec<u8> {
     a.extend_from_slice(&[0xff, 0xe0]);
     a.finish().expect("ordinary helper veneer labels")
 }
+
+/// One entry of a FUNCALL probe table (bliss-6m6ca). Every word is raw: the
+/// runtime clears the table's meaning at each collection by moving the
+/// `collections` stamp, so `function` is compared, never dereferenced.
+#[repr(C)]
+pub struct OrdinaryFuncallProbeEntry {
+    /// Bits of the function object this entry selects for.
+    pub function: u64,
+    /// `egcl_rt::call_table::invalidation_epoch` when the entry was filled.
+    pub epoch: u64,
+    /// The runtime's collection stamp when the entry was filled.
+    pub collections: u64,
+    /// The target cell's revision word, and the revision of `descriptor`.
+    pub revision_address: u64,
+    pub revision: u64,
+    /// The target cell's published `OrdinaryEntryDescriptor`.
+    pub descriptor: u64,
+}
+
+pub const ORDINARY_FUNCALL_PROBE_ENTRIES: usize = 4;
+
+/// Addresses a FUNCALL probe reads; each outlives the probe's code.
+#[derive(Clone, Copy)]
+pub struct OrdinaryFuncallProbe {
+    /// `[OrdinaryFuncallProbeEntry; ORDINARY_FUNCALL_PROBE_ENTRIES]`.
+    pub table: u64,
+    /// The invalidation epoch word.
+    pub epoch: u64,
+    /// The collection stamp word.
+    pub collections: u64,
+    /// Offset of the active native control in the R13 execution context.
+    pub active_control: i32,
+    /// Offset of `stack_limit` in that control.
+    pub stack_limit: u8,
+}
+
+/// The ordinary entry of the builtin FUNCALL cell: `(funcall f a0 a1 a2)`
+/// arrives as RDI=f, RSI=a0, RDX=a1, [RSP+8]=a2 and RCX=count. When `f` is a
+/// function object the runtime recorded in `table` for the current
+/// invalidation epoch, collection and target cell revision, the probe
+/// re-checks the target descriptor's arity and stack bound, shifts the
+/// arguments down one place and tail-jumps to the target's ordinary entry,
+/// exactly as a named call to it would enter. Otherwise, with every incoming
+/// register and stack word intact, it falls through to the bytes the caller
+/// appends: the cell's published runtime veneer. The probe is a leaf with no
+/// safepoint; it clobbers only R8-R11 before deciding.
+pub fn emit_ordinary_funcall_probe(probe: OrdinaryFuncallProbe) -> Vec<u8> {
+    use egcl_rt::call_table::{OrdinaryEntryDescriptor, ORDINARY_ARITY_ANY};
+    const STRIDE: usize = size_of::<OrdinaryFuncallProbeEntry>();
+    fn mem(a: &mut Asm, rex: u8, op: u8, reg: u8, base: u8, disp: i32) {
+        // [base + disp32]; base is never RSP/R12 here.
+        a.extend_from_slice(&[rex, op, 0x80 | ((reg & 7) << 3) | (base & 7)]);
+        a.extend_from_slice(&disp.to_le_bytes());
+    }
+    fn unsigned_branch(a: &mut Asm, opcode: u8, target: egcl_rt::asm::Label) {
+        let at = a.here();
+        a.jcc(Cc::E, target);
+        a.patch_u8(at + 1, opcode); // 0x86 JBE, 0x82 JB
+    }
+    let mut a = Asm::new();
+    let miss = a.label();
+    let hit = a.label();
+    a.extend_from_slice(&[0x48, 0x83, 0xf9, 0x01]); // cmp rcx,1
+    a.jcc(Cc::L, miss);
+    a.extend_from_slice(&[0x48, 0x83, 0xf9, 0x04]); // cmp rcx,4
+    a.jcc(Cc::G, miss);
+    a.extend_from_slice(&[0x49, 0xba]); // mov r10, table
+    a.extend_from_slice(&probe.table.to_le_bytes());
+    a.extend_from_slice(&[0x49, 0xb9]); // mov r9, &epoch
+    a.extend_from_slice(&probe.epoch.to_le_bytes());
+    a.extend_from_slice(&[0x4d, 0x8b, 0x09]); // mov r9,[r9]
+    a.extend_from_slice(&[0x49, 0xb8]); // mov r8, &collections
+    a.extend_from_slice(&probe.collections.to_le_bytes());
+    a.extend_from_slice(&[0x4d, 0x8b, 0x00]); // mov r8,[r8]
+    for index in 0..ORDINARY_FUNCALL_PROBE_ENTRIES {
+        let next = a.label();
+        let field = |offset: usize| (index * STRIDE + offset) as i32;
+        mem(&mut a, 0x49, 0x3b, 7, 2, field(offset_of!(OrdinaryFuncallProbeEntry, function))); // cmp rdi,[r10+]
+        a.jcc(Cc::Ne, next);
+        mem(&mut a, 0x4d, 0x3b, 9, 2, field(offset_of!(OrdinaryFuncallProbeEntry, epoch))); // cmp r9,[r10+]
+        a.jcc(Cc::Ne, next);
+        mem(&mut a, 0x4d, 0x3b, 8, 2, field(offset_of!(OrdinaryFuncallProbeEntry, collections))); // cmp r8,[r10+]
+        a.jcc(Cc::Ne, next);
+        mem(&mut a, 0x4d, 0x8b, 11, 2, field(offset_of!(OrdinaryFuncallProbeEntry, revision_address))); // mov r11,[r10+]
+        a.extend_from_slice(&[0x4d, 0x8b, 0x1b]); // mov r11,[r11]
+        mem(&mut a, 0x4d, 0x3b, 11, 2, field(offset_of!(OrdinaryFuncallProbeEntry, revision))); // cmp r11,[r10+]
+        a.jcc(Cc::Ne, next);
+        // The revision is unchanged, so the cell still publishes, and its
+        // execution still retains, this descriptor.
+        mem(&mut a, 0x4d, 0x8b, 11, 2, field(offset_of!(OrdinaryFuncallProbeEntry, descriptor))); // mov r11,[r10+]
+        a.jmp(hit);
+        a.bind(next);
+    }
+    a.jmp(miss);
+    a.bind(hit);
+    // Arity: count-1 actuals, or a descriptor that checks its own count.
+    let arity_ok = a.label();
+    a.extend_from_slice(&[0x4c, 0x8d, 0x51, 0xff]); // lea r10,[rcx-1]
+    mem(&mut a, 0x4d, 0x3b, 10, 3, offset_of!(OrdinaryEntryDescriptor, arity) as i32); // cmp r10,[r11+arity]
+    a.jcc(Cc::E, arity_ok);
+    debug_assert_eq!(ORDINARY_ARITY_ANY, usize::MAX);
+    a.extend_from_slice(&[0x49, 0x83, 0xbb]); // cmp qword [r11+arity], -1
+    a.extend_from_slice(&(offset_of!(OrdinaryEntryDescriptor, arity) as i32).to_le_bytes());
+    a.extend_from_slice(&[0xff]);
+    a.jcc(Cc::Ne, miss);
+    a.bind(arity_ok);
+    // The target runs on this frame's stack: its own bound must fit above
+    // the execution's limit, as a named caller checks before its CALL.
+    mem(&mut a, 0x4d, 0x8b, 10, 5, probe.active_control); // mov r10,[r13+control]
+    a.extend_from_slice(&[0x4d, 0x85, 0xd2]); // test r10,r10
+    a.jcc(Cc::E, miss);
+    a.extend_from_slice(&[0x49, 0x89, 0xe1]); // mov r9,rsp
+    mem(&mut a, 0x4d, 0x2b, 9, 3, offset_of!(OrdinaryEntryDescriptor, stack_required) as i32); // sub r9,[r11+..]
+    unsigned_branch(&mut a, 0x82, miss); // jb: wrapped
+    a.extend_from_slice(&[0x4d, 0x3b, 0x4a, probe.stack_limit]); // cmp r9,[r10+limit]
+    unsigned_branch(&mut a, 0x86, miss); // jbe
+    // Commit: drop the function, shift the actuals into place.
+    let no_overflow = a.label();
+    a.extend_from_slice(&[0x48, 0x89, 0xf7]); // mov rdi,rsi
+    a.extend_from_slice(&[0x48, 0x89, 0xd6]); // mov rsi,rdx
+    a.extend_from_slice(&[0x48, 0x83, 0xf9, 0x04]); // cmp rcx,4
+    a.jcc(Cc::Ne, no_overflow);
+    a.extend_from_slice(&[0x48, 0x8b, 0x54, 0x24, 0x08]); // mov rdx,[rsp+8]
+    a.bind(no_overflow);
+    a.extend_from_slice(&[0x48, 0xff, 0xc9]); // dec rcx
+    a.extend_from_slice(&[0x48, 0xb8]); // mov rax, NIL: no closure
+    a.extend_from_slice(&NIL.0.to_le_bytes());
+    let entry = offset_of!(OrdinaryEntryDescriptor, entry) as i32;
+    a.extend_from_slice(&[0x41, 0xff, 0xa3]); // jmp [r11+entry]
+    a.extend_from_slice(&entry.to_le_bytes());
+    a.bind(miss);
+    a.finish().expect("ordinary FUNCALL probe labels")
+}

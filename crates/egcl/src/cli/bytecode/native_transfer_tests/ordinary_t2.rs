@@ -145,8 +145,11 @@ fn ordinary_t2_admits_checked_fixnum_self_recursion() {
     assert_proven_self_call(&code, symbol);
     let NativeCodeStorage::Mapped(mapped) = &code._storage else { unreachable!() };
     assert!(mapped.ordinary_entry.is_some(), "typed root calls use the ordinary ABI");
-    assert!(mapped.ordinary_descriptor(0).is_none(),
-        "unchecked named callers must use the checked dispatcher");
+    // The entry checks the declaration itself, so named callers may enter
+    // it directly (bliss-6m6ca).
+    assert!(mapped.ordinary_checks_params, "the typed entry checks its declarations");
+    assert!(mapped.ordinary_descriptor(0).is_some(),
+        "a checking entry is published to named callers");
     egcl_rt::rooted!(function = egcl_rt::symbols::symbol_function(symbol).unwrap());
     let segment = super::super::call_table::enter_ordinary_segment();
     let root = segment.retain_root(mapped, *function);

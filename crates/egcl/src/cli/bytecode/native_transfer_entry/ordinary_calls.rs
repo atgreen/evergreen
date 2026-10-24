@@ -329,6 +329,52 @@ pub(super) unsafe extern "C" fn guard(
     }
 }
 
+/// The rejection veneer of an entry that checks declared parameter types.
+/// The entry data is the body its code retains. A wrong count signals as
+/// `wrong_arity` does; otherwise a declared type failed, and the same
+/// validation root ingress runs signals its TYPE-ERROR (bliss-6m6ca).
+pub(super) unsafe extern "C" fn wrong_arguments(
+    request: *mut u8,
+    out: *mut OrdinaryHelperOutcome,
+    image: *mut SysvTransferCapture,
+) {
+    let request = request.cast::<OrdinaryArityRequest>();
+    unsafe {
+        with_entry_roots(request, || {
+            root_publication::published(image, || {
+                let result = guard_c2i(|| {
+                    if native_error_pending() {
+                        return Ok(NIL);
+                    }
+                    let body = &*((*request).entry_data as *const BytecodeFunction);
+                    egcl_rt::rooted!(args = Vec::new());
+                    let count = (*request).nargs;
+                    args.try_reserve_exact(count).map_err(|_| EgclError::Oom)?;
+                    args.extend_from_slice(&(&(*request).register_args)[..count.min(3)]);
+                    if count > 3 {
+                        args.extend_from_slice(std::slice::from_raw_parts(
+                            (*request).overflow_args,
+                            count - 3,
+                        ));
+                    }
+                    if !super::super::arity_accepts(body, args.len()) {
+                        let (min, max) = (usize::from(body.min_args), usize::from(body.arity));
+                        return Err(EgclError::ProgramError(if min == max {
+                            format!("wrong number of arguments: expected {max}, got {}", args.len())
+                        } else {
+                            format!("wrong number of arguments: expected {min} to {max}, got {}", args.len())
+                        }));
+                    }
+                    validate_declared_args(body, &args)?;
+                    // The generated check and the declaration disagree.
+                    Err(invalid_capture())
+                });
+                finish(result, out);
+            });
+        });
+    }
+}
+
 /// The arity veneer's entry data for an entry accepting `min..=max`
 /// arguments: the count itself for a fixed entry, as before.
 pub(super) fn expected_arguments(min: u16, max: u16) -> usize {

@@ -300,6 +300,8 @@ pub(super) struct TransferCode {
     ordinary_stack_required: Option<usize>,
     /// A `&key` entry's body entry past binding; see `run_activation`.
     ordinary_bound_entry: Option<usize>,
+    /// The ordinary entry checks declared parameter types itself.
+    pub(super) ordinary_checks_params: bool,
     _ordinary_keywords: Option<JitBuffer>,
     _ordinary_arity: Option<JitBuffer>,
     _ordinary_cold: Option<JitBuffer>,
@@ -838,10 +840,10 @@ impl TransferCode {
         use egcl_rt::call_table::{OrdinaryEntryDescriptor, ORDINARY_X64_LISP_KIND, ORDINARY_X64_LISP_VERSION, ORDINARY_ENV_NONE};
         // Root ingress validates declared parameters before entering generated
         // code, and source-proven self calls preserve those established facts.
-        // A named ordinary caller has no per-parameter validator at its raw
-        // machine boundary yet, so do not publish this entry as a general
-        // descriptor. It will take the checked dispatcher instead.
-        if self.body.param_types.iter().any(|ty| !ty.is_any()) {
+        // A named ordinary caller can enter a typed body only when its entry
+        // checks the declarations itself; otherwise do not publish this entry
+        // as a general descriptor, and the call takes the checked dispatcher.
+        if !self.ordinary_checks_params && self.body.param_types.iter().any(|ty| !ty.is_any()) {
             return None;
         }
         let offset = self.ordinary_entry.filter(|offset| *offset < self.code_len)?;
@@ -1271,9 +1273,16 @@ impl TransferCode {
                 } else {
                     (usize::from(body.arity), None)
                 };
-                let arity = JitBuffer::new(&egcl_compiler::t2::native_transfer::emit_ordinary_arity_veneer(
-                    ordinary_calls::wrong_arity,
-                    ordinary_calls::expected_arguments(body.min_args, body.arity)))?;
+                // A typed body's entry checks its declarations and rejects
+                // through a veneer that can name the failed one.
+                let arity = JitBuffer::new(&if body.param_types.iter().any(|ty| !ty.is_any()) {
+                    egcl_compiler::t2::native_transfer::emit_ordinary_arity_veneer(
+                        ordinary_calls::wrong_arguments, Arc::as_ptr(&body) as usize)
+                } else {
+                    egcl_compiler::t2::native_transfer::emit_ordinary_arity_veneer(
+                        ordinary_calls::wrong_arity,
+                        ordinary_calls::expected_arguments(body.min_args, body.arity))
+                })?;
                 let options = OrdinaryLispEntryOptions {
                     arity: entry_arity, arity_error_veneer: arity.as_ptr() as u64, binding,
                 };
@@ -1528,6 +1537,7 @@ impl TransferCode {
             ordinary_entry: emitted.ordinary_entry,
             ordinary_stack_required: emitted.ordinary_stack_required,
             ordinary_bound_entry: emitted.ordinary_bound_entry,
+            ordinary_checks_params: emitted.ordinary_checks_params,
             _ordinary_keywords: ordinary_keywords,
             _ordinary_arity: ordinary_arity,
             _ordinary_cold: ordinary_cold,
@@ -2165,7 +2175,8 @@ fn invalid_capture() -> EgclError {
 /// entry pads an omitted one with the unsupplied marker (bliss-6m6ca).
 fn ordinary_entry_parameters(body: &BytecodeFunction) -> bool {
     fixed_tagged_parameters(body)
-        || (positional_tagged_parameters(body) && body.min_args < body.arity && body.arity <= 3)
+        || (positional_tagged_parameters(body) && body.min_args < body.arity && body.arity <= 3
+            && body.param_types.iter().all(|ty| ty.is_any()))
         || (body.variadic && !body.has_env && body.param_types.iter().all(|ty| ty.is_any())
             && super::variadic_plan::VariadicPlan::native_keywords(body).is_some())
 }
