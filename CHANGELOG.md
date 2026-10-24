@@ -88,6 +88,17 @@
 
 ### Performance
 
+- `make-instance` of a class reuses what it worked out for the class's
+  previous instances: which slots each initarg fills, the default initargs and
+  initforms to run, and the `:after` methods on `initialize-instance` and
+  `shared-initialize` that apply. Compiled code, `funcall` and `apply` call it
+  directly instead of building and evaluating a form. On x86-64 Linux, in a hot
+  function, `(make-instance 'point :x i :y i)` drops from about 40 µs to
+  1 µs, and a subclass with a third slot from about 54 µs to 1.1 µs. Initarg
+  checking, default initargs, initforms, user methods, class redefinition and
+  `make-instances-obsolete` behave as before; adding or removing a method or
+  redefining a class makes the next call work everything out again
+  ([#596](https://github.com/atgreen/evergreen/pull/596)).
 - Compiled calls to structure accessors and to class `:reader`, `:writer` and
   `:accessor` functions read or store the slot directly. A read such as
   `(point-x p)` drops from about 3.2 µs to 0.2 µs, and a store such as

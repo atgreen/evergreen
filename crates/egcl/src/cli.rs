@@ -6703,6 +6703,27 @@ fn check_initargs_valid(
             break;
         }
     }
+    let Some(valid) = valid_initarg_names(env, class_name, generic_names) else {
+        return Ok(());
+    };
+    for pair in initargs.chunks_exact(2) {
+        let bare = sym_bare_name_rc(pair[0]);
+        if bare.as_ref() != "ALLOW-OTHER-KEYS" && !valid.iter().any(|k| k.as_str() == bare.as_ref()) {
+            return Err(EgclError::ProgramError(format!(
+                "{} is not a valid initialization argument for class {}",
+                format_val(pair[0]),
+                symbol_bare_name(class_name)
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The initarg names valid for `class_name` (CLHS 7.1.2), bare as
+/// `SlotDef::initargs` stores them: its effective slots' initargs plus the
+/// &KEY names of the applicable methods on `generic_names`. `None` when one of
+/// those methods has &ALLOW-OTHER-KEYS, which makes every name valid.
+fn valid_initarg_names(env: &Env, class_name: &str, generic_names: &[&str]) -> Option<Vec<String>> {
     let mut valid: Vec<String> = effective_slots_for_class(env, class_name)
         .into_iter()
         .flat_map(|slot| slot.initargs)
@@ -6739,22 +6760,12 @@ fn check_initargs_valid(
         for lambda_list in lambda_lists {
             let info = lambda_list_key_info(lambda_list);
             if info.allow_other_keys {
-                return Ok(());
+                return None;
             }
             valid.extend(info.keys);
         }
     }
-    for pair in initargs.chunks_exact(2) {
-        let bare = sym_bare_name_rc(pair[0]);
-        if bare.as_ref() != "ALLOW-OTHER-KEYS" && !valid.iter().any(|k| k.as_str() == bare.as_ref()) {
-            return Err(EgclError::ProgramError(format!(
-                "{} is not a valid initialization argument for class {}",
-                format_val(pair[0]),
-                symbol_bare_name(class_name)
-            )));
-        }
-    }
-    Ok(())
+    Some(valid)
 }
 
 /// The slot symbols an initarg fills, or the initarg's own symbol when no slot
@@ -7482,6 +7493,28 @@ fn evaluated_initargs(
         if let Some(supplied) = supplied.as_deref_mut() {
             supplied.push(*key);
             supplied.push(value);
+        }
+        i += 2;
+    }
+    Ok(std::mem::take(&mut *initargs))
+}
+
+/// [`evaluated_initargs`] for initargs that are already evaluated: each
+/// initarg's value once per slot it fills, or under the initarg's own name when
+/// it fills none. Duplicates are kept; the stdlib core lets the leftmost win.
+fn slot_keyed_initargs(
+    class_name: &str,
+    supplied: &[EgclVal],
+    env: &Env,
+) -> Result<Vec<EgclVal>, EgclError> {
+    rooted_args!(supplied = supplied);
+    egcl_rt::rooted!(initargs = Vec::<EgclVal>::with_capacity(supplied.len()));
+    let mut i = 0;
+    while i + 1 < supplied.len() {
+        // Symbols are not relocated, so the slot-symbol list needs no root.
+        for slot in resolve_slot_symbols(class_name, supplied[i], env)? {
+            initargs.push(slot);
+            initargs.push(supplied[i + 1]);
         }
         i += 2;
     }
@@ -8389,9 +8422,28 @@ fn run_initialization_aux_methods(
     args: &[EgclVal],
     qualifier: egcl_stdlib::MethodQualifier,
 ) -> Result<(), EgclError> {
+    let mut ordered = select_initialization_aux_methods(env, gf_name, args, qualifier);
+    egcl_rt::rooted_ref!(_ordered_root = &mut ordered);
+    // Do not hold an iterator borrow while Lisp invokes a moving collection.
+    #[allow(clippy::needless_range_loop)]
+    for index in 0..ordered.len() {
+        invoke_method(env, &ordered[index], args, None)?;
+    }
+    Ok(())
+}
+
+/// The methods [`run_initialization_aux_methods`] runs, in the order it runs
+/// them. Selection can allocate but runs no user methods. The caller must root
+/// the result before it allocates again.
+fn select_initialization_aux_methods(
+    env: &mut Env,
+    gf_name: &str,
+    args: &[EgclVal],
+    qualifier: egcl_stdlib::MethodQualifier,
+) -> Vec<MethodDef> {
     let mut methods = match env.methods.borrow().get(gf_name).cloned() {
         Some(methods) if !methods.is_empty() => methods,
-        _ => return Ok(()),
+        _ => return Vec::new(),
     };
     egcl_rt::rooted_ref!(_methods_root = &mut methods);
     let precedence = egcl_rt::symbols::find_index(gf_name)
@@ -8411,20 +8463,15 @@ fn run_initialization_aux_methods(
         }
     }
     applicable.sort_by(|a, b| a.1.cmp(&b.1));
+    // Nothing below allocates, so the copies need no root until the caller's.
     let mut ordered: Vec<MethodDef> = applicable
         .into_iter()
         .map(|(index, _)| methods[index].clone())
         .collect();
-    egcl_rt::rooted_ref!(_ordered_root = &mut ordered);
     if qualifier == egcl_stdlib::MethodQualifier::After {
         ordered.reverse();
     }
-    // Do not hold an iterator borrow while Lisp invokes a moving collection.
-    #[allow(clippy::needless_range_loop)]
-    for index in 0..ordered.len() {
-        invoke_method(env, &ordered[index], args, None)?;
-    }
-    Ok(())
+    ordered
 }
 
 /// True if the generic `name` has at least one method applicable to `args`.
@@ -10061,6 +10108,7 @@ fn scan_evaluator_roots(visit: &mut dyn FnMut(*mut EgclVal), root_definitions: b
         });
     }
     visit_global_symbol_macro_roots(visit);
+    visit_make_instance_plan_roots(visit);
     // Shared per-pass visit state (bliss-s56e).
     with_env_visit_state(|state| {
         // Definitions outlive every Env, including the execution that created
@@ -41163,27 +41211,98 @@ fn install_slot_accessor_method(
 }
 
 // ── MAKE-INSTANCE ────────────────────────────────────────────────
+/// MAKE-INSTANCE in operator position: `cdr` is the unevaluated
+/// `(class-form initarg-form...)`.
 fn eval_make_instance(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     let (class_form, mut init_args) = cp(cdr);
     // Root across the allocating class-form evaluation (moving GC; bliss-8qf).
     egcl_rt::rooted_ref!(_initargs_root = &mut init_args);
     egcl_rt::rooted!(class_input = eval_form(class_form, env)?);
-    let class = resolve_class_metaobject(env, *class_input)?;
+    egcl_rt::rooted!(class = resolve_class_metaobject(env, *class_input)?);
     // Finalizing the class orders its superclasses; an inconsistent hierarchy
-    // must be reported here, where the caller can handle it, not later when
-    // something merely prints the instance (ansi objects defclass.forward-ref.4).
-    egcl_stdlib::compute_class_precedence_list(class)?;
-    let class_name = class_name_for_instance_class(class);
-    // The initargs as the caller wrote them, for the initialization protocol
-    // below; `initargs` itself is keyed by slot name, for filling slots.
-    egcl_rt::rooted!(supplied_initargs = Vec::<EgclVal>::new());
-    if list_to_vec(init_args).len() % 2 != 0 {
+    // must be reported here, where the caller can handle it, before the
+    // initarg forms run, not later when something merely prints the instance
+    // (ansi objects defclass.forward-ref.4). A current plan for the class was
+    // made after this check succeeded in this generation, so it can be
+    // skipped; if the plan goes stale meanwhile, `make_instance_of_class`
+    // checks after all.
+    let cpl_checked = make_instance_plan_for(*class).is_none();
+    if cpl_checked {
+        egcl_stdlib::compute_class_precedence_list(*class)?;
+    }
+    egcl_rt::rooted!(forms = list_to_vec(init_args));
+    if forms.len() % 2 != 0 {
         return Err(EgclError::ProgramError(
             "MAKE-INSTANCE: initialization arguments must come in keyword/value pairs".into(),
         ));
     }
-    let mut initargs =
-        evaluated_initargs(&class_name, init_args, env, Some(&mut supplied_initargs))?;
+    // Keys and values are evaluated left to right, as for any function call.
+    egcl_rt::rooted!(values = Vec::<EgclVal>::with_capacity(forms.len()));
+    for i in 0..forms.len() {
+        let value = eval_form(forms[i], env)?;
+        values.push(value);
+    }
+    make_instance_of_class(*class, &values, env, cpl_checked)
+}
+
+/// MAKE-INSTANCE on evaluated arguments `(class-designator initarg...)`: what
+/// a call from FUNCALL, APPLY or compiled code reaches, with the same
+/// behaviour as operator position. Before this existed such a call rebuilt a
+/// `(make-instance 'class ':x 'v ...)` form and evaluated it.
+fn make_instance_values(args: &[EgclVal], env: &mut Env) -> Result<EgclVal, EgclError> {
+    rooted_args!(args = args);
+    let class = resolve_class_metaobject(env, args[0])?;
+    make_instance_of_class(class, &args[1..], env, false)
+}
+
+/// MAKE-INSTANCE of the class metaobject (or unresolved designator) `class`
+/// with the evaluated initarg list `initargs`. `cpl_checked` says the caller
+/// has already computed the class precedence list.
+///
+/// A class whose layout has a current plan (see "MAKE-INSTANCE plans") takes
+/// it; anything the plan does not cover takes the general protocol below.
+fn make_instance_of_class(
+    class: EgclVal,
+    initargs: &[EgclVal],
+    env: &mut Env,
+    cpl_checked: bool,
+) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted!(class = class);
+    rooted_args!(initargs = initargs);
+    let generation = GF_DISPATCH_GENERATION.load(AtomicOrdering::Acquire);
+    if let Some(plan) = make_instance_plan_for(*class)
+        && let Some(result) = make_instance_planned(*class, &plan, initargs, env)
+    {
+        return result;
+    }
+    if !cpl_checked {
+        egcl_stdlib::compute_class_precedence_list(*class)?;
+    }
+    let result = make_instance_general(*class, initargs, env);
+    if result.is_ok() {
+        note_make_instance_class(*class, generation, env);
+    }
+    result
+}
+
+/// The full MAKE-INSTANCE initialization protocol on evaluated initargs, for
+/// any class and any state of the initialization generic functions.
+fn make_instance_general(
+    mut class: EgclVal,
+    supplied: &[EgclVal],
+    env: &mut Env,
+) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted_ref!(_class_root = &mut class);
+    let class_name = class_name_for_instance_class(class);
+    if supplied.len() % 2 != 0 {
+        return Err(EgclError::ProgramError(
+            "MAKE-INSTANCE: initialization arguments must come in keyword/value pairs".into(),
+        ));
+    }
+    // The initargs as the caller wrote them, for the initialization protocol
+    // below; `initargs` itself is keyed by slot name, for filling slots.
+    egcl_rt::rooted!(supplied_initargs = supplied.to_vec());
+    egcl_rt::rooted!(initargs = slot_keyed_initargs(&class_name, &supplied_initargs, env)?);
 
     // Apply :default-initargs (CLHS 7.1.4): for each effective default whose
     // initarg the caller did NOT supply, evaluate its value form and append it
@@ -41198,7 +41317,7 @@ fn eval_make_instance(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError>
         // already-evaluated initarg AND each new value must be rooted across
         // them — otherwise a nursery value moves and the bare Vec copy goes
         // stale (bliss-6b2).
-        egcl_rt::rooted!(rooted = initargs.clone());
+        egcl_rt::rooted!(rooted = initargs.to_vec());
         let supplied: std::collections::HashSet<String> = supplied_initargs
             .chunks_exact(2)
             .map(|pair| pair[0])
@@ -41239,7 +41358,7 @@ fn eval_make_instance(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError>
             supplied_initargs.push(*initarg_kw_root);
             supplied_initargs.push(value);
         }
-        initargs = std::mem::take(&mut *rooted);
+        *initargs = std::mem::take(&mut *rooted);
     }
     // Validity is judged on the defaulted initarg list, so a class whose
     // :default-initargs say :allow-other-keys t accepts anything (ansi class-24.2).
@@ -41250,9 +41369,8 @@ fn eval_make_instance(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError>
         &["INITIALIZE-INSTANCE", "SHARED-INITIALIZE", "ALLOCATE-INSTANCE"],
     )?;
 
-    // Keep initargs rooted across make_instance, the initforms, and the user
+    // `initargs` stays rooted across make_instance, the initforms, and the user
     // :after methods below — all of which allocate (bliss-6b2 #2).
-    egcl_rt::rooted_ref!(_ig = &mut initargs);
     let explicit_slots: Vec<String> = initargs
         .chunks_exact(2)
         .map(|pair| sym_bare_name_rc(pair[0]).to_string())
@@ -41295,6 +41413,596 @@ fn eval_make_instance(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError>
         egcl_stdlib::MethodQualifier::After,
     )?;
     Ok(instance)
+}
+
+// ── MAKE-INSTANCE plans (bliss-ih7pa) ────────────────────────────
+//
+// The general protocol above rebuilds everything from the class definitions
+// on every call: the class name as a String, each initarg's slots by walking
+// the superclasses and comparing names, the effective slots and the valid
+// initarg names (cloning every ClassDef on the way), and the :after methods
+// on INITIALIZE-INSTANCE and SHARED-INITIALIZE by computing each method's
+// applicability. For a two-slot class that was ~39us per call.
+//
+// None of that changes between calls unless a definition changes, so a class
+// that makes instances repeatedly gets a plan: per-initarg slot symbols, the
+// default initargs and initforms to run, and the :after methods selected for
+// its instances. A plan is keyed by the class's layout (its wrapper address,
+// which a redefinition replaces and which is never reused) and stamped with
+// GF_DISPATCH_GENERATION. Every write to the class, method or generic
+// definition tables bumps that generation, so DEFCLASS, DEFMETHOD,
+// REMOVE-METHOD and DEFGENERIC all retire every plan. A class whose wrapper is
+// obsolete has no layout key and takes the general path.
+//
+// A plan does not replace the protocol; it caches the protocol's own answers.
+// It runs the same steps in the same order: the caller's initargs, then each
+// default initarg the caller did not supply (its form evaluated then), the
+// validity check, allocation and slot filling by the stdlib core, the
+// initforms of still-unbound slots, then the SHARED-INITIALIZE and
+// INITIALIZE-INSTANCE :after methods. A plan is made only for a class the
+// general path has just finished with twice in one generation, so the
+// precedence list was computed and the class has a layout. What a plan does
+// not cover takes the general path instead:
+//
+//   * user methods on MAKE-INSTANCE: such a call dispatches the generic, and
+//     reaches here only through its built-in fallback, when no method applies;
+//   * a class with an :allocation :class slot, a class the evaluator did not
+//     define, or a default initarg that fills no slot or is not valid: no plan;
+//   * an initarg that fills no slot (one only a method's &KEY accepts, or
+//     :ALLOW-OTHER-KEYS), is not valid, or is not a symbol, and an odd-length
+//     list: that call goes the general way, before anything is evaluated.
+//
+// If the generation moves during a call (an initform that runs DEFMETHOD),
+// the remaining steps fall back to the general helpers, which read the
+// definitions afresh.
+
+const MAKE_INSTANCE_INIT_GENERICS: [&str; 3] =
+    ["INITIALIZE-INSTANCE", "SHARED-INITIALIZE", "ALLOCATE-INSTANCE"];
+
+/// What a supplied initarg does under a plan.
+struct MakeInstanceKey {
+    symbol: u32,
+    /// The slots it fills, most specific class first.
+    slots: Box<[u32]>,
+    /// Bit `i` is set when this initarg has the name of default initarg `i`,
+    /// so supplying it suppresses that default (CLHS 7.1.4).
+    covers: u64,
+}
+
+struct MakeInstanceDefault {
+    keyword: u32,
+    slots: Box<[u32]>,
+}
+
+struct MakeInstancePlan {
+    generation: u64,
+    class_name: String,
+    /// The valid initarg names; `None` when every name is valid.
+    valid: Option<Vec<String>>,
+    /// Supplied initargs met so far, filled on first use.
+    keys: Mutex<Vec<MakeInstanceKey>>,
+    /// Effective default initargs, most specific first. Default `i`'s value
+    /// form is `forms[i]`.
+    defaults: Vec<MakeInstanceDefault>,
+    /// Slots with an initform, in effective-slot order. Initform `j` is
+    /// `forms[defaults.len() + j]`.
+    initforms: Vec<u32>,
+    /// What evaluating each form takes, with `kinds[i]` saying how `forms[i]`
+    /// is held. Visited by the evaluator root scanner; copy one out and
+    /// release the lock before using it.
+    forms: Mutex<Vec<EgclVal>>,
+    kinds: Vec<PlanForm>,
+    /// Method ids of the applicable :after methods, in run order, once known.
+    shared_after: Mutex<Option<Box<[EgclVal]>>>,
+    initialize_after: Mutex<Option<Box<[EgclVal]>>>,
+}
+
+/// How a plan evaluates an initform or default-initarg form.
+#[derive(Clone, Copy)]
+enum PlanForm {
+    /// A self-evaluating object or a QUOTE form: held as its value, which is
+    /// the very object evaluating the form returns.
+    Constant,
+    /// `(FUNCALL fn)`, which a DEFCLASS inside a lexical environment stores
+    /// for each non-constant form: held as `fn`, called with no arguments.
+    Call,
+    /// Anything else: held as the form, evaluated.
+    Eval,
+}
+
+/// How to hold `form` in a plan. Does not allocate.
+fn classify_plan_form(form: EgclVal, quote: EgclVal, funcall: EgclVal) -> (PlanForm, EgclVal) {
+    if form.is_cons() {
+        let (head, tail) = cp(form);
+        if tail.is_cons() && cp(tail).1.is_nil() {
+            let arg = cp(tail).0;
+            if head == quote {
+                return (PlanForm::Constant, arg);
+            }
+            if head == funcall
+                && (arg.is_function()
+                    || (arg.is_heap_object() && egcl_rt::function::is_interpreted_function(arg)))
+            {
+                return (PlanForm::Call, arg);
+            }
+        }
+        return (PlanForm::Eval, form);
+    }
+    if form.is_symbol() && !(form.is_nil() || form == T || is_keyword_arg(form)) {
+        return (PlanForm::Eval, form);
+    }
+    (PlanForm::Constant, form)
+}
+
+/// The value of form `index` of `plan`.
+fn eval_plan_form(
+    plan: &MakeInstancePlan,
+    index: usize,
+    env: &mut Env,
+) -> Result<EgclVal, EgclError> {
+    let held = lock_ignoring_poison(&plan.forms)[index];
+    match plan.kinds[index] {
+        PlanForm::Constant => Ok(held),
+        PlanForm::Call => apply_function(held, &[], env),
+        PlanForm::Eval => eval_form(held, env),
+    }
+}
+
+enum MakeInstancePlanEntry {
+    /// The general path finished once in this generation.
+    Seen(u64),
+    /// No plan can cover this class in this generation.
+    Declined,
+    Ready(Arc<MakeInstancePlan>),
+}
+
+#[derive(Default)]
+struct MakeInstancePlans {
+    generation: u64,
+    entries: HashMap<usize, MakeInstancePlanEntry, egcl_rt::fxhash::FxBuildHasher>,
+}
+
+static MAKE_INSTANCE_PLANS: LazyLock<SharedCell<MakeInstancePlans>> =
+    LazyLock::new(SharedCell::default);
+
+fn lock_ignoring_poison<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|error| error.into_inner())
+}
+
+/// Visit every form a plan holds. Runs with mutators stopped; no mutator holds
+/// a plan lock across an allocation.
+fn visit_make_instance_plan_roots(visit: &mut dyn FnMut(*mut EgclVal)) {
+    for entry in MAKE_INSTANCE_PLANS.borrow().entries.values() {
+        if let MakeInstancePlanEntry::Ready(plan) = entry {
+            for form in lock_ignoring_poison(&plan.forms).iter_mut() {
+                visit(form);
+            }
+        }
+    }
+}
+
+/// The current plan for instances of `class`, if it has one.
+fn make_instance_plan_for(class: EgclVal) -> Option<Arc<MakeInstancePlan>> {
+    let layout = egcl_stdlib::clos::class_layout_key(class)?;
+    let generation = GF_DISPATCH_GENERATION.load(AtomicOrdering::Acquire);
+    match MAKE_INSTANCE_PLANS.borrow().entries.get(&layout) {
+        Some(MakeInstancePlanEntry::Ready(plan)) if plan.generation == generation => {
+            Some(Arc::clone(plan))
+        }
+        _ => None,
+    }
+}
+
+/// Record that the general path just made an instance of `class` in
+/// `generation`, and make a plan the second time it does.
+fn note_make_instance_class(class: EgclVal, generation: u64, env: &mut Env) {
+    if GF_DISPATCH_GENERATION.load(AtomicOrdering::Acquire) != generation {
+        return;
+    }
+    let Some(layout) = egcl_stdlib::clos::class_layout_key(class) else {
+        return;
+    };
+    let build = {
+        let mut plans = MAKE_INSTANCE_PLANS.borrow_mut();
+        if plans.generation > generation {
+            return;
+        }
+        if plans.generation < generation {
+            // Every entry is stale; dropping them keeps the table bounded.
+            plans.generation = generation;
+            plans.entries.clear();
+        }
+        match plans.entries.get(&layout) {
+            Some(MakeInstancePlanEntry::Seen(seen)) => *seen == generation,
+            Some(MakeInstancePlanEntry::Ready(_) | MakeInstancePlanEntry::Declined) => false,
+            None => {
+                plans
+                    .entries
+                    .insert(layout, MakeInstancePlanEntry::Seen(generation));
+                false
+            }
+        }
+    };
+    if !build {
+        return;
+    }
+    let entry = match make_instance_plan_parts(class, generation, env) {
+        Some(plan) => MakeInstancePlanEntry::Ready(Arc::new(plan)),
+        None => MakeInstancePlanEntry::Declined,
+    };
+    // The plan's forms are unrooted until published; nothing here allocates.
+    let mut plans = MAKE_INSTANCE_PLANS.borrow_mut();
+    if plans.generation == generation
+        && GF_DISPATCH_GENERATION.load(AtomicOrdering::Acquire) == generation
+    {
+        plans.entries.insert(layout, entry);
+    }
+}
+
+fn initarg_name_valid(valid: &Option<Vec<String>>, name: &str) -> bool {
+    name != "ALLOW-OTHER-KEYS" && valid.as_ref().is_none_or(|names| names.iter().any(|n| n == name))
+}
+
+/// The slot symbols the initarg named `name` fills, as `resolve_slot_symbols`
+/// finds them, or `None` when it fills no slot.
+fn initarg_slot_symbols(env: &Env, class_name: &str, name: &str) -> Option<Box<[u32]>> {
+    let names = slots_for_initarg(env, class_name, name);
+    if names.is_empty() {
+        return None;
+    }
+    names
+        .iter()
+        .map(|slot| resolve_sym(slot).and_then(|symbol| symbol.symbol_index()))
+        .collect()
+}
+
+/// Compute a plan for `class` from the same helpers the general path uses, or
+/// `None` when the class needs something a plan does not cover.
+fn make_instance_plan_parts(
+    class: EgclVal,
+    generation: u64,
+    env: &mut Env,
+) -> Option<MakeInstancePlan> {
+    let class_name = class_name_for_instance_class(class);
+    if !env.classes.borrow().contains_key(&class_name) {
+        return None;
+    }
+    let mut effective = effective_slots_for_class(env, &class_name);
+    egcl_rt::rooted_ref!(_effective_root = &mut effective);
+    if effective
+        .iter()
+        .any(|slot| slot.allocation == SlotAllocation::Class)
+    {
+        return None;
+    }
+    let valid = valid_initarg_names(env, &class_name, &MAKE_INSTANCE_INIT_GENERICS);
+    let (default_names, default_forms): (Vec<String>, Vec<EgclVal>) =
+        effective_default_initargs(env, &class_name).into_iter().unzip();
+    egcl_rt::rooted!(default_forms = default_forms);
+    if default_names.len() > 64 {
+        return None;
+    }
+    let mut defaults = Vec::with_capacity(default_names.len());
+    for name in &default_names {
+        if !initarg_name_valid(&valid, name) {
+            return None;
+        }
+        let keyword = resolve_sym(&format!(":{name}"))?.symbol_index()?;
+        let slots = initarg_slot_symbols(env, &class_name, name)?;
+        defaults.push(MakeInstanceDefault { keyword, slots });
+    }
+    let mut initforms = Vec::new();
+    let mut initform_indices = Vec::new();
+    // Indexed: interning can collect, and the collector updates `effective`.
+    #[allow(clippy::needless_range_loop)]
+    for index in 0..effective.len() {
+        if effective[index].initform.is_none() {
+            continue;
+        }
+        let name = effective[index].name.clone();
+        initforms.push(resolve_sym(&name)?.symbol_index()?);
+        initform_indices.push(index);
+    }
+    let quote = quote_sym();
+    let funcall = EgclVal::from_symbol_index(egcl_rt::symbols::find_index("FUNCALL")?);
+    // No allocation from here until the caller publishes the plan.
+    let (kinds, forms): (Vec<PlanForm>, Vec<EgclVal>) = default_forms
+        .iter()
+        .copied()
+        .chain(
+            initform_indices
+                .iter()
+                .map(|&index| effective[index].initform.unwrap_or(NIL)),
+        )
+        .map(|form| classify_plan_form(form, quote, funcall))
+        .unzip();
+    Some(MakeInstancePlan {
+        generation,
+        class_name,
+        valid,
+        keys: Mutex::new(Vec::new()),
+        defaults,
+        initforms,
+        forms: Mutex::new(forms),
+        kinds,
+        shared_after: Mutex::new(None),
+        initialize_after: Mutex::new(None),
+    })
+}
+
+/// Work out what initarg `key` (symbol `symbol`) does under `plan`, and
+/// remember it. `None` when the plan does not cover it. Can allocate (interning).
+fn learn_make_instance_key(
+    plan: &MakeInstancePlan,
+    key: EgclVal,
+    symbol: u32,
+    env: &Env,
+) -> Option<(Box<[u32]>, u64)> {
+    let name = sym_bare_name_rc(key).to_string();
+    if !initarg_name_valid(&plan.valid, &name) {
+        return None;
+    }
+    let slots = initarg_slot_symbols(env, &plan.class_name, &name)?;
+    let mut covers = 0u64;
+    for (index, default) in plan.defaults.iter().enumerate() {
+        let default_name = sym_bare_name_rc(EgclVal::from_symbol_index(default.keyword));
+        if default_name.as_ref() == name {
+            covers |= 1 << index;
+        }
+    }
+    let mut keys = lock_ignoring_poison(&plan.keys);
+    if keys.len() < 64 && !keys.iter().any(|known| known.symbol == symbol) {
+        keys.push(MakeInstanceKey {
+            symbol,
+            slots: slots.clone(),
+            covers,
+        });
+    }
+    Some((slots, covers))
+}
+
+fn make_instance_plan_current(plan: &MakeInstancePlan) -> bool {
+    GF_DISPATCH_GENERATION.load(AtomicOrdering::Acquire) == plan.generation
+}
+
+/// MAKE-INSTANCE of `class` under `plan`. `None`, before anything has been
+/// evaluated, when the plan does not cover this call.
+fn make_instance_planned(
+    mut class: EgclVal,
+    plan: &MakeInstancePlan,
+    supplied: &[EgclVal],
+    env: &mut Env,
+) -> Option<Result<EgclVal, EgclError>> {
+    if supplied.len() % 2 != 0 {
+        return None;
+    }
+    egcl_rt::rooted_ref!(_class_root = &mut class);
+    rooted_args!(supplied = supplied);
+    // The slot-keyed initargs the stdlib core fills slots from.
+    egcl_rt::rooted!(initargs = Vec::<EgclVal>::with_capacity(supplied.len()));
+    let mut covered = 0u64;
+    let mut i = 0;
+    while i + 1 < supplied.len() {
+        let symbol = supplied[i].symbol_index()?;
+        let known = {
+            let keys = lock_ignoring_poison(&plan.keys);
+            match keys.iter().find(|known| known.symbol == symbol) {
+                Some(known) => {
+                    for &slot in known.slots.iter() {
+                        initargs.push(EgclVal::from_symbol_index(slot));
+                        initargs.push(supplied[i + 1]);
+                    }
+                    covered |= known.covers;
+                    true
+                }
+                None => false,
+            }
+        };
+        if !known {
+            let (slots, covers) = learn_make_instance_key(plan, supplied[i], symbol, env)?;
+            for &slot in slots.iter() {
+                initargs.push(EgclVal::from_symbol_index(slot));
+                initargs.push(supplied[i + 1]);
+            }
+            covered |= covers;
+        }
+        i += 2;
+    }
+    Some(make_instance_planned_run(
+        class, plan, supplied, &mut initargs, covered, env,
+    ))
+}
+
+fn make_instance_planned_run(
+    mut class: EgclVal,
+    plan: &MakeInstancePlan,
+    supplied: &[EgclVal],
+    initargs: &mut Vec<EgclVal>,
+    covered: u64,
+    env: &mut Env,
+) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted_ref!(_class_root = &mut class);
+    // The defaults that ran, as (keyword value) pairs: the protocol sees them
+    // after the caller's initargs.
+    egcl_rt::rooted!(defaulted = Vec::<EgclVal>::new());
+    for (index, default) in plan.defaults.iter().enumerate() {
+        if covered & (1 << index) != 0 {
+            continue;
+        }
+        let value = eval_plan_form(plan, index, env)?;
+        // CLHS 7.1.4: the leftmost initarg that fills a slot wins.
+        for &slot in default.slots.iter() {
+            let slot = EgclVal::from_symbol_index(slot);
+            if !initargs.chunks_exact(2).any(|pair| pair[0] == slot) {
+                initargs.push(slot);
+                initargs.push(value);
+            }
+        }
+        defaulted.push(EgclVal::from_symbol_index(default.keyword));
+        defaulted.push(value);
+    }
+    // Every initarg a plan accepts is valid; recheck only if a default's form
+    // changed the definitions.
+    if !make_instance_plan_current(plan) {
+        egcl_rt::rooted!(all = [supplied, &defaulted[..]].concat());
+        check_initargs_valid(env, &plan.class_name, &all, &MAKE_INSTANCE_INIT_GENERICS)?;
+    }
+    // `egcl_stdlib::make_instance` without its built-in-class check, which
+    // linearizes the class afresh on every call: the class was not built-in
+    // when the general path made this plan, and redefining it retires the
+    // plan. `initargs` is rooted by the caller.
+    let mut instance = if make_instance_plan_current(plan) {
+        let instance = egcl_stdlib::allocate_instance(class)?;
+        egcl_stdlib::initialize_instance(instance, initargs)?;
+        instance
+    } else {
+        egcl_stdlib::make_instance(class, initargs)?
+    };
+    egcl_rt::rooted_ref!(_instance_root = &mut instance);
+    if make_instance_plan_current(plan) {
+        let first = plan.defaults.len();
+        for (index, &slot) in plan.initforms.iter().enumerate() {
+            let slot = EgclVal::from_symbol_index(slot);
+            if egcl_stdlib::slot_boundp(instance, slot)? {
+                continue;
+            }
+            let value = eval_plan_form(plan, first + index, env)?;
+            egcl_stdlib::set_slot_value(instance, slot, value)?;
+        }
+    } else {
+        let explicit_slots: Vec<String> = initargs
+            .chunks_exact(2)
+            .map(|pair| sym_bare_name_rc(pair[0]).to_string())
+            .collect();
+        apply_class_initforms(instance, &plan.class_name, env, None, &explicit_slots)?;
+    }
+    // SHARED-INITIALIZE's :after methods run inside INITIALIZE-INSTANCE's
+    // primary, so before INITIALIZE-INSTANCE's own.
+    run_planned_after_methods(env, plan, "SHARED-INITIALIZE", instance, supplied, &defaulted)?;
+    run_planned_after_methods(env, plan, "INITIALIZE-INSTANCE", instance, supplied, &defaulted)?;
+    Ok(instance)
+}
+
+/// `run_initialization_aux_methods` for the :after methods of `gf_name`, with
+/// the selection cached in `plan` while it is current.
+fn run_planned_after_methods(
+    env: &mut Env,
+    plan: &MakeInstancePlan,
+    gf_name: &str,
+    instance: EgclVal,
+    supplied: &[EgclVal],
+    defaulted: &[EgclVal],
+) -> Result<(), EgclError> {
+    let shared = gf_name == "SHARED-INITIALIZE";
+    let cache = if shared {
+        &plan.shared_after
+    } else {
+        &plan.initialize_after
+    };
+    let current = make_instance_plan_current(plan);
+    let cached = if current {
+        lock_ignoring_poison(cache).clone()
+    } else {
+        None
+    };
+    if cached.as_ref().is_some_and(|ids| ids.is_empty()) {
+        return Ok(());
+    }
+    // (instance &rest initargs), or (instance slot-names &rest initargs) with
+    // slot-names T for SHARED-INITIALIZE.
+    let mut args = Vec::with_capacity(supplied.len() + defaulted.len() + 2);
+    args.push(instance);
+    if shared {
+        args.push(T);
+    }
+    args.extend_from_slice(supplied);
+    args.extend_from_slice(defaulted);
+    egcl_rt::rooted!(args = args);
+    let qualifier = egcl_stdlib::MethodQualifier::After;
+    if !current {
+        return run_initialization_aux_methods(env, gf_name, &args, qualifier);
+    }
+    let mut methods = match cached {
+        Some(ids) => match methods_by_ids(env, gf_name, &ids) {
+            Some(methods) => methods,
+            None => return run_initialization_aux_methods(env, gf_name, &args, qualifier),
+        },
+        None => {
+            // Applicability depends only on the instance's class: the
+            // remaining required argument is always T, and a fresh instance
+            // can match no EQL specializer. So one selection serves every
+            // instance with this layout.
+            let methods = select_initialization_aux_methods(env, gf_name, &args, qualifier);
+            let ids: Box<[EgclVal]> = methods.iter().map(|method| method.method_id).collect();
+            if make_instance_plan_current(plan) && ids.iter().all(|id| !id.is_heap_object()) {
+                *lock_ignoring_poison(cache) = Some(ids);
+            }
+            methods
+        }
+    };
+    egcl_rt::rooted_ref!(_methods_root = &mut methods);
+    #[allow(clippy::needless_range_loop)]
+    for index in 0..methods.len() {
+        invoke_method(env, &methods[index], &args, None)?;
+    }
+    Ok(())
+}
+
+/// Whether `symbol` is CL:MAKE-INSTANCE with no function installed in its
+/// place, so a compiled call cell can take `Target::MakeInstance`. Changing
+/// its function cell invalidates the cell; `make_instance_call` checks the
+/// rest per call.
+fn names_builtin_make_instance(symbol: u32) -> bool {
+    !egcl_rt::symbols::is_uninterned(symbol)
+        && egcl_rt::symbols::find_index("MAKE-INSTANCE") == Some(symbol)
+        && installed_function(symbol).is_none()
+        && global_fn("MAKE-INSTANCE").is_none()
+}
+
+thread_local! {
+    /// `(gf generation, direct-call generation, symbol, direct?)` for
+    /// `make_instance_call`.
+    static MAKE_INSTANCE_CALL_MEMO: std::cell::Cell<Option<(u64, u64, u32, bool)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// MAKE-INSTANCE called by name from a compiled call cell. Reaches the
+/// evaluated-arguments entry directly when `apply_function` would: no function
+/// replaces the builtin and MAKE-INSTANCE is not a generic function with
+/// methods. Otherwise, or when that cannot be shown, the full call.
+fn make_instance_call(
+    symbol: u32,
+    args: &[EgclVal],
+    env: &mut Env,
+) -> Result<EgclVal, EgclError> {
+    if !args.is_empty() && installed_function(symbol).is_none() {
+        let gf_generation = GF_DISPATCH_GENERATION.load(AtomicOrdering::Acquire);
+        let call_generation = bytecode::direct_call_gen();
+        let direct = match MAKE_INSTANCE_CALL_MEMO.with(std::cell::Cell::get) {
+            Some((gf, call, memo_symbol, direct))
+                if gf == gf_generation && call == call_generation && memo_symbol == symbol =>
+            {
+                direct
+            }
+            _ => {
+                // The order `apply_function_impl` resolves a symbol in.
+                let direct = names_builtin_make_instance(symbol)
+                    && named_call_target(env, "MAKE-INSTANCE", Some(symbol), true).is_none()
+                    && !env.generics.contains_key("MAKE-INSTANCE")
+                    && !env.methods.contains_key("MAKE-INSTANCE");
+                MAKE_INSTANCE_CALL_MEMO.with(|memo| {
+                    memo.set(Some((gf_generation, call_generation, symbol, direct)))
+                });
+                direct
+            }
+        };
+        if direct {
+            let result = make_instance_values(args, env);
+            env.clear_mv();
+            return result;
+        }
+    }
+    apply_function(EgclVal::from_symbol_index(symbol), args, env)
 }
 
 // ── Apply function (lambda or named) ─────────────────────────────
@@ -42781,6 +43489,15 @@ fn apply_builtin_fast(
         "SLOT-BOUNDP" if args.len() == 2 => {
             env.clear_mv();
             Some(slot_boundp_protocol(args[0], args[1], env))
+        }
+        // MAKE-INSTANCE with no methods on it (a generic is dispatched before
+        // this point): FUNCALL, APPLY and compiled calls take the same
+        // protocol as operator position without rebuilding a form
+        // (bliss-ih7pa).
+        "MAKE-INSTANCE" if !args.is_empty() => {
+            let result = make_instance_values(args, env);
+            env.clear_mv();
+            Some(result)
         }
         // Reachable through FUNCALL/APPLY/MAPCAR, not only operator position.
         "ALLOCATE-INSTANCE" if !args.is_empty() => {
