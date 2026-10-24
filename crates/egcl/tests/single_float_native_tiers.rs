@@ -32,6 +32,9 @@ const DEFINITIONS: &str = "\
     (defun feq (x y) (= x y)) \
     (defun fltk (x) (if (< x 2.0) 'small 'large)) \
     (defun ffib (n) (if (< n 2.0) n (+ (ffib (- n 1.0)) (ffib (- n 2.0))))) \
+    (defun fmixv (x y) (+ x y)) \
+    (defun fltv (x n) (< x n)) \
+    (dotimes (i 60) (fmixv 1.5 i) (fltv 1.5 i)) \
     (dotimes (i 60) \
       (fadd1 0.5) (fsub 2.5 1.0) (fmul 1.5 2.0) (fmix 1.5) (fbig 1.0) \
       (flt 1.0 2.0) (fle 1.0 2.0) (fgt 1.0 2.0) (fge 1.0 2.0) (feq 1.0 2.0) \
@@ -53,7 +56,10 @@ const PROBES: &str = "\
               (feq -0.0 0.0) (feq 2 2.0) (flt -0.0 0.0) (fle inf inf) (flt 1.0 inf) \
               (flt nan 1.0) (fle nan 1.0) (fgt nan 1.0) (fge 1.0 nan) (feq nan nan) \
               (fltk 1.5) (fltk 2.0) (fltk 1) (fltk 1/2) \
-              (ffib 15.0) (ffib 10.5) (ffib 5) (ffib 4d0))))";
+              (ffib 15.0) (ffib 10.5) (ffib 5) (ffib 4d0) \
+              (fmixv 1.5 2) (fmixv 2 3) (fmixv 1.5 16777217) (fmixv 1.5 1/2) \
+              (fmixv 0.5 -7) (fmixv 1.0 most-positive-fixnum) (fmixv 3 1.25) \
+              (fltv 2.5 2) (fltv 16777216.0 16777217) (fltv 1 2))))";
 
 fn run(envs: &[(&str, &str)]) -> String {
     let program = format!("(progn {DEFINITIONS} {PROBES})");
@@ -88,7 +94,8 @@ fn single_float_results_match_the_interpreter_at_every_tier() {
         T NIL NIL T T T NIL T NIL T NIL T NIL T T NIL T T \
         NIL T NIL T T \
         SMALL LARGE SMALL SMALL \
-        610.0 99.5 5.0 3.0d0)";
+        610.0 99.5 5.0 3.0d0 \
+        3.5 5 1.6777218e7 2.0 -6.5 1.1529215e18 4.25 NIL T T)";
     assert_eq!(interpreted, expected);
     for tier in ["t0", "t1", "t2"] {
         let compiled = run(&[("EGCL_FORCE_TIER", tier)]);
@@ -142,6 +149,49 @@ fn single_float_t1_runs_native_and_guards() {
     assert!(stdout.contains("T1 1000.0 0 1 1"), "{stdout}\n{stderr}");
     assert!(!stderr.contains("FADD1: T1 declined"), "{stderr}");
     assert!(stdout.contains("GUARD 1.5 T 2"), "both native guards must fail once: {stdout}\n{stderr}");
+}
+
+/// A single-float combined with a fixnum VARIABLE profiles as single-float
+/// (contagion). The speculated code must take an exactly representable fixnum
+/// natively instead of failing its guard on every call, and still deopt for a
+/// fixnum pair (whose answer is an integer) or a ratio. Checked at T1 with a
+/// warm profile and at T2.
+#[test]
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn single_float_with_fixnum_variable_runs_natively_without_deopts() {
+    let definitions = "\
+        (defun fmixv (x y) (+ x y)) \
+        (defun fltv (x n) (< x n))";
+    let measure = "\
+        (let ((before (egcl-ext:deopt-count))) \
+          (dotimes (i 1000) (fmixv 1.5 i) (fltv 2.5 i)) \
+          (format t \"STEADY ~S ~S ~S~%\" (- (egcl-ext:deopt-count) before) \
+            (egcl-ext:function-tier 'fmixv) (egcl-ext:function-tier 'fltv)))";
+    let t1 = format!("(progn {definitions} \
+        (dotimes (i 40) (fmixv 1.5 2) (fltv 1.5 2)) {measure} \
+        (let ((before (egcl-ext:deopt-count))) \
+          (format t \"GUARD ~S ~S~%\" (list (fmixv 2 3) (fmixv 1.5 1/2) (fltv 1 2)) \
+            (- (egcl-ext:deopt-count) before))))");
+    let (stdout, stderr) = run_logged(&t1,
+        &[("EGCL_T0_T1_THRESHOLD", "10"), ("EGCL_DISABLE_T2", "1"), ("EGCL_T2_LOG", "stderr")]);
+    assert!(stdout.contains("STEADY 0 1 1"), "{stdout}\n{stderr}");
+    assert!(stdout.contains("GUARD (5 2.0 T) 3"), "speculated guards must still fire: {stdout}\n{stderr}");
+
+    let t2 = format!("(progn {definitions} \
+        (loop repeat 20000 \
+              until (and (eql 2 (egcl-ext:function-tier 'fmixv)) \
+                         (eql 2 (egcl-ext:function-tier 'fltv))) \
+              do (fmixv 1.5 2) (fltv 1.5 2)) \
+        {measure})");
+    let (stdout, stderr) = run_logged(&t2, &[
+        ("EGCL_T0_T1_THRESHOLD", "2"),
+        ("EGCL_T2_THRESHOLD", "20"),
+        ("EGCL_T2_THREADS", "1"),
+        ("EGCL_T2_LOG", "stderr"),
+    ]);
+    assert!(stdout.contains("STEADY 0 2 2"), "{stdout}\n{stderr}");
+    assert!(stderr.contains("FMIXV: speculated 1 site(s)"), "{stderr}");
+    assert!(stderr.contains("FLTV: speculated 1 site(s)"), "{stderr}");
 }
 
 /// T2: the single-float Fibonacci compiles every arithmetic and comparison
