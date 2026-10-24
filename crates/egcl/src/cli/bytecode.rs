@@ -27314,6 +27314,17 @@ mod direct_call_invalidation_tests {
         }
     }
 
+    /// Whether an active lower-tier loop can enter `native` by OSR. A T2 loop
+    /// with an ordinary entry keeps its loop headers in a mapped companion.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn has_osr_target(native: &NativeCode) -> bool {
+        #[cfg(target_os = "linux")]
+        if let NativeCodeStorage::Mapped(code) = &native._storage {
+            return !code.osr_target_headers().is_empty();
+        }
+        !native.osr_entries.is_empty()
+    }
+
     #[cfg(all(target_arch = "x86_64", unix))]
     #[test]
     fn native_caller_preserves_its_frame_through_callee_guard_recovery() {
@@ -27383,7 +27394,7 @@ mod direct_call_invalidation_tests {
             input,
         })
         .expect("install callee T2 after caller emission");
-        assert!(!replacement.osr_entries.is_empty());
+        assert!(has_osr_target(&replacement));
         if checked_native_installation_allowed() {
             assert!(replacement.num_slots <= callee.num_slots);
         } else {
@@ -27457,10 +27468,7 @@ mod direct_call_invalidation_tests {
             input,
         })
         .expect("install replacement T2 code");
-        assert!(
-            !replacement.osr_entries.is_empty(),
-            "must have a real OSR target"
-        );
+        assert!(has_osr_target(&replacement), "must have a real OSR target");
         assert!(
             replacement.num_slots <= original.num_slots,
             "must reach version check, not frame-size refusal"

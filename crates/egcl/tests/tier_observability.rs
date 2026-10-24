@@ -2508,14 +2508,14 @@ fn t2_elides_unobservable_multiple_value_resets() {
         "a stale multiple-value state leaked through the T2 return:\n{stdout}"
     );
     if MAPPED_LINUX {
+        // A DOTIMES body gets the ordinary x86-64 Lisp entry (bliss-6m6ca).
         assert!(
-            stderr.contains("MV-LOOP: optimized worker result installed with mapped T2 ABI"),
-            "MV-LOOP must have an installed mapped T2 body: {stderr}"
+            stderr.contains("MV-LOOP: optimized worker result installed with ordinary x86-64 Lisp T2 ABI"),
+            "MV-LOOP must have an installed ordinary T2 body: {stderr}"
         );
         assert!(
-            stderr
-                .lines()
-                .any(|line| line.contains("MV-LOOP: mapped T2 emitted; clear_mv_resets=1,")),
+            stderr.lines().any(|line| line
+                .contains("MV-LOOP: ordinary x86-64 Lisp T2 emitted; clear_mv_resets=1,")),
             "only the final observable reset may survive in emitted IR: {stderr}"
         );
         return;

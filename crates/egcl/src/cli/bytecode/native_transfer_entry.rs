@@ -940,6 +940,19 @@ impl TransferCode {
         self.osr_companion.as_deref().unwrap_or(self)
     }
 
+    /// The code an active lower-tier loop enters by OSR: this code, or the
+    /// mapped companion an ordinary entry retains for its loop headers.
+    #[cfg(test)]
+    pub(super) fn osr_target(&self) -> *const Self {
+        self.osr_destination()
+    }
+
+    /// Bytecode loop headers that OSR can enter, in `osr_target`.
+    #[cfg(test)]
+    pub(super) fn osr_target_headers(&self) -> Vec<u32> {
+        self.osr_destination().osr_entries.keys().copied().collect()
+    }
+
     pub(super) fn needs_recompile(&self) -> bool {
         self.recompile.get()
     }
@@ -1201,9 +1214,10 @@ impl TransferCode {
         } else { None };
         let mut ordinary_arity = None;
         let mut ordinary_cold = None;
-        let ordinary = ordinary_ir.filter(|_| !ordinary_admission_suppressed()
+        let ordinary = ordinary_ir.filter(|ir| !ordinary_admission_suppressed()
             && fixed_tagged_parameters(&body)
-            && scope_free_native_body(&body, false))
+            && ordinary_native_body(&body)
+            && ordinary_single_frame_states(&body, ir))
             .and_then(|ir| {
                 use egcl_compiler::t2::emit::{OrdinaryLispEntryOptions, OrdinaryCallTarget, OrdinaryCallFlags};
                 let mut ir = ir.clone();
@@ -1264,6 +1278,11 @@ impl TransferCode {
                                     // re-enter run, and callbacks restore the
                                     // enclosing control before native resume.
                                     trusted_control: true,
+                                    // T2 is final: `record_loop_heat` has no
+                                    // promotion left to request, so an idle
+                                    // loop poll need not reach Rust. T1 keeps
+                                    // sampling the heat that promotes it.
+                                    top_tier: matches!(tier, CompilationTier::T2),
                                 }).inspect_err(|error| t2_log_write(format_args!(
                                     "{}: ordinary entry declined: {error:?}", display_fn_name(&body.name)
                                 ))).ok()
@@ -2201,6 +2220,37 @@ fn scope_free_native_body(body: &BytecodeFunction, allow_values: bool) -> bool {
     !body.has_env && local_control_native_body(body, allow_values, false, false)
 }
 
+/// A body the ordinary x86-64 Lisp entry may run: scope-free, or scope-free
+/// apart from local TAGBODYs (bliss-6m6ca). Every DOTIMES, DOLIST, DO and
+/// LOOP is one, so admitting them lets a loop call its callees through the
+/// ordinary ABI instead of preparing a mapped child activation per call.
+///
+/// A local `Go` names a tagbody of this same bytecode function: the compiler
+/// emits `GoNamed` for a tag owned by an enclosing function, and `NamedTag`
+/// (which `try_compile_variant` refuses) when a closure could capture a tag.
+/// With no closure, `#'`, catch, unwind or binding in the body, nothing
+/// outside this activation can transfer to its tags, so T2 lowers each `Go`
+/// to a plain jump and the ordinary frame keeps no runtime handler record.
+/// Deoptimization rebuilds the record from the exact scope map, as it does for
+/// a local BLOCK, so these bodies must not own more than one logical frame
+/// per guard (see `ordinary_single_frame_states`).
+pub(super) fn ordinary_native_body(body: &BytecodeFunction) -> bool {
+    !body.has_env && slot_parameters(body, false)
+        && body.code.iter().all(|op| local_control_op(op, false, false, false)
+            || matches!(op, Instr::PushTag { .. } | Instr::Go { .. }))
+}
+
+/// Whether a body uses the TAGBODY extension `ordinary_native_body` admits.
+fn has_local_tagbody(body: &BytecodeFunction) -> bool {
+    body.code.iter().any(|op| matches!(op, Instr::PushTag { .. }))
+}
+
+/// Retained self expansion reconstructs only local BLOCKs in nested logical
+/// frames. A tagbody body is admitted only while every guard owns one frame.
+fn ordinary_single_frame_states(body: &BytecodeFunction, ir: &egcl_compiler::t2::ir::Function) -> bool {
+    !has_local_tagbody(body) || ir.frame_states.iter().all(|(_, state)| state.scopes.len() == 1)
+}
+
 // Raw numeric locals use the existing managed activation's local control scopes.
 // Dynamic scopes, escaping control identities and MV still need independent
 // representation-aware contracts before they can share this narrow entry.
@@ -2225,15 +2275,19 @@ fn packed_f64_native_body(body: &BytecodeFunction, ir: &egcl_compiler::t2::ir::F
 }
 
 fn local_control_native_body(body: &BytecodeFunction, allow_values: bool, allow_local_scopes: bool, allow_primary_transport: bool) -> bool {
+    slot_parameters(body, allow_local_scopes)
+        && body.code.iter().all(|op| local_control_op(op, allow_values, allow_local_scopes, allow_primary_transport))
+}
+
+fn slot_parameters(body: &BytecodeFunction, allow_local_scopes: bool) -> bool {
     // Captured variables are helper-v2 Invokes on the activation's EnvFrame,
     // so a capturing body needs the local-scope (native cleanup) emitter.
-    ((body.param_layout.len() == usize::from(body.arity) || variadic_slot_parameters(body))
+    (body.param_layout.len() == usize::from(body.arity) || variadic_slot_parameters(body))
         && body
             .param_layout
             .iter()
             .all(|(_, location)| matches!(location, VarLoc::Slot(_)))
-        || allow_local_scopes && captured_activation_parameters(body))
-        && body.code.iter().all(|op| local_control_op(op, allow_values, allow_local_scopes, allow_primary_transport))
+        || allow_local_scopes && captured_activation_parameters(body)
 }
 
 /// The first instruction `local_control_native_body` refuses under the same

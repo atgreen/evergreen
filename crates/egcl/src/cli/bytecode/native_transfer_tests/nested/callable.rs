@@ -106,7 +106,10 @@ fn native_v2_callable_slot_reloads_a_moving_builtin_wrapper() {
     for form in ["((funcall function x))", "((apply function x nil))"] {
         let code = compile_caller("(function x)", form, &env);
         egcl_rt::rooted!(
-            prototype = super::super::super::super::read_eval_all_env("#'list", &mut env).unwrap()
+            // A builtin with no direct kernel: FUNCALL of one with a kernel
+            // (LIST, since #610) runs that kernel through the funcall_fast
+            // cache and never prepares a wrapped entry (bliss-6m6ca).
+            prototype = super::super::super::super::read_eval_all_env("#'vector", &mut env).unwrap()
         );
         egcl_rt::rooted!(
             source = super::super::super::super::reified_closure(*prototype)
@@ -127,7 +130,8 @@ fn native_v2_callable_slot_reloads_a_moving_builtin_wrapper() {
             native_callable::take_relocation(),
             "callable must move during entry preparation"
         );
-        assert_eq!(cp(*result), (EgclVal::from_fixnum(42), NIL));
+        assert_eq!(egcl_stdlib::length(*result).unwrap(), 1);
+        assert_eq!(egcl_stdlib::elt(*result, 0).unwrap(), EgclVal::from_fixnum(42));
     }
 }
 

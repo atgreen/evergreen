@@ -88,6 +88,11 @@ pub struct OrdinarySelfCallFacts {
     /// restore it before native resumption. The raw ordinary ABI alone does
     /// not establish this precondition (runtime adapters may have no control).
     pub trusted_control: bool,
+    /// The artifact is its function's final tier, so its loop polls need not
+    /// sample back-edge heat. Each poll then first tests the R13 execution's
+    /// pending-work slot, exactly as an ordinary call admits, and skips the
+    /// published runtime poll when nothing is armed (bliss-6m6ca).
+    pub top_tier: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -102,7 +107,7 @@ pub(super) struct OrdinaryCallEmission<'a> {
     pub(super) poll_veneer: Option<u64>,
     pub(super) self_calls: &'a [Inst],
     direct_self: bool,
-    self_facts: OrdinarySelfCallFacts,
+    pub(super) self_facts: OrdinarySelfCallFacts,
 }
 
 /// Emit a single named ordinary call followed immediately by returning its

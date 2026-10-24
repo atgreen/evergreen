@@ -1261,6 +1261,8 @@ fn emit_idle_poll_guard(a: &mut Asm, fast: NativePollFastPath, home: FramedHome,
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 struct PollFrame {
     fast_path: Option<(NativePollFastPath, FramedHome)>,
+    /// Ordinary final-tier code: skip an idle poll by testing R13's slot.
+    execution_idle: bool,
     arguments: Vec<(crate::t2::ir::Value, u32)>,
     native_frame_mode: bool,
     spill_area: NativeValueArea,
@@ -1286,7 +1288,16 @@ fn emit_mapped_poll(
         let idle = a.label();
         emit_idle_poll_guard(a, fast, home, idle);
         idle
-    });
+    }).or_else(|| frame.execution_idle.then(|| {
+        // The ordinary entry holds the current execution in R13 for its
+        // whole extent; ordinary call admission reads this same slot.
+        let idle = a.label();
+        let slow = a.label();
+        emit_execution_poll_guard(a, 13, slow);
+        a.jmp(idle);
+        a.bind(slow);
+        idle
+    }));
     for (index, home) in values.raw_registers().enumerate() {
         load_home(a, RAX, home, 0);
         store_home(
@@ -1331,7 +1342,7 @@ fn emit_mapped_poll(
     )?;
     if frame.native_frame_mode { mov_imm64(a, 7, 0); }
     else { load_home(a, 7, frame.base, 0); }
-    if heat && frame.fast_path.is_none() {
+    if heat && frame.fast_path.is_none() && !frame.execution_idle {
         a.extend_from_slice(&[0x48, 0x83, 0xcf, 0x01]); // or rdi,1
     }
     mov_imm64(a, RAX, veneer as i64);
@@ -6347,6 +6358,7 @@ fn emit_framed_inner(
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     let poll_frame = frame_base_home.zip(activation_slots).map(|(base, activation_slots)| PollFrame {
         fast_path: poll_fast_path.zip(poll_control_home),
+        execution_idle: ordinary_call.is_some_and(|call| call.self_facts.top_tier),
         arguments: native_arguments.clone(), native_frame_mode,
         spill_area, base, activation_slots, shadow_slots: shadow_root_slots, raw_spill_start: raw_poll_spill_start,
         native_slots: native_spill_slots,
@@ -10258,7 +10270,7 @@ mod poll_map_tests {
         let emit = |roots: &[crate::t2::ir::Value], shadow_slots| {
             let mut a = Asm::new();
             let (_, map) = emit_mapped_poll(&mut a, &values, roots, &homes.values,
-                &PollFrame { fast_path: None, arguments: Vec::new(), native_frame_mode: false, spill_area: NativeValueArea::Activation(0), base: FramedHome::Stack(1), activation_slots: 0, shadow_slots,
+                &PollFrame { fast_path: None, execution_idle: false, arguments: Vec::new(), native_frame_mode: false, spill_area: NativeValueArea::Activation(0), base: FramedHome::Stack(1), activation_slots: 0, shadow_slots,
                     raw_spill_start: 2, native_slots: 3 }, 0x12345678, false).unwrap();
             (a.finish().unwrap(), map)
         };
@@ -10423,7 +10435,7 @@ mod poll_map_tests {
                 &[tagged],
                 &homes.values,
                 &PollFrame {
-                    fast_path: None,
+                    fast_path: None, execution_idle: false,
                     arguments: Vec::new(), native_frame_mode: false,
                     spill_area: if native_storage { NativeValueArea::NativeStack(3) } else { NativeValueArea::Activation(1) },
                     base: FramedHome::Stack(1),
