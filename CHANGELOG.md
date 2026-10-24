@@ -385,7 +385,7 @@
 - Allocating an instance or a structure no longer discards every cached
   class precedence list, and a structure constructor no longer recomputes
   its class's precedence list on each call
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#593](https://github.com/atgreen/evergreen/pull/593)).
 - Iterating the symbols of a package that does not exist, with `loop` or
   `with-package-iterator`, signals `package-error` instead of iterating
   nothing ([#589](https://github.com/atgreen/evergreen/pull/589)).
