@@ -1365,6 +1365,42 @@ fn resolve(name: &str) -> Option<Handler> {
             Ok(args.get(2).copied().unwrap_or(NIL))
         }),
 
+        // Builtins that existed only in operator position, so compiled code
+        // reached them by synthesizing and re-evaluating a form at several
+        // microseconds a call. An ASDF load of Babel made ~150k STRING calls and
+        // ~150k compiled (setf aref)/(setf cdr) stores that way (bliss-qoy0k).
+        "EGCL::SET-AREF" | "EGCL::SET-ELT" => {
+            Some(|operator, args, _env| super::set_aref_values(operator, args))
+        }
+        "EGCL::SET-CAR" | "EGCL::SET-CDR" => {
+            Some(|operator, args, _env| super::set_cons_values(operator, args))
+        }
+        "STRING" => Some(|_operator, args, _env| {
+            if args.len() != 1 {
+                return Err(EgclError::ProgramError(format!(
+                    "STRING requires exactly 1 argument, got {}",
+                    args.len()
+                )));
+            }
+            super::string_value(args[0])
+        }),
+        "VECTOR" => Some(|_operator, args, _env| Ok(egcl_stdlib::build_simple_vector(args))),
+        "FIND-PACKAGE" => Some(|_operator, args, env| {
+            Ok(args
+                .first()
+                .map_or(NIL, |&designator| super::find_package_value(env, designator)))
+        }),
+        "GENSYM" => Some(|_operator, args, env| {
+            if args.len() > 1 {
+                return Err(EgclError::ProgramError(format!(
+                    "GENSYM accepts at most 1 argument, got {}",
+                    args.len()
+                )));
+            }
+            let args = RootedVals::new(args.to_vec());
+            super::gensym_value(env, args.first().copied())
+        }),
+
         "EGCL::%MAKE-STRUCT" => Some(|_operator, args, _env| {
             let args = RootedVals::new(args.to_vec());
 
