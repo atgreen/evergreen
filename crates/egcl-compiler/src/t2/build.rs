@@ -4380,6 +4380,10 @@ mod tests {
         // those two is therefore only meaningful on its own host. The
         // System Z, POWER and RISC-V emitters carry their own
         // host-independent assemblers and run everywhere (bliss-d2ter).
+        #[cfg_attr(
+            not(any(target_arch = "x86_64", target_arch = "aarch64")),
+            allow(unused_mut)
+        )]
         let mut backends = vec![
             (
                 "s390x",
@@ -4509,7 +4513,11 @@ mod tests {
             // those two is therefore only meaningful on its own host. The
             // System Z, POWER and RISC-V emitters carry their own
             // host-independent assemblers and run everywhere (bliss-d2ter).
-            let mut backends = vec![
+            #[cfg_attr(
+            not(any(target_arch = "x86_64", target_arch = "aarch64")),
+            allow(unused_mut)
+        )]
+        let mut backends = vec![
                 (
                     "s390x",
                     emit_s390x::emit_framed_with_runtime(
