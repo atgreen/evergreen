@@ -131,17 +131,22 @@ pub(super) unsafe extern "C" fn prepare_nested(cell: u64, record: *mut MappedCal
     // publishing or selecting first; the checked call does both. Pending
     // work still takes the full path, whose poll services it at this call.
     if unsafe { call_table::mapped_callee_declines(cell) } && current_poll_idle() {
-        unsafe {
-            (*record).entry = std::ptr::null();
-            (*record).activation = std::ptr::null_mut();
-            (*record).owner = std::ptr::null_mut();
-            (*record).forward = std::ptr::null();
-            (*record).outcome = NativeOutcome { value: NIL, exit: NativeExit::Returned };
-        }
+        unsafe { decline_to_checked(record) };
+        return;
+    }
+    // A FUNCALL whose callable already has a cached target needs no child:
+    // the checked call runs that target directly (bliss-vwgb0).
+    if unsafe { call_table::is_builtin_funcall(cell) && super::funcall_fast::cached(record) }
+        && current_poll_idle()
+    {
+        unsafe { decline_to_checked(record) };
         return;
     }
     prepare_call(record, || unsafe {
         let invocation = &mut *(*record).context;
+        if call_table::is_builtin_funcall(cell) && super::funcall_fast::prepare(record) {
+            return Ok(NIL);
+        }
         if call_table::is_builtin_funcall(cell) && invocation.nargs != 0 {
             if let Some(entries) = super::super::native_callable::entries_for(*invocation.args) {
                 (*record).target = invocation.args as u64;
@@ -156,6 +161,17 @@ pub(super) unsafe extern "C" fn prepare_nested(cell: u64, record: *mut MappedCal
         }
         prepare_child(record, || call_table::mapped_callee(cell))
     });
+}
+
+/// Leave the call to the adapter's checked slot, as a declined preparation does.
+unsafe fn decline_to_checked(record: *mut MappedCallRecord) {
+    unsafe {
+        (*record).entry = std::ptr::null();
+        (*record).activation = std::ptr::null_mut();
+        (*record).owner = std::ptr::null_mut();
+        (*record).forward = std::ptr::null();
+        (*record).outcome = NativeOutcome { value: NIL, exit: NativeExit::Returned };
+    }
 }
 
 pub(in crate::cli::bytecode) unsafe extern "C" fn prepare_callable(

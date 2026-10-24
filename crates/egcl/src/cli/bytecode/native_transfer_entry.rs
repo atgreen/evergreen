@@ -39,6 +39,7 @@ mod deopt;
 pub(super) use deopt::with_ordinary_guard_resume_observer_for_test;
 mod native_frames;
 mod lean_root;
+pub(super) mod funcall_fast;
 #[cfg(test)]
 pub(super) use lean_root::take_lean_root_entries_for_test;
 pub(super) mod ordinary_calls;
@@ -680,7 +681,9 @@ unsafe extern "C" fn checked_call_published(
     PUBLISHED_CHECKED_CALLS.with(|count| count.set(count.get() + 1));
     unsafe {
         root_publication::published_mapped(record, || {
-            if !call_lean_target(target, record) {
+            let direct = call_lean_target(target, record)
+                || (call_table::is_builtin_funcall(target) && funcall_fast::call(record));
+            if !direct {
                 call_table::checked_call(target, record);
             }
             if (*record).outcome.exit == NativeExit::Returned {

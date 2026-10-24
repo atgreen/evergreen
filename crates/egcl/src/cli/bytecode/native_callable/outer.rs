@@ -84,6 +84,14 @@ pub(super) fn invoke(
     args: &[EgclVal],
     env: &mut Env,
 ) -> Result<EgclVal, EgclError> {
+    // A function object whose installed native code is already selected runs
+    // directly: that code's entry polls and owns a segment of its own, as it
+    // does when the adapter below reaches it through `apply_function_impl`
+    // (bliss-vwgb0). Everything else keeps the published entry.
+    let admit = native_transfer_entry::funcall_fast::Admit::Native;
+    if let Some(result) = native_transfer_entry::funcall_fast::apply(function, args, env, admit) {
+        return result;
+    }
     egcl_rt::rooted!(function = function);
     egcl_rt::rooted!(args = args.to_vec());
     let entry = ordinary_entry().ok_or_else(|| {

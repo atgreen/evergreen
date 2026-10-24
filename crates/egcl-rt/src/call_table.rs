@@ -260,6 +260,7 @@ impl Table {
     }
 
     fn invalidate(&mut self, ordinal: usize) {
+        INVALIDATION_EPOCH.fetch_add(1, Ordering::AcqRel);
         let binding = &mut self.bindings[ordinal];
         binding.revision = binding.revision.wrapping_add(1);
         binding.cells.retain(|weak| {
@@ -304,6 +305,17 @@ static TABLE: OnceLock<Mutex<Table>> = OnceLock::new();
 /// Bumped after every change to any cell's published ordinary entry. A
 /// directory that saw no change since its last sweep has nothing to retire.
 static ORDINARY_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// Bumped by every invalidation of any binding: a definition change, a tier
+/// publication or a broad native-code invalidation.
+static INVALIDATION_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// The current invalidation epoch. A cache of call targets that records it
+/// when it selects a target, and rejects the target once it has changed, sees
+/// every change that would make a call cell select again.
+pub fn invalidation_epoch() -> u64 {
+    INVALIDATION_EPOCH.load(Ordering::Acquire)
+}
 
 /// The current ordinary publication epoch. Read it BEFORE inspecting the
 /// slots it summarizes: a change racing that inspection then shows up as a
@@ -378,6 +390,8 @@ pub unsafe fn publish_ordinary(cell: &CallCell, descriptor: &OrdinaryEntryDescri
 }
 
 pub fn invalidate(symbol: u32) {
+    // Even a name no cell has resolved yet: callable caches key on this.
+    INVALIDATION_EPOCH.fetch_add(1, Ordering::AcqRel);
     let Some(table) = TABLE.get() else { return };
     let mut table = table.lock().unwrap();
     if let Some(&ordinal) = table.by_symbol.get(&symbol) {
@@ -401,6 +415,7 @@ pub unsafe fn publish_ordinary_with_heat(
 /// Existing broad native-code invalidations also redirect callable slots.
 /// This runs on definition/tier changes, never on an ordinary warmed call.
 pub fn invalidate_all() {
+    INVALIDATION_EPOCH.fetch_add(1, Ordering::AcqRel);
     let Some(table) = TABLE.get() else { return };
     let mut table = table.lock().unwrap();
     for ordinal in 0..table.bindings.len() {
