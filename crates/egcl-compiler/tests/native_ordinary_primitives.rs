@@ -68,7 +68,7 @@ fn global_value_read_compiles_through_the_ordinary_abi() {
         &f,
         OrdinaryLispEntryOptions {
             arity: 0,
-            arity_error_veneer: 1,
+            arity_error_veneer: 1, binding: None,
         },
         &targets,
         OrdinaryCallFlags {
@@ -187,7 +187,7 @@ fn semantic_store_keeps_its_continuation_and_discards_the_primary() {
         &f,
         OrdinaryLispEntryOptions {
             arity: 0,
-            arity_error_veneer: 1,
+            arity_error_veneer: 1, binding: None,
         },
         &targets,
         OrdinaryCallFlags {

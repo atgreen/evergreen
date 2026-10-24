@@ -15,6 +15,42 @@ pub struct OrdinaryLispEntryOptions {
     /// The veneer must publish every actual argument and closure before any
     /// collecting/unwinding helper; it cannot use the rejected fixed arity.
     pub arity_error_veneer: u64,
+    /// How an entry that accepts other than exactly `arity` arguments binds
+    /// them (bliss-6m6ca). `None` accepts exactly `arity` arguments.
+    pub binding: Option<OrdinaryArgumentBinding>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum OrdinaryArgumentBinding {
+    Optional(OrdinaryOptionalArguments),
+    Keywords(OrdinaryKeywordArguments),
+}
+
+/// An entry accepting `min_arity..=arity` register arguments. Each omitted
+/// parameter is set to `unsupplied`, the runtime's unsupplied-argument
+/// marker, before the body runs, exactly as the managed activation entry
+/// binds it; the body's own prologue then evaluates the default. Every
+/// accepted argument arrives in a register, so `arity` is at most three.
+#[derive(Clone, Copy, Debug)]
+pub struct OrdinaryOptionalArguments {
+    pub min_arity: usize,
+    pub unsupplied: u64,
+}
+
+/// A `&key` entry. The body is a fixed `arity`-argument function of its
+/// bound parameter slots, at most three. The entry passes the actual
+/// arguments to `bind(plan, registers, overflow, count, out) -> u64`, a
+/// noncollecting leaf that never signals: it writes `arity` bound values to
+/// `out` and returns nonzero, or returns zero having written nothing. On
+/// success the entry enters the body with those values. Otherwise it
+/// tail-jumps to `decline` with every incoming register intact, exactly as a
+/// wrong-arity entry reaches its veneer; that veneer completes the call
+/// through the general binder, which signals any argument error.
+#[derive(Clone, Copy, Debug)]
+pub struct OrdinaryKeywordArguments {
+    pub bind: u64,
+    pub plan: u64,
+    pub decline: u64,
 }
 
 /// Emit an environment-free ordinary entry for a bounded tagged leaf.

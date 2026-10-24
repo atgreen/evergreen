@@ -97,6 +97,18 @@
   parameters, and `apply`, also get cheaper: `apply` of a function object from
   a loop drops from about 1.8 µs to 0.75 µs and `funcall` of a symbol from
   2.7 µs to 1.6 µs ([#621](https://github.com/atgreen/evergreen/pull/621)).
+- On x86-64 Linux, optimized code now calls more kinds of functions with a
+  direct machine call, as it calls fixed-arity functions since #621:
+  - A function whose trailing parameters are `&optional` (at most three
+    parameters): a warmed call from a loop drops from about 640 ns to 15 ns.
+  - A function with `&key` parameters whose defaults are constants, binding at
+    most three variables: about 680 ns to 30 ns.
+  - A function that computes with raw double-floats, and a loop that
+    accumulates them: a call to a function returning `(+ x 1d0)` drops from
+    about 880 ns to 180 ns, most of which is boxing the argument and the
+    result.
+
+  ([#PR](https://github.com/atgreen/evergreen/pull/PR))
 - More than 50 builtins called from compiled code no longer rebuild and
   re-evaluate their call form each time. They include `evenp`, `oddp`, `/`,
   `member` and `assoc` with `:test` or `:key`, `mapcar`, `map`, `format`,

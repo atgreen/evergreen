@@ -520,7 +520,11 @@ pub fn emit_framed_ordinary_function_with_self_call_facts(
         flags.signal_epoch].contains(&0)
     { return Err(declined("missing veneer or flag address")); }
     if crate::t2::verify::verify(f).is_err() { return Err(declined("IR verification")); }
-    if (0..f.num_values()).any(|v| f.value(Value(v as u32)).repr != ValueRepresentation::Tagged) {
+    // Raw doubles live in native homes and are reboxed on deoptimization
+    // (bliss-k4psf). Other raw representations have no ordinary support.
+    if (0..f.num_values()).any(|v| !matches!(f.value(Value(v as u32)).repr,
+        ValueRepresentation::Tagged | ValueRepresentation::UnboxedF64))
+    {
         return Err(declined("untagged value"));
     }
     if f.frame_states.iter().any(|(_, state)| {
@@ -559,13 +563,21 @@ pub fn emit_framed_ordinary_function_with_self_call_facts(
                         && (position == 0 || !returns.contains(&insts[position - 1])))
                     { return Err(declined("return of possibly multiple values")); }
                 }
+                // Arithmetic on raw doubles cannot fail and carries no guard.
+                Opcode::FloatAdd | Opcode::FloatSub | Opcode::FloatMul | Opcode::FloatDiv
+                | Opcode::FloatCmpEq | Opcode::FloatCmpLt | Opcode::FloatCmpLe
+                | Opcode::FloatCmpGt | Opcode::FloatCmpGe
+                    if data.args.iter().all(|&v| f.value(v).repr == ValueRepresentation::UnboxedF64) => {}
+                Opcode::ConstDouble | Opcode::BoxFloat => {}
                 Opcode::Guard | Opcode::FixnumAdd | Opcode::FixnumSub | Opcode::FixnumMul
                 | Opcode::FixnumNeg | Opcode::FixnumShl | Opcode::FixnumShr
                 | Opcode::FloatAdd | Opcode::FloatSub | Opcode::FloatMul
                 | Opcode::FloatCmpEq | Opcode::FloatCmpLt | Opcode::FloatCmpLe
-                | Opcode::FloatCmpGt | Opcode::FloatCmpGe => {
+                | Opcode::FloatCmpGt | Opcode::FloatCmpGe | Opcode::UnboxFloat => {
                     if data.frame_state.is_none() {
-                        return Err(declined("guarded operation without a frame state"));
+                        // Name the operation: an unguarded one is a shape
+                        // this emitter does not model, not a missing state.
+                        return Err(EmitError::UnsupportedOp(super::op_tag(data.opcode)));
                     }
                 }
                 Opcode::ConstFixnum | Opcode::ConstFloat | Opcode::ConstNil | Opcode::ConstT

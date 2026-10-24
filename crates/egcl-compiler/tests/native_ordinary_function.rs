@@ -316,7 +316,7 @@ fn execute_with_self_stack_bound(f: &Function, arity: usize, args: &[u64; 7], ex
         f,
         OrdinaryLispEntryOptions {
             arity,
-            arity_error_veneer: rejected as *const () as u64,
+            arity_error_veneer: rejected as *const () as u64, binding: None,
         },
         &targets,
         flags,
@@ -510,7 +510,7 @@ fn ordinary_entry_rejects_unpolled_cycles() {
         &f,
         OrdinaryLispEntryOptions {
             arity: 0,
-            arity_error_veneer: 1,
+            arity_error_veneer: 1, binding: None,
         },
         &[],
         OrdinaryCallFlags {

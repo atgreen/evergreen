@@ -13,6 +13,8 @@
 //! hot, THROW, conditions, restarts and UNWIND-PROTECT across the loop, zero
 //! and multiple values, allocating callees, deep recursion and stack
 //! exhaustion, wrong argument counts, and FUNCALL/APPLY of every designator.
+//! A callee whose trailing parameters are `&optional` gets an ordinary entry
+//! too, which binds each omitted parameter as the managed entry does.
 //!
 //! The expected lines were taken from the tree-walker.
 
@@ -250,4 +252,150 @@ fn deep_recursion_through_looping_frames_signals_storage_condition() {
         let (out, _) = run(tier, program, &[]);
         assert_eq!(result_line(tier, &out), "RESULT (2000 :STORAGE-CONDITION)", "tier {tier:?}:\n{out}");
     }
+}
+
+#[test]
+fn optional_callees_bind_omitted_parameters_through_the_ordinary_entry() {
+    check_all_tiers(
+        r#"
+(progn
+  (defun oo-1 (a &optional (b 10) (c (+ a b) c-p)) (list a b c c-p))
+  (defun oo-0 (&optional x) (if x (* x 2) :none))
+  (defun oo-2 (a &optional b) (+ a (or b 1)))
+  (defun oo-alloc (a &optional (b (list a a))) (cons a b))
+  (defun oo-rec (n &optional (acc 0)) (if (= n 0) acc (oo-rec (- n 1) (+ acc n))))
+  (defun oo-drive-1 (n) (let ((r nil)) (dotimes (i n r) (setq r (list (oo-1 i) (oo-1 i 2) (oo-1 i 2 3))))))
+  (defun oo-drive-0 (n) (let ((r nil)) (dotimes (i n r) (setq r (list (oo-0) (oo-0 i))))))
+  (defun oo-drive-2 (n x) (let ((s x)) (dotimes (i n s) (setq s (oo-2 s)) (setq s (oo-2 s i)))))
+  (defun oo-drive-alloc (n)
+    (let ((acc nil)) (dotimes (i n) (push (oo-alloc i) acc) (push (oo-alloc i :x) acc))
+      (list (length acc) (first acc) (second acc) (car (last acc)))))
+  (defun oo-few (n) (let ((r nil)) (dotimes (i n r) (setq r (oo-2)))))
+  (defun oo-many (n) (let ((r nil)) (dotimes (i n r) (setq r (oo-2 1 2 3)))))
+  (defun oo-fo (f n) (let ((r nil)) (dotimes (i n r) (setq r (list (funcall f i) (funcall f i 5))))))
+  (dotimes (j 40) (oo-drive-1 100) (oo-drive-0 100) (oo-drive-2 100 0) (oo-drive-alloc 50)
+    (oo-rec 50) (oo-fo #'oo-2 10))
+  (format t "RESULT ~S~%"
+          (list (oo-drive-1 1000) (oo-drive-0 1000)
+                (oo-drive-2 1000 0) (oo-drive-2 100 most-positive-fixnum) (oo-drive-2 100 0.5)
+                (handler-case (oo-few 3) (program-error () :program-error)
+                  (error (e) (list :error (type-of e))))
+                (handler-case (oo-many 3) (program-error () :program-error)
+                  (error (e) (list :error (type-of e))))
+                (oo-fo #'oo-2 100) (oo-fo 'oo-2 100)
+                (oo-drive-alloc 3000) (oo-rec 300) (oo-rec 100 most-positive-fixnum))))
+"#,
+        "RESULT (((999 10 1009 NIL) (999 2 1001 NIL) (999 2 3 T)) (:NONE 1998) 500500 \
+         1152921504606852025 5050.5 :PROGRAM-ERROR :PROGRAM-ERROR (100 104) (100 104) \
+         (6000 (2999 . :X) (2999 2999 2999) (0 0 0)) 45150 1152921504606852025)",
+    );
+}
+
+#[test]
+fn keyword_callees_bind_through_the_ordinary_entry() {
+    check_all_tiers(
+        r#"
+(progn
+  (defun ok-0 (&key value) value)
+  (defun ok-1 (a &key (b 10) (c nil c-p)) (list a b c c-p))
+  (defun ok-2 (&key x) (if x (* x 2) :none))
+  (defun ok-3 (a &key b) (+ a (or b 1)))
+  (defun ok-4 (a &optional (o 5) &key (z 7)) (list a o z))
+  (defun ok-5 (a &key (b (list a))) (cons a b))
+  (defun ok-6 (a &key b &allow-other-keys) (list a b))
+  (defun ok-rec (n &key (acc 0)) (if (= n 0) acc (ok-rec (- n 1) :acc (+ acc n))))
+  (defun ok-cell (a &key (tag :t)) (list a tag (make-string 2 :initial-element #\y)))
+  (defun ok-drive-1 (n)
+    (let ((r nil)) (dotimes (i n r)
+      (setq r (list (ok-1 i) (ok-1 i :b 2) (ok-1 i :c 3) (ok-1 i :c 3 :b 4) (ok-1 i :b 1 :b 2))))))
+  (defun ok-drive-2 (n) (let ((r nil)) (dotimes (i n r) (setq r (list (ok-2) (ok-2 :x i))))))
+  (defun ok-drive-3 (n x) (let ((s x)) (dotimes (i n s) (setq s (ok-3 s)) (setq s (ok-3 s :b i)))))
+  (defun ok-drive-4 (n) (let ((r nil)) (dotimes (i n r) (setq r (list (ok-4 i) (ok-4 i 1) (ok-4 i 1 :z 2))))))
+  (defun ok-drive-5 (n) (let ((r nil)) (dotimes (i n r) (setq r (list (ok-5 i) (ok-5 i :b 3))))))
+  (defun ok-drive-6 (n) (let ((r nil)) (dotimes (i n r) (setq r (list (ok-6 i :q 1) (ok-6 i :b 2 :zz 3))))))
+  (defun ok-alloc (n)
+    (let ((acc nil)) (dotimes (i n) (push (ok-cell i) acc) (push (ok-cell i :tag :u) acc))
+      (list (length acc) (first acc) (second acc))))
+  (defun ok-odd (n) (let ((r nil)) (dotimes (i n r) (setq r (ok-3 1 :b)))))
+  (defun ok-unknown (n) (let ((r nil)) (dotimes (i n r) (setq r (ok-3 1 :zz 2)))))
+  (defun ok-few (n) (let ((r nil)) (dotimes (i n r) (setq r (ok-3)))))
+  (defun ok-aok (n) (let ((r nil)) (dotimes (i n r) (setq r (ok-3 1 :zz 2 :allow-other-keys t)))))
+  (defun ok-aok-nil (n) (let ((r nil)) (dotimes (i n r) (setq r (ok-3 1 :allow-other-keys nil :b 5)))))
+  (defun ok-fk (f n) (let ((r nil)) (dotimes (i n r) (setq r (list (funcall f i) (funcall f i :b 5))))))
+  (dotimes (j 40) (ok-drive-1 50) (ok-drive-2 50) (ok-drive-3 50 0) (ok-drive-4 50) (ok-drive-5 50)
+    (ok-drive-6 50) (ok-rec 50) (ok-alloc 50) (ok-fk #'ok-3 10))
+  ;; Called from the evaluator, before and after it tiers: the managed
+  ;; activation binds and enters past the keyword entry, even for a leaf.
+  (let ((direct (loop for i below 60 sum (ok-0 :value i)))
+        (errors (mapcar (lambda (f) (handler-case (funcall f 3) (program-error () :program-error)
+                                      (error (e) (list :error (type-of e)))))
+                        (list #'ok-odd #'ok-unknown #'ok-few))))
+    (format t "RESULT ~S~%"
+            (list direct (ok-drive-1 1000) (ok-drive-2 1000)
+                  (ok-drive-3 1000 0) (ok-drive-3 100 most-positive-fixnum) (ok-drive-3 100 0.5)
+                  (ok-drive-4 1000) (ok-drive-5 1000) (ok-drive-6 1000) errors
+                  (ok-aok 3) (ok-aok-nil 3) (ok-fk #'ok-3 100) (ok-fk 'ok-3 100)
+                  (ok-rec 100) (ok-rec 100 :acc most-positive-fixnum) (ok-alloc 3000)))))
+"#,
+        "RESULT (1770 ((999 10 NIL NIL) (999 2 NIL NIL) (999 10 3 T) (999 4 3 T) (999 1 NIL NIL)) \
+         (:NONE 1998) 500500 1152921504606852025 5050.5 ((999 5 7) (999 1 7) (999 1 2)) \
+         ((999 999) (999 . 3)) ((999 NIL) (999 2)) (:PROGRAM-ERROR :PROGRAM-ERROR :PROGRAM-ERROR) \
+         2 6 (100 104) (100 104) 5050 1152921504606852025 (6000 (2999 :U \"yy\") (2999 :T \"yy\")))",
+    );
+}
+
+/// A warmed `&key` callee is entered natively: it installs the ordinary
+/// entry rather than staying on the mapped ABI.
+#[test]
+fn a_keyword_callee_installs_the_ordinary_entry() {
+    if !cfg!(all(target_arch = "x86_64", target_os = "linux")) {
+        return;
+    }
+    let program = r#"
+(progn
+  (defun ok-key (a &key (b 0)) (+ a b))
+  (defun ok-key-caller (n) (let ((s 0)) (dotimes (i n s) (setq s (ok-key s :b 1)))))
+  (dotimes (j 40) (ok-key-caller 1000))
+  (format t "RESULT ~D TIER ~D~%" (ok-key-caller 100000) (egcl-ext:function-tier 'ok-key)))
+"#;
+    let (out, log) = run(None, program, &[("EGCL_T2_LOG", "stderr")]);
+    assert_eq!(result_line(None, &out), "RESULT 100000 TIER 2", "{out}\n{log}");
+    assert!(
+        log.lines().any(|line| line
+            .contains("OK-KEY: optimized worker result installed with ordinary x86-64 Lisp T2 ABI")),
+        "{log}"
+    );
+}
+
+/// Raw double-float bodies get the ordinary entry too (bliss-k4psf): a
+/// guard failing in one, as caller or callee, reboxes its raw values for the
+/// interpreter, which then finishes the call with the generic arithmetic.
+#[test]
+fn double_float_bodies_call_and_deoptimize_through_the_ordinary_entry() {
+    check_all_tiers(
+        r#"
+(progn
+  (defun od-g1 (x) (+ x 1d0))
+  (defun od-g2 (x y) (let ((d (- x y))) (* d d)))
+  (defun od-g4 (a b c d) (declare (double-float a b c d)) (+ (* a b) (* c d)))
+  (defun od-loop-g1 (n x) (let ((s x)) (dotimes (i n s) (setq s (od-g1 s)))))
+  (defun od-loop-mix (lst) (let ((s 0d0)) (dolist (e lst s) (setq s (+ s (od-g2 e 1d0))))))
+  (defun od-loop-g4 (n) (let ((s 0d0)) (dotimes (i n s) (setq s (+ s (od-g4 s 0.5d0 1d0 2d0))))))
+  (defun od-boxing (n)
+    (let ((acc nil)) (dotimes (i n) (push (od-g1 (float i 1d0)) acc))
+      (list (length acc) (first acc) (car (last acc)))))
+  (dotimes (j 300) (od-loop-g1 50 0d0) (od-loop-mix (list 1d0 2d0 3d0)) (od-loop-g4 50)
+    (od-boxing 20))
+  (format t "RESULT ~S~%"
+          (list (od-loop-g1 1000 0d0) (od-loop-g1 10 5) (od-loop-g1 10 1/2) (od-loop-g1 10 2.5f0)
+                (od-loop-mix (list 1d0 2d0 3 4/3 5.0f0 6d0))
+                (handler-case (od-loop-g1 3 "x") (type-error () :type-error)
+                  (error (e) (list :error (type-of e))))
+                (od-boxing 3000) (od-loop-g4 1000)
+                (handler-case (od-g4 1d0 2d0 3d0 4) (type-error () :type-error)
+                  (error (e) (list :error (type-of e)))))))
+"#,
+        "RESULT (1000.0d0 15.0d0 10.5d0 12.5d0 46.111111111111114d0 :TYPE-ERROR \
+         (3000 3000.0d0 1.0d0) 4.935362387624709d176 14.0d0)",
+    );
 }

@@ -385,3 +385,122 @@ impl VariadicPlan {
         true
     }
 }
+
+/// The most bound values an ordinary `&key` entry passes in registers.
+pub(super) const NATIVE_KEYWORD_VALUES: usize = 3;
+
+impl VariadicPlan {
+    /// The plan for `func` when every call it can bind needs no evaluation:
+    /// required, `&optional` and `&key` parameters with constant defaults,
+    /// no `&rest`, and at most [`NATIVE_KEYWORD_VALUES`] bound values. An
+    /// ordinary `&key` entry binds through [`native_keyword_bind`] with it.
+    pub(super) fn native_keywords(func: &BytecodeFunction) -> Option<&VariadicPlan> {
+        let plan = Self::of(func)?;
+        let constant = |initial: &Initial| matches!(initial, Initial::Constant(_));
+        (plan.keys.is_some() && !plan.rest
+            && plan.values <= NATIVE_KEYWORD_VALUES
+            && plan.optionals.iter().all(|optional| constant(&optional.initial))
+            && plan.keys.iter().flatten().all(|key| constant(&key.initial))
+            && plan.aux.iter().all(constant)
+            && func.param_layout.iter().enumerate()
+                .all(|(index, (_, location))| matches!(location, VarLoc::Slot(slot) if usize::from(*slot) == index)))
+        .then_some(plan)
+    }
+
+    /// `bind` for an ordinary entry: the values it would store in slots
+    /// `0..values`, written to `out`, or `false` having written nothing.
+    /// It reads only immediate argument words and recognizes a keyword only
+    /// by the symbol `bind` last matched, so it takes no lock, allocates
+    /// nothing and cannot collect, signal or panic. Every call it declines,
+    /// the general binder handles, and teaches it the keywords used.
+    fn bind_native(&self, args: impl Fn(usize) -> EgclVal, count: usize, out: &mut [EgclVal]) -> bool {
+        let Some(keys) = &self.keys else { return false };
+        let positional = self.required + self.optionals.len();
+        if count < self.required || out.len() != self.values {
+            return false;
+        }
+        let tail_start = count.min(positional);
+        if (count - tail_start) % 2 != 0 {
+            return false;
+        }
+        // `native_keywords` admits at most this many keys.
+        if keys.len() > NATIVE_KEYWORD_VALUES {
+            return false;
+        }
+        let mut supplied: u64 = 0;
+        let mut key_values = [0usize; NATIVE_KEYWORD_VALUES];
+        for at in (tail_start..count).step_by(2) {
+            let key = args(at);
+            // `:allow-other-keys` and an unknown keyword never match a cached
+            // spec; the general binder decides what they mean.
+            let index = keys.iter().position(|spec| key.is_symbol() && spec.seen.load(Ordering::Relaxed) == key.0);
+            let Some(index) = index else { return false };
+            // The first occurrence of a keyword supplies it (CLHS 3.4.1.4).
+            if supplied & (1 << index) == 0 {
+                supplied |= 1 << index;
+                key_values[index] = at + 1;
+            }
+        }
+        let mut at = 0;
+        let mut push = |value: EgclVal| {
+            out[at] = value;
+            at += 1;
+        };
+        for index in 0..self.required {
+            push(args(index));
+        }
+        for (index, optional) in self.optionals.iter().enumerate() {
+            let Initial::Constant(initial) = optional.initial else { return false };
+            let given = self.required + index < count;
+            push(if given { args(self.required + index) } else { initial });
+            if optional.supplied_p {
+                push(if given { T } else { NIL });
+            }
+        }
+        for (index, key) in keys.iter().enumerate() {
+            let Initial::Constant(initial) = key.initial else { return false };
+            let given = supplied & (1 << index) != 0;
+            push(if given { args(key_values[index]) } else { initial });
+            if key.supplied_p {
+                push(if given { T } else { NIL });
+            }
+        }
+        for initial in &self.aux {
+            let Initial::Constant(initial) = *initial else { return false };
+            push(initial);
+        }
+        at == self.values
+    }
+}
+
+/// The ordinary `&key` entry's bind helper (`OrdinaryKeywordArguments`).
+/// `registers` holds the first three actual arguments, `overflow` the rest,
+/// as the ordinary ABI passes them; `out` receives the bound values.
+///
+/// # Safety
+/// `plan` comes from [`VariadicPlan::native_keywords`] for a body its code
+/// retains; the argument areas hold `count` words and `out` holds the plan's
+/// value count. Called from generated code before the entry's frame exists.
+pub(super) unsafe extern "C" fn native_keyword_bind(
+    plan: *const VariadicPlan,
+    registers: *const EgclVal,
+    overflow: *const EgclVal,
+    count: usize,
+    out: *mut EgclVal,
+) -> u64 {
+    #[cfg(test)]
+    if PLANS_DISABLED.with(std::cell::Cell::get) {
+        return 0;
+    }
+    let plan = unsafe { &*plan };
+    let args = |index: usize| unsafe {
+        if index < 3 { *registers.add(index) } else { *overflow.add(index - 3) }
+    };
+    let out = unsafe { std::slice::from_raw_parts_mut(out, plan.values) };
+    u64::from(plan.bind_native(args, count, out))
+}
+
+/// The number of values `plan` binds, for the ordinary entry's arity.
+pub(super) fn bound_values(plan: &VariadicPlan) -> usize {
+    plan.values
+}

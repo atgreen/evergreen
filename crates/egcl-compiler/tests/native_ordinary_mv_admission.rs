@@ -185,7 +185,7 @@ fn exercise(clear_between: bool) {
         &f,
         OrdinaryLispEntryOptions {
             arity: 0,
-            arity_error_veneer: rejected as *const () as u64,
+            arity_error_veneer: rejected as *const () as u64, binding: None,
         },
         &targets,
         flags,

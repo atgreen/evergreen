@@ -243,7 +243,7 @@ fn ordinary_tail_reuses_frame_and_preserves_moves_depth_and_result_descriptor() 
             &forwarder(arity, &indices),
             OrdinaryLispEntryOptions {
                 arity,
-                arity_error_veneer: tail_cold_probe as *const () as u64,
+                arity_error_veneer: tail_cold_probe as *const () as u64, binding: None,
             },
             target,
             flags,
