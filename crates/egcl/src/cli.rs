@@ -41535,7 +41535,7 @@ fn make_instance_allocate_and_initialize(
         .chunks_exact(2)
         .map(|pair| sym_bare_name_rc(pair[0]).to_string())
         .collect();
-    let (instance_initargs, class_initargs) = split_initargs_for_class(env, class_name, &initargs);
+    let (instance_initargs, class_initargs) = split_initargs_for_class(env, class_name, initargs);
     egcl_rt::rooted!(instance_initargs = instance_initargs);
     egcl_stdlib::initialize_instance(instance, &instance_initargs)?;
     for (slot_name, value) in class_initargs {
