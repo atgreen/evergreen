@@ -681,9 +681,9 @@ unsafe extern "C" fn checked_call_published(
     PUBLISHED_CHECKED_CALLS.with(|count| count.set(count.get() + 1));
     unsafe {
         root_publication::published_mapped(record, || {
-            if !call_lean_target(target, record)
-                && !(call_table::is_builtin_funcall(target) && funcall_fast::call(record))
-            {
+            let direct = call_lean_target(target, record)
+                || (call_table::is_builtin_funcall(target) && funcall_fast::call(record));
+            if !direct {
                 call_table::checked_call(target, record);
             }
             if (*record).outcome.exit == NativeExit::Returned {
