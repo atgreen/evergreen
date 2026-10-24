@@ -6297,6 +6297,311 @@ fn assoc_eql(item: EgclVal, alist: EgclVal) -> Result<EgclVal, EgclError> {
     Ok(NIL)
 }
 
+/// The :KEY, :TEST and :TEST-NOT of MEMBER or ASSOC, with the kernel slots of
+/// their builtins when they are `#'name` wrappers, selected once per call as
+/// SORT's are ([`sort_builtin_slot`]). Rooted by the caller.
+#[derive(Clone, Copy)]
+struct ListSearchFns {
+    key: EgclVal,
+    test: EgclVal,
+    test_not: EgclVal,
+    has_key: bool,
+    has_test: bool,
+    has_test_not: bool,
+    key_slot: Option<u32>,
+    test_slot: Option<u32>,
+}
+
+impl egcl_rt::gc::TraceHostRoots for ListSearchFns {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
+        visit(&mut self.key);
+        visit(&mut self.test);
+        visit(&mut self.test_not);
+    }
+}
+
+impl ListSearchFns {
+    /// Validate MEMBER/ASSOC's evaluated keyword tail. A bad tail (odd count,
+    /// non-symbol key, unknown key) is a catchable PROGRAM-ERROR (bliss-l6y9).
+    fn new(kwargs: &[EgclVal]) -> Result<ListSearchFns, EgclError> {
+        validate_builtin_keywords(kwargs, &["KEY", "TEST", "TEST-NOT"])?;
+        let key = find_key_arg(kwargs, "KEY");
+        let test = find_key_arg(kwargs, "TEST");
+        let test_not = find_key_arg(kwargs, "TEST-NOT");
+        let has_key = matches!(key, Some(v) if v != NIL);
+        let has_test = test.is_some();
+        let has_test_not = test_not.is_some();
+        let key = key.unwrap_or(NIL);
+        let test = test.unwrap_or(NIL);
+        let test_not = test_not.unwrap_or(NIL);
+        Ok(ListSearchFns {
+            key,
+            test,
+            test_not,
+            has_key,
+            has_test,
+            has_test_not,
+            key_slot: if has_key { sort_builtin_slot(key, 1) } else { None },
+            test_slot: if has_test {
+                sort_builtin_slot(test, 2)
+            } else if has_test_not {
+                sort_builtin_slot(test_not, 2)
+            } else {
+                None
+            },
+        })
+    }
+
+    fn plain(&self) -> bool {
+        !self.has_key && !self.has_test && !self.has_test_not
+    }
+
+    /// Whether `probe` (an element, or an entry's car) satisfies the search
+    /// for `item`. Can call Lisp: `self` must be rooted by the caller, which
+    /// also holds every value it needs afterwards in rooted slots.
+    fn matches(&self, item: EgclVal, probe: EgclVal, env: &mut Env) -> Result<bool, EgclError> {
+        egcl_rt::rooted!(item = item);
+        let probe = if self.has_key {
+            sort_call(self.key, self.key_slot, &[probe], env)?
+        } else {
+            probe
+        };
+        Ok(if self.has_test {
+            sort_call(self.test, self.test_slot, &[*item, probe], env)? != NIL
+        } else if self.has_test_not {
+            sort_call(self.test_not, self.test_slot, &[*item, probe], env)? == NIL
+        } else {
+            eql_values(probe, *item)
+        })
+    }
+}
+
+/// MEMBER on evaluated arguments `(item list &key key test test-not)`, shared
+/// by operator position and compiled calls, which reached the keyword shapes
+/// only by synthesizing and re-evaluating a form at ~34 us a call
+/// (bliss-qoy0k).
+fn member_values(args: &[EgclVal], env: &mut Env) -> Result<EgclVal, EgclError> {
+    if args.len() < 2 {
+        return Err(EgclError::ProgramError(format!(
+            "MEMBER called with {} argument(s); requires at least 2",
+            args.len()
+        )));
+    }
+    egcl_rt::rooted!(fns = ListSearchFns::new(&args[2..])?);
+    // No :key/:test/:test-not: the shape the direct fast path handles.
+    // Delegate so the two cannot drift.
+    if fns.plain() {
+        return member_eql(args[0], args[1]);
+    }
+    // Root everything held across the :key/:test calls, which run arbitrary
+    // Lisp: unrooted, ASDF's `(member action list :test 'equal)` walked freed
+    // nursery after a mid-walk minor GC (bliss-4bp).
+    egcl_rt::rooted!(item = args[0]);
+    egcl_rt::rooted!(c = args[1]);
+    reject_closure_as_list(*c)?;
+    while c.is_cons() {
+        let (car, _) = cp(*c);
+        if fns.matches(*item, car, env)? {
+            return Ok(*c);
+        }
+        // Re-read the (rooted, GC-current) cell only after the allocating
+        // calls above — a cdr copied before them would be stale.
+        let (_, next) = cp(*c);
+        *c = next;
+    }
+    // MEMBER's LIST argument must be a proper list: a non-list (or an
+    // improper/dotted tail reached without a match) is a TYPE-ERROR (CLHS;
+    // ansi-test member.error, check-type-error over non-lists).
+    if !c.is_nil() {
+        return Err(EgclError::TypeError {
+            datum: *c,
+            expected: "list".into(),
+        });
+    }
+    Ok(NIL)
+}
+
+/// ASSOC on evaluated arguments `(item alist &key key test test-not)`; the
+/// :key applies to each entry's car. Mirrors [`member_values`], including its
+/// rooting (bliss-4bp, bliss-qoy0k).
+fn assoc_values(args: &[EgclVal], env: &mut Env) -> Result<EgclVal, EgclError> {
+    if args.len() < 2 {
+        return Err(EgclError::ProgramError(format!(
+            "ASSOC called with {} argument(s); requires at least 2",
+            args.len()
+        )));
+    }
+    egcl_rt::rooted!(fns = ListSearchFns::new(&args[2..])?);
+    // No keywords: same kernel the fast path uses (see member_eql).
+    if fns.plain() {
+        return assoc_eql(args[0], args[1]);
+    }
+    egcl_rt::rooted!(item = args[0]);
+    egcl_rt::rooted!(c = args[1]);
+    reject_closure_as_list(*c)?;
+    while c.is_cons() {
+        let (pair, _) = cp(*c);
+        // Skip NIL entries; only compare against real (cons) pairs. A non-NIL,
+        // non-cons element is not a pair — a TYPE-ERROR whose datum is that
+        // offending element (assoc.error.11).
+        if !pair.is_cons() && !pair.is_nil() {
+            return Err(EgclError::TypeError {
+                datum: pair,
+                expected: "list".into(),
+            });
+        }
+        if pair.is_cons() {
+            let (k, _) = cp(pair);
+            if fns.matches(*item, k, env)? {
+                // Re-read the (rooted, GC-current) pair after the allocating
+                // calls — a copy from before is stale.
+                let (fresh_pair, _) = cp(*c);
+                return Ok(fresh_pair);
+            }
+        }
+        let (_, next) = cp(*c);
+        *c = next;
+    }
+    // ASSOC's ALIST must be a proper list of pairs: a non-list / improper tail
+    // is a TYPE-ERROR (CLHS; ansi-test assoc.error).
+    if !c.is_nil() {
+        return Err(EgclError::TypeError {
+            datum: *c,
+            expected: "list".into(),
+        });
+    }
+    Ok(NIL)
+}
+
+/// Call MAPCAR's or MAP's function on one tuple, through its builtin's kernel
+/// when it is a `#'name` wrapper taking at most two arguments.
+fn map_call(
+    function: EgclVal,
+    slot: Option<u32>,
+    args: &[EgclVal],
+    env: &mut Env,
+) -> Result<EgclVal, EgclError> {
+    if slot.is_some() {
+        sort_call(function, slot, args, env)
+    } else {
+        apply_function(function, args, env)
+    }
+}
+
+/// MAPCAR on evaluated arguments `(function list &rest more-lists)`: apply the
+/// function to successive tuples, stopping at the shortest list. Shared by
+/// operator position and compiled calls, which reached it only by synthesizing
+/// and re-evaluating a form at ~32 us a call (bliss-qoy0k).
+fn mapcar_values(args: &[EgclVal], env: &mut Env) -> Result<EgclVal, EgclError> {
+    // (mapcar) with no function argument is a PROGRAM-ERROR.
+    if args.is_empty() {
+        return Err(EgclError::ProgramError(
+            "MAPCAR requires a function and at least one list".into(),
+        ));
+    }
+    // (mapcar fn) with no lists supplied is a PROGRAM-ERROR.
+    if args.len() < 2 {
+        return Err(EgclError::ProgramError(
+            "MAPCAR requires at least one list argument".into(),
+        ));
+    }
+    // Root the function, the input lists' elements, and the accumulated
+    // results across the loop: each call can relocate them (bliss-6b2 #2).
+    egcl_rt::rooted!(fn_val = args[0]);
+    egcl_rt::rooted!(lists = Vec::<Vec<EgclVal>>::with_capacity(args.len() - 1));
+    for &lst in &args[1..] {
+        // A list argument must be a proper list: walk the spine and signal
+        // TYPE-ERROR if it ends in a non-NIL atom (a dotted list) or is itself
+        // a non-list atom (ANSI mapcar.error.4/8). The walk only calls `cp`
+        // (no allocation), so the plain Vec is safe here.
+        let mut elems: Vec<EgclVal> = Vec::new();
+        let mut c = lst;
+        while c.is_cons() {
+            let (car, cdr2) = cp(c);
+            elems.push(car);
+            c = cdr2;
+        }
+        if !c.is_nil() {
+            // The datum is the improper tail when the argument is a dotted
+            // list: the list itself satisfies LIST, and ansi mapcar.error.8
+            // checks that the datum does not.
+            return Err(EgclError::TypeError {
+                datum: if lst.is_cons() { c } else { lst },
+                expected: "list".into(),
+            });
+        }
+        lists.push(elems);
+    }
+    let n = lists.iter().map(|l| l.len()).min().unwrap_or(0);
+    let slot = if lists.len() <= 2 {
+        sort_builtin_slot(*fn_val, lists.len())
+    } else {
+        None
+    };
+    egcl_rt::rooted!(results = Vec::<EgclVal>::with_capacity(n));
+    for i in 0..n {
+        let mut call_args: Vec<EgclVal> = lists.iter().map(|l| l[i]).collect();
+        egcl_rt::rooted_ref!(_args_root = &mut call_args);
+        let value = map_call(*fn_val, slot, &call_args, env)?;
+        results.push(value);
+    }
+    Ok(vec_to_list(&results))
+}
+
+/// MAP on evaluated arguments `(result-type function sequence &rest more)`.
+/// Shared by operator position and compiled calls (bliss-qoy0k).
+fn map_values(args: &[EgclVal], env: &mut Env) -> Result<EgclVal, EgclError> {
+    if args.len() < 3 {
+        // Too few arguments to a standard function is a PROGRAM-ERROR (CLHS),
+        // not an internal error — ansi MAP.ERROR.5/6 call (map 'list) and
+        // (map 'list #'null) and expect one.
+        return Err(EgclError::ProgramError(format!(
+            "MAP called with {} argument(s); requires at least 3",
+            args.len()
+        )));
+    }
+    // Root the result type, the function, and every sequence element and
+    // result across the apply loop (bliss-6b2 #2).
+    egcl_rt::rooted!(result_type = args[0]);
+    egcl_rt::rooted!(fn_val = args[1]);
+    egcl_rt::rooted!(seqs = Vec::<Vec<EgclVal>>::with_capacity(args.len() - 2));
+    for &seq in &args[2..] {
+        // Any CL sequence: list, string, or (simple/complex) vector.
+        let elems: Vec<EgclVal> = seq_elements(seq)?;
+        seqs.push(elems);
+    }
+    let len = seqs.iter().map(Vec::len).min().unwrap_or(0);
+    let slot = if seqs.len() <= 2 {
+        sort_builtin_slot(*fn_val, seqs.len())
+    } else {
+        None
+    };
+    egcl_rt::rooted!(results = Vec::<EgclVal>::with_capacity(len));
+    for i in 0..len {
+        let mut call_args: Vec<EgclVal> = seqs.iter().map(|seq| seq[i]).collect();
+        egcl_rt::rooted_ref!(_args_root = &mut call_args);
+        let value = map_call(*fn_val, slot, &call_args, env)?;
+        results.push(value);
+    }
+    let result_type = *result_type;
+    // `(map nil …)` is called for effect and returns NIL — the only case the
+    // shared builder cannot express, since NIL also names the empty list.
+    if result_type.is_nil() {
+        return Ok(NIL);
+    }
+    // Everything else goes through the SAME classification CONCATENATE uses.
+    // This arm used to carry its own smaller copy, which recognized neither
+    // compound specifiers like `(simple-string 3)` nor SIMPLE-BASE-STRING nor
+    // any bit-vector type, and silently answered a LIST for all of them (ansi
+    // MAP.38-47, MAP.FILL.5). Duplicating stdlib classification in the
+    // interpreter is what AGENTS.md's architecture rule forbids, and this is
+    // precisely how the two drifted apart. Expand a DEFTYPE alias first — see
+    // the CONCATENATE arm.
+    let expanded = resolve_type_spec(env, result_type)?;
+    egcl_rt::rooted!(expanded = expanded);
+    egcl_stdlib::build_result_sequence(*expanded, &results)
+}
+
 /// A list-walking builtin's argument must actually BE a list: NIL or a cons.
 ///
 /// `reject_closure_as_list` alone is not enough. It only catches a closure
@@ -20412,7 +20717,7 @@ fn fixed_arity_builtin(bare: &str) -> Option<(usize, usize)> {
         // :test-not of #'NOT is called with TWO arguments and must be a
         // PROGRAM-ERROR (ansi POSITION.ERROR.13 and its FIND/COUNT siblings).
         "NOT" | "NULL" => Some((1, 1)),
-        "ZEROP" | "PLUSP" | "MINUSP" => Some((1, 1)),
+        "ZEROP" | "PLUSP" | "MINUSP" | "EVENP" | "ODDP" => Some((1, 1)),
         // (rest list) — exactly one; (nth n list) — exactly two.
         "REST" => Some((1, 1)),
         "NTH" => Some((2, 2)),
@@ -21123,6 +21428,414 @@ fn gensym_value(env: &mut Env, arg: Option<EgclVal>) -> Result<EgclVal, EgclErro
     Ok(reader::make_uninterned_symbol(&name))
 }
 
+/// EVENP (`want_even`) or ODDP of an evaluated argument, shared by operator
+/// position and compiled calls, which used to reach it only by synthesizing and
+/// re-evaluating a form at ~12 us a call (bliss-qoy0k). Allocation-free.
+fn parity_value(want_even: bool, v: EgclVal) -> Result<EgclVal, EgclError> {
+    // Parity must be exact: a bignum via f64 (num_val as i64)
+    // overflows and gives the wrong bit (bliss-05hy).
+    let even = if v.is_fixnum() {
+        v.as_fixnum() % 2 == 0
+    } else if let Some(n) = bigint_from_val(v) {
+        // Even iff the least-significant limb is even (0 ⇒ even).
+        n.mag.first().copied().unwrap_or(0) & 1 == 0
+    } else {
+        return Err(EgclError::TypeError {
+            datum: v,
+            expected: "integer".into(),
+        });
+    };
+    Ok(if even == want_even { T } else { NIL })
+}
+
+/// TYPE-OF of an evaluated object, shared by operator position and compiled
+/// calls, which reached it only by synthesizing and re-evaluating a form
+/// (bliss-qoy0k).
+fn type_of_value(v: EgclVal) -> Result<EgclVal, EgclError> {
+    if python::is_proxy(v) {
+        return Ok(
+            resolve_sym("EGCL-PYTHON::OBJECT").expect("Python object type symbol")
+        );
+    }
+    if egcl_stdlib::synchronization::mutex_p(v) {
+        return Ok(resolve_sym("EGCL-THREAD::MUTEX").expect("mutex type symbol"));
+    }
+    if egcl_stdlib::synchronization::condition_variable_p(v) {
+        return Ok(resolve_sym("EGCL-THREAD::CONDITION-VARIABLE")
+            .expect("condition-variable type symbol"));
+    }
+    // Preserve the defining symbol, including its home package.
+    //
+    // CLHS TYPE-OF: the answer is the class's PROPER name, and if
+    // the class has none, the class itself. A name is proper only
+    // while FIND-CLASS maps it back to this class, so a class
+    // whose name has been unbound with
+    // `(setf (find-class 'x) nil)` answers the metaobject. That
+    // distinction was unobservable while a class WAS its name
+    // symbol -- the two answers were the same object, which is why
+    // ansi-test TYPE-OF.9 passed before bliss-vsjn1 and needs this
+    // after.
+    if egcl_stdlib::is_instance(v) {
+        let class = egcl_stdlib::class_of(v);
+        let name = egcl_stdlib::class_name(class);
+        if !name.is_nil() {
+            if egcl_stdlib::find_class(name) == Some(class) {
+                return Ok(name);
+            }
+            return Ok(class);
+        }
+    }
+    if egcl_stdlib::sequences::is_double_float_array(v) {
+        let complex = egcl_stdlib::is_complex_vector(v);
+        let dims = if egcl_rt::types::md_array_p(v) {
+            md_dims(v)?
+        } else {
+            vec![egcl_stdlib::array_total_size(v).unwrap()]
+        };
+        let dim_vals: Vec<_> = dims.into_iter()
+            .map(|d| EgclVal::from_fixnum(d as i64)).collect();
+        egcl_rt::rooted!(dims_list = vec_to_list(&dim_vals));
+        return Ok(vec_to_list(&[
+            resolve_sym(if complex { "ARRAY" } else { "SIMPLE-ARRAY" }).unwrap(),
+            resolve_sym("DOUBLE-FLOAT").unwrap(),
+            *dims_list,
+        ]));
+    }
+    // A bit-vector's TYPE-OF is the compound (SIMPLE-BIT-VECTOR n)
+    // specifier, not a bare symbol (bliss-zg9).
+    if egcl_rt::types::bit_vector_p(v) {
+        let len = egcl_rt::types::bit_vector_len(v).unwrap_or(0);
+        egcl_rt::rooted!(inner = arena_cons(EgclVal::from_fixnum(len as i64), NIL));
+        let sym = resolve_sym("SIMPLE-BIT-VECTOR").unwrap_or(NIL);
+        return Ok(arena_cons(sym, *inner));
+    }
+    if egcl_rt::types::complexp(v) {
+        return Ok(resolve_sym("COMPLEX").unwrap_or(NIL));
+    }
+    // A multidimensional array's TYPE-OF is the compound specifier
+    // (SIMPLE-ARRAY T (d0 d1 …)) (bliss-rh0t).
+    if egcl_rt::types::md_array_p(v) {
+        let dims = md_dims(v)?;
+        let dim_vals: Vec<EgclVal> = dims
+            .iter()
+            .map(|&d| EgclVal::from_fixnum(d as i64))
+            .collect();
+        egcl_rt::rooted!(dims_list = vec_to_list(&dim_vals));
+        let spec = vec![
+            resolve_sym("SIMPLE-ARRAY").unwrap_or(NIL),
+            resolve_sym("T").unwrap_or(T),
+            *dims_list,
+        ];
+        return Ok(vec_to_list(&spec));
+    }
+    // CLHS TYPE-OF: the most specific recognizable type. 0 and 1
+    // are BITs, other non-negative fixnums (INTEGER 0 mpf), bignums
+    // the open ranges beyond the fixnums (ansi type-of.1/4).
+    if v.is_fixnum() {
+        let n = v.as_fixnum();
+        if n == 0 || n == 1 {
+            return Ok(resolve_sym("BIT").unwrap_or(NIL));
+        }
+        if n > 1 {
+            return Ok(vec_to_list(&[
+                resolve_sym("INTEGER").unwrap_or(NIL),
+                EgclVal::from_fixnum(0),
+                EgclVal::from_fixnum((1_i64 << 60) - 1),
+            ]));
+        }
+    } else if egcl_rt::types::integerp(v) {
+        let negative = egcl_rt::bignum::bigint_from_val(v)
+            .map(|big| big.sign < 0)
+            .unwrap_or(false);
+        let integer = resolve_sym("INTEGER").unwrap_or(NIL);
+        // The bounds just outside the fixnum range are bignums.
+        let mut magnitude = Vec::new();
+        egcl_rt::bignum::mag_set_bit(&mut magnitude, 60);
+        return Ok(if negative {
+            let below = egcl_rt::bignum::mag_add(&magnitude, &[1]);
+            egcl_rt::rooted!(bound = egcl_rt::bignum::BigInt::from_mag(-1, below).to_val());
+            vec_to_list(&[integer, resolve_sym("*").unwrap_or(NIL), *bound])
+        } else {
+            egcl_rt::rooted!(bound = egcl_rt::bignum::BigInt::from_mag(1, magnitude).to_val());
+            vec_to_list(&[integer, *bound])
+        });
+    } else if egcl_rt::bignum::ratio_parts_val(v).is_some() {
+        return Ok(resolve_sym("RATIO").unwrap_or(NIL));
+    } else if egcl_rt::types::readtablep(v) {
+        return Ok(resolve_sym("READTABLE").unwrap_or(NIL));
+    } else if is_string_value(v) && egcl_stdlib::is_complex_vector(v) {
+        // An adjustable or fill-pointered string is not a
+        // SIMPLE-STRING (ansi coerce.1). Its element type is the
+        // storage's: BASE-CHAR when displaced onto a base string.
+        let size = egcl_stdlib::array_total_size(v).unwrap_or(0);
+        let elt = if is_base_string_value(v) { "BASE-CHAR" } else { "CHARACTER" };
+        return Ok(vec_to_list(&[
+            resolve_sym("VECTOR").unwrap_or(NIL),
+            resolve_sym(elt).unwrap_or(NIL),
+            EgclVal::from_fixnum(size as i64),
+        ]));
+    } else if is_string_value(v) && !is_base_string_value(v) {
+        // A 32-bit CHARACTER string is (SIMPLE-ARRAY CHARACTER (n));
+        // only the 8-bit storage is a SIMPLE-BASE-STRING, which is
+        // what TYPEP answers for it (bliss-ajb3). TYPE-OF called
+        // every string SIMPLE-BASE-STRING, so (typep x (type-of x))
+        // was NIL for a MAKE-STRING result.
+        let size = egcl_stdlib::array_total_size(v).unwrap_or(0);
+        egcl_rt::rooted!(dims = vec_to_list(&[EgclVal::from_fixnum(size as i64)]));
+        return Ok(vec_to_list(&[
+            resolve_sym("SIMPLE-ARRAY").unwrap_or(NIL),
+            resolve_sym("CHARACTER").unwrap_or(NIL),
+            *dims,
+        ]));
+    }
+    // A general vector's TYPE-OF is (SIMPLE-VECTOR n), or
+    // (VECTOR T n) for an adjustable / fill-pointered / displaced
+    // one (ansi make-array.*, type-of.*).
+    if egcl_stdlib::is_complex_vector(v) && egcl_stdlib::cvec_is_bit(v) {
+        // A fill-pointer / adjustable / displaced bit vector.
+        return Ok(resolve_sym("BIT-VECTOR").unwrap_or(NIL));
+    }
+    if v.is_heap_object()
+        && !is_string_value(v)
+        && !egcl_rt::types::bit_vector_p(v)
+        && (egcl_stdlib::is_complex_vector(v)
+            || unsafe { (*(v.as_ptr() as *const ObjectHeader)).type_id() }
+                == type_id::SIMPLE_VECTOR)
+    {
+        let size = egcl_stdlib::array_total_size(v).unwrap_or(0);
+        return Ok(if egcl_stdlib::is_complex_vector(v) {
+            vec_to_list(&[
+                resolve_sym("VECTOR").unwrap_or(NIL),
+                T,
+                EgclVal::from_fixnum(size as i64),
+            ])
+        } else {
+            vec_to_list(&[
+                resolve_sym("SIMPLE-VECTOR").unwrap_or(NIL),
+                EgclVal::from_fixnum(size as i64),
+            ])
+        });
+    }
+    let type_name = if v.is_nil() {
+        "NULL"
+    } else if v == T {
+        "BOOLEAN"
+    } else if v.is_fixnum() {
+        "FIXNUM"
+    } else if v.is_single_float() {
+        "SINGLE-FLOAT"
+    } else if v.is_double_float() {
+        "DOUBLE-FLOAT"
+    } else if v.is_character() {
+        "CHARACTER"
+    } else if is_keyword_arg(v) {
+        // A keyword's most specific type is KEYWORD, not SYMBOL
+        // (CLHS TYPE-OF; matches SBCL). bliss-54t8.
+        "KEYWORD"
+    } else if v.is_symbol() {
+        "SYMBOL"
+    } else if is_function_value(v) {
+        // A function value — a real function object or an interpreter
+        // closure (represented as a `(EGCL::CLOSURE . id)` cons). This
+        // must precede the `is_cons` check so a closure's TYPE-OF is
+        // FUNCTION, not CONS, and CLOS dispatch on the FUNCTION class
+        // recognises it (bliss-5ir; cl-ppcre passes scanners as funcs).
+        "FUNCTION"
+    } else if v.is_cons() {
+        "CONS"
+    } else if is_string_value(v) {
+        "SIMPLE-BASE-STRING"
+    } else if egcl_stdlib::pathnames::is_logical_pathname(v) {
+        "LOGICAL-PATHNAME"
+    } else if egcl_stdlib::pathnames::is_pathname(v) {
+        "PATHNAME"
+    } else {
+        "T"
+    };
+    match resolve_sym(type_name) {
+        Some(sym) => Ok(sym),
+        None => Ok(arena_str(type_name)),
+    }
+}
+
+/// MAKE-HASH-TABLE on evaluated `&key` arguments: honor :test, :weakness and
+/// :synchronized and ignore the rest. Backed by the real stdlib hash table.
+/// Shared by operator position and compiled calls (bliss-qoy0k).
+fn make_hash_table_values(args: &[EgclVal]) -> Result<EgclVal, EgclError> {
+    let mut test = egcl_stdlib::HashTest::Eql;
+    let mut weakness: Option<egcl_stdlib::Weakness> = None;
+    let mut synchronized = false;
+    // A trailing keyword without a value is ignored.
+    for pair in args.chunks_exact(2) {
+        let (kw, v) = (pair[0], pair[1]);
+        if !kw.is_symbol() {
+            continue;
+        }
+        let kn = sym_name(kw);
+        let kn = kn.strip_prefix("KEYWORD:").unwrap_or(&kn);
+        // :weakness names which half of an entry the table holds WEAKLY
+        // (R3.13). Trivial-Garbage's :key-or-value needs an ephemeron fixpoint
+        // EGCL does not have, so it is REJECTED rather than silently downgraded
+        // to a strong table (bliss-10an).
+        if kn == "WEAKNESS" {
+            if v.is_nil() {
+                weakness = None;
+            } else {
+                let wn = sym_name(v);
+                let wb = wn.strip_prefix("KEYWORD:").unwrap_or(&wn).to_uppercase();
+                weakness = match wb.as_str() {
+                    "KEY" => Some(egcl_stdlib::Weakness::Key),
+                    "VALUE" => Some(egcl_stdlib::Weakness::Value),
+                    "KEY-AND-VALUE" => Some(egcl_stdlib::Weakness::KeyAndValue),
+                    other => {
+                        return Err(EgclError::ProgramError(format!(
+                            "MAKE-HASH-TABLE: unsupported :WEAKNESS :{other}; EGCL supports :KEY, :VALUE and :KEY-AND-VALUE"
+                        )));
+                    }
+                };
+            }
+        }
+        // Dropping this left every :synchronized table unlocked, so concurrent
+        // writers corrupted it (GitHub #518).
+        if kn == "SYNCHRONIZED" {
+            synchronized = !v.is_nil();
+        }
+        if kn == "TEST" {
+            // :test accepts a function DESIGNATOR — the symbol
+            // (eq/eql/equal/equalp) OR the function `#'equal`, which bliss-uuh
+            // reifies as a wrapper closure; resolve either to the test name
+            // (bliss-lac).
+            let tn = function_designator_name(v).unwrap_or_default();
+            let tb = tn.strip_prefix("KEYWORD:").unwrap_or(&tn).to_uppercase();
+            test = match tb.as_str() {
+                "EQ" => egcl_stdlib::HashTest::Eq,
+                "EQUAL" => egcl_stdlib::HashTest::Equal,
+                "EQUALP" => egcl_stdlib::HashTest::Equalp,
+                _ => egcl_stdlib::HashTest::Eql,
+            };
+        }
+    }
+    let opts = egcl_stdlib::MakeHashTableOptions {
+        test,
+        weakness,
+        synchronized,
+        ..Default::default()
+    };
+    egcl_stdlib::make_hash_table(&opts)
+}
+
+/// RANDOM on evaluated arguments `(limit &optional random-state)`, shared by
+/// operator position and compiled calls, which reached it only by
+/// synthesizing and re-evaluating a form (bliss-qoy0k).
+fn random_values(args: &[EgclVal], env: &mut Env) -> Result<EgclVal, EgclError> {
+    // One or two arguments: CLHS 3.5.1 wants a PROGRAM-ERROR for a wrong
+    // argument COUNT (ansi RANDOM.ERROR.1-2).
+    if !(1..=2).contains(&args.len()) {
+        return Err(EgclError::ProgramError(format!(
+            "RANDOM requires one or two arguments, got {}",
+            args.len()
+        )));
+    }
+    egcl_rt::rooted!(limit_r = args[0]);
+    // The optional RANDOM-STATE argument, else *RANDOM-STATE*; the draws
+    // below advance that object, so a copy made by MAKE-RANDOM-STATE yields
+    // the same sequence (CLHS RANDOM; ansi numbers make-random-state.1-3).
+    egcl_rt::rooted!(
+        state = match args.get(1) {
+            Some(&state) => state,
+            None => env.lookup_var("*RANDOM-STATE*").unwrap_or(NIL),
+        }
+    );
+    let draw = || random_state_draw(*state);
+    let limit = *limit_r;
+    if limit.is_fixnum() {
+        let bound = limit.as_fixnum();
+        if bound <= 0 {
+            // CLHS: LIMIT is of type (REAL (0)), so a non-positive
+            // one is a TYPE-ERROR -- ansi RANDOM.ERROR.3 checks
+            // exactly that. It was a PROGRAM-ERROR, i.e. the two
+            // error kinds were swapped with the arity case above.
+            return Err(EgclError::TypeError {
+                datum: limit,
+                expected: "(REAL (0))".into(),
+            });
+        }
+        let r = (draw() % bound as u64) as i64;
+        return Ok(EgclVal::from_fixnum(r));
+    }
+    if limit.is_single_float() {
+        let bound = limit.as_single_float();
+        if bound <= 0.0 {
+            // CLHS: LIMIT is of type (REAL (0)), so a non-positive
+            // one is a TYPE-ERROR -- ansi RANDOM.ERROR.3 checks
+            // exactly that. It was a PROGRAM-ERROR, i.e. the two
+            // error kinds were swapped with the arity case above.
+            return Err(EgclError::TypeError {
+                datum: limit,
+                expected: "(REAL (0))".into(),
+            });
+        }
+        // 24 random mantissa bits give a uniform unit float in [0,1).
+        let unit = (draw() >> 40) as f32 / (1u64 << 24) as f32;
+        return Ok(EgclVal::from_single_float(unit * bound));
+    }
+    if limit.is_double_float() {
+        let bound = limit.as_double_float();
+        if bound <= 0.0 {
+            // CLHS: LIMIT is of type (REAL (0)), so a non-positive
+            // one is a TYPE-ERROR -- ansi RANDOM.ERROR.3 checks
+            // exactly that. It was a PROGRAM-ERROR, i.e. the two
+            // error kinds were swapped with the arity case above.
+            return Err(EgclError::TypeError {
+                datum: limit,
+                expected: "(REAL (0))".into(),
+            });
+        }
+        // 53 random mantissa bits give a uniform unit double in [0,1).
+        let unit = (draw() >> 11) as f64 / (1u64 << 53) as f64;
+        return Ok(egcl_rt::gc::alloc_double_float(unit * bound));
+    }
+    // Bignum limit: draw a random magnitude with the same limb count
+    // and reduce modulo the limit for a value in [0, limit).
+    if let Some(b) = bigint_from_val(limit) {
+        if b.sign <= 0 {
+            // CLHS: LIMIT is of type (REAL (0)), so a non-positive
+            // one is a TYPE-ERROR -- ansi RANDOM.ERROR.3 checks
+            // exactly that. It was a PROGRAM-ERROR, i.e. the two
+            // error kinds were swapped with the arity case above.
+            return Err(EgclError::TypeError {
+                datum: limit,
+                expected: "(REAL (0))".into(),
+            });
+        }
+        let mut limbs = Vec::with_capacity(b.mag.len());
+        for _ in 0..b.mag.len() {
+            limbs.push(draw());
+        }
+        let r = BigInt::from_mag(1, limbs);
+        let (_, rem) = big_divmod(&r, &b);
+        return Ok(rem.to_val());
+    }
+    Err(EgclError::TypeError {
+        datum: limit,
+        expected: "positive integer or float".into(),
+    })
+}
+
+/// The single argument of a one-argument builtin, with the PROGRAM-ERRORs
+/// [`expect_one_arg`] signals for the source form.
+fn one_arg(who: &str, args: &[EgclVal]) -> Result<EgclVal, EgclError> {
+    match args {
+        [a] => Ok(*a),
+        [] => Err(EgclError::ProgramError(format!(
+            "{who} requires exactly one argument"
+        ))),
+        _ => Err(EgclError::ProgramError(format!(
+            "{who} takes only one argument"
+        ))),
+    }
+}
+
 fn eval_builtin_arguments(
     name: &str,
     forms: EgclVal,
@@ -21810,29 +22523,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             }
             "WRITE-CHAR" => return eval_builtin_arguments(&name, cdr, env),
             "MAKE-STRING" => return eval_builtin_arguments(&name, cdr, env),
-            "MAKE-STRING-OUTPUT-STREAM" => {
-                // (make-string-output-stream &key element-type): the keywords
-                // are validated (ansi make-string-output-stream.*). A
-                // BASE-CHAR element type (or any non-empty subtype of it)
-                // makes GET-OUTPUT-STREAM-STRING answer a SIMPLE-BASE-STRING
-                // (ansi WITH-OUTPUT-TO-STRING.8); any other type, a CHARACTER
-                // string.
-                let args = list_to_vec(cdr);
-                let vals = eval_forms(args.iter().copied(), env)?;
-                check_keyword_args("MAKE-STRING-OUTPUT-STREAM", &vals[..], &["ELEMENT-TYPE"])?;
-                let element_type = vals
-                    .chunks_exact(2)
-                    .find(|pair| {
-                        pair[0].is_symbol() && sym_bare_name_rc(pair[0]).as_ref() == "ELEMENT-TYPE"
-                    })
-                    .map(|pair| pair[1]);
-                let base = element_type.is_some_and(|et| {
-                    !et.is_nil()
-                        && resolve_sym("BASE-CHAR")
-                            .is_some_and(|base_char| subtypep_relation(et, base_char).0)
-                });
-                return egcl_stdlib::streams::make_string_output_stream_of(base);
-            }
+            "MAKE-STRING-OUTPUT-STREAM" => return eval_builtin_arguments(&name, cdr, env),
             "MAKE-BROADCAST-STREAM" => return eval_builtin_arguments(&name, cdr, env),
             "MAKE-CONCATENATED-STREAM" => return eval_builtin_arguments(&name, cdr, env),
             "MAKE-TWO-WAY-STREAM" => return eval_builtin_arguments(&name, cdr, env),
@@ -22205,11 +22896,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 return egcl_rt::ffi::unmarshal_from_c(raw, &ret_type);
             }
             "EGCL::%EXIT" => return eval_builtin_arguments(&name, cdr, env),
-            "GET-OUTPUT-STREAM-STRING" => {
-                let (sf, _) = cp(cdr);
-                let stream = eval_form(sf, env)?;
-                return egcl_stdlib::get_output_stream_string(stream);
-            }
+            "GET-OUTPUT-STREAM-STRING" => return eval_builtin_arguments(&name, cdr, env),
             "SYNONYM-STREAM-SYMBOL" => {
                 let (sf, _) = cp(cdr);
                 let s = eval_form(sf, env)?;
@@ -22605,75 +23292,14 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             // REALPART/IMAGPART: for a COMPLEX return the stored part; for a real
             // number REALPART is the number itself and IMAGPART is 0 (of the same
             // type — an integer 0 for a rational, 0.0 for a float) (CLHS).
-            "REALPART" | "IMAGPART" => {
-                let want_real = name == "REALPART";
-                let af = expect_one_arg(cdr, name.as_str())?;
-                let v = eval_form(af, env)?;
-                if let Some(rp) = egcl_rt::types::complex_realpart(v) {
-                    return Ok(if want_real {
-                        rp
-                    } else {
-                        egcl_rt::types::complex_imagpart(v).unwrap_or(NIL)
-                    });
-                }
-                if is_number_value(v) {
-                    // CLHS: (imagpart real) is LITERALLY (* 0 real), and ansi
-                    // IMAGPART.4 compares against that expression directly. A
-                    // CONSTRUCTED zero cannot express it: the format has to
-                    // follow the argument (0.0d0 for a double, 0 for a
-                    // rational) AND so does the SIGN -- (* 0 -3.4028235e38) is
-                    // -0.0, which no hand-built zero gives. Routing through the
-                    // multiply kernel gets format, sign and the
-                    // rational/float distinction for free.
-                    if want_real {
-                        return Ok(v);
-                    }
-                    return match apply_numeric_op("*", &[EgclVal::from_fixnum(0), v]) {
-                        Some(r) => r,
-                        None => Ok(EgclVal::from_fixnum(0)),
-                    };
-                }
-                return Err(EgclError::TypeError {
-                    datum: v,
-                    expected: "number".to_string(),
-                });
-            }
+            "REALPART" | "IMAGPART" => return eval_builtin_arguments(&name, cdr, env),
             // (COMPLEX realpart &optional imagpart) — build a complex number
             // with type contagion + canonicalisation (CLHS 12.1.3.3). imagpart
             // defaults to a rational 0, so a rational realpart with no imagpart
             // returns the realpart itself (bliss-qng).
-            "COMPLEX" => {
-                // (complex realpart &optional imagpart): one or two arguments.
-                // With none, `cp(NIL)` handed a NIL realpart straight to
-                // make_complex, which reported "NIL is not of type real" -- a
-                // TYPE-ERROR where CLHS 3.5.1 requires a PROGRAM-ERROR for a
-                // wrong argument COUNT (ansi COMPLEX.ERROR.1/2).
-                let n = form_arg_count(cdr);
-                if !(1..=2).contains(&n) {
-                    return Err(EgclError::ProgramError(format!(
-                        "COMPLEX requires one or two arguments, got {n}"
-                    )));
-                }
-                let (rf, rrest) = cp(cdr);
-                egcl_rt::rooted!(real = eval_form(rf, env)?);
-                let imag = if rrest.is_cons() {
-                    let (iform, _) = cp(rrest);
-                    eval_form(iform, env)?
-                } else {
-                    EgclVal::from_fixnum(0)
-                };
-                return make_complex(*real, imag);
-            }
+            "COMPLEX" => return eval_builtin_arguments(&name, cdr, env),
             // (RATIONAL x) / (RATIONALIZE x) — float → exact rational (bliss-k0jg).
-            "RATIONAL" | "RATIONALIZE" => {
-                let af = expect_one_arg(cdr, name.as_str())?;
-                let v = eval_form(af, env)?;
-                return if name == "RATIONAL" {
-                    cl_rational(v)
-                } else {
-                    cl_rationalize(v)
-                };
-            }
+            "RATIONAL" | "RATIONALIZE" => return eval_builtin_arguments(&name, cdr, env),
             "STRINGP" => {
                 // Exactly one argument, else a catchable PROGRAM-ERROR
                 // (ansi STRINGP.ERROR.1/2).
@@ -22687,80 +23313,8 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 let v = eval_form(af, env)?;
                 return Ok(if is_string_value(v) { T } else { NIL });
             }
-            "BOUNDP" => {
-                let (sf, _) = cp(cdr);
-                let sym = eval_form(sf, env)?;
-                // NIL and T are constant variables — always bound.
-                if sym.is_nil() || sym == T {
-                    return Ok(T);
-                }
-                // Keywords are constant variables bound to themselves (CLHS 11.1.2.3.1).
-                if is_keyword_arg(sym) {
-                    return Ok(T);
-                }
-                // A non-symbol argument is a TYPE-ERROR (boundp.error.3/4/5/6).
-                if !sym.is_symbol() {
-                    return Err(EgclError::TypeError {
-                        datum: sym,
-                        expected: "SYMBOL".to_string(),
-                    });
-                }
-                // Resolve a SYMBOL argument by INDEX (the same resolution an
-                // evaluated variable reference uses), not by name string: a
-                // package-interned symbol's heap name cell holds its BARE name
-                // while the registry key is qualified, so the name-based
-                // lookup missed every qualified global (bliss-o2da).
-                return Ok(if sym.is_symbol() {
-                    if env.lookup_var_symbol(sym).is_some() {
-                        T
-                    } else {
-                        NIL
-                    }
-                } else if env.lookup_var(&val_as_str(sym)).is_some() {
-                    T
-                } else {
-                    NIL
-                });
-            }
-            "SYMBOL-VALUE" => {
-                let (sf, _) = cp(cdr);
-                let sym = eval_form(sf, env)?;
-                // Constant variables (CLHS): (symbol-value 'nil) → NIL, 't → T.
-                if sym.is_nil() {
-                    return Ok(NIL);
-                }
-                if sym == T {
-                    return Ok(T);
-                }
-                // Keywords evaluate to themselves (CLHS 11.1.2.3.1).
-                if is_keyword_arg(sym) {
-                    return Ok(sym);
-                }
-                // A non-symbol argument is a TYPE-ERROR (symbol-value.error.3).
-                if !sym.is_symbol() {
-                    return Err(EgclError::TypeError {
-                        datum: sym,
-                        expected: "SYMBOL".to_string(),
-                    });
-                }
-                // SYMBOL-VALUE reads the DYNAMIC value only (CLHS): a lexical
-                // binding is not a symbol value at all. Going through
-                // lookup_var_symbol also consulted the lexical frames, so
-                //
-                //   (let ((z 0)) (declare (special z))
-                //     (multiple-value-bind (z) (values 3) (symbol-value 'z)))
-                //
-                // returned the M-V-B's LEXICAL 3 instead of the dynamic 0
-                // (bliss-qui9, resurfaced by bliss-s2y9). Resolution is still
-                // BY INDEX, which is what bliss-o2da actually needed — a
-                // package-qualified symbol must not be looked up by bare name.
-                let idx = sym.symbol_index();
-                let resolved = idx.and_then(global_value_cell);
-                return match resolved {
-                    Some(v) => Ok(v),
-                    None => Err(EgclError::UnboundVariable(sym)),
-                };
-            }
+            "BOUNDP" => return eval_builtin_arguments(&name, cdr, env),
+            "SYMBOL-VALUE" => return eval_builtin_arguments(&name, cdr, env),
             "SET" => return eval_builtin_arguments(&name, cdr, env),
             "MAKUNBOUND" => {
                 // (makunbound symbol) — make SYMBOL's dynamic value unbound and
@@ -25466,114 +26020,13 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             // A bit-vector is a rank-1 array of BITs (reader `#*…`). All bit
             // vectors egcl builds are simple, so SIMPLE-BIT-VECTOR-P coincides
             // with BIT-VECTOR-P (bliss-zg9).
-            "BIT-VECTOR-P" | "SIMPLE-BIT-VECTOR-P" => {
-                let (af, _) = cp(cdr);
-                let v = eval_form(af, env)?;
-                // BIT-VECTOR-P is true of a complex (fill-pointer/adjustable/
-                // displaced) bit vector too; SIMPLE-BIT-VECTOR-P only of a truly
-                // simple one (bliss-65nx).
-                let simple_only = sym_bare_name_rc(car).as_ref() == "SIMPLE-BIT-VECTOR-P";
-                let ok = if simple_only {
-                    egcl_rt::types::bit_vector_p(v)
-                } else {
-                    is_bit_vector_value(v)
-                };
-                return Ok(if ok { T } else { NIL });
-            }
-            "%BIT-VECTOR-FROM-BITS" => {
-                // (%bit-vector-from-bits list) — build a SIMPLE bit-vector from a
-                // list of bits (each 0 or 1). The one-shot constructor MAKE-ARRAY
-                // :element-type bit uses (boot.lisp); egcl bit-vectors are
-                // immutable after construction, so the whole content is supplied
-                // here. Bits are read into a native Vec<u8> before the single
-                // allocation, so no EgclVal is held live across a GC (the source
-                // list holds only fixnums, which never move); GC-safe.
-                let (af, _) = cp(cdr);
-                let lst = eval_form(af, env)?;
-                let elems = list_to_vec(lst);
-                let mut bits: Vec<u8> = Vec::with_capacity(elems.len());
-                for e in &elems {
-                    match if e.is_fixnum() { e.as_fixnum() } else { -1 } {
-                        0 => bits.push(0),
-                        1 => bits.push(1),
-                        _ => {
-                            return Err(EgclError::TypeError {
-                                datum: *e,
-                                expected: "BIT (0 or 1)".into(),
-                            });
-                        }
-                    }
-                }
-                return Ok(egcl_compiler::reader::make_bit_vector(&bits));
-            }
-            "ADJUSTABLE-ARRAY-P" => {
-                // Only a COMPLEX_ARRAY created :adjustable is adjustable.
-                let (af, _) = cp(cdr);
-                let v = eval_form(af, env)?;
-                let adj = egcl_stdlib::is_complex_vector(v) && egcl_stdlib::cvec_adjustable(v);
-                return Ok(if adj { T } else { NIL });
-            }
-            "ARRAY-HAS-FILL-POINTER-P" => {
-                // Only a vector created with a non-NIL :fill-pointer has one. A
-                // plain (make-array n :adjustable t) is the same COMPLEX_ARRAY
-                // representation but answers NIL per ANSI (bliss-0x9y).
-                let (af, _) = cp(cdr);
-                let v = eval_form(af, env)?;
-                let has =
-                    egcl_stdlib::is_complex_vector(v) && egcl_stdlib::cvec_has_fill_pointer(v);
-                return Ok(if has { T } else { NIL });
-            }
-            "ARRAY-DISPLACEMENT" => {
-                // (values base offset) for a displaced array, (values nil 0)
-                // otherwise (bliss-7o4y).
-                let (af, _) = cp(cdr);
-                let v = eval_form(af, env)?;
-                // A displaced multidimensional array keeps its displacement in
-                // its row-major storage vector (MAKE-ARRAY, boot.lisp).
-                let v = match egcl_rt::types::md_array_storage(v) {
-                    Some(storage) if egcl_stdlib::is_complex_vector(storage) => storage,
-                    _ => v,
-                };
-                if egcl_stdlib::is_complex_vector(v) {
-                    if let Some((base, offset, _)) = egcl_stdlib::cvec_displacement(v) {
-                        let off = EgclVal::from_fixnum(offset as i64);
-                        env.set_mv(vec![base, off]);
-                        return Ok(base);
-                    }
-                }
-                env.set_mv(vec![NIL, EgclVal::from_fixnum(0)]);
-                return Ok(NIL);
-            }
-            "ARRAY-ELEMENT-TYPE" => {
-                let (af, _) = cp(cdr);
-                let v = eval_form(af, env)?;
-                // An 8-bit base string holds BASE-CHAR and a 32-bit string
-                // CHARACTER (spec §1.6.3); bit-vectors (simple OR a
-                // fill-pointer/adjustable/displaced complex bit vector, egcl-
-                // 65nx) hold BIT; packed vectors hold DOUBLE-FLOAT.
-                let ty = if is_base_string_value(v) {
-                    "BASE-CHAR"
-                } else if is_string_value(v) {
-                    "CHARACTER"
-                } else if is_bit_vector_value(v) {
-                    "BIT"
-                } else if egcl_stdlib::sequences::is_double_float_array(v) {
-                    "DOUBLE-FLOAT"
-                } else {
-                    "T"
-                };
-                return Ok(resolve_sym(ty).unwrap_or(T));
-            }
-            "ARRAY-RANK" => {
-                let (af, _) = cp(cdr);
-                let v = eval_form(af, env)?;
-                // Multidimensional arrays carry their rank; every other egcl
-                // array (vector/string) is rank-1.
-                if let Some(rank) = egcl_rt::types::md_array_rank(v) {
-                    return Ok(rank);
-                }
-                return Ok(EgclVal::from_fixnum(1));
-            }
+            "BIT-VECTOR-P" | "SIMPLE-BIT-VECTOR-P" => return eval_builtin_arguments(&name, cdr, env),
+            "%BIT-VECTOR-FROM-BITS" => return eval_builtin_arguments(&name, cdr, env),
+            "ADJUSTABLE-ARRAY-P" => return eval_builtin_arguments(&name, cdr, env),
+            "ARRAY-HAS-FILL-POINTER-P" => return eval_builtin_arguments(&name, cdr, env),
+            "ARRAY-DISPLACEMENT" => return eval_builtin_arguments(&name, cdr, env),
+            "ARRAY-ELEMENT-TYPE" => return eval_builtin_arguments(&name, cdr, env),
+            "ARRAY-RANK" => return eval_builtin_arguments(&name, cdr, env),
             "ARRAY-DIMENSIONS" => {
                 let (af, _) = cp(cdr);
                 egcl_rt::rooted!(v = eval_form(af, env)?);
@@ -25595,52 +26048,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 };
                 return Ok(vec_to_list(&[EgclVal::from_fixnum(len)]));
             }
-            "ARRAY-DIMENSION" => {
-                // (array-dimension array axis-number). For a multidim array this
-                // is dims[axis]; a rank-1 array (vector/string) has only axis 0
-                // (its length).
-                let (af, r) = cp(cdr);
-                egcl_rt::rooted!(av = eval_form(af, env)?);
-                let axis_v = eval_form(cp(r).0, env)?;
-                // The axis number must be a non-negative fixnum; anything else is
-                // a TYPE-ERROR, not a Rust panic (array-dimension.error tests pass
-                // symbols / negatives to probe the error signalling).
-                if !axis_v.is_fixnum() || axis_v.as_fixnum() < 0 {
-                    return Err(EgclError::TypeError {
-                        datum: axis_v,
-                        expected: "non-negative array axis number".into(),
-                    });
-                }
-                let axis = axis_v.as_fixnum();
-                if egcl_rt::types::md_array_p(*av) {
-                    let dims = md_dims(*av)?;
-                    if axis < 0 || axis as usize >= dims.len() {
-                        return Err(EgclError::ProgramError(format!(
-                            "ARRAY-DIMENSION: axis {axis} out of range for a rank-{} array",
-                            dims.len()
-                        )));
-                    }
-                    return Ok(EgclVal::from_fixnum(dims[axis as usize] as i64));
-                }
-                if axis != 0 {
-                    // A catchable PROGRAM-ERROR, not an uncatchable Internal error
-                    // that would abort do-tests (bliss-dksg).
-                    return Err(EgclError::ProgramError(format!(
-                        "ARRAY-DIMENSION: axis {axis} out of range for a rank-1 array"
-                    )));
-                }
-                // A rank-1 dimension is the TOTAL size, not the active length: for
-                // a fill-pointer / adjustable vector ARRAY-DIMENSION returns the
-                // backing capacity (like ARRAY-TOTAL-SIZE), while LENGTH follows
-                // the fill pointer (bliss-30be).
-                if egcl_stdlib::is_complex_vector(*av) {
-                    return Ok(EgclVal::from_fixnum(
-                        egcl_stdlib::cvec_capacity(*av) as i64
-                    ));
-                }
-                let len = egcl_stdlib::length(*av)? as i64;
-                return Ok(EgclVal::from_fixnum(len));
-            }
+            "ARRAY-DIMENSION" => return eval_builtin_arguments(&name, cdr, env),
             "ARRAY-TOTAL-SIZE" => {
                 // Product of the dimensions = capacity of the row-major storage
                 // (multidim), else the vector/string length. For a fill-pointer /
@@ -25670,83 +26078,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 return egcl_stdlib::reverse(v);
             }
             "NTH" => return eval_builtin_arguments(&name, cdr, env),
-            "MAKE-HASH-TABLE" => {
-                // (make-hash-table &key test size ...) — honor :test, :weakness
-                // and :synchronized; evaluate and ignore the rest. Backed by the
-                // real stdlib hash table.
-                let mut test = egcl_stdlib::HashTest::Eql;
-                let mut weakness: Option<egcl_stdlib::Weakness> = None;
-                let mut synchronized = false;
-                egcl_rt::rooted!(c = cdr);
-                while c.is_cons() {
-                    let (kw_form, r) = cp(*c);
-                    if !r.is_cons() {
-                        break;
-                    }
-                    let (vf, r2) = cp(r);
-                    egcl_rt::rooted!(vf = vf);
-                    egcl_rt::rooted!(r2 = r2);
-                    // Evaluate the keyword too: called directly the keyword is a
-                    // self-evaluating symbol, but reached through apply_function's
-                    // synthesize path (funcall/apply/bytecode CallNamed) every
-                    // argument arrives quoted as `(quote :test)` (bliss-x5y.2).
-                    let kw = eval_form(kw_form, env)?;
-                    let v = eval_form(*vf, env)?;
-                    if kw.is_symbol() {
-                        let kn = sym_name(kw);
-                        // :weakness names which half of an entry the table holds
-                        // WEAKLY (R3.13). Trivial-Garbage's :key-or-value needs an
-                        // ephemeron fixpoint EGCL does not have, so it is
-                        // REJECTED rather than silently downgraded to a strong
-                        // table (bliss-10an).
-                        if kn.strip_prefix("KEYWORD:").unwrap_or(&kn) == "WEAKNESS" {
-                            if v.is_nil() {
-                                weakness = None;
-                            } else {
-                                let wn = sym_name(v);
-                                let wb = wn.strip_prefix("KEYWORD:").unwrap_or(&wn).to_uppercase();
-                                weakness = match wb.as_str() {
-                                    "KEY" => Some(egcl_stdlib::Weakness::Key),
-                                    "VALUE" => Some(egcl_stdlib::Weakness::Value),
-                                    "KEY-AND-VALUE" => Some(egcl_stdlib::Weakness::KeyAndValue),
-                                    other => {
-                                        return Err(EgclError::ProgramError(format!(
-                                            "MAKE-HASH-TABLE: unsupported :WEAKNESS :{other}; EGCL supports :KEY, :VALUE and :KEY-AND-VALUE"
-                                        )));
-                                    }
-                                };
-                            }
-                        }
-                        // Dropping this left every :synchronized table unlocked,
-                        // so concurrent writers corrupted it (GitHub #518).
-                        if kn.strip_prefix("KEYWORD:").unwrap_or(&kn) == "SYNCHRONIZED" {
-                            synchronized = !v.is_nil();
-                        }
-                        if kn.strip_prefix("KEYWORD:").unwrap_or(&kn) == "TEST" {
-                            // :test accepts a function DESIGNATOR — the symbol
-                            // (eq/eql/equal/equalp) OR the function `#'equal`,
-                            // which bliss-uuh now reifies as a wrapper closure;
-                            // resolve either to the test name (bliss-lac).
-                            let tn = function_designator_name(v).unwrap_or_default();
-                            let tb = tn.strip_prefix("KEYWORD:").unwrap_or(&tn).to_uppercase();
-                            test = match tb.as_str() {
-                                "EQ" => egcl_stdlib::HashTest::Eq,
-                                "EQUAL" => egcl_stdlib::HashTest::Equal,
-                                "EQUALP" => egcl_stdlib::HashTest::Equalp,
-                                _ => egcl_stdlib::HashTest::Eql,
-                            };
-                        }
-                    }
-                    *c = *r2;
-                }
-                let opts = egcl_stdlib::MakeHashTableOptions {
-                    test,
-                    weakness,
-                    synchronized,
-                    ..Default::default()
-                };
-                return egcl_stdlib::make_hash_table(&opts);
-            }
+            "MAKE-HASH-TABLE" => return eval_builtin_arguments(&name, cdr, env),
             "GETHASH" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::PUT-GETHASH" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::SET-AREF" | "EGCL::SET-ELT" => {
@@ -25892,289 +26224,17 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 }
                 return Ok(vec_to_list(&pairs));
             }
-            "MAPCAR" => {
-                // (mapcar fn list1 list2 ...) — apply fn to successive tuples,
-                // stopping at the shortest list.
-                // Root the source spine, the input lists' elements, and the
-                // accumulated results across the loops: each eval_form /
-                // apply_function allocates and can relocate the earlier, bare
-                // `Vec`-resident values and the not-yet-walked spine under a minor
-                // GC (bliss-6b2 #2).
-                // (mapcar) with no function argument is a PROGRAM-ERROR.
-                if !cdr.is_cons() {
-                    return Err(EgclError::ProgramError(
-                        "MAPCAR requires a function and at least one list".into(),
-                    ));
-                }
-                let (fn_form, r0) = cp(cdr);
-                egcl_rt::rooted!(r = r0);
-                egcl_rt::rooted!(fn_val = eval_form(fn_form, env)?);
-                // (mapcar fn) with no lists supplied is a PROGRAM-ERROR.
-                if !r.is_cons() {
-                    return Err(EgclError::ProgramError(
-                        "MAPCAR requires at least one list argument".into(),
-                    ));
-                }
-                egcl_rt::rooted!(lists = Vec::<Vec<EgclVal>>::new());
-                while r.is_cons() {
-                    let (list_form, rest) = cp(*r);
-                    egcl_rt::rooted!(rest = rest);
-                    egcl_rt::rooted!(lst = eval_form(list_form, env)?);
-                    // A list argument must be a proper list: walk the spine and
-                    // signal TYPE-ERROR if it ends in a non-NIL atom (a dotted
-                    // list) or is itself a non-list atom (ANSI mapcar.error.4/8).
-                    // The walk only calls `cp` (no allocation), so the plain
-                    // Vec is safe here.
-                    let mut elems: Vec<EgclVal> = Vec::new();
-                    let mut c = *lst;
-                    while c.is_cons() {
-                        let (car, cdr2) = cp(c);
-                        elems.push(car);
-                        c = cdr2;
-                    }
-                    if !c.is_nil() {
-                        // The datum is the improper tail when the argument is
-                        // a dotted list: the list itself satisfies LIST, and
-                        // ansi mapcar.error.8 checks that the datum does not.
-                        return Err(EgclError::TypeError {
-                            datum: if lst.is_cons() { c } else { *lst },
-                            expected: "list".into(),
-                        });
-                    }
-                    lists.push(elems);
-                    *r = *rest;
-                }
-                let n = lists.iter().map(|l| l.len()).min().unwrap_or(0);
-                egcl_rt::rooted!(results = Vec::<EgclVal>::with_capacity(n));
-                for i in 0..n {
-                    let mut args: Vec<EgclVal> = lists.iter().map(|l| l[i]).collect();
-                    egcl_rt::rooted_ref!(_args_root = &mut args);
-                    results.push(apply_function(*fn_val, &args, env)?);
-                }
-                return Ok(vec_to_list(&results));
-            }
-            "MAP" => {
-                // Root the source-form spine as well as the result-type/function
-                // and every sequence element and result across the apply loop
-                // (bliss-6b2 #2): each eval_form / apply_function allocates and can
-                // relocate these Rust-heap Vec-resident values and the not-yet-
-                // evaluated source forms.
-                egcl_rt::rooted!(src = list_to_vec(cdr));
-                if src.len() < 3 {
-                    // Too few arguments to a standard function is a
-                    // PROGRAM-ERROR (CLHS), not an internal error — ansi
-                    // MAP.ERROR.5/6 call (map 'list) and (map 'list #'null) and
-                    // expect one.
-                    return Err(EgclError::ProgramError(format!(
-                        "MAP called with {} argument(s); requires at least 3",
-                        src.len()
-                    )));
-                }
-                egcl_rt::rooted!(result_type = eval_form(src[0], env)?);
-                egcl_rt::rooted!(fn_val = eval_form(src[1], env)?);
-                egcl_rt::rooted!(seqs = Vec::<Vec<EgclVal>>::new());
-                for i in 2..src.len() {
-                    let seq = eval_form(src[i], env)?;
-                    // Any CL sequence: list, string, or (simple/complex) vector.
-                    let elems: Vec<EgclVal> = seq_elements(seq)?;
-                    seqs.push(elems);
-                }
-                let len = seqs.iter().map(Vec::len).min().unwrap_or(0);
-                egcl_rt::rooted!(results = Vec::<EgclVal>::with_capacity(len));
-                for i in 0..len {
-                    let call_args: Vec<EgclVal> = seqs.iter().map(|seq| seq[i]).collect();
-                    results.push(apply_function(*fn_val, &call_args, env)?);
-                }
-                let result_type = *result_type;
-                // `(map nil …)` is called for effect and returns NIL — the only
-                // case the shared builder cannot express, since NIL also names
-                // the empty list.
-                if result_type.is_nil() {
-                    return Ok(NIL);
-                }
-                // Everything else goes through the SAME classification
-                // CONCATENATE uses. This arm used to carry its own smaller copy,
-                // which recognized neither compound specifiers like
-                // `(simple-string 3)` nor SIMPLE-BASE-STRING nor any bit-vector
-                // type, and silently answered a LIST for all of them (ansi
-                // MAP.38-47, MAP.FILL.5). Duplicating stdlib classification in
-                // the interpreter is what AGENTS.md's architecture rule forbids,
-                // and this is precisely how the two drifted apart.
-                // Expand a DEFTYPE alias first — see the CONCATENATE arm.
-                let expanded = resolve_type_spec(env, result_type)?;
-                egcl_rt::rooted!(expanded = expanded);
-                return egcl_stdlib::build_result_sequence(*expanded, &results);
-            }
+            "MAPCAR" => return eval_builtin_arguments(&name, cdr, env),
+            "MAP" => return eval_builtin_arguments(&name, cdr, env),
             // FIND / POSITION / COUNT are defined in lib/boot.lisp over
             // ELT/LENGTH/FUNCALL so their :key/:test can be any interpreter
             // function.  The stdlib helpers only understood a fixed set of
             // sentinel keys and panicked (aborting the process) on a real
             // function — see bliss-0l1.  No builtin arm here means these names
             // fall through to the user/boot function table below.
-            "MEMBER" => {
-                // (member item list &key key test test-not)
-                let (item_f, r) = cp(cdr);
-                let (list_f, kwrest) = cp(r);
-                // Root everything held across the allocating :key/:test calls
-                // (arbitrary Lisp functions): the unevaluated forms, item, the
-                // spine cursor, and the function values themselves (a :test can
-                // be a closure cons). Unrooted, ASDF's circular-dependency
-                // check `(member action list :test 'equal)` walked freed
-                // nursery after a mid-walk minor GC (bliss-4bp).
-                egcl_rt::rooted!(list_f = list_f);
-                egcl_rt::rooted!(kwrest = kwrest);
-                egcl_rt::rooted!(item = eval_form(item_f, env)?);
-                egcl_rt::rooted!(c = eval_form(*list_f, env)?);
-                // eval_args returns RootedVals (already GC-rooted).
-                let kwargs = eval_args(*kwrest, env)?;
-                // Bad keyword tail (odd count / non-symbol key / unknown key) is a
-                // catchable PROGRAM-ERROR, not silently ignored (bliss-l6y9).
-                validate_builtin_keywords(&kwargs, &["KEY", "TEST", "TEST-NOT"])?;
-                let has_key = matches!(find_key_arg(&kwargs, "KEY"), Some(v) if v != NIL);
-                let has_test = find_key_arg(&kwargs, "TEST").is_some();
-                let has_test_not = find_key_arg(&kwargs, "TEST-NOT").is_some();
-                let mut fns = vec![
-                    find_key_arg(&kwargs, "KEY").unwrap_or(NIL),
-                    find_key_arg(&kwargs, "TEST").unwrap_or(NIL),
-                    find_key_arg(&kwargs, "TEST-NOT").unwrap_or(NIL),
-                ];
-                egcl_rt::rooted_ref!(_fns_root = &mut fns);
-                // No :key/:test/:test-not -- the exact shape the fast path
-                // handles. Delegate so the two cannot drift.
-                if !has_key && !has_test && !has_test_not {
-                    return member_eql(*item, *c);
-                }
-                reject_closure_as_list(*c)?;
-                while c.is_cons() {
-                    let (car, _) = cp(*c);
-                    let probe = if has_key {
-                        apply_function(fns[0], &[car], env)?
-                    } else {
-                        car
-                    };
-                    let matched = if has_test {
-                        apply_function(fns[1], &[*item, probe], env)? != NIL
-                    } else if has_test_not {
-                        apply_function(fns[2], &[*item, probe], env)? == NIL
-                    } else {
-                        eql_values(probe, *item)
-                    };
-                    if matched {
-                        return Ok(*c);
-                    }
-                    // Re-read the (rooted, GC-current) cell only after the
-                    // allocating calls above — a cdr copied before them would
-                    // be stale.
-                    let (_, next) = cp(*c);
-                    *c = next;
-                }
-                // MEMBER's LIST argument must be a proper list: a non-list (or an
-                // improper/dotted tail reached without a match) is a TYPE-ERROR
-                // (CLHS; ansi-test member.error, check-type-error over non-lists).
-                if !c.is_nil() {
-                    return Err(EgclError::TypeError {
-                        datum: *c,
-                        expected: "list".into(),
-                    });
-                }
-                return Ok(NIL);
-            }
-            "ASSOC" => {
-                // (assoc item alist &key key test test-not) — previously the
-                // &key arguments were dropped entirely and every entry compared
-                // with vals_equal, so `(assoc 2.0 '((2 . b)) :test '=)` returned
-                // NIL and `:key` was ignored. Mirror MEMBER: honor :key/:test/
-                // :test-not, applying :key to each entry's CAR. GC-rooting mirrors
-                // MEMBER exactly (the :key/:test calls run arbitrary Lisp that can
-                // relocate the nursery; bliss-4bp).
-                let (item_f, r) = cp(cdr);
-                let (alist_f, kwrest) = cp(r);
-                egcl_rt::rooted!(alist_f = alist_f);
-                egcl_rt::rooted!(kwrest = kwrest);
-                egcl_rt::rooted!(item = eval_form(item_f, env)?);
-                egcl_rt::rooted!(c = eval_form(*alist_f, env)?);
-                let kwargs = eval_args(*kwrest, env)?;
-                // Bad keyword tail (odd count / non-symbol key / unknown key) is a
-                // catchable PROGRAM-ERROR, not silently ignored (bliss-l6y9).
-                validate_builtin_keywords(&kwargs, &["KEY", "TEST", "TEST-NOT"])?;
-                let has_key = matches!(find_key_arg(&kwargs, "KEY"), Some(v) if v != NIL);
-                let has_test = find_key_arg(&kwargs, "TEST").is_some();
-                let has_test_not = find_key_arg(&kwargs, "TEST-NOT").is_some();
-                let mut fns = vec![
-                    find_key_arg(&kwargs, "KEY").unwrap_or(NIL),
-                    find_key_arg(&kwargs, "TEST").unwrap_or(NIL),
-                    find_key_arg(&kwargs, "TEST-NOT").unwrap_or(NIL),
-                ];
-                egcl_rt::rooted_ref!(_fns_root = &mut fns);
-                // No keywords: same kernel the fast path uses (see member_eql).
-                if !has_key && !has_test && !has_test_not {
-                    return assoc_eql(*item, *c);
-                }
-                reject_closure_as_list(*c)?;
-                while c.is_cons() {
-                    let (pair, _) = cp(*c);
-                    // Skip NIL entries; only compare against real (cons) pairs.
-                    // A non-NIL, non-cons element is not a pair — a TYPE-ERROR
-                    // whose datum is that offending element (assoc.error.11).
-                    if !pair.is_cons() && !pair.is_nil() {
-                        return Err(EgclError::TypeError {
-                            datum: pair,
-                            expected: "list".into(),
-                        });
-                    }
-                    if pair.is_cons() {
-                        let (k, _) = cp(pair);
-                        let probe = if has_key {
-                            apply_function(fns[0], &[k], env)?
-                        } else {
-                            k
-                        };
-                        let matched = if has_test {
-                            apply_function(fns[1], &[*item, probe], env)? != NIL
-                        } else if has_test_not {
-                            apply_function(fns[2], &[*item, probe], env)? == NIL
-                        } else {
-                            eql_values(probe, *item)
-                        };
-                        if matched {
-                            // Re-read the (rooted, GC-current) pair after the
-                            // allocating calls — a copy from before is stale.
-                            let (fresh_pair, _) = cp(*c);
-                            return Ok(fresh_pair);
-                        }
-                    }
-                    let (_, next) = cp(*c);
-                    *c = next;
-                }
-                // ASSOC's ALIST must be a proper list of pairs: a non-list / improper
-                // tail is a TYPE-ERROR (CLHS; ansi-test assoc.error).
-                if !c.is_nil() {
-                    return Err(EgclError::TypeError {
-                        datum: *c,
-                        expected: "list".into(),
-                    });
-                }
-                return Ok(NIL);
-            }
-            "CONCATENATE" => {
-                // Delegate to stdlib so CLI sequence behavior matches the
-                // same implementation used by lower-level stage-3 tests.
-                // Root the arg spine and the result type across the argument
-                // evaluations (moving GC; bliss-4bp).
-                let (type_form, rest) = cp(cdr);
-                egcl_rt::rooted!(rest = rest);
-                egcl_rt::rooted!(result_type = eval_form(type_form, env)?);
-                let sequences = eval_args(*rest, env)?;
-                // Expand a DEFTYPE alias before stdlib classifies it. The
-                // classifier only knows the built-in sequence type names, so a
-                // user type — babel's `(deftype unicode-string () '(simple-array
-                // character (*)))` is the case that surfaced this — was rejected
-                // outright as "not a sequence type specifier". CLHS allows any
-                // type specifier denoting a sequence subtype, DEFTYPE included.
-                let expanded = resolve_type_spec(env, *result_type)?;
-                egcl_rt::rooted!(expanded = expanded);
-                return egcl_stdlib::concatenate(*expanded, &sequences);
-            }
+            "MEMBER" => return eval_builtin_arguments(&name, cdr, env),
+            "ASSOC" => return eval_builtin_arguments(&name, cdr, env),
+            "CONCATENATE" => return eval_builtin_arguments(&name, cdr, env),
             "SUBSEQ" if global_fn(&name).is_none() => {
                 return eval_builtin_arguments(&name, cdr, env);
             }
@@ -26249,43 +26309,8 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 return Ok(pathname);
             }
             "PARSE-NAMESTRING" => return eval_builtin_arguments(&name, cdr, env),
-            "NAMESTRING" => {
-                // (namestring pathname) — exactly one pathname designator; a
-                // string coerces to a pathname first (ansi namestring.1/.2), and
-                // wrong arity is a PROGRAM-ERROR (namestring.error.1/.2).
-                let n = form_arg_count(cdr);
-                if n != 1 {
-                    return Err(EgclError::ProgramError(format!(
-                        "NAMESTRING requires exactly 1 argument, got {n}"
-                    )));
-                }
-                let (pathname_form, _) = cp(cdr);
-                let mut pathname = eval_form(pathname_form, env)?;
-                egcl_rt::rooted_ref!(_p = &mut pathname);
-                let pn = coerce_pathname_designator(pathname)?;
-                return egcl_stdlib::namestring(pn);
-            }
-            "PROBE-FILE" => {
-                // (probe-file pathspec) — truename if the file exists, else NIL.
-                let (pathname_form, _) = cp(cdr);
-                egcl_rt::rooted!(pathname = eval_form(pathname_form, env)?);
-                // Relative to *DEFAULT-PATHNAME-DEFAULTS* (CLHS 19.2.3), as OPEN.
-                if is_path_designator(*pathname) {
-                    *pathname = resolve_against_dpd(*pathname, env)?;
-                }
-                if egcl_stdlib::is_pathname(*pathname)
-                    && egcl_stdlib::wild_pathname_p(*pathname, None)
-                {
-                    // A wild pathname names no single file (CLHS PROBE-FILE;
-                    // ansi files probe-file.error.3/.4, file-error.1).
-                    return Err(file_error_with_pathname(
-                        env,
-                        *pathname,
-                        "PROBE-FILE: wild pathname",
-                    ));
-                }
-                return Ok(egcl_stdlib::probe_file(*pathname)?.unwrap_or(NIL));
-            }
+            "NAMESTRING" => return eval_builtin_arguments(&name, cdr, env),
+            "PROBE-FILE" => return eval_builtin_arguments(&name, cdr, env),
             "OPEN" => return eval_builtin_arguments(&name, cdr, env),
             "DELETE-FILE" => {
                 // (delete-file pathspec) — delete the file, returning T.
@@ -26328,29 +26353,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 env.set_mv(vec![defaulted, old_true, new_true]);
                 return Ok(defaulted);
             }
-            "FILE-WRITE-DATE" => {
-                // (file-write-date pathspec) — the file's last-modified time as a
-                // CL universal time (seconds since 1900-01-01). ASDF uses it for
-                // staleness checks (bliss-lb6.14).
-                let (path_form, _) = cp(cdr);
-                egcl_rt::rooted!(pathspec = eval_form(path_form, env)?);
-                if is_path_designator(*pathspec) {
-                    *pathspec = resolve_against_dpd(*pathspec, env)?;
-                }
-                let path = path_designator_to_string(*pathspec)?;
-                if let Some(date) = egcl_stdlib::embedded_files::write_date(&path) {
-                    return Ok(EgclVal::from_fixnum(date));
-                }
-                let secs = std::fs::metadata(&path)
-                    .and_then(|m| m.modified())
-                    .map_err(|e| EgclError::FileError(format!("{}: {}", path, e)))?
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_err(|e| EgclError::FileError(e.to_string()))?
-                    .as_secs();
-                // Universal time epoch (1900) precedes the Unix epoch (1970) by
-                // 2208988800 seconds.
-                return Ok(EgclVal::from_fixnum(secs as i64 + 2_208_988_800));
-            }
+            "FILE-WRITE-DATE" => return eval_builtin_arguments(&name, cdr, env),
             "GET-UNIVERSAL-TIME" => {
                 return Ok(EgclVal::from_fixnum(
                     egcl_stdlib::time::get_universal_time(),
@@ -26715,20 +26718,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             "EVENP" | "ODDP" => {
                 let af = expect_one_arg(cdr, name.as_str())?;
                 let v = eval_form(af, env)?;
-                // Parity must be exact: a bignum via f64 (num_val as i64)
-                // overflows and gives the wrong bit (bliss-05hy).
-                let even = if v.is_fixnum() {
-                    v.as_fixnum() % 2 == 0
-                } else if let Some(n) = bigint_from_val(v) {
-                    // Even iff the least-significant limb is even (0 ⇒ even).
-                    n.mag.first().copied().unwrap_or(0) & 1 == 0
-                } else {
-                    return Err(EgclError::TypeError {
-                        datum: v,
-                        expected: "integer".into(),
-                    });
-                };
-                return Ok(if even == (name == "EVENP") { T } else { NIL });
+                return parity_value(name == "EVENP", v);
             }
             "ABS" => {
                 let af = expect_one_arg(cdr, "ABS")?;
@@ -26737,60 +26727,11 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             }
             // NUMERATOR/DENOMINATOR of a rational: an integer is n/1; a ratio
             // stores numerator@8 / denominator@16 (RatioData) (bliss-apr).
-            "NUMERATOR" | "DENOMINATOR" => {
-                let want_num = name == "NUMERATOR";
-                let af = expect_one_arg(cdr, name.as_str())?;
-                let v = eval_form(af, env)?;
-                if egcl_rt::types::integerp(v) {
-                    return Ok(if want_num {
-                        v
-                    } else {
-                        EgclVal::from_fixnum(1)
-                    });
-                }
-                // A ratio (rational but not integer) stores numerator@8 /
-                // denominator@16 in its RatioData body.
-                if egcl_rt::types::rationalp(v) {
-                    let off = if want_num { 8 } else { 16 };
-                    return Ok(unsafe { *(v.as_ptr().add(off) as *const EgclVal) });
-                }
-                return Err(EgclError::TypeError {
-                    datum: v,
-                    expected: "rational".into(),
-                });
-            }
+            "NUMERATOR" | "DENOMINATOR" => return eval_builtin_arguments(&name, cdr, env),
             // FLOAT: coerce a real to a float. (float x) => single-float; with a
             // float prototype, the prototype's format. egcl floats are single;
             // route through num_val (bliss-apr).
-            "FLOAT" => {
-                if !cdr.is_cons() || cp(cp(cdr).1).1.is_cons() {
-                    return Err(EgclError::ProgramError(
-                        "FLOAT takes one or two arguments".into(),
-                    ));
-                }
-                let (af, rest) = cp(cdr);
-                egcl_rt::rooted!(rest = rest);
-                egcl_rt::rooted!(v = eval_form(af, env)?);
-                // (FLOAT x prototype): the result takes the prototype's float
-                // format. (FLOAT x) with no prototype returns an already-float
-                // argument unchanged, else converts a rational to the default
-                // (SINGLE-FLOAT). CLHS FLOAT.
-                let kind = if rest.is_cons() {
-                    let proto = eval_form(cp(*rest).0, env)?;
-                    real_float_kind(proto)
-                } else if egcl_rt::types::floatp(*v) {
-                    return Ok(*v);
-                } else {
-                    FloatKind::Single
-                };
-                if egcl_rt::types::realp(*v) {
-                    return Ok(box_float(num_val(*v)?, kind));
-                }
-                return Err(EgclError::TypeError {
-                    datum: *v,
-                    expected: "real".into(),
-                });
-            }
+            "FLOAT" => return eval_builtin_arguments(&name, cdr, env),
             "MIN" | "MAX" => return eval_builtin_arguments(&name, cdr, env),
             "FLOOR" => return eval_floor(cdr, env),
             "REM" => return eval_builtin_arguments(&name, cdr, env),
@@ -26804,35 +26745,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             "LOGBITP" => return eval_builtin_arguments(&name, cdr, env),
             "INTEGER-LENGTH" | "LOGCOUNT" => return eval_builtin_arguments(&name, cdr, env),
             "EXPT" => return eval_builtin_arguments(&name, cdr, env),
-            "SQRT" => {
-                let af = expect_one_arg(cdr, "SQRT")?;
-                let v = eval_form(af, env)?;
-                // Complex argument → principal complex square root (bliss-k0jg
-                // follow-up): sqrt(a+bi) = √((r+a)/2) + sign(b)·√((r−a)/2)·i.
-                if let Some(re) = egcl_rt::types::complex_realpart(v) {
-                    let imag = egcl_rt::types::complex_imagpart(v).unwrap_or(NIL);
-                    let a = num_val(re)?;
-                    let b = num_val(imag)?;
-                    let kind = widen_float(real_float_kind(re), real_float_kind(imag));
-                    let r = a.hypot(b);
-                    let re_out = ((r + a) / 2.0).sqrt();
-                    let im_out = ((r - a) / 2.0).sqrt() * if b < 0.0 { -1.0 } else { 1.0 };
-                    // box_float may allocate (double); root the real part across
-                    // the imaginary allocation and the COMPLEX build.
-                    egcl_rt::rooted!(re_v = box_float(re_out, kind));
-                    let im_v = box_float(im_out, kind);
-                    return make_complex(*re_v, im_v);
-                }
-                let kind = real_float_kind(v);
-                let nv = num_val(v)?;
-                // A negative real has a pure-imaginary root #C(0.0 √|x|), not NaN.
-                if nv < 0.0 {
-                    egcl_rt::rooted!(re_v = box_float(0.0, kind));
-                    let im_v = box_float((-nv).sqrt(), kind);
-                    return make_complex(*re_v, im_v);
-                }
-                return Ok(box_float(nv.sqrt(), kind));
-            }
+            "SQRT" => return eval_builtin_arguments(&name, cdr, env),
             // Transcendental functions on reals → single-float (bliss-44qp).
             // Computed in f64 then narrowed. Complex arguments and the complex
             // codomain of out-of-real-range inputs (e.g. (asin 2), (acosh 0))
@@ -26893,135 +26806,9 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 ]);
                 return Ok(EgclVal::from_fixnum(mantissa as i64));
             }
-            "DECODE-FLOAT" => {
-                // => (values significand exponent sign), significand in [1/2, 1).
-                let (af, _) = cp(cdr);
-                let v = eval_form(af, env)?;
-                let is_double = v.is_double_float();
-                let (sign, mantissa, exp) = if is_double {
-                    decode_f64(v.as_double_float())
-                } else {
-                    decode_f32(num_val(v)? as f32)
-                };
-                let (significand, exponent) = if mantissa == 0 {
-                    (0.0f64, 0i32)
-                } else {
-                    // value = mantissa·2^exp; put the significand in [1/2,1):
-                    // significand = mantissa·2^(exp - E), where E makes it so.
-                    let bits = (64 - mantissa.leading_zeros()) as i32; // bit length
-                    let exponent = exp + bits;
-                    let significand = mantissa as f64 * 2f64.powi(exp - exponent);
-                    (significand, exponent)
-                };
-                let kind = if is_double {
-                    FloatKind::Double
-                } else {
-                    FloatKind::Single
-                };
-                env.set_mv(vec![
-                    box_float(significand, kind),
-                    EgclVal::from_fixnum(exponent as i64),
-                    box_float(sign as f64, kind),
-                ]);
-                return Ok(box_float(significand, kind));
-            }
+            "DECODE-FLOAT" => return eval_builtin_arguments(&name, cdr, env),
             "EXP" | "SIN" | "COS" | "TAN" | "ASIN" | "ACOS" | "SINH" | "COSH" | "TANH"
-            | "ASINH" | "ACOSH" | "ATANH" => {
-                let af = expect_one_arg(cdr, name.as_str())?;
-                let v = eval_form(af, env)?;
-                // A COMPLEX argument (bliss-bd9c). `num_val` below rejects one,
-                // so these used to answer "#C(..) is not of type number" -- the
-                // single largest family left in the numbers chapter. Only the
-                // functions with direct, branch-cut-free formulas are handled
-                // here; the inverse ones (ASIN/ACOS/ATAN/ASINH/ACOSH/ATANH) need
-                // complex log and sqrt with principal-value branch cuts and are
-                // deliberately left to fall through to the real path.
-                if let Some(re) = egcl_rt::types::complex_realpart(v) {
-                    let imag = egcl_rt::types::complex_imagpart(v).unwrap_or(NIL);
-                    let a = num_val(re)?;
-                    let b = num_val(imag)?;
-                    // (p+qi)/(r+si), used for TAN and TANH.
-                    let cdiv = |p: f64, q: f64, r: f64, s: f64| {
-                        let d = r * r + s * s;
-                        ((p * r + q * s) / d, (q * r - p * s) / d)
-                    };
-                    let parts = match name.as_str() {
-                        // e^(a+bi) = e^a (cos b + i sin b)
-                        "EXP" => Some((a.exp() * b.cos(), a.exp() * b.sin())),
-                        // sin(a+bi) = sin a cosh b + i cos a sinh b
-                        "SIN" => Some((a.sin() * b.cosh(), a.cos() * b.sinh())),
-                        // cos(a+bi) = cos a cosh b - i sin a sinh b
-                        "COS" => Some((a.cos() * b.cosh(), -(a.sin() * b.sinh()))),
-                        // sinh(a+bi) = sinh a cos b + i cosh a sin b
-                        "SINH" => Some((a.sinh() * b.cos(), a.cosh() * b.sin())),
-                        // cosh(a+bi) = cosh a cos b + i sinh a sin b
-                        "COSH" => Some((a.cosh() * b.cos(), a.sinh() * b.sin())),
-                        // tan = sin/cos, tanh = sinh/cosh, as complex quotients.
-                        "TAN" => Some(cdiv(
-                            a.sin() * b.cosh(),
-                            a.cos() * b.sinh(),
-                            a.cos() * b.cosh(),
-                            -(a.sin() * b.sinh()),
-                        )),
-                        "TANH" => Some(cdiv(
-                            a.sinh() * b.cos(),
-                            a.cosh() * b.sin(),
-                            a.cosh() * b.cos(),
-                            a.sinh() * b.sin(),
-                        )),
-                        // The six INVERSE functions (bliss-i13d): principal
-                        // values via complex log and sqrt, CLHS 12.1.5.3.
-                        _ => complex_inverse(name.as_str(), (a, b)),
-                    };
-                    if let Some((re_out, im_out)) = parts {
-                        let kind = widen_float(real_float_kind(re), real_float_kind(imag));
-                        // box_float may allocate (double); root the real part
-                        // across the imaginary allocation and the COMPLEX build,
-                        // exactly as SQRT's complex branch does.
-                        egcl_rt::rooted!(re_v = box_float(re_out, kind));
-                        let im_v = box_float(im_out, kind);
-                        return make_complex(*re_v, im_v);
-                    }
-                }
-                let x = num_val(v)?;
-                let r = match name.as_str() {
-                    "EXP" => x.exp(),
-                    "SIN" => x.sin(),
-                    "COS" => x.cos(),
-                    "TAN" => x.tan(),
-                    "ASIN" => x.asin(),
-                    "ACOS" => x.acos(),
-                    "SINH" => x.sinh(),
-                    "COSH" => x.cosh(),
-                    "TANH" => x.tanh(),
-                    "ASINH" => x.asinh(),
-                    "ACOSH" => x.acosh(),
-                    "ATANH" => x.atanh(),
-                    _ => unreachable!(),
-                };
-                // A REAL argument OUTSIDE the function's real domain --
-                // (asin 2), (acos 2), (acosh 0), (atanh 2) -- has a COMPLEX
-                // principal value, not NaN (CLHS 12.1.5.3). The real kernels
-                // above return NaN there, so recompute through the same complex
-                // formula used for a complex argument. Restricted to a finite
-                // input so a NaN ARGUMENT still yields NaN.
-                if r.is_nan() && x.is_finite() {
-                    if let Some((re_out, im_out)) = complex_inverse(name.as_str(), (x, 0.0)) {
-                        let kind = real_float_kind(v);
-                        egcl_rt::rooted!(re_v = box_float(re_out, kind));
-                        let im_v = box_float(im_out, kind);
-                        return make_complex(*re_v, im_v);
-                    }
-                }
-                // EXP only: e^x is never zero and never infinite for finite
-                // x, so either outcome is a range condition (CLHS 12.1.4.3).
-                let r = if name.as_str() == "EXP" {
-                    check_float_range(r, real_float_kind(v), x.is_finite(), true)?
-                } else {
-                    r
-                };
-                return Ok(box_float(r, real_float_kind(v)));
-            }
+            | "ASINH" | "ACOSH" | "ATANH" => return eval_builtin_arguments(&name, cdr, env),
             // (ATAN y) = arctangent; (ATAN y x) = phase of x+yi (atan2).
             "ATAN" => {
                 if !cdr.is_cons() || cp(cp(cdr).1).1.is_cons() {
@@ -27110,112 +26897,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 }
                 return Ok(box_float(x.ln(), kind));
             }
-            "RANDOM" => {
-                // (random limit &optional random-state) — a value in [0, limit)
-                // of the same type as LIMIT. The optional random-state arg is
-                // evaluated (for effect) but the shared generator is used.
-                // (random limit &optional random-state): one or two arguments.
-                // With none, `cp(NIL)` produced a NIL limit that fell through to
-                // "NIL is not of type positive integer or float" -- a TYPE-ERROR
-                // where CLHS 3.5.1 wants a PROGRAM-ERROR for a wrong argument
-                // COUNT (ansi RANDOM.ERROR.1-2).
-                let n = form_arg_count(cdr);
-                if !(1..=2).contains(&n) {
-                    return Err(EgclError::ProgramError(format!(
-                        "RANDOM requires one or two arguments, got {n}"
-                    )));
-                }
-                let (limit_form, rest) = cp(cdr);
-                // Root the pending spine and limit across the optional
-                // random-state eval (moving GC; bliss-4bp).
-                egcl_rt::rooted!(rest = rest);
-                egcl_rt::rooted!(limit_r = eval_form(limit_form, env)?);
-                // The optional RANDOM-STATE argument, else *RANDOM-STATE*; the
-                // draws below advance that object, so a copy made by
-                // MAKE-RANDOM-STATE yields the same sequence (CLHS RANDOM; ansi
-                // numbers make-random-state.1-3).
-                egcl_rt::rooted!(
-                    state = if rest.is_cons() {
-                        eval_form(cp(*rest).0, env)?
-                    } else {
-                        env.lookup_var("*RANDOM-STATE*").unwrap_or(NIL)
-                    }
-                );
-                let draw = || random_state_draw(*state);
-                let limit = *limit_r;
-                if limit.is_fixnum() {
-                    let bound = limit.as_fixnum();
-                    if bound <= 0 {
-                        // CLHS: LIMIT is of type (REAL (0)), so a non-positive
-                        // one is a TYPE-ERROR -- ansi RANDOM.ERROR.3 checks
-                        // exactly that. It was a PROGRAM-ERROR, i.e. the two
-                        // error kinds were swapped with the arity case above.
-                        return Err(EgclError::TypeError {
-                            datum: limit,
-                            expected: "(REAL (0))".into(),
-                        });
-                    }
-                    let r = (draw() % bound as u64) as i64;
-                    return Ok(EgclVal::from_fixnum(r));
-                }
-                if limit.is_single_float() {
-                    let bound = limit.as_single_float();
-                    if bound <= 0.0 {
-                        // CLHS: LIMIT is of type (REAL (0)), so a non-positive
-                        // one is a TYPE-ERROR -- ansi RANDOM.ERROR.3 checks
-                        // exactly that. It was a PROGRAM-ERROR, i.e. the two
-                        // error kinds were swapped with the arity case above.
-                        return Err(EgclError::TypeError {
-                            datum: limit,
-                            expected: "(REAL (0))".into(),
-                        });
-                    }
-                    // 24 random mantissa bits give a uniform unit float in [0,1).
-                    let unit = (draw() >> 40) as f32 / (1u64 << 24) as f32;
-                    return Ok(EgclVal::from_single_float(unit * bound));
-                }
-                if limit.is_double_float() {
-                    let bound = limit.as_double_float();
-                    if bound <= 0.0 {
-                        // CLHS: LIMIT is of type (REAL (0)), so a non-positive
-                        // one is a TYPE-ERROR -- ansi RANDOM.ERROR.3 checks
-                        // exactly that. It was a PROGRAM-ERROR, i.e. the two
-                        // error kinds were swapped with the arity case above.
-                        return Err(EgclError::TypeError {
-                            datum: limit,
-                            expected: "(REAL (0))".into(),
-                        });
-                    }
-                    // 53 random mantissa bits give a uniform unit double in [0,1).
-                    let unit = (draw() >> 11) as f64 / (1u64 << 53) as f64;
-                    return Ok(egcl_rt::gc::alloc_double_float(unit * bound));
-                }
-                // Bignum limit: draw a random magnitude with the same limb count
-                // and reduce modulo the limit for a value in [0, limit).
-                if let Some(b) = bigint_from_val(limit) {
-                    if b.sign <= 0 {
-                        // CLHS: LIMIT is of type (REAL (0)), so a non-positive
-                        // one is a TYPE-ERROR -- ansi RANDOM.ERROR.3 checks
-                        // exactly that. It was a PROGRAM-ERROR, i.e. the two
-                        // error kinds were swapped with the arity case above.
-                        return Err(EgclError::TypeError {
-                            datum: limit,
-                            expected: "(REAL (0))".into(),
-                        });
-                    }
-                    let mut limbs = Vec::with_capacity(b.mag.len());
-                    for _ in 0..b.mag.len() {
-                        limbs.push(draw());
-                    }
-                    let r = BigInt::from_mag(1, limbs);
-                    let (_, rem) = big_divmod(&r, &b);
-                    return Ok(rem.to_val());
-                }
-                return Err(EgclError::TypeError {
-                    datum: limit,
-                    expected: "positive integer or float".into(),
-                });
-            }
+            "RANDOM" => return eval_builtin_arguments(&name, cdr, env),
             "NTH-VALUE" => {
                 let (nf, r) = cp(cdr);
                 egcl_rt::rooted!(form = cp(r).0);
@@ -27426,51 +27108,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 }
                 return Ok(*copy);
             }
-            "FIND-CLASS" => {
-                // (find-class name &optional (errorp t) environment) — return the
-                // class metaobject, or (when errorp is NIL) NIL if none is found.
-                let (name_form, rest) = cp(cdr);
-                // Root the pending spine and name across the errorp eval
-                // (moving GC; bliss-4bp).
-                egcl_rt::rooted!(rest = rest);
-                egcl_rt::rooted!(name_r = eval_form(name_form, env)?);
-                // errorp defaults to T when the argument is omitted.
-                let errorp = if rest.is_cons() {
-                    let (errorp_form, _) = cp(*rest);
-                    eval_form(errorp_form, env)? != NIL
-                } else {
-                    true
-                };
-                let name = *name_r;
-                if let Some(class) = egcl_stdlib::find_class(name) {
-                    return Ok(class);
-                }
-                // RESTART is defined on first use by the restart machinery;
-                // FIND-CLASS must see it before any restart exists (CLHS 4.3.7;
-                // ansi objects find-class.1).
-                if name.is_symbol()
-                    && sym_bare_name_rc(name).as_ref() == "RESTART"
-                    && symbol_home_package_name(name) == "COMMON-LISP"
-                {
-                    return ensure_restart_class(env);
-                }
-                if let Ok(class) = resolve_class_metaobject(env, name)
-                    && class != name
-                {
-                    return Ok(class);
-                }
-                if !errorp {
-                    return Ok(NIL);
-                }
-                let name_str = if name.is_symbol() {
-                    sym_name(name)
-                } else {
-                    val_as_str(name)
-                };
-                let msg = format!("there is no class named {}", name_str);
-                let condition = make_simple_error_condition(arena_str(&msg), env)?;
-                return Err(signal_and_raise(env, condition, msg));
-            }
+            "FIND-CLASS" => return eval_builtin_arguments(&name, cdr, env),
             "CLASS-NAME" => {
                 // A user method on CLASS-NAME takes part in dispatch; the built-in
                 // behaviour is the fallback for classes without one (ansi class-name.2).
@@ -29189,254 +28827,10 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     Ok(NIL)
                 });
             }
-            "STRING=" => {
-                // ANSI: compare the (optionally :start1/:end1/:start2/:end2
-                // bounded) substrings for character equality. The bounds were
-                // previously ignored, so (string= "xabcy" "abc" :start1 1 :end1 4)
-                // returned NIL (bliss-cnzs).
-                let (a, b, _start1) = string_compare_bounds(cdr, env)?;
-                return Ok(if a == b { T } else { NIL });
-            }
-            "STRING<" => {
-                // ANSI: the mismatch index (in string1's coordinates) if
-                // string1 < string2, else NIL — honoring the :start1/:end1/
-                // :start2/:end2 bounds, which used to be ignored (bliss-c62r).
-                let (a, b, start1) = string_compare_bounds(cdr, env)?;
-                let (i, ord) = string_mismatch(&a, &b);
-                return Ok(if ord == std::cmp::Ordering::Less {
-                    EgclVal::from_fixnum((start1 + i) as i64)
-                } else {
-                    NIL
-                });
-            }
-            "STRING>" => {
-                // ANSI: the mismatch index (in string1's coordinates) if
-                // string1 > string2, else NIL — honoring the bounding keywords
-                // (bliss-c62r).
-                let (a, b, start1) = string_compare_bounds(cdr, env)?;
-                let (i, ord) = string_mismatch(&a, &b);
-                return Ok(if ord == std::cmp::Ordering::Greater {
-                    EgclVal::from_fixnum((start1 + i) as i64)
-                } else {
-                    NIL
-                });
-            }
-            "TYPE-OF" => {
-                // (type-of object): exactly one argument, else a PROGRAM-ERROR
-                // (ansi TYPE-OF.ERROR.1/2).
-                let n = form_arg_count(cdr);
-                if n != 1 {
-                    return Err(EgclError::ProgramError(format!(
-                        "TYPE-OF requires exactly 1 argument, got {n}"
-                    )));
-                }
-                let (af, _) = cp(cdr);
-                let v = eval_form(af, env)?;
-                if python::is_proxy(v) {
-                    return Ok(
-                        resolve_sym("EGCL-PYTHON::OBJECT").expect("Python object type symbol")
-                    );
-                }
-                if egcl_stdlib::synchronization::mutex_p(v) {
-                    return Ok(resolve_sym("EGCL-THREAD::MUTEX").expect("mutex type symbol"));
-                }
-                if egcl_stdlib::synchronization::condition_variable_p(v) {
-                    return Ok(resolve_sym("EGCL-THREAD::CONDITION-VARIABLE")
-                        .expect("condition-variable type symbol"));
-                }
-                // Preserve the defining symbol, including its home package.
-                //
-                // CLHS TYPE-OF: the answer is the class's PROPER name, and if
-                // the class has none, the class itself. A name is proper only
-                // while FIND-CLASS maps it back to this class, so a class
-                // whose name has been unbound with
-                // `(setf (find-class 'x) nil)` answers the metaobject. That
-                // distinction was unobservable while a class WAS its name
-                // symbol -- the two answers were the same object, which is why
-                // ansi-test TYPE-OF.9 passed before bliss-vsjn1 and needs this
-                // after.
-                if egcl_stdlib::is_instance(v) {
-                    let class = egcl_stdlib::class_of(v);
-                    let name = egcl_stdlib::class_name(class);
-                    if !name.is_nil() {
-                        if egcl_stdlib::find_class(name) == Some(class) {
-                            return Ok(name);
-                        }
-                        return Ok(class);
-                    }
-                }
-                if egcl_stdlib::sequences::is_double_float_array(v) {
-                    let complex = egcl_stdlib::is_complex_vector(v);
-                    let dims = if egcl_rt::types::md_array_p(v) {
-                        md_dims(v)?
-                    } else {
-                        vec![egcl_stdlib::array_total_size(v).unwrap()]
-                    };
-                    let dim_vals: Vec<_> = dims.into_iter()
-                        .map(|d| EgclVal::from_fixnum(d as i64)).collect();
-                    egcl_rt::rooted!(dims_list = vec_to_list(&dim_vals));
-                    return Ok(vec_to_list(&[
-                        resolve_sym(if complex { "ARRAY" } else { "SIMPLE-ARRAY" }).unwrap(),
-                        resolve_sym("DOUBLE-FLOAT").unwrap(),
-                        *dims_list,
-                    ]));
-                }
-                // A bit-vector's TYPE-OF is the compound (SIMPLE-BIT-VECTOR n)
-                // specifier, not a bare symbol (bliss-zg9).
-                if egcl_rt::types::bit_vector_p(v) {
-                    let len = egcl_rt::types::bit_vector_len(v).unwrap_or(0);
-                    egcl_rt::rooted!(inner = arena_cons(EgclVal::from_fixnum(len as i64), NIL));
-                    let sym = resolve_sym("SIMPLE-BIT-VECTOR").unwrap_or(NIL);
-                    return Ok(arena_cons(sym, *inner));
-                }
-                if egcl_rt::types::complexp(v) {
-                    return Ok(resolve_sym("COMPLEX").unwrap_or(NIL));
-                }
-                // A multidimensional array's TYPE-OF is the compound specifier
-                // (SIMPLE-ARRAY T (d0 d1 …)) (bliss-rh0t).
-                if egcl_rt::types::md_array_p(v) {
-                    let dims = md_dims(v)?;
-                    let dim_vals: Vec<EgclVal> = dims
-                        .iter()
-                        .map(|&d| EgclVal::from_fixnum(d as i64))
-                        .collect();
-                    egcl_rt::rooted!(dims_list = vec_to_list(&dim_vals));
-                    let spec = vec![
-                        resolve_sym("SIMPLE-ARRAY").unwrap_or(NIL),
-                        resolve_sym("T").unwrap_or(T),
-                        *dims_list,
-                    ];
-                    return Ok(vec_to_list(&spec));
-                }
-                // CLHS TYPE-OF: the most specific recognizable type. 0 and 1
-                // are BITs, other non-negative fixnums (INTEGER 0 mpf), bignums
-                // the open ranges beyond the fixnums (ansi type-of.1/4).
-                if v.is_fixnum() {
-                    let n = v.as_fixnum();
-                    if n == 0 || n == 1 {
-                        return Ok(resolve_sym("BIT").unwrap_or(NIL));
-                    }
-                    if n > 1 {
-                        return Ok(vec_to_list(&[
-                            resolve_sym("INTEGER").unwrap_or(NIL),
-                            EgclVal::from_fixnum(0),
-                            EgclVal::from_fixnum((1_i64 << 60) - 1),
-                        ]));
-                    }
-                } else if egcl_rt::types::integerp(v) {
-                    let negative = egcl_rt::bignum::bigint_from_val(v)
-                        .map(|big| big.sign < 0)
-                        .unwrap_or(false);
-                    let integer = resolve_sym("INTEGER").unwrap_or(NIL);
-                    // The bounds just outside the fixnum range are bignums.
-                    let mut magnitude = Vec::new();
-                    egcl_rt::bignum::mag_set_bit(&mut magnitude, 60);
-                    return Ok(if negative {
-                        let below = egcl_rt::bignum::mag_add(&magnitude, &[1]);
-                        egcl_rt::rooted!(bound = egcl_rt::bignum::BigInt::from_mag(-1, below).to_val());
-                        vec_to_list(&[integer, resolve_sym("*").unwrap_or(NIL), *bound])
-                    } else {
-                        egcl_rt::rooted!(bound = egcl_rt::bignum::BigInt::from_mag(1, magnitude).to_val());
-                        vec_to_list(&[integer, *bound])
-                    });
-                } else if egcl_rt::bignum::ratio_parts_val(v).is_some() {
-                    return Ok(resolve_sym("RATIO").unwrap_or(NIL));
-                } else if egcl_rt::types::readtablep(v) {
-                    return Ok(resolve_sym("READTABLE").unwrap_or(NIL));
-                } else if is_string_value(v) && egcl_stdlib::is_complex_vector(v) {
-                    // An adjustable or fill-pointered string is not a
-                    // SIMPLE-STRING (ansi coerce.1). Its element type is the
-                    // storage's: BASE-CHAR when displaced onto a base string.
-                    let size = egcl_stdlib::array_total_size(v).unwrap_or(0);
-                    let elt = if is_base_string_value(v) { "BASE-CHAR" } else { "CHARACTER" };
-                    return Ok(vec_to_list(&[
-                        resolve_sym("VECTOR").unwrap_or(NIL),
-                        resolve_sym(elt).unwrap_or(NIL),
-                        EgclVal::from_fixnum(size as i64),
-                    ]));
-                } else if is_string_value(v) && !is_base_string_value(v) {
-                    // A 32-bit CHARACTER string is (SIMPLE-ARRAY CHARACTER (n));
-                    // only the 8-bit storage is a SIMPLE-BASE-STRING, which is
-                    // what TYPEP answers for it (bliss-ajb3). TYPE-OF called
-                    // every string SIMPLE-BASE-STRING, so (typep x (type-of x))
-                    // was NIL for a MAKE-STRING result.
-                    let size = egcl_stdlib::array_total_size(v).unwrap_or(0);
-                    egcl_rt::rooted!(dims = vec_to_list(&[EgclVal::from_fixnum(size as i64)]));
-                    return Ok(vec_to_list(&[
-                        resolve_sym("SIMPLE-ARRAY").unwrap_or(NIL),
-                        resolve_sym("CHARACTER").unwrap_or(NIL),
-                        *dims,
-                    ]));
-                }
-                // A general vector's TYPE-OF is (SIMPLE-VECTOR n), or
-                // (VECTOR T n) for an adjustable / fill-pointered / displaced
-                // one (ansi make-array.*, type-of.*).
-                if egcl_stdlib::is_complex_vector(v) && egcl_stdlib::cvec_is_bit(v) {
-                    // A fill-pointer / adjustable / displaced bit vector.
-                    return Ok(resolve_sym("BIT-VECTOR").unwrap_or(NIL));
-                }
-                if v.is_heap_object()
-                    && !is_string_value(v)
-                    && !egcl_rt::types::bit_vector_p(v)
-                    && (egcl_stdlib::is_complex_vector(v)
-                        || unsafe { (*(v.as_ptr() as *const ObjectHeader)).type_id() }
-                            == type_id::SIMPLE_VECTOR)
-                {
-                    let size = egcl_stdlib::array_total_size(v).unwrap_or(0);
-                    return Ok(if egcl_stdlib::is_complex_vector(v) {
-                        vec_to_list(&[
-                            resolve_sym("VECTOR").unwrap_or(NIL),
-                            T,
-                            EgclVal::from_fixnum(size as i64),
-                        ])
-                    } else {
-                        vec_to_list(&[
-                            resolve_sym("SIMPLE-VECTOR").unwrap_or(NIL),
-                            EgclVal::from_fixnum(size as i64),
-                        ])
-                    });
-                }
-                let type_name = if v.is_nil() {
-                    "NULL"
-                } else if v == T {
-                    "BOOLEAN"
-                } else if v.is_fixnum() {
-                    "FIXNUM"
-                } else if v.is_single_float() {
-                    "SINGLE-FLOAT"
-                } else if v.is_double_float() {
-                    "DOUBLE-FLOAT"
-                } else if v.is_character() {
-                    "CHARACTER"
-                } else if is_keyword_arg(v) {
-                    // A keyword's most specific type is KEYWORD, not SYMBOL
-                    // (CLHS TYPE-OF; matches SBCL). bliss-54t8.
-                    "KEYWORD"
-                } else if v.is_symbol() {
-                    "SYMBOL"
-                } else if is_function_value(v) {
-                    // A function value — a real function object or an interpreter
-                    // closure (represented as a `(EGCL::CLOSURE . id)` cons). This
-                    // must precede the `is_cons` check so a closure's TYPE-OF is
-                    // FUNCTION, not CONS, and CLOS dispatch on the FUNCTION class
-                    // recognises it (bliss-5ir; cl-ppcre passes scanners as funcs).
-                    "FUNCTION"
-                } else if v.is_cons() {
-                    "CONS"
-                } else if is_string_value(v) {
-                    "SIMPLE-BASE-STRING"
-                } else if egcl_stdlib::pathnames::is_logical_pathname(v) {
-                    "LOGICAL-PATHNAME"
-                } else if egcl_stdlib::pathnames::is_pathname(v) {
-                    "PATHNAME"
-                } else {
-                    "T"
-                };
-                match resolve_sym(type_name) {
-                    Some(sym) => return Ok(sym),
-                    None => return Ok(arena_str(type_name)),
-                }
-            }
+            "STRING=" => return eval_builtin_arguments(&name, cdr, env),
+            "STRING<" => return eval_builtin_arguments(&name, cdr, env),
+            "STRING>" => return eval_builtin_arguments(&name, cdr, env),
+            "TYPE-OF" => return eval_builtin_arguments(&name, cdr, env),
             _ => {}
         }
 
@@ -32907,12 +32301,21 @@ fn eval_arith_div(args: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         let value = eval_form(af, env)?;
         vals.push(value);
     }
+    div_values(&vals)
+}
+
+/// `/` on evaluated arguments, shared by operator position and compiled calls,
+/// which reached it only by synthesizing and re-evaluating a form
+/// (bliss-qoy0k). Only the complex path allocates before it has read every
+/// argument; it gets rooted copies.
+fn div_values(vals: &[EgclVal]) -> Result<EgclVal, EgclError> {
     if vals.is_empty() {
         return Err(EgclError::ProgramError(
             "/ requires at least one argument".into(),
         ));
     }
-    if any_complex(&vals) {
+    if any_complex(vals) {
+        let vals = RootedVals::new(vals.to_vec());
         return complex_arith(CxOp::Div, &vals);
     }
     if vals.len() == 1 {
@@ -35315,11 +34718,7 @@ fn string_designator(v: EgclVal) -> String {
     val_as_str(v)
 }
 
-fn string_compare_bounds(
-    cdr: EgclVal,
-    env: &mut Env,
-) -> Result<(String, String, usize), EgclError> {
-    let args = eval_args(cdr, env)?;
+fn string_compare_bounds_values(args: &[EgclVal]) -> Result<(String, String, usize), EgclError> {
     if args.len() < 2 {
         return Err(EgclError::ProgramError(
             "string comparison requires two string designators".into(),
@@ -42527,7 +41926,7 @@ fn apply_intlen_or_logcount(name: &str, v: EgclVal) -> Result<EgclVal, EgclError
 
 /// Builtins reached through `apply_numeric_op` — the shared numeric-tower
 /// kernels, identical to operator position.
-const DIRECT_NUMERIC: &[&str] = &["+", "-", "*", "1+", "1-", "<", ">", "<=", ">=", "=", "/="];
+const DIRECT_NUMERIC: &[&str] = &["+", "-", "*", "1+", "1-", "<", ">", "<=", ">=", "=", "/=", "/"];
 
 /// Builtins `apply_function` hands to `apply_builtin` on evaluated arguments.
 const DIRECT_STRUCTURAL: &[&str] = &[
@@ -42612,6 +42011,57 @@ const DIRECT_FAST: &[&str] = &[
     "ZEROP",
     "PLUSP",
     "MINUSP",
+    // EVENP/ODDP: leaf parity tests (bliss-qoy0k). Without an entry, compiled
+    // `(oddp e)` cost ~12 us against ~0.3 us for `(< e 0)`.
+    "EVENP",
+    "ODDP",
+    // Leaf array predicates and accessors whose only entry is in
+    // `evaluated_builtins`, which `apply_builtin_fast` falls back to
+    // (bliss-qoy0k).
+    "BIT-VECTOR-P",
+    "SIMPLE-BIT-VECTOR-P",
+    "ADJUSTABLE-ARRAY-P",
+    "ARRAY-RANK",
+    "ARRAY-ELEMENT-TYPE",
+    "ARRAY-HAS-FILL-POINTER-P",
+    "ARRAY-DIMENSION",
+    // More leaf builtins with only an `evaluated_builtins` entry: pure
+    // functions of their arguments (and of global variable cells) that never
+    // call Lisp, signal only by returning an error, and set no extra values.
+    // Through the general path each cost ~5 us against ~1-2 us here
+    // (bliss-qoy0k).
+    "TYPE-OF",
+    "BOUNDP",
+    "SYMBOL-VALUE",
+    "STRING=",
+    "STRING<",
+    "STRING>",
+    "MAKE-HASH-TABLE",
+    "GET-OUTPUT-STREAM-STRING",
+    "RANDOM",
+    // Leaf numeric functions with only an `evaluated_builtins` entry
+    // (bliss-qoy0k). DECODE-FLOAT is left out: it sets multiple values.
+    "FLOAT",
+    "COMPLEX",
+    "REALPART",
+    "IMAGPART",
+    "NUMERATOR",
+    "DENOMINATOR",
+    "RATIONAL",
+    "RATIONALIZE",
+    "SQRT",
+    "EXP",
+    "SIN",
+    "COS",
+    "TAN",
+    "ASIN",
+    "ACOS",
+    "SINH",
+    "COSH",
+    "TANH",
+    "ASINH",
+    "ACOSH",
+    "ATANH",
     "VALUES",
     "VALUES-LIST",
     "REVERSE",
@@ -42905,6 +42355,7 @@ fn apply_numeric_op(name: &str, args: &[EgclVal]) -> Option<Result<EgclVal, Egcl
     Some(match name {
         "+" => fold_arith_vals(args, 0, 0.0, |a, b| a + b, bigrat_add, |a, b| a + b),
         "*" => fold_arith_vals(args, 1, 1.0, |a, b| a * b, bigrat_mul, |a, b| a * b),
+        "/" => div_values(args),
         "-" => sub_vals(args),
         // 1+/1- were the only hot unary arithmetic missing here, so a compiled
         // loop's `(1- i)` fell through to synthesize-and-re-evaluate: ~5.1us a
@@ -43864,6 +43315,10 @@ fn apply_builtin_fast(
         "ENDP" if args.len() == 1 => {
             env.clear_mv();
             Some(apply_builtin(name, args, env))
+        }
+        "EVENP" | "ODDP" if args.len() == 1 => {
+            env.clear_mv();
+            Some(parity_value(name == "EVENP", args[0]))
         }
         "ZEROP" | "PLUSP" | "MINUSP" if args.len() == 1 => {
             env.clear_mv();
@@ -46305,6 +45760,23 @@ fn eval_format(args: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     let (ff, fa) = cp(*r);
     egcl_rt::rooted!(fa = fa);
     egcl_rt::rooted!(fv = eval_form(ff, env)?);
+    let av = eval_args(*fa, env)?;
+    format_values(*dest, *fv, &av, env)
+}
+
+/// FORMAT on an evaluated destination (a `t` already resolved to the current
+/// *STANDARD-OUTPUT*), control and arguments. Shared by operator position and
+/// compiled calls, which reached it only by synthesizing and re-evaluating a
+/// form at ~32 us a call (bliss-qoy0k).
+fn format_values(
+    dest: EgclVal,
+    control: EgclVal,
+    args: &[EgclVal],
+    env: &mut Env,
+) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted!(dest = dest);
+    egcl_rt::rooted!(fv = control);
+    let av = RootedVals::new(args.to_vec());
     // A FORMATTER result is an interpreted closure, physically a cons; it is a
     // function control all the same (ansi formatter.* via FORMAT).
     let control_is_function = is_function_value(*fv);
@@ -46313,7 +45785,6 @@ fn eval_format(args: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     // WARN.19). With a NIL destination it prints into a fresh string stream and
     // returns the string.
     if control_is_function {
-        let av = eval_args(*fa, env)?;
         if (*dest).is_nil() {
             egcl_rt::rooted!(stream = egcl_stdlib::make_string_output_stream(NIL)?);
             let mut call_args: Vec<EgclVal> = Vec::with_capacity(av.len() + 1);
@@ -46331,7 +45802,6 @@ fn eval_format(args: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         return Ok(NIL);
     }
     let fs = val_as_str(*fv);
-    let av = eval_args(*fa, env)?;
     // Park the env so the formatter's `~A`/`~S` can dispatch user print-object
     // methods (via stdlib_print_object_hook → dispatch_print_object).
     let prev_env = PRINT_ENV.with(|c| c.replace(env as *mut Env));

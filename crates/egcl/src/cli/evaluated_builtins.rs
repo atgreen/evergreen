@@ -1412,6 +1412,651 @@ fn resolve(name: &str) -> Option<Handler> {
             super::string_value(args[0])
         }),
         "VECTOR" => Some(|_operator, args, _env| Ok(egcl_stdlib::build_simple_vector(args))),
+        // More builtins that compiled code reached only by synthesizing and
+        // re-evaluating a form, at 17-56 us a call (bliss-qoy0k). Operator
+        // position evaluates its arguments and comes here too.
+        "MEMBER" => Some(|_operator, args, env| super::member_values(args, env)),
+        "ASSOC" => Some(|_operator, args, env| super::assoc_values(args, env)),
+        "MAPCAR" => Some(|_operator, args, env| super::mapcar_values(args, env)),
+        "MAP" => Some(|_operator, args, env| super::map_values(args, env)),
+        "TYPE-OF" => Some(|_operator, args, _env| {
+            // Exactly one argument, else a PROGRAM-ERROR (ansi
+            // TYPE-OF.ERROR.1/2).
+            if args.len() != 1 {
+                return Err(EgclError::ProgramError(format!(
+                    "TYPE-OF requires exactly 1 argument, got {}",
+                    args.len()
+                )));
+            }
+            super::type_of_value(args[0])
+        }),
+        "STRING=" => Some(|_operator, args, _env| {
+            let (a, b, _start1) = super::string_compare_bounds_values(args)?;
+            Ok(if a == b { T } else { NIL })
+        }),
+        "STRING<" | "STRING>" => Some(|operator, args, _env| {
+            // The mismatch index (in string1's coordinates) when the order
+            // holds, else NIL, honoring the bounding keywords (bliss-c62r).
+            let want = if operator == "STRING<" {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            };
+            let (a, b, start1) = super::string_compare_bounds_values(args)?;
+            let (i, ord) = super::string_mismatch(&a, &b);
+            Ok(if ord == want {
+                EgclVal::from_fixnum((start1 + i) as i64)
+            } else {
+                NIL
+            })
+        }),
+        "FORMAT" => Some(|_operator, args, env| {
+            // A `t` destination is the CURRENT *standard-output*; see
+            // eval_format.
+            let mut dest = args.first().copied().unwrap_or(NIL);
+            if dest == T {
+                dest = env.lookup_var("*STANDARD-OUTPUT*").unwrap_or(NIL);
+            }
+            let control = args.get(1).copied().unwrap_or(NIL);
+            super::format_values(dest, control, args.get(2..).unwrap_or(&[]), env)
+        }),
+        "BIT-VECTOR-P" | "SIMPLE-BIT-VECTOR-P" => Some(|operator, args, _env| {
+            // A bit-vector is a rank-1 array of BITs. BIT-VECTOR-P is true of
+            // a complex (fill-pointer/adjustable/displaced) bit vector too;
+            // SIMPLE-BIT-VECTOR-P only of a truly simple one (bliss-zg9,
+            // bliss-65nx).
+            let v = args.first().copied().unwrap_or(NIL);
+            let ok = if operator == "SIMPLE-BIT-VECTOR-P" {
+                egcl_rt::types::bit_vector_p(v)
+            } else {
+                super::is_bit_vector_value(v)
+            };
+            Ok(if ok { T } else { NIL })
+        }),
+        "ADJUSTABLE-ARRAY-P" => Some(|_operator, args, _env| {
+            // Only a COMPLEX_ARRAY created :adjustable is adjustable.
+            let v = args.first().copied().unwrap_or(NIL);
+            let adj = egcl_stdlib::is_complex_vector(v) && egcl_stdlib::cvec_adjustable(v);
+            Ok(if adj { T } else { NIL })
+        }),
+        "ARRAY-DISPLACEMENT" => Some(|_operator, args, env| {
+            // (values base offset) for a displaced array, (values nil 0)
+            // otherwise (bliss-7o4y).
+            let v = args.first().copied().unwrap_or(NIL);
+            // A displaced multidimensional array keeps its displacement in its
+            // row-major storage vector (MAKE-ARRAY, boot.lisp).
+            let v = match egcl_rt::types::md_array_storage(v) {
+                Some(storage) if egcl_stdlib::is_complex_vector(storage) => storage,
+                _ => v,
+            };
+            if egcl_stdlib::is_complex_vector(v) {
+                if let Some((base, offset, _)) = egcl_stdlib::cvec_displacement(v) {
+                    let off = EgclVal::from_fixnum(offset as i64);
+                    env.set_mv(vec![base, off]);
+                    return Ok(base);
+                }
+            }
+            env.set_mv(vec![NIL, EgclVal::from_fixnum(0)]);
+            Ok(NIL)
+        }),
+        "BOUNDP" => Some(|_operator, args, env| {
+            let sym = args.first().copied().unwrap_or(NIL);
+            // NIL and T are constant variables — always bound. Keywords are
+            // constant variables bound to themselves (CLHS 11.1.2.3.1).
+            if sym.is_nil() || sym == T || super::is_keyword_arg(sym) {
+                return Ok(T);
+            }
+            // A non-symbol argument is a TYPE-ERROR (boundp.error.3/4/5/6).
+            if !sym.is_symbol() {
+                return Err(EgclError::TypeError {
+                    datum: sym,
+                    expected: "SYMBOL".to_string(),
+                });
+            }
+            // Resolve the symbol by INDEX (the same resolution an evaluated
+            // variable reference uses), not by name string: a package-interned
+            // symbol's heap name cell holds its BARE name while the registry
+            // key is qualified, so the name-based lookup missed every
+            // qualified global (bliss-o2da).
+            Ok(if env.lookup_var_symbol(sym).is_some() { T } else { NIL })
+        }),
+        "FIND-CLASS" => Some(|_operator, args, env| {
+            // (find-class name &optional (errorp t) environment) — the class
+            // metaobject, or (when errorp is NIL) NIL if none is found.
+            egcl_rt::rooted!(name = args.first().copied().unwrap_or(NIL));
+            let errorp = args.get(1).is_none_or(|errorp| !errorp.is_nil());
+            if let Some(class) = egcl_stdlib::find_class(*name) {
+                return Ok(class);
+            }
+            // RESTART is defined on first use by the restart machinery;
+            // FIND-CLASS must see it before any restart exists (CLHS 4.3.7;
+            // ansi objects find-class.1).
+            if name.is_symbol()
+                && sym_bare_name_rc(*name).as_ref() == "RESTART"
+                && super::symbol_home_package_name(*name) == "COMMON-LISP"
+            {
+                return super::ensure_restart_class(env);
+            }
+            if let Ok(class) = super::resolve_class_metaobject(env, *name)
+                && class != *name
+            {
+                return Ok(class);
+            }
+            if !errorp {
+                return Ok(NIL);
+            }
+            let name_str = if name.is_symbol() {
+                sym_name(*name)
+            } else {
+                val_as_str(*name)
+            };
+            let msg = format!("there is no class named {}", name_str);
+            let condition = super::make_simple_error_condition(arena_str(&msg), env)?;
+            Err(super::signal_and_raise(env, condition, msg))
+        }),
+        "MAKE-HASH-TABLE" => Some(|_operator, args, _env| super::make_hash_table_values(args)),
+        "NAMESTRING" => Some(|_operator, args, _env| {
+            // (namestring pathname) — exactly one pathname designator; a
+            // string coerces to a pathname first (ansi namestring.1/.2), and
+            // wrong arity is a PROGRAM-ERROR (namestring.error.1/.2).
+            if args.len() != 1 {
+                return Err(EgclError::ProgramError(format!(
+                    "NAMESTRING requires exactly 1 argument, got {}",
+                    args.len()
+                )));
+            }
+            egcl_rt::rooted!(pathname = args[0]);
+            let pn = super::coerce_pathname_designator(*pathname)?;
+            egcl_stdlib::namestring(pn)
+        }),
+        "PROBE-FILE" => Some(|_operator, args, env| {
+            // (probe-file pathspec) — truename if the file exists, else NIL.
+            egcl_rt::rooted!(pathname = args.first().copied().unwrap_or(NIL));
+            // Relative to *DEFAULT-PATHNAME-DEFAULTS* (CLHS 19.2.3), as OPEN.
+            if super::is_path_designator(*pathname) {
+                *pathname = super::resolve_against_dpd(*pathname, env)?;
+            }
+            if egcl_stdlib::is_pathname(*pathname) && egcl_stdlib::wild_pathname_p(*pathname, None)
+            {
+                // A wild pathname names no single file (CLHS PROBE-FILE; ansi
+                // files probe-file.error.3/.4, file-error.1).
+                return Err(super::file_error_with_pathname(
+                    env,
+                    *pathname,
+                    "PROBE-FILE: wild pathname",
+                ));
+            }
+            Ok(egcl_stdlib::probe_file(*pathname)?.unwrap_or(NIL))
+        }),
+        "FILE-WRITE-DATE" => Some(|_operator, args, env| {
+            // (file-write-date pathspec) — the file's last-modified time as a
+            // CL universal time (seconds since 1900-01-01). ASDF uses it for
+            // staleness checks (bliss-lb6.14).
+            egcl_rt::rooted!(pathspec = args.first().copied().unwrap_or(NIL));
+            if super::is_path_designator(*pathspec) {
+                *pathspec = super::resolve_against_dpd(*pathspec, env)?;
+            }
+            let path = super::path_designator_to_string(*pathspec)?;
+            if let Some(date) = egcl_stdlib::embedded_files::write_date(&path) {
+                return Ok(EgclVal::from_fixnum(date));
+            }
+            let secs = std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .map_err(|e| EgclError::FileError(format!("{}: {}", path, e)))?
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| EgclError::FileError(e.to_string()))?
+                .as_secs();
+            // Universal time epoch (1900) precedes the Unix epoch (1970) by
+            // 2208988800 seconds.
+            Ok(EgclVal::from_fixnum(secs as i64 + 2_208_988_800))
+        }),
+        "ARRAY-RANK" => Some(|_operator, args, _env| {
+            let v = args.first().copied().unwrap_or(NIL);
+            // Multidimensional arrays carry their rank; every other egcl
+            // array (vector/string) is rank-1.
+            if let Some(rank) = egcl_rt::types::md_array_rank(v) {
+                return Ok(rank);
+            }
+            Ok(EgclVal::from_fixnum(1))
+        }),
+        "ARRAY-ELEMENT-TYPE" => Some(|_operator, args, _env| {
+            let v = args.first().copied().unwrap_or(NIL);
+            // An 8-bit base string holds BASE-CHAR and a 32-bit string
+            // CHARACTER (spec §1.6.3); bit-vectors (simple OR a
+            // fill-pointer/adjustable/displaced complex bit vector, egcl-
+            // 65nx) hold BIT; packed vectors hold DOUBLE-FLOAT.
+            let ty = if is_base_string_value(v) {
+                "BASE-CHAR"
+            } else if is_string_value(v) {
+                "CHARACTER"
+            } else if is_bit_vector_value(v) {
+                "BIT"
+            } else if egcl_stdlib::sequences::is_double_float_array(v) {
+                "DOUBLE-FLOAT"
+            } else {
+                "T"
+            };
+            Ok(resolve_sym(ty).unwrap_or(T))
+        }),
+        "GET-OUTPUT-STREAM-STRING" => Some(|_operator, args, _env| {
+            let stream = args.first().copied().unwrap_or(NIL);
+            egcl_stdlib::get_output_stream_string(stream)
+        }),
+        "SYMBOL-VALUE" => Some(|_operator, args, _env| {
+            let sym = args.first().copied().unwrap_or(NIL);
+            // Constant variables (CLHS): (symbol-value 'nil) → NIL, 't → T.
+            if sym.is_nil() {
+                return Ok(NIL);
+            }
+            if sym == T {
+                return Ok(T);
+            }
+            // Keywords evaluate to themselves (CLHS 11.1.2.3.1).
+            if is_keyword_arg(sym) {
+                return Ok(sym);
+            }
+            // A non-symbol argument is a TYPE-ERROR (symbol-value.error.3).
+            if !sym.is_symbol() {
+                return Err(EgclError::TypeError {
+                    datum: sym,
+                    expected: "SYMBOL".to_string(),
+                });
+            }
+            // SYMBOL-VALUE reads the DYNAMIC value only (CLHS): a lexical
+            // binding is not a symbol value at all. Going through
+            // lookup_var_symbol also consulted the lexical frames, so
+            //
+            //   (let ((z 0)) (declare (special z))
+            //     (multiple-value-bind (z) (values 3) (symbol-value 'z)))
+            //
+            // returned the M-V-B's LEXICAL 3 instead of the dynamic 0
+            // (bliss-qui9, resurfaced by bliss-s2y9). Resolution is still
+            // BY INDEX, which is what bliss-o2da actually needed — a
+            // package-qualified symbol must not be looked up by bare name.
+            let idx = sym.symbol_index();
+            let resolved = idx.and_then(global_value_cell);
+            match resolved {
+                Some(v) => Ok(v),
+                None => Err(EgclError::UnboundVariable(sym)),
+            }
+        }),
+        "RANDOM" => Some(|_operator, args, env| super::random_values(args, env)),
+        "MAKE-STRING-OUTPUT-STREAM" => Some(|_operator, args, _env| {
+            // (make-string-output-stream &key element-type): the keywords are
+            // validated (ansi make-string-output-stream.*). A BASE-CHAR element
+            // type (or any non-empty subtype of it) makes
+            // GET-OUTPUT-STREAM-STRING answer a SIMPLE-BASE-STRING (ansi
+            // WITH-OUTPUT-TO-STRING.8); any other type, a CHARACTER string.
+            super::check_keyword_args("MAKE-STRING-OUTPUT-STREAM", args, &["ELEMENT-TYPE"])?;
+            let element_type = args
+                .chunks_exact(2)
+                .find(|pair| {
+                    pair[0].is_symbol() && sym_bare_name_rc(pair[0]).as_ref() == "ELEMENT-TYPE"
+                })
+                .map(|pair| pair[1]);
+            let base = element_type.is_some_and(|et| {
+                !et.is_nil()
+                    && resolve_sym("BASE-CHAR")
+                        .is_some_and(|base_char| super::subtypep_relation(et, base_char).0)
+            });
+            egcl_stdlib::streams::make_string_output_stream_of(base)
+        }),
+        "CONCATENATE" => Some(|_operator, args, env| {
+            // Delegate to stdlib so CLI sequence behavior matches the same
+            // implementation used by lower-level stage-3 tests.
+            let Some((&result_type, sequences)) = args.split_first() else {
+                return Err(EgclError::ProgramError(
+                    "CONCATENATE requires a result type".into(),
+                ));
+            };
+            egcl_rt::rooted!(result_type = result_type);
+            let sequences = RootedVals::new(sequences.to_vec());
+            // Expand a DEFTYPE alias before stdlib classifies it. The
+            // classifier only knows the built-in sequence type names, so a user
+            // type — babel's `(deftype unicode-string () '(simple-array
+            // character (*)))` is the case that surfaced this — was rejected
+            // outright as "not a sequence type specifier". CLHS allows any type
+            // specifier denoting a sequence subtype, DEFTYPE included.
+            let expanded = super::resolve_type_spec(env, *result_type)?;
+            egcl_rt::rooted!(expanded = expanded);
+            egcl_stdlib::concatenate(*expanded, &sequences)
+        }),
+        "%BIT-VECTOR-FROM-BITS" => Some(|_operator, args, _env| {
+            // (%bit-vector-from-bits list) — build a SIMPLE bit-vector from a
+            // list of bits (each 0 or 1). The one-shot constructor MAKE-ARRAY
+            // :element-type bit uses (boot.lisp); egcl bit-vectors are
+            // immutable after construction, so the whole content is supplied
+            // here. Bits are read into a native Vec<u8> before the single
+            // allocation, so no EgclVal is held live across a GC.
+            let elems = list_to_vec(args.first().copied().unwrap_or(NIL));
+            let mut bits: Vec<u8> = Vec::with_capacity(elems.len());
+            for e in &elems {
+                match if e.is_fixnum() { e.as_fixnum() } else { -1 } {
+                    0 => bits.push(0),
+                    1 => bits.push(1),
+                    _ => {
+                        return Err(EgclError::TypeError {
+                            datum: *e,
+                            expected: "BIT (0 or 1)".into(),
+                        });
+                    }
+                }
+            }
+            Ok(egcl_compiler::reader::make_bit_vector(&bits))
+        }),
+        "ARRAY-HAS-FILL-POINTER-P" => Some(|_operator, args, _env| {
+            // Only a vector created with a non-NIL :fill-pointer has one. A
+            // plain (make-array n :adjustable t) is the same COMPLEX_ARRAY
+            // representation but answers NIL per ANSI (bliss-0x9y).
+            let v = args.first().copied().unwrap_or(NIL);
+            let has = egcl_stdlib::is_complex_vector(v) && egcl_stdlib::cvec_has_fill_pointer(v);
+            Ok(if has { T } else { NIL })
+        }),
+        "ARRAY-DIMENSION" => Some(|_operator, args, _env| {
+            // (array-dimension array axis-number). For a multidim array this
+            // is dims[axis]; a rank-1 array (vector/string) has only axis 0
+            // (its length).
+            let av = args.first().copied().unwrap_or(NIL);
+            let axis_v = args.get(1).copied().unwrap_or(NIL);
+            // The axis number must be a non-negative fixnum; anything else is
+            // a TYPE-ERROR, not a Rust panic (array-dimension.error tests pass
+            // symbols / negatives to probe the error signalling).
+            if !axis_v.is_fixnum() || axis_v.as_fixnum() < 0 {
+                return Err(EgclError::TypeError {
+                    datum: axis_v,
+                    expected: "non-negative array axis number".into(),
+                });
+            }
+            let axis = axis_v.as_fixnum();
+            if egcl_rt::types::md_array_p(av) {
+                let dims = md_dims(av)?;
+                if axis as usize >= dims.len() {
+                    return Err(EgclError::ProgramError(format!(
+                        "ARRAY-DIMENSION: axis {axis} out of range for a rank-{} array",
+                        dims.len()
+                    )));
+                }
+                return Ok(EgclVal::from_fixnum(dims[axis as usize] as i64));
+            }
+            if axis != 0 {
+                // A catchable PROGRAM-ERROR, not an uncatchable Internal error
+                // that would abort do-tests (bliss-dksg).
+                return Err(EgclError::ProgramError(format!(
+                    "ARRAY-DIMENSION: axis {axis} out of range for a rank-1 array"
+                )));
+            }
+            // A rank-1 dimension is the TOTAL size, not the active length: for
+            // a fill-pointer / adjustable vector ARRAY-DIMENSION returns the
+            // backing capacity (like ARRAY-TOTAL-SIZE), while LENGTH follows
+            // the fill pointer (bliss-30be).
+            if egcl_stdlib::is_complex_vector(av) {
+                return Ok(EgclVal::from_fixnum(egcl_stdlib::cvec_capacity(av) as i64));
+            }
+            Ok(EgclVal::from_fixnum(egcl_stdlib::length(av)? as i64))
+        }),
+        "REALPART" | "IMAGPART" => Some(|operator, args, _env| {
+            let name = operator;
+            let want_real = name == "REALPART";
+            let v = super::one_arg(name, args)?;
+            if let Some(rp) = egcl_rt::types::complex_realpart(v) {
+                return Ok(if want_real {
+                    rp
+                } else {
+                    egcl_rt::types::complex_imagpart(v).unwrap_or(NIL)
+                });
+            }
+            if is_number_value(v) {
+                // CLHS: (imagpart real) is LITERALLY (* 0 real), and ansi
+                // IMAGPART.4 compares against that expression directly. A
+                // CONSTRUCTED zero cannot express it: the format has to
+                // follow the argument (0.0d0 for a double, 0 for a
+                // rational) AND so does the SIGN -- (* 0 -3.4028235e38) is
+                // -0.0, which no hand-built zero gives. Routing through the
+                // multiply kernel gets format, sign and the
+                // rational/float distinction for free.
+                if want_real {
+                    return Ok(v);
+                }
+                return match apply_numeric_op("*", &[EgclVal::from_fixnum(0), v]) {
+                    Some(r) => r,
+                    None => Ok(EgclVal::from_fixnum(0)),
+                };
+            }
+            Err(EgclError::TypeError {
+                datum: v,
+                expected: "number".to_string(),
+            })
+        }),
+        "RATIONAL" | "RATIONALIZE" => Some(|operator, args, _env| {
+            let name = operator;
+            let v = super::one_arg(name, args)?;
+            if name == "RATIONAL" {
+                cl_rational(v)
+            } else {
+                cl_rationalize(v)
+            }
+        }),
+        "NUMERATOR" | "DENOMINATOR" => Some(|operator, args, _env| {
+            let name = operator;
+            let want_num = name == "NUMERATOR";
+            let v = super::one_arg(name, args)?;
+            if egcl_rt::types::integerp(v) {
+                return Ok(if want_num {
+                    v
+                } else {
+                    EgclVal::from_fixnum(1)
+                });
+            }
+            // A ratio (rational but not integer) stores numerator@8 /
+            // denominator@16 in its RatioData body.
+            if egcl_rt::types::rationalp(v) {
+                let off = if want_num { 8 } else { 16 };
+                return Ok(unsafe { *(v.as_ptr().add(off) as *const EgclVal) });
+            }
+            Err(EgclError::TypeError {
+                datum: v,
+                expected: "rational".into(),
+            })
+        }),
+        "SQRT" => Some(|operator, args, _env| {
+            let name = operator;
+            let v = super::one_arg(name, args)?;
+            // Complex argument → principal complex square root (bliss-k0jg
+            // follow-up): sqrt(a+bi) = √((r+a)/2) + sign(b)·√((r−a)/2)·i.
+            if let Some(re) = egcl_rt::types::complex_realpart(v) {
+                let imag = egcl_rt::types::complex_imagpart(v).unwrap_or(NIL);
+                let a = num_val(re)?;
+                let b = num_val(imag)?;
+                let kind = widen_float(real_float_kind(re), real_float_kind(imag));
+                let r = a.hypot(b);
+                let re_out = ((r + a) / 2.0).sqrt();
+                let im_out = ((r - a) / 2.0).sqrt() * if b < 0.0 { -1.0 } else { 1.0 };
+                // box_float may allocate (double); root the real part across
+                // the imaginary allocation and the COMPLEX build.
+                egcl_rt::rooted!(re_v = box_float(re_out, kind));
+                let im_v = box_float(im_out, kind);
+                return make_complex(*re_v, im_v);
+            }
+            let kind = real_float_kind(v);
+            let nv = num_val(v)?;
+            // A negative real has a pure-imaginary root #C(0.0 √|x|), not NaN.
+            if nv < 0.0 {
+                egcl_rt::rooted!(re_v = box_float(0.0, kind));
+                let im_v = box_float((-nv).sqrt(), kind);
+                return make_complex(*re_v, im_v);
+            }
+            Ok(box_float(nv.sqrt(), kind))
+        }),
+        "DECODE-FLOAT" => Some(|_operator, args, env| {
+            // => (values significand exponent sign), significand in [1/2, 1).
+            let v = args.first().copied().unwrap_or(NIL);
+            let is_double = v.is_double_float();
+            let (sign, mantissa, exp) = if is_double {
+                decode_f64(v.as_double_float())
+            } else {
+                decode_f32(num_val(v)? as f32)
+            };
+            let (significand, exponent) = if mantissa == 0 {
+                (0.0f64, 0i32)
+            } else {
+                // value = mantissa·2^exp; put the significand in [1/2,1):
+                // significand = mantissa·2^(exp - E), where E makes it so.
+                let bits = (64 - mantissa.leading_zeros()) as i32; // bit length
+                let exponent = exp + bits;
+                let significand = mantissa as f64 * 2f64.powi(exp - exponent);
+                (significand, exponent)
+            };
+            let kind = if is_double {
+                FloatKind::Double
+            } else {
+                FloatKind::Single
+            };
+            // A double box allocates, so the first must be rooted across the
+            // second.
+            egcl_rt::rooted!(significand = box_float(significand, kind));
+            egcl_rt::rooted!(sign = box_float(sign as f64, kind));
+            env.set_mv(vec![*significand, EgclVal::from_fixnum(exponent as i64), *sign]);
+            Ok(*significand)
+        }),
+        "EXP" | "SIN" | "COS" | "TAN" | "ASIN" | "ACOS" | "SINH" | "COSH" | "TANH" | "ASINH"
+        | "ACOSH" | "ATANH" => Some(|operator, args, _env| {
+            let name = operator;
+            let v = super::one_arg(name, args)?;
+            // A COMPLEX argument (bliss-bd9c). `num_val` below rejects one,
+            // so these used to answer "#C(..) is not of type number" -- the
+            // single largest family left in the numbers chapter. Only the
+            // functions with direct, branch-cut-free formulas are handled
+            // here; the inverse ones (ASIN/ACOS/ATAN/ASINH/ACOSH/ATANH) need
+            // complex log and sqrt with principal-value branch cuts and are
+            // deliberately left to fall through to the real path.
+            if let Some(re) = egcl_rt::types::complex_realpart(v) {
+                let imag = egcl_rt::types::complex_imagpart(v).unwrap_or(NIL);
+                let a = num_val(re)?;
+                let b = num_val(imag)?;
+                // (p+qi)/(r+si), used for TAN and TANH.
+                let cdiv = |p: f64, q: f64, r: f64, s: f64| {
+                    let d = r * r + s * s;
+                    ((p * r + q * s) / d, (q * r - p * s) / d)
+                };
+                let parts = match name {
+                    // e^(a+bi) = e^a (cos b + i sin b)
+                    "EXP" => Some((a.exp() * b.cos(), a.exp() * b.sin())),
+                    // sin(a+bi) = sin a cosh b + i cos a sinh b
+                    "SIN" => Some((a.sin() * b.cosh(), a.cos() * b.sinh())),
+                    // cos(a+bi) = cos a cosh b - i sin a sinh b
+                    "COS" => Some((a.cos() * b.cosh(), -(a.sin() * b.sinh()))),
+                    // sinh(a+bi) = sinh a cos b + i cosh a sin b
+                    "SINH" => Some((a.sinh() * b.cos(), a.cosh() * b.sin())),
+                    // cosh(a+bi) = cosh a cos b + i sinh a sin b
+                    "COSH" => Some((a.cosh() * b.cos(), a.sinh() * b.sin())),
+                    // tan = sin/cos, tanh = sinh/cosh, as complex quotients.
+                    "TAN" => Some(cdiv(
+                        a.sin() * b.cosh(),
+                        a.cos() * b.sinh(),
+                        a.cos() * b.cosh(),
+                        -(a.sin() * b.sinh()),
+                    )),
+                    "TANH" => Some(cdiv(
+                        a.sinh() * b.cos(),
+                        a.cosh() * b.sin(),
+                        a.cosh() * b.cos(),
+                        a.sinh() * b.sin(),
+                    )),
+                    // The six INVERSE functions (bliss-i13d): principal
+                    // values via complex log and sqrt, CLHS 12.1.5.3.
+                    _ => complex_inverse(name, (a, b)),
+                };
+                if let Some((re_out, im_out)) = parts {
+                    let kind = widen_float(real_float_kind(re), real_float_kind(imag));
+                    // box_float may allocate (double); root the real part
+                    // across the imaginary allocation and the COMPLEX build,
+                    // exactly as SQRT's complex branch does.
+                    egcl_rt::rooted!(re_v = box_float(re_out, kind));
+                    let im_v = box_float(im_out, kind);
+                    return make_complex(*re_v, im_v);
+                }
+            }
+            let x = num_val(v)?;
+            let r = match name {
+                "EXP" => x.exp(),
+                "SIN" => x.sin(),
+                "COS" => x.cos(),
+                "TAN" => x.tan(),
+                "ASIN" => x.asin(),
+                "ACOS" => x.acos(),
+                "SINH" => x.sinh(),
+                "COSH" => x.cosh(),
+                "TANH" => x.tanh(),
+                "ASINH" => x.asinh(),
+                "ACOSH" => x.acosh(),
+                "ATANH" => x.atanh(),
+                _ => unreachable!(),
+            };
+            // A REAL argument OUTSIDE the function's real domain --
+            // (asin 2), (acos 2), (acosh 0), (atanh 2) -- has a COMPLEX
+            // principal value, not NaN (CLHS 12.1.5.3). The real kernels
+            // above return NaN there, so recompute through the same complex
+            // formula used for a complex argument. Restricted to a finite
+            // input so a NaN ARGUMENT still yields NaN.
+            if r.is_nan() && x.is_finite() {
+                if let Some((re_out, im_out)) = complex_inverse(name, (x, 0.0)) {
+                    let kind = real_float_kind(v);
+                    egcl_rt::rooted!(re_v = box_float(re_out, kind));
+                    let im_v = box_float(im_out, kind);
+                    return make_complex(*re_v, im_v);
+                }
+            }
+            // EXP only: e^x is never zero and never infinite for finite
+            // x, so either outcome is a range condition (CLHS 12.1.4.3).
+            let r = if name == "EXP" {
+                check_float_range(r, real_float_kind(v), x.is_finite(), true)?
+            } else {
+                r
+            };
+            Ok(box_float(r, real_float_kind(v)))
+        }),
+        "FLOAT" => Some(|_operator, args, _env| {
+            // FLOAT: coerce a real to a float, one or two arguments.
+            if !(1..=2).contains(&args.len()) {
+                return Err(EgclError::ProgramError(
+                    "FLOAT takes one or two arguments".into(),
+                ));
+            }
+            let v = args[0];
+            // (FLOAT x prototype): the result takes the prototype's float
+            // format. (FLOAT x) with no prototype returns an already-float
+            // argument unchanged, else converts a rational to the default
+            // (SINGLE-FLOAT). CLHS FLOAT.
+            let kind = if let Some(&proto) = args.get(1) {
+                super::real_float_kind(proto)
+            } else if egcl_rt::types::floatp(v) {
+                return Ok(v);
+            } else {
+                FloatKind::Single
+            };
+            if egcl_rt::types::realp(v) {
+                return Ok(super::box_float(num_val(v)?, kind));
+            }
+            Err(EgclError::TypeError {
+                datum: v,
+                expected: "real".into(),
+            })
+        }),
+        "COMPLEX" => Some(|_operator, args, _env| {
+            // (COMPLEX realpart &optional imagpart) — build a complex number
+            // with type contagion + canonicalisation (CLHS 12.1.3.3). imagpart
+            // defaults to a rational 0, so a rational realpart with no imagpart
+            // returns the realpart itself (bliss-qng). A wrong argument COUNT
+            // is a PROGRAM-ERROR (CLHS 3.5.1; ansi COMPLEX.ERROR.1/2).
+            if !(1..=2).contains(&args.len()) {
+                return Err(EgclError::ProgramError(format!(
+                    "COMPLEX requires one or two arguments, got {}",
+                    args.len()
+                )));
+            }
+            let imag = args.get(1).copied().unwrap_or(EgclVal::from_fixnum(0));
+            super::make_complex(args[0], imag)
+        }),
         "SORT" | "STABLE-SORT" => Some(|operator, args, env| {
             let operator = operator.rsplit(':').next().unwrap_or(operator);
             super::sort_values(operator, args, env)
