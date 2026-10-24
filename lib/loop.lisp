@@ -112,12 +112,20 @@
                      (cond
                        ((eq family :list)
                         (let ((part (gensym "LOOP-PART")))
+                          (if (equal kind "COLLECT")
+                              ;; A fresh one-element list is its own last cons:
+                              ;; no LAST walk, and a SETF of the tail's CDR
+                              ;; compiles to a store where RPLACD was a full call
+                              ;; of a Lisp function per element.
+                              `(let ((,part (list ,value)))
+                                 (setf (cdr ,tail) ,part)
+                                 (setq ,tail ,part ,var (cdr ,aux)))
                           `(let ((,part ,(cond ((equal kind "COLLECT") `(list ,value))
                                               ((equal kind "APPEND") `(copy-list ,value))
                                               (t value))))
                              (when ,part
                                (rplacd ,tail ,part)
-                               (setq ,tail (last ,part) ,var (cdr ,aux))))))
+                               (setq ,tail (last ,part) ,var (cdr ,aux)))))))
                        ((equal kind "COUNT") `(when ,value (incf ,var)))
                        ((equal kind "SUM") `(incf ,var ,value))
                        (t (let ((next (gensym "LOOP-VALUE")))

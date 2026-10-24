@@ -88,6 +88,10 @@
 
 ### Performance
 
+- `loop ... collect` no longer calls `rplacd` and `last` for every element it
+  collects: a collected element is a fresh one-element list, so it becomes the
+  new tail directly. A compiled `(loop repeat 50 collect x)` drops from about
+  287 µs to 80 µs ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
 - On x86-64 Linux, optimized code allocates conses and double-float boxes
   itself, bumping the thread's allocation buffer, instead of calling the
   runtime for each one. A warmed `(cons 1 2)` in a loop drops from about
