@@ -3310,6 +3310,22 @@ Returns NIL."
 
 (defun substitute (new old seq &key key (test (function eql)) test-not
                                     (start 0) end count from-end)
+  ;; The whole-list fast path REMOVE has: one forward pass, testing in the
+  ;; same order as the general path below.
+  (when (and (listp seq) (eql start 0) (null end) (null count) (null from-end))
+    (let ((testfn (or test-not test))
+          (result nil)
+          (l seq))
+      (tagbody
+        scan
+          (when (endp l) (go done))
+          (let* ((x (car l))
+                 (r (funcall testfn old (if key (funcall key x) x))))
+            (push (if (if test-not (not r) r) new x) result))
+          (setq l (cdr l))
+          (go scan)
+        done)
+      (return-from substitute (nreverse result))))
   (let* ((items (coerce seq 'list))
          (testfn (or test-not test)) (neg (if test-not t nil))
          (chosen (%match-positions
@@ -3318,6 +3334,19 @@ Returns NIL."
     (%coerce-like (%substitute-list new items chosen) seq)))
 
 (defun substitute-if (new pred seq &key key (start 0) end count from-end)
+  ;; The same whole-list fast path as SUBSTITUTE.
+  (when (and (listp seq) (eql start 0) (null end) (null count) (null from-end))
+    (let ((result nil)
+          (l seq))
+      (tagbody
+        scan
+          (when (endp l) (go done))
+          (let ((x (car l)))
+            (push (if (funcall pred (if key (funcall key x) x)) new x) result))
+          (setq l (cdr l))
+          (go scan)
+        done)
+      (return-from substitute-if (nreverse result))))
   (let* ((items (coerce seq 'list))
          (chosen (%match-positions
                   (lambda (x) (funcall pred (if key (funcall key x) x)))
