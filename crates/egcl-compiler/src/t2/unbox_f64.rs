@@ -541,6 +541,34 @@ pub fn remove_dead_boxes(f: &mut Function) {
     }
 }
 
+/// `(raw double operations, calls)` in `f`: raw arithmetic and comparisons,
+/// and the `Call`/`Invoke` sites that remain. Raw values are admitted only
+/// by the mapped calling convention, whose calls cost more than the ordinary
+/// ABI's (bliss-k4psf); a caller weighs the two before choosing raw code.
+pub fn raw_operation_and_call_counts(f: &Function) -> (usize, usize) {
+    let mut operations = 0;
+    let mut calls = 0;
+    for &block in f.block_order() {
+        for &inst in &f.block(block).insts {
+            let data = f.inst(inst);
+            match data.opcode {
+                Opcode::FloatAdd | Opcode::FloatSub | Opcode::FloatMul | Opcode::FloatCmpEq
+                | Opcode::FloatCmpLt | Opcode::FloatCmpLe | Opcode::FloatCmpGt
+                | Opcode::FloatCmpGe
+                    if data.args.iter().any(|&value| f.value(value).repr == Repr::UnboxedF64) =>
+                {
+                    operations += 1
+                }
+                Opcode::Call | Opcode::Invoke if matches!(data.aux, AuxData::CallTarget(_)) => {
+                    calls += 1
+                }
+                _ => {}
+            }
+        }
+    }
+    (operations, calls)
+}
+
 /// Whether `f` holds any raw double value.
 pub fn has_raw_doubles(f: &Function) -> bool {
     (0..f.num_values()).any(|index| f.value(Value(index as u32)).repr == Repr::UnboxedF64)

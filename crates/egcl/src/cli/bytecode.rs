@@ -25571,6 +25571,17 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
         if raw && !egcl_compiler::t2::unbox_f64::optimize(&mut candidate) {
             t2_log!("{name}: raw double candidate failed verification => tagged only");
             None
+        } else if packed_sites == 0 && raw && {
+            // Raw code installs only with the mapped calling convention, whose
+            // calls cost about a microsecond more than the ordinary ABI's. A
+            // body that is mostly calls would lose more there than its few
+            // unboxed operations gain (bliss-k4psf); keep it tagged.
+            let (operations, calls) =
+                egcl_compiler::t2::unbox_f64::raw_operation_and_call_counts(&candidate);
+            calls > operations
+        } {
+            t2_log!("{name}: raw double candidate is call-dominated => tagged only");
+            None
         } else if packed_sites != 0 || raw {
             t2_log!(
                 "{name}: raw double candidate: speculated {speculated} site(s), {} packed",
