@@ -28234,8 +28234,11 @@ mod method_compilation_tests {
         let callable = super::super::METHOD_COMPILED.borrow()[&id];
         let name = egcl_rt::function::name(callable).as_symbol_index();
         let body = registry_get(name).unwrap();
-        assert!(contains_host_eval(&body));
-        assert!(!contains_load_time_values(&body));
+        // Since #566 the live compile paths initialize LOAD-TIME-VALUE cells,
+        // so the callback compiles with its cell instead of retrying through
+        // host evaluation.
+        assert!(!contains_host_eval(&body));
+        assert!(contains_load_time_values(&body));
         assert_eq!(
             super::super::read_eval_all_env(
                 "(equal (funcall (method-callback-ltv '(42))) '((42) (:cell)))",
@@ -28243,6 +28246,16 @@ mod method_compilation_tests {
             )
             .unwrap(),
             T
+        );
+        assert_eq!(
+            super::super::read_eval_all_env(
+                "(eq (second (funcall (method-callback-ltv 1)))
+                     (second (funcall (method-callback-ltv 2))))",
+                &mut env,
+            )
+            .unwrap(),
+            T,
+            "the compiled callback's LOAD-TIME-VALUE is evaluated once"
         );
     }
 
