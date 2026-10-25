@@ -41,7 +41,7 @@
   longer a condition: `type-of` returned `t`, and `handler-case` for its own
   type did not catch it. `warn` and `error` with format arguments could
   likewise lose their format control string
-  ([#TGPR](https://github.com/atgreen/evergreen/pull/TGPR)).
+  ([#645](https://github.com/atgreen/evergreen/pull/645)).
 - An internal error inside compiled code that a native function called no
   longer aborts the process. It is reported as an ordinary Lisp error, as it
   already was for compiled code called from the interpreter. Making a closure
