@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.0.11 - 2026-10-24
+
 ### Added
 
 - `egcl-ext:with-locked-hash-table` is implemented. It was documented but
@@ -95,6 +97,27 @@
   the collector copied most of the 64 MB nursery each time. A loop that
   collects 50-element lists 300,000 times spent 12.4 s in collection and now
   spends 0.06 s ([#631](https://github.com/atgreen/evergreen/pull/631)).
+- On AArch64, a self-recursive function calls itself through a register entry
+  instead of generic dispatch: `fib 27` at T2 drops from 334 ms to 34 ms, and a
+  self-recursive sum from 938 ms to 44 ms
+  ([#622](https://github.com/atgreen/evergreen/pull/622)). A hot
+  tail-recursive function now promotes to T2 and runs at loop speed instead of
+  16 times slower, and its declared integer ranges are enforced
+  ([#592](https://github.com/atgreen/evergreen/pull/592)).
+- The System Z, ppc64le and AArch64 ports compile more code natively: captured
+  variables, closure factories, register entries for resolved callees, raw
+  double-float operations and four-argument callees on System Z, and closure
+  factories on ppc64le and AArch64
+  ([#475](https://github.com/atgreen/evergreen/pull/475),
+  [#477](https://github.com/atgreen/evergreen/pull/477),
+  [#484](https://github.com/atgreen/evergreen/pull/484),
+  [#485](https://github.com/atgreen/evergreen/pull/485),
+  [#486](https://github.com/atgreen/evergreen/pull/486),
+  [#505](https://github.com/atgreen/evergreen/pull/505),
+  [#531](https://github.com/atgreen/evergreen/pull/531),
+  [#612](https://github.com/atgreen/evergreen/pull/612),
+  [#613](https://github.com/atgreen/evergreen/pull/613),
+  [#614](https://github.com/atgreen/evergreen/pull/614)).
 - On x86-64 Linux, a loop in a function that is called only once now leaves
   the interpreter part-way through: once it has gone round 100,000 times, the
   function is compiled and the running loop continues in native code from the
@@ -556,6 +579,17 @@
 
 ### Fixed
 
+- A ppc64le background T2 worker no longer aborts with "no entry found for
+  key" when it inlines a callee whose blocks are laid out out of order
+  ([#503](https://github.com/atgreen/evergreen/pull/503)).
+- An allocation that fails because the collector could not run now reports the
+  collector's error, instead of "GC heap unavailable" or "memory allocation of
+  24 bytes failed" ([#550](https://github.com/atgreen/evergreen/pull/550)).
+- Compiling a `restart-case` keeps its already-compiled clauses alive while
+  later clauses compile, so a collection in between can no longer leave one
+  dangling ([#553](https://github.com/atgreen/evergreen/pull/553)).
+- `(compile nil '(lambda ...))` keeps the lambda's `the` type checks
+  ([#571](https://github.com/atgreen/evergreen/pull/571)).
 - `(abs -0d0)` returns `0.0d0`, as `(abs -0.0)` already returned `0.0`; it
   returned `-0.0d0` ([#629](https://github.com/atgreen/evergreen/pull/629)).
 - A function whose optimized code arrives while one of its loops is still
