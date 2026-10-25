@@ -71,4 +71,10 @@ iolib
 slime@egcl
 sly@egcl
 quicklisp-client@egcl
+archive@egcl
+zip@egcl
+unix-opts@egcl
+with-user-abort@egcl
+local-time@egcl
+parachute@egcl
 EOF

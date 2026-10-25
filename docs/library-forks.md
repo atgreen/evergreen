@@ -41,6 +41,12 @@ exercises these forks:
 | swank (in the slime tree, branch `egcl`) | https://github.com/atgreen/slime | `69afcb088f6463850c532a2f573d9ec5d875fdb9` |
 | slynk (in the sly tree, branch `egcl`) | https://github.com/atgreen/sly | `e81f332eb458e33cd650f8601f655da58be18b98` — the EGCL backend, moved out of `lib/slynk/` |
 | Quicklisp client (native TCP and directory enumeration) | https://github.com/atgreen/quicklisp-client | `2115f1d96963bf48d6a4c5c7111189bd326bfbed` |
+| archive (branch `egcl`: pathname metadata and stat accessors) | https://github.com/atgreen/archive | `3e500919b0226c10a848aefe8e57a8cff02b2a6b` |
+| zip (branch `egcl`: native file permissions) | https://github.com/atgreen/zip | `6f3efd09130475bd43de6efc1f83da8dae0ac7b9` |
+| unix-opts (branch `egcl`: argv and exit status) | https://github.com/atgreen/unix-opts | `07e240c4b1ac8d3ade055f770713c995f39b7c4d` |
+| with-user-abort (branch `egcl`: interrupt condition) | https://github.com/atgreen/with-user-abort | `9c0b83eb51cd8553d8b731eef5d6163eb82d0fc8` |
+| local-time (branch `egcl`: subsecond wall clock) | https://github.com/atgreen/local-time | `0ac828f4c978696298e41d1f86c8af923a240700` |
+| parachute (branch `egcl`: process exit status) | https://github.com/atgreen/parachute | `99ee47171ec686f7b1d80b1afcd588bb3ed300d5` |
 
 The [Quicklisp client scenario](../tests/quicklisp-client/README.md) fetches this
 exact client through ocicl, checks its native connection and filesystem
@@ -96,7 +102,8 @@ commands with `--dry-run` (before the optional project directory). The script
 requires `git` and an `ocicl` version supporting Git sources on `PATH`, stops
 on the first failed install, and fetches each fork's default branch, except
 USOCKET (`egcl-support`), Atomics, closer-mop, Ironclad, pure-tls, chipz, SLIME, SLY and the
-Quicklisp client (`egcl`), where their ports live. No commit revisions
+Quicklisp client, Archive, ZIP, unix-opts, with-user-abort, local-time and
+Parachute (`egcl`), where their ports live. No commit revisions
 are specified. It creates `ocicl.csv` if needed so installation stays in the
 selected directory. ocicl records the resolved commits in that file;
 commit it in your project for reproducibility. The script downloads and
@@ -176,3 +183,20 @@ printed and structured backtraces, live condition capture, and output destinatio
 through cold and cached ASDF loads and all four execution modes. Its EGCL adapter
 uses `EGCL-DEBUG` owned snapshots. Argument values are included only when available;
 native argument locations and source locations are not yet exposed.
+
+The [portability fork scenario](../tests/portability-forks/README.md) loads the
+six audit ports through immutable ocicl sources. It checks pathname metadata,
+TAR and ZIP writing/reading, permission bits, raw arguments, interrupt condition
+translation, clock precision and process exit statuses. These are focused
+compatibility checks, not claims that the full upstream suites pass.
+Archive's integer-file-descriptor stat remains unsupported; Parachute timeouts
+remain unenforced on EGCL. The existing unix-opts suite has three failures also
+reproduced without the adapter (`bliss-c1s72`).
+
+The `bliss-wne9.10` audit does not justify adding EGCL to every SBCL branch.
+Many branches are optional optimizations with portable alternatives, including
+Alexandria, Babel, global-vars, named-readtables and trivial-file-size.
+CFFI already has an EGCL fork; its separate static-image operation needs an
+EGCL runtime-linking implementation, not an alias to SBCL's core format.
+Capability-dependent follow-up work is tracked by `bliss-wne9.10.2`, including
+Parachute timeout enforcement and deeper introspection-library coverage.
