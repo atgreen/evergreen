@@ -10037,8 +10037,10 @@ fn accessor_call_miss(symbol: u32, args: &[EgclVal], env: &mut Env) -> Result<Eg
 /// name-lookups, the empty-list plumbing in `invoke_standard_methods` /
 /// `invoke_primary_chain`, and the `MethodContext` push/pop. Works from the
 /// cached method-ids alone (METHOD_COMPILED is keyed by method-id), so it never
-/// re-resolves the MethodDef. Returns None to fall through to the general path
-/// (aux methods present, more than one primary, or an uncompiled body).
+/// re-resolves the MethodDef. Less specific primaries are allowed too: a
+/// most specific one that never mentions CALL-NEXT-METHOD cannot reach them
+/// (bliss-3k0xm). Returns None to fall through to the general path (aux
+/// methods present, a next-method mention, or an uncompiled body).
 fn try_single_primary_fast(
     env: &mut Env,
     effective: &GfEffective,
@@ -10197,13 +10199,22 @@ fn generic_is_slot_reader(env: &Env, name: &str) -> bool {
 
 /// Which of the first GF_KEY_MAX_ARGS argument positions some method of `name`
 /// specializes, as a bit mask. Only the dispatch key consults it.
+// Calls wider than the inline cache key are safe only when later arguments
+// have no specializers; preserve the newer dispatch machinery.
+const GF_SPECIALIZED_BEYOND_KEY: u8 = 0x80;
+
 fn generic_specialized_positions(env: &Env, name: &str) -> u8 {
     let mut mask = 0u8;
     if let Some(methods) = env.methods.borrow().get(name) {
         for method in methods {
             for (position, specializer) in method.specializers.iter().enumerate() {
-                if position < GF_KEY_MAX_ARGS && !matches!(specializer, MethodSpecializer::Any) {
+                if matches!(specializer, MethodSpecializer::Any) {
+                    continue;
+                }
+                if position < GF_KEY_MAX_ARGS {
                     mask |= 1 << position;
+                } else {
+                    mask |= GF_SPECIALIZED_BEYOND_KEY;
                 }
             }
         }
@@ -10318,7 +10329,10 @@ const DISPATCH_BIT_EQL_VALUE: u32 = 1 << 24;
 /// The key therefore holds no movable reference and needs no GC tracing.
 #[inline]
 fn gf_dispatch_key(gf: u32, args: &[EgclVal], meta: &GfMeta) -> Option<GfKey> {
-    if !meta.cacheable || args.len() > GF_KEY_MAX_ARGS {
+    if !meta.cacheable
+        || args.len() > usize::from(u8::MAX)
+        || (args.len() > GF_KEY_MAX_ARGS && meta.specialized & GF_SPECIALIZED_BEYOND_KEY != 0)
+    {
         return None;
     }
     let mut classes = [0u64; GF_KEY_MAX_ARGS];
@@ -35689,14 +35703,38 @@ fn end_earmuff_convention() {
         }
     }
     EARMUFF_CONVENTION.store(false, std::sync::atomic::Ordering::Relaxed);
+    special_answers_changed();
 }
 
 /// Register `sym` as globally special (idempotent). No-op for non-symbols.
 fn proclaim_special(sym: EgclVal) {
     if sym.is_symbol() {
         let full = sym_name_rc(sym).to_string();
-        PROCLAIMED_SPECIAL.borrow_mut().insert(full);
+        let added = PROCLAIMED_SPECIAL.borrow_mut().insert(full);
+        if added {
+            special_answers_changed();
+        }
     }
+}
+
+/// Bumped AFTER every change to what [`is_special_var`] answers -- a new
+/// proclamation, or the end of the earmuff convention -- so a cached answer
+/// computed before the change is never used after it (bliss-3k0xm).
+static SPECIAL_ANSWERS_GENERATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn special_answers_changed() {
+    SPECIAL_ANSWERS_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
+thread_local! {
+    /// Per-thread [`is_special_var`] answers for interned symbols, indexed by
+    /// symbol index: 0 unknown, 1 lexical, 2 special. Valid while the
+    /// generation matches [`SPECIAL_ANSWERS_GENERATION`]. The uncached test
+    /// spells the symbol's name and hashes it into the proclamation set under
+    /// a lock, and native code makes it for every read of a dynamically bound
+    /// special variable, so cl-ppcre's matchers paid it per character.
+    static SPECIAL_ANSWERS: RefCell<(u64, Vec<u8>)> = const { RefCell::new((0, Vec::new())) };
 }
 
 /// True if `name` (a symbol's FULL name, as `sym_name` spells it -- not the bare
@@ -35720,6 +35758,40 @@ fn is_special_var(sym: EgclVal) -> bool {
     if !sym.is_symbol() {
         return false;
     }
+    let idx = sym.as_symbol_index();
+    if sym.is_nil() || sym == T || egcl_rt::symbols::is_uninterned(idx) {
+        return is_special_var_uncached(sym);
+    }
+    // Read the generation BEFORE computing, so an answer racing a
+    // proclamation is filed under the generation it may predate.
+    let generation = SPECIAL_ANSWERS_GENERATION.load(std::sync::atomic::Ordering::Acquire);
+    let cached = SPECIAL_ANSWERS.with(|answers| {
+        let answers = answers.borrow();
+        if answers.0 != generation {
+            return 0;
+        }
+        answers.1.get(idx as usize).copied().unwrap_or(0)
+    });
+    if cached != 0 {
+        return cached == 2;
+    }
+    let special = is_special_var_uncached(sym);
+    SPECIAL_ANSWERS.with(|answers| {
+        let mut answers = answers.borrow_mut();
+        if answers.0 != generation {
+            answers.0 = generation;
+            answers.1.clear();
+        }
+        let i = idx as usize;
+        if i >= answers.1.len() {
+            answers.1.resize(i + 1, 0);
+        }
+        answers.1[i] = if special { 2 } else { 1 };
+    });
+    special
+}
+
+fn is_special_var_uncached(sym: EgclVal) -> bool {
     let full = sym_name_rc(sym);
     let bare = symbol_bare_name(&full);
     let b = bare.as_bytes();
