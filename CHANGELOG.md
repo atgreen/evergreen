@@ -31,7 +31,7 @@
   of 3.3 s. A loop that runs inside a `let` binding of a special variable
   now leaves the interpreter like any other hot loop: 10,000,000 iterations
   of `(let ((*x* 0)) (dotimes (i n) (incf *x* i)))` take 8.4 s instead of 22 s
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#639](https://github.com/atgreen/evergreen/pull/639)).
 
 ## 0.0.11 - 2026-10-24
 
