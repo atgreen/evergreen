@@ -4,6 +4,20 @@
 
 ### Performance
 
+- On x86-64 Linux, a long-running loop that computes with double-floats,
+  such as `(dotimes (i n s) (setq s (+ s 1d0)))`, now leaves the interpreter
+  part-way through its first call, as a fixnum loop already did. Before, it
+  stayed interpreted for the whole call and the function still reported
+  tier 0, even though the same body ran about 300 times faster once enough
+  separate calls had compiled it. The loop keeps running while its optimized
+  code compiles, then continues in that code with its doubles held unboxed.
+  A first call of 10,000,000 iterations of that loop takes 0.2 s instead of
+  15.7 s, and the issue's 4,000,000-iteration call after two warm-up calls
+  takes 0.019 s instead of 6.3 s. A double loop that calls a function goes
+  native too, but its calls are still slow in that first call: 4,000,000
+  iterations take 2.9 s instead of 9.6 s, and 0.11 s from the next call on
+  ([#PR](https://github.com/atgreen/evergreen/pull/PR), reported in
+  [#642](https://github.com/atgreen/evergreen/issues/642)).
 - On x86-64 Linux, a loop typed at the REPL, given to `--eval` or written at
   the top level of a loaded file now leaves the interpreter part-way through,
   as a loop in a once-called function already did: after 100,000 iterations
