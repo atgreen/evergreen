@@ -6730,7 +6730,13 @@ fn abs_value(v: EgclVal) -> Result<EgclVal, EgclError> {
     if v.is_single_float() {
         return Ok(EgclVal::from_single_float(v.as_single_float().abs()));
     }
-    // Any other REAL (bignum, ratio, double-float): |x| = x if x>=0 else -x,
+    // A double clears its sign bit, as a single does: comparing -0.0d0 with
+    // zero finds them equal, so the generic path below returned -0.0d0
+    // (bliss-2n1uq).
+    if v.is_double_float() {
+        return Ok(egcl_rt::gc::alloc_double_float(v.as_double_float().abs()));
+    }
+    // Any other REAL (bignum, ratio): |x| = x if x>=0 else -x,
     // via the generic compare/subtract cores so the exact type is preserved
     // (bliss-apr).
     if egcl_rt::types::realp(v) {
