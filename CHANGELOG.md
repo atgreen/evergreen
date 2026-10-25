@@ -55,7 +55,7 @@
   return success while the signalled permit also stayed available, so one
   signal admitted two waiters. A wake that arrives too late for one wait can
   also no longer end the same fiber's next wait, such as a following sleep,
-  early ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  early ([#647](https://github.com/atgreen/evergreen/pull/647)).
 - A condition is no longer corrupted when a garbage collection runs while it
   is being made. If a slot's initform allocated enough to start a collection,
   `make-condition`, `error` and `signal` could return an object that was no
