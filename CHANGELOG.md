@@ -88,6 +88,13 @@
 
 ### Performance
 
+- A minor garbage collection no longer keeps dead lists alive because they
+  were built by setting a cons's cdr, as `loop ... collect`, `(setf (cdr tail)
+  ...)` and `nconc` do. Every such store was recorded as a root for the next
+  minor collection, even when the cons itself was new and already garbage, so
+  the collector copied most of the 64 MB nursery each time. A loop that
+  collects 50-element lists 300,000 times spent 12.4 s in collection and now
+  spends 0.06 s ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
 - On x86-64 Linux, a loop in a function that is called only once now leaves
   the interpreter part-way through: once it has gone round 100,000 times, the
   function is compiled and the running loop continues in native code from the
