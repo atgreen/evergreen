@@ -183,8 +183,8 @@ fn osr_matches_interpretation_across_loop_shapes() {
     }
 }
 
-/// Linux temporarily keeps the current activation interpreted until mapped OSR
-/// is implemented; other targets must still prove actual native entry.
+/// Every target must prove actual native entry; x86-64 Linux enters the
+/// function's mapped code at the loop header (bliss-s0v50).
 /// PROMOTION must actually happen — output parity alone cannot see a dead OSR
 /// path (bliss-j1o7: the main dispatch path never threaded the registry
 /// symbol, so `maybe_osr` rejected every back-edge and every one of these
@@ -202,11 +202,7 @@ fn cold_hot_loop_obeys_platform_osr_policy() {
         .expect("spawn");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains(if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
-            "12497500 0"
-        } else {
-            "12497500 1"
-        }),
+        stdout.starts_with("12497500 ") && !stdout.starts_with("12497500 0"),
         "cold hot loop must preserve its sum and obey platform OSR admission (got: {stdout:?})"
     );
 }
@@ -225,11 +221,7 @@ fn cold_hot_loop_obeys_platform_osr_policy_at_default_threshold() {
         .expect("spawn");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains(if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
-            "19999900000 0"
-        } else {
-            "19999900000 1"
-        }),
+        stdout.starts_with("19999900000 ") && !stdout.starts_with("19999900000 0"),
         "default-threshold hot loop must obey platform OSR admission (got: {stdout:?})"
     );
 }
@@ -391,4 +383,86 @@ fn osr_does_not_replay_effects_after_an_expired_catch() {
         "NESTED 1 :CONTROL-ERROR",
         "the nested-tagbody route to the same replay must agree too"
     );
+}
+
+/// A loop in a function called only once leaves T0 by OSR (bliss-s0v50):
+/// every non-local exit, guard failure, redefinition, closure, nested loop and
+/// multiple-value shape below must still print exactly what the interpreter
+/// prints, and the plain loops must actually have entered native code.
+#[test]
+fn once_called_loops_enter_native_code_and_match_interpretation() {
+    let program = r#"
+(progn
+  (defun oc-deopt (n) (let ((s 0)) (dotimes (i n s) (setq s (if (< i 600) (+ s i) (+ s 0.5))))))
+  (defun oc-bignum (n) (let ((s 1)) (dotimes (i n s) (setq s (if (< i 600) (+ s 1) (* s 3))) (when (> s (expt 10 60)) (setq s 7)))))
+  (defun oc-return (n) (dotimes (i n :never) (when (= i 600) (return-from oc-return (list :early i)))))
+  (defun oc-throw (n) (dotimes (i n) (when (= i 600) (throw :tag (list :thrown i)))))
+  (defun oc-error (n) (let ((s 0)) (dotimes (i n s) (when (= i 600) (error "boom ~a" i)) (incf s))))
+  (defun oc-inner-handler (n) (let ((s 0)) (dotimes (i n s) (handler-case (if (= (mod i 100) 0) (error "x") (incf s)) (error () (decf s))))))
+  (defun oc-inner-cleanup (n) (let ((s 0) (c 0)) (dotimes (i n (list s c)) (unwind-protect (incf s) (incf c)))))
+  (defvar *oc-special* 1)
+  (defun oc-inner-special (n) (let ((s 0)) (dotimes (i n s) (let ((*oc-special* (mod i 3))) (incf s *oc-special*)))))
+  (defun oc-redefine (n) (let ((s 0)) (dotimes (i n s) (when (= i 600) (eval '(defun oc-redefine (n) (list :new n)))) (incf s))))
+  (defun oc-closures (n) (let ((fs nil)) (dotimes (i n) (when (zerop (mod i 300)) (let ((j i)) (push (lambda () j) fs)))) (mapcar #'funcall fs)))
+  (defun oc-nested (n) (let ((s 0)) (dotimes (i n s) (dotimes (j 10) (incf s (* i j))))))
+  (defun oc-values (n) (let ((s 0)) (dotimes (i n) (incf s i)) (values s (* 2 s) :done)))
+  (defun oc-return-values (n) (dotimes (i n) (when (= i 800) (return (values i :x :y)))))
+  (defun oc-cons (n) (let ((acc nil)) (dotimes (i n) (push (cons i i) acc)) (list (length acc) (reduce #'+ acc :key #'car))))
+  (format t "~s~%" (list (oc-deopt 1200) (oc-bignum 1200) (oc-return 1200)
+                         (catch :tag (oc-throw 1200))
+                         (handler-case (oc-error 1200) (error (c) (princ-to-string c)))
+                         (oc-inner-handler 1200) (oc-inner-cleanup 1200)
+                         (let ((log nil)) (list (catch :tag (unwind-protect (oc-throw 1200) (push :cleaned log))) log))
+                         (oc-inner-special 1200) (oc-redefine 1200) (oc-redefine 1)
+                         (oc-closures 1200) (oc-nested 300)
+                         (multiple-value-list (oc-values 1200))
+                         (multiple-value-list (oc-return-values 1200))
+                         (oc-cons 1200)))
+  (format t "OSR ~s~%" (every #'plusp (mapcar #'egcl-ext:function-osr-count
+                                              '(oc-deopt oc-return oc-throw oc-error oc-nested oc-values oc-cons)))))
+"#;
+    let run = |tier: Option<&str>| {
+        let mut command = Command::new(BIN);
+        command
+            .args(["--no-init", "--eval", program])
+            .env_remove("EGCL_FORCE_TIER")
+            .env("EGCL_OSR_THRESHOLD", "200")
+            .env("EGCL_T1_T2_BACKEDGE_THRESHOLD", "100");
+        if let Some(tier) = tier {
+            command.env("EGCL_FORCE_TIER", tier);
+        }
+        let output = command.output().expect("run once-called loops");
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    let tiered = run(None);
+    let oracle = run(Some("interp"));
+    assert_eq!(tiered.lines().next(), oracle.lines().next(), "{tiered}");
+    assert!(tiered.contains("OSR T"), "the once-called loops must enter native code: {tiered}");
+}
+
+/// Optimized code proves a loop-invariant parameter a fixnum before its loop.
+/// A T0 activation resumed by that proof's failure later re-enters the code at
+/// the loop header with the non-fixnum still in its frame, so the entry must
+/// test it again rather than compare a float as a fixnum forever.
+#[test]
+fn osr_entry_rechecks_a_proof_made_before_the_loop() {
+    let program = "(progn
+      (defun osr-bound (n)
+        (let ((r 0) (i 0))
+          (loop (when (>= i n) (return r))
+                (incf r) (when (> i 100) (return :runaway)) (setq i (+ i 1)))))
+      (dotimes (k 40) (osr-bound 6))
+      (format t \"BOUND ~s ~s ~s~%\" (osr-bound 6) (osr-bound 50.5)
+              (plusp (egcl-ext:function-osr-count 'osr-bound))))";
+    let output = Command::new(BIN)
+        .args(["--no-init", "--eval", program])
+        .env("EGCL_FORCE_TIER", "t2")
+        .env("EGCL_T1_T2_BACKEDGE_THRESHOLD", "5")
+        .env("EGCL_OSR_THRESHOLD", "10")
+        .output()
+        .expect("run OSR bound regression");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+    assert!(stdout.contains("BOUND 6 51 T"), "{stdout}");
 }

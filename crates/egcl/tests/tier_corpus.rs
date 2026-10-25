@@ -13,6 +13,8 @@ fn run_corpus(tier: &str, transitions: bool) -> (String, String) {
         .join("../../tests/differential/tier-corpus.lisp");
     let mut command = Command::new(env!("CARGO_BIN_EXE_egcl"));
     let probe = if transitions && tier == "t2" {
+        // Forced T2 installs mapped code at the first call on x86-64 Linux, so
+        // no loop is left running in T0 for OSR to move.
         if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
             "(assert (= (egcl-ext:function-osr-count 'fib-iter) 0))"
         } else {

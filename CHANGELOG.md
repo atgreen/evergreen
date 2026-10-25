@@ -88,6 +88,23 @@
 
 ### Performance
 
+- On x86-64 Linux, a loop in a function that is called only once now leaves
+  the interpreter part-way through: once it has gone round 100,000 times, the
+  function is compiled and the running loop continues in native code from the
+  same iteration. Before, such a loop ran interpreted to the end. Without any
+  warm-up, 10,000,000 iterations of a fixnum sum loop take 0.21 s instead of
+  14.5 s, of a loop that calls another function 4.7 s instead of 16.8 s, of a
+  loop that reads a special variable 2.9 s instead of 14.6 s, and 3,000,000 of
+  a consing loop 4.3 s instead of 9.4 s; three calls of a 2,000,000-iteration
+  driver of a double-float step function take 6.1 s instead of 21.5 s. A
+  loop inside the same function's `handler-case`, `unwind-protect`, `catch`
+  or special binding, a loop that computes with double-floats, and a loop at
+  top level still run interpreted ([#630](https://github.com/atgreen/evergreen/pull/630)).
+- On x86-64 Linux, a function whose loop uses `push`, `decf` or `loop ...
+  collect` now gets the fast register calling convention when it is optimized,
+  as other loops already did, so calling it is cheaper: 100,000 calls of a
+  50-iteration `push` loop take 0.34 s instead of 0.50 s
+  ([#630](https://github.com/atgreen/evergreen/pull/630)).
 - `loop ... collect` no longer calls `rplacd` and `last` for every element it
   collects: a collected element is a fresh one-element list, so it becomes the
   new tail directly. A compiled `(loop repeat 50 collect x)` drops from about

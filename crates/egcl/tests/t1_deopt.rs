@@ -108,7 +108,8 @@ fn impure_osr_loop_resumes_after_effect_on_numeric_guard_failure() {
     assert!(
         String::from_utf8_lossy(&output.stdout).contains(
             if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
-                "OSR-EFFECTS (200 200 NIL NIL)"
+                // Mapped T1 computes the ratio generically: no deopt.
+                "OSR-EFFECTS (200 200 T NIL)"
             } else {
                 "OSR-EFFECTS (200 200 T T)"
             }

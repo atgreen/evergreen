@@ -272,6 +272,9 @@ fn captured_loop_enters_t2_by_osr_and_deopts_on_its_frame() {
         ("EGCL_T1_T2_INVOKE_THRESHOLD", "100000000"),
         ("EGCL_T1_T2_BACKEDGE_THRESHOLD", "1000"),
         ("EGCL_T2_THREADS", "1"),
+        // The T0 continuation of R3's deopt runs exactly the default number of
+        // back-edges, so it would re-enter native code at its final test.
+        ("EGCL_OSR_THRESHOLD", "1000000"),
     ]);
     let oracle = run(&[("EGCL_FORCE_TIER", "interp")]);
     let results = |out: &str| {

@@ -420,56 +420,61 @@ ignores either one measures warmup rather than steady state:
   activation (`EGCL_OSR_THRESHOLD`). The anonymous path next to it uses 200.
 
 So the same empty `DOTIMES` costs wildly different amounts depending on where
-it sits. Measured 2026-10-03 on `target/x86_64-unknown-linux-musl/release/egcl`,
-min of 5 runs, with the 205 ms process startup subtracted:
+it sits. Measured 2026-10-24 on `target/x86_64-unknown-linux-musl/release/egcl`
+(x86-64 Linux, after bliss-s0v50), min of 5 runs, with the 366 ms process
+startup subtracted:
 
 ```
   iterations   toplevel (dotimes (i N))   inside a function called once
-      50,000        0.229 us/iter                1.110 us/iter
-     100,000        0.102                        1.031
-     500,000        0.082                        0.268
-   1,000,000        0.085                        0.172
-   4,000,000        0.078                        0.102
-  10,000,000        0.077                        0.086
+      50,000        1.094 us/iter                0.947 us/iter
+     100,000        0.917                        0.902
+     500,000        0.904                        0.263
+   1,000,000        0.910                        0.139
+   4,000,000        0.902                        0.032
+  10,000,000        0.886                        0.015
 ```
 
-Both shapes converge on roughly **0.08 us/iter** — this engine's steady state
-for an empty counted loop, consistent with the ~76 ns/iter back-edge GC poll
-measured in bliss-qt702, which is what currently sets that floor.
+**A toplevel loop never goes native on x86-64 Linux.** Its activation is
+anonymous, and the anonymous OSR path (200 back-edges) is still the checked-ABI
+one that Linux disables (bliss-of682), so it costs the interpreted ~0.9 us/iter
+however long it runs. The 0.08 us/iter this table used to show for it predates
+the mapped-entry default (#210). Benchmark loops inside a function.
 
-A toplevel loop is there by 500k. The once-called shape is slower for longer
-because **OSR is the only thing that rescues it**: one invocation never clears
-the 10-call T0 → T1 gate, so the loop runs interpreted until the back-edge
-count reaches `osr_threshold()`, and only the iterations after that run
-native. That is why its average falls as N grows rather than dropping at a
-point — at 10M, 100k interpreted iterations at ~1.03 plus 9.9M native ones at
-~0.077 averages the 0.086 measured above.
+**A once-called function leaves T0 by OSR.** One invocation never clears the
+10-call T0 → T1 gate, so the loop runs interpreted until the function's
+back-edge count reaches `osr_threshold()`. Then `maybe_mapped_osr` compiles
+mapped T1 and enters it at the loop header with the interpreter's frame
+(bliss-s0v50); the loop's heat queues T2, and the T1 loop moves to T2 by the
+existing mapped OSR. That is why its average falls as N grows rather than
+dropping at a point: at 10M, ~100k interpreted iterations at ~0.9 plus 9.9M
+native ones average the 0.015 measured above. Before bliss-s0v50 this column
+read ~0.9 us/iter at every N.
 
-Confirmed by removing OSR rather than inferring it, same 10M once-called loop:
+Confirmed by moving the threshold, same 10M once-called loop:
 
 ```
-  default                              1.07 s   0.087 us/iter
-  EGCL_OSR_THRESHOLD=4000000000       10.40 s   1.019 us/iter   (OSR never fires)
-  EGCL_OSR_THRESHOLD=1000              0.97 s   0.076 us/iter
-  EGCL_T0_T1_THRESHOLD=1               0.95 s   0.074 us/iter
+  default                              0.16 s   0.016 us/iter
+  EGCL_OSR_THRESHOLD=4000000000        9.09 s   0.909 us/iter   (OSR never fires)
+  EGCL_OSR_THRESHOLD=1000              0.08 s   0.008 us/iter
+  EGCL_T0_T1_THRESHOLD=1               0.27 s   0.027 us/iter
 ```
 
-With OSR off, the loop costs ~1.02 us/iter however long it runs: that is the
-un-promoted cost. Lowering the invocation gate instead is worth only ~1.13x
-here, so for this shape the back-edge threshold is the lever, not the
+With OSR off, the loop costs ~0.9 us/iter however long it runs: that is the
+un-promoted cost. For this shape the back-edge threshold is the lever, not the
 invocation one.
 
-Use **1M+ iterations** for a toplevel loop, more for a cold function, and say
-which shape and which count a number came from. Around 100k the numbers are
-also **bimodal** — note that 100k above took less wall time in total than 50k
-did — so a single 100k sample reads as noise or as a regression and is
-neither.
+What still stays in T0 for its whole run (each measured, bliss-s0v50): a loop
+inside its own function's `handler-case`, `unwind-protect`, `catch` or special
+binding (bliss-4iwh1); a loop whose T0 profile saw a double-float, because
+mapped T1 double arithmetic is slower than T0 and raw-double T2 has no loop
+entries (bliss-vwpaz). A once-called loop that
+calls another function does go native but pays ~0.5 us per call from the
+mapped activation (bliss-lxskg), against ~0.013 us from a warmed ordinary
+caller.
 
-**Do not expect the ~150x this section used to claim.** That came with a
-0.012 us/iter steady-state figure which nothing reproduces; the real spread
-between a cold 50k loop and steady state is about 3x for a toplevel loop and
-about 13x for a once-called one. If you see 0.012 us/iter quoted anywhere, it
-is stale.
+Use **1M+ iterations** for a once-called function, and say which shape and
+which count a number came from. Around 100k the numbers are **bimodal**, so a
+single 100k sample reads as noise or as a regression and is neither.
 
 **`DISASSEMBLE` does not tell you whether a loop promoted.** It reports the
 *function's* installed tier, so a loop-hot function still prints `T0` long
