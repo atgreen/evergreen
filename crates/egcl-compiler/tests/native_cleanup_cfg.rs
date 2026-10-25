@@ -844,7 +844,22 @@ fn noncapturing_closure_is_an_argument_free_transfer_invoke() {
         },
         Instr::Return,
     ];
-    assert!(build::build_from_bytecode(&body).is_err());
+    // The plain builder serves checked-ABI emitters (#478): it lowers the
+    // creation to a target-free, argument-free adapter `Call`, never to the
+    // mapped `Invoke` with exceptional successors built below.
+    let checked = build::build_from_bytecode(&body).unwrap();
+    verify::verify(&checked).unwrap();
+    let checked_closure = checked
+        .block_order()
+        .iter()
+        .flat_map(|&block| &checked.block(block).insts)
+        .copied()
+        .find(|&inst| matches!(checked.inst(inst).aux, AuxData::NestedClosure(0)))
+        .unwrap();
+    let checked_data = checked.inst(checked_closure);
+    assert_eq!(checked_data.opcode, Opcode::Call);
+    assert!(checked_data.args.is_empty());
+    assert!(checked_data.targets.is_empty());
     let ir = build::build_from_bytecode_for_native_cleanups(&body).unwrap();
     verify::verify(&ir).unwrap();
     let closure = ir
@@ -873,6 +888,10 @@ fn noncapturing_closure_is_an_argument_free_transfer_invoke() {
     assert!(
         build::build_from_bytecode_for_native_cleanups(&body).is_err(),
         "an out-of-range nested function must decline"
+    );
+    assert!(
+        build::build_from_bytecode(&body).is_err(),
+        "the checked-ABI lowering must decline an out-of-range nested function too"
     );
     // A capturing closure reaches the activation's EnvFrame through the
     // runtime, identified by its exact bytecode PC (bliss-shih7.27).
