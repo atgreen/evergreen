@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import time
 import tomllib
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -282,6 +283,9 @@ def build(args):
 BUNDLED_LICENSES = 'BUNDLED-LICENSES.txt'
 
 
+OCICL_INSTALL_ATTEMPTS = 4
+
+
 def vendor_lisp_dependencies(project):
     """Install the APK builder's pinned Lisp dependencies into the snapshot and
     record their licences.
@@ -298,7 +302,19 @@ def vendor_lisp_dependencies(project):
         raise SystemExit(f'{project}: no ocicl.csv to install from')
     # Deliberately not optional: silently skipping would produce a source RPM
     # that looks complete and cannot build the Android tooling.
-    run(['ocicl', 'install'], cwd=project)
+    # The fetch crosses the network from a CI container and has failed
+    # mid-download from ghcr.io's CDN ("couldn't read from ... socket") on
+    # one run and succeeded on the next. ocicl skips what it already has, so
+    # retrying only re-fetches the missing systems.
+    for attempt in range(1, OCICL_INSTALL_ATTEMPTS + 1):
+        try:
+            run(['ocicl', 'install'], cwd=project)
+            break
+        except subprocess.CalledProcessError:
+            if attempt == OCICL_INSTALL_ATTEMPTS:
+                raise
+            print(f'ocicl install failed (attempt {attempt}); retrying', flush=True)
+            time.sleep(10 * attempt)
     notices = subprocess.check_output(['ocicl', 'collect-licenses'], cwd=project, text=True)
     if 'Total: 0 licenses' in notices or not notices.strip():
         raise SystemExit(f'{project}: ocicl collected no licences')
