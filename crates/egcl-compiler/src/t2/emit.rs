@@ -4805,9 +4805,10 @@ fn raw_reject(f: &Function, why: &str) -> bool {
 
 /// Admit raw F64 transport only where every collecting/cold boundary has an
 /// authoritative representation map. Raw entry arguments, ordinary helper or
-/// return operands, OSR imports, and other unboxed representations remain out
-/// of scope. Raw producers are guarded unboxing, packed loads, raw double
-/// constants and explicit double arithmetic; packed stores consume raw words
+/// return operands and other unboxed representations remain out of scope; an
+/// OSR entry unboxes its raw double imports (bliss-vwpaz). Raw producers are
+/// guarded unboxing, packed loads, raw double constants, OSR imports and
+/// explicit double arithmetic; packed stores consume raw words
 /// without boxing, and escape boxes call the published box veneer.
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 fn native_representations_supported(
@@ -4824,12 +4825,11 @@ fn native_representations_supported(
     let has_raw = (0..f.num_values()).any(|i| raw(Value(i as u32)));
     if has_raw && (roots != NativeRootPublication::PublishedHomes
         || storage != NativeCallStorage::NativeStack || !precise_deopt
-        || !f.osr_entries.is_empty()
         || f.block(f.entry()).params.iter().copied().any(raw)
         || (0..f.num_values()).any(|i| !matches!(f.value(Value(i as u32)).repr,
             Repr::Tagged | Repr::UnboxedF64)))
     {
-        return raw_reject(f, "raw values need published homes, native storage, precise deopt, no OSR import or raw entry parameter");
+        return raw_reject(f, "raw values need published homes, native storage, precise deopt and no raw entry parameter");
     }
     for (_, state) in f.frame_states.iter() {
         let sources = state.scopes.iter().flat_map(|scope| scope.locals.iter().chain(&scope.stack))
@@ -8092,11 +8092,21 @@ fn emit_framed_inner(
         //
         // The representations come from `slot_map`, the same producer the deopt
         // export reads, so import and export cannot disagree about this frame.
+        //
+        // A raw double slot (bliss-vwpaz) is unboxed on import: the stub
+        // tests the interpreter's datum for the exact boxed double-float
+        // layout and copies its payload word into the raw home. That is the
+        // inverse of the deopt export's `ReboxF64`, and it is admitted only
+        // where raw homes already exist (published native roots and native
+        // call storage). The runtime checks those slots before it enters, so
+        // the in-stub test is a trap, never a deopt from half-imported homes.
         let specs = slot_map::slot_specs(scope, fs);
-        if specs
-            .iter()
-            .any(|s| ConversionKind::for_repr(s.repr) != Some(ConversionKind::None))
-        {
+        let raw_double_imports = transfer_mode && published_native_roots && native_call_storage;
+        if specs.iter().any(|s| match ConversionKind::for_repr(s.repr) {
+            Some(ConversionKind::None) => false,
+            Some(ConversionKind::UnboxDouble) => !raw_double_imports,
+            _ => true,
+        }) {
             continue;
         }
         // Liveness at the target, read from regalloc2's precise per-ProgPoint
@@ -8113,25 +8123,43 @@ fn emit_framed_inner(
         let Some(live) = machine.live_vregs_before(target_inst, &read_vregs) else {
             continue;
         };
+        let raw_double = |value: Value| f.value(value).repr == ValueRepresentation::UnboxedF64;
         let live_at_target = |value: Value| -> bool {
+            let class = if raw_double(value) { RegClass::Xmm } else { RegClass::Gpr };
             live.iter()
-                .any(|vreg| vreg.class == RegClass::Gpr && vreg.num == value.0)
+                .any(|vreg| vreg.class == class && vreg.num == value.0)
+        };
+        // Raw double constants the optimizer hoisted out of the loop are
+        // rematerialized into their homes, not imported.
+        let raw_constant = |value: Value| match f.value(value).def {
+            ValueDef::Result { inst, .. } => match (f.inst(inst).opcode, &f.inst(inst).aux) {
+                (Opcode::ConstDouble, AuxData::DoubleImm(bits)) => Some(*bits),
+                _ => None,
+            },
+            _ => None,
         };
         // Import is the inverse of recovery only for values actually named by
         // the header state. Optimizations may leave another value live here
         // (for example a pre-loop guard's refined alias). Its defining code is
         // bypassed by OSR, so never publish an entry with an uninitialized home.
         // Tagged constants are materialized at their uses and need no import.
+        let imported = |value: Value| {
+            homes.contains_key(&value)
+                && specs.iter().any(|spec| {
+                    matches!(&spec.source, ValueSource::Value { value: source, .. }
+                        if *source == value)
+                })
+        };
         let complete_imports = live.iter().all(|vreg| {
             let value = Value(vreg.num);
+            if (vreg.num as usize) < f.num_values() && raw_double(value) {
+                return raw_double_imports && vreg.class == RegClass::Xmm
+                    && (imported(value)
+                        || (raw_constant(value).is_some() && homes.contains_key(&value)));
+            }
             vreg.class == RegClass::Gpr
                 && f.value(value).repr == ValueRepresentation::Tagged
-                && (const_tagged.contains_key(&value)
-                    || (homes.contains_key(&value)
-                        && specs.iter().any(|spec| {
-                            matches!(&spec.source, ValueSource::Value { value: source, .. }
-                                if *source == value)
-                        })))
+                && (const_tagged.contains_key(&value) || imported(value))
         });
         if !complete_imports {
             continue;
@@ -8167,16 +8195,28 @@ fn emit_framed_inner(
         // the loop) serialises a tagged datum rather than whatever the
         // register or slot held when the entry was taken; a live import below
         // overwrites any home the two happen to share.
+        // A raw double home gets +0.0, which reboxes to a double-float.
         for spec in &specs {
             if let ValueSource::Value { value, .. } = &spec.source {
                 if !live_at_target(*value) {
                     if let Some(&home) = homes.get(value) {
-                        mov_imm64(&mut a, RAX, egcl_rt::value::NIL.0 as i64);
+                        let filler = if raw_double(*value) { 0 } else { egcl_rt::value::NIL.0 as i64 };
+                        mov_imm64(&mut a, RAX, filler);
                         store_home(&mut a, home, RAX, 0);
                     }
                 }
             }
         }
+        for vreg in &live {
+            let value = Value(vreg.num);
+            if (vreg.num as usize) < f.num_values() && raw_double(value) && !imported(value)
+                && let (Some(bits), Some(&home)) = (raw_constant(value), homes.get(&value))
+            {
+                mov_imm64(&mut a, RAX, bits as i64);
+                store_home(&mut a, home, RAX, 0);
+            }
+        }
+        let import_trap = a.label();
         // Import only slots whose value is LIVE at the OSR target block.
         // regalloc2 reuses one register for several disjoint-range values, so
         // a slot map can legitimately name two values sharing a register home
@@ -8203,6 +8243,23 @@ fn emit_framed_inner(
                     continue;
                 }
                 if let Some(&home) = homes.get(value) {
+                    if raw_double(*value) {
+                        // rax = the tagged datum; rdx (never a value home)
+                        // addresses its object. Only the exact boxed-double
+                        // layout supplies the payload word.
+                        mov_from_frame(&mut a, RAX, 7 /* rdi */, slot);
+                        mov_rr(&mut a, SCRATCH, RAX);
+                        alu_r_imm(&mut a, 4, SCRATCH, 7);
+                        alu_r_imm(&mut a, 7, SCRATCH, egcl_rt::value::TAG_HEAP_OBJECT as i32);
+                        a.jcc(Cc::Ne, import_trap);
+                        mov_rr(&mut a, SCRATCH, RAX);
+                        alu_r_imm(&mut a, 4, SCRATCH, -8);
+                        a.extend_from_slice(&[0x80, 0x7a, 0x07, egcl_rt::object::type_id::DOUBLE_FLOAT]);
+                        a.jcc(Cc::Ne, import_trap);
+                        load_mem64_disp(&mut a, RAX, SCRATCH, 8);
+                        store_home(&mut a, home, RAX, 0);
+                        continue;
+                    }
                     match home {
                         FramedHome::Reg(r) => mov_from_frame(&mut a, r, 7 /* rdi */, slot),
                         FramedHome::Stack(_) => {
@@ -8227,6 +8284,10 @@ fn emit_framed_inner(
             }
         }
         jump_to_shared_body(&mut a, block_label[&osr.block]);
+        // The runtime admits an entry only after checking every raw import
+        // (`TransferCode::osr_imports_admit`), so this is unreachable.
+        a.bind(import_trap);
+        a.extend_from_slice(&[0x0f, 0x0b]); // ud2
         osr_entries.push((osr.bcp, offset));
     }
 

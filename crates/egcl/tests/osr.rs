@@ -738,3 +738,64 @@ fn a_deoptimized_long_loop_reenters_native_code_after_its_phase_change() {
     }
     assert!(reentries("PC-ALTERNATE") <= 4, "{log}");
 }
+
+/// A loop in a once-called function whose accumulator is a double-float
+/// leaves T0 by OSR into raw-double T2 (bliss-vwpaz, GitHub #642). Before,
+/// such a loop stayed interpreted for the whole call and the function still
+/// reported tier 0. The OSR companion of the raw T2 version unboxes the
+/// loop's doubles at the header; NaN, infinities, -0.0, fixnum and
+/// single-float contagion, a double turning fixnum mid-loop, a double
+/// escaping into a list and a callee returning doubles must all print what
+/// the interpreter prints.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn once_called_double_float_loops_enter_t2_and_match_interpretation() {
+    let program = r#"
+(defvar *df-inf* (* 1d308 10d0))
+(defun df-sum (n) (let ((s 0d0)) (dotimes (i n s) (setq s (+ s 1d0)))))
+(defun df-negzero (n) (let ((s -0d0)) (dotimes (i n s) (setq s (* s 1d0)))))
+(defun df-inf (n) (let ((s 1d300)) (dotimes (i n s) (setq s (* s 1.5d0)))))
+(defun df-nan (n) (let ((s 0d0)) (dotimes (i n s) (setq s (+ s (if (= i 100) (- *df-inf* *df-inf*) 0.5d0))))))
+(defun df-fixnum (n) (let ((s 0d0)) (dotimes (i n s) (setq s (+ s i)))))
+(defun df-single (n) (let ((s 0d0)) (dotimes (i n s) (setq s (+ s 1.5f0)))))
+(defun df-to-fixnum (n) (let ((s 0d0) (k (floor n 2))) (dotimes (i n s) (setq s (if (>= i k) (+ (floor s) 1) (+ s 1d0))))))
+(defun df-escape (n) (let ((acc nil) (s 0d0)) (dotimes (i n (list (length acc) (car acc) (reduce #'+ acc))) (setq s (+ s 0.25d0)) (when (zerop (mod i 1000)) (push s acc)))))
+(defun df-step (i) (* i 1d-3))
+(defun df-call (n) (let ((s 0d0)) (dotimes (i n s) (setq s (+ s (df-step i))))))
+(format t "~s~%" (list (df-sum 20000) (df-negzero 20000) (df-inf 20000) (df-nan 20000) (df-fixnum 20000)
+                       (df-single 20000) (df-to-fixnum 20000) (df-escape 20000) (df-call 20000)))
+(format t "OSR ~s~%" (mapcar (lambda (f) (list (egcl-ext:function-tier f) (plusp (egcl-ext:function-osr-count f))))
+                             '(df-sum df-negzero df-inf df-nan df-fixnum df-single df-call)))
+"#;
+    let file = std::env::temp_dir().join(format!("egcl-double-osr-{}.lisp", std::process::id()));
+    std::fs::write(&file, program).unwrap();
+    let run = |tier: Option<&str>| {
+        let mut command = Command::new(BIN);
+        command
+            .args(["--no-init", "--load"])
+            .arg(&file)
+            .env_remove("EGCL_FORCE_TIER")
+            // A loop that queues T2 waits for it, so the entry is deterministic.
+            .env("EGCL_T2", "1")
+            .env("EGCL_OSR_THRESHOLD", "200")
+            .env("EGCL_T2_LOG", "stderr");
+        if let Some(tier) = tier {
+            command.env("EGCL_FORCE_TIER", tier);
+        }
+        let output = command.output().expect("run double-float loops");
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(output.status.success(), "{stderr}");
+        (String::from_utf8_lossy(&output.stdout).into_owned(), stderr)
+    };
+    let (tiered, log) = run(None);
+    let (oracle, _) = run(Some("interp"));
+    std::fs::remove_file(&file).unwrap();
+    assert_eq!(tiered.lines().next(), oracle.lines().next(), "{log}");
+    assert_eq!(
+        tiered.lines().nth(1),
+        Some("OSR ((2 T) (2 T) (2 T) (2 T) (2 T) (2 T) (2 T))"),
+        "each once-called double loop must reach T2 by OSR:\n{log}"
+    );
+    assert!(log.contains("DF-SUM: raw double OSR companion emitted"), "{log}");
+    assert!(log.contains("DF-SUM: double-float loop enters T2 by OSR"), "{log}");
+}

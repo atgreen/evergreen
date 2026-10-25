@@ -53,12 +53,10 @@ pub(in crate::cli::bytecode) fn prepare_ordinary_t2(
         Ok(scopes) => scopes,
         Err(error) => return decline(&format!("control-scope analysis: {error:?}")),
     };
+    // A raw clone keeps its loop headers: installation emits the full-call
+    // code without them and a mapped OSR companion that unboxes the running
+    // loop's doubles (bliss-vwpaz).
     let mut mapped = optimized.clone();
-    if has_raw {
-        // Only this full-entry clone has raw homes. The worker retains its
-        // tagged artifact and T1 OSR path; raw imports require separate recipes.
-        mapped.osr_entries.clear();
-    }
     if let Err(error) = egcl_compiler::t2::build::legalize_transfer_calls(&mut mapped, &scopes) {
         return decline(&format!("transfer-call legalization: {error:?}"));
     }

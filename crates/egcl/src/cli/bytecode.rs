@@ -25855,7 +25855,18 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
             egcl_compiler::t2::speculate::SpeculateOptions { double_float: true },
         );
         let raw = egcl_compiler::t2::unbox_f64::has_raw_doubles(&candidate);
-        if raw && !egcl_compiler::t2::unbox_f64::optimize(&mut candidate) {
+        let optimized = !raw || egcl_compiler::t2::unbox_f64::optimize(&mut candidate);
+        // Only the x86-64 Linux mapped entry unboxes raw OSR imports
+        // (bliss-vwpaz); elsewhere a header importing a raw double is dropped.
+        if raw && !cfg!(all(target_arch = "x86_64", target_os = "linux")) {
+            let states = &candidate.frame_states;
+            candidate.osr_entries.retain(|entry| {
+                states.get(entry.frame_state).scopes.iter().flat_map(|scope| &scope.locals)
+                    .all(|source| !matches!(source, egcl_compiler::t2::frame_state::ValueSource::Value {
+                        repr: egcl_compiler::t2::ir::ValueRepresentation::UnboxedF64, .. }))
+            });
+        }
+        if !optimized {
             t2_log!("{name}: raw double candidate failed verification => tagged only");
             None
         } else if packed_sites == 0 && raw && {
@@ -26640,6 +26651,17 @@ type MappedOsrDeclines = HashMap<(usize, u32), std::sync::Weak<BytecodeFunction>
 static MAPPED_OSR_DECLINED: egcl_rt::execution_local::ExecutionLocal<RefCell<MappedOsrDeclines>> =
     unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(HashMap::new())) };
 
+/// Double-float loops whose T2 version is being compiled, keyed like
+/// `MAPPED_OSR_DECLINED`. The T0 loop looks for it every
+/// `MAPPED_OSR_T2_POLL` back-edges and leaves the set when it enters or
+/// declines (bliss-vwpaz).
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+static MAPPED_OSR_AWAITING_T2: egcl_rt::execution_local::ExecutionLocal<RefCell<MappedOsrDeclines>> =
+    unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(HashMap::new())) };
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+const MAPPED_OSR_T2_POLL: u32 = 256;
+
 /// Bodies whose T0 activation is currently running in mapped code entered by
 /// OSR. A guard that fails there resumes the rest of the activation in a
 /// nested T0 run; entering native code again from that run would nest one
@@ -26854,16 +26876,84 @@ fn maybe_mapped_osr(
     if is_profile_pinned(owner) {
         return decline();
     }
-    // Mapped code keeps tagged homes: its double-float arithmetic is slower
-    // than T0's, and raw-double T2 code has no loop-header entries to move on
-    // to. A loop T0 has seen compute with doubles stays interpreted.
-    if (0..act.func.code.len() as u32)
-        .any(|bcp| type_profile_at(body_ptr, bcp).is_some_and(|profile| profile.double_float > 0))
-    {
+    // Mapped T1 keeps tagged homes, and its double-float arithmetic is slower
+    // than T0's. A loop T0 has seen compute with doubles goes straight to T2
+    // instead, whose OSR companion unboxes the loop's doubles (bliss-vwpaz):
+    // the T0 loop keeps running while the worker compiles, then enters it.
+    let awaiting = MAPPED_OSR_AWAITING_T2.with(|awaiting| awaiting.borrow().get(&key)
+        .and_then(std::sync::Weak::upgrade)
+        .is_some_and(|body| Arc::ptr_eq(&body, &act.func)));
+    if awaiting && egcl_rt::function::back_edge_count(fn_obj.unwrap()) % MAPPED_OSR_T2_POLL != 0 {
+        return None;
+    }
+    let double_loop = awaiting || (0..act.func.code.len() as u32)
+        .any(|bcp| type_profile_at(body_ptr, bcp).is_some_and(|profile| profile.double_float > 0));
+    // A re-warmed double loop would re-enter through generic mapped T1.
+    if double_loop && reentry > 0 {
         return decline();
     }
     poll_t2_completions();
     let mut installed = NATIVE_REGISTRY.with(|registry| registry.borrow().get(&owner).cloned());
+    // EGCL_T2=1 stays deterministic: this loop waits for the T2 it queued,
+    // as a promoting dispatch does.
+    if double_loop && (egcl_t2_forced() || forced_tier() == Some(ForcedTier::T2))
+        && installed.as_ref().is_none_or(|native| !native.is_t2) && t2_enabled()
+        && (T2_QUEUED.with(|queued| queued.borrow().contains_key(&owner))
+            || request_t2_compilation(owner, u64::from(egcl_rt::function::back_edge_count(fn_obj.unwrap())) << 32))
+    {
+        if let Some(native) = wait_for_t2(owner) {
+            installed = Some(native);
+        }
+        if !current_definition() || !owner_current() {
+            return decline();
+        }
+    }
+    if double_loop {
+        let forget = || MAPPED_OSR_AWAITING_T2.with(|awaiting| awaiting.borrow_mut().remove(&key));
+        match installed.as_ref() {
+            Some(native) if native.is_t2 => {
+                forget();
+                let has_entry = matches!(&native._storage, NativeCodeStorage::Mapped(code)
+                    if code.has_osr_entry(target_bcp));
+                if !has_entry {
+                    return decline();
+                }
+                if t2_log_target().is_some() {
+                    t2_log_write(format_args!(
+                        "{}: double-float loop enters T2 by OSR at header {target_bcp}",
+                        display_fn_name(&act.func.name)
+                    ));
+                }
+            }
+            _ => {
+                if !t2_enabled() || T2_DECLINED.with(|declined| declined.borrow().contains(&owner)) {
+                    forget();
+                    return decline();
+                }
+                if !T2_QUEUED.with(|queued| queued.borrow().contains_key(&owner)) {
+                    let count = egcl_rt::function::back_edge_count(fn_obj.unwrap());
+                    let priority = (u64::from(count) << 32)
+                        | u64::from(egcl_rt::function::invoke_count(fn_obj.unwrap()));
+                    if !request_t2_compilation(owner, priority) {
+                        forget();
+                        return decline();
+                    }
+                    if t2_log_target().is_some() {
+                        t2_log_write(format_args!(
+                            "{}: double-float loop at header {target_bcp} awaits T2 in T0",
+                            display_fn_name(&act.func.name)
+                        ));
+                    }
+                }
+                MAPPED_OSR_AWAITING_T2.with(|awaiting| {
+                    let mut awaiting = awaiting.borrow_mut();
+                    awaiting.retain(|_, body| body.strong_count() > 0);
+                    awaiting.insert(key, Arc::downgrade(&act.func));
+                });
+                return None;
+            }
+        }
+    }
     // Re-entering after a guard deopt: code whose guards have failed would
     // fail again at once. Replace it with generic T1, as a numeric phase
     // change does, so the loop leaves T0 and its re-warmed profile leads the
@@ -26930,6 +27020,11 @@ fn maybe_mapped_osr(
         &native, target_bcp, act.frame, &act.handlers, &mut act.dyn_binds, env_frame, env,
     ) {
         native_transfer_entry::interpreter_osr::InterpreterOsr::Declined => decline(),
+        native_transfer_entry::interpreter_osr::InterpreterOsr::NotNow => {
+            // Retry a threshold later rather than on every back-edge.
+            egcl_rt::function::reset_back_edge_count(fn_obj.unwrap());
+            None
+        }
         native_transfer_entry::interpreter_osr::InterpreterOsr::Retired(result) => {
             super::events::record(super::events::EventKind::Osr, sym, u64::from(target_bcp), 0);
             Some(Ok(OsrOutcome::Retired(result)))
