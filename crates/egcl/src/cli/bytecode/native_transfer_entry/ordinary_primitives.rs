@@ -15,8 +15,7 @@ fn symbols() -> &'static Vec<(OrdinaryPrimitive, u32)> {
         OrdinaryPrimitive::ALL
             .into_iter()
             .map(|primitive| {
-                let name = format!("%EGCL-ORDINARY-{primitive:?}").to_ascii_uppercase();
-                (primitive, egcl_rt::symbols::intern(&name))
+                (primitive, egcl_rt::symbols::intern(&primitive.adapter_name()))
             })
             .collect()
     })

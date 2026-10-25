@@ -1514,7 +1514,7 @@ unsafe fn trace_object(
         }
 
         // ── Symbol: name/value/function/plist/package are references; the
-        //    trailing flags/tls_index words are raw (§1.7). ──
+        //    trailing flags/binding_guard words are raw (§1.7). ──
         tid::SYMBOL => {
             for i in 0..5 {
                 visit_word(i);

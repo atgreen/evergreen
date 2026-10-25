@@ -570,7 +570,12 @@ pub struct SymbolData {
     pub plist: EgclVal,
     pub package: EgclVal,
     pub flags: u32,
-    pub tls_index: u32,
+    /// Compiled-code access guard (bliss-csc8v). The low 31 bits count the
+    /// executions that currently hold a dynamic binding of this symbol; bit 31
+    /// is set once the symbol is a constant. Zero means the value cell is the
+    /// value every execution sees and may assign, so native code reads and
+    /// writes the cell inline and calls the runtime only otherwise.
+    pub binding_guard: core::sync::atomic::AtomicU32,
 }
 
 /// Symbol flag bits.

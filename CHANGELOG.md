@@ -20,6 +20,16 @@
   than 5 minutes. A loop that increments a special variable still runs at
   about 1 us per iteration
   ([#637](https://github.com/atgreen/evergreen/pull/637)).
+- On x86-64 Linux, compiled code reads and assigns a special variable
+  directly in its value cell when no thread or fiber has it dynamically
+  bound, instead of calling into the runtime for every access. Bound,
+  unbound and constant variables still take the runtime path, so `let`,
+  `progv`, per-thread bindings, unbound-variable errors and assignments to
+  constants behave as before. 10,000,000 iterations of
+  `(dotimes (i n) (incf *x* i))` take 0.6 s instead of 9.1 s, in a function
+  or at top level, and a loop that only reads a special takes 0.35 s instead
+  of 3.4 s
+  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
 
 ## 0.0.11 - 2026-10-24
 

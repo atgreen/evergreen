@@ -18814,6 +18814,14 @@ impl Drop for ActiveNativeCode<'_> {
 #[cfg(test)]
 thread_local! {
     static MV_CLEAR_HELPER_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Runtime global reads and assignments from native code, which the inline
+    /// value-cell path skips (bliss-csc8v).
+    static GLOBAL_ACCESS_HELPER_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn count_global_access_helper_call() {
+    GLOBAL_ACCESS_HELPER_CALLS.with(|calls| calls.set(calls.get() + 1));
 }
 
 /// c2i adapter: call the interpreted function named by `sym` with `n` arguments
@@ -18842,6 +18850,8 @@ extern "C" fn c2i_clear_mv() {
 /// allocating and side-effect-free, so — like `c2i_clear_mv` — it needs no GC
 /// stack map: r14/r15 are callee-saved and rsp stays 16-aligned across the call.
 extern "C" fn c2i_load_global(sym: u64) -> u64 {
+    #[cfg(test)]
+    count_global_access_helper_call();
     match egcl_rt::symbols::symbol_value(sym as u32).filter(|v| *v != egcl_rt::value::UNBOUND) {
         Some(v) => v.0,
         None => {
@@ -18878,7 +18888,55 @@ extern "C" fn c2i_load_function(sym: u64) -> u64 {
         .0
 }
 
+/// The symbol object whose value cell T1 may access inline (bliss-csc8v), or
+/// `None` to keep the helper call. Linux x86-64 only for now.
+#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
+fn t1_inline_special_object(sym: u32) -> Option<u64> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    egcl_rt::symbols::inline_access_object(sym).map(|object| object as u64)
+}
+
+/// `rax = object.value` when `object.binding_guard` has no binding count and the
+/// cell is bound, then jump to `done`; otherwise fall through to `slow`, where
+/// the helper reads the execution's binding or signals UNBOUND-VARIABLE. Clobbers
+/// only rax, like the helper call it skips.
+#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
+fn emit_t1_inline_special_load(c: &mut Asm, object: u64, slow: Label, done: Label) {
+    let guard = u8::try_from(egcl_rt::symbols::SYMBOL_BINDING_GUARD_OFFSET).unwrap();
+    let value = u8::try_from(egcl_rt::symbols::SYMBOL_VALUE_OFFSET).unwrap();
+    c.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64 (symbol object)
+    c.extend_from_slice(&object.to_le_bytes());
+    c.extend_from_slice(&[0xF7, 0x40, guard]); // test dword [rax+guard], imm32
+    c.extend_from_slice(&egcl_rt::symbols::BINDING_GUARD_COUNT_MASK.to_le_bytes());
+    c.jcc(Cc::Ne, slow);
+    c.extend_from_slice(&[0x48, 0x8B, 0x40, value]); // mov rax, [rax+value]
+    c.extend_from_slice(&[0x48, 0x83, 0xF8]); // cmp rax, imm8 (UNBOUND)
+    c.push(u8::try_from(egcl_rt::value::UNBOUND_BITS).unwrap());
+    c.jcc(Cc::Ne, done);
+}
+
+/// `object.value = rsi` and jump to `done` when `object.binding_guard` is zero:
+/// no execution binds the symbol and it is not a constant. Otherwise fall
+/// through to `slow`, whose helper writes the binding or rejects the constant.
+/// Registry value cells are minor-GC roots, so the store needs no barrier.
+/// Clobbers only rax; rsi still holds the value for the helper.
+#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
+fn emit_t1_inline_special_store(c: &mut Asm, object: u64, slow: Label, done: Label) {
+    let guard = u8::try_from(egcl_rt::symbols::SYMBOL_BINDING_GUARD_OFFSET).unwrap();
+    let value = u8::try_from(egcl_rt::symbols::SYMBOL_VALUE_OFFSET).unwrap();
+    c.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64 (symbol object)
+    c.extend_from_slice(&object.to_le_bytes());
+    c.extend_from_slice(&[0x83, 0x78, guard, 0x00]); // cmp dword [rax+guard], 0
+    c.jcc(Cc::Ne, slow);
+    c.extend_from_slice(&[0x48, 0x89, 0x70, value]); // mov [rax+value], rsi
+    c.jmp(done);
+}
+
 extern "C" fn c2i_store_global(sym: u64, val: u64) {
+    #[cfg(test)]
+    count_global_access_helper_call();
     if let Err(error) = egcl_rt::symbols::set_symbol_value_checked(sym as u32, EgclVal(val)) {
         stash_native_error(error);
     }
@@ -24684,12 +24742,22 @@ fn emit_native(
             }
             // Read a global/special var's value cell → push (bliss-x5y.15). Same
             // non-allocating call contract as ClearMv (r14/r15 callee-saved).
+            // An interned symbol nobody has bound dynamically is read straight
+            // from its value cell; the helper handles bindings and UNBOUND
+            // (bliss-csc8v).
             Instr::LoadGlobal(sym) => {
+                let done = c.label();
+                if let Some(object) = t1_inline_special_object(*sym) {
+                    let slow = c.label();
+                    emit_t1_inline_special_load(&mut c, object, slow, done);
+                    c.bind(slow);
+                }
                 c.extend_from_slice(&[0xBF]); // mov edi, imm32 (sym) — zero-extends
                 c.extend_from_slice(&sym.to_le_bytes());
                 c.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64 (c2i_load_global)
                 c.extend_from_slice(&load_global_addr.to_le_bytes());
                 emit_c2i_helper_call(&mut c);
+                c.bind(done);
                 push_rax(&mut c); // result → operand stack
             }
             // `#'f` — identical shape to LoadGlobal, reading the symbol's
@@ -24711,11 +24779,18 @@ fn emit_native(
             // value). A side effect, so the function is not speculated.
             Instr::StoreGlobal(sym) => {
                 pop_into(&mut c, 6, false); // value → rsi (arg 2)
+                let done = c.label();
+                if let Some(object) = t1_inline_special_object(*sym) {
+                    let slow = c.label();
+                    emit_t1_inline_special_store(&mut c, object, slow, done);
+                    c.bind(slow);
+                }
                 c.extend_from_slice(&[0xBF]); // mov edi, imm32 (sym, arg 1)
                 c.extend_from_slice(&sym.to_le_bytes());
                 c.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64 (c2i_store_global)
                 c.extend_from_slice(&store_global_addr.to_le_bytes());
                 emit_c2i_helper_call(&mut c);
+                c.bind(done);
             }
             Instr::Go {
                 tagbody_id,

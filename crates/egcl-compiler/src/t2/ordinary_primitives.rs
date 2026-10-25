@@ -23,6 +23,12 @@ pub enum OrdinaryPrimitive {
 }
 
 impl OrdinaryPrimitive {
+    /// The interned name of the private symbol whose adapter implements this
+    /// operation, e.g. `%EGCL-ORDINARY-LOADGLOBAL`.
+    pub fn adapter_name(self) -> String {
+        format!("%EGCL-ORDINARY-{self:?}").to_ascii_uppercase()
+    }
+
     pub const ALL: [Self; 9] = [
         Self::LoadGlobal,
         Self::StoreGlobal,
