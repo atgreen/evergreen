@@ -466,3 +466,66 @@ fn osr_entry_rechecks_a_proof_made_before_the_loop() {
     assert!(output.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
     assert!(stdout.contains("BOUND 6 51 T"), "{stdout}");
 }
+
+/// Top-level loops and loops in closures leave T0 mid-loop (bliss-of682).
+/// Each form below is its own top-level form, run once: a compiled thunk
+/// gets a private identity for the run, so its hot loop enters mapped code by
+/// OSR, including inside TIME (which now compiles) and around specials,
+/// calls, consing, non-local exits and a mid-loop deopt. The output must
+/// match the tree-walker's, and the log must show the entries.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn toplevel_and_closure_loops_enter_native_code_and_match_interpretation() {
+    let program = r#"
+(defvar *tl-special* 0)
+(defun tl-step (s i) (+ s i))
+(defun tl-run-it (f) (catch 'tl-tag (funcall f)))
+(defun tl-make-summer () (lambda (n) (let ((s 0)) (dotimes (i n s) (incf s i)))))
+(let ((s 0)) (dotimes (i 3000) (incf s i)) (print s))
+(print (time (let ((s 0)) (dotimes (i 3000 s) (incf s i)))))
+(print (multiple-value-list (time (let ((s 0)) (dotimes (i 3000 (values s :mv)) (incf s i))))))
+(dotimes (i 3000) (incf *tl-special* i))
+(print *tl-special*)
+(print (let ((s 0)) (dotimes (i 3000 s) (setf s (tl-step s i)))))
+(print (let ((r nil)) (dotimes (i 3000 (list (length r) (reduce #'+ r :key #'car))) (push (cons i i) r))))
+(print (loop for i below 3000 sum i))
+(print (let ((n 3000)) (loop for i below n collect (* i i) into xs finally (return (reduce #'+ xs)))))
+(print (let ((s 0)) (dotimes (i 3000 s) (incf s (if (< i 2500) 1 0.5)))))
+(print (block out (dotimes (i 3000) (when (= i 2500) (return-from out (list :out i))))))
+(print (tl-run-it (lambda () (let ((s 0)) (dotimes (i 3000) (incf s i) (when (= i 2500) (throw 'tl-tag (list s i))))))))
+(print (handler-case (let ((s 0)) (dotimes (i 3000 s) (incf s i) (when (= i 2500) (error "boom ~a" s)))) (error (e) (princ-to-string e))))
+(print (let ((s 0)) (dotimes (i 60) (dotimes (j 60) (incf s (* i j)))) s))
+(print (list (funcall (tl-make-summer) 3000) (funcall (tl-make-summer) 3000)))
+(print (labels ((run (n) (let ((s 0)) (dotimes (i n s) (incf s i))))) (run 3000)))
+"#;
+    let file = std::env::temp_dir().join(format!("egcl-toplevel-osr-{}.lisp", std::process::id()));
+    std::fs::write(&file, program).unwrap();
+    let run = |tier: Option<&str>| {
+        let mut command = Command::new(BIN);
+        command
+            .args(["--no-init", "--load"])
+            .arg(&file)
+            .env_remove("EGCL_FORCE_TIER")
+            .env("EGCL_OSR_THRESHOLD", "1000")
+            .env("EGCL_LOG", "osr=debug");
+        if let Some(tier) = tier {
+            command.env("EGCL_FORCE_TIER", tier);
+        }
+        let output = command.output().expect("run top-level loops");
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(output.status.success(), "{stderr}");
+        let stdout = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| !line.contains("seconds of") && !line.contains("bytes consed"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        (stdout, stderr)
+    };
+    let (tiered, log) = run(None);
+    let (oracle, _) = run(Some("interp"));
+    std::fs::remove_file(&file).unwrap();
+    assert_eq!(tiered, oracle, "{log}");
+    let toplevel = log.matches("<toplevel>: T0 activation entered mapped").count();
+    assert!(toplevel >= 10, "top-level loops must enter native code ({toplevel}):\n{log}");
+    assert!(log.contains("<lambda>: T0 activation entered mapped"), "{log}");
+}

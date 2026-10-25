@@ -831,6 +831,74 @@ fn write_str_to(stream: EgclVal, s: &str, env: &mut Env) -> Result<(), EgclError
     }
 }
 
+/// Run `evaluate` as TIME's form: print a real/run/GC-time + bytes-consed
+/// report to *trace-output* and return the form's values (bliss-kfy4). The
+/// TIME special form evaluates its form here, and so does the bytecode
+/// backend's top-level TIME, which compiles the form (bliss-of682).
+fn eval_timed(
+    env: &mut Env,
+    evaluate: impl FnOnce(&mut Env) -> Result<EgclVal, EgclError>,
+) -> Result<EgclVal, EgclError> {
+    let start = time_sample()?;
+    // Root the result AND the saved multiple values: the report write
+    // below allocates (make_lisp_string / arena_str), which can move
+    // nursery objects (GC-safety; bliss-6b2).
+    egcl_rt::rooted!(result = evaluate(env)?);
+    let saved_mv_active = env.mv_active;
+    egcl_rt::rooted!(saved_mv = std::mem::take(&mut env.mv));
+    write_time_report(env, start)?;
+    env.mv = std::mem::take(&mut *saved_mv);
+    env.mv_active = saved_mv_active;
+    Ok(*result)
+}
+
+/// What TIME reads before and after its form: internal real and run time,
+/// bytes allocated, minor and major collection counts, and total pause time.
+/// Every word is a plain integer, so compiled TIME carries the starting sample
+/// as a list of fixnums (`EGCL::%TIME-START`, bliss-of682).
+type TimeSample = [i64; 6];
+
+fn time_sample() -> Result<TimeSample, EgclError> {
+    let real = egcl_stdlib::time::get_internal_real_time();
+    let run = egcl_stdlib::time::get_internal_run_time()?;
+    let g = egcl_rt::heap_stats();
+    Ok([
+        real,
+        run,
+        g.bytes_allocated as i64,
+        g.minor_gc_count as i64,
+        g.major_gc_count as i64,
+        (g.total_minor_pause_us + g.total_major_pause_us) as i64,
+    ])
+}
+
+/// Print TIME's report for the interval since `start` to *trace-output*.
+/// Allocates; the caller roots its live values.
+fn write_time_report(env: &mut Env, start: TimeSample) -> Result<(), EgclError> {
+    let [t0_real, t0_run, b0, minor0, major0, pause0] = start;
+    let [t1_real, t1_run, b1, minor1, major1, pause1] = time_sample()?;
+    // internal-time-units-per-second is 1000 (milliseconds).
+    let secs = |units: i64| units as f64 / 1000.0;
+    let consed = (b1 as u64).saturating_sub(b0 as u64);
+    let minor = (minor1 as u64).saturating_sub(minor0 as u64);
+    let major = (major1 as u64).saturating_sub(major0 as u64);
+    let gc_us = (pause1 as u64).saturating_sub(pause0 as u64);
+    let report = format!(
+        "\nEvaluation took:\n  \
+         {:.6} seconds of real time\n  \
+         {:.6} seconds of total run time\n  \
+         {} bytes consed\n  \
+         {} minor GCs, {} major GCs, {:.6} seconds of GC time\n",
+        secs(t1_real - t0_real),
+        secs(t1_run - t0_run),
+        consed,
+        minor,
+        major,
+        gc_us as f64 / 1_000_000.0,
+    );
+    write_trace_output(env, &report)
+}
+
 /// Write a diagnostic report to `*TRACE-OUTPUT*` (falling back to
 /// `*STANDARD-OUTPUT*`, then process stdout). Used by TIME/ROOM (bliss-kfy4).
 /// Gray-stream aware. Allocates (the string), so callers must root any live
@@ -22609,6 +22677,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 return eval_builtin_arguments(&name, cdr, env)
             }
             "EGCL::%SYM-BY-INDEX" => return eval_builtin_arguments(&name, cdr, env),
+            "EGCL::%TIME-START" | "EGCL::%TIME-REPORT" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::%FN-LAMBDA-LIST" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::%NATIVE-MUTEX" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::%NATIVE-FIBER" => {
@@ -26395,42 +26464,8 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 // consed report to *trace-output*, and return FORM's values
                 // (bliss-kfy4). A special form — it controls FORM's evaluation.
                 let (form, _rest) = cp(cdr);
-                let t0_real = egcl_stdlib::time::get_internal_real_time();
-                let t0_run = egcl_stdlib::time::get_internal_run_time()?;
-                let g0 = egcl_rt::heap_stats();
-                // Root the result AND the saved multiple values: the report write
-                // below allocates (make_lisp_string / arena_str), which can move
-                // nursery objects (GC-safety; bliss-6b2).
-                egcl_rt::rooted!(result = eval_form(form, env)?);
-                let saved_mv_active = env.mv_active;
-                egcl_rt::rooted!(saved_mv = std::mem::take(&mut env.mv));
-                let t1_real = egcl_stdlib::time::get_internal_real_time();
-                let t1_run = egcl_stdlib::time::get_internal_run_time()?;
-                let g1 = egcl_rt::heap_stats();
-                // internal-time-units-per-second is 1000 (milliseconds).
-                let secs = |units: i64| units as f64 / 1000.0;
-                let consed = g1.bytes_allocated.saturating_sub(g0.bytes_allocated);
-                let minor = g1.minor_gc_count.saturating_sub(g0.minor_gc_count);
-                let major = g1.major_gc_count.saturating_sub(g0.major_gc_count);
-                let gc_us = (g1.total_minor_pause_us + g1.total_major_pause_us)
-                    .saturating_sub(g0.total_minor_pause_us + g0.total_major_pause_us);
-                let report = format!(
-                    "\nEvaluation took:\n  \
-                     {:.6} seconds of real time\n  \
-                     {:.6} seconds of total run time\n  \
-                     {} bytes consed\n  \
-                     {} minor GCs, {} major GCs, {:.6} seconds of GC time\n",
-                    secs(t1_real - t0_real),
-                    secs(t1_run - t0_run),
-                    consed,
-                    minor,
-                    major,
-                    gc_us as f64 / 1_000_000.0,
-                );
-                write_trace_output(env, &report)?;
-                env.mv = std::mem::take(&mut *saved_mv);
-                env.mv_active = saved_mv_active;
-                return Ok(*result);
+                egcl_rt::rooted!(form = form);
+                return eval_timed(env, |env| eval_form(*form, env));
             }
             "ROOM" => {
                 // (room &optional verbose): print heap occupancy to *trace-output*
