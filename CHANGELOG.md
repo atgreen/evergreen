@@ -532,6 +532,8 @@
 
 ### Fixed
 
+- `(abs -0d0)` returns `0.0d0`, as `(abs -0.0)` already returned `0.0`; it
+  returned `-0.0d0` ([#629](https://github.com/atgreen/evergreen/pull/629)).
 - A function whose optimized code arrives while one of its loops is still
   running inside a call from another function no longer crashes with
   "ordinary entry is not an OSR destination". The running loop now jumps into
