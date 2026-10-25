@@ -241,19 +241,10 @@ fn single_float_calls_return_one_value_at_the_admitted_tier() {
         ("=", "(= x 3.0)", "3.0", "t"),
         ("+", "(+ x 2)", "3.0", "5.0"),
     ] {
-        // The mapped Linux emitter does not yet admit float literals or
-        // float specialization (bliss-w67f1). The mixed call keeps genuine
-        // generic T1 execution for the two shapes without a float literal.
-        // Checked platforms retain their existing T2 contract.
-        let native_tiers = if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
-            if call == "(+ x 2)" {
-                [1, 1, 0, 0]
-            } else {
-                [0; 4]
-            }
-        } else {
-            [2; 4]
-        };
+        // Every platform installs these at T2. The mapped x86-64 Linux
+        // emitter admits single-float literals and guarded single-float
+        // arithmetic, including a mixed fixnum operand (bliss-w67f1, #590).
+        let native_tiers = [2; 4];
         check_values_in_tiers(
             name,
             call,
