@@ -33,6 +33,17 @@ pub(crate) fn after_wait_park() {
     }
 }
 
+/// Runs in SIGNAL after the permits are added to the count and before any is
+/// handed to a waiter.
+static AFTER_SEMAPHORE_COUNT_RAISED: Mutex<Option<Hook>> = Mutex::new(None);
+
+pub(crate) fn after_semaphore_count_raised() {
+    let hook = AFTER_SEMAPHORE_COUNT_RAISED.lock().unwrap().take();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 pub(super) fn before_wake_claim() {
     let hook = BEFORE_WAKE_CLAIM.with(|slot| slot.borrow_mut().take());
     if let Some(hook) = hook {
@@ -238,6 +249,32 @@ fn only_one_waker_claims_a_wait_that_is_still_mounted() {
         pool.submit(fiber).unwrap();
         let claims = join_fiber(fiber).unwrap().as_fixnum();
         assert_eq!(claims, 2, "expected first=true second=false, got code {claims}");
+        pool.shutdown_and_join().unwrap();
+    });
+}
+
+/// A TRY-WAIT that takes SIGNAL's permit between SIGNAL raising the count and
+/// handing that permit to a parked waiter: the permit goes to exactly one of
+/// them and the count never goes negative (bliss-8f1c1).
+#[test]
+fn signal_does_not_hand_off_a_permit_try_wait_already_took() {
+    isolated("signal_does_not_hand_off_a_permit_try_wait_already_took", || {
+        assert!(SEMAPHORE.set(EgclSemaphore::new(None, 0).unwrap()).is_ok());
+        let (pool, fiber, descriptor, _token) = start_parked(semaphore_entry);
+        let stolen = Arc::new(AtomicBool::new(false));
+        let thief = Arc::clone(&stolen);
+        *AFTER_SEMAPHORE_COUNT_RAISED.lock().unwrap() = Some(Box::new(move || {
+            thief.store(SEMAPHORE.get().unwrap().try_wait(1).unwrap(), Ordering::Release);
+        }));
+        SEMAPHORE.get().unwrap().signal(1).unwrap();
+        assert!(stolen.load(Ordering::Acquire), "the hook's TRY-WAIT took the permit");
+        let count = SEMAPHORE.get().unwrap().count();
+        assert_eq!(count, 0, "one permit, taken once, left the count at {count}");
+        assert!(parked_unmounted(&descriptor), "the waiter was also given the permit");
+        // A second permit is the waiter's.
+        SEMAPHORE.get().unwrap().signal(1).unwrap();
+        assert_eq!(join_fiber(fiber).unwrap().as_fixnum(), 1);
+        assert_eq!(SEMAPHORE.get().unwrap().count(), 0);
         pool.shutdown_and_join().unwrap();
     });
 }
