@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Added
+
+- `install-egcl-forks` now installs EGCL adapters for Archive filesystem
+  metadata, ZIP file permissions, unix-opts arguments and exit status,
+  with-user-abort interrupt handling, local-time subsecond precision, and
+  Parachute exit status ([#638](https://github.com/atgreen/evergreen/pull/638)).
+
 ### Performance
 
 - On x86-64 Linux, a long-running loop that computes with double-floats,
