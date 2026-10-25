@@ -26,11 +26,11 @@
   unbound and constant variables still take the runtime path, so `let`,
   `progv`, per-thread bindings, unbound-variable errors and assignments to
   constants behave as before. 10,000,000 iterations of
-  `(dotimes (i n) (incf *x* i))` take 0.6 s instead of 9.1 s, in a function
-  or at top level, and a loop that only reads a special takes 0.35 s instead
-  of 3.4 s. A loop that runs inside a `let` binding of a special variable
+  `(dotimes (i n) (incf *x* i))` take 0.6 s instead of 9.3 s, in a function
+  or at top level, and a loop that only reads a special takes 0.36 s instead
+  of 3.3 s. A loop that runs inside a `let` binding of a special variable
   now leaves the interpreter like any other hot loop: 10,000,000 iterations
-  of `(let ((*x* 0)) (dotimes (i n) (incf *x* i)))` take 8 s instead of 21 s
+  of `(let ((*x* 0)) (dotimes (i n) (incf *x* i)))` take 8.4 s instead of 22 s
   ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
 
 ## 0.0.11 - 2026-10-24
