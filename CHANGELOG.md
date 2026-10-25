@@ -35,6 +35,14 @@
 
 ### Fixed
 
+- An internal error inside compiled code that a native function called no
+  longer aborts the process. It is reported as an ordinary Lisp error, as it
+  already was for compiled code called from the interpreter. Making a closure
+  also no longer fails outright when a garbage collection it starts cannot
+  run, for example because another thread did not stop in time; the
+  collection is retried at the next allocation
+  ([#644](https://github.com/atgreen/evergreen/pull/644); reported in
+  [#609](https://github.com/atgreen/evergreen/issues/609)).
 - `read-line` on a Gray stream, such as a flexi-streams stream, now reports
   end of file. It returns `eof-value` when `eof-error-p` is false and signals
   `end-of-file` otherwise. Before, it returned an empty string forever, so a
