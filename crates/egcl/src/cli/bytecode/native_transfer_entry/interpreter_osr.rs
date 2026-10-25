@@ -27,6 +27,9 @@ use super::*;
 pub(in crate::cli::bytecode) enum InterpreterOsr {
     /// Not admitted; the activation is untouched and keeps interpreting.
     Declined,
+    /// Not admitted for the values the activation holds now; a later
+    /// back-edge may enter. The activation is untouched.
+    NotNow,
     /// The mapped activation owned and retired the T0 frame. The T0
     /// activation is complete with this result.
     Retired(Result<EgclVal, EgclError>),
@@ -123,11 +126,32 @@ pub(in crate::cli::bytecode) fn enter(
     {
         return InterpreterOsr::Declined;
     }
+    // A raw double home imports only a double-float (bliss-vwpaz). Another
+    // datum there now is a property of this iteration, not of the body.
+    if !destination.osr_imports_admit(header, |slot| unsafe { slot_get(frame, slot) }) {
+        return InterpreterOsr::NotNow;
+    }
+    // The raw imports' current words, compared (never dereferenced) after
+    // `prepare` to show a collection relocated them in place (osr=debug).
+    let raw_words = |slots: &[u16]| -> Vec<u64> {
+        slots.iter().map(|&slot| unsafe { slot_get(frame, slot) }.0).collect()
+    };
+    let raw_slots = destination.osr_raw_doubles.get(&header).filter(|_| {
+        egcl_rt::log::enabled("osr", egcl_rt::log::DEBUG)
+    });
+    let before = raw_slots.map(|slots| raw_words(slots));
     // Reserve every ledger while failure still means "keep interpreting".
     // `prepare` may collect: the frame's slots are scanned where they are.
     let Ok(state) = ActivationState::prepare(destination, env) else {
         return InterpreterOsr::Declined;
     };
+    if let (Some(slots), Some(before)) = (raw_slots, before) {
+        let after = raw_words(slots);
+        egcl_rt::blog!("osr", egcl_rt::log::DEBUG,
+            "{}: raw double imports at header {header}: slots {slots:?} {} ({before:#x?} -> {after:#x?})",
+            display_fn_name(&destination.body.name),
+            if before == after { "unmoved" } else { "relocated before entry" });
+    }
     let mut state = Box::new(state);
     // The ledger is reserved for every BindSpecial of the body, so moving the
     // live guards into it below cannot allocate.

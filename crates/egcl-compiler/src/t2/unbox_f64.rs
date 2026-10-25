@@ -32,9 +32,10 @@
 //!
 //! The function must verify on entry; [`optimize`] returns `false`, leaving
 //! the function unusable, if the result does not verify, and the caller then
-//! discards this candidate. Only the x86-64 Linux mapped full-entry artifact
-//! consumes raw values, so OSR entries are dropped here: a raw loop header
-//! cannot import tagged interpreter slots.
+//! discards this candidate. Only the x86-64 Linux mapped artifact consumes
+//! raw values. OSR entries are kept, their header states naming the raw
+//! values: the full-call code drops them, and its OSR companion unboxes the
+//! interpreter's double-floats on entry (bliss-vwpaz).
 
 use super::frame_state::ValueSource;
 use super::ir::{
@@ -282,8 +283,9 @@ fn convert_params(f: &mut Function) {
     if candidates.is_empty() {
         return;
     }
-    // Raw headers cannot import tagged interpreter slots.
-    f.osr_entries.clear();
+    // OSR entries stay: a header state that names a converted parameter
+    // marks it `UnboxedF64` below, and the mapped entry unboxes that
+    // interpreter slot on import (bliss-vwpaz).
     let entry_state = f.entry_frame_state;
     let mut entry_unboxed: HashMap<Value, Value> = HashMap::new();
     let mut ordered: Vec<Value> = candidates.iter().copied().collect();
@@ -748,7 +750,11 @@ mod tests {
         let named_raw = f.frame_states.iter().any(|(_, state)| state.scopes[0].locals.iter().any(|source|
             matches!(source, ValueSource::Value { value, repr: Repr::UnboxedF64 } if *value == s)));
         assert!(named_raw, "{}", render(&f));
-        assert!(f.osr_entries.is_empty());
+        // A loop header keeps its OSR entry, whose state names the raw
+        // accumulator for the entry to unbox (bliss-vwpaz).
+        assert!(f.osr_entries.iter().all(|entry| f.frame_states.get(entry.frame_state).scopes[0]
+            .locals.iter().all(|source| !matches!(source,
+                ValueSource::Value { value, repr: Repr::Tagged } if *value == s))));
     }
 
     #[test]

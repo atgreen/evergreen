@@ -309,6 +309,9 @@ pub(super) struct TransferCode {
     pub(super) has_deopt: bool,
     bcp_offsets: Vec<u32>,
     osr_entries: HashMap<u32, usize>,
+    /// Per OSR header, the locals an entry unboxes into raw double homes
+    /// (bliss-vwpaz). Each must hold a double-float when the entry is taken.
+    osr_raw_doubles: HashMap<u32, Vec<u16>>,
     // OSR imports use managed activation homes, independently of full-call ABI.
     osr_companion: Option<Box<TransferCode>>,
     osr_polls: HashMap<usize, u32>,
@@ -962,6 +965,20 @@ impl TransferCode {
         self.osr_companion.as_deref().unwrap_or(self)
     }
 
+    /// Whether a running loop can enter this version at `header`.
+    pub(super) fn has_osr_entry(&self, header: u32) -> bool {
+        self.osr_destination().osr_entries.contains_key(&header)
+    }
+
+    /// Whether an activation whose local `slot` holds `local(slot)` may
+    /// enter OSR header `header` of this destination: every local the entry
+    /// unboxes into a raw double home holds a double-float (bliss-vwpaz). A
+    /// loop whose accumulator is momentarily a fixnum keeps running where it is.
+    pub(super) fn osr_imports_admit(&self, header: u32, local: impl Fn(u16) -> EgclVal) -> bool {
+        self.osr_raw_doubles.get(&header)
+            .is_none_or(|slots| slots.iter().all(|&slot| local(slot).is_double_float()))
+    }
+
     /// Whether a guard of this version, or of the companion its loops are
     /// entered in, has failed (bliss-k51a).
     pub(super) fn has_deopted(&self) -> bool {
@@ -1141,6 +1158,56 @@ impl TransferCode {
         call_cells: &[(u32, Arc<egcl_rt::call_table::CallCell>)],
         allow_recursion: bool,
         tier: CompilationTier,
+    ) -> Result<Self, EmitDecline> {
+        let has_raw = (0..ir.num_values()).any(|index| ir.value(
+            egcl_compiler::t2::ir::Value(index as u32)).repr
+                != egcl_compiler::t2::ir::ValueRepresentation::Tagged);
+        if !has_raw || ir.osr_entries.is_empty() {
+            return Self::try_emit_prepared_entries(body, roots, ir, ordinary_ir, deopt_metadata,
+                call_cells, allow_recursion, tier, false);
+        }
+        // Raw doubles (bliss-vwpaz): the full-call code is emitted exactly as
+        // without loop headers, and a separate mapped owner with raw homes
+        // imports a running lower-tier loop, unboxing its double locals. A
+        // declined companion leaves a full-call-only version, as before.
+        let mut primary_ir = ir.clone();
+        primary_ir.osr_entries.clear();
+        let mut code = Self::try_emit_prepared_entries(Arc::clone(&body), Arc::clone(&roots),
+            &primary_ir, ordinary_ir, deopt_metadata.clone(), call_cells, allow_recursion, tier, false)?;
+        match Self::try_emit_prepared_entries(Arc::clone(&body), roots, ir, None, deopt_metadata,
+            call_cells, allow_recursion, tier, true)
+        {
+            Ok(companion) if !companion.osr_entries.is_empty() => {
+                t2_log_write(format_args!(
+                    "{}: raw double OSR companion emitted; headers={:?}",
+                    display_fn_name(&body.name), companion.osr_entries.keys().collect::<Vec<_>>()
+                ));
+                code.osr_companion = Some(Box::new(companion));
+            }
+            Ok(_) => t2_log_write(format_args!(
+                "{}: raw double OSR companion has no emittable loop header",
+                display_fn_name(&body.name)
+            )),
+            Err(decline) => t2_log_write(format_args!(
+                "{}: raw double OSR companion declined ({decline})", display_fn_name(&body.name)
+            )),
+        }
+        Ok(code)
+    }
+
+    /// `raw_osr` admits raw double values together with OSR entries: the
+    /// mapped-only companion of a raw-double version (bliss-vwpaz).
+    #[allow(clippy::too_many_arguments)]
+    fn try_emit_prepared_entries(
+        body: Arc<BytecodeFunction>,
+        roots: Arc<ActiveBytecodeRoot>,
+        ir: &egcl_compiler::t2::ir::Function,
+        ordinary_ir: Option<&egcl_compiler::t2::ir::Function>,
+        deopt_metadata: Option<Arc<T2InstalledMetadata>>,
+        call_cells: &[(u32, Arc<egcl_rt::call_table::CallCell>)],
+        allow_recursion: bool,
+        tier: CompilationTier,
+        raw_osr: bool,
     ) -> Result<Self, EmitDecline> {
         let exec = |buffer: Option<JitBuffer>| buffer.ok_or(EmitDecline::ExecutableMemory);
         // Every normal mapped entry clears the complete MV buffer before
@@ -1423,7 +1490,7 @@ impl TransferCode {
                 != egcl_compiler::t2::ir::ValueRepresentation::Tagged);
         let storage = if has_raw {
             if !matches!(tier, CompilationTier::T2) || deopt_metadata.is_none()
-                || !ir.osr_entries.is_empty() || !packed_f64_native_body(&body, ir)
+                || (!ir.osr_entries.is_empty() && !raw_osr) || !packed_f64_native_body(&body, ir)
             {
                 return Err(EmitDecline::RawValues);
             }
@@ -1547,6 +1614,20 @@ impl TransferCode {
         }).collect();
         // Fixed for this code's lifetime, and every activation sizes buffers by
         // them: count once here, not by scanning the bytecode on each call.
+        let osr_entries: HashMap<u32, usize> = emitted.osr_entries.into_iter().collect();
+        let osr_raw_doubles = ir.osr_entries.iter()
+            .filter(|entry| osr_entries.contains_key(&entry.bcp))
+            .filter_map(|entry| {
+                let state = ir.frame_states.get(entry.frame_state);
+                let slots: Vec<u16> = state.scopes.first()?.locals.iter().enumerate()
+                    .filter(|(_, source)| matches!(source,
+                        egcl_compiler::t2::frame_state::ValueSource::Value { repr, .. }
+                            if *repr == egcl_compiler::t2::ir::ValueRepresentation::UnboxedF64))
+                    .map(|(slot, _)| slot as u16)
+                    .collect();
+                (!slots.is_empty()).then_some((entry.bcp, slots))
+            })
+            .collect();
         let special_binds = body.code.iter()
             .filter(|op| matches!(op, Instr::BindSpecial(_))).count();
         let catch_pushes = body.code.iter()
@@ -1574,7 +1655,8 @@ impl TransferCode {
             _native_calls: Arc::new(emitted.native_calls.ok_or(EmitDecline::NativeCallSites)?),
             has_deopt: emitted.has_deopt,
             bcp_offsets: emitted.bcp_offsets,
-            osr_entries: emitted.osr_entries.into_iter().collect(),
+            osr_entries,
+            osr_raw_doubles,
             osr_companion,
             osr_polls,
             _veneer: veneer,
@@ -1977,11 +2059,10 @@ impl TransferCode {
         if error.is_none() {
             return Err(invalid_capture());
         }
-        // This path currently admits only tagged values. A future
-        // unboxed emitter must supply its boxing/emergency contract.
+        // A raw double home (bliss-vwpaz) is reboxed as deopt does.
         egcl_rt::rooted!(
             frames = unsafe { &mut *context.snapshots.cast::<SysvSiteSnapshot>().add(index) }
-                .reconstruct(|_| unreachable!("tagged-only entry"))
+                .reconstruct(egcl_rt::gc::alloc_double_float)
                 .map_err(|_| invalid_capture())?
         );
         let site = self.sites.sites().nth(index).ok_or_else(invalid_capture)?;
@@ -3922,6 +4003,7 @@ unsafe fn prepare_osr(image: *const SysvTransferCapture) -> bool {
     let [frame] = frames.as_slice() else { return false };
     if frame.resume_pc != *header || frame.locals.len() != usize::from(code.body.n_locals)
         || !frame.stack.is_empty()
+        || !destination.osr_imports_admit(*header, |slot| frame.locals.get(usize::from(slot)).copied().unwrap_or(NIL))
     {
         return false;
     }

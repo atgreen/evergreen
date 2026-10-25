@@ -67,6 +67,8 @@ pub enum ConversionKind {
     BoxFloat,
     /// Widen a 32-bit integer to 64-bit.
     WidenI32ToI64,
+    /// Unbox a heap double-float to its raw f64 payload (bliss-vwpaz).
+    UnboxDouble,
 }
 
 impl ConversionKind {
@@ -78,19 +80,17 @@ impl ConversionKind {
     /// ad-hoc matches, or a representation one side learns about and the other
     /// does not becomes a miscompile visible only on an OSR'd loop.
     ///
-    /// Returns `None` when this conversion vocabulary cannot express the
-    /// import. That is the case for `UnboxedF64`: export reboxes it by
-    /// heap-allocating a double-float, but `ConversionKind` distinguishes only
-    /// `UnboxFloat` (the single-float immediate), so there is no inverse. A
-    /// caller that gets `None` must decline the OSR entry rather than transfer
-    /// the slot unconverted.
+    /// `UnboxedF64` imports by `UnboxDouble`: export reboxes it by
+    /// heap-allocating a double-float, and the import reads that object's
+    /// payload back. An emitter that cannot perform a conversion must decline
+    /// the OSR entry rather than transfer the slot unconverted.
     pub fn for_repr(repr: ValueRepresentation) -> Option<ConversionKind> {
         use ValueRepresentation as R;
         match repr {
             R::Tagged => Some(ConversionKind::None),
             R::UnboxedFixnum => Some(ConversionKind::UnboxFixnum),
             R::UnboxedF32 => Some(ConversionKind::UnboxFloat),
-            R::UnboxedF64 => None,
+            R::UnboxedF64 => Some(ConversionKind::UnboxDouble),
         }
     }
 }
@@ -198,12 +198,13 @@ mod tests {
                     Rebox::ReboxF32,
                     Some(ConversionKind::UnboxFloat),
                 ) => {}
-                // Export can rebox an f64 (it heap-allocates a double-float);
-                // the `ConversionKind` vocabulary has no single/double
-                // distinction, so there is no import conversion that can undo
-                // it. `None` records that honestly and the OSR entry is
-                // declined rather than emitted wrong.
-                (ValueRepresentation::UnboxedF64, Rebox::ReboxF64, None) => {}
+                // Export heap-allocates a double-float; import reads its
+                // payload back (bliss-vwpaz).
+                (
+                    ValueRepresentation::UnboxedF64,
+                    Rebox::ReboxF64,
+                    Some(ConversionKind::UnboxDouble),
+                ) => {}
                 other => panic!("import/export disagree for {repr:?}: {other:?}"),
             }
         }
