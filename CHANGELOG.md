@@ -41,7 +41,7 @@
   also no longer fails outright when a garbage collection it starts cannot
   run, for example because another thread did not stop in time; the
   collection is retried at the next allocation
-  ([#VJPR](https://github.com/atgreen/evergreen/pull/VJPR); reported in
+  ([#644](https://github.com/atgreen/evergreen/pull/644); reported in
   [#609](https://github.com/atgreen/evergreen/issues/609)).
 - `read-line` on a Gray stream, such as a flexi-streams stream, now reports
   end of file. It returns `eof-value` when `eof-error-p` is false and signals
