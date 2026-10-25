@@ -51,7 +51,7 @@
   An `egcl-thread:try-semaphore` in another thread or fiber could take a
   permit that `signal-semaphore` was about to hand to a waiting fiber; both
   then had it and the semaphore's count went negative
-  ([#SEMPR](https://github.com/atgreen/evergreen/pull/SEMPR)).
+  ([#648](https://github.com/atgreen/evergreen/pull/648)).
 - A fiber's timed wait now has exactly one outcome when its timeout expires
   just as it is woken. Before, `condition-wait` with `:timeout` could return
   true for a fiber whose timeout had already ended the wait, although the
