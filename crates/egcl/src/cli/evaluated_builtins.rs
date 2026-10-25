@@ -5880,10 +5880,24 @@ fn resolve(name: &str) -> Option<Handler> {
             let eof_error_p = if args.len() > 1 { args[1] } else { T };
             let inp = resolve_input_stream(stream, env);
             if is_gray_stream(inp) {
-                // The Gray stream-read-line returns (values string eof-p);
-                // invoke_generic_function yields the primary value (the line).
-                let line = invoke_generic_function("STREAM-READ-LINE", &[inp], env)?;
-                return Ok(line);
+                // The Gray STREAM-READ-LINE returns (values string missing-newline-p),
+                // and at end of file an empty string with a true second value.
+                // READ-LINE turns that into END-OF-FILE or eof-value; returning
+                // the empty string instead made every read loop over a Gray
+                // stream spin forever at EOF (bliss-w0i7).
+                env.clear_mv();
+                egcl_rt::rooted!(line = invoke_generic_function("STREAM-READ-LINE", &[inp], env)?);
+                let missing_newline = env.mv_active && env.mv.get(1).is_some_and(|v| !v.is_nil());
+                if missing_newline && line.is_string() && val_as_str(*line).is_empty() {
+                    if eof_error_p.is_nil() {
+                        let eof_value = if args.len() > 2 { args[2] } else { NIL };
+                        env.set_mv(vec![eof_value, T]);
+                        return Ok(eof_value);
+                    }
+                    return Err(EgclError::StreamError("end of file on READ-LINE".into()));
+                }
+                env.set_mv(vec![*line, if missing_newline { T } else { NIL }]);
+                return Ok(*line);
             }
             let (line_val, missing_newline) = egcl_stdlib::stream_read_line(inp)?;
             if line_val == EOF {

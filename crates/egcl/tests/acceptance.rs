@@ -9223,6 +9223,44 @@ fn gray_input_stream_routes_read_functions_through_generics() {
 }
 
 #[test]
+fn gray_read_line_reports_end_of_file() {
+    // STREAM-READ-LINE returns an empty string and a true second value at end
+    // of file; READ-LINE must turn that into eof-value or END-OF-FILE. It used
+    // to return "" forever, so cl-unicode's parse loop never ended (bliss-w0i7).
+    let prog = r#"(progn
+       (defclass chars-in (fundamental-character-input-stream)
+         ((cs :initarg :cs :accessor ci-cs)))
+       (defmethod stream-read-char ((s chars-in)) (or (pop (ci-cs s)) :eof))
+       (defclass lines-in (fundamental-character-input-stream)
+         ((ls :initarg :ls :accessor li-ls)))
+       (defmethod stream-read-line ((s lines-in))
+         (if (li-ls s) (values (pop (li-ls s)) nil) (values "" t)))
+       (let ((c (make-instance 'chars-in :cs (coerce (format nil "ab~%~%cd") 'list)))
+             (l (make-instance 'lines-in :ls (list "x" ""))))
+         (format t "~s|~s|~s|~s|~s|~s|~s|~s"
+                 (multiple-value-list (read-line c nil :eof))
+                 (multiple-value-list (read-line c nil :eof))
+                 (multiple-value-list (read-line c nil :eof))
+                 (multiple-value-list (read-line c nil :eof))
+                 (handler-case (read-line c) (end-of-file () :signalled))
+                 (multiple-value-list (read-line l nil :eof))
+                 (multiple-value-list (read-line l nil :eof))
+                 (multiple-value-list (read-line l nil :eof)))))"#;
+    let output = egcl_bin()
+        .args(["--eval", prog])
+        .output()
+        .expect("run egcl");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains(
+            r#"("ab" NIL)|("" NIL)|("cd" T)|(:EOF T)|:SIGNALLED|("x" NIL)|("" NIL)|(:EOF T)"#
+        ),
+        "expected READ-LINE on a Gray stream to report end of file, got stdout: '{stdout}', stderr: '{err}'"
+    );
+}
+
+#[test]
 fn gray_stream_instances_are_streams_for_method_dispatch() {
     // FUNDAMENTAL-STREAM sits under STREAM, as on every host with Gray streams:
     // a method specialized on STREAM applies to a Gray instance (AllegroServe's
