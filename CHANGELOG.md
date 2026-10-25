@@ -99,12 +99,12 @@
   driver of a double-float step function take 6.1 s instead of 21.5 s. A
   loop inside the same function's `handler-case`, `unwind-protect`, `catch`
   or special binding, a loop that computes with double-floats, and a loop at
-  top level still run interpreted ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  top level still run interpreted ([#630](https://github.com/atgreen/evergreen/pull/630)).
 - On x86-64 Linux, a function whose loop uses `push`, `decf` or `loop ...
   collect` now gets the fast register calling convention when it is optimized,
   as other loops already did, so calling it is cheaper: 100,000 calls of a
   50-iteration `push` loop take 0.34 s instead of 0.50 s
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#630](https://github.com/atgreen/evergreen/pull/630)).
 - `loop ... collect` no longer calls `rplacd` and `last` for every element it
   collects: a collected element is a fresh one-element list, so it becomes the
   new tail directly. A compiled `(loop repeat 50 collect x)` drops from about
