@@ -19,7 +19,7 @@
   instead of 18.9 s, and `(loop for i below n sum i)` 0.23 s instead of more
   than 5 minutes. A loop that increments a special variable still runs at
   about 1 us per iteration
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#637](https://github.com/atgreen/evergreen/pull/637)).
 
 ## 0.0.11 - 2026-10-24
 
