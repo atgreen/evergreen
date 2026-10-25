@@ -13,8 +13,11 @@
 //! Admission is deliberately narrow. The activation must hold only the local
 //! BLOCK and TAGBODY records the destination's scope map expects before the
 //! header: those have no runtime registration (no token, no catch tag, no
-//! condition cluster, no saved cleanup and no special binding), so moving the
-//! frame moves the whole dynamic state. Anything else stays interpreted.
+//! condition cluster and no saved cleanup), so moving the frame moves the
+//! whole dynamic state. Its own special bindings may also be live, exactly
+//! the ones the scope map names: their guards move to the mapped activation's
+//! binding ledger, which deoptimization hands back the same way (bliss-csc8v).
+//! Anything else stays interpreted.
 
 use super::*;
 
@@ -30,49 +33,72 @@ pub(in crate::cli::bytecode) enum InterpreterOsr {
 }
 
 /// Whether the T0 records `handlers` are exactly the local BLOCK/TAGBODY
-/// scopes the destination maps before `header`, in order.
-fn handlers_match_scopes(code: &TransferCode, header: u32, handlers: &[Handler]) -> bool {
-    let Some(scopes) = code.control_scopes.before(header) else { return false };
+/// scopes the destination maps before `header`, in order, and `bindings` are
+/// exactly its live special bindings. Returns each binding's push PC.
+fn handlers_match_scopes(
+    code: &TransferCode,
+    header: u32,
+    handlers: &[Handler],
+    bindings: &[ScopedDynBind],
+) -> Option<Vec<u32>> {
+    let scopes = code.control_scopes.before(header)?;
     let mut records = handlers.iter();
+    let mut binds = bindings.iter();
+    let mut depth = 0;
+    let mut push_bcps = Vec::with_capacity(bindings.len());
     for scope in scopes {
         if scope.ownership != Ownership::Local {
-            return false;
+            return None;
         }
         match scope.kind {
             // The activation's EnvFrame moves with the state.
             ScopeKind::LexicalEnvironment => continue,
-            ScopeKind::Block { id, register: false, .. } => {
-                let Some(Handler::Block { block_id, token, .. }) = records.next() else { return false };
-                if *block_id != id || !token.is_empty() {
-                    return false;
+            // A binding T0 established inside the same handler records the
+            // mapped ledger would have counted (`validate_special_bindings`).
+            ScopeKind::SpecialBinding { symbol } => {
+                let binding = binds.next()?;
+                if binding.guard.idx != symbol || binding.handler_depth != depth {
+                    return None;
                 }
+                push_bcps.push(scope.push_bcp);
+            }
+            ScopeKind::Block { id, register: false, .. } => {
+                let Some(Handler::Block { block_id, token, .. }) = records.next() else { return None };
+                if *block_id != id || !token.is_empty() {
+                    return None;
+                }
+                depth += 1;
             }
             ScopeKind::Tagbody { id } => {
                 let Some(Handler::Tag { tagbody_id, token: None, tag_bcps, .. }) = records.next() else {
-                    return false;
+                    return None;
                 };
                 if *tagbody_id != id || !tag_bcps.is_empty() {
-                    return false;
+                    return None;
                 }
+                depth += 1;
             }
-            _ => return false,
+            _ => return None,
         }
     }
-    records.next().is_none()
+    (records.next().is_none() && binds.next().is_none()).then_some(push_bcps)
 }
 
 /// Enter `native`'s mapped code at loop `header` with the T0 activation whose
 /// frame is `frame`. The caller has checked that the operand stack is empty,
 /// that the frame is the activation's own and that it holds no cleanup
-/// continuation or dynamic binding.
+/// continuation.
 ///
-/// On `Retired` the frame has been popped and the result is the activation's;
-/// on `Declined` nothing has changed.
+/// On `Retired` the frame has been popped, the activation's special bindings
+/// (`bindings`, left empty) were owned and released by the mapped activation,
+/// and the result is the activation's; on `Declined` nothing has changed.
+/// `bindings` stays where the caller roots it until nothing more can collect.
 pub(in crate::cli::bytecode) fn enter(
     native: &NativeCode,
     header: u32,
     frame: *mut Frame,
     handlers: &[Handler],
+    bindings: &mut Vec<ScopedDynBind>,
     env_frame: Option<Arc<SharedCell<EnvFrame>>>,
     env: &mut Env,
 ) -> InterpreterOsr {
@@ -83,10 +109,12 @@ pub(in crate::cli::bytecode) fn enter(
     };
     if !native_transfer::is_supported()
         || !local_control_native_body(&destination.body, true, true, false)
-        || !handlers_match_scopes(destination, header, handlers)
     {
         return InterpreterOsr::Declined;
     }
+    let Some(push_bcps) = handlers_match_scopes(destination, header, handlers, bindings) else {
+        return InterpreterOsr::Declined;
+    };
     let stack = egcl_rt::current_stack();
     // The activation's frame must be the top one: no Special frame (a
     // binding or condition cluster) sits above it.
@@ -101,6 +129,11 @@ pub(in crate::cli::bytecode) fn enter(
         return InterpreterOsr::Declined;
     };
     let mut state = Box::new(state);
+    // The ledger is reserved for every BindSpecial of the body, so moving the
+    // live guards into it below cannot allocate.
+    if state.specials.capacity() < bindings.len() {
+        return InterpreterOsr::Declined;
+    }
     state.env_frame = env_frame;
     egcl_rt::rooted_ref!(_state = &mut *state);
     let slots = destination.slots.max(unsafe { (*frame).num_locals });
@@ -112,6 +145,11 @@ pub(in crate::cli::bytecode) fn enter(
         return InterpreterOsr::Declined;
     }
     drop(_state);
+    // Hand the live bindings over without restoring them: the mapped activation
+    // now unbinds each at its UnbindSpecial or on unwind, and a deoptimization
+    // returns them to a rebuilt T0 activation. A move, not an allocation.
+    state.specials.extend(push_bcps.into_iter().zip(bindings.drain(..))
+        .map(|(push_bcp, binding)| SavedSpecial { push_bcp, binding }));
     if let Some(symbol) = destination.installed_symbol {
         OSR_ENTRY_COUNTS.with(|counts| {
             let mut counts = counts.borrow_mut();

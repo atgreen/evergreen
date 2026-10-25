@@ -18053,7 +18053,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                 // OSR (bliss-izt.1): once this loop is hot and the operand stack
                 // is empty, finish the activation in native code instead of
                 // interpreting the rest of the loop.
-                match maybe_osr(&acts[top_idx], target_bcp, env) {
+                match maybe_osr(&mut acts[top_idx], target_bcp, env) {
                     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
                     Some(Ok(OsrOutcome::Retired(result))) => {
                         // The mapped activation already popped this frame.
@@ -26513,7 +26513,7 @@ fn run_native_osr(
 /// compile and enter OSR native code to finish this activation (bliss-izt.1).
 /// `None` means not (yet) eligible — the caller keeps interpreting.
 fn maybe_osr(
-    act: &Activation,
+    act: &mut Activation,
     target_bcp: u32,
     env: &mut Env,
 ) -> Option<Result<OsrOutcome, EgclError>> {
@@ -26565,7 +26565,7 @@ impl Drop for MappedOsrActive {
 /// there its loop heat promotes it to T2 by the existing mapped OSR.
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 fn maybe_mapped_osr(
-    act: &Activation,
+    act: &mut Activation,
     target_bcp: u32,
     env: &mut Env,
 ) -> Option<Result<OsrOutcome, EgclError>> {
@@ -26576,8 +26576,9 @@ fn maybe_mapped_osr(
     // The loop header state: a backward GO with an empty operand stack whose
     // TAGBODY is already the innermost record, so the GO has nothing left to
     // unwind, and no cleanup continuation or dynamic binding to carry.
+    // Live special bindings move with the frame (bliss-csc8v).
     if (target_bcp as usize) >= act.bcp || act.sp_top != 0
-        || !act.cleanup_conts.is_empty() || !act.dyn_binds.is_empty()
+        || !act.cleanup_conts.is_empty()
     {
         return None;
     }
@@ -26675,8 +26676,9 @@ fn maybe_mapped_osr(
     }
     MAPPED_OSR_ACTIVE.with(|active| active.borrow_mut().push(body_ptr));
     let _active = MappedOsrActive(body_ptr);
+    let env_frame = act.env_frame.clone();
     match native_transfer_entry::interpreter_osr::enter(
-        &native, target_bcp, act.frame, &act.handlers, act.env_frame.clone(), env,
+        &native, target_bcp, act.frame, &act.handlers, &mut act.dyn_binds, env_frame, env,
     ) {
         native_transfer_entry::interpreter_osr::InterpreterOsr::Declined => decline(),
         native_transfer_entry::interpreter_osr::InterpreterOsr::Retired(result) => {
