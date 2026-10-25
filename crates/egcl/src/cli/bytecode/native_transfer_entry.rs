@@ -962,6 +962,12 @@ impl TransferCode {
         self.osr_companion.as_deref().unwrap_or(self)
     }
 
+    /// Whether a guard of this version, or of the companion its loops are
+    /// entered in, has failed (bliss-k51a).
+    pub(super) fn has_deopted(&self) -> bool {
+        self.deopts.get() > 0 || self.osr_destination().deopts.get() > 0
+    }
+
     /// The code an active lower-tier loop enters by OSR: this code, or the
     /// mapped companion an ordinary entry retains for its loop headers.
     #[cfg(test)]
