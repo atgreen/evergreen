@@ -11,3 +11,15 @@ for port in ironclad@egcl pure-tls@egcl chipz@egcl archive@egcl zip@egcl unix-op
     "$repo/scripts/install-egcl-forks" --dry-run |
         grep -Fx "ocicl install git+https://github.com/atgreen/$port"
 done
+python3 - "$repo" <<'PY'
+import json
+from pathlib import Path
+import subprocess
+import sys
+repo = Path(sys.argv[1])
+commands = subprocess.check_output([repo / 'scripts/install-egcl-forks', '--dry-run'], text=True).splitlines()
+for entry in json.loads((repo / 'tests/audited-forks/forks.json').read_text()):
+    expected = f"ocicl install {entry['fork'].replace('https://', 'git+https://')}@{entry['branch']}"
+    assert commands.count(expected) == 1, expected
+print('All audited forks occur exactly once in installer output')
+PY

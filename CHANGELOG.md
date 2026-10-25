@@ -4,10 +4,12 @@
 
 ### Added
 
-- `install-egcl-forks` now installs EGCL adapters for Archive filesystem
-  metadata, ZIP file permissions, unix-opts arguments and exit status,
-  with-user-abort interrupt handling, local-time subsecond precision, and
-  Parachute exit status ([#638](https://github.com/atgreen/evergreen/pull/638)).
+- `install-egcl-forks` includes the audited ocicl libraries through maintained
+  EGCL forks. Adapters cover archive metadata, command-line handling, clocks,
+  readtable iteration, CLOS JSON encoding, type introspection and macro expansion;
+  libraries with portable implementations include focused compatibility checks.
+  The library guide records tested revisions and remaining capability limits
+  ([#638](https://github.com/atgreen/evergreen/pull/638)).
 
 ### Performance
 
