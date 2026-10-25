@@ -1567,15 +1567,12 @@ mod tests {
             let generation = input.generation;
             let input = egcl_rt::CrossThreadRoot::new(input);
             let artifact = input.with_gc_stable(compile_t2_artifact);
-            if checked_native_installation_allowed() {
-                assert!(install_t2_completion(T2Completion {
-                    sym: symbol, generation,
-                    artifact: Some(artifact.expect("compile checked captured callback")), input,
-                }).unwrap().is_t2);
-            } else {
-                assert!(artifact.is_none(), "captured callbacks require the Linux interpreter adapter");
-                assert!(try_promote_to_t1_with_speculation(symbol, false).is_none());
-            }
+            // Closure bodies that read captured bindings reach mapped native
+            // code on x86-64 Linux as well (#494).
+            assert!(install_t2_completion(T2Completion {
+                sym: symbol, generation,
+                artifact: Some(artifact.expect("compile captured callback")), input,
+            }).unwrap().is_t2);
         }
         egcl_rt::rooted!(args = [*function, EgclVal::from_fixnum(41)]);
         let cell = resolve(egcl_rt::symbols::intern("OBJECT-CALL-CALLER")).unwrap();
@@ -1613,17 +1610,10 @@ mod tests {
         let generation = input.generation;
         let input = egcl_rt::CrossThreadRoot::new(input);
         let artifact = input.with_gc_stable(compile_t2_artifact);
-        if captured && !checked_native_installation_allowed() {
-            assert!(artifact.is_none());
-            // Republish the exact bytecode body to exercise invalidation without
-            // pretending an unsupported captured body has acquired native code.
-            registry_put(symbol, registry_get(symbol).unwrap());
-        } else {
-            assert!(install_t2_completion(T2Completion {
-                sym: symbol, generation,
-                artifact: Some(artifact.expect("recompile callback")), input,
-            }).unwrap().is_t2);
-        }
+        assert!(install_t2_completion(T2Completion {
+            sym: symbol, generation,
+            artifact: Some(artifact.expect("recompile callback")), input,
+        }).unwrap().is_t2);
         TARGET_LOOKUPS.with(|count| count.set(0));
         let entry =
             unsafe { &*cell.checked_entry_address(false) }.load(std::sync::atomic::Ordering::Acquire);
