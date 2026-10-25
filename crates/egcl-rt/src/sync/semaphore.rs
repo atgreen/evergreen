@@ -134,17 +134,26 @@ impl EgclSemaphore {
             })
             .map_err(|_| EgclError::ProgramError("semaphore count overflow".into()))?;
 
+        #[cfg(all(test, egcl_fibers))]
+        crate::thread::wait_token_tests::after_semaphore_count_raised();
+
         let mut waiters = self.fiber_waiters.lock().unwrap();
         let mut remaining = permits;
-        while remaining > 0 {
-            match waiters.pop_front() {
-                Some(waiter) => {
-                    if waiter.wake() {
-                        self.count.fetch_sub(1, Ordering::AcqRel);
-                        remaining -= 1;
-                    }
-                }
-                None => break,
+        while remaining > 0 && !waiters.is_empty() {
+            // Take the permit out of the count before handing it over. TRY-WAIT
+            // does not take this lock, so a permit still in the count could
+            // also go to a concurrent acquirer, and the hand-off would then
+            // drive the count negative (bliss-8f1c1). If none is left, such an
+            // acquirer already has it, and the waiter stays queued.
+            if !self.try_wait(1)? {
+                break;
+            }
+            let waiter = waiters.pop_front().expect("checked non-empty");
+            if waiter.wake() {
+                remaining -= 1;
+            } else {
+                // Its deadline completed the wait first: keep the permit.
+                self.count.fetch_add(1, Ordering::AcqRel);
             }
         }
         for _ in 0..remaining {
