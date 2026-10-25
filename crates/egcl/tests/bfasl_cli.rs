@@ -416,8 +416,13 @@ fn load_time_values_are_initialized_once_per_fasl_load() {
     fs::remove_file(src).unwrap();
     let program = format!(
         r#"
+      ;; A LOAD-TIME-VALUE form sees the loader's dynamic bindings but not its
+      ;; lexical ones, so *LTV-DYNAMIC* must really be bound dynamically: an
+      ;; unproclaimed earmuffed name is bound lexically by LET (bliss-c3gyu).
       (setq *ltv-count* 0 ltv-global :global *ltv-dynamic* :outer)
-      (let ((ltv-global :lexical) (*ltv-dynamic* :dynamic)) (load {out:?}))
+      (let ((ltv-global :lexical) (*ltv-dynamic* :dynamic))
+        (declare (special *ltv-dynamic*))
+        (load {out:?}))
       (format t "LOAD-COUNT ~S~%" *ltv-count*)
       (setq *ltv-old* (ltv-a))
       (format t "CELLS ~S ~S ~S ~S~%" (ltv-a) (ltv-b) (eq (ltv-a) (ltv-a)) (eq (ltv-a) (ltv-b)))
