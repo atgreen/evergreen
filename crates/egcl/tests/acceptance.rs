@@ -9223,6 +9223,38 @@ fn gray_input_stream_routes_read_functions_through_generics() {
 }
 
 #[test]
+fn condition_survives_a_collection_in_its_slot_initform() {
+    // A slot initform that collects moves the freshly made condition; the
+    // constructor used to return its unrooted copy, so the second instance below
+    // came back as garbage (TYPE-OF T, class HEAP-OBJECT) and an ERROR of it
+    // escaped its own HANDLER-CASE (bliss-togth).
+    let prog = r#"(progn
+       (define-condition gc-cond (error)
+         ((a :initform (progn (egcl-ext:gc) (list 1 2)) :reader gc-cond-a)
+          (b :initarg :b :reader gc-cond-b)))
+       (defun try (i)
+         (let* ((c1 (make-condition 'gc-cond :b (list i (format nil "s~a" i))))
+                (c2 (make-condition 'gc-cond :b (list :two))))
+           (list (type-of c1) (gc-cond-a c1) (gc-cond-b c1)
+                 (type-of c2) (gc-cond-a c2) (gc-cond-b c2)
+                 (handler-case (error 'gc-cond :b (list :e i))
+                   (gc-cond (c) (list (type-of c) (gc-cond-b c)))))))
+       (format t "~s|~s" (try 0) (try 1)))"#;
+    let output = egcl_bin()
+        .args(["--eval", prog])
+        .output()
+        .expect("run egcl");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains(
+            r#"(GC-COND (1 2) (0 "s0") GC-COND (1 2) (:TWO) (GC-COND (:E 0)))|(GC-COND (1 2) (1 "s1") GC-COND (1 2) (:TWO) (GC-COND (:E 1)))"#
+        ),
+        "expected conditions intact after a collection in a slot initform, got stdout: '{stdout}', stderr: '{err}'"
+    );
+}
+
+#[test]
 fn gray_read_line_reports_end_of_file() {
     // STREAM-READ-LINE returns an empty string and a true second value at end
     // of file; READ-LINE must turn that into eof-value or END-OF-FILE. It used
