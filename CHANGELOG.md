@@ -35,6 +35,11 @@
 
 ### Fixed
 
+- `read-line` on a Gray stream, such as a flexi-streams stream, now reports
+  end of file. It returns `eof-value` when `eof-error-p` is false and signals
+  `end-of-file` otherwise. Before, it returned an empty string forever, so a
+  loop reading lines until `nil` never ended. Building cl-unicode's tables
+  from the Unicode data files hung this way (#GRAYPR).
 - A closure that has become garbage is now collected even if its body
   contains `progv`, and so is everything it captured. Before, such a closure
   was kept for the rest of the run. bordeaux-threads wraps every thread
