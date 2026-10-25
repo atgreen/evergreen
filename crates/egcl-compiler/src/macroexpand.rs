@@ -1392,6 +1392,10 @@ fn collect_body_declarations(items: &[EgclVal]) -> (usize, Vec<DeclInfo>) {
     (index, declarations)
 }
 
+// Index rather than iterate: `macroexpand_all` can collect, and the caller
+// keeps `items` rooted, so each `items[index]` read after it sees the
+// relocated value. An iterator's copy would be stale by the comparison.
+#[allow(clippy::needless_range_loop)]
 fn expand_body_items(
     items: &[EgclVal],
     declaration_end: usize,
