@@ -111,6 +111,38 @@ fails. Deoptimization must preserve both completed side effects and the next
 Lisp operation to execute. Raising compilation thresholds changes when work is
 compiled, not the intended semantics of the source.
 
+### Recursive macroexpansion { #macroexpand-all }
+
+**Function** `(egcl-ext:macroexpand-all form &optional environment)` → expanded form
+
+Recursively expands macros and symbol macros in executable positions of `form`.
+Unlike `macroexpand`, it descends into function arguments and bodies. It respects
+local macro definitions and lexical variable/function bindings; quoted data,
+parameter names, keyword names, and method specializers remain data. Compiler
+macros are not expanded.
+
+An omitted or `nil` environment means the global environment, including global
+symbol macros. A non-`nil` environment must be a live lexical environment received
+by a macro's `&environment` parameter. Its dynamic extent is unchanged by this
+function. Invalid environment objects signal `program-error`, and conditions
+signalled by expanders propagate to the caller.
+
+```lisp
+(defmacro plus-one (x) `(+ ,x 1))
+(egcl-ext:macroexpand-all '(list '(plus-one 2) (plus-one 2)))
+;; => (LIST '(PLUS-ONE 2) (+ 2 1))
+```
+
+`load-time-value` expressions are expanded in the global environment, without
+evaluating them. Atomic update forms (`egcl-ext:atomic-incf` and `atomic-decf`)
+require specialized place lowering and currently signal `program-error` when
+encountered in an executable position. They are never silently returned as
+fully expanded forms. Macro-defining forms (`defmacro` and
+`define-compiler-macro`) also signal `program-error`: their destructuring lambda
+lists do not yet have a complete recursive walker. Ordinary `macrolet` bindings
+and calls to existing macros are supported. The exact shape of other expansions
+is implementation specific and may change between releases.
+
 ### Declaration introspection { #declaration-introspection }
 
 These functions let a macro read declarations in force. They are the

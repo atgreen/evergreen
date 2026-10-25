@@ -5571,6 +5571,10 @@ fn resolve(name: &str) -> Option<Handler> {
             Ok(pn)
         }),
 
+        "EGCL-EXT:MACROEXPAND-ALL" => Some(|_operator, args, env| {
+            macroexpand_all_builtin(args, env)
+        }),
+
         "EGCL-EXT:DECLARATION-SPECIFIER" => Some(|_operator, args, _env| {
             let args = RootedVals::new(args.to_vec());
 

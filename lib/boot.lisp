@@ -6219,3 +6219,12 @@ WITH-LOCKED-HASH-TABLE on TABLE for its dynamic extent."
      ,@body))
 
 (export 'egcl-ext:with-locked-hash-table :egcl-ext)
+
+;;; Recursive macroexpansion for code-inspection and portability libraries.
+(export (intern "MACROEXPAND-ALL" :egcl-ext) :egcl-ext)
+(setf (documentation (intern "MACROEXPAND-ALL" :egcl-ext) 'function)
+      "Recursively expand FORM in optional lexical ENVIRONMENT (default NIL).
+Expands local and global macros and symbol macros; compiler macros are not expanded.
+Quoted data is preserved. LOAD-TIME-VALUE is expanded in the global environment.
+Signals PROGRAM-ERROR for atomic update places and macro-defining forms,
+whose syntax requires specialized lowering or a macro lambda-list walker.")
