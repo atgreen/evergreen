@@ -33,6 +33,19 @@
   of `(let ((*x* 0)) (dotimes (i n) (incf *x* i)))` take 8.4 s instead of 22 s
   ([#639](https://github.com/atgreen/evergreen/pull/639)).
 
+### Fixed
+
+- A closure that has become garbage is now collected even if its body
+  contains `progv`, and so is everything it captured. Before, such a closure
+  was kept for the rest of the run. bordeaux-threads wraps every thread
+  function in one, so each `bt:make-thread` leaked the thread's function and
+  its captures: about 54 KB per thread, or 20 KB per connection in a
+  thread-per-connection server. `progv` is now compiled. Closures the
+  interpreter builds are also freed once they are unreachable, during normal
+  garbage collection. Before, they were freed only between files loaded with
+  `load` ([#640](https://github.com/atgreen/evergreen/pull/640); reported in
+  [#634](https://github.com/atgreen/evergreen/issues/634)).
+
 ## 0.0.11 - 2026-10-24
 
 ### Added

@@ -1427,6 +1427,77 @@ mod reified_closure_rooting_tests {
     }
 }
 
+#[cfg(test)]
+mod closure_identity_gc_tests {
+    use super::*;
+
+    /// The registry key of a tree-walker closure's identity cons.
+    fn closure_id(identity: EgclVal) -> u64 {
+        cp(identity).1.as_fixnum() as u64
+    }
+
+    /// A tree-walker closure's registry entry keeps its captures alive, and
+    /// relocates them, exactly while its identity cons is live; once the cons
+    /// dies a collection drops the entry (GH #634).
+    #[test]
+    fn tree_closure_entry_lives_exactly_as_long_as_its_identity() {
+        let _lock = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env = &mut env);
+        egcl_rt::rooted!(body = reader::read_from_string("(held)").unwrap().0);
+        let captured = Arc::new(SharedCell::new(EnvFrame::default()));
+        // The captured frame is the only owner of the payload.
+        captured
+            .borrow_mut()
+            .vars
+            .insert("HELD".into(), arena_cons(EgclVal::from_fixnum(7), NIL));
+        let unrooted = captured.borrow().vars["HELD"];
+        egcl_rt::rooted!(identity = register_tree_closure(Closure {
+            params_form: NIL,
+            body: *body,
+            captured_frame: Arc::clone(&captured),
+            captured_specials: Vec::new(),
+            captured_blocks: Vec::new(),
+            captured_tags: Vec::new(),
+            captured_funs: Some(Arc::clone(&env.funs)),
+            captured_macros: None,
+        }));
+        let id = closure_id(*identity);
+        egcl_rt::gc::collect_t0_minor().unwrap();
+        let held = captured.borrow().vars["HELD"];
+        assert_ne!(held.to_raw(), unrooted.to_raw(), "the capture must actually move");
+        assert_eq!(cp(held), (EgclVal::from_fixnum(7), NIL), "the moved capture is intact");
+        assert!(closure_registry().borrow().contains_key(&id), "a live closure keeps its entry");
+        assert!(CLOSURE_IDENTITIES.borrow().contains_key(&id));
+
+        // The first collection promoted the identity, so only a major
+        // collection can find it dead.
+        drop(identity);
+        egcl_rt::gc::full_gc().unwrap();
+        assert!(!closure_registry().borrow().contains_key(&id), "a dead closure loses its entry");
+        assert!(!CLOSURE_IDENTITIES.borrow().contains_key(&id));
+        drop_dead_closures();
+
+        // An identity that dies in the nursery is found by a minor collection.
+        let young = register_tree_closure(Closure {
+            params_form: NIL,
+            body: *body,
+            captured_frame: Arc::new(SharedCell::new(EnvFrame::default())),
+            captured_specials: Vec::new(),
+            captured_blocks: Vec::new(),
+            captured_tags: Vec::new(),
+            captured_funs: Some(Arc::clone(&env.funs)),
+            captured_macros: None,
+        });
+        let young_id = closure_id(young);
+        assert!(closure_registry().borrow().contains_key(&young_id));
+        egcl_rt::gc::collect_t0_minor().unwrap();
+        assert!(!closure_registry().borrow().contains_key(&young_id));
+        assert!(!CLOSURE_IDENTITIES.borrow().contains_key(&young_id));
+        drop_dead_closures();
+    }
+}
+
 /// Resolve a function designator to its tiered function object (FnMeta), for the
 /// bliss-jtc.10 profiling-introspection builtins. Accepts an interpreted-function
 /// object directly (`#'foo`) or a symbol naming a global function (`'foo`).
@@ -13537,8 +13608,91 @@ fn register_tree_closure(mut closure: Closure) -> EgclVal {
     let marker = resolve_sym("EGCL::CLOSURE").unwrap_or(NIL);
     egcl_rt::rooted!(reference = arena_cons(marker, EgclVal::from_fixnum(id as i64)));
     drop(_construction_root);
+    // Nothing below allocates, so no collection can separate the entry from
+    // its identity record.
     closure_registry().borrow_mut().insert(id, closure);
+    track_closure_identity(id, *reference);
+    drop_dead_closures();
     *reference
+}
+
+// ── Collecting dead tree-walker closures ─────────────────────────
+//
+// A registry entry's params, body and captured frame are scanned as roots, so
+// they stay alive for as long as the entry exists. The entry is reachable from
+// Lisp only through its `(EGCL::CLOSURE . id)` cons, so once that cons dies the
+// entry is garbage too. `CLOSURE_IDENTITIES` holds each cons WEAKLY, and the
+// collector reports which ones died after every minor and major collection.
+// The hook then removes those entries, so whatever only they kept alive is
+// collected by the next collection, at runtime and not just at file-load
+// boundaries (GH #634). `prune_closure_registry`'s heap walk still covers
+// entries restored from an image, which have no identity record.
+//
+// The entry remains a strong root until its cons is seen dead, so a cons
+// reachable only from its own entry's captures (a closure stored in a variable
+// it closes over) is never seen dead; that needs ephemeron semantics.
+
+/// Each tracked tree-walker closure's identity cons, keyed by closure id. Not
+/// visited by any root scanner: the weak-container hook relocates the slots
+/// that survive and reports the ones that died.
+static CLOSURE_IDENTITIES: LazyLock<SharedCell<HashMap<u64, EgclVal, egcl_rt::fxhash::FxBuildHasher>>> =
+    LazyLock::new(|| SharedCell::new(HashMap::default()));
+
+/// Registry entries the collector found dead, removed during a collection and
+/// dropped later outside it, so no destructor runs inside the collector. Their
+/// heap references are stale and are never read.
+static DEAD_CLOSURES: Mutex<Vec<Closure>> = Mutex::new(Vec::new());
+
+fn track_closure_identity(id: u64, identity: EgclVal) {
+    if closure_prune_disabled() {
+        return;
+    }
+    static HOOK: std::sync::Once = std::sync::Once::new();
+    HOOK.call_once(|| egcl_rt::gc::register_weak_container_hook(drop_unreachable_closures));
+    CLOSURE_IDENTITIES.borrow_mut().insert(id, identity);
+}
+
+/// Weak-container hook: forget every tracked closure whose identity cons the
+/// collector found dead, and take its registry entry out of the root set.
+fn drop_unreachable_closures(resolve: &dyn Fn(*mut EgclVal) -> bool) {
+    let mut dead = Vec::new();
+    CLOSURE_IDENTITIES.borrow_mut().retain(|&id, identity| {
+        let live = resolve(identity);
+        if !live {
+            dead.push(id);
+        }
+        live
+    });
+    if dead.is_empty() {
+        return;
+    }
+    let mut removed = Vec::with_capacity(dead.len());
+    {
+        let registry = closure_registry();
+        let mut registry = registry.borrow_mut();
+        removed.extend(dead.iter().filter_map(|id| registry.remove(id)));
+    }
+    {
+        let mut tiers = TREE_CLOSURE_TIERS.borrow_mut();
+        for id in &dead {
+            tiers.remove(id);
+        }
+    }
+    DEAD_CLOSURES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .extend(removed);
+}
+
+/// Release the registry entries the collector removed. Called outside any
+/// collection.
+fn drop_dead_closures() {
+    let dead = std::mem::take(
+        &mut *DEAD_CLOSURES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+    );
+    drop(dead);
 }
 
 /// Tiering state of one tree-walker closure (bliss-wojl9): calls counted so
@@ -13716,9 +13870,11 @@ fn prune_closure_registry() -> (usize, usize) {
         let before = reg.borrow().len();
         reg.borrow_mut().retain(|id, _| live.contains(id));
         TREE_CLOSURE_TIERS.borrow_mut().retain(|id, _| live.contains(id));
+        CLOSURE_IDENTITIES.borrow_mut().retain(|id, _| live.contains(id));
         let after = reg.borrow().len();
         Some((before, after, live.len()))
     });
+    drop_dead_closures();
     let Ok(Some((before, after, live_count))) = result else {
         return (0, 0);
     };
@@ -20172,6 +20328,7 @@ fn mv_operator_preserves(name: &str) -> bool {
             | "CATCH"
             | "UNWIND-PROTECT"
             | "PROGV"
+            | "EGCL::%PROGV"
             | "TAGBODY"
             | "HANDLER-BIND"
             | "HANDLER-CASE"
@@ -22424,21 +22581,8 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 egcl_rt::rooted_ref!(_body_root = &mut body);
                 egcl_rt::rooted!(syms_v = eval_form(syms_form, env)?);
                 egcl_rt::rooted!(vals_v = eval_form(vals_form, env)?);
-                let syms = list_to_vec(*syms_v);
-                let vals = list_to_vec(*vals_v);
-                for sym in &syms {
-                    if !sym.is_symbol() || *sym == NIL || *sym == T {
-                        return Err(EgclError::TypeError {
-                            datum: *sym,
-                            expected: "SYMBOL".into(),
-                        });
-                    }
-                }
                 egcl_rt::rooted!(bindings = Vec::<DynBind>::new());
-                for (i, sym) in syms.iter().enumerate() {
-                    let value = vals.get(i).copied().unwrap_or(egcl_rt::value::UNBOUND);
-                    bindings.push(DynBind::establish(*sym, value));
-                }
+                progv_establish(*syms_v, *vals_v, &mut bindings)?;
                 let result = eval_progn(body, env);
                 // Duplicate symbols unwind in reverse binding order.
                 while bindings.pop().is_some() {}
@@ -22706,6 +22850,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             | "EGCL::%STRUCT-SLOT-TYPESPEC"
             | "EGCL::%MAKE-SIMPLE-ARRAY"
             | "EGCL::%MEMORY-FENCE"
+            | "EGCL::%PROGV"
             | "EGCL::%CAS-CAR"
             | "EGCL::%CAS-CDR"
             | "EGCL::%CAS-SVREF"
@@ -33968,6 +34113,54 @@ impl Drop for DynBind {
     }
 }
 
+/// Establish PROGV's dynamic bindings, pairing each symbol in `syms` with the
+/// corresponding element of `vals`. A symbol without a value is made unbound
+/// for the extent (CLHS PROGV); extra values are ignored. Every symbol is
+/// validated before any binding is made. `bindings` must already be rooted by
+/// the caller, which unwinds it in reverse order so duplicate symbols restore
+/// correctly. Shared by the evaluator's PROGV and `EGCL::%PROGV`, the entry the
+/// bytecode lowerer compiles PROGV to (GH #634).
+fn progv_establish(
+    syms: EgclVal,
+    vals: EgclVal,
+    bindings: &mut Vec<DynBind>,
+) -> Result<(), EgclError> {
+    let syms = list_to_vec(syms);
+    for sym in &syms {
+        if !sym.is_symbol() || *sym == NIL || *sym == T {
+            return Err(EgclError::TypeError {
+                datum: *sym,
+                expected: "SYMBOL".into(),
+            });
+        }
+    }
+    egcl_rt::rooted!(vals = list_to_vec(vals));
+    for (i, sym) in syms.iter().enumerate() {
+        let value = vals.get(i).copied().unwrap_or(egcl_rt::value::UNBOUND);
+        bindings.push(DynBind::establish(*sym, value));
+    }
+    Ok(())
+}
+
+/// `(egcl::%progv symbols values thunk)`: call `thunk` with PROGV's bindings in
+/// effect and return its values. The bindings are undone on every exit,
+/// including a non-local transfer or error propagating out of the thunk.
+fn call_progv(args: &[EgclVal], env: &mut Env) -> Result<EgclVal, EgclError> {
+    if args.len() != 3 {
+        return Err(EgclError::ProgramError(format!(
+            "EGCL::%PROGV requires three arguments; got {}",
+            args.len()
+        )));
+    }
+    egcl_rt::rooted!(thunk = args[2]);
+    egcl_rt::rooted!(bindings = Vec::<DynBind>::new());
+    progv_establish(args[0], args[1], &mut bindings)?;
+    env.clear_mv();
+    let result = apply_function(*thunk, &[], env);
+    while bindings.pop().is_some() {}
+    result
+}
+
 /// `saved` is a heap-capable value held for the whole body evaluation; a
 /// rooted `Vec<DynBind>` keeps it precise across allocation, so the restore on
 /// drop writes back a relocated — not stale — value (moving GC; bliss-8qf).
@@ -42746,6 +42939,11 @@ fn apply_function_impl(
         // Check for closure: (EGCL::CLOSURE . id)
         if lh.is_symbol() && sym_name(lh) == "EGCL::CLOSURE" && lr.is_fixnum() {
             let id = lr.as_fixnum() as u64;
+            // The registry entry lives only while its identity cons does, and a
+            // collection drops it once the cons dies. Tiering up below can
+            // allocate before the entry is read, so keep the cons alive here
+            // rather than relying on the caller's copy being a root.
+            egcl_rt::rooted!(_identity = fn_val);
             let generic_name = generic_wrapper_cache().borrow().names.get(&id).cloned();
             if let Some(name) = generic_name {
                 return invoke_generic_function(&name, args, env);
@@ -43137,6 +43335,7 @@ fn is_builtin_function(name: &str) -> bool {
             | "EGCL::%STRUCT-SLOT-TYPESPEC"
             | "EGCL::%MAKE-SIMPLE-ARRAY"
             | "EGCL::%MEMORY-FENCE"
+            | "EGCL::%PROGV"
             | "EGCL::%CAS-CAR"
             | "EGCL::%CAS-CDR"
             | "EGCL::%CAS-SVREF"
@@ -43319,7 +43518,9 @@ fn apply_builtin_fast(
         // See evaluated_builtins.rs: without these, COMPILED code reaches LIST
         // and GETF through the synthesize-and-re-evaluate detour, at 8.67us and
         // 7.31us against 0.035us for CAR.
-        "LIST" | "GETF" => {
+        // Compiled PROGV (GH #634): keep it off the synthesize-and-evaluate
+        // detour, which a tree-walker-free build does not have.
+        "LIST" | "GETF" | "EGCL::%PROGV" => {
             env.clear_mv();
             evaluated_builtins::call(name, args, env)
         }

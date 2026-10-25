@@ -10451,6 +10451,90 @@ fn progv_binds_and_restores_special_variables() {
     );
 }
 
+/// Bytes of Lisp heap kept per dropped closure, for each closure shape, as
+/// `LABEL BYTES` lines. Each closure captures a fresh 10,000-character string,
+/// so a closure that is never collected keeps about 40 KB.
+const CLOSURE_RETENTION_PROGRAM: &str = r#"
+(defvar *payload* nil)
+(defun heap-bytes ()
+  (egcl-ext:gc :full t)
+  (let ((text (with-output-to-string (*standard-output*) (room))) (total 0))
+    (dolist (label '("nursery:" "old generation:" "large objects:") total)
+      (let ((at (search label text)))
+        (when at
+          (incf total (parse-integer text :start (+ at (length label))
+                                          :junk-allowed t)))))))
+(defun churn (label make)
+  (let ((before (heap-bytes)))
+    (dotimes (i 2000) (funcall make (make-string 10000)))
+    (format t "~&~a ~d~%" label (round (- (heap-bytes) before) 2000))))
+(churn "plain" (lambda (v) (lambda () (length v))))
+(churn "progv" (lambda (v) (lambda () (progv '(*payload*) (list 1) (length v)))))
+(churn "progv-outer" (lambda (v) (progv nil nil (lambda () (length v)))))
+(defun make-progv-closure (v) (lambda () (progv '(*payload*) (list 1) (length v))))
+(compile 'make-progv-closure)
+(churn "progv-compiled" #'make-progv-closure)
+"#;
+
+/// Run [`CLOSURE_RETENTION_PROGRAM`] and return each shape's bytes kept per
+/// closure.
+fn closure_retention(extra_env: &[(&str, &str)]) -> Vec<(String, i64)> {
+    let mut cmd = egcl_bin();
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
+    let output = cmd
+        .args(["--no-init", "--eval", &format!("(progn {CLOSURE_RETENTION_PROGRAM})")])
+        .output()
+        .expect("run egcl");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let (label, bytes) = line.split_once(' ')?;
+            Some((label.to_string(), bytes.trim().parse().ok()?))
+        })
+        .collect()
+}
+
+/// A closure whose body contains PROGV used to be built by the tree-walker,
+/// whose closure registry kept it and everything it captured for good, so
+/// every bordeaux-threads MAKE-THREAD leaked its thread function (GH #634).
+/// PROGV now compiles, so these closures are ordinary compiled closures.
+#[test]
+fn progv_closures_do_not_retain_their_captures() {
+    check_closure_retention(&[]);
+}
+
+/// A tree-walker closure's registry entry is dropped once the closure is
+/// unreachable, at runtime rather than only at file-load boundaries. Under the
+/// pure tree-walker every closure has such an entry (GH #634).
+#[test]
+fn tree_walker_closures_do_not_retain_their_captures() {
+    check_closure_retention(&[("EGCL_FORCE_TIER", "interp")]);
+}
+
+fn check_closure_retention(extra_env: &[(&str, &str)]) {
+    let rows = closure_retention(extra_env);
+    for label in ["plain", "progv", "progv-outer", "progv-compiled"] {
+        let kept = rows
+            .iter()
+            .find(|(name, _)| name == label)
+            .unwrap_or_else(|| panic!("no {label} row in {rows:?}"))
+            .1;
+        assert!(
+            kept < 2_000,
+            "{label}: {kept} bytes kept per dropped closure; all rows {rows:?}"
+        );
+    }
+}
+
 /// A COMPILED macro whose lambda list has `&environment` and that passes the env
 /// to MACROEXPAND-1, when invoked FROM THE INTERPRETER, must receive a usable
 /// lexical environment. The bytecode macro-invocation path previously bound
