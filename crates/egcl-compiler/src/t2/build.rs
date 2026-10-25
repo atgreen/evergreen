@@ -3303,8 +3303,9 @@ impl<'a> Builder<'a> {
                         },
                         &[(IRType::TOP, ValueRepresentation::Tagged)],
                     );
-                    if !self.native_cleanups
-                        && n == 2
+// Calls in native-cleanup builds become Invokes below; the
+                    // pass splits those too (bliss-3k0xm).
+                    if n == 2
                         && policy != InlinePolicy::NotInline
                         && super::string_char::is_string_char_accessor(*sym)
                     {
