@@ -27713,18 +27713,14 @@ mod direct_call_invalidation_tests {
         let generation = input.generation;
         let input = egcl_rt::CrossThreadRoot::new(input);
         let artifact = input.with_gc_stable(compile_t2_artifact);
-        let native = if checked_native_installation_allowed() {
-            let native = install_t2_completion(T2Completion {
-                sym: symbol, generation,
-                artifact: Some(artifact.expect("compile lexical GC probe")), input,
-            }).unwrap();
-            assert!(native.is_t2);
-            Some(native)
-        } else {
-            assert!(artifact.is_none(), "captured code requires the Linux interpreter adapter");
-            assert!(try_promote_to_t1_with_speculation(symbol, false).is_none());
-            None
-        };
+        // Bodies that read and write environment bindings (LoadEnvVar/StoreEnvVar)
+        // enter mapped native code on x86-64 Linux too (#494), so every platform
+        // runs this probe natively.
+        let native = install_t2_completion(T2Completion {
+            sym: symbol, generation,
+            artifact: Some(artifact.expect("compile lexical GC probe")), input,
+        }).unwrap();
+        assert!(native.is_t2);
         // Redefinition gives the same indexes different meanings. The retained
         // code must still use its own snapshot, including after registry removal.
         body.names.swap(0, 1);
@@ -27735,11 +27731,7 @@ mod direct_call_invalidation_tests {
         let original_address = value.to_raw();
         env.define_local_symbol(source, *value);
         drop(value); // only the source binding owns it when native execution begins
-        egcl_rt::rooted!(result = if let Some(native) = native {
-            run_native(&native, symbol, &[], &mut env).unwrap()
-        } else {
-            run_with_sym(Arc::clone(&selected_body), &[], NIL, symbol, &mut env).unwrap()
-        });
+        egcl_rt::rooted!(result = run_native(&native, symbol, &[], &mut env).unwrap());
         assert_ne!(result.to_raw(), original_address, "the selected activation's only root must move");
         assert_eq!(super::super::cp(*result), (EgclVal::from_fixnum(71), NIL));
         assert_eq!(Env::lookup_frame(&env.frame, "T2-CAPTURE-SOURCE"), Some(NIL));
@@ -27767,37 +27759,22 @@ mod direct_call_invalidation_tests {
         let generation = input.generation;
         let input = egcl_rt::CrossThreadRoot::new(input);
         let artifact = input.with_gc_stable(compile_t2_artifact);
-        let native = if checked_native_installation_allowed() {
-            Some(install_t2_completion(T2Completion {
-                sym: symbol, generation,
-                artifact: Some(artifact.expect("checked captured lexical access must compile at T2")),
-                input,
-            }).expect("install callback T2"))
-        } else {
-            assert!(artifact.is_none(), "captured mapped T2 admission remains unsupported");
-            None
-        };
-        if let Some(native) = &native {
-            assert!(native.is_t2);
-        }
-        let mut invoke = |argument| {
-            if let Some(native) = &native {
-                run_native(native, symbol, &[argument], &mut env)
-            } else {
-                super::super::apply_function(*callback, &[argument], &mut env)
-            }
-        };
+        // A closure body that reads and writes captured bindings is admitted
+        // to mapped T2 on x86-64 Linux as well (#494).
+        let native = install_t2_completion(T2Completion {
+            sym: symbol, generation,
+            artifact: Some(artifact.expect("captured lexical access must compile at T2")),
+            input,
+        }).expect("install callback T2");
+        assert!(native.is_t2);
+        let mut invoke = |argument| run_native(&native, symbol, &[argument], &mut env);
         assert_eq!(invoke(EgclVal::from_fixnum(2)).unwrap(), EgclVal::from_fixnum(12));
         let before = deopt_count();
         egcl_rt::rooted!(answer = invoke(EgclVal::from_fixnum(1152921504606846975)).unwrap());
         let mut printed = String::new();
         super::super::print_val(*answer, &mut printed);
         assert_eq!(printed, "1152921504606846987");
-        if native.is_some() {
-            assert!(deopt_count() > before, "native overflow must exercise deoptimization");
-        } else {
-            assert_eq!(deopt_count(), before, "interpreted capture must not report a native deopt");
-        }
+        assert!(deopt_count() > before, "native overflow must exercise deoptimization");
         egcl_rt::rooted!(again = super::super::apply_function(*callback,
             &[EgclVal::from_fixnum(1)], &mut env).unwrap());
         printed.clear();
@@ -27840,30 +27817,27 @@ mod direct_call_invalidation_tests {
         egcl_rt::rooted!(_original_root = ActiveBytecodeRoot::new(&original_body));
         egcl_rt::rooted!(_replacement_root = ActiveBytecodeRoot::new(&replacement_body));
         registry_put(symbol, Arc::clone(&original_body));
-        let original = try_promote_to_t1_with_speculation(symbol, false);
+        // Environment-reading (LoadEnvVar) bodies reach T1 on x86-64 Linux too
+        // (#494), so both versions run as native code on every platform this
+        // test covers.
+        let original = try_promote_to_t1_with_speculation(symbol, false)
+            .expect("original environment-reading body reaches T1");
         registry_put(symbol, Arc::clone(&replacement_body));
-        let replacement = try_promote_to_t1_with_speculation(symbol, false);
-        assert_eq!(original.is_some(), checked_native_installation_allowed());
-        assert_eq!(replacement.is_some(), checked_native_installation_allowed());
-        let execute = |code: &Option<Rc<NativeCode>>, body: &Arc<BytecodeFunction>, env: &mut Env| {
-            if let Some(code) = code {
-                run_native(code, symbol, &[], env)
-            } else {
-                run_with_sym(Arc::clone(body), &[], NIL, symbol, env)
-            }
-        };
+        let replacement = try_promote_to_t1_with_speculation(symbol, false)
+            .expect("replacement environment-reading body reaches T1");
+        let execute = |code: &Rc<NativeCode>, env: &mut Env| run_native(code, symbol, &[], env);
         assert_eq!(
-            execute(&replacement, &replacement_body, &mut env).unwrap(),
+            execute(&replacement, &mut env).unwrap(),
             EgclVal::from_fixnum(29)
         );
         assert_eq!(
-            execute(&original, &original_body, &mut env).unwrap(),
+            execute(&original, &mut env).unwrap(),
             EgclVal::from_fixnum(11),
             "an old activation must not resolve its indexes through replacement metadata"
         );
         registry_remove(symbol);
         assert_eq!(
-            execute(&original, &original_body, &mut env).unwrap(),
+            execute(&original, &mut env).unwrap(),
             EgclVal::from_fixnum(11)
         );
     }
@@ -28260,8 +28234,11 @@ mod method_compilation_tests {
         let callable = super::super::METHOD_COMPILED.borrow()[&id];
         let name = egcl_rt::function::name(callable).as_symbol_index();
         let body = registry_get(name).unwrap();
-        assert!(contains_host_eval(&body));
-        assert!(!contains_load_time_values(&body));
+        // Since #566 the live compile paths initialize LOAD-TIME-VALUE cells,
+        // so the callback compiles with its cell instead of retrying through
+        // host evaluation.
+        assert!(!contains_host_eval(&body));
+        assert!(contains_load_time_values(&body));
         assert_eq!(
             super::super::read_eval_all_env(
                 "(equal (funcall (method-callback-ltv '(42))) '((42) (:cell)))",
@@ -28269,6 +28246,16 @@ mod method_compilation_tests {
             )
             .unwrap(),
             T
+        );
+        assert_eq!(
+            super::super::read_eval_all_env(
+                "(eq (second (funcall (method-callback-ltv 1)))
+                     (second (funcall (method-callback-ltv 2))))",
+                &mut env,
+            )
+            .unwrap(),
+            T,
+            "the compiled callback's LOAD-TIME-VALUE is evaluated once"
         );
     }
 
@@ -29243,16 +29230,14 @@ mod active_bytecode_root_tests {
              (dotimes (i 40) (native-capture-version))", &mut env).unwrap();
         egcl_rt::rooted!(old = super::super::global_fn("NATIVE-CAPTURE-VERSION").unwrap());
         let symbol = egcl_rt::function::name(*old).as_symbol_index();
-        let code = NATIVE_REGISTRY.with(|registry| registry.borrow().get(&symbol).cloned());
-        assert_eq!(code.is_some(), checked_native_installation_allowed(),
-            "captured bodies must use the platform's admitted execution route");
+        // A closure body that reads captured bindings tiers up to native code
+        // on x86-64 Linux as well (#494), so the hot definition is native on
+        // every platform.
+        let code = NATIVE_REGISTRY.with(|registry| registry.borrow().get(&symbol).cloned())
+            .expect("the hot captured body reaches native code");
         super::super::read_eval_all_env(
             "(let ((held 99)) (defun native-capture-version () held))", &mut env).unwrap();
-        let answer = if let Some(code) = code {
-            run_native_callable(&code, symbol, *old, &[], &mut env).unwrap()
-        } else {
-            super::super::apply_function(*old, &[], &mut env).unwrap()
-        };
+        let answer = run_native_callable(&code, symbol, *old, &[], &mut env).unwrap();
         assert_eq!(answer, EgclVal::from_fixnum(42));
         assert_eq!(super::super::read_eval_all_env("(native-capture-version)", &mut env).unwrap(),
             EgclVal::from_fixnum(99));
