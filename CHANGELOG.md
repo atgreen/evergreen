@@ -35,6 +35,13 @@
 
 ### Fixed
 
+- A condition is no longer corrupted when a garbage collection runs while it
+  is being made. If a slot's initform allocated enough to start a collection,
+  `make-condition`, `error` and `signal` could return an object that was no
+  longer a condition: `type-of` returned `t`, and `handler-case` for its own
+  type did not catch it. `warn` and `error` with format arguments could
+  likewise lose their format control string
+  ([#TGPR](https://github.com/atgreen/evergreen/pull/TGPR)).
 - An internal error inside compiled code that a native function called no
   longer aborts the process. It is reported as an ordinary Lisp error, as it
   already was for compiled code called from the interpreter. Making a closure

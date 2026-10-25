@@ -5525,16 +5525,20 @@ fn make_simple_condition(
     format_args: &[EgclVal],
     env: &mut Env,
 ) -> Result<EgclVal, EgclError> {
+    // Registering the class, interning the slot names and consing the argument
+    // list can each move the control string and the arguments (bliss-togth).
+    egcl_rt::rooted!(format_control = format_control);
+    egcl_rt::rooted!(format_args = format_args.to_vec());
     let class = ensure_condition_class_registered(env, class_name)?;
-    egcl_stdlib::make_instance(
-        class,
-        &[
-            resolve_sym("FORMAT-CONTROL").unwrap_or(NIL),
-            format_control,
-            resolve_sym("FORMAT-ARGUMENTS").unwrap_or(NIL),
-            vec_to_list(format_args),
-        ],
-    )
+    egcl_rt::rooted!(initargs = vec![
+        resolve_sym("FORMAT-CONTROL").unwrap_or(NIL),
+        NIL,
+        resolve_sym("FORMAT-ARGUMENTS").unwrap_or(NIL),
+        NIL,
+    ]);
+    initargs[3] = vec_to_list(&format_args);
+    initargs[1] = *format_control;
+    egcl_stdlib::make_instance(class, &initargs)
 }
 
 fn make_simple_error_condition(message: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
@@ -5832,6 +5836,10 @@ fn build_condition_instance_impl(
     initarg_pairs: &[EgclVal],
     pinned_gc: bool,
 ) -> Result<EgclVal, EgclError> {
+    // The caller's initargs are read across class registration, symbol
+    // interning and default-initarg evaluation, all of which can allocate, so
+    // work from a rooted copy (bliss-togth).
+    egcl_rt::rooted!(initarg_pairs = initarg_pairs.to_vec());
     let class = ensure_condition_class_registered(env, type_name)?;
     let slot_specs = condition_slot_specs(env, type_name);
     let mut initargs = Vec::new();
@@ -5841,33 +5849,33 @@ fn build_condition_instance_impl(
     // 7.1.4; CONDITION-9-SLOTS.4/6), and one initarg may fill several slots
     // (CONDITION-6's :both-slots).
     let mut set_slots: Vec<String> = Vec::new();
+    // `val` points at a rooted slot and is read only after interning the slot
+    // name, which can allocate.
     let fill_slot = |initargs: &mut Vec<EgclVal>,
                      set_slots: &mut Vec<String>,
                      slot_name: &str,
-                     val: EgclVal| {
+                     val: &EgclVal| {
         if !set_slots.iter().any(|s| s == slot_name) {
             set_slots.push(slot_name.to_string());
             initargs.push(resolve_sym(slot_name).unwrap_or(NIL));
-            initargs.push(val);
+            initargs.push(*val);
         }
     };
     let mut i = 0;
     while i + 1 < initarg_pairs.len() {
-        let key = initarg_pairs[i];
-        let val = initarg_pairs[i + 1];
-        let key_name = sym_bare_name_rc(key);
+        let key_name = sym_bare_name_rc(initarg_pairs[i]);
         seen_initargs.push(key_name.clone());
         let mut matched = false;
         for (slot_name, initarg) in &slot_specs {
             if initarg == key_name.as_ref() {
                 matched = true;
-                fill_slot(&mut initargs, &mut set_slots, slot_name, val);
+                fill_slot(&mut initargs, &mut set_slots, slot_name, &initarg_pairs[i + 1]);
             }
         }
         if !matched {
             // An initarg matching no slot :initarg is still passed through as its
             // bare-named symbol (an INITIALIZE-INSTANCE &key may consume it).
-            fill_slot(&mut initargs, &mut set_slots, &key_name, val);
+            fill_slot(&mut initargs, &mut set_slots, &key_name, &initarg_pairs[i + 1]);
         }
         i += 2;
     }
@@ -5890,7 +5898,7 @@ fn build_condition_instance_impl(
         }
         egcl_rt::rooted!(value = eval_form(default_form, env)?);
         for slot_name in &matching_slots {
-            fill_slot(&mut initargs, &mut set_slots, slot_name, *value);
+            fill_slot(&mut initargs, &mut set_slots, slot_name, &value);
         }
     }
     // Builtin condition slots with an ANSI :initform of NIL (SIMPLE-CONDITION's
@@ -5911,7 +5919,9 @@ fn build_condition_instance_impl(
             }
         }
     }
-    let instance = if pinned_gc {
+    // Applying the class initforms below evaluates them, so a nursery instance
+    // can move before it is returned.
+    egcl_rt::rooted!(instance = if pinned_gc {
         // GC-heap + pinned so the pooled instance is immortal and non-moving
         // (D5.13), while still carrying the CLI-recognized condition class.
         let inst = egcl_stdlib::clos::allocate_instance_pinned_gc(class)?;
@@ -5919,14 +5929,14 @@ fn build_condition_instance_impl(
         inst
     } else {
         egcl_stdlib::make_instance(class, &initargs)?
-    };
+    });
     let explicit_slots: Vec<String> = initargs
         .chunks_exact(2)
         .map(|pair| sym_bare_name_rc(pair[0]).to_string())
         .collect();
     let cond_class_name = class_name_for_instance_class(class);
-    apply_class_initforms(instance, &cond_class_name, env, None, &explicit_slots)?;
-    Ok(instance)
+    apply_class_initforms(*instance, &cond_class_name, env, None, &explicit_slots)?;
+    Ok(*instance)
 }
 
 /// Coerce a condition designator to a condition instance per ANSI CL. A symbol
