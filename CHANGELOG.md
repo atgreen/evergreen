@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### Performance
+
+- On x86-64 Linux, a loop typed at the REPL, given to `--eval` or written at
+  the top level of a loaded file now leaves the interpreter part-way through,
+  as a loop in a once-called function already did: after 100,000 iterations
+  the running loop continues in native code. So does a loop in a closure,
+  such as `(funcall (make-adder) n)` on a `(lambda ...)` that loops. `time`
+  is now compiled instead of interpreted, so `(time (dotimes ...))` and
+  `(print (time ...))` measure compiled code; before, everything inside `time`
+  was evaluated by the slow tree-walker. `loop for i below n` inside a `let`
+  is compiled too. Without any warm-up, 10,000,000 iterations of a top-level
+  fixnum sum loop take 0.24 s instead of 14.4 s; inside `time` they take the
+  same 0.24 s, where they used to take about 22 minutes. A top-level loop
+  that calls a function takes 5.5 s instead of 17.5 s, a consing loop 3.1 s
+  instead of 18.9 s, and `(loop for i below n sum i)` 0.23 s instead of more
+  than 5 minutes. A loop that increments a special variable still runs at
+  about 1 us per iteration
+  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+
 ## 0.0.11 - 2026-10-24
 
 ### Added

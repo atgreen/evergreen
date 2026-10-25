@@ -3085,11 +3085,13 @@ impl<'e> Lowerer<'e> {
                 "LABELS" => self.lower_flet(rest, true),
                 "MACROLET" | "SYMBOL-MACROLET" => self.lower_macrolet(form),
                 // TIME/ROOM are interpreter special forms (profiling; bliss-kfy4).
-                // The compiler has no lowering, and treating them as plain calls
-                // (the default below) would evaluate TIME's body in single-value
-                // context — dropping its multiple values. Bail so the enclosing
-                // form is interpreted, where TIME correctly preserves body values.
-                "TIME" | "ROOM" => Err(Bail),
+                // Treating them as plain calls (the default below) would
+                // evaluate TIME's body in single-value context — dropping its
+                // multiple values. TIME lowers to a sample/report pair around
+                // its form instead (bliss-of682); ROOM bails so the enclosing
+                // form is interpreted.
+                "TIME" => self.lower_time(rest),
+                "ROOM" => Err(Bail),
                 _ => self.lower_call(&name, op, rest),
             }
         } else {
@@ -5107,6 +5109,14 @@ impl<'e> Lowerer<'e> {
                     let mut var = *forms.get(i + 1).ok_or(Bail)?;
                     egcl_rt::rooted_ref!(_var_root = &mut var);
                     take_type(&mut forms, i + 2)?;
+                    // `for VAR below|to|upto LIMIT` counts up from 0 (CLHS
+                    // 6.1.2.1.1); spell out the default start so the FROM driver
+                    // below compiles it rather than bailing the enclosing form
+                    // to the tree-walker (bliss-of682).
+                    if matches!(kw(*forms.get(i + 2).ok_or(Bail)?).as_deref(), Some("BELOW" | "TO" | "UPTO")) {
+                        let from = s("FROM")?;
+                        forms.splice(i + 2..i + 2, [from, EgclVal::from_fixnum(0)]);
+                    }
                     match kw(*forms.get(i + 2).ok_or(Bail)?).as_deref() {
                         Some("ACROSS") => {
                             // Evaluate the vector and its active length once;
@@ -6777,6 +6787,34 @@ impl<'e> Lowerer<'e> {
         }
         self.emit(Instr::ValuesToList); // pop primary, push list
         Ok(())
+    }
+
+    /// `(time form)` as `(let ((#:start (egcl::%time-start)))
+    /// (multiple-value-prog1 form (egcl::%time-report #:start)))` (bliss-of682).
+    /// The sample lives in a local, not on the operand stack, so a loop in FORM
+    /// runs with the stack empty and can still leave T0 by OSR. A timed form
+    /// that signals or exits non-locally prints no report, as in the evaluator.
+    fn lower_time(&mut self, rest: EgclVal) -> LowerResult<()> {
+        if !rest.is_cons() {
+            return Err(record_bail(|| "time:malformed".to_string()));
+        }
+        let (form, tail) = cp(rest);
+        if !tail.is_nil() {
+            return Err(record_bail(|| "time:malformed".to_string()));
+        }
+        egcl_rt::rooted!(form = form);
+        egcl_rt::rooted!(start = super::gensym_symbol("TIME-START"));
+        let let_sym = resolve_sym("LET").ok_or(Bail)?;
+        let mvprog1 = resolve_sym("MULTIPLE-VALUE-PROG1").ok_or(Bail)?;
+        let sample = resolve_sym("EGCL::%TIME-START").ok_or(Bail)?;
+        let report = resolve_sym("EGCL::%TIME-REPORT").ok_or(Bail)?;
+        egcl_rt::rooted!(sample_call = vec_to_list(&[sample]));
+        egcl_rt::rooted!(binding = vec_to_list(&[*start, *sample_call]));
+        egcl_rt::rooted!(bindings = vec_to_list(&[*binding]));
+        egcl_rt::rooted!(report_call = vec_to_list(&[report, *start]));
+        egcl_rt::rooted!(body = vec_to_list(&[mvprog1, *form, *report_call]));
+        egcl_rt::rooted!(timed = vec_to_list(&[let_sym, *bindings, *body]));
+        self.lower_expr(*timed)
     }
 
     /// Preserve the first form's values while evaluating the trailing forms.
@@ -21465,6 +21503,21 @@ fn closure_compilation_owner(sym: u32, count: u32) -> (u32, u32) {
     (owner, invocations)
 }
 
+/// The instance whose symbol owns the compiled version of closure body `body`,
+/// for a running activation of instance `sym` to enter by OSR (bliss-of682).
+/// The owner `closure_compilation_owner` chose when this call was dispatched,
+/// under the same validity checks; this reads it without counting a call.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn closure_osr_owner(sym: u32, body: &Arc<BytecodeFunction>) -> u32 {
+    CLOSURE_COMPILATION
+        .with(|cache| cache.borrow().get(&(Arc::as_ptr(body) as usize)).map(|state| state.owner))
+        .filter(|&owner| {
+            !is_profile_pinned(owner)
+                && registry_get(owner).is_some_and(|entry| Arc::ptr_eq(&entry, body))
+        })
+        .unwrap_or(sym)
+}
+
 /// Per-function invocation counters driving T0→T1 promotion.
 static INVOKE_COUNTS: egcl_rt::execution_local::ExecutionLocal<
     RefCell<HashMap<u32, u32, egcl_rt::fxhash::FxBuildHasher>>,
@@ -26485,13 +26538,31 @@ fn maybe_mapped_osr(
         return decline();
     }
     egcl_rt::rooted!(fn_obj = Some(fn_obj));
+    // A closure instance a `(lambda ...)` evaluation made has a private symbol
+    // whose function cell stays empty; its registry entry alone names its body
+    // (bliss-of682). Instances of one template share one compiled version,
+    // installed under the template's compilation owner, which may be another
+    // instance -- the code `native_for_dispatch` would run this call in.
+    let closure = egcl_rt::symbols::is_uninterned(sym)
+        && egcl_rt::symbols::symbol_function(sym)
+            .filter(|&value| egcl_rt::function::is_interpreted_function(value))
+            .is_none()
+        && egcl_rt::function::definition_index(fn_obj.unwrap()) == sym
+        && closure_bodies().borrow().get(&sym).is_some_and(|body| Arc::ptr_eq(body, &act.func));
     // Only the symbol's current definition: a redefined function's running
     // loop finishes in the code it started in.
     let current_definition = || {
-        egcl_rt::symbols::symbol_function(sym) == *fn_obj
+        (closure || egcl_rt::symbols::symbol_function(sym) == *fn_obj)
             && registry_get(sym).is_some_and(|body| Arc::ptr_eq(&body, &act.func))
     };
     if !current_definition() {
+        return decline();
+    }
+    let owner = if closure { closure_osr_owner(sym, &act.func) } else { sym };
+    let owner_current = || {
+        owner == sym || registry_get(owner).is_some_and(|body| Arc::ptr_eq(&body, &act.func))
+    };
+    if is_profile_pinned(owner) {
         return decline();
     }
     // Mapped code keeps tagged homes: its double-float arithmetic is slower
@@ -26503,21 +26574,24 @@ fn maybe_mapped_osr(
         return decline();
     }
     poll_t2_completions();
-    let installed = NATIVE_REGISTRY.with(|registry| registry.borrow().get(&sym).cloned());
+    let installed = NATIVE_REGISTRY.with(|registry| registry.borrow().get(&owner).cloned());
     let native = match installed {
         Some(native) => native,
         None => {
-            if t1_declined(sym) {
+            if t1_declined(sym) || t1_declined(owner) {
                 return decline();
             }
-            let Some(native) = try_promote_to_t1(sym) else { return decline() };
+            let Some(native) = try_promote_to_t1(owner) else { return decline() };
             // Compilation can collect and run Lisp; publish only for the
             // definition this activation is running.
-            if !current_definition() || native.body.as_ref().is_none_or(|body| !Arc::ptr_eq(body, &act.func)) {
+            if !current_definition() || !owner_current()
+                || native.body.as_ref().is_none_or(|body| !Arc::ptr_eq(body, &act.func))
+            {
                 return decline();
             }
-            mark_fresh_promotion(sym);
-            publish_native(sym, *fn_obj, &native);
+            mark_fresh_promotion(owner);
+            // A private representative has no function cell to publish into.
+            publish_native(owner, if owner == sym { *fn_obj } else { None }, &native);
             native
         }
     };
@@ -26878,20 +26952,112 @@ pub fn eval_toplevel(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclEr
     // in portable mode before tree-walking — same rationale as lazy_compile_defun
     // (bliss-mr4p). Only reached after the fast path already declined, so it
     // never adds work to a form that compiles opportunistically.
-    match compile_thunk(form, env, false)
-        .or_else(|| compile_thunk(form, env, true))
+    reset_last_bail_reason();
+    // As for a hot tree-walker closure (`compile_tree_closure`): when the
+    // opportunistic lowering left a nested callback to the host evaluator, use
+    // the complete lowering if it compiles. A `(lambda ...)` left to EvalHost
+    // runs tree-walked, two orders of magnitude slower than T0, and can never
+    // reach native code (bliss-of682). Only a form with a loop pays for the
+    // second compile, so a library load's one-shot forms are unaffected.
+    let compiled: Option<Arc<BytecodeFunction>> = match compile_thunk(form, env, false) {
+        Some(fast) if contains_host_eval(&fast) && body_contains_loop(form) => {
+            let fast = Arc::new(fast);
+            // The portable compile allocates; the first result's constants
+            // stay rooted until it is chosen or dropped.
+            egcl_rt::rooted!(_fast_root = ActiveBytecodeRoot::new(&fast));
+            reset_last_bail_reason();
+            Some(compile_thunk(form, env, true).map(Arc::new).unwrap_or(fast))
+        }
+        Some(fast) => Some(Arc::new(fast)),
+        None => compile_thunk(form, env, true).map(Arc::new),
+    };
+    match compiled
         .filter(|function| !contains_load_time_values(function))
     {
-        Some(bf) => {
+        Some(arc) => {
             trace("compiled");
-            let arc = Arc::new(bf);
+            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+            if let Some(owner) = ToplevelLoopOwner::new(&arc) {
+                let function = owner.function;
+                return run_with_sym(arc, &[], function, owner.sym, env);
+            }
             let fn_val = NIL;
             run(arc, &[], fn_val, env)
         }
         None => {
             trace("bailed");
+            trace_named("<toplevel>", "bailed", last_bail_reason().as_deref());
             eval_form(form, env)
         }
+    }
+}
+
+/// A private callable identity for a compiled top-level form that contains a
+/// loop, held for the one time the form runs (bliss-of682).
+///
+/// A top-level thunk ran with no function object and no registry symbol, so
+/// nothing counted its back-edges and nothing could own native code for it:
+/// mapped OSR (bliss-s0v50) installs T1 under a function's symbol and enters
+/// it with that function's frame, so a hot top-level loop stayed in T0. This
+/// gives the thunk exactly the identity `compile_and_reify_lambda` gives a
+/// method body -- a fresh uninterned symbol whose registry entry is the body
+/// and whose function cell holds an interpreted function object -- so the
+/// thunk's activation is an ordinary named activation to the tiering ladder:
+/// its back-edges count on the object, `maybe_mapped_osr` promotes and enters
+/// it, and loop heat moves it on to T2. Nothing can name the symbol, so no
+/// caller can reach the code.
+///
+/// Dropping the owner retires every registration once the form has returned
+/// or unwound. No activation of the body remains then: the thunk is not
+/// reachable from Lisp, it is never re-entered, and a guard failure resumes it
+/// in a nested T0 run that has finished too. A T2 job still queued for the
+/// symbol finds no registered body when it completes and is discarded.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+struct ToplevelLoopOwner {
+    sym: u32,
+    function: EgclVal,
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+impl ToplevelLoopOwner {
+    /// An owner for `body` if it has a loop mapped OSR could enter. Forms
+    /// without a backward GO keep running without an identity.
+    fn new(body: &Arc<BytecodeFunction>) -> Option<Self> {
+        if profiling_disabled() || osr_threshold() == u32::MAX || cfg!(egcl_no_t1) {
+            return None;
+        }
+        let has_loop = body.code.iter().enumerate().any(|(bcp, op)| {
+            matches!(op, Instr::Go { target_bcp, .. } if (*target_bcp as usize) < bcp)
+        });
+        if !has_loop {
+            return None;
+        }
+        egcl_rt::rooted!(_body_root = ActiveBytecodeRoot::new(body));
+        egcl_rt::rooted!(sym = egcl_rt::symbols::make_uninterned("TOPLEVEL"));
+        let sym_idx = sym.as_symbol_index();
+        closure_bodies().borrow_mut().insert(sym_idx, Arc::clone(body));
+        registry_put(sym_idx, Arc::clone(body));
+        let function = egcl_rt::function::alloc_interpreted(NIL, NIL, NIL, *sym);
+        // The tiering counters are found through the function cell, as for a
+        // reified method (`compile_and_reify_lambda`). The symbol cell roots
+        // the object until the owner is dropped; the running frame roots it too.
+        egcl_rt::symbols::set_symbol_function(sym_idx, function);
+        Some(Self { sym: sym_idx, function })
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+impl Drop for ToplevelLoopOwner {
+    fn drop(&mut self) {
+        // As `remove_shake_closure` does, without `registry_remove`'s
+        // direct-call generation bump: nothing could have baked a call to a
+        // symbol no code can name, and the bump invalidates every call cell.
+        egcl_rt::symbols::set_symbol_function(self.sym, egcl_rt::value::UNBOUND);
+        closure_bodies().borrow_mut().remove(&self.sym);
+        let generation = REGISTRY_GENERATION
+            .with(|g| g.borrow().get(&self.sym).copied().unwrap_or(0).wrapping_add(1));
+        install_local_definition(self.sym, None, generation);
+        OSR_ENTRY_COUNTS.with(|counts| counts.borrow_mut().remove(&self.sym));
     }
 }
 

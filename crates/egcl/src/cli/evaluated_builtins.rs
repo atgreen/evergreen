@@ -946,6 +946,44 @@ fn resolve(name: &str) -> Option<Handler> {
             )))
         }),
 
+        // Compiled TIME (bliss-of682): `%TIME-START` samples the clocks and
+        // collector counters as a list of fixnums, and `%TIME-REPORT` prints
+        // the interval since that sample, exactly as the TIME special form does.
+        "EGCL::%TIME-START" => Some(|_operator, _args, _env| {
+            let sample = time_sample()?;
+            let words: Vec<EgclVal> = sample.iter().map(|&word| EgclVal::from_fixnum(word)).collect();
+            // Fixnums are immediates: nothing to root while the list is built.
+            Ok(vec_to_list(&words))
+        }),
+
+        // The source arm's evaluated form. Compiled code reaches this without
+        // building a call form, so it reads the address without allocating --
+        // what a relocation probe needs (bliss-of682).
+        "EGCL-INTERNAL::%OBJECT-ADDRESS" | "EGCL-INTERNAL:%OBJECT-ADDRESS" | "%OBJECT-ADDRESS" => {
+            Some(|_operator, args, _env| {
+                let object = args.first().copied().unwrap_or(NIL);
+                let bits = if object.is_cons() || object.is_heap_object() {
+                    (unsafe { object.as_ptr() }) as u64
+                } else {
+                    object.0
+                };
+                Ok(EgclVal::from_fixnum((bits & ((1 << 60) - 1)) as i64))
+            })
+        }
+
+        "EGCL::%TIME-REPORT" => Some(|_operator, args, env| {
+            let mut start: TimeSample = [0; 6];
+            let words = args.first().map(|&list| list_to_vec(list)).unwrap_or_default();
+            if words.len() != start.len() || !words.iter().all(|word| word.is_fixnum()) {
+                return Err(EgclError::ProgramError("%TIME-REPORT: not a TIME sample".into()));
+            }
+            for (slot, word) in start.iter_mut().zip(&words) {
+                *slot = word.as_fixnum();
+            }
+            write_time_report(env, start)?;
+            Ok(NIL)
+        }),
+
         "EGCL::%FN-LAMBDA-LIST" => Some(|_operator, args, _env| {
             let args = RootedVals::new(args.to_vec());
 

@@ -119,6 +119,9 @@ pub(in crate::cli::bytecode) fn enter(
             *count = count.saturating_add(1);
         });
     }
+    egcl_rt::blog!("osr", egcl_rt::log::DEBUG,
+        "{}: T0 activation entered mapped {} code at header {header}",
+        display_fn_name(&destination.body.name), if destination.is_t2 { "T2" } else { "T1" });
     // A T0 source never entered native code, so count this activation against
     // the native depth cap as an ordinary entry does.
     NATIVE_DEPTH.with(|depth| depth.set(depth.get() + 1));

@@ -417,28 +417,35 @@ ignores either one measures warmup rather than steady state:
   (`EGCL_T0_T1_THRESHOLD`). A function called *once* does not clear it,
   however long its loop runs.
 - `osr_threshold()` — **100,000 back-edges** for OSR inside a running
-  activation (`EGCL_OSR_THRESHOLD`). The anonymous path next to it uses 200.
+  activation (`EGCL_OSR_THRESHOLD`). A top-level form's loop uses the same
+  gate (bliss-of682).
 
-So the same empty `DOTIMES` costs wildly different amounts depending on where
-it sits. Measured 2026-10-24 on `target/x86_64-unknown-linux-musl/release/egcl`
-(x86-64 Linux, after bliss-s0v50), min of 5 runs, with the 366 ms process
+So the same empty `DOTIMES` costs wildly different amounts depending on how
+long it runs. Measured 2026-10-24 on `target/x86_64-unknown-linux-musl/release/egcl`
+(x86-64 Linux, after bliss-of682), min of 5 runs, with the 338 ms process
 startup subtracted:
 
 ```
   iterations   toplevel (dotimes (i N))   inside a function called once
-      50,000        1.094 us/iter                0.947 us/iter
-     100,000        0.917                        0.902
-     500,000        0.904                        0.263
-   1,000,000        0.910                        0.139
-   4,000,000        0.902                        0.032
-  10,000,000        0.886                        0.015
+      50,000        0.958 us/iter                0.832 us/iter
+     100,000        0.861                        0.893
+     500,000        0.253                        0.262
+   1,000,000        0.129                        0.131
+   4,000,000        0.035                        0.033
+  10,000,000        0.016                        0.015
 ```
 
-**A toplevel loop never goes native on x86-64 Linux.** Its activation is
-anonymous, and the anonymous OSR path (200 back-edges) is still the checked-ABI
-one that Linux disables (bliss-of682), so it costs the interpreted ~0.9 us/iter
-however long it runs. The 0.08 us/iter this table used to show for it predates
-the mapped-entry default (#210). Benchmark loops inside a function.
+**A toplevel loop now leaves T0 the same way** (bliss-of682). A compiled
+top-level form whose bytecode has a loop runs with a private callable identity
+for that one run (`ToplevelLoopOwner`: an uninterned symbol registered with the
+body, and a function object in its cell), so its back-edges count and
+`maybe_mapped_osr` enters mapped code exactly as for a once-called function;
+the registrations are dropped when the form returns. TIME now compiles, so
+`(time (dotimes ...))` and `(print (time ...))` behave the same. Before
+bliss-of682 the toplevel column read ~0.9 us/iter at every N, and anything
+under TIME was tree-walked at tens of us/iter. A loop in a closure whose
+function cell is empty (a `(lambda ...)` instance) enters the code installed
+under its template's compilation owner.
 
 **A once-called function leaves T0 by OSR.** One invocation never clears the
 10-call T0 → T1 gate, so the loop runs interpreted until the function's
@@ -464,15 +471,19 @@ un-promoted cost. For this shape the back-edge threshold is the lever, not the
 invocation one.
 
 What still stays in T0 for its whole run (each measured, bliss-s0v50): a loop
-inside its own function's `handler-case`, `unwind-protect`, `catch` or special
-binding (bliss-4iwh1); a loop whose T0 profile saw a double-float, because
+inside its own function's -- or its own top-level form's -- `handler-case`,
+`unwind-protect`, `catch` or special binding (bliss-4iwh1); a loop whose T0 profile saw a double-float, because
 mapped T1 double arithmetic is slower than T0 and raw-double T2 has no loop
 entries (bliss-vwpaz). A once-called loop that
 calls another function does go native but pays ~0.5 us per call from the
 mapped activation (bliss-lxskg), against ~0.013 us from a warmed ordinary
 caller.
 
-Use **1M+ iterations** for a once-called function, and say which shape and
+A loop that increments a global special (`(incf *x* i)`) goes native but
+still costs ~0.9 us/iter there, in a function or at top level alike
+(bliss-csc8v).
+
+Use **1M+ iterations** for a once-called function or a toplevel loop, and say which shape and
 which count a number came from. Around 100k the numbers are **bimodal**, so a
 single 100k sample reads as noise or as a regression and is neither.
 
