@@ -488,9 +488,19 @@ impl Environment {
     /// Augment this environment with declarations.
     /// Returns a new Environment frame with the given declarations.
     pub fn augment_declarations(&self, decls: Vec<DeclInfo>) -> Environment {
+        let mut variables = HashMap::new();
+        for declaration in &decls {
+            if let DeclInfo::Custom(_, specifier) = declaration {
+                if specifier.is_cons() && is_symbol_named(unsafe { cons_car(*specifier) }, "SPECIAL") {
+                    for name in cons_to_vec(unsafe { cons_cdr(*specifier) }) {
+                        variables.insert(name.0, VariableInfo::Special);
+                    }
+                }
+            }
+        }
         Environment {
             parent: Some(Arc::new(self.clone())),
-            variables: HashMap::new(),
+            variables,
             functions: HashMap::new(),
             declarations: decls,
             no_gc_roots: false,
@@ -1003,6 +1013,47 @@ pub fn set_atomic_update_operator_test(test: fn(EgclVal) -> bool) {
     let _ = ATOMIC_UPDATE_OPERATOR.set(test);
 }
 
+thread_local! {
+    // Compilation deliberately leaves some forms to later lowering. A tooling
+    // request cannot report those forms as recursively expanded.
+    static TOOL_EXPANSION: Cell<bool> = const { Cell::new(false) };
+}
+
+static GLOBAL_EXPANSION_ENVIRONMENT: std::sync::OnceLock<fn() -> Environment> =
+    std::sync::OnceLock::new();
+
+/// Install the host's global environment provider for LOAD-TIME-VALUE walking.
+pub fn set_global_expansion_environment(provider: fn() -> Environment) {
+    let _ = GLOBAL_EXPANSION_ENVIRONMENT.set(provider);
+}
+
+/// Recursively expand for a caller that will inspect the returned Lisp form.
+/// Unlike the compiler pass, expand LOAD-TIME-VALUE in the global environment,
+/// and reject syntax whose expansion is deferred to specialized lowering.
+pub fn macroexpand_all_for_tools(form: EgclVal, env: &Environment) -> Result<EgclVal, EgclError> {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TOOL_EXPANSION.with(|flag| flag.set(self.0));
+        }
+    }
+    let _restore = Restore(TOOL_EXPANSION.with(|flag| flag.replace(true)));
+    macroexpand_all(form, env)
+}
+
+fn expand_load_time_value(form: EgclVal) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted!(items = cons_to_vec(form));
+    if !(2..=3).contains(&items.len()) {
+        return Err(EgclError::ProgramError("malformed LOAD-TIME-VALUE".into()));
+    }
+    let mut global = GLOBAL_EXPANSION_ENVIRONMENT
+        .get()
+        .map_or_else(Environment::null, |provider| provider());
+    egcl_rt::rooted_ref!(_global_root = &mut global);
+    items[1] = macroexpand_all(items[1], &global)?;
+    Ok(vec_to_cons(&items))
+}
+
 /// Set the macroexpand hook.
 pub fn set_macroexpand_hook(hook: MacroexpandHook) {
     MACROEXPAND_HOOK.with(|cell| cell.set(hook));
@@ -1103,10 +1154,7 @@ impl Drop for PackageCellGuard {
     }
 }
 
-pub fn macroexpand_1(
-    mut form: EgclVal,
-    env: &Environment,
-) -> Result<(EgclVal, bool), EgclError> {
+pub fn macroexpand_1(mut form: EgclVal, env: &Environment) -> Result<(EgclVal, bool), EgclError> {
     let _pkg_guard = {
         let sym = egcl_rt::symbols::find_index("*PACKAGE*");
         let saved = sym.and_then(egcl_rt::symbols::symbol_value);
@@ -1351,13 +1399,13 @@ fn expand_body_items(
     expanded_items: &mut Vec<EgclVal>,
 ) -> Result<bool, EgclError> {
     let mut changed = false;
-    for (index, &item) in items.iter().enumerate() {
+    for index in 0..items.len() {
         let expanded = if index < declaration_end {
-            item
+            items[index]
         } else {
-            macroexpand_all(item, env)?
+            macroexpand_all(items[index], env)?
         };
-        changed |= expanded != item;
+        changed |= expanded != items[index];
         expanded_items.push(expanded);
     }
     Ok(changed)
@@ -1395,11 +1443,30 @@ pub fn macroexpand_all(form: EgclVal, env: &Environment) -> Result<EgclVal, Egcl
             .get()
             .is_some_and(|is_atomic_update| is_atomic_update(operator))
         {
+            if TOOL_EXPANSION.with(Cell::get) {
+                return Err(EgclError::ProgramError(
+                    "MACROEXPAND-ALL does not support atomic update places".into(),
+                ));
+            }
             return Ok(form);
         }
     }
     // Step 1: Macroexpand the top-level form
-    let (mut expanded, _) = macroexpand(form, env)?;
+    // Tool expansion must reject unsupported syntax even when another macro
+    // produces it. Stop before its own expander consumes the place protocol.
+    let unsupported_atomic = |value: EgclVal| {
+        TOOL_EXPANSION.with(Cell::get)
+            && value.is_cons()
+            && ATOMIC_UPDATE_OPERATOR.get().is_some_and(|test| {
+                test(unsafe { cons_car(value) })
+            })
+    };
+    let (mut expanded, _) = macroexpand_until(form, env, unsupported_atomic)?;
+    if unsupported_atomic(expanded) {
+        return Err(EgclError::ProgramError(
+            "MACROEXPAND-ALL does not support atomic update places".into(),
+        ));
+    }
 
     // Step 2: If the result is an atom (not a cons), we're done.
     // NIL is an atom (it's the empty list, not a cons cell).
@@ -1464,7 +1531,13 @@ pub fn macroexpand_all(form: EgclVal, env: &Environment) -> Result<EgclVal, Egcl
     // Step 3.d: Compiler macro check.
     // Only applies to function-call forms (not special operators or macros
     // after full macroexpansion).
-    if !env.is_notinline(operator) {
+    if !TOOL_EXPANSION.with(Cell::get)
+        && !env.is_notinline(operator)
+        && !matches!(
+            env.function_information(operator),
+            Some(FunctionInfo::Lexical)
+        )
+    {
         if let Some(cm_fn) = lookup_compiler_macro(operator) {
             let cm_result = cm_fn(expanded, env)?;
             // If the compiler macro returns a form that is NOT pointer-equal
@@ -1649,6 +1722,7 @@ fn expand_special_form(
         // The value form is a separate compilation in the null lexical
         // environment. Its compiler expands global macros later; walking it
         // here would capture this body's MACROLET/SYMBOL-MACROLET bindings.
+        "LOAD-TIME-VALUE" if TOOL_EXPANSION.with(Cell::get) => expand_load_time_value(form),
         "LOAD-TIME-VALUE" => Ok(form),
         // A definer's LAMBDA LIST binds variables over its body, so those names
         // shadow an enclosing SYMBOL-MACROLET (CLHS 3.1.2.1.1). Walking these as
@@ -1819,10 +1893,7 @@ fn expand_tagbody(mut form: EgclVal, env: &Environment) -> Result<EgclVal, EgclE
 /// already worked, because that table survives to the tree-walker.
 ///
 /// Vars that are NOT symbol macros are left alone, exactly as SETQ leaves them.
-fn expand_multiple_value_setq(
-    mut form: EgclVal,
-    env: &Environment,
-) -> Result<EgclVal, EgclError> {
+fn expand_multiple_value_setq(mut form: EgclVal, env: &Environment) -> Result<EgclVal, EgclError> {
     // Root across the allocating expand recursion (moving GC; bliss-noh).
     egcl_rt::rooted_ref!(_form_root = &mut form);
     let mut operator = unsafe { cons_car(form) };
@@ -1911,11 +1982,7 @@ fn expand_setf(mut form: EgclVal, env: &Environment) -> Result<EgclVal, EgclErro
 /// ordinary macro in the head position expands the same way (CLHS 5.1.2.7). A
 /// function-call place keeps its head and expands only its argument subforms —
 /// no compiler macro is applied to it.
-fn expand_place(
-    mut place: EgclVal,
-    env: &Environment,
-    depth: usize,
-) -> Result<EgclVal, EgclError> {
+fn expand_place(mut place: EgclVal, env: &Environment, depth: usize) -> Result<EgclVal, EgclError> {
     egcl_rt::rooted_ref!(_place_root = &mut place);
     // A place that expands to itself — `(symbol-macrolet ((a a)) (setf a 1))` —
     // must be reported, not recursed on until the Rust stack runs out.
@@ -2209,10 +2276,114 @@ fn expand_function_special(mut form: EgclVal, env: &Environment) -> Result<EgclV
 /// Expand a lambda expression: (lambda (params...) body...)
 /// Parameters are NOT expanded (they are binding names).
 /// Body is expanded in an env augmented with param bindings.
-fn expand_lambda_expression(
-    mut lambda: EgclVal,
+/// Expand ordinary lambda-list initializers in left-to-right binding order.
+/// An initializer sees previous parameters, but not its own variable or its
+/// supplied-p variable. Keyword names and method specializers are data.
+fn expand_lambda_list(
+    params: EgclVal,
+    body: EgclVal,
     env: &Environment,
-) -> Result<EgclVal, EgclError> {
+    specialized_required: bool,
+) -> Result<(EgclVal, Environment), EgclError> {
+    egcl_rt::rooted!(params = params);
+    egcl_rt::rooted!(items = cons_to_vec(*params));
+    egcl_rt::rooted!(expanded = Vec::with_capacity(items.len()));
+    let (_, declarations) = collect_body_declarations(&cons_to_vec(body));
+    let mut scope = env.augment_declarations(declarations);
+    egcl_rt::rooted_ref!(_scope_root = &mut scope);
+    let special_parameters: HashSet<u64> = scope.variables.keys().copied().collect();
+    let binding_info = |name: EgclVal| {
+        if special_parameters.contains(&name.0) { VariableInfo::Special }
+        else { VariableInfo::Lexical }
+    };
+    // Binding declarations govern each parameter when its binding begins,
+    // not its own initializer. Free SPECIAL declarations already apply.
+    let mut section = "required";
+    for item in items.iter().copied() {
+        if let Some(name) = get_symbol_name(item) {
+            if name.starts_with('&') {
+                section = if name == "&KEY" { "key" } else { "other" };
+                continue;
+            }
+            scope.variables.remove(&item.0);
+        } else if item.is_cons() {
+            let parts = cons_to_vec(item);
+            let first = parts[0];
+            let name = if section == "key" && first.is_cons() {
+                let pair = cons_to_vec(first);
+                pair.get(1).copied().unwrap_or(egcl_rt::value::NIL)
+            } else { first };
+            scope.variables.remove(&name.0);
+            if parts.len() > 2 { scope.variables.remove(&parts[2].0); }
+        }
+    }
+    let mut section = "required";
+    let mut changed = false;
+    for index in 0..items.len() {
+        let item = items[index];
+        if item.is_symbol() {
+            if let Some(name) = get_symbol_name(item) {
+                if name.starts_with('&') {
+                    section = match name.as_str() {
+                        "&OPTIONAL" => "optional",
+                        "&KEY" => "key",
+                        "&AUX" => "aux",
+                        "&ALLOW-OTHER-KEYS" => section,
+                        _ => "required",
+                    };
+                    expanded.push(item);
+                    continue;
+                }
+            }
+            scope = scope.augment_variable(item, binding_info(item));
+            expanded.push(item);
+            continue;
+        }
+        egcl_rt::rooted!(parts = cons_to_vec(item));
+        if parts.is_empty() {
+            return Err(EgclError::ProgramError("empty lambda parameter".into()));
+        }
+        if section == "required" {
+            if !specialized_required {
+                return Err(EgclError::ProgramError(
+                    "destructuring is not an ordinary lambda parameter".into(),
+                ));
+            }
+            scope = scope.augment_variable(parts[0], binding_info(parts[0]));
+            expanded.push(items[index]);
+            continue;
+        }
+        // Expand before extending scope. Root the complete parts vector: its
+        // parameter names and initializer may move while a macro allocates.
+        if parts.len() > 1 {
+            let value = macroexpand_all(parts[1], &scope)?;
+            changed |= value != parts[1];
+            parts[1] = value;
+        }
+        let variable = if section == "key" && parts[0].is_cons() {
+            let pair_tail = unsafe { cons_cdr(parts[0]) };
+            if !pair_tail.is_cons() {
+                return Err(EgclError::ProgramError("invalid keyword parameter".into()));
+            }
+            unsafe { cons_car(pair_tail) }
+        } else {
+            parts[0]
+        };
+        scope = scope.augment_variable(variable, binding_info(variable));
+        if section != "aux" && parts.len() > 2 {
+            scope = scope.augment_variable(parts[2], binding_info(parts[2]));
+        }
+        expanded.push(vec_to_cons(&parts));
+    }
+    egcl_rt::rooted!(result = if changed {
+        vec_to_cons(&expanded)
+    } else {
+        *params
+    });
+    Ok((*result, scope.clone()))
+}
+
+fn expand_lambda_expression(mut lambda: EgclVal, env: &Environment) -> Result<EgclVal, EgclError> {
     // Root across the allocating expand recursion (moving GC; bliss-noh).
     egcl_rt::rooted_ref!(_lambda_root = &mut lambda);
     let mut lambda_sym = unsafe { cons_car(lambda) }; // LAMBDA
@@ -2226,27 +2397,19 @@ fn expand_lambda_expression(
     let mut body = unsafe { cons_cdr(rest) }; // body forms
     egcl_rt::rooted_ref!(_body_root = &mut body);
 
-    // Augment environment with parameter bindings (shadow any symbol macros)
-    let mut new_env = env.clone();
-    let param_list = cons_to_vec(params);
-    for param in &param_list {
-        if param.is_symbol() && !param.is_nil() {
-            // Skip lambda list keywords (&optional, &rest, &key, &body, &allow-other-keys, &aux, &whole, &environment)
-            if let Some(name) = get_symbol_name(*param) {
-                if name.starts_with('&') {
-                    continue;
-                }
-            }
-            new_env = new_env.augment_variable(*param, VariableInfo::Lexical);
-        }
-    }
+    let (mut expanded_params, mut new_env) = expand_lambda_list(params, body, env, false)?;
+    egcl_rt::rooted_ref!(_expanded_params_root = &mut expanded_params);
+    egcl_rt::rooted_ref!(_new_env_root = &mut new_env);
 
     let expanded_body = expand_body(body, &new_env)?;
 
-    if expanded_body == body {
+    if expanded_body == body && expanded_params == params {
         Ok(lambda)
     } else {
-        Ok(alloc_cons(lambda_sym, alloc_cons(params, expanded_body)))
+        Ok(alloc_cons(
+            lambda_sym,
+            alloc_cons(expanded_params, expanded_body),
+        ))
     }
 }
 
@@ -2283,6 +2446,33 @@ fn expand_definer_body(
         return Ok(form);
     };
 
+    let operator = get_symbol_name(items[0]);
+    if matches!(operator.as_deref().and_then(|name| name.rsplit(':').next()),
+        Some("DEFUN" | "DEFMETHOD" | "METHOD")) {
+        egcl_rt::rooted!(body = vec_to_cons(&items[(lambda_list_index + 1)..]));
+        let (mut params, mut body_env) = expand_lambda_list(
+            items[lambda_list_index], *body, env,
+            operator.as_deref() != Some("DEFUN"),
+        )?;
+        egcl_rt::rooted_ref!(_params_root = &mut params);
+        egcl_rt::rooted_ref!(_body_env_root = &mut body_env);
+        items[lambda_list_index] = params;
+        egcl_rt::rooted!(expanded_body = expand_body(*body, &body_env)?);
+        let prefix = &items[..=lambda_list_index];
+        let mut result = *expanded_body;
+        egcl_rt::rooted_ref!(_result_root = &mut result);
+        for index in (0..prefix.len()).rev() {
+            result = alloc_cons(prefix[index], result);
+        }
+        return Ok(result);
+    }
+
+    if TOOL_EXPANSION.with(Cell::get) {
+        return Err(EgclError::ProgramError(
+            "MACROEXPAND-ALL does not support macro-defining forms with macro lambda lists".into(),
+        ));
+    }
+
     // Parameter names shadow symbol macros over the body. `(var default)`,
     // `(var specializer)` and `((:keyword var) default)` all name their variable
     // in the car (or the cadr of the keyword pair).
@@ -2294,7 +2484,7 @@ fn expand_definer_body(
             let first = unsafe { cons_car(param) };
             if first.is_cons() {
                 // ((:keyword var) …)
-                let rest = unsafe { cons_cdr(param) };
+                let rest = unsafe { cons_cdr(first) };
                 if rest.is_cons() {
                     unsafe { cons_car(rest) }
                 } else {
@@ -2536,29 +2726,23 @@ fn expand_flet(mut form: EgclVal, env: &Environment) -> Result<EgclVal, EgclErro
         let mut fn_body = unsafe { cons_cdr(fn_rest) };
         egcl_rt::rooted_ref!(_fn_body_root = &mut fn_body);
 
-        // Augment env with params for expanding the function body
-        let mut fn_env = env.clone();
-        let param_list = cons_to_vec(params);
-        for param in &param_list {
-            if param.is_symbol() && !param.is_nil() {
-                if let Some(name) = get_symbol_name(*param) {
-                    if name.starts_with('&') {
-                        continue;
-                    }
-                }
-                fn_env = fn_env.augment_variable(*param, VariableInfo::Lexical);
-            }
-        }
-
-        let expanded_fn_body = expand_body(fn_body, &fn_env)?;
-        if expanded_fn_body != fn_body {
+        let (mut expanded_params, mut fn_env) = expand_lambda_list(params, fn_body, env, false)?;
+        egcl_rt::rooted_ref!(_expanded_params_root = &mut expanded_params);
+        egcl_rt::rooted_ref!(_fn_env_root = &mut fn_env);
+        let mut expanded_fn_body = expand_body(fn_body, &fn_env)?;
+        egcl_rt::rooted_ref!(_expanded_fn_body_root = &mut expanded_fn_body);
+        if expanded_fn_body != fn_body || expanded_params != params {
             defs_changed = true;
         }
-        expanded_defs.push(alloc_cons(fn_name, alloc_cons(params, expanded_fn_body)));
+        expanded_defs.push(alloc_cons(
+            fn_name,
+            alloc_cons(expanded_params, expanded_fn_body),
+        ));
     }
 
     // Augment env with function names for the body
     let mut body_env = env.clone();
+    egcl_rt::rooted_ref!(_body_env_root = &mut body_env);
     for i in 0..defs.len() {
         let def = defs[i];
         if def.is_cons() {
@@ -2628,28 +2812,18 @@ fn expand_labels(mut form: EgclVal, env: &Environment) -> Result<EgclVal, EgclEr
         let mut fn_body = unsafe { cons_cdr(fn_rest) };
         egcl_rt::rooted_ref!(_fn_body_root = &mut fn_body);
 
-        // Augment with params
-        let mut fn_env = augmented_env.clone();
+        let (mut expanded_params, mut fn_env) = expand_lambda_list(params, fn_body, &augmented_env, false)?;
+        egcl_rt::rooted_ref!(_expanded_params_root = &mut expanded_params);
         egcl_rt::rooted_ref!(_fn_env_root = &mut fn_env);
-        egcl_rt::rooted!(param_list = cons_to_vec(params));
-        for j in 0..param_list.len() {
-            let param = param_list[j];
-            if param.is_symbol() && !param.is_nil() {
-                if let Some(name) = get_symbol_name(param) {
-                    if name.starts_with('&') {
-                        continue;
-                    }
-                }
-                fn_env = fn_env.augment_variable(param, VariableInfo::Lexical);
-            }
-        }
-
         let mut expanded_fn_body = expand_body(fn_body, &fn_env)?;
         egcl_rt::rooted_ref!(_expanded_fn_body_root = &mut expanded_fn_body);
-        if expanded_fn_body != fn_body {
+        if expanded_fn_body != fn_body || expanded_params != params {
             defs_changed = true;
         }
-        expanded_defs.push(alloc_cons(fn_name, alloc_cons(params, expanded_fn_body)));
+        expanded_defs.push(alloc_cons(
+            fn_name,
+            alloc_cons(expanded_params, expanded_fn_body),
+        ));
     }
 
     let mut expanded_body = expand_body(body, &augmented_env)?;

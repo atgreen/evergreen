@@ -5255,6 +5255,46 @@ fn load_macroexpand_environment(handle: EgclVal) -> Option<MacroexpandEnv> {
     MACROEXPAND_ENVIRONMENTS.with(|envs| envs.borrow().get(&(id as u64)).cloned())
 }
 
+/// A null lexical environment still contains global symbol macros.
+fn macroexpand_global_environment() -> MacroexpandEnv {
+    let base = cli_global_macro_env();
+    let variables = GLOBAL_SYMBOL_MACROS
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(&index, &value)| {
+            (
+                EgclVal::from_symbol_index(index),
+                VariableInfo::SymbolMacro(value),
+            )
+        })
+        .collect();
+    MacroexpandEnv::child_of(base, variables, Vec::new(), Vec::new())
+}
+
+fn macroexpand_all_builtin(args: &[EgclVal], env: &Env) -> Result<EgclVal, EgclError> {
+    if !(1..=2).contains(&args.len()) {
+        return Err(EgclError::ProgramError(
+            "EGCL-EXT:MACROEXPAND-ALL requires a form and an optional environment".into(),
+        ));
+    }
+    egcl_rt::rooted!(args = args.to_vec());
+    let environment = args.get(1).copied().unwrap_or(NIL);
+    let mut macro_env = if environment.is_nil() {
+        macroexpand_global_environment()
+    } else {
+        load_macroexpand_environment(environment).ok_or_else(|| {
+            EgclError::ProgramError(
+                "EGCL-EXT:MACROEXPAND-ALL received an invalid lexical environment".into(),
+            )
+        })?
+    };
+    egcl_rt::rooted_ref!(_macro_env_root = &mut macro_env);
+    with_macroexpand_dynamic_context(env, || {
+        compiler_macroexpand::macroexpand_all_for_tools(args[0], &macro_env)
+    })
+}
+
 /// Lossless declaration lookup for implementation compatibility libraries.
 /// The environment handle has dynamic extent (CLHS 3.1.1.4), matching the
 /// registry lifetime above; NIL denotes the null lexical environment.
@@ -10952,6 +10992,7 @@ impl Env {
         ))]
         bytecode::initialize_native_callable_entries();
         compiler_macroexpand::set_local_macro_evaluator(eval_compiler_local_macro);
+        compiler_macroexpand::set_global_expansion_environment(macroexpand_global_environment);
         compiler_macroexpand::set_macroexpand_hook(invoke_lisp_macroexpand_hook);
         compiler_macroexpand::set_atomic_update_operator_test(is_atomic_update_operator);
         install_evaluator_global_root_scanner();
@@ -20754,7 +20795,7 @@ fn fixed_arity_builtin(bare: &str) -> Option<(usize, usize)> {
         "RENAME-FILE" => Some((2, 2)),
         "ENSURE-DIRECTORIES-EXIST" => Some((1, 65)),
         "DIRECTORY" => Some((1, 65)),
-        "MACROEXPAND" | "MACROEXPAND-1" | "MACRO-FUNCTION" | "CONSTANTP" | "COMPILE"
+        "MACROEXPAND" | "MACROEXPAND-1" | "MACROEXPAND-ALL" | "MACRO-FUNCTION" | "CONSTANTP" | "COMPILE"
         | "DECODE-UNIVERSAL-TIME" => Some((1, 2)),
         "SLEEP" | "DISASSEMBLE" => Some((1, 1)),
         "SLOT-VALUE" | "SLOT-BOUNDP" | "SLOT-EXISTS-P" | "SLOT-MAKUNBOUND" => Some((2, 2)),
@@ -27468,6 +27509,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 record_module(env, &name);
                 return Ok(module_val);
             }
+            "EGCL-EXT:MACROEXPAND-ALL" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL-EXT:DECLARATION-SPECIFIER" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL-EXT:DECLARATION-SPECIFIERS" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL-EXT:PROCLAIMED-DECLARATIONS" => return eval_builtin_arguments(&name, cdr, env),
@@ -43070,6 +43112,8 @@ fn is_builtin_function(name: &str) -> bool {
             | "EGCL-EXT::INFLATE"
             | "EGCL-EXT:GC"
             | "EGCL-EXT::GC"
+            | "EGCL-EXT:MACROEXPAND-ALL"
+            | "EGCL-EXT::MACROEXPAND-ALL"
             | "EGCL-EXT:DECLARATION-SPECIFIER"
             | "EGCL-EXT::DECLARATION-SPECIFIER"
             | "EGCL-EXT:DECLARATION-SPECIFIERS"
@@ -44058,6 +44102,9 @@ fn apply_builtin(name: &str, args: &[EgclVal], _env: &mut Env) -> Result<EgclVal
         )));
     }
     match name {
+        "EGCL-EXT:MACROEXPAND-ALL" | "EGCL-EXT::MACROEXPAND-ALL" => {
+            macroexpand_all_builtin(args, _env)
+        }
         "EGCL-EXT:DECLARATION-SPECIFIER" | "EGCL-EXT::DECLARATION-SPECIFIER" => {
             if args.len() != 2 {
                 return Err(EgclError::ProgramError(format!(
