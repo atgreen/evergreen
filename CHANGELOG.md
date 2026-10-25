@@ -43,7 +43,7 @@
   so a value that keeps changing type ends up in generic native code
   rather than recompiling for every change. Loops that move to double-floats
   still finish in the interpreter
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#646](https://github.com/atgreen/evergreen/pull/646)).
 
 ### Fixed
 
