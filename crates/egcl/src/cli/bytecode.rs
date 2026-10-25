@@ -13706,6 +13706,16 @@ pub(super) fn install_closure_control(
         .insert(sym_idx, (blocks, tags));
 }
 
+/// Run the major collection a previous allocation requested, if any, before
+/// making a closure. It is only an opportunity: a failed collection moved
+/// nothing (an out-of-memory minor collection, or a world that did not stop
+/// in time) and leaves the request set, so the next allocation retries it and
+/// reports a real exhaustion itself. Panicking here instead aborted the process
+/// through a nested native call (GitHub #609, bliss-vj99y).
+fn collect_requested_major_before_closure() {
+    let _ = egcl_rt::gc::collect_if_major_requested();
+}
+
 /// Materialize a callable value for a nested-lambda `MakeClosure`. Each
 /// evaluation yields a distinct function identity: a fresh uninterned symbol
 /// whose bytecode body is registered, wrapped in an interpreted-function object.
@@ -13725,8 +13735,7 @@ pub(super) fn make_bytecode_closure(
     let sym_idx = sym.as_symbol_index();
     egcl_rt::rooted!(_callable_root = ActiveCallableRoot(sym_idx));
     // Short-lived closures only die in a major collection (bliss-5ndk).
-    egcl_rt::gc::collect_if_major_requested()
-        .expect("GC failed while making a closure");
+    collect_requested_major_before_closure();
     let lambda_list = if nested.variadic {
         nested.params_form
     } else {
@@ -14460,8 +14469,7 @@ pub(super) fn compile_tree_closure(
     };
     egcl_rt::rooted!(_bytecode_root = ActiveBytecodeRoot::new(&bf));
     // Short-lived closures only die in a major collection (bliss-5ndk).
-    egcl_rt::gc::collect_if_major_requested()
-        .expect("GC failed while making a closure");
+    collect_requested_major_before_closure();
     let sym = egcl_rt::symbols::make_uninterned("CLOSURE");
     let sym_idx = sym.as_symbol_index();
     closure_bodies().borrow_mut().insert(sym_idx, Arc::clone(&bf));
@@ -19306,13 +19314,71 @@ extern "C" fn c2i_pop_env_child() {
 /// reached via this boundary); it must become a condition `run_native` re-raises,
 /// never kill the process. The closure's captured state is asserted unwind-safe:
 /// a panic drops the RAII borrow guards on the way out, so RefCells are released.
+///
+/// CL stack frames are not RAII: a frame pushed inside `f` stays pushed when a
+/// panic skips its pop. Everything `f` pushed is dead once it has panicked, so
+/// the stack is cut back to the frame that was current on entry. Otherwise the
+/// enclosing native activation finds a stranger's frame on top when it
+/// retires, and `finish_nested`'s check aborts the process (bliss-vj99y).
 fn guard_c2i<F>(f: F) -> Result<EgclVal, EgclError>
 where
     F: FnOnce() -> Result<EgclVal, EgclError>,
 {
+    let stack = egcl_rt::current_stack();
+    let entry_fp = stack.fp();
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
         Ok(result) => result,
-        Err(payload) => Err(c2i_panic_error(payload)),
+        Err(payload) => {
+            pop_frames_above(stack, entry_fp);
+            Err(c2i_panic_error(payload))
+        }
+    }
+}
+
+/// Pop every frame pushed after `entry_fp`. Frames are pushed at increasing
+/// addresses, so the ones above `entry_fp` are exactly those at higher ones.
+fn pop_frames_above(stack: &egcl_rt::EgclStack, entry_fp: *const egcl_rt::stack::Frame) {
+    while !stack.fp().is_null() && (stack.fp() as usize) > (entry_fp as usize) {
+        stack.pop_frame();
+    }
+}
+
+#[cfg(test)]
+mod guard_c2i_stack_tests {
+    use super::*;
+
+    /// A panic recovered at the c2i boundary leaves the CL stack where it was
+    /// on entry, however many frames the panicking code had pushed
+    /// (bliss-vj99y), and a normal return is left alone.
+    #[test]
+    fn recovered_panic_pops_the_frames_it_stranded() {
+        let stack = egcl_rt::current_stack();
+        let outer = stack
+            .push_frame(NIL, std::ptr::null(), 0, 0)
+            .expect("push the caller's frame");
+        let entry_fp = stack.fp();
+        let result = guard_c2i(|| {
+            let stack = egcl_rt::current_stack();
+            stack.push_frame(NIL, std::ptr::null(), 0, 0).expect("push");
+            stack.push_frame(NIL, std::ptr::null(), 2, 0).expect("push");
+            panic!("simulated failure inside a nested native call");
+        });
+        let message = format!("{:?}", result.expect_err("the panic becomes an error"));
+        assert!(message.contains("recovered a panic"), "{message}");
+        assert_eq!(stack.fp(), entry_fp, "stranded frames are popped");
+
+        // A frame left pushed by a normal return is not the guard's to pop.
+        let kept = guard_c2i(|| {
+            egcl_rt::current_stack()
+                .push_frame(NIL, std::ptr::null(), 0, 0)
+                .expect("push");
+            Ok(NIL)
+        });
+        assert!(kept.is_ok());
+        assert_ne!(stack.fp(), entry_fp);
+        stack.pop_frame();
+        assert_eq!(stack.fp(), outer as *const _);
+        stack.pop_frame();
     }
 }
 
