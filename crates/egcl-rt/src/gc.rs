@@ -2431,7 +2431,11 @@ impl HeapCollector {
         let heap_base_addr = state.heap_base as usize;
         let heap_end = heap_base_addr + state.config.heap_size;
         for &slot_addr in &state.remembered {
-            if slot_addr >= heap_base_addr && slot_addr + 8 <= heap_end {
+            // A slot in a nursery holder is no root (see `write_barrier`); a
+            // live holder is traced, a dead one must not keep its referent.
+            if slot_addr >= heap_base_addr && slot_addr + 8 <= heap_end
+                && !slot_in_nursery(state, slot_addr)
+            {
                 mark_ref(
                     unsafe { *(slot_addr as *const EgclVal) },
                     &mut nursery_index,
@@ -2745,7 +2749,11 @@ impl HeapCollector {
         // their referents now live in regions a minor GC does not move.
         let remembered: Vec<usize> = state.remembered.drain().collect();
         for slot_addr in remembered {
-            if slot_addr < heap_base_addr || slot_addr + 8 > heap_end {
+            // Nursery holders were not roots; a live one's copy is relocated
+            // with the evacuated objects below.
+            if slot_addr < heap_base_addr || slot_addr + 8 > heap_end
+                || slot_in_nursery(state, slot_addr)
+            {
                 continue;
             }
             // SAFETY: slot_addr lies within the managed heap.
@@ -4054,10 +4062,27 @@ pub fn write_barrier(slot_addr: *mut EgclVal, old_val: EgclVal, new_val: EgclVal
         if gc_marking_in_progress() {
             state.satb_log.push(old_val);
         }
-        if is_heap_ref(new_val) {
+        // A slot inside a nursery object is not an old→young root: if its
+        // holder is live, tracing the holder reaches the referent. Recording it
+        // made every list built by tail mutation (`(setf (cdr tail) ..)`,
+        // LOOP COLLECT) a root at the next minor collection, so dead lists
+        // survived it and the whole nursery was copied every cycle.
+        if is_heap_ref(new_val) && !slot_in_nursery(state, slot_addr as usize) {
             state.remembered.insert(slot_addr as usize);
         }
     }
+}
+
+/// Whether `slot_addr` lies in a nursery region of `state`'s heap.
+fn slot_in_nursery(state: &HeapState, slot_addr: usize) -> bool {
+    let base = state.heap_base as usize;
+    if slot_addr < base {
+        return false;
+    }
+    state
+        .regions
+        .get((slot_addr - base) / state.config.region_size)
+        .is_some_and(|region| region.header.kind == RegionKind::Nursery)
 }
 
 /// Store `new` into the reference slot at `slot`, running the write barrier

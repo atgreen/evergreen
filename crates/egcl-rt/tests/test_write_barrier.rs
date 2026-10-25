@@ -113,6 +113,29 @@ fn old_to_young_reference_survives_and_relocates_across_minor_gc() {
 }
 
 #[test]
+fn a_young_holder_is_not_a_remembered_root() {
+    let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    init_heap(&gc_config()).unwrap();
+    let mut alloc = HeapAllocator::new().unwrap();
+
+    // A young holder storing a young reference -- the tail mutation every
+    // forward-built list (LOOP COLLECT) does. Tracing the holder covers the
+    // edge when the holder is live, so the slot must not become a root: as one,
+    // it kept every dead list alive across the next minor collection.
+    let holder = alloc.alloc_fast(16).unwrap();
+    let young = alloc.alloc_fast(24).unwrap();
+    unsafe { store_ref(holder as *mut EgclVal, heap_ref(young)) };
+    assert_eq!(remembered_set_len(), 0, "a nursery holder records nothing");
+
+    // An old (large-object) holder still records the same store.
+    let old = alloc.alloc_large(16).unwrap();
+    unsafe { store_ref(old as *mut EgclVal, heap_ref(young)) };
+    assert_eq!(remembered_set_len(), 1, "an old holder is still remembered");
+    HeapCollector::new().minor_gc().unwrap();
+    assert_eq!(remembered_set_len(), 0);
+}
+
+#[test]
 fn immediate_stores_do_not_grow_the_remembered_set() {
     let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
     init_heap(&gc_config()).unwrap();
