@@ -32,6 +32,18 @@
   now leaves the interpreter like any other hot loop: 10,000,000 iterations
   of `(let ((*x* 0)) (dotimes (i n) (incf *x* i)))` take 8.4 s instead of 22 s
   ([#639](https://github.com/atgreen/evergreen/pull/639)).
+- On x86-64 Linux, a long-running loop whose arithmetic changes type part-way
+  through, for example a fixnum sum that becomes a single-float or overflows
+  into a bignum, returns to native code after the change instead of
+  finishing that call in the interpreter. Once the loop has run another
+  100,000 iterations, the code that made the wrong assumption is replaced
+  with code compiled for the new types. One call of
+  `(dotimes (i 8000000) (setq acc (+ acc (if (< i 4000000) 1 1.0f0))))` takes
+  0.6 s instead of 7.4 s. A loop can switch code a limited number of times,
+  so a value that keeps changing type ends up in generic native code
+  rather than recompiling for every change. Loops that move to double-floats
+  still finish in the interpreter
+  ([#646](https://github.com/atgreen/evergreen/pull/646)).
 
 ### Fixed
 

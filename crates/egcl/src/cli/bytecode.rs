@@ -26663,6 +26663,100 @@ impl Drop for MappedOsrActive {
     }
 }
 
+/// How many more machine levels one T0 activation may enter by mapped OSR
+/// after its first entry deoptimized (bliss-k51a). Each level is a resumed T0
+/// run nested in the failed machine activation, so the bound caps both stack
+/// growth and how often one activation can trade code after deopts.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+const MAPPED_REOSR_MAX_DEPTH: usize = 2;
+
+/// Per-function count of versions retired so a re-warmed loop could re-enter
+/// native code after a deopt (bliss-k51a).
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+static REOSR_RETIREMENTS: egcl_rt::execution_local::ExecutionLocal<RefCell<HashMap<u32, u32>>> =
+    unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(HashMap::new())) };
+
+/// Retirements a function may spend on re-entry over its lifetime
+/// (`EGCL_REOSR_LIMIT`, default 4). A site whose type keeps changing has a
+/// mixed profile by then and compiles generic; this bounds the rest.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn reosr_limit() -> u32 {
+    use std::sync::OnceLock;
+    static N: OnceLock<u32> = OnceLock::new();
+    *N.get_or_init(|| positive_env(&["EGCL_REOSR_LIMIT"], 4))
+}
+
+/// Spend one of `sym`'s retirements; returns how many it had spent before.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn take_reosr_budget(sym: u32) -> Option<u32> {
+    REOSR_RETIREMENTS.with(|counts| {
+        let mut counts = counts.borrow_mut();
+        let spent = counts.entry(sym).or_insert(0);
+        let before = *spent;
+        if before >= reosr_limit() {
+            return None;
+        }
+        *spent += 1;
+        Some(before)
+    })
+}
+
+/// The first time a function's loop re-enters after a deopt, forget the
+/// type `failed` bet on at each site that has since seen another type, so the
+/// replacement follows the new phase (bliss-k51a). Later re-entries keep both
+/// phases' samples: a site that changed again is mixed and compiles generic,
+/// instead of alternating between specialisations on every phase.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn decay_changed_phase_sites(body: &Arc<BytecodeFunction>, failed: &NativeCode) {
+    let speculations: Vec<(u32, SpecType)> = match failed.t2_metadata.as_deref() {
+        Some(installed) => installed.speculations.clone(),
+        // T1's optimistic arithmetic templates are always Fixnum.
+        None => body.code.iter().enumerate()
+            .filter(|(_, op)| matches!(op, Instr::CallNamed { sym, .. } if is_arith_speculatable(*sym)))
+            .map(|(bcp, _)| (bcp as u32, SpecType::Fixnum))
+            .collect(),
+    };
+    let key = Arc::as_ptr(body) as usize;
+    TYPE_PROFILE.with(|profiles| {
+        let mut profiles = profiles.borrow_mut();
+        for (bcp, kind) in speculations {
+            let Some(profile) = profiles.get_mut(&(key, bcp)) else { continue };
+            let total = profile.total();
+            let bet = match kind {
+                SpecType::Fixnum => &mut profile.fixnum,
+                SpecType::SingleFloat => &mut profile.single_float,
+                SpecType::DoubleFloat => &mut profile.double_float,
+            };
+            if *bet < total {
+                *bet = 0;
+            }
+        }
+    });
+}
+
+/// Retire `sym`'s installed version, whose guards failed in a still-running
+/// activation, for generic T1 -- the numeric phase-change replacement -- and
+/// let dispatch queue a T2 version from the re-warmed profile (bliss-k51a).
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn retire_for_reosr(sym: u32, fn_obj: Option<EgclVal>) -> Option<Rc<NativeCode>> {
+    // The failed version stays alive in the suspended activations using it.
+    NATIVE_REGISTRY.with(|r| r.borrow_mut().remove(&sym));
+    bump_direct_call_gen();
+    T2_DECLINED.with(|s| s.borrow_mut().remove(&sym));
+    DEOPT_COUNTS.with(|m| m.borrow_mut().insert(sym, 0));
+    PROMOTED_FRESH.with(|s| s.borrow_mut().remove(&sym));
+    LAST_FAILED_SPECULATION.with(|m| m.borrow_mut().remove(&sym));
+    DECAYED_EVIDENCE.with(|m| m.borrow_mut().remove(&sym));
+    let Some(generic) = try_promote_to_t1_with_speculation(sym, false) else {
+        if let Some(function) = fn_obj {
+            egcl_rt::function::set_tier(function, 0);
+        }
+        return None;
+    };
+    publish_native(sym, fn_obj, &generic);
+    Some(generic)
+}
+
 /// Enter published mapped code at a hot loop header of a T0 activation, so a
 /// loop in a function called only once leaves the interpreter (bliss-s0v50).
 /// The function is promoted to T1 here if it has no native code yet; from
@@ -26700,7 +26794,22 @@ fn maybe_mapped_osr(
     {
         return None;
     }
-    if MAPPED_OSR_ACTIVE.with(|active| active.borrow().contains(&body_ptr)) {
+    // A guard deopt resumes the activation in a T0 run nested inside the
+    // failed machine activation. Its loop may enter again once it re-warms,
+    // but only a bounded number of levels deep (bliss-k51a).
+    let reentry = MAPPED_OSR_ACTIVE.with(|active| {
+        active.borrow().iter().filter(|&&body| body == body_ptr).count()
+    });
+    if reentry > 0 {
+        egcl_rt::blog!("osr", egcl_rt::log::TRACE,
+            "[osr] {}: loop re-warmed after a deopt at header {target_bcp} (depth {reentry}{})",
+            sym_label(act.sym),
+            if reentry > MAPPED_REOSR_MAX_DEPTH { ", at the re-entry limit" } else { "" });
+    }
+    // Past the limit the loop finishes in T0. Restart its count so this is
+    // reconsidered once per threshold, not on every later back-edge.
+    if reentry > MAPPED_REOSR_MAX_DEPTH {
+        egcl_rt::function::reset_back_edge_count(fn_obj);
         return None;
     }
     let decline = || {
@@ -26754,14 +26863,50 @@ fn maybe_mapped_osr(
         return decline();
     }
     poll_t2_completions();
-    let installed = NATIVE_REGISTRY.with(|registry| registry.borrow().get(&owner).cloned());
+    let mut installed = NATIVE_REGISTRY.with(|registry| registry.borrow().get(&owner).cloned());
+    // Re-entering after a guard deopt: code whose guards have failed would
+    // fail again at once. Replace it with generic T1, as a numeric phase
+    // change does, so the loop leaves T0 and its re-warmed profile leads the
+    // next T2 version.
+    if reentry > 0
+        && installed.as_ref().is_some_and(|native| {
+            matches!(&native._storage, NativeCodeStorage::Mapped(code) if code.has_deopted())
+        })
+    {
+        let Some(spent) = take_reosr_budget(owner) else {
+            egcl_rt::blog!("osr", egcl_rt::log::TRACE,
+                "[osr] {}: re-entry budget spent; the loop stays in T0", sym_label(sym));
+            egcl_rt::function::reset_back_edge_count(fn_obj.unwrap());
+            return None;
+        };
+        if spent == 0
+            && let Some(failed) = installed.as_ref()
+        {
+            decay_changed_phase_sites(&act.func, failed);
+        }
+        let generic = retire_for_reosr(owner, if owner == sym { *fn_obj } else { None });
+        if !current_definition() || !owner_current() {
+            return decline();
+        }
+        let Some(generic) = generic else { return decline() };
+        if t2_log_target().is_some() {
+            t2_log_write(format_args!(
+                "{}: loop re-warmed after a guard deopt => generic T1, re-entering by OSR at header {target_bcp} (depth {reentry})",
+                display_fn_name(&act.func.name)
+            ));
+        }
+        installed = Some(generic);
+    }
     let native = match installed {
         Some(native) => native,
         None => {
             if t1_declined(sym) || t1_declined(owner) {
                 return decline();
             }
-            let Some(native) = try_promote_to_t1(owner) else { return decline() };
+            // A re-entry compiles no speculation its first entry disproved.
+            let Some(native) = try_promote_to_t1_with_speculation(owner, reentry == 0) else {
+                return decline();
+            };
             // Compilation can collect and run Lisp; publish only for the
             // definition this activation is running.
             if !current_definition() || !owner_current()

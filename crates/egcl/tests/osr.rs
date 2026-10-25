@@ -678,3 +678,63 @@ fn loops_inside_special_bindings_enter_native_code_and_match_interpretation() {
         assert!(log.contains(&format!("{name}: T0 activation entered mapped")), "{name}:\n{log}");
     }
 }
+
+/// A guard deopt inside one long-running activation no longer strands the
+/// rest of that loop in T0 (bliss-k51a). Each function is warmed until T2 is
+/// installed, then called with a loop whose arithmetic changes phase halfway:
+/// fixnum to single-float, fixnum to bignum, single-float to fixnum. The
+/// resumed loop re-warms, its failed version is retired for generic T1, and
+/// it re-enters native code by OSR in the same activation, a bounded number
+/// of times. A site that alternates every iteration settles on generic code.
+/// Results must match the tree-walker.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn a_deoptimized_long_loop_reenters_native_code_after_its_phase_change() {
+    let program = r#"
+(defun pc-float (n h) (let ((acc 0)) (dotimes (i n acc) (setq acc (+ acc (if (< i h) 1 1.0f0))))))
+(defun pc-bignum (n h) (let ((acc (- most-positive-fixnum h))) (dotimes (i n (- acc most-positive-fixnum)) (setq acc (+ acc 1)))))
+(defun pc-fixnum (n h) (let ((acc 0) (x 0)) (dotimes (i n (list acc x)) (setq x (+ (if (< i h) 0.5f0 1) i)) (setq acc (+ acc 1)))))
+(defun pc-alternate (n h) (declare (ignore h)) (let ((acc 0) (x 0)) (dotimes (i n acc) (setq x (if (evenp i) 1 1.0f0)) (setq acc (+ acc (* x 2))))))
+(dolist (f '(pc-float pc-bignum pc-fixnum pc-alternate))
+  (dotimes (k 30) (funcall f 40 100)))
+(format t "~s~%" (list (pc-float 20000 10000) (pc-bignum 20000 10000) (pc-fixnum 20000 10000) (pc-alternate 20000 0)
+                       (pc-float 20000 10000) (pc-bignum 20000 10000) (pc-fixnum 20000 10000) (pc-alternate 20000 0)))
+(format t "OSR ~s~%" (mapcar #'egcl-ext:function-osr-count '(pc-float pc-bignum pc-fixnum pc-alternate)))
+"#;
+    let file = std::env::temp_dir().join(format!("egcl-phase-reosr-{}.lisp", std::process::id()));
+    std::fs::write(&file, program).unwrap();
+    let run = |tier: Option<&str>| {
+        let mut command = Command::new(BIN);
+        command
+            .args(["--no-init", "--load"])
+            .arg(&file)
+            .env_remove("EGCL_FORCE_TIER")
+            // A dispatch that queues T2 waits for it, so the phase change
+            // always fails a guard of installed T2 code.
+            .env("EGCL_T2", "1")
+            .env("EGCL_OSR_THRESHOLD", "1000")
+            .env("EGCL_T2_LOG", "stderr");
+        if let Some(tier) = tier {
+            command.env("EGCL_FORCE_TIER", tier);
+        }
+        let output = command.output().expect("run phase-change loops");
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(output.status.success(), "{stderr}");
+        (String::from_utf8_lossy(&output.stdout).into_owned(), stderr)
+    };
+    let (tiered, log) = run(None);
+    let (oracle, _) = run(Some("interp"));
+    std::fs::remove_file(&file).unwrap();
+    assert_eq!(tiered.lines().next(), oracle.lines().next(), "{log}");
+    assert_eq!(
+        tiered.lines().next(),
+        Some("(20000.0 10000 (20000 20000) 40000.0 20000.0 10000 (20000 20000) 40000.0)"),
+        "{log}"
+    );
+    let reentries = |name: &str| log.matches(&format!("{name}: loop re-warmed after a guard deopt")).count();
+    for name in ["PC-FLOAT", "PC-BIGNUM", "PC-FIXNUM"] {
+        let count = reentries(name);
+        assert!((1..=4).contains(&count), "{name} re-entered {count} times:\n{log}");
+    }
+    assert!(reentries("PC-ALTERNATE") <= 4, "{log}");
+}
