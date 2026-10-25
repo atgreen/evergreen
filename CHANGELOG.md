@@ -16,7 +16,7 @@
   takes 0.019 s instead of 6.3 s. A double loop that calls a function goes
   native too, but its calls are still slow in that first call: 4,000,000
   iterations take 2.9 s instead of 9.6 s, and 0.11 s from the next call on
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR), reported in
+  ([#649](https://github.com/atgreen/evergreen/pull/649), reported in
   [#642](https://github.com/atgreen/evergreen/issues/642)).
 - On x86-64 Linux, a loop typed at the REPL, given to `--eval` or written at
   the top level of a loaded file now leaves the interpreter part-way through,
