@@ -37,7 +37,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// `SymbolData` payload size (everything past the 8-byte header): name, value,
-/// function, plist, package (5×8) + flags + tls_index (2×4) = 48 bytes.
+/// function, plist, package (5×8) + flags + binding_guard (2×4) = 48 bytes.
 const SYMBOL_BODY_SIZE: usize = 48;
 
 /// Uninterned symbol indices start above the top bit so they never collide with
@@ -140,7 +140,7 @@ fn alloc_pinned_symbol(name: EgclVal, package: EgclVal) -> EgclVal {
         (*sym).plist = NIL;
         (*sym).package = *package;
         (*sym).flags = 0;
-        (*sym).tls_index = 0;
+        std::ptr::write(&raw mut (*sym).binding_guard, AtomicU32::new(0));
 
         EgclVal::from_heap_ptr(header)
     }
@@ -617,6 +617,7 @@ pub fn restore(data: &[u8]) -> Result<(), EgclError> {
     for name in names {
         intern(&name);
     }
+    resync_binding_guards();
     Ok(())
 }
 
@@ -789,6 +790,7 @@ pub fn restore_objects(data: &[u8]) -> Result<(), EgclError> {
             }
         }
     }
+    resync_binding_guards();
     Ok(())
 }
 
@@ -826,16 +828,104 @@ fn write_cell(idx: u32, set: impl FnOnce(&mut SymbolData)) {
     });
 }
 
+// ── Inline compiled access (bliss-csc8v) ────────────────────────────────────
+//
+// Native code reads and assigns a special variable without calling the runtime
+// when the symbol's `binding_guard` word is zero: no execution holds a dynamic
+// binding of it and it is not a constant, so the value cell is exactly what
+// `symbol_value` reads and `set_symbol_value_checked` writes. The guard counts
+// executions, not bindings: it changes only when an execution's binding overlay
+// gains or loses the symbol, and an execution establishes its own bindings
+// sequentially, so a zero observed by an execution proves it has none. Other
+// executions' bindings make the guard nonzero and only send this one to the
+// (equally correct) runtime path. No write barrier is needed: value cells of
+// registry symbols are scanned as roots by every collection.
+
+/// Byte offset of a symbol object's value cell.
+pub const SYMBOL_VALUE_OFFSET: i32 = std::mem::offset_of!(SymbolData, value) as i32;
+/// Byte offset of a symbol object's 32-bit `binding_guard` word.
+pub const SYMBOL_BINDING_GUARD_OFFSET: i32 = std::mem::offset_of!(SymbolData, binding_guard) as i32;
+/// `binding_guard` bit recording that the symbol is a constant. Reads may stay
+/// inline for a constant; assignments must reach the runtime, which rejects them.
+pub const BINDING_GUARD_CONSTANT: u32 = 1 << 31;
+/// `binding_guard` bits counting executions that hold a dynamic binding.
+pub const BINDING_GUARD_COUNT_MASK: u32 = !BINDING_GUARD_CONSTANT;
+
+/// The pinned object of an interned symbol, for native code that accesses its
+/// value cell inline. `None` for an uninterned symbol (which a sweep can free)
+/// or an unknown index; such accesses keep the runtime call.
+/// `EGCL_NO_INLINE_SPECIALS` disables the inline path, for comparison and
+/// bisection; it is read once per process.
+pub fn inline_access_object(idx: u32) -> Option<usize> {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if is_uninterned(idx) || *DISABLED.get_or_init(|| std::env::var_os("EGCL_NO_INLINE_SPECIALS").is_some()) {
+        return None;
+    }
+    symbol_object_ptr(idx)
+}
+
+/// The raw `binding_guard` word of a symbol, for tests and diagnostics.
+pub fn binding_guard(idx: u32) -> Option<u32> {
+    read_cell(idx, |s| s.binding_guard.load(Ordering::SeqCst))
+}
+
+fn adjust_binding_guard(idx: u32, gained: bool) {
+    read_cell(idx, |s| {
+        if gained {
+            s.binding_guard.fetch_add(1, Ordering::SeqCst);
+        } else {
+            s.binding_guard.fetch_sub(1, Ordering::SeqCst);
+        }
+    });
+}
+
+/// One execution's dynamic-binding overlay. Dropping it (when an execution is
+/// retired while it still holds bindings, e.g. a fiber abandoned mid-LET)
+/// releases its share of each symbol's guard, so the inline path is restored.
+#[derive(Default)]
+struct DynamicValues {
+    // Symbol indices are dense small integers: FxHash, not SipHash. Every
+    // access to a bound special looks here.
+    map: HashMap<u32, EgclVal, FxBuildHasher>,
+}
+
+impl Drop for DynamicValues {
+    fn drop(&mut self) {
+        for &idx in self.map.keys() {
+            adjust_binding_guard(idx, false);
+        }
+    }
+}
+
 // Dynamic bindings belong to the Lisp execution, not to a carrier or to the
 // process-wide symbol object. All callers, including stdlib printers, see the
 // same binding overlay through symbol_value/set_symbol_value.
-static DYNAMIC_VALUES: crate::execution_local::ExecutionLocal<
-    std::cell::RefCell<std::collections::HashMap<u32, EgclVal>>,
-> = unsafe {
-    crate::execution_local::ExecutionLocal::new(|| {
-        std::cell::RefCell::new(std::collections::HashMap::new())
-    })
+static DYNAMIC_VALUES: crate::execution_local::ExecutionLocal<std::cell::RefCell<DynamicValues>> = unsafe {
+    crate::execution_local::ExecutionLocal::new(|| std::cell::RefCell::new(DynamicValues::default()))
 };
+
+/// Recompute every symbol's guard after the registry is replaced wholesale
+/// (image restore): restored objects carry the saving process's counts. Only
+/// the restoring execution's overlay is known; it is counted so a binding it
+/// still holds keeps its symbol on the runtime path.
+fn resync_binding_guards() {
+    let bound: Vec<u32> = DYNAMIC_VALUES.with(|values| values.borrow().map.keys().copied().collect());
+    with_registry(|reg| {
+        let Some(reg) = reg else { return };
+        for &obj in reg.interned.iter().chain(reg.uninterned.values()) {
+            if crate::gc::heap_object_type_id(obj) != Some(type_id::SYMBOL) {
+                continue;
+            }
+            // SAFETY: registry entries that are SYMBOL objects are pinned live symbols.
+            let s = unsafe { &*symbol_data(obj) };
+            let constant = if s.flags & symbol_flags::CONSTANT != 0 { BINDING_GUARD_CONSTANT } else { 0 };
+            s.binding_guard.store(constant, Ordering::SeqCst);
+        }
+    });
+    for idx in bound {
+        adjust_binding_guard(idx, true);
+    }
+}
 
 /// Bind locally; the returned previous local value must be rooted until restored.
 pub fn bind_symbol_value(idx: u32, value: EgclVal) -> Option<EgclVal> {
@@ -845,7 +935,7 @@ pub fn bind_symbol_value(idx: u32, value: EgclVal) -> Option<EgclVal> {
             // SAFETY: root scanners execute under the stop-the-world handshake.
             unsafe {
                 DYNAMIC_VALUES.scan(|values| {
-                    for (&index, value) in values.borrow_mut().iter_mut() {
+                    for (&index, value) in values.borrow_mut().map.iter_mut() {
                         trace_symbol_index(index, visit);
                         visit(value);
                     }
@@ -853,24 +943,34 @@ pub fn bind_symbol_value(idx: u32, value: EgclVal) -> Option<EgclVal> {
             };
         })
     });
-    DYNAMIC_VALUES.with(|values| values.borrow_mut().insert(idx, value))
+    let previous = DYNAMIC_VALUES.with(|values| values.borrow_mut().map.insert(idx, value));
+    if previous.is_none() {
+        // This execution's overlay gained the symbol: inline accesses must stop
+        // using the value cell before the binding's body runs.
+        adjust_binding_guard(idx, true);
+    }
+    previous
 }
 
 pub fn restore_symbol_binding(idx: u32, previous: Option<EgclVal>) {
-    DYNAMIC_VALUES.with(|values| {
+    let released = DYNAMIC_VALUES.with(|values| {
         let mut values = values.borrow_mut();
         if let Some(previous) = previous {
-            values.insert(idx, previous);
+            values.map.insert(idx, previous);
+            false
         } else {
-            values.remove(&idx);
+            values.map.remove(&idx).is_some()
         }
     });
+    if released {
+        adjust_binding_guard(idx, false);
+    }
 }
 
 /// Read the current dynamic binding, or the global cell when not bound locally.
 pub fn symbol_value(idx: u32) -> Option<EgclVal> {
     DYNAMIC_VALUES
-        .with(|values| values.borrow().get(&idx).copied())
+        .with(|values| values.borrow().map.get(&idx).copied())
         .or_else(|| read_cell(idx, |s| EgclVal(s.value.load(Ordering::Acquire))))
 }
 
@@ -881,7 +981,10 @@ pub fn symbol_is_constant(idx: u32) -> bool {
 
 /// Mark an already-established compile-time binding as constant.
 pub fn mark_symbol_constant(idx: u32) {
-    write_cell(idx, |s| s.flags |= symbol_flags::CONSTANT);
+    write_cell(idx, |s| {
+        s.flags |= symbol_flags::CONSTANT;
+        s.binding_guard.fetch_or(BINDING_GUARD_CONSTANT, Ordering::SeqCst);
+    });
 }
 
 /// Publish a constant's global value and metadata together. Defining a constant
@@ -890,6 +993,7 @@ pub fn define_symbol_constant(idx: u32, value: EgclVal) {
     write_cell(idx, |s| {
         s.value.store(value.0, Ordering::Release);
         s.flags |= symbol_flags::CONSTANT;
+        s.binding_guard.fetch_or(BINDING_GUARD_CONSTANT, Ordering::SeqCst);
     });
 }
 
@@ -903,7 +1007,7 @@ pub fn set_symbol_value_checked(idx: u32, value: EgclVal) -> Result<(), EgclErro
         }
         let local = DYNAMIC_VALUES.with(|values| {
             let mut values = values.borrow_mut();
-            if let Some(slot) = values.get_mut(&idx) {
+            if let Some(slot) = values.map.get_mut(&idx) {
                 *slot = value;
                 true
             } else {
@@ -931,7 +1035,7 @@ pub fn set_symbol_value_checked(idx: u32, value: EgclVal) -> Result<(), EgclErro
 pub fn set_symbol_value(idx: u32, value: EgclVal) {
     let local = DYNAMIC_VALUES.with(|values| {
         let mut values = values.borrow_mut();
-        if let Some(slot) = values.get_mut(&idx) {
+        if let Some(slot) = values.map.get_mut(&idx) {
             *slot = value;
             true
         } else {
@@ -948,7 +1052,7 @@ pub fn set_symbol_value(idx: u32, value: EgclVal) {
 pub fn compare_exchange_symbol_value(idx: u32, old: EgclVal, new: EgclVal) -> Option<EgclVal> {
     let local = DYNAMIC_VALUES.with(|values| {
         let mut values = values.borrow_mut();
-        values.get_mut(&idx).map(|slot| {
+        values.map.get_mut(&idx).map(|slot| {
             let actual = *slot;
             if actual == old {
                 *slot = new;
@@ -969,7 +1073,7 @@ pub fn atomic_update_symbol_value(
 ) -> Option<Result<EgclVal, EgclError>> {
     let local = DYNAMIC_VALUES.with(|values| {
         let mut values = values.borrow_mut();
-        values.get_mut(&idx).map(|slot| {
+        values.map.get_mut(&idx).map(|slot| {
             let old = *slot;
             let new = crate::sync::atomic::checked_fixnum_update(old, delta, subtract)?;
             *slot = new;

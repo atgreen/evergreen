@@ -162,6 +162,25 @@ mod ordinary_prefix;
 mod inline_alloc;
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[path = "inline_special.rs"]
+mod inline_special;
+
+/// The CLI's test for a globally special variable (bliss-csc8v). Proclamations
+/// live above this crate; the test must stay true once it is true.
+static SPECIAL_VARIABLE_TEST: std::sync::OnceLock<fn(u32) -> bool> = std::sync::OnceLock::new();
+
+/// Install the test the emitter uses to decide whether a mapped global access
+/// may read or assign the symbol's value cell inline.
+pub fn set_special_variable_test(test: fn(u32) -> bool) {
+    let _ = SPECIAL_VARIABLE_TEST.set(test);
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn is_global_special(symbol: u32) -> bool {
+    SPECIAL_VARIABLE_TEST.get().is_some_and(|test| test(symbol))
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[path = "ordinary_primitives.rs"]
 mod ordinary_primitives;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -2495,17 +2514,33 @@ fn emit_symbol_value(
     c2i_load_global_addr: u64,
     c2i_recovery_toggle_addr: u64,
     transfer_check: Option<NativeTransferCheck>,
+    inline_value_cell: bool,
 ) -> Result<CallReturn, EmitError> {
     use crate::t2::ir::AuxData;
     let sym = match data.aux {
         AuxData::SymbolRef(s) => s,
         _ => return Err(EmitError::UnsupportedOp(0xFA)),
     };
+    let r0 = *data.results.first().ok_or(EmitError::UnsupportedOp(0xFA))?;
+    let dst = *reg.get(&r0).ok_or(EmitError::UnsupportedOp(0xF2))?;
+    // A value-cell read skips the helper unless the symbol is bound
+    // dynamically or unbound (bliss-csc8v). SymbolFunction shares this
+    // emitter with a different helper and never takes the inline path.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let inline_done = if inline_value_cell {
+        inline_special::emit_mapped_load(a, sym)
+    } else {
+        None
+    };
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+    let _ = inline_value_cell;
     mov_imm64(a, 7, sym as i64); // mov rdi, sym
     mov_imm64(a, 0, c2i_load_global_addr as i64); // mov rax, c2i_load_global
     let site = emit_runtime_helper_call(a, c2i_recovery_toggle_addr, transfer_check);
-    let r0 = *data.results.first().ok_or(EmitError::UnsupportedOp(0xFA))?;
-    let dst = *reg.get(&r0).ok_or(EmitError::UnsupportedOp(0xF2))?;
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    if let Some(done) = inline_done {
+        a.bind(done);
+    }
     mov_rr(a, dst, 0); // mov result, rax
     Ok(site)
 }
@@ -2534,9 +2569,17 @@ fn emit_set_symbol_value(
     } else {
         mov_rr(a, 6, *reg.get(&v).ok_or(EmitError::UnsupportedOp(0xF2))?); // mov rsi, v
     }
+    // Assign the value cell directly unless the symbol is bound dynamically
+    // or constant (bliss-csc8v).
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let inline_done = inline_special::emit_mapped_store(a, sym, 6);
     mov_imm64(a, 7, sym as i64); // mov rdi, sym
     mov_imm64(a, 0, c2i_store_global_addr as i64); // mov rax, c2i_store_global
     let site = emit_runtime_helper_call(a, c2i_recovery_toggle_addr, transfer_check);
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    if let Some(done) = inline_done {
+        a.bind(done);
+    }
     Ok(site)
 }
 
@@ -6775,6 +6818,8 @@ fn emit_framed_inner(
             #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
             let inline_alloc_done = if !ordinary_call_mode && inline_alloc_mv_free.contains(&inst) {
                 inline_alloc::emit_framed_fast_path(&mut a, &d, &homes, &const_tagged, true)
+            } else if !ordinary_call_mode && d.opcode == Opcode::Invoke {
+                inline_special::emit_transfer_fast_path(&mut a, &d, &homes, &const_tagged)
             } else { None };
             if let (Some(roots), Some(frame_base), Some(_)) =
                 (roots, frame_base_home, activation_slots)
@@ -6828,7 +6873,9 @@ fn emit_framed_inner(
             } else if ordinary_call_mode && d.opcode == Opcode::Call {
                 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
                 { let inline_done = inline_alloc::emit_ordinary_fast_path(&mut a, &d, &homes,
-                    &const_tagged, inline_alloc_single.contains(&inst));
+                    &const_tagged, inline_alloc_single.contains(&inst))
+                    .or_else(|| inline_special::emit_ordinary_fast_path(&mut a, &d, &homes,
+                        &const_tagged, inline_alloc_single.contains(&inst)));
                 inst_calls = ordinary_call.unwrap().for_inst(inst).emit(&mut a, &d, &homes, &const_tagged,
                     ordinary_call::OrdinaryCallFrame { function: f, inference: &inference,
                         outgoing: outgoing_area,
@@ -7306,6 +7353,7 @@ fn emit_framed_inner(
                     c2i_load_global_addr,
                     c2i_recovery_toggle_addr,
                     transfer_check,
+                    true,
                 )?);
             } else if d.opcode == Opcode::SymbolFunction {
                 // Same shape as a global read, different helper: it reads the
@@ -7317,6 +7365,7 @@ fn emit_framed_inner(
                     c2i_load_function_addr,
                     c2i_recovery_toggle_addr,
                     transfer_check,
+                    false,
                 )?);
             } else if d.opcode == Opcode::SetSymbolValue {
                 inst_calls.push(emit_set_symbol_value(

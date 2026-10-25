@@ -529,3 +529,152 @@ fn toplevel_and_closure_loops_enter_native_code_and_match_interpretation() {
     assert!(toplevel >= 10, "top-level loops must enter native code ({toplevel}):\n{log}");
     assert!(log.contains("<lambda>: T0 activation entered mapped"), "{log}");
 }
+
+/// Runs `program` from a file with low promotion thresholds, natively and under
+/// the tree-walker, and returns both outputs and the native run's log.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn run_against_interpreter(name: &str, program: &str, env: &[(&str, &str)]) -> (String, String, String) {
+    let file = std::env::temp_dir().join(format!("egcl-{name}-{}.lisp", std::process::id()));
+    std::fs::write(&file, program).unwrap();
+    let run = |tier: Option<&str>| {
+        let mut command = Command::new(BIN);
+        command
+            .args(["--no-init", "--load"])
+            .arg(&file)
+            .env_remove("EGCL_FORCE_TIER")
+            .env("EGCL_OSR_THRESHOLD", "200")
+            .env("EGCL_T1_T2_BACKEDGE_THRESHOLD", "100")
+            .env("EGCL_LOG", "osr=debug");
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        if let Some(tier) = tier {
+            command.env("EGCL_FORCE_TIER", tier);
+        }
+        let output = command.output().expect("run special-variable loops");
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(output.status.success(), "{stderr}");
+        (String::from_utf8_lossy(&output.stdout).into_owned(), stderr)
+    };
+    let (tiered, log) = run(None);
+    let (oracle, _) = run(Some("interp"));
+    std::fs::remove_file(&file).unwrap();
+    (tiered, oracle, log)
+}
+
+/// The program's output without its final native-entry report.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn without_osr_report(output: &str) -> String {
+    output.lines().filter(|line| !line.starts_with("OSR ")).collect::<Vec<_>>().join("\n")
+}
+
+/// Native code reads and assigns a special's value cell inline while no
+/// execution binds it (bliss-csc8v). Bindings in callers, callees, PROGV and
+/// other threads, unbound and constant variables, SYMBOL-VALUE and SET, and a
+/// mid-loop deopt must all still print what the interpreter prints.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn special_variable_access_in_native_loops_matches_interpretation() {
+    let program = r#"
+(defvar *sv-x* 0)
+(defvar *sv-y* 10)
+(defvar *sv-u*)
+(defvar *sv-l* nil)
+(defconstant +sv-k+ 7)
+(defmacro sv-check (form)
+  `(print (handler-case ,form
+            (unbound-variable (c) (list :unbound (cell-error-name c)))
+            (error (c) (list :error (type-of c))))))
+(defun sv-sum (n) (dotimes (i n) (incf *sv-x* i)) *sv-x*)
+(defun sv-read-x () *sv-x*)
+(defun sv-bump () (incf *sv-x*))
+(defun sv-caller (n) (let ((*sv-x* 100)) (dotimes (i n) (sv-bump)) (sv-read-x)))
+(defun sv-read-u (n) (let ((s 0)) (dotimes (i n s) (setq s (+ s *sv-u*)))))
+(defun sv-unbind-midway (n)
+  (let ((s 0)) (dotimes (i n s) (when (= i 1500) (makunbound '*sv-u*)) (setq s (+ s *sv-u*)))))
+(defun sv-progv (n) (progv '(*sv-x* *sv-y*) '(1000 2000) (dotimes (i n) (incf *sv-x*) (incf *sv-y* 2)) (list *sv-x* *sv-y* (sv-read-x))))
+(defun sv-set (n) (dotimes (i n) (set '*sv-x* (+ (symbol-value '*sv-x*) 1))) *sv-x*)
+(defun sv-setf (n) (dotimes (i n) (setf (symbol-value '*sv-x*) (+ *sv-x* 2))) (symbol-value '*sv-x*))
+(defun sv-read-k (n) (let ((s 0)) (dotimes (i n s) (setq s (+ s +sv-k+)))))
+(defun sv-set-k () (set '+sv-k+ 8))
+(defun sv-deopt (n) (dotimes (i n) (when (= i 2000) (setq *sv-x* 0.5d0)) (incf *sv-x*)) *sv-x*)
+(defun sv-heap (n) (setq *sv-l* nil) (dotimes (i n) (setq *sv-l* (cons (list i) *sv-l*))) (list (length *sv-l*) (car *sv-l*)))
+(defun sv-thread (k) (let ((*sv-x* (* k 1000))) (dotimes (i 3000) (incf *sv-x*)) *sv-x*))
+(sv-check (progn (setq *sv-x* 0) (sv-sum 3000)))
+(sv-check (progn (setq *sv-x* 0) (dotimes (k 30) (sv-sum 100)) *sv-x*))
+(sv-check (progn (setq *sv-x* 5) (list (sv-caller 3000) *sv-x*)))
+(sv-check (sv-read-u 3000))
+(sv-check (progn (setq *sv-u* 1) (sv-read-u 3000)))
+(sv-check (progn (setq *sv-u* 1) (sv-unbind-midway 3000)))
+(sv-check (list (boundp '*sv-u*) (let ((*sv-u* 4)) (sv-read-u 3000)) (boundp '*sv-u*)))
+(sv-check (progn (setq *sv-x* 1 *sv-y* 10) (list (sv-progv 3000) *sv-x* *sv-y*)))
+(sv-check (progn (setq *sv-x* 0) (sv-set 3000)))
+(sv-check (progn (setq *sv-x* 0) (sv-setf 3000)))
+(sv-check (progn (setq *sv-x* 0) (list (let ((*sv-x* 50)) (sv-set 3000)) *sv-x*)))
+(sv-check (sv-read-k 3000))
+(sv-check (sv-set-k))
+(sv-check (progn (setq *sv-x* 0) (sv-deopt 3000)))
+(sv-check (sv-heap 3000))
+(sv-check (progn (setq *sv-x* 77)
+                 (let ((ts (loop for k from 1 to 4
+                                 collect (let ((k k)) (egcl-thread:make-thread (lambda () (sv-thread k)))))))
+                   (list (mapcar #'egcl-thread:join-thread ts) *sv-x*))))
+(setq *sv-x* 0)
+(dotimes (i 3000) (incf *sv-x* i))
+(sv-check *sv-x*)
+(format t "~%OSR ~s~%" (every #'plusp (mapcar #'egcl-ext:function-osr-count
+                                              '(sv-sum sv-read-u sv-set sv-setf sv-deopt sv-heap))))
+"#;
+    let (tiered, oracle, log) = run_against_interpreter("special-access", program, &[]);
+    assert_eq!(without_osr_report(&tiered), without_osr_report(&oracle), "{log}");
+    assert!(tiered.contains("OSR T"), "the loops must enter native code: {tiered}\n{log}");
+    // The inline path is what this exercises; the runtime path must agree too.
+    let (fallback, _, log) =
+        run_against_interpreter("special-access-off", program, &[("EGCL_NO_INLINE_SPECIALS", "1")]);
+    assert_eq!(without_osr_report(&fallback), without_osr_report(&oracle), "{log}");
+}
+
+/// A hot loop running inside its own LET of a special leaves T0 with the
+/// binding live (bliss-csc8v): the binding moves to the mapped activation,
+/// stays visible to callees, survives a mid-loop deopt and is undone on every
+/// exit, including an error, a THROW and a nested rebinding of the same name.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn loops_inside_special_bindings_enter_native_code_and_match_interpretation() {
+    let program = r#"
+(defvar *sb-x* 0)
+(defvar *sb-y* 2)
+(defun sb-read-x () *sb-x*)
+(defun sb-around (n) (let ((*sb-x* 0)) (dotimes (i n) (incf *sb-x* i)) (list *sb-x* (sb-read-x))))
+(defun sb-deopt (n)
+  (let ((*sb-x* 0) (*sb-y* :outer))
+    (dotimes (i n) (when (= i 2000) (setq *sb-x* (- most-positive-fixnum 5))) (incf *sb-x*))
+    (list *sb-x* *sb-y* (sb-read-x))))
+(defun sb-float (n) (let ((*sb-x* 0)) (dotimes (i n) (when (= i 2000) (setq *sb-x* 0.5d0)) (incf *sb-x*)) *sb-x*))
+(defun sb-error (n) (let ((*sb-x* 0)) (dotimes (i n) (incf *sb-x*) (when (= i 2500) (error "stop ~a" *sb-x*)))))
+(defun sb-throw (n) (let ((*sb-x* 0)) (dotimes (i n) (incf *sb-x*) (when (= i 2600) (throw 'sb-out (list :thrown *sb-x*))))))
+(defun sb-nested (n) (let ((*sb-x* :a)) (let ((*sb-x* 0)) (dotimes (i n) (incf *sb-x*)) (setq *sb-y* *sb-x*)) *sb-x*))
+(defun sb-callee (n) (let ((*sb-x* 5) (s 0)) (dotimes (i n s) (setq s (+ s (sb-read-x))) (when (= i 1500) (setq *sb-x* 6)))))
+(defun sb-thread (k) (let ((*sb-x* (* k 1000))) (dotimes (i 3000) (incf *sb-x*)) *sb-x*))
+(setq *sb-x* 9)
+(print (list (sb-around 3000) *sb-x*))
+(print (list (sb-deopt 3000) *sb-x* *sb-y*))
+(print (list (sb-float 3000) *sb-x*))
+(print (list (handler-case (sb-error 3000) (error (c) (princ-to-string c))) *sb-x*))
+(print (list (catch 'sb-out (sb-throw 3000)) *sb-x*))
+(print (list (sb-nested 3000) *sb-y* *sb-x*))
+(print (list (sb-callee 3000) *sb-x*))
+(print (let ((ts (loop for k from 1 to 4 collect (let ((k k)) (egcl-thread:make-thread (lambda () (sb-thread k)))))))
+         (list (mapcar #'egcl-thread:join-thread ts) *sb-x*)))
+(let ((*sb-x* 1)) (dotimes (i 3000) (incf *sb-x*)) (print *sb-x*))
+(print *sb-x*)
+(format t "~%OSR ~s~%" (every #'plusp (mapcar #'egcl-ext:function-osr-count
+                                              '(sb-around sb-deopt sb-float sb-error sb-nested sb-callee))))
+"#;
+    let (tiered, oracle, log) = run_against_interpreter("special-bindings", program, &[]);
+    assert_eq!(without_osr_report(&tiered), without_osr_report(&oracle), "{log}");
+    assert!(tiered.contains("OSR T"), "the bound loops must enter native code: {tiered}\n{log}");
+    for name in ["SB-AROUND", "SB-DEOPT", "SB-ERROR", "SB-NESTED"] {
+        assert!(log.contains(&format!("{name}: T0 activation entered mapped")), "{name}:\n{log}");
+    }
+}

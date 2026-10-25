@@ -66,6 +66,10 @@ pub(super) unsafe fn validate_special_bindings(
 pub(super) unsafe fn special_request(call: &TransferCallRequest) -> Result<EgclVal, EgclError> {
     let tag = call.symbol & !u64::from(u32::MAX);
     let index = call.symbol as u32;
+    #[cfg(test)]
+    if matches!(tag, TRANSFER_GLOBAL_LOAD_REQUEST | TRANSFER_GLOBAL_STORE_REQUEST) {
+        count_global_access_helper_call();
+    }
     if tag == TRANSFER_GLOBAL_LOAD_REQUEST {
         if call.nargs != 0 {
             return Err(invalid_capture());

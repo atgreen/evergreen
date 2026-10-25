@@ -11,6 +11,7 @@ mod compiled;
 mod fallback;
 mod fibers;
 mod handlers;
+mod inline_specials;
 mod live_signaling;
 mod linkage;
 mod nested;

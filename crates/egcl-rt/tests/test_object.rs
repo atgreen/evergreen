@@ -357,7 +357,7 @@ fn cons_cell_car_cdr_are_egclval() {
 #[test]
 fn symbol_data_has_correct_fields() {
     let size = mem::size_of::<SymbolData>();
-    // header(8) + name(8) + value(8) + function(8) + plist(8) + package(8) + flags(4) + tls_index(4) = 56
+    // header(8) + name(8) + value(8) + function(8) + plist(8) + package(8) + flags(4) + binding_guard(4) = 56
     assert_eq!(size, 56);
 }
 
@@ -370,7 +370,7 @@ fn symbol_data_field_offsets() {
     assert_eq!(memoffset(|s: &SymbolData| &s.plist), 32);
     assert_eq!(memoffset(|s: &SymbolData| &s.package), 40);
     assert_eq!(memoffset(|s: &SymbolData| &s.flags), 48);
-    assert_eq!(memoffset(|s: &SymbolData| &s.tls_index), 52);
+    assert_eq!(memoffset(|s: &SymbolData| &s.binding_guard), 52);
 }
 
 // ── symbol_flags constants ────────────────────────────────────────

@@ -10954,6 +10954,9 @@ impl Env {
         compiler_macroexpand::set_local_macro_evaluator(eval_compiler_local_macro);
         compiler_macroexpand::set_macroexpand_hook(invoke_lisp_macroexpand_hook);
         compiler_macroexpand::set_atomic_update_operator_test(is_atomic_update_operator);
+        egcl_compiler::t2::emit::set_special_variable_test(|index| {
+            is_special_var(EgclVal::from_symbol_index(index))
+        });
         install_evaluator_global_root_scanner();
         if reset_clos {
             let _ = egcl_stdlib::bootstrap_clos();
