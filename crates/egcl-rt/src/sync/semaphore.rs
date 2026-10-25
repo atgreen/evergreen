@@ -89,6 +89,8 @@ impl EgclSemaphore {
                     }
                     drop(waiters);
                     crate::thread::park_prepared_current_fiber()?;
+                    #[cfg(all(test, egcl_fibers))]
+                    crate::thread::wait_token_tests::after_wait_park();
                     if waiter.notified.load(Ordering::Acquire) {
                         return Ok(true);
                     }

@@ -349,5 +349,109 @@ fn mutex_condition_and_semaphore_timeouts_return_without_stale_wakes() {
     assert!(TIMEOUT_SEM.get().unwrap().try_wait(1).unwrap());
 }
 
+// Timeouts that land around NOTIFY/SIGNAL time (bliss-xown). Each fiber's
+// deadline is staggered across the window in which the native thread
+// signals, so some deadlines fire just before, at, and after a wake.
+static RACE_INDEX: AtomicUsize = AtomicUsize::new(0);
+static RACE_SEM: OnceLock<EgclSemaphore> = OnceLock::new();
+static RACE_COND_MUTEX: OnceLock<EgclMutex> = OnceLock::new();
+static RACE_COND: OnceLock<EgclCondVar> = OnceLock::new();
+static RACE_MUTEX: OnceLock<EgclMutex> = OnceLock::new();
+static RACE_MUTEX_INSIDE: AtomicUsize = AtomicUsize::new(0);
+const RACE_FIBERS: usize = 48;
+const RACE_ROUNDS: usize = 12;
+
+fn race_timeout() -> Duration {
+    let index = RACE_INDEX.fetch_add(1, Ordering::AcqRel) % RACE_FIBERS;
+    Duration::from_micros(200 + 40 * index as u64)
+}
+
+fn race_semaphore_waiter() -> EgclVal {
+    let timeout = race_timeout();
+    EgclVal::from_fixnum(i64::from(
+        RACE_SEM.get().unwrap().wait(Some(timeout)).unwrap(),
+    ))
+}
+
+fn race_condition_waiter() -> EgclVal {
+    let timeout = race_timeout();
+    let mutex = RACE_COND_MUTEX.get().unwrap();
+    mutex.grab(true, None).unwrap();
+    let notified = RACE_COND.get().unwrap().wait(mutex, Some(timeout)).unwrap();
+    mutex.release().unwrap();
+    EgclVal::from_fixnum(i64::from(notified))
+}
+
+fn race_mutex_waiter() -> EgclVal {
+    let timeout = race_timeout();
+    let mutex = RACE_MUTEX.get().unwrap();
+    if !mutex.grab(true, Some(timeout)).unwrap() {
+        return EgclVal::from_fixnum(0);
+    }
+    assert_eq!(RACE_MUTEX_INSIDE.fetch_add(1, Ordering::AcqRel), 0);
+    std::thread::yield_now();
+    RACE_MUTEX_INSIDE.fetch_sub(1, Ordering::AcqRel);
+    mutex.release().unwrap();
+    EgclVal::from_fixnum(1)
+}
+
+fn race_round(entry: fn() -> EgclVal, mut wake: impl FnMut() -> i64) -> (i64, i64) {
+    let group = SchedulerGroup::init(&SchedulerConfig { num_workers: 2 }).unwrap();
+    for _ in 0..RACE_FIBERS {
+        group.submit(make_fiber(function(entry)).unwrap()).unwrap();
+    }
+    let mut woken = 0;
+    for step in 0..RACE_FIBERS {
+        woken += wake();
+        if step % 4 == 0 {
+            std::thread::sleep(Duration::from_micros(150));
+        }
+    }
+    let values = group.finish().unwrap();
+    let reported = values.iter().map(|value| value.as_fixnum()).sum();
+    (woken, reported)
+}
+
+#[test]
+fn timed_waits_racing_wakes_conserve_permits_and_notifications() {
+    let _guard = serial_lock().lock().unwrap();
+    RACE_SEM.get_or_init(|| EgclSemaphore::new(None, 0).unwrap());
+    RACE_COND_MUTEX.get_or_init(EgclMutex::default);
+    RACE_COND.get_or_init(EgclCondVar::default);
+    RACE_MUTEX.get_or_init(EgclMutex::default);
+    for round in 0..RACE_ROUNDS {
+        // Every SIGNAL adds one permit: a waiter that reports success took one.
+        let semaphore = RACE_SEM.get().unwrap();
+        let (signalled, acquired) = race_round(race_semaphore_waiter, || {
+            semaphore.signal(1).unwrap();
+            1
+        });
+        let left = semaphore.count();
+        assert_eq!(
+            acquired + left,
+            signalled,
+            "round {round}: {signalled} permits became {acquired} acquisitions plus {left} left"
+        );
+        while semaphore.try_wait(1).unwrap() {}
+
+        // A waiter reports notified exactly when NOTIFY selected it.
+        let condition = RACE_COND.get().unwrap();
+        let (selected, notified) = race_round(race_condition_waiter, || condition.notify(1) as i64);
+        assert_eq!(
+            notified, selected,
+            "round {round}: NOTIFY selected {selected} waiters but {notified} reported notified"
+        );
+
+        // Timed acquisitions stay mutually exclusive and none hangs.
+        let mutex = RACE_MUTEX.get().unwrap();
+        race_round(race_mutex_waiter, || {
+            if mutex.grab(false, None).unwrap() {
+                mutex.release().unwrap();
+            }
+            0
+        });
+    }
+}
+
 #[path = "support/native_entry.rs"]
 mod native_entry;

@@ -74,6 +74,8 @@ impl EgclCondVar {
                 }
                 drop(state);
                 crate::thread::park_prepared_current_fiber()?;
+                #[cfg(all(test, egcl_fibers))]
+                crate::thread::wait_token_tests::after_wait_park();
                 let notified = waiter.notified.load(Ordering::Acquire);
                 let mut state = self.state.lock().unwrap();
                 state

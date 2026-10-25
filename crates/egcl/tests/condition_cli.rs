@@ -99,6 +99,46 @@ fn native_lisp_condition_wait_releases_recursive_depth_and_counts_wakes() {
     );
 }
 
+/// Fiber condition waits whose timeouts land around CONDITION-NOTIFY
+/// (bliss-xown): a waiter reports it was notified exactly when a NOTIFY
+/// selected it, never when its deadline won and NOTIFY passed it over.
+/// One carrier starts the waiters a few milliseconds apart and NOTIFY runs
+/// at a similar rate once the first deadline is due, so deadlines and
+/// notifications interleave and both outcomes occur in each round.
+#[test]
+fn timed_fiber_condition_waits_agree_with_notify_counts() {
+    run(
+        r#"
+      (defvar *race-cv* (egcl-thread:make-condition-variable))
+      (defvar *race-mutex* (egcl-thread:make-mutex))
+      (defvar *race-ready* 0)
+      (defun timed-race-waiter ()
+        (egcl-thread:grab-mutex *race-mutex*)
+        (incf *race-ready*)
+        (let ((woke (egcl-thread:condition-wait *race-cv* *race-mutex* :timeout 1/10)))
+          (egcl-thread:release-mutex *race-mutex*)
+          (if woke 1 0)))
+      (dotimes (round 8)
+        (setf *race-ready* 0)
+        (let* ((fibers (loop repeat 32 collect (egcl-fiber:make-fiber #'timed-race-waiter)))
+               (group (egcl-fiber:start-fibers fibers :carrier-count 1))
+               (selected 0))
+          (loop until (egcl-thread:with-mutex (*race-mutex*) (> *race-ready* 0)))
+          (sleep 1/10)
+          (loop repeat 60
+                do (incf selected (egcl-thread:condition-notify *race-cv*))
+                   (sleep (/ (+ 2 (mod round 4)) 1000)))
+          (let ((reported (reduce #'+ (egcl-fiber:finish-fibers group))))
+            (assert (= reported selected) ()
+                    "round ~D: NOTIFY selected ~D waiters but ~D reported notified"
+                    round selected reported))))
+      (format t "TIMED-CONDITION-RACE-OK~%")
+    "#,
+        "TIMED-CONDITION-RACE-OK",
+        &[],
+    );
+}
+
 #[test]
 fn saved_condition_cannot_reuse_process_local_wait_queue() {
     let nonce = std::time::SystemTime::now()
