@@ -43,7 +43,7 @@
   thread-per-connection server. `progv` is now compiled. Closures the
   interpreter builds are also freed once they are unreachable, during normal
   garbage collection. Before, they were freed only between files loaded with
-  `load` ([#PR](https://github.com/atgreen/evergreen/pull/PR); reported in
+  `load` ([#640](https://github.com/atgreen/evergreen/pull/640); reported in
   [#634](https://github.com/atgreen/evergreen/issues/634)).
 
 ## 0.0.11 - 2026-10-24
