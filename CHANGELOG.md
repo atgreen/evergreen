@@ -25,6 +25,11 @@
 
 ### Added
 
+- `EGCL-EXT:MACROEXPAND-ALL` recursively expands macros and symbol macros
+  with lexical environment support. Lambda-list defaults now expand in their
+  proper binding scope, including optional/key/aux and supplied-p variables;
+  outer symbol macros no longer replace bound parameter references
+  ([#641](https://github.com/atgreen/evergreen/pull/641)).
 - `egcl-ext:with-locked-hash-table` is implemented. It was documented but
   undefined. It runs its body holding a recursive lock of the table's own, so
   the bodies of `with-locked-hash-table` forms on one table exclude each
