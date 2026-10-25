@@ -995,6 +995,9 @@ fn resolve(name: &str) -> Option<Handler> {
             })
         }),
 
+        // The bytecode lowerer compiles PROGV to this, with its body as a
+        // zero-argument closure; the thunk's values are the form's values.
+        "EGCL::%PROGV" => Some(|_operator, args, env| call_progv(args, env)),
         "EGCL::%MEMORY-FENCE" => Some(|_operator, args, env| {
             env.clear_mv();
             egcl_stdlib::synchronization::memory_barrier(args)

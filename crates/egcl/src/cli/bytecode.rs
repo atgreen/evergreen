@@ -3078,6 +3078,7 @@ impl<'e> Lowerer<'e> {
                 "MULTIPLE-VALUE-BIND" => self.lower_mvb(rest),
                 "MULTIPLE-VALUE-LIST" => self.lower_mvlist(rest),
                 "MULTIPLE-VALUE-PROG1" => self.lower_mvprog1(rest),
+                "PROGV" => self.lower_progv(rest),
                 "NTH-VALUE" => self.lower_nth_value(rest),
                 "LAMBDA" => self.lower_lambda(op, rest),
                 "FUNCTION" => self.lower_function(rest),
@@ -3132,6 +3133,31 @@ impl<'e> Lowerer<'e> {
             self.push_n(1);
             Ok(())
         }
+    }
+
+    /// `(progv symbols values form*)` lowers to
+    /// `(egcl::%progv symbols values #'(lambda () form*))`. The runtime entry
+    /// establishes the dynamic bindings, calls the thunk, and undoes them on
+    /// every exit, the same way the evaluator does. Before this PROGV bailed,
+    /// so any closure whose body contained one was built by the tree-walker and
+    /// kept in its closure registry, which retained it and everything it
+    /// captured indefinitely (GH #634). `compute_captured_names` treats the
+    /// body as a closure body so the locals it references are boxed.
+    fn lower_progv(&mut self, mut rest: EgclVal) -> LowerResult<()> {
+        egcl_rt::rooted_ref!(_rest_root = &mut rest);
+        if !rest.is_cons() || !cp(rest).1.is_cons() {
+            return Err(Bail);
+        }
+        let progv = resolve_sym("EGCL::%PROGV").ok_or(Bail)?;
+        let lambda = resolve_sym("LAMBDA").ok_or(Bail)?;
+        let function = resolve_sym("FUNCTION").ok_or(Bail)?;
+        // Every subform is read from the rooted `rest` after the last
+        // allocation that could move it; `form_list` roots its items.
+        egcl_rt::rooted!(params_body = arena_cons(NIL, cp(cp(rest).1).1));
+        egcl_rt::rooted!(lambda_form = arena_cons(lambda, *params_body));
+        egcl_rt::rooted!(thunk = form_list(&[function, *lambda_form]));
+        egcl_rt::rooted!(call = form_list(&[progv, cp(rest).0, cp(cp(rest).1).0, *thunk]));
+        self.lower_expr(*call)
     }
 
     /// Lower a form whose primary value is only tested: an IF/WHEN/UNLESS or
@@ -8620,7 +8646,6 @@ fn is_bail_special(name: &str) -> bool {
             | "MACROLET"
             | "SYMBOL-MACROLET"
             | "LOAD-TIME-VALUE"
-            | "PROGV"
             | "MULTIPLE-VALUE-CALL"
             // Absent, its variable list `(a b)` was lowered as a CallNamed and
             // the form died with "undefined function: A" under every bytecode
@@ -9892,6 +9917,19 @@ fn compute_captured_names(body: EgclVal) -> std::collections::HashSet<String> {
                     }
                 }
                 for form in list_to_vec(flet_body) {
+                    walk(form, out);
+                }
+                return;
+            }
+            if n == "PROGV" {
+                // The body becomes a closure (`lower_progv`), so every name it
+                // uses must be boxed; the two list forms are evaluated in place.
+                let (syms_form, tail) = cp(cdr);
+                let (vals_form, body) = cp(tail);
+                walk(syms_form, out);
+                walk(vals_form, out);
+                collect_symbol_names(body, out);
+                for form in list_to_vec(body) {
                     walk(form, out);
                 }
                 return;

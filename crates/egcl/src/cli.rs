@@ -20172,6 +20172,7 @@ fn mv_operator_preserves(name: &str) -> bool {
             | "CATCH"
             | "UNWIND-PROTECT"
             | "PROGV"
+            | "EGCL::%PROGV"
             | "TAGBODY"
             | "HANDLER-BIND"
             | "HANDLER-CASE"
@@ -22424,21 +22425,8 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 egcl_rt::rooted_ref!(_body_root = &mut body);
                 egcl_rt::rooted!(syms_v = eval_form(syms_form, env)?);
                 egcl_rt::rooted!(vals_v = eval_form(vals_form, env)?);
-                let syms = list_to_vec(*syms_v);
-                let vals = list_to_vec(*vals_v);
-                for sym in &syms {
-                    if !sym.is_symbol() || *sym == NIL || *sym == T {
-                        return Err(EgclError::TypeError {
-                            datum: *sym,
-                            expected: "SYMBOL".into(),
-                        });
-                    }
-                }
                 egcl_rt::rooted!(bindings = Vec::<DynBind>::new());
-                for (i, sym) in syms.iter().enumerate() {
-                    let value = vals.get(i).copied().unwrap_or(egcl_rt::value::UNBOUND);
-                    bindings.push(DynBind::establish(*sym, value));
-                }
+                progv_establish(*syms_v, *vals_v, &mut bindings)?;
                 let result = eval_progn(body, env);
                 // Duplicate symbols unwind in reverse binding order.
                 while bindings.pop().is_some() {}
@@ -22706,6 +22694,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             | "EGCL::%STRUCT-SLOT-TYPESPEC"
             | "EGCL::%MAKE-SIMPLE-ARRAY"
             | "EGCL::%MEMORY-FENCE"
+            | "EGCL::%PROGV"
             | "EGCL::%CAS-CAR"
             | "EGCL::%CAS-CDR"
             | "EGCL::%CAS-SVREF"
@@ -33968,6 +33957,54 @@ impl Drop for DynBind {
     }
 }
 
+/// Establish PROGV's dynamic bindings, pairing each symbol in `syms` with the
+/// corresponding element of `vals`. A symbol without a value is made unbound
+/// for the extent (CLHS PROGV); extra values are ignored. Every symbol is
+/// validated before any binding is made. `bindings` must already be rooted by
+/// the caller, which unwinds it in reverse order so duplicate symbols restore
+/// correctly. Shared by the evaluator's PROGV and `EGCL::%PROGV`, the entry the
+/// bytecode lowerer compiles PROGV to (GH #634).
+fn progv_establish(
+    syms: EgclVal,
+    vals: EgclVal,
+    bindings: &mut Vec<DynBind>,
+) -> Result<(), EgclError> {
+    let syms = list_to_vec(syms);
+    for sym in &syms {
+        if !sym.is_symbol() || *sym == NIL || *sym == T {
+            return Err(EgclError::TypeError {
+                datum: *sym,
+                expected: "SYMBOL".into(),
+            });
+        }
+    }
+    egcl_rt::rooted!(vals = list_to_vec(vals));
+    for (i, sym) in syms.iter().enumerate() {
+        let value = vals.get(i).copied().unwrap_or(egcl_rt::value::UNBOUND);
+        bindings.push(DynBind::establish(*sym, value));
+    }
+    Ok(())
+}
+
+/// `(egcl::%progv symbols values thunk)`: call `thunk` with PROGV's bindings in
+/// effect and return its values. The bindings are undone on every exit,
+/// including a non-local transfer or error propagating out of the thunk.
+fn call_progv(args: &[EgclVal], env: &mut Env) -> Result<EgclVal, EgclError> {
+    if args.len() != 3 {
+        return Err(EgclError::ProgramError(format!(
+            "EGCL::%PROGV requires three arguments; got {}",
+            args.len()
+        )));
+    }
+    egcl_rt::rooted!(thunk = args[2]);
+    egcl_rt::rooted!(bindings = Vec::<DynBind>::new());
+    progv_establish(args[0], args[1], &mut bindings)?;
+    env.clear_mv();
+    let result = apply_function(*thunk, &[], env);
+    while bindings.pop().is_some() {}
+    result
+}
+
 /// `saved` is a heap-capable value held for the whole body evaluation; a
 /// rooted `Vec<DynBind>` keeps it precise across allocation, so the restore on
 /// drop writes back a relocated — not stale — value (moving GC; bliss-8qf).
@@ -43137,6 +43174,7 @@ fn is_builtin_function(name: &str) -> bool {
             | "EGCL::%STRUCT-SLOT-TYPESPEC"
             | "EGCL::%MAKE-SIMPLE-ARRAY"
             | "EGCL::%MEMORY-FENCE"
+            | "EGCL::%PROGV"
             | "EGCL::%CAS-CAR"
             | "EGCL::%CAS-CDR"
             | "EGCL::%CAS-SVREF"
@@ -43319,7 +43357,9 @@ fn apply_builtin_fast(
         // See evaluated_builtins.rs: without these, COMPILED code reaches LIST
         // and GETF through the synthesize-and-re-evaluate detour, at 8.67us and
         // 7.31us against 0.035us for CAR.
-        "LIST" | "GETF" => {
+        // Compiled PROGV (GH #634): keep it off the synthesize-and-evaluate
+        // detour, which a tree-walker-free build does not have.
+        "LIST" | "GETF" | "EGCL::%PROGV" => {
             env.clear_mv();
             evaluated_builtins::call(name, args, env)
         }
