@@ -10509,7 +10509,19 @@ fn closure_retention(extra_env: &[(&str, &str)]) -> Vec<(String, i64)> {
 /// PROGV now compiles, so these closures are ordinary compiled closures.
 #[test]
 fn progv_closures_do_not_retain_their_captures() {
-    let rows = closure_retention(&[]);
+    check_closure_retention(&[]);
+}
+
+/// A tree-walker closure's registry entry is dropped once the closure is
+/// unreachable, at runtime rather than only at file-load boundaries. Under the
+/// pure tree-walker every closure has such an entry (GH #634).
+#[test]
+fn tree_walker_closures_do_not_retain_their_captures() {
+    check_closure_retention(&[("EGCL_FORCE_TIER", "interp")]);
+}
+
+fn check_closure_retention(extra_env: &[(&str, &str)]) {
+    let rows = closure_retention(extra_env);
     for label in ["plain", "progv", "progv-outer", "progv-compiled"] {
         let kept = rows
             .iter()
