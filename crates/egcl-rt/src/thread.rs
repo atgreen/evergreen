@@ -26,6 +26,9 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 #[cfg(all(target_arch = "x86_64", windows))]
 #[path = "thread/windows.rs"]
 mod windows;
+#[cfg(all(test, egcl_fibers))]
+#[path = "thread/wait_token_tests.rs"]
+pub(crate) mod wait_token_tests;
 #[cfg(all(target_arch = "x86_64", windows))]
 use windows::FiberExecutionContext;
 
@@ -1512,6 +1515,10 @@ pub struct Fiber {
     /// Monotonic token distinguishing successive blocking operations.  Stale
     /// timeout/I/O completions cannot wake a later wait by the same fiber.
     wait_generation: AtomicU64,
+    /// The last `wait_generation` a waker completed, written under `state`.
+    /// A wait that is still mounted stays Blocked after its first wake, so
+    /// this, not the state, makes the second waker of that token lose.
+    claimed_generation: AtomicU64,
     tls: OrderedMutex<Vec<EgclVal>>,
     dynamic_bindings: OrderedMutex<Vec<(EgclVal, EgclVal)>>,
     handler_stack: OrderedMutex<Vec<EgclVal>>,
@@ -3088,6 +3095,7 @@ pub fn make_fiber_with_stack_size(entry: EgclVal, stack_size: usize) -> Result<F
         wake_pending: AtomicBool::new(false),
         suspend_reason: AtomicU8::new(SUSPEND_NONE),
         wait_generation: AtomicU64::new(0),
+        claimed_generation: AtomicU64::new(0),
         tls: OrderedMutex::new(
             LockLevel::ExecutionObject,
             fiber_object_order(id, 4),
@@ -3755,6 +3763,21 @@ pub(crate) fn cancel_prepared_current_fiber_park() {
 /// Wake a blocked fiber if `token` still names its current wait.  This is the
 /// common completion path for synchronization, timers, and I/O readiness.
 pub(crate) fn wake_fiber_wait(id: FiberId, token: u64) -> bool {
+    claim_fiber_wait(id, token, || {})
+}
+
+/// Complete wait `token` if no other waker has, and report whether this call
+/// did. Exactly one of the wakers racing for a token (deadline, I/O, a
+/// synchronization primitive) wins; a loser changes nothing and can hand its
+/// permit or notification to another waiter.
+///
+/// The claim is checked and recorded under the fiber's state lock, the lock
+/// that publishes each wait. `prepare_current_fiber_park` advances the
+/// generation before it publishes Blocked, so a Blocked fiber whose
+/// generation is still `token` is in that wait, not a later one. `on_claim`
+/// runs only for the winner, before the fiber can resume, so the woken wait
+/// sees what its waker recorded for it.
+pub(crate) fn claim_fiber_wait(id: FiberId, token: u64, on_claim: impl FnOnce()) -> bool {
     let fiber = match fiber_registry().lock().unwrap().get(&id).cloned() {
         Some(fiber) => fiber,
         None => return false,
@@ -3762,6 +3785,8 @@ pub(crate) fn wake_fiber_wait(id: FiberId, token: u64) -> bool {
     if fiber.wait_generation.load(Ordering::Acquire) != token {
         return false;
     }
+    #[cfg(all(test, egcl_fibers))]
+    wait_token_tests::before_wake_claim();
     let pool = fiber
         .scheduler_pool
         .lock()
@@ -3771,7 +3796,33 @@ pub(crate) fn wake_fiber_wait(id: FiberId, token: u64) -> bool {
     let Some(pool) = pool else {
         return false;
     };
-    submit_fiber_to_pool(id, &pool).is_ok()
+    let enqueue = {
+        let mut state = fiber.state.lock().unwrap();
+        if !matches!(*state, FiberState::Blocked | FiberState::Waiting)
+            || fiber.wait_generation.load(Ordering::Acquire) != token
+            || fiber.claimed_generation.load(Ordering::Relaxed) == token
+        {
+            return false;
+        }
+        fiber.claimed_generation.store(token, Ordering::Relaxed);
+        on_claim();
+        if fiber.mounted.load(Ordering::Acquire) {
+            // As in submit_fiber_to_pool: the carrier consumes this under the
+            // same lock after the context switch.
+            fiber.wake_pending.store(true, Ordering::Release);
+            false
+        } else {
+            *state = FiberState::Runnable;
+            true
+        }
+    };
+    if enqueue {
+        pool.submit(WorkerTask {
+            result_cell: Arc::clone(&fiber.result),
+            thread: fiber,
+        });
+    }
+    true
 }
 
 pub fn interrupt_fiber(id: FiberId, condition: EgclVal) -> Result<(), EgclError> {

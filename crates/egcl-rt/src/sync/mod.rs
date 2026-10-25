@@ -169,9 +169,14 @@ impl FiberWaiter {
         }
     }
 
+    /// Complete this wait and mark it notified, unless its deadline or another
+    /// waker already completed it; the caller then gives the wake to someone
+    /// else. Marking it first would let a waiter woken by its timeout report
+    /// a permit or notification its waker never granted (bliss-xown).
     fn wake(&self) -> bool {
-        self.notified
-            .store(true, std::sync::atomic::Ordering::Release);
-        crate::thread::wake_fiber_wait(self.fiber, self.token)
+        let notified = &self.notified;
+        crate::thread::claim_fiber_wait(self.fiber, self.token, || {
+            notified.store(true, std::sync::atomic::Ordering::Release)
+        })
     }
 }
