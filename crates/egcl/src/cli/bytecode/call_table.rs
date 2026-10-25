@@ -1687,25 +1687,19 @@ mod tests {
             .expect("compile native slot body");
         let args: Vec<EgclVal> = args.iter().copied().map(EgclVal::from_fixnum).collect();
         egcl_rt::rooted!(args = args);
-        let interpreter_only = !checked_native_installation_allowed()
-            && (body.variadic || body.min_args != body.arity || body.max_args != Some(body.arity));
         registry_put(symbol, Arc::new(body));
         let input = snapshot_t2_input(symbol, 0).expect("snapshot leaf");
         let generation = input.generation;
         let input = egcl_rt::CrossThreadRoot::new(input);
         let artifact = input.with_gc_stable(compile_t2_artifact);
-        if interpreter_only {
-            assert!(artifact.is_none(), "optional arguments require the Linux interpreter adapter");
-            assert!(try_promote_to_t1_with_speculation(symbol, false).is_none());
-        } else {
-            let code = install_t2_completion(T2Completion {
-                sym: symbol, generation,
-                artifact: Some(artifact.expect("compile T2 leaf")), input,
-            }).expect("install T2 leaf");
-            assert!(code.is_t2);
-            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-            assert!(matches!(code._storage, NativeCodeStorage::Mapped(_)));
-        }
+        // &optional bodies reach mapped T1/T2 on x86-64 Linux too (#457).
+        let code = install_t2_completion(T2Completion {
+            sym: symbol, generation,
+            artifact: Some(artifact.expect("compile T2 leaf")), input,
+        }).expect("install T2 leaf");
+        assert!(code.is_t2);
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        assert!(matches!(code._storage, NativeCodeStorage::Mapped(_)));
         let cell = resolve(symbol).unwrap();
         let state = unsafe { state(Arc::as_ptr(&cell) as u64) };
         struct RestoreEnv(*mut Env);
@@ -1722,11 +1716,7 @@ mod tests {
             "cold-call probe must be live"
         );
         assert!(!cell.is_cold());
-        if interpreter_only {
-            assert!(matches!(*state.target.borrow(), Some(Target::Bytecode { .. })));
-        } else {
-            assert!(matches!(*state.target.borrow(), Some(Target::Native { .. })));
-        }
+        assert!(matches!(*state.target.borrow(), Some(Target::Native { .. })));
         TARGET_LOOKUPS.with(|count| count.set(0));
         for _ in 0..100 {
             let entry = unsafe { &*cell.checked_entry_address(args.len() > 3) }
