@@ -97,8 +97,11 @@ fn load_function_callers_match_every_tier_and_install_t2() {
     }
 }
 
-/// Automatic promotion installs these bodies with the mapped T2 ABI instead
-/// of declining them as an unsupported control-scope shape.
+/// Automatic promotion installs these bodies at T2 instead of declining them
+/// as an unsupported control-scope shape. The `#'f` callers keep the mapped
+/// T2 ABI. S-STRUCT-SET's SETF expands to a one-variable TakeValuesToLocals,
+/// which the ordinary x86-64 Lisp entry admits since bliss-z4dlm (#630), so
+/// it installs there instead. That entry is also T2.
 #[test]
 fn automatic_promotion_installs_load_function_callers_at_t2() {
     if !MAPPED_LINUX {
@@ -111,16 +114,16 @@ fn automatic_promotion_installs_load_function_callers_at_t2() {
         ("EGCL_T2_LOG", "stderr"),
     ]);
     assert_eq!(line(&stdout, "TIERS"), "TIERS (2 2 2 2 2)", "{stderr}");
-    for name in [
-        "S-APPLY",
-        "S-MAPCAR",
-        "S-REDUCE",
-        "S-STRUCT-SET",
-        "LF-CALLER",
+    for (name, abi) in [
+        ("S-APPLY", "mapped T2 ABI"),
+        ("S-MAPCAR", "mapped T2 ABI"),
+        ("S-REDUCE", "mapped T2 ABI"),
+        ("S-STRUCT-SET", "ordinary x86-64 Lisp T2 ABI"),
+        ("LF-CALLER", "mapped T2 ABI"),
     ] {
         assert!(
             stderr.contains(&format!(
-                "{name}: optimized worker result installed with mapped T2 ABI"
+                "{name}: optimized worker result installed with {abi}"
             )),
             "{name} did not install at T2:\n{stderr}"
         );
