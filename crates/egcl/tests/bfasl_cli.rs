@@ -917,8 +917,10 @@ fn extended_loop_and_setf_place_bfasl_round_trip() {
 
 /// R4.24 / R4.38: source-free quasiquote preserves values under each platform
 /// tier policy. Its AllocCons reaches T1 on every platform, including mapped
-/// x86-64 Linux (bliss-elwvl), where this loop shape still does not report an
-/// OSR entry; a companion from the same artifact must also promote to T1.
+/// x86-64 Linux (bliss-elwvl); a companion from the same artifact must also
+/// promote to T1. Below the invocation threshold the hot loop still enters
+/// native code through OSR everywhere. On mapped x86-64 Linux that T0 OSR
+/// installs the function's T1 code to resume in (#630), so it reports tier 1.
 #[test]
 fn portable_quasiquote_preserves_tier_policy_after_fasl_load() {
     let dir = workdir("native-quasiquote");
@@ -947,8 +949,9 @@ fn portable_quasiquote_preserves_tier_policy_after_fasl_load() {
     );
     fs::remove_file(src).unwrap();
     let linux_native_policy = cfg!(all(target_arch = "x86_64", target_os = "linux"));
+    let osr_tier = if linux_native_policy { 1 } else { 0 };
     for (threshold, expected_tier, expected_osr, expected_step_tier) in
-        [("1", 1, false, 1), ("100000", 0, !linux_native_policy, 0)]
+        [("1", 1, false, 1), ("100000", osr_tier, true, 0)]
     {
         let loaded = Command::new(BIN)
             .args(["--no-bootstrap", "--no-init", "--eval"])
