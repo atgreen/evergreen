@@ -658,7 +658,7 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                         || data.flags != (crate::t2::ir::InstFlags {
                             effectful: true, guard: true, ..Default::default() })
                         || data.frame_state.is_none() || !matches!(data.aux, AuxData::None)
-                        || (valid && data.args.iter().chain(&data.results).any(|&v| f.value(v).repr != Repr::Tagged)) {
+                        || data.args.iter().chain(&data.results).any(|&v| f.value(v).repr != Repr::Tagged) {
                         errors.push(VerifyError::new("V8 vector-range-access-contract",
                             format!("block{bi} requires a guarded tagged store and its SSA witness")));
                     }

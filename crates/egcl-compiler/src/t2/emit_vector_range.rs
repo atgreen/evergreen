@@ -143,7 +143,7 @@ mod tests {
         let broken = a.label();
         let finish = a.label();
         for (r, offset) in [(1, 0), (6, 8), (7, 16)] {
-            load_from_rsp(&mut a, SCRATCH, i32::from(offset));
+            load_from_rsp(&mut a, SCRATCH, offset);
             cmp_rr(&mut a, r, SCRATCH);
             a.jcc(Cc::Ne, broken);
         }

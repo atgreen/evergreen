@@ -18,6 +18,10 @@
 
 ### Performance
 
+- T2 checks vector layout and bounds once before eligible counted store loops,
+  preserving checked fallback, reference barriers, and moving-GC safety
+  ([#699](https://github.com/atgreen/evergreen/pull/699)).
+
 - Common `MAKE-ARRAY` calls can use a collecting native adapter that checks
   mutable unsigned-byte-8 type descriptors at runtime and allocates through the
   existing stdlib constructor, preserving general fallback and `NOTINLINE` calls
