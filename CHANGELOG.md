@@ -30,6 +30,11 @@
   expansion and other compile-time Lisp effects stay in the requesting execution
   ([#662](https://github.com/atgreen/evergreen/pull/662)).
 
+- `EQUALP` hash tables now hash bignum and ratio keys without temporary
+  Rust heap allocations, preserving exact cross-type numeric hashes and the
+  existing float fast paths
+  ([#668](https://github.com/atgreen/evergreen/pull/668)).
+
 - T2 now profiles integer shifts, bitwise operations and other numeric
   operations, and retains feedback when a cold speculation fails. Keccak
   extraction no longer repeatedly recompiles the same invalid fixnum guess

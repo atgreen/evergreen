@@ -684,11 +684,71 @@ fn equalp_float_hash(f: f64) -> u64 {
     hash_u64(if f == 0.0 { 0 } else { f.to_bits() })
 }
 
-/// EQUALP hash of a real, by value: EQUALP compares numbers with `=`, so `1`,
-/// `1.0`, `1d0`, `2/2` -- and `1/2` with `0.5` -- must hash alike. A real that
-/// some double denotes exactly hashes as that double; any other (a fixnum or
-/// bignum past 2^53, a ratio like 1/3) can only be `=` to rationals, so it
-/// hashes as its exact rational.
+/// Inspect an integer's sign and little-endian magnitude without copying it.
+/// The callback must not allocate Lisp objects or reach a GC safepoint: the
+/// borrowed bignum limbs point into the moving heap. Fixnums use stack storage.
+fn with_integer_magnitude<R>(v: EgclVal, inspect: impl FnOnce(i8, &[u64]) -> R) -> R {
+    if v.is_fixnum() {
+        let n = v.as_fixnum();
+        let magnitude = [n.unsigned_abs()];
+        return inspect(n.signum() as i8, if n == 0 { &[] } else { &magnitude });
+    }
+    // SAFETY: callers supply integer values from a number or a normalized
+    // ratio. The callback neither allocates Lisp objects nor retains the slice.
+    unsafe {
+        let p = v.as_ptr();
+        debug_assert_eq!((*(p as *const ObjectHeader)).type_id(), type_id::BIGNUM);
+        let sign = *(p.add(8) as *const i32);
+        let n = *(p.add(12) as *const u32) as usize;
+        inspect(
+            sign.signum() as i8,
+            std::slice::from_raw_parts(p.add(16) as *const u64, n),
+        )
+    }
+}
+
+fn integer_magnitude_hash(sign: i8, limbs: &[u64]) -> u64 {
+    limbs.iter().fold(hash_u64(sign as u64), |h, &limb| {
+        combine_hashes(h, hash_u64(limb))
+    })
+}
+
+/// Exact binary64 encoding of sign * magnitude / 2^denominator_shift.
+/// Reject excess precision, overflow and subnormal rounding before extracting
+/// the (at most 53-bit) odd significand. No floating arithmetic is needed.
+fn exact_dyadic_float_bits(sign: i8, limbs: &[u64], denominator_shift: usize) -> Option<u64> {
+    let Some(&top) = limbs.last() else {
+        return Some(0);
+    };
+    let bit_length = 64 * (limbs.len() - 1) + (64 - top.leading_zeros() as usize);
+    let first = limbs.iter().position(|&limb| limb != 0)?;
+    let trailing = 64 * first + limbs[first].trailing_zeros() as usize;
+    let precision = bit_length - trailing;
+    let exponent = bit_length as i128 - 1 - denominator_shift as i128;
+    let scale = trailing as i128 - denominator_shift as i128;
+    if precision > 53 || exponent > 1023 || scale < -1074 {
+        return None;
+    }
+    let offset = trailing % 64;
+    let mut significand = limbs[first] >> offset;
+    if offset != 0 {
+        significand |= limbs.get(first + 1).copied().unwrap_or(0) << (64 - offset);
+    }
+    let sign_bit = u64::from(sign < 0) << 63;
+    Some(
+        sign_bit
+            | if exponent >= -1022 {
+                (((exponent + 1023) as u64) << 52)
+                    | ((significand << (53 - precision)) & ((1_u64 << 52) - 1))
+            } else {
+                significand << ((scale + 1074) as usize)
+            },
+    )
+}
+
+/// EQUALP hashes floats by their binary64 value, and a rational by that same
+/// value only if exactly representable. Other normalized rationals hash their
+/// existing numerator/denominator limbs, without conversion, GCD or products.
 fn equalp_real_hash(v: EgclVal) -> u64 {
     if v.is_fixnum() {
         let n = v.as_fixnum();
@@ -700,22 +760,29 @@ fn equalp_real_hash(v: EgclVal) -> u64 {
     if let Some(f) = crate::equality::float_value(v) {
         return equalp_float_hash(f);
     }
-    let Some(r) = egcl_rt::bignum::as_bigrat(v) else {
-        return hash_u64(v.0);
-    };
-    let f = r.to_f64();
-    if f.is_finite()
-        && egcl_rt::bignum::bigrat_cmp(&crate::numbers::float_exact_rational(f), &r)
-            == std::cmp::Ordering::Equal
-    {
-        return equalp_float_hash(f);
-    }
-    let integer_hash = |n: &egcl_rt::bignum::BigInt| {
-        n.mag.iter().fold(hash_u64(n.sign as u64), |h, &limb| {
-            combine_hashes(h, hash_u64(limb))
+    let (num, den) = egcl_rt::bignum::ratio_parts_val(v).unwrap_or((v, EgclVal::from_fixnum(1)));
+    with_integer_magnitude(den, |den_sign, den_limbs| {
+        let denominator_shift = if den_sign > 0 {
+            den_limbs.iter().position(|&limb| limb != 0).and_then(|i| {
+                let limb = den_limbs[i];
+                (limb.is_power_of_two() && i + 1 == den_limbs.len())
+                    .then(|| i * 64 + limb.trailing_zeros() as usize)
+            })
+        } else {
+            None
+        };
+        with_integer_magnitude(num, |sign, limbs| {
+            if let Some(bits) =
+                denominator_shift.and_then(|shift| exact_dyadic_float_bits(sign, limbs, shift))
+            {
+                return equalp_float_hash(f64::from_bits(bits));
+            }
+            combine_hashes(
+                integer_magnitude_hash(sign, limbs),
+                integer_magnitude_hash(den_sign, den_limbs),
+            )
         })
-    };
-    combine_hashes(integer_hash(&r.num), integer_hash(&r.den))
+    })
 }
 
 /// EQUALP hash of any number. A complex with a zero imaginary part is `=` to
@@ -727,7 +794,7 @@ fn equalp_number_hash(v: EgclVal) -> Option<u64> {
     let (re, im) = crate::equality::number_parts(v);
     let h = equalp_real_hash(re);
     Some(
-        if crate::equality::number_equal(im, EgclVal::from_fixnum(0)) {
+        if crate::numbers::zerop(im).expect("numeric imaginary part") {
             h
         } else {
             combine_hashes(h, equalp_real_hash(im))
@@ -1845,6 +1912,123 @@ mod tests {
         // 3 ones, 3 zeros, 3 halves (each pair both ways), 2^64 twice; the
         // rest only equal themselves.
         assert_eq!(equal_pairs, 9 + 9 + 9 + 4 + 1 + 1 + 1);
+    }
+
+    #[test]
+    fn equalp_hash_handles_ratio_constructor_normalization() {
+        use egcl_rt::bignum::alloc_ratio_cli;
+        for (num, den, expected_num, expected_den) in
+            [(1, -2, -1, 2), (2, 6, 1, 3), (0, 3, 0, 1), (6, 3, 2, 1)]
+        {
+            egcl_rt::rooted!(
+                a = alloc_ratio_cli(EgclVal::from_fixnum(num), EgclVal::from_fixnum(den))
+            );
+            egcl_rt::rooted!(
+                b = alloc_ratio_cli(
+                    EgclVal::from_fixnum(expected_num),
+                    EgclVal::from_fixnum(expected_den)
+                )
+            );
+            assert!(crate::equality::equalp(*a, *b));
+            assert_eq!(equalp_real_hash(*a), equalp_real_hash(*b));
+            if expected_den == 1 {
+                assert_eq!(*a, EgclVal::from_fixnum(expected_num));
+            }
+        }
+    }
+
+    #[test]
+    fn equalp_dyadic_encoding_handles_binary64_boundaries() {
+        // Each sample is independently a binary64 value. Decode its exact
+        // rational with the general arithmetic implementation, then require the
+        // allocation-free encoder to recover the original bits.
+        for bits in [
+            0,
+            1,
+            2,
+            (1_u64 << 52) - 1,
+            1_u64 << 52,
+            (1_u64 << 52) + 1,
+            0x3fe0_0000_0000_0000,
+            0x3ff0_0000_0000_0000,
+            0x4340_0000_0000_0000,
+            0x7fef_ffff_ffff_ffff,
+        ] {
+            for negative in [false, true] {
+                let bits = bits | (u64::from(negative) << 63);
+                let f = f64::from_bits(bits);
+                let r = crate::numbers::float_exact_rational(f);
+                let shift = egcl_rt::bignum::mag_bitlen(&r.den.mag) - 1;
+                let expected = if f == 0.0 { 0 } else { bits };
+                assert_eq!(
+                    exact_dyadic_float_bits(r.num.sign, &r.num.mag, shift),
+                    Some(expected)
+                );
+            }
+        }
+        // Rounding must never be mistaken for exact representability.
+        assert_eq!(exact_dyadic_float_bits(1, &[1], 1075), None);
+        assert_eq!(exact_dyadic_float_bits(1, &[3], 1075), None);
+        assert_eq!(exact_dyadic_float_bits(1, &[(1 << 53) + 1], 0), None);
+        let mut overflow = [0; 17];
+        overflow[16] = 1;
+        assert_eq!(exact_dyadic_float_bits(1, &overflow, 0), None);
+        // Extract a 53-bit odd significand crossing a limb boundary.
+        let significand = (1_u64 << 52) + 1;
+        assert_eq!(
+            exact_dyadic_float_bits(1, &[significand << 40, significand >> 24], 40),
+            Some((significand as f64).to_bits()),
+        );
+    }
+
+    #[test]
+    fn equalp_rational_hash_matches_exact_arithmetic_reference() {
+        use egcl_rt::bignum::{BigInt, BigRat};
+        // Keep the old general-arithmetic algorithm as an independent oracle:
+        // all existing hash values must survive this performance change.
+        fn reference(r: &BigRat) -> u64 {
+            let f = r.to_f64();
+            if f.is_finite()
+                && egcl_rt::bignum::bigrat_cmp(&crate::numbers::float_exact_rational(f), r)
+                    == std::cmp::Ordering::Equal
+            {
+                equalp_float_hash(f)
+            } else {
+                combine_hashes(
+                    integer_magnitude_hash(r.num.sign, &r.num.mag),
+                    integer_magnitude_hash(r.den.sign, &r.den.mag),
+                )
+            }
+        }
+        for numerator in [0, 1, -1, 3, -3, (1_i64 << 53) + 1, i64::MAX, i64::MIN] {
+            for denominator in [1, 2, 3, 64, (1_i64 << 53) + 1] {
+                let r = BigRat::new(BigInt::from_i64(numerator), BigInt::from_i64(denominator));
+                egcl_rt::rooted!(value = r.to_val());
+                assert_eq!(equalp_real_hash(*value), reference(&r));
+            }
+        }
+        for shift in [52, 53, 60, 63, 64, 65, 1023, 1024, 1074, 1075, 2048] {
+            let mut power = vec![0; shift / 64 + 1];
+            power[shift / 64] = 1 << (shift % 64);
+            for sign in [-1, 1] {
+                let integer = BigInt::from_mag(sign, power.clone());
+                for r in [
+                    BigRat::from_bigint(integer.clone()),
+                    BigRat::new(
+                        BigInt::from_i64(sign as i64),
+                        BigInt::from_mag(1, power.clone()),
+                    ),
+                    BigRat::new(integer, BigInt::from_i64(3)),
+                ] {
+                    egcl_rt::rooted!(value = r.to_val());
+                    assert_eq!(
+                        equalp_real_hash(*value),
+                        reference(&r),
+                        "shift={shift}, sign={sign}"
+                    );
+                }
+            }
+        }
     }
 
     /// The address flag comes from the hash that consulted the address: a

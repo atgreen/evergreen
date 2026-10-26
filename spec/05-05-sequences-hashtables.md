@@ -385,7 +385,15 @@ completes (GC-managed or explicit deallocation for Rust-side tables).
 | `EQ` | `tagged-pointer-hash` | XOR-fold of the tagged pointer value with a per-boot random seed; multiply-shift mixing (Murmur3 finalizer) |
 | `EQL` | `eql-hash` | `eq-hash` for non-numeric; numeric types: extract raw bits, mix with Murmur3 finalizer; ensures `(eql 1 1.0)` is false → different hashes allowed |
 | `EQUAL` | `equal-hash` | Recursive structural hash: strings→FNV-1a on chars; conses→combine car/cdr hashes with rotation+XOR; arrays→hash elements with depth limit of 4; all others→`eql-hash` |
-| `EQUALP` | `equalp-hash` | Like `equal-hash` but: strings→FNV-1a on `CHAR-DOWNCASE`'d chars; numbers→coerce to `DOUBLE-FLOAT` bits then hash; hash tables→hash entries recursively |
+| `EQUALP` | `equalp-hash` | Like `equal-hash` but: strings→FNV-1a on `CHAR-DOWNCASE`'d chars; numbers→hash `DOUBLE-FLOAT` bits only for exactly representable values, otherwise hash normalized rational components; hash tables→hash entries recursively |
+
+Hashing real numbers under `EQUALP` inspects existing integer limbs without allocating
+intermediate big integers or rationals. A reduced ratio can equal a binary
+float only when its denominator is a power of two. Significant-bit length and
+exponent bounds determine exact binary64 representability, including
+subnormals; signed zeros hash like integer zero. A complex with zero imaginary
+part hashes like its real part. Ratio constructors normalize denominator signs
+and common factors, collapsing integral results to integers.
 
 **Depth limit:** Recursive hashing (`equal-hash`, `equalp-hash`) MUST
 enforce a depth limit (default 4) to avoid unbounded traversal of
