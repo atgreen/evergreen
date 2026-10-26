@@ -1,6 +1,6 @@
 # Focused ML-DSA comparison: 2026-10-26
 
-EGCL remains roughly 242 times slower than SBCL on the later measured
+In this sample, EGCL was roughly 242 times slower than SBCL on the later measured
 keygen/sign/verify roundtrip (16.445 s versus approximately 0.068 s).
 Tiering heuristics contribute, but changing thresholds alone did not close the
 gap: earlier promotion was slower, disabling T2 was slower, and already-T2
@@ -103,7 +103,7 @@ Do not interpret missing native samples as interpreter execution.
 
 A separate profile after pinning still observed six compilations and one
 approximately 162 ms GC. It is not a perfectly steady-state measurement.
-`DECODE-POLY-Z` remained at T1: T2's mapped emitter rejected bytecode 4113,
+`DECODE-POLY-Z` remained at T1: T2's mapped emitter rejected encoded IR opcode 4113,
 `FixnumShl` with a variable shift count; the current emitter handles only a
 constant count on this path. Installed tiers, actual native execution,
 compilation events and GC pauses answer different questions and are retained
@@ -137,7 +137,7 @@ sufficient evidence of faster execution.
 1. Repair stable guard feedback and recompilation backoff for the confirmed
    Keccak cycle; identify the failing guard before choosing a production fix.
 2. Extend mapped lowering for variable shifts and hot packing helpers such as
-   `DECODE-POLY-Z`, then measure their effect on this unchanged case.
+   `DECODE-POLY-Z` (`bliss-x19f7`), then measure their effect on this unchanged case.
 3. Improve already-T2 loops, array representation, generated arithmetic and
    runtime/call ABI costs using isolated components and native profiles.
 
@@ -146,3 +146,39 @@ The complete failed EGCL baseline spent 80.6% of test time in OpenSSL tests and
 9.8% in ML-DSA. Improving this crypto case alone cannot establish whole-suite
 parity; profile OpenSSL/parser work separately. The focused analysis is tracked
 by `bliss-aug7d`, alongside the full baseline's existing correctness follow-ups.
+
+## Reproduce the focused measurements
+
+Prepare the pinned installation and runtime as described in [README](README.md).
+From this directory, set the runtime path and select a separate cache for each
+implementation. For example, with `EGCL_BIN` pointing at a release build:
+
+```sh
+export TLS_COMPARE_RUNTIME="$PWD/runtime/ocicl-runtime.lisp"
+export TLS_COMPARE_CACHE="$PWD/cache/egcl/"
+TLS_COMPARE_ROUNDS=3 ../../scripts/egcl-limited.sh "$EGCL_BIN" \
+  --no-init --load ml-dsa-roundtrip.lisp
+
+export TLS_COMPARE_CACHE="$PWD/cache/sbcl/"
+TLS_COMPARE_ROUNDS=3 ../../scripts/egcl-limited.sh sbcl \
+  --noinform --no-sysinit --no-userinit --non-interactive \
+  --load ml-dsa-roundtrip.lisp
+```
+
+Use the same CPU budget for both implementations; the recorded runs used
+`taskset -c 8-11` between the limiting script and executable. The documented
+tier overrides and `TLS_COMPARE_PIN_KECCAK=1` must each use a new EGCL process.
+`TLS_COMPARE_GC=1` adds diagnostic `TIME` output and is not the clean timing mode.
+The pin is intentional interpreter execution of one helper, not profiling of
+normal native performance.
+
+For native components, replace the loaded file with `ml-dsa-ntt.lisp` and set
+`TLS_COMPARE_N=1000` for the recorded batch size. It warms real array operations
+before caller invocation heat, checks coefficient preservation, and requires T2
+on EGCL. `TLS_COMPARE_DISASSEMBLE=1` captures generated code after measurement.
+
+The diagnostic patch applies to runtime `3cb5e8b2`; build it in an isolated
+checkout using the normal release profile. Toggle its environment variable in
+fresh processes against that same binary. Its recorded patch SHA256 is
+`2d9946ab461e0799d163f982748ccead78d3ce11c71e4adec33d9f67047e1c7e`.
+The patch is an experiment for this report, not a change to the default runtime.

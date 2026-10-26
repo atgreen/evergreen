@@ -126,5 +126,7 @@ byte-identical, although both observe the original runner entrypoint.
 Failure follow-ups are `bliss-v38sp` (fractional timeout), `bliss-2k83w`
 (handshake/OpenSSL assertions), `bliss-30p86` (Gray input-stream recognition),
 and `bliss-moehk` (UIOP subprocess launch). The cached closer-mop load workaround
-is tracked by `bliss-uq2oi`. Separate SBCL case analysis remains in progress under
-`bliss-aug7d`; this full-run record contains no SBCL comparison.
+is tracked by `bliss-uq2oi`. The [focused ML-DSA comparison](ML-DSA.md) records
+SBCL timings, tier-policy controls, native component measurements, and a
+prioritized investigation under `bliss-aug7d`. This full-run record itself
+contains no full-suite SBCL comparison.

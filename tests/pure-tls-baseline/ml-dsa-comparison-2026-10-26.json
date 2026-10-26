@@ -546,5 +546,20 @@
       "caveat": "No paired same-binary component control; no demonstrated NTT speedup or regression."
     },
     "conclusion": "Single OFF/ON process pair observed about12% later-round wall improvement while deopts increased610 to680; guard cycle unresolved."
+  },
+  "portable_benchmarks": {
+    "ml-dsa-roundtrip.lisp": {
+      "sha256": "7c1d53857420875518b9f296ffb0d3008438ebad4b081aa1c803393d8bb7d538",
+      "note": "Reproduction source; original measured source hash is retained separately."
+    },
+    "ml-dsa-ntt.lisp": {
+      "sha256": "b5016a41135332bc24e14f4db6ff4064f8e8a5d7f337a1d7279150fd0121846f",
+      "note": "Reproduction source; original measured source hash is retained separately."
+    }
+  },
+  "followups": {
+    "adaptive_guard_cycle": "bliss-yuxa7",
+    "variable_count_shift": "bliss-x19f7",
+    "full_sbcl_dependency_loading": "bliss-kvm6t"
   }
 }
