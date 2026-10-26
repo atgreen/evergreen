@@ -9,6 +9,7 @@
     "egcl:test:speculation_feedback": [""],
     "egcl:test:loop_peeling": [""],
     "egcl:test:integer_extraction": [""],
+    "egcl:test:make_array_fast_path_cli": [""],
     "egcl:test:constant_reference_folding": [""],
     "egcl:test:raw_fixnum": [""],
     "egcl:test:immediate_vector_stores": [""],
