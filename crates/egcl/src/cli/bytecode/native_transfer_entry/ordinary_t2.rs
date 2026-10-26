@@ -8,9 +8,9 @@ use super::*;
 use egcl_compiler::t2::ir::{Function, Value, ValueRepresentation};
 
 pub(in crate::cli::bytecode) struct PreparedT2 {
-    ir: Function,
-    ordinary_ir: Function,
-    call_cells: Vec<(u32, Arc<egcl_rt::call_table::CallCell>)>,
+    emitted: EmittedTransfer,
+    clear_mv_resets: usize,
+    raw_f64_values: usize,
 }
 
 pub(in crate::cli::bytecode) fn prepare_ordinary_t2(
@@ -63,11 +63,22 @@ pub(in crate::cli::bytecode) fn prepare_ordinary_t2(
     if let Err(error) = egcl_compiler::t2::verify::verify(&mapped) {
         return decline(&format!("verify after legalization: {error:?}"));
     }
-    Some(PreparedT2 {
-        ir: mapped,
-        ordinary_ir: optimized.clone(),
-        call_cells: input.call_cells.clone(),
-    })
+    let context = input.mapped_context.as_ref()?;
+    let emitted = match EmittedTransfer::try_emit_prepared_with_ordinary(
+        &input.body, &mapped, Some(optimized), true,
+        &input.call_cells, context, CompilationTier::T2,
+    ) {
+        Ok(emitted) => emitted,
+        Err(error) => return decline(&format!("emission: {error}")),
+    };
+    let clear_mv_resets = mapped.block_order().iter()
+        .flat_map(|&block| mapped.block(block).insts.iter())
+        .filter(|&&inst| mapped.inst(inst).opcode == egcl_compiler::t2::ir::Opcode::ClearMv)
+        .count();
+    let raw_f64_values = (0..mapped.num_values()).filter(|&index|
+        mapped.value(Value(index as u32)).repr == ValueRepresentation::UnboxedF64
+    ).count();
+    Some(PreparedT2 { emitted, clear_mv_resets, raw_f64_values })
 }
 
 pub(in crate::cli::bytecode) fn install_ordinary_t2(
@@ -99,16 +110,7 @@ pub(in crate::cli::bytecode) fn install_ordinary_t2(
         deopt_bodies,
     });
     let roots = retain_native_body(body);
-    let mut code = match TransferCode::try_emit_prepared_with_ordinary(
-        Arc::clone(body),
-        roots,
-        &prepared.ir,
-        Some(&prepared.ordinary_ir),
-        Some(Arc::clone(&metadata)),
-        &prepared.call_cells,
-        true,
-        CompilationTier::T2,
-    ) {
+    let mut code = match prepared.emitted.install(Arc::clone(body), roots, Some(Arc::clone(&metadata))) {
         Ok(code) => code,
         Err(decline) => {
             if let Some((tagged, speculations)) = artifact.mapped_fallback.take() {
@@ -157,13 +159,8 @@ pub(in crate::cli::bytecode) fn install_ordinary_t2(
         _storage: NativeCodeStorage::Mapped(code),
     });
     if t2_log_target().is_some() {
-        let clear_mv_resets = prepared.ir.block_order().iter()
-            .flat_map(|&block| prepared.ir.block(block).insts.iter())
-            .filter(|&&inst| prepared.ir.inst(inst).opcode == egcl_compiler::t2::ir::Opcode::ClearMv)
-            .count();
-        let raw_f64_values = (0..prepared.ir.num_values()).filter(|&index|
-            prepared.ir.value(Value(index as u32)).repr == ValueRepresentation::UnboxedF64
-        ).count();
+        let clear_mv_resets = prepared.clear_mv_resets;
+        let raw_f64_values = prepared.raw_f64_values;
         let abi = match &native._storage {
             NativeCodeStorage::Mapped(code) if code.ordinary_entry.is_some() => "ordinary x86-64 Lisp",
             _ => "mapped",
