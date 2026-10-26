@@ -172,6 +172,8 @@ fn native_v2_call_cells_capture_after_rust_reentry_and_run_cleanup_once() {
     let artifact = input.with_gc_stable(compile_t2_artifact).unwrap();
     assert!(
         install_t2_completion(T2Completion {
+                    panicked: false,
+                    _permit: None, dependencies: Vec::new(),
             sym: symbol,
             generation,
             artifact: Some(artifact),

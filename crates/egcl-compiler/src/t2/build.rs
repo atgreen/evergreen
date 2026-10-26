@@ -155,6 +155,60 @@ pub fn build_from_bytecode(bf: &BytecodeFunction) -> Result<Function, BuildError
     build_from_bytecode_with_inline_options(bf, InlineOptions::default())
 }
 
+/// Build exclusively from captured constants and worker-owned metadata.
+/// Supply the original definition identity with `InlineOptions::with_root_symbol`;
+/// worker compilation must not intern a name to recover an execution identity.
+pub fn build_from_snapshot(
+    snapshot: &super::constants::BytecodeSnapshot,
+    options: InlineOptions,
+) -> Result<Function, BuildError> {
+    if options.root_symbol().is_none() {
+        return Err(BuildError::Unsupported("snapshot requires a root symbol"));
+    }
+    build_from_bytecode_with_inline_options(&snapshot.body, options.with_constant_snapshot(snapshot))
+}
+
+pub fn build_for_transfer_optimization_snapshot(
+    snapshot: &super::constants::BytecodeSnapshot,
+    symbol: u32,
+) -> Result<Function, BuildError> {
+    let options = InlineOptions::default()
+        .with_root_symbol(symbol)
+        .with_constant_snapshot(snapshot);
+    let mut builder = Builder::new(&snapshot.body, options);
+    builder.transfer_mode = true;
+    builder.run()
+}
+
+pub fn build_for_native_scope_optimization_snapshot(
+    snapshot: &super::constants::BytecodeSnapshot,
+    symbol: u32,
+) -> Result<Function, BuildError> {
+    let options = InlineOptions::default()
+        .with_root_symbol(symbol)
+        .with_constant_snapshot(snapshot);
+    let mut builder = Builder::new(&snapshot.body, options);
+    builder.transfer_mode = true;
+    builder.native_cleanups = true;
+    builder.run()
+}
+
+pub fn build_from_bytecode_for_native_cleanups_snapshot(
+    snapshot: &super::constants::BytecodeSnapshot,
+    symbol: u32,
+) -> Result<Function, BuildError> {
+    let scopes = ScopeMap::analyze_function(&snapshot.body).map_err(BuildError::InvalidScopes)?;
+    let options = InlineOptions::default()
+        .with_root_symbol(symbol)
+        .with_constant_snapshot(snapshot);
+    let mut builder = Builder::new(&snapshot.body, options);
+    builder.transfer_mode = true;
+    builder.native_cleanups = true;
+    let mut function = builder.run()?;
+    legalize_transfer_calls(&mut function, &scopes)?;
+    Ok(function)
+}
+
 /// Construct the native-transfer call contract with an explicit cold fallback
 /// for every remaining call. This entry point stays separate from installation
 /// until complete helper, scope, polling and native landing coverage is ready.
@@ -511,6 +565,7 @@ fn check_self_inline_arguments(
 }
 
 struct Builder<'a> {
+    constants: std::sync::Arc<super::constants::ConstantPoolSnapshot>,
     bf: &'a BytecodeFunction,
     f: Function,
     /// Sorted bytecode indices that begin a basic block.
@@ -746,6 +801,7 @@ impl<'a> Builder<'a> {
             .root_symbol()
             .unwrap_or_else(|| egcl_rt::symbols::intern(&bf.name));
         Builder {
+            constants: inline_options.constants(bf),
             bf,
             f: Function::new(bf.name.clone()),
             leaders: Vec::new(),
@@ -1747,7 +1803,7 @@ impl<'a> Builder<'a> {
             {
                 let aux = match instruction {
                     Instr::EvalHost(index) => {
-                        if self.bf.constants.get(*index as usize).is_none() {
+                        if self.constants.get(*index as usize).is_none() {
                             return Err(BuildError::Unsupported("invalid host form constant"));
                         }
                         AuxData::HostEval(*index)
@@ -3137,17 +3193,12 @@ impl<'a> Builder<'a> {
                 let Instr::Const(cidx) = self.bf.code[bcp - 1] else {
                     return Ok(false);
                 };
-                let Some(type_name) = self
-                    .bf
-                    .constants
-                    .get(cidx as usize)
-                    .copied()
-                    .filter(|v| v.is_symbol())
-                    .and_then(|v| crate::reader::symbol_name(v.as_symbol_index()))
+                let Some(super::constants::ConstantDescription::Symbol { name: Some(type_name), .. }) =
+                    self.constants.get(cidx as usize)
                 else {
                     return Ok(false);
                 };
-                match type_name.rsplit(':').next().unwrap_or(&type_name) {
+                match type_name.rsplit(':').next().unwrap_or(type_name) {
                     "FIXNUM" => Some(TypeBits::FIXNUM),
                     // (TYPEP x 'CONS) is the same unsound tag test as CONSP
                     // above -- a closure would answer T.  See bliss-74rl.
@@ -3306,56 +3357,21 @@ impl<'a> Builder<'a> {
 
     /// Classify a constant-pool `EgclVal` and emit the matching `Const*`.
     fn emit_const(&mut self, block: Block, idx: u16) -> Result<Value, BuildError> {
-        let slot = self
-            .bf
-            .constants
-            .get(idx as usize)
+        use super::constants::ConstantDescription as Constant;
+        let constant = self.constants.get(idx as usize)
             .ok_or(BuildError::Unsupported("constant index out of range"))?;
-        let val = *slot;
-
-        let (opcode, aux, ty) = if val.is_nil() {
-            (Opcode::ConstNil, AuxData::None, IRType::of(TypeBits::NULL))
-        } else if val == egcl_rt::value::T {
-            (Opcode::ConstT, AuxData::None, IRType::of(TypeBits::SYMBOL))
-        } else if val.is_fixnum() {
-            (
-                Opcode::ConstFixnum,
-                AuxData::FixnumImm(val.as_fixnum()),
-                IRType::of(TypeBits::FIXNUM),
-            )
-        } else if val.is_character() {
-            (
-                Opcode::ConstChar,
-                AuxData::CharImm(val.as_char()),
-                IRType::of(TypeBits::CHARACTER),
-            )
-        } else if val.is_single_float() {
-            (
-                Opcode::ConstFloat,
-                AuxData::FloatImm(val.as_single_float()),
-                IRType::of(TypeBits::SINGLE_FLOAT),
-            )
-        } else if val.tag() == egcl_rt::value::TAG_SYMBOL {
-            (
-                Opcode::ConstSymbol,
-                AuxData::SymbolRef(val.as_symbol_index()),
-                IRType::of(TypeBits::SYMBOL),
-            )
-        } else {
-            // Cons / heap object / function: retain its GC-rewritten pool slot.
-            // A double literal keeps its tagged box but is typed, so double
-            // speculation can read it as a constant (bliss-thcbb).
-            (
-                Opcode::ConstHeapObj,
-                AuxData::HeapLiteral {
-                    slot: slot as *const _ as usize,
-                },
-                if val.is_double_float() {
-                    IRType::of(TypeBits::DOUBLE_FLOAT)
-                } else {
-                    IRType::TOP
-                },
-            )
+        let (opcode, aux, ty) = match constant {
+            Constant::Nil => (Opcode::ConstNil, AuxData::None, IRType::of(TypeBits::NULL)),
+            Constant::True => (Opcode::ConstT, AuxData::None, IRType::of(TypeBits::SYMBOL)),
+            Constant::Fixnum(value) => (Opcode::ConstFixnum, AuxData::FixnumImm(*value), IRType::of(TypeBits::FIXNUM)),
+            Constant::Character(value) => (Opcode::ConstChar, AuxData::CharImm(*value), IRType::of(TypeBits::CHARACTER)),
+            Constant::SingleFloat(value) => (Opcode::ConstFloat, AuxData::FloatImm(*value), IRType::of(TypeBits::SINGLE_FLOAT)),
+            Constant::Symbol { index, .. } => (Opcode::ConstSymbol, AuxData::SymbolRef(*index), IRType::of(TypeBits::SYMBOL)),
+            Constant::Heap { slot, double_bits } => {
+                if let Some(bits) = double_bits { self.f.double_literals.insert(*slot, *bits); }
+                (Opcode::ConstHeapObj, AuxData::HeapLiteral { slot: *slot },
+                    if double_bits.is_some() { IRType::of(TypeBits::DOUBLE_FLOAT) } else { IRType::TOP })
+            }
         };
 
         Ok(self

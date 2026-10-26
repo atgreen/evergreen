@@ -85,6 +85,8 @@ fn install_body(symbol: u32, body: Arc<BytecodeFunction>) -> (u32, Rc<NativeCode
         .with_gc_stable_mutator(compile_t2_artifact)
         .expect("ordinary T2 artifact");
     let code = install_t2_completion(T2Completion {
+                    panicked: false,
+                    _permit: None, dependencies: Vec::new(),
         sym: symbol,
         generation,
         artifact: Some(artifact),
@@ -667,8 +669,8 @@ fn ordinary_t2_guard_retirement_preserves_effects_and_actual_tier() {
         run_native(&code, symbol, &[EgclVal::from_fixnum(41)], &mut env).unwrap(),
         EgclVal::from_fixnum(42)
     );
-    let replacement =
-        NATIVE_REGISTRY.with(|registry| registry.borrow().get(&symbol).unwrap().clone());
+    // Publication is asynchronous, and waiting must not replay the tick effect.
+    let replacement = background_t1::wait(symbol).expect("publish baseline after T2 guard retirement");
     assert!(!Rc::ptr_eq(&replacement, &code));
     assert!(matches!(replacement._storage, NativeCodeStorage::Mapped(_)));
     assert!(
@@ -735,6 +737,8 @@ fn ordinary_t2_missing_mapped_artifact_preserves_mapped_t1() {
     assert!(artifact.mapped.take().is_some(), "worker prepares mapped IR");
     assert!(
         install_t2_completion(T2Completion {
+                    panicked: false,
+                    _permit: None, dependencies: Vec::new(),
             sym: symbol,
             generation,
             artifact: Some(artifact),
@@ -771,6 +775,8 @@ fn install_mv_body(
             .with_gc_stable_mutator(compile_t2_artifact)
             .expect("MV-bind worker artifact");
         install_t2_completion(T2Completion {
+                    panicked: false,
+                    _permit: None, dependencies: Vec::new(),
             sym: symbol,
             generation,
             artifact: Some(artifact),
@@ -1381,6 +1387,8 @@ fn ordinary_t2_diagnostics_report_sparse_speculation_and_actual_publication() {
         (
             bcp,
             T2Completion {
+                    panicked: false,
+                    _permit: None, dependencies: Vec::new(),
                 sym: symbol,
                 generation,
                 artifact: Some(artifact),

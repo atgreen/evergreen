@@ -93,3 +93,35 @@ pub(in crate::cli::bytecode) fn invoke(
         Ok(result)
     }))
 }
+
+/// Resolve semantic adapters while a Lisp execution owns the symbol and call
+/// registries. Workers only consult these immutable symbol/cell bindings.
+#[derive(Clone)]
+pub(super) struct Bindings(Vec<(OrdinaryPrimitive, u32, Arc<egcl_rt::call_table::CallCell>)>);
+
+impl Bindings {
+    pub(super) fn owners(&self) -> Vec<Arc<egcl_rt::call_table::CallCell>> {
+        self.0.iter().map(|(_, _, cell)| Arc::clone(cell)).collect()
+    }
+
+    pub(super) fn capture() -> Self {
+        Self(symbols().iter().filter_map(|&(kind, symbol)| {
+            Some((kind, symbol, super::super::call_table::resolve(symbol)?))
+        }).collect())
+    }
+
+    pub(super) fn lower(
+        &self,
+        ir: &mut egcl_compiler::t2::ir::Function,
+        cells: &mut Vec<(u32, Arc<egcl_rt::call_table::CallCell>)>,
+    ) -> Option<()> {
+        egcl_compiler::t2::emit::lower_ordinary_primitives(ir, |primitive| {
+            let (_, symbol, cell) = self.0.iter().find(|(kind, _, _)| *kind == primitive)?;
+            if !cells.iter().any(|(existing, _)| existing == symbol) {
+                cells.push((*symbol, Arc::clone(cell)));
+            }
+            Some(*symbol)
+        }).ok()?;
+        Some(())
+    }
+}

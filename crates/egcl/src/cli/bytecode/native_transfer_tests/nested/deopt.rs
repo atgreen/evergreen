@@ -545,9 +545,9 @@ fn native_v2_installed_child_rebuilds_failed_guard_version() {
         old.deopt_count()
     );
     let symbol = egcl_rt::symbols::intern("CHILD-INSTALLED-PHASE");
-    let replacement = NATIVE_REGISTRY
-        .with(|registry| registry.borrow().get(&symbol).cloned())
-        .unwrap();
+    // Guard retirement queues its replacement; wait for owner-side publication
+    // without executing the Lisp body again.
+    let replacement = background_t1::wait(symbol).expect("publish replacement after guard retirement");
     let NativeCodeStorage::Mapped(mapped) = &replacement._storage else {
         panic!("mapped replacement")
     };

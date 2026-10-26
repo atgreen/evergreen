@@ -292,6 +292,7 @@ pub struct InlineOptions {
     pub config: InlineConfig,
     policies: HashMap<u32, InlinePolicy>,
     bodies: HashMap<u32, Arc<BytecodeFunction>>,
+    constant_snapshots: HashMap<usize, Arc<super::constants::ConstantPoolSnapshot>>,
     call_sites: HashMap<(u32, u32), CallSiteProfile>,
     root_symbol: Option<u32>,
 }
@@ -337,6 +338,23 @@ impl InlineOptions {
     pub fn with_body(mut self, symbol: u32, body: Arc<BytecodeFunction>) -> Self {
         self.bodies.insert(symbol, body);
         self
+    }
+
+    /// Register worker-owned metadata together with its original constant-slot
+    /// descriptions. The caller retains and roots the original body separately.
+    pub fn with_body_snapshot(mut self, symbol: u32, snapshot: &super::constants::BytecodeSnapshot) -> Self {
+        self.bodies.insert(symbol, Arc::clone(&snapshot.body));
+        self.with_constant_snapshot(snapshot)
+    }
+
+    pub(crate) fn with_constant_snapshot(mut self, snapshot: &super::constants::BytecodeSnapshot) -> Self {
+        self.constant_snapshots.insert(Arc::as_ptr(&snapshot.body) as usize, Arc::clone(&snapshot.constants));
+        self
+    }
+
+    pub(crate) fn constants(&self, body: &BytecodeFunction) -> Arc<super::constants::ConstantPoolSnapshot> {
+        self.constant_snapshots.get(&(body as *const _ as usize)).cloned()
+            .unwrap_or_else(|| Arc::new(super::constants::ConstantPoolSnapshot::capture(body)))
     }
 
     /// Identify the function being compiled, for direct/mutual-recursion

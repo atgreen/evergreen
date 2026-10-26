@@ -273,8 +273,8 @@ requirements that satisfy it.
 | Requirement | Summary |
 |-------------|---------|
 | R4.23–R4.24 | T0 interprets any CL form; maintains invocation counters |
-| R4.25–R4.26 | T1 compiles with < 1 ms latency; includes profiling stubs |
-| R4.27–R4.30 | T2 applies full optimisation; runs on background thread |
+| R4.25–R4.26 | Heat triggers promotion; native compiler workers permit moving GC |
+| R4.27–R4.30 | Continue current tier; validate publication; bound and deduplicate requests |
 | R4.38–R4.41 | OSR entry/exit; deoptimisation with blacklisting |
 | R4.53–R4.58 | Profiling counters, type profiles, tier-promotion triggers |
 

@@ -1401,6 +1401,8 @@ mod tests {
             // Callers that look up a global function (LoadFunction) are
             // admitted to mapped T2 on x86-64 Linux as well (#460).
             let code = install_t2_completion(T2Completion {
+                    panicked: false,
+                    _permit: None, dependencies: Vec::new(),
                 sym: symbol, generation,
                 artifact: Some(artifact.expect("compile admitted callback")), input,
             }).unwrap();
@@ -1444,6 +1446,8 @@ mod tests {
         let input = egcl_rt::CrossThreadRoot::new(input);
         let artifact = input.with_gc_stable(compile_t2_artifact).unwrap();
         install_t2_completion(T2Completion {
+                    panicked: false,
+                    _permit: None, dependencies: Vec::new(),
             sym: symbol, generation, artifact: Some(artifact), input,
         }).unwrap();
         args[0] = egcl_rt::symbols::symbol_function(egcl_rt::symbols::intern("PIC-INDEPENDENT")).unwrap();
@@ -1530,6 +1534,8 @@ mod tests {
             let artifact = input.with_gc_stable(compile_t2_artifact).unwrap();
             assert!(
                 install_t2_completion(T2Completion {
+                    panicked: false,
+                    _permit: None, dependencies: Vec::new(),
                     sym: symbol,
                     generation,
                     artifact: Some(artifact),
@@ -1570,6 +1576,8 @@ mod tests {
             // Closure bodies that read captured bindings reach mapped native
             // code on x86-64 Linux as well (#494).
             assert!(install_t2_completion(T2Completion {
+                    panicked: false,
+                    _permit: None, dependencies: Vec::new(),
                 sym: symbol, generation,
                 artifact: Some(artifact.expect("compile captured callback")), input,
             }).unwrap().is_t2);
@@ -1611,6 +1619,8 @@ mod tests {
         let input = egcl_rt::CrossThreadRoot::new(input);
         let artifact = input.with_gc_stable(compile_t2_artifact);
         assert!(install_t2_completion(T2Completion {
+                    panicked: false,
+                    _permit: None, dependencies: Vec::new(),
             sym: symbol, generation,
             artifact: Some(artifact.expect("recompile callback")), input,
         }).unwrap().is_t2);
@@ -1675,6 +1685,8 @@ mod tests {
         let artifact = input.with_gc_stable(compile_t2_artifact);
         // &optional bodies reach mapped T1/T2 on x86-64 Linux too (#457).
         let code = install_t2_completion(T2Completion {
+                    panicked: false,
+                    _permit: None, dependencies: Vec::new(),
             sym: symbol, generation,
             artifact: Some(artifact.expect("compile T2 leaf")), input,
         }).expect("install T2 leaf");

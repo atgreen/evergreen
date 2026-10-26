@@ -94,14 +94,14 @@ subsection; the master list is collected here for cross-referencing.
 
 | ID | Requirement | Level |
 |----|-------------|-------|
-| R4.23 | The compiler front-end MUST lower any valid executable CL form to portable EGCL bytecode before T0 execution | MUST |
-| R4.24 | T0 MUST maintain per-function invocation counters (§4.9) | MUST |
-| R4.25 | T1 MUST compile a CL function from EGCL bytecode to native code with < 1 ms latency for typical functions (≤ 200 bytecode instructions) | MUST |
-| R4.26 | T1 code MUST include profiling stubs for T2 promotion | MUST |
-| R4.27 | T2 MUST apply the full optimisation pass pipeline (§4.5) | MUST |
-| R4.28 | Tier promotion thresholds MUST be configurable at runtime | MUST |
-| R4.29 | Compilation MUST occur on a background thread; it MUST NOT block the calling thread except at safepoints | MUST |
-| R4.30 | T2 compilation MAY be deferred or skipped under memory pressure | MAY |
+| R4.23 | Every user-defined function MUST begin execution at T0 (portable bytecode interpreter). | MUST |
+| R4.24 | The runtime MUST request promotion of a function from T0 to T1 when its invocation counter reaches the T0→T1 threshold (default 10). | MUST |
+| R4.25 | The runtime MUST request promotion of a function from T1 to T2 when its invocation counter reaches the T1→T2 threshold (default 4 096) **or** a back-edge counter in the function reaches the loop-heat threshold (default 10 000). | MUST |
+| R4.26 | T1 and T2 native compilation MUST execute on dedicated background compiler workers from already-expanded bytecode, without repeating source-level compile-time effects. Expensive compiler work MUST permit moving GC to complete concurrently; a whole-compilation GC exclusion is forbidden. | MUST |
+| R4.27 | While native compilation is queued or running, ordinary execution MUST continue in its current tier. Publication MUST validate definition generation and dependencies, register complete code/GC metadata, and atomically expose the entry at subsequent dispatch or matching OSR polls; stale results MUST be discarded. | MUST |
+| R4.28 | If native compilation fails, the function MUST retain its usable tier and the failure MUST be logged. Structural failures MUST suppress retries for the same definition and compilation kind; transient failures MAY retry with backoff. Every terminal outcome MUST release request ownership and roots. | MUST |
+| R4.29 | Tier thresholds MUST be configurable at startup via environment variables (`EGCL_T0_T1_THRESHOLD`, `EGCL_T1_T2_THRESHOLD`, `EGCL_LOOP_HEAT_THRESHOLD`). | MUST |
+| R4.30 | T1 and T2 compilation queues MUST be separate and bounded (default 64 entries each). Requests MUST be deduplicated through publication by function identity, definition generation, target tier, and OSR entry where applicable. A full queue MUST drop new automatic requests with a counter increment, without blocking or leaving the request marked pending. | MUST |
 
 ### 4.0.5  Optimisation Passes (§4.5)
 
@@ -243,15 +243,28 @@ deoptimisation.
 
 **T1 — Baseline Compiler:**  Performs a single-pass lowering from bytecode to
 native code without constructing the T2 SSA IR graph.  Inserts
-profiling stubs at call sites and back-edges.  Target latency: < 1 ms for a
-200-instruction function.  No optimisation beyond peephole lowering and
-constant folding of immediates.
+profiling stubs at call sites and back-edges. T1 MUST include these stubs for
+T2 promotion and MUST compile typical functions (≤ 200 bytecode instructions)
+with < 1 ms compiler latency, excluding queue wait.  No optimisation beyond peephole lowering and
+constant folding of immediates. Compilation runs on a dedicated T1 worker;
+ordinary callers continue executing T0 until validated publication.
 
 **T2 — Optimising Compiler:**  Builds the block-based SSA IR (§4.3), runs the
 optimisation pass pipeline (§4.5), lowers to machine-specific nodes, performs
 register allocation (§4.7), and emits optimised native code.  Runs on a
 background compilation thread.  Code is installed atomically via pointer
-swap on the function object.
+swap on the function object after generation/dependency validation and GC
+metadata registration. Both tiers obey the worker lifecycle in §4.4; expensive
+compilation permits moving GC to complete.
+
+Source processing is managed Lisp execution in the requesting execution
+context: reader macros, macro/compiler-macro expansion, and `EVAL-WHEN`
+compile-time evaluation may run Lisp, allocate, signal conditions, and recurse
+into compilation. Their ordering and dynamic context remain intact. Native
+promotion consumes the resulting bytecode and never repeats those effects.
+Snapshot preparation and publication are bounded managed phases around the
+GC-safe worker computation; explicit forced compilation may wait cooperatively.
+See [§4.4](04-04-tiered.md) for the target design and implementation gaps.
 
 ## 4.5  Optimisation Passes — Overview
 
@@ -260,7 +273,7 @@ See `spec/04-05-optimisation.md` for the full specification.
 **Pass ordering (A4.02):**
 
 ```text
-1. Build IR from AST
+1. Build IR from already-expanded bytecode
 2. Type propagation (forward data-flow, CL type lattice)
 3. Constant folding
 4. Inlining (profile-guided, budget-limited)
@@ -287,8 +300,8 @@ site and a maximum inlining depth of 5.
 See `spec/04-06-osr.md` for the full specification.
 
 **OSR Entry (A4.03):** When a bytecode back-edge counter exceeds the T2
-threshold, the running T0/T1 frame is suspended at the safepoint.  The T2
-compiler is invoked (if not already running).  Once T2 code is ready, the
+threshold, the running T0/T1 frame requests background compilation and
+continues executing. Once validated T2 code is ready at a matching poll, the
 interpreter/T1 frame's live locals at the bytecode PC are mapped to the T2
 code's SSA variables via an **OSR entry map**, and execution transfers to the
 T2 loop header.

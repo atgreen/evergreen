@@ -24,6 +24,7 @@ fn check_listing(enabled: bool) {
     let program = r#"
         (defun segment-listing (x) (+ x 1))
         (dotimes (i 30) (assert (= 42 (segment-listing 41))))
+        (assert (= (egcl-ext:function-tier 'segment-listing) 1))
         (disassemble 'segment-listing)
     "#;
     let output = Command::new(env!("CARGO_BIN_EXE_egcl"))

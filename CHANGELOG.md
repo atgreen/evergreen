@@ -18,6 +18,12 @@
 
 ### Performance
 
+- Native tier compilation on x86-64 Linux and s390x Linux now runs on
+  background workers while Lisp execution continues. Compiler snapshots let
+  moving GC proceed during optimization and machine-code emission; macro
+  expansion and other compile-time Lisp effects stay in the requesting execution
+  ([#662](https://github.com/atgreen/evergreen/pull/662)).
+
 - Local functions defined with `flet` or `labels` can now compile when they
   read or write enclosing lexical variables. Small helpers inline into their
   callers, including sibling `labels` functions, while shared mutation and
@@ -92,6 +98,10 @@
   ([#646](https://github.com/atgreen/evergreen/pull/646)).
 
 ### Fixed
+
+- Private function symbols no longer cause multi-gigabyte allocations in the
+  interpreter's arithmetic-classification cache
+  ([#662](https://github.com/atgreen/evergreen/pull/662)).
 
 - Fiber migration preserves execution-local state after native calls on s390x,
   preventing wrong `NIL` results and crashes caused by reading a previous

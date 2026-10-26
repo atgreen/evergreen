@@ -65,6 +65,7 @@
 //!   interpreted result. The integration tests under `tests/` gate every
 //!   change on both.
 
+pub mod constants;
 pub mod frame_state;
 pub mod ir;
 pub mod mach;

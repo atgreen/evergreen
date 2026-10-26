@@ -217,6 +217,8 @@ fn exercise_ordinary_osr(inherited_scopes: bool, fail_entry_guard: bool, replace
         .with_gc_stable_mutator(compile_t2_artifact)
         .expect("ordinary worker artifact");
     let next = install_t2_completion(T2Completion {
+                    panicked: false,
+                    _permit: None, dependencies: Vec::new(),
         sym: symbol,
         generation,
         artifact: Some(artifact),
@@ -608,6 +610,8 @@ fn ordinary_mapped_child_osr_retains_parent_and_current_child_activation() {
         .with_gc_stable_mutator(compile_t2_artifact)
         .expect("ordinary child worker artifact");
     let next = install_t2_completion(T2Completion {
+                    panicked: false,
+                    _permit: None, dependencies: Vec::new(),
         sym: symbol,
         generation,
         artifact: Some(artifact),

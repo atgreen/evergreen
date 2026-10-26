@@ -479,6 +479,8 @@ fn exercise_condition_osr_entry(case: ConditionCase, guard: bool, nested_child: 
         "real scoped numeric speculation required"
     );
     let next = install_t2_completion(T2Completion {
+                    panicked: false,
+                    _permit: None, dependencies: Vec::new(),
         sym: symbol,
         generation,
         artifact: Some(artifact),

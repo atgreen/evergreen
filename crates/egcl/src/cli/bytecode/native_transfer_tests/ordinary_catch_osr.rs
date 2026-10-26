@@ -401,6 +401,8 @@ fn exercise_local_catch_osr(fail_guard: bool, nested_child: bool) {
         "the genuine worker artifact must speculate the protected accumulator addition"
     );
     let next = install_t2_completion(T2Completion {
+                    panicked: false,
+                    _permit: None, dependencies: Vec::new(),
         sym: symbol,
         generation,
         artifact: Some(artifact),
