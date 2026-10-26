@@ -128,6 +128,10 @@
 
 ### Fixed
 
+- Native x86-64 branches preserve comparison results across intervening boxing,
+  fixing incorrect loop counts and results in some unboxed integer loops
+  ([#680](https://github.com/atgreen/evergreen/pull/680)).
+
 - Private function symbols no longer cause multi-gigabyte allocations in the
   interpreter's arithmetic-classification cache
   ([#662](https://github.com/atgreen/evergreen/pull/662)).
