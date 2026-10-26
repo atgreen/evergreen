@@ -10496,6 +10496,47 @@ fn compiled_macro_whole_includes_operator_and_all_args() {
     );
 }
 
+/// A variable proclaimed special by DECLAIM alone, with no DEFVAR, is special
+/// for the rest of a COMPILE-FILE'd file (CLHS 3.2.3.1.1): a LET of it binds
+/// dynamically, so a function or method called inside the LET reads the new
+/// value. COMPILE-FILE used to proclaim it only at load time and compiled the
+/// LET as a lexical binding; ansi-test's IS-SIMILAR (auxiliary/ansi-aux.lsp)
+/// then found *SIMILARITY-LIST* unbound in 27 printer tests.
+#[test]
+fn compile_file_declaim_special_takes_effect_for_the_rest_of_the_file() {
+    let dir = std::env::temp_dir().join(format!("egcl_test_declaim_special_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create declaim special test dir");
+    let src = dir.join("ds.lisp");
+    std::fs::write(
+        &src,
+        "(declaim (special *ds*))\n\
+         (defun ds-read () *ds*)\n\
+         (defgeneric ds-gf (x))\n\
+         (defmethod ds-gf ((x cons)) *ds*)\n\
+         (defun ds-bind () (let ((*ds* 1)) (list (ds-read) (ds-gf '(a)))))\n",
+    )
+    .expect("write declaim special source");
+    let fasl = dir.join("ds.fasl");
+    let prog = format!(
+        "(progn (compile-file #P\"{}\" :output-file #P\"{}\") (load #P\"{}\") \
+           (format t \"DS=~s\" (handler-case (ds-bind) (unbound-variable () :unbound))))",
+        src.to_str().unwrap(),
+        fasl.to_str().unwrap(),
+        fasl.to_str().unwrap()
+    );
+    let output = egcl_bin()
+        .args(["--eval", &prog])
+        .output()
+        .expect("run egcl");
+    let _ = std::fs::remove_dir_all(&dir);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("DS=(1 1)"),
+        "a DECLAIMed special must be bound dynamically in compiled code; got: '{stdout}', stderr: '{}'",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// PROGV dynamically binds a runtime list of special variables to a runtime
 /// list of values for the extent of its body, restoring them afterward (bliss-66ny;
 /// needed by bordeaux-threads v2's ESTABLISH-DYNAMIC-ENV).
