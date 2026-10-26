@@ -271,6 +271,8 @@ pub enum Opcode {
     Load,
     Car,
     Cdr,
+    /// Tagged general-vector load. ArrayRef also admits packed U8;
+    /// AuxData::None retains the SIMPLE_VECTOR-only SVREF contract.
     VecRef,
     /// Ordered type/bounds check for an AREF/SVREF whose result is fully dead.
     ArrayReadDiscarded,
@@ -300,6 +302,8 @@ pub enum Opcode {
     Store,
     SetCar,
     SetCdr,
+    /// Guarded AREF store into a general vector or supported packed layout.
+    /// Packed U8 stores check 0..255 before truncation and return tagged value.
     VecSet,
     /// Simple-vector store whose fourth operand witnesses a successful
     /// SmallVectorRangeP and a verified counted-loop induction. The verifier
@@ -438,6 +442,12 @@ pub enum AuxData {
     HeapLiteral {
         slot: usize,
     },
+    /// Semantic rank-one AREF layout contract for VecRef/ArrayReadDiscarded.
+    /// Unlike CallTarget provenance, this must be retained when cloning.
+    /// AuxData::None means SIMPLE_VECTOR-only (SVREF).
+    ArrayRef,
+    /// VecSet implements SVREF assignment: SIMPLE_VECTOR only, never packed.
+    SimpleVectorStore,
     FieldOffset(u32),
     /// Index in the retained root bytecode body's environment name table.
     EnvironmentName(u16),
