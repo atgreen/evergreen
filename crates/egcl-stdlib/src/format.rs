@@ -1344,15 +1344,18 @@ fn exp_with_decimal_point(s: &str, exp_char: char) -> String {
 }
 
 /// CL `~E` with an explicit fraction-digit count `d` (CLHS 22.3.3.2).
-/// `k` is the scale factor (default 1: `k` significant digits before the decimal
-/// point, `d` after); `e` zero-pads the exponent to that many digits. The
+/// `k` is the scale factor (default 1): a positive `k` puts `k` significant
+/// digits before the decimal point and `d-k+1` after it, so `~,2,,2E` of 0.05
+/// is `50.0e-3` and `~,2,,3E` is `500.e-4`; a `k` of zero or less puts `d`
+/// digits after the point. `e` zero-pads the exponent to that many digits. The
 /// exponent always carries a sign. Numbers are computed in f64 and rounded to `d`
 /// fraction digits, so binary32 imprecision beyond `d` is discarded (no bliss-8zrb
 /// regression on this path).
 fn format_e_fixed(f: f64, d: usize, e: Option<usize>, k: i64, exp_char: char) -> String {
     let neg = f.is_sign_negative() && f != 0.0;
     let af = f.abs();
-    let factor = 10f64.powi(d as i32);
+    let frac = if k > 0 { (d as i64 + 1 - k).max(0) as usize } else { d };
+    let factor = 10f64.powi(frac as i32);
     let (mant, exp) = if af == 0.0 {
         (0.0f64, 0i64)
     } else {
@@ -1367,7 +1370,10 @@ fn format_e_fixed(f: f64, d: usize, e: Option<usize>, k: i64, exp_char: char) ->
         }
         (mant, exp)
     };
-    let mant_str = format!("{:.*}", d, mant);
+    let mut mant_str = format!("{:.*}", frac, mant);
+    if frac == 0 {
+        mant_str.push('.');
+    }
     let exp_sign = if exp < 0 { '-' } else { '+' };
     let exp_digits = match e {
         Some(ee) => format!("{:0width$}", exp.unsigned_abs(), width = ee),
@@ -3228,7 +3234,7 @@ fn format_impl(
                 let k = params
                     .get(3)
                     .map_or(Ok(1), |p| resolve_param(p, 1, arg_idx))?;
-                let _of = params
+                let overflow = params
                     .get(4)
                     .map_or(Ok(-1), |p| resolve_param(p, -1, arg_idx))?;
                 let pad_param = params
@@ -3263,6 +3269,28 @@ fn format_impl(
                         exp_char,
                     )
                 };
+                // ~@E signs a non-negative value too (CLHS 22.3.3.2).
+                if at_sign && !s.starts_with('-') {
+                    s.insert(0, '+');
+                }
+                if w > 0 && (s.chars().count() as i64) > w {
+                    // Without d the single zero after the point is optional, and
+                    // goes when the field is too narrow for it: ~5E of 1.0 is
+                    // "1.e+0" (ansi format.e.4-9).
+                    if d < 0 {
+                        if let Some(p) = s.find(".0") {
+                            if !s[p + 2..].starts_with(|c: char| c.is_ascii_digit()) {
+                                s.remove(p + 1);
+                            }
+                        }
+                    }
+                    // Still too wide: an overflow character fills the field
+                    // instead (ansi format.e.21).
+                    if (s.chars().count() as i64) > w && overflow >= 0 {
+                        let c = char::from_u32(overflow as u32).unwrap_or('*');
+                        s = std::iter::repeat_n(c, w as usize).collect();
+                    }
+                }
                 // ~w,…E: right-justify in a field of at least w chars, padding on the
                 // left with padchar (default space) (bliss-o30e).
                 if w > 0 && (s.chars().count() as i64) < w {
