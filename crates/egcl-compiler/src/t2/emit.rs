@@ -143,10 +143,10 @@ use crate::t2::slot_map;
 use crate::t2::slot_map::ConversionKind;
 use crate::t2::x64_frame::{select_frame_homes, ValueHome as FramedHome, GPR_X86};
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[path = "emit_integer_low_bits.rs"]
 mod integer_low_bits;
 
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[path = "ordinary_leaf.rs"]
 mod ordinary_leaf;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]

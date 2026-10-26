@@ -356,7 +356,7 @@ fn run_internal(f: &mut Function, profitable: bool) -> usize {
     raw.len()
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 mod tests {
     use super::*;
     use crate::t2::frame_state::{FrameScope, FrameState};
