@@ -937,7 +937,7 @@ unsafe fn resolve_location(
             .and_then(|index| cursor.registers[index])
             .and_then(|address| walk.slot(address))
             .map(|address| address as *mut EgclVal),
-        NativeValueLocation::Constant(_) | NativeValueLocation::Unavailable => None,
+        NativeValueLocation::Constant(_) | NativeValueLocation::RawConstant(_) | NativeValueLocation::Unavailable => None,
     }
 }
 
@@ -983,7 +983,7 @@ unsafe fn visit_frame(
             resolve_location(location, cursor, body_sp, activation, layout.activation_slots, walk)
         };
         #[cfg(test)]
-        if !matches!(location, NativeValueLocation::Constant(_) | NativeValueLocation::Unavailable) {
+        if !matches!(location, NativeValueLocation::Constant(_) | NativeValueLocation::RawConstant(_) | NativeValueLocation::Unavailable) {
             use std::sync::atomic::Ordering::Relaxed;
             EXPECTED.fetch_add(1, Relaxed);
             if resolved.is_some() {
@@ -991,7 +991,7 @@ unsafe fn visit_frame(
             }
         }
         let Some(slot) = resolved else {
-            if !matches!(location, NativeValueLocation::Constant(_) | NativeValueLocation::Unavailable) {
+            if !matches!(location, NativeValueLocation::Constant(_) | NativeValueLocation::RawConstant(_) | NativeValueLocation::Unavailable) {
                 note_bail(Bail::LocationUnresolved);
             }
             continue;

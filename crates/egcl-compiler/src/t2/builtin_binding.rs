@@ -44,6 +44,8 @@ fn fixed_standard_primitive(symbol: u32) -> bool {
             | "MIN"
             | "MAX"
             | "ASH"
+            | "BYTE"
+            | "LDB"
             | "NOT"
             | "NULL"
             | "EQ"

@@ -161,6 +161,8 @@ pub mod op {
     pub const IFLOOR: u32 = 0x002E;
     pub const IMIN: u32 = 0x002F;
     pub const IMAX: u32 = 0x0036;
+    /// Noncollecting native extraction, with a cold noninteger guard.
+    pub const INTEGER_LOW_BITS: u32 = 0x0037;
 
     // ── 0x30 float ALU ───────────────────────────────────────────────
     pub const FADD: u32 = 0x0030;
@@ -666,6 +668,7 @@ fn lower_inst(lo: &mut Lowering, inst: Inst) {
         LogOr => bin!(op::OR),
         LogXor => bin!(op::XOR),
         LogNot => un!(op::NOT),
+        IntegerLowBits => un!(op::INTEGER_LOW_BITS),
 
         // ── box / unbox / widen ──
         BoxFixnum => un!(op::BOX_FIXNUM),

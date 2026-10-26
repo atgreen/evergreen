@@ -109,6 +109,8 @@ pub enum FrameValueLocation {
     Home(ValueHome),
     /// A nonmoving tagged word materialized by the emitter when needed.
     Immediate(EgclVal),
+    /// Raw scalar bits, never interpreted as a tagged Lisp object or GC root.
+    RawImmediate(u64),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -319,12 +321,27 @@ fn resolve_frame_values(
             return Err(FrameMapError::InvalidValue(value));
         }
         let location = if let Some(&bits) = constants.get(&value) {
-            let constant = EgclVal(bits);
-            if repr != ValueRepresentation::Tagged || immediate_constant(f, value) != Some(constant)
-            {
-                return Err(FrameMapError::InvalidConstant(value));
+            if repr == ValueRepresentation::UnboxedFixnum {
+                let ValueDef::Result { inst, .. } = f.value(value).def else {
+                    return Err(FrameMapError::InvalidConstant(value));
+                };
+                let instruction = f.inst(inst);
+                if !matches!((&instruction.opcode, &instruction.aux),
+                    (Opcode::ConstFixnum, AuxData::FixnumImm(n))
+                        if *n as u64 == bits && (egcl_rt::bignum::FIXNUM_MIN..=egcl_rt::bignum::FIXNUM_MAX).contains(n))
+                {
+                    return Err(FrameMapError::InvalidConstant(value));
+                }
+                FrameValueLocation::RawImmediate(bits)
+            } else {
+                let constant = EgclVal(bits);
+                if repr != ValueRepresentation::Tagged
+                    || immediate_constant(f, value) != Some(constant)
+                {
+                    return Err(FrameMapError::InvalidConstant(value));
+                }
+                FrameValueLocation::Immediate(constant)
             }
-            FrameValueLocation::Immediate(constant)
         } else {
             let home = *homes
                 .values
@@ -447,4 +464,67 @@ pub fn select_frame_homes(
         values,
         stack_slots,
     })
+}
+
+#[cfg(test)]
+mod raw_constant_tests {
+    use super::*;
+    use crate::t2::ir::{IRType, InstData, InstFlags, TypeBits};
+    use crate::t2::mach::{RegClass, VReg};
+
+    #[test]
+    fn raw_fixnum_immediate_validates_literal_and_keeps_machine_bits() {
+        for n in [1, 3, 5, 7, -1, egcl_rt::bignum::FIXNUM_MAX] {
+            let mut f = Function::new("raw-constant-map");
+            let block = f.entry();
+            let (_, values) = f.push_inst(
+                block,
+                InstData {
+                    opcode: Opcode::ConstFixnum,
+                    args: vec![],
+                    results: vec![],
+                    aux: AuxData::FixnumImm(n),
+                    flags: InstFlags::default(),
+                    targets: vec![],
+                    frame_state: None,
+                    source_pos: 0,
+                },
+                &[(
+                    IRType::of(TypeBits::FIXNUM),
+                    ValueRepresentation::UnboxedFixnum,
+                )],
+            );
+            let value = values[0];
+            let vreg = VReg {
+                num: value.0,
+                class: RegClass::Gpr,
+            };
+            let mut machine = MachFunc::default();
+            machine
+                .value_reprs
+                .insert(vreg, ValueRepresentation::UnboxedFixnum);
+            let homes = FrameHomes {
+                values: HashMap::new(),
+                stack_slots: 0,
+            };
+            let resolve = |bits| {
+                resolve_frame_values(
+                    &f,
+                    &machine,
+                    &homes,
+                    &HashMap::from([(value, bits)]),
+                    HashSet::from([vreg]),
+                )
+            };
+            let mapped = resolve(n as u64).unwrap();
+            assert_eq!(
+                mapped.value(value).unwrap().location,
+                FrameValueLocation::RawImmediate(n as u64)
+            );
+            assert_eq!(mapped.value(value).unwrap().gc_home(), None);
+            assert!(
+                matches!(resolve((n as u64).wrapping_add(1)), Err(FrameMapError::InvalidConstant(v)) if v == value)
+            );
+        }
+    }
 }

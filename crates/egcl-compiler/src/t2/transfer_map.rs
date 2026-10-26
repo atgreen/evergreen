@@ -263,10 +263,11 @@ pub(crate) fn lower_resolved_transfer_maps(
             .clone();
         let substitute = |source: &mut ValueSource| {
             if let ValueSource::Value { value, .. } = source {
-                if let Some(FrameValueLocation::Immediate(constant)) =
-                    point.value(*value).map(|entry| entry.location)
-                {
-                    *source = ValueSource::Const(constant);
+                match point.value(*value).map(|entry| entry.location) {
+                    Some(FrameValueLocation::Immediate(constant)) => *source = ValueSource::Const(constant),
+                    Some(FrameValueLocation::RawImmediate(bits)) =>
+                        *source = ValueSource::Const(egcl_rt::value::EgclVal::from_fixnum(bits as i64)),
+                    _ => {}
                 }
             }
         };
@@ -282,7 +283,7 @@ pub(crate) fn lower_resolved_transfer_maps(
         }
         map.frames = deopt::lower_one(0, &state, &|value| match point.value(value)?.location {
             FrameValueLocation::Home(home) => home.location(),
-            FrameValueLocation::Immediate(_) => None,
+            FrameValueLocation::Immediate(_) | FrameValueLocation::RawImmediate(_) => None,
         })
         .map_err(TransferMapError::FrameState)?
         .scopes;
@@ -320,6 +321,8 @@ pub(crate) fn lower_poll_transfer_map(
         if let ValueSource::Value { value, .. } = source {
             match values.value(*value).map(|entry| entry.location) {
                 Some(FrameValueLocation::Immediate(value)) => *source = ValueSource::Const(value),
+                Some(FrameValueLocation::RawImmediate(bits)) =>
+                    *source = ValueSource::Const(egcl_rt::value::EgclVal::from_fixnum(bits as i64)),
                 None => *source = ValueSource::Const(egcl_rt::value::NIL),
                 _ => {}
             }
@@ -335,7 +338,7 @@ pub(crate) fn lower_poll_transfer_map(
     }
     let frames = deopt::lower_one(0, &state, &|value| match values.value(value)?.location {
         FrameValueLocation::Home(home) => home.location(),
-        FrameValueLocation::Immediate(_) => None,
+        FrameValueLocation::Immediate(_) | FrameValueLocation::RawImmediate(_) => None,
     }).ok()?.scopes;
     let mut roots = Vec::new();
     for frame in &frames {

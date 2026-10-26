@@ -18,6 +18,12 @@
 
 ### Performance
 
+- T2 on x86-64 Linux can peel a narrowing integer loop into a generic first
+  iteration and a guarded fixnum remainder. Constant byte extraction compiles
+  directly, and eligible integer arithmetic stays unboxed between operations
+  while retaining precise deoptimization and generic fallbacks
+  ([#664](https://github.com/atgreen/evergreen/pull/664)).
+
 - Native tier compilation on x86-64 Linux and s390x Linux now runs on
   background workers while Lisp execution continues. Compiler snapshots let
   moving GC proceed during optimization and machine-code emission; macro

@@ -108,9 +108,9 @@ impl Pass for Licm {
 
 /// A natural loop: its header and the set of blocks in its body (header
 /// included). Bodies are unioned across all back-edges sharing a header.
-struct NaturalLoop {
-    header: Block,
-    body: Vec<Block>,
+pub(crate) struct NaturalLoop {
+    pub(crate) header: Block,
+    pub(crate) body: Vec<Block>,
 }
 
 impl NaturalLoop {
@@ -122,7 +122,7 @@ impl NaturalLoop {
 /// Identify natural loops: a CFG edge `b → h` is a back-edge
 /// when `h` dominates `b`; the loop body is `{h} ∪ {n : n reaches b without
 /// passing through h}`. Bodies for back-edges that share a header are unioned.
-fn detect_loops(f: &Function, dom: &DominatorTree) -> Vec<NaturalLoop> {
+pub(crate) fn detect_loops(f: &Function, dom: &DominatorTree) -> Vec<NaturalLoop> {
     let mut loops: Vec<NaturalLoop> = Vec::new();
 
     for &b in f.block_order() {

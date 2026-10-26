@@ -268,6 +268,82 @@ fn sat_mul(a: i64, b: i64) -> i64 {
     a.saturating_mul(b)
 }
 
+// These facts describe tagged fixnums after their guards. In particular, a
+// signed i64 range is not a proof that a value fits the tagged representation.
+const FIXNUM_BOUNDS: Range = Range {
+    lo: -(1i64 << 60),
+    hi: (1i64 << 60) - 1,
+};
+
+fn bounded_fixnum_operand(operand: &IRType) -> Option<Range> {
+    if operand.bits != TypeBits::FIXNUM {
+        return None;
+    }
+    let range = operand.range.unwrap_or(FIXNUM_BOUNDS);
+    range_meet(range, FIXNUM_BOUNDS)
+}
+
+fn constant_shift_range(opcode: Opcode, ops: &[IRType]) -> Option<Range> {
+    let input = bounded_fixnum_operand(ops.first()?)?;
+    let count = bounded_fixnum_operand(ops.get(1)?)?;
+    if count.lo != count.hi {
+        return None;
+    }
+    let count = count.lo;
+    let right = match opcode {
+        // ASH's signed count: negative means arithmetic right shift. Avoid
+        // negating the count, which can overflow for an extreme input fact.
+        Opcode::FixnumShl if count < 0 => Some(count.unsigned_abs().min(63) as u32),
+        // This IR opcode has an unsigned-direction count, unlike ASH. Only
+        // the supported nonnegative machine-count domain is inferred here.
+        Opcode::FixnumShr if (0..64).contains(&count) => Some(count as u32),
+        Opcode::FixnumShr => return None,
+        _ => None,
+    };
+    if let Some(count) = right {
+        return Some(Range {
+            lo: input.lo >> count,
+            hi: input.hi >> count,
+        });
+    }
+    if input.lo == 0 && input.hi == 0 {
+        return Some(input);
+    }
+    if count > 60 {
+        return None;
+    }
+    let lo = (input.lo as i128) << count;
+    let hi = (input.hi as i128) << count;
+    // Do not use wrapping shifts, or claim a bounded result when a left shift
+    // can overflow its fixnum domain. The existing overflow guard remains.
+    (lo >= FIXNUM_BOUNDS.lo as i128 && hi <= FIXNUM_BOUNDS.hi as i128).then_some(Range {
+        lo: lo as i64,
+        hi: hi as i64,
+    })
+}
+
+fn positive_mask_range(ops: &[IRType]) -> Option<Range> {
+    let a = bounded_fixnum_operand(ops.first()?)?;
+    let b = bounded_fixnum_operand(ops.get(1)?)?;
+    let (mask, input) = if a.lo == a.hi && a.lo >= 0 {
+        (a.lo, b)
+    } else if b.lo == b.hi && b.lo >= 0 {
+        (b.lo, a)
+    } else {
+        return None;
+    };
+    // For a nonnegative input AND cannot exceed the input either. Negative
+    // inputs still produce a nonnegative result bounded by the mask.
+    Some(Range {
+        lo: 0,
+        hi: if input.lo >= 0 {
+            mask.min(input.hi)
+        } else {
+            mask
+        },
+    })
+}
+
 /// Evaluate the abstract result of an instruction from its operand facts.
 /// Returns `⊥` when an operand is not yet known, so unknowns never pollute a
 /// result with a spuriously-wide fact during the fixpoint.
@@ -355,9 +431,27 @@ fn eval(opcode: Opcode, aux: &AuxData, ops: &[IRType]) -> IRType {
                 class_id: None,
             }
         }
+        FixnumShl | FixnumShr | LogAnd => {
+            let range = if opcode == LogAnd {
+                positive_mask_range(ops)
+            } else {
+                constant_shift_range(opcode, ops)
+            };
+            IRType {
+                range: range.or(Some(FULL)),
+                ..IRType::of(TypeBits::FIXNUM)
+            }
+        }
+        IntegerLowBits => match aux {
+            AuxData::FixnumImm(mask) if (0..=(1i64 << 60) - 1).contains(mask) => IRType {
+                range: Some(Range { lo: 0, hi: *mask }),
+                ..IRType::of(TypeBits::FIXNUM)
+            },
+            _ => IRType::TOP,
+        },
         // Fixnum ops whose range we do not track precisely: known FIXNUM, full range.
-        FixnumDiv | FixnumFloor | FixnumMin | FixnumMax | FixnumRem | FixnumMod | FixnumShl | FixnumShr | LogAnd | LogOr | LogXor
-        | LogNot | WidenI32 | UnboxFixnum | BoxFixnum => fixnum_full(),
+        FixnumDiv | FixnumFloor | FixnumMin | FixnumMax | FixnumRem | FixnumMod | LogOr
+        | LogXor | LogNot | WidenI32 | UnboxFixnum | BoxFixnum => fixnum_full(),
 
         // Float arithmetic: propagate the float tag(s) of the operands.
         FloatAdd | FloatSub | FloatMul | FloatDiv => {
@@ -409,7 +503,8 @@ fn eval(opcode: Opcode, aux: &AuxData, ops: &[IRType]) -> IRType {
 
         // Comparisons and predicates yield a CL boolean.
         FixnumCmpEq | FixnumCmpLt | FixnumCmpLe | FixnumCmpGt | FixnumCmpGe | FloatCmpEq
-        | FloatCmpLt | FloatCmpLe | FloatCmpGt | FloatCmpGe | GenericEq | GenericEqual | InstanceOf => boolean(),
+        | FloatCmpLt | FloatCmpLe | FloatCmpGt | FloatCmpGe | GenericEq | GenericEqual
+        | InstanceOf => boolean(),
 
         // A type check narrows its operand to the checked tag (spec R4.63).
         // A Guard VALUE does the same for its passed-through result: it exists
@@ -579,8 +674,139 @@ impl Facts {
 const WIDEN_AFTER: usize = 400;
 const MAX_PASSES: usize = WIDEN_AFTER + 8;
 
+/// A fresh BYTE descriptor may be mutable in this implementation. Infer an
+/// LDB result only while that descriptor has one executable consumer, crosses
+/// normal single-predecessor edges, and encounters no opaque effects. Calls
+/// remain in the IR: these are facts about successful normal returns only.
+fn fresh_ldb_facts(f: &Function) -> HashMap<Value, IRType> {
+    use super::builtin_binding::{Binding, snapshot};
+    let canonical = |data: &super::ir::InstData, key: &str| {
+        let AuxData::CallTarget(symbol) = data.aux else {
+            return false;
+        };
+        matches!(data.opcode, Opcode::Call | Opcode::Invoke)
+            && egcl_rt::symbols::registry_key(symbol).as_deref() == Some(key)
+            && snapshot(symbol) == Some(Binding::FixedStandard)
+    };
+    let constant = |value| {
+        let ValueDef::Result { inst, .. } = f.value(value).def else {
+            return None;
+        };
+        let data = f.inst(inst);
+        match (&data.opcode, &data.aux) {
+            (Opcode::ConstFixnum, AuxData::FixnumImm(n)) => Some(*n),
+            _ => None,
+        }
+    };
+    let mut uses = HashMap::<Value, usize>::new();
+    for &block in f.block_order() {
+        for &inst in &f.block(block).insts {
+            let data = f.inst(inst);
+            for &value in data
+                .args
+                .iter()
+                .chain(data.targets.iter().flat_map(|edge| &edge.args))
+            {
+                *uses.entry(value).or_default() += 1;
+            }
+        }
+    }
+    let mut facts = HashMap::new();
+    for &start in f.block_order() {
+        for (position, &inst) in f.block(start).insts.iter().enumerate() {
+            let ldb = f.inst(inst);
+            if !canonical(ldb, "LDB") || ldb.args.len() != 2 || ldb.results.len() != 1 {
+                continue;
+            }
+            let mut descriptor = ldb.args[0];
+            let mut block = start;
+            let mut end = position;
+            let mut visited = std::collections::HashSet::new();
+            let width = 'trace: loop {
+                if !visited.insert(block)
+                    || f.osr_entries.iter().any(|entry| entry.block == block)
+                    || uses.get(&descriptor) != Some(&1)
+                {
+                    break None;
+                }
+                for &previous in f.block(block).insts[..end].iter().rev() {
+                    let data = f.inst(previous);
+                    if data.results.contains(&descriptor) {
+                        if !canonical(data, "BYTE")
+                            || data.args.len() != 2
+                            || data.results.len() != 1
+                        {
+                            break 'trace None;
+                        }
+                        let Some(width) = constant(data.args[0]) else {
+                            break 'trace None;
+                        };
+                        let Some(position) = constant(data.args[1]) else {
+                            break 'trace None;
+                        };
+                        break 'trace ((0..=60).contains(&width) && position >= 0).then_some(width);
+                    }
+                    if data.opcode != Opcode::ClearMv
+                        && (data.flags.effectful
+                            || data.flags.call
+                            || data.flags.safepoint
+                            || matches!(data.opcode, Opcode::Call | Opcode::Invoke))
+                    {
+                        break 'trace None;
+                    }
+                }
+                let predecessors = f.preds(block);
+                let [predecessor] = predecessors.as_slice() else {
+                    break None;
+                };
+                let instructions = &f.block(*predecessor).insts;
+                let Some(&terminator) = instructions.last() else {
+                    break None;
+                };
+                let edge = f.inst(terminator);
+                // An Invoke's first edge is its successful normal return.
+                if !matches!(edge.opcode, Opcode::Jump | Opcode::Invoke)
+                    || edge
+                        .targets
+                        .first()
+                        .is_none_or(|target| target.block != block)
+                {
+                    break None;
+                }
+                if let ValueDef::Param { block: owner, num } = f.value(descriptor).def {
+                    if owner == block {
+                        let Some(&argument) = edge.targets[0].args.get(num as usize) else {
+                            break None;
+                        };
+                        descriptor = argument;
+                    }
+                }
+                block = *predecessor;
+                // BYTE itself can be the predecessor's Invoke terminator;
+                // inspect it before rejecting intervening calls.
+                end = instructions.len() - usize::from(edge.opcode == Opcode::Jump);
+            };
+            if let Some(width) = width {
+                facts.insert(
+                    ldb.results[0],
+                    IRType {
+                        bits: TypeBits::FIXNUM,
+                        range: Some(Range {
+                            lo: 0,
+                            hi: (1i64 << width) - 1,
+                        }),
+                        class_id: None,
+                    },
+                );
+            }
+        }
+    }
+    facts
+}
+
 /// Infer types, ranges, and representations for every reachable value in `f`.
 pub fn infer(f: &Function) -> InferenceResult {
+    let ldb_facts = fresh_ldb_facts(f);
     let rpo = f.reverse_postorder();
     let dom = f.dominators();
     let mut g = Facts(HashMap::new());
@@ -721,7 +947,12 @@ pub fn infer(f: &Function) -> InferenceResult {
                     continue;
                 }
                 let ops: Vec<IRType> = idef.args.iter().map(|&a| fact(a, &env, &g)).collect();
-                let res = eval(idef.opcode, &idef.aux, &ops);
+                let res = idef
+                    .results
+                    .first()
+                    .and_then(|value| ldb_facts.get(value))
+                    .copied()
+                    .unwrap_or_else(|| eval(idef.opcode, &idef.aux, &ops));
                 for &rv in &idef.results {
                     let old = g.get(rv);
                     let joined = ty_join(old, res);
@@ -918,6 +1149,314 @@ mod tests {
             "an unknown call result joined with NIL can still be a heap object"
         );
         assert_eq!(inferred.repr(merged), Some(ValueRepresentation::Tagged));
+    }
+
+    fn ldb_fixture(
+        width: i64,
+        position: i64,
+        byte_name: &str,
+        ldb_name: &str,
+    ) -> (Function, Value, Value) {
+        let mut f = Function::new("fresh-ldb");
+        let entry = f.entry();
+        let integer = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+        let width = const_fixnum(&mut f, entry, width);
+        let position = const_fixnum(&mut f, entry, position);
+        let (_, descriptor) = f.push_inst(
+            entry,
+            InstData {
+                aux: AuxData::CallTarget(egcl_rt::symbols::intern(byte_name)),
+                args: vec![width, position],
+                flags: InstFlags {
+                    call: true,
+                    effectful: true,
+                    safepoint: true,
+                    ..InstFlags::default()
+                },
+                ..inst(Opcode::Call)
+            },
+            &[(IRType::TOP, ValueRepresentation::Tagged)],
+        );
+        let (_, result) = f.push_inst(
+            entry,
+            InstData {
+                aux: AuxData::CallTarget(egcl_rt::symbols::intern(ldb_name)),
+                args: vec![descriptor[0], integer],
+                flags: InstFlags {
+                    call: true,
+                    effectful: true,
+                    safepoint: true,
+                    ..InstFlags::default()
+                },
+                ..inst(Opcode::Call)
+            },
+            &[(IRType::TOP, ValueRepresentation::Tagged)],
+        );
+        f.set_terminator(entry, ret());
+        (f, descriptor[0], result[0])
+    }
+
+    #[test]
+    fn fresh_canonical_ldb_bounds_preserve_signaling_calls() {
+        for (width, position, expected) in [
+            (0, 0, Some(0)),
+            (8, 0, Some(255)),
+            (60, 1000, Some((1i64 << 60) - 1)),
+            (61, 0, None),
+            (-1, 0, None),
+            (8, -1, None),
+        ] {
+            let (f, _, result) = ldb_fixture(width, position, "BYTE", "LDB");
+            let before = f.block(f.entry()).insts.clone();
+            let facts = infer(&f);
+            assert_eq!(facts.range(result), expected.map(|hi| Range { lo: 0, hi }));
+            assert_eq!(f.block(f.entry()).insts, before);
+            for &i in &before {
+                let data = f.inst(i);
+                if data.opcode == Opcode::Call {
+                    assert!(data.flags.call && data.flags.effectful && data.flags.safepoint);
+                }
+            }
+        }
+        for (byte, ldb) in [("RANGE-TEST::BYTE", "LDB"), ("BYTE", "RANGE-TEST::LDB")] {
+            let (f, _, result) = ldb_fixture(8, 0, byte, ldb);
+            assert_eq!(infer(&f).ty(result), IRType::TOP);
+        }
+    }
+
+    #[test]
+    fn ldb_rejects_descriptor_escape_mutation_and_opaque_calls() {
+        for escape in [false, true] {
+            let (mut f, descriptor, result) = ldb_fixture(8, 0, "BYTE", "LDB");
+            let entry = f.entry();
+            let (call, _) = f.push_inst(
+                entry,
+                InstData {
+                    args: if escape { vec![descriptor] } else { vec![] },
+                    aux: AuxData::CallTarget(egcl_rt::symbols::intern("RANGE-TEST::MUTATE")),
+                    flags: InstFlags {
+                        call: true,
+                        effectful: true,
+                        ..InstFlags::default()
+                    },
+                    ..inst(Opcode::Call)
+                },
+                &[],
+            );
+            assert_eq!(f.block_mut(entry).insts.pop(), Some(call));
+            let ValueDef::Result { inst: ldb, .. } = f.value(result).def else {
+                unreachable!()
+            };
+            let at = f.block(entry).insts.iter().position(|&i| i == ldb).unwrap();
+            f.block_mut(entry).insts.insert(at, call);
+            assert_eq!(infer(&f).ty(result), IRType::TOP);
+        }
+    }
+
+    #[test]
+    fn fresh_ldb_descriptor_crosses_only_unique_normal_edges() {
+        let (mut f, descriptor, result) = ldb_fixture(8, 0, "BYTE", "LDB");
+        let entry = f.entry();
+        let normal = f.make_block();
+        let exceptional = f.make_block();
+        let alias = f.add_block_param(normal, IRType::TOP, ValueRepresentation::Tagged);
+        let ValueDef::Result { inst: byte, .. } = f.value(descriptor).def else {
+            unreachable!()
+        };
+        let ValueDef::Result { inst: ldb, .. } = f.value(result).def else {
+            unreachable!()
+        };
+        // Move the LDB to the constructor's normal successor, carrying the
+        // fresh descriptor as an edge parameter, as transfer IR does.
+        f.block_mut(entry).insts.retain(|&i| i != ldb);
+        f.block_mut(entry).insts.truncate(3);
+        f.inst_mut(byte).opcode = Opcode::Invoke;
+        f.inst_mut(byte).targets = vec![
+            BlockCall {
+                block: normal,
+                args: vec![descriptor],
+            },
+            BlockCall {
+                block: exceptional,
+                args: vec![],
+            },
+        ];
+        f.inst_mut(ldb).args[0] = alias;
+        f.block_mut(normal).insts.push(ldb);
+        f.set_terminator(normal, ret());
+        f.set_terminator(exceptional, inst(Opcode::Trap));
+        assert_eq!(infer(&f).range(result), Some(Range { lo: 0, hi: 255 }));
+        // An exceptional alias is not evidence of successful construction.
+        f.inst_mut(byte).targets.swap(0, 1);
+        assert_eq!(infer(&f).ty(result), IRType::TOP);
+    }
+
+    fn ranged_fixnum(lo: i64, hi: i64) -> IRType {
+        IRType {
+            range: Some(Range { lo, hi }),
+            ..fixnum()
+        }
+    }
+
+    #[test]
+    fn constant_shift_ranges_cover_signed_and_large_counts() {
+        let cases = [
+            (Opcode::FixnumShl, -9, 17, -3, -2, 2),
+            (Opcode::FixnumShr, -9, 17, 3, -2, 2),
+            (Opcode::FixnumShl, -9, 17, -1000, -1, 0),
+            (Opcode::FixnumShl, 0, 17, -1000, 0, 0),
+            (Opcode::FixnumShl, -17, -1, -1000, -1, -1),
+            (Opcode::FixnumShl, -9, 17, 3, -72, 136),
+            (Opcode::FixnumShl, -9, 17, 0, -9, 17),
+            (Opcode::FixnumShl, 0, 0, FIXNUM_BOUNDS.hi, 0, 0),
+        ];
+        for (opcode, lo, hi, count, expected_lo, expected_hi) in cases {
+            assert_eq!(
+                eval(
+                    opcode,
+                    &AuxData::None,
+                    &[ranged_fixnum(lo, hi), ranged_fixnum(count, count)]
+                )
+                .range,
+                Some(Range {
+                    lo: expected_lo,
+                    hi: expected_hi
+                })
+            );
+        }
+        for (opcode, input, count) in [
+            (
+                Opcode::FixnumShl,
+                ranged_fixnum(0, FIXNUM_BOUNDS.hi),
+                ranged_fixnum(1, 1),
+            ),
+            (
+                Opcode::FixnumShl,
+                ranged_fixnum(-1, 1),
+                ranged_fixnum(1000, 1000),
+            ),
+            (
+                Opcode::FixnumShl,
+                ranged_fixnum(0, 10),
+                ranged_fixnum(-2, -1),
+            ),
+            (
+                Opcode::FixnumShr,
+                ranged_fixnum(0, 10),
+                ranged_fixnum(-1, -1),
+            ),
+            (
+                Opcode::FixnumShr,
+                ranged_fixnum(0, 10),
+                ranged_fixnum(64, 64),
+            ),
+            (Opcode::FixnumShl, IRType::TOP, ranged_fixnum(-8, -8)),
+        ] {
+            assert_eq!(
+                eval(opcode, &AuxData::None, &[input, count]).range,
+                Some(FULL)
+            );
+        }
+    }
+
+    #[test]
+    fn byte_mask_and_shift_ranges_enclose_all_small_inputs() {
+        // Enumerate concrete signed inputs rather than mirroring endpoint
+        // formulas; arithmetic right shifts must round negative values down.
+        for lo in -20..=20 {
+            for hi in lo..=20 {
+                for count in -8..=8 {
+                    let range = eval(
+                        Opcode::FixnumShl,
+                        &AuxData::None,
+                        &[ranged_fixnum(lo, hi), ranged_fixnum(count, count)],
+                    )
+                    .range
+                    .unwrap();
+                    for value in lo..=hi {
+                        let actual = if count < 0 {
+                            value >> -count
+                        } else {
+                            value << count
+                        };
+                        assert!((range.lo..=range.hi).contains(&actual));
+                    }
+                }
+                for mask in [0, 1, 5, 15, 255] {
+                    for operands in [
+                        [ranged_fixnum(lo, hi), ranged_fixnum(mask, mask)],
+                        [ranged_fixnum(mask, mask), ranged_fixnum(lo, hi)],
+                    ] {
+                        let range = eval(Opcode::LogAnd, &AuxData::None, &operands)
+                            .range
+                            .unwrap();
+                        for value in lo..=hi {
+                            assert!((range.lo..=range.hi).contains(&(value & mask)));
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            eval(
+                Opcode::LogAnd,
+                &AuxData::None,
+                &[fixnum(), ranged_fixnum(255, 255)]
+            )
+            .range,
+            Some(Range { lo: 0, hi: 255 })
+        );
+        assert_eq!(
+            eval(
+                Opcode::LogAnd,
+                &AuxData::None,
+                &[fixnum(), ranged_fixnum(-1, -1)]
+            )
+            .range,
+            Some(FULL)
+        );
+    }
+
+    #[test]
+    fn guarded_unsigned56_remainder_entry_keeps_shift_range() {
+        let mut f = Function::new("shift-remainder");
+        let entry = f.entry();
+        // A peeled generic iteration's result guard establishes this fact;
+        // the original unsigned64/bignum entry must never be given this type.
+        let value = f.add_block_param(
+            entry,
+            ranged_fixnum(0, (1i64 << 56) - 1),
+            ValueRepresentation::Tagged,
+        );
+        f.mark_entry_param_checked(value);
+        let count = const_fixnum(&mut f, entry, -8);
+        let (_, shifted) = f.push_inst(
+            entry,
+            InstData {
+                args: vec![value, count],
+                ..inst(Opcode::FixnumShl)
+            },
+            &[(fixnum(), ValueRepresentation::UnboxedFixnum)],
+        );
+        let mask = const_fixnum(&mut f, entry, 255);
+        let (_, byte) = f.push_inst(
+            entry,
+            InstData {
+                args: vec![shifted[0], mask],
+                ..inst(Opcode::LogAnd)
+            },
+            &[(fixnum(), ValueRepresentation::UnboxedFixnum)],
+        );
+        f.set_terminator(entry, ret());
+        let facts = infer(&f);
+        assert_eq!(
+            facts.range(shifted[0]),
+            Some(Range {
+                lo: 0,
+                hi: (1i64 << 48) - 1
+            })
+        );
+        assert_eq!(facts.range(byte[0]), Some(Range { lo: 0, hi: 255 }));
     }
 
     #[test]
