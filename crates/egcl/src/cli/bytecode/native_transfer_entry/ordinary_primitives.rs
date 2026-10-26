@@ -8,14 +8,110 @@
 use super::*;
 use egcl_compiler::t2::emit::OrdinaryPrimitive;
 
+#[derive(Clone, Copy)]
+struct ArraySymbols {
+    make_array: u32,
+    element_type: u32,
+    unsigned_byte: u32,
+}
+
+static ARRAY_SYMBOLS: std::sync::OnceLock<ArraySymbols> = std::sync::OnceLock::new();
+
+impl ArraySymbols {
+    fn capture() -> Self {
+        Self {
+            make_array: egcl_rt::symbols::intern("MAKE-ARRAY"),
+            element_type: egcl_rt::symbols::intern("KEYWORD:ELEMENT-TYPE"),
+            unsigned_byte: egcl_rt::symbols::intern("UNSIGNED-BYTE"),
+        }
+    }
+}
+
+// No allocation, interning or callback occurs while inspecting these objects.
+// In particular, a heap literal/DEFCONSTANT descriptor is not assumed immutable.
+fn simple_ub8_length(args: &[EgclVal], symbols: ArraySymbols) -> Option<usize> {
+    if args.len() != 3
+        || args[1] != EgclVal::from_symbol_index(symbols.element_type)
+        || !args[2].is_cons()
+    {
+        return None;
+    }
+    let (head, tail) = cp(args[2]);
+    if head != EgclVal::from_symbol_index(symbols.unsigned_byte) || !tail.is_cons() {
+        return None;
+    }
+    let (width, end) = cp(tail);
+    if width != EgclVal::from_fixnum(8) || !end.is_nil() {
+        return None;
+    }
+    let dimension = if args[0].is_cons() {
+        let (length, tail) = cp(args[0]);
+        if !tail.is_nil() {
+            return None;
+        }
+        length
+    } else {
+        args[0]
+    };
+    if !dimension.is_fixnum() || dimension.as_fixnum() < 0 {
+        return None;
+    }
+    let length = dimension.as_fixnum() as usize;
+    let bytes = length.checked_mul(8)?.checked_add(16)?;
+    (bytes <= isize::MAX as usize).then_some(length)
+}
+
+fn note_array_constructor(fast: bool) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("EGCL_NATIVE_ARRAY_CONSTRUCTOR_STATS").is_some()) {
+        return;
+    }
+    static FAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static FALLBACK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let counter = if fast { &FAST } else { &FALLBACK };
+    if counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+        eprintln!(
+            "[native-array-constructor] {} count=1",
+            if fast { "fast" } else { "fallback" }
+        );
+    }
+}
+
+fn make_array(args: &[EgclVal], env: *mut Env) -> Result<EgclVal, EgclError> {
+    // These copies, including the mutable descriptor and dimensions list, must
+    // move with GC during construction or arbitrary public fallback evaluation.
+    egcl_rt::rooted!(args = args.to_vec());
+    let symbols = *ARRAY_SYMBOLS.get().ok_or_else(invalid_capture)?;
+    if let Some(length) = simple_ub8_length(&args, symbols) {
+        note_array_constructor(true);
+        return Ok(egcl_stdlib::build_filled_simple_vector(
+            length,
+            EgclVal::from_fixnum(0),
+        ));
+    }
+    note_array_constructor(false);
+    egcl_rt::rooted!(
+        function = egcl_rt::symbols::symbol_function(symbols.make_array)
+            .unwrap_or_else(|| EgclVal::from_symbol_index(symbols.make_array))
+    );
+    // This is the public function, whose body calls %MAKE-SIMPLE-ARRAY. Its
+    // cell is never replaced by our private call-site adapter, so no recursion
+    // through this adapter is possible on an unsupported request.
+    apply_function(*function, &args, unsafe { &mut *env })
+}
+
 static SYMBOLS: std::sync::OnceLock<Vec<(OrdinaryPrimitive, u32)>> = std::sync::OnceLock::new();
 
 fn symbols() -> &'static Vec<(OrdinaryPrimitive, u32)> {
     SYMBOLS.get_or_init(|| {
+        ARRAY_SYMBOLS.get_or_init(ArraySymbols::capture);
         OrdinaryPrimitive::ALL
             .into_iter()
             .map(|primitive| {
-                (primitive, egcl_rt::symbols::intern(&primitive.adapter_name()))
+                (
+                    primitive,
+                    egcl_rt::symbols::intern(&primitive.adapter_name()),
+                )
             })
             .collect()
     })
@@ -60,6 +156,7 @@ pub(in crate::cli::bytecode) fn invoke(
         use OrdinaryPrimitive::*;
         let expected = match primitive {
             LoadGlobal | LoadFunction => 1,
+            MakeArray => 3,
             _ => 2,
         };
         if args.len() != expected {
@@ -73,6 +170,7 @@ pub(in crate::cli::bytecode) fn invoke(
                 NIL
             }
             Cons => EgclVal(c2i_alloc_cons(args[0].to_raw(), args[1].to_raw())),
+            MakeArray => make_array(args, env)?,
             _ => {
                 let name = match primitive {
                     Add => "+",
@@ -105,9 +203,14 @@ impl Bindings {
     }
 
     pub(super) fn capture() -> Self {
-        Self(symbols().iter().filter_map(|&(kind, symbol)| {
-            Some((kind, symbol, super::super::call_table::resolve(symbol)?))
-        }).collect())
+        Self(
+            symbols()
+                .iter()
+                .filter_map(|&(kind, symbol)| {
+                    Some((kind, symbol, super::super::call_table::resolve(symbol)?))
+                })
+                .collect(),
+        )
     }
 
     pub(super) fn lower(
@@ -121,7 +224,8 @@ impl Bindings {
                 cells.push((*symbol, Arc::clone(cell)));
             }
             Some(*symbol)
-        }).ok()?;
+        })
+        .ok()?;
         Some(())
     }
 }
