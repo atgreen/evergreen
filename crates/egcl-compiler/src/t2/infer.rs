@@ -356,7 +356,7 @@ fn eval(opcode: Opcode, aux: &AuxData, ops: &[IRType]) -> IRType {
             }
         }
         // Fixnum ops whose range we do not track precisely: known FIXNUM, full range.
-        FixnumDiv | FixnumRem | FixnumMod | FixnumShl | FixnumShr | LogAnd | LogOr | LogXor
+        FixnumDiv | FixnumFloor | FixnumMin | FixnumMax | FixnumRem | FixnumMod | FixnumShl | FixnumShr | LogAnd | LogOr | LogXor
         | LogNot | WidenI32 | UnboxFixnum | BoxFixnum => fixnum_full(),
 
         // Float arithmetic: propagate the float tag(s) of the operands.

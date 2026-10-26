@@ -157,6 +157,10 @@ pub mod op {
     pub const NOT: u32 = 0x002B;
     /// Sign-extend i32→i64 (`movsxd`).
     pub const MOVSXD: u32 = 0x002C;
+    pub const IMOD: u32 = 0x002D;
+    pub const IFLOOR: u32 = 0x002E;
+    pub const IMIN: u32 = 0x002F;
+    pub const IMAX: u32 = 0x0036;
 
     // ── 0x30 float ALU ───────────────────────────────────────────────
     pub const FADD: u32 = 0x0030;
@@ -640,7 +644,11 @@ fn lower_inst(lo: &mut Lowering, inst: Inst) {
         FixnumSub => bin!(op::SUB),
         FixnumMul => bin!(op::IMUL),
         FixnumDiv => bin!(op::IDIV),
-        FixnumRem | FixnumMod => bin!(op::IREM),
+        FixnumRem => bin!(op::IREM),
+        FixnumMod => bin!(op::IMOD),
+        FixnumFloor => bin!(op::IFLOOR),
+        FixnumMin => bin!(op::IMIN),
+        FixnumMax => bin!(op::IMAX),
         FixnumNeg => un!(op::NEG),
         FixnumShl => bin!(op::SHL),
         FixnumShr => bin!(op::SAR),

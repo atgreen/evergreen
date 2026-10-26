@@ -203,6 +203,13 @@ impl Pass for ConstFold {
                             FixnumMul => {
                                 (x as i128 * y as i128).pipe(in_fixnum_range).map(Fold::Fix)
                             }
+                            FixnumMin => Some(Fold::Fix(x.min(y))),
+                            FixnumMax => Some(Fold::Fix(x.max(y))),
+                            FixnumFloor if y != 0 => {
+                                let q = x as i128 / y as i128;
+                                let r = x as i128 % y as i128;
+                                in_fixnum_range(q - i128::from(r != 0 && (r < 0) != (y < 0))).map(Fold::Fix)
+                            }
                             FixnumDiv if y != 0 => {
                                 in_fixnum_range(x as i128 / y as i128).map(Fold::Fix)
                             }

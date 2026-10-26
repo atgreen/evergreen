@@ -46,10 +46,10 @@
 //! * `LOGAND LOGIOR LOGXOR LOGNOT` (fixnum) → `Log*`; exact on the tagged
 //!   representation, so no overflow and no untag/retag.
 //! * `MOD` by a constant positive power of two (fixnum) → `LogAnd` with the
-//!   divisor operand **replaced** by the mask. Only this shape: the floored
-//!   remainder of a positive power-of-two divisor is the low bits, sign
-//!   included; `REM` is not routed here, and a general `FixnumMod` would be
-//!   declined by every emitter and cost the function its T2 code.
+//!   divisor operand **replaced** by the mask on every backend.
+//! * On x86-64, binary fixnum `MIN MAX MOD REM` use guarded native templates.
+//!   `FLOOR TRUNCATE` use quotient templates only when normal continuations
+//!   discard secondary values; observed tuples retain the ordinary call.
 //! * `ASH` with two arguments (fixnum) → `FixnumShl`; the emitter checks the
 //!   constant shift amount and handles right shifts.
 //! * `NOT` / `NULL` → pure `GenericEq(x, NIL)`, no profile, no guard, no
@@ -953,6 +953,7 @@ pub fn speculate_with(
     // Read phase: collect the calls to rewrite (keeps the borrow off `f` for the
     // mutation phase).
     let mut work: Vec<(Inst, Opcode, IRType, ExtraArg)> = Vec::new();
+    let discarded_values = super::opt_clear_mv::dead_after(f);
     // Constant fixnum operands, so a divisor can be recognised without relying
     // on ConstFold having run -- the T2 driver only runs the mid-end pipeline
     // when `opt` is set, so a rewrite that needed folding afterwards would go
@@ -1080,25 +1081,28 @@ pub fn speculate_with(
                         ExtraArg::None,
                     ));
                 }
-            } else if egcl_rt::symbols::symbol_name(sym).as_deref() == Some("MOD") {
-                // MOD by a constant power of two is a mask, so it lowers to the
-                // LogAnd every one of the four emitters already implements --
-                // no new emitter arm, and ppc64le/s390x get it too.
-                //
-                // Deliberately ONLY this shape. A general fixnum MOD would need
-                // FixnumMod, which exists in the IR and in lower.rs but that NO
-                // EMITTER implements, so producing it would make the emitter
-                // decline and cost the whole function its T2 code -- slower than
-                // the generic call it replaced.
-                if spec == SpecType::Fixnum {
-                    if let Some(mask) = mod_mask_of(f, &data.args, &consts) {
-                        work.push((
-                            inst,
-                            Opcode::LogAnd,
-                            result_type(SpecType::Fixnum),
-                            ExtraArg::ReplaceSecondWithFixnum(mask),
-                        ));
-                    }
+            } else if spec == SpecType::Fixnum && argc == 2
+                && matches!(egcl_rt::symbols::registry_key(sym).as_deref(),
+                    Some("MIN" | "MAX" | "MOD"
+                        | "REM" | "FLOOR" | "TRUNCATE"))
+            {
+                let name = egcl_rt::symbols::symbol_name(sym).unwrap();
+                if name == "MOD" && let Some(mask) = mod_mask_of(f, &data.args, &consts) {
+                    work.push((inst, Opcode::LogAnd, result_type(spec),
+                        ExtraArg::ReplaceSecondWithFixnum(mask)));
+                } else if cfg!(target_arch = "x86_64") {
+                    let opcode = match name.as_str() {
+                        "MIN" => Opcode::FixnumMin,
+                        "MAX" => Opcode::FixnumMax,
+                        "MOD" => Opcode::FixnumMod,
+                        "REM" => Opcode::FixnumRem,
+                        // The quotient-only form is valid only when all normal
+                        // successor paths discard the secondary remainder.
+                        "FLOOR" if discarded_values.contains(&inst) => Opcode::FixnumFloor,
+                        "TRUNCATE" if discarded_values.contains(&inst) => Opcode::FixnumDiv,
+                        _ => continue,
+                    };
+                    work.push((inst, opcode, result_type(spec), ExtraArg::None));
                 }
             } else if egcl_rt::symbols::symbol_name(sym).as_deref() == Some("ASH") {
                 // Arithmetic shift by a (constant, checked at emit) amount: left is a
@@ -1729,6 +1733,12 @@ fn fixnum_family(op: Opcode) -> bool {
         FixnumAdd
             | FixnumSub
             | FixnumMul
+            | FixnumDiv
+            | FixnumFloor
+            | FixnumRem
+            | FixnumMod
+            | FixnumMin
+            | FixnumMax
             | FixnumNeg
             | FixnumShl
             | LogAnd
@@ -2054,6 +2064,64 @@ mod tests {
             },
         );
         (f, call)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn integer_builtins_require_canonical_identity_and_preserve_observed_tuples() {
+        use crate::t2::ir::InstData;
+        for (name, opcode) in [
+            ("MIN", Opcode::FixnumMin),
+            ("MAX", Opcode::FixnumMax),
+            ("MOD", Opcode::FixnumMod),
+            ("REM", Opcode::FixnumRem),
+        ] {
+            let (mut f, call) = build_call(name, 2);
+            assert_eq!(speculate(&mut f, &|_| Some(SpecType::Fixnum)), 1);
+            assert_eq!(f.inst(call).opcode, opcode);
+        }
+        for (name, opcode) in [
+            ("FLOOR", Opcode::FixnumFloor),
+            ("TRUNCATE", Opcode::FixnumDiv),
+        ] {
+            let (mut f, call) = build_call(name, 2);
+            // The return observes the full tuple: retain the ordinary call.
+            assert_eq!(speculate(&mut f, &|_| Some(SpecType::Fixnum)), 0);
+            assert_eq!(f.inst(call).opcode, Opcode::Call);
+            let block = f.entry();
+            let (clear, _) = f.push_inst(
+                block,
+                InstData {
+                    opcode: Opcode::ClearMv,
+                    args: vec![],
+                    results: vec![],
+                    aux: AuxData::None,
+                    flags: InstFlags {
+                        effectful: true,
+                        ..Default::default()
+                    },
+                    targets: vec![],
+                    frame_state: None,
+                    source_pos: 0,
+                },
+                &[],
+            );
+            let insts = &mut f.block_mut(block).insts;
+            assert_eq!(insts.pop(), Some(clear));
+            insts.insert(insts.len() - 1, clear);
+            assert_eq!(speculate(&mut f, &|_| Some(SpecType::Fixnum)), 1);
+            assert_eq!(f.inst(call).opcode, opcode);
+        }
+        for name in [
+            "USER654::MIN",
+            "USER654::MAX",
+            "USER654::MOD",
+            "USER654::REM",
+        ] {
+            let (mut f, call) = build_call(name, 2);
+            assert_eq!(speculate(&mut f, &|_| Some(SpecType::Fixnum)), 0);
+            assert_eq!(f.inst(call).opcode, Opcode::Call);
+        }
     }
 
     #[test]
