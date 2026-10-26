@@ -26582,6 +26582,10 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
                 t2_log!("{name}: invariant bounds hoisted: {bounds}");
             }
         }
+        if std::env::var_os("EGCL_DISABLE_INTEGER_SHIFT").is_none() {
+            let probes = egcl_compiler::t2::integer_shift::specialize(function, &array_inline_options);
+            if probes != 0 { t2_log!("{name}: integer shift probes: {probes}"); }
+        }
         let mut cleanup = PassManager::new();
         cleanup.add(Box::new(egcl_compiler::t2::opt_dce::Dce));
         cleanup.run(function);

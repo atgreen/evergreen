@@ -442,6 +442,7 @@ fn eval(opcode: Opcode, aux: &AuxData, ops: &[IRType]) -> IRType {
                 ..IRType::of(TypeBits::FIXNUM)
             }
         }
+        TryIntegerShr => IRType::of(TypeBits::SYMBOL.join(TypeBits::NULL)),
         IntegerLowBits => match aux {
             AuxData::FixnumImm(mask) if (0..=(1i64 << 60) - 1).contains(mask) => IRType {
                 range: Some(Range { lo: 0, hi: *mask }),
@@ -953,7 +954,10 @@ pub fn infer(f: &Function) -> InferenceResult {
                     .and_then(|value| ldb_facts.get(value))
                     .copied()
                     .unwrap_or_else(|| eval(idef.opcode, &idef.aux, &ops));
-                for &rv in &idef.results {
+                for (index, &rv) in idef.results.iter().enumerate() {
+                    let res = if idef.opcode == Opcode::TryIntegerShr && index == 1 {
+                        IRType::of(TypeBits::FIXNUM)
+                    } else { res };
                     let old = g.get(rv);
                     let joined = ty_join(old, res);
                     if joined != old {

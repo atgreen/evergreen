@@ -143,6 +143,9 @@ use crate::t2::slot_map;
 use crate::t2::slot_map::ConversionKind;
 use crate::t2::x64_frame::{select_frame_homes, ValueHome as FramedHome, GPR_X86};
 
+#[path = "emit_integer_shift.rs"]
+mod integer_shift;
+
 #[path = "emit_integer_low_bits.rs"]
 mod integer_low_bits;
 
@@ -5324,7 +5327,7 @@ fn emit_transfer_function_with_storage(
                     | Opcode::Cdr
                     | Opcode::StringCharOrNil
                     | Opcode::VecRef | Opcode::VecSet | Opcode::ArrayReadDiscarded | Opcode::PackedF64P
-                    | Opcode::MemoryFence
+                    | Opcode::MemoryFence | Opcode::TryIntegerShr
             ) {
                 return Err(EmitError::UnsupportedOp(op_tag(f.inst(inst).opcode)));
             }
@@ -6497,6 +6500,7 @@ fn emit_framed_inner(
                             | Opcode::ClearMv
                             | Opcode::TakeValuesToLocals
                             | Opcode::MemoryFence
+                            | Opcode::TryIntegerShr
                             | Opcode::TryPackedF64Set
                             | Opcode::PackedF64P
                     )
@@ -7467,6 +7471,8 @@ fn emit_framed_inner(
                 vector_element_address(&mut a, array, index,
                     const_tagged.get(&d.args[1]).copied(), label);
                 a.bind(done);
+            } else if d.opcode == Opcode::TryIntegerShr {
+                integer_shift::emit(&mut a, &d, &inst_reg, &const_tagged)?;
             } else if d.opcode == Opcode::TryPackedF64Set {
                 let failed = a.label();
                 let done = a.label();
