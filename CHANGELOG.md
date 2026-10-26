@@ -197,6 +197,11 @@
   bootstrap, avoiding an undefined-function error from a later macro definition
   ([#700](https://github.com/atgreen/evergreen/pull/700)).
 
+- `defstruct`'s keyword constructor accepts slots named `t` or after another
+  constant, and a slot named after a special variable no longer changes what
+  the later slots' initforms see
+  ([#693](https://github.com/atgreen/evergreen/pull/693)).
+
 - General arithmetic `LOOP` clauses evaluate bound and step initial forms once
   in source order, before binding the iteration variable, including zero-trip
   loops and loops whose bodies change the original bound or step
