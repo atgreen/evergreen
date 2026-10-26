@@ -10,7 +10,7 @@ Tracking: `bliss-gxv10`.
 This is a **failure baseline**, not a claim that pure-tls passes on EGCL.
 The initial full run exposed handshake, cancellation, and OpenSSL-related
 failures; retain the actual final logs and summaries when comparing revisions.
-No final counts or timings are asserted by this harness. A failed suite or load
+The measured result is recorded below. A failed suite or load
 must remain a failed process exit; a timeout or memory-cap termination is not a
 passing test. Do not compare failed-run timings as passing performance results.
 
@@ -83,3 +83,48 @@ For a separately labelled optional cached-load investigation, pass
 `closer-mop-packages.lisp`. This preloads that one source file instead of forcing
 recompilation. It is not the default baseline and must not be silently combined
 with default load-time comparisons.
+
+
+## Recorded result: 2026-10-26
+
+The single provisional full run completed all 13 suites with **499 checks:
+482 passed, 17 failed, 0 FiveAM skips**. It exited 1. This is a failed-run
+reference, not a passing performance result or a median. Filtered OpenSSL
+configuration scenarios are not included in the FiveAM skip count.
+
+Setup took 90.710 s; tests took 2713.980 s; process wall time was 46:52.49
+with peak RSS 1,330,340 KiB. Setup used a mixed cache populated by earlier
+failed load probes and forced closer-mop recompilation. Tests used natural JIT
+tiering and include compilation, sleeps, sockets, network and subprocess costs.
+
+| Suite | Seconds | Checks | Pass | Fail |
+| --- | ---: | ---: | ---: | ---: |
+| CRYPTO-TESTS | 17.330 | 50 | 50 | 0 |
+| ML-DSA-TESTS | 265.002 | 69 | 69 | 0 |
+| RECORD-TESTS | 60.766 | 48 | 48 | 0 |
+| HANDSHAKE-TESTS | 37.301 | 90 | 88 | 2 |
+| CERTIFICATE-TESTS | 5.082 | 58 | 58 | 0 |
+| CANCEL-TESTS | 0.196 | 6 | 4 | 2 |
+| CANCEL-INTEGRATION-TESTS | 10.513 | 5 | 5 | 0 |
+| OPENSSL-TESTS | 2187.608 | 37 | 28 | 9 |
+| BORINGSSL-TESTS | 0.441 | 23 | 23 | 0 |
+| X509TEST-TESTS | 0.732 | 9 | 9 | 0 |
+| SECURITY-REGRESSION-TESTS | 128.239 | 93 | 91 | 2 |
+| TRUST-STORE-TESTS | 0.344 | 9 | 9 | 0 |
+| RESUMPTION-INTEROP-TESTS | 0.369 | 2 | 0 | 2 |
+
+[Machine-readable results](baseline-2026-10-26.json) preserve revisions, hashes,
+failure names and reasons, OpenSSL adapter summaries, and the external raw log's
+location and SHA256. [Suite timings](baseline-timings.csv) contain the same
+13 measured rows. The raw log is a session-external artifact, not bundled here.
+The measured runtime is `3cb5e8b236f3b9dfd64f85c84d92f4aa46b4b166`;
+the pure-tls revision is the pinned `1fce0aab061bbb82777895f5fd8dab3272337265`.
+The original measurement harness hash is preserved separately from hashes of
+the portable committed harness: parameterizing its paths did not make the files
+byte-identical, although both observe the original runner entrypoint.
+
+Failure follow-ups are `bliss-v38sp` (fractional timeout), `bliss-2k83w`
+(handshake/OpenSSL assertions), `bliss-30p86` (Gray input-stream recognition),
+and `bliss-moehk` (UIOP subprocess launch). The cached closer-mop load workaround
+is tracked by `bliss-uq2oi`. Separate SBCL case analysis remains in progress under
+`bliss-aug7d`; this full-run record contains no SBCL comparison.
