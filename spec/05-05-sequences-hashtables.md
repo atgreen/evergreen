@@ -387,7 +387,7 @@ completes (GC-managed or explicit deallocation for Rust-side tables).
 | `EQUAL` | `equal-hash` | Recursive structural hash: strings→FNV-1a on chars; conses→combine car/cdr hashes with rotation+XOR; arrays→hash elements with depth limit of 4; all others→`eql-hash` |
 | `EQUALP` | `equalp-hash` | Like `equal-hash` but: strings→FNV-1a on `CHAR-DOWNCASE`'d chars; numbers→hash `DOUBLE-FLOAT` bits only for exactly representable values, otherwise hash normalized rational components; hash tables→hash entries recursively |
 
-Numeric `EQUALP` hashing inspects existing integer limbs without allocating
+Hashing real numbers under `EQUALP` inspects existing integer limbs without allocating
 intermediate big integers or rationals. A reduced ratio can equal a binary
 float only when its denominator is a power of two. Significant-bit length and
 exponent bounds determine exact binary64 representability, including
