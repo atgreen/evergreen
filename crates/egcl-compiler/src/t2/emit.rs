@@ -1602,6 +1602,66 @@ fn emit_arith_inst(
         }
     };
     match data.opcode {
+        Opcode::FixnumMin | Opcode::FixnumMax | Opcode::FixnumDiv
+        | Opcode::FixnumFloor | Opcode::FixnumRem | Opcode::FixnumMod => {
+            // RAX, RDX and RDI are reserved by the framed allocator.
+            // Load constants independently: framed_mat's shared RDX scratch
+            // would otherwise overwrite a constant dividend or divisor.
+            for (value, target) in [(data.args[0], RAX), (data.args[1], 7)] {
+                if let Some(&constant) = consts.get(&value) {
+                    mov_imm64(a, target, egcl_rt::value::EgclVal::from_fixnum(constant).0 as i64);
+                } else {
+                    let source = *reg.get(&value).ok_or(EmitError::UnsupportedOp(0xF2))?;
+                    guard(a, value, source);
+                    mov_rr(a, target, source);
+                }
+            }
+            if matches!(data.opcode, Opcode::FixnumMin | Opcode::FixnumMax) {
+                let chosen = a.label();
+                cmp_rr(a, RAX, 7);
+                a.jcc(if data.opcode == Opcode::FixnumMin { Cc::Le } else { Cc::Ge }, chosen);
+                mov_rr(a, RAX, 7);
+                a.bind(chosen);
+            } else {
+                alu_rr(a, 0x85, 7, 7); // test rdi,rdi
+                a.jcc(Cc::E, deopt);
+                // Dividing the tagged operands yields an untagged quotient
+                // and an already-tagged remainder. The divisor is a multiple
+                // of eight, so IDIV's i64::MIN / -1 trap is impossible.
+                a.extend_from_slice(&[0x48, 0x99]); // cqo
+                a.extend_from_slice(&[0x48, 0xF7, 0xFF]); // idiv rdi
+                if matches!(data.opcode, Opcode::FixnumMod | Opcode::FixnumFloor) {
+                    let exact_or_same_sign = a.label();
+                    let negative_remainder = a.label();
+                    let adjust = a.label();
+                    alu_rr(a, 0x85, SCRATCH, SCRATCH);
+                    a.jcc(Cc::E, exact_or_same_sign);
+                    a.jcc(Cc::L, negative_remainder);
+                    alu_rr(a, 0x85, 7, 7);
+                    a.jcc(Cc::Ge, exact_or_same_sign);
+                    a.jmp(adjust);
+                    a.bind(negative_remainder);
+                    alu_rr(a, 0x85, 7, 7);
+                    a.jcc(Cc::L, exact_or_same_sign);
+                    a.bind(adjust);
+                    alu_r_imm(a, 5, RAX, 1); // floored quotient = truncated - 1
+                    alu_rr(a, 0x01, SCRATCH, 7); // remainder += divisor
+                    a.bind(exact_or_same_sign);
+                }
+                if matches!(data.opcode, Opcode::FixnumMod | Opcode::FixnumRem) {
+                    mov_rr(a, RAX, SCRATCH);
+                } else {
+                    // MIN-FIXNUM / -1 is a valid i64 quotient but not a fixnum.
+                    // Check before retagging so the precise deopt sees every
+                    // original operand in its unchanged home.
+                    mov_imm64(a, 7, (1_i64 << 60) - 1);
+                    cmp_rr(a, RAX, 7);
+                    a.jcc(Cc::G, deopt);
+                    shl_imm(a, RAX, 3);
+                }
+            }
+            mov_rr(a, dst, RAX);
+        }
         Opcode::FixnumMul => {
             let (a0, b0) = (data.args[0], data.args[1]);
             let folded = if let Some(&c) = consts.get(&b0) {
@@ -2972,6 +3032,12 @@ fn is_fixnum_guarding_op(op: crate::t2::ir::Opcode) -> bool {
         FixnumAdd
             | FixnumSub
             | FixnumMul
+            | FixnumDiv
+            | FixnumFloor
+            | FixnumRem
+            | FixnumMod
+            | FixnumMin
+            | FixnumMax
             | FixnumNeg
             | LogAnd
             | LogOr
@@ -3799,6 +3865,12 @@ fn is_fixnum_producing_op(op: crate::t2::ir::Opcode) -> bool {
         FixnumAdd
             | FixnumSub
             | FixnumMul
+            | FixnumDiv
+            | FixnumFloor
+            | FixnumRem
+            | FixnumMod
+            | FixnumMin
+            | FixnumMax
             | FixnumNeg
             | LogAnd
             | LogOr
@@ -5064,6 +5136,8 @@ fn emit_transfer_function_with_storage(
             if deopt_veneer.is_some() && matches!(data.opcode,
                 Opcode::Guard | Opcode::FixnumAdd | Opcode::FixnumSub
                     | Opcode::FixnumMul | Opcode::FixnumNeg
+                    | Opcode::FixnumDiv | Opcode::FixnumFloor | Opcode::FixnumRem
+                    | Opcode::FixnumMod | Opcode::FixnumMin | Opcode::FixnumMax
                     | Opcode::FixnumCmpEq | Opcode::FixnumCmpLt | Opcode::FixnumCmpLe
                     | Opcode::FixnumCmpGt | Opcode::FixnumCmpGe
                     | Opcode::LogAnd | Opcode::LogOr | Opcode::LogXor | Opcode::LogNot
@@ -10900,5 +10974,160 @@ mod adjacent_home_tests {
         let end = a.here();
         load_home(&mut a, RAX, FramedHome::Stack(3), 8);
         assert!(a.here() > end);
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64", unix))]
+mod integer_builtin_tests {
+    use super::*;
+    use crate::t2::ir::{
+        AuxData, Function, IRType, InstData, InstFlags, Opcode, TypeBits, ValueRepresentation,
+    };
+    use egcl_rt::value::{EgclVal, NIL};
+    use std::collections::{HashMap, HashSet};
+
+    /// Exercise the actual instruction template independently of tiering and
+    /// generic fallback. A failed type/zero/overflow guard returns NIL.
+    fn kernel(
+        opcode: Opcode,
+        constant: Option<(usize, i64)>,
+        destination: u8,
+    ) -> egcl_rt::jit::JitBuffer {
+        let mut f = Function::new("integer-builtin-template");
+        let block = f.entry();
+        let x = f.add_block_param(block, IRType::TOP, ValueRepresentation::Tagged);
+        let y = f.add_block_param(block, IRType::TOP, ValueRepresentation::Tagged);
+        let (_, result) = f.push_inst(
+            block,
+            InstData {
+                opcode,
+                args: vec![x, y],
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags::default(),
+                targets: vec![],
+                frame_state: None,
+                source_pos: 0,
+            },
+            &[(IRType::of(TypeBits::FIXNUM), ValueRepresentation::Tagged)],
+        );
+        let mut asm = Asm::new();
+        mov_rr(&mut asm, 9, 6); // preserve input y before reusing RSI
+        mov_rr(&mut asm, 6, 7); // RSI is an allocatable home, not scratch
+        let fail = asm.label();
+        let mut regs = HashMap::from([(x, 6), (y, 9), (result[0], destination)]);
+        let consts = constant
+            .map(|(index, value)| HashMap::from([([x, y][index], value)]))
+            .unwrap_or_default();
+        emit_arith_inst(
+            &mut asm,
+            &f,
+            &f.inst(crate::t2::ir::Inst(0)).clone(),
+            &mut regs,
+            &mut vec![],
+            &consts,
+            &HashMap::new(),
+            &HashMap::new(),
+            &mut HashSet::new(),
+            &HashSet::new(),
+            fail,
+        )
+        .unwrap();
+        mov_rr(&mut asm, RAX, destination);
+        asm.extend_from_slice(&[0xC3]);
+        asm.bind(fail);
+        mov_imm64(&mut asm, RAX, NIL.0 as i64);
+        asm.extend_from_slice(&[0xC3]);
+        egcl_rt::jit::JitBuffer::new(&asm.finish().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn integer_builtin_templates_match_signed_cl_semantics() {
+        let samples = [
+            -1152921504606846976,
+            -100,
+            -25,
+            -24,
+            -7,
+            -1,
+            0,
+            1,
+            3,
+            7,
+            24,
+            25,
+            100,
+            1152921504606846975,
+        ];
+        for opcode in [
+            Opcode::FixnumMin,
+            Opcode::FixnumMax,
+            Opcode::FixnumDiv,
+            Opcode::FixnumFloor,
+            Opcode::FixnumRem,
+            Opcode::FixnumMod,
+        ] {
+            for constant in [None, Some((0, -25)), Some((1, 24)), Some((1, -1))] {
+                for destination in [6, 8, 9, 10] {
+                    let code = kernel(opcode, constant, destination);
+                    let run: extern "C" fn(u64, u64) -> u64 =
+                        unsafe { std::mem::transmute(code.as_ptr()) };
+                    for left in samples {
+                        for right in samples {
+                            let x = if let Some((0, value)) = constant {
+                                value
+                            } else {
+                                left
+                            } as i128;
+                            let y = if let Some((1, value)) = constant {
+                                value
+                            } else {
+                                right
+                            } as i128;
+                            let expected = match opcode {
+                                Opcode::FixnumMin => Some(x.min(y)),
+                                Opcode::FixnumMax => Some(x.max(y)),
+                                _ if y == 0 => None,
+                                Opcode::FixnumDiv => Some(x / y),
+                                Opcode::FixnumRem => Some(x % y),
+                                Opcode::FixnumFloor => {
+                                    Some(x / y - i128::from(x % y != 0 && (x % y < 0) != (y < 0)))
+                                }
+                                Opcode::FixnumMod => {
+                                    Some(if x % y != 0 && (x % y < 0) != (y < 0) {
+                                        x % y + y
+                                    } else {
+                                        x % y
+                                    })
+                                }
+                                _ => unreachable!(),
+                            }
+                            .filter(|value| (-(1_i128 << 60)..(1_i128 << 60)).contains(value));
+                            let actual = EgclVal(run(
+                                EgclVal::from_fixnum(left).0,
+                                EgclVal::from_fixnum(right).0,
+                            ));
+                            assert_eq!(
+                                actual,
+                                expected
+                                    .map(|value| EgclVal::from_fixnum(value as i64))
+                                    .unwrap_or(NIL),
+                                "{opcode:?} {x} {y}, constant={constant:?}, dst={destination}"
+                            );
+                        }
+                    }
+                    if constant.is_none() {
+                        assert_eq!(
+                            run(EgclVal::from_single_float(3.0).0, EgclVal::from_fixnum(2).0),
+                            NIL.0
+                        );
+                        assert_eq!(
+                            run(EgclVal::from_fixnum(3).0, EgclVal::from_single_float(2.0).0),
+                            NIL.0
+                        );
+                    }
+                }
+            }
+        }
     }
 }

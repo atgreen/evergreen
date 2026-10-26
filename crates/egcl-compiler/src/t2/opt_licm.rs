@@ -274,6 +274,9 @@ fn opcode_hoist_safe(op: Opcode) -> bool {
             | FixnumAdd
             | FixnumSub
             | FixnumMul
+            | FixnumFloor
+            | FixnumMin
+            | FixnumMax
             | FixnumDiv
             | FixnumRem
             | FixnumMod
