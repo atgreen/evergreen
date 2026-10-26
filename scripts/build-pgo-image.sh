@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 # SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-# Local instrumentation PGO, used by `make image`. No installation.
+# Instrumentation PGO for `make image` and native RPM runtimes. No installation.
+# EGCL_PGO_RUNTIME_OUT exports the raw runtime instead of dumping an image;
+# additional arguments are passed unchanged to both Cargo builds.
 # All build/profile artifacts are retained in a fresh directory for diagnosis.
 set -euo pipefail
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
@@ -16,7 +18,7 @@ llvm=$(sed -n 's/^LLVM version: //p' <<<"$version")
 [[ -n $host && -n $llvm ]] || die 'cannot identify rustc host and LLVM version'
 target=${EGCL_PGO_TARGET:-x86_64-unknown-linux-musl}
 case "$host/$target" in
-    x86_64-unknown-linux-gnu/x86_64-unknown-linux-musl) ;;
+    *-unknown-linux-gnu/"${host%-gnu}-musl") ;;
     "$host/$host") ;;
     *) die "target $target is not runnable on host $host; PGO requires native training" ;;
 esac
@@ -68,7 +70,7 @@ require_marker() {
 
 logged generate env CARGO_TARGET_DIR="$work/generate" \
     CARGO_ENCODED_RUSTFLAGS="${base_flags}-Cprofile-generate=$work/raw" \
-    "$cargo" build --locked --release -p egcl --target "$target"
+    "$cargo" build --locked --release -p egcl --target "$target" "$@"
 instrumented="$work/generate/$target/release/egcl"
 logged prepare env EGCL_PGO_WORK="$work/training" EGCL_PGO_PHASE=prepare \
     LLVM_PROFILE_FILE="$work/prepare-profiles/%p-%m.profraw" \
@@ -98,9 +100,23 @@ logged merge "$profdata" merge -o "$work/merged.profdata" "${raw[@]}"
 [[ -s $work/merged.profdata ]] || die 'merge produced no profile'
 logged use env CARGO_TARGET_DIR="$work/use" \
     CARGO_ENCODED_RUSTFLAGS="${base_flags}-Cprofile-use=$work/merged.profdata${separator}-Cllvm-args=-pgo-warn-missing-function" \
-    "$cargo" build --locked --release -p egcl --target "$target"
+    "$cargo" build --locked --release -p egcl --target "$target" "$@"
 if grep -Ei 'warning:.*(profile|hash mismatch|control flow change)' "$work/use.log"; then
     die "profile-use build reported incompatible or missing profile data; see $work/use.log"
+fi
+
+# RPM packaging must strip the runtime BEFORE appending its saved image.
+# Publish only after training and profile-use validation have succeeded.
+if [[ -n ${EGCL_PGO_RUNTIME_OUT:-} ]]; then
+    output=$EGCL_PGO_RUNTIME_OUT
+    [[ ! -d $output ]] || die "runtime destination is a directory: $output"
+    mkdir -p -- "$(dirname -- "$output")"
+    staged_runtime=$(mktemp "${output}.XXXXXX")
+    cp -- "$work/use/$target/release/egcl" "$staged_runtime"
+    chmod 755 "$staged_runtime"
+    mv -f -- "$staged_runtime" "$output"
+    echo "PGO runtime: $output"
+    exit 0
 fi
 
 # Dump beside the destination so publication is an atomic, same-filesystem

@@ -3,6 +3,8 @@
 # SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
 import importlib.util
+import argparse
+import os
 from pathlib import Path
 import platform
 import stat
@@ -25,6 +27,56 @@ SPEC = Path(__file__).with_name('egcl.spec')
 
 
 class BuildStageTests(unittest.TestCase):
+    def test_native_pgo_and_cross_release_routing_preserve_strip_before_dump(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'docs').mkdir()
+            (root / 'docs/fedora-rpm.md').write_text('documentation')
+            (root / 'SOURCE-REVISION').write_text('test-source')
+            calls = []
+
+            def run(command, *, env=None, **kwargs):
+                command = list(map(str, command))
+                calls.append((command, env))
+                if 'bash' in command:
+                    runtime = Path(env['EGCL_PGO_RUNTIME_OUT'])
+                    runtime.parent.mkdir(parents=True, exist_ok=True)
+                    runtime.write_bytes(b'trained runtime')
+                elif 'cargo' in command:
+                    triple = command[command.index('--target') + 1]
+                    executable = 'egcl.exe' if 'windows' in triple else 'egcl'
+                    runtime = root / 'target' / triple / 'release' / executable
+                    runtime.parent.mkdir(parents=True, exist_ok=True)
+                    runtime.write_bytes(b'ordinary cross runtime')
+                elif '--strip-debug' in command:
+                    runtime = Path(command[-1])
+                    runtime.write_bytes(runtime.read_bytes() + b' stripped')
+                elif 'scripts/build-image.lisp' in command:
+                    runtime = Path(command[command.index('--no-init') - 1])
+                    destination = Path(env['EGCL_IMAGE_OUT'].removeprefix('Z:'))
+                    destination.write_bytes(runtime.read_bytes() + b' image')
+
+            args = argparse.Namespace(output=root / 'output', tools=root / 'tools',
+                                      android_ndk=root / 'ndk', sysroot_release='44',
+                                      target=['native', 'static', 'windows'])
+            with patch.object(build, 'ROOT', root), patch.object(build, 'run', run), \
+                    patch.object(build.subprocess, 'check_output', return_value='fixture'), \
+                    patch.dict(os.environ, {'CARGO_NET_OFFLINE': 'true'}):
+                stage = build.build(args)
+            for name in ('egcl', 'egcl-static'):
+                self.assertEqual((stage / 'usr/bin' / name).read_bytes(),
+                                 b'trained runtime stripped image')
+            pgo = [(cmd, env) for cmd, env in calls if 'bash' in cmd]
+            self.assertEqual(len(pgo), 2)
+            for (cmd, env), name in zip(pgo, ('native', 'static')):
+                self.assertEqual(cmd[0], str(root / 'scripts/egcl-limited.sh'))
+                self.assertEqual(env['EGCL_PGO_TARGET'], build.TARGETS[name])
+                self.assertEqual(env['CARGO_NET_OFFLINE'], 'true')
+                self.assertEqual('egcl-rt/c-ffi' in cmd, name == 'native')
+            cross = [cmd for cmd, env in calls if 'cargo' in cmd]
+            self.assertEqual(len(cross), 1)
+            self.assertIn(build.TARGETS['windows'], cross[0])
+
     def test_a_full_build_starts_with_an_empty_stage(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)

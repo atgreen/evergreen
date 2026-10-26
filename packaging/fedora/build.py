@@ -220,12 +220,27 @@ def build(args):
                 copy(bundled,
                      stage / 'usr/share/licenses/egcl-target-android' / BUNDLED_LICENSES)
             stage_apk_builder(stage)
-        command = ['cargo', 'build', '--locked', '--release', '--target', triple, '-p', 'egcl']
+        cargo_args = []
         if triple == 's390x-unknown-linux-musl':
-            command += ['-Z', 'build-std=std,panic_unwind']
+            cargo_args += ['-Z', 'build-std=std,panic_unwind']
         if name not in ('windows', 'static') and not name.endswith('-static'):
-            command += ['--features', 'egcl-rt/c-ffi']
-        run([limited, *command], env=target_env)
+            cargo_args += ['--features', 'egcl-rt/c-ffi']
+        if name in ('native', 'static'):
+            # Each target trains its own profile with exactly its release features.
+            # Consume the explicit PGO output, never a cached ordinary Cargo binary.
+            runtime = output / 'pgo-runtime' / name
+            pgo_env = target_env | {
+                'EGCL_PGO_TARGET': triple,
+                'EGCL_PGO_ROOT': str(output / 'pgo' / name),
+                'EGCL_PGO_RUNTIME_OUT': str(runtime),
+                # Two compiler passes plus training, rather than one Cargo build.
+                'EGCL_TIMEOUT': os.environ.get('EGCL_TIMEOUT', '7200'),
+            }
+            run([limited, 'bash', ROOT / 'scripts/build-pgo-image.sh', *cargo_args], env=pgo_env)
+        else:
+            command = ['cargo', 'build', '--locked', '--release', '--target', triple,
+                       '-p', 'egcl', *cargo_args]
+            run([limited, *command], env=target_env)
         # Strip BEFORE dumping; stripping an appended image destroys its trailer.
         stripped = output / 'stripped' / f'{name}{suffix}'
         copy(runtime, stripped)
