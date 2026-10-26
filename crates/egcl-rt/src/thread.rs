@@ -3363,6 +3363,10 @@ pub(crate) fn current_yield_requested() -> bool {
         .unwrap_or(true)
 }
 
+// Resolve carrier TLS inside a fresh call, just like current_fiber(). Inlining
+// lets LLVM retain the old carrier's TLS address across a yielding caller,
+// selecting another fiber's ExecutionLocal slots after migration.
+#[inline(never)]
 pub fn current_fiber_id() -> Option<FiberId> {
     ACTIVE_FIBER_ID
         .try_with(|slot| slot.get())
