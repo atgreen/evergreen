@@ -18,6 +18,11 @@
 
 ### Performance
 
+- On x86-64, T2 now emits native fixnum `min`, `max`, `mod`, `rem`,
+  and single-value `floor` and `truncate` operations, avoiding runtime calls
+  in integer loops while preserving signed results and error fallback
+  ([#656](https://github.com/atgreen/evergreen/pull/656)).
+
 - On x86-64 Linux, a long-running loop that computes with double-floats,
   such as `(dotimes (i n s) (setq s (+ s 1d0)))`, now leaves the interpreter
   part-way through its first call, as a fixnum loop already did. Before, it
