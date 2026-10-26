@@ -26,6 +26,10 @@
   first-entry deoptimization, observable effects, and generic OSR paths
   ([#690](https://github.com/atgreen/evergreen/pull/690)).
 
+- T2 can shift fixnums and canonical one-limb integers right without a generic
+  arithmetic call, preserving fallback for wider results and other inputs
+  ([#689](https://github.com/atgreen/evergreen/pull/689)).
+
 - References to established constants can compile as literal values. T2 also
   folds fixnum constants in cached bytecode using metadata captured before
   background compilation, avoiding repeated global lookups
