@@ -199,6 +199,12 @@
   `load` ([#640](https://github.com/atgreen/evergreen/pull/640); reported in
   [#634](https://github.com/atgreen/evergreen/issues/634)).
 
+- A `make-package` nickname that already names a package, a `defpackage`
+  `:import-from` of a name its package lacks, and an `import` name conflict
+  each signal a correctable `package-error`; `continue` leaves out the
+  offending nickname, name or symbol
+  ([#692](https://github.com/atgreen/evergreen/pull/692)).
+
 ## 0.0.11 - 2026-10-24
 
 ### Added
