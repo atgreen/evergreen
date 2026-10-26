@@ -18,6 +18,12 @@
 
 ### Performance
 
+- On x86-64 Linux, T2 loops now read vector elements and boxed or packed
+  doubles directly, and store computed doubles into packed arrays without
+  allocating a box. Vector stores retain the moving-GC write barrier, and
+  array accesses keep bounds checks and fallback for other layouts
+  ([#657](https://github.com/atgreen/evergreen/pull/657)).
+
 - On x86-64, T2 now emits native fixnum `min`, `max`, `mod`, `rem`,
   and single-value `floor` and `truncate` operations, avoiding runtime calls
   in integer loops while preserving signed results and error fallback

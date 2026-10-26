@@ -638,9 +638,27 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                     ));
                 }
 
-                if matches!(data.opcode, Opcode::PackedF64Ref | Opcode::PackedF64Set) {
+                if data.opcode == Opcode::TryPackedF64Set {
                     use crate::t2::ir::{TypeBits, ValueRepresentation as Repr};
-                    let load = data.opcode == Opcode::PackedF64Ref;
+                    let valid = data.args.iter().chain(&data.results)
+                        .all(|value| valid_values.contains(&value.0));
+                    if !valid || data.args.len() != 3 || data.results.len() != 1
+                        || data.flags != (crate::t2::ir::InstFlags {
+                            effectful: true, ..crate::t2::ir::InstFlags::default() })
+                        || data.frame_state.is_some() || !matches!(data.aux, AuxData::None)
+                        || (valid && data.args.len() == 3 && data.results.len() == 1
+                            && (data.args[..2].iter().any(|&v| f.value(v).repr != Repr::Tagged)
+                                || f.value(data.args[2]).repr != Repr::UnboxedF64
+                                || f.value(data.args[2]).ty.bits != TypeBits::DOUBLE_FLOAT
+                                || f.value(data.results[0]).repr != Repr::Tagged)) {
+                        errors.push(VerifyError::new("V8 packed-store-probe-contract",
+                            format!("block{bi} requires tagged array/index, raw double and tagged success flag")));
+                    }
+                }
+
+                if matches!(data.opcode, Opcode::PackedF64Ref | Opcode::VecF64Ref | Opcode::PackedF64Set) {
+                    use crate::t2::ir::{TypeBits, ValueRepresentation as Repr};
+                    let load = matches!(data.opcode, Opcode::PackedF64Ref | Opcode::VecF64Ref);
                     let valid = data.args.iter().chain(&data.results)
                         .all(|value| valid_values.contains(&value.0));
                     let shape = data.args.len() == (if load { 2 } else { 3 })
