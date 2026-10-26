@@ -313,6 +313,10 @@
   `end-of-file` otherwise. Before, it returned an empty string forever, so a
   loop reading lines until `nil` never ended. Building cl-unicode's tables
   from the Unicode data files hung this way ([#643](https://github.com/atgreen/evergreen/pull/643)).
+- The reader accepts a bit vector as the contents of `#nA`, and an empty
+  level such as `#2a()` gives the axes below it length 0
+  ([#685](https://github.com/atgreen/evergreen/pull/685)).
+
 - A closure that has become garbage is now collected even if its body
   contains `progv`, and so is everything it captured. Before, such a closure
   was kept for the rest of the run. bordeaux-threads wraps every thread
