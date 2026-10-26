@@ -30,6 +30,10 @@
   arithmetic call, preserving fallback for wider results and other inputs
   ([#689](https://github.com/atgreen/evergreen/pull/689)).
 
+- More T2 functions retain the ordinary native calling convention when they
+  use guarded fixnum MIN/MAX or packed-double array reads
+  ([#688](https://github.com/atgreen/evergreen/pull/688)).
+
 - References to established constants can compile as literal values. T2 also
   folds fixnum constants in cached bytecode using metadata captured before
   background compilation, avoiding repeated global lookups

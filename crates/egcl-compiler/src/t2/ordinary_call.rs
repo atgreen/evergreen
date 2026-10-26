@@ -578,6 +578,29 @@ pub fn emit_framed_ordinary_function_with_self_call_facts(
                         && (position == 0 || !returns.contains(&insts[position - 1])))
                     { return Err(declined("return of possibly multiple values")); }
                 }
+                Opcode::FixnumMin | Opcode::FixnumMax => {
+                    if data.args.len() != 2 || data.results.len() != 1
+                        || data.args.iter().chain(&data.results).any(|&value|
+                            f.value(value).repr != ValueRepresentation::Tagged)
+                        || f.value(data.results[0]).ty.bits != TypeBits::FIXNUM
+                        || data.flags != (crate::t2::ir::InstFlags {
+                            guard: true, effectful: true, ..Default::default() })
+                        || data.frame_state.is_none()
+                    { return Err(declined("guarded fixnum selection shape")); }
+                }
+                Opcode::PackedF64Ref => {
+                    // Shared representation validation and the IR verifier
+                    // establish exact packed/generic-double layouts. Retain
+                    // ordered type/bounds recovery before exposing a raw word.
+                    if data.args.len() != 2 || data.results.len() != 1
+                        || data.args.iter().any(|&value| f.value(value).repr != ValueRepresentation::Tagged)
+                        || f.value(data.results[0]).repr != ValueRepresentation::UnboxedF64
+                        || f.value(data.results[0]).ty.bits != TypeBits::DOUBLE_FLOAT
+                        || data.flags != (crate::t2::ir::InstFlags {
+                            guard: true, effectful: true, ..Default::default() })
+                        || data.frame_state.is_none()
+                    { return Err(declined("guarded packed-double read shape")); }
+                }
                 // Raw double operations. Their shapes, including the deopt
                 // states of sqrt and division (bliss-lhy89), are checked by
                 // the raw representation validator.

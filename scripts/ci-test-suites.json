@@ -18,6 +18,7 @@
     "egcl:test:ordinary_raw_fixnum_cli": [""],
     "egcl:test:comparison_fusion_liveness": [""],
     "egcl:test:invariant_loop_bounds": [""],
+    "egcl:test:ordinary_numeric_arrays_cli": [""],
     "egcl-stdlib:test:integer_shifts": [""]
   },
   "areas": {
