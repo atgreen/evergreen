@@ -18,6 +18,10 @@
 
 ### Performance
 
+- Simple array construction accepts proper rank-one dimension lists in its native
+  fast path while preserving option handling and numeric initialization
+  ([#686](https://github.com/atgreen/evergreen/pull/686)).
+
 - References to established constants can compile as literal values. T2 also
   folds fixnum constants in cached bytecode using metadata captured before
   background compilation, avoiding repeated global lookups
