@@ -132,6 +132,11 @@
 
 ### Fixed
 
+- General arithmetic `LOOP` clauses evaluate bound and step initial forms once
+  in source order, before binding the iteration variable, including zero-trip
+  loops and loops whose bodies change the original bound or step
+  ([#687](https://github.com/atgreen/evergreen/pull/687)).
+
 - Native x86-64 branches preserve comparison results across intervening boxing,
   fixing incorrect loop counts and results in some unboxed integer loops
   ([#680](https://github.com/atgreen/evergreen/pull/680)).
