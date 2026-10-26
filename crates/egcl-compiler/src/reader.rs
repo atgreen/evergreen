@@ -1717,7 +1717,9 @@ fn read_token_with_base(
             depth + 1,
         ),
         ')' => Err(EgclError::StreamError("unexpected ')'".into())),
-        '"' => read_string(chars, pos + 1),
+        // The string ends at the character that opened it: `ch` may have
+        // been given string syntax by SET-SYNTAX-FROM-CHAR.
+        '"' => read_string(chars, pos + 1, ch),
         '\'' => {
             let (mut val, p) = read_token_with_base(
                 chars,
@@ -2035,26 +2037,46 @@ fn is_delimiter(c: char) -> bool {
         || c == ','
 }
 
-fn read_string(chars: &mut ReaderInput<'_>, mut pos: usize) -> Result<(EgclVal, usize), EgclError> {
+/// Read a string's contents after its opening character, up to the next
+/// occurrence of that same character `close` (CLHS 2.4.5). Any character with
+/// single-escape syntax in the current readtable quotes the next one, not just
+/// `\`: SET-SYNTAX-FROM-CHAR can give another character either role (ansi
+/// set-syntax-from-char.double-quote, .single-escape.2). Nothing allocates
+/// until the string itself, so the readtable needs no rooting.
+fn read_string(
+    chars: &mut ReaderInput<'_>,
+    mut pos: usize,
+    close: char,
+) -> Result<(EgclVal, usize), EgclError> {
+    let rt = if any_char_syntax_override() {
+        current_readtable_value()
+    } else {
+        NIL
+    };
     let mut s = String::new();
     loop {
         if !chars.has(pos)? {
             return Err(EgclError::StreamError("unterminated string".into()));
         }
-        match chars.at(pos)? {
-            '"' => return Ok((alloc_string(&s), pos + 1)),
-            '\\' => {
-                pos += 1;
-                if !chars.has(pos)? {
-                    return Err(EgclError::StreamError("unterminated string escape".into()));
-                }
-                s.push(chars.at(pos)?);
-                pos += 1;
+        let c = chars.at(pos)?;
+        if c == close {
+            return Ok((alloc_string(&s), pos + 1));
+        }
+        let single_escape = if rt == NIL {
+            c == '\\'
+        } else {
+            effective_char_syntax(rt, c).0 == 4
+        };
+        if single_escape {
+            pos += 1;
+            if !chars.has(pos)? {
+                return Err(EgclError::StreamError("unterminated string escape".into()));
             }
-            c => {
-                s.push(c);
-                pos += 1;
-            }
+            s.push(chars.at(pos)?);
+            pos += 1;
+        } else {
+            s.push(c);
+            pos += 1;
         }
     }
 }
@@ -4384,7 +4406,7 @@ fn read_pathname_literal(
         return Err(EgclError::StreamError("unexpected end after #P".into()));
     }
     let (string_val, end) = if chars.at(pos)? == '"' {
-        read_string(chars, pos + 1)?
+        read_string(chars, pos + 1, '"')?
     } else {
         let (val, end) =
             read_token_with_base(chars, pos, labels, read_base, read_eval, read_circular, depth)?;
