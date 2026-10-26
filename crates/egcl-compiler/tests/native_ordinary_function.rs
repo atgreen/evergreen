@@ -814,3 +814,186 @@ fn ordinary_packed_double_read_executes_raw_load_with_tagged_return_boundary() {
     assert!(egcl_rt::packed_f64::set(*packed, 1, 2.5));
     execute(&f, 2, &[packed.0, 1 << 3, 0, 0, 0, 0, 0], NIL.0);
 }
+
+#[test]
+fn ordinary_versioned_vector_store_executes_fast_clone_and_large_checked_loop() {
+    use egcl_compiler::t2::{vector_ranges, verify};
+    use egcl_rt::{
+        EgclVal, gc,
+        object::{ObjectHeader, type_id},
+    };
+
+    let mut f = Function::new("ordinary-versioned-vector-store");
+    let entry = f.entry();
+    let vector = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+    let start = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+    let end = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+    let one = value(
+        &mut f,
+        entry,
+        instruction(Opcode::ConstFixnum, vec![], AuxData::FixnumImm(1)),
+    );
+    let fast_value = value(
+        &mut f,
+        entry,
+        instruction(Opcode::ConstFixnum, vec![], AuxData::FixnumImm(77)),
+    );
+    let slow_value = value(
+        &mut f,
+        entry,
+        instruction(Opcode::ConstFixnum, vec![], AuxData::FixnumImm(88)),
+    );
+    let header = f.make_block();
+    let body = f.make_block();
+    let done = f.make_block();
+    let index = f.add_block_param(header, IRType::TOP, ValueRepresentation::Tagged);
+    let mut jump = instruction(Opcode::Jump, vec![], AuxData::None);
+    jump.targets = vec![BlockCall {
+        block: header,
+        args: vec![start],
+    }];
+    f.set_terminator(entry, jump);
+    let recovery = state(&mut f, vector, &[vector, index, end], 0);
+    let guarded = InstFlags {
+        guard: true,
+        effectful: true,
+        ..Default::default()
+    };
+    let mut compare = instruction(Opcode::FixnumCmpGe, vec![index, end], AuxData::None);
+    compare.flags = guarded;
+    compare.frame_state = Some(recovery);
+    let condition = f
+        .push_inst(
+            header,
+            compare,
+            &[(
+                IRType::of(TypeBits::SYMBOL.join(TypeBits::NULL)),
+                ValueRepresentation::Tagged,
+            )],
+        )
+        .1[0];
+    let mut branch = instruction(Opcode::Brif, vec![condition], AuxData::None);
+    branch.targets = vec![
+        BlockCall {
+            block: done,
+            args: vec![],
+        },
+        BlockCall {
+            block: body,
+            args: vec![],
+        },
+    ];
+    f.set_terminator(header, branch);
+    let mut store = instruction(
+        Opcode::VecSet,
+        vec![vector, index, fast_value],
+        AuxData::None,
+    );
+    store.flags = guarded;
+    store.frame_state = Some(recovery);
+    let (checked_store, _) =
+        f.push_inst(body, store, &[(IRType::TOP, ValueRepresentation::Tagged)]);
+    let mut add = instruction(Opcode::FixnumAdd, vec![index, one], AuxData::None);
+    add.flags = guarded;
+    add.frame_state = Some(recovery);
+    let next = value(&mut f, body, add);
+    let mut jump = instruction(Opcode::Jump, vec![], AuxData::None);
+    jump.targets = vec![BlockCall {
+        block: header,
+        args: vec![next],
+    }];
+    f.set_terminator(body, jump);
+    f.set_terminator(
+        done,
+        instruction(Opcode::Return, vec![vector], AuxData::None),
+    );
+    verify::verify(&f).unwrap();
+    let stats = vector_ranges::version_counted_stores(&mut f);
+    assert_eq!(stats.loops, 1, "{stats:?}");
+    assert_eq!(stats.stores, 1, "{stats:?}");
+    // Deliberately distinguish executed branches AFTER cloning. This changes
+    // only the original checked store: the fast clone must still store 77.
+    f.inst_mut(checked_store).args[2] = slow_value;
+    verify::verify(&f).unwrap();
+    let fast_stores: Vec<_> = f
+        .block_order()
+        .iter()
+        .flat_map(|&b| &f.block(b).insts)
+        .filter(|&&i| f.inst(i).opcode == Opcode::VecSetInRange)
+        .copied()
+        .collect();
+    assert_eq!(fast_stores.len(), 1);
+    assert_eq!(f.inst(fast_stores[0]).args[2], fast_value);
+
+    fn allocate_vector(length: usize) -> EgclVal {
+        let bytes = 8 + length * 8;
+        let body = gc::alloc_typed(bytes, type_id::SIMPLE_VECTOR).unwrap();
+        // No Lisp allocation until the complete object is initialized/rooted.
+        unsafe {
+            body.cast::<u64>().write(length as u64);
+            for i in 0..length {
+                body.add(8 + i * 8)
+                    .cast::<EgclVal>()
+                    .write(EgclVal::from_fixnum(-1));
+            }
+            EgclVal::from_heap_ptr(body.sub(gc::body_header_offset(bytes)))
+        }
+    }
+    fn element(vector: EgclVal, index: usize) -> EgclVal {
+        unsafe {
+            let header = vector.as_ptr();
+            let offset = if (*header.cast::<ObjectHeader>()).is_large_object() {
+                16
+            } else {
+                8
+            };
+            *header.add(offset + 8 + index * 8).cast::<EgclVal>()
+        }
+    }
+    unsafe extern "C" fn poll(_activation: *mut u8) -> u64 {
+        0
+    }
+    egcl_rt::rooted!(small = allocate_vector(8));
+    egcl_rt::rooted!(large = allocate_vector(65_533));
+    assert!(!unsafe { (*small.as_ptr().cast::<ObjectHeader>()).is_large_object() });
+    assert!(unsafe { (*large.as_ptr().cast::<ObjectHeader>()).is_large_object() });
+    for (vector, start, end, expected) in [
+        (*small, 1, 4, 77),
+        (*large, 1, 4, 88),
+        (*small, 5, 5, -1),
+        (*large, 5, 5, -1),
+        (*small, 7, 6, -1),
+        (*large, 7, 6, -1),
+    ] {
+        let length = if vector == *small { 8 } else { 65_533 };
+        let before: Vec<_> = (0..length).map(|i| element(vector, i)).collect();
+        // execute_with_poll requires emission of a real ordinary entry and
+        // asserts the native return descriptor/result. Cold veneers return
+        // a distinct sentinel, so fallback cannot make these assertions pass.
+        execute_with_poll(
+            &f,
+            3,
+            &[
+                vector.0,
+                EgclVal::from_fixnum(start).0,
+                EgclVal::from_fixnum(end).0,
+                0,
+                0,
+                0,
+                0,
+            ],
+            vector.0,
+            poll as *const () as u64,
+        );
+        if start < end {
+            for i in start..end {
+                assert_eq!(element(vector, i as usize).as_fixnum(), expected);
+            }
+            assert_eq!(element(vector, start as usize - 1).as_fixnum(), -1);
+            assert_eq!(element(vector, end as usize).as_fixnum(), -1);
+        } else {
+            let after: Vec<_> = (0..length).map(|i| element(vector, i)).collect();
+            assert_eq!(after, before, "zero/reversed interval must not write");
+        }
+    }
+}

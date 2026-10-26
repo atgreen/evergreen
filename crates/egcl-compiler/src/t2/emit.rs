@@ -149,6 +149,9 @@ mod integer_shift;
 #[path = "emit_integer_low_bits.rs"]
 mod integer_low_bits;
 
+#[path = "emit_vector_range.rs"]
+mod vector_range;
+
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[path = "ordinary_leaf.rs"]
 mod ordinary_leaf;
@@ -5326,8 +5329,8 @@ fn emit_transfer_function_with_storage(
                     | Opcode::Car
                     | Opcode::Cdr
                     | Opcode::StringCharOrNil
-                    | Opcode::VecRef | Opcode::VecSet | Opcode::ArrayReadDiscarded | Opcode::PackedF64P
-                    | Opcode::MemoryFence | Opcode::TryIntegerShr
+                    | Opcode::VecRef | Opcode::VecSet | Opcode::VecSetInRange | Opcode::ArrayReadDiscarded | Opcode::PackedF64P
+                    | Opcode::MemoryFence | Opcode::TryIntegerShr | Opcode::SmallVectorRangeP
             ) {
                 return Err(EmitError::UnsupportedOp(op_tag(f.inst(inst).opcode)));
             }
@@ -6501,6 +6504,7 @@ fn emit_framed_inner(
                             | Opcode::TakeValuesToLocals
                             | Opcode::MemoryFence
                             | Opcode::TryIntegerShr
+                            | Opcode::SmallVectorRangeP
                             | Opcode::TryPackedF64Set
                             | Opcode::PackedF64P
                     )
@@ -7089,6 +7093,11 @@ fn emit_framed_inner(
                     _ => None,
                 }
             } else { None };
+            let runtime_data = (d.opcode == Opcode::VecSetInRange).then(|| {
+                let mut operands = d.clone();
+                operands.args.truncate(3);
+                operands
+            });
             let (mut inst_reg, result_stores) = if stack_float.is_some()
                 || d.opcode == Opcode::TakeValuesToLocals
                 || d.opcode == Opcode::Invoke
@@ -7103,7 +7112,7 @@ fn emit_framed_inner(
             {
                 (HashMap::new(), Vec::new())
             } else {
-                prepare_framed_inst(&mut a, &d, &homes, &const_tagged)?
+                prepare_framed_inst(&mut a, runtime_data.as_ref().unwrap_or(&d), &homes, &const_tagged)?
             };
             let mut inst_calls = Vec::new();
             let mut inst_pool = Vec::new();
@@ -7490,7 +7499,9 @@ fn emit_framed_inner(
                 a.bind(failed);
                 mov_imm64(&mut a, dst, egcl_rt::value::NIL.0 as i64);
                 a.bind(done);
-            } else if matches!(d.opcode, Opcode::VecRef | Opcode::VecSet) {
+            } else if d.opcode == Opcode::SmallVectorRangeP {
+                vector_range::emit(&mut a, f, &d, &mut inst_reg, &mut inst_pool, &const_tagged)?;
+            } else if matches!(d.opcode, Opcode::VecRef | Opcode::VecSet | Opcode::VecSetInRange) {
                 let label = *inst_deopt.get(&inst)
                     .ok_or(EmitError::UnsupportedOp(op_tag(d.opcode)))?;
                 let array = if let Some(&bits) = const_tagged.get(&d.args[0]) {
@@ -7537,8 +7548,24 @@ fn emit_framed_inner(
                     a.jmp(label);
                     a.bind(vector);
                 }
-                vector_element_address(&mut a, array, index,
-                    const_tagged.get(&d.args[1]).copied(), label);
+                if d.opcode == Opcode::VecSetInRange {
+                    // Verification requires the predicate's successful edge
+                    // and counted induction to dominate this access. Keep the
+                    // tagged vector live: a poll may relocate it after the
+                    // predicate. No interior pointer survives a safepoint.
+                    mov_rr(&mut a, SCRATCH, array);
+                    alu_r_imm(&mut a, 4, SCRATCH, -8);
+                    if let Some(&bits) = const_tagged.get(&d.args[1]) {
+                        mov_imm64(&mut a, RAX, bits as i64);
+                        alu_rr(&mut a, 0x01, SCRATCH, RAX);
+                    } else {
+                        alu_rr(&mut a, 0x01, SCRATCH, index);
+                    }
+                    alu_r_imm(&mut a, 0, SCRATCH, 16);
+                } else {
+                    vector_element_address(&mut a, array, index,
+                        const_tagged.get(&d.args[1]).copied(), label);
+                }
                 if d.opcode == Opcode::VecRef {
                     load_mem64_disp(&mut a, inst_reg[&d.results[0]], SCRATCH, 0);
                 } else {
@@ -7587,7 +7614,7 @@ fn emit_framed_inner(
                     if let Some(&bits) = const_tagged.get(&value) { mov_imm64(&mut a, dst, bits as i64); }
                     else { mov_rr(&mut a, dst, inst_reg[&value]); }
                 }
-                if d.opcode == Opcode::VecSet { a.bind(stored); }
+                if matches!(d.opcode, Opcode::VecSet | Opcode::VecSetInRange) { a.bind(stored); }
             } else if matches!(d.opcode, Opcode::PackedF64Ref | Opcode::VecF64Ref | Opcode::PackedF64Set) {
                 if !published_native_roots || !native_call_storage {
                     return Err(EmitError::UnsupportedOp(op_tag(d.opcode)));

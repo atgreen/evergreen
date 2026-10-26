@@ -164,6 +164,7 @@ pub mod op {
     /// Noncollecting native extraction, with a cold noninteger guard.
     pub const INTEGER_LOW_BITS: u32 = 0x0037;
     pub const TRY_INTEGER_SHR: u32 = 0x0038;
+    pub const SMALL_VECTOR_RANGE: u32 = 0x0039;
 
     // ── 0x30 float ALU ───────────────────────────────────────────────
     pub const FADD: u32 = 0x0030;
@@ -204,6 +205,7 @@ pub mod op {
     /// GC write barrier.
     pub const WRITE_BARRIER: u32 = 0x0063;
     pub const MEMORY_FENCE: u32 = 0x0064;
+    pub const VECTOR_STORE_IN_RANGE: u32 = 0x0065;
 
     // ── 0x70 calls / guards ──────────────────────────────────────────
     /// Direct/indirect call (clobbers caller-saved; safepoint).
@@ -671,6 +673,7 @@ fn lower_inst(lo: &mut Lowering, inst: Inst) {
         LogNot => un!(op::NOT),
         IntegerLowBits => un!(op::INTEGER_LOW_BITS),
         TryIntegerShr => lo.emit_annotated(inst, op::TRY_INTEGER_SHR, defs, uses),
+        SmallVectorRangeP => lo.emit_annotated(inst, op::SMALL_VECTOR_RANGE, defs, uses),
 
         // ── box / unbox / widen ──
         BoxFixnum => un!(op::BOX_FIXNUM),
@@ -719,6 +722,11 @@ fn lower_inst(lo: &mut Lowering, inst: Inst) {
         // ── memory stores ──
         Store | SetCar | SetCdr | VecSet | PackedF64Set | TryPackedF64Set => {
             lo.emit_annotated(inst, op::STORE, defs, uses);
+        }
+        VecSetInRange => {
+            // The fourth SSA operand is a structural proof, not a machine
+            // value read by the store. Its producer remains live for Brif.
+            lo.emit_annotated(inst, op::VECTOR_STORE_IN_RANGE, defs, uses[..3].to_vec());
         }
         WriteBarrier => lo.emit_annotated(inst, op::WRITE_BARRIER, defs, uses),
         MemoryFence => unreachable!(),

@@ -616,7 +616,7 @@ pub fn emit_framed_ordinary_function_with_self_call_facts(
                     }
                 }
                 Opcode::UnboxFixnum | Opcode::IntegerLowBits
-                | Opcode::VecRef | Opcode::VecSet | Opcode::ArrayReadDiscarded => {
+                | Opcode::VecRef | Opcode::VecSet | Opcode::VecSetInRange | Opcode::ArrayReadDiscarded => {
                     if data.frame_state.is_none() {
                         return Err(declined("guarded numeric or array operation without state"));
                     }
@@ -641,7 +641,7 @@ pub fn emit_framed_ordinary_function_with_self_call_facts(
                 | Opcode::LogNot | Opcode::Jump | Opcode::Brif
                 | Opcode::Car | Opcode::Cdr | Opcode::ConstHeapObj
                 | Opcode::StringByteLength | Opcode::StringAsciiCharAt | Opcode::StringCharOrNil
-                | Opcode::MemoryFence | Opcode::TryIntegerShr => {}
+                | Opcode::MemoryFence | Opcode::TryIntegerShr | Opcode::SmallVectorRangeP => {}
                 _ => return Err(EmitError::UnsupportedOp(super::op_tag(data.opcode))),
             }
         }
