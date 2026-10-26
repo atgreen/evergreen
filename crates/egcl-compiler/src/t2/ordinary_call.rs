@@ -529,6 +529,12 @@ pub fn emit_framed_ordinary_function_with_self_call_facts(
     {
         return Err(declined("unsupported native representation contract"));
     }
+    if std::env::var_os("EGCL_DISABLE_RAW_ORDINARY_ABI").is_some()
+        && (0..f.num_values()).any(|v|
+            f.value(Value(v as u32)).repr == ValueRepresentation::UnboxedFixnum)
+    {
+        return Err(declined("raw ordinary ABI disabled"));
+    }
     if f.frame_states.iter().any(|(_, state)| {
         // Retained self expansion shares one body's scope-free recovery
         // protocol. Cross-function logical frames need separate admission.
