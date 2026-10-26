@@ -153,19 +153,20 @@ fn ordinary_array_constructor_relocates_prebuilt_arguments_and_live_result() {
         1,
         "only the final public CONS may enter a named call; MAKE-ARRAY must use its private adapter"
     );
-    let (array, returned_marker) = cp(*result);
+    egcl_rt::rooted!(array = cp(*result).0);
+    egcl_rt::rooted!(returned_marker = cp(*result).1);
     assert_eq!(
-        returned_marker, args[1],
+        *returned_marker, args[1],
         "native homes must reload the moved marker after allocation"
     );
-    assert_eq!(cp(returned_marker).0.as_fixnum(), 71);
+    assert_eq!(cp(*returned_marker).0.as_fixnum(), 71);
     assert_eq!(cp(args[0]).0.as_fixnum(), 3);
     assert_eq!(cp(args[2]).0, unsigned_byte);
     assert_eq!(cp(cp(args[2]).1).0.as_fixnum(), 8);
-    assert_eq!(egcl_stdlib::sequences::array_total_size(array), Some(3));
+    assert_eq!(egcl_stdlib::sequences::array_total_size(*array), Some(3));
     for index in 0..3 {
         assert_eq!(
-            egcl_stdlib::sequences::aref(array, index).unwrap(),
+            egcl_stdlib::sequences::aref(*array, index).unwrap(),
             EgclVal::from_fixnum(0)
         );
     }
