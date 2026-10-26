@@ -375,12 +375,12 @@ impl EmittedTransfer {
                 return false;
             } else if !context.ordinary_parameters {
                 Some("parameter shape (ordinary_entry_parameters)".to_string())
-            } else if !ordinary_native_body(&body) {
+            } else if !ordinary_native_body(body) {
                 Some(format!("instruction {} (ordinary_native_body)",
-                    first_refused_ordinary_op(&body).as_deref().unwrap_or("parameter slots")))
+                    first_refused_ordinary_op(body).as_deref().unwrap_or("parameter slots")))
             } else if !ordinary_primary_transport_eliminated(ir) {
                 Some("a primary-value binder survived specialization (TakeValuesToLocals)".to_string())
-            } else if !ordinary_single_frame_states(&body, ir) {
+            } else if !ordinary_single_frame_states(body, ir) {
                 Some("a TAGBODY body with a multi-frame state (ordinary_single_frame_states)".to_string())
             } else {
                 None
@@ -457,7 +457,7 @@ impl EmittedTransfer {
                             native_errors: flags.native_errors, signal_epoch: flags.signal_epoch };
                         let self_calls = if matches!(tier, CompilationTier::T2) && !body.variadic {
                             context.body_symbol
-                                .map(|symbol| ordinary_t2::proven_self_calls(&ir, &body, symbol))
+                                .map(|symbol| ordinary_t2::proven_self_calls(&ir, body, symbol))
                                 .unwrap_or_default()
                         } else { Vec::new() };
                         let emit_general = || {
@@ -549,7 +549,7 @@ impl EmittedTransfer {
             if !matches!(tier, CompilationTier::T2)
                 || !has_metadata
                 || (!ir.osr_entries.is_empty() && !raw_osr)
-                || !packed_f64_native_body(&body, ir)
+                || !packed_f64_native_body(body, ir)
             {
                 return Err(EmitDecline::RawValues);
             }
@@ -629,7 +629,7 @@ impl EmittedTransfer {
                 ));
             }
         }
-        let scopes = egcl_compiler::control_scope::ScopeMap::analyze_function(&body)
+        let scopes = egcl_compiler::control_scope::ScopeMap::analyze_function(body)
             .map_err(EmitDecline::Scopes)?;
         let guard_handler_capacity = (0..body.code.len())
             .filter_map(|bcp| scopes.before(bcp as u32))
@@ -683,7 +683,7 @@ impl EmittedTransfer {
         }
         let code = exec(JitBuffer::new(&emitted.code))?;
         let arguments = native_debug::arguments(
-            &body,
+            body,
             emitted.native_recursive_entry.is_some() || emitted.ordinary_entry.is_some(),
         );
         let osr_polls = emitted

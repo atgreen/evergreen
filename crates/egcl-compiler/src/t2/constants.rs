@@ -117,7 +117,7 @@ impl BytecodeSnapshot {
         for (original, copied) in source.restart_cases.iter().zip(&mut body.restart_cases) {
             for (original, copied) in original.restarts.iter().zip(&mut copied.restarts) {
                 let snapshot = Self::capture(&original.function);
-                copied.function = Box::new((*snapshot.body).clone());
+                *copied.function = (*snapshot.body).clone();
                 restart_functions.push(snapshot);
             }
         }

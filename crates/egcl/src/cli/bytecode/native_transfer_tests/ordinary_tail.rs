@@ -343,6 +343,20 @@ fn ordinary_tail_long_chain_retires_owners_and_relocates_error_arguments() {
         for (symbol, _) in codes.iter().rev() {
             super::super::call_table::ordinary_call(*symbol, &warm).unwrap();
         }
+        // Warming can queue the terminal's T1 compilation. Settle that work
+        // before measuring adapter entries, then refresh cells invalidated by
+        // publication. A structural decline leaves the terminal in T0.
+        let terminal = egcl_rt::symbols::intern("ORDINARY-TAIL-CHAIN-TERMINAL");
+        if background_t1::pending(terminal) {
+            let _ = background_t1::wait(terminal);
+            assert!(
+                !background_t1::pending(terminal),
+                "terminal compilation must settle before measuring the chain"
+            );
+        }
+        for (symbol, _) in codes.iter().rev() {
+            super::super::call_table::ordinary_call(*symbol, &warm).unwrap();
+        }
     }
     let (symbol, root) = codes.remove(0);
     drop(codes);

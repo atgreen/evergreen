@@ -343,6 +343,14 @@ pub(super) fn prepare_background_t1(
     prepare_native(bf, allow_speculation, sym, backedge_counter, false)
 }
 
+pub(super) fn prepare_background_osr(
+    bf: &Arc<BytecodeFunction>,
+    backedge_counter: u64,
+    allow_traps: bool,
+) -> Option<(PreparedT1, Vec<Rc<NativeCode>>)> {
+    prepare_native(bf, true, u32::MAX, backedge_counter, allow_traps)
+}
+
 fn prepare_native(
     bf: &BytecodeFunction,
     allow_speculation: bool,

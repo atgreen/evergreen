@@ -32,6 +32,16 @@
 //! (closures / multiple values / special vars), nmq.6 (parity + default flip),
 //! nmq.2 (codegen via i2c/c2i), nmq.3 (precise GC of frames).
 
+#[cfg(any(all(target_arch = "x86_64", target_os = "linux"), all(target_arch = "s390x", target_os = "linux")))]
+mod background_t1;
+#[cfg(all(test, any(all(target_arch = "x86_64", target_os = "linux"), all(target_arch = "s390x", target_os = "linux"))))]
+mod background_compile_tests;
+#[cfg(all(test, any(all(target_arch = "x86_64", target_os = "linux"), all(target_arch = "s390x", target_os = "linux"))))]
+use background_compile_tests::pause as compiler_test_pause;
+#[cfg(all(test, not(any(all(target_arch = "x86_64", target_os = "linux"), all(target_arch = "s390x", target_os = "linux")))))]
+fn compiler_test_pause(_symbol: u32, _t2: bool) {}
+#[cfg(all(target_arch = "s390x", target_os = "linux"))]
+mod background_osr;
 #[cfg(any(
     all(target_arch = "x86_64", target_os = "linux"),
     all(
@@ -21189,6 +21199,7 @@ fn materialize_t2_deopt_scopes(
 // Only the x86-64 emitter currently consumes them for direct native calls.
 enum NativeCodeStorage {
     Checked {
+        _backedge_counter: Option<Box<std::sync::atomic::AtomicU32>>,
         _buffer: egcl_rt::jit::JitBuffer,
         // Exact code-version metadata, independent of debugger registration.
         _native_calls: Option<Arc<egcl_compiler::t2::x64_calls::NativeCallSites>>,
@@ -21304,7 +21315,9 @@ struct NativeEmission {
     env_names: Box<NativeEnvNames>,
     code: Vec<u8>,
     osr_entries: Vec<(u32, usize)>,
+    #[cfg_attr(all(not(test), target_arch = "x86_64", target_os = "linux"), allow(dead_code))]
     bcp_offsets: Vec<u32>,
+    #[cfg_attr(all(not(test), target_arch = "x86_64", target_os = "linux"), allow(dead_code))]
     has_deopt: bool,
     direct_calls: Vec<Rc<NativeCode>>,
 }
@@ -22167,13 +22180,50 @@ static T2_COMPLETIONS: egcl_rt::execution_local::ExecutionLocal<
 
 #[derive(Clone)]
 struct T2BodySnapshot {
+    generation: u64,
+    snapshot: Option<egcl_compiler::t2::constants::BytecodeSnapshot>,
     symbol: u32,
     body: std::sync::Arc<BytecodeFunction>,
     invocations: u32,
     call_sites: Vec<(u32, u32)>,
 }
 
+/// Addresses and ownership captured while the source is GC-stable. Workers may
+/// clone these Arcs but never read their mutable Lisp slots.
+#[derive(Clone)]
+struct CompilerSourceBody {
+    symbol: u32,
+    body: Arc<BytecodeFunction>,
+    constant_ranges: Vec<(usize, usize)>,
+    nested_slots: Vec<u64>,
+}
+impl CompilerSourceBody {
+    fn capture(symbol: u32, body: &Arc<BytecodeFunction>) -> Self {
+        fn ranges(body: &BytecodeFunction, out: &mut Vec<(usize, usize)>) {
+            let start = body.constants.as_ptr() as usize;
+            out.push((start, start + std::mem::size_of_val(body.constants.as_slice())));
+            for nested in &body.nested_functions { ranges(nested, out); }
+            for cases in &body.restart_cases {
+                for restart in &cases.restarts { ranges(&restart.function, out); }
+            }
+        }
+        let mut constant_ranges = Vec::new();
+        ranges(body, &mut constant_ranges);
+        Self { symbol, body: Arc::clone(body), constant_ranges,
+            nested_slots: body.nested_functions.iter().map(|b| std::ptr::from_ref(b) as u64).collect() }
+    }
+    fn owns_slot(&self, slot: usize) -> bool {
+        self.constant_ranges.iter().any(|&(start, end)| slot >= start && slot < end
+            && (slot - start) % std::mem::size_of::<EgclVal>() == 0)
+    }
+}
+
 struct T2CompileInput {
+    snapshot: Option<egcl_compiler::t2::constants::BytecodeSnapshot>,
+    sources: Vec<CompilerSourceBody>,
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    mapped_context: Option<native_transfer_entry::EmissionContext>,
+
     call_cells: Vec<(u32, Arc<egcl_rt::call_table::CallCell>)>,
     sym: u32,
     generation: u64,
@@ -22188,6 +22238,35 @@ struct T2CompileInput {
     /// Identifies the installed code to its own deopt stubs (see
     /// `CODE_BY_ID`); never 0.
     code_id: u64,
+}
+
+impl T2CompileInput {
+    fn source_body(&self) -> &Arc<BytecodeFunction> {
+        self.sources.first().map(|source| &source.body).unwrap_or(&self.body)
+    }
+
+    /// Called only while the original input is protected from moving GC.
+    /// The result owns non-executable metadata, with no movable values to scan.
+    fn detach(&self) -> Self {
+        use egcl_compiler::t2::constants::BytecodeSnapshot;
+        let snapshot = BytecodeSnapshot::capture(&self.body);
+        let mut sources = vec![CompilerSourceBody::capture(self.sym, &self.body)];
+        let inline_bodies = self.inline_bodies.iter().map(|saved| {
+            sources.push(CompilerSourceBody::capture(saved.symbol, &saved.body));
+            let snapshot = if saved.symbol == self.sym { snapshot.clone() } else { BytecodeSnapshot::capture(&saved.body) };
+            T2BodySnapshot { generation: saved.generation, symbol: saved.symbol, body: Arc::clone(&snapshot.body), snapshot: Some(snapshot),
+                invocations: saved.invocations, call_sites: saved.call_sites.clone() }
+        }).collect();
+        Self {
+            body: Arc::clone(&snapshot.body), snapshot: Some(snapshot), sources,
+            call_cells: self.call_cells.clone(), sym: self.sym, generation: self.generation,
+            priority: self.priority, type_profiles: self.type_profiles.clone(),
+            receiver_profiles: self.receiver_profiles.clone(), inline_bodies,
+            direct_natives: self.direct_natives.clone(), code_id: self.code_id,
+            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+            mapped_context: self.mapped_context.clone(),
+        }
+    }
 }
 
 /// Source of `T2CompileInput::code_id`.
@@ -22316,7 +22395,24 @@ fn validate_t2_root_sync(activation_slots: u16, artifact: &CheckedT2Artifact) ->
     activation_slots.checked_add(artifact.shadow_root_slots)
 }
 
+/// Capacity counts queued, active and completed-but-unpublished jobs. A slow
+/// owner cannot accumulate unlimited executable artifacts in its channel.
+struct CompilerPermit(Arc<std::sync::atomic::AtomicUsize>);
+impl CompilerPermit {
+    fn acquire(used: &Arc<std::sync::atomic::AtomicUsize>, capacity: usize) -> Option<Self> {
+        used.fetch_update(std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire,
+            |n| (n < capacity).then_some(n + 1)).ok()?;
+        Some(Self(Arc::clone(used)))
+    }
+}
+impl Drop for CompilerPermit {
+    fn drop(&mut self) { self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel); }
+}
+
 struct T2Completion {
+    panicked: bool,
+    dependencies: Vec<(u32, u64)>,
+    _permit: Option<CompilerPermit>,
     sym: u32,
     generation: u64,
     artifact: Option<T2Artifact>,
@@ -22324,6 +22420,8 @@ struct T2Completion {
 }
 
 struct T2Job {
+    dependencies: Vec<(u32, u64)>,
+    permit: CompilerPermit,
     sym: u32,
     generation: u64,
     priority: u64,
@@ -22337,6 +22435,7 @@ struct T2QueueState {
 }
 
 struct T2CompileQueue {
+    outstanding: Arc<std::sync::atomic::AtomicUsize>,
     state: std::sync::Mutex<T2QueueState>,
     ready: std::sync::Condvar,
     dropped: std::sync::atomic::AtomicU64,
@@ -22379,6 +22478,7 @@ fn t2_compile_queue() -> &'static std::sync::Arc<T2CompileQueue> {
     QUEUE.get_or_init(|| {
         let capacity = positive_env(&["EGCL_COMPILE_QUEUE_SIZE"], 64) as usize;
         let queue = Arc::new(T2CompileQueue {
+            outstanding: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             state: std::sync::Mutex::new(T2QueueState {
                 jobs: Vec::new(),
                 capacity,
@@ -22387,9 +22487,10 @@ fn t2_compile_queue() -> &'static std::sync::Arc<T2CompileQueue> {
             dropped: std::sync::atomic::AtomicU64::new(0),
         });
         let threads = positive_env(&["EGCL_T2_THREADS"], 2).min(32);
+        let mut started = 0;
         for index in 0..threads {
             let worker_queue = Arc::clone(&queue);
-            let _ = std::thread::Builder::new()
+            let worker = std::thread::Builder::new()
                 .name(format!("egcl-t2-{index}"))
                 .spawn(move || {
                     loop {
@@ -22400,11 +22501,14 @@ fn t2_compile_queue() -> &'static std::sync::Arc<T2CompileQueue> {
                         // a worker and strand force/debug callers waiting forever.
                         let artifact =
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                job.input.with_gc_stable(compile_t2_artifact)
-                            }))
-                            .ok()
-                            .flatten();
+                                compile_rooted_t2(&job.input)
+                            }));
+                        let panicked = artifact.is_err();
+                        let artifact = artifact.ok().flatten();
                         let _ = job.completion.send(T2Completion {
+                            panicked,
+                            dependencies: job.dependencies,
+                            _permit: Some(job.permit),
                             sym,
                             generation,
                             artifact,
@@ -22412,6 +22516,10 @@ fn t2_compile_queue() -> &'static std::sync::Arc<T2CompileQueue> {
                         });
                     }
                 });
+            if worker.is_ok() { started += 1; }
+        }
+        if started == 0 {
+            queue.state.lock().unwrap_or_else(|e| e.into_inner()).capacity = 0;
         }
         queue
     })
@@ -22888,6 +22996,8 @@ fn snapshot_t2_input(sym: u32, priority: u64) -> Option<T2CompileInput> {
                     return None;
                 }
                 Some(T2BodySnapshot {
+                    generation: REGISTRY_GENERATION.with(|g| g.borrow().get(&symbol).copied().unwrap_or(0)),
+                    snapshot: None,
                     symbol,
                     body: std::sync::Arc::new((**body).clone()),
                     invocations,
@@ -22906,6 +23016,11 @@ fn snapshot_t2_input(sym: u32, priority: u64) -> Option<T2CompileInput> {
             total
         );
     }
+    let body = Arc::clone(&root);
+    egcl_rt::rooted!(_preparation_roots = T2InstalledBodies {
+        bodies: std::iter::once(Arc::clone(&body))
+            .chain(inline_bodies.iter().map(|saved| Arc::clone(&saved.body))).collect(),
+    });
     let generation = REGISTRY_GENERATION.with(|g| g.borrow().get(&sym).copied().unwrap_or(0));
     let direct_natives = direct_native_targets(sym, generation, &root, &inline_bodies);
     let mut call_cells = Vec::new();
@@ -22927,12 +23042,17 @@ fn snapshot_t2_input(sym: u32, priority: u64) -> Option<T2CompileInput> {
             }
         }
     }
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let mapped_context = Some(native_transfer_entry::EmissionContext::capture(&body, true));
     Some(T2CompileInput {
+        snapshot: None, sources: Vec::new(),
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        mapped_context,
         call_cells,
         sym,
         generation,
         priority,
-        body: std::sync::Arc::new((*root).clone()),
+        body,
         type_profiles,
         receiver_profiles,
         inline_bodies,
@@ -23061,6 +23181,12 @@ fn request_t2_compilation(sym: u32, priority: u64) -> bool {
     {
         return false;
     }
+    let queue = t2_compile_queue();
+    let capacity = positive_env(&["EGCL_COMPILE_QUEUE_SIZE"], 64) as usize;
+    let Some(permit) = CompilerPermit::acquire(&queue.outstanding, capacity) else {
+        queue.dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return false;
+    };
     let Some(input) = snapshot_t2_input(sym, priority) else {
         T2_DECLINED.with(|s| s.borrow_mut().insert(sym));
         return false;
@@ -23070,12 +23196,16 @@ fn request_t2_compilation(sym: u32, priority: u64) -> bool {
     // EGCL_T2_DISCARD (compile, install nothing) this splits T2's cost three
     // ways: snapshot / compile / emitted code.
     if t2_no_queue() {
+        PENDING_DIRECT_CALLS.with(|m| m.borrow_mut().remove(&(sym, input.generation)));
         T2_DECLINED.with(|s| s.borrow_mut().insert(sym));
         return false;
     }
     let generation = input.generation;
     let priority = input.priority;
+    let dependencies = input.inline_bodies.iter().map(|saved| (saved.symbol, saved.generation)).collect();
     let job = T2Job {
+        dependencies,
+        permit,
         sym,
         generation,
         priority,
@@ -23138,6 +23268,12 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
     let direct_calls = PENDING_DIRECT_CALLS
         .with(|m| m.borrow_mut().remove(&(done.sym, done.generation)))
         .unwrap_or_default();
+    T2_QUEUED.with(|s| {
+        let mut queued = s.borrow_mut();
+        if queued.get(&done.sym) == Some(&done.generation) {
+            queued.remove(&done.sym);
+        }
+    });
     // Refresh the canonical definition before validating the local generation.
     // Otherwise a worker can accept a job predating another thread's DEFUN,
     // or record its decline against the replacement definition.
@@ -23147,12 +23283,17 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
     if current_generation != done.generation {
         return None;
     }
-    T2_QUEUED.with(|s| {
-        let mut queued = s.borrow_mut();
-        if queued.get(&done.sym) == Some(&done.generation) {
-            queued.remove(&done.sym);
+    for &(symbol, generation) in &done.dependencies {
+        registry_get(symbol);
+        if REGISTRY_GENERATION.with(|g| g.borrow().get(&symbol).copied().unwrap_or(0)) != generation {
+            t2_log_write(format_args!("{}: discard result after inlining dependency changed", sym_label(done.sym)));
+            return None;
         }
-    });
+    }
+    if done.panicked {
+        t2_log_write(format_args!("{}: compiler panic; retaining current tier and allowing retry", sym_label(done.sym)));
+        return None;
+    }
     let Some(mut artifact) = done.artifact else {
         T2_DECLINED.with(|s| s.borrow_mut().insert(done.sym));
         return None;
@@ -23282,6 +23423,7 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
         _env_names: checked.env_names,
         _call_cells: artifact.call_cells,
         _storage: NativeCodeStorage::Checked {
+            _backedge_counter: None,
             _buffer: buf,
             _native_calls: checked.native_calls.map(Arc::new),
         },
@@ -23317,6 +23459,7 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
 }
 
 fn poll_t2_completions() {
+    background_t1::poll();
     loop {
         let done = T2_COMPLETIONS.with(|slot| {
             slot.borrow()
@@ -23332,45 +23475,48 @@ fn poll_t2_completions() {
 /// compiler thread a chance to run; publication itself still happens only when
 /// this owner thread polls.
 pub(super) fn poll_background_compilation() {
-    std::thread::yield_now();
     poll_t2_completions();
-    if T2_QUEUED.with(|queued| !queued.borrow().is_empty()) {
-        let done = T2_COMPLETIONS.with(|slot| {
-            slot.borrow().as_ref().and_then(|(_, receiver)| {
-                receiver
-                    .recv_timeout(std::time::Duration::from_secs(1))
-                    .ok()
-            })
-        });
-        if let Some(done) = done {
-            let _ = install_t2_completion(done);
-            poll_t2_completions();
-        }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while (T2_QUEUED.with(|queued| !queued.borrow().is_empty()) || background_t1::pending_any())
+        && std::time::Instant::now() < deadline {
+        compiler_wait_tick();
+        poll_t2_completions();
     }
 }
 
 fn wait_for_t2(sym: u32) -> Option<Rc<NativeCode>> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
+        poll_t2_completions();
         if let Some(nc) = NATIVE_REGISTRY.with(|r| r.borrow().get(&sym).cloned()) {
-            if nc.is_t2 {
-                return Some(nc);
-            }
+            if nc.is_t2 { return Some(nc); }
         }
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            return None;
-        }
-        let done = T2_COMPLETIONS.with(|slot| {
-            slot.borrow()
-                .as_ref()
-                .and_then(|(_, receiver)| receiver.recv_timeout(remaining).ok())
-        })?;
-        let installed_sym = done.sym;
-        let installed = install_t2_completion(done);
-        if installed_sym == sym && installed.is_none() {
-            return None;
-        }
+        if !T2_QUEUED.with(|queued| queued.borrow().contains_key(&sym))
+            || std::time::Instant::now() >= deadline { return None; }
+        compiler_wait_tick();
+    }
+}
+
+/// Wait without preventing collection or occupying a runnable fiber's carrier.
+fn compiler_wait_tick() {
+    if egcl_rt::thread::current_fiber().is_some_and(|fiber| fiber.can_yield()) {
+        let _ = egcl_rt::thread::fiber_yield();
+    } else {
+        // No Lisp heap access, root mutation or execution-local borrow while blocked.
+        let _blocked = unsafe { egcl_rt::safepoint::NativeBlockingScope::enter() };
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+#[cfg(not(any(all(target_arch = "x86_64", target_os = "linux"), all(target_arch = "s390x", target_os = "linux"))))]
+mod background_t1 {
+    use super::*;
+    pub(super) fn poll() {}
+    pub(super) fn pending(_sym: u32) -> bool { false }
+    pub(super) fn pending_any() -> bool { false }
+    pub(super) fn request(sym: u32) -> bool { try_promote_to_t1(sym).is_some() }
+    pub(super) fn wait(sym: u32) -> Option<Rc<NativeCode>> {
+        NATIVE_REGISTRY.with(|r| r.borrow().get(&sym).cloned())
     }
 }
 
@@ -23429,26 +23575,12 @@ fn native_for_dispatch(
             T1_DECLINED.with(|s| s.borrow_mut().insert(caller_sym));
             return None;
         }
-        let Some(nc) = try_promote_to_t1(sym) else {
-            // Remember only a decline the bytecode itself forces. A profiler pin
-            // also declines here, and `profile_unpin` promises the function may
-            // tier up again — memoizing that would silently make the pin
-            // permanent (bliss-yy9m).
-            if !is_profile_pinned(sym) && !is_profile_pinned(caller_sym) {
-                T1_DECLINED.with(|s| {
-                    let mut declined = s.borrow_mut();
-                    declined.insert(sym);
-                    declined.insert(caller_sym);
-                });
-                egcl_rt::blog!(
-                    "compile",
-                    egcl_rt::log::TRACE,
-                    "[T1] {}: decline recorded at invocation {invoke_count}; later calls run T0 without tier dispatch",
-                    sym_label(caller_sym)
-                );
-            }
-            return None;
-        };
+        background_t1::request(sym);
+        let forced = matches!(forced_tier(), Some(ForcedTier::T1 | ForcedTier::T2)) || egcl_t2_forced();
+        let nc = if forced { background_t1::wait(sym) } else {
+            background_t1::poll();
+            NATIVE_REGISTRY.with(|r| r.borrow().get(&sym).cloned())
+        }?;
         // Compilation can refresh the registry after dispatch selected its
         // callable. Never run or publish the replacement on the old object.
         if nc.body.as_ref().is_none_or(|selected| !Arc::ptr_eq(selected, body)) {
@@ -23670,6 +23802,17 @@ fn note_native_deopt(sym: u32, code: Option<&NativeCode>, guard_bcp: Option<u32>
             DECAYED_EVIDENCE.with(|m| m.borrow_mut().remove(&sym));
             let fn_obj = egcl_rt::symbols::symbol_function(sym)
                 .filter(|&value| egcl_rt::function::is_interpreted_function(value));
+            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+            {
+                // T0 remains executable while the generic replacement is
+                // queued. A guard failure must not compile on the mutator.
+                if let Some(function) = fn_obj {
+                    egcl_rt::function::set_tier(function, 0);
+                }
+                background_t1::request_with_speculation(sym, false);
+                trace("stale numeric specialization retired → queued generic T1");
+            }
+            #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
             if let Some(fallback) = try_promote_to_t1_with_speculation(sym, false) {
                 publish_native(sym, fn_obj, &fallback);
                 trace("stale numeric specialization retired → generic T1");
@@ -23737,17 +23880,20 @@ fn run_native_callable(
     }
     egcl_rt::rooted!(function = function);
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    if let NativeCodeStorage::Mapped(code) = &nc._storage {
+    if let NativeCodeStorage::Mapped(_) = &nc._storage {
         egcl_rt::rooted!(args = args.to_vec());
         egcl_rt::rooted_ref!(_env = &mut *env);
-        let replacement = native_transfer_entry::refresh_installed(nc);
-        let code = replacement.as_ref().map_or(code, |native| {
-            let NativeCodeStorage::Mapped(code) = &native._storage else {
+        if let Some(replacement) = native_transfer_entry::refresh_installed(nc) {
+            let NativeCodeStorage::Mapped(code) = &replacement._storage else {
                 unreachable!()
             };
-            code
-        });
-        return code.run_callable(*function, &args, env);
+            return code.run_callable(*function, &args, env);
+        }
+        // A pending replacement is not an execution failure. Interpret this
+        // exact retained definition, including its callable's captured scope,
+        // rather than repeatedly entering the code whose guard already failed.
+        let body = Arc::clone(nc.body.as_ref().expect("mapped code retains its bytecode body"));
+        return run_with_sym(body, &args, *function, sym, env);
     }
     // The segment ABI carries exceptional exits out-of-band through its cold
     // landing path, so it does not need the legacy post-call transfer poll.
@@ -25543,6 +25689,10 @@ fn memoized_by_sym<T: Copy>(
     sym: u32,
     compute: impl FnOnce(u32) -> T,
 ) -> T {
+    // Private symbols use sparse, high-bit IDs; never size a dense cache by them.
+    if egcl_rt::symbols::is_uninterned(sym) {
+        return compute(sym);
+    }
     let i = sym as usize;
     if let Some(hit) = memo.with(|m| m.borrow().get(i).copied().flatten()) {
         return hit;
@@ -25840,6 +25990,7 @@ fn checked_native_installation_allowed() -> bool {
 /// Try to promote `sym`'s bytecode function to T1 native code (install into
 /// executable memory). Returns the installed code, or `None` if it can't be
 /// compiled to native.
+#[cfg(any(test, not(any(all(target_arch = "x86_64", target_os = "linux"), all(target_arch = "s390x", target_os = "linux")))))]
 fn try_promote_to_t1(sym: u32) -> Option<Rc<NativeCode>> {
     try_promote_to_t1_with_speculation(sym, true)
 }
@@ -25847,6 +25998,7 @@ fn try_promote_to_t1(sym: u32) -> Option<Rc<NativeCode>> {
 /// Build T1 with or without its optimistic fixnum templates. The
 /// non-speculating form is the stable native fallback while a replacement T2
 /// version is compiled for a newly observed numeric phase.
+#[cfg(any(test, not(all(target_arch = "x86_64", target_os = "linux"))))]
 fn try_promote_to_t1_with_speculation(sym: u32, allow_speculation: bool) -> Option<Rc<NativeCode>> {
     if cfg!(egcl_no_t1) {
         return None;
@@ -25925,6 +26077,20 @@ fn try_promote_to_t1_with_speculation(sym: u32, allow_speculation: bool) -> Opti
         has_deopt,
         direct_calls,
     } = emit_native_t1(&bf, allow_speculation, sym, backedge_counter, false)?;
+    install_checked_t1_artifact(sym, bf, NativeEmission {
+        env_names, code, osr_entries, bcp_offsets, has_deopt, direct_calls,
+    }, None, None)
+}
+
+#[cfg(any(test, not(all(target_arch = "x86_64", target_os = "linux"))))]
+fn install_checked_t1_artifact(
+    sym: u32,
+    bf: Arc<BytecodeFunction>,
+    emission: NativeEmission,
+    roots: Option<egcl_rt::CrossThreadRoot<T2InstalledBodies>>,
+    backedge_counter: Option<Box<std::sync::atomic::AtomicU32>>,
+) -> Option<Rc<NativeCode>> {
+    let NativeEmission { env_names, code, osr_entries, bcp_offsets, has_deopt, direct_calls } = emission;
     let num_slots = bf.num_slots();
     // Install-time GC contract (bliss-jtc.4, R4.46): a validated stack map for
     // the activation's safepoint must exist, or the code is not installed.
@@ -25943,6 +26109,7 @@ fn try_promote_to_t1_with_speculation(sym: u32, allow_speculation: bool) -> Opti
         _env_names: env_names,
         _call_cells: Vec::new(),
         _storage: NativeCodeStorage::Checked {
+            _backedge_counter: backedge_counter,
             _buffer: buf,
             _native_calls: None,
         },
@@ -25960,7 +26127,10 @@ fn try_promote_to_t1_with_speculation(sym: u32, allow_speculation: bool) -> Opti
         bcp_offsets,
         code_info,
         has_deopt,
-        t2_metadata: None,
+        t2_metadata: roots.map(|roots| Arc::new(T2InstalledMetadata {
+            speculations: Vec::new(), cold_guesses: Vec::new(), _roots: roots,
+            deopt_bodies: HashMap::new(),
+        })),
     });
     NATIVE_REGISTRY.with(|r| r.borrow_mut().insert(sym, Rc::clone(&nc)));
     Some(nc)
@@ -26043,6 +26213,13 @@ fn t2_log_write(msg: std::fmt::Arguments) {
 
 macro_rules! t2_log {
     ($($a:tt)*) => { t2_log_write(format_args!($($a)*)) };
+}
+
+fn compile_rooted_t2(input: &egcl_rt::CrossThreadRoot<T2CompileInput>) -> Option<T2Artifact> {
+    let detached = input.with_gc_stable(T2CompileInput::detach);
+    #[cfg(test)]
+    compiler_test_pause(detached.sym, true);
+    compile_t2_artifact(&detached)
 }
 
 #[cfg(egcl_no_t2)]
@@ -26172,7 +26349,9 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     // callees there: the caller would stay at T1 (bliss-6988n).
     inline_options.config.cross_function_recovery = checked_native_installation_allowed();
     for saved in &input.inline_bodies {
-        inline_options = inline_options.with_body(saved.symbol, std::sync::Arc::clone(&saved.body));
+        inline_options = if let Some(snapshot) = &saved.snapshot {
+            inline_options.with_body_snapshot(saved.symbol, snapshot)
+        } else { inline_options.with_body(saved.symbol, Arc::clone(&saved.body)) };
         for &(bcp, calls) in &saved.call_sites {
             inline_options =
                 inline_options.with_call_site_profile(saved.symbol, bcp, calls, saved.invocations);
@@ -26187,16 +26366,22 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
             | Instr::LoadEnvVar(_) | Instr::StoreEnvVar(_) | Instr::DefineEnvVar(_)
             | Instr::PushEnvChild | Instr::PopEnvChild))
     {
-        egcl_compiler::t2::build::build_for_native_scope_optimization(bf, sym)
+        if let Some(snapshot) = &input.snapshot {
+            egcl_compiler::t2::build::build_for_native_scope_optimization_snapshot(snapshot, sym)
+        } else { egcl_compiler::t2::build::build_for_native_scope_optimization(bf, sym) }
     } else if cfg!(all(target_arch = "x86_64", target_os = "linux"))
         && bf.code.iter().any(|op| matches!(op, Instr::LoadGlobal(_) | Instr::StoreGlobal(_)))
     {
         // Keep scope-free global operations available to ordinary primitive
         // lowering. The native-scope builder makes them exceptional Invokes
         // before optimization, which belong to the mapped control protocol.
-        egcl_compiler::t2::build::build_for_transfer_optimization(bf, sym)
+        if let Some(snapshot) = &input.snapshot {
+            egcl_compiler::t2::build::build_for_transfer_optimization_snapshot(snapshot, sym)
+        } else { egcl_compiler::t2::build::build_for_transfer_optimization(bf, sym) }
     } else {
-        egcl_compiler::t2::build::build_from_bytecode_with_inline_options(bf, inline_options)
+        if let Some(snapshot) = &input.snapshot {
+            egcl_compiler::t2::build::build_from_snapshot(snapshot, inline_options)
+        } else { egcl_compiler::t2::build::build_from_bytecode_with_inline_options(bf, inline_options) }
     };
     let mut f = match built {
         Ok(f) => f,
@@ -26357,13 +26542,13 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     // checked fallback emitter. Keep its immutable worker source alive too.
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     if mapped.is_some() {
-        rooted_bodies.push(Arc::clone(&input.body));
+        rooted_bodies.push(Arc::clone(input.source_body()));
     }
     if bf.code.iter().any(|instruction| matches!(instruction,
         Instr::LoadEnvVar(_) | Instr::StoreEnvVar(_))) {
         // Retain the source snapshot for lexical deoptimization metadata,
         // including when there are no heap constants.
-        rooted_bodies.push(std::sync::Arc::clone(&input.body));
+        rooted_bodies.push(std::sync::Arc::clone(input.source_body()));
     }
     // A checked-ABI closure creator bakes the address of a `nested_functions`
     // entry of THIS snapshot (see `PortableCalls::nested_bodies`), so the code
@@ -26374,9 +26559,9 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
         .any(|instruction| matches!(instruction, Instr::MakeClosure { .. }))
         && !rooted_bodies
             .iter()
-            .any(|body| std::sync::Arc::ptr_eq(body, &input.body))
+            .any(|body| std::sync::Arc::ptr_eq(body, input.source_body()))
     {
-        rooted_bodies.push(std::sync::Arc::clone(&input.body));
+        rooted_bodies.push(std::sync::Arc::clone(input.source_body()));
     }
     // The mapped emitter has not run yet, so derive constant-slot ownership
     // from its optimized IR, independently of checked emission. Include the
@@ -26395,9 +26580,12 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
         }
     }
     for slot in heap_constant_slots {
-        let owner = std::iter::once(&input.body)
-            .chain(input.inline_bodies.iter().map(|saved| &saved.body))
-            .find(|body| bytecode_body_owns_constant_slot(body, slot));
+        let owner = if input.sources.is_empty() {
+            std::iter::once(&input.body).chain(input.inline_bodies.iter().map(|saved| &saved.body))
+                .find(|body| bytecode_body_owns_constant_slot(body, slot))
+        } else {
+            input.sources.iter().find(|source| source.owns_slot(slot)).map(|source| &source.body)
+        };
         let Some(owner) = owner else {
             t2_log!("{name}: emitted heap constant has no rooted owner => stay T1");
             return None;
@@ -26416,7 +26604,9 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
                 if deopt_bodies.contains_key(&scope.function) {
                     continue;
                 }
-                let owner = if scope.function == sym {
+                let owner = if let Some(source) = input.sources.iter().find(|source| source.symbol == scope.function) {
+                    &source.body
+                } else if scope.function == sym {
                     &input.body
                 } else {
                     let Some(saved) = input
@@ -26541,11 +26731,8 @@ fn compile_checked_t2_artifact(
             // that exact Arc onto `rooted_bodies` whenever the body creates a
             // closure. The worker snapshot has its own Arc identity, so rooting
             // the installed root body instead would leave these dangling.
-            nested_bodies: bf
-                .nested_functions
-                .iter()
-                .map(|nested| std::ptr::from_ref(nested) as u64)
-                .collect(),
+            nested_bodies: input.sources.first().map(|source| source.nested_slots.clone())
+                .unwrap_or_else(|| bf.nested_functions.iter().map(|nested| std::ptr::from_ref(nested) as u64).collect()),
         },
     ) {
         Ok(fc) => fc,
@@ -26661,6 +26848,9 @@ fn bytecode_body_owns_constant_slot(body: &BytecodeFunction, slot: usize) -> boo
 /// entry stub that jumps into that header. Shares the frame/GC layout with the
 /// normal native tier (same `num_slots`/stack map).
 struct OsrCode {
+    /// Roots survive queued compilation, publication and active OSR entries.
+    _compiler_roots: Option<egcl_rt::CrossThreadRoot<T2InstalledBodies>>,
+    _backedge_counter: Option<Box<std::sync::atomic::AtomicU32>>,
     /// Name snapshots addressed by emitted environment accesses.
     _env_names: Box<NativeEnvNames>,
     /// OSR activations retain their code owner across registry invalidation.
@@ -26675,6 +26865,7 @@ struct OsrCode {
     bf: Arc<BytecodeFunction>,
 }
 
+#[cfg_attr(all(target_arch = "s390x", target_os = "linux"), allow(dead_code))]
 struct OsrCompilation {
     /// Identifies declined compilations too, without keeping retired bodies alive.
     body: std::sync::Weak<BytecodeFunction>,
@@ -26777,26 +26968,33 @@ fn osr_traps_enabled() -> bool {
 /// Compile the running activation's body, not a possibly newer definition of
 /// its name. Both successful and declined compilations are version-specific.
 fn compile_osr(sym: u32, body: &Arc<BytecodeFunction>) -> Option<Rc<OsrCode>> {
-    let cached = OSR_REGISTRY.with(|r| {
-        let registry = r.borrow();
-        let cached = registry.get(&sym)?;
-        let cached_body = cached.body.upgrade()?;
-        Arc::ptr_eq(&cached_body, body).then(|| cached.code.clone())
-    });
-    if let Some(cached) = cached {
-        return cached;
+    #[cfg(all(target_arch = "s390x", target_os = "linux"))]
+    {
+        background_osr::compile(body, sym)
     }
-    let result = compile_osr_code(body, sym);
-    OSR_REGISTRY.with(|r| {
-        r.borrow_mut().insert(
-            sym,
-            OsrCompilation {
-                body: Arc::downgrade(body),
-                code: result.clone(),
-            },
-        );
-    });
-    result
+    #[cfg(not(all(target_arch = "s390x", target_os = "linux")))]
+    {
+        let cached = OSR_REGISTRY.with(|r| {
+            let registry = r.borrow();
+            let cached = registry.get(&sym)?;
+            let cached_body = cached.body.upgrade()?;
+            Arc::ptr_eq(&cached_body, body).then(|| cached.code.clone())
+        });
+        if let Some(cached) = cached {
+            return cached;
+        }
+        let result = compile_osr_code(body, sym);
+        OSR_REGISTRY.with(|r| {
+            r.borrow_mut().insert(
+                sym,
+                OsrCompilation {
+                    body: Arc::downgrade(body),
+                    code: result.clone(),
+                },
+            );
+        });
+        result
+    }
 }
 
 /// OSR-compile an ANONYMOUS activation's loop directly from its bytecode
@@ -26805,17 +27003,25 @@ fn compile_osr(sym: u32, body: &Arc<BytecodeFunction>) -> Option<Rc<OsrCode>> {
 /// lets a hot loop in a top-level form (babel's encoding-table build) reach
 /// native, since such activations carry `sym == u32::MAX` (bliss-pohq).
 fn compile_osr_from_func(func: &Arc<BytecodeFunction>) -> Option<Rc<OsrCode>> {
-    let key = Arc::as_ptr(func) as usize;
-    if let Some(cached) = ANON_OSR_REGISTRY.with(|r| r.borrow().get(&key).cloned()) {
-        return cached;
+    #[cfg(all(target_arch = "s390x", target_os = "linux"))]
+    {
+        background_osr::compile(func, u32::MAX)
     }
-    let result = compile_osr_code(func, u32::MAX);
-    ANON_OSR_REGISTRY.with(|r| r.borrow_mut().insert(key, result.clone()));
-    result
+    #[cfg(not(all(target_arch = "s390x", target_os = "linux")))]
+    {
+        let key = Arc::as_ptr(func) as usize;
+        if let Some(cached) = ANON_OSR_REGISTRY.with(|r| r.borrow().get(&key).cloned()) {
+            return cached;
+        }
+        let result = compile_osr_code(func, u32::MAX);
+        ANON_OSR_REGISTRY.with(|r| r.borrow_mut().insert(key, result.clone()));
+        result
+    }
 }
 
 /// Emit OSR-entry native code for one bytecode function (shared by the sym-keyed
 /// and anonymous paths). `sym` is used only for perf-map / jitdump labelling.
+#[cfg(any(test, not(all(target_arch = "s390x", target_os = "linux"))))]
 fn compile_osr_code(bf: &Arc<BytecodeFunction>, sym: u32) -> Option<Rc<OsrCode>> {
     if cfg!(egcl_no_t1) {
         return None;
@@ -26854,13 +27060,23 @@ fn compile_osr_code(bf: &Arc<BytecodeFunction>, sym: u32) -> Option<Rc<OsrCode>>
     if std::env::var_os("EGCL_OSR_DEBUG").is_some() && emitted.is_none() {
         eprintln!("[osr] emit_native returned None (unsupported) for sym {sym}");
     }
+    install_osr_emission(bf, sym, emitted?, None, None)
+}
+
+fn install_osr_emission(
+    bf: &Arc<BytecodeFunction>,
+    sym: u32,
+    emission: NativeEmission,
+    roots: Option<egcl_rt::CrossThreadRoot<T2InstalledBodies>>,
+    backedge_counter: Option<Box<std::sync::atomic::AtomicU32>>,
+) -> Option<Rc<OsrCode>> {
     let NativeEmission {
         env_names,
         code,
         osr_entries: osr,
         direct_calls,
         ..
-    } = emitted?;
+    } = emission;
     if osr.is_empty() {
         if std::env::var_os("EGCL_OSR_DEBUG").is_some() {
             eprintln!("[osr] osr map empty (no loop entry) for sym {sym}");
@@ -26875,6 +27091,8 @@ fn compile_osr_code(bf: &Arc<BytecodeFunction>, sym: u32) -> Option<Rc<OsrCode>>
     maybe_write_perf_map("OSR", entry as usize, code.len(), sym);
     maybe_write_jitdump_code_load("OSR", entry as usize, &code, sym);
     Some(Rc::new(OsrCode {
+        _compiler_roots: roots,
+        _backedge_counter: backedge_counter,
         _env_names: env_names,
         _buffer: buf,
         _direct_calls: direct_calls,
@@ -27136,7 +27354,7 @@ fn decay_changed_phase_sites(body: &Arc<BytecodeFunction>, failed: &NativeCode) 
 /// activation, for generic T1 -- the numeric phase-change replacement -- and
 /// let dispatch queue a T2 version from the re-warmed profile (bliss-k51a).
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-fn retire_for_reosr(sym: u32, fn_obj: Option<EgclVal>) -> Option<Rc<NativeCode>> {
+fn retire_for_reosr(sym: u32, fn_obj: Option<EgclVal>) {
     // The failed version stays alive in the suspended activations using it.
     NATIVE_REGISTRY.with(|r| r.borrow_mut().remove(&sym));
     bump_direct_call_gen();
@@ -27145,14 +27363,12 @@ fn retire_for_reosr(sym: u32, fn_obj: Option<EgclVal>) -> Option<Rc<NativeCode>>
     PROMOTED_FRESH.with(|s| s.borrow_mut().remove(&sym));
     LAST_FAILED_SPECULATION.with(|m| m.borrow_mut().remove(&sym));
     DECAYED_EVIDENCE.with(|m| m.borrow_mut().remove(&sym));
-    let Some(generic) = try_promote_to_t1_with_speculation(sym, false) else {
-        if let Some(function) = fn_obj {
-            egcl_rt::function::set_tier(function, 0);
-        }
-        return None;
-    };
-    publish_native(sym, fn_obj, &generic);
-    Some(generic)
+    if let Some(function) = fn_obj {
+        egcl_rt::function::set_tier(function, 0);
+    }
+    // Retirement spends its budget once. Later back-edges find no installed
+    // failed version and only wait for/retry this generic request.
+    background_t1::request_with_speculation(sym, false);
 }
 
 /// Enter published mapped code at a hot loop header of a T0 activation, so a
@@ -27259,7 +27475,11 @@ fn maybe_mapped_osr(
     let awaiting = MAPPED_OSR_AWAITING_T2.with(|awaiting| awaiting.borrow().get(&key)
         .and_then(std::sync::Weak::upgrade)
         .is_some_and(|body| Arc::ptr_eq(&body, &act.func)));
-    if awaiting && egcl_rt::function::back_edge_count(fn_obj.unwrap()) % MAPPED_OSR_T2_POLL != 0 {
+    if (awaiting || background_t1::pending(owner))
+        && !matches!(forced_tier(), Some(ForcedTier::T1 | ForcedTier::T2))
+        && !egcl_t2_forced()
+        && egcl_rt::function::back_edge_count(fn_obj.unwrap()) % MAPPED_OSR_T2_POLL != 0
+    {
         return None;
     }
     let double_loop = awaiting || (0..act.func.code.len() as u32)
@@ -27311,8 +27531,10 @@ fn maybe_mapped_osr(
                     let priority = (u64::from(count) << 32)
                         | u64::from(egcl_rt::function::invoke_count(fn_obj.unwrap()));
                     if !request_t2_compilation(owner, priority) {
+                        // Queue pressure and transient preparation failures must
+                        // leave this activation eligible at its next OSR poll.
                         forget();
-                        return decline();
+                        return None;
                     }
                     if t2_log_target().is_some() {
                         t2_log_write(format_args!(
@@ -27350,18 +27572,19 @@ fn maybe_mapped_osr(
         {
             decay_changed_phase_sites(&act.func, failed);
         }
-        let generic = retire_for_reosr(owner, if owner == sym { *fn_obj } else { None });
+        retire_for_reosr(owner, if owner == sym { *fn_obj } else { None });
         if !current_definition() || !owner_current() {
             return decline();
         }
-        let Some(generic) = generic else { return decline() };
         if t2_log_target().is_some() {
             t2_log_write(format_args!(
-                "{}: loop re-warmed after a guard deopt => generic T1, re-entering by OSR at header {target_bcp} (depth {reentry})",
+                "{}: loop re-warmed after a guard deopt => awaiting generic T1 at OSR header {target_bcp} (depth {reentry})",
                 display_fn_name(&act.func.name)
             ));
         }
-        installed = Some(generic);
+        // Pending or queue pressure is temporary, not a property of this
+        // body's OSR entry. Never memoize it in MAPPED_OSR_DECLINED.
+        return None;
     }
     let native = match installed {
         Some(native) => native,
@@ -27370,10 +27593,17 @@ fn maybe_mapped_osr(
                 return decline();
             }
             // A re-entry compiles no speculation its first entry disproved.
-            let Some(native) = try_promote_to_t1_with_speculation(owner, reentry == 0) else {
-                return decline();
-            };
-            // Compilation can collect and run Lisp; publish only for the
+            // The live frame keeps interpreting while the compiler works.
+            background_t1::request_with_speculation(owner, reentry == 0);
+            let forced = matches!(forced_tier(), Some(ForcedTier::T1 | ForcedTier::T2))
+                || egcl_t2_forced();
+            let native = if forced {
+                background_t1::wait(owner)
+            } else {
+                background_t1::poll();
+                NATIVE_REGISTRY.with(|registry| registry.borrow().get(&owner).cloned())
+            }?;
+            // Snapshotting and publication can collect; enter only the
             // definition this activation is running.
             if !current_definition() || !owner_current()
                 || native.body.as_ref().is_none_or(|body| !Arc::ptr_eq(body, &act.func))
@@ -28540,6 +28770,9 @@ mod direct_call_invalidation_tests {
             .with_gc_stable(compile_t2_artifact)
             .expect("compile callee T2");
         let replacement = install_t2_completion(T2Completion {
+            panicked: false,
+            dependencies: Vec::new(),
+            _permit: None,
             sym: callee_symbol,
             generation,
             artifact: Some(artifact),
@@ -28614,6 +28847,9 @@ mod direct_call_invalidation_tests {
             .with_gc_stable(compile_t2_artifact)
             .expect("compile real replacement T2 code");
         let replacement = install_t2_completion(T2Completion {
+            panicked: false,
+            dependencies: Vec::new(),
+            _permit: None,
             sym: symbol,
             generation,
             artifact: Some(artifact),
@@ -28680,6 +28916,9 @@ mod direct_call_invalidation_tests {
         // enter mapped native code on x86-64 Linux too (#494), so every platform
         // runs this probe natively.
         let native = install_t2_completion(T2Completion {
+            panicked: false,
+            dependencies: Vec::new(),
+            _permit: None,
             sym: symbol, generation,
             artifact: Some(artifact.expect("compile lexical GC probe")), input,
         }).unwrap();
@@ -28725,6 +28964,9 @@ mod direct_call_invalidation_tests {
         // A closure body that reads and writes captured bindings is admitted
         // to mapped T2 on x86-64 Linux as well (#494).
         let native = install_t2_completion(T2Completion {
+            panicked: false,
+            dependencies: Vec::new(),
+            _permit: None,
             sym: symbol, generation,
             artifact: Some(artifact.expect("captured lexical access must compile at T2")),
             input,
@@ -29019,6 +29261,9 @@ mod direct_call_invalidation_tests {
             .expect("replace definition from another execution");
         assert!(
             install_t2_completion(T2Completion {
+            panicked: false,
+            dependencies: Vec::new(),
+            _permit: None,
                 sym: symbol,
                 generation,
                 artifact: None,
@@ -29313,6 +29558,9 @@ mod jtc4_stack_map_tests {
             let input = egcl_rt::CrossThreadRoot::new(input);
             let artifact = input.with_gc_stable(compile_t2_artifact).unwrap();
             let native = install_t2_completion(T2Completion {
+            panicked: false,
+            dependencies: Vec::new(),
+            _permit: None,
                 sym: symbol,
                 generation,
                 artifact: Some(artifact),
@@ -29602,6 +29850,7 @@ mod jtc4_stack_map_tests {
             _env_names: Box::default(),
             _call_cells: Vec::new(),
             _storage: NativeCodeStorage::Checked {
+            _backedge_counter: None,
                 _buffer: buf,
                 _native_calls: None,
             },
@@ -29674,6 +29923,7 @@ mod jtc4_stack_map_tests {
             _env_names: Box::default(),
             _call_cells: Vec::new(),
             _storage: NativeCodeStorage::Checked {
+            _backedge_counter: None,
                 _buffer: buf,
                 _native_calls: None,
             },
@@ -30041,7 +30291,8 @@ mod active_bytecode_root_tests {
         egcl_rt::rooted!(second = make_bytecode_closure(&body, None));
         let a = egcl_rt::function::name(*first).as_symbol_index();
         let b = egcl_rt::function::name(*second).as_symbol_index();
-        let old = native_for_dispatch(a, None, t1_threshold(), &body).unwrap();
+        native_for_dispatch(a, None, t1_threshold(), &body);
+        let old = background_t1::wait(a).unwrap();
         let shared = native_for_dispatch(b, None, 1, &body).unwrap();
         assert!(Rc::ptr_eq(&old, &shared));
         profile_pin(b);
@@ -30049,7 +30300,8 @@ mod active_bytecode_root_tests {
         assert!(Rc::ptr_eq(&old, &native_for_dispatch(a, None, 1, &body).unwrap()));
         profile_pin(a);
         profile_unpin(b);
-        let replacement = native_for_dispatch(b, None, t1_threshold(), &body).unwrap();
+        native_for_dispatch(b, None, t1_threshold(), &body);
+        let replacement = background_t1::wait(b).unwrap();
         assert!(!Rc::ptr_eq(&old, &replacement));
         assert!(native_for_dispatch(a, None, u32::MAX, &body).is_none());
         assert!(PROMOTED_FRESH.with(|set| set.borrow().contains(&b)));
@@ -30196,7 +30448,7 @@ mod active_bytecode_root_tests {
         // A closure body that reads captured bindings tiers up to native code
         // on x86-64 Linux as well (#494), so the hot definition is native on
         // every platform.
-        let code = NATIVE_REGISTRY.with(|registry| registry.borrow().get(&symbol).cloned())
+        let code = background_t1::wait(symbol)
             .expect("the hot captured body reaches native code");
         super::super::read_eval_all_env(
             "(let ((held 99)) (defun native-capture-version () held))", &mut env).unwrap();

@@ -3198,7 +3198,7 @@ impl<'a> Builder<'a> {
                 else {
                     return Ok(false);
                 };
-                match type_name.rsplit(':').next().unwrap_or(&type_name) {
+                match type_name.rsplit(':').next().unwrap_or(type_name) {
                     "FIXNUM" => Some(TypeBits::FIXNUM),
                     // (TYPEP x 'CONS) is the same unsound tag test as CONSP
                     // above -- a closure would answer T.  See bliss-74rl.

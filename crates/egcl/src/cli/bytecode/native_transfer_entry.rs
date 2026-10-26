@@ -574,25 +574,31 @@ pub(super) fn refresh_installed(expected: &NativeCode) -> Option<Rc<NativeCode>>
         return None;
     }
     egcl_rt::rooted!(function = function);
-    // Ordinary T2 versions retire to an honest non-speculating mapped baseline.
-    // The next dispatch can queue optimized worker compilation again; this
-    // local baseline frontend must not replace it under a T2 tier label.
-    let replacement = TransferCode::compile_variant(
-        Arc::clone(&body),
-        !expected.is_t2,
-        !expected.is_t2,
-        Some(symbol),
-    )
-    .or_else(|| {
-        TransferCode::compile_variant(Arc::clone(&body), false, !expected.is_t2, Some(symbol))
-    })?;
-    // Compilation can collect and reenter runtime services. Never let a stale
-    // invocation replace code published for a newer version or callable.
-    if !current() || callable() != *function {
+    // Retire only the exact current publication. Its running activations keep
+    // their owner, while subsequent calls execute T0 until replacement arrives.
+    NATIVE_REGISTRY.with(|registry| registry.borrow_mut().remove(&symbol));
+    bump_direct_call_gen();
+    if let Some(function) = *function {
+        egcl_rt::function::set_tier(function, 0);
+    }
+    // A T2 guard failure falls back to non-speculating T1; a T1 refresh may
+    // use its newer profile. The broker rejects superseded compilation tickets.
+    background_t1::request_with_speculation(symbol, !expected.is_t2);
+    let forced = matches!(forced_tier(), Some(ForcedTier::T1 | ForcedTier::T2))
+        || egcl_t2_forced();
+    let replacement = if forced {
+        background_t1::wait(symbol)
+    } else {
+        background_t1::poll();
+        NATIVE_REGISTRY.with(|registry| registry.borrow().get(&symbol).cloned())
+    }?;
+    // A stale caller must still interpret its original body if the definition
+    // changed while preparation or cooperative waiting ran runtime services.
+    if replacement.body.as_ref().is_none_or(|current| !Arc::ptr_eq(current, &body))
+        || callable() != *function
+    {
         return None;
     }
-    let replacement = install_baseline_code(symbol, replacement)?;
-    publish_native(symbol, *function, &replacement);
     Some(replacement)
 }
 

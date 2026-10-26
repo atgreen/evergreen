@@ -479,6 +479,8 @@ fn exercise_cleanup_osr_entry(case: CleanupCase, nested_child: bool) {
         "real worker numeric speculation, not relabeled baseline code"
     );
     let next = install_t2_completion(T2Completion {
+                    panicked: false,
+                    _permit: None, dependencies: Vec::new(),
         sym: symbol,
         generation,
         artifact: Some(artifact),

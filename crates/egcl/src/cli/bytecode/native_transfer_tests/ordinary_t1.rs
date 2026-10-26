@@ -105,6 +105,7 @@ fn ordinary_t1_keeps_arithmetic_guards_and_register_recursion() {
     registry_put(symbol, Arc::clone(&body));
     egcl_rt::rooted!(function = egcl_rt::symbols::symbol_function(symbol).unwrap());
     let code = native_for_dispatch(symbol, Some(*function), t1_threshold(), &body)
+        .or_else(|| background_t1::wait(symbol))
         .expect("normal dispatch must publish T1");
     assert!(matches!(code._storage, NativeCodeStorage::Mapped(_)));
     assert!(!code.is_t2);

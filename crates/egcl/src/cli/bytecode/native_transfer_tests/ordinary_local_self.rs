@@ -64,6 +64,8 @@ fn ordinary_labels_self_cold_retains_real_local_callable() {
     let input = egcl_rt::CrossThreadRoot::new(input);
     let artifact = input.with_gc_stable_mutator(compile_t2_artifact).expect("local T2 artifact");
     let local_code = install_t2_completion(T2Completion {
+                    panicked: false,
+                    _permit: None, dependencies: Vec::new(),
         sym: local_symbol, generation, artifact: Some(artifact), input,
     }).expect("local ordinary T2 installation");
     let NativeCodeStorage::Mapped(owner) = &local_code._storage else { panic!("local native owner") };

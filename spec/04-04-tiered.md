@@ -5,11 +5,14 @@ the HotSpot JVM's interpreter → C1 → C2 pipeline.  This section specifies
 each tier's internal mechanics, the decision logic for tier transitions, the
 compilation queues, and the interaction with the profiling subsystem (§4.9).
 
-**Implementation status.** The worker lifecycle below is the target design.
-`bliss-ifnlh` tracks asynchronous T1 and `bliss-hrvj9` tracks removing
-compilation-length GC exclusion. This specification does not claim that these
-gaps are implemented or tested; existing coverage must be audited against the
-new contracts.
+**Implementation status.** `bliss-ifnlh` implements asynchronous T1 and OSR
+on x86-64 Linux and s390x Linux; `bliss-hrvj9` isolates T2 compilation from
+moving GC using immutable bytecode/constant snapshots. Managed preparation
+and publication remain on the owner. Ports of the remaining T1 backends are
+tracked by `bliss-rxs9j`. Invalidation of already-published inlined callees remains
+tracked by `bliss-9w03d`; rejecting a pending stale result does not solve that
+separate lifetime problem. Existing coverage debt remains explicit; these
+changes do not assert complete cross-platform coverage or advance the build stage.
 
 ---
 
@@ -497,8 +500,10 @@ A generation distinguishes redefinitions even when the name or owner is reused.
 
 ### 4.4.6.2  Queue Implementation
 
-Each tier uses a bounded maximum-priority queue with a short-held mutex and
-condition variable, default capacity 64, and a drop counter. Workers release
+Each tier uses a bounded queue with a short-held mutex and condition variable,
+default capacity 64, and a drop counter. T1 uses FIFO order for prompt baseline
+availability; T2 selects the hottest queued request. Checked OSR has a separate
+FIFO worker on s390x. Workers release
 the queue lock before compiling. Completed artifacts also require bounded
 retention so a stalled owner cannot grow memory without limit.
 
@@ -590,8 +595,9 @@ hold the queue mutex only during enqueue/dequeue (microseconds).
 | `EGCL_T1_T2_THRESHOLD` | 4 096 | Invocation count to trigger T2 compilation |
 | `EGCL_LOOP_HEAT_THRESHOLD` | 10 000 | Back-edge count to trigger T2 compilation |
 | `EGCL_DISABLE_T2` | unset | Set to a true value to keep hot functions at T1 for debugging/differential testing |
-| `EGCL_T2_THREADS` | 2 | Number of T2 workers (T1 has a separate worker) |
-| `EGCL_COMPILE_QUEUE_SIZE` | 64 | Maximum queued entries per tier |
+| `EGCL_T1_THREADS` | 1 | Number of dedicated T1 workers |
+| `EGCL_T2_THREADS` | 2 | Number of dedicated T2 workers |
+| `EGCL_COMPILE_QUEUE_SIZE` | 64 | Maximum outstanding jobs per queue, including running jobs and unconsumed completions |
 | `EGCL_INLINE_LIMIT` | 30 | Maximum IR node count for inlining in T2 |
 | `EGCL_T2_NODE_BUDGET` | 500 | Maximum IR nodes per function post-inlining |
 | `EGCL_MAX_STACK_DEPTH` | 65 536 | Maximum ValueStack slots per green thread (overflow signals `STORAGE-CONDITION`) |

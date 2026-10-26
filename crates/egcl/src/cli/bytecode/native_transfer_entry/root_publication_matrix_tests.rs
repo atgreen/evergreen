@@ -512,6 +512,8 @@ fn native_private_root_survives_real_callee_osr() {
         .with_gc_stable_mutator(compile_t2_artifact)
         .expect("ordinary worker artifact");
     let next = install_t2_completion(T2Completion {
+                    panicked: false,
+                    _permit: None, dependencies: Vec::new(),
         sym: symbol,
         generation,
         artifact: Some(artifact),

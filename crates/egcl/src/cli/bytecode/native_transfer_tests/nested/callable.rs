@@ -262,6 +262,7 @@ fn native_v2_apply_releases_arguments_before_parent_continues() {
             t1_threshold(),
             &typed_body
         )
+        .or_else(|| background_t1::wait(typed_symbol))
         .is_some()
     );
     egcl_rt::rooted!(

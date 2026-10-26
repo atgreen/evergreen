@@ -387,6 +387,8 @@ mod tests {
             let artifact = input.with_gc_stable(compile_t2_artifact).unwrap();
             codes.push(
                 install_t2_completion(T2Completion {
+                    panicked: false,
+                    _permit: None, dependencies: Vec::new(),
                     sym: symbol,
                     generation,
                     artifact: Some(artifact),

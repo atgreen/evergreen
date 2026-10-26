@@ -53,8 +53,11 @@ fn restored_callable_dispatch_preserves_multiple_values() {
       (defun image-callable (x) (values (+ x 1) :old))
       (defvar *image-callable* #'image-callable)
       (defun image-invoke (f x) (funcall f x))
-      (dotimes (i 40)
-        (assert (equal '(42 :old) (multiple-value-list (image-invoke *image-callable* 41)))))
+      ;; Promotion is asynchronous; observe publication before saving/listing.
+      (dotimes (i 100)
+        (assert (equal '(42 :old) (multiple-value-list (image-invoke *image-callable* 41))))
+        (when (= (egcl-ext:function-tier 'image-invoke) 2) (return)))
+      (assert (= (egcl-ext:function-tier 'image-invoke) 2))
       (format t "CALLABLE-SAVE-OK~%")
       (save-lisp-and-die "{filename}")
     "#
@@ -66,8 +69,11 @@ fn restored_callable_dispatch_preserves_multiple_values() {
             filename,
             "--eval",
             r#"
-      (dotimes (i 40)
-        (assert (equal '(42 :old) (multiple-value-list (image-invoke *image-callable* 41)))))
+      ;; Promotion is asynchronous; observe publication before saving/listing.
+      (dotimes (i 100)
+        (assert (equal '(42 :old) (multiple-value-list (image-invoke *image-callable* 41))))
+        (when (= (egcl-ext:function-tier 'image-invoke) 2) (return)))
+      (assert (= (egcl-ext:function-tier 'image-invoke) 2))
       (disassemble #'image-invoke)
       (format t "CALLABLE-RESTORE-OK~%")
     "#,
