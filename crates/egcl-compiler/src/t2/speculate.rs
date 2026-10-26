@@ -2005,7 +2005,7 @@ fn rewrite_dominated_uses(
 mod tests {
     use super::*;
     use crate::t2::frame_state::{FrameScope, FrameState};
-    use crate::t2::ir::{InstData, ValueRepresentation};
+    use crate::t2::ir::ValueRepresentation;
 
     // Build `(* a b)`: two params, a Call to `*` carrying a FrameState at bcp 2,
     // then a Return of the result. Returns (function, the call Inst).
@@ -2069,6 +2069,7 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn integer_builtins_require_canonical_identity_and_preserve_observed_tuples() {
+        use crate::t2::ir::InstData;
         for (name, opcode) in [
             ("MIN", Opcode::FixnumMin),
             ("MAX", Opcode::FixnumMax),
