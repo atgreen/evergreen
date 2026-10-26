@@ -1204,8 +1204,8 @@ fn resolve(name: &str) -> Option<Handler> {
         // Boot MAKE-ARRAY's common case: LENGTH elements (a bare integer or
         // proper rank-one dimension list), no options but
         // :ELEMENT-TYPE and either :INITIAL-ELEMENT or :INITIAL-CONTENTS, and
-        // an element type that upgrades to T -- which is a simple vector. NIL
-        // means another case, which boot parses in full.
+        // an element type that upgrades to T or packed U8. NIL means another
+        // case, which boot parses in full.
         "EGCL::%MAKE-SIMPLE-ARRAY" => Some(|_operator, args, env| {
             env.clear_mv();
             // Resolving a symbol can allocate, so do it before reading ARGS.
@@ -1261,14 +1261,21 @@ fn resolve(name: &str) -> Option<Handler> {
                 }
                 rest = next;
             }
-            if element_type.is_some_and(|v| upgrade_elt(v) == EltU::U8) {
-                return Ok(NIL);
-            }
-            let Some(default) = types.default_element(element_type.unwrap_or(T)) else {
-                return Ok(NIL);
+            let packed_u8 = element_type.is_some_and(|v| upgrade_elt(v) == EltU::U8);
+            let default = if packed_u8 {
+                EgclVal::from_fixnum(0)
+            } else {
+                let Some(default) = types.default_element(element_type.unwrap_or(T)) else {
+                    return Ok(NIL);
+                };
+                default
             };
             let length = length.as_fixnum() as usize;
             let Some(contents) = initial_contents else {
+                if packed_u8 {
+                    let fill = egcl_stdlib::sequences::u8_value(initial_element.unwrap_or(default))?;
+                    return egcl_rt::packed_u8::make(length, fill);
+                }
                 return Ok(egcl_stdlib::build_filled_simple_vector(
                     length,
                     initial_element.unwrap_or(default),
@@ -1280,7 +1287,11 @@ fn resolve(name: &str) -> Option<Handler> {
                 return Ok(NIL);
             }
             egcl_rt::rooted!(contents = contents);
-            egcl_rt::rooted!(vector = egcl_stdlib::build_filled_simple_vector(length, NIL));
+            egcl_rt::rooted!(vector = if packed_u8 {
+                egcl_rt::packed_u8::make(length, 0)?
+            } else {
+                egcl_stdlib::build_filled_simple_vector(length, NIL)
+            });
             if contents.is_cons() {
                 // Walk a list once; ELT on it would rescan from the head.
                 let mut rest = *contents;
