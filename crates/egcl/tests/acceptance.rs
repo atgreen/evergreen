@@ -3395,6 +3395,60 @@ fn typep_heap_numerics_and_complex_introspection() {
     }
 }
 
+/// TYPE-OF answers a type that SUBTYPEP places under every type the object
+/// belongs to (ansi type-of.1): a character's is STANDARD-CHAR, BASE-CHAR or
+/// EXTENDED-CHAR rather than CHARACTER, and a one-dimensional array type such
+/// as a string's (SIMPLE-ARRAY CHARACTER (n)) is a VECTOR and a SEQUENCE.
+#[test]
+fn type_of_agrees_with_subtypep_for_characters_and_strings() {
+    let cases = [
+        ("(type-of #\\a)", "STANDARD-CHAR"),
+        ("(type-of #\\Rubout)", "BASE-CHAR"),
+        ("(type-of (code-char 955))", "EXTENDED-CHAR"),
+        ("(subtypep (type-of #\\a) 'base-char)", "T"),
+        ("(subtypep (type-of (make-string 2 :initial-element (code-char 955))) 'sequence)", "T"),
+        ("(subtypep '(simple-array character (3)) 'vector)", "T"),
+        ("(subtypep '(array t (*)) 'sequence)", "T"),
+        ("(subtypep '(simple-array t (2 3)) 'sequence)", "NIL"),
+        ("(subtypep '(simple-array character (3)) 'simple-array)", "T"),
+        // Built-in objects answer their class's name, a generic function its
+        // class, a structure type is an ATOM, and only a simple vector is a
+        // SIMPLE-ARRAY (ansi type-of.1/.4).
+        ("(type-of (find-package :cl))", "PACKAGE"),
+        ("(type-of (make-hash-table))", "HASH-TABLE"),
+        ("(type-of (make-string-output-stream))", "STRING-STREAM"),
+        ("(progn (defgeneric tos-gf (x)) (type-of #'tos-gf))", "STANDARD-GENERIC-FUNCTION"),
+        ("(progn (defstruct tos-s a) (multiple-value-list (subtypep 'tos-s 'atom)))", "(T T)"),
+        ("(typep (make-array 2 :adjustable t) 'simple-array)", "NIL"),
+        ("(typep (make-array 2) 'simple-array)", "T"),
+        ("(typep (make-array 2 :adjustable t) 'array)", "T"),
+        ("(type-of (make-random-state))", "RANDOM-STATE"),
+        ("(type-of #'car)", "COMPILED-FUNCTION"),
+        (
+            "(progn (defgeneric tos-gf2 (x)) (defmethod tos-gf2 ((x integer)) x) \
+               (type-of (find-method #'tos-gf2 nil (list (find-class 'integer)))))",
+            "STANDARD-METHOD",
+        ),
+    ];
+    for (expr, expected) in cases {
+        let out = egcl_bin()
+            .args(["--eval", &format!("(print {expr})")])
+            .output()
+            .expect("run egcl");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout
+            .lines()
+            .map(|l| l.trim())
+            .find(|l| !l.is_empty())
+            .unwrap_or("");
+        assert_eq!(
+            got, expected,
+            "{expr} => expected {expected}, got: {got} (stderr: {})",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
 /// EXPT of a negative real to a non-integer power, or of a complex base, returns
 /// a complex (real `powf` returned NaN, and a complex base errored). Integer
 /// powers of a complex base are exact via repeated multiplication.
@@ -8041,10 +8095,11 @@ fn cl_ppcre_matcher_regressions() {
         ("(progn (defun ftest (x) x) (functionp #'ftest))", "T"),
         (
             "(progn (defun ftest2 (x) x) (type-of #'ftest2))",
-            "FUNCTION",
+            "COMPILED-FUNCTION",
         ),
         ("(typep (lambda (x) x) 'function)", "T"),
-        ("(type-of (lambda (x) x))", "FUNCTION"),
+        // TYPEP calls it a COMPILED-FUNCTION, so TYPE-OF does too (as SBCL).
+        ("(type-of (lambda (x) x))", "COMPILED-FUNCTION"),
         (
             "(let ((f (lambda (x) x))) (list (atom f) (consp f) (listp f) (typep f 'atom) (typep f 'cons) (typep f 'list)))",
             "(T NIL NIL T NIL NIL)",

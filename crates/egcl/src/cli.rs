@@ -18706,9 +18706,28 @@ fn subtypep_relation(t1: EgclVal, t2: EgclVal) -> (bool, bool) {
             other => other,
         };
         if !t2.is_cons() {
+            // A one-dimensional ARRAY or SIMPLE-ARRAY type is also a VECTOR,
+            // and so a SEQUENCE: TYPE-OF of a string is (SIMPLE-ARRAY
+            // CHARACTER (n)) (ansi type-of.1). Decided before RESOLVE-SYM,
+            // which can allocate while T1 is held only here.
+            let rank_one = matches!(base, "ARRAY" | "SIMPLE-ARRAY")
+                && parse_arr_type(t1).is_some_and(|a| match a.dims {
+                    Dims::Rank(n) => n == 1,
+                    Dims::List(ref axes) => axes.len() == 1,
+                    Dims::Star => false,
+                });
             // Compare the narrowed base atom against the atomic supertype.
             if let Some(base_sym) = resolve_sym(base) {
-                return subtypep_relation(base_sym, t2);
+                let narrowed = subtypep_relation(base_sym, t2);
+                if !narrowed.0 && rank_one {
+                    if let Some(vector) = resolve_sym("VECTOR") {
+                        let as_vector = subtypep_relation(vector, t2);
+                        if as_vector.0 {
+                            return as_vector;
+                        }
+                    }
+                }
+                return narrowed;
             }
             return (false, false);
         }
@@ -18745,6 +18764,10 @@ fn subtypep_relation(t1: EgclVal, t2: EgclVal) -> (bool, bool) {
     let t1_struct = is_structure_type_name(t1);
     let t2_struct = is_structure_type_name(t2);
     if t1_struct {
+        // A structure instance is an atom (ansi type-of.1 over *universe*).
+        if n2.as_ref() == "ATOM" {
+            return (true, true);
+        }
         if n2.as_ref() == "STRUCTURE-OBJECT" {
             return (true, true);
         }
@@ -21955,6 +21978,21 @@ fn type_of_value(v: EgclVal) -> Result<EgclVal, EgclError> {
         ];
         return Ok(vec_to_list(&spec));
     }
+    // A character's most specific recognizable type: STANDARD-CHAR
+    // for the 96 standard characters, BASE-CHAR for the other base
+    // characters, EXTENDED-CHAR for the rest -- each a subtype of every
+    // character type that holds it, which CHARACTER is not (ansi
+    // type-of.1). The same predicates TYPEP uses decide it.
+    if v.is_character() {
+        let name = if is_standard_char_value(v) {
+            "STANDARD-CHAR"
+        } else if is_base_char_value(v) {
+            "BASE-CHAR"
+        } else {
+            "EXTENDED-CHAR"
+        };
+        return Ok(resolve_sym(name).unwrap_or(NIL));
+    }
     // CLHS TYPE-OF: the most specific recognizable type. 0 and 1
     // are BITs, other non-negative fixnums (INTEGER 0 mpf), bignums
     // the open ranges beyond the fixnums (ansi type-of.1/4).
@@ -22043,6 +22081,18 @@ fn type_of_value(v: EgclVal) -> Result<EgclVal, EgclError> {
             ])
         });
     }
+    // A generic function's class is STANDARD-GENERIC-FUNCTION, and TYPE-OF
+    // must answer a type under it (ansi type-of.4); FUNCTION is not. The
+    // same two tests CLASS-OF uses, since a generic function reaches here in
+    // more than one representation.
+    if egcl_stdlib::clos::is_generic_function_object(v) || is_generic_function_value(v) {
+        return Ok(resolve_sym("STANDARD-GENERIC-FUNCTION").unwrap_or(NIL));
+    }
+    // A method object is a STANDARD-METHOD, as CLASS-OF answers (ansi
+    // type-of.4); it is a meta handle that nothing below recognizes.
+    if egcl_stdlib::clos::is_method_object(v) {
+        return Ok(resolve_sym("STANDARD-METHOD").unwrap_or(NIL));
+    }
     let type_name = if v.is_nil() {
         "NULL"
     } else if v == T {
@@ -22065,9 +22115,15 @@ fn type_of_value(v: EgclVal) -> Result<EgclVal, EgclError> {
         // A function value — a real function object or an interpreter
         // closure (represented as a `(EGCL::CLOSURE . id)` cons). This
         // must precede the `is_cons` check so a closure's TYPE-OF is
-        // FUNCTION, not CONS, and CLOS dispatch on the FUNCTION class
-        // recognises it (bliss-5ir; cl-ppcre passes scanners as funcs).
-        "FUNCTION"
+        // a function type, not CONS, and CLOS dispatch on the FUNCTION
+        // class recognises it (bliss-5ir; cl-ppcre passes scanners as
+        // funcs). TYPEP calls every such value a COMPILED-FUNCTION, so
+        // TYPE-OF answers that (ansi type-of.1); SBCL does the same.
+        "COMPILED-FUNCTION"
+    } else if is_random_state_value(v) {
+        // Represented as a cons, but its type is RANDOM-STATE, as CLASS-OF
+        // already answers; this must precede the `is_cons` check.
+        "RANDOM-STATE"
     } else if v.is_cons() {
         "CONS"
     } else if is_string_value(v) {
@@ -22077,6 +22133,13 @@ fn type_of_value(v: EgclVal) -> Result<EgclVal, EgclError> {
     } else if egcl_stdlib::pathnames::is_pathname(v) {
         "PATHNAME"
     } else {
+        // A package, hash table, stream, readtable or other built-in object
+        // answers its class's name, so SUBTYPEP places the answer under that
+        // class (ansi type-of.1/.4); T only when the class itself is T.
+        let class_name = egcl_stdlib::class_name(egcl_stdlib::class_of(v));
+        if class_name.is_symbol() && class_name != T && !class_name.is_nil() {
+            return Ok(class_name);
+        }
         "T"
     };
     match resolve_sym(type_name) {
