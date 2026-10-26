@@ -7,6 +7,9 @@ use std::cell::Cell;
 #[path = "ordinary_t2_poll_latency.rs"]
 mod poll_latency;
 
+#[path = "ordinary_array_constructor_relocation.rs"]
+mod array_constructor_relocation;
+
 thread_local! {
     // An address for comparison only: this deliberately is not a GC root.
     static ALLOCATED_ROOT: Cell<u64> = const { Cell::new(0) };
