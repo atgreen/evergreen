@@ -18,6 +18,11 @@
 
 ### Performance
 
+- Common `MAKE-ARRAY` calls can use a collecting native adapter that checks
+  mutable unsigned-byte-8 type descriptors at runtime and allocates through the
+  existing stdlib constructor, preserving general fallback and `NOTINLINE` calls
+  ([#691](https://github.com/atgreen/evergreen/pull/691)).
+
 - Simple array construction accepts proper rank-one dimension lists in its native
   fast path while preserving option handling and numeric initialization
   ([#686](https://github.com/atgreen/evergreen/pull/686)).
