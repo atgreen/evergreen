@@ -295,12 +295,43 @@ pub struct InlineOptions {
     constant_snapshots: HashMap<usize, Arc<super::constants::ConstantPoolSnapshot>>,
     call_sites: HashMap<(u32, u32), CallSiteProfile>,
     root_symbol: Option<u32>,
+    // Owner-captured established DEFCONSTANT fixnums. No worker heap reads.
+    constant_globals: HashMap<u32, i64>,
+    constant_global_owner: Option<u32>,
 }
 
 impl InlineOptions {
     pub fn with_policy(mut self, bcp: u32, policy: InlinePolicy) -> Self {
         self.policies.insert(bcp, policy);
         self
+    }
+
+    /// Attach immutable facts captured by the compilation owner: each symbol
+    /// is an established, bound DEFCONSTANT whose value is this fixnum. The
+    /// caller must exclude special/dynamically bound references. This map is
+    /// scoped to the root body; it must not leak into an inlined callee.
+    pub fn with_constant_globals(mut self, values: HashMap<u32, i64>) -> Self {
+        self.constant_globals = values;
+        self.constant_global_owner = self.root_symbol;
+        self
+    }
+
+    /// Transfer builders historically ignore body-inlining options. Preserve
+    /// that boundary while carrying immutable constant metadata to workers.
+    pub(crate) fn constant_globals_only(self, root: u32) -> Self {
+        Self {
+            root_symbol: Some(root),
+            constant_globals: self.constant_globals,
+            constant_global_owner: self.constant_global_owner,
+            constant_snapshots: self.constant_snapshots,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn constant_global(&self, body_symbol: u32, symbol: u32) -> Option<i64> {
+        (self.constant_global_owner == Some(body_symbol))
+            .then(|| self.constant_globals.get(&symbol).copied())
+            .flatten()
     }
 
     pub fn policy_at(&self, bcp: u32) -> InlinePolicy {
@@ -538,6 +569,26 @@ mod tests {
             .iter()
             .find(|m| m.function == KnownFunction::Eq)
             .unwrap()
+    }
+
+    #[test]
+    fn transfer_options_keep_only_constant_facts_and_safe_snapshots() {
+        let root = 17;
+        let source = saved_body(vec![Instr::LoadLocal(0), Instr::Return]);
+        let snapshot = super::super::constants::BytecodeSnapshot::capture(&source);
+        let mut options = InlineOptions::default().with_root_symbol(root)
+            .with_constant_globals(HashMap::from([(42, 5)]))
+            .with_body_snapshot(99, &snapshot)
+            .with_policy(3, InlinePolicy::NotInline)
+            .with_call_site_profile(root, 3, 100, 100);
+        options.config.node_budget = 0;
+        let filtered = options.constant_globals_only(root);
+        assert_eq!(filtered.constant_global(root, 42), Some(5));
+        assert_eq!(filtered.config, InlineConfig::default());
+        assert!(filtered.bodies.is_empty());
+        assert!(filtered.policies.is_empty());
+        assert!(filtered.call_sites.is_empty());
+        assert_eq!(filtered.constant_snapshots.len(), 1);
     }
 
     #[test]

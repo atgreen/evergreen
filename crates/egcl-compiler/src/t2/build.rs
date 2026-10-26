@@ -172,25 +172,30 @@ pub fn build_for_transfer_optimization_snapshot(
     snapshot: &super::constants::BytecodeSnapshot,
     symbol: u32,
 ) -> Result<Function, BuildError> {
-    let options = InlineOptions::default()
-        .with_root_symbol(symbol)
-        .with_constant_snapshot(snapshot);
-    let mut builder = Builder::new(&snapshot.body, options);
-    builder.transfer_mode = true;
-    builder.run()
+    build_for_transfer_optimization_snapshot_with_inline_options(snapshot, symbol, InlineOptions::default())
+}
+
+pub fn build_for_transfer_optimization_snapshot_with_inline_options(
+    snapshot: &super::constants::BytecodeSnapshot,
+    symbol: u32,
+    options: InlineOptions,
+) -> Result<Function, BuildError> {
+    build_for_transfer_optimization_with_inline_options(&snapshot.body, symbol, options.with_constant_snapshot(snapshot))
 }
 
 pub fn build_for_native_scope_optimization_snapshot(
     snapshot: &super::constants::BytecodeSnapshot,
     symbol: u32,
 ) -> Result<Function, BuildError> {
-    let options = InlineOptions::default()
-        .with_root_symbol(symbol)
-        .with_constant_snapshot(snapshot);
-    let mut builder = Builder::new(&snapshot.body, options);
-    builder.transfer_mode = true;
-    builder.native_cleanups = true;
-    builder.run()
+    build_for_native_scope_optimization_snapshot_with_inline_options(snapshot, symbol, InlineOptions::default())
+}
+
+pub fn build_for_native_scope_optimization_snapshot_with_inline_options(
+    snapshot: &super::constants::BytecodeSnapshot,
+    symbol: u32,
+    options: InlineOptions,
+) -> Result<Function, BuildError> {
+    build_for_native_scope_optimization_with_inline_options(&snapshot.body, symbol, options.with_constant_snapshot(snapshot))
 }
 
 pub fn build_from_bytecode_for_native_cleanups_snapshot(
@@ -249,7 +254,15 @@ pub fn build_for_transfer_optimization(
     bf: &BytecodeFunction,
     symbol: u32,
 ) -> Result<Function, BuildError> {
-    let mut builder = Builder::new(bf, InlineOptions::default().with_root_symbol(symbol));
+    build_for_transfer_optimization_with_inline_options(bf, symbol, InlineOptions::default())
+}
+
+pub fn build_for_transfer_optimization_with_inline_options(
+    bf: &BytecodeFunction,
+    symbol: u32,
+    options: InlineOptions,
+) -> Result<Function, BuildError> {
+    let mut builder = Builder::new(bf, options.constant_globals_only(symbol));
     builder.transfer_mode = true;
     builder.run()
 }
@@ -260,7 +273,15 @@ pub fn build_for_native_scope_optimization(
     bf: &BytecodeFunction,
     symbol: u32,
 ) -> Result<Function, BuildError> {
-    let mut builder = Builder::new(bf, InlineOptions::default().with_root_symbol(symbol));
+    build_for_native_scope_optimization_with_inline_options(bf, symbol, InlineOptions::default())
+}
+
+pub fn build_for_native_scope_optimization_with_inline_options(
+    bf: &BytecodeFunction,
+    symbol: u32,
+    options: InlineOptions,
+) -> Result<Function, BuildError> {
+    let mut builder = Builder::new(bf, options.constant_globals_only(symbol));
     builder.transfer_mode = true;
     builder.native_cleanups = true;
     builder.run()
@@ -652,7 +673,8 @@ impl<'a> Builder<'a> {
         match self.bf.code.get(bcp)? {
             Instr::BindSpecial(_) => Some(AuxData::SpecialBinding { bcp: bcp as u32, enter: true }),
             Instr::UnbindSpecial(_) => Some(AuxData::SpecialBinding { bcp: bcp as u32, enter: false }),
-            Instr::LoadGlobal(symbol) => Some(AuxData::GlobalValue { symbol: *symbol, store: false }),
+            Instr::LoadGlobal(symbol) if self.inline_options.constant_global(self.root_symbol, *symbol).is_none()
+                => Some(AuxData::GlobalValue { symbol: *symbol, store: false }),
             Instr::StoreGlobal(symbol) => Some(AuxData::GlobalValue { symbol: *symbol, store: true }),
             // Captured variables live in the activation's heap EnvFrame, which
             // only the runtime owns; it decodes the instruction at this PC.
@@ -1973,6 +1995,13 @@ impl<'a> Builder<'a> {
                     }
                 }
                 Instr::LoadGlobal(sym) => {
+                    if let Some(value) = self.inline_options.constant_global(self.root_symbol, *sym) {
+                        let value = self.emit(block, Opcode::ConstFixnum, vec![],
+                            AuxData::FixnumImm(value), InstFlags::default(), None,
+                            IRType::of(TypeBits::FIXNUM)).expect("constant global has a result");
+                        stack.push(value);
+                        continue;
+                    }
                     let fs = self.build_frame_state(block, &stack, i as u32);
                     let v = self.emit(
                         block,
@@ -3809,6 +3838,67 @@ mod tests {
 
     fn has_opcode(f: &Function, b: Block, op: Opcode) -> bool {
         f.block(b).insts.iter().any(|&i| f.inst(i).opcode == op)
+    }
+
+    #[test]
+    fn captured_constant_globals_fold_cached_bytecode_without_worker_cell_reads() {
+        let root = egcl_rt::symbols::intern("T2-CACHED-CONSTANT-ROOT");
+        let other_root = egcl_rt::symbols::intern("T2-CACHED-CONSTANT-OTHER");
+        let constant = egcl_rt::symbols::intern("T2-CACHED-CONSTANT-GLOBAL");
+        let body = bf(
+            "T2-CACHED-CONSTANT-ROOT",
+            vec![Instr::LoadGlobal(constant), Instr::Return],
+            vec![],
+            0,
+            0,
+            1,
+        );
+        let snapshot = super::super::constants::BytecodeSnapshot::capture(&body);
+        // The supplied immutable fact, not a live symbol cell, is the proof.
+        // This test intentionally need not establish any heap/global binding.
+        let options = InlineOptions::default()
+            .with_root_symbol(root)
+            .with_constant_globals(HashMap::from([(constant, 5)]));
+        for function in [
+            build_from_bytecode_with_inline_options(&body, options.clone()),
+            build_for_transfer_optimization_snapshot_with_inline_options(&snapshot, root, options.clone()),
+            build_for_native_scope_optimization_snapshot_with_inline_options(&snapshot, root, options.clone()),
+        ] {
+            let function = function.expect("constant-aware builder");
+            let instructions: Vec<_> = function
+                .block_order()
+                .iter()
+                .flat_map(|&b| function.block(b).insts.iter().map(|&i| function.inst(i)))
+                .collect();
+            assert!(
+                instructions
+                    .iter()
+                    .any(|data| data.opcode == Opcode::ConstFixnum
+                        && matches!(data.aux, AuxData::FixnumImm(5)))
+            );
+            assert!(
+                !instructions
+                    .iter()
+                    .any(|data| data.opcode == Opcode::SymbolValue
+                        || matches!(data.aux, AuxData::GlobalValue { .. }))
+            );
+            assert!(crate::t2::verify::verify(&function).is_ok());
+        }
+        // Changing roots during body inlining must not reuse the caller's
+        // locally scoped facts. An absent capture remains an ordinary load.
+        for options in [
+            InlineOptions::default().with_root_symbol(root),
+            options.with_root_symbol(other_root),
+        ] {
+            let function = build_from_bytecode_with_inline_options(&body, options).unwrap();
+            assert!(function.block_order().iter().any(|&b| {
+                function
+                    .block(b)
+                    .insts
+                    .iter()
+                    .any(|&i| function.inst(i).opcode == Opcode::SymbolValue)
+            }));
+        }
     }
 
     #[test]

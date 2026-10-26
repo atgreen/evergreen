@@ -2519,6 +2519,12 @@ const PRIMITIVE_ALLOWLIST: &[&str] = &[
     "PACKAGE-NAME",
 ];
 
+/// Diagnostic switch read only by compilers, never by emitted references.
+fn constant_reference_folding_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("EGCL_DISABLE_CONSTANT_FOLDING").is_none())
+}
+
 /// Compiler state for lowering one function body.
 struct Lowerer<'e> {
     self_symbol: Option<u32>,
@@ -3028,7 +3034,29 @@ impl<'e> Lowerer<'e> {
             if self.env.has_symbol_macro(form.as_symbol_index()) {
                 return Err(Bail);
             }
-            self.emit(Instr::LoadGlobal(form.as_symbol_index()));
+            let symbol = form.as_symbol_index();
+            if constant_reference_folding_enabled()
+                && egcl_rt::symbols::symbol_is_constant(symbol)
+                && egcl_rt::symbols::binding_guard(symbol)
+                    == Some(egcl_rt::symbols::BINDING_GUARD_CONSTANT)
+            {
+                if let Some(value) = egcl_rt::symbols::symbol_value(symbol)
+                    .filter(|value| *value != egcl_rt::value::UNBOUND)
+                {
+                    // DEFCONSTANT permits substituting its established value.
+                    // Preserve lexical/special/symbol-macro precedence above;
+                    // a marked but unbound symbol must still signal at runtime.
+                    // No Lisp allocation occurs between reading the value and
+                    // publishing it into the rooted Lowerer's constant pool.
+                    // The ordinary bytecode/BFASL literal machinery then owns
+                    // movable values exactly as it does for explicit literals.
+                    let index = self.add_const(value);
+                    self.emit(Instr::Const(index));
+                    self.push_n(1);
+                    return Ok(());
+                }
+            }
+            self.emit(Instr::LoadGlobal(symbol));
             self.push_n(1);
             return Ok(());
         }
@@ -22237,6 +22265,8 @@ struct T2CompileInput {
     priority: u64,
     body: std::sync::Arc<BytecodeFunction>,
     type_profiles: HashMap<u32, TypeProfile>,
+    /// Immediate constant globals captured on the owner, never read by workers.
+    constant_globals: HashMap<u32, i64>,
     receiver_profiles: Vec<(String, Vec<ReceiverTypeProfileEntrySnapshot>)>,
     inline_bodies: Vec<T2BodySnapshot>,
     /// Native callees the s390x T2 emitter may enter directly, resolved here
@@ -22268,6 +22298,7 @@ impl T2CompileInput {
             body: Arc::clone(&snapshot.body), snapshot: Some(snapshot), sources,
             call_cells: self.call_cells.clone(), sym: self.sym, generation: self.generation,
             priority: self.priority, type_profiles: self.type_profiles.clone(),
+            constant_globals: self.constant_globals.clone(),
             receiver_profiles: self.receiver_profiles.clone(), inline_bodies,
             direct_natives: self.direct_natives.clone(), code_id: self.code_id,
             #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -22933,6 +22964,25 @@ fn t2_reachable_callees(
 fn snapshot_t2_input(sym: u32, priority: u64) -> Option<T2CompileInput> {
     let root = registry_get(sym)?;
     let root_ptr = Arc::as_ptr(&root) as usize;
+    // Owner-thread capture, before detached metadata reaches a compiler worker.
+    // A fixnum has no movable payload. Legal constant redefinition must be EQL;
+    // special references and active dynamic overlays keep their runtime loads.
+    let constant_globals = root.code.iter().filter(|_| constant_reference_folding_enabled()).filter_map(|instruction| {
+        let Instr::LoadGlobal(symbol) = instruction else { return None };
+        let name = egcl_rt::symbols::registry_key(*symbol)?;
+        let bare = name.rsplit(':').next().unwrap_or(&name).as_bytes();
+        // Keep this snapshot policy conservative even after bootstrap stops
+        // treating unproclaimed earmuffs as special. Proclamations themselves
+        // remain keyed by the full canonical name, never its bare spelling.
+        let earmuffed = bare.len() > 2 && bare[0] == b'*' && bare[bare.len() - 1] == b'*';
+        if earmuffed || super::is_proclaimed_special(&name)
+            || !egcl_rt::symbols::symbol_is_constant(*symbol)
+            || egcl_rt::symbols::binding_guard(*symbol)
+                != Some(egcl_rt::symbols::BINDING_GUARD_CONSTANT)
+        { return None; }
+        let value = egcl_rt::symbols::symbol_value(*symbol)?;
+        value.is_fixnum().then(|| (*symbol, value.as_fixnum()))
+    }).collect();
     let type_profiles = TYPE_PROFILE.with(|profiles| {
         profiles
             .borrow()
@@ -23061,6 +23111,7 @@ fn snapshot_t2_input(sym: u32, priority: u64) -> Option<T2CompileInput> {
         priority,
         body,
         type_profiles,
+        constant_globals,
         receiver_profiles,
         inline_bodies,
         direct_natives,
@@ -26345,8 +26396,11 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
         }
     };
 
-    let mut inline_options =
-        egcl_compiler::t2::inlining::InlineOptions::default().with_root_symbol(sym);
+    let mut inline_options = egcl_compiler::t2::inlining::InlineOptions::default()
+        .with_root_symbol(sym).with_constant_globals(input.constant_globals.clone());
+    if !input.constant_globals.is_empty() {
+        t2_log!("{name}: captured {} constant global fixnum binding(s)", input.constant_globals.len());
+    }
     // Mapped transfer (the only installable T2 where checked installation is
     // refused) reconstructs one logical frame per deopt point and declines any
     // caller holding an inlined callee's deopt point. Do not inline those
@@ -26371,8 +26425,8 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
             | Instr::PushEnvChild | Instr::PopEnvChild))
     {
         if let Some(snapshot) = &input.snapshot {
-            egcl_compiler::t2::build::build_for_native_scope_optimization_snapshot(snapshot, sym)
-        } else { egcl_compiler::t2::build::build_for_native_scope_optimization(bf, sym) }
+            egcl_compiler::t2::build::build_for_native_scope_optimization_snapshot_with_inline_options(snapshot, sym, inline_options)
+        } else { egcl_compiler::t2::build::build_for_native_scope_optimization_with_inline_options(bf, sym, inline_options) }
     } else if cfg!(all(target_arch = "x86_64", target_os = "linux"))
         && bf.code.iter().any(|op| matches!(op, Instr::LoadGlobal(_) | Instr::StoreGlobal(_)))
     {
@@ -26380,8 +26434,8 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
         // lowering. The native-scope builder makes them exceptional Invokes
         // before optimization, which belong to the mapped control protocol.
         if let Some(snapshot) = &input.snapshot {
-            egcl_compiler::t2::build::build_for_transfer_optimization_snapshot(snapshot, sym)
-        } else { egcl_compiler::t2::build::build_for_transfer_optimization(bf, sym) }
+            egcl_compiler::t2::build::build_for_transfer_optimization_snapshot_with_inline_options(snapshot, sym, inline_options)
+        } else { egcl_compiler::t2::build::build_for_transfer_optimization_with_inline_options(bf, sym, inline_options) }
     } else {
         if let Some(snapshot) = &input.snapshot {
             egcl_compiler::t2::build::build_from_snapshot(snapshot, inline_options)
