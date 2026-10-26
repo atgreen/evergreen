@@ -5,5 +5,8 @@ crates/egcl/src/cli.rs:eval_defstruct:name_sym
 crates/egcl/src/cli.rs:eval_restart_case:result
 crates/egcl/src/cli.rs:eval_tagbody:result
 crates/egcl/src/cli/bytecode.rs:c2i_eval_form_with_frame:result
-crates/egcl/src/cli/bytecode.rs:lower_flet:is_capturing
+# Pure bool; same existing finding after splitting the scoped wrapper.
+crates/egcl/src/cli/bytecode.rs:lower_flet_inner:is_capturing
+# Vec<String> parameter names contain no GC values (producer-chain false positive).
+crates/egcl/src/cli/bytecode.rs:lower_inline_local:names
 crates/egcl/src/cli/bytecode.rs:lower_function:captured

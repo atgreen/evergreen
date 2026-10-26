@@ -2537,6 +2537,8 @@ struct Lowerer<'e> {
     /// close over enclosing lexicals). Each is a closure value stored in a boxed
     /// binding of the same name; a call to it lowers to `(funcall name args…)`.
     closure_fns: std::collections::HashSet<String>,
+    /// Nonescaping expression helpers expanded in their definition-site scope.
+    inline_local_fns: HashMap<String, InlineLocal>,
     /// Lazily-built macro-expansion environment (mirrors `env`'s macros), used
     /// to compile macro forms by expanding then lowering.
     macro_env: Option<MacroexpandEnv>,
@@ -2610,6 +2612,47 @@ struct Lowerer<'e> {
     env: &'e Env,
 }
 
+/// A bounded local expression helper. The source is compile-time only; it is
+/// rooted with the Lowerer and never enters a runtime literal pool or BFASL.
+#[derive(Clone)]
+struct InlineLocal {
+    definition: EgclVal,
+    scopes: Vec<HashMap<String, VarLoc>>,
+    local_fns: HashMap<String, u32>,
+    closure_fns: std::collections::HashSet<String>,
+    declared_special: HashMap<String, u32>,
+    inline_policies: Vec<(u32, bool)>,
+}
+
+impl egcl_rt::gc::TraceHostRoots for InlineLocal {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
+        visit(&mut self.definition);
+        let mut seen = std::collections::HashSet::new();
+        for &symbol in self.local_fns.values() {
+            trace_private_function_roots(symbol, visit, &mut seen);
+        }
+    }
+}
+
+struct PrivateFunctionRoots(HashMap<String, u32>);
+impl egcl_rt::gc::TraceHostRoots for PrivateFunctionRoots {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
+        let mut seen = std::collections::HashSet::new();
+        for &symbol in self.0.values() {
+            trace_private_function_roots(symbol, visit, &mut seen);
+        }
+    }
+}
+
+struct InlineLocalRoots(HashMap<String, InlineLocal>);
+impl egcl_rt::gc::TraceHostRoots for InlineLocalRoots {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
+        for helper in self.0.values_mut() {
+            egcl_rt::gc::TraceHostRoots::trace_host_roots(helper, visit);
+        }
+    }
+}
+
 /// A lexically active tagbody during lowering.
 struct TagScope {
     id: u32,
@@ -2632,6 +2675,9 @@ impl egcl_rt::gc::TraceHostRoots for Lowerer<'_> {
         trace_instruction_roots(&self.code, visit, &mut seen);
         for &symbol in self.local_fns.values() {
             trace_private_function_roots(symbol, visit, &mut seen);
+        }
+        for helper in self.inline_local_fns.values_mut() {
+            egcl_rt::gc::TraceHostRoots::trace_host_roots(helper, visit);
         }
         egcl_rt::gc::TraceHostRoots::trace_host_roots(&mut self.macro_env, visit);
         for specifier in &mut self.declared_specifiers {
@@ -2668,6 +2714,7 @@ impl<'e> Lowerer<'e> {
             declared_special: std::collections::HashMap::new(),
             local_fns: std::collections::HashMap::new(),
             closure_fns: std::collections::HashSet::new(),
+            inline_local_fns: HashMap::new(),
             macro_env: None,
             declared_specifiers: Vec::new(),
             has_env: false,
@@ -3693,6 +3740,55 @@ impl<'e> Lowerer<'e> {
         Ok(())
     }
 
+    /// Inline a nonescaping local expression without capturing caller bindings.
+    /// Evaluate all arguments in the caller before introducing any parameters,
+    /// then resolve free variables/functions in the definition-site namespace.
+    fn lower_inline_local(&mut self, mut helper: InlineLocal, rest: EgclVal) -> LowerResult<()> {
+        egcl_rt::rooted_ref!(_helper = &mut helper);
+        egcl_rt::rooted!(args = list_to_vec(rest));
+        let (params, _) = flet_def_forms(helper.definition);
+        let names: Vec<String> = list_to_vec(params).into_iter().map(sym_name).collect();
+        if names.len() != args.len() || self.next_local as usize + names.len() > u16::MAX as usize {
+            return Err(Bail);
+        }
+        for i in 0..args.len() {
+            self.lower_expr(args[i])?;
+        }
+        let saved_next = self.next_local;
+        let scopes = std::mem::replace(&mut self.scopes, helper.scopes.clone());
+        let mut local_fns = PrivateFunctionRoots(std::mem::replace(&mut self.local_fns, helper.local_fns.clone()));
+        egcl_rt::rooted_ref!(_local_fns = &mut local_fns);
+        let closure_fns = std::mem::replace(&mut self.closure_fns, helper.closure_fns.clone());
+        let declared_special = std::mem::replace(&mut self.declared_special, helper.declared_special.clone());
+        let inline_policies = std::mem::replace(&mut self.inline_policies, helper.inline_policies.clone());
+        // A parameter is a fresh lexical binding, shadowing a free SPECIAL
+        // declaration inherited from the definition site, like an ordinary
+        // compiled function's parameter binder.
+        for name in &names {
+            self.declared_special.remove(name);
+        }
+        // Eligibility rejects local-function references, so no call-site local
+        // definition may accidentally shadow a global called by the helper.
+        let mut inline_fns = InlineLocalRoots(std::mem::take(&mut self.inline_local_fns));
+        egcl_rt::rooted_ref!(_inline_fns = &mut inline_fns);
+        self.enter_scope();
+        let slots: Vec<_> = names.iter().map(|name| self.alloc_slot(name)).collect();
+        for slot in slots.into_iter().rev() {
+            self.emit(Instr::StoreLocal(slot));
+            self.pop_n(1);
+        }
+        let (_, body) = flet_def_forms(helper.definition);
+        let result = self.lower_progn(body);
+        self.exit_scope(saved_next);
+        self.scopes = scopes;
+        self.local_fns = local_fns.0;
+        self.closure_fns = closure_fns;
+        self.declared_special = declared_special;
+        self.inline_policies = inline_policies;
+        self.inline_local_fns = inline_fns.0;
+        result
+    }
+
     /// `(macrolet ((name ll body…) …) body…)` / `(symbol-macrolet …)` in a
     /// function body: local macros and symbol-macros are purely expand-time, so
     /// fully expand the whole form (which installs the local definitions, expands
@@ -3768,6 +3864,9 @@ impl<'e> Lowerer<'e> {
         // lowered sibling args out from under a plain Vec.
         egcl_rt::rooted_ref!(_op_root = &mut op);
         egcl_rt::rooted_ref!(_rest_root = &mut rest);
+        if let Some(helper) = self.inline_local_fns.get(name).cloned() {
+            return self.lower_inline_local(helper, rest);
+        }
         // A lexically-visible local function (flet/labels): call its compiled
         // body directly by the gensym it is registered under.
         if let Some(&sym) = self.local_fns.get(name) {
@@ -7184,6 +7283,7 @@ impl<'e> Lowerer<'e> {
                 &self.declared_special,
                 &captures,
                 &callable,
+                &self.local_fns,
                 &enclosing_blocks,
                 &enclosing_tags,
                 &enclosing_slots,
@@ -7288,11 +7388,50 @@ impl<'e> Lowerer<'e> {
     /// Each local function's body is compiled to a `BytecodeFunction`, registered
     /// under a fresh gensym, and calls to it lower to a bytecode `CallNamed` on
     /// that gensym — so local (and mutually) recursive functions run on the
-    /// EgclStack, bounded recursion. Local functions must be non-capturing (no
-    /// enclosing lexical local) since a `CallNamed` callee gets no heap-frame
-    /// inheritance; anything unsupported inside bails the whole form (so no
-    /// tree-walker `env.funs` scoping is needed).
+    /// EgclStack, bounded recursion. Capturing definitions use compiled closures
+    /// with shared heap bindings; bounded nonescaping expression helpers inline
+    /// directly in their definition-site scope.
     fn lower_flet(&mut self, rest: EgclVal, is_labels: bool) -> LowerResult<()> {
+        egcl_rt::rooted!(rest = rest);
+        let (definitions, body) = cp(*rest);
+        if inline_local_group(&list_to_vec(definitions), body) {
+            let mut used = std::collections::HashSet::new();
+            for definition in list_to_vec(definitions) {
+                collect_symbol_names(flet_def_forms(definition).1, &mut used);
+            }
+            if used.iter().any(|name| inline_local_macro_reference(self.env, name)) {
+                let operator = resolve_sym(if is_labels { "LABELS" } else { "FLET" }).ok_or(Bail)?;
+                egcl_rt::rooted!(form = arena_cons(operator, *rest));
+                if self.macro_env.is_none() {
+                    self.macro_env = Some(super::macroexpand_environment_from_cli(self.env));
+                }
+                let mut scoped = self.declaration_scoped_macro_env();
+                egcl_rt::rooted_ref!(_scoped = &mut scoped);
+                let menv = scoped.as_ref().unwrap_or_else(|| self.macro_env.as_ref().unwrap());
+                let suspended = suspend_file_expansion_errors();
+                let expanded = compiler_macroexpand::macroexpand_all(*form, menv);
+                drop(suspended);
+                let expanded = expanded.map_err(|_| record_bail(|| "flet:inline-macroexpand".to_string()))?;
+                let (operator, expanded_rest) = cp(expanded);
+                if !operator.is_symbol() || sym_name(operator) != if is_labels { "LABELS" } else { "FLET" } {
+                    return Err(Bail);
+                }
+                *rest = expanded_rest;
+            }
+        }
+        let mut saved = InlineLocalRoots(self.inline_local_fns.clone());
+        egcl_rt::rooted_ref!(_saved = &mut saved);
+        for def in list_to_vec(cp(*rest).0) {
+            if def.is_cons() && cp(def).0.is_symbol() {
+                self.inline_local_fns.remove(&sym_name(cp(def).0));
+            }
+        }
+        let result = self.lower_flet_inner(*rest, is_labels);
+        self.inline_local_fns = saved.0;
+        result
+    }
+
+    fn lower_flet_inner(&mut self, rest: EgclVal, is_labels: bool) -> LowerResult<()> {
         let (defs_form, mut body) = cp(rest);
         // The definition list and the form body are heap-rooted across the
         // allocating parse (resolve_sym gensyms) and per-function compilation
@@ -7329,6 +7468,11 @@ impl<'e> Lowerer<'e> {
         // declaration needs none of this and stays compiled.
         for i in 0..defs.len() {
             let (params_form, fbody) = flet_def_forms(defs[i]);
+            if parse_lambda_list(params_form).is_some_and(|(params, _, _, _)| {
+                params.iter().any(|name| is_special_name(name))
+            }) {
+                return Err(record_bail(|| "lambda-list:special-parameter-flet".to_string()));
+            }
             let decl_special = body_declared_special(super::body_through_implicit_block(fbody));
             if decl_special.is_empty() {
                 continue;
@@ -7346,6 +7490,38 @@ impl<'e> Lowerer<'e> {
         let local_names: std::collections::HashSet<String> =
             parsed.iter().map(|(n, _)| n.clone()).collect();
 
+        // Small expression helpers need neither a closure allocation nor heap
+        // access for their captures. Expansion is bounded and excludes escaped
+        // function identities and recursive/sibling calls; all other definitions
+        // retain the general compiled closure path below.
+        if inline_local_group(&defs[..], body)
+            && defs.iter().all(|definition| !self_calls::notinline(cp(*definition).0.as_symbol_index(), &self.inline_policies))
+        {
+            let namespace: std::collections::HashSet<_> = self.closure_fns.iter()
+                .chain(self.inline_local_fns.keys()).cloned().collect();
+            let mut used = std::collections::HashSet::new();
+            for i in 0..defs.len() {
+                collect_symbol_names(flet_def_forms(defs[i]).1, &mut used);
+            }
+            // An existing boxed capture is addressed by name at runtime. A
+            // call-site heap frame could shadow it, so preserve its definition
+            // frame with the general closure representation instead.
+            if namespace.is_disjoint(&used)
+                && !used.iter().any(|name| inline_local_macro_reference(self.env, name))
+                && !used.iter().any(|name| matches!(self.lookup_local(name), Some(VarLoc::Boxed)))
+            {
+                for i in 0..parsed.len() {
+                    self.inline_local_fns.insert(parsed[i].0.clone(), InlineLocal {
+                        definition: defs[i], scopes: self.scopes.clone(),
+                        local_fns: self.local_fns.clone(), closure_fns: self.closure_fns.clone(),
+                        declared_special: self.declared_special.clone(),
+                        inline_policies: self.inline_policies.clone(),
+                    });
+                }
+                return self.lower_progn(body);
+            }
+        }
+
         // Portable (BFASL) compilation lowers every local function to an
         // env-capturing closure stored in a heap frame: those serialize as nested
         // bytecode functions, so the artifact is source-free and a fresh process
@@ -7357,9 +7533,9 @@ impl<'e> Lowerer<'e> {
             return self.lower_flet_capturing(&parsed, &defs[..], body, is_labels);
         }
 
-        // Non-portable opportunistic path. A local function that references an
-        // enclosing lexical (a capture) needs the closure machinery, which is
-        // portable-only, so defer such a form to the tree-walker.
+        // Capturing opportunistic definitions use the same bytecode closure
+        // representation as portable definitions. Its shared heap bindings keep
+        // mutations visible to the enclosing function and sibling closures.
         let enclosing: std::collections::HashSet<String> =
             self.scopes.iter().flat_map(|s| s.keys().cloned()).collect();
         let is_capturing = (0..parsed.len()).any(|i| {
@@ -7375,12 +7551,10 @@ impl<'e> Lowerer<'e> {
                 collect_symbol_names(f, &mut used);
             }
             used.iter()
-                .any(|u| enclosing.contains(u) && !params.contains(u) && !local_names.contains(u))
+                .any(|u| enclosing.contains(u) && !params.contains(u))
         });
         if is_capturing {
-            return Err(record_bail(|| {
-                "flet:captures-enclosing-lexical".to_string()
-            }));
+            return self.lower_flet_capturing(&parsed, &defs[..], body, is_labels);
         }
 
         // If any local function is referenced as a VALUE (`#'localfn`) — in the
@@ -7396,10 +7570,11 @@ impl<'e> Lowerer<'e> {
             return Err(record_bail(|| "flet:function-as-value".to_string()));
         }
 
-        let saved_local_fns = self.local_fns.clone();
+        let mut saved_local_fns = PrivateFunctionRoots(self.local_fns.clone());
+        egcl_rt::rooted_ref!(_saved_local_fns = &mut saved_local_fns);
 
         // LABELS bodies see all siblings + self; FLET bodies do not.
-        let body_local_fns = if is_labels {
+        let mut body_local_fns = PrivateFunctionRoots(if is_labels {
             let mut m = self.local_fns.clone();
             for (name, sym) in &parsed {
                 m.insert(name.clone(), *sym);
@@ -7407,7 +7582,8 @@ impl<'e> Lowerer<'e> {
             m
         } else {
             self.local_fns.clone()
-        };
+        });
+        egcl_rt::rooted_ref!(_body_local_fns = &mut body_local_fns);
 
         // Compile and register each local function body. Re-derive params/fbody
         // from the rooted `defs` each iteration (compilation allocates).
@@ -7421,7 +7597,7 @@ impl<'e> Lowerer<'e> {
                 fbody,
                 self.env,
                 &self.declared_special,
-                &body_local_fns,
+                &body_local_fns.0,
                 self.portable,
             )
             .ok_or_else(|| record_bail(|| "flet:local-function-body".to_string()))?;
@@ -7447,14 +7623,14 @@ impl<'e> Lowerer<'e> {
             self.local_fns.insert(name.clone(), *sym);
         }
         let r = self.lower_progn(body);
-        self.local_fns = saved_local_fns;
+        self.local_fns = saved_local_fns.0;
         r
     }
 
-    /// Portable capturing `flet`/`labels`: each local function closes over
-    /// enclosing lexicals (and, for `labels`, its siblings). The closures live in
-    /// a shared child heap frame so mutual/self recursion resolves; each is bound
-    /// to a boxed variable of its name and called through `funcall` (see
+    /// Compiled capturing `flet`/`labels`: each local function closes over
+    /// enclosing lexicals (and, for `labels`, its siblings). Function bindings
+    /// live in a shared child frame; LABELS captures that frame while FLET
+    /// captures its parent. Calls use the boxed FUNCTION namespace (see
     /// `lower_call`). Enclosing captured lexicals must already be boxed
     /// (arranged by `compute_captured_names`); a local that references an unboxed
     /// enclosing slot bails.
@@ -7487,6 +7663,13 @@ impl<'e> Lowerer<'e> {
             .map(|(k, _v)| k.clone())
             .collect();
         let enclosing_callable = self.closure_fns.clone();
+        let mut saved_local_fns = PrivateFunctionRoots(self.local_fns.clone());
+        egcl_rt::rooted_ref!(_saved_local_fns = &mut saved_local_fns);
+        let mut child_local_fns = PrivateFunctionRoots(saved_local_fns.0.clone());
+        egcl_rt::rooted_ref!(_child_local_fns = &mut child_local_fns);
+        if is_labels {
+            child_local_fns.0.retain(|name, _| !local_names.contains(name));
+        }
 
         // A macro can reveal these captures after the initial syntactic scan.
         // Ask the enclosing compiler to retry with heap bindings, just as for
@@ -7516,13 +7699,17 @@ impl<'e> Lowerer<'e> {
             return Err(record_bail(|| "flet:closure-captures-slot".to_string()));
         }
 
-        // Establish a child heap frame to hold the closures, so labels siblings
-        // (defined into the same frame) resolve through capture.
+        // LABELS definitions capture their shared child frame. FLET definitions
+        // capture the enclosing frame: a new same-name binding must not hide an
+        // outer function from a definition that lexically refers to it.
         self.has_env = true;
-        self.emit(Instr::PushEnvChild);
+        if is_labels {
+            self.emit(Instr::PushEnvChild);
+        }
         let saved_next = self.next_local;
         self.enter_scope();
         let saved_closure_fns = self.closure_fns.clone();
+        self.local_fns.retain(|name, _| !local_names.contains(name));
 
         // Names each closure may resolve. labels closures additionally see all
         // siblings; flet closures do not.
@@ -7581,6 +7768,7 @@ impl<'e> Lowerer<'e> {
                 &self.declared_special,
                 &captures,
                 &callable,
+                &child_local_fns.0,
                 &enclosing_blocks,
                 &enclosing_tags,
                 &child_enclosing_slots,
@@ -7598,13 +7786,27 @@ impl<'e> Lowerer<'e> {
                 capture_env: true,
             });
             self.push_n(1);
-            let ni = self.intern_name(&closure_fn_binding_key(&parsed[i].0));
-            self.emit(Instr::DefineEnvVar(ni));
-            self.pop_n(1);
+            if is_labels {
+                let ni = self.intern_name(&closure_fn_binding_key(&parsed[i].0));
+                self.emit(Instr::DefineEnvVar(ni));
+                self.pop_n(1);
+            }
+        }
+        if !is_labels {
+            // The operand stack roots every constructed closure while the next
+            // one allocates. Install them only after all definition environments
+            // have captured the parent, in reverse stack order.
+            self.emit(Instr::PushEnvChild);
+            for i in (0..parsed.len()).rev() {
+                let ni = self.intern_name(&closure_fn_binding_key(&parsed[i].0));
+                self.emit(Instr::DefineEnvVar(ni));
+                self.pop_n(1);
+            }
         }
 
         let r = self.lower_progn(body);
         self.closure_fns = saved_closure_fns;
+        self.local_fns = saved_local_fns.0;
         self.exit_scope(saved_next);
         self.emit(Instr::PopEnvChild);
         r
@@ -7761,6 +7963,7 @@ fn compile_capturing_local(
     inherited_specials: &std::collections::HashMap<String, u32>,
     captures: &std::collections::HashSet<String>,
     callable: &std::collections::HashSet<String>,
+    local_fns: &HashMap<String, u32>,
     enclosing_blocks: &std::collections::HashSet<String>,
     enclosing_tags: &std::collections::HashSet<String>,
     enclosing_slots: &std::collections::HashSet<String>,
@@ -7786,6 +7989,7 @@ fn compile_capturing_local(
     lo.captured_names = compute_captured_names(fbody);
     lo.has_env = true;
     lo.closure_fns = callable.clone();
+    lo.local_fns = local_fns.clone();
     lo.enclosing_blocks = enclosing_blocks.clone();
     lo.enclosing_tags = enclosing_tags.clone();
     lo.loop_finish_tag = loop_finish_tag.map(str::to_owned);
@@ -7810,9 +8014,14 @@ fn compile_capturing_local(
     } else {
         declared_parameter_types(fbody, &param_names)?
     };
+    let decl_special = body_declared_special(super::body_through_implicit_block(fbody));
+    lo.push_declared_special(&decl_special);
+    let declarations = lo.enter_body_declarations(fbody);
     if lower_body(&mut lo, fbody).is_err() {
         return None;
     }
+    lo.leave_body_declarations(declarations);
+    lo.pop_declared_special(&decl_special);
     lo.emit(Instr::Return);
     let mut self_call_sites = Vec::new();
     let (arity, min_args) = positional_arity(
@@ -9455,8 +9664,10 @@ fn take_box_request() -> std::collections::HashSet<String> {
 /// captured a slot-allocated binding, compiles again with those names boxed.
 ///
 /// Bounded: each round must add a name that is not already forced, so it
-/// terminates in at most the number of bindings, and the cap keeps a
-/// pathological body from looping.
+/// stops immediately when an attempt requests no additional binding. A finite
+/// budget derived from the original source's names allows independent local
+/// groups to request their captures in separate attempts, while a macro that
+/// generates fresh captured names on every expansion cannot retry forever.
 #[allow(clippy::too_many_arguments)]
 fn compile_function_in(
     name: &str,
@@ -9481,7 +9692,11 @@ fn compile_function_in(
     egcl_rt::rooted!(params_form = params_form);
     egcl_rt::rooted!(body = body);
     let mut forced: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for _ in 0..4 {
+    let mut source_names = std::collections::HashSet::new();
+    collect_symbol_names(*params_form, &mut source_names);
+    collect_symbol_names(*body, &mut source_names);
+    let retry_budget = source_names.len().saturating_add(1).max(4);
+    for _ in 0..retry_budget {
         let _ = take_box_request();
         let attempt = compile_function_forcing_boxed(
             name,
@@ -9827,6 +10042,86 @@ fn collect_lambda_list_init_names(
     }
 }
 
+fn inline_local_macro_reference(env: &Env, name: &str) -> bool {
+    super::macro_defined(env, name)
+        || egcl_rt::symbols::find_index(name).is_some_and(|symbol| {
+            compiler_macroexpand::has_compiler_macro(EgclVal::from_symbol_index(symbol))
+        })
+}
+
+/// Conservatively select bounded, nonescaping local expression definitions.
+/// Lexical bindings lower in the helper's definition-site scope. Function and
+/// control/declaration forms retain the general compiled closure representation.
+fn inline_local_group(defs: &[EgclVal], body: EgclVal) -> bool {
+    fn expression(form: EgclVal, budget: &mut usize) -> bool {
+        if *budget == 0 { return false; }
+        *budget -= 1;
+        if !form.is_cons() { return true; }
+        let (operator, args) = cp(form);
+        if !operator.is_symbol() { return false; }
+        match sym_bare_name_rc(operator).as_ref() {
+            "QUOTE" => return true,
+            "LET" | "LET*" => {
+                let (bindings, body) = cp(args);
+                // A binding list is syntax, not a function call. In particular,
+                // INCF expands to LET* plus MULTIPLE-VALUE-BIND; walking its
+                // list of binding pairs as expressions would reject it.
+                for binding in list_to_vec(bindings) {
+                    if binding.is_symbol() { continue; }
+                    if !binding.is_cons() { return false; }
+                    let (name, values) = cp(binding);
+                    if !name.is_symbol() { return false; }
+                    let initializers = list_to_vec(values);
+                    if initializers.len() > 1 || !initializers.iter().all(|&v| expression(v, budget)) {
+                        return false;
+                    }
+                }
+                return list_to_vec(body).iter().all(|&form| expression(form, budget));
+            }
+            "IF" | "PROGN" | "SETQ" | "THE" => {},
+            name if is_bail_special(name) || matches!(name,
+                "LAMBDA" | "FUNCTION" | "FLET" | "LABELS"
+                | "BLOCK" | "RETURN" | "RETURN-FROM" | "GO" | "TAGBODY"
+                | "CATCH" | "THROW" | "UNWIND-PROTECT" | "HANDLER-CASE"
+                | "HANDLER-BIND" | "RESTART-CASE" | "RESTART-BIND" | "PROGV"
+                | "DECLARE" | "DEFUN" | "DEFMACRO" | "MACROLET" | "SYMBOL-MACROLET") => return false,
+            _ => {},
+        }
+        let mut tail = args;
+        while tail.is_cons() {
+            let (arg, rest) = cp(tail);
+            if !expression(arg, budget) { return false; }
+            tail = rest;
+        }
+        tail.is_nil()
+    }
+    if defs.is_empty() || defs.iter().any(|def| !def.is_cons())
+        || body_may_capture_closure(&list_to_vec(body)) { return false; }
+    let names: std::collections::HashSet<_> = defs.iter().filter_map(|&def| {
+        let (name, _) = cp(def);
+        name.is_symbol().then(|| sym_name(name))
+    }).collect();
+    if names.len() != defs.len() || references_local_fn_value(body, &names) { return false; }
+    let mut used = std::collections::HashSet::new();
+    collect_symbol_names(body, &mut used);
+    if used.contains("NOTINLINE") { return false; }
+    for &def in defs {
+        let (params, fbody) = flet_def_forms(def);
+        let Some((parameters, _, _, false)) = parse_lambda_list(params) else { return false; };
+        if parameters.iter().any(|name| is_special_name(name)) { return false; }
+        // Optional defaults require an entry binder; preserve the closure path.
+        if list_to_vec(params).iter().any(|p| !p.is_symbol() || sym_name(*p).starts_with('&')) {
+            return false;
+        }
+        let mut used = std::collections::HashSet::new();
+        collect_symbol_names(fbody, &mut used);
+        if !names.is_disjoint(&used) { return false; }
+        let mut budget = 96;
+        if !list_to_vec(fbody).iter().all(|&form| expression(form, &mut budget)) { return false; }
+    }
+    true
+}
+
 /// Names of variables captured by a nested `(lambda …)` in `body` (an
 /// over-approximation: a nested lambda's free symbols minus its own params).
 /// A function/`let` binding whose name is in this set is boxed into the heap
@@ -9893,6 +10188,10 @@ fn compute_captured_names(body: EgclVal) -> std::collections::HashSet<String> {
                 // free symbols (minus its own params) that name an enclosing
                 // local get boxed; unrelated globals simply never match a local.
                 let (defs_form, flet_body) = cp(cdr);
+                if inline_local_group(&list_to_vec(defs_form), flet_body) {
+                    for form in list_to_vec(flet_body) { walk(form, out); }
+                    return;
+                }
                 for def in list_to_vec(defs_form) {
                     if !def.is_cons() {
                         continue;
@@ -29963,3 +30262,37 @@ mod active_bytecode_root_tests {
 mod native_error_tests;
 
 mod native_debug;
+
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn capturing_local_native_frame_preserves_a_relocated_capture() {
+    use native_transfer_entry::{TransferCode, take_native_fallback_count};
+    let _lock = super::heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    super::read_eval_all_env(
+        "(defun collecting-local-probe () (%force-minor-gc-for-test))", &mut env,
+    ).unwrap();
+    egcl_rt::rooted!(params = reader::read_from_string("(value)").unwrap().0);
+    // Taking the function value keeps this on the general compiled closure
+    // path; it must not be replaced by source inlining for this probe.
+    egcl_rt::rooted!(forms = reader::read_from_string(
+        "((flet ((read-value () (collecting-local-probe) value))
+            (funcall #'read-value)))"
+    ).unwrap().0);
+    let body = Arc::new(compile_function(
+        "MOVING-CAPTURING-LOCAL", *params, *forms, &env, false, false,
+    ).expect("compile opportunistic capturing local"));
+    assert!(body.code.iter().any(|op| matches!(op, Instr::MakeClosure { capture_env: true, .. })));
+    egcl_rt::rooted!(_body = ActiveBytecodeRoot::new(&body));
+    let code = TransferCode::compile_mapped_for_test(body).expect("compile actual native creator");
+    // Allocate after lowering so the captured object is still nursery-born.
+    egcl_rt::rooted!(datum = super::arena_str("moving local capture"));
+    let before = datum.to_raw();
+    take_native_fallback_count();
+    egcl_rt::rooted!(result = code.run(&[*datum], &mut env).unwrap());
+    assert_ne!(datum.to_raw(), before, "the captured object must actually relocate");
+    assert_eq!(*result, *datum, "the closure must return the relocated object");
+    assert_eq!(super::val_as_str(*result), "moving local capture");
+    assert_eq!(take_native_fallback_count(), 0, "the creator must execute native code");
+}
