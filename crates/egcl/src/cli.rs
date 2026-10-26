@@ -15559,6 +15559,15 @@ fn compile_file_in_package_name(form: EgclVal) -> Option<String> {
     )
 }
 
+/// The legacy unqualified DEFINE-PACKAGE spelling is a bootstrap convenience.
+/// Package-local macros with that name must go through ordinary expansion.
+fn bootstrap_define_package_operator(op: EgclVal) -> bool {
+    op.is_symbol()
+        && egcl_stdlib::find_package("COMMON-LISP-USER").is_some_and(|package| {
+            egcl_stdlib::find_present_symbol(package, "DEFINE-PACKAGE") == Some(op)
+        })
+}
+
 /// Whether COMPILE-FILE must evaluate this top-level form at COMPILE time
 /// (CLHS 3.2.3.1): the definition forms whose effects the compiler itself needs
 /// to see, plus EVAL-WHEN, whose situation list decides for itself.
@@ -15656,7 +15665,10 @@ fn process_compile_toplevel_form_at(
                     proclaim_special(cp(cdr).0);
                     return Ok(());
                 }
-                "DEFINE-PACKAGE" => {
+                "DEFINE-PACKAGE"
+                    if bootstrap_define_package_operator(op)
+                        && lookup_macro(env, &name).is_none() =>
+                {
                     eval_defpackage(cdr, env)?;
                     return Ok(());
                 }

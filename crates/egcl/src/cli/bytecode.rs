@@ -11389,12 +11389,11 @@ fn bbu_package_plan(form: EgclVal) -> Result<Option<BbuPackagePlan>, EgclError> 
         return Ok(None);
     }
     let (op, rest) = cp(form);
-    if !op.is_symbol()
-        || !matches!(
-            sym_bare_name_rc(op).as_ref(),
-            "DEFPACKAGE" | "DEFINE-PACKAGE"
-        )
-    {
+    let defpackage = op.is_symbol()
+        && egcl_stdlib::find_package("COMMON-LISP").is_some_and(|package| {
+            egcl_stdlib::find_present_symbol(package, "DEFPACKAGE") == Some(op)
+        });
+    if !defpackage && !super::bootstrap_define_package_operator(op) {
         return Ok(None);
     }
     if !rest.is_cons() {
