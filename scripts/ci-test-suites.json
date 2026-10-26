@@ -16,6 +16,7 @@
     "egcl:test:vector_ranges_cli": [""],
     "egcl:test:packed_u8_cli": [""],
     "egcl:test:packed_u8_native_cli": [""],
+    "egcl:test:packed_u8_persistence_cli": [""],
     "egcl-rt:test:packed_u8_vectors": [""],
     "egcl-stdlib:test:packed_u8_sequences": [""],
     "egcl:test:constant_reference_folding": [""],
