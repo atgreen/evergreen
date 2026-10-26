@@ -4,6 +4,11 @@
 
 ### Added
 
+- An illustrated [guide to function calling conventions](docs/design/function-calling-conventions.html)
+  for readers new to EGCL, covering all sixteen calls between T2, T1, T0,
+  and the tree walker, with register, stack, and runtime metadata diagrams
+  ([#395](https://github.com/atgreen/evergreen/pull/395)).
+
 - `install-egcl-forks` includes the audited ocicl libraries through maintained
   EGCL forks. Adapters cover archive metadata, command-line handling, clocks,
   readtable iteration, CLOS JSON encoding, type introspection and macro expansion;
