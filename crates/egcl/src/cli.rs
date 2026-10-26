@@ -12175,42 +12175,45 @@ pub(super) fn fmt_form_debug(val: EgclVal) -> String {
 
 /// Render one axis of a multidimensional array's row-major storage as nested
 /// parenthesised lists for the `#nA` printer. `base` is the row-major storage
-/// vector, `dims` the remaining axes, `start` the flat offset. Returns
-/// the number of leaf elements consumed.
-fn print_md_nested(base: EgclVal, dims: &[usize], start: usize, out: &mut String) -> usize {
-    if dims.is_empty() {
-        if let Some(raw) = egcl_rt::packed_f64::get(base, start) {
+/// vector, `dims` the remaining axes, `start` the flat offset. Each axis is a
+/// list for *PRINT-LEVEL* and *PRINT-LENGTH* (CLHS 22.1.3.8): the caller has
+/// checked this list's own depth, a sub-axis past the level prints as `#`, and
+/// a list stops at `...` after *PRINT-LENGTH* elements (keep in sync with the
+/// stdlib's `md_render`).
+fn print_md_nested(base: EgclVal, dims: &[usize], start: usize, out: &mut String) {
+    // Printing an element may dispatch PRINT-OBJECT, which allocates.
+    egcl_rt::rooted!(base = base);
+    let Some((&n, rest)) = dims.split_first() else {
+        if let Some(raw) = egcl_rt::packed_f64::get(*base, start) {
             out.push_str(&egcl_stdlib::format::double_float_to_string(raw));
         } else {
-            print_val(egcl_stdlib::elt(base, start).unwrap_or(NIL), out);
+            print_val(egcl_stdlib::elt(*base, start).unwrap_or(NIL), out);
         }
-        return 1;
-    }
+        return;
+    };
+    let depth = PRINT_DEPTH.with(|d| d.get());
+    let limit = egcl_stdlib::format::print_length();
+    let sub_axis_elided =
+        !rest.is_empty() && egcl_stdlib::format::print_level().is_some_and(|lvl| depth + 1 >= lvl);
+    let stride: usize = rest.iter().product();
+    PRINT_DEPTH.with(|d| d.set(depth + 1));
     out.push('(');
-    let mut consumed = 0;
-    if dims.len() <= 1 {
-        let n = dims.first().copied().unwrap_or(0);
-        for i in 0..n {
-            if i > 0 {
-                out.push(' ');
-            }
-            if let Some(raw) = egcl_rt::packed_f64::get(base, start + i) {
-                out.push_str(&egcl_stdlib::format::double_float_to_string(raw));
-            } else {
-                print_val(egcl_stdlib::elt(base, start + i).unwrap_or(NIL), out);
-            }
+    for i in 0..n {
+        if i > 0 {
+            out.push(' ');
         }
-        consumed = n;
-    } else {
-        for i in 0..dims[0] {
-            if i > 0 {
-                out.push(' ');
-            }
-            consumed += print_md_nested(base, &dims[1..], start + consumed, out);
+        if limit.is_some_and(|l| i >= l) {
+            out.push_str("...");
+            break;
+        }
+        if sub_axis_elided {
+            out.push('#');
+        } else {
+            print_md_nested(*base, rest, start + i * stride, out);
         }
     }
     out.push(')');
-    consumed
+    PRINT_DEPTH.with(|d| d.set(depth));
 }
 
 /// Current structural nesting depth for *PRINT-LEVEL* (0 at the top level).
@@ -12703,7 +12706,13 @@ fn print_val_inner(val: EgclVal, out: &mut String) {
                     out.push_str("#<ARRAY>");
                 }
                 type_id::MD_ARRAY => {
-                    // #<rank>A(nested row-major lists) (bliss-rh0t).
+                    // #<rank>A(nested row-major lists) (bliss-rh0t). Past
+                    // *PRINT-LEVEL* the whole array prints as `#`.
+                    let depth = PRINT_DEPTH.with(|d| d.get());
+                    if egcl_stdlib::format::print_level().is_some_and(|lvl| depth >= lvl) {
+                        out.push('#');
+                        return;
+                    }
                     let storage = *(ptr.add(8) as *const EgclVal);
                     let rank = (*(ptr.add(24) as *const EgclVal)).as_fixnum().max(0);
                     let dims = md_dims(val).unwrap_or_default();

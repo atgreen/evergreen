@@ -1089,9 +1089,9 @@ fn heap_vector_string(v: EgclVal, escapep: bool) -> Option<String> {
         return Some(format!("#({})", elements.join(" ")));
     }
     if let Some(length) = egcl_rt::packed_f64::len(v) {
-        let elements: Vec<_> = (0..length).map(|i|
-            double_float_to_string(egcl_rt::packed_f64::get(v, i).unwrap())).collect();
-        return Some(format!("#({})", elements.join(" ")));
+        return Some(vector_elements_string(length, |i| {
+            double_float_to_string(egcl_rt::packed_f64::get(v, i).unwrap())
+        }));
     }
     unsafe {
         let ptr = v.as_ptr();
@@ -1111,7 +1111,11 @@ fn heap_vector_string(v: EgclVal, escapep: bool) -> Option<String> {
                         .max(0) as usize,
                 );
             }
-            let (nested, _) = md_render(storage, &dims, 0, escapep);
+            // Past *PRINT-LEVEL* the whole array prints as `#`.
+            if print_level().is_some_and(|lvl| PRINT_DEPTH.with(|d| d.get()) >= lvl) {
+                return Some("#".to_string());
+            }
+            let nested = md_render(storage, &dims, 0, escapep);
             return Some(format!("#{rank}A{nested}"));
         }
         // A complex vector reads its elements through the displacement-aware
@@ -1137,91 +1141,97 @@ fn heap_vector_string(v: EgclVal, escapep: bool) -> Option<String> {
             if !print_array_active() {
                 return Some(format!("#<VECTOR {count}>"));
             }
-            let mut s = String::from("#(");
-            for i in 0..count {
-                if i > 0 {
-                    s.push(' ');
-                }
-                if let Some(raw) = crate::sequences::double_float_array_element(v, i) {
-                    s.push_str(&double_float_to_string(raw));
+            egcl_rt::rooted!(v = v);
+            return Some(vector_elements_string(count, |i| {
+                if let Some(raw) = crate::sequences::double_float_array_element(*v, i) {
+                    double_float_to_string(raw)
                 } else {
-                    let e = crate::sequences::cvec_element(v, i).unwrap_or(NIL);
-                    s.push_str(&egclval_to_print_string(e, escapep));
+                    let e = crate::sequences::cvec_element(*v, i).unwrap_or(NIL);
+                    egclval_to_print_string(e, escapep)
                 }
-            }
-            s.push(')');
-            return Some(s);
+            }));
         }
-        let (base, count) = match (*(ptr as *const ObjectHeader)).type_id() {
-            type_id::SIMPLE_VECTOR => (
-                ptr,
-                *(ptr.add(object_payload_offset(ptr)) as *const u64) as usize,
-            ),
+        let count = match (*(ptr as *const ObjectHeader)).type_id() {
+            type_id::SIMPLE_VECTOR => *(ptr.add(object_payload_offset(ptr)) as *const u64) as usize,
             _ => return None,
         };
-        let boff = object_payload_offset(base);
-        let mut s = String::from("#(");
-        for i in 0..count {
-            if i > 0 {
-                s.push(' ');
-            }
-            let e = *(base.add(boff + 8 + i * 8) as *const EgclVal);
-            s.push_str(&egclval_to_print_string(e, escapep));
-        }
-        s.push(')');
-        Some(s)
+        // Re-read the payload through the rooted vector for each element:
+        // printing one may dispatch PRINT-OBJECT, which allocates.
+        egcl_rt::rooted!(v = v);
+        Some(vector_elements_string(count, |i| {
+            let p = v.as_ptr();
+            let e = *(p.add(object_payload_offset(p) + 8 + i * 8) as *const EgclVal);
+            egclval_to_print_string(e, escapep)
+        }))
     }
 }
 
 /// Render one axis of a multidimensional array's row-major storage as nested
 /// parenthesised lists (CLHS `#nA` syntax). `base` is the row-major storage
 /// vector, `dims` the remaining axes, `start` the flat offset of this
-/// subtree. Returns the rendered subtree and the number of leaf elements it
-/// consumed.
-unsafe fn md_render(
-    base: EgclVal,
-    dims: &[usize],
-    start: usize,
-    escapep: bool,
-) -> (String, usize) {
-    if dims.is_empty() {
-        let text = if let Some(raw) = egcl_rt::packed_f64::get(base, start) {
+/// subtree. Each axis is a list for *PRINT-LEVEL* and *PRINT-LENGTH* (CLHS
+/// 22.1.3.8): the caller has checked this list's own depth, a sub-axis past
+/// the level prints as `#`, and a list stops at `...` after *PRINT-LENGTH*
+/// elements (keep in sync with cli `print_md_nested`).
+fn md_render(base: EgclVal, dims: &[usize], start: usize, escapep: bool) -> String {
+    // Printing an element may dispatch PRINT-OBJECT, which allocates.
+    egcl_rt::rooted!(base = base);
+    let Some((&n, rest)) = dims.split_first() else {
+        return if let Some(raw) = egcl_rt::packed_f64::get(*base, start) {
             double_float_to_string(raw)
         } else {
-            egclval_to_print_string(crate::sequences::elt(base, start).unwrap_or(NIL), escapep)
+            egclval_to_print_string(crate::sequences::elt(*base, start).unwrap_or(NIL), escapep)
         };
-        return (text, 1);
-    }
-    if dims.len() == 1 {
-        let n = dims[0];
-        let mut s = String::from("(");
-        for i in 0..n {
-            if i > 0 {
-                s.push(' ');
-            }
-            if let Some(raw) = egcl_rt::packed_f64::get(base, start + i) {
-                s.push_str(&double_float_to_string(raw));
-            } else {
-                let e = crate::sequences::elt(base, start + i).unwrap_or(NIL);
-                s.push_str(&egclval_to_print_string(e, escapep));
-            }
+    };
+    let depth = PRINT_DEPTH.with(|d| d.get());
+    let limit = print_length();
+    let sub_axis_elided = !rest.is_empty() && print_level().is_some_and(|lvl| depth + 1 >= lvl);
+    let stride: usize = rest.iter().product();
+    PRINT_DEPTH.with(|d| d.set(depth + 1));
+    let mut s = String::from("(");
+    for i in 0..n {
+        if i > 0 {
+            s.push(' ');
         }
-        s.push(')');
-        (s, n)
-    } else {
-        let mut s = String::from("(");
-        let mut consumed = 0;
-        for i in 0..dims[0] {
-            if i > 0 {
-                s.push(' ');
-            }
-            let (sub, c) = unsafe { md_render(base, &dims[1..], start + consumed, escapep) };
-            s.push_str(&sub);
-            consumed += c;
+        if limit.is_some_and(|l| i >= l) {
+            s.push_str("...");
+            break;
         }
-        s.push(')');
-        (s, consumed)
+        if sub_axis_elided {
+            s.push('#');
+        } else {
+            s.push_str(&md_render(*base, rest, start + i * stride, escapep));
+        }
     }
+    s.push(')');
+    PRINT_DEPTH.with(|d| d.set(depth));
+    s
+}
+
+/// `#(...)` over a vector's `count` elements under *PRINT-LEVEL* and
+/// *PRINT-LENGTH* (CLHS 22.1.3.7), as cli `print_val` prints a simple vector:
+/// `#` past the level, `...` after the length. `element` renders element `i`.
+fn vector_elements_string(count: usize, mut element: impl FnMut(usize) -> String) -> String {
+    let depth = PRINT_DEPTH.with(|d| d.get());
+    if print_level().is_some_and(|lvl| depth >= lvl) {
+        return "#".to_string();
+    }
+    let limit = print_length();
+    PRINT_DEPTH.with(|d| d.set(depth + 1));
+    let mut s = String::from("#(");
+    for i in 0..count {
+        if i > 0 {
+            s.push(' ');
+        }
+        if limit.is_some_and(|l| i >= l) {
+            s.push_str("...");
+            break;
+        }
+        s.push_str(&element(i));
+    }
+    s.push(')');
+    PRINT_DEPTH.with(|d| d.set(depth));
+    s
 }
 
 /// True iff `v` is the interpreter closure representation `(EGCL::CLOSURE . id)`
