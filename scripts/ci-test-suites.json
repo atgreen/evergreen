@@ -16,6 +16,7 @@
     "egcl:test:immediate_vector_stores": [""],
     "egcl:test:ordinary_raw_fixnum_cli": [""],
     "egcl:test:comparison_fusion_liveness": [""],
+    "egcl:test:invariant_loop_bounds": [""],
     "egcl-stdlib:test:integer_shifts": [""]
   },
   "areas": {

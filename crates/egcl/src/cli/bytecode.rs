@@ -26575,8 +26575,16 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
         pm.add(Box::new(egcl_compiler::t2::opt_gvn::Gvn));
         pm.add(Box::new(egcl_compiler::t2::opt_guard::GuardElim));
         pm.add(Box::new(egcl_compiler::t2::opt_clear_mv::ClearMvElim));
-        pm.add(Box::new(egcl_compiler::t2::opt_dce::Dce));
         pm.run(function);
+        if std::env::var_os("EGCL_DISABLE_INVARIANT_BOUNDS").is_none() {
+            let bounds = egcl_compiler::t2::opt_guard::hoist_invariant_bounds(function);
+            if bounds != 0 {
+                t2_log!("{name}: invariant bounds hoisted: {bounds}");
+            }
+        }
+        let mut cleanup = PassManager::new();
+        cleanup.add(Box::new(egcl_compiler::t2::opt_dce::Dce));
+        cleanup.run(function);
     }
     if let Some(candidate) = &mut packed {
         egcl_compiler::t2::unbox_f64::remove_dead_boxes(candidate);
