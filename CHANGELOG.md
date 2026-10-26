@@ -22,6 +22,10 @@
   is also a fixnum, preserving the GC barrier for reference stores
   ([#673](https://github.com/atgreen/evergreen/pull/673)).
 
+- T2 functions with proven unboxed integer loops can retain ordinary native
+  calls while keeping arguments and results compatible with Lisp callers
+  ([#674](https://github.com/atgreen/evergreen/pull/674)).
+
 - T2 on x86-64 Linux can peel a narrowing integer loop into a generic first
   iteration and a guarded fixnum remainder. Constant byte extraction compiles
   directly, and eligible integer arithmetic stays unboxed between operations
