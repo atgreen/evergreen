@@ -93,6 +93,8 @@ pub mod opt_dce; // deopt-aware DCE + rematerialisation
 pub mod opt_guard; // guard elimination + hoisting
 pub mod opt_gvn; // global value numbering / CSE
 pub mod opt_loop_peel; // profitable type-transition peeling with generic fallback
+pub mod vector_ranges;
+pub(crate) mod vector_range_proof;
 mod region_clone;
 pub mod opt_licm; // loop-invariant code motion
 pub mod regalloc; // regalloc2 adapter + stack maps

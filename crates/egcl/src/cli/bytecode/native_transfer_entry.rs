@@ -3429,6 +3429,8 @@ unsafe extern "C" fn poll_or_transfer(
                 native_poll::observe_request();
             }
             poll_or_transfer_unpublished(request, out);
+            #[cfg(test)]
+            root_publication::observe_after();
             if (*out).exit == NativeExit::Returned && prepare_osr(image) {
                 (*out).exit = NativeExit::Transfer;
             }

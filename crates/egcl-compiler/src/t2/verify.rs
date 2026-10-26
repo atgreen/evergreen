@@ -638,6 +638,31 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                     ));
                 }
 
+                if data.opcode == Opcode::SmallVectorRangeP {
+                    use crate::t2::ir::{TypeBits, ValueRepresentation as Repr};
+                    let valid = data.args.iter().chain(&data.results).all(|v| valid_values.contains(&v.0));
+                    if !valid || data.args.len() != 3 || data.results.len() != 1
+                        || data.flags != crate::t2::ir::InstFlags::default()
+                        || data.frame_state.is_some() || !matches!(data.aux, AuxData::None)
+                        || (valid && data.results.len() == 1 &&
+                            (data.args.iter().chain(&data.results).any(|&v| f.value(v).repr != Repr::Tagged)
+                                || f.value(data.results[0]).ty.bits != TypeBits::SYMBOL.join(TypeBits::NULL))) {
+                        errors.push(VerifyError::new("V8 vector-range-predicate-contract",
+                            format!("block{bi} requires three tagged operands and one pure Boolean result")));
+                    }
+                }
+                if data.opcode == Opcode::VecSetInRange {
+                    use crate::t2::ir::ValueRepresentation as Repr;
+                    let valid = data.args.iter().chain(&data.results).all(|v| valid_values.contains(&v.0));
+                    if !valid || data.args.len() != 4 || data.results.len() != 1
+                        || data.flags != (crate::t2::ir::InstFlags {
+                            effectful: true, guard: true, ..Default::default() })
+                        || data.frame_state.is_none() || !matches!(data.aux, AuxData::None)
+                        || data.args.iter().chain(&data.results).any(|&v| f.value(v).repr != Repr::Tagged) {
+                        errors.push(VerifyError::new("V8 vector-range-access-contract",
+                            format!("block{bi} requires a guarded tagged store and its SSA witness")));
+                    }
+                }
                 if data.opcode == Opcode::TryIntegerShr {
                     use crate::t2::ir::{TypeBits, ValueRepresentation as Repr};
                     let valid = data.args.iter().chain(&data.results).all(|v| valid_values.contains(&v.0));
@@ -751,6 +776,11 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
 
     if errors.is_empty() {
         verify_cleanup_continuations(f, &mut errors);
+    }
+    if errors.is_empty() {
+        if let Err(error) = crate::t2::vector_range_proof::verify_accesses(f) {
+            errors.push(VerifyError::new("V8 vector-range-proof", error));
+        }
     }
     if errors.is_empty() {
         Ok(())

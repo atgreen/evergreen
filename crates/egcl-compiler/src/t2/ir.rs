@@ -301,6 +301,10 @@ pub enum Opcode {
     SetCar,
     SetCdr,
     VecSet,
+    /// Simple-vector store whose fourth operand witnesses a successful
+    /// SmallVectorRangeP and a verified counted-loop induction. The verifier
+    /// re-establishes that proof; ordinary stores never gain unchecked flags.
+    VecSetInRange,
     SetSymbolValue,
     WriteBarrier,
     MemoryFence,
@@ -376,6 +380,10 @@ pub enum Opcode {
     /// AuxData::FixnumImm; results are (tagged T/NIL, tagged fixnum). Unsupported
     /// layouts/results return NIL and fixnum zero without error or deopt.
     TryIntegerShr,
+    /// Pure range/layout probe: (vector, start, end) -> tagged T/NIL. True
+    /// establishes a small-header simple vector and fixnum endpoints with
+    /// 0 <= start <= end <= length. Never allocates, errors or deoptimizes.
+    SmallVectorRangeP,
 }
 
 impl Opcode {

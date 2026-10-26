@@ -26624,6 +26624,19 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
         }
     }
 
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    if std::env::var_os("EGCL_DISABLE_VECTOR_RANGES").is_none() {
+        for function in std::iter::once(&mut f).chain(packed.iter_mut()) {
+            let ranges = egcl_compiler::t2::vector_ranges::version_counted_stores(function);
+            if ranges.loops != 0 {
+                t2_log!("{name}: vector range versions: {} stores={}", ranges.loops, ranges.stores);
+            }
+            for reason in ranges.declined {
+                t2_log!("{name}: vector range version declined: {reason}");
+            }
+        }
+    }
+
     if let Err(e) = egcl_compiler::t2::verify::verify(&f) {
         t2_log!("{name}: post-mid-end verify failed: {e:?} => stay T1");
         return None;

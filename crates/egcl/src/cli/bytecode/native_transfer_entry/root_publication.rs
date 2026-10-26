@@ -87,6 +87,19 @@ pub(in super::super) type ObserveHook = Option<fn()>;
 pub(in super::super) static OBSERVE: egcl_rt::execution_local::ExecutionLocal<Cell<ObserveHook>> =
     unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| Cell::new(None)) };
 
+/// Test observer after runtime poll work drains, while native roots remain
+/// published and before OSR preparation or generated-request refresh.
+#[cfg(test)]
+pub(in super::super) static OBSERVE_AFTER: egcl_rt::execution_local::ExecutionLocal<Cell<ObserveHook>> =
+    unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| Cell::new(None)) };
+
+#[cfg(test)]
+pub(super) fn observe_after() {
+    if let Some(hook) = OBSERVE_AFTER.with(Cell::get) {
+        hook();
+    }
+}
+
 /// Locate a fixture value only at an actual published generated poll, and
 /// require that no managed activation or MV buffer is keeping it alive.
 #[cfg(test)]
