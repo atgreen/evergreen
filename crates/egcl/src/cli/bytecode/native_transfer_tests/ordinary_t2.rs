@@ -2254,3 +2254,92 @@ fn ordinary_t2_packed_store_does_not_box_per_element() {
     let NativeCodeStorage::Mapped(mapped) = &code._storage else { unreachable!() };
     assert_eq!(mapped.deopt_count(), 0, "the packed arm must stay native");
 }
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
+fn ordinary_t2_vector_store_reloads_destination_after_collecting_box() {
+    const CHILD: &str = "EGCL_TEST_ARRAY_BOX_RELOCATION_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        // Inline allocation is selected once per process. Isolate this test so
+        // every escape box takes our collecting veneer, without changing the
+        // production helper or the allocation policy of neighboring tests.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "cli::bytecode::native_transfer_tests::ordinary_t2::ordinary_t2_vector_store_reloads_destination_after_collecting_box",
+                "--ignored", "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .env("EGCL_INLINE_ALLOC", "0")
+            .env("EGCL_GC_POISON", "1")
+            .output().unwrap();
+        assert!(output.status.success(), "collecting-box child failed: {}\n{}\n{}",
+            output.status, String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("RAW-ARRAY-BOX-MOVED"),
+            "the exact native relocation test must run in the child");
+        return;
+    }
+
+    use egcl_compiler::t2::native_transfer::{SysvTransferCapture, emit_published_helper_veneer};
+    use egcl_rt::jit::JitBuffer;
+    thread_local! {
+        static DESTINATION: Cell<*const EgclVal> = const { Cell::new(std::ptr::null()) };
+        static BOX_CALLS: Cell<usize> = const { Cell::new(0) };
+        static MOVEMENT: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+    }
+    unsafe extern "C" fn collecting_box(
+        request: *mut u8, out: *mut NativeOutcome, image: *mut SysvTransferCapture,
+    ) {
+        let bits = request as u64;
+        let value = unsafe { native_transfer_entry::root_publication::published(image, || {
+            BOX_CALLS.with(|count| count.set(count.get() + 1));
+            // This points into ARGS, a rooted Vec owned by the test. Keep only
+            // raw addresses across GC; never borrow its value while GC updates it.
+            let slot = DESTINATION.with(Cell::get);
+            assert!(!slot.is_null());
+            let before = (*slot).to_raw();
+            egcl_rt::gc::full_gc().unwrap();
+            let after = (*slot).to_raw();
+            MOVEMENT.with(|movement| movement.set((before, after)));
+            egcl_rt::gc::alloc_double_float(f64::from_bits(bits))
+        }) };
+        unsafe { out.write(NativeOutcome { value, exit: NativeExit::Returned }) };
+    }
+
+    let _lock = super::super::super::heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    // The helper always returns normally; the cold entry is deliberately a trap.
+    // Both buffers outlive both invocations of the installed code in this child.
+    let cold = JitBuffer::new(&[0x0f, 0x0b]).unwrap();
+    let veneer = JitBuffer::new(&emit_published_helper_veneer(collecting_box, cold.as_ptr())).unwrap();
+    egcl_compiler::t2::emit::install_box_double_veneer(veneer.as_ptr() as u64);
+    assert!(egcl_rt::gc::native_alloc_layout().is_none(), "box fast path must be disabled");
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    let (symbol, code) = install("ORDINARY-T2-COLLECTING-ARRAY-BOX", "(dst scale)",
+        "((setf (aref dst 0) (* scale 0.5d0)) dst)", &mut env);
+    assert_mapped_t2(&code);
+    egcl_rt::rooted!(packed = egcl_rt::packed_f64::make(1, 0.0).unwrap());
+    egcl_rt::rooted!(scale = egcl_rt::gc::alloc_double_float(7.5));
+    egcl_rt::rooted!(args = vec![*packed, *scale]);
+    assert_eq!(run_native(&code, symbol, &args, &mut env).unwrap(), *packed);
+    assert_eq!(egcl_rt::packed_f64::get(*packed, 0), Some(3.75));
+    assert_eq!(BOX_CALLS.with(Cell::get), 0,
+        "the installed TryPackedF64Set arm must avoid boxing");
+
+    egcl_rt::collect_t0_minor().unwrap();
+    egcl_rt::rooted!(dst = super::super::super::read_eval_all_env("(vector nil)", &mut env).unwrap());
+    args[0] = *dst;
+    DESTINATION.with(|slot| slot.set(args.as_ptr()));
+    let before = dst.to_raw();
+    egcl_rt::rooted!(result = run_native(&code, symbol, &args, &mut env).unwrap());
+    DESTINATION.with(|slot| slot.set(std::ptr::null()));
+    assert_eq!(BOX_CALLS.with(Cell::get), 1,
+        "the same code must execute its vector-only BoxFloat slow arm");
+    let moved = MOVEMENT.with(Cell::get);
+    assert_eq!(moved.0, before, "destination must still be young at the boxing boundary");
+    assert_ne!(moved.0, moved.1, "boxing must actually relocate the destination");
+    assert_ne!(dst.to_raw(), before, "destination must move across the native call");
+    assert_eq!(*result, *dst, "the returned destination must be the relocated root");
+    assert_eq!(egcl_stdlib::sequences::aref(*dst, 0).unwrap().as_double_float(), 3.75,
+        "VecSet must recompute the element address after the collecting box");
+    let NativeCodeStorage::Mapped(mapped) = &code._storage else { unreachable!() };
+    assert_eq!(mapped.deopt_count(), 0, "both store arms must execute native code");
+    println!("RAW-ARRAY-BOX-MOVED");
+}
