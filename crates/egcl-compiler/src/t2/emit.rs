@@ -4865,6 +4865,49 @@ fn packed_f64_element_address(
     alu_rr(a, 0x01, SCRATCH, RAX);
 }
 
+/// Noncollecting barrier leaf. Host bookkeeping may grow, but this cannot
+/// initiate Lisp GC or retain the interior pointer after returning.
+unsafe extern "C" fn store_vector_element(slot: *mut egcl_rt::EgclVal, value: u64) {
+    unsafe { egcl_rt::gc::store_ref(slot, egcl_rt::EgclVal::from_raw(value)) };
+}
+
+/// Leave the simple-vector element's slot address in rdx. Small and large
+/// headers share the same body layout: raw length, then tagged elements.
+fn vector_element_address(a: &mut Asm, array: u8, index: u8,
+    constant_index: Option<u64>, deopt: egcl_rt::asm::Label) {
+    mov_rr(a, SCRATCH, array);
+    alu_r_imm(a, 4, SCRATCH, 7);
+    alu_r_imm(a, 7, SCRATCH, egcl_rt::value::TAG_HEAP_OBJECT as i32);
+    a.jcc(Cc::Ne, deopt);
+    mov_rr(a, SCRATCH, array);
+    alu_r_imm(a, 4, SCRATCH, -8);
+    a.extend_from_slice(&[0x80, 0x7a, 0x07, egcl_rt::object::type_id::SIMPLE_VECTOR]);
+    a.jcc(Cc::Ne, deopt);
+    let small = a.label();
+    let body = a.label();
+    a.extend_from_slice(&[0x66, 0x81, 0x3a, 0xff, 0xff]);
+    a.jcc(Cc::Ne, small);
+    alu_r_imm(a, 0, SCRATCH, 16);
+    a.jmp(body);
+    a.bind(small);
+    alu_r_imm(a, 0, SCRATCH, 8);
+    a.bind(body);
+    if let Some(bits) = constant_index { mov_imm64(a, RAX, bits as i64); }
+    else { mov_rr(a, RAX, index); }
+    alu_r_imm(a, 4, RAX, 7);
+    a.jcc(Cc::Ne, deopt);
+    if let Some(bits) = constant_index { mov_imm64(a, RAX, bits as i64); }
+    else { mov_rr(a, RAX, index); }
+    sar_imm(a, RAX, 3);
+    alu_r_imm(a, 7, RAX, 0);
+    a.jcc(Cc::L, deopt);
+    cmp_mem64_disp8(a, RAX, SCRATCH, 0);
+    a.jcc(Cc::Ge, deopt);
+    shl_imm(a, RAX, 3);
+    alu_rr(a, 0x01, SCRATCH, RAX);
+    alu_r_imm(a, 0, SCRATCH, 8);
+}
+
 /// Decline raw representation transport. `EGCL_RAW_DBG` names the reason on
 /// stderr (with the rendered IR printed once per checked function).
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -4919,7 +4962,7 @@ fn native_representations_supported(
             let data = f.inst(inst);
             // Edges carry raw values only through equally represented block
             // parameters, checked by the ordinary IR verifier.
-            if matches!(data.opcode, Opcode::PackedF64Ref | Opcode::PackedF64Set) {
+            if matches!(data.opcode, Opcode::PackedF64Ref | Opcode::VecF64Ref | Opcode::PackedF64Set | Opcode::TryPackedF64Set) {
                 // The verifier checks the exact operand, representation and
                 // ordered recovery contract for these operations.
                 continue;
@@ -5056,7 +5099,7 @@ fn emit_transfer_function_with_storage(
     for &block in f.block_order() {
         for &inst in &f.block(block).insts {
             let data = f.inst(inst);
-            if matches!(data.opcode, Opcode::UnboxFloat | Opcode::PackedF64Ref | Opcode::PackedF64Set
+            if matches!(data.opcode, Opcode::UnboxFloat | Opcode::PackedF64Ref | Opcode::VecF64Ref | Opcode::PackedF64Set | Opcode::TryPackedF64Set
                 | Opcode::ConstDouble | Opcode::BoxFloat)
                 || (matches!(data.opcode, Opcode::FloatAdd | Opcode::FloatSub | Opcode::FloatMul
                     | Opcode::FloatDiv | Opcode::FloatSqrt | Opcode::FloatNeg)
@@ -5177,6 +5220,7 @@ fn emit_transfer_function_with_storage(
                     | Opcode::Car
                     | Opcode::Cdr
                     | Opcode::StringCharOrNil
+                    | Opcode::VecRef | Opcode::VecSet | Opcode::ArrayReadDiscarded | Opcode::PackedF64P
                     | Opcode::MemoryFence
             ) {
                 return Err(EmitError::UnsupportedOp(op_tag(f.inst(inst).opcode)));
@@ -6343,6 +6387,8 @@ fn emit_framed_inner(
                             | Opcode::ClearMv
                             | Opcode::TakeValuesToLocals
                             | Opcode::MemoryFence
+                            | Opcode::TryPackedF64Set
+                            | Opcode::PackedF64P
                     )
                 {
                     continue;
@@ -7251,7 +7297,154 @@ fn emit_framed_inner(
                 a.jcc(Cc::Ne, label);
                 load_mem64_disp(&mut a, dst, SCRATCH, 8);
                 a.bind(done);
-            } else if matches!(d.opcode, Opcode::PackedF64Ref | Opcode::PackedF64Set) {
+            } else if d.opcode == Opcode::PackedF64P {
+                let failed = a.label();
+                let done = a.label();
+                let array = if let Some(&bits) = const_tagged.get(&d.args[0]) {
+                    mov_imm64(&mut a, RAX, bits as i64); RAX
+                } else { inst_reg[&d.args[0]] };
+                mov_rr(&mut a, SCRATCH, array);
+                alu_r_imm(&mut a, 4, SCRATCH, 7);
+                alu_r_imm(&mut a, 7, SCRATCH, egcl_rt::value::TAG_HEAP_OBJECT as i32);
+                a.jcc(Cc::Ne, failed);
+                mov_rr(&mut a, SCRATCH, array);
+                alu_r_imm(&mut a, 4, SCRATCH, -8);
+                a.extend_from_slice(&[0x80, 0x7a, 0x07, egcl_rt::object::type_id::SIMPLE_ARRAY]);
+                a.jcc(Cc::Ne, failed);
+                let small = a.label(); let body = a.label();
+                a.extend_from_slice(&[0x66, 0x81, 0x3a, 0xff, 0xff]);
+                a.jcc(Cc::Ne, small);
+                alu_r_imm(&mut a, 0, SCRATCH, 16); a.jmp(body);
+                a.bind(small); alu_r_imm(&mut a, 0, SCRATCH, 8); a.bind(body);
+                a.extend_from_slice(&[0x80, 0x3a, egcl_rt::object::ElementTypeTag::DoubleFloat as u8]);
+                a.jcc(Cc::Ne, failed);
+                let dst = inst_reg[&d.results[0]];
+                mov_imm64(&mut a, dst, egcl_rt::value::T.0 as i64); a.jmp(done);
+                a.bind(failed); mov_imm64(&mut a, dst, egcl_rt::value::NIL.0 as i64);
+                a.bind(done);
+            } else if d.opcode == Opcode::ArrayReadDiscarded {
+                let label = *inst_deopt.get(&inst)
+                    .ok_or(EmitError::UnsupportedOp(op_tag(d.opcode)))?;
+                let AuxData::CallTarget(symbol) = d.aux else {
+                    return Err(EmitError::UnsupportedOp(op_tag(d.opcode)));
+                };
+                let array = if let Some(&bits) = const_tagged.get(&d.args[0]) {
+                    mov_imm64(&mut a, RAX, bits as i64); RAX
+                } else { inst_reg[&d.args[0]] };
+                let index = inst_reg.get(&d.args[1]).copied().unwrap_or(RAX);
+                let vector = a.label();
+                let done = a.label();
+                if egcl_rt::symbols::registry_key(symbol).as_deref() == Some("AREF") {
+                    mov_rr(&mut a, SCRATCH, array);
+                    alu_r_imm(&mut a, 4, SCRATCH, 7);
+                    alu_r_imm(&mut a, 7, SCRATCH, egcl_rt::value::TAG_HEAP_OBJECT as i32);
+                    a.jcc(Cc::Ne, label);
+                    mov_rr(&mut a, SCRATCH, array);
+                    alu_r_imm(&mut a, 4, SCRATCH, -8);
+                    a.extend_from_slice(&[0x80, 0x7a, 0x07, egcl_rt::object::type_id::SIMPLE_VECTOR]);
+                    a.jcc(Cc::E, vector);
+                    packed_f64_element_address(&mut a, array, index,
+                        const_tagged.get(&d.args[1]).copied(), label);
+                    a.jmp(done);
+                    a.bind(vector);
+                }
+                vector_element_address(&mut a, array, index,
+                    const_tagged.get(&d.args[1]).copied(), label);
+                a.bind(done);
+            } else if d.opcode == Opcode::TryPackedF64Set {
+                let failed = a.label();
+                let done = a.label();
+                let array = if let Some(&bits) = const_tagged.get(&d.args[0]) {
+                    mov_imm64(&mut a, RAX, bits as i64); RAX
+                } else { inst_reg[&d.args[0]] };
+                let index = inst_reg.get(&d.args[1]).copied().unwrap_or(RAX);
+                packed_f64_element_address(&mut a, array, index,
+                    const_tagged.get(&d.args[1]).copied(), failed);
+                store_mem64_disp(&mut a, SCRATCH, egcl_rt::packed_f64::DATA_OFFSET as i32,
+                    inst_reg[&d.args[2]]);
+                let dst = inst_reg[&d.results[0]];
+                mov_imm64(&mut a, dst, egcl_rt::value::T.0 as i64);
+                a.jmp(done);
+                a.bind(failed);
+                mov_imm64(&mut a, dst, egcl_rt::value::NIL.0 as i64);
+                a.bind(done);
+            } else if matches!(d.opcode, Opcode::VecRef | Opcode::VecSet) {
+                let label = *inst_deopt.get(&inst)
+                    .ok_or(EmitError::UnsupportedOp(op_tag(d.opcode)))?;
+                let array = if let Some(&bits) = const_tagged.get(&d.args[0]) {
+                    mov_imm64(&mut a, RAX, bits as i64); RAX
+                } else { inst_reg[&d.args[0]] };
+                let index = inst_reg.get(&d.args[1]).copied().unwrap_or(RAX);
+                let vector = a.label();
+                let stored = a.label();
+                if d.opcode == Opcode::VecSet {
+                    mov_rr(&mut a, SCRATCH, array);
+                    alu_r_imm(&mut a, 4, SCRATCH, 7);
+                    alu_r_imm(&mut a, 7, SCRATCH, egcl_rt::value::TAG_HEAP_OBJECT as i32);
+                    a.jcc(Cc::Ne, label);
+                    mov_rr(&mut a, SCRATCH, array);
+                    alu_r_imm(&mut a, 4, SCRATCH, -8);
+                    a.extend_from_slice(&[0x80, 0x7a, 0x07, egcl_rt::object::type_id::SIMPLE_VECTOR]);
+                    a.jcc(Cc::E, vector);
+                    packed_f64_element_address(&mut a, array, index,
+                        const_tagged.get(&d.args[1]).copied(), label);
+                    // Preserve the interior slot address while validating the
+                    // tagged double. No call or safepoint occurs in this span.
+                    push_reg(&mut a, SCRATCH);
+                    let failed = a.label();
+                    let value = d.args[2];
+                    if let Some(&bits) = const_tagged.get(&value) { mov_imm64(&mut a, RAX, bits as i64); }
+                    else { mov_rr(&mut a, RAX, inst_reg[&value]); }
+                    mov_rr(&mut a, SCRATCH, RAX);
+                    alu_r_imm(&mut a, 4, SCRATCH, 7);
+                    alu_r_imm(&mut a, 7, SCRATCH, egcl_rt::value::TAG_HEAP_OBJECT as i32);
+                    a.jcc(Cc::Ne, failed);
+                    mov_rr(&mut a, SCRATCH, RAX);
+                    alu_r_imm(&mut a, 4, SCRATCH, -8);
+                    a.extend_from_slice(&[0x80, 0x7a, 0x07, egcl_rt::object::type_id::DOUBLE_FLOAT]);
+                    a.jcc(Cc::Ne, failed);
+                    load_mem64_disp(&mut a, RAX, SCRATCH, 8);
+                    pop_reg(&mut a, SCRATCH);
+                    store_mem64_disp(&mut a, SCRATCH, egcl_rt::packed_f64::DATA_OFFSET as i32, RAX);
+                    let dst = inst_reg[&d.results[0]];
+                    if let Some(&bits) = const_tagged.get(&value) { mov_imm64(&mut a, dst, bits as i64); }
+                    else { mov_rr(&mut a, dst, inst_reg[&value]); }
+                    a.jmp(stored);
+                    a.bind(failed);
+                    pop_reg(&mut a, SCRATCH);
+                    a.jmp(label);
+                    a.bind(vector);
+                }
+                vector_element_address(&mut a, array, index,
+                    const_tagged.get(&d.args[1]).copied(), label);
+                if d.opcode == Opcode::VecRef {
+                    load_mem64_disp(&mut a, inst_reg[&d.results[0]], SCRATCH, 0);
+                } else {
+                    // Preserve every caller-save home around the noncollecting
+                    // barrier leaf. No map or safepoint exposes the slot pointer.
+                    let volatile = [RAX, 1, 2, 6, 7, 8, 9, 10, 11];
+                    for &reg in &volatile { push_reg(&mut a, reg); }
+                    a.extend_from_slice(&[0x48, 0x83, 0xec, 8]);
+                    mov_rr(&mut a, 7, SCRATCH);
+                    let value = d.args[2];
+                    if let Some(&bits) = const_tagged.get(&value) {
+                        mov_imm64(&mut a, 6, bits as i64);
+                    } else {
+                        let reg = inst_reg[&value];
+                        if let Some(pos) = volatile.iter().position(|&r| r == reg) {
+                            load_from_rsp(&mut a, 6, (8 + (8 - pos) * 8) as i32);
+                        } else { mov_rr(&mut a, 6, reg); }
+                    }
+                    mov_imm64(&mut a, RAX, store_vector_element as *const () as i64);
+                    a.extend_from_slice(&[0xff, 0xd0]);
+                    a.extend_from_slice(&[0x48, 0x83, 0xc4, 8]);
+                    for &reg in volatile.iter().rev() { pop_reg(&mut a, reg); }
+                    let dst = inst_reg[&d.results[0]];
+                    if let Some(&bits) = const_tagged.get(&value) { mov_imm64(&mut a, dst, bits as i64); }
+                    else { mov_rr(&mut a, dst, inst_reg[&value]); }
+                }
+                if d.opcode == Opcode::VecSet { a.bind(stored); }
+            } else if matches!(d.opcode, Opcode::PackedF64Ref | Opcode::VecF64Ref | Opcode::PackedF64Set) {
                 if !published_native_roots || !native_call_storage {
                     return Err(EmitError::UnsupportedOp(op_tag(d.opcode)));
                 }
@@ -7265,15 +7458,41 @@ fn emit_framed_inner(
                     RAX
                 } else { inst_reg[&d.args[0]] };
                 let index = inst_reg.get(&d.args[1]).copied().unwrap_or(RAX);
+                let packed = a.label();
+                let loaded = a.label();
+                if matches!(d.opcode, Opcode::PackedF64Ref | Opcode::VecF64Ref) {
+                    mov_rr(&mut a, SCRATCH, array);
+                    alu_r_imm(&mut a, 4, SCRATCH, 7);
+                    alu_r_imm(&mut a, 7, SCRATCH, egcl_rt::value::TAG_HEAP_OBJECT as i32);
+                    a.jcc(Cc::Ne, label);
+                    mov_rr(&mut a, SCRATCH, array);
+                    alu_r_imm(&mut a, 4, SCRATCH, -8);
+                    a.extend_from_slice(&[0x80, 0x7a, 0x07, egcl_rt::object::type_id::SIMPLE_VECTOR]);
+                    a.jcc(Cc::Ne, if d.opcode == Opcode::VecF64Ref { label } else { packed });
+                    vector_element_address(&mut a, array, index,
+                        const_tagged.get(&d.args[1]).copied(), label);
+                    load_mem64_disp(&mut a, SCRATCH, SCRATCH, 0);
+                    mov_rr(&mut a, RAX, SCRATCH);
+                    alu_r_imm(&mut a, 4, RAX, 7);
+                    alu_r_imm(&mut a, 7, RAX, egcl_rt::value::TAG_HEAP_OBJECT as i32);
+                    a.jcc(Cc::Ne, label);
+                    alu_r_imm(&mut a, 4, SCRATCH, -8);
+                    a.extend_from_slice(&[0x80, 0x7a, 0x07, egcl_rt::object::type_id::DOUBLE_FLOAT]);
+                    a.jcc(Cc::Ne, label);
+                    load_mem64_disp(&mut a, inst_reg[&d.results[0]], SCRATCH, 8);
+                    a.jmp(loaded);
+                    a.bind(packed);
+                }
                 packed_f64_element_address(&mut a, array, index,
                     const_tagged.get(&d.args[1]).copied(), label);
-                if d.opcode == Opcode::PackedF64Ref {
+                if matches!(d.opcode, Opcode::PackedF64Ref | Opcode::VecF64Ref) {
                     load_mem64_disp(&mut a, inst_reg[&d.results[0]], SCRATCH,
                         egcl_rt::packed_f64::DATA_OFFSET as i32);
                 } else {
                     store_mem64_disp(&mut a, SCRATCH, egcl_rt::packed_f64::DATA_OFFSET as i32,
                         inst_reg[&d.args[2]]);
                 }
+                if matches!(d.opcode, Opcode::PackedF64Ref | Opcode::VecF64Ref) { a.bind(loaded); }
             } else if matches!(d.opcode, Opcode::FloatSqrt | Opcode::FloatNeg | Opcode::FloatDiv)
                 && d.results.first().is_some_and(|&value|
                     f.value(value).repr == ValueRepresentation::UnboxedF64)

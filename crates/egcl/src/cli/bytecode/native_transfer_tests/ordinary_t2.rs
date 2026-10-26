@@ -2200,3 +2200,57 @@ fn ordinary_t2_self_recursion_exceeds_legacy_depth_without_fallback() {
     assert_eq!(unsafe { &*execution }.active_native_control(), control);
     assert_eq!(egcl_rt::native_transfer::current_segment(), segment);
 }
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
+fn ordinary_t2_array_store_barrier_preserves_and_moves_a_young_value() {
+    let _lock = super::super::super::heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    super::super::super::read_eval_all_env(
+        "(defun array-access-allocator () (%ordinary-t2-root-for-test))
+         (defun array-access-collector () (%force-minor-gc-for-test))", &mut env).unwrap();
+    let (symbol, code) = install("ORDINARY-T2-ARRAY-BARRIER", "(dst)",
+        "((setf (aref dst 0) (array-access-allocator))
+          (array-access-collector)
+          (aref dst 0))", &mut env);
+    assert_mapped_t2(&code);
+    egcl_rt::rooted!(dst = super::super::super::read_eval_all_env("(vector nil)", &mut env).unwrap());
+    egcl_rt::gc::full_gc().unwrap();
+    egcl_rt::rooted!(args = vec![*dst]);
+    expect_entry(&code);
+    egcl_rt::rooted!(result = run_native(&code, symbol, &args, &mut env).unwrap());
+    let before = ALLOCATED_ROOT.with(Cell::get);
+    assert_ne!(before, 0, "the installed caller must allocate its stored cons");
+    assert_ne!(result.to_raw(), before, "the new referent must actually relocate");
+    assert_eq!(super::super::super::cp(*result), (EgclVal::from_fixnum(71), NIL));
+    assert_eq!(egcl_stdlib::sequences::aref(*dst, 0).unwrap(), *result);
+    let NativeCodeStorage::Mapped(mapped) = &code._storage else { unreachable!() };
+    assert_eq!(mapped.deopt_count(), 0, "simple-vector memory operations must stay native");
+    assert!(observed_entry());
+}
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
+fn ordinary_t2_packed_store_does_not_box_per_element() {
+    // Production startup installs this process-lifetime helper before compiling
+    // raw candidates. The minimal unit-test Env skips that startup sequence.
+    native_transfer_entry::install_box_double_veneer();
+    let _lock = super::super::super::heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    let (symbol, code) = install("ORDINARY-T2-RAW-ARRAY-STORE", "(dst n)",
+        "((dotimes (i n) (setf (aref dst i) (* i 0.001d0))) dst)", &mut env);
+    assert_mapped_t2(&code);
+    egcl_rt::rooted!(dst = egcl_rt::packed_f64::make(256, 0.0).unwrap());
+    egcl_rt::rooted!(args = vec![*dst, EgclVal::from_fixnum(1)]);
+    run_native(&code, symbol, &args, &mut env).unwrap();
+    let before = egcl_rt::gc::heap_stats().bytes_allocated;
+    args[1] = EgclVal::from_fixnum(256);
+    run_native(&code, symbol, &args, &mut env).unwrap();
+    let allocated = egcl_rt::gc::heap_stats().bytes_allocated - before;
+    assert_eq!(allocated, 0, "the warmed packed-store kernel must allocate no Lisp objects");
+    assert_eq!(egcl_rt::packed_f64::get(*dst, 255), Some(0.255));
+    let NativeCodeStorage::Mapped(mapped) = &code._storage else { unreachable!() };
+    assert_eq!(mapped.deopt_count(), 0, "the packed arm must stay native");
+}

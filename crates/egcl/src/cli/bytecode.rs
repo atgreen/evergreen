@@ -25804,6 +25804,7 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
                 inline_options.with_call_site_profile(saved.symbol, bcp, calls, saved.invocations);
         }
     }
+    let array_inline_options = inline_options.clone();
     let built = if cfg!(all(target_arch = "x86_64", target_os = "linux"))
         && bf.code.iter().any(|op| matches!(op, Instr::PushCatch { .. } | Instr::PushUnwind { .. }
             | Instr::PushHandlerCase { .. } | Instr::PushHandlerBind { .. } | Instr::PushRestartCase { .. }
@@ -25853,6 +25854,7 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
             &profile,
             egcl_compiler::t2::speculate::SpeculateOptions { double_float: true },
         );
+        let array_sites = egcl_compiler::t2::array_access::specialize(&mut candidate, true, &array_inline_options);
         let raw = egcl_compiler::t2::unbox_f64::has_raw_doubles(&candidate);
         let optimized = !raw || egcl_compiler::t2::unbox_f64::optimize(&mut candidate);
         // Only the x86-64 Linux mapped entry unboxes raw OSR imports
@@ -25868,7 +25870,7 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
         if !optimized {
             t2_log!("{name}: raw double candidate failed verification => tagged only");
             None
-        } else if packed_sites == 0 && raw && {
+        } else if packed_sites == 0 && array_sites == 0 && raw && {
             // Raw code installs only with the mapped calling convention, whose
             // calls cost about a microsecond more than the ordinary ABI's. A
             // body that is mostly calls would lose more there than its few
@@ -25879,7 +25881,7 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
         } {
             t2_log!("{name}: raw double candidate is call-dominated => tagged only");
             None
-        } else if packed_sites != 0 || raw {
+        } else if packed_sites != 0 || array_sites != 0 || raw {
             t2_log!(
                 "{name}: raw double candidate: speculated {speculated} site(s), {} packed",
                 packed_sites
@@ -25893,6 +25895,7 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
         profile(bcp).filter(|spec| *spec != egcl_compiler::t2::speculate::SpecType::DoubleFloat)
     };
     let speculated = egcl_compiler::t2::speculate::speculate(&mut f, &tagged_profile);
+    egcl_compiler::t2::array_access::specialize(&mut f, false, &array_inline_options);
     let speculations = t2_numeric_speculations(&f, sym);
     // Speculation is an ENHANCEMENT, not the admission test for T2. Even with no
     // speculatable arithmetic site, T2's mid-end (const-fold + GVN + DCE) still

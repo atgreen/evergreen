@@ -372,7 +372,8 @@ fn eval(opcode: Opcode, aux: &AuxData, ops: &[IRType]) -> IRType {
             };
             IRType::of(bits)
         }
-        PackedF64Ref => IRType::of(TypeBits::DOUBLE_FLOAT),
+        TryPackedF64Set | PackedF64P => IRType::of(TypeBits::SYMBOL.join(TypeBits::NULL)),
+        PackedF64Ref | VecF64Ref => IRType::of(TypeBits::DOUBLE_FLOAT),
         BoxFloat | UnboxFloat => {
             let bits = ops[0]
                 .bits

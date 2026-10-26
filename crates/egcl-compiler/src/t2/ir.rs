@@ -272,10 +272,18 @@ pub enum Opcode {
     Car,
     Cdr,
     VecRef,
+    /// Ordered type/bounds check for an AREF/SVREF whose result is fully dead.
+    ArrayReadDiscarded,
     /// Guarded simple packed-double load: tagged array/index -> raw F64.
     PackedF64Ref,
+    /// Guarded SIMPLE_VECTOR load of a boxed double, returned as raw F64.
+    VecF64Ref,
     /// Guarded simple packed-double store: tagged array/index, raw F64; no result.
     PackedF64Set,
+    /// Noncollecting packed store probe; returns T on success, NIL otherwise.
+    TryPackedF64Set,
+    /// Exact packed-double layout predicate; never signals or allocates.
+    PackedF64P,
     SymbolValue,
     /// `#'f` for a global function name — a RUNTIME load of the symbol's
     /// function cell, not a constant: the function may be redefined between

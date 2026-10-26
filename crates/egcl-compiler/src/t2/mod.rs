@@ -134,3 +134,6 @@ pub mod opt_fold; // constant folding + strength reduction
 pub mod packed_f64;
 /// Raw double-float representation cleanup after double speculation.
 pub mod unbox_f64;
+
+/// Guarded general array element accesses.
+pub mod array_access;
