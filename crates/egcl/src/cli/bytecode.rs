@@ -26395,6 +26395,12 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
         }
     };
     if cfg!(all(target_arch = "x86_64", target_os = "linux"))
+        && std::env::var_os("EGCL_DISABLE_INTEGER_EXTRACTION").is_none()
+    {
+        let extracted = egcl_compiler::t2::integer_extract::specialize(&mut f, &array_inline_options);
+        if extracted != 0 { t2_log!("{name}: native integer extraction: {extracted} site(s)"); }
+    }
+    if cfg!(all(target_arch = "x86_64", target_os = "linux"))
         && std::env::var_os("EGCL_DISABLE_LOOP_PEELING").is_none()
     {
         let peeled = egcl_compiler::t2::opt_loop_peel::peel_for_numeric_types(
@@ -26510,6 +26516,21 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     if let Some(candidate) = &mut packed {
         egcl_compiler::t2::unbox_f64::remove_dead_boxes(candidate);
     }
+    // Keep the tagged artifact usable if representation selection or native
+    // emission declines the raw candidate, just as for raw doubles.
+    if std::env::var_os("EGCL_DISABLE_RAW_FIXNUM").is_none() {
+        let mut candidate = packed.as_ref().unwrap_or(&f).clone();
+        let raw = egcl_compiler::t2::unbox_fixnum::run_profitable(&mut candidate);
+        if raw != 0 {
+            if egcl_compiler::t2::verify::verify(&candidate).is_ok() {
+                t2_log!("{name}: raw fixnum values: {raw}");
+                packed = Some(candidate);
+            } else {
+                t2_log!("{name}: raw fixnum candidate verify failed; retaining tagged fallback");
+            }
+        }
+    }
+
     if let Err(e) = egcl_compiler::t2::verify::verify(&f) {
         t2_log!("{name}: post-mid-end verify failed: {e:?} => stay T1");
         return None;

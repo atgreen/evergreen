@@ -18,6 +18,9 @@ pub enum NativeValueLocation {
     /// SysV callee-saved hardware register, recovered by unwinding the callee.
     Register(u8),
     Constant(EgclVal),
+    /// Scalar machine bits; representation determines their interpretation.
+    /// Never a tagged value, pointer, writable location, or GC root.
+    RawConstant(u64),
     /// A nonroot whose volatile home was overwritten by call setup or the callee.
     Unavailable,
 }
@@ -161,6 +164,12 @@ impl NativeFrameValues {
             }
             let location = match entry.location {
                 FrameValueLocation::Immediate(value) => NativeValueLocation::Constant(value),
+                FrameValueLocation::RawImmediate(bits) => {
+                    if entry.repr != ValueRepresentation::UnboxedFixnum {
+                        return Err(Error::InvalidValues);
+                    }
+                    NativeValueLocation::RawConstant(bits)
+                },
                 FrameValueLocation::Home(_) if shadow.is_some() => {
                     shadow.unwrap()
                 }
@@ -294,11 +303,16 @@ impl NativeFrameValues {
                         return Err(Error::InvalidLocation);
                     }
                     NativeValueLocation::Constant(constant)
-                        if egcl_rt::gc::is_heap_ref(constant) =>
+                        if value.repr != ValueRepresentation::Tagged || egcl_rt::gc::is_heap_ref(constant) =>
                     {
                         return Err(Error::InvalidValues);
                     }
-                    NativeValueLocation::Constant(_) | NativeValueLocation::Unavailable => {
+                    NativeValueLocation::RawConstant(bits)
+                        if value.repr != ValueRepresentation::UnboxedFixnum
+                            || !(egcl_rt::bignum::FIXNUM_MIN..=egcl_rt::bignum::FIXNUM_MAX).contains(&(bits as i64)) => {
+                        return Err(Error::InvalidValues);
+                    }
+                    NativeValueLocation::Constant(_) | NativeValueLocation::RawConstant(_) | NativeValueLocation::Unavailable => {
                         if value.may_reference_heap {
                             return Err(Error::InvalidValues);
                         }
@@ -351,6 +365,29 @@ mod tests {
             activation_base_slot: Some(7),
             activation_slots: 12,
         }
+    }
+
+    #[test]
+    fn raw_constants_with_pointer_like_bits_are_never_tagged_roots() {
+        for bits in [1u64, 3, 5, 7, u64::MAX] {
+            let values = [FrameValue { value: Value(0), repr: Repr::UnboxedFixnum,
+                location: FrameValueLocation::RawImmediate(bits) }];
+            let map = NativeFrameValues::for_call(&values, &[], 0, &[], None,
+                layout(), None, |_| false).unwrap();
+            assert_eq!(map.ssa_value(Value(0)).unwrap().locations(), &[NativeValueLocation::RawConstant(bits)]);
+            assert_eq!(map.gc_locations().count(), 0);
+            assert!(NativeFrameValues::for_call(&values, &[Value(0)], 0, &[], None,
+                layout(), None, |_| false).is_err(), "a raw constant cannot be requested as a root");
+            let invalid = [FrameValue { repr: Repr::Tagged, ..values[0] }];
+            assert!(NativeFrameValues::for_call(&invalid, &[], 0, &[], None,
+                layout(), None, |_| false).is_err());
+        }
+        // The original tagged immediate rule remains strict.
+        let tagged = [FrameValue { value: Value(0), repr: Repr::Tagged,
+            location: FrameValueLocation::Immediate(EgclVal(1)) }];
+        assert!(egcl_rt::gc::is_heap_ref(EgclVal(1)));
+        assert!(NativeFrameValues::for_call(&tagged, &[], 0, &[], None,
+            layout(), None, |_| false).is_err());
     }
 
     #[test]

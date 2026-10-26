@@ -1956,12 +1956,26 @@ fn ordinary_single_frame_states(body: &BytecodeFunction, ir: &egcl_compiler::t2:
 // Dynamic scopes, escaping control identities and MV still need independent
 // representation-aware contracts before they can share this narrow entry.
 fn packed_f64_native_body(body: &BytecodeFunction, ir: &egcl_compiler::t2::ir::Function) -> bool {
+    numeric_native_body(body, ir, false)
+}
+
+// Fixnum boxing is a nonallocating tag shift; tagged multiple-value transport
+// can therefore share its existing mapped contract after explicit conversion.
+fn raw_numeric_native_body(body: &BytecodeFunction, ir: &egcl_compiler::t2::ir::Function) -> bool {
+    let allow_values = (0..ir.num_values()).all(|index|
+        ir.value(egcl_compiler::t2::ir::Value(index as u32)).repr
+            != egcl_compiler::t2::ir::ValueRepresentation::UnboxedF64);
+    numeric_native_body(body, ir, allow_values)
+}
+
+fn numeric_native_body(body: &BytecodeFunction, ir: &egcl_compiler::t2::ir::Function, allow_values: bool) -> bool {
     // The original boot SETF bytecode retains its primary-value binder. Admit
-    // that transport only when specialization eliminated every live binder; SetValues remains excluded below.
+    // that transport only when specialization eliminated every live binder.
+    // Tagged multiple values are admitted for scalar fixnum candidates.
     let normalized = ir.block_order().iter().all(|&block| ir.block(block).insts.iter().all(|&inst| {
         ir.inst(inst).opcode != egcl_compiler::t2::ir::Opcode::TakeValuesToLocals
     }));
-    normalized && local_control_native_body(body, false, true, true)
+    normalized && local_control_native_body(body, allow_values, true, true)
         && !body.code.iter().any(|op| matches!(op,
             Instr::PushCatch { .. } | Instr::Throw
                 | Instr::PushUnwind { .. } | Instr::EnterCleanupNormal { .. } | Instr::CleanupReturn

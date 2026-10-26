@@ -8,6 +8,8 @@
     "egcl:test:tier_corpus": [""],
     "egcl:test:speculation_feedback": [""],
     "egcl:test:loop_peeling": [""],
+    "egcl:test:integer_extraction": [""],
+    "egcl:test:raw_fixnum": [""],
     "egcl-stdlib:test:integer_shifts": [""]
   },
   "areas": {

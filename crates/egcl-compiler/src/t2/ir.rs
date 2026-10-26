@@ -367,6 +367,11 @@ pub enum Opcode {
     /// Raw double negation: flips the sign bit, so `(- 0d0)` is `-0d0` as in
     /// the interpreter. Total; never deopts (bliss-lhy89).
     FloatNeg,
+    /// Extract low bits from any integer, with a nonnegative fixnum mask in
+    /// AuxData::FixnumImm. Tagged bignums use their low magnitude limb with
+    /// sign correction; raw fixnums need only an AND. Nonintegers deopt to
+    /// the retained BYTE/LDB expression before any private descriptor exists.
+    IntegerLowBits,
 }
 
 impl Opcode {
@@ -795,6 +800,24 @@ impl Function {
         });
         self.blocks[block.index()].params.push(v);
         v
+    }
+
+    /// Remove an unused parameter and its incoming edge arguments. The caller
+    /// has already retired all executable/FrameState/OSR uses of its value.
+    /// Arena identities remain stable; following parameter ordinals are fixed.
+    pub(crate) fn remove_block_param(&mut self, block: Block, index: usize) -> Value {
+        let removed = self.blocks[block.index()].params.remove(index);
+        for (num, value) in self.blocks[block.index()].params.iter().enumerate() {
+            self.values[value.index()].def = ValueDef::Param { block, num: num as u16 };
+        }
+        for source in self.block_order.clone() {
+            if let Some(inst) = self.terminator(source) {
+                for edge in &mut self.insts[inst.index()].targets {
+                    if edge.block == block { edge.args.remove(index); }
+                }
+            }
+        }
+        removed
     }
 
     /// Append a (non-terminator) instruction to `block`, returning it plus its

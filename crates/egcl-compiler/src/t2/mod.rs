@@ -140,3 +140,8 @@ pub mod unbox_f64;
 
 /// Guarded general array element accesses.
 pub mod array_access;
+
+/// Native constant byte extraction.
+pub mod integer_extract;
+/// Signed machine integer representation selection.
+pub mod unbox_fixnum;

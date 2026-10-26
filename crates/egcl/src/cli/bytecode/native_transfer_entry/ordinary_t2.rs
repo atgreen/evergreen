@@ -11,6 +11,7 @@ pub(in crate::cli::bytecode) struct PreparedT2 {
     emitted: EmittedTransfer,
     clear_mv_resets: usize,
     raw_f64_values: usize,
+    raw_fixnum_values: usize,
 }
 
 pub(in crate::cli::bytecode) fn prepare_ordinary_t2(
@@ -42,10 +43,12 @@ pub(in crate::cli::bytecode) fn prepare_ordinary_t2(
     }
     let has_raw = (0..optimized.num_values())
         .any(|index| optimized.value(Value(index as u32)).repr != ValueRepresentation::Tagged);
-    if has_raw && (!packed_f64_native_body(&input.body, optimized)
+    let admitted_body = raw_numeric_native_body(&input.body, optimized);
+    if has_raw && (!admitted_body
         || (0..optimized.num_values()).any(|index| !matches!(
             optimized.value(Value(index as u32)).repr,
-            ValueRepresentation::Tagged | ValueRepresentation::UnboxedF64)))
+            ValueRepresentation::Tagged | ValueRepresentation::UnboxedF64
+                | ValueRepresentation::UnboxedFixnum)))
     {
         return decline("unsupported raw representation or control scope");
     }
@@ -78,7 +81,10 @@ pub(in crate::cli::bytecode) fn prepare_ordinary_t2(
     let raw_f64_values = (0..mapped.num_values()).filter(|&index|
         mapped.value(Value(index as u32)).repr == ValueRepresentation::UnboxedF64
     ).count();
-    Some(PreparedT2 { emitted, clear_mv_resets, raw_f64_values })
+    let raw_fixnum_values = (0..mapped.num_values()).filter(|&index|
+        mapped.value(Value(index as u32)).repr == ValueRepresentation::UnboxedFixnum
+    ).count();
+    Some(PreparedT2 { emitted, clear_mv_resets, raw_f64_values, raw_fixnum_values })
 }
 
 pub(in crate::cli::bytecode) fn install_ordinary_t2(
@@ -117,7 +123,7 @@ pub(in crate::cli::bytecode) fn install_ordinary_t2(
                 // A raw double candidate declined; install the tagged artifact
                 // with its own speculation metadata instead (bliss-thcbb).
                 t2_log_write(format_args!(
-                    "{}: raw double T2 emission declined ({decline}); installing tagged T2",
+                    "{}: raw numeric T2 emission declined ({decline}); installing tagged T2",
                     display_fn_name(&body.name)
                 ));
                 artifact.mapped = Some(tagged);
@@ -161,12 +167,13 @@ pub(in crate::cli::bytecode) fn install_ordinary_t2(
     if t2_log_target().is_some() {
         let clear_mv_resets = prepared.clear_mv_resets;
         let raw_f64_values = prepared.raw_f64_values;
+        let raw_fixnum_values = prepared.raw_fixnum_values;
         let abi = match &native._storage {
             NativeCodeStorage::Mapped(code) if code.ordinary_entry.is_some() => "ordinary x86-64 Lisp",
             _ => "mapped",
         };
         t2_log_write(format_args!(
-            "{}: {abi} T2 emitted; clear_mv_resets={clear_mv_resets}, raw_f64_values={raw_f64_values}",
+            "{}: {abi} T2 emitted; clear_mv_resets={clear_mv_resets}, raw_f64_values={raw_f64_values}, raw_fixnum_values={raw_fixnum_values}",
             display_fn_name(&body.name)
         ));
     }

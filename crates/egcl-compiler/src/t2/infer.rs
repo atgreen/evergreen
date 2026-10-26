@@ -442,6 +442,13 @@ fn eval(opcode: Opcode, aux: &AuxData, ops: &[IRType]) -> IRType {
                 ..IRType::of(TypeBits::FIXNUM)
             }
         }
+        IntegerLowBits => match aux {
+            AuxData::FixnumImm(mask) if (0..=(1i64 << 60) - 1).contains(mask) => IRType {
+                range: Some(Range { lo: 0, hi: *mask }),
+                ..IRType::of(TypeBits::FIXNUM)
+            },
+            _ => IRType::TOP,
+        },
         // Fixnum ops whose range we do not track precisely: known FIXNUM, full range.
         FixnumDiv | FixnumFloor | FixnumMin | FixnumMax | FixnumRem | FixnumMod | LogOr
         | LogXor | LogNot | WidenI32 | UnboxFixnum | BoxFixnum => fixnum_full(),

@@ -549,7 +549,7 @@ impl EmittedTransfer {
             if !matches!(tier, CompilationTier::T2)
                 || !has_metadata
                 || (!ir.osr_entries.is_empty() && !raw_osr)
-                || !packed_f64_native_body(body, ir)
+                || !raw_numeric_native_body(body, ir)
             {
                 return Err(EmitDecline::RawValues);
             }

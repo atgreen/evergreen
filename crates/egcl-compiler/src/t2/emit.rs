@@ -144,6 +144,9 @@ use crate::t2::slot_map::ConversionKind;
 use crate::t2::x64_frame::{select_frame_homes, ValueHome as FramedHome, GPR_X86};
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[path = "emit_integer_low_bits.rs"]
+mod integer_low_bits;
+
 #[path = "ordinary_leaf.rs"]
 mod ordinary_leaf;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -1560,6 +1563,71 @@ fn parallel_home_move_snapshot(a: &mut Asm, moves: &[(FramedHome, HomeMoveSrc)])
     a.extend_from_slice(&(bytes as i32).to_le_bytes());
 }
 
+/// Raw fixnums remain signed 61-bit mathematical integers. Compute into reserved
+/// registers so a failed range guard leaves every pre-operation SSA home intact.
+fn emit_raw_fixnum_inst(
+    a: &mut Asm, f: &Function, data: &crate::t2::ir::InstData,
+    reg: &std::collections::HashMap<crate::t2::ir::Value, u8>,
+    consts: &std::collections::HashMap<crate::t2::ir::Value, i64>,
+    deopt: egcl_rt::asm::Label,
+) -> Result<(), EmitError> {
+    use crate::t2::ir::Opcode;
+    let load = |a: &mut Asm, value, target| -> Result<(), EmitError> {
+        if let Some(&n) = consts.get(&value) { mov_imm64(a, target, n); }
+        else { mov_rr(a, target, *reg.get(&value).ok_or(EmitError::UnsupportedOp(0xF2))?); }
+        Ok(())
+    };
+    load(a, data.args[0], RAX)?;
+    if data.args.len() > 1 { load(a, data.args[1], 7)?; }
+    let mut range_guard = false;
+    if let Some(cc) = fixnum_cmp_cc(data.opcode) {
+        cmp_rr(a, RAX, 7);
+        let dst = reg[&data.results[0]];
+        mov_imm64(a, dst, egcl_rt::value::T.0 as i64);
+        let done = a.label();
+        a.jcc(cc, done);
+        mov_imm64(a, dst, egcl_rt::value::NIL.0 as i64);
+        a.bind(done);
+        return Ok(());
+    }
+    match data.opcode {
+        Opcode::FixnumAdd => { alu_rr(a, 0x01, RAX, 7);
+            range_guard = !add_sub_cannot_overflow(f.value(data.args[0]).ty.range, f.value(data.args[1]).ty.range, false); }
+        Opcode::FixnumSub => { alu_rr(a, 0x29, RAX, 7);
+            range_guard = !add_sub_cannot_overflow(f.value(data.args[0]).ty.range, f.value(data.args[1]).ty.range, true); }
+        Opcode::FixnumMul => { imul_rr(a, RAX, 7); a.jcc(Cc::O, deopt); range_guard = true; }
+        Opcode::FixnumNeg => { neg_r(a, RAX); range_guard = true; }
+        Opcode::LogAnd => alu_rr(a, 0x21, RAX, 7),
+        Opcode::LogOr => alu_rr(a, 0x09, RAX, 7),
+        Opcode::LogXor => alu_rr(a, 0x31, RAX, 7),
+        Opcode::LogNot => not_r(a, RAX),
+        Opcode::FixnumShl | Opcode::FixnumShr => {
+            let amount = *consts.get(&data.args[1]).ok_or(EmitError::UnsupportedOp(op_tag(data.opcode)))?;
+            if data.opcode == Opcode::FixnumShr || amount < 0 {
+                sar_imm(a, RAX, amount.unsigned_abs().min(63) as u8);
+            } else if amount <= 60 {
+                // Guard the original operand before shifting: a 64-bit shift
+                // alone cannot distinguish values whose high bits were lost.
+                mov_imm64(a, SCRATCH, FIXNUM_MAX >> amount);
+                cmp_rr(a, RAX, SCRATCH); a.jcc(Cc::G, deopt);
+                mov_imm64(a, SCRATCH, FIXNUM_MIN >> amount);
+                cmp_rr(a, RAX, SCRATCH); a.jcc(Cc::L, deopt);
+                shl_imm(a, RAX, amount as u8);
+            } else {
+                alu_r_imm(a, 7, RAX, 0); a.jcc(Cc::Ne, deopt);
+            }
+        }
+        _ => return Err(EmitError::UnsupportedOp(op_tag(data.opcode))),
+    }
+    if range_guard {
+        // OF only detects signed64 overflow; fixnums require exactly signed61.
+        mov_rr(a, SCRATCH, RAX); shl_imm(a, SCRATCH, 3); sar_imm(a, SCRATCH, 3);
+        cmp_rr(a, RAX, SCRATCH); a.jcc(Cc::Ne, deopt);
+    }
+    mov_rr(a, reg[&data.results[0]], RAX);
+    Ok(())
+}
+
 /// Emit one arithmetic instruction (result register pre-assigned). Operands are
 /// read from `reg`/`consts`; the result lands in its allocated register.
 // These are disjoint mutable allocation maps and immutable analysis inputs.
@@ -1580,6 +1648,10 @@ fn emit_arith_inst(
     use crate::t2::ir::Opcode;
     // Robustness: never index past the operands — decline (=> stay T1) instead of
     // panicking in the JIT path if a speculated op has an unexpected shape.
+    if data.results.first().is_some_and(|&value|
+        f.value(value).repr == crate::t2::ir::ValueRepresentation::UnboxedFixnum) {
+        return emit_raw_fixnum_inst(a, f, data, reg, consts, deopt);
+    }
     let is_unary = matches!(data.opcode, Opcode::FixnumNeg | Opcode::LogNot);
     if data.results.is_empty() || data.args.len() < if is_unary { 1 } else { 2 } {
         return Err(EmitError::UnsupportedOp(op_tag(data.opcode)));
@@ -2902,7 +2974,8 @@ fn emit_deopt_source(
     use crate::t2::frame_state::{RematOp, ValueSource};
     match source {
         ValueSource::Value { value, repr } => {
-            if *repr != crate::t2::ir::ValueRepresentation::Tagged {
+            if !matches!(repr, crate::t2::ir::ValueRepresentation::Tagged
+                | crate::t2::ir::ValueRepresentation::UnboxedFixnum) {
                 return Err(EmitError::UnsupportedOp(0xF5));
             }
             if let Some(&bits) = const_tagged.get(value) {
@@ -2915,6 +2988,7 @@ fn emit_deopt_source(
                     rsp_adjust,
                 );
             }
+            if *repr == crate::t2::ir::ValueRepresentation::UnboxedFixnum { shl_imm(a, RAX, 3); }
         }
         ValueSource::Const(value) => {
             if is_moving_gc_reference(*value) {
@@ -4942,7 +5016,7 @@ fn native_representations_supported(
         || storage != NativeCallStorage::NativeStack || !precise_deopt
         || f.block(f.entry()).params.iter().copied().any(raw)
         || (0..f.num_values()).any(|i| !matches!(f.value(Value(i as u32)).repr,
-            Repr::Tagged | Repr::UnboxedF64)))
+            Repr::Tagged | Repr::UnboxedF64 | Repr::UnboxedFixnum)))
     {
         return raw_reject(f, "raw values need published homes, native storage, precise deopt and no raw entry parameter");
     }
@@ -4960,6 +5034,34 @@ fn native_representations_supported(
     for &block in f.block_order() {
         for &inst in &f.block(block).insts {
             let data = f.inst(inst);
+            if matches!(data.opcode, Opcode::BoxFixnum | Opcode::UnboxFixnum) {
+                let (input, output) = if data.opcode == Opcode::BoxFixnum {
+                    (Repr::UnboxedFixnum, Repr::Tagged)
+                } else { (Repr::Tagged, Repr::UnboxedFixnum) };
+                if data.args.len() != 1 || data.results.len() != 1
+                    || f.value(data.args[0]).repr != input || f.value(data.results[0]).repr != output
+                    || data.opcode == Opcode::UnboxFixnum
+                        && (if data.flags.guard { data.frame_state.is_none() }
+                            else { !crate::t2::unbox_fixnum::proven_tagged_fixnum(f, data.args[0]) }) {
+                    return raw_reject(f, "fixnum conversion shape");
+                }
+                continue;
+            }
+            if (matches!(data.opcode, Opcode::ConstFixnum | Opcode::IntegerLowBits)
+                && data.results.len() == 1 && f.value(data.results[0]).repr == Repr::UnboxedFixnum)
+                || (matches!(data.opcode, Opcode::FixnumAdd | Opcode::FixnumSub | Opcode::FixnumMul
+                    | Opcode::FixnumNeg | Opcode::FixnumShl | Opcode::FixnumShr
+                    | Opcode::LogAnd | Opcode::LogOr | Opcode::LogXor | Opcode::LogNot)
+                    && data.results.len() == 1 && f.value(data.results[0]).repr == Repr::UnboxedFixnum
+                    && data.args.iter().enumerate().all(|(index, &value)|
+                        f.value(value).repr == Repr::UnboxedFixnum || index == 1
+                            && matches!(data.opcode, Opcode::FixnumShl | Opcode::FixnumShr)
+                            && matches!(f.value(value).def, crate::t2::ir::ValueDef::Result { inst, .. }
+                                if f.inst(inst).opcode == Opcode::ConstFixnum)))
+                || (fixnum_cmp_cc(data.opcode).is_some() && data.args.len() == 2
+                    && data.args.iter().all(|&value| f.value(value).repr == Repr::UnboxedFixnum)) {
+                continue;
+            }
             // Edges carry raw values only through equally represented block
             // parameters, checked by the ordinary IR verifier.
             if matches!(data.opcode, Opcode::PackedF64Ref | Opcode::VecF64Ref | Opcode::PackedF64Set | Opcode::TryPackedF64Set) {
@@ -5099,6 +5201,7 @@ fn emit_transfer_function_with_storage(
     for &block in f.block_order() {
         for &inst in &f.block(block).insts {
             let data = f.inst(inst);
+            if matches!(data.opcode, Opcode::BoxFixnum | Opcode::UnboxFixnum) { continue; }
             if matches!(data.opcode, Opcode::UnboxFloat | Opcode::PackedF64Ref | Opcode::VecF64Ref | Opcode::PackedF64Set | Opcode::TryPackedF64Set
                 | Opcode::ConstDouble | Opcode::BoxFloat)
                 || (matches!(data.opcode, Opcode::FloatAdd | Opcode::FloatSub | Opcode::FloatMul
@@ -5184,7 +5287,7 @@ fn emit_transfer_function_with_storage(
                     | Opcode::FixnumCmpEq | Opcode::FixnumCmpLt | Opcode::FixnumCmpLe
                     | Opcode::FixnumCmpGt | Opcode::FixnumCmpGe
                     | Opcode::LogAnd | Opcode::LogOr | Opcode::LogXor | Opcode::LogNot
-                    | Opcode::FixnumShl | Opcode::FixnumShr)
+                    | Opcode::FixnumShl | Opcode::FixnumShr | Opcode::IntegerLowBits)
             {
                 continue;
             }
@@ -5606,7 +5709,9 @@ fn emit_framed_inner(
             match (d.opcode, &d.aux) {
                 (Opcode::ConstFixnum, AuxData::FixnumImm(v)) => {
                     consts.insert(r, *v);
-                    const_tagged.insert(r, egcl_rt::value::EgclVal::from_fixnum(*v).0);
+                    const_tagged.insert(r, if f.value(r).repr == ValueRepresentation::UnboxedFixnum {
+                        *v as u64
+                    } else { egcl_rt::value::EgclVal::from_fixnum(*v).0 });
                 }
                 (Opcode::ConstFloat, AuxData::FloatImm(v)) => {
                     float_consts.insert(r, v.to_bits());
@@ -5673,7 +5778,8 @@ fn emit_framed_inner(
                 if uses.get(&cond) == Some(&1) {
                     if let ValueDef::Result { inst, .. } = f.value(cond).def {
                         let op = f.inst(inst).opcode;
-                        if ((code_id == 0 && fixnum_cmp_cc(op).is_some()) || op == Opcode::GenericEq)
+                        if ((code_id == 0 && fixnum_cmp_cc(op).is_some()
+                            && f.inst(inst).args.iter().all(|&v| f.value(v).repr != ValueRepresentation::UnboxedFixnum)) || op == Opcode::GenericEq)
                             && f.block(b).insts.contains(&inst)
                         {
                             fused.insert(inst);
@@ -6375,6 +6481,7 @@ fn emit_framed_inner(
                         d.opcode,
                         Opcode::Call
                             | Opcode::GenericEq
+                            | Opcode::BoxFixnum
                             | Opcode::TypeCheck
                             | Opcode::Car
                             | Opcode::Cdr
@@ -6391,6 +6498,12 @@ fn emit_framed_inner(
                             | Opcode::PackedF64P
                     )
                 {
+                    continue;
+                }
+                if d.opcode == Opcode::UnboxFixnum && !d.flags.guard
+                    && crate::t2::unbox_fixnum::proven_tagged_fixnum(f, d.args[0])
+                {
+                    // A dominating runtime proof makes this a total tag shift.
                     continue;
                 }
                 if (matches!(d.opcode, Opcode::FloatAdd | Opcode::FloatSub | Opcode::FloatMul
@@ -7529,6 +7642,19 @@ fn emit_framed_inner(
                 }
                 let register = inst_reg[&d.results[0]];
                 a.extend_from_slice(&[0x66, rex_w(0, register), 0x0f, 0x7e, modrm_rr(0, register)]);
+            } else if matches!(d.opcode, Opcode::BoxFixnum | Opcode::UnboxFixnum) {
+                let source = d.args[0];
+                if let Some(&bits) = const_tagged.get(&source) { mov_imm64(&mut a, RAX, bits as i64); }
+                else { mov_rr(&mut a, RAX, inst_reg[&source]); }
+                if d.opcode == Opcode::UnboxFixnum {
+                    let label = inst_deopt.get(&inst).copied().unwrap_or(deopt);
+                    if d.flags.guard { guard_fixnum(&mut a, RAX, label); }
+                    sar_imm(&mut a, RAX, 3);
+                } else { shl_imm(&mut a, RAX, 3); }
+                mov_rr(&mut a, inst_reg[&d.results[0]], RAX);
+            } else if d.opcode == Opcode::IntegerLowBits {
+                let label = inst_deopt.get(&inst).copied().unwrap_or(deopt);
+                integer_low_bits::emit(&mut a, f, &d, &mut inst_reg, &mut inst_pool, &const_tagged, label)?;
             } else if d.opcode == Opcode::GenericEq {
                 emit_generic_eq(&mut a, &d, &mut inst_reg, &mut inst_pool, &const_tagged)?;
             } else if d.opcode == Opcode::TypeCheck {
@@ -7551,6 +7677,10 @@ fn emit_framed_inner(
                     &declared_single_floats,
                     label,
                 )?;
+            } else if fixnum_cmp_cc(d.opcode).is_some() && d.args.iter().any(|&v|
+                f.value(v).repr == ValueRepresentation::UnboxedFixnum) {
+                let label = inst_deopt.get(&inst).copied().unwrap_or(deopt);
+                emit_raw_fixnum_inst(&mut a, f, &d, &inst_reg, &consts, label)?;
             } else if fixnum_cmp_cc(d.opcode).is_some() {
                 // A comparison the branch did not fuse: produce T/NIL.
                 let label = inst_deopt.get(&inst).copied().unwrap_or(deopt);
@@ -8108,6 +8238,7 @@ fn emit_framed_inner(
     // a 16-multiple sub keeps the call aligned.
     enum SlotSrc {
         Home(FramedHome),
+        FixnumHome(FramedHome),
         Imm(u64),
         Remat(crate::t2::frame_state::RematRecipeId),
     }
@@ -8182,13 +8313,14 @@ fn emit_framed_inner(
                         {
                             f64_slots.push(u32::try_from(srcs.len() - 4)
                                 .map_err(|_| EmitError::UnsupportedOp(0xF5))?);
-                        } else if *repr != ValueRepresentation::Tagged {
+                        } else if !matches!(repr, ValueRepresentation::Tagged | ValueRepresentation::UnboxedFixnum) {
                             return Err(EmitError::UnsupportedOp(0xF5));
                         }
                         if let Some(&bits) = const_tagged.get(value) {
-                            SlotSrc::Imm(bits)
+                            SlotSrc::Imm(if *repr == ValueRepresentation::UnboxedFixnum { bits << 3 } else { bits })
                         } else if let Some(&home) = homes.get(value) {
-                            SlotSrc::Home(home)
+                            if *repr == ValueRepresentation::UnboxedFixnum { SlotSrc::FixnumHome(home) }
+                            else { SlotSrc::Home(home) }
                         } else {
                             return Err(EmitError::UnsupportedOp(0xF6));
                         }
@@ -8205,6 +8337,7 @@ fn emit_framed_inner(
                 if std::env::var_os("EGCL_DEOPT_SRC_DBG").is_some() {
                     let desc = match &s {
                         SlotSrc::Home(h) => format!("Home({h:?})"),
+                        SlotSrc::FixnumHome(h) => format!("FixnumHome({h:?})"),
                         SlotSrc::Imm(b) => format!("Imm({b:#x})"),
                         SlotSrc::Remat(_) => "Remat".to_string(),
                     };
@@ -8234,6 +8367,11 @@ fn emit_framed_inner(
             match s {
                 SlotSrc::Home(home) => {
                     load_home(&mut a, RAX, *home, alloc as i32);
+                    store_to_rsp(&mut a, RAX, (i * 8) as i32);
+                }
+                SlotSrc::FixnumHome(home) => {
+                    load_home(&mut a, RAX, *home, alloc as i32);
+                    shl_imm(&mut a, RAX, 3);
                     store_to_rsp(&mut a, RAX, (i * 8) as i32);
                 }
                 SlotSrc::Imm(bits) => {
@@ -8427,6 +8565,8 @@ fn emit_framed_inner(
         let raw_constant = |value: Value| match f.value(value).def {
             ValueDef::Result { inst, .. } => match (f.inst(inst).opcode, &f.inst(inst).aux) {
                 (Opcode::ConstDouble, AuxData::DoubleImm(bits)) => Some(*bits),
+                (Opcode::ConstFixnum, AuxData::FixnumImm(n))
+                    if f.value(value).repr == ValueRepresentation::UnboxedFixnum => Some(*n as u64),
                 _ => None,
             },
             _ => None,
@@ -8449,6 +8589,10 @@ fn emit_framed_inner(
                 return raw_double_imports && vreg.class == RegClass::Xmm
                     && (imported(value)
                         || (raw_constant(value).is_some() && homes.contains_key(&value)));
+            }
+            if (vreg.num as usize) < f.num_values()
+                && f.value(value).repr == ValueRepresentation::UnboxedFixnum {
+                return vreg.class == RegClass::Gpr && raw_constant(value).is_some();
             }
             vreg.class == RegClass::Gpr
                 && f.value(value).repr == ValueRepresentation::Tagged
@@ -8502,7 +8646,9 @@ fn emit_framed_inner(
         }
         for vreg in &live {
             let value = Value(vreg.num);
-            if (vreg.num as usize) < f.num_values() && raw_double(value) && !imported(value)
+            if (vreg.num as usize) < f.num_values()
+                && matches!(f.value(value).repr, ValueRepresentation::UnboxedF64 | ValueRepresentation::UnboxedFixnum)
+                && !imported(value)
                 && let (Some(bits), Some(&home)) = (raw_constant(value), homes.get(&value))
             {
                 mov_imm64(&mut a, RAX, bits as i64);
@@ -9973,6 +10119,98 @@ mod tests {
             "a float operand must deopt to the interpreter"
         );
         assert_eq!(CLEARS.load(Ordering::SeqCst), 1, "failed guards must not clear values");
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    thread_local! { static RAW_RECOVERED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
+
+    /// Use exactly the published/native-stack entry protocol required in
+    /// production; the legacy framed wrapper cannot transport raw GC maps.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    fn run_raw_native(f: &Function, input: egcl_rt::value::EgclVal) -> Option<egcl_rt::value::EgclVal> {
+        use egcl_rt::native_transfer::{self, NativeOutcome, NativeExit, NativeReturnValues};
+        unsafe extern "C" fn deopt(request: *mut u8, out: *mut NativeOutcome,
+            _: *mut crate::t2::native_transfer::SysvTransferCapture) {
+            let request = unsafe { &*request.cast::<TransferDeoptRequest>() };
+            WIDE_DEOPTED.with(|seen| seen.set(true));
+            if request.n_words >= 6 {
+                RAW_RECOVERED.with(|value| value.set(unsafe { *request.words.add(5) }));
+            }
+            unsafe { out.write(NativeOutcome { value: egcl_rt::value::NIL, exit: NativeExit::Returned }); }
+        }
+        unsafe extern "C" fn values(_: u64, destination: *mut egcl_rt::value::EgclVal, operation: u64) {
+            if operation == native_transfer::SNAPSHOT_NATIVE_RETURN_VALUES {
+                unsafe { destination.cast::<NativeReturnValues>().write(NativeReturnValues::SINGLE); }
+            }
+        }
+        let veneer = egcl_rt::jit::JitBuffer::new(&crate::t2::native_transfer::emit_published_helper_veneer(
+            deopt, std::ptr::null())).unwrap();
+        let (artifact, _) = emit_framed_native_handlers_with_entries_and_storage(f,
+            1, 1, 1, 1, values as *const () as u64, 1, 1, 0, None,
+            Some(veneer.as_ptr() as u64), &[], NativeRootPublication::PublishedHomes,
+            NativeCallStorage::NativeStack).expect("production mapped raw fixnum artifact");
+        let code = egcl_rt::jit::JitBuffer::new(&artifact.code).unwrap();
+        let mut activation = vec![egcl_rt::value::NIL; 1 + usize::from(artifact.shadow_root_slots)];
+        activation[0] = input;
+        let stack = egcl_rt::EgclStack::new(64 * 1024);
+        WIDE_DEOPTED.with(|seen| seen.set(false));
+        let result = unsafe { native_transfer::invoke_native_segment(code.as_ptr(),
+            activation.as_mut_ptr().cast(), &stack) }.unwrap();
+        assert_eq!(result.exit, NativeExit::Returned);
+        (!WIDE_DEOPTED.with(|seen| seen.get())).then_some(result.value)
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[test]
+    fn raw_fixnum_pass_executes_unbox_math_box_and_checks_61_bit_overflow() {
+        use crate::t2::ir::{Opcode, ValueRepresentation as Repr};
+        use egcl_rt::value::EgclVal;
+        let mut f = speculated_mul5();
+        assert!(crate::t2::unbox_fixnum::run(&mut f) > 0);
+        assert!(f.block_order().iter().flat_map(|&b| &f.block(b).insts)
+            .any(|&i| f.inst(i).opcode == Opcode::UnboxFixnum));
+        assert!(f.block_order().iter().flat_map(|&b| &f.block(b).insts)
+            .any(|&i| f.inst(i).opcode == Opcode::FixnumMul
+                && f.value(f.inst(i).results[0]).repr == Repr::UnboxedFixnum));
+        for x in [-123, 0, 42, FIXNUM_MAX / 5] {
+            assert_eq!(run_raw_native(&f, EgclVal::from_fixnum(x)).map(|v| v.as_fixnum()), Some(x * 5));
+        }
+        // This product fits i64 but not a fixnum: OF alone would miss it.
+        assert!(run_raw_native(&f, EgclVal::from_fixnum(FIXNUM_MAX / 5 + 1)).is_none());
+        assert!(run_raw_native(&f, EgclVal::from_single_float(2.0)).is_none());
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[test]
+    fn raw_fixnum_cold_exit_reboxes_live_intermediate_before_serializing() {
+        use crate::t2::frame_state::{FrameState, FrameScope, ValueSource};
+        use crate::t2::ir::{Opcode, AuxData, InstData, InstFlags, IRType, TypeBits, ValueRepresentation as Repr};
+        let mut f = speculated_mul5();
+        let block = f.entry();
+        let mul = f.block(block).insts.iter().copied().find(|&i| f.inst(i).opcode == Opcode::FixnumMul).unwrap();
+        let value = f.inst(mul).results[0];
+        let x = f.block(block).params[0];
+        let fs = f.frame_states.add(FrameState { scopes: vec![FrameScope { function: 0, bcp: 3,
+            locals: vec![ValueSource::Value { value: x, repr: Repr::Tagged }],
+            stack: vec![ValueSource::Value { value, repr: Repr::Tagged }] }], remat: vec![] });
+        let term = f.terminator(block).unwrap();
+        let (constant, c) = f.push_inst(block, InstData { opcode: Opcode::ConstFixnum,
+            args: vec![], results: vec![], aux: AuxData::FixnumImm(FIXNUM_MAX),
+            flags: InstFlags::default(), targets: vec![], frame_state: None, source_pos: 0 },
+            &[(IRType::of(TypeBits::FIXNUM), Repr::Tagged)]);
+        let (add, result) = f.push_inst(block, InstData { opcode: Opcode::FixnumAdd,
+            args: vec![value, c[0]], results: vec![], aux: AuxData::None,
+            flags: InstFlags { guard: true, ..InstFlags::default() }, targets: vec![], frame_state: Some(fs), source_pos: 0 },
+            &[(IRType::of(TypeBits::FIXNUM), Repr::Tagged)]);
+        let body = &mut f.block_mut(block).insts;
+        body.retain(|&i| i != constant && i != add);
+        let pos = body.iter().position(|&i| i == term).unwrap();
+        body.splice(pos..pos, [constant, add]);
+        f.inst_mut(term).args = vec![result[0]];
+        assert!(crate::t2::unbox_fixnum::run(&mut f) > 0);
+        RAW_RECOVERED.with(|value| value.set(0));
+        assert!(run_raw_native(&f, egcl_rt::value::EgclVal::from_fixnum(7)).is_none());
+        assert_eq!(egcl_rt::value::EgclVal(RAW_RECOVERED.with(|value| value.get())).as_fixnum(), 35);
     }
 
     /// Build post-speculation IR for `(x) -> x * c` where the param `x` carries
