@@ -1201,7 +1201,8 @@ fn resolve(name: &str) -> Option<Handler> {
             };
             Ok(struct_slot_typespec(*object, *slot))
         }),
-        // Boot MAKE-ARRAY's common case: LENGTH elements, no options but
+        // Boot MAKE-ARRAY's common case: LENGTH elements (a bare integer or
+        // proper rank-one dimension list), no options but
         // :ELEMENT-TYPE and either :INITIAL-ELEMENT or :INITIAL-CONTENTS, and
         // an element type that upgrades to T -- which is a simple vector. NIL
         // means another case, which boot parses in full.
@@ -1217,6 +1218,26 @@ fn resolve(name: &str) -> Option<Handler> {
                     "%MAKE-SIMPLE-ARRAY takes two arguments".into(),
                 ));
             };
+            let length = if length.is_cons() {
+                // This diagnostic disables only the rank-one extension. Bare
+                // lengths keep their existing fast path for paired timings.
+                static RANK_ONE_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                if !*RANK_ONE_ENABLED.get_or_init(|| {
+                    std::env::var_os("EGCL_DISABLE_RANK_ONE_ARRAY_FASTPATH").is_none()
+                }) {
+                    return Ok(NIL);
+                }
+                let (dimension, tail) = cp(*length);
+                if !tail.is_nil() {
+                    return Ok(NIL);
+                }
+                dimension
+            } else {
+                *length
+            };
+            // All symbol resolution is already finished, and only a validated
+            // immediate dimension survives the later collecting allocation.
+            // The dimension list itself is not retained in a Rust local.
             if !length.is_fixnum() || length.as_fixnum() < 0 {
                 return Ok(NIL);
             }
