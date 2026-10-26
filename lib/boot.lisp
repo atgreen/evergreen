@@ -730,8 +730,11 @@
   ;; WRITE to a string stream: WRITE binds every printer-control keyword
   ;; (:base :circle :escape :pretty :length ...) around the printing, so this
   ;; honours them all (CLHS 22.4; ansi printer print.cons.5-7).
-  (with-output-to-string (s)
-    (apply #'write x :stream s keys)))
+  ;; This definition precedes WITH-OUTPUT-TO-STRING's macro installation.
+  ;; Use its core expansion so every tier can compile the bootstrap body.
+  (let ((s (make-string-output-stream)))
+    (apply #'write x :stream s keys)
+    (get-output-stream-string s)))
 
 ;; Minimal PPRINT: a fresh newline, then the escaped printed representation of
 ;; OBJECT, with no trailing space, returning no values (CLHS). Full XP pretty-

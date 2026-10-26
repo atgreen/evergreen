@@ -153,6 +153,10 @@
 
 ### Fixed
 
+- `WRITE-TO-STRING` honors printer controls under every forced tier during
+  bootstrap, avoiding an undefined-function error from a later macro definition
+  ([#700](https://github.com/atgreen/evergreen/pull/700)).
+
 - General arithmetic `LOOP` clauses evaluate bound and step initial forms once
   in source order, before binding the iteration variable, including zero-trip
   loops and loops whose bodies change the original bound or step
