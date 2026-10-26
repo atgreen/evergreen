@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Added
+
+- `install-egcl-forks` includes the audited ocicl libraries through maintained
+  EGCL forks. Adapters cover archive metadata, command-line handling, clocks,
+  readtable iteration, CLOS JSON encoding, type introspection and macro expansion;
+  libraries with portable implementations include focused compatibility checks.
+  The library guide records tested revisions and remaining capability limits
+  ([#638](https://github.com/atgreen/evergreen/pull/638)).
+
 ### Performance
 
 - On x86-64 Linux, a long-running loop that computes with double-floats,

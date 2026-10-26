@@ -41,6 +41,41 @@ exercises these forks:
 | swank (in the slime tree, branch `egcl`) | https://github.com/atgreen/slime | `69afcb088f6463850c532a2f573d9ec5d875fdb9` |
 | slynk (in the sly tree, branch `egcl`) | https://github.com/atgreen/sly | `e81f332eb458e33cd650f8601f655da58be18b98` — the EGCL backend, moved out of `lib/slynk/` |
 | Quicklisp client (native TCP and directory enumeration) | https://github.com/atgreen/quicklisp-client | `2115f1d96963bf48d6a4c5c7111189bd326bfbed` |
+| archive (branch `egcl`: pathname metadata and stat accessors) | https://github.com/atgreen/archive | `3e500919b0226c10a848aefe8e57a8cff02b2a6b` |
+| zip (branch `egcl`: native file permissions) | https://github.com/atgreen/zip | `6f3efd09130475bd43de6efc1f83da8dae0ac7b9` |
+| unix-opts (branch `egcl`: argv and exit status) | https://github.com/atgreen/unix-opts | `07e240c4b1ac8d3ade055f770713c995f39b7c4d` |
+| with-user-abort (branch `egcl`: interrupt condition) | https://github.com/atgreen/with-user-abort | `9c0b83eb51cd8553d8b731eef5d6163eb82d0fc8` |
+| local-time (branch `egcl`: subsecond wall clock) | https://github.com/atgreen/local-time | `0ac828f4c978696298e41d1f86c8af923a240700` |
+| parachute (branch `egcl`: process exit status) | https://github.com/atgreen/parachute | `99ee47171ec686f7b1d80b1afcd588bb3ed300d5` |
+| alexandria (branch `egcl`) | https://github.com/atgreen/alexandria | `ec09d2346f2314fe799cd76002e465b88623417d` |
+| babel (branch `egcl`) | https://github.com/atgreen/babel | `75fc2911f83711278d1717e5786bbc7cc4a5da7c` |
+| cl-interpol (branch `egcl`) | https://github.com/atgreen/cl-interpol | `3326c4758ec7f07ed32667a0e82bf261d7b7130e` |
+| named-readtables (branch `egcl`) | https://github.com/atgreen/named-readtables | `587960ee3b46e291723aba4bfa8ef74ebd86c151` |
+| cl-utilities (branch `egcl`) | https://github.com/atgreen/cl-utilities | `ef354659a27dc903f638397526d47eab951a019e` |
+| esrap (branch `egcl`) | https://github.com/atgreen/esrap | `b77d22cbcf49eb8d8b50c64b304d906df315fd7b` |
+| global-vars (branch `egcl`) | https://github.com/atgreen/global-vars | `cd58cd24bca9615cacdbd54201e3213020b84e86` |
+| iterate (branch `egcl`) | https://github.com/atgreen/iterate | `73bcbed445417d8b746b0b41b945edd73f48d415` |
+| split-sequence (branch `egcl`) | https://github.com/atgreen/split-sequence | `289ad9090c45d1eedc0f85e812a615ae8dca8e16` |
+| string-case (branch `egcl`) | https://github.com/atgreen/string-case | `5f26c530c1bf3d59896516610161d3112929b92e` |
+| cl-json (branch `egcl`) | https://github.com/atgreen/cl-json | `ec31cbb368ada69444d6fce7d2ef64f97ceb43c8` |
+| cl-selfupdate (branch `egcl`) | https://github.com/atgreen/cl-selfupdate | `28da63816581df8825fb71c66ce6c555a45a9d7d` |
+| drakma (branch `egcl`) | https://github.com/atgreen/drakma | `d94490cfc29a9822e77fe7baded9f17cfa5c13d3` |
+| puri (branch `egcl`) | https://github.com/atgreen/puri | `d5c83b66a09cda3dfb79f1f0009017920b87b519` |
+| quri (branch `egcl`) | https://github.com/atgreen/quri | `93872698b99965b28b63b707e83f99d5cfee55cc` |
+| rewrite-cl (branch `egcl`) | https://github.com/atgreen/rewrite-cl | `110e6fe4904d3610659ea0b163ee0a68ebdc8416` |
+| trivial-custom-debugger (branch `egcl`) | https://github.com/atgreen/trivial-custom-debugger | `8a35b1980298c3fdf88628129217d945e3c5abd8` |
+| trivial-file-size (branch `egcl`) | https://github.com/atgreen/trivial-file-size | `a897f75c4ded70249e1a694f38ca45a68d8de492` |
+| rt (branch `egcl`) | https://github.com/atgreen/rt | `b7bf6c2025541eb7ba3b68ab399d972365fc65c2` |
+| parse-declarations (branch `egcl`) | https://github.com/atgreen/parse-declarations | `c07a536a11de5321c1cf50c5aba883cbf4950b6a` |
+| lift (branch `egcl`) | https://github.com/atgreen/lift | `3a940176d0925aaabfd7e443e687a50c4cdb0b77` |
+| doc (branch `egcl`) | https://github.com/atgreen/doc | `c4d6d18e9c7e63a6f4eefbe93b156dea0511617a` |
+| mgl-pax (branch `egcl`) | https://github.com/atgreen/mgl-pax | `8b55f9ce85ab5a979985055595aeced454b0760c` |
+| introspect-environment (branch `egcl`) | https://github.com/atgreen/introspect-environment | `1bcd945c2e2a6358557272886c03bd120ecc95f7` |
+| trivia (branch `egcl`) | https://github.com/atgreen/trivia | `be03bc1ce6b6ad7217c4838a9ef0ea4b9d579d60` |
+| type-i (branch `egcl`) | https://github.com/atgreen/type-i | `eb2335d44542febcfaaf91adf6d3522787f78f87` |
+| misc-extensions (branch `egcl`) | https://github.com/atgreen/misc-extensions | `d401b504e55d396e8fa9df7fe9af4ae68651c301` |
+| serapeum (branch `egcl`) | https://github.com/atgreen/serapeum | `43b66df1da96578efc90555d4fee1543590295e6` |
+| trivial-macroexpand-all (branch `egcl`) | https://github.com/atgreen/trivial-macroexpand-all | `594238e46b4fbcf5baa35b4e6b1bbb0d2e486f1a` |
 
 The [Quicklisp client scenario](../tests/quicklisp-client/README.md) fetches this
 exact client through ocicl, checks its native connection and filesystem
@@ -96,7 +131,8 @@ commands with `--dry-run` (before the optional project directory). The script
 requires `git` and an `ocicl` version supporting Git sources on `PATH`, stops
 on the first failed install, and fetches each fork's default branch, except
 USOCKET (`egcl-support`), Atomics, closer-mop, Ironclad, pure-tls, chipz, SLIME, SLY and the
-Quicklisp client (`egcl`), where their ports live. No commit revisions
+Quicklisp client, Archive, ZIP, unix-opts, with-user-abort, local-time,
+Parachute and the additional audited forks (`egcl`), where their ports live. No commit revisions
 are specified. It creates `ocicl.csv` if needed so installation stays in the
 selected directory. ocicl records the resolved commits in that file;
 commit it in your project for reproducibility. The script downloads and
@@ -176,3 +212,54 @@ printed and structured backtraces, live condition capture, and output destinatio
 through cold and cached ASDF loads and all four execution modes. Its EGCL adapter
 uses `EGCL-DEBUG` owned snapshots. Argument values are included only when available;
 native argument locations and source locations are not yet exposed.
+
+The [portability fork scenario](../tests/portability-forks/README.md) loads the
+six audit ports through immutable ocicl sources. It checks pathname metadata,
+TAR and ZIP writing/reading, permission bits, raw arguments, interrupt condition
+translation, clock precision and process exit statuses. These are focused
+compatibility checks, not claims that the full upstream suites pass.
+Archive's integer-file-descriptor stat remains unsupported; Parachute timeouts
+remain unenforced on EGCL. The existing unix-opts suite has three failures also
+reproduced without the adapter (`bliss-c1s72`).
+
+The `bliss-wne9.10` audit does not justify adding EGCL to every SBCL branch.
+Many branches are optional optimizations with portable alternatives, including
+Alexandria, Babel, global-vars, named-readtables and trivial-file-size.
+CFFI already has an EGCL fork; its separate static-image operation needs an
+EGCL runtime-linking implementation, not an alias to SBCL's core format.
+Capability-dependent follow-up work is tracked by `bliss-wne9.10.2`, including
+Parachute timeout enforcement and deeper introspection-library coverage.
+
+## Audited ocicl libraries
+
+The additional forks above follow the upstream sources identified by each
+`ocicl/PROJECT/README.org`. Alexandria, Iterate, RT, and Parse Declarations
+preserve their non-GitHub upstream history in `atgreen` repositories. The
+[complete pinned inventory](../tests/audited-forks/forks.json) records each
+source, tested commit, executable smoke-test paths, and coverage limits.
+
+The [audited-forks scenario](../tests/audited-forks/README.md) installs these
+commits through ocicl and runs their public API checks in isolated EGCL
+processes. Named Readtables uses EGCL's native macro-character enumeration,
+which avoids scanning all Unicode characters when loading dependent libraries.
+Libraries whose portable implementation already works retain that code and
+add explicit EGCL validation rather than changing implementation feature flags.
+
+Passing smoke tests do not establish complete upstream-suite conformance.
+In particular, CL-JSON fluid-object decoding remains unsupported; LIFT and
+Parachute do not enforce their timeout fallback; documentation tests cover base
+sections rather than full rendering and navigation; Drakma does not perform a
+network request in this scenario; CL-Selfupdate does not replace executables.
+
+The Trivial Macroexpand All fork requires a runtime exporting
+`EGCL-EXT:MACROEXPAND-ALL` from
+[runtime PR #641](https://github.com/atgreen/evergreen/pull/641). It preserves
+lexical macro environments and quoted
+data; unsupported atomic updates and macro-definition forms signal
+`PROGRAM-ERROR`, and compiler macros are outside this API. The scenario must
+run on that runtime before claiming combined compatibility of its consumers.
+
+Cold CL-Unicode data generation exceeded the 600-second EGCL check limit
+(`bliss-ks0tt`). The audited CL-INTERPOL scenario supports `--prepare-unicode`
+to generate portable Unicode Lisp data with SBCL in a separate cache before
+EGCL compiles and tests it; that is distinct from a cold EGCL build.
