@@ -3136,15 +3136,95 @@ unsafe extern "C" fn save_cleanup(cleanup_bcp: u32, resume_bcp: u32, value: Egcl
     NIL
 }
 
+/// Successful lexical reads/writes neither allocate Lisp objects nor reenter
+/// Lisp. Their own activation already roots its environment and the machine
+/// caller retains every live home. Avoid publishing a second boundary only
+/// while there is no request that needs that boundary to park or signal.
+unsafe fn lexical_environment_leaf(
+    request: *mut u8,
+    image: *mut SysvTransferCapture,
+) -> Option<EgclVal> {
+    use egcl_compiler::t2::emit::{TransferCallRequest, TRANSFER_LEXICAL_ENVIRONMENT_REQUEST};
+    let call = unsafe { &*request.cast::<TransferCallRequest>() };
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    if call.symbol & !u64::from(u32::MAX) != TRANSFER_LEXICAL_ENVIRONMENT_REQUEST
+        || !*ENABLED.get_or_init(|| std::env::var_os("EGCL_LEXICAL_LEAF").is_none_or(|v| v != "0"))
+        || !current_poll_idle()
+    {
+        return None;
+    }
+    let context = unsafe { CAPTURE.with(Cell::get).as_ref() }?;
+    if context.selected.is_some() || context.failure.is_some() || context.osr.is_some()
+        || context.recursive_escape || context.owner.is_null() || context.env_frame.is_null()
+    {
+        return None;
+    }
+    let owner = unsafe { &*context.owner };
+    let pc = unsafe { (*image).return_pc } as usize;
+    if !pc.checked_sub(owner.code.as_ptr() as usize).is_some_and(|offset|
+        offset < owner.code_len && owner._native_calls.value_map(offset).is_some())
+        || !std::ptr::eq(context.body, Arc::as_ptr(&owner.body))
+    {
+        // A direct child can belong to a different retained code owner. Its
+        // publication resolves the exact physical owner before inspecting state.
+        return None;
+    }
+    let instruction = owner.body.code.get(call.symbol as u32 as usize)?;
+    let frame = unsafe { &*context.env_frame }.as_ref()?;
+    let (index, store) = match instruction {
+        Instr::LoadEnvVar(index) if call.nargs == 0 => (*index, false),
+        Instr::StoreEnvVar(index) if call.nargs == 1 && !call.args.is_null() => (*index, true),
+        _ => return None,
+    };
+    let name = owner.body.names.get(usize::from(index))?;
+    let symbol = egcl_rt::symbols::find_index(name);
+    let value = if store {
+        let value = unsafe { *call.args };
+        if !Env::set_resolved_frame_var(frame, name, symbol, value) { return None; }
+        NIL
+    } else {
+        // Missing bindings must signal with the full published native stack.
+        Env::lookup_resolved_frame(frame, name, symbol)?
+    };
+    #[cfg(test)]
+    lexical_leaf_tests::record_hit(store);
+    Some(value)
+}
+
 unsafe extern "C" fn call_or_throw(
     request: *mut u8,
     out: *mut egcl_rt::native_transfer::NativeOutcome,
     image: *mut SysvTransferCapture,
 ) {
+    #[cfg(test)]
+    lexical_leaf_tests::before_request(request);
+    if let Some(value) = unsafe { lexical_environment_leaf(request, image) } {
+        unsafe { out.write(NativeOutcome { value, exit: NativeExit::Returned }); }
+        return;
+    }
     unsafe {
-        root_publication::published(image, || call_or_throw_unpublished(request, out))
+        root_publication::published(image, || {
+            use egcl_compiler::t2::emit::{TransferCallRequest, TRANSFER_LEXICAL_ENVIRONMENT_REQUEST};
+            let kind = (*request.cast::<TransferCallRequest>()).symbol & !u64::from(u32::MAX);
+            if kind == TRANSFER_LEXICAL_ENVIRONMENT_REQUEST {
+                #[cfg(test)]
+                lexical_leaf_tests::record_published(request);
+                // Calls can be the compiler's cooperation points. Service any
+                // armed request while every native frame is precisely visible.
+                if !current_poll_idle() {
+                    poll_or_transfer_unpublished(std::ptr::null_mut(), out);
+                    if (*out).exit != NativeExit::Returned { return; }
+                }
+                #[cfg(test)]
+                lexical_leaf_tests::inside_published(request);
+            }
+            call_or_throw_unpublished(request, out)
+        })
     }
 }
+
+#[cfg(test)]
+mod lexical_leaf_tests;
 
 /// Run the captured-variable instruction at the request's PC against the
 /// executing activation's heap EnvFrame, exactly as the interpreter's arm for

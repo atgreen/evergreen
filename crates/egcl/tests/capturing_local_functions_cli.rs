@@ -77,6 +77,36 @@ const PROGRAM: &str = r#"
        (flet ((three () (+ c (outer 1)))) (three))
        (flet ((four () (+ d (outer 1)))) (four))
        (flet ((five () (+ e (outer 1)))) (five)))))
+(defun mixed-global-cell (x) (+ x 1000))
+(defun mixed-flet-sibling (mask)
+  (flet ((mixed-global-cell (x) (logand x mask))
+         (work (x) (+ mask (mixed-global-cell x))))
+    (work 3)))
+(defun mixed-local-factory (mask)
+  (labels ((cell (x) (logand x mask))
+           ;; MASK is only a transitive free reference, through CELL.
+           (work (n)
+             (let ((sum 0)) (dotimes (i n sum) (incf sum (cell i))))))
+    #'work))
+(defun mixed-local-mutation (n)
+  (let ((stamp 0))
+    (labels ((cell (x) (incf stamp) (logand x 7))
+             (work (count)
+               (let ((sum 0)) (dotimes (i count (+ sum stamp)) (incf sum (cell i))))))
+      (work n))))
+(defun sibling-parameter-shadow (mask)
+  (labels ((cell (x) (logand x mask))
+           (work (mask) (+ (cell 3) mask)))
+    (work 100)))
+(defun boxed-sibling-parameter-shadow (mask)
+  (labels ((cell (x) (logand x mask))
+           (work (mask)
+             (let ((reader (lambda () mask))) (+ (cell 3) (funcall reader)))))
+    (work 100)))
+(defun mixed-callsite-shadow (mask)
+  (labels ((cell (x) (logand x mask))
+           (other (n) (if (zerop n) mask (other (1- n)))))
+    (let ((mask 100)) (declare (ignore mask)) (cell 3))))
 (defun boxed-shadowing (seed)
   (let ((reader (lambda () seed)))
     (flet ((cell () seed))
@@ -99,7 +129,12 @@ const PROGRAM: &str = r#"
   (assert (= (globally-special-local-parameter) 10))
   (assert (equal (compiler-hidden-local-exit) '(:inner :outer-survived)))
   (assert (equal (boxed-shadowing 53) '(53 53)))
-  (assert (= (five-contextual-captures 1 2 3 4 5 10) 70)))
+  (assert (= (five-contextual-captures 1 2 3 4 5 10) 70))
+  (assert (= (mixed-local-mutation 1000) 4500))
+  (assert (= (mixed-flet-sibling 7) 1010))
+  (assert (= (sibling-parameter-shadow 7) 103))
+  (assert (= (boxed-sibling-parameter-shadow 7) 103))
+  (assert (= (mixed-callsite-shadow 7) 3)))
 (let* ((a (shared-locals 10)) (b (shared-locals 100)))
   (assert (= (funcall (first a)) 20))
   (assert (= (funcall (first b)) 110))
@@ -114,6 +149,9 @@ const PROGRAM: &str = r#"
   (block cell
     (flet ((cell () (compiler-hidden-exit-call))) (list (cell) :outer-survived)))
   '(:inner :outer-survived)))
+(let ((work (mixed-local-factory 7)))
+  (dotimes (warm 40) (assert (= (funcall work 1000) 3500)))
+  (format t "MIXED-WORK-TIER ~S~%" (egcl-ext:function-tier work)))
 (format t "FIVE-CAPTURE-TIER ~S~%" (egcl-ext:function-tier 'five-contextual-captures))
 (format t "CAPTURED-LOCALS-OK ~S~%"
         (mapcar #'egcl-ext:function-tier '(captured-read captured-write shadowed-local)))
@@ -122,7 +160,9 @@ const PROGRAM: &str = r#"
 fn check(tier: &str, stress: bool) -> String {
     let mut command = Command::new(env!("CARGO_BIN_EXE_egcl"));
     let program = if stress {
-        PROGRAM.replace("(warm 80)", "(warm 2)")
+        PROGRAM
+            .replace("(warm 80)", "(warm 2)")
+            .replace("(warm 40)", "(warm 2)")
     } else {
         PROGRAM.to_owned()
     };
@@ -158,6 +198,10 @@ fn capturing_local_functions_compile_and_share_bindings() {
     for tier in ["t1", "t2"] {
         let out = check(tier, false);
         if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
+            assert!(
+                !out.contains("MIXED-WORK-TIER 0"),
+                "sibling caller must compile: {out}"
+            );
             assert!(
                 !out.contains("FIVE-CAPTURE-TIER 0"),
                 "five captures must compile: {out}"

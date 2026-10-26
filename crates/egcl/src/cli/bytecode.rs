@@ -2624,6 +2624,31 @@ struct InlineLocal {
     inline_policies: Vec<(u32, bool)>,
 }
 
+impl InlineLocal {
+    /// Boxed values use name-based runtime lookup. Inline only when no later
+    /// lexical binding shadows the definition's captured binding; otherwise the
+    /// materialized closure installs its original environment for the call.
+    fn can_inline_in(&self, lowerer: &Lowerer<'_>) -> bool {
+        let (params, body) = flet_def_forms(self.definition);
+        let params: std::collections::HashSet<_> = list_to_vec(params).into_iter().map(sym_name).collect();
+        let mut used = std::collections::HashSet::new();
+        collect_symbol_names(body, &mut used);
+        used.iter().filter(|name| !params.contains(*name)).all(|name| {
+            if self.declared_special.contains_key(name) || is_special_name(name) { return true; }
+            let definition = self.scopes.iter().enumerate().rev()
+                .find_map(|(index, scope)| scope.get(name).map(|location| (index, *location)));
+            match definition {
+                Some((definition_index, VarLoc::Boxed)) => {
+                    let current = lowerer.scopes.iter().enumerate().rev()
+                        .find_map(|(index, scope)| scope.get(name).map(|location| (index, *location)));
+                    matches!(current, Some((index, VarLoc::Boxed)) if index == definition_index)
+                }
+                _ => true,
+            }
+        })
+    }
+}
+
 impl egcl_rt::gc::TraceHostRoots for InlineLocal {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
         visit(&mut self.definition);
@@ -3864,7 +3889,10 @@ impl<'e> Lowerer<'e> {
         // lowered sibling args out from under a plain Vec.
         egcl_rt::rooted_ref!(_op_root = &mut op);
         egcl_rt::rooted_ref!(_rest_root = &mut rest);
-        if let Some(helper) = self.inline_local_fns.get(name).cloned() {
+        if let Some(helper) = self.inline_local_fns.get(name).cloned()
+            && !self_calls::notinline(op.as_symbol_index(), &self.inline_policies)
+            && helper.can_inline_in(self)
+        {
             return self.lower_inline_local(helper, rest);
         }
         // A lexically-visible local function (flet/labels): call its compiled
@@ -7117,7 +7145,7 @@ impl<'e> Lowerer<'e> {
         self.scopes
             .iter()
             .flat_map(|s| s.iter())
-            .filter(|(_, v)| matches!(v, VarLoc::Slot(_)))
+            .filter(|(name, _)| matches!(self.lookup_local(name), Some(VarLoc::Slot(_))))
             .map(|(k, _)| k.clone())
             .chain(self.enclosing_slots.iter().cloned())
             .collect()
@@ -7271,7 +7299,7 @@ impl<'e> Lowerer<'e> {
                 .scopes
                 .iter()
                 .flat_map(|s| s.iter())
-                .filter(|&(_k, v)| matches!(v, VarLoc::Boxed))
+                .filter(|(name, _)| matches!(self.lookup_local(name), Some(VarLoc::Boxed)))
                 .map(|(k, _v)| k.clone())
                 .collect();
             self.has_env = true;
@@ -7284,6 +7312,7 @@ impl<'e> Lowerer<'e> {
                 &captures,
                 &callable,
                 &self.local_fns,
+                &HashMap::new(),
                 &enclosing_blocks,
                 &enclosing_tags,
                 &enclosing_slots,
@@ -7627,6 +7656,35 @@ impl<'e> Lowerer<'e> {
         r
     }
 
+    /// Select leaf helpers independently of complex/recursive siblings. The
+    /// general path still materializes every function identity for escapes and
+    /// shadowed call sites, while safe direct calls can expand these bodies.
+    fn local_inline_candidates(
+        &self, parsed: &[(String, u32)], defs: &[EgclVal], body: EgclVal,
+    ) -> InlineLocalRoots {
+        let mut helpers = HashMap::new();
+        let mut body_names = std::collections::HashSet::new();
+        collect_symbol_names(body, &mut body_names);
+        if body_names.contains("NOTINLINE") { return InlineLocalRoots(helpers); }
+        let names = parsed.iter().map(|(name, _)| name.clone()).collect();
+        for (index, (name, _)) in parsed.iter().enumerate() {
+            if !inline_local_definition(defs[index], &names)
+                || self_calls::notinline(cp(defs[index]).0.as_symbol_index(), &self.inline_policies)
+            { continue; }
+            let mut used = std::collections::HashSet::new();
+            collect_symbol_names(flet_def_forms(defs[index]).1, &mut used);
+            if used.iter().any(|name| inline_local_macro_reference(self.env, name)
+                || self.closure_fns.contains(name) || self.inline_local_fns.contains_key(name))
+            { continue; }
+            helpers.insert(name.clone(), InlineLocal {
+                definition: defs[index], scopes: self.scopes.clone(),
+                local_fns: self.local_fns.clone(), closure_fns: self.closure_fns.clone(),
+                declared_special: self.declared_special.clone(), inline_policies: self.inline_policies.clone(),
+            });
+        }
+        InlineLocalRoots(helpers)
+    }
+
     /// Compiled capturing `flet`/`labels`: each local function closes over
     /// enclosing lexicals (and, for `labels`, its siblings). Function bindings
     /// live in a shared child frame; LABELS captures that frame while FLET
@@ -7652,16 +7710,18 @@ impl<'e> Lowerer<'e> {
             .scopes
             .iter()
             .flat_map(|s| s.iter())
-            .filter(|&(_k, v)| matches!(v, VarLoc::Boxed))
+            .filter(|(name, _)| matches!(self.lookup_local(name), Some(VarLoc::Boxed)))
             .map(|(k, _v)| k.clone())
             .collect();
         let enclosing_slots: std::collections::HashSet<String> = self
             .scopes
             .iter()
             .flat_map(|s| s.iter())
-            .filter(|&(_k, v)| matches!(v, VarLoc::Slot(_)))
+            .filter(|(name, _)| matches!(self.lookup_local(name), Some(VarLoc::Slot(_))))
             .map(|(k, _v)| k.clone())
             .collect();
+        let mut inline_helpers = self.local_inline_candidates(parsed, defs, body);
+        egcl_rt::rooted_ref!(_inline_helpers = &mut inline_helpers);
         let enclosing_callable = self.closure_fns.clone();
         let mut saved_local_fns = PrivateFunctionRoots(self.local_fns.clone());
         egcl_rt::rooted_ref!(_saved_local_fns = &mut saved_local_fns);
@@ -7759,6 +7819,7 @@ impl<'e> Lowerer<'e> {
 
         // Build each closure and store it in the child frame. Re-derive
         // params/fbody from the rooted `defs` each iteration (compilation allocates).
+        let no_inline_helpers = HashMap::new();
         for i in 0..parsed.len() {
             let (params_form, fbody) = flet_def_block_forms(defs[i]);
             let bf = compile_capturing_local(
@@ -7769,6 +7830,8 @@ impl<'e> Lowerer<'e> {
                 &captures,
                 &callable,
                 &child_local_fns.0,
+                // FLET definition bodies do not see their new siblings.
+                if is_labels { &inline_helpers.0 } else { &no_inline_helpers },
                 &enclosing_blocks,
                 &enclosing_tags,
                 &child_enclosing_slots,
@@ -7804,6 +7867,9 @@ impl<'e> Lowerer<'e> {
             }
         }
 
+        for (name, helper) in &inline_helpers.0 {
+            self.inline_local_fns.insert(name.clone(), helper.clone());
+        }
         let r = self.lower_progn(body);
         self.closure_fns = saved_closure_fns;
         self.local_fns = saved_local_fns.0;
@@ -7964,6 +8030,7 @@ fn compile_capturing_local(
     captures: &std::collections::HashSet<String>,
     callable: &std::collections::HashSet<String>,
     local_fns: &HashMap<String, u32>,
+    inline_helpers: &HashMap<String, InlineLocal>,
     enclosing_blocks: &std::collections::HashSet<String>,
     enclosing_tags: &std::collections::HashSet<String>,
     enclosing_slots: &std::collections::HashSet<String>,
@@ -8003,6 +8070,14 @@ fn compile_capturing_local(
     for name in captures {
         lo.scopes[0].insert(name.clone(), VarLoc::Boxed);
     }
+    for (name, helper) in inline_helpers {
+        let mut helper = helper.clone();
+        helper.scopes = lo.scopes.clone();
+        lo.inline_local_fns.insert(name.clone(), helper);
+    }
+    // Keep parameter bindings distinct from captured homes, including a boxed
+    // parameter with the same name as a helper's definition-site capture.
+    lo.enter_scope();
     let mut param_layout = Vec::with_capacity(param_names.len());
     for pn in &param_names {
         // A parameter shadows a captured enclosing lexical of the same name.
@@ -10052,7 +10127,7 @@ fn inline_local_macro_reference(env: &Env, name: &str) -> bool {
 /// Conservatively select bounded, nonescaping local expression definitions.
 /// Lexical bindings lower in the helper's definition-site scope. Function and
 /// control/declaration forms retain the general compiled closure representation.
-fn inline_local_group(defs: &[EgclVal], body: EgclVal) -> bool {
+fn inline_local_definition(def: EgclVal, names: &std::collections::HashSet<String>) -> bool {
     fn expression(form: EgclVal, budget: &mut usize) -> bool {
         if *budget == 0 { return false; }
         *budget -= 1;
@@ -10095,6 +10170,21 @@ fn inline_local_group(defs: &[EgclVal], body: EgclVal) -> bool {
         }
         tail.is_nil()
     }
+    if !def.is_cons() || !cp(def).0.is_symbol() { return false; }
+    let (params, fbody) = flet_def_forms(def);
+    let Some((parameters, _, _, false)) = parse_lambda_list(params) else { return false; };
+    if parameters.iter().any(|name| is_special_name(name)) { return false; }
+    if list_to_vec(params).iter().any(|p| !p.is_symbol() || sym_name(*p).starts_with('&')) {
+        return false;
+    }
+    let mut used = std::collections::HashSet::new();
+    collect_symbol_names(fbody, &mut used);
+    if !names.is_disjoint(&used) { return false; }
+    let mut budget = 96;
+    list_to_vec(fbody).iter().all(|&form| expression(form, &mut budget))
+}
+
+fn inline_local_group(defs: &[EgclVal], body: EgclVal) -> bool {
     if defs.is_empty() || defs.iter().any(|def| !def.is_cons())
         || body_may_capture_closure(&list_to_vec(body)) { return false; }
     let names: std::collections::HashSet<_> = defs.iter().filter_map(|&def| {
@@ -10104,22 +10194,7 @@ fn inline_local_group(defs: &[EgclVal], body: EgclVal) -> bool {
     if names.len() != defs.len() || references_local_fn_value(body, &names) { return false; }
     let mut used = std::collections::HashSet::new();
     collect_symbol_names(body, &mut used);
-    if used.contains("NOTINLINE") { return false; }
-    for &def in defs {
-        let (params, fbody) = flet_def_forms(def);
-        let Some((parameters, _, _, false)) = parse_lambda_list(params) else { return false; };
-        if parameters.iter().any(|name| is_special_name(name)) { return false; }
-        // Optional defaults require an entry binder; preserve the closure path.
-        if list_to_vec(params).iter().any(|p| !p.is_symbol() || sym_name(*p).starts_with('&')) {
-            return false;
-        }
-        let mut used = std::collections::HashSet::new();
-        collect_symbol_names(fbody, &mut used);
-        if !names.is_disjoint(&used) { return false; }
-        let mut budget = 96;
-        if !list_to_vec(fbody).iter().all(|&form| expression(form, &mut budget)) { return false; }
-    }
-    true
+    !used.contains("NOTINLINE") && defs.iter().all(|&def| inline_local_definition(def, &names))
 }
 
 /// Names of variables captured by a nested `(lambda …)` in `body` (an
@@ -30295,4 +30370,40 @@ fn capturing_local_native_frame_preserves_a_relocated_capture() {
     assert_eq!(*result, *datum, "the closure must return the relocated object");
     assert_eq!(super::val_as_str(*result), "moving local capture");
     assert_eq!(take_native_fallback_count(), 0, "the creator must execute native code");
+}
+
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn mixed_local_sibling_inlines_a_transitive_capture() {
+    let _lock = super::heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    let mask = resolve_sym("MASK").unwrap();
+    env.define_local_symbol(mask, EgclVal::from_fixnum(7));
+    egcl_rt::rooted!(params = reader::read_from_string("(n)").unwrap().0);
+    egcl_rt::rooted!(forms = reader::read_from_string(
+        "((let ((mask 7))
+           (labels ((cell (x) (logand x mask))
+                    (work (count)
+                      (let ((sum 0))
+                        (dotimes (i count sum) (setq sum (+ sum (cell i)))))))
+             (work n))))"
+    ).unwrap().0);
+    let body = compile_function("MIXED-LOCAL-SIBLING", *params, *forms, &env, false, false)
+        .expect("compile capturing sibling group");
+    let worker = &body.nested_functions[1];
+    // The sibling never names MASK in its source. Its generated body must read
+    // the original captured home, rather than call CELL through FUNCALL or read
+    // a global MASK after losing that transitive lexical dependency.
+    assert!(worker.names.iter().any(|name| name == "MASK"));
+    assert!(!worker.names.iter().any(|name| name == "#'CELL"));
+    assert!(!worker.code.iter().any(|op| matches!(op, Instr::CallNamed { sym, .. }
+        if sym_name(EgclVal::from_symbol_index(*sym)) == "FUNCALL")));
+    use native_transfer_entry::{TransferCode, take_native_fallback_count};
+    egcl_rt::rooted!(_worker = ActiveBytecodeRoot::new(worker));
+    let native = TransferCode::compile_mapped_for_test(Arc::clone(worker))
+        .expect("compile the actual sibling body to native code");
+    take_native_fallback_count();
+    assert_eq!(native.run(&[EgclVal::from_fixnum(1000)], &mut env).unwrap(), EgclVal::from_fixnum(3500));
+    assert_eq!(take_native_fallback_count(), 0, "the sibling must run natively");
 }
