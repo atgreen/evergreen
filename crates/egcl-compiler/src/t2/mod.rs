@@ -92,6 +92,8 @@ pub mod opt_clear_mv; // dead multiple-value-reset elimination
 pub mod opt_dce; // deopt-aware DCE + rematerialisation
 pub mod opt_guard; // guard elimination + hoisting
 pub mod opt_gvn; // global value numbering / CSE
+pub mod opt_loop_peel; // profitable type-transition peeling with generic fallback
+mod region_clone;
 pub mod opt_licm; // loop-invariant code motion
 pub mod regalloc; // regalloc2 adapter + stack maps
 // Shared by the framed backends: who may carry a register entry, and which

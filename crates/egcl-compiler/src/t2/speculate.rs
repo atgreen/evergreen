@@ -957,6 +957,21 @@ pub fn speculate_with(
     profile: &impl Fn(u32) -> Option<SpecType>,
     options: SpeculateOptions,
 ) -> usize {
+    speculate_selected(f, profile, options, None)
+}
+
+/// Specialize only a proved fast region; the generic/peeled copies keep their
+/// original calls. Static operand proofs still take precedence over profiles.
+pub(crate) fn speculate_blocks(f: &mut Function, blocks: &[crate::t2::ir::Block]) -> usize {
+    speculate_selected(f, &|_| None, SpeculateOptions { double_float: false }, Some(blocks))
+}
+
+fn speculate_selected(
+    f: &mut Function,
+    profile: &impl Fn(u32) -> Option<SpecType>,
+    options: SpeculateOptions,
+    selected: Option<&[crate::t2::ir::Block]>,
+) -> usize {
     if options.double_float && cfg!(target_arch = "x86_64") {
         split_variadic_double_arithmetic(f, profile);
     }
@@ -988,6 +1003,7 @@ pub fn speculate_with(
         }
     }
     for &b in f.block_order() {
+        if selected.is_some_and(|blocks| !blocks.contains(&b)) { continue; }
         for &inst in &f.block(b).insts {
             let data = f.inst(inst);
             if !matches!(data.opcode, Opcode::Call | Opcode::Invoke) {
@@ -1313,7 +1329,7 @@ pub fn speculate_with(
         .entry_frame_state
         .map(|id| f.frame_states.get(id).scopes[0].function);
     materialize_entry_param_preguards(f, &fixnum_sites, self_sym);
-    materialize_self_call_result_guards(f, self_sym);
+    if selected.is_none() { materialize_self_call_result_guards(f, self_sym); }
     materialize_fixnum_operand_guards(f, &fixnum_sites);
     n
 }

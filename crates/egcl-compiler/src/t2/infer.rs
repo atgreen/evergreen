@@ -268,6 +268,82 @@ fn sat_mul(a: i64, b: i64) -> i64 {
     a.saturating_mul(b)
 }
 
+// These facts describe tagged fixnums after their guards. In particular, a
+// signed i64 range is not a proof that a value fits the tagged representation.
+const FIXNUM_BOUNDS: Range = Range {
+    lo: -(1i64 << 60),
+    hi: (1i64 << 60) - 1,
+};
+
+fn bounded_fixnum_operand(operand: &IRType) -> Option<Range> {
+    if operand.bits != TypeBits::FIXNUM {
+        return None;
+    }
+    let range = operand.range.unwrap_or(FIXNUM_BOUNDS);
+    range_meet(range, FIXNUM_BOUNDS)
+}
+
+fn constant_shift_range(opcode: Opcode, ops: &[IRType]) -> Option<Range> {
+    let input = bounded_fixnum_operand(ops.first()?)?;
+    let count = bounded_fixnum_operand(ops.get(1)?)?;
+    if count.lo != count.hi {
+        return None;
+    }
+    let count = count.lo;
+    let right = match opcode {
+        // ASH's signed count: negative means arithmetic right shift. Avoid
+        // negating the count, which can overflow for an extreme input fact.
+        Opcode::FixnumShl if count < 0 => Some(count.unsigned_abs().min(63) as u32),
+        // This IR opcode has an unsigned-direction count, unlike ASH. Only
+        // the supported nonnegative machine-count domain is inferred here.
+        Opcode::FixnumShr if (0..64).contains(&count) => Some(count as u32),
+        Opcode::FixnumShr => return None,
+        _ => None,
+    };
+    if let Some(count) = right {
+        return Some(Range {
+            lo: input.lo >> count,
+            hi: input.hi >> count,
+        });
+    }
+    if input.lo == 0 && input.hi == 0 {
+        return Some(input);
+    }
+    if count > 60 {
+        return None;
+    }
+    let lo = (input.lo as i128) << count;
+    let hi = (input.hi as i128) << count;
+    // Do not use wrapping shifts, or claim a bounded result when a left shift
+    // can overflow its fixnum domain. The existing overflow guard remains.
+    (lo >= FIXNUM_BOUNDS.lo as i128 && hi <= FIXNUM_BOUNDS.hi as i128).then_some(Range {
+        lo: lo as i64,
+        hi: hi as i64,
+    })
+}
+
+fn positive_mask_range(ops: &[IRType]) -> Option<Range> {
+    let a = bounded_fixnum_operand(ops.first()?)?;
+    let b = bounded_fixnum_operand(ops.get(1)?)?;
+    let (mask, input) = if a.lo == a.hi && a.lo >= 0 {
+        (a.lo, b)
+    } else if b.lo == b.hi && b.lo >= 0 {
+        (b.lo, a)
+    } else {
+        return None;
+    };
+    // For a nonnegative input AND cannot exceed the input either. Negative
+    // inputs still produce a nonnegative result bounded by the mask.
+    Some(Range {
+        lo: 0,
+        hi: if input.lo >= 0 {
+            mask.min(input.hi)
+        } else {
+            mask
+        },
+    })
+}
+
 /// Evaluate the abstract result of an instruction from its operand facts.
 /// Returns `⊥` when an operand is not yet known, so unknowns never pollute a
 /// result with a spuriously-wide fact during the fixpoint.
@@ -355,9 +431,20 @@ fn eval(opcode: Opcode, aux: &AuxData, ops: &[IRType]) -> IRType {
                 class_id: None,
             }
         }
+        FixnumShl | FixnumShr | LogAnd => {
+            let range = if opcode == LogAnd {
+                positive_mask_range(ops)
+            } else {
+                constant_shift_range(opcode, ops)
+            };
+            IRType {
+                range: range.or(Some(FULL)),
+                ..IRType::of(TypeBits::FIXNUM)
+            }
+        }
         // Fixnum ops whose range we do not track precisely: known FIXNUM, full range.
-        FixnumDiv | FixnumFloor | FixnumMin | FixnumMax | FixnumRem | FixnumMod | FixnumShl | FixnumShr | LogAnd | LogOr | LogXor
-        | LogNot | WidenI32 | UnboxFixnum | BoxFixnum => fixnum_full(),
+        FixnumDiv | FixnumFloor | FixnumMin | FixnumMax | FixnumRem | FixnumMod | LogOr
+        | LogXor | LogNot | WidenI32 | UnboxFixnum | BoxFixnum => fixnum_full(),
 
         // Float arithmetic: propagate the float tag(s) of the operands.
         FloatAdd | FloatSub | FloatMul | FloatDiv => {
@@ -409,7 +496,8 @@ fn eval(opcode: Opcode, aux: &AuxData, ops: &[IRType]) -> IRType {
 
         // Comparisons and predicates yield a CL boolean.
         FixnumCmpEq | FixnumCmpLt | FixnumCmpLe | FixnumCmpGt | FixnumCmpGe | FloatCmpEq
-        | FloatCmpLt | FloatCmpLe | FloatCmpGt | FloatCmpGe | GenericEq | GenericEqual | InstanceOf => boolean(),
+        | FloatCmpLt | FloatCmpLe | FloatCmpGt | FloatCmpGe | GenericEq | GenericEqual
+        | InstanceOf => boolean(),
 
         // A type check narrows its operand to the checked tag (spec R4.63).
         // A Guard VALUE does the same for its passed-through result: it exists
@@ -918,6 +1006,174 @@ mod tests {
             "an unknown call result joined with NIL can still be a heap object"
         );
         assert_eq!(inferred.repr(merged), Some(ValueRepresentation::Tagged));
+    }
+
+    fn ranged_fixnum(lo: i64, hi: i64) -> IRType {
+        IRType {
+            range: Some(Range { lo, hi }),
+            ..fixnum()
+        }
+    }
+
+    #[test]
+    fn constant_shift_ranges_cover_signed_and_large_counts() {
+        let cases = [
+            (Opcode::FixnumShl, -9, 17, -3, -2, 2),
+            (Opcode::FixnumShr, -9, 17, 3, -2, 2),
+            (Opcode::FixnumShl, -9, 17, -1000, -1, 0),
+            (Opcode::FixnumShl, 0, 17, -1000, 0, 0),
+            (Opcode::FixnumShl, -17, -1, -1000, -1, -1),
+            (Opcode::FixnumShl, -9, 17, 3, -72, 136),
+            (Opcode::FixnumShl, -9, 17, 0, -9, 17),
+            (Opcode::FixnumShl, 0, 0, FIXNUM_BOUNDS.hi, 0, 0),
+        ];
+        for (opcode, lo, hi, count, expected_lo, expected_hi) in cases {
+            assert_eq!(
+                eval(
+                    opcode,
+                    &AuxData::None,
+                    &[ranged_fixnum(lo, hi), ranged_fixnum(count, count)]
+                )
+                .range,
+                Some(Range {
+                    lo: expected_lo,
+                    hi: expected_hi
+                })
+            );
+        }
+        for (opcode, input, count) in [
+            (
+                Opcode::FixnumShl,
+                ranged_fixnum(0, FIXNUM_BOUNDS.hi),
+                ranged_fixnum(1, 1),
+            ),
+            (
+                Opcode::FixnumShl,
+                ranged_fixnum(-1, 1),
+                ranged_fixnum(1000, 1000),
+            ),
+            (
+                Opcode::FixnumShl,
+                ranged_fixnum(0, 10),
+                ranged_fixnum(-2, -1),
+            ),
+            (
+                Opcode::FixnumShr,
+                ranged_fixnum(0, 10),
+                ranged_fixnum(-1, -1),
+            ),
+            (
+                Opcode::FixnumShr,
+                ranged_fixnum(0, 10),
+                ranged_fixnum(64, 64),
+            ),
+            (Opcode::FixnumShl, IRType::TOP, ranged_fixnum(-8, -8)),
+        ] {
+            assert_eq!(
+                eval(opcode, &AuxData::None, &[input, count]).range,
+                Some(FULL)
+            );
+        }
+    }
+
+    #[test]
+    fn byte_mask_and_shift_ranges_enclose_all_small_inputs() {
+        // Enumerate concrete signed inputs rather than mirroring endpoint
+        // formulas; arithmetic right shifts must round negative values down.
+        for lo in -20..=20 {
+            for hi in lo..=20 {
+                for count in -8..=8 {
+                    let range = eval(
+                        Opcode::FixnumShl,
+                        &AuxData::None,
+                        &[ranged_fixnum(lo, hi), ranged_fixnum(count, count)],
+                    )
+                    .range
+                    .unwrap();
+                    for value in lo..=hi {
+                        let actual = if count < 0 {
+                            value >> -count
+                        } else {
+                            value << count
+                        };
+                        assert!((range.lo..=range.hi).contains(&actual));
+                    }
+                }
+                for mask in [0, 1, 5, 15, 255] {
+                    for operands in [
+                        [ranged_fixnum(lo, hi), ranged_fixnum(mask, mask)],
+                        [ranged_fixnum(mask, mask), ranged_fixnum(lo, hi)],
+                    ] {
+                        let range = eval(Opcode::LogAnd, &AuxData::None, &operands)
+                            .range
+                            .unwrap();
+                        for value in lo..=hi {
+                            assert!((range.lo..=range.hi).contains(&(value & mask)));
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            eval(
+                Opcode::LogAnd,
+                &AuxData::None,
+                &[fixnum(), ranged_fixnum(255, 255)]
+            )
+            .range,
+            Some(Range { lo: 0, hi: 255 })
+        );
+        assert_eq!(
+            eval(
+                Opcode::LogAnd,
+                &AuxData::None,
+                &[fixnum(), ranged_fixnum(-1, -1)]
+            )
+            .range,
+            Some(FULL)
+        );
+    }
+
+    #[test]
+    fn guarded_unsigned56_remainder_entry_keeps_shift_range() {
+        let mut f = Function::new("shift-remainder");
+        let entry = f.entry();
+        // A peeled generic iteration's result guard establishes this fact;
+        // the original unsigned64/bignum entry must never be given this type.
+        let value = f.add_block_param(
+            entry,
+            ranged_fixnum(0, (1i64 << 56) - 1),
+            ValueRepresentation::Tagged,
+        );
+        f.mark_entry_param_checked(value);
+        let count = const_fixnum(&mut f, entry, -8);
+        let (_, shifted) = f.push_inst(
+            entry,
+            InstData {
+                args: vec![value, count],
+                ..inst(Opcode::FixnumShl)
+            },
+            &[(fixnum(), ValueRepresentation::UnboxedFixnum)],
+        );
+        let mask = const_fixnum(&mut f, entry, 255);
+        let (_, byte) = f.push_inst(
+            entry,
+            InstData {
+                args: vec![shifted[0], mask],
+                ..inst(Opcode::LogAnd)
+            },
+            &[(fixnum(), ValueRepresentation::UnboxedFixnum)],
+        );
+        f.set_terminator(entry, ret());
+        let facts = infer(&f);
+        assert_eq!(
+            facts.range(shifted[0]),
+            Some(Range {
+                lo: 0,
+                hi: (1i64 << 48) - 1
+            })
+        );
+        assert_eq!(facts.range(byte[0]), Some(Range { lo: 0, hi: 255 }));
     }
 
     #[test]

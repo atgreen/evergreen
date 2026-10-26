@@ -648,6 +648,42 @@ pub fn big_gcd(x: &BigInt, y: &BigInt) -> BigInt {
     }
     a
 }
+
+/// Try an arithmetic right shift without allocating or copying integer limbs.
+/// Accept fixnums and canonical one-limb bignums, returning only fixnum results.
+/// `None` asks the caller to retain its full integer/type-error fallback. No
+/// reference into the heap survives this call, and no safepoint occurs here.
+pub fn try_small_integer_right_shift(value: EgclVal, bits: u64) -> Option<EgclVal> {
+    if value.is_fixnum() {
+        return Some(EgclVal::from_fixnum(value.as_fixnum() >> bits.min(63)));
+    }
+    if !value.is_heap_object() {
+        return None;
+    }
+    // SAFETY: value is a live tagged object. Check its header and limb count
+    // before reading the canonical payload; this leaf never allocates or polls.
+    let (sign, magnitude) = unsafe {
+        let ptr = value.as_ptr();
+        if (*(ptr as *const ObjectHeader)).type_id() != type_id::BIGNUM
+            || *(ptr.add(12) as *const u32) != 1
+        {
+            return None;
+        }
+        (*(ptr.add(8) as *const i32), *(ptr.add(16) as *const u64))
+    };
+    if !matches!(sign, -1 | 1) || magnitude == 0 {
+        return None;
+    }
+    // Signed i128 represents both signs of the entire u64 magnitude. Its
+    // arithmetic shift supplies floor rounding for negative, inexact division.
+    let integer = if sign < 0 {
+        -(magnitude as i128)
+    } else {
+        magnitude as i128
+    };
+    fixnum_from_i128(integer >> bits.min(127))
+}
+
 /// Read a fixnum or BIGNUM into a BigInt. `None` for any other value.
 pub fn bigint_from_val(v: EgclVal) -> Option<BigInt> {
     if v.is_fixnum() {

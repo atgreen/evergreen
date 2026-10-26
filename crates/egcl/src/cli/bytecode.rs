@@ -26394,6 +26394,22 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
             return None;
         }
     };
+    if cfg!(all(target_arch = "x86_64", target_os = "linux"))
+        && std::env::var_os("EGCL_DISABLE_LOOP_PEELING").is_none()
+    {
+        let peeled = egcl_compiler::t2::opt_loop_peel::peel_for_numeric_types(
+            &mut f,
+            &|bcp| input.type_profiles.get(&bcp).is_some_and(|p| {
+                p.fixnum >= 4 && p.bignum > 0
+                    && p.fixnum >= p.bignum.saturating_mul(2)
+                    && p.single_float == 0 && p.double_float == 0 && p.other == 0
+            }),
+            egcl_compiler::t2::opt_loop_peel::PeelOptions::default(),
+        );
+        if peeled.loops != 0 || !peeled.declined.is_empty() {
+            t2_log!("{name}: type-driven loop peeling: {peeled:?}");
+        }
+    }
     // Preserve the tagged artifact, including its OSR imports. Closed packed
     // expressions need the original calls before numeric speculation replaces
     // cold arithmetic with fixnum guesses. Only mapped full-entry code admits

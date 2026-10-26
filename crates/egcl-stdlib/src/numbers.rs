@@ -6,7 +6,7 @@
 use std::cmp::Ordering;
 use egcl_rt::bignum::{
     BigInt, BigRat, big_cmp, bigint_from_val, fixnum_from_i128, mag_add, mag_bitlen, mag_sub,
-    ratio_parts_val,
+    ratio_parts_val, try_small_integer_right_shift,
 };
 use egcl_rt::error::EgclError;
 use egcl_rt::value::EgclVal;
@@ -123,6 +123,14 @@ pub fn ash(value: EgclVal, count: EgclVal) -> Result<EgclVal, EgclError> {
             if let Some(result) = fixnum_from_i128((n as i128) << shift) {
                 return Ok(result);
             }
+        }
+    }
+
+    // The count's type is known before this success-only leaf. All other
+    // counts, multi-limb inputs and non-fixnum results retain the generic path.
+    if count.is_fixnum() && count.as_fixnum() < 0 {
+        if let Some(result) = try_small_integer_right_shift(value, count.as_fixnum().unsigned_abs()) {
+            return Ok(result);
         }
     }
 
