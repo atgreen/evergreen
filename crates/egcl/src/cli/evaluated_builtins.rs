@@ -1261,6 +1261,9 @@ fn resolve(name: &str) -> Option<Handler> {
                 }
                 rest = next;
             }
+            if element_type.is_some_and(|v| upgrade_elt(v) == EltU::U8) {
+                return Ok(NIL);
+            }
             let Some(default) = types.default_element(element_type.unwrap_or(T)) else {
                 return Ok(NIL);
             };
@@ -1458,7 +1461,7 @@ fn resolve(name: &str) -> Option<Handler> {
         // reached them by synthesizing and re-evaluating a form at several
         // microseconds a call. An ASDF load of Babel made ~150k STRING calls and
         // ~150k compiled (setf aref)/(setf cdr) stores that way (bliss-qoy0k).
-        "EGCL::SET-AREF" | "EGCL::SET-ELT" => {
+        "EGCL::SET-AREF" | "EGCL::SET-ELT" | "EGCL::SET-SVREF" => {
             Some(|operator, args, _env| super::set_aref_values(operator, args))
         }
         "EGCL::SET-CAR" | "EGCL::SET-CDR" => {
@@ -1683,6 +1686,10 @@ fn resolve(name: &str) -> Option<Handler> {
         }),
         "ARRAY-ELEMENT-TYPE" => Some(|_operator, args, _env| {
             let v = args.first().copied().unwrap_or(NIL);
+            if egcl_stdlib::sequences::is_u8_array(v) {
+                let symbol = EgclVal::from_symbol_index(egcl_rt::symbols::intern("UNSIGNED-BYTE"));
+                return Ok(vec_to_list(&[symbol, EgclVal::from_fixnum(8)]));
+            }
             // An 8-bit base string holds BASE-CHAR and a 32-bit string
             // CHARACTER (spec §1.6.3); bit-vectors (simple OR a
             // fill-pointer/adjustable/displaced complex bit vector, egcl-
@@ -3103,6 +3110,9 @@ fn resolve(name: &str) -> Option<Handler> {
             // BIT/SBIT read a bit array exactly like AREF (rank-1 here).
 
             let arr0 = args.first().copied().unwrap_or(NIL);
+            if name == "SVREF" && !is_simple_vector_value(arr0) {
+                return Err(EgclError::TypeError { datum: arr0, expected: "SIMPLE-VECTOR".into() });
+            }
             // Multidimensional (rank ≥ 2) array: AREF takes one subscript per
             // axis (row-major); ROW-MAJOR-AREF takes a single flat index.
             if egcl_rt::types::md_array_p(arr0) {
@@ -3186,6 +3196,32 @@ fn resolve(name: &str) -> Option<Handler> {
             resolve_type_spec(env, spec)
         }),
 
+        "EGCL-INTERNAL::%U8-ELEMENT-TYPE-P"
+        | "EGCL-INTERNAL:%U8-ELEMENT-TYPE-P"
+        | "%U8-ELEMENT-TYPE-P" => Some(|_, args, _| {
+            Ok(
+                if args.first().is_some_and(|&v| upgrade_elt(v) == EltU::U8) {
+                    T
+                } else {
+                    NIL
+                },
+            )
+        }),
+        "EGCL-INTERNAL::%MAKE-U8-VECTOR" | "EGCL-INTERNAL:%MAKE-U8-VECTOR" | "%MAKE-U8-VECTOR" => {
+            Some(|_, args, _| {
+                let size = args.first().copied().unwrap_or(NIL);
+                if !size.is_fixnum() || size.as_fixnum() < 0 {
+                    return Err(EgclError::TypeError {
+                        datum: size,
+                        expected: "non-negative array dimension".into(),
+                    });
+                }
+                let fill = egcl_stdlib::sequences::u8_value(
+                    args.get(1).copied().unwrap_or(EgclVal::from_fixnum(0)),
+                )?;
+                egcl_rt::packed_u8::make(size.as_fixnum() as usize, fill)
+            })
+        }
         "EGCL-INTERNAL::%MAKE-DOUBLE-FLOAT-VECTOR"
         | "EGCL-INTERNAL:%MAKE-DOUBLE-FLOAT-VECTOR"
         | "%MAKE-DOUBLE-FLOAT-VECTOR" => Some(|_operator, args, _env| {
@@ -3240,6 +3276,12 @@ fn resolve(name: &str) -> Option<Handler> {
                     dims.push(d.as_fixnum() as usize);
                     c = rest;
                 }
+                if args.get(3).is_some_and(|v| !v.is_nil()) {
+                    return egcl_stdlib::sequences::build_u8_md_array(
+                        &dims,
+                        egcl_stdlib::sequences::u8_value(*fill)?,
+                    );
+                }
                 if args.get(2).is_some_and(|v| !v.is_nil()) {
                     if !fill.is_double_float() {
                         return Err(EgclError::TypeError { datum: *fill, expected: "DOUBLE-FLOAT".into() });
@@ -3287,6 +3329,15 @@ fn resolve(name: &str) -> Option<Handler> {
             let has_fill_pointer = args.len() > 5 && !args[5].is_nil();
             // 7th arg (optional): non-NIL ⇒ element-type BIT (bliss-65nx).
             let element_is_bit = args.len() > 6 && !args[6].is_nil();
+            if args.get(9).is_some_and(|v| !v.is_nil()) {
+                return egcl_stdlib::sequences::build_u8_complex_vector(
+                    size,
+                    fp,
+                    adjustable,
+                    egcl_stdlib::sequences::u8_value(iel)?,
+                    has_fill_pointer,
+                );
+            }
             if args.get(7).is_some_and(|v| !v.is_nil()) {
                 if !iel.is_double_float() {
                     return Err(EgclError::TypeError { datum: iel, expected: "DOUBLE-FLOAT".into() });
@@ -3373,6 +3424,22 @@ fn resolve(name: &str) -> Option<Handler> {
             let has_fill_pointer = args.len() > 6 && !args[6].is_nil();
             // 8th arg (optional): non-NIL ⇒ element-type BIT (bliss-65nx).
             let element_is_bit = args.len() > 7 && !args[7].is_nil();
+            if args.get(9).is_some_and(|v| !v.is_nil()) {
+                return egcl_stdlib::sequences::build_u8_displaced_vector(
+                    base,
+                    offset,
+                    length,
+                    fp,
+                    adjustable,
+                    has_fill_pointer,
+                );
+            }
+            if egcl_stdlib::sequences::is_u8_array(base) {
+                return Err(EgclError::TypeError {
+                    datum: base,
+                    expected: "matching displaced array element type".into(),
+                });
+            }
             if args.get(8).is_some_and(|v| !v.is_nil()) {
                 return egcl_stdlib::sequences::build_double_float_displaced_vector(
                     base, offset, length, fp, adjustable, has_fill_pointer,

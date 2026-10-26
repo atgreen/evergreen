@@ -1015,6 +1015,64 @@ unsafe fn object_payload_offset(ptr: *const u8) -> usize {
     }
 }
 
+/// Readable octet arrays use the existing standard read-time evaluation
+/// syntax. Reading this representation requires the normal *READ-EVAL* = T.
+/// Explicit decimal radix prefixes make reconstruction independent of the
+/// printer's base and of the reader's numeric base. Displaced views are copied
+/// into similar storage; capacity, rank, element type and vector flags survive.
+/// This path allocates only Rust strings/vectors, never Lisp objects.
+pub fn u8_readable_representation(value: EgclVal) -> Option<String> {
+    if !print_readably_active() || !crate::sequences::is_u8_array(value) {
+        return None;
+    }
+    fn contents(value: EgclVal, dims: &[usize], index: &mut usize, out: &mut String) {
+        if let Some((&length, rest)) = dims.split_first() {
+            out.push('(');
+            for i in 0..length {
+                if i != 0 { out.push(' '); }
+                contents(value, rest, index, out);
+            }
+            out.push(')');
+        } else {
+            let byte = crate::sequences::u8_array_element(value, *index).expect("octet array element");
+            out.push_str(&format!("#10r{byte}"));
+            *index += 1;
+        }
+    }
+    let md_dims = egcl_rt::types::md_array_dims(value);
+    let dims = if let Some(dims) = md_dims {
+        (0..crate::sequences::length(dims).expect("array dimensions"))
+            .map(|i| crate::sequences::elt(dims, i).expect("array dimension").as_fixnum() as usize)
+            .collect::<Vec<_>>()
+    } else {
+        vec![crate::sequences::array_total_size(value).expect("octet array size")]
+    };
+    let mut out = String::from("#.(COMMON-LISP:MAKE-ARRAY ");
+    if md_dims.is_some() {
+        out.push_str("'(");
+        for (i, dimension) in dims.iter().enumerate() {
+            if i != 0 { out.push(' '); }
+            out.push_str(&format!("#10r{dimension}"));
+        }
+        out.push(')');
+    } else {
+        out.push_str(&format!("#10r{}", dims[0]));
+    }
+    out.push_str(" :ELEMENT-TYPE '(COMMON-LISP:UNSIGNED-BYTE #10r8) :INITIAL-CONTENTS '");
+    let mut index = 0;
+    contents(value, &dims, &mut index, &mut out);
+    if crate::sequences::is_complex_vector(value) {
+        if crate::sequences::cvec_has_fill_pointer(value) {
+            out.push_str(&format!(" :FILL-POINTER #10r{}", crate::sequences::cvec_fill_pointer(value)));
+        }
+        if crate::sequences::cvec_adjustable(value) {
+            out.push_str(" :ADJUSTABLE COMMON-LISP:T");
+        }
+    }
+    out.push(')');
+    Some(out)
+}
+
 /// Render a heap vector — simple-vector or complex (fill-pointer / adjustable) —
 /// as `#(e0 e1 …)`. `None` for non-vector heap objects. A complex vector shows
 /// only its active elements (0..fill-pointer).
@@ -1024,6 +1082,11 @@ fn heap_vector_string(v: EgclVal, escapep: bool) -> Option<String> {
     }
     if crate::pathnames::registered_string(v).is_some() || crate::pathnames::is_pathname(v) {
         return None;
+    }
+    if let Some(length) = egcl_rt::packed_u8::len(v) {
+        if !print_array_active() { return Some(format!("#<UB8-VECTOR {length}>")); }
+        let elements: Vec<_> = (0..length).map(|i| egclval_to_print_string(EgclVal::from_fixnum(i64::from(egcl_rt::packed_u8::get(v, i).unwrap())), escapep)).collect();
+        return Some(format!("#({})", elements.join(" ")));
     }
     if let Some(length) = egcl_rt::packed_f64::len(v) {
         let elements: Vec<_> = (0..length).map(|i|
@@ -1494,6 +1557,7 @@ fn egclval_to_print_inner(mut v: EgclVal, escapep: bool) -> String {
     if let Some(s) = dispatch_pprint(v, escapep) {
         return s;
     }
+    if let Some(text) = u8_readable_representation(v) { return text; }
     if v.is_nil() {
         return print_symbol_name("NIL", escapep);
     }

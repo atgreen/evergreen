@@ -881,7 +881,8 @@
 ;; disagreed with (array-element-type (make-array 1 :element-type 'base-char)).
 (defun upgraded-array-element-type (type &optional environment)
   (declare (ignore environment))
-  (cond ((member (if (consp type) (car type) type) '(double-float long-float)) 'double-float)
+  (cond ((egcl-internal::%u8-element-type-p (%expand-type-spec type)) '(unsigned-byte 8))
+        ((member (if (consp type) (car type) type) '(double-float long-float)) 'double-float)
         ((eq type 'bit) 'bit)
         ((member type '(base-char standard-char)) 'base-char)
         ((member type '(character extended-char)) 'character)
@@ -2456,6 +2457,7 @@ Returns NIL."
          (stringp (member et '(character base-char standard-char extended-char nil)))
          (bitp (eq et 'bit))
          (doublep (member et-kind '(double-float long-float)))
+         (u8p (egcl-internal::%u8-element-type-p et))
          (fp-cell (member :fill-pointer keys))
          (adj-cell (member :adjustable keys))
          (fp (and fp-cell (car (cdr fp-cell))))
@@ -2477,7 +2479,7 @@ Returns NIL."
                          ((integerp fp) fp)
                          (t size))))
          (%make-displaced-array base offset size fpn (and adjustable t)
-                                (and stringp (not bitp) t) (and fp t) (and bitp t) (and doublep t))))
+                                (and stringp (not bitp) t) (and fp t) (and bitp t) (and doublep t) (and u8p t))))
       ;; :displaced-to (rank >= 2): the row-major storage is itself a vector
       ;; displaced onto BASE, so AREF, ROW-MAJOR-AREF and the printer read
       ;; and write BASE's elements (ansi print.array.2.*).
@@ -2489,9 +2491,9 @@ Returns NIL."
          (egcl-internal::%make-md-array-with-storage
           dimensions
           (%make-displaced-array base offset total total nil
-                                 (and stringp (not bitp) t) nil (and bitp t) (and doublep t)))))
+                                 (and stringp (not bitp) t) nil (and bitp t) (and doublep t) (and u8p t)))))
       (mdp
-       (let ((arr (%make-md-array dimensions iel (and doublep t))))
+       (let ((arr (%make-md-array dimensions iel (and doublep t) (and u8p t))))
          (when ic-cell
            (fill-md-array-from-contents arr dimensions (car (cdr ic-cell))))
          arr))
@@ -2501,7 +2503,7 @@ Returns NIL."
       ;; universe.lsp builds (make-array nil)).
       ((null dimensions)
        (%make-md-array nil (cond (ic-cell (car (cdr ic-cell)))
-                                 (t iel)) (and doublep t)))
+                                 (t iel)) (and doublep t) (and u8p t)))
       ;; A :fill-pointer or :adjustable request ⇒ a complex (fill-pointer /
       ;; adjustable) vector. The fill pointer is the given value, SIZE for
       ;; :fill-pointer t, or SIZE when only :adjustable is supplied.
@@ -2518,12 +2520,18 @@ Returns NIL."
                                        (and stringp (not bitp) t) (and fp t)
                                        (and bitp t) (and doublep t)
                                        ;; BASE-CHAR asks for 8-bit storage.
-                                       (and (member et '(base-char standard-char)) t))))
+                                       (and (member et '(base-char standard-char)) t) (and u8p t))))
          (when ic-cell
            (let ((i 0))
              (dolist (e (coerce (car (cdr ic-cell)) 'list))
                (setf (aref v i) e)
                (setq i (+ i 1)))))
+         v))
+      (u8p
+       (let ((v (egcl-internal::%make-u8-vector size iel)))
+         (when ic-cell
+           (%check-initial-contents-length (cadr ic-cell) size)
+           (dotimes (i size) (setf (aref v i) (elt (cadr ic-cell) i))))
          v))
       (doublep
        (let ((v (%make-double-float-vector size iel)))
@@ -2632,7 +2640,9 @@ Returns NIL."
          (iel-cell (member :initial-element keys))
          (fp (and fp-cell (car (cdr fp-cell))))
          (iel (if iel-cell (car (cdr iel-cell))
-                  (if (eq (array-element-type array) 'double-float) 0d0 nil)))
+                  (cond ((eq (array-element-type array) 'double-float) 0d0)
+                        ((equal (array-element-type array) '(unsigned-byte 8)) 0)
+                        (t nil))))
          ;; No :fill-pointer supplied. Per ANSI the array keeps its fill
          ;; pointer if it has one; a plain adjustable array has none, so its
          ;; length simply tracks the new SIZE. ARRAY-HAS-FILL-POINTER-P now
@@ -2786,6 +2796,9 @@ Returns NIL."
       (bitp
        (make-array size :element-type 'bit :initial-element (if iel-cell iel 0)))
       ((and (member head '(vector array simple-array))
+            (egcl-internal::%u8-element-type-p (%expand-type-spec elt)))
+       (make-array size :element-type elt :initial-element (if iel-cell iel 0)))
+      ((and (member head '(vector array simple-array))
             (member (if (consp elt) (car elt) elt) '(double-float long-float)))
        (make-array size :element-type elt :initial-element (if iel-cell iel 0d0)))
       (t
@@ -2843,6 +2856,8 @@ Returns NIL."
                           'string)))
         ((bit-vector-p orig) (coerce list 'bit-vector))
         ((listp orig) list)
+        ((equal (array-element-type orig) '(unsigned-byte 8))
+         (coerce list '(vector (unsigned-byte 8))))
         (t (coerce list 'vector))))
 
 ;; Does ITEM match ELT under TESTFN, with KEY applied to ELT and NEG inverting?
@@ -3997,7 +4012,7 @@ Returns NIL."
 (defun (setf aref) (new array &rest subscripts)
   (egcl::set-aref array (apply (function array-row-major-index) array subscripts) new)
   new)
-(defun (setf svref) (new v i) (egcl::set-aref v i new) new)
+(defun (setf svref) (new v i) (egcl::set-svref v i new) new)
 (defun (setf elt) (new seq i) (egcl::set-elt seq i new) new)
 (defun (setf gethash) (new key table &optional default)
   (declare (ignore default))

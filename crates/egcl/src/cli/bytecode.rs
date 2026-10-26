@@ -4360,7 +4360,8 @@ impl<'e> Lowerer<'e> {
                 // `(setf (aref|svref|char|schar|row-major-aref|elt seq i) val)` →
                 // the internal store primitive (seq, index, value). ELT lowers to
                 // SET-ELT (fill-pointer-bounded), the AREF family to SET-AREF
-                // (total-size-bounded) — see aref_setf_place (bliss-30be).
+                // (total-size-bounded). SVREF uses its restricted SET-SVREF
+                // primitive — see aref_setf_place (bliss-30be).
                 egcl_rt::rooted_ref!(_seq_root = &mut seq);
                 egcl_rt::rooted_ref!(_index_root = &mut index);
                 let sym = resolve_sym(prim).ok_or(Bail)?.as_symbol_index();
@@ -8221,6 +8222,7 @@ fn symbol_function_setf_place(place: EgclVal) -> Option<EgclVal> {
 /// Returns `(store-primitive, seq, index)`. ELT respects the fill pointer, so it
 /// lowers to `EGCL::SET-ELT`; the AREF family ignores it and lowers to
 /// `EGCL::SET-AREF` (bliss-30be — the two differ on fill-pointer vectors).
+/// SVREF keeps its general-simple-vector restriction through `EGCL::SET-SVREF`.
 fn aref_setf_place(place: EgclVal) -> Option<(&'static str, EgclVal, EgclVal)> {
     if !place.is_cons() {
         return None;
@@ -8231,7 +8233,8 @@ fn aref_setf_place(place: EgclVal) -> Option<(&'static str, EgclVal, EgclVal)> {
     }
     match sym_bare_name_rc(items[0]).as_ref() {
         "ELT" => Some(("EGCL::SET-ELT", items[1], items[2])),
-        "AREF" | "SVREF" | "CHAR" | "SCHAR" | "ROW-MAJOR-AREF" | "BIT" | "SBIT" => {
+        "SVREF" => Some(("EGCL::SET-SVREF", items[1], items[2])),
+        "AREF" | "CHAR" | "SCHAR" | "ROW-MAJOR-AREF" | "BIT" | "SBIT" => {
             Some(("EGCL::SET-AREF", items[1], items[2]))
         }
         _ => None,
@@ -10487,7 +10490,8 @@ const BBU_MAGIC: &[u8; 4] = b"BBU\0";
 // 0x0203: package-object constants (tag 20), resolved by name on load; saved
 // heap-reference constants (tag 21), valid only in a core image's registry
 // unit; hash-table constants (tag 22): test plus key/value refs.
-const BBU_BYTECODE_VERSION: u16 = 0x0203;
+// 0x0204: packed U8 payloads (tag 23) and U8 multidimensional backing refs (tag 24).
+const BBU_BYTECODE_VERSION: u16 = 0x0204;
 const BBU_VERIFIER_VERSION: u16 = 0x0100;
 const BBU_NO_INDEX: u32 = u32::MAX;
 /// Unit-flags bit: every load form is represented in `load_actions`, so the
@@ -10568,13 +10572,18 @@ enum BbuGraphNode {
     Cons(Vec<usize>),
     Vector(Vec<usize>),
     MdArray(Vec<u64>, Vec<usize>),
+    MdPackedU8(Vec<u64>, Vec<usize>),
+    // Complex/displaced storage is externalized by row-major contents rather
+    // than by its active fill-pointer prefix or process-local displacement.
+    MdPackedU8Snapshot(Vec<u64>, Vec<u8>),
 }
 
 impl BbuGraphNode {
     fn children(&self) -> &[usize] {
         match self {
-            Self::Cons(children) | Self::Vector(children) | Self::MdArray(_, children) => children,
-            Self::Leaf | Self::Existing(_) => &[],
+            Self::Cons(children) | Self::Vector(children) | Self::MdArray(_, children)
+                | Self::MdPackedU8(_, children) => children,
+            Self::Leaf | Self::Existing(_) | Self::MdPackedU8Snapshot(_, _) => &[],
         }
     }
 }
@@ -10590,8 +10599,10 @@ fn bbu_vector_elements(value: EgclVal) -> Option<Vec<EgclVal>> {
         return None;
     }
     unsafe {
-        let count = *(value.as_ptr().add(8) as *const u64) as usize;
-        Some(std::slice::from_raw_parts(value.as_ptr().add(16) as *const EgclVal, count).to_vec())
+        let header = &*value.as_ptr().cast::<egcl_rt::ObjectHeader>();
+        let offset = if header.is_large_object() { 16 } else { 8 };
+        let count = *(value.as_ptr().add(offset) as *const u64) as usize;
+        Some(std::slice::from_raw_parts(value.as_ptr().add(offset + 8) as *const EgclVal, count).to_vec())
     }
 }
 
@@ -10645,14 +10656,20 @@ fn capture_bbu_graph(
                     }
                 })
                 .collect::<Option<Vec<_>>>()?;
-            let elements = bbu_vector_elements(storage)?;
-            BbuGraphNode::MdArray(
-                dimensions,
-                elements
-                    .into_iter()
-                    .map(|element| add(element, &mut values, &mut seen))
-                    .collect(),
-            )
+            if egcl_rt::packed_u8::is_vector(storage) {
+                BbuGraphNode::MdPackedU8(dimensions, vec![add(storage, &mut values, &mut seen)])
+            } else if egcl_stdlib::sequences::is_u8_array(storage) {
+                let total = dimensions.iter().try_fold(1usize, |n, &d| n.checked_mul(usize::try_from(d).ok()?))?;
+                let bytes = (0..total).map(|index| egcl_stdlib::sequences::u8_array_element(storage, index))
+                    .collect::<Option<Vec<_>>>()?;
+                BbuGraphNode::MdPackedU8Snapshot(dimensions, bytes)
+            } else {
+                let elements = bbu_vector_elements(storage)?;
+                BbuGraphNode::MdArray(
+                    dimensions,
+                    elements.into_iter().map(|element| add(element, &mut values, &mut seen)).collect(),
+                )
+            }
         } else {
             BbuGraphNode::Leaf
         };
@@ -10742,6 +10759,10 @@ impl BbuConstPool {
     }
 
     fn value(&mut self, v: EgclVal) -> Option<u32> {
+        // Image heap references preserve identity with the saved global graph.
+        if self.saved_heap_refs && egcl_stdlib::sequences::is_u8_array(v) {
+            return self.value_leaf(v);
+        }
         let aggregate = v.is_cons()
             || (v.is_heap_object()
                 && matches!(
@@ -10795,6 +10816,21 @@ impl BbuConstPool {
                         }
                         put_u32(&mut bytes, u32::try_from(children.len()).ok()?);
                     }
+                    BbuGraphNode::MdPackedU8(dimensions, _) => {
+                        put_u8(&mut bytes, 24);
+                        put_u32(&mut bytes, u32::try_from(dimensions.len()).ok()?);
+                        for &dimension in dimensions { put_u64(&mut bytes, dimension); }
+                    }
+                    BbuGraphNode::MdPackedU8Snapshot(dimensions, contents) => {
+                        let mut payload = vec![23];
+                        put_u32(&mut payload, u32::try_from(contents.len()).ok()?);
+                        payload.extend_from_slice(contents);
+                        let storage_ref = self.intern_encoded(payload);
+                        put_u8(&mut bytes, 24);
+                        put_u32(&mut bytes, u32::try_from(dimensions.len()).ok()?);
+                        for &dimension in dimensions { put_u64(&mut bytes, dimension); }
+                        put_u32(&mut bytes, storage_ref);
+                    }
                     _ => return None,
                 }
                 for child in children {
@@ -10844,6 +10880,7 @@ impl BbuConstPool {
                 if matches!(
                     node,
                     BbuGraphNode::Cons(_) | BbuGraphNode::Vector(_) | BbuGraphNode::MdArray(_, _)
+                        | BbuGraphNode::MdPackedU8(_, _) | BbuGraphNode::MdPackedU8Snapshot(_, _)
                 ) {
                     self.graph_values.push(values[index]);
                     self.graph_refs.push(references[index]?);
@@ -11031,6 +11068,17 @@ impl BbuConstPool {
             let mut bytes = Vec::new();
             put_u8(&mut bytes, 21);
             put_u64(&mut bytes, v.0);
+            return Some(self.intern_encoded(bytes));
+        }
+        if egcl_stdlib::sequences::is_u8_array(v) {
+            // Similar rank-one constants need their active elements and U8
+            // specialization, not adjustable/fill-pointer/displacement state.
+            let length = egcl_stdlib::sequences::length(v).ok()?;
+            let mut bytes = vec![23];
+            put_u32(&mut bytes, u32::try_from(length).ok()?);
+            for index in 0..length {
+                bytes.push(egcl_stdlib::sequences::u8_array_element(v, index)?);
+            }
             return Some(self.intern_encoded(bytes));
         }
         None
@@ -12944,6 +12992,8 @@ enum BbuConstant {
         test: u8,
         entry_refs: Vec<u32>,
     },
+    PackedU8(Vec<u8>),
+    MdPackedU8 { dimensions: Vec<u64>, storage_ref: u32 },
     /// A general multidimensional array: dimensions plus row-major element refs.
     MdArray {
         dimensions: Vec<u64>,
@@ -13165,6 +13215,17 @@ fn parse_bbu_constant(
                 .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
                 .collect();
             BbuConstant::HashTable { test, entry_refs }
+        }
+        23 if bytecode_version >= 0x0204 => {
+            let length = cursor.u32()? as usize;
+            BbuConstant::PackedU8(cursor.take(length)?.to_vec())
+        }
+        24 if bytecode_version >= 0x0204 => {
+            let rank = cursor.u32()? as usize;
+            if rank > 1024 { return Err(bbu_error("multidimensional array rank is too large")); }
+            let mut dimensions = Vec::with_capacity(rank);
+            for _ in 0..rank { dimensions.push(cursor.u64()?); }
+            BbuConstant::MdPackedU8 { dimensions, storage_ref: cursor.u32()? }
         }
         19 if bytecode_version >= 0x010d => {
             let rank = cursor.u32()? as usize;
@@ -13583,6 +13644,24 @@ fn allocate_bbu_constants(constants: &[BbuConstant]) -> Result<Vec<EgclVal>, Egc
                     ..Default::default()
                 })?
             }
+            BbuConstant::PackedU8(bytes) => {
+                let array = egcl_rt::packed_u8::make(bytes.len(), 0)?;
+                for (index, &byte) in bytes.iter().enumerate() {
+                    if !egcl_rt::packed_u8::set(array, index, byte) {
+                        return Err(bbu_error("invalid packed byte constant"));
+                    }
+                }
+                array
+            }
+            BbuConstant::MdPackedU8 { dimensions, storage_ref } => {
+                validate_bbu_u8_storage(constants, dimensions, *storage_ref)?;
+                let dimensions = dimensions.iter().map(|&dimension| usize::try_from(dimension)
+                    .map_err(|_| bbu_error("array dimension exceeds host range")))
+                    .collect::<Result<Vec<_>, _>>()?;
+                // The shell's backing is fixed up after every constant has
+                // been allocated, permitting forward references and sharing.
+                egcl_stdlib::sequences::build_md_array_with_storage(&dimensions, NIL)?
+            }
             BbuConstant::Cons(_, _) => arena_cons(NIL, NIL),
             BbuConstant::Vector(refs) => egcl_stdlib::build_simple_vector(&vec![NIL; refs.len()]),
             BbuConstant::MdArray {
@@ -13624,6 +13703,16 @@ fn fill_bbu_constant_edges(constants: &[BbuConstant], values: &[EgclVal]) -> Res
                     egcl_stdlib::set_elt(values[index], element, referent(*reference)?)?;
                 }
             }
+            BbuConstant::MdPackedU8 { dimensions, storage_ref } => {
+                validate_bbu_u8_storage(constants, dimensions, *storage_ref)?;
+                let storage = referent(*storage_ref)?;
+                unsafe {
+                    // MD_ARRAY's fixed three-word body always has a small
+                    // header; word zero is the backing reference, not bytes.
+                    let slot = values[index].as_ptr().add(8).cast::<EgclVal>();
+                    egcl_rt::gc::store_ref(slot, storage);
+                }
+            }
             BbuConstant::MdArray { element_refs, .. } => {
                 let storage = egcl_rt::types::md_array_storage(values[index])
                     .ok_or_else(|| bbu_error("missing array constant storage"))?;
@@ -13633,6 +13722,21 @@ fn fill_bbu_constant_edges(constants: &[BbuConstant], values: &[EgclVal]) -> Res
             }
             _ => {}
         }
+    }
+    Ok(())
+}
+
+fn validate_bbu_u8_storage(constants: &[BbuConstant], dimensions: &[u64], reference: u32) -> Result<(), EgclError> {
+    let index = bbu_index(reference, constants.len(), "packed array storage")?;
+    let BbuConstant::PackedU8(bytes) = &constants[index] else {
+        return Err(bbu_error("packed array storage is not a U8 payload"));
+    };
+    let total = dimensions.iter().try_fold(1u64, |n, &d| n.checked_mul(d));
+    if total != Some(bytes.len() as u64) {
+        return Err(bbu_error("packed array dimensions do not match storage length"));
+    }
+    if dimensions.iter().any(|&d| d > ((1u64 << 60) - 1) || usize::try_from(d).is_err()) {
+        return Err(bbu_error("packed array dimension exceeds host fixnum range"));
     }
     Ok(())
 }
@@ -15942,6 +16046,9 @@ fn load_bbu_definitions(bytes: &[u8], env: &mut Env, restoring: bool) -> Result<
                 for &reference in refs {
                     bbu_index(reference, encoded_constants.len(), "vector element")?;
                 }
+            }
+            BbuConstant::MdPackedU8 { dimensions, storage_ref } => {
+                validate_bbu_u8_storage(&encoded_constants, dimensions, *storage_ref)?;
             }
             BbuConstant::MdArray { element_refs, .. } => {
                 for &reference in element_refs {
@@ -30860,3 +30967,6 @@ fn mixed_local_sibling_inlines_a_transitive_capture() {
     assert_eq!(native.run(&[EgclVal::from_fixnum(1000)], &mut env).unwrap(), EgclVal::from_fixnum(3500));
     assert_eq!(take_native_fallback_count(), 0, "the sibling must run natively");
 }
+
+#[cfg(test)]
+mod packed_u8_persistence_tests;

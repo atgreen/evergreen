@@ -29,7 +29,8 @@ const PROGRAM: &str = r#"
     (dotimes (i 150)
       (let ((array (native-constructor-array 3)))
         (assert (equal (coerce array 'list) '(0 0 0)))
-        (assert (simple-vector-p array)))
+        (assert (typep array '(simple-array (unsigned-byte 8) (*))))
+        (assert (not (simple-vector-p array))))
       (assert (= (length (native-constructor-bare 3)) 3))
       (assert (= (length (native-constructor-effect 3)) 3))
       (assert (= (length (opaque-constructor-array 3)) 3)))
@@ -53,7 +54,7 @@ const PROGRAM: &str = r#"
       (format t "MUTATED-ARRAY:~S~%" (describe-native-array array)))
     (rplaca +native-array-descriptor+ 'unsigned-byte)
     (rplacd +native-array-descriptor+ (list 8))
-    (assert (simple-vector-p (native-constructor-array 3)))
+    (assert (typep (native-constructor-array 3) '(simple-array (unsigned-byte 8) (3))))
     ;; Non-rank-one dimensions and errors run the original public semantics.
     (assert (equal (array-dimensions (native-constructor-bare '(2 2))) '(2 2)))
     (assert (= (array-rank (native-constructor-bare nil)) 0))

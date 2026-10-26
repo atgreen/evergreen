@@ -57,8 +57,9 @@ fn simple_ub8_length(args: &[EgclVal], symbols: ArraySymbols) -> Option<usize> {
         return None;
     }
     let length = dimension.as_fixnum() as usize;
-    let bytes = length.checked_mul(8)?.checked_add(16)?;
-    (bytes <= isize::MAX as usize).then_some(length)
+    let bytes = length.checked_add(egcl_rt::packed_u8::DATA_OFFSET)?;
+    (bytes <= u32::MAX as usize - 32 && bytes <= isize::MAX as usize - 32)
+        .then_some(length)
 }
 
 fn note_array_constructor(fast: bool) {
@@ -84,10 +85,9 @@ fn make_array(args: &[EgclVal], env: *mut Env) -> Result<EgclVal, EgclError> {
     let symbols = *ARRAY_SYMBOLS.get().ok_or_else(invalid_capture)?;
     if let Some(length) = simple_ub8_length(&args, symbols) {
         note_array_constructor(true);
-        return Ok(egcl_stdlib::build_filled_simple_vector(
-            length,
-            EgclVal::from_fixnum(0),
-        ));
+        // Use the same packed payload allocator as the public constructor.
+        // All arguments remain rooted during the collecting allocation.
+        return egcl_rt::packed_u8::make(length, 0);
     }
     note_array_constructor(false);
     egcl_rt::rooted!(

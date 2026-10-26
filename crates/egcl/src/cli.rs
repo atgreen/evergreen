@@ -12256,6 +12256,10 @@ fn print_val_inner(val: EgclVal, out: &mut String) {
         out.push_str(&s);
         return;
     }
+    if let Some(text) = egcl_stdlib::format::u8_readable_representation(val) {
+        out.push_str(&text);
+        return;
+    }
     if val.is_nil() {
         out.push_str("NIL");
     } else if val == T {
@@ -12671,6 +12675,18 @@ fn print_val_inner(val: EgclVal, out: &mut String) {
                         out.push_str(&egcl_stdlib::format::decorate_integer_radix(digits, base));
                     } else {
                         out.push_str(&digits);
+                    }
+                }
+                type_id::SIMPLE_ARRAY if egcl_rt::packed_u8::is_vector(val) => {
+                    if !egcl_stdlib::format::print_array_active() {
+                        out.push_str(&format!("#<UB8-VECTOR {}>", egcl_rt::packed_u8::len(val).unwrap()));
+                    } else {
+                        out.push_str("#(");
+                        for i in 0..egcl_rt::packed_u8::len(val).unwrap() {
+                            if i != 0 { out.push(' '); }
+                            print_val(EgclVal::from_fixnum(i64::from(egcl_rt::packed_u8::get(val, i).unwrap())), out);
+                        }
+                        out.push(')');
                     }
                 }
                 type_id::SIMPLE_ARRAY if egcl_rt::packed_f64::is_vector(val) => {
@@ -13373,7 +13389,7 @@ fn is_simple_vector_value(v: EgclVal) -> bool {
     // A bit vector's element type is BIT, not T -- and this must cover the
     // complex-bit case too, which is why it is `is_bit_vector_value` rather
     // than `types::bit_vector_p` (bliss-65nx).
-    if is_bit_vector_value(v) || egcl_rt::packed_f64::is_vector(v) {
+    if is_bit_vector_value(v) || egcl_rt::packed_f64::is_vector(v) || egcl_rt::packed_u8::is_vector(v) {
         return false;
     }
     // Fill pointer / adjustable / displaced => complex, hence not simple.
@@ -17778,6 +17794,7 @@ enum EltU {
     Nil,
     Bit,
     DoubleFloat,
+    U8,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -17836,10 +17853,12 @@ fn upgrade_elt(spec: EgclVal) -> EltU {
                     {
                         return EltU::Bit;
                     }
+
                 }
             }
         }
     }
+    if egcl_stdlib::sequences::u8_element_type_p(spec) { return EltU::U8; }
     EltU::T
 }
 
@@ -18024,6 +18043,8 @@ fn object_elt_class(object: EgclVal) -> Elt {
         Elt::AnyString
     } else if is_bit_vector_value(object) {
         Elt::Up(EltU::Bit)
+    } else if egcl_stdlib::sequences::is_u8_array(object) {
+        Elt::Up(EltU::U8)
     } else if egcl_stdlib::sequences::is_double_float_array(object) {
         Elt::Up(EltU::DoubleFloat)
     } else {
@@ -19072,8 +19093,10 @@ fn typep_matches(
             // vectors, strings, AND multidimensional arrays — but a multidim
             // array is not a VECTOR (rank ≥ 2).
             "VECTOR" => is_vector_value(object),
-            "ARRAY" | "SIMPLE-ARRAY" => {
-                is_vector_value(object) || egcl_rt::types::md_array_p(object)
+            "ARRAY" => is_vector_value(object) || egcl_rt::types::md_array_p(object),
+            "SIMPLE-ARRAY" => {
+                let storage = egcl_rt::types::md_array_storage(object).unwrap_or(object);
+                (is_vector_value(object) || egcl_rt::types::md_array_p(object)) && !egcl_stdlib::is_complex_vector(storage)
             }
             "SEQUENCE" => object.is_list() || is_vector_value(object),
             other => {
@@ -19189,6 +19212,7 @@ fn typep_matches(
             // A multidimensional array satisfies ARRAY/SIMPLE-ARRAY but not
             // VECTOR (rank ≥ 2), and egcl stores its elements generally.
             if egcl_rt::types::md_array_p(object) {
+                if op.as_ref() == "SIMPLE-ARRAY" && egcl_rt::types::md_array_storage(object).is_some_and(egcl_stdlib::is_complex_vector) { return Ok(false); }
                 if op.as_ref() == "VECTOR" {
                     return Ok(false);
                 }
@@ -21307,6 +21331,10 @@ fn set_aref_values(name: &str, args: &[EgclVal]) -> Result<EgclVal, EgclError> {
         });
     }
     let i = idx.as_fixnum() as usize;
+    if name == "EGCL::SET-SVREF" {
+        egcl_stdlib::sequences::set_svref(seq, i, val)?;
+        return Ok(val);
+    }
     if let Some(storage) = egcl_rt::types::md_array_storage(seq) {
         // A multidimensional place lowered by aref_setf_place carries a
         // single (row-major) index — store straight into the backing
@@ -21783,6 +21811,16 @@ fn type_of_value(v: EgclVal) -> Result<EgclVal, EgclError> {
             }
             return Ok(class);
         }
+    }
+    if egcl_stdlib::sequences::is_u8_array(v) {
+        let complex = egcl_stdlib::is_complex_vector(v)
+            || egcl_rt::types::md_array_storage(v).is_some_and(egcl_stdlib::is_complex_vector);
+        let dims = if egcl_rt::types::md_array_p(v) { md_dims(v)? } else { vec![egcl_stdlib::array_total_size(v).unwrap()] };
+        let dim_vals: Vec<_> = dims.into_iter().map(|d| EgclVal::from_fixnum(d as i64)).collect();
+        egcl_rt::rooted!(dims_list = vec_to_list(&dim_vals));
+        egcl_rt::rooted!(element = vec_to_list(&[EgclVal::from_symbol_index(egcl_rt::symbols::intern("UNSIGNED-BYTE")), EgclVal::from_fixnum(8)]));
+        let head = resolve_sym(if complex { "ARRAY" } else { "SIMPLE-ARRAY" }).unwrap();
+        return Ok(vec_to_list(&[head, *element, *dims_list]));
     }
     if egcl_stdlib::sequences::is_double_float_array(v) {
         let complex = egcl_stdlib::is_complex_vector(v);
@@ -25421,7 +25459,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                                 // (one subscript per axis) or `(setf (row-major-aref
                                 // a k) v)`. Compute the row-major flat index and
                                 // store into the backing storage.
-                                if egcl_rt::types::md_array_p(*seq_r) {
+                                if acc != "SVREF" && egcl_rt::types::md_array_p(*seq_r) {
                                     let idx_forms: Vec<EgclVal> = list_to_vec(cp(*aargs).1);
                                     egcl_rt::rooted!(subs = Vec::<EgclVal>::new());
                                     for f in idx_forms {
@@ -25467,7 +25505,9 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                                     });
                                 }
                                 let i = idx.as_fixnum() as usize;
-                                if !egcl_stdlib::is_complex_vector(seq) && is_string_value(seq) {
+                                if acc == "SVREF" {
+                                    egcl_stdlib::sequences::set_svref(seq, i, *val)?;
+                                } else if !egcl_stdlib::is_complex_vector(seq) && is_string_value(seq) {
                                     // Char-typed complex vectors are STRINGP but
                                     // store elements in the backing vector; only
                                     // simple strings use string_set_char (bliss-9q4).
@@ -26185,6 +26225,8 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             "EGCL-INTERNAL::%EXPAND-TYPE-SPEC"
             | "EGCL-INTERNAL:%EXPAND-TYPE-SPEC"
             | "%EXPAND-TYPE-SPEC" => return eval_builtin_arguments(&name, cdr, env),
+            "EGCL-INTERNAL::%U8-ELEMENT-TYPE-P" | "EGCL-INTERNAL:%U8-ELEMENT-TYPE-P" | "%U8-ELEMENT-TYPE-P"
+            | "EGCL-INTERNAL::%MAKE-U8-VECTOR" | "EGCL-INTERNAL:%MAKE-U8-VECTOR" | "%MAKE-U8-VECTOR" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL-INTERNAL::%MAKE-DOUBLE-FLOAT-VECTOR"
             | "EGCL-INTERNAL:%MAKE-DOUBLE-FLOAT-VECTOR"
             | "%MAKE-DOUBLE-FLOAT-VECTOR" => return eval_builtin_arguments(&name, cdr, env),
@@ -26369,7 +26411,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             "MAKE-HASH-TABLE" => return eval_builtin_arguments(&name, cdr, env),
             "GETHASH" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::PUT-GETHASH" => return eval_builtin_arguments(&name, cdr, env),
-            "EGCL::SET-AREF" | "EGCL::SET-ELT" => {
+            "EGCL::SET-AREF" | "EGCL::SET-ELT" | "EGCL::SET-SVREF" => {
                 let args = eval_args(cdr, env)?;
                 return set_aref_values(&name, &args);
             }
@@ -43448,7 +43490,7 @@ fn is_builtin_function(name: &str) -> bool {
             | "ARRAYP" | "ARRAY-DIMENSIONS"
             | "ARRAY-DIMENSION" | "ARRAY-TOTAL-SIZE" | "VECTOR-PUSH" | "VECTOR-PUSH-EXTEND"
             | "VECTOR-POP" | "FILL-POINTER" | "%MAKE-COMPLEX-VECTOR" | "%MAKE-DISPLACED-ARRAY"
-            | "%MAKE-SIMPLE-VECTOR" | "%MAKE-DOUBLE-FLOAT-VECTOR"
+            | "%MAKE-SIMPLE-VECTOR" | "%MAKE-DOUBLE-FLOAT-VECTOR" | "%MAKE-U8-VECTOR" | "%U8-ELEMENT-TYPE-P"
             | "%EXPAND-TYPE-SPEC"
             | "ADJUSTABLE-ARRAY-P" | "ARRAY-HAS-FILL-POINTER-P" | "ARRAY-DISPLACEMENT"
             // Numbers
@@ -43823,7 +43865,9 @@ fn apply_builtin_fast(
             let i = args[1].as_fixnum() as usize;
             // ELT bounds against the fill pointer; AREF and friends against the
             // total size (CLHS). Mirror the operator handlers exactly.
-            Some(if name == "ELT" {
+            Some(if name == "SVREF" {
+                egcl_stdlib::sequences::svref(args[0], i)
+            } else if name == "ELT" {
                 egcl_stdlib::elt(args[0], i)
             } else {
                 egcl_stdlib::aref(args[0], i)
@@ -44078,7 +44122,7 @@ fn apply_builtin_fast(
             env.clear_mv();
             Some(egcl_stdlib::length(args[0]).map(|n| EgclVal::from_fixnum(n as i64)))
         }
-        "EGCL::SET-AREF" | "EGCL::SET-ELT"
+        "EGCL::SET-AREF" | "EGCL::SET-ELT" | "EGCL::SET-SVREF"
             if args.len() == 3
                 && args[1].is_fixnum()
                 && args[1].as_fixnum() >= 0
@@ -44092,7 +44136,9 @@ fn apply_builtin_fast(
             env.clear_mv();
             let i = args[1].as_fixnum() as usize;
             let val = args[2];
-            let r = if name == "EGCL::SET-ELT" {
+            let r = if name == "EGCL::SET-SVREF" {
+                egcl_stdlib::sequences::set_svref(args[0], i, val)
+            } else if name == "EGCL::SET-ELT" {
                 egcl_stdlib::set_elt(args[0], i, val)
             } else {
                 egcl_stdlib::set_aref(args[0], i, val)
