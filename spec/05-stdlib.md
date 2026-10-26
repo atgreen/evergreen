@@ -194,7 +194,7 @@ t
 ```
 
 **R5.11 [S4]** `STANDARD-CLASS` MUST support single and multiple inheritance with
-C3 linearization for the class precedence list (CPL).
+the class precedence list (CPL) ordered as CLHS 4.3.5 specifies.
 
 **R5.12 [S4]** `MAKE-INSTANCE` MUST follow the ANSI initialization protocol:
 `allocate-instance` → `initialize-instance` → `shared-initialize`.

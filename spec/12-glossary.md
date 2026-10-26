@@ -46,7 +46,7 @@
 | **Capability set** | An immutable bitfield attached to a sandbox context controlling which system resources are accessible (deny-by-default). | §8.2.2 (D8.01) |
 | **`.bimg`** | The EGCL image file format: a memory-mapped snapshot of the heap, symbol table, package registry, and compiled code cache. | §7.2 (D7.01) |
 | **Relocation table** | A delta-encoded list of heap offsets requiring pointer adjustment when an image is loaded at a different base address. | §7.2.10 (A7.01) |
-| **C3 linearisation** | The algorithm for computing the Class Precedence List (CPL) in CLOS, ensuring a monotonic, consistent ordering of superclasses. | §5.3 (R5.11) |
+| **Class precedence list (CPL)** | A class and its superclasses, most specific first, ordered by the topological sort of CLHS 4.3.5 (not C3, which differs on some hierarchies). | §5.3 (R5.11) |
 | **SWANK / Slynk** | The IDE communication protocol (SLIME/SLY compatible) providing eval, completion, debugging, and inspection over a socket connection. EGCL does not implement it; it loads a standard upstream backend as a library and provides the socket/introspection primitives (§6.1.5). | §6.1.5, §6.3.7 (D6.07) |
 | **Trampoline** | A small executable code stub used for FFI callbacks; allocated from a pool of executable pages and freed when the CL callback object is GC'd. | §2.7.5 |
 | **Frame pointer chain** | The linked list of `prev_fp` pointers in CL stack frames enabling O(n) stack walks for debugging and GC root scanning. | §2.4.2 (D2.02) |
