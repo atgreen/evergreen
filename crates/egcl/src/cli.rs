@@ -17497,24 +17497,22 @@ enum NumHead {
     Float,
     SingleF,
     DoubleF,
-    ShortF,
-    LongF,
 }
 
 /// `sub`'s head-set ⊆ `sup`'s head-set (ignoring bounds). INTEGER ⊆ RATIONAL ⊆
-/// REAL, every FLOAT subtype ⊆ FLOAT ⊆ REAL; the four named float formats are
-/// pairwise disjoint.
+/// REAL, every FLOAT subtype ⊆ FLOAT ⊆ REAL; SINGLE-FLOAT and DOUBLE-FLOAT are
+/// disjoint. EGCL has two float formats, so SHORT-FLOAT is the same type as
+/// SINGLE-FLOAT and LONG-FLOAT the same as DOUBLE-FLOAT (CLHS 12.1.4.1.1), as
+/// TYPEP already treats them: `num_head_from_name` maps them to those heads.
 fn num_head_subtype(sub: NumHead, sup: NumHead) -> bool {
     use NumHead::*;
     match sup {
         Real => true,
         Rational => matches!(sub, Integer | Rational),
         Integer => matches!(sub, Integer),
-        Float => matches!(sub, Float | SingleF | DoubleF | ShortF | LongF),
+        Float => matches!(sub, Float | SingleF | DoubleF),
         SingleF => matches!(sub, SingleF),
         DoubleF => matches!(sub, DoubleF),
-        ShortF => matches!(sub, ShortF),
-        LongF => matches!(sub, LongF),
     }
 }
 
@@ -17524,10 +17522,8 @@ fn num_head_from_name(name: &str) -> Option<NumHead> {
         "RATIONAL" => NumHead::Rational,
         "REAL" => NumHead::Real,
         "FLOAT" => NumHead::Float,
-        "SINGLE-FLOAT" => NumHead::SingleF,
-        "DOUBLE-FLOAT" => NumHead::DoubleF,
-        "SHORT-FLOAT" => NumHead::ShortF,
-        "LONG-FLOAT" => NumHead::LongF,
+        "SINGLE-FLOAT" | "SHORT-FLOAT" => NumHead::SingleF,
+        "DOUBLE-FLOAT" | "LONG-FLOAT" => NumHead::DoubleF,
         _ => return None,
     })
 }
