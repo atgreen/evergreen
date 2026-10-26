@@ -12,6 +12,7 @@
     "egcl:test:integer_extraction": [""],
     "egcl:test:make_array_fast_path_cli": [""],
     "egcl:test:native_array_constructor": [""],
+    "egcl:test:vector_ranges_cli": [""],
     "egcl:test:constant_reference_folding": [""],
     "egcl:test:integer_shift_probe": [""],
     "egcl:test:raw_fixnum": [""],
