@@ -9124,6 +9124,31 @@ fn char_string_and_list_functions() {
     }
 }
 
+/// SYMBOL-PACKAGE of a COMMON-LISP symbol is COMMON-LISP even after another
+/// package re-exports it, as UIOP/COMMON-LISP and parenscript do for T and
+/// NIL. The answer used to depend on which package the registry listed first.
+#[test]
+fn symbol_package_of_a_reexported_cl_symbol_stays_common_lisp() {
+    let prog = "(progn \
+        (defpackage :spk-reexport (:use :cl) (:export #:t #:nil #:car #:spk-own)) \
+        (format t \"SPK=~s~%\" \
+          (list (package-name (symbol-package 't)) \
+                (package-name (symbol-package nil)) \
+                (package-name (symbol-package 'car)) \
+                (package-name (symbol-package 'spk-reexport:spk-own)) \
+                (eq (find-symbol \"T\" :spk-reexport) t))))";
+    let out = egcl_bin()
+        .args(["--eval", prog])
+        .output()
+        .expect("run egcl");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("SPK=(\"COMMON-LISP\" \"COMMON-LISP\" \"COMMON-LISP\" \"SPK-REEXPORT\" T)"),
+        "home package of re-exported CL symbols; got: '{stdout}', stderr: '{}'",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// Regression: GCD/LCM and the STRING-TRIM family were undefined.
 #[test]
 fn gcd_lcm_and_string_trim() {
