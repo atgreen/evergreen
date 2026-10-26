@@ -552,11 +552,10 @@ pub fn hoist_invariant_bounds(f: &mut Function) -> usize {
                         | Opcode::ConstSymbol
                         | Opcode::ConstChar
                 );
-                let transparent = literal
-                    || matches!(
-                        data.opcode,
-                        Opcode::TypeCheck | Opcode::InstanceOf | Opcode::GenericEq
-                    );
+                // Predicate operands can be invariant while their heap/class
+                // observations change in the body. Do not move TypeCheck or
+                // InstanceOf, or anything following them in this prefix.
+                let transparent = literal || data.opcode == Opcode::GenericEq;
                 if data.flags.call
                     || data.flags.safepoint
                     || (!bound
@@ -2267,6 +2266,54 @@ mod invariant_bounds_tests {
             assert_eq!(hoist_invariant_bounds(&mut x.f), 0);
             assert!(x.f.block(x.bound_block).insts.contains(&x.add));
         }
+    }
+
+    fn mutable_predicate_stops_bound_prefix(opcode: Opcode) {
+        let mut x = fixture();
+        let operand = x.f.block(x.header).params[0];
+        let mut predicate = data(opcode, vec![operand]);
+        predicate.aux = AuxData::TypeTag(IRType::of(TypeBits::STRING));
+        // Even predicates without effect/call flags are not necessarily
+        // invariant: the body may mutate the object or its class.
+        let (predicate, _) = x.f.push_inst(
+            x.header,
+            predicate,
+            &[(IRType::of(TypeBits::SYMBOL.join(TypeBits::NULL)), Repr::Tagged)],
+        );
+        let instructions = &mut x.f.block_mut(x.header).insts;
+        assert_eq!(instructions.pop(), Some(predicate));
+        instructions.insert(0, predicate);
+
+        let mut call = data(Opcode::Call, vec![operand]);
+        call.aux = AuxData::CallTarget(0);
+        call.flags = InstFlags {
+            call: true,
+            effectful: true,
+            safepoint: true,
+            ..Default::default()
+        };
+        let (call, _) = x.f.push_inst(x.tail, call, &[]);
+        let instructions = &mut x.f.block_mut(x.tail).insts;
+        assert_eq!(instructions.pop(), Some(call));
+        instructions.insert(0, call);
+        crate::t2::verify::verify(&x.f).unwrap();
+
+        assert_eq!(hoist_invariant_bounds(&mut x.f), 0);
+        assert!(x.f.block(x.header).insts.contains(&predicate));
+        assert!(x.f.block(x.bound_block).insts.contains(&x.add));
+        assert!(x.f.block(x.bound_block).insts.contains(&x.min));
+        assert!(x.f.block(x.tail).insts.contains(&call));
+        crate::t2::verify::verify(&x.f).unwrap();
+    }
+
+    #[test]
+    fn type_check_stops_prefix_before_later_numeric_bounds() {
+        mutable_predicate_stops_bound_prefix(Opcode::TypeCheck);
+    }
+
+    #[test]
+    fn instance_of_stops_prefix_before_later_numeric_bounds() {
+        mutable_predicate_stops_bound_prefix(Opcode::InstanceOf);
     }
 
     #[test]
