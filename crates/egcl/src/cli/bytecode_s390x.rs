@@ -358,6 +358,11 @@ fn prepare_native(
     backedge_counter: u64,
     allow_traps: bool,
 ) -> Option<(PreparedT1, Vec<Rc<NativeCode>>)> {
+    // Local jumps cannot bypass lexical-frame cleanup. Apply this admission
+    // rule to background T1 and OSR as well as the synchronous test helper.
+    if local_exit_crosses_env_frame(bf) {
+        return None;
+    }
     // Captured parameters use EnvFrames and need not fit in activation slots.
     if bf.arity > bf.num_slots() && !bf.has_env {
         return None;
@@ -458,9 +463,9 @@ fn prepare_native(
     ))
 }
 
-/// Synchronous OSR callers use the same emitter, with owner preparation and
-/// publication still on their managed execution. The background broker calls
-/// the two phases separately.
+/// Tests and compatibility hosts can run both phases synchronously; Linux
+/// production requests use the background broker.
+#[cfg(any(test, not(target_os = "linux")))]
 pub(super) fn emit_native(
     bf: &BytecodeFunction,
     allow_speculation: bool,

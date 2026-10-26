@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 use super::*;
 use std::sync::{Condvar, Mutex, OnceLock};
 
@@ -475,5 +478,163 @@ fn background_t2_queue_pressure_does_not_permanently_decline_double_osr() {
     let native = wait_for_t2(symbol).expect("retried double loop installs T2");
     assert!(native.is_t2);
     assert!(Arc::ptr_eq(native.body.as_ref().unwrap(), &body));
+    registry_remove(symbol);
+}
+
+#[cfg(target_arch = "s390x")]
+#[test]
+fn background_s390x_numeric_deopt_queues_generic_replacement() {
+    let _lock = super::super::heap_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    super::super::read_eval_all_env("(defun background-s390x-phase (x) (+ x 1))", &mut env)
+        .unwrap();
+    let symbol = resolve_sym("BACKGROUND-S390X-PHASE")
+        .unwrap()
+        .as_symbol_index();
+    egcl_rt::rooted!(params = reader::read_from_string("(x)").unwrap().0);
+    egcl_rt::rooted!(forms = reader::read_from_string("((+ x 1))").unwrap().0);
+    let body = Arc::new(
+        compile_function(
+            "BACKGROUND-S390X-PHASE",
+            *params,
+            *forms,
+            &env,
+            false,
+            false,
+        )
+        .unwrap(),
+    );
+    registry_put(symbol, Arc::clone(&body));
+    egcl_rt::rooted!(function = egcl_rt::symbols::symbol_function(symbol).unwrap());
+    // Establish real fixnum evidence, then emit and execute real checked T1.
+    assert_eq!(
+        run_with_sym(
+            Arc::clone(&body),
+            &[EgclVal::from_fixnum(4)],
+            *function,
+            symbol,
+            &mut env,
+        )
+        .unwrap(),
+        EgclVal::from_fixnum(5)
+    );
+    let original =
+        try_promote_to_t1_with_speculation(symbol, true).expect("compile speculative checked T1");
+    assert!(
+        original.has_deopt,
+        "fixture must contain a real arithmetic guard"
+    );
+    mark_fresh_promotion(symbol);
+    publish_native(symbol, Some(*function), &original);
+    assert_eq!(
+        run_native(&original, symbol, &[EgclVal::from_fixnum(4)], &mut env,).unwrap(),
+        EgclVal::from_fixnum(5)
+    );
+
+    let hold = Hold::new(symbol, false);
+    let before_deopts = deopt_count();
+    // Resume each failed arithmetic guard in T0 so the changed numeric phase
+    // supplies real profile evidence; never call note_native_deopt directly.
+    for _ in 0..deopt_blacklist_threshold().saturating_add(2) {
+        assert_eq!(
+            run_native(
+                &original,
+                symbol,
+                &[EgclVal::from_single_float(1.5)],
+                &mut env,
+            )
+            .unwrap(),
+            EgclVal::from_single_float(2.5)
+        );
+        if background_t1::pending(symbol) {
+            break;
+        }
+    }
+    assert!(
+        deopt_count() > before_deopts,
+        "actual generated guards must fail"
+    );
+    assert!(
+        background_t1::pending(symbol),
+        "numeric phase retirement must queue its replacement, not compile on the mutator"
+    );
+    assert_eq!(egcl_rt::function::tier(*function), 0);
+    assert!(NATIVE_REGISTRY.with(|registry| !registry.borrow().contains_key(&symbol)));
+    hold.await_worker();
+    drop(hold);
+    background_t1::wait(symbol);
+    let replacement = NATIVE_REGISTRY
+        .with(|registry| registry.borrow().get(&symbol).cloned())
+        .expect("background generic T1 must publish");
+    assert!(!Rc::ptr_eq(&original, &replacement));
+    assert!(Arc::ptr_eq(replacement.body.as_ref().unwrap(), &body));
+    let before_generic = deopt_count();
+    assert_eq!(
+        run_native(
+            &replacement,
+            symbol,
+            &[EgclVal::from_single_float(1.5)],
+            &mut env,
+        )
+        .unwrap(),
+        EgclVal::from_single_float(2.5)
+    );
+    assert_eq!(
+        deopt_count(),
+        before_generic,
+        "generic replacement must handle the observed float phase without another guard failure"
+    );
+    registry_remove(symbol);
+}
+
+#[cfg(all(target_arch = "s390x", target_os = "linux"))]
+#[test]
+fn background_s390x_declines_local_exit_across_captured_environment() {
+    let _lock = crate::cli::heap_test_lock()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    egcl_rt::rooted!(
+        forms = reader::read_from_string(
+            "((let ((x 7) (g nil))
+            (let ((f (lambda () x)))
+              (block done
+                (let ((x 70))
+                  (setq g (lambda () x))
+                  (return-from done nil)))
+              (+ x (funcall f) (funcall g)))))"
+        )
+        .unwrap()
+        .0
+    );
+    let body = Arc::new(
+        compile_function("BACKGROUND-S390X-ENV-EXIT", NIL, *forms, &env, false, false)
+            .expect("real source must compile to bytecode"),
+    );
+    let symbol = egcl_rt::symbols::intern("BACKGROUND-S390X-ENV-EXIT");
+    registry_put(symbol, Arc::clone(&body));
+    assert!(
+        local_exit_crosses_env_frame(&body),
+        "fixture must leave a captured lexical child: {:?}",
+        body.code
+    );
+    assert!(
+        !native_would_lose_captured_control(&body),
+        "fixture must exercise environment restoration, not captured control exclusion"
+    );
+    let counter = std::sync::atomic::AtomicU32::new(0);
+    let counter_address = std::ptr::from_ref(&counter) as u64;
+    assert!(s390x::prepare_background_t1(symbol, &body, true, counter_address).is_none());
+    assert!(s390x::prepare_background_osr(&body, counter_address, true).is_none());
+    // Both the escaped closure's inner binding and the restored outer binding
+    // must survive RETURN-FROM: 7 + 7 + 70, not a stale inner-frame lookup.
+    assert_eq!(
+        run(body, &[], NIL, &mut env).unwrap(),
+        EgclVal::from_fixnum(84)
+    );
     registry_remove(symbol);
 }

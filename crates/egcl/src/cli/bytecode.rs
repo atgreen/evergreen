@@ -175,7 +175,7 @@ use egcl_rt::asm::{Asm, Cc, Label};
 #[cfg(all(target_arch = "s390x", unix))]
 #[path = "bytecode_s390x.rs"]
 mod s390x;
-#[cfg(all(target_arch = "s390x", unix))]
+#[cfg(all(target_arch = "s390x", unix, any(test, not(target_os = "linux"))))]
 use s390x::emit_native;
 
 #[cfg(all(target_arch = "riscv64", unix))]
@@ -23512,7 +23512,6 @@ fn compiler_wait_tick() {
 mod background_t1 {
     use super::*;
     pub(super) fn poll() {}
-    pub(super) fn pending(_sym: u32) -> bool { false }
     pub(super) fn pending_any() -> bool { false }
     pub(super) fn request(sym: u32) -> bool { try_promote_to_t1(sym).is_some() }
     pub(super) fn wait(sym: u32) -> Option<Rc<NativeCode>> {
@@ -23789,10 +23788,9 @@ fn note_native_deopt(sym: u32, code: Option<&NativeCode>, guard_bcp: Option<u32>
             }
         }
         if phase_change {
-            // The current T2 assumptions are stale, but native execution itself
-            // is profitable. Replace it immediately with non-speculating T1 so
-            // subsequent calls stay native while dispatch queues a profile-led
-            // replacement T2 version.
+            // Retire stale assumptions and request a non-speculating baseline.
+            // Ported backends retain T0 execution while replacement compiles;
+            // later dispatch can request a profile-led T2 version.
             NATIVE_REGISTRY.with(|r| r.borrow_mut().remove(&sym));
             bump_direct_call_gen(); // invalidate baked direct-call targets (bliss-zhvn)
             T2_DECLINED.with(|s| s.borrow_mut().remove(&sym));
@@ -23802,7 +23800,7 @@ fn note_native_deopt(sym: u32, code: Option<&NativeCode>, guard_bcp: Option<u32>
             DECAYED_EVIDENCE.with(|m| m.borrow_mut().remove(&sym));
             let fn_obj = egcl_rt::symbols::symbol_function(sym)
                 .filter(|&value| egcl_rt::function::is_interpreted_function(value));
-            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+            #[cfg(all(any(target_arch = "x86_64", target_arch = "s390x"), target_os = "linux"))]
             {
                 // T0 remains executable while the generic replacement is
                 // queued. A guard failure must not compile on the mutator.
@@ -23812,7 +23810,7 @@ fn note_native_deopt(sym: u32, code: Option<&NativeCode>, guard_bcp: Option<u32>
                 background_t1::request_with_speculation(sym, false);
                 trace("stale numeric specialization retired → queued generic T1");
             }
-            #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+            #[cfg(not(all(any(target_arch = "x86_64", target_arch = "s390x"), target_os = "linux")))]
             if let Some(fallback) = try_promote_to_t1_with_speculation(sym, false) {
                 publish_native(sym, fn_obj, &fallback);
                 trace("stale numeric specialization retired → generic T1");
@@ -25926,7 +25924,7 @@ mod ppc64le;
 /// Emit T1 native code for the host. Each architecture's baseline emitter
 /// decides for itself what it can lower; a host with no emitter never promotes
 /// and every function stays in the counting interpreter.
-#[cfg(egcl_no_t1)]
+#[cfg(all(egcl_no_t1, any(test, not(all(target_arch = "s390x", target_os = "linux")))))]
 fn emit_native_t1(
     _bf: &BytecodeFunction,
     _allow_speculation: bool,
@@ -25937,7 +25935,7 @@ fn emit_native_t1(
     None
 }
 
-#[cfg(not(egcl_no_t1))]
+#[cfg(all(not(egcl_no_t1), any(test, not(all(target_arch = "s390x", target_os = "linux")))))]
 fn emit_native_t1(
     bf: &BytecodeFunction,
     allow_speculation: bool,
@@ -25998,7 +25996,7 @@ fn try_promote_to_t1(sym: u32) -> Option<Rc<NativeCode>> {
 /// Build T1 with or without its optimistic fixnum templates. The
 /// non-speculating form is the stable native fallback while a replacement T2
 /// version is compiled for a newly observed numeric phase.
-#[cfg(any(test, not(all(target_arch = "x86_64", target_os = "linux"))))]
+#[cfg(any(test, not(all(any(target_arch = "x86_64", target_arch = "s390x"), target_os = "linux"))))]
 fn try_promote_to_t1_with_speculation(sym: u32, allow_speculation: bool) -> Option<Rc<NativeCode>> {
     if cfg!(egcl_no_t1) {
         return None;

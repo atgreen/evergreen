@@ -1,6 +1,7 @@
 {
   "fast": {
-    "egcl:lib:egcl": ["cli::bytecode::native_transfer_tests::", "cli::bytecode::native_transfer_entry::ordinary_calls::tests::"],
+    "egcl:lib:egcl": ["cli::bytecode::native_transfer_tests::", "cli::bytecode::native_transfer_entry::ordinary_calls::tests::", "cli::bytecode::background_compile_tests::", "cli::bytecode::native_transfer_entry::background_compilation::tests::"],
+    "egcl:test:background_compilation_cli": [""],
     "egcl:test:native_default_policy_cli": [""],
     "egcl:test:native_transfer_disassembly": [""],
     "egcl:test:native_callable_image": [""],

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Owner-managed requests and publication; compiler workers never run Lisp.
 use super::*;
 use std::sync::{Condvar, Mutex, OnceLock, mpsc};
