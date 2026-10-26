@@ -14689,6 +14689,20 @@ fn reader_struct_constructor(name: EgclVal, slots: &[EgclVal]) -> Option<EgclVal
     if !egcl_stdlib::is_structure_class(class) {
         return None;
     }
+    // A slot name is a string designator, interned as a keyword (CLHS
+    // 2.4.8.13): #S(point "X" 1) and #S(point #\X 1) name slot X as :X and
+    // X do (ansi syntax.sharp-s.3-4). Symbols are pinned, so only the
+    // vector itself needs rooting.
+    egcl_rt::rooted!(initargs = slots.to_vec());
+    for i in (0..initargs.len()).step_by(2) {
+        let key = initargs[i];
+        if key.is_character() || is_string_value(key) || key.is_symbol() {
+            if let Some(keyword) = resolve_sym(&format!(":{}", string_designator_name(key))) {
+                initargs[i] = keyword;
+            }
+        }
+    }
+    let slots: &[EgclVal] = &initargs;
     // #S calls the structure's constructor (CLHS 2.4.8.13), so slots the
     // literal leaves out take their initforms. Go through the full
     // MAKE-INSTANCE protocol when a load environment is available (the same
