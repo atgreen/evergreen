@@ -249,6 +249,10 @@
   preventing wrong `NIL` results and crashes caused by reading a previous
   carrier's fiber identity ([#661](https://github.com/atgreen/evergreen/pull/661)).
 
+- `format`'s `~?` and `~@?` accept a function, such as `formatter` returns, as
+  their control as well as a format string
+  ([#676](https://github.com/atgreen/evergreen/pull/676)).
+
 - `compile-file` now expands package-local `define-package` macros normally,
   so macros that add `COMMON-LISP` to their package's use list compile and
   load correctly ([#655](https://github.com/atgreen/evergreen/pull/655),
