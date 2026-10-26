@@ -18,6 +18,13 @@
 
 ### Performance
 
+- Local functions defined with `flet` or `labels` can now compile when they
+  read or write enclosing lexical variables. Small helpers inline into their
+  callers, including sibling `labels` functions, while shared mutation and
+  lexical scope are preserved. Native captured-variable accesses also avoid
+  redundant runtime work when no poll or signal needs servicing
+  ([#658](https://github.com/atgreen/evergreen/pull/658)).
+
 - On x86-64 Linux, T2 loops now read vector elements and boxed or packed
   doubles directly, and store computed doubles into packed arrays without
   allocating a box. Vector stores retain the moving-GC write barrier, and
