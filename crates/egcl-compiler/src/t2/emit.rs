@@ -5780,7 +5780,10 @@ fn emit_framed_inner(
                         let op = f.inst(inst).opcode;
                         if ((code_id == 0 && fixnum_cmp_cc(op).is_some()
                             && f.inst(inst).args.iter().all(|&v| f.value(v).repr != ValueRepresentation::UnboxedFixnum)) || op == Opcode::GenericEq)
-                            && f.block(b).insts.contains(&inst)
+                            // Operand lifetimes end at the comparison in LIR.
+                            // A later instruction may reuse their homes before
+                            // Brif, so only adjacent compares can be deferred.
+                            && f.block(b).insts.iter().rev().nth(1) == Some(&inst)
                         {
                             fused.insert(inst);
                         }
