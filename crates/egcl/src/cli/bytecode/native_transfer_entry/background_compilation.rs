@@ -971,6 +971,7 @@ pub(in crate::cli::bytecode) fn compile_background_t1(input: PreparedT1) -> Opti
             (
                 egcl_compiler::t2::build::build_from_bytecode_for_native_cleanups_snapshot(
                     &input.snapshot,
+                    input.symbol,
                 )
                 .map_err(EmitDecline::Build)?,
                 None,
