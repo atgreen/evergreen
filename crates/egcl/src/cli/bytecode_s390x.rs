@@ -177,16 +177,19 @@ fn boolean(a: &mut ZAsm, mask: u8) {
 /// every guard edge. The shared deopt adapter can resume the exact bytecode.
 fn arithmetic(
     a: &mut ZAsm,
-    sym: u32,
+    site: &CallSite,
     nargs: u16,
     bcp: u32,
     deopts: &mut std::collections::BTreeMap<u32, ZLabel>,
 ) -> bool {
-    let supported = (nargs == 1 && inlinable_unary_fixnum_op(sym).is_some())
-        || (nargs == 2 && inlinable_fixnum_op(sym).is_some());
-    if !supported { return false; }
-    use egcl_compiler::t2::builtin_binding::{self, Binding};
-    let Some(binding) = builtin_binding::snapshot(sym) else { return false; };
+    use egcl_compiler::t2::builtin_binding::Binding;
+    let supported = (nargs == 1 && site.unary.is_some()) || (nargs == 2 && site.binary.is_some());
+    if !supported {
+        return false;
+    }
+    let Some(binding) = site.binding else {
+        return false;
+    };
     if let Binding::Guarded { address, expected } = binding {
         let deopt = *deopts.entry(bcp).or_insert_with(|| a.label());
         a.imm64(1, address as u64);
@@ -196,7 +199,7 @@ fn arithmetic(
         a.branch(6, deopt);
     }
     if nargs == 1 {
-        if let Some(op) = inlinable_unary_fixnum_op(sym) {
+        if let Some(op) = site.unary {
             let deopt = *deopts.entry(bcp).or_insert_with(|| a.label());
             a.load(2, 9, -8);
             guard_fixnum(a, 2, deopt);
@@ -217,7 +220,7 @@ fn arithmetic(
     if nargs != 2 {
         return false;
     }
-    let Some(op) = inlinable_fixnum_op(sym) else {
+    let Some(op) = site.binary else {
         return false;
     };
     let deopt = *deopts.entry(bcp).or_insert_with(|| a.label());
@@ -284,6 +287,172 @@ fn arithmetic(
     true
 }
 
+/// A snapshot contains only owned compiler data and opaque stable addresses.
+/// The owner must retain and GC-root the original bytecode body (including
+/// nested bodies) until publication/discard, then for installed code's lifetime.
+/// Worker emission never dereferences any address captured here.
+pub(super) struct PreparedT1 {
+    code: Vec<Instr>,
+    name: String,
+    n_locals: u16,
+    body_address: u64,
+    constant_slots: Vec<u64>,
+    nested_slots: Vec<u64>,
+    env_names: Box<NativeEnvNames>,
+    calls: HashMap<u32, CallSite>,
+    allow_speculation: bool,
+    sym: u32,
+    backedge_counter: u64,
+    backedge_threshold: u32,
+    allow_traps: bool,
+}
+
+struct CallSite {
+    callee: u32,
+    direct: Option<DirectTarget>,
+    builtin_slot: Option<u32>,
+    profile: u64,
+    unary: Option<UnaryFixnumOp>,
+    binary: Option<FixnumOp>,
+    binding: Option<egcl_compiler::t2::builtin_binding::Binding>,
+}
+
+struct DirectTarget {
+    entry: u64,
+    code_info: u64,
+    num_slots: u16,
+    generation: u64,
+}
+
+/// No execution-local Rc escapes to a worker. The broker retains direct-call
+/// targets separately and attaches them when converting this artifact.
+pub(super) struct EmittedT1 {
+    pub(super) env_names: Box<NativeEnvNames>,
+    pub(super) code: Vec<u8>,
+    pub(super) osr_entries: Vec<(u32, usize)>,
+    pub(super) bcp_offsets: Vec<u32>,
+    pub(super) has_deopt: bool,
+}
+
+pub(super) fn prepare_background_t1(
+    sym: u32,
+    bf: &Arc<BytecodeFunction>,
+    allow_speculation: bool,
+    backedge_counter: u64,
+) -> Option<(PreparedT1, Vec<Rc<NativeCode>>)> {
+    prepare_native(bf, allow_speculation, sym, backedge_counter, false)
+}
+
+fn prepare_native(
+    bf: &BytecodeFunction,
+    allow_speculation: bool,
+    sym: u32,
+    backedge_counter: u64,
+    allow_traps: bool,
+) -> Option<(PreparedT1, Vec<Rc<NativeCode>>)> {
+    // Captured parameters use EnvFrames and need not fit in activation slots.
+    if bf.arity > bf.num_slots() && !bf.has_env {
+        return None;
+    }
+    let values_sym = resolve_sym("VALUES")?.as_symbol_index();
+    let mut calls = HashMap::new();
+    let mut direct_calls = Vec::new();
+    for (index, instr) in bf.code.iter().enumerate() {
+        let (callee, nargs) = match *instr {
+            Instr::CallNamed { sym, nargs } => (sym, nargs),
+            Instr::SetValues(nargs) => (values_sym, nargs),
+            _ => continue,
+        };
+        let mut direct = None;
+        if matches!(instr, Instr::CallNamed { .. }) && nn_direct_enabled() {
+            // Capture before lookup so a replacement cannot stamp an old
+            // native target with a newer invalidation generation.
+            let generation = direct_call_gen();
+            if let (Some(cbf), Some(cnc)) = (
+                registry_get(callee),
+                NATIVE_REGISTRY.with(|r| r.borrow().get(&callee).cloned()),
+            ) {
+                let fixed =
+                    !cbf.variadic && cbf.max_args == Some(cbf.min_args) && cbf.min_args == nargs;
+                let no_types = cbf
+                    .param_types
+                    .iter()
+                    .all(|t| matches!(t, DeclaredType::Any));
+                let not_closure = !cbf.has_env
+                    && closure_captured_env(EgclVal::from_symbol_index(callee)).is_none()
+                    && !closure_controls().borrow().contains_key(&callee);
+                if replacement_function(callee).is_none()
+                    && native_transfer_abi_compatible(&cnc)
+                    && (!cnc.has_deopt || cnc.is_t2)
+                    && fixed
+                    && no_types
+                    && not_closure
+                {
+                    direct = Some(DirectTarget {
+                        entry: cnc.entry as u64,
+                        code_info: cnc.code_info as *const CodeInfo as u64,
+                        num_slots: cnc.num_slots,
+                        generation,
+                    });
+                    direct_calls.push(cnc);
+                }
+            }
+        }
+        // The builtin guard precedes lookup for the same reason as the
+        // native-target guard: a newer generation must never bless old data.
+        let builtin_generation = direct_call_gen();
+        let builtin_slot = super::super::direct_builtin_slot(callee, usize::from(nargs));
+        let profile = if builtin_slot.is_some() {
+            builtin_generation
+        } else if registry_get(callee).is_some() {
+            call_site_profile_token(bf as *const BytecodeFunction as usize, index as u32)
+        } else {
+            0
+        };
+        calls.insert(
+            index as u32,
+            CallSite {
+                callee,
+                direct,
+                builtin_slot,
+                profile,
+                unary: inlinable_unary_fixnum_op(callee),
+                binary: inlinable_fixnum_op(callee),
+                binding: egcl_compiler::t2::builtin_binding::snapshot(callee),
+            },
+        );
+    }
+    Some((
+        PreparedT1 {
+            code: bf.code.clone(),
+            name: bf.name.clone(),
+            n_locals: bf.n_locals,
+            body_address: bf as *const BytecodeFunction as u64,
+            constant_slots: bf
+                .constants
+                .iter()
+                .map(|v| v as *const EgclVal as u64)
+                .collect(),
+            nested_slots: bf
+                .nested_functions
+                .iter()
+                .map(|v| v as *const Arc<BytecodeFunction> as u64)
+                .collect(),
+            env_names: NativeEnvNames::new(bf),
+            calls,
+            allow_speculation,
+            sym,
+            backedge_counter,
+            backedge_threshold: t2_backedge_threshold(),
+            allow_traps,
+        },
+        direct_calls,
+    ))
+}
+
+/// Synchronous OSR callers use the same emitter, with owner preparation and
+/// publication still on their managed execution. The background broker calls
+/// the two phases separately.
 pub(super) fn emit_native(
     bf: &BytecodeFunction,
     allow_speculation: bool,
@@ -291,17 +460,26 @@ pub(super) fn emit_native(
     backedge_counter: u64,
     allow_traps: bool,
 ) -> Option<NativeEmission> {
-    let env_names = NativeEnvNames::new(bf);
-    // Parameters live in slots unless the function captures them into a
-    // heap EnvFrame, in which case the bytecode reaches them through
-    // LoadEnvVar and the activation may be narrower than the arity: a closure
-    // factory with five captured parameters has one slot. Only the former
-    // shape can violate the slot count, and then only through an invariant
-    // breach the emitter must not build on.
-    if bf.arity > bf.num_slots() && !bf.has_env {
-        return None;
-    }
-    let values_sym = resolve_sym("VALUES")?.as_symbol_index();
+    let (input, direct_calls) =
+        prepare_native(bf, allow_speculation, sym, backedge_counter, allow_traps)?;
+    let emitted = compile_background_t1(input)?;
+    Some(NativeEmission {
+        env_names: emitted.env_names,
+        code: emitted.code,
+        osr_entries: emitted.osr_entries,
+        bcp_offsets: emitted.bcp_offsets,
+        has_deopt: emitted.has_deopt,
+        direct_calls,
+    })
+}
+
+pub(super) fn compile_background_t1(input: PreparedT1) -> Option<EmittedT1> {
+    let bf = &input;
+    let env_names = &input.env_names;
+    let allow_speculation = input.allow_speculation;
+    let sym = input.sym;
+    let backedge_counter = input.backedge_counter;
+    let allow_traps = input.allow_traps;
     let mut a = ZAsm::new();
     let labels: Vec<_> = bf.code.iter().map(|_| a.label()).collect();
     let exit = a.label();
@@ -332,9 +510,6 @@ pub(super) fn emit_native(
     };
     let mut osr_headers = std::collections::BTreeSet::new();
     let mut can_osr_to_t2 = false;
-    // Callees called directly; retained so their code outlives a registry
-    // replacement while this caller's code still jumps into it.
-    let mut direct_calls = Vec::new();
     prologue(&mut a, bf.n_locals);
     for (index, instr) in bf.code.iter().enumerate() {
         let bcp = index as u32;
@@ -357,7 +532,7 @@ pub(super) fn emit_native(
             Instr::Const(k) => {
                 // The registry-rooted constant slot is stable; its contents can
                 // move during GC and must be reloaded on each execution.
-                a.imm64(2, bf.constants.get(k as usize)? as *const EgclVal as u64);
+                a.imm64(2, *bf.constant_slots.get(k as usize)?);
                 a.load(2, 2, 0);
                 push(&mut a);
             }
@@ -383,99 +558,40 @@ pub(super) fn emit_native(
                 push(&mut a);
             }
             Instr::CallNamed { nargs, .. } | Instr::SetValues(nargs) => {
-                let callee = match *instr {
-                    Instr::CallNamed { sym, .. } => sym,
-                    _ => values_sym,
-                };
+                let site = bf.calls.get(&bcp)?;
+                let callee = site.callee;
                 if allow_speculation
                     && matches!(instr, Instr::CallNamed { .. })
-                    && arithmetic(&mut a, callee, nargs, bcp, &mut deopts)
+                    && arithmetic(&mut a, site, nargs, bcp, &mut deopts)
                 {
                     continue;
                 }
-                // Direct native->native fast path with a runtime c2i fallback
-                // (bliss-zhvn, bliss-767gn). On a guard miss the emitted code
-                // jumps to `slow`, which falls into the c2i emission below; on
-                // success it jumps past c2i to `direct_after`. The eligibility
-                // test is the x86-64 emitter's, verbatim.
                 let mut direct_after: Option<ZLabel> = None;
-                if matches!(instr, Instr::CallNamed { .. }) && nn_direct_enabled() {
-                    // Capture the guard before the lookup: a concurrent
-                    // replacement must not stamp an old target with its newer
-                    // generation.
-                    let baked_gen = direct_call_gen();
-                    if let (Some(cbf), Some(cnc)) = (
-                        registry_get(callee),
-                        NATIVE_REGISTRY.with(|r| r.borrow().get(&callee).cloned()),
-                    ) {
-                        let fixed = !cbf.variadic
-                            && cbf.max_args == Some(cbf.min_args)
-                            && cbf.min_args == nargs;
-                        let no_types = cbf
-                            .param_types
-                            .iter()
-                            .all(|t| matches!(t, DeclaredType::Any));
-                        let not_closure = !cbf.has_env
-                            && closure_captured_env(EgclVal::from_symbol_index(callee)).is_none()
-                            && !closure_controls().borrow().contains_key(&callee);
-                        if replacement_function(callee).is_none()
-                            && native_transfer_abi_compatible(&cnc)
-                            // A deopting T2 callee resumes T0 inline and
-                            // returns a finished value (bliss-w6aki); a T1
-                            // callee's deopt still waits for run_native.
-                            && (!cnc.has_deopt || cnc.is_t2)
-                            && fixed
-                            && no_types
-                            && not_closure
-                        {
-                            egcl_rt::blog!(
-                                "compile",
-                                egcl_rt::log::TRACE,
-                                "[T1] {}: direct call to {} [T{}]",
-                                display_fn_name(&bf.name),
-                                display_fn_name(&cbf.name),
-                                if cnc.is_t2 { 2 } else { 1 }
-                            );
-                            let slow = a.label();
-                            let after = a.label();
-                            direct_native_call(
-                                &mut a,
-                                cnc.entry as u64,
-                                cnc.code_info as *const CodeInfo as u64,
-                                cnc.num_slots,
-                                nargs,
-                                baked_gen,
-                                slow,
-                                exit,
-                            );
-                            direct_calls.push(cnc);
-                            a.branch(15, after);
-                            a.bind(slow);
-                            direct_after = Some(after);
-                        }
-                    }
+                if let Some(target) = &site.direct {
+                    let slow = a.label();
+                    let after = a.label();
+                    direct_native_call(
+                        &mut a,
+                        target.entry,
+                        target.code_info,
+                        target.num_slots,
+                        nargs,
+                        target.generation,
+                        slow,
+                        exit,
+                    );
+                    a.branch(15, after);
+                    a.bind(slow);
+                    direct_after = Some(after);
                 }
-                // A leaf builtin the call site resolved at compile time is
-                // called through the direct adapter with its table slot baked
-                // in and the invalidation generation in place of a profile
-                // token (builtins do not tier, so there is nothing to profile),
-                // exactly as the x86-64 T1 emitter does (bliss-x5y.27). Same
-                // slice convention, so only r2, r5 and the target differ. Every
-                // call used to be resolved BY NAME in c2i (bliss-flzmi).
-                let direct_builtin = super::super::direct_builtin_slot(callee, usize::from(nargs));
+                let direct_builtin = site.builtin_slot;
                 match direct_builtin {
                     Some(slot) => a.imm64(2, (u64::from(slot) << 32) | u64::from(callee)),
                     None => a.imm64(2, u64::from(callee)),
                 }
                 a.imm64(3, u64::from(nargs));
                 a.address(4, 9, -8 * i32::from(nargs));
-                let profile = if direct_builtin.is_some() {
-                    direct_call_gen()
-                } else if registry_get(callee).is_some() {
-                    call_site_profile_token(bf as *const BytecodeFunction as usize, bcp)
-                } else {
-                    0
-                };
+                let profile = site.profile;
                 a.imm64(5, profile);
                 let adapter = if direct_builtin.is_some() {
                     c2i_call_builtin as *const () as u64
@@ -540,7 +656,7 @@ pub(super) fn emit_native(
                         a.load_u32(2, 1, 0);
                         a.add_imm(2, 1);
                         a.store_u32(2, 1, 0);
-                        a.imm64(3, u64::from(t2_backedge_threshold()));
+                        a.imm64(3, u64::from(bf.backedge_threshold));
                         a.compare(2, 3);
                         a.branch(4, keep);
                         a.imm64(2, 0);
@@ -552,7 +668,7 @@ pub(super) fn emit_native(
                             a.imm64(2, u64::from(sym));
                             a.imm64(3, u64::from(target_bcp));
                             a.mov(4, 8);
-                            a.imm64(5, bf as *const BytecodeFunction as u64);
+                            a.imm64(5, bf.body_address);
                             helper(&mut a, c2i_t1_backedge as *const () as u64, exit);
                         }
                         a.imm64(0, 0);
@@ -596,14 +712,14 @@ pub(super) fn emit_native(
                 helper(&mut a, c2i_store_global as *const () as u64, exit);
             }
             Instr::LoadEnvVar(i) => {
-                a.imm64(2, std::ptr::from_ref(&*env_names) as u64);
+                a.imm64(2, std::ptr::from_ref(&**env_names) as u64);
                 a.imm64(3, u64::from(i));
                 helper(&mut a, c2i_load_env as *const () as u64, exit);
                 push(&mut a);
             }
             Instr::StoreEnvVar(i) | Instr::DefineEnvVar(i) => {
                 pop(&mut a, 4);
-                a.imm64(2, std::ptr::from_ref(&*env_names) as u64);
+                a.imm64(2, std::ptr::from_ref(&**env_names) as u64);
                 a.imm64(3, u64::from(i));
                 helper(
                     &mut a,
@@ -640,15 +756,14 @@ pub(super) fn emit_native(
             // function containing a LAMBDA declined T1 on s390x and stayed
             // interpreted (native_portable_closure's four factory tests).
             Instr::MakeClosure { func, capture_env } => {
-                let nested =
-                    bf.nested_functions.get(func as usize)? as *const Arc<BytecodeFunction>;
-                a.imm64(2, nested as u64);
+                let nested = *bf.nested_slots.get(func as usize)?;
+                a.imm64(2, nested);
                 a.imm64(3, u64::from(capture_env));
                 helper(&mut a, c2i_make_bytecode_closure as *const () as u64, exit);
                 push(&mut a);
             }
             Instr::EvalHost(k) | Instr::MakeClosureEnv(k) => {
-                a.imm64(2, bf.constants.get(k as usize)? as *const EgclVal as u64);
+                a.imm64(2, *bf.constant_slots.get(k as usize)?);
                 a.load(2, 2, 0);
                 helper(
                     &mut a,
@@ -729,13 +844,12 @@ pub(super) fn emit_native(
         .iter()
         .map(|&label| a.label_offset(label).unwrap() as u32)
         .collect();
-    Some(NativeEmission {
-        env_names,
+    Some(EmittedT1 {
+        env_names: input.env_names,
         code: a.finish()?,
         osr_entries,
         bcp_offsets,
         has_deopt: !deopts.is_empty() || can_osr_to_t2,
-        direct_calls,
     })
 }
 
@@ -752,6 +866,54 @@ mod tests {
             symbol,
             try_promote_to_t1(symbol).expect("must install s390x T1"),
         )
+    }
+
+    #[test]
+    fn s390x_prepared_emission_runs_without_the_owner_registry() {
+        let _lock = crate::cli::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env = &mut env);
+        egcl_rt::rooted!(
+            form =
+                reader::read_from_string("((let ((x '(worker constant))) (lambda () x)) (+ 3 4))")
+                    .unwrap()
+                    .0
+        );
+        let symbol = egcl_rt::symbols::intern("S390X-WORKER-SNAPSHOT");
+        let body = Arc::new(
+            compile_function("S390X-WORKER-SNAPSHOT", NIL, *form, &env, false, false).unwrap(),
+        );
+        registry_put(symbol, body.clone());
+        let (input, retained) = super::prepare_background_t1(symbol, &body, true, 0)
+            .expect("prepare on the managed owner");
+        let _retained_direct_targets = retained;
+        let expected_constants: Vec<_> = body
+            .constants
+            .iter()
+            .map(|value| value as *const EgclVal as u64)
+            .collect();
+        assert_eq!(input.constant_slots, expected_constants);
+        let expected_nested: Vec<_> = body
+            .nested_functions
+            .iter()
+            .map(|nested| nested as *const Arc<BytecodeFunction> as u64)
+            .collect();
+        assert_eq!(input.nested_slots, expected_nested);
+        registry_remove(symbol);
+        // Only the immutable snapshot crosses threads. In particular, the
+        // worker has no source Arc, native registry, or unrooted Lisp values.
+        let emitted = std::thread::spawn(move || super::compile_background_t1(input))
+            .join()
+            .unwrap()
+            .expect("emit outside the owner's execution context");
+        assert!(!emitted.code.is_empty());
+        assert_eq!(emitted.bcp_offsets.len(), body.code.len());
+        assert!(
+            emitted.has_deopt,
+            "the captured arithmetic guard must be emitted"
+        );
     }
 
     #[test]
