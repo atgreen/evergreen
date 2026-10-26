@@ -4102,10 +4102,26 @@ impl<'e> Lowerer<'e> {
         if nargs > u16::MAX as usize {
             return Err(Bail);
         }
+        let symbol = op.as_symbol_index();
+        // Preserve explicit NOTINLINE for the native constructor expansion.
+        // Lexical/captured function resolution above keeps its own namespace.
+        // An indirect FUNCALL is opaque to the canonical MAKE-ARRAY rewrite.
+        if egcl_rt::symbols::find_index("MAKE-ARRAY") == Some(symbol)
+            && self_calls::notinline(symbol, &self.inline_policies)
+        {
+            let count = u16::try_from(nargs + 1).map_err(|_| Bail)?;
+            let funcall = resolve_sym("FUNCALL").ok_or(Bail)?.as_symbol_index();
+            self.emit(Instr::LoadFunction(symbol));
+            self.push_n(1);
+            for i in 0..nargs { self.lower_expr(args[i])?; }
+            self.emit(Instr::CallNamed { sym: funcall, nargs: count });
+            self.pop_n(count);
+            self.push_n(1);
+            return Ok(());
+        }
         for i in 0..nargs {
             self.lower_expr(args[i])?;
         }
-        let symbol = op.as_symbol_index();
         if self.self_symbol == Some(symbol)
             && !self_calls::notinline(symbol, &self.inline_policies)
         {
