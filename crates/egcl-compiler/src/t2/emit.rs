@@ -7533,6 +7533,28 @@ fn emit_framed_inner(
                 if d.opcode == Opcode::VecRef {
                     load_mem64_disp(&mut a, inst_reg[&d.results[0]], SCRATCH, 0);
                 } else {
+                    let value = d.args[2];
+                    if std::env::var_os("EGCL_DISABLE_IMMEDIATE_VECTOR_STORES").is_none()
+                        && const_tagged.get(&value).is_none_or(|bits| bits & 7 == 0)
+                    {
+                        let barrier = a.label();
+                        // SATB observes the overwritten value, not just the new
+                        // one. Bypass the barrier only for fixnum -> fixnum:
+                        // there is neither an old referent to preserve nor a
+                        // new remembered-set edge. No safepoint intervenes.
+                        if !const_tagged.contains_key(&value) {
+                            guard_fixnum(&mut a, inst_reg[&value], barrier);
+                        }
+                        load_mem64_disp(&mut a, RAX, SCRATCH, 0);
+                        guard_fixnum(&mut a, RAX, barrier);
+                        if let Some(&bits) = const_tagged.get(&value) {
+                            mov_imm64(&mut a, RAX, bits as i64);
+                        } else { mov_rr(&mut a, RAX, inst_reg[&value]); }
+                        store_mem64_disp(&mut a, SCRATCH, 0, RAX);
+                        mov_rr(&mut a, inst_reg[&d.results[0]], RAX);
+                        a.jmp(stored);
+                        a.bind(barrier);
+                    }
                     // Preserve every caller-save home around the noncollecting
                     // barrier leaf. No map or safepoint exposes the slot pointer.
                     let volatile = [RAX, 1, 2, 6, 7, 8, 9, 10, 11];
