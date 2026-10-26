@@ -39162,7 +39162,12 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     // Printer options are currently ignored.
     egcl_rt::rooted!(representation = None::<EgclVal>);
     let mut named_or_offset = false;
-    let mut conc_name = format!("{name_str}-");
+    // None: no prefix, so each accessor is the slot's own symbol ((:conc-name)
+    // or (:conc-name nil)). Some(prefix): the accessor is prefix+slot-name
+    // interned in the defining package -- also for an empty prefix, as with
+    // (:conc-name "") and slots named in another package (ansi
+    // struct-test-36).
+    let mut conc_name: Option<String> = Some(format!("{name_str}-"));
     let mut include_parent: Option<EgclVal> = None;
     // `:include`'s trailing slot-override specs — `(slot [new-default . opts])` —
     // which redefine an inherited slot's default/type/read-only in this child
@@ -39198,7 +39203,7 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     named_or_offset = true;
                 }
                 if opt.is_symbol() && sym_bare_name_rc(opt).as_ref() == "CONC-NAME" {
-                    conc_name = String::new();
+                    conc_name = None;
                 }
                 continue;
             }
@@ -39216,11 +39221,11 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 "CONC-NAME" => {
                     let v = if orest.is_cons() { cp(orest).0 } else { NIL };
                     conc_name = if v == NIL {
-                        String::new()
+                        None
                     } else if v.is_symbol() {
-                        sym_bare_name_rc(v).to_string()
+                        Some(sym_bare_name_rc(v).to_string())
                     } else {
-                        val_as_str(v)
+                        Some(val_as_str(v))
                     };
                 }
                 "INCLUDE" => {
@@ -39356,10 +39361,11 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         let slot_str = sym_bare_name_rc(slot_sym);
         egcl_rt::rooted!(default = default);
         egcl_rt::rooted!(slot_type = slot_type);
-        let accessor = if conc_name.is_empty() {
-            slot_sym
-        } else {
-            resolve_sym(&format!("{definition_package}::{conc_name}{slot_str}")).unwrap_or(NIL)
+        let accessor = match &conc_name {
+            None => slot_sym,
+            Some(prefix) => {
+                resolve_sym(&format!("{definition_package}::{prefix}{slot_str}")).unwrap_or(NIL)
+            }
         };
         let initarg = resolve_sym(&format!(":{slot_str}")).unwrap_or(NIL);
         slots.push(StructSlot {
@@ -39457,10 +39463,11 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             // silently takes its default instead — which, for slynk's
             // `(socket (missing-arg))`, means an error the moment a client
             // connects.
-            let accessor = if conc_name.is_empty() {
-                slot_sym
-            } else {
-                resolve_sym(&format!("{definition_package}::{conc_name}{bare_sname}")).unwrap_or(NIL)
+            let accessor = match &conc_name {
+                None => slot_sym,
+                Some(prefix) => {
+                    resolve_sym(&format!("{definition_package}::{prefix}{bare_sname}")).unwrap_or(NIL)
+                }
             };
             // A `(slot … :read-only t)` override makes the inherited slot
             // read-only in the child.

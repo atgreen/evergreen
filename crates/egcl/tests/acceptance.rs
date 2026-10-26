@@ -6573,6 +6573,33 @@ fn defstruct_is_gc_safe_under_stress() {
     );
 }
 
+/// DEFSTRUCT's `(:conc-name "")` is an empty prefix, not no prefix: the
+/// accessor for a slot named in another package is interned in the package
+/// current at the DEFSTRUCT, while `(:conc-name nil)` uses the slot's own
+/// symbol (CLHS DEFSTRUCT; ansi struct-test-36).
+#[test]
+fn defstruct_empty_string_conc_name_interns_accessors_in_the_current_package() {
+    // The slots' package must exist before the next form is read.
+    let prog = "\
+        (defstruct (cn-empty (:conc-name \"\")) cn-slots::cn-a) \
+        (defstruct (cn-none (:conc-name nil)) cn-slots::cn-b) \
+        (format t \"CN=~s~%\" \
+          (list (cn-a (make-cn-empty :cn-a 1)) \
+                (fboundp 'cn-slots::cn-a) \
+                (cn-slots::cn-b (make-cn-none :cn-b 2)) \
+                (fboundp 'cn-b)))";
+    let out = egcl_bin()
+        .args(["--eval", "(defpackage :cn-slots (:use))", "--eval", &format!("(progn {prog})")])
+        .output()
+        .expect("run egcl");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("CN=(1 NIL 2 NIL)"),
+        "(:conc-name \"\") accessors belong to the current package; got: '{stdout}', stderr: '{}'",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// bliss-44qp-adjacent: COPY-STRUCTURE (was fboundp => T but "undefined
 /// function") shallow-copies any structure/instance — a distinct object with the
 /// same class and every bound slot copied, including inherited (:include) slots.
