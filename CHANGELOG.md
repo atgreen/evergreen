@@ -93,6 +93,10 @@
 
 ### Fixed
 
+- Fiber migration preserves execution-local state after native calls on s390x,
+  preventing wrong `NIL` results and crashes caused by reading a previous
+  carrier's fiber identity ([#661](https://github.com/atgreen/evergreen/pull/661)).
+
 - `compile-file` now expands package-local `define-package` macros normally,
   so macros that add `COMMON-LISP` to their package's use list compile and
   load correctly ([#655](https://github.com/atgreen/evergreen/pull/655),
