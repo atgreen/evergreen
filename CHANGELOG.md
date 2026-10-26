@@ -4,6 +4,11 @@
 
 ### Added
 
+- `(UNSIGNED-BYTE 8)` arrays store one byte per element and report their
+  specialized type, with native access, supported array and sequence operations,
+  and typed BFASL, image, and readable-print round trips
+  ([#701](https://github.com/atgreen/evergreen/pull/701)).
+
 - An illustrated [guide to function calling conventions](docs/design/function-calling-conventions.html)
   for readers new to EGCL, covering all sixteen calls between T2, T1, T0,
   and the tree walker, with register, stack, and runtime metadata diagrams

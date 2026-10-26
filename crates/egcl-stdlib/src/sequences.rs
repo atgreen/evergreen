@@ -238,6 +238,11 @@ fn collect_elements(sequence: EgclVal) -> Result<Vec<EgclVal>, EgclError> {
         }
         return Ok(elems);
     }
+    if let Some(len) = egcl_rt::packed_u8::len(sequence) {
+        return Ok((0..len)
+            .map(|i| EgclVal::from_fixnum(i64::from(egcl_rt::packed_u8::get(sequence, i).unwrap())))
+            .collect());
+    }
     if let Some(len) = egcl_rt::packed_f64::len(sequence) {
         egcl_rt::rooted!(sequence = sequence);
         egcl_rt::rooted!(values = Vec::with_capacity(len));
@@ -819,6 +824,9 @@ pub fn array_total_size(v: EgclVal) -> Option<usize> {
     if is_vector(v) {
         return Some(vector_length(v));
     }
+    if let Some(n) = egcl_rt::packed_u8::len(v) {
+        return Some(n);
+    }
     if let Some(n) = egcl_rt::packed_f64::len(v) {
         return Some(n);
     }
@@ -1241,6 +1249,25 @@ pub fn vector_push_extend(
     }
     let fp = cvec_fill_pointer(v);
     let cap = cvec_capacity(v);
+    if is_u8_array(v) {
+        let byte = u8_value(value)?;
+        egcl_rt::rooted!(v = v);
+        if fp >= cap {
+            if !cvec_adjustable(*v) {
+                return Err(EgclError::TypeError {
+                    datum: *v,
+                    expected: "adjustable vector".into(),
+                });
+            }
+            let new_cap = cap
+                .checked_add(extension.unwrap_or(cap.max(8)).max(1))
+                .ok_or(EgclError::Oom)?;
+            resize_u8_complex_vector(*v, new_cap, fp, 0)?;
+        }
+        cvec_set_elt(*v, fp, EgclVal::from_fixnum(i64::from(byte)))?;
+        cvec_set_fill_pointer_raw(*v, fp + 1);
+        return Ok(EgclVal::from_fixnum(fp as i64));
+    }
     if is_double_float_array(v) {
         double_float_value(value)?;
         egcl_rt::rooted!(v = v);
@@ -1328,6 +1355,9 @@ pub fn adjust_complex_vector(
     }
     let cap = cvec_capacity(v);
     let fp = fill_pointer.unwrap_or(new_size).min(new_size);
+    if is_u8_array(v) {
+        return resize_u8_complex_vector(v, new_size, fp, u8_value(initial_element)?);
+    }
     if is_double_float_array(v) {
         let fill = double_float_value(initial_element)?;
         return resize_double_float_complex_vector(v, new_size, fp, fill);
@@ -1401,6 +1431,21 @@ fn sort_vector_in_place(
     key: Option<EgclVal>,
     stable: bool,
 ) -> EgclVal {
+    if is_u8_sequence(sequence) {
+        egcl_rt::rooted!(inputs = (sequence, (predicate, key)));
+        let mut elems = collect_elements(sequence).expect("packed octet sequence");
+        let compare =
+            |a: &EgclVal, b: &EgclVal| compare_with_predicate(inputs.1.0, inputs.1.1, *a, *b);
+        if stable {
+            elems.sort_by(compare);
+        } else {
+            elems.sort_unstable_by(compare);
+        }
+        for (index, value) in elems.into_iter().enumerate() {
+            set_u8_array_element(inputs.0, index, value.as_fixnum() as u8);
+        }
+        return inputs.0;
+    }
     if is_double_float_sequence(sequence) {
         egcl_rt::rooted!(inputs = (sequence, (predicate, key)));
         let mut elems = collect_elements(sequence).expect("packed sequence");
@@ -1703,6 +1748,9 @@ pub fn length(sequence: EgclVal) -> Result<usize, EgclError> {
     if is_vector(sequence) {
         return Ok(vector_length(sequence));
     }
+    if let Some(len) = egcl_rt::packed_u8::len(sequence) {
+        return Ok(len);
+    }
     if let Some(len) = egcl_rt::packed_f64::len(sequence) {
         return Ok(len);
     }
@@ -1756,6 +1804,14 @@ pub fn elt(sequence: EgclVal, index: usize) -> Result<EgclVal, EgclError> {
             });
         }
         return Ok(vector_elt(sequence, index));
+    }
+    if egcl_rt::packed_u8::is_vector(sequence) {
+        return egcl_rt::packed_u8::get(sequence, index)
+            .map(|v| EgclVal::from_fixnum(i64::from(v)))
+            .ok_or_else(|| EgclError::TypeError {
+                datum: sequence,
+                expected: "valid packed octet array index".into(),
+            });
     }
     if egcl_rt::packed_f64::is_vector(sequence) {
         let value = egcl_rt::packed_f64::get(sequence, index).ok_or_else(|| {
@@ -1828,6 +1884,15 @@ pub fn elt(sequence: EgclVal, index: usize) -> Result<EgclVal, EgclError> {
 /// is the same reasoning `build_filled_simple_vector` documents, minus its
 /// nursery assumption, which a destination handed in from Lisp cannot make.)
 pub fn fill_vector_with_octets(sequence: EgclVal, start: usize, octets: &[u8]) -> Option<usize> {
+    if let Some(len) = egcl_rt::packed_u8::len(sequence) {
+        if start > len || octets.len() > len - start {
+            return None;
+        }
+        for (i, &v) in octets.iter().enumerate() {
+            egcl_rt::packed_u8::set(sequence, start + i, v);
+        }
+        return Some(octets.len());
+    }
     if !is_vector(sequence) {
         return None;
     }
@@ -1858,6 +1923,16 @@ pub fn fill_vector_with_octets(sequence: EgclVal, start: usize, octets: &[u8]) -
 /// a `Vec<EgclVal>` through `elt` cost a full sequence dispatch per element and,
 /// at 8 bytes an element, eight times the memory of the data itself.
 pub fn vector_octets(sequence: EgclVal, start: usize, end: usize) -> Option<Vec<u8>> {
+    if let Some(len) = egcl_rt::packed_u8::len(sequence) {
+        if start > end || end > len {
+            return None;
+        }
+        return Some(
+            (start..end)
+                .map(|i| egcl_rt::packed_u8::get(sequence, i).unwrap())
+                .collect(),
+        );
+    }
     if !is_vector(sequence) {
         return None;
     }
@@ -1894,6 +1969,17 @@ pub fn set_elt(sequence: EgclVal, index: usize, value: EgclVal) -> Result<(), Eg
         }
         vector_set_elt(sequence, index, value);
         return Ok(());
+    }
+    if egcl_rt::packed_u8::is_vector(sequence) {
+        let value = u8_value(value)?;
+        return if egcl_rt::packed_u8::set(sequence, index, value) {
+            Ok(())
+        } else {
+            Err(EgclError::TypeError {
+                datum: sequence,
+                expected: "valid packed octet array index".into(),
+            })
+        };
     }
     if egcl_rt::packed_f64::is_vector(sequence) {
         if !value.is_double_float() {
@@ -2120,6 +2206,9 @@ pub fn search_direct(
 
 /// Copy a sequence (CL `COPY-SEQ`).
 pub fn copy_seq(sequence: EgclVal) -> Result<EgclVal, EgclError> {
+    if is_u8_sequence(sequence) {
+        return subseq(sequence, 0, None);
+    }
     if is_double_float_sequence(sequence) {
         return subseq(sequence, 0, None);
     }
@@ -2172,11 +2261,23 @@ fn is_bit_seq(v: EgclVal) -> bool {
     egcl_rt::types::bit_vector_p(v) || (is_complex_vector(v) && cvec_is_bit(v))
 }
 
-pub fn subseq(
-    sequence: EgclVal,
-    start: usize,
-    end: Option<usize>,
-) -> Result<EgclVal, EgclError> {
+pub fn subseq(sequence: EgclVal, start: usize, end: Option<usize>) -> Result<EgclVal, EgclError> {
+    if is_u8_sequence(sequence) {
+        let len = length(sequence)?;
+        let end = end.unwrap_or(len);
+        if start > end || end > len {
+            return Err(EgclError::TypeError {
+                datum: sequence,
+                expected: "valid subsequence bounds".into(),
+            });
+        }
+        egcl_rt::rooted!(sequence = sequence);
+        let result = egcl_rt::packed_u8::make(end - start, 0)?;
+        for i in start..end {
+            egcl_rt::packed_u8::set(result, i - start, u8_array_element(*sequence, i).unwrap());
+        }
+        return Ok(result);
+    }
     if is_double_float_sequence(sequence) {
         let len = length(sequence)?;
         let end = end.unwrap_or(len);
@@ -2285,6 +2386,9 @@ pub fn subseq(
 
 /// Reverse a sequence (non-destructive, CL `REVERSE`).
 pub fn reverse(sequence: EgclVal) -> Result<EgclVal, EgclError> {
+    if is_u8_sequence(sequence) {
+        return nreverse(subseq(sequence, 0, None)?);
+    }
     if is_double_float_sequence(sequence) {
         return nreverse(subseq(sequence, 0, None)?);
     }
@@ -2310,6 +2414,16 @@ pub fn reverse(sequence: EgclVal) -> Result<EgclVal, EgclError> {
 
 /// Reverse a sequence destructively (CL `NREVERSE`).
 pub fn nreverse(sequence: EgclVal) -> Result<EgclVal, EgclError> {
+    if is_u8_sequence(sequence) {
+        let len = length(sequence)?;
+        for i in 0..len / 2 {
+            let left = u8_array_element(sequence, i).unwrap();
+            let right = u8_array_element(sequence, len - i - 1).unwrap();
+            set_u8_array_element(sequence, i, right);
+            set_u8_array_element(sequence, len - i - 1, left);
+        }
+        return Ok(sequence);
+    }
     if is_double_float_sequence(sequence) {
         let len = length(sequence)?;
         for i in 0..len / 2 {
@@ -2706,6 +2820,9 @@ pub fn build_result_sequence(
             expected: format!("sequence type specifier matching length {}", elems.len()),
         });
     }
+    if result_type_is_u8_vector(result_type) {
+        return build_packed_u8(elems);
+    }
     if result_type_is_double_float_vector(result_type) {
         return build_packed_f64(elems);
     }
@@ -3026,7 +3143,9 @@ pub fn remove(
             .map(|(_, &v)| v)
             .collect();
 
-        if is_double_float_sequence(sequence) {
+        if is_u8_sequence(sequence) {
+            build_packed_u8(&result)
+        } else if is_double_float_sequence(sequence) {
             build_packed_f64(&result)
         } else if is_list(sequence) {
             Ok(build_list(&result))
@@ -3052,7 +3171,9 @@ pub fn remove(
             }
             result.push(elem);
         }
-        if is_double_float_sequence(sequence) {
+        if is_u8_sequence(sequence) {
+            build_packed_u8(&result)
+        } else if is_double_float_sequence(sequence) {
             build_packed_f64(&result)
         } else if is_list(sequence) {
             Ok(build_list(&result))
@@ -3104,7 +3225,9 @@ pub fn substitute(
             .map(|(i, &v)| if sub_set.contains(&i) { new_item } else { v })
             .collect();
 
-        if is_double_float_sequence(sequence) {
+        if is_u8_sequence(sequence) {
+            build_packed_u8(&result)
+        } else if is_double_float_sequence(sequence) {
             build_packed_f64(&result)
         } else if is_list(sequence) {
             Ok(build_list(&result))
@@ -3131,7 +3254,9 @@ pub fn substitute(
             }
             result.push(elem);
         }
-        if is_double_float_sequence(sequence) {
+        if is_u8_sequence(sequence) {
+            build_packed_u8(&result)
+        } else if is_double_float_sequence(sequence) {
             build_packed_f64(&result)
         } else if is_list(sequence) {
             Ok(build_list(&result))
@@ -3224,4 +3349,207 @@ pub fn stable_sort(
     } else {
         Ok(sort_vector_in_place(sequence, predicate, key, true))
     }
+}
+
+// Packed octet arrays share the existing complex-array wrapper protocol.
+pub fn is_u8_array(v: EgclVal) -> bool {
+    if egcl_rt::packed_u8::is_vector(v) {
+        return true;
+    }
+    if is_complex_vector(v) {
+        return unsafe { (*(v.as_ptr().add(32) as *const EgclVal)).as_fixnum() == 12 };
+    }
+    egcl_rt::types::md_array_storage(v).is_some_and(is_u8_array)
+}
+
+pub fn u8_array_element(v: EgclVal, index: usize) -> Option<u8> {
+    if is_complex_vector(v) {
+        if index >= cvec_capacity(v) {
+            return None;
+        }
+        return match cvec_displacement(v) {
+            Some((base, offset, _)) => u8_array_element(base, offset.checked_add(index)?),
+            None => egcl_rt::packed_u8::get(cvec_storage(v), index),
+        };
+    }
+    if let Some(storage) = egcl_rt::types::md_array_storage(v) {
+        return u8_array_element(storage, index);
+    }
+    egcl_rt::packed_u8::get(v, index)
+}
+
+fn is_u8_sequence(v: EgclVal) -> bool {
+    !egcl_rt::types::md_array_p(v) && is_u8_array(v)
+}
+
+fn set_u8_array_element(v: EgclVal, index: usize, value: u8) -> bool {
+    if is_complex_vector(v) {
+        if index >= cvec_capacity(v) {
+            return false;
+        }
+        return match cvec_displacement(v) {
+            Some((base, offset, _)) => offset
+                .checked_add(index)
+                .is_some_and(|index| set_u8_array_element(base, index, value)),
+            None => egcl_rt::packed_u8::set(cvec_storage(v), index, value),
+        };
+    }
+    if let Some(storage) = egcl_rt::types::md_array_storage(v) {
+        return set_u8_array_element(storage, index, value);
+    }
+    egcl_rt::packed_u8::set(v, index, value)
+}
+
+fn resize_u8_complex_vector(
+    v: EgclVal,
+    new_size: usize,
+    fill_pointer: usize,
+    fill: u8,
+) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted!(v = v);
+    let retained = cvec_capacity(*v).min(new_size);
+    let storage = egcl_rt::packed_u8::make(new_size, fill)?;
+    for index in 0..retained {
+        let value = u8_array_element(*v, index).expect("packed array element");
+        egcl_rt::packed_u8::set(storage, index, value);
+    }
+    cvec_set_storage(*v, storage);
+    cvec_clear_displacement(*v);
+    cvec_set_fill_pointer_raw(*v, fill_pointer.min(new_size));
+    Ok(*v)
+}
+
+pub fn build_u8_complex_vector(
+    capacity: usize,
+    fill_pointer: usize,
+    adjustable: bool,
+    fill: u8,
+    has_fill_pointer: bool,
+) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted!(storage = egcl_rt::packed_u8::make(capacity, fill)?);
+    Ok(build_complex_array_body(
+        *storage,
+        EgclVal::from_fixnum(fill_pointer.min(capacity) as i64),
+        if adjustable { T } else { NIL },
+        EgclVal::from_fixnum(12),
+        EgclVal::from_fixnum(i64::from(has_fill_pointer)),
+        NIL,
+        NIL,
+    ))
+}
+
+pub fn build_u8_displaced_vector(
+    base: EgclVal,
+    offset: usize,
+    length: usize,
+    fill_pointer: usize,
+    adjustable: bool,
+    has_fill_pointer: bool,
+) -> Result<EgclVal, EgclError> {
+    if !is_u8_array(base) {
+        return Err(EgclError::TypeError {
+            datum: base,
+            expected: "array with (UNSIGNED-BYTE 8) elements".into(),
+        });
+    }
+    if offset
+        .checked_add(length)
+        .is_none_or(|end| end > array_total_size(base).unwrap())
+    {
+        return Err(EgclError::ProgramError(
+            "displaced array exceeds base storage".into(),
+        ));
+    }
+    Ok(build_complex_array_body(
+        base,
+        EgclVal::from_fixnum(fill_pointer.min(length) as i64),
+        if adjustable { T } else { NIL },
+        EgclVal::from_fixnum(12),
+        EgclVal::from_fixnum(i64::from(has_fill_pointer)),
+        EgclVal::from_fixnum(offset as i64),
+        EgclVal::from_fixnum(length as i64),
+    ))
+}
+
+pub fn build_u8_md_array(dims: &[usize], fill: u8) -> Result<EgclVal, EgclError> {
+    let total = dims
+        .iter()
+        .try_fold(1usize, |n, d| n.checked_mul(*d))
+        .ok_or(EgclError::Oom)?;
+    let storage = egcl_rt::packed_u8::make(total, fill)?;
+    build_md_array_with_storage(dims, storage)
+}
+
+pub fn u8_value(value: EgclVal) -> Result<u8, EgclError> {
+    if value.is_fixnum() && (0..=255).contains(&value.as_fixnum()) {
+        Ok(value.as_fixnum() as u8)
+    } else {
+        Err(EgclError::TypeError {
+            datum: value,
+            expected: "(UNSIGNED-BYTE 8)".into(),
+        })
+    }
+}
+
+fn build_packed_u8(values: &[EgclVal]) -> Result<EgclVal, EgclError> {
+    let raw = values
+        .iter()
+        .map(|&v| u8_value(v))
+        .collect::<Result<Vec<_>, _>>()?;
+    let result = egcl_rt::packed_u8::make(raw.len(), 0)?;
+    for (i, v) in raw.into_iter().enumerate() {
+        egcl_rt::packed_u8::set(result, i, v);
+    }
+    Ok(result)
+}
+
+/// Numeric requests whose upgraded representation is the packed octet class.
+/// Exact BIT requests keep their existing representation.
+pub fn u8_element_type_p(spec: EgclVal) -> bool {
+    fn parts(mut spec: EgclVal) -> Option<Vec<EgclVal>> {
+        let mut result = Vec::new();
+        while spec.is_cons() {
+            if result.len() == 4 { return None; }
+            let cell = unsafe { &*(spec.as_ptr() as *const ConsCell) };
+            result.push(cell.car);
+            spec = cell.cdr;
+        }
+        spec.is_nil().then_some(result)
+    }
+    fn bound(v: EgclVal, lower: bool) -> Option<i64> {
+        if v.is_fixnum() { return Some(v.as_fixnum()); }
+        let values = parts(v)?;
+        if values.len() != 1 || !values[0].is_fixnum() { return None; }
+        if lower { values[0].as_fixnum().checked_add(1) } else { values[0].as_fixnum().checked_sub(1) }
+    }
+    let Some(values) = parts(spec) else { return false; };
+    if values.is_empty() || !values[0].is_symbol() { return false; }
+    match egcl_compiler::reader::symbol_name(values[0].as_symbol_index()).as_deref() {
+        Some("UNSIGNED-BYTE") if values.len() == 2 && values[1].is_fixnum() => (2..=8).contains(&values[1].as_fixnum()),
+        Some("MOD") if values.len() == 2 && values[1].is_fixnum() => (3..=256).contains(&values[1].as_fixnum()),
+        Some("INTEGER") if values.len() == 3 => {
+            let (Some(lo), Some(hi)) = (bound(values[1], true), bound(values[2], false)) else { return false; };
+            lo >= 0 && hi <= 255 && lo <= hi && (lo, hi) != (0, 1)
+        }
+        _ => false,
+    }
+}
+
+pub fn result_type_is_u8_vector(result_type: EgclVal) -> bool {
+    if !result_type.is_cons() { return false; }
+    let cell = unsafe { &*(result_type.as_ptr() as *const ConsCell) };
+    if !cell.car.is_symbol() || !cell.cdr.is_cons() { return false; }
+    if !matches!(egcl_compiler::reader::symbol_name(cell.car.as_symbol_index()).as_deref(), Some("VECTOR" | "ARRAY" | "SIMPLE-ARRAY")) { return false; }
+    u8_element_type_p(unsafe { (*(cell.cdr.as_ptr() as *const ConsCell)).car })
+}
+
+/// SVREF is restricted to a general simple vector, unlike AREF.
+pub fn svref(vector: EgclVal, index: usize) -> Result<EgclVal, EgclError> {
+    if !is_vector(vector) { return Err(EgclError::TypeError { datum: vector, expected: "SIMPLE-VECTOR".into() }); }
+    elt(vector, index)
+}
+
+pub fn set_svref(vector: EgclVal, index: usize, value: EgclVal) -> Result<(), EgclError> {
+    if !is_vector(vector) { return Err(EgclError::TypeError { datum: vector, expected: "SIMPLE-VECTOR".into() }); }
+    set_aref(vector, index, value)
 }

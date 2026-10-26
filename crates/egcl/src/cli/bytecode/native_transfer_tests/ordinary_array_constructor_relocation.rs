@@ -163,6 +163,8 @@ fn ordinary_array_constructor_relocates_prebuilt_arguments_and_live_result() {
     assert_eq!(cp(args[0]).0.as_fixnum(), 3);
     assert_eq!(cp(args[2]).0, unsigned_byte);
     assert_eq!(cp(cp(args[2]).1).0.as_fixnum(), 8);
+    assert!(egcl_rt::packed_u8::is_vector(*array));
+    assert_eq!(egcl_rt::packed_u8::len(*array), Some(3));
     assert_eq!(egcl_stdlib::sequences::array_total_size(*array), Some(3));
     for index in 0..3 {
         assert_eq!(

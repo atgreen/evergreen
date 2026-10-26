@@ -4945,6 +4945,60 @@ fn packed_f64_element_address(
     alu_rr(a, 0x01, SCRATCH, RAX);
 }
 
+/// Checked byte address. Only RAX/RDX are modified, no allocation or call.
+fn packed_u8_element_address(
+    a: &mut Asm,
+    array: u8,
+    index: u8,
+    constant_index: Option<u64>,
+    deopt: egcl_rt::asm::Label,
+) {
+    // Never modify an operand: it may reside in a permanent callee-save home.
+    mov_rr(a, SCRATCH, array);
+    alu_r_imm(a, 4, SCRATCH, 7);
+    alu_r_imm(a, 7, SCRATCH, egcl_rt::value::TAG_HEAP_OBJECT as i32);
+    a.jcc(Cc::Ne, deopt);
+    mov_rr(a, SCRATCH, array);
+    alu_r_imm(a, 4, SCRATCH, -8);
+    a.extend_from_slice(&[0x80, 0x7a, 0x07, egcl_rt::object::type_id::SIMPLE_ARRAY]);
+    a.jcc(Cc::Ne, deopt);
+    let small = a.label();
+    let body = a.label();
+    // The low header word is the size class, with FFFF selecting the
+    // extended header. Packed storage exists in both allocation classes.
+    a.extend_from_slice(&[0x66, 0x81, 0x3a, 0xff, 0xff]);
+    a.jcc(Cc::Ne, small);
+    alu_r_imm(a, 0, SCRATCH, 16);
+    a.jmp(body);
+    a.bind(small);
+    alu_r_imm(a, 0, SCRATCH, 8);
+    a.bind(body);
+    a.extend_from_slice(&[0x80, 0x3a, egcl_rt::object::ElementTypeTag::U8 as u8]);
+    a.jcc(Cc::Ne, deopt);
+    if let Some(bits) = constant_index {
+        mov_imm64(a, RAX, bits as i64);
+    } else {
+        mov_rr(a, RAX, index);
+    }
+    alu_r_imm(a, 4, RAX, 7);
+    alu_r_imm(a, 7, RAX, egcl_rt::value::TAG_FIXNUM as i32);
+    a.jcc(Cc::Ne, deopt);
+    if let Some(bits) = constant_index {
+        mov_imm64(a, RAX, bits as i64);
+    } else {
+        mov_rr(a, RAX, index);
+    }
+    sar_imm(a, RAX, 3);
+    alu_r_imm(a, 7, RAX, 0);
+    a.jcc(Cc::L, deopt);
+    // A checked packed allocation has length <= isize::MAX, so its
+    // nonnegative length also fits the signed comparison on x86-64.
+    cmp_mem64_disp8(a, RAX, SCRATCH, 8);
+    a.jcc(Cc::Ge, deopt);
+    alu_rr(a, 0x01, SCRATCH, RAX);
+    alu_r_imm(a, 0, SCRATCH, 16);
+}
+
 /// Noncollecting barrier leaf. Host bookkeeping may grow, but this cannot
 /// initiate Lisp GC or retain the interior pointer after returning.
 unsafe extern "C" fn store_vector_element(slot: *mut egcl_rt::EgclVal, value: u64) {
@@ -7454,31 +7508,37 @@ fn emit_framed_inner(
             } else if d.opcode == Opcode::ArrayReadDiscarded {
                 let label = *inst_deopt.get(&inst)
                     .ok_or(EmitError::UnsupportedOp(op_tag(d.opcode)))?;
-                let AuxData::CallTarget(symbol) = d.aux else {
+                if !matches!(d.aux, AuxData::None | AuxData::ArrayRef) {
                     return Err(EmitError::UnsupportedOp(op_tag(d.opcode)));
-                };
+                }
                 let array = if let Some(&bits) = const_tagged.get(&d.args[0]) {
                     mov_imm64(&mut a, RAX, bits as i64); RAX
                 } else { inst_reg[&d.args[0]] };
                 let index = inst_reg.get(&d.args[1]).copied().unwrap_or(RAX);
-                let vector = a.label();
                 let done = a.label();
-                if egcl_rt::symbols::registry_key(symbol).as_deref() == Some("AREF") {
-                    mov_rr(&mut a, SCRATCH, array);
-                    alu_r_imm(&mut a, 4, SCRATCH, 7);
-                    alu_r_imm(&mut a, 7, SCRATCH, egcl_rt::value::TAG_HEAP_OBJECT as i32);
-                    a.jcc(Cc::Ne, label);
-                    mov_rr(&mut a, SCRATCH, array);
-                    alu_r_imm(&mut a, 4, SCRATCH, -8);
-                    a.extend_from_slice(&[0x80, 0x7a, 0x07, egcl_rt::object::type_id::SIMPLE_VECTOR]);
-                    a.jcc(Cc::E, vector);
+                if matches!(d.aux, AuxData::ArrayRef) {
+                    let not_vector = a.label();
+                    vector_element_address(&mut a, array, index,
+                        const_tagged.get(&d.args[1]).copied(), not_vector);
+                    a.jmp(done);
+                    a.bind(not_vector);
+                    if let Some(&bits) = const_tagged.get(&d.args[0]) {
+                        mov_imm64(&mut a, RAX, bits as i64);
+                    }
+                    let not_u8 = a.label();
+                    packed_u8_element_address(&mut a, array, index,
+                        const_tagged.get(&d.args[1]).copied(), not_u8);
+                    a.jmp(done);
+                    a.bind(not_u8);
+                    if let Some(&bits) = const_tagged.get(&d.args[0]) {
+                        mov_imm64(&mut a, RAX, bits as i64);
+                    }
                     packed_f64_element_address(&mut a, array, index,
                         const_tagged.get(&d.args[1]).copied(), label);
-                    a.jmp(done);
-                    a.bind(vector);
+                } else {
+                    vector_element_address(&mut a, array, index,
+                        const_tagged.get(&d.args[1]).copied(), label);
                 }
-                vector_element_address(&mut a, array, index,
-                    const_tagged.get(&d.args[1]).copied(), label);
                 a.bind(done);
             } else if d.opcode == Opcode::TryIntegerShr {
                 integer_shift::emit(&mut a, &d, &inst_reg, &const_tagged)?;
@@ -7510,7 +7570,25 @@ fn emit_framed_inner(
                 let index = inst_reg.get(&d.args[1]).copied().unwrap_or(RAX);
                 let vector = a.label();
                 let stored = a.label();
-                if d.opcode == Opcode::VecSet {
+                if d.opcode == Opcode::VecRef && matches!(d.aux, AuxData::ArrayRef) {
+                    let not_vector = a.label();
+                    // Keep the existing SIMPLE_VECTOR success path first.
+                    vector_element_address(&mut a, array, index,
+                        const_tagged.get(&d.args[1]).copied(), not_vector);
+                    load_mem64_disp(&mut a, inst_reg[&d.results[0]], SCRATCH, 0);
+                    a.jmp(stored);
+                    a.bind(not_vector);
+                    if let Some(&bits) = const_tagged.get(&d.args[0]) {
+                        mov_imm64(&mut a, RAX, bits as i64);
+                    }
+                    packed_u8_element_address(&mut a, array, index,
+                        const_tagged.get(&d.args[1]).copied(), label);
+                    a.extend_from_slice(&[0x0f, 0xb6, 0x02]); // movzx eax,byte [rdx]
+                    shl_imm(&mut a, RAX, 3);
+                    mov_rr(&mut a, inst_reg[&d.results[0]], RAX);
+                    a.jmp(stored);
+                }
+                if d.opcode == Opcode::VecSet && !matches!(d.aux, AuxData::SimpleVectorStore) {
                     mov_rr(&mut a, SCRATCH, array);
                     alu_r_imm(&mut a, 4, SCRATCH, 7);
                     alu_r_imm(&mut a, 7, SCRATCH, egcl_rt::value::TAG_HEAP_OBJECT as i32);
@@ -7519,6 +7597,28 @@ fn emit_framed_inner(
                     alu_r_imm(&mut a, 4, SCRATCH, -8);
                     a.extend_from_slice(&[0x80, 0x7a, 0x07, egcl_rt::object::type_id::SIMPLE_VECTOR]);
                     a.jcc(Cc::E, vector);
+                    // A general-vector store skips byte-layout probing entirely.
+                    let not_u8 = a.label();
+                    packed_u8_element_address(&mut a, array, index,
+                        const_tagged.get(&d.args[1]).copied(), not_u8);
+                    let value = d.args[2];
+                    if let Some(&bits) = const_tagged.get(&value) {
+                        mov_imm64(&mut a, RAX, bits as i64);
+                    } else { mov_rr(&mut a, RAX, inst_reg[&value]); }
+                    guard_fixnum(&mut a, RAX, label);
+                    alu_r_imm(&mut a, 7, RAX, 0);
+                    a.jcc(Cc::L, label);
+                    alu_r_imm(&mut a, 7, RAX, 255 << 3);
+                    a.jcc(Cc::G, label);
+                    sar_imm(&mut a, RAX, 3);
+                    a.extend_from_slice(&[0x88, 0x02]); // mov byte [rdx],al
+                    shl_imm(&mut a, RAX, 3);
+                    mov_rr(&mut a, inst_reg[&d.results[0]], RAX);
+                    a.jmp(stored);
+                    a.bind(not_u8);
+                    if let Some(&bits) = const_tagged.get(&d.args[0]) {
+                        mov_imm64(&mut a, RAX, bits as i64);
+                    }
                     packed_f64_element_address(&mut a, array, index,
                         const_tagged.get(&d.args[1]).copied(), label);
                     // Preserve the interior slot address while validating the
@@ -7614,7 +7714,7 @@ fn emit_framed_inner(
                     if let Some(&bits) = const_tagged.get(&value) { mov_imm64(&mut a, dst, bits as i64); }
                     else { mov_rr(&mut a, dst, inst_reg[&value]); }
                 }
-                if matches!(d.opcode, Opcode::VecSet | Opcode::VecSetInRange) { a.bind(stored); }
+                a.bind(stored);
             } else if matches!(d.opcode, Opcode::PackedF64Ref | Opcode::VecF64Ref | Opcode::PackedF64Set) {
                 if !published_native_roots || !native_call_storage {
                     return Err(EmitError::UnsupportedOp(op_tag(d.opcode)));

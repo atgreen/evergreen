@@ -567,6 +567,37 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                     }
                 }
 
+                // ArrayRef is a semantic memory-layout contract, never call
+                // provenance. Clones retain it; unknown metadata cannot widen
+                // SIMPLE_VECTOR-only SVREF into an AREF byte-array operation.
+                let array_read = matches!(data.opcode, Opcode::VecRef | Opcode::ArrayReadDiscarded);
+                if matches!(data.aux, AuxData::ArrayRef) && !array_read
+                    || array_read && !matches!(data.aux, AuxData::None | AuxData::ArrayRef)
+                    || array_read && (data.args.len() != 2
+                        || data.results.len() != usize::from(data.opcode == Opcode::VecRef)
+                        || data.flags != (crate::t2::ir::InstFlags { guard: true, effectful: true, ..Default::default() })
+                        || data.frame_state.is_none()
+                        || data.args.iter().chain(&data.results).any(|v| valid_values.contains(&v.0)
+                            && f.value(*v).repr != super::ir::ValueRepresentation::Tagged))
+                {
+                    errors.push(VerifyError::new("V8 array-read-contract",
+                        format!("block{bi} malformed {:?} array-read contract", data.opcode)));
+                }
+
+                if matches!(data.aux, AuxData::SimpleVectorStore) && data.opcode != Opcode::VecSet
+                    || data.opcode == Opcode::VecSet && (
+                        !matches!(data.aux, AuxData::None | AuxData::SimpleVectorStore)
+                        || data.args.len() != 3 || data.results.len() != 1
+                        || data.flags != (crate::t2::ir::InstFlags {
+                            guard: true, effectful: true, ..Default::default() })
+                        || data.frame_state.is_none()
+                        || data.args.iter().chain(&data.results).any(|v| valid_values.contains(&v.0)
+                            && f.value(*v).repr != super::ir::ValueRepresentation::Tagged))
+                {
+                    errors.push(VerifyError::new("V8 array-store-contract",
+                        format!("block{bi} malformed {:?} array-store contract", data.opcode)));
+                }
+
                 // V8 — StringByteLength consumes an explicitly layout-refined
                 // SSA value and is a pure load. StringAsciiCharAt consumes the
                 // same refinement but can still fail its bounds/ASCII assumptions,

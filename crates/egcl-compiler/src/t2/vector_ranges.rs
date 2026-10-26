@@ -123,6 +123,9 @@ fn version(f: &mut Function, lp: &CountedVectorLoop) -> Result<(), &'static str>
         };
         let store = f.inst_mut(inst);
         store.opcode = Opcode::VecSetInRange;
+        // The successful predicate already establishes SIMPLE_VECTOR. Keep
+        // a vector-only source store's contract on its checked fallback.
+        store.aux = AuxData::None;
         store.args.push(witness[0]);
     }
     // This also repairs FrameState-only uses and merges distinct cloned loop

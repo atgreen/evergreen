@@ -10,8 +10,9 @@
 //! to hash it under EGCL. Everything else in Ironclad stays in Lisp.
 //!
 //! Every kernel works on Ironclad's own data layout -- octet vectors, and
-//! `(unsigned-byte 32)` round-key and register vectors -- which EGCL stores as
-//! simple vectors of fixnums. Nothing here allocates, so a kernel can read and
+//! `(unsigned-byte 32)` round-key and register vectors. Octets may use packed
+//! byte storage; word vectors use general fixnum slots. Nothing here allocates
+//! on the Lisp heap, so a kernel can read and
 //! write those vectors in place without rooting them, and every value it
 //! stores is a fixnum, which needs no write barrier.
 //!
@@ -94,7 +95,7 @@ fn slots(v: EgclVal, start: usize, count: usize, what: &str) -> Result<*mut Egcl
     if start > len || count > len - start {
         return Err(type_error(
             v,
-            &format!("{what} with at least {} elements", start + count),
+            &format!("{what} with at least {} elements", start.saturating_add(count)),
         ));
     }
     Ok(unsafe { base.add(start) })
@@ -129,11 +130,30 @@ fn write_words(v: EgclVal, start: usize, words: &[u64], what: &str) -> Result<()
 }
 
 fn read_bytes<const N: usize>(v: EgclVal, start: usize) -> Result<[u8; N], EgclError> {
+    if let Some(length) = egcl_rt::packed_u8::len(v) {
+        if start > length || N > length - start {
+            return Err(type_error(v, "an octet vector containing the requested block"));
+        }
+        return Ok(std::array::from_fn(|index| {
+            egcl_rt::packed_u8::get(v, start + index).unwrap()
+        }));
+    }
     let words = read_words::<N>(v, start, 8, "an octet vector")?;
     Ok(words.map(|w| w as u8))
 }
 
 fn write_bytes(v: EgclVal, start: usize, bytes: &[u8]) -> Result<(), EgclError> {
+    if let Some(length) = egcl_rt::packed_u8::len(v) {
+        if start > length || bytes.len() > length - start {
+            return Err(type_error(v, "an octet vector containing the requested block"));
+        }
+        for (index, &byte) in bytes.iter().enumerate() {
+            // All indices were checked before the first write. Raw bytes need
+            // no reference barrier and these accessors cannot collect.
+            egcl_rt::packed_u8::set(v, start + index, byte);
+        }
+        return Ok(());
+    }
     let words: Vec<u64> = bytes.iter().map(|&b| u64::from(b)).collect();
     write_words(v, start, &words, "an octet vector")
 }
@@ -660,6 +680,24 @@ fn keccak_absorb_values(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packed_u8_crypto_blocks_keep_bounds_and_word_vector_compatibility() {
+        egcl_rt::rooted!(packed = egcl_rt::packed_u8::make(32, 17).unwrap());
+        egcl_rt::rooted!(general = crate::sequences::build_filled_simple_vector(
+            32, EgclVal::from_fixnum(17)
+        ));
+        let block: [u8; 16] = std::array::from_fn(|index| (index * 17) as u8);
+        for array in [*packed, *general] {
+            write_bytes(array, 8, &block).unwrap();
+            assert_eq!(read_bytes::<16>(array, 8).unwrap(), block);
+            assert!(read_bytes::<16>(array, 17).is_err());
+            assert!(write_bytes(array, 17, &block).is_err());
+            assert_eq!(read_bytes::<16>(array, 8).unwrap(), block);
+            assert!(read_bytes::<1>(array, usize::MAX).is_err());
+            assert_eq!(read_bytes::<0>(array, 32).unwrap(), []);
+        }
+    }
 
     /// SHA-512 of the single padded block for "abc" (FIPS 180-4 example).
     #[test]

@@ -4,7 +4,7 @@
 use std::process::Command;
 
 /// MAKE-ARRAY builds a plain vector natively when its only options are
-/// :ELEMENT-TYPE and :INITIAL-ELEMENT and the type upgrades to T. Every result
+/// :ELEMENT-TYPE and :INITIAL-ELEMENT and the type upgrades to T or packed U8. Every result
 /// here is what the full option parsing gave before: the defaults (NIL for T,
 /// 0 for integer types), option order and duplicates, and the requests that
 /// keep the full path (bit, character, double-float, :INITIAL-CONTENTS,
@@ -61,13 +61,13 @@ fn make_array_fast_path_matches_the_full_option_parsing() {
     );
     assert!(
         stdout.contains(
-            r#"RESULT:(((SIMPLE-VECTOR 3) 3 (NIL NIL NIL)) ((SIMPLE-VECTOR 3) 3 (NIL NIL NIL)) ((SIMPLE-VECTOR 3) 3 (0 0 0)) ((SIMPLE-VECTOR 3) 3 (-1 -1 -1)) ((SIMPLE-VECTOR 3) 3 (0 0 0)) ((SIMPLE-VECTOR 3) 3 (0 0 0)) ((SIMPLE-VECTOR 3) 3 (:X :X :X)) ((SIMPLE-VECTOR 3) 3 (1 1 1)) ((SIMPLE-VECTOR 3) 3 (0 0 0)) ((SIMPLE-BIT-VECTOR 3) 3 (0 0 0)) ((SIMPLE-ARRAY CHARACTER (3)) 3 (#\a #\a #\a)) ((SIMPLE-ARRAY DOUBLE-FLOAT (3)) 3 (0.0d0 0.0d0 0.0d0)) ((SIMPLE-VECTOR 3) 3 (7 7 7)) ((SIMPLE-VECTOR 3) 3 (A B C)) T (2 3) ((SIMPLE-VECTOR 0) 0 NIL) :NEGATIVE #(NIL NIL NIL))"#
+            r#"RESULT:(((SIMPLE-VECTOR 3) 3 (NIL NIL NIL)) ((SIMPLE-VECTOR 3) 3 (NIL NIL NIL)) ((SIMPLE-ARRAY (UNSIGNED-BYTE 8) (3)) 3 (0 0 0)) ((SIMPLE-VECTOR 3) 3 (-1 -1 -1)) ((SIMPLE-VECTOR 3) 3 (0 0 0)) ((SIMPLE-VECTOR 3) 3 (0 0 0)) ((SIMPLE-VECTOR 3) 3 (:X :X :X)) ((SIMPLE-VECTOR 3) 3 (1 1 1)) ((SIMPLE-VECTOR 3) 3 (0 0 0)) ((SIMPLE-BIT-VECTOR 3) 3 (0 0 0)) ((SIMPLE-ARRAY CHARACTER (3)) 3 (#\a #\a #\a)) ((SIMPLE-ARRAY DOUBLE-FLOAT (3)) 3 (0.0d0 0.0d0 0.0d0)) ((SIMPLE-VECTOR 3) 3 (7 7 7)) ((SIMPLE-VECTOR 3) 3 (A B C)) T (2 3) ((SIMPLE-VECTOR 0) 0 NIL) :NEGATIVE #(NIL NIL NIL))"#
         ),
         "{stdout}"
     );
     assert!(
         stdout.contains(
-            r#"CONTENTS:(((SIMPLE-VECTOR 3) 3 (A B C)) ((SIMPLE-VECTOR 3) 3 (1 2 3)) ((SIMPLE-VECTOR 2) 2 (#\x #\y)) ((SIMPLE-VECTOR 0) 0 NIL) ((SIMPLE-VECTOR 2) 2 (1.0d0 1.0d0)) :SHORT :IMPROPER ((SIMPLE-VECTOR 2) 2 (1 2)) ((SIMPLE-ARRAY CHARACTER (3)) 3 (#\a #\b #\c)) ((SIMPLE-BIT-VECTOR 4) 4 (1 0 1 1)))"#
+            r#"CONTENTS:(((SIMPLE-VECTOR 3) 3 (A B C)) ((SIMPLE-ARRAY (UNSIGNED-BYTE 8) (3)) 3 (1 2 3)) ((SIMPLE-VECTOR 2) 2 (#\x #\y)) ((SIMPLE-VECTOR 0) 0 NIL) ((SIMPLE-VECTOR 2) 2 (1.0d0 1.0d0)) :SHORT :IMPROPER ((SIMPLE-VECTOR 2) 2 (1 2)) ((SIMPLE-ARRAY CHARACTER (3)) 3 (#\a #\b #\c)) ((SIMPLE-BIT-VECTOR 4) 4 (1 0 1 1)))"#
         ),
         "{stdout}"
     );
@@ -123,7 +123,7 @@ fn rank_one_dimension_lists_match_the_full_make_array_path() {
     let mut results = Vec::new();
     for enabled in [false, true] {
         let admission = if enabled {
-            "(assert fast) (assert (equal (coerce fast 'list) '(0 0 0)))"
+            "(assert fast) (assert (equal (array-element-type fast) '(unsigned-byte 8))) (assert (equal (coerce fast 'list) '(0 0 0)))"
         } else {
             "(assert (null fast))"
         };
@@ -163,6 +163,18 @@ fn rank_one_array_heap_fill_and_contents_survive_collecting_allocation() {
             (let ((copy (make-array (list 3) :initial-contents contents)))
               (assert (equal (coerce copy 'list) contents))
               (dotimes (j 3) (assert (eq (aref copy j) (nth j contents)))))))
+        ;; Reading packed doubles allocates boxed values. A failed octet
+        ;; initialization must retain both the source and the error datum.
+        (let ((caught 0))
+          (dotimes (i 8)
+            (handler-case
+                (make-array (list 3) :element-type '(unsigned-byte 8)
+                  :initial-contents
+                    (make-array 3 :element-type 'double-float :initial-element 1d0))
+              (type-error (condition)
+                (assert (= (type-error-datum condition) 1d0))
+                (incf caught))))
+          (assert (= caught 8)))
         (format t "RANK-ONE-HEAP-OK~%")
     "#;
     let mut outputs = Vec::new();

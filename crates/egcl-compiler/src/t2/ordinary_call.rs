@@ -615,8 +615,29 @@ pub fn emit_framed_ordinary_function_with_self_call_facts(
                         return Err(declined("unproven pure fixnum unbox"));
                     }
                 }
-                Opcode::UnboxFixnum | Opcode::IntegerLowBits
-                | Opcode::VecRef | Opcode::VecSet | Opcode::VecSetInRange | Opcode::ArrayReadDiscarded => {
+                Opcode::VecRef | Opcode::ArrayReadDiscarded => {
+                    if !matches!(data.aux, AuxData::None | AuxData::ArrayRef)
+                        || data.args.len() != 2
+                        || data.results.len() != usize::from(data.opcode == Opcode::VecRef)
+                        || data.flags != (crate::t2::ir::InstFlags { guard: true, effectful: true, ..Default::default() })
+                        || data.frame_state.is_none()
+                        || data.args.iter().chain(&data.results).any(|&v| f.value(v).repr != ValueRepresentation::Tagged)
+                    {
+                        return Err(declined("invalid tagged array-read layout contract"));
+                    }
+                }
+                Opcode::VecSet => {
+                    if !matches!(data.aux, AuxData::None | AuxData::SimpleVectorStore)
+                        || data.args.len() != 3 || data.results.len() != 1
+                        || data.flags != (crate::t2::ir::InstFlags {
+                            guard: true, effectful: true, ..Default::default() })
+                        || data.frame_state.is_none()
+                        || data.args.iter().chain(&data.results).any(|&v| f.value(v).repr != ValueRepresentation::Tagged)
+                    {
+                        return Err(declined("invalid tagged array-store layout contract"));
+                    }
+                }
+                Opcode::UnboxFixnum | Opcode::IntegerLowBits | Opcode::VecSetInRange => {
                     if data.frame_state.is_none() {
                         return Err(declined("guarded numeric or array operation without state"));
                     }

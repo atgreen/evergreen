@@ -997,3 +997,206 @@ fn ordinary_versioned_vector_store_executes_fast_clone_and_large_checked_loop() 
         }
     }
 }
+
+fn packed_u8_access_function(opcode: Opcode, aref: bool, constant: bool) -> Function {
+    let mut f = Function::new("ordinary-packed-u8-access");
+    let entry = f.entry();
+    let array = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+    let index = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+    let incoming = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+    let stored = if constant {
+        value(
+            &mut f,
+            entry,
+            instruction(Opcode::ConstFixnum, vec![], AuxData::FixnumImm(255)),
+        )
+    } else {
+        incoming
+    };
+    let access_index = if constant && opcode == Opcode::VecRef {
+        value(
+            &mut f,
+            entry,
+            instruction(Opcode::ConstFixnum, vec![], AuxData::FixnumImm(0)),
+        )
+    } else {
+        index
+    };
+    let args = if opcode == Opcode::VecSet {
+        vec![array, access_index, stored]
+    } else {
+        vec![array, access_index]
+    };
+    let mut access = instruction(
+        opcode,
+        args,
+        if aref {
+            AuxData::ArrayRef
+        } else {
+            AuxData::None
+        },
+    );
+    access.flags = InstFlags {
+        guard: true,
+        effectful: true,
+        ..Default::default()
+    };
+    access.frame_state = Some(state(&mut f, array, &[array, index, incoming], 57));
+    let results = if opcode == Opcode::ArrayReadDiscarded {
+        vec![]
+    } else {
+        vec![(IRType::TOP, ValueRepresentation::Tagged)]
+    };
+    let (_, output) = f.push_inst(entry, access, &results);
+    let answer = output.first().copied().unwrap_or_else(|| {
+        value(
+            &mut f,
+            entry,
+            instruction(Opcode::ConstFixnum, vec![], AuxData::FixnumImm(42)),
+        )
+    });
+    f.set_terminator(
+        entry,
+        instruction(Opcode::Return, vec![answer], AuxData::None),
+    );
+    egcl_compiler::t2::verify::verify(&f).unwrap();
+    f
+}
+
+#[test]
+fn ordinary_packed_u8_reads_and_stores_cover_small_large_and_checked_failures() {
+    use egcl_rt::{EgclVal, object::ObjectHeader, packed_u8};
+    let read = packed_u8_access_function(Opcode::VecRef, true, false);
+    let write = packed_u8_access_function(Opcode::VecSet, false, false);
+    let constant_read = packed_u8_access_function(Opcode::VecRef, true, true);
+    let constant_write = packed_u8_access_function(Opcode::VecSet, false, true);
+    let discarded = packed_u8_access_function(Opcode::ArrayReadDiscarded, true, false);
+    let svref = packed_u8_access_function(Opcode::VecRef, false, false);
+    let mut svwrite = write.clone();
+    let store = *svwrite
+        .block(svwrite.entry())
+        .insts
+        .iter()
+        .find(|&&i| svwrite.inst(i).opcode == Opcode::VecSet)
+        .unwrap();
+    svwrite.inst_mut(store).aux = AuxData::SimpleVectorStore;
+    egcl_compiler::t2::verify::verify(&svwrite).unwrap();
+    let discarded_svref = packed_u8_access_function(Opcode::ArrayReadDiscarded, false, false);
+    let cold = (-8i64) as u64; // distinct rejected veneer; no interpreter fallback
+    let mut forged = read.clone();
+    let load = *forged
+        .block(forged.entry())
+        .insts
+        .iter()
+        .find(|&&i| forged.inst(i).opcode == Opcode::VecRef)
+        .unwrap();
+    forged.inst_mut(load).aux = AuxData::CallTarget(77);
+    assert!(
+        egcl_compiler::t2::verify::verify(&forged).is_err(),
+        "call provenance cannot widen the array layout contract"
+    );
+    for length in [4, 600_000] {
+        egcl_rt::rooted!(array = packed_u8::make(length, 17).unwrap());
+        assert_eq!(
+            unsafe { (*array.as_ptr().cast::<ObjectHeader>()).is_large_object() },
+            length > 4
+        );
+        for index in [0, length - 1] {
+            let arguments = [array.0, EgclVal::from_fixnum(index as i64).0, 0, 0, 0, 0, 0];
+            execute(&read, 3, &arguments, 17 << 3);
+            execute(&constant_read, 3, &[array.0, NIL.0, 0, 0, 0, 0, 0], 17 << 3);
+            execute(&discarded, 3, &arguments, 42 << 3);
+            execute(&svref, 3, &arguments, cold);
+            execute(&svwrite, 3, &arguments, cold);
+            assert_eq!(packed_u8::get(*array, index), Some(17));
+            execute(&discarded_svref, 3, &arguments, cold);
+            for byte in [0, 1, 127, 128, 255] {
+                let mut arguments = arguments;
+                arguments[2] = EgclVal::from_fixnum(byte).0;
+                execute(&write, 3, &arguments, arguments[2]);
+                assert_eq!(packed_u8::get(*array, index), Some(byte as u8));
+                execute(&read, 3, &arguments, arguments[2]);
+            }
+            execute(&constant_write, 3, &arguments, 255 << 3);
+            assert_eq!(packed_u8::get(*array, index), Some(255));
+            for invalid in [
+                EgclVal::from_fixnum(-1),
+                EgclVal::from_fixnum(256),
+                EgclVal::from_fixnum(egcl_rt::bignum::FIXNUM_MAX),
+                NIL,
+                EgclVal::from_char('x'),
+                *array,
+            ] {
+                let mut arguments = arguments;
+                arguments[2] = invalid.0;
+                execute(&write, 3, &arguments, cold);
+                assert_eq!(
+                    packed_u8::get(*array, index),
+                    Some(255),
+                    "failed store must not truncate/write"
+                );
+            }
+            assert!(packed_u8::set(*array, index, 17));
+        }
+        for invalid in [
+            EgclVal::from_fixnum(-1),
+            EgclVal::from_fixnum(length as i64),
+            EgclVal::from_fixnum(egcl_rt::bignum::FIXNUM_MAX),
+            NIL,
+            EgclVal::from_char('x'),
+        ] {
+            let args = [array.0, invalid.0, 255 << 3, 0, 0, 0, 0];
+            for (f, answer) in [(&read, cold), (&write, cold), (&discarded, cold)] {
+                execute(f, 3, &args, answer);
+            }
+            assert_eq!(packed_u8::get(*array, 0), Some(17));
+            assert_eq!(packed_u8::get(*array, length - 1), Some(17));
+        }
+    }
+    egcl_rt::rooted!(empty = packed_u8::make(0, 0).unwrap());
+    execute(&read, 3, &[empty.0, 0, 0, 0, 0, 0, 0], cold);
+    execute(&write, 3, &[empty.0, 0, 0, 0, 0, 0, 0], cold);
+    egcl_rt::rooted!(
+        general = {
+            let body =
+                egcl_rt::gc::alloc_typed(24, egcl_rt::object::type_id::SIMPLE_VECTOR).unwrap();
+            unsafe {
+                body.cast::<u64>().write(2);
+                body.add(8)
+                    .cast::<EgclVal>()
+                    .write(EgclVal::from_fixnum(31));
+                body.add(16)
+                    .cast::<EgclVal>()
+                    .write(EgclVal::from_fixnum(32));
+                EgclVal::from_heap_ptr(body.sub(egcl_rt::gc::body_header_offset(24)))
+            }
+        }
+    );
+    for f in [&read, &svref] {
+        execute(f, 3, &[general.0, 0, 0, 0, 0, 0, 0], 31 << 3);
+    }
+    for f in [&discarded, &discarded_svref] {
+        execute(f, 3, &[general.0, 0, 0, 0, 0, 0, 0], 42 << 3);
+    }
+    execute(&svwrite, 3, &[general.0, 0, 255 << 3, 0, 0, 0, 0], 255 << 3);
+    execute(&read, 3, &[general.0, 0, 0, 0, 0, 0, 0], 255 << 3);
+    egcl_rt::rooted!(doubles = egcl_rt::packed_f64::make(2, 1.25).unwrap());
+    execute(&read, 3, &[doubles.0, 0, 0, 0, 0, 0, 0], cold);
+    execute(&write, 3, &[doubles.0, 0, 255 << 3, 0, 0, 0, 0], cold);
+    assert_eq!(egcl_rt::packed_f64::get(*doubles, 0), Some(1.25));
+    execute(&svwrite, 3, &[doubles.0, 0, 255 << 3, 0, 0, 0, 0], cold);
+    assert_eq!(egcl_rt::packed_f64::get(*doubles, 0), Some(1.25));
+    // General vectors retain reference stores through the noncollecting
+    // barrier. SVREF must return the exact stored tagged heap object.
+    execute(
+        &svwrite,
+        3,
+        &[general.0, 0, doubles.0, 0, 0, 0, 0],
+        doubles.0,
+    );
+    execute(&svref, 3, &[general.0, 0, 0, 0, 0, 0, 0], doubles.0);
+    for invalid in [NIL, EgclVal::from_fixnum(0), EgclVal::from_char('x')] {
+        execute(&read, 3, &[invalid.0, 0, 0, 0, 0, 0, 0], cold);
+        execute(&write, 3, &[invalid.0, 0, 0, 0, 0, 0, 0], cold);
+    }
+}

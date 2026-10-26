@@ -65,7 +65,7 @@ fn clear_mv(f: &mut Function, site: Inst, old: &InstData) {
 }
 
 /// Run after numeric speculation so double-consuming reads are visible as
-/// UnboxFloat uses. The tagged artifact selects only ordinary vector accesses;
+/// UnboxFloat uses. The tagged artifact accepts general vectors and packed U8 arrays;
 /// the raw candidate additionally loads packed or boxed doubles directly.
 pub fn specialize(f: &mut Function, raw: bool, options: &super::inlining::InlineOptions) -> usize {
     if !cfg!(all(target_arch = "x86_64", target_os = "linux")) {
@@ -103,7 +103,8 @@ pub fn specialize(f: &mut Function, raw: bool, options: &super::inlining::Inline
             continue;
         }
         let load = matches!(key.as_str(), "AREF" | "SVREF");
-        let store = key == "EGCL::SET-AREF";
+        let simple_store = key == "EGCL::SET-SVREF";
+        let store = key == "EGCL::SET-AREF" || simple_store;
         if (!load && !store) || old.args.len() != if load { 2 } else { 3 } {
             continue;
         }
@@ -145,6 +146,7 @@ pub fn specialize(f: &mut Function, raw: bool, options: &super::inlining::Inline
         if discarded {
             let data = f.inst_mut(site);
             data.opcode = Opcode::ArrayReadDiscarded;
+            data.aux = if key == "AREF" { AuxData::ArrayRef } else { AuxData::None };
             data.results.clear();
             data.flags = InstFlags {
                 effectful: true,
@@ -194,7 +196,8 @@ pub fn specialize(f: &mut Function, raw: bool, options: &super::inlining::Inline
         } else {
             let data = f.inst_mut(site);
             data.opcode = if load { Opcode::VecRef } else { Opcode::VecSet };
-            data.aux = AuxData::None;
+            data.aux = if load && key == "AREF" { AuxData::ArrayRef }
+                else if simple_store { AuxData::SimpleVectorStore } else { AuxData::None };
             data.flags = InstFlags {
                 effectful: true,
                 guard: true,
@@ -220,7 +223,8 @@ fn specialize_raw_stores(f: &mut Function) -> usize {
         .block_order()
         .iter()
         .flat_map(|&b| f.block(b).insts.clone())
-        .filter(|&i| f.inst(i).opcode == Opcode::VecSet)
+        .filter(|&i| f.inst(i).opcode == Opcode::VecSet
+            && matches!(f.inst(i).aux, AuxData::None))
         .collect();
     let mut count = 0;
     for store in stores {
@@ -528,7 +532,7 @@ fn specialize_boxed_read(f: &mut Function, site: Inst, old: &InstData) {
     f.set_terminator(packed, exit(boxed[0]));
     let data = f.inst_mut(site);
     data.opcode = Opcode::VecRef;
-    data.aux = AuxData::None;
+    data.aux = AuxData::ArrayRef;
     data.flags = InstFlags {
         effectful: true,
         guard: true,
@@ -605,6 +609,117 @@ mod tests {
             .find(|i| i.opcode == Opcode::VecRef)
             .unwrap();
         assert!(access.flags.guard && access.flags.effectful);
+        assert!(matches!(access.aux, AuxData::ArrayRef));
         assert_eq!(access.frame_state, Some(state));
     }
+    #[test]
+    fn simple_vector_store_does_not_select_raw_packed_double_store() {
+        let mut f = Function::new("svref-raw-store-layout-contract");
+        let block = f.entry();
+        let array = f.add_block_param(block, IRType::TOP, Repr::Tagged);
+        let index = f.add_block_param(block, IRType::TOP, Repr::Tagged);
+        let state = f.frame_states.add(FrameState {
+            scopes: vec![],
+            remat: vec![],
+        });
+        let instruction = |opcode, args, aux, flags, frame_state| InstData {
+            opcode,
+            args,
+            results: vec![],
+            aux,
+            flags,
+            targets: vec![],
+            frame_state,
+            source_pos: 0,
+        };
+        let raw = f
+            .push_inst(
+                block,
+                instruction(
+                    Opcode::ConstDouble,
+                    vec![],
+                    AuxData::DoubleImm(1.5f64.to_bits()),
+                    InstFlags::default(),
+                    None,
+                ),
+                &[(IRType::of(TypeBits::DOUBLE_FLOAT), Repr::UnboxedF64)],
+            )
+            .1[0];
+        let boxed = f
+            .push_inst(
+                block,
+                instruction(
+                    Opcode::BoxFloat,
+                    vec![raw],
+                    AuxData::None,
+                    InstFlags {
+                        effectful: true,
+                        ..Default::default()
+                    },
+                    None,
+                ),
+                &[(IRType::of(TypeBits::DOUBLE_FLOAT), Repr::Tagged)],
+            )
+            .1[0];
+        let symbol = egcl_rt::symbols::intern("EGCL::SET-SVREF");
+        let store = f
+            .push_inst(
+                block,
+                instruction(
+                    Opcode::Call,
+                    vec![array, index, boxed],
+                    AuxData::CallTarget(symbol),
+                    InstFlags {
+                        call: true,
+                        safepoint: true,
+                        effectful: true,
+                        ..Default::default()
+                    },
+                    Some(state),
+                ),
+                &[(IRType::TOP, Repr::Tagged)],
+            )
+            .0;
+        f.set_terminator(
+            block,
+            instruction(
+                Opcode::Return,
+                vec![array],
+                AuxData::None,
+                InstFlags::default(),
+                None,
+            ),
+        );
+        super::super::verify::verify(&f).unwrap();
+        assert_eq!(
+            specialize(
+                &mut f,
+                true,
+                &super::super::inlining::InlineOptions::default()
+            ),
+            1
+        );
+        assert_eq!(f.inst(store).frame_state, Some(state));
+        assert!(
+            f.block(block)
+                .insts
+                .iter()
+                .any(|&i| matches!(f.inst(i).aux, AuxData::BuiltinBinding { .. }))
+        );
+        assert!(
+            f.block(block)
+                .insts
+                .iter()
+                .any(|&i| f.inst(i).opcode == Opcode::ClearMv)
+        );
+        assert_eq!(specialize_raw_stores(&mut f), 0);
+        assert_eq!(f.inst(store).opcode, Opcode::VecSet);
+        assert!(matches!(f.inst(store).aux, AuxData::SimpleVectorStore));
+        // The identical fixture IS eligible for the ordinary AREF rewrite,
+        // proving this checks the layout exclusion rather than another bailout.
+        f.inst_mut(store).aux = AuxData::None;
+        assert_eq!(specialize_raw_stores(&mut f), 1);
+        super::super::verify::verify(&f).unwrap();
+    }
+
 }
