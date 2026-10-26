@@ -207,7 +207,8 @@ fn analyze(f: &Function, lp: &NaturalLoop, proved: bool) -> Option<CountedVector
                         effectful: true,
                         ..Default::default()
                     })
-                || !matches!(d.aux, AuxData::None)
+                || !(matches!(d.aux, AuxData::None)
+                    || !proved && matches!(d.aux, AuxData::SimpleVectorStore))
                 || d.frame_state.is_none()
             {
                 return None;
@@ -514,6 +515,23 @@ mod tests {
             assert!(verify_accesses(&x.f).is_err());
         }
     }
+    #[test]
+    fn transformation_keeps_vector_only_fallback_and_proves_fast_store() {
+        let mut x = fixture();
+        x.f.inst_mut(x.store).aux = AuxData::SimpleVectorStore;
+        let stats = super::super::vector_ranges::version_counted_stores(&mut x.f);
+        assert_eq!((stats.loops, stats.stores), (1, 1));
+        assert!(matches!(x.f.inst(x.store).aux, AuxData::SimpleVectorStore));
+        assert_eq!(x.f.inst(x.store).opcode, Opcode::VecSet);
+        assert!(x.f.block_order().iter().any(|&block| {
+            x.f.block(block).insts.iter().any(|&inst| {
+                x.f.inst(inst).opcode == Opcode::VecSetInRange
+                    && matches!(x.f.inst(inst).aux, AuxData::None)
+            })
+        }));
+        super::super::verify::verify(&x.f).unwrap();
+    }
+
     #[test]
     fn predicate_must_be_immediately_before_success_branch() {
         let mut x = fixture();
