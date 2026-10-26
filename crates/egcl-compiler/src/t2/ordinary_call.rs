@@ -520,12 +520,14 @@ pub fn emit_framed_ordinary_function_with_self_call_facts(
         flags.signal_epoch].contains(&0)
     { return Err(declined("missing veneer or flag address")); }
     if crate::t2::verify::verify(f).is_err() { return Err(declined("IR verification")); }
-    // Raw doubles live in native homes and are reboxed on deoptimization
-    // (bliss-k4psf). Other raw representations have no ordinary support.
-    if (0..f.num_values()).any(|v| !matches!(f.value(Value(v as u32)).repr,
-        ValueRepresentation::Tagged | ValueRepresentation::UnboxedF64))
+    // Ordinary calls retain the same authoritative native homes, precise cold
+    // reconstruction and GC maps as the mapped backend. Admit raw fixnums only
+    // through that shared validator: speculative type annotations alone never
+    // authorize a pure unbox, and entry/call/return boundaries stay tagged.
+    if !super::native_representations_supported(f, NativeRootPublication::PublishedHomes,
+        NativeCallStorage::NativeStack, true)
     {
-        return Err(declined("untagged value"));
+        return Err(declined("unsupported native representation contract"));
     }
     if f.frame_states.iter().any(|(_, state)| {
         // Retained self expansion shares one body's scope-free recovery
@@ -542,6 +544,10 @@ pub fn emit_framed_ordinary_function_with_self_call_facts(
             let data = f.inst(inst);
             match data.opcode {
                 Opcode::Call => {
+                    if data.args.iter().chain(&data.results).any(|&value|
+                        f.value(value).repr != ValueRepresentation::Tagged) {
+                        return Err(declined("raw ordinary call boundary"));
+                    }
                     call_count += 1;
                     let mut matches = targets.iter().filter(|(site, _)| *site == inst);
                     let (_, target) = matches.next()
@@ -559,6 +565,9 @@ pub fn emit_framed_ordinary_function_with_self_call_facts(
                     }
                 }
                 Opcode::Return => {
+                    if data.args.iter().any(|&value| f.value(value).repr != ValueRepresentation::Tagged) {
+                        return Err(declined("raw ordinary return"));
+                    }
                     if data.args.len() != 1 || (!single.contains(&inst)
                         && (position == 0 || !returns.contains(&insts[position - 1])))
                     { return Err(declined("return of possibly multiple values")); }
@@ -571,7 +580,19 @@ pub fn emit_framed_ordinary_function_with_self_call_facts(
                 | Opcode::FloatCmpEq | Opcode::FloatCmpLt | Opcode::FloatCmpLe
                 | Opcode::FloatCmpGt | Opcode::FloatCmpGe
                     if data.args.iter().all(|&v| f.value(v).repr == ValueRepresentation::UnboxedF64) => {}
-                Opcode::ConstDouble | Opcode::BoxFloat => {}
+                Opcode::ConstDouble | Opcode::BoxFloat | Opcode::BoxFixnum => {}
+                Opcode::UnboxFixnum if !data.flags.guard => {
+                    if data.args.len() != 1 || !crate::t2::unbox_fixnum::proven_tagged_fixnum(f, data.args[0]) {
+                        return Err(declined("unproven pure fixnum unbox"));
+                    }
+                }
+                Opcode::UnboxFixnum | Opcode::IntegerLowBits
+                | Opcode::VecRef | Opcode::VecSet | Opcode::ArrayReadDiscarded => {
+                    if data.frame_state.is_none() {
+                        return Err(declined("guarded numeric or array operation without state"));
+                    }
+                }
+                Opcode::PackedF64P => {}
                 Opcode::Guard | Opcode::FixnumAdd | Opcode::FixnumSub | Opcode::FixnumMul
                 | Opcode::FixnumNeg | Opcode::FixnumShl | Opcode::FixnumShr
                 | Opcode::FloatAdd | Opcode::FloatSub | Opcode::FloatMul

@@ -749,3 +749,22 @@ fn eliminated_self_calls_do_not_require_child_stack_space() {
             1 << 3, 0, None, true, Some(below_bottom), 0);
     }
 }
+
+#[test]
+fn raw_fixnum_math_executes_through_the_ordinary_native_abi() {
+    let mut f = Function::new("ordinary-raw-fixnum-arithmetic");
+    let entry = f.entry();
+    let x = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+    let one = value(&mut f, entry,
+        instruction(Opcode::ConstFixnum, vec![], AuxData::FixnumImm(1)));
+    let mut add = instruction(Opcode::FixnumAdd, vec![x, one], AuxData::None);
+    add.flags.guard = true;
+    add.frame_state = Some(state(&mut f, x, &[x, one], 0));
+    let result = value(&mut f, entry, add);
+    f.set_terminator(entry, instruction(Opcode::Return, vec![result], AuxData::None));
+    // This is a backend capability test, not permission to make isolated
+    // additions raw in the production profitability selector.
+    assert!(egcl_compiler::t2::unbox_fixnum::run(&mut f) > 0);
+    execute(&f, 1, &[40 << 3, 0, 0, 0, 0, 0, 0], 41 << 3);
+    execute(&f, 1, &[(-43i64 << 3) as u64, 0, 0, 0, 0, 0, 0], (-42i64 << 3) as u64);
+}
