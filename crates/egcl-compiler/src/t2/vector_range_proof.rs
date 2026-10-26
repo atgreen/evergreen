@@ -124,7 +124,7 @@ fn analyze(f: &Function, lp: &NaturalLoop, proved: bool) -> Option<CountedVector
         || comparison.args.len() != 2
         || comparison.results.len() != 1
         || !tagged(f, comparison.results[0])
-        || !matches!(comparison.aux, AuxData::None)
+        || !matches!(comparison.aux, AuxData::None | AuxData::CallTarget(_))
     {
         return None;
     }
@@ -167,7 +167,7 @@ fn analyze(f: &Function, lp: &NaturalLoop, proved: bool) -> Option<CountedVector
         || add.opcode != Opcode::FixnumAdd
         || add.args.len() != 2
         || add.results.len() != 1
-        || !matches!(add.aux, AuxData::None)
+        || !matches!(add.aux, AuxData::None | AuxData::CallTarget(_))
         || !tagged(f, next)
         || !((add.args[0] == index && one(f, add.args[1]))
             || (add.args[1] == index && one(f, add.args[0])))
@@ -578,6 +578,26 @@ mod tests {
         verify_accesses(&x.f).unwrap();
         let second = crate::t2::vector_ranges::version_counted_stores(&mut x.f);
         assert_eq!(second.loops, 0, "{second:?}");
+    }
+
+    #[test]
+    fn transformation_accepts_retained_numeric_call_targets() {
+        let mut x = fixture();
+        let branch = x.f.terminator(x.header).unwrap();
+        let condition = x.f.inst(branch).args[0];
+        let comparison = result_inst(&x.f, condition).unwrap();
+        x.f.inst_mut(comparison).aux = AuxData::CallTarget(egcl_rt::symbols::intern(">="));
+        x.f.inst_mut(x.add).aux = AuxData::CallTarget(egcl_rt::symbols::intern("+"));
+        crate::t2::verify::verify(&x.f).unwrap();
+        let stats = crate::t2::vector_ranges::version_counted_stores(&mut x.f);
+        assert_eq!(stats.loops, 1, "{stats:?}");
+        assert_eq!(stats.stores, 1);
+        assert_eq!(x.f.inst(comparison).opcode, Opcode::FixnumCmpGe);
+        assert_eq!(x.f.inst(x.add).opcode, Opcode::FixnumAdd);
+        assert!(matches!(x.f.inst(comparison).aux, AuxData::CallTarget(_)));
+        assert!(matches!(x.f.inst(x.add).aux, AuxData::CallTarget(_)));
+        crate::t2::verify::verify(&x.f).unwrap();
+        verify_accesses(&x.f).unwrap();
     }
 
     #[test]
