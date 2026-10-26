@@ -226,8 +226,10 @@ Within step 4.d, the order for a function call form
 ### `define-compiler-macro`
 
 `(define-compiler-macro name lambda-list &body body)` — MUST support
-`&whole`. The compiler macro MUST be pure (no side effects) and MUST
-decline by returning the `&whole` form when it cannot optimize.
+`&whole`. Compiler-macro functions execute as ordinary managed Lisp code;
+the native compiler cannot assume they are pure or safe to invoke from an
+unmanaged worker. A compiler macro declines by returning the `&whole` form
+when it cannot optimize.
 
 ### `compiler-macro-function`
 
@@ -528,6 +530,24 @@ available from the reader's source-location table (§4.1).
 
 ## 4.2.12 Concurrency
 
+Source processing runs in the requesting managed Lisp execution. Reader
+macros (§4.1), macro/compiler-macro expanders and `*macroexpand-hook*`, and
+`EVAL-WHEN` compile-time evaluation can allocate, perform I/O, signal
+conditions, establish restarts, change definitions, and recursively compile.
+Preserve the requesting dynamic bindings, handlers/restarts and the required
+ordering of top-level forms. Root live expansion state and reach safepoints
+normally; do not hold table locks or GC-scanned mutable borrows across Lisp
+callbacks.
+
+The native-worker boundary is the already-expanded bytecode described in
+[§4.4](04-04-tiered.md). T1/T2 promotion MUST NOT invoke source expanders again
+or repeat compile-time effects, including when optimizing an inline candidate.
+If suitable bytecode or metadata is unavailable, defer or decline that native
+optimization. Source compilation can itself trigger native compilation, but
+cannot wait on an occupied worker that depends on that same source work.
+These are target architecture constraints tracked by `bliss-ifnlh` and
+`bliss-hrvj9`, not an assertion of current worker isolation.
+
 - Global macro, compiler macro, and symbol macro tables are each
   protected by independent read-write locks (read for expansion,
   write for definition/removal).
@@ -559,5 +579,6 @@ available from the reader's source-location table (§4.1).
 | Symbol macro + `setq` → `setf` conversion | R4.13 |
 | Shadowing rules (all five cases in §4.2.10) | Structural |
 | Concurrency (multi-threaded compilation under ThreadSanitizer) | Safety |
-| Global definitions expanded on native workers, including worker-triggered moving GC | Safety |
+| Managed source expansion under moving GC; caller bindings, handlers/restarts, and recursive compilation preserved | Safety |
+| T1/T2 promotion of expanded bytecode leaves macro/compiler-macro and compile-time effect records unchanged | Native-worker boundary (§4.4) |
 | Performance (expand 10 000 nested macros in < 200 ms) | Throughput |

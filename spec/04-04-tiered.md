@@ -3,7 +3,13 @@
 **Scope.**  EGCL executes Common Lisp code through three tiers modelled on
 the HotSpot JVM's interpreter → C1 → C2 pipeline.  This section specifies
 each tier's internal mechanics, the decision logic for tier transitions, the
-compilation queue, and the interaction with the profiling subsystem (§4.9).
+compilation queues, and the interaction with the profiling subsystem (§4.9).
+
+**Implementation status.** The worker lifecycle below is the target design.
+`bliss-ifnlh` tracks asynchronous T1 and `bliss-hrvj9` tracks removing
+compilation-length GC exclusion. This specification does not claim that these
+gaps are implemented or tested; existing coverage must be audited against the
+new contracts.
 
 ---
 
@@ -12,34 +18,35 @@ compilation queue, and the interaction with the profiling subsystem (§4.9).
 | ID | Requirement |
 |----|-------------|
 | R4.23 | Every user-defined function MUST begin execution at T0 (portable bytecode interpreter). |
-| R4.24 | The runtime MUST promote a function from T0 to T1 when its invocation counter reaches the T0→T1 threshold (default 10). |
-| R4.25 | The runtime MUST promote a function from T1 to T2 when its invocation counter reaches the T1→T2 threshold (default 4 096) **or** a back-edge counter in the function reaches the loop-heat threshold (default 10 000). |
-| R4.26 | T1 compilation MUST complete synchronously on the calling thread before the function's next invocation executes compiled code.  T2 compilation MUST execute on a background compiler thread. |
-| R4.27 | While T2 compilation is in progress, the function MUST continue executing its T1 code; the switch to T2 code MUST be atomic (single pointer store, visible at the next call-site dispatch or matching OSR back-edge poll). |
-| R4.28 | If T2 compilation fails (e.g., unsupported construct, resource exhaustion), the function MUST remain at T1 permanently and the failure MUST be logged. |
+| R4.24 | The runtime MUST request promotion of a function from T0 to T1 when its invocation counter reaches the T0→T1 threshold (default 10). |
+| R4.25 | The runtime MUST request promotion of a function from T1 to T2 when its invocation counter reaches the T1→T2 threshold (default 4 096) **or** a back-edge counter in the function reaches the loop-heat threshold (default 10 000). |
+| R4.26 | T1 and T2 native compilation MUST execute on dedicated background compiler workers from already-expanded bytecode, without repeating source-level compile-time effects. Expensive compiler work MUST permit moving GC to complete concurrently; a whole-compilation GC exclusion is forbidden. |
+| R4.27 | While native compilation is queued or running, ordinary execution MUST continue in its current tier. Publication MUST validate definition generation and dependencies, register complete code/GC metadata, and atomically expose the entry at subsequent dispatch or matching OSR polls; stale results MUST be discarded. |
+| R4.28 | If native compilation fails, the function MUST retain its usable tier and the failure MUST be logged. Structural failures MUST suppress retries for the same definition and compilation kind; transient failures MAY retry with backoff. Every terminal outcome MUST release request ownership and roots. |
 | R4.29 | Tier thresholds MUST be configurable at startup via environment variables (`EGCL_T0_T1_THRESHOLD`, `EGCL_T1_T2_THRESHOLD`, `EGCL_LOOP_HEAT_THRESHOLD`). |
-| R4.30 | The compilation queue MUST be bounded (default 64 entries); when full, new compilation requests MUST be dropped with a counter increment, not block the caller. |
+| R4.30 | T1 and T2 compilation queues MUST be separate and bounded (default 64 entries each). Requests MUST be deduplicated through publication by function identity, definition generation, target tier, and OSR entry where applicable. A full queue MUST drop new automatic requests with a counter increment, without blocking or leaving the request marked pending. |
 
 ---
 
 ## 4.4.2  Tier Overview
 
 ```text
-                ┌─────────────┐
-                │ T0 bytecode │  first call
-                │ interpreter │──────────┐
-                └─────────────┘          │ invoke_count ≥ T0_T1_THRESHOLD
-                                         ▼
-                                ┌─────────────┐
-                                │ T1 baseline  │  synchronous compile
-                                │  compiler    │──────────┐
-                                └─────────────┘          │ invoke_count ≥ T1_T2_THRESHOLD
-                                                         │  OR  back_edge_count ≥ LOOP_HEAT
-                                                         ▼
-                                                ┌─────────────┐
-                                                │ T2 optimising│ background compile
-                                                │  compiler    │
-                                                └─────────────┘
+Managed source processing → expanded bytecode → T0 execution
+                                                │ hotness request
+                                                ▼
+                                           T1 bounded queue
+                                                │ dedicated worker
+                                                ▼
+                                      validated T1 publication
+                                                │ further heat
+                                                ▼
+                                           T2 bounded queue
+                                                │ dedicated workers
+                                                ▼
+                                      validated T2 publication
+
+Execution continues in its current tier while requests are pending.
+Loop heat may request an OSR entry before invocation-driven promotion.
 ```
 
 Each tier is described in detail below.
@@ -181,7 +188,7 @@ Representative bytecodes:
 
 On every function entry, the bytecode loop atomically increments the
 callee's `invoke_count` and checks against `T0_T1_THRESHOLD`; if reached, it
-calls `request_t1_compilation` synchronously (§4.4.4.2).  On every
+requests background T1 compilation and continues in T0 (§4.4.4.2).  On every
 `BACK_EDGE`, it increments the function's back-edge counter and checks OSR
 eligibility.
 
@@ -233,7 +240,7 @@ pub struct FnMeta {
     pub tier: AtomicU8,           // 0, 1, or 2
     /// Pointer to the active entry point; updated atomically on tier change.
     pub entry: AtomicPtr<u8>,
-    /// Flags: QUEUED_FOR_T2, T2_FAILED, NEVER_COMPILE, ...
+    /// Per-definition compilation state complements the request-key registry.
     pub flags: AtomicU16,
 }
 ```
@@ -260,55 +267,34 @@ from bytecode to native code.  It trades code quality for compilation speed
 
 ### 4.4.4.2  Compilation Trigger
 
-When `invoke_count` reaches `T0_T1_THRESHOLD` (R4.24), the T0 eval loop calls
-`request_t1_compilation(meta, thread)`.  T1 compilation executes **synchronously**
-on the calling thread (R4.26):
+When `invoke_count` reaches `T0_T1_THRESHOLD` (R4.24), the T0 eval loop
+requests T1 compilation through the shared lifecycle (§4.4.6). Enqueueing
+neither changes the installed tier nor waits for the result. Later dispatches
+or matching OSR polls install completed artifacts and select the new entry.
 
-```rust
-fn request_t1_compilation(meta: &FnMeta, thread: &mut EgclThread) {
-    // Prevent double compilation.
-    let prev = meta.tier.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire);
-    if prev.is_err() { return; }
+An explicit forced-compilation operation MAY wait for its request. Such a
+wait MUST be cooperative with safepoints and fiber scheduling, hold no lock
+needed by the compiler or collector, and avoid waiting recursively on work
+that requires the same occupied worker. It uses the same worker and validated
+publication path; an automatic hotness request never waits for compilation.
 
-    let code = baseline_compile(meta, thread.runtime);
-    match code {
-        Ok(compiled) => {
-            let ptr = thread.runtime.code_cache.install(compiled);
-            meta.entry.store(ptr, Ordering::Release);
-        }
-        Err(e) => {
-            log::warn!("T1 compilation of {:?} failed: {}", meta.name, e);
-            meta.tier.store(0, Ordering::Release); // fall back to T0
-            if e.is_structural() {
-                // Unsupported construct (e.g., inline assembly) — never retry.
-                meta.flags.fetch_or(NEVER_COMPILE, Ordering::Release);
-            }
-            // Transient failures (e.g., OOM) leave NEVER_COMPILE unset,
-            // allowing retry on next threshold hit as the counter keeps
-            // incrementing.
-        }
-    }
-}
-```
+### 4.4.4.3  Single-Pass Bytecode Lowering
 
-### 4.4.4.3  Single-Pass AST Walk
-
-The baseline compiler performs a single depth-first walk of the expanded AST.
-For each node it emits native code directly into a mutable `CodeBuffer` — no
-intermediate representation is constructed.
+The baseline compiler walks the saved bytecode and emits native code into a
+private `CodeBuffer`, without constructing T2 SSA IR or re-expanding source.
 
 ```text
-baseline_compile(fn_meta) → CompiledCode:
+baseline_compile(snapshot) → RelocatableArtifact:
     buf ← new CodeBuffer
-    emit_prologue(buf, fn_meta)        // stack frame setup + invoke counter stub
-    walk(buf, fn_body, fn_env_shape)   // recursive code emission
-    emit_epilogue(buf)                 // return sequence
-    buf.finalise()                     // flush icache, set executable
+    emit_prologue(buf, snapshot.frame_shape)
+    lower_bytecode(buf, snapshot.instructions, snapshot.reference_indices)
+    emit_epilogue(buf)
+    return buf + relocations + stack_maps + OSR_metadata
 ```
 
-**No optimisation** is performed at T1: no register allocation beyond a fixed
-set of scratch registers, no constant folding, no dead code elimination.  Values
-flow through the stack frame's spill area.
+Values flow through the stack frame's spill area. Compilation returns an
+unpublished artifact; resolving movable constants, registering GC metadata,
+and making the entry executable belong to installation (§4.4.5.5).
 
 ### 4.4.4.4  Calling Convention
 
@@ -439,40 +425,56 @@ the IR in valid SSA form.
 
 ### 4.4.5.4  Background Thread Model
 
-T2 compilation runs on a dedicated **compiler thread pool** (default: 2 OS
-threads, configurable via `EGCL_T2_THREADS`).  Each thread loops:
-`pop_blocking()` → `t2_compile()` → return a relocatable compilation artifact.
-The requesting mutator installs completed artifacts at its next dispatch or
-back-edge poll. This ownership split keeps thread-local function registries,
-GC metadata registration, executable-memory publication, and stale-definition
-generation checks on the thread that owns them.
+T1 uses one dedicated OS compiler thread; T2 uses a separate pool (default:
+2 OS threads, configurable via `EGCL_T2_THREADS`). Separate queues keep a
+long optimizing job from occupying baseline compilation capacity. Both tiers
+share request ownership, completion, cancellation and publication rules.
+Each worker loops: wait for a request → compile → return a relocatable artifact.
+The requesting managed execution installs completions at dispatch or a
+back-edge poll, respecting ownership of thread-local registries.
 
-Compiler thread constraints:
-- MUST NOT allocate into the Lisp heap (avoids triggering GC).
-- MUST use a private bump allocator for IR nodes, freed in bulk post-compilation.
-- MUST check the safepoint flag at pass boundaries and yield if GC is pending.
+The worker's expensive phase operates on owned, immutable compiler data.
+Bytecode instructions, control-flow metadata and profile snapshots can be
+copied; movable constants and definition dependencies use stable handles or
+indices into registered, GC-updated roots. A copied `EgclVal`, raw pointer,
+or `Vec<EgclVal>` alone is not such a handle. Workers MUST NOT dereference
+movable objects outside a bounded managed-access phase, nor retain such a
+borrow across that phase. Resolving a handle requires the same discipline.
+Code buffers carry relocations rather than embedded stale object addresses.
 
-### 4.4.5.5  Code Installation via Atomic Swap
+During expensive compilation, workers are outside the mutator rendezvous in
+a GC-safe state. They MUST NOT hold a GC-excluding lock until the job finishes;
+yielding only at pass boundaries is insufficient. Root lifetimes cover queued,
+running, and completed-but-unpublished jobs. Snapshot preparation and
+installation use bounded managed phases and safepoint cooperation; neither
+may hide an unbounded traversal under GC exclusion.
 
-When the owning mutator receives a completed T2 artifact, the new code is
-installed atomically:
+Workers MUST NOT invoke Lisp expanders, source readers, user constant-folding
+functions, or other Lisp callbacks. Missing bytecode or an unsupported
+optimization causes deferral or a normal compilation failure, never hidden
+source processing on a worker. See [§4.2](04-02-macroexpand.md) for the managed
+source-processing boundary. A future compiler written in Lisp would instead
+need managed compiler threads with ordinary roots and safepoints.
 
-```rust
-fn install_code(meta: &FnMeta, compiled: CompiledCode) {
-    let code_ptr = runtime.code_cache.install(compiled);
-    // Atomic pointer store; subsequent calls pick up T2 code.
-    meta.entry.store(code_ptr, Ordering::Release);
-    meta.tier.store(2, Ordering::Release);
-    // The old T1 code is NOT freed immediately — it may still be on
-    // active stack frames. It becomes reclaimable at the next GC
-    // safepoint when no frame references it (§3 code-cache GC).
-}
-```
+### 4.4.5.5  Validated Code Publication
 
-**Semantics:** Because `entry` is updated with `Release` ordering and call
-sites load it with `Acquire`, no thread can observe a partially-written
-code pointer.  At worst, a thread executes one more call through T1 code
-before seeing the T2 update — this is acceptable (R4.27).
+Installation is a short managed transaction for either tier:
+
+1. Verify the function identity, definition generation, compilation kind, and
+   recorded dependencies still match. Reject an obsolete artifact or one
+   superseded by an already-installed higher tier.
+2. Resolve constant relocations from current rooted handles. Register code,
+   stack maps, unwind/deoptimization maps and OSR entries before exposing code.
+3. Under synchronization shared with redefinition/invalidation, revalidate
+   assumptions and publish the entry with release ordering. Dispatch loads
+   with acquire ordering; tier diagnostics must describe that published entry.
+4. Complete the request and release its roots, retaining the installed code's
+   own roots. Rejected or failed installation releases unpublished resources.
+
+No caller may observe partially initialized metadata. Redefinition cannot race
+between the final validity check and publication. Old code remains live while
+active frames reference it and is reclaimed under code-cache GC (§3).
+Existing activations continue until a matching, validated OSR entry is ready.
 
 ---
 
@@ -480,34 +482,37 @@ before seeing the T2 update — this is acceptable (R4.27).
 
 ### 4.4.6.1  Data Structure — D4.07 (CompilationRequest)
 
-```rust
-pub struct CompilationRequest {
-    /// The function to compile.
-    pub fn_meta: Arc<FnMeta>,
-    /// Priority score (higher = compile sooner).
-    pub priority: u32,
-    /// Timestamp of request (monotonic, for age-based tiebreaking).
-    pub enqueued_at: u64,
-}
-```
+The conceptual request contains:
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `fn_meta` | `Arc<FnMeta>` | Shared reference to function metadata |
-| `priority` | `u32` | Computed from invocation count + back-edge heat |
-| `enqueued_at` | `u64` | Monotonic timestamp for FIFO tiebreaking |
+| Field | Description |
+|-------|-------------|
+| Key | Stable function identity, definition generation, target tier, optional OSR bytecode PC/entry kind |
+| Input | Owned bytecode and profile snapshot, stable constant handles, dependency generations |
+| Owner | Managed publication destination and completion/cancellation state |
+| Priority | Invocation count + twice back-edge heat |
+| Enqueued time | Monotonic timestamp for FIFO tiebreaking |
+
+Function identity is not merely its printable name or a movable heap address.
+A generation distinguishes redefinitions even when the name or owner is reused.
 
 ### 4.4.6.2  Queue Implementation
 
-The compilation queue is a **bounded maximum-priority queue** protected by a
-`Mutex` + `Condvar`, with capacity default 64 (R4.30) and an `AtomicU64` drop
-counter. A vector with maximum-priority removal and a binary max-heap are
-equivalent implementations of this policy at the default small capacity.
+Each tier uses a bounded maximum-priority queue with a short-held mutex and
+condition variable, default capacity 64, and a drop counter. Workers release
+the queue lock before compiling. Completed artifacts also require bounded
+retention so a stalled owner cannot grow memory without limit.
 
-**Enqueue semantics (R4.30):** If at capacity, increment `dropped` and return
-`false` (never block).  If the function is already queued, update priority if
-higher.  Otherwise push and `notify_one`.  Compiler threads call
-`pop_blocking()` which waits on the condvar.
+Admission atomically reserves the request key. A duplicate queued, running,
+or awaiting-publication request shares the existing work; a queued request
+may gain priority. If admission fails or the queue is full, release the
+reservation and increment the appropriate counter. The current tier remains
+usable, and later heat can retry. Workers sleep on the queue condition while
+idle, without participating as active mutators.
+
+The reservation remains live through compilation and publication, and is
+released on success, failure, stale-result rejection, cancellation or owner
+shutdown. Cancellation disposes of queued/completed artifacts and lets running
+jobs retire safely; it cannot free roots still used by a worker.
 
 ---
 
@@ -515,43 +520,23 @@ higher.  Otherwise push and `notify_one`.  Compiler threads call
 
 ### Algorithm A4.08 — Tier Promotion Decision
 
-The promotion decision is split into two checks, both embedded in
-profiling stubs emitted by T1 (§4.4.4.6) and the T0 eval loop
-(§4.4.3.3):
+Invocation and back-edge paths select a candidate without changing the
+installed tier:
 
 ```text
-ALGORITHM A4.08  tier_promotion_decision(fn_meta)
-
-Input:  fn_meta — FnMeta of the function under consideration
-Output: action ∈ { NONE, COMPILE_T1, ENQUEUE_T2 }
-
-1.  tier ← fn_meta.tier.load(Acquire)
-2.  IF tier = 0:
-3.      IF fn_meta.invoke_count.load(Relaxed) ≥ T0_T1_THRESHOLD:
-4.          RETURN COMPILE_T1       // synchronous T1 compilation
-5.      RETURN NONE
-6.  IF tier = 1:
-7.      IF fn_meta.flags contains T2_FAILED or NEVER_COMPILE:
-8.          RETURN NONE             // do not re-attempt
-9.      IF fn_meta.flags contains QUEUED_FOR_T2:
-10.         RETURN NONE             // already in queue
-11.     invoke_hot ← fn_meta.invoke_count.load(Relaxed) ≥ T1_T2_THRESHOLD
-12.     loop_hot   ← fn_meta.back_edge_count.load(Relaxed) ≥ LOOP_HEAT_THRESHOLD
-13.     IF invoke_hot OR loop_hot:
-14.         SET fn_meta.flags |= QUEUED_FOR_T2
-15.         priority ← fn_meta.invoke_count + 2 × fn_meta.back_edge_count
-16.         ENQUEUE CompilationRequest { fn_meta, priority, now() }
-17.         RETURN ENQUEUE_T2
-18.     RETURN NONE
-19. // tier = 2: already at max tier
-20. RETURN NONE
+ALGORITHM A4.08 tier_promotion_decision(function, optional_osr_entry)
+1. Read current definition generation, installed tier, and hotness.
+2. Choose eligible target tier and compilation kind from hotness/OSR policy.
+3. If no target, structurally failed for this key, or in retry backoff: return.
+4. Form key = (identity, generation, target tier, optional OSR entry).
+5. Try to reserve key and enqueue its owned snapshot in that tier's queue.
+6. On duplicate: retain existing work; on full: release reservation, count drop.
+7. Continue current execution; poll completions at later dispatch/OSR points.
 ```
 
-**Notes:**
-- Step 15: back-edge count is weighted 2× because loop-heavy functions
-  benefit more from optimisation than call-heavy functions.
-- The `QUEUED_FOR_T2` flag (step 9) prevents duplicate enqueues.  It is
-  cleared by the compiler thread after compilation completes (or fails).
+Queue eligibility is not evidence of promotion. Only a successfully published
+artifact changes the installed tier, and only an actual entry proves execution
+in that tier.
 
 ---
 
@@ -573,12 +558,12 @@ The tiered compilation system depends on §4.9 (Profiling) for:
 
 | Failure | Effect | Recovery |
 |---------|--------|----------|
-| T1 compilation of unsupported form | Function stays at T0 | Log warning; flag `NEVER_COMPILE` if structural (e.g., inline assembly) |
-| T1 compilation OOM | Function stays at T0 | Log; retry on next threshold hit (counter keeps incrementing) |
-| T2 compilation of unsupported construct | Function stays at T1 | Flag `T2_FAILED`; log (R4.28) |
-| T2 compilation OOM | Function stays at T1 | Log; clear `QUEUED_FOR_T2`; may retry if counter doubles |
-| Code cache full | Evict coldest T2 code (LRU) | Evicted function drops to T1; counters reset |
-| Compilation queue full | Request dropped (R4.30) | `dropped` counter incremented; function re-eligible on next threshold hit |
+| Unsupported construct | Keep current tier | Log; suppress retries for this definition and compilation kind |
+| Allocation/resource failure | Keep current tier | Log; release pending state; retry with backoff |
+| Stale definition or dependency | Discard unpublished artifact | Release pending state and roots; new generation remains eligible |
+| Code cache full | Keep current usable tier | Reclaim eligible inactive code; back off if still full |
+| Compilation queue full | Request dropped (R4.30) | Increment drop counter; release reservation; remain eligible |
+| Owner shutdown/cancellation | Discard request/result | Release roots when workers can no longer access them |
 
 ---
 
@@ -587,8 +572,8 @@ The tiered compilation system depends on §4.9 (Profiling) for:
 | Resource | Synchronisation | Lock Order |
 |----------|-----------------|------------|
 | `FnMeta` fields | Lock-free atomics (`AtomicU32`, `AtomicPtr`, etc.) | N/A |
-| `CompilationQueue.heap` | `Mutex` + `Condvar` | Before code-cache lock |
-| Code cache installation | `RwLock` (write during install, read during execution) | After queue lock |
+| Per-tier compilation queue | `Mutex` + `Condvar` | Released before compilation or installation |
+| Code publication and invalidation | Shared synchronization for generation check and entry publication | Never nested under queue lock; no lock held across code execution |
 | IR node arena (per-compilation) | Thread-local bump allocator | No lock |
 | Type profile slots | Per-slot `AtomicU64` (packed type + count) | N/A |
 
@@ -605,8 +590,8 @@ hold the queue mutex only during enqueue/dequeue (microseconds).
 | `EGCL_T1_T2_THRESHOLD` | 4 096 | Invocation count to trigger T2 compilation |
 | `EGCL_LOOP_HEAT_THRESHOLD` | 10 000 | Back-edge count to trigger T2 compilation |
 | `EGCL_DISABLE_T2` | unset | Set to a true value to keep hot functions at T1 for debugging/differential testing |
-| `EGCL_T2_THREADS` | 2 | Number of background compiler threads |
-| `EGCL_COMPILE_QUEUE_SIZE` | 64 | Maximum entries in the T2 compilation queue |
+| `EGCL_T2_THREADS` | 2 | Number of T2 workers (T1 has a separate worker) |
+| `EGCL_COMPILE_QUEUE_SIZE` | 64 | Maximum queued entries per tier |
 | `EGCL_INLINE_LIMIT` | 30 | Maximum IR node count for inlining in T2 |
 | `EGCL_T2_NODE_BUDGET` | 500 | Maximum IR nodes per function post-inlining |
 | `EGCL_MAX_STACK_DEPTH` | 65 536 | Maximum ValueStack slots per green thread (overflow signals `STORAGE-CONDITION`) |
@@ -625,7 +610,7 @@ immediately after T1, while `EGCL_T2=0` is a compatibility off-switch.
 
 | Test | Scope | Method |
 |------|-------|--------|
-| Tier transition correctness | Unit | Call a function N times; assert `fn_meta.tier` progresses 0 → 1 → 2 |
+| Tier transition correctness | Unit | Drive hotness, await bounded completion, and prove native entry at each installed tier; a counter or disassembly alone is insufficient |
 | T0/T1 semantic equivalence | Integration | Run ansi-test under forced T0 and forced T1 (`EGCL_T0_T1_THRESHOLD=1`); diff results |
 | T1/T2 semantic equivalence | Integration | Run ansi-test under forced T1 and forced T2 (`EGCL_T1_T2_THRESHOLD=1`); diff results |
 | Compilation queue overflow | Unit | Fill queue to capacity; assert `try_enqueue` returns `false` and `dropped` increments |
@@ -633,3 +618,26 @@ immediately after T1, while `EGCL_T2=0` is a compatibility off-switch.
 | Deoptimisation round-trip | Integration | Force type guard failure; assert correct fallback to T1 and eventual re-promotion |
 | Code cache eviction | Unit | Fill code cache; assert LRU eviction and tier demotion |
 | Threshold configurability | Unit | Set env vars; assert runtime reads correct values |
+
+The worker-boundary regressions require deterministic coordination rather than
+sleep-based timing:
+
+- Pause a real T1 job, then a real T2 job, inside expensive compilation. While
+  paused, prove another managed execution progresses and a moving collection
+  completes. Verify relocation of a relevant rooted constant by comparing
+  addresses before/after, then resume compilation, install, and execute native
+  code with the correct constant/result. Stress/poison success without actual
+  relocation does not establish this property.
+- Redefine the function and invalidate a captured dependency while a job is
+  paused; its old result must never replace the new definition. Exercise a
+  slower T1 completion after T2 publication as well.
+- Exercise duplicate requests while queued, running and awaiting publication;
+  full queues; structural and transient failures; cancellation and owner
+  shutdown. Verify bounded retention, released roots/reservations, and retry
+  eligibility. Cover both invocation and OSR request kinds.
+- Record macro, compiler-macro and compile-time evaluation activity during
+  source processing. Subsequent T1/T2 promotion must leave that record unchanged.
+  Check requesting dynamic bindings, handlers/restarts, and recursive source
+  compilation under moving GC, including a cooperative explicit compilation wait.
+
+These are acceptance criteria, not citations to existing test coverage.
