@@ -442,6 +442,232 @@ fn osr_bypasses_block(f: &Function, leader: Block, consumer: Block) -> bool {
 
 // ── Transform 3: loop-invariant guard hoisting ──────────────────────
 
+/// Hoist only the always-executed invariant prefix of a loop's header chain.
+/// Run after ClearMvElim: multiple-value resets and every other observable
+/// effect are ordering barriers, rather than permission to speculate a bound.
+#[derive(Default)]
+pub struct InvariantBounds;
+
+impl Pass for InvariantBounds {
+    fn name(&self) -> &'static str {
+        "invariant-bounds"
+    }
+
+    fn run(&mut self, f: &mut Function, analyses: &mut Analyses) {
+        if hoist_invariant_bounds(f) != 0 {
+            analyses.invalidate();
+        }
+    }
+}
+
+/// Return the number of bound arithmetic operations moved. Recovery states
+/// are private snapshots of the first header visit; no CFG or OSR record changes.
+/// Only existing, unconditional single-edge preheaders are admitted. A loop
+/// reachable from OSR without executing that preheader is left unchanged.
+pub fn hoist_invariant_bounds(f: &mut Function) -> usize {
+    let dom = f.dominators();
+    let mut loops: HashMap<Block, Vec<Block>> = HashMap::new();
+    for &block in f.block_order() {
+        for successor in f.succs(block) {
+            if dom.dominates(successor, block) {
+                loops.entry(successor).or_default().push(block);
+            }
+        }
+    }
+    let mut headers: Vec<_> = loops.keys().copied().collect();
+    headers.sort_by_key(|header| header.0);
+    let mut count = 0;
+    for header in headers {
+        let body = natural_loop_body(f, header, &loops[&header]);
+        let Some(ph) = preheader(f, header, &body) else {
+            continue;
+        };
+        let Some(term) = f.terminator(ph) else {
+            continue;
+        };
+        let pre = f.inst(term);
+        if pre.opcode != Opcode::Jump
+            || pre.targets.len() != 1
+            || pre.targets[0].block != header
+            || pre.targets[0].args.len() != f.block(header).params.len()
+            || osr_bypasses_block(f, ph, header)
+        {
+            continue;
+        }
+        // Recompute locations after each independent loop's relocation.
+        let locations = inst_block_map(f);
+        let entry: HashMap<_, _> = f
+            .block(header)
+            .params
+            .iter()
+            .copied()
+            .zip(pre.targets[0].args.iter().copied())
+            .collect();
+        let mut invariant = HashMap::new();
+        for (index, &param) in f.block(header).params.iter().enumerate() {
+            let all_latches_forward = body.iter().all(|&block| {
+                f.terminator(block).is_none_or(|term| {
+                    f.inst(term)
+                        .targets
+                        .iter()
+                        .filter(|edge| edge.block == header)
+                        .all(|edge| edge.args.get(index) == Some(&param))
+                })
+            });
+            if all_latches_forward {
+                invariant.insert(param, entry[&param]);
+            }
+        }
+        let mut aliases = HashMap::new();
+        let mut available = HashSet::new();
+        // (instruction, original block, new operands, private recovery state).
+        let mut planned = Vec::new();
+        let mut arithmetic_count = 0;
+        let mut visited = HashSet::new();
+        let mut block = header;
+        let mut scanned = 0;
+        'prefix: loop {
+            if !visited.insert(block) || visited.len() > 32 {
+                break;
+            }
+            for &inst in &f.block(block).insts {
+                scanned += 1;
+                if scanned > 128 || planned.len() >= 32 {
+                    break 'prefix;
+                }
+                let data = f.inst(inst);
+                if data.opcode.is_terminator() {
+                    break;
+                }
+                let bound = matches!(
+                    data.opcode,
+                    Opcode::FixnumAdd | Opcode::FixnumSub | Opcode::FixnumMin | Opcode::FixnumMax
+                );
+                let proof = data.opcode == Opcode::Guard && is_plain_fixnum_guard(data);
+                let literal = matches!(
+                    data.opcode,
+                    Opcode::ConstFixnum
+                        | Opcode::ConstNil
+                        | Opcode::ConstT
+                        | Opcode::ConstSymbol
+                        | Opcode::ConstChar
+                );
+                // Predicate operands can be invariant while their heap/class
+                // observations change in the body. Do not move TypeCheck or
+                // InstanceOf, or anything following them in this prefix.
+                let transparent = literal || data.opcode == Opcode::GenericEq;
+                if data.flags.call
+                    || data.flags.safepoint
+                    || (!bound
+                        && !proof
+                        && (!transparent
+                            || data.flags.effectful
+                            || data.flags.guard
+                            || data.frame_state.is_some()))
+                    || ((bound || proof) && data.frame_state.is_none())
+                {
+                    break 'prefix;
+                }
+                let args: Vec<_> = data
+                    .args
+                    .iter()
+                    .map(|&value| bounds_alias(bounds_alias(value, &aliases), &invariant))
+                    .collect();
+                let ready = |value| {
+                    available.contains(&value)
+                        || def_block(f, &locations, value)
+                            .is_some_and(|owner| dom.dominates(owner, ph))
+                };
+                if !args.iter().all(|&value| ready(value)) {
+                    // A total pure computation can stay in the header without
+                    // affecting the schedule of a later invariant operation.
+                    // A potentially failing operation must keep its order.
+                    if bound || proof {
+                        break 'prefix;
+                    }
+                    continue;
+                }
+                let recovery = if let Some(id) = data.frame_state {
+                    let mut state = f.frame_states.get(id).clone();
+                    let mut valid = true;
+                    let mut rewrite = |source: &mut ValueSource| {
+                        if let ValueSource::Value { value, .. } = source {
+                            *value = bounds_alias(bounds_alias(*value, &aliases), &entry);
+                            if !ready(*value) {
+                                valid = false;
+                            }
+                        }
+                    };
+                    for scope in &mut state.scopes {
+                        scope
+                            .locals
+                            .iter_mut()
+                            .chain(&mut scope.stack)
+                            .for_each(&mut rewrite);
+                    }
+                    for recipe in &mut state.remat {
+                        recipe.inputs.iter_mut().for_each(&mut rewrite);
+                    }
+                    if !valid {
+                        break 'prefix;
+                    }
+                    Some(state)
+                } else {
+                    None
+                };
+                arithmetic_count += usize::from(bound);
+                available.extend(data.results.iter().copied());
+                planned.push((inst, block, args, recovery));
+            }
+            let Some(term) = f.terminator(block) else {
+                break;
+            };
+            let jump = f.inst(term);
+            if jump.opcode != Opcode::Jump || jump.targets.len() != 1 {
+                break;
+            }
+            let next = jump.targets[0].block;
+            if next == header
+                || !body.contains(&next)
+                || f.preds(next).as_slice() != [block]
+                || f.osr_entries.iter().any(|entry| entry.block == next)
+                || jump.targets[0].args.len() != f.block(next).params.len()
+            {
+                break;
+            }
+            for (&param, &arg) in f.block(next).params.iter().zip(&jump.targets[0].args) {
+                aliases.insert(param, bounds_alias(arg, &aliases));
+            }
+            block = next;
+        }
+        if arithmetic_count == 0 {
+            continue;
+        }
+        for (inst, from, args, state) in planned {
+            let state = state.map(|state| f.frame_states.add(state));
+            let data = f.inst_mut(inst);
+            data.args = args;
+            data.frame_state = state;
+            move_inst_before_terminator(f, inst, from, ph);
+        }
+        count += arithmetic_count;
+    }
+    count
+}
+
+fn bounds_alias(mut value: Value, aliases: &HashMap<Value, Value>) -> Value {
+    for _ in 0..=aliases.len() {
+        let Some(&next) = aliases.get(&value) else {
+            break;
+        };
+        if next == value {
+            break;
+        }
+        value = next;
+    }
+    value
+}
+
 /// Move loop-invariant guards to their loop's preheader.
 fn hoist_loop_invariant(f: &mut Function, dom: &crate::t2::ir::DominatorTree) -> bool {
     let inst_block = inst_block_map(f);
@@ -1821,5 +2047,371 @@ mod tests {
                 "every entry must execute the invariant guard before using its result"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod invariant_bounds_tests {
+    use super::*;
+    use crate::t2::frame_state::{FrameScope, FrameState, RematOp, RematRecipe, RematRecipeId};
+    use crate::t2::ir::{BlockCall, InstData, InstFlags, OsrEntry, ValueRepresentation as Repr};
+
+    fn data(opcode: Opcode, args: Vec<Value>) -> InstData {
+        InstData {
+            opcode,
+            args,
+            results: vec![],
+            aux: AuxData::None,
+            flags: InstFlags::default(),
+            targets: vec![],
+            frame_state: None,
+            source_pos: 0,
+        }
+    }
+    fn constant(f: &mut Function, b: Block, n: i64) -> Value {
+        let mut d = data(Opcode::ConstFixnum, vec![]);
+        d.aux = AuxData::FixnumImm(n);
+        f.push_inst(b, d, &[(IRType::of(TypeBits::FIXNUM), Repr::Tagged)])
+            .1[0]
+    }
+    fn jump(f: &mut Function, b: Block, target: Block, args: Vec<Value>) {
+        let mut d = data(Opcode::Jump, vec![]);
+        d.targets.push(BlockCall {
+            block: target,
+            args,
+        });
+        f.set_terminator(b, d);
+    }
+    fn state(
+        f: &mut Function,
+        bcp: u32,
+        locals: &[Value],
+        stack: &[Value],
+    ) -> crate::t2::frame_state::FrameStateId {
+        let value = |&value| ValueSource::Value {
+            value,
+            repr: Repr::Tagged,
+        };
+        f.frame_states.add(FrameState {
+            scopes: vec![FrameScope {
+                function: 0,
+                bcp,
+                locals: locals.iter().map(value).collect(),
+                stack: stack.iter().map(value).collect(),
+            }],
+            remat: vec![],
+        })
+    }
+    fn checked(
+        f: &mut Function,
+        b: Block,
+        value: Value,
+        fs: crate::t2::frame_state::FrameStateId,
+    ) -> Value {
+        let mut d = data(Opcode::Guard, vec![value]);
+        d.aux = AuxData::TypeTag(IRType::of(TypeBits::FIXNUM));
+        d.flags = InstFlags {
+            guard: true,
+            effectful: true,
+            ..Default::default()
+        };
+        d.frame_state = Some(fs);
+        f.push_inst(b, d, &[(IRType::of(TypeBits::FIXNUM), Repr::Tagged)])
+            .1[0]
+    }
+    struct Fixture {
+        f: Function,
+        header: Block,
+        tail: Block,
+        bound_block: Block,
+        add: Inst,
+        min: Inst,
+        index: Value,
+        entry_index: Value,
+        old_state: crate::t2::frame_state::FrameStateId,
+    }
+    fn fixture() -> Fixture {
+        let mut f = Function::new("invariant-header-bound");
+        let ph = f.entry();
+        let offset = f.add_block_param(ph, IRType::TOP, Repr::Tagged);
+        let limit = f.add_block_param(ph, IRType::TOP, Repr::Tagged);
+        let zero = constant(&mut f, ph, 0);
+        let one = constant(&mut f, ph, 1);
+        let header = f.make_block();
+        let bounds = f.make_block();
+        let tail = f.make_block();
+        let exit = f.make_block();
+        let off = f.add_block_param(header, IRType::TOP, Repr::Tagged);
+        let lim = f.add_block_param(header, IRType::TOP, Repr::Tagged);
+        let index = f.add_block_param(header, IRType::of(TypeBits::FIXNUM), Repr::Tagged);
+        jump(&mut f, ph, header, vec![offset, limit, zero]);
+        let fs = state(&mut f, 10, &[off, lim, index], &[]);
+        let off_fx = checked(&mut f, header, off, fs);
+        let lim_fx = checked(&mut f, header, lim, fs);
+        let eight = constant(&mut f, header, 8);
+        jump(&mut f, header, bounds, vec![]);
+        let fs_add = state(&mut f, 11, &[off, lim, index], &[index, off_fx, eight]);
+        let mut d = data(Opcode::FixnumAdd, vec![off_fx, eight]);
+        d.flags = InstFlags {
+            guard: true,
+            effectful: true,
+            ..Default::default()
+        };
+        d.frame_state = Some(fs_add);
+        let (add, sum) = f.push_inst(bounds, d, &[(IRType::of(TypeBits::FIXNUM), Repr::Tagged)]);
+        let fs_min = state(&mut f, 12, &[off, lim, index], &[index, sum[0], lim_fx]);
+        let mut d = data(Opcode::FixnumMin, vec![sum[0], lim_fx]);
+        d.flags = InstFlags {
+            guard: true,
+            effectful: true,
+            ..Default::default()
+        };
+        d.frame_state = Some(fs_min);
+        let (min, bound) = f.push_inst(bounds, d, &[(IRType::of(TypeBits::FIXNUM), Repr::Tagged)]);
+        let fs_cmp = state(&mut f, 13, &[off, lim, index], &[index, bound[0]]);
+        let mut d = data(Opcode::FixnumCmpLt, vec![index, bound[0]]);
+        d.flags = InstFlags {
+            guard: true,
+            effectful: true,
+            ..Default::default()
+        };
+        d.frame_state = Some(fs_cmp);
+        let (_, cmp) = f.push_inst(
+            bounds,
+            d,
+            &[(
+                IRType::of(TypeBits::SYMBOL.join(TypeBits::NULL)),
+                Repr::Tagged,
+            )],
+        );
+        let mut branch = data(Opcode::Brif, cmp);
+        branch.targets = vec![
+            BlockCall {
+                block: tail,
+                args: vec![],
+            },
+            BlockCall {
+                block: exit,
+                args: vec![],
+            },
+        ];
+        f.set_terminator(bounds, branch);
+        let fs_next = state(&mut f, 20, &[off, lim, index], &[index, one]);
+        let mut d = data(Opcode::FixnumAdd, vec![index, one]);
+        d.flags = InstFlags {
+            guard: true,
+            effectful: true,
+            ..Default::default()
+        };
+        d.frame_state = Some(fs_next);
+        let (_, next) = f.push_inst(tail, d, &[(IRType::of(TypeBits::FIXNUM), Repr::Tagged)]);
+        jump(&mut f, tail, header, vec![off, lim, next[0]]);
+        f.set_terminator(exit, data(Opcode::Return, vec![index]));
+        crate::t2::verify::verify(&f).unwrap();
+        Fixture {
+            f,
+            header,
+            tail,
+            bound_block: bounds,
+            add,
+            min,
+            index,
+            entry_index: zero,
+            old_state: fs_add,
+        }
+    }
+
+    #[test]
+    fn invariant_header_chain_hoists_and_recovers_first_iteration_values() {
+        let mut x = fixture();
+        let old = x.f.frame_states.get(x.old_state).clone();
+        assert_eq!(hoist_invariant_bounds(&mut x.f), 2);
+        let ph = x.f.entry();
+        assert!(x.f.block(ph).insts.contains(&x.add));
+        assert!(x.f.block(ph).insts.contains(&x.min));
+        assert!(!x.f.block(x.bound_block).insts.contains(&x.add));
+        let new_id = x.f.inst(x.add).frame_state.unwrap();
+        assert_ne!(new_id, x.old_state);
+        let new = x.f.frame_states.get(new_id);
+        assert_eq!(new.scopes[0].bcp, 11);
+        assert!(
+            matches!(new.scopes[0].locals[2], ValueSource::Value { value, .. } if value == x.entry_index)
+        );
+        assert!(
+            matches!(x.f.frame_states.get(x.old_state).scopes[0].locals[2], ValueSource::Value { value, .. } if value == x.index)
+        );
+        assert_eq!(old.scopes[0].bcp, new.scopes[0].bcp);
+        crate::t2::verify::verify(&x.f).unwrap();
+        assert_eq!(hoist_invariant_bounds(&mut x.f), 0);
+    }
+
+    #[test]
+    fn preceding_effect_or_mv_reset_blocks_the_header_chain() {
+        for reset in [false, true] {
+            let mut x = fixture();
+            let mut d = data(if reset { Opcode::ClearMv } else { Opcode::Call }, vec![]);
+            d.flags = InstFlags {
+                call: true,
+                effectful: true,
+                safepoint: true,
+                ..Default::default()
+            };
+            if !reset {
+                d.aux = AuxData::CallTarget(0);
+            }
+            let (effect, _) = x.f.push_inst(x.header, d, &[]);
+            let list = &mut x.f.block_mut(x.header).insts;
+            assert_eq!(list.pop(), Some(effect));
+            list.insert(0, effect);
+            assert_eq!(hoist_invariant_bounds(&mut x.f), 0);
+            assert!(x.f.block(x.bound_block).insts.contains(&x.add));
+        }
+    }
+
+    fn mutable_predicate_stops_bound_prefix(opcode: Opcode) {
+        let mut x = fixture();
+        let operand = x.f.block(x.header).params[0];
+        let mut predicate = data(opcode, vec![operand]);
+        predicate.aux = AuxData::TypeTag(IRType::of(TypeBits::STRING));
+        // Even predicates without effect/call flags are not necessarily
+        // invariant: the body may mutate the object or its class.
+        let (predicate, _) = x.f.push_inst(
+            x.header,
+            predicate,
+            &[(IRType::of(TypeBits::SYMBOL.join(TypeBits::NULL)), Repr::Tagged)],
+        );
+        let instructions = &mut x.f.block_mut(x.header).insts;
+        assert_eq!(instructions.pop(), Some(predicate));
+        instructions.insert(0, predicate);
+
+        let mut call = data(Opcode::Call, vec![operand]);
+        call.aux = AuxData::CallTarget(0);
+        call.flags = InstFlags {
+            call: true,
+            effectful: true,
+            safepoint: true,
+            ..Default::default()
+        };
+        let (call, _) = x.f.push_inst(x.tail, call, &[]);
+        let instructions = &mut x.f.block_mut(x.tail).insts;
+        assert_eq!(instructions.pop(), Some(call));
+        instructions.insert(0, call);
+        crate::t2::verify::verify(&x.f).unwrap();
+
+        assert_eq!(hoist_invariant_bounds(&mut x.f), 0);
+        assert!(x.f.block(x.header).insts.contains(&predicate));
+        assert!(x.f.block(x.bound_block).insts.contains(&x.add));
+        assert!(x.f.block(x.bound_block).insts.contains(&x.min));
+        assert!(x.f.block(x.tail).insts.contains(&call));
+        crate::t2::verify::verify(&x.f).unwrap();
+    }
+
+    #[test]
+    fn type_check_stops_prefix_before_later_numeric_bounds() {
+        mutable_predicate_stops_bound_prefix(Opcode::TypeCheck);
+    }
+
+    #[test]
+    fn instance_of_stops_prefix_before_later_numeric_bounds() {
+        mutable_predicate_stops_bound_prefix(Opcode::InstanceOf);
+    }
+
+    #[test]
+    fn body_only_bound_is_not_evaluated_on_a_zero_trip() {
+        let mut x = fixture();
+        // A branch before the bound means that bound need never execute.
+        let head_term = x.f.terminator(x.header).unwrap();
+        let exit = x.f.make_block();
+        x.f.set_terminator(exit, data(Opcode::Return, vec![x.index]));
+        let d = x.f.inst_mut(head_term);
+        d.opcode = Opcode::Brif;
+        d.args = vec![x.index];
+        d.targets.push(BlockCall {
+            block: exit,
+            args: vec![],
+        });
+        assert_eq!(hoist_invariant_bounds(&mut x.f), 0);
+        assert!(x.f.block(x.bound_block).insts.contains(&x.add));
+        crate::t2::verify::verify(&x.f).unwrap();
+    }
+
+    #[test]
+    fn loop_varying_operand_and_unavailable_recovery_value_are_not_hoisted() {
+        for recovery_only in [false, true] {
+            let mut x = fixture();
+            if recovery_only {
+                let fs = x.f.inst(x.add).frame_state.unwrap();
+                // A pure variant value is valid at the old continuation but
+                // cannot be reconstructed before the first header execution.
+                let (opaque_inst, opaque) = x.f.push_inst(
+                    x.bound_block,
+                    data(Opcode::GenericEq, vec![x.index, x.index]),
+                    &[(
+                        IRType::of(TypeBits::SYMBOL.join(TypeBits::NULL)),
+                        Repr::Tagged,
+                    )],
+                );
+                let list = &mut x.f.block_mut(x.bound_block).insts;
+                assert_eq!(list.pop(), Some(opaque_inst));
+                let at = list.iter().position(|&inst| inst == x.add).unwrap();
+                list.insert(at, opaque_inst);
+                x.f.frame_states.get_mut(fs).scopes[0]
+                    .stack
+                    .push(ValueSource::Value {
+                        value: opaque[0],
+                        repr: Repr::Tagged,
+                    });
+                crate::t2::verify::verify(&x.f).unwrap();
+            } else {
+                x.f.inst_mut(x.add).args[0] = x.index;
+            }
+            assert_eq!(hoist_invariant_bounds(&mut x.f), 0);
+            assert!(x.f.block(x.bound_block).insts.contains(&x.add));
+        }
+    }
+
+    #[test]
+    fn direct_or_nested_osr_bypass_preserves_original_computations() {
+        for nested in [false, true] {
+            let mut x = fixture();
+            let target = if nested { x.tail } else { x.header };
+            let fs = state(&mut x.f, 10, &[x.index], &[]);
+            x.f.osr_entries.push(OsrEntry {
+                control_scopes: vec![],
+                bcp: 10,
+                block: target,
+                frame_state: fs,
+                checks: vec![],
+            });
+            assert_eq!(hoist_invariant_bounds(&mut x.f), 0);
+            assert!(x.f.block(x.bound_block).insts.contains(&x.add));
+        }
+    }
+
+    #[test]
+    fn recovery_rematerialization_sources_use_preheader_arguments() {
+        let mut x = fixture();
+        let fs = x.f.inst(x.add).frame_state.unwrap();
+        let source = ValueSource::Value {
+            value: x.index,
+            repr: Repr::Tagged,
+        };
+        let original = x.f.frame_states.get_mut(fs);
+        original.remat.push(RematRecipe {
+            op: RematOp::FixnumAdd,
+            inputs: vec![source.clone(), source],
+            result_repr: Repr::Tagged,
+        });
+        original.scopes[0]
+            .locals
+            .push(ValueSource::Remat(RematRecipeId(0)));
+        assert_eq!(hoist_invariant_bounds(&mut x.f), 2);
+        let remat =
+            &x.f.frame_states
+                .get(x.f.inst(x.add).frame_state.unwrap())
+                .remat[0];
+        assert!(remat.inputs.iter().all(|source| matches!(source,
+            ValueSource::Value { value, .. } if *value == x.entry_index)));
+        crate::t2::verify::verify(&x.f).unwrap();
     }
 }

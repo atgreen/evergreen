@@ -22,6 +22,10 @@
   fast path while preserving option handling and numeric initialization
   ([#686](https://github.com/atgreen/evergreen/pull/686)).
 
+- T2 can compute eligible invariant loop-bound arithmetic once while preserving
+  first-entry deoptimization, observable effects, and generic OSR paths
+  ([#690](https://github.com/atgreen/evergreen/pull/690)).
+
 - References to established constants can compile as literal values. T2 also
   folds fixnum constants in cached bytecode using metadata captured before
   background compilation, avoiding repeated global lookups
