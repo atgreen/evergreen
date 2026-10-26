@@ -129,7 +129,18 @@ and provides generation. The native binary retains automatic ELF dependencies.
 
 Builds and image probes run through `scripts/egcl-limited.sh`; a working user
 systemd session is required. `CARGO_BUILD_JOBS`, `EGCL_MEM_MAX`, and
-`EGCL_TIMEOUT` control resource limits. The builder does not use PGO.
+`EGCL_TIMEOUT` control resource limits. Native glibc and host-static musl runtimes
+use PGO: each gets a fresh instrumented build, checked training runs, and a
+profile-use rebuild before stripping and image dumping. Cross runtimes use
+ordinary release builds. Native PGO defaults to a 7200-second limit for both
+compiler passes and training; other commands default to 1800 seconds.
+
+Native builds require `llvm-profdata` matching rustc's LLVM version. Install it
+with `rustup component add llvm-tools-preview` for the selected toolchain, or
+set `LLVM_PROFDATA` to a matching executable. Release builders install the
+component before the offline RPM build. Missing tools, training failures, or
+incompatible profiles fail the build rather than falling back to non-PGO.
+Profiles and compiler/training logs remain under `target/fedora-rpm/pgo/`.
 
 RPMs appear in `target/fedora-rpm/RPMS/<arch>/` — `x86_64` on an Intel build
 host, `ppc64le` on a POWER one. The builder checks each staged

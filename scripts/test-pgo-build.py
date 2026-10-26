@@ -31,7 +31,7 @@ def fail(stage):
         sys.exit(42)
 if name == "rustc":
     if args == ["-vV"]:
-        print("host: x86_64-unknown-linux-gnu\nLLVM version: 21.1.8")
+        print("host: " + env.get("PGO_TEST_HOST", "x86_64-unknown-linux-gnu") + "\nLLVM version: 21.1.8")
     else:
         print(env["PGO_TEST_SYSROOT"])
 elif name == "llvm-profdata":
@@ -103,9 +103,9 @@ class PgoBuildTests(unittest.TestCase):
             PGO_TEST_LOG=str(self.log), PGO_TEST_SYSROOT=str(self.work / "sysroot"),
         )
 
-    def run_build(self, **overrides):
+    def run_build(self, *args, **overrides):
         return subprocess.run(
-            ["bash", str(ROOT / "scripts/build-pgo-image.sh")], cwd=ROOT,
+            ["bash", str(ROOT / "scripts/build-pgo-image.sh"), *args], cwd=ROOT,
             env=dict(self.env, **overrides), text=True, capture_output=True,
         )
 
@@ -126,6 +126,37 @@ class PgoBuildTests(unittest.TestCase):
         self.assertIn("-Cprofile-generate=", builds[0]["flags"])
         self.assertIn("-Cprofile-use=", builds[1]["flags"])
         self.assertNotEqual(self.image.read_bytes(), b"previous image")
+
+    def test_raw_runtime_preserves_features_without_dumping_image(self):
+        runtime = self.work / "rpm runtime" / "egcl"
+        result = self.run_build("--features", "egcl-rt/c-ffi",
+                                EGCL_PGO_TARGET="x86_64-unknown-linux-gnu",
+                                EGCL_PGO_RUNTIME_OUT=str(runtime))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(runtime.is_file())
+        self.assertTrue(os.access(runtime, os.X_OK))
+        self.assertEqual(self.image.read_bytes(), b"previous image")
+        commands = self.commands()
+        builds = [c for c in commands if c["name"] == "cargo"]
+        self.assertEqual(len(builds), 2)
+        for build in builds:
+            self.assertEqual(build["args"][-2:], ["--features", "egcl-rt/c-ffi"])
+        self.assertFalse(any("scripts/build-image.lisp" in c["args"] for c in commands))
+
+    def test_failed_raw_runtime_build_preserves_previous_runtime(self):
+        runtime = self.work / "egcl-runtime"
+        runtime.write_bytes(b"previous runtime")
+        for phase in ("generate", "load", "merge", "use", "profile-warning"):
+            with self.subTest(phase=phase):
+                result = self.run_build(EGCL_PGO_RUNTIME_OUT=str(runtime), PGO_TEST_FAIL=phase)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(runtime.read_bytes(), b"previous runtime")
+                self.assertEqual(self.image.read_bytes(), b"previous image")
+
+    def test_native_power_musl_training_is_allowed(self):
+        result = self.run_build(PGO_TEST_HOST="powerpc64le-unknown-linux-gnu",
+                                EGCL_PGO_TARGET="powerpc64le-unknown-linux-musl")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_make_image_failure_does_not_fall_back_or_replace_image(self):
         result = self.run_make("image", PGO_TEST_LLVM="23.1.1")

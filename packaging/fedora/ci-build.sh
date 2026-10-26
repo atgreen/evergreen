@@ -96,6 +96,10 @@ OCICL_REPO
         ;;
     binary)
         srpm=${3:?Expected the shared SRPM path}
+        if [[ $group == native || $group == all ]]; then
+            # Installed before the offline RPM build, and matched to pinned rustc.
+            rustup component add llvm-tools-preview
+        fi
         triple_text=$(python3 - "$group" <<'PY'
 import runpy, sys
 builder = runpy.run_path('packaging/fedora/build.py')
