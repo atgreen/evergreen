@@ -768,3 +768,49 @@ fn raw_fixnum_math_executes_through_the_ordinary_native_abi() {
     execute(&f, 1, &[40 << 3, 0, 0, 0, 0, 0, 0], 41 << 3);
     execute(&f, 1, &[(-43i64 << 3) as u64, 0, 0, 0, 0, 0, 0], (-42i64 << 3) as u64);
 }
+
+#[test]
+fn ordinary_guarded_min_max_execute_signed_fixnum_selection() {
+    for opcode in [Opcode::FixnumMin, Opcode::FixnumMax] {
+        let mut f = Function::new("ordinary-guarded-fixnum-selection");
+        let entry = f.entry();
+        let x = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+        let y = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+        let mut select = instruction(opcode, vec![x, y], AuxData::None);
+        select.flags = InstFlags { guard: true, effectful: true, ..Default::default() };
+        select.frame_state = Some(state(&mut f, x, &[x, y], 0));
+        let result = value(&mut f, entry, select);
+        f.set_terminator(entry, instruction(Opcode::Return, vec![result], AuxData::None));
+        for (left, right) in [(9i64, 3i64), (-9, -3), (-3, 9), (7, 7),
+            (egcl_rt::bignum::FIXNUM_MIN, egcl_rt::bignum::FIXNUM_MAX)] {
+            for (x, y) in [(left, right), (right, left)] {
+                let expected = if opcode == Opcode::FixnumMin { x.min(y) } else { x.max(y) };
+                execute(&f, 2, &[(x << 3) as u64, (y << 3) as u64, 0, 0, 0, 0, 0], (expected << 3) as u64);
+            }
+        }
+    }
+}
+
+#[test]
+fn ordinary_packed_double_read_executes_raw_load_with_tagged_return_boundary() {
+    let mut f = Function::new("ordinary-packed-read");
+    let entry = f.entry();
+    let array = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+    let index = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+    let recovery = state(&mut f, array, &[array, index], 0);
+    let mut load = instruction(Opcode::PackedF64Ref, vec![array, index], AuxData::None);
+    load.flags = InstFlags { guard: true, effectful: true, ..Default::default() };
+    load.frame_state = Some(recovery);
+    let raw = f.push_inst(entry, load, &[(IRType::of(TypeBits::DOUBLE_FLOAT), ValueRepresentation::UnboxedF64)]).1[0];
+    let constant = f.push_inst(entry, instruction(Opcode::ConstDouble, vec![], AuxData::DoubleImm(1.25f64.to_bits())),
+        &[(IRType::of(TypeBits::DOUBLE_FLOAT), ValueRepresentation::UnboxedF64)]).1[0];
+    let mut compare = instruction(Opcode::FloatCmpEq, vec![raw, constant], AuxData::None);
+    compare.flags = InstFlags { guard: true, effectful: true, ..Default::default() };
+    compare.frame_state = Some(recovery);
+    let result = f.push_inst(entry, compare, &[(IRType::of(TypeBits::SYMBOL.join(TypeBits::NULL)), ValueRepresentation::Tagged)]).1[0];
+    f.set_terminator(entry, instruction(Opcode::Return, vec![result], AuxData::None));
+    egcl_rt::rooted!(packed = egcl_rt::packed_f64::make(2, 1.25).unwrap());
+    execute(&f, 2, &[packed.0, 0, 0, 0, 0, 0, 0], egcl_rt::value::T.0);
+    assert!(egcl_rt::packed_f64::set(*packed, 1, 2.5));
+    execute(&f, 2, &[packed.0, 1 << 3, 0, 0, 0, 0, 0], NIL.0);
+}
