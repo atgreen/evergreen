@@ -589,6 +589,9 @@ pub struct OsrEntry {
 /// A block-based SSA function.
 #[derive(Clone, Debug)]
 pub struct Function {
+    /// Immutable double payloads captured before the compiler releases its GC gate.
+    /// Keys are rooted pool-slot addresses, never dereferenced by optimization.
+    pub(crate) double_literals: std::collections::HashMap<usize, u64>,
     blocks: Vec<BlockData>,
     insts: Vec<InstData>,
     values: Vec<ValueData>,
@@ -634,6 +637,7 @@ impl Function {
     /// the builder adds the function parameters as entry-block parameters).
     pub fn new(name: impl Into<String>) -> Function {
         let mut f = Function {
+            double_literals: std::collections::HashMap::new(),
             blocks: Vec::new(),
             insts: Vec::new(),
             values: Vec::new(),
@@ -1056,6 +1060,8 @@ impl Function {
         if callee_entry_params.len() != call_data.args.len() {
             return Err("callee entry arity does not match call");
         }
+
+        self.double_literals.extend(callee.double_literals.iter().map(|(&slot, &bits)| (slot, bits)));
 
         // Split after the call. The old instruction remains in the arena but is
         // no longer in block layout, exactly like other dead IR instructions.

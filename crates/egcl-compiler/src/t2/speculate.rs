@@ -379,8 +379,8 @@ fn statically_proven_spec_type(f: &Function, args: &[crate::t2::ir::Value]) -> O
 
 /// The IEEE bits of `value` when it is a compile-time double-float operand: a
 /// `ConstDouble`, or a `ConstHeapObj` whose literal is a double. The literal is
-/// read through its rooted pool slot; T2 compilation runs GC-stable, so the
-/// object cannot move or be collected while it is read here.
+/// described by the builder's immutable snapshot. Optimization never reads
+/// the rooted pool slot or the movable boxed object.
 pub(crate) fn double_literal_bits(f: &Function, value: Value) -> Option<u64> {
     let crate::t2::ir::ValueDef::Result { inst, .. } = f.value(value).def else {
         return None;
@@ -391,10 +391,7 @@ pub(crate) fn double_literal_bits(f: &Function, value: Value) -> Option<u64> {
         (Opcode::ConstHeapObj, AuxData::HeapLiteral { slot })
             if f.value(value).ty.bits == TypeBits::DOUBLE_FLOAT =>
         {
-            // SAFETY: the builder types a heap literal DOUBLE_FLOAT only after
-            // reading a double through this same live constant-pool slot.
-            let literal = unsafe { *(*slot as *const egcl_rt::value::EgclVal) };
-            literal.is_double_float().then(|| literal.as_double_float().to_bits())
+            f.double_literals.get(slot).copied()
         }
         _ => None,
     }
