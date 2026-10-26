@@ -5954,6 +5954,45 @@ fn package_errors_are_correctable() {
                (delete-package \"PE-NO~SUCH\"))",
             "NIL",
         ),
+        // A MAKE-PACKAGE nickname that already names a package is correctable
+        // too, and continuing leaves that nickname off (make-package.error.3-4).
+        (
+            "(progn (make-package \"PE-F\" :use nil) \
+               (non-abort-restart-p (make-package \"PE-G\" :nicknames '(\"PE-F\"))))",
+            "SUCCESS",
+        ),
+        (
+            "(progn (make-package \"PE-H\" :use nil) \
+               (handler-bind ((error (lambda (c) (declare (ignore c)) (continue)))) \
+                 (package-nicknames (make-package \"PE-I\" :nicknames '(\"PE-H\")))))",
+            "NIL",
+        ),
+        // DEFPACKAGE importing a name its package lacks (defpackage.24-25).
+        (
+            "(progn (defpackage \"PE-J\" (:use)) \
+               (non-abort-restart-p (defpackage \"PE-K\" (:import-from \"PE-J\" \"NOT-THERE\"))))",
+            "SUCCESS",
+        ),
+        (
+            "(progn (defpackage \"PE-J2\" (:use)) \
+               (non-abort-restart-p (defpackage \"PE-K2\" (:shadowing-import-from \"PE-J2\" \"NOT-THERE\"))))",
+            "SUCCESS",
+        ),
+        // IMPORT of a symbol distinct from a present same-named one
+        // (import.error.4-5); continuing leaves the present symbol in place.
+        (
+            "(progn (make-package \"PE-L\" :use nil) (intern \"FOO\" \"PE-L\") \
+               (non-abort-restart-p (import 'foo \"PE-L\")))",
+            "SUCCESS",
+        ),
+        (
+            "(progn (make-package \"PE-M\" :use nil) \
+               (let ((own (intern \"FOO\" \"PE-M\"))) \
+                 (handler-bind ((error (lambda (c) (declare (ignore c)) (continue)))) \
+                   (import 'foo \"PE-M\")) \
+                 (eq own (find-symbol \"FOO\" \"PE-M\"))))",
+            "T",
+        ),
     ];
     for (expr, expected) in cases {
         let program = format!("(progn {helper} (cl:format t \"~S\" {expr}))");

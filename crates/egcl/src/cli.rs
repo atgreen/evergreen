@@ -21652,23 +21652,32 @@ fn export_import_values(
             egcl_stdlib::shadowing_import(&syms, pkg)?;
         } else {
             // Name-conflict check (CLHS IMPORT; ansi
-            // IMPORT.ERROR.3): importing a symbol DISTINCT from a
-            // same-named symbol already PRESENT in the package is
-            // a PACKAGE-ERROR (SHADOWING-IMPORT is the resolving
-            // variant and takes the branch above).
-            if !export_mode {
-                for (name, sym) in &resolved {
-                    if let Some(existing) = egcl_stdlib::find_present_symbol(pkg, name) {
-                        if existing != *sym {
-                            return Err(EgclError::PackageError(format!(
-                                "importing {name} into {pkg_name} conflicts with \
-                                 a distinct present {name}"
-                            )));
-                        }
-                    }
-                }
-            }
+            // IMPORT.ERROR.3-5): importing a symbol DISTINCT from a
+            // same-named symbol already PRESENT in the package is a
+            // correctable PACKAGE-ERROR, and CONTINUE leaves that symbol
+            // out (SHADOWING-IMPORT is the resolving variant and takes the
+            // branch above). A handler runs Lisp, so the package is looked
+            // up again after each signal.
+            let mut kept = Vec::with_capacity(resolved.len());
             for (name, sym) in resolved {
+                let conflict = !export_mode
+                    && egcl_stdlib::find_package(&pkg_name)
+                        .and_then(|pkg| egcl_stdlib::find_present_symbol(pkg, &name))
+                        .is_some_and(|existing| existing != sym);
+                if conflict {
+                    signal_correctable_package_error(
+                        package_object(&pkg_name),
+                        &format!("importing {name} into {pkg_name} conflicts with a distinct present {name}"),
+                        env,
+                    )?;
+                    continue;
+                }
+                kept.push((name, sym));
+            }
+            let Some(pkg) = egcl_stdlib::find_package(&pkg_name) else {
+                return Ok(T);
+            };
+            for (name, sym) in kept {
                 let _ = egcl_stdlib::add_symbol(pkg, &name, sym, export_mode);
                 // IMPORT of an UNINTERNED symbol also sets its home
                 // package (CLHS IMPORT; ansi IMPORT.5): the symbol
@@ -45922,6 +45931,20 @@ fn eval_defpackage(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 return Err(EgclError::PackageError(format!(
                     "DEFPACKAGE: there is no package named {from} to import from"
                 )));
+            }
+        }
+        // A name :IMPORT-FROM or :SHADOWING-IMPORT-FROM does not find in
+        // its package is a correctable PACKAGE-ERROR (CLHS DEFPACKAGE; ansi
+        // defpackage.24-25); CONTINUE leaves that name out.
+        let mut i = import_from.len();
+        while i > 0 {
+            i -= 1;
+            let (from, name, _) = &import_from[i];
+            if find_symbol_in_package(env, from, name).is_none() {
+                let message = format!("DEFPACKAGE: no symbol named {name} in package {from}");
+                let source = package_object(&resolve_package_name(env, from));
+                signal_correctable_package_error(source, &message, env)?;
+                import_from.remove(i);
             }
         }
         let mut imported = std::collections::HashMap::new();
