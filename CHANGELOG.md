@@ -18,6 +18,11 @@
 
 ### Performance
 
+- References to established constants can compile as literal values. T2 also
+  folds fixnum constants in cached bytecode using metadata captured before
+  background compilation, avoiding repeated global lookups
+  ([#678](https://github.com/atgreen/evergreen/pull/678)).
+
 - T2 can store fixnums directly into simple vectors when the overwritten value
   is also a fixnum, preserving the GC barrier for reference stores
   ([#673](https://github.com/atgreen/evergreen/pull/673)).
