@@ -11384,17 +11384,16 @@ fn bbu_package_designator(value: EgclVal) -> Option<String> {
 /// load actions. Options that the tree-walker currently treats as metadata or
 /// no-ops remain harmless; options requiring symbol import/re-export identity
 /// are rejected until their dedicated action encoding lands.
-fn bbu_package_plan(form: EgclVal) -> Result<Option<BbuPackagePlan>, EgclError> {
+fn bbu_package_plan(form: EgclVal, env: &Env) -> Result<Option<BbuPackagePlan>, EgclError> {
     if !form.is_cons() {
         return Ok(None);
     }
     let (op, rest) = cp(form);
-    if !op.is_symbol()
-        || !matches!(
-            sym_bare_name_rc(op).as_ref(),
-            "DEFPACKAGE" | "DEFINE-PACKAGE"
-        )
-    {
+    let defpackage = op.is_symbol()
+        && egcl_stdlib::find_package("COMMON-LISP").is_some_and(|package| {
+            egcl_stdlib::find_present_symbol(package, "DEFPACKAGE") == Some(op)
+        });
+    if !defpackage && !super::bootstrap_define_package_operator(op, env) {
         return Ok(None);
     }
     if !rest.is_cons() {
@@ -11536,7 +11535,7 @@ pub fn build_bbu_from_forms(
         // whose options the portable planner doesn't cover (e.g. :import-from)
         // yields Err here — treat that as "not portably compilable" and fall
         // through to the load-source fallback rather than failing the file.
-        if let Ok(Some(plan)) = bbu_package_plan(form) {
+        if let Ok(Some(plan)) = bbu_package_plan(form, env) {
             let package_ref = pool.package(&plan.name, &plan.nicknames);
             let use_refs = plan
                 .uses

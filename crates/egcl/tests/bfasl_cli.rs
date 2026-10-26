@@ -2774,6 +2774,97 @@ fn compile_file_prepass_handles_eval_when_and_read_time_constants() {
 }
 
 #[test]
+fn compile_file_expands_package_local_define_package_macros() {
+    let dir = workdir("user-define-package");
+    let macros = dir.join("macros.lisp");
+    fs::write(
+        &macros,
+        "(defpackage :mk (:use :common-lisp) (:export #:define-package #:make-package-cl))
+         (in-package :mk)
+         (defmacro define-package (name &rest body)
+           `(defpackage ,name (:use :common-lisp) ,@body))
+         (defmacro make-package-cl (name &rest body)
+           `(defpackage ,name (:use :common-lisp) ,@body))",
+    )
+    .unwrap();
+    for (operator, package) in [("define-package", "p1"), ("make-package-cl", "p2")] {
+        let src = dir.join(format!("{package}.lisp"));
+        let out = dir.join(format!("{package}.bfasl"));
+        fs::write(&src, format!(
+            "(mk:{operator} :{package} (:export #:twice))\n(in-package :{package})\n(defun twice (x) (* 2 x))\n"
+        )).unwrap();
+        let compiled = run(&format!(
+            "(progn (load \"{}\") (compile-file \"{}\" \"{}\"))",
+            macros.display(),
+            src.display(),
+            out.display()
+        ));
+        assert!(
+            compiled.status.success(),
+            "{operator}: stdout={} stderr={}",
+            String::from_utf8_lossy(&compiled.stdout),
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        fs::remove_file(&src).unwrap();
+        let loaded = run(&format!(
+            "(progn (load \"{}\") (eval (read-from-string \"({package}:twice 21)\")))",
+            out.display()
+        ));
+        assert!(
+            loaded.status.success(),
+            "{operator}: stdout={} stderr={}",
+            String::from_utf8_lossy(&loaded.stdout),
+            String::from_utf8_lossy(&loaded.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&loaded.stdout).trim(), "42");
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn compile_file_does_not_hide_bootstrap_named_macro_expansion_errors() {
+    let dir = workdir("define-package-expansion-error");
+    let src = dir.join("bad.lisp");
+    let out = dir.join("bad.bfasl");
+    fs::write(&src, "(define-package :bad652)\n").unwrap();
+    let compiled = run(&format!(
+        r#"(progn
+             (defmacro define-package (name)
+               (declare (ignore name)) (error "package macro failed"))
+             (multiple-value-bind (path warnings-p failure-p)
+                 (compile-file "{}" "{}")
+               (declare (ignore path)) (list warnings-p failure-p)))"#,
+        src.display(),
+        out.display()
+    ));
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&compiled.stdout).lines().last(),
+        Some("(T T)")
+    );
+    fs::remove_file(&src).unwrap();
+    let loaded = run(&format!(
+        r#"(list (handler-case (load "{}") (program-error () :caught))
+                 (not (find-package "BAD652")))"#,
+        out.display()
+    ));
+    assert!(
+        loaded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&loaded.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&loaded.stdout).trim(),
+        "(:CAUGHT T)"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn compile_file_round_trips_define_package_without_source() {
     let dir = workdir("define-package");
     let src = dir.join("p.lisp");
