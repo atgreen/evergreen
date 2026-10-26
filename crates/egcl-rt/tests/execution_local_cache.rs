@@ -33,6 +33,11 @@ fn migrating_fiber() -> EgclVal {
         for _ in 0..200 {
             assert_eq!(value.0.get(), identity);
             fiber_yield().unwrap();
+            assert_eq!(
+                current_fiber_id().map(|id| id.0),
+                Some(identity),
+                "the execution identity must be read from the resumed carrier"
+            );
             let next = current_thread_id();
             if next != carrier {
                 MIGRATIONS.fetch_add(1, Ordering::Relaxed);
