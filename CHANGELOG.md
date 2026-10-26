@@ -267,6 +267,11 @@
   permit that `signal-semaphore` was about to hand to a waiting fiber; both
   then had it and the semaphore's count went negative
   ([#648](https://github.com/atgreen/evergreen/pull/648)).
+- `*print-level*` and `*print-length*` apply to multidimensional arrays, each
+  axis counting as a list level, and the `prin1-to-string`/`format ~S` printer
+  applies them to vectors as `write-to-string` already did
+  ([#681](https://github.com/atgreen/evergreen/pull/681)).
+
 - A fiber's timed wait now has exactly one outcome when its timeout expires
   just as it is woken. Before, `condition-wait` with `:timeout` could return
   true for a fiber whose timeout had already ended the wait, although the
