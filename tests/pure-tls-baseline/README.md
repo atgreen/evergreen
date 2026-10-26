@@ -8,8 +8,8 @@ sources. Compatibility changes belong in the pinned atgreen fork.
 Tracking: `bliss-gxv10`.
 
 This is a **failure baseline**, not a claim that pure-tls passes on EGCL.
-The initial full run exposed failures in four main suites and OpenSSL-related
-coverage; retain the actual final logs and summaries when comparing revisions.
+The initial full run exposed handshake, cancellation, and OpenSSL-related
+failures; retain the actual final logs and summaries when comparing revisions.
 No final counts or timings are asserted by this harness. A failed suite or load
 must remain a failed process exit; a timeout or memory-cap termination is not a
 passing test. Do not compare failed-run timings as passing performance results.
@@ -21,8 +21,12 @@ directory, fetch the committed collection before starting the measurement:
 
 ```sh
 ocicl install
+mkdir -p runtime
+cp "${OCICL_RUNTIME:-${XDG_DATA_HOME:-$HOME/.local/share}/ocicl/ocicl-runtime.lisp}" runtime/
 ```
 
+If your runtime needs its bundled ASDF upgrade, copy the adjacent `asdf.lisp`
+into `runtime/` too. The runner records the runtime file's hash.
 The installation must provide `ocicl/` and `runtime/ocicl-runtime.lisp` alongside
 the unchanged lock. Installation can use the network; the test process disables
 ocicl downloads and enables local-only resolution. No library source override is
@@ -61,9 +65,11 @@ checks; timing markers alone are insufficient.
 The main entrypoint runs 13 suites: crypto, ML-DSA, record, handshake, certificate,
 cancellation, cancellation integration, OpenSSL adaptations, BoringSSL patterns,
 X509test validation, security regression, trust store, and resumption interop.
-BoringSSL **pattern** tests are included. External BoringSSL tooling/corpus,
-external ACME integration, and the separate network-dependent entrypoint are not
-run. Individual main-suite skips remain visible in the FiveAM summaries.
+BoringSSL **pattern** tests are included. The separate ACME suites, external
+BoringSSL tooling/corpus, and the network-dependent entrypoint are not run.
+The main runner itself includes one GitHub connection probe, local sockets,
+threads, and OpenSSL subprocesses. Its wall time includes fixed sleeps and
+network effects. Individual skips remain visible in the FiveAM summaries.
 
 The default load phase forces `closer-mop` recompilation before loading
 `pure-tls/test`. A cold compile/load worked, but fresh cached loading failed with

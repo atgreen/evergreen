@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Run the pinned pure-tls main test entrypoint, preserving failures and timings."""
 import argparse
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
+import platform
 from pathlib import Path
 import re
 import shutil
@@ -59,16 +61,31 @@ def main():
         env['EGCL_BASELINE_CLOSER_SOURCE'] = str(args.closer_package_source.resolve(strict=True))
     command = [str(repo / 'scripts/egcl-limited.sh'), '/usr/bin/time', '-v', '-o',
                str(Path(str(prefix) + '.time')), str(binary), '--no-init', '--load', str(here / 'run-suite.lisp')]
+    inputs = {'executable_sha256': binary, 'manifest_sha256': lock,
+              'harness_sha256': here / 'run-suite.lisp',
+              'runner_sha256': Path(__file__), 'ocicl_runtime_sha256': runtime}
+    fingerprints = {name: sha256(path) for name, path in inputs.items()}
+    started_utc = datetime.now(timezone.utc).isoformat()
     started = time.monotonic()
     before = os.getloadavg()
     with Path(str(prefix) + '.log').open('w') as output:
         process = subprocess.run(command, cwd=work, env=env, stdout=output, stderr=subprocess.STDOUT)
     lines = Path(str(prefix) + '.log').read_text(errors='replace').splitlines()
+    completed_suites = [line.split()[1] for line in lines
+                        if line.startswith('BASELINE-SUITE-SECONDS ')]
+    completed = (len(completed_suites) == 13 and len(set(completed_suites)) == 13
+                 and any(line.startswith('BASELINE-TEST-SECONDS ') for line in lines)
+                 and any(line in ('BASELINE-RESULT T', 'BASELINE-RESULT NIL') for line in lines))
+    passed = process.returncode == 0 and completed and 'BASELINE-RESULT T' in lines
+    changed = [name for name, path in inputs.items() if sha256(path) != fingerprints[name]]
     result = dict(runtime_revision=args.runtime_revision, label=args.label, returncode=process.returncode,
+                  started_utc=started_utc, platform=platform.platform(), cpu_count=os.cpu_count(),
+                  inputs_changed_during_run=changed,
+                  entrypoint_completed=completed, completed_suites=completed_suites,
+                  suite_passed=passed,
                   wall_seconds=time.monotonic() - started, load_average_before=before,
                   load_average_after=os.getloadavg(), command=command,
-                  executable_sha256=sha256(binary), manifest_sha256=sha256(lock),
-                  harness_sha256=sha256(here / 'run-suite.lisp'), runner_sha256=sha256(Path(__file__)),
+                  **fingerprints,
                   repository_revision=subprocess.check_output(['git', '-C', str(repo), 'rev-parse', 'HEAD'], text=True).strip(),
                   environment_overrides={k: v for k, v in env.items() if k.startswith(('EGCL_', 'OCICL_')) or k == 'TMPDIR'},
                   limits=dict(memory=args.memory, swap='0', timeout_seconds=args.timeout),
@@ -76,6 +93,10 @@ def main():
                   fiveam_summaries=[line.strip() for line in lines if re.search(r'Did \d+ checks|Pass:|Skip:|Fail:', line)])
     Path(str(prefix) + '.json').write_text(json.dumps(result, indent=2) + '\n')
     print(json.dumps(result, indent=2))
+    if changed:
+        return 1
+    if process.returncode == 0 and not passed:
+        return 1
     return process.returncode if process.returncode >= 0 else 128 - process.returncode
 
 
