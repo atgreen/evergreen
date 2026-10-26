@@ -885,7 +885,11 @@
 ;; disagreed with (array-element-type (make-array 1 :element-type 'base-char)).
 (defun upgraded-array-element-type (type &optional environment)
   (declare (ignore environment))
-  (cond ((egcl-internal::%u8-element-type-p (%expand-type-spec type)) '(unsigned-byte 8))
+  ;; NIL, the empty type, upgrades to itself: the upgraded type must be a
+  ;; supertype of TYPE and a subtype of every upgrade of its supertypes, and
+  ;; only NIL is both (ansi arrays upgraded-array-element-type.nil.1).
+  (cond ((null type) nil)
+        ((egcl-internal::%u8-element-type-p (%expand-type-spec type)) '(unsigned-byte 8))
         ((member (if (consp type) (car type) type) '(double-float long-float)) 'double-float)
         ((eq type 'bit) 'bit)
         ((member type '(base-char standard-char)) 'base-char)
