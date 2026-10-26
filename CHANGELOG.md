@@ -24,6 +24,11 @@
   expansion and other compile-time Lisp effects stay in the requesting execution
   ([#662](https://github.com/atgreen/evergreen/pull/662)).
 
+- T2 now profiles integer shifts, bitwise operations and other numeric
+  operations, and retains feedback when a cold speculation fails. Keccak
+  extraction no longer repeatedly recompiles the same invalid fixnum guess
+  ([#663](https://github.com/atgreen/evergreen/pull/663)).
+
 - Local functions defined with `flet` or `labels` can now compile when they
   read or write enclosing lexical variables. Small helpers inline into their
   callers, including sibling `labels` functions, while shared mutation and

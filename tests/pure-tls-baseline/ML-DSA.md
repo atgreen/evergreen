@@ -182,3 +182,31 @@ checkout using the normal release profile. Toggle its environment variable in
 fresh processes against that same binary. Its recorded patch SHA256 is
 `2d9946ab461e0799d163f982748ccead78d3ce11c71e4adec33d9f67047e1c7e`.
 The patch is an experiment for this report, not a change to the default runtime.
+
+## Speculation feedback fix (PR #663)
+
+[PR #663](https://github.com/atgreen/evergreen/pull/663) addresses the repeated
+Keccak extraction cycle above. At runtime commit
+`4dad255a`, the same pinned deterministic roundtrip completed two rounds with
+correct verification, sizes and the reference signature hash. Deopts remained
+22→22; a separate two-round event run recorded exactly one T1 and one T2
+compilation of `KECCAK-STATE-EXTRACT-OUTPUT`, ending at T2. The direct helper
+probe passed all 40,800 byte checks with zero new deopts (previously 24).
+
+The fixed quiet run took 8.523 s and 7.470 s; the event run took 8.907 s and
+7.490 s. These follow-up observations are not paired statistical comparisons
+against the earlier 16.445 s reference, and loading remains separately timed.
+The new native regression reproduces 100 later deopts on the pre-fix binary
+and zero on the fixed binary, while both report T2 and produce correct bytes.
+
+The underlying guard was a fixnum check on the initial loaded lane, hoisted
+from ASH at bytecode106 to the inner-loop entrance at76. Unsigned64 inputs can
+be bignums even though shifting right8 yields an unsigned56 fixnum. ASH had
+no operand profile, and failed cold guesses remained absent profiles, so each
+replacement guessed fixnum again. Numeric profiling now covers the operations
+T2 specializes; failed installed cold guesses retain empty profiles that wait
+for actual evidence. Other profiled sites and static proofs remain eligible.
+
+[Follow-up evidence and hashes](speculation-feedback-2026-10-26.json) identify
+the saved binary, inputs and external logs. Unsigned lane range propagation,
+raw64 shifts and array representations remain future work in `bliss-imlh4`.
