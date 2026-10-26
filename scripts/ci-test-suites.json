@@ -10,10 +10,11 @@
     "egcl:test:loop_peeling": [""],
     "egcl:test:integer_extraction": [""],
     "egcl:test:raw_fixnum": [""],
+    "egcl:test:immediate_vector_stores": [""],
     "egcl-stdlib:test:integer_shifts": [""]
   },
   "areas": {
-    "compiler": {"egcl-compiler:lib:egcl_compiler": [""]},
+    "compiler": {"egcl-compiler:lib:egcl_compiler": [""], "egcl-compiler:test:native_vector_store": [""]},
     "runtime": {"egcl-rt:lib:egcl_rt": [""]},
     "reader": {"egcl-compiler:lib:egcl_compiler": ["reader::"]}
   }
