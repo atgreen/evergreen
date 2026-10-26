@@ -18025,14 +18025,14 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                 let registered_callee = bytecode_for_callable(sym, *function);
 
                 // Profile every call site's execution frequency.  Type details
-                // remain restricted to speculatable arithmetic sites. `bcp` was
+                // cover numeric operations specialized by T2. `bcp` was
                 // already advanced past this instruction, so the site is bcp-1.
                 let func_ptr = Arc::as_ptr(&acts[top_idx].func) as usize;
                 let call_bcp = acts[top_idx].bcp as u32 - 1;
                 if registered_callee.is_some() {
                     record_call_site(func_ptr, call_bcp);
                 }
-                if is_arith_speculatable(sym) || is_double_profiled_builtin(sym) {
+                if is_numeric_profiled_builtin(sym) {
                     record_type_profile(func_ptr, call_bcp, args);
                 }
 
@@ -21514,6 +21514,13 @@ fn decay_failed_speculation(
         TYPE_PROFILE.with(|profiles| {
             let mut profiles = profiles.borrow_mut();
             for &(bcp, kind) in &installed.speculations {
+                // A failed version must not leave its unobserved guesses cold:
+                // None guesses Fixnum again, whereas an empty profile waits for
+                // actual observations. Use speculation origins, not a recovery
+                // BCP which guard hoisting may have moved to a loop header.
+                if installed.cold_guesses.contains(&bcp) {
+                    profiles.entry((key, bcp)).or_default();
+                }
                 if let Some(profile) = profiles.get_mut(&(key, bcp)) {
                     match kind {
                         SpecType::Fixnum => profile.fixnum = 0,
@@ -25706,16 +25713,15 @@ fn memoized_by_sym<T: Copy>(
     value
 }
 
-/// `SQRT` and `/` record operand types only so T2 can compile a double site
-/// raw (bliss-lhy89). They have no fixnum fast path, so they stay out of
-/// `is_arith_speculatable` and the cold-guess bookkeeping that goes with it.
-fn is_double_profiled_builtin(sym: u32) -> bool {
-    memoized_by_sym(&DOUBLE_PROFILED_MEMO, sym, |sym| {
-        matches!(egcl_rt::symbols::symbol_name(sym).as_deref(), Some("SQRT" | "/"))
-    })
+/// Keep profiling in sync with T2's numeric operation classifiers. In
+/// particular ASH/bitwise/division/min/max can see both fixnums and bignums;
+/// the T1 fixnum fast-path whitelist alone does not cover them.
+fn is_numeric_profiled_builtin(sym: u32) -> bool {
+    memoized_by_sym(&NUMERIC_PROFILED_MEMO, sym,
+        egcl_compiler::t2::speculate::profiles_numeric_operands)
 }
 
-static DOUBLE_PROFILED_MEMO: egcl_rt::execution_local::ExecutionLocal<RefCell<Vec<Option<bool>>>> =
+static NUMERIC_PROFILED_MEMO: egcl_rt::execution_local::ExecutionLocal<RefCell<Vec<Option<bool>>>> =
     unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| const { RefCell::new(Vec::new()) }) };
 
 static FIXNUM_OP_MEMO: egcl_rt::execution_local::ExecutionLocal<
@@ -29683,6 +29689,60 @@ mod jtc4_stack_map_tests {
         assert_eq!(empty.total(), 0);
         assert_eq!(observed.fixnum, 0);
         assert_eq!(observed.single_float, 2, "retain the new phase's samples");
+    }
+
+    #[test]
+    fn installed_cold_speculation_waits_for_real_evidence_after_failure() {
+        let _lock = super::super::heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env_root = &mut env);
+        egcl_rt::rooted!(form = super::super::vec_to_list(&[NIL]));
+        let body = Arc::new(compile_function("COLD-INSTALLED", NIL, *form, &env, false, false).unwrap());
+        let key = Arc::as_ptr(&body) as usize;
+        clear_bytecode_profiles(key);
+        TYPE_PROFILE.with(|profiles| {
+            profiles.borrow_mut().insert((key, 2), TypeProfile {
+                fixnum: 20, bignum: 1, ..TypeProfile::default()
+            });
+            profiles.borrow_mut().insert((key, 3), TypeProfile {
+                fixnum: 20, ..TypeProfile::default()
+            });
+        });
+        let installed = T2InstalledMetadata {
+            speculations: vec![(1, SpecType::Fixnum), (2, SpecType::Fixnum)],
+            cold_guesses: vec![1, 4],
+            _roots: egcl_rt::CrossThreadRoot::new(T2InstalledBodies { bodies: vec![Arc::clone(&body)] }),
+            deopt_bodies: HashMap::new(),
+        };
+        let failed = decay_failed_speculation(&body, None, Some(&installed));
+        assert_eq!(failed, vec![(1, SpecType::Fixnum, true), (2, SpecType::Fixnum, false)]);
+        let cold = type_profile_at(key, 1).expect("retain failed cold guess");
+        assert_eq!(cold.total(), 0, "do not invent operand observations");
+        assert_eq!(cold.speculation(), None, "do not repeat without evidence");
+        assert_eq!(type_profile_at(key, 2).unwrap().bignum, 1);
+        assert_eq!(type_profile_at(key, 3).unwrap().speculation(), Some(SpecType::Fixnum));
+        assert!(type_profile_at(key, 4).is_none(), "a queried but unspecialized site is still cold");
+        record_type_profile(key, 1, &[EgclVal::from_fixnum(7)]);
+        assert_eq!(type_profile_at(key, 1).unwrap().speculation(), Some(SpecType::Fixnum),
+            "new evidence may justify specialization");
+        clear_bytecode_profiles(key);
+        assert!(type_profile_at(key, 1).is_none(), "definition retirement clears feedback");
+    }
+
+    #[test]
+    fn numeric_profile_candidates_include_integer_t2_operations() {
+        let _lock = super::super::heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env_root = &mut env);
+        for name in ["+", "-", "*", "<", ">", "<=", ">=", "=", "1+", "1-",
+            "LOGAND", "LOGIOR", "LOGXOR", "LOGNOT", "ASH", "MIN", "MAX",
+            "MOD", "REM", "FLOOR", "TRUNCATE", "SQRT", "/"]
+        {
+            let symbol = super::super::resolve_sym(name).unwrap().as_symbol_index();
+            assert!(is_numeric_profiled_builtin(symbol), "missing {name} operand profile");
+        }
+        let symbol = super::super::resolve_sym("CONS").unwrap().as_symbol_index();
+        assert!(!is_numeric_profiled_builtin(symbol));
     }
 
     #[test]

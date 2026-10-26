@@ -1,0 +1,70 @@
+{
+  "runtime_commit": "4dad255afc0c4628d0ab8c2cee6a69b709129ba3",
+  "pr": "https://github.com/atgreen/evergreen/pull/663",
+  "bead": "bliss-yuxa7",
+  "external_artifact_directory": "/home/green/orca/workspaces/evergreen/pure-tls-baseline/compare",
+  "binary_sha256": "40a747d90ae6db504a57192dbfbf3ef961c12125dde8e915c466df84afb56702",
+  "library_lock": "ocicl.csv",
+  "quiet_roundtrip_seconds": [
+    8.523,
+    7.47
+  ],
+  "event_roundtrip_seconds": [
+    8.907,
+    7.49
+  ],
+  "roundtrip_deopts": [
+    22,
+    22
+  ],
+  "keccak_compilations": {
+    "T1": 1,
+    "T2": 1
+  },
+  "helper_byte_checks": 40800,
+  "helper_deopts": [
+    22,
+    22
+  ],
+  "native_regression_steady_deopts": {
+    "before": 100,
+    "after": 0
+  },
+  "unit_tests_passed": 24,
+  "neighbor_tests_passed": 3,
+  "stress": {
+    "EGCL_GC_STRESS": "17",
+    "EGCL_GC_POISON": "1",
+    "EGCL_GC_STRESS_AFTER_INIT": "1"
+  },
+  "notes": [
+    "Exploratory timing observations, not paired statistical speedups.",
+    "Pre-fix native regression used saved diagnostic-only 7cc6fc07 binary with tracing disabled.",
+    "No new rooting fix claimed; stress output matches normal.",
+    "Runtime build command: cargo test --locked --release -p egcl --bin egcl --test speculation_feedback --test tier_observability --no-run -j2; default release profile.",
+    "Runtime runs capped by egcl-limited.sh; real library runs affinity8-11, 8G/600s, downloads disabled; TLS_COMPARE_CACHE points to baseline/cache."
+  ],
+  "external_file_sha256": {
+    "egcl-feedback-fixed": "40a747d90ae6db504a57192dbfbf3ef961c12125dde8e915c466df84afb56702",
+    "feedback-build.log": "1b76afc47fb7aae238eacd59b65b9e431dba6207e4554a04ff87fe591d50575f",
+    "feedback-unit-build.log": "5867f5c64a7623300eb55970425d7df7744e3f03bdf582af59f85c2cf60e01e1",
+    "feedback-unit-tests.log": "382cd913ec7d44a60bc8f5d0ed01b1d315b3143508820942ec950a94b19f32f5",
+    "feedback-regression.log": "8398ccdeeed25028e2102cb64c5a22e59c80c7f6d8ed2e13cbd6a3506c05ba25",
+    "feedback-bignum-neighbors.log": "8ce833f37e25be7121ae64fa5623df5c5eb4a0cc26504d4cd60ef331d393df6d",
+    "feedback-clippy.log": "8dc7df60d347d3a3e08d87ef27b4f9a294700aabb42ab028f72d64ef187c5093",
+    "feedback-root-lint.log": "d20e55f341ec10cd8176737847352386e6078d7c3d45909119a6734bd856520a",
+    "feedback-coverage.log": "cc0bf83006572bdef22e61a6189cf3673d802905a5dbd59f5529c4ce89efc7c7",
+    "feedback-ci-contract.log": "e898af9b3263095ee2dc520865bca77ba23629d56101be34f85572ada0f1a742",
+    "feedback-ci-plan.log": "d875e2dbe346a97a0fe07a7422e03663ecfd6508ee7277f5c3537a4847fa50a3",
+    "feedback-roundtrip.log": "49cb43766e27233967e4da40aafcaf134f41600b1b97cd1efc2cbbad46416702",
+    "feedback-events.log": "9a5e59297601207eed2283e7331facc217cff8fce5894ffef2b4a42eb15ccdc8",
+    "feedback-keccak-probe.log": "298a011a1b04c5fbc219214b7a41507c4dce0423bce6fc9790baaefdec243805",
+    "feedback-lane-stress.log": "8887a60e32b0598f21e2c2b1d65bbd1a868a05034d8372289c0c2e667cfe0810",
+    "lane-feedback-regression.lisp": "4b2f759c8ec7a5d571a8db036e71254ab061fd19d5e248b6a059a1f1edf34a49",
+    "lane-feedback-before.log": "f9985d5ad0096bf20ef60b15c17d9d33a70c570f588edaf80d651f08447b61c9",
+    "roundtrip-deopts.lisp": "a39cb974b0808bd7123fbd9442223bc26cac3b5d542afa1250c43bafc626a4be",
+    "roundtrip-feedback-events.lisp": "41621fe442628e493ba7ea882ac08122489381101a1502f35a333352761a8ddf",
+    "keccak-deopt-probe.lisp": "8a45a097f2f7419b92042aa67db6cb295bfd3db30152f45dabffd88391c3394f"
+  },
+  "pre_fix_binary_sha256": "f1a18bfce034058288eb11c4e64af25c91b069664f4d514890b4d70e48f4da8b"
+}

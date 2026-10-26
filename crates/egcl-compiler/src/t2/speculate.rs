@@ -283,6 +283,19 @@ fn cmp_of(sym: u32) -> Option<Cmp> {
     }
 }
 
+/// Numeric calls whose operands can inform T2 speculation. The interpreter
+/// uses this alongside the same operation classifiers as the rewrite below,
+/// including integer operations whose inputs may require bignums.
+pub fn profiles_numeric_operands(sym: u32) -> bool {
+    arith_of(sym).is_some()
+        || incdec_of(sym).is_some()
+        || cmp_of(sym).is_some()
+        || bitwise_of(sym).is_some()
+        || matches!(egcl_rt::symbols::symbol_name(sym).as_deref(),
+            Some("ASH" | "MIN" | "MAX" | "MOD" | "REM" | "FLOOR" | "TRUNCATE"
+                | "SQRT" | "/"))
+}
+
 /// The typed comparison opcode for `(kind, speculated-type)`. Fixnum supports all
 /// five on every backend. Single-float comparisons have an emitter only on
 /// x86-64 (bliss-9bw59); elsewhere keep their ordinary calls rather than
