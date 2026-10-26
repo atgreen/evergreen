@@ -39682,18 +39682,26 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 // evaluated every :initform and looked up two sets of :after
                 // methods -- none of which a structure has.
                 //
-                // The initarg is written explicitly as ((:slot slot) …) rather
+                // The initarg is written explicitly as ((:slot var) …) rather
                 // than relying on the slot symbol's own name, because the slot
                 // symbol lives in the defining package and its keyword must not
                 // depend on that.
+                //
+                // VAR is a fresh uninterned symbol, not the slot symbol: a slot
+                // may be named T or another constant, which cannot be bound
+                // (ansi struct-test-65), or a special variable, which binding
+                // would make every later slot's initform see the argument rather
+                // than the variable's value, though initforms are evaluated in
+                // the DEFSTRUCT's lexical environment (structure-60-1).
                 egcl_rt::rooted!(params = Vec::<EgclVal>::new());
                 egcl_rt::rooted!(call = vec![sym("EGCL::%MAKE-STRUCT"), quote(name_sym)]);
                 params.push(sym("&KEY"));
                 for slot in &slots {
                     egcl_rt::rooted!(dflt = slot.default);
-                    egcl_rt::rooted!(keyform = vec_to_list(&[slot.initarg, slot.slot_sym]));
+                    let var = reader::make_uninterned_symbol(&sym_bare_name_rc(slot.slot_sym));
+                    egcl_rt::rooted!(keyform = vec_to_list(&[slot.initarg, var]));
                     params.push(vec_to_list(&[*keyform, *dflt]));
-                    call.push(checked_struct_slot_form(slot.slot_sym, slot.slot_type));
+                    call.push(checked_struct_slot_form(var, slot.slot_type));
                 }
                 egcl_rt::rooted!(kw_lambda = vec_to_list(&params));
                 egcl_rt::rooted!(kw_body = vec_to_list(&call));

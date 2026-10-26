@@ -6739,6 +6739,33 @@ fn copy_structure_shallow_copies_instances() {
     );
 }
 
+/// DEFSTRUCT's keyword constructor binds a fresh variable per slot rather than
+/// the slot's own symbol: a slot may be named T or another constant, which
+/// cannot be bound (ansi struct-test-65), or a special variable, whose binding
+/// would leak into later slots' initforms (structure-60-1).
+#[test]
+fn defstruct_constructor_handles_constant_and_special_slot_names() {
+    let prog = "(progn \
+        (defvar *cs-v* 10) \
+        (defstruct cs-tp t pi most-positive-fixnum) \
+        (defstruct cs-sp (a *cs-v*) *cs-v* (b *cs-v*)) \
+        (format t \"CS=~s~%\" \
+          (list (let ((s (make-cs-tp :t 1 :pi 2 :most-positive-fixnum 3))) \
+                  (list (cs-tp-t s) (cs-tp-pi s) (cs-tp-most-positive-fixnum s))) \
+                (let ((s (make-cs-sp :*cs-v* 200))) \
+                  (list (cs-sp-a s) (cs-sp-*cs-v* s) (cs-sp-b s))))))";
+    let out = egcl_bin()
+        .args(["--eval", prog])
+        .output()
+        .expect("run egcl");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("CS=((1 2 3) (10 200 10))"),
+        "defstruct constructor slot variables; got: '{stdout}', stderr: '{}'",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// bliss-05hy: FLOOR/CEILING/TRUNCATE/ROUND/MOD/REM and EVENP/ODDP were computed
 /// via f64 (num_val + `as i64`), which overflows and loses precision on bignums
 /// (and large fixnums) — (floor (expt 2 70) 2) returned -1. They now use exact
