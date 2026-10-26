@@ -8,6 +8,7 @@
     "egcl:test:tier_corpus": [""],
     "egcl:test:speculation_feedback": [""],
     "egcl:test:loop_peeling": [""],
+    "egcl:test:loop_arithmetic_once": [""],
     "egcl:test:integer_extraction": [""],
     "egcl:test:make_array_fast_path_cli": [""],
     "egcl:test:constant_reference_folding": [""],

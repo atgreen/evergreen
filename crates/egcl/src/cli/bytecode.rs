@@ -5458,7 +5458,9 @@ impl<'e> Lowerer<'e> {
                             // so both tiers agree.
                             let ctr = fresh("CTR", &mut nsym)?;
                             bindings.push(form_list(&[ctr, start]));
-                            bindings.push(form_list(&[var, ctr]));
+                            // Bind the user variable only after all arithmetic
+                            // initial forms below: their scope sees the outer
+                            // variable, not this iteration's initial value.
                             let mut adv = 4;
                             // VAR is published at the top of the iteration — before
                             // the limit test below — so the iteration that ends the
@@ -5514,6 +5516,12 @@ impl<'e> Lowerer<'e> {
                                 );
                             if let Some((mut bound, cmp)) = limit {
                                 egcl_rt::rooted_ref!(_bound_root = &mut bound);
+                                let bound_var = fresh("BOUND", &mut nsym)?;
+                                // Arithmetic start, bound and step are evaluated
+                                // once, in source order, including zero-trip loops.
+                                // BOUND and STEP remain rooted while fresh/form_list
+                                // allocate the generated initial bindings.
+                                bindings.push(form_list(&[bound_var, bound]));
                                 // terminate when var passes the bound
                                 let test_cmp = if cmp == "<=" {
                                     ">"
@@ -5533,12 +5541,15 @@ impl<'e> Lowerer<'e> {
                                 // array, where the collector cannot see it. The
                                 // outer form_list roots its slice, but only
                                 // after every element has already been computed.
-                                let mut test_form = form_list(&[s(test_cmp)?, ctr, bound]);
+                                let mut test_form = form_list(&[s(test_cmp)?, ctr, bound_var]);
                                 egcl_rt::rooted_ref!(_test_form_root = &mut test_form);
                                 let mut go_form = form_list(&[s("GO")?, end]);
                                 egcl_rt::rooted_ref!(_go_form_root = &mut go_form);
                                 pre.push(form_list(&[s("WHEN")?, test_form, go_form]));
                             }
+                            let step_var = fresh("STEP", &mut nsym)?;
+                            bindings.push(form_list(&[step_var, step]));
+                            bindings.push(form_list(&[var, ctr]));
                             let op = if descending { "-" } else { "+" };
                             // Advance from VAR, not from CTR: a body that assigns
                             // to the loop variable moves the iteration with it
@@ -5552,7 +5563,7 @@ impl<'e> Lowerer<'e> {
                             steps.push(form_list(&[
                                 s("SETQ")?,
                                 ctr,
-                                form_list(&[s(op)?, var, step]),
+                                form_list(&[s(op)?, var, step_var]),
                             ]));
                             i += adv;
                         }
