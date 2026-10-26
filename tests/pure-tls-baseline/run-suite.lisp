@@ -1,0 +1,47 @@
+(require :asdf)
+(asdf:initialize-source-registry '(:source-registry :ignore-inherited-configuration))
+(asdf:initialize-output-translations
+ (list :output-translations
+       (list t (or (uiop:getenv "EGCL_BASELINE_CACHE")
+                   (error "EGCL_BASELINE_CACHE must be set by run-baseline.py")))
+       :ignore-inherited-configuration))
+(load (or (uiop:getenv "EGCL_BASELINE_RUNTIME")
+          (error "EGCL_BASELINE_RUNTIME must be set by run-baseline.py")))
+(setf ocicl-runtime:*download* nil ocicl-runtime:*local-only* t)
+(format t "BASELINE-IMPLEMENTATION ~S ~S~%" (lisp-implementation-type) (lisp-implementation-version))
+(defvar *baseline-load-start* (get-internal-real-time))
+(format t "BASELINE-LOAD-BEGIN~%")
+(finish-output)
+(let ((source (uiop:getenv "EGCL_BASELINE_CLOSER_SOURCE")))
+  (if source
+      (progn
+        (format t "BASELINE-SETUP-WORKAROUND CLOSER-MOP-PACKAGE-SOURCE~%")
+        (load source)
+        (asdf:load-system :closer-mop))
+      (progn
+        (format t "BASELINE-SETUP-WORKAROUND FORCE-CLOSER-MOP-REBUILD~%")
+        (asdf:load-system :closer-mop :force t))))
+(asdf:load-system :pure-tls/test)
+(format t "BASELINE-LOAD-SECONDS ~,6F~%"
+ (/ (- (get-internal-real-time) *baseline-load-start*) (float internal-time-units-per-second 1d0)))
+;; Observe the unchanged upstream RUN-TESTS entrypoint. One wrapper per suite
+;; records elapsed time after the original FiveAM RUN! has returned.
+(let ((original (fdefinition 'fiveam:run!)))
+  (setf (fdefinition 'fiveam:run!)
+        (lambda (&rest arguments)
+          (let ((start (get-internal-real-time)))
+            (format t "BASELINE-SUITE-BEGIN ~S~%" (first arguments))
+            (finish-output)
+            (multiple-value-prog1 (apply original arguments)
+              (format t "BASELINE-SUITE-SECONDS ~S ~,6F~%" (first arguments)
+                      (/ (- (get-internal-real-time) start)
+                         (float internal-time-units-per-second 1d0)))
+              (finish-output)))))
+  (let* ((start (get-internal-real-time))
+         (ok (pure-tls/test:run-tests))
+         (elapsed (/ (- (get-internal-real-time) start)
+                     (float internal-time-units-per-second 1d0))))
+    (format t "BASELINE-TEST-SECONDS ~,6F~%BASELINE-RESULT ~S~%" elapsed ok)
+    (finish-output)
+    (setf (fdefinition 'fiveam:run!) original)
+    (uiop:quit (if ok 0 1))))

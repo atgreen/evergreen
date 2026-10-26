@@ -1,0 +1,53 @@
+;;; SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+;;; SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
+(require :asdf)
+(asdf:initialize-source-registry '(:source-registry :ignore-inherited-configuration))
+(asdf:initialize-output-translations
+ (list :output-translations (list t (or (uiop:getenv "TLS_COMPARE_CACHE")
+                     (error "TLS_COMPARE_CACHE must name an isolated output cache"))) :ignore-inherited-configuration))
+(load (or (uiop:getenv "TLS_COMPARE_RUNTIME")
+          (error "TLS_COMPARE_RUNTIME must name the pinned ocicl runtime")))
+(setf ocicl-runtime:*download* nil ocicl-runtime:*local-only* t)
+(defparameter *load-start* (get-internal-real-time))
+(asdf:load-system :pure-tls)
+(format t "COMPARE-LOAD ~,6F~%" (/ (- (get-internal-real-time) *load-start*) (float internal-time-units-per-second 1d0)))
+(format t "COMPARE-IMPL ~S ~S~%" (lisp-implementation-type) (lisp-implementation-version))
+(format t "COMPARE-CRYPTO-FEATURES ~S~%" (intersection *features* '(:ironclad-egcl-primitives-64 :ironclad-assembly :ironclad-fast-mod64-arithmetic)))
+(defmacro measured-form (form)
+  (if (uiop:getenv "TLS_COMPARE_GC") `(time ,form) form))
+(defun run-roundtrip-case (round)
+  (let* ((seed (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x42))
+         (rnd (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x55))
+         (msg (pure-tls::string-to-octets "Hello, post-quantum world!"))
+         (wall0 (get-internal-real-time)) (cpu0 (get-internal-run-time)))
+    (multiple-value-bind (pk sk) (measured-form (pure-tls::ml-dsa-65-keygen seed))
+      (let* ((wall1 (get-internal-real-time)) (cpu1 (get-internal-run-time))
+             (sig (measured-form (pure-tls::ml-dsa-65-sign sk msg rnd)))
+             (wall2 (get-internal-real-time)) (cpu2 (get-internal-run-time))
+             (ok (measured-form (pure-tls::ml-dsa-65-verify pk msg sig)))
+             (wall3 (get-internal-real-time)) (cpu3 (get-internal-run-time)))
+        (assert ok) (assert (= 1952 (length pk))) (assert (= 4032 (length sk)))
+        (assert (= 3309 (length sig)))
+        (format t "COMPARE-ROUND ~D WALL ~{~,6F ~} CPU ~{~,6F ~} HASH ~A~%" round
+                (mapcar (lambda (n) (/ n (float internal-time-units-per-second 1d0)))
+                        (list (- wall1 wall0) (- wall2 wall1) (- wall3 wall2) (- wall3 wall0)))
+                (mapcar (lambda (n) (/ n (float internal-time-units-per-second 1d0)))
+                        (list (- cpu1 cpu0) (- cpu2 cpu1) (- cpu3 cpu2) (- cpu3 cpu0)))
+                (ironclad:byte-array-to-hex-string (ironclad:digest-sequence :sha256 sig)))
+        (finish-output)))))
+#+egcl (when (uiop:getenv "TLS_COMPARE_PIN_KECCAK") (egcl-ext:profile 'ironclad::keccak-state-extract-output))
+#+egcl (format t "COMPARE-DEOPTS-BEGIN ~S~%" (egcl-ext:deopt-count))
+(format t "COMPARE-READY~%") (finish-output)
+(dotimes (round (parse-integer (or (uiop:getenv "TLS_COMPARE_ROUNDS") "3")))
+  (run-roundtrip-case round)
+  #+egcl
+  (dolist (fn '(pure-tls::ml-dsa-65-keygen pure-tls::ml-dsa-65-sign pure-tls::ml-dsa-65-verify
+                pure-tls::ml-dsa-ntt! pure-tls::ml-dsa-intt! pure-tls::ml-dsa-poly-mul-ntt
+                pure-tls::sample-in-ball pure-tls::decode-poly-z pure-tls::expand-a))
+    (format t "COMPARE-TIER ~S ~S HEAT ~S BACKEDGES ~S OSR ~S~%" fn
+            (egcl-ext:function-tier fn) (egcl-ext:function-invoke-count fn)
+            (egcl-ext:function-back-edge-count fn) (egcl-ext:function-osr-count fn))))
+#+egcl (format t "COMPARE-DEOPTS-END ~S~%" (egcl-ext:deopt-count))
+(format t "COMPARE-COMPLETE~%") (finish-output)
+(uiop:quit 0)

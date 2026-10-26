@@ -1,0 +1,329 @@
+{
+  "status": "complete",
+  "sample_count": 1,
+  "suite_passed": false,
+  "scope": "pure-tls/test:run-tests (13 main suites)",
+  "suites": [
+    {
+      "name": "CRYPTO-TESTS",
+      "seconds": 17.33,
+      "checks": 50,
+      "passed": 50,
+      "skipped": 0,
+      "failed": 0,
+      "failing_tests": []
+    },
+    {
+      "name": "ML-DSA-TESTS",
+      "seconds": 265.002,
+      "checks": 69,
+      "passed": 69,
+      "skipped": 0,
+      "failed": 0,
+      "failing_tests": []
+    },
+    {
+      "name": "RECORD-TESTS",
+      "seconds": 60.766,
+      "checks": 48,
+      "passed": 48,
+      "skipped": 0,
+      "failed": 0,
+      "failing_tests": []
+    },
+    {
+      "name": "HANDSHAKE-TESTS",
+      "seconds": 37.301,
+      "checks": 90,
+      "passed": 88,
+      "skipped": 0,
+      "failed": 2,
+      "failing_tests": [
+        "ED448-SERVER-HANDSHAKE",
+        "ED25519-SERVER-HANDSHAKE"
+      ]
+    },
+    {
+      "name": "CERTIFICATE-TESTS",
+      "seconds": 5.082,
+      "checks": 58,
+      "passed": 58,
+      "skipped": 0,
+      "failed": 0,
+      "failing_tests": []
+    },
+    {
+      "name": "CANCEL-TESTS",
+      "seconds": 0.196,
+      "checks": 6,
+      "passed": 4,
+      "skipped": 0,
+      "failed": 2,
+      "failing_tests": [
+        "CHECK-CANCEL-CONTEXT-TLS-ERROR",
+        "TIMEOUT-BASIC"
+      ]
+    },
+    {
+      "name": "CANCEL-INTEGRATION-TESTS",
+      "seconds": 10.513,
+      "checks": 5,
+      "passed": 5,
+      "skipped": 0,
+      "failed": 0,
+      "failing_tests": []
+    },
+    {
+      "name": "OPENSSL-TESTS",
+      "seconds": 2187.608,
+      "checks": 37,
+      "passed": 28,
+      "skipped": 0,
+      "failed": 9,
+      "failing_tests": [
+        "EXECUTE-12-CT-ALL",
+        "EXECUTE-03-CUSTOM-VERIFY-ALL",
+        "EXECUTE-13-FRAGMENTATION-ALL",
+        "EXECUTE-09-ALPN-ALL",
+        "EXECUTE-21-KEY-UPDATE-ALL",
+        "EXECUTE-21-KEY-UPDATE-ALL",
+        "EXECUTE-01-SIMPLE-ALL",
+        "EXECUTE-01-SIMPLE-ALL",
+        "EXECUTE-0-DEFAULT"
+      ]
+    },
+    {
+      "name": "BORINGSSL-TESTS",
+      "seconds": 0.441,
+      "checks": 23,
+      "passed": 23,
+      "skipped": 0,
+      "failed": 0,
+      "failing_tests": []
+    },
+    {
+      "name": "X509TEST-TESTS",
+      "seconds": 0.732,
+      "checks": 9,
+      "passed": 9,
+      "skipped": 0,
+      "failed": 0,
+      "failing_tests": []
+    },
+    {
+      "name": "SECURITY-REGRESSION-TESTS",
+      "seconds": 128.239,
+      "checks": 93,
+      "passed": 91,
+      "skipped": 0,
+      "failed": 2,
+      "failing_tests": [
+        "POST-HANDSHAKE-UNKNOWN-MESSAGE-IS-REJECTED",
+        "POST-HANDSHAKE-RECORD-DRIBBLE-IS-BOUNDED"
+      ]
+    },
+    {
+      "name": "TRUST-STORE-TESTS",
+      "seconds": 0.344,
+      "checks": 9,
+      "passed": 9,
+      "skipped": 0,
+      "failed": 0,
+      "failing_tests": []
+    },
+    {
+      "name": "RESUMPTION-INTEROP-TESTS",
+      "seconds": 0.369,
+      "checks": 2,
+      "passed": 0,
+      "skipped": 0,
+      "failed": 2,
+      "failing_tests": [
+        "RESUMPTION-AGAINST-OPENSSL-WITH-HRR",
+        "RESUMPTION-AGAINST-OPENSSL"
+      ]
+    }
+  ],
+  "totals": {
+    "checks": 499,
+    "passed": 482,
+    "skipped": 0,
+    "failed": 17
+  },
+  "openssl_configuration_summaries": [
+    {
+      "file": "01-simple.cnf",
+      "passed": 1,
+      "failed": 3,
+      "skipped": "not printed by upstream adapter"
+    },
+    {
+      "file": "21-key-update.cnf",
+      "passed": 0,
+      "failed": 4,
+      "skipped": "not printed by upstream adapter"
+    },
+    {
+      "file": "09-alpn.cnf",
+      "passed": 2,
+      "failed": 6,
+      "skipped": "not printed by upstream adapter"
+    },
+    {
+      "file": "14-curves.cnf",
+      "passed": 0,
+      "failed": 0,
+      "skipped": "not printed by upstream adapter"
+    },
+    {
+      "file": "13-fragmentation.cnf",
+      "passed": 9,
+      "failed": 7,
+      "skipped": "not printed by upstream adapter"
+    },
+    {
+      "file": "24-padding.cnf",
+      "passed": 1,
+      "failed": 0,
+      "skipped": "not printed by upstream adapter"
+    },
+    {
+      "file": "22-compression.cnf",
+      "passed": 0,
+      "failed": 0,
+      "skipped": "not printed by upstream adapter"
+    },
+    {
+      "file": "05-sni.cnf",
+      "passed": 1,
+      "failed": 0,
+      "skipped": "not printed by upstream adapter"
+    },
+    {
+      "file": "03-custom_verify.cnf",
+      "passed": 1,
+      "failed": 2,
+      "skipped": "not printed by upstream adapter"
+    },
+    {
+      "file": "26-tls13_client_auth.cnf",
+      "passed": 6,
+      "failed": 0,
+      "skipped": "not printed by upstream adapter"
+    },
+    {
+      "file": "12-ct.cnf",
+      "passed": 1,
+      "failed": 1,
+      "skipped": "not printed by upstream adapter"
+    },
+    {
+      "file": "15-certstatus.cnf",
+      "passed": 0,
+      "failed": 0,
+      "skipped": "not printed by upstream adapter"
+    },
+    {
+      "file": "28-seclevel.cnf",
+      "passed": 0,
+      "failed": 0,
+      "skipped": "not printed by upstream adapter"
+    }
+  ],
+  "notes": [
+    "Single provisional reference run, not a passing-suite performance median.",
+    "Setup cache was populated by earlier failed load probes; load includes forced closer-mop rebuild and dependency recompilation.",
+    "Test time includes JIT warmup, fixed sleeps, sockets, network and OpenSSL subprocess effects.",
+    "FiveAM skip counts do not include all filtered OpenSSL configuration scenarios.",
+    "External ACME/network entrypoints and external BoringSSL corpus were not run."
+  ],
+  "measurement": {
+    "load_seconds": 90.71,
+    "test_seconds": 2713.98,
+    "wall_seconds": 2812.5298774840776,
+    "wall_display": "46:52.49",
+    "peak_rss_kib": 1330340,
+    "user_seconds": 3703.45,
+    "system_seconds": 144.43,
+    "exit_status": 1,
+    "tier_policy": "natural JIT; no forced tier",
+    "limits": {
+      "memory": "8G",
+      "swap": "0",
+      "timeout_seconds": 3600
+    }
+  },
+  "provenance": {
+    "egcl_revision": "3cb5e8b236f3b9dfd64f85c84d92f4aa46b4b166",
+    "egcl_sha256": "e07a41f528603c051937eba874723707f39616ee09751dfa82bf90b60a9301cd",
+    "target": "x86_64-unknown-linux-musl",
+    "features": "default: thread-cache-alloc",
+    "pure_tls_revision": "1fce0aab061bbb82777895f5fd8dab3272337265",
+    "pure_tls_upstream_revision": "9c733eab5092b9221fa2a3e18d396fd7548a27fe",
+    "pure_tls_change": "Only test environment adapter; no implementation change.",
+    "platform": "Linux-7.2.11-200.fc44.x86_64-x86_64-with-glibc2.43",
+    "openssl": "OpenSSL 3.5.9 29 Sep 2026 (Library: OpenSSL 3.5.9 29 Sep 2026)",
+    "ocicl_cli": "/usr/bin/ocicl 2.20.0",
+    "runtime_sha256": "515151dcd6faea43749d1277c3b18d47f6deafd790be2a4a44c074183da32f44",
+    "manifest_sha256": "56e4c0648bfbe16357666b94eaa43cde79bf82a14cc5812c9a691dfff47889a8",
+    "build_command": "cargo build --locked --release -p egcl --bin egcl -j2 (scripts/egcl-limited.sh; 8G; 1800s)",
+    "cpu": "Intel Xeon E5-2670 0 @ 2.60GHz; KVM guest; 16 logical CPUs",
+    "measured_harness_sha256": "eb8bdf29a5d7c2b1c43360da03f878ed0dde4a83ba728552e2cfc98bfd411e30",
+    "portable_harness_revision": "c4c46ddb",
+    "portable_harness_files_sha256": {
+      "run-baseline.py": "d01f49d7d94ed454b50a4d959968ff42dfd24c6c6b4f76133f49b3a1df01b74a",
+      "run-suite.lisp": "bb2d2681b0e9607d30324275330c3e3b1ebaeff7ae25f72b866e744f3e683afb"
+    },
+    "harness_note": "The measured session harness and committed portable harness are not byte-identical. The portable harness parameterizes paths and observes the same original pure-tls/test:run-tests entrypoint.",
+    "raw_log": {
+      "location": "/home/green/orca/workspaces/evergreen/pure-tls-baseline/logs/full-preflight.log",
+      "availability": "session-external artifact; not committed",
+      "sha256": "d0791022b95a73e45b7275377fbc78b0a74bafeff1023b57a324a592212f2caf"
+    }
+  },
+  "workarounds": [
+    {
+      "bead": "bliss-uq2oi",
+      "description": "Force closer-mop recompilation during separately timed load phase to avoid cached package creation failure."
+    }
+  ],
+  "failure_inventory": [
+    {
+      "suite": "HANDSHAKE-TESTS",
+      "failed_checks": 2,
+      "reason": "Ed25519 and Ed448 server handshake success assertions failed after client connection failure.",
+      "bead": "bliss-2k83w"
+    },
+    {
+      "suite": "CANCEL-TESTS",
+      "failed_checks": 2,
+      "reason": "Fractional timeout path raised TYPE-ERROR: float 4.0019958e9 is not RATIONAL.",
+      "bead": "bliss-v38sp"
+    },
+    {
+      "suite": "OPENSSL-TESTS",
+      "failed_checks": 9,
+      "reason": "Adapter assertions failed for simple/default, key-update, ALPN, fragmentation, custom verification and CT scenarios. Repeated test names represent distinct failed assertions; scenario counts are separate from FiveAM checks.",
+      "bead": "bliss-2k83w"
+    },
+    {
+      "suite": "SECURITY-REGRESSION-TESTS",
+      "failed_checks": 2,
+      "reason": "VECTOR-INPUT-STREAM rejected as (AND STREAM (SATISFIES INPUT-STREAM-P)) in post-handshake tests.",
+      "bead": "bliss-30p86"
+    },
+    {
+      "suite": "RESUMPTION-INTEROP-TESTS",
+      "failed_checks": 2,
+      "reason": "UIOP/LAUNCH-PROGRAM:LAUNCH-PROGRAM signalled NOT-IMPLEMENTED-ERROR.",
+      "bead": "bliss-moehk"
+    }
+  ],
+  "followups": [
+    "bliss-uq2oi",
+    "bliss-v38sp",
+    "bliss-2k83w",
+    "bliss-30p86",
+    "bliss-moehk"
+  ]
+}

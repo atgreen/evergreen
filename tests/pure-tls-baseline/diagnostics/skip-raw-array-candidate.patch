@@ -1,0 +1,17 @@
+diff --git a/crates/egcl/src/cli/bytecode.rs b/crates/egcl/src/cli/bytecode.rs
+index 91f475e2..e4e9e8f1 100644
+--- a/crates/egcl/src/cli/bytecode.rs
++++ b/crates/egcl/src/cli/bytecode.rs
+@@ -26228,7 +26228,11 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
+             &profile,
+             egcl_compiler::t2::speculate::SpeculateOptions { double_float: true },
+         );
+-        let array_sites = egcl_compiler::t2::array_access::specialize(&mut candidate, true, &array_inline_options);
++        let array_sites = if std::env::var_os("EGCL_PROBE_SKIP_RAW_ARRAY_CANDIDATE").is_some() {
++            0
++        } else {
++            egcl_compiler::t2::array_access::specialize(&mut candidate, true, &array_inline_options)
++        };
+         let raw = egcl_compiler::t2::unbox_f64::has_raw_doubles(&candidate);
+         let optimized = !raw || egcl_compiler::t2::unbox_f64::optimize(&mut candidate);
+         // Only the x86-64 Linux mapped entry unboxes raw OSR imports

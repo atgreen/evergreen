@@ -1,0 +1,565 @@
+{
+  "status": "exploratory focused comparison; successful identical outputs; not full-suite parity",
+  "date": "2026-10-26",
+  "runtime": {
+    "egcl_revision": "3cb5e8b236f3b9dfd64f85c84d92f4aa46b4b166",
+    "egcl_sha256": "e07a41f528603c051937eba874723707f39616ee09751dfa82bf90b60a9301cd",
+    "sbcl_version": "2.6.9-1.fc44",
+    "build": "release, default features, x86_64-unknown-linux-musl",
+    "affinity": "CPUs 8-11, same KVM host"
+  },
+  "dependencies": {
+    "pure_tls": "1fce0aab061bbb82777895f5fd8dab3272337265",
+    "ironclad": "cc43462b19b42e2827559b443159c76900f2e8aa",
+    "scope": "identical pinned pure-tls and direct dependencies; implementation-specific Ironclad feature paths differ"
+  },
+  "case": {
+    "seed": "32 octets #x42",
+    "randomizer": "32 octets #x55",
+    "message": "Hello, post-quantum world!",
+    "operations": [
+      "keygen",
+      "sign",
+      "verify"
+    ],
+    "checks": "verification true; public key1952, secret key4032, signature3309 bytes; all round signature SHA256 equal",
+    "signature_sha256": "25d60898f6aa74d6c49426f219128c16b62df3fb8a07836a9c4849e210165e8b"
+  },
+  "runs": [
+    {
+      "name": "sbcl-cached",
+      "policy": "SBCL native",
+      "load_seconds": 1.582988,
+      "rounds": [
+        {
+          "round": 0,
+          "wall_seconds": {
+            "keygen": 0.029,
+            "sign": 0.044999,
+            "verify": 0.058,
+            "total": 0.131999
+          },
+          "cpu_seconds": {
+            "keygen": 0.029549,
+            "sign": 0.043961,
+            "verify": 0.058074,
+            "total": 0.131584
+          },
+          "signature_sha256": "25d60898f6aa74d6c49426f219128c16b62df3fb8a07836a9c4849e210165e8b"
+        },
+        {
+          "round": 1,
+          "wall_seconds": {
+            "keygen": 0.01,
+            "sign": 0.046,
+            "verify": 0.011,
+            "total": 0.067
+          },
+          "cpu_seconds": {
+            "keygen": 0.01052,
+            "sign": 0.045094,
+            "verify": 0.011331,
+            "total": 0.066945
+          },
+          "signature_sha256": "25d60898f6aa74d6c49426f219128c16b62df3fb8a07836a9c4849e210165e8b"
+        },
+        {
+          "round": 2,
+          "wall_seconds": {
+            "keygen": 0.011,
+            "sign": 0.045999,
+            "verify": 0.011,
+            "total": 0.067999
+          },
+          "cpu_seconds": {
+            "keygen": 0.010553,
+            "sign": 0.045298,
+            "verify": 0.011339,
+            "total": 0.06719
+          },
+          "signature_sha256": "25d60898f6aa74d6c49426f219128c16b62df3fb8a07836a9c4849e210165e8b"
+        },
+        {
+          "round": 3,
+          "wall_seconds": {
+            "keygen": 0.011,
+            "sign": 0.045,
+            "verify": 0.012,
+            "total": 0.068
+          },
+          "cpu_seconds": {
+            "keygen": 0.010506,
+            "sign": 0.044889,
+            "verify": 0.011587,
+            "total": 0.066982
+          },
+          "signature_sha256": "25d60898f6aa74d6c49426f219128c16b62df3fb8a07836a9c4849e210165e8b"
+        },
+        {
+          "round": 4,
+          "wall_seconds": {
+            "keygen": 0.01,
+            "sign": 0.045999,
+            "verify": 0.012,
+            "total": 0.067999
+          },
+          "cpu_seconds": {
+            "keygen": 0.010408,
+            "sign": 0.045178,
+            "verify": 0.011596,
+            "total": 0.067182
+          },
+          "signature_sha256": "25d60898f6aa74d6c49426f219128c16b62df3fb8a07836a9c4849e210165e8b"
+        }
+      ]
+    },
+    {
+      "name": "egcl-default-quiet",
+      "policy": "default natural JIT",
+      "load_seconds": 26.106,
+      "rounds": [
+        {
+          "round": 0,
+          "wall_seconds": {
+            "keygen": 5.234,
+            "sign": 6.935,
+            "verify": 6.396,
+            "total": 18.565
+          },
+          "cpu_seconds": {
+            "keygen": 5.836,
+            "sign": 7.576,
+            "verify": 10.15,
+            "total": 23.562
+          },
+          "signature_sha256": "25d60898f6aa74d6c49426f219128c16b62df3fb8a07836a9c4849e210165e8b"
+        },
+        {
+          "round": 1,
+          "wall_seconds": {
+            "keygen": 4.654,
+            "sign": 6.988,
+            "verify": 4.803,
+            "total": 16.445
+          },
+          "cpu_seconds": {
+            "keygen": 5.17,
+            "sign": 7.598,
+            "verify": 5.616,
+            "total": 18.384
+          },
+          "signature_sha256": "25d60898f6aa74d6c49426f219128c16b62df3fb8a07836a9c4849e210165e8b"
+        }
+      ],
+      "deopts_begin": 22,
+      "deopts_end": 636
+    },
+    {
+      "name": "egcl-early-quiet",
+      "policy": "early promotion",
+      "load_seconds": 29.654,
+      "rounds": [
+        {
+          "round": 0,
+          "wall_seconds": {
+            "keygen": 7.976,
+            "sign": 12.002,
+            "verify": 7.362,
+            "total": 27.34
+          },
+          "cpu_seconds": {
+            "keygen": 10.068,
+            "sign": 14.692,
+            "verify": 9.327,
+            "total": 34.087
+          },
+          "signature_sha256": "25d60898f6aa74d6c49426f219128c16b62df3fb8a07836a9c4849e210165e8b"
+        },
+        {
+          "round": 1,
+          "wall_seconds": {
+            "keygen": 6.539,
+            "sign": 9.7,
+            "verify": 6.23,
+            "total": 22.469
+          },
+          "cpu_seconds": {
+            "keygen": 8.022,
+            "sign": 11.595,
+            "verify": 7.776,
+            "total": 27.393
+          },
+          "signature_sha256": "25d60898f6aa74d6c49426f219128c16b62df3fb8a07836a9c4849e210165e8b"
+        }
+      ],
+      "deopts_begin": 113,
+      "deopts_end": 1987,
+      "overrides": {
+        "EGCL_T0_T1_THRESHOLD": 1,
+        "EGCL_T1_T2_INVOKE_THRESHOLD": 10,
+        "EGCL_T1_T2_BACKEDGE_THRESHOLD": 1000
+      },
+      "unchanged_osr_threshold": 100000
+    },
+    {
+      "name": "egcl-no-t2",
+      "policy": "T2 disabled",
+      "load_seconds": 25.458,
+      "rounds": [
+        {
+          "round": 0,
+          "wall_seconds": {
+            "keygen": 5.755,
+            "sign": 21.519,
+            "verify": 6.403,
+            "total": 33.677
+          },
+          "cpu_seconds": {
+            "keygen": 5.695,
+            "sign": 21.303,
+            "verify": 6.339,
+            "total": 33.337
+          },
+          "signature_sha256": "25d60898f6aa74d6c49426f219128c16b62df3fb8a07836a9c4849e210165e8b"
+        },
+        {
+          "round": 1,
+          "wall_seconds": {
+            "keygen": 6.566,
+            "sign": 21.402,
+            "verify": 6.198,
+            "total": 34.166
+          },
+          "cpu_seconds": {
+            "keygen": 6.493,
+            "sign": 21.202,
+            "verify": 6.132,
+            "total": 33.827
+          },
+          "signature_sha256": "25d60898f6aa74d6c49426f219128c16b62df3fb8a07836a9c4849e210165e8b"
+        }
+      ],
+      "overrides": {
+        "EGCL_DISABLE_T2": 1
+      }
+    },
+    {
+      "name": "egcl-pin-keccak",
+      "policy": "Keccak output helper PROFILE-pinned T0",
+      "load_seconds": 26.479,
+      "rounds": [
+        {
+          "round": 0,
+          "wall_seconds": {
+            "keygen": 3.677,
+            "sign": 5.196,
+            "verify": 2.621,
+            "total": 11.494
+          },
+          "cpu_seconds": {
+            "keygen": 3.798,
+            "sign": 5.236,
+            "verify": 5.268,
+            "total": 14.302
+          },
+          "signature_sha256": "25d60898f6aa74d6c49426f219128c16b62df3fb8a07836a9c4849e210165e8b"
+        },
+        {
+          "round": 1,
+          "wall_seconds": {
+            "keygen": 2.858,
+            "sign": 4.941,
+            "verify": 2.439,
+            "total": 10.238
+          },
+          "cpu_seconds": {
+            "keygen": 2.883,
+            "sign": 4.944,
+            "verify": 2.431,
+            "total": 10.258
+          },
+          "signature_sha256": "25d60898f6aa74d6c49426f219128c16b62df3fb8a07836a9c4849e210165e8b"
+        }
+      ],
+      "deopts_begin": 22,
+      "deopts_end": 22,
+      "intervention": "(egcl-ext:profile 'ironclad::keccak-state-extract-output) intentionally pins this helper to T0; not a production fix"
+    }
+  ],
+  "components": [
+    {
+      "name": "egcl-ntt",
+      "array_element_type": "T",
+      "batches": [
+        {
+          "operation": "NTT",
+          "batch": 0,
+          "iterations": 1000,
+          "wall_seconds": 2.469,
+          "cpu_seconds": 2.449,
+          "sum": 557696
+        },
+        {
+          "operation": "ADD",
+          "batch": 0,
+          "iterations": 1000,
+          "wall_seconds": 0.087,
+          "cpu_seconds": 0.086,
+          "sum": 1031748726
+        },
+        {
+          "operation": "NTT",
+          "batch": 1,
+          "iterations": 1000,
+          "wall_seconds": 2.476,
+          "cpu_seconds": 2.453,
+          "sum": 557696
+        },
+        {
+          "operation": "ADD",
+          "batch": 1,
+          "iterations": 1000,
+          "wall_seconds": 0.088,
+          "cpu_seconds": 0.088,
+          "sum": 1064871937
+        },
+        {
+          "operation": "NTT",
+          "batch": 2,
+          "iterations": 1000,
+          "wall_seconds": 2.44,
+          "cpu_seconds": 2.421,
+          "sum": 557696
+        },
+        {
+          "operation": "ADD",
+          "batch": 2,
+          "iterations": 1000,
+          "wall_seconds": 0.088,
+          "cpu_seconds": 0.087,
+          "sum": 1047712646
+        }
+      ],
+      "wall_medians": {
+        "NTT": 2.469,
+        "ADD": 0.088
+      }
+    },
+    {
+      "name": "sbcl-ntt",
+      "array_element_type": "(UNSIGNED-BYTE 32)",
+      "batches": [
+        {
+          "operation": "NTT",
+          "batch": 0,
+          "iterations": 1000,
+          "wall_seconds": 0.113999,
+          "cpu_seconds": 0.113016,
+          "sum": 557696
+        },
+        {
+          "operation": "ADD",
+          "batch": 0,
+          "iterations": 1000,
+          "wall_seconds": 0.008,
+          "cpu_seconds": 0.008245,
+          "sum": 1031748726
+        },
+        {
+          "operation": "NTT",
+          "batch": 1,
+          "iterations": 1000,
+          "wall_seconds": 0.114999,
+          "cpu_seconds": 0.113317,
+          "sum": 557696
+        },
+        {
+          "operation": "ADD",
+          "batch": 1,
+          "iterations": 1000,
+          "wall_seconds": 0.008,
+          "cpu_seconds": 0.008615,
+          "sum": 1064871937
+        },
+        {
+          "operation": "NTT",
+          "batch": 2,
+          "iterations": 1000,
+          "wall_seconds": 0.114,
+          "cpu_seconds": 0.112864,
+          "sum": 557696
+        },
+        {
+          "operation": "ADD",
+          "batch": 2,
+          "iterations": 1000,
+          "wall_seconds": 0.009,
+          "cpu_seconds": 0.008518,
+          "sum": 1047712646
+        }
+      ],
+      "wall_medians": {
+        "NTT": 0.114,
+        "ADD": 0.008
+      }
+    }
+  ],
+  "interpretation": {
+    "component_ntt_wall_ratio": 21.657894736842103,
+    "component_add_wall_ratio": 11.0,
+    "default_to_sbcl_second_round_ratio": 241.84179179105575,
+    "sample_caveat": "Each EGCL condition has only two sequential rounds, hence just one later-round observation; no EGCL warm median or confidence interval claimed. Component medians are three batches in one process.",
+    "followup": "bliss-yuxa7: confirmed repeated compilation/deoptimization cycle; exact failing guard remains unknown"
+  },
+  "external_artifacts": {
+    "location": "/home/green/orca/workspaces/evergreen/pure-tls-baseline/compare",
+    "availability": "session-external artifacts; not committed",
+    "sha256": {
+      "roundtrip.lisp": "97ab1d3fa2274bb05af842b1e5b45e1ef1a52bd25cb835b976f8045592673b85",
+      "roundtrip-deopts.lisp": "a39cb974b0808bd7123fbd9442223bc26cac3b5d542afa1250c43bafc626a4be",
+      "roundtrip-profile.lisp": "238e997b4c3de5d71be6fd3b906ea7673aa7ba5b00567b3fc1ae5554ff1e6adf",
+      "roundtrip-profile-pin.lisp": "9dfcfeac430aa9c5cb9512091e9989faacb7c6783257f04e61428061b9f8ef48",
+      "ntt-case.lisp": "8d9cd8ca2b5388234df2f2d1cf6fa786ac54a632ecaea58508cd3e3aaffa5a60",
+      "profile-flat-report.txt": "aa63b73b53548dff3a46d9631141f08ad627e94a684c17ead5979b6ebb89a6c9",
+      "profile-pin-report.txt": "0a12c954a537f6924ae8c462f97926a848d3449e6548245559e1dffe105413d9",
+      "profile-flat.log": "bb798edc8032f1bb83b8abae91ec4cb6fb9086055f5fca47e5d2eca51a4ca155",
+      "profile-pin.log": "5280acba2509faa6eb62783fd56739aca4d9101cac9ed2ded61e10b55178e631",
+      "profile-default.t2": "04ec4333576fcabf4ee509ef98a11eb30443563cba3058d863ad6424c894f2d5",
+      "sbcl-cached.log": "a76c74d46f9e09f7cff6d442adf5b50bf858758ff98846eaa46197fd4f0bf323",
+      "egcl-default-quiet.log": "ff2a2ee9ae44dbd1b7f84cb4b99990bfad61366dccd542e4c02e1a1d96cd2678",
+      "egcl-early-quiet.log": "ec556fc928a22bf712d7ae2495510370022ed7e656c4bb50f9064cafb5c83a74",
+      "egcl-no-t2.log": "7075b0aa0d0f3da71e48dcf9003423c9029ecf0dedee08bc1235858776335375",
+      "egcl-pin-keccak.log": "d4913d4ab8666776023b37dac92405fb09fbbc1c9366450a0a3116f561536236",
+      "egcl-ntt.log": "baf19be771a13c3f2996bc99eed07002e2140f940773dd7a82c5d5e5eb34be23",
+      "sbcl-ntt.log": "540a65d49c23726104b0725a068bfa50cd6bbf34b4a21145ea4bc1c995b3a4ef",
+      "profile-pin-all-symbols.txt": "7ec7c653861b6ff56e6eb000e8babf524c41ec1e72a2bf635ed8bce2f4e9cad7",
+      "egcl-array-probe-off.log": "68f831b6bb7dd43364227c09f49c043187275ea4a85f31fe0973e2370ab8aff9",
+      "egcl-array-probe-on.log": "4e57b859c6228e28aedeaeca5587c82379c323288bd5719dd177b4f43a8cdf1e"
+    }
+  },
+  "profile_observations": {
+    "flat_inference_percent_across_threads": 24.26,
+    "keccak_helper_t1_compiles": 37,
+    "keccak_helper_t2_compiles": 36,
+    "operation_minor_gc": 0,
+    "operation_major_gc": 0,
+    "post_pin_compiles": 6,
+    "post_pin_minor_gc": 1,
+    "post_pin_minor_gc_ms": 162.406,
+    "native_execution_evidence": "profile-pin-all-symbols.txt contains T2:PURE-TLS::ML-DSA-NTT! and T2:PURE-TLS::ML-DSA-INTT! samples",
+    "limits": "Flat cycles only; callgraph denied; cooperative sprof lacks native hooks. No compilation durations measured.",
+    "operation_bytes_consed": 24520432
+  },
+  "prototype": {
+    "status": "diagnostic only; not a production patch or default",
+    "base_revision": "3cb5e8b236f3b9dfd64f85c84d92f4aa46b4b166",
+    "binary_sha256": "81d300116a11b0194bee6f7ebfd11a0c0d3408eb8febbd97d647d8d29d88f414",
+    "patch": "diagnostics/skip-raw-array-candidate.patch",
+    "patch_sha256": "2d9946ab461e0799d163f982748ccead78d3ce11c71e4adec33d9f67047e1c7e",
+    "intervention": "EGCL_PROBE_SKIP_RAW_ARRAY_CANDIDATE=1 skips generic-array specialization only in the raw candidate; tagged-array pass retained",
+    "same_binary_runs": [
+      {
+        "name": "egcl-array-probe-off",
+        "rounds": [
+          {
+            "round": 0,
+            "wall_seconds": {
+              "keygen": 5.32,
+              "sign": 7.14,
+              "verify": 6.5,
+              "total": 18.96
+            },
+            "cpu_seconds": {
+              "keygen": 5.887,
+              "sign": 7.806,
+              "verify": 10.34,
+              "total": 24.033
+            },
+            "signature_sha256": "25d60898f6aa74d6c49426f219128c16b62df3fb8a07836a9c4849e210165e8b"
+          },
+          {
+            "round": 1,
+            "wall_seconds": {
+              "keygen": 4.672,
+              "sign": 7.086,
+              "verify": 4.68,
+              "total": 16.438
+            },
+            "cpu_seconds": {
+              "keygen": 5.195,
+              "sign": 7.711,
+              "verify": 5.464,
+              "total": 18.37
+            },
+            "signature_sha256": "25d60898f6aa74d6c49426f219128c16b62df3fb8a07836a9c4849e210165e8b"
+          }
+        ],
+        "deopts_begin": 22,
+        "deopts_end": 632
+      },
+      {
+        "name": "egcl-array-probe-on",
+        "rounds": [
+          {
+            "round": 0,
+            "wall_seconds": {
+              "keygen": 4.61,
+              "sign": 6.291,
+              "verify": 5.668,
+              "total": 16.569
+            },
+            "cpu_seconds": {
+              "keygen": 4.916,
+              "sign": 6.577,
+              "verify": 7.528,
+              "total": 19.021
+            },
+            "signature_sha256": "25d60898f6aa74d6c49426f219128c16b62df3fb8a07836a9c4849e210165e8b"
+          },
+          {
+            "round": 1,
+            "wall_seconds": {
+              "keygen": 4.214,
+              "sign": 6.248,
+              "verify": 3.961,
+              "total": 14.423
+            },
+            "cpu_seconds": {
+              "keygen": 4.491,
+              "sign": 6.518,
+              "verify": 4.352,
+              "total": 15.361
+            },
+            "signature_sha256": "25d60898f6aa74d6c49426f219128c16b62df3fb8a07836a9c4849e210165e8b"
+          }
+        ],
+        "deopts_begin": 22,
+        "deopts_end": 702
+      }
+    ],
+    "later_round_wall_improvement_percent": 12.258182260615635,
+    "ntt_observation": {
+      "wall_seconds_per_1000_pairs": 2.535,
+      "old_baseline_seconds": 2.469,
+      "mapped_code_bytes_before": 21528,
+      "mapped_code_bytes_after": 18690,
+      "caveat": "No paired same-binary component control; no demonstrated NTT speedup or regression."
+    },
+    "conclusion": "Single OFF/ON process pair observed about12% later-round wall improvement while deopts increased610 to680; guard cycle unresolved."
+  },
+  "portable_benchmarks": {
+    "ml-dsa-roundtrip.lisp": {
+      "sha256": "7c1d53857420875518b9f296ffb0d3008438ebad4b081aa1c803393d8bb7d538",
+      "note": "Reproduction source; original measured source hash is retained separately."
+    },
+    "ml-dsa-ntt.lisp": {
+      "sha256": "b5016a41135332bc24e14f4db6ff4064f8e8a5d7f337a1d7279150fd0121846f",
+      "note": "Reproduction source; original measured source hash is retained separately."
+    }
+  },
+  "followups": {
+    "adaptive_guard_cycle": "bliss-yuxa7",
+    "variable_count_shift": "bliss-x19f7",
+    "full_sbcl_dependency_loading": "bliss-kvm6t"
+  }
+}
