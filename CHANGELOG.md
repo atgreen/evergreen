@@ -168,6 +168,10 @@
   signal admitted two waiters. A wake that arrives too late for one wait can
   also no longer end the same fiber's next wait, such as a following sleep,
   early ([#647](https://github.com/atgreen/evergreen/pull/647)).
+- `subtypep` treats `short-float` as the same type as `single-float` and
+  `long-float` as the same as `double-float`, as `typep` already did
+  ([#682](https://github.com/atgreen/evergreen/pull/682)).
+
 - A condition is no longer corrupted when a garbage collection runs while it
   is being made. If a slot's initform allocated enough to start a collection,
   `make-condition`, `error` and `signal` could return an object that was no
