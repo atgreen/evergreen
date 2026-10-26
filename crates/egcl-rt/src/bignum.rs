@@ -41,9 +41,18 @@ fn gc_alloc_obj(total_size: usize, type_id: u8) -> *mut u8 {
     }
 }
 
-/// Allocate a RATIO heap object (numerator/denominator are integers) on the
-/// shared GC heap, using the spec RatioData layout (bliss-jtc.5).
+/// Construct a canonical rational from integer components. The denominator
+/// must be nonzero. Normalize its sign and reduce common factors; integral
+/// results become integers. Hashing may therefore inspect ratio limbs directly.
 pub fn alloc_ratio_cli(num: EgclVal, den: EgclVal) -> EgclVal {
+    let numerator = bigint_from_val(num).expect("ratio numerator must be an integer");
+    let denominator = bigint_from_val(den).expect("ratio denominator must be an integer");
+    assert!(!denominator.is_zero(), "ratio denominator must be nonzero");
+    BigRat::new(numerator, denominator).to_val()
+}
+
+/// Allocate components already normalized by BigRat, without repeating GCD.
+fn alloc_normalized_ratio(num: EgclVal, den: EgclVal) -> EgclVal {
     crate::rooted!(num = num);
     crate::rooted!(den = den);
     let ptr = gc_alloc_obj(std::mem::size_of::<RatioData>(), type_id::RATIO) as *mut RatioData;
@@ -802,7 +811,7 @@ impl BigRat {
             // Denominator construction can relocate a heap-allocated numerator.
             crate::rooted!(num = self.num.to_val());
             let den = self.den.to_val();
-            alloc_ratio_cli(*num, den)
+            alloc_normalized_ratio(*num, den)
         }
     }
 }
