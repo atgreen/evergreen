@@ -13,10 +13,11 @@
     "egcl:test:raw_fixnum": [""],
     "egcl:test:immediate_vector_stores": [""],
     "egcl:test:ordinary_raw_fixnum_cli": [""],
+    "egcl:test:comparison_fusion_liveness": [""],
     "egcl-stdlib:test:integer_shifts": [""]
   },
   "areas": {
-    "compiler": {"egcl-compiler:lib:egcl_compiler": [""], "egcl-compiler:test:native_vector_store": [""], "egcl-compiler:test:native_ordinary_function": [""]},
+    "compiler": {"egcl-compiler:lib:egcl_compiler": [""], "egcl-compiler:test:native_vector_store": [""], "egcl-compiler:test:native_ordinary_function": [""], "egcl-compiler:test:native_comparison_fusion": [""]},
     "runtime": {"egcl-rt:lib:egcl_rt": [""]},
     "reader": {"egcl-compiler:lib:egcl_compiler": ["reader::"]}
   }
