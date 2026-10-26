@@ -210,77 +210,6 @@ pub fn specialize(f: &mut Function, raw: bool, options: &super::inlining::Inline
     count
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::t2::frame_state::FrameState;
-
-    #[test]
-    fn canonical_accessors_become_guarded_memory_operations() {
-        let mut f = Function::new("array-access");
-        let block = f.entry();
-        let array = f.add_block_param(block, IRType::TOP, Repr::Tagged);
-        let index = f.add_block_param(block, IRType::of(TypeBits::FIXNUM), Repr::Tagged);
-        let symbol = egcl_rt::symbols::intern("AREF");
-        let state = f.frame_states.add(FrameState {
-            scopes: vec![],
-            remat: vec![],
-        });
-        let (_, result) = f.push_inst(
-            block,
-            InstData {
-                opcode: Opcode::Call,
-                args: vec![array, index],
-                results: vec![],
-                aux: AuxData::CallTarget(symbol),
-                flags: InstFlags {
-                    effectful: true,
-                    call: true,
-                    safepoint: true,
-                    ..InstFlags::default()
-                },
-                targets: vec![],
-                frame_state: Some(state),
-                source_pos: 0,
-            },
-            &[(IRType::TOP, Repr::Tagged)],
-        );
-        f.set_terminator(
-            block,
-            InstData {
-                opcode: Opcode::Return,
-                args: result,
-                results: vec![],
-                aux: AuxData::None,
-                flags: InstFlags {
-                    terminator: true,
-                    ..InstFlags::default()
-                },
-                targets: vec![],
-                frame_state: None,
-                source_pos: 0,
-            },
-        );
-        assert_eq!(
-            specialize(
-                &mut f,
-                false,
-                &super::super::inlining::InlineOptions::default()
-            ),
-            1
-        );
-        let access = f
-            .block(block)
-            .insts
-            .iter()
-            .map(|&i| f.inst(i))
-            .find(|i| i.opcode == Opcode::VecRef)
-            .unwrap();
-        assert!(access.flags.guard && access.flags.effectful);
-        assert_eq!(access.frame_state, Some(state));
-    }
-}
-
 /// Delay a store-only escape box until the destination actually needs tagged
 /// elements. The packed arm consumes raw bits and does not allocate at all.
 fn specialize_raw_stores(f: &mut Function) -> usize {
@@ -607,4 +536,75 @@ fn specialize_boxed_read(f: &mut Function, site: Inst, old: &InstData) {
     };
     f.block_mut(vector).insts.push(site);
     f.set_terminator(vector, exit(old.results[0]));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::t2::frame_state::FrameState;
+
+    #[test]
+    fn canonical_accessors_become_guarded_memory_operations() {
+        let mut f = Function::new("array-access");
+        let block = f.entry();
+        let array = f.add_block_param(block, IRType::TOP, Repr::Tagged);
+        let index = f.add_block_param(block, IRType::of(TypeBits::FIXNUM), Repr::Tagged);
+        let symbol = egcl_rt::symbols::intern("AREF");
+        let state = f.frame_states.add(FrameState {
+            scopes: vec![],
+            remat: vec![],
+        });
+        let (_, result) = f.push_inst(
+            block,
+            InstData {
+                opcode: Opcode::Call,
+                args: vec![array, index],
+                results: vec![],
+                aux: AuxData::CallTarget(symbol),
+                flags: InstFlags {
+                    effectful: true,
+                    call: true,
+                    safepoint: true,
+                    ..InstFlags::default()
+                },
+                targets: vec![],
+                frame_state: Some(state),
+                source_pos: 0,
+            },
+            &[(IRType::TOP, Repr::Tagged)],
+        );
+        f.set_terminator(
+            block,
+            InstData {
+                opcode: Opcode::Return,
+                args: result,
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags {
+                    terminator: true,
+                    ..InstFlags::default()
+                },
+                targets: vec![],
+                frame_state: None,
+                source_pos: 0,
+            },
+        );
+        assert_eq!(
+            specialize(
+                &mut f,
+                false,
+                &super::super::inlining::InlineOptions::default()
+            ),
+            1
+        );
+        let access = f
+            .block(block)
+            .insts
+            .iter()
+            .map(|&i| f.inst(i))
+            .find(|i| i.opcode == Opcode::VecRef)
+            .unwrap();
+        assert!(access.flags.guard && access.flags.effectful);
+        assert_eq!(access.frame_state, Some(state));
+    }
 }
