@@ -258,6 +258,10 @@
   load correctly ([#655](https://github.com/atgreen/evergreen/pull/655),
   reported in [#652](https://github.com/atgreen/evergreen/issues/652)).
 
+- `format`'s `~:T` and `~:@T` (`pprint-tab`) produce no output unless
+  `*print-pretty*` is true
+  ([#677](https://github.com/atgreen/evergreen/pull/677)).
+
 - `egcl-thread:signal-semaphore` no longer gives one permit to two takers.
   An `egcl-thread:try-semaphore` in another thread or fiber could take a
   permit that `signal-semaphore` was about to hand to a waiting fiber; both
