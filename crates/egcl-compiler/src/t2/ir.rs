@@ -372,6 +372,10 @@ pub enum Opcode {
     /// sign correction; raw fixnums need only an AND. Nonintegers deopt to
     /// the retained BYTE/LDB expression before any private descriptor exists.
     IntegerLowBits,
+    /// Pure integer right-shift probe. Unary tagged input, positive shift in
+    /// AuxData::FixnumImm; results are (tagged T/NIL, tagged fixnum). Unsupported
+    /// layouts/results return NIL and fixnum zero without error or deopt.
+    TryIntegerShr,
 }
 
 impl Opcode {

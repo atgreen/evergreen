@@ -145,3 +145,6 @@ pub mod array_access;
 pub mod integer_extract;
 /// Signed machine integer representation selection.
 pub mod unbox_fixnum;
+
+/// Success-only integer shift fast paths with retained generic calls.
+pub mod integer_shift;

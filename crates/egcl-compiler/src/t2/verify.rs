@@ -638,6 +638,21 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                     ));
                 }
 
+                if data.opcode == Opcode::TryIntegerShr {
+                    use crate::t2::ir::{TypeBits, ValueRepresentation as Repr};
+                    let valid = data.args.iter().chain(&data.results).all(|v| valid_values.contains(&v.0));
+                    if !valid || data.args.len() != 1 || data.results.len() != 2
+                        || data.flags != crate::t2::ir::InstFlags::default()
+                        || data.frame_state.is_some() || !matches!(data.aux, AuxData::FixnumImm(n) if n > 0)
+                        || (valid && data.results.len() == 2 &&
+                            (data.args.iter().chain(&data.results).any(|&v| f.value(v).repr != Repr::Tagged)
+                                || f.value(data.results[0]).ty.bits != TypeBits::SYMBOL.join(TypeBits::NULL)
+                                || f.value(data.results[1]).ty.bits != TypeBits::FIXNUM)) {
+                        errors.push(VerifyError::new("V8 integer-shift-probe-contract",
+                            format!("block{bi} requires tagged integer input and (boolean, fixnum) outputs")));
+                    }
+                }
+
                 if data.opcode == Opcode::TryPackedF64Set {
                     use crate::t2::ir::{TypeBits, ValueRepresentation as Repr};
                     let valid = data.args.iter().chain(&data.results)

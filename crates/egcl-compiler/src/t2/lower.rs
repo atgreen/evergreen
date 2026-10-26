@@ -163,6 +163,7 @@ pub mod op {
     pub const IMAX: u32 = 0x0036;
     /// Noncollecting native extraction, with a cold noninteger guard.
     pub const INTEGER_LOW_BITS: u32 = 0x0037;
+    pub const TRY_INTEGER_SHR: u32 = 0x0038;
 
     // ── 0x30 float ALU ───────────────────────────────────────────────
     pub const FADD: u32 = 0x0030;
@@ -669,6 +670,7 @@ fn lower_inst(lo: &mut Lowering, inst: Inst) {
         LogXor => bin!(op::XOR),
         LogNot => un!(op::NOT),
         IntegerLowBits => un!(op::INTEGER_LOW_BITS),
+        TryIntegerShr => lo.emit_annotated(inst, op::TRY_INTEGER_SHR, defs, uses),
 
         // ── box / unbox / widen ──
         BoxFixnum => un!(op::BOX_FIXNUM),
