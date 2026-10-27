@@ -97,6 +97,54 @@ Sampling observes a running workload; short programs may end before meaningful
 samples accumulate. Retain the workload and build configuration with any
 profile you use to justify a performance change.
 
+## Minor-GC phase timing { #minor-gc-phases }
+
+Set `EGCL_GC_PHASE_LOG` before starting EGCL to write phase timings to stderr.
+The flag is cached on first use and tests presence: `=0` also enables it.
+Leave it unset for ordinary timing comparisons.
+
+```sh
+EGCL_GC_PHASE_LOG=1 scripts/egcl-limited.sh \
+  target/x86_64-unknown-linux-musl/release/egcl --no-init --load workload.lisp \
+  2>gc-phases.log
+env -u EGCL_GC_PHASE_LOG scripts/egcl-limited.sh \
+  target/x86_64-unknown-linux-musl/release/egcl --no-init --load workload.lisp
+```
+
+Each successful minor body emits one `[gc-phases] minor` line with eight
+consecutive intervals in nanoseconds:
+
+| Field | Work included |
+| --- | --- |
+| `setup_index_ns` | Heap setup and initial nursery indexing |
+| `roots_mark_ns` | Stack, symbol, external, and remembered roots |
+| `old_scan_ns` | Older-generation scanning, including mandatory off-heap scans |
+| `young_mark_ns` | Pinned-region roots and transitive young marking |
+| `evacuate_ns` | Capacity checks, copies, and pinned-region promotion |
+| `heap_relocate_ns` | Remembered slots and heap-object fields |
+| `roots_relocate_ns` | Stack, symbol, and external root relocation |
+| `reclaim_rearm_ns` | Weak references, finalizers, verification, reset, soft-dirty rearming, and final bookkeeping |
+
+Lazy nursery indexing is charged to whichever interval forces it.
+`phase_sum_ns` equals `body_total_ns`; that body total excludes formatting and
+writing its own line. `recorded_pause_us` retains the existing GC-statistics
+boundary, which ends before final bookkeeping. Timings include the diagnostic
+clock reads and any other enabled GC diagnostics.
+
+The separate `[gc-phases] minor_stw` line reports `enter_ns`,
+`body_with_log_ns`, and `exit_ns`, whose sum is `total_ns`. Entry covers the
+stop-the-world rendezvous and TLAB retirement; exit covers resumption. The body
+interval includes its diagnostic output. These intervals exclude the collector
+admission lock acquired by callers before the wrapper; subtracting body time
+therefore does not measure that lock's admission cost.
+
+A minor drained inside a major collection emits only the body line. A failed
+minor body emits no complete phase line; its wrapper reports `ok=0`, with the
+three interval fields absent if the body was never entered. Logging adds
+measurement overhead and makes no hard real-time guarantee. On Linux,
+soft-dirty tracking can cause first-write page faults during later execution;
+that system-time cost falls outside the recorded collection pause.
+
 ## Allocation and measurement discipline
 
 `room` measures Lisp-heap activity. Rust strings, vectors, hash maps, and other

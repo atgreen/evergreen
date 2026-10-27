@@ -4,6 +4,10 @@
 
 ### Added
 
+- Optional minor-GC phase timings distinguish root scans, evacuation,
+  relocation, and reclamation from stop-the-world coordination
+  ([#707](https://github.com/atgreen/evergreen/pull/707)).
+
 - `(UNSIGNED-BYTE 8)` arrays store one byte per element and report their
   specialized type, with native access, supported array and sequence operations,
   and typed BFASL, image, and readable-print round trips
