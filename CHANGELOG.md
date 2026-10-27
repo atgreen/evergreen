@@ -194,6 +194,11 @@
   while reading a string
   ([#695](https://github.com/atgreen/evergreen/pull/695)).
 
+- Class precedence lists follow Common Lisp's specified topological ordering
+  where it differs from C3, preserving the standard method and slot precedence
+  for nonmonotonic multiple-inheritance graphs
+  ([#696](https://github.com/atgreen/evergreen/pull/696)).
+
 - `NOTINLINE` declarations remain effective through native specialization,
   while preserving argument evaluation and lookup of redefined functions
   ([#703](https://github.com/atgreen/evergreen/pull/703)).
