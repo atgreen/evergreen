@@ -216,6 +216,10 @@
 
 ### Fixed
 
+- `FORMAT` treats `~:T` and `~:@T` outside a logical block as no-ops, including
+  when pretty printing is enabled, while preserving tabulation within blocks
+  ([#726](https://github.com/atgreen/evergreen/pull/726)).
+
 - Pretty-printer `:FILL` conditional newlines behave like `:LINEAR` while
   miser mode is active, preserving ordinary section filling otherwise
   ([#727](https://github.com/atgreen/evergreen/pull/727)).
