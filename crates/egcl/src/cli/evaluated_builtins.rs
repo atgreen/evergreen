@@ -5383,10 +5383,14 @@ fn resolve(name: &str) -> Option<Handler> {
             }
             let allow_other_keys = args[1..]
                 .chunks(2)
-                .any(|kv| kv[0].is_symbol() && sym_bare_name_rc(kv[0]).as_ref() == "ALLOW-OTHER-KEYS" && kv[1] != NIL);
+                .find(|kv| {
+                    is_keyword_arg(kv[0])
+                        && sym_bare_name_rc(kv[0]).as_ref() == "ALLOW-OTHER-KEYS"
+                })
+                .is_some_and(|kv| kv[1] != NIL);
             if !allow_other_keys {
                 for kv in args[1..].chunks(2) {
-                    let known = kv[0].is_symbol()
+                    let known = is_keyword_arg(kv[0])
                         && matches!(
                             sym_bare_name_rc(kv[0]).as_ref(),
                             "VERBOSE" | "PRINT" | "IF-DOES-NOT-EXIST" | "EXTERNAL-FORMAT" | "ALLOW-OTHER-KEYS"
@@ -5406,7 +5410,8 @@ fn resolve(name: &str) -> Option<Handler> {
             let mut if_missing_nil = false;
             let mut i = 1;
             while i + 1 < args.len() {
-                if args[i].is_symbol() && sym_bare_name_rc(args[i]).as_ref() == "IF-DOES-NOT-EXIST"
+                if is_keyword_arg(args[i])
+                    && sym_bare_name_rc(args[i]).as_ref() == "IF-DOES-NOT-EXIST"
                 {
                     if_missing_nil = args[i + 1] == NIL;
                 }
