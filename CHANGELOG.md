@@ -23,6 +23,10 @@
 
 ### Performance
 
+- Fast native byte-array construction avoids copying constructor arguments,
+  while preserving mutable type checks and public fallback
+  ([#705](https://github.com/atgreen/evergreen/pull/705)).
+
 - T2 combines eligible eight-byte integer serialization loops into one native
   word store on x86-64 Linux, preserving checked fallback, loop results, and
   precise GC and interrupt boundaries
