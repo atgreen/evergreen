@@ -8,6 +8,8 @@
 #[path = "gc_minor_phase.rs"]
 mod minor_phase;
 use minor_phase::{MinorPhaseLog, Phase as MinorPhase};
+#[path = "gc_root_phase.rs"]
+mod root_phase;
 
 use crate::error::EgclError;
 use crate::image_relocation::ImageRelocations;
@@ -2409,7 +2411,9 @@ impl HeapCollector {
             &mut nursery_index,
             &mut mark_worklist,
         );
+        let root_clock = root_phase::start();
         Self::scan_cl_stack_roots(|v| mark_ref(v, &mut nursery_index, &mut mark_worklist));
+        root_phase::finish(root_clock, b"minor_mark_cl_stack", state.stats.minor_gc_count + 1, 0);
         let tracing = gc_verify_enabled();
         if tracing {
             VERIFY_TRACE.with(|t| {
@@ -2418,6 +2422,7 @@ impl HeapCollector {
                 t.reloc.clear();
             });
         }
+        let root_clock = root_phase::start();
         crate::symbols::for_each_root_slot(|slot| {
             let v = unsafe { *slot };
             if tracing {
@@ -2425,6 +2430,7 @@ impl HeapCollector {
             }
             mark_ref(v, &mut nursery_index, &mut mark_worklist);
         });
+        root_phase::finish(root_clock, b"minor_mark_symbols", state.stats.minor_gc_count + 1, 0);
         scan_external_mark_roots(|slot| {
             let v = unsafe { *slot };
             if tracing {
@@ -2801,11 +2807,14 @@ impl HeapCollector {
         // also be reachable only from a CL-stack frame or the entry continuation.
         // Relocate those roots to the moved locations too, while forwarding is
         // still intact and before the nursery is reset.
+        let root_clock = root_phase::start();
         Self::relocate_cl_stack_refs(heap_base_addr, state.config.heap_size);
+        root_phase::finish(root_clock, b"minor_relocate_cl_stack", state.stats.minor_gc_count + 1, 0);
         relocate_entry_continuation(heap_base_addr, heap_end);
         // Symbol-table roots (bliss-jtc.6 Stage C): a nursery object may be
         // reachable only from a global symbol's cell; rewrite those cells to the
         // evacuated location while forwarding is intact.
+        let root_clock = root_phase::start();
         crate::symbols::for_each_root_slot(|slot| unsafe {
             let before = (*slot).0;
             relocate_slot(slot, heap_base_addr, heap_end);
@@ -2814,6 +2823,7 @@ impl HeapCollector {
                 VERIFY_TRACE.with(|t| t.borrow_mut().reloc.insert(slot as usize, (before, after)));
             }
         });
+        root_phase::finish(root_clock, b"minor_relocate_symbols", state.stats.minor_gc_count + 1, 0);
         scan_external_roots(|slot| unsafe {
             let before = (*slot).0;
             relocate_slot(slot, heap_base_addr, heap_end);
@@ -4318,7 +4328,9 @@ fn scan_external_roots(mut visit: impl FnMut(*mut EgclVal)) {
     SCAN_PASS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let scanners = root_scanners().lock().unwrap().clone();
     for s in scanners {
+        let root_clock = root_phase::start();
         s(&mut visit);
+        root_phase::finish(root_clock, b"external_scanner", 0, s as *const () as usize);
     }
 }
 

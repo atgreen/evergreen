@@ -4,6 +4,10 @@
 
 ### Added
 
+- Optional GC root-scanner timings attribute stack, symbol, and individual
+  external scanner costs, with address anchors for resolving scanner names
+  ([#710](https://github.com/atgreen/evergreen/pull/710)).
+
 - Optional minor-GC phase timings distinguish root scans, evacuation,
   relocation, and reclamation from stop-the-world coordination
   ([#707](https://github.com/atgreen/evergreen/pull/707)).
