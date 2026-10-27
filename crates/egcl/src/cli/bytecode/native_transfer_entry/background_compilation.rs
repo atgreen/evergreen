@@ -401,6 +401,12 @@ impl EmittedTransfer {
                     ordinary_declined(&"primitive lowering (ordinary_primitives::lower)");
                     return None;
                 }
+                if std::env::var_os("EGCL_DISABLE_ARRAY_LAYOUT_FACTS").is_none() {
+                    let layouts = egcl_compiler::t2::array_layout::hoist_layouts(&mut ir);
+                    if layouts != 0 {
+                        t2_log_write(format_args!("{}: array layout witnesses: {layouts}", display_fn_name(&body.name)));
+                    }
+                }
                 egcl_compiler::t2::opt_clear_mv::eliminate_redundant(&mut ir, true);
                 use egcl_compiler::t2::emit::OrdinaryArgumentBinding;
                 let keyword_plan = context.keyword_plan;

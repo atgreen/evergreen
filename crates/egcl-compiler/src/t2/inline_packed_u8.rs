@@ -76,6 +76,95 @@ pub(super) fn emit_ordinary(
     Some(done)
 }
 
+/// Pair only the next instruction in this block. In particular, no implicit
+/// poll, edge projection, MV reset or other operation may be bypassed.
+pub(super) fn adjacent_layout(
+    f: &Function,
+    block: crate::t2::ir::Block,
+    call: crate::t2::ir::Inst,
+    straight_polls: &std::collections::HashSet<crate::t2::ir::Inst>,
+    tail: bool,
+) -> Option<(crate::t2::ir::Inst, Value)> {
+    let data = f.inst(call);
+    if tail || data.opcode != Opcode::Call || shape(f, data).is_none() {
+        return None;
+    }
+    let instructions = &f.block(block).insts;
+    let position = instructions.iter().position(|&inst| inst == call)?;
+    let probe = *instructions.get(position + 1)?;
+    let layout = f.inst(probe);
+    if straight_polls.contains(&probe)
+        || layout.opcode != Opcode::PackedU8Layout
+        || layout.args.as_slice() != data.results.as_slice()
+        || layout.results.len() != 1
+        || layout.flags != crate::t2::ir::InstFlags::default()
+        || !matches!(layout.aux, AuxData::None)
+        || layout.frame_state.is_some()
+        || !layout.targets.is_empty()
+        || f.value(layout.results[0]).repr != ValueRepresentation::Tagged
+        || f.value(layout.results[0]).ty.bits
+            != crate::t2::ir::TypeBits::FIXNUM.join(crate::t2::ir::TypeBits::NULL)
+    {
+        return None;
+    }
+    Some((probe, layout.results[0]))
+}
+
+/// Only the runtime-validated bump success supplies this width. Every slow
+/// branch still enters the original collecting call and the real probe.
+pub(super) fn emit_ordinary_layout(
+    a: &mut Asm,
+    f: &Function,
+    data: &InstData,
+    homes: &HashMap<Value, FramedHome>,
+    constants: &HashMap<Value, u64>,
+    mv_empty: bool,
+    fusion: (Value, egcl_rt::asm::Label),
+) -> Option<()> {
+    if !mv_empty {
+        return None;
+    }
+    let result = *homes.get(data.results.first()?)?;
+    let width = *homes.get(&fusion.0)?;
+    let valid_home = |home| match home {
+        FramedHome::Reg(reg) => crate::t2::x64_frame::FRAME_GPRS
+            .iter()
+            .any(|&index| crate::t2::x64_frame::GPR_X86[index] == reg),
+        FramedHome::Stack(slot) => slot <= i32::MAX as u32 / 8,
+    };
+    if result == width || !valid_home(result) || !valid_home(width) {
+        return None;
+    }
+    let slow = a.label();
+    emit_bump(a, f, data, homes, constants, slow)?;
+    publish_layout_completion(a, result, width, fusion.1);
+    a.bind(slow);
+    static LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *LOG.get_or_init(|| std::env::var_os("EGCL_ARRAY_LAYOUT_LOG").is_some()) {
+        eprintln!(
+            "[array-layout] {}: inline allocation witness reused",
+            f.name()
+        );
+    }
+    Some(())
+}
+
+/// Enter only after emit_bump committed and initialized a small packed-U8
+/// allocation in RAX. Caller preflighted distinct final homes and empty MV.
+/// No allocation pointer is retained: publish tagged array and tagged width.
+fn publish_layout_completion(
+    a: &mut Asm,
+    result: FramedHome,
+    width: FramedHome,
+    done: egcl_rt::asm::Label,
+) {
+    store_home(a, result, RAX, 0);
+    mov_imm32(a, SCRATCH, 8 << 3);
+    store_home(a, width, SCRATCH, 0);
+    a.push(0xf8); // incoming MV was proven empty; fast allocation leaves it so
+    a.jmp(done);
+}
+
 pub(super) fn emit_framed(
     a: &mut Asm,
     f: &Function,
@@ -374,5 +463,190 @@ mod tests {
         assert!(bytes <= 544, "bounded template grew to {bytes} bytes");
         eprintln!("inline packed-U8 worst-home ordinary bytes={bytes}");
         // This budget excludes unrolling a store for every possible element.
+    }
+    fn paired_fixture() -> (Function, crate::t2::ir::Inst, crate::t2::ir::Inst, Value) {
+        let (mut f, call_data) = fixture();
+        let block = f.entry();
+        let call = f.block(block).insts[0];
+        let (probe, results) = f.push_inst(
+            block,
+            InstData {
+                opcode: Opcode::PackedU8Layout,
+                args: call_data.results,
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags::default(),
+                frame_state: None,
+                targets: vec![],
+                source_pos: 0,
+            },
+            &[(
+                IRType::of(crate::t2::ir::TypeBits::FIXNUM.join(crate::t2::ir::TypeBits::NULL)),
+                ValueRepresentation::Tagged,
+            )],
+        );
+        assert_eq!(f.block_mut(block).insts.pop(), Some(probe));
+        f.block_mut(block).insts.insert(1, probe);
+        (f, call, probe, results[0])
+    }
+    #[test]
+    fn allocation_layout_pair_requires_exact_adjacent_array_without_poll_or_tail() {
+        let (mut f, call, probe, width) = paired_fixture();
+        let block = f.entry();
+        let mut polls = std::collections::HashSet::new();
+        assert_eq!(
+            adjacent_layout(&f, block, call, &polls, false),
+            Some((probe, width))
+        );
+        assert_eq!(adjacent_layout(&f, block, call, &polls, true), None);
+        polls.insert(probe);
+        assert_eq!(adjacent_layout(&f, block, call, &polls, false), None);
+        polls.clear();
+        let original = f.inst(probe).args[0];
+        f.inst_mut(probe).args[0] = f.inst(call).args[0];
+        assert_eq!(adjacent_layout(&f, block, call, &polls, false), None);
+        f.inst_mut(probe).args[0] = original;
+        let (reset, _) = f.push_inst(
+            block,
+            InstData {
+                opcode: Opcode::ClearMv,
+                args: vec![],
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags {
+                    effectful: true,
+                    ..Default::default()
+                },
+                frame_state: None,
+                targets: vec![],
+                source_pos: 0,
+            },
+            &[],
+        );
+        assert_eq!(f.block_mut(block).insts.pop(), Some(reset));
+        f.block_mut(block).insts.insert(1, reset);
+        assert_eq!(adjacent_layout(&f, block, call, &polls, false), None);
+        f.block_mut(block).insts.retain(|&inst| inst != reset);
+        f.inst_mut(call).aux = AuxData::CallTarget(0xf004);
+        assert_eq!(adjacent_layout(&f, block, call, &polls, false), None);
+    }
+    #[test]
+    fn allocation_layout_fast_exit_requires_empty_mv_and_distinct_publishable_homes() {
+        let (f, call, _, width) = paired_fixture();
+        let data = f.inst(call);
+        let homes = HashMap::from([
+            (data.args[0], FramedHome::Stack(0)),
+            (data.args[1], FramedHome::Stack(1)),
+            (data.args[2], FramedHome::Stack(2)),
+            (data.results[0], FramedHome::Reg(1)),
+            (width, FramedHome::Stack(3)),
+        ]);
+        let mut a = Asm::new();
+        let done = a.label();
+        assert!(
+            emit_ordinary_layout(
+                &mut a,
+                &f,
+                data,
+                &homes,
+                &HashMap::new(),
+                false,
+                (width, done)
+            )
+            .is_none()
+        );
+        let mut aliases = homes.clone();
+        aliases.insert(width, FramedHome::Reg(1));
+        assert!(
+            emit_ordinary_layout(
+                &mut a,
+                &f,
+                data,
+                &aliases,
+                &HashMap::new(),
+                true,
+                (width, done)
+            )
+            .is_none()
+        );
+        assert_eq!(a.here(), 0);
+        assert!(
+            emit_ordinary_layout(
+                &mut a,
+                &f,
+                data,
+                &homes,
+                &HashMap::new(),
+                true,
+                (width, done)
+            )
+            .is_some()
+        );
+        // Original slow call/probe emission belongs here; the fast branch must
+        // cross it, with both homes published and CF cleared beforehand.
+        let slow = a.here();
+        a.push(0x90);
+        a.bind(done);
+        let code = a.finish().unwrap();
+        assert_eq!(&code[slow - 6..slow - 5], &[0xf8]);
+        assert_eq!(code[slow - 5], 0xe9);
+        assert_eq!(
+            i32::from_le_bytes(code[slow - 4..slow].try_into().unwrap()),
+            1
+        );
+        assert!(
+            code[..slow]
+                .windows(5)
+                .any(|bytes| bytes == [0xba, 64, 0, 0, 0]),
+            "tagged small-header width uses flag-preserving short MOV32"
+        );
+    }
+    #[test]
+    fn native_layout_completion_publishes_homes_and_skips_probe_without_stack_or_carry_damage() {
+        // Exercise the actual production tail after a phantom successful bump.
+        // The mock tagged bits are never dereferenced: this is native control /
+        // publication evidence, NOT an allocation or moving-GC claim.
+        let mock_array = 0x1234_5002u64;
+        let unrelated = 0xfeed_1234_5678_9abcu64;
+        for (array_home, width_home) in [
+            (FramedHome::Reg(1), FramedHome::Stack(0)),
+            (FramedHome::Stack(0), FramedHome::Reg(1)),
+            (FramedHome::Stack(0), FramedHome::Stack(1)),
+        ] {
+            let mut a = Asm::new();
+            mov_rr(&mut a, 8, 7); // output pointer: independent of final homes
+            mov_rr(&mut a, RAX, 4);
+            store_mem64_disp(&mut a, 8, 24, RAX); // entry RSP
+            a.extend_from_slice(&[0x48, 0x8d, 0x64, 0x24, 0xe8]); // lea rsp,[rsp-24]
+            mov_imm64(&mut a, 6, unrelated as i64);
+            mov_imm64(&mut a, RAX, mock_array as i64);
+            a.push(0xf9); // STC must be cleared by the production tail
+            let done = a.label();
+            publish_layout_completion(&mut a, array_home, width_home, done);
+            // This represents the skipped slow-call / actual layout-probe path.
+            a.extend_from_slice(&[0x41, 0xc6, 0x40, 16, 123]);
+            a.bind(done);
+            load_home(&mut a, RAX, array_home, 0);
+            store_mem64_disp(&mut a, 8, 0, RAX);
+            load_home(&mut a, RAX, width_home, 0);
+            store_mem64_disp(&mut a, 8, 8, RAX);
+            a.extend_from_slice(&[0x41, 0x0f, 0x92, 0x40, 32]); // setc byte [r8+32]
+            store_mem64_disp(&mut a, 8, 40, 6);
+            a.extend_from_slice(&[0x48, 0x8d, 0x64, 0x24, 24]);
+            mov_rr(&mut a, RAX, 4);
+            store_mem64_disp(&mut a, 8, 48, RAX);
+            a.push(0xc3);
+            let bytes = a.finish().unwrap();
+            let code = egcl_rt::jit::JitBuffer::new(&bytes).unwrap();
+            let entry: extern "C" fn(*mut u64) = unsafe { std::mem::transmute(code.as_ptr()) };
+            let mut observed = [0u64; 7];
+            entry(observed.as_mut_ptr());
+            assert_eq!(observed[0], mock_array);
+            assert_eq!(observed[1], 64);
+            assert_eq!(observed[2], 0, "the slow probe sentinel must be bypassed");
+            assert_eq!(observed[4], 0, "CLC supplies the ordinary empty-MV promise");
+            assert_eq!(observed[5], unrelated, "unrelated live RSI home survives");
+            assert_eq!(observed[3], observed[6], "native stack remains balanced");
+        }
     }
 }

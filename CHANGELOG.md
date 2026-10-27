@@ -4,6 +4,10 @@
 
 ### Changed
 
+- x86-64 Linux T2 shares checked packed-byte array layout information across
+  repeated stores while retaining bounds checks and moving-GC safety
+  ([#731](https://github.com/atgreen/evergreen/pull/731)).
+
 - x86-64 Linux T2 reduces redundant versions of bounded byte-extraction loops,
   keeps partial-word stores native, and uses register rotations for eligible
   cyclic value moves ([#730](https://github.com/atgreen/evergreen/pull/730)).

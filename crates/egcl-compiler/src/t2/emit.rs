@@ -198,8 +198,8 @@ fn redundant_bounded_cycle_polls(
         }
         let kernel = f.inst(body[body.len() - 2]);
         let branch = f.inst(body[body.len() - 1]);
-        if !matches!(kernel.opcode, Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8)
-            || kernel.args.len() != 4
+        if !matches!(kernel.opcode, Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8 | Opcode::TryStoreIntegerOctets1To8Layout)
+            || kernel.args.len() != if kernel.opcode == Opcode::TryStoreIntegerOctets1To8Layout { 5 } else { 4 }
             || kernel.results.len() != 2
             || !kernel.flags.effectful
             || kernel.flags.call
@@ -240,7 +240,7 @@ fn redundant_bounded_cycle_polls(
         // still remove the success-entry check.
         if body[..body.len() - 2].iter().any(|&inst| {
             let d = f.inst(inst);
-            matches!(d.opcode, Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8)
+            matches!(d.opcode, Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8 | Opcode::TryStoreIntegerOctets1To8Layout)
                 || !d.targets.is_empty()
                 || d.flags.terminator
         }) {
@@ -5674,8 +5674,8 @@ fn emit_transfer_function_with_storage(
                     | Opcode::Cdr
                     | Opcode::StringCharOrNil
                     | Opcode::VecRef | Opcode::VecSet | Opcode::VecSetInRange | Opcode::ArrayReadDiscarded | Opcode::PackedF64P
-                    | Opcode::MemoryFence | Opcode::TryIntegerShr | Opcode::SmallVectorRangeP
-                    | Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8 | Opcode::NativePoll
+                    | Opcode::MemoryFence | Opcode::TryIntegerShr | Opcode::SmallVectorRangeP | Opcode::PackedU8Layout
+                    | Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8 | Opcode::TryStoreIntegerOctets1To8Layout | Opcode::NativePoll
             ) {
                 return Err(EmitError::UnsupportedOp(op_tag(f.inst(inst).opcode)));
             }
@@ -6890,9 +6890,9 @@ fn emit_framed_inner(
                             | Opcode::TakeValuesToLocals
                             | Opcode::MemoryFence
                             | Opcode::TryIntegerShr
-                            | Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8
+                            | Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8 | Opcode::TryStoreIntegerOctets1To8Layout
                             | Opcode::NativePoll
-                            | Opcode::SmallVectorRangeP
+                            | Opcode::SmallVectorRangeP | Opcode::PackedU8Layout
                             | Opcode::TryPackedF64Set
                             | Opcode::PackedF64P
                     )
@@ -7309,6 +7309,8 @@ fn emit_framed_inner(
     // state knows the bytecode position it deoptimizes to. Collect (native
     // offset, bcp) at those points; post-processed into a per-bcp map below.
     let mut bcp_sites: Vec<(u32, u32)> = Vec::new();
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let mut allocation_layout_completions = HashMap::new();
 
     // Emit each block: bind its label, emit its instructions, then its terminator
     // (with block-parameter moves on each out-edge).
@@ -7506,7 +7508,8 @@ fn emit_framed_inner(
             });
             let (mut inst_reg, result_stores) = if stack_float.is_some()
                 || d.opcode == Opcode::TakeValuesToLocals
-                || matches!(d.opcode, Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8)
+                || d.opcode == Opcode::PackedU8Layout
+                || matches!(d.opcode, Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8 | Opcode::TryStoreIntegerOctets1To8Layout)
                 || d.opcode == Opcode::Invoke
                 || matches!(
                     d.opcode,
@@ -7528,12 +7531,22 @@ fn emit_framed_inner(
                     d.opcode == Opcode::FloatAdd && raw_add_needs_zero_fixup(f, &d.args));
             } else if ordinary_call_mode && d.opcode == Opcode::Call {
                 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-                { let inline_done = inline_alloc::emit_ordinary_fast_path(&mut a, &d, &homes,
+                {
+                let fused = inline_packed_u8::adjacent_layout(f, b, inst, &straight_poll_sources,
+                    ordinary_call.unwrap().returns_at(inst)).is_some_and(|(probe, width)| {
+                    let done = a.label();
+                    if inline_packed_u8::emit_ordinary_layout(&mut a, f, &d, &homes,
+                        &const_tagged, inline_alloc_single.contains(&inst), (width, done)).is_some() {
+                        allocation_layout_completions.insert(probe, done);
+                        true
+                    } else { false }
+                });
+                let inline_done = if fused { None } else { inline_alloc::emit_ordinary_fast_path(&mut a, &d, &homes,
                     &const_tagged, inline_alloc_single.contains(&inst))
                     .or_else(|| inline_packed_u8::emit_ordinary(&mut a, f, &d, &homes,
                         &const_tagged, inline_alloc_single.contains(&inst)))
                     .or_else(|| inline_special::emit_ordinary_fast_path(&mut a, &d, &homes,
-                        &const_tagged, inline_alloc_single.contains(&inst)));
+                        &const_tagged, inline_alloc_single.contains(&inst))) };
                 inst_calls = ordinary_call.unwrap().for_inst(inst).emit(&mut a, &d, &homes, &const_tagged,
                     ordinary_call::OrdinaryCallFrame { function: f, inference: &inference,
                         outgoing: outgoing_area,
@@ -7895,8 +7908,10 @@ fn emit_framed_inner(
                         const_tagged.get(&d.args[1]).copied(), label);
                 }
                 a.bind(done);
-            } else if matches!(d.opcode, Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8) {
+            } else if matches!(d.opcode, Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8 | Opcode::TryStoreIntegerOctets1To8Layout) {
                 octet_word_store::emit_framed(&mut a, f, &d, &homes, &const_tagged)?;
+            } else if d.opcode == Opcode::PackedU8Layout {
+                octet_word_store::emit_layout(&mut a, f, &d, &homes, &const_tagged)?;
             } else if d.opcode == Opcode::TryIntegerShr {
                 integer_shift::emit(&mut a, &d, &inst_reg, &const_tagged)?;
             } else if d.opcode == Opcode::TryPackedF64Set {
@@ -8488,6 +8503,8 @@ fn emit_framed_inner(
             }
             #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
             if let Some(done) = inline_alloc_done { a.bind(done); }
+            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+            if let Some(done) = allocation_layout_completions.remove(&inst) { a.bind(done); }
         }
 
         if ordinary_returns_from_call { continue; }

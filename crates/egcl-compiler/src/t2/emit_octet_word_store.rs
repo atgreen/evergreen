@@ -11,8 +11,15 @@ fn invalid_shape(f: &Function, data: &crate::t2::ir::InstData) -> bool {
     use crate::t2::ir::{AuxData, InstFlags, Opcode, ValueRepresentation as Repr};
     !matches!(
         data.opcode,
-        Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8
-    ) || data.args.len() != 4
+        Opcode::TryStoreIntegerOctets8
+            | Opcode::TryStoreIntegerOctets1To8
+            | Opcode::TryStoreIntegerOctets1To8Layout
+    ) || data.args.len()
+        != if data.opcode == Opcode::TryStoreIntegerOctets1To8Layout {
+            5
+        } else {
+            4
+        }
         || data.results.len() != 2
         || !matches!(data.aux, AuxData::None)
         || data.flags
@@ -57,7 +64,17 @@ pub(super) fn emit(
     }
     // Snapshot all operands before writing either result: an output may alias
     // any input home. Framed inputs never occupy the reserved RAX/RDX scratch.
-    for input in &data.args {
+    let layout = data.opcode == Opcode::TryStoreIntegerOctets1To8Layout;
+    if layout {
+        let input = data.args[4];
+        if let Some(&bits) = constants.get(&input) {
+            mov_imm64(a, RAX, bits as i64);
+            push_reg(a, RAX);
+        } else {
+            push_reg(a, reg[&input]);
+        }
+    }
+    for input in &data.args[..4] {
         if let Some(&bits) = constants.get(input) {
             mov_imm64(a, RAX, bits as i64);
             push_reg(a, RAX);
@@ -69,7 +86,8 @@ pub(super) fn emit(
         a,
         success_dst,
         final_dst,
-        data.opcode == Opcode::TryStoreIntegerOctets1To8,
+        data.opcode != Opcode::TryStoreIntegerOctets8,
+        layout,
     )
 }
 
@@ -87,12 +105,27 @@ pub(super) fn emit_framed(
     if invalid_shape(f, data) {
         return Err(EmitError::UnsupportedOp(op_tag(data.opcode)));
     }
-    for (index, input) in data.args.iter().enumerate() {
+    let layout = data.opcode == Opcode::TryStoreIntegerOctets1To8Layout;
+    if layout {
+        let input = data.args[4];
+        if let Some(&bits) = constants.get(&input) {
+            mov_imm64(a, RAX, bits as i64);
+        } else {
+            load_home(
+                a,
+                RAX,
+                *homes.get(&input).ok_or(EmitError::UnsupportedOp(0xF2))?,
+                0,
+            );
+        }
+        push_reg(a, RAX);
+    }
+    for (index, input) in data.args[..4].iter().enumerate() {
         if let Some(&bits) = constants.get(input) {
             mov_imm64(a, RAX, bits as i64);
         } else {
             let home = *homes.get(input).ok_or(EmitError::UnsupportedOp(0xF2))?;
-            load_home(a, RAX, home, (index * 8) as i32);
+            load_home(a, RAX, home, ((index + usize::from(layout)) * 8) as i32);
         }
         push_reg(a, RAX);
     }
@@ -100,7 +133,8 @@ pub(super) fn emit_framed(
         a,
         RAX,
         SCRATCH,
-        data.opcode == Opcode::TryStoreIntegerOctets1To8,
+        data.opcode != Opcode::TryStoreIntegerOctets8,
+        layout,
     )?;
     for (&value, source) in data.results.iter().zip([RAX, SCRATCH]) {
         if let Some(&home) = homes.get(&value) {
@@ -110,11 +144,89 @@ pub(super) fn emit_framed(
     Ok(())
 }
 
-fn emit_body(a: &mut Asm, success_dst: u8, final_dst: u8, partial: bool) -> Result<(), EmitError> {
+/// Probe only the immutable object layout. Its tagged width can cross GC;
+/// unlike an interior address it remains valid when the array is relocated.
+pub(super) fn emit_layout(
+    a: &mut Asm,
+    f: &Function,
+    data: &crate::t2::ir::InstData,
+    homes: &std::collections::HashMap<crate::t2::ir::Value, FramedHome>,
+    constants: &std::collections::HashMap<crate::t2::ir::Value, u64>,
+) -> Result<(), EmitError> {
+    use crate::t2::ir::{AuxData, InstFlags, TypeBits, ValueRepresentation as Repr};
+    if data.opcode != Opcode::PackedU8Layout
+        || data.args.len() != 1
+        || data.results.len() != 1
+        || data.flags != InstFlags::default()
+        || data.frame_state.is_some()
+        || !data.targets.is_empty()
+        || !matches!(data.aux, AuxData::None)
+        || data
+            .args
+            .iter()
+            .chain(&data.results)
+            .any(|&v| f.value(v).repr != Repr::Tagged)
+        || f.value(data.results[0]).ty.bits != TypeBits::FIXNUM.join(TypeBits::NULL)
+    {
+        return Err(EmitError::UnsupportedOp(op_tag(data.opcode)));
+    }
+    let input = data.args[0];
+    if let Some(&bits) = constants.get(&input) {
+        mov_imm64(a, RAX, bits as i64);
+    } else {
+        load_home(
+            a,
+            RAX,
+            *homes.get(&input).ok_or(EmitError::UnsupportedOp(0xF2))?,
+            0,
+        );
+    }
+    let failed = a.label();
+    let small = a.label();
+    let body = a.label();
+    let done = a.label();
+    mov_rr(a, SCRATCH, RAX);
+    alu_r_imm(a, 4, SCRATCH, 7);
+    alu_r_imm(a, 7, SCRATCH, egcl_rt::value::TAG_HEAP_OBJECT as i32);
+    a.jcc(Cc::Ne, failed);
+    alu_r_imm(a, 4, RAX, -8);
+    a.extend_from_slice(&[0x80, 0x78, 0x07, egcl_rt::object::type_id::SIMPLE_ARRAY]);
+    a.jcc(Cc::Ne, failed);
+    a.extend_from_slice(&[0x66, 0x81, 0x38, 0xff, 0xff]);
+    a.jcc(Cc::Ne, small);
+    mov_imm64(a, SCRATCH, 16);
+    a.jmp(body);
+    a.bind(small);
+    mov_imm64(a, SCRATCH, 8);
+    a.bind(body);
+    alu_rr(a, 0x01, RAX, SCRATCH);
+    a.extend_from_slice(&[0x80, 0x38, egcl_rt::object::ElementTypeTag::U8 as u8]);
+    a.jcc(Cc::Ne, failed);
+    shl_imm(a, SCRATCH, 3);
+    mov_rr(a, RAX, SCRATCH);
+    a.jmp(done);
+    a.bind(failed);
+    mov_imm64(a, RAX, egcl_rt::value::NIL.to_raw() as i64);
+    a.bind(done);
+    mov_imm64(a, SCRATCH, 0);
+    if let Some(&home) = homes.get(&data.results[0]) {
+        store_home(a, home, RAX, 0);
+    }
+    Ok(())
+}
+
+fn emit_body(
+    a: &mut Asm,
+    success_dst: u8,
+    final_dst: u8,
+    partial: bool,
+    layout: bool,
+) -> Result<(), EmitError> {
     const RSP: u8 = 4;
     alu_r_imm(a, 5, RSP, 24);
     // Fixed stack: raw word/result flag +0, final FX +8, body/slot +16,
-    // integer +24, end +32, start +40, array +48. Every exit restores 56 bytes.
+    // integer +24, end +32, start +40, array +48, optional width +56.
+    // Every exit restores 56 bytes, or 64 with the verified width witness.
     let failed = a.label();
     let short = a.label();
     let fixnum = a.label();
@@ -170,25 +282,38 @@ fn emit_body(a: &mut Asm, success_dst: u8, final_dst: u8, partial: bool) -> Resu
     store_to_rsp(a, RAX, 0);
     store_to_rsp(a, SCRATCH, 8);
 
-    load_from_rsp(a, RAX, 48);
-    mov_rr(a, SCRATCH, RAX);
-    alu_r_imm(a, 4, SCRATCH, 7);
-    alu_r_imm(a, 7, SCRATCH, egcl_rt::value::TAG_HEAP_OBJECT as i32);
-    a.jcc(Cc::Ne, failed);
-    alu_r_imm(a, 4, RAX, -8);
-    a.extend_from_slice(&[0x80, 0x78, 0x07, egcl_rt::object::type_id::SIMPLE_ARRAY]);
-    a.jcc(Cc::Ne, failed);
-    let small = a.label();
-    let body = a.label();
-    a.extend_from_slice(&[0x66, 0x81, 0x38, 0xff, 0xff]);
-    a.jcc(Cc::Ne, small);
-    alu_r_imm(a, 0, RAX, 16);
-    a.jmp(body);
-    a.bind(small);
-    alu_r_imm(a, 0, RAX, 8);
-    a.bind(body);
-    a.extend_from_slice(&[0x80, 0x38, egcl_rt::object::ElementTypeTag::U8 as u8]);
-    a.jcc(Cc::Ne, failed);
+    if layout {
+        // The verifier binds this immutable width witness to this exact array.
+        // NIL keeps the original checked scalar fallback. Rebuild the body
+        // pointer from the current tagged root: it may have moved at any poll.
+        load_from_rsp(a, SCRATCH, 56);
+        alu_r_imm(a, 7, SCRATCH, egcl_rt::value::NIL.to_raw() as i32);
+        a.jcc(Cc::E, failed);
+        sar_imm(a, SCRATCH, 3);
+        load_from_rsp(a, RAX, 48);
+        alu_r_imm(a, 4, RAX, -8);
+        alu_rr(a, 0x01, RAX, SCRATCH);
+    } else {
+        load_from_rsp(a, RAX, 48);
+        mov_rr(a, SCRATCH, RAX);
+        alu_r_imm(a, 4, SCRATCH, 7);
+        alu_r_imm(a, 7, SCRATCH, egcl_rt::value::TAG_HEAP_OBJECT as i32);
+        a.jcc(Cc::Ne, failed);
+        alu_r_imm(a, 4, RAX, -8);
+        a.extend_from_slice(&[0x80, 0x78, 0x07, egcl_rt::object::type_id::SIMPLE_ARRAY]);
+        a.jcc(Cc::Ne, failed);
+        let small = a.label();
+        let body = a.label();
+        a.extend_from_slice(&[0x66, 0x81, 0x38, 0xff, 0xff]);
+        a.jcc(Cc::Ne, small);
+        alu_r_imm(a, 0, RAX, 16);
+        a.jmp(body);
+        a.bind(small);
+        alu_r_imm(a, 0, RAX, 8);
+        a.bind(body);
+        a.extend_from_slice(&[0x80, 0x38, egcl_rt::object::ElementTypeTag::U8 as u8]);
+        a.jcc(Cc::Ne, failed);
+    }
     store_to_rsp(a, RAX, 16);
     load_from_rsp(a, RAX, 40);
     mov_rr(a, SCRATCH, RAX);
@@ -276,7 +401,7 @@ fn emit_body(a: &mut Asm, success_dst: u8, final_dst: u8, partial: bool) -> Resu
     mov_imm64(a, SCRATCH, 0); // no interior pointer escapes in a scratch register
     load_from_rsp(a, final_dst, 8);
     load_from_rsp(a, success_dst, 0);
-    alu_r_imm(a, 0, RSP, 56);
+    alu_r_imm(a, 0, RSP, if layout { 64 } else { 56 });
     Ok(())
 }
 
@@ -286,13 +411,37 @@ mod tests {
     use crate::t2::ir::{
         AuxData, IRType, InstData, InstFlags, Opcode, TypeBits, ValueRepresentation,
     };
-    use egcl_rt::object::{type_id, ElementTypeTag, ObjectHeader};
+    use egcl_rt::object::{ElementTypeTag, ObjectHeader, type_id};
     use egcl_rt::value::{EgclVal, NIL, T};
     use iced_x86::{Decoder, DecoderOptions, Mnemonic, OpKind, Register};
     use std::collections::HashMap;
 
     fn kernel(outputs: [u8; 2], constants: [Option<u64>; 4]) -> egcl_rt::jit::JitBuffer {
         kernel_opcode(outputs, constants, Opcode::TryStoreIntegerOctets8)
+    }
+    fn width_probe(
+        f: &mut Function,
+        block: crate::t2::ir::Block,
+        array: crate::t2::ir::Value,
+    ) -> (crate::t2::ir::Inst, crate::t2::ir::Value) {
+        let (inst, results) = f.push_inst(
+            block,
+            InstData {
+                opcode: Opcode::PackedU8Layout,
+                args: vec![array],
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags::default(),
+                targets: vec![],
+                frame_state: None,
+                source_pos: 0,
+            },
+            &[(
+                IRType::of(TypeBits::FIXNUM.join(TypeBits::NULL)),
+                ValueRepresentation::Tagged,
+            )],
+        );
+        (inst, results[0])
     }
     fn kernel_opcode(
         outputs: [u8; 2],
@@ -304,11 +453,17 @@ mod tests {
         let args: Vec<_> = (0..4)
             .map(|_| f.add_block_param(block, IRType::TOP, ValueRepresentation::Tagged))
             .collect();
+        let probe = (opcode == Opcode::TryStoreIntegerOctets1To8Layout)
+            .then(|| width_probe(&mut f, block, args[0]));
+        let mut kernel_args = args.clone();
+        if let Some((_, width)) = probe {
+            kernel_args.push(width);
+        }
         let (inst, result) = f.push_inst(
             block,
             InstData {
                 opcode,
-                args: args.clone(),
+                args: kernel_args,
                 results: vec![],
                 aux: AuxData::None,
                 flags: InstFlags {
@@ -345,6 +500,14 @@ mod tests {
             .collect();
         for v in constants.keys() {
             registers.remove(v);
+        }
+        if let Some((inst, width)) = probe {
+            registers.insert(width, 8);
+            let homes = registers
+                .iter()
+                .map(|(&v, &r)| (v, FramedHome::Reg(r)))
+                .collect();
+            super::emit_layout(&mut a, &f, f.inst(inst), &homes, &constants).unwrap();
         }
         registers.insert(result[0], outputs[0]);
         registers.insert(result[1], outputs[1]);
@@ -390,9 +553,11 @@ mod tests {
             "bounded straight-line word kernel: {} instructions",
             decoded.len()
         );
-        assert!(decoded
-            .iter()
-            .all(|i| i.mnemonic() != Mnemonic::Call && !i.is_invalid()));
+        assert!(
+            decoded
+                .iter()
+                .all(|i| i.mnemonic() != Mnemonic::Call && !i.is_invalid())
+        );
         if opcode == Opcode::TryStoreIntegerOctets8 {
             assert!(
                 decoded
@@ -724,11 +889,17 @@ mod tests {
         let args: Vec<_> = (0..4)
             .map(|_| f.add_block_param(block, IRType::TOP, ValueRepresentation::Tagged))
             .collect();
+        let probe = (opcode == Opcode::TryStoreIntegerOctets1To8Layout)
+            .then(|| width_probe(&mut f, block, args[0]));
+        let mut kernel_args = args.clone();
+        if let Some((_, width)) = probe {
+            kernel_args.push(width);
+        }
         let (inst, results) = f.push_inst(
             block,
             InstData {
                 opcode,
-                args: args.clone(),
+                args: kernel_args,
                 results: vec![],
                 aux: AuxData::None,
                 flags: InstFlags {
@@ -783,6 +954,10 @@ mod tests {
         // Exercise load_home's immediately-preceding-store forwarding on
         // the first argument. Each later push must invalidate it by position.
         store_home(&mut a, FramedHome::Stack(0), 7, 0);
+        if let Some((inst, width)) = probe {
+            homes.insert(width, FramedHome::Stack(6));
+            super::emit_layout(&mut a, &f, f.inst(inst), &homes, &constants).unwrap();
+        }
         super::emit_framed(&mut a, &f, f.inst(inst), &homes, &constants).unwrap();
         load_home(&mut a, RAX, success_home, 0);
         store_mem64_disp(&mut a, 10, 0, RAX);
@@ -815,9 +990,11 @@ mod tests {
         alu_r_imm(&mut a, 0, 4, 96);
         a.extend_from_slice(&[0xc3]);
         let bytes = a.finish().unwrap();
-        assert!(Decoder::new(64, &bytes, DecoderOptions::NONE)
-            .into_iter()
-            .all(|i| i.mnemonic() != Mnemonic::Call && !i.is_invalid()));
+        assert!(
+            Decoder::new(64, &bytes, DecoderOptions::NONE)
+                .into_iter()
+                .all(|i| i.mnemonic() != Mnemonic::Call && !i.is_invalid())
+        );
         egcl_rt::jit::JitBuffer::new(&bytes).unwrap()
     }
 
@@ -873,41 +1050,26 @@ mod tests {
     }
     #[test]
     fn native_partial_octets_cover_all_spans_signs_layouts_and_output_aliases() {
-        for outputs in [[8, RAX], [7, 6], [1, 9], [RAX, SCRATCH], [SCRATCH, RAX]] {
-            let code = kernel_opcode(outputs, [None; 4], Opcode::TryStoreIntegerOctets1To8);
-            for large in [false, true] {
-                let mut o = Octets::new(if large { 600000 } else { 32 }, large);
-                for n in 1..=8 {
-                    for start in [0, 1, o.length - n] {
-                        for value in [
-                            egcl_rt::bignum::FIXNUM_MIN,
-                            -257,
-                            -1,
-                            0,
-                            255,
-                            egcl_rt::bignum::FIXNUM_MAX,
-                        ] {
-                            let before = partial_image(&o, start, value as u64, n);
-                            let shifted = ((value as i128) >> (8 * n)) as i64;
-                            assert_eq!(
-                                run(
-                                    &code,
-                                    [
-                                        o.tagged(),
-                                        fx(start as i64),
-                                        fx((start + n) as i64),
-                                        fx(value)
-                                    ]
-                                ),
-                                [T.to_raw(), fx(shifted)]
-                            );
-                            assert_eq!(o.words, before);
-                        }
-                        for magnitude in [(1u64 << 60) + 1, 1u64 << 63, u64::MAX] {
-                            for sign in [-1, 1] {
-                                let mut integer = Integer::new(sign, magnitude);
-                                let value = (magnitude as i128) * (sign as i128);
+        for opcode in [
+            Opcode::TryStoreIntegerOctets1To8,
+            Opcode::TryStoreIntegerOctets1To8Layout,
+        ] {
+            for outputs in [[8, RAX], [7, 6], [1, 9], [RAX, SCRATCH], [SCRATCH, RAX]] {
+                let code = kernel_opcode(outputs, [None; 4], opcode);
+                for large in [false, true] {
+                    let mut o = Octets::new(if large { 600000 } else { 32 }, large);
+                    for n in 1..=8 {
+                        for start in [0, 1, o.length - n] {
+                            for value in [
+                                egcl_rt::bignum::FIXNUM_MIN,
+                                -257,
+                                -1,
+                                0,
+                                255,
+                                egcl_rt::bignum::FIXNUM_MAX,
+                            ] {
                                 let before = partial_image(&o, start, value as u64, n);
+                                let shifted = ((value as i128) >> (8 * n)) as i64;
                                 assert_eq!(
                                     run(
                                         &code,
@@ -915,15 +1077,35 @@ mod tests {
                                             o.tagged(),
                                             fx(start as i64),
                                             fx((start + n) as i64),
-                                            integer.tagged()
+                                            fx(value)
                                         ]
                                     ),
-                                    [T.to_raw(), fx((value >> (8 * n)) as i64)]
+                                    [T.to_raw(), fx(shifted)]
                                 );
-                                assert_eq!(
-                                    o.words, before,
-                                    "prefix/suffix/header retained, negative high-word correct"
-                                );
+                                assert_eq!(o.words, before);
+                            }
+                            for magnitude in [(1u64 << 60) + 1, 1u64 << 63, u64::MAX] {
+                                for sign in [-1, 1] {
+                                    let mut integer = Integer::new(sign, magnitude);
+                                    let value = (magnitude as i128) * (sign as i128);
+                                    let before = partial_image(&o, start, value as u64, n);
+                                    assert_eq!(
+                                        run(
+                                            &code,
+                                            [
+                                                o.tagged(),
+                                                fx(start as i64),
+                                                fx((start + n) as i64),
+                                                integer.tagged()
+                                            ]
+                                        ),
+                                        [T.to_raw(), fx((value >> (8 * n)) as i64)]
+                                    );
+                                    assert_eq!(
+                                        o.words, before,
+                                        "prefix/suffix/header retained, negative high-word correct"
+                                    );
+                                }
                             }
                         }
                     }
@@ -933,46 +1115,56 @@ mod tests {
     }
     #[test]
     fn native_partial_octets_reject_unsupported_spans_and_values_without_writes() {
-        let code = kernel_opcode([RAX, SCRATCH], [None; 4], Opcode::TryStoreIntegerOctets1To8);
-        let mut o = Octets::new(32, false);
-        let array = o.tagged();
-        let mut wide = Integer::new(1, u64::MAX);
-        wide.count = 2;
-        for args in [
-            [array, fx(1), fx(1), fx(7)],
-            [array, fx(2), fx(1), fx(7)],
-            [array, fx(0), fx(9), fx(7)],
-            [array, fx(-1), fx(3), fx(7)],
-            [array, fx(30), fx(33), fx(7)],
-            [array, NIL.to_raw(), fx(3), fx(7)],
-            [array, fx(0), T.to_raw(), fx(7)],
-            [array, fx(0), fx(3), NIL.to_raw()],
-            [array, fx(0), fx(3), wide.tagged()],
-            [NIL.to_raw(), fx(0), fx(3), fx(7)],
+        for opcode in [
+            Opcode::TryStoreIntegerOctets1To8,
+            Opcode::TryStoreIntegerOctets1To8Layout,
         ] {
-            let before = o.words.clone();
-            assert_eq!(run(&code, args), [NIL.to_raw(), fx(0)]);
-            assert_eq!(o.words, before);
+            let code = kernel_opcode([RAX, SCRATCH], [None; 4], opcode);
+            let mut o = Octets::new(32, false);
+            let array = o.tagged();
+            let mut wide = Integer::new(1, u64::MAX);
+            wide.count = 2;
+            for args in [
+                [array, fx(1), fx(1), fx(7)],
+                [array, fx(2), fx(1), fx(7)],
+                [array, fx(0), fx(9), fx(7)],
+                [array, fx(-1), fx(3), fx(7)],
+                [array, fx(30), fx(33), fx(7)],
+                [array, NIL.to_raw(), fx(3), fx(7)],
+                [array, fx(0), T.to_raw(), fx(7)],
+                [array, fx(0), fx(3), NIL.to_raw()],
+                [array, fx(0), fx(3), wide.tagged()],
+                [NIL.to_raw(), fx(0), fx(3), fx(7)],
+            ] {
+                let before = o.words.clone();
+                assert_eq!(run(&code, args), [NIL.to_raw(), fx(0)]);
+                assert_eq!(o.words, before);
+            }
         }
     }
     #[test]
     fn native_partial_direct_homes_keep_spills_constants_and_dead_result() {
-        for aliases in [false, true] {
-            for dead in [false, true] {
-                let code = framed_kernel_opcode(
-                    [None, Some(fx(1)), None, Some(fx(-257))],
-                    aliases,
-                    dead,
-                    Opcode::TryStoreIntegerOctets1To8,
-                );
-                let mut o = Octets::new(24, false);
-                let before = partial_image(&o, 1, (-257i64) as u64, 3);
-                let result = run(&code, [o.tagged(), NIL.to_raw(), fx(4), NIL.to_raw()]);
-                assert_eq!(result[0], T.to_raw());
-                if !dead {
-                    assert_eq!(result[1], fx(-1));
+        for opcode in [
+            Opcode::TryStoreIntegerOctets1To8,
+            Opcode::TryStoreIntegerOctets1To8Layout,
+        ] {
+            for aliases in [false, true] {
+                for dead in [false, true] {
+                    let code = framed_kernel_opcode(
+                        [None, Some(fx(1)), None, Some(fx(-257))],
+                        aliases,
+                        dead,
+                        opcode,
+                    );
+                    let mut o = Octets::new(24, false);
+                    let before = partial_image(&o, 1, (-257i64) as u64, 3);
+                    let result = run(&code, [o.tagged(), NIL.to_raw(), fx(4), NIL.to_raw()]);
+                    assert_eq!(result[0], T.to_raw());
+                    if !dead {
+                        assert_eq!(result[1], fx(-1));
+                    }
+                    assert_eq!(o.words, before);
                 }
-                assert_eq!(o.words, before);
             }
         }
     }
@@ -980,7 +1172,7 @@ mod tests {
     fn new_full_word_path_keeps_old_instruction_shape_before_cold_partial_handler() {
         fn full_prefix(partial: bool) -> Vec<(iced_x86::Code, String)> {
             let mut a = Asm::new();
-            super::emit_body(&mut a, RAX, SCRATCH, partial).unwrap();
+            super::emit_body(&mut a, RAX, SCRATCH, partial, false).unwrap();
             let bytes = a.finish().unwrap();
             let mut shape = Vec::new();
             for i in Decoder::new(64, &bytes, DecoderOptions::NONE) {
