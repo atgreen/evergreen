@@ -127,11 +127,15 @@ fn recursive_calls_enter_the_frameless_base_case_prefix() {
 
 #[test]
 fn recursive_admission_tests_flags_without_register_round_trips() {
-    use iced_x86::{Decoder, DecoderOptions, Mnemonic};
+    use iced_x86::{Decoder, DecoderOptions, MemorySize, Mnemonic};
     let code = execute_with_self_calls(&fib(), 1, &[12 * 8, 0, 0, 0, 0, 0, 0],
         144 * 8, 0, None, true);
-    let byte_loads = Decoder::new(64, &code, DecoderOptions::NONE).into_iter()
-        .filter(|instruction| instruction.mnemonic() == Mnemonic::Movzx).count();
+    let instructions: Vec<_> = Decoder::new(64, &code, DecoderOptions::NONE).into_iter().collect();
+    // Compact recovery legitimately zero-extends WORD recipes. Admission's
+    // BYTE flags must still be tested directly, without byte-load round trips.
+    let byte_loads = instructions.iter().filter(|instruction|
+        instruction.mnemonic() == Mnemonic::Movzx
+            && instruction.memory_size() == MemorySize::UInt8).count();
     assert_eq!(byte_loads, 0, "admission must test byte flags directly in memory");
 }
 

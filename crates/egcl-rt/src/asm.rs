@@ -173,6 +173,9 @@ enum FixupKind {
     /// x86-64 `rel32`, measured from the END of the four-byte field.
     #[cfg(not(target_arch = "aarch64"))]
     Rel32,
+    /// A signed table word containing target label minus base label.
+    #[cfg(target_arch = "x86_64")]
+    LabelDifference(Label),
     /// A64 `imm26` (`B`, `BL`): `(target - instruction) / 4`, ±128 MiB.
     #[cfg(target_arch = "aarch64")]
     Imm26,
@@ -192,6 +195,11 @@ struct Fixup {
     label: Label,
     kind: FixupKind,
 }
+
+#[cfg(target_arch = "x86_64")]
+mod x86_relax;
+#[cfg(target_arch = "x86_64")]
+pub use x86_relax::OffsetMap;
 
 /// AArch64 instruction encoding. Compiled on every host — the encoders are pure
 /// functions and their tests are the only thing pinning them to the manual, so
@@ -232,6 +240,8 @@ pub struct Asm {
     /// Bound offset of each label, or `None` while still forward-referenced.
     labels: Vec<Option<usize>>,
     fixups: Vec<Fixup>,
+    #[cfg(target_arch = "x86_64")]
+    relaxable_branches: Vec<(usize, usize)>,
     preceding_rsp_store: Option<(usize, i32, u8)>,
 }
 
@@ -247,6 +257,8 @@ impl Asm {
             code: Vec::new(),
             labels: Vec::new(),
             fixups: Vec::new(),
+            #[cfg(target_arch = "x86_64")]
+            relaxable_branches: Vec::new(),
             preceding_rsp_store: None,
         }
     }
@@ -318,10 +330,10 @@ impl Asm {
         Label(self.labels.len() - 1)
     }
 
-    /// The buffer offset a bound label resolves to, or `None` if unbound. Offsets
-    /// are final: all control flow uses fixed `rel32` displacements, so `finish`
-    /// patches in place without moving code (no jump relaxation). Used to build
-    /// the bytecode→native position map for the tiered-JIT viewer (bliss-zmmb).
+    /// A bound label's emission-layout offset, or `None` if unbound. `finish`
+    /// patches fixed displacements without moving these positions. The opt-in
+    /// x86 `finish_relaxed` can move code; its returned OffsetMap must translate
+    /// every previously recorded position before publication or patching.
     #[inline]
     pub fn label_offset(&self, l: Label) -> Option<usize> {
         self.labels[l.0]
@@ -348,6 +360,8 @@ impl Asm {
     /// `jmp rel32` to `l` (opcode `E9`), reserving the displacement for `finish`.
     #[cfg(not(target_arch = "aarch64"))]
     pub fn jmp(&mut self, l: Label) {
+        #[cfg(target_arch = "x86_64")]
+        self.relaxable_branches.push((self.code.len(), 5));
         self.code.push(0xE9);
         self.reserve_rel32(l);
     }
@@ -355,6 +369,8 @@ impl Asm {
     /// `jcc rel32` to `l` (opcode `0F 8x`), reserving the displacement.
     #[cfg(not(target_arch = "aarch64"))]
     pub fn jcc(&mut self, cc: Cc, l: Label) {
+        #[cfg(target_arch = "x86_64")]
+        self.relaxable_branches.push((self.code.len(), 6));
         self.code.extend_from_slice(&[0x0F, cc.opcode2()]);
         self.reserve_rel32(l);
     }
@@ -390,6 +406,18 @@ impl Asm {
         self.extend_from_slice(&[0x48 | if register >= 8 { 4 } else { 0 }, 0x8d,
             ((register & 7) << 3) | 5]);
         self.reserve_rel32(label);
+    }
+
+    /// Append a signed target-minus-base label difference. Unlike computing
+    /// label offsets eagerly, this remains valid when relaxed layout moves code.
+    #[cfg(target_arch = "x86_64")]
+    pub fn relative_i32(&mut self, target: Label, base: Label) {
+        self.fixups.push(Fixup {
+            site: self.code.len(),
+            label: target,
+            kind: FixupKind::LabelDifference(base),
+        });
+        self.code.extend_from_slice(&[0; 4]);
     }
 
     /// Reserve a 4-byte `rel32` slot at the current position, to be patched to
@@ -446,6 +474,12 @@ impl Asm {
                     let rel = target - (fx.site as i64 + 4);
                     let rel32 = i32::try_from(rel).ok()?;
                     self.code[fx.site..fx.site + 4].copy_from_slice(&rel32.to_le_bytes());
+                }
+                #[cfg(target_arch = "x86_64")]
+                FixupKind::LabelDifference(base) => {
+                    let base = (*self.labels.get(base.0)?)? as i64;
+                    let delta = i32::try_from(target - base).ok()?;
+                    self.code[fx.site..fx.site + 4].copy_from_slice(&delta.to_le_bytes());
                 }
                 #[cfg(target_arch = "aarch64")]
                 FixupKind::Imm26 => {

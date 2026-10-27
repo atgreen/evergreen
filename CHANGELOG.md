@@ -4,6 +4,10 @@
 
 ### Changed
 
+- x86 T2 emits compact recovery recipes, shares cold return tails, and uses
+  short native branches while preserving exact GC, deoptimization and OSR
+  positions ([#728](https://github.com/atgreen/evergreen/pull/728)).
+
 - x86 T2 shares cold ordinary deoptimization serialization through compact
   state recipes when the complete replacement, including tables, is smaller,
   while preserving precise recovery and collecting guards
