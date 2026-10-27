@@ -5,6 +5,10 @@
 //!
 //! Inspired by HotSpot G1 and ZGC. See §3 of the spec.
 
+#[path = "gc_minor_phase.rs"]
+mod minor_phase;
+use minor_phase::{MinorPhaseLog, Phase as MinorPhase};
+
 use crate::error::EgclError;
 use crate::image_relocation::ImageRelocations;
 use crate::value::EgclVal;
@@ -2300,6 +2304,7 @@ impl HeapCollector {
     /// or promotes to old-gen based on gen_age vs promotion_threshold.
     fn minor_gc_stw_body(&mut self) -> Result<(), EgclError> {
         let start = std::time::Instant::now();
+        let mut phases = MinorPhaseLog::new(start);
 
         let mut guard = heap_state().lock().unwrap();
         let state = guard
@@ -2396,6 +2401,8 @@ impl HeapCollector {
                 }
             };
 
+        phases.mark(MinorPhase::SetupIndex);
+
         // Direct roots shared with the major collector.
         mark_ref(
             get_entry_continuation(),
@@ -2443,6 +2450,8 @@ impl HeapCollector {
                 );
             }
         }
+
+        phases.mark(MinorPhase::RootsMark);
 
         // Scan non-nursery objects for young references.  The remembered set
         // is the fast-path record of old-to-young stores, but not every store
@@ -2530,6 +2539,8 @@ impl HeapCollector {
             crate::syscall::dbg_write(b" young refs\n");
         }
 
+        phases.mark(MinorPhase::OldScan);
+
         // A pinned nursery region stays in place as a unit.  Treat every object
         // in it as live so its outbound references are retained and relocated;
         // otherwise an unmarked neighbour could keep a stale pointer after the
@@ -2562,6 +2573,8 @@ impl HeapCollector {
                 });
             }
         }
+
+        phases.mark(MinorPhase::YoungMark);
 
         // Nothing has moved yet. If the survivors cannot all be placed, stop
         // here with the heap intact and report exhaustion, rather than panic
@@ -2739,6 +2752,8 @@ impl HeapCollector {
             }
         }
 
+        phases.mark(MinorPhase::Evacuate);
+
         // Relocate old→young references recorded by the write barrier (jtc.21).
         // Each remembered slot may hold a pointer to a nursery object that was
         // just evacuated; chase its forwarding pointer and rewrite the slot to
@@ -2780,6 +2795,8 @@ impl HeapCollector {
             Self::relocate_object_fields(state, heap_base_addr, heap_end);
         }
 
+        phases.mark(MinorPhase::HeapRelocate);
+
         // Complete the young-object root set (bliss-jtc.17): a nursery object may
         // also be reachable only from a CL-stack frame or the entry continuation.
         // Relocate those roots to the moved locations too, while forwarding is
@@ -2805,6 +2822,8 @@ impl HeapCollector {
                 VERIFY_TRACE.with(|t| t.borrow_mut().reloc.insert(slot as usize, (before, after)));
             }
         });
+
+        phases.mark(MinorPhase::RootsRelocate);
 
         // Forward finalizer-registry keys and weak-pointer referents for every
         // object promoted out of the nursery this cycle, while the forwarding
@@ -3083,14 +3102,36 @@ impl HeapCollector {
 
         // Return the scratch to the thread-local with its capacity retained
         // (bliss-5i3f). No early exit runs between the takes above and here.
+        let phase_indexed = nursery_index.lazily_indexed;
         MINOR_OBJECT_MAP.with(|s| *s.borrow_mut() = std::mem::take(&mut nursery_index));
         MINOR_WORKLIST.with(|s| *s.borrow_mut() = std::mem::take(&mut mark_worklist));
+        phases.mark(MinorPhase::ReclaimRearm);
+        phases.finish(state.stats.minor_gc_count, dirty_scan, phase_indexed, elapsed_us);
 
         Ok(())
     }
 
     fn minor_gc_stop_the_world(&mut self) -> Result<(), EgclError> {
-        with_stopped_world(|| self.minor_gc_stw_body())
+        let profiling = minor_phase::enabled();
+        let start = profiling.then(std::time::Instant::now);
+        let mut entered = None;
+        let mut finished = None;
+        let result = with_stopped_world(|| {
+            if profiling {
+                entered = Some(std::time::Instant::now());
+            }
+            let result = self.minor_gc_stw_body();
+            if profiling {
+                finished = Some(std::time::Instant::now());
+            }
+            result
+        });
+        if let Some(start) = start {
+            minor_phase::log_stw(
+                self.gc_stats.minor_gc_count, start, entered, finished, result.is_ok(),
+            );
+        }
+        result
     }
 }
 
