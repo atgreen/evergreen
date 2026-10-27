@@ -48,6 +48,7 @@ fn fixed_standard_primitive(symbol: u32) -> bool {
             | "LDB"
             | "NOT"
             | "NULL"
+            | "ENDP"
             | "EQ"
             | "CAR"
             | "CDR"

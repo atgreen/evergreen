@@ -82,6 +82,7 @@ use egcl_rt::bytecode::{BytecodeFunction, Instr};
 pub enum KnownFunction {
     Eq,
     Null,
+    Endp,
     Car,
     Cdr,
     Consp,
@@ -96,6 +97,7 @@ pub enum KnownFunction {
 pub enum IntrinsicId {
     Eq,
     Null,
+    Endp,
     /// Guard the argument as a cons and load its first field.
     Car,
     /// Guard the argument as a cons and load its second field.
@@ -152,6 +154,15 @@ const KNOWN: &[InlineMetadata] = &[
         effects: EffectSummary::PURE_TOTAL,
         cost: 2,
         expansion: IntrinsicId::Null,
+    },
+    InlineMetadata {
+        function: KnownFunction::Endp,
+        name: "ENDP",
+        fixed_arity: 1,
+        // Invalid operands deopt to the original call, where ENDP signals.
+        effects: EffectSummary::PURE_TOTAL,
+        cost: 3,
+        expansion: IntrinsicId::Endp,
     },
     InlineMetadata {
         function: KnownFunction::Car,
@@ -662,7 +673,11 @@ mod tests {
         let shadow = egcl_rt::symbols::intern("SOME-OTHER-PACKAGE:EQ");
         assert_eq!(metadata_for_symbol(shadow), None);
 
-        for (name, function) in [("CAR", KnownFunction::Car), ("CDR", KnownFunction::Cdr)] {
+        for (name, function) in [
+            ("CAR", KnownFunction::Car),
+            ("CDR", KnownFunction::Cdr),
+            ("ENDP", KnownFunction::Endp),
+        ] {
             assert_eq!(
                 metadata_for_symbol(egcl_rt::symbols::intern(name)).map(|m| m.function),
                 Some(function)

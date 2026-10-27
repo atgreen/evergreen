@@ -3193,6 +3193,48 @@ impl<'a> Builder<'a> {
             return Ok(true);
         }
 
+        if intrinsic == IntrinsicId::Endp {
+            // ENDP is NULL plus a signaling list check.  The specialized
+            // union guard accepts NIL and ordinary proper-list conses; the
+            // emitters conservatively deopt closure-shaped conses so the
+            // original call can signal TYPE-ERROR.  Keep the pre-call stack
+            // in the FrameState for that recovery.
+            let fs = self.build_frame_state(block, stack, bcp as u32);
+            let value = stack
+                .pop()
+                .ok_or(BuildError::Unsupported("stack underflow (ENDP)"))?;
+            let list = IRType::of(TypeBits::CONS.join(TypeBits::NULL));
+            let guarded = self
+                .emit(
+                    block,
+                    Opcode::Guard,
+                    vec![value],
+                    AuxData::EndpList,
+                    InstFlags {
+                        effectful: true,
+                        guard: true,
+                        ..InstFlags::default()
+                    },
+                    Some(fs),
+                    list,
+                )
+                .ok_or(BuildError::Unsupported("ENDP guard has a result"))?;
+            let nil = self.emit_const_nil(block);
+            let result = self
+                .emit(
+                    block,
+                    Opcode::GenericEq,
+                    vec![guarded, nil],
+                    AuxData::None,
+                    InstFlags::default(),
+                    None,
+                    IRType::TOP,
+                )
+                .ok_or(BuildError::Unsupported("ENDP comparison has a result"))?;
+            stack.push(result);
+            return Ok(true);
+        }
+
         let type_bits = match intrinsic {
             // NOT inlinable (bliss-74rl).  A TypeBits::CONS test is a raw tag
             // test, but egcl represents a closure as the cons
@@ -3248,6 +3290,7 @@ impl<'a> Builder<'a> {
                 }
             }
             IntrinsicId::Eq | IntrinsicId::Null => None,
+            IntrinsicId::Endp => unreachable!("handled as a signaling list guard above"),
             IntrinsicId::Car | IntrinsicId::Cdr => {
                 unreachable!("handled as guarded field loads above")
             }
@@ -3301,6 +3344,7 @@ impl<'a> Builder<'a> {
             | IntrinsicId::Stringp => {
                 unreachable!("handled as TypeCheck above")
             }
+            IntrinsicId::Endp => unreachable!("handled as a signaling list guard above"),
             IntrinsicId::Car | IntrinsicId::Cdr => {
                 unreachable!("handled as guarded field loads above")
             }
@@ -4699,6 +4743,148 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn endp_expands_to_a_signaling_list_guard_and_nil_test() {
+        let endp = egcl_rt::symbols::intern("ENDP");
+        let input = bf(
+            "inline-endp",
+            vec![
+                Instr::LoadLocal(0),
+                Instr::CallNamed {
+                    sym: endp,
+                    nargs: 1,
+                },
+                Instr::Return,
+            ],
+            vec![],
+            1,
+            1,
+            1,
+        );
+
+        let function = build_from_bytecode(&input).expect("ENDP must reach T2");
+        crate::t2::verify::verify(&function).unwrap();
+        assert!(!has_opcode(&function, function.entry(), Opcode::Call));
+        assert!(has_opcode(
+            &function,
+            function.entry(),
+            Opcode::GenericEq
+        ));
+        let guard = function
+            .block(function.entry())
+            .insts
+            .iter()
+            .map(|&inst| function.inst(inst))
+            .find(|data| {
+                matches!(
+                    data.aux,
+                    AuxData::EndpList
+                )
+            })
+            .expect("ENDP must guard NIL-or-data-cons before comparing with NIL");
+        assert_eq!(guard.opcode, Opcode::Guard);
+        assert!(guard.flags.guard && guard.flags.effectful);
+        assert!(guard.frame_state.is_some(), "the guard must deopt to ENDP");
+        let state = function.frame_states.get(guard.frame_state.unwrap());
+        assert_eq!(state.scopes[0].bcp, 1);
+        assert_eq!(state.scopes[0].stack.len(), 1);
+
+        let runtime = crate::t2::emit_s390x::RuntimeCalls {
+            deopt: 1,
+            multiple_values: 1,
+            ..Default::default()
+        };
+        #[cfg_attr(
+            not(any(target_arch = "x86_64", target_arch = "aarch64")),
+            allow(unused_mut)
+        )]
+        let mut emissions = vec![
+            (
+                "s390x",
+                crate::t2::emit_s390x::emit_framed_with_runtime(
+                    &function,
+                    1,
+                    input.num_slots(),
+                    runtime.clone(),
+                ),
+            ),
+            (
+                "ppc64le",
+                crate::t2::emit_ppc64le::emit_framed_with_runtime(
+                    &function,
+                    1,
+                    input.num_slots(),
+                    runtime.clone(),
+                ),
+            ),
+            (
+                "riscv64",
+                crate::t2::emit_riscv64::emit_framed_with_runtime(
+                    &function,
+                    1,
+                    input.num_slots(),
+                    crate::t2::emit_riscv64::RuntimeCalls {
+                        multiple_values: 1,
+                        ..Default::default()
+                    },
+                ),
+            ),
+        ];
+        #[cfg(target_arch = "x86_64")]
+        emissions.push((
+            "x86_64",
+            crate::t2::emit::emit_framed(&function, 1, 1, 0, 0, 0, 0, 0, 1, None),
+        ));
+        #[cfg(target_arch = "aarch64")]
+        emissions.push((
+            "aarch64",
+            crate::t2::emit_a64::emit_framed_with_runtime(
+                &function,
+                1,
+                input.num_slots(),
+                runtime,
+            ),
+        ));
+        for (backend, emission) in emissions {
+            assert!(
+                emission
+                    .unwrap_or_else(|error| panic!("{backend}: {error:?}"))
+                    .has_deopt,
+                "{backend}: the signaling guard needs a deopt exit"
+            );
+        }
+    }
+
+    #[test]
+    fn notinline_endp_keeps_the_signaling_call() {
+        let endp = egcl_rt::symbols::intern("ENDP");
+        let input = bf(
+            "notinline-endp",
+            vec![
+                Instr::LoadLocal(0),
+                Instr::CallNamed {
+                    sym: endp,
+                    nargs: 1,
+                },
+                Instr::Return,
+            ],
+            vec![],
+            1,
+            1,
+            1,
+        );
+        let options = InlineOptions::default().with_policy(1, InlinePolicy::NotInline);
+        let function = build_from_bytecode_with_inline_options(&input, options).unwrap();
+        let call = function
+            .block(function.entry())
+            .insts
+            .iter()
+            .map(|&inst| function.inst(inst))
+            .find(|data| data.opcode == Opcode::Call)
+            .expect("NOTINLINE ENDP must remain a call");
+        assert!(matches!(call.aux, AuxData::OpaqueCallTarget(sym) if sym == endp));
     }
 
     #[test]

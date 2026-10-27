@@ -550,6 +550,11 @@ pub enum AuxData {
         scopes: Vec<crate::control_scope::ControlScope>,
     },
     TypeTag(IRType),
+    /// ENDP's semantic list guard: accept NIL or an ordinary data cons, but
+    /// reject the cons-tagged interpreter-closure representation. This is not
+    /// a plain CONS|NULL type proof and must not be removed from inferred type
+    /// facts alone.
+    EndpList,
     /// Exact class code for the pure bytecode `TypeP` predicate. Unlike a
     /// `TypeTag`, classes such as BOOLEAN and LIST are not equivalent to their
     /// broad type-lattice union.

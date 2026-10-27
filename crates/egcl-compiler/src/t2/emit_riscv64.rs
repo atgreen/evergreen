@@ -313,6 +313,23 @@ impl Emitter<'_> {
         self.asm.branch(Cond::Ne, T1, T2, deopt);
     }
 
+    /// Accept NIL or a cons that is not the interpreter's closure encoding.
+    ///
+    /// Closures are represented as `(EGCL::CLOSURE . id)`, so their CDR is a
+    /// fixnum. Conservatively deopt every cons with a fixnum CDR; the resumed
+    /// ENDP call distinguishes closures from ordinary dotted conses exactly.
+    fn guard_list(&mut self, register: u8, deopt: Label) {
+        let passed = self.asm.label();
+        self.asm.imm64(T1, NIL.0);
+        self.asm.branch(Cond::Eq, register, T1, passed);
+        self.guard_cons(register, deopt);
+        self.asm.and_imm(T1, register, -8);
+        self.asm.load(T1, T1, 8);
+        self.asm.and_imm(T1, T1, 7);
+        self.asm.branch(Cond::Eq, T1, ZERO, deopt);
+        self.asm.bind(passed);
+    }
+
     /// `a0 = a0 + a1`, deopting on signed overflow, which on a flagless ISA
     /// is "both inputs disagree with the sum in sign". The sum is kept in a
     /// temporary until the check passes so the exit sees the operands.
@@ -450,7 +467,7 @@ impl Emitter<'_> {
         let first = *data.args.first().ok_or_else(unsupported)?;
         self.load(first, A0)?;
         match data.opcode {
-            Guard if matches!(&data.aux, AuxData::TypeTag(ty) if ty.bits == TypeBits::FIXNUM || ty.bits == TypeBits::SINGLE_FLOAT || ty.bits == TypeBits::CONS) =>
+            Guard if matches!(&data.aux, AuxData::TypeTag(ty) if ty.bits == TypeBits::FIXNUM || ty.bits == TypeBits::SINGLE_FLOAT || ty.bits == TypeBits::CONS) || matches!(&data.aux, AuxData::EndpList) =>
             {
                 // CONS matters as much as the numeric tags: build.rs emits a
                 // separate Guard(TypeTag(CONS)) ahead of every Car/Cdr, so
@@ -462,6 +479,9 @@ impl Emitter<'_> {
                         self.guard_fixnum(A0, deopt)
                     }
                     AuxData::TypeTag(ty) if ty.bits == TypeBits::CONS => self.guard_cons(A0, deopt),
+                    AuxData::EndpList => {
+                        self.guard_list(A0, deopt)
+                    }
                     _ => self.guard_single_float(A0, deopt),
                 }
             }
@@ -1162,6 +1182,86 @@ mod tests {
         assert!(code.has_deopt);
         assert_ne!(code.bcp_offsets[9], u32::MAX);
         assert_eq!(code.shadow_root_slots, 0);
+    }
+
+    fn list_guard() -> Function {
+        let mut function = Function::new("riscv64-list-guard");
+        let block = function.entry();
+        let input = function.add_block_param(block, IRType::TOP, ValueRepresentation::Tagged);
+        let state = function.frame_states.add(FrameState {
+            scopes: vec![FrameScope {
+                function: 81,
+                bcp: 4,
+                locals: vec![ValueSource::Value {
+                    value: input,
+                    repr: ValueRepresentation::Tagged,
+                }],
+                stack: vec![],
+            }],
+            remat: vec![],
+        });
+        let (_, guarded) = function.push_inst(
+            block,
+            InstData {
+                opcode: Opcode::Guard,
+                args: vec![input],
+                results: vec![],
+                aux: AuxData::EndpList,
+                flags: InstFlags {
+                    effectful: true,
+                    guard: true,
+                    ..InstFlags::default()
+                },
+                targets: vec![],
+                frame_state: Some(state),
+                source_pos: 0,
+            },
+            &[(
+                IRType::of(TypeBits::CONS.join(TypeBits::NULL)),
+                ValueRepresentation::Tagged,
+            )],
+        );
+        function.set_terminator(
+            block,
+            InstData {
+                opcode: Opcode::Return,
+                args: vec![guarded[0]],
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags::default(),
+                targets: vec![],
+                frame_state: None,
+                source_pos: 0,
+            },
+        );
+        function
+    }
+
+    #[test]
+    fn emits_list_guard_that_excludes_closure_shaped_conses() {
+        extern "C" fn deopt(_: u64, _: u64, _: *const u64, _: u64) {}
+        let compiled = emit_framed(&list_guard(), deopt as *const () as usize as u64, 1)
+            .expect("emit NIL-or-data-cons guard");
+        assert!(compiled.has_deopt);
+        #[cfg(target_arch = "riscv64")]
+        {
+            let buffer = egcl_rt::jit::JitBuffer::new(&compiled.code).unwrap();
+            let entry: extern "C" fn(*mut u64) -> u64 =
+                unsafe { std::mem::transmute(buffer.as_ptr()) };
+            let mut ordinary = [T.0, NIL.0];
+            let ordinary = ordinary.as_mut_ptr() as u64 | egcl_rt::value::TAG_CONS;
+            let mut closure = [T.0, EgclVal::from_fixnum(81).0];
+            let closure = closure.as_mut_ptr() as u64 | egcl_rt::value::TAG_CONS;
+            for (input, expected) in [
+                (NIL.0, NIL.0),
+                (ordinary, ordinary),
+                (EgclVal::from_fixnum(3).0, NIL.0),
+                (closure, NIL.0),
+            ] {
+                let mut slots = [input];
+                assert_eq!(entry(slots.as_mut_ptr()), expected);
+            }
+        }
     }
 
     #[test]

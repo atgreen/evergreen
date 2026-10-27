@@ -1459,6 +1459,24 @@ impl Emitter<'_> {
         self.asm.branch(6, deopt);
     }
 
+    /// Admit NIL or an ordinary data cons for ENDP. Interpreter closures are
+    /// represented as `(EGCL::CLOSURE . fixnum-id)`, so conservatively deopt
+    /// every cons with a fixnum cdr. The original ENDP call then distinguishes
+    /// a closure from a valid dotted cons without burdening proper-list loops.
+    fn guard_endp_list(&mut self, register: u8, deopt: Label) {
+        let accepted = self.asm.label();
+        debug_assert_eq!(register, 2);
+        self.branch_if_equal_imm(egcl_rt::value::NIL.0, accepted);
+        self.guard_cons(register, deopt);
+        self.asm.mov(3, register);
+        self.asm.imm64(4, !7u64);
+        self.asm.and(3, 4);
+        self.asm.load(3, 3, 8);
+        self.asm.test_mask_low(3, 7);
+        self.asm.branch(8, deopt);
+        self.asm.bind(accepted);
+    }
+
     fn float_operand(&mut self, value: Value, register: u8, deopt: Label) -> Result<(), EmitError> {
         if let Some(&bits) = self.constants.get(&value) {
             let constant = EgclVal(bits);
@@ -1664,7 +1682,7 @@ impl Emitter<'_> {
         };
         self.load(first, 2)?;
         match data.opcode {
-            Guard if matches!(&data.aux, AuxData::TypeTag(ty) if ty.bits == TypeBits::FIXNUM || ty.bits == TypeBits::SINGLE_FLOAT || ty.bits == TypeBits::CONS) =>
+            Guard if matches!(&data.aux, AuxData::TypeTag(ty) if ty.bits == TypeBits::FIXNUM || ty.bits == TypeBits::SINGLE_FLOAT || ty.bits == TypeBits::CONS) || matches!(&data.aux, AuxData::EndpList) =>
             {
                 // CONS matters as much as the numeric tags: build.rs emits a
                 // separate Guard(TypeTag(CONS)) ahead of every Car/Cdr, so
@@ -1676,6 +1694,9 @@ impl Emitter<'_> {
                         self.guard_fixnum(2, deopt)
                     }
                     AuxData::TypeTag(ty) if ty.bits == TypeBits::CONS => self.guard_cons(2, deopt),
+                    AuxData::EndpList => {
+                        self.guard_endp_list(2, deopt)
+                    }
                     _ => self.guard_single_float(2, deopt),
                 }
             }
