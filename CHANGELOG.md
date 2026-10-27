@@ -216,6 +216,10 @@
 
 ### Fixed
 
+- Pretty-printer `:FILL` conditional newlines behave like `:LINEAR` while
+  miser mode is active, preserving ordinary section filling otherwise
+  ([#727](https://github.com/atgreen/evergreen/pull/727)).
+
 - `FORMAT` preserves conditional layout emitted by pprint dispatch methods,
   `FORMATTER` iteration bodies, and `~/.../` callbacks, including destination
   columns and the `~W` colon/at-sign printer bindings
