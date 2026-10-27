@@ -4406,6 +4406,10 @@ fn read_nd_array_literal_and_equalp_roundtrip() {
         ("(array-dimensions (read-from-string \"#2a#*\"))", "(0 0)"),
         ("(array-dimensions (read-from-string \"#3a()\"))", "(0 0 0)"),
         ("(array-dimensions (read-from-string \"#2a(())\"))", "(1 0)"),
+        (
+            "(handler-case (read-from-string (format nil \"#~DA()\" array-rank-limit)) (reader-error () :reader-error) (error () :wrong-error))",
+            ":READER-ERROR",
+        ),
     ];
     for (expr, expected) in cases {
         let out = egcl_bin()
