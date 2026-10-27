@@ -403,6 +403,7 @@ impl EmittedTransfer {
                 }
                 if std::env::var_os("EGCL_DISABLE_ARRAY_LAYOUT_FACTS").is_none() {
                     let layouts = egcl_compiler::t2::array_layout::hoist_layouts(&mut ir);
+                    egcl_compiler::t2::opt_guard::reuse_layout_evidence(&mut ir);
                     if layouts != 0 {
                         t2_log_write(format_args!("{}: array layout witnesses: {layouts}", display_fn_name(&body.name)));
                     }

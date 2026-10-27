@@ -7,7 +7,8 @@
 //!
 //! [`infer`] is a forward, flow-sensitive dataflow analysis in the sparse
 //! conditional constant propagation family. For every reachable `Value` it
-//! computes a narrowed [`IRType`] (tag bits, an optional integer [`Range`],
+//! also publishes shared structural evidence in [`InferenceResult::structural`].
+//! For numeric types it computes a narrowed [`IRType`] (tag bits, an optional integer [`Range`],
 //! an optional class id) and from that a [`ValueRepresentation`] saying
 //! whether the value can be carried unboxed. Results go in an
 //! [`InferenceResult`] side table; the IR is never mutated.
@@ -38,14 +39,14 @@
 //! 2. Iterate up to `MAX_PASSES` times over reverse postorder; widening is
 //!    switched on after `WIDEN_AFTER` passes. Each pass:
 //!    1. Collect `check_refine[B]`, the narrowings of every
-//!       `TypeCheck`/`Guard` with a `TypeTag` in block `B`.
+//!       `Guard` with a `TypeTag`/`StringLayout` in block `B`.
 //!    2. For each block: join its parameters over predecessor edge
 //!       arguments; build a local environment by walking the dominator chain
 //!       and meeting in every edge refinement on the chain (including the
 //!       block's own) and every check refinement of a **strict** dominator;
 //!       then evaluate instructions in program order with `eval`, joining
 //!       each result into the global fact and inserting it into the local
-//!       environment. A `TypeCheck`/`Guard` met in program order narrows its
+//!       environment. A successful `Guard` met in program order narrows its
 //!       operand for the rest of the block.
 //!       After evaluating a block, derive its outgoing branch refinements
 //!       from the updated facts. `edge_refine[T]` holds bounds true on the
@@ -62,8 +63,8 @@
 //! fixnum add/sub/mul/neg propagate ranges with saturating arithmetic; other
 //! fixnum ops yield the full fixnum range; float ops propagate float tags;
 //! generic arithmetic applies numeric contagion and adds `BIGNUM` whenever
-//! `FIXNUM` is possible; comparisons yield `SYMBOL|NULL`; `TypeCheck`/`Guard`
-//! results are the operand met with the tag; everything else is `⊤`.
+//! `FIXNUM` is possible; comparisons and `TypeCheck` yield `SYMBOL|NULL`; successful `Guard`
+//! results meet the operand with the established type; everything else is `⊤`.
 //!
 //! # Rationale
 //!
@@ -108,9 +109,13 @@ use crate::t2::pass::{Analyses, Pass};
 pub struct InferenceResult {
     types: HashMap<Value, IRType>,
     reprs: HashMap<Value, ValueRepresentation>,
+    structural: super::value_facts::StructuralFacts,
 }
 
 impl InferenceResult {
+    /// Structural evidence from the same immutable IR snapshot as numeric facts.
+    pub fn structural(&self) -> &super::value_facts::StructuralFacts { &self.structural }
+
     /// The inferred `IRType` for `v` (`⊥` if the value was never reached).
     pub fn ty(&self, v: Value) -> IRType {
         self.types.get(&v).copied().unwrap_or(IRType::BOTTOM)
@@ -508,17 +513,13 @@ fn eval(opcode: Opcode, aux: &AuxData, ops: &[IRType]) -> IRType {
         | FloatCmpLt | FloatCmpLe | FloatCmpGt | FloatCmpGe | GenericEq | GenericEqual
         | InstanceOf => boolean(),
 
-        // A type check narrows its operand to the checked tag (spec R4.63).
-        // A Guard VALUE does the same for its passed-through result: it exists
-        // only on the path where the check held (egcl-x5y.25b). A non-TypeTag
-        // guard (StringLayout) passes its operand's type through unchanged.
-        TypeCheck | Guard => {
-            let tag = match aux {
-                AuxData::TypeTag(t) => *t,
-                _ => IRType::TOP,
-            };
-            ty_meet(ops.first().copied().unwrap_or(IRType::TOP), tag)
-        }
+        // A predicate produces a Boolean; it never establishes its truth.
+        TypeCheck => boolean(),
+        // Only successful guards refine their operand and passed-through value.
+        Guard => ty_meet(
+            ops.first().copied().unwrap_or(IRType::TOP),
+            guard_type(aux).unwrap_or(IRType::TOP),
+        ),
 
         AllocCons => IRType::of(TypeBits::CONS),
         StringCharOrNil => IRType::of(TypeBits::CHARACTER.join(TypeBits::NULL)),
@@ -526,6 +527,33 @@ fn eval(opcode: Opcode, aux: &AuxData, ops: &[IRType]) -> IRType {
         // Everything else (loads, calls, generic memory) is unconstrained.
         _ => IRType::TOP,
     }
+}
+
+/// The type established by a successful guard. Layout -> type is sound;
+/// the reverse implication does not establish a concrete string layout.
+fn guard_type(aux: &AuxData) -> Option<IRType> {
+    match aux {
+        AuxData::TypeTag(tag) => Some(*tag),
+        AuxData::StringLayout => Some(IRType::of(TypeBits::STRING)),
+        _ => None,
+    }
+}
+
+/// Predicate semantics are not always the raw representation bitset: SYMBOLP
+/// also accepts NIL. Admit only understood tag predicates, without untested
+/// range/class annotations. New predicates need an explicit semantic rule.
+fn predicate_true_type(bits: TypeBits) -> Option<IRType> {
+    let bits = if bits == TypeBits::SYMBOL {
+        bits.join(TypeBits::NULL)
+    } else if bits == TypeBits::FIXNUM
+        || bits == TypeBits::FIXNUM.join(TypeBits::BIGNUM)
+        || bits == TypeBits::STRING
+    {
+        bits
+    } else {
+        return None;
+    };
+    Some(IRType::of(bits))
 }
 
 // ── Flow-sensitive refinements from Brif conditions ─────────────────
@@ -809,13 +837,14 @@ fn fresh_ldb_facts(f: &Function) -> HashMap<Value, IRType> {
 /// Infer types, ranges, and representations for every reachable value in `f`.
 pub fn infer(f: &Function) -> InferenceResult {
     let ldb_facts = fresh_ldb_facts(f);
+    let structural = super::value_facts::StructuralFacts::analyze(f);
     let rpo = f.reverse_postorder();
     let dom = f.dominators();
     let mut g = Facts(HashMap::new());
 
     // Seed entry / pred-less block parameters from their declared type once.
     for &b in &rpo {
-        if f.preds(b).is_empty() {
+        if b == f.entry() || f.preds(b).is_empty() {
             for &p in &f.block(b).params {
                 g.0.insert(p, f.value(p).ty);
             }
@@ -855,21 +884,21 @@ pub fn infer(f: &Function) -> InferenceResult {
         // Recompute branch/guard refinements against the current facts. A
         // refinement attached to block T is valid throughout the region T
         // dominates. `edge_refine` holds facts known on *entry* to T; `check_refine`
-        // holds `TypeCheck`/`Guard` narrowings, valid only in blocks T strictly
+        // holds successful `Guard` narrowings, valid only in blocks T strictly
         // dominates (a use before the check in T itself is handled in program order).
-        let mut edge_refine: HashMap<usize, Vec<Refine>> = HashMap::new();
+        let mut edge_refine: HashMap<usize, (super::ir::Block, Vec<Refine>)> = HashMap::new();
         let mut check_refine: HashMap<usize, Vec<Refine>> = HashMap::new();
 
         for &b in &rpo {
-            // TypeCheck / Guard narrowings within this block, for dominated blocks.
+            // Successful guard narrowings within this block, for dominated blocks.
             for &inst in &f.block(b).insts {
                 let idef = f.inst(inst);
-                if matches!(idef.opcode, Opcode::TypeCheck | Opcode::Guard) && !idef.args.is_empty()
+                if idef.opcode == Opcode::Guard && !idef.args.is_empty()
                 {
-                    if let AuxData::TypeTag(tag) = &idef.aux {
+                    if let Some(tag) = guard_type(&idef.aux) {
                         check_refine.entry(b.index()).or_default().push(Refine {
                             value: idef.args[0],
-                            ty: *tag,
+                            ty: tag,
                         });
                     }
                 }
@@ -910,7 +939,8 @@ pub fn infer(f: &Function) -> InferenceResult {
             let mut env: HashMap<Value, IRType> = HashMap::new();
             let mut d = b;
             loop {
-                if let Some(refs) = edge_refine.get(&d.index()) {
+                if let Some((_, refs)) = edge_refine.get(&d.index()).filter(|(source, _)|
+                    structural.block_dominates_all_entries(*source, b)) {
                     for rf in refs {
                         let cur = env
                             .get(&rf.value)
@@ -920,7 +950,8 @@ pub fn infer(f: &Function) -> InferenceResult {
                     }
                 }
                 if d != b {
-                    if let Some(refs) = check_refine.get(&d.index()) {
+                    if let Some(refs) = check_refine.get(&d.index()).filter(|_|
+                        structural.block_dominates_all_entries(d, b)) {
                         for rf in refs {
                             let cur = env
                                 .get(&rf.value)
@@ -968,12 +999,12 @@ pub fn infer(f: &Function) -> InferenceResult {
                     env.insert(rv, joined);
                 }
                 // In-program-order guard narrowing for the rest of this block.
-                if matches!(idef.opcode, Opcode::TypeCheck | Opcode::Guard) && !idef.args.is_empty()
+                if idef.opcode == Opcode::Guard && !idef.args.is_empty()
                 {
-                    if let AuxData::TypeTag(tag) = &idef.aux {
+                    if let Some(tag) = guard_type(&idef.aux) {
                         let v = idef.args[0];
                         let cur = fact(v, &env, &g);
-                        env.insert(v, ty_meet(cur, *tag));
+                        env.insert(v, ty_meet(cur, tag));
                     }
                 }
             }
@@ -987,6 +1018,26 @@ pub fn infer(f: &Function) -> InferenceResult {
                     let cond = t.args[0];
                     if let ValueDef::Result { inst, .. } = f.value(cond).def {
                         let cdef = f.inst(inst);
+                        // A true predicate edge narrows only its unique target
+                        // and dominated region, never the false edge or uses
+                        // before the branch. OSR imports can bypass the test;
+                        // leave this optional refinement off in OSR functions.
+                        if cdef.opcode == Opcode::TypeCheck && cdef.args.len() == 1
+                            && f.osr_entries.is_empty()
+                        {
+                            if let (AuxData::TypeTag(tag), Some(call)) = (&cdef.aux, t.targets.first()) {
+                                let tgt = call.block;
+                                if tgt != f.entry() && f.preds(tgt) == vec![b]
+                                    && t.targets.iter().filter(|c| c.block == tgt).count() == 1
+                                {
+                                    if let Some(ty) = predicate_true_type(tag.bits) {
+                                        edge_refine.entry(tgt.index()).or_insert_with(|| (b, Vec::new())).1.push(Refine {
+                                            value: cdef.args[0], ty,
+                                        });
+                                    }
+                                }
+                            }
+                        }
                         if cdef.args.len() == 2 {
                             let (ca, cb) = (cdef.args[0], cdef.args[1]);
                             for (edge, taken) in [(0usize, true), (1usize, false)] {
@@ -995,11 +1046,11 @@ pub fn infer(f: &Function) -> InferenceResult {
                                     // preds() deduplicates blocks. Two branch
                                     // outcomes entering the same block do not
                                     // establish either outcome's constraint.
-                                    if f.preds(tgt) == vec![b]
+                                    if tgt != f.entry() && f.preds(tgt) == vec![b]
                                         && t.targets.iter().filter(|c| c.block == tgt).count() == 1
                                     {
                                         let refs = narrow_cmp(cdef.opcode, ca, cb, taken, &g);
-                                        edge_refine.entry(tgt.index()).or_default().extend(refs);
+                                        edge_refine.entry(tgt.index()).or_insert_with(|| (b, Vec::new())).1.extend(refs);
                                     }
                                 }
                             }
@@ -1019,7 +1070,7 @@ pub fn infer(f: &Function) -> InferenceResult {
     for (&v, &t) in &g.0 {
         reprs.insert(v, repr_of(t));
     }
-    InferenceResult { types: g.0, reprs }
+    InferenceResult { types: g.0, reprs, structural }
 }
 
 /// Choose a provable/profitable unboxed representation for a fact, else `Tagged`.
@@ -1570,8 +1621,8 @@ mod tests {
     }
 
     #[test]
-    fn typecheck_narrows_the_met_type() {
-        // entry: p: TOP ; r = TypeCheck(p, FIXNUM) ; then use r downstream.
+    fn typecheck_produces_a_tagged_boolean_without_narrowing_operand() {
+        // entry: p: TOP ; r = TypeCheck(p, FIXNUM) is a pure Boolean predicate.
         let mut f = Function::new("tc");
         let e = f.entry();
         let p = f.add_block_param(e, IRType::TOP, ValueRepresentation::Tagged);
@@ -1580,10 +1631,7 @@ mod tests {
             InstData {
                 args: vec![p],
                 aux: AuxData::TypeTag(fixnum()),
-                flags: InstFlags {
-                    guard: true,
-                    ..InstFlags::default()
-                },
+                flags: InstFlags::default(),
                 ..inst(Opcode::TypeCheck)
             },
             &[(IRType::TOP, ValueRepresentation::Tagged)],
@@ -1591,9 +1639,410 @@ mod tests {
         f.set_terminator(e, ret());
 
         let res = infer(&f);
-        // The checked result is narrowed to FIXNUM (met with TOP).
-        assert_eq!(res.ty(r[0]).bits, TypeBits::FIXNUM);
-        assert_eq!(res.repr(r[0]), Some(ValueRepresentation::UnboxedFixnum));
+        // Real producers emit a pure predicate, not a failing guard.
+        assert_eq!(res.ty(r[0]).bits, TypeBits::SYMBOL.join(TypeBits::NULL));
+        assert_eq!(res.ty(p), IRType::TOP);
+        assert_eq!(res.repr(r[0]), Some(ValueRepresentation::Tagged));
+    }
+
+    #[test]
+    fn real_bytecode_predicates_build_boolean_typechecks() {
+        use egcl_rt::bytecode::{BytecodeFunction, Instr, typep_class};
+        for operation in [
+            Instr::TypeP(typep_class::BOOLEAN),
+            Instr::CallNamed {
+                sym: egcl_rt::symbols::intern("INTEGERP"),
+                nargs: 1,
+            },
+        ] {
+            let body = BytecodeFunction {
+                self_call_sites: vec![],
+                notinline_sites: vec![],
+                code: vec![Instr::LoadLocal(0), operation, Instr::Return],
+                constants: vec![],
+                load_time_values: vec![],
+                handler_cases: vec![],
+                handler_binds: vec![],
+                names: vec![],
+                restart_cases: vec![],
+                nested_functions: vec![],
+                param_layout: vec![],
+                param_types: vec![],
+                has_env: false,
+                n_locals: 1,
+                max_stack: 1,
+                arity: 1,
+                name: "inferred-predicate".into(),
+                params_form: egcl_rt::value::NIL,
+                min_args: 1,
+                max_args: Some(1),
+                variadic: false,
+                binder_cache: Default::default(),
+            };
+            let f = crate::t2::build::build_from_bytecode(&body).unwrap();
+            let check = f
+                .block_order()
+                .iter()
+                .flat_map(|&b| &f.block(b).insts)
+                .map(|&i| f.inst(i))
+                .find(|d| d.opcode == Opcode::TypeCheck)
+                .unwrap();
+            assert!(!check.flags.guard && !check.flags.effectful && check.frame_state.is_none());
+            let facts = infer(&f);
+            assert_eq!(
+                facts.ty(check.results[0]).bits,
+                TypeBits::SYMBOL.join(TypeBits::NULL)
+            );
+            assert_eq!(
+                facts.repr(check.results[0]),
+                Some(ValueRepresentation::Tagged)
+            );
+            assert_eq!(facts.ty(check.args[0]), IRType::TOP);
+        }
+    }
+
+    #[test]
+    fn predicate_refines_only_unique_true_edge_not_earlier_or_false_uses() {
+        for (shared, osr) in [(false, false), (true, false), (false, true)] {
+            let mut f = Function::new("predicate-regions");
+            let entry = f.entry();
+            let input = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+            let (_, predicate) = f.push_inst(
+                entry,
+                InstData {
+                    args: vec![input],
+                    aux: AuxData::TypeTag(IRType {
+                        range: Some(Range { lo: 0, hi: 0 }),
+                        ..fixnum()
+                    }),
+                    ..inst(Opcode::TypeCheck)
+                },
+                &[(IRType::TOP, ValueRepresentation::Tagged)],
+            );
+            let one = const_fixnum(&mut f, entry, 1);
+            let (_, before) = f.push_inst(
+                entry,
+                InstData {
+                    args: vec![input, one],
+                    ..inst(Opcode::GenericAdd)
+                },
+                &[(IRType::TOP, ValueRepresentation::Tagged)],
+            );
+            // Reuse the Boolean value without treating it as a passed-through
+            // operand or a proof that its own tested condition is true.
+            let (_, bool_use) = f.push_inst(
+                entry,
+                InstData {
+                    args: vec![predicate[0], predicate[0]],
+                    ..inst(Opcode::GenericEq)
+                },
+                &[(IRType::TOP, ValueRepresentation::Tagged)],
+            );
+            let yes = f.make_block();
+            let no = if shared { yes } else { f.make_block() };
+            f.set_terminator(
+                entry,
+                InstData {
+                    args: vec![predicate[0]],
+                    targets: vec![
+                        BlockCall {
+                            block: yes,
+                            args: vec![],
+                        },
+                        BlockCall {
+                            block: no,
+                            args: vec![],
+                        },
+                    ],
+                    ..inst(Opcode::Brif)
+                },
+            );
+            let (_, true_value) = f.push_inst(
+                yes,
+                InstData {
+                    args: vec![input, one],
+                    ..inst(Opcode::GenericAdd)
+                },
+                &[(IRType::TOP, ValueRepresentation::Tagged)],
+            );
+            f.set_terminator(yes, ret());
+            let false_value = if shared {
+                true_value[0]
+            } else {
+                let (_, v) = f.push_inst(
+                    no,
+                    InstData {
+                        args: vec![input, one],
+                        ..inst(Opcode::GenericAdd)
+                    },
+                    &[(IRType::TOP, ValueRepresentation::Tagged)],
+                );
+                f.set_terminator(no, ret());
+                v[0]
+            };
+            if osr {
+                let state = f.frame_states.add(crate::t2::frame_state::FrameState {
+                    scopes: vec![],
+                    remat: vec![],
+                });
+                f.osr_entries.push(crate::t2::ir::OsrEntry {
+                    block: yes,
+                    bcp: 0,
+                    frame_state: state,
+                    checks: vec![],
+                    control_scopes: vec![],
+                });
+            }
+            let facts = infer(&f);
+            assert!(facts.ty(before[0]).bits.contains(TypeBits::DOUBLE_FLOAT));
+            assert!(facts.ty(false_value).bits.contains(TypeBits::DOUBLE_FLOAT));
+            assert_eq!(
+                facts.ty(bool_use[0]).bits,
+                TypeBits::SYMBOL.join(TypeBits::NULL)
+            );
+            if !shared && !osr {
+                assert_eq!(
+                    facts.ty(true_value[0]).bits,
+                    TypeBits::FIXNUM.join(TypeBits::BIGNUM)
+                );
+                assert_eq!(
+                    facts.range(true_value[0]),
+                    None,
+                    "tag predicate does not test numeric range"
+                );
+            } else {
+                assert!(
+                    facts
+                        .ty(true_value[0])
+                        .bits
+                        .contains(TypeBits::DOUBLE_FLOAT)
+                );
+            }
+            assert_eq!(facts.ty(input), IRType::TOP);
+        }
+    }
+
+    #[test]
+    fn predicate_backedge_does_not_refine_initial_function_entry() {
+        let mut f = Function::new("predicate-entry-backedge");
+        let e = f.entry();
+        let input = f.add_block_param(e, IRType::TOP, ValueRepresentation::Tagged);
+        let (_, earlier) = f.push_inst(
+            e,
+            InstData {
+                args: vec![input],
+                ..inst(Opcode::Guard)
+            },
+            &[(IRType::TOP, ValueRepresentation::Tagged)],
+        );
+        let (_, predicate) = f.push_inst(
+            e,
+            InstData {
+                args: vec![input],
+                aux: AuxData::TypeTag(fixnum()),
+                ..inst(Opcode::TypeCheck)
+            },
+            &[(IRType::TOP, ValueRepresentation::Tagged)],
+        );
+        let exit = f.make_block();
+        f.set_terminator(
+            e,
+            InstData {
+                args: vec![predicate[0]],
+                targets: vec![
+                    BlockCall {
+                        block: e,
+                        args: vec![input],
+                    },
+                    BlockCall {
+                        block: exit,
+                        args: vec![],
+                    },
+                ],
+                ..inst(Opcode::Brif)
+            },
+        );
+        f.set_terminator(exit, ret());
+        let facts = infer(&f);
+        assert_eq!(facts.ty(input), IRType::TOP);
+        assert_eq!(
+            facts.ty(earlier[0]),
+            IRType::TOP,
+            "the initial runtime entry bypasses the true backedge"
+        );
+    }
+
+    #[test]
+    fn symbol_predicate_true_edge_keeps_nil_in_its_semantic_type() {
+        let mut f = Function::new("symbolp-nil");
+        let e = f.entry();
+        let input = f.add_block_param(e, IRType::TOP, ValueRepresentation::Tagged);
+        let (_, predicate) = f.push_inst(
+            e,
+            InstData {
+                args: vec![input],
+                aux: AuxData::TypeTag(IRType::of(TypeBits::SYMBOL)),
+                ..inst(Opcode::TypeCheck)
+            },
+            &[(IRType::TOP, ValueRepresentation::Tagged)],
+        );
+        let yes = f.make_block();
+        let no = f.make_block();
+        f.set_terminator(
+            e,
+            InstData {
+                args: vec![predicate[0]],
+                targets: vec![
+                    BlockCall {
+                        block: yes,
+                        args: vec![],
+                    },
+                    BlockCall {
+                        block: no,
+                        args: vec![],
+                    },
+                ],
+                ..inst(Opcode::Brif)
+            },
+        );
+        let (_, copy) = f.push_inst(
+            yes,
+            InstData {
+                args: vec![input],
+                ..inst(Opcode::Guard)
+            },
+            &[(IRType::TOP, ValueRepresentation::Tagged)],
+        );
+        f.set_terminator(yes, ret());
+        f.set_terminator(no, ret());
+        let facts = infer(&f);
+        assert_eq!(
+            facts.ty(copy[0]).bits,
+            TypeBits::SYMBOL.join(TypeBits::NULL)
+        );
+        assert_eq!(facts.ty(input), IRType::TOP);
+    }
+
+    #[test]
+    fn osr_bypass_cannot_inherit_an_earlier_string_layout_type() {
+        for bypass in [false, true] {
+            let mut f = Function::new("layout-type-osr-bypass");
+            let e = f.entry();
+            let input = f.add_block_param(e, IRType::TOP, ValueRepresentation::Tagged);
+            let state = f.frame_states.add(crate::t2::frame_state::FrameState {
+                scopes: vec![],
+                remat: vec![],
+            });
+            f.push_inst(
+                e,
+                InstData {
+                    args: vec![input],
+                    aux: AuxData::StringLayout,
+                    frame_state: Some(state),
+                    flags: InstFlags {
+                        guard: true,
+                        effectful: true,
+                        ..Default::default()
+                    },
+                    ..inst(Opcode::Guard)
+                },
+                &[(IRType::TOP, ValueRepresentation::Tagged)],
+            );
+            let body = f.make_block();
+            f.set_terminator(
+                e,
+                InstData {
+                    targets: vec![BlockCall {
+                        block: body,
+                        args: vec![],
+                    }],
+                    ..inst(Opcode::Jump)
+                },
+            );
+            let (_, observed) = f.push_inst(
+                body,
+                InstData {
+                    args: vec![input],
+                    aux: AuxData::TypeTag(IRType::TOP),
+                    ..inst(Opcode::Guard)
+                },
+                &[(IRType::TOP, ValueRepresentation::Tagged)],
+            );
+            f.set_terminator(body, ret());
+            f.osr_entries.push(crate::t2::ir::OsrEntry {
+                block: if bypass { body } else { e },
+                bcp: 0,
+                frame_state: state,
+                control_scopes: vec![],
+                checks: vec![],
+            });
+            assert_eq!(
+                infer(&f).ty(observed[0]).bits,
+                if bypass {
+                    TypeBits::TOP
+                } else {
+                    TypeBits::STRING
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn string_layout_guard_implies_string_type_without_reverse_layout_claim() {
+        let mut f = Function::new("string-layout-type");
+        let entry = f.entry();
+        let input = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+        let (_, checked) = f.push_inst(
+            entry,
+            InstData {
+                args: vec![input],
+                aux: AuxData::StringLayout,
+                flags: InstFlags {
+                    guard: true,
+                    effectful: true,
+                    ..Default::default()
+                },
+                ..inst(Opcode::Guard)
+            },
+            &[(IRType::TOP, ValueRepresentation::Tagged)],
+        );
+        let (_, same_block) = f.push_inst(
+            entry,
+            InstData {
+                args: vec![input],
+                ..inst(Opcode::Guard)
+            },
+            &[(IRType::TOP, ValueRepresentation::Tagged)],
+        );
+        let successor = f.make_block();
+        f.set_terminator(
+            entry,
+            InstData {
+                targets: vec![BlockCall {
+                    block: successor,
+                    args: vec![],
+                }],
+                ..inst(Opcode::Jump)
+            },
+        );
+        let (_, dominated) = f.push_inst(
+            successor,
+            InstData {
+                args: vec![input],
+                ..inst(Opcode::Guard)
+            },
+            &[(IRType::TOP, ValueRepresentation::Tagged)],
+        );
+        f.set_terminator(successor, ret());
+        let facts = infer(&f);
+        for value in [checked[0], same_block[0], dominated[0]] {
+            assert_eq!(facts.ty(value).bits, TypeBits::STRING);
+        }
+        assert_eq!(
+            facts.ty(input),
+            IRType::TOP,
+            "guard does not rewrite earlier/global input facts"
+        );
     }
 
     #[test]

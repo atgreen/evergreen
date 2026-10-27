@@ -1,6 +1,6 @@
 {
   "fast": {
-    "egcl-compiler:lib:egcl_compiler": ["t2::array_layout::", "t2::emit::octet_word_store::tests::", "t2::opt_loop_peel::", "t2::emit::phi_cycle_tests::", "t2::emit::tests::strength_reduces_to_lea_when_range_is_safe", "t2::emit::tests::keeps_imul_and_overflow_check_when_range_unknown", "t2::emit::unused_deopt_tests::", "t2::emit::inline_packed_u8::tests::", "t2::emit::shared_deopt::tests::"],
+    "egcl-compiler:lib:egcl_compiler": ["t2::array_layout::", "t2::value_facts::", "t2::infer::", "t2::opt_guard::tests::imported_string_guard_result_gets_its_own_semantic_type_check", "t2::verify::tests::v8_string_layout_flows_through_phi_but_not_raw_input_or_mixed_join", "t2::emit::tests::string_layout_forwarded_guard_runs_with_original_precise_failure_state", "t2::emit::octet_word_store::tests::", "t2::opt_loop_peel::", "t2::emit::phi_cycle_tests::", "t2::emit::tests::strength_reduces_to_lea_when_range_is_safe", "t2::emit::tests::keeps_imul_and_overflow_check_when_range_unknown", "t2::emit::unused_deopt_tests::", "t2::emit::inline_packed_u8::tests::", "t2::emit::shared_deopt::tests::"],
     "egcl-rt:lib:egcl_rt": ["asm::x86_relax::tests::", "gc::root_kind_tests::", "gc_soft_dirty::tests::", "gc_async_wp::imp::tests::", "gc::native_packed_u8_small_header_contract_matches_allocator"],
     "egcl-rt:test:gc_async_old_roots": [""],
     "egcl-rt:test:gc_sparse_old_regions": [""],
@@ -21,6 +21,7 @@
     "egcl:test:loop_peeling": [""],
     "egcl:test:bounded_octet_fallback": [""],
     "egcl:test:array_layout_witness_cli": [""],
+    "egcl:test:type_constraint_facts_cli": [""],
     "egcl:test:loop_arithmetic_once": [""],
     "egcl:test:integer_extraction": [""],
     "egcl:test:make_array_fast_path_cli": [""],

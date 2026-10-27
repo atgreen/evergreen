@@ -6880,6 +6880,9 @@ fn emit_framed_inner(
                             | Opcode::TypeCheck
                             | Opcode::Car
                             | Opcode::Cdr
+                            // The explicit layout guard owns recovery; this
+                            // dependent raw length load cannot deopt itself.
+                            | Opcode::StringByteLength
                             | Opcode::StringCharOrNil
                             | Opcode::SymbolValue
                             | Opcode::SymbolFunction
@@ -10553,6 +10556,191 @@ mod tests {
             *((ptr as *mut u64).add(1)) = bytes.len() as u64;
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.add(16), bytes.len());
             egcl_rt::value::EgclVal::from_heap_ptr(ptr)
+        }
+    }
+
+    /// Shared identity facts must retain the real layout proof while forwarding
+    /// a second guard's different SSA result to the first guard's result.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[test]
+    fn string_layout_forwarded_guard_runs_with_original_precise_failure_state() {
+        use crate::t2::ir::{AuxData, Opcode};
+        use std::sync::atomic::AtomicU64;
+        static EFFECTS: AtomicU64 = AtomicU64::new(0);
+        extern "C" fn effect(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) -> u64 {
+            EFFECTS.fetch_add(1, Ordering::SeqCst);
+            egcl_rt::value::NIL.to_raw()
+        }
+        static SCOPES: AtomicU64 = AtomicU64::new(0);
+        static WORDS: AtomicU64 = AtomicU64::new(0);
+        static BCP: AtomicU64 = AtomicU64::new(u64::MAX);
+        static INPUT: AtomicU64 = AtomicU64::new(0);
+        extern "C" fn capture(scopes: u64, words: u64, payload: *const u64, _: u64) -> u64 {
+            SCOPES.store(scopes, Ordering::SeqCst);
+            WORDS.store(words, Ordering::SeqCst);
+            // This bounded noncollecting observer reads the emitted frame stream.
+            // Do not assert across the C boundary; validate everything on return.
+            if scopes == 1 && words == 5 && !payload.is_null() {
+                BCP.store(unsafe { payload.add(1).read() }, Ordering::SeqCst);
+                INPUT.store(unsafe { payload.add(4).read() }, Ordering::SeqCst);
+            }
+            egcl_rt::value::NIL.to_raw()
+        }
+        let mut f = string_layout_fn(false);
+        let entry = f.entry();
+        let first = f.block(entry).insts[0];
+        let load = f.block(entry).insts[1];
+        let proof = f.inst(first).results[0];
+        let original_state = f.inst(first).frame_state.unwrap();
+        // An actual opaque call commits an effect before the layout checks.
+        // Its pre-call state is distinct from the first guard's post-call BCP.
+        let effect_state = f
+            .frame_states
+            .add(f.frame_states.get(original_state).clone());
+        f.frame_states.get_mut(original_state).scopes[0].bcp = 7;
+        let (call, _) = f.push_inst(
+            entry,
+            crate::t2::ir::InstData {
+                opcode: Opcode::Call,
+                args: vec![],
+                results: vec![],
+                aux: AuxData::OpaqueCallTarget(egcl_rt::symbols::intern("STRING-LAYOUT-EFFECT-TEST")),
+                flags: crate::t2::ir::InstFlags {
+                    call: true,
+                    safepoint: true,
+                    effectful: true,
+                    ..Default::default()
+                },
+                targets: vec![],
+                frame_state: Some(effect_state),
+                source_pos: 0,
+            },
+            &[(
+                crate::t2::ir::IRType::TOP,
+                crate::t2::ir::ValueRepresentation::Tagged,
+            )],
+        );
+        assert_eq!(f.block_mut(entry).insts.pop(), Some(call));
+        f.block_mut(entry).insts.insert(0, call);
+        let mut later_state = f.frame_states.get(original_state).clone();
+        later_state.scopes[0].bcp = 9;
+        let later_state = f.frame_states.add(later_state);
+        let mut later_guard = f.inst(first).clone();
+        later_guard.args = vec![proof];
+        later_guard.results.clear();
+        later_guard.frame_state = Some(later_state);
+        let (second, results) = f.push_inst(
+            entry,
+            later_guard,
+            &[(f.value(proof).ty, f.value(proof).repr)],
+        );
+        assert_eq!(f.block_mut(entry).insts.pop(), Some(second));
+        f.block_mut(entry).insts.insert(2, second);
+        let mut type_guard = f.inst(second).clone();
+        type_guard.args = vec![results[0]];
+        type_guard.results.clear();
+        type_guard.aux = AuxData::TypeTag(crate::t2::ir::IRType::of(crate::t2::ir::TypeBits::STRING));
+        let (type_check, typed) = f.push_inst(entry, type_guard,
+            &[(f.value(proof).ty, f.value(proof).repr)]);
+        assert_eq!(f.block_mut(entry).insts.pop(), Some(type_check));
+        f.block_mut(entry).insts.insert(3, type_check);
+        f.inst_mut(load).args = vec![typed[0]];
+        crate::t2::verify::verify(&f).expect("two layouts and a derived string type verify");
+        crate::t2::pass::Pass::run(
+            &mut crate::t2::opt_guard::GuardElim,
+            &mut f,
+            &mut crate::t2::pass::Analyses::new(),
+        );
+        let guards: Vec<_> = f
+            .block_order()
+            .iter()
+            .flat_map(|&block| f.block(block).insts.iter().copied())
+            .filter(|&inst| {
+                f.inst(inst).opcode == Opcode::Guard
+                    && matches!(f.inst(inst).aux, AuxData::StringLayout)
+            })
+            .collect();
+        assert_eq!(
+            guards,
+            vec![first],
+            "a refined alias must share its dominating layout proof"
+        );
+        assert_eq!(
+            f.inst(load).args,
+            vec![proof],
+            "consumer keeps the surviving proof SSA value"
+        );
+        assert!(!f.block(entry).insts.contains(&type_check),
+            "the successful layout fact implies STRING and removes its redundant type guard");
+        assert_eq!(f.inst(first).frame_state, Some(original_state));
+        crate::t2::verify::verify(&f).expect("forwarded string layout still verifies");
+        let emitted = emit_framed_with_activation_slots(
+            &f,
+            mock_c2i_deopt as *const () as usize as u64,
+            capture as *const () as usize as u64,
+            effect as *const () as usize as u64,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1, // one original frame slot; emitted shadow roots follow it
+            None,
+        )
+        .unwrap();
+        assert!(
+            emitted.has_deopt,
+            "the first real type/layout guard remains"
+        );
+        let buffer = egcl_rt::jit::JitBuffer::new(&emitted.code).unwrap();
+        let run: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buffer.as_ptr()) };
+        let mut frame = [test_string(b"abc").to_raw(), 0, 0, 0];
+        EFFECTS.store(0, Ordering::SeqCst);
+        assert_eq!(
+            egcl_rt::value::EgclVal(run(frame.as_mut_ptr())).as_fixnum(),
+            3
+        );
+        assert_eq!(
+            SCOPES.load(Ordering::SeqCst),
+            0,
+            "valid string stays native"
+        );
+        assert_eq!(EFFECTS.load(Ordering::SeqCst), 1, "valid path commits the prefix once");
+        // This synthetic header is not a moving-GC fixture. The surviving
+        // guard must reject it before interpreting any string body fields.
+        let mut pathname = Box::new(egcl_rt::object::ObjectHeader::new(
+            egcl_rt::object::type_id::PATHNAME,
+            2,
+        ));
+        let wrong_layout = unsafe {
+            egcl_rt::value::EgclVal::from_heap_ptr(
+                (&mut *pathname as *mut egcl_rt::object::ObjectHeader).cast::<u8>(),
+            )
+        };
+        for input in [egcl_rt::value::EgclVal::from_fixnum(9), wrong_layout] {
+            EFFECTS.store(0, Ordering::SeqCst);
+            SCOPES.store(0, Ordering::SeqCst);
+            WORDS.store(0, Ordering::SeqCst);
+            BCP.store(u64::MAX, Ordering::SeqCst);
+            INPUT.store(0, Ordering::SeqCst);
+            frame[0] = input.to_raw();
+            let _ = run(frame.as_mut_ptr());
+            assert_eq!(
+                EFFECTS.load(Ordering::SeqCst),
+                1,
+                "committed prefix runs exactly once"
+            );
+            assert_eq!(SCOPES.load(Ordering::SeqCst), 1);
+            assert_eq!(WORDS.load(Ordering::SeqCst), 5);
+            assert_eq!(
+                BCP.load(Ordering::SeqCst),
+                7,
+                "failure resumes after the effect at the first guard, not the removed later guard"
+            );
+            assert_eq!(INPUT.load(Ordering::SeqCst), input.to_raw());
         }
     }
 

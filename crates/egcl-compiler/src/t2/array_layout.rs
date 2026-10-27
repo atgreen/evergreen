@@ -7,9 +7,7 @@ use super::ir::{
     AuxData, Block, Function, IRType, Inst, InstData, InstFlags, Opcode, TypeBits, Value, ValueDef,
     ValueRepresentation,
 };
-use std::collections::{HashMap, HashSet};
-
-const BUDGET: usize = 512;
+use std::collections::HashMap;
 
 fn owner(f: &Function, inst: Inst) -> Option<(Block, usize)> {
     f.block_order().iter().find_map(|&block| {
@@ -21,69 +19,8 @@ fn owner(f: &Function, inst: Inst) -> Option<(Block, usize)> {
     })
 }
 
-/// Resolve closed forwarding graphs without accepting a seedless phi cycle.
-/// Every incoming edge participates, including repeated edges from one block.
 fn origin(f: &Function, value: Value) -> Option<Value> {
-    let mut todo = vec![value];
-    let mut graph = HashMap::<Value, Vec<Value>>::new();
-    let mut seeds = HashSet::new();
-    while let Some(value) = todo.pop() {
-        if graph.contains_key(&value) {
-            continue;
-        }
-        if graph.len() == BUDGET || f.value(value).repr != ValueRepresentation::Tagged {
-            return None;
-        }
-        let inputs = match f.value(value).def {
-            ValueDef::Result { inst, num: 0 }
-                if f.inst(inst).opcode == Opcode::Guard
-                    && f.inst(inst).args.len() == 1
-                    && f.inst(inst).results.len() == 1 =>
-            {
-                f.inst(inst).args.clone()
-            }
-            ValueDef::Param { block, num } if block != f.entry() => {
-                let mut inputs = Vec::new();
-                for &predecessor in f.block_order() {
-                    let Some(terminator) = f.terminator(predecessor) else {
-                        continue;
-                    };
-                    for edge in &f.inst(terminator).targets {
-                        if edge.block == block {
-                            inputs.push(*edge.args.get(num as usize)?);
-                        }
-                    }
-                }
-                if inputs.is_empty() {
-                    return None;
-                }
-                inputs
-            }
-            _ => {
-                seeds.insert(value);
-                Vec::new()
-            }
-        };
-        todo.extend(inputs.iter().copied());
-        graph.insert(value, inputs);
-    }
-    if seeds.len() != 1 {
-        return None;
-    }
-    let seed = *seeds.iter().next()?;
-    let mut reaches = seeds;
-    for _ in 0..graph.len() {
-        let before = reaches.len();
-        for (&node, inputs) in &graph {
-            if inputs.iter().any(|input| reaches.contains(input)) {
-                reaches.insert(node);
-            }
-        }
-        if reaches.len() == before {
-            break;
-        }
-    }
-    (reaches.len() == graph.len()).then_some(seed)
+    super::value_facts::StructuralFacts::analyze(f).origin(value)
 }
 
 fn probe_location(f: &Function, seed: Value) -> Option<(Block, Option<Inst>, Value)> {
@@ -107,44 +44,11 @@ fn probe_location(f: &Function, seed: Value) -> Option<(Block, Option<Inst>, Val
     }
 }
 
-// OSR imports can break equality between distinct SSA aliases. Until those
-// equalities are guarded, reject every OSR path reaching the consumer, even
-// one that would execute the probe. Ordinary compilation clears these records.
-fn osr_reaches(f: &Function, target: Block) -> bool {
-    let mut todo: Vec<_> = f.osr_entries.iter().map(|entry| entry.block).collect();
-    let mut seen = HashSet::new();
-    while let Some(block) = todo.pop() {
-        if !seen.insert(block) {
-            continue;
-        }
-        if block == target {
-            return true;
-        }
-        if let Some(terminator) = f.terminator(block) {
-            todo.extend(f.inst(terminator).targets.iter().map(|edge| edge.block));
-        }
-    }
-    false
-}
-
-fn dominates(f: &Function, probe: Inst, consumer: Inst) -> bool {
-    let Some((before, position)) = owner(f, probe) else {
-        return false;
-    };
-    let Some((after, use_position)) = owner(f, consumer) else {
-        return false;
-    };
-    (if before == after {
-        position < use_position
-    } else {
-        f.dominators().dominates(before, after)
-    }) && !osr_reaches(f, after)
-}
-
 /// Hoist only witnesses used by repeated kernels. Keep existing effects,
 /// recovery states, argument identities and checked scalar fallback unchanged.
 pub fn hoist_layouts(f: &mut Function) -> usize {
     let dom = f.dominators();
+    let facts = super::value_facts::StructuralFacts::analyze(f);
     let loops = super::opt_licm::detect_loops(f, &dom);
     let sites: Vec<_> = f
         .block_order()
@@ -165,7 +69,7 @@ pub fn hoist_layouts(f: &mut Function) -> usize {
             continue;
         }
         let array = f.inst(site).args[0];
-        let Some(seed) = origin(f, array) else {
+        let Some(seed) = facts.origin(array) else {
             continue;
         };
         let Some((probe_block, after, argument)) = probe_location(f, seed) else {
@@ -175,11 +79,14 @@ pub fn hoist_layouts(f: &mut Function) -> usize {
             .iter()
             .any(|lp| lp.body.contains(&block) && !lp.body.contains(&probe_block))
             || !dom.dominates(probe_block, block)
-            || osr_reaches(f, block)
+            || facts.osr_reaches(block)
         {
             continue;
         }
-        let witness = if let Some(&witness) = witnesses.get(&seed) {
+        let existing = facts.layout_before(array, super::value_facts::LayoutKind::PackedU8, site);
+        let witness = if let Some(proof) = existing {
+            proof.evidence
+        } else if let Some(&witness) = witnesses.get(&seed) {
             witness
         } else {
             let (_, results) = f.push_inst(
@@ -231,6 +138,7 @@ pub fn hoist_layouts(f: &mut Function) -> usize {
 /// Called after structural SSA verification. Re-establish every proof from IR;
 /// a forged Boolean, profile or type annotation is never a layout witness.
 pub fn verify_accesses(f: &Function) -> Result<(), String> {
+    let facts = super::value_facts::StructuralFacts::analyze(f);
     for &block in f.block_order() {
         for &inst in &f.block(block).insts {
             let data = f.inst(inst);
@@ -281,13 +189,9 @@ pub fn verify_accesses(f: &Function) -> Result<(), String> {
             if producer.opcode != Opcode::PackedU8Layout
                 || producer.args.len() != 1
                 || producer.results.first() != Some(&data.args[4])
-                || !dominates(f, probe, inst)
+                || !facts.witness_for(data.args[0], data.args[4], inst)
             {
-                return Err("layout producer does not dominate every entry".into());
-            }
-            let array = origin(f, data.args[0]).ok_or("ambiguous kernel array origin")?;
-            if origin(f, producer.args[0]) != Some(array) {
-                return Err("layout witness names a different array".into());
+                return Err("layout witness is not valid for this array on every entry".into());
             }
         }
     }

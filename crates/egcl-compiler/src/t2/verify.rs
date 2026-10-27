@@ -610,29 +610,6 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                 // SSA value and is a pure load. StringAsciiCharAt consumes the
                 // same refinement but can still fail its bounds/ASCII assumptions,
                 // so it remains an ordered deopt guard.
-                if matches!(
-                    data.opcode,
-                    Opcode::StringByteLength | Opcode::StringAsciiCharAt
-                ) {
-                    let refined = data.args.first().is_some_and(|value| {
-                        valid_values.contains(&value.0)
-                            && matches!(
-                                f.value(*value).def,
-                                ValueDef::Result { inst, .. }
-                                    if f.inst(inst).opcode == Opcode::Guard
-                                        && matches!(&f.inst(inst).aux, AuxData::StringLayout)
-                            )
-                    });
-                    if !refined {
-                        errors.push(VerifyError::new(
-                            "V8 layout-proof",
-                            format!(
-                                "block{bi} {:?} does not consume a StringLayout guard result",
-                                data.opcode
-                            ),
-                        ));
-                    }
-                }
                 if data.opcode == Opcode::StringByteLength
                     && (data.flags.guard || data.flags.effectful || data.frame_state.is_some())
                 {
@@ -862,6 +839,24 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
         }
     }
 
+    // Structural queries run only after SSA and metadata validation: malformed
+    // value/edge indices must produce diagnostics rather than analysis panics.
+    if errors.is_empty() {
+        let facts = super::value_facts::StructuralFacts::analyze(f);
+        for &block in f.block_order() {
+            for &inst in &f.block(block).insts {
+                let d = f.inst(inst);
+                if matches!(d.opcode, Opcode::StringByteLength | Opcode::StringAsciiCharAt)
+                    && !d.args.first().is_some_and(|&subject|
+                        facts.refined_layout_before(subject, super::value_facts::LayoutKind::SimpleString, inst)
+                            .is_some_and(|proof| proof.encoding == super::value_facts::LayoutEvidence::RefinedValue))
+                {
+                    errors.push(VerifyError::new("V8 layout-proof",
+                        format!("{inst:?} lacks a dominating successful simple-string layout proof")));
+                }
+            }
+        }
+    }
     if errors.is_empty() {
         verify_cleanup_continuations(f, &mut errors);
     }
@@ -2060,6 +2055,70 @@ mod tests {
         assert!(
             errs.iter().any(|e| e.check == "V8 layout-guard-contract"),
             "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn v8_string_layout_flows_through_phi_but_not_raw_input_or_mixed_join() {
+        let mut f = Function::new("forwarded-string-layout");
+        let entry = f.entry();
+        let raw = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+        let state = f.frame_states.add(FrameState {
+            scopes: vec![FrameScope {
+                function: 0,
+                bcp: 0,
+                locals: vec![ValueSource::Value {
+                    value: raw,
+                    repr: ValueRepresentation::Tagged,
+                }],
+                stack: vec![],
+            }],
+            remat: vec![],
+        });
+        let (_, checked) = f.push_inst(
+            entry,
+            InstData {
+                args: vec![raw],
+                aux: AuxData::StringLayout,
+                flags: InstFlags {
+                    guard: true,
+                    effectful: true,
+                    ..InstFlags::default()
+                },
+                frame_state: Some(state),
+                ..inst(Opcode::Guard)
+            },
+            &[(IRType::of(TypeBits::STRING), ValueRepresentation::Tagged)],
+        );
+        let body = f.make_block();
+        let phi = f.add_block_param(body, IRType::TOP, ValueRepresentation::Tagged);
+        f.set_terminator(entry, jump(body, vec![checked[0]]));
+        let (load, result) = f.push_inst(
+            body,
+            InstData {
+                args: vec![phi],
+                ..inst(Opcode::StringByteLength)
+            },
+            &[(fixnum(), ValueRepresentation::Tagged)],
+        );
+        f.set_terminator(body, ret(result));
+        verify(&f).expect("a forwarded refined dependency carries its successful layout proof");
+        f.inst_mut(load).args[0] = raw;
+        assert!(
+            verify(&f)
+                .unwrap_err()
+                .iter()
+                .any(|e| e.check == "V8 layout-proof"),
+            "the unchecked original input does not carry the proof dependency"
+        );
+        f.inst_mut(load).args[0] = phi;
+        let term = f.terminator(entry).unwrap();
+        f.inst_mut(term).targets[0].args[0] = raw;
+        assert!(
+            verify(&f)
+                .unwrap_err()
+                .iter()
+                .any(|e| e.check == "V8 layout-proof")
         );
     }
 
