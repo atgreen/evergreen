@@ -9233,6 +9233,11 @@ fn format_colon_tab_needs_pretty_printing() {
     let cases = [
         ("(let ((*print-pretty* nil)) (format nil \"XX~10:tYY\"))", "\"XXYY\""),
         ("(let ((*print-pretty* nil)) (format nil \"XX~10,20:@tYY\"))", "\"XXYY\""),
+        ("(let ((*print-pretty* nil)) (format nil \"~v:t~a\" 10 \"x\"))", "\"x\""),
+        (
+            "(let ((*print-pretty* nil)) (format nil \"~v,v:@t~a\" 10 20 \"x\"))",
+            "\"x\"",
+        ),
         ("(let ((*print-pretty* nil)) (format nil \"XX~4tYY\"))", "\"XX  YY\""),
         ("(let ((*print-pretty* nil)) (format nil \"XX~2@tYY\"))", "\"XX  YY\""),
     ];
