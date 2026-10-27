@@ -32,7 +32,7 @@ use crate::error::EgclError;
 use crate::fxhash::FxBuildHasher;
 use crate::lock_order::{LockLevel, OrderedRwLock};
 use crate::object::{ObjectHeader, SymbolData, symbol_flags, type_id};
-use crate::value::{NIL, EgclVal, UNBOUND};
+use crate::value::{EgclVal, NIL, UNBOUND};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -77,6 +77,30 @@ static UNINTERNED_COUNTER: AtomicU32 = AtomicU32::new(UNINTERNED_BASE);
 // Only operations that can change an existing name's identity invalidate
 // positive lookup snapshots. Adding a new interned name cannot do so.
 static NAME_GENERATION: AtomicU64 = AtomicU64::new(0);
+// Conservative object-inventory generation. Cell-only atomic stores do not
+// change allocation identities; every registry write invalidates the proof.
+static ROOT_OBJECT_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn root_object_generation() -> u64 {
+    ROOT_OBJECT_GENERATION.load(Ordering::Acquire)
+}
+
+/// Snapshot registry object identities, never their movable cells. The caller
+/// validates them under the collector's heap lock and STW extent (heap -> registry).
+pub(crate) fn root_object_addresses() -> Vec<EgclVal> {
+    with_registry(|registry| {
+        registry
+            .map(|registry| {
+                registry
+                    .interned
+                    .iter()
+                    .chain(registry.uninterned.values())
+                    .copied()
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
 
 /// Allocate a string on the GC heap holding `s`.
 ///
@@ -158,6 +182,7 @@ unsafe fn symbol_data(obj: EgclVal) -> *mut SymbolData {
 
 fn with_registry_mut<R>(f: impl FnOnce(&mut SymbolRegistry) -> R) -> R {
     let mut guard = REGISTRY.write().expect("symbol registry poisoned");
+    ROOT_OBJECT_GENERATION.fetch_add(1, Ordering::Release);
     let reg = guard.get_or_insert_with(|| SymbolRegistry {
         interned: Vec::new(),
         uninterned: HashMap::default(),
@@ -858,7 +883,9 @@ pub const BINDING_GUARD_COUNT_MASK: u32 = !BINDING_GUARD_CONSTANT;
 /// bisection; it is read once per process.
 pub fn inline_access_object(idx: u32) -> Option<usize> {
     static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if is_uninterned(idx) || *DISABLED.get_or_init(|| std::env::var_os("EGCL_NO_INLINE_SPECIALS").is_some()) {
+    if is_uninterned(idx)
+        || *DISABLED.get_or_init(|| std::env::var_os("EGCL_NO_INLINE_SPECIALS").is_some())
+    {
         return None;
     }
     symbol_object_ptr(idx)
@@ -901,7 +928,9 @@ impl Drop for DynamicValues {
 // process-wide symbol object. All callers, including stdlib printers, see the
 // same binding overlay through symbol_value/set_symbol_value.
 static DYNAMIC_VALUES: crate::execution_local::ExecutionLocal<std::cell::RefCell<DynamicValues>> = unsafe {
-    crate::execution_local::ExecutionLocal::new(|| std::cell::RefCell::new(DynamicValues::default()))
+    crate::execution_local::ExecutionLocal::new(
+        || std::cell::RefCell::new(DynamicValues::default()),
+    )
 };
 
 /// Recompute every symbol's guard after the registry is replaced wholesale
@@ -909,7 +938,8 @@ static DYNAMIC_VALUES: crate::execution_local::ExecutionLocal<std::cell::RefCell
 /// the restoring execution's overlay is known; it is counted so a binding it
 /// still holds keeps its symbol on the runtime path.
 fn resync_binding_guards() {
-    let bound: Vec<u32> = DYNAMIC_VALUES.with(|values| values.borrow().map.keys().copied().collect());
+    let bound: Vec<u32> =
+        DYNAMIC_VALUES.with(|values| values.borrow().map.keys().copied().collect());
     with_registry(|reg| {
         let Some(reg) = reg else { return };
         for &obj in reg.interned.iter().chain(reg.uninterned.values()) {
@@ -918,7 +948,11 @@ fn resync_binding_guards() {
             }
             // SAFETY: registry entries that are SYMBOL objects are pinned live symbols.
             let s = unsafe { &*symbol_data(obj) };
-            let constant = if s.flags & symbol_flags::CONSTANT != 0 { BINDING_GUARD_CONSTANT } else { 0 };
+            let constant = if s.flags & symbol_flags::CONSTANT != 0 {
+                BINDING_GUARD_CONSTANT
+            } else {
+                0
+            };
             s.binding_guard.store(constant, Ordering::SeqCst);
         }
     });
@@ -983,7 +1017,8 @@ pub fn symbol_is_constant(idx: u32) -> bool {
 pub fn mark_symbol_constant(idx: u32) {
     write_cell(idx, |s| {
         s.flags |= symbol_flags::CONSTANT;
-        s.binding_guard.fetch_or(BINDING_GUARD_CONSTANT, Ordering::SeqCst);
+        s.binding_guard
+            .fetch_or(BINDING_GUARD_CONSTANT, Ordering::SeqCst);
     });
 }
 
@@ -993,7 +1028,8 @@ pub fn define_symbol_constant(idx: u32, value: EgclVal) {
     write_cell(idx, |s| {
         s.value.store(value.0, Ordering::Release);
         s.flags |= symbol_flags::CONSTANT;
-        s.binding_guard.fetch_or(BINDING_GUARD_CONSTANT, Ordering::SeqCst);
+        s.binding_guard
+            .fetch_or(BINDING_GUARD_CONSTANT, Ordering::SeqCst);
     });
 }
 
@@ -1202,6 +1238,21 @@ pub fn shake_roots(candidates: &std::collections::HashSet<u32>) -> Vec<EgclVal> 
         }
         roots
     })
+}
+
+#[cfg(test)]
+pub(crate) fn register_root_test_object(object: EgclVal) -> u32 {
+    let index = UNINTERNED_COUNTER.fetch_add(1, Ordering::Relaxed);
+    with_registry_mut(|registry| {
+        registry.uninterned.insert(index, object);
+    });
+    index
+}
+#[cfg(test)]
+pub(crate) fn remove_root_test_object(index: u32) {
+    with_registry_mut(|registry| {
+        registry.uninterned.remove(&index);
+    });
 }
 
 #[cfg(test)]

@@ -2303,6 +2303,148 @@ impl Default for HeapCollector {
     }
 }
 
+/// All-or-nothing witness that registry cells are already covered by the old
+/// object scan. Pinned symbol boundaries cannot change while registry identity
+/// and heap lifetime stay unchanged; registry writes invalidate conservatively.
+#[derive(Clone, Copy)]
+struct MinorSymbolCoverage {
+    heap_epoch: u64,
+    registry_generation: u64,
+    eligible: bool,
+}
+
+fn minor_symbol_elision_disabled() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var_os("EGCL_DISABLE_MINOR_SYMBOL_ROOT_ELISION").is_some())
+}
+
+fn minor_symbol_coverage(state: &mut HeapState) -> MinorSymbolCoverage {
+    let heap_epoch = heap_identity_epoch();
+    let registry_generation = crate::symbols::root_object_generation();
+    if let Some(proof) = state.minor_symbol_coverage
+        && proof.heap_epoch == heap_epoch
+        && proof.registry_generation == registry_generation
+    {
+        return proof;
+    }
+    let objects = crate::symbols::root_object_addresses();
+    let eligible = older_symbol_objects_covered(state, &objects);
+    let proof = MinorSymbolCoverage {
+        heap_epoch,
+        registry_generation,
+        eligible,
+    };
+    state.minor_symbol_coverage = Some(proof);
+    proof
+}
+
+/// Do not inspect a registry-provided header until an authoritative region walk
+/// reaches that exact allocation start. In particular, an aligned pointer into
+/// another object's payload, a Nursery symbol or a pinned-host annotation is
+/// not sufficient evidence. No helper here re-locks the collector's heap.
+fn older_symbol_objects_covered(state: &HeapState, objects: &[EgclVal]) -> bool {
+    let base = state.heap_base as usize;
+    let Some(end) = base.checked_add(state.config.heap_size) else {
+        return false;
+    };
+    let mut expected = std::collections::HashSet::new();
+    let mut regions = Vec::new();
+    for &object in objects {
+        if !object.is_heap_object() {
+            return false;
+        }
+        let address = (object.to_raw() & !crate::value::TAG_MASK) as usize;
+        if address < base || address >= end {
+            return false;
+        }
+        let index = (address - base) / state.config.region_size;
+        let Some(region) = state.regions.get(index) else {
+            return false;
+        };
+        if !is_old_scan_kind(region.header.kind)
+            || address < region.base as usize
+            || address >= region.header.alloc_top as usize
+        {
+            return false;
+        }
+        expected.insert(address);
+        regions.push(index);
+    }
+    regions.sort_unstable();
+    regions.dedup();
+    let symbol_size = std::mem::size_of::<crate::object::SymbolData>() - OBJECT_HEADER_SIZE;
+    let symbol_footprint = object_footprint(symbol_size).0;
+    for index in regions {
+        let region = &state.regions[index];
+        let mut cursor = region.base as usize;
+        let top = region.header.alloc_top as usize;
+        if cursor < base || top > end || top < cursor {
+            return false;
+        }
+        while cursor
+            .checked_add(OBJECT_HEADER_SIZE)
+            .is_some_and(|next| next <= top)
+        {
+            let ptr = cursor as *const u8;
+            let header = unsafe { header_at(ptr) };
+            if header.0 == 0 {
+                break;
+            }
+            if header.size_units() == LARGE_SIZE_SENTINEL
+                && cursor
+                    .checked_add(LARGE_OBJECT_PAYLOAD_OFFSET)
+                    .is_none_or(|next| next > top)
+            {
+                return false;
+            }
+            let size = if header.size_units() == LARGE_SIZE_SENTINEL {
+                let raw = unsafe { *ptr.add(OBJECT_HEADER_SIZE).cast::<u64>() };
+                let Ok(size) = usize::try_from(raw) else {
+                    return false;
+                };
+                size
+            } else {
+                header.size_units() as usize * 8
+            };
+            if size < OBJECT_HEADER_SIZE
+                || size % OBJECT_ALIGNMENT != 0
+                || cursor.checked_add(size).is_none_or(|next| next > top)
+            {
+                return false;
+            }
+            if expected.contains(&cursor) {
+                if header.type_id() != crate::object::type_id::SYMBOL
+                    || !unsafe { header_is_pinned(ptr) }
+                    || unsafe { header_is_forwarded(ptr) }
+                    || size != symbol_footprint
+                    || unsafe { body_offset(ptr) } != OBJECT_HEADER_SIZE
+                    || unsafe { header_exact_body_len(ptr) } != symbol_size
+                {
+                    return false;
+                }
+                expected.remove(&cursor);
+            }
+            cursor += size;
+        }
+    }
+    expected.is_empty()
+}
+
+fn log_minor_symbol_coverage(minor: u64, elided: bool) {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("EGCL_MINOR_SYMBOL_ROOT_LOG").is_some()) {
+        return;
+    }
+    crate::syscall::dbg_write(b"[gc-symbol-roots] minor id=");
+    write_decimal(minor);
+    crate::syscall::dbg_write(if elided {
+        b" path=ELIDED"
+    } else {
+        b" path=FULL"
+    });
+    crate::syscall::dbg_write(b"\n");
+}
+
 impl HeapCollector {
     /// Stop-the-world minor (nursery) collection.
     /// Cheney-style scavenge: copies live nursery objects into survivor space
@@ -2406,6 +2548,11 @@ impl HeapCollector {
                 }
             };
 
+        // Fix this decision before marking, then reuse it after evacuation.
+        // A retained Nursery region becoming OldGen must not change eligibility.
+        let elide_symbol_roots =
+            !minor_symbol_elision_disabled() && minor_symbol_coverage(state).eligible;
+        log_minor_symbol_coverage(state.stats.minor_gc_count + 1, elide_symbol_roots);
         phases.mark(MinorPhase::SetupIndex);
 
         // Direct roots shared with the major collector.
@@ -2426,13 +2573,15 @@ impl HeapCollector {
             });
         }
         let root_clock = root_phase::start();
-        crate::symbols::for_each_root_slot(|slot| {
-            let v = unsafe { *slot };
-            if tracing {
-                VERIFY_TRACE.with(|t| t.borrow_mut().mark.insert(slot as usize, v.0));
-            }
-            mark_ref(v, &mut nursery_index, &mut mark_worklist);
-        });
+        if !elide_symbol_roots {
+            crate::symbols::for_each_root_slot(|slot| {
+                let v = unsafe { *slot };
+                if tracing {
+                    VERIFY_TRACE.with(|t| t.borrow_mut().mark.insert(slot as usize, v.0));
+                }
+                mark_ref(v, &mut nursery_index, &mut mark_worklist);
+            });
+        }
         root_phase::finish(root_clock, b"minor_mark_symbols", state.stats.minor_gc_count + 1, 0);
         scan_external_mark_roots(ExternalRootScanKind::MinorMark, |slot| {
             let v = unsafe { *slot };
@@ -2818,14 +2967,16 @@ impl HeapCollector {
         // reachable only from a global symbol's cell; rewrite those cells to the
         // evacuated location while forwarding is intact.
         let root_clock = root_phase::start();
-        crate::symbols::for_each_root_slot(|slot| unsafe {
-            let before = (*slot).0;
-            relocate_slot(slot, heap_base_addr, heap_end);
-            if tracing {
-                let after = (*slot).0;
-                VERIFY_TRACE.with(|t| t.borrow_mut().reloc.insert(slot as usize, (before, after)));
-            }
-        });
+        if !elide_symbol_roots {
+            crate::symbols::for_each_root_slot(|slot| unsafe {
+                let before = (*slot).0;
+                relocate_slot(slot, heap_base_addr, heap_end);
+                if tracing {
+                    let after = (*slot).0;
+                    VERIFY_TRACE.with(|t| t.borrow_mut().reloc.insert(slot as usize, (before, after)));
+                }
+            });
+        }
         root_phase::finish(root_clock, b"minor_relocate_symbols", state.stats.minor_gc_count + 1, 0);
         scan_external_roots_with_kind(ExternalRootScanKind::MinorRelocate, |slot| unsafe {
             let before = (*slot).0;
@@ -7550,6 +7701,7 @@ struct HeapState {
     /// Dead pinned function/symbol slots, recorded after major-GC reachability.
     /// Each slot remains a walkable filler until reused; live objects never move.
     free_pinned_slots: Vec<(usize, usize)>,
+    minor_symbol_coverage: Option<MinorSymbolCoverage>,
     /// Nursery regions an object has been pinned in since the last minor
     /// collection (bliss-xyt4l). That collection walks only these regions to
     /// find the pinned ones it must retain in place, instead of every nursery
@@ -7702,6 +7854,7 @@ fn allocate_heap_state(config: &GcConfig) -> Result<HeapState, EgclError> {
     let state = HeapState {
         pinned_hosts: std::collections::HashSet::new(),
         free_pinned_slots: Vec::new(),
+        minor_symbol_coverage: None,
         nursery_pin_candidates: std::collections::HashSet::new(),
         config: config.clone(),
         stats,
@@ -10454,3 +10607,7 @@ mod allocation_failure_message_tests {
 #[cfg(test)]
 #[path = "gc_root_kind_tests.rs"]
 mod root_kind_tests;
+
+#[cfg(test)]
+#[path = "minor_symbol_roots_tests.rs"]
+mod minor_symbol_roots_tests;
