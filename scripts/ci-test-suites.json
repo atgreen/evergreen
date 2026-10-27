@@ -1,6 +1,8 @@
 {
   "fast": {
-    "egcl-rt:lib:egcl_rt": ["gc::root_kind_tests::"],
+    "egcl-rt:lib:egcl_rt": ["gc::root_kind_tests::", "gc_soft_dirty::tests::", "gc_async_wp::imp::tests::"],
+    "egcl-rt:test:gc_async_old_roots": [""],
+    "egcl-rt:test:gc_sparse_old_regions": [""],
     "egcl-stdlib:lib:egcl_stdlib": ["hashtable::tests::minor_root_tracking_mark_relocate_full_and_weak_halves"],
     "egcl-stdlib:test:hashtable_minor_roots": [""],
     "egcl-stdlib:test:hashtable_gc": [""],

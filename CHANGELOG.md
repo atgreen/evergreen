@@ -31,6 +31,11 @@
 
 ### Performance
 
+- Linux minor GC can track writes to older heap ranges with asynchronous
+  kernel write protection, preserving legacy and full-scan fallbacks while
+  avoiding process-wide write protection of unrelated pages
+  ([#713](https://github.com/atgreen/evergreen/pull/713)).
+
 - Unchanged hash tables can skip repeated strong entry-root scans during minor
   GC, while preserving full major and inspection scans and weak-entry cleanup
   ([#711](https://github.com/atgreen/evergreen/pull/711)).

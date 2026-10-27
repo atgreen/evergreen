@@ -1679,6 +1679,28 @@ fn old_generation_bytes(state: &HeapState) -> usize {
         .sum()
 }
 
+/// Exact nonempty older-region extents, including unused tails. An allocation
+/// into an existing older region must dirty a previously armed page. Old region
+/// recycling happens only during major/reset paths, which disarm tracking; a
+/// kind transition/new extent is a new token and initially reads fully dirty.
+fn older_tracking_regions(state: &HeapState) -> Vec<crate::gc_async_wp::Range> {
+    state.regions.iter().filter_map(|region| {
+        (is_old_scan_kind(region.header.kind)
+            && region.header.alloc_top as usize > region.base as usize).then_some(
+            crate::gc_async_wp::Range {
+                start: region.base as usize,
+                // Large-object heads can extend over continuation regions
+                // whose alloc_top is empty. Cover the entire used tail too.
+                end: (region.header.alloc_limit as usize).max(
+                    (region.header.alloc_top as usize).saturating_add(crate::syscall::page_size() - 1)
+                        & !(crate::syscall::page_size() - 1)
+                ),
+                kind: region.header.kind as u8,
+            }
+        )
+    }).collect()
+}
+
 #[inline]
 fn is_old_scan_kind(kind: RegionKind) -> bool {
     matches!(
@@ -1763,7 +1785,9 @@ impl OldGenScan {
                 _ => self.ranges.push((base, top)),
             }
         }
-        crate::gc_soft_dirty::read_dirty_pages(heap.0, heap.1, &self.ranges, &mut self.dirty)
+        crate::gc_soft_dirty::read_dirty_pages(
+            heap.0, heap.1, &self.ranges, &older_tracking_regions(state), &mut self.dirty,
+        )
     }
 
     /// Record the off-heap-tracing object at `header` in region `idx`.
@@ -3079,6 +3103,7 @@ impl HeapCollector {
             state.config.heap_size,
             old_generation_bytes(state),
             state.config.nursery_size,
+            &older_tracking_regions(state),
         );
 
         // Update stats.
@@ -3977,6 +4002,7 @@ impl HeapCollector {
                 heap_size,
                 old_generation_bytes(state),
                 state.config.nursery_size,
+                &older_tracking_regions(state),
             );
         }
 
