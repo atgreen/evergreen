@@ -36,7 +36,8 @@
 //!
 //! The callee symbol decides the family; `statically_proven_spec_type`
 //! (operand SSA types, with fixnum-into-single-float contagion) takes
-//! precedence over the profile:
+//! precedence over the profile. Inferred operand constraints veto numeric guesses
+//! when an operand is provably nonnumeric; they never remove required guards:
 //!
 //! * `+ - *` with two arguments → `Fixnum{Add,Sub,Mul}` / `Float{Add,Sub,Mul}`;
 //!   unary `-` → `FixnumNeg` (fixnum only); other arities stay generic.
@@ -701,6 +702,38 @@ fn reconcile_with_operands(
     }
 }
 
+/// Negative operand constraints for one immutable selection phase. These facts
+/// only veto impossible numeric guesses; they do not license unboxing or replace
+/// the existing floating-point contagion policy. Inference is lazy and shared
+/// across sites, and the snapshot is dropped before any IR mutation.
+#[derive(Default)]
+struct NumericConstraints(std::cell::OnceCell<super::infer::InferenceResult>);
+
+impl NumericConstraints {
+    fn excludes_numeric(&self, f: &Function, args: &[Value]) -> bool {
+        let numeric = TypeBits::FIXNUM
+            .join(TypeBits::BIGNUM)
+            .join(TypeBits::RATIO)
+            .join(TypeBits::SINGLE_FLOAT)
+            .join(TypeBits::DOUBLE_FLOAT)
+            .join(TypeBits::COMPLEX);
+        let excludes = |bits: TypeBits| !bits.is_bottom() && bits.meet(numeric).is_bottom();
+        if args.iter().any(|&arg| excludes(f.value(arg).ty.bits)) {
+            return true;
+        }
+        // Numeric declarations cannot yield a nonnumeric refinement. Avoid a
+        // whole analysis when all operands already have numeric declarations.
+        if args.iter().all(|&arg| {
+            let bits = f.value(arg).ty.bits;
+            bits.is_bottom() || bits.meet(numeric) == bits
+        }) {
+            return false;
+        }
+        let facts = self.0.get_or_init(|| super::infer::infer(f));
+        args.iter().any(|&arg| excludes(facts.ty(arg).bits))
+    }
+}
+
 /// Split a `+`, `-` or `*` of three or more operands whose site profiled
 /// double-float into a left-to-right chain of binary calls (bliss-thcbb.1), so
 /// each link can take the binary raw double form. The interpreter folds the
@@ -711,6 +744,7 @@ fn reconcile_with_operands(
 /// interpreter simply evaluates the original call again.
 fn split_variadic_double_arithmetic(f: &mut Function, profile: &impl Fn(u32) -> Option<SpecType>) {
     use crate::t2::ir::{InstData, ValueRepresentation};
+    let constraints = NumericConstraints::default();
     let mut sites = Vec::new();
     for &block in f.block_order() {
         for &inst in &f.block(block).insts {
@@ -723,9 +757,12 @@ fn split_variadic_double_arithmetic(f: &mut Function, profile: &impl Fn(u32) -> 
             if arith_of(sym).is_none() || profile(frame_state_bcp(f, state)) != Some(SpecType::DoubleFloat) {
                 continue;
             }
-            sites.push(inst);
+            if !constraints.excludes_numeric(f, &data.args) {
+                sites.push(inst);
+            }
         }
     }
+    drop(constraints);
     for site in sites {
         let data = f.inst(site).clone();
         let state = data.frame_state.expect("collected with a frame state");
@@ -831,10 +868,26 @@ fn speculate_double_only_sites(
     let raw_double = (IRType::of(TypeBits::DOUBLE_FLOAT), ValueRepresentation::UnboxedF64);
     let mut n = 0;
     // Program order, so a site sees the refined type of an earlier one.
-    let sites: Vec<Inst> = f.block_order().iter()
-        .flat_map(|&block| f.block(block).insts.clone())
-        .collect();
-    for site in sites {
+    let sites: Vec<(Inst, SpecType)> = {
+        let constraints = NumericConstraints::default();
+        f.block_order().iter()
+            .flat_map(|&block| f.block(block).insts.iter().copied())
+            .filter_map(|site| {
+                let data = f.inst(site);
+                let AuxData::CallTarget(symbol) = data.aux else { return None };
+                if data.opcode != Opcode::Call || data.results.len() != 1
+                    || !data.targets.is_empty()
+                    || double_only_opcode(symbol, data.args.len()).is_none()
+                {
+                    return None;
+                }
+                let state = data.frame_state?;
+                let observed = profile(frame_state_bcp(f, state))?;
+                (!constraints.excludes_numeric(f, &data.args)).then_some((site, observed))
+            })
+            .collect()
+    };
+    for (site, observed) in sites {
         let data = f.inst(site).clone();
         let AuxData::CallTarget(symbol) = data.aux else { continue };
         if data.opcode != Opcode::Call || data.results.len() != 1 || !data.targets.is_empty() {
@@ -842,11 +895,9 @@ fn speculate_double_only_sites(
         }
         let Some(opcode) = double_only_opcode(symbol, data.args.len()) else { continue };
         let Some(state) = data.frame_state else { continue };
-        // A declined site answers `None`; an unprofiled one a cold guess.
-        let observed = profile(frame_state_bcp(f, state));
-        if observed.is_none()
-            || !double_only_operands(f, opcode, &data.args, consts,
-                observed == Some(SpecType::DoubleFloat))
+        // Declined sites were excluded during the immutable selection phase.
+        if !double_only_operands(f, opcode, &data.args, consts,
+                observed == SpecType::DoubleFloat)
         {
             continue;
         }
@@ -978,6 +1029,7 @@ fn speculate_selected(
     // Read phase: collect the calls to rewrite (keeps the borrow off `f` for the
     // mutation phase).
     let mut work: Vec<(Inst, Opcode, IRType, ExtraArg)> = Vec::new();
+    let constraints = NumericConstraints::default();
     let discarded_values = super::opt_clear_mv::dead_after(f);
     // Constant fixnum operands, so a divisor can be recognised without relying
     // on ConstFold having run -- the T2 driver only runs the mid-end pipeline
@@ -1048,6 +1100,9 @@ fn speculate_selected(
             else {
                 continue;
             };
+            if profiles_numeric_operands(sym) && constraints.excludes_numeric(f, &data.args) {
+                continue;
+            }
             if spec == SpecType::DoubleFloat {
                 // Only binary arithmetic and comparisons have a raw double form.
                 let opcode = match (arith_of(sym), cmp_of(sym)) {
@@ -1147,6 +1202,7 @@ fn speculate_selected(
 
     // Mutation phase: turn each into a guarded typed op.
     let mut initially_reachable = None;
+    drop(constraints);
     let mut n = 0;
     let mut fixnum_sites: Vec<Inst> = Vec::new();
     for (inst, opcode, ty, extra) in work {
@@ -2469,4 +2525,174 @@ mod tests {
         assert_eq!(speculate_with(&mut f, &|_| Some(SpecType::DoubleFloat), DOUBLE_FLOAT), 0);
         assert_eq!(f.inst(call).opcode, Opcode::Call);
     }
+    // The producer deliberately declares TOP: only inference knows it returns
+    // a Boolean. This distinguishes the negative consumer from the existing
+    // declared-type reconciliation in speculation.
+    fn call_with_inferred_boolean(name: &str, arity: usize, position: usize) -> (Function, Inst) {
+        use crate::t2::frame_state::ValueSource;
+        use crate::t2::ir::InstData;
+        let (mut f, call) = build_call(name, arity);
+        let block = f.entry();
+        let input = f.block(block).params[0];
+        let (predicate, values) = f.push_inst(
+            block,
+            InstData {
+                opcode: Opcode::TypeCheck,
+                args: vec![input],
+                results: vec![],
+                aux: AuxData::TypeTag(IRType::of(TypeBits::FIXNUM)),
+                flags: InstFlags::default(),
+                targets: vec![],
+                frame_state: None,
+                source_pos: 0,
+            },
+            &[(IRType::TOP, ValueRepresentation::Tagged)],
+        );
+        assert_eq!(f.block_mut(block).insts.pop(), Some(predicate));
+        f.block_mut(block).insts.insert(0, predicate);
+        let (constant, ones) = f.push_inst(
+            block,
+            InstData {
+                opcode: Opcode::ConstFixnum,
+                args: vec![],
+                results: vec![],
+                aux: AuxData::FixnumImm(1),
+                flags: InstFlags::default(),
+                targets: vec![],
+                frame_state: None,
+                source_pos: 0,
+            },
+            &[(IRType::of(TypeBits::FIXNUM), ValueRepresentation::Tagged)],
+        );
+        assert_eq!(f.block_mut(block).insts.pop(), Some(constant));
+        f.block_mut(block).insts.insert(1, constant);
+        let mut args = vec![ones[0]; arity];
+        args[position] = values[0];
+        f.inst_mut(call).args = args.clone();
+        let state = f.inst(call).frame_state.unwrap();
+        f.frame_states.get_mut(state).scopes[0].stack = args
+            .into_iter()
+            .map(|value| ValueSource::Value {
+                value,
+                repr: ValueRepresentation::Tagged,
+            })
+            .collect();
+        assert_eq!(f.value(values[0]).ty, IRType::TOP);
+        assert_eq!(
+            crate::t2::infer::infer(&f).ty(values[0]).bits,
+            TypeBits::SYMBOL.join(TypeBits::NULL)
+        );
+        crate::t2::verify::verify(&f).unwrap();
+        (f, call)
+    }
+
+    fn assert_boolean_numeric_call_unchanged(
+        name: &str,
+        arity: usize,
+        position: usize,
+        profile: SpecType,
+        options: SpeculateOptions,
+    ) {
+        let (mut f, call) = call_with_inferred_boolean(name, arity, position);
+        let original = format!("{:?}", f.inst(call));
+        let state = f.inst(call).frame_state.unwrap();
+        let original_state = format!("{:?}", f.frame_states.get(state));
+        let count = f.num_insts();
+        assert_eq!(
+            speculate_with(&mut f, &|_| Some(profile), options),
+            0,
+            "{name}/{arity} Boolean argument {position} must remain generic"
+        );
+        assert_eq!(f.num_insts(), count, "no split/unbox/guard may be inserted");
+        assert_eq!(
+            format!("{:?}", f.inst(call)),
+            original,
+            "opcode, arguments, targets, flags and exact FrameState ID remain intact"
+        );
+        assert_eq!(
+            format!("{:?}", f.frame_states.get(state)),
+            original_state,
+            "the generic signaling call retains its original evaluated operand stack"
+        );
+        crate::t2::verify::verify(&f).unwrap();
+    }
+
+    #[test]
+    fn inferred_boolean_operands_veto_stale_fixnum_calls_in_either_position() {
+        for position in 0..2 {
+            assert_boolean_numeric_call_unchanged(
+                "+",
+                2,
+                position,
+                SpecType::Fixnum,
+                SpeculateOptions::default(),
+            );
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn inferred_boolean_veto_covers_variadic_and_double_only_entrances() {
+        for (name, arity, position) in [
+            ("+", 3, 1),
+            ("SQRT", 1, 0),
+            ("-", 1, 0),
+            ("/", 2, 0),
+            ("/", 2, 1),
+        ] {
+            assert_boolean_numeric_call_unchanged(
+                name,
+                arity,
+                position,
+                SpecType::DoubleFloat,
+                DOUBLE_FLOAT,
+            );
+        }
+    }
+
+    #[test]
+    fn negative_numeric_veto_does_not_reject_unknown_or_numeric_containing_types() {
+        for ty in [
+            IRType::TOP,
+            IRType::BOTTOM,
+            IRType::of(TypeBits::FIXNUM.join(TypeBits::SYMBOL).join(TypeBits::NULL)),
+        ] {
+            let (mut f, call) = build_call("+", 2);
+            for param in f.block(f.entry()).params.clone() {
+                f.refine_type(param, ty);
+            }
+            assert_eq!(speculate(&mut f, &|_| Some(SpecType::Fixnum)), 1, "{ty:?}");
+            assert_eq!(f.inst(call).opcode, Opcode::FixnumAdd);
+            crate::t2::verify::verify(&f).unwrap();
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn negative_numeric_veto_preserves_single_float_union_and_boolean_operations() {
+        let (mut f, call) = build_call("+", 2);
+        for param in f.block(f.entry()).params.clone() {
+            f.refine_type(
+                param,
+                IRType::of(TypeBits::FIXNUM.join(TypeBits::SINGLE_FLOAT)),
+            );
+        }
+        assert_eq!(speculate(&mut f, &|_| Some(SpecType::SingleFloat)), 1);
+        assert_eq!(f.inst(call).opcode, Opcode::FloatAdd);
+        crate::t2::verify::verify(&f).unwrap();
+        for name in ["NOT", "NULL"] {
+            let (mut f, call) = call_with_inferred_boolean(name, 1, 0);
+            assert_eq!(
+                speculate_with(&mut f, &|_| Some(SpecType::DoubleFloat), DOUBLE_FLOAT),
+                1
+            );
+            assert_eq!(
+                f.inst(call).opcode,
+                Opcode::GenericEq,
+                "Boolean operations do not enter the numeric veto"
+            );
+            crate::t2::verify::verify(&f).unwrap();
+        }
+    }
+
 }
