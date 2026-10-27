@@ -31,6 +31,11 @@
 
 ### Performance
 
+- System Z T2 loops perform their full root-synchronizing runtime poll every
+  64 selected back edges instead of on every iteration, reducing tight-loop
+  overhead while retaining bounded signal, GC, error, and fiber-yield latency
+  ([#615](https://github.com/atgreen/evergreen/pull/615)).
+
 - Linux minor GC can track writes to older heap ranges with asynchronous
   kernel write protection, preserving legacy and full-scan fallbacks while
   avoiding process-wide write protection of unrelated pages
