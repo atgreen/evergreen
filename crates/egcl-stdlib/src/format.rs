@@ -3537,36 +3537,63 @@ fn format_impl(
                 }
                 let ctrl_val = args[*arg_idx];
                 *arg_idx += 1;
-                // Control string must be a string
-                if !ctrl_val.is_heap_object() || !egcl_rt::types::stringp(ctrl_val) {
+                // The control is a format string or, as for `~{~}`, a function
+                // such as FORMATTER returns (CLHS 22.3.7.6): it is called with
+                // a string stream and the arguments, and returns those it did
+                // not consume (ansi format.?.6-11, format.@?.6-9). An
+                // interpreted closure is cons-tagged; the apply hook calls it.
+                let is_string = ctrl_val.is_heap_object() && egcl_rt::types::stringp(ctrl_val);
+                let callable =
+                    ctrl_val.is_function() || ctrl_val.is_heap_object() || ctrl_val.is_cons();
+                if !is_string && callable {
+                    if at_sign {
+                        run_iteration_body("", Some(ctrl_val), args, arg_idx, output)?;
+                    } else {
+                        if *arg_idx >= args.len() {
+                            return Err(EgclError::ControlError("too few args for ~?".into()));
+                        }
+                        let args_val = args[*arg_idx];
+                        *arg_idx += 1;
+                        let mut sub_args = if args_val.is_nil() {
+                            Vec::new()
+                        } else {
+                            cons_list_to_vec(args_val)
+                        };
+                        egcl_rt::rooted_ref!(_sub_args_root = &mut sub_args);
+                        let mut sub_idx = 0;
+                        run_iteration_body("", Some(ctrl_val), &sub_args, &mut sub_idx, output)?;
+                    }
+                    take_escape();
+                } else if !is_string {
                     return Err(EgclError::TypeError {
                         datum: ctrl_val,
-                        expected: "string".into(),
+                        expected: "(OR STRING FUNCTION)".into(),
                     });
-                }
-                let sub_control = extract_egcl_string(ctrl_val).ok_or_else(|| {
-                    EgclError::Internal("failed to extract format string".into())
-                })?;
-                if at_sign {
-                    // ~@? — use the enclosing argument list from current position
-                    format_impl(&sub_control, args, arg_idx, output)?;
-                    // A `~^` inside ends the ~? control string only.
-                    take_escape();
                 } else {
-                    // ~? — consume a separate list argument for the sub-format's args
-                    if *arg_idx >= args.len() {
-                        return Err(EgclError::ControlError("too few args for ~?".into()));
-                    }
-                    let args_val = args[*arg_idx];
-                    *arg_idx += 1;
-                    let sub_args = if args_val.is_nil() {
-                        Vec::new()
+                    let sub_control = extract_egcl_string(ctrl_val).ok_or_else(|| {
+                        EgclError::Internal("failed to extract format string".into())
+                    })?;
+                    if at_sign {
+                        // ~@? — use the enclosing argument list from current position
+                        format_impl(&sub_control, args, arg_idx, output)?;
+                        // A `~^` inside ends the ~? control string only.
+                        take_escape();
                     } else {
-                        cons_list_to_vec(args_val)
-                    };
-                    let mut sub_idx = 0;
-                    format_impl(&sub_control, &sub_args, &mut sub_idx, output)?;
-                    take_escape();
+                        // ~? — consume a separate list argument for the sub-format's args
+                        if *arg_idx >= args.len() {
+                            return Err(EgclError::ControlError("too few args for ~?".into()));
+                        }
+                        let args_val = args[*arg_idx];
+                        *arg_idx += 1;
+                        let sub_args = if args_val.is_nil() {
+                            Vec::new()
+                        } else {
+                            cons_list_to_vec(args_val)
+                        };
+                        let mut sub_idx = 0;
+                        format_impl(&sub_control, &sub_args, &mut sub_idx, output)?;
+                        take_escape();
+                    }
                 }
             }
             'P' => {

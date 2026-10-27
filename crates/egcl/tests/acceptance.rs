@@ -4079,6 +4079,42 @@ fn misc_time_type_and_pathname_designators() {
     }
 }
 
+/// `~?` and `~@?` take their control as a format string or a function such as
+/// FORMATTER returns (CLHS 22.3.7.6). The function is called with a stream and
+/// the arguments; `~@?` continues with the arguments it did not consume (ansi
+/// format.?.6-11, format.@?.6-9). Any other control is a TYPE-ERROR.
+#[test]
+fn format_indirection_takes_a_function_control() {
+    let cases = [
+        ("(format nil \"~?\" (formatter \"<~a>\") '(1))", "\"<1>\""),
+        ("(format nil \"~?|~a\" (formatter \"~a\") '(1 2) 3)", "\"1|3\""),
+        ("(format nil \"~@?|~a\" (formatter \"~a\") 1 2)", "\"1|2\""),
+        ("(format nil \"~?\" \"[~a]\" '(4))", "\"[4]\""),
+        ("(handler-case (format nil \"~?\" 42 nil) (type-error () :type-error))", ":TYPE-ERROR"),
+        (
+            "(handler-case (format nil \"~?\" '(lambda (stream &rest args) (declare (ignore stream args)) nil) nil) (type-error () :type-error))",
+            ":TYPE-ERROR",
+        ),
+    ];
+    for (expr, expected) in cases {
+        let out = egcl_bin()
+            .args(["--eval", &format!("(print {expr})")])
+            .output()
+            .expect("run egcl");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout
+            .lines()
+            .map(|l| l.trim())
+            .find(|l| !l.is_empty())
+            .unwrap_or("");
+        assert_eq!(
+            got, expected,
+            "{expr} => expected {expected}, got: {got} (stderr: {})",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
 /// SUBTYPEP with a compound (parameterized/bounded) SUBTYPE: it narrows its head
 /// type, so it is a subtype of whatever the head is — (integer 0 10) ⊆ integer,
 /// (vector t 3) ⊆ array, (mod 5) ⊆ integer. Previously sym_name on the cons gave
