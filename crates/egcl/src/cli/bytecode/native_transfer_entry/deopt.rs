@@ -1512,6 +1512,35 @@ pub(in crate::cli::bytecode) fn with_ordinary_guard_resume_observer_for_test<R>(
     body()
 }
 
+// The observer sees a validated, rooted, fully tagged stream. Its pointer is
+// valid only for the duration of the callback; collecting callbacks must read
+// it after collection rather than retain a borrowed slice across collection.
+#[cfg(test)]
+type OrdinaryGuardPayloadObserver = Cell<Option<fn(*const u64, usize, bool)>>;
+
+#[cfg(test)]
+static ORDINARY_GUARD_PAYLOAD_OBSERVER:
+    egcl_rt::execution_local::ExecutionLocal<OrdinaryGuardPayloadObserver> = unsafe {
+        egcl_rt::execution_local::ExecutionLocal::new(|| Cell::new(None))
+    };
+
+#[cfg(test)]
+pub(in crate::cli::bytecode) fn with_ordinary_guard_payload_observer_for_test<R>(
+    observe: fn(*const u64, usize, bool),
+    body: impl FnOnce() -> R,
+) -> R {
+    struct Restore(Option<fn(*const u64, usize, bool)>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ORDINARY_GUARD_PAYLOAD_OBSERVER.with(|slot| slot.set(self.0));
+        }
+    }
+    let _restore = Restore(
+        ORDINARY_GUARD_PAYLOAD_OBSERVER.with(|slot| slot.replace(Some(observe))),
+    );
+    body()
+}
+
 pub(super) unsafe fn resume_ordinary_guard(request: *mut u8) -> Result<EgclVal, EgclError> {
     use egcl_compiler::t2::emit::OrdinaryGuardRequest;
     use egcl_compiler::t2::x64_calls::{NativeCallOrigin, NativeCallValues};
@@ -1605,6 +1634,10 @@ pub(super) unsafe fn resume_ordinary_guard(request: *mut u8) -> Result<EgclVal, 
             )
         }.map_err(|_| invalid_capture())?;
         roots.payload_ranges = payload_ranges()?;
+    }
+    #[cfg(test)]
+    if let Some(observe) = ORDINARY_GUARD_PAYLOAD_OBSERVER.with(Cell::get) {
+        observe(request.words, request.n_words as usize, !f64_slots.is_empty());
     }
     // A `&key` body's native arguments are its bound slots, not the call's
     // actuals; like its managed frame, it records no original arguments.

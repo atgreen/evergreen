@@ -20,6 +20,10 @@ mod vector_range_relocation;
 #[path = "ordinary_octet_word_store_relocation.rs"]
 mod octet_word_store_relocation;
 
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[path = "ordinary_shared_deopt.rs"]
+mod shared_deopt;
+
 thread_local! {
     // An address for comparison only: this deliberately is not a GC root.
     static ALLOCATED_ROOT: Cell<u64> = const { Cell::new(0) };
@@ -268,6 +272,106 @@ fn ordinary_t2_self_calls_check_single_float_tags() {
         "wrong float tag: {result:?}");
 }
 
+/// Decode only instructions reachable through direct control-flow edges from
+/// ENTRY_OFFSET. Follow both conditional outcomes, direct jumps and internal
+/// direct-call targets; every call also has a fallthrough continuation. This
+/// deliberately does not resolve indirect jumps (including recipe-dispatched
+/// recovery continuations), so it is not a complete executable-code inventory.
+/// It keeps embedded recipe data out of direct native code-shape assertions.
+fn directly_reachable_native_instructions(
+    bytes: &[u8],
+    base: u64,
+    entry_offset: usize,
+) -> Vec<iced_x86::Instruction> {
+    use iced_x86::{Decoder, DecoderOptions, Mnemonic};
+    let mut pending = vec![entry_offset];
+    let mut instructions = std::collections::BTreeMap::new();
+    while let Some(offset) = pending.pop() {
+        if offset >= bytes.len() || instructions.contains_key(&offset) {
+            continue;
+        }
+        let mut decoder = Decoder::with_ip(
+            64,
+            &bytes[offset..],
+            base + offset as u64,
+            DecoderOptions::NONE,
+        );
+        let instruction = decoder.decode();
+        assert!(
+            !instruction.is_invalid(),
+            "invalid reachable native instruction at {offset:#x}"
+        );
+        let next = offset + instruction.len();
+        let terminal = matches!(
+            instruction.mnemonic(),
+            Mnemonic::Ret
+                | Mnemonic::Retf
+                | Mnemonic::Iret
+                | Mnemonic::Iretd
+                | Mnemonic::Iretq
+                | Mnemonic::Ud0
+                | Mnemonic::Ud1
+                | Mnemonic::Ud2
+                | Mnemonic::Int
+                | Mnemonic::Int1
+                | Mnemonic::Int3
+                | Mnemonic::Hlt
+        );
+        let direct_target = matches!(
+            instruction.op0_kind(),
+            iced_x86::OpKind::NearBranch16
+                | iced_x86::OpKind::NearBranch32
+                | iced_x86::OpKind::NearBranch64
+        );
+        if direct_target
+            && let Some(target) = instruction
+                .near_branch_target()
+                .checked_sub(base)
+                .and_then(|target| usize::try_from(target).ok())
+                .filter(|target| *target < bytes.len())
+        {
+            pending.push(target);
+        }
+        if !terminal && instruction.mnemonic() != Mnemonic::Jmp {
+            pending.push(next);
+        }
+        instructions.insert(offset, instruction);
+    }
+    instructions.into_values().collect()
+}
+
+#[test]
+fn direct_native_reachability_skips_data_and_visits_calls_and_loops_once() {
+    // JMP skips fake JO data; CALL reaches the leaf; conditional JO has a RET
+    // successor and a self-loop successor. Bytes after the leaf RET are data.
+    let bytes = [
+        0xeb, 4, 0x70, 0, 0xc3, 0xcc, 0xe8, 5, 0, 0, 0, 0x70, 2, 0xeb, 0xfe, 0xc3, 0x90, 0xc3,
+        0x70, 0,
+    ];
+    let instructions = directly_reachable_native_instructions(&bytes, 0x1000, 0);
+    assert_eq!(
+        instructions
+            .iter()
+            .map(|i| i.ip() - 0x1000)
+            .collect::<Vec<_>>(),
+        vec![0, 6, 11, 13, 15, 16, 17]
+    );
+    assert_eq!(
+        instructions
+            .iter()
+            .filter(|i| i.mnemonic() == iced_x86::Mnemonic::Jo)
+            .count(),
+        1
+    );
+    assert_eq!(
+        instructions
+            .iter()
+            .filter(|i| i.code() == iced_x86::Code::Call_rel32_64)
+            .count(),
+        1
+    );
+}
+
 #[test]
 #[ignore = "requires a platform-supported native segment transition"]
 fn ordinary_t2_uses_native_recursion_for_bounded_fibonacci() {
@@ -301,16 +405,17 @@ fn ordinary_t2_uses_native_recursion_for_bounded_fibonacci() {
     let NativeCodeStorage::Mapped(mapped) = &code._storage else { unreachable!() };
     assert!(mapped.ordinary_entry.is_some(),
         "bounded recursion must use the ordinary register ABI");
-    let bytes = unsafe { std::slice::from_raw_parts(code.entry, code.code_len) };
-    let direct_calls = iced_x86::Decoder::with_ip(64, bytes, code.entry as u64,
-        iced_x86::DecoderOptions::NONE).into_iter().filter(|instruction|
+    let (base, length) = mapped.ordinary_code_bounds().expect("ordinary code bounds");
+    let bytes = unsafe { std::slice::from_raw_parts(base as *const u8, length) };
+    let instructions = directly_reachable_native_instructions(
+        bytes, base as u64, mapped.ordinary_entry.unwrap(),
+    );
+    let direct_calls = instructions.iter().filter(|instruction|
         instruction.code() == iced_x86::Code::Call_rel32_64
-            && instruction.near_branch_target() >= code.entry as u64
-            && instruction.near_branch_target() < code.entry as u64 + code.code_len as u64)
+            && instruction.near_branch_target() >= base as u64
+            && instruction.near_branch_target() < base as u64 + length as u64)
         .count();
     assert_eq!(direct_calls, 2, "both recursive edges must call generated code directly");
-    let instructions: Vec<_> = iced_x86::Decoder::with_ip(64, bytes, code.entry as u64,
-        iced_x86::DecoderOptions::NONE).into_iter().collect();
     let base_case_tests = instructions.windows(2).filter(|pair| {
         let instruction = &pair[0];
         instruction.mnemonic() == iced_x86::Mnemonic::Cmp

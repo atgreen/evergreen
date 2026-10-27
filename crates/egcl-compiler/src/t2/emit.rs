@@ -346,6 +346,10 @@ mod ordinary_prefix;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[path = "inline_alloc.rs"]
 mod inline_alloc;
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[path = "shared_deopt.rs"]
+mod shared_deopt;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[path = "inline_packed_u8.rs"]
 mod inline_packed_u8;
@@ -8739,6 +8743,17 @@ fn emit_framed_inner(
             deopt_stubs.push((osr.frame_state, *label, format!("osr@{}", osr.bcp)));
         }
     }
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let shared_trial = (shared_deopt::enabled() && ordinary_guard_veneer.is_some()
+        && f.osr_entries.is_empty()).then(|| (a.clone(), native_calls.clone(), native_value_maps.clone()));
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let mut shared_sites = Vec::new();
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let mut shared_supported = true;
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let cold_start = a.here();
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let mut shared_diagnostic = None;
     for (fsid, label, origin) in deopt_stubs {
         let fs = f.frame_states.get(fsid);
         if fs.scopes.is_empty() {
@@ -8826,6 +8841,21 @@ fn emit_framed_inner(
         let request_bytes = if segment_deopt.is_some() || ordinary_guard_veneer.is_some() { 32 } else { 0 };
         let alloc = ((n_words * 8) + request_bytes + 15) & !15;
 
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        if shared_trial.is_some() {
+            let sources = srcs.iter().map(|source| match source {
+                SlotSrc::Home(home) => Some(shared_deopt::Source::Home(*home, false)),
+                SlotSrc::FixnumHome(home) => Some(shared_deopt::Source::Home(*home, true)),
+                SlotSrc::Imm(bits) => Some(shared_deopt::Source::Imm(*bits)),
+                SlotSrc::Remat(id) => shared_deopt::source(&ValueSource::Remat(*id), fs, &homes, &const_tagged, 0),
+            }).collect::<Option<Vec<_>>>();
+            if let Some(sources) = sources {
+                if let Ok(n_scopes) = u32::try_from(fs.scopes.len()) {
+                    shared_sites.push(shared_deopt::Site { label, frame_state: fsid, n_scopes,
+                        sources, f64_slots: f64_slots.clone().into_boxed_slice() });
+                } else { shared_supported = false; }
+            } else { shared_supported = false; }
+        }
         a.bind(label);
         #[cfg(all(target_arch = "x86_64", windows))]
         probe_windows_stack(&mut a, alloc as u32);
@@ -8967,6 +8997,31 @@ fn emit_framed_inner(
             crate::t2::native_return::emit_dynamic_return(&mut a, c2i_mv_addr);
         } else {
             a.push(0xC3);
+        }
+    }
+
+    // Trial emission is transactional: rejected candidates never change bytes,
+    // label bindings, call PCs, value maps, or the retained legacy recovery path.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    if let Some((prefix, mut calls, mut values)) = shared_trial {
+        let old_cold_bytes = a.here() - cold_start;
+        if shared_supported {
+            if let (Some(control), Some(veneer)) = (native_control_home, ordinary_guard_veneer) {
+                if let Some(candidate) = shared_deopt::emit_candidate(prefix, &shared_sites,
+                    native_spill_slots, control, veneer, emit_epilogue)
+                {
+                    let new_cold_bytes = candidate.asm.here() - cold_start;
+                    if new_cold_bytes < old_cold_bytes {
+                        shared_diagnostic = Some((shared_sites.len(), old_cold_bytes, new_cold_bytes,
+                            candidate.data_offset, candidate.data_bytes, candidate.helper_start, candidate.helper_end));
+                        calls.extend(candidate.calls);
+                        values.extend(candidate.values);
+                        a = candidate.asm;
+                        native_calls = calls;
+                        native_value_maps = values;
+                    }
+                }
+            }
         }
     }
 
@@ -9301,6 +9356,11 @@ fn emit_framed_inner(
                 .and_then(|bytes| bytes.checked_add(32 + 15))
                 .map(|bytes| (bytes & !15) + 8).ok_or(EmitError::BadBranch)?
         } else { 0 };
+        // Shared serialization reserves a fixed snapshot/payload extent which
+        // can exceed any individual legacy stream. Admit the ACTUAL call frame.
+        let guard_bytes = native_calls.iter().filter(|site| matches!(site.origin, NativeCallOrigin::Deopt(_)))
+            .try_fold(guard_bytes, |bound, site| (site.stack_adjust as usize).checked_add(8)
+                .map(|required| bound.max(required))).ok_or(EmitError::BadBranch)?;
         Some(if ordinary_call_mode {
             let outgoing_bytes = f.block_order().iter().flat_map(|&block| &f.block(block).insts)
                 .filter_map(|&inst| {
@@ -9330,6 +9390,16 @@ fn emit_framed_inner(
             .copy_from_slice(&bound.to_le_bytes());
     }
 
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    if let Some((sites, old_bytes, new_bytes, data_offset, data_bytes, helper_start, helper_end)) = shared_diagnostic {
+        static LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *LOG.get_or_init(|| std::env::var_os("EGCL_SHARED_DEOPT_LOG").is_some()) {
+            let fingerprint = code.iter().fold(0xcbf2_9ce4_8422_2325u64,
+                |hash, byte| (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3));
+            eprintln!("[shared-deopt] function={} chosen sites={} old_cold_bytes={} new_cold_bytes={} data_offset={} data_bytes={} helper_start={} helper_end={} code_len={} fingerprint={:016x}",
+                f.name(), sites, old_bytes, new_bytes, data_offset, data_bytes, helper_start, helper_end, code.len(), fingerprint);
+        }
+    }
     Ok(FramedCode {
         frame_entry: (!ordinary_call_mode).then_some(0),
         ordinary_entry,

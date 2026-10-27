@@ -4,6 +4,11 @@
 
 ### Changed
 
+- x86 T2 shares cold ordinary deoptimization serialization through compact
+  state recipes when the complete replacement, including tables, is smaller,
+  while preserving precise recovery and collecting guards
+  ([#719](https://github.com/atgreen/evergreen/pull/719)).
+
 - x86 T2 omits unreachable instruction recovery stubs after range and type
   proofs remove their branches, reducing generated code while retaining live
   deoptimization and OSR recovery
