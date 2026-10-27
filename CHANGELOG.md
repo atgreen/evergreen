@@ -226,6 +226,10 @@
   collection is retried at the next allocation
   ([#644](https://github.com/atgreen/evergreen/pull/644); reported in
   [#609](https://github.com/atgreen/evergreen/issues/609)).
+- `defstruct` with `(:conc-name "")` interns each accessor in the current
+  package, as for any other prefix, instead of using the slot's own symbol
+  ([#684](https://github.com/atgreen/evergreen/pull/684)).
+
 - `read-line` on a Gray stream, such as a flexi-streams stream, now reports
   end of file. It returns `eof-value` when `eof-error-p` is false and signals
   `end-of-file` otherwise. Before, it returned an empty string forever, so a
