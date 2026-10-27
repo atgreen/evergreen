@@ -290,6 +290,17 @@ const POSITIVE_PHI_READY: &str = r#"
 (assert (= 2 (egcl-ext:function-tier 'positive-inferred-double-phi)))
 (assert (= 2 (egcl-ext:function-tier 'positive-inferred-single-phi)))
 (assert (= 2 (egcl-ext:function-tier 'positive-inferred-fixnum-phi)))
+;; First arithmetic calls occur only after actual T2 installation. Isolate
+;; successful calls so a doomed cold fixnum version cannot hide behind recovery.
+(let ((before-double (egcl-ext:deopt-count)))
+  (positive-inferred-double-phi nil 1 t)
+  (assert (= before-double (egcl-ext:deopt-count))))
+(let ((before-single (egcl-ext:deopt-count)))
+  (positive-inferred-single-phi nil 1 t)
+  (assert (= before-single (egcl-ext:deopt-count))))
+(let ((before-fixnum (egcl-ext:deopt-count)))
+  (positive-inferred-fixnum-phi nil 1 t)
+  (assert (= before-fixnum (egcl-ext:deopt-count))))
 "#;
 
 const POSITIVE_PHI_CHECK: &str = r#"

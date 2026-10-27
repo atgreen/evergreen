@@ -4,6 +4,10 @@
 
 ### Changed
 
+- T2 uses inferred numeric types to select arithmetic specializations ahead of
+  stale profiles while preserving failed-site feedback and runtime checks
+  ([#735](https://github.com/atgreen/evergreen/pull/735)).
+
 - T2 avoids impossible numeric speculation when inferred operand types prove
   a nonnumeric value, reducing avoidable deoptimization and recompilation
   ([#734](https://github.com/atgreen/evergreen/pull/734)).
