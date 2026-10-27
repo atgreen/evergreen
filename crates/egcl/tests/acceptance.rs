@@ -6228,6 +6228,57 @@ fn package_errors_are_correctable() {
     }
 }
 
+/// IMPORT must diagnose a distinct same-named symbol that is accessible by
+/// inheritance, not only one already present in the target package. Continuing
+/// from the correctable PACKAGE-ERROR leaves the inherited binding unchanged
+/// (bliss-ah2qi).
+#[test]
+fn import_conflict_with_inherited_symbol_is_correctable() {
+    let program = r#"(progn
+      (defmacro non-abort-restart-p (&body body)
+        `(catch 'handled
+           (handler-bind ((error (lambda (c)
+                                   (throw 'handled
+                                     (if (some (lambda (r)
+                                                 (not (eq (restart-name r) 'abort)))
+                                               (compute-restarts c))
+                                         'success 'fail)))))
+             ,@body)))
+      (make-package "PE-INHERITED-SOURCE" :use nil)
+      (make-package "PE-IMPORT-SOURCE" :use nil)
+      (let ((inherited (intern "CLASH" "PE-INHERITED-SOURCE"))
+            (replacement (intern "CLASH" "PE-IMPORT-SOURCE")))
+        (export inherited "PE-INHERITED-SOURCE")
+        (make-package "PE-INHERITED-TARGET" :use '("PE-INHERITED-SOURCE"))
+        (cl:format t "~S~%"
+          (non-abort-restart-p
+            (import replacement "PE-INHERITED-TARGET")))
+        (handler-bind ((error (lambda (c) (continue c))))
+          (import replacement "PE-INHERITED-TARGET"))
+        (multiple-value-bind (found status)
+            (find-symbol "CLASH" "PE-INHERITED-TARGET")
+          (cl:format t "~S" (list (eq found inherited) status)))))"#;
+
+    let output = egcl_bin()
+        .args(["--eval", program])
+        .output()
+        .expect("failed to run egcl");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "inherited IMPORT conflict probe failed:\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .collect::<Vec<_>>(),
+        ["SUCCESS", "(T :INHERITED)", "NIL"],
+        "IMPORT did not preserve the inherited binding after continuation"
+    );
+}
+
 /// A symbol registry key is `PACKAGE::NAME`, and NAME may itself contain
 /// colons. Ten sites split such a key at the LAST marker, which lands inside
 /// the name: SYMBOL-PACKAGE reported "COMMON-LISP-USER::PR2" — not even a well

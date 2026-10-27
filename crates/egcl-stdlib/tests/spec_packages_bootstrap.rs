@@ -216,6 +216,38 @@ fn import_conflict_leaves_existing_binding_unchanged() {
 }
 
 #[test]
+fn import_conflict_leaves_inherited_binding_unchanged() {
+    let mut registry = fresh_registry();
+
+    let provider = registry
+        .make_package("AH2QI-PROVIDER", &[], &[])
+        .unwrap();
+    let alternative = registry
+        .make_package("AH2QI-ALTERNATIVE", &[], &[])
+        .unwrap();
+    let target = registry.make_package("AH2QI-TARGET", &[], &[]).unwrap();
+
+    let (inherited, _) = intern("CLASH", provider).unwrap();
+    export(&[inherited], provider).unwrap();
+    use_package(&[provider], target).unwrap();
+    let (replacement, _) = intern("CLASH", alternative).unwrap();
+
+    import(&[replacement], target).expect_err("inherited import conflict must fail");
+    assert_eq!(
+        find_symbol("CLASH", target).unwrap(),
+        Some((inherited, InternStatus::Inherited)),
+        "failed import must leave the inherited binding accessible",
+    );
+
+    import(&[inherited], target).expect("importing the inherited symbol itself must succeed");
+    assert_eq!(
+        find_symbol("CLASH", target).unwrap(),
+        Some((inherited, InternStatus::Internal)),
+        "importing the inherited symbol itself must make it present",
+    );
+}
+
+#[test]
 fn shadowing_import_overrides_inherited_symbol_with_local_binding() {
     // Per R5.52 and R5.54, SHADOWING-IMPORT must allow a package to resolve a
     // symbol conflict by installing its own present symbol.

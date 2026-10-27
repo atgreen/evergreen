@@ -194,6 +194,11 @@
 
 ### Fixed
 
+- `import` now signals a correctable package conflict when a distinct
+  same-named symbol is inherited by the target package; continuing preserves
+  the inherited binding
+  ([#714](https://github.com/atgreen/evergreen/pull/714)).
+
 - Strings opened by a character given double-quote syntax now end at that
   character, and characters given single-escape syntax quote the next character
   while reading a string
