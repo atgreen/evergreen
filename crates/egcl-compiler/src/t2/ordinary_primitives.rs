@@ -44,6 +44,52 @@ impl OrdinaryPrimitive {
     ];
 }
 
+/// Immutable immediate identities captured by the owner that registers the
+/// private adapter. Background emission never looks up or interns symbols.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PackedU8AdapterSymbols {
+    pub element_type: u32,
+    pub unsigned_byte: u32,
+}
+
+fn packed_u8_adapters()
+-> &'static std::sync::Mutex<std::collections::HashMap<u32, Option<PackedU8AdapterSymbols>>> {
+    static ADAPTERS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<u32, Option<PackedU8AdapterSymbols>>>,
+    > = std::sync::OnceLock::new();
+    ADAPTERS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Register an exact runtime-owned semantic identity, never a public name or
+/// inferred body shape. Conflicting registration permanently declines inline
+/// emission for that identity; its unchanged collecting call remains valid.
+pub fn register_packed_u8_adapter(target: u32, symbols: PackedU8AdapterSymbols) -> bool {
+    let mut adapters = packed_u8_adapters().lock().unwrap();
+    match adapters.entry(target) {
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(Some(symbols));
+            true
+        }
+        std::collections::hash_map::Entry::Occupied(mut entry) => {
+            if *entry.get() == Some(symbols) {
+                true
+            } else {
+                *entry.get_mut() = None;
+                false
+            }
+        }
+    }
+}
+
+pub(super) fn packed_u8_adapter(target: u32) -> Option<PackedU8AdapterSymbols> {
+    packed_u8_adapters()
+        .lock()
+        .unwrap()
+        .get(&target)
+        .copied()
+        .flatten()
+}
+
 fn array_constructor_candidate(f: &Function, data: &InstData) -> bool {
     use crate::t2::ir::ValueDef;
     let AuxData::CallTarget(symbol) = data.aux else {

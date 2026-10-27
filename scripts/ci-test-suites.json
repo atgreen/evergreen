@@ -1,7 +1,7 @@
 {
   "fast": {
-    "egcl-compiler:lib:egcl_compiler": ["t2::emit::unused_deopt_tests::"],
-    "egcl-rt:lib:egcl_rt": ["gc::root_kind_tests::", "gc_soft_dirty::tests::", "gc_async_wp::imp::tests::"],
+    "egcl-compiler:lib:egcl_compiler": ["t2::emit::unused_deopt_tests::", "t2::emit::inline_packed_u8::tests::"],
+    "egcl-rt:lib:egcl_rt": ["gc::root_kind_tests::", "gc_soft_dirty::tests::", "gc_async_wp::imp::tests::", "gc::native_packed_u8_small_header_contract_matches_allocator"],
     "egcl-rt:test:gc_async_old_roots": [""],
     "egcl-rt:test:gc_sparse_old_regions": [""],
     "egcl-stdlib:lib:egcl_stdlib": ["hashtable::tests::minor_root_tracking_mark_relocate_full_and_weak_halves"],

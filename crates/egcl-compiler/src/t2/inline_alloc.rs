@@ -86,7 +86,7 @@ pub(super) fn list_shape(data: &InstData) -> Option<ListShape> {
 
 /// `op r64, qword ptr fs:[disp32]` (or the store form), absolute within the
 /// thread's TLS block.
-fn fs_mem(a: &mut Asm, opcode: u8, reg: u8, disp: i32) {
+pub(super) fn fs_mem(a: &mut Asm, opcode: u8, reg: u8, disp: i32) {
     a.push(0x64);
     a.push(0x48 | if reg >= 8 { 4 } else { 0 });
     a.push(opcode);
@@ -103,7 +103,7 @@ fn lea_rax(a: &mut Asm, dst: u8, disp: i32) {
     a.extend_from_slice(&disp.to_le_bytes());
 }
 
-fn load_value(
+pub(super) fn load_value(
     a: &mut Asm,
     dst: u8,
     value: Value,
@@ -256,7 +256,7 @@ pub(super) fn emit_box_double_fast_path(
 
 /// The window's `(cursor, limit, epoch)` displacements from the thread
 /// pointer.
-fn window_fields(layout: &egcl_rt::gc::NativeAllocLayout) -> Option<(i32, i32, i32)> {
+pub(super) fn window_fields(layout: &egcl_rt::gc::NativeAllocLayout) -> Option<(i32, i32, i32)> {
     use egcl_rt::gc::native_tlab_offsets as offsets;
     let window = |field: i32| layout.tls_offset.checked_add(field);
     Some((

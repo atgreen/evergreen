@@ -346,6 +346,9 @@ mod ordinary_prefix;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[path = "inline_alloc.rs"]
 mod inline_alloc;
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[path = "inline_packed_u8.rs"]
+mod inline_packed_u8;
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[path = "inline_special.rs"]
@@ -370,7 +373,8 @@ fn is_global_special(symbol: u32) -> bool {
 #[path = "ordinary_primitives.rs"]
 mod ordinary_primitives;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-pub use ordinary_primitives::{OrdinaryPrimitive, lower_ordinary_primitives};
+pub use ordinary_primitives::{OrdinaryPrimitive, lower_ordinary_primitives,
+    PackedU8AdapterSymbols, register_packed_u8_adapter};
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub use ordinary_call::{emit_framed_ordinary_call, emit_framed_ordinary_tail_call,
     emit_framed_ordinary_guarded_call, emit_framed_ordinary_two_calls, emit_framed_ordinary_function, emit_framed_ordinary_function_with_poll, emit_framed_ordinary_function_with_self_calls, emit_framed_ordinary_function_with_self_call_facts, OrdinarySelfCallFacts, OrdinaryCallTarget, OrdinaryCallFlags,
@@ -5726,24 +5730,26 @@ fn emit_framed_inner(
     let single_returns = if native_returns {
         crate::t2::opt_clear_mv::single_value_state_after_normalized_calls(f, true, &normalized_calls)
     } else { HashSet::new() };
-    // A call to CONS, LIST or LIST* returns one value and so empties the MV
-    // buffer, which its inline fast path preserves only from an empty buffer.
+    // List constructors and the registered packed-U8 adapter return one value.
+    // Their inline paths preserve MV only when the incoming buffer is empty.
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     let inline_alloc_single = if ordinary_call_mode && native_returns {
         let mut normalized = normalized_calls.clone();
         normalized.extend(f.block_order().iter().flat_map(|&block| f.block(block).insts.iter().copied())
             .filter(|&inst| f.inst(inst).opcode == Opcode::Call
-                && inline_alloc::list_shape(f.inst(inst)).is_some()));
+                && (inline_alloc::list_shape(f.inst(inst)).is_some()
+                    || inline_packed_u8::eligible(f, f.inst(inst)))));
         crate::t2::opt_clear_mv::single_value_state_after_normalized_calls(f, true, &normalized)
     } else { HashSet::new() };
     // Mapped code empties the MV buffer only at explicit resets, so an inline
-    // CONS may also leave a state that nothing reads before the next one.
+    // allocation may also leave a state that nothing reads before the next one.
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     let inline_alloc_mv_free: HashSet<Inst> = if ordinary_call_mode { HashSet::new() } else {
         let sites: HashSet<Inst> = f.block_order().iter()
             .flat_map(|&block| f.block(block).insts.iter().copied())
             .filter(|&inst| matches!(f.inst(inst).opcode, Opcode::Call | Opcode::Invoke)
-                && inline_alloc::list_shape(f.inst(inst)).is_some())
+                && (inline_alloc::list_shape(f.inst(inst)).is_some()
+                    || inline_packed_u8::eligible(f, f.inst(inst))))
             .collect();
         if sites.is_empty() { HashSet::new() } else {
             let mut free = crate::t2::opt_clear_mv::single_value_state_after_normalized_calls(f, false, &sites);
@@ -7358,6 +7364,7 @@ fn emit_framed_inner(
             #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
             let inline_alloc_done = if !ordinary_call_mode && inline_alloc_mv_free.contains(&inst) {
                 inline_alloc::emit_framed_fast_path(&mut a, &d, &homes, &const_tagged, true)
+                    .or_else(|| inline_packed_u8::emit_framed(&mut a, f, &d, &homes, &const_tagged, true))
             } else if !ordinary_call_mode && d.opcode == Opcode::Invoke {
                 inline_special::emit_transfer_fast_path(&mut a, &d, &homes, &const_tagged)
             } else { None };
@@ -7420,6 +7427,8 @@ fn emit_framed_inner(
                 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
                 { let inline_done = inline_alloc::emit_ordinary_fast_path(&mut a, &d, &homes,
                     &const_tagged, inline_alloc_single.contains(&inst))
+                    .or_else(|| inline_packed_u8::emit_ordinary(&mut a, f, &d, &homes,
+                        &const_tagged, inline_alloc_single.contains(&inst)))
                     .or_else(|| inline_special::emit_ordinary_fast_path(&mut a, &d, &homes,
                         &const_tagged, inline_alloc_single.contains(&inst)));
                 inst_calls = ordinary_call.unwrap().for_inst(inst).emit(&mut a, &d, &homes, &const_tagged,

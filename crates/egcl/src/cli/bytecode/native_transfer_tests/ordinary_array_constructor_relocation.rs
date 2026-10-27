@@ -55,6 +55,9 @@ fn ordinary_array_constructor_relocates_prebuilt_arguments_and_live_result() {
             .env("EGCL_GC_STRESS_AFTER_INIT", "1")
             .env("EGCL_GC_POISON", "1")
             .env("EGCL_NATIVE_ARRAY_CONSTRUCTOR_STATS", "1")
+            // Keep this regression on the collecting adapter; the inline
+            // allocation tests separately prove fast results really relocate.
+            .env("EGCL_DISABLE_INLINE_U8_ALLOCATION", "1")
             .env_remove("EGCL_DISABLE_NATIVE_ARRAY_CONSTRUCTOR")
             .output()
             .expect("run isolated constructor relocation test");
