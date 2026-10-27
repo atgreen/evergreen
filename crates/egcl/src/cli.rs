@@ -13362,6 +13362,21 @@ fn is_vector_value(v: EgclVal) -> bool {
     egcl_rt::types::vectorp(v)
 }
 
+/// The array accessors' argument check (CLHS 15.2): ARRAYP's own test -- a
+/// vector, string or multidimensional array -- or a TYPE-ERROR naming ARRAY.
+/// Without it ARRAY-RANK answered 1, ARRAY-ELEMENT-TYPE T and
+/// ADJUSTABLE-ARRAY-P NIL for any object at all (ansi arrays *.error.3-5).
+fn require_array(v: EgclVal) -> Result<(), EgclError> {
+    if is_vector_value(v) || egcl_rt::types::md_array_p(v) {
+        Ok(())
+    } else {
+        Err(EgclError::TypeError {
+            datum: v,
+            expected: "ARRAY".into(),
+        })
+    }
+}
+
 /// Sentinel-safe HASH-TABLE-P.
 fn is_hash_table_value(v: EgclVal) -> bool {
     egcl_stdlib::hash_table_p(v)
@@ -26365,6 +26380,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             "ARRAY-DIMENSIONS" => {
                 let (af, _) = cp(cdr);
                 egcl_rt::rooted!(v = eval_form(af, env)?);
+                require_array(*v)?;
                 if egcl_rt::types::md_array_p(*v) {
                     let dims = md_dims(*v)?;
                     let dim_vals: Vec<EgclVal> = dims
@@ -26393,6 +26409,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 // 5, not 3).
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
+                require_array(v)?;
                 if let Some(storage) = egcl_rt::types::md_array_storage(v) {
                     return Ok(EgclVal::from_fixnum(egcl_stdlib::length(storage)? as i64));
                 }

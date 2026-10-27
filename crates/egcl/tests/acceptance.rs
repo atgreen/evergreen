@@ -4007,7 +4007,37 @@ fn misc_time_type_and_pathname_designators() {
         ("(upgraded-array-element-type 'character)", "CHARACTER"),
         ("(upgraded-array-element-type 'bit)", "BIT"),
         ("(upgraded-array-element-type t)", "T"),
-        ("(upgraded-array-element-type '(unsigned-byte 8))", "T"),
+        (
+            "(upgraded-array-element-type '(unsigned-byte 8))",
+            "(UNSIGNED-BYTE 8)",
+        ),
+        ("(upgraded-array-element-type nil)", "NIL"),
+        // The array accessors take only arrays: anything else is a TYPE-ERROR
+        // naming ARRAY (ansi arrays *.error.3-5), and arrays still answer.
+        (
+            "(handler-case (array-rank 10) (type-error (c) (type-error-expected-type c)))",
+            "ARRAY",
+        ),
+        (
+            "(handler-case (array-element-type nil) (type-error (c) (type-error-datum c)))",
+            "NIL",
+        ),
+        (
+            "(handler-case (adjustable-array-p 'x) (type-error () :type-error))",
+            ":TYPE-ERROR",
+        ),
+        (
+            "(handler-case (array-dimensions '(a b)) (type-error () :type-error))",
+            ":TYPE-ERROR",
+        ),
+        (
+            "(handler-case (array-total-size #\\a) (type-error () :type-error))",
+            ":TYPE-ERROR",
+        ),
+        (
+            "(list (array-rank \"ab\") (array-rank (make-array '(2 3))) (array-dimensions #*101))",
+            "(1 2 (3))",
+        ),
         ("(upgraded-complex-part-type 'single-float)", "SINGLE-FLOAT"),
         ("(upgraded-complex-part-type 'integer)", "RATIONAL"),
         // PATHNAME-MATCH-P coerces string designators.

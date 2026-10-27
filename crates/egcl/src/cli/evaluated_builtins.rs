@@ -1552,6 +1552,7 @@ fn resolve(name: &str) -> Option<Handler> {
         "ADJUSTABLE-ARRAY-P" => Some(|_operator, args, _env| {
             // Only a COMPLEX_ARRAY created :adjustable is adjustable.
             let v = args.first().copied().unwrap_or(NIL);
+            require_array(v)?;
             let adj = egcl_stdlib::is_complex_vector(v) && egcl_stdlib::cvec_adjustable(v);
             Ok(if adj { T } else { NIL })
         }),
@@ -1559,6 +1560,7 @@ fn resolve(name: &str) -> Option<Handler> {
             // (values base offset) for a displaced array, (values nil 0)
             // otherwise (bliss-7o4y).
             let v = args.first().copied().unwrap_or(NIL);
+            require_array(v)?;
             // A displaced multidimensional array keeps its displacement in its
             // row-major storage vector (MAKE-ARRAY, boot.lisp).
             let v = match egcl_rt::types::md_array_storage(v) {
@@ -1688,6 +1690,7 @@ fn resolve(name: &str) -> Option<Handler> {
         }),
         "ARRAY-RANK" => Some(|_operator, args, _env| {
             let v = args.first().copied().unwrap_or(NIL);
+            require_array(v)?;
             // Multidimensional arrays carry their rank; every other egcl
             // array (vector/string) is rank-1.
             if let Some(rank) = egcl_rt::types::md_array_rank(v) {
@@ -1705,6 +1708,7 @@ fn resolve(name: &str) -> Option<Handler> {
             // CHARACTER (spec §1.6.3); bit-vectors (simple OR a
             // fill-pointer/adjustable/displaced complex bit vector, egcl-
             // 65nx) hold BIT; packed vectors hold DOUBLE-FLOAT.
+            require_array(v)?;
             let ty = if is_base_string_value(v) {
                 "BASE-CHAR"
             } else if is_string_value(v) {
@@ -1829,6 +1833,7 @@ fn resolve(name: &str) -> Option<Handler> {
             // plain (make-array n :adjustable t) is the same COMPLEX_ARRAY
             // representation but answers NIL per ANSI (bliss-0x9y).
             let v = args.first().copied().unwrap_or(NIL);
+            require_array(v)?;
             let has = egcl_stdlib::is_complex_vector(v) && egcl_stdlib::cvec_has_fill_pointer(v);
             Ok(if has { T } else { NIL })
         }),

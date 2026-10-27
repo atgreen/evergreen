@@ -202,6 +202,13 @@
   loops and loops whose bodies change the original bound or step
   ([#687](https://github.com/atgreen/evergreen/pull/687)).
 
+- The array accessors (`array-rank`, `array-dimensions`, `array-total-size`,
+  `array-element-type`, `array-displacement`, `array-has-fill-pointer-p` and
+  `adjustable-array-p`) signal a `type-error` for an argument that is not an
+  array, instead of answering as if it were a vector, and
+  `(upgraded-array-element-type nil)` returns `NIL`
+  ([#671](https://github.com/atgreen/evergreen/pull/671)).
+
 - Native x86-64 branches preserve comparison results across intervening boxing,
   fixing incorrect loop counts and results in some unboxed integer loops
   ([#680](https://github.com/atgreen/evergreen/pull/680)).
