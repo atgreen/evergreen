@@ -19,6 +19,31 @@
 (defmethod egcl-gray-streams:stream-line-column ((stream error-column-stream))
   (error "column unavailable"))
 
+(defclass semantic-layout-object () ())
+
+(defun semantic-layout-printer (stream object)
+  (declare (ignore object))
+  (pprint-logical-block (stream nil :prefix "[" :suffix "]")
+    (write-string "aa " stream)
+    (pprint-newline :fill stream)
+    (write-string "bb" stream)))
+
+(defclass write-modifier-object () ())
+
+(defmethod print-object ((object write-modifier-object) stream)
+  (declare (ignore object))
+  (write-char (if *print-pretty* #\P #\p) stream)
+  (write-char (if *print-level* #\L #\l) stream)
+  (write-char (if *print-length* #\N #\n) stream))
+
+(defun slash-semantic-layout (stream object colon-p at-sign-p &rest parameters)
+  (declare (ignore object colon-p at-sign-p parameters))
+  (semantic-layout-printer stream nil))
+
+(defun slash-current-column (stream object colon-p at-sign-p &rest parameters)
+  (declare (ignore object colon-p at-sign-p parameters))
+  (format stream "~D" (egcl-gray-streams:stream-line-column stream)))
+
 (defun check-layout (name expected function)
   (let ((actual (funcall function)))
     (format t "~A: ~:[FAIL~;PASS~] expected ~S actual ~S~%" name (equal expected actual) expected actual)
@@ -130,6 +155,55 @@
               (format nil "~@<~:(foo~:_bar~)~:>"))
             (let ((*print-right-margin* 3))
               (format nil "~@<~:(foo~:_bar~)~:>")))))
+  ;; Lisp printers and callback formatters must contribute their conditional
+  ;; newlines to the enclosing FORMAT document.  If any callback is flattened
+  ;; through a temporary string stream, [aa bb] is laid out at column zero and
+  ;; incorrectly overflows once it is pasted after "1234 ".
+  (let ((*print-right-margin* 10)
+        (*print-pprint-dispatch* (copy-pprint-dispatch nil))
+        (object (make-instance 'semantic-layout-object))
+        (expected (format nil "1234 [aa~%      bb]")))
+    (set-pprint-dispatch 'semantic-layout-object #'semantic-layout-printer
+                         0 *print-pprint-dispatch*)
+    (dolist (control '("~@<1234 ~A~:>" "~@<1234 ~S~:>" "~@<1234 ~W~:>"))
+      (check-layout :format-object-semantic-layout expected
+        (lambda () (format nil control object))))
+    (check-layout :formatter-iteration-semantic-layout
+        (format nil "1234 [aa~%     bb]")
+      (lambda ()
+        (format nil "~@<1234 ~{~}~:>"
+                (formatter "~*~@<[aa ~:_bb]~:>") (list nil)))))
+  (check-layout :format-write-modifiers '("pLN" "PLN" "pln" "Pln" "pLN")
+    (lambda ()
+      (let ((*print-pretty* nil) (*print-level* 1) (*print-length* 1)
+            (object (make-instance 'write-modifier-object)))
+        (list (format nil "~W" object)
+              (format nil "~:W" object)
+              (format nil "~@W" object)
+              (format nil "~:@W" object)
+              (format nil "~W" object)))))
+  (check-layout :format-slash-semantic-layout (format nil "1234 [aa~%      bb]")
+    (lambda ()
+      (let ((*print-right-margin* 10))
+        (format nil "~@<1234 ~/slash-semantic-layout/~:>"
+                (make-instance 'semantic-layout-object)))))
+  (check-layout :format-callback-column "1234 5"
+    (lambda ()
+      (format nil "~@<1234 ~/slash-current-column/~:>" nil)))
+  (check-layout :format-callback-column-after-break (format nil "abc~%0")
+    (lambda ()
+      (format nil "~@<abc~:@_~/slash-current-column/~:>" nil)))
+  (check-layout :format-callback-destination-column "abc 4"
+    (lambda ()
+      (with-output-to-string (stream)
+        (write-string "abc " stream)
+        (format stream "~/slash-current-column/" nil))))
+  (check-layout :format-callback-pretty-stream-column "abc 4"
+    (lambda ()
+      (with-output-to-string (destination)
+        (pprint-logical-block (destination nil)
+          (write-string "abc " destination)
+          (format destination "~/slash-current-column/" nil)))))
   (check-layout :format-line-tab-start-column "abc  x"
     (lambda () (with-output-to-string (s)
       (write-string "abc" s)

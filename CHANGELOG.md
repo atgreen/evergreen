@@ -211,6 +211,11 @@
 
 ### Fixed
 
+- `FORMAT` preserves conditional layout emitted by pprint dispatch methods,
+  `FORMATTER` iteration bodies, and `~/.../` callbacks, including destination
+  columns and the `~W` colon/at-sign printer bindings
+  ([#723](https://github.com/atgreen/evergreen/pull/723)).
+
 - `FORMAT` logical blocks and public pretty printing share one semantic layout
   engine, preserving conditional breaks, indentation, tabs, case conversion,
   printer limits, circular output, and Gray-stream behavior

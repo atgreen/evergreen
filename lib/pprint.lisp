@@ -22,6 +22,26 @@
         (setf section (%pp-column stream)))))
   nil)
 
+;; Run a Lisp printer/formatter callback against the same queued representation
+;; used by PPRINT-LOGICAL-BLOCK.  Rust FORMAT callers splice the returned events
+;; into their enclosing LayoutDoc instead of flattening the callback through a
+;; temporary string stream.  COLUMN is the callback's actual insertion column,
+;; needed by code which asks STREAM-LINE-COLUMN while it is producing output.
+(defun %pp-capture-call (function arguments column)
+  (let ((stream (make-instance '%pretty-stream)))
+    (setf (%pp-column stream) column)
+    (push nil (%pp-frames stream))
+    (let ((result (apply function stream arguments)))
+      (list result (nreverse (pop (%pp-frames stream)))))))
+
+(defun %pprint-dispatch-layout (table object column)
+  (let ((entry (egcl::%pprint-dispatch-entry table object)))
+    (when entry
+      (let ((captured (%pp-capture-call (third entry) (list object) column)))
+        ;; Keep a separate found flag: an applicable printer is allowed to emit
+        ;; no events and must not fall back to the ordinary object printer.
+        (list t (second captured))))))
+
 (defun %pp-note-event-column (stream event &optional (section 0))
   ;; FORMAT queues a whole semantic document at once.  Keep the speculative
   ;; column consistent with STREAM-WRITE-CHAR for code which asks for the

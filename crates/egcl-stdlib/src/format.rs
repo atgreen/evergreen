@@ -45,8 +45,23 @@ fn dispatch_print_object(v: EgclVal, escapep: bool) -> Option<String> {
 pub type FormatApplyHook = fn(EgclVal, &[EgclVal]) -> Result<EgclVal, EgclError>;
 static FORMAT_APPLY_HOOK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// Apply a Lisp FORMAT callback to a queued pretty stream and return both its
+/// primary value and the semantic events it emitted.  The callback arguments
+/// exclude the stream; the evaluator creates it at `start_column`.
+pub type FormatLayoutApplyHook =
+    fn(EgclVal, &[EgclVal], usize) -> Result<(EgclVal, LayoutDoc), EgclError>;
+static FORMAT_LAYOUT_APPLY_HOOK: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 pub fn set_format_apply_hook(hook: Option<FormatApplyHook>) {
     FORMAT_APPLY_HOOK.store(
+        hook.map_or(0, |h| h as usize),
+        std::sync::atomic::Ordering::Release,
+    );
+}
+
+pub fn set_format_layout_apply_hook(hook: Option<FormatLayoutApplyHook>) {
+    FORMAT_LAYOUT_APPLY_HOOK.store(
         hook.map_or(0, |h| h as usize),
         std::sync::atomic::Ordering::Release,
     );
@@ -62,6 +77,35 @@ fn apply_format_function(func: EgclVal, args: &[EgclVal]) -> Result<EgclVal, Egc
         return hook(func, args);
     }
     call_format_dispatch(func, args)
+}
+
+fn apply_format_function_to_layout(
+    func: EgclVal,
+    args: &[EgclVal],
+    start_column: usize,
+) -> Result<(EgclVal, LayoutDoc), EgclError> {
+    let raw = FORMAT_LAYOUT_APPLY_HOOK.load(std::sync::atomic::Ordering::Acquire);
+    if raw != 0 {
+        // SAFETY: the cell only ever holds 0 or a FormatLayoutApplyHook.
+        let hook: FormatLayoutApplyHook =
+            unsafe { std::mem::transmute::<usize, FormatLayoutApplyHook>(raw) };
+        return hook(func, args, start_column);
+    }
+
+    // Standalone stdlib users have no evaluator-owned pretty stream. Preserve
+    // the historical string-stream behavior as a compatibility fallback.
+    egcl_rt::rooted!(func = func);
+    egcl_rt::rooted!(stream = crate::streams::make_string_output_stream(NIL)?);
+    let mut call_args = Vec::with_capacity(args.len() + 1);
+    call_args.push(*stream);
+    call_args.extend_from_slice(args);
+    egcl_rt::rooted_ref!(_call_args_root = &mut call_args);
+    let tail = apply_format_function(*func, &call_args)?;
+    let text = extract_egcl_string(crate::streams::get_output_stream_string(*stream)?)
+        .unwrap_or_default();
+    let mut doc = LayoutDoc::default();
+    doc.text(&text);
+    Ok((tail, doc))
 }
 
 /// The body FORMATTER function as `run_iteration_body` takes it: NIL, the
@@ -85,21 +129,18 @@ fn run_iteration_body(
         return format_impl(body, elements, idx, output);
     };
     egcl_rt::rooted!(func = func);
-    egcl_rt::rooted!(stream = crate::streams::make_string_output_stream(NIL)?);
-    let mut call_args: Vec<EgclVal> = Vec::with_capacity(elements.len() - *idx + 1);
-    call_args.push(*stream);
-    call_args.extend_from_slice(&elements[*idx..]);
-    egcl_rt::rooted_ref!(_call_args_root = &mut call_args);
-    let tail = apply_format_function(*func, &call_args)?;
+    let (tail, doc) = apply_format_function_to_layout(
+        *func,
+        &elements[*idx..],
+        output.current_column(),
+    )?;
     let remaining = if tail.is_cons() {
         cons_list_to_vec(tail).len()
     } else {
         0
     };
     *idx += (elements.len() - *idx).saturating_sub(remaining);
-    if let Some(text) = extract_egcl_string(crate::streams::get_output_stream_string(*stream)?) {
-        output.text(&text);
-    }
+    output.append(doc);
     Ok(())
 }
 
@@ -134,7 +175,7 @@ pub fn function_representation(v: EgclVal) -> String {
     "#<FUNCTION>".to_string()
 }
 
-pub type PprintDispatchHook = fn(EgclVal, bool) -> Option<String>;
+pub type PprintDispatchHook = fn(EgclVal, bool, usize) -> Option<LayoutDoc>;
 static PPRINT_DISPATCH_HOOK: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
@@ -148,14 +189,35 @@ pub fn set_pprint_dispatch_hook(hook: Option<PprintDispatchHook>) {
 /// The text a *PRINT-PPRINT-DISPATCH* entry prints for `v`, when *PRINT-PRETTY*
 /// is true, a dispatch hook is installed and an entry applies. Shared with the
 /// interpreter's own printer so WRITE and FORMAT agree.
-pub fn dispatch_pprint(v: EgclVal, escapep: bool) -> Option<String> {
+pub fn dispatch_pprint_layout(
+    v: EgclVal,
+    escapep: bool,
+    start_column: usize,
+) -> Option<LayoutDoc> {
     let raw = PPRINT_DISPATCH_HOOK.load(std::sync::atomic::Ordering::Acquire);
     if raw == 0 || !print_pretty_active() {
         return None;
     }
     // SAFETY: the cell only ever holds 0 or a `PprintDispatchHook` stored above.
     let hook: PprintDispatchHook = unsafe { std::mem::transmute::<usize, PprintDispatchHook>(raw) };
-    hook(v, escapep)
+    hook(v, escapep, start_column)
+}
+
+pub fn dispatch_pprint(v: EgclVal, escapep: bool) -> Option<String> {
+    dispatch_pprint_layout(v, escapep, 0).map(|doc| {
+        render_layout(
+            &doc,
+            &LayoutOptions {
+                margin: print_integer_variable("*PRINT-RIGHT-MARGIN*").unwrap_or(80),
+                miser_width: print_integer_variable("*PRINT-MISER-WIDTH*"),
+                line_limit: (!print_readably_active())
+                    .then(|| print_integer_variable("*PRINT-LINES*"))
+                    .flatten(),
+                start_column: 0,
+                pretty: print_pretty_active(),
+            },
+        )
+    })
 }
 
 /// `*PRINT-PRETTY*` is true.
@@ -1484,6 +1546,14 @@ fn escape_string_body(s: &str) -> String {
 }
 
 fn egclval_to_print_string(v: EgclVal, escapep: bool) -> String {
+    egclval_to_print_string_with_dispatch(v, escapep, true)
+}
+
+fn egclval_to_print_string_with_dispatch(
+    v: EgclVal,
+    escapep: bool,
+    dispatch_pretty: bool,
+) -> String {
     // Printing circular structure without *PRINT-CIRCLE* is unbounded (CLHS
     // 22.1.3.5 leaves it undefined); stop at the native stack budget with a
     // marker rather than faulting through the guard page, which took the ansi
@@ -1494,7 +1564,7 @@ fn egclval_to_print_string(v: EgclVal, escapep: bool) -> String {
     // Establish (at the outermost level) the *print-circle* label table, so
     // shared/circular structure prints with #N=/#N# instead of looping.
     circle_enter(v);
-    let s = egclval_to_print_inner(v, escapep);
+    let s = egclval_to_print_inner(v, escapep, dispatch_pretty);
     circle_exit();
     s
 }
@@ -1616,7 +1686,7 @@ fn real_format_value(val: EgclVal) -> Result<f64, EgclError> {
     }
 }
 
-fn egclval_to_print_inner(mut v: EgclVal, escapep: bool) -> String {
+fn egclval_to_print_inner(mut v: EgclVal, escapep: bool, dispatch_pretty: bool) -> String {
     // Root V for the rest of the function. dispatch_pprint below calls a Lisp
     // pprint function through the dispatch hook: that allocates (the applicable
     // entry search, a string stream, the call itself) and so can fire a
@@ -1628,8 +1698,10 @@ fn egclval_to_print_inner(mut v: EgclVal, escapep: bool) -> String {
     egcl_rt::rooted_ref!(_v_root = &mut v);
     // A *PRINT-PPRINT-DISPATCH* entry applying to V prints it instead
     // (only when *PRINT-PRETTY* is true and a table with entries is bound).
-    if let Some(s) = dispatch_pprint(v, escapep) {
-        return s;
+    if dispatch_pretty {
+        if let Some(s) = dispatch_pprint(v, escapep) {
+            return s;
+        }
     }
     if let Some(text) = u8_readable_representation(v) {
         return text;
@@ -1813,6 +1885,18 @@ fn egclval_to_print_inner(mut v: EgclVal, escapep: bool) -> String {
         return s;
     }
     format!("#<object {:?}>", v)
+}
+
+fn print_value_layout(output: &mut LayoutDoc, value: EgclVal, escapep: bool) -> LayoutDoc {
+    if let Some(doc) = dispatch_pprint_layout(value, escapep, output.current_column()) {
+        doc
+    } else {
+        let mut doc = LayoutDoc::default();
+        doc.text(&egclval_to_print_string_with_dispatch(
+            value, escapep, false,
+        ));
+        doc
+    }
 }
 
 /// Print a CLOS instance. Under `princ`/`~A` a condition carrying a
@@ -2144,22 +2228,16 @@ fn integer_magnitude(val: EgclVal, radix: u32) -> Option<(bool, String)> {
     }
 }
 
-/// Append `s` to `output` in a `~A`/`~S` field: at least `minpad` `padchar`s of
-/// padding, widened to `mincol` total (measured in CHARACTERS, not bytes). With
-/// `@` the padding goes on the left (right-justify), otherwise on the right
-/// (bliss-znib).
-fn pad_format_field(
+fn pad_layout_field(
     output: &mut LayoutDoc,
-    s: &str,
+    doc: LayoutDoc,
     mincol: usize,
     colinc: usize,
     minpad: usize,
     padchar: char,
     at_sign: bool,
 ) {
-    // MINPAD copies of PADCHAR, then COLINC more at a time until the field
-    // is at least MINCOL wide (CLHS 22.3.4.1; ansi format.a.22).
-    let len = s.chars().count();
+    let len = doc.flat_string().chars().count();
     let mut pad = minpad;
     while len + pad < mincol {
         pad += colinc.max(1);
@@ -2168,9 +2246,9 @@ fn pad_format_field(
         for _ in 0..pad {
             output.character(padchar);
         }
-        output.text(s);
-    } else {
-        output.text(s);
+    }
+    output.append(doc);
+    if !at_sign {
         for _ in 0..pad {
             output.character(padchar);
         }
@@ -2547,11 +2625,15 @@ fn parse_directives(control: &str) -> Result<Vec<Directive>, EgclError> {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LayoutDoc {
     events: Vec<LayoutEvent>,
+    start_column: usize,
 }
 
 impl LayoutDoc {
     pub fn from_events(events: Vec<LayoutEvent>) -> Self {
-        Self { events }
+        Self {
+            events,
+            start_column: 0,
+        }
     }
 
     pub fn events(&self) -> &[LayoutEvent] {
@@ -2560,6 +2642,16 @@ impl LayoutDoc {
 
     pub fn into_events(self) -> Vec<LayoutEvent> {
         self.events
+    }
+
+    fn append(&mut self, mut other: LayoutDoc) {
+        if let Some(LayoutEvent::Text(first)) = other.events.first_mut()
+            && let Some(LayoutEvent::Text(last)) = self.events.last_mut()
+        {
+            last.push_str(first);
+            other.events.remove(0);
+        }
+        self.events.extend(other.events);
     }
 
     fn text(&mut self, text: &str) {
@@ -2598,10 +2690,52 @@ impl LayoutDoc {
     }
 
     fn current_column(&self) -> usize {
-        self.flat_string()
-            .rsplit('\n')
-            .next()
-            .map_or(0, |line| line.chars().count())
+        // A callback observes the speculative queued column: conditional
+        // newlines are assumed not to break yet, but a mandatory newline does
+        // reset the column whenever pretty printing is active.  Rendering with
+        // an effectively unbounded margin gives exactly that behavior while
+        // retaining tabs and nested blocks' column rules.
+        let options = LayoutOptions {
+            margin: 1_000_000_000,
+            miser_width: None,
+            line_limit: None,
+            start_column: self.start_column,
+            pretty: print_pretty_active(),
+        };
+        let rendered = render_layout(self, &options);
+        let last_line = rendered.rsplit('\n').next().unwrap_or_default();
+        if rendered.contains('\n') {
+            last_line.chars().count()
+        } else {
+            self.start_column + last_line.chars().count()
+        }
+    }
+}
+
+struct PrintDynamicBinding {
+    index: u32,
+    saved: Option<EgclVal>,
+}
+
+impl PrintDynamicBinding {
+    fn establish(name: &str, value: EgclVal) -> Option<Self> {
+        let index = egcl_rt::symbols::find_index(name)?;
+        let saved = egcl_rt::symbols::bind_symbol_value(index, value);
+        Some(Self { index, saved })
+    }
+}
+
+impl egcl_rt::gc::TraceHostRoots for PrintDynamicBinding {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
+        if let Some(saved) = &mut self.saved {
+            visit(saved);
+        }
+    }
+}
+
+impl Drop for PrintDynamicBinding {
+    fn drop(&mut self) {
+        egcl_rt::symbols::restore_symbol_binding(self.index, self.saved);
     }
 }
 
@@ -3188,12 +3322,12 @@ pub fn format(
         }
     }
 
-    let doc = format_to_layout(control_string, args)?;
     let start_column = if to_stream {
         crate::streams::stream_line_column(destination).unwrap_or(0) as usize
     } else {
         0
     };
+    let doc = format_to_layout_at_column(control_string, args, start_column)?;
     let options = LayoutOptions {
         margin: print_integer_variable("*PRINT-RIGHT-MARGIN*").unwrap_or(80),
         miser_width: print_integer_variable("*PRINT-MISER-WIDTH*"),
@@ -3278,6 +3412,14 @@ fn print_integer_variable(name: &str) -> Option<usize> {
 /// breaks.  The evaluator uses this to splice FORMAT into an enclosing Lisp
 /// pretty stream instead of flattening conditional directives into text.
 pub fn format_to_layout(control_string: &str, args: &[EgclVal]) -> Result<LayoutDoc, EgclError> {
+    format_to_layout_at_column(control_string, args, 0)
+}
+
+pub fn format_to_layout_at_column(
+    control_string: &str,
+    args: &[EgclVal],
+    start_column: usize,
+) -> Result<LayoutDoc, EgclError> {
     let mut args = args.to_vec();
     egcl_rt::rooted_ref!(_args_root = &mut args);
     validate_matching(control_string)?;
@@ -3289,7 +3431,10 @@ pub fn format_to_layout(control_string: &str, args: &[EgclVal]) -> Result<Layout
         }
     }
 
-    let mut output = LayoutDoc::default();
+    let mut output = LayoutDoc {
+        events: Vec::new(),
+        start_column,
+    };
     let mut arg_idx = 0;
     take_escape();
     let result = format_impl(control_string, &args, &mut arg_idx, &mut output);
@@ -3559,12 +3704,14 @@ fn format_impl(
                 }
                 let val = args[*arg_idx];
                 *arg_idx += 1;
-                let s = if colon && val.is_nil() {
-                    "()".into()
+                let doc = if colon && val.is_nil() {
+                    let mut doc = LayoutDoc::default();
+                    doc.text("()");
+                    doc
                 } else {
-                    egclval_to_print_string(val, false)
+                    print_value_layout(output, val, false)
                 };
-                pad_format_field(output, &s, mincol, colinc, minpad, padchar, at_sign);
+                pad_layout_field(output, doc, mincol, colinc, minpad, padchar, at_sign);
             }
             'S' => {
                 // ~mincol,colinc,minpad,padchar S — same padding as ~A (bliss-znib).
@@ -3591,12 +3738,14 @@ fn format_impl(
                 }
                 let val = args[*arg_idx];
                 *arg_idx += 1;
-                let s = if colon && val.is_nil() {
-                    "()".into()
+                let doc = if colon && val.is_nil() {
+                    let mut doc = LayoutDoc::default();
+                    doc.text("()");
+                    doc
                 } else {
-                    egclval_to_print_string(val, true)
+                    print_value_layout(output, val, true)
                 };
-                pad_format_field(output, &s, mincol, colinc, minpad, padchar, at_sign);
+                pad_layout_field(output, doc, mincol, colinc, minpad, padchar, at_sign);
             }
             'D' | 'B' | 'O' | 'X' => {
                 let radix = match directive {
@@ -4275,7 +4424,20 @@ fn format_impl(
                 }
                 let val = args[*arg_idx];
                 *arg_idx += 1;
-                output.text(&egclval_to_print_string(val, true));
+                let mut pretty_binding = colon
+                    .then(|| PrintDynamicBinding::establish("*PRINT-PRETTY*", T))
+                    .flatten();
+                let mut level_binding = at_sign
+                    .then(|| PrintDynamicBinding::establish("*PRINT-LEVEL*", NIL))
+                    .flatten();
+                let mut length_binding = at_sign
+                    .then(|| PrintDynamicBinding::establish("*PRINT-LENGTH*", NIL))
+                    .flatten();
+                egcl_rt::rooted_ref!(_pretty_binding_root = &mut pretty_binding);
+                egcl_rt::rooted_ref!(_level_binding_root = &mut level_binding);
+                egcl_rt::rooted_ref!(_length_binding_root = &mut length_binding);
+                let doc = print_value_layout(output, val, true);
+                output.append(doc);
             }
             '?' => {
                 if *arg_idx >= args.len() {
@@ -5023,20 +5185,18 @@ fn format_impl(
                 egcl_rt::rooted!(func = func);
                 egcl_rt::rooted!(arg = arg);
                 egcl_rt::rooted_ref!(_param_vals_root = &mut param_vals);
-                egcl_rt::rooted!(stream = crate::streams::make_string_output_stream(NIL)?);
-                let mut call_args: Vec<EgclVal> = Vec::with_capacity(4 + param_vals.len());
-                call_args.push(*stream);
+                let mut call_args: Vec<EgclVal> = Vec::with_capacity(3 + param_vals.len());
                 call_args.push(*arg);
                 call_args.push(if colon { T } else { NIL });
                 call_args.push(if at_sign { T } else { NIL });
                 call_args.extend_from_slice(&param_vals);
                 egcl_rt::rooted_ref!(_call_args_root = &mut call_args);
-                apply_format_function(*func, &call_args)?;
-                if let Some(text) =
-                    extract_egcl_string(crate::streams::get_output_stream_string(*stream)?)
-                {
-                    output.text(&text);
-                }
+                let (_, doc) = apply_format_function_to_layout(
+                    *func,
+                    &call_args,
+                    output.current_column(),
+                )?;
+                output.append(doc);
             }
             '\n' => {
                 // ~<newline>: the newline and the following whitespace are
