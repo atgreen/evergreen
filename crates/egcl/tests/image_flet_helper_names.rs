@@ -18,12 +18,14 @@ impl Drop for Fixture {
     }
 }
 
-/// A definition LOAD compiles to bytecode, whose FLET becomes a named helper.
+/// Keep a named FLET helper: this test exercises image helper-name allocation,
+/// so expanding the small helper inline would remove the behavior under test.
 fn flet_definition(package: &str, name: &str) -> String {
     format!(
         "(defpackage #:{package} (:use #:cl))\n(in-package #:{package})\n\
          (defun {name} (s)\n\
            (flet ((ws-p (c) (member c '(#\\Space))))\n\
+             (declare (notinline ws-p))\n\
              (loop for c across s count (ws-p c))))\n"
     )
 }
