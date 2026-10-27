@@ -318,3 +318,112 @@ fn shared_recovery_is_profitable_or_keeps_identical_legacy_artifacts() {
         large.code.len()
     );
 }
+
+#[test]
+fn compact_recipe_boundaries_preserve_kinds_and_reject_wide_payloads() {
+    assert_eq!(narrow_recipe(16383 * 8), Some(16383));
+    assert_eq!(narrow_recipe((1 << 29) | (16383 * 8)), Some(0x7fff));
+    assert_eq!(narrow_recipe((2 << 29) | 16383), Some(0xbfff));
+    assert_eq!(narrow_recipe(16384 * 8), None);
+    assert_eq!(narrow_recipe((2 << 29) | 16384), None);
+    assert_eq!(narrow_recipe(1), None);
+    assert_eq!(narrow_recipe(3 << 29), None);
+}
+
+extern "C" fn capture_recipe_boundary(request: *const OrdinaryGuardRequest) -> u64 {
+    let request = unsafe { &*request };
+    let words = unsafe { std::slice::from_raw_parts(request.words, request.n_words as usize) };
+    words[0] ^ words[1] ^ words[2] ^ request.control as usize as u64
+}
+
+#[test]
+fn compact_and_wide_recipes_execute_at_stack_offset_boundary() {
+    // A=64; offset 64+16375*8 is the final narrow home. The next slot
+    // must select wide recipes for the entire function, without truncation.
+    for (slot, narrow) in [(16375u32, true), (16376u32, false)] {
+        let body = 131096usize; // 8 mod16: calls remain aligned after two PUSHes.
+        let mut a = Asm::new();
+        a.extend_from_slice(&[0x55, 0x53, 0x48, 0x81, 0xec]);
+        a.extend_from_slice(&(body as u32).to_le_bytes());
+        mov_imm64(&mut a, RAX, -7);
+        store_to_rsp(&mut a, RAX, (slot * 8) as i32);
+        mov_imm64(&mut a, RAX, 2.25f64.to_bits() as i64);
+        store_to_rsp(&mut a, RAX, 8);
+        mov_imm64(&mut a, RAX, 0x555);
+        store_to_rsp(&mut a, RAX, 0);
+        let first = a.label();
+        let second = a.label();
+        alu_r_imm(&mut a, 7, 7, 0);
+        a.jcc(Cc::E, first);
+        a.jmp(second);
+        let sites: Vec<_> = [first, second]
+            .into_iter()
+            .enumerate()
+            .map(|(i, label)| Site {
+                label,
+                frame_state: FrameStateId(i as u32),
+                n_scopes: 1,
+                sources: vec![
+                    Source::Home(FramedHome::Stack(slot), true),
+                    Source::Imm(5),
+                    Source::Home(FramedHome::Stack(1), false),
+                ],
+                f64_slots: vec![2].into_boxed_slice(),
+            })
+            .collect();
+        let candidate = emit_candidate(
+            a,
+            &sites,
+            slot + 1,
+            FramedHome::Stack(0),
+            capture_recipe_boundary as *const () as usize as u64,
+            |a| {
+                a.extend_from_slice(&[0x48, 0x8d, 0xa4, 0x24]);
+                a.extend_from_slice(&(body as i32).to_le_bytes());
+                a.extend_from_slice(&[0x5b, 0x5d]);
+            },
+        )
+        .unwrap();
+        assert_eq!(candidate.calls.len(), 2);
+        assert_ne!(
+            candidate.calls[0].return_offset,
+            candidate.calls[1].return_offset
+        );
+        assert!(candidate.calls.iter().all(|call| call.stack_adjust == 64));
+        for call in &candidate.calls {
+            assert!(
+                matches!(&candidate.values[&call.return_offset], NativeCallValues::Deoptimizing { native_slots, f64_slots } if *native_slots == slot+1 && f64_slots.as_ref() == [2])
+            );
+        }
+        let helper = candidate.helper_start..candidate.helper_end;
+        let data = candidate.data_offset;
+        let bytes = candidate.asm.finish().unwrap();
+        let has_word_load =
+            iced_x86::Decoder::new(64, &bytes[helper], iced_x86::DecoderOptions::NONE)
+                .into_iter()
+                .any(|i| i.mnemonic() == iced_x86::Mnemonic::Movzx);
+        assert_eq!(has_word_load, narrow);
+        let descriptor = (data + 7) & !7;
+        let stride = 12 + if narrow { 6 } else { 12 };
+        for start in [descriptor, descriptor + stride] {
+            assert_eq!(
+                u32::from_le_bytes(bytes[start..start + 4].try_into().unwrap()),
+                1
+            );
+            assert_eq!(
+                u32::from_le_bytes(bytes[start + 4..start + 8].try_into().unwrap()),
+                3
+            );
+        }
+        // Two 12-byte headers, three recipes each, then one aligned u64 pool entry.
+        assert_eq!(bytes.len(), ((descriptor + 2 * stride + 7) & !7) + 8);
+        let buffer = egcl_rt::jit::JitBuffer::new(&bytes).unwrap();
+        let function: extern "C" fn(u64) -> u64 = unsafe { std::mem::transmute(buffer.as_ptr()) };
+        let expected = EgclVal::from_fixnum(-7).0 ^ 5 ^ 2.25f64.to_bits() ^ 0x555;
+        assert_eq!(function(0), expected);
+        assert_eq!(function(1), expected);
+    }
+}
+
+#[path = "shared_deopt_tail_tests.rs"]
+mod tail_tests;
