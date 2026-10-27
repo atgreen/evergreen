@@ -302,6 +302,7 @@ mod tests {
         let code = vec![0x02, 0, 0, 0x0d, 0, 0, 0, 0, 1, 0, 0x10, 1, 0];
         let encoded = BbuFunction {
             self_call_sites: vec![3],
+            notinline_sites: Vec::new(),
             name_ref: 0,
             lambda_list_ref: BBU_NO_INDEX,
             flags: 0,
@@ -353,37 +354,49 @@ mod tests {
             "((declare (notinline ash >=)) (if (>= n 8) (ash n -8) n))",
             &env,
         );
+        use egcl_compiler::t2::{
+            build,
+            ir::{AuxData, Opcode},
+            speculate,
+        };
         let ash = resolve_sym("ASH").unwrap().as_symbol_index();
         let comparison = resolve_sym(">=").unwrap().as_symbol_index();
-        let funcall = egcl_rt::symbols::find_index("FUNCALL").unwrap();
-        for symbol in [ash, comparison] {
+        assert_eq!(compiled.notinline_sites.len(), 2);
+        for &pc in &compiled.notinline_sites {
             assert!(
-                !compiled
-                    .code
-                    .iter()
-                    .any(|op| matches!(op, Instr::CallNamed { sym, .. } if *sym == symbol))
-            );
-            assert!(
-                !compiled
-                    .code
-                    .iter()
-                    .any(|op| matches!(op, Instr::LoadFunction(sym) if *sym == symbol)),
-                "callee lookup must not precede argument evaluation"
-            );
-            assert!(
-                compiled
-                    .constants
-                    .contains(&EgclVal::from_symbol_index(symbol))
+                matches!(compiled.code[pc as usize], Instr::CallNamed { sym, nargs: 2 }
+                if sym == ash || sym == comparison)
             );
         }
-        assert_eq!(
-            compiled
+        assert!(
+            !compiled
                 .code
                 .iter()
-                .filter(|op| matches!(op, Instr::CallNamed { sym, nargs: 3 } if *sym == funcall))
-                .count(),
-            2
+                .any(|op| matches!(op, Instr::LoadFunction(_))),
+            "callee lookup must remain at the named call after argument evaluation"
         );
+        for transfers in [false, true] {
+            let mut ir = if transfers {
+                build::build_from_bytecode_for_transfers(&compiled)
+            } else {
+                build::build_from_bytecode(&compiled)
+            }
+            .unwrap();
+            assert_eq!(ir.block_order().iter().flat_map(|&b| &ir.block(b).insts)
+                .filter(|&&i| matches!(ir.inst(i).aux, AuxData::OpaqueCallTarget(sym) if sym == ash || sym == comparison)).count(), 2);
+            assert_eq!(
+                speculate::speculate(&mut ir, &|_| Some(speculate::SpecType::Fixnum)),
+                0,
+                "NOTINLINE blocks numeric expansion, including static proofs"
+            );
+            assert!(
+                !ir.block_order()
+                    .iter()
+                    .flat_map(|&b| &ir.block(b).insts)
+                    .any(|&i| matches!(ir.inst(i).opcode, Opcode::FixnumShl | Opcode::FixnumCmpGe))
+            );
+            egcl_compiler::t2::verify::verify(&ir).unwrap();
+        }
     }
 
     #[test]
@@ -399,22 +412,19 @@ mod tests {
             &env,
         );
         let ash = resolve_sym("ASH").unwrap().as_symbol_index();
-        let funcall = egcl_rt::symbols::find_index("FUNCALL").unwrap();
+        let calls: Vec<_> = compiled
+            .code
+            .iter()
+            .enumerate()
+            .filter_map(|(pc, op)| {
+                matches!(op, Instr::CallNamed { sym, nargs: 2 } if *sym == ash).then_some(pc as u32)
+            })
+            .collect();
+        assert_eq!(calls.len(), 3, "all calls retain named native dispatch");
         assert_eq!(
-            compiled
-                .code
-                .iter()
-                .filter(|op| matches!(op, Instr::CallNamed { sym, nargs: 2 } if *sym == ash))
-                .count(),
-            1
-        );
-        assert_eq!(
-            compiled
-                .code
-                .iter()
-                .filter(|op| matches!(op, Instr::CallNamed { sym, nargs: 3 } if *sym == funcall))
-                .count(),
-            2
+            compiled.notinline_sites,
+            vec![calls[0], calls[2]],
+            "only the nested INLINE call reopens compiler specialization"
         );
     }
 
@@ -450,6 +460,96 @@ mod tests {
             42,
             "arguments run before resolving the global callee"
         );
+    }
+
+    #[test]
+    fn notinline_bbu_roundtrip_validates_call_offsets_and_required_policy_gate() {
+        let _lock = super::super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let name = resolve_sym("NOTINLINE-BBU-PROBE").unwrap();
+        let encoded = BbuFunction {
+            self_call_sites: vec![],
+            notinline_sites: vec![3],
+            name_ref: 0,
+            lambda_list_ref: BBU_NO_INDEX,
+            flags: 0,
+            arity_min: 1,
+            arity_max: 1,
+            n_locals: 1,
+            max_stack: 1,
+            code: vec![0x02, 0, 0, 0x0d, 0, 0, 0, 0, 1, 0, 0x10, 1, 0],
+            literal_refs: vec![],
+            param_layout: vec![],
+            has_env: false,
+            variadic: false,
+            restart_tables: vec![],
+            handler_cases: vec![],
+            handler_binds: vec![],
+        };
+        let mut bytes = Vec::new();
+        serialize_bbu_function_record(&mut bytes, &encoded);
+        let mut restored = parse_bbu_function(&mut BbuCursor::new(&bytes)).unwrap();
+        assert!(
+            decode_bbu_function(&restored, &[name], &[], &[], 0x0200)
+                .unwrap()
+                .notinline_sites
+                .is_empty()
+        );
+        let table = serialize_bbu_notinline_sites(&[encoded]);
+        restored.notinline_sites = parse_bbu_notinline_sites(&table, 1).unwrap().remove(0);
+        let decoded = decode_bbu_function(&restored, &[name], &[], &[], 0x0200).unwrap();
+        assert_eq!(decoded.notinline_sites, vec![1]);
+        assert!(matches!(decoded.code[1], Instr::CallNamed { .. }));
+        for bad_offset in [0, 4, 13] {
+            restored.notinline_sites = vec![bad_offset];
+            assert!(decode_bbu_function(&restored, &[name], &[], &[], 0x0200).is_err());
+        }
+        assert!(parse_bbu_notinline_sites(&table, 2).is_err());
+        let mut trailing = table.clone();
+        trailing.push(0);
+        assert!(parse_bbu_notinline_sites(&trailing, 1).is_err());
+        let mut duplicate = Vec::new();
+        for word in [1, 2, 3, 3] {
+            put_u32(&mut duplicate, word);
+        }
+        assert!(parse_bbu_notinline_sites(&duplicate, 1).is_err());
+        assert!(validate_bbu_aux_flags(BBU_AUX_NOTINLINE_SITES, BBU_AUX_REQUIRED_POLICY).is_ok());
+        assert!(validate_bbu_aux_flags(BBU_AUX_NOTINLINE_SITES, 0).is_err());
+        assert!(validate_bbu_aux_flags(0xffff, BBU_AUX_REQUIRED_POLICY).is_err());
+        assert!(validate_bbu_aux_flags(0xffff, 0).is_ok());
+    }
+
+    #[test]
+    fn notinline_restart_clause_records_its_own_leading_declaration() {
+        let _lock = super::super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env = &mut env);
+        egcl_rt::rooted!(params = reader::read_from_string("(n)").unwrap().0);
+        egcl_rt::rooted!(
+            body = reader::read_from_string("((declare (notinline ash)) (ash n -8))")
+                .unwrap()
+                .0
+        );
+        let empty = std::collections::HashSet::new();
+        let compiled = compile_restart_clause(
+            *params,
+            *body,
+            &env,
+            &empty,
+            &HashMap::new(),
+            &empty,
+            &empty,
+            &empty,
+            false,
+        )
+        .unwrap();
+        assert_eq!(compiled.notinline_sites.len(), 1);
+        let pc = compiled.notinline_sites[0] as usize;
+        let ash = resolve_sym("ASH").unwrap().as_symbol_index();
+        assert!(matches!(compiled.code[pc], Instr::CallNamed { sym, .. } if sym == ash));
     }
 
 }

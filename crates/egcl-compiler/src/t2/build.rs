@@ -854,6 +854,12 @@ impl<'a> Builder<'a> {
     // ── Driver ──────────────────────────────────────────────────────
 
     fn run(mut self) -> Result<Function, BuildError> {
+        if self.bf.notinline_sites.windows(2).any(|p| p[0] >= p[1])
+            || self.bf.notinline_sites.iter().any(|&pc|
+                !matches!(self.bf.code.get(pc as usize), Some(Instr::CallNamed { .. }))) {
+            return Err(BuildError::Unsupported("invalid NOTINLINE call-site metadata"));
+        }
+
         let code = &self.bf.code;
 
         // Empty body → a function that returns NIL.
@@ -2353,6 +2359,9 @@ impl<'a> Builder<'a> {
                     if stack.len() < n {
                         return Err(BuildError::Unsupported("stack underflow (CallNamed)"));
                     }
+                    let policy = if self.bf.notinline_sites.binary_search(&(i as u32)).is_ok() {
+                        InlinePolicy::NotInline
+                    } else { self.inline_options.policy_at(i as u32) };
                     // Compiler-known functions reach T2 through shared metadata
                     // and call-site policy. An expansion hook can still decline
                     // for operand-shape reasons (for example dynamic TYPEP),
@@ -2360,7 +2369,6 @@ impl<'a> Builder<'a> {
                     if let Some(metadata) =
                         metadata_for_symbol(*sym).filter(|_| !self.native_cleanups)
                     {
-                        let policy = self.inline_options.policy_at(i as u32);
                         let decision = decide(
                             metadata,
                             *nargs,
@@ -2402,7 +2410,9 @@ impl<'a> Builder<'a> {
                             opcode: Opcode::Call,
                             args,
                             results: vec![],
-                            aux: AuxData::CallTarget(*sym),
+                            aux: if policy == InlinePolicy::NotInline {
+                                AuxData::OpaqueCallTarget(*sym)
+                            } else { AuxData::CallTarget(*sym) },
                             flags: InstFlags {
                                 effectful: true,
                                 call: true,
@@ -2417,7 +2427,7 @@ impl<'a> Builder<'a> {
                     );
                     if !self.native_cleanups
                         && n == 2
-                        && self.inline_options.policy_at(bcp) != InlinePolicy::NotInline
+                        && policy != InlinePolicy::NotInline
                         && super::string_char::is_string_char_accessor(*sym)
                     {
                         self.string_char_calls.insert(inst);
@@ -3808,6 +3818,7 @@ mod tests {
     ) -> BytecodeFunction {
         BytecodeFunction {
             self_call_sites: Vec::new(),
+            notinline_sites: Vec::new(),
             code,
             constants,
             load_time_values: vec![],

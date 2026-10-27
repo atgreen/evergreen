@@ -369,6 +369,7 @@ mod poll_scope_tests {
     fn osr_poll_preserves_exact_nested_catch_header_scopes() {
         let body = BytecodeFunction {
             self_call_sites: Vec::new(),
+            notinline_sites: Vec::new(),
             name: "nested-catch-poll-scopes".into(),
             code: vec![
                 Instr::LoadLocal(0),

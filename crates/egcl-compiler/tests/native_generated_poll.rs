@@ -72,6 +72,7 @@ fn generated_loop_poll_checks_each_pending_source_and_reloads_moved_roots() {
     };
     let source = BytecodeFunction {
         self_call_sites: Vec::new(),
+        notinline_sites: Vec::new(),
         code: vec![
             Instr::Br(1),
             Instr::Const(0),

@@ -698,7 +698,7 @@ impl Emitter<'_> {
                     self.runtime.portable.make_closure
                 }
                 Opcode::Call => {
-                    let AuxData::CallTarget(symbol) = data.aux else {
+                    let Some(symbol) = data.aux.named_call_target() else {
                         return Err(unsupported!());
                     };
                     // A register-entry body must not touch r13 (the caller's

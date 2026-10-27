@@ -12,6 +12,7 @@ use egcl_rt::bytecode::{BytecodeFunction, Instr};
 fn cleanup_body() -> BytecodeFunction {
     let mut body = BytecodeFunction {
         self_call_sites: Vec::new(),
+        notinline_sites: Vec::new(),
         name: "cleanup-merge".into(),
         code: vec![],
         constants: vec![EgclVal::from_fixnum(99)],

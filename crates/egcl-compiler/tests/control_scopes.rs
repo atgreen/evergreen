@@ -229,6 +229,7 @@ fn cleanup_protocol_rejects_orphan_returns_and_mismatched_normal_entries() {
 fn function_with_scopes(code: Vec<Instr>) -> egcl_rt::bytecode::BytecodeFunction {
     egcl_rt::bytecode::BytecodeFunction {
         self_call_sites: Vec::new(),
+        notinline_sites: Vec::new(),
         code,
         constants: vec![],
         load_time_values: vec![],

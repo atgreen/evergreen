@@ -77,6 +77,7 @@ fn native_v2_recursive_body_is_admitted_for_outer_segment() {
     let self_symbol = egcl_rt::symbols::intern("NATIVE-RECURSION-PROBE");
     let body = egcl_rt::bytecode::BytecodeFunction {
         self_call_sites: Vec::new(),
+        notinline_sites: Vec::new(),
         code: vec![
             egcl_rt::bytecode::Instr::CallNamed {
                 sym: self_symbol,
@@ -120,6 +121,7 @@ fn native_v2_osr_loop_poll_preserves_native_segment_state() {
         .unwrap_or_else(|e| e.into_inner());
     let body = Arc::new(egcl_rt::bytecode::BytecodeFunction {
         self_call_sites: Vec::new(),
+        notinline_sites: Vec::new(),
         // The first pass through the loop changes a local from T to NIL; the
         // second pass exits.  This gives the T2 OSR body a real back-edge poll
         // without needing a bytecode call (the regression is stack alignment

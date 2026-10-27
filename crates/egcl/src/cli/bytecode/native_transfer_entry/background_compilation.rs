@@ -461,12 +461,12 @@ impl EmittedTransfer {
                                 .unwrap_or_default()
                         } else { Vec::new() };
                         let emit_general = || {
-                            use egcl_compiler::t2::ir::{AuxData, Opcode};
+                            use egcl_compiler::t2::ir::Opcode;
                             let targets = ir.block_order().iter()
                                 .flat_map(|&block| ir.block(block).insts.iter().copied())
                                 .filter(|&inst| ir.inst(inst).opcode == Opcode::Call)
                                 .map(|inst| {
-                                    let AuxData::CallTarget(symbol) = ir.inst(inst).aux else { return None };
+                                    let symbol = ir.inst(inst).aux.named_call_target()?;
                                     let (_, cell) = call_cells.iter().find(|(name, _)| *name == symbol)?;
                                     Some((inst, OrdinaryCallTarget { symbol,
                                         descriptor_slot: cell.ordinary_entry_address() as u64,
@@ -512,14 +512,14 @@ impl EmittedTransfer {
                                         multiple_values: c2i_t2_mv as *const () as u64,
                                     }).ok())
                         }).or_else(|| {
-                            use egcl_compiler::t2::ir::{AuxData, Opcode};
+                            use egcl_compiler::t2::ir::Opcode;
                             let calls: Vec<_> = ir.block_order().iter()
                                 .flat_map(|&block| &ir.block(block).insts)
                                 .filter(|&&inst| ir.inst(inst).opcode == Opcode::Call)
                                 .collect();
                             if calls.len() != 2 { return None; }
                             let target = |inst| {
-                                let AuxData::CallTarget(symbol) = ir.inst(inst).aux else { return None };
+                                let symbol = ir.inst(inst).aux.named_call_target()?;
                                 let (_, cell) = call_cells.iter().find(|(name, _)| *name == symbol)?;
                                 Some(OrdinaryCallTarget { symbol,
                                     descriptor_slot: cell.ordinary_entry_address() as u64,

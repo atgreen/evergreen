@@ -153,6 +153,14 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
         for (pos, &inst) in bd.insts.iter().enumerate() {
             let data = f.inst(inst);
             let is_term = data.opcode.is_terminator();
+            if matches!(data.aux, AuxData::OpaqueCallTarget(_))
+                && (!matches!(data.opcode, Opcode::Call | Opcode::Invoke)
+                    || !data.flags.call || !data.flags.effectful || !data.flags.safepoint
+                    || data.frame_state.is_none()) {
+                errors.push(VerifyError::new("V8 opaque-call-contract",
+                    format!("block{bi} NOTINLINE dispatch requires an effectful safepoint Call/Invoke with recovery state")));
+            }
+
             if data.opcode == Opcode::Invoke
                 && (data.targets.len() != 2
                     || data.targets[0].block == data.targets[1].block
@@ -161,7 +169,7 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                     || !data.flags.safepoint
                     || !matches!(
                         data.aux,
-                        AuxData::CallTarget(_)
+                        AuxData::CallTarget(_) | AuxData::OpaqueCallTarget(_)
                             | AuxData::HostEval(_)
                             | AuxData::FunctionLookup(_)
                             | AuxData::ValuesToList

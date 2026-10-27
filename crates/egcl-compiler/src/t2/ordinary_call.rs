@@ -185,7 +185,7 @@ fn emit_ordinary_call_body(
     if call.opcode != Opcode::Call
         || call.args.len() > 4
         || call.results.len() != 1
-        || !matches!(call.aux, AuxData::CallTarget(symbol) if symbol == target.symbol)
+        || call.aux.named_call_target() != Some(target.symbol)
         || !call.flags.call
         || !call.flags.safepoint
         || ret.opcode != Opcode::Return
@@ -335,7 +335,7 @@ pub fn emit_framed_ordinary_two_calls(
     for (&inst, target) in [first, last].iter().zip(targets) {
         let call = f.inst(inst);
         if call.args.len() > 4 || call.results.len() != 1 || !call.flags.call || !call.flags.safepoint
-            || !matches!(call.aux, AuxData::CallTarget(symbol) if symbol == target.symbol)
+            || call.aux.named_call_target() != Some(target.symbol)
         { return Err(bad()); }
     }
     let ret = f.inst(*insts.last().ok_or_else(bad)?);
@@ -561,7 +561,7 @@ pub fn emit_framed_ordinary_function_with_self_call_facts(
                     if matches.next().is_some() || target.descriptor_slot == 0
                         || target.revision_address == 0 || data.args.len() > u16::MAX as usize
                         || data.results.len() > 1 || !data.flags.call || !data.flags.safepoint
-                        || !matches!(data.aux, AuxData::CallTarget(symbol) if symbol == target.symbol)
+                        || data.aux.named_call_target() != Some(target.symbol)
                     { return Err(declined("call site shape")); }
                     if position + 2 == insts.len() {
                         let ret = f.inst(insts[position + 1]);

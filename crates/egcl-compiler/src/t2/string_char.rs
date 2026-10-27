@@ -216,6 +216,7 @@ mod tests {
     fn body(code: Vec<Instr>, arity: u16) -> BytecodeFunction {
         BytecodeFunction {
             self_call_sites: Vec::new(),
+            notinline_sites: Vec::new(),
             code,
             constants: vec![],
             load_time_values: vec![],

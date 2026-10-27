@@ -570,6 +570,7 @@ mod tests {
             ],
             constants: vec![EgclVal::from_fixnum(8), EgclVal::from_fixnum(0)],
             self_call_sites: vec![],
+            notinline_sites: Vec::new(),
             load_time_values: vec![],
             handler_cases: vec![],
             handler_binds: vec![],

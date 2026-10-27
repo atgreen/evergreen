@@ -25,6 +25,7 @@ fn bytecode_fn() -> BytecodeFunction {
     code.extend([Instr::CallNamed { sym, nargs: 0 }, Instr::Return]);
     BytecodeFunction {
         self_call_sites: Vec::new(),
+        notinline_sites: Vec::new(),
         code,
         constants: vec![EgclVal::from_fixnum(1)],
         load_time_values: vec![],
@@ -52,6 +53,7 @@ fn legacy_bytecode_fn() -> BytecodeFunction {
     let sym = egcl_rt::symbols::intern("NATIVE-POLL-ABI-LEGACY-CALLEE");
     BytecodeFunction {
         self_call_sites: Vec::new(),
+        notinline_sites: Vec::new(),
         code: vec![Instr::CallNamed { sym, nargs: 0 }, Instr::Return],
         constants: vec![],
         load_time_values: vec![],
@@ -81,6 +83,7 @@ fn call_free_loop_fn() -> BytecodeFunction {
     // SysV stack.
     BytecodeFunction {
         self_call_sites: Vec::new(),
+        notinline_sites: Vec::new(),
         code: vec![
             Instr::Const(0),
             Instr::Br(2),

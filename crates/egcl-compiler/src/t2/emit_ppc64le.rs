@@ -509,7 +509,7 @@ impl Emitter<'_> {
                     self.runtime.portable.make_closure
                 }
                 Opcode::Call => {
-                    let AuxData::CallTarget(symbol) = data.aux else {
+                    let Some(symbol) = data.aux.named_call_target() else {
                         return Err(unsupported());
                     };
                     for (index, &arg) in data.args.iter().enumerate() {

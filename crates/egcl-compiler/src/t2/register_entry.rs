@@ -146,7 +146,7 @@ pub fn plan(query: &RegisterEntryQuery<'_>) -> RegisterEntryPlan {
     let calls_fit = instructions().all(|data| {
         data.opcode != Opcode::Call
             || (is_self_call(data, query.self_sym) && data.args.len() <= query.args_max)
-            || (matches!(data.aux, AuxData::CallTarget(_))
+            || (data.aux.named_call_target().is_some()
                 && data.args.len() <= query.call_args_max)
     });
 

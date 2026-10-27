@@ -43,6 +43,7 @@ fn bytecode_fn(
 ) -> BytecodeFunction {
     BytecodeFunction {
         self_call_sites: Vec::new(),
+        notinline_sites: Vec::new(),
         code,
         constants,
         load_time_values: vec![],
@@ -1688,6 +1689,7 @@ fn fixnum_profile_speculates_the_call() {
     let star = egcl_rt::symbols::intern("*");
     let bf = BytecodeFunction {
         self_call_sites: Vec::new(),
+        notinline_sites: Vec::new(),
         code: vec![
             Instr::LoadLocal(0),
             Instr::Const(0),

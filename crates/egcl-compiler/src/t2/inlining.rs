@@ -541,6 +541,7 @@ mod tests {
     fn saved_body(code: Vec<Instr>) -> Arc<BytecodeFunction> {
         Arc::new(BytecodeFunction {
             self_call_sites: Vec::new(),
+            notinline_sites: Vec::new(),
             code,
             constants: vec![],
             load_time_values: vec![],
