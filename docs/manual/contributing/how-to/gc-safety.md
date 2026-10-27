@@ -47,11 +47,20 @@ EGCL_GC_STRESS=1 EGCL_GC_POISON=1 \
 Compare the output as well as the exit status. A value can be lost before it is
 stored and produce a quietly wrong result instead of a poisoned-pointer crash.
 
-On Linux, once the old generation reaches a quarter of the nursery's size, a
-minor collection scans only the old-generation pages the kernel reports as
-written since the previous minor collection (soft-dirty tracking). A small
-reproducer stays below that size; set `EGCL_GC_SOFT_DIRTY=1` to exercise the
-tracked scan anyway.
+On Linux, once the old generation reaches a quarter of the nursery's size,
+minor collections can scan only the old-generation pages the kernel reports as
+written since the previous collection. Auto mode prefers asynchronous write
+protection of older heap ranges when the kernel supports it, with legacy
+process-wide soft-dirty tracking as fallback. Unsupported or uncertain tracking
+retains a full old-generation scan.
+
+A small reproducer stays below that size. Set `EGCL_GC_SOFT_DIRTY=1` to force
+legacy soft-dirty tracking even for a small heap; `EGCL_GC_SOFT_DIRTY=0` forces
+full scanning. Presence of `EGCL_DISABLE_ASYNC_OLD_TRACKING` keeps Auto mode on
+the legacy backend. `EGCL_GC_ASYNC_WP_LOG=1` reports successful async arming and
+snapshots or fallback; use those markers to prove which backend ran. Keep this
+diagnostic logging disabled for performance measurements.
+
 A change that adds a new kind of off-heap storage reachable from a heap object
 must be traced on every minor collection, not only when its holder's page is
 written: see `traces_off_heap` in `crates/egcl-rt/src/gc.rs`. To tell a
