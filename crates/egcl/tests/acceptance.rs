@@ -4091,6 +4091,10 @@ fn format_indirection_takes_a_function_control() {
         ("(format nil \"~@?|~a\" (formatter \"~a\") 1 2)", "\"1|2\""),
         ("(format nil \"~?\" \"[~a]\" '(4))", "\"[4]\""),
         ("(handler-case (format nil \"~?\" 42 nil) (type-error () :type-error))", ":TYPE-ERROR"),
+        (
+            "(handler-case (format nil \"~?\" '(lambda (stream &rest args) (declare (ignore stream args)) nil) nil) (type-error () :type-error))",
+            ":TYPE-ERROR",
+        ),
     ];
     for (expr, expected) in cases {
         let out = egcl_bin()
