@@ -1200,6 +1200,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#minor-gc-phases" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Minor-GC phase timing
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#allocation-and-measurement-discipline" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2043,6 +2054,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#minor-gc-phases" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Minor-GC phase timing
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#allocation-and-measurement-discipline" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2147,6 +2169,77 @@ returns the collected sample count. <code>sprof-fold</code> writes folded-stack 
 <p>Sampling observes a running workload; short programs may end before meaningful
 samples accumulate. Retain the workload and build configuration with any
 profile you use to justify a performance change.</p>
+<h2 id="minor-gc-phases">Minor-GC phase timing<a class="headerlink" href="#minor-gc-phases" title="Permanent link">&para;</a></h2>
+<p>Set <code>EGCL_GC_PHASE_LOG</code> before starting EGCL to write phase timings to stderr.
+The flag is cached on first use and tests presence: <code>=0</code> also enables it.
+Leave it unset for ordinary timing comparisons.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="nv">EGCL_GC_PHASE_LOG</span><span class="o">=</span><span class="m">1</span><span class="w"> </span>scripts/egcl-limited.sh<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="w">  </span>target/x86_64-unknown-linux-musl/release/egcl<span class="w"> </span>--no-init<span class="w"> </span>--load<span class="w"> </span>workload.lisp<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="w">  </span><span class="m">2</span>&gt;gc-phases.log
+<a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a>env<span class="w"> </span>-u<span class="w"> </span>EGCL_GC_PHASE_LOG<span class="w"> </span>scripts/egcl-limited.sh<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a><span class="w">  </span>target/x86_64-unknown-linux-musl/release/egcl<span class="w"> </span>--no-init<span class="w"> </span>--load<span class="w"> </span>workload.lisp
+</code></pre></div>
+<p>Each successful minor body emits one <code>[gc-phases] minor</code> line with eight
+consecutive intervals in nanoseconds:</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Work included</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>setup_index_ns</code></td>
+<td>Heap setup and initial nursery indexing</td>
+</tr>
+<tr>
+<td><code>roots_mark_ns</code></td>
+<td>Stack, symbol, external, and remembered roots</td>
+</tr>
+<tr>
+<td><code>old_scan_ns</code></td>
+<td>Older-generation scanning, including mandatory off-heap scans</td>
+</tr>
+<tr>
+<td><code>young_mark_ns</code></td>
+<td>Pinned-region roots and transitive young marking</td>
+</tr>
+<tr>
+<td><code>evacuate_ns</code></td>
+<td>Capacity checks, copies, and pinned-region promotion</td>
+</tr>
+<tr>
+<td><code>heap_relocate_ns</code></td>
+<td>Remembered slots and heap-object fields</td>
+</tr>
+<tr>
+<td><code>roots_relocate_ns</code></td>
+<td>Stack, symbol, and external root relocation</td>
+</tr>
+<tr>
+<td><code>reclaim_rearm_ns</code></td>
+<td>Weak references, finalizers, verification, reset, soft-dirty rearming, and final bookkeeping</td>
+</tr>
+</tbody>
+</table>
+<p>Lazy nursery indexing is charged to whichever interval forces it.
+<code>phase_sum_ns</code> equals <code>body_total_ns</code>; that body total excludes formatting and
+writing its own line. <code>recorded_pause_us</code> retains the existing GC-statistics
+boundary, which ends before final bookkeeping. Timings include the diagnostic
+clock reads and any other enabled GC diagnostics.</p>
+<p>The separate <code>[gc-phases] minor_stw</code> line reports <code>enter_ns</code>,
+<code>body_with_log_ns</code>, and <code>exit_ns</code>, whose sum is <code>total_ns</code>. Entry covers the
+stop-the-world rendezvous and TLAB retirement; exit covers resumption. The body
+interval includes its diagnostic output. These intervals exclude the collector
+admission lock acquired by callers before the wrapper; subtracting body time
+therefore does not measure that lock's admission cost.</p>
+<p>A minor drained inside a major collection emits only the body line. A failed
+minor body emits no complete phase line; its wrapper reports <code>ok=0</code>, with the
+three interval fields absent if the body was never entered. Logging adds
+measurement overhead and makes no hard real-time guarantee. On Linux,
+soft-dirty tracking can cause first-write page faults during later execution;
+that system-time cost falls outside the recorded collection pause.</p>
 <h2 id="allocation-and-measurement-discipline">Allocation and measurement discipline<a class="headerlink" href="#allocation-and-measurement-discipline" title="Permanent link">&para;</a></h2>
 <p><code>room</code> measures Lisp-heap activity. Rust strings, vectors, hash maps, and other
 host allocations can dominate execution time independently. The contributor
