@@ -56,6 +56,7 @@ pub struct StructuralFacts {
     origins: RefCell<HashMap<Value, Option<Value>>>,
     successors: HashMap<Block, Vec<Block>>,
     osr_entries: Vec<Block>,
+    all_entry_dominance: RefCell<HashMap<(Block, Block), bool>>,
 }
 
 impl StructuralFacts {
@@ -240,6 +241,19 @@ impl StructuralFacts {
         {
             return false;
         }
+        // These conclusions need no alternate-entry traversal. The snapshot's
+        // reachability table already proves that no OSR entry can reach AFTER.
+        if before == after || !self.osr_reaches(after) {
+            return true;
+        }
+        let cached = self
+            .all_entry_dominance
+            .borrow()
+            .get(&(before, after))
+            .copied();
+        if let Some(answer) = cached {
+            return answer;
+        }
         let mut todo = self.osr_entries.clone();
         let mut seen = HashSet::new();
         while let Some(block) = todo.pop() {
@@ -247,12 +261,18 @@ impl StructuralFacts {
                 continue;
             }
             if block == after {
+                self.all_entry_dominance
+                    .borrow_mut()
+                    .insert((before, after), false);
                 return false;
             }
             if let Some(next) = self.successors.get(&block) {
                 todo.extend(next);
             }
         }
+        self.all_entry_dominance
+            .borrow_mut()
+            .insert((before, after), true);
         true
     }
 
@@ -576,12 +596,25 @@ mod tests {
             args: vec![],
         }];
         *f.inst_mut(ret) = jump;
+        let facts = StructuralFacts::analyze(&f);
+        for _ in 0..2 {
+            assert!(
+                facts
+                    .refined_layout_before(proof, LayoutKind::SimpleString, ret2)
+                    .is_some(),
+                "every OSR path still executes the earlier guard"
+            );
+        }
         f.osr_entries[0].block = downstream;
-        assert!(
-            StructuralFacts::analyze(&f)
-                .refined_layout_before(proof, LayoutKind::SimpleString, ret2)
-                .is_none()
-        );
+        let facts = StructuralFacts::analyze(&f);
+        for _ in 0..2 {
+            assert!(
+                facts
+                    .refined_layout_before(proof, LayoutKind::SimpleString, ret2)
+                    .is_none(),
+                "a fresh snapshot must reject the new bypassing entry"
+            );
+        }
     }
 
     #[test]

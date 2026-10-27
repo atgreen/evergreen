@@ -3,7 +3,9 @@
 T2 inference returns numeric type/range/representation facts and a structural
 fact snapshot. `value_facts::StructuralFacts` is also available independently
 when a verifier or structural transform needs no numeric analysis. Rebuild it
-after changing instructions, edge arguments, or OSR entries.
+after changing instructions, edge arguments, or OSR entries. Origin and
+alternate-entry dominance queries are memoized within that snapshot; cached
+answers do not cross IR rewrites.
 
 The shared domain distinguishes exact object identity, successful simple-string
 layout guards, and nullable packed-U8 layout witnesses. A broad STRING or VECTOR
