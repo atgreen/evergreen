@@ -427,3 +427,6 @@ fn compact_and_wide_recipes_execute_at_stack_offset_boundary() {
 
 #[path = "shared_deopt_tail_tests.rs"]
 mod tail_tests;
+
+#[path = "branch_relax_tests.rs"]
+mod branch_relax_tests;

@@ -320,10 +320,9 @@ pub(super) fn emit_candidate(
         .zip(&continuations)
     {
         a.bind(descriptor);
-        let delta = i32::try_from(a.label_offset(continuation)? as i64 - a.here() as i64).ok()?;
         a.extend_from_slice(&site.n_scopes.to_le_bytes());
         a.extend_from_slice(&u32::try_from(recipe.len()).ok()?.to_le_bytes());
-        a.extend_from_slice(&delta.to_le_bytes());
+        a.relative_i32(continuation, descriptor);
         for word in recipe {
             if narrow {
                 let encoded = narrow_recipe(*word)?;

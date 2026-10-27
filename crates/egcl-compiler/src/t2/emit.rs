@@ -351,6 +351,9 @@ mod inline_alloc;
 #[path = "shared_deopt.rs"]
 mod shared_deopt;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[path = "branch_relax.rs"]
+mod branch_relax;
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[path = "inline_packed_u8.rs"]
 mod inline_packed_u8;
 
@@ -9011,8 +9014,18 @@ fn emit_framed_inner(
                     native_spill_slots, control, veneer, emit_epilogue)
                 {
                     let new_cold_bytes = candidate.asm.here() - cold_start;
-                    if new_cold_bytes < old_cold_bytes {
-                        shared_diagnostic = Some((shared_sites.len(), old_cold_bytes, new_cold_bytes,
+                    // No OSR entries follow shared recovery. Compare complete
+                    // final layouts: unequal branch shortening can reverse a
+                    // small pre-layout saving. Reject malformed layouts.
+                    let (old_size, new_size, old_cold, new_cold) = if branch_relax::enabled() {
+                        let (old_code, old_map) = a.clone().finish_relaxed().ok_or(EmitError::BadBranch)?;
+                        let (new_code, new_map) = candidate.asm.clone().finish_relaxed().ok_or(EmitError::BadBranch)?;
+                        (old_code.len(), new_code.len(),
+                            old_code.len() - branch_relax::offset(Some(&old_map), cold_start)?,
+                            new_code.len() - branch_relax::offset(Some(&new_map), cold_start)?)
+                    } else { (a.here(), candidate.asm.here(), old_cold_bytes, new_cold_bytes) };
+                    if new_size < old_size {
+                        shared_diagnostic = Some((shared_sites.len(), old_cold, new_cold,
                             candidate.data_offset, candidate.data_bytes, candidate.helper_start, candidate.helper_end));
                         calls.extend(candidate.calls);
                         values.extend(candidate.values);
@@ -9278,7 +9291,56 @@ fn emit_framed_inner(
     if !transfer_maps.is_empty() {
         return Err(EmitError::UnsupportedOp(0xFD));
     }
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
     let code = a.finish().ok_or(EmitError::BadBranch)?;
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let (code, layout) = if branch_relax::enabled() {
+        let (code, layout) = a.finish_relaxed().ok_or(EmitError::BadBranch)?;
+        (code, Some(layout))
+    } else {
+        (a.finish().ok_or(EmitError::BadBranch)?, None)
+    };
+    // All following consumers see final positions. Stack geometry, bytecode
+    // PCs, SSA identities and absolute heap-literal addresses do not relocate.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let (compiled_entry, ordinary_entry, ordinary_bound_entry, native_recursive_entry) = {
+        let map = layout.as_ref();
+        for (_, entry) in &mut osr_entries {
+            *entry = branch_relax::offset(map, *entry)?;
+        }
+        for (pc, _) in &mut bcp_sites {
+            *pc = branch_relax::offset32(map, *pc)?;
+        }
+        for site in &mut root_sync_sites {
+            site.code_offset = branch_relax::offset32(map, site.code_offset)?;
+        }
+        for site in &mut native_calls {
+            site.return_offset = branch_relax::offset(map, site.return_offset)?;
+        }
+        native_value_maps = native_value_maps.into_iter().map(|(pc, values)| {
+            Ok((branch_relax::offset(map, pc)?, values))
+        }).collect::<Result<_, EmitError>>()?;
+        for site in &mut native_poll_transfer_sites {
+            site.return_offset = branch_relax::offset32(map, site.return_offset)?;
+        }
+        if let Some(transfer) = transfers {
+            branch_relax::transfers(map, transfer)?;
+        }
+        for patch in &mut ordinary_self_stack_fixups {
+            *patch = branch_relax::offset(map, *patch)?;
+        }
+        if let Some((_, _, _, data, bytes, start, end)) = &mut shared_diagnostic {
+            let data_end = branch_relax::offset(map, data.checked_add(*bytes).ok_or(EmitError::BadBranch)?)?;
+            *data = branch_relax::offset(map, *data)?;
+            *bytes = data_end.checked_sub(*data).ok_or(EmitError::BadBranch)?;
+            *start = branch_relax::offset(map, *start)?;
+            *end = branch_relax::offset(map, *end)?;
+        }
+        (branch_relax::offset(map, compiled_entry)?,
+            branch_relax::optional(map, ordinary_entry)?,
+            branch_relax::optional(map, ordinary_bound_entry)?,
+            branch_relax::optional(map, native_recursive_entry)?)
+    };
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     let mut code = code;
     #[cfg(all(target_arch = "x86_64", windows))]
