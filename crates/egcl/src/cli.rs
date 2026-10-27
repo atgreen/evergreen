@@ -12999,6 +12999,17 @@ fn symbol_home_package_name(sym: EgclVal) -> String {
     if let Some((pkg, _)) = egcl_rt::symbols::split_registry_key(&name) {
         return pkg.to_string();
     }
+    // A COMMON-LISP symbol stays COMMON-LISP's whatever other package
+    // re-exports it. EXPORT makes an inherited symbol present in the
+    // exporting package here, so the scan below found T and NIL in
+    // UIOP/COMMON-LISP or PARENSCRIPT (both re-export them) whenever that
+    // package came first in the list, and SYMBOL-PACKAGE answered it; which
+    // package came first changed from build to build.
+    if let Some(cl) = egcl_stdlib::find_package("COMMON-LISP")
+        && egcl_stdlib::find_present_symbol(cl, &name) == Some(sym)
+    {
+        return "COMMON-LISP".to_string();
+    }
     for pkg in egcl_stdlib::list_all_packages() {
         if egcl_stdlib::find_present_symbol(pkg, &name) == Some(sym) {
             if let Some(pname) = egcl_stdlib::package_name(pkg) {
