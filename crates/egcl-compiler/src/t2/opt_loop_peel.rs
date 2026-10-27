@@ -20,6 +20,9 @@ use super::ir::{
 };
 use super::region_clone::{clone_region, repair_outside_uses};
 
+#[path = "bounded_octet_fallback.rs"]
+mod bounded_octet_fallback;
+
 /// Bounded growth: duplicate only small innermost loops with useful feedback.
 #[derive(Clone, Copy, Debug)]
 pub struct PeelOptions {
@@ -72,6 +75,15 @@ pub fn peel_for_numeric_types(
             continue;
         };
         if known_tiny_loop(f, lp.header, &lp.body, latch) {
+            continue;
+        }
+        if std::env::var_os("EGCL_DISABLE_BOUNDED_FALLBACK_PRUNING").is_none()
+            && bounded_octet_fallback::bounded(f, lp.header, &lp.body, latch)
+        {
+            stats.declined.push(format!(
+                "header {}: bounded octet scalar fallback",
+                lp.header.0
+            ));
             continue;
         }
         let mut trial = f.clone();

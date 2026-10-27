@@ -1697,8 +1697,8 @@ fn emit_home_move(a: &mut Asm, dst: FramedHome, src: HomeMoveSrc) {
 /// while a pending move still reads it (bliss-x5y.28: the previous
 /// unconditional stack snapshot cost a sub-rsp + store/reload round trip PER
 /// MOVE — two of them on every fib activation for what is a single register
-/// move). Only a residual cycle takes the snapshot path, which captures every
-/// remaining source before writing any destination.
+/// move). A residual permutation rotates through reserved RDI on Linux x86;
+/// unsupported cycles retain the general stack snapshot fallback.
 fn parallel_home_move(a: &mut Asm, moves: &[(FramedHome, HomeMoveSrc)]) {
     let mut pending: Vec<(FramedHome, HomeMoveSrc)> = moves
         .iter()
@@ -1728,7 +1728,55 @@ fn parallel_home_move(a: &mut Asm, moves: &[(FramedHome, HomeMoveSrc)]) {
             break; // every pending destination is still read: a cycle
         }
     }
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    if parallel_home_move_cycles(a, &pending) {
+        return;
+    }
     parallel_home_move_snapshot(a, &pending);
+}
+
+/// A residual permutation consists of disjoint cycles. Save one old home in
+/// RDI, rotate each cycle, then restore its last destination from RDI. RAX is
+/// the existing memory-to-memory move scratch; neither is a framed value home.
+/// All eligibility checks precede emission, so unsupported inputs keep the
+/// existing snapshot path unchanged. No instruction changes CF or RSP and no
+/// allocation/safepoint can observe the temporary unrooted copy.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn parallel_home_move_cycles(a: &mut Asm, moves: &[(FramedHome, HomeMoveSrc)]) -> bool {
+    use std::collections::{HashMap, HashSet};
+    let valid_home = |home| match home {
+        FramedHome::Reg(reg) => crate::t2::x64_frame::FRAME_GPRS.iter()
+            .any(|&index| crate::t2::x64_frame::GPR_X86[index] == reg),
+        FramedHome::Stack(slot) => slot <= i32::MAX as u32 / 8,
+    };
+    let mut edges = HashMap::new();
+    let mut sources = HashSet::new();
+    for &(dst, src) in moves {
+        let HomeMoveSrc::Home(src) = src else { return false; };
+        if !valid_home(dst) || !valid_home(src) || edges.insert(dst, src).is_some()
+            || !sources.insert(src) {
+            return false;
+        }
+    }
+    if edges.keys().any(|dst| !sources.contains(dst)) {
+        return false;
+    }
+    // Follow input order, not HashMap iteration, for deterministic emission.
+    for &(first, _) in moves {
+        if !edges.contains_key(&first) { continue; }
+        load_home(a, 7, first, 0);
+        let mut dst = first;
+        loop {
+            let src = edges.remove(&dst).expect("validated permutation cycle");
+            if src == first {
+                store_home(a, dst, 7, 0);
+                break;
+            }
+            emit_home_move(a, dst, HomeMoveSrc::Home(src));
+            dst = src;
+        }
+    }
+    true
 }
 
 /// The general cyclic case: a temporary stack snapshot captures every source
@@ -12207,3 +12255,7 @@ mod integer_builtin_tests {
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 #[path = "unused_deopt_tests.rs"]
 mod unused_deopt_tests;
+
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+#[path = "phi_cycle_tests.rs"]
+mod phi_cycle_tests;
