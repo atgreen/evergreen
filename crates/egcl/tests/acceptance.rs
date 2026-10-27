@@ -10439,6 +10439,47 @@ fn load_accepts_a_pathname_designator() {
 }
 
 #[test]
+fn load_and_compile_file_argument_errors_are_program_errors() {
+    // CLHS 3.5.1.2 and 3.5.1.4 (ansi load.error.2-3, compile-file.error.2): a
+    // missing file argument, an odd keyword list and an unknown keyword are
+    // PROGRAM-ERRORs, and the file is not loaded; :ALLOW-OTHER-KEYS T permits
+    // the unknown keyword. Keyword identity includes the KEYWORD package, and
+    // repeated :ALLOW-OTHER-KEYS arguments obey the usual leftmost-wins rule.
+    let dir = std::env::temp_dir().join(format!("egcl_test_load_args_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let file_path = dir.join("f.lisp");
+    std::fs::write(&file_path, "(format t \"[LOADED]\")\n").expect("write");
+    let file = file_path.to_str().unwrap();
+    let prog = format!(
+        "(format t \"~&RESULT=~s~%\" \
+           (list (handler-case (load) (program-error () :pe)) \
+                 (handler-case (compile-file) (program-error () :pe)) \
+                 (handler-case (load \"{file}\" :bad-key-arg t) (program-error () :pe)) \
+                 (handler-case (load \"{file}\" :verbose) (program-error () :pe)) \
+                 (handler-case (load \"{file}\" 'cl-user::verbose t) (program-error () :pe)) \
+                 (handler-case (load \"{file}\" :bad-key-arg t 'cl-user::allow-other-keys t) \
+                   (program-error () :pe)) \
+                 (handler-case (load \"{file}\" :bad-key-arg t \
+                                     :allow-other-keys nil :allow-other-keys t) \
+                   (program-error () :pe)) \
+                 (load \"{file}\" :bad-key-arg t :allow-other-keys t)))"
+    );
+    let output = egcl_bin()
+        .args(["--eval", &prog])
+        .output()
+        .expect("run egcl");
+    let _ = std::fs::remove_file(&file_path);
+    let _ = std::fs::remove_dir(&dir);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("RESULT=(:PE :PE :PE :PE :PE :PE :PE T)")
+            && stdout.matches("[LOADED]").count() == 1,
+        "LOAD and COMPILE-FILE argument errors, got: '{stdout}', stderr: '{}'",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn load_pathname_is_dynamic_across_called_functions_and_nested_loads() {
     // bliss-lb6.23: LOAD used to insert *LOAD-PATHNAME* into only the current
     // evaluator frame. A global function called by a loaded file therefore saw

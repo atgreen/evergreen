@@ -236,6 +236,11 @@
   fixing incorrect loop counts and results in some unboxed integer loops
   ([#680](https://github.com/atgreen/evergreen/pull/680)).
 
+- `load` and `compile-file` signal `program-error` when called without a file,
+  and `load` signals it for an odd keyword list or an unknown keyword (unless
+  `:allow-other-keys` is true) instead of loading the file
+  ([#672](https://github.com/atgreen/evergreen/pull/672)).
+
 - Private function symbols no longer cause multi-gigabyte allocations in the
   interpreter's arithmetic-classification cache
   ([#662](https://github.com/atgreen/evergreen/pull/662)).

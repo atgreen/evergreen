@@ -5370,8 +5370,38 @@ fn resolve(name: &str) -> Option<Handler> {
         "LOAD" => Some(|_operator, args, env| {
             let args = RootedVals::new(args.to_vec());
 
+            // A missing filespec, an odd keyword list or an unknown keyword is
+            // a PROGRAM-ERROR (CLHS 3.5.1.2, 3.5.1.4; ansi load.error.2-3),
+            // unless :ALLOW-OTHER-KEYS is true.
             if args.is_empty() {
-                return Err(EgclError::Internal("LOAD requires a pathname".into()));
+                return Err(EgclError::ProgramError("LOAD requires a filespec".into()));
+            }
+            if args.len() % 2 == 0 {
+                return Err(EgclError::ProgramError(
+                    "LOAD: odd number of keyword arguments".into(),
+                ));
+            }
+            let allow_other_keys = args[1..]
+                .chunks(2)
+                .find(|kv| {
+                    is_keyword_arg(kv[0])
+                        && sym_bare_name_rc(kv[0]).as_ref() == "ALLOW-OTHER-KEYS"
+                })
+                .is_some_and(|kv| kv[1] != NIL);
+            if !allow_other_keys {
+                for kv in args[1..].chunks(2) {
+                    let known = is_keyword_arg(kv[0])
+                        && matches!(
+                            sym_bare_name_rc(kv[0]).as_ref(),
+                            "VERBOSE" | "PRINT" | "IF-DOES-NOT-EXIST" | "EXTERNAL-FORMAT" | "ALLOW-OTHER-KEYS"
+                        );
+                    if !known {
+                        return Err(EgclError::ProgramError(format!(
+                            "LOAD: unknown keyword argument {}",
+                            format_val(kv[0])
+                        )));
+                    }
+                }
             }
             let mut path_val = args[0];
             egcl_rt::rooted_ref!(_path_root = &mut path_val);
@@ -5380,7 +5410,8 @@ fn resolve(name: &str) -> Option<Handler> {
             let mut if_missing_nil = false;
             let mut i = 1;
             while i + 1 < args.len() {
-                if args[i].is_symbol() && sym_bare_name_rc(args[i]).as_ref() == "IF-DOES-NOT-EXIST"
+                if is_keyword_arg(args[i])
+                    && sym_bare_name_rc(args[i]).as_ref() == "IF-DOES-NOT-EXIST"
                 {
                     if_missing_nil = args[i + 1] == NIL;
                 }
@@ -5483,9 +5514,11 @@ fn resolve(name: &str) -> Option<Handler> {
             // output-truename, warnings-p, failure-p. ASDF passes the target as
             // an :output-file keyword (not positional).
 
+            // A missing input file is a PROGRAM-ERROR (CLHS 3.5.1.2; ansi
+            // compile-file.error.2).
             if args.is_empty() {
-                return Err(EgclError::Internal(
-                    "COMPILE-FILE requires a source".into(),
+                return Err(EgclError::ProgramError(
+                    "COMPILE-FILE requires an input file".into(),
                 ));
             }
             egcl_rt::rooted!(source_pathname = resolve_against_dpd(args[0], env)?);
