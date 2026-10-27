@@ -11288,7 +11288,10 @@ impl Env {
             EgclVal::from_fixnum(-(1_i64 << 60)),
         );
         env.seed_standard_constant("CHAR-CODE-LIMIT", EgclVal::from_fixnum(0x110000));
-        env.seed_standard_constant("ARRAY-RANK-LIMIT", EgclVal::from_fixnum(8));
+        env.seed_standard_constant(
+            "ARRAY-RANK-LIMIT",
+            EgclVal::from_fixnum(i64::from(egcl_rt::types::ARRAY_RANK_LIMIT)),
+        );
         env.seed_standard_constant(
             "ARRAY-DIMENSION-LIMIT",
             EgclVal::from_fixnum((1_i64 << 60) - 1),

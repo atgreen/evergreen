@@ -816,6 +816,12 @@ fn read_nd_array_literal(
     depth: usize,
     rank: u32,
 ) -> Result<(EgclVal, usize), EgclError> {
+    if rank >= egcl_rt::types::ARRAY_RANK_LIMIT {
+        return Err(EgclError::StreamError(format!(
+            "illegal #nA array rank {rank}: must be less than ARRAY-RANK-LIMIT ({})",
+            egcl_rt::types::ARRAY_RANK_LIMIT,
+        )));
+    }
     pos = skip_whitespace_and_comments(chars, pos)?;
     let (mut contents, p) = read_token_with_base(
         chars,
