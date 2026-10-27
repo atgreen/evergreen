@@ -7838,7 +7838,7 @@ fn write_slot_value(
 /// over the `env.classes` superclass links (deduped). Used to compute effective
 /// slots so inherited slot definitions participate in instance initialization.
 fn class_precedence_names(env: &Env, class_name: &str) -> Vec<String> {
-    // The CLOS core's C3 linearization decides which class's slot specifier is
+    // The CLOS core's class precedence list decides which class's slot specifier is
     // most specific (ansi class-0304..0311); the preorder walk below is the
     // fallback for a class the core does not know.
     if let Some(class_sym) = resolve_sym(class_name) {

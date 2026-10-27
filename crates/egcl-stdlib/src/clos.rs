@@ -1546,7 +1546,7 @@ fn is_builtin_class(st: &ClosState, class: EgclVal) -> bool {
         // build a layout, and nothing should be instantiated this early.
         return true;
     }
-    c3_linearize(st, class)
+    linearize_class_precedence(st, class)
         .map(|cpl| !cpl.contains(&st.standard_object_class))
         .unwrap_or(true)
 }
@@ -2318,7 +2318,7 @@ fn finalize_class_layout(st: &mut ClosState, class: EgclVal) {
     if is_builtin_class(st, class) {
         return;
     }
-    let cpl = c3_linearize(st, class).unwrap_or_else(|_| vec![class]);
+    let cpl = linearize_class_precedence(st, class).unwrap_or_else(|_| vec![class]);
     let mut order: Vec<EgclVal> = Vec::new();
     let mut index: HashMap<EgclVal, usize> = HashMap::new();
     // A slot a more specific class declares :allocation :class shadows the
@@ -2444,7 +2444,7 @@ pub fn class_name(class: EgclVal) -> EgclVal {
     with_state(|st| st.class_meta.get(&class).map(|m| m.name).unwrap_or(NIL))
 }
 
-/// Compute the class precedence list using C3 linearization (R5.67).
+/// Compute the class precedence list by the standard's rule (R5.67).
 pub fn compute_class_precedence_list(class: EgclVal) -> Result<Vec<EgclVal>, EgclError> {
     with_state(|st| {
         if let Some(cpl) = st.cpl_cache.borrow().get(&class) {
@@ -2453,7 +2453,7 @@ pub fn compute_class_precedence_list(class: EgclVal) -> Result<Vec<EgclVal>, Egc
         // Pure Rust allocation only: no GC or Lisp callbacks while borrowed.
         // Do not cache errors or unknown classes. This bounds derived entries
         // by registered metadata and preserves the existing unknown-class API.
-        let cpl = c3_linearize(st, class)?;
+        let cpl = linearize_class_precedence(st, class)?;
         if st.class_meta.contains_key(&class) {
             st.cpl_cache.borrow_mut().insert(class, cpl.clone());
         }
@@ -2737,7 +2737,7 @@ pub fn effective_slots(class: EgclVal) -> Vec<EgclVal> {
     out
 }
 
-// ── C3 linearization ──────────────────────────────────────────────
+// ── Class precedence lists (CLHS 4.3.5) ─────────────────────────
 
 /// Infer direct superclasses for a class that is part of a consecutive-
 /// fixnum registration group. This enables the diamond-inheritance test
@@ -2789,22 +2789,35 @@ fn infer_group_supers(st: &ClosState, class: EgclVal) -> Option<Vec<EgclVal>> {
     }
 }
 
-fn c3_linearize(st: &ClosState, class: EgclVal) -> Result<Vec<EgclVal>, EgclError> {
-    #[cfg(test)]
-    cpl_tests::LINEARIZATIONS.with(|count| count.set(count.get() + 1));
-    c3_linearize_guarded(st, class, &mut Vec::new())
+/// The direct superclasses `class` is ordered over: its recorded ones, or the
+/// group-inferred ones while it still has only the default [STANDARD-OBJECT]
+/// (set by `set_find_class`), so the heuristic never overrides supers that
+/// were set on purpose. `None` for a class the core does not know.
+fn direct_supers_for_precedence(st: &ClosState, class: EgclVal) -> Option<Vec<EgclVal>> {
+    let meta = st.class_meta.get(&class)?;
+    let is_default_supers = meta.direct_supers.len() == 1
+        && meta.direct_supers[0] == st.standard_object_class
+        && st.standard_object_class != NIL;
+    if is_default_supers {
+        if let Some(inferred) = infer_group_supers(st, class) {
+            return Some(inferred);
+        }
+    }
+    Some(meta.direct_supers.clone())
 }
 
-/// `visiting` is the chain of classes currently being linearized; re-entering
-/// one means the (possibly heuristic-inferred) super graph is CYCLIC, which
-/// previously recursed to a stack-overflow SIGSEGV (bliss-d0b:
-/// trivial-gray-streams' fundamental-stream vs the bootstrap stream classes).
-/// Report it as a catchable error naming the class instead.
-fn c3_linearize_guarded(
+/// Every class in `class`'s hierarchy with its direct superclasses, `class`
+/// first and each class once. `visiting` is the chain being descended;
+/// reaching one of its members again means the (possibly heuristic-inferred)
+/// super graph is CYCLIC, which previously recursed to a stack-overflow
+/// SIGSEGV (bliss-d0b: trivial-gray-streams' fundamental-stream vs the
+/// bootstrap stream classes). Report it as a catchable error naming the class.
+fn collect_hierarchy(
     st: &ClosState,
     class: EgclVal,
     visiting: &mut Vec<EgclVal>,
-) -> Result<Vec<EgclVal>, EgclError> {
+    out: &mut Vec<(EgclVal, Vec<EgclVal>)>,
+) -> Result<(), EgclError> {
     if visiting.contains(&class) {
         let name = st.class_meta.get(&class).map(|m| m.name).unwrap_or(class);
         // Do not enter the symbol registry while holding the CLOS root lock.
@@ -2813,76 +2826,89 @@ fn c3_linearize_guarded(
             "cyclic class hierarchy: {rendered} appears among its own superclasses"
         )));
     }
+    if out.iter().any(|(seen, _)| *seen == class) {
+        return Ok(());
+    }
+    let supers = direct_supers_for_precedence(st, class).unwrap_or_default();
+    out.push((class, supers.clone()));
     visiting.push(class);
-    let result = c3_linearize_inner(st, class, visiting);
+    for s in &supers {
+        collect_hierarchy(st, *s, visiting, out)?;
+    }
     visiting.pop();
-    result
+    Ok(())
 }
 
-fn c3_linearize_inner(
-    st: &ClosState,
-    class: EgclVal,
-    visiting: &mut Vec<EgclVal>,
-) -> Result<Vec<EgclVal>, EgclError> {
-    let direct_supers = match st.class_meta.get(&class) {
-        Some(meta) => {
-            // Only use inferred supers when the class's current direct_supers
-            // are exactly the default [STANDARD-OBJECT] (set by set_find_class).
-            // This prevents the heuristic from overriding intentionally-set supers.
-            let is_default_supers = meta.direct_supers.len() == 1
-                && meta.direct_supers[0] == st.standard_object_class
-                && st.standard_object_class != NIL;
-            if is_default_supers {
-                if let Some(inferred) = infer_group_supers(st, class) {
-                    inferred
-                } else {
-                    meta.direct_supers.clone()
-                }
-            } else {
-                meta.direct_supers.clone()
-            }
+/// The class precedence list of `class`, by CLHS 4.3.5: a topological sort of
+/// the local precedence orders (each class before its direct superclasses,
+/// and those in the order written), where among several classes that could
+/// come next the one with a direct subclass rightmost in the list so far goes
+/// first.
+///
+/// This is the standard's own rule, not C3. The two agree on most
+/// hierarchies, including every diamond, but not on all: for ansi
+/// class-0306's eight classes C3 orders B before C and the standard's rule C
+/// before B. SBCL, CCL and Allegro follow the standard, and the precedence
+/// list decides method order, so code ported from them must see the same
+/// order here.
+fn linearize_class_precedence(st: &ClosState, class: EgclVal) -> Result<Vec<EgclVal>, EgclError> {
+    #[cfg(test)]
+    cpl_tests::LINEARIZATIONS.with(|count| count.set(count.get() + 1));
+    let mut classes: Vec<(EgclVal, Vec<EgclVal>)> = Vec::new();
+    collect_hierarchy(st, class, &mut Vec::new(), &mut classes)?;
+
+    // (before, after) pairs: C before S1, S1 before S2, ... for each class C
+    // with direct superclasses (S1 S2 ...).
+    let mut constraints: Vec<(EgclVal, EgclVal)> = Vec::new();
+    for (c, supers) in &classes {
+        let mut previous = *c;
+        for s in supers {
+            constraints.push((previous, *s));
+            previous = *s;
         }
-        None => return Ok(vec![class]),
-    };
-
-    if direct_supers.is_empty() {
-        return Ok(vec![class]);
     }
-
-    // L(C) = C + merge(L(S1), …, L(Sn), [S1, …, Sn])
-    let mut lists: Vec<Vec<EgclVal>> = Vec::with_capacity(direct_supers.len() + 1);
-    for s in &direct_supers {
-        lists.push(c3_linearize_guarded(st, *s, visiting)?);
-    }
-    lists.push(direct_supers);
-
-    let mut result = vec![class];
-    loop {
-        lists.retain(|l| !l.is_empty());
-        if lists.is_empty() {
-            break;
-        }
-        // Pick first head not in any tail
-        let head = lists
+    let mut remaining: Vec<EgclVal> = classes.iter().map(|(c, _)| *c).collect();
+    let mut result: Vec<EgclVal> = Vec::with_capacity(remaining.len());
+    while !remaining.is_empty() {
+        let candidates: Vec<EgclVal> = remaining
             .iter()
-            .map(|l| l[0])
-            .find(|&h| !lists.iter().any(|l| l[1..].contains(&h)))
-            .ok_or_else(|| {
-                // A Lisp-level error, so a DEFCLASS whose superclasses cannot be
-                // ordered is caught by HANDLER-CASE like any other definition
-                // error (ansi objects defclass.forward-ref.4) rather than
-                // aborting the image.
-                EgclError::ProgramError(
-                    "C3 linearization failed: inconsistent class hierarchy".into(),
-                )
-            })?;
-
-        result.push(head);
-        for l in &mut lists {
-            if !l.is_empty() && l[0] == head {
-                l.remove(0);
+            .copied()
+            .filter(|c| {
+                !constraints
+                    .iter()
+                    .any(|(before, after)| after == c && remaining.contains(before))
+            })
+            .collect();
+        let next = match candidates.as_slice() {
+            // A Lisp-level error, so a DEFCLASS whose superclasses cannot be
+            // ordered is caught by HANDLER-CASE like any other definition
+            // error (ansi objects defclass.forward-ref.4) rather than
+            // aborting the image.
+            [] => {
+                return Err(EgclError::ProgramError(
+                    "inconsistent class hierarchy: no class precedence list satisfies the local precedence orders".into(),
+                ));
             }
-        }
+            [only] => *only,
+            _ => {
+                let mut best = candidates[0];
+                let mut best_position: Option<usize> = None;
+                for candidate in &candidates {
+                    let position = result.iter().rposition(|placed| {
+                        classes
+                            .iter()
+                            .any(|(c, supers)| c == placed && supers.contains(candidate))
+                    });
+                    if position.is_some() && position > best_position {
+                        best = *candidate;
+                        best_position = position;
+                    }
+                }
+                best
+            }
+        };
+        result.push(next);
+        remaining.retain(|c| *c != next);
     }
     Ok(result)
 }
@@ -3606,7 +3632,7 @@ fn specializer_applicable(st: &ClosState, specializer: EgclVal, arg_class: EgclV
         return true; // exact match
     }
     // Walk the CPL of arg_class to check if specializer appears
-    if let Ok(cpl) = c3_linearize(st, arg_class) {
+    if let Ok(cpl) = linearize_class_precedence(st, arg_class) {
         cpl.contains(&specializer)
     } else {
         false
@@ -3645,7 +3671,7 @@ fn method_specificity_key(
         if spec == st.t_class_val || spec == NIL {
             return UNSPECIALIZED_DISTANCE;
         }
-        match c3_linearize(st, arg_classes[i]) {
+        match linearize_class_precedence(st, arg_classes[i]) {
             Ok(cpl) => cpl
                 .iter()
                 .position(|&c| c == spec)
@@ -4328,6 +4354,31 @@ mod cpl_tests {
             compute_class_precedence_list(d).unwrap(),
             vec![d, b, c, a, base]
         );
+    }
+
+    #[test]
+    fn precedence_follows_the_standards_rule_where_c3_differs() {
+        let _guard = test_guard();
+        // ansi class-0306: H (F G), F (D C), G (E), D (B), E (B), B (A), C (A).
+        // CLHS 4.3.5's sort puts C before G: after H F D, both C and G could
+        // come next, and C's direct subclass F stands further right than G's
+        // direct subclass H. C3 would merge the superclass lists and put B and
+        // G ahead of C.
+        let a = define(56001, &[]);
+        let b = define(56002, &[a]);
+        let c = define(56003, &[a]);
+        let d = define(56004, &[b]);
+        let e = define(56005, &[b]);
+        let f = define(56006, &[d, c]);
+        let g = define(56007, &[e]);
+        let h = define(56008, &[f, g]);
+        assert_eq!(
+            compute_class_precedence_list(h).unwrap(),
+            vec![h, f, d, c, g, e, b, a]
+        );
+        // And the same classes' own lists, where the two rules agree.
+        assert_eq!(compute_class_precedence_list(f).unwrap(), vec![f, d, b, c, a]);
+        assert_eq!(compute_class_precedence_list(g).unwrap(), vec![g, e, b, a]);
     }
 
     #[test]
