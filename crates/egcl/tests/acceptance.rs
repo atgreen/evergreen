@@ -9458,9 +9458,9 @@ fn gcd_lcm_and_string_trim() {
     }
 }
 
-/// `~:T` and `~:@T` are PPRINT-TAB (CLHS 22.3.5.2) and do nothing unless
-/// *PRINT-PRETTY* is true; plain `~T` and `~@T` still tab (ansi format.:t.2-3,
-/// format.:@t.4-5).
+/// `~:T` and `~:@T` are PPRINT-TAB (CLHS 22.3.5.2) and do nothing outside a
+/// logical block (or when *PRINT-PRETTY* is false); plain `~T` and `~@T` still
+/// tab (ansi format.:t.2-3, format.:@t.4-5).
 #[test]
 fn format_colon_tab_needs_pretty_printing() {
     let cases = [
@@ -9470,6 +9470,11 @@ fn format_colon_tab_needs_pretty_printing() {
         (
             "(let ((*print-pretty* nil)) (format nil \"~v,v:@t~a\" 10 20 \"x\"))",
             "\"x\"",
+        ),
+        ("(let ((*print-pretty* t)) (format nil \"XX~10:tYY\"))", "\"XXYY\""),
+        (
+            "(let ((*print-pretty* t)) (format nil \"XX~10,20:@tYY\"))",
+            "\"XXYY\"",
         ),
         ("(let ((*print-pretty* nil)) (format nil \"XX~4tYY\"))", "\"XX  YY\""),
         ("(let ((*print-pretty* nil)) (format nil \"XX~2@tYY\"))", "\"XX  YY\""),

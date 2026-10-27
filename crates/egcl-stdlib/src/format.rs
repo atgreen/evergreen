@@ -3119,7 +3119,7 @@ fn render_events(events: &[LayoutEvent], state: &mut LayoutState<'_>, section: u
                 kind,
                 colnum,
                 colinc,
-            } if state.options.pretty || matches!(kind, TabKind::Line | TabKind::LineRelative) => {
+            } if matches!(kind, TabKind::Line | TabKind::LineRelative) => {
                 state.tab(*kind, *colnum as usize, *colinc as usize, section)
             }
             LayoutEvent::Tab { .. } => {}
