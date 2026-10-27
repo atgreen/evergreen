@@ -6155,6 +6155,22 @@ fn resolve(name: &str) -> Option<Handler> {
                 }
                 i += 2;
             }
+            // A nickname that already names a package is a correctable
+            // PACKAGE-ERROR as well (CLHS MAKE-PACKAGE; ansi
+            // make-package.error.3-4); CONTINUE leaves that nickname off.
+            let mut kept = Vec::with_capacity(nicknames.len());
+            for nick in nicknames {
+                if egcl_stdlib::find_package(&nick).is_some() {
+                    signal_correctable_package_error(
+                        package_object(&nick),
+                        &format!("a package named {nick} already exists"),
+                        env,
+                    )?;
+                    continue;
+                }
+                kept.push(nick);
+            }
+            let nicknames = kept;
             let use_refs: Vec<&str> = uses.iter().map(String::as_str).collect();
             ensure_package_available(env, &pkg_name, &use_refs);
             if !nicknames.is_empty() {
