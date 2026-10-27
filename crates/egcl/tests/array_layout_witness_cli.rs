@@ -45,8 +45,8 @@ const PROGRAM: &str = r#"
       done)
     array))
 (defun layout-words (mixed)
-  (let ((words (make-array 18)))
-    (dotimes (i 18)
+  (let ((words (make-array 40)))
+    (dotimes (i 40)
       (setf (aref words i)
         (if mixed
           (case (mod i 4)
@@ -86,7 +86,7 @@ const PROGRAM: &str = r#"
         (let ((before (egcl-ext:deopt-count)))
           (dolist (width '(8 64 8))
             (setf (car (cdr *record-element-type*)) width)
-            (dolist (size '(0 7 9 135 136 137))
+            (dolist (size '(0 7 9 135 136 137 257))
               (layout-check ordinary size nil (= width 64))
               (layout-check mixed size nil (= width 64))))
           (sleep 0.01)
@@ -100,7 +100,7 @@ const PROGRAM: &str = r#"
   ;; general T storage in EGCL, then width8 must produce packed bytes again.
   (dolist (width '(8 64 8))
     (setf (car (cdr *record-element-type*)) width)
-    (dolist (size '(0 7 9 135 136 137))
+    (dolist (size '(0 7 9 135 136 137 257))
       (layout-check ordinary size t (= width 64))
       (layout-check mixed size t (= width 64)))))
  ;; A changed constructor element type must never borrow the UB8 witness.
@@ -139,13 +139,17 @@ const PROGRAM: &str = r#"
 #[test]
 fn array_layout_witness_preserves_binary_records_and_mutable_constructor_types() {
     let mut reference: Option<String> = None;
-    for enabled in [false, true] {
+    for (enabled, inline_allocation) in [(false, true), (true, true), (true, false)] {
         let mut command = Command::new(env!("CARGO_BIN_EXE_egcl"));
         command
             .env("EGCL_T0_T1_THRESHOLD", "20")
             .env("EGCL_T2_THRESHOLD", "40")
             .env("EGCL_T2_THREADS", "1")
             .env("EGCL_T2_LOG", "stderr")
+            .env("EGCL_ARRAY_LAYOUT_LOG", "1")
+            .env("EGCL_NATIVE_ARRAY_CONSTRUCTOR_STATS", "1")
+            .env_remove("EGCL_DISABLE_INLINE_U8_ALLOCATION")
+            .env_remove("EGCL_DISABLE_NATIVE_ARRAY_CONSTRUCTOR")
             .env_remove("EGCL_FORCE_TIER")
             .env_remove("EGCL_DISABLE_ARRAY_LAYOUT_FACTS")
             .env_remove("EGCL_DISABLE_OCTET_WORD_STORES")
@@ -159,6 +163,9 @@ fn array_layout_witness_preserves_binary_records_and_mutable_constructor_types()
             .args(["--no-init", "--eval", PROGRAM]);
         if !enabled {
             command.env("EGCL_DISABLE_ARRAY_LAYOUT_FACTS", "1");
+        }
+        if !inline_allocation {
+            command.env("EGCL_DISABLE_INLINE_U8_ALLOCATION", "1");
         }
         let output = command
             .output()
@@ -192,6 +199,21 @@ fn array_layout_witness_preserves_binary_records_and_mutable_constructor_types()
             witnessed, enabled,
             "layout witness admission must match ablation\n{stderr}"
         );
+        let fused = stderr.lines().any(|line| {
+            line.contains("LAYOUT-RECORD-WRITER")
+                && line.ends_with("inline allocation witness reused")
+        });
+        assert_eq!(
+            fused,
+            enabled && inline_allocation,
+            "only the actual eligible allocation/probe pair is fused\n{stderr}"
+        );
+        if !inline_allocation {
+            assert!(
+                stderr.contains("[native-array-constructor] fast count=1"),
+                "collecting constructor fallback must actually execute\n{stderr}"
+            );
+        }
         if let Some(expected) = &reference {
             assert_eq!(stdout.as_ref(), expected.as_str());
         } else {
@@ -258,6 +280,10 @@ fn array_layout_witness_keeps_relocated_output_valid_before_record_stores() {
             .env("EGCL_T2_THRESHOLD", "40")
             .env("EGCL_T2_THREADS", "1")
             .env("EGCL_T2_LOG", "stderr")
+            .env("EGCL_ARRAY_LAYOUT_LOG", "1")
+            .env("EGCL_NATIVE_ARRAY_CONSTRUCTOR_STATS", "1")
+            .env_remove("EGCL_DISABLE_INLINE_U8_ALLOCATION")
+            .env_remove("EGCL_DISABLE_NATIVE_ARRAY_CONSTRUCTOR")
             .env("EGCL_GC_POISON", "1")
             .env_remove("EGCL_FORCE_TIER")
             .env_remove("EGCL_DISABLE_ARRAY_LAYOUT_FACTS")
@@ -314,6 +340,14 @@ fn array_layout_witness_keeps_relocated_output_valid_before_record_stores() {
         assert_eq!(
             witnessed, enabled,
             "moving target must use the intended witness mode\n{stderr}"
+        );
+        let fused = stderr.lines().any(|line| {
+            line.contains("LAYOUT-MOVING-WRITER")
+                && line.ends_with("inline allocation witness reused")
+        });
+        assert_eq!(
+            fused, enabled,
+            "moving fixture must exercise the eligible native pair\n{stderr}"
         );
         if let Some(expected) = &reference {
             assert_eq!(stdout.as_ref(), expected.as_str());

@@ -7309,6 +7309,8 @@ fn emit_framed_inner(
     // state knows the bytecode position it deoptimizes to. Collect (native
     // offset, bcp) at those points; post-processed into a per-bcp map below.
     let mut bcp_sites: Vec<(u32, u32)> = Vec::new();
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let mut allocation_layout_completions = HashMap::new();
 
     // Emit each block: bind its label, emit its instructions, then its terminator
     // (with block-parameter moves on each out-edge).
@@ -7529,12 +7531,22 @@ fn emit_framed_inner(
                     d.opcode == Opcode::FloatAdd && raw_add_needs_zero_fixup(f, &d.args));
             } else if ordinary_call_mode && d.opcode == Opcode::Call {
                 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-                { let inline_done = inline_alloc::emit_ordinary_fast_path(&mut a, &d, &homes,
+                {
+                let fused = inline_packed_u8::adjacent_layout(f, b, inst, &straight_poll_sources,
+                    ordinary_call.unwrap().returns_at(inst)).is_some_and(|(probe, width)| {
+                    let done = a.label();
+                    if inline_packed_u8::emit_ordinary_layout(&mut a, f, &d, &homes,
+                        &const_tagged, inline_alloc_single.contains(&inst), (width, done)).is_some() {
+                        allocation_layout_completions.insert(probe, done);
+                        true
+                    } else { false }
+                });
+                let inline_done = if fused { None } else { inline_alloc::emit_ordinary_fast_path(&mut a, &d, &homes,
                     &const_tagged, inline_alloc_single.contains(&inst))
                     .or_else(|| inline_packed_u8::emit_ordinary(&mut a, f, &d, &homes,
                         &const_tagged, inline_alloc_single.contains(&inst)))
                     .or_else(|| inline_special::emit_ordinary_fast_path(&mut a, &d, &homes,
-                        &const_tagged, inline_alloc_single.contains(&inst)));
+                        &const_tagged, inline_alloc_single.contains(&inst))) };
                 inst_calls = ordinary_call.unwrap().for_inst(inst).emit(&mut a, &d, &homes, &const_tagged,
                     ordinary_call::OrdinaryCallFrame { function: f, inference: &inference,
                         outgoing: outgoing_area,
@@ -8491,6 +8503,8 @@ fn emit_framed_inner(
             }
             #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
             if let Some(done) = inline_alloc_done { a.bind(done); }
+            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+            if let Some(done) = allocation_layout_completions.remove(&inst) { a.bind(done); }
         }
 
         if ordinary_returns_from_call { continue; }
