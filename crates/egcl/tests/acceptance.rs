@@ -7271,6 +7271,38 @@ fn print_level_and_length_apply_to_arrays_and_vectors() {
         ),
         ("(let ((*print-length* 2)) (prin1-to-string #(1 2 3 4)))", "\"#(1 2 ...)\""),
         ("(let ((*print-level* 1)) (format nil \"~s\" (list #(1 2))))", "\"(#)\""),
+        (
+            "(let ((v (make-array 4 :element-type '(unsigned-byte 8) :initial-contents '(1 2 3 4)))) (write-to-string v :length 2 :pretty nil))",
+            "\"#(1 2 ...)\"",
+        ),
+        (
+            "(let ((v (make-array 2 :element-type '(unsigned-byte 8) :initial-contents '(1 2)))) (write-to-string (list v) :level 1 :pretty nil))",
+            "\"(#)\"",
+        ),
+        (
+            "(let ((v (make-array 4 :element-type '(unsigned-byte 8) :initial-contents '(1 2 3 4))) (*print-length* 2)) (prin1-to-string v))",
+            "\"#(1 2 ...)\"",
+        ),
+        (
+            "(let ((v (make-array 2 :element-type '(unsigned-byte 8) :initial-contents '(1 2))) (*print-level* 1)) (prin1-to-string (list v)))",
+            "\"(#)\"",
+        ),
+        (
+            "(let ((v (make-array 4 :element-type 'double-float :initial-contents '(1.0d0 2.0d0 3.0d0 4.0d0)))) (write-to-string v :length 2 :pretty nil))",
+            "\"#(1.0d0 2.0d0 ...)\"",
+        ),
+        (
+            "(let ((v (make-array 2 :element-type 'double-float :initial-contents '(1.0d0 2.0d0)))) (write-to-string (list v) :level 1 :pretty nil))",
+            "\"(#)\"",
+        ),
+        (
+            "(let ((v (make-array 4 :element-type 'double-float :initial-contents '(1.0d0 2.0d0 3.0d0 4.0d0))) (*print-length* 2)) (prin1-to-string v))",
+            "\"#(1.0d0 2.0d0 ...)\"",
+        ),
+        (
+            "(let ((v (make-array 2 :element-type 'double-float :initial-contents '(1.0d0 2.0d0))) (*print-level* 1)) (prin1-to-string (list v)))",
+            "\"(#)\"",
+        ),
         ("(prin1-to-string #2A((1 2) (3 4)))", "\"#2A((1 2) (3 4))\""),
     ];
     for (expr, expected) in cases {
