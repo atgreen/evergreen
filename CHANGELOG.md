@@ -43,6 +43,11 @@
 
 ### Performance
 
+- T2 inlines the signaling `ENDP` list-end check used by `DOLIST` and
+  `LOOP FOR ... IN`, while preserving type errors and closure handling through
+  guarded deoptimization
+  ([#717](https://github.com/atgreen/evergreen/pull/717)).
+
 - System Z T2 loops perform their full root-synchronizing runtime poll every
   64 selected back edges instead of on every iteration, reducing tight-loop
   overhead while retaining bounded signal, GC, error, and fiber-yield latency
