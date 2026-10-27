@@ -394,6 +394,10 @@ pub enum Opcode {
     /// octets and returns 0 or -1. False writes nothing and returns fixnum zero.
     /// No allocation, helper call, deopt or interior safepoint. Ordered effect.
     TryStoreIntegerOctets8,
+    /// Success-only partial/full store, same operand/layout contracts as
+    /// TryStoreIntegerOctets8, but accepts 1..=8 bytes and returns the exact
+    /// fixnum ASH(integer, -8*(end-start)). False still writes nothing.
+    TryStoreIntegerOctets1To8,
     /// Explicit block-entry poll around a bounded straight-line replacement.
     /// No operands/results; exact entry/exit recovery state is mandatory.
     NativePoll,

@@ -4,6 +4,10 @@
 
 ### Changed
 
+- x86-64 Linux T2 reduces redundant versions of bounded byte-extraction loops,
+  keeps partial-word stores native, and uses register rotations for eligible
+  cyclic value moves ([#730](https://github.com/atgreen/evergreen/pull/730)).
+
 - x86 T2 emits compact recovery recipes, shares cold return tails, and uses
   short native branches while preserving exact GC, deoptimization and OSR
   positions ([#728](https://github.com/atgreen/evergreen/pull/728)).

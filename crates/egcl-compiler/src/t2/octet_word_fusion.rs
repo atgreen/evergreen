@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-//! Version exact integer-to-octet counted loops before scalar type peeling.
+//! Version integer-to-octet counted loops before scalar type peeling. The
+//! success-only kernel accepts spans 1..=8; unsupported spans keep the original
+//! checked scalar/OSR loop. Post-state index is END and lane is ASH(-8*N).
 //!
 //! The kernel is a success-only bounded operation. Its two results establish
 //! the final index/end and ASH64 value; nothing assumes that deopt-only locals
@@ -14,7 +16,7 @@ use super::ir::{
     AuxData, Block, BlockCall, BoundedPollScope, Function, IRType, Inst, InstData, InstFlags,
     Opcode, TypeBits, Value, ValueDef, ValueRepresentation as Repr,
 };
-use super::opt_licm::{NaturalLoop, detect_loops};
+use super::opt_licm::{detect_loops, NaturalLoop};
 use super::region_clone::{clone_region, repair_outside_uses};
 use std::collections::{HashMap, HashSet};
 
@@ -213,10 +215,12 @@ fn recognize(
             d.opcode == Opcode::Brif
                 && d.targets.len() == 2
                 && d.targets[1].block == *preheader
-                && d.args
-                    .first()
-                    .and_then(|&v| result(f, v))
-                    .is_some_and(|i| f.inst(i).opcode == Opcode::TryStoreIntegerOctets8)
+                && d.args.first().and_then(|&v| result(f, v)).is_some_and(|i| {
+                    matches!(
+                        f.inst(i).opcode,
+                        Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8
+                    )
+                })
         })
     }) {
         return Err("already versioned checked fallback");
@@ -510,7 +514,8 @@ fn recognize(
         return Err("loop bound varies");
     }
     // A forwarding parameter used in the last BODY iteration does not have
-    // the final header phi's value: its index is end-1 and its lane is ASH56.
+    // the final header phi's value: its index is end-1 and its lane is
+    // ASH(-8*(N-1)), for the successful kernel span N (1..=8).
     // Two kernel outputs cannot recreate those temporaries, so never collapse
     // such body aliases to the final index/lane while repairing exit states.
     let post_aliases = aliases
@@ -694,7 +699,7 @@ fn transform(f: &mut Function, p: &Pattern) -> Result<(), &'static str> {
     let end = mapped(f, p.end, &initial, &p.aliases, &p.body)?;
     let lane = initial[&p.lane];
     let mut d = plain(
-        Opcode::TryStoreIntegerOctets8,
+        Opcode::TryStoreIntegerOctets1To8,
         vec![array, start, end, lane],
     );
     d.flags.effectful = true;
@@ -1067,10 +1072,19 @@ mod tests {
             x.f.block_order()
                 .iter()
                 .flat_map(|&b| &x.f.block(b).insts)
-                .filter(|&&i| x.f.inst(i).opcode == Opcode::TryStoreIntegerOctets8)
+                .filter(|&&i| {
+                    matches!(
+                        x.f.inst(i).opcode,
+                        Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8
+                    )
+                })
                 .copied()
                 .collect();
         assert_eq!(kernels.len(), 1);
+        assert_eq!(
+            x.f.inst(kernels[0]).opcode,
+            Opcode::TryStoreIntegerOctets1To8
+        );
         assert_eq!(x.f.inst(kernels[0]).args[0], x.array);
         assert_eq!(x.f.inst(kernels[0]).args[1], x.start);
         assert_eq!(x.f.inst(kernels[0]).args[3], x.initial_lane);
@@ -1226,19 +1240,21 @@ mod tests {
                 .iter()
                 .copied()
                 .filter(|&b| {
-                    x.f.block(b)
-                        .insts
-                        .iter()
-                        .any(|&i| x.f.inst(i).opcode == Opcode::TryStoreIntegerOctets8)
+                    x.f.block(b).insts.iter().any(|&i| {
+                        matches!(
+                            x.f.inst(i).opcode,
+                            Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8
+                        )
+                    })
                 })
                 .collect();
         assert_eq!(kernels.len(), 1);
-        assert!(
-            !x.f.block(kernels[0])
-                .insts
-                .iter()
-                .any(|&i| x.f.inst(i).opcode == Opcode::ClearMv)
-        );
+        assert!(!x
+            .f
+            .block(kernels[0])
+            .insts
+            .iter()
+            .any(|&i| x.f.inst(i).opcode == Opcode::ClearMv));
     }
 
     #[test]
@@ -1341,10 +1357,12 @@ mod tests {
                 .iter()
                 .copied()
                 .find(|&b| {
-                    x.f.block(b)
-                        .insts
-                        .iter()
-                        .any(|&i| x.f.inst(i).opcode == Opcode::TryStoreIntegerOctets8)
+                    x.f.block(b).insts.iter().any(|&i| {
+                        matches!(
+                            x.f.inst(i).opcode,
+                            Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8
+                        )
+                    })
                 })
                 .unwrap();
         let instructions = &x.f.block(probe).insts;
