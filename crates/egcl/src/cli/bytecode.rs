@@ -4103,15 +4103,18 @@ impl<'e> Lowerer<'e> {
             return Err(Bail);
         }
         let symbol = op.as_symbol_index();
-        // Preserve explicit NOTINLINE for the native constructor expansion.
-        // Lexical/captured function resolution above keeps its own namespace.
-        // An indirect FUNCALL is opaque to the canonical MAKE-ARRAY rewrite.
-        if egcl_rt::symbols::find_index("MAKE-ARRAY") == Some(symbol)
-            && self_calls::notinline(symbol, &self.inline_policies)
-        {
+        // A source NOTINLINE policy must survive every later tier and BFASL
+        // loading, not just suppress the frontend's own shortcuts. Keep the
+        // call opaque to named-call specialization through canonical FUNCALL.
+        // A symbol designator delays lookup until AFTER argument evaluation,
+        // exactly like CallNamed; LoadFunction here would capture a definition
+        // before arguments that can redefine it. Lexical/captured calls above
+        // retain their separate function namespace.
+        if self_calls::notinline(symbol, &self.inline_policies) {
             let count = u16::try_from(nargs + 1).map_err(|_| Bail)?;
-            let funcall = resolve_sym("FUNCALL").ok_or(Bail)?.as_symbol_index();
-            self.emit(Instr::LoadFunction(symbol));
+            let funcall = egcl_rt::symbols::intern("FUNCALL");
+            let designator = self.add_const(EgclVal::from_symbol_index(symbol));
+            self.emit(Instr::Const(designator));
             self.push_n(1);
             for i in 0..nargs { self.lower_expr(args[i])?; }
             self.emit(Instr::CallNamed { sym: funcall, nargs: count });

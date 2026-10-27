@@ -341,4 +341,115 @@ mod tests {
         legacy.self_call_sites = vec![0];
         assert!(decode_bbu_function(&legacy, &[name, other], &[], &[], 0x0200).is_err());
     }
+    #[test]
+    fn notinline_named_calls_remain_opaque_to_later_tiers() {
+        let _lock = super::super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env = &mut env);
+        let compiled = lower(
+            "NOTINLINE-NUMERIC-POLICY",
+            "((declare (notinline ash >=)) (if (>= n 8) (ash n -8) n))",
+            &env,
+        );
+        let ash = resolve_sym("ASH").unwrap().as_symbol_index();
+        let comparison = resolve_sym(">=").unwrap().as_symbol_index();
+        let funcall = egcl_rt::symbols::find_index("FUNCALL").unwrap();
+        for symbol in [ash, comparison] {
+            assert!(
+                !compiled
+                    .code
+                    .iter()
+                    .any(|op| matches!(op, Instr::CallNamed { sym, .. } if *sym == symbol))
+            );
+            assert!(
+                !compiled
+                    .code
+                    .iter()
+                    .any(|op| matches!(op, Instr::LoadFunction(sym) if *sym == symbol)),
+                "callee lookup must not precede argument evaluation"
+            );
+            assert!(
+                compiled
+                    .constants
+                    .contains(&EgclVal::from_symbol_index(symbol))
+            );
+        }
+        assert_eq!(
+            compiled
+                .code
+                .iter()
+                .filter(|op| matches!(op, Instr::CallNamed { sym, nargs: 3 } if *sym == funcall))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn notinline_nested_inline_override_only_reopens_its_lexical_call() {
+        let _lock = super::super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env = &mut env);
+        let compiled = lower(
+            "NOTINLINE-NESTED-POLICY",
+            "((declare (notinline ash)) (list (ash n -8) (locally (declare (inline ash)) (ash n -8)) (ash n -8)))",
+            &env,
+        );
+        let ash = resolve_sym("ASH").unwrap().as_symbol_index();
+        let funcall = egcl_rt::symbols::find_index("FUNCALL").unwrap();
+        assert_eq!(
+            compiled
+                .code
+                .iter()
+                .filter(|op| matches!(op, Instr::CallNamed { sym, nargs: 2 } if *sym == ash))
+                .count(),
+            1
+        );
+        assert_eq!(
+            compiled
+                .code
+                .iter()
+                .filter(|op| matches!(op, Instr::CallNamed { sym, nargs: 3 } if *sym == funcall))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn notinline_symbol_designator_resolves_after_argument_effects() {
+        let _lock = super::super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env = &mut env);
+        super::super::super::read_eval_all_env(
+            "(defun notinline-timing-target (n) n)
+             (defun notinline-timing-new (n) (+ n 1))
+             (defun notinline-timing-swap (n)
+               (setf (symbol-function 'notinline-timing-target) #'notinline-timing-new) n)",
+            &mut env,
+        )
+        .unwrap();
+        let compiled = lower(
+            "NOTINLINE-TIMING-CALLER",
+            "((declare (notinline notinline-timing-target)) (notinline-timing-target (notinline-timing-swap n)))",
+            &env,
+        );
+        let result = run(
+            Arc::new(compiled),
+            &[EgclVal::from_fixnum(41)],
+            NIL,
+            &mut env,
+        )
+        .unwrap();
+        assert_eq!(
+            result.as_fixnum(),
+            42,
+            "arguments run before resolving the global callee"
+        );
+    }
+
 }
