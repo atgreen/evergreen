@@ -211,6 +211,11 @@
 
 ### Fixed
 
+- `FORMAT` logical blocks and public pretty printing share one semantic layout
+  engine, preserving conditional breaks, indentation, tabs, case conversion,
+  printer limits, circular output, and Gray-stream behavior
+  ([#718](https://github.com/atgreen/evergreen/pull/718)).
+
 - `import` now signals a correctable package conflict when a distinct
   same-named symbol is inherited by the target package; continuing preserves
   the inherited binding
