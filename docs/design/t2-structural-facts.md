@@ -99,3 +99,30 @@ an actual recognized LDB/ASH byte loop. The native string test demonstrates both
 structural guard reuse and automatic removal of a redundant STRING type guard
 from the stronger successful layout proof. Its committed prefix effect and
 original failure state are checked explicitly.
+
+## Numeric speculation consumes negative constraints
+
+Before selecting a numeric specialization, T2 consults inferred operand types.
+A nonempty type disjoint from all numeric types rules out that guess. Unknown
+and bottom facts do not veto speculation, and numeric-containing unions still
+use the existing profile and floating-point contagion rules. This is a negative
+constraint, not permission to omit a runtime guard.
+
+```lisp
+(defun predicate-or-add (x addp)
+  (let ((p (typep x 'fixnum)))
+    (if addp (+ p 1) p)))
+```
+
+The normal branch can warm the function without exercising the addition. Even
+if that cold addition receives a fixnum guess, inference proves that `p` is a
+Boolean. T2 keeps the original generic call, which signals TYPE-ERROR when
+reached, rather than installing an arithmetic guard that must deoptimize.
+Errors, preceding effects, exceptional continuations, and multiple values keep
+the original call's behavior.
+
+Each immutable selection phase lazily computes at most one inference snapshot,
+shared across its candidates. The snapshot is discarded before mutation. The
+same rule applies before variadic-double splitting and before double-only
+expansion, so those entrances cannot bypass the constraint. Operands whose
+declared types are already numeric need no additional inference query.
