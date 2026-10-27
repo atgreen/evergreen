@@ -4,6 +4,10 @@
 
 ### Changed
 
+- T2 shares structural layout proofs with type inference and preserves Boolean
+  type-predicate results and required checks across OSR entries
+  ([#732](https://github.com/atgreen/evergreen/pull/732)).
+
 - x86-64 Linux T2 shares checked packed-byte array layout information across
   repeated stores while retaining bounds checks and moving-GC safety
   ([#731](https://github.com/atgreen/evergreen/pull/731)).

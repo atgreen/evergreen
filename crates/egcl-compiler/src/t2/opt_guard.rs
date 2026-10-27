@@ -101,6 +101,7 @@ impl Pass for GuardElim {
         changed |= !split_phis.is_empty();
         changed |= remove_inference_proven(f);
         changed |= remove_dominating_duplicates(f, &dom);
+        changed |= reuse_layout_evidence(f) != 0;
         changed |= hoist_loop_invariant(f, &dom);
 
         // A nested (or later) OSR entry can import an outer loop parameter
@@ -156,8 +157,14 @@ fn check_imported_guard_results(f: &mut Function, dom: &crate::t2::ir::Dominator
         for value in imported {
             let ValueDef::Result { inst, .. } = f.value(value).def else { continue };
             let data = f.inst(inst);
-            let (Opcode::Guard, AuxData::TypeTag(ty)) = (data.opcode, &data.aux) else { continue };
-            let ty = *ty;
+            if data.opcode != Opcode::Guard { continue; }
+            let ty = match &data.aux {
+                AuxData::TypeTag(ty) => *ty,
+                // This establishes only the semantic STRING constraint for
+                // imported results. It is not a reusable storage-layout proof.
+                AuxData::StringLayout => IRType::of(TypeBits::STRING),
+                _ => continue,
+            };
             // A guard the header dominates runs again after the entry.
             if inst_block.get(inst.index()).copied().flatten()
                 .is_some_and(|block| dom.dominates(header, block))
@@ -165,7 +172,7 @@ fn check_imported_guard_results(f: &mut Function, dom: &crate::t2::ir::Dominator
                 continue;
             }
             let checks = &mut f.osr_entries[index].checks;
-            if !checks.iter().any(|&(checked, _)| checked == value) {
+            if !checks.contains(&(value, ty)) {
                 checks.push((value, ty));
                 added = true;
             }
@@ -439,6 +446,75 @@ fn osr_bypasses_block(f: &Function, leader: Block, consumer: Block) -> bool {
         pending.extend(f.succs(block));
     }
     false
+}
+
+/// Reuse structural evidence through exact SSA forwarding, independent of the
+/// operation consuming it. Successful guards preserve a refined object result;
+/// nullable probes preserve their NIL-or-header-width result and failure test.
+/// Rebuild after each rewrite so no fact can name a detached proof producer.
+pub fn reuse_layout_evidence(f: &mut Function) -> usize {
+    use super::value_facts::{LayoutEvidence, LayoutKind, StructuralFacts};
+    // Refined results may also be imported through FrameState metadata. Keep
+    // mapped compilation conservative until structural import checks exist.
+    if !f.osr_entries.is_empty() {
+        return 0;
+    }
+    let candidates = f
+        .block_order()
+        .iter()
+        .flat_map(|&b| f.block(b).insts.iter())
+        .filter(|&&inst| {
+            f.inst(inst).opcode == Opcode::PackedU8Layout
+                || (f.inst(inst).opcode == Opcode::Guard
+                    && matches!(f.inst(inst).aux, AuxData::StringLayout))
+        })
+        .take(2)
+        .count();
+    if candidates < 2 {
+        return 0;
+    }
+    // Consume the same fact interface as numeric/type guard optimization.
+    // Later rewrites invalidate the snapshot and require a structural rebuild.
+    let inference = super::infer::infer(f);
+    let mut facts = inference.structural().clone();
+    let mut count = 0;
+    // Bound total rewrite work; leaving a redundant check is always sound.
+    while count < 32 {
+        let replacement = f.block_order().iter().find_map(|&block| {
+            f.block(block).insts.iter().find_map(|&inst| {
+                let d = f.inst(inst);
+                let (kind, encoding) = match (&d.opcode, &d.aux) {
+                    (Opcode::Guard, AuxData::StringLayout) => {
+                        (LayoutKind::SimpleString, LayoutEvidence::RefinedValue)
+                    }
+                    (Opcode::PackedU8Layout, AuxData::None) => {
+                        (LayoutKind::PackedU8, LayoutEvidence::NullableHeaderWidth)
+                    }
+                    _ => return None,
+                };
+                if d.args.len() != 1 || d.results.len() != 1 {
+                    return None;
+                }
+                let proof = facts.layout_before(d.args[0], kind, inst)?;
+                // Both must be genuine recognized producers, not a malformed
+                // consumer that merely happens to have the right opcode.
+                let this = facts.layout_producer(inst)?;
+                (this.encoding == encoding
+                    && proof.encoding == encoding
+                    && f.value(this.evidence).repr == f.value(proof.evidence).repr
+                    && f.value(this.evidence).ty == f.value(proof.evidence).ty)
+                    .then_some((inst, this.evidence, proof.evidence))
+            })
+        });
+        let Some((inst, from, to)) = replacement else {
+            break;
+        };
+        replace_all_uses(f, from, to);
+        detach_inst(f, inst);
+        count += 1;
+        facts = StructuralFacts::analyze(f);
+    }
+    count
 }
 
 // ── Transform 3: loop-invariant guard hoisting ──────────────────────
@@ -1778,6 +1854,90 @@ mod tests {
             f.block(entry).insts.contains(&guard),
             "ENDP's closure exclusion is stronger than a type-lattice proof"
         );
+    }
+
+    #[test]
+    fn imported_string_guard_result_gets_its_own_semantic_type_check() {
+        for prior in [None, Some(fixnum())] {
+            let mut f = Function::new("imported-layout-result");
+            let e = f.entry();
+            let input = f.add_block_param(e, IRType::TOP, ValueRepresentation::Tagged);
+            let fs = f.frame_states.add(FrameState {
+                scopes: vec![FrameScope {
+                    function: 0,
+                    bcp: 0,
+                    locals: vec![ValueSource::Value {
+                        value: input,
+                        repr: ValueRepresentation::Tagged,
+                    }],
+                    stack: vec![],
+                }],
+                remat: vec![],
+            });
+            let (_, checked) = f.push_inst(
+                e,
+                InstData {
+                    args: vec![input],
+                    aux: AuxData::StringLayout,
+                    flags: InstFlags {
+                        guard: true,
+                        effectful: true,
+                        ..Default::default()
+                    },
+                    frame_state: Some(fs),
+                    ..base(Opcode::Guard)
+                },
+                &[(IRType::TOP, ValueRepresentation::Tagged)],
+            );
+            let body = f.make_block();
+            f.set_terminator(
+                e,
+                InstData {
+                    targets: vec![BlockCall {
+                        block: body,
+                        args: vec![],
+                    }],
+                    ..base(Opcode::Jump)
+                },
+            );
+            let mut imported = f.frame_states.get(fs).clone();
+            imported.scopes[0].locals = vec![ValueSource::Value {
+                value: checked[0],
+                repr: ValueRepresentation::Tagged,
+            }];
+            let imported = f.frame_states.add(imported);
+            f.osr_entries.push(crate::t2::ir::OsrEntry {
+                block: body,
+                bcp: 1,
+                frame_state: imported,
+                control_scopes: vec![],
+                checks: prior.map(|ty| vec![(checked[0], ty)]).unwrap_or_default(),
+            });
+            let (redundant, _) = f.push_inst(
+                body,
+                InstData {
+                    args: vec![checked[0]],
+                    aux: AuxData::TypeTag(IRType::of(TypeBits::STRING)),
+                    flags: InstFlags {
+                        guard: true,
+                        effectful: true,
+                        ..Default::default()
+                    },
+                    frame_state: Some(imported),
+                    ..base(Opcode::Guard)
+                },
+                &[(IRType::of(TypeBits::STRING), ValueRepresentation::Tagged)],
+            );
+            f.set_terminator(body, ret());
+            run(&mut f);
+            assert!(!f.block(body).insts.contains(&redundant));
+            assert!(
+                f.osr_entries[0]
+                    .checks
+                    .contains(&(checked[0], IRType::of(TypeBits::STRING))),
+                "an existing unrelated check must not suppress the required string check"
+            );
+        }
     }
 
     #[test]
