@@ -4492,6 +4492,11 @@ fn read_nd_array_literal_and_equalp_roundtrip() {
             "(handler-case (read-from-string (format nil \"#~DA()\" array-rank-limit)) (reader-error () :reader-error) (error () :wrong-error))",
             ":READER-ERROR",
         ),
+        // The contents may be a packed (unsigned-byte 8) vector (syntax.sharp-a.8).
+        (
+            "(let ((v (read-from-string \"#1a#.(make-array 3 :element-type '(unsigned-byte 8) :initial-contents '(1 2 3))\"))) (list (typep v 'simple-vector) (equalp v #(1 2 3))))",
+            "(T T)",
+        ),
     ];
     for (expr, expected) in cases {
         let out = egcl_bin()
