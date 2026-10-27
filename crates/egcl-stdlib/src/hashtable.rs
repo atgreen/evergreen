@@ -11,7 +11,7 @@
 //! See spec §5.7.
 
 use std::collections::HashSet;
-use std::sync::Once;
+use std::sync::{Once, OnceLock};
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use egcl_rt::error::EgclError;
 use egcl_rt::lock_order::{LockLevel, OrderedMutex};
@@ -41,11 +41,16 @@ fn register_live_table(ptr: usize) {
         .insert(ptr);
 }
 
-/// GC external root scanner: yield every live hash table's entry key and value
-/// slots so the collector marks + relocates them. Runs while the collector holds
-/// the heap lock, so it only reads the table registry and each table's current
-/// [`Buckets`] — it never allocates on the GC heap.
+fn root_tracking_disabled() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var_os("EGCL_DISABLE_HASH_TABLE_ROOT_TRACKING").is_some())
+}
+
+/// Scan strong halves of dirty tables during minors, and all tables for full
+/// walks. The collector has stopped mutators; no Lisp allocation occurs here.
 fn scan_hash_table_roots(visit: &mut dyn FnMut(*mut EgclVal)) {
+    let kind = egcl_rt::gc::external_root_scan_kind();
+    let disabled = root_tracking_disabled();
     let guard = LIVE_TABLES.lock().unwrap();
     let Some(tables) = guard.as_ref() else {
         return;
@@ -56,24 +61,49 @@ fn scan_hash_table_roots(visit: &mut dyn FnMut(*mut EgclVal)) {
         // touches their buckets.
         unsafe {
             let inner = addr as *mut HashTableInner;
-            let weakness = (*inner).weakness;
-            // A WEAK half is deliberately not visited: yielding it here would
-            // make the table keep its own referent alive. The collector calls
-            // `process_weak_table_entries` instead, which relocates survivors and
-            // drops dead entries (R3.13).
-            let key_is_weak = matches!(weakness, Some(Weakness::Key | Weakness::KeyAndValue));
-            let value_is_weak = matches!(weakness, Some(Weakness::Value | Weakness::KeyAndValue));
-            for slot in buckets_mut(&mut (*inner).buckets).entries.iter_mut() {
-                if let Some(entry) = slot.as_mut() {
-                    if !key_is_weak {
-                        visit(&mut entry.key as *mut EgclVal);
-                    }
-                    if !value_is_weak {
-                        visit(&mut entry.value as *mut EgclVal);
-                    }
-                }
+            scan_table_roots(&mut *inner, kind, disabled, visit);
+        }
+    }
+}
+
+/// Called with exclusive writer access or the world stopped. Rebuilding or
+/// deleting buckets cannot introduce nursery references; only SET-GETHASH can.
+fn scan_table_roots(
+    inner: &mut HashTableInner,
+    kind: egcl_rt::gc::ExternalRootScanKind,
+    disabled: bool,
+    visit: &mut dyn FnMut(*mut EgclVal),
+) {
+    use egcl_rt::gc::ExternalRootScanKind::{Full, MinorRelocate};
+    if disabled || matches!(kind, Full) {
+        // Full walks include majors, snapshots and verification. Their visitor
+        // may change slots, so the next minor must conservatively inspect them.
+        inner.minor_roots_dirty = true;
+    } else if !inner.minor_roots_dirty {
+        return;
+    }
+    let weakness = inner.weakness;
+    // A WEAK half is deliberately not visited: yielding it here would
+    // make the table keep its own referent alive. The collector calls
+    // `process_weak_table_entries` instead, which relocates survivors and
+    // drops dead entries (R3.13).
+    let key_is_weak = matches!(weakness, Some(Weakness::Key | Weakness::KeyAndValue));
+    let value_is_weak = matches!(weakness, Some(Weakness::Value | Weakness::KeyAndValue));
+    for slot in buckets_mut(&mut inner.buckets).entries.iter_mut() {
+        if let Some(entry) = slot.as_mut() {
+            if !key_is_weak {
+                visit(&mut entry.key as *mut EgclVal);
+            }
+            if !value_is_weak {
+                visit(&mut entry.value as *mut EgclVal);
             }
         }
+    }
+    // Mark must not clear: relocation still needs the very same slots. Minor
+    // survivors are outside the nursery and need no further minor root visits
+    // until a mutator publishes another key/value. Full/disabled walks stay dirty.
+    if !disabled && matches!(kind, MinorRelocate) {
+        inner.minor_roots_dirty = false;
     }
 }
 
@@ -211,6 +241,9 @@ struct HashTableInner {
     /// The current [`Buckets`]: replaced, never edited, while readers may share it.
     buckets: AtomicPtr<Buckets>,
     count: usize,
+    /// Written only by exclusive mutators and STW root scanning. Read-side
+    /// rehashes preserve references and never touch this flag.
+    minor_roots_dirty: bool,
     rehash_size: f64,
     rehash_threshold: f64,
     synchronized: bool,
@@ -1160,6 +1193,7 @@ pub fn make_hash_table(options: &MakeHashTableOptions) -> Result<EgclVal, EgclEr
         test: options.test,
         buckets: AtomicPtr::new(Box::into_raw(Buckets::empty(capacity))),
         count: 0,
+        minor_roots_dirty: true,
         rehash_size: options.rehash_size,
         rehash_threshold: options.rehash_threshold,
         synchronized: options.synchronized,
@@ -1588,6 +1622,9 @@ pub fn set_gethash(key: EgclVal, table: EgclVal, value: EgclVal) -> Result<(), E
     // Safety: ptr is valid, non-null, and points to a leaked Box<HashTableInner>.
     // We create exactly one &mut reference from the raw pointer per call.
     let inner = unsafe { &mut *ptr };
+    // Both insertion and overwrite can publish nursery keys/values. Set this
+    // before any bucket write; this operation cannot collect or reach a safepoint.
+    inner.minor_roots_dirty = true;
     // A writer has the table to itself, so this places the buckets.
     placed_buckets(inner);
     // A key hashed by a movable object's address makes this table need
@@ -1873,6 +1910,56 @@ mod tests {
             *(body as *mut EgclVal).add(1) = cdr;
             EgclVal::from_cons_ptr(body)
         }
+    }
+
+    #[test]
+    fn minor_root_tracking_mark_relocate_full_and_weak_halves() {
+        use egcl_rt::gc::ExternalRootScanKind::{Full, MinorMark, MinorRelocate};
+        // No Lisp allocation: these entries are immediate and the local table
+        // is not registered, so simulated visitors cannot affect GC liveness.
+        let mut inner = HashTableInner {
+            header: ObjectHeader::new(type_id::HASH_TABLE, 0),
+            test: HashTest::Eq,
+            buckets: AtomicPtr::new(Box::into_raw(Buckets::empty(16))),
+            count: 1,
+            minor_roots_dirty: true,
+            rehash_size: 2.0,
+            rehash_threshold: 0.75,
+            synchronized: false,
+            weakness: None,
+            address_sensitive: false,
+            placement: AtomicU64::new(0),
+            lock: TableLock::new(),
+        };
+        buckets_mut(&mut inner.buckets).entries[0] = Some(RHEntry {
+            key: EgclVal::from_fixnum(1), value: EgclVal::from_fixnum(2), probe_dist: 0,
+        });
+        let scan = |inner: &mut HashTableInner, kind, disabled| {
+            let mut visits = 0;
+            scan_table_roots(inner, kind, disabled, &mut |_| visits += 1);
+            visits
+        };
+        assert_eq!(scan(&mut inner, MinorMark, false), 2);
+        assert!(inner.minor_roots_dirty, "mark must retain relocation work");
+        assert_eq!(scan(&mut inner, MinorRelocate, false), 2);
+        assert!(!inner.minor_roots_dirty);
+        assert_eq!(scan(&mut inner, MinorMark, false), 0);
+        assert_eq!(scan(&mut inner, MinorRelocate, false), 0);
+        assert_eq!(scan(&mut inner, Full, false), 2);
+        assert!(inner.minor_roots_dirty);
+        assert_eq!(scan(&mut inner, MinorRelocate, false), 2);
+        assert_eq!(scan(&mut inner, MinorMark, true), 2);
+        assert_eq!(scan(&mut inner, MinorRelocate, true), 2);
+        assert!(inner.minor_roots_dirty, "disabled tracking stays conservative");
+        for weakness in [Weakness::Key, Weakness::Value, Weakness::KeyAndValue] {
+            inner.weakness = Some(weakness);
+            let expected = if matches!(weakness, Weakness::KeyAndValue) { 0 } else { 1 };
+            assert_eq!(scan(&mut inner, MinorMark, false), expected);
+            assert_eq!(scan(&mut inner, MinorRelocate, false), expected);
+            assert_eq!(scan(&mut inner, Full, false), expected);
+        }
+        // No readers or registered scanner can retain these local buckets.
+        unsafe { drop(Box::from_raw(*inner.buckets.get_mut())); }
     }
 
     /// Two numbers EQUALP calls equal must land in the same bucket of an
