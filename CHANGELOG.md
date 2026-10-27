@@ -31,6 +31,10 @@
 
 ### Performance
 
+- Unchanged hash tables can skip repeated strong entry-root scans during minor
+  GC, while preserving full major and inspection scans and weak-entry cleanup
+  ([#711](https://github.com/atgreen/evergreen/pull/711)).
+
 - T2 on x86-64 Linux omits redundant implicit polls within guarded eight-byte
   stores, retaining precise moving-GC roots and interrupt checks before and
   after each bounded operation

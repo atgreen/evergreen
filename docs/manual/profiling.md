@@ -192,6 +192,37 @@ setup are not separately attributed. Use this log to locate work, then benchmark
 with both diagnostic flags unset; do not treat instrumented timings as an
 uninstrumented performance result.
 
+## Hash-table minor-root tracking { #hash-table-minor-roots }
+
+By default, EGCL tracks whether a hash table's off-heap entries need another
+minor-GC root traversal. Construction and `(SETF GETHASH)` mark the table dirty.
+Marking leaves it dirty; only a completed minor relocation traversal clears it.
+Unchanged tables can then skip their strong entry-root traversal until another
+write. Weak-entry cleanup still runs on every collection.
+
+This relies on the current minor collector collecting only the nursery:
+references into Survivor and OldGen regions are outside that collection.
+After minor relocation, surviving entry references no longer point into the
+nursery. This tracking changes neither reachability nor root-scan epochs.
+Major collections, snapshots, and verification retain full conservative scans
+and mark tables dirty again. Consequently, verification can prevent the skips
+that an ordinary run would make; do not expect identical scan counts with
+verification enabled.
+
+For a diagnostic comparison, `EGCL_DISABLE_HASH_TABLE_ROOT_TRACKING` restores
+full entry-root traversals. It caches presence on first use, so `=0` also
+**disables** tracking. Use fresh processes and the same binary for both arms,
+and leave GC timing logs unset when measuring performance:
+
+```sh
+env -u EGCL_GC_PHASE_LOG -u EGCL_GC_ROOT_PHASE_LOG \
+  -u EGCL_DISABLE_HASH_TABLE_ROOT_TRACKING scripts/egcl-limited.sh \
+  target/x86_64-unknown-linux-musl/release/egcl --no-init --load workload.lisp
+env -u EGCL_GC_PHASE_LOG -u EGCL_GC_ROOT_PHASE_LOG \
+  EGCL_DISABLE_HASH_TABLE_ROOT_TRACKING=1 scripts/egcl-limited.sh \
+  target/x86_64-unknown-linux-musl/release/egcl --no-init --load workload.lisp
+```
+
 ## Allocation and measurement discipline
 
 `room` measures Lisp-heap activity. Rust strings, vectors, hash maps, and other

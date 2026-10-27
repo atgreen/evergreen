@@ -1,5 +1,12 @@
 {
   "fast": {
+    "egcl-rt:lib:egcl_rt": ["gc::root_kind_tests::"],
+    "egcl-stdlib:lib:egcl_stdlib": ["hashtable::tests::minor_root_tracking_mark_relocate_full_and_weak_halves"],
+    "egcl-stdlib:test:hashtable_minor_roots": [""],
+    "egcl-stdlib:test:hashtable_gc": [""],
+    "egcl-stdlib:test:hashtable_large_gc": [""],
+    "egcl:test:hashtable_cli": [""],
+    "egcl:test:image_hash_keys": [""],
     "egcl:test:image_flet_helper_names": [""],
     "egcl:lib:egcl": ["cli::bytecode::self_calls::tests::notinline_", "cli::bytecode::native_transfer_tests::", "cli::bytecode::native_transfer_entry::ordinary_calls::tests::", "cli::bytecode::background_compile_tests::", "cli::bytecode::packed_u8_persistence_tests::", "cli::bytecode::native_transfer_entry::background_compilation::tests::", "cli::bytecode::jtc4_stack_map_tests::installed_cold_speculation_waits_for_real_evidence_after_failure", "cli::bytecode::jtc4_stack_map_tests::numeric_profile_candidates_include_integer_t2_operations"],
     "egcl:test:background_compilation_cli": [""],

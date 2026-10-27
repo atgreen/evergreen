@@ -10,6 +10,9 @@ mod minor_phase;
 use minor_phase::{MinorPhaseLog, Phase as MinorPhase};
 #[path = "gc_root_phase.rs"]
 mod root_phase;
+#[path = "gc_root_kind.rs"]
+mod root_kind;
+pub use root_kind::{ExternalRootScanKind, external_root_scan_kind};
 
 use crate::error::EgclError;
 use crate::image_relocation::ImageRelocations;
@@ -2431,7 +2434,7 @@ impl HeapCollector {
             mark_ref(v, &mut nursery_index, &mut mark_worklist);
         });
         root_phase::finish(root_clock, b"minor_mark_symbols", state.stats.minor_gc_count + 1, 0);
-        scan_external_mark_roots(|slot| {
+        scan_external_mark_roots(ExternalRootScanKind::MinorMark, |slot| {
             let v = unsafe { *slot };
             if tracing {
                 VERIFY_TRACE.with(|t| t.borrow_mut().mark.insert(slot as usize, v.0));
@@ -2824,7 +2827,7 @@ impl HeapCollector {
             }
         });
         root_phase::finish(root_clock, b"minor_relocate_symbols", state.stats.minor_gc_count + 1, 0);
-        scan_external_roots(|slot| unsafe {
+        scan_external_roots_with_kind(ExternalRootScanKind::MinorRelocate, |slot| unsafe {
             let before = (*slot).0;
             relocate_slot(slot, heap_base_addr, heap_end);
             if tracing {
@@ -3457,7 +3460,7 @@ impl HeapCollector {
         });
         // External roots (bliss-jtc.8): EgclVals owned outside the GC heap, e.g.
         // hash-table entries in a Rust Vec.
-        scan_external_mark_roots(|slot| {
+        scan_external_mark_roots(ExternalRootScanKind::Full, |slot| {
             let v = unsafe { *slot };
             mark_ref(v, &mut object_map, &mut scan_worklist);
         });
@@ -4309,7 +4312,7 @@ pub fn marking_external_roots() -> bool {
     MARKING_EXTERNAL_ROOTS.with(Cell::get)
 }
 
-fn scan_external_mark_roots(visit: impl FnMut(*mut EgclVal)) {
+fn scan_external_mark_roots(kind: ExternalRootScanKind, visit: impl FnMut(*mut EgclVal)) {
     #[cfg(debug_assertions)]
     struct Marking(bool);
     #[cfg(debug_assertions)]
@@ -4320,11 +4323,16 @@ fn scan_external_mark_roots(visit: impl FnMut(*mut EgclVal)) {
     }
     #[cfg(debug_assertions)]
     let _marking = Marking(MARKING_EXTERNAL_ROOTS.with(|slot| slot.replace(true)));
-    scan_external_roots(visit);
+    scan_external_roots_with_kind(kind, visit);
 }
 
 /// Invoke every registered external root scanner with `visit`.
-fn scan_external_roots(mut visit: impl FnMut(*mut EgclVal)) {
+fn scan_external_roots(visit: impl FnMut(*mut EgclVal)) {
+    scan_external_roots_with_kind(ExternalRootScanKind::Full, visit);
+}
+
+fn scan_external_roots_with_kind(kind: ExternalRootScanKind, mut visit: impl FnMut(*mut EgclVal)) {
+    let _kind = root_kind::Scope::enter(kind);
     SCAN_PASS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let scanners = root_scanners().lock().unwrap().clone();
     for s in scanners {
@@ -4345,6 +4353,7 @@ pub unsafe fn visit_shake_host_roots(
     excluded: &[RootScanner],
     visit: &mut dyn FnMut(*mut EgclVal),
 ) {
+    let _kind = root_kind::Scope::enter(ExternalRootScanKind::Full);
     advance_root_scan_pass();
     let scanners = root_scanners().lock().unwrap().clone();
     for scanner in scanners {
@@ -10441,3 +10450,7 @@ mod allocation_failure_message_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "gc_root_kind_tests.rs"]
+mod root_kind_tests;
