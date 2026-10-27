@@ -4,6 +4,10 @@
 
 ### Changed
 
+- T2 avoids impossible numeric speculation when inferred operand types prove
+  a nonnumeric value, reducing avoidable deoptimization and recompilation
+  ([#734](https://github.com/atgreen/evergreen/pull/734)).
+
 - T2 shares structural layout proofs with type inference and preserves Boolean
   type-predicate results and required checks across OSR entries
   ([#732](https://github.com/atgreen/evergreen/pull/732)).

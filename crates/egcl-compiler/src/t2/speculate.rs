@@ -2594,6 +2594,27 @@ mod tests {
         options: SpeculateOptions,
     ) {
         let (mut f, call) = call_with_inferred_boolean(name, arity, position);
+        if profile == SpecType::DoubleFloat {
+            // Use actual tagged DOUBLE-FLOAT variables beside the Boolean,
+            // so another constant/admission rule cannot explain the veto.
+            let params = f.block(f.entry()).params.clone();
+            for (index, &param) in params.iter().enumerate() {
+                if index != position {
+                    f.refine_type(param, IRType::of(TypeBits::DOUBLE_FLOAT));
+                    f.inst_mut(call).args[index] = param;
+                }
+            }
+            let args = f.inst(call).args.clone();
+            let state = f.inst(call).frame_state.unwrap();
+            f.frame_states.get_mut(state).scopes[0].stack = args
+                .into_iter()
+                .map(|value| crate::t2::frame_state::ValueSource::Value {
+                    value,
+                    repr: ValueRepresentation::Tagged,
+                })
+                .collect();
+            crate::t2::verify::verify(&f).unwrap();
+        }
         let original = format!("{:?}", f.inst(call));
         let state = f.inst(call).frame_state.unwrap();
         let original_state = format!("{:?}", f.frame_states.get(state));
@@ -2634,7 +2655,10 @@ mod tests {
     #[test]
     fn inferred_boolean_veto_covers_variadic_and_double_only_entrances() {
         for (name, arity, position) in [
+            ("+", 2, 0),
+            ("+", 2, 1),
             ("+", 3, 1),
+            ("+", 3, 2), // do not specialize a good prefix before seeing a bad tail
             ("SQRT", 1, 0),
             ("-", 1, 0),
             ("/", 2, 0),
@@ -2693,6 +2717,72 @@ mod tests {
             );
             crate::t2::verify::verify(&f).unwrap();
         }
+    }
+
+    #[test]
+    fn inferred_boolean_invoke_preserves_exceptional_projection_and_state() {
+        use crate::t2::ir::{BlockCall, InstData};
+        let (mut f, call) = call_with_inferred_boolean("+", 2, 0);
+        let entry = f.entry();
+        let returned = f.block_mut(entry).insts.pop().unwrap();
+        assert_eq!(f.inst(returned).opcode, Opcode::Return);
+        let normal = f.make_block();
+        let cold = f.make_block();
+        let result = f.add_block_param(normal, IRType::TOP, ValueRepresentation::Tagged);
+        let produced = f.inst(call).results[0];
+        let state = f.inst(call).frame_state.unwrap();
+        let invoke = f.inst_mut(call);
+        invoke.opcode = Opcode::Invoke;
+        invoke.flags.terminator = true;
+        invoke.targets = vec![
+            BlockCall {
+                block: normal,
+                args: vec![produced],
+            },
+            BlockCall {
+                block: cold,
+                args: vec![],
+            },
+        ];
+        let mut ret = f.inst(returned).clone();
+        ret.args = vec![result];
+        f.set_terminator(normal, ret);
+        let transfer = f.set_terminator(
+            cold,
+            InstData {
+                opcode: Opcode::NlxTransfer,
+                args: vec![],
+                results: vec![],
+                aux: AuxData::TransferSite {
+                    origin_bcp: 2,
+                    scopes: vec![],
+                },
+                flags: InstFlags {
+                    effectful: true,
+                    call: true,
+                    safepoint: true,
+                    ..Default::default()
+                },
+                targets: vec![],
+                frame_state: Some(state),
+                source_pos: 0,
+            },
+        );
+        crate::t2::verify::verify(&f).unwrap();
+        let original = format!("{:?}", f.inst(call));
+        let original_transfer = format!("{:?}", f.inst(transfer));
+        let original_state = format!("{:?}", f.frame_states.get(state));
+        let count = f.num_insts();
+        assert_eq!(speculate(&mut f, &|_| Some(SpecType::Fixnum)), 0);
+        assert_eq!(f.num_insts(), count);
+        assert_eq!(
+            format!("{:?}", f.inst(call)),
+            original,
+            "generic Invoke keeps both exact edge projections and all call effects"
+        );
+        assert_eq!(format!("{:?}", f.inst(transfer)), original_transfer);
+        assert_eq!(format!("{:?}", f.frame_states.get(state)), original_state);
+        crate::t2::verify::verify(&f).unwrap();
     }
 
 }
