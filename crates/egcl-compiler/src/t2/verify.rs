@@ -702,7 +702,7 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                             format!("block{bi} requires a guarded tagged store and its SSA witness")));
                     }
                 }
-                if data.opcode == Opcode::TryStoreIntegerOctets8 {
+                if matches!(data.opcode, Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8) {
                     use crate::t2::ir::{TypeBits, ValueRepresentation as Repr};
                     let valid = data.args.iter().chain(&data.results)
                         .all(|value| valid_values.contains(&value.0));
@@ -2212,27 +2212,51 @@ mod tests {
     }
     #[test]
     fn octet_word_store_requires_tagged_outputs_and_effectful_only_flags() {
-        for malformed in 0..5 {
-            let mut f = Function::new("octet-word-contract");
-            let entry = f.entry();
-            let args: Vec<_> = (0..4).map(|_| f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged)).collect();
-            let mut d = inst(Opcode::TryStoreIntegerOctets8);
-            d.args = args.clone();
-            d.flags.effectful = true;
-            let (i, values) = f.push_inst(entry, d, &[
-                (IRType::of(TypeBits::SYMBOL.join(TypeBits::NULL)), ValueRepresentation::Tagged),
-                (fixnum(), ValueRepresentation::Tagged),
-            ]);
-            f.set_terminator(entry, ret(vec![values[1]]));
-            match malformed {
-                0 => { verify(&f).unwrap(); continue; }
-                1 => f.inst_mut(i).flags.effectful = false,
-                2 => f.inst_mut(i).flags.call = true,
-                3 => f.set_repr(args[0], ValueRepresentation::UnboxedFixnum),
-                _ => { f.inst_mut(i).args.pop(); }
+        for opcode in [
+            Opcode::TryStoreIntegerOctets8,
+            Opcode::TryStoreIntegerOctets1To8,
+        ] {
+            for malformed in 0..5 {
+                let mut f = Function::new("octet-word-contract");
+                let entry = f.entry();
+                let args: Vec<_> = (0..4)
+                    .map(|_| f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged))
+                    .collect();
+                let mut d = inst(opcode);
+                d.args = args.clone();
+                d.flags.effectful = true;
+                let (i, values) = f.push_inst(
+                    entry,
+                    d,
+                    &[
+                        (
+                            IRType::of(TypeBits::SYMBOL.join(TypeBits::NULL)),
+                            ValueRepresentation::Tagged,
+                        ),
+                        (fixnum(), ValueRepresentation::Tagged),
+                    ],
+                );
+                f.set_terminator(entry, ret(vec![values[1]]));
+                match malformed {
+                    0 => {
+                        verify(&f).unwrap();
+                        continue;
+                    }
+                    1 => f.inst_mut(i).flags.effectful = false,
+                    2 => f.inst_mut(i).flags.call = true,
+                    3 => f.set_repr(args[0], ValueRepresentation::UnboxedFixnum),
+                    _ => {
+                        f.inst_mut(i).args.pop();
+                    }
+                }
+                let errors = verify(&f).unwrap_err();
+                assert!(
+                    errors
+                        .iter()
+                        .any(|e| e.check == "V8 octet-word-store-contract"),
+                    "{errors:?}"
+                );
             }
-            let errors = verify(&f).unwrap_err();
-            assert!(errors.iter().any(|e| e.check == "V8 octet-word-store-contract"), "{errors:?}");
         }
     }
 

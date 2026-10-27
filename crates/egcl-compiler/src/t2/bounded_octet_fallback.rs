@@ -37,10 +37,15 @@ fn integer(
     seen: &mut HashSet<Value>,
     seed: &mut bool,
     depth: usize,
+    visits_left: &mut usize,
 ) -> bool {
-    if depth > 64 {
+    // The active recursion set detects phi cycles, but a shared acyclic DAG
+    // can still revisit both operands exponentially. Bound total work across
+    // the entire proof, not just the depth of each path; exhaustion declines.
+    if depth > 64 || *visits_left == 0 {
         return false;
     }
+    *visits_left -= 1;
     let value = alias(f, value);
     if integer_constant(f, value).is_some()
         || (f.is_entry_param_checked(value) && f.value(value).ty.bits == TypeBits::FIXNUM)
@@ -65,9 +70,9 @@ fn integer(
                             .collect();
                         !edges.is_empty()
                             && edges.iter().all(|e| {
-                                e.args
-                                    .get(num as usize)
-                                    .is_some_and(|&v| integer(f, v, seen, seed, depth + 1))
+                                e.args.get(num as usize).is_some_and(|&v| {
+                                    integer(f, v, seen, seed, depth + 1, visits_left)
+                                })
                             })
                     })
                 })
@@ -85,9 +90,12 @@ fn integer(
                 let binary = operands(f, value, Opcode::FixnumAdd, "+")
                     .or_else(|| operands(f, value, Opcode::FixnumMul, "*"));
                 if let Some(args) = binary {
-                    args.len() == 2 && args.iter().all(|&v| integer(f, v, seen, seed, depth + 1))
+                    args.len() == 2
+                        && args
+                            .iter()
+                            .all(|&v| integer(f, v, seen, seed, depth + 1, visits_left))
                 } else if let Some(args) = standard(f, value, "1+") {
-                    args.len() == 1 && integer(f, args[0], seen, seed, depth + 1)
+                    args.len() == 1 && integer(f, args[0], seen, seed, depth + 1, visits_left)
                 } else {
                     false
                 }
@@ -138,7 +146,10 @@ pub(super) fn bounded(f: &Function, header: Block, body: &[Block], latch: Block)
     else {
         return false;
     };
-    if f.inst(kernel).opcode != Opcode::TryStoreIntegerOctets8 {
+    if !matches!(
+        f.inst(kernel).opcode,
+        Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8
+    ) {
         return false;
     }
     let Some(tail) = f.terminator(latch) else {
@@ -192,7 +203,7 @@ pub(super) fn bounded(f: &Function, header: Block, body: &[Block], latch: Block)
             continue;
         }
         let mut seed = false;
-        if !integer(f, start, &mut HashSet::new(), &mut seed, 0) || !seed {
+        if !integer(f, start, &mut HashSet::new(), &mut seed, 0, &mut 512) || !seed {
             continue;
         }
         // Only invariant header phis may be substituted with entry arguments.
@@ -477,6 +488,48 @@ mod tests {
         );
     }
     #[test]
+    fn repeated_ssa_dag_exhausts_one_shared_proof_budget() {
+        let mut f = Function::new("shared-integer-dag");
+        let entry = f.entry();
+        let mut value = constant(&mut f, entry, 1);
+        let fs = f.frame_states.add(FrameState {
+            scopes: vec![],
+            remat: vec![],
+        });
+        for _ in 0..4 {
+            value = call(&mut f, entry, "+", vec![value, value], fs);
+        }
+        let mut visits_left = 512;
+        let mut seed = false;
+        assert!(
+            integer(
+                &f,
+                value,
+                &mut HashSet::new(),
+                &mut seed,
+                0,
+                &mut visits_left
+            ) && seed
+        );
+        assert_eq!(visits_left, 512 - 31);
+        // Only 17 SSA operations, but tree traversal would make 262143 visits.
+        // The depth bound alone would permit that work (and much larger DAGs).
+        for _ in 4..17 {
+            value = call(&mut f, entry, "*", vec![value, value], fs);
+        }
+        let mut visits_left = 512;
+        let mut seed = false;
+        assert!(!integer(
+            &f,
+            value,
+            &mut HashSet::new(),
+            &mut seed,
+            0,
+            &mut visits_left
+        ));
+        assert_eq!(visits_left, 0, "work is bounded over the full proof");
+    }
+    #[test]
     fn nested_integer_phi_arithmetic_proves_dynamic_octet_start() {
         let mut f = Function::new("dynamic-octet-start");
         let entry = f.entry();
@@ -521,12 +574,12 @@ mod tests {
         let next_i = call(&mut f, outer_back, "1+", vec![i], fs);
         jump(&mut f, outer_back, outer, vec![next_i]);
         let mut seed = false;
-        assert!(integer(&f, start, &mut HashSet::new(), &mut seed, 0) && seed);
+        assert!(integer(&f, start, &mut HashSet::new(), &mut seed, 0, &mut 512) && seed);
         let term = f.terminator(entry).unwrap();
         f.inst_mut(term).targets[0].args[0] = unknown;
         let mut seed = false;
         assert!(
-            !integer(&f, start, &mut HashSet::new(), &mut seed, 0),
+            !integer(&f, start, &mut HashSet::new(), &mut seed, 0, &mut 512),
             "an unknown seed can be a nonprogressing float"
         );
     }

@@ -431,14 +431,14 @@ fn windows_t2_stack_probe_preserves_four_compiled_arguments() {
 
 #[test]
 #[cfg(target_os = "linux")]
-fn large_cyclic_home_moves_probe_the_snapshot_stack_pages() {
+fn large_snapshot_fallback_probes_the_stack_pages() {
     use iced_x86::{Decoder, DecoderOptions, Mnemonic, Register};
     let moves: Vec<_> = (0..1030).map(|index| (
         FramedHome::Stack(index),
         HomeMoveSrc::Home(FramedHome::Stack((index + 1) % 1030)),
     )).collect();
     let mut asm = Asm::new();
-    parallel_home_move(&mut asm, &moves);
+    parallel_home_move_snapshot(&mut asm, &moves);
     let bytes = asm.finish().unwrap();
     let mut decoder = Decoder::new(64, &bytes, DecoderOptions::NONE);
     let mut reserved = 0;

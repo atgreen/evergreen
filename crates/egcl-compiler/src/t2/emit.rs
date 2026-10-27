@@ -198,7 +198,7 @@ fn redundant_bounded_cycle_polls(
         }
         let kernel = f.inst(body[body.len() - 2]);
         let branch = f.inst(body[body.len() - 1]);
-        if kernel.opcode != Opcode::TryStoreIntegerOctets8
+        if !matches!(kernel.opcode, Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8)
             || kernel.args.len() != 4
             || kernel.results.len() != 2
             || !kernel.flags.effectful
@@ -240,7 +240,7 @@ fn redundant_bounded_cycle_polls(
         // still remove the success-entry check.
         if body[..body.len() - 2].iter().any(|&inst| {
             let d = f.inst(inst);
-            d.opcode == Opcode::TryStoreIntegerOctets8
+            matches!(d.opcode, Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8)
                 || !d.targets.is_empty()
                 || d.flags.terminator
         }) {
@@ -5675,7 +5675,7 @@ fn emit_transfer_function_with_storage(
                     | Opcode::StringCharOrNil
                     | Opcode::VecRef | Opcode::VecSet | Opcode::VecSetInRange | Opcode::ArrayReadDiscarded | Opcode::PackedF64P
                     | Opcode::MemoryFence | Opcode::TryIntegerShr | Opcode::SmallVectorRangeP
-                    | Opcode::TryStoreIntegerOctets8 | Opcode::NativePoll
+                    | Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8 | Opcode::NativePoll
             ) {
                 return Err(EmitError::UnsupportedOp(op_tag(f.inst(inst).opcode)));
             }
@@ -6890,7 +6890,7 @@ fn emit_framed_inner(
                             | Opcode::TakeValuesToLocals
                             | Opcode::MemoryFence
                             | Opcode::TryIntegerShr
-                            | Opcode::TryStoreIntegerOctets8
+                            | Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8
                             | Opcode::NativePoll
                             | Opcode::SmallVectorRangeP
                             | Opcode::TryPackedF64Set
@@ -7506,7 +7506,7 @@ fn emit_framed_inner(
             });
             let (mut inst_reg, result_stores) = if stack_float.is_some()
                 || d.opcode == Opcode::TakeValuesToLocals
-                || d.opcode == Opcode::TryStoreIntegerOctets8
+                || matches!(d.opcode, Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8)
                 || d.opcode == Opcode::Invoke
                 || matches!(
                     d.opcode,
@@ -7895,7 +7895,7 @@ fn emit_framed_inner(
                         const_tagged.get(&d.args[1]).copied(), label);
                 }
                 a.bind(done);
-            } else if d.opcode == Opcode::TryStoreIntegerOctets8 {
+            } else if matches!(d.opcode, Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8) {
                 octet_word_store::emit_framed(&mut a, f, &d, &homes, &const_tagged)?;
             } else if d.opcode == Opcode::TryIntegerShr {
                 integer_shift::emit(&mut a, &d, &inst_reg, &const_tagged)?;

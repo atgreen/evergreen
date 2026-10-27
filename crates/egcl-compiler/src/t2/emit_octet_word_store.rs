@@ -1,15 +1,18 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-//! Checked, noncollecting eight-octet store. No call, poll, allocation or raw
-//! pointer escapes this template. The sole payload write follows every check.
+//! Checked, noncollecting one-to-eight-octet stores. No call, poll, allocation
+//! or raw pointer escapes. Every payload write follows complete validation.
 
 use super::*;
+use crate::t2::ir::Opcode;
 
 fn invalid_shape(f: &Function, data: &crate::t2::ir::InstData) -> bool {
     use crate::t2::ir::{AuxData, InstFlags, Opcode, ValueRepresentation as Repr};
-    data.opcode != Opcode::TryStoreIntegerOctets8
-        || data.args.len() != 4
+    !matches!(
+        data.opcode,
+        Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8
+    ) || data.args.len() != 4
         || data.results.len() != 2
         || !matches!(data.aux, AuxData::None)
         || data.flags
@@ -62,7 +65,12 @@ pub(super) fn emit(
             push_reg(a, reg[input]);
         }
     }
-    emit_body(a, success_dst, final_dst)
+    emit_body(
+        a,
+        success_dst,
+        final_dst,
+        data.opcode == Opcode::TryStoreIntegerOctets1To8,
+    )
 }
 
 /// Materialize operands directly from canonical native homes. Four spilled
@@ -88,7 +96,12 @@ pub(super) fn emit_framed(
         }
         push_reg(a, RAX);
     }
-    emit_body(a, RAX, SCRATCH)?;
+    emit_body(
+        a,
+        RAX,
+        SCRATCH,
+        data.opcode == Opcode::TryStoreIntegerOctets1To8,
+    )?;
     for (&value, source) in data.results.iter().zip([RAX, SCRATCH]) {
         if let Some(&home) = homes.get(&value) {
             store_home(a, home, source, 0);
@@ -97,12 +110,13 @@ pub(super) fn emit_framed(
     Ok(())
 }
 
-fn emit_body(a: &mut Asm, success_dst: u8, final_dst: u8) -> Result<(), EmitError> {
+fn emit_body(a: &mut Asm, success_dst: u8, final_dst: u8, partial: bool) -> Result<(), EmitError> {
     const RSP: u8 = 4;
     alu_r_imm(a, 5, RSP, 24);
     // Fixed stack: raw word/result flag +0, final FX +8, body/slot +16,
     // integer +24, end +32, start +40, array +48. Every exit restores 56 bytes.
     let failed = a.label();
+    let short = a.label();
     let fixnum = a.label();
     let positive = a.label();
     let negative = a.label();
@@ -190,7 +204,7 @@ fn emit_body(a: &mut Asm, success_dst: u8, final_dst: u8) -> Result<(), EmitErro
     alu_r_imm(a, 0, SCRATCH, 8 << 3);
     a.jcc(Cc::O, failed);
     cmp_rr(a, RAX, SCRATCH);
-    a.jcc(Cc::Ne, failed);
+    a.jcc(Cc::Ne, if partial { short } else { failed });
     sar_imm(a, RAX, 3);
     load_from_rsp(a, SCRATCH, 16);
     // Runtime packed allocation bounds length below isize::MAX. Equal end is
@@ -208,6 +222,51 @@ fn emit_body(a: &mut Asm, success_dst: u8, final_dst: u8) -> Result<(), EmitErro
     mov_imm64(a, RAX, egcl_rt::value::T.to_raw() as i64);
     store_to_rsp(a, RAX, 0);
     a.jmp(done);
+    if partial {
+        a.bind(short);
+        // End and start are tagged fixnums; start is already nonnegative.
+        // Require an increasing short span before SUB, so difference cannot
+        // overflow. Complete ALL bounds checks before borrowing RCX/writing.
+        load_from_rsp(a, RAX, 32);
+        load_from_rsp(a, SCRATCH, 40);
+        cmp_rr(a, RAX, SCRATCH);
+        a.jcc(Cc::Le, failed);
+        alu_rr(a, 0x29, RAX, SCRATCH);
+        alu_r_imm(a, 7, RAX, 7 << 3);
+        a.jcc(Cc::G, failed);
+        store_to_rsp(a, RAX, 32); // private end copy becomes tagged byte count
+        load_from_rsp(a, RAX, 32);
+        load_from_rsp(a, SCRATCH, 40);
+        alu_rr(a, 0x01, RAX, SCRATCH);
+        sar_imm(a, RAX, 3);
+        load_from_rsp(a, SCRATCH, 16);
+        cmp_mem64_disp8(a, RAX, SCRATCH, 8);
+        a.jcc(Cc::G, failed);
+        load_from_rsp(a, RAX, 40);
+        sar_imm(a, RAX, 3);
+        alu_rr(a, 0x01, SCRATCH, RAX);
+        alu_r_imm(a, 0, SCRATCH, 16); // reserved RDX is the byte cursor
+        push_reg(a, 1); // RCX may be a live canonical home: partial path only
+        load_from_rsp(a, 1, 16); // previous ASH64 tagged result, stack +8
+        sar_imm(a, 1, 3); // high word: zero or all ones
+        load_from_rsp(a, RAX, 8); // raw low word, stack +8
+        let again = a.label();
+        a.bind(again);
+        a.extend_from_slice(&[0x88, 0x02]); // mov byte [rdx],al
+        a.extend_from_slice(&[0x48, 0x0f, 0xac, 0xc8, 8]); // shrd rax,rcx,8
+        a.extend_from_slice(&[0x48, 0xff, 0xc2]); // inc rdx
+        a.extend_from_slice(&[0x48, 0x83, 0x6c, 0x24, 40, 8]); // sub count,tagged1
+        a.jcc(Cc::Ne, again);
+        shl_imm(a, RAX, 3); // any canonical one-limb integer >>8 fits fixnum
+        store_to_rsp(a, RAX, 16); // final FX, stack +8
+        a.extend_from_slice(&[0x59]); // pop rcx: restore unrelated live home
+        mov_imm64(a, RAX, egcl_rt::value::T.to_raw() as i64);
+        store_to_rsp(a, RAX, 0);
+        a.jmp(done);
+    } else {
+        // Keep the otherwise-unused label bound without adding bytes.
+        a.bind(short);
+    }
     a.bind(failed);
     mov_imm64(a, RAX, egcl_rt::value::NIL.to_raw() as i64);
     store_to_rsp(a, RAX, 0);
@@ -227,12 +286,19 @@ mod tests {
     use crate::t2::ir::{
         AuxData, IRType, InstData, InstFlags, Opcode, TypeBits, ValueRepresentation,
     };
-    use egcl_rt::object::{ElementTypeTag, ObjectHeader, type_id};
+    use egcl_rt::object::{type_id, ElementTypeTag, ObjectHeader};
     use egcl_rt::value::{EgclVal, NIL, T};
     use iced_x86::{Decoder, DecoderOptions, Mnemonic, OpKind, Register};
     use std::collections::HashMap;
 
     fn kernel(outputs: [u8; 2], constants: [Option<u64>; 4]) -> egcl_rt::jit::JitBuffer {
+        kernel_opcode(outputs, constants, Opcode::TryStoreIntegerOctets8)
+    }
+    fn kernel_opcode(
+        outputs: [u8; 2],
+        constants: [Option<u64>; 4],
+        opcode: Opcode,
+    ) -> egcl_rt::jit::JitBuffer {
         let mut f = Function::new("try-store-eight-octets-kernel");
         let block = f.entry();
         let args: Vec<_> = (0..4)
@@ -241,7 +307,7 @@ mod tests {
         let (inst, result) = f.push_inst(
             block,
             InstData {
-                opcode: Opcode::TryStoreIntegerOctets8,
+                opcode,
                 args: args.clone(),
                 results: vec![],
                 aux: AuxData::None,
@@ -315,33 +381,50 @@ mod tests {
             .into_iter()
             .collect();
         assert!(
-            decoded.len() <= 256,
+            decoded.len()
+                <= if opcode == Opcode::TryStoreIntegerOctets8 {
+                    256
+                } else {
+                    320
+                },
             "bounded straight-line word kernel: {} instructions",
             decoded.len()
         );
-        assert!(
-            decoded
-                .iter()
-                .all(|i| i.mnemonic() != Mnemonic::Call && !i.is_invalid())
-        );
-        assert!(
-            decoded
-                .iter()
-                .filter(|i| matches!(
-                    i.op0_kind(),
-                    OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64
-                ))
-                .all(|i| i.near_branch_target() > i.ip()),
-            "the word kernel must not hide a byte loop"
-        );
-        assert_eq!(
-            decoded
-                .iter()
-                .filter(|i| i.op0_kind() == OpKind::Memory && i.memory_base() == Register::RDX)
-                .count(),
-            1,
-            "exactly one payload store"
-        );
+        assert!(decoded
+            .iter()
+            .all(|i| i.mnemonic() != Mnemonic::Call && !i.is_invalid()));
+        if opcode == Opcode::TryStoreIntegerOctets8 {
+            assert!(
+                decoded
+                    .iter()
+                    .filter(|i| matches!(
+                        i.op0_kind(),
+                        OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64
+                    ))
+                    .all(|i| i.near_branch_target() > i.ip()),
+                "the word kernel must not hide a byte loop"
+            );
+            assert_eq!(
+                decoded
+                    .iter()
+                    .filter(|i| i.op0_kind() == OpKind::Memory && i.memory_base() == Register::RDX)
+                    .count(),
+                1,
+                "exactly one payload store"
+            );
+        } else {
+            assert_eq!(
+                decoded
+                    .iter()
+                    .filter(|i| matches!(
+                        i.op0_kind(),
+                        OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64
+                    ) && i.near_branch_target() < i.ip())
+                    .count(),
+                1,
+                "one bounded partial loop"
+            );
+        }
         egcl_rt::jit::JitBuffer::new(&bytes).unwrap()
     }
 
@@ -623,6 +706,19 @@ mod tests {
         aliases: bool,
         dead_final: bool,
     ) -> egcl_rt::jit::JitBuffer {
+        framed_kernel_opcode(
+            constants,
+            aliases,
+            dead_final,
+            Opcode::TryStoreIntegerOctets8,
+        )
+    }
+    fn framed_kernel_opcode(
+        constants: [Option<u64>; 4],
+        aliases: bool,
+        dead_final: bool,
+        opcode: Opcode,
+    ) -> egcl_rt::jit::JitBuffer {
         let mut f = Function::new("octet-word-all-spilled-native-homes");
         let block = f.entry();
         let args: Vec<_> = (0..4)
@@ -631,7 +727,7 @@ mod tests {
         let (inst, results) = f.push_inst(
             block,
             InstData {
-                opcode: Opcode::TryStoreIntegerOctets8,
+                opcode,
                 args: args.clone(),
                 results: vec![],
                 aux: AuxData::None,
@@ -719,11 +815,9 @@ mod tests {
         alu_r_imm(&mut a, 0, 4, 96);
         a.extend_from_slice(&[0xc3]);
         let bytes = a.finish().unwrap();
-        assert!(
-            Decoder::new(64, &bytes, DecoderOptions::NONE)
-                .into_iter()
-                .all(|i| i.mnemonic() != Mnemonic::Call && !i.is_invalid())
-        );
+        assert!(Decoder::new(64, &bytes, DecoderOptions::NONE)
+            .into_iter()
+            .all(|i| i.mnemonic() != Mnemonic::Call && !i.is_invalid()));
         egcl_rt::jit::JitBuffer::new(&bytes).unwrap()
     }
 
@@ -767,5 +861,157 @@ mod tests {
                 }
             }
         }
+    }
+    fn partial_image(o: &Octets, start: usize, raw: u64, n: usize) -> Vec<u64> {
+        let mut expected = o.words.clone();
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(expected.as_mut_ptr().cast::<u8>(), expected.len() * 8)
+        };
+        bytes[o.data_offset + start..o.data_offset + start + n]
+            .copy_from_slice(&raw.to_le_bytes()[..n]);
+        expected
+    }
+    #[test]
+    fn native_partial_octets_cover_all_spans_signs_layouts_and_output_aliases() {
+        for outputs in [[8, RAX], [7, 6], [1, 9], [RAX, SCRATCH], [SCRATCH, RAX]] {
+            let code = kernel_opcode(outputs, [None; 4], Opcode::TryStoreIntegerOctets1To8);
+            for large in [false, true] {
+                let mut o = Octets::new(if large { 600000 } else { 32 }, large);
+                for n in 1..=8 {
+                    for start in [0, 1, o.length - n] {
+                        for value in [
+                            egcl_rt::bignum::FIXNUM_MIN,
+                            -257,
+                            -1,
+                            0,
+                            255,
+                            egcl_rt::bignum::FIXNUM_MAX,
+                        ] {
+                            let before = partial_image(&o, start, value as u64, n);
+                            let shifted = ((value as i128) >> (8 * n)) as i64;
+                            assert_eq!(
+                                run(
+                                    &code,
+                                    [
+                                        o.tagged(),
+                                        fx(start as i64),
+                                        fx((start + n) as i64),
+                                        fx(value)
+                                    ]
+                                ),
+                                [T.to_raw(), fx(shifted)]
+                            );
+                            assert_eq!(o.words, before);
+                        }
+                        for magnitude in [(1u64 << 60) + 1, 1u64 << 63, u64::MAX] {
+                            for sign in [-1, 1] {
+                                let mut integer = Integer::new(sign, magnitude);
+                                let value = (magnitude as i128) * (sign as i128);
+                                let before = partial_image(&o, start, value as u64, n);
+                                assert_eq!(
+                                    run(
+                                        &code,
+                                        [
+                                            o.tagged(),
+                                            fx(start as i64),
+                                            fx((start + n) as i64),
+                                            integer.tagged()
+                                        ]
+                                    ),
+                                    [T.to_raw(), fx((value >> (8 * n)) as i64)]
+                                );
+                                assert_eq!(
+                                    o.words, before,
+                                    "prefix/suffix/header retained, negative high-word correct"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn native_partial_octets_reject_unsupported_spans_and_values_without_writes() {
+        let code = kernel_opcode([RAX, SCRATCH], [None; 4], Opcode::TryStoreIntegerOctets1To8);
+        let mut o = Octets::new(32, false);
+        let array = o.tagged();
+        let mut wide = Integer::new(1, u64::MAX);
+        wide.count = 2;
+        for args in [
+            [array, fx(1), fx(1), fx(7)],
+            [array, fx(2), fx(1), fx(7)],
+            [array, fx(0), fx(9), fx(7)],
+            [array, fx(-1), fx(3), fx(7)],
+            [array, fx(30), fx(33), fx(7)],
+            [array, NIL.to_raw(), fx(3), fx(7)],
+            [array, fx(0), T.to_raw(), fx(7)],
+            [array, fx(0), fx(3), NIL.to_raw()],
+            [array, fx(0), fx(3), wide.tagged()],
+            [NIL.to_raw(), fx(0), fx(3), fx(7)],
+        ] {
+            let before = o.words.clone();
+            assert_eq!(run(&code, args), [NIL.to_raw(), fx(0)]);
+            assert_eq!(o.words, before);
+        }
+    }
+    #[test]
+    fn native_partial_direct_homes_keep_spills_constants_and_dead_result() {
+        for aliases in [false, true] {
+            for dead in [false, true] {
+                let code = framed_kernel_opcode(
+                    [None, Some(fx(1)), None, Some(fx(-257))],
+                    aliases,
+                    dead,
+                    Opcode::TryStoreIntegerOctets1To8,
+                );
+                let mut o = Octets::new(24, false);
+                let before = partial_image(&o, 1, (-257i64) as u64, 3);
+                let result = run(&code, [o.tagged(), NIL.to_raw(), fx(4), NIL.to_raw()]);
+                assert_eq!(result[0], T.to_raw());
+                if !dead {
+                    assert_eq!(result[1], fx(-1));
+                }
+                assert_eq!(o.words, before);
+            }
+        }
+    }
+    #[test]
+    fn new_full_word_path_keeps_old_instruction_shape_before_cold_partial_handler() {
+        fn full_prefix(partial: bool) -> Vec<(iced_x86::Code, String)> {
+            let mut a = Asm::new();
+            super::emit_body(&mut a, RAX, SCRATCH, partial).unwrap();
+            let bytes = a.finish().unwrap();
+            let mut shape = Vec::new();
+            for i in Decoder::new(64, &bytes, DecoderOptions::NONE) {
+                let branch = matches!(
+                    i.op0_kind(),
+                    OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64
+                );
+                shape.push((
+                    i.code(),
+                    if branch {
+                        String::new()
+                    } else {
+                        format!("{i:?}")
+                    },
+                ));
+                if i.mnemonic() == Mnemonic::Mov
+                    && i.op0_kind() == OpKind::Memory
+                    && i.memory_base() == Register::RDX
+                {
+                    break;
+                }
+            }
+            shape
+        }
+        let old = full_prefix(false);
+        let new = full_prefix(true);
+        // Debug instruction includes IP/next-IP, which are identical on this
+        // prefix: only direct relative branch target immediates are excluded.
+        assert_eq!(
+            old, new,
+            "no extra executed full-eight validation instructions"
+        );
     }
 }
