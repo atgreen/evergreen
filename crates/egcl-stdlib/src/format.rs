@@ -3194,6 +3194,7 @@ fn render_block(
                         NewlineKind::Mandatory => true,
                         NewlineKind::Linear => linear,
                         NewlineKind::Miser => miser,
+                        NewlineKind::Fill if miser => linear,
                         NewlineKind::Fill => {
                             state.lines > section_line
                                 || section_end_column(&events[index + 1..], state.column, section)
