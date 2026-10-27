@@ -27,6 +27,10 @@
 
 ### Performance
 
+- Root inventory walks avoid duplicate traversal of shared bytecode bodies
+  and captured environment frames while preserving distinct callable owners
+  ([#708](https://github.com/atgreen/evergreen/pull/708)).
+
 - T2 on x86-64 Linux omits redundant implicit polls within guarded eight-byte
   stores, retaining precise moving-GC roots and interrupt checks before and
   after each bounded operation

@@ -145,6 +145,18 @@ measurement overhead and makes no hard real-time guarantee. On Linux,
 soft-dirty tracking can cause first-write page faults during later execution;
 that system-time cost falls outside the recorded collection pause.
 
+## Root traversal comparison { #root-visit-sharing }
+
+Bytecode root inventory walks share visitation state for repeated code bodies
+and captured environment frames by default. Public and owner-specific walks
+start fresh contexts; this changes no global GC epoch or phase boundary.
+
+For a diagnostic comparison, start a fresh process with
+`EGCL_DISABLE_ROOT_VISIT_SHARING=1` to restore repeated traversal. This flag is
+cached on first use and checks presence, so `=0` also disables sharing. Leave
+it unset for the default behavior, and compare the same binary and workload
+in separate processes. The flag changes traversal work, not the required roots.
+
 ## Allocation and measurement discipline
 
 `room` measures Lisp-heap activity. Rust strings, vectors, hash maps, and other
