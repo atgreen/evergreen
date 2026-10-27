@@ -16,10 +16,11 @@
 //!
 //! **Input:** a well-formed `Function`. A guard is an instruction with the
 //! `guard` flag; it carries a `FrameState`, checks `args[0]`, and may define
-//! a refined result that passes the operand through. Its proof is either a
-//! type (`AuxData::TypeTag`) or a layout refinement (`AuxData::StringLayout`);
+//! a refined result that passes the operand through. Reusable proofs are either
+//! a type (`AuxData::TypeTag`) or a layout refinement (`AuxData::StringLayout`);
 //! the two are distinct `GuardKind`s, because knowing a value is a string
-//! does not prove it has a directly addressable simple layout.
+//! does not prove it has a directly addressable simple layout. Semantic guards
+//! such as `AuxData::EndpList` remain ordered and are not discharged here.
 //!
 //! **Output:** removed guards are unlinked from their block (arena entries
 //! stay, unreferenced). Every result a removed guard defined is forwarded to
@@ -69,8 +70,8 @@
 //!
 //! # Limits
 //!
-//! * Transform 1 handles `TypeTag` guards only; layout guards are never
-//!   proven by inference.
+//! * Transform 1 handles `TypeTag` guards only; layout guards and ENDP's
+//!   closure-excluding semantic list guard are never proven by inference.
 //! * No guard is hoisted out of a loop that lacks a ready-made preheader;
 //!   LICM can synthesise one but is not in the production pipeline.
 //! * Duplicate detection is pairwise over all guards (quadratic in guard
@@ -1719,6 +1720,63 @@ mod tests {
         assert!(
             survivor_in_entry,
             "the dominating guard must be the survivor"
+        );
+    }
+
+    #[test]
+    fn inferred_cons_does_not_remove_endp_semantic_guard() {
+        // An interpreter closure is cons-tagged too, so inferred CONS does not
+        // prove that ENDP may safely answer NIL.  This guard must survive even
+        // though an ordinary TypeTag(CONS|NULL) guard would be redundant.
+        let mut f = Function::new("endp-semantic-guard");
+        let entry = f.entry();
+        let cons = f.add_block_param(
+            entry,
+            IRType::of(TypeBits::CONS),
+            ValueRepresentation::Tagged,
+        );
+        let state = f.frame_states.add(FrameState {
+            scopes: vec![FrameScope {
+                function: 0,
+                bcp: 1,
+                locals: vec![],
+                stack: vec![ValueSource::Value {
+                    value: cons,
+                    repr: ValueRepresentation::Tagged,
+                }],
+            }],
+            remat: vec![],
+        });
+        let (guard, guarded) = f.push_inst(
+            entry,
+            InstData {
+                args: vec![cons],
+                aux: AuxData::EndpList,
+                flags: InstFlags {
+                    guard: true,
+                    effectful: true,
+                    ..InstFlags::default()
+                },
+                frame_state: Some(state),
+                ..base(Opcode::Guard)
+            },
+            &[(
+                IRType::of(TypeBits::CONS.join(TypeBits::NULL)),
+                ValueRepresentation::Tagged,
+            )],
+        );
+        f.set_terminator(
+            entry,
+            InstData {
+                args: vec![guarded[0]],
+                ..ret()
+            },
+        );
+
+        run(&mut f);
+        assert!(
+            f.block(entry).insts.contains(&guard),
+            "ENDP's closure exclusion is stronger than a type-lattice proof"
         );
     }
 

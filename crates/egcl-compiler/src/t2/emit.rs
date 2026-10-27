@@ -3857,11 +3857,10 @@ fn emit_list_guard(
     pool: &mut Vec<u8>,
     deopt: egcl_rt::asm::Label,
 ) -> Result<(), EmitError> {
-    use crate::t2::ir::{AuxData, Opcode, TypeBits};
-    let list = TypeBits::CONS.join(TypeBits::NULL);
+    use crate::t2::ir::{AuxData, Opcode};
     if data.args.len() != 1
         || data.results.len() != 1
-        || !matches!(data.aux, AuxData::TypeTag(t) if t.bits == list)
+        || !matches!(data.aux, AuxData::EndpList)
         || !data.flags.guard
         || !data.flags.effectful
         || data.frame_state.is_none()
@@ -8172,9 +8171,7 @@ fn emit_framed_inner(
                     AuxData::TypeTag(t) if t.bits == TypeBits::CONS => {
                         emit_cons_guard(&mut a, &d, &mut inst_reg, &mut inst_pool, label)?
                     }
-                    AuxData::TypeTag(t)
-                        if t.bits == TypeBits::CONS.join(TypeBits::NULL) =>
-                    {
+                    AuxData::EndpList => {
                         emit_list_guard(&mut a, &d, &mut inst_reg, &mut inst_pool, label)?
                     }
                     AuxData::TypeTag(t) if t.bits == TypeBits::FIXNUM => {

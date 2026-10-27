@@ -1069,7 +1069,7 @@ impl Emitter<'_> {
             .ok_or(EmitError::UnsupportedOp(op_tag(data.opcode)))?;
         self.load(first, W0)?;
         match data.opcode {
-            Guard if matches!(&data.aux, AuxData::TypeTag(ty) if ty.bits == TypeBits::FIXNUM || ty.bits == TypeBits::SINGLE_FLOAT || ty.bits == TypeBits::CONS || ty.bits == TypeBits::CONS.join(TypeBits::NULL)) =>
+            Guard if matches!(&data.aux, AuxData::TypeTag(ty) if ty.bits == TypeBits::FIXNUM || ty.bits == TypeBits::SINGLE_FLOAT || ty.bits == TypeBits::CONS) || matches!(&data.aux, AuxData::EndpList) =>
             {
                 // CONS matters as much as the numeric tags: build.rs emits a
                 // separate Guard(TypeTag(CONS)) ahead of every Car/Cdr, so
@@ -1091,7 +1091,7 @@ impl Emitter<'_> {
                         self.guard_fixnum_range(ty, deopt)?;
                     }
                     AuxData::TypeTag(ty) if ty.bits == TypeBits::CONS => self.guard_cons(W0, deopt),
-                    AuxData::TypeTag(ty) if ty.bits == TypeBits::CONS.join(TypeBits::NULL) => {
+                    AuxData::EndpList => {
                         self.guard_list(W0, deopt)?
                     }
                     _ => self.guard_single_float(W0, deopt),

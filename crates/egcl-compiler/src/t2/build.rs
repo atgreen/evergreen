@@ -3209,7 +3209,7 @@ impl<'a> Builder<'a> {
                     block,
                     Opcode::Guard,
                     vec![value],
-                    AuxData::TypeTag(list),
+                    AuxData::EndpList,
                     InstFlags {
                         effectful: true,
                         guard: true,
@@ -4780,8 +4780,7 @@ mod tests {
             .find(|data| {
                 matches!(
                     data.aux,
-                    AuxData::TypeTag(ty)
-                        if ty.bits == TypeBits::CONS.join(TypeBits::NULL)
+                    AuxData::EndpList
                 )
             })
             .expect("ENDP must guard NIL-or-data-cons before comparing with NIL");

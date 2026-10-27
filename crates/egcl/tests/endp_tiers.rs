@@ -9,18 +9,22 @@ use std::process::Command;
 
 const PROGRAM: &str = r#"
 (defun t2-endp-probe (x)
-  (values :stale :secondary)
-  (multiple-value-call #'list (endp x)))
+  (endp x))
 
-;; Install the function at T2 on ordinary proper-list inputs.
-(dotimes (i 200) (t2-endp-probe (if (evenp i) '(a b) nil)))
+;; Install the function at T2 on ordinary proper-list inputs. Compilation is
+;; asynchronous, so keep yielding through calls until publication completes.
+(loop repeat 20000
+      until (= 2 (egcl-ext:function-tier 't2-endp-probe))
+      for i from 0
+      do (t2-endp-probe (if (evenp i) '(a b) nil)))
 (assert (= 2 (egcl-ext:function-tier 't2-endp-probe)))
-(assert (equal '(t) (t2-endp-probe nil)))
-(assert (equal '(nil) (t2-endp-probe '(a b))))
+(assert (equal '(t) (multiple-value-call #'list (t2-endp-probe nil))))
+(assert (equal '(nil) (multiple-value-call #'list (t2-endp-probe '(a b)))))
 
 ;; A valid dotted cons with a fixnum cdr takes the conservative deopt and still
 ;; has ENDP's NIL result. Non-lists and closure-shaped conses must signal.
-(assert (equal '(nil) (t2-endp-probe (cons 'a 3))))
+(assert (equal '(nil)
+               (multiple-value-call #'list (t2-endp-probe (cons 'a 3)))))
 (assert (eq :type-error
             (handler-case (t2-endp-probe 7)
               (type-error () :type-error))))

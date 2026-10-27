@@ -467,7 +467,7 @@ impl Emitter<'_> {
         let first = *data.args.first().ok_or_else(unsupported)?;
         self.load(first, A0)?;
         match data.opcode {
-            Guard if matches!(&data.aux, AuxData::TypeTag(ty) if ty.bits == TypeBits::FIXNUM || ty.bits == TypeBits::SINGLE_FLOAT || ty.bits == TypeBits::CONS || ty.bits == TypeBits::CONS.join(TypeBits::NULL)) =>
+            Guard if matches!(&data.aux, AuxData::TypeTag(ty) if ty.bits == TypeBits::FIXNUM || ty.bits == TypeBits::SINGLE_FLOAT || ty.bits == TypeBits::CONS) || matches!(&data.aux, AuxData::EndpList) =>
             {
                 // CONS matters as much as the numeric tags: build.rs emits a
                 // separate Guard(TypeTag(CONS)) ahead of every Car/Cdr, so
@@ -479,7 +479,7 @@ impl Emitter<'_> {
                         self.guard_fixnum(A0, deopt)
                     }
                     AuxData::TypeTag(ty) if ty.bits == TypeBits::CONS => self.guard_cons(A0, deopt),
-                    AuxData::TypeTag(ty) if ty.bits == TypeBits::CONS.join(TypeBits::NULL) => {
+                    AuxData::EndpList => {
                         self.guard_list(A0, deopt)
                     }
                     _ => self.guard_single_float(A0, deopt),
@@ -1206,7 +1206,7 @@ mod tests {
                 opcode: Opcode::Guard,
                 args: vec![input],
                 results: vec![],
-                aux: AuxData::TypeTag(IRType::of(TypeBits::CONS.join(TypeBits::NULL))),
+                aux: AuxData::EndpList,
                 flags: InstFlags {
                     effectful: true,
                     guard: true,
