@@ -133,6 +133,176 @@
 #[path = "ordinary_bounded_poll_tests.rs"]
 mod ordinary_bounded_poll_tests;
 
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+#[path = "bounded_poll_coalescing_tests.rs"]
+mod bounded_poll_coalescing_tests;
+
+/// Remove only implicit entry polls inside an already bounded poll envelope.
+/// This is deliberately not a general loop poll placement pass. The original
+/// scalar loop, explicit boundaries, heat and OSR transfer points remain.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn redundant_bounded_cycle_polls(
+    f: &Function,
+    blocks: &[crate::t2::ir::Block],
+    polls: &std::collections::HashSet<crate::t2::ir::Block>,
+    heat: &std::collections::HashSet<crate::t2::ir::Block>,
+) -> std::collections::HashSet<crate::t2::ir::Block> {
+    use crate::t2::ir::{AuxData, Block, Opcode};
+    use std::collections::{HashMap, HashSet};
+    let mut predecessors: HashMap<Block, Vec<Block>> = HashMap::new();
+    for &block in blocks {
+        if let Some(term) = f.terminator(block) {
+            for edge in &f.inst(term).targets {
+                predecessors.entry(edge.block).or_default().push(block);
+            }
+        }
+    }
+    let unique_predecessor = |block, predecessor| {
+        predecessors
+            .get(&block)
+            .is_some_and(|p| p.as_slice() == [predecessor])
+    };
+    let jump_target = |block| {
+        let term = f.inst(f.terminator(block)?);
+        (term.opcode == Opcode::Jump && term.targets.len() == 1).then(|| term.targets[0].block)
+    };
+    let protected = |block| {
+        block == f.entry()
+            || heat.contains(&block)
+            || f.osr_entries.iter().any(|entry| entry.block == block)
+    };
+    let mut redundant = HashSet::new();
+    for &pre in blocks {
+        let pre_insts = &f.block(pre).insts;
+        if pre_insts.len() != 2 {
+            continue;
+        }
+        let pre_poll = f.inst(pre_insts[0]);
+        let AuxData::BoundedPoll { exit: false, scope } = &pre_poll.aux else {
+            continue;
+        };
+        if pre_poll.opcode != Opcode::NativePoll || !polls.contains(&pre) {
+            continue;
+        }
+        let Some(probe) = jump_target(pre) else {
+            continue;
+        };
+        if !unique_predecessor(probe, pre) {
+            continue;
+        }
+        let body = &f.block(probe).insts;
+        // A small, acyclic segment only. No arbitrary helper/call cost may be
+        // hidden by removing its entry poll, even when its result is unused.
+        if body.len() < 2 {
+            continue;
+        }
+        let kernel = f.inst(body[body.len() - 2]);
+        let branch = f.inst(body[body.len() - 1]);
+        if kernel.opcode != Opcode::TryStoreIntegerOctets8
+            || kernel.args.len() != 4
+            || kernel.results.len() != 2
+            || !kernel.flags.effectful
+            || kernel.flags.call
+            || kernel.flags.safepoint
+            || kernel.flags.guard
+            || kernel.flags.terminator
+            || !kernel.targets.is_empty()
+            || branch.opcode != Opcode::Brif
+            || branch.args != [kernel.results[0]]
+            || branch.targets.len() != 2
+        {
+            continue;
+        }
+        let probe_bounded = body.len() <= 16
+            && !body[..body.len() - 2].iter().any(|&inst| {
+                let d = f.inst(inst);
+                let guard = d.opcode == Opcode::Guard
+                    && d.flags.guard
+                    && match &d.aux {
+                        AuxData::BuiltinBinding { .. } => true,
+                        AuxData::TypeTag(ty) => {
+                            ty.bits == crate::t2::ir::TypeBits::FIXNUM
+                                && ty.range.is_none()
+                                && ty.class_id.is_none()
+                        }
+                        _ => false,
+                    };
+                let allowed = is_const_opcode(d.opcode) || guard;
+                !allowed
+                    || d.flags.call
+                    || d.flags.safepoint
+                    || d.flags.terminator
+                    || !d.targets.is_empty()
+                    || (d.flags.effectful && !(d.opcode == Opcode::Guard && d.flags.guard))
+            });
+        // Prefix calls or MV resets retain the probe poll. They do not make
+        // the later ClearMv -> POST edge unbounded, so its separate proof can
+        // still remove the success-entry check.
+        if body[..body.len() - 2].iter().any(|&inst| {
+            let d = f.inst(inst);
+            d.opcode == Opcode::TryStoreIntegerOctets8
+                || !d.targets.is_empty()
+                || d.flags.terminator
+        }) {
+            continue;
+        }
+        let success = branch.targets[0].block;
+        let slow = branch.targets[1].block;
+        if !unique_predecessor(success, probe) {
+            continue;
+        }
+        let success_body = &f.block(success).insts;
+        // The MV reset may already have been coalesced by opt_clear_mv.
+        if success_body.len() != 1 && success_body.len() != 2 {
+            continue;
+        }
+        if success_body.len() == 2 {
+            let clear = f.inst(success_body[0]);
+            if clear.opcode != Opcode::ClearMv
+                || !clear.args.is_empty()
+                || !clear.results.is_empty()
+                || !clear.targets.is_empty()
+                || clear.flags.guard
+                || clear.flags.terminator
+                || !matches!(clear.aux, AuxData::None)
+            {
+                continue;
+            }
+        }
+        let Some(post) = jump_target(success) else {
+            continue;
+        };
+        if !unique_predecessor(post, success) || !polls.contains(&post) {
+            continue;
+        }
+        let Some(&post_inst) = f.block(post).insts.first() else {
+            continue;
+        };
+        let post_poll = f.inst(post_inst);
+        if post_poll.opcode != Opcode::NativePoll
+            || !matches!(&post_poll.aux, AuxData::BoundedPoll { exit: true, scope: other } if other == scope)
+        {
+            continue;
+        }
+        // The rejected kernel performs no stores. Its scalar continuation must
+        // still reach a retained poll immediately, before executing work.
+        let slow_polled = f.block(slow).insts.len() == 1
+            && jump_target(slow).is_some_and(|target| polls.contains(&target) && protected(target));
+        if [pre, probe, success, post].contains(&slow) {
+            continue;
+        }
+        for block in [probe, success] {
+            if (block != probe || (probe_bounded && slow_polled))
+                && polls.contains(&block)
+                && !protected(block)
+            {
+                redundant.insert(block);
+            }
+        }
+    }
+    redundant
+}
+
 use crate::t2::x64_calls::{
     CallReturn, NativeCallOrigin, NativeCallSites, NativeCallValues, NativeStackBase,
 };
@@ -6105,6 +6275,16 @@ fn emit_framed_inner(
             {
                 headers.remove(&block);
             }
+        }
+        if std::env::var_os("EGCL_DISABLE_BOUNDED_POLL_COALESCING").is_none() {
+            let redundant = redundant_bounded_cycle_polls(f, &blocks, &headers, &heat_headers);
+            if !redundant.is_empty()
+                && std::env::var_os("EGCL_BOUNDED_POLL_LOG").is_some()
+            {
+                eprintln!("[bounded-poll] {}: removed {} implicit poll(s)",
+                    f.name(), redundant.len());
+            }
+            headers.retain(|block| !redundant.contains(block));
         }
         let mut points = HashMap::new();
         for &header in &headers {
