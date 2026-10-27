@@ -11197,10 +11197,15 @@ mod tests {
             "range proof removes overflow deopt, but the argument tag guard remains"
         );
         let code = framed.code;
-        // `lea rax,[rcx+rcx*4]` = 48 8D 04 89 ; and NO overflow branch (0F 80).
-        assert!(code.contains(&0x8D), "must emit lea for a range-safe *5");
+        // Recognize the arithmetic LEA and overflow condition independently
+        // of register assignment and near/short branch layout.
+        assert!(iced_x86::Decoder::new(64, &code, iced_x86::DecoderOptions::NONE)
+            .into_iter().any(|instruction| instruction.mnemonic() == iced_x86::Mnemonic::Lea
+                && instruction.memory_index_scale() == 4
+                && instruction.memory_base() == instruction.memory_index()),
+            "must emit arithmetic lea for a range-safe *5");
         assert!(
-            !contains(&code, &[0x0F, 0x80]),
+            !has_overflow_branch(&code),
             "range proves no overflow → no jo deopt"
         );
         let buf = egcl_rt::jit::JitBuffer::new(&code).unwrap();
@@ -11238,9 +11243,11 @@ mod tests {
             "the emitted overflow edge must make the artifact deopt-capable"
         );
         let code = framed.code;
-        assert!(code.contains(&0x69), "unknown range → imul r64,r64,5");
+        assert!(iced_x86::Decoder::new(64, &code, iced_x86::DecoderOptions::NONE)
+            .into_iter().any(|instruction| instruction.mnemonic() == iced_x86::Mnemonic::Imul),
+            "unknown range → imul r64,r64,5");
         assert!(
-            contains(&code, &[0x0F, 0x80]),
+            has_overflow_branch(&code),
             "unknown range → keep the jo overflow deopt"
         );
         let buf = egcl_rt::jit::JitBuffer::new(&code).unwrap();
