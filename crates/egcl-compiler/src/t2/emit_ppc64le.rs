@@ -90,7 +90,7 @@
 //! FIXNUM and SINGLE_FLOAT tags, `FloatAdd/Sub/Mul` on tagged single-floats
 //! (moved in with `mtvsrd` and converted to double format), `FixnumAdd/Sub/Mul/Neg` and the
 //! five comparisons (branchless via `isel`), all tag-guarded and deopting on
-//! overflow; `Guard` for CONS, `Car`/`Cdr` on a proven cons, `GenericEq`,
+//! overflow; `Guard` for CONS and (CONS OR NULL), `Car`/`Cdr` on a proven cons, `GenericEq`,
 //! `LogAnd/Or/Xor/Not` and `FixnumShl/Shr` by a constant, and the builder's
 //! target-free `Call` for `MULTIPLE-VALUE-LIST` (`AuxData::ValuesToList`) and
 //! for non-capturing closure creation (`AuxData::NestedClosure`), both of which
@@ -342,6 +342,27 @@ impl Emitter<'_> {
         self.asm.and(T0, register, T0);
         self.asm.compare_imm(0, T0, egcl_rt::value::TAG_CONS as i16);
         self.asm.branch(Cc::Ne, 0, deopt);
+    }
+
+    /// Accept NIL or a cons that is not the interpreter's closure encoding.
+    ///
+    /// Closures are represented as `(EGCL::CLOSURE . id)`, so their CDR is a
+    /// fixnum. Conservatively deopt every cons with a fixnum CDR; the resumed
+    /// ENDP call distinguishes closures from ordinary dotted conses exactly.
+    fn guard_list(&mut self, register: u8, deopt: Label) -> Result<(), EmitError> {
+        let passed = self.asm.label();
+        self.asm.compare_imm(0, register, NIL.0 as i16);
+        self.asm.branch(Cc::E, 0, passed);
+        self.guard_cons(register, deopt);
+        self.asm.imm64(T0, !7u64);
+        self.asm.and(T1, register, T0);
+        self.asm.load(T1, T1, 8).ok_or_else(unsupported)?;
+        self.asm.li(T0, 7);
+        self.asm.and(T1, T1, T0);
+        self.asm.compare_imm(0, T1, 0);
+        self.asm.branch(Cc::E, 0, deopt);
+        self.asm.bind(passed);
+        Ok(())
     }
 
     fn guard_single_float(&mut self, register: u8, deopt: Label) {
@@ -681,7 +702,7 @@ impl Emitter<'_> {
         let first = *data.args.first().ok_or_else(unsupported)?;
         self.load(first, W0)?;
         match data.opcode {
-            Guard if matches!(&data.aux, AuxData::TypeTag(ty) if ty.bits == TypeBits::FIXNUM || ty.bits == TypeBits::SINGLE_FLOAT || ty.bits == TypeBits::CONS) =>
+            Guard if matches!(&data.aux, AuxData::TypeTag(ty) if ty.bits == TypeBits::FIXNUM || ty.bits == TypeBits::SINGLE_FLOAT || ty.bits == TypeBits::CONS || ty.bits == TypeBits::CONS.join(TypeBits::NULL)) =>
             {
                 let deopt = self.deopt_label(data)?;
                 match &data.aux {
@@ -689,6 +710,9 @@ impl Emitter<'_> {
                         self.guard_fixnum(W0, deopt)
                     }
                     AuxData::TypeTag(ty) if ty.bits == TypeBits::CONS => self.guard_cons(W0, deopt),
+                    AuxData::TypeTag(ty) if ty.bits == TypeBits::CONS.join(TypeBits::NULL) => {
+                        self.guard_list(W0, deopt)?
+                    }
                     _ => self.guard_single_float(W0, deopt),
                 }
             }
@@ -1337,4 +1361,91 @@ pub fn emit_framed_with_runtime(
         heap_constant_slots: emitter.heap_constants.values().copied().collect(),
         has_deopt,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::t2::frame_state::FrameScope;
+    use crate::t2::ir::{IRType, InstFlags};
+
+    fn list_guard() -> Function {
+        let mut function = Function::new("ppc64le-list-guard");
+        let block = function.entry();
+        let input = function.add_block_param(block, IRType::TOP, ValueRepresentation::Tagged);
+        let state = function.frame_states.add(FrameState {
+            scopes: vec![FrameScope {
+                function: 81,
+                bcp: 4,
+                locals: vec![ValueSource::Value {
+                    value: input,
+                    repr: ValueRepresentation::Tagged,
+                }],
+                stack: vec![],
+            }],
+            remat: vec![],
+        });
+        let (_, guarded) = function.push_inst(
+            block,
+            InstData {
+                opcode: Opcode::Guard,
+                args: vec![input],
+                results: vec![],
+                aux: AuxData::TypeTag(IRType::of(TypeBits::CONS.join(TypeBits::NULL))),
+                flags: InstFlags {
+                    effectful: true,
+                    guard: true,
+                    ..InstFlags::default()
+                },
+                targets: vec![],
+                frame_state: Some(state),
+                source_pos: 0,
+            },
+            &[(
+                IRType::of(TypeBits::CONS.join(TypeBits::NULL)),
+                ValueRepresentation::Tagged,
+            )],
+        );
+        function.set_terminator(
+            block,
+            InstData {
+                opcode: Opcode::Return,
+                args: vec![guarded[0]],
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags::default(),
+                targets: vec![],
+                frame_state: None,
+                source_pos: 0,
+            },
+        );
+        function
+    }
+
+    #[test]
+    fn emits_list_guard_that_excludes_closure_shaped_conses() {
+        extern "C" fn deopt(_: u64, _: u64, _: *const u64, _: u64) {}
+        let compiled = emit_framed(&list_guard(), deopt as *const () as usize as u64, 1)
+            .expect("emit NIL-or-data-cons guard");
+        assert!(compiled.has_deopt);
+        #[cfg(all(target_arch = "powerpc64", target_endian = "little"))]
+        {
+            let buffer = egcl_rt::jit::JitBuffer::new(&compiled.code).unwrap();
+            let entry: extern "C" fn(*mut u64) -> u64 =
+                unsafe { std::mem::transmute(buffer.as_ptr()) };
+            let mut ordinary = [T.0, NIL.0];
+            let ordinary = ordinary.as_mut_ptr() as u64 | egcl_rt::value::TAG_CONS;
+            let mut closure = [T.0, EgclVal::from_fixnum(81).0];
+            let closure = closure.as_mut_ptr() as u64 | egcl_rt::value::TAG_CONS;
+            for (input, expected) in [
+                (NIL.0, NIL.0),
+                (ordinary, ordinary),
+                (EgclVal::from_fixnum(3).0, NIL.0),
+                (closure, NIL.0),
+            ] {
+                let mut slots = [input];
+                assert_eq!(entry(slots.as_mut_ptr()), expected);
+            }
+        }
+    }
 }
