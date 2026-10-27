@@ -3438,6 +3438,9 @@ fn format_impl(
                 //                    previously falling through to the absolute
                 //                    computation, so `ab~3@Tx` emitted one space
                 //                    instead of three.
+                // ~:T and ~:@T are PPRINT-TAB (CLHS 22.3.5.2), which does
+                // nothing unless *PRINT-PRETTY* is true (ansi format.:t.2-3,
+                // format.:@t.4-5).
                 let first = if !params.is_empty() {
                     resolve_param(&params[0], 1, arg_idx)?.max(0) as usize
                 } else {
@@ -3448,6 +3451,9 @@ fn format_impl(
                 } else {
                     1
                 };
+                if colon && !print_pretty_active() {
+                    continue;
+                }
                 // Column is a CHARACTER count, not a byte count — the byte
                 // length overshoots on any multibyte output already on the line.
                 let cur_col = match output.rfind('\n') {

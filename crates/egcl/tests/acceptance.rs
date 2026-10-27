@@ -9225,6 +9225,41 @@ fn gcd_lcm_and_string_trim() {
     }
 }
 
+/// `~:T` and `~:@T` are PPRINT-TAB (CLHS 22.3.5.2) and do nothing unless
+/// *PRINT-PRETTY* is true; plain `~T` and `~@T` still tab (ansi format.:t.2-3,
+/// format.:@t.4-5).
+#[test]
+fn format_colon_tab_needs_pretty_printing() {
+    let cases = [
+        ("(let ((*print-pretty* nil)) (format nil \"XX~10:tYY\"))", "\"XXYY\""),
+        ("(let ((*print-pretty* nil)) (format nil \"XX~10,20:@tYY\"))", "\"XXYY\""),
+        ("(let ((*print-pretty* nil)) (format nil \"~v:t~a\" 10 \"x\"))", "\"x\""),
+        (
+            "(let ((*print-pretty* nil)) (format nil \"~v,v:@t~a\" 10 20 \"x\"))",
+            "\"x\"",
+        ),
+        ("(let ((*print-pretty* nil)) (format nil \"XX~4tYY\"))", "\"XX  YY\""),
+        ("(let ((*print-pretty* nil)) (format nil \"XX~2@tYY\"))", "\"XX  YY\""),
+    ];
+    for (expr, expected) in cases {
+        let out = egcl_bin()
+            .args(["--eval", &format!("(print {expr})")])
+            .output()
+            .expect("run egcl");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout
+            .lines()
+            .map(|l| l.trim())
+            .find(|l| !l.is_empty())
+            .unwrap_or("");
+        assert_eq!(
+            got, expected,
+            "{expr} => expected {expected}, got: {got} (stderr: {})",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
 /// Regression: FORMAT ~w,dF honors d (decimal places) and w (width). Previously
 /// the d parameter was ignored, so ~,2F printed full precision. (bliss-2pt.13)
 #[test]
