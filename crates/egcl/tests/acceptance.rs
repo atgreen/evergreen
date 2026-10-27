@@ -10091,10 +10091,10 @@ fn hash_s_slot_names_are_string_designators() {
 /// keyword whose name contains a colon and the structure slot named |A:B|.
 #[test]
 fn hash_s_slot_names_preserve_package_marker_characters() {
-    let prog = r#"(progn
+    let prog = r##"(progn
         (defstruct sds-exact |A:B|)
         (let ((v (read-from-string "#S(sds-exact \"A:B\" value)")))
-          (format t "SDS-EXACT=~s~%" (slot-value v '|A:B|))))"#;
+          (format t "SDS-EXACT=~s~%" (slot-value v '|A:B|))))"##;
     let out = egcl_bin()
         .args(["--eval", prog])
         .output()
