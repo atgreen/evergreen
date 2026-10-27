@@ -1084,13 +1084,21 @@ fn heap_vector_string(v: EgclVal, escapep: bool) -> Option<String> {
         return None;
     }
     if let Some(length) = egcl_rt::packed_u8::len(v) {
-        if !print_array_active() { return Some(format!("#<UB8-VECTOR {length}>")); }
-        let elements: Vec<_> = (0..length).map(|i| egclval_to_print_string(EgclVal::from_fixnum(i64::from(egcl_rt::packed_u8::get(v, i).unwrap())), escapep)).collect();
-        return Some(format!("#({})", elements.join(" ")));
+        if !print_array_active() {
+            return Some(format!("#<UB8-VECTOR {length}>"));
+        }
+        egcl_rt::rooted!(v = v);
+        return Some(vector_elements_string(length, |i| {
+            egclval_to_print_string(
+                EgclVal::from_fixnum(i64::from(egcl_rt::packed_u8::get(*v, i).unwrap())),
+                escapep,
+            )
+        }));
     }
     if let Some(length) = egcl_rt::packed_f64::len(v) {
+        egcl_rt::rooted!(v = v);
         return Some(vector_elements_string(length, |i| {
-            double_float_to_string(egcl_rt::packed_f64::get(v, i).unwrap())
+            double_float_to_string(egcl_rt::packed_f64::get(*v, i).unwrap())
         }));
     }
     unsafe {

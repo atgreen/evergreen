@@ -12216,6 +12216,35 @@ fn print_md_nested(base: EgclVal, dims: &[usize], start: usize, out: &mut String
     PRINT_DEPTH.with(|d| d.set(depth));
 }
 
+/// Render a specialized vector's elements with the same *PRINT-LEVEL* and
+/// *PRINT-LENGTH* accounting as a simple general vector.
+fn print_specialized_vector_elements(
+    count: usize,
+    out: &mut String,
+    mut print_element: impl FnMut(usize, &mut String),
+) {
+    let depth = PRINT_DEPTH.with(|d| d.get());
+    if egcl_stdlib::format::print_level().is_some_and(|lvl| depth >= lvl) {
+        out.push('#');
+        return;
+    }
+    let limit = egcl_stdlib::format::print_length();
+    PRINT_DEPTH.with(|d| d.set(depth + 1));
+    out.push_str("#(");
+    for i in 0..count {
+        if i > 0 {
+            out.push(' ');
+        }
+        if limit.is_some_and(|n| i >= n) {
+            out.push_str("...");
+            break;
+        }
+        print_element(i, out);
+    }
+    out.push(')');
+    PRINT_DEPTH.with(|d| d.set(depth));
+}
+
 /// Current structural nesting depth for *PRINT-LEVEL* (0 at the top level).
 /// Incremented around each list body; balanced, so it returns to 0 after a
 /// top-level print.
@@ -12669,23 +12698,32 @@ fn print_val_inner(val: EgclVal, out: &mut String) {
                     if !egcl_stdlib::format::print_array_active() {
                         out.push_str(&format!("#<UB8-VECTOR {}>", egcl_rt::packed_u8::len(val).unwrap()));
                     } else {
-                        out.push_str("#(");
-                        for i in 0..egcl_rt::packed_u8::len(val).unwrap() {
-                            if i != 0 { out.push(' '); }
-                            print_val(EgclVal::from_fixnum(i64::from(egcl_rt::packed_u8::get(val, i).unwrap())), out);
-                        }
-                        out.push(')');
+                        egcl_rt::rooted!(val = val);
+                        print_specialized_vector_elements(
+                            egcl_rt::packed_u8::len(*val).unwrap(),
+                            out,
+                            |i, out| {
+                                print_val(
+                                    EgclVal::from_fixnum(i64::from(
+                                        egcl_rt::packed_u8::get(*val, i).unwrap(),
+                                    )),
+                                    out,
+                                );
+                            },
+                        );
                     }
                 }
                 type_id::SIMPLE_ARRAY if egcl_rt::packed_f64::is_vector(val) => {
-                    out.push_str("#(");
-                    for i in 0..egcl_rt::packed_f64::len(val).unwrap() {
-                        if i != 0 { out.push(' '); }
-                        out.push_str(&egcl_stdlib::format::double_float_to_string(
-                            egcl_rt::packed_f64::get(val, i).unwrap(),
-                        ));
-                    }
-                    out.push(')');
+                    egcl_rt::rooted!(val = val);
+                    print_specialized_vector_elements(
+                        egcl_rt::packed_f64::len(*val).unwrap(),
+                        out,
+                        |i, out| {
+                            out.push_str(&egcl_stdlib::format::double_float_to_string(
+                                egcl_rt::packed_f64::get(*val, i).unwrap(),
+                            ));
+                        },
+                    );
                 }
                 type_id::SIMPLE_ARRAY if egcl_rt::types::bit_vector_p(val) => {
                     // A bit-vector prints in `#*bits` syntax (bliss-zg9).
