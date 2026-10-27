@@ -8657,7 +8657,17 @@ fn emit_framed_inner(
         egcl_rt::asm::Label,
         String,
     )> = Vec::new();
+    static KEEP_UNUSED_DEOPT_STUBS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let keep_unused = *KEEP_UNUSED_DEOPT_STUBS.get_or_init(|| {
+        std::env::var_os("EGCL_DISABLE_UNUSED_DEOPT_STUB_ELISION").is_some()
+    });
     for (&inst, &label) in &inst_deopt {
+        // All instruction branches are emitted. A range/type proof can leave
+        // this label unused; no call-PC/value-map entry is needed either.
+        // OSR checks are emitted later, so their separate labels stay intact.
+        if !keep_unused && !a.label_is_referenced(label) {
+            continue;
+        }
         let fsid = f
             .inst(inst)
             .frame_state
@@ -11994,3 +12004,7 @@ mod integer_builtin_tests {
         }
     }
 }
+
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+#[path = "unused_deopt_tests.rs"]
+mod unused_deopt_tests;
