@@ -323,9 +323,12 @@
 ;;; bootstrap evaluator.
 ;;; ---------------------------------------------------------------------------
 
-;; DECLAIM records global declarations. Inline policy and function types take
-;; effect while compiling subsequent definitions as well as when loading or
-;; evaluating the form; ordinary PROCLAIM calls alone have no compile-time effect.
+;; DECLAIM records global declarations. Inline policy, function types and
+;; special proclamations take effect while compiling subsequent definitions as
+;; well as when loading or evaluating the form (CLHS 3.2.3.1.1); ordinary
+;; PROCLAIM calls alone have no compile-time effect.  A SPECIAL proclaimed only
+;; at load time left COMPILE-FILE binding the variable lexically in the rest of
+;; the file, so its readers found it unbound.
 (defmacro declaim (&rest specs)
   (let ((forms nil))
     (dolist (spec specs)
@@ -336,7 +339,8 @@
                        (list 'proclaim (list 'quote spec)))
                  forms))
           (special
-           (push (list 'egcl-internal::%proclaim-special (list 'quote (cdr spec)))
+           (push (list 'eval-when '(:compile-toplevel :load-toplevel :execute)
+                       (list 'egcl-internal::%proclaim-special (list 'quote (cdr spec))))
                  forms))
           ;; (declaration name …) names declarations the implementation must
           ;; accept; the environment then records them for

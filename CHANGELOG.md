@@ -184,6 +184,11 @@
   interpreter's arithmetic-classification cache
   ([#662](https://github.com/atgreen/evergreen/pull/662)).
 
+- A variable proclaimed special only by `declaim`, with no `defvar`, is special
+  for the rest of a file compiled with `compile-file`, so a `let` of it binds
+  dynamically instead of lexically
+  ([#675](https://github.com/atgreen/evergreen/pull/675)).
+
 - Fiber migration preserves execution-local state after native calls on s390x,
   preventing wrong `NIL` results and crashes caused by reading a previous
   carrier's fiber identity ([#661](https://github.com/atgreen/evergreen/pull/661)).
