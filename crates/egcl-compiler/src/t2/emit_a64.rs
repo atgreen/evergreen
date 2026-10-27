@@ -468,6 +468,30 @@ impl Emitter<'_> {
         self.asm.jcc(Cc::Ne, deopt);
     }
 
+    /// A LIST guard accepts NIL or a cons that cannot be the interpreter's
+    /// `(EGCL::CLOSURE . id)` representation. The fixnum-CDR rejection is
+    /// conservative: an ordinary dotted cons may deopt, but optimized code
+    /// never mistakes a closure for a Common Lisp list.
+    fn guard_list(
+        &mut self,
+        register: a64::Reg,
+        deopt: egcl_rt::asm::Label,
+    ) -> Result<(), EmitError> {
+        let passed = self.asm.label();
+        self.asm
+            .word(a64::cmp_imm(register, NIL.0).expect("NIL fits an add-immediate"));
+        self.asm.jcc(Cc::E, passed);
+        self.guard_cons(register, deopt);
+        self.asm
+            .word(a64::and_imm(T0, register, !7u64).expect("!7 is a logical immediate"));
+        self.load_at(T0, T0, 8)?;
+        self.asm
+            .word(a64::tst_imm(T0, 7).expect("7 is a logical immediate"));
+        self.asm.jcc(Cc::E, deopt);
+        self.asm.bind(passed);
+        Ok(())
+    }
+
     /// Bounds half of a fixnum guard, mirroring emit.rs's `emit_fixnum_guard`.
     /// W0 holds the tagged operand and has already passed the tag check.
     ///
@@ -1045,7 +1069,7 @@ impl Emitter<'_> {
             .ok_or(EmitError::UnsupportedOp(op_tag(data.opcode)))?;
         self.load(first, W0)?;
         match data.opcode {
-            Guard if matches!(&data.aux, AuxData::TypeTag(ty) if ty.bits == TypeBits::FIXNUM || ty.bits == TypeBits::SINGLE_FLOAT || ty.bits == TypeBits::CONS) =>
+            Guard if matches!(&data.aux, AuxData::TypeTag(ty) if ty.bits == TypeBits::FIXNUM || ty.bits == TypeBits::SINGLE_FLOAT || ty.bits == TypeBits::CONS || ty.bits == TypeBits::CONS.join(TypeBits::NULL)) =>
             {
                 // CONS matters as much as the numeric tags: build.rs emits a
                 // separate Guard(TypeTag(CONS)) ahead of every Car/Cdr, so
@@ -1067,6 +1091,9 @@ impl Emitter<'_> {
                         self.guard_fixnum_range(ty, deopt)?;
                     }
                     AuxData::TypeTag(ty) if ty.bits == TypeBits::CONS => self.guard_cons(W0, deopt),
+                    AuxData::TypeTag(ty) if ty.bits == TypeBits::CONS.join(TypeBits::NULL) => {
+                        self.guard_list(W0, deopt)?
+                    }
                     _ => self.guard_single_float(W0, deopt),
                 }
             }

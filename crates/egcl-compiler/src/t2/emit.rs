@@ -3846,6 +3846,55 @@ fn emit_cons_guard(
     Ok(())
 }
 
+/// Guard a tagged value as a list and return the same value under a refined
+/// SSA identity. NIL passes directly. A non-NIL value must carry the cons tag;
+/// conses whose CDR is a fixnum deopt conservatively because that is also the
+/// representation of an interpreter closure `(EGCL::CLOSURE . id)`.
+fn emit_list_guard(
+    a: &mut Asm,
+    data: &crate::t2::ir::InstData,
+    reg: &mut std::collections::HashMap<crate::t2::ir::Value, u8>,
+    pool: &mut Vec<u8>,
+    deopt: egcl_rt::asm::Label,
+) -> Result<(), EmitError> {
+    use crate::t2::ir::{AuxData, Opcode, TypeBits};
+    let list = TypeBits::CONS.join(TypeBits::NULL);
+    if data.args.len() != 1
+        || data.results.len() != 1
+        || !matches!(data.aux, AuxData::TypeTag(t) if t.bits == list)
+        || !data.flags.guard
+        || !data.flags.effectful
+        || data.frame_state.is_none()
+    {
+        return Err(EmitError::UnsupportedOp(op_tag(Opcode::Guard)));
+    }
+    let xr = *reg
+        .get(&data.args[0])
+        .ok_or(EmitError::UnsupportedOp(0xF2))?;
+    let passed = a.label();
+    alu_r_imm(a, 7 /* CMP */, xr, egcl_rt::value::NIL.0 as i32);
+    a.jcc(Cc::E, passed);
+    mov_rr(a, SCRATCH, xr);
+    alu_r_imm(a, 4 /* AND */, SCRATCH, 7);
+    alu_r_imm(
+        a,
+        7, /* CMP */
+        SCRATCH,
+        egcl_rt::value::TAG_CONS as i32,
+    );
+    a.jcc(Cc::Ne, deopt);
+    mov_rr(a, SCRATCH, xr);
+    alu_r_imm(a, 4 /* AND */, SCRATCH, -8);
+    mov_mem64_disp8(a, SCRATCH, SCRATCH, 8);
+    alu_r_imm(a, 4 /* AND */, SCRATCH, 7);
+    alu_r_imm(a, 7 /* CMP */, SCRATCH, 0);
+    a.jcc(Cc::E, deopt);
+    a.bind(passed);
+    let dst = framed_alloc(reg, pool, data.results[0])?;
+    mov_rr(a, dst, xr);
+    Ok(())
+}
+
 /// A speculated fixnum operand proof reified as an SSA guard value
 /// (speculate.rs materialize_fixnum_operand_guards, egcl-x5y.25b): test the
 /// low three tag bits are zero and enforce any inclusive range, deopt otherwise,
@@ -8122,6 +8171,11 @@ fn emit_framed_inner(
                     }
                     AuxData::TypeTag(t) if t.bits == TypeBits::CONS => {
                         emit_cons_guard(&mut a, &d, &mut inst_reg, &mut inst_pool, label)?
+                    }
+                    AuxData::TypeTag(t)
+                        if t.bits == TypeBits::CONS.join(TypeBits::NULL) =>
+                    {
+                        emit_list_guard(&mut a, &d, &mut inst_reg, &mut inst_pool, label)?
                     }
                     AuxData::TypeTag(t) if t.bits == TypeBits::FIXNUM => {
                         emit_fixnum_value_guard(&mut a, &d, &mut inst_reg, &mut inst_pool, label)?;
