@@ -211,6 +211,12 @@
   names, including names that contain package-marker characters
   ([#694](https://github.com/atgreen/evergreen/pull/694)).
 
+- `type-of` reports character, array, function, method, random-state, and
+  built-in object types that `subtypep` places under the object's classes;
+  adjustable, fill-pointered, and displaced vectors no longer satisfy
+  `simple-array`
+  ([#702](https://github.com/atgreen/evergreen/pull/702)).
+
 - `NOTINLINE` declarations remain effective through native specialization,
   while preserving argument evaluation and lookup of redefined functions
   ([#703](https://github.com/atgreen/evergreen/pull/703)).
