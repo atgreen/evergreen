@@ -7247,6 +7247,83 @@ fn multidimensional_arrays() {
     }
 }
 
+/// *PRINT-LEVEL* and *PRINT-LENGTH* apply to arrays and vectors in both
+/// printers (CLHS 22.1.3.7-8): each axis of a multidimensional array is a list
+/// level, a level past the limit prints as `#`, and a list or vector stops at
+/// `...` after *PRINT-LENGTH* elements (ansi print.array.level.*,
+/// print.array.length.*). WRITE-TO-STRING and PRIN1-TO-STRING take different
+/// printers, so both are checked.
+#[test]
+fn print_level_and_length_apply_to_arrays_and_vectors() {
+    let cases = [
+        (
+            "(write-to-string #2A((4 (17)) (9 (a)) ((b) 0)) :level 2 :pretty nil)",
+            "\"#2A((4 #) (9 #) (# 0))\"",
+        ),
+        ("(write-to-string #2A(()) :level 1 :pretty nil)", "\"#2A(#)\""),
+        ("(write-to-string #2A(()) :level 0 :pretty nil)", "\"#\""),
+        ("(write-to-string '(#2A((a))) :level 2 :pretty nil)", "\"(#2A(#))\""),
+        ("(write-to-string #2A((1 2) (3 4)) :length 1 :pretty nil)", "\"#2A((1 ...) ...)\""),
+        ("(write-to-string #2A((1)) :length 0 :pretty nil)", "\"#2A(...)\""),
+        (
+            "(let ((*print-length* 1)) (prin1-to-string #2A((1 2) (3 4))))",
+            "\"#2A((1 ...) ...)\"",
+        ),
+        ("(let ((*print-length* 2)) (prin1-to-string #(1 2 3 4)))", "\"#(1 2 ...)\""),
+        ("(let ((*print-level* 1)) (format nil \"~s\" (list #(1 2))))", "\"(#)\""),
+        (
+            "(let ((v (make-array 4 :element-type '(unsigned-byte 8) :initial-contents '(1 2 3 4)))) (write-to-string v :length 2 :pretty nil))",
+            "\"#(1 2 ...)\"",
+        ),
+        (
+            "(let ((v (make-array 2 :element-type '(unsigned-byte 8) :initial-contents '(1 2)))) (write-to-string (list v) :level 1 :pretty nil))",
+            "\"(#)\"",
+        ),
+        (
+            "(let ((v (make-array 4 :element-type '(unsigned-byte 8) :initial-contents '(1 2 3 4))) (*print-length* 2)) (prin1-to-string v))",
+            "\"#(1 2 ...)\"",
+        ),
+        (
+            "(let ((v (make-array 2 :element-type '(unsigned-byte 8) :initial-contents '(1 2))) (*print-level* 1)) (prin1-to-string (list v)))",
+            "\"(#)\"",
+        ),
+        (
+            "(let ((v (make-array 4 :element-type 'double-float :initial-contents '(1.0d0 2.0d0 3.0d0 4.0d0)))) (write-to-string v :length 2 :pretty nil))",
+            "\"#(1.0d0 2.0d0 ...)\"",
+        ),
+        (
+            "(let ((v (make-array 2 :element-type 'double-float :initial-contents '(1.0d0 2.0d0)))) (write-to-string (list v) :level 1 :pretty nil))",
+            "\"(#)\"",
+        ),
+        (
+            "(let ((v (make-array 4 :element-type 'double-float :initial-contents '(1.0d0 2.0d0 3.0d0 4.0d0))) (*print-length* 2)) (prin1-to-string v))",
+            "\"#(1.0d0 2.0d0 ...)\"",
+        ),
+        (
+            "(let ((v (make-array 2 :element-type 'double-float :initial-contents '(1.0d0 2.0d0))) (*print-level* 1)) (prin1-to-string (list v)))",
+            "\"(#)\"",
+        ),
+        ("(prin1-to-string #2A((1 2) (3 4)))", "\"#2A((1 2) (3 4))\""),
+    ];
+    for (expr, expected) in cases {
+        let out = egcl_bin()
+            .args(["--eval", &format!("(print {expr})")])
+            .output()
+            .expect("run egcl");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout
+            .lines()
+            .map(|l| l.trim())
+            .find(|l| !l.is_empty())
+            .unwrap_or("");
+        assert_eq!(
+            got, expected,
+            "{expr} => expected {expected}, got: {got} (stderr: {})",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
 /// bliss-qng: the COMPLEX constructor (type contagion + canonicalisation) and
 /// complex arithmetic (+ - * /) over the numeric tower, including real⇄complex
 /// mixing, unary negate/reciprocal, and canonicalisation of a rational complex
