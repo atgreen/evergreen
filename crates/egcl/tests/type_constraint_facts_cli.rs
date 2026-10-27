@@ -240,3 +240,156 @@ fn inferred_boolean_arithmetic_stays_generic_and_preserves_errors_effects_and_va
         }
     }
 }
+
+const POSITIVE_PHI_SOURCE: &str = r#"
+(declaim (notinline positive-inferred-double-phi positive-inferred-single-phi
+                    positive-inferred-fixnum-phi))
+;; The IF join is declared TOP by the builder. Only inference establishes its
+;; numeric family; OTHER is an unconstrained parameter, not a literal float.
+(defun positive-inferred-double-phi (flag other arithmetic)
+  (let ((n (if flag 1.25d0 2.5d0))) (if arithmetic (+ n other) n)))
+(defun positive-inferred-single-phi (flag other arithmetic)
+  (let ((n (if flag 1.25f0 2.5f0))) (if arithmetic (+ n other) n)))
+(defun positive-inferred-fixnum-phi (flag other arithmetic)
+  (let ((n (if flag 1 2))) (if arithmetic (+ n other) n)))
+(defun positive-phi-check ()
+  (dolist (flag '(nil t))
+    (dolist (other '(1 -2))
+      (let ((double (positive-inferred-double-phi flag other t))
+            (single (positive-inferred-single-phi flag other t))
+            (fixnum (positive-inferred-fixnum-phi flag other t)))
+        (assert (typep double 'double-float))
+        (assert (typep single 'single-float))
+        (assert (typep fixnum 'fixnum))
+        ;; Independent literal answers avoid using the same inferred phi in
+        ;; the reference computation. All values are exactly representable.
+        (assert (eql double (if flag (if (= other 1) 2.25d0 -0.75d0)
+                                   (if (= other 1) 3.5d0 0.5d0))))
+        (assert (eql single (if flag (if (= other 1) 2.25f0 -0.75f0)
+                                   (if (= other 1) 3.5f0 0.5f0))))
+        (assert (eql fixnum (if flag (if (= other 1) 2 -1)
+                                   (if (= other 1) 3 0)))))))
+  t)
+;; No arithmetic executes in T0/T1 before T2 installs: its cold fixnum
+;; guess must be reconciled with the inferred phi family, not repaired by
+;; lower-tier arithmetic samples or a preceding T1 guard failure.
+(defun positive-phi-warm ()
+  (dolist (flag '(nil t))
+    (positive-inferred-double-phi flag 1 nil)
+    (positive-inferred-single-phi flag 1 nil)
+    (positive-inferred-fixnum-phi flag 1 nil)))
+(dotimes (i 40) (positive-phi-warm))
+"#;
+
+const POSITIVE_PHI_READY: &str = r#"
+(loop repeat 100
+      until (and (= 2 (egcl-ext:function-tier 'positive-inferred-double-phi))
+                 (= 2 (egcl-ext:function-tier 'positive-inferred-single-phi))
+                 (= 2 (egcl-ext:function-tier 'positive-inferred-fixnum-phi)))
+      do (positive-phi-warm) (sleep 0.01))
+(assert (= 2 (egcl-ext:function-tier 'positive-inferred-double-phi)))
+(assert (= 2 (egcl-ext:function-tier 'positive-inferred-single-phi)))
+(assert (= 2 (egcl-ext:function-tier 'positive-inferred-fixnum-phi)))
+;; First arithmetic calls occur only after actual T2 installation. Isolate
+;; successful calls so a doomed cold fixnum version cannot hide behind recovery.
+(let ((before-double (egcl-ext:deopt-count)))
+  (positive-inferred-double-phi nil 1 t)
+  (assert (= before-double (egcl-ext:deopt-count))))
+(let ((before-single (egcl-ext:deopt-count)))
+  (positive-inferred-single-phi nil 1 t)
+  (assert (= before-single (egcl-ext:deopt-count))))
+(let ((before-fixnum (egcl-ext:deopt-count)))
+  (positive-inferred-fixnum-phi nil 1 t)
+  (assert (= before-fixnum (egcl-ext:deopt-count))))
+"#;
+
+const POSITIVE_PHI_CHECK: &str = r#"
+(positive-phi-check)
+(dolist (flag '(nil t))
+  (dolist (other '(1 -2))
+    (format t "POSITIVE-PHI ~S ~S ~S ~S ~S~%" flag other
+      (positive-inferred-double-phi flag other t)
+      (positive-inferred-single-phi flag other t)
+      (positive-inferred-fixnum-phi flag other t))))
+(format t "POSITIVE-INFERRED-NUMERIC-PHI-OK~%")
+"#;
+
+#[test]
+fn inferred_numeric_phis_choose_native_float_families_and_keep_coercions() {
+    let mut reference: Option<String> = None;
+    for (tier, stress) in [("interp", false), ("t2", false), ("t2", true)] {
+        let ready = if tier == "t2" { POSITIVE_PHI_READY } else { "" };
+        let program = format!("{POSITIVE_PHI_SOURCE}\n{ready}\n{POSITIVE_PHI_CHECK}");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_egcl"));
+        command
+            .env("EGCL_FORCE_TIER", tier)
+            .env("EGCL_LAZY_COMPILE", "0")
+            .env("EGCL_T2_THREADS", "1")
+            .env("EGCL_T2_LOG", "stderr")
+            .env_remove("EGCL_PROFILING_DISABLED")
+            .env_remove("EGCL_T2_NO_QUEUE")
+            .env_remove("EGCL_GC_STRESS")
+            .env_remove("EGCL_GC_STRESS_SKIP")
+            .env_remove("EGCL_GC_STRESS_AT")
+            .env_remove("EGCL_GC_STRESS_AFTER_INIT")
+            .env_remove("EGCL_GC_POISON")
+            .args(["--no-init", "--eval", &program]);
+        if stress {
+            command
+                .env("EGCL_GC_STRESS", "17")
+                .env("EGCL_GC_STRESS_AFTER_INIT", "1")
+                .env("EGCL_GC_POISON", "1");
+        }
+        let output = command
+            .output()
+            .expect("run inferred numeric phi regression");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "tier={tier} stress={stress}\n{stdout}\n{stderr}"
+        );
+        assert!(stdout.contains("POSITIVE-INFERRED-NUMERIC-PHI-OK"));
+        if tier == "t2" {
+            for name in [
+                "POSITIVE-INFERRED-DOUBLE-PHI",
+                "POSITIVE-INFERRED-SINGLE-PHI",
+                "POSITIVE-INFERRED-FIXNUM-PHI",
+            ] {
+                let installs: Vec<_> = stderr
+                    .lines()
+                    .filter(|line| {
+                        line.contains(&format!("{name}: optimized worker result installed with "))
+                    })
+                    .collect();
+                assert_eq!(
+                    installs.len(),
+                    1,
+                    "{name} must install its right family once, without a failed cold fixnum guess\n{stderr}"
+                );
+                assert!(
+                    installs[0].contains("ordinary x86-64 Lisp T2 ABI")
+                        || installs[0].contains("mapped T2 ABI")
+                );
+            }
+            assert!(
+                stderr.lines().any(|line| {
+                    line.contains("POSITIVE-INFERRED-DOUBLE-PHI:")
+                        && line.contains("T2 emitted;")
+                        && line
+                            .split("raw_f64_values=")
+                            .nth(1)
+                            .and_then(|value| value.split(',').next())
+                            .and_then(|value| value.parse::<usize>().ok())
+                            .is_some_and(|count| count > 0)
+                }),
+                "the inferred double phi must reach actual raw-double native emission\n{stderr}"
+            );
+        }
+        if let Some(expected) = &reference {
+            assert_eq!(stdout.as_ref(), expected.as_str());
+        } else {
+            reference = Some(stdout.into_owned());
+        }
+    }
+}

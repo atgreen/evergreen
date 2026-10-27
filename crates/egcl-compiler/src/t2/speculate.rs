@@ -365,17 +365,54 @@ fn frame_state_bcp(f: &Function, fs: FrameStateId) -> u32 {
         .unwrap_or(0)
 }
 
+trait OperandFacts {
+    fn bits(&self, value: Value) -> Option<TypeBits>;
+}
+
+impl OperandFacts for super::infer::InferenceResult {
+    fn bits(&self, value: Value) -> Option<TypeBits> {
+        self.get(value).map(|ty| ty.bits)
+    }
+}
+
+struct CapturedOperandFacts(Vec<(Value, TypeBits)>);
+
+impl OperandFacts for CapturedOperandFacts {
+    fn bits(&self, value: Value) -> Option<TypeBits> {
+        self.0.iter().find_map(|&(v, bits)| (v == value).then_some(bits))
+    }
+}
+
+fn operand_bits(
+    f: &Function,
+    inferred: Option<&dyn OperandFacts>,
+    value: Value,
+) -> TypeBits {
+    let declared = f.value(value).ty.bits;
+    let Some(bits) = inferred.and_then(|facts| facts.bits(value)) else { return declared };
+    if bits.is_bottom() || declared.is_bottom() { return declared; }
+    declared.meet(bits)
+}
+
+fn conflicting_operand_facts(f: &Function, inferred: Option<&dyn OperandFacts>, args: &[Value]) -> bool {
+    args.iter().any(|&value| {
+        let declared = f.value(value).ty.bits;
+        inferred.and_then(|facts| facts.bits(value)).is_some_and(|bits|
+            !declared.is_bottom() && !bits.is_bottom() && declared.meet(bits).is_bottom())
+    })
+}
+
 /// Resolve a numeric specialization entirely from SSA types. This is the path
 /// used by declared parameters: no sampled type is needed, and a stale profile
 /// can never contradict the source assertion. A fixnum constant participates
 /// in a single-float operation through CL float contagion.
-fn statically_proven_spec_type(f: &Function, args: &[crate::t2::ir::Value]) -> Option<SpecType> {
+fn statically_proven_spec_type(f: &Function, args: &[crate::t2::ir::Value], inferred: Option<&dyn OperandFacts>) -> Option<SpecType> {
     let subset =
         |bits: TypeBits, allowed: TypeBits| !bits.is_bottom() && bits.meet(allowed) == bits;
     if !args.is_empty()
         && args
             .iter()
-            .all(|&arg| subset(f.value(arg).ty.bits, TypeBits::FIXNUM))
+            .all(|&arg| subset(operand_bits(f, inferred, arg), TypeBits::FIXNUM))
     {
         return Some(SpecType::Fixnum);
     }
@@ -384,10 +421,10 @@ fn statically_proven_spec_type(f: &Function, args: &[crate::t2::ir::Value]) -> O
     let all_single_numeric = !args.is_empty()
         && args
             .iter()
-            .all(|&arg| subset(f.value(arg).ty.bits, numeric));
+            .all(|&arg| subset(operand_bits(f, inferred, arg), numeric));
     let has_single = args
         .iter()
-        .any(|&arg| subset(f.value(arg).ty.bits, TypeBits::SINGLE_FLOAT));
+        .any(|&arg| subset(operand_bits(f, inferred, arg), TypeBits::SINGLE_FLOAT));
     (all_single_numeric && has_single).then_some(SpecType::SingleFloat)
 }
 
@@ -449,6 +486,7 @@ fn double_operands_admissible(
     args: &[Value],
     consts: &HashMap<Value, i64>,
     comparison: bool,
+    inferred: Option<&dyn OperandFacts>,
 ) -> bool {
     // Arithmetic also takes a fixnum variable beside a double (contagion).
     let variable_bits = if comparison {
@@ -458,7 +496,7 @@ fn double_operands_admissible(
     };
     let may_be_double = |arg: Value| {
         double_literal_bits(f, arg).is_some() || {
-            let bits = f.value(arg).ty.bits;
+            let bits = operand_bits(f, inferred, arg);
             double_constant_operand(f, arg, consts, comparison).is_none()
                 && !bits.is_bottom()
                 && !bits.meet(TypeBits::DOUBLE_FLOAT).is_bottom()
@@ -467,7 +505,7 @@ fn double_operands_admissible(
     args.len() == 2
         && args.iter().all(|&arg| {
             double_constant_operand(f, arg, consts, comparison).is_some() || {
-                let bits = f.value(arg).ty.bits;
+                let bits = operand_bits(f, inferred, arg);
                 !bits.is_bottom() && !bits.meet(variable_bits).is_bottom()
             }
         })
@@ -488,11 +526,12 @@ fn statically_proven_double(
     args: &[Value],
     consts: &HashMap<Value, i64>,
     comparison: bool,
+    inferred: Option<&dyn OperandFacts>,
 ) -> bool {
-    double_operands_admissible(f, args, consts, comparison)
+    double_operands_admissible(f, args, consts, comparison, inferred)
         && args.iter().all(|&arg| {
             double_constant_operand(f, arg, consts, comparison).is_some()
-                || f.value(arg).ty.bits == TypeBits::DOUBLE_FLOAT
+                || operand_bits(f, inferred, arg) == TypeBits::DOUBLE_FLOAT
         })
 }
 
@@ -509,12 +548,13 @@ fn reconcile_double(
     comparison: bool,
     spec: SpecType,
     options: SpeculateOptions,
+    inferred: Option<&dyn OperandFacts>,
 ) -> Option<SpecType> {
     let admitted = options.double_float
         && cfg!(target_arch = "x86_64")
-        && double_operands_admissible(f, args, consts, comparison);
+        && double_operands_admissible(f, args, consts, comparison, inferred);
     let known_double = args.iter().any(|&arg| {
-        f.value(arg).ty.bits == TypeBits::DOUBLE_FLOAT || double_literal_bits(f, arg).is_some()
+        operand_bits(f, inferred, arg) == TypeBits::DOUBLE_FLOAT || double_literal_bits(f, arg).is_some()
     });
     match spec {
         SpecType::DoubleFloat => admitted.then_some(SpecType::DoubleFloat),
@@ -679,13 +719,14 @@ fn reconcile_with_operands(
     f: &Function,
     args: &[crate::t2::ir::Value],
     spec: SpecType,
+    inferred: Option<&dyn OperandFacts>,
 ) -> Option<SpecType> {
     if spec == SpecType::DoubleFloat {
         return Some(spec);
     }
     let numeric = TypeBits::FIXNUM.join(TypeBits::SINGLE_FLOAT);
     let known = |arg: &crate::t2::ir::Value| {
-        let bits = f.value(*arg).ty.bits;
+        let bits = operand_bits(f, inferred, *arg);
         (!bits.is_bottom() && bits != TypeBits::TOP).then_some(bits)
     };
     if args.iter().filter_map(known).any(|bits| bits.meet(numeric).is_bottom()) {
@@ -702,14 +743,19 @@ fn reconcile_with_operands(
     }
 }
 
-/// Negative operand constraints for one immutable selection phase. These facts
-/// only veto impossible numeric guesses; they do not license unboxing or replace
-/// the existing floating-point contagion policy. Inference is lazy and shared
+/// Operand constraints for one immutable selection phase. Inferred types may
+/// correct a profiled family or veto an impossible guess. They never remove
+/// runtime guards or broaden floating-point contagion. Inference is lazy and shared
 /// across sites, and the snapshot is dropped before any IR mutation.
 #[derive(Default)]
 struct NumericConstraints(std::cell::OnceCell<super::infer::InferenceResult>);
 
 impl NumericConstraints {
+    fn inferred_for<'a>(&'a self, f: &Function, args: &[Value]) -> Option<&'a super::infer::InferenceResult> {
+        args.iter().any(|&arg| f.value(arg).ty.bits.0.count_ones() > 1)
+            .then(|| self.0.get_or_init(|| super::infer::infer(f)))
+    }
+
     fn excludes_numeric(&self, f: &Function, args: &[Value]) -> bool {
         let numeric = TypeBits::FIXNUM
             .join(TypeBits::BIGNUM)
@@ -817,12 +863,13 @@ fn double_only_operands(
     args: &[Value],
     consts: &HashMap<Value, i64>,
     observed: bool,
+    inferred: Option<&dyn OperandFacts>,
 ) -> bool {
     let proven = |value: Value| {
-        double_literal_bits(f, value).is_some() || f.value(value).ty.bits == TypeBits::DOUBLE_FLOAT
+        double_literal_bits(f, value).is_some() || operand_bits(f, inferred, value) == TypeBits::DOUBLE_FLOAT
     };
     let may_be_double = |value: Value| {
-        let bits = f.value(value).ty.bits;
+        let bits = operand_bits(f, inferred, value);
         !bits.is_bottom() && !bits.meet(TypeBits::DOUBLE_FLOAT).is_bottom()
     };
     let constant = |value: Value| double_constant_operand(f, value, consts, false);
@@ -831,7 +878,7 @@ fn double_only_operands(
             && (proven(args[0]) || (observed && constant(args[0]).is_none() && may_be_double(args[0])));
     }
     let fixnum = |value: Value| {
-        let bits = f.value(value).ty.bits;
+        let bits = operand_bits(f, inferred, value);
         !bits.is_bottom() && bits.meet(TypeBits::FIXNUM) == bits
     };
     let statically = args.len() == 2
@@ -842,7 +889,7 @@ fn double_only_operands(
     args.len() == 2
         && args.iter().any(|&arg| constant(arg).is_none())
         && constant(args[1]).is_none_or(|bits| f64::from_bits(bits) != 0.0)
-        && (statically || (observed && double_operands_admissible(f, args, consts, false)))
+        && (statically || (observed && double_operands_admissible(f, args, consts, false, inferred)))
 }
 
 /// Compile `SQRT`, unary `-` and binary `/` of doubles to raw operations
@@ -868,8 +915,8 @@ fn speculate_double_only_sites(
     let raw_double = (IRType::of(TypeBits::DOUBLE_FLOAT), ValueRepresentation::UnboxedF64);
     let mut n = 0;
     // Program order, so a site sees the refined type of an earlier one.
-    let sites: Vec<(Inst, SpecType)> = {
-        let constraints = NumericConstraints::default();
+    let constraints = NumericConstraints::default();
+    let sites: Vec<(Inst, SpecType, CapturedOperandFacts)> = {
         f.block_order().iter()
             .flat_map(|&block| f.block(block).insts.iter().copied())
             .filter_map(|site| {
@@ -883,11 +930,17 @@ fn speculate_double_only_sites(
                 }
                 let state = data.frame_state?;
                 let observed = profile(frame_state_bcp(f, state))?;
-                (!constraints.excludes_numeric(f, &data.args)).then_some((site, observed))
+                if constraints.excludes_numeric(f, &data.args) { return None; }
+                let inferred = constraints.inferred_for(f, &data.args).map(|facts| facts as &dyn OperandFacts);
+                if conflicting_operand_facts(f, inferred, &data.args) { return None; }
+                let captured = CapturedOperandFacts(data.args.iter().map(|&value|
+                    (value, operand_bits(f, inferred, value))).collect());
+                Some((site, observed, captured))
             })
             .collect()
     };
-    for (site, observed) in sites {
+    drop(constraints);
+    for (site, observed, facts) in sites {
         let data = f.inst(site).clone();
         let AuxData::CallTarget(symbol) = data.aux else { continue };
         if data.opcode != Opcode::Call || data.results.len() != 1 || !data.targets.is_empty() {
@@ -896,8 +949,13 @@ fn speculate_double_only_sites(
         let Some(opcode) = double_only_opcode(symbol, data.args.len()) else { continue };
         let Some(state) = data.frame_state else { continue };
         // Declined sites were excluded during the immutable selection phase.
-        if !double_only_operands(f, opcode, &data.args, consts,
-                observed == SpecType::DoubleFloat)
+        // Earlier expansions preserve these operands' successful values and
+        // can strengthen their declarations. Intersect both sources of type
+        // evidence; captured TOP never hides a newly declared double, while a
+        // known incompatible type cannot be forgotten by the fallback.
+        if conflicting_operand_facts(f, Some(&facts), &data.args)
+            || !double_only_operands(f, opcode, &data.args, consts,
+                observed == SpecType::DoubleFloat, Some(&facts))
         {
             continue;
         }
@@ -1086,16 +1144,27 @@ fn speculate_selected(
             let proven_double = options.double_float
                 && cfg!(target_arch = "x86_64")
                 && (arith_of(sym).is_some() || comparison)
-                && statically_proven_double(f, &data.args, &consts, comparison);
+                && statically_proven_double(f, &data.args, &consts, comparison, None);
             let Some(spec) = proven_double
                 .then_some(SpecType::DoubleFloat)
-                .or_else(|| statically_proven_spec_type(f, &data.args))
+                .or_else(|| statically_proven_spec_type(f, &data.args, None))
                 .or_else(|| {
-                    profile(bcp)
-                        .and_then(|spec| {
-                            reconcile_double(f, &data.args, &consts, comparison, spec, options)
-                        })
-                        .and_then(|spec| reconcile_with_operands(f, &data.args, spec))
+                    // New inferred proofs only select a family at an admitted
+                    // site. None can encode a previous overflow/domain failure;
+                    // operand types alone must not reactivate that speculation.
+                    profile(bcp).and_then(|observed| {
+                        let inferred = profiles_numeric_operands(sym)
+                            .then(|| constraints.inferred_for(f, &data.args))
+                            .flatten().map(|facts| facts as &dyn OperandFacts);
+                        if conflicting_operand_facts(f, inferred, &data.args) { return None; }
+                        let proven = options.double_float && cfg!(target_arch = "x86_64")
+                            && (arith_of(sym).is_some() || comparison)
+                            && statically_proven_double(f, &data.args, &consts, comparison, inferred);
+                        proven.then_some(SpecType::DoubleFloat)
+                            .or_else(|| statically_proven_spec_type(f, &data.args, inferred))
+                            .or_else(|| reconcile_double(f, &data.args, &consts, comparison, observed, options, inferred)
+                                .and_then(|spec| reconcile_with_operands(f, &data.args, spec, inferred)))
+                    })
                 })
             else {
                 continue;
@@ -2783,6 +2852,143 @@ mod tests {
         assert_eq!(format!("{:?}", f.inst(transfer)), original_transfer);
         assert_eq!(format!("{:?}", f.frame_states.get(state)), original_state);
         crate::t2::verify::verify(&f).unwrap();
+    }
+
+    // An unknown argument selects either literal, then the join is consumed twice.
+    // This deliberately exercises the bytecode producer and its TOP-declared phi,
+    // rather than manufacturing a narrowed parameter in the test.
+    #[cfg(target_arch = "x86_64")]
+    fn numeric_join_from_bytecode(left: TypeBits, right: TypeBits) -> (Function, Inst) {
+        use egcl_rt::bytecode::{BytecodeFunction, Instr};
+        use egcl_rt::value::EgclVal;
+        let plus = egcl_rt::symbols::intern("+");
+        let owner = egcl_rt::symbols::intern("INFERRED-NUMERIC-JOIN");
+        egcl_rt::rooted!(a = if left == TypeBits::DOUBLE_FLOAT {
+            egcl_rt::gc::alloc_double_float(1.25)
+        } else if left == TypeBits::SINGLE_FLOAT {
+            EgclVal::from_single_float(1.25)
+        } else {
+            EgclVal::from_fixnum(3)
+        });
+        egcl_rt::rooted!(b = if right == TypeBits::DOUBLE_FLOAT {
+            egcl_rt::gc::alloc_double_float(2.5)
+        } else if right == TypeBits::SINGLE_FLOAT {
+            EgclVal::from_single_float(2.5)
+        } else {
+            EgclVal::from_fixnum(7)
+        });
+        let body = BytecodeFunction {
+            self_call_sites: vec![],
+            notinline_sites: vec![],
+            code: vec![
+                Instr::LoadLocal(0),
+                Instr::BrIfFalse(4),
+                Instr::Const(0),
+                Instr::Br(5),
+                Instr::Const(1),
+                Instr::StoreLocal(1),
+                Instr::LoadLocal(1),
+                Instr::LoadLocal(1),
+                Instr::CallNamed { sym: plus, nargs: 2 },
+                Instr::Return,
+            ],
+            constants: vec![*a, *b],
+            load_time_values: vec![],
+            handler_cases: vec![],
+            handler_binds: vec![],
+            names: vec![],
+            restart_cases: vec![],
+            nested_functions: vec![],
+            param_layout: vec![],
+            param_types: vec![],
+            has_env: false,
+            n_locals: 2,
+            max_stack: 2,
+            arity: 1,
+            name: "inferred-numeric-join".into(),
+            params_form: egcl_rt::value::NIL,
+            min_args: 1,
+            max_args: Some(1),
+            variadic: false,
+            binder_cache: Default::default(),
+        };
+        // No live heap inspection on the builder side: capture the rooted literals
+        // first, exactly as the compilation owner does for a worker.
+        let snapshot = crate::t2::constants::BytecodeSnapshot::capture(&body);
+        let f = crate::t2::build::build_from_snapshot(
+            &snapshot,
+            crate::t2::inlining::InlineOptions::default().with_root_symbol(owner),
+        ).unwrap();
+        crate::t2::verify::verify(&f).unwrap();
+        let call = f.block_order().iter()
+            .flat_map(|&block| f.block(block).insts.iter().copied())
+            .find(|&inst| matches!(f.inst(inst).opcode, Opcode::Call | Opcode::Invoke)
+                && matches!(f.inst(inst).aux, AuxData::CallTarget(symbol) if symbol == plus))
+            .expect("the builder must retain the generic arithmetic call");
+        let facts = crate::t2::infer::infer(&f);
+        for &operand in &f.inst(call).args {
+            assert_eq!(f.value(operand).ty, IRType::TOP, "join stays undeclared");
+            assert!(matches!(f.value(operand).def, crate::t2::ir::ValueDef::Param { .. }),
+                "the arithmetic consumes a real forwarding/join parameter");
+            assert_eq!(facts.ty(operand).bits, left.join(right));
+        }
+        (f, call)
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn inferred_numeric_joins_override_stale_profiles_with_the_proven_family() {
+        for (family, stale, expected) in [
+            (TypeBits::FIXNUM, SpecType::SingleFloat, Opcode::FixnumAdd),
+            (TypeBits::SINGLE_FLOAT, SpecType::Fixnum, Opcode::FloatAdd),
+            (TypeBits::DOUBLE_FLOAT, SpecType::Fixnum, Opcode::BoxFloat),
+        ] {
+            let (mut f, call) = numeric_join_from_bytecode(family, family);
+            assert_eq!(speculate_with(&mut f, &|_| Some(stale), DOUBLE_FLOAT), 1);
+            assert_eq!(f.inst(call).opcode, expected, "inferred family {family:?}");
+            if family == TypeBits::DOUBLE_FLOAT {
+                assert_eq!(raw_operation(&f, call).opcode, Opcode::FloatAdd);
+                assert_eq!(f.value(raw_operation(&f, call).results[0]).repr,
+                    ValueRepresentation::UnboxedF64);
+            } else {
+                assert_eq!(f.value(f.inst(call).results[0]).ty.bits, family);
+            }
+            crate::t2::verify::verify(&f).unwrap();
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn inferred_numeric_joins_do_not_reenable_a_site_without_feedback() {
+        for family in [TypeBits::FIXNUM, TypeBits::SINGLE_FLOAT, TypeBits::DOUBLE_FLOAT] {
+            let (mut f, call) = numeric_join_from_bytecode(family, family);
+            let before = format!("{:?}", f.inst(call));
+            let state = f.inst(call).frame_state.unwrap();
+            let before_state = format!("{:?}", f.frame_states.get(state));
+            let count = f.num_insts();
+            assert_eq!(speculate_with(&mut f, &|_| None, DOUBLE_FLOAT), 0);
+            assert_eq!(format!("{:?}", f.inst(call)), before);
+            assert_eq!(format!("{:?}", f.frame_states.get(state)), before_state);
+            assert_eq!(f.num_insts(), count, "absent/declined feedback is not a new license");
+            crate::t2::verify::verify(&f).unwrap();
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn ambiguous_numeric_join_keeps_profile_selection_and_runtime_guards() {
+        let (f, call) = numeric_join_from_bytecode(TypeBits::FIXNUM, TypeBits::SINGLE_FLOAT);
+        for (profile, expected) in [
+            (SpecType::Fixnum, Opcode::FixnumAdd),
+            (SpecType::SingleFloat, Opcode::FloatAdd),
+        ] {
+            let mut g = f.clone();
+            assert_eq!(speculate_with(&mut g, &|_| Some(profile), DOUBLE_FLOAT), 1);
+            assert_eq!(g.inst(call).opcode, expected);
+            assert!(g.inst(call).flags.guard && g.inst(call).frame_state.is_some(),
+                "ambiguous joins must retain the typed operation's runtime checks and recovery state");
+            crate::t2::verify::verify(&g).unwrap();
+        }
     }
 
 }

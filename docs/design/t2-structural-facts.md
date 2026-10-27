@@ -126,3 +126,40 @@ shared across its candidates. The snapshot is discarded before mutation. The
 same rule applies before variadic-double splitting and before double-only
 expansion, so those entrances cannot bypass the constraint. Operands whose
 declared types are already numeric need no additional inference query.
+
+## Inferred numeric family selection
+
+At a site with admitted profile feedback, inferred operand types can now select
+a numeric family ahead of a stale profile. The existing declared-type path is
+unchanged. A new inferred-positive path never overrides `None` feedback: even
+fixnum operands can overflow, and double operands can encounter zero divisors,
+negative square roots, or unordered comparisons. Those failures still retire
+the speculation through the existing feedback policy.
+
+```lisp
+(defun inferred-double-join (flag other arithmetic)
+  (let ((n (if flag 1.25d0 2.5d0)))
+    (if arithmetic (+ n other) n)))
+```
+
+The builder gives the join value an unknown declared type. Inference joins two
+double constants and proves DOUBLE-FLOAT. A cold fixnum guess for the addition
+can therefore select the existing guarded double path instead, including its
+existing fixnum contagion rules for `other`. Single-float and fixnum joins use
+their corresponding families; ambiguous unions still require profile checks.
+No inferred fact changes the SSA value's declaration or representation merely
+to pass information between these decisions.
+
+Double heap literals retain their semantic type only when both the builder's
+declaration and immutable captured double metadata agree. Inference does not
+read a live or movable heap object. This preserves the literal's type through
+joins without claiming that an arbitrary heap constant is a double.
+
+The double-only phase captures operand type bits before rewriting calls, then
+discards the complete analysis snapshot. Earlier expansions preserve the same
+successful Lisp result values, so captured semantic bits remain valid and can
+be intersected with strengthened declarations in program order. Conflicting
+facts reject specialization. Exact literal conversions, operand guards, overflow,
+NaN and domain checks, recovery states, and multiple-value effects remain in
+place. Global result/phi facts are covered here; using a branch-local constraint
+for an original input requires a separate per-use query.
