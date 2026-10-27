@@ -125,7 +125,7 @@ fn emit_body(a: &mut Asm, success_dst: u8, final_dst: u8, partial: bool) -> Resu
     load_from_rsp(a, RAX, 24);
     mov_rr(a, SCRATCH, RAX);
     alu_r_imm(a, 4, SCRATCH, 7);
-    alu_r_imm(a, 7, SCRATCH, 0);
+    // AND already sets ZF for the fixnum tag; consume it directly.
     a.jcc(Cc::E, fixnum);
     alu_r_imm(a, 7, SCRATCH, egcl_rt::value::TAG_HEAP_OBJECT as i32);
     a.jcc(Cc::Ne, failed);
@@ -157,7 +157,7 @@ fn emit_body(a: &mut Asm, success_dst: u8, final_dst: u8, partial: bool) -> Resu
     load_mem64_disp(a, RAX, RAX, 16);
     mov_rr(a, SCRATCH, RAX);
     shr_imm(a, SCRATCH, 60);
-    alu_r_imm(a, 7, SCRATCH, 0); // canonical positive magnitude >= 2^60
+    // SHR already sets ZF: canonical positive magnitude must be >= 2^60.
     a.jcc(Cc::E, failed);
     mov_imm64(a, SCRATCH, 0);
     a.jmp(decoded);
