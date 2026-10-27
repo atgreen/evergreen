@@ -165,6 +165,8 @@ pub mod op {
     pub const INTEGER_LOW_BITS: u32 = 0x0037;
     pub const TRY_INTEGER_SHR: u32 = 0x0038;
     pub const SMALL_VECTOR_RANGE: u32 = 0x0039;
+    pub const TRY_STORE_INTEGER_OCTETS8: u32 = 0x003a;
+    pub const NATIVE_POLL: u32 = 0x003b;
 
     // ── 0x30 float ALU ───────────────────────────────────────────────
     pub const FADD: u32 = 0x0030;
@@ -673,6 +675,8 @@ fn lower_inst(lo: &mut Lowering, inst: Inst) {
         LogNot => un!(op::NOT),
         IntegerLowBits => un!(op::INTEGER_LOW_BITS),
         TryIntegerShr => lo.emit_annotated(inst, op::TRY_INTEGER_SHR, defs, uses),
+        TryStoreIntegerOctets8 => lo.emit_annotated(inst, op::TRY_STORE_INTEGER_OCTETS8, defs, uses),
+        NativePoll => lo.emit_annotated(inst, op::NATIVE_POLL, defs, uses),
         SmallVectorRangeP => lo.emit_annotated(inst, op::SMALL_VECTOR_RANGE, defs, uses),
 
         // ── box / unbox / widen ──

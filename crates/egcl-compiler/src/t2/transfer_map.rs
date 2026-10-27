@@ -356,6 +356,61 @@ pub(crate) fn lower_poll_transfer_map(
     })
 }
 
+/// Lower an explicit bounded-region poll without advertising an OSR entry.
+/// Transparent local control scopes persist in the source-backed poll payload. Unlike
+/// the legacy header map, every explicit frame-state source must be recoverable;
+/// an absent home cannot silently become NIL. Operand-stack slots are retained.
+#[cfg_attr(not(all(target_arch = "x86_64", target_os = "linux")), allow(dead_code))]
+pub(crate) fn lower_explicit_poll_transfer_map(
+    f: &Function,
+    inst: Inst,
+    machine_inst: usize,
+    values: &crate::t2::x64_frame::FrameValues,
+) -> Option<TransferCaptureMap> {
+    use crate::t2::frame_state::ValueSource;
+    use crate::t2::x64_frame::FrameValueLocation;
+    let data = f.inst(inst);
+    if data.opcode != super::ir::Opcode::NativePoll { return None; }
+    let mut state = f.frame_states.get(data.frame_state?).clone();
+    if state.scopes.len() != 1 { return None; }
+    let scope = &state.scopes[0];
+    let AuxData::BoundedPoll { scope: origin, .. } = &data.aux else { return None; };
+    if origin.function != scope.function || origin.bcp != scope.bcp
+        || !super::octet_word_fusion::bounded_poll_scopes_supported(&origin.control_scopes)
+    { return None; }
+    let control_scopes = origin.control_scopes.clone();
+    let origin_bcp = scope.bcp;
+    let substitute = |source: &mut ValueSource| -> Option<()> {
+        if let ValueSource::Value { value, .. } = source {
+            match values.value(*value)?.location {
+                FrameValueLocation::Immediate(value) => *source = ValueSource::Const(value),
+                FrameValueLocation::RawImmediate(bits) =>
+                    *source = ValueSource::Const(egcl_rt::value::EgclVal::from_fixnum(bits as i64)),
+                FrameValueLocation::Home(_) => {}
+            }
+        }
+        Some(())
+    };
+    let scope = &mut state.scopes[0];
+    for source in scope.locals.iter_mut().chain(&mut scope.stack) {
+        substitute(source)?;
+    }
+    for recipe in &mut state.remat {
+        for source in &mut recipe.inputs { substitute(source)?; }
+    }
+    let frames = deopt::lower_one(0, &state, &|value| match values.value(value)?.location {
+        FrameValueLocation::Home(home) => home.location(),
+        FrameValueLocation::Immediate(_) | FrameValueLocation::RawImmediate(_) => None,
+    }).ok()?.scopes;
+    let mut roots = Vec::new();
+    for frame in &frames {
+        for slot in &frame.slots { collect_roots(slot, &mut roots); }
+    }
+    Some(TransferCaptureMap {
+        call: inst, machine_inst, origin_bcp, control_scopes, frames, roots,
+    })
+}
+
 #[cfg(test)]
 mod poll_scope_tests {
     use super::lower_poll_transfer_map;
@@ -462,5 +517,113 @@ mod poll_scope_tests {
                 "poll must describe the exact scope stack at header {bcp}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod explicit_poll_tests {
+    use super::*;
+    use crate::t2::frame_state::{FrameScope, FrameState, RematOp, RematRecipe, RematRecipeId, ValueSource};
+    use crate::t2::ir::{BoundedPollScope, IRType, InstData, InstFlags, OsrEntry, ValueRepresentation};
+    use egcl_rt::EgclVal;
+    use std::collections::HashMap;
+
+    #[test]
+    fn explicit_poll_keeps_source_scope_payload_stack_remat_and_exact_homes_without_osr_entries() {
+        let mut f = Function::new("explicit-poll-state");
+        let block = f.entry();
+        let state = f.frame_states.add(FrameState {
+            scopes: vec![FrameScope {
+                function: 1, bcp: 7,
+                locals: vec![ValueSource::Const(EgclVal::from_fixnum(42))],
+                stack: vec![ValueSource::Const(EgclVal::from_fixnum(99)), ValueSource::Remat(RematRecipeId(0))],
+            }], remat: vec![RematRecipe {
+                op: RematOp::FixnumAdd,
+                inputs: vec![ValueSource::Const(EgclVal::from_fixnum(3)), ValueSource::Const(EgclVal::from_fixnum(4))],
+                result_repr: ValueRepresentation::UnboxedFixnum,
+            }],
+        });
+        f.osr_entries.push(OsrEntry {
+            control_scopes: vec![], bcp: 7, block, frame_state: state, checks: vec![],
+        });
+        let origin = BoundedPollScope { function: 1, bcp: 7, control_scopes: vec![] };
+        let (poll, _) = f.push_inst(block, InstData {
+            opcode: Opcode::NativePoll, args: vec![], results: vec![],
+            aux: AuxData::BoundedPoll { exit: false, scope: origin.clone() },
+            flags: InstFlags { effectful: true, safepoint: true, ..Default::default() },
+            targets: vec![], frame_state: Some(state), source_pos: 0,
+        }, &[]);
+        let (_, zero) = f.push_inst(block, InstData {
+            opcode: Opcode::ConstFixnum, args: vec![], results: vec![], aux: AuxData::FixnumImm(0),
+            flags: InstFlags::default(), targets: vec![], frame_state: None, source_pos: 0,
+        }, &[(IRType::TOP, ValueRepresentation::Tagged)]);
+        f.set_terminator(block, InstData {
+            opcode: Opcode::Return, args: zero, results: vec![], aux: AuxData::None,
+            flags: InstFlags::default(), targets: vec![], frame_state: None, source_pos: 0,
+        });
+        let mut machine = crate::t2::lower::lower(&f);
+        crate::t2::regalloc::allocate(&mut machine).unwrap();
+        let homes = crate::t2::x64_frame::select_frame_homes(&f, &machine, |_| false).unwrap();
+        let values = crate::t2::x64_frame::resolve_values_before(
+            &f, &machine, &homes, &HashMap::new(), machine.blocks[0].start,
+        ).unwrap();
+        // Ordinary publication removes external OSR imports. The boundary's
+        // immutable source proof must survive that legitimate transformation.
+        f.osr_entries.clear();
+        let map = lower_explicit_poll_transfer_map(&f, poll, 0, &values).unwrap();
+        assert!(map.control_scopes.is_empty());
+        assert_eq!(map.frames[0].resume_pc, 7);
+        assert_eq!(map.frames[0].num_locals, 1);
+        assert_eq!(map.frames[0].slots[..2], [
+            SlotDescriptor::MaterializeConst(EgclVal::from_fixnum(42)),
+            SlotDescriptor::MaterializeConst(EgclVal::from_fixnum(99)),
+        ]);
+        let SlotDescriptor::Remat(recipe) = &map.frames[0].slots[2] else { panic!("preserve rematerialisation"); };
+        assert_eq!(recipe.op, RematOp::FixnumAdd);
+        assert_eq!(recipe.inputs, vec![
+            SlotDescriptor::MaterializeConst(EgclVal::from_fixnum(3)),
+            SlotDescriptor::MaterializeConst(EgclVal::from_fixnum(4)),
+        ]);
+        let transparent = vec![crate::control_scope::ControlScope {
+            push_bcp: 1, ownership: crate::control_scope::Ownership::Local, sp_restore: 0,
+            kind: crate::control_scope::ScopeKind::Tagbody { id: 3 },
+        }, crate::control_scope::ControlScope {
+            push_bcp: 2, ownership: crate::control_scope::Ownership::Local, sp_restore: 0,
+            kind: crate::control_scope::ScopeKind::LexicalEnvironment,
+        }, crate::control_scope::ControlScope {
+            push_bcp: 3, ownership: crate::control_scope::Ownership::Local, sp_restore: 0,
+            kind: crate::control_scope::ScopeKind::Block { id: 4, resume_bcp: 20, register: false },
+        }];
+        let mut with_scopes = origin.clone();
+        with_scopes.control_scopes = transparent.clone();
+        f.inst_mut(poll).aux = AuxData::BoundedPoll { exit: true, scope: with_scopes.clone() };
+        assert_eq!(lower_explicit_poll_transfer_map(&f, poll, 0, &values).unwrap().control_scopes, transparent);
+        for (function, bcp) in [(2, 7), (1, 8)] {
+            let mut wrong = with_scopes.clone();
+            wrong.function = function; wrong.bcp = bcp;
+            f.inst_mut(poll).aux = AuxData::BoundedPoll { exit: false, scope: wrong };
+            assert!(lower_explicit_poll_transfer_map(&f, poll, 0, &values).is_none());
+        }
+        let mut inherited = with_scopes.clone();
+        inherited.control_scopes[0].ownership = crate::control_scope::Ownership::Inherited;
+        f.inst_mut(poll).aux = AuxData::BoundedPoll { exit: false, scope: inherited };
+        assert!(lower_explicit_poll_transfer_map(&f, poll, 0, &values).is_none());
+        let mut unsupported = origin.clone();
+        unsupported.control_scopes = vec![crate::control_scope::ControlScope {
+            push_bcp: 1, ownership: crate::control_scope::Ownership::Local, sp_restore: 0,
+            kind: crate::control_scope::ScopeKind::Catch { resume_bcp: 20 },
+        }];
+        f.inst_mut(poll).aux = AuxData::BoundedPoll { exit: false, scope: unsupported };
+        assert!(lower_explicit_poll_transfer_map(&f, poll, 0, &values).is_none());
+        f.inst_mut(poll).aux = AuxData::BoundedPoll { exit: false, scope: origin };
+        let missing = f.add_block_param(block, IRType::TOP, ValueRepresentation::Tagged);
+        f.frame_states.get_mut(state).remat[0].inputs[0] = ValueSource::Value { value: missing, repr: ValueRepresentation::Tagged };
+        assert!(lower_explicit_poll_transfer_map(&f, poll, 0, &values).is_none(), "recipe inputs need exact homes too");
+        f.frame_states.get_mut(state).remat[0].inputs[0] = ValueSource::Const(EgclVal::from_fixnum(3));
+        f.frame_states.get_mut(state).scopes[0].stack = vec![ValueSource::Value {
+            value: missing, repr: ValueRepresentation::Tagged,
+        }];
+        assert!(lower_explicit_poll_transfer_map(&f, poll, 0, &values).is_none(),
+            "a missing recovery source must never silently materialize NIL");
     }
 }

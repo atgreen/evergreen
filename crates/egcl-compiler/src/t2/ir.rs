@@ -388,6 +388,15 @@ pub enum Opcode {
     /// establishes a small-header simple vector and fixnum endpoints with
     /// 0 <= start <= end <= length. Never allocates, errors or deoptimizes.
     SmallVectorRangeP,
+    /// Success-only bounded store: tagged (packed-U8 array, start, end,
+    /// integer) -> (T/NIL, fixnum ASH64). True requires an exact eight-byte
+    /// span and a fixnum/canonical one-limb integer; writes eight little-endian
+    /// octets and returns 0 or -1. False writes nothing and returns fixnum zero.
+    /// No allocation, helper call, deopt or interior safepoint. Ordered effect.
+    TryStoreIntegerOctets8,
+    /// Explicit block-entry poll around a bounded straight-line replacement.
+    /// No operands/results; exact entry/exit recovery state is mandatory.
+    NativePoll,
 }
 
 impl Opcode {
@@ -424,6 +433,16 @@ pub struct InstFlags {
 pub struct BlockCall {
     pub block: Block,
     pub args: Vec<Value>,
+}
+
+/// Source-backed logical recovery scope for a bounded poll. Ordinary native
+/// lowering may discard OSR import records; this exact original scope chain
+/// must survive independently, just as TransferSite keeps its source scopes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BoundedPollScope {
+    pub function: u32,
+    pub bcp: u32,
+    pub control_scopes: Vec<crate::control_scope::ControlScope>,
 }
 
 /// Opcode-specific immediate payload.
@@ -545,6 +564,9 @@ pub enum AuxData {
     /// string representations whose layout still requires generic dispatch.
     StringLayout,
     ClassRef(u32),
+    /// Distinguish pre-effect and post-effect native poll origins. This is
+    /// bookkeeping, not permission to ignore the instruction's FrameState.
+    BoundedPoll { exit: bool, scope: BoundedPollScope },
 }
 
 impl AuxData {

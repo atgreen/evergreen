@@ -13,6 +13,9 @@ mod array_constructor_relocation;
 #[path = "ordinary_vector_range_relocation.rs"]
 mod vector_range_relocation;
 
+#[path = "ordinary_octet_word_store_relocation.rs"]
+mod octet_word_store_relocation;
+
 thread_local! {
     // An address for comparison only: this deliberately is not a GC root.
     static ALLOCATED_ROOT: Cell<u64> = const { Cell::new(0) };

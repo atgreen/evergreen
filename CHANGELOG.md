@@ -23,6 +23,11 @@
 
 ### Performance
 
+- T2 combines eligible eight-byte integer serialization loops into one native
+  word store on x86-64 Linux, preserving checked fallback, loop results, and
+  precise GC and interrupt boundaries
+  ([#704](https://github.com/atgreen/evergreen/pull/704)).
+
 - T2 checks vector layout and bounds once before eligible counted store loops,
   preserving checked fallback, reference barriers, and moving-GC safety
   ([#699](https://github.com/atgreen/evergreen/pull/699)).

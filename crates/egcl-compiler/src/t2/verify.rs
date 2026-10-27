@@ -702,6 +702,42 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                             format!("block{bi} requires a guarded tagged store and its SSA witness")));
                     }
                 }
+                if data.opcode == Opcode::TryStoreIntegerOctets8 {
+                    use crate::t2::ir::{TypeBits, ValueRepresentation as Repr};
+                    let valid = data.args.iter().chain(&data.results)
+                        .all(|value| valid_values.contains(&value.0));
+                    if !valid || data.args.len() != 4 || data.results.len() != 2
+                        || data.flags != (crate::t2::ir::InstFlags { effectful: true, ..Default::default() })
+                        || data.frame_state.is_some() || !data.targets.is_empty()
+                        || !matches!(data.aux, AuxData::None)
+                        || (valid && data.results.len() == 2 &&
+                            (data.args.iter().chain(&data.results).any(|&v| f.value(v).repr != Repr::Tagged)
+                                || f.value(data.results[0]).ty.bits != TypeBits::SYMBOL.join(TypeBits::NULL)
+                                || f.value(data.results[1]).ty.bits != TypeBits::FIXNUM)) {
+                        errors.push(VerifyError::new("V8 octet-word-store-contract",
+                            format!("block{bi} requires four tagged operands and effectful-only (boolean, fixnum) results")));
+                    }
+                }
+                if data.opcode == Opcode::NativePoll {
+                    // Source-backed scope metadata survives ordinary lowering,
+                    // which legitimately removes the OSR import records.
+                    let scope_proven = data.frame_state.filter(|id| (id.0 as usize) < f.frame_states.len())
+                        .is_some_and(|id| {
+                            let [frame] = f.frame_states.get(id).scopes.as_slice() else { return false; };
+                            let AuxData::BoundedPoll { scope, .. } = &data.aux else { return false; };
+                            scope.function == frame.function && scope.bcp == frame.bcp
+                                && crate::t2::octet_word_fusion::bounded_poll_scopes_supported(&scope.control_scopes)
+                        });
+                    if !scope_proven || pos != 0 || !data.args.is_empty() || !data.results.is_empty()
+                        || !data.targets.is_empty() || data.frame_state.is_none()
+                        || data.flags != (crate::t2::ir::InstFlags {
+                            effectful: true, safepoint: true, ..Default::default() })
+                        || !matches!(data.aux, AuxData::BoundedPoll { .. }) {
+                        errors.push(VerifyError::new("V8 bounded-native-poll-contract",
+                            format!("block{bi} requires a first-in-block effectful safepoint with an exact FrameState")));
+                    }
+                }
+
                 if data.opcode == Opcode::TryIntegerShr {
                     use crate::t2::ir::{TypeBits, ValueRepresentation as Repr};
                     let valid = data.args.iter().chain(&data.results).all(|v| valid_values.contains(&v.0));
@@ -2174,4 +2210,76 @@ mod tests {
             "{errs:?}"
         );
     }
+    #[test]
+    fn octet_word_store_requires_tagged_outputs_and_effectful_only_flags() {
+        for malformed in 0..5 {
+            let mut f = Function::new("octet-word-contract");
+            let entry = f.entry();
+            let args: Vec<_> = (0..4).map(|_| f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged)).collect();
+            let mut d = inst(Opcode::TryStoreIntegerOctets8);
+            d.args = args.clone();
+            d.flags.effectful = true;
+            let (i, values) = f.push_inst(entry, d, &[
+                (IRType::of(TypeBits::SYMBOL.join(TypeBits::NULL)), ValueRepresentation::Tagged),
+                (fixnum(), ValueRepresentation::Tagged),
+            ]);
+            f.set_terminator(entry, ret(vec![values[1]]));
+            match malformed {
+                0 => { verify(&f).unwrap(); continue; }
+                1 => f.inst_mut(i).flags.effectful = false,
+                2 => f.inst_mut(i).flags.call = true,
+                3 => f.set_repr(args[0], ValueRepresentation::UnboxedFixnum),
+                _ => { f.inst_mut(i).args.pop(); }
+            }
+            let errors = verify(&f).unwrap_err();
+            assert!(errors.iter().any(|e| e.check == "V8 octet-word-store-contract"), "{errors:?}");
+        }
+    }
+
+    #[test]
+    fn bounded_native_poll_requires_exact_state_and_first_block_position() {
+        for malformed in 0..8 {
+            let mut f = Function::new("bounded-poll-contract");
+            let entry = f.entry();
+            let fs = f.frame_states.add(FrameState { scopes: vec![FrameScope {
+                function: 0, bcp: 0, locals: vec![], stack: vec![],
+            }], remat: vec![] });
+            if malformed == 4 { const_fixnum(&mut f, entry, 1); }
+            let mut d = inst(Opcode::NativePoll);
+            d.aux = AuxData::BoundedPoll { exit: false, scope: crate::t2::ir::BoundedPollScope {
+                function: 0, bcp: 0, control_scopes: vec![],
+            } };
+            d.flags = InstFlags { effectful: true, safepoint: true, ..Default::default() };
+            d.frame_state = Some(fs);
+            match malformed {
+                1 => d.frame_state = None,
+                2 => d.flags.call = true,
+                3 => d.aux = AuxData::None,
+                5 => {
+                    let AuxData::BoundedPoll { scope, .. } = &mut d.aux else { unreachable!(); };
+                    scope.function = 1;
+                }
+                7 => {
+                    use crate::control_scope::{ControlScope, Ownership, ScopeKind};
+                    let AuxData::BoundedPoll { scope, .. } = &mut d.aux else { unreachable!(); };
+                    scope.control_scopes.push(ControlScope { push_bcp: 0, ownership: Ownership::Inherited,
+                        sp_restore: 0, kind: ScopeKind::Tagbody { id: 0 } });
+                }
+                6 => {
+                    let mut different = f.frame_states.get(fs).clone();
+                    different.scopes[0].bcp = 1;
+                    d.frame_state = Some(f.frame_states.add(different));
+                }
+                _ => {}
+            }
+            f.push_inst(entry, d, &[]);
+            f.set_terminator(entry, ret(vec![]));
+            if malformed == 0 { assert!(f.osr_entries.is_empty()); verify(&f).unwrap(); }
+            else {
+                let errors = verify(&f).unwrap_err();
+                assert!(errors.iter().any(|e| e.check == "V8 bounded-native-poll-contract"), "{errors:?}");
+            }
+        }
+    }
+
 }
