@@ -456,6 +456,8 @@ pub enum AuxData {
     /// a movable callable. This guard stays ordered with calls and stores.
     BuiltinBinding { address: usize, expected: u64 },
     CallTarget(u32),
+    /// Named dispatch retained by NOTINLINE; no compiler intrinsic/body expansion.
+    OpaqueCallTarget(u32),
     /// Evaluate an owned constant form through the native-transfer bridge.
     HostEval(u16),
     /// Read a function designator through the native-transfer bridge.
@@ -543,6 +545,16 @@ pub enum AuxData {
     /// string representations whose layout still requires generic dispatch.
     StringLayout,
     ClassRef(u32),
+}
+
+impl AuxData {
+    /// Resolve late named dispatch without granting permission to inline it.
+    pub fn named_call_target(&self) -> Option<u32> {
+        match self {
+            Self::CallTarget(symbol) | Self::OpaqueCallTarget(symbol) => Some(*symbol),
+            _ => None,
+        }
+    }
 }
 
 /// One instruction. Terminators carry `targets`; guards/deoptimising insts carry
@@ -1036,7 +1048,7 @@ impl Function {
         let data = self.inst(call).clone();
         if data.opcode != Opcode::Call
             || data.frame_state.is_none()
-            || !matches!(data.aux, AuxData::CallTarget(_) | AuxData::GlobalValue { .. }
+            || !matches!(data.aux, AuxData::CallTarget(_) | AuxData::OpaqueCallTarget(_) | AuxData::GlobalValue { .. }
                 | AuxData::FunctionLookup(_) | AuxData::ValuesToList)
             || !self.block_has_terminator(block)
         {

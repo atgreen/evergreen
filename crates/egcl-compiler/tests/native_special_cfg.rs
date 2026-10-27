@@ -16,6 +16,7 @@ fn special_body() -> BytecodeFunction {
     let y = egcl_rt::symbols::intern("*NATIVE-SPECIAL-Y*");
     BytecodeFunction {
         self_call_sites: Vec::new(),
+        notinline_sites: Vec::new(),
         name: "native-special-cfg".into(),
         code: vec![
             Instr::LoadLocal(0),

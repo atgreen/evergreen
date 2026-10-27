@@ -154,6 +154,7 @@ fn leaf(guarded: bool) -> Function {
 fn call_body() -> Function {
     let body = BytecodeFunction {
         self_call_sites: Vec::new(),
+        notinline_sites: Vec::new(),
         name: "native-return-call".into(),
         code: vec![Instr::CallNamed { sym: 1, nargs: 0 }, Instr::Return],
         constants: vec![],

@@ -149,6 +149,7 @@ mod tests {
     fn body(constants: Vec<EgclVal>) -> BytecodeFunction {
         BytecodeFunction {
             self_call_sites: vec![],
+            notinline_sites: vec![],
             code: vec![Instr::Const(0), Instr::Return],
             constants,
             load_time_values: vec![],
@@ -275,4 +276,28 @@ mod tests {
             Some(2.5_f64.to_bits())
         );
     }
+    #[test]
+    fn snapshot_keeps_notinline_call_policy_after_source_mutation() {
+        let mut source = body(vec![EgclVal::from_fixnum(7)]);
+        let symbol = egcl_rt::symbols::intern("IDENTITY");
+        source.code.insert(
+            1,
+            Instr::CallNamed {
+                sym: symbol,
+                nargs: 1,
+            },
+        );
+        source.notinline_sites = vec![1];
+        let snapshot = BytecodeSnapshot::capture(&source);
+        source.notinline_sites.clear();
+        assert_eq!(snapshot.body.notinline_sites, vec![1]);
+        let ir = build::build_from_snapshot(&snapshot, options()).unwrap();
+        assert!(
+            ir.block_order()
+                .iter()
+                .flat_map(|&b| &ir.block(b).insts)
+                .any(|&i| matches!(ir.inst(i).aux, AuxData::OpaqueCallTarget(s) if s == symbol))
+        );
+    }
+
 }

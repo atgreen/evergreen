@@ -270,6 +270,9 @@ pub struct BytecodeFunction {
     /// NOTINLINE. Instruction indices survive cloning and must follow rewrites.
     /// Empty for legacy/synthetic bodies without that positive source proof.
     pub self_call_sites: Vec<u32>,
+    /// Named call instruction PCs that source NOTINLINE declarations keep opaque
+    /// to compiler specialization, while retaining ordinary named dispatch.
+    pub notinline_sites: Vec<u32>,
     pub code: Vec<Instr>,
     pub constants: Vec<EgclVal>,
     /// Compiler-only LOAD-TIME-VALUE initializers: (cell constant slot, form).

@@ -158,6 +158,10 @@
 
 ### Fixed
 
+- `NOTINLINE` declarations remain effective through native specialization,
+  while preserving argument evaluation and lookup of redefined functions
+  ([#703](https://github.com/atgreen/evergreen/pull/703)).
+
 - `WRITE-TO-STRING` honors printer controls under every forced tier during
   bootstrap, avoiding an undefined-function error from a later macro definition
   ([#700](https://github.com/atgreen/evergreen/pull/700)).

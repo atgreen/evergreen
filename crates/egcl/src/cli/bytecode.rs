@@ -2529,6 +2529,7 @@ fn constant_reference_folding_enabled() -> bool {
 struct Lowerer<'e> {
     self_symbol: Option<u32>,
     self_call_sites: Vec<u32>,
+    notinline_sites: Vec<u32>,
     inline_policies: Vec<(u32, bool)>,
     code: Vec<Instr>,
     constants: Vec<EgclVal>,
@@ -2746,6 +2747,7 @@ impl<'e> Lowerer<'e> {
         Lowerer {
             self_symbol: None,
             self_call_sites: Vec::new(),
+            notinline_sites: Vec::new(),
             inline_policies: env.active_declarations.iter().flat_map(|&specifier| self_calls::declaration_inline_policies(specifier)).collect(),
             code: Vec::new(),
             constants: Vec::new(),
@@ -2797,6 +2799,11 @@ impl<'e> Lowerer<'e> {
     }
 
     fn emit(&mut self, i: Instr) {
+        if let Instr::CallNamed { sym, .. } = i
+            && self_calls::notinline(sym, &self.inline_policies)
+        {
+            self.notinline_sites.push(self.code.len() as u32);
+        }
         self.code.push(i);
     }
 
@@ -8058,6 +8065,7 @@ fn compile_local_function(
     );
     Some(BytecodeFunction {
         self_call_sites: lo.self_call_sites,
+        notinline_sites: lo.notinline_sites,
         code: lo.code,
         constants: lo.constants,
         load_time_values: lo.load_time_values,
@@ -8170,6 +8178,7 @@ fn compile_capturing_local(
     );
     Some(BytecodeFunction {
         self_call_sites,
+        notinline_sites: lo.notinline_sites,
         code: lo.code,
         constants: lo.constants,
         load_time_values: lo.load_time_values,
@@ -8832,10 +8841,13 @@ fn compile_restart_clause(
     } else {
         declared_parameter_types(body, &param_names)?
     };
+    let declarations = lo.enter_body_declarations(body);
     lower_body(&mut lo, body).ok()?;
+    lo.leave_body_declarations(declarations);
     lo.emit(Instr::Return);
     Some(BytecodeFunction {
         self_call_sites: Vec::new(),
+        notinline_sites: lo.notinline_sites,
         code: lo.code,
         constants: lo.constants,
         load_time_values: lo.load_time_values,
@@ -10101,6 +10113,7 @@ fn compile_function_forcing_boxed(
     );
     let mut function = BytecodeFunction {
         self_call_sites: lo.self_call_sites,
+        notinline_sites: lo.notinline_sites,
         code: lo.code,
         constants: lo.constants,
         load_time_values: lo.load_time_values,
@@ -10434,6 +10447,7 @@ fn compile_thunk(form: EgclVal, env: &Env, portable: bool) -> Option<BytecodeFun
     lo.emit(Instr::Return);
     Some(BytecodeFunction {
         self_call_sites: Vec::new(),
+        notinline_sites: lo.notinline_sites,
         code: lo.code,
         constants: lo.constants,
         load_time_values: lo.load_time_values,
@@ -10508,6 +10522,8 @@ const BBU_AUX_RESTART_TABLES: u16 = 7;
 const BBU_AUX_HANDLER_CASES: u16 = 9;
 // Optional: older units conservatively retain dynamic named calls.
 const BBU_AUX_SELF_CALL_SITES: u16 = 10;
+const BBU_AUX_NOTINLINE_SITES: u16 = 12;
+const BBU_AUX_REQUIRED_POLICY: u16 = 1;
 // Per function, each HANDLER-BIND's condition type names (0x0203). Absent from
 // older units, whose functions could not contain PUSH_HANDLER_BIND.
 const BBU_AUX_HANDLER_BINDS: u16 = 11;
@@ -11087,6 +11103,7 @@ impl BbuConstPool {
 
 struct BbuFunction {
     self_call_sites: Vec<u32>,
+    notinline_sites: Vec<u32>,
     name_ref: u32,
     lambda_list_ref: u32,
     flags: u32,
@@ -11498,6 +11515,7 @@ fn serialize_bbu_function(
         .collect();
     Some(BbuFunction {
         self_call_sites: bf.self_call_sites.iter().map(|&pc| bbu_pc(pc, &offsets, end_pc)).collect::<Option<Vec<_>>>()?,
+        notinline_sites: bf.notinline_sites.iter().map(|&pc| bbu_pc(pc, &offsets, end_pc)).collect::<Option<Vec<_>>>()?,
         name_ref,
         lambda_list_ref,
         flags,
@@ -11674,6 +11692,45 @@ fn parse_bbu_self_call_sites(bytes: &[u8], count: usize) -> Result<Vec<Vec<u32>>
         functions.push(sites);
     }
     if !cursor.done() { return Err(bbu_error("trailing self-call table bytes")); }
+    Ok(functions)
+}
+
+fn serialize_bbu_notinline_sites(functions: &[BbuFunction]) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_u32(&mut out, functions.len() as u32);
+    for function in functions {
+        put_u32(&mut out, function.notinline_sites.len() as u32);
+        for &site in &function.notinline_sites { put_u32(&mut out, site); }
+    }
+    out
+}
+
+fn validate_bbu_aux_flags(kind: u16, flags: u16) -> Result<(), EgclError> {
+    // Older readers reject all nonzero flags, so they cannot silently discard
+    // a negative optimization policy they do not understand.
+    if flags != 0 && !(kind == BBU_AUX_NOTINLINE_SITES && flags == BBU_AUX_REQUIRED_POLICY) {
+        return Err(bbu_error("unsupported auxiliary-table flags"));
+    }
+    if kind == BBU_AUX_NOTINLINE_SITES && flags != BBU_AUX_REQUIRED_POLICY {
+        return Err(bbu_error("NOTINLINE metadata requires policy-version gating"));
+    }
+    Ok(())
+}
+
+fn parse_bbu_notinline_sites(bytes: &[u8], count: usize) -> Result<Vec<Vec<u32>>, EgclError> {
+    let mut cursor = BbuCursor::new(bytes);
+    if cursor.u32()? as usize != count { return Err(bbu_error("NOTINLINE table count mismatch")); }
+    let mut functions = Vec::new();
+    for _ in 0..count {
+        let count = cursor.u32()?;
+        let mut sites = Vec::new();
+        for _ in 0..count { sites.push(cursor.u32()?); }
+        if sites.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(bbu_error("NOTINLINE sites must be ordered and unique"));
+        }
+        functions.push(sites);
+    }
+    if !cursor.done() { return Err(bbu_error("trailing NOTINLINE table bytes")); }
     Ok(functions)
 }
 
@@ -12255,7 +12312,7 @@ pub fn build_bbu_from_forms(
     put_u32(&mut out, pool.entries.len() as u32);
     put_u32(&mut out, functions.len() as u32);
     put_u32(&mut out, load_actions.len() as u32);
-    put_u32(&mut out, 5);
+    put_u32(&mut out, 5 + u32::from(functions.iter().any(|f| !f.notinline_sites.is_empty())));
     put_u32(&mut out, source_file_ref);
     put_u64(&mut out, fnv1a64(source.as_bytes()));
 
@@ -12287,6 +12344,13 @@ pub fn build_bbu_from_forms(
     put_u16(&mut out, 0);
     put_u32(&mut out, handler_cases.len() as u32);
     out.extend_from_slice(&handler_cases);
+    if functions.iter().any(|f| !f.notinline_sites.is_empty()) {
+        let policies = serialize_bbu_notinline_sites(&functions);
+        put_u16(&mut out, BBU_AUX_NOTINLINE_SITES);
+        put_u16(&mut out, BBU_AUX_REQUIRED_POLICY);
+        put_u32(&mut out, policies.len() as u32);
+        out.extend_from_slice(&policies);
+    }
     let self_calls = serialize_bbu_self_call_sites(&functions);
     put_u16(&mut out, BBU_AUX_SELF_CALL_SITES);
     put_u16(&mut out, 0);
@@ -12318,7 +12382,7 @@ fn assemble_bbu(
     put_u32(&mut out, pool.entries.len() as u32);
     put_u32(&mut out, functions.len() as u32);
     put_u32(&mut out, load_actions.len() as u32);
-    put_u32(&mut out, 5);
+    put_u32(&mut out, 5 + u32::from(functions.iter().any(|f| !f.notinline_sites.is_empty())));
     put_u32(&mut out, source_file_ref);
     put_u64(&mut out, fnv1a64(content_tag));
     for entry in &pool.entries {
@@ -12349,6 +12413,13 @@ fn assemble_bbu(
     put_u16(&mut out, 0);
     put_u32(&mut out, handler_cases.len() as u32);
     out.extend_from_slice(&handler_cases);
+    if functions.iter().any(|f| !f.notinline_sites.is_empty()) {
+        let policies = serialize_bbu_notinline_sites(functions);
+        put_u16(&mut out, BBU_AUX_NOTINLINE_SITES);
+        put_u16(&mut out, BBU_AUX_REQUIRED_POLICY);
+        put_u32(&mut out, policies.len() as u32);
+        out.extend_from_slice(&policies);
+    }
     let self_calls = serialize_bbu_self_call_sites(functions);
     put_u16(&mut out, BBU_AUX_SELF_CALL_SITES);
     put_u16(&mut out, 0);
@@ -13004,6 +13075,7 @@ enum BbuConstant {
 #[derive(Clone, Debug)]
 struct EncodedBbuFunction {
     self_call_sites: Vec<u32>,
+    notinline_sites: Vec<u32>,
     name_ref: u32,
     lambda_list_ref: u32,
     flags: u32,
@@ -13286,6 +13358,7 @@ fn parse_bbu_function(cursor: &mut BbuCursor<'_>) -> Result<EncodedBbuFunction, 
     }
     Ok(EncodedBbuFunction {
         self_call_sites: Vec::new(),
+        notinline_sites: Vec::new(),
         name_ref,
         lambda_list_ref,
         flags,
@@ -14100,8 +14173,17 @@ fn decode_bbu_function(
         }
         self_call_sites.push(pc);
     }
+    let mut notinline_sites = Vec::new();
+    for &offset in &encoded.notinline_sites {
+        let pc = map_pc(offset)?;
+        if !matches!(code.get(pc as usize), Some(Instr::CallNamed { .. })) {
+            return Err(bbu_error("NOTINLINE metadata must name a named call"));
+        }
+        notinline_sites.push(pc);
+    }
     Ok(BytecodeFunction {
         self_call_sites,
+        notinline_sites,
         code,
         constants: literal_values,
         load_time_values: Vec::new(),
@@ -15654,6 +15736,9 @@ fn eliminate_self_tail_calls(func: &mut BytecodeFunction, self_sym: u32) -> bool
     func.self_call_sites = func.self_call_sites.iter()
         .filter(|site| !sites.contains(&(**site as usize)))
         .map(|site| map[*site as usize]).collect();
+    func.notinline_sites = func.notinline_sites.iter()
+        .filter(|site| !sites.contains(&(**site as usize)))
+        .map(|site| map[*site as usize]).collect();
     true
 }
 
@@ -16125,14 +16210,13 @@ fn load_bbu_definitions(bytes: &[u8], env: &mut Env, restoring: bool) -> Result<
     let mut handler_case_tables = None;
     let mut handler_bind_tables = None;
     let mut self_call_tables = None;
+    let mut notinline_tables = None;
     for _ in 0..aux_count {
         let kind = cursor.u16()?;
         let flags = cursor.u16()?;
         let len = cursor.u32()? as usize;
         let bytes = cursor.take(len)?;
-        if flags != 0 {
-            return Err(bbu_error("unsupported auxiliary-table flags"));
-        }
+        validate_bbu_aux_flags(kind, flags)?;
         if kind == BBU_AUX_FUNCTION_METADATA {
             if function_metadata.is_some() {
                 return Err(bbu_error("duplicate function-metadata table"));
@@ -16143,6 +16227,9 @@ fn load_bbu_definitions(bytes: &[u8], env: &mut Env, restoring: bool) -> Result<
                 return Err(bbu_error("duplicate restart-table metadata"));
             }
             restart_tables = Some(parse_bbu_restart_tables(bytes, function_count)?);
+        } else if kind == BBU_AUX_NOTINLINE_SITES {
+            if notinline_tables.is_some() { return Err(bbu_error("duplicate NOTINLINE metadata")); }
+            notinline_tables = Some(parse_bbu_notinline_sites(bytes, function_count)?);
         } else if kind == BBU_AUX_SELF_CALL_SITES {
             if self_call_tables.is_some() { return Err(bbu_error("duplicate self-call metadata")); }
             self_call_tables = Some(parse_bbu_self_call_sites(bytes, function_count)?);
@@ -16179,6 +16266,11 @@ fn load_bbu_definitions(bytes: &[u8], env: &mut Env, restoring: bool) -> Result<
     if let Some(tables) = self_call_tables {
         for (function, sites) in encoded_functions.iter_mut().zip(tables) {
             function.self_call_sites = sites;
+        }
+    }
+    if let Some(tables) = notinline_tables {
+        for (function, sites) in encoded_functions.iter_mut().zip(tables) {
+            function.notinline_sites = sites;
         }
     }
     for function in &encoded_functions {

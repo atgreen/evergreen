@@ -2164,7 +2164,7 @@ fn emit_call(
 ) -> Result<Vec<CallReturn>, EmitError> {
     use crate::t2::ir::AuxData;
     let sym = match data.aux {
-        AuxData::CallTarget(s) => s,
+        AuxData::CallTarget(s) | AuxData::OpaqueCallTarget(s) => s,
         _ => return Err(EmitError::UnsupportedOp(0xF8)),
     };
     let nargs = data.args.len();
@@ -2203,7 +2203,8 @@ fn emit_call(
         // A self-call with the wrong argument count must reach c2i, which
         // raises PROGRAM-ERROR; the register entry would bind whatever is in
         // the argument registers (bliss-w6aki).
-        if !self_call_disabled && sym == ss && nargs <= C2I_ARGS_SELF.len() && nargs == self_arity
+        if !self_call_disabled && matches!(data.aux, AuxData::CallTarget(_))
+            && sym == ss && nargs <= C2I_ARGS_SELF.len() && nargs == self_arity
         {
             // Stack guard. The direct call below takes a REAL C frame and does
             // not reach c2i_call_args, so it never sees native_depth_cap() —
@@ -2370,7 +2371,7 @@ fn emit_invoke_call(
     recursion: Option<(RecursiveTransfer, egcl_rt::asm::Label)>,
 ) -> Result<(Vec<u32>, u32), EmitError> {
     let (request_word0, request_word1, cleanup) = match data.aux {
-        crate::t2::ir::AuxData::CallTarget(symbol) => {
+        crate::t2::ir::AuxData::CallTarget(symbol) | crate::t2::ir::AuxData::OpaqueCallTarget(symbol) => {
             (u64::from(symbol), data.args.len() as u64, false)
         }
         crate::t2::ir::AuxData::TransferThrow => (TRANSFER_THROW_REQUEST, 2, false),
@@ -4822,7 +4823,7 @@ pub fn emit_framed_native_handlers_with_native_recursion(
             let data = f.inst(inst);
             matches!(data.opcode, Opcode::CleanupSave | Opcode::CleanupRestore | Opcode::CleanupLanding
                 | Opcode::CatchLanding | Opcode::HandlerLanding | Opcode::TakeValuesToLocals)
-                || (data.opcode == Opcode::Invoke && !matches!(data.aux, AuxData::CallTarget(_)))
+                || (data.opcode == Opcode::Invoke && !matches!(data.aux, AuxData::CallTarget(_) | AuxData::OpaqueCallTarget(_)))
         })
     {
         return Err(EmitError::UnsupportedOp(0xFA));
@@ -7213,7 +7214,7 @@ fn emit_framed_inner(
                         .as_deref_mut()
                         .ok_or(EmitError::UnsupportedOp(0xFA))?;
                     let veneer = match d.aux {
-                        AuxData::CallTarget(symbol) => transfer
+                        AuxData::CallTarget(symbol) | AuxData::OpaqueCallTarget(symbol) => transfer
                             .named_veneers
                             .iter()
                             .find(|(name, _)| *name == symbol)
@@ -9881,6 +9882,7 @@ mod tests {
         let star = egcl_rt::symbols::intern("*");
         let bf = BytecodeFunction {
             self_call_sites: Vec::new(),
+            notinline_sites: Vec::new(),
             code: vec![
                 Instr::LoadLocal(0),
                 Instr::Const(0),

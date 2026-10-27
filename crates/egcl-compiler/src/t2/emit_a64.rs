@@ -741,7 +741,7 @@ impl Emitter<'_> {
         let helper = if let Some(data) = data {
             match data.opcode {
                 Opcode::Call => {
-                    let AuxData::CallTarget(symbol) = data.aux else {
+                    let Some(symbol) = data.aux.named_call_target() else {
                         return Err(unsupported!());
                     };
                     for (index, &arg) in data.args.iter().enumerate() {

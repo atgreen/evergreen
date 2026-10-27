@@ -47760,6 +47760,7 @@ mod env_gc_root_tests {
         use egcl_rt::bytecode::{BytecodeFunction, Instr, VarLoc};
         let nested = BytecodeFunction {
             self_call_sites: Vec::new(),
+            notinline_sites: Vec::new(),
             code: vec![Instr::LoadLocal(0), Instr::Return],
             constants: vec![],
             load_time_values: vec![],

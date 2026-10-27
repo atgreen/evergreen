@@ -540,7 +540,9 @@ length     : u32
 bytes      : [u8; length]
 ```
 
-Unknown `table_kind` values MUST be skipped by `length`.
+Unknown `table_kind` values with zero `flags` MUST be skipped by `length`.
+Nonzero flags are accepted only when the recognized table defines them; this
+lets required executable policy reject an older reader instead of being lost.
 
 | Table | Required | Contents |
 |-------|----------|----------|
@@ -550,6 +552,7 @@ Unknown `table_kind` values MUST be skipped by `length`.
 | `Dependencies` | MUST | required `.bfasl` identities, provided features, package dependencies, content hashes |
 | `Policy` | SHOULD | compiler optimization/safety/debug/speed policy that influenced bytecode |
 | `FunctionMetadata` | MUST for bytecode version 1.3+ | per-function `has_env`/`variadic` flags and parameter name, `VarLoc`, and primitive declared-type entries |
+| `NotinlineSites` | Present when needed | effective source `NOTINLINE` decisions for named calls; retained across later tiers |
 | `SelfCallSites` | Optional | source-proven calls bound to the executing definition, excluding effective `NOTINLINE` declarations and differently resolved lexical names |
 
 Debug records may include macroexpansion provenance as source spans or compact
@@ -565,6 +568,15 @@ u16 slot, u8 declared_type}`. Location kind 0 names a checked local slot; kind
 mean `Any`, `Fixnum`, and `SingleFloat`. A variadic function's core
 `lambda_list_ref` is executable binder metadata and MUST be present; it is not
 a retained function body or source fallback.
+
+`NotinlineSites` uses `table_kind = 12`, with `flags = 1`. Its payload is a
+`u32 function_count`, then for each function a `u32 site_count` and strictly
+increasing `u32` byte offsets identifying `CALL_NAMED` instructions. The loader
+validates counts, instruction boundaries, call opcodes, and uniqueness. An
+absent table preserves legacy behavior. Writers omit it when no call needs
+this policy. Earlier readers reject its nonzero flag rather than silently
+re-enable inlining. The calls retain ordinary named dispatch; only compiler
+body and intrinsic expansion are prohibited.
 
 `SelfCallSites` uses `table_kind = 10`, with flags zero. Its payload is a
 `u32 function_count`, followed in function-table order by a `u32 site_count`
