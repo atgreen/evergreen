@@ -75,12 +75,11 @@ fn type_predicates_refine_only_the_true_branch_and_keep_boolean_results() {
             .env_remove("EGCL_GC_STRESS_SKIP")
             .env_remove("EGCL_GC_STRESS_AT")
             .env_remove("EGCL_GC_STRESS_AFTER_INIT")
-            .env_remove("EGCL_GC_POISON")
-            .args(["--no-init", "--eval", SOURCE]);
-        if tier == "t2" {
-            command.args(["--eval", NATIVE_READY]);
-        }
-        command.args(["--eval", CHECK]);
+            .env_remove("EGCL_GC_POISON");
+        let ready = if tier == "t2" { NATIVE_READY } else { "" };
+        // One evaluation in every mode: readiness must not add a printed NIL.
+        let program = format!("{SOURCE}\n{ready}\n{CHECK}");
+        command.args(["--no-init", "--eval", &program]);
         if stress {
             command
                 .env("EGCL_GC_STRESS", "17")
