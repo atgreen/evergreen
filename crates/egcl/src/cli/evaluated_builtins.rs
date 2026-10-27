@@ -20,7 +20,9 @@ fn is_standard_reader_stand_in(function: EgclVal, installed: EgclVal, stand_in: 
         || installed_function(index).is_some_and(|f| f == installed)
 }
 
-fn pprint_layout_events(list: EgclVal) -> Result<Vec<egcl_stdlib::format::LayoutEvent>, EgclError> {
+pub(super) fn pprint_layout_events(
+    list: EgclVal,
+) -> Result<Vec<egcl_stdlib::format::LayoutEvent>, EgclError> {
     use egcl_stdlib::format::{CaseMode, IndentKind, LayoutEvent, NewlineKind, TabKind};
 
     let mut events = Vec::new();

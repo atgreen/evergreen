@@ -14290,6 +14290,45 @@ fn stdlib_format_apply_hook(func: EgclVal, args: &[EgclVal]) -> Result<EgclVal, 
     apply_function(*func, &args, env)
 }
 
+fn stdlib_format_layout_apply_hook(
+    func: EgclVal,
+    args: &[EgclVal],
+    start_column: usize,
+) -> Result<(EgclVal, egcl_stdlib::format::LayoutDoc), EgclError> {
+    let ptr = PRINT_ENV.with(|c| c.get());
+    if ptr.is_null() {
+        return Err(EgclError::ControlError(
+            "FORMAT cannot call a function outside an evaluation".into(),
+        ));
+    }
+    egcl_rt::rooted!(func = func);
+    let args = RootedVals::new(args.to_vec());
+    egcl_rt::rooted!(argument_list = vec_to_list(&args));
+    let capture = resolve_sym("EGCL-PPRINT::%PP-CAPTURE-CALL")
+        .ok_or_else(|| EgclError::Internal("missing semantic FORMAT callback bridge".into()))?;
+    let column = EgclVal::from_fixnum(start_column.min(i64::MAX as usize) as i64);
+    // Safety: PRINT_ENV is the live print-entry environment and formatting is
+    // single-threaded, as in stdlib_format_apply_hook.
+    let env = unsafe { &mut *ptr };
+    egcl_rt::rooted!(captured = apply_function(
+        capture,
+        &[*func, *argument_list, column],
+        env,
+    )?);
+    let mut fields = list_to_vec(*captured);
+    egcl_rt::rooted_ref!(_fields_root = &mut fields);
+    if fields.len() != 2 {
+        return Err(EgclError::Internal(
+            "malformed semantic FORMAT callback result".into(),
+        ));
+    }
+    let events = evaluated_builtins::pprint_layout_events(fields[1])?;
+    Ok((
+        fields[0],
+        egcl_stdlib::format::LayoutDoc::from_events(events),
+    ))
+}
+
 thread_local! {
     /// An error, or a non-local transfer, raised by Lisp that the PRINTER called
     /// back into: a user `PRINT-OBJECT` method or a `*PRINT-PPRINT-DISPATCH*`
@@ -14330,7 +14369,11 @@ fn resignal_print_error(result: Result<EgclVal, EgclError>) -> Result<EgclVal, E
     }
 }
 
-fn stdlib_pprint_dispatch_hook(val: EgclVal, _escape: bool) -> Option<String> {
+fn stdlib_pprint_dispatch_hook(
+    val: EgclVal,
+    escape: bool,
+    start_column: usize,
+) -> Option<egcl_stdlib::format::LayoutDoc> {
     let table = egcl_rt::symbols::find_index("*PRINT-PPRINT-DISPATCH*")
         .and_then(egcl_rt::symbols::symbol_value)?;
     if table == egcl_rt::value::UNBOUND || !table.is_cons() || cp(table).1.is_nil() {
@@ -14342,11 +14385,15 @@ fn stdlib_pprint_dispatch_hook(val: EgclVal, _escape: bool) -> Option<String> {
     }
     egcl_rt::rooted!(val = val);
     egcl_rt::rooted!(table = table);
-    let dispatch = resolve_sym("EGCL::%PPRINT-DISPATCH-STRING")?;
+    let dispatch = resolve_sym("EGCL-PPRINT::%PPRINT-DISPATCH-LAYOUT")?;
     // Safety: the parked pointer is the live print-entry &mut Env (as in
     // stdlib_print_object_hook); printing is single-threaded.
     let env = unsafe { &mut *ptr };
-    let result = match apply_function(dispatch, &[*table, *val], env) {
+    let column = EgclVal::from_fixnum(start_column.min(i64::MAX as usize) as i64);
+    let mut escape_binding = resolve_sym("*PRINT-ESCAPE*")
+        .map(|symbol| DynBind::establish(symbol, if escape { T } else { NIL }));
+    egcl_rt::rooted_ref!(_escape_binding_root = &mut escape_binding);
+    let result = match apply_function(dispatch, &[*table, *val, column], env) {
         Ok(v) => v,
         Err(e) => {
             // A pprint entry that signals or throws is NOT "no applicable
@@ -14355,10 +14402,24 @@ fn stdlib_pprint_dispatch_hook(val: EgclVal, _escape: bool) -> Option<String> {
             return None;
         }
     };
-    if is_string_value(result) {
-        Some(val_as_str(result))
-    } else {
-        None
+    if result.is_nil() {
+        return None;
+    }
+    egcl_rt::rooted!(result = result);
+    let mut fields = list_to_vec(*result);
+    egcl_rt::rooted_ref!(_fields_root = &mut fields);
+    if fields.len() != 2 || fields[0].is_nil() {
+        park_print_error(EgclError::Internal(
+            "malformed pprint dispatch layout result".into(),
+        ));
+        return None;
+    }
+    match evaluated_builtins::pprint_layout_events(fields[1]) {
+        Ok(events) => Some(egcl_stdlib::format::LayoutDoc::from_events(events)),
+        Err(error) => {
+            park_print_error(error);
+            None
+        }
     }
 }
 
@@ -14932,6 +14993,7 @@ fn read_eval_all_env(source: &str, env: &mut Env) -> Result<EgclVal, EgclError> 
     egcl_stdlib::format::set_print_object_hook(Some(stdlib_print_object_hook));
     egcl_stdlib::format::set_pprint_dispatch_hook(Some(stdlib_pprint_dispatch_hook));
     egcl_stdlib::format::set_format_apply_hook(Some(stdlib_format_apply_hook));
+    egcl_stdlib::format::set_format_layout_apply_hook(Some(stdlib_format_layout_apply_hook));
     egcl_stdlib::format::set_function_print_hook(Some(generic_function_print_hook));
     let chars: Vec<char> = source.chars().collect();
     register_declared_packages(&chars);
@@ -46463,7 +46525,15 @@ fn format_values(
     // across rendering: user PRINT-OBJECT methods can allocate and collect.
     let gray = is_gray_stream(*dest);
     if gray && is_pprint_queue_stream(*dest) {
-        let result = egcl_stdlib::format::format_to_layout(&fs, &av);
+        let result = (|| {
+            let column = invoke_generic_function("STREAM-LINE-COLUMN", &[*dest], env)?;
+            let start_column = if column.is_fixnum() && column.as_fixnum() >= 0 {
+                column.as_fixnum() as usize
+            } else {
+                0
+            };
+            egcl_stdlib::format::format_to_layout_at_column(&fs, &av, start_column)
+        })();
         PRINT_ENV.with(|c| c.set(prev_env));
         let doc = match result {
             Ok(doc) => doc,
@@ -47068,6 +47138,7 @@ pub fn run(args: &[String]) -> Result<i32, EgclError> {
     egcl_stdlib::format::set_print_object_hook(Some(stdlib_print_object_hook));
     egcl_stdlib::format::set_pprint_dispatch_hook(Some(stdlib_pprint_dispatch_hook));
     egcl_stdlib::format::set_format_apply_hook(Some(stdlib_format_apply_hook));
+    egcl_stdlib::format::set_format_layout_apply_hook(Some(stdlib_format_layout_apply_hook));
     egcl_stdlib::format::set_function_print_hook(Some(generic_function_print_hook));
     // Looked up once: it decides how the arguments parse, then loads below.
     let embedded = embedded_core();
@@ -50348,6 +50419,9 @@ mod error_backtrace_rooting_tests {
                 egcl_stdlib::format::set_print_object_hook(Some(stdlib_print_object_hook));
                 egcl_stdlib::format::set_pprint_dispatch_hook(Some(stdlib_pprint_dispatch_hook));
                 egcl_stdlib::format::set_format_apply_hook(Some(stdlib_format_apply_hook));
+                egcl_stdlib::format::set_format_layout_apply_hook(Some(
+                    stdlib_format_layout_apply_hook,
+                ));
             }
         }
         egcl_stdlib::format::set_print_object_hook(Some(collecting_printer));
