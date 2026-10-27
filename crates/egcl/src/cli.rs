@@ -23078,7 +23078,8 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 return Ok(vec_to_list(&[*a, *b, *c]));
             }
             "EGCL::%DEBUG-BACKTRACE" | "EGCL::%PPRINT-CIRCLE"
-                | "EGCL::%PPRINT-NATIVE-COLUMN" | "EGCL::%FORMAT-CONSUMED" => {
+                | "EGCL::%PPRINT-NATIVE-COLUMN" | "EGCL::%PPRINT-RENDER-LAYOUT"
+                | "EGCL::%FORMAT-CONSUMED" => {
                 return eval_builtin_arguments(&name, cdr, env)
             }
             "EGCL::%SYM-BY-INDEX" => return eval_builtin_arguments(&name, cdr, env),
@@ -43479,7 +43480,8 @@ fn is_builtin_function(name: &str) -> bool {
         return true;
     }
     if matches!(name, "EGCL::%STANDARD-CHARACTER-READER" | "EGCL::SET-FILL-POINTER"
-        | "EGCL::%PPRINT-CIRCLE" | "EGCL::%PPRINT-NATIVE-COLUMN" | "EGCL::%FORMAT-CONSUMED"
+        | "EGCL::%PPRINT-CIRCLE" | "EGCL::%PPRINT-NATIVE-COLUMN"
+        | "EGCL::%PPRINT-RENDER-LAYOUT" | "EGCL::%FORMAT-CONSUMED"
         | "EGCL::%NATIVE-INTERACTIVE-STREAM-P") {
         return true;
     }
@@ -46316,6 +46318,105 @@ fn eval_format(args: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     format_values(*dest, *fv, &av, env)
 }
 
+fn is_pprint_queue_stream(stream: EgclVal) -> bool {
+    if !is_gray_stream(stream) {
+        return false;
+    }
+    egcl_rt::rooted!(stream = stream);
+    let Some(pretty_stream_name) = resolve_sym("EGCL-PPRINT::%PRETTY-STREAM") else {
+        return false;
+    };
+    let class = egcl_stdlib::class_of(*stream);
+    egcl_stdlib::compute_class_precedence_list(class).is_ok_and(|cpl| {
+        cpl.into_iter()
+            .any(|class| egcl_stdlib::class_name(class) == pretty_stream_name)
+    })
+}
+
+fn layout_event_to_lisp(event: egcl_stdlib::format::LayoutEvent) -> EgclVal {
+    use egcl_stdlib::format::LayoutEvent;
+
+    match event {
+        LayoutEvent::Text(text) => {
+            let characters: Vec<EgclVal> = text.chars().map(EgclVal::from_char).collect();
+            vec_to_list(&characters)
+        }
+        LayoutEvent::CaseStart(mode) => {
+            vec_to_list(&[
+                resolve_sym(":CASE-START").expect("the CASE-START keyword is interned"),
+                resolve_sym(match mode {
+                    egcl_stdlib::format::CaseMode::Lower => ":LOWER",
+                    egcl_stdlib::format::CaseMode::Upper => ":UPPER",
+                    egcl_stdlib::format::CaseMode::CapitalizeWords => ":CAPITALIZE-WORDS",
+                    egcl_stdlib::format::CaseMode::CapitalizeFirst => ":CAPITALIZE-FIRST",
+                })
+                .expect("the FORMAT case keyword is interned"),
+            ])
+        }
+        LayoutEvent::CaseEnd => vec_to_list(&[
+            resolve_sym(":CASE-END").expect("the CASE-END keyword is interned"),
+        ]),
+        LayoutEvent::Block { prefix, per_line_prefix, suffix, events } => {
+            egcl_rt::rooted!(prefix = egcl_stdlib::make_lisp_string(&prefix));
+            egcl_rt::rooted!(suffix = egcl_stdlib::make_lisp_string(&suffix));
+            egcl_rt::rooted!(events = layout_events_to_lisp(events));
+            vec_to_list(&[
+                resolve_sym(":BLOCK").expect("the BLOCK keyword is interned"),
+                *prefix,
+                if per_line_prefix.is_some() { T } else { NIL },
+                *suffix,
+                *events,
+            ])
+        }
+        LayoutEvent::Newline(kind) => vec_to_list(&[
+            resolve_sym(":NEWLINE").expect("the NEWLINE keyword is interned"),
+            resolve_sym(match kind {
+                egcl_stdlib::format::NewlineKind::Linear => ":LINEAR",
+                egcl_stdlib::format::NewlineKind::Fill => ":FILL",
+                egcl_stdlib::format::NewlineKind::Miser => ":MISER",
+                egcl_stdlib::format::NewlineKind::Mandatory => ":MANDATORY",
+            }).expect("the pprint newline keyword is interned"),
+        ]),
+        LayoutEvent::Indent { relative_to, amount } => vec_to_list(&[
+            resolve_sym(":INDENT").expect("the INDENT keyword is interned"),
+            resolve_sym(match relative_to {
+                egcl_stdlib::format::IndentKind::Block => ":BLOCK",
+                egcl_stdlib::format::IndentKind::Current => ":CURRENT",
+            }).expect("the pprint indent keyword is interned"),
+            EgclVal::from_fixnum(i64::from(amount)),
+        ]),
+        LayoutEvent::Tab { kind, colnum, colinc } => vec_to_list(&[
+            resolve_sym(":TAB").expect("the TAB keyword is interned"),
+            resolve_sym(match kind {
+                egcl_stdlib::format::TabKind::Line => ":LINE",
+                egcl_stdlib::format::TabKind::Section => ":SECTION",
+                egcl_stdlib::format::TabKind::LineRelative => ":LINE-RELATIVE",
+                egcl_stdlib::format::TabKind::SectionRelative => ":SECTION-RELATIVE",
+            }).expect("the pprint tab keyword is interned"),
+            EgclVal::from_fixnum(i64::from(colnum)),
+            EgclVal::from_fixnum(i64::from(colinc)),
+        ]),
+    }
+}
+
+fn layout_events_to_lisp(events: Vec<egcl_stdlib::format::LayoutEvent>) -> EgclVal {
+    egcl_rt::rooted!(result = NIL);
+    for event in events.into_iter().rev() {
+        egcl_rt::rooted!(event = layout_event_to_lisp(event));
+        // Text is represented as a list of character events. Splice those into
+        // the containing event list instead of nesting them as one event.
+        if (*event).is_cons() && cp(*event).0.is_character() {
+            let characters = list_to_vec(*event);
+            for character in characters.into_iter().rev() {
+                *result = arena_cons(character, *result);
+            }
+        } else if !(*event).is_nil() {
+            *result = arena_cons(*event, *result);
+        }
+    }
+    *result
+}
+
 /// FORMAT on an evaluated destination (a `t` already resolved to the current
 /// *STANDARD-OUTPUT*), control and arguments. Shared by operator position and
 /// compiled calls, which reached it only by synthesizing and re-evaluating a
@@ -46361,6 +46462,22 @@ fn format_values(
     // user-defined Gray methods, just as for WRITE-STRING. Keep DEST rooted
     // across rendering: user PRINT-OBJECT methods can allocate and collect.
     let gray = is_gray_stream(*dest);
+    if gray && is_pprint_queue_stream(*dest) {
+        let result = egcl_stdlib::format::format_to_layout(&fs, &av);
+        PRINT_ENV.with(|c| c.set(prev_env));
+        let doc = match result {
+            Ok(doc) => doc,
+            Err(error) => return resignal_print_error(Err(error)),
+        };
+        if let Some(error) = PENDING_PRINT_ERROR.with(|cell| cell.borrow_mut().take()) {
+            return Err(error);
+        }
+        egcl_rt::rooted!(events = layout_events_to_lisp(doc.into_events()));
+        let enqueue = resolve_sym("EGCL-PPRINT::%PP-ENQUEUE-EVENTS")
+            .ok_or_else(|| EgclError::Internal("missing pprint event bridge".into()))?;
+        apply_function(enqueue, &[*dest, *events], env)?;
+        return Ok(NIL);
+    }
     let result = egcl_stdlib::format(if gray { NIL } else { *dest }, &fs, &av);
     PRINT_ENV.with(|c| c.set(prev_env));
     // A ~A/~S that called a user PRINT-OBJECT method or pprint entry which

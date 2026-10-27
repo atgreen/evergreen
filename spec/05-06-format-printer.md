@@ -104,11 +104,13 @@ enum QueueEntry {
     Text { start: usize, end: usize },
     Newline { kind: NewlineKind, section_end: usize },
     Indent { kind: IndentKind, amount: i32 },
+    Tab { kind: TabKind, colnum: usize, colinc: usize },
     BlockStart { prefix: Option<String>, per_line: bool, section_end: usize },
     BlockEnd { suffix: Option<String> },
 }
 
 enum IndentKind { Block, Current }
+enum TabKind { Line, Section, LineRelative, SectionRelative }
 
 struct SectionEntry {
     start: usize, indent: usize, miser_mode: bool,
@@ -255,8 +257,8 @@ thread-local LRU (capacity: 256, keyed by string `eq`).
 
 ### Justification `~<...~>`
 
-- **Text mode** (no `~:;` as first separator, and no colon modifier on `~<`): segments spaced within mincol. `~@<` right-justify, `~:@<` center. MUST be closed with `~>` (not `~:>`).
-- **Logical-block mode**: triggered by `~:<` (colon modifier on the opening directive) OR by `~:;` appearing as the first segment separator. Provides prefix/suffix/body for the pretty-printer. MUST be closed with `~:>` (colon modifier on the closing directive). Using `~>` to close a logical block, or `~:>` to close a text justification, is an error (`format-error`).
+- **Text mode**: triggered by `~>` without a colon. Segments are spaced within mincol; modifiers on the opening directive retain their justification meanings (`~@<` right-justifies and `~:@<` centers).
+- **Logical-block mode**: triggered by `~:>` (colon modifier on the closing directive). Provides prefix/suffix/body for the pretty-printer; `~;` separates those segments and `~@;` selects a per-line prefix. A colon on the opening `~<` supplies the default parenthesis prefix and suffix; it does not select the mode. Pretty-printer-only directives in a text justification are an error (`format-error`).
 
 ### Up-and-Out `~^`
 
@@ -293,11 +295,12 @@ PROCEDURE attempt_output(xp):
         fits = section_fits(xp, section_end)
         emit = (kind == Mandatory) OR
                (kind == Linear AND NOT fits) OR
-               (kind == Miser AND miser_active AND NOT fits) OR
+               (kind == Miser AND miser_active) OR
                (kind == Fill AND (NOT fits OR next_block_doesnt_fit))
         IF emit: output newline + per-line-prefix + indentation
           IF *print-lines* exceeded: output " ..", abort
       Indent{kind, amount} → update block indentation
+      Tab{kind, colnum, colinc} → output padding from the line or section origin
       BlockStart{prefix, per_line, section_end}:
         push_section(xp, xp.column, check_miser(xp), per_line prefix)
         IF prefix: write prefix to target, advance column

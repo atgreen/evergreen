@@ -71,6 +71,259 @@ fn egcl_string_to_rust(val: EgclVal) -> String {
     }
 }
 
+// ── Queued pretty-layout engine (R5.166/R5.179) ────────────────
+
+fn layout_options(margin: usize) -> LayoutOptions {
+    LayoutOptions {
+        margin,
+        miser_width: None,
+        line_limit: None,
+        start_column: 0,
+        pretty: true,
+    }
+}
+
+#[test]
+fn layout_linear_breaks_the_whole_block_and_applies_current_indent() {
+    let doc = LayoutDoc::from_events(vec![LayoutEvent::Block {
+        prefix: "(".into(),
+        per_line_prefix: None,
+        suffix: ")".into(),
+        events: vec![
+            LayoutEvent::Text("M".into()),
+            LayoutEvent::Indent {
+                relative_to: IndentKind::Current,
+                amount: 1,
+            },
+            LayoutEvent::Newline(NewlineKind::Linear),
+            LayoutEvent::Text("M".into()),
+        ],
+    }]);
+
+    assert_eq!(render_layout(&doc, &layout_options(2)), "(M\n   M)");
+    assert_eq!(render_layout(&doc, &layout_options(20)), "(MM)");
+}
+
+#[test]
+fn layout_fill_breaks_sections_and_trims_break_whitespace() {
+    let mut events = Vec::new();
+    for i in 0..4 {
+        events.push(LayoutEvent::Text("A ".into()));
+        if i != 3 {
+            events.push(LayoutEvent::Newline(NewlineKind::Fill));
+        }
+    }
+    let doc = LayoutDoc::from_events(vec![LayoutEvent::Block {
+        prefix: String::new(),
+        per_line_prefix: None,
+        suffix: String::new(),
+        events,
+    }]);
+
+    assert_eq!(render_layout(&doc, &layout_options(3)), "A\nA\nA\nA ");
+}
+
+#[test]
+fn layout_miser_breaks_when_miser_mode_is_active_even_if_text_fits() {
+    let doc = LayoutDoc::from_events(vec![LayoutEvent::Block {
+        prefix: String::new(),
+        per_line_prefix: None,
+        suffix: String::new(),
+        events: vec![
+            LayoutEvent::Newline(NewlineKind::Miser),
+            LayoutEvent::Text("A".into()),
+        ],
+    }]);
+    let mut options = layout_options(20);
+    options.miser_width = Some(20);
+
+    assert_eq!(render_layout(&doc, &options), "\nA");
+}
+
+#[test]
+fn layout_section_tab_is_relative_to_the_block_body() {
+    let doc = LayoutDoc::from_events(vec![LayoutEvent::Block {
+        prefix: "[".into(),
+        per_line_prefix: None,
+        suffix: "]".into(),
+        events: vec![LayoutEvent::Tab {
+            kind: TabKind::Section,
+            colnum: 1,
+            colinc: 0,
+        }],
+    }]);
+
+    assert_eq!(render_layout(&doc, &layout_options(80)), "[ ]");
+}
+
+#[test]
+fn format_to_layout_preserves_logical_directives_as_events() {
+    let doc = format_to_layout("~:<M~1:I~@:_M~:>", &[lb_fixlist(&[1, 2])]).unwrap();
+
+    assert_eq!(render_layout(&doc, &layout_options(100)), "(M\n   M)");
+    assert!(matches!(doc.events(), [LayoutEvent::Block { .. }]));
+}
+
+#[test]
+fn format_layout_fill_matches_the_printer_regression_shape() {
+    let doc = format_to_layout(
+        "~@<A ~:_A ~:_A ~:_A ~:_A ~:_A ~:_A ~:_A ~:_A ~:_A ~:_~:>",
+        &[],
+    )
+    .unwrap();
+
+    assert_eq!(
+        render_layout(&doc, &layout_options(6)),
+        "A A A\nA A A\nA A A\nA "
+    );
+}
+
+#[test]
+fn layout_repeats_a_per_line_prefix() {
+    let doc = LayoutDoc::from_events(vec![LayoutEvent::Block {
+        prefix: ";; ".into(),
+        per_line_prefix: Some(";; ".into()),
+        suffix: String::new(),
+        events: vec![
+            LayoutEvent::Text("A ".into()),
+            LayoutEvent::Newline(NewlineKind::Mandatory),
+            LayoutEvent::Text("B".into()),
+        ],
+    }]);
+
+    assert_eq!(render_layout(&doc, &layout_options(80)), ";; A\n;; B");
+}
+
+#[test]
+fn layout_line_limit_writes_each_open_suffix_without_retruncating_it() {
+    let doc = LayoutDoc::from_events(vec![LayoutEvent::Block {
+        prefix: "(".into(),
+        per_line_prefix: None,
+        suffix: "\n)".into(),
+        events: vec![
+            LayoutEvent::Text("a".into()),
+            LayoutEvent::Newline(NewlineKind::Mandatory),
+            LayoutEvent::Text("b".into()),
+        ],
+    }]);
+    let mut options = layout_options(80);
+    options.line_limit = Some(1);
+
+    assert_eq!(render_layout(&doc, &options), "(a ..\n)");
+}
+
+#[test]
+fn layout_nested_multiline_prefix_makes_an_enclosing_linear_break_fire() {
+    let doc = LayoutDoc::from_events(vec![LayoutEvent::Block {
+        prefix: String::new(),
+        per_line_prefix: None,
+        suffix: String::new(),
+        events: vec![
+            LayoutEvent::Text("a".into()),
+            LayoutEvent::Newline(NewlineKind::Linear),
+            LayoutEvent::Block {
+                prefix: "x\n".into(),
+                per_line_prefix: None,
+                suffix: String::new(),
+                events: vec![LayoutEvent::Text("b".into())],
+            },
+        ],
+    }]);
+
+    assert_eq!(render_layout(&doc, &layout_options(80)), "a\nx\nb");
+}
+
+#[test]
+fn layout_line_limit_does_not_truncate_plain_format_newlines() {
+    let doc = LayoutDoc::from_events(vec![LayoutEvent::Text("a\nb".into())]);
+    let mut options = layout_options(80);
+    options.line_limit = Some(1);
+
+    assert_eq!(render_layout(&doc, &options), "a\nb");
+}
+
+#[test]
+fn layout_case_conversion_preserves_conditional_newlines() {
+    let doc = format_to_layout("~@<~:(FOO ~:_BAR~)~:>", &[]).unwrap();
+
+    assert_eq!(render_layout(&doc, &layout_options(4)), "Foo\nBar");
+}
+
+#[test]
+fn layout_case_conversion_observes_layout_generated_whitespace() {
+    let tabbed = format_to_layout("~:(foo~5Tbar~)", &[]).unwrap();
+    assert_eq!(render_layout(&tabbed, &layout_options(80)), "Foo  Bar");
+
+    let conditional = format_to_layout("~@<~:(foo~:_bar~)~:>", &[]).unwrap();
+    assert_eq!(render_layout(&conditional, &layout_options(80)), "Foobar");
+    assert_eq!(render_layout(&conditional, &layout_options(3)), "Foo\nBar");
+}
+
+#[test]
+fn layout_line_tab_uses_the_destination_starting_column() {
+    let doc = format_to_layout("x~5Ty", &[]).unwrap();
+    let mut options = layout_options(80);
+    options.start_column = 3;
+
+    assert_eq!(render_layout(&doc, &options), "x y");
+}
+
+#[test]
+fn layout_section_tab_origin_advances_at_an_unbroken_newline_directive() {
+    let doc = format_to_layout("~@<[a~:_b~2,0:Tx]~:>", &[]).unwrap();
+
+    assert_eq!(render_layout(&doc, &layout_options(80)), "[ab x]");
+}
+
+#[test]
+fn layout_section_tab_uses_the_new_origin_during_linear_fit() {
+    let doc = LayoutDoc::from_events(vec![LayoutEvent::Block {
+        prefix: String::new(),
+        per_line_prefix: None,
+        suffix: String::new(),
+        events: vec![
+            LayoutEvent::Text("abcd".into()),
+            LayoutEvent::Newline(NewlineKind::Linear),
+            LayoutEvent::Text("x".into()),
+            LayoutEvent::Tab {
+                kind: TabKind::Section,
+                colnum: 2,
+                colinc: 0,
+            },
+        ],
+    }]);
+
+    assert_eq!(render_layout(&doc, &layout_options(5)), "abcd\nx ");
+}
+
+#[test]
+fn layout_multiline_own_delimiter_forces_a_linear_break() {
+    let doc = LayoutDoc::from_events(vec![LayoutEvent::Block {
+        prefix: "p\n".into(),
+        per_line_prefix: None,
+        suffix: String::new(),
+        events: vec![
+            LayoutEvent::Text("a".into()),
+            LayoutEvent::Newline(NewlineKind::Linear),
+            LayoutEvent::Text("b".into()),
+        ],
+    }]);
+
+    assert_eq!(render_layout(&doc, &layout_options(80)), "p\na\nb");
+}
+
+#[test]
+fn layout_per_line_prefix_remains_active_in_a_multiline_suffix() {
+    let doc = LayoutDoc::from_events(vec![LayoutEvent::Block {
+        prefix: ";; ".into(),
+        per_line_prefix: Some(";; ".into()),
+        suffix: "\nx".into(),
+        events: vec![LayoutEvent::Text("a".into())],
+    }]);
+
+    assert_eq!(render_layout(&doc, &layout_options(80)), ";; a\n;; x");
+}
+
 // ── NewlineKind enum ──────────────────────────────────────────────
 
 #[test]
@@ -1993,8 +2246,8 @@ fn format_logical_block_list_argument_consumption_matches_sbcl() {
     // Nested blocks: the inner block consumes a sublist element.
     let nested = lb_list(&[n(1), lb_fixlist(&[2]), n(3)]);
     assert_eq!(format_nil_string("~<~a ~<~a~:> ~a~:>", &[nested]), "1 2 3");
-    // Mandatory conditional newline breaks even in linear rendering.
-    assert_eq!(format_nil_string("~@<a~:@_b~:>", &[]), "a\nb");
+    // With *PRINT-PRETTY* false, even a mandatory conditional newline is inert.
+    assert_eq!(format_nil_string("~@<a~:@_b~:>", &[]), "ab");
     assert_eq!(format_nil_string("~@<~a ~_~a~:>", &[n(1), n(2)]), "1 2");
 }
 

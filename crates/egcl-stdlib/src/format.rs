@@ -8,7 +8,7 @@
 use egcl_rt::error::EgclError;
 use egcl_rt::lock_order::{LockLevel, OrderedMutex};
 use egcl_rt::object::{ObjectHeader, type_id};
-use egcl_rt::value::{NIL, T, EgclVal, UNBOUND};
+use egcl_rt::value::{EgclVal, NIL, T, UNBOUND};
 
 // ── User print-object hook ────────────────────────────────────────
 //
@@ -79,7 +79,7 @@ fn run_iteration_body(
     body_function: Option<EgclVal>,
     elements: &[EgclVal],
     idx: &mut usize,
-    output: &mut String,
+    output: &mut LayoutDoc,
 ) -> Result<(), EgclError> {
     let Some(func) = body_function else {
         return format_impl(body, elements, idx, output);
@@ -91,10 +91,14 @@ fn run_iteration_body(
     call_args.extend_from_slice(&elements[*idx..]);
     egcl_rt::rooted_ref!(_call_args_root = &mut call_args);
     let tail = apply_format_function(*func, &call_args)?;
-    let remaining = if tail.is_cons() { cons_list_to_vec(tail).len() } else { 0 };
+    let remaining = if tail.is_cons() {
+        cons_list_to_vec(tail).len()
+    } else {
+        0
+    };
     *idx += (elements.len() - *idx).saturating_sub(remaining);
     if let Some(text) = extract_egcl_string(crate::streams::get_output_stream_string(*stream)?) {
-        output.push_str(&text);
+        output.text(&text);
     }
     Ok(())
 }
@@ -105,8 +109,7 @@ fn run_iteration_body(
 /// interpreter, which owns the generic-function registry; `None` for any other
 /// function. Must not allocate on the Lisp heap.
 pub type FunctionPrintHook = fn(EgclVal) -> Option<String>;
-static FUNCTION_PRINT_HOOK: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static FUNCTION_PRINT_HOOK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 pub fn set_function_print_hook(hook: Option<FunctionPrintHook>) {
     FUNCTION_PRINT_HOOK.store(
@@ -132,7 +135,8 @@ pub fn function_representation(v: EgclVal) -> String {
 }
 
 pub type PprintDispatchHook = fn(EgclVal, bool) -> Option<String>;
-static PPRINT_DISPATCH_HOOK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static PPRINT_DISPATCH_HOOK: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 pub fn set_pprint_dispatch_hook(hook: Option<PprintDispatchHook>) {
     PPRINT_DISPATCH_HOOK.store(
@@ -236,7 +240,13 @@ pub fn apply_print_case(name: &str) -> String {
         }
         _ => {}
     }
-    let affected = |c: char| if mode == 1 { c.is_lowercase() } else { c.is_uppercase() };
+    let affected = |c: char| {
+        if mode == 1 {
+            c.is_lowercase()
+        } else {
+            c.is_uppercase()
+        }
+    };
     let case = egcl_rt::symbols::find_index("*PRINT-CASE*")
         .and_then(egcl_rt::symbols::symbol_value)
         .filter(|v| v.is_symbol())
@@ -645,7 +655,9 @@ impl CircleTable {
 
     fn is_shared(&self, v: EgclVal) -> bool {
         v.is_cons()
-            && self.counts.get(&(unsafe { v.as_ptr() } as usize))
+            && self
+                .counts
+                .get(&(unsafe { v.as_ptr() } as usize))
                 .is_some_and(|n| *n >= 2)
     }
 
@@ -673,7 +685,9 @@ struct CircleContexts {
 }
 
 static CIRCLE: egcl_rt::execution_local::ExecutionLocal<std::cell::RefCell<CircleContexts>> = unsafe {
-    egcl_rt::execution_local::ExecutionLocal::new(|| std::cell::RefCell::new(CircleContexts::default()))
+    egcl_rt::execution_local::ExecutionLocal::new(|| {
+        std::cell::RefCell::new(CircleContexts::default())
+    })
 };
 
 /// Reuse the current graph's table for recursive printing, but scan an
@@ -705,11 +719,18 @@ pub fn circle_enter(root: EgclVal) {
         })
     });
     let covered = CIRCLE.with(|c| {
-        !root.is_cons() || c.borrow().tables.last().is_some_and(|table| {
-            table.counts.contains_key(&(unsafe { root.as_ptr() } as usize))
-        })
+        !root.is_cons()
+            || c.borrow().tables.last().is_some_and(|table| {
+                table
+                    .counts
+                    .contains_key(&(unsafe { root.as_ptr() } as usize))
+            })
     });
-    let table = if covered { None } else { CircleTable::build(root) };
+    let table = if covered {
+        None
+    } else {
+        CircleTable::build(root)
+    };
     CIRCLE.with(|c| {
         let mut contexts = c.borrow_mut();
         if contexts.pushed.is_empty() {
@@ -717,7 +738,9 @@ pub fn circle_enter(root: EgclVal) {
         }
         contexts.pushed.push(table.is_some());
         if let Some(mut table) = table {
-            table.next_label = contexts.tables.last()
+            table.next_label = contexts
+                .tables
+                .last()
                 .map_or(contexts.next_label, |parent| parent.next_label);
             contexts.tables.push(table);
         }
@@ -769,7 +792,13 @@ thread_local! {
 /// Print `val` as `~A` would under `*PRINT-BASE*` = `radix`, padded on the
 /// left to `mincol` with `padchar`: the non-integer case of the radix
 /// directives.
-fn push_non_integer_in_radix(output: &mut String, val: EgclVal, radix: u32, mincol: usize, padchar: char) {
+fn push_non_integer_in_radix(
+    output: &mut LayoutDoc,
+    val: EgclVal,
+    radix: u32,
+    mincol: usize,
+    padchar: char,
+) {
     let prev = PRINT_BASE_OVERRIDE.with(|c| c.replace(radix));
     let text = egclval_to_print_string(val, false);
     PRINT_BASE_OVERRIDE.with(|c| c.set(prev));
@@ -1029,12 +1058,15 @@ pub fn u8_readable_representation(value: EgclVal) -> Option<String> {
         if let Some((&length, rest)) = dims.split_first() {
             out.push('(');
             for i in 0..length {
-                if i != 0 { out.push(' '); }
+                if i != 0 {
+                    out.push(' ');
+                }
                 contents(value, rest, index, out);
             }
             out.push(')');
         } else {
-            let byte = crate::sequences::u8_array_element(value, *index).expect("octet array element");
+            let byte =
+                crate::sequences::u8_array_element(value, *index).expect("octet array element");
             out.push_str(&format!("#10r{byte}"));
             *index += 1;
         }
@@ -1042,7 +1074,11 @@ pub fn u8_readable_representation(value: EgclVal) -> Option<String> {
     let md_dims = egcl_rt::types::md_array_dims(value);
     let dims = if let Some(dims) = md_dims {
         (0..crate::sequences::length(dims).expect("array dimensions"))
-            .map(|i| crate::sequences::elt(dims, i).expect("array dimension").as_fixnum() as usize)
+            .map(|i| {
+                crate::sequences::elt(dims, i)
+                    .expect("array dimension")
+                    .as_fixnum() as usize
+            })
             .collect::<Vec<_>>()
     } else {
         vec![crate::sequences::array_total_size(value).expect("octet array size")]
@@ -1051,7 +1087,9 @@ pub fn u8_readable_representation(value: EgclVal) -> Option<String> {
     if md_dims.is_some() {
         out.push_str("'(");
         for (i, dimension) in dims.iter().enumerate() {
-            if i != 0 { out.push(' '); }
+            if i != 0 {
+                out.push(' ');
+            }
             out.push_str(&format!("#10r{dimension}"));
         }
         out.push(')');
@@ -1063,7 +1101,10 @@ pub fn u8_readable_representation(value: EgclVal) -> Option<String> {
     contents(value, &dims, &mut index, &mut out);
     if crate::sequences::is_complex_vector(value) {
         if crate::sequences::cvec_has_fill_pointer(value) {
-            out.push_str(&format!(" :FILL-POINTER #10r{}", crate::sequences::cvec_fill_pointer(value)));
+            out.push_str(&format!(
+                " :FILL-POINTER #10r{}",
+                crate::sequences::cvec_fill_pointer(value)
+            ));
         }
         if crate::sequences::cvec_adjustable(value) {
             out.push_str(" :ADJUSTABLE COMMON-LISP:T");
@@ -1142,7 +1183,11 @@ fn heap_vector_string(v: EgclVal, escapep: bool) -> Option<String> {
                 let mut s = String::from("#*");
                 for i in 0..count {
                     let e = crate::sequences::cvec_element(v, i).unwrap_or(NIL);
-                    s.push(if e.is_fixnum() && e.as_fixnum() == 1 { '1' } else { '0' });
+                    s.push(if e.is_fixnum() && e.as_fixnum() == 1 {
+                        '1'
+                    } else {
+                        '0'
+                    });
                 }
                 return Some(s);
             }
@@ -1354,7 +1399,11 @@ fn exp_with_decimal_point(s: &str, exp_char: char) -> String {
 fn format_e_fixed(f: f64, d: usize, e: Option<usize>, k: i64, exp_char: char) -> String {
     let neg = f.is_sign_negative() && f != 0.0;
     let af = f.abs();
-    let frac = if k > 0 { (d as i64 + 1 - k).max(0) as usize } else { d };
+    let frac = if k > 0 {
+        (d as i64 + 1 - k).max(0) as usize
+    } else {
+        d
+    };
     let factor = 10f64.powi(frac as i32);
     let (mant, exp) = if af == 0.0 {
         (0.0f64, 0i64)
@@ -1467,7 +1516,11 @@ pub fn single_float_to_string(x: f32) -> String {
     }
     // A single float carries an explicit `f` marker when the default format
     // is a double format (CLHS 22.1.3.1.3; ansi print.single-float.3).
-    let marker = if default_float_format_is_double() { 'f' } else { 'e' };
+    let marker = if default_float_format_is_double() {
+        'f'
+    } else {
+        'e'
+    };
     let a = x.abs();
     if a != 0.0 && !(1e-3..1e7).contains(&a) {
         let s = format!("{x:e}");
@@ -1525,21 +1578,18 @@ fn rational_format_value(rational: &egcl_rt::bignum::BigRat) -> f64 {
     // components of a representable ratio do not turn into infinity/infinity.
     fn leading_limbs(integer: &egcl_rt::bignum::BigInt) -> (f64, usize) {
         let dropped = integer.mag.len().saturating_sub(2);
-        let leading = egcl_rt::bignum::BigInt::from_parts(
-            integer.sign as i32,
-            &integer.mag[dropped..],
-        );
+        let leading =
+            egcl_rt::bignum::BigInt::from_parts(integer.sign as i32, &integer.mag[dropped..]);
         (leading.to_f64(), dropped)
     }
     let (numerator, numerator_scale) = leading_limbs(&rational.num);
     let (denominator, denominator_scale) = leading_limbs(&rational.den);
-    let exponent = ((numerator_scale as i64 - denominator_scale as i64) * 64)
-        .clamp(-4096, 4096) as i32;
+    let exponent =
+        ((numerator_scale as i64 - denominator_scale as i64) * 64).clamp(-4096, 4096) as i32;
     // Split the exponent to keep the scale itself finite and nonzero, even
     // when the final quotient is near the overflow or subnormal boundary.
     let first_scale = exponent.clamp(-1022, 1023);
-    (numerator / denominator * 2.0f64.powi(first_scale))
-        * 2.0f64.powi(exponent - first_scale)
+    (numerator / denominator * 2.0f64.powi(first_scale)) * 2.0f64.powi(exponent - first_scale)
 }
 
 fn real_format_value(val: EgclVal) -> Result<f64, EgclError> {
@@ -1581,7 +1631,9 @@ fn egclval_to_print_inner(mut v: EgclVal, escapep: bool) -> String {
     if let Some(s) = dispatch_pprint(v, escapep) {
         return s;
     }
-    if let Some(text) = u8_readable_representation(v) { return text; }
+    if let Some(text) = u8_readable_representation(v) {
+        return text;
+    }
     if v.is_nil() {
         return print_symbol_name("NIL", escapep);
     }
@@ -1946,12 +1998,12 @@ fn format_cons(v: EgclVal, escapep: bool) -> String {
 }
 
 /// Append `text` to `output`, left-padded with `padchar` to `mincol` columns.
-fn push_padded_left(output: &mut String, text: &str, mincol: usize, padchar: char) {
+fn push_padded_left(output: &mut LayoutDoc, text: &str, mincol: usize, padchar: char) {
     let len = text.chars().count();
     for _ in len..mincol {
-        output.push(padchar);
+        output.character(padchar);
     }
-    output.push_str(text);
+    output.text(text);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2097,7 +2149,7 @@ fn integer_magnitude(val: EgclVal, radix: u32) -> Option<(bool, String)> {
 /// `@` the padding goes on the left (right-justify), otherwise on the right
 /// (bliss-znib).
 fn pad_format_field(
-    output: &mut String,
+    output: &mut LayoutDoc,
     s: &str,
     mincol: usize,
     colinc: usize,
@@ -2113,11 +2165,15 @@ fn pad_format_field(
         pad += colinc.max(1);
     }
     if at_sign {
-        output.extend(std::iter::repeat_n(padchar, pad));
-        output.push_str(s);
+        for _ in 0..pad {
+            output.character(padchar);
+        }
+        output.text(s);
     } else {
-        output.push_str(s);
-        output.extend(std::iter::repeat_n(padchar, pad));
+        output.text(s);
+        for _ in 0..pad {
+            output.character(padchar);
+        }
     }
 }
 
@@ -2419,12 +2475,14 @@ fn parse_directives(control: &str) -> Result<Vec<Directive>, EgclError> {
                         i += 1;
                     }
                     // A literal too large for an i64 saturates: it is still "out
-                // of range" for ~[ and "pad everything" for widths.
-                params.push(Param::Num(num_str.parse::<i64>().unwrap_or(if num_str.starts_with('-') {
-                    i64::MIN
-                } else {
-                    i64::MAX
-                })));
+                    // of range" for ~[ and "pad everything" for widths.
+                    params.push(Param::Num(num_str.parse::<i64>().unwrap_or(
+                        if num_str.starts_with('-') {
+                            i64::MIN
+                        } else {
+                            i64::MAX
+                        },
+                    )));
                     if i < chars.len() && chars[i] == ',' {
                         i += 1;
                     }
@@ -2481,6 +2539,592 @@ fn parse_directives(control: &str) -> Result<Vec<Directive>, EgclError> {
     Ok(directives)
 }
 
+// ── Queued pretty-layout engine ───────────────────────────────────
+
+/// An owned pretty-printing document.  FORMAT returns this intermediate form
+/// to callers that need to splice its directives into an enclosing logical
+/// block (notably the evaluator's Gray pretty stream) without flattening them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LayoutDoc {
+    events: Vec<LayoutEvent>,
+}
+
+impl LayoutDoc {
+    pub fn from_events(events: Vec<LayoutEvent>) -> Self {
+        Self { events }
+    }
+
+    pub fn events(&self) -> &[LayoutEvent] {
+        &self.events
+    }
+
+    pub fn into_events(self) -> Vec<LayoutEvent> {
+        self.events
+    }
+
+    fn text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if let Some(LayoutEvent::Text(last)) = self.events.last_mut() {
+            last.push_str(text);
+        } else {
+            self.events.push(LayoutEvent::Text(text.to_string()));
+        }
+    }
+
+    fn character(&mut self, character: char) {
+        if let Some(LayoutEvent::Text(last)) = self.events.last_mut() {
+            last.push(character);
+        } else {
+            self.events.push(LayoutEvent::Text(character.to_string()));
+        }
+    }
+
+    fn flat_string(&self) -> String {
+        let options = LayoutOptions {
+            pretty: false,
+            ..LayoutOptions::default()
+        };
+        render_layout(self, &options)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+
+    fn ends_with(&self, suffix: char) -> bool {
+        self.flat_string().ends_with(suffix)
+    }
+
+    fn current_column(&self) -> usize {
+        self.flat_string()
+            .rsplit('\n')
+            .next()
+            .map_or(0, |line| line.chars().count())
+    }
+}
+
+/// A semantic operation in a queued pretty-print document.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LayoutEvent {
+    Text(String),
+    CaseStart(CaseMode),
+    CaseEnd,
+    Block {
+        prefix: String,
+        per_line_prefix: Option<String>,
+        suffix: String,
+        events: Vec<LayoutEvent>,
+    },
+    Newline(NewlineKind),
+    Indent {
+        relative_to: IndentKind,
+        amount: i32,
+    },
+    Tab {
+        kind: TabKind,
+        colnum: u32,
+        colinc: u32,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndentKind {
+    Block,
+    Current,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaseMode {
+    Lower,
+    Upper,
+    CapitalizeWords,
+    CapitalizeFirst,
+}
+
+/// Dynamic parameters needed to resolve a queued layout document.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LayoutOptions {
+    pub margin: usize,
+    pub miser_width: Option<usize>,
+    pub line_limit: Option<usize>,
+    pub start_column: usize,
+    pub pretty: bool,
+}
+
+impl Default for LayoutOptions {
+    fn default() -> Self {
+        Self {
+            margin: 80,
+            miser_width: None,
+            line_limit: None,
+            start_column: 0,
+            pretty: true,
+        }
+    }
+}
+
+struct LayoutState<'a> {
+    options: &'a LayoutOptions,
+    output: String,
+    column: usize,
+    pending_spaces: usize,
+    lines: usize,
+    prefixes: Vec<(usize, String)>,
+    stopped: bool,
+    limit_enabled: bool,
+    cases: Vec<CaseState>,
+}
+
+struct CaseState {
+    mode: CaseMode,
+    word_start: bool,
+    first_seen: bool,
+}
+
+impl CaseState {
+    fn new(mode: CaseMode) -> Self {
+        Self {
+            mode,
+            word_start: true,
+            first_seen: false,
+        }
+    }
+
+    fn character(&mut self, character: char) -> char {
+        match self.mode {
+            CaseMode::Lower => crate::characters::char_downcase(character),
+            CaseMode::Upper => crate::characters::char_upcase(character),
+            CaseMode::CapitalizeWords => {
+                if !character.is_alphanumeric() {
+                    self.word_start = true;
+                    character
+                } else if self.word_start {
+                    self.word_start = false;
+                    crate::characters::char_upcase(character)
+                } else {
+                    crate::characters::char_downcase(character)
+                }
+            }
+            CaseMode::CapitalizeFirst => {
+                if !self.first_seen && character.is_alphabetic() {
+                    self.first_seen = true;
+                    crate::characters::char_upcase(character)
+                } else if self.first_seen {
+                    crate::characters::char_downcase(character)
+                } else {
+                    character
+                }
+            }
+        }
+    }
+}
+
+impl LayoutState<'_> {
+    fn flush_spaces(&mut self) {
+        self.output
+            .extend(std::iter::repeat_n(' ', self.pending_spaces));
+        self.pending_spaces = 0;
+    }
+
+    fn character(&mut self, character: char) {
+        if character == '\n' {
+            self.newline(0, false);
+        } else {
+            let character = self
+                .cases
+                .iter_mut()
+                .rev()
+                .fold(character, |character, state| state.character(character));
+            self.column += 1;
+            if character == ' ' {
+                self.pending_spaces += 1;
+            } else {
+                self.flush_spaces();
+                self.output.push(character);
+            }
+        }
+    }
+
+    fn text(&mut self, text: &str) {
+        for character in text.chars() {
+            self.character(character);
+        }
+    }
+
+    fn newline(&mut self, indent: usize, trim: bool) {
+        if self.stopped {
+            return;
+        }
+        if trim {
+            self.pending_spaces = 0;
+        } else {
+            self.flush_spaces();
+        }
+        if self.limit_enabled
+            && self
+                .options
+                .line_limit
+                .is_some_and(|limit| self.lines + 1 >= limit)
+        {
+            self.output.push_str(" ..");
+            self.stopped = true;
+            return;
+        }
+        for case in self.cases.iter_mut().rev() {
+            case.character('\n');
+        }
+        self.output.push('\n');
+        self.lines += 1;
+        self.column = 0;
+        let prefixes = self.prefixes.clone();
+        for (column, prefix) in prefixes {
+            while self.column < column {
+                self.character(' ');
+            }
+            self.text(&prefix);
+        }
+        while self.column < indent {
+            self.character(' ');
+        }
+    }
+
+    fn tab(&mut self, kind: TabKind, colnum: usize, colinc: usize, section: usize) {
+        let (origin, relative) = match kind {
+            TabKind::Line => (0, false),
+            TabKind::Section => (section, false),
+            TabKind::LineRelative => (0, true),
+            TabKind::SectionRelative => (section, true),
+        };
+        let current = self.column.saturating_sub(origin);
+        let spaces = if relative {
+            let target = current + colnum;
+            colnum
+                + if colinc > 0 && target % colinc != 0 {
+                    colinc - target % colinc
+                } else {
+                    0
+                }
+        } else if current < colnum {
+            colnum - current
+        } else if colinc > 0 {
+            colinc - ((current - colnum) % colinc)
+        } else {
+            0
+        };
+        for _ in 0..spaces {
+            self.character(' ');
+        }
+    }
+}
+
+fn flat_end_position(
+    events: &[LayoutEvent],
+    mut column: usize,
+    mut section: usize,
+) -> Option<(usize, usize)> {
+    for event in events {
+        match event {
+            LayoutEvent::Text(text) => {
+                for character in text.chars() {
+                    if character == '\n' {
+                        return None;
+                    }
+                    column += 1;
+                }
+            }
+            LayoutEvent::CaseStart(_) | LayoutEvent::CaseEnd => {}
+            LayoutEvent::Block {
+                prefix,
+                suffix,
+                events,
+                ..
+            } => {
+                for character in prefix.chars() {
+                    if character == '\n' {
+                        return None;
+                    }
+                    column += 1;
+                }
+                column = flat_end_position(events, column, column)?.0;
+                for character in suffix.chars() {
+                    if character == '\n' {
+                        return None;
+                    }
+                    column += 1;
+                }
+            }
+            LayoutEvent::Newline(NewlineKind::Mandatory) => return None,
+            LayoutEvent::Newline(_) => section = column,
+            LayoutEvent::Indent { .. } => {}
+            LayoutEvent::Tab {
+                kind,
+                colnum,
+                colinc,
+            } => {
+                let (origin, relative) = match kind {
+                    TabKind::Line => (0, false),
+                    TabKind::Section => (section, false),
+                    TabKind::LineRelative => (0, true),
+                    TabKind::SectionRelative => (section, true),
+                };
+                let current = column.saturating_sub(origin);
+                let colnum = *colnum as usize;
+                let colinc = *colinc as usize;
+                column += if relative {
+                    let target = current + colnum;
+                    colnum
+                        + if colinc > 0 && target % colinc != 0 {
+                            colinc - target % colinc
+                        } else {
+                            0
+                        }
+                } else if current < colnum {
+                    colnum - current
+                } else if colinc > 0 {
+                    colinc - ((current - colnum) % colinc)
+                } else {
+                    0
+                };
+            }
+        }
+    }
+    Some((column, section))
+}
+
+fn flat_end_column(events: &[LayoutEvent], column: usize, section: usize) -> Option<usize> {
+    flat_end_position(events, column, section).map(|position| position.0)
+}
+
+/// Flat column at the next conditional-newline boundary.  The boolean says
+/// the event slice ended, in which case the enclosing suffix belongs to this
+/// section's fit calculation.
+fn section_end_column(
+    events: &[LayoutEvent],
+    mut column: usize,
+    section: usize,
+) -> Option<(usize, bool)> {
+    for event in events {
+        match event {
+            LayoutEvent::Text(text) => {
+                for character in text.chars() {
+                    if character == '\n' {
+                        return Some((column, false));
+                    }
+                    column += 1;
+                }
+            }
+            LayoutEvent::Block {
+                prefix,
+                suffix,
+                events,
+                ..
+            } => {
+                for character in prefix.chars() {
+                    if character == '\n' {
+                        return Some((column, false));
+                    }
+                    column += 1;
+                }
+                column = flat_end_column(events, column, column)?;
+                for character in suffix.chars() {
+                    if character == '\n' {
+                        return Some((column, false));
+                    }
+                    column += 1;
+                }
+            }
+            LayoutEvent::CaseStart(_) | LayoutEvent::CaseEnd => {}
+            LayoutEvent::Newline(_) => return Some((column, false)),
+            LayoutEvent::Indent { .. } => {}
+            LayoutEvent::Tab {
+                kind,
+                colnum,
+                colinc,
+            } => {
+                let doc = LayoutDoc::from_events(vec![LayoutEvent::Tab {
+                    kind: *kind,
+                    colnum: *colnum,
+                    colinc: *colinc,
+                }]);
+                column = flat_end_column(doc.events(), column, section)?;
+            }
+        }
+    }
+    Some((column, true))
+}
+
+fn render_events(events: &[LayoutEvent], state: &mut LayoutState<'_>, section: usize) {
+    let enclosing_case_depth = state.cases.len();
+    for event in events {
+        if state.stopped {
+            break;
+        }
+        match event {
+            LayoutEvent::Text(text) => state.text(text),
+            LayoutEvent::CaseStart(mode) => {
+                state.cases.push(CaseState::new(*mode));
+            }
+            LayoutEvent::CaseEnd => {
+                state.cases.pop();
+            }
+            LayoutEvent::Block {
+                prefix,
+                per_line_prefix,
+                suffix,
+                events,
+            } => render_block(prefix, per_line_prefix.as_deref(), suffix, events, state),
+            LayoutEvent::Newline(NewlineKind::Mandatory) if state.options.pretty => {
+                state.newline(section, true)
+            }
+            // Conditional directives outside a logical block are inert, as
+            // are all PPRINT-NEWLINE kinds when pretty printing is disabled.
+            LayoutEvent::Newline(_) | LayoutEvent::Indent { .. } => {}
+            LayoutEvent::Tab {
+                kind,
+                colnum,
+                colinc,
+            } if state.options.pretty || matches!(kind, TabKind::Line | TabKind::LineRelative) => {
+                state.tab(*kind, *colnum as usize, *colinc as usize, section)
+            }
+            LayoutEvent::Tab { .. } => {}
+        }
+    }
+    state.cases.truncate(enclosing_case_depth);
+}
+
+fn render_block(
+    prefix: &str,
+    per_line_prefix: Option<&str>,
+    suffix: &str,
+    events: &[LayoutEvent],
+    state: &mut LayoutState<'_>,
+) {
+    let enclosing_case_depth = state.cases.len();
+    let enclosing_limit_enabled = state.limit_enabled;
+    state.limit_enabled = true;
+    let start = state.column;
+    state.text(prefix);
+    let base = state.column;
+    if let Some(per_line_prefix) = per_line_prefix {
+        state.prefixes.push((start, per_line_prefix.to_string()));
+    }
+    let multiline_delimiter = prefix.contains('\n') || suffix.contains('\n');
+    let linear = multiline_delimiter
+        || flat_end_column(events, base, base)
+            .and_then(|column| column.checked_add(suffix.chars().count()))
+            .is_none_or(|column| column > state.options.margin);
+    let miser = state
+        .options
+        .miser_width
+        .is_some_and(|width| state.options.margin.saturating_sub(base) <= width);
+    let mut indent = base;
+    let mut section_line = state.lines;
+    let mut section = base;
+
+    for (index, event) in events.iter().enumerate() {
+        if state.stopped {
+            break;
+        }
+        match event {
+            LayoutEvent::Text(text) => state.text(text),
+            LayoutEvent::CaseStart(mode) => {
+                state.cases.push(CaseState::new(*mode));
+            }
+            LayoutEvent::CaseEnd => {
+                state.cases.pop();
+            }
+            LayoutEvent::Block {
+                prefix,
+                per_line_prefix,
+                suffix,
+                events,
+            } => render_block(prefix, per_line_prefix.as_deref(), suffix, events, state),
+            LayoutEvent::Indent {
+                relative_to,
+                amount,
+            } if state.options.pretty && !miser => {
+                let origin = match relative_to {
+                    IndentKind::Block => base,
+                    IndentKind::Current => state.column,
+                };
+                indent = origin.saturating_add_signed(*amount as isize);
+            }
+            LayoutEvent::Indent { .. } => {}
+            LayoutEvent::Newline(kind) => {
+                let should_break = if !state.options.pretty {
+                    false
+                } else {
+                    match kind {
+                        NewlineKind::Mandatory => true,
+                        NewlineKind::Linear => linear,
+                        NewlineKind::Miser => miser,
+                        NewlineKind::Fill => {
+                            state.lines > section_line
+                                || section_end_column(&events[index + 1..], state.column, section)
+                                    .and_then(|(column, at_end)| {
+                                        if at_end && suffix.contains('\n') {
+                                            None
+                                        } else if at_end {
+                                            column.checked_add(suffix.chars().count())
+                                        } else {
+                                            Some(column)
+                                        }
+                                    })
+                                    .is_none_or(|column| column > state.options.margin)
+                        }
+                    }
+                };
+                if should_break {
+                    state.newline(if state.options.pretty { indent } else { 0 }, true);
+                }
+                section_line = state.lines;
+                section = state.column;
+            }
+            LayoutEvent::Tab {
+                kind,
+                colnum,
+                colinc,
+            } if state.options.pretty || matches!(kind, TabKind::Line | TabKind::LineRelative) => {
+                state.tab(*kind, *colnum as usize, *colinc as usize, section)
+            }
+            LayoutEvent::Tab { .. } => {}
+        }
+    }
+    state.cases.truncate(enclosing_case_depth);
+    // A line limit truncates the body, but every open block must still write
+    // its suffix in full (CLHS *PRINT-LINES*). Suffix newlines themselves do
+    // not trigger a second truncation marker.
+    let stopped = state.stopped;
+    state.stopped = false;
+    state.limit_enabled = false;
+    state.text(suffix);
+    if per_line_prefix.is_some() {
+        state.prefixes.pop();
+    }
+    state.stopped = stopped;
+    state.limit_enabled = enclosing_limit_enabled;
+}
+
+/// Resolve an owned layout document using the supplied printer parameters.
+pub fn render_layout(doc: &LayoutDoc, options: &LayoutOptions) -> String {
+    let mut state = LayoutState {
+        options,
+        output: String::new(),
+        column: options.start_column,
+        pending_spaces: 0,
+        lines: 0,
+        prefixes: Vec::new(),
+        stopped: false,
+        limit_enabled: false,
+        cases: Vec::new(),
+    };
+    render_events(doc.events(), &mut state, options.start_column);
+    state.flush_spaces();
+    state.output
+}
+
 // ── Main format engine ────────────────────────────────────────────
 
 // Number of arguments the most recent top-level `format` call consumed.
@@ -2518,8 +3162,6 @@ pub fn format(
 ) -> Result<EgclVal, EgclError> {
     let mut destination = destination;
     egcl_rt::rooted_ref!(_destination_root = &mut destination);
-    let mut args = args.to_vec();
-    egcl_rt::rooted_ref!(_args_root = &mut args);
     // Validate destination
     let to_string = destination.is_nil();
     let to_stdout = destination == T;
@@ -2546,34 +3188,22 @@ pub fn format(
         }
     }
 
-    // Validate matching brackets/braces/parens before executing
-    validate_matching(control_string)?;
-    if control_has_overflow_justification(control_string) {
-        if let Some(d) = clause_directive_among(control_string, &['W', 'I', '_']) {
-            return Err(EgclError::ControlError(format!(
-                "~{d} is not allowed in a control string with a ~<...~:;...~> justification"
-            )));
-        }
-    }
-
-    let mut output = String::new();
-    let mut arg_idx: usize = 0;
-    take_escape();
-    let result = format_impl(control_string, &args, &mut arg_idx, &mut output);
-    // A top-level `~^` ends the whole control string; nothing is left pending.
-    take_escape();
-    if let Err(e) = &result {
-        if std::env::var_os("EGCL_FMT_DBG").is_some() {
-            eprintln!(
-                ";; fmt TOP error={} control={:?} nargs={}",
-                e,
-                control_string.chars().take(120).collect::<String>(),
-                args.len()
-            );
-        }
-    }
-    result?;
-    LAST_CONSUMED.with(|c| c.set(arg_idx.min(args.len())));
+    let doc = format_to_layout(control_string, args)?;
+    let start_column = if to_stream {
+        crate::streams::stream_line_column(destination).unwrap_or(0) as usize
+    } else {
+        0
+    };
+    let options = LayoutOptions {
+        margin: print_integer_variable("*PRINT-RIGHT-MARGIN*").unwrap_or(80),
+        miser_width: print_integer_variable("*PRINT-MISER-WIDTH*"),
+        line_limit: (!print_readably_active())
+            .then(|| print_integer_variable("*PRINT-LINES*"))
+            .flatten(),
+        start_column,
+        pretty: print_pretty_active(),
+    };
+    let output = render_layout(&doc, &options);
 
     if to_stdout {
         print!("{}", output);
@@ -2635,6 +3265,48 @@ pub fn format(
     } else {
         Ok(NIL)
     }
+}
+
+fn print_integer_variable(name: &str) -> Option<usize> {
+    egcl_rt::symbols::find_index(name)
+        .and_then(egcl_rt::symbols::symbol_value)
+        .filter(|value| value.is_fixnum() && value.as_fixnum() >= 0)
+        .map(|value| value.as_fixnum() as usize)
+}
+
+/// Parse and execute FORMAT into semantic layout events without resolving line
+/// breaks.  The evaluator uses this to splice FORMAT into an enclosing Lisp
+/// pretty stream instead of flattening conditional directives into text.
+pub fn format_to_layout(control_string: &str, args: &[EgclVal]) -> Result<LayoutDoc, EgclError> {
+    let mut args = args.to_vec();
+    egcl_rt::rooted_ref!(_args_root = &mut args);
+    validate_matching(control_string)?;
+    if control_has_overflow_justification(control_string) {
+        if let Some(d) = clause_directive_among(control_string, &['W', 'I', '_']) {
+            return Err(EgclError::ControlError(format!(
+                "~{d} is not allowed in a control string with a ~<...~:;...~> justification"
+            )));
+        }
+    }
+
+    let mut output = LayoutDoc::default();
+    let mut arg_idx = 0;
+    take_escape();
+    let result = format_impl(control_string, &args, &mut arg_idx, &mut output);
+    take_escape();
+    if let Err(error) = &result {
+        if std::env::var_os("EGCL_FMT_DBG").is_some() {
+            eprintln!(
+                ";; fmt TOP error={} control={:?} nargs={}",
+                error,
+                control_string.chars().take(120).collect::<String>(),
+                args.len()
+            );
+        }
+    }
+    result?;
+    LAST_CONSUMED.with(|cell| cell.set(arg_idx.min(args.len())));
+    Ok(output)
 }
 
 fn validate_matching(control: &str) -> Result<(), EgclError> {
@@ -2718,7 +3390,7 @@ fn format_impl(
     control: &str,
     args: &[EgclVal],
     arg_idx: &mut usize,
-    output: &mut String,
+    output: &mut LayoutDoc,
 ) -> Result<(), EgclError> {
     let chars: Vec<char> = control.chars().collect();
     let mut i = 0;
@@ -2727,7 +3399,7 @@ fn format_impl(
             return Ok(());
         }
         if chars[i] != '~' {
-            output.push(chars[i]);
+            output.character(chars[i]);
             i += 1;
             continue;
         }
@@ -2777,11 +3449,13 @@ fn format_impl(
                 }
                 // A literal too large for an i64 saturates: it is still "out
                 // of range" for ~[ and "pad everything" for widths.
-                params.push(Param::Num(num_str.parse::<i64>().unwrap_or(if num_str.starts_with('-') {
-                    i64::MIN
-                } else {
-                    i64::MAX
-                })));
+                params.push(Param::Num(num_str.parse::<i64>().unwrap_or(
+                    if num_str.starts_with('-') {
+                        i64::MIN
+                    } else {
+                        i64::MAX
+                    },
+                )));
                 if i < chars.len() && chars[i] == ',' {
                     i += 1;
                 }
@@ -2811,10 +3485,7 @@ fn format_impl(
         let directive = chars[i].to_ascii_uppercase();
         i += 1;
 
-        let resolve_param = |p: &Param,
-                             default: i64,
-                             aidx: &mut usize|
-         -> Result<i64, EgclError> {
+        let resolve_param = |p: &Param, default: i64, aidx: &mut usize| -> Result<i64, EgclError> {
             match p {
                 Param::Num(n) => Ok(*n),
                 Param::Char(c) => Ok(*c as i64),
@@ -2981,7 +3652,7 @@ fn format_impl(
                         continue;
                     }
                 };
-                output.push_str(&format_integer_parts(
+                output.text(&format_integer_parts(
                     negative,
                     &digits,
                     radix,
@@ -3054,7 +3725,7 @@ fn format_impl(
                             continue;
                         }
                     };
-                    output.push_str(&format_integer_parts(
+                    output.text(&format_integer_parts(
                         negative,
                         &digits,
                         radix,
@@ -3079,12 +3750,12 @@ fn format_impl(
                     // Roman numerals stop at 4999; to_roman prints anything
                     // outside that range in decimal, bignums included.
                     if val.is_fixnum() {
-                        output.push_str(&to_roman(val.as_fixnum(), colon));
+                        output.text(&to_roman(val.as_fixnum(), colon));
                     } else {
                         if negative {
-                            output.push('-');
+                            output.character('-');
                         }
-                        output.push_str(&digits);
+                        output.text(&digits);
                     }
                     continue;
                 }
@@ -3095,7 +3766,7 @@ fn format_impl(
                         digits
                     ))
                 })?;
-                output.push_str(&if colon { ordinal(english) } else { english });
+                output.text(&if colon { ordinal(english) } else { english });
             }
             'F' => {
                 // ~w,d,k,overflowchar,padcharF (CLHS 22.3.3.1).  Parameters are
@@ -3121,7 +3792,9 @@ fn format_impl(
                 let d_opt = param(1).map(|d| d.max(0) as usize);
                 let scale = param(2).unwrap_or(0).clamp(-300, 300) as i32;
                 let overflow_char = param(3).and_then(|c| char::from_u32(c as u32));
-                let pad_char = param(4).and_then(|c| char::from_u32(c as u32)).unwrap_or(' ');
+                let pad_char = param(4)
+                    .and_then(|c| char::from_u32(c as u32))
+                    .unwrap_or(' ');
                 if *arg_idx >= args.len() {
                     return Err(EgclError::ControlError("too few args for ~F".into()));
                 }
@@ -3129,7 +3802,12 @@ fn format_impl(
                 *arg_idx += 1;
                 // A non-number prints as ~wD (CLHS 22.3.3.1).
                 if !egcl_rt::types::numberp(val) || egcl_rt::types::complexp(val) {
-                    push_padded_left(output, &egclval_to_print_string(val, false), w_opt.unwrap_or(0), pad_char);
+                    push_padded_left(
+                        output,
+                        &egclval_to_print_string(val, false),
+                        w_opt.unwrap_or(0),
+                        pad_char,
+                    );
                     continue;
                 }
                 let f = real_format_value(val)?;
@@ -3144,13 +3822,21 @@ fn format_impl(
                 };
                 // Scaling by a power of ten never changes the sign.
                 let negative = f.is_sign_negative();
-                let sign = if negative { "-" } else if at_sign { "+" } else { "" };
+                let sign = if negative {
+                    "-"
+                } else if at_sign {
+                    "+"
+                } else {
+                    ""
+                };
                 let abs = scaled.abs();
                 // Fixed digits after the point: D when given; otherwise, with a
                 // width, as many of the shortest decimal's as fit (at least the
                 // point); otherwise the shortest decimal itself.
                 let shortest_frac = shortest_abs.split_once('.').map_or(0, |(_, fr)| fr.len());
-                let int_len = shortest_abs.split_once('.').map_or(shortest_abs.len(), |(i, _)| i.len());
+                let int_len = shortest_abs
+                    .split_once('.')
+                    .map_or(shortest_abs.len(), |(i, _)| i.len());
                 let fixed_digits = |dd: usize| -> String {
                     // More digits than the shortest decimal carries is padding;
                     // fewer means rounding the float's EXACT value, ties away
@@ -3164,7 +3850,8 @@ fn format_impl(
                 let mut digits = match (w_opt, d_opt) {
                     (_, Some(dd)) => fixed_digits(dd),
                     (Some(w), None) => {
-                        let room = (w as i64 - sign.len() as i64 - int_len as i64 - 1).max(0) as usize;
+                        let room =
+                            (w as i64 - sign.len() as i64 - int_len as i64 - 1).max(0) as usize;
                         // Rounding a value just off a short decimal to the
                         // room can leave zeros (-112.400000000001 -> "112.400");
                         // the width-chosen fraction has no trailing zero digits
@@ -3188,7 +3875,8 @@ fn format_impl(
                 // ".50"); a bare trailing point always gets a zero ("1." ->
                 // "1.0"), even past the width.
                 if let Some(w) = w_opt {
-                    if sign.len() + digits.len() > w && digits.starts_with("0.") && digits.len() > 2 {
+                    if sign.len() + digits.len() > w && digits.starts_with("0.") && digits.len() > 2
+                    {
                         digits.remove(0);
                     }
                     // Only a width-chosen zero fraction loses its zero ("~0F"
@@ -3207,7 +3895,9 @@ fn format_impl(
                     let len = s.chars().count();
                     if len > w {
                         if let Some(oc) = overflow_char {
-                            output.extend(std::iter::repeat_n(oc, w));
+                            for _ in 0..w {
+                                output.character(oc);
+                            }
                             continue;
                         }
                     } else {
@@ -3215,7 +3905,7 @@ fn format_impl(
                         s = format!("{pad}{s}");
                     }
                 }
-                output.push_str(&s);
+                output.text(&s);
             }
             'E' => {
                 // ~w,d,e,k,overflowchar,padchar,exponentcharE. Resolve params in
@@ -3304,7 +3994,7 @@ fn format_impl(
                     let prefix: String = std::iter::repeat_n(pad, n).collect();
                     s = format!("{prefix}{s}");
                 }
-                output.push_str(&s);
+                output.text(&s);
             }
             'G' => {
                 // ~w,d,e,k,overflowchar,padcharG. Resolve the prefix params in order
@@ -3353,7 +4043,7 @@ fn format_impl(
                     let prefix: String = std::iter::repeat_n(pad, n).collect();
                     s = format!("{prefix}{s}");
                 }
-                output.push_str(&s);
+                output.text(&s);
             }
             '$' => {
                 // ~d,n,w,padchar$: d = digits after the point (default 2), n = min
@@ -3407,15 +4097,15 @@ fn format_impl(
                     // printed first, then padding, then the digits.
                     let pad: String = std::iter::repeat_n(padchar, w - count).collect();
                     if colon && !sign.is_empty() {
-                        output.push_str(sign);
-                        output.push_str(&pad);
-                        output.push_str(&num[sign.len()..]);
+                        output.text(sign);
+                        output.text(&pad);
+                        output.text(&num[sign.len()..]);
                     } else {
-                        output.push_str(&pad);
-                        output.push_str(&num);
+                        output.text(&pad);
+                        output.text(&num);
                     }
                 } else {
-                    output.push_str(&num);
+                    output.text(&num);
                 }
             }
             '%' => {
@@ -3425,7 +4115,7 @@ fn format_impl(
                     1
                 };
                 for _ in 0..count {
-                    output.push('\n');
+                    output.character('\n');
                 }
             }
             '&' => {
@@ -3436,10 +4126,10 @@ fn format_impl(
                 };
                 // Fresh line: emit newline only if not at start of line
                 if !output.is_empty() && !output.ends_with('\n') {
-                    output.push('\n');
+                    output.character('\n');
                 }
                 for _ in 1..count {
-                    output.push('\n');
+                    output.character('\n');
                 }
             }
             '|' => {
@@ -3449,20 +4139,36 @@ fn format_impl(
                     1
                 };
                 for _ in 0..count {
-                    output.push('\x0c');
+                    output.character('\x0c');
                 }
             }
-            // ~I (indent) and ~_ (conditional/fill newline) are pretty-printer
-            // hints; this linear (non-pretty) printer ignores them, EXCEPT the
-            // mandatory conditional newline ~:@_, which breaks unconditionally
-            // (CLHS 22.3.5.1) and so must break here too. Any numeric parameter
-            // (e.g. ~3i) and the remaining :/@ modifiers are parsed and
-            // harmlessly discarded. ASDF/UIOP use these inside ~<…~:> blocks.
-            'I' => {}
+            // Inside a logical block these remain semantic operations until the
+            // block is laid out.  Outside one the renderer treats indentation and
+            // non-mandatory conditional newlines as inert.
+            'I' => {
+                let amount = params
+                    .first()
+                    .map_or(Ok(0), |param| resolve_param(param, 0, arg_idx))?
+                    .clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+                output.events.push(LayoutEvent::Indent {
+                    // CLHS ~:I is relative to the current column; plain ~I is
+                    // relative to the logical block's body origin.
+                    relative_to: if colon {
+                        IndentKind::Current
+                    } else {
+                        IndentKind::Block
+                    },
+                    amount,
+                });
+            }
             '_' => {
-                if colon && at_sign {
-                    output.push('\n');
-                }
+                let kind = match (colon, at_sign) {
+                    (false, false) => NewlineKind::Linear,
+                    (true, false) => NewlineKind::Fill,
+                    (false, true) => NewlineKind::Miser,
+                    (true, true) => NewlineKind::Mandatory,
+                };
+                output.events.push(LayoutEvent::Newline(kind));
             }
             '~' => {
                 let count = if !params.is_empty() {
@@ -3471,7 +4177,7 @@ fn format_impl(
                     1
                 };
                 for _ in 0..count {
-                    output.push('~');
+                    output.character('~');
                 }
             }
             'T' => {
@@ -3488,42 +4194,30 @@ fn format_impl(
                 // nothing unless *PRINT-PRETTY* is true (ansi format.:t.2-3,
                 // format.:@t.4-5).
                 let first = if !params.is_empty() {
-                    resolve_param(&params[0], 1, arg_idx)?.max(0) as usize
+                    resolve_param(&params[0], 1, arg_idx)?.clamp(0, u32::MAX as i64) as u32
                 } else {
                     1
                 };
                 let colinc = if params.len() > 1 {
-                    resolve_param(&params[1], 1, arg_idx)?.max(0) as usize
+                    resolve_param(&params[1], 1, arg_idx)?.clamp(0, u32::MAX as i64) as u32
                 } else {
                     1
                 };
-                if colon && !print_pretty_active() {
-                    continue;
-                }
-                // Column is a CHARACTER count, not a byte count — the byte
-                // length overshoots on any multibyte output already on the line.
-                let cur_col = match output.rfind('\n') {
-                    Some(p) => output[p + 1..].chars().count(),
-                    None => output.chars().count(),
-                };
-                let spaces = if at_sign {
-                    let target = cur_col + first;
-                    let extra = if colinc > 0 && target % colinc != 0 {
-                        colinc - (target % colinc)
+                output.events.push(LayoutEvent::Tab {
+                    kind: if colon {
+                        if at_sign {
+                            TabKind::SectionRelative
+                        } else {
+                            TabKind::Section
+                        }
+                    } else if at_sign {
+                        TabKind::LineRelative
                     } else {
-                        0
-                    };
-                    first + extra
-                } else if cur_col < first {
-                    first - cur_col
-                } else if colinc > 0 {
-                    colinc - ((cur_col - first) % colinc)
-                } else {
-                    0
-                };
-                for _ in 0..spaces {
-                    output.push(' ');
-                }
+                        TabKind::Line
+                    },
+                    colnum: first,
+                    colinc,
+                });
             }
             '*' => {
                 // ~n* skips n (default 1); ~n:* backs up n; ~n@* goes to
@@ -3562,17 +4256,17 @@ fn format_impl(
                 if colon {
                     // ~:C spells out a non-graphic character's name; ~:@C adds
                     // nothing here (no key-name information to give).
-                    output.push_str(&character_name(c));
+                    output.text(&character_name(c));
                 } else if at_sign {
                     // ~@C prints the character as the reader would read it.
-                    output.push_str("#\\");
+                    output.text("#\\");
                     if c == ' ' && !print_readably_active() {
-                        output.push(' ');
+                        output.character(' ');
                     } else {
-                        output.push_str(&character_name(c));
+                        output.text(&character_name(c));
                     }
                 } else {
-                    output.push(c);
+                    output.character(c);
                 }
             }
             'W' => {
@@ -3581,7 +4275,7 @@ fn format_impl(
                 }
                 let val = args[*arg_idx];
                 *arg_idx += 1;
-                output.push_str(&egclval_to_print_string(val, true));
+                output.text(&egclval_to_print_string(val, true));
             }
             '?' => {
                 if *arg_idx >= args.len() {
@@ -3673,10 +4367,10 @@ fn format_impl(
                 *arg_idx += 1;
                 let is_one = val.is_fixnum() && val.as_fixnum() == 1;
                 if at_sign {
-                    output.push_str(if is_one { "y" } else { "ies" });
+                    output.text(if is_one { "y" } else { "ies" });
                 } else {
                     if !is_one {
-                        output.push('s');
+                        output.character('s');
                     }
                 }
             }
@@ -3779,7 +4473,13 @@ fn format_impl(
                     if at_least_once && *arg_idx >= args.len() && !reached(0) {
                         let mut sub_idx = 0;
                         OUTER_REMAINING.with(|c| c.set(Some(0)));
-                        run_iteration_body(&body, body_function_arg(body_function), &[], &mut sub_idx, output)?;
+                        run_iteration_body(
+                            &body,
+                            body_function_arg(body_function),
+                            &[],
+                            &mut sub_idx,
+                            output,
+                        )?;
                         take_escape();
                     }
                     while *arg_idx < args.len() && !reached(iters) {
@@ -3795,7 +4495,13 @@ fn format_impl(
                         let sub_args = proper_list_elements(sub)?;
                         let mut sub_idx = 0;
                         OUTER_REMAINING.with(|c| c.set(Some(args.len() - *arg_idx)));
-                        run_iteration_body(&body, body_function_arg(body_function), &sub_args, &mut sub_idx, output)?;
+                        run_iteration_body(
+                            &body,
+                            body_function_arg(body_function),
+                            &sub_args,
+                            &mut sub_idx,
+                            output,
+                        )?;
                         // `~^` ends this sublist's pass; `~:^` the iteration.
                         if take_escape() == 2 {
                             break;
@@ -3806,12 +4512,24 @@ fn format_impl(
                     // ~@{ : iterate over the remaining arguments themselves.
                     let mut iters = 0i64;
                     if at_least_once && *arg_idx >= args.len() && !reached(0) {
-                        run_iteration_body(&body, body_function_arg(body_function), args, arg_idx, output)?;
+                        run_iteration_body(
+                            &body,
+                            body_function_arg(body_function),
+                            args,
+                            arg_idx,
+                            output,
+                        )?;
                         take_escape();
                     }
                     while *arg_idx < args.len() && !reached(iters) {
                         let before = *arg_idx;
-                        run_iteration_body(&body, body_function_arg(body_function), args, arg_idx, output)?;
+                        run_iteration_body(
+                            &body,
+                            body_function_arg(body_function),
+                            args,
+                            arg_idx,
+                            output,
+                        )?;
                         if take_escape() != 0 {
                             break;
                         }
@@ -3838,7 +4556,13 @@ fn format_impl(
                         let saved_outer = OUTER_REMAINING.with(|c| c.get());
                         OUTER_REMAINING.with(|c| c.set(Some(0)));
                         let mut sub_idx = 0;
-                        run_iteration_body(&body, body_function_arg(body_function), &[], &mut sub_idx, output)?;
+                        run_iteration_body(
+                            &body,
+                            body_function_arg(body_function),
+                            &[],
+                            &mut sub_idx,
+                            output,
+                        )?;
                         take_escape();
                         OUTER_REMAINING.with(|c| c.set(saved_outer));
                     }
@@ -3859,7 +4583,13 @@ fn format_impl(
                             let sub_args = proper_list_elements(*sublist)?;
                             let mut sub_idx = 0;
                             OUTER_REMAINING.with(|c| c.set(Some(sublists.len() - iters - 1)));
-                            run_iteration_body(&body, body_function_arg(body_function), &sub_args, &mut sub_idx, output)?;
+                            run_iteration_body(
+                                &body,
+                                body_function_arg(body_function),
+                                &sub_args,
+                                &mut sub_idx,
+                                output,
+                            )?;
                             if take_escape() == 2 {
                                 break;
                             }
@@ -3881,7 +4611,13 @@ fn format_impl(
                     }
                     if list_val.is_nil() && at_least_once && !reached(0) {
                         let mut sub_idx = 0;
-                        run_iteration_body(&body, body_function_arg(body_function), &[], &mut sub_idx, output)?;
+                        run_iteration_body(
+                            &body,
+                            body_function_arg(body_function),
+                            &[],
+                            &mut sub_idx,
+                            output,
+                        )?;
                         take_escape();
                     }
                     if !list_val.is_nil() {
@@ -3891,7 +4627,13 @@ fn format_impl(
                         let mut iters = 0i64;
                         while sub_idx < list_elements.len() && !reached(iters) {
                             let before = sub_idx;
-                            run_iteration_body(&body, body_function_arg(body_function), &list_elements, &mut sub_idx, output)?;
+                            run_iteration_body(
+                                &body,
+                                body_function_arg(body_function),
+                                &list_elements,
+                                &mut sub_idx,
+                                output,
+                            )?;
                             if take_escape() != 0 {
                                 break;
                             }
@@ -3954,26 +4696,27 @@ fn format_impl(
                     if nil_v {
                         *arg_idx += 1;
                     }
-                    let idx_i64 = if !nil_v && params.first().is_some_and(|p| !matches!(p, Param::None)) {
-                        resolve_param(&params[0], 0, arg_idx)?
-                    } else {
-                        if *arg_idx >= args.len() {
-                            return Err(EgclError::ControlError("too few args for ~[".into()));
-                        }
-                        let val = args[*arg_idx];
-                        *arg_idx += 1;
-                        if val.is_fixnum() {
-                            val.as_fixnum()
-                        } else if let Some((negative, _)) = integer_magnitude(val, 10) {
-                            // A bignum selects no clause (ansi format.cond.4).
-                            if negative { i64::MIN } else { i64::MAX }
+                    let idx_i64 =
+                        if !nil_v && params.first().is_some_and(|p| !matches!(p, Param::None)) {
+                            resolve_param(&params[0], 0, arg_idx)?
                         } else {
-                            return Err(EgclError::TypeError {
-                                datum: val,
-                                expected: "integer".into(),
-                            });
-                        }
-                    };
+                            if *arg_idx >= args.len() {
+                                return Err(EgclError::ControlError("too few args for ~[".into()));
+                            }
+                            let val = args[*arg_idx];
+                            *arg_idx += 1;
+                            if val.is_fixnum() {
+                                val.as_fixnum()
+                            } else if let Some((negative, _)) = integer_magnitude(val, 10) {
+                                // A bignum selects no clause (ansi format.cond.4).
+                                if negative { i64::MIN } else { i64::MAX }
+                            } else {
+                                return Err(EgclError::TypeError {
+                                    datum: val,
+                                    expected: "integer".into(),
+                                });
+                            }
+                        };
                     // A negative selector wraps to a huge usize -> out of range ->
                     // the ~:; default clause (if any), matching an unmatched index.
                     let idx = idx_i64 as usize;
@@ -3997,20 +4740,17 @@ fn format_impl(
                 let body_end = find_matching_close(&chars, i, '(')?;
                 let body: String = chars[body_start..body_end].iter().collect();
                 i = skip_close_directive(&chars, body_end);
-                let mut inner = String::new();
+                let mut inner = LayoutDoc::default();
                 format_impl(&body, args, arg_idx, &mut inner)?;
-                // Character by character with the CHAR-UPCASE/CHAR-DOWNCASE
-                // mapping, as STRING-UPCASE does: Rust's string case mapping
-                // is not 1:1 ("ß" would upcase to "SS"). bliss-ne14.
-                if colon && at_sign {
-                    output.extend(inner.chars().map(crate::characters::char_upcase));
-                } else if colon {
-                    output.push_str(&capitalize_words(&inner));
-                } else if at_sign {
-                    output.push_str(&capitalize_first(&inner));
-                } else {
-                    output.extend(inner.chars().map(crate::characters::char_downcase));
-                }
+                let mode = match (colon, at_sign) {
+                    (true, true) => CaseMode::Upper,
+                    (true, false) => CaseMode::CapitalizeWords,
+                    (false, true) => CaseMode::CapitalizeFirst,
+                    (false, false) => CaseMode::Lower,
+                };
+                output.events.push(LayoutEvent::CaseStart(mode));
+                output.events.extend(inner.into_events());
+                output.events.push(LayoutEvent::CaseEnd);
             }
             ')' => {
                 return Err(EgclError::Internal("unmatched ~)".into()));
@@ -4037,12 +4777,9 @@ fn format_impl(
                 };
                 i = skip_close_directive(&chars, body_end);
                 if close_is_colon {
-                    // Pretty-printing logical block (CLHS 22.3.5.2), rendered
-                    // linearly (everything "fits on one line"; only mandatory
-                    // newlines break). Segments are [prefix~;]body[~;suffix]
-                    // (a `~@;` separator marks a PER-LINE prefix, identical to
-                    // a plain prefix in linear rendering); prefix and suffix
-                    // are constant text. A `:` on the OPENING supplies the
+                    // Pretty-printing logical block (CLHS 22.3.5.2). Segments
+                    // are [prefix~;]body[~;suffix]; `~@;` marks a per-line
+                    // prefix. A `:` on the OPENING supplies the
                     // default "("/")" pair. `@` on the opening formats the
                     // block over the remaining arguments; otherwise the block
                     // consumes ONE argument — a list, whose elements become
@@ -4050,6 +4787,7 @@ fn format_impl(
                     // free body when that argument is missing) — and a
                     // NON-list argument is printed by WRITE with the whole
                     // block, prefix and suffix included, skipped (bliss-aspj).
+                    let per_line_prefix = first_separator_has_at_sign(&body);
                     let clauses = split_clauses(&body);
                     let (pre_seg, body_seg, suf_seg) = match clauses.len() {
                         0 => (None, String::new(), None),
@@ -4065,18 +4803,25 @@ fn format_impl(
                         pre_seg.unwrap_or_else(|| if colon { "(" } else { "" }.to_string());
                     let suffix =
                         suf_seg.unwrap_or_else(|| if colon { ")" } else { "" }.to_string());
-                    // CLHS requires prefix/suffix to be constant strings, so
-                    // format them over NO arguments: literal directives (~~,
-                    // ~%) still render, while an argument-consuming directive
-                    // signals a control-error much as SBCL rejects it.
-                    let emit_const = |seg: &str, output: &mut String| -> Result<(), EgclError> {
-                        format_impl(seg, &[], &mut 0, output)
+                    // Prefix and suffix are constant controls, formatted over
+                    // no arguments and flattened before becoming block metadata.
+                    let format_const = |seg: &str| -> Result<String, EgclError> {
+                        let mut doc = LayoutDoc::default();
+                        format_impl(seg, &[], &mut 0, &mut doc)?;
+                        Ok(doc.flat_string())
                     };
+                    let prefix = format_const(&prefix)?;
+                    let suffix = format_const(&suffix)?;
                     if at_sign {
-                        emit_const(&prefix, output)?;
-                        format_impl(&body_seg, args, arg_idx, output)?;
+                        let mut body_doc = LayoutDoc::default();
+                        format_impl(&body_seg, args, arg_idx, &mut body_doc)?;
                         take_escape();
-                        emit_const(&suffix, output)?;
+                        output.events.push(LayoutEvent::Block {
+                            prefix: prefix.clone(),
+                            per_line_prefix: per_line_prefix.then_some(prefix),
+                            suffix,
+                            events: body_doc.into_events(),
+                        });
                     } else {
                         if *arg_idx >= args.len() {
                             return Err(EgclError::ControlError("too few args for ~<".into()));
@@ -4084,14 +4829,26 @@ fn format_impl(
                         let val = args[*arg_idx];
                         *arg_idx += 1;
                         if val.is_cons() || val.is_nil() {
-                            let sub_args = cons_list_to_vec(val);
+                            let mut sub_args = cons_list_to_vec(val);
+                            egcl_rt::rooted_ref!(_sub_args_root = &mut sub_args);
                             let mut sub_idx = 0;
-                            emit_const(&prefix, output)?;
-                            format_impl(&body_seg, &sub_args, &mut sub_idx, output)?;
+                            let mut body_doc = LayoutDoc::default();
+                            // One graph-wide table makes repeated elements share
+                            // labels across separate ~A/~S directives.
+                            circle_enter(val);
+                            let body_result =
+                                format_impl(&body_seg, &sub_args, &mut sub_idx, &mut body_doc);
+                            circle_exit();
+                            body_result?;
                             take_escape();
-                            emit_const(&suffix, output)?;
+                            output.events.push(LayoutEvent::Block {
+                                prefix: prefix.clone(),
+                                per_line_prefix: per_line_prefix.then_some(prefix),
+                                suffix,
+                                events: body_doc.into_events(),
+                            });
                         } else {
-                            output.push_str(&egclval_to_print_string(val, true));
+                            output.text(&egclval_to_print_string(val, true));
                         }
                     }
                 } else {
@@ -4129,23 +4886,23 @@ fn format_impl(
                     let mut overflow_text: Option<String> = None;
                     if overflow.is_some() && !clauses.is_empty() {
                         let first = clauses.remove(0);
-                        let mut text = String::new();
+                        let mut text = LayoutDoc::default();
                         format_impl(&first, args, arg_idx, &mut text)?;
                         if take_escape() != 0 {
                             clauses.clear();
                         }
-                        overflow_text = Some(text);
+                        overflow_text = Some(text.flat_string());
                     }
                     let mut parts = Vec::new();
                     for clause in &clauses {
-                        let mut part = String::new();
+                        let mut part = LayoutDoc::default();
                         format_impl(clause, args, arg_idx, &mut part)?;
                         // `~^` in a segment discards that segment and ends the
                         // clause; the segments so far are justified.
                         if take_escape() != 0 {
                             break;
                         }
-                        parts.push(part);
+                        parts.push(part.flat_string());
                     }
                     let total_len: usize = parts.iter().map(|p| p.chars().count()).sum();
 
@@ -4194,7 +4951,7 @@ fn format_impl(
                         justified.extend(std::iter::repeat_n(padchar, gap_width(g)));
                     }
                     if let (Some((spare, line_width)), Some(text)) = (overflow, overflow_text) {
-                        let column = output.rsplit('\n').next().map_or(0, |l| l.chars().count());
+                        let column = output.current_column();
                         let line_width = line_width.unwrap_or_else(|| {
                             egcl_rt::symbols::find_index("*PRINT-RIGHT-MARGIN*")
                                 .and_then(egcl_rt::symbols::symbol_value)
@@ -4202,10 +4959,10 @@ fn format_impl(
                                 .map_or(72, |v| v.as_fixnum().max(0) as usize)
                         });
                         if column + justified.chars().count() + spare > line_width {
-                            output.push_str(&text);
+                            output.text(&text);
                         }
                     }
-                    output.push_str(&justified);
+                    output.text(&justified);
                 }
             }
             '>' => {
@@ -4249,15 +5006,12 @@ fn format_impl(
                     });
                 }
                 if *arg_idx >= args.len() {
-                    return Err(EgclError::Internal(format!(
-                        "too few args for ~/{}/",
-                        name
-                    )));
+                    return Err(EgclError::Internal(format!("too few args for ~/{}/", name)));
                 }
                 let arg = args[*arg_idx];
                 *arg_idx += 1;
-                let Some(func) = lookup_format_function(&name)
-                    .or_else(|| format_function_designator(&name))
+                let Some(func) =
+                    lookup_format_function(&name).or_else(|| format_function_designator(&name))
                 else {
                     return Err(EgclError::UndefinedFunction(
                         egcl_compiler::reader::read_symbol_token(&name.to_uppercase())
@@ -4281,7 +5035,7 @@ fn format_impl(
                 if let Some(text) =
                     extract_egcl_string(crate::streams::get_output_stream_string(*stream)?)
                 {
-                    output.push_str(&text);
+                    output.text(&text);
                 }
             }
             '\n' => {
@@ -4289,7 +5043,7 @@ fn format_impl(
                 // skipped; `~:` keeps the whitespace, `~@` keeps the newline
                 // (CLHS 22.3.9.3; ansi format.newline.2/3).
                 if at_sign {
-                    output.push('\n');
+                    output.character('\n');
                 }
                 if !colon {
                     while i < chars.len() && chars[i].is_whitespace() {
@@ -4471,7 +5225,11 @@ fn control_has_overflow_justification(control: &str) -> bool {
         }
         i += 1;
         while i < chars.len()
-            && (chars[i].is_ascii_digit() || matches!(chars[i], ',' | '\'' | 'v' | 'V' | '#' | ':' | '@' | '-' | '+'))
+            && (chars[i].is_ascii_digit()
+                || matches!(
+                    chars[i],
+                    ',' | '\'' | 'v' | 'V' | '#' | ':' | '@' | '-' | '+'
+                ))
         {
             if chars[i] == '\'' {
                 i += 1;
@@ -4515,7 +5273,11 @@ fn clause_directive_among(clause: &str, wanted: &[char]) -> Option<char> {
         }
         i += 1;
         while i < chars.len()
-            && (chars[i].is_ascii_digit() || matches!(chars[i], ',' | '\'' | 'v' | 'V' | '#' | ':' | '@' | '-' | '+'))
+            && (chars[i].is_ascii_digit()
+                || matches!(
+                    chars[i],
+                    ',' | '\'' | 'v' | 'V' | '#' | ':' | '@' | '-' | '+'
+                ))
         {
             if chars[i] == '\'' {
                 i += 1;
@@ -4549,7 +5311,11 @@ fn justify_overflow_params(body: &str) -> Option<(usize, Option<usize>)> {
         i += 1;
         let mut colon = false;
         while i < chars.len()
-            && (chars[i].is_ascii_digit() || matches!(chars[i], ',' | '\'' | 'v' | 'V' | '#' | ':' | '@' | '-' | '+'))
+            && (chars[i].is_ascii_digit()
+                || matches!(
+                    chars[i],
+                    ',' | '\'' | 'v' | 'V' | '#' | ':' | '@' | '-' | '+'
+                ))
         {
             if chars[i] == '\'' {
                 i += 1;
@@ -4568,9 +5334,15 @@ fn justify_overflow_params(body: &str) -> Option<(usize, Option<usize>)> {
                 if !colon {
                     return None;
                 }
-                let params: String = chars[start..i].iter().filter(|c| **c != ':' && **c != '@').collect();
+                let params: String = chars[start..i]
+                    .iter()
+                    .filter(|c| **c != ':' && **c != '@')
+                    .collect();
                 let mut fields = params.split(',');
-                let spare = fields.next().and_then(|f| f.parse::<usize>().ok()).unwrap_or(0);
+                let spare = fields
+                    .next()
+                    .and_then(|f| f.parse::<usize>().ok())
+                    .unwrap_or(0);
                 let width = fields.next().and_then(|f| f.parse::<usize>().ok());
                 return Some((spare, width));
             }
@@ -4579,6 +5351,47 @@ fn justify_overflow_params(body: &str) -> Option<(usize, Option<usize>)> {
         i += 1;
     }
     None
+}
+
+/// Whether the first top-level logical-block separator is `~@;`, which makes
+/// the preceding prefix repeat on every continuation line.
+fn first_separator_has_at_sign(body: &str) -> bool {
+    let chars: Vec<char> = body.chars().collect();
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '~' {
+            i += 1;
+            continue;
+        }
+        i += 1;
+        let mut at_sign = false;
+        while i < chars.len()
+            && (chars[i].is_ascii_digit()
+                || matches!(
+                    chars[i],
+                    ',' | '\'' | 'v' | 'V' | '#' | ':' | '@' | '-' | '+'
+                ))
+        {
+            if chars[i] == '\'' && i + 1 < chars.len() {
+                i += 2;
+                continue;
+            }
+            at_sign |= chars[i] == '@';
+            i += 1;
+        }
+        if i >= chars.len() {
+            break;
+        }
+        match chars[i] {
+            '{' | '[' | '(' | '<' => depth += 1,
+            '}' | ']' | ')' | '>' => depth -= 1,
+            ';' if depth == 0 => return at_sign,
+            _ => {}
+        }
+        i += 1;
+    }
+    false
 }
 
 fn split_clauses(body: &str) -> Vec<String> {
@@ -4633,39 +5446,6 @@ fn split_clauses(body: &str) -> Vec<String> {
     clauses
 }
 
-fn capitalize_words(s: &str) -> String {
-    let mut result = String::new();
-    let mut cap_next = true;
-    for c in s.chars() {
-        if c.is_whitespace() || !c.is_alphanumeric() {
-            result.push(c);
-            cap_next = true;
-        } else if cap_next {
-            result.push(crate::characters::char_upcase(c));
-            cap_next = false;
-        } else {
-            result.push(crate::characters::char_downcase(c));
-        }
-    }
-    result
-}
-
-fn capitalize_first(s: &str) -> String {
-    let mut result = String::new();
-    let mut done = false;
-    for c in s.chars() {
-        if !done && c.is_alphabetic() {
-            result.push(crate::characters::char_upcase(c));
-            done = true;
-        } else if done {
-            result.push(crate::characters::char_downcase(c));
-        } else {
-            result.push(c);
-        }
-    }
-    result
-}
-
 // ── formatter ─────────────────────────────────────────────────────
 
 /// Compile a FORMAT control string for repeated use.
@@ -4691,8 +5471,7 @@ pub fn formatter(control_string: &str) -> Result<EgclVal, EgclError> {
         (*closure).header = header;
         (*closure).function = ctrl_str; // the captured control string
         // Store control string in closed_vars slot (offset after ClosureData)
-        *(ptr.add(std::mem::size_of::<egcl_rt::object::ClosureData>()) as *mut EgclVal) =
-            ctrl_str;
+        *(ptr.add(std::mem::size_of::<egcl_rt::object::ClosureData>()) as *mut EgclVal) = ctrl_str;
         // Return as function-tagged pointer so it's callable
         Ok(EgclVal::from_function_ptr(ptr))
     }
@@ -4729,10 +5508,10 @@ pub fn pprint_logical_block(
             } else {
                 cons_list_to_vec(list)
             };
-            let mut body_output = String::new();
+            let mut body_output = LayoutDoc::default();
             let mut idx = 0;
             format_impl(&body_str, &list_elements, &mut idx, &mut body_output)?;
-            output.push_str(&body_output);
+            output.push_str(&body_output.flat_string());
         }
     } else if !list.is_nil() {
         // If no body format string, print the list elements separated by spaces

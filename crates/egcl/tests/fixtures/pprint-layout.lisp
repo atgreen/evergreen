@@ -2,10 +2,37 @@
 
 (defvar *layout-failures* 0)
 
+(defclass %pretty-stream (egcl-gray-streams:fundamental-character-output-stream)
+  ((characters :initform nil :accessor fake-pretty-characters)))
+
+(defmethod egcl-gray-streams:stream-write-char ((stream %pretty-stream) character)
+  (push character (fake-pretty-characters stream))
+  character)
+
+(defmethod egcl-gray-streams:stream-line-column ((stream %pretty-stream)) 0)
+
+(defclass error-column-stream (egcl-gray-streams:fundamental-character-output-stream) ())
+
+(defmethod egcl-gray-streams:stream-write-char ((stream error-column-stream) character)
+  character)
+
+(defmethod egcl-gray-streams:stream-line-column ((stream error-column-stream))
+  (error "column unavailable"))
+
 (defun check-layout (name expected function)
   (let ((actual (funcall function)))
     (format t "~A: ~:[FAIL~;PASS~] expected ~S actual ~S~%" name (equal expected actual) expected actual)
     (unless (equal expected actual) (incf *layout-failures*))))
+
+(defun multiline-within-p (text margin)
+  (let ((column 0) (multiline nil) (within t))
+    (loop for character across text do
+      (if (char= character #\Newline)
+          (setf column 0 multiline t)
+          (progn
+            (incf column)
+            (when (> column margin) (setf within nil)))))
+    (and multiline within)))
 
 (let ((*print-pretty* t) (*print-miser-width* nil))
   (check-layout :linear (format nil "(111~% 222~% 333)")
@@ -52,6 +79,127 @@
       (pprint-logical-block (s nil)
         (write-string "a" s) (terpri s) (write-string "b " s)
         (pprint-newline :fill s) (write-string "c" s)))))
+  ;; Exercise the same layout decisions through both public interfaces.  The
+  ;; FORMAT cases must enqueue into the surrounding logical block rather than
+  ;; render into a temporary one-line string.
+  (let ((fill-output (format nil "A A A~%A A A~%A A A~%A ")))
+    (check-layout :direct-fill fill-output
+      (lambda () (let ((*print-right-margin* 6))
+        (with-output-to-string (s)
+          (pprint-logical-block (s nil)
+            (dotimes (i 10)
+              (declare (ignore i))
+              (write-string "A " s)
+              (pprint-newline :fill s)))))))
+    (check-layout :format-fill fill-output
+      (lambda () (let ((*print-right-margin* 6))
+        (format nil "~@<A ~:_A ~:_A ~:_A ~:_A ~:_A ~:_A ~:_A ~:_A ~:_A ~:_~:>")))))
+  (let ((indent-output (format nil "(M~%   M)")))
+    (check-layout :direct-indent indent-output
+      (lambda () (with-output-to-string (s)
+        (pprint-logical-block (s nil :prefix "(" :suffix ")")
+          (write-string "M" s)
+          (pprint-indent :current 1 s)
+          (pprint-newline :mandatory s)
+          (write-string "M" s)))))
+    (check-layout :format-indent indent-output
+      (lambda () (format nil "~:<M~1:I~@:_M~:>" '(m m)))))
+  (let ((*print-right-margin* 20) (*print-miser-width* 20)
+        (miser-output (format nil "~%A")))
+    (check-layout :direct-miser miser-output
+      (lambda () (with-output-to-string (s)
+        (pprint-logical-block (s nil)
+          (pprint-newline :miser s)
+          (write-string "A" s)))))
+    (check-layout :format-miser miser-output
+      (lambda () (format nil "~@<~@_A~:>"))))
+  (check-layout :direct-section-tab "[ ]"
+    (lambda () (with-output-to-string (s)
+      (pprint-logical-block (s nil :prefix "[" :suffix "]")
+        (pprint-tab :section 1 0 s)))))
+  (check-layout :format-section-tab "[ ]"
+    (lambda () (format nil "~<[~;~,0:T~;]~:>" '(a))))
+  (check-layout :format-case-layout (format nil "Foo~%Bar")
+    (lambda () (let ((*print-right-margin* 4))
+      (format nil "~@<~:(FOO ~:_BAR~)~:>"))))
+  (check-layout :format-case-layout-whitespace
+      (list "Foo  Bar" "Foobar" (format nil "Foo~%Bar"))
+    (lambda ()
+      (list (format nil "~:(foo~5Tbar~)")
+            (let ((*print-right-margin* 80))
+              (format nil "~@<~:(foo~:_bar~)~:>"))
+            (let ((*print-right-margin* 3))
+              (format nil "~@<~:(foo~:_bar~)~:>")))))
+  (check-layout :format-line-tab-start-column "abc  x"
+    (lambda () (with-output-to-string (s)
+      (write-string "abc" s)
+      (format s "~5Tx"))))
+  (check-layout :format-section-tab-after-unbroken-break "[ab x]"
+    (lambda () (let ((*print-right-margin* 80))
+      (format nil "~@<[a~:_b~2,0:Tx]~:>"))))
+  (check-layout :format-mandatory-not-pretty "ab"
+    (lambda () (let ((*print-pretty* nil))
+      (format nil "~@<a~:@_b~:>"))))
+  (check-layout :format-readably-ignores-line-limit (format nil "(a~%b)")
+    (lambda () (let ((*print-lines* 1) (*print-readably* t))
+      (format nil "~@<(a~:@_b)~:>"))))
+  (check-layout :format-bridge-column 3
+    (lambda () (let ((column nil))
+      (with-output-to-string (s)
+        (pprint-logical-block (s nil)
+          (format s "abc")
+          (setf column (egcl-gray-streams:stream-line-column s))))
+      column)))
+  (check-layout :format-bridge-semantic-columns '(5 1)
+    (lambda () (let ((columns nil))
+      (with-output-to-string (s)
+        (pprint-logical-block (s nil)
+          (format s "a~5T")
+          (push (egcl-gray-streams:stream-line-column s) columns)
+          (format s "~:@_b")
+          (push (egcl-gray-streams:stream-line-column s) columns)))
+      (nreverse columns))))
+  (check-layout :format-bridge-section-column 6
+    (lambda () (let ((column nil))
+      (with-output-to-string (s)
+        (pprint-logical-block (s nil)
+          (format s "~@<[a~:_b~2,0:Tx]~:>")
+          (setf column (egcl-gray-streams:stream-line-column s))))
+      column)))
+  (check-layout :same-bare-class-name "ok"
+    (lambda () (let ((stream (make-instance '%pretty-stream)))
+      (format stream "ok")
+      (coerce (nreverse (fake-pretty-characters stream)) 'string))))
+  (check-layout :gray-column-error t
+    (lambda () (handler-case
+      (let ((stream (make-instance 'error-column-stream)))
+        (pprint-logical-block (stream nil)
+          (write-string "x" stream))
+        nil)
+      (error () t))))
+  (check-layout :large-indent-tab "a .."
+    (lambda () (let ((*print-lines* 1))
+      (with-output-to-string (s)
+        (pprint-logical-block (s nil)
+          (write-string "a" s)
+          (pprint-indent :block -100000000000000000000 s)
+          (pprint-newline :mandatory s)
+          ;; The line limit stops rendering here, but the bridge must still
+          ;; decode this valid Common Lisp integer without wrapping it.
+          (pprint-tab :line-relative 100000000000000000000 0 s))))))
+  (check-layout :format-circle "(#1=(0) #1#)"
+    (lambda () (let ((*print-circle* t) (shared (list 0)))
+      (format nil "~:<~@{~A~^ ~}~:>" (list shared shared)))))
+  (check-layout :pprint-margin t
+    (lambda () (let ((*print-right-margin* 40))
+      (multiline-within-p
+       (with-output-to-string (s)
+         (pprint '(defun area-of-ring (outer inner)
+                    (let ((a (* pi outer outer)) (b (* pi inner inner)))
+                      (if (> a b) (- a b)
+                          (error "inner ~a exceeds outer ~a" inner outer))))
+                 s))
+       40))))
   (dolist (pretty '(nil t))
     (let ((*print-pretty* pretty))
       (check-layout :newline-stream t (lambda () (handler-case (pprint-newline :fill 42) (type-error () t))))
