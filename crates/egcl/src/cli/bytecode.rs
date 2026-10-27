@@ -386,6 +386,33 @@ static REGISTRY_GENERATION: egcl_rt::execution_local::ExecutionLocal<
     RefCell<HashMap<u32, u64, egcl_rt::fxhash::FxBuildHasher>>,
 > = unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(HashMap::default())) };
 
+/// One root inventory walk owns this state. Never retain it across callbacks,
+/// GC phases, or owner-specific snapshot/dependency walks.
+#[derive(Default)]
+struct CodeRootVisitState {
+    bodies: std::collections::HashSet<usize>,
+    env: super::EnvRootVisitState,
+}
+
+fn root_visit_sharing_enabled() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    !*DISABLED.get_or_init(|| std::env::var_os("EGCL_DISABLE_ROOT_VISIT_SHARING").is_some())
+}
+
+impl CodeRootVisitState {
+    fn trace_frame(
+        &mut self,
+        frame: &Arc<super::SharedCell<super::EnvFrame>>,
+        visit: &mut dyn FnMut(*mut EgclVal),
+    ) {
+        if root_visit_sharing_enabled() {
+            super::visit_env_frame_roots(frame, &mut self.env, visit);
+        } else {
+            super::visit_env_frame_roots(frame, &mut super::EnvRootVisitState::default(), visit);
+        }
+    }
+}
+
 // Host code forms a graph too: private bodies are owned by live callables or
 // active/calling code, not by the dispatch caches that happen to store Arcs.
 fn traced_bytecode_bodies() -> &'static SharedCell<(u64, std::collections::HashSet<usize>)> {
@@ -425,7 +452,7 @@ struct ActiveCallableRoot(u32);
 impl egcl_rt::gc::TraceHostRoots for ActiveCallableRoot {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
         if self.0 != u32::MAX {
-            trace_private_function_roots(self.0, visit, &mut std::collections::HashSet::new());
+            trace_private_function_roots(self.0, visit, &mut CodeRootVisitState::default());
         }
     }
 }
@@ -434,21 +461,21 @@ pub(super) unsafe fn trace_bytecode_function(
     function: *mut BytecodeFunction,
     visit: &mut dyn FnMut(*mut EgclVal),
 ) {
-    unsafe { trace_bytecode_graph(function, visit, &mut std::collections::HashSet::new()) };
+    unsafe { trace_bytecode_graph(function, visit, &mut CodeRootVisitState::default()) };
 }
 
 unsafe fn trace_bytecode_graph(
     function: *mut BytecodeFunction,
     visit: &mut dyn FnMut(*mut EgclVal),
-    seen: &mut std::collections::HashSet<usize>,
+    state: &mut CodeRootVisitState,
 ) {
     let identity = function as usize;
-    if !seen.insert(identity) {
-        return;
-    }
     with_traced_bytecode_bodies(|traced| {
         traced.insert(identity);
     });
+    if !state.bodies.insert(identity) {
+        return;
+    }
     // SAFETY: the scanner runs during a stop-the-world GC. BytecodeFunction is
     // held behind Arc during execution/registration, but its EgclVal slots must
     // still be rewritten when the moving collector forwards their referents.
@@ -463,22 +490,22 @@ unsafe fn trace_bytecode_graph(
     for restart_case in &mut function.restart_cases {
         for restart in &mut restart_case.restarts {
             unsafe {
-                trace_bytecode_graph(&mut *restart.function, visit, seen);
+                trace_bytecode_graph(&mut *restart.function, visit, state);
             }
         }
     }
     for nested in &mut function.nested_functions {
         unsafe {
-            trace_bytecode_graph(Arc::as_ptr(nested) as *mut BytecodeFunction, visit, seen);
+            trace_bytecode_graph(Arc::as_ptr(nested) as *mut BytecodeFunction, visit, state);
         }
     }
-    trace_instruction_roots(&function.code, visit, seen);
+    trace_instruction_roots(&function.code, visit, state);
 }
 
 fn trace_instruction_roots(
     code: &[Instr],
     visit: &mut dyn FnMut(*mut EgclVal),
-    seen: &mut std::collections::HashSet<usize>,
+    state: &mut CodeRootVisitState,
 ) {
     for instruction in code {
         let symbol = match instruction {
@@ -489,14 +516,14 @@ fn trace_instruction_roots(
             | Instr::BindSpecial(sym) => *sym,
             _ => continue,
         };
-        trace_private_function_roots(symbol, visit, seen);
+        trace_private_function_roots(symbol, visit, state);
     }
 }
 
 fn trace_private_function_roots(
     symbol: u32,
     visit: &mut dyn FnMut(*mut EgclVal),
-    seen: &mut std::collections::HashSet<usize>,
+    state: &mut CodeRootVisitState,
 ) {
     with_traced_callables(|traced| {
         traced.insert(symbol);
@@ -508,9 +535,9 @@ fn trace_private_function_roots(
     if let Some(body) = body {
         let frame = closure_envs().borrow().get(&symbol).cloned();
         if let Some(frame) = frame {
-            super::visit_env_frame_roots(&frame, &mut super::EnvRootVisitState::default(), visit);
+            state.trace_frame(&frame, visit);
         }
-        unsafe { trace_bytecode_graph(Arc::as_ptr(&body) as *mut BytecodeFunction, visit, seen) };
+        unsafe { trace_bytecode_graph(Arc::as_ptr(&body) as *mut BytecodeFunction, visit, state) };
     }
 }
 
@@ -552,6 +579,7 @@ fn scan_bytecode_roots(visit: &mut dyn FnMut(*mut EgclVal)) {
         .filter_map(|definition| definition.body.as_ref())
         .map(|body| Arc::as_ptr(body) as usize)
         .collect();
+    let mut state = CodeRootVisitState::default();
     for weak in live_bytecode_bodies().borrow().values() {
         let Some(function) = weak.upgrade() else {
             // Keep the Weak allocation reservation until a major collection
@@ -565,7 +593,10 @@ fn scan_bytecode_roots(visit: &mut dyn FnMut(*mut EgclVal)) {
         // All mutators are stopped. Trace the same Arc allocation used by its
         // owning thread, including dormant named functions in that thread's
         // registry; a copied constant pool would leave the original stale.
-        unsafe { trace_bytecode_function(Arc::as_ptr(&function) as *mut BytecodeFunction, visit) };
+        if !root_visit_sharing_enabled() {
+            state.bodies.clear();
+        }
+        unsafe { trace_bytecode_graph(Arc::as_ptr(&function) as *mut BytecodeFunction, visit, &mut state) };
     }
 }
 
@@ -748,13 +779,14 @@ fn trace_function_captures(name: EgclVal, visit: &mut dyn FnMut(*mut EgclVal)) {
     with_traced_callables(|traced| {
         traced.insert(symbol);
     });
+    let mut state = CodeRootVisitState::default();
     let body = closure_bodies().borrow().get(&symbol).cloned();
     if let Some(body) = body {
-        unsafe { trace_bytecode_function(Arc::as_ptr(&body) as *mut BytecodeFunction, visit) };
+        unsafe { trace_bytecode_graph(Arc::as_ptr(&body) as *mut BytecodeFunction, visit, &mut state) };
     }
     let frame = closure_envs().borrow().get(&symbol).cloned();
     if let Some(frame) = frame {
-        super::visit_env_frame_roots(&frame, &mut super::EnvRootVisitState::default(), visit);
+        state.trace_frame(&frame, visit);
     }
 }
 
@@ -2669,9 +2701,9 @@ impl InlineLocal {
 impl egcl_rt::gc::TraceHostRoots for InlineLocal {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
         visit(&mut self.definition);
-        let mut seen = std::collections::HashSet::new();
+        let mut state = CodeRootVisitState::default();
         for &symbol in self.local_fns.values() {
-            trace_private_function_roots(symbol, visit, &mut seen);
+            trace_private_function_roots(symbol, visit, &mut state);
         }
     }
 }
@@ -2679,9 +2711,9 @@ impl egcl_rt::gc::TraceHostRoots for InlineLocal {
 struct PrivateFunctionRoots(HashMap<String, u32>);
 impl egcl_rt::gc::TraceHostRoots for PrivateFunctionRoots {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
-        let mut seen = std::collections::HashSet::new();
+        let mut state = CodeRootVisitState::default();
         for &symbol in self.0.values() {
-            trace_private_function_roots(symbol, visit, &mut seen);
+            trace_private_function_roots(symbol, visit, &mut state);
         }
     }
 }
@@ -2713,10 +2745,10 @@ struct TagScope {
 /// `nested_functions` (bliss-wlf).
 impl egcl_rt::gc::TraceHostRoots for Lowerer<'_> {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
-        let mut seen = std::collections::HashSet::new();
-        trace_instruction_roots(&self.code, visit, &mut seen);
+        let mut state = CodeRootVisitState::default();
+        trace_instruction_roots(&self.code, visit, &mut state);
         for &symbol in self.local_fns.values() {
-            trace_private_function_roots(symbol, visit, &mut seen);
+            trace_private_function_roots(symbol, visit, &mut state);
         }
         for helper in self.inline_local_fns.values_mut() {
             egcl_rt::gc::TraceHostRoots::trace_host_roots(helper, visit);
@@ -31071,3 +31103,7 @@ fn mixed_local_sibling_inlines_a_transitive_capture() {
 
 #[cfg(test)]
 mod packed_u8_persistence_tests;
+
+#[cfg(test)]
+#[path = "bytecode/root_visit_sharing_tests.rs"]
+mod root_visit_sharing_tests;

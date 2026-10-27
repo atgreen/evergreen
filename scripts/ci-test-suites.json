@@ -1,6 +1,6 @@
 {
   "fast": {
-    "egcl:lib:egcl": ["cli::bytecode::self_calls::tests::notinline_", "cli::bytecode::native_transfer_tests::", "cli::bytecode::native_transfer_entry::ordinary_calls::tests::", "cli::bytecode::background_compile_tests::", "cli::bytecode::packed_u8_persistence_tests::", "cli::bytecode::native_transfer_entry::background_compilation::tests::", "cli::bytecode::jtc4_stack_map_tests::installed_cold_speculation_waits_for_real_evidence_after_failure", "cli::bytecode::jtc4_stack_map_tests::numeric_profile_candidates_include_integer_t2_operations"],
+    "egcl:lib:egcl": ["cli::bytecode::root_visit_sharing_tests::", "cli::bytecode::self_calls::tests::notinline_", "cli::bytecode::native_transfer_tests::", "cli::bytecode::native_transfer_entry::ordinary_calls::tests::", "cli::bytecode::background_compile_tests::", "cli::bytecode::packed_u8_persistence_tests::", "cli::bytecode::native_transfer_entry::background_compilation::tests::", "cli::bytecode::jtc4_stack_map_tests::installed_cold_speculation_waits_for_real_evidence_after_failure", "cli::bytecode::jtc4_stack_map_tests::numeric_profile_candidates_include_integer_t2_operations"],
     "egcl:test:background_compilation_cli": [""],
     "egcl:test:native_default_policy_cli": [""],
     "egcl:test:native_transfer_disassembly": [""],
