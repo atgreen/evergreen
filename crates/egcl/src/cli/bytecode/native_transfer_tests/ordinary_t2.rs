@@ -323,15 +323,14 @@ fn directly_reachable_native_instructions(
                 | iced_x86::OpKind::NearBranch32
                 | iced_x86::OpKind::NearBranch64
         );
-        if direct_target {
-            if let Some(target) = instruction
+        if direct_target
+            && let Some(target) = instruction
                 .near_branch_target()
                 .checked_sub(base)
                 .and_then(|target| usize::try_from(target).ok())
                 .filter(|target| *target < bytes.len())
-            {
-                pending.push(target);
-            }
+        {
+            pending.push(target);
         }
         if !terminal && instruction.mnemonic() != Mnemonic::Jmp {
             pending.push(next);
