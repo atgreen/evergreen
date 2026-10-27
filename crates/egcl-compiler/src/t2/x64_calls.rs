@@ -39,6 +39,10 @@ pub enum NativeCallOrigin {
     Instruction(Inst),
     LoopPoll(Block),
     StraightPoll(Inst),
+    /// Explicit, frame-state-backed poll before a bounded native region.
+    BoundedLoopEntry(Inst),
+    /// Explicit poll after a bounded native region has completed.
+    BoundedLoopExit(Inst),
     Deopt(FrameStateId),
     RestartDeopt,
 }

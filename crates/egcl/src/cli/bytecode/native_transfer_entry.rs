@@ -1551,6 +1551,19 @@ impl TransferCode {
                 .map_err(|_| invalid_capture())?
         );
         let site = self.sites.sites().nth(index).ok_or_else(invalid_capture)?;
+        // Explicit bounded-loop polls recover at a verified logical boundary,
+        // which need not be an allocating/calling bytecode instruction. Admit
+        // only an exact recorded poll callsite; all frame checks still apply.
+        let bounded_loop_poll = self
+            ._native_calls
+            .get(site.return_offset() as usize)
+            .is_some_and(|call| {
+                matches!(
+                    call.origin,
+                    egcl_compiler::t2::x64_calls::NativeCallOrigin::BoundedLoopEntry(_)
+                        | egcl_compiler::t2::x64_calls::NativeCallOrigin::BoundedLoopExit(_)
+                )
+            });
         let saved = frames
             .first()
             .filter(|saved| {
@@ -1558,7 +1571,8 @@ impl TransferCode {
                     && saved.resume_pc == site.map().origin_bcp
                     && saved.locals.len() == usize::from(self.body.n_locals)
                     && saved.stack.len() <= usize::from(self.body.max_stack)
-                    && matches!(
+                    && self.body.code.get(saved.resume_pc as usize).is_some()
+                    && (bounded_loop_poll || matches!(
                         self.body.code.get(saved.resume_pc as usize),
                         Some(
                             Instr::CallNamed { .. }
@@ -1588,7 +1602,7 @@ impl TransferCode {
                                 | Instr::LoadGlobal(_)
                                 | Instr::StoreGlobal(_)
                         )
-                    )
+                    ))
             })
             .ok_or_else(invalid_capture)?;
         let running = site.map().control_scopes.iter().filter_map(|scope| {
@@ -3652,6 +3666,13 @@ pub(in crate::cli::bytecode) fn entry_poll_idle(
 pub(in crate::cli::bytecode) fn current_poll_idle() -> bool {
     egcl_rt::thread::current_execution_context_for_native()
         .is_some_and(|execution| entry_poll_idle(unsafe { &*execution }))
+}
+
+/// Request the real execution-local deferred interrupt without an OS signal.
+#[cfg(test)]
+pub(in crate::cli::bytecode) fn request_interrupt_for_test() {
+    egcl_rt::thread::post_current_pending_signal(egcl_rt::PendingSignal::Interrupt);
+    egcl_rt::runtime::mark_process_signal_activity();
 }
 
 pub(in crate::cli::bytecode) unsafe fn poll_or_transfer_unpublished(

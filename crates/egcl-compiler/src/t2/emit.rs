@@ -129,6 +129,10 @@
 //!   sources serialised by each precise deopt stub.
 //! * `EGCL_NO_DIRECT_SELF_CALL=1` — route self-calls through c2i.
 
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+#[path = "ordinary_bounded_poll_tests.rs"]
+mod ordinary_bounded_poll_tests;
+
 use crate::t2::x64_calls::{
     CallReturn, NativeCallOrigin, NativeCallSites, NativeCallValues, NativeStackBase,
 };
@@ -151,6 +155,9 @@ mod integer_low_bits;
 
 #[path = "emit_vector_range.rs"]
 mod vector_range;
+
+#[path = "emit_octet_word_store.rs"]
+mod octet_word_store;
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[path = "ordinary_leaf.rs"]
@@ -839,6 +846,11 @@ pub struct FramedCode {
     /// SysV records bind authoritative value copies; other backends explicitly
     /// report unavailable metadata.
     pub native_calls: Option<crate::t2::x64_calls::NativeCallSites>,
+    /// Exact explicit-poll recovery sites for an ordinary Lisp ABI artifact.
+    /// Its owner must install these alongside `native_calls`; ordinary calls
+    /// have no separate transfer-emission accumulator.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    pub native_poll_transfer_sites: Vec<crate::t2::transfer_sites::SysvTransferSite>,
     /// Owned unwind records for the independently callable Windows entries.
     #[cfg(all(target_arch = "x86_64", windows))]
     pub windows_unwind: Vec<WindowsUnwindRange>,
@@ -5386,6 +5398,7 @@ fn emit_transfer_function_with_storage(
                     | Opcode::StringCharOrNil
                     | Opcode::VecRef | Opcode::VecSet | Opcode::VecSetInRange | Opcode::ArrayReadDiscarded | Opcode::PackedF64P
                     | Opcode::MemoryFence | Opcode::TryIntegerShr | Opcode::SmallVectorRangeP
+                    | Opcode::TryStoreIntegerOctets8 | Opcode::NativePoll
             ) {
                 return Err(EmitError::UnsupportedOp(op_tag(f.inst(inst).opcode)));
             }
@@ -5990,6 +6003,31 @@ fn emit_framed_inner(
         headers
     };
 
+    // Explicit polls share the existing block-entry publication and spill
+    // protocol. The marker itself emits no second call or machine body.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let mut bounded_polls = HashMap::new();
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+    let bounded_polls: HashMap<crate::t2::ir::Block, (Inst, bool)> = HashMap::new();
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    for &block in &blocks {
+        for (index, &inst) in f.block(block).insts.iter().enumerate() {
+            let data = f.inst(inst);
+            if data.opcode != Opcode::NativePoll { continue; }
+            let AuxData::BoundedPoll { exit, .. } = data.aux else {
+                return Err(EmitError::UnsupportedOp(op_tag(data.opcode)));
+            };
+            if index != 0 || !data.args.is_empty() || !data.results.is_empty()
+                || data.frame_state.is_none() || !data.flags.effectful || !data.flags.safepoint
+                || data.flags.call || data.flags.guard || data.flags.terminator || !data.targets.is_empty()
+                || native_poll_veneer.is_none() || !(transfer_mode || ordinary_call_mode)
+            {
+                return Err(EmitError::UnsupportedOp(op_tag(data.opcode)));
+            }
+            bounded_polls.insert(block, (inst, exit));
+        }
+    }
+
     // Native segment polling is placed at loop headers rather than after every
     // branch. This keeps condition flags intact and guarantees that every
     // cycle reaches a poll. Header roots use the same split-aware ranges as
@@ -6043,6 +6081,7 @@ fn emit_framed_inner(
                 }
             }
         }
+        headers.extend(bounded_polls.keys().copied());
         // A parameter-free jump to the next block emits no edge moves or
         // branch. Its poll is redundant when that next block still polls.
         // Keep heat and OSR entries: their polls also implement tier transfer.
@@ -6051,7 +6090,7 @@ fn emit_framed_inner(
             let (block, next) = (pair[0], pair[1]);
             let data = f.block(block);
             if block == entry || !headers.contains(&block) || !headers.contains(&next)
-                || heat_headers.contains(&block)
+                || heat_headers.contains(&block) || bounded_polls.contains_key(&block)
                 || f.osr_entries.iter().any(|osr| osr.block == block)
                 || !data.params.is_empty() || !f.block(next).params.is_empty()
                 || data.insts.len() != 1
@@ -6098,7 +6137,7 @@ fn emit_framed_inner(
             for &inst in &f.block(block).insts {
                 let opcode = f.inst(inst).opcode;
                 if opcode.is_terminator()
-                    || opcode == Opcode::CleanupLanding
+                    || opcode == Opcode::CleanupLanding || opcode == Opcode::NativePoll
                     || is_const_opcode(opcode)
                 {
                     continue;
@@ -6189,9 +6228,12 @@ fn emit_framed_inner(
     // transfer capture, and a later landing write-back, cannot access it.
     // Give those recovery values preserved homes before deriving ANY maps;
     // normal polls, OSR imports and exceptional captures must agree.
-    if transfer_mode {
-        for entry in f.osr_entries.iter().filter(|entry| loop_points.contains_key(&entry.block)) {
-            let state = f.frame_states.get(entry.frame_state);
+    if transfer_mode || ordinary_call_mode {
+        let poll_states = f.osr_entries.iter()
+            .filter(|entry| loop_points.contains_key(&entry.block)).map(|entry| entry.frame_state)
+            .chain(bounded_polls.values().map(|&(inst, _)| f.inst(inst).frame_state.unwrap()));
+        for frame_state in poll_states {
+            let state = f.frame_states.get(frame_state);
             let sources = state.scopes.iter().flat_map(|scope| scope.locals.iter().chain(&scope.stack))
                 .chain(state.remat.iter().flat_map(|recipe| &recipe.inputs));
             for source in sources {
@@ -6559,6 +6601,8 @@ fn emit_framed_inner(
                             | Opcode::TakeValuesToLocals
                             | Opcode::MemoryFence
                             | Opcode::TryIntegerShr
+                            | Opcode::TryStoreIntegerOctets8
+                            | Opcode::NativePoll
                             | Opcode::SmallVectorRangeP
                             | Opcode::TryPackedF64Set
                             | Opcode::PackedF64P
@@ -6967,6 +7011,8 @@ fn emit_framed_inner(
     let mut native_value_maps = HashMap::new();
 
     let mut native_calls = Vec::new();
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let mut native_poll_transfer_sites = Vec::new();
     let mut root_sync_sites = Vec::new();
     let mut emitted_safepoints = 0usize;
     // Bytecode→native correlation for the tiered-JIT viewer (bliss-zmmb): the T2
@@ -6992,12 +7038,20 @@ fn emit_framed_inner(
                 heat_headers.contains(&b),
             )?;
             native_value_maps.insert(call.return_offset, NativeCallValues::Frame(values));
-            native_calls.push(call.site(NativeCallOrigin::LoopPoll(b), NativeStackBase::Body));
-            if transfer_mode && local_osr_scopes
-                && let Some(map) = crate::t2::transfer_map::lower_poll_transfer_map(
-                    f, b, loop_points[&b], &loop_maps[&b],
-                )
-            {
+            let origin = match bounded_polls.get(&b) {
+                Some(&(inst, false)) => NativeCallOrigin::BoundedLoopEntry(inst),
+                Some(&(inst, true)) => NativeCallOrigin::BoundedLoopExit(inst),
+                None => NativeCallOrigin::LoopPoll(b),
+            };
+            native_calls.push(call.site(origin, NativeStackBase::Body));
+            let map = if let Some(&(inst, _)) = bounded_polls.get(&b) {
+                Some(crate::t2::transfer_map::lower_explicit_poll_transfer_map(
+                    f, inst, loop_points[&b], &loop_maps[&b],
+                ).ok_or(EmitError::UnsupportedOp(0xFE))?)
+            } else if transfer_mode && local_osr_scopes {
+                crate::t2::transfer_map::lower_poll_transfer_map(f, b, loop_points[&b], &loop_maps[&b])
+            } else { None };
+            if let Some(map) = map {
                 let mut shadow_roots = Vec::new();
                 let mut native_spills = Vec::new();
                 for (index, value) in loop_roots[&b].iter().enumerate() {
@@ -7010,7 +7064,7 @@ fn emit_framed_inner(
                         }
                     }
                 }
-                transfers.as_mut().unwrap().sites.push(crate::t2::transfer_sites::SysvTransferSite {
+                let site = crate::t2::transfer_sites::SysvTransferSite {
                     return_offset: call.return_offset.try_into().map_err(|_| EmitError::BadBranch)?,
                     stack_slots: native_spill_slots,
                     call_stack_adjust: call.stack_adjust,
@@ -7019,7 +7073,14 @@ fn emit_framed_inner(
                     shadow_roots,
                     native_spills,
                     map,
-                });
+                };
+                if let Some(transfer) = transfers.as_mut() {
+                    transfer.sites.push(site);
+                } else if ordinary_call_mode {
+                    native_poll_transfer_sites.push(site);
+                } else {
+                    return Err(EmitError::UnsupportedOp(0xFE));
+                }
             }
         }
         // Fixnum operands proven by a dominating guard: the entry block dominates
@@ -7070,7 +7131,7 @@ fn emit_framed_inner(
                 continue;
             }
             if (is_const_opcode(d.opcode) && d.opcode != Opcode::ConstHeapObj)
-                || d.opcode == Opcode::CleanupLanding
+                || d.opcode == Opcode::CleanupLanding || d.opcode == Opcode::NativePoll
                 || (d.opcode.is_terminator() && d.opcode != Opcode::Invoke)
                 || fused.contains(&inst)
             {
@@ -7155,6 +7216,7 @@ fn emit_framed_inner(
             });
             let (mut inst_reg, result_stores) = if stack_float.is_some()
                 || d.opcode == Opcode::TakeValuesToLocals
+                || d.opcode == Opcode::TryStoreIntegerOctets8
                 || d.opcode == Opcode::Invoke
                 || matches!(
                     d.opcode,
@@ -7541,6 +7603,8 @@ fn emit_framed_inner(
                         const_tagged.get(&d.args[1]).copied(), label);
                 }
                 a.bind(done);
+            } else if d.opcode == Opcode::TryStoreIntegerOctets8 {
+                octet_word_store::emit_framed(&mut a, f, &d, &homes, &const_tagged)?;
             } else if d.opcode == Opcode::TryIntegerShr {
                 integer_shift::emit(&mut a, &d, &inst_reg, &const_tagged)?;
             } else if d.opcode == Opcode::TryPackedF64Set {
@@ -9028,6 +9092,8 @@ fn emit_framed_inner(
         native_argument_base,
         native_argument_count: if native_frame_mode { f.block(entry).params.len() as u16 } else { 0 },
         native_calls: Some(native_calls),
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        native_poll_transfer_sites,
         code,
         #[cfg(all(target_arch = "x86_64", windows))]
         windows_unwind,

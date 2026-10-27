@@ -662,7 +662,8 @@ pub fn emit_framed_ordinary_function_with_self_call_facts(
                 | Opcode::LogNot | Opcode::Jump | Opcode::Brif
                 | Opcode::Car | Opcode::Cdr | Opcode::ConstHeapObj
                 | Opcode::StringByteLength | Opcode::StringAsciiCharAt | Opcode::StringCharOrNil
-                | Opcode::MemoryFence | Opcode::TryIntegerShr | Opcode::SmallVectorRangeP => {}
+                | Opcode::MemoryFence | Opcode::TryIntegerShr | Opcode::SmallVectorRangeP
+                | Opcode::TryStoreIntegerOctets8 | Opcode::NativePoll => {}
                 _ => return Err(EmitError::UnsupportedOp(super::op_tag(data.opcode))),
             }
         }

@@ -1858,6 +1858,8 @@ pub fn emit_framed_with_runtime(
         native_argument_base: None,
         native_argument_count: 0,
         native_calls: None,
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        native_poll_transfer_sites: Vec::new(),
         #[cfg(all(target_arch = "x86_64", windows))]
         windows_unwind: Vec::new(),
         code: emitter.asm.finish().ok_or(EmitError::BadBranch)?,

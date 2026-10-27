@@ -439,7 +439,7 @@ impl EmittedTransfer {
                 let options = OrdinaryLispEntryOptions {
                     arity: entry_arity, arity_error_veneer: arity.as_ptr() as u64, binding,
                 };
-                let emitted = egcl_compiler::t2::emit::emit_framed_ordinary_leaf(&ir, options).ok()
+                let mut emitted = egcl_compiler::t2::emit::emit_framed_ordinary_leaf(&ir, options).ok()
                     .or_else(|| {
                         let flags = context.native_flags?;
                         let cold = JitBuffer::new(&egcl_compiler::t2::native_transfer::emit_ordinary_published_veneer(
@@ -535,7 +535,8 @@ impl EmittedTransfer {
                         ordinary_cold = Some(cold);
                         Some(emitted)
                     })?;
-                let sites = SysvTransferTable::new(emitted.code.len(), Vec::new()).ok()?;
+                let sites = SysvTransferTable::new(emitted.code.len(),
+                    std::mem::take(&mut emitted.native_poll_transfer_sites)).ok()?;
                 ordinary_arity = Some(arity);
                 Some((emitted, sites))
             });
