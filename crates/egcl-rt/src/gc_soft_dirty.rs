@@ -28,7 +28,7 @@
 //! from outside the process (CRIU pre-dump) would hide stores from the
 //! collector; run such a process with `EGCL_GC_SOFT_DIRTY=0`.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Page-granular dirty bitmap over the heap, filled by [`read_dirty_pages`].
 #[derive(Default)]
@@ -99,11 +99,14 @@ impl DirtyPages {
 /// Heap base the tracker is armed for (0 = not armed), and its size.
 static ARMED_BASE: AtomicUsize = AtomicUsize::new(0);
 static ARMED_SIZE: AtomicUsize = AtomicUsize::new(0);
+static ACTIVE_ASYNC: AtomicBool = AtomicBool::new(false);
 
 /// Forget the last clear: the next minor collection scans the whole old
 /// generation and re-arms the tracker. Called after a major collection.
 pub(crate) fn disarm() {
     ARMED_BASE.store(0, Ordering::Release);
+    ACTIVE_ASYNC.store(false, Ordering::Release);
+    crate::gc_async_wp::invalidate();
 }
 
 #[cfg(target_os = "linux")]
@@ -111,7 +114,7 @@ mod imp {
     use std::fs::File;
     use std::io::Write;
     use std::os::unix::fs::FileExt;
-    use std::sync::Mutex;
+    use std::sync::{Mutex, MutexGuard};
 
     const PM_SOFT_DIRTY: u64 = 1 << 55;
 
@@ -173,6 +176,12 @@ mod imp {
     }
 
     pub(super) static TRACKER: Mutex<Option<Tracker>> = Mutex::new(None);
+
+    pub(super) fn lock_tracker() -> Option<MutexGuard<'static, Option<Tracker>>> {
+        // Fork can inherit a lock held by a vanished parent thread. Poison is
+        // also unknown state: neither case may publish or consume clean bits.
+        TRACKER.try_lock().ok()
+    }
 
     /// Check that the kernel tracks writes: two touched pages, a clear, a
     /// write to the first, and the bits must read exactly `[dirty, clean]`.
@@ -274,6 +283,10 @@ fn mode() -> Mode {
     })
 }
 
+fn prefer_async(mode: Mode, disabled: bool) -> bool {
+    mode == Mode::Auto && !disabled
+}
+
 fn enabled() -> bool {
     mode() != Mode::Off
 }
@@ -300,6 +313,7 @@ pub(crate) fn read_dirty_pages(
     heap_base: usize,
     heap_size: usize,
     ranges: &[(usize, usize)],
+    older_regions: &[crate::gc_async_wp::Range],
     out: &mut DirtyPages,
 ) -> bool {
     if !enabled()
@@ -308,11 +322,47 @@ pub(crate) fn read_dirty_pages(
     {
         return false;
     }
+    if ACTIVE_ASYNC.load(Ordering::Acquire) {
+        let shift = page_shift();
+        out.reset(heap_base, heap_size, shift);
+        // A missing coverage entry must never look clean, including large-
+        // object continuation pages. Only requested, validated extents may clear.
+        out.bits.fill(u64::MAX);
+        let Some(heap_end) = heap_base.checked_add(heap_size) else {
+            disarm();
+            return false;
+        };
+        for range in older_regions {
+            if range.start < heap_base || range.end > heap_end || range.end <= range.start {
+                disarm();
+                return false;
+            }
+            for page in ((range.start - heap_base) >> shift)..((range.end - heap_base) >> shift) {
+                out.bits[page / 64] &= !(1u64 << (page % 64));
+            }
+        }
+        let ok = crate::gc_async_wp::read(
+            (heap_base, heap_size, crate::gc::heap_identity_epoch()),
+            older_regions,
+            |start, end| {
+                for page in ((start - heap_base) >> shift)..((end - heap_base) >> shift) {
+                    out.bits[page / 64] |= 1u64 << (page % 64);
+                }
+            },
+        );
+        if !ok {
+            disarm();
+        }
+        return ok;
+    }
     #[cfg(target_os = "linux")]
     {
         let shift = page_shift();
         out.reset(heap_base, heap_size, shift);
-        let mut guard = imp::TRACKER.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(mut guard) = imp::lock_tracker() else {
+            disarm();
+            return false;
+        };
         let Some(tracker) = guard.as_mut() else {
             return false;
         };
@@ -348,7 +398,7 @@ pub(crate) fn read_dirty_pages(
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (ranges, out);
+        let _ = (ranges, older_regions, out);
         false
     }
 }
@@ -358,14 +408,56 @@ pub(crate) fn read_dirty_pages(
 /// `nursery_bytes`. Call with the world stopped, after the collector's last
 /// write that could leave an old object referring into the nursery — i.e.
 /// once the nursery is empty.
-pub(crate) fn rearm(heap_base: usize, heap_size: usize, old_bytes: usize, nursery_bytes: usize) {
-    disarm();
+pub(crate) fn rearm(
+    heap_base: usize,
+    heap_size: usize,
+    old_bytes: usize,
+    nursery_bytes: usize,
+    older_regions: &[crate::gc_async_wp::Range],
+) {
+    // Do not destroy a reusable async context between successful minor cycles.
+    // External invalidation (major, heap replacement) still drops it via disarm.
+    ARMED_BASE.store(0, Ordering::Release);
+    ACTIVE_ASYNC.store(false, Ordering::Release);
     if !worthwhile(old_bytes, nursery_bytes) {
+        crate::gc_async_wp::invalidate();
         return;
     }
+    // A forked child must not block on an inherited async-context mutex or
+    // issue an ioctl through its parent's MM. Stay fully unarmed until safe.
+    if !crate::gc_async_wp::process_ready() {
+        return;
+    }
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let disabled =
+        *DISABLED.get_or_init(|| std::env::var_os("EGCL_DISABLE_ASYNC_OLD_TRACKING").is_some());
+    // Explicit On preserves the forced-legacy contract; only Auto selects async.
+    if prefer_async(mode(), disabled) {
+        match crate::gc_async_wp::rearm(
+            (heap_base, heap_size, crate::gc::heap_identity_epoch()),
+            older_regions,
+        ) {
+            crate::gc_async_wp::ArmResult::Armed => {
+                ACTIVE_ASYNC.store(true, Ordering::Release);
+                ARMED_SIZE.store(heap_size, Ordering::Release);
+                ARMED_BASE.store(heap_base, Ordering::Release);
+                return;
+            }
+            // Partial arming is unknown: the next minor must scan everything.
+            crate::gc_async_wp::ArmResult::Failed => {
+                disarm();
+                return;
+            }
+            crate::gc_async_wp::ArmResult::Unavailable => {}
+        }
+    }
+    crate::gc_async_wp::invalidate();
     #[cfg(target_os = "linux")]
     {
-        let mut guard = imp::TRACKER.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(mut guard) = imp::lock_tracker() else {
+            disarm();
+            return;
+        };
         let tracker = guard.get_or_insert_with(|| imp::Tracker {
             files: None,
             buf: Vec::new(),
@@ -380,12 +472,419 @@ pub(crate) fn rearm(heap_base: usize, heap_size: usize, old_bytes: usize, nurser
         }
     }
     #[cfg(not(target_os = "linux"))]
-    let _ = (heap_base, heap_size);
+    let _ = (heap_base, heap_size, older_regions);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "isolated Linux UFFD/fork/heap replacement hardgates; run explicitly"]
+    fn async_failure_fork_and_restore_hardgates() {
+        const CASE: &str = "EGCL_ASYNC_HARDGATE_CASE";
+        const TEST: &str = "gc_soft_dirty::tests::async_failure_fork_and_restore_hardgates";
+        let Ok(case) = std::env::var(CASE) else {
+            for case in ["read", "rearm", "restore", "fork", "poison"] {
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args([
+                        "--exact",
+                        TEST,
+                        "--ignored",
+                        "--nocapture",
+                        "--test-threads=1",
+                    ])
+                    .env(CASE, case)
+                    .env("EGCL_GC_ASYNC_WP_LOG", "1")
+                    .env_remove("EGCL_DISABLE_ASYNC_OLD_TRACKING");
+                for (key, _) in
+                    std::env::vars().filter(|(key, _)| key.starts_with("EGCL_GC_STRESS"))
+                {
+                    command.env_remove(key);
+                }
+                if matches!(case, "fork" | "poison") {
+                    command.env("EGCL_GC_SOFT_DIRTY", "1");
+                } else {
+                    command.env_remove("EGCL_GC_SOFT_DIRTY");
+                }
+                let output = command.output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "case {case}: {}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        };
+        if case == "fork" {
+            crate::gc_async_wp::with_locked_parent_context(|range, unlock_context| {
+                let mut legacy = imp::TRACKER.lock().unwrap();
+                let tracker = legacy.get_or_insert_with(|| imp::Tracker {
+                    files: None,
+                    buf: Vec::new(),
+                    unsupported: false,
+                });
+                assert!(
+                    imp::files(tracker, page_shift()).is_some(),
+                    "parent legacy Files must be real"
+                );
+                let pid = unsafe { libc::fork() };
+                assert!(pid >= 0);
+                if pid == 0 {
+                    let mut pages = DirtyPages::default();
+                    let size = range.end - range.start;
+                    ARMED_BASE.store(range.start, Ordering::Release);
+                    ARMED_SIZE.store(size, Ordering::Release);
+                    ACTIVE_ASYNC.store(true, Ordering::Release);
+                    let async_unknown = !read_dirty_pages(
+                        range.start,
+                        size,
+                        &[(range.start, range.end)],
+                        &[range],
+                        &mut pages,
+                    );
+                    let async_unarmed = ARMED_BASE.load(Ordering::Acquire) == 0
+                        && !ACTIVE_ASYNC.load(Ordering::Acquire);
+                    // Select the inherited legacy state explicitly: it must not
+                    // block on the parent-held mutex or inspect parent Files.
+                    ARMED_BASE.store(range.start, Ordering::Release);
+                    let legacy_unknown = !read_dirty_pages(
+                        range.start,
+                        size,
+                        &[(range.start, range.end)],
+                        &[range],
+                        &mut pages,
+                    );
+                    unlock_context();
+                    // Now own-context setup is possible, but the legacy mutex
+                    // is still inherited locked: forced-legacy rearm fails closed.
+                    rearm(range.start, size, size, size, &[range]);
+                    let rearm_unknown = ARMED_BASE.load(Ordering::Acquire) == 0
+                        && !ACTIVE_ASYNC.load(Ordering::Acquire);
+                    unsafe {
+                        libc::_exit(
+                            if async_unknown && async_unarmed && legacy_unknown && rearm_unknown {
+                                0
+                            } else {
+                                31
+                            },
+                        );
+                    }
+                }
+                struct Child {
+                    pid: i32,
+                    alive: bool,
+                }
+                impl Drop for Child {
+                    fn drop(&mut self) {
+                        if self.alive {
+                            unsafe {
+                                libc::kill(self.pid, libc::SIGKILL);
+                                libc::waitpid(self.pid, std::ptr::null_mut(), 0);
+                            }
+                        }
+                    }
+                }
+                let mut child = Child { pid, alive: true };
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                let mut status = 0;
+                loop {
+                    let result = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+                    if result == pid {
+                        child.alive = false;
+                        break;
+                    }
+                    assert!(result >= 0);
+                    if std::time::Instant::now() >= deadline {
+                        panic!("fork child blocked on inherited tracking mutex");
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                assert!(
+                    libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                    "child status {status}"
+                );
+            });
+            return;
+        }
+        if case == "poison" {
+            let _ = std::panic::catch_unwind(|| {
+                let _guard = imp::TRACKER.lock().unwrap();
+                panic!("intentional legacy tracker poison");
+            });
+            ARMED_BASE.store(4096, Ordering::Release);
+            ARMED_SIZE.store(4096, Ordering::Release);
+            let mut pages = DirtyPages::default();
+            assert!(!read_dirty_pages(
+                4096,
+                4096,
+                &[(4096, 8192)],
+                &[],
+                &mut pages
+            ));
+            rearm(4096, 4096, 4096, 4096, &[]);
+            assert_eq!(ARMED_BASE.load(Ordering::Acquire), 0);
+            return;
+        }
+        crate::gc::init_heap(&crate::gc::GcConfig {
+            heap_size: 2 * 1024 * 1024,
+            heap_max: 2 * 1024 * 1024,
+            nursery_size: 32 * 1024,
+            tlab_size: 256,
+            region_size: 4096,
+            promotion_threshold: 15,
+            pause_target_ms: 10,
+            gc_workers: 1,
+            satb_buffer_size: 32,
+            old_occupancy_trigger: 0.9,
+        })
+        .unwrap();
+        fn cons(marker: i64) -> crate::value::EgclVal {
+            let body = crate::gc::alloc_typed(16, crate::object::type_id::CONS).unwrap();
+            unsafe {
+                body.cast::<crate::value::EgclVal>()
+                    .write(crate::value::EgclVal::from_fixnum(marker));
+                body.cast::<crate::value::EgclVal>()
+                    .add(1)
+                    .write(crate::value::NIL);
+                crate::value::EgclVal::from_cons_ptr(body)
+            }
+        }
+        if case == "restore" {
+            let heap_base = crate::gc::heap_base_address();
+            let identity = crate::gc::heap_identity_epoch();
+            let mut image = Vec::<u8>::new();
+            {
+                crate::rooted!(roots = Vec::<crate::value::EgclVal>::new());
+                for i in 0..800 {
+                    roots.push(cons(i));
+                }
+                crate::gc::collect_t0_minor().unwrap();
+                assert!(
+                    ACTIVE_ASYNC.load(Ordering::Acquire),
+                    "real async arm required before restore"
+                );
+                crate::gc::walk_heap(|body, kind, size| {
+                    image.extend_from_slice(&(body as usize as u64).to_le_bytes());
+                    image.push(kind);
+                    image.extend_from_slice(&(size as u32).to_le_bytes());
+                    image.extend_from_slice(unsafe { std::slice::from_raw_parts(body, size) });
+                    true
+                })
+                .unwrap();
+            }
+            crate::gc::restore_heap(&image).unwrap();
+            assert_eq!(
+                crate::gc::heap_base_address(),
+                heap_base,
+                "same-address heap replacement"
+            );
+            assert_ne!(crate::gc::heap_identity_epoch(), identity);
+            assert_eq!(
+                ARMED_BASE.load(Ordering::Acquire),
+                0,
+                "image invalidates prior armed coverage"
+            );
+            assert!(!ACTIVE_ASYNC.load(Ordering::Acquire));
+            let restored_minor_count = crate::gc::heap_stats().minor_gc_count;
+            let mut holder = crate::value::NIL;
+            let mut restored_pages = std::collections::HashSet::new();
+            crate::gc::walk_heap(|body, kind, size| {
+                restored_pages.insert(body as usize & !4095usize);
+                if holder.is_nil() && kind == crate::object::type_id::CONS && size == 16 {
+                    holder = unsafe { crate::value::EgclVal::from_cons_ptr(body as *mut u8) };
+                }
+                true
+            })
+            .unwrap();
+            assert!(holder.is_cons());
+            crate::rooted!(holder = holder);
+            for (ordinal, marker) in [910, 911].into_iter().enumerate() {
+                // Image objects are restored pinned in Nursery. A referent in
+                // the same region would be retained in place, proving nothing
+                // about relocation. Fill its tail until the candidate is in a
+                // different region, without collecting before the first store.
+                let before = {
+                    crate::rooted!(young = crate::value::NIL);
+                    for _ in 0..512 {
+                        *young = cons(marker);
+                        if !restored_pages.contains(&(young.to_raw() as usize & !4095usize)) {
+                            break;
+                        }
+                    }
+                    assert!(
+                        !restored_pages.contains(&(young.to_raw() as usize & !4095usize)),
+                        "fresh referent must be outside every image-pinned region"
+                    );
+                    if ordinal == 0 {
+                        assert_eq!(
+                            crate::gc::heap_stats().minor_gc_count,
+                            restored_minor_count,
+                            "candidate selection must not collect before the first post-restore store"
+                        );
+                        assert_eq!(
+                            ARMED_BASE.load(Ordering::Acquire),
+                            0,
+                            "first post-restore collection must still be unarmed"
+                        );
+                    }
+                    unsafe {
+                        (*holder)
+                            .as_ptr()
+                            .cast::<crate::value::EgclVal>()
+                            .write(*young);
+                    }
+                    young.to_raw()
+                };
+                crate::gc::collect_t0_minor().unwrap();
+                let value = unsafe { (*holder).as_ptr().cast::<crate::value::EgclVal>().read() };
+                assert_ne!(
+                    value.to_raw(),
+                    before,
+                    "restored sole young referent must move"
+                );
+                assert_eq!(
+                    unsafe {
+                        value
+                            .as_ptr()
+                            .cast::<crate::value::EgclVal>()
+                            .read()
+                            .as_fixnum()
+                    },
+                    marker
+                );
+                assert!(
+                    ACTIVE_ASYNC.load(Ordering::Acquire),
+                    "restored anonymous heap re-arms async after its full scan"
+                );
+            }
+            return;
+        }
+        crate::rooted!(roots = Vec::<crate::value::EgclVal>::new());
+        for i in 0..800 {
+            roots.push(cons(i));
+        }
+        crate::gc::collect_t0_minor().unwrap();
+        assert!(
+            ACTIVE_ASYNC.load(Ordering::Acquire),
+            "real async context required before failure injection"
+        );
+        crate::gc_async_wp::inject_after_chunk(case == "rearm");
+        let before = {
+            crate::rooted!(first = cons(920));
+            crate::rooted!(last = cons(921));
+            unsafe {
+                roots[0]
+                    .as_ptr()
+                    .cast::<crate::value::EgclVal>()
+                    .write(*first);
+                roots
+                    .last()
+                    .unwrap()
+                    .as_ptr()
+                    .cast::<crate::value::EgclVal>()
+                    .write(*last);
+            }
+            ((*first).to_raw(), (*last).to_raw())
+        };
+        let before = [before.0, before.1];
+        crate::gc::collect_t0_minor().unwrap();
+        assert_eq!(
+            crate::gc_async_wp::injected_chunks(),
+            (1, 1),
+            "failure must occur after exactly one successful real chunk"
+        );
+        if case == "rearm" {
+            assert_eq!(
+                ARMED_BASE.load(Ordering::Acquire),
+                0,
+                "partial rearm leaves next minor fully unarmed"
+            );
+            let before2 = {
+                crate::rooted!(first = cons(922));
+                crate::rooted!(last = cons(923));
+                unsafe {
+                    roots[0]
+                        .as_ptr()
+                        .cast::<crate::value::EgclVal>()
+                        .write(*first);
+                    roots
+                        .last()
+                        .unwrap()
+                        .as_ptr()
+                        .cast::<crate::value::EgclVal>()
+                        .write(*last);
+                }
+                [(*first).to_raw(), (*last).to_raw()]
+            };
+            crate::gc::collect_t0_minor().unwrap();
+            for ((holder, old), marker) in [roots[0], *roots.last().unwrap()]
+                .into_iter()
+                .zip(before2)
+                .zip([922, 923])
+            {
+                let value = unsafe { holder.as_ptr().cast::<crate::value::EgclVal>().read() };
+                assert_ne!(value.to_raw(), old);
+                assert_eq!(
+                    unsafe {
+                        value
+                            .as_ptr()
+                            .cast::<crate::value::EgclVal>()
+                            .read()
+                            .as_fixnum()
+                    },
+                    marker
+                );
+            }
+        } else {
+            for ((holder, old), marker) in [roots[0], *roots.last().unwrap()]
+                .into_iter()
+                .zip(before)
+                .zip([920, 921])
+            {
+                let value = unsafe { holder.as_ptr().cast::<crate::value::EgclVal>().read() };
+                assert_ne!(
+                    value.to_raw(),
+                    old,
+                    "partial read must fall back over BOTH successful and unvisited older ranges"
+                );
+                assert_eq!(
+                    unsafe {
+                        value
+                            .as_ptr()
+                            .cast::<crate::value::EgclVal>()
+                            .read()
+                            .as_fixnum()
+                    },
+                    marker
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn async_selection_preserves_off_and_forced_legacy_contracts() {
+        assert!(!prefer_async(Mode::Off, false));
+        assert!(!prefer_async(Mode::On, false));
+        assert!(!prefer_async(Mode::Auto, true));
+        assert!(prefer_async(Mode::Auto, false));
+    }
+
+    #[test]
+    fn async_unknown_pages_default_dirty_including_large_object_tails() {
+        let base = 0x10_0000;
+        let mut pages = DirtyPages::default();
+        pages.reset(base, 4 * 4096, 12);
+        pages.bits.fill(u64::MAX);
+        // One explicitly covered clean page; the untracked tail stays dirty.
+        pages.bits[0] &= !(1 << 0);
+        assert!(!pages.is_dirty(base));
+        assert!(pages.is_dirty(base + 4096));
+        assert!(pages.any_dirty(base + 3 * 4096, base + 4 * 4096));
+    }
 
     #[test]
     fn any_dirty_finds_pages_inside_the_range_only() {
