@@ -203,6 +203,10 @@
   most specific inherited default wins in multiple-inheritance hierarchies
   ([#697](https://github.com/atgreen/evergreen/pull/697)).
 
+- `symbol-package` continues to report `COMMON-LISP` for its symbols after
+  another package re-exports them, independent of package registry order
+  ([#698](https://github.com/atgreen/evergreen/pull/698)).
+
 - `NOTINLINE` declarations remain effective through native specialization,
   while preserving argument evaluation and lookup of redefined functions
   ([#703](https://github.com/atgreen/evergreen/pull/703)).
