@@ -220,6 +220,11 @@
 
 ### Fixed
 
+- Interpreted `MULTIPLE-VALUE-BIND` preserves uninterned variable identity,
+  preventing fresh SETF-expander store variables from permanently retaining
+  their generated names during workloads such as TLS I/O
+  ([#729](https://github.com/atgreen/evergreen/pull/729)).
+
 - `FORMAT` treats `~:T` and `~:@T` outside a logical block as no-ops, including
   when pretty printing is enabled, while preserving tabulation within blocks
   ([#726](https://github.com/atgreen/evergreen/pull/726)).
