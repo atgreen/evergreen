@@ -189,6 +189,11 @@
 
 ### Fixed
 
+- Strings opened by a character given double-quote syntax now end at that
+  character, and characters given single-escape syntax quote the next character
+  while reading a string
+  ([#695](https://github.com/atgreen/evergreen/pull/695)).
+
 - `NOTINLINE` declarations remain effective through native specialization,
   while preserving argument evaluation and lookup of redefined functions
   ([#703](https://github.com/atgreen/evergreen/pull/703)).
