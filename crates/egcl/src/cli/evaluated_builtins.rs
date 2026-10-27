@@ -20,6 +20,101 @@ fn is_standard_reader_stand_in(function: EgclVal, installed: EgclVal, stand_in: 
         || installed_function(index).is_some_and(|f| f == installed)
 }
 
+fn pprint_layout_events(list: EgclVal) -> Result<Vec<egcl_stdlib::format::LayoutEvent>, EgclError> {
+    use egcl_stdlib::format::{CaseMode, IndentKind, LayoutEvent, NewlineKind, TabKind};
+
+    let mut events = Vec::new();
+    let mut remaining = list;
+    while remaining.is_cons() {
+        let (event, rest) = cp(remaining);
+        remaining = rest;
+        if event.is_character() {
+            events.push(LayoutEvent::Text(event.as_char().to_string()));
+            continue;
+        }
+        let fields = list_to_vec(event);
+        if fields.is_empty() || !fields[0].is_symbol() {
+            return Err(EgclError::Internal("malformed pretty-printer event".into()));
+        }
+        match sym_bare_name_rc(fields[0]).as_ref() {
+            "CASE-START" if fields.len() == 2 && fields[1].is_symbol() => {
+                let mode = match sym_bare_name_rc(fields[1]).as_ref() {
+                    "LOWER" => CaseMode::Lower,
+                    "UPPER" => CaseMode::Upper,
+                    "CAPITALIZE-WORDS" => CaseMode::CapitalizeWords,
+                    "CAPITALIZE-FIRST" => CaseMode::CapitalizeFirst,
+                    _ => return Err(EgclError::Internal("unknown FORMAT case mode".into())),
+                };
+                events.push(LayoutEvent::CaseStart(mode));
+            }
+            "CASE-END" if fields.len() == 1 => events.push(LayoutEvent::CaseEnd),
+            "BLOCK" if fields.len() == 5 => {
+                if !is_string_value(fields[1]) || !is_string_value(fields[3]) {
+                    return Err(EgclError::Internal("non-string logical-block delimiter".into()));
+                }
+                let prefix = val_as_str(fields[1]);
+                events.push(LayoutEvent::Block {
+                    per_line_prefix: (!fields[2].is_nil()).then(|| prefix.clone()),
+                    prefix,
+                    suffix: val_as_str(fields[3]),
+                    events: pprint_layout_events(fields[4])?,
+                });
+            }
+            "NEWLINE" if fields.len() == 2 && fields[1].is_symbol() => {
+                let kind = match sym_bare_name_rc(fields[1]).as_ref() {
+                    "LINEAR" => NewlineKind::Linear,
+                    "FILL" => NewlineKind::Fill,
+                    "MISER" => NewlineKind::Miser,
+                    "MANDATORY" => NewlineKind::Mandatory,
+                    _ => return Err(EgclError::Internal("unknown pprint newline kind".into())),
+                };
+                events.push(LayoutEvent::Newline(kind));
+            }
+            "INDENT" if fields.len() == 3 && fields[1].is_symbol() && fields[2].is_fixnum() => {
+                let relative_to = match sym_bare_name_rc(fields[1]).as_ref() {
+                    "BLOCK" => IndentKind::Block,
+                    "CURRENT" => IndentKind::Current,
+                    _ => return Err(EgclError::Internal("unknown pprint indent kind".into())),
+                };
+                events.push(LayoutEvent::Indent {
+                    relative_to,
+                    amount: fields[2].as_fixnum() as i32,
+                });
+            }
+            "TAB"
+                if fields.len() == 4
+                    && fields[1].is_symbol()
+                    && fields[2].is_fixnum()
+                    && fields[3].is_fixnum() =>
+            {
+                let kind = match sym_bare_name_rc(fields[1]).as_ref() {
+                    "LINE" => TabKind::Line,
+                    "SECTION" => TabKind::Section,
+                    "LINE-RELATIVE" => TabKind::LineRelative,
+                    "SECTION-RELATIVE" => TabKind::SectionRelative,
+                    _ => return Err(EgclError::Internal("unknown pprint tab kind".into())),
+                };
+                events.push(LayoutEvent::Tab {
+                    kind,
+                    colnum: fields[2].as_fixnum().max(0) as u32,
+                    colinc: fields[3].as_fixnum().max(0) as u32,
+                });
+            }
+            _ => return Err(EgclError::Internal("malformed pretty-printer event".into())),
+        }
+    }
+    if !remaining.is_nil() {
+        return Err(EgclError::Internal("improper pretty-printer event list".into()));
+    }
+    Ok(events)
+}
+
+fn nonnegative_print_option(env: &Env, name: &str) -> Option<usize> {
+    env.lookup_var(name)
+        .filter(|value| value.is_fixnum() && value.as_fixnum() >= 0)
+        .map(|value| value.as_fixnum() as usize)
+}
+
 pub(super) fn call(
     name: &str,
     args: &[EgclVal],
@@ -139,6 +234,39 @@ fn resolve(name: &str) -> Option<Handler> {
             Ok(egcl_stdlib::streams::stream_line_column(args[0])
                 .map(|column| EgclVal::from_fixnum(column as i64))
                 .unwrap_or(NIL))
+        }),
+        "EGCL::%PPRINT-RENDER-LAYOUT" => Some(|_operator, args, env| {
+            if args.len() != 2 {
+                return Err(EgclError::ProgramError(
+                    "%PPRINT-RENDER-LAYOUT requires a layout node and destination".into(),
+                ));
+            }
+            let args = RootedVals::new(args.to_vec());
+            let events = pprint_layout_events(vec_to_list(&[args[0]]))?;
+            egcl_rt::rooted!(out = resolve_output_stream(args[1], env));
+            let start_column = if is_gray_stream(*out) {
+                let value = invoke_generic_function("STREAM-LINE-COLUMN", &[*out], env)?;
+                Some(value)
+                    .filter(|value| value.is_fixnum() && value.as_fixnum() >= 0)
+                    .map_or(0, |value| value.as_fixnum() as usize)
+            } else {
+                egcl_stdlib::streams::stream_line_column(*out).unwrap_or(0) as usize
+            };
+            let options = egcl_stdlib::format::LayoutOptions {
+                margin: nonnegative_print_option(env, "*PRINT-RIGHT-MARGIN*").unwrap_or(80),
+                miser_width: nonnegative_print_option(env, "*PRINT-MISER-WIDTH*"),
+                line_limit: (!egcl_stdlib::format::print_readably_active())
+                    .then(|| nonnegative_print_option(env, "*PRINT-LINES*"))
+                    .flatten(),
+                start_column,
+                pretty: env
+                    .lookup_var("*PRINT-PRETTY*")
+                    .is_some_and(|value| !value.is_nil()),
+            };
+            let doc = egcl_stdlib::format::LayoutDoc::from_events(events);
+            let rendered = egcl_stdlib::format::render_layout(&doc, &options);
+            write_str_to(*out, &rendered, env)?;
+            Ok(NIL)
         }),
         "EGCL::%DEBUG-BACKTRACE" => Some(|_operator, args, env| {
             let prev_env = PRINT_ENV.with(|c| c.replace(env as *mut Env));

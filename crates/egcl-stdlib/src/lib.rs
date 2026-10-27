@@ -106,8 +106,9 @@ pub use devtools::{
 };
 pub use error::StdlibError;
 pub use format::{
-    NewlineKind, TabKind, copy_pprint_dispatch, format, formatter, pprint_dispatch, pprint_indent,
-    pprint_logical_block, pprint_newline, pprint_tab, register_format_function,
+    CaseMode, IndentKind, LayoutDoc, LayoutEvent, LayoutOptions, NewlineKind, TabKind,
+    copy_pprint_dispatch, format, format_to_layout, formatter, pprint_dispatch, pprint_indent,
+    pprint_logical_block, pprint_newline, pprint_tab, register_format_function, render_layout,
     set_pprint_dispatch,
 };
 pub use hashtable::{
