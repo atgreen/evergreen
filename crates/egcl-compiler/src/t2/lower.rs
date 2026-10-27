@@ -168,6 +168,8 @@ pub mod op {
     pub const TRY_STORE_INTEGER_OCTETS8: u32 = 0x003a;
     pub const TRY_STORE_INTEGER_OCTETS1_TO8: u32 = 0x003c;
     pub const NATIVE_POLL: u32 = 0x003b;
+    pub const PACKED_U8_LAYOUT: u32 = 0x003d;
+    pub const TRY_STORE_INTEGER_OCTETS1_TO8_LAYOUT: u32 = 0x003e;
 
     // ── 0x30 float ALU ───────────────────────────────────────────────
     pub const FADD: u32 = 0x0030;
@@ -678,6 +680,8 @@ fn lower_inst(lo: &mut Lowering, inst: Inst) {
         TryIntegerShr => lo.emit_annotated(inst, op::TRY_INTEGER_SHR, defs, uses),
         TryStoreIntegerOctets8 => lo.emit_annotated(inst, op::TRY_STORE_INTEGER_OCTETS8, defs, uses),
         TryStoreIntegerOctets1To8 => lo.emit_annotated(inst, op::TRY_STORE_INTEGER_OCTETS1_TO8, defs, uses),
+        PackedU8Layout => lo.emit_annotated(inst, op::PACKED_U8_LAYOUT, defs, uses),
+        TryStoreIntegerOctets1To8Layout => lo.emit_annotated(inst, op::TRY_STORE_INTEGER_OCTETS1_TO8_LAYOUT, defs, uses),
         NativePoll => lo.emit_annotated(inst, op::NATIVE_POLL, defs, uses),
         SmallVectorRangeP => lo.emit_annotated(inst, op::SMALL_VECTOR_RANGE, defs, uses),
 

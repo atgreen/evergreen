@@ -398,6 +398,13 @@ pub enum Opcode {
     /// TryStoreIntegerOctets8, but accepts 1..=8 bytes and returns the exact
     /// fixnum ASH(integer, -8*(end-start)). False still writes nothing.
     TryStoreIntegerOctets1To8,
+    /// Non-signalling immutable-layout witness: tagged header width 8 or 16
+    /// for an exact simple packed-U8 array, NIL otherwise. No pointer escapes.
+    PackedU8Layout,
+    /// Same checked partial-store contract with a fifth, verifier-backed
+    /// PackedU8Layout witness for this exact array. NIL declines with no writes;
+    /// width witnesses remove only layout checks, never index/value bounds.
+    TryStoreIntegerOctets1To8Layout,
     /// Explicit block-entry poll around a bounded straight-line replacement.
     /// No operands/results; exact entry/exit recovery state is mandatory.
     NativePoll,

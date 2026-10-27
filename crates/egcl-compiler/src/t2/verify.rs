@@ -702,11 +702,24 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                             format!("block{bi} requires a guarded tagged store and its SSA witness")));
                     }
                 }
-                if matches!(data.opcode, Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8) {
+                if data.opcode == Opcode::PackedU8Layout {
+                    use crate::t2::ir::{TypeBits, ValueRepresentation as Repr};
+                    let valid = data.args.iter().chain(&data.results).all(|v| valid_values.contains(&v.0));
+                    if !valid || data.args.len() != 1 || data.results.len() != 1
+                        || data.flags != crate::t2::ir::InstFlags::default()
+                        || data.frame_state.is_some() || !data.targets.is_empty() || !matches!(data.aux, AuxData::None)
+                        || (valid && data.results.len() == 1 &&
+                            (data.args.iter().chain(&data.results).any(|&v| f.value(v).repr != Repr::Tagged)
+                                || f.value(data.results[0]).ty.bits != TypeBits::FIXNUM.join(TypeBits::NULL))) {
+                        errors.push(VerifyError::new("V8 packed-u8-layout-contract", format!("block{bi} requires one tagged array and a pure tagged width/NIL result")));
+                    }
+                }
+                if matches!(data.opcode, Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8 | Opcode::TryStoreIntegerOctets1To8Layout) {
                     use crate::t2::ir::{TypeBits, ValueRepresentation as Repr};
                     let valid = data.args.iter().chain(&data.results)
                         .all(|value| valid_values.contains(&value.0));
-                    if !valid || data.args.len() != 4 || data.results.len() != 2
+                    if !valid || data.args.len() != if data.opcode == Opcode::TryStoreIntegerOctets1To8Layout { 5 } else { 4 }
+                        || data.results.len() != 2
                         || data.flags != (crate::t2::ir::InstFlags { effectful: true, ..Default::default() })
                         || data.frame_state.is_some() || !data.targets.is_empty()
                         || !matches!(data.aux, AuxData::None)
@@ -855,6 +868,11 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
     if errors.is_empty() {
         if let Err(error) = crate::t2::vector_range_proof::verify_accesses(f) {
             errors.push(VerifyError::new("V8 vector-range-proof", error));
+        }
+    }
+    if errors.is_empty() {
+        if let Err(error) = crate::t2::array_layout::verify_accesses(f) {
+            errors.push(VerifyError::new("V8 packed-u8-layout-proof", error));
         }
     }
     if errors.is_empty() {
