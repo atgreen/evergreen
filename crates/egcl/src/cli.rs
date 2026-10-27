@@ -7507,44 +7507,29 @@ fn class_slot_owner(env: &Env, class_name: &str, slot_name: &str) -> Option<Stri
     })
 }
 
-/// The effective `:default-initargs` for `class_name`: the union over the class
-/// and its superclasses (most-specific first), keeping the first (most specific)
-/// default for each initarg name (CLHS 7.1.4). Each entry is `(bare-initarg-name,
-/// value-form)`; the form is evaluated at MAKE-INSTANCE time only when the
-/// caller did not supply that initarg.
+/// The effective `:default-initargs` for `class_name`: the union over the
+/// class precedence list, keeping the first (most specific) default for each
+/// initarg name (CLHS 7.1.4). Each entry is `(bare-initarg-name, value-form)`;
+/// the form is evaluated at MAKE-INSTANCE time only when the caller did not
+/// supply that initarg.
+///
+/// The walk follows the precedence list, not a depth-first visit of the
+/// direct superclasses: with `(defclass d (b c))` where only A (above B) and
+/// C supply a default, C precedes A in D's precedence list, so C's default
+/// wins (ansi class-0305).
 fn effective_default_initargs(env: &Env, class_name: &str) -> Vec<(String, EgclVal)> {
-    fn walk(
-        env: &Env,
-        class_name: &str,
-        out: &mut Vec<(String, EgclVal)>,
-        seen_initargs: &mut HashSet<String>,
-        seen_classes: &mut HashSet<String>,
-    ) {
-        if !seen_classes.insert(class_name.to_string()) {
-            return;
-        }
-        let Some(cd) = env.classes.borrow().get(class_name).cloned() else {
-            return;
+    let mut out = Vec::new();
+    let mut seen_initargs = HashSet::new();
+    for name in class_precedence_names(env, class_name) {
+        let Some(cd) = env.classes.borrow().get(&name).cloned() else {
+            continue;
         };
         for (initarg, form) in &cd.default_initargs {
             if seen_initargs.insert(initarg.clone()) {
                 out.push((initarg.clone(), *form));
             }
         }
-        for sup in &cd.supers {
-            walk(env, sup, out, seen_initargs, seen_classes);
-        }
     }
-    let mut out = Vec::new();
-    let mut seen_initargs = HashSet::new();
-    let mut seen_classes = HashSet::new();
-    walk(
-        env,
-        class_name,
-        &mut out,
-        &mut seen_initargs,
-        &mut seen_classes,
-    );
     out
 }
 

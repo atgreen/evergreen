@@ -1327,12 +1327,20 @@ fn class_allocated_slots_and_default_initargs() {
   ;; :default-initargs (instance slot) + explicit override
   (defclass base () ((s :initarg :s)))
   (defclass di (base) () (:default-initargs :s 42))
-  (format nil "~A ~A ~A ~A ~A"
+  ;; the default from the most specific class in the PRECEDENCE LIST wins:
+  ;; C precedes A in D's list, though a depth-first walk reaches A first
+  ;; (ansi class-0305)
+  (defclass dia-a () ((a :initarg :a)) (:default-initargs :a 'x))
+  (defclass dia-b (dia-a) ())
+  (defclass dia-c (dia-a) () (:default-initargs :a 'y))
+  (defclass dia-d (dia-b dia-c) ())
+  (format nil "~A ~A ~A ~A ~A ~A"
     (cs-of (make-instance 'owner))          ; SHARED
     (cs-of (make-instance 'sub))            ; SHARED (inherited class slot)
     (swo (make-instance 'load-op))          ; (PREP COMP)
     (slot-value (make-instance 'di) 's)     ; 42
-    (slot-value (make-instance 'di :s 9) 's)))"#; // 9 (explicit overrides default)
+    (slot-value (make-instance 'di :s 9) 's) ; 9 (explicit overrides default)
+    (slot-value (make-instance 'dia-d) 'a)))"#; // Y
     let output = egcl_bin()
         .args(["--eval", expr])
         .output()
@@ -1340,7 +1348,7 @@ fn class_allocated_slots_and_default_initargs() {
     assert_eq!(output.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("SHARED SHARED (PREP COMP) 42 9"),
+        stdout.contains("SHARED SHARED (PREP COMP) 42 9 Y"),
         "class-allocated slots + default-initargs; got: '{}', stderr: '{}'",
         stdout,
         String::from_utf8_lossy(&output.stderr),
