@@ -3424,6 +3424,13 @@ fn type_of_agrees_with_subtypep_for_characters_and_strings() {
         ("(typep (make-array 2 :adjustable t) 'array)", "T"),
         ("(type-of (make-random-state))", "RANDOM-STATE"),
         ("(type-of #'car)", "COMPILED-FUNCTION"),
+        // A displaced rank-2 array is not a SIMPLE-ARRAY, so its TYPE-OF
+        // answers ARRAY and TYPEP agrees (ansi the.4, type-of.3, coerce.1).
+        (
+            "(let ((a (make-array '(2 2) :displaced-to (make-array 4)))) (list (type-of a) (typep a (type-of a))))",
+            "((ARRAY T (2 2)) T)",
+        ),
+        ("(type-of (make-array '(2 2)))", "(SIMPLE-ARRAY T (2 2))"),
         (
             "(progn (defgeneric tos-gf2 (x)) (defmethod tos-gf2 ((x integer)) x) \
                (type-of (find-method #'tos-gf2 nil (list (find-class 'integer)))))",
