@@ -21785,17 +21785,23 @@ fn export_import_values(
         } else {
             // Name-conflict check (CLHS IMPORT; ansi
             // IMPORT.ERROR.3-5): importing a symbol DISTINCT from a
-            // same-named symbol already PRESENT in the package is a
+            // same-named symbol already ACCESSIBLE in the package (present or
+            // inherited) is a
             // correctable PACKAGE-ERROR, and CONTINUE leaves that symbol
             // out (SHADOWING-IMPORT is the resolving variant and takes the
             // branch above). A handler runs Lisp, so the package is looked
             // up again after each signal.
             let mut kept = Vec::with_capacity(resolved.len());
             for (name, sym) in resolved {
-                let conflict = !export_mode
-                    && egcl_stdlib::find_package(&pkg_name)
-                        .and_then(|pkg| egcl_stdlib::find_present_symbol(pkg, &name))
-                        .is_some_and(|existing| existing != sym);
+                let conflict = if !export_mode {
+                    match egcl_stdlib::find_package(&pkg_name) {
+                        Some(pkg) => egcl_stdlib::find_symbol(&name, pkg)?
+                            .is_some_and(|(existing, _)| existing != sym),
+                        None => false,
+                    }
+                } else {
+                    false
+                };
                 if conflict {
                     signal_correctable_package_error(
                         package_object(&pkg_name),

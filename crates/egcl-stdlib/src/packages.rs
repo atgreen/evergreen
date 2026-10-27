@@ -877,6 +877,38 @@ pub enum InternStatus {
     New,
 }
 
+fn find_symbol_in_store(
+    registry: &PackageStore,
+    name: &str,
+    package: EgclVal,
+    context: &str,
+) -> Result<Option<(EgclVal, InternStatus)>, EgclError> {
+    let package = lookup_package_arc(registry, package)?;
+    let package = package
+        .read()
+        .map_err(|_| lock_poisoned_error(context))?;
+
+    if let Some(sym) = package.internal_symbols.get(name) {
+        return Ok(Some((sym, InternStatus::Internal)));
+    }
+    if let Some(sym) = package.external_symbols.get(name) {
+        return Ok(Some((sym, InternStatus::External)));
+    }
+
+    let use_list = package.use_list.clone();
+    drop(package);
+    for used_pkg_handle in use_list {
+        if let Some(used_pkg) = registry.packages.get(&pkg_id(used_pkg_handle)) {
+            let used_pkg = used_pkg.read().map_err(|_| lock_poisoned_error(context))?;
+            if let Some(sym) = used_pkg.external_symbols.get(name) {
+                return Ok(Some((sym, InternStatus::Inherited)));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
 /// Find a symbol without interning it.
 pub fn find_symbol(
     name: &str,
@@ -887,35 +919,7 @@ pub fn find_symbol(
         .state
         .read()
         .map_err(|_| lock_poisoned_error("find-symbol"))?;
-    let package = lookup_package_arc(&registry, package)?;
-    let package = package
-        .read()
-        .map_err(|_| lock_poisoned_error("find-symbol"))?;
-
-    if let Some(sym) = package.internal_symbols.get(name) {
-        return Ok(Some((sym, InternStatus::Internal)));
-    }
-    if let Some(sym) = package.external_symbols.get(name) {
-        return Ok(Some((sym, InternStatus::External)));
-    }
-
-    // Never nest per-package locks just to traverse a use-list. Snapshot the
-    // handles under the target lock, then acquire each used package separately;
-    // true multi-package operations use ascending package-id order.
-    let use_list = package.use_list.clone();
-    drop(package);
-    for used_pkg_handle in use_list {
-        if let Some(used_pkg) = registry.packages.get(&pkg_id(used_pkg_handle)) {
-            let used_pkg = used_pkg
-                .read()
-                .map_err(|_| lock_poisoned_error("find-symbol"))?;
-            if let Some(sym) = used_pkg.external_symbols.get(name) {
-                return Ok(Some((sym, InternStatus::Inherited)));
-            }
-        }
-    }
-
-    Ok(None)
+    find_symbol_in_store(&registry, name, package, "find-symbol")
 }
 
 /// Export symbols from a package.
@@ -1094,6 +1098,16 @@ pub fn import(symbols: &[EgclVal], package: EgclVal) -> Result<(), EgclError> {
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
+
+    for (&sym, name) in symbols.iter().zip(&resolved) {
+        if find_symbol_in_store(&registry, name, package, "import")?
+            .is_some_and(|(existing, _)| existing != sym)
+        {
+            return Err(EgclError::PackageError(format!(
+                "Name conflict for symbol {name:?}"
+            )));
+        }
+    }
     let target = target.write().map_err(|_| lock_poisoned_error("import"))?;
 
     for (&sym, name) in symbols.iter().zip(resolved) {
