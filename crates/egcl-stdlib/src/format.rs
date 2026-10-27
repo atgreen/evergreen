@@ -3273,7 +3273,7 @@ fn format_impl(
                 if at_sign && !s.starts_with('-') {
                     s.insert(0, '+');
                 }
-                if w > 0 && (s.chars().count() as i64) > w {
+                if w >= 0 && (s.chars().count() as i64) > w {
                     // Without d the single zero after the point is optional, and
                     // goes when the field is too narrow for it: ~5E of 1.0 is
                     // "1.e+0" (ansi format.e.4-9).
