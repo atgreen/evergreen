@@ -197,3 +197,97 @@ fn private_call_only_capture_moves_and_survives_major_without_global_function_ow
     );
     assert!(with_traced_callables(|traced| traced.contains(&symbol)));
 }
+
+#[test]
+fn repeated_instruction_identities_visit_once_but_distinct_owners_keep_both_frames() {
+    let _lock = super::super::heap_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    let template = Arc::new(body(&env));
+    let parent = frame(None, 70);
+    let first = frame(Some(Arc::clone(&parent)), 71);
+    let second = frame(Some(Arc::clone(&parent)), 72);
+    let frames = [&first, &second];
+    let mut owners = Vec::new();
+    egcl_rt::rooted_ref!(_owners = &mut owners);
+    for captured in frames {
+        // Equal printed names do not imply equal callable identities.
+        let value = egcl_rt::symbols::make_uninterned("REPEATED-ROOT-OWNER");
+        owners.push(value);
+        let symbol = value.as_symbol_index();
+        closure_bodies()
+            .borrow_mut()
+            .insert(symbol, Arc::clone(&template));
+        closure_envs()
+            .borrow_mut()
+            .insert(symbol, Arc::clone(captured));
+    }
+    assert_ne!(owners[0], owners[1]);
+    let mut caller = body(&env);
+    caller.code.clear();
+    for owner in owners.iter() {
+        let sym = owner.as_symbol_index();
+        for _ in 0..3 {
+            caller.code.extend([
+                Instr::CallNamed { sym, nargs: 0 },
+                Instr::LoadFunction(sym),
+                Instr::LoadGlobal(sym),
+                Instr::StoreGlobal(sym),
+                Instr::BindSpecial(sym),
+            ]);
+        }
+    }
+    let caller = Arc::new(caller);
+    let slots: Vec<_> = [&parent, &first, &second]
+        .into_iter()
+        .map(|f| f.borrow_mut().vars.get_mut("CAPTURE").unwrap() as *mut EgclVal as usize)
+        .collect();
+    // Each public walk starts fresh. Count the temporary exact-symbol callback
+    // by value, not stack address: trace_symbol_index reuses a temporary slot.
+    for replacement in [101, 102] {
+        let mut identities = HashMap::new();
+        let mut captures = HashMap::new();
+        unsafe {
+            trace_bytecode_function(Arc::as_ptr(&caller) as *mut _, &mut |slot| {
+                if let Some(owner) = owners.iter().find(|&&owner| owner == *slot) {
+                    *identities.entry(owner.as_symbol_index()).or_insert(0) += 1;
+                }
+                if slots.contains(&(slot as usize)) {
+                    *captures.entry(slot as usize).or_insert(0) += 1;
+                    *slot = EgclVal::from_fixnum(replacement);
+                }
+            });
+        }
+        let per_owner = if root_visit_sharing_enabled() { 1 } else { 15 };
+        for owner in owners.iter() {
+            assert_eq!(identities[&owner.as_symbol_index()], per_owner);
+            assert!(with_traced_callables(
+                |seen| seen.contains(&owner.as_symbol_index())
+            ));
+        }
+        for (i, slot) in slots.iter().enumerate() {
+            let expected = if root_visit_sharing_enabled() {
+                1
+            } else if i == 0 {
+                30
+            } else {
+                15
+            };
+            assert_eq!(captures[slot], expected);
+        }
+        for f in [&parent, &first, &second] {
+            assert_eq!(
+                f.borrow().vars.get("CAPTURE"),
+                Some(&EgclVal::from_fixnum(replacement))
+            );
+        }
+    }
+    for owner in owners.iter() {
+        closure_bodies()
+            .borrow_mut()
+            .remove(&owner.as_symbol_index());
+        closure_envs().borrow_mut().remove(&owner.as_symbol_index());
+    }
+}

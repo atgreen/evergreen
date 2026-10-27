@@ -391,6 +391,7 @@ static REGISTRY_GENERATION: egcl_rt::execution_local::ExecutionLocal<
 #[derive(Default)]
 struct CodeRootVisitState {
     bodies: std::collections::HashSet<usize>,
+    callables: std::collections::HashSet<u32>,
     env: super::EnvRootVisitState,
 }
 
@@ -525,6 +526,13 @@ fn trace_private_function_roots(
     visit: &mut dyn FnMut(*mut EgclVal),
     state: &mut CodeRootVisitState,
 ) {
+    // Instruction operands carry immediate symbol indices, not distinct
+    // mutable reference slots. The first visit owns this identity's complete
+    // symbol/environment/code walk; another identity still owns its captures
+    // even when both identities share one bytecode template.
+    if root_visit_sharing_enabled() && !state.callables.insert(symbol) {
+        return;
+    }
     with_traced_callables(|traced| {
         traced.insert(symbol);
     });

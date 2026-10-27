@@ -147,8 +147,10 @@ that system-time cost falls outside the recorded collection pause.
 
 ## Root traversal comparison { #root-visit-sharing }
 
-Bytecode root inventory walks share visitation state for repeated code bodies
-and captured environment frames by default. Public and owner-specific walks
+Bytecode root inventory walks share visitation state for repeated code bodies,
+exact symbol identities and captured environment frames by default. Distinct
+callable identities keep their own captures even when their code is shared.
+Public and owner-specific walks
 start fresh contexts; this changes no global GC epoch or phase boundary.
 
 For a diagnostic comparison, start a fresh process with
