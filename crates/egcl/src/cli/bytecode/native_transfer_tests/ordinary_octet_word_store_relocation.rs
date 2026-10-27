@@ -143,13 +143,27 @@ fn observe_boundary() {
 #[test]
 #[ignore = "requires a platform-supported native segment transition"]
 fn ordinary_octet_word_store_polls_relocate_roots_and_deliver_interrupts() {
+    run_fixture(false);
+}
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
+fn ordinary_nested_octet_word_store_polls_relocate_roots_and_deliver_interrupts() {
+    run_fixture(true);
+}
+
+fn run_fixture(nested: bool) {
     const CHILD: &str = "EGCL_TEST_OCTET_WORD_ROOTS_CHILD";
-    const TEST: &str = "cli::bytecode::native_transfer_tests::ordinary_t2::octet_word_store_relocation::ordinary_octet_word_store_polls_relocate_roots_and_deliver_interrupts";
+    let test = if nested {
+        "cli::bytecode::native_transfer_tests::ordinary_t2::octet_word_store_relocation::ordinary_nested_octet_word_store_polls_relocate_roots_and_deliver_interrupts"
+    } else {
+        "cli::bytecode::native_transfer_tests::ordinary_t2::octet_word_store_relocation::ordinary_octet_word_store_polls_relocate_roots_and_deliver_interrupts"
+    };
     if std::env::var_os(CHILD).is_none() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                TEST,
+                test,
                 "--ignored",
                 "--nocapture",
                 "--test-threads=1",
@@ -157,6 +171,8 @@ fn ordinary_octet_word_store_polls_relocate_roots_and_deliver_interrupts() {
             .env(CHILD, "1")
             .env("EGCL_T2_LOG", "stderr")
             .env("EGCL_GC_POISON", "1")
+            .env("EGCL_BOUNDED_POLL_LOG", "1")
+            .env_remove("EGCL_DISABLE_BOUNDED_POLL_COALESCING")
             .env_remove("EGCL_DISABLE_OCTET_WORD_STORES")
             .output()
             .expect("run isolated octet word store root fixture");
@@ -175,6 +191,18 @@ fn ordinary_octet_word_store_polls_relocate_roots_and_deliver_interrupts() {
             stderr.contains("OCTET-WORD-ROOTS: octet word stores: 1"),
             "the guarded word-store fusion must actually be emitted: {stderr}"
         );
+        if nested {
+            assert!(
+                stderr.lines().any(|line| {
+                    line.split_once("[bounded-poll] OCTET-WORD-ROOTS: removed ")
+                        .and_then(|(_, suffix)| suffix.split_whitespace().next())
+                        .and_then(|number| number.parse::<usize>().ok())
+                        .is_some_and(|removed| removed > 0)
+                }),
+                "the nested native fixture must actually coalesce implicit polls: {stderr}"
+            );
+            assert!(stdout.contains("OCTET-WORD-NESTED-ROOTS-OK"));
+        }
         return;
     }
     let _lock = crate::cli::heap_test_lock()
@@ -195,9 +223,30 @@ fn ordinary_octet_word_store_polls_relocate_roots_and_deliver_interrupts() {
         &mut env,
     )
     .unwrap();
-    let (symbol, code) = install(
-        "OCTET-WORD-ROOTS",
-        "(array start value carrier)",
+    // Repeat the same word twice so byte and final liveout expectations remain
+    // identical, while the fast region is genuinely inside an outer cycle.
+    let body = if nested {
+        "((declare (type fixnum start) (type integer value) (type simple-vector carrier))
+          (let ((end (+ start 8)) (index start) (lane value) (round 0))
+            (declare (type fixnum round))
+            (tagbody outer
+              (setq index start)
+              (setq lane value)
+             loop
+              (if (>= index end) (go done))
+              (setf (aref array index) (ldb (byte 8 0) lane))
+              (setq lane (ash lane -8))
+              (setq index (1+ index))
+              (go loop)
+             done
+              (setq round (1+ round))
+              (if (< round 2) (go outer)))
+            (setf (svref carrier 0) array)
+            (setf (svref carrier 1) lane)
+            (setf (svref carrier 2) index)
+            (setf (svref carrier 3) value)
+            array))"
+    } else {
         "((declare (type fixnum start) (type integer value) (type simple-vector carrier))
           (let ((end (+ start 8)) (index start) (lane value))
             (tagbody loop
@@ -210,7 +259,12 @@ fn ordinary_octet_word_store_polls_relocate_roots_and_deliver_interrupts() {
             (setf (svref carrier 1) lane)
             (setf (svref carrier 2) index)
             (setf (svref carrier 3) value)
-            array))",
+            array))"
+    };
+    let (symbol, code) = install(
+        "OCTET-WORD-ROOTS",
+        "(array start value carrier)",
+        body,
         &mut env,
     );
     assert_mapped_t2(&code);
@@ -351,4 +405,7 @@ fn ordinary_octet_word_store_polls_relocate_roots_and_deliver_interrupts() {
         }
     }
     println!("OCTET-WORD-ROOTS-OK");
+    if nested {
+        println!("OCTET-WORD-NESTED-ROOTS-OK");
+    }
 }
