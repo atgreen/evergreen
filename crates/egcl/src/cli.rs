@@ -44993,7 +44993,6 @@ fn eval_multiple_value_bind(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, Egcl
     // global definitions in the body — e.g. INTERN inside UIOP's ENSURE-SYMBOL,
     // which runs under two nested MULTIPLE-VALUE-BINDs — persist to the caller.
     let vars: Vec<EgclVal> = list_to_vec(vars_form);
-    let var_names: Vec<String> = vars.iter().map(|v| sym_name(*v)).collect();
     // A variable that is special here — earmuffed, proclaimed, or named by a
     // `(declare (special v))` at the head of the body — binds DYNAMICALLY, like
     // the same variable in a LET (CLHS 3.3.4; bliss-ge3g). Binding it lexically
@@ -45007,7 +45006,7 @@ fn eval_multiple_value_bind(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, Egcl
         egcl_rt::rooted!(dyn_binds = Vec::<DynBind>::new());
         // Restored after the body: `with_child_frame` restores only the frame.
         let saved_locally = env.locally_specials.clone();
-        for (i, var_name) in var_names.iter().enumerate() {
+        for (i, var) in vars.iter().copied().enumerate() {
             let val = if i == 0 {
                 *primary
             } else if i < mv.len() {
@@ -45015,17 +45014,29 @@ fn eval_multiple_value_bind(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, Egcl
             } else {
                 NIL
             };
-            if let_binding_is_dynamic(vars[i], &body_specials) {
-                dyn_binds.push(DynBind::establish(vars[i], val));
-                expose_locally_special(env, vars[i]);
+            if let_binding_is_dynamic(var, &body_specials) {
+                dyn_binds.push(DynBind::establish(var, val));
+                expose_locally_special(env, var);
             } else {
-                env.define_local(var_name, val);
+                // Preserve the variable's identity. SETF expanders routinely
+                // return fresh, uninterned store variables through M-V-B;
+                // binding one by its printed name interns that unique name
+                // permanently on every interpreted expansion (GitHub #725).
+                if var.symbol_index().is_some() {
+                    env.define_local_symbol(var, val);
+                } else {
+                    // Preserve the old error-path behaviour for malformed
+                    // variable lists (including NIL/T) rather than panicking
+                    // in `as_symbol_index`; valid M-V-B variables take the
+                    // identity-preserving arm above.
+                    env.define_local(&sym_name(var), val);
+                }
                 // Bound LEXICALLY here, so it shadows any enclosing declaration
                 // that made the name dynamic — the same rule lower_mvb follows
                 // (bliss-7v68). Without it an enclosing `(let ((z 0)) (declare
                 // (special z)) …)` leaves Z dynamic and the M-V-B's own binding
                 // is invisible (bliss-s2y9).
-                shadow_locally_special(env, vars[i]);
+                shadow_locally_special(env, var);
             }
         }
         // A declared name the form did NOT bind is a free declaration: it only
