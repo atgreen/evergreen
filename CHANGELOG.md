@@ -11,6 +11,11 @@
 
 ### Added
 
+- x86 T2 allocates small packed-byte arrays directly from a native TLAB window,
+  supporting scalar and singleton-list dimensions while preserving collecting
+  fallback and mutable element-type checks
+  ([#716](https://github.com/atgreen/evergreen/pull/716)).
+
 - Optional GC root-scanner timings attribute stack, symbol, and individual
   external scanner costs, with address anchors for resolving scanner names
   ([#710](https://github.com/atgreen/evergreen/pull/710)).

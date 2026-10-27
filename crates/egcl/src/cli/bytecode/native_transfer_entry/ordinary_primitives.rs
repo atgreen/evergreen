@@ -78,7 +78,19 @@ fn note_array_constructor(fast: bool) {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static ARRAY_RUNTIME_ENTRIES: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(in crate::cli::bytecode) fn take_array_runtime_entries_for_test() -> usize {
+    ARRAY_RUNTIME_ENTRIES.with(|entries| entries.replace(0))
+}
+
 fn make_array(args: &[EgclVal], env: *mut Env) -> Result<EgclVal, EgclError> {
+    #[cfg(test)]
+    ARRAY_RUNTIME_ENTRIES.with(|entries| entries.set(entries.get() + 1));
     let symbols = *ARRAY_SYMBOLS.get().ok_or_else(invalid_capture)?;
     if let Some(length) = simple_ub8_length(args, symbols) {
         note_array_constructor(true);
@@ -108,10 +120,20 @@ fn symbols() -> &'static Vec<(OrdinaryPrimitive, u32)> {
         OrdinaryPrimitive::ALL
             .into_iter()
             .map(|primitive| {
-                (
-                    primitive,
-                    egcl_rt::symbols::intern(&primitive.adapter_name()),
-                )
+                let target = egcl_rt::symbols::intern(&primitive.adapter_name());
+                if primitive == OrdinaryPrimitive::MakeArray {
+                    let symbols = *ARRAY_SYMBOLS.get().expect("captured array symbols");
+                    // Only the owner of this private semantic adapter may
+                    // publish its immediate identities to background emission.
+                    egcl_compiler::t2::emit::register_packed_u8_adapter(
+                        target,
+                        egcl_compiler::t2::emit::PackedU8AdapterSymbols {
+                            element_type: symbols.element_type,
+                            unsigned_byte: symbols.unsigned_byte,
+                        },
+                    );
+                }
+                (primitive, target)
             })
             .collect()
     })

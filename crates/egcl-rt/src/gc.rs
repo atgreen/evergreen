@@ -6505,6 +6505,63 @@ pub struct NativeAllocLayout {
     pub double_footprint: u32,
 }
 
+/// Small packed-U8 header/body contract for native templates. This describes
+/// encoding only, not an allocation guarantee or a prezeroed-payload promise.
+#[derive(Clone, Copy, Debug)]
+pub struct NativePackedU8Layout {
+    pub header_base: u64,
+    pub size_units_one: u64,
+    pub size_units_mask: u64,
+    pub body_size_mask: u64,
+    pub body_size_shift: u8,
+    pub alignment: u8,
+    pub header_bytes: u8,
+    pub length_offset: u8,
+    pub data_offset: u8,
+    pub element_tag: u8,
+}
+
+pub fn native_packed_u8_layout() -> NativePackedU8Layout {
+    let mut body_bit = ObjectHeader::new(0, 0);
+    body_bit.set_hash(1);
+    let mut body_mask = ObjectHeader::new(0, 0);
+    body_mask.set_hash(u32::MAX);
+    NativePackedU8Layout {
+        header_base: ObjectHeader::new(crate::object::type_id::SIMPLE_ARRAY, 0).0,
+        size_units_one: ObjectHeader::new(0, 1).0,
+        size_units_mask: ObjectHeader::new(0, u16::MAX).0,
+        body_size_mask: body_mask.0,
+        body_size_shift: body_bit.0.trailing_zeros() as u8,
+        alignment: OBJECT_ALIGNMENT as u8,
+        header_bytes: OBJECT_HEADER_SIZE as u8,
+        length_offset: crate::packed_u8::LENGTH_OFFSET as u8,
+        data_offset: crate::packed_u8::DATA_OFFSET as u8,
+        element_tag: crate::object::ElementTypeTag::U8 as u8,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn native_packed_u8_small_header_contract_matches_allocator() {
+    let layout = native_packed_u8_layout();
+    for length in [0usize, 1, 7, 8, 9, 136, 256] {
+        let body = crate::packed_u8::DATA_OFFSET + length;
+        let mut expected = 0u64;
+        unsafe {
+            write_object_header(
+                (&raw mut expected).cast(),
+                crate::object::type_id::SIMPLE_ARRAY,
+                body as u32,
+            );
+        }
+        let footprint = object_footprint(body).0;
+        let actual = layout.header_base
+            | ((body as u64) << layout.body_size_shift)
+            | ((footprint as u64 / 8) * layout.size_units_one);
+        assert_eq!(actual, expected, "length={length}");
+    }
+}
+
 /// The window budget while `EGCL_GC_STRESS` is active: a few objects, so
 /// generated code still allocates inline but reaches the stressing runtime
 /// allocation (and its forced collection) every few conses.

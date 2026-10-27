@@ -40,15 +40,24 @@ const PROGRAM: &str = r#"
       (dotimes (i 40) (native-constructor-array 3) (native-constructor-bare 3))
       (assert (= (egcl-ext:deopt-count) before)))
     (assert (= (length (multiple-value-list (native-constructor-array 0))) 1))
+    (assert (= (length (multiple-value-list
+                       (progn (values 1 2 3) (native-constructor-bare 8)))) 1))
     (format t "NATIVE-ARRAY:~S~%"
       (list (describe-native-array (native-constructor-array 0))
             (describe-native-array (native-constructor-array 3))
             (describe-native-array (native-constructor-bare 3))))
+    ;; Above the bounded inline cap, exercise the collecting private adapter.
+    (let ((array (native-constructor-bare 257)))
+      (assert (= (length array) 257))
+      (assert (every #'zerop array)))
     ;; Width mutation must be observed by the runtime validation, rather than
     ;; trusting an earlier compiler snapshot of the heap constant descriptor.
     (rplaca +native-array-descriptor+ 'double-float)
     (rplacd +native-array-descriptor+ nil)
-    (let ((array (native-constructor-array 3)))
+    (let ((array (native-constructor-array 3))
+          (bare (native-constructor-bare 3)))
+      (assert (eq (array-element-type bare) 'double-float))
+      (assert (every #'zerop bare))
       (assert (eq (array-element-type array) 'double-float))
       (assert (every #'zerop array))
       (format t "MUTATED-ARRAY:~S~%" (describe-native-array array)))
@@ -68,6 +77,11 @@ const PROGRAM: &str = r#"
       (handler-case (native-constructor-array 1.5)
         (type-error () (setf caught t)))
       (assert caught))
+    (dolist (dimension (list -1 1.5))
+      (let ((caught nil))
+        (handler-case (native-constructor-bare dimension)
+          (type-error () (setf caught t)))
+        (assert caught)))
     (assert (eq (flet ((make-array (dims &rest options)
                        (declare (ignore dims options)) :lexical))
                   (make-array '(3) :element-type '(unsigned-byte 8))) :lexical))
@@ -167,6 +181,9 @@ fn native_constructor_mixed_live_heap_values_survive_gc_stress_and_fallback() {
               (assert (eq retained marker))
               (assert (equal retained '("retained" (7 11))))
               (assert (equal (coerce array 'list) '(0 0 0 0 0))))))
+        ;; The bounded path must retain the collecting adapter above its cap.
+        (let ((result (stress-native-constructor 257 (list 7 11))))
+          (assert (= (length (first result)) 257)))
         (rplaca +stress-array-type+ 'double-float)
         (rplacd +stress-array-type+ nil)
         (dotimes (i 6)
