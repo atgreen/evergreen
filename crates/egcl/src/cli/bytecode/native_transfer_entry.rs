@@ -38,6 +38,8 @@ use activation::ActivationState;
 mod deopt;
 #[cfg(test)]
 pub(super) use deopt::with_ordinary_guard_resume_observer_for_test;
+#[cfg(test)]
+pub(super) use deopt::with_ordinary_guard_payload_observer_for_test;
 mod native_frames;
 mod lean_root;
 pub(super) mod funcall_fast;

@@ -20,6 +20,10 @@ mod vector_range_relocation;
 #[path = "ordinary_octet_word_store_relocation.rs"]
 mod octet_word_store_relocation;
 
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[path = "ordinary_shared_deopt.rs"]
+mod shared_deopt;
+
 thread_local! {
     // An address for comparison only: this deliberately is not a GC root.
     static ALLOCATED_ROOT: Cell<u64> = const { Cell::new(0) };

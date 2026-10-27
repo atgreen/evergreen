@@ -186,6 +186,7 @@ enum FixupKind {
 /// A pending displacement: where to patch, what shape, and the label to reach.
 /// `site` is the four-byte field on x86-64 and the instruction itself on A64,
 /// because that is what each displacement is relative to.
+#[derive(Clone)]
 struct Fixup {
     site: usize,
     label: Label,
@@ -225,6 +226,7 @@ fn branch_words(target: i64, site: usize, bits: u32) -> Option<u32> {
 }
 
 /// A growable code buffer with deferred branch resolution.
+#[derive(Clone)]
 pub struct Asm {
     code: Vec<u8>,
     /// Bound offset of each label, or `None` while still forward-referenced.
@@ -379,6 +381,15 @@ impl Asm {
         for word in words {
             self.word(*word);
         }
+    }
+
+    /// Load a JIT-local immutable table address without an absolute relocation.
+    #[cfg(target_arch = "x86_64")]
+    pub fn lea_rip_label(&mut self, register: u8, label: Label) {
+        assert!(register < 16);
+        self.extend_from_slice(&[0x48 | if register >= 8 { 4 } else { 0 }, 0x8d,
+            ((register & 7) << 3) | 5]);
+        self.reserve_rel32(label);
     }
 
     /// Reserve a 4-byte `rel32` slot at the current position, to be patched to
