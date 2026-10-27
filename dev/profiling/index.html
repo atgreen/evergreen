@@ -1211,6 +1211,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#gc-root-scanner-timing" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        GC root-scanner timing
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#allocation-and-measurement-discipline" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2065,6 +2076,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#gc-root-scanner-timing" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        GC root-scanner timing
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#allocation-and-measurement-discipline" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2240,6 +2262,58 @@ three interval fields absent if the body was never entered. Logging adds
 measurement overhead and makes no hard real-time guarantee. On Linux,
 soft-dirty tracking can cause first-write page faults during later execution;
 that system-time cost falls outside the recorded collection pause.</p>
+<h2 id="gc-root-scanner-timing">GC root-scanner timing<a class="headerlink" href="#gc-root-scanner-timing" title="Permanent link">&para;</a></h2>
+<p>Set <code>EGCL_GC_ROOT_PHASE_LOG</code> before startup to attribute root-scanning work.
+It is off by default and caches presence on first use: even <code>=0</code> enables it.
+It works independently of <code>EGCL_GC_PHASE_LOG</code>.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="nv">EGCL_GC_ROOT_PHASE_LOG</span><span class="o">=</span><span class="m">1</span><span class="w"> </span>scripts/egcl-limited.sh<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="w">  </span>target/x86_64-unknown-linux-musl/release/egcl<span class="w"> </span>--no-init<span class="w"> </span>--load<span class="w"> </span>workload.lisp<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="w">  </span><span class="m">2</span>&gt;gc-roots.log
+</code></pre></div>
+<p>Each <code>[gc-root-phases]</code> line has a kind followed by decimal
+<code>pass</code>, <code>minor</code>, <code>scanner</code>, <code>anchor</code>, and <code>elapsed_ns</code> fields:</p>
+<table>
+<thead>
+<tr>
+<th>Kind</th>
+<th>Interval</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>external_scanner</code></td>
+<td>One registered external root scanner, including its original visitor's work</td>
+</tr>
+<tr>
+<td><code>minor_mark_cl_stack</code> / <code>minor_mark_symbols</code></td>
+<td>Minor-GC stack or symbol root marking</td>
+</tr>
+<tr>
+<td><code>minor_relocate_cl_stack</code> / <code>minor_relocate_symbols</code></td>
+<td>Minor-GC stack or symbol root relocation</td>
+</tr>
+</tbody>
+</table>
+<p><code>pass</code> is the existing external root-scan epoch, not a collection number.
+Stack and symbol intervals precede external enumeration and retain the preceding
+epoch. <code>minor</code> identifies the attempted minor collection for those intervals;
+external scanners report <code>minor=0</code>, including when called by a major collection,
+verification, or a snapshot. Use pass and log order to group scanner invocations.
+<code>scanner=0</code> denotes a stack or symbol interval.</p>
+<p>For external scanners, <code>scanner</code> is the runtime function address. <code>anchor</code> is
+the runtime address of <code>egcl_rt::gc::root_scanners</code>. Keep the exact unstripped
+binary and its hash, then locate that anchor's link-time address:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>nm<span class="w"> </span>-anC<span class="w"> </span>path/to/egcl<span class="w"> </span><span class="p">|</span><span class="w"> </span>rg<span class="w"> </span><span class="s1">'egcl_rt::gc::root_scanners$'</span>
+</code></pre></div>
+<p>Subtract the link-time anchor from the logged anchor to obtain the ASLR slide.
+Subtract that slide from the logged scanner address, convert the result to hex,
+and resolve it with <code>addr2line -Cfipe path/to/egcl 0xADDRESS</code>.</p>
+<p>Each interval excludes formatting and writing its own line. Enclosing GC phase
+and pause measurements include that output overhead. These intervals are not a
+complete partition: entry-continuation roots, remembered roots, and scanner-list
+setup are not separately attributed. Use this log to locate work, then benchmark
+with both diagnostic flags unset; do not treat instrumented timings as an
+uninstrumented performance result.</p>
 <h2 id="allocation-and-measurement-discipline">Allocation and measurement discipline<a class="headerlink" href="#allocation-and-measurement-discipline" title="Permanent link">&para;</a></h2>
 <p><code>room</code> measures Lisp-heap activity. Rust strings, vectors, hash maps, and other
 host allocations can dominate execution time independently. The contributor
