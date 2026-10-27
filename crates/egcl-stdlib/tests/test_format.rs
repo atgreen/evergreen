@@ -124,6 +124,41 @@ fn layout_fill_breaks_sections_and_trims_break_whitespace() {
 }
 
 #[test]
+fn layout_fill_breaks_like_linear_in_miser_mode() {
+    let mut events = Vec::new();
+    for _ in 0..10 {
+        events.push(LayoutEvent::Text("A ".into()));
+        events.push(LayoutEvent::Newline(NewlineKind::Fill));
+    }
+    let doc = LayoutDoc::from_events(vec![LayoutEvent::Block {
+        prefix: String::new(),
+        per_line_prefix: None,
+        suffix: String::new(),
+        events,
+    }]);
+    let mut options = layout_options(10);
+    options.miser_width = Some(10);
+
+    assert_eq!(render_layout(&doc, &options), "A\n".repeat(10));
+
+    options.miser_width = Some(9);
+    assert_eq!(render_layout(&doc, &options), "A A A A A\nA A A A A ");
+
+    let fitting_doc = LayoutDoc::from_events(vec![LayoutEvent::Block {
+        prefix: String::new(),
+        per_line_prefix: None,
+        suffix: String::new(),
+        events: vec![
+            LayoutEvent::Text("A ".into()),
+            LayoutEvent::Newline(NewlineKind::Fill),
+            LayoutEvent::Text("A".into()),
+        ],
+    }]);
+    options.miser_width = Some(10);
+    assert_eq!(render_layout(&fitting_doc, &options), "A A");
+}
+
+#[test]
 fn layout_miser_breaks_when_miser_mode_is_active_even_if_text_fits() {
     let doc = LayoutDoc::from_events(vec![LayoutEvent::Block {
         prefix: String::new(),
