@@ -989,6 +989,15 @@ pub fn infer(f: &Function) -> InferenceResult {
                 for (index, &rv) in idef.results.iter().enumerate() {
                     let res = if matches!(idef.opcode, Opcode::TryIntegerShr | Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8 | Opcode::TryStoreIntegerOctets1To8Layout) && index == 1 {
                         IRType::of(TypeBits::FIXNUM)
+                    } else if idef.opcode == Opcode::ConstHeapObj
+                        && f.value(rv).ty.bits == TypeBits::DOUBLE_FLOAT
+                        && matches!(idef.aux, AuxData::HeapLiteral { slot }
+                            if f.double_literals.contains_key(&slot))
+                    {
+                        // The builder captured an immutable double literal on
+                        // the owner thread. Preserve that semantic type through
+                        // joins without inspecting a movable heap object.
+                        IRType::of(TypeBits::DOUBLE_FLOAT)
                     } else { res };
                     let old = g.get(rv);
                     let joined = ty_join(old, res);
@@ -2397,5 +2406,49 @@ mod tests {
         // Inside the body, `i` is narrowed below the bound, so i+1 ≤ 10.
         assert_eq!(r.range(i1[0]), Some(Range { lo: 1, hi: 10 }));
         assert_eq!(r.repr(i), Some(ValueRepresentation::UnboxedFixnum));
+    }
+    #[test]
+    fn heap_double_literal_fact_requires_declared_type_and_immutable_snapshot() {
+        // The address is an opaque pool-slot identity. Inference must use only
+        // the compiler-owned snapshot, never read this synthetic heap address.
+        const SLOT: usize = 0x12340;
+        for (declared_double, snapshot, expected) in [
+            (true, false, IRType::TOP),
+            (true, true, IRType::of(TypeBits::DOUBLE_FLOAT)),
+            (false, true, IRType::TOP),
+        ] {
+            let mut f = Function::new("literal-proof-boundary");
+            let entry = f.entry();
+            if snapshot {
+                f.double_literals.insert(SLOT, 1.25f64.to_bits());
+            }
+            let (_, result) = f.push_inst(
+                entry,
+                InstData {
+                    aux: AuxData::HeapLiteral { slot: SLOT },
+                    ..inst(Opcode::ConstHeapObj)
+                },
+                &[(
+                    if declared_double {
+                        IRType::of(TypeBits::DOUBLE_FLOAT)
+                    } else {
+                        IRType::TOP
+                    },
+                    ValueRepresentation::Tagged,
+                )],
+            );
+            f.set_terminator(
+                entry,
+                InstData {
+                    args: vec![result[0]],
+                    ..ret()
+                },
+            );
+            assert_eq!(
+                infer(&f).ty(result[0]),
+                expected,
+                "declared_double={declared_double}, snapshot={snapshot}"
+            );
+        }
     }
 }
