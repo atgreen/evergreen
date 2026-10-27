@@ -79,16 +79,16 @@ fn note_array_constructor(fast: bool) {
 }
 
 fn make_array(args: &[EgclVal], env: *mut Env) -> Result<EgclVal, EgclError> {
-    // These copies, including the mutable descriptor and dimensions list, must
-    // move with GC during construction or arbitrary public fallback evaluation.
-    egcl_rt::rooted!(args = args.to_vec());
     let symbols = *ARRAY_SYMBOLS.get().ok_or_else(invalid_capture)?;
-    if let Some(length) = simple_ub8_length(&args, symbols) {
+    if let Some(length) = simple_ub8_length(args, symbols) {
         note_array_constructor(true);
-        // Use the same packed payload allocator as the public constructor.
-        // All arguments remain rooted during the collecting allocation.
+        // Decoding cannot allocate and rechecks mutable descriptors each call.
+        // Only the scalar length survives this collecting allocation; no local
+        // argument copy or borrowed heap object is used afterward.
         return egcl_rt::packed_u8::make(length, 0);
     }
+    // Public fallback may allocate and still needs every argument afterward.
+    egcl_rt::rooted!(args = args.to_vec());
     note_array_constructor(false);
     egcl_rt::rooted!(
         function = egcl_rt::symbols::symbol_function(symbols.make_array)
