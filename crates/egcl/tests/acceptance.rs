@@ -3950,6 +3950,44 @@ fn format_exponential_shortest_float() {
     }
 }
 
+/// FORMAT ~E's sign, width, overflow and scale parameters (CLHS 22.3.3.2): `@`
+/// signs a non-negative value; without d, the zero after the point goes when
+/// the field is too narrow for it; an overflow character fills a field the
+/// result cannot fit; a scale factor k > 0 leaves d-k+1 fraction digits (ansi
+/// format.e.4-9, .12, .18-19, .21).
+#[test]
+fn format_exponential_sign_width_and_scale() {
+    let cases = [
+        ("(format nil \"~5e\" 1.0)", "\"1.e+0\""),
+        ("(format nil \"~6e\" -1.0)", "\"-1.e+0\""),
+        ("(format nil \"~6@e\" 1.0)", "\"+1.e+0\""),
+        ("(format nil \"~7,2@e\" 0.5)", "\"+5.00e-1\""),
+        ("(format nil \"~6,2,,,'*e\" 0.5)", "\"******\""),
+        ("(format nil \"~0,2,,,'*e\" 0.5)", "\"\""),
+        ("(format nil \"~,2,,2e\" 0.05)", "\"50.0e-3\""),
+        ("(format nil \"~,2,,3e\" 0.05)", "\"500.e-4\""),
+        ("(format nil \"~10e\" 1.0)", "\"    1.0e+0\""),
+        ("(format nil \"~,2e\" 1234.5)", "\"1.23e+3\""),
+    ];
+    for (expr, expected) in cases {
+        let out = egcl_bin()
+            .args(["--eval", &format!("(print {expr})")])
+            .output()
+            .expect("run egcl");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout
+            .lines()
+            .map(|l| l.trim())
+            .find(|l| !l.is_empty())
+            .unwrap_or("");
+        assert_eq!(
+            got, expected,
+            "{expr} => expected {expected}, got: {got} (stderr: {})",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
 /// The float introspection/manipulation family (were undefined): DECODE-FLOAT,
 /// INTEGER-DECODE-FLOAT, SCALE-FLOAT, FLOAT-SIGN, FLOAT-RADIX/DIGITS/PRECISION,
 /// and FFLOOR/FCEILING/FTRUNCATE/FROUND (float-quotient rounding).

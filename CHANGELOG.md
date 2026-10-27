@@ -292,6 +292,10 @@
   type did not catch it. `warn` and `error` with format arguments could
   likewise lose their format control string
   ([#645](https://github.com/atgreen/evergreen/pull/645)).
+- `format`'s `~E` honors the `@` sign, the overflow character, a width too
+  narrow for the optional zero after the point, and a scale factor above 1
+  ([#683](https://github.com/atgreen/evergreen/pull/683)).
+
 - An internal error inside compiled code that a native function called no
   longer aborts the process. It is reported as an ordinary Lisp error, as it
   already was for compiled code called from the interpreter. Making a closure
