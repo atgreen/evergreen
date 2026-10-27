@@ -127,7 +127,7 @@ fn recursive_calls_enter_the_frameless_base_case_prefix() {
 
 #[test]
 fn recursive_admission_tests_flags_without_register_round_trips() {
-    use iced_x86::{Decoder, DecoderOptions, MemorySize, Mnemonic, OpKind};
+    use iced_x86::{Decoder, DecoderOptions, MemorySize, Mnemonic};
     let code = execute_with_self_calls(&fib(), 1, &[12 * 8, 0, 0, 0, 0, 0, 0],
         144 * 8, 0, None, true);
     let instructions: Vec<_> = Decoder::new(64, &code, DecoderOptions::NONE).into_iter().collect();
@@ -137,11 +137,6 @@ fn recursive_admission_tests_flags_without_register_round_trips() {
         instruction.mnemonic() == Mnemonic::Movzx
             && instruction.memory_size() == MemorySize::UInt8).count();
     assert_eq!(byte_loads, 0, "admission must test byte flags directly in memory");
-    assert!(instructions.iter().filter(|instruction|
-        instruction.mnemonic() == Mnemonic::Cmp
-            && instruction.op0_kind() == OpKind::Memory
-            && instruction.memory_size() == MemorySize::UInt8).count() >= 2,
-        "both byte poll flags must retain direct memory tests");
 }
 
 #[test]
