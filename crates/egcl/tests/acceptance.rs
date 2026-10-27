@@ -4091,6 +4091,41 @@ fn subtypep_compound_subtypes() {
     }
 }
 
+/// EGCL has two float formats, so SHORT-FLOAT is the same type as SINGLE-FLOAT
+/// and LONG-FLOAT the same as DOUBLE-FLOAT (CLHS 12.1.4.1.1). TYPEP already
+/// said so; SUBTYPEP called them disjoint, so ansi-test's choice of exponent
+/// markers demanded one where none is printed (print.single-float.3-4 etc.).
+#[test]
+fn subtypep_treats_merged_float_formats_as_one_type() {
+    let cases = [
+        ("(multiple-value-list (subtypep 'short-float 'single-float))", "(T T)"),
+        ("(multiple-value-list (subtypep 'single-float 'short-float))", "(T T)"),
+        ("(multiple-value-list (subtypep 'long-float 'double-float))", "(T T)"),
+        ("(multiple-value-list (subtypep 'double-float 'long-float))", "(T T)"),
+        ("(multiple-value-list (subtypep '(short-float 0.0 1.0) '(single-float 0.0)))", "(T T)"),
+        ("(multiple-value-list (subtypep 'single-float 'double-float))", "(NIL T)"),
+        ("(multiple-value-list (subtypep 'short-float 'long-float))", "(NIL T)"),
+        ("(multiple-value-list (subtypep 'long-float 'float))", "(T T)"),
+    ];
+    for (expr, expected) in cases {
+        let out = egcl_bin()
+            .args(["--eval", &format!("(print {expr})")])
+            .output()
+            .expect("run egcl");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout
+            .lines()
+            .map(|l| l.trim())
+            .find(|l| !l.is_empty())
+            .unwrap_or("");
+        assert_eq!(
+            got, expected,
+            "{expr} => expected {expected}, got: {got} (stderr: {})",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
 /// PEEK-CHAR (was undefined): returns the next character without consuming it;
 /// peek-type NIL = next char, T = skip whitespace, a character = skip until it.
 #[test]
