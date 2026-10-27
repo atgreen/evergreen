@@ -139,6 +139,17 @@ fn scoped_vector_copies_survive_gc_and_copy_back_on_nonlocal_exit() {
               (setf (egcl-ffi:mem-ref pointer :double) 3.75d0)
               (values 7 8)))))
         (assert (= 3.75d0 (aref vector 0))))
+      ;; Specialized vectors have packed representations of their own.
+      (let ((vector (make-array 4 :element-type '(unsigned-byte 8) :initial-contents '(1 2 3 4))))
+        (egcl-ffi:with-pointer-to-vector-data (pointer vector)
+          (assert (= 3 (egcl-ffi:mem-ref pointer :uint8 2)))
+          (setf (egcl-ffi:mem-ref pointer :uint8 3) 200))
+        (assert (equalp vector #(1 2 3 200))))
+      (let ((vector (make-array 2 :element-type 'double-float :initial-contents '(1.25d0 2.5d0))))
+        (egcl-ffi:with-pointer-to-vector-data (pointer vector :double)
+          (assert (= 2.5d0 (egcl-ffi:mem-ref pointer :double 8)))
+          (setf (egcl-ffi:mem-ref pointer :double) 3.75d0))
+        (assert (= 3.75d0 (aref vector 0))))
       (let ((invalid (vector 1 999)))
         (assert (handler-case
                   (progn (egcl-ffi:with-pointer-to-vector-data (pointer invalid)
