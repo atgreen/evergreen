@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-//! Finite loops distinguish every selected backedge from sampled polling.
-//! Execute this test on each target (QEMU proves cadence, not native latency).
+//! Finite loops distinguish every-selected-backedge polling from the sampled
+//! cadence used on System Z. Execute this test on each target (QEMU proves
+//! cadence, not native latency).
 
 use egcl_compiler::t2::{
     emit::FramedCode,
@@ -17,7 +18,8 @@ use std::cell::Cell;
 
 const INITIAL_ROOT: u64 = 0x1001;
 const MOVED_BY: u64 = 0x10000;
-const ITERATIONS: usize = 8;
+const ITERATIONS: usize = 128;
+const S390X_POLL_INTERVAL: usize = 64;
 const ROOTS: usize = 20;
 const ACTIVATION_SLOTS: usize = ROOTS + 2;
 
@@ -195,7 +197,7 @@ extern "C" fn unexpected_deopt(_: u64, _: u64, _: *const u64, _: u64) {
     panic!("bounded fixnum loop must not deoptimize");
 }
 
-fn verify(compiled: FramedCode, execute: bool) {
+fn verify(compiled: FramedCode, execute: bool, poll_interval: usize) {
     assert_eq!(compiled.root_sync_sites.len(), 1);
     // System Z omits proven-immediate counter word. Every backend
     // must exclude the not-yet-defined destination phi homes.
@@ -221,17 +223,20 @@ fn verify(compiled: FramedCode, execute: bool) {
             STATE.with(|state| state.set((slots.as_mut_ptr(), slots.len(), 0, exit_first)));
             let result = entry(slots.as_mut_ptr());
             let count = STATE.with(|state| state.replace((std::ptr::null_mut(), 0, 0, false)).2);
+            let expected_polls = ITERATIONS / poll_interval;
             assert_eq!(
                 count,
-                if exit_first { 1 } else { ITERATIONS },
-                "a loop shorter than 256 iterations must poll every selected backward edge"
+                if exit_first { 1 } else { expected_polls },
+                "the loop must poll at the backend's selected-edge cadence"
             );
             assert_eq!(
                 result,
                 if exit_first {
                     NIL.0
                 } else {
-                    INITIAL_ROOT + (ITERATIONS % ROOTS) as u64 * 16 + ITERATIONS as u64 * MOVED_BY
+                    INITIAL_ROOT
+                        + (ITERATIONS % ROOTS) as u64 * 16
+                        + expected_polls as u64 * MOVED_BY
                 },
                 "normal edges reload rewritten roots; a pending request exits on the first edge"
             );
@@ -240,7 +245,7 @@ fn verify(compiled: FramedCode, execute: bool) {
 }
 
 macro_rules! backend {
-    ($name:ident, $module:ident, $native:expr) => {
+    ($name:ident, $module:ident, $native:expr, $poll_interval:expr) => {
         #[test]
         fn $name() {
             use egcl_compiler::t2::$module::{RuntimeCalls, emit_framed_with_runtime};
@@ -254,27 +259,31 @@ macro_rules! backend {
                 },
             )
             .expect("finite poll loop must compile");
-            verify(compiled, $native);
+            verify(compiled, $native, $poll_interval);
         }
     };
 }
 backend!(
     aarch64_finite_loop_polls_every_selected_edge,
     emit_a64,
-    cfg!(target_arch = "aarch64")
+    cfg!(target_arch = "aarch64"),
+    1
 );
 backend!(
     ppc64le_finite_loop_polls_every_selected_edge,
     emit_ppc64le,
-    cfg!(all(target_arch = "powerpc64", target_endian = "little"))
+    cfg!(all(target_arch = "powerpc64", target_endian = "little")),
+    1
 );
 backend!(
     riscv64_finite_loop_polls_every_selected_edge,
     emit_riscv64,
-    cfg!(target_arch = "riscv64")
+    cfg!(target_arch = "riscv64"),
+    1
 );
 backend!(
-    s390x_finite_loop_polls_every_selected_edge,
+    s390x_finite_loop_polls_on_sampled_cadence,
     emit_s390x,
-    cfg!(target_arch = "s390x")
+    cfg!(target_arch = "s390x"),
+    S390X_POLL_INTERVAL
 );

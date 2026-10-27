@@ -49,12 +49,13 @@
 //! (regalloc2's plus the stable homes added for split values), the edge
 //! parallel-copy buffer (max block-param count), the deopt serialisation buffer
 //! (max over frame states of four header words plus locals plus stack per
-//! scope), the remat buffer (max recipe count), and five words holding the saved
+//! scope), the remat buffer (max recipe count), and six words holding the saved
 //! call result, the `EgclStack` pointer the entry
 //! received in r3, the caller's frame pointer and stack offset parked
 //! across a direct native call, and the code id stamped by the entry (bit 63
-//! set by the register entry, which owns no frame). Every access must fit a signed 20-bit
-//! displacement, so an oversized frame declines.
+//! set by the register entry, which owns no frame), followed by the back-edge
+//! poll counter. Every access must fit a signed 20-bit displacement, so an
+//! oversized frame declines.
 //!
 //! The entry prologue copies the entry block's parameters from activation
 //! slots `0..n` into their homes. OSR entries are additional prologues, one per
@@ -107,7 +108,8 @@
 //!
 //! Back-edge polls: a block with a successor at or before itself in block
 //! order calls `poll` before its edge moves through the same root-synchronising
-//! path on every execution. A function with a cycle but no `poll` adapter declines.
+//! path every [`POLL_INTERVAL`] selected-edge crossings. A function with a cycle
+//! but no `poll` adapter declines.
 //!
 //! # Supported opcodes
 //!
@@ -231,8 +233,9 @@ pub struct RuntimeCalls {
 /// own live values. r2-r5 are volatile and never homes.
 pub const REGISTER_ENTRY_ARGS_MAX: usize = 4;
 
-/// Back edges between full runtime polls. A power of two, so the counter
-/// test is one TMLL; 64 matches the interval emit.rs uses on x86-64.
+/// Back edges between full runtime polls. A power of two, so the counter test
+/// is one TMLL. This is a System Z loop cadence; other backends poll every
+/// selected back edge, independently of x86's straight-line poll interval.
 const POLL_INTERVAL: u16 = 64;
 
 fn calls_runtime(opcode: Opcode) -> bool {
@@ -1538,9 +1541,8 @@ impl Emitter<'_> {
             // root-synchronizing poll before its edge moves -- but only on
             // every POLL_INTERVAL'th crossing. The poll is a call into Rust
             // AND a full shadow-root synchronisation of every live value, so
-            // paying it per iteration set this backend's loop floor; x86-64
-            // polls on an interval too (emit.rs POLL_INTERVAL). Skipping the
-            // other crossings bounds, rather than removes, the latency of
+            // paying it per iteration set this backend's loop floor. Skipping
+            // the other crossings bounds, rather than removes, the latency of
             // everything the poll services -- a stop-the-world request, a
             // signal, a fiber yield -- which is why this is a cadence change
             // and not an inline flag test: no condition the runtime poll
