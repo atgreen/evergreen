@@ -23,6 +23,11 @@
 
 ### Performance
 
+- T2 on x86-64 Linux omits redundant implicit polls within guarded eight-byte
+  stores, retaining precise moving-GC roots and interrupt checks before and
+  after each bounded operation
+  ([#706](https://github.com/atgreen/evergreen/pull/706)).
+
 - Fast native byte-array construction avoids copying constructor arguments,
   while preserving mutable type checks and public fallback
   ([#705](https://github.com/atgreen/evergreen/pull/705)).
