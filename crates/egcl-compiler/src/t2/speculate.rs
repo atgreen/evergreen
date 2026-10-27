@@ -2857,6 +2857,7 @@ mod tests {
     // An unknown argument selects either literal, then the join is consumed twice.
     // This deliberately exercises the bytecode producer and its TOP-declared phi,
     // rather than manufacturing a narrowed parameter in the test.
+    #[cfg(target_arch = "x86_64")]
     fn numeric_join_from_bytecode(left: TypeBits, right: TypeBits) -> (Function, Inst) {
         use egcl_rt::bytecode::{BytecodeFunction, Instr};
         use egcl_rt::value::EgclVal;
