@@ -212,3 +212,22 @@ fn empty_features_does_not_enable_bootstrap_defaults() {
       (format t "DISPATCH-OK~%")
     "##);
 }
+
+/// A string ends at the character that opened it, and any character with
+/// single-escape syntax quotes the next one inside it (CLHS 2.4.5): both
+/// roles can be given to another character by SET-SYNTAX-FROM-CHAR (ansi
+/// set-syntax-from-char.double-quote, .single-escape.2).
+#[test]
+fn strings_honor_syntax_copied_by_set_syntax_from_char() {
+    run(r##"
+      (let ((*readtable* (copy-readtable nil)))
+        (set-syntax-from-char #\% #\")
+        (assert (equal (read-from-string "%abc%") "abc"))
+        (assert (equal (read-from-string "%a\"b%") "a\"b"))
+        (set-syntax-from-char #\! #\\)
+        (assert (equal (read-from-string "\"x!\"y\"") "x\"y"))
+        (assert (equal (read-from-string "\"p\\q\"") "pq")))
+      (assert (equal (read-from-string "\"plain\\\"text\"") "plain\"text"))
+      (format t "DISPATCH-OK~%")
+    "##);
+}
