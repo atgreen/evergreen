@@ -14223,6 +14223,16 @@ fn stdlib_format_apply_hook(func: EgclVal, args: &[EgclVal]) -> Result<EgclVal, 
         ));
     }
     egcl_rt::rooted!(func = func);
+    // FORMAT's indirection directives accept function objects, not arbitrary
+    // evaluator forms.  In particular, `apply_function` deliberately accepts
+    // a raw `(LAMBDA ...)` form as an internal extension, but FUNCTIONP (and
+    // the FORMAT contract) does not classify that list as a function.
+    if !is_function_value(*func) {
+        return Err(EgclError::TypeError {
+            datum: *func,
+            expected: "FUNCTION".into(),
+        });
+    }
     let args = RootedVals::new(args.to_vec());
     // Safety: the parked pointer is the live print-entry &mut Env (as in
     // stdlib_print_object_hook); printing is single-threaded.
