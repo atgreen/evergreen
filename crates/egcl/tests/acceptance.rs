@@ -10086,6 +10086,27 @@ fn hash_s_slot_names_are_string_designators() {
     );
 }
 
+/// A #S string slot designator is interned as an exact keyword name rather
+/// than parsed as reader/package syntax. In particular, "A:B" designates the
+/// keyword whose name contains a colon and the structure slot named |A:B|.
+#[test]
+fn hash_s_slot_names_preserve_package_marker_characters() {
+    let prog = r#"(progn
+        (defstruct sds-exact |A:B|)
+        (let ((v (read-from-string "#S(sds-exact \"A:B\" value)")))
+          (format t "SDS-EXACT=~s~%" (slot-value v '|A:B|))))"#;
+    let out = egcl_bin()
+        .args(["--eval", prog])
+        .output()
+        .expect("run egcl");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("SDS-EXACT=VALUE"),
+        "#S must preserve exact string-designator slot names; got: '{stdout}', stderr: '{}'",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// DEFSTRUCT instances print in readable #S(NAME :slot val …) syntax (both the
 /// prin1 builtin and prin1-to-string agree), with inherited :include slots
 /// included in precedence order. (bliss-i1i9)

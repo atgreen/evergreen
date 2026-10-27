@@ -207,6 +207,10 @@
   another package re-exports them, independent of package registry order
   ([#698](https://github.com/atgreen/evergreen/pull/698)).
 
+- `#S` structure literals accept character and string designators for slot
+  names, including names that contain package-marker characters
+  ([#694](https://github.com/atgreen/evergreen/pull/694)).
+
 - `NOTINLINE` declarations remain effective through native specialization,
   while preserving argument evaluation and lookup of redefined functions
   ([#703](https://github.com/atgreen/evergreen/pull/703)).
