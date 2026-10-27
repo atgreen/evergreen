@@ -145,6 +145,53 @@ measurement overhead and makes no hard real-time guarantee. On Linux,
 soft-dirty tracking can cause first-write page faults during later execution;
 that system-time cost falls outside the recorded collection pause.
 
+## GC root-scanner timing { #gc-root-scanner-timing }
+
+Set `EGCL_GC_ROOT_PHASE_LOG` before startup to attribute root-scanning work.
+It is off by default and caches presence on first use: even `=0` enables it.
+It works independently of `EGCL_GC_PHASE_LOG`.
+
+```sh
+EGCL_GC_ROOT_PHASE_LOG=1 scripts/egcl-limited.sh \
+  target/x86_64-unknown-linux-musl/release/egcl --no-init --load workload.lisp \
+  2>gc-roots.log
+```
+
+Each `[gc-root-phases]` line has a kind followed by decimal
+`pass`, `minor`, `scanner`, `anchor`, and `elapsed_ns` fields:
+
+| Kind | Interval |
+| --- | --- |
+| `external_scanner` | One registered external root scanner, including its original visitor's work |
+| `minor_mark_cl_stack` / `minor_mark_symbols` | Minor-GC stack or symbol root marking |
+| `minor_relocate_cl_stack` / `minor_relocate_symbols` | Minor-GC stack or symbol root relocation |
+
+`pass` is the existing external root-scan epoch, not a collection number.
+Stack and symbol intervals precede external enumeration and retain the preceding
+epoch. `minor` identifies the attempted minor collection for those intervals;
+external scanners report `minor=0`, including when called by a major collection,
+verification, or a snapshot. Use pass and log order to group scanner invocations.
+`scanner=0` denotes a stack or symbol interval.
+
+For external scanners, `scanner` is the runtime function address. `anchor` is
+the runtime address of `egcl_rt::gc::root_scanners`. Keep the exact unstripped
+binary and its hash, then locate that anchor's link-time address:
+
+```sh
+nm -anC path/to/egcl | rg 'egcl_rt::gc::root_scanners$'
+```
+
+Subtract the link-time anchor from the logged anchor to obtain the ASLR slide.
+Subtract that slide from the logged scanner address, convert the result to hex,
+and resolve it with `addr2line -Cfipe path/to/egcl 0xADDRESS`.
+
+Each interval excludes formatting and writing its own line. Enclosing GC phase
+and pause measurements include that output overhead. These intervals are not a
+complete partition: entry-continuation roots, remembered roots, and scanner-list
+setup are not separately attributed. Use this log to locate work, then benchmark
+with both diagnostic flags unset; do not treat instrumented timings as an
+uninstrumented performance result.
+
 ## Allocation and measurement discipline
 
 `room` measures Lisp-heap activity. Rust strings, vectors, hash maps, and other
