@@ -3963,6 +3963,7 @@ fn format_exponential_sign_width_and_scale() {
         ("(format nil \"~6@e\" 1.0)", "\"+1.e+0\""),
         ("(format nil \"~7,2@e\" 0.5)", "\"+5.00e-1\""),
         ("(format nil \"~6,2,,,'*e\" 0.5)", "\"******\""),
+        ("(format nil \"~0,2,,,'*e\" 0.5)", "\"\""),
         ("(format nil \"~,2,,2e\" 0.05)", "\"50.0e-3\""),
         ("(format nil \"~,2,,3e\" 0.05)", "\"500.e-4\""),
         ("(format nil \"~10e\" 1.0)", "\"    1.0e+0\""),
