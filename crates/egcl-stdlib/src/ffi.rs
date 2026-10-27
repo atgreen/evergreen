@@ -209,13 +209,18 @@ fn offset(value: EgclVal) -> Result<isize, EgclError> {
 }
 
 fn vector_layout(vector: EgclVal, ty: &AlienType) -> Result<(usize, usize), EgclError> {
-    let vector_kind = vector.is_heap_object()
-        && unsafe {
-            matches!(
-                (*(vector.as_ptr() as *const ObjectHeader)).type_id(),
-                type_id::SIMPLE_VECTOR | type_id::COMPLEX_ARRAY
-            )
-        };
+    // Specialized (UNSIGNED-BYTE 8) and DOUBLE-FLOAT vectors have their own
+    // packed representations; AREF and SET-AREF read and write them, so the
+    // copy in and out below works on them unchanged.
+    let vector_kind = egcl_rt::packed_u8::is_vector(vector)
+        || egcl_rt::packed_f64::is_vector(vector)
+        || vector.is_heap_object()
+            && unsafe {
+                matches!(
+                    (*(vector.as_ptr() as *const ObjectHeader)).type_id(),
+                    type_id::SIMPLE_VECTOR | type_id::COMPLEX_ARRAY
+                )
+            };
     if !vector_kind
         || !matches!(
             ty,
