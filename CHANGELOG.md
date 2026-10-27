@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Changed
+
+- x86 T2 omits unreachable instruction recovery stubs after range and type
+  proofs remove their branches, reducing generated code while retaining live
+  deoptimization and OSR recovery
+  ([#715](https://github.com/atgreen/evergreen/pull/715)).
+
 ### Added
 
 - Optional GC root-scanner timings attribute stack, symbol, and individual
