@@ -4398,6 +4398,18 @@ fn read_nd_array_literal_and_equalp_roundtrip() {
             "(handler-case (read-from-string \"#2A((1 2) (3))\") (error () :err))",
             ":ERR",
         ),
+        // A bit vector supplies a level like any sequence, and an empty level
+        // gives the axes below it length 0 (syntax.sharp-a.7, .18, .22-23).
+        ("(coerce (read-from-string \"#1a#*000110\") 'list)", "(0 0 0 1 1 0)"),
+        ("(array-dimensions (read-from-string \"#2anil\"))", "(0 0)"),
+        ("(array-dimensions (read-from-string \"#2a\\\"\\\"\"))", "(0 0)"),
+        ("(array-dimensions (read-from-string \"#2a#*\"))", "(0 0)"),
+        ("(array-dimensions (read-from-string \"#3a()\"))", "(0 0 0)"),
+        ("(array-dimensions (read-from-string \"#2a(())\"))", "(1 0)"),
+        (
+            "(handler-case (read-from-string (format nil \"#~DA()\" array-rank-limit)) (reader-error () :reader-error) (error () :wrong-error))",
+            ":READER-ERROR",
+        ),
     ];
     for (expr, expected) in cases {
         let out = egcl_bin()

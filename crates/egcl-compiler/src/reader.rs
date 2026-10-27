@@ -816,6 +816,12 @@ fn read_nd_array_literal(
     depth: usize,
     rank: u32,
 ) -> Result<(EgclVal, usize), EgclError> {
+    if rank >= egcl_rt::types::ARRAY_RANK_LIMIT {
+        return Err(EgclError::StreamError(format!(
+            "illegal #nA array rank {rank}: must be less than ARRAY-RANK-LIMIT ({})",
+            egcl_rt::types::ARRAY_RANK_LIMIT,
+        )));
+    }
     pos = skip_whitespace_and_comments(chars, pos)?;
     let (mut contents, p) = read_token_with_base(
         chars,
@@ -831,6 +837,10 @@ fn read_nd_array_literal(
     let mut dims: Vec<usize> = Vec::new();
     egcl_rt::rooted!(flat = Vec::<EgclVal>::new());
     nd_collect(contents, rank, 0, &mut dims, &mut flat)?;
+    // An empty level leaves the axes below it unvisited; they have length 0,
+    // so #2a() / #2anil / #2a"" read as a 0x0 array, not a rank-1 one
+    // (syntax.sharp-a.18, .22-23).
+    dims.resize(rank as usize, 0);
     // Rank 1 is a SIMPLE_VECTOR; rank 0 and rank ≥ 2 are real MD_ARRAY objects
     // (rank-0 has empty dims and a single-element row-major storage, matching
     // `(make-array nil)` → %make-md-array in boot.lisp). Conflating rank 0 with
@@ -875,8 +885,10 @@ fn nd_collect(
     Ok(())
 }
 
-/// The elements of a list, simple vector or string, in order; None for a
-/// non-sequence.
+/// The elements of a list, simple vector, bit vector or string, in order;
+/// None for a non-sequence. (A vector with a fill pointer, or an adjustable
+/// or displaced one, is not read here: its element accessors live in
+/// egcl-stdlib, which this crate cannot reach.)
 fn sequence_items(node: EgclVal) -> Option<Vec<EgclVal>> {
     if node == NIL {
         return Some(Vec::new());
@@ -893,6 +905,13 @@ fn sequence_items(node: EgclVal) -> Option<Vec<EgclVal>> {
     }
     if node.is_string() {
         return Some(node.as_string().chars().map(EgclVal::from_char).collect());
+    }
+    if let Some(length) = egcl_rt::types::bit_vector_len(node) {
+        return Some(
+            (0..length)
+                .map(|i| EgclVal::from_fixnum(i64::from(egcl_rt::types::bit_vector_ref(node, i).unwrap_or(0))))
+                .collect(),
+        );
     }
     if node.is_heap_object() {
         unsafe {

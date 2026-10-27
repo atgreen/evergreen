@@ -9,6 +9,9 @@
 use crate::object::{ElementTypeTag, ObjectHeader, type_id};
 use crate::value::EgclVal;
 
+/// Exclusive upper bound on array rank, exposed to Lisp as ARRAY-RANK-LIMIT.
+pub const ARRAY_RANK_LIMIT: u32 = 8;
+
 /// Extract the `type_id` from a heap object's header.
 ///
 /// # Safety
