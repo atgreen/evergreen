@@ -1222,6 +1222,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#hash-table-minor-roots" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Hash-table minor-root tracking
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#allocation-and-measurement-discipline" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2087,6 +2098,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#hash-table-minor-roots" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Hash-table minor-root tracking
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#allocation-and-measurement-discipline" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2314,6 +2336,31 @@ complete partition: entry-continuation roots, remembered roots, and scanner-list
 setup are not separately attributed. Use this log to locate work, then benchmark
 with both diagnostic flags unset; do not treat instrumented timings as an
 uninstrumented performance result.</p>
+<h2 id="hash-table-minor-roots">Hash-table minor-root tracking<a class="headerlink" href="#hash-table-minor-roots" title="Permanent link">&para;</a></h2>
+<p>By default, EGCL tracks whether a hash table's off-heap entries need another
+minor-GC root traversal. Construction and <code>(SETF GETHASH)</code> mark the table dirty.
+Marking leaves it dirty; only a completed minor relocation traversal clears it.
+Unchanged tables can then skip their strong entry-root traversal until another
+write. Weak-entry cleanup still runs on every collection.</p>
+<p>This relies on the current minor collector collecting only the nursery:
+references into Survivor and OldGen regions are outside that collection.
+After minor relocation, surviving entry references no longer point into the
+nursery. This tracking changes neither reachability nor root-scan epochs.
+Major collections, snapshots, and verification retain full conservative scans
+and mark tables dirty again. Consequently, verification can prevent the skips
+that an ordinary run would make; do not expect identical scan counts with
+verification enabled.</p>
+<p>For a diagnostic comparison, <code>EGCL_DISABLE_HASH_TABLE_ROOT_TRACKING</code> restores
+full entry-root traversals. It caches presence on first use, so <code>=0</code> also
+<strong>disables</strong> tracking. Use fresh processes and the same binary for both arms,
+and leave GC timing logs unset when measuring performance:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>env<span class="w"> </span>-u<span class="w"> </span>EGCL_GC_PHASE_LOG<span class="w"> </span>-u<span class="w"> </span>EGCL_GC_ROOT_PHASE_LOG<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a><span class="w">  </span>-u<span class="w"> </span>EGCL_DISABLE_HASH_TABLE_ROOT_TRACKING<span class="w"> </span>scripts/egcl-limited.sh<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a><span class="w">  </span>target/x86_64-unknown-linux-musl/release/egcl<span class="w"> </span>--no-init<span class="w"> </span>--load<span class="w"> </span>workload.lisp
+<a id="__codelineno-7-4" name="__codelineno-7-4" href="#__codelineno-7-4"></a>env<span class="w"> </span>-u<span class="w"> </span>EGCL_GC_PHASE_LOG<span class="w"> </span>-u<span class="w"> </span>EGCL_GC_ROOT_PHASE_LOG<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-7-5" name="__codelineno-7-5" href="#__codelineno-7-5"></a><span class="w">  </span><span class="nv">EGCL_DISABLE_HASH_TABLE_ROOT_TRACKING</span><span class="o">=</span><span class="m">1</span><span class="w"> </span>scripts/egcl-limited.sh<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-7-6" name="__codelineno-7-6" href="#__codelineno-7-6"></a><span class="w">  </span>target/x86_64-unknown-linux-musl/release/egcl<span class="w"> </span>--no-init<span class="w"> </span>--load<span class="w"> </span>workload.lisp
+</code></pre></div>
 <h2 id="allocation-and-measurement-discipline">Allocation and measurement discipline<a class="headerlink" href="#allocation-and-measurement-discipline" title="Permanent link">&para;</a></h2>
 <p><code>room</code> measures Lisp-heap activity. Rust strings, vectors, hash maps, and other
 host allocations can dominate execution time independently. The contributor
