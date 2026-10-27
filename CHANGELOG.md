@@ -31,6 +31,11 @@
 
 ### Performance
 
+- Minor GC can omit duplicate global symbol-cell walks after proving that the
+  old-object scan covers every registered symbol, with conservative fallback
+  for unsupported inventories
+  ([#712](https://github.com/atgreen/evergreen/pull/712)).
+
 - Unchanged hash tables can skip repeated strong entry-root scans during minor
   GC, while preserving full major and inspection scans and weak-entry cleanup
   ([#711](https://github.com/atgreen/evergreen/pull/711)).
