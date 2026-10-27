@@ -4340,9 +4340,9 @@ fn format_impl(
                 //                    previously falling through to the absolute
                 //                    computation, so `ab~3@Tx` emitted one space
                 //                    instead of three.
-                // ~:T and ~:@T are PPRINT-TAB (CLHS 22.3.5.2), which does
-                // nothing unless *PRINT-PRETTY* is true (ansi format.:t.2-3,
-                // format.:@t.4-5).
+                // ~:T and ~:@T are PPRINT-TAB (CLHS 22.3.5.2): they apply only
+                // inside a logical block while *PRINT-PRETTY* is true (ansi
+                // format.:t.2-3, format.:@t.4-5).
                 let first = if !params.is_empty() {
                     resolve_param(&params[0], 1, arg_idx)?.clamp(0, u32::MAX as i64) as u32
                 } else {
