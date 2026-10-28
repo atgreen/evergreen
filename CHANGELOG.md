@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- Callable standard comment readers return zero values, so custom list readers
+  skip comments without inserting spurious `NIL` elements
+  ([#767](https://github.com/atgreen/evergreen/pull/767)).
+
 - `SUBTYPEP` preserves both type operands when integer-type canonicalization
   triggers a moving collection, preventing incorrect range comparisons under
   allocation pressure ([#766](https://github.com/atgreen/evergreen/pull/766)).
