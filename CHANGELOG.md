@@ -4,6 +4,11 @@
 
 ### Changed
 
+- Source closures expand captured macros and user-defined `SETF` places before
+  bytecode compilation, and loop bodies can enter tiered execution on their
+  first invocation, including CFFI callbacks
+  ([#743](https://github.com/atgreen/evergreen/pull/743)).
+
 - Bytecode calls constant quoted global function names directly while retaining
   normal argument evaluation, redefinition and lexical function semantics
   ([#740](https://github.com/atgreen/evergreen/pull/740)).
