@@ -11,6 +11,7 @@ use egcl_stdlib::sequences;
 #[test]
 fn adjustable_md_commit_relocates_new_backing_and_dimensions_and_rejects_partial_updates() {
     // This integration binary has one test, and owns explicit minor collections.
+    let _ = egcl_rt::packed_u8::make(0, 0).unwrap();
     egcl_rt::gc::collect_t0_minor().unwrap();
     egcl_rt::rooted!(
         storage = sequences::build_complex_vector(

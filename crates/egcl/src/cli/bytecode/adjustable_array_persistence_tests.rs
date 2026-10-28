@@ -38,9 +38,16 @@ fn adjustable_md_storage_graph_preserves_displacement_and_updates_through_aliase
         .expect("adjustable graph must be portable");
     assert!(pool.entries.iter().any(|bytes| bytes.first() == Some(&25)));
     assert!(pool.entries.iter().any(|bytes| bytes.first() == Some(&26)));
+    let md_reference = pool
+        .value(*md)
+        .expect("a direct MD root must use the same graph entry");
     let constants = parse_pool(&pool);
     egcl_rt::rooted!(values = materialize_bbu_constants(&constants).unwrap());
     egcl_rt::rooted!(restored = values[reference as usize]);
+    assert_eq!(
+        egcl_stdlib::elt(*restored, 2).unwrap(),
+        values[md_reference as usize]
+    );
     egcl_rt::rooted!(base = egcl_stdlib::elt(*restored, 0).unwrap());
     egcl_rt::rooted!(view = egcl_stdlib::elt(*restored, 1).unwrap());
     egcl_rt::rooted!(md = egcl_stdlib::elt(*restored, 2).unwrap());
@@ -73,6 +80,7 @@ fn array_pool_identity_survives_movement_and_does_not_merge_equal_mutable_backin
     let _lock = super::super::heap_test_lock()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
+    let _ = egcl_rt::packed_u8::make(0, 0).unwrap(); // Initialize the isolated test process's heap.
     egcl_rt::gc::collect_t0_minor().unwrap();
     egcl_rt::rooted!(
         first = egcl_stdlib::build_complex_vector(

@@ -10799,11 +10799,11 @@ impl BbuConstPool {
 
     fn value(&mut self, v: EgclVal) -> Option<u32> {
         // Mutable wrappers must retain identity with the saved image heap.
-        if self.saved_heap_refs && egcl_rt::types::arrayp(v) {
+        if self.saved_heap_refs && (egcl_rt::types::arrayp(v) || egcl_rt::types::md_array_p(v)) {
             let mut bytes = vec![21]; put_u64(&mut bytes, v.to_raw());
             return Some(self.intern_encoded(bytes));
         }
-        let aggregate = v.is_cons() || egcl_rt::types::arrayp(v);
+        let aggregate = v.is_cons() || egcl_rt::types::arrayp(v) || egcl_rt::types::md_array_p(v);
         if !aggregate {
             return self.value_leaf(v);
         }

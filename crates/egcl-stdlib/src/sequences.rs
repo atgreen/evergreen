@@ -1203,7 +1203,7 @@ pub fn adopt_adjusted_array(array: EgclVal, replacement: EgclVal) -> Result<Egcl
         });
     }
     let rank = |value| egcl_rt::types::md_array_rank(value).map_or(1, |r| r.as_fixnum());
-    if !egcl_rt::types::arrayp(replacement)
+    if !(egcl_rt::types::arrayp(replacement) || egcl_rt::types::md_array_p(replacement))
         || rank(array) != rank(replacement)
         || array_element_kind(array) != array_element_kind(replacement)
     {

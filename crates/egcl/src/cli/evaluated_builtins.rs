@@ -3661,7 +3661,9 @@ fn resolve(name: &str) -> Option<Handler> {
                 let arr = args[0];
                 // The public wrapper constructs and validates a complete
                 // replacement before this nonallocating in-place commit.
-                if args.len() == 2 && egcl_rt::types::arrayp(args[1]) {
+                if args.len() == 2
+                    && (egcl_rt::types::arrayp(args[1]) || egcl_rt::types::md_array_p(args[1]))
+                {
                     return egcl_stdlib::sequences::adopt_adjusted_array(arr, args[1]);
                 }
                 let new_size = if args[1].is_fixnum() {
