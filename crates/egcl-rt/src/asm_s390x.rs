@@ -117,6 +117,19 @@ impl Asm {
         self.rre(0xb317, dst, src);
     }
 
+    /// CEBR: short (single) BFP compare, setting the condition code to 0 for
+    /// equal, 1 for `dst < src`, 2 for `dst > src` and 3 for UNORDERED -- so a
+    /// NaN is distinguishable from an ordering, which the comparison arm
+    /// relies on. Verified against llvm-mc -triple=s390x-linux-gnu.
+    pub fn compare_single(&mut self, dst: u8, src: u8) {
+        self.rre(0xb309, dst, src);
+    }
+
+    /// CDBR: long (double) BFP compare, with the same condition codes.
+    pub fn compare_double(&mut self, dst: u8, src: u8) {
+        self.rre(0xb319, dst, src);
+    }
+
     pub fn shift_right_signed(&mut self, dst: u8, src: u8, bits: u8) {
         assert!(dst < 16 && src < 16 && bits < 64);
         self.code
