@@ -461,13 +461,20 @@
 
 (defun nocap-lambda () (let ((f (lambda (x) (+ x 1)))) (funcall f 1)))
 (defun mapcar-lambda (l) (mapcar (lambda (x) (* x 2)) l))
-(defun make-tagger () (lambda (x) (list x :tagged)))
+;; Noncapturing FUNCTION identities may be shared. Fresh identity matters when
+;; closures own distinct mutable bindings; retain that stronger invariant here.
+(defun make-tagger ()
+  (let ((tag :tagged))
+    (lambda (x) (prog1 (list x tag) (setq tag :used)))))
 
 (check :nocap-lambda (let ((acc 0)) (dotimes (i 30 acc) (incf acc (nocap-lambda)))))
 (check :mapcar-lambda (let ((acc nil)) (dotimes (i 30 acc) (setq acc (mapcar-lambda (list i 2 3))))))
 (check :fresh-closures
        (let ((a (make-tagger)) (b (make-tagger)))
-         (list (eq a b) (funcall a 1) (funcall b 2))))
+         (let ((result (list (eq a b) (funcall a 1) (funcall b 2))))
+           (assert (equal '(3 :used) (funcall a 3)))
+           (assert (equal '(4 :used) (funcall b 4)))
+           result)))
 
 ;; A hot nested lambda creating a closure that exits to a block/tag the
 ;; enclosing function established (bliss-ku9w review).

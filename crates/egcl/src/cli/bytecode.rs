@@ -142,6 +142,7 @@ mod call_table_native;
 #[cfg(all(target_arch = "x86_64", unix))]
 mod call_table_funcall;
 mod quoted_funcall;
+mod closure_templates;
 use super::control_payload::ControlPayload;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 use super::control_payload::reserve_control_values;
@@ -518,6 +519,7 @@ fn trace_private_function_roots(
 fn scan_bytecode_roots(visit: &mut dyn FnMut(*mut EgclVal)) {
     // SAFETY: the collector stopped every execution, including suspended fibers.
     unsafe {
+        closure_templates::clear_for_collection();
         call_table::scan(visit);
         #[cfg(all(target_arch = "x86_64", unix))]
         call_table_funcall::scan_contexts(visit);
@@ -14584,27 +14586,88 @@ pub(super) fn make_bytecode_closure(
     nested: &Arc<BytecodeFunction>,
     captured_env: Option<Arc<SharedCell<EnvFrame>>>,
 ) -> EgclVal {
-    // Instances retain the same template; only identity and captures differ.
-    // Root its literal pool before constructing the installed lambda list.
+    make_prepared_bytecode_closure(nested, captured_env, false).0
+}
+
+/// Production MakeClosure may share a function only when neither lexical cells
+/// nor lexical control tokens belong to the creating activation. The fresh API
+/// above remains available to callers that explicitly require a new identity.
+fn make_template_closure(
+    nested: &Arc<BytecodeFunction>,
+    captured_env: Option<Arc<SharedCell<EnvFrame>>>,
+    env: &Env,
+) -> EgclVal {
+    let (closure, control_free) = if captured_env.is_some() {
+        (make_bytecode_closure(nested, captured_env), false)
+    } else {
+        make_prepared_bytecode_closure(nested, None, true)
+    };
+    if !control_free {
+        register_closure_control(closure, env);
+    }
+    closure
+}
+
+fn make_prepared_bytecode_closure(
+    nested: &Arc<BytecodeFunction>,
+    captured_env: Option<Arc<SharedCell<EnvFrame>>>,
+    reuse: bool,
+) -> (EgclVal, bool) {
     egcl_rt::rooted!(_nested_roots = ActiveBytecodeRoot::new(nested));
-    egcl_rt::rooted!(sym = egcl_rt::symbols::make_uninterned("CLOSURE"));
+    // The caller need not expose this frame through an active activation yet.
+    // Own a precise root before pending-major or preparation allocations.
+    egcl_rt::rooted!(_capture_root = captured_env.as_ref().map(|frame| {
+        super::SuspendedFrameRoot(Arc::clone(frame))
+    }));
+    #[cfg(test)]
+    closure_templates::collect_during_preparation_for_test();
+    // MakeClosure remains a cooperation opportunity even on allocation-free
+    // hits: native loop polling may count this helper as its safepoint. Native
+    // callers already publish precise roots here for the allocating path.
+    egcl_rt::safepoint::poll_safepoint();
+    collect_requested_major_before_closure();
+    let cached = closure_templates::lookup(nested);
+    // Disabled/fresh construction needs no identity-sharing analysis. Keep the
+    // uncached comparison free of work introduced solely to justify reuse.
+    let control_free = cached.map_or_else(
+        || {
+            reuse
+                && closure_templates::enabled()
+                && captured_env.is_none()
+                && !bf_has_free_control_exit(nested)
+        },
+        |p| p.control_free,
+    );
+    let reusable = reuse && captured_env.is_none() && control_free;
+    if reusable && let Some(callable) = cached.and_then(|p| p.callable) {
+        let name = egcl_rt::function::name(callable);
+        let index = name.as_symbol_index();
+        if registry_get(index).is_some_and(|body| Arc::ptr_eq(&body, nested))
+            && egcl_rt::symbols::symbol_function(index).is_none_or(|value| value == callable || value == egcl_rt::value::UNBOUND)
+        {
+            return (callable, true);
+        }
+    }
+    egcl_rt::rooted!(lambda_list = cached.map_or(NIL, |p| p.lambda_list));
+    egcl_rt::rooted!(name = cached.map_or(NIL, |p| p.name));
+    if cached.is_none() {
+        *lambda_list = if nested.variadic { nested.params_form } else { installed_lambda_list(nested.arity) };
+        *name = arena_str("CLOSURE");
+    }
+    egcl_rt::rooted!(sym = egcl_rt::symbols::make_uninterned_with_name(*name));
     let sym_idx = sym.as_symbol_index();
     egcl_rt::rooted!(_callable_root = ActiveCallableRoot(sym_idx));
-    // Short-lived closures only die in a major collection (bliss-5ndk).
-    collect_requested_major_before_closure();
-    let lambda_list = if nested.variadic {
-        nested.params_form
-    } else {
-        installed_lambda_list(nested.arity)
-    };
     registry_put(sym_idx, Arc::clone(nested));
-    closure_bodies()
-        .borrow_mut()
-        .insert(sym_idx, Arc::clone(nested));
+    closure_bodies().borrow_mut().insert(sym_idx, Arc::clone(nested));
     if let Some(frame) = captured_env {
         closure_envs().borrow_mut().insert(sym_idx, frame);
     }
-    egcl_rt::function::alloc_interpreted(lambda_list, NIL, NIL, *sym)
+    let closure = egcl_rt::function::alloc_interpreted(*lambda_list, NIL, NIL, *sym);
+    closure_templates::remember(nested, closure_templates::Prepared {
+        lambda_list: *lambda_list, name: *name, control_free,
+        callable: reusable.then_some(closure),
+    });
+    (closure, control_free)
 }
 
 /// Lazy (deferred) compilation of top-level DEFUNs (bliss-x5y). Eagerly
@@ -18439,11 +18502,10 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                 } else {
                     None
                 };
-                let closure = make_bytecode_closure(&nested, captured);
+                let closure = make_template_closure(&nested, captured, env);
                 // Capture the lexical block/tag scope so the closure's non-local
                 // exits resolve against the tokens visible where it was created,
                 // not the dynamic stack where it is later called (bliss-4u5u).
-                register_closure_control(closure, env);
                 acts[top_idx].push_op(closure);
             }
             Instr::AllocCons => {
@@ -20394,8 +20456,7 @@ extern "C" fn c2i_make_bytecode_closure(nested: *const Arc<BytecodeFunction>, ca
 
         // The executing NativeCode retains its original bytecode body, including
         // this nested function, even if its global name is redefined meanwhile.
-        egcl_rt::rooted!(closure = make_bytecode_closure(unsafe { &*nested }, captured));
-        register_closure_control(*closure, unsafe { &*env });
+        egcl_rt::rooted!(closure = make_template_closure(unsafe { &*nested }, captured, unsafe { &*env }));
         Ok(*closure)
     }) {
         Ok(value) => value.0,
