@@ -15308,6 +15308,26 @@ fn frame_capture_names(frame: Arc<SharedCell<EnvFrame>>) -> std::collections::Ha
     captures
 }
 
+/// This is a sufficient absence proof, not free-function analysis. Use the
+/// evaluator's exact namespace keys, preserving package and uninterned identity.
+fn closure_expansion_ignores_functions(lambda_list: EgclVal, body: EgclVal, env: &Env) -> bool {
+    let names: std::collections::HashSet<String> = env.funs.borrow().keys().cloned().collect();
+    // Local SETF function names need compound-name analysis; leave them on the
+    // existing fallback rather than compare only their printed base names.
+    if names.iter().any(|name| name.starts_with('(')) { return false; }
+    let mut pending = vec![lambda_list, body];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(form) = pending.pop() {
+        if form.is_symbol() && names.contains(&sym_name(form)) { return false; }
+        if form.is_cons() && seen.insert(form.0) {
+            let (car, cdr) = cp(form);
+            pending.push(car);
+            pending.push(cdr);
+        }
+    }
+    true
+}
+
 /// Compile a hot tree-walker closure `(EGCL::CLOSURE . id)` to bytecode and
 /// reify it as a callable object under a fresh private symbol (bliss-wojl9).
 ///
@@ -15375,6 +15395,26 @@ pub(super) fn compile_tree_closure(
         }
         (lambda_list, body) = cp(rest);
     }
+    // A definition-site FLET can be incidental (for example a factory's
+    // registration helper). Expand with that namespace intact, then discard it
+    // only when no symbol anywhere in the complete expansion can name it.
+    // Including quoted data and shadowed occurrences is deliberately conservative.
+    let has_local_functions = !compile_env.funs.borrow().is_empty();
+    let mut filtered_env = has_local_functions.then(|| compile_env.clone());
+    egcl_rt::rooted_ref!(_filtered_env_root = &mut filtered_env);
+    let compile_env = if has_local_functions {
+        if !*PREEXPAND.get().expect("closure expansion policy initialized")
+            || !closure_expansion_ignores_functions(lambda_list, body, compile_env)
+        {
+            log_not_compiled(label, "closure references captured local function namespace");
+            return None;
+        }
+        let filtered = filtered_env.as_mut().expect("captured function environment");
+        filtered.funs = Arc::new(SharedCell::new(HashMap::new()));
+        &*filtered
+    } else {
+        compile_env
+    };
     let captures = frame_capture_names(Arc::clone(&frame));
     let enclosing_blocks: std::collections::HashSet<String> =
         blocks.iter().map(|(name, _)| name.clone()).collect();
@@ -15424,6 +15464,10 @@ pub(super) fn compile_tree_closure(
         );
         return None;
     };
+    if has_local_functions && contains_host_eval(&bf) {
+        log_not_compiled(label, "closure local namespace requires host evaluation");
+        return None;
+    }
     egcl_rt::rooted!(_bytecode_root = ActiveBytecodeRoot::new(&bf));
     // Short-lived closures only die in a major collection (bliss-5ndk).
     collect_requested_major_before_closure();

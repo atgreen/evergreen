@@ -13866,8 +13866,8 @@ fn settled_tree_closure(id: u64) -> Option<EgclVal> {
 /// T1/T2 however hot it became. Compiling its LAMBDA against its captured heap
 /// frame yields the same kind of closure a compiled creator returns; later
 /// calls of the cons dispatch to it. A closure is compiled only when it is
-/// self-contained: no local SPECIAL declarations, and no captured FLET/LABELS
-/// namespace (a compiled named call cannot reach a tree-walker local function).
+/// self-contained: no local SPECIAL declarations, and no references to its
+/// captured FLET/LABELS namespace after definition-site macroexpansion.
 fn tree_closure_tier_up(id: u64, env: &Env) -> Option<EgclVal> {
     // The forced tree-walker (the differential oracle) never compiles.
     if cfg!(egcl_no_tree_walker)
@@ -13915,7 +13915,7 @@ fn tree_closure_tier_up(id: u64, env: &Env) -> Option<EgclVal> {
             "closure {id}: tiering declined: no captured function namespace");
         return None;
     };
-    if !closure.captured_specials.is_empty() || !funs.borrow().is_empty() {
+    if !closure.captured_specials.is_empty() {
         egcl_rt::blog!("compile", egcl_rt::log::TRACE,
             "closure {id}: tiering declined: {} captured special declarations, {} local functions",
             closure.captured_specials.len(), funs.borrow().len());
