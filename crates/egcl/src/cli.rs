@@ -5732,11 +5732,16 @@ fn egcl_error_to_condition(
             //     (an unmatched `)`, an unknown `#` dispatch, a bad token).
             //   * STREAM-ERROR  — a real I/O fault (broken pipe, closed stream).
             let m = msg.to_ascii_lowercase();
-            let is_eof = m.starts_with("unterminated")
-                || m.contains("end of file")
-                || m.contains("unexpected end")
-                || m.contains("eof")
-                || m == "trailing single escape";
+            // Names inside package errors may themselves contain "EOF" or
+            // "unterminated"; their spelling does not change the condition.
+            let package_reader_error = m.starts_with("no external symbol ")
+                || m.starts_with("package not found: ");
+            let is_eof = !package_reader_error
+                && (m.starts_with("unterminated")
+                    || m.contains("end of file")
+                    || m.contains("unexpected end")
+                    || m.contains("eof")
+                    || m == "trailing single escape");
             let is_reader = !is_eof
                 && (m.contains("dispatch")
                     || m.contains("dot")
@@ -14634,6 +14639,24 @@ fn reader_package_resolver(prefix: &str) -> Option<String> {
     egcl_stdlib::package_name(actual)
 }
 
+/// Resolve a single-colon token against the authoritative export table.
+/// Package prefixes and symbol names have already undergone reader case and
+/// local-nickname processing. Ordinary lookups and errors allocate Rust storage
+/// only; KEYWORD and its nicknames retain the reader's keyword constructor.
+fn reader_external_symbol_resolver(pkg: &str, name: &str) -> Result<EgclVal, EgclError> {
+    let package = egcl_stdlib::find_package(pkg)
+        .ok_or_else(|| EgclError::StreamError(format!("package not found: {pkg}")))?;
+    if egcl_stdlib::package_name_eq(package, "KEYWORD") {
+        return Ok(reader::intern_keyword_symbol(name));
+    }
+    match egcl_stdlib::find_symbol(name, package)? {
+        Some((symbol, egcl_stdlib::InternStatus::External)) => Ok(symbol),
+        _ => Err(EgclError::StreamError(format!(
+            "no external symbol {name:?} in package {pkg:?}"
+        ))),
+    }
+}
+
 fn reader_symbol_resolver(pkg: Option<&str>, name: &str) -> Option<u32> {
     let ptr = READ_EVAL_ENV.with(|c| c.get());
     if ptr.is_null() || RESOLVING_SYMBOL.with(|c| c.get()) {
@@ -15010,6 +15033,7 @@ fn read_eval_all_env(source: &str, env: &mut Env) -> Result<EgclVal, EgclError> 
     reader::set_plain_macro_invoker(Some(reader_plain_macro_invoker));
     reader::set_readtable_getter(Some(cli_current_readtable));
     reader::set_symbol_resolver(Some(reader_symbol_resolver));
+    reader::set_external_symbol_resolver(Some(reader_external_symbol_resolver));
     reader::set_package_resolver(Some(reader_package_resolver));
     reader::set_pathname_constructor(Some(reader_pathname_constructor));
     reader::set_struct_constructor(Some(reader_struct_constructor));

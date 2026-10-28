@@ -21,6 +21,7 @@
 //! * `set_readtable_getter` — the current `*readtable*` object.
 //! * `set_symbol_resolver` — package-aware symbol resolution for
 //!   `pkg:sym` / `pkg::sym` / `:keyword` tokens.
+//! * `set_external_symbol_resolver` — non-interning export lookup for `pkg:sym`.
 //! * `set_pathname_constructor` / `set_struct_constructor` — `#P` and `#S`.
 //!
 //! # Entry points
@@ -108,6 +109,13 @@ const MAX_READER_NESTING: usize = 4096;
 
 pub fn intern_symbol(name: &str) -> u32 {
     egcl_rt::symbols::intern(name)
+}
+
+/// The reader's keyword constructor, shared with package-resolution hooks that
+/// recognize a nickname for KEYWORD. A keyword prefix always interns.
+pub fn intern_keyword_symbol(name: &str) -> EgclVal {
+    let index = intern_symbol(&egcl_rt::symbols::keyword_registry_key(name));
+    EgclVal::from_symbol_index(index)
 }
 
 /// Look up an already-interned symbol index by name WITHOUT interning it.
@@ -396,6 +404,26 @@ pub fn set_symbol_resolver(hook: Option<SymbolResolver>) {
 fn resolve_symbol_via_hook(pkg: Option<&str>, name: &str) -> Option<u32> {
     let hook = *SYMBOL_RESOLVER.lock().unwrap();
     hook.and_then(|h| h(pkg, name))
+}
+
+// The package registry owns export status. Keep this lookup separate from the
+// interning resolver: failure to find an external symbol must never fall back
+// to creating a new internal one. Bootstrap-only readers without a package
+// system retain their existing registry-key resolution.
+type ExternalSymbolResolver = fn(&str, &str) -> Result<EgclVal, EgclError>;
+static EXTERNAL_SYMBOL_RESOLVER: OrderedMutex<Option<ExternalSymbolResolver>> =
+    OrderedMutex::new(LockLevel::CodeCache, 13, "reader external symbol resolver", None);
+
+pub fn set_external_symbol_resolver(hook: Option<ExternalSymbolResolver>) {
+    *EXTERNAL_SYMBOL_RESOLVER.lock().unwrap() = hook;
+}
+
+fn resolve_external_symbol_via_hook(
+    pkg: &str,
+    name: &str,
+) -> Option<Result<EgclVal, EgclError>> {
+    let hook = *EXTERNAL_SYMBOL_RESOLVER.lock().unwrap();
+    hook.map(|resolve| resolve(pkg, name))
 }
 
 // ── Package-local nicknames ───────────────────────────────────────
@@ -2657,6 +2685,14 @@ fn try_package_qualified(
         // ask it for the canonical name first, then match as before.
         let local = resolve_package_via_hook(pkg);
         let pkg = local.as_deref().unwrap_or(pkg);
+        // A leading ':' and an explicit KEYWORD prefix retain keyword
+        // interning. Every other single-colon token denotes an already
+        // external symbol, including the otherwise special-cased CL/EGCL.
+        if !internal
+            && let Some(symbol) = resolve_external_symbol_via_hook(pkg, sym_name)
+        {
+            return symbol.map(Some);
+        }
         // Known packages: CL, KEYWORD, EGCL, COMMON-LISP
         match pkg {
             "CL" | "COMMON-LISP" => {
@@ -2670,9 +2706,7 @@ fn try_package_qualified(
                 Ok(Some(EgclVal::from_symbol_index(idx)))
             }
             "KEYWORD" => {
-                let full = egcl_rt::symbols::keyword_registry_key(sym_name);
-                let idx = intern_symbol(&full);
-                Ok(Some(EgclVal::from_symbol_index(idx)))
+                Ok(Some(intern_keyword_symbol(sym_name)))
             }
             "EGCL" => {
                 let full = format!("EGCL::{}", sym_name);

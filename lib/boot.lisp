@@ -4757,10 +4757,46 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
 ;;; loading; they can be wired to real system info later.
 ;;; ---------------------------------------------------------------------------
 
+;;; Existing public native extension entry points have implementations in the
+;;; evaluator rather than DEFUN forms. Publish their package interface before
+;;; any qualified reference is read, just as DEFPACKAGE does for Lisp code.
+(export (mapcar (lambda (name) (intern name "EGCL-EXT"))
+                '(
+                  "BAIL-REPORT" "CANCEL-FINALIZATION" "CHDIR"
+                  "CRC32" "CRYPTO-AES-DECRYPT-BLOCK" "CRYPTO-AES-ENCRYPT-BLOCK"
+                  "CRYPTO-GHASH-MUL" "CRYPTO-KECCAK-ABSORB" "CRYPTO-KECCAK-F1600"
+                  "CRYPTO-SHA256-BLOCK" "CRYPTO-SHA256-WORDS" "CRYPTO-SHA512-BLOCK"
+                  "CRYPTO-SHA512-WORDS" "DECLARATION-SPECIFIER" "DECLARATION-SPECIFIERS"
+                  "DELETE-DIRECTORY" "DEOPT-COUNT" "EMBED-FILE"
+                  "EMBEDDED-FILE-P" "EMBEDDED-FILES" "EVENTS-COUNT"
+                  "EVENTS-JSON" "EVENTS-REPORT" "EVENTS-RESET"
+                  "EVENTS-START" "EVENTS-STOP" "EVENTS-SUMMARY"
+                  "FINALIZE" "FUNCALLABLE-INSTANCE-FUNCTION" "FUNCTION-BACK-EDGE-COUNT"
+                  "FUNCTION-INVOKE-COUNT" "FUNCTION-OSR-COUNT" "FUNCTION-TIER"
+                  "GC" "GENERIC-RECEIVER-PROFILE-COUNT" "GENERIC-RECEIVER-PROFILE-DISTINCT-COUNT"
+                  "GET-PRECISE-TIME" "GETCWD" "GETENV"
+                  "HASH-TABLE-SYNCHRONIZED-P" "HASH-TABLE-WEAKNESS" "INFLATE"
+                  "INTERRUPT-CONDITION" "IO-TIMEOUT" "MACROEXPAND-ALL"
+                  "PROCLAIMED-DECLARATIONS" "PROCLAIMED-OPTIMIZE" "PROFILE"
+                  "PROFILE-REPORT" "PROFILE-REPORT-CALLS" "PROFILE-RESET"
+                  "RAW-COMMAND-LINE-ARGUMENTS" "REAL-TIME-NANOSECONDS" "RUN-PROGRAM"
+                  "SAVE-IMAGE" "SAVE-IMAGE-AND-DIE" "SAVE-LISP-AND-DIE"
+                  "SET-FUNCALLABLE-INSTANCE-FUNCTION" "SETENV" "SHA256"
+                  "SOCKET-OS-ERROR" "SPROF-FOLD" "SPROF-START"
+                  "SPROF-STOP" "TIMEOUT-CONDITION" "UNPROFILE"
+                  "UNSETENV"))
+        "EGCL-EXT")
+
+;;; Publish the thread API before reading its qualified definitions.
 ;;; Native mutex policy lives here; %NATIVE-MUTEX delegates to the stdlib.
 (export (mapcar (lambda (name) (intern name "EGCL-THREAD"))
                 '("MAKE-THREAD" "JOIN-THREAD" "CURRENT-THREAD" "THREAD-NAME"
-                  "THREAD-ALIVE-P" "ALL-THREADS" "THREAD-YIELD"))
+                  "THREAD-ALIVE-P" "ALL-THREADS" "THREAD-YIELD"
+                  "MAKE-MUTEX" "MUTEX-P" "MUTEX" "GRAB-MUTEX"
+                  "RELEASE-MUTEX" "WITH-MUTEX"
+                  "MAKE-CONDITION-VARIABLE" "CONDITION-VARIABLE"
+                  "CONDITION-VARIABLE-P" "CONDITION-WAIT"
+                  "CONDITION-NOTIFY" "CONDITION-BROADCAST"))
         "EGCL-THREAD")
 
 (defun egcl-thread:make-mutex (&key name recursive)
@@ -4798,10 +4834,6 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
            (egcl-thread:release-mutex ,lock))
          (values-list ,results)))))
 
-(export '(egcl-thread:make-mutex egcl-thread:mutex-p egcl-thread:mutex
-          egcl-thread:grab-mutex egcl-thread:release-mutex egcl-thread:with-mutex)
-        "EGCL-THREAD")
-
 (defun egcl-thread:make-condition-variable (&key name)
   (egcl::%native-condition :make name))
 
@@ -4824,11 +4856,6 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
 
 (defun egcl-thread:condition-broadcast (condition-variable)
   (egcl::%native-condition :broadcast condition-variable))
-
-(export '(egcl-thread:make-condition-variable egcl-thread:condition-variable
-          egcl-thread:condition-variable-p egcl-thread:condition-wait
-          egcl-thread:condition-notify egcl-thread:condition-broadcast)
-        "EGCL-THREAD")
 
 (defun lisp-implementation-type () "EGCL")
 (defun lisp-implementation-version () "0.0.11")
@@ -4893,6 +4920,10 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
 ;;; FBOUNDP guard (as Serapeum's macro-tools uses) sees the truth instead of a
 ;;; function that lies (bliss-powf).
 ;;; ---------------------------------------------------------------------------
+
+(export (mapcar (lambda (name) (intern name "EGCL-CLTL2"))
+                '("DEFINE-DECLARATION" "DECLARATION-INFORMATION"))
+        "EGCL-CLTL2")
 
 (defvar egcl-cltl2::*declaration-handlers* (make-hash-table :test 'eq))
 
@@ -4961,9 +4992,6 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
          (t
           (error "EGCL-CLTL2:DECLARATION-INFORMATION: ~s does not name a declaration EGCL can report"
                  decl-name)))))))
-
-(export '(egcl-cltl2:define-declaration egcl-cltl2:declaration-information)
-        "EGCL-CLTL2")
 
 ;;; Foreign addresses are opaque heap objects, never tagged Lisp addresses.
 ;;; Foreign storage has an explicit lifetime: C may retain it after Lisp drops
@@ -5044,6 +5072,19 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
 ;;;;
 ;;;; The PY package does not use COMMON-LISP, which is what lets IMPORT, TYPE-OF,
 ;;;; TYPEP and CALL-METHOD keep the names Python gives them.
+
+;;; External, so TYPE-OF and error messages read PY:OBJECT rather than
+;;; EGCL-PYTHON::OBJECT -- the nickname is the whole point of the package.
+;;; INTERN by name rather than writing '(py:import ...): a quoted list is read
+;;; before these are external, and the reader's own symbol for PY:IMPORT is not
+;;; necessarily the one in the package table, so the export lands on nothing. Every
+;;; other package here exports the same way for the same reason.
+(export (mapcar (lambda (name) (intern name "EGCL-PYTHON"))
+                '("OBJECT" "OBJECTP" "IMPORT" "EXEC" "RESOLVE" "CALL" "CALL-METHOD"
+                  "GETATTR" "SETATTR" "TYPE-OF" "TYPEP" "STR" "REPR" "START" "STOP"
+                  "EXCEPTION" "EXCEPTION-KIND" "EXCEPTION-TEXT" "EXCEPTION-FRAMES"
+                  "EXCEPTION-OBJECT" "BACKTRACE" "FLUSH" "EXPORT"))
+        "EGCL-PYTHON")
 
 ;;; PYTHON'S OUTPUT REACHES *STANDARD-OUTPUT* (bliss-c4g9u).
 ;;;
@@ -5197,19 +5238,6 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
   (mapcar (lambda (frame)
             (list :python (third frame) (first frame) (second frame)))
           (reverse (py:exception-frames condition))))
-
-;;; External, so TYPE-OF and error messages read PY:OBJECT rather than
-;;; EGCL-PYTHON::OBJECT -- the nickname is the whole point of the package.
-;;; INTERN by name rather than writing '(py:import ...): a quoted list is read
-;;; before these are external, and the reader's own symbol for PY:IMPORT is not
-;;; necessarily the one in the package table, so the export lands on nothing. Every
-;;; other package here exports the same way for the same reason.
-(export (mapcar (lambda (name) (intern name "EGCL-PYTHON"))
-                '("OBJECT" "OBJECTP" "IMPORT" "EXEC" "RESOLVE" "CALL" "CALL-METHOD"
-                  "GETATTR" "SETATTR" "TYPE-OF" "TYPEP" "STR" "REPR" "START" "STOP"
-                  "EXCEPTION" "EXCEPTION-KIND" "EXCEPTION-TEXT" "EXCEPTION-FRAMES"
-                  "EXCEPTION-OBJECT" "BACKTRACE" "FLUSH" "EXPORT"))
-        "EGCL-PYTHON")
 
 ;;; Retention is explicit: C may keep the entry after Lisp drops the wrapper.
 ;;; Retire every C reference/invocation before FREE-CALLBACK. Callback failures
@@ -6296,13 +6324,13 @@ no parameter names take their defaults."
           (setf (gethash table locks)
                 (egcl-thread:make-mutex :name "hash table" :recursive t))))))
 
+(export (intern "WITH-LOCKED-HASH-TABLE" :egcl-ext) :egcl-ext)
+
 (defmacro egcl-ext:with-locked-hash-table ((table) &body body)
   "Run BODY holding TABLE's recursive lock, excluding every other
 WITH-LOCKED-HASH-TABLE on TABLE for its dynamic extent."
   `(egcl-thread:with-mutex ((egcl::%hash-table-lock ,table))
      ,@body))
-
-(export 'egcl-ext:with-locked-hash-table :egcl-ext)
 
 ;;; Recursive macroexpansion for code-inspection and portability libraries.
 (export (intern "MACROEXPAND-ALL" :egcl-ext) :egcl-ext)
