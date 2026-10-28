@@ -145,11 +145,25 @@ fn core_image_preserves_adjustable_array_identity_in_globals_and_compiled_consta
       (defparameter *array-image-view* (make-array 2 :displaced-to *array-image-base* :displaced-index-offset 1))
       (eval (list 'defun 'array-image-constant nil (list 'quote *array-image-base*)))
       (compile 'array-image-constant)
+      (defparameter *array-image-floats* (make-array 4 :element-type 'double-float :initial-element 1.25d0))
+      (defparameter *array-image-bits* (make-array 4 :element-type 'bit :initial-element 0))
+      (eval (list 'defun 'array-image-float-constant nil (list 'quote *array-image-floats*)))
+      (eval (list 'defun 'array-image-bit-constant nil (list 'quote *array-image-bits*)))
+      (compile 'array-image-float-constant)
+      (compile 'array-image-bit-constant)
+      (assert (eq *array-image-floats* (array-image-float-constant)))
+      (assert (eq *array-image-bits* (array-image-bit-constant)))
       (assert (eq *array-image-base* (array-image-constant)))
       (egcl-ext:save-lisp-and-die {core:?}))"#
     );
     run(&dir.0, &build, None, false);
     let checks = r#"(progn
+      (assert (eq *array-image-floats* (array-image-float-constant)))
+      (assert (eq *array-image-bits* (array-image-bit-constant)))
+      (setf (aref *array-image-floats* 1) 42.5d0)
+      (setf (aref *array-image-bits* 1) 1)
+      (assert (= (aref (array-image-float-constant) 1) 42.5d0))
+      (assert (= (aref (array-image-bit-constant) 1) 1))
       (assert (adjustable-array-p *array-image-base*))
       (assert (eq *array-image-base* (array-image-constant)))
       (assert (eq (array-displacement *array-image-view*) *array-image-base*))

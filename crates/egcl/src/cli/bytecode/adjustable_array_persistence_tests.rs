@@ -323,3 +323,28 @@ fn array_graph_version_accepts_legacy_minor_and_rejects_future_minor_before_inst
     unit[4..6].copy_from_slice(&0x0204u16.to_le_bytes());
     assert_eq!(load_bbu_definitions(&unit, &mut env, false).unwrap(), NIL);
 }
+
+#[test]
+fn saved_image_array_constants_reference_actual_heap_objects_for_all_storage_kinds() {
+    let _lock = super::super::heap_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    egcl_rt::rooted!(doubles = egcl_rt::packed_f64::make(2, 1.25).unwrap());
+    egcl_rt::rooted!(bits = egcl_stdlib::sequences::build_bit_vector_from_bits(&[0, 1]).unwrap());
+    egcl_rt::rooted!(bytes = egcl_rt::packed_u8::make(2, 255).unwrap());
+    egcl_rt::rooted!(general = egcl_stdlib::build_simple_vector(&[NIL, NIL]));
+    egcl_rt::rooted!(text = egcl_stdlib::streams::make_lisp_string_fresh("mutable"));
+    let mut pool = BbuConstPool {
+        saved_heap_refs: true,
+        ..BbuConstPool::default()
+    };
+    egcl_rt::rooted_ref!(_pool = &mut pool);
+    for array in [*doubles, *bits, *bytes, *general, *text] {
+        let reference = pool.value(array).unwrap();
+        assert_eq!(pool.entries[reference as usize][0], 21);
+        assert_eq!(
+            u64::from_le_bytes(pool.entries[reference as usize][1..9].try_into().unwrap()),
+            array.to_raw()
+        );
+    }
+}

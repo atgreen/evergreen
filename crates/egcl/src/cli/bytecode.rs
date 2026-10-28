@@ -10799,9 +10799,7 @@ impl BbuConstPool {
 
     fn value(&mut self, v: EgclVal) -> Option<u32> {
         // Mutable wrappers must retain identity with the saved image heap.
-        if self.saved_heap_refs && (egcl_stdlib::is_complex_vector(v)
-            || egcl_rt::types::md_array_p(v) || egcl_stdlib::sequences::is_u8_array(v))
-        {
+        if self.saved_heap_refs && egcl_rt::types::arrayp(v) {
             let mut bytes = vec![21]; put_u64(&mut bytes, v.to_raw());
             return Some(self.intern_encoded(bytes));
         }
