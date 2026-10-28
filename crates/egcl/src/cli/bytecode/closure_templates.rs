@@ -181,8 +181,9 @@ mod tests {
         );
         egcl_rt::gc::collect_t0_minor().unwrap();
         let frame = Arc::new(SharedCell::new(EnvFrame::default()));
-        let payload = crate::cli::arena_cons(EgclVal::from_fixnum(73), NIL);
-        frame.borrow_mut().vars.insert("HELD".into(), payload);
+        egcl_rt::rooted!(payload = crate::cli::arena_cons(EgclVal::from_fixnum(73), NIL));
+        frame.borrow_mut().vars.insert("HELD".into(), *payload);
+        drop(payload);
         let before = frame.borrow().vars["HELD"].0;
         // No Env/activation/host root exposes frame here. The builder's own
         // precise root must be installed before this forced collection fires.
