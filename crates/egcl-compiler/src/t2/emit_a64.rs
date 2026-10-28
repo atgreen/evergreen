@@ -1136,6 +1136,35 @@ impl Emitter<'_> {
                 }
                 self.box_single(F0);
             }
+            FloatCmpEq | FloatCmpLt | FloatCmpLe | FloatCmpGt | FloatCmpGe => {
+                let deopt = self.deopt_label(data)?;
+                self.float_operand(first, W0, deopt)?;
+                self.float_operand(*data.args.get(1).ok_or(unsupported!())?, W1, deopt)?;
+                self.unbox_single(F0, W0);
+                self.unbox_single(F1, W1);
+                // After FCMP the signed integer conditions do NOT mean what
+                // they mean after CMP: an unordered compare sets C and V, so
+                // LT and LE both read as true for a NaN (asm/a64.rs says so on
+                // `fcmp`). Two things keep this exact. The unordered case
+                // deopts first -- the interpreter's NaN ordering is not IEEE's,
+                // so native code must not decide it, which is the same reason
+                // emit.rs deopts on parity. And `<`/`<=` are emitted as the
+                // swapped `>`/`>=`, so the only conditions ever selected on are
+                // EQ, GT and GE, which are exact once the operands are ordered.
+                let (x, y, cc) = match data.opcode {
+                    FloatCmpEq => (F0, F1, Cc::E),
+                    FloatCmpLt => (F1, F0, Cc::G),
+                    FloatCmpLe => (F1, F0, Cc::Ge),
+                    FloatCmpGt => (F0, F1, Cc::G),
+                    _ => (F0, F1, Cc::Ge),
+                };
+                self.asm.word(a64::fcmp_single(x, y));
+                self.asm.jcc(Cc::O, deopt);
+                self.imm(T0, NIL.0);
+                self.imm(T1, T.0);
+                self.asm.word(a64::csel(W0, T1, T0, cc));
+                return self.store(result, W0);
+            }
             FixnumAdd | FixnumSub | FixnumMul | FixnumNeg | FixnumCmpEq | FixnumCmpLt
             | FixnumCmpLe | FixnumCmpGt | FixnumCmpGe => {
                 let deopt = self.deopt_label(data)?;
@@ -2066,4 +2095,117 @@ mod tests {
         }
     }
 
+    /// Single-float comparisons select T/NIL branchlessly, and an unordered
+    /// compare deopts instead of inventing an ordering.
+    ///
+    /// This is the emitter half of what let `speculate.rs` stop refusing
+    /// single-float comparisons on this target (bliss-66hij). The NaN cases
+    /// are the point: after `FCMP` an unordered result sets C and V, so the
+    /// signed conditions LT and LE both read true for a NaN. If the unordered
+    /// deopt were dropped, `(< nan 1.0)` would answer T.
+    #[test]
+    fn single_float_comparisons_select_branchlessly_and_deopt_on_nan() {
+        use crate::t2::frame_state::{FrameScope, FrameState, ValueSource};
+
+        thread_local! {
+            static DEOPTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        }
+        extern "C" fn deopt(_: u64, _: u64, _: *const u64, _: u64) -> u64 {
+            DEOPTED.with(|flag| flag.set(true));
+            NIL.0
+        }
+
+        fn compare(opcode: Opcode) -> Function {
+            let mut f = Function::new("a64-float-cmp");
+            let block = f.entry();
+            let x = f.add_block_param(block, IRType::TOP, ValueRepresentation::Tagged);
+            let y = f.add_block_param(block, IRType::TOP, ValueRepresentation::Tagged);
+            let state = f.frame_states.add(FrameState {
+                scopes: vec![FrameScope {
+                    function: 0,
+                    bcp: 0,
+                    locals: vec![
+                        ValueSource::Value { value: x, repr: ValueRepresentation::Tagged },
+                        ValueSource::Value { value: y, repr: ValueRepresentation::Tagged },
+                    ],
+                    stack: vec![],
+                }],
+                remat: vec![],
+            });
+            let (_, answer) = f.push_inst(
+                block,
+                InstData {
+                    opcode,
+                    args: vec![x, y],
+                    results: vec![],
+                    aux: AuxData::None,
+                    flags: InstFlags::default(),
+                    targets: vec![],
+                    frame_state: Some(state),
+                    source_pos: 0,
+                },
+                &[(IRType::TOP, ValueRepresentation::Tagged)],
+            );
+            f.set_terminator(
+                block,
+                InstData {
+                    opcode: Opcode::Return,
+                    args: vec![answer[0]],
+                    results: vec![],
+                    aux: AuxData::None,
+                    flags: InstFlags::default(),
+                    targets: vec![],
+                    frame_state: None,
+                    source_pos: 0,
+                },
+            );
+            f
+        }
+
+        // (opcode, a<b expected, a>b expected, a==b expected)
+        let cases = [
+            (Opcode::FloatCmpLt, true, false, false),
+            (Opcode::FloatCmpLe, true, false, true),
+            (Opcode::FloatCmpGt, false, true, false),
+            (Opcode::FloatCmpGe, false, true, true),
+            (Opcode::FloatCmpEq, false, false, true),
+        ];
+        for (opcode, lt, gt, eq) in cases {
+            let compiled =
+                emit_framed(&compare(opcode), deopt as *const () as u64, 2).expect("emits");
+            assert!(!compiled.code.is_empty());
+            // The expected answers drive the hardware assertions below and have
+            // no other consumer, so a host that is not AArch64 would see three
+            // unused bindings -- which `-D warnings` makes errors. Name them
+            // here rather than underscoring them: an underscore would also hide
+            // a genuinely unused expectation.
+            let _ = (lt, gt, eq);
+            #[cfg(all(target_arch = "aarch64", unix))]
+            {
+                let code = egcl_rt::jit::JitBuffer::new(&compiled.code).unwrap();
+                // SAFETY: the buffer owns the generated C-ABI activation entry.
+                let entry: unsafe extern "C" fn(*mut u64) -> u64 =
+                    unsafe { std::mem::transmute(code.as_ptr()) };
+                let run = |a: f32, b: f32| {
+                    DEOPTED.with(|flag| flag.set(false));
+                    let mut slots = vec![
+                        EgclVal::from_single_float(a).0,
+                        EgclVal::from_single_float(b).0,
+                        0,
+                        0,
+                    ];
+                    let answer = unsafe { entry(slots.as_mut_ptr()) };
+                    (answer, DEOPTED.with(std::cell::Cell::get))
+                };
+                let t_or_nil = |yes: bool| if yes { T.0 } else { NIL.0 };
+                assert_eq!(run(1.5, 2.5), (t_or_nil(lt), false), "{opcode:?} 1.5 ? 2.5");
+                assert_eq!(run(2.5, 1.5), (t_or_nil(gt), false), "{opcode:?} 2.5 ? 1.5");
+                assert_eq!(run(2.5, 2.5), (t_or_nil(eq), false), "{opcode:?} 2.5 ? 2.5");
+                // Either operand a NaN is unordered: deopt, never an answer.
+                // Without the VS branch, LT and LE would answer T here.
+                assert_eq!(run(f32::NAN, 1.5).1, true, "{opcode:?} NaN on the left");
+                assert_eq!(run(1.5, f32::NAN).1, true, "{opcode:?} NaN on the right");
+            }
+        }
+    }
 }

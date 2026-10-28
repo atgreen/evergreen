@@ -298,9 +298,12 @@ pub fn profiles_numeric_operands(sym: u32) -> bool {
 }
 
 /// The typed comparison opcode for `(kind, speculated-type)`. Fixnum supports all
-/// five on every backend. Single-float comparisons have an emitter only on
-/// x86-64 (bliss-9bw59); elsewhere keep their ordinary calls rather than
-/// producing IR that would force the entire function out of T2.
+/// five on every backend. Single-float comparisons have an emitter on x86-64
+/// (bliss-9bw59) and now AArch64 (bliss-66hij); on a backend without one, keep
+/// the ordinary calls rather than producing IR that would force the entire
+/// function out of T2. Double-float comparisons stay x86-64-only: they ride the
+/// raw-double representation, which a checked-ABI backend cannot yet carry
+/// through its deopt stream (bliss-2fjmo).
 fn typed_cmp_opcode(c: Cmp, s: SpecType) -> Option<Opcode> {
     use Opcode::*;
     Some(match (c, s) {
@@ -309,7 +312,10 @@ fn typed_cmp_opcode(c: Cmp, s: SpecType) -> Option<Opcode> {
         (Cmp::Le, SpecType::Fixnum) => FixnumCmpLe,
         (Cmp::Ge, SpecType::Fixnum) => FixnumCmpGe,
         (Cmp::Eq, SpecType::Fixnum) => FixnumCmpEq,
-        (_, SpecType::SingleFloat | SpecType::DoubleFloat) if !cfg!(target_arch = "x86_64") => {
+        (_, SpecType::DoubleFloat) if !cfg!(target_arch = "x86_64") => return None,
+        (_, SpecType::SingleFloat)
+            if !cfg!(any(target_arch = "x86_64", target_arch = "aarch64")) =>
+        {
             return None
         }
         (Cmp::Lt, SpecType::SingleFloat) => FloatCmpLt,
