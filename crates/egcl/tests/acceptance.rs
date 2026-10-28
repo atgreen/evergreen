@@ -3424,6 +3424,28 @@ fn type_of_agrees_with_subtypep_for_characters_and_strings() {
         ("(typep (make-array 2 :adjustable t) 'array)", "T"),
         ("(type-of (make-random-state))", "RANDOM-STATE"),
         ("(type-of #'car)", "COMPILED-FUNCTION"),
+        // A displaced rank-2 array is not a SIMPLE-ARRAY, so its TYPE-OF
+        // answers ARRAY and TYPEP agrees (ansi the.4, type-of.3, coerce.1).
+        (
+            "(let ((a (make-array '(2 2) :displaced-to (make-array 6) :displaced-index-offset 1))) \
+               (list (type-of a) (typep a (type-of a)) (typep a 'simple-array) \
+                     (multiple-value-list (subtypep (type-of a) 'simple-array))))",
+            "((ARRAY T (2 2)) T NIL (NIL T))",
+        ),
+        (
+            "(let ((a (make-array '(2 2)))) \
+               (list (type-of a) (typep a (type-of a)) (typep a 'simple-array) \
+                     (multiple-value-list (subtypep (type-of a) 'simple-array))))",
+            "((SIMPLE-ARRAY T (2 2)) T T (T T))",
+        ),
+        // Specialized displaced arrays keep their existing element type.
+        (
+            "(let ((a (make-array '(2 2) :element-type '(unsigned-byte 8) \
+                            :displaced-to (make-array 6 :element-type '(unsigned-byte 8)) \
+                            :displaced-index-offset 1))) \
+               (list (type-of a) (typep a (type-of a)) (typep a 'simple-array)))",
+            "((ARRAY (UNSIGNED-BYTE 8) (2 2)) T NIL)",
+        ),
         (
             "(progn (defgeneric tos-gf2 (x)) (defmethod tos-gf2 ((x integer)) x) \
                (type-of (find-method #'tos-gf2 nil (list (find-class 'integer)))))",
@@ -3435,6 +3457,12 @@ fn type_of_agrees_with_subtypep_for_characters_and_strings() {
             .args(["--eval", &format!("(print {expr})")])
             .output()
             .expect("run egcl");
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{expr} should exit 0 (stderr: {})",
+            String::from_utf8_lossy(&out.stderr)
+        );
         let stdout = String::from_utf8_lossy(&out.stdout);
         let got = stdout
             .lines()

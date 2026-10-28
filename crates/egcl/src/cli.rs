@@ -22031,8 +22031,12 @@ fn type_of_value(v: EgclVal) -> Result<EgclVal, EgclError> {
         return Ok(resolve_sym("COMPLEX").unwrap_or(NIL));
     }
     // A multidimensional array's TYPE-OF is the compound specifier
-    // (SIMPLE-ARRAY T (d0 d1 …)) (bliss-rh0t).
+    // (SIMPLE-ARRAY T (d0 d1 …)) (bliss-rh0t) -- or (ARRAY T (…)) when its
+    // storage is a complex vector (displaced), since TYPEP does not call
+    // such an array a SIMPLE-ARRAY and TYPE-OF must answer a type the
+    // object satisfies (ansi the.4, type-of.3, coerce.1).
     if egcl_rt::types::md_array_p(v) {
+        let complex = egcl_rt::types::md_array_storage(v).is_some_and(egcl_stdlib::is_complex_vector);
         let dims = md_dims(v)?;
         let dim_vals: Vec<EgclVal> = dims
             .iter()
@@ -22040,7 +22044,7 @@ fn type_of_value(v: EgclVal) -> Result<EgclVal, EgclError> {
             .collect();
         egcl_rt::rooted!(dims_list = vec_to_list(&dim_vals));
         let spec = vec![
-            resolve_sym("SIMPLE-ARRAY").unwrap_or(NIL),
+            resolve_sym(if complex { "ARRAY" } else { "SIMPLE-ARRAY" }).unwrap_or(NIL),
             resolve_sym("T").unwrap_or(T),
             *dims_list,
         ];
