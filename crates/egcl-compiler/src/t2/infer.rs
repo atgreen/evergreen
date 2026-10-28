@@ -998,14 +998,9 @@ pub fn infer_for_sites(f: &Function, sites: &[Inst]) -> InferenceResult {
                     }
                     env.insert(rv, joined);
                 }
-                // In-program-order guard narrowing for the rest of this block.
-                if idef.opcode == Opcode::Guard && !idef.args.is_empty() {
-                    if let Some(tag) = guard_type(&idef.aux) {
-                        let v = idef.args[0];
-                        let cur = fact(v, &env, &g);
-                        env.insert(v, ty_meet(cur, tag));
-                    }
-                }
+                // Checked operations establish original-argument facts only
+                // on this successful continuation, after their own pre-state.
+                apply_normal_return_facts(f, inst, &g, &mut env);
             }
             // Compute outgoing bounds only after this block's instructions:
             // its comparison operands (including constants) now have facts.
@@ -1043,17 +1038,11 @@ type CheckRefinements = HashMap<usize, Vec<Refine>>;
 fn check_refinements(f: &Function, rpo: &[Block]) -> CheckRefinements {
     let mut check_refine: CheckRefinements = HashMap::new();
     for &b in rpo {
-        // Successful guard narrowings within this block, for dominated blocks.
+        // Audited normal-return argument facts, for strictly dominated blocks.
         for &inst in &f.block(b).insts {
-            let idef = f.inst(inst);
-            if idef.opcode == Opcode::Guard && !idef.args.is_empty() {
-                if let Some(tag) = guard_type(&idef.aux) {
-                    check_refine.entry(b.index()).or_default().push(Refine {
-                        value: idef.args[0],
-                        ty: tag,
-                    });
-                }
-            }
+            super::normal_return_facts::visit_argument_facts(f, inst, |value, ty| {
+                check_refine.entry(b.index()).or_default().push(Refine { value, ty });
+            });
         }
     }
 
@@ -1167,6 +1156,15 @@ fn entry_environment(
     env
 }
 
+fn apply_normal_return_facts(
+    f: &Function, inst: Inst, g: &Facts, env: &mut HashMap<Value, IRType>,
+) {
+    super::normal_return_facts::visit_argument_facts(f, inst, |value, ty| {
+        let current = env.get(&value).copied().unwrap_or_else(|| g.get(value));
+        env.insert(value, ty_meet(current, ty));
+    });
+}
+
 fn capture_site_facts(
     f: &Function,
     sites: &[Inst],
@@ -1194,16 +1192,8 @@ fn capture_site_facts(
                     );
                 }
             }
-            // Capture precedes this guard: its own check proves nothing about
-            // its pre-state. Later instructions can use the successful fact.
-            if data.opcode == Opcode::Guard
-                && !data.args.is_empty()
-                && let Some(ty) = guard_type(&data.aux)
-            {
-                let value = data.args[0];
-                let current = env.get(&value).copied().unwrap_or_else(|| g.get(value));
-                env.insert(value, ty_meet(current, ty));
-            }
+            // Its normal-return contract proves nothing about its pre-state.
+            apply_normal_return_facts(f, inst, g, &mut env);
         }
     }
     before
@@ -2151,11 +2141,15 @@ mod tests {
         let mut f = Function::new("string-layout-type");
         let entry = f.entry();
         let input = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+        let state = f.frame_states.add(crate::t2::frame_state::FrameState {
+            scopes: vec![], remat: vec![],
+        });
         let (_, checked) = f.push_inst(
             entry,
             InstData {
                 args: vec![input],
                 aux: AuxData::StringLayout,
+                frame_state: Some(state),
                 flags: InstFlags {
                     guard: true,
                     effectful: true,
@@ -2212,13 +2206,18 @@ mod tests {
         let mut f = Function::new("guard");
         let e = f.entry();
         let p = f.add_block_param(e, IRType::TOP, ValueRepresentation::Tagged);
+        let state = f.frame_states.add(crate::t2::frame_state::FrameState {
+            scopes: vec![], remat: vec![],
+        });
         f.push_inst(
             e,
             InstData {
                 args: vec![p],
                 aux: AuxData::TypeTag(fixnum()),
+                frame_state: Some(state),
                 flags: InstFlags {
                     guard: true,
+                    effectful: true,
                     ..InstFlags::default()
                 },
                 ..inst(Opcode::Guard)
@@ -2615,13 +2614,18 @@ mod tests {
         let mut f = Function::new("requested-guard-order");
         let entry = f.entry();
         let input = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+        let state = f.frame_states.add(crate::t2::frame_state::FrameState {
+            scopes: vec![], remat: vec![],
+        });
         let (guard, _) = f.push_inst(
             entry,
             InstData {
                 args: vec![input],
                 aux: AuxData::TypeTag(fixnum()),
+                frame_state: Some(state),
                 flags: InstFlags {
                     guard: true,
+                    effectful: true,
                     ..InstFlags::default()
                 },
                 ..inst(Opcode::Guard)

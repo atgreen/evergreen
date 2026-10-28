@@ -1087,7 +1087,21 @@ impl TransferCode {
                 }
             };
             if optimize {
-                egcl_compiler::t2::speculate::speculate(&mut ir, &profile);
+                // A retired family is a failure constraint, not missing type
+                // samples. Static declarations must not bypass it in mapped T1.
+                egcl_compiler::t2::speculate::speculate_with_feedback(
+                    &mut ir, &profile, egcl_compiler::t2::speculate::SpeculateOptions::default(),
+                    &|bcp, kind| {
+                        use egcl_compiler::t2::speculate::SpecType as CompilerType;
+                        let kind = match kind {
+                            CompilerType::Fixnum => SpecType::Fixnum,
+                            CompilerType::SingleFloat => SpecType::SingleFloat,
+                            CompilerType::DoubleFloat => SpecType::DoubleFloat,
+                        };
+                        type_profile_at(Arc::as_ptr(&body) as usize, bcp)
+                            .is_none_or(|profile| profile.permits(kind))
+                    },
+                );
             }
             let speculations = t2_numeric_speculations(&ir, symbol);
             let mut passes = egcl_compiler::t2::pass::PassManager::new();

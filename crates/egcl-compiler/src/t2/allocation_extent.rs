@@ -54,7 +54,10 @@ pub(crate) fn end_in_bounds(f: &Function, kernel: Inst, facts: &StructuralFacts)
     };
     let dimension = f.inst(call).args[0];
     let direct_fixnum = f.value(dimension).repr == ValueRepresentation::Tagged
-        && f.value(dimension).ty.bits == TypeBits::FIXNUM;
+        && (f.value(dimension).ty.bits == TypeBits::FIXNUM
+            || facts
+                .origin(dimension)
+                .is_some_and(|seed| f.value(seed).ty.bits == TypeBits::FIXNUM));
     fn upper(
         f: &Function,
         value: Value,
@@ -188,6 +191,7 @@ pub fn specialize(f: &mut Function) -> usize {
 
 /// Only pure adjacent extent production may be skipped by validated allocation
 /// success. Any implicit poll remains an actual instruction boundary.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub(crate) fn adjacent_completion(
     f: &Function,
     block: super::ir::Block,
@@ -441,5 +445,30 @@ mod tests {
         let unrelated = f.block(e).params[3];
         f.inst_mut(back).targets[0].args[2] = unrelated;
         assert!(crate::t2::verify::verify(&f).is_err());
+    }
+    #[test]
+    fn direct_fixnum_capacity_proof_survives_top_declared_dimension_alias() {
+        let (mut f, call, kernel) = fixture(false, false);
+        let entry = f.entry();
+        let dimension = f.inst(call).args[0];
+        let forwarded = f.make_block();
+        let alias = f.add_block_param(forwarded, IRType::TOP, ValueRepresentation::Tagged);
+        let instructions = std::mem::take(&mut f.block_mut(entry).insts);
+        f.block_mut(forwarded).insts = instructions;
+        let mut jump = data(Opcode::Jump, vec![]);
+        jump.targets = vec![BlockCall {
+            block: forwarded,
+            args: vec![dimension],
+        }];
+        f.set_terminator(entry, jump);
+        f.inst_mut(call).args[0] = alias;
+        assert_eq!(f.value(alias).ty, IRType::TOP);
+        crate::t2::verify::verify(&f).unwrap();
+        assert_eq!(super::super::allocation_facts::specialize(&mut f), 1);
+        assert!(matches!(
+            f.inst(kernel).aux,
+            AuxData::AllocationExtentInBounds
+        ));
+        crate::t2::verify::verify(&f).unwrap();
     }
 }

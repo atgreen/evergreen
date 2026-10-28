@@ -60,6 +60,12 @@ fn back_off_interpreter_osr(function: EgclVal) {
     }
 }
 
+// FX/single failures require an exact installed numeric site. Keep the legacy
+// raw-double policy for entry unboxing and its existing per-function backoff.
+fn numeric_deopt_uses_function_policy(sites: &[(u32, SpecType)], guard_bcp: u32) -> bool {
+    sites.iter().any(|&(site, kind)| site == guard_bcp || kind == SpecType::DoubleFloat)
+}
+
 fn note_segment_deopt(code: &TransferCode, guard_bcp: u32) {
     let count = code.deopts.get().saturating_add(1);
     code.deopts.set(count);
@@ -80,14 +86,14 @@ fn note_segment_deopt(code: &TransferCode, guard_bcp: u32) {
     // T0 blacklisting for unsupported domains. Retain this exact version and
     // release the registry borrow before policy code retires or replaces it.
     if let Some((symbol, native)) = &installed {
-        // Raw double-float T2 follows the same policy (bliss-thcbb): its failed
-        // double guards retire that speculation instead of cycling through
-        // baseline recompiles that would speculate it again.
-        let raw_doubles = native.is_t2
+        // Installed numeric guards must reach the persistent family feedback,
+        // including FX overflow with valid FX operands. Unrelated nonnumeric
+        // T2 guard failures retain the segment policy below.
+        let numeric_failure = native.is_t2
             && native.t2_metadata.as_ref().is_some_and(|installed| {
-                installed.speculations.iter().any(|&(_, kind)| kind == SpecType::DoubleFloat)
+                numeric_deopt_uses_function_policy(&installed.speculations, guard_bcp)
             });
-        if !native.is_t2 || raw_doubles {
+        if !native.is_t2 || numeric_failure {
             note_native_deopt(*symbol, Some(native), Some(guard_bcp));
             return;
         }
@@ -1890,6 +1896,20 @@ unsafe fn prepare_completed_deopt_unpublished(capture: *mut SysvTransferCapture)
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn installed_numeric_deopt_dispatches_fixnum_and_single_exact_sites() {
+        use super::{numeric_deopt_uses_function_policy, SpecType};
+        for kind in [SpecType::Fixnum, SpecType::SingleFloat] {
+            assert!(numeric_deopt_uses_function_policy(&[(11, kind)], 11));
+            assert!(!numeric_deopt_uses_function_policy(&[(11, kind)], 9));
+            assert!(!numeric_deopt_uses_function_policy(&[(11, kind)], 0));
+        }
+        assert!(!numeric_deopt_uses_function_policy(&[], 11));
+        // Preserve existing raw-double entry/guard routing.
+        assert!(numeric_deopt_uses_function_policy(&[(11, SpecType::DoubleFloat)], 0));
+        assert!(numeric_deopt_uses_function_policy(&[(11, SpecType::DoubleFloat)], 9));
+    }
+
     #[test]
     fn native_v2_raw_f64_deopt_reboxes_before_t0_resume() {
         use egcl_compiler::t2::frame_state::{FrameScope, FrameState, ValueSource};

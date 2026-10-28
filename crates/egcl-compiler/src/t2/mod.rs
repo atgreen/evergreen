@@ -81,6 +81,7 @@ pub mod x64_value_maps;
 // ── Front end ─────────────────────────────────────────────────────
 pub mod build; // bytecode → SSA
 pub mod infer; // type/range/representation inference
+pub mod normal_return_facts; // audited successful-continuation argument contracts
 pub mod builtin_binding; // exact binding guards for builtin specialization
 pub mod inlining; // call-site policy + compiler-known inline metadata
 pub mod verify; // IR verifier

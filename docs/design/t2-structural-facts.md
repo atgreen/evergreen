@@ -11,7 +11,8 @@ The shared domain distinguishes exact object identity, successful simple-string
 layout guards, and nullable packed-U8 layout witnesses. A broad STRING or VECTOR
 type is insufficient to justify direct storage access. A nullable witness
 proves which object was inspected; it does not prove that the result is non-NIL.
-Consumers retain the witness failure branch, bounds checks, and value checks.
+Consumers retain the witness failure branch and value checks. A separate extent
+proof can remove a capacity comparison; layout evidence alone cannot.
 
 Successful simple-string layout guards also imply STRING in numeric type
 inference. The implication is one-way: a STRING type does not imply storage
@@ -42,16 +43,30 @@ its specialized store kernel. Its identity/dominance verification now uses the
 shared analysis. The late ordinary pipeline also removes duplicate explicit
 layout probes. Layout facts never cache interior pointers: consumers reload the
 current rooted object after moving GC. Only immutable storage properties belong
-in this domain. Mutable contents, lengths, displacement, and adjustable backing
-storage require separate effect and alias reasoning.
+in this domain. Mutable contents, adjustable logical lengths, displacement, and
+adjustable backing storage require separate effect and alias reasoning.
 
-Inline allocation currently has a conditional postcondition: only its validated
-bump-allocation success proves the small packed-U8 layout. Its collecting slow
-call remains generic. The existing adjacent-probe optimization retains its
-poll, multiple-value, exact-result and final-home restrictions. Do not mark the
-whole constructor Call result as packed-U8 based on its name or a mutable type
-descriptor. Making fast/slow allocation paths explicit in IR is a further step
-needed before general IR passes can consume that conditional postcondition.
+Allocation postconditions have explicit nullable SSA producers.
+`PackedU8AllocationLayout` names both the subject and the original canonical
+constructor result. Validated inline allocation supplies its header width;
+the collecting slow return undergoes a real layout probe. Neither a constructor
+name nor a mutable element-type descriptor makes the whole Call result packed-U8.
+Poll, multiple-value, exact-result and final-home restrictions still apply.
+
+`PackedU8AllocationExtent` names the subject, layout witness and constructor
+result. Fast allocation captures the initialized length. Otherwise, a successful
+layout probe permits reading the actual immutable capacity, with a separate
+fixnum-representability check; an unsupported layout or capacity produces NIL.
+The proof depends on checked allocator/storage contracts, not an expectation
+that an oversized request would run out of memory.
+
+An extent consumer requires correlated array, layout and length evidence across
+every forwarding phi. It normally checks its end index against the scalar extent.
+The verifier permits omitting that capacity comparison when the end is the exact
+extent, a direct fixnum dimension, or a checked MIN capped by one of those values.
+Type, nonnegative-index, span and nullable-witness checks remain. A mutable list's
+old CAR is never interchangeable with the dimension actually accepted by allocation.
+OSR imports and mismatched evidence retain checks or decline the optimization.
 
 Existing string layout operations have verifier and native-emitter support but
 no current source-to-IR producer. Their structural integration is exercised by
@@ -251,6 +266,23 @@ refinement producer/emitter integration is limited to x86-64 Linux and declines
 functions with OSR entries. This conservative consumer restriction does not
 remove the all-entry safety requirements of the inference API.
 
+## Successful-continuation argument contracts
+
+`normal_return_facts::visit_argument_facts` describes original-argument facts,
+not just result types. Audited checked tagged arithmetic and type/layout guards
+establish their argument constraints only after the instruction succeeds or in
+blocks it strictly dominates through every entry. The same callback serves
+fixed-point inference and the final site replay. A later use can therefore
+reuse a check without narrowing an earlier use or the original SSA declaration.
+
+These initial contracts belong to fixed IR operations whose failed checks leave
+optimized execution. They are not summaries inferred for arbitrary Lisp calls.
+A generic Call or Invoke may handle an error, use replacement arguments, or
+return without validating an argument. Its normal return establishes no such
+fact. Predicates still require their unique true edge. Pure refinement copies
+relay their independently verified result proof without creating a new fact
+about their original input.
+
 ## Operand proofs, result vetoes, and feedback
 
 An operand-family proof and a mathematical result interval answer different
@@ -263,11 +295,16 @@ verified local operand ranges above.
 
 These facts are structural proofs, not sampled value ranges. They do not turn
 an explicit declined `None` profile entry into a new positive speculation.
-The existing declared-type policy remains distinct; the new inferred-positive
-path preserves failed-site feedback. Domain checks, overflow checks, exceptional
-continuations, and multiple-value behavior stay unless their own precise
-preconditions have been proved. In particular, a DOUBLE-FLOAT type proof alone
-does not prove a divisor is nonzero or a square-root operand is nonnegative.
+An explicit per-body, per-site failed-family policy also vetoes declared-type
+selection and alternate numeric producers, including peeled and packed-double
+candidates. Valid fixnum operands cannot resurrect a specialization whose
+result overflowed. New samples and profile decay retain that rejection; a new
+definition resets it. Only matching installed numeric guard metadata establishes
+this failure. Packed-array layout/index failures have separate guard semantics.
+Domain checks, overflow checks, exceptional continuations, and multiple-value
+behavior stay unless their own precise preconditions have been proved. In
+particular, a DOUBLE-FLOAT type proof alone does not prove a divisor is nonzero
+or a square-root operand is nonnegative.
 
 ## Guarded expectations from callee bodies
 

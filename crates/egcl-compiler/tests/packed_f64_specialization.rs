@@ -266,3 +266,30 @@ fn store_transport_declines_multiple_values_unknown_producers_and_raw_escape() {
         assert_eq!(format!("{f:?}"), before, "declines must preserve exact tagged IR");
     }
 }
+
+#[test]
+fn failed_family_rejects_entire_closed_packed_expression_without_changing_state() {
+    let _lock = SYMBOLS.lock().unwrap();
+    for bcp in [1, 2, 3, 4] {
+        let mut f = kernel(egcl_rt::symbols::intern("AREF"), false);
+        let original = format!("{f:?}");
+        assert_eq!(
+            egcl_compiler::t2::packed_f64::specialize_with_feedback(&mut f, &|site, kind| !(site
+                == bcp
+                && kind == egcl_compiler::t2::speculate::SpecType::DoubleFloat)),
+            0
+        );
+        assert_eq!(
+            format!("{f:?}"),
+            original,
+            "no partial mutation, including FrameStates, at vetoed site {bcp}"
+        );
+        egcl_compiler::t2::verify::verify(&f).unwrap();
+    }
+    let mut f = kernel(egcl_rt::symbols::intern("AREF"), false);
+    assert_eq!(
+        egcl_compiler::t2::packed_f64::specialize_with_feedback(&mut f, &|bcp, _| bcp != 999),
+        4
+    );
+    egcl_compiler::t2::verify::verify(&f).unwrap();
+}

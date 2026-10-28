@@ -864,7 +864,7 @@ impl NumericConstraints {
 /// into +0.0) every raw `FloatAdd` already reproduces. Each link deoptimizes
 /// with the whole call's frame state: arithmetic has no effects, so the
 /// interpreter simply evaluates the original call again.
-fn split_variadic_double_arithmetic(f: &mut Function, profile: &impl Fn(u32) -> Option<SpecType>) {
+fn split_variadic_double_arithmetic(f: &mut Function, profile: &impl Fn(u32) -> Option<SpecType>, permits: &dyn Fn(u32, SpecType) -> bool) {
     use crate::t2::ir::{InstData, ValueRepresentation};
     let constraints = NumericConstraints::default();
     let mut sites = Vec::new();
@@ -876,7 +876,8 @@ fn split_variadic_double_arithmetic(f: &mut Function, profile: &impl Fn(u32) -> 
             }
             let AuxData::CallTarget(sym) = data.aux else { continue };
             let Some(state) = data.frame_state else { continue };
-            if arith_of(sym).is_none() || profile(frame_state_bcp(f, state)) != Some(SpecType::DoubleFloat) {
+            if arith_of(sym).is_none() || !permits(frame_state_bcp(f, state), SpecType::DoubleFloat)
+                || profile(frame_state_bcp(f, state)) != Some(SpecType::DoubleFloat) {
                 continue;
             }
             if !constraints.excludes_numeric(f, inst, &data.args) {
@@ -986,6 +987,7 @@ fn speculate_double_only_sites(
     f: &mut Function,
     profile: &impl Fn(u32) -> Option<SpecType>,
     consts: &HashMap<Value, i64>,
+    permits: &dyn Fn(u32, SpecType) -> bool,
 ) -> usize {
     use crate::t2::ir::{InstData, ValueRepresentation};
     let raw_double = (IRType::of(TypeBits::DOUBLE_FLOAT), ValueRepresentation::UnboxedF64);
@@ -1005,6 +1007,7 @@ fn speculate_double_only_sites(
                     return None;
                 }
                 let state = data.frame_state?;
+                if !permits(frame_state_bcp(f, state), SpecType::DoubleFloat) { return None; }
                 let observed = profile(frame_state_bcp(f, state))?;
                 if constraints.excludes_numeric(f, site, &data.args) { return None; }
                 let scoped = constraints.inferred_for(f, &data.args)
@@ -1144,13 +1147,33 @@ pub fn speculate_with(
     profile: &impl Fn(u32) -> Option<SpecType>,
     options: SpeculateOptions,
 ) -> usize {
-    speculate_selected(f, profile, options, None)
+    speculate_with_feedback(f, profile, options, &|_, _| true)
+}
+
+/// Explicit per-site failure policy is independent of valid operand types.
+/// A rejected family cannot be reinstated even by static source type proofs.
+/// Existing entrypoints preserve their historical allow-all policy.
+pub fn speculate_with_feedback(
+    f: &mut Function,
+    profile: &impl Fn(u32) -> Option<SpecType>,
+    options: SpeculateOptions,
+    permits: &dyn Fn(u32, SpecType) -> bool,
+) -> usize {
+    speculate_selected(f, profile, options, None, permits)
 }
 
 /// Specialize only a proved fast region; the generic/peeled copies keep their
 /// original calls. Static operand proofs still take precedence over profiles.
+#[allow(dead_code)] // Retained allow-all internal compatibility entrypoint.
 pub(crate) fn speculate_blocks(f: &mut Function, blocks: &[crate::t2::ir::Block]) -> usize {
-    speculate_selected(f, &|_| None, SpeculateOptions { double_float: false }, Some(blocks))
+    speculate_blocks_with_feedback(f, blocks, &|_, _| true)
+}
+
+pub(crate) fn speculate_blocks_with_feedback(
+    f: &mut Function, blocks: &[crate::t2::ir::Block],
+    permits: &dyn Fn(u32, SpecType) -> bool,
+) -> usize {
+    speculate_selected(f, &|_| None, SpeculateOptions { double_float: false }, Some(blocks), permits)
 }
 
 fn speculate_selected(
@@ -1158,9 +1181,10 @@ fn speculate_selected(
     profile: &impl Fn(u32) -> Option<SpecType>,
     options: SpeculateOptions,
     selected: Option<&[crate::t2::ir::Block]>,
+    permits: &dyn Fn(u32, SpecType) -> bool,
 ) -> usize {
     if options.double_float && cfg!(target_arch = "x86_64") {
-        split_variadic_double_arithmetic(f, profile);
+        split_variadic_double_arithmetic(f, profile, permits);
     }
     // Read phase: collect the calls to rewrite (keeps the borrow off `f` for the
     // mutation phase).
@@ -1258,6 +1282,7 @@ fn speculate_selected(
             else {
                 continue;
             };
+            if !permits(bcp, spec) { continue; }
             if profiles_numeric_operands(sym) && constraints.excludes_numeric(f, inst, &data.args) {
                 continue;
             }
@@ -1553,7 +1578,7 @@ fn speculate_selected(
         }
     }
     if options.double_float && cfg!(target_arch = "x86_64") {
-        n += speculate_double_only_sites(f, profile, &consts);
+        n += speculate_double_only_sites(f, profile, &consts, permits);
     }
     let self_sym = f
         .entry_frame_state
@@ -3396,6 +3421,74 @@ mod tests {
                     if name == "+" { x + 1 } else { x - 1 }
                 );
             }
+        }
+    }
+    #[test]
+    fn explicit_failed_family_veto_overrides_declared_types_without_changing_call() {
+        for (kind, bits) in [
+            (SpecType::Fixnum, TypeBits::FIXNUM),
+            (SpecType::SingleFloat, TypeBits::SINGLE_FLOAT),
+            (SpecType::DoubleFloat, TypeBits::DOUBLE_FLOAT),
+        ] {
+            let (mut f, call) = build_call("+", 2);
+            for p in f.block(f.entry()).params.clone() {
+                f.refine_type(p, IRType::of(bits));
+            }
+            let original = format!("{:?}", f.inst(call));
+            let state = f.inst(call).frame_state.unwrap();
+            let old_state = format!("{:?}", f.frame_states.get(state));
+            let count = f.num_insts();
+            assert_eq!(
+                speculate_with_feedback(
+                    &mut f,
+                    &|_| Some(kind),
+                    SpeculateOptions { double_float: true },
+                    &|bcp, candidate| !(bcp == 2 && candidate == kind)
+                ),
+                0
+            );
+            assert_eq!(format!("{:?}", f.inst(call)), original);
+            assert_eq!(format!("{:?}", f.frame_states.get(state)), old_state);
+            assert_eq!(f.num_insts(), count);
+            crate::t2::verify::verify(&f).unwrap();
+        }
+        let (mut f, call) = build_call("+", 2);
+        assert_eq!(
+            speculate_with_feedback(
+                &mut f,
+                &|_| Some(SpecType::Fixnum),
+                SpeculateOptions::default(),
+                &|bcp, _| bcp != 999
+            ),
+            1
+        );
+        assert_eq!(
+            f.inst(call).opcode,
+            Opcode::FixnumAdd,
+            "unrelated failure policy does not disable valid sites"
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn failed_double_policy_blocks_variadic_and_double_only_producers() {
+        for (name, arity) in [("+", 3), ("SQRT", 1), ("-", 1), ("/", 2)] {
+            let (mut f, call) = build_call(name, arity);
+            let count = f.num_insts();
+            let original = format!("{:?}", f.inst(call));
+            assert_eq!(
+                speculate_with_feedback(
+                    &mut f,
+                    &|_| Some(SpecType::DoubleFloat),
+                    DOUBLE_FLOAT,
+                    &|_, kind| kind != SpecType::DoubleFloat
+                ),
+                0,
+                "{name}"
+            );
+            assert_eq!(f.num_insts(), count, "no doomed split/unbox on {name}");
+            assert_eq!(format!("{:?}", f.inst(call)), original);
+            crate::t2::verify::verify(&f).unwrap();
         }
     }
 }

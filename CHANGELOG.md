@@ -9,7 +9,7 @@
   effects and runtime checks ([#737](https://github.com/atgreen/evergreen/pull/737)).
 - T2 uses branch-local type and range proofs to remove redundant numeric
   checks and recovery code, avoids fixnum specializations proven to overflow,
-  and shares validated packed-byte allocation layout evidence
+  and shares validated packed-byte allocation layout and extent proofs
   ([#736](https://github.com/atgreen/evergreen/pull/736)).
 
 - T2 uses inferred numeric types to select arithmetic specializations ahead of
