@@ -14,6 +14,7 @@ pub(in crate::cli::bytecode) struct PreparedT2 {
     raw_fixnum_values: usize,
     allocation_extent_values: usize,
     extent_bounds_proofs: usize,
+    allocation_dimension_proofs: usize,
 }
 
 pub(in crate::cli::bytecode) fn prepare_ordinary_t2(
@@ -86,9 +87,9 @@ pub(in crate::cli::bytecode) fn prepare_ordinary_t2(
     let raw_fixnum_values = (0..mapped.num_values()).filter(|&index|
         mapped.value(Value(index as u32)).repr == ValueRepresentation::UnboxedFixnum
     ).count();
-    let (allocation_extent_values, extent_bounds_proofs) = emitted.allocation_extent_counts();
+    let (allocation_extent_values, extent_bounds_proofs, allocation_dimension_proofs) = emitted.allocation_extent_counts();
     Some(PreparedT2 { emitted, clear_mv_resets, raw_f64_values, raw_fixnum_values,
-        allocation_extent_values, extent_bounds_proofs })
+        allocation_extent_values, extent_bounds_proofs, allocation_dimension_proofs })
 }
 
 pub(in crate::cli::bytecode) fn install_ordinary_t2(
@@ -174,12 +175,13 @@ pub(in crate::cli::bytecode) fn install_ordinary_t2(
         let raw_fixnum_values = prepared.raw_fixnum_values;
         let allocation_extent_values = prepared.allocation_extent_values;
         let extent_bounds_proofs = prepared.extent_bounds_proofs;
+        let allocation_dimension_proofs = prepared.allocation_dimension_proofs;
         let abi = match &native._storage {
             NativeCodeStorage::Mapped(code) if code.ordinary_entry.is_some() => "ordinary x86-64 Lisp",
             _ => "mapped",
         };
         t2_log_write(format_args!(
-            "{}: {abi} T2 emitted; clear_mv_resets={clear_mv_resets}, raw_f64_values={raw_f64_values}, allocation_extent_values={allocation_extent_values}, extent_bounds_proofs={extent_bounds_proofs}, raw_fixnum_values={raw_fixnum_values}",
+            "{}: {abi} T2 emitted; clear_mv_resets={clear_mv_resets}, raw_f64_values={raw_f64_values}, allocation_extent_values={allocation_extent_values}, extent_bounds_proofs={extent_bounds_proofs}, allocation_dimension_proofs={allocation_dimension_proofs}, raw_fixnum_values={raw_fixnum_values}",
             display_fn_name(&body.name)
         ));
     }

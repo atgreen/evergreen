@@ -60,13 +60,25 @@ fixnum-representability check; an unsupported layout or capacity produces NIL.
 The proof depends on checked allocator/storage contracts, not an expectation
 that an oversized request would run out of memory.
 
-An extent consumer requires correlated array, layout and length evidence across
-every forwarding phi. It normally checks its end index against the scalar extent.
-The verifier permits omitting that capacity comparison when the end is the exact
-extent, a direct fixnum dimension, or a checked MIN capped by one of those values.
-Type, nonnegative-index, span and nullable-witness checks remain. A mutable list's
-old CAR is never interchangeable with the dimension actually accepted by allocation.
-OSR imports and mismatched evidence retain checks or decline the optimization.
+The default store optimization keeps its existing five runtime operands. An
+`AllocationDimensionInBounds` marker permits omitting the capacity comparison
+only when the verifier reconstructs the canonical allocation, the same direct
+dimension, its prior fixnum validation, and the end's upper bound. A successful
+checked MIN or another audited argument contract can supply that validation
+even when the original dimension's declaration remains TOP. The proof adds no
+runtime value or length preparation. Unknown and mutable-list dimensions keep
+the original checked kernel.
+
+The explicit captured-extent consumer remains available with
+`EGCL_FORCE_ALLOCATION_EXTENTS`; `EGCL_DISABLE_ALLOCATION_EXTENTS` takes priority.
+It requires correlated array, layout and length evidence across every forwarding
+phi. It checks the end against the scalar extent unless the verifier proves the
+end is that exact extent or is capped by an accepted direct dimension. This path
+is retained for native validation and future consumers; transporting a sixth
+operand did not pay for the current store kernels. Type, nonnegative-index, span
+and nullable-witness checks remain. A mutable list's old CAR never substitutes
+for the dimension actually accepted by allocation. OSR imports and mismatched
+evidence retain checks or decline the optimization.
 
 Existing string layout operations have verifier and native-emitter support but
 no current source-to-IR producer. Their structural integration is exercised by

@@ -495,6 +495,9 @@ pub enum AuxData {
     /// Exact allocation-extent relation proves END <= capacity on normal
     /// producer return. Never a profile/assertion; verifier rebuilds the proof.
     AllocationExtentInBounds,
+    /// A correlated canonical allocation dimension bounds END on this normal
+    /// continuation. Five-input layout kernel: no captured extent is carried.
+    AllocationDimensionInBounds,
     /// VecSet implements SVREF assignment: SIMPLE_VECTOR only, never packed.
     SimpleVectorStore,
     FieldOffset(u32),

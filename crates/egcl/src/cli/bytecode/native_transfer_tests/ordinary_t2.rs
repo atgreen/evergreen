@@ -767,7 +767,7 @@ fn ordinary_t2_guard_retirement_preserves_effects_and_actual_tier() {
         unreachable!()
     };
     let threshold = deopt_blacklist_threshold();
-    for _ in 0..threshold {
+    for attempt in 0..threshold {
         egcl_rt::rooted!(
             result = run_native(
                 &code,
@@ -781,6 +781,9 @@ fn ordinary_t2_guard_retirement_preserves_effects_and_actual_tier() {
             super::super::super::format_val(*result),
             "1152921504606846976"
         );
+        if attempt == 0 {
+            assert!(mapped.needs_recompile(), "first installed numeric failure retires retained code");
+        }
     }
     assert!(mapped.needs_recompile());
     assert_eq!(

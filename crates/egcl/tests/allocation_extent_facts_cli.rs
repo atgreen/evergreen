@@ -169,7 +169,7 @@ fn installed_count(stderr: &str, owner: &str, field: &str) -> usize {
 fn allocation_extents_are_installed_proofs_with_moving_and_mutable_fallbacks() {
     let mut reference = None;
     let source = program();
-    for enabled in [false, true] {
+    for (enabled, forced) in [(false, false), (true, false), (true, true), (false, true)] {
         let mut command = Command::new(env!("CARGO_BIN_EXE_egcl"));
         for (key, _) in std::env::vars() {
             if key.starts_with("EGCL_") {
@@ -183,6 +183,9 @@ fn allocation_extents_are_installed_proofs_with_moving_and_mutable_fallbacks() {
             .env("EGCL_T2_LOG", "stderr")
             .env("EGCL_ALLOCATION_FACTS_LOG", "1")
             .env("EGCL_GC_POISON", "1");
+        if forced {
+            command.env("EGCL_FORCE_ALLOCATION_EXTENTS", "1");
+        }
         if !enabled {
             command.env("EGCL_DISABLE_ALLOCATION_EXTENTS", "1");
         }
@@ -194,7 +197,7 @@ fn allocation_extents_are_installed_proofs_with_moving_and_mutable_fallbacks() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             output.status.success(),
-            "enabled={enabled}\n{stdout}\n{stderr}"
+            "enabled={enabled} forced={forced}\n{stdout}\n{stderr}"
         );
         assert!(stdout.contains("ALLOCATION-EXTENT-NATIVE-OUTPUT-OK"));
         assert!(stdout.contains("EXTENT-TIERS 2 2"));
@@ -214,12 +217,24 @@ fn allocation_extents_are_installed_proofs_with_moving_and_mutable_fallbacks() {
                 "{stderr}"
             );
             let extents = installed_count(&stderr, owner, "allocation_extent_values");
-            assert_eq!(extents > 0, enabled, "installed producer {owner}\n{stderr}");
+            assert_eq!(
+                extents > 0,
+                enabled && forced,
+                "installed producer {owner}\n{stderr}"
+            );
             let proofs = installed_count(&stderr, owner, "extent_bounds_proofs");
             assert_eq!(
                 proofs > 0,
-                enabled && owner == "EXTENT-DIRECT-WRITER",
+                enabled && forced && owner == "EXTENT-DIRECT-WRITER",
                 "only the direct immutable dimension may waive bounds\n{stderr}"
+            );
+        }
+        for owner in ["EXTENT-DIRECT-WRITER", "EXTENT-LIST-WRITER"] {
+            let proofs = installed_count(&stderr, owner, "allocation_dimension_proofs");
+            assert_eq!(
+                proofs > 0,
+                enabled && !forced && owner == "EXTENT-DIRECT-WRITER",
+                "five-argument dimension proof must not carry a captured extent\n{stderr}"
             );
         }
         let moves = stderr
@@ -230,7 +245,7 @@ fn allocation_extents_are_installed_proofs_with_moving_and_mutable_fallbacks() {
             })
             .unwrap_or(0);
         assert!(moves > 0, "must observe changed array addresses\n{stderr}");
-        eprintln!("enabled={enabled} actual_relocations={moves}");
+        eprintln!("enabled={enabled} forced={forced} actual_relocations={moves}");
         if let Some(expected) = &reference {
             assert_eq!(stdout.as_ref(), expected);
         } else {

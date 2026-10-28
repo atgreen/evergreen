@@ -700,7 +700,9 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                         || data.results.len() != 2
                         || data.flags != (crate::t2::ir::InstFlags { effectful: true, ..Default::default() })
                         || data.frame_state.is_some() || !data.targets.is_empty()
-                        || !(matches!(data.aux, AuxData::None) || (data.opcode == Opcode::TryStoreIntegerOctets1To8Extent && matches!(data.aux, AuxData::AllocationExtentInBounds)))
+                        || !(matches!(data.aux, AuxData::None)
+                            || (data.opcode == Opcode::TryStoreIntegerOctets1To8Extent && matches!(data.aux, AuxData::AllocationExtentInBounds))
+                            || (data.opcode == Opcode::TryStoreIntegerOctets1To8Layout && matches!(data.aux, AuxData::AllocationDimensionInBounds)))
                         || (valid && data.results.len() == 2 &&
                             (data.args.iter().chain(&data.results).any(|&v| f.value(v).repr != Repr::Tagged)
                                 || f.value(data.results[0]).ty.bits != TypeBits::SYMBOL.join(TypeBits::NULL)

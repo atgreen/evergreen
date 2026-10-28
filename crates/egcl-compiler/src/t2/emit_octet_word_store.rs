@@ -19,7 +19,9 @@ fn invalid_shape(f: &Function, data: &crate::t2::ir::InstData) -> bool {
         != if data.opcode == Opcode::TryStoreIntegerOctets1To8Extent { 6 }
         else if data.opcode == Opcode::TryStoreIntegerOctets1To8Layout { 5 } else { 4 }
         || data.results.len() != 2
-        || !(matches!(data.aux, AuxData::None) || (data.opcode == Opcode::TryStoreIntegerOctets1To8Extent && matches!(data.aux, AuxData::AllocationExtentInBounds)))
+        || !(matches!(data.aux, AuxData::None)
+            || (data.opcode == Opcode::TryStoreIntegerOctets1To8Extent && matches!(data.aux, AuxData::AllocationExtentInBounds))
+            || (data.opcode == Opcode::TryStoreIntegerOctets1To8Layout && matches!(data.aux, AuxData::AllocationDimensionInBounds)))
         || data.flags
             != (InstFlags {
                 effectful: true,
@@ -94,7 +96,7 @@ pub(super) fn emit(
         data.opcode != Opcode::TryStoreIntegerOctets8,
         layout,
         extent,
-        matches!(data.aux, crate::t2::ir::AuxData::AllocationExtentInBounds),
+        matches!(data.aux, crate::t2::ir::AuxData::AllocationExtentInBounds | crate::t2::ir::AuxData::AllocationDimensionInBounds),
     )
 }
 
@@ -150,7 +152,7 @@ pub(super) fn emit_framed(
         data.opcode != Opcode::TryStoreIntegerOctets8,
         layout,
         extent,
-        matches!(data.aux, crate::t2::ir::AuxData::AllocationExtentInBounds),
+        matches!(data.aux, crate::t2::ir::AuxData::AllocationExtentInBounds | crate::t2::ir::AuxData::AllocationDimensionInBounds),
     )?;
     for (&value, source) in data.results.iter().zip([RAX, SCRATCH]) {
         if let Some(&home) = homes.get(&value) {
@@ -414,7 +416,7 @@ fn emit_body_extent(
             a.jcc(Cc::G, failed);
             load_from_rsp(a, SCRATCH, 16);
         }
-    } else {
+    } else if !bounded {
         cmp_mem64_disp8(a, RAX, SCRATCH, 8);
         a.jcc(Cc::G, failed);
     }
@@ -455,7 +457,7 @@ fn emit_body_extent(
                 a.jcc(Cc::G, failed);
                 load_from_rsp(a, SCRATCH, 16);
             }
-        } else {
+        } else if !bounded {
             cmp_mem64_disp8(a, RAX, SCRATCH, 8);
             a.jcc(Cc::G, failed);
         }
@@ -540,6 +542,15 @@ mod tests {
         constants: [Option<u64>; 4],
         opcode: Opcode,
     ) -> egcl_rt::jit::JitBuffer {
+        kernel_opcode_with_aux(outputs, constants, opcode, AuxData::None)
+    }
+
+    fn kernel_opcode_with_aux(
+        outputs: [u8; 2],
+        constants: [Option<u64>; 4],
+        opcode: Opcode,
+        aux: AuxData,
+    ) -> egcl_rt::jit::JitBuffer {
         let mut f = Function::new("try-store-eight-octets-kernel");
         let block = f.entry();
         let args: Vec<_> = (0..4)
@@ -557,7 +568,7 @@ mod tests {
                 opcode,
                 args: kernel_args,
                 results: vec![],
-                aux: AuxData::None,
+                aux,
                 flags: InstFlags {
                     effectful: true,
                     ..Default::default()
@@ -1395,6 +1406,45 @@ mod tests {
             assert_eq!(output[0], NIL.to_raw()); assert_eq!(array.words, before, "failure writes nothing");
             assert_eq!(output[2], lane); assert_eq!(output[3], output[4]);
         }
+    }
+
+    #[test]
+    fn native_dimension_proof_removes_twenty_fixed_bytes_without_extra_operands() {
+        let body = |bounded| {
+            let mut a = Asm::new();
+            super::emit_body_extent(&mut a, RAX, SCRATCH, true, true, false, bounded).unwrap();
+            a.finish().unwrap()
+        };
+        let checked = body(false); let proven = body(true);
+        assert_eq!(proven.len() + 20, checked.len(), "only two cmp-memory/near-JG pairs disappear");
+        let cmps = |code: &[u8]| Decoder::new(64, code, DecoderOptions::NONE)
+            .into_iter().filter(|i| i.mnemonic() == Mnemonic::Cmp).count();
+        assert_eq!(cmps(&proven) + 2, cmps(&checked));
+        let code = kernel_opcode_with_aux([8, RAX], [None; 4],
+            Opcode::TryStoreIntegerOctets1To8Layout, AuxData::AllocationDimensionInBounds);
+        for start in [0, 1] {
+            for count in [1, 7, 8] {
+                for lane in [-1, 0, 0x0102_0304_0506i64] {
+                    // Every invocation satisfies the independently verified
+                    // capacity precondition. Bounds-failure cases stay in the
+                    // existing dynamically checked kernel matrix.
+                    let mut bytes = Octets::new(start + count, false);
+                    assert_eq!(run(&code, [bytes.tagged(), fx(start as i64), fx((start+count) as i64), fx(lane)]),
+                        [T.to_raw(), fx(((lane as i128) >> (8*count)) as i64)]);
+                    for i in 0..start {
+                        let ptr = bytes.words.as_ptr().cast::<u8>();
+                        assert_eq!(unsafe { *ptr.add(bytes.data_offset+i) }, 0xa5);
+                    }
+                    for i in 0..count {
+                        let ptr = bytes.words.as_ptr().cast::<u8>();
+                        assert_eq!(unsafe { *ptr.add(bytes.data_offset+start+i) }, ((lane as i128 >> (8*i)) & 255) as u8);
+                    }
+                }
+            }
+        }
+        let mut bytes = Octets::new(8, false); let before = bytes.words.clone();
+        assert_eq!(run(&code, [bytes.tagged(), fx(0), fx(8), T.to_raw()])[0], NIL.to_raw());
+        assert_eq!(bytes.words, before, "integer/type guard remains before any write");
     }
 
 }

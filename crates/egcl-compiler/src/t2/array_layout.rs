@@ -173,7 +173,9 @@ pub fn verify_accesses(f: &Function) -> Result<(), String> {
             let extent = data.opcode == Opcode::TryStoreIntegerOctets1To8Extent;
             if data.args.len() != if extent { 6 } else { 5 }
                 || data.results.len() != 2
-                || !(matches!(data.aux, AuxData::None) || (extent && matches!(data.aux, AuxData::AllocationExtentInBounds)))
+                || !(matches!(data.aux, AuxData::None)
+                    || (extent && matches!(data.aux, AuxData::AllocationExtentInBounds))
+                    || (!extent && matches!(data.aux, AuxData::AllocationDimensionInBounds)))
                 || data.flags
                     != (InstFlags {
                         effectful: true,
@@ -193,6 +195,10 @@ pub fn verify_accesses(f: &Function) -> Result<(), String> {
                 || (matches!(data.aux, AuxData::AllocationExtentInBounds)
                     && !super::allocation_extent::end_in_bounds(f, inst, &facts))) {
                 return Err("invalid correlated extent or unproved capacity bound".into());
+            }
+            if !extent && matches!(data.aux, AuxData::AllocationDimensionInBounds)
+                && !super::allocation_extent::dimension_in_bounds(f, inst, &facts) {
+                return Err("unproved allocation dimension capacity bound".into());
             }
             let Some(seed) = facts.origin(data.args[4]) else {
                 return Err("layout witness has no unique producer".into());

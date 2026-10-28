@@ -90,26 +90,33 @@ pub fn specialize(f: &mut Function) -> usize {
     if *DISABLED.get_or_init(|| std::env::var_os("EGCL_DISABLE_ALLOCATION_FACTS").is_some()) {
         return 0;
     }
-    let facts = StructuralFacts::analyze(f);
     let candidates: Vec<_> = f
         .block_order()
         .iter()
         .flat_map(|&b| &f.block(b).insts)
         .copied()
-        .filter(|&i| f.inst(i).opcode == Opcode::PackedU8Layout)
+        .filter(|&i| {
+            let d = f.inst(i);
+            d.opcode == Opcode::PackedU8Layout
+                && d.args.len() == 1
+                && d.results.len() == 1
+                && d.flags == InstFlags::default()
+                && matches!(d.aux, AuxData::None)
+                && d.frame_state.is_none()
+                && d.targets.is_empty()
+        })
         .collect();
+    if candidates.is_empty() {
+        // A previous invocation may already have materialized allocation
+        // witnesses. Preserve their extent continuation without building an
+        // otherwise unused structural snapshot for this pass.
+        super::allocation_extent::specialize(f);
+        return 0;
+    }
+    let facts = StructuralFacts::analyze(f);
     let mut changed = 0;
     for probe in candidates {
         let d = f.inst(probe);
-        if d.args.len() != 1
-            || d.results.len() != 1
-            || d.flags != InstFlags::default()
-            || !matches!(d.aux, AuxData::None)
-            || d.frame_state.is_some()
-            || !d.targets.is_empty()
-        {
-            continue;
-        }
         let Some(seed) = facts.origin(d.args[0]) else {
             continue;
         };

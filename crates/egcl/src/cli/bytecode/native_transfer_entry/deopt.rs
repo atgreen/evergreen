@@ -95,6 +95,16 @@ fn note_segment_deopt(code: &TransferCode, guard_bcp: u32) {
             });
         if !native.is_t2 || numeric_failure {
             note_native_deopt(*symbol, Some(native), Some(guard_bcp));
+            // Function policy can retire this publication immediately. Retained
+            // callers must also stop entering its failed machine body; only
+            // this exact activation's code is marked, never its replacement.
+            let still_installed = NATIVE_REGISTRY.with(|registry| {
+                registry.borrow().get(symbol)
+                    .is_some_and(|current| Rc::ptr_eq(current, native))
+            });
+            if !still_installed {
+                code.recompile.set(true);
+            }
             return;
         }
     }

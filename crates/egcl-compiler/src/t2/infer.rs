@@ -1130,7 +1130,10 @@ fn entry_environment(
                     .get(&rf.value)
                     .copied()
                     .unwrap_or_else(|| g.get(rf.value));
-                env.insert(rf.value, ty_meet(cur, rf.ty));
+                let refined = ty_meet(cur, rf.ty);
+                if refined != cur {
+                    env.insert(rf.value, refined);
+                }
             }
         }
         if d != b {
@@ -1143,7 +1146,10 @@ fn entry_environment(
                         .get(&rf.value)
                         .copied()
                         .unwrap_or_else(|| g.get(rf.value));
-                    env.insert(rf.value, ty_meet(cur, rf.ty));
+                    let refined = ty_meet(cur, rf.ty);
+                if refined != cur {
+                    env.insert(rf.value, refined);
+                }
                 }
             }
         }
@@ -1161,7 +1167,10 @@ fn apply_normal_return_facts(
 ) {
     super::normal_return_facts::visit_argument_facts(f, inst, |value, ty| {
         let current = env.get(&value).copied().unwrap_or_else(|| g.get(value));
-        env.insert(value, ty_meet(current, ty));
+        let refined = ty_meet(current, ty);
+        if refined != current {
+            env.insert(value, refined);
+        }
     });
 }
 
@@ -2609,6 +2618,41 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn checked_normal_return_refines_untrusted_declared_double_in_successor() {
+        // A declaration without immutable literal metadata is not a global
+        // proof. Only the successful runtime check establishes this original
+        // SSA value's type in its normal continuation.
+        let mut f = Function::new("checked-untrusted-double");
+        let entry = f.entry();
+        let (_, literal) = f.push_inst(entry, InstData {
+            aux: AuxData::HeapLiteral { slot: 0x12340 },
+            ..inst(Opcode::ConstHeapObj)
+        }, &[(IRType::of(TypeBits::DOUBLE_FLOAT), ValueRepresentation::Tagged)]);
+        let literal = literal[0];
+        assert!(f.double_literals.is_empty());
+        let state = f.frame_states.add(crate::t2::frame_state::FrameState {
+            scopes: vec![], remat: vec![],
+        });
+        let (guard, _) = f.push_inst(entry, InstData {
+            args: vec![literal], aux: AuxData::TypeTag(IRType::of(TypeBits::DOUBLE_FLOAT)),
+            flags: InstFlags { guard: true, effectful: true, ..Default::default() },
+            frame_state: Some(state), ..inst(Opcode::Guard)
+        }, &[]);
+        let successor = f.make_block();
+        f.set_terminator(entry, InstData { targets: vec![BlockCall {
+            block: successor, args: vec![] }], ..inst(Opcode::Jump) });
+        let (later, _) = f.push_inst(successor, InstData {
+            args: vec![literal, literal], ..inst(Opcode::GenericEq)
+        }, &[(IRType::TOP, ValueRepresentation::Tagged)]);
+        f.set_terminator(successor, ret());
+        let facts = infer_for_sites(&f, &[guard, later]);
+        assert_eq!(facts.ty(literal), IRType::TOP, "no heap read or declaration trust");
+        assert_eq!(facts.ty_before(guard, literal), IRType::TOP);
+        assert_eq!(facts.ty_before(later, literal), IRType::of(TypeBits::DOUBLE_FLOAT),
+            "the checked predecessor must publish its fact across the edge");
+    }
+
     #[test]
     fn requested_guard_site_captures_prestate_and_later_success_only() {
         let mut f = Function::new("requested-guard-order");

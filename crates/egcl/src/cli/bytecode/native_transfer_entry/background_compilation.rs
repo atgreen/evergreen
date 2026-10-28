@@ -10,7 +10,7 @@ pub(in crate::cli::bytecode) struct EmittedTransfer {
     code_len: usize,
     frame_entry: Option<usize>,
     ordinary_entry: Option<usize>,
-    allocation_extent_counts: (usize, usize),
+    allocation_extent_counts: (usize, usize, usize),
     ordinary_stack_required: Option<usize>,
     ordinary_bound_entry: Option<usize>,
     ordinary_checks_params: bool,
@@ -50,7 +50,7 @@ pub(in crate::cli::bytecode) struct EmittedTransfer {
 }
 
 impl EmittedTransfer {
-    pub(super) fn allocation_extent_counts(&self) -> (usize, usize) {
+    pub(super) fn allocation_extent_counts(&self) -> (usize, usize, usize) {
         self.allocation_extent_counts
     }
 
@@ -375,7 +375,7 @@ impl EmittedTransfer {
                 display_fn_name(&body.name)
             ))
         };
-        let mut allocation_extent_counts = (0, 0);
+        let mut allocation_extent_counts = (0, 0, 0);
         let ordinary = ordinary_ir.filter(|ir| {
             let reason = if context.ordinary_suppressed {
                 return false;
@@ -555,12 +555,14 @@ impl EmittedTransfer {
                 // candidate predates these ordinary-only allocation rewrites.
                 allocation_extent_counts = ir.block_order().iter()
                     .flat_map(|&block| ir.block(block).insts.iter())
-                    .fold((0, 0), |(values, proofs), &inst| {
+                    .fold((0, 0, 0), |(values, proofs, dimensions), &inst| {
                         use egcl_compiler::t2::ir::{AuxData, Opcode};
                         let d = ir.inst(inst);
                         (values + usize::from(d.opcode == Opcode::PackedU8AllocationExtent),
                          proofs + usize::from(d.opcode == Opcode::TryStoreIntegerOctets1To8Extent
-                             && matches!(d.aux, AuxData::AllocationExtentInBounds)))
+                             && matches!(d.aux, AuxData::AllocationExtentInBounds)),
+                         dimensions + usize::from(d.opcode == Opcode::TryStoreIntegerOctets1To8Layout
+                             && matches!(d.aux, AuxData::AllocationDimensionInBounds)))
                     });
                 ordinary_arity = Some(arity);
                 Some((emitted, sites))
@@ -777,7 +779,7 @@ impl EmittedTransfer {
             ordinary_entry: emitted.ordinary_entry,
             allocation_extent_counts: if emitted.ordinary_entry.is_some() {
                 allocation_extent_counts
-            } else { (0, 0) },
+            } else { (0, 0, 0) },
             ordinary_stack_required: emitted.ordinary_stack_required,
             ordinary_bound_entry: emitted.ordinary_bound_entry,
             ordinary_checks_params: emitted.ordinary_checks_params,
