@@ -885,13 +885,25 @@ fn nd_collect(
     Ok(())
 }
 
-/// The elements of a list, simple vector, bit vector or string, in order;
-/// None for a non-sequence. (A vector with a fill pointer, or an adjustable
-/// or displaced one, is not read here: its element accessors live in
-/// egcl-stdlib, which this crate cannot reach.)
+/// The elements of a list, simple vector, bit vector, packed byte vector
+/// or string, in order; None for a non-sequence. (A
+/// vector with a fill pointer, or an adjustable or displaced one, is not
+/// read here: its element accessors live in egcl-stdlib, which this crate
+/// cannot reach.)
 fn sequence_items(node: EgclVal) -> Option<Vec<EgclVal>> {
     if node == NIL {
         return Some(Vec::new());
+    }
+    // An (unsigned-byte 8) vector is packed byte storage, not a
+    // SIMPLE_VECTOR, so `#1a#.(make-array 4 :element-type '(unsigned-byte 8)
+    // ...)` reads its elements through the packed accessor (syntax.sharp-a.8);
+    // each element is a fixnum, so nothing here allocates.
+    if let Some(length) = egcl_rt::packed_u8::len(node) {
+        return Some(
+            (0..length)
+                .map(|i| EgclVal::from_fixnum(i64::from(egcl_rt::packed_u8::get(node, i).unwrap_or(0))))
+                .collect(),
+        );
     }
     if node.is_cons() {
         let mut items = Vec::new();
