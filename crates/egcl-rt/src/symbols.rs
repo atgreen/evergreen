@@ -487,9 +487,17 @@ pub fn symbol_name(idx: u32) -> Option<String> {
 /// distinct symbol (a unique high-range index) with a real heap object, but the
 /// name is not added to the intern map, so `intern`/`find_index` never return it.
 pub fn make_uninterned(name: &str) -> EgclVal {
-    let idx = UNINTERNED_COUNTER.fetch_add(1, Ordering::Relaxed);
     let name_str = alloc_name(name, false);
-    let sym = alloc_pinned_symbol(name_str, NIL);
+    make_uninterned_with_name(name_str)
+}
+
+/// Create a fresh private symbol sharing an existing immutable name string.
+/// The symbol identity and all mutable symbol cells remain independent.
+pub fn make_uninterned_with_name(name: EgclVal) -> EgclVal {
+    assert!(name.is_string(), "symbol name must be a string");
+    crate::rooted!(name = name);
+    let idx = UNINTERNED_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let sym = alloc_pinned_symbol(*name, NIL);
     with_registry_mut(|reg| {
         reg.uninterned.insert(idx, sym);
     });

@@ -2811,8 +2811,7 @@ unsafe fn lexical_environment_request(
             let captured = unsafe { (*context.env_frame).clone() };
             // As for a non-capturing closure: nothing allocates between its
             // creation and the outcome write.
-            let closure = super::make_bytecode_closure(&nested, captured);
-            super::register_closure_control(closure, unsafe { &*NATIVE_ENV.with(Cell::get) });
+            let closure = super::make_template_closure(&nested, captured, unsafe { &*NATIVE_ENV.with(Cell::get) });
             Ok(closure)
         }
         _ => Err(invalid_capture()),
@@ -2939,8 +2938,7 @@ unsafe fn call_or_throw_unpublished(
                     let nested = Arc::clone(body.nested_functions
                         .get(call.symbol as u32 as usize)
                         .ok_or_else(invalid_capture)?);
-                    let closure = super::make_bytecode_closure(&nested, None);
-                    super::register_closure_control(closure, env);
+                    let closure = super::make_template_closure(&nested, None, env);
                     Ok(closure)
                 } else {
                     let symbol = EgclVal::from_symbol_index(call.symbol as u32);
