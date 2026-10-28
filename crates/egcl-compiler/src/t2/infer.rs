@@ -1194,8 +1194,14 @@ fn capture_site_facts(
     }
     let mut before = HashMap::new();
     for &block in rpo {
+        let instructions = &f.block(block).insts;
+        let Some(last) = instructions.iter().rposition(|inst| requested.contains(inst)) else {
+            continue;
+        };
+        // Each replay starts from converged global facts and the complete
+        // edge/check maps. Other blocks' local environments do not feed it.
         let mut env = entry_environment(block, g, dom, structural, &edges, checks);
-        for &inst in &f.block(block).insts {
+        for &inst in &instructions[..=last] {
             let data = f.inst(inst);
             if requested.contains(&inst) {
                 for &value in &data.args {
@@ -1950,6 +1956,11 @@ mod tests {
                     IRType::TOP
                 }
             );
+            // The predecessor has no requested site in this replay. Its
+            // branch contract still applies, unless an alternate OSR bypasses it.
+            let only_successor = infer_for_sites(&f, &[true_site]);
+            assert_eq!(only_successor.ty_before(true_site, input),
+                facts.ty_before(true_site, input));
             // Unrequested sites and nonoperands never gain scoped proofs.
             assert_eq!(facts.ty_before(site(bool_use[0]), input), facts.ty(input));
             assert_eq!(
@@ -2655,6 +2666,10 @@ mod tests {
         assert_eq!(facts.ty_before(guard, literal), IRType::TOP);
         assert_eq!(facts.ty_before(later, literal), IRType::of(TypeBits::DOUBLE_FLOAT),
             "the checked predecessor must publish its fact across the edge");
+        let only_successor = infer_for_sites(&f, &[later]);
+        assert_eq!(only_successor.ty_before(later, literal),
+            IRType::of(TypeBits::DOUBLE_FLOAT),
+            "an unrequested predecessor still publishes its checked contract");
     }
 
     #[test]
