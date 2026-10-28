@@ -522,6 +522,12 @@ fn effective_char_syntax(rt: EgclVal, c: char) -> (u8, char) {
     standard_char_syntax(c)
 }
 
+/// Built-in macro operation and termination status after syntax delegation.
+pub fn standard_macro_source(readtable: EgclVal, ch: char) -> Option<(char, bool)> {
+    let (code, source) = effective_char_syntax(readtable, ch);
+    matches!(code, 2 | 3).then_some((source, code == 3))
+}
+
 /// True when `c` has whitespace[2] syntax in the current readtable, which is
 /// what PEEK-CHAR with a peek type of T skips (CLHS PEEK-CHAR; ansi
 /// PEEK-CHAR.20/.21).
@@ -1241,6 +1247,9 @@ struct ReaderInput<'a> {
     chars: InputChars<'a>,
     stream: Option<&'a mut dyn ReaderStream>,
     eof: bool,
+    // Used only when invoking an ordinary standard reader-macro function.
+    // Consumed before recursive reads, which retain the caller's readtable.
+    initial_standard_macro: Option<char>,
 }
 
 impl<'a> ReaderInput<'a> {
@@ -1249,6 +1258,7 @@ impl<'a> ReaderInput<'a> {
             chars: InputChars::Slice(chars),
             stream: None,
             eof: true,
+            initial_standard_macro: None,
         }
     }
 
@@ -1351,6 +1361,7 @@ pub fn read_from_stream(
         chars: InputChars::Buffered(Vec::new()),
         stream: Some(stream),
         eof: false,
+        initial_standard_macro: None,
     };
     let (value, mut consumed) = read_form_input(&mut input, 0, read_base, read_eval)?;
     egcl_rt::rooted!(value = value);
@@ -1370,6 +1381,43 @@ pub fn read_from_stream(
     input.unread_lookahead(consumed)?;
     Ok(*value)
 }
+/// Invoke an ordinary standard macro function after its macro character was
+/// consumed. Only the initial operation is fixed; recursive reads use the live
+/// readtable. Dispatching # is deliberately excluded (its table is char-keyed).
+pub fn read_standard_macro_from_stream(
+    stream: &mut dyn ReaderStream,
+    source: char,
+    invoked_character: char,
+    read_base: u32,
+    read_eval: bool,
+) -> Result<Vec<EgclVal>, EgclError> {
+    if !matches!(source, '(' | ')' | '\'' | '"' | ';' | '`' | ',') {
+        return Err(EgclError::StreamError("not an ordinary standard reader macro".into()));
+    }
+    let mut input = ReaderInput {
+        chars: InputChars::Buffered(vec![invoked_character]),
+        stream: Some(stream),
+        eof: false,
+        initial_standard_macro: Some(source),
+    };
+    if source == ';' {
+        let mut pos = 1;
+        while input.has(pos)? {
+            if input.at(pos)? == '\n' { break; }
+            pos += 1;
+        }
+        return Ok(Vec::new());
+    }
+    egcl_rt::rooted!(labels = CircularLabels { labels: HashMap::new() });
+    let (value, consumed) = read_token_with_base(
+        &mut input, 0, &mut labels, read_base, read_eval,
+        default_string_reader_circular_mode(), 0,
+    )?;
+    egcl_rt::rooted!(value = value);
+    input.unread_lookahead(consumed)?;
+    Ok(if *value == MISSING { Vec::new() } else { vec![*value] })
+}
+
 // ── Core reader ───────────────────────────────────────────────────
 
 pub fn read(state: &mut ReaderState) -> Result<EgclVal, EgclError> {
@@ -1636,8 +1684,12 @@ fn read_token_with_base(
             "reader nesting limit exceeded".into(),
         ));
     }
-    // Skip whitespace and line comments
-    pos = skip_whitespace_and_comments(chars, pos)?;
+    let initial_standard_macro = chars.initial_standard_macro.take();
+    // A directly invoked standard handler starts at the synthetic macro char,
+    // even when that character has different syntax in the caller's table.
+    if initial_standard_macro.is_none() {
+        pos = skip_whitespace_and_comments(chars, pos)?;
+    }
     if !chars.has(pos)? {
         return Ok((EOF, pos));
     }
@@ -1646,7 +1698,9 @@ fn read_token_with_base(
     // standard hardcoded dispatch. `dispatch_ch` is the character whose built-in
     // reader behaviour applies (the copied "delegate"), so e.g. a char given
     // `(`-syntax opens a list.
-    let dispatch_ch = if any_char_syntax_override() {
+    let dispatch_ch = if let Some(source) = initial_standard_macro {
+        source
+    } else if any_char_syntax_override() {
         let rt = current_readtable_value();
         let (code, delegate) = effective_char_syntax(rt, ch);
         match code {
@@ -4725,6 +4779,15 @@ pub fn set_standard_macro_syntax(readtable: EgclVal, ch: char, non_terminating: 
         table.insert((key, ch), (code, ch));
     }
     ANY_CHAR_SYNTAX_OVERRIDE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Install an ordinary built-in handler under a different character.
+pub fn set_standard_macro_alias(readtable: EgclVal, to: char, source: char, non_terminating: bool) {
+    set_standard_macro_syntax(readtable, to, non_terminating);
+    let key = readtable_key(readtable);
+    let mut guard = CHAR_SYNTAX.lock().unwrap();
+    guard.get_or_insert_with(HashMap::new)
+        .insert((key, to), (if non_terminating { 3 } else { 2 }, source));
 }
 
 /// Drop a custom `#` sub-character reader from `readtable`, so the built-in one

@@ -15075,6 +15075,7 @@ fn read_eval_all_env(source: &str, env: &mut Env) -> Result<EgclVal, EgclError> 
         // owns no locks.  Keep the form's result rooted across those calls.
         run_deferred_lisp_finalizers(env);
         last = value;
+        print_loaded_value(last, env)?;
         if let Some(t1) = t1 {
             eval_ns += t1.elapsed().as_nanos();
         }
@@ -15088,6 +15089,29 @@ fn read_eval_all_env(source: &str, env: &mut Env) -> Result<EgclVal, EgclError> 
         );
     }
     Ok(last)
+}
+
+/// Use symbol-aware lookup for standard specials: a captured frame can carry
+/// an older lexical copy while its live dynamic binding is in the value cell.
+fn dynamic_standard_variable(env: &Env, name: &str) -> Option<EgclVal> {
+    egcl_rt::symbols::find_index(name)
+        .and_then(|index| env.lookup_var_symbol(EgclVal::from_symbol_index(index)))
+        .or_else(|| env.lookup_var(name))
+}
+
+/// LOAD's result printing uses the Lisp output stream and the active printer.
+fn print_loaded_value(value: EgclVal, env: &mut Env) -> Result<(), EgclError> {
+    if !matches!(env.eval_context, EvalContext::Load)
+        || !dynamic_standard_variable(env, "*LOAD-PRINT*").is_some_and(|v| v != NIL)
+    {
+        return Ok(());
+    }
+    egcl_rt::rooted!(value = value);
+    egcl_rt::rooted!(output = dynamic_standard_variable(env, "*STANDARD-OUTPUT*").unwrap_or(T));
+    let previous = PRINT_ENV.with(|slot| slot.replace(env as *mut Env));
+    let result = egcl_stdlib::format(*output, "~&~S~%", &[*value]);
+    PRINT_ENV.with(|slot| slot.set(previous));
+    result.map(|_| ())
 }
 
 /// Invoke callbacks queued by the collector, outside every GC lock.
@@ -15113,6 +15137,8 @@ fn run_deferred_lisp_finalizers(env: &mut Env) {
     env.mv_active = saved_mv_active;
 }
 
+type CompileReadForms = (Vec<EgclVal>, Vec<String>, Vec<usize>);
+
 /// Pre-read a source file's top-level forms for COMPILE-FILE, processing
 /// compile-time effects as it goes.
 ///
@@ -15129,7 +15155,7 @@ fn read_forms_for_compile(
     src_path: &str,
     compile_time_failure: &mut Option<()>,
     env: &mut Env,
-) -> Result<(Vec<EgclVal>, Vec<String>), EgclError> {
+) -> Result<CompileReadForms, EgclError> {
     with_eval_context(env, EvalContext::CompileFile, |env| {
         reader::set_read_eval_hook(Some(read_time_eval));
         reader::set_macro_handler_invoker(Some(reader_macro_invoker));
@@ -15141,6 +15167,7 @@ fn read_forms_for_compile(
         let mut forms = Vec::new();
         egcl_rt::rooted_ref!(_forms_root = &mut forms);
         let mut definition_packages = Vec::new();
+        let mut source_group_ends = Vec::new();
         loop {
             while pos < chars.len() && chars[pos].is_ascii_whitespace() {
                 pos += 1;
@@ -15178,6 +15205,13 @@ fn read_forms_for_compile(
             // package, so its target symbol's home package is not necessarily
             // the package in which the expander was defined.
             let definition_package = env.current_package.clone();
+            if dynamic_standard_variable(env, "*COMPILE-PRINT*").is_some_and(|v| v != NIL) {
+                egcl_rt::rooted!(output = dynamic_standard_variable(env, "*STANDARD-OUTPUT*").unwrap_or(T));
+                let previous = PRINT_ENV.with(|slot| slot.replace(env as *mut Env));
+                let printed = egcl_stdlib::format(*output, "; ~S~%", &[val]);
+                PRINT_ENV.with(|slot| slot.set(previous));
+                printed?;
+            }
             seed_compile_time_definitions(val, env)?;
             // A compile-time effect that FAILS is a failed compilation, not a
             // footnote. This used to discard the error, mentioning it only under
@@ -15226,9 +15260,10 @@ fn read_forms_for_compile(
                 }
             }
             forms.extend(load_forms);
+            source_group_ends.push(forms.len());
             pos = next_pos;
         }
-        Ok((forms, definition_packages))
+        Ok((forms, definition_packages, source_group_ends))
     })
 }
 
@@ -15600,7 +15635,15 @@ fn compile_file_load_forms(form: EgclVal, env: &mut Env) -> Result<Vec<EgclVal>,
             let mut result = Vec::new();
             egcl_rt::rooted_ref!(_result_root = &mut result);
             for index in 0..nested_forms.len() {
-                result.extend(compile_file_load_forms(nested_forms[index], env)?);
+                let expanded = compile_file_load_forms(nested_forms[index], env)?;
+                if index + 1 == nested_forms.len() && expanded.is_empty() {
+                    result.push(NIL);
+                } else {
+                    result.extend(expanded);
+                }
+            }
+            if result.is_empty() {
+                result.push(NIL);
             }
             Ok(result)
         }
@@ -15618,7 +15661,15 @@ fn compile_file_load_forms(form: EgclVal, env: &mut Env) -> Result<Vec<EgclVal>,
                 let mut result = Vec::new();
                 egcl_rt::rooted_ref!(_result_root = &mut result);
                 for index in 0..nested_forms.len() {
-                    result.extend(compile_file_load_forms(nested_forms[index], env)?);
+                    let expanded = compile_file_load_forms(nested_forms[index], env)?;
+                    if index + 1 == nested_forms.len() && expanded.is_empty() {
+                        result.push(NIL);
+                    } else {
+                        result.extend(expanded);
+                    }
+                }
+                if result.is_empty() {
+                    result.push(NIL);
                 }
                 Ok(result)
             } else {
@@ -15643,7 +15694,12 @@ fn compile_file_load_forms(form: EgclVal, env: &mut Env) -> Result<Vec<EgclVal>,
             egcl_rt::rooted_ref!(_result_root = &mut result);
             let nested_result = (|| {
                 for index in 0..nested_forms.len() {
-                    result.extend(compile_file_load_forms(nested_forms[index], env)?);
+                    let expanded = compile_file_load_forms(nested_forms[index], env)?;
+                    if index + 1 == nested_forms.len() && expanded.is_empty() {
+                        result.push(NIL);
+                    } else {
+                        result.extend(expanded);
+                    }
                 }
                 // Flattening removes this MACROLET from the load actions.
                 // Expand uses inside emitted definitions before restoring the
@@ -15661,6 +15717,9 @@ fn compile_file_load_forms(form: EgclVal, env: &mut Env) -> Result<Vec<EgclVal>,
             })();
             restore_toplevel_macrolet(env, &mut saved_names, &mut saved_definitions);
             nested_result?;
+            if result.is_empty() {
+                result.push(NIL);
+            }
             Ok(result)
         }
         _ => Ok(vec![*form]),
@@ -15771,6 +15830,9 @@ fn bootstrap_define_package_operator(op: EgclVal, env: &Env) -> bool {
 /// SETQ and SETF were on this list too and are gone with it: an assignment has
 /// no compile-time semantics.
 ///
+/// DEFUN likewise establishes no function binding during compilation. An
+/// explicit (:COMPILE-TOPLEVEL) EVAL-WHEN still evaluates its body normally.
+///
 /// So are DEFGENERIC and DEFMETHOD (bliss-459lt): CLHS gives them no
 /// compile-time effect, and installing a method while compiling changed the
 /// running image. ASDF-FLV defines an ASDF:PERFORM :AROUND method next to the
@@ -15789,7 +15851,6 @@ fn compile_toplevel_form_has_effect(form: EgclVal, env: &Env) -> bool {
     matches!(
         symbol_leaf_name(&name),
         "EVAL-WHEN"
-            | "DEFUN"
             | "DEFMACRO"
             | "DEFINE-COMPILER-MACRO"
             | "DEFINE-SYMBOL-MACRO"
@@ -19906,6 +19967,11 @@ fn load_path_into_env(path: &str, env: &mut Env) -> Result<EgclVal, EgclError> {
                 EgclError::FileError(format!("cannot read {}: {}", resolved_path, e))
             })?,
         };
+        if dynamic_standard_variable(env, "*LOAD-VERBOSE*").is_some_and(|v| v != NIL) {
+            egcl_rt::rooted!(output = dynamic_standard_variable(env, "*STANDARD-OUTPUT*").unwrap_or(T));
+            egcl_rt::rooted!(path = arena_str(&resolved_path));
+            egcl_stdlib::format(*output, "; Loading ~A~%", &[*path])?;
+        }
         // A EGCL FASL (.bfasl) starts with the BFASL magic — verify and load the
         // compiled unit (bliss-lb6.6); otherwise treat the file as source.
         if bytes.len() >= egcl_rt::bfasl::BFASL_MAGIC.len()
@@ -20013,6 +20079,49 @@ fn replace_compile_file_error_count(count: usize) -> usize {
     COMPILE_FILE_ERROR_COUNT.with(|cell| cell.replace(count))
 }
 
+#[derive(Clone, Copy, Default)]
+struct CompileFileWarningFlags {
+    any: bool,
+    non_style: bool,
+}
+
+static COMPILE_FILE_WARNINGS: egcl_rt::execution_local::ExecutionLocal<std::cell::Cell<Option<CompileFileWarningFlags>>> =
+    unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| const { std::cell::Cell::new(None) }) };
+
+/// Nested compilations return their own flags and also contribute actual
+/// warnings to the enclosing compilation. RAII restores state on error exits.
+struct CompileFileWarningScope {
+    previous: Option<CompileFileWarningFlags>,
+}
+impl CompileFileWarningScope {
+    fn new() -> Self {
+        Self { previous: COMPILE_FILE_WARNINGS.with(|state| state.replace(Some(CompileFileWarningFlags::default()))) }
+    }
+    fn flags(&self) -> CompileFileWarningFlags {
+        COMPILE_FILE_WARNINGS.with(|state| state.get().unwrap_or_default())
+    }
+}
+impl Drop for CompileFileWarningScope {
+    fn drop(&mut self) {
+        let current = self.flags();
+        let restored = self.previous.map(|mut outer| {
+            outer.any |= current.any;
+            outer.non_style |= current.non_style;
+            outer
+        });
+        COMPILE_FILE_WARNINGS.with(|state| state.set(restored));
+    }
+}
+fn record_compile_file_warning(style: bool) {
+    COMPILE_FILE_WARNINGS.with(|state| {
+        if let Some(mut flags) = state.get() {
+            flags.any = true;
+            flags.non_style |= !style;
+            state.set(Some(flags));
+        }
+    });
+}
+
 /// Print each compile-time error COMPILE-FILE found to `*ERROR-OUTPUT*`, in the
 /// `; caught ERROR:` style SBCL uses, and count it so COMPILE-FILE returns
 /// WARNINGS-P and FAILURE-P true (CLHS 3.2.5).
@@ -20053,7 +20162,7 @@ fn build_bfasl_from_source(
     // re-reads the text form-by-form WITH evaluation, so the compile-time
     // reader state exists when the custom syntax is reached (bliss-tzc2).
     let mut compile_time_failure = None;
-    let (mut forms, definition_packages) =
+    let (mut forms, definition_packages, source_group_ends) =
         match read_forms_for_compile(source, src_path, &mut compile_time_failure, env) {
             Ok(forms) => forms,
             // A compile-time evaluation that signalled is a FAILED COMPILATION —
@@ -20101,6 +20210,7 @@ fn build_bfasl_from_source(
     let unit = bytecode::build_bbu_from_forms(
         &forms,
         &definition_packages,
+        &source_group_ends,
         src_path,
         source,
         env,
@@ -23144,6 +23254,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             "SET-SYNTAX-FROM-CHAR" => return eval_builtin_arguments(&name, cdr, env),
             "SET-MACRO-CHARACTER" => return eval_builtin_arguments(&name, cdr, env),
             "GET-MACRO-CHARACTER" => return eval_builtin_arguments(&name, cdr, env),
+            "EGCL::%READ-STANDARD-MACRO" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::%COPY-READTABLE" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::%READTABLE-CASE" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::%SET-READTABLE-CASE" => return eval_builtin_arguments(&name, cdr, env),
@@ -27962,9 +28073,31 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             "COMPILE-FILE-PATHNAME" => return eval_builtin_arguments(&name, cdr, env),
             #[cfg(not(egcl_no_dynamic_code))]
             "REQUIRE" => {
-                let (module_form, _) = cp(cdr);
-                let module_val = eval_form(module_form, env)?;
-                return require_module(module_val, env);
+                let args = eval_args(cdr, env)?;
+                if !(1..=2).contains(&args.len()) {
+                    return Err(EgclError::ProgramError(
+                        "REQUIRE expects a module name and optional pathname list".into(),
+                    ));
+                }
+                if args.len() == 2 && args[1] != NIL {
+                    let name = module_designator_name(args[0]);
+                    if module_provided(env, &name) {
+                        return Ok(NIL);
+                    }
+                    let paths = if args[1].is_cons() {
+                        list_to_vec(args[1])
+                    } else {
+                        vec![args[1]]
+                    };
+                    let paths = RootedVals::new(paths);
+                    for index in 0..paths.len() {
+                        egcl_rt::rooted!(pathname = resolve_against_dpd(paths[index], env)?);
+                        let path = path_designator_to_string(*pathname)?;
+                        load_path_into_env(&path, env)?;
+                    }
+                    return Ok(T);
+                }
+                return require_module(args[0], env);
             }
             "PROVIDE" => {
                 let (module_form, _) = cp(cdr);
@@ -43573,7 +43706,7 @@ fn is_builtin_function(name: &str) -> bool {
     if name == "PRINT-OBJECT" {
         return true;
     }
-    if matches!(name, "EGCL::%STANDARD-CHARACTER-READER" | "EGCL::SET-FILL-POINTER"
+    if matches!(name, "EGCL::%READ-STANDARD-MACRO" | "EGCL::%STANDARD-CHARACTER-READER" | "EGCL::SET-FILL-POINTER"
         | "EGCL::%PPRINT-CIRCLE" | "EGCL::%PPRINT-NATIVE-COLUMN"
         | "EGCL::%PPRINT-RENDER-LAYOUT" | "EGCL::%FORMAT-CONSUMED"
         | "EGCL::%NATIVE-INTERACTIVE-STREAM-P") {

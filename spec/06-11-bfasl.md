@@ -554,6 +554,7 @@ lets required executable policy reject an older reader instead of being lost.
 | `FunctionMetadata` | MUST for bytecode version 1.3+ | per-function `has_env`/`variadic` flags and parameter name, `VarLoc`, and primitive declared-type entries |
 | `NotinlineSites` | Present when needed | effective source `NOTINLINE` decisions for named calls; retained across later tiers |
 | `SelfCallSites` | Optional | source-proven calls bound to the executing definition, excluding effective `NOTINLINE` declarations and differently resolved lexical names |
+| `TopLevelResults` | Optional | source-form result boundaries for `LOAD :PRINT`, independently of internal installation actions |
 
 Debug records may include macroexpansion provenance as source spans or compact
 forms for tooling, but the executable semantics remain the bytecode and load
@@ -568,6 +569,21 @@ u16 slot, u8 declared_type}`. Location kind 0 names a checked local slot; kind
 mean `Any`, `Fixnum`, and `SingleFloat`. A variadic function's core
 `lambda_list_ref` is executable binder metadata and MUST be present; it is not
 a retained function body or source fallback.
+
+`TopLevelResults` uses `table_kind = 13`, `flags = 0`. Its payload is a
+`u32` group count followed by three `u32` words per group: the exclusive action
+end, result kind, and result index. Kind 0 denotes NIL with index `0xffffffff`;
+kind 1 names a user-result action; kind 2 names a materialized constant-pool value
+(for example an original definer name). Ends are nondecreasing and cover the
+complete action stream. An action result belongs to its own group and cannot
+select internal interning, closure registration, or load-time-cell initialization.
+Constant indexes are checked before actions execute; they do not evaluate forms
+or repeat initializer effects. Repeated ends
+represent empty source forms. The loader retains the selected result across
+remaining internal actions, then prints once per original source form. Image
+restoration does not print these results. Unknown flags-zero auxiliary tables
+are skippable by older readers; pre-metadata FASLs need recompilation to retain
+exact source-form printing boundaries. No constant or action record is changed.
 
 `NotinlineSites` uses `table_kind = 12`, with `flags = 1`. Its payload is a
 `u32 function_count`, then for each function a `u32 site_count` and strictly

@@ -1290,6 +1290,24 @@
 ;; readtable that still reads.  A semicolon consumes the comment and returns no
 ;; values; a close paren is the reader error it always is.
 (defvar egcl::*standard-readtable-for-macro-functions* nil)
+;; Ordinary macro functions retain their source operation when installed on
+;; another character. Recursive reads continue to use the caller's readtable;
+;; the invocation character still determines a string reader's closing delimiter.
+(defun egcl::%standard-list-reader (stream char)
+  (egcl::%read-standard-macro stream #\( char))
+(defun egcl::%standard-close-reader (stream char)
+  (egcl::%read-standard-macro stream #\) char))
+(defun egcl::%standard-quote-reader (stream char)
+  (egcl::%read-standard-macro stream #\' char))
+(defun egcl::%standard-string-reader (stream char)
+  (egcl::%read-standard-macro stream #\" char))
+(defun egcl::%standard-comment-reader (stream char)
+  (egcl::%read-standard-macro stream #\; char))
+(defun egcl::%standard-backquote-reader (stream char)
+  (egcl::%read-standard-macro stream #\` char))
+(defun egcl::%standard-comma-reader (stream char)
+  (egcl::%read-standard-macro stream #\, char))
+
 (defun egcl::%standard-reader-macro (stream char)
   (cond ((char= char #\;) (read-line stream nil nil) (values))
         ((char= char #\)) (error 'reader-error :stream stream))

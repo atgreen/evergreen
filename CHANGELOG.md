@@ -269,6 +269,12 @@
   including empty vectors and multidimensional rows
   ([#721](https://github.com/atgreen/evergreen/pull/721)).
 
+- `COMPILE-FILE` keeps ordinary function definitions out of the compiling image
+  and honors output pathnames, printing options, and style versus ordinary
+  warning flags. `LOAD` honors output options
+  and copied reader-macro operations, and `REQUIRE` accepts explicit pathnames
+  ([#738](https://github.com/atgreen/evergreen/pull/738)).
+
 - Interpreted `MULTIPLE-VALUE-BIND` preserves uninterned variable identity,
   preventing fresh SETF-expander store variables from permanently retaining
   their generated names during workloads such as TLS I/O

@@ -10540,6 +10540,9 @@ const BBU_AUX_HANDLER_CASES: u16 = 9;
 // Optional: older units conservatively retain dynamic named calls.
 const BBU_AUX_SELF_CALL_SITES: u16 = 10;
 const BBU_AUX_NOTINLINE_SITES: u16 = 12;
+// Optional printing metadata; unknown flags-zero auxiliary tables are skipped
+// by prior readers without changing the load plan or constant interpretation.
+const BBU_AUX_TOPLEVEL_RESULTS: u16 = 13;
 const BBU_AUX_REQUIRED_POLICY: u16 = 1;
 // Per function, each HANDLER-BIND's condition type names (0x0203). Absent from
 // older units, whose functions could not contain PUSH_HANDLER_BIND.
@@ -11722,6 +11725,73 @@ fn serialize_bbu_notinline_sites(functions: &[BbuFunction]) -> Vec<u8> {
     out
 }
 
+#[derive(Clone, Copy)]
+struct BbuPrintGroup {
+    // Exclusive action end; repeated ends represent empty/NIL source forms.
+    end: u32,
+    // 0 = NIL, 1 = action result, 2 = materialized constant.
+    result_kind: u32,
+    result: u32,
+}
+
+fn serialize_bbu_print_groups(groups: &[BbuPrintGroup]) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_u32(&mut out, groups.len() as u32);
+    for group in groups {
+        put_u32(&mut out, group.end);
+        put_u32(&mut out, group.result_kind);
+        put_u32(&mut out, group.result);
+    }
+    out
+}
+
+fn parse_bbu_print_groups(bytes: &[u8], actions: &[BbuLoadAction], constant_count: usize) -> Result<Vec<BbuPrintGroup>, EgclError> {
+    let mut cursor = BbuCursor::new(bytes);
+    let count = cursor.u32()? as usize;
+    if count > bytes.len().saturating_sub(4) / 12 {
+        return Err(bbu_error("invalid top-level result count"));
+    }
+    let mut groups = Vec::with_capacity(count);
+    let mut previous_end = 0;
+    for _ in 0..count {
+        let end = cursor.u32()?;
+        let result_kind = cursor.u32()?;
+        let result = cursor.u32()?;
+        let valid_result = match result_kind {
+            0 => result == BBU_NO_INDEX,
+            1 => result >= previous_end && result < end && (result as usize) < actions.len()
+                && matches!(actions[result as usize].kind, 1 | 3 | 4 | 5 | 7 | 8 | 9 | 12),
+            2 => (result as usize) < constant_count,
+            _ => false,
+        };
+        if end < previous_end || end as usize > actions.len() || !valid_result {
+            return Err(bbu_error("invalid top-level result action"));
+        }
+        groups.push(BbuPrintGroup { end, result_kind, result });
+        previous_end = end;
+    }
+    if !cursor.done() || previous_end as usize != actions.len() {
+        return Err(bbu_error("incomplete top-level result groups"));
+    }
+    Ok(groups)
+}
+
+/// Literal user-visible result of a definer whose portable operation may return
+/// an initializer, NIL, or an internal SETF writer name instead. These are data,
+/// not additional evaluation of the initializer or definition.
+fn bbu_definer_result(form: EgclVal) -> Option<EgclVal> {
+    if !form.is_cons() { return None; }
+    let (op, rest) = cp(form);
+    if !op.is_symbol() || !rest.is_cons() { return None; }
+    let name = sym_bare_name_rc(op);
+    if !matches!(name.as_ref(), "DEFUN" | "DEFVAR" | "DEFPARAMETER" | "DEFCONSTANT" | "DEFINE-CONDITION") {
+        return None;
+    }
+    let package = egcl_stdlib::find_package("COMMON-LISP")?;
+    if egcl_stdlib::find_present_symbol(package, &name) != Some(op) { return None; }
+    Some(cp(rest).0)
+}
+
 fn validate_bbu_aux_flags(kind: u16, flags: u16) -> Result<(), EgclError> {
     // Older readers reject all nonzero flags, so they cannot silently discard
     // a negative optimization policy they do not understand.
@@ -11840,6 +11910,8 @@ fn serialize_bbu_handler_cases(functions: &[BbuFunction]) -> Vec<u8> {
 /// `None` means the form has no load-time action after compile-file has already
 /// resolved its effect (an initializer-less DEFVAR).
 fn portable_load_thunk_form(form: EgclVal) -> Option<EgclVal> {
+    let mut form = form;
+    egcl_rt::rooted_ref!(_form_root = &mut form);
     if !form.is_cons() {
         return Some(form);
     }
@@ -11857,31 +11929,40 @@ fn portable_load_thunk_form(form: EgclVal) -> Option<EgclVal> {
             if kind.as_ref() == "DEFVAR" && !init_and_doc.is_cons() {
                 return None;
             }
-            let init = if init_and_doc.is_cons() {
+            let mut init = if init_and_doc.is_cons() {
                 cp(init_and_doc).0
             } else {
                 NIL
             };
+            egcl_rt::rooted_ref!(_init_root = &mut init);
             if kind.as_ref() == "DEFCONSTANT" {
                 // Mirror the DEFCONSTANT macro in lib/boot.lisp: assign and mark
                 // as ONE operation, never a bare SETQ. The fasl re-evaluates this
                 // form at load time, after COMPILE-FILE already evaluated (and so
                 // marked) it, so a SETQ here is an assignment to an established
                 // constant and is refused (bliss-sci0).
-                let quoted = form_list(&[resolve_sym("QUOTE")?, var]);
+                egcl_rt::rooted!(quoted = form_list(&[resolve_sym("QUOTE")?, var]));
                 return Some(form_list(&[
                     resolve_sym("EGCL-INTERNAL::%DEFCONSTANT")?,
-                    quoted,
+                    *quoted,
                     init,
                 ]));
             }
-            let setq = form_list(&[resolve_sym("SETQ")?, var, init]);
+            egcl_rt::rooted!(setq = form_list(&[resolve_sym("SETQ")?, var, init]));
             if kind.as_ref() == "DEFVAR" {
-                let quoted = form_list(&[resolve_sym("QUOTE")?, var]);
-                let boundp = form_list(&[resolve_sym("BOUNDP")?, quoted]);
-                Some(form_list(&[resolve_sym("UNLESS")?, boundp, setq]))
+                egcl_rt::rooted!(quoted = form_list(&[resolve_sym("QUOTE")?, var]));
+                #[cfg(test)]
+                {
+                    // Old addresses are comparison-only snapshots, never dereferenced.
+                    let before = (setq.0, quoted.0);
+                    if compile_file_print_group_tests::collect_portable_intermediates() {
+                        compile_file_print_group_tests::record_portable_movement(before, (setq.0, quoted.0));
+                    }
+                }
+                egcl_rt::rooted!(boundp = form_list(&[resolve_sym("BOUNDP")?, *quoted]));
+                Some(form_list(&[resolve_sym("UNLESS")?, *boundp, *setq]))
             } else {
-                Some(setq)
+                Some(*setq)
             }
         }
         "DEFINE-CONDITION" => {
@@ -12043,6 +12124,7 @@ fn bbu_package_plan(form: EgclVal, env: &Env) -> Result<Option<BbuPackagePlan>, 
 pub fn build_bbu_from_forms(
     forms: &[EgclVal],
     definition_packages: &[String],
+    source_group_ends: &[usize],
     src_path: &str,
     source: &str,
     env: &Env,
@@ -12051,6 +12133,11 @@ pub fn build_bbu_from_forms(
     if forms.len() != definition_packages.len() {
         return Err(bbu_error("compile-file form/package metadata mismatch"));
     }
+    if source_group_ends.windows(2).any(|pair| pair[0] > pair[1])
+        || source_group_ends.last().copied().unwrap_or(0) != forms.len()
+    {
+        return Err(bbu_error("compile-file source group metadata mismatch"));
+    }
     let mut forms = forms.to_vec();
     egcl_rt::rooted_ref!(_forms_root = &mut forms);
     let mut pool = BbuConstPool::default();
@@ -12058,6 +12145,8 @@ pub fn build_bbu_from_forms(
     let source_file_ref = pool.string(src_path);
     let mut functions = Vec::new();
     let mut load_actions: Vec<(u8, u8, u32, u32, u32)> = Vec::new();
+    let mut form_results = Vec::new();
+    let mut form_action_ends = vec![0usize];
 
     // Reading/compile-time evaluation has already restored the caller's
     // package. Local macros still expand during lowering, so restore each
@@ -12076,6 +12165,12 @@ pub fn build_bbu_from_forms(
         let env = &compilation_env;
         let mut form = forms[form_index];
         egcl_rt::rooted_ref!(_form_root = &mut form);
+        let action_start = load_actions.len();
+        let constant_result = if let Some(value) = bbu_definer_result(form) {
+            let Some(index) = pool.value(value) else { return Ok(None); };
+            Some(index)
+        } else { None };
+        let mut explicit_result = None;
         let mut done = false;
         reset_last_bail_reason();
         // Every lowering attempt below for this form reports a failed
@@ -12087,6 +12182,8 @@ pub fn build_bbu_from_forms(
         if let Some(package) = super::compile_file_in_package_name(form) {
             let name_ref = pool.string(&package);
             load_actions.push((12, 0, name_ref, BBU_NO_INDEX, BBU_NO_INDEX));
+            form_results.push((1, (load_actions.len() - 1) as u32));
+            form_action_ends.push(load_actions.len());
             continue;
         }
 
@@ -12110,6 +12207,7 @@ pub fn build_bbu_from_forms(
                 .collect::<Vec<_>>();
             let uses_ref = pool.vector(&use_refs);
             let exports_ref = pool.vector(&export_refs);
+            explicit_result = Some(load_actions.len());
             load_actions.push((1, 0, package_ref, uses_ref, exports_ref));
             for name in plan.interns {
                 let name_ref = pool.string(&name);
@@ -12319,8 +12417,24 @@ pub fn build_bbu_from_forms(
             }
             return Ok(None);
         }
+        form_results.push(if let Some(index) = constant_result {
+            (2, index)
+        } else if let Some(index) = explicit_result.or_else(||
+            (load_actions.len() > action_start).then(|| load_actions.len() - 1)) {
+            (1, index as u32)
+        } else { (0, BBU_NO_INDEX) });
+        form_action_ends.push(load_actions.len());
     }
 
+    let mut print_groups = Vec::with_capacity(source_group_ends.len());
+    let mut previous_end = 0;
+    for &end in source_group_ends {
+        let (result_kind, result) = if end > previous_end {
+            form_results[end - 1]
+        } else { (0, BBU_NO_INDEX) };
+        print_groups.push(BbuPrintGroup { end: form_action_ends[end] as u32, result_kind, result });
+        previous_end = end;
+    }
     let mut out = Vec::new();
     out.extend_from_slice(BBU_MAGIC);
     put_u16(&mut out, BBU_BYTECODE_VERSION);
@@ -12329,7 +12443,7 @@ pub fn build_bbu_from_forms(
     put_u32(&mut out, pool.entries.len() as u32);
     put_u32(&mut out, functions.len() as u32);
     put_u32(&mut out, load_actions.len() as u32);
-    put_u32(&mut out, 5 + u32::from(functions.iter().any(|f| !f.notinline_sites.is_empty())));
+    put_u32(&mut out, 6 + u32::from(functions.iter().any(|f| !f.notinline_sites.is_empty())));
     put_u32(&mut out, source_file_ref);
     put_u64(&mut out, fnv1a64(source.as_bytes()));
 
@@ -12378,6 +12492,11 @@ pub fn build_bbu_from_forms(
     put_u16(&mut out, 0);
     put_u32(&mut out, handler_binds.len() as u32);
     out.extend_from_slice(&handler_binds);
+    let groups = serialize_bbu_print_groups(&print_groups);
+    put_u16(&mut out, BBU_AUX_TOPLEVEL_RESULTS);
+    put_u16(&mut out, 0);
+    put_u32(&mut out, groups.len() as u32);
+    out.extend_from_slice(&groups);
     Ok(Some(out))
 }
 
@@ -16267,6 +16386,7 @@ fn load_bbu_definitions(bytes: &[u8], env: &mut Env, restoring: bool) -> Result<
     let mut handler_bind_tables = None;
     let mut self_call_tables = None;
     let mut notinline_tables = None;
+    let mut print_groups = None;
     for _ in 0..aux_count {
         let kind = cursor.u16()?;
         let flags = cursor.u16()?;
@@ -16294,6 +16414,9 @@ fn load_bbu_definitions(bytes: &[u8], env: &mut Env, restoring: bool) -> Result<
                 return Err(bbu_error("duplicate handler-case metadata"));
             }
             handler_case_tables = Some(parse_bbu_handler_cases(bytes, function_count)?);
+        } else if kind == BBU_AUX_TOPLEVEL_RESULTS {
+            if print_groups.is_some() { return Err(bbu_error("duplicate top-level result groups")); }
+            print_groups = Some(parse_bbu_print_groups(bytes, &actions, constant_count)?);
         } else if kind == BBU_AUX_HANDLER_BINDS {
             if handler_bind_tables.is_some() {
                 return Err(bbu_error("duplicate handler-bind metadata"));
@@ -16665,7 +16788,17 @@ fn load_bbu_definitions(bytes: &[u8], env: &mut Env, restoring: bool) -> Result<
 
     let mut last = NIL;
     egcl_rt::rooted_ref!(_last_root = &mut last);
-    for action in actions {
+    let mut group_result = NIL;
+    egcl_rt::rooted_ref!(_group_result_root = &mut group_result);
+    let groups = print_groups.unwrap_or_default();
+    let mut next_group = 0;
+    while groups.get(next_group).is_some_and(|group| group.end == 0) {
+        let group = &groups[next_group];
+        let value = if group.result_kind == 2 { constants[group.result as usize] } else { NIL };
+        if !restoring { super::print_loaded_value(value, env)?; }
+        next_group += 1;
+    }
+    for (action_index, action) in actions.into_iter().enumerate() {
         match action.kind {
             12 => {
                 let name = bbu_string(&encoded_constants, action.arg0)?;
@@ -16803,6 +16936,16 @@ fn load_bbu_definitions(bytes: &[u8], env: &mut Env, restoring: bool) -> Result<
                     .insert(action.arg1, Arc::clone(body));
             }
             _ => unreachable!("load actions were verified above"),
+        }
+        if groups.get(next_group).is_some_and(|group| group.result_kind == 1 && group.result as usize == action_index) {
+            group_result = last;
+        }
+        while groups.get(next_group).is_some_and(|group| group.end as usize == action_index + 1) {
+            let group = &groups[next_group];
+            let value = if group.result_kind == 2 { constants[group.result as usize] } else { group_result };
+            if !restoring { super::print_loaded_value(value, env)?; }
+            group_result = NIL;
+            next_group += 1;
         }
     }
     Ok(last)
@@ -31418,3 +31561,129 @@ fn mixed_local_sibling_inlines_a_transitive_capture() {
 
 #[cfg(test)]
 mod packed_u8_persistence_tests;
+
+#[cfg(test)]
+mod compile_file_print_group_tests {
+    use super::*;
+
+    thread_local! {
+        static COLLECT_INTERMEDIATES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static INTERMEDIATE_MOVEMENT: std::cell::Cell<(bool, bool)> = const { std::cell::Cell::new((false, false)) };
+    }
+
+    pub(super) fn collect_portable_intermediates() -> bool {
+        if !COLLECT_INTERMEDIATES.with(|active| active.get()) { return false; }
+        egcl_rt::gc::collect_t0_minor().unwrap();
+        true
+    }
+
+    pub(super) fn record_portable_movement(before: (u64, u64), after: (u64, u64)) {
+        INTERMEDIATE_MOVEMENT.with(|record| record.set((before.0 != after.0, before.1 != after.1)));
+    }
+
+    #[test]
+    fn portable_defvar_intermediates_relocate_before_later_allocations() {
+        const CHILD: &str = "EGCL_PORTABLE_DEFINITION_ROOT_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new("timeout")
+                .args(["--kill-after=5", "45"])
+                .arg(std::env::current_exe().unwrap())
+                .args(["--exact", "cli::bytecode::compile_file_print_group_tests::portable_defvar_intermediates_relocate_before_later_allocations", "--nocapture"])
+                .env(CHILD, "1").env("EGCL_GC_STRESS", "0").env("EGCL_GC_POISON", "1")
+                .env_remove("EGCL_GC_DISABLE").env_remove("EGCL_GC_STRESS_SKIP").env_remove("EGCL_GC_STRESS_AT")
+                .output().unwrap();
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("PORTABLE-SETQ-AND-QUOTE-RELOCATED"));
+            return;
+        }
+        egcl_rt::init_heap(&egcl_rt::GcConfig {
+            heap_size: 4 * 1024 * 1024, heap_max: 4 * 1024 * 1024,
+            nursery_size: 256 * 1024, tlab_size: 4096, region_size: 4096,
+            promotion_threshold: 1, pause_target_ms: 10, gc_workers: 1,
+            satb_buffer_size: 32, old_occupancy_trigger: 0.0,
+        }).unwrap();
+        egcl_rt::rooted!(env = Env::new(false));
+        for name in ["QUOTE", "SETQ", "BOUNDP", "UNLESS", "DEFVAR", "PORTABLE-ROOT-VARIABLE"] {
+            resolve_sym(name).unwrap();
+        }
+        egcl_rt::rooted!(source = super::super::read_from_string_in_env(
+            "(defvar portable-root-variable '(13 21))", &mut env).unwrap().0);
+        // Move/promote startup state first so fresh intermediate conses occupy
+        // evacuable nursery storage rather than an image/symbol-pinned region.
+        egcl_rt::gc::collect_t0_minor().unwrap();
+        COLLECT_INTERMEDIATES.with(|active| active.set(true));
+        egcl_rt::rooted!(rewritten = portable_load_thunk_form(*source).unwrap());
+        COLLECT_INTERMEDIATES.with(|active| active.set(false));
+        let moved = INTERMEDIATE_MOVEMENT.with(|record| record.get());
+        assert_eq!(moved, (true, true), "both newly built conses must really relocate");
+        egcl_rt::rooted!(parts = list_to_vec(*rewritten));
+        assert_eq!(sym_bare_name_rc(parts[0]).as_ref(), "UNLESS");
+        egcl_rt::rooted!(boundp = list_to_vec(parts[1]));
+        egcl_rt::rooted!(assignment = list_to_vec(parts[2]));
+        assert_eq!(sym_bare_name_rc(boundp[0]).as_ref(), "BOUNDP");
+        assert_eq!(sym_bare_name_rc(cp(boundp[1]).0).as_ref(), "QUOTE");
+        assert_eq!(sym_bare_name_rc(assignment[0]).as_ref(), "SETQ");
+        assert_eq!(assignment[1], cp(cp(*source).1).0);
+        assert_eq!(assignment[2], cp(cp(cp(*source).1).1).0);
+        println!("PORTABLE-SETQ-AND-QUOTE-RELOCATED");
+    }
+
+    fn actions() -> Vec<BbuLoadAction> {
+        [1, 2, 7]
+            .into_iter()
+            .map(|kind| BbuLoadAction {
+                kind,
+                flags: 0,
+                arg0: 0,
+                arg1: 0,
+                arg2: 0,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn group_result_precedes_internal_setup_and_empty_group_is_nil() {
+        let groups = [
+            BbuPrintGroup { result_kind: 1, end: 2, result: 0 },
+            BbuPrintGroup { result_kind: 1, end: 3, result: 2 },
+            BbuPrintGroup {
+                result_kind: 0,
+                end: 3,
+                result: BBU_NO_INDEX,
+            },
+        ];
+        let decoded =
+            parse_bbu_print_groups(&serialize_bbu_print_groups(&groups), &actions(), 1).unwrap();
+        assert_eq!(decoded.len(), 3);
+        assert_eq!(decoded[0].result, 0);
+        assert_eq!(decoded[2].result, BBU_NO_INDEX);
+        let constant = [BbuPrintGroup { end: 0, result_kind: 2, result: 0 }];
+        assert!(parse_bbu_print_groups(&serialize_bbu_print_groups(&constant), &[], 1).is_ok());
+        assert!(validate_bbu_aux_flags(BBU_AUX_TOPLEVEL_RESULTS, 0).is_ok());
+        assert!(validate_bbu_aux_flags(BBU_AUX_TOPLEVEL_RESULTS, 1).is_err());
+    }
+
+    #[test]
+    fn malformed_group_metadata_cannot_select_internal_or_prior_actions() {
+        for groups in [
+            vec![BbuPrintGroup { result_kind: 1, end: 3, result: 1 }],
+            vec![BbuPrintGroup { result_kind: 1, end: 4, result: 2 }],
+            vec![
+                BbuPrintGroup { result_kind: 1, end: 2, result: 0 },
+                BbuPrintGroup { result_kind: 1, end: 3, result: 0 },
+            ],
+            vec![BbuPrintGroup { result_kind: 1, end: 2, result: 0 }],
+            vec![BbuPrintGroup { result_kind: 2, end: 3, result: 1 }],
+            vec![BbuPrintGroup { result_kind: 3, end: 3, result: 0 }],
+            vec![BbuPrintGroup { result_kind: 0, end: 3, result: 0 }],
+        ] {
+            assert!(
+                parse_bbu_print_groups(&serialize_bbu_print_groups(&groups), &actions(), 1).is_err()
+            );
+        }
+        let mut encoded = serialize_bbu_print_groups(&[BbuPrintGroup { result_kind: 1, end: 3, result: 2 }]);
+        encoded.push(0);
+        assert!(parse_bbu_print_groups(&encoded, &actions(), 1).is_err());
+        assert!(parse_bbu_print_groups(&encoded[..7], &actions(), 1).is_err());
+    }
+}
