@@ -198,8 +198,8 @@ fn redundant_bounded_cycle_polls(
         }
         let kernel = f.inst(body[body.len() - 2]);
         let branch = f.inst(body[body.len() - 1]);
-        if !matches!(kernel.opcode, Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8 | Opcode::TryStoreIntegerOctets1To8Layout)
-            || kernel.args.len() != if kernel.opcode == Opcode::TryStoreIntegerOctets1To8Layout { 5 } else { 4 }
+        if !matches!(kernel.opcode, Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8 | Opcode::TryStoreIntegerOctets1To8Layout | Opcode::TryStoreIntegerOctets1To8Extent)
+            || kernel.args.len() != if kernel.opcode == Opcode::TryStoreIntegerOctets1To8Layout { 5 } else if kernel.opcode == Opcode::TryStoreIntegerOctets1To8Extent { 6 } else { 4 }
             || kernel.results.len() != 2
             || !kernel.flags.effectful
             || kernel.flags.call
@@ -240,7 +240,7 @@ fn redundant_bounded_cycle_polls(
         // still remove the success-entry check.
         if body[..body.len() - 2].iter().any(|&inst| {
             let d = f.inst(inst);
-            matches!(d.opcode, Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8 | Opcode::TryStoreIntegerOctets1To8Layout)
+            matches!(d.opcode, Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8 | Opcode::TryStoreIntegerOctets1To8Layout | Opcode::TryStoreIntegerOctets1To8Extent)
                 || !d.targets.is_empty()
                 || d.flags.terminator
         }) {
@@ -5689,8 +5689,8 @@ fn emit_transfer_function_with_storage(
                     | Opcode::Cdr
                     | Opcode::StringCharOrNil
                     | Opcode::VecRef | Opcode::VecSet | Opcode::VecSetInRange | Opcode::ArrayReadDiscarded | Opcode::PackedF64P
-                    | Opcode::MemoryFence | Opcode::TryIntegerShr | Opcode::SmallVectorRangeP | Opcode::PackedU8Layout | Opcode::PackedU8AllocationLayout
-                    | Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8 | Opcode::TryStoreIntegerOctets1To8Layout | Opcode::NativePoll
+                    | Opcode::MemoryFence | Opcode::TryIntegerShr | Opcode::SmallVectorRangeP | Opcode::PackedU8Layout | Opcode::PackedU8AllocationLayout | Opcode::PackedU8AllocationExtent
+                    | Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8 | Opcode::TryStoreIntegerOctets1To8Layout | Opcode::TryStoreIntegerOctets1To8Extent | Opcode::NativePoll
             ) {
                 return Err(EmitError::UnsupportedOp(op_tag(f.inst(inst).opcode)));
             }
@@ -6908,9 +6908,9 @@ fn emit_framed_inner(
                             | Opcode::TakeValuesToLocals
                             | Opcode::MemoryFence
                             | Opcode::TryIntegerShr
-                            | Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8 | Opcode::TryStoreIntegerOctets1To8Layout
+                            | Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8 | Opcode::TryStoreIntegerOctets1To8Layout | Opcode::TryStoreIntegerOctets1To8Extent
                             | Opcode::NativePoll
-                            | Opcode::SmallVectorRangeP | Opcode::PackedU8Layout | Opcode::PackedU8AllocationLayout
+                            | Opcode::SmallVectorRangeP | Opcode::PackedU8Layout | Opcode::PackedU8AllocationLayout | Opcode::PackedU8AllocationExtent
                             | Opcode::TryPackedF64Set
                             | Opcode::PackedF64P
                     )
@@ -7538,8 +7538,8 @@ fn emit_framed_inner(
             });
             let (mut inst_reg, result_stores) = if stack_float.is_some()
                 || d.opcode == Opcode::TakeValuesToLocals
-                || matches!(d.opcode, Opcode::PackedU8Layout | Opcode::PackedU8AllocationLayout)
-                || matches!(d.opcode, Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8 | Opcode::TryStoreIntegerOctets1To8Layout)
+                || matches!(d.opcode, Opcode::PackedU8Layout | Opcode::PackedU8AllocationLayout | Opcode::PackedU8AllocationExtent)
+                || matches!(d.opcode, Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8 | Opcode::TryStoreIntegerOctets1To8Layout | Opcode::TryStoreIntegerOctets1To8Extent)
                 || d.opcode == Opcode::Invoke
                 || matches!(
                     d.opcode,
@@ -7566,13 +7566,14 @@ fn emit_framed_inner(
                 let fused = inline_packed_u8::allocation_layout(f, b, inst, &straight_poll_sources,
                     ordinary_call.unwrap().returns_at(inst)).is_some_and(|layout| {
                     let done = a.label();
-                    if inline_packed_u8::emit_ordinary_layout(&mut a, f, &d, &homes,
-                        &const_tagged, inline_alloc_single.contains(&inst), (layout.width, done)).is_some() {
+                    if inline_packed_u8::emit_ordinary_layout_extent(&mut a, f, &d, &homes,
+                        &const_tagged, inline_alloc_single.contains(&inst),
+                        (layout.width, done, layout.extent.map(|(_, value)| value))).is_some() {
                         if layout.delayed {
                             delayed_completion = Some((layout.width, done));
                             delayed_allocation_layouts.insert(layout.probe);
                         } else {
-                            allocation_layout_completions.insert(layout.probe, done);
+                            allocation_layout_completions.insert(layout.extent.map_or(layout.probe, |(inst, _)| inst), done);
                         }
                         true
                     } else { false }
@@ -7960,8 +7961,10 @@ fn emit_framed_inner(
                         const_tagged.get(&d.args[1]).copied(), label);
                 }
                 a.bind(done);
-            } else if matches!(d.opcode, Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8 | Opcode::TryStoreIntegerOctets1To8Layout) {
+            } else if matches!(d.opcode, Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8 | Opcode::TryStoreIntegerOctets1To8Layout | Opcode::TryStoreIntegerOctets1To8Extent) {
                 octet_word_store::emit_framed(&mut a, f, &d, &homes, &const_tagged)?;
+            } else if d.opcode == Opcode::PackedU8AllocationExtent {
+                octet_word_store::emit_extent(&mut a, f, &d, &homes, &const_tagged)?;
             } else if matches!(d.opcode, Opcode::PackedU8Layout | Opcode::PackedU8AllocationLayout) {
                 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
                 let delayed = delayed_allocation_layouts.remove(&inst);

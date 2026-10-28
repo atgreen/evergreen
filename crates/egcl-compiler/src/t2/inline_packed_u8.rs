@@ -122,6 +122,7 @@ pub(super) struct AllocationLayout {
     pub probe: crate::t2::ir::Inst,
     pub width: Value,
     pub delayed: bool,
+    pub extent: Option<(crate::t2::ir::Inst, Value)>,
 }
 
 pub(super) fn allocation_layout(
@@ -132,7 +133,8 @@ pub(super) fn allocation_layout(
     tail: bool,
 ) -> Option<AllocationLayout> {
     if let Some((probe, width)) = adjacent_layout(f, block, call, straight_polls, tail) {
-        return Some(AllocationLayout { probe, width, delayed: false });
+        let extent = crate::t2::allocation_extent::adjacent_completion(f, block, probe, straight_polls);
+        return Some(AllocationLayout { probe, width, delayed: false, extent });
     }
     if tail || f.inst(call).opcode != Opcode::Call || shape(f, f.inst(call)).is_none() {
         return None;
@@ -159,7 +161,7 @@ pub(super) fn allocation_layout(
     if crate::t2::allocation_facts::allocation_site(f, probe, &facts) != Some(call) {
         return None;
     }
-    Some(AllocationLayout { probe, width: f.inst(probe).results[0], delayed: index != position + 1 })
+    Some(AllocationLayout { probe, width: f.inst(probe).results[0], delayed: index != position + 1, extent: None })
 }
 
 /// Consume an early scalar completion after a retained MV clear. The scalar is
@@ -184,14 +186,22 @@ pub(super) fn emit_delayed_layout(
 
 /// Only the runtime-validated bump success supplies this width. Every slow
 /// branch still enters the original collecting call and the real probe.
+#[cfg(test)]
 pub(super) fn emit_ordinary_layout(
+    a: &mut Asm, f: &Function, data: &InstData, homes: &HashMap<Value, FramedHome>,
+    constants: &HashMap<Value, u64>, mv_empty: bool, fusion: (Value, egcl_rt::asm::Label),
+) -> Option<()> {
+    emit_ordinary_layout_extent(a, f, data, homes, constants, mv_empty, (fusion.0, fusion.1, None))
+}
+
+pub(super) fn emit_ordinary_layout_extent(
     a: &mut Asm,
     f: &Function,
     data: &InstData,
     homes: &HashMap<Value, FramedHome>,
     constants: &HashMap<Value, u64>,
     mv_empty: bool,
-    fusion: (Value, egcl_rt::asm::Label),
+    fusion: (Value, egcl_rt::asm::Label, Option<Value>),
 ) -> Option<()> {
     if !mv_empty {
         return None;
@@ -207,9 +217,17 @@ pub(super) fn emit_ordinary_layout(
     if result == width || !valid_home(result) || !valid_home(width) {
         return None;
     }
+    let extent = match fusion.2 {
+        Some(value) => {
+            let home = *homes.get(&value)?;
+            if home == result || home == width || !valid_home(home) { return None; }
+            Some(home)
+        },
+        None => None,
+    };
     let slow = a.label();
     emit_bump(a, f, data, homes, constants, slow)?;
-    publish_layout_completion(a, result, width, fusion.1);
+    publish_layout_extent_completion(a, result, width, extent, fusion.1);
     a.bind(slow);
     static LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *LOG.get_or_init(|| std::env::var_os("EGCL_ARRAY_LAYOUT_LOG").is_some()) {
@@ -224,13 +242,27 @@ pub(super) fn emit_ordinary_layout(
 /// Enter only after emit_bump committed and initialized a small packed-U8
 /// allocation in RAX. Caller preflighted distinct final homes and empty MV.
 /// No allocation pointer is retained: publish tagged array and tagged width.
-fn publish_layout_completion(
+#[cfg(test)]
+fn publish_layout_completion(a: &mut Asm, result: FramedHome, width: FramedHome,
+    done: egcl_rt::asm::Label) {
+    publish_layout_extent_completion(a, result, width, None, done)
+}
+
+fn publish_layout_extent_completion(
     a: &mut Asm,
     result: FramedHome,
     width: FramedHome,
+    extent: Option<FramedHome>,
     done: egcl_rt::asm::Label,
 ) {
     store_home(a, result, RAX, 0);
+    if let Some(extent) = extent {
+        // This is precisely the scalar decoded before cursor commit, already
+        // written into the fresh object's immutable length. Never reread CAR.
+        load_mem64_disp(a, SCRATCH, RAX, 16 - egcl_rt::value::TAG_HEAP_OBJECT as i32);
+        shl_imm(a, SCRATCH, 3);
+        store_home(a, extent, SCRATCH, 0);
+    }
     mov_imm32(a, SCRATCH, 8 << 3);
     store_home(a, width, SCRATCH, 0);
     a.push(0xf8); // incoming MV was proven empty; fast allocation leaves it so
@@ -774,6 +806,48 @@ mod tests {
             "generic slow return has no unconditional allocation layout");
         // Emission-only construction plus bare native execution checks the
         // transport/consumer, not a moving collection or actual TLAB allocation.
+    }
+
+    #[test]
+    fn allocation_extent_fast_completion_captures_decoded_length_and_preserves_cf() {
+        // Bare native tail over an aligned nonmoving fixture. This proves the
+        // production completion's transport, not moving-GC/TLAB admission.
+        let object = [0u64, 0, 136, 0];
+        let tagged = unsafe { egcl_rt::value::EgclVal::from_heap_ptr(object.as_ptr().cast_mut().cast()).to_raw() };
+        let mut a = Asm::new(); mov_rr(&mut a, 8, 7);
+        mov_rr(&mut a, RAX, 4); store_mem64_disp(&mut a, 8, 48, RAX);
+        alu_r_imm(&mut a, 5, 4, 32);
+        mov_imm64(&mut a, 6, 0x1234); mov_imm64(&mut a, RAX, tagged as i64); a.push(0xf9);
+        let done = a.label();
+        publish_layout_extent_completion(&mut a, FramedHome::Stack(0), FramedHome::Stack(1),
+            Some(FramedHome::Stack(2)), done);
+        // Both the slow layout probe and slow capacity load are bypassed.
+        mov_imm64(&mut a, RAX, 999); store_mem64_disp(&mut a, 8, 24, RAX);
+        a.bind(done);
+        for i in 0..3 { load_home(&mut a, RAX, FramedHome::Stack(i), 0); store_mem64_disp(&mut a, 8, i as i32 * 8, RAX); }
+        a.extend_from_slice(&[0x41, 0x0f, 0x92, 0x40, 32]);
+        store_mem64_disp(&mut a, 8, 40, 6);
+        alu_r_imm(&mut a, 0, 4, 32); mov_rr(&mut a, RAX, 4); store_mem64_disp(&mut a, 8, 56, RAX); a.push(0xc3);
+        let jit = egcl_rt::jit::JitBuffer::new(&a.finish().unwrap()).unwrap();
+        let run: extern "C" fn(*mut u64) = unsafe { std::mem::transmute(jit.as_ptr()) };
+        let mut out = [0u64; 8]; run(out.as_mut_ptr());
+        assert_eq!(&out[..3], &[tagged, 8 << 3, 136 << 3]);
+        assert_eq!(out[3], 0); assert_eq!(out[4], 0, "CLC remains the ordinary empty-MV promise");
+        assert_eq!(out[5], 0x1234); assert_eq!(out[6], out[7]);
+    }
+
+    #[test]
+    fn allocation_extent_completion_rejects_overlapping_homes_before_emission() {
+        let (f, call, _, width) = paired_fixture(); let data = f.inst(call);
+        let homes = HashMap::from([(data.args[0], FramedHome::Stack(0)),
+            (data.args[1], FramedHome::Stack(1)), (data.args[2], FramedHome::Stack(2)),
+            (data.results[0], FramedHome::Stack(3)), (width, FramedHome::Stack(4))]);
+        let mut a = Asm::new(); let done = a.label();
+        for alias in [data.results[0], width] {
+            assert!(emit_ordinary_layout_extent(&mut a, &f, data, &homes, &HashMap::new(),
+                true, (width, done, Some(alias))).is_none());
+            assert_eq!(a.here(), 0, "preflight must precede bump emission or cursor commit");
+        }
     }
 
 }

@@ -464,8 +464,9 @@ fn eval(opcode: Opcode, aux: &AuxData, ops: &[IRType]) -> IRType {
         TryIntegerShr
         | TryStoreIntegerOctets8
         | TryStoreIntegerOctets1To8
-        | TryStoreIntegerOctets1To8Layout => IRType::of(TypeBits::SYMBOL.join(TypeBits::NULL)),
-        PackedU8Layout | PackedU8AllocationLayout => {
+        | TryStoreIntegerOctets1To8Layout
+        | TryStoreIntegerOctets1To8Extent => IRType::of(TypeBits::SYMBOL.join(TypeBits::NULL)),
+        PackedU8Layout | PackedU8AllocationLayout | PackedU8AllocationExtent => {
             IRType::of(TypeBits::FIXNUM.join(TypeBits::NULL))
         }
         IntegerLowBits => match aux {
@@ -973,6 +974,7 @@ pub fn infer_for_sites(f: &Function, sites: &[Inst]) -> InferenceResult {
                             | Opcode::TryStoreIntegerOctets8
                             | Opcode::TryStoreIntegerOctets1To8
                             | Opcode::TryStoreIntegerOctets1To8Layout
+                            | Opcode::TryStoreIntegerOctets1To8Extent
                     ) && index == 1
                     {
                         IRType::of(TypeBits::FIXNUM)

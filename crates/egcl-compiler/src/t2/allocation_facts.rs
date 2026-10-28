@@ -44,7 +44,16 @@ pub(crate) fn allocation_site(
     {
         return None;
     }
-    let ValueDef::Result { inst: call, num: 0 } = f.value(d.args[1]).def else {
+    let call = constructor_for(f, d.args[1])?;
+    if !facts.precedes(call, witness) || !facts.same_identity_at(d.args[0], d.args[1], witness) {
+        return None;
+    }
+    Some(call)
+}
+
+/// Exact private semantic constructor, never a public symbol-name guess.
+pub(crate) fn constructor_for(f: &Function, result: super::ir::Value) -> Option<Inst> {
+    let ValueDef::Result { inst: call, num: 0 } = f.value(result).def else {
         return None;
     };
     let constructor = f.inst(call);
@@ -53,7 +62,7 @@ pub(crate) fn allocation_site(
     };
     if constructor.opcode != Opcode::Call
         || constructor.results.len() != 1
-        || constructor.results[0] != d.args[1]
+        || constructor.results[0] != result
         || constructor.args.len() != 3
         || !constructor.flags.call
         || !constructor.flags.effectful
@@ -67,8 +76,6 @@ pub(crate) fn allocation_site(
             .chain(&constructor.results)
             .any(|&v| f.value(v).repr != ValueRepresentation::Tagged)
         || !canonical_adapter(target)
-        || !facts.precedes(call, witness)
-        || !facts.same_identity_at(d.args[0], d.args[1], witness)
     {
         return None;
     }
@@ -121,6 +128,7 @@ pub fn specialize(f: &mut Function) -> usize {
             f.name()
         );
     }
+    super::allocation_extent::specialize(f);
     changed
 }
 

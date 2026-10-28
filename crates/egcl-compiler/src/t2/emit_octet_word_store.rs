@@ -14,14 +14,12 @@ fn invalid_shape(f: &Function, data: &crate::t2::ir::InstData) -> bool {
         Opcode::TryStoreIntegerOctets8
             | Opcode::TryStoreIntegerOctets1To8
             | Opcode::TryStoreIntegerOctets1To8Layout
+            | Opcode::TryStoreIntegerOctets1To8Extent
     ) || data.args.len()
-        != if data.opcode == Opcode::TryStoreIntegerOctets1To8Layout {
-            5
-        } else {
-            4
-        }
+        != if data.opcode == Opcode::TryStoreIntegerOctets1To8Extent { 6 }
+        else if data.opcode == Opcode::TryStoreIntegerOctets1To8Layout { 5 } else { 4 }
         || data.results.len() != 2
-        || !matches!(data.aux, AuxData::None)
+        || !(matches!(data.aux, AuxData::None) || (data.opcode == Opcode::TryStoreIntegerOctets1To8Extent && matches!(data.aux, AuxData::AllocationExtentInBounds)))
         || data.flags
             != (InstFlags {
                 effectful: true,
@@ -64,7 +62,14 @@ pub(super) fn emit(
     }
     // Snapshot all operands before writing either result: an output may alias
     // any input home. Framed inputs never occupy the reserved RAX/RDX scratch.
-    let layout = data.opcode == Opcode::TryStoreIntegerOctets1To8Layout;
+    let extent = data.opcode == Opcode::TryStoreIntegerOctets1To8Extent;
+    let layout = extent || data.opcode == Opcode::TryStoreIntegerOctets1To8Layout;
+    if extent {
+        let input = data.args[5];
+        if let Some(&bits) = constants.get(&input) {
+            mov_imm64(a, RAX, bits as i64); push_reg(a, RAX);
+        } else { push_reg(a, reg[&input]); }
+    }
     if layout {
         let input = data.args[4];
         if let Some(&bits) = constants.get(&input) {
@@ -82,12 +87,14 @@ pub(super) fn emit(
             push_reg(a, reg[input]);
         }
     }
-    emit_body(
+    emit_body_extent(
         a,
         success_dst,
         final_dst,
         data.opcode != Opcode::TryStoreIntegerOctets8,
         layout,
+        extent,
+        matches!(data.aux, crate::t2::ir::AuxData::AllocationExtentInBounds),
     )
 }
 
@@ -105,7 +112,14 @@ pub(super) fn emit_framed(
     if invalid_shape(f, data) {
         return Err(EmitError::UnsupportedOp(op_tag(data.opcode)));
     }
-    let layout = data.opcode == Opcode::TryStoreIntegerOctets1To8Layout;
+    let extent = data.opcode == Opcode::TryStoreIntegerOctets1To8Extent;
+    let layout = extent || data.opcode == Opcode::TryStoreIntegerOctets1To8Layout;
+    if extent {
+        let input = data.args[5];
+        if let Some(&bits) = constants.get(&input) { mov_imm64(a, RAX, bits as i64); }
+        else { load_home(a, RAX, *homes.get(&input).ok_or(EmitError::UnsupportedOp(0xf2))?, 0); }
+        push_reg(a, RAX);
+    }
     if layout {
         let input = data.args[4];
         if let Some(&bits) = constants.get(&input) {
@@ -115,7 +129,7 @@ pub(super) fn emit_framed(
                 a,
                 RAX,
                 *homes.get(&input).ok_or(EmitError::UnsupportedOp(0xF2))?,
-                0,
+                (usize::from(extent) * 8) as i32,
             );
         }
         push_reg(a, RAX);
@@ -125,16 +139,18 @@ pub(super) fn emit_framed(
             mov_imm64(a, RAX, bits as i64);
         } else {
             let home = *homes.get(input).ok_or(EmitError::UnsupportedOp(0xF2))?;
-            load_home(a, RAX, home, ((index + usize::from(layout)) * 8) as i32);
+            load_home(a, RAX, home, ((index + usize::from(layout) + usize::from(extent)) * 8) as i32);
         }
         push_reg(a, RAX);
     }
-    emit_body(
+    emit_body_extent(
         a,
         RAX,
         SCRATCH,
         data.opcode != Opcode::TryStoreIntegerOctets8,
         layout,
+        extent,
+        matches!(data.aux, crate::t2::ir::AuxData::AllocationExtentInBounds),
     )?;
     for (&value, source) in data.results.iter().zip([RAX, SCRATCH]) {
         if let Some(&home) = homes.get(&value) {
@@ -215,12 +231,63 @@ pub(super) fn emit_layout(
     Ok(())
 }
 
-fn emit_body(
+/// Read capacity only after the verifier-backed nullable layout succeeds.
+/// Width and array are reloaded from canonical homes; no raw pointer crosses a
+/// call or poll. Unrepresentable capacities conservatively return NIL.
+pub(super) fn emit_extent(
+    a: &mut Asm, f: &Function, data: &crate::t2::ir::InstData,
+    homes: &std::collections::HashMap<crate::t2::ir::Value, FramedHome>,
+    constants: &std::collections::HashMap<crate::t2::ir::Value, u64>,
+) -> Result<(), EmitError> {
+    use crate::t2::ir::{AuxData, InstFlags, TypeBits, ValueRepresentation};
+    if data.opcode != Opcode::PackedU8AllocationExtent || data.args.len() != 3
+        || data.results.len() != 1 || data.flags != InstFlags::default()
+        || !matches!(data.aux, AuxData::None) || data.frame_state.is_some() || !data.targets.is_empty()
+        || data.args.iter().chain(&data.results).any(|&v| f.value(v).repr != ValueRepresentation::Tagged)
+        || f.value(data.results[0]).ty.bits != TypeBits::FIXNUM.join(TypeBits::NULL)
+    { return Err(EmitError::UnsupportedOp(op_tag(data.opcode))); }
+    let dst = *homes.get(&data.results[0]).ok_or(EmitError::UnsupportedOp(0xf2))?;
+    let load = |a: &mut Asm, reg, value| -> Result<(), EmitError> {
+        if let Some(&bits) = constants.get(&value) { mov_imm64(a, reg, bits as i64); }
+        else { load_home(a, reg, *homes.get(&value).ok_or(EmitError::UnsupportedOp(0xf2))?, 0); }
+        Ok(())
+    };
+    let failed = a.label(); let done = a.label();
+    load(a, SCRATCH, data.args[1])?;
+    alu_r_imm(a, 7, SCRATCH, egcl_rt::value::NIL.to_raw() as i32);
+    a.jcc(Cc::E, failed);
+    sar_imm(a, SCRATCH, 3);
+    load(a, RAX, data.args[0])?;
+    alu_r_imm(a, 4, RAX, -8);
+    alu_rr(a, 0x01, RAX, SCRATCH);
+    load_mem64_disp(a, SCRATCH, RAX, 8);
+    mov_rr(a, RAX, SCRATCH);
+    shr_imm(a, RAX, 60);
+    a.jcc(Cc::Ne, failed);
+    shl_imm(a, SCRATCH, 3);
+    store_home(a, dst, SCRATCH, 0);
+    a.jmp(done);
+    a.bind(failed);
+    mov_imm64(a, SCRATCH, egcl_rt::value::NIL.to_raw() as i64);
+    store_home(a, dst, SCRATCH, 0);
+    a.bind(done);
+    mov_imm64(a, SCRATCH, 0);
+    Ok(())
+}
+
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+fn emit_body(a: &mut Asm, success_dst: u8, final_dst: u8, partial: bool, layout: bool) -> Result<(), EmitError> {
+    emit_body_extent(a, success_dst, final_dst, partial, layout, false, false)
+}
+
+fn emit_body_extent(
     a: &mut Asm,
     success_dst: u8,
     final_dst: u8,
     partial: bool,
     layout: bool,
+    extent: bool,
+    bounded: bool,
 ) -> Result<(), EmitError> {
     const RSP: u8 = 4;
     alu_r_imm(a, 5, RSP, 24);
@@ -315,6 +382,11 @@ fn emit_body(
         a.jcc(Cc::Ne, failed);
     }
     store_to_rsp(a, RAX, 16);
+    if extent {
+        load_from_rsp(a, SCRATCH, 64);
+        alu_r_imm(a, 7, SCRATCH, egcl_rt::value::NIL.to_raw() as i32);
+        a.jcc(Cc::E, failed);
+    }
     load_from_rsp(a, RAX, 40);
     mov_rr(a, SCRATCH, RAX);
     alu_r_imm(a, 4, SCRATCH, 7);
@@ -334,8 +406,18 @@ fn emit_body(
     load_from_rsp(a, SCRATCH, 16);
     // Runtime packed allocation bounds length below isize::MAX. Equal end is
     // permitted: it denotes the byte just after the eight-byte store.
-    cmp_mem64_disp8(a, RAX, SCRATCH, 8);
-    a.jcc(Cc::G, failed);
+    if extent {
+        if !bounded {
+            load_from_rsp(a, SCRATCH, 64);
+            sar_imm(a, SCRATCH, 3);
+            cmp_rr(a, RAX, SCRATCH);
+            a.jcc(Cc::G, failed);
+            load_from_rsp(a, SCRATCH, 16);
+        }
+    } else {
+        cmp_mem64_disp8(a, RAX, SCRATCH, 8);
+        a.jcc(Cc::G, failed);
+    }
     load_from_rsp(a, RAX, 40);
     sar_imm(a, RAX, 3);
     alu_rr(a, 0x01, SCRATCH, RAX);
@@ -365,8 +447,18 @@ fn emit_body(
         alu_rr(a, 0x01, RAX, SCRATCH);
         sar_imm(a, RAX, 3);
         load_from_rsp(a, SCRATCH, 16);
-        cmp_mem64_disp8(a, RAX, SCRATCH, 8);
-        a.jcc(Cc::G, failed);
+        if extent {
+            if !bounded {
+                load_from_rsp(a, SCRATCH, 64);
+                sar_imm(a, SCRATCH, 3);
+                cmp_rr(a, RAX, SCRATCH);
+                a.jcc(Cc::G, failed);
+                load_from_rsp(a, SCRATCH, 16);
+            }
+        } else {
+            cmp_mem64_disp8(a, RAX, SCRATCH, 8);
+            a.jcc(Cc::G, failed);
+        }
         load_from_rsp(a, RAX, 40);
         sar_imm(a, RAX, 3);
         alu_rr(a, 0x01, SCRATCH, RAX);
@@ -401,7 +493,7 @@ fn emit_body(
     mov_imm64(a, SCRATCH, 0); // no interior pointer escapes in a scratch register
     load_from_rsp(a, final_dst, 8);
     load_from_rsp(a, success_dst, 0);
-    alu_r_imm(a, 0, RSP, if layout { 64 } else { 56 });
+    alu_r_imm(a, 0, RSP, if extent { 72 } else if layout { 64 } else { 56 });
     Ok(())
 }
 
@@ -1206,4 +1298,103 @@ mod tests {
             "no extra executed full-eight validation instructions"
         );
     }
+    fn extent_probe_kernel() -> egcl_rt::jit::JitBuffer {
+        let mut f = Function::new("native-allocation-extent-probe"); let e = f.entry();
+        let args: Vec<_> = (0..3).map(|_| f.add_block_param(e, IRType::TOP, ValueRepresentation::Tagged)).collect();
+        let (inst, results) = f.push_inst(e, InstData {
+            opcode: Opcode::PackedU8AllocationExtent, args: args.clone(), results: vec![],
+            aux: AuxData::None, flags: InstFlags::default(), targets: vec![], frame_state: None, source_pos: 0,
+        }, &[(IRType::of(TypeBits::FIXNUM.join(TypeBits::NULL)), ValueRepresentation::Tagged)]);
+        let homes = std::collections::HashMap::from([(args[0], FramedHome::Reg(7)),
+            (args[1], FramedHome::Reg(6)), (results[0], FramedHome::Reg(1))]);
+        let mut a = Asm::new();
+        emit_extent(&mut a, &f, f.inst(inst), &homes, &std::collections::HashMap::new()).unwrap();
+        mov_rr(&mut a, RAX, 1); a.push(0xc3);
+        egcl_rt::jit::JitBuffer::new(&a.finish().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn native_allocation_extent_checks_nullable_layout_and_actual_capacity() {
+        let code = extent_probe_kernel();
+        let run: extern "C" fn(u64, u64) -> u64 = unsafe { std::mem::transmute(code.as_ptr()) };
+        for large in [false, true] {
+            for n in [0, 1, 7, 8, 136, 257] {
+                let mut array = Octets::new(n, large);
+                assert_eq!(run(array.tagged(), fx(if large { 16 } else { 8 })), fx(n as i64));
+                // Mutating an unrelated dimensions list cannot affect this read:
+                // only the array's actual immutable capacity is consumed.
+                let slot = if large { 3 } else { 2 };
+                array.words[slot] = 1u64 << 60;
+                assert_eq!(run(array.tagged(), fx(if large { 16 } else { 8 })), NIL.to_raw());
+            }
+        }
+        assert_eq!(run(T.to_raw(), NIL.to_raw()), NIL.to_raw(), "NIL layout must precede any heap read");
+    }
+
+    fn extent_store_kernel(capacity: u64, bounded: bool) -> (egcl_rt::jit::JitBuffer, Vec<u8>) {
+        let mut f = Function::new("native-extent-store"); let e = f.entry();
+        let args: Vec<_> = (0..6).map(|_| f.add_block_param(e, IRType::TOP, ValueRepresentation::Tagged)).collect();
+        let (inst, result) = f.push_inst(e, InstData {
+            opcode: Opcode::TryStoreIntegerOctets1To8Extent, args: args.clone(), results: vec![],
+            aux: if bounded { AuxData::AllocationExtentInBounds } else { AuxData::None },
+            flags: InstFlags { effectful: true, ..Default::default() }, targets: vec![], frame_state: None, source_pos: 0,
+        }, &[(IRType::of(TypeBits::SYMBOL.join(TypeBits::NULL)), ValueRepresentation::Tagged),
+             (IRType::of(TypeBits::FIXNUM), ValueRepresentation::Tagged)]);
+        let homes = std::collections::HashMap::from([(args[0], FramedHome::Reg(7)),
+            (args[1], FramedHome::Reg(6)), (args[2], FramedHome::Reg(9)), (args[3], FramedHome::Reg(1)),
+            (result[0], FramedHome::Reg(7)), (result[1], FramedHome::Reg(6))]);
+        // Width/extent are correlated proof inputs, supplied as constants in
+        // this bare emitter fixture. IR proof rejection is tested separately.
+        let constants = std::collections::HashMap::from([(args[4], fx(8)), (args[5], capacity)]);
+        let mut a = Asm::new();
+        mov_rr(&mut a, 10, 8); mov_rr(&mut a, 9, SCRATCH); mov_rr(&mut a, 11, 4);
+        emit_framed(&mut a, &f, f.inst(inst), &homes, &constants).unwrap();
+        store_mem64_disp(&mut a, 10, 0, 7); store_mem64_disp(&mut a, 10, 8, 6);
+        store_mem64_disp(&mut a, 10, 16, 1); store_mem64_disp(&mut a, 10, 24, 11);
+        mov_rr(&mut a, RAX, 4); store_mem64_disp(&mut a, 10, 32, RAX); a.push(0xc3);
+        let bytes = a.finish().unwrap();
+        (egcl_rt::jit::JitBuffer::new(&bytes).unwrap(), bytes)
+    }
+
+    #[test]
+    fn native_extent_kernel_removes_capacity_comparisons_but_preserves_other_checks() {
+        let (checked, checked_bytes) = extent_store_kernel(fx(8), false);
+        let (bounded, bounded_bytes) = extent_store_kernel(fx(8), true);
+        let (nil_capacity, _) = extent_store_kernel(NIL.to_raw(), true);
+        let cmp_count = |bytes: &[u8]| Decoder::new(64, bytes, DecoderOptions::NONE)
+            .into_iter().filter(|i| i.mnemonic() == Mnemonic::Cmp).count();
+        assert_eq!(cmp_count(&checked_bytes) - cmp_count(&bounded_bytes), 2,
+            "full and partial capacity comparisons removed, not tag/span/integer checks");
+        assert!(bounded_bytes.len() < checked_bytes.len());
+        for code in [&checked, &bounded] {
+            let run: extern "C" fn(u64, u64, u64, u64, *mut u64) = unsafe { std::mem::transmute(code.as_ptr()) };
+            for span in [1, 7, 8] {
+                for lane in [-0x0102_0304_0506i64, 0, 0x0102_0304_0506] {
+                    let mut array = Octets::new(8, false); let before = array.words.clone();
+                    let mut output = [0u64; 5];
+                    let start = if span < 8 { 1 } else { 0 };
+                    run(array.tagged(), fx(start), fx(start + span), fx(lane), output.as_mut_ptr());
+                    assert_eq!(output[0], T.to_raw());
+                    assert_eq!(output[1], fx(((lane as i128) >> (8 * span)) as i64));
+                    assert_eq!(output[2], fx(lane), "partial path preserves unrelated live RCX");
+                    assert_eq!(output[3], output[4], "all snapshots and temporary pushes unwind");
+                    let mut expected = before;
+                    for i in 0..span as usize {
+                        let p = expected.as_mut_ptr().cast::<u8>();
+                        unsafe { *p.add(array.data_offset + start as usize + i) = ((lane as i128 >> (8*i)) & 255) as u8; }
+                    }
+                    assert_eq!(array.words, expected);
+                }
+            }
+        }
+        for (code, start, end, lane) in [(&checked, 1, 9, fx(1)), (&checked, 2, 9, fx(1)), (&checked, -1, 7, fx(1)),
+            (&checked, 0, 0, fx(1)), (&checked, 0, 7, T.to_raw()), (&nil_capacity, 0, 7, fx(1))] {
+            let run: extern "C" fn(u64, u64, u64, u64, *mut u64) = unsafe { std::mem::transmute(code.as_ptr()) };
+            let mut array = Octets::new(8, false); let before = array.words.clone(); let mut output = [0u64; 5];
+            run(array.tagged(), fx(start), fx(end), lane, output.as_mut_ptr());
+            assert_eq!(output[0], NIL.to_raw()); assert_eq!(array.words, before, "failure writes nothing");
+            assert_eq!(output[2], lane); assert_eq!(output[3], output[4]);
+        }
+    }
+
 }

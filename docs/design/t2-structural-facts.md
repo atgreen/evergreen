@@ -161,8 +161,113 @@ successful Lisp result values, so captured semantic bits remain valid and can
 be intersected with strengthened declarations in program order. Conflicting
 facts reject specialization. Exact literal conversions, operand guards, overflow,
 NaN and domain checks, recovery states, and multiple-value effects remain in
-place. Global result/phi facts are covered here; using a branch-local constraint
-for an original input requires a separate per-use query.
+place. The per-use interface below also makes branch-local constraints
+available for original inputs without changing their global declarations.
+
+## Requested-site inference
+
+`infer(f)` retains its whole-function interface. `InferenceResult::ty(value)`
+answers with the global fact for that SSA definition. It cannot describe a
+constraint that applies to only some uses of an original parameter.
+
+A consumer can instead request the instructions whose operands it will inspect:
+
+```rust
+let facts = infer_for_sites(f, &sites);
+let operand_type = facts.ty_before(site, operand);
+```
+
+Inference runs once. A final scoped replay uses the frozen final global facts,
+including any widening, to record facts immediately **before** the requested
+instructions. Only their direct operands are recorded. An unrequested site or
+nonoperand query falls back to the global fact; it does not trigger another
+analysis or establish a new scoped proof. A guard cannot establish its own
+precondition, and a later predicate cannot refine an earlier use.
+
+The replay retains existing scope rules: a successful guard refines later uses,
+a true predicate edge refines its unique dominated region, and a shared target
+of both branch outcomes establishes neither outcome. False predicate edges do
+not acquire the positive constraint. Branch/guard facts must dominate across
+all entries, including OSR imports. Optional predicate-edge narrowing remains
+disabled in OSR functions.
+
+The result is an immutable snapshot. Consumers must discard it after changing
+instructions, operands, CFG edges, or OSR records. Repeated site queries are
+lookups in that snapshot, not independent inference runs. A rewrite batch can
+retain captured facts only when its transformations preserve the relevant
+values and control paths; otherwise it must rebuild the analysis.
+
+For example, `x` remains the original parameter here:
+
+```lisp
+(defun scoped-double-add (x other arithmetic)
+  (if (typep x 'double-float)
+      (if arithmetic (+ x other) x)
+      :not-double))
+```
+
+The true branch proves DOUBLE-FLOAT at the addition. The global type of `x`
+remains unknown. With admitted profile feedback, the site fact can select the
+guarded double arithmetic family ahead of a cold fixnum guess. An exact double
+input needs no fixnum-to-double contagion conversion; `other` still needs its
+own checks and the existing contagion rules. On x86-64 Linux, the canonical
+DOUBLE-FLOAT type predicate lowers to an exact heap-tag/widetag test. A distinct
+user-package type symbol with the same printed leaf name keeps generic TYPEP
+semantics.
+
+## Verified local refinements
+
+Guard discharge keeps a conversion's result SSA identity. For an UnboxFloat
+whose exact pre-state proves DOUBLE-FLOAT, it removes the redundant check and
+recovery attachment while retaining the payload conversion. The verifier
+recomputes the scoped proof independently: clearing a guard flag is not
+permission to load an arbitrary pointer. The pure x86 path masks the tagged
+pointer and loads the double payload without a call, safepoint, or failure
+branch. It never caches an interior pointer across moving GC.
+
+Ranges need an explicit local carrier when the machine emitter consumes
+SSA-declared bounds:
+
+```lisp
+(defun bounded-increment (x)
+  (if (typep x 'fixnum)
+      (if (>= x -20)
+          (if (<= x 20) (+ x 1) :outside)
+          :outside)
+      :outside))
+```
+
+At the addition, `x` is in [-20, 20]. A fresh pure FIXNUM Guard result can carry
+that proven range to this arithmetic use. It is a verified SSA copy, not a new
+runtime check. The original value, its other uses, and the math's FrameState
+inputs remain unchanged. The existing add/sub emitter can then prove the result
+fits and omit JO. It still checks overflow for a range that can cross a fixnum
+endpoint; operand type alone does not justify omitting that check.
+
+Every pure refinement must independently imply its complete asserted type and
+inclusive range at its own pre-state. A forged stronger range, a false-branch
+use, or a use preceding its proof fails verification. The initial pure numeric
+refinement producer/emitter integration is limited to x86-64 Linux and declines
+functions with OSR entries. This conservative consumer restriction does not
+remove the all-entry safety requirements of the inference API.
+
+## Operand proofs, result vetoes, and feedback
+
+An operand-family proof and a mathematical result interval answer different
+questions. FIXNUM operands can produce a bignum. If proven integer bounds put
+an operation's entire mathematical result outside the fixnum domain, result
+analysis vetoes the fixnum guess and preserves the generic call. An interval
+that overlaps the domain does not authorize guard removal. Overflow omission
+requires the stronger proof that every result fits, consumed through the
+verified local operand ranges above.
+
+These facts are structural proofs, not sampled value ranges. They do not turn
+an explicit declined `None` profile entry into a new positive speculation.
+The existing declared-type policy remains distinct; the new inferred-positive
+path preserves failed-site feedback. Domain checks, overflow checks, exceptional
+continuations, and multiple-value behavior stay unless their own precise
+preconditions have been proved. In particular, a DOUBLE-FLOAT type proof alone
+does not prove a divisor is nonzero or a square-root operand is nonnegative.
 
 ## Guarded expectations from callee bodies
 

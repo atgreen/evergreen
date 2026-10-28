@@ -49,6 +49,16 @@ pub struct LayoutFact {
     pub encoding: LayoutEvidence,
 }
 
+/// Immutable packed capacity correlated with a nullable layout proof. Both
+/// scalars survive relocation; no raw base/interior pointer is captured.
+#[derive(Clone, Copy, Debug)]
+pub struct ExtentFact {
+    pub producer: Inst,
+    pub subject: Value,
+    pub layout: Value,
+    pub evidence: Value,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct StructuralFacts {
     forward: HashMap<Value, Vec<Value>>,
@@ -56,6 +66,7 @@ pub struct StructuralFacts {
     dominators: Option<DominatorTree>,
     osr_reachable: HashSet<Block>,
     layouts: Vec<LayoutFact>,
+    extents: Vec<ExtentFact>,
     origins: RefCell<HashMap<Value, Option<Value>>>,
     successors: HashMap<Block, Vec<Block>>,
     osr_entries: Vec<Block>,
@@ -172,6 +183,17 @@ impl StructuralFacts {
                     facts.layouts.push(LayoutFact { producer: inst, subject: d.args[0],
                         evidence: d.results[0], kind: LayoutKind::PackedU8,
                         encoding: LayoutEvidence::AllocationOrProbeWidth });
+                }
+            }
+        }
+        for &block in f.block_order() {
+            for &inst in &f.block(block).insts {
+                if f.inst(inst).opcode == Opcode::PackedU8AllocationExtent
+                    && super::allocation_extent::producer_site(f, inst, &facts).is_some()
+                {
+                    let d = f.inst(inst);
+                    facts.extents.push(ExtentFact { producer: inst, subject: d.args[0],
+                        layout: d.args[1], evidence: d.results[0] });
                 }
             }
         }
@@ -361,6 +383,18 @@ impl StructuralFacts {
             .iter()
             .copied()
             .find(|fact| fact.producer == inst)
+    }
+
+    pub fn extent_before(&self, subject: Value, consumer: Inst) -> Option<ExtentFact> {
+        self.extents.iter().copied().find(|fact| self.precedes(fact.producer, consumer)
+            && self.same_identity_at(fact.subject, subject, consumer))
+    }
+
+    pub fn extent_for(&self, subject: Value, layout: Value, extent: Value, consumer: Inst) -> bool {
+        self.extents.iter().any(|fact| self.precedes(fact.producer, consumer)
+            && self.same_identity_at(fact.subject, subject, consumer)
+            && self.same_identity_at(fact.layout, layout, consumer)
+            && self.same_identity_at(fact.evidence, extent, consumer))
     }
 
     pub fn witness_for(&self, subject: Value, witness: Value, consumer: Inst) -> bool {

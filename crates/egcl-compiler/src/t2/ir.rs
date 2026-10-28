@@ -414,6 +414,16 @@ pub enum Opcode {
     /// collecting call remains generic and its result is probed normally.
     /// Explicit SSA operands preserve the relation through ordinary cloning.
     PackedU8AllocationLayout,
+    /// Checked immutable packed capacity, tagged nonnegative fixnum or NIL.
+    /// Inputs: subject, width proof, canonical constructor result. Inline
+    /// success may export the already captured length; slow paths read actual
+    /// capacity only after validating the nullable width proof.
+    PackedU8AllocationExtent,
+    /// Six-input octet kernel: array/start/end/integer/width/extent. Uses a
+    /// correlated immutable scalar capacity instead of a heap length load.
+    /// AllocationExtentInBounds omits the capacity comparison only with a
+    /// verifier-reconstructed upper-bound proof; all other checks remain.
+    TryStoreIntegerOctets1To8Extent,
 }
 
 impl Opcode {
@@ -482,6 +492,9 @@ pub enum AuxData {
     /// Unlike CallTarget provenance, this must be retained when cloning.
     /// AuxData::None means SIMPLE_VECTOR-only (SVREF).
     ArrayRef,
+    /// Exact allocation-extent relation proves END <= capacity on normal
+    /// producer return. Never a profile/assertion; verifier rebuilds the proof.
+    AllocationExtentInBounds,
     /// VecSet implements SVREF assignment: SIMPLE_VECTOR only, never packed.
     SimpleVectorStore,
     FieldOffset(u32),

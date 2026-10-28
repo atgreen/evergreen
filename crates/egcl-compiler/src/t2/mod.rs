@@ -155,6 +155,7 @@ pub mod integer_shift;
 /// Guarded whole-word replacement of bounded integer-to-octet loops.
 pub mod octet_word_fusion;
 pub mod allocation_facts;
+pub mod allocation_extent;
 pub mod array_layout;
 pub mod value_facts;
 

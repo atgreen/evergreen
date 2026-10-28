@@ -163,12 +163,17 @@ pub fn verify_accesses(f: &Function) -> Result<(), String> {
             {
                 return Err("invalid allocation-backed layout producer".into());
             }
-            if data.opcode != Opcode::TryStoreIntegerOctets1To8Layout {
+            if data.opcode == Opcode::PackedU8AllocationExtent
+                && super::allocation_extent::producer_site(f, inst, &facts).is_none() {
+                return Err("invalid allocation extent producer".into());
+            }
+            if !matches!(data.opcode, Opcode::TryStoreIntegerOctets1To8Layout | Opcode::TryStoreIntegerOctets1To8Extent) {
                 continue;
             }
-            if data.args.len() != 5
+            let extent = data.opcode == Opcode::TryStoreIntegerOctets1To8Extent;
+            if data.args.len() != if extent { 6 } else { 5 }
                 || data.results.len() != 2
-                || !matches!(data.aux, AuxData::None)
+                || !(matches!(data.aux, AuxData::None) || (extent && matches!(data.aux, AuxData::AllocationExtentInBounds)))
                 || data.flags
                     != (InstFlags {
                         effectful: true,
@@ -183,6 +188,11 @@ pub fn verify_accesses(f: &Function) -> Result<(), String> {
                     .any(|&v| f.value(v).repr != ValueRepresentation::Tagged)
             {
                 return Err("malformed layout-backed octet kernel".into());
+            }
+            if extent && (!facts.extent_for(data.args[0], data.args[4], data.args[5], inst)
+                || (matches!(data.aux, AuxData::AllocationExtentInBounds)
+                    && !super::allocation_extent::end_in_bounds(f, inst, &facts))) {
+                return Err("invalid correlated extent or unproved capacity bound".into());
             }
             let Some(seed) = facts.origin(data.args[4]) else {
                 return Err("layout witness has no unique producer".into());
