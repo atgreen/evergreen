@@ -11910,6 +11910,8 @@ fn serialize_bbu_handler_cases(functions: &[BbuFunction]) -> Vec<u8> {
 /// `None` means the form has no load-time action after compile-file has already
 /// resolved its effect (an initializer-less DEFVAR).
 fn portable_load_thunk_form(form: EgclVal) -> Option<EgclVal> {
+    let mut form = form;
+    egcl_rt::rooted_ref!(_form_root = &mut form);
     if !form.is_cons() {
         return Some(form);
     }
@@ -11927,31 +11929,40 @@ fn portable_load_thunk_form(form: EgclVal) -> Option<EgclVal> {
             if kind.as_ref() == "DEFVAR" && !init_and_doc.is_cons() {
                 return None;
             }
-            let init = if init_and_doc.is_cons() {
+            let mut init = if init_and_doc.is_cons() {
                 cp(init_and_doc).0
             } else {
                 NIL
             };
+            egcl_rt::rooted_ref!(_init_root = &mut init);
             if kind.as_ref() == "DEFCONSTANT" {
                 // Mirror the DEFCONSTANT macro in lib/boot.lisp: assign and mark
                 // as ONE operation, never a bare SETQ. The fasl re-evaluates this
                 // form at load time, after COMPILE-FILE already evaluated (and so
                 // marked) it, so a SETQ here is an assignment to an established
                 // constant and is refused (bliss-sci0).
-                let quoted = form_list(&[resolve_sym("QUOTE")?, var]);
+                egcl_rt::rooted!(quoted = form_list(&[resolve_sym("QUOTE")?, var]));
                 return Some(form_list(&[
                     resolve_sym("EGCL-INTERNAL::%DEFCONSTANT")?,
-                    quoted,
+                    *quoted,
                     init,
                 ]));
             }
-            let setq = form_list(&[resolve_sym("SETQ")?, var, init]);
+            egcl_rt::rooted!(setq = form_list(&[resolve_sym("SETQ")?, var, init]));
             if kind.as_ref() == "DEFVAR" {
-                let quoted = form_list(&[resolve_sym("QUOTE")?, var]);
-                let boundp = form_list(&[resolve_sym("BOUNDP")?, quoted]);
-                Some(form_list(&[resolve_sym("UNLESS")?, boundp, setq]))
+                egcl_rt::rooted!(quoted = form_list(&[resolve_sym("QUOTE")?, var]));
+                #[cfg(test)]
+                {
+                    // Old addresses are comparison-only snapshots, never dereferenced.
+                    let before = ((*setq).0, (*quoted).0);
+                    if compile_file_print_group_tests::collect_portable_intermediates() {
+                        compile_file_print_group_tests::record_portable_movement(before, ((*setq).0, (*quoted).0));
+                    }
+                }
+                egcl_rt::rooted!(boundp = form_list(&[resolve_sym("BOUNDP")?, *quoted]));
+                Some(form_list(&[resolve_sym("UNLESS")?, *boundp, *setq]))
             } else {
-                Some(setq)
+                Some(*setq)
             }
         }
         "DEFINE-CONDITION" => {
@@ -31554,6 +31565,68 @@ mod packed_u8_persistence_tests;
 #[cfg(test)]
 mod compile_file_print_group_tests {
     use super::*;
+
+    thread_local! {
+        static COLLECT_INTERMEDIATES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static INTERMEDIATE_MOVEMENT: std::cell::Cell<(bool, bool)> = const { std::cell::Cell::new((false, false)) };
+    }
+
+    pub(super) fn collect_portable_intermediates() -> bool {
+        if !COLLECT_INTERMEDIATES.with(|active| active.get()) { return false; }
+        egcl_rt::gc::collect_t0_minor().unwrap();
+        true
+    }
+
+    pub(super) fn record_portable_movement(before: (u64, u64), after: (u64, u64)) {
+        INTERMEDIATE_MOVEMENT.with(|record| record.set((before.0 != after.0, before.1 != after.1)));
+    }
+
+    #[test]
+    fn portable_defvar_intermediates_relocate_before_later_allocations() {
+        const CHILD: &str = "EGCL_PORTABLE_DEFINITION_ROOT_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new("timeout")
+                .args(["--kill-after=5", "45"])
+                .arg(std::env::current_exe().unwrap())
+                .args(["--exact", "cli::bytecode::compile_file_print_group_tests::portable_defvar_intermediates_relocate_before_later_allocations", "--nocapture"])
+                .env(CHILD, "1").env("EGCL_GC_STRESS", "0").env("EGCL_GC_POISON", "1")
+                .env_remove("EGCL_GC_DISABLE").env_remove("EGCL_GC_STRESS_SKIP").env_remove("EGCL_GC_STRESS_AT")
+                .output().unwrap();
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("PORTABLE-SETQ-AND-QUOTE-RELOCATED"));
+            return;
+        }
+        egcl_rt::init_heap(&egcl_rt::GcConfig {
+            heap_size: 4 * 1024 * 1024, heap_max: 4 * 1024 * 1024,
+            nursery_size: 256 * 1024, tlab_size: 4096, region_size: 4096,
+            promotion_threshold: 1, pause_target_ms: 10, gc_workers: 1,
+            satb_buffer_size: 32, old_occupancy_trigger: 0.0,
+        }).unwrap();
+        egcl_rt::rooted!(env = Env::new(false));
+        for name in ["QUOTE", "SETQ", "BOUNDP", "UNLESS", "DEFVAR", "PORTABLE-ROOT-VARIABLE"] {
+            resolve_sym(name).unwrap();
+        }
+        egcl_rt::rooted!(source = super::super::read_from_string_in_env(
+            "(defvar portable-root-variable '(13 21))", &mut env).unwrap().0);
+        // Move/promote startup state first so fresh intermediate conses occupy
+        // evacuable nursery storage rather than an image/symbol-pinned region.
+        egcl_rt::gc::collect_t0_minor().unwrap();
+        COLLECT_INTERMEDIATES.with(|active| active.set(true));
+        egcl_rt::rooted!(rewritten = portable_load_thunk_form(*source).unwrap());
+        COLLECT_INTERMEDIATES.with(|active| active.set(false));
+        let moved = INTERMEDIATE_MOVEMENT.with(|record| record.get());
+        assert_eq!(moved, (true, true), "both newly built conses must really relocate");
+        let parts = list_to_vec(*rewritten);
+        assert_eq!(sym_bare_name_rc(parts[0]).as_ref(), "UNLESS");
+        let boundp = list_to_vec(parts[1]);
+        let assignment = list_to_vec(parts[2]);
+        assert_eq!(sym_bare_name_rc(boundp[0]).as_ref(), "BOUNDP");
+        assert_eq!(sym_bare_name_rc(cp(boundp[1]).0).as_ref(), "QUOTE");
+        assert_eq!(sym_bare_name_rc(assignment[0]).as_ref(), "SETQ");
+        assert_eq!(assignment[1], cp(cp(*source).1).0);
+        assert_eq!(assignment[2], cp(cp(cp(*source).1).1).0);
+        println!("PORTABLE-SETQ-AND-QUOTE-RELOCATED");
+    }
 
     fn actions() -> Vec<BbuLoadAction> {
         [1, 2, 7]
