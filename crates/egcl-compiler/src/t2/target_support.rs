@@ -77,6 +77,23 @@ pub const fn simple_string_char_access() -> bool {
     ))
 }
 
+/// Whether the host emitter encodes `IntegerLowBits`, the native constant-width
+/// `LDB` / `LOGAND`-mask extraction that `integer_extract` selects.
+///
+/// The pass rewrites the call outright, so a target without the arm must not be
+/// offered it: the opcode would decline the whole function. The arm needs a
+/// fixnum fast path AND a bignum one -- the low bits of a negative magnitude
+/// are the low bits of its negation, even across limbs, because higher limbs
+/// are multiples of 2^64 -- plus the deopt exits for a non-integer, a
+/// non-canonical bignum and an unexpected sign. To add a target: give its
+/// emitter that arm, then name it here.
+pub const fn integer_low_bits() -> bool {
+    cfg!(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        target_os = "linux"
+    ))
+}
+
 /// Whether the host emitter encodes the **raw `UnboxedF64`** double-float
 /// pipeline: `ConstDouble`, raw `FloatAdd`/`Sub`/`Mul`/`Div`/`Neg`/`Sqrt` and
 /// the raw double comparisons.

@@ -98,6 +98,9 @@
   the runtime, so `CHAR`, `SCHAR` and `ELT` cost 32x less per access and a
   character-scanning loop runs 2.6x faster
   ([#754](https://github.com/atgreen/evergreen/pull/754)).
+- AArch64 T2 extracts a constant-width byte field natively, so `LDB` of a
+  constant byte specifier costs 194x less per call, on bignums as well as
+  fixnums ([#756](https://github.com/atgreen/evergreen/pull/756)).
 
 - AArch64 T2 reaches captured lexical variables, so a closure that reads or
   writes one is no longer barred from the optimizing tier: 114 of the 129

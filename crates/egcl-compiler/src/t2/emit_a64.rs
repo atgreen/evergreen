@@ -860,6 +860,88 @@ impl Emitter<'_> {
         self.store(data.results[0], W0)
     }
 
+    /// `IntegerLowBits`: the low `mask` bits of an integer, for a constant-width
+    /// `LDB` or a `LOGAND` against a constant mask. No call, allocation or
+    /// safepoint.
+    ///
+    /// A fixnum is just untag-and-mask. A bignum is the interesting half, and
+    /// the reason the arm is worth having rather than declining to the runtime:
+    /// the low bits of a NEGATIVE magnitude are the low bits of its NEGATION,
+    /// even for a multi-limb bignum, because every higher limb is a multiple of
+    /// 2^64 and so contributes nothing below bit 64. So limb 0 negated is the
+    /// whole answer, whatever the magnitude's length.
+    ///
+    /// `BignumHeader` is `header | sign: i32 @8 | n_limbs: u32 @12 | limbs @16`.
+    /// Anything that is not a canonical bignum of sign +1 or -1 deopts: zero is
+    /// a fixnum, so a zero limb count is not a bignum this path should accept.
+    fn integer_low_bits(&mut self, data: &InstData) -> Result<(), EmitError> {
+        use egcl_rt::object::type_id;
+        const FIXNUM_MAX: i64 = (1 << 60) - 1;
+        let AuxData::FixnumImm(mask) = data.aux else {
+            return Err(EmitError::UnsupportedOp(op_tag(data.opcode)));
+        };
+        if data.args.len() != 1
+            || data.results.len() != 1
+            || !(0..=FIXNUM_MAX).contains(&mask)
+            || !data.flags.guard
+            || data.frame_state.is_none()
+        {
+            return Err(EmitError::UnsupportedOp(op_tag(data.opcode)));
+        }
+        // Only the tagged representation: this emitter declines a function with
+        // any non-tagged value, so the raw-fixnum variants emit.rs also handles
+        // cannot reach here.
+        if self.function.value(data.args[0]).repr != ValueRepresentation::Tagged
+            || self.function.value(data.results[0]).repr != ValueRepresentation::Tagged
+        {
+            return Err(EmitError::UnsupportedOp(op_tag(data.opcode)));
+        }
+        let deopt = self.deopt_label(data)?;
+        let fixnum = self.asm.label();
+        let positive = self.asm.label();
+        let masked = self.asm.label();
+        self.load(data.args[0], W0)?;
+        self.asm
+            .word(a64::and_imm(T0, W0, 7).expect("7 is a logical immediate"));
+        self.compare_imm(T0, 0);
+        self.asm.jcc(Cc::E, fixnum);
+        self.compare_imm(T0, egcl_rt::value::TAG_HEAP_OBJECT);
+        self.asm.jcc(Cc::Ne, deopt);
+        self.asm
+            .word(a64::and_imm(W0, W0, !7u64).expect("!7 is a logical immediate"));
+        self.asm
+            .word(a64::ldrb_imm(T0, W0, 7).expect("7 fits the byte-form offset"));
+        self.compare_imm(T0, u64::from(type_id::BIGNUM));
+        self.asm.jcc(Cc::Ne, deopt);
+        // A canonical bignum has at least one limb; zero is a fixnum.
+        self.asm
+            .word(a64::ldr_w_imm(T0, W0, 12).expect("12 fits the word-form offset"));
+        self.compare_imm(T0, 0);
+        self.asm.jcc(Cc::E, deopt);
+        // `sign` is an i32. Loaded zero-extended, so -1 reads as 0xFFFFFFFF and
+        // is compared as that rather than sign-extended -- same test, one fewer
+        // instruction form to get wrong.
+        self.asm
+            .word(a64::ldr_w_imm(T0, W0, 8).expect("8 fits the word-form offset"));
+        self.compare_imm(T0, 1);
+        self.asm.jcc(Cc::E, positive);
+        self.compare_imm(T0, u64::from(u32::MAX));
+        self.asm.jcc(Cc::Ne, deopt);
+        self.load_at(W0, W0, 16)?;
+        self.asm.word(a64::neg(W0, W0));
+        self.asm.jmp(masked);
+        self.asm.bind(positive);
+        self.load_at(W0, W0, 16)?;
+        self.asm.jmp(masked);
+        self.asm.bind(fixnum);
+        self.asm.word(a64::asr_imm(W0, W0, 3));
+        self.asm.bind(masked);
+        self.imm(T0, mask as u64);
+        self.asm.word(a64::and(W0, W0, T0));
+        self.asm.word(a64::lsl_imm(W0, W0, 3));
+        self.store(data.results[0], W0)
+    }
+
     // ── control flow ─────────────────────────────────────────────
 
     fn edge(&mut self, edge: &BlockCall) -> Result<(), EmitError> {
@@ -1256,6 +1338,7 @@ impl Emitter<'_> {
                 return self.epilogue();
             }
             StringCharOrNil => return self.string_char_or_nil(data),
+            IntegerLowBits => return self.integer_low_bits(data),
             Jump if data.targets.len() == 1 => return self.edge(&data.targets[0]),
             Brif if data.args.len() == 1 && data.targets.len() == 2 => {
                 let otherwise = self.asm.label();

@@ -27347,7 +27347,7 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
             t2_log!("{name}: guarded return type hints: {hints} value(s)");
         }
     }
-    if cfg!(all(target_arch = "x86_64", target_os = "linux"))
+    if egcl_compiler::t2::target_support::integer_low_bits()
         && std::env::var_os("EGCL_DISABLE_INTEGER_EXTRACTION").is_none()
     {
         let extracted = egcl_compiler::t2::integer_extract::specialize(&mut f, &array_inline_options);
