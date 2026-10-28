@@ -116,7 +116,8 @@ mod tests {
         egcl_rt::rooted!(first = make_template_closure(&body, None, &env));
         // No Lisp allocation between these two requests: a hit must be literal
         // identity reuse, not merely another function sharing the same body.
-        assert_eq!(*first, make_template_closure(&body, None, &env));
+        let reused = make_template_closure(&body, None, &env);
+        assert_eq!(*first, reused);
         egcl_rt::rooted!(fresh = make_bytecode_closure(&body, None));
         assert_ne!(*first, *fresh);
         assert!(Arc::ptr_eq(
@@ -178,10 +179,8 @@ mod tests {
         );
         egcl_rt::gc::collect_t0_minor().unwrap();
         let frame = Arc::new(SharedCell::new(EnvFrame::default()));
-        frame.borrow_mut().vars.insert(
-            "HELD".into(),
-            crate::cli::arena_cons(EgclVal::from_fixnum(73), NIL),
-        );
+        let payload = crate::cli::arena_cons(EgclVal::from_fixnum(73), NIL);
+        frame.borrow_mut().vars.insert("HELD".into(), payload);
         let before = frame.borrow().vars["HELD"].0;
         // No Env/activation/host root exposes frame here. The builder's own
         // precise root must be installed before this forced collection fires.
@@ -221,7 +220,8 @@ mod tests {
         );
         egcl_rt::rooted!(second = make_template_closure(&body, None, &env));
         assert_ne!(*first, *second);
-        assert_eq!(*second, make_template_closure(&body, None, &env));
+        let reused = make_template_closure(&body, None, &env);
+        assert_eq!(*second, reused);
         // Empty the nursery before constructing young metadata: no pinned
         // function/symbol allocation may retain its region in place.
         egcl_rt::gc::collect_t0_minor().unwrap();
