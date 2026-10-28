@@ -5,6 +5,8 @@
 //! deliberately non-owning GC caches: discard them BEFORE every collection and
 //! on heap replacement, rather than extending the lifetime of callable objects.
 use super::*;
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::sync::Weak;
 
