@@ -26,7 +26,13 @@ const SOURCE: &str = r#"
     (unwind-protect
       (funcall (lambda () (throw 'nrm-tag (values n :throw))))
       (incf *nrm-effects*))))
+(defun nrm-stale ()
+  (block nrm-single
+    (funcall (lambda ()
+      (values :stale :extra)
+      (return-from nrm-single 11)))))
 (defun nrm-warm ()
+  (assert (equal '(11) (multiple-value-list (nrm-stale))))
   (assert (null (multiple-value-list (nrm-exit 0))))
   (assert (equal '(1) (multiple-value-list (nrm-exit 1))))
   (assert (equal '(2 :secondary) (multiple-value-list (nrm-exit 2))))
@@ -34,11 +40,18 @@ const SOURCE: &str = r#"
   (assert (equal '(9 :throw) (multiple-value-list (nrm-throw 9)))))
 (dotimes (i 100) (nrm-warm))
 "#;
+// Creators of free lexical-control closures are deliberately pinned to T0 by
+// native_would_lose_captured_control. Exercise them from a real native caller;
+// dynamic THROW has no such lexical-token restriction and is native itself.
 const READY: &str = r#"
 (loop repeat 150 until
- (every (lambda (s) (= 2 (egcl-ext:function-tier s))) '(nrm-exit nrm-nested nrm-throw))
+ (every (lambda (s) (= 2 (egcl-ext:function-tier s))) '(nrm-warm nrm-throw))
  do (nrm-warm) (sleep 0.01))
-(dolist (s '(nrm-exit nrm-nested nrm-throw)) (assert (= 2 (egcl-ext:function-tier s))))
+(dolist (s '(nrm-warm nrm-throw))
+  (unless (eql 2 (egcl-ext:function-tier s))
+    (error "Expected native driver ~S, got tier ~S" s (egcl-ext:function-tier s))))
+(dolist (s '(nrm-exit nrm-nested nrm-stale))
+  (assert (eql 0 (egcl-ext:function-tier s))))
 "#;
 const CHECK: &str = r#"
 (setq *nrm-effects* 0 *nrm-cleanups* nil)
@@ -92,7 +105,7 @@ fn named_nonlocal_returns_preserve_all_values_through_cleanup_and_native_calls()
         );
         assert!(stdout.contains("NAMED-RETURN-VALUES-OK"));
         if tier == "t2" {
-            for name in ["NRM-EXIT", "NRM-NESTED", "NRM-THROW"] {
+            for name in ["NRM-WARM", "NRM-THROW"] {
                 assert!(
                     stderr.lines().any(|line| line
                         .contains(&format!("{name}: optimized worker result installed with "))
