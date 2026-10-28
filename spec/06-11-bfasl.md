@@ -571,11 +571,14 @@ mean `Any`, `Fixnum`, and `SingleFloat`. A variadic function's core
 a retained function body or source fallback.
 
 `TopLevelResults` uses `table_kind = 13`, `flags = 0`. Its payload is a
-`u32` group count followed by pairs of `u32` exclusive action-end indexes and
-result-action indexes. `0xffffffff` denotes a NIL result with no result action.
-Ends are nondecreasing, cover the complete action stream, and each non-NIL result
-belongs to its own group and names a user-result action rather than internal
-interning, closure registration, or load-time-cell initialization. Repeated ends
+`u32` group count followed by three `u32` words per group: the exclusive action
+end, result kind, and result index. Kind 0 denotes NIL with index `0xffffffff`;
+kind 1 names a user-result action; kind 2 names a materialized constant-pool value
+(for example an original definer name). Ends are nondecreasing and cover the
+complete action stream. An action result belongs to its own group and cannot
+select internal interning, closure registration, or load-time-cell initialization.
+Constant indexes are checked before actions execute; they do not evaluate forms
+or repeat initializer effects. Repeated ends
 represent empty source forms. The loader retains the selected result across
 remaining internal actions, then prints once per original source form. Image
 restoration does not print these results. Unknown flags-zero auxiliary tables
