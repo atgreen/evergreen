@@ -13829,6 +13829,7 @@ fn drop_dead_closures() {
 #[derive(Clone, Copy)]
 struct TreeClosureTier {
     calls: u32,
+    eager_loop: bool,
     settled: bool,
     compiled: EgclVal,
 }
@@ -13857,7 +13858,7 @@ fn settled_tree_closure(id: u64) -> Option<EgclVal> {
 }
 
 /// The compiled object behind a hot tree-walker closure, compiling it on the
-/// call that reaches the lazy-compile threshold.
+/// first call when its body contains a loop, otherwise at the lazy-compile threshold.
 ///
 /// Under lazy compilation a closure created by a creator that has not been
 /// compiled yet -- a once-called DEFUN, or any toplevel LET -- is a tree-walker
@@ -13877,16 +13878,27 @@ fn tree_closure_tier_up(id: u64, env: &Env) -> Option<EgclVal> {
     }
     {
         let mut tiers = TREE_CLOSURE_TIERS.borrow_mut();
-        let entry = tiers.entry(id).or_insert(TreeClosureTier {
-            calls: 0,
-            settled: false,
-            compiled: NIL,
+        let entry = tiers.entry(id).or_insert_with(|| {
+            // Match DEFUN's hybrid policy: a loop needs bytecode before its
+            // back-edge heat can be observed. This structural walk cannot
+            // allocate on the Lisp heap and is cached once per closure.
+            let eager_loop = env
+                .closures
+                .borrow()
+                .get(&id)
+                .is_some_and(|closure| bytecode::body_contains_loop(closure.body));
+            TreeClosureTier {
+                calls: 0,
+                eager_loop,
+                settled: false,
+                compiled: NIL,
+            }
         });
         if entry.settled {
             return (!entry.compiled.is_nil()).then_some(entry.compiled);
         }
         entry.calls += 1;
-        if entry.calls < bytecode::lazy_compile_threshold() {
+        if !entry.eager_loop && entry.calls < bytecode::lazy_compile_threshold() {
             return None;
         }
         // Claim the single compile attempt before releasing the table.
