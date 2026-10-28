@@ -1233,6 +1233,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#t2-inference-phases" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        T2 inference phases
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#allocation-and-measurement-discipline" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2109,6 +2120,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#t2-inference-phases" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        T2 inference phases
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#allocation-and-measurement-discipline" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2361,6 +2383,26 @@ and leave GC timing logs unset when measuring performance:</p>
 <a id="__codelineno-7-5" name="__codelineno-7-5" href="#__codelineno-7-5"></a><span class="w">  </span><span class="nv">EGCL_DISABLE_HASH_TABLE_ROOT_TRACKING</span><span class="o">=</span><span class="m">1</span><span class="w"> </span>scripts/egcl-limited.sh<span class="w"> </span><span class="se">\</span>
 <a id="__codelineno-7-6" name="__codelineno-7-6" href="#__codelineno-7-6"></a><span class="w">  </span>target/x86_64-unknown-linux-musl/release/egcl<span class="w"> </span>--no-init<span class="w"> </span>--load<span class="w"> </span>workload.lisp
 </code></pre></div>
+<h2 id="t2-inference-phases">T2 inference phases<a class="headerlink" href="#t2-inference-phases" title="Permanent link">&para;</a></h2>
+<p>Set <code>EGCL_INFER_PHASE_LOG</code> before startup to write one <code>[infer-phases]</code> row
+per inference invocation to stderr. Presence is cached on first use, so <code>=0</code>
+also enables the diagnostic. For example:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="nv">EGCL_INFER_PHASE_LOG</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="nv">EGCL_FORCE_TIER</span><span class="o">=</span>t2<span class="w"> </span><span class="nv">EGCL_MEM_MAX</span><span class="o">=</span>8G<span class="w"> </span><span class="nv">EGCL_TIMEOUT</span><span class="o">=</span><span class="m">180</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a><span class="w">  </span>scripts/egcl-limited.sh<span class="w"> </span>target/x86_64-unknown-linux-musl/release/egcl<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a><span class="w">  </span>--no-init<span class="w"> </span>--load<span class="w"> </span>workload.lisp
+</code></pre></div>
+<p>All time fields use nanoseconds. <code>setup_ns</code>, <code>checks_ns</code>, <code>fixpoint_ns</code>,
+<code>repr_ns</code>, and <code>replay_ns</code> describe successive analysis phases. The entry
+and edge-map intervals are nested: <code>entry_ns</code> and <code>edge_ns</code> include work in
+both fixpoint and requested-site replay; <code>replay_entry_ns</code> is the replay
+subset of <code>entry_ns</code>. Do not add these nested intervals to the phase totals.
+<code>total_ns</code> excludes formatting and writing the row, and does not measure the
+rest of native compilation or complete process startup.</p>
+<p>Pass counts, block visits, dominator-chain steps, and dominance-query counts
+help distinguish repeated analysis from expensive individual operations.
+Timestamp reads and logging perturb enabled runs. With the flag absent there
+are no clock reads or timing output, but diagnostic branches remain; use
+fresh processes with the flag unset for performance comparisons.</p>
 <h2 id="allocation-and-measurement-discipline">Allocation and measurement discipline<a class="headerlink" href="#allocation-and-measurement-discipline" title="Permanent link">&para;</a></h2>
 <p><code>room</code> measures Lisp-heap activity. Rust strings, vectors, hash maps, and other
 host allocations can dominate execution time independently. The contributor
