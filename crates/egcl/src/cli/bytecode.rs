@@ -141,6 +141,7 @@ mod call_table_native;
 mod call_table_native;
 #[cfg(all(target_arch = "x86_64", unix))]
 mod call_table_funcall;
+mod quoted_funcall;
 use super::control_payload::ControlPayload;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 use super::control_payload::reserve_control_values;
@@ -4081,6 +4082,20 @@ impl<'e> Lowerer<'e> {
                 return Err(record_bail(|| format!("call:{name}")));
             }
         }
+        // A quoted symbol is a global function designator, even inside FLET.
+        // Resolving it after the actuals agrees with symbolic FUNCALL; a
+        // retained FUNCTION object must keep the indirect route instead.
+        if name == "FUNCALL"
+            && let Some(target) = quoted_funcall::target(self, op, rest)
+        {
+            egcl_rt::rooted!(args = list_to_vec(cp(rest).1));
+            let nargs = u16::try_from(args.len()).map_err(|_| Bail)?;
+            for i in 0..args.len() {
+                self.lower_expr(args[i])?;
+            }
+            self.emit_global_named_call(target, nargs);
+            return Ok(());
+        }
         // `(funcall #'(setf ACC) v obj)` is how SETF expands an accessor place.
         // Through FUNCALL, a writer generic -- which has no function object --
         // was reached by name on every call. Call the writer's own name
@@ -4129,19 +4144,21 @@ impl<'e> Lowerer<'e> {
         for i in 0..nargs {
             self.lower_expr(args[i])?;
         }
+        self.emit_global_named_call(symbol, nargs as u16);
+        Ok(())
+    }
+
+    // Both ordinary named calls and symbolic FUNCALL use the same self-site
+    // generation checks, NOTINLINE metadata, and exact stack accounting.
+    fn emit_global_named_call(&mut self, symbol: u32, nargs: u16) {
         if self.self_symbol == Some(symbol)
             && !self_calls::notinline(symbol, &self.inline_policies)
         {
             self.self_call_sites.push(self.code.len() as u32);
         }
-        self.emit(Instr::CallNamed {
-            sym: op.as_symbol_index(),
-            nargs: nargs as u16,
-        });
-        // Call pops nargs and pushes one result.
-        self.pop_n(nargs as u16);
+        self.emit(Instr::CallNamed { sym: symbol, nargs });
+        self.pop_n(nargs);
         self.push_n(1);
-        Ok(())
     }
 
     /// `(setq var val ...)` — store into lexical local slots only; any special

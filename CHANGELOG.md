@@ -4,6 +4,10 @@
 
 ### Changed
 
+- Bytecode calls constant quoted global function names directly while retaining
+  normal argument evaluation, redefinition and lexical function semantics
+  ([#740](https://github.com/atgreen/evergreen/pull/740)).
+
 - `TYPE-OF` identifies displaced multidimensional arrays as `ARRAY`, keeping
   its result consistent with `TYPEP` and `SUBTYPEP`
   ([#720](https://github.com/atgreen/evergreen/pull/720)).
