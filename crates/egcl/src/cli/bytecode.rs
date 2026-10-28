@@ -15308,6 +15308,43 @@ fn frame_capture_names(frame: Arc<SharedCell<EnvFrame>>) -> std::collections::Ha
     captures
 }
 
+/// This is a sufficient absence proof, not free-function analysis. Use the
+/// evaluator's exact namespace keys, preserving package and uninterned identity.
+fn closure_expansion_ignores_functions(lambda_list: EgclVal, body: EgclVal, env: &Env) -> bool {
+    let names: std::collections::HashSet<String> = env.funs.borrow().keys().cloned().collect();
+    // Local SETF function names need compound-name analysis; leave them on the
+    // existing fallback rather than compare only their printed base names.
+    if names.iter().any(|name| name.starts_with('(')) { return false; }
+    let block = reader::find_symbol_index("BLOCK");
+    let return_from = reader::find_symbol_index("RETURN-FROM");
+    let quote = reader::find_symbol_index("QUOTE");
+    let mut pending = vec![(lambda_list, true, false), (body, false, false)];
+    let mut seen = std::collections::HashSet::new();
+    while let Some((form, datum, expression)) = pending.pop() {
+        if form.is_symbol() && names.contains(&sym_name(form)) { return false; }
+        if form.is_cons() && seen.insert((form.0, datum, expression)) {
+            let (car, cdr) = cp(form);
+            // These literal positions belong exclusively to the control
+            // namespace. In particular NAMED-LAMBDA's implicit BLOCK does not
+            // imply a reference to its same-named LABELS function.
+            let control = car.symbol_index().is_some_and(|symbol|
+                Some(symbol) == block || Some(symbol) == return_from);
+            if expression && !datum && control && cdr.is_cons() {
+                let (label, rest) = cp(cdr);
+                if label.is_symbol() {
+                    pending.push((car, false, true));
+                    pending.push((rest, false, false));
+                    continue;
+                }
+            }
+            pending.push((car, datum, true));
+            pending.push((cdr, datum || car.symbol_index().is_some_and(|symbol|
+                Some(symbol) == quote), false));
+        }
+    }
+    true
+}
+
 /// Compile a hot tree-walker closure `(EGCL::CLOSURE . id)` to bytecode and
 /// reify it as a callable object under a fresh private symbol (bliss-wojl9).
 ///
@@ -15375,6 +15412,29 @@ pub(super) fn compile_tree_closure(
         }
         (lambda_list, body) = cp(rest);
     }
+    // A definition-site FLET can be incidental (for example a factory's
+    // registration helper). Expand with that namespace intact, then discard it
+    // only when no symbol anywhere in the complete expansion can name it.
+    // Including quoted data and shadowed occurrences is deliberately conservative.
+    let has_local_functions = !compile_env.funs.borrow().is_empty();
+    let mut filtered_env = has_local_functions.then(|| compile_env.clone());
+    egcl_rt::rooted_ref!(_filtered_env_root = &mut filtered_env);
+    let compile_env = if has_local_functions {
+        static UNUSED_FUNCTIONS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*UNUSED_FUNCTIONS.get_or_init(||
+            std::env::var_os("EGCL_DISABLE_UNUSED_CLOSURE_FUNCTIONS").is_none())
+            || !*PREEXPAND.get().expect("closure expansion policy initialized")
+            || !closure_expansion_ignores_functions(lambda_list, body, compile_env)
+        {
+            log_not_compiled(label, "closure references captured local function namespace");
+            return None;
+        }
+        let filtered = filtered_env.as_mut().expect("captured function environment");
+        filtered.funs = Arc::new(SharedCell::new(HashMap::new()));
+        &*filtered
+    } else {
+        compile_env
+    };
     let captures = frame_capture_names(Arc::clone(&frame));
     let enclosing_blocks: std::collections::HashSet<String> =
         blocks.iter().map(|(name, _)| name.clone()).collect();
@@ -15424,6 +15484,10 @@ pub(super) fn compile_tree_closure(
         );
         return None;
     };
+    if has_local_functions && contains_host_eval(&bf) {
+        log_not_compiled(label, "closure local namespace requires host evaluation");
+        return None;
+    }
     egcl_rt::rooted!(_bytecode_root = ActiveBytecodeRoot::new(&bf));
     // Short-lived closures only die in a major collection (bliss-5ndk).
     collect_requested_major_before_closure();

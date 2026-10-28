@@ -1,5 +1,6 @@
 {
   "fast": {
+    "egcl:test:unused_lexical_function_tiers": [""],
     "egcl:test:array_adjustment_cli": [""],
     "egcl:test:array_adjustment_persistence_cli": [""],
     "egcl-stdlib:test:array_adjustment": [""],
