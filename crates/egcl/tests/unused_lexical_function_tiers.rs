@@ -94,11 +94,7 @@ fn source_closure_ignores_only_proven_unused_definition_site_functions() {
                     .env("EGCL_GC_POISON", "1");
             }
             if disabled {
-                command.env(
-                    "EGCL_DISABLE_TREE_CLOSURE_EXPANSION",
-                    "EGCL_DISABLE_UNUSED_CLOSURE_FUNCTIONS",
-                    "1",
-                );
+                command.env("EGCL_DISABLE_UNUSED_CLOSURE_FUNCTIONS", "1");
             }
             let result = command.output().expect("run source closure regression");
             let stdout = String::from_utf8_lossy(&result.stdout);
