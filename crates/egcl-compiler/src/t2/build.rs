@@ -3274,13 +3274,16 @@ impl<'a> Builder<'a> {
                 let Instr::Const(cidx) = self.bf.code[bcp - 1] else {
                     return Ok(false);
                 };
-                let Some(super::constants::ConstantDescription::Symbol { name: Some(type_name), .. }) =
+                let Some(super::constants::ConstantDescription::Symbol { index: type_index, name: Some(type_name) }) =
                     self.constants.get(cidx as usize)
                 else {
                     return Ok(false);
                 };
                 match type_name.rsplit(':').next().unwrap_or(type_name) {
                     "FIXNUM" => Some(TypeBits::FIXNUM),
+                    "DOUBLE-FLOAT" if cfg!(all(target_arch = "x86_64", target_os = "linux"))
+                        && egcl_rt::symbols::registry_key(*type_index).as_deref() == Some("DOUBLE-FLOAT")
+                        => Some(TypeBits::DOUBLE_FLOAT),
                     // (TYPEP x 'CONS) is the same unsound tag test as CONSP
                     // above -- a closure would answer T.  See bliss-74rl.
                     "CONS" => return Ok(false),
@@ -4981,6 +4984,35 @@ mod tests {
         let f = build_from_bytecode_with_inline_options(&input, explicit_inline).expect("builds");
         assert!(has_opcode(&f, f.entry(), Opcode::GenericEq));
         assert!(!has_opcode(&f, f.entry(), Opcode::Call));
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[test]
+    fn double_typep_intrinsic_requires_canonical_type_symbol_identity() {
+        let typep = egcl_rt::symbols::intern("TYPEP");
+        let canonical = EgclVal::from_symbol_index(egcl_rt::symbols::intern("DOUBLE-FLOAT"));
+        let qualified = EgclVal::from_symbol_index(
+            egcl_rt::symbols::intern("SCOPED-DOUBLE-BOUNDARY::DOUBLE-FLOAT"));
+        let uninterned = egcl_rt::symbols::make_uninterned("DOUBLE-FLOAT");
+        for (type_symbol, primitive) in [(canonical, true), (qualified, false), (uninterned, false)] {
+            let input = bf("double-type-identity", vec![
+                Instr::LoadLocal(0), Instr::Const(0),
+                Instr::CallNamed { sym: typep, nargs: 2 }, Instr::Return,
+            ], vec![type_symbol], 1, 1, 2);
+            let f = build_from_bytecode(&input).expect("constant TYPEP builds");
+            let instructions: Vec<_> = f.block_order().iter()
+                .flat_map(|&b| f.block(b).insts.iter().map(|&i| f.inst(i))).collect();
+            assert_eq!(instructions.iter().any(|d| d.opcode == Opcode::TypeCheck
+                && matches!(d.aux, AuxData::TypeTag(ty) if ty.bits == TypeBits::DOUBLE_FLOAT)),
+                primitive, "a same-leaf-name symbol is not a primitive layout proof");
+            if !primitive {
+                let call = instructions.iter().find(|d| d.opcode == Opcode::Call
+                    && matches!(d.aux, AuxData::CallTarget(sym) if sym == typep))
+                    .expect("qualified/uninterned type keeps the actual TYPEP call");
+                assert!(call.frame_state.is_some());
+                assert!(!instructions.iter().any(|d| d.opcode == Opcode::TypeCheck));
+            }
+        }
     }
 
     #[test]

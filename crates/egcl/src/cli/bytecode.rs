@@ -1500,11 +1500,11 @@ fn format_bytecode_listing(sym: u32, bf: &Arc<BytecodeFunction>) -> String {
             // operand-type profile that drives tier-up speculation.
             Instr::CallNamed { .. } => type_profile_at(func_ptr, pc as u32)
                 .map(|p| {
-                    let spec = match p.dominant() {
+                    let spec = match p.speculation() {
                         Some(SpecType::Fixnum) => " ⇒ speculate FIXNUM",
                         Some(SpecType::SingleFloat) => " ⇒ speculate SINGLE-FLOAT",
                         Some(SpecType::DoubleFloat) => " ⇒ speculate DOUBLE-FLOAT",
-                        None => " ⇒ generic (polymorphic / cold)",
+                        None => " ⇒ generic (polymorphic / cold / retired family)",
                     };
                     format!(
                         "[profile fix:{} float:{} double:{} bignum:{} other:{}{}]",
@@ -21645,6 +21645,10 @@ pub struct TypeProfile {
     /// so a site that mixes doubles with other operands cannot alternate
     /// between raw double and fixnum versions without end.
     pub double_declined: bool,
+    /// Failed guarded results/domains are independent of valid input samples.
+    /// New fixnum samples cannot resurrect an overflowing fixnum version.
+    pub fixnum_declined: bool,
+    pub single_declined: bool,
 }
 
 impl TypeProfile {
@@ -21675,9 +21679,24 @@ impl TypeProfile {
         }
     }
 
-    /// The T2 choice for an observed site, including lightly sampled but
-    /// monomorphic sites. Share it with deopt feedback so generic sites are
-    /// never mistaken for failed guards at another arithmetic operation.
+    /// Explicit failed-family policy, independent of observed operand types.
+    fn permits(&self, kind: SpecType) -> bool {
+        match kind {
+            SpecType::Fixnum => !self.fixnum_declined,
+            SpecType::SingleFloat => !self.single_declined,
+            SpecType::DoubleFloat => !self.double_declined,
+        }
+    }
+
+    fn decline(&mut self, kind: SpecType) {
+        match kind {
+            SpecType::Fixnum => self.fixnum_declined = true,
+            SpecType::SingleFloat => self.single_declined = true,
+            SpecType::DoubleFloat => self.double_declined = true,
+        }
+    }
+
+    /// The T2 choice for observed operand types after failed-family policy.
     fn speculation(&self) -> Option<SpecType> {
         let choice = self.dominant().or({
             if self.other != 0 || self.bignum != 0 {
@@ -21692,36 +21711,36 @@ impl TypeProfile {
                 None
             }
         });
-        choice.filter(|spec| !(self.double_declined && *spec == SpecType::DoubleFloat))
+        choice.filter(|spec| self.permits(*spec))
     }
 }
 
-/// Retire raw double-float speculation at the sites a failed guard names
-/// (bliss-thcbb). A guard at a double site declines that site; a guard at
-/// function entry (bytecode 0, a parameter unboxed for a raw loop variable)
-/// declines every double site of the version. The decayed evidence is given
-/// back, so the replacement compiles those sites generic instead of trusting
-/// the handful of samples taken since the deopt. Returns whether any site was
-/// declined; the caller then replaces the version at once.
-fn decline_failed_double_sites(
+/// Retire only an installed numeric family named by the failing guard.
+/// Operand observations remain type evidence: overflow/domain failure does not
+/// turn fixnum inputs into bignums. Keep rejection separately until definition
+/// retirement, even after profile decay or new same-type observations.
+fn decline_failed_numeric_sites(
     body: &Arc<BytecodeFunction>,
     installed: &T2InstalledMetadata,
     guard_bcp: u32,
 ) -> bool {
     let key = Arc::as_ptr(body) as usize;
-    let sites: Vec<u32> = installed
+    let sites: Vec<_> = installed
         .speculations
         .iter()
-        .filter(|&&(bcp, kind)| kind == SpecType::DoubleFloat && (guard_bcp == 0 || bcp == guard_bcp))
-        .map(|&(bcp, _)| bcp)
+        .filter(|&&(bcp, kind)| bcp == guard_bcp
+            // Retain existing raw-double entry-unbox retirement. A bare entry
+            // failure must not retire unrelated fixnum/single arithmetic.
+            || (guard_bcp == 0 && kind == SpecType::DoubleFloat))
+        .copied()
         .collect();
     if sites.is_empty() {
         return false;
     }
     TYPE_PROFILE.with(|profiles| {
         let mut profiles = profiles.borrow_mut();
-        for bcp in sites {
-            profiles.entry((key, bcp)).or_default().double_declined = true;
+        for (bcp, kind) in sites {
+            profiles.entry((key, bcp)).or_default().decline(kind);
         }
     });
     true
@@ -23993,7 +24012,8 @@ impl Drop for BlockScopeGuard {
 /// returning to run_native (bliss-w6aki). An obsolete activation may still
 /// fail a guard; that counts, but must not retire the replacement's code.
 /// `guard_bcp` is the failing guard's position in the function's own bytecode
-/// when the caller knows it; it is used only to name the guard in EGCL_T2_LOG.
+/// when the caller knows it; installed numeric metadata also uses it to retire
+/// the failed site's family without discarding valid operand observations.
 fn note_native_deopt(sym: u32, code: Option<&NativeCode>, guard_bcp: Option<u32>) {
     DEOPT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     trace("native speculative deopt → interpreter");
@@ -24021,10 +24041,8 @@ fn note_native_deopt(sym: u32, code: Option<&NativeCode>, guard_bcp: Option<u32>
     if current.as_ref().zip(bf)
         .is_some_and(|(current, original)| Arc::ptr_eq(current, original))
     {
-        // Backoff/blacklist: an occasional deopt (a rare overflow) is fine and
-        // the fast path stays installed. Repeated failures either indicate a
-        // supported numeric phase change (retire this version and recompile) or
-        // a genuinely unsupported domain (permanently blacklist speculation).
+        // Installed numeric failures retire their site/family immediately.
+        // Other failures retain threshold-based phase-change/backoff handling.
         let n = DEOPT_COUNTS.with(|m| {
             let mut b = m.borrow_mut();
             let e = b.entry(sym).or_insert(0);
@@ -24055,16 +24073,20 @@ fn note_native_deopt(sym: u32, code: Option<&NativeCode>, guard_bcp: Option<u32>
         // evidence, and the site now has some (bliss-9bw59). Waiting for the
         // threshold re-ran a float recursion through eight deopts first.
         let cold_disproved = !threshold_hit && cold_guess_disproved(sym);
-        // A failed raw double guard retires that speculation and recompiles
-        // at once, keeping the evidence (bliss-thcbb).
-        let double_declined = is_t2
+        // An installed numeric guard can fail despite perfectly valid operand
+        // type evidence (overflow, zero divisor, NaN/domain). Retire that
+        // site/family immediately rather than repeating the same assumption.
+        let numeric_declined = is_t2
             && bf.zip(metadata).zip(guard_bcp).is_some_and(|((body, installed), bcp)| {
-                decline_failed_double_sites(body, installed, bcp)
+                decline_failed_numeric_sites(body, installed, bcp)
             });
+        let double_failure = numeric_declined && metadata.zip(guard_bcp).is_some_and(|(installed, bcp)| {
+            installed.speculations.iter().any(|&(site, kind)| kind == SpecType::DoubleFloat && (bcp == 0 || site == bcp))
+        });
         let phase_change = cold_disproved
-            || double_declined
+            || numeric_declined
             || (threshold_hit && supported_numeric_phase_change(sym));
-        if double_declined {
+        if numeric_declined {
             restore_decayed_evidence(sym);
         }
         if cold_disproved {
@@ -24094,8 +24116,10 @@ fn note_native_deopt(sym: u32, code: Option<&NativeCode>, guard_bcp: Option<u32>
                 "{nm}: native guard deopt #{n} => resuming interpreted{}",
                 if cold_disproved {
                     " (cold fixnum guess disproved => generic T1 + recompile)"
-                } else if double_declined {
+                } else if double_failure {
                     " (raw double speculation failed => generic T1 + recompile)"
+                } else if numeric_declined {
+                    " (numeric speculation failed => generic T1 + recompile)"
                 } else if phase_change {
                     " (threshold hit: supported numeric phase change => generic T1 + recompile)"
                 } else if threshold_hit {
@@ -26687,6 +26711,11 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
 
     let mut inline_options = egcl_compiler::t2::inlining::InlineOptions::default()
         .with_root_symbol(sym).with_constant_globals(input.constant_globals.clone());
+    let permits = |bcp: u32, kind: egcl_compiler::t2::speculate::SpecType| {
+        use egcl_compiler::t2::speculate::SpecType as Bc;
+        let kind = match kind { Bc::Fixnum => SpecType::Fixnum, Bc::SingleFloat => SpecType::SingleFloat, Bc::DoubleFloat => SpecType::DoubleFloat };
+        input.type_profiles.get(&bcp).is_none_or(|p| p.permits(kind))
+    };
     if !input.constant_globals.is_empty() {
         t2_log!("{name}: captured {} constant global fixnum binding(s)", input.constant_globals.len());
     }
@@ -26775,7 +26804,7 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     if cfg!(all(target_arch = "x86_64", target_os = "linux"))
         && std::env::var_os("EGCL_DISABLE_LOOP_PEELING").is_none()
     {
-        let peeled = egcl_compiler::t2::opt_loop_peel::peel_for_numeric_types(
+        let peeled = egcl_compiler::t2::opt_loop_peel::peel_for_numeric_types_with_feedback(
             &mut f,
             &|bcp| input.type_profiles.get(&bcp).is_some_and(|p| {
                 p.fixnum >= 4 && p.bignum > 0
@@ -26783,6 +26812,7 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
                     && p.single_float == 0 && p.double_float == 0 && p.other == 0
             }),
             egcl_compiler::t2::opt_loop_peel::PeelOptions::default(),
+            &permits,
         );
         if peeled.loops != 0 || !peeled.declined.is_empty() {
             t2_log!("{name}: type-driven loop peeling: {peeled:?}");
@@ -26805,11 +26835,12 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
         target_arch = "s390x"
     )) {
         let mut candidate = f.clone();
-        let packed_sites = egcl_compiler::t2::packed_f64::specialize(&mut candidate);
-        let speculated = egcl_compiler::t2::speculate::speculate_with(
+        let packed_sites = egcl_compiler::t2::packed_f64::specialize_with_feedback(&mut candidate, &permits);
+        let speculated = egcl_compiler::t2::speculate::speculate_with_feedback(
             &mut candidate,
             &profile,
             egcl_compiler::t2::speculate::SpeculateOptions { double_float: true },
+            &permits,
         );
         let array_sites = egcl_compiler::t2::array_access::specialize(&mut candidate, true, &array_inline_options);
         let raw = egcl_compiler::t2::unbox_f64::has_raw_doubles(&candidate);
@@ -26851,7 +26882,8 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     let tagged_profile = |bcp: u32| {
         profile(bcp).filter(|spec| *spec != egcl_compiler::t2::speculate::SpecType::DoubleFloat)
     };
-    let speculated = egcl_compiler::t2::speculate::speculate(&mut f, &tagged_profile);
+    let speculated = egcl_compiler::t2::speculate::speculate_with_feedback(&mut f, &tagged_profile,
+        egcl_compiler::t2::speculate::SpeculateOptions::default(), &permits);
     egcl_compiler::t2::array_access::specialize(&mut f, false, &array_inline_options);
     let speculations = t2_numeric_speculations(&f, sym);
     // Speculation is an ENHANCEMENT, not the admission test for T2. Even with no
@@ -27229,8 +27261,8 @@ fn t2_numeric_speculations(
         for &instruction in &f.block(block).insts {
             let data = f.inst(instruction);
             let kind = match data.opcode {
-                FixnumAdd | FixnumSub | FixnumMul | FixnumDiv | FixnumRem | FixnumMod
-                | FixnumNeg | FixnumShl | FixnumShr | LogAnd | LogOr | LogXor | LogNot
+                FixnumAdd | FixnumSub | FixnumMul | FixnumDiv | FixnumFloor | FixnumRem | FixnumMod
+                | FixnumMin | FixnumMax | FixnumNeg | FixnumShl | FixnumShr | LogAnd | LogOr | LogXor | LogNot
                 | FixnumCmpEq | FixnumCmpLt | FixnumCmpLe | FixnumCmpGt | FixnumCmpGe => {
                     SpecType::Fixnum
                 }
@@ -30104,6 +30136,8 @@ mod jtc4_stack_map_tests {
                 bignum: 0,
                 other: 0,
                 double_declined: false,
+                fixnum_declined: false,
+                single_declined: false,
             });
             // This site was already generic; its historical bignum samples
             // must not turn another site's overflow into a new numeric phase.
@@ -30161,6 +30195,137 @@ mod jtc4_stack_map_tests {
             "new evidence may justify specialization");
         clear_bytecode_profiles(key);
         assert!(type_profile_at(key, 1).is_none(), "definition retirement clears feedback");
+    }
+
+    #[test]
+    fn failed_numeric_family_is_independent_of_valid_operand_observations() {
+        for kind in [
+            SpecType::Fixnum,
+            SpecType::SingleFloat,
+            SpecType::DoubleFloat,
+        ] {
+            let mut profile = TypeProfile::default();
+            match kind {
+                SpecType::Fixnum => profile.fixnum = 16,
+                SpecType::SingleFloat => profile.single_float = 16,
+                SpecType::DoubleFloat => profile.double_float = 16,
+            }
+            assert_eq!(profile.dominant(), Some(kind));
+            profile.decline(kind);
+            assert_eq!(
+                profile.total(),
+                16,
+                "failure is not a new operand-type sample"
+            );
+            assert_eq!(
+                profile.dominant(),
+                Some(kind),
+                "operand evidence remains true"
+            );
+            assert_eq!(
+                profile.speculation(),
+                None,
+                "failed result/domain owns a separate veto"
+            );
+        }
+    }
+
+    #[test]
+    fn installed_numeric_failure_retires_only_the_actual_site_and_survives_decay() {
+        let _lock = super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env_root = &mut env);
+        egcl_rt::rooted!(form = super::super::vec_to_list(&[NIL]));
+        let body = Arc::new(
+            compile_function("FAILED-NUMERIC-FAMILY", NIL, *form, &env, false, false).unwrap(),
+        );
+        let key = Arc::as_ptr(&body) as usize;
+        clear_bytecode_profiles(key);
+        TYPE_PROFILE.with(|profiles| {
+            let mut profiles = profiles.borrow_mut();
+            for bcp in [1, 4] {
+                profiles.insert(
+                    (key, bcp),
+                    TypeProfile {
+                        fixnum: 16,
+                        ..Default::default()
+                    },
+                );
+            }
+            profiles.insert(
+                (key, 2),
+                TypeProfile {
+                    single_float: 16,
+                    ..Default::default()
+                },
+            );
+            profiles.insert(
+                (key, 3),
+                TypeProfile {
+                    double_float: 16,
+                    ..Default::default()
+                },
+            );
+        });
+        let installed = T2InstalledMetadata {
+            speculations: vec![
+                (1, SpecType::Fixnum),
+                (2, SpecType::SingleFloat),
+                (3, SpecType::DoubleFloat),
+                (4, SpecType::Fixnum),
+            ],
+            cold_guesses: vec![],
+            _roots: egcl_rt::CrossThreadRoot::new(T2InstalledBodies {
+                bodies: vec![Arc::clone(&body)],
+            }),
+            deopt_bodies: HashMap::new(),
+        };
+        assert!(
+            !decline_failed_numeric_sites(&body, &installed, 9),
+            "unrelated TYPEP/result assertion is not a numeric failure"
+        );
+        assert!(type_profile_at(key, 9).is_none());
+        assert!(decline_failed_numeric_sites(&body, &installed, 1));
+        let failed = type_profile_at(key, 1).unwrap();
+        assert_eq!(failed.fixnum, 16);
+        assert_eq!(failed.speculation(), None);
+        assert_eq!(
+            type_profile_at(key, 4).unwrap().speculation(),
+            Some(SpecType::Fixnum)
+        );
+        assert_eq!(
+            type_profile_at(key, 2).unwrap().speculation(),
+            Some(SpecType::SingleFloat)
+        );
+        decay_failed_speculation(&body, None, Some(&installed));
+        record_type_profile(key, 1, &[EgclVal::from_fixnum(7), EgclVal::from_fixnum(1)]);
+        let failed = type_profile_at(key, 1).unwrap();
+        assert!(failed.fixnum > 0);
+        assert!(!failed.permits(SpecType::Fixnum));
+        assert_eq!(failed.speculation(), None);
+        assert!(
+            decline_failed_numeric_sites(&body, &installed, 0),
+            "preserve raw double entry-unbox policy"
+        );
+        assert!(
+            !type_profile_at(key, 3)
+                .unwrap()
+                .permits(SpecType::DoubleFloat)
+        );
+        assert!(
+            type_profile_at(key, 4).unwrap().permits(SpecType::Fixnum),
+            "entry0 must not retire unrelated fixnum sites"
+        );
+        clear_bytecode_profiles(key);
+        record_type_profile(key, 1, &[EgclVal::from_fixnum(7)]);
+        assert_eq!(
+            type_profile_at(key, 1).unwrap().speculation(),
+            Some(SpecType::Fixnum),
+            "new definition/body resets failure policy"
+        );
+        clear_bytecode_profiles(key);
     }
 
     #[test]

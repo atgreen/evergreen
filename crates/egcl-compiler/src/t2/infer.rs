@@ -94,10 +94,11 @@
 //! * `EGCL_IR_DUMP` (any value) makes the `TypeInference` pass print the
 //!   number of values with a non-`⊥` fact to stderr.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::t2::ir::{
-    AuxData, Function, IRType, Opcode, Range, TypeBits, Value, ValueDef, ValueRepresentation,
+    AuxData, Block, DominatorTree, Function, IRType, Inst, Opcode, Range, TypeBits, Value,
+    ValueDef, ValueRepresentation,
 };
 use crate::t2::pass::{Analyses, Pass};
 
@@ -110,15 +111,28 @@ pub struct InferenceResult {
     types: HashMap<Value, IRType>,
     reprs: HashMap<Value, ValueRepresentation>,
     structural: super::value_facts::StructuralFacts,
+    before: HashMap<(Inst, Value), IRType>,
 }
 
 impl InferenceResult {
     /// Structural evidence from the same immutable IR snapshot as numeric facts.
-    pub fn structural(&self) -> &super::value_facts::StructuralFacts { &self.structural }
+    pub fn structural(&self) -> &super::value_facts::StructuralFacts {
+        &self.structural
+    }
 
     /// The inferred `IRType` for `v` (`⊥` if the value was never reached).
     pub fn ty(&self, v: Value) -> IRType {
         self.types.get(&v).copied().unwrap_or(IRType::BOTTOM)
+    }
+
+    /// Fact immediately before a requested instruction, for one of its operands.
+    /// Unrequested sites/values conservatively use the ordinary global fact.
+    /// This is a snapshot: rebuild after any IR/CFG/OSR change.
+    pub fn ty_before(&self, inst: Inst, value: Value) -> IRType {
+        self.before
+            .get(&(inst, value))
+            .copied()
+            .unwrap_or_else(|| self.ty(value))
     }
 
     /// The inferred fact for `v`, if one was computed.
@@ -447,8 +461,14 @@ fn eval(opcode: Opcode, aux: &AuxData, ops: &[IRType]) -> IRType {
                 ..IRType::of(TypeBits::FIXNUM)
             }
         }
-        TryIntegerShr | TryStoreIntegerOctets8 | TryStoreIntegerOctets1To8 | TryStoreIntegerOctets1To8Layout => IRType::of(TypeBits::SYMBOL.join(TypeBits::NULL)),
-        PackedU8Layout => IRType::of(TypeBits::FIXNUM.join(TypeBits::NULL)),
+        TryIntegerShr
+        | TryStoreIntegerOctets8
+        | TryStoreIntegerOctets1To8
+        | TryStoreIntegerOctets1To8Layout
+        | TryStoreIntegerOctets1To8Extent => IRType::of(TypeBits::SYMBOL.join(TypeBits::NULL)),
+        PackedU8Layout | PackedU8AllocationLayout | PackedU8AllocationExtent => {
+            IRType::of(TypeBits::FIXNUM.join(TypeBits::NULL))
+        }
         IntegerLowBits => match aux {
             AuxData::FixnumImm(mask) if (0..=(1i64 << 60) - 1).contains(mask) => IRType {
                 range: Some(Range { lo: 0, hi: *mask }),
@@ -548,6 +568,7 @@ fn predicate_true_type(bits: TypeBits) -> Option<IRType> {
     } else if bits == TypeBits::FIXNUM
         || bits == TypeBits::FIXNUM.join(TypeBits::BIGNUM)
         || bits == TypeBits::STRING
+        || bits == TypeBits::DOUBLE_FLOAT
     {
         bits
     } else {
@@ -708,7 +729,7 @@ const MAX_PASSES: usize = WIDEN_AFTER + 8;
 /// LDB result only while that descriptor has one executable consumer, crosses
 /// normal single-predecessor edges, and encounters no opaque effects. Calls
 /// remain in the IR: these are facts about successful normal returns only.
-fn fresh_ldb_facts(f: &Function) -> HashMap<Value, IRType> {
+fn fresh_ldb_facts(f: &Function, predecessors: &[Vec<Block>]) -> HashMap<Value, IRType> {
     use super::builtin_binding::{Binding, snapshot};
     let canonical = |data: &super::ir::InstData, key: &str| {
         let AuxData::CallTarget(symbol) = data.aux else {
@@ -785,8 +806,7 @@ fn fresh_ldb_facts(f: &Function) -> HashMap<Value, IRType> {
                         break 'trace None;
                     }
                 }
-                let predecessors = f.preds(block);
-                let [predecessor] = predecessors.as_slice() else {
+                let [predecessor] = predecessors[block.index()].as_slice() else {
                     break None;
                 };
                 let instructions = &f.block(*predecessor).insts;
@@ -834,9 +854,70 @@ fn fresh_ldb_facts(f: &Function) -> HashMap<Value, IRType> {
     facts
 }
 
+// Presence-enabled compiler diagnostics, independent of inference semantics.
+// All subphase intervals are inclusive where documented in the output schema.
+#[derive(Default)]
+struct InferenceTimings {
+    start: Option<std::time::Instant>,
+    setup_ns: u128,
+    checks_ns: u128,
+    fixpoint_ns: u128,
+    entry_ns: u128,
+    edge_ns: u128,
+    replay_ns: u128,
+    replay_entry_ns: u128,
+    repr_ns: u128,
+    passes: usize,
+    block_visits: usize,
+    replay_blocks: usize,
+    replay_insts: usize,
+    entry_calls: usize,
+    idom_steps: usize,
+    dominance_queries: usize,
+}
+
+impl InferenceTimings {
+    fn new() -> Self {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let enabled = *ENABLED.get_or_init(|| std::env::var_os("EGCL_INFER_PHASE_LOG").is_some());
+        Self { start: enabled.then(std::time::Instant::now), ..Self::default() }
+    }
+
+    fn clock(&self) -> Option<std::time::Instant> {
+        self.start.map(|_| std::time::Instant::now())
+    }
+
+    fn elapsed(start: Option<std::time::Instant>) -> u128 {
+        start.map_or(0, |start| start.elapsed().as_nanos())
+    }
+
+    fn finish(&self, f: &Function, blocks: usize, sites: usize) {
+        let Some(start) = self.start else { return };
+        eprintln!("[infer-phases] function={:?} total_ns={} setup_ns={} checks_ns={} fixpoint_ns={} entry_ns={} edge_ns={} replay_ns={} replay_entry_ns={} repr_ns={} passes={} blocks={} block_visits={} replay_blocks={} replay_insts={} sites={} entry_calls={} idom_steps={} dominance_queries={}",
+            f.name(), start.elapsed().as_nanos(), self.setup_ns, self.checks_ns,
+            self.fixpoint_ns, self.entry_ns, self.edge_ns, self.replay_ns,
+            self.replay_entry_ns, self.repr_ns, self.passes, blocks,
+            self.block_visits, self.replay_blocks, self.replay_insts, sites,
+            self.entry_calls, self.idom_steps, self.dominance_queries);
+    }
+}
+
 /// Infer types, ranges, and representations for every reachable value in `f`.
 pub fn infer(f: &Function) -> InferenceResult {
-    let ldb_facts = fresh_ldb_facts(f);
+    infer_for_sites(f, &[])
+}
+
+/// Run inference once and capture operand facts only at the requested sites.
+/// Scoped facts are replayed against the frozen final global solution, never
+/// copied from an intermediate/widening iteration or recomputed per site.
+pub fn infer_for_sites(f: &Function, sites: &[Inst]) -> InferenceResult {
+    let mut timings = InferenceTimings::new();
+    let setup_start = timings.clock();
+    // The IR is frozen throughout this invocation. Preserve Function::preds
+    // ordering/deduplication once, rather than rescanning the whole CFG in
+    // every widening pass and for every candidate comparison edge.
+    let predecessors = f.pred_lists();
+    let ldb_facts = fresh_ldb_facts(f, &predecessors);
     let structural = super::value_facts::StructuralFacts::analyze(f);
     let rpo = f.reverse_postorder();
     let dom = f.dominators();
@@ -844,7 +925,7 @@ pub fn infer(f: &Function) -> InferenceResult {
 
     // Seed entry / pred-less block parameters from their declared type once.
     for &b in &rpo {
-        if b == f.entry() || f.preds(b).is_empty() {
+        if b == f.entry() || predecessors[b.index()].is_empty() {
             for &p in &f.block(b).params {
                 g.0.insert(p, f.value(p).ty);
             }
@@ -877,7 +958,17 @@ pub fn infer(f: &Function) -> InferenceResult {
         }
     }
 
+    // These contracts depend only on the frozen IR, never the evolving
+    // lattice solution. Share one snapshot across widening iterations and the
+    // final requested-site replay; comparison edge bounds remain per-pass.
+    timings.setup_ns = InferenceTimings::elapsed(setup_start);
+    let checks_start = timings.clock();
+    let check_refine = check_refinements(f, &rpo);
+    timings.checks_ns = InferenceTimings::elapsed(checks_start);
+    let fixpoint_start = timings.clock();
+
     for pass in 0..MAX_PASSES {
+        if timings.start.is_some() { timings.passes += 1; }
         let widen = pass >= WIDEN_AFTER;
         let mut changed = false;
 
@@ -887,33 +978,17 @@ pub fn infer(f: &Function) -> InferenceResult {
         // holds successful `Guard` narrowings, valid only in blocks T strictly
         // dominates (a use before the check in T itself is handled in program order).
         let mut edge_refine: HashMap<usize, (super::ir::Block, Vec<Refine>)> = HashMap::new();
-        let mut check_refine: HashMap<usize, Vec<Refine>> = HashMap::new();
 
         for &b in &rpo {
-            // Successful guard narrowings within this block, for dominated blocks.
-            for &inst in &f.block(b).insts {
-                let idef = f.inst(inst);
-                if idef.opcode == Opcode::Guard && !idef.args.is_empty()
-                {
-                    if let Some(tag) = guard_type(&idef.aux) {
-                        check_refine.entry(b.index()).or_default().push(Refine {
-                            value: idef.args[0],
-                            ty: tag,
-                        });
-                    }
-                }
-            }
-        }
-
-        for &b in &rpo {
+            if timings.start.is_some() { timings.block_visits += 1; }
             // 1. Block parameter facts = join over predecessor edges (or the
             //    declared type for pred-less blocks, seeded above).
-            let preds = f.preds(b);
+            let preds = predecessors[b.index()].as_slice();
             if !preds.is_empty() {
                 let params = f.block(b).params.clone();
                 for (num, &p) in params.iter().enumerate() {
                     let mut acc = IRType::BOTTOM;
-                    for &pred in &preds {
+                    for &pred in preds {
                         if let Some(term) = f.terminator(pred) {
                             for call in &f.inst(term).targets {
                                 if call.block == b {
@@ -934,38 +1009,7 @@ pub fn infer(f: &Function) -> InferenceResult {
                 }
             }
 
-            // 2. Build the flow-sensitive environment at entry to `b`: meet `g`
-            //    with every refinement whose scope dominates `b`.
-            let mut env: HashMap<Value, IRType> = HashMap::new();
-            let mut d = b;
-            loop {
-                if let Some((_, refs)) = edge_refine.get(&d.index()).filter(|(source, _)|
-                    structural.block_dominates_all_entries(*source, b)) {
-                    for rf in refs {
-                        let cur = env
-                            .get(&rf.value)
-                            .copied()
-                            .unwrap_or_else(|| g.get(rf.value));
-                        env.insert(rf.value, ty_meet(cur, rf.ty));
-                    }
-                }
-                if d != b {
-                    if let Some(refs) = check_refine.get(&d.index()).filter(|_|
-                        structural.block_dominates_all_entries(d, b)) {
-                        for rf in refs {
-                            let cur = env
-                                .get(&rf.value)
-                                .copied()
-                                .unwrap_or_else(|| g.get(rf.value));
-                            env.insert(rf.value, ty_meet(cur, rf.ty));
-                        }
-                    }
-                }
-                match dom.idom(d) {
-                    Some(id) if id != d => d = id,
-                    _ => break,
-                }
-            }
+            let mut env = entry_environment(b, &g, &dom, &structural, &edge_refine, &check_refine, &mut timings);
 
             // 3. Walk instructions in program order, using the local environment.
             let fact = |v: Value, env: &HashMap<Value, IRType>, g: &Facts| -> IRType {
@@ -987,7 +1031,15 @@ pub fn infer(f: &Function) -> InferenceResult {
                     .copied()
                     .unwrap_or_else(|| eval(idef.opcode, &idef.aux, &ops));
                 for (index, &rv) in idef.results.iter().enumerate() {
-                    let res = if matches!(idef.opcode, Opcode::TryIntegerShr | Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8 | Opcode::TryStoreIntegerOctets1To8Layout) && index == 1 {
+                    let res = if matches!(
+                        idef.opcode,
+                        Opcode::TryIntegerShr
+                            | Opcode::TryStoreIntegerOctets8
+                            | Opcode::TryStoreIntegerOctets1To8
+                            | Opcode::TryStoreIntegerOctets1To8Layout
+                            | Opcode::TryStoreIntegerOctets1To8Extent
+                    ) && index == 1
+                    {
                         IRType::of(TypeBits::FIXNUM)
                     } else if idef.opcode == Opcode::ConstHeapObj
                         && f.value(rv).ty.bits == TypeBits::DOUBLE_FLOAT
@@ -998,7 +1050,9 @@ pub fn infer(f: &Function) -> InferenceResult {
                         // the owner thread. Preserve that semantic type through
                         // joins without inspecting a movable heap object.
                         IRType::of(TypeBits::DOUBLE_FLOAT)
-                    } else { res };
+                    } else {
+                        res
+                    };
                     let old = g.get(rv);
                     let joined = ty_join(old, res);
                     if joined != old {
@@ -1007,66 +1061,17 @@ pub fn infer(f: &Function) -> InferenceResult {
                     }
                     env.insert(rv, joined);
                 }
-                // In-program-order guard narrowing for the rest of this block.
-                if idef.opcode == Opcode::Guard && !idef.args.is_empty()
-                {
-                    if let Some(tag) = guard_type(&idef.aux) {
-                        let v = idef.args[0];
-                        let cur = fact(v, &env, &g);
-                        env.insert(v, ty_meet(cur, tag));
-                    }
-                }
+                // Checked operations establish original-argument facts only
+                // on this successful continuation, after their own pre-state.
+                apply_normal_return_facts(f, inst, &g, &mut env);
             }
             // Compute outgoing bounds only after this block's instructions:
             // its comparison operands (including constants) now have facts.
             // Global facts still accumulate monotonically, so a loop-carried
             // bound that grows on a later pass weakens the inferred result.
-            if let Some(term) = f.terminator(b) {
-                let t = f.inst(term);
-                if t.opcode == Opcode::Brif && !t.args.is_empty() {
-                    let cond = t.args[0];
-                    if let ValueDef::Result { inst, .. } = f.value(cond).def {
-                        let cdef = f.inst(inst);
-                        // A true predicate edge narrows only its unique target
-                        // and dominated region, never the false edge or uses
-                        // before the branch. OSR imports can bypass the test;
-                        // leave this optional refinement off in OSR functions.
-                        if cdef.opcode == Opcode::TypeCheck && cdef.args.len() == 1
-                            && f.osr_entries.is_empty()
-                        {
-                            if let (AuxData::TypeTag(tag), Some(call)) = (&cdef.aux, t.targets.first()) {
-                                let tgt = call.block;
-                                if tgt != f.entry() && f.preds(tgt) == vec![b]
-                                    && t.targets.iter().filter(|c| c.block == tgt).count() == 1
-                                {
-                                    if let Some(ty) = predicate_true_type(tag.bits) {
-                                        edge_refine.entry(tgt.index()).or_insert_with(|| (b, Vec::new())).1.push(Refine {
-                                            value: cdef.args[0], ty,
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                        if cdef.args.len() == 2 {
-                            let (ca, cb) = (cdef.args[0], cdef.args[1]);
-                            for (edge, taken) in [(0usize, true), (1usize, false)] {
-                                if let Some(call) = t.targets.get(edge) {
-                                    let tgt = call.block;
-                                    // preds() deduplicates blocks. Two branch
-                                    // outcomes entering the same block do not
-                                    // establish either outcome's constraint.
-                                    if tgt != f.entry() && f.preds(tgt) == vec![b]
-                                        && t.targets.iter().filter(|c| c.block == tgt).count() == 1
-                                    {
-                                        let refs = narrow_cmp(cdef.opcode, ca, cb, taken, &g);
-                                        edge_refine.entry(tgt.index()).or_insert_with(|| (b, Vec::new())).1.extend(refs);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            let edge_start = timings.clock();
+            add_edge_refinements(f, b, &g, &predecessors, &mut edge_refine);
+            timings.edge_ns += InferenceTimings::elapsed(edge_start);
         }
 
         if !changed {
@@ -1074,12 +1079,238 @@ pub fn infer(f: &Function) -> InferenceResult {
         }
     }
 
+    timings.fixpoint_ns = InferenceTimings::elapsed(fixpoint_start);
     // Derive representations from the final types.
+    let repr_start = timings.clock();
     let mut reprs = HashMap::new();
     for (&v, &t) in &g.0 {
         reprs.insert(v, repr_of(t));
     }
-    InferenceResult { types: g.0, reprs, structural }
+    timings.repr_ns = InferenceTimings::elapsed(repr_start);
+    let replay_start = timings.clock();
+    let entry_before_replay = timings.entry_ns;
+    let before = if sites.is_empty() {
+        HashMap::new()
+    } else {
+        capture_site_facts(f, sites, &g, &rpo, &dom, &structural,
+            CaptureContext { checks: &check_refine, predecessors: &predecessors, timings: &mut timings })
+    };
+    timings.replay_ns = InferenceTimings::elapsed(replay_start);
+    timings.replay_entry_ns = timings.entry_ns - entry_before_replay;
+    timings.finish(f, rpo.len(), sites.len());
+    InferenceResult {
+        types: g.0,
+        reprs,
+        structural,
+        before,
+    }
+}
+
+type EdgeRefinements = HashMap<usize, (Block, Vec<Refine>)>;
+type CheckRefinements = HashMap<usize, Vec<Refine>>;
+
+fn check_refinements(f: &Function, rpo: &[Block]) -> CheckRefinements {
+    let mut check_refine: CheckRefinements = HashMap::new();
+    for &b in rpo {
+        // Audited normal-return argument facts, for strictly dominated blocks.
+        for &inst in &f.block(b).insts {
+            super::normal_return_facts::visit_argument_facts(f, inst, |value, ty| {
+                check_refine.entry(b.index()).or_default().push(Refine { value, ty });
+            });
+        }
+    }
+
+    check_refine
+}
+
+fn add_edge_refinements(
+    f: &Function, b: Block, g: &Facts, predecessors: &[Vec<Block>],
+    edge_refine: &mut EdgeRefinements,
+) {
+    if let Some(term) = f.terminator(b) {
+        let t = f.inst(term);
+        if t.opcode == Opcode::Brif && !t.args.is_empty() {
+            let cond = t.args[0];
+            if let ValueDef::Result { inst, .. } = f.value(cond).def {
+                let cdef = f.inst(inst);
+                // A true predicate edge narrows only its unique target
+                // and dominated region, never the false edge or uses
+                // before the branch. OSR imports can bypass the test;
+                // leave this optional refinement off in OSR functions.
+                if cdef.opcode == Opcode::TypeCheck
+                    && cdef.args.len() == 1
+                    && f.osr_entries.is_empty()
+                {
+                    if let (AuxData::TypeTag(tag), Some(call)) = (&cdef.aux, t.targets.first()) {
+                        let tgt = call.block;
+                        if tgt != f.entry()
+                            && predecessors[tgt.index()].as_slice() == [b]
+                            && t.targets.iter().filter(|c| c.block == tgt).count() == 1
+                        {
+                            if let Some(ty) = predicate_true_type(tag.bits) {
+                                edge_refine
+                                    .entry(tgt.index())
+                                    .or_insert_with(|| (b, Vec::new()))
+                                    .1
+                                    .push(Refine {
+                                        value: cdef.args[0],
+                                        ty,
+                                    });
+                            }
+                        }
+                    }
+                }
+                if cdef.args.len() == 2 {
+                    let (ca, cb) = (cdef.args[0], cdef.args[1]);
+                    for (edge, taken) in [(0usize, true), (1usize, false)] {
+                        if let Some(call) = t.targets.get(edge) {
+                            let tgt = call.block;
+                            // preds() deduplicates blocks. Two branch
+                            // outcomes entering the same block do not
+                            // establish either outcome's constraint.
+                            if tgt != f.entry()
+                                && predecessors[tgt.index()].as_slice() == [b]
+                                && t.targets.iter().filter(|c| c.block == tgt).count() == 1
+                            {
+                                let refs = narrow_cmp(cdef.opcode, ca, cb, taken, g);
+                                edge_refine
+                                    .entry(tgt.index())
+                                    .or_insert_with(|| (b, Vec::new()))
+                                    .1
+                                    .extend(refs);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn entry_environment(
+    b: Block,
+    g: &Facts,
+    dom: &DominatorTree,
+    structural: &super::value_facts::StructuralFacts,
+    edge_refine: &EdgeRefinements,
+    check_refine: &CheckRefinements,
+    timings: &mut InferenceTimings,
+) -> HashMap<Value, IRType> {
+    let entry_start = timings.clock();
+    if timings.start.is_some() { timings.entry_calls += 1; }
+    let mut env: HashMap<Value, IRType> = HashMap::new();
+    let mut d = b;
+    loop {
+        if timings.start.is_some() { timings.idom_steps += 1; }
+        if let Some((_, refs)) = edge_refine
+            .get(&d.index())
+            .filter(|(source, _)| {
+                if timings.start.is_some() { timings.dominance_queries += 1; }
+                structural.block_dominates_all_entries(*source, b)
+            })
+        {
+            for rf in refs {
+                let cur = env
+                    .get(&rf.value)
+                    .copied()
+                    .unwrap_or_else(|| g.get(rf.value));
+                let refined = ty_meet(cur, rf.ty);
+                if refined != cur {
+                    env.insert(rf.value, refined);
+                }
+            }
+        }
+        if d != b {
+            if let Some(refs) = check_refine
+                .get(&d.index())
+                .filter(|_| {
+                    if timings.start.is_some() { timings.dominance_queries += 1; }
+                    structural.block_dominates_all_entries(d, b)
+                })
+            {
+                for rf in refs {
+                    let cur = env
+                        .get(&rf.value)
+                        .copied()
+                        .unwrap_or_else(|| g.get(rf.value));
+                    let refined = ty_meet(cur, rf.ty);
+                if refined != cur {
+                    env.insert(rf.value, refined);
+                }
+                }
+            }
+        }
+        match dom.idom(d) {
+            Some(id) if id != d => d = id,
+            _ => break,
+        }
+    }
+
+    timings.entry_ns += InferenceTimings::elapsed(entry_start);
+    env
+}
+
+fn apply_normal_return_facts(
+    f: &Function, inst: Inst, g: &Facts, env: &mut HashMap<Value, IRType>,
+) {
+    super::normal_return_facts::visit_argument_facts(f, inst, |value, ty| {
+        let current = env.get(&value).copied().unwrap_or_else(|| g.get(value));
+        let refined = ty_meet(current, ty);
+        if refined != current {
+            env.insert(value, refined);
+        }
+    });
+}
+
+struct CaptureContext<'a> {
+    checks: &'a CheckRefinements,
+    predecessors: &'a [Vec<Block>],
+    timings: &'a mut InferenceTimings,
+}
+
+fn capture_site_facts(
+    f: &Function,
+    sites: &[Inst],
+    g: &Facts,
+    rpo: &[Block],
+    dom: &DominatorTree,
+    structural: &super::value_facts::StructuralFacts,
+    context: CaptureContext<'_>,
+) -> HashMap<(Inst, Value), IRType> {
+    let CaptureContext { checks, predecessors, timings } = context;
+    let requested: HashSet<_> = sites.iter().copied().collect();
+    let mut edges = EdgeRefinements::new();
+    for &block in rpo {
+        let edge_start = timings.clock();
+        add_edge_refinements(f, block, g, predecessors, &mut edges);
+        timings.edge_ns += InferenceTimings::elapsed(edge_start);
+    }
+    let mut before = HashMap::new();
+    for &block in rpo {
+        let instructions = &f.block(block).insts;
+        let Some(last) = instructions.iter().rposition(|inst| requested.contains(inst)) else {
+            continue;
+        };
+        // Each replay starts from converged global facts and the complete
+        // edge/check maps. Other blocks' local environments do not feed it.
+        let mut env = entry_environment(block, g, dom, structural, &edges, checks, timings);
+        if timings.start.is_some() { timings.replay_blocks += 1; }
+        for &inst in &instructions[..=last] {
+            if timings.start.is_some() { timings.replay_insts += 1; }
+            let data = f.inst(inst);
+            if requested.contains(&inst) {
+                for &value in &data.args {
+                    before.insert(
+                        (inst, value),
+                        env.get(&value).copied().unwrap_or_else(|| g.get(value)),
+                    );
+                }
+            }
+            // Its normal-return contract proves nothing about its pre-state.
+            apply_normal_return_facts(f, inst, g, &mut env);
+        }
+    }
+    before
 }
 
 /// Choose a provable/profitable unboxed representation for a fact, else `Tagged`.
@@ -1802,7 +2033,35 @@ mod tests {
                     control_scopes: vec![],
                 });
             }
-            let facts = infer(&f);
+            let site = |value| match f.value(value).def {
+                ValueDef::Result { inst, .. } => inst,
+                _ => panic!("expected instruction result"),
+            };
+            let prior_site = site(before[0]);
+            let true_site = site(true_value[0]);
+            let false_site = site(false_value);
+            let facts = infer_for_sites(&f, &[prior_site, true_site, false_site]);
+            assert_eq!(facts.ty_before(prior_site, input), IRType::TOP);
+            assert_eq!(facts.ty_before(false_site, input), IRType::TOP);
+            assert_eq!(
+                facts.ty_before(true_site, input),
+                if !shared && !osr {
+                    fixnum()
+                } else {
+                    IRType::TOP
+                }
+            );
+            // The predecessor has no requested site in this replay. Its
+            // branch contract still applies, unless an alternate OSR bypasses it.
+            let only_successor = infer_for_sites(&f, &[true_site]);
+            assert_eq!(only_successor.ty_before(true_site, input),
+                facts.ty_before(true_site, input));
+            // Unrequested sites and nonoperands never gain scoped proofs.
+            assert_eq!(facts.ty_before(site(bool_use[0]), input), facts.ty(input));
+            assert_eq!(
+                facts.ty_before(true_site, predicate[0]),
+                facts.ty(predicate[0])
+            );
             assert!(facts.ty(before[0]).bits.contains(TypeBits::DOUBLE_FLOAT));
             assert!(facts.ty(false_value).bits.contains(TypeBits::DOUBLE_FLOAT));
             assert_eq!(
@@ -2001,11 +2260,15 @@ mod tests {
         let mut f = Function::new("string-layout-type");
         let entry = f.entry();
         let input = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+        let state = f.frame_states.add(crate::t2::frame_state::FrameState {
+            scopes: vec![], remat: vec![],
+        });
         let (_, checked) = f.push_inst(
             entry,
             InstData {
                 args: vec![input],
                 aux: AuxData::StringLayout,
+                frame_state: Some(state),
                 flags: InstFlags {
                     guard: true,
                     effectful: true,
@@ -2062,13 +2325,18 @@ mod tests {
         let mut f = Function::new("guard");
         let e = f.entry();
         let p = f.add_block_param(e, IRType::TOP, ValueRepresentation::Tagged);
+        let state = f.frame_states.add(crate::t2::frame_state::FrameState {
+            scopes: vec![], remat: vec![],
+        });
         f.push_inst(
             e,
             InstData {
                 args: vec![p],
                 aux: AuxData::TypeTag(fixnum()),
+                frame_state: Some(state),
                 flags: InstFlags {
                     guard: true,
+                    effectful: true,
                     ..InstFlags::default()
                 },
                 ..inst(Opcode::Guard)
@@ -2238,6 +2506,14 @@ mod tests {
         );
         f.set_terminator(successor, ret());
         assert_eq!(infer(&f).range(result[0]), Some(Range { lo: 1, hi: 41 }));
+
+        // A new inference invocation must observe a changed CFG, rather than
+        // retaining the prior shared-edge predecessor snapshot.
+        let separate_false = f.make_block();
+        f.set_terminator(separate_false, ret());
+        let branch = f.terminator(entry).unwrap();
+        f.inst_mut(branch).targets[1].block = separate_false;
+        assert_eq!(infer(&f).range(result[0]), Some(Range { lo: 1, hi: 2 }));
     }
 
     #[test]
@@ -2398,7 +2674,16 @@ mod tests {
 
         f.set_terminator(exit, ret());
 
-        let r = infer(&f);
+        let site = match f.value(i1[0]).def {
+            ValueDef::Result { inst, .. } => inst,
+            _ => unreachable!(),
+        };
+        let r = infer_for_sites(&f, &[site]);
+        assert_eq!(
+            r.ty_before(site, i).range,
+            Some(Range { lo: 0, hi: 9 }),
+            "site range must replay the final loop solution"
+        );
         // The induction variable is a bounded fixnum: 0 ≤ i ≤ 10.
         assert_eq!(r.ty(i).bits, TypeBits::FIXNUM, "index must be a FIXNUM");
         let rng = r.range(i).expect("index must have a proven range");
@@ -2449,6 +2734,156 @@ mod tests {
                 expected,
                 "declared_double={declared_double}, snapshot={snapshot}"
             );
+        }
+    }
+    #[test]
+    fn checked_normal_return_refines_untrusted_declared_double_in_successor() {
+        // A declaration without immutable literal metadata is not a global
+        // proof. Only the successful runtime check establishes this original
+        // SSA value's type in its normal continuation.
+        let mut f = Function::new("checked-untrusted-double");
+        let entry = f.entry();
+        let (_, literal) = f.push_inst(entry, InstData {
+            aux: AuxData::HeapLiteral { slot: 0x12340 },
+            ..inst(Opcode::ConstHeapObj)
+        }, &[(IRType::of(TypeBits::DOUBLE_FLOAT), ValueRepresentation::Tagged)]);
+        let literal = literal[0];
+        assert!(f.double_literals.is_empty());
+        let state = f.frame_states.add(crate::t2::frame_state::FrameState {
+            scopes: vec![], remat: vec![],
+        });
+        let (guard, _) = f.push_inst(entry, InstData {
+            args: vec![literal], aux: AuxData::TypeTag(IRType::of(TypeBits::DOUBLE_FLOAT)),
+            flags: InstFlags { guard: true, effectful: true, ..Default::default() },
+            frame_state: Some(state), ..inst(Opcode::Guard)
+        }, &[]);
+        let successor = f.make_block();
+        f.set_terminator(entry, InstData { targets: vec![BlockCall {
+            block: successor, args: vec![] }], ..inst(Opcode::Jump) });
+        let (later, _) = f.push_inst(successor, InstData {
+            args: vec![literal, literal], ..inst(Opcode::GenericEq)
+        }, &[(IRType::TOP, ValueRepresentation::Tagged)]);
+        f.set_terminator(successor, ret());
+        let facts = infer_for_sites(&f, &[guard, later]);
+        assert_eq!(facts.ty(literal), IRType::TOP, "no heap read or declaration trust");
+        assert_eq!(facts.ty_before(guard, literal), IRType::TOP);
+        assert_eq!(facts.ty_before(later, literal), IRType::of(TypeBits::DOUBLE_FLOAT),
+            "the checked predecessor must publish its fact across the edge");
+        let only_successor = infer_for_sites(&f, &[later]);
+        assert_eq!(only_successor.ty_before(later, literal),
+            IRType::of(TypeBits::DOUBLE_FLOAT),
+            "an unrequested predecessor still publishes its checked contract");
+    }
+
+    #[test]
+    fn requested_guard_site_captures_prestate_and_later_success_only() {
+        let mut f = Function::new("requested-guard-order");
+        let entry = f.entry();
+        let input = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+        let state = f.frame_states.add(crate::t2::frame_state::FrameState {
+            scopes: vec![], remat: vec![],
+        });
+        let (guard, _) = f.push_inst(
+            entry,
+            InstData {
+                args: vec![input],
+                aux: AuxData::TypeTag(fixnum()),
+                frame_state: Some(state),
+                flags: InstFlags {
+                    guard: true,
+                    effectful: true,
+                    ..InstFlags::default()
+                },
+                ..inst(Opcode::Guard)
+            },
+            &[],
+        );
+        let (later, _) = f.push_inst(
+            entry,
+            InstData {
+                args: vec![input, input],
+                ..inst(Opcode::GenericAdd)
+            },
+            &[(IRType::TOP, ValueRepresentation::Tagged)],
+        );
+        f.set_terminator(entry, ret());
+        let facts = infer_for_sites(&f, &[guard, later, later]);
+        assert_eq!(facts.ty_before(guard, input), IRType::TOP);
+        assert_eq!(facts.ty_before(later, input), fixnum());
+        assert_eq!(facts.ty(input), IRType::TOP);
+        assert_eq!(infer(&f).ty_before(later, input), IRType::TOP);
+        assert_eq!(
+            facts.before.len(),
+            2,
+            "only requested operand pairs retained"
+        );
+    }
+
+    #[test]
+    fn requested_sites_capture_real_bytecode_branch_operand_facts() {
+        use egcl_rt::bytecode::{BytecodeFunction, Instr};
+        let body = BytecodeFunction {
+            self_call_sites: vec![],
+            notinline_sites: vec![],
+            code: vec![
+                Instr::LoadLocal(0),
+                Instr::CallNamed {
+                    sym: egcl_rt::symbols::intern("INTEGERP"),
+                    nargs: 1,
+                },
+                Instr::BrIfFalse(5),
+                Instr::LoadLocal(0),
+                Instr::Return,
+                Instr::LoadLocal(0),
+                Instr::Return,
+            ],
+            constants: vec![],
+            load_time_values: vec![],
+            handler_cases: vec![],
+            handler_binds: vec![],
+            names: vec![],
+            restart_cases: vec![],
+            nested_functions: vec![],
+            param_layout: vec![],
+            param_types: vec![],
+            has_env: false,
+            n_locals: 1,
+            max_stack: 1,
+            arity: 1,
+            name: "inferred-predicate".into(),
+            params_form: egcl_rt::value::NIL,
+            min_args: 1,
+            max_args: Some(1),
+            variadic: false,
+            binder_cache: Default::default(),
+        };
+        let f = crate::t2::build::build_from_bytecode(&body).unwrap();
+        let branch = f
+            .block_order()
+            .iter()
+            .find_map(|&b| {
+                f.terminator(b)
+                    .filter(|&i| f.inst(i).opcode == Opcode::Brif)
+            })
+            .expect("bytecode conditional must build a branch");
+        let returns: Vec<_> = f
+            .block_order()
+            .iter()
+            .filter_map(|&b| f.terminator(b))
+            .filter(|&i| f.inst(i).opcode == Opcode::Return)
+            .collect();
+        assert_eq!(returns.len(), 2);
+        let facts = infer_for_sites(&f, &returns);
+        let yes = f.inst(branch).targets[0].block;
+        for site in returns {
+            let input = f.inst(site).args[0];
+            assert_eq!(facts.ty(input), IRType::TOP);
+            let expected = if f.block(yes).insts.contains(&site) {
+                IRType::of(TypeBits::FIXNUM.join(TypeBits::BIGNUM))
+            } else {
+                IRType::TOP
+            };
+            assert_eq!(facts.ty_before(site, input), expected);
         }
     }
 }

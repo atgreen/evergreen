@@ -54,6 +54,16 @@ pub fn peel_for_numeric_types(
     benefit: &impl Fn(u32) -> bool,
     options: PeelOptions,
 ) -> PeelStats {
+    peel_for_numeric_types_with_feedback(f, benefit, options, &|_, _| true)
+}
+
+/// Runtime failure policy also owns arithmetic created in cloned fast loops.
+pub fn peel_for_numeric_types_with_feedback(
+    f: &mut Function,
+    benefit: &impl Fn(u32) -> bool,
+    options: PeelOptions,
+    permits: &dyn Fn(u32, super::speculate::SpecType) -> bool,
+) -> PeelStats {
     let dom = f.dominators();
     let loops = super::opt_licm::detect_loops(f, &dom);
     let mut stats = PeelStats::default();
@@ -88,7 +98,7 @@ pub fn peel_for_numeric_types(
         }
         let mut trial = f.clone();
         let before = trial.num_insts();
-        if let Err(error) = transform(&mut trial, lp.header, &lp.body, parameter, latch, range) {
+        if let Err(error) = transform(&mut trial, lp.header, &lp.body, parameter, latch, range, permits) {
             stats
                 .declined
                 .push(format!("header {}: {error}", lp.header.0));
@@ -398,6 +408,8 @@ fn jump(f: &mut Function, from: Block, to: Block, args: Vec<Value>) {
     );
 }
 
+// Keep the runtime failure policy beside the existing region/typing inputs.
+#[allow(clippy::too_many_arguments)]
 fn transform(
     f: &mut Function,
     header: Block,
@@ -405,6 +417,7 @@ fn transform(
     parameter: usize,
     latch: Block,
     range: Option<Range>,
+    permits: &dyn Fn(u32, super::speculate::SpecType) -> bool,
 ) -> Result<(), &'static str> {
     let outside: Vec<_> = f
         .preds(header)
@@ -533,7 +546,7 @@ fn transform(
             edge.block = bridge;
         }
     }
-    super::speculate::speculate_blocks(f, &fast_blocks);
+    super::speculate::speculate_blocks_with_feedback(f, &fast_blocks, permits);
     let fast_term = f
         .terminator(fast.block_map[&latch])
         .ok_or("fast latch missing terminator")?;
@@ -806,5 +819,23 @@ mod tests {
             0
         );
         assert_eq!(format!("{f:?}"), before);
+    }
+    #[test]
+    fn declined_normalization_family_does_not_reappear_in_a_fast_clone() {
+        let mut f = loop_ir(-8);
+        let before = f.num_insts();
+        let stats = peel_for_numeric_types_with_feedback(
+            &mut f,
+            &|bcp| bcp == 7,
+            PeelOptions::default(),
+            &|bcp, kind| !(bcp == 7 && kind == super::super::speculate::SpecType::Fixnum),
+        );
+        assert_eq!(stats.loops, 0, "{stats:?}");
+        assert_eq!(
+            f.num_insts(),
+            before,
+            "transactional rejection keeps original generic/OSR graph"
+        );
+        crate::t2::verify::verify(&f).unwrap();
     }
 }

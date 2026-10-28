@@ -81,7 +81,7 @@ pub fn register_packed_u8_adapter(target: u32, symbols: PackedU8AdapterSymbols) 
     }
 }
 
-pub(super) fn packed_u8_adapter(target: u32) -> Option<PackedU8AdapterSymbols> {
+pub(crate) fn packed_u8_adapter(target: u32) -> Option<PackedU8AdapterSymbols> {
     packed_u8_adapters()
         .lock()
         .unwrap()

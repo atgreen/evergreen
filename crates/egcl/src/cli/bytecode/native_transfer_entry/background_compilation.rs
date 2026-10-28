@@ -10,6 +10,7 @@ pub(in crate::cli::bytecode) struct EmittedTransfer {
     code_len: usize,
     frame_entry: Option<usize>,
     ordinary_entry: Option<usize>,
+    allocation_extent_counts: (usize, usize, usize),
     ordinary_stack_required: Option<usize>,
     ordinary_bound_entry: Option<usize>,
     ordinary_checks_params: bool,
@@ -49,6 +50,10 @@ pub(in crate::cli::bytecode) struct EmittedTransfer {
 }
 
 impl EmittedTransfer {
+    pub(super) fn allocation_extent_counts(&self) -> (usize, usize, usize) {
+        self.allocation_extent_counts
+    }
+
     pub(super) fn install(
         mut self,
         body: Arc<BytecodeFunction>,
@@ -370,6 +375,7 @@ impl EmittedTransfer {
                 display_fn_name(&body.name)
             ))
         };
+        let mut allocation_extent_counts = (0, 0, 0);
         let ordinary = ordinary_ir.filter(|ir| {
             let reason = if context.ordinary_suppressed {
                 return false;
@@ -544,6 +550,20 @@ impl EmittedTransfer {
                     })?;
                 let sites = SysvTransferTable::new(emitted.code.len(),
                     std::mem::take(&mut emitted.native_poll_transfer_sites)).ok()?;
+                // Count only the IR whose machine emission and exact native
+                // transfer-site construction both succeeded. The outer mapped
+                // candidate predates these ordinary-only allocation rewrites.
+                allocation_extent_counts = ir.block_order().iter()
+                    .flat_map(|&block| ir.block(block).insts.iter())
+                    .fold((0, 0, 0), |(values, proofs, dimensions), &inst| {
+                        use egcl_compiler::t2::ir::{AuxData, Opcode};
+                        let d = ir.inst(inst);
+                        (values + usize::from(d.opcode == Opcode::PackedU8AllocationExtent),
+                         proofs + usize::from(d.opcode == Opcode::TryStoreIntegerOctets1To8Extent
+                             && matches!(d.aux, AuxData::AllocationExtentInBounds)),
+                         dimensions + usize::from(d.opcode == Opcode::TryStoreIntegerOctets1To8Layout
+                             && matches!(d.aux, AuxData::AllocationDimensionInBounds)))
+                    });
                 ordinary_arity = Some(arity);
                 Some((emitted, sites))
             });
@@ -757,6 +777,9 @@ impl EmittedTransfer {
             code_len: emitted.code.len(),
             frame_entry: emitted.frame_entry,
             ordinary_entry: emitted.ordinary_entry,
+            allocation_extent_counts: if emitted.ordinary_entry.is_some() {
+                allocation_extent_counts
+            } else { (0, 0, 0) },
             ordinary_stack_required: emitted.ordinary_stack_required,
             ordinary_bound_entry: emitted.ordinary_bound_entry,
             ordinary_checks_params: emitted.ordinary_checks_params,
@@ -943,7 +966,7 @@ pub(in crate::cli::bytecode) fn compile_background_t1(input: PreparedT1) -> Opti
             .map_err(EmitDecline::Build)?;
             if optimize && scope_free_native_body(body, false) {
                 let cold = RefCell::new(Vec::new());
-                egcl_compiler::t2::speculate::speculate(&mut ir, &|bcp| {
+                egcl_compiler::t2::speculate::speculate_with_feedback(&mut ir, &|bcp| {
                     use egcl_compiler::t2::speculate::SpecType as CompilerType;
                     match input.profiles.get(&bcp) {
                         None => {
@@ -958,6 +981,16 @@ pub(in crate::cli::bytecode) fn compile_background_t1(input: PreparedT1) -> Opti
                             _ => None,
                         },
                     }
+                }, egcl_compiler::t2::speculate::SpeculateOptions::default(), &|bcp, kind| {
+                    use egcl_compiler::t2::speculate::SpecType as CompilerType;
+                    let kind = match kind {
+                        CompilerType::Fixnum => SpecType::Fixnum,
+                        CompilerType::SingleFloat => SpecType::SingleFloat,
+                        CompilerType::DoubleFloat => SpecType::DoubleFloat,
+                    };
+                    // Use the immutable profiles captured for this exact body,
+                    // never live worker-thread feedback or declarations alone.
+                    input.profiles.get(&bcp).is_none_or(|profile| profile.permits(kind))
                 });
                 cold_guesses = cold.into_inner();
             }

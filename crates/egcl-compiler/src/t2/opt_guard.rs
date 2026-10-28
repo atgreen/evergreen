@@ -132,6 +132,13 @@ impl Pass for GuardElim {
         // The CFG is unchanged, so `dom` still holds.
         changed |= check_imported_guard_results(f, &dom);
 
+        // Preserve scoped range aliases: forwarding them to their wider source
+        // would erase the proof consumed by native arithmetic lowering.
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        {
+            changed |= super::opt_refine::discharge_guards(f) != 0;
+        }
+
         if changed {
             // Value definitions moved / were forwarded; drop derived analyses.
             a.invalidate();
@@ -464,7 +471,7 @@ pub fn reuse_layout_evidence(f: &mut Function) -> usize {
         .iter()
         .flat_map(|&b| f.block(b).insts.iter())
         .filter(|&&inst| {
-            f.inst(inst).opcode == Opcode::PackedU8Layout
+            matches!(f.inst(inst).opcode, Opcode::PackedU8Layout | Opcode::PackedU8AllocationLayout)
                 || (f.inst(inst).opcode == Opcode::Guard
                     && matches!(f.inst(inst).aux, AuxData::StringLayout))
         })
@@ -499,8 +506,11 @@ pub fn reuse_layout_evidence(f: &mut Function) -> usize {
                 // Both must be genuine recognized producers, not a malformed
                 // consumer that merely happens to have the right opcode.
                 let this = facts.layout_producer(inst)?;
+                let compatible = proof.encoding == encoding
+                    || (encoding == LayoutEvidence::NullableHeaderWidth
+                        && proof.encoding == LayoutEvidence::AllocationOrProbeWidth);
                 (this.encoding == encoding
-                    && proof.encoding == encoding
+                    && compatible
                     && f.value(this.evidence).repr == f.value(proof.evidence).repr
                     && f.value(this.evidence).ty == f.value(proof.evidence).ty)
                     .then_some((inst, this.evidence, proof.evidence))

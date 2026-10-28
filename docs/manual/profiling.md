@@ -223,6 +223,32 @@ env -u EGCL_GC_PHASE_LOG -u EGCL_GC_ROOT_PHASE_LOG \
   target/x86_64-unknown-linux-musl/release/egcl --no-init --load workload.lisp
 ```
 
+## T2 inference phases
+
+Set `EGCL_INFER_PHASE_LOG` before startup to write one `[infer-phases]` row
+per inference invocation to stderr. Presence is cached on first use, so `=0`
+also enables the diagnostic. For example:
+
+```sh
+EGCL_INFER_PHASE_LOG=1 EGCL_FORCE_TIER=t2 EGCL_MEM_MAX=8G EGCL_TIMEOUT=180 \
+  scripts/egcl-limited.sh target/x86_64-unknown-linux-musl/release/egcl \
+  --no-init --load workload.lisp
+```
+
+All time fields use nanoseconds. `setup_ns`, `checks_ns`, `fixpoint_ns`,
+`repr_ns`, and `replay_ns` describe successive analysis phases. The entry
+and edge-map intervals are nested: `entry_ns` and `edge_ns` include work in
+both fixpoint and requested-site replay; `replay_entry_ns` is the replay
+subset of `entry_ns`. Do not add these nested intervals to the phase totals.
+`total_ns` excludes formatting and writing the row, and does not measure the
+rest of native compilation or complete process startup.
+
+Pass counts, block visits, dominator-chain steps, and dominance-query counts
+help distinguish repeated analysis from expensive individual operations.
+Timestamp reads and logging perturb enabled runs. With the flag absent there
+are no clock reads or timing output, but diagnostic branches remain; use
+fresh processes with the flag unset for performance comparisons.
+
 ## Allocation and measurement discipline
 
 `room` measures Lisp-heap activity. Rust strings, vectors, hash maps, and other

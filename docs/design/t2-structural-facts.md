@@ -11,7 +11,8 @@ The shared domain distinguishes exact object identity, successful simple-string
 layout guards, and nullable packed-U8 layout witnesses. A broad STRING or VECTOR
 type is insufficient to justify direct storage access. A nullable witness
 proves which object was inspected; it does not prove that the result is non-NIL.
-Consumers retain the witness failure branch, bounds checks, and value checks.
+Consumers retain the witness failure branch and value checks. A separate extent
+proof can remove a capacity comparison; layout evidence alone cannot.
 
 Successful simple-string layout guards also imply STRING in numeric type
 inference. The implication is one-way: a STRING type does not imply storage
@@ -42,16 +43,42 @@ its specialized store kernel. Its identity/dominance verification now uses the
 shared analysis. The late ordinary pipeline also removes duplicate explicit
 layout probes. Layout facts never cache interior pointers: consumers reload the
 current rooted object after moving GC. Only immutable storage properties belong
-in this domain. Mutable contents, lengths, displacement, and adjustable backing
-storage require separate effect and alias reasoning.
+in this domain. Mutable contents, adjustable logical lengths, displacement, and
+adjustable backing storage require separate effect and alias reasoning.
 
-Inline allocation currently has a conditional postcondition: only its validated
-bump-allocation success proves the small packed-U8 layout. Its collecting slow
-call remains generic. The existing adjacent-probe optimization retains its
-poll, multiple-value, exact-result and final-home restrictions. Do not mark the
-whole constructor Call result as packed-U8 based on its name or a mutable type
-descriptor. Making fast/slow allocation paths explicit in IR is a further step
-needed before general IR passes can consume that conditional postcondition.
+Allocation postconditions have explicit nullable SSA producers.
+`PackedU8AllocationLayout` names both the subject and the original canonical
+constructor result. Validated inline allocation supplies its header width;
+the collecting slow return undergoes a real layout probe. Neither a constructor
+name nor a mutable element-type descriptor makes the whole Call result packed-U8.
+Poll, multiple-value, exact-result and final-home restrictions still apply.
+
+`PackedU8AllocationExtent` names the subject, layout witness and constructor
+result. Fast allocation captures the initialized length. Otherwise, a successful
+layout probe permits reading the actual immutable capacity, with a separate
+fixnum-representability check; an unsupported layout or capacity produces NIL.
+The proof depends on checked allocator/storage contracts, not an expectation
+that an oversized request would run out of memory.
+
+The default store optimization keeps its existing five runtime operands. An
+`AllocationDimensionInBounds` marker permits omitting the capacity comparison
+only when the verifier reconstructs the canonical allocation, the same direct
+dimension, its prior fixnum validation, and the end's upper bound. A successful
+checked MIN or another audited argument contract can supply that validation
+even when the original dimension's declaration remains TOP. The proof adds no
+runtime value or length preparation. Unknown and mutable-list dimensions keep
+the original checked kernel.
+
+The explicit captured-extent consumer remains available with
+`EGCL_FORCE_ALLOCATION_EXTENTS`; `EGCL_DISABLE_ALLOCATION_EXTENTS` takes priority.
+It requires correlated array, layout and length evidence across every forwarding
+phi. It checks the end against the scalar extent unless the verifier proves the
+end is that exact extent or is capped by an accepted direct dimension. This path
+is retained for native validation and future consumers; transporting a sixth
+operand did not pay for the current store kernels. Type, nonnegative-index, span
+and nullable-witness checks remain. A mutable list's old CAR never substitutes
+for the dimension actually accepted by allocation. OSR imports and mismatched
+evidence retain checks or decline the optimization.
 
 Existing string layout operations have verifier and native-emitter support but
 no current source-to-IR producer. Their structural integration is exercised by
@@ -161,8 +188,135 @@ successful Lisp result values, so captured semantic bits remain valid and can
 be intersected with strengthened declarations in program order. Conflicting
 facts reject specialization. Exact literal conversions, operand guards, overflow,
 NaN and domain checks, recovery states, and multiple-value effects remain in
-place. Global result/phi facts are covered here; using a branch-local constraint
-for an original input requires a separate per-use query.
+place. The per-use interface below also makes branch-local constraints
+available for original inputs without changing their global declarations.
+
+## Requested-site inference
+
+`infer(f)` retains its whole-function interface. `InferenceResult::ty(value)`
+answers with the global fact for that SSA definition. It cannot describe a
+constraint that applies to only some uses of an original parameter.
+
+A consumer can instead request the instructions whose operands it will inspect:
+
+```rust
+let facts = infer_for_sites(f, &sites);
+let operand_type = facts.ty_before(site, operand);
+```
+
+Inference runs once. A final scoped replay uses the frozen final global facts,
+including any widening, to record facts immediately **before** the requested
+instructions. Only their direct operands are recorded. An unrequested site or
+nonoperand query falls back to the global fact; it does not trigger another
+analysis or establish a new scoped proof. A guard cannot establish its own
+precondition, and a later predicate cannot refine an earlier use.
+
+The replay retains existing scope rules: a successful guard refines later uses,
+a true predicate edge refines its unique dominated region, and a shared target
+of both branch outcomes establishes neither outcome. False predicate edges do
+not acquire the positive constraint. Branch/guard facts must dominate across
+all entries, including OSR imports. Optional predicate-edge narrowing remains
+disabled in OSR functions.
+
+The result is an immutable snapshot. Consumers must discard it after changing
+instructions, operands, CFG edges, or OSR records. Repeated site queries are
+lookups in that snapshot, not independent inference runs. A rewrite batch can
+retain captured facts only when its transformations preserve the relevant
+values and control paths; otherwise it must rebuild the analysis.
+
+For example, `x` remains the original parameter here:
+
+```lisp
+(defun scoped-double-add (x other arithmetic)
+  (if (typep x 'double-float)
+      (if arithmetic (+ x other) x)
+      :not-double))
+```
+
+The true branch proves DOUBLE-FLOAT at the addition. The global type of `x`
+remains unknown. With admitted profile feedback, the site fact can select the
+guarded double arithmetic family ahead of a cold fixnum guess. An exact double
+input needs no fixnum-to-double contagion conversion; `other` still needs its
+own checks and the existing contagion rules. On x86-64 Linux, the canonical
+DOUBLE-FLOAT type predicate lowers to an exact heap-tag/widetag test. A distinct
+user-package type symbol with the same printed leaf name keeps generic TYPEP
+semantics.
+
+## Verified local refinements
+
+Guard discharge keeps a conversion's result SSA identity. For an UnboxFloat
+whose exact pre-state proves DOUBLE-FLOAT, it removes the redundant check and
+recovery attachment while retaining the payload conversion. The verifier
+recomputes the scoped proof independently: clearing a guard flag is not
+permission to load an arbitrary pointer. The pure x86 path masks the tagged
+pointer and loads the double payload without a call, safepoint, or failure
+branch. It never caches an interior pointer across moving GC.
+
+Ranges need an explicit local carrier when the machine emitter consumes
+SSA-declared bounds:
+
+```lisp
+(defun bounded-increment (x)
+  (if (typep x 'fixnum)
+      (if (>= x -20)
+          (if (<= x 20) (+ x 1) :outside)
+          :outside)
+      :outside))
+```
+
+At the addition, `x` is in [-20, 20]. A fresh pure FIXNUM Guard result can carry
+that proven range to this arithmetic use. It is a verified SSA copy, not a new
+runtime check. The original value, its other uses, and the math's FrameState
+inputs remain unchanged. The existing add/sub emitter can then prove the result
+fits and omit JO. It still checks overflow for a range that can cross a fixnum
+endpoint; operand type alone does not justify omitting that check.
+
+Every pure refinement must independently imply its complete asserted type and
+inclusive range at its own pre-state. A forged stronger range, a false-branch
+use, or a use preceding its proof fails verification. The initial pure numeric
+refinement producer/emitter integration is limited to x86-64 Linux and declines
+functions with OSR entries. This conservative consumer restriction does not
+remove the all-entry safety requirements of the inference API.
+
+## Successful-continuation argument contracts
+
+`normal_return_facts::visit_argument_facts` describes original-argument facts,
+not just result types. Audited checked tagged arithmetic and type/layout guards
+establish their argument constraints only after the instruction succeeds or in
+blocks it strictly dominates through every entry. The same callback serves
+fixed-point inference and the final site replay. A later use can therefore
+reuse a check without narrowing an earlier use or the original SSA declaration.
+
+These initial contracts belong to fixed IR operations whose failed checks leave
+optimized execution. They are not summaries inferred for arbitrary Lisp calls.
+A generic Call or Invoke may handle an error, use replacement arguments, or
+return without validating an argument. Its normal return establishes no such
+fact. Predicates still require their unique true edge. Pure refinement copies
+relay their independently verified result proof without creating a new fact
+about their original input.
+
+## Operand proofs, result vetoes, and feedback
+
+An operand-family proof and a mathematical result interval answer different
+questions. FIXNUM operands can produce a bignum. If proven integer bounds put
+an operation's entire mathematical result outside the fixnum domain, result
+analysis vetoes the fixnum guess and preserves the generic call. An interval
+that overlaps the domain does not authorize guard removal. Overflow omission
+requires the stronger proof that every result fits, consumed through the
+verified local operand ranges above.
+
+These facts are structural proofs, not sampled value ranges. They do not turn
+an explicit declined `None` profile entry into a new positive speculation.
+An explicit per-body, per-site failed-family policy also vetoes declared-type
+selection and alternate numeric producers, including peeled and packed-double
+candidates. Valid fixnum operands cannot resurrect a specialization whose
+result overflowed. New samples and profile decay retain that rejection; a new
+definition resets it. Only matching installed numeric guard metadata establishes
+this failure. Packed-array layout/index failures have separate guard semantics.
+Domain checks, overflow checks, exceptional continuations, and multiple-value
+behavior stay unless their own precise preconditions have been proved. In
+particular, a DOUBLE-FLOAT type proof alone does not prove a divisor is nonzero
+or a square-root operand is nonnegative.
 
 ## Guarded expectations from callee bodies
 
