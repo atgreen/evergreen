@@ -3294,6 +3294,9 @@ fn resolve(name: &str) -> Option<Handler> {
             // One-dimensional array/vector/string access — delegates to elt.
             // BIT/SBIT read a bit array exactly like AREF (rank-1 here).
 
+            if name == "SVREF" && args.len() != 2 {
+                return Err(EgclError::ProgramError(format!("SVREF requires exactly 2 arguments, got {}", args.len())));
+            }
             let arr0 = args.first().copied().unwrap_or(NIL);
             if name == "SVREF" && !is_simple_vector_value(arr0) {
                 return Err(EgclError::TypeError { datum: arr0, expected: "SIMPLE-VECTOR".into() });
@@ -3381,6 +3384,11 @@ fn resolve(name: &str) -> Option<Handler> {
             resolve_type_spec(env, spec)
         }),
 
+        "EGCL-INTERNAL::%BIT-ELEMENT-TYPE-P"
+        | "EGCL-INTERNAL:%BIT-ELEMENT-TYPE-P"
+        | "%BIT-ELEMENT-TYPE-P" => Some(|_, args, _| {
+            Ok(if args.first().is_some_and(|&v| egcl_stdlib::sequences::bit_element_type_p(v)) { T } else { NIL })
+        }),
         "EGCL-INTERNAL::%U8-ELEMENT-TYPE-P"
         | "EGCL-INTERNAL:%U8-ELEMENT-TYPE-P"
         | "%U8-ELEMENT-TYPE-P" => Some(|_, args, _| {

@@ -142,6 +142,19 @@ const PROGRAM: &str = r#"
     (assert (equal (array-adjust-elements a) '(a b c new)))
     (when (string= (egcl-ext:getenv "EGCL_FORCE_TIER") "t2")
       (assert (= (egcl-ext:function-tier 'array-adjust-native-call) 2))))
+  (dolist (type '(bit (unsigned-byte 0) (unsigned-byte 1) (mod 1) (mod 2)
+                 (integer 0 0) (integer 1 1) (integer 0 1) (integer 0 (2))))
+    (assert (eq (upgraded-array-element-type type) 'bit))
+    (let* ((initial (if (equal type '(integer 1 1)) 1 0))
+           (array (make-array 3 :element-type type :initial-element initial)))
+      (assert (eq (array-element-type array) 'bit))
+      (assert (typep array (list 'array type '(3))))
+      (assert (every (lambda (element) (= element initial)) array))))
+  (assert (equal (upgraded-array-element-type '(integer 0 (4))) '(unsigned-byte 8)))
+  (assert (subtypep (upgraded-array-element-type '(integer 0 (2)))
+                    (upgraded-array-element-type '(integer 0 (4)))))
+  (dolist (args (list nil (list (vector 1)) (list (vector 1) 0 :extra)))
+    (assert (array-adjust-program-error-p (lambda () (apply #'svref args)))))
   (format t "ARRAY-ADJUSTMENT-OK~%"))
 "#;
 
@@ -176,7 +189,7 @@ fn run(tier: &str, stress: bool) -> String {
         );
     }
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    assert_eq!(stdout, "ARRAY-ADJUSTMENT-OK");
+    assert_eq!(stdout, "ARRAY-ADJUSTMENT-OK\nNIL");
     stdout
 }
 

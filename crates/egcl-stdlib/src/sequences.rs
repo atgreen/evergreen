@@ -3641,9 +3641,9 @@ fn build_packed_u8(values: &[EgclVal]) -> Result<EgclVal, EgclError> {
     Ok(result)
 }
 
-/// Numeric requests whose upgraded representation is the packed octet class.
-/// Exact BIT requests keep their existing representation.
-pub fn u8_element_type_p(spec: EgclVal) -> bool {
+/// Bounded unsigned requests share one representation policy across public
+/// upgrading, TYPEP, and constructor admission. Only host data is allocated.
+fn small_unsigned_element_bits(spec: EgclVal) -> Option<u8> {
     fn parts(mut spec: EgclVal) -> Option<Vec<EgclVal>> {
         let mut result = Vec::new();
         while spec.is_cons() {
@@ -3660,17 +3660,37 @@ pub fn u8_element_type_p(spec: EgclVal) -> bool {
         if values.len() != 1 || !values[0].is_fixnum() { return None; }
         if lower { values[0].as_fixnum().checked_add(1) } else { values[0].as_fixnum().checked_sub(1) }
     }
-    let Some(values) = parts(spec) else { return false; };
-    if values.is_empty() || !values[0].is_symbol() { return false; }
-    match egcl_compiler::reader::symbol_name(values[0].as_symbol_index()).as_deref() {
-        Some("UNSIGNED-BYTE") if values.len() == 2 && values[1].is_fixnum() => (2..=8).contains(&values[1].as_fixnum()),
-        Some("MOD") if values.len() == 2 && values[1].is_fixnum() => (3..=256).contains(&values[1].as_fixnum()),
-        Some("INTEGER") if values.len() == 3 => {
-            let (Some(lo), Some(hi)) = (bound(values[1], true), bound(values[2], false)) else { return false; };
-            lo >= 0 && hi <= 255 && lo <= hi && (lo, hi) != (0, 1)
-        }
-        _ => false,
+    if spec.is_symbol() {
+        return (egcl_compiler::reader::symbol_name(spec.as_symbol_index()).as_deref() == Some("BIT"))
+            .then_some(1);
     }
+    let values = parts(spec)?;
+    if values.is_empty() || !values[0].is_symbol() { return None; }
+    let (lo, hi) = match egcl_compiler::reader::symbol_name(values[0].as_symbol_index()).as_deref() {
+        Some("UNSIGNED-BYTE") if values.len() == 2 && values[1].is_fixnum() => {
+            let width = values[1].as_fixnum();
+            if !(0..=8).contains(&width) { return None; }
+            (0, (1i64 << width) - 1)
+        }
+        Some("MOD") if values.len() == 2 && values[1].is_fixnum() => {
+            let modulus = values[1].as_fixnum();
+            if !(1..=256).contains(&modulus) { return None; }
+            (0, modulus - 1)
+        }
+        Some("INTEGER") if values.len() == 3 => (bound(values[1], true)?, bound(values[2], false)?),
+        _ => return None,
+    };
+    (lo >= 0 && lo <= hi && hi <= 255).then_some(if hi <= 1 { 1 } else { 8 })
+}
+
+/// Numeric requests whose upgraded representation is packed BIT storage.
+pub fn bit_element_type_p(spec: EgclVal) -> bool {
+    small_unsigned_element_bits(spec) == Some(1)
+}
+
+/// Numeric requests whose upgraded representation is packed octet storage.
+pub fn u8_element_type_p(spec: EgclVal) -> bool {
+    small_unsigned_element_bits(spec) == Some(8)
 }
 
 pub fn result_type_is_u8_vector(result_type: EgclVal) -> bool {

@@ -71,40 +71,83 @@ fn bbu_counts(bytes: &[u8]) -> (u32, u32, u32) {
 fn bbu_layout(bbu: &[u8]) -> (Vec<&[u8]>, usize) {
     let constant_count = u32::from_le_bytes(bbu[12..16].try_into().unwrap()) as usize;
     let function_count = u32::from_le_bytes(bbu[16..20].try_into().unwrap()) as usize;
+    fn take<'a>(bbu: &'a [u8], pos: &mut usize, size: usize) -> &'a [u8] {
+        let end = pos.checked_add(size).expect("test BBU payload length overflow");
+        let bytes = bbu.get(*pos..end).expect("truncated test BBU payload");
+        *pos = end;
+        bytes
+    }
+    fn count(bbu: &[u8], pos: &mut usize) -> usize {
+        u32::from_le_bytes(take(bbu, pos, 4).try_into().unwrap()) as usize
+    }
+    fn items<'a>(bbu: &'a [u8], pos: &mut usize, length: usize, width: usize) -> &'a [u8] {
+        take(bbu, pos, length.checked_mul(width).expect("test BBU item length overflow"))
+    }
     let mut pos = 40usize;
     for _ in 0..constant_count {
-        let tag = bbu[pos];
-        pos += 1;
+        let tag = take(bbu, &mut pos, 1)[0];
         match tag {
             0 | 1 => {}
-            2 | 6 => pos += 8,
+            2 | 6 | 13 | 16 | 17 | 21 => { take(bbu, &mut pos, 8); }
+            5 | 7 | 12 | 18 | 20 => { take(bbu, &mut pos, 4); }
             3 => {
-                pos += 1;
-                let len = u32::from_le_bytes(bbu[pos..pos + 4].try_into().unwrap()) as usize;
-                pos += 4 + len;
+                assert!(take(bbu, &mut pos, 1)[0] <= 1);
+                let length = count(bbu, &mut pos);
+                take(bbu, &mut pos, length);
             }
-            5 | 7 | 12 => pos += 4,
             8 => {
-                let len = u32::from_le_bytes(bbu[pos..pos + 4].try_into().unwrap()) as usize;
-                pos += 4 + len;
+                let length = count(bbu, &mut pos);
+                std::str::from_utf8(take(bbu, &mut pos, length)).unwrap();
             }
             10 => {
-                pos += 4;
-                let count = u32::from_le_bytes(bbu[pos..pos + 4].try_into().unwrap()) as usize;
-                pos += 4 + count * 4;
+                take(bbu, &mut pos, 4);
+                let length = count(bbu, &mut pos);
+                items(bbu, &mut pos, length, 4);
             }
             14 => {
-                let count = u32::from_le_bytes(bbu[pos..pos + 4].try_into().unwrap()) as usize;
-                pos += 4 + count * 4;
+                let length = count(bbu, &mut pos);
+                items(bbu, &mut pos, length, 4);
             }
-            11 => pos += 9,
-            13 | 16 | 17 => pos += 8,
-            18 => pos += 4,
+            11 => { take(bbu, &mut pos, 9); }
             19 => {
-                let rank = u32::from_le_bytes(bbu[pos..pos + 4].try_into().unwrap()) as usize;
-                pos += 4 + rank * 8;
-                let count = u32::from_le_bytes(bbu[pos..pos + 4].try_into().unwrap()) as usize;
-                pos += 4 + count * 4;
+                let rank = count(bbu, &mut pos);
+                items(bbu, &mut pos, rank, 8);
+                let length = count(bbu, &mut pos);
+                items(bbu, &mut pos, length, 4);
+            }
+            22 => {
+                take(bbu, &mut pos, 1);
+                let length = count(bbu, &mut pos);
+                items(bbu, &mut pos, length, 8);
+            }
+            23 | 28 => {
+                let length = count(bbu, &mut pos);
+                let bytes = take(bbu, &mut pos, length);
+                if tag == 28 { assert!(bytes.iter().all(|&bit| bit <= 1)); }
+            }
+            24 | 25 => {
+                let rank = count(bbu, &mut pos);
+                assert!(rank <= 1024 && (tag == 24 || rank != 1));
+                items(bbu, &mut pos, rank, 8);
+                take(bbu, &mut pos, 4);
+            }
+            26 => {
+                let fields = take(bbu, &mut pos, 12);
+                assert!(fields[8] <= 1 && fields[10] <= 1 && fields[11] <= 1);
+                assert!(matches!(fields[9], 0 | 1 | 2 | 11 | 12));
+                if fields[11] == 1 { take(bbu, &mut pos, 16); }
+                take(bbu, &mut pos, 4);
+            }
+            27 => {
+                let length = count(bbu, &mut pos);
+                items(bbu, &mut pos, length, 8);
+            }
+            29 => {
+                let base = take(bbu, &mut pos, 1)[0];
+                assert!(base <= 1);
+                let length = count(bbu, &mut pos);
+                let text = std::str::from_utf8(take(bbu, &mut pos, length)).unwrap();
+                assert!(base == 0 || text.chars().all(|c| (c as u32) < 256));
             }
             other => panic!("test BBU parser does not know constant tag {other}"),
         }

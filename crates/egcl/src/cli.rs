@@ -18073,21 +18073,8 @@ fn upgrade_elt(spec: EgclVal) -> EltU {
         if head.is_symbol() && matches!(sym_bare_name_rc(head).as_ref(), "DOUBLE-FLOAT" | "LONG-FLOAT") {
             return EltU::DoubleFloat;
         }
-        // (integer 0 1) / (mod 2) / (unsigned-byte 1) upgrade to BIT; other
-        // compound element types upgrade to T under egcl's policy.
-        if let Some(nt) = parse_num_type(spec) {
-            if matches!(nt.head, NumHead::Integer) {
-                if let (Bnd::Incl(lo), Bnd::Incl(hi)) = (&nt.lo, &nt.hi) {
-                    let zero = egcl_rt::bignum::BigRat::from_i64(0);
-                    let one = egcl_rt::bignum::BigRat::from_i64(1);
-                    if egcl_rt::bignum::bigrat_cmp(lo, &zero) == std::cmp::Ordering::Equal
-                        && egcl_rt::bignum::bigrat_cmp(hi, &one) == std::cmp::Ordering::Equal
-                    {
-                        return EltU::Bit;
-                    }
-
-                }
-            }
+        if egcl_stdlib::sequences::bit_element_type_p(spec) {
+            return EltU::Bit;
         }
     }
     if egcl_stdlib::sequences::u8_element_type_p(spec) { return EltU::U8; }
@@ -26595,7 +26582,8 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             "EGCL-INTERNAL::%EXPAND-TYPE-SPEC"
             | "EGCL-INTERNAL:%EXPAND-TYPE-SPEC"
             | "%EXPAND-TYPE-SPEC" => return eval_builtin_arguments(&name, cdr, env),
-            "EGCL-INTERNAL::%U8-ELEMENT-TYPE-P" | "EGCL-INTERNAL:%U8-ELEMENT-TYPE-P" | "%U8-ELEMENT-TYPE-P"
+            "EGCL-INTERNAL::%BIT-ELEMENT-TYPE-P" | "EGCL-INTERNAL:%BIT-ELEMENT-TYPE-P" | "%BIT-ELEMENT-TYPE-P"
+            | "EGCL-INTERNAL::%U8-ELEMENT-TYPE-P" | "EGCL-INTERNAL:%U8-ELEMENT-TYPE-P" | "%U8-ELEMENT-TYPE-P"
             | "EGCL-INTERNAL::%MAKE-U8-VECTOR" | "EGCL-INTERNAL:%MAKE-U8-VECTOR" | "%MAKE-U8-VECTOR" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL-INTERNAL::%MAKE-DOUBLE-FLOAT-VECTOR"
             | "EGCL-INTERNAL:%MAKE-DOUBLE-FLOAT-VECTOR"
@@ -43900,7 +43888,7 @@ fn is_builtin_function(name: &str) -> bool {
             | "ARRAYP" | "ARRAY-DIMENSIONS"
             | "ARRAY-DIMENSION" | "ARRAY-TOTAL-SIZE" | "VECTOR-PUSH" | "VECTOR-PUSH-EXTEND"
             | "VECTOR-POP" | "FILL-POINTER" | "%MAKE-COMPLEX-VECTOR" | "%MAKE-DISPLACED-ARRAY"
-            | "%MAKE-SIMPLE-VECTOR" | "%MAKE-DOUBLE-FLOAT-VECTOR" | "%MAKE-U8-VECTOR" | "%U8-ELEMENT-TYPE-P"
+            | "%MAKE-SIMPLE-VECTOR" | "%MAKE-DOUBLE-FLOAT-VECTOR" | "%MAKE-U8-VECTOR" | "%U8-ELEMENT-TYPE-P" | "%BIT-ELEMENT-TYPE-P"
             | "%EXPAND-TYPE-SPEC"
             | "ADJUSTABLE-ARRAY-P" | "ARRAY-HAS-FILL-POINTER-P" | "ARRAY-DISPLACEMENT"
             // Numbers

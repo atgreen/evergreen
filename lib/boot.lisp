@@ -889,6 +889,7 @@
   ;; supertype of TYPE and a subtype of every upgrade of its supertypes, and
   ;; only NIL is both (ansi arrays upgraded-array-element-type.nil.1).
   (cond ((null type) nil)
+        ((egcl-internal::%bit-element-type-p (%expand-type-spec type)) 'bit)
         ((egcl-internal::%u8-element-type-p (%expand-type-spec type)) '(unsigned-byte 8))
         ((member (if (consp type) (car type) type) '(double-float long-float)) 'double-float)
         ((eq type 'bit) 'bit)
@@ -2516,7 +2517,7 @@ Returns NIL."
          ;; MAKE-ARRAY builds string storage, not a general NIL-filled vector.
          ;; EXTENDED-CHAR upgrades to CHARACTER, so it too builds a string.
          (stringp (member et '(character base-char standard-char extended-char nil)))
-         (bitp (eq et 'bit))
+         (bitp (egcl-internal::%bit-element-type-p et))
          (doublep (member et-kind '(double-float long-float)))
          (u8p (egcl-internal::%u8-element-type-p et))
          (fp-cell (%array-keyword-cell :fill-pointer keys))
