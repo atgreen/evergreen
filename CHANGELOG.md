@@ -8,6 +8,10 @@
   skip comments without inserting spurious `NIL` elements
   ([#767](https://github.com/atgreen/evergreen/pull/767)).
 
+- Reader macro functions retained only by a readtable survive garbage
+  collection, preventing invalid-function failures during extended reads
+  ([#773](https://github.com/atgreen/evergreen/pull/773)).
+
 - `SUBTYPEP` preserves both type operands when integer-type canonicalization
   triggers a moving collection, preventing incorrect range comparisons under
   allocation pressure ([#766](https://github.com/atgreen/evergreen/pull/766)).

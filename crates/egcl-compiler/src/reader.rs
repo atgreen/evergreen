@@ -157,15 +157,37 @@ pub fn make_uninterned_symbol(name: &str) -> EgclVal {
 
 // ── Global macro character tables ─────────────────────────────────
 static MACRO_CHARS: OrderedMutex<Option<MacroCharTable>> =
-    OrderedMutex::new(LockLevel::CodeCache, 1, "reader macro characters", None);
+    OrderedMutex::new(LockLevel::GcWorld, 16, "reader macro characters", None);
 static DISPATCH_CHARS: OrderedMutex<Option<DispatchCharTable>> =
     OrderedMutex::new(LockLevel::CodeCache, 2, "reader dispatch characters", None);
 static DISPATCH_SUB_CHARS: OrderedMutex<Option<DispatchSubCharTable>> = OrderedMutex::new(
-    LockLevel::CodeCache,
-    3,
+    LockLevel::GcWorld,
+    17,
     "reader dispatch sub-characters",
     None,
 );
+
+// A readtable registration may be the only reference to an anonymous handler.
+// Pinned interpreted functions still need marking: major GC reclaims their
+// slots, and their bodies and captured values can move. Expose the actual
+// map slots so the collector can both retain and relocate their references.
+fn scan_reader_handler_roots(visit: &mut dyn FnMut(*mut EgclVal)) {
+    if let Some(table) = MACRO_CHARS.lock().unwrap().as_mut() {
+        for (handler, _) in table.values_mut() {
+            visit(handler);
+        }
+    }
+    if let Some(table) = DISPATCH_SUB_CHARS.lock().unwrap().as_mut() {
+        for handler in table.values_mut() {
+            visit(handler);
+        }
+    }
+}
+
+fn install_reader_handler_root_scanner() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| egcl_rt::gc::register_root_scanner(scan_reader_handler_roots));
+}
 type ReadEvalHook = fn(EgclVal) -> Result<EgclVal, EgclError>;
 static READ_EVAL_HOOK: OrderedMutex<Option<ReadEvalHook>> =
     OrderedMutex::new(LockLevel::CodeCache, 4, "reader eval hook", None);
@@ -4680,6 +4702,7 @@ pub fn copy_readtable(from: EgclVal, to: Option<EgclVal>) -> Result<EgclVal, Egc
     for (disp_char, sub_char, handler) in sub_copies {
         sub_table.insert((dst_key, disp_char, sub_char), handler);
     }
+    drop(sub_guard);
     // Carry the readtable-case across the copy. `(copy-readtable nil dest)`
     // takes the standard readtable's case (:upcase); `(copy-readtable rt dest)`
     // takes rt's (readtable-case.7).
@@ -4768,6 +4791,7 @@ pub fn set_macro_character(
     function: EgclVal,
     non_terminating: bool,
 ) -> Result<(), EgclError> {
+    install_reader_handler_root_scanner();
     let key = readtable.0 & !egcl_rt::value::TAG_MASK;
     {
         let mut guard = MACRO_CHARS.lock().unwrap();
@@ -4855,6 +4879,7 @@ pub fn set_dispatch_macro_character(
     sub_char: char,
     function: EgclVal,
 ) -> Result<(), EgclError> {
+    install_reader_handler_root_scanner();
     let key = readtable.0 & !egcl_rt::value::TAG_MASK;
     let mut guard = DISPATCH_SUB_CHARS.lock().unwrap();
     let table = guard.get_or_insert_with(HashMap::new);
