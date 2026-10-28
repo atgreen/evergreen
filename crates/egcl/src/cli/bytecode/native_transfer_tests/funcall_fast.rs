@@ -241,6 +241,7 @@ fn ordinary_function_lookup_and_symbol_designators_avoid_per_call_runtime_entrie
     egcl_rt::rooted_ref!(_env = &mut env);
     super::super::super::read_eval_all_env(
         "(defun fd-identity (x) x)
+         (defun fd-direct () (let ((r nil)) (dotimes (i 1000 r) (setq r (fd-identity i)))))
          (defun fd-local () (let ((f #'fd-identity) (r nil))
                               (dotimes (i 1000 r) (setq r (funcall f i)))))
          (defun fd-symbol (f) (let ((r nil))
@@ -248,6 +249,10 @@ fn ordinary_function_lookup_and_symbol_designators_avoid_per_call_runtime_entrie
         &mut env,
     ).unwrap();
     let (target, _) = super::ordinary_t2::install("FD-IDENTITY", "(x)", "(x)", &mut env);
+    let (direct, _) = super::ordinary_t2::install(
+        "FD-DIRECT", "()",
+        "((let ((r nil)) (dotimes (i 1000 r) (setq r (fd-identity i)))))", &mut env,
+    );
     let (local, local_code) = super::ordinary_t2::install(
         "FD-LOCAL", "()",
         "((let ((f #'fd-identity) (r nil)) (dotimes (i 1000 r) (setq r (funcall f i)))))",
@@ -262,9 +267,13 @@ fn ordinary_function_lookup_and_symbol_designators_avoid_per_call_runtime_entrie
         assert!(mapped.ordinary_entry.is_some(), "both callers require an ordinary entry");
     }
     super::super::native_transfer_entry::ordinary_calls::take_named_entries_for_test();
+    egcl_rt::rooted!(control = run_caller("FD-DIRECT-CALLER", "((+ (fd-direct) (fd-direct)))", 1, &mut env).unwrap());
+    let baseline = super::super::native_transfer_entry::ordinary_calls::take_named_entries_for_test();
     egcl_rt::rooted!(result = run_caller("FD-CALLER", "((+ (fd-local) (fd-symbol 'fd-identity)))", 1, &mut env).unwrap());
     let entries = super::super::native_transfer_entry::ordinary_calls::take_named_entries_for_test();
-    uninstall(&[target, local, symbol]);
-    assert_eq!(*result, EgclVal::from_fixnum(1998));
-    assert!(entries < 50, "{entries} runtime entries for 4000 indirect native calls");
+    uninstall(&[target, direct, local, symbol]);
+    assert_eq!(*control, EgclVal::from_fixnum(1998));
+    assert_eq!(*result, *control);
+    assert!(entries <= baseline + 20,
+        "{entries} runtime entries versus {baseline} direct-call entries for 4000 calls");
 }
