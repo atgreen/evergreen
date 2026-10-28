@@ -1724,10 +1724,10 @@ fn resolve(name: &str) -> Option<Handler> {
             Ok(if ok { T } else { NIL })
         }),
         "ADJUSTABLE-ARRAY-P" => Some(|_operator, args, _env| {
-            // Only a COMPLEX_ARRAY created :adjustable is adjustable.
+            // Rank-independent adjustability is carried by complex storage.
             let v = args.first().copied().unwrap_or(NIL);
             require_array(v)?;
-            let adj = egcl_stdlib::is_complex_vector(v) && egcl_stdlib::cvec_adjustable(v);
+            let adj = egcl_stdlib::sequences::array_adjustable(v);
             Ok(if adj { T } else { NIL })
         }),
         "ARRAY-DISPLACEMENT" => Some(|_operator, args, env| {
@@ -1874,27 +1874,22 @@ fn resolve(name: &str) -> Option<Handler> {
         }),
         "ARRAY-ELEMENT-TYPE" => Some(|_operator, args, _env| {
             let v = args.first().copied().unwrap_or(NIL);
-            if egcl_stdlib::sequences::is_u8_array(v) {
+            require_array(v)?;
+            use egcl_stdlib::sequences::ArrayElementKind;
+            let kind = egcl_stdlib::sequences::array_element_kind(v)
+                .ok_or_else(|| EgclError::TypeError { datum: v, expected: "ARRAY".into() })?;
+            if kind == ArrayElementKind::U8 {
                 let symbol = EgclVal::from_symbol_index(egcl_rt::symbols::intern("UNSIGNED-BYTE"));
                 return Ok(vec_to_list(&[symbol, EgclVal::from_fixnum(8)]));
             }
-            // An 8-bit base string holds BASE-CHAR and a 32-bit string
-            // CHARACTER (spec §1.6.3); bit-vectors (simple OR a
-            // fill-pointer/adjustable/displaced complex bit vector, egcl-
-            // 65nx) hold BIT; packed vectors hold DOUBLE-FLOAT.
-            require_array(v)?;
-            let ty = if is_base_string_value(v) {
-                "BASE-CHAR"
-            } else if is_string_value(v) {
-                "CHARACTER"
-            } else if is_bit_vector_value(v) {
-                "BIT"
-            } else if egcl_stdlib::sequences::is_double_float_array(v) {
-                "DOUBLE-FLOAT"
-            } else {
-                "T"
+            let name = match kind {
+                ArrayElementKind::BaseChar => "BASE-CHAR",
+                ArrayElementKind::Character => "CHARACTER",
+                ArrayElementKind::Bit => "BIT",
+                ArrayElementKind::DoubleFloat => "DOUBLE-FLOAT",
+                ArrayElementKind::General | ArrayElementKind::U8 => "T",
             };
-            Ok(resolve_sym(ty).unwrap_or(T))
+            Ok(resolve_sym(name).unwrap_or(T))
         }),
         "GET-OUTPUT-STREAM-STRING" => Some(|_operator, args, _env| {
             let stream = args.first().copied().unwrap_or(NIL);
@@ -3319,7 +3314,7 @@ fn resolve(name: &str) -> Option<Handler> {
                 } else {
                     md_row_major_index(arr0, &args[1..])?
                 };
-                return egcl_stdlib::elt(storage, flat);
+                return egcl_stdlib::aref(storage, flat);
             }
             if args.len() != 2 {
                 return Err(EgclError::ProgramError(format!(
@@ -3664,6 +3659,11 @@ fn resolve(name: &str) -> Option<Handler> {
                     ));
                 }
                 let arr = args[0];
+                // The public wrapper constructs and validates a complete
+                // replacement before this nonallocating in-place commit.
+                if args.len() == 2 && egcl_rt::types::arrayp(args[1]) {
+                    return egcl_stdlib::sequences::adopt_adjusted_array(arr, args[1]);
+                }
                 let new_size = if args[1].is_fixnum() {
                     args[1].as_fixnum().max(0) as usize
                 } else {

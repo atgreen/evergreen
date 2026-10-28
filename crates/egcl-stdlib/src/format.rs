@@ -1168,9 +1168,9 @@ pub fn u8_readable_representation(value: EgclVal) -> Option<String> {
                 crate::sequences::cvec_fill_pointer(value)
             ));
         }
-        if crate::sequences::cvec_adjustable(value) {
-            out.push_str(" :ADJUSTABLE COMMON-LISP:T");
-        }
+    }
+    if crate::sequences::array_adjustable(value) {
+        out.push_str(" :ADJUSTABLE COMMON-LISP:T");
     }
     out.push(')');
     Some(out)

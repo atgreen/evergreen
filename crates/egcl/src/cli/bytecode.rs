@@ -10522,7 +10522,9 @@ const BBU_MAGIC: &[u8; 4] = b"BBU\0";
 // heap-reference constants (tag 21), valid only in a core image's registry
 // unit; hash-table constants (tag 22): test plus key/value refs.
 // 0x0204: packed U8 payloads (tag 23) and U8 multidimensional backing refs (tag 24).
-const BBU_BYTECODE_VERSION: u16 = 0x0204;
+// 0x0205: full complex/MD storage graphs and fresh typed backing constants.
+const BBU_BYTECODE_VERSION: u16 = 0x0205;
+mod array_constants;
 const BBU_VERIFIER_VERSION: u16 = 0x0100;
 const BBU_NO_INDEX: u32 = u32::MAX;
 /// Unit-flags bit: every load form is represented in `load_actions`, so the
@@ -10609,17 +10611,18 @@ enum BbuGraphNode {
     Vector(Vec<usize>),
     MdArray(Vec<u64>, Vec<usize>),
     MdPackedU8(Vec<u64>, Vec<usize>),
-    // Complex/displaced storage is externalized by row-major contents rather
-    // than by its active fill-pointer prefix or process-local displacement.
-    MdPackedU8Snapshot(Vec<u64>, Vec<u8>),
+    MdStorage(Vec<u64>, Vec<usize>),
+    ComplexArray(array_constants::ComplexMetadata, Vec<usize>),
+    ArrayLeaf(Vec<u8>),
 }
 
 impl BbuGraphNode {
     fn children(&self) -> &[usize] {
         match self {
             Self::Cons(children) | Self::Vector(children) | Self::MdArray(_, children)
-                | Self::MdPackedU8(_, children) => children,
-            Self::Leaf | Self::Existing(_) | Self::MdPackedU8Snapshot(_, _) => &[],
+                | Self::MdPackedU8(_, children) | Self::MdStorage(_, children)
+                | Self::ComplexArray(_, children) => children,
+            Self::Leaf | Self::Existing(_) | Self::ArrayLeaf(_) => &[],
         }
     }
 }
@@ -10694,18 +10697,18 @@ fn capture_bbu_graph(
                 .collect::<Option<Vec<_>>>()?;
             if egcl_rt::packed_u8::is_vector(storage) {
                 BbuGraphNode::MdPackedU8(dimensions, vec![add(storage, &mut values, &mut seen)])
-            } else if egcl_stdlib::sequences::is_u8_array(storage) {
-                let total = dimensions.iter().try_fold(1usize, |n, &d| n.checked_mul(usize::try_from(d).ok()?))?;
-                let bytes = (0..total).map(|index| egcl_stdlib::sequences::u8_array_element(storage, index))
-                    .collect::<Option<Vec<_>>>()?;
-                BbuGraphNode::MdPackedU8Snapshot(dimensions, bytes)
-            } else {
-                let elements = bbu_vector_elements(storage)?;
+            } else if let Some(elements) = bbu_vector_elements(storage) {
                 BbuGraphNode::MdArray(
                     dimensions,
                     elements.into_iter().map(|element| add(element, &mut values, &mut seen)).collect(),
                 )
+            } else {
+                BbuGraphNode::MdStorage(dimensions, vec![add(storage, &mut values, &mut seen)])
             }
+        } else if let Some((storage, metadata)) = array_constants::complex_parts(value) {
+            BbuGraphNode::ComplexArray(metadata, vec![add(storage, &mut values, &mut seen)])
+        } else if let Some(payload) = array_constants::leaf_payload(value) {
+            BbuGraphNode::ArrayLeaf(payload)
         } else {
             BbuGraphNode::Leaf
         };
@@ -10795,16 +10798,14 @@ impl BbuConstPool {
     }
 
     fn value(&mut self, v: EgclVal) -> Option<u32> {
-        // Image heap references preserve identity with the saved global graph.
-        if self.saved_heap_refs && egcl_stdlib::sequences::is_u8_array(v) {
-            return self.value_leaf(v);
+        // Mutable wrappers must retain identity with the saved image heap.
+        if self.saved_heap_refs && (egcl_stdlib::is_complex_vector(v)
+            || egcl_rt::types::md_array_p(v) || egcl_stdlib::sequences::is_u8_array(v))
+        {
+            let mut bytes = vec![21]; put_u64(&mut bytes, v.to_raw());
+            return Some(self.intern_encoded(bytes));
         }
-        let aggregate = v.is_cons()
-            || (v.is_heap_object()
-                && matches!(
-                    unsafe { (*(v.as_ptr() as *const egcl_rt::ObjectHeader)).type_id() },
-                    egcl_rt::object::type_id::SIMPLE_VECTOR | egcl_rt::object::type_id::MD_ARRAY
-                ));
+        let aggregate = v.is_cons() || egcl_rt::types::arrayp(v);
         if !aggregate {
             return self.value_leaf(v);
         }
@@ -10857,16 +10858,15 @@ impl BbuConstPool {
                         put_u32(&mut bytes, u32::try_from(dimensions.len()).ok()?);
                         for &dimension in dimensions { put_u64(&mut bytes, dimension); }
                     }
-                    BbuGraphNode::MdPackedU8Snapshot(dimensions, contents) => {
-                        let mut payload = vec![23];
-                        put_u32(&mut payload, u32::try_from(contents.len()).ok()?);
-                        payload.extend_from_slice(contents);
-                        let storage_ref = self.intern_encoded(payload);
-                        put_u8(&mut bytes, 24);
+                    BbuGraphNode::MdStorage(dimensions, _) => {
+                        put_u8(&mut bytes, 25);
                         put_u32(&mut bytes, u32::try_from(dimensions.len()).ok()?);
                         for &dimension in dimensions { put_u64(&mut bytes, dimension); }
-                        put_u32(&mut bytes, storage_ref);
                     }
+                    BbuGraphNode::ComplexArray(metadata, _) => {
+                        put_u8(&mut bytes, 26); metadata.encode(&mut bytes);
+                    }
+                    BbuGraphNode::ArrayLeaf(payload) => bytes.extend_from_slice(payload),
                     _ => return None,
                 }
                 for child in children {
@@ -10875,6 +10875,12 @@ impl BbuConstPool {
                 references[index] = Some(if let Some(reserved) = references[index] {
                     self.entries[reserved as usize] = bytes;
                     reserved
+                } else if !matches!(nodes[index], BbuGraphNode::Cons(_)) {
+                    // Preserve mutable array/storage identity; same-object
+                    // reuse is already handled by the rooted graph cache.
+                    let reference = u32::try_from(self.entries.len()).ok()?;
+                    self.entries.push(bytes);
+                    reference
                 } else {
                     self.intern_encoded(bytes)
                 });
@@ -10911,12 +10917,20 @@ impl BbuConstPool {
                 }
             }
         }
-        if cyclic {
+        // Mutable arrays must keep same-object identity across separate pool
+        // calls even when their content graph is acyclic. Entries are roots,
+        // and capture_bbu_graph rebuilds its temporary address map each time.
+        if cyclic || nodes.iter().any(|node| matches!(node,
+            BbuGraphNode::Vector(_) | BbuGraphNode::MdArray(_, _)
+                | BbuGraphNode::MdPackedU8(_, _) | BbuGraphNode::MdStorage(_, _)
+                | BbuGraphNode::ComplexArray(_, _) | BbuGraphNode::ArrayLeaf(_))) {
             for (index, node) in nodes.iter().enumerate() {
                 if matches!(
                     node,
                     BbuGraphNode::Cons(_) | BbuGraphNode::Vector(_) | BbuGraphNode::MdArray(_, _)
-                        | BbuGraphNode::MdPackedU8(_, _) | BbuGraphNode::MdPackedU8Snapshot(_, _)
+                        | BbuGraphNode::MdPackedU8(_, _)
+                        | BbuGraphNode::MdStorage(_, _) | BbuGraphNode::ComplexArray(_, _)
+                        | BbuGraphNode::ArrayLeaf(_)
                 ) {
                     self.graph_values.push(values[index]);
                     self.graph_refs.push(references[index]?);
@@ -13200,6 +13214,11 @@ enum BbuConstant {
         entry_refs: Vec<u32>,
     },
     PackedU8(Vec<u8>),
+    PackedF64(Vec<u64>),
+    BitArray(Vec<u8>),
+    ArrayString { base: bool, text: String },
+    MdStorage { dimensions: Vec<u64>, storage_ref: u32 },
+    ComplexArray { storage_ref: u32, metadata: array_constants::ComplexMetadata },
     MdPackedU8 { dimensions: Vec<u64>, storage_ref: u32 },
     /// A general multidimensional array: dimensions plus row-major element refs.
     MdArray {
@@ -13435,6 +13454,41 @@ fn parse_bbu_constant(
             for _ in 0..rank { dimensions.push(cursor.u64()?); }
             BbuConstant::MdPackedU8 { dimensions, storage_ref: cursor.u32()? }
         }
+        25 if bytecode_version >= 0x0205 => {
+            let rank = cursor.u32()? as usize;
+            if rank > 1024 || rank == 1 { return Err(bbu_error("invalid multidimensional array rank")); }
+            let mut dimensions = Vec::with_capacity(rank);
+            for _ in 0..rank {
+                let dimension = cursor.u64()?;
+                if dimension > ((1u64 << 60) - 1) || usize::try_from(dimension).is_err() {
+                    return Err(bbu_error("array dimension exceeds host fixnum range"));
+                }
+                dimensions.push(dimension);
+            }
+            BbuConstant::MdStorage { dimensions, storage_ref: cursor.u32()? }
+        }
+        26 if bytecode_version >= 0x0205 => {
+            let metadata = array_constants::ComplexMetadata::parse(cursor)?;
+            BbuConstant::ComplexArray { metadata, storage_ref: cursor.u32()? }
+        }
+        27 if bytecode_version >= 0x0205 => {
+            let length = cursor.u32()? as usize;
+            let bytes = cursor.take(length.checked_mul(8).ok_or_else(|| bbu_error("packed array too large"))?)?;
+            BbuConstant::PackedF64(bytes.chunks_exact(8).map(|b| u64::from_le_bytes(b.try_into().unwrap())).collect())
+        }
+        28 if bytecode_version >= 0x0205 => {
+            let length = cursor.u32()? as usize;
+            let bits = cursor.take(length)?;
+            if bits.iter().any(|&bit| bit > 1) { return Err(bbu_error("invalid bit payload")); }
+            BbuConstant::BitArray(bits.to_vec())
+        }
+        29 if bytecode_version >= 0x0205 => {
+            let base = match cursor.u8()? { 0 => false, 1 => true, _ => return Err(bbu_error("invalid string width")) };
+            let length = cursor.u32()? as usize;
+            let text = std::str::from_utf8(cursor.take(length)?).map_err(|_| bbu_error("invalid string UTF-8"))?.to_owned();
+            if base && text.chars().any(|c| (c as u32) >= 256) { return Err(bbu_error("invalid base string character")); }
+            BbuConstant::ArrayString { base, text }
+        }
         19 if bytecode_version >= 0x010d => {
             let rank = cursor.u32()? as usize;
             if rank > 1024 {
@@ -13669,6 +13723,7 @@ fn materialize_bbu_constants(constants: &[BbuConstant]) -> Result<Vec<EgclVal>, 
     let mut values = allocate_bbu_constants(constants)?;
     egcl_rt::rooted_ref!(_values_root = &mut values);
     fill_bbu_constant_edges(constants, &values)?;
+    array_constants::validate_values(constants, &values)?;
     fill_bbu_hash_tables(constants, &values)?;
     Ok(values)
 }
@@ -13698,6 +13753,7 @@ fn fill_bbu_hash_tables(constants: &[BbuConstant], values: &[EgclVal]) -> Result
 // refer forward, including back to itself; all shells remain rooted while later
 // constants allocate and potentially move the earlier ones.
 fn allocate_bbu_constants(constants: &[BbuConstant]) -> Result<Vec<EgclVal>, EgclError> {
+    array_constants::validate_graph(constants)?;
     let mut values = Vec::with_capacity(constants.len());
     egcl_rt::rooted_ref!(_values_root = &mut values);
     for (index, constant) in constants.iter().enumerate() {
@@ -13862,6 +13918,32 @@ fn allocate_bbu_constants(constants: &[BbuConstant]) -> Result<Vec<EgclVal>, Egc
                 }
                 array
             }
+            BbuConstant::PackedF64(bits) => {
+                egcl_rt::rooted!(array = egcl_rt::packed_f64::make(bits.len(), 0.0)?);
+                for (index, &bits) in bits.iter().enumerate() {
+                    if !egcl_rt::packed_f64::set(*array, index, f64::from_bits(bits)) { return Err(bbu_error("invalid double payload")); }
+                }
+                *array
+            }
+            BbuConstant::BitArray(bits) => egcl_stdlib::sequences::build_bit_vector_from_bits(bits)?,
+            BbuConstant::ArrayString { base, text } => {
+                if *base && text.chars().any(|c| (c as u32) >= 256) {
+                    return Err(bbu_error("invalid base string character"));
+                }
+                if *base { egcl_stdlib::streams::make_lisp_base_string_fresh(text) }
+                else { egcl_stdlib::streams::make_lisp_string_fresh(text) }
+            },
+            BbuConstant::MdStorage { dimensions, .. } => {
+                let dimensions = dimensions.iter().map(|&d| usize::try_from(d).map_err(|_| bbu_error("array dimension exceeds host range")))
+                    .collect::<Result<Vec<_>, _>>()?;
+                egcl_stdlib::sequences::build_md_array_with_storage(&dimensions, NIL)?
+            }
+            BbuConstant::ComplexArray { .. } => {
+                // A valid empty wrapper while the GC can observe this shell.
+                // Exact metadata and storage are published without allocation
+                // only after every referenced constant has a rooted shell.
+                egcl_stdlib::build_complex_vector(&[], 0, 0, false, false, false, false)
+            }
             BbuConstant::MdPackedU8 { dimensions, storage_ref } => {
                 validate_bbu_u8_storage(constants, dimensions, *storage_ref)?;
                 let dimensions = dimensions.iter().map(|&dimension| usize::try_from(dimension)
@@ -13912,6 +13994,22 @@ fn fill_bbu_constant_edges(constants: &[BbuConstant], values: &[EgclVal]) -> Res
                     egcl_stdlib::set_elt(values[index], element, referent(*reference)?)?;
                 }
             }
+            BbuConstant::MdStorage { storage_ref, .. } => unsafe {
+                egcl_rt::gc::store_ref(values[index].as_ptr().add(8).cast::<EgclVal>(), referent(*storage_ref)?);
+            },
+            BbuConstant::ComplexArray { storage_ref, metadata } => unsafe {
+                let value = values[index];
+                egcl_rt::gc::store_ref(value.as_ptr().add(8).cast::<EgclVal>(), referent(*storage_ref)?);
+                let (offset, total) = metadata.displacement.map_or((NIL, NIL), |(offset, total)|
+                    (EgclVal::from_fixnum(offset as i64), EgclVal::from_fixnum(total as i64)));
+                let words = [EgclVal::from_fixnum(metadata.fill_pointer as i64),
+                    if metadata.adjustable { T } else { NIL },
+                    EgclVal::from_fixnum(metadata.element_type as i64),
+                    EgclVal::from_fixnum(i64::from(metadata.has_fill_pointer)), offset, total];
+                for (word, item) in words.into_iter().enumerate() {
+                    *value.as_ptr().add(16 + word * 8).cast::<EgclVal>() = item;
+                }
+            },
             BbuConstant::MdPackedU8 { dimensions, storage_ref } => {
                 validate_bbu_u8_storage(constants, dimensions, *storage_ref)?;
                 let storage = referent(*storage_ref)?;
@@ -16307,6 +16405,9 @@ fn load_bbu_definitions(bytes: &[u8], env: &mut Env, restoring: bool) -> Result<
                     bbu_index(reference, encoded_constants.len(), "vector element")?;
                 }
             }
+            BbuConstant::MdStorage { storage_ref, .. } | BbuConstant::ComplexArray { storage_ref, .. } => {
+                bbu_index(*storage_ref, encoded_constants.len(), "array storage")?;
+            }
             BbuConstant::MdPackedU8 { dimensions, storage_ref } => {
                 validate_bbu_u8_storage(&encoded_constants, dimensions, *storage_ref)?;
             }
@@ -16326,6 +16427,8 @@ fn load_bbu_definitions(bytes: &[u8], env: &mut Env, restoring: bool) -> Result<
             _ => {}
         }
     }
+
+    array_constants::validate_graph(&encoded_constants)?;
 
     let mut encoded_functions = Vec::with_capacity(function_count);
     for _ in 0..function_count {
@@ -31687,3 +31790,5 @@ mod compile_file_print_group_tests {
         assert!(parse_bbu_print_groups(&encoded[..7], &actions(), 1).is_err());
     }
 }
+#[cfg(test)]
+mod adjustable_array_persistence_tests;
