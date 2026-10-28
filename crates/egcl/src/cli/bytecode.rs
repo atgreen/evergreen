@@ -31008,8 +31008,13 @@ mod jtc4_stack_map_tests {
         let mut pool = BbuConstPool::default();
         egcl_rt::rooted_ref!(_pool_root = &mut pool);
         let nil_ref = pool.value(NIL).unwrap();
-        egcl_rt::rooted!(bits = reader::read_from_string("#*101").unwrap().0);
-        egcl_rt::rooted!(circle = arena_cons(NIL, *bits));
+        // Bit vectors are now portable constants; a live stream remains an
+        // unsupported leaf, preserving this test's partial-graph rollback.
+        egcl_rt::rooted!(
+            unsupported = egcl_stdlib::streams::make_string_output_stream_of(false).unwrap()
+        );
+        assert!(pool.value(*unsupported).is_none());
+        egcl_rt::rooted!(circle = arena_cons(NIL, *unsupported));
         super::super::store_cons_field(*circle, *circle, true).unwrap();
         assert!(pool.value(*circle).is_none());
         assert_eq!(pool.entries, vec![vec![0]]);

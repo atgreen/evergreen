@@ -58,7 +58,9 @@ fn adjustable_array_graph_loads_without_source_and_preserves_metadata_and_aliase
     std::fs::write(dir.0.join("arrays.lisp"), r#"
 (defparameter *adjusted-array-constants*
   #.(let* ((base (make-array 6 :initial-contents '(a b c d e f) :adjustable t :fill-pointer 4))
-           (view (make-array '(2 2) :displaced-to base :displaced-index-offset 1 :adjustable t))
+           (view (egcl-internal::%make-md-array-with-storage '(2 2)
+                   (make-array 4 :displaced-to base :displaced-index-offset 1
+                                 :adjustable t :fill-pointer 2)))
            (bytes (make-array '(2 2) :element-type '(unsigned-byte 8) :initial-element 255 :adjustable t))
            (floats (make-array '(2 2) :element-type 'double-float :initial-element -1.25d0 :adjustable t))
            (bits (make-array '(2 2) :element-type 'bit :initial-element 1 :adjustable t))
@@ -110,6 +112,11 @@ fn adjustable_array_graph_loads_without_source_and_preserves_metadata_and_aliase
         (assert (adjustable-array-p view))
         (assert (eq (array-displacement view) base))
         (assert (= (nth-value 1 (array-displacement view)) 1))
+        ;; The MD backing has FP=2 and capacity=4. Array access must use all
+        ;; four row-major elements, including after portable graph restoration.
+        (assert (eq (aref view 1 1) 'e))
+        (setf (aref view 1 1) 'changed)
+        (assert (eq (aref base 4) 'changed))
         (assert (eq base (adjust-array base 6 :initial-contents '(p q r s t u))))
         (assert (eq (aref view 0 0) 'q))
         (assert (eq view (adjust-array view '(2 3) :initial-element 'new)))
