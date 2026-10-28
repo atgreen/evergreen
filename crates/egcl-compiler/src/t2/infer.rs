@@ -729,7 +729,7 @@ const MAX_PASSES: usize = WIDEN_AFTER + 8;
 /// LDB result only while that descriptor has one executable consumer, crosses
 /// normal single-predecessor edges, and encounters no opaque effects. Calls
 /// remain in the IR: these are facts about successful normal returns only.
-fn fresh_ldb_facts(f: &Function) -> HashMap<Value, IRType> {
+fn fresh_ldb_facts(f: &Function, predecessors: &[Vec<Block>]) -> HashMap<Value, IRType> {
     use super::builtin_binding::{Binding, snapshot};
     let canonical = |data: &super::ir::InstData, key: &str| {
         let AuxData::CallTarget(symbol) = data.aux else {
@@ -806,8 +806,7 @@ fn fresh_ldb_facts(f: &Function) -> HashMap<Value, IRType> {
                         break 'trace None;
                     }
                 }
-                let predecessors = f.preds(block);
-                let [predecessor] = predecessors.as_slice() else {
+                let [predecessor] = predecessors[block.index()].as_slice() else {
                     break None;
                 };
                 let instructions = &f.block(*predecessor).insts;
@@ -914,7 +913,11 @@ pub fn infer(f: &Function) -> InferenceResult {
 pub fn infer_for_sites(f: &Function, sites: &[Inst]) -> InferenceResult {
     let mut timings = InferenceTimings::new();
     let setup_start = timings.clock();
-    let ldb_facts = fresh_ldb_facts(f);
+    // The IR is frozen throughout this invocation. Preserve Function::preds
+    // ordering/deduplication once, rather than rescanning the whole CFG in
+    // every widening pass and for every candidate comparison edge.
+    let predecessors = f.pred_lists();
+    let ldb_facts = fresh_ldb_facts(f, &predecessors);
     let structural = super::value_facts::StructuralFacts::analyze(f);
     let rpo = f.reverse_postorder();
     let dom = f.dominators();
@@ -922,7 +925,7 @@ pub fn infer_for_sites(f: &Function, sites: &[Inst]) -> InferenceResult {
 
     // Seed entry / pred-less block parameters from their declared type once.
     for &b in &rpo {
-        if b == f.entry() || f.preds(b).is_empty() {
+        if b == f.entry() || predecessors[b.index()].is_empty() {
             for &p in &f.block(b).params {
                 g.0.insert(p, f.value(p).ty);
             }
@@ -980,12 +983,12 @@ pub fn infer_for_sites(f: &Function, sites: &[Inst]) -> InferenceResult {
             if timings.start.is_some() { timings.block_visits += 1; }
             // 1. Block parameter facts = join over predecessor edges (or the
             //    declared type for pred-less blocks, seeded above).
-            let preds = f.preds(b);
+            let preds = predecessors[b.index()].as_slice();
             if !preds.is_empty() {
                 let params = f.block(b).params.clone();
                 for (num, &p) in params.iter().enumerate() {
                     let mut acc = IRType::BOTTOM;
-                    for &pred in &preds {
+                    for &pred in preds {
                         if let Some(term) = f.terminator(pred) {
                             for call in &f.inst(term).targets {
                                 if call.block == b {
@@ -1067,7 +1070,7 @@ pub fn infer_for_sites(f: &Function, sites: &[Inst]) -> InferenceResult {
             // Global facts still accumulate monotonically, so a loop-carried
             // bound that grows on a later pass weakens the inferred result.
             let edge_start = timings.clock();
-            add_edge_refinements(f, b, &g, &mut edge_refine);
+            add_edge_refinements(f, b, &g, &predecessors, &mut edge_refine);
             timings.edge_ns += InferenceTimings::elapsed(edge_start);
         }
 
@@ -1090,7 +1093,7 @@ pub fn infer_for_sites(f: &Function, sites: &[Inst]) -> InferenceResult {
         HashMap::new()
     } else {
         capture_site_facts(f, sites, &g, &rpo, &dom, &structural,
-            CaptureContext { checks: &check_refine, timings: &mut timings })
+            CaptureContext { checks: &check_refine, predecessors: &predecessors, timings: &mut timings })
     };
     timings.replay_ns = InferenceTimings::elapsed(replay_start);
     timings.replay_entry_ns = timings.entry_ns - entry_before_replay;
@@ -1120,7 +1123,10 @@ fn check_refinements(f: &Function, rpo: &[Block]) -> CheckRefinements {
     check_refine
 }
 
-fn add_edge_refinements(f: &Function, b: Block, g: &Facts, edge_refine: &mut EdgeRefinements) {
+fn add_edge_refinements(
+    f: &Function, b: Block, g: &Facts, predecessors: &[Vec<Block>],
+    edge_refine: &mut EdgeRefinements,
+) {
     if let Some(term) = f.terminator(b) {
         let t = f.inst(term);
         if t.opcode == Opcode::Brif && !t.args.is_empty() {
@@ -1138,7 +1144,7 @@ fn add_edge_refinements(f: &Function, b: Block, g: &Facts, edge_refine: &mut Edg
                     if let (AuxData::TypeTag(tag), Some(call)) = (&cdef.aux, t.targets.first()) {
                         let tgt = call.block;
                         if tgt != f.entry()
-                            && f.preds(tgt) == vec![b]
+                            && predecessors[tgt.index()].as_slice() == [b]
                             && t.targets.iter().filter(|c| c.block == tgt).count() == 1
                         {
                             if let Some(ty) = predicate_true_type(tag.bits) {
@@ -1163,7 +1169,7 @@ fn add_edge_refinements(f: &Function, b: Block, g: &Facts, edge_refine: &mut Edg
                             // outcomes entering the same block do not
                             // establish either outcome's constraint.
                             if tgt != f.entry()
-                                && f.preds(tgt) == vec![b]
+                                && predecessors[tgt.index()].as_slice() == [b]
                                 && t.targets.iter().filter(|c| c.block == tgt).count() == 1
                             {
                                 let refs = narrow_cmp(cdef.opcode, ca, cb, taken, g);
@@ -1258,6 +1264,7 @@ fn apply_normal_return_facts(
 
 struct CaptureContext<'a> {
     checks: &'a CheckRefinements,
+    predecessors: &'a [Vec<Block>],
     timings: &'a mut InferenceTimings,
 }
 
@@ -1270,12 +1277,12 @@ fn capture_site_facts(
     structural: &super::value_facts::StructuralFacts,
     context: CaptureContext<'_>,
 ) -> HashMap<(Inst, Value), IRType> {
-    let CaptureContext { checks, timings } = context;
+    let CaptureContext { checks, predecessors, timings } = context;
     let requested: HashSet<_> = sites.iter().copied().collect();
     let mut edges = EdgeRefinements::new();
     for &block in rpo {
         let edge_start = timings.clock();
-        add_edge_refinements(f, block, g, &mut edges);
+        add_edge_refinements(f, block, g, predecessors, &mut edges);
         timings.edge_ns += InferenceTimings::elapsed(edge_start);
     }
     let mut before = HashMap::new();
@@ -2499,6 +2506,14 @@ mod tests {
         );
         f.set_terminator(successor, ret());
         assert_eq!(infer(&f).range(result[0]), Some(Range { lo: 1, hi: 41 }));
+
+        // A new inference invocation must observe a changed CFG, rather than
+        // retaining the prior shared-edge predecessor snapshot.
+        let separate_false = f.make_block();
+        f.set_terminator(separate_false, ret());
+        let branch = f.terminator(entry).unwrap();
+        f.inst_mut(branch).targets[1].block = separate_false;
+        assert_eq!(infer(&f).range(result[0]), Some(Range { lo: 1, hi: 2 }));
     }
 
     #[test]
