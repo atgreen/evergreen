@@ -393,7 +393,8 @@
 ### Fixed
 
 - Two places that packed `(unsigned-byte 8)` arrays missed, each of which
-  broke every `ocicl install`:
+  broke every `ocicl install`
+  ([#755](https://github.com/atgreen/evergreen/pull/755)):
   - Ironclad's SHA3 and other Keccak digests work again. The native Keccak
     absorb rejected Ironclad's packed buffer as "not of type "an octet
     vector"". It now reads packed and general octet vectors alike, as the
