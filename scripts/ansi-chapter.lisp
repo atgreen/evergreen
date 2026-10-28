@@ -100,7 +100,13 @@
 ;; files chapter (ensure-directories-exist.8) expects to create it itself.
 (unless (string= cl-user::*ansi-chapter* "files")
   (ensure-directories-exist (merge-pathnames "scratch/" *default-pathname-defaults*)))
-(do-tests)
+;; ansi-test expects to be driven from a top-level REPL, where
+;; *LOAD-PATHNAME* and *LOAD-TRUENAME* are NIL; LOAD-PATHNAME.1 and
+;; LOAD-TRUENAME.1 (system-construction) assert exactly that.  This driver
+;; arrives through --load, which binds both to the driver's own path for the
+;; whole run, so give the tests the top-level view.
+(let ((*load-pathname* nil) (*load-truename* nil))
+  (do-tests))
 (format t "~%passed: ~A~%" (length regression-test::*passed-tests*))
 (format t "failed: ~A~%" (length regression-test::*failed-tests*))
 (when regression-test::*failed-tests*
