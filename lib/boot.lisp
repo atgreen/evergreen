@@ -888,14 +888,14 @@
   ;; NIL, the empty type, upgrades to itself: the upgraded type must be a
   ;; supertype of TYPE and a subtype of every upgrade of its supertypes, and
   ;; only NIL is both (ansi arrays upgraded-array-element-type.nil.1).
-  (cond ((null type) nil)
-        ((egcl-internal::%bit-element-type-p (%expand-type-spec type)) 'bit)
-        ((egcl-internal::%u8-element-type-p (%expand-type-spec type)) '(unsigned-byte 8))
-        ((member (if (consp type) (car type) type) '(double-float long-float)) 'double-float)
-        ((eq type 'bit) 'bit)
-        ((member type '(base-char standard-char)) 'base-char)
-        ((member type '(character extended-char)) 'character)
-        (t t)))
+  (let ((type (%expand-type-spec type)))
+    (cond ((null type) nil)
+          ((egcl-internal::%bit-element-type-p type) 'bit)
+          ((egcl-internal::%u8-element-type-p type) '(unsigned-byte 8))
+          ((member (if (consp type) (car type) type) '(double-float long-float)) 'double-float)
+          ((member type '(base-char standard-char)) 'base-char)
+          ((member type '(character extended-char)) 'character)
+          (t t))))
 
 ;; UPGRADED-COMPLEX-PART-TYPE (CLHS 12.2.6): the part type used for a complex of
 ;; the given part type. egcl stores complex parts unspecialised, so a float part
