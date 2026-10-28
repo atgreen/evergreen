@@ -91,6 +91,9 @@
 //! (moved in with `mtvsrd` and converted to double format), `FixnumAdd/Sub/Mul/Neg` and the
 //! five comparisons (branchless via `isel`), all tag-guarded and deopting on
 //! overflow; `Guard` for CONS and (CONS OR NULL), `Car`/`Cdr` on a proven cons, `GenericEq`,
+//! the five single-float comparisons (`fcmpu` then `isel` of T/NIL, deopting
+//! on an unordered compare so the interpreter decides NaN ordering),
+//! `FixnumMin`/`FixnumMax` as a plain select of a tagged operand,
 //! `LogAnd/Or/Xor/Not` and `FixnumShl/Shr` by a constant, and the builder's
 //! target-free `Call` for `MULTIPLE-VALUE-LIST` (`AuxData::ValuesToList`) and
 //! for non-capturing closure creation (`AuxData::NestedClosure`), both of which
@@ -702,7 +705,9 @@ impl Emitter<'_> {
         let first = *data.args.first().ok_or_else(unsupported)?;
         self.load(first, W0)?;
         match data.opcode {
-            Guard if matches!(&data.aux, AuxData::TypeTag(ty) if ty.bits == TypeBits::FIXNUM || ty.bits == TypeBits::SINGLE_FLOAT || ty.bits == TypeBits::CONS) || matches!(&data.aux, AuxData::EndpList) =>
+            Guard
+                if matches!(&data.aux, AuxData::TypeTag(ty) if ty.bits == TypeBits::FIXNUM || ty.bits == TypeBits::SINGLE_FLOAT || ty.bits == TypeBits::CONS)
+                    || matches!(&data.aux, AuxData::EndpList) =>
             {
                 let deopt = self.deopt_label(data)?;
                 match &data.aux {
@@ -710,9 +715,7 @@ impl Emitter<'_> {
                         self.guard_fixnum(W0, deopt)
                     }
                     AuxData::TypeTag(ty) if ty.bits == TypeBits::CONS => self.guard_cons(W0, deopt),
-                    AuxData::EndpList => {
-                        self.guard_list(W0, deopt)?
-                    }
+                    AuxData::EndpList => self.guard_list(W0, deopt)?,
                     _ => self.guard_single_float(W0, deopt),
                 }
             }
@@ -734,6 +737,58 @@ impl Emitter<'_> {
                 self.asm.sldi(W0, W0, 32);
                 self.asm.li(T0, 4);
                 self.asm.or(W0, W0, T0);
+            }
+            FloatCmpEq | FloatCmpLt | FloatCmpLe | FloatCmpGt | FloatCmpGe => {
+                // A speculated single-float comparison yielding T or NIL, as
+                // emit.rs and emit_a64.rs do it. Each operand is guarded to be
+                // a single-float exactly as `FloatAdd` guards its own, and an
+                // UNORDERED compare -- either operand a NaN -- deopts: the
+                // interpreter's NaN ordering is not IEEE's, so native code must
+                // not be the one to decide it.
+                //
+                // Taking that exit FIRST is also what makes the ordinary
+                // conditions usable below. `Cc::Le` and `Cc::Ge` are encoded as
+                // "not GT" and "not LT" (`Cc::ppc_condition`), and `fcmpu`
+                // leaves LT, GT and EQ all clear when unordered, so each would
+                // read TRUE for a NaN. CR bit 3 is consulted before either, so
+                // by the `isel` the compare is known ordered and the codes mean
+                // what they say.
+                let deopt = self.deopt_label(data)?;
+                self.float_operand(first, W0, deopt)?;
+                self.float_operand(*data.args.get(1).ok_or_else(unsupported)?, W1, deopt)?;
+                self.unbox_single(F0, W0);
+                self.unbox_single(F1, W1);
+                self.asm.compare_double(0, F0, F1);
+                self.asm.branch(Cc::O, 0, deopt);
+                self.asm.imm64(T0, T.0);
+                self.asm.imm64(T1, NIL.0);
+                let cc = match data.opcode {
+                    FloatCmpEq => Cc::E,
+                    FloatCmpLt => Cc::L,
+                    FloatCmpLe => Cc::Le,
+                    FloatCmpGt => Cc::G,
+                    _ => Cc::Ge,
+                };
+                self.asm.isel(W0, T0, T1, cc, 0);
+                return self.store(result, W0);
+            }
+            FixnumMin | FixnumMax => {
+                // Both operands are tagged by the same shift, so the signed
+                // order of the tagged words is the operands' order, the winner
+                // is already tagged, and nothing can overflow. Ties keep the
+                // first operand, as emit.rs's `jcc Le/Ge` does.
+                let deopt = self.deopt_label(data)?;
+                self.guard_fixnum(W0, deopt);
+                self.load(*data.args.get(1).ok_or_else(unsupported)?, W1)?;
+                self.guard_fixnum(W1, deopt);
+                self.asm.compare(0, W0, W1);
+                let cc = if data.opcode == FixnumMin {
+                    Cc::Le
+                } else {
+                    Cc::Ge
+                };
+                self.asm.isel(W0, W0, W1, cc, 0);
+                return self.store(result, W0);
             }
             FixnumAdd | FixnumSub | FixnumMul | FixnumNeg | FixnumCmpEq | FixnumCmpLt
             | FixnumCmpLe | FixnumCmpGt | FixnumCmpGe => {
@@ -1420,6 +1475,161 @@ mod tests {
             },
         );
         function
+    }
+
+    /// A two-parameter function whose single instruction is `opcode`, with the
+    /// frame state its deopt exit needs.
+    fn binary(name: &str, opcode: Opcode, ty: IRType) -> Function {
+        let mut function = Function::new(name);
+        let block = function.entry();
+        let a = function.add_block_param(block, ty, ValueRepresentation::Tagged);
+        let b = function.add_block_param(block, ty, ValueRepresentation::Tagged);
+        let state = function.frame_states.add(FrameState {
+            scopes: vec![FrameScope {
+                function: 81,
+                bcp: 4,
+                locals: vec![
+                    ValueSource::Value {
+                        value: a,
+                        repr: ValueRepresentation::Tagged,
+                    },
+                    ValueSource::Value {
+                        value: b,
+                        repr: ValueRepresentation::Tagged,
+                    },
+                ],
+                stack: vec![],
+            }],
+            remat: vec![],
+        });
+        let (_, out) = function.push_inst(
+            block,
+            InstData {
+                opcode,
+                args: vec![a, b],
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags::default(),
+                targets: vec![],
+                frame_state: Some(state),
+                source_pos: 0,
+            },
+            &[(IRType::TOP, ValueRepresentation::Tagged)],
+        );
+        function.set_terminator(
+            block,
+            InstData {
+                opcode: Opcode::Return,
+                args: vec![out[0]],
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags::default(),
+                targets: vec![],
+                frame_state: None,
+                source_pos: 0,
+            },
+        );
+        function
+    }
+
+    /// Both families must EMIT on any host, so x86-64 CI -- which builds no
+    /// other POWER coverage -- guards that these arms exist at all. Before they
+    /// were added each answered `UnsupportedOp`, which cost the whole function
+    /// its T2 code and left a runtime call in the loop.
+    #[test]
+    fn emits_fixnum_min_max_and_single_float_comparisons() {
+        extern "C" fn deopt(_: u64, _: u64, _: *const u64, _: u64) {}
+        let deopt = deopt as *const () as usize as u64;
+        for (name, opcode, ty) in [
+            ("ppc64le-min", Opcode::FixnumMin, TypeBits::FIXNUM),
+            ("ppc64le-max", Opcode::FixnumMax, TypeBits::FIXNUM),
+            ("ppc64le-flt", Opcode::FloatCmpLt, TypeBits::SINGLE_FLOAT),
+            ("ppc64le-fle", Opcode::FloatCmpLe, TypeBits::SINGLE_FLOAT),
+            ("ppc64le-fgt", Opcode::FloatCmpGt, TypeBits::SINGLE_FLOAT),
+            ("ppc64le-fge", Opcode::FloatCmpGe, TypeBits::SINGLE_FLOAT),
+            ("ppc64le-feq", Opcode::FloatCmpEq, TypeBits::SINGLE_FLOAT),
+        ] {
+            emit_framed(&binary(name, opcode, IRType::of(ty)), deopt, 2)
+                .unwrap_or_else(|e| panic!("{name} must emit, got {e:?}"));
+        }
+    }
+
+    /// The answers, where only a tie separates `<` from `<=`, and a NaN must
+    /// reach the deopt exit rather than be answered here: the interpreter's NaN
+    /// ordering is not IEEE's. A regression to reading `Cc::Le` straight off an
+    /// unordered `fcmpu` shows up as the NaN row answering T instead.
+    #[test]
+    #[cfg(all(target_arch = "powerpc64", target_endian = "little"))]
+    fn selects_and_compares_give_the_ordered_answers() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static DEOPTED: AtomicBool = AtomicBool::new(false);
+        extern "C" fn deopt(_: u64, _: u64, _: *const u64, _: u64) {
+            DEOPTED.store(true, Ordering::Relaxed);
+        }
+        let deopt = deopt as *const () as usize as u64;
+        let run = |function: &Function, x: u64, y: u64| {
+            DEOPTED.store(false, Ordering::Relaxed);
+            let compiled = emit_framed(function, deopt, 2).expect("emit");
+            let buffer = egcl_rt::jit::JitBuffer::new(&compiled.code).unwrap();
+            let entry: extern "C" fn(*mut u64) -> u64 =
+                unsafe { std::mem::transmute(buffer.as_ptr()) };
+            let mut slots = [x, y];
+            let answer = entry(slots.as_mut_ptr());
+            (answer, DEOPTED.load(Ordering::Relaxed))
+        };
+
+        let fix = |v: i64| EgclVal::from_fixnum(v).0;
+        let min = binary("min", Opcode::FixnumMin, IRType::of(TypeBits::FIXNUM));
+        let max = binary("max", Opcode::FixnumMax, IRType::of(TypeBits::FIXNUM));
+        for (a, b, lo, hi) in [
+            (3i64, 7i64, 3i64, 7i64),
+            (7, 3, 3, 7),
+            (5, 5, 5, 5),
+            (-9, 4, -9, 4),
+        ] {
+            assert_eq!(run(&min, fix(a), fix(b)).0, fix(lo), "min {a} {b}");
+            assert_eq!(run(&max, fix(a), fix(b)).0, fix(hi), "max {a} {b}");
+        }
+
+        let sf = |v: f32| EgclVal::from_single_float(v).0;
+        for (opcode, name, rows) in [
+            (
+                Opcode::FloatCmpLt,
+                "<",
+                [(1.5f32, 2.5f32, T.0), (2.5, 1.5, NIL.0), (2.5, 2.5, NIL.0)],
+            ),
+            (
+                Opcode::FloatCmpLe,
+                "<=",
+                [(1.5, 2.5, T.0), (2.5, 1.5, NIL.0), (2.5, 2.5, T.0)],
+            ),
+            (
+                Opcode::FloatCmpGt,
+                ">",
+                [(2.5, 1.5, T.0), (1.5, 2.5, NIL.0), (2.5, 2.5, NIL.0)],
+            ),
+            (
+                Opcode::FloatCmpGe,
+                ">=",
+                [(2.5, 1.5, T.0), (1.5, 2.5, NIL.0), (2.5, 2.5, T.0)],
+            ),
+            (
+                Opcode::FloatCmpEq,
+                "=",
+                [(2.5, 2.5, T.0), (1.5, 2.5, NIL.0), (2.5, 1.5, NIL.0)],
+            ),
+        ] {
+            let f = binary(name, opcode, IRType::of(TypeBits::SINGLE_FLOAT));
+            for (a, b, expected) in rows {
+                let (answer, deopted) = run(&f, sf(a), sf(b));
+                assert_eq!(answer, expected, "{a} {name} {b}");
+                assert!(!deopted, "{a} {name} {b} must not deopt");
+            }
+            // Either operand a NaN leaves the decision to the interpreter.
+            for (a, b) in [(f32::NAN, 1.5f32), (1.5, f32::NAN), (f32::NAN, f32::NAN)] {
+                assert!(run(&f, sf(a), sf(b)).1, "{a} {name} {b} must deopt");
+            }
+        }
     }
 
     #[test]

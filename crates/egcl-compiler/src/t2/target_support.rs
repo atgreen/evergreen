@@ -40,16 +40,35 @@
 /// Whether the host emitter encodes `FloatCmpEq`/`Lt`/`Le`/`Gt`/`Ge` on
 /// **boxed single-floats**.
 ///
-/// x86-64 `emit.rs` (bliss-9bw59) and AArch64 `emit_a64.rs` both guard each
-/// operand to be a single-float, compare, and select `T`/`NIL`, deopting on an
-/// unordered compare so the interpreter — whose NaN ordering is not IEEE's —
-/// decides that case. To add a target: give its emitter that arm, then name it
-/// here.
+/// x86-64 `emit.rs` (bliss-9bw59), AArch64 `emit_a64.rs` and ppc64le
+/// `emit_ppc64le.rs` all guard each operand to be a single-float, compare, and
+/// select `T`/`NIL`, deopting on an unordered compare so the interpreter —
+/// whose NaN ordering is not IEEE's — decides that case. To add a target: give
+/// its emitter that arm, then name it here.
 pub const fn single_float_comparison() -> bool {
-    cfg!(any(target_arch = "x86_64", target_arch = "aarch64"))
+    cfg!(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        all(target_arch = "powerpc64", target_endian = "little")
+    ))
 }
 
-/// Whether the host emitter encodes `FixnumMin`/`FixnumMax` and the
+/// Whether the host emitter encodes `FixnumMin`/`FixnumMax` on tagged fixnums.
+///
+/// Separate from [`fixnum_division`] because it is a far smaller arm and a
+/// port reaches it first: both operands are tagged by the same shift, so the
+/// comparison is the operands' own order, the winner is already tagged, and
+/// nothing can overflow. ppc64le has this and not the division family. To add
+/// a target: give its emitter that select, then name it here.
+pub const fn fixnum_select() -> bool {
+    cfg!(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        all(target_arch = "powerpc64", target_endian = "little")
+    ))
+}
+
+/// Whether the host emitter encodes the
 /// `FixnumDiv`/`FixnumFloor`/`FixnumRem`/`FixnumMod` family on tagged fixnums.
 ///
 /// The quotient forms are the discarded-remainder `TRUNCATE` and `FLOOR`;
@@ -96,5 +115,13 @@ mod tests {
     #[test]
     fn double_float_implies_single_float_comparison() {
         assert!(!super::double_float() || super::single_float_comparison());
+    }
+
+    /// Dividing needs the select: `MOD` and `FLOOR` are corrected with a
+    /// comparison against the divisor, and a backend that cannot select one of
+    /// two tagged fixnums cannot encode that correction either.
+    #[test]
+    fn fixnum_division_implies_fixnum_select() {
+        assert!(!super::fixnum_division() || super::fixnum_select());
     }
 }
