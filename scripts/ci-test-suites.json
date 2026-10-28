@@ -1,5 +1,6 @@
 {
   "fast": {
+    "egcl:test:reader_external_symbols_cli": [""],
     "egcl:test:unused_lexical_function_tiers": [""],
     "egcl:test:array_adjustment_cli": [""],
     "egcl:test:array_adjustment_persistence_cli": [""],
@@ -66,6 +67,6 @@
   "areas": {
     "compiler": {"egcl-compiler:lib:egcl_compiler": [""], "egcl-compiler:test:native_vector_store": [""], "egcl-compiler:test:native_ordinary_function": [""], "egcl-compiler:test:native_comparison_fusion": [""]},
     "runtime": {"egcl-rt:lib:egcl_rt": [""]},
-    "reader": {"egcl-compiler:lib:egcl_compiler": ["reader::"]}
+    "reader": {"egcl-compiler:lib:egcl_compiler": ["reader::"], "egcl:test:reader_external_symbols_cli": [""]}
   }
 }

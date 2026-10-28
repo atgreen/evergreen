@@ -8,6 +8,11 @@
   triggers a moving collection, preventing incorrect range comparisons under
   allocation pressure ([#766](https://github.com/atgreen/evergreen/pull/766)).
 
+- Reading `PACKAGE:NAME` requires an external symbol and signals `READER-ERROR`
+  for missing or non-public names without interning them; implementation APIs
+  publish their exports before bootstrap definitions use them
+  ([#765](https://github.com/atgreen/evergreen/pull/765)).
+
 - A hot function containing `(ASH <constant> <negative constant>)` reaches the
   optimizing tier instead of being held back by it, measured at 739x on a loop
   built from that shape ([#752](https://github.com/atgreen/evergreen/pull/752)).
