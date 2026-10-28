@@ -10540,6 +10540,9 @@ const BBU_AUX_HANDLER_CASES: u16 = 9;
 // Optional: older units conservatively retain dynamic named calls.
 const BBU_AUX_SELF_CALL_SITES: u16 = 10;
 const BBU_AUX_NOTINLINE_SITES: u16 = 12;
+// Optional printing metadata; unknown flags-zero auxiliary tables are skipped
+// by prior readers without changing the load plan or constant interpretation.
+const BBU_AUX_TOPLEVEL_RESULTS: u16 = 13;
 const BBU_AUX_REQUIRED_POLICY: u16 = 1;
 // Per function, each HANDLER-BIND's condition type names (0x0203). Absent from
 // older units, whose functions could not contain PUSH_HANDLER_BIND.
@@ -11722,6 +11725,58 @@ fn serialize_bbu_notinline_sites(functions: &[BbuFunction]) -> Vec<u8> {
     out
 }
 
+#[derive(Clone, Copy)]
+struct BbuPrintGroup {
+    // Exclusive action end; repeated ends represent empty/NIL source forms.
+    end: u32,
+    result: u32,
+}
+
+fn serialize_bbu_print_groups(groups: &[BbuPrintGroup]) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_u32(&mut out, groups.len() as u32);
+    for group in groups {
+        put_u32(&mut out, group.end);
+        put_u32(&mut out, group.result);
+    }
+    out
+}
+
+fn parse_bbu_print_groups(
+    bytes: &[u8],
+    actions: &[BbuLoadAction],
+) -> Result<Vec<BbuPrintGroup>, EgclError> {
+    let mut cursor = BbuCursor::new(bytes);
+    let count = cursor.u32()? as usize;
+    if count > bytes.len().saturating_sub(4) / 8 {
+        return Err(bbu_error("invalid top-level result count"));
+    }
+    let mut groups = Vec::with_capacity(count);
+    let mut previous_end = 0;
+    for _ in 0..count {
+        let end = cursor.u32()?;
+        let result = cursor.u32()?;
+        if end < previous_end
+            || end as usize > actions.len()
+            || (result != BBU_NO_INDEX
+                && (result < previous_end
+                    || result >= end
+                    || !matches!(
+                        actions[result as usize].kind,
+                        1 | 3 | 4 | 5 | 7 | 8 | 9 | 12
+                    )))
+        {
+            return Err(bbu_error("invalid top-level result action"));
+        }
+        groups.push(BbuPrintGroup { end, result });
+        previous_end = end;
+    }
+    if !cursor.done() || previous_end as usize != actions.len() {
+        return Err(bbu_error("incomplete top-level result groups"));
+    }
+    Ok(groups)
+}
+
 fn validate_bbu_aux_flags(kind: u16, flags: u16) -> Result<(), EgclError> {
     // Older readers reject all nonzero flags, so they cannot silently discard
     // a negative optimization policy they do not understand.
@@ -12043,6 +12098,7 @@ fn bbu_package_plan(form: EgclVal, env: &Env) -> Result<Option<BbuPackagePlan>, 
 pub fn build_bbu_from_forms(
     forms: &[EgclVal],
     definition_packages: &[String],
+    source_group_ends: &[usize],
     src_path: &str,
     source: &str,
     env: &Env,
@@ -12051,6 +12107,11 @@ pub fn build_bbu_from_forms(
     if forms.len() != definition_packages.len() {
         return Err(bbu_error("compile-file form/package metadata mismatch"));
     }
+    if source_group_ends.windows(2).any(|pair| pair[0] > pair[1])
+        || source_group_ends.last().copied().unwrap_or(0) != forms.len()
+    {
+        return Err(bbu_error("compile-file source group metadata mismatch"));
+    }
     let mut forms = forms.to_vec();
     egcl_rt::rooted_ref!(_forms_root = &mut forms);
     let mut pool = BbuConstPool::default();
@@ -12058,6 +12119,8 @@ pub fn build_bbu_from_forms(
     let source_file_ref = pool.string(src_path);
     let mut functions = Vec::new();
     let mut load_actions: Vec<(u8, u8, u32, u32, u32)> = Vec::new();
+    let mut form_results = Vec::new();
+    let mut form_action_ends = vec![0usize];
 
     // Reading/compile-time evaluation has already restored the caller's
     // package. Local macros still expand during lowering, so restore each
@@ -12076,6 +12139,8 @@ pub fn build_bbu_from_forms(
         let env = &compilation_env;
         let mut form = forms[form_index];
         egcl_rt::rooted_ref!(_form_root = &mut form);
+        let action_start = load_actions.len();
+        let mut explicit_result = None;
         let mut done = false;
         reset_last_bail_reason();
         // Every lowering attempt below for this form reports a failed
@@ -12087,6 +12152,8 @@ pub fn build_bbu_from_forms(
         if let Some(package) = super::compile_file_in_package_name(form) {
             let name_ref = pool.string(&package);
             load_actions.push((12, 0, name_ref, BBU_NO_INDEX, BBU_NO_INDEX));
+            form_results.push(Some(load_actions.len() - 1));
+            form_action_ends.push(load_actions.len());
             continue;
         }
 
@@ -12110,6 +12177,7 @@ pub fn build_bbu_from_forms(
                 .collect::<Vec<_>>();
             let uses_ref = pool.vector(&use_refs);
             let exports_ref = pool.vector(&export_refs);
+            explicit_result = Some(load_actions.len());
             load_actions.push((1, 0, package_ref, uses_ref, exports_ref));
             for name in plan.interns {
                 let name_ref = pool.string(&name);
@@ -12319,8 +12387,21 @@ pub fn build_bbu_from_forms(
             }
             return Ok(None);
         }
+        form_results.push(explicit_result.or_else(||
+            (load_actions.len() > action_start).then(|| load_actions.len() - 1)));
+        form_action_ends.push(load_actions.len());
     }
 
+    let mut print_groups = Vec::with_capacity(source_group_ends.len());
+    let mut previous_end = 0;
+    for &end in source_group_ends {
+        let result = if end > previous_end { form_results[end - 1] } else { None };
+        print_groups.push(BbuPrintGroup {
+            end: form_action_ends[end] as u32,
+            result: result.map_or(BBU_NO_INDEX, |index| index as u32),
+        });
+        previous_end = end;
+    }
     let mut out = Vec::new();
     out.extend_from_slice(BBU_MAGIC);
     put_u16(&mut out, BBU_BYTECODE_VERSION);
@@ -12329,7 +12410,7 @@ pub fn build_bbu_from_forms(
     put_u32(&mut out, pool.entries.len() as u32);
     put_u32(&mut out, functions.len() as u32);
     put_u32(&mut out, load_actions.len() as u32);
-    put_u32(&mut out, 5 + u32::from(functions.iter().any(|f| !f.notinline_sites.is_empty())));
+    put_u32(&mut out, 6 + u32::from(functions.iter().any(|f| !f.notinline_sites.is_empty())));
     put_u32(&mut out, source_file_ref);
     put_u64(&mut out, fnv1a64(source.as_bytes()));
 
@@ -12378,6 +12459,11 @@ pub fn build_bbu_from_forms(
     put_u16(&mut out, 0);
     put_u32(&mut out, handler_binds.len() as u32);
     out.extend_from_slice(&handler_binds);
+    let groups = serialize_bbu_print_groups(&print_groups);
+    put_u16(&mut out, BBU_AUX_TOPLEVEL_RESULTS);
+    put_u16(&mut out, 0);
+    put_u32(&mut out, groups.len() as u32);
+    out.extend_from_slice(&groups);
     Ok(Some(out))
 }
 
@@ -16267,6 +16353,7 @@ fn load_bbu_definitions(bytes: &[u8], env: &mut Env, restoring: bool) -> Result<
     let mut handler_bind_tables = None;
     let mut self_call_tables = None;
     let mut notinline_tables = None;
+    let mut print_groups = None;
     for _ in 0..aux_count {
         let kind = cursor.u16()?;
         let flags = cursor.u16()?;
@@ -16294,6 +16381,9 @@ fn load_bbu_definitions(bytes: &[u8], env: &mut Env, restoring: bool) -> Result<
                 return Err(bbu_error("duplicate handler-case metadata"));
             }
             handler_case_tables = Some(parse_bbu_handler_cases(bytes, function_count)?);
+        } else if kind == BBU_AUX_TOPLEVEL_RESULTS {
+            if print_groups.is_some() { return Err(bbu_error("duplicate top-level result groups")); }
+            print_groups = Some(parse_bbu_print_groups(bytes, &actions)?);
         } else if kind == BBU_AUX_HANDLER_BINDS {
             if handler_bind_tables.is_some() {
                 return Err(bbu_error("duplicate handler-bind metadata"));
@@ -16665,7 +16755,15 @@ fn load_bbu_definitions(bytes: &[u8], env: &mut Env, restoring: bool) -> Result<
 
     let mut last = NIL;
     egcl_rt::rooted_ref!(_last_root = &mut last);
-    for action in actions {
+    let mut group_result = NIL;
+    egcl_rt::rooted_ref!(_group_result_root = &mut group_result);
+    let groups = print_groups.unwrap_or_default();
+    let mut next_group = 0;
+    while groups.get(next_group).is_some_and(|group| group.end == 0) {
+        if !restoring { super::print_loaded_value(NIL, env)?; }
+        next_group += 1;
+    }
+    for (action_index, action) in actions.into_iter().enumerate() {
         match action.kind {
             12 => {
                 let name = bbu_string(&encoded_constants, action.arg0)?;
@@ -16803,6 +16901,14 @@ fn load_bbu_definitions(bytes: &[u8], env: &mut Env, restoring: bool) -> Result<
                     .insert(action.arg1, Arc::clone(body));
             }
             _ => unreachable!("load actions were verified above"),
+        }
+        if groups.get(next_group).is_some_and(|group| group.result as usize == action_index) {
+            group_result = last;
+        }
+        while groups.get(next_group).is_some_and(|group| group.end as usize == action_index + 1) {
+            if !restoring { super::print_loaded_value(group_result, env)?; }
+            group_result = NIL;
+            next_group += 1;
         }
     }
     Ok(last)
@@ -31418,3 +31524,61 @@ fn mixed_local_sibling_inlines_a_transitive_capture() {
 
 #[cfg(test)]
 mod packed_u8_persistence_tests;
+
+#[cfg(test)]
+mod compile_file_print_group_tests {
+    use super::*;
+
+    fn actions() -> Vec<BbuLoadAction> {
+        [1, 2, 7]
+            .into_iter()
+            .map(|kind| BbuLoadAction {
+                kind,
+                flags: 0,
+                arg0: 0,
+                arg1: 0,
+                arg2: 0,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn group_result_precedes_internal_setup_and_empty_group_is_nil() {
+        let groups = [
+            BbuPrintGroup { end: 2, result: 0 },
+            BbuPrintGroup { end: 3, result: 2 },
+            BbuPrintGroup {
+                end: 3,
+                result: BBU_NO_INDEX,
+            },
+        ];
+        let decoded =
+            parse_bbu_print_groups(&serialize_bbu_print_groups(&groups), &actions()).unwrap();
+        assert_eq!(decoded.len(), 3);
+        assert_eq!(decoded[0].result, 0);
+        assert_eq!(decoded[2].result, BBU_NO_INDEX);
+        assert!(validate_bbu_aux_flags(BBU_AUX_TOPLEVEL_RESULTS, 0).is_ok());
+        assert!(validate_bbu_aux_flags(BBU_AUX_TOPLEVEL_RESULTS, 1).is_err());
+    }
+
+    #[test]
+    fn malformed_group_metadata_cannot_select_internal_or_prior_actions() {
+        for groups in [
+            vec![BbuPrintGroup { end: 3, result: 1 }],
+            vec![BbuPrintGroup { end: 4, result: 2 }],
+            vec![
+                BbuPrintGroup { end: 2, result: 0 },
+                BbuPrintGroup { end: 3, result: 0 },
+            ],
+            vec![BbuPrintGroup { end: 2, result: 0 }],
+        ] {
+            assert!(
+                parse_bbu_print_groups(&serialize_bbu_print_groups(&groups), &actions()).is_err()
+            );
+        }
+        let mut encoded = serialize_bbu_print_groups(&[BbuPrintGroup { end: 3, result: 2 }]);
+        encoded.push(0);
+        assert!(parse_bbu_print_groups(&encoded, &actions()).is_err());
+        assert!(parse_bbu_print_groups(&encoded[..7], &actions()).is_err());
+    }
+}

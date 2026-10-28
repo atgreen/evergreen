@@ -20,6 +20,19 @@ fn is_standard_reader_stand_in(function: EgclVal, installed: EgclVal, stand_in: 
         || installed_function(index).is_some_and(|f| f == installed)
 }
 
+fn ordinary_standard_reader_name(ch: char) -> Option<&'static str> {
+    Some(match ch {
+        '(' => "EGCL::%STANDARD-LIST-READER",
+        ')' => "EGCL::%STANDARD-CLOSE-READER",
+        '\'' => "EGCL::%STANDARD-QUOTE-READER",
+        '"' => "EGCL::%STANDARD-STRING-READER",
+        ';' => "EGCL::%STANDARD-COMMENT-READER",
+        '`' => "EGCL::%STANDARD-BACKQUOTE-READER",
+        ',' => "EGCL::%STANDARD-COMMA-READER",
+        _ => return None,
+    })
+}
+
 pub(super) fn pprint_layout_events(
     list: EgclVal,
 ) -> Result<Vec<egcl_stdlib::format::LayoutEvent>, EgclError> {
@@ -900,6 +913,13 @@ fn resolve(name: &str) -> Option<Handler> {
                 .copied()
                 .filter(|v| v.is_heap_object())
                 .unwrap_or_else(cli_current_readtable);
+            for source in ['(', ')', '\'', '"', ';', '`', ','] {
+                if is_standard_reader_stand_in(args[1], *handler,
+                    ordinary_standard_reader_name(source).unwrap()) {
+                    reader::set_standard_macro_alias(rt, args[0].as_char(), source, non_term);
+                    return Ok(T);
+                }
+            }
             // The stand-in GET-MACRO-CHARACTER reports for a standard macro
             // character, put back on that same character, means its built-in
             // syntax (see reader::set_standard_macro_syntax).
@@ -949,16 +969,40 @@ fn resolve(name: &str) -> Option<Handler> {
                 // No custom handler: report the built-in macro function for a
                 // standard macro character as an fbound placeholder symbol
                 // (get-macro-character.1/.3 only check functionp/fboundp).
-                _ => match reader::standard_macro_char(ch) {
-                    Some(standard_nt) => (
-                        resolve_sym("EGCL::%STANDARD-READER-MACRO").unwrap_or(NIL),
-                        standard_nt,
-                    ),
+                _ => match reader::standard_macro_source(rt, ch) {
+                    Some((source, standard_nt)) => {
+                        let name = resolve_sym(ordinary_standard_reader_name(source)
+                            .unwrap_or("EGCL::%STANDARD-READER-MACRO")).unwrap_or(NIL);
+                        (symbol_function_object(env, name).unwrap_or(NIL), standard_nt)
+                    }
                     None => (NIL, false),
                 },
             };
             env.set_mv(vec![f, if nt { T } else { NIL }]);
             Ok(f)
+        }),
+
+        "EGCL::%READ-STANDARD-MACRO" => Some(|_operator, args, env| {
+            let args = RootedVals::new(args.to_vec());
+            if args.len() != 3 || !args[1].is_character() || !args[2].is_character() {
+                return Err(EgclError::ProgramError("standard reader requires stream, source and invocation characters".into()));
+            }
+            let mut stream = args[0];
+            egcl_rt::rooted_ref!(_stream_root = &mut stream);
+            let read_base = env.lookup_var("*READ-BASE*").filter(|v| v.is_fixnum())
+                .map(|v| v.as_fixnum() as u32).filter(|b| (2..=36).contains(b)).unwrap_or(10);
+            let read_eval = env.lookup_var("*READ-EVAL*").is_none_or(|v| v != NIL);
+            sync_reader_float_format(env);
+            let previous_env = READ_EVAL_ENV.with(|slot| slot.replace(env as *mut Env));
+            let result = reader::read_standard_macro_from_stream(
+                &mut LispReaderStream { stream: &mut stream, env },
+                args[1].as_char(), args[2].as_char(), read_base, read_eval,
+            );
+            READ_EVAL_ENV.with(|slot| slot.set(previous_env));
+            let values = result?;
+            let primary = values.first().copied().unwrap_or(NIL);
+            env.set_mv(values);
+            Ok(primary)
         }),
 
         "EGCL::%COPY-READTABLE" => Some(|_operator, args, _env| {
@@ -5533,6 +5577,20 @@ fn resolve(name: &str) -> Option<Handler> {
                     }
                 }
             }
+            // Keyword options are dynamic so nested LOAD calls inherit them;
+            // the caller's bindings are restored on success and error.
+            let mut option_bindings = Vec::new();
+            egcl_rt::rooted_ref!(_option_roots = &mut option_bindings);
+            for (keyword, variable) in [("VERBOSE", "*LOAD-VERBOSE*"), ("PRINT", "*LOAD-PRINT*")] {
+                if let Some(pair) = args[1..].chunks(2).find(|pair| {
+                    is_keyword_arg(pair[0]) && sym_bare_name_rc(pair[0]).as_ref() == keyword
+                }) {
+                    let symbol = resolve_sym(variable).ok_or_else(|| {
+                        EgclError::Internal(format!("LOAD: {variable} is unavailable"))
+                    })?;
+                    option_bindings.push(DynBind::establish(symbol, pair[1]));
+                }
+            }
             let mut path_val = args[0];
             egcl_rt::rooted_ref!(_path_root = &mut path_val);
             // :if-does-not-exist nil → return NIL for a missing file instead
@@ -5578,6 +5636,10 @@ fn resolve(name: &str) -> Option<Handler> {
                 // CURRENT_PACKAGE as well as the value cell: it is the reader's
                 // bare-symbol resolution context and what the prompt shows, and
                 // the two are kept in step deliberately (bliss-lb6.12).
+                let mut readtable_binding = egcl_rt::symbols::find_index("*READTABLE*").map(|index| {
+                    DynBind::establish(EgclVal::from_symbol_index(index), cli_current_readtable())
+                });
+                egcl_rt::rooted_ref!(_readtable_binding_root = &mut readtable_binding);
                 let saved_package = env.current_package.clone();
                 // And a real dynamic binding of *PACKAGE*, as for a file LOAD
                 // (see `load_path_into_env`), so another thread's write to the
@@ -5587,7 +5649,13 @@ fn resolve(name: &str) -> Option<Handler> {
                 let dynamic_package = global_value_cell(package_symbol.as_symbol_index())
                     .unwrap_or(egcl_rt::value::UNBOUND);
                 egcl_rt::rooted!(_package_binding = DynBind::establish(package_symbol, dynamic_package));
-                let result = read_eval_all_env(&contents, env);
+                if env.lookup_var("*LOAD-VERBOSE*").is_some_and(|v| v != NIL) {
+                    egcl_rt::rooted!(output = env.lookup_var("*STANDARD-OUTPUT*").unwrap_or(T));
+                    egcl_stdlib::format(*output, "; Loading stream~%", &[])?;
+                }
+                let result = with_eval_context(env, EvalContext::Load, |env| {
+                    read_eval_all_env(&contents, env)
+                });
                 if env.current_package != saved_package {
                     env.current_package = saved_package.clone();
                     env.define_local("*PACKAGE*", package_object(&saved_package));
@@ -5661,7 +5729,8 @@ fn resolve(name: &str) -> Option<Handler> {
             // and it was previously ACCEPTED AND SILENTLY IGNORED — the
             // compile overwrote the default output path (bliss-m1a).
             if i < args.len() && !args[i].is_symbol() {
-                out_path = Some(path_designator_to_string(args[i])?);
+                egcl_rt::rooted!(pathname = resolve_against_dpd(args[i], env)?);
+                out_path = Some(path_designator_to_string(*pathname)?);
                 i += 1;
             }
             // The remaining tail must be a well-formed &key list (output-file
@@ -5672,6 +5741,8 @@ fn resolve(name: &str) -> Option<Handler> {
                     "COMPILE-FILE: odd number of &KEY arguments".into(),
                 ));
             }
+            let mut verbose = None;
+            let mut print = None;
             while i + 1 < args.len() {
                 let key = args[i];
                 let val = args[i + 1];
@@ -5681,10 +5752,26 @@ fn resolve(name: &str) -> Option<Handler> {
                         format_val(key)
                     )));
                 }
-                if sym_bare_name_rc(key).as_ref() == "OUTPUT-FILE" && val != NIL {
-                    out_path = Some(path_designator_to_string(val)?);
+                if sym_bare_name_rc(key).as_ref() == "OUTPUT-FILE" && val != NIL && out_path.is_none() {
+                    egcl_rt::rooted!(pathname = resolve_against_dpd(val, env)?);
+                    out_path = Some(path_designator_to_string(*pathname)?);
+                }
+                if is_keyword_arg(key) {
+                    match sym_bare_name_rc(key).as_ref() {
+                        "VERBOSE" => { verbose.get_or_insert(val != NIL); }
+                        "PRINT" => { print.get_or_insert(val != NIL); }
+                        _ => {}
+                    }
                 }
                 i += 2;
+            }
+            let mut print_binding = None;
+            egcl_rt::rooted_ref!(_print_binding_root = &mut print_binding);
+            if let Some(value) = print {
+                let symbol = resolve_sym("*COMPILE-PRINT*").ok_or_else(|| {
+                    EgclError::Internal("COMPILE-FILE: *COMPILE-PRINT* is unavailable".into())
+                })?;
+                print_binding = Some(DynBind::establish(symbol, if value { T } else { NIL }));
             }
             let out_path = out_path.unwrap_or_else(|| {
                 // CLHS 3.2.3: COMPILE-FILE's default output MUST equal
@@ -5706,10 +5793,9 @@ fn resolve(name: &str) -> Option<Handler> {
             // SBCL). Only fires when compilation actually happens — ASDF
             // calls COMPILE-FILE only for a missing/stale fasl — so warm
             // loads stay silent.
-            let compile_verbose = env
-                .lookup_var("*COMPILE-VERBOSE*")
-                .map(|v| !v.is_nil())
-                .unwrap_or(true);
+            let compile_verbose = verbose.unwrap_or_else(|| {
+                env.lookup_var("*COMPILE-VERBOSE*").is_none_or(|v| v != NIL)
+            });
             let compile_start = std::time::Instant::now();
             if compile_verbose {
                 let written = std::fs::metadata(&src_path)
@@ -5718,7 +5804,9 @@ fn resolve(name: &str) -> Option<Handler> {
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                     .map(|d| format!(" (written {})", format_compile_note_date(d.as_secs())))
                     .unwrap_or_default();
-                println!("; compiling file \"{src_path}\"{written}:");
+                egcl_rt::rooted!(output = env.lookup_var("*STANDARD-OUTPUT*").unwrap_or(T));
+                egcl_rt::rooted!(note = arena_str(&format!("; compiling file \"{src_path}\"{written}:\n")));
+                egcl_stdlib::format(*output, "~A", &[*note])?;
             }
             // ANSI COMPILE-FILE binds *PACKAGE* (and *READTABLE*) for the
             // dynamic extent of the compilation (CLHS 3.2.1), so a file's
@@ -5728,6 +5816,10 @@ fn resolve(name: &str) -> Option<Handler> {
             // compilation is done (mirrors LOAD in load_path_into_env), and
             // bind it dynamically for the extent so the file's package lives in
             // this thread's binding, not in the global value other threads share.
+            let mut readtable_binding = egcl_rt::symbols::find_index("*READTABLE*").map(|index| {
+                DynBind::establish(EgclVal::from_symbol_index(index), cli_current_readtable())
+            });
+            egcl_rt::rooted_ref!(_readtable_binding_root = &mut readtable_binding);
             let saved_package = env.current_package.clone();
             let compile_package_symbol = resolve_sym("*PACKAGE*").ok_or_else(|| {
                 EgclError::Internal("COMPILE-FILE: *PACKAGE* is unavailable".into())
@@ -5782,14 +5874,12 @@ fn resolve(name: &str) -> Option<Handler> {
             if compile_verbose {
                 let el = compile_start.elapsed();
                 let secs = el.as_secs();
-                println!("; wrote {out_path}");
-                println!(
-                    "; compilation finished in {}:{:02}:{:02}.{:03}",
-                    secs / 3600,
-                    (secs % 3600) / 60,
-                    secs % 60,
-                    el.subsec_millis()
-                );
+                egcl_rt::rooted!(output = env.lookup_var("*STANDARD-OUTPUT*").unwrap_or(T));
+                egcl_rt::rooted!(note = arena_str(&format!(
+                    "; wrote {out_path}\n; compilation finished in {}:{:02}:{:02}.{:03}\n",
+                    secs / 3600, (secs % 3600) / 60, secs % 60, el.subsec_millis()
+                )));
+                egcl_stdlib::format(*output, "~A", &[*note])?;
             }
             let (out_pn, _) = egcl_stdlib::parse_namestring(arena_str(&out_path), None, None)?;
             // An ERROR reported during compilation makes both WARNINGS-P and
