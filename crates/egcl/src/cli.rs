@@ -20762,6 +20762,9 @@ fn mv_operator_preserves(name: &str) -> bool {
             | "MACROEXPAND-1"
             | "EGCL::%MACROEXPAND-PLACE"
             | "GET-MACRO-CHARACTER"
+            // A comment reader consumes input and returns zero values. Keep
+            // that distinct from one NIL when its Lisp wrapper returns.
+            | "EGCL::%READ-STANDARD-MACRO"
             | "GET-PROPERTIES"
             | "GET-SETF-EXPANSION"
             | "EGCL-EXT:RUN-PROGRAM"
