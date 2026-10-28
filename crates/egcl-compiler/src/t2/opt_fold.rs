@@ -55,9 +55,11 @@
 //! `i128` and a result outside that range is **not** folded; the instruction
 //! is left for the generic or guarded path rather than wrapping. Division,
 //! remainder and modulus by a constant zero are never folded: the runtime
-//! must signal. `FixnumShl` folds only for shift counts in `0..63`,
-//! `FixnumShr` in `0..64`. `cl_mod` implements CL `MOD` (remainder with the
-//! divisor's sign) for the constant path.
+//! must signal. `FixnumShl` folds counts in `0..63` as left shifts and any
+//! NEGATIVE count as an arithmetic right shift, because `(ash x -n)` lowers to
+//! `FixnumShl` with a negative constant; `FixnumShr` folds `0..64`. `cl_mod`
+//! implements CL `MOD` (remainder with the divisor's sign) for the constant
+//! path.
 //!
 //! # Guards on reduced instructions
 //!
@@ -219,6 +221,27 @@ impl Pass for ConstFold {
                             FixnumMod if y != 0 => in_fixnum_range(cl_mod(x, y)).map(Fold::Fix),
                             FixnumShl if (0..63).contains(&y) => {
                                 in_fixnum_range((x as i128) << y).map(Fold::Fix)
+                            }
+                            // A NEGATIVE count is a RIGHT shift. That is how
+                            // `(ash x -n)` lowers: ASH becomes `FixnumShl`
+                            // whatever the sign and each emitter reads the
+                            // constant to choose a direction. Folding only the
+                            // non-negative half was not merely a missed
+                            // optimisation -- `emit_fixnum_inst` declines a
+                            // binary op with two constant operands on the
+                            // premise that the mid-end folded it, so
+                            // `(ash 12345 -3)` in a hot function cost the WHOLE
+                            // function its T2 code: measured at 3696 ms against
+                            // a 4 ms baseline, 924x, on x86-64 (bliss-w0adt).
+                            //
+                            // Saturating the count is exact rather than
+                            // defensive: a fixnum payload is 61 bits, so any
+                            // shift at or past that yields 0 or -1 and every
+                            // larger count gives the same answer -- which is
+                            // also why the emitters saturate.
+                            FixnumShl if y < 0 => {
+                                let count = (-(y as i128)).min(127) as u32;
+                                in_fixnum_range((x as i128) >> count).map(Fold::Fix)
                             }
                             FixnumShr if (0..64).contains(&y) => {
                                 in_fixnum_range((x as i128) >> y).map(Fold::Fix)
@@ -680,6 +703,50 @@ mod tests {
             Opcode::FixnumAdd,
             "MAX+1 must not wrap"
         );
+    }
+
+    /// `(ash x -n)` lowers to `FixnumShl` with a NEGATIVE constant, so a
+    /// constant one must fold as an arithmetic right shift. Leaving it unfolded
+    /// was not a missed optimisation: `emit_fixnum_inst` declines a binary op
+    /// with two constant operands on the premise that the mid-end folded it, so
+    /// `(ash 12345 -3)` in a hot function cost the whole function its T2 code
+    /// -- measured at 924x the baseline on x86-64 (bliss-w0adt).
+    #[test]
+    fn folds_negative_shift_counts_as_right_shifts() {
+        // The reproducer's own numbers, then the sign and saturation cases a
+        // right shift gets wrong: a negative value must round toward negative
+        // infinity, as an arithmetic shift does and CL's ASH requires, and a
+        // count past the payload width must answer 0 or -1 rather than wrap.
+        for (value, count, expected) in [
+            (12345_i64, -3_i64, 1543_i64),
+            (-17, -2, -5),
+            (8, -3, 1),
+            (7, -3, 0),
+            (-1, -1, -1),
+            (-1, -200, -1),
+            (1, -200, 0),
+            (FIXNUM_MAX, -59, 1),
+            (FIXNUM_MAX, -60, 0),
+        ] {
+            let mut f = Function::new("ash-negative");
+            let e = f.entry();
+            let x = const_fixnum(&mut f, e, value);
+            let n = const_fixnum(&mut f, e, count);
+            let (shift, _) = binop(&mut f, e, Opcode::FixnumShl, vec![x, n]);
+            ret(&mut f, e);
+            run(&mut f);
+            let d = f.inst(shift);
+            assert_eq!(
+                d.opcode,
+                Opcode::ConstFixnum,
+                "(ash {value} {count}) did not fold"
+            );
+            assert!(
+                matches!(d.aux, AuxData::FixnumImm(got) if got == expected),
+                "(ash {value} {count}) folded to {:?}, expected {expected}",
+                d.aux
+            );
+        }
     }
 
     // FixnumMul(x, 8) strength-reduces to FixnumShl(x, 3).
