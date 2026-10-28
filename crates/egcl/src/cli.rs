@@ -13893,16 +13893,19 @@ fn tree_closure_tier_up(id: u64, env: &Env) -> Option<EgclVal> {
         entry.settled = true;
     }
     let Some(mut closure) = env.closures.borrow().get(&id).cloned() else {
-        egcl_rt::blog!("compile", "closure {id}: tiering declined: missing source registry entry");
+        egcl_rt::blog!("compile", egcl_rt::log::TRACE,
+            "closure {id}: tiering declined: missing source registry entry");
         return None;
     };
     egcl_rt::rooted_ref!(_closure_root = &mut closure);
     let Some(funs) = closure.captured_funs.clone() else {
-        egcl_rt::blog!("compile", "closure {id}: tiering declined: no captured function namespace");
+        egcl_rt::blog!("compile", egcl_rt::log::TRACE,
+            "closure {id}: tiering declined: no captured function namespace");
         return None;
     };
     if !closure.captured_specials.is_empty() || !funs.borrow().is_empty() {
-        egcl_rt::blog!("compile", "closure {id}: tiering declined: {} captured special declarations, {} local functions",
+        egcl_rt::blog!("compile", egcl_rt::log::TRACE,
+            "closure {id}: tiering declined: {} captured special declarations, {} local functions",
             closure.captured_specials.len(), funs.borrow().len());
         return None;
     }
