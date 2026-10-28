@@ -164,3 +164,62 @@ fn a_left_shift_that_leaves_fixnum_range_still_answers() {
         );
     }
 }
+
+/// A shift whose VALUE and COUNT are both constant must still answer, and must
+/// not cost its function the top tier.
+///
+/// This one is not about an emitter arm at all, which is why it is easy to miss
+/// from either side. `opt_fold` folded `FixnumShl` only for non-negative
+/// counts, but `(ash x -n)` lowers to `FixnumShl` with a NEGATIVE constant --
+/// and `emit.rs` declines a binary op whose both operands are constant, on the
+/// documented premise that the mid-end already folded it. So `(ash 12345 -3)`
+/// in a hot function refused `FixnumShl` and the whole function stayed at T1:
+/// measured on x86-64 at 3696 ms against a 4 ms baseline for the same loop
+/// counting with `+`, i.e. 924x, and 5 ms once folded (bliss-w0adt).
+///
+/// A timing assertion would be flaky, so this checks the answers across tiers
+/// and leaves the speed to the bead. The cases are the ones a right-shift fold
+/// gets wrong: a negative value must round toward negative infinity as CL's
+/// ASH requires, a count past the 61-bit payload must saturate to 0 or -1
+/// rather than wrap, and a result that leaves fixnum range must NOT fold.
+#[test]
+fn shifts_of_two_constants_agree_at_every_tier() {
+    let program = r#"
+      (defun k () (ash 12345 -3))
+      (defun j () (list (ash 1 0) (ash 5 3) (ash -5 3)
+                        (ash -17 -2) (ash 7 -3) (ash -1 -1)
+                        (ash 1 -200) (ash -1 -200)
+                        (ash 1152921504606846975 -60)
+                        (ash 1 100) (ash 1152921504606846975 2)))
+      (dotimes (i 3000) (k) (j))
+      (format t "K ~a~%" (k))
+      (format t "J ~{~a~^ ~}~%" (j))
+    "#;
+    for tier in ["interp", "t0", "t1", "t2"] {
+        let out = Command::new(BIN)
+            .args(["--no-init", "--eval", program])
+            .env("EGCL_FORCE_TIER", tier)
+            .output()
+            .expect("run egcl");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "tier={tier}: {stdout}\n{stderr}");
+        for line in [
+            "K 1543",
+            // (ash 1 0)=1, (ash 5 3)=40, (ash -5 3)=-40; then the negative
+            // counts: -17>>2 floors to -5, 7>>3 to 0, -1>>1 stays -1; the
+            // saturating pair; (2^60-1)>>60 = 0; and the two that leave fixnum
+            // range and must answer as bignums rather than fold.
+            "J 1 40 -40 -5 0 -1 0 -1 0 \
+             1267650600228229401496703205376 4611686018427387900",
+        ] {
+            let want: String = line.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(
+                stdout
+                    .lines()
+                    .any(|l| l.split_whitespace().collect::<Vec<_>>().join(" ") == want),
+                "tier={tier}: missing {want:?} in:\n{stdout}\n{stderr}"
+            );
+        }
+    }
+}
