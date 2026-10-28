@@ -10,6 +10,11 @@
 
 ### Changed
 
+- Source closures inside unused lexical function bindings can enter tiered
+  compilation, including generated string encoders and counters; closures that
+  reference those bindings retain their lexical behavior
+  ([#759](https://github.com/atgreen/evergreen/pull/759)).
+
 - AArch64 T2 reads a character from a simple string inline instead of calling
   the runtime, so `CHAR`, `SCHAR` and `ELT` cost 32x less per access and a
   character-scanning loop runs 2.6x faster
