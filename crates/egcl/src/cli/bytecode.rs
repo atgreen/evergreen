@@ -14454,7 +14454,7 @@ static LAZY_DECLINED: egcl_rt::execution_local::ExecutionLocal<
 /// EAGER-compiles them and defers only straight-line/leaf functions, which is
 /// what removes the asdf load penalty without losing hot-loop tiering (the
 /// stage-5 gate) (bliss-x5y).
-fn body_contains_loop(body: EgclVal) -> bool {
+pub(super) fn body_contains_loop(body: EgclVal) -> bool {
     fn walk(v: EgclVal, depth: u32) -> bool {
         if depth > 400 {
             return true; // deep/odd form — err toward eager
@@ -15059,6 +15059,44 @@ pub(super) fn compile_tree_closure(
     }
     egcl_rt::rooted_ref!(_lambda_list_root = &mut lambda_list);
     egcl_rt::rooted_ref!(_body_root = &mut body);
+    // Keep the original source as the callable's interpreter fallback. The
+    // compiler works on a separately rooted expansion in its definition-site
+    // environment, exactly as other lambda compilation paths do.
+    egcl_rt::rooted!(source_lambda_list = lambda_list);
+    egcl_rt::rooted!(source_body = body);
+    static PREEXPAND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *PREEXPAND.get_or_init(|| {
+        std::env::var_os("EGCL_DISABLE_TREE_CLOSURE_EXPANSION").is_none()
+    }) {
+        // Expand the whole LAMBDA so its parameters shadow symbol macros and
+        // its declarations and local macro scopes remain visible. In
+        // particular, registered SETF expanders must run before the lowerer's
+        // primitive-place selection. A CFFI MEM-REF place is one such user
+        // expander; no library-specific operation is recognized here.
+        let lambda_symbol = resolve_sym("LAMBDA")?;
+        egcl_rt::rooted!(tail = arena_cons(lambda_list, body));
+        egcl_rt::rooted!(lambda = arena_cons(lambda_symbol, *tail));
+        let mut macro_env = super::macroexpand_environment_from_cli(compile_env);
+        egcl_rt::rooted_ref!(_macro_env_root = &mut macro_env);
+        let suspended = suspend_file_expansion_errors();
+        let expansion = super::with_macroexpand_dynamic_context(compile_env, || {
+            compiler_macroexpand::macroexpand_all(*lambda, &macro_env)
+        });
+        drop(suspended);
+        egcl_rt::rooted!(expanded = match expansion {
+            Ok(expanded) => expanded,
+            Err(error) => {
+                log_not_compiled(label, &format!("closure macroexpansion: {error}"));
+                return None;
+            }
+        });
+        let (head, rest) = cp(*expanded);
+        if head != lambda_symbol || !rest.is_cons() {
+            log_not_compiled(label, "closure macroexpansion did not retain a lambda");
+            return None;
+        }
+        (lambda_list, body) = cp(rest);
+    }
     let captures = frame_capture_names(Arc::clone(&frame));
     let enclosing_blocks: std::collections::HashSet<String> =
         blocks.iter().map(|(name, _)| name.clone()).collect();
@@ -15122,7 +15160,8 @@ pub(super) fn compile_tree_closure(
             .insert(sym_idx, (blocks.to_vec(), tags.to_vec()));
     }
     // Keep the source as the object's fallback body, as a reified method does.
-    let function = egcl_rt::function::alloc_interpreted(lambda_list, body, NIL, sym);
+    let function =
+        egcl_rt::function::alloc_interpreted(*source_lambda_list, *source_body, NIL, sym);
     // The tiering counters are found through the private symbol's function
     // cell (see compile_and_reify_lambda); nothing can name the symbol.
     egcl_rt::symbols::set_symbol_function(sym_idx, function);
