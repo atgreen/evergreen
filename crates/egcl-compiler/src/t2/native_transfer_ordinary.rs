@@ -158,6 +158,7 @@ fn emit(helper: OrdinaryPublishedHelper, expected: Option<usize>) -> Vec<u8> {
 /// runtime clears the table's meaning at each collection by moving the
 /// `collections` stamp, so `function` is compared, never dereferenced.
 #[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct OrdinaryFuncallProbeEntry {
     /// Bits of the function object this entry selects for.
     pub function: u64,

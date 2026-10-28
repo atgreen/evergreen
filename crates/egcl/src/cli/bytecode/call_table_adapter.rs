@@ -51,6 +51,33 @@ impl FuncallProbe {
             rejected: std::cell::Cell::new((NIL.0, usize::MAX, u64::MAX, u64::MAX)),
         }
     }
+
+    fn record(&self, entry: egcl_compiler::t2::native_transfer::OrdinaryFuncallProbeEntry) {
+        let index = if super::super::native_transfer_entry::ordinary_function_designators_enabled() {
+            // A newly selected hot callable should take the first generated
+            // comparison. Coalesce its old slot rather than filling the table
+            // with duplicates when a mapped caller repeatedly records it.
+            let previous = self.entries.iter().position(|slot| unsafe {
+                (*slot.get()).function == entry.function
+            }).unwrap_or(self.entries.len() - 1);
+            if previous == 0 && unsafe { *self.entries[0].get() == entry } {
+                return;
+            }
+            for index in (1..=previous).rev() {
+                // Only this execution writes, without allocating or yielding;
+                // no generated reader can observe this partial permutation.
+                unsafe {
+                    self.entries[index].get().write(*self.entries[index - 1].get());
+                }
+            }
+            0
+        } else {
+            let index = self.next.get();
+            self.next.set((index + 1) % self.entries.len());
+            index
+        };
+        unsafe { self.entries[index].get().write(entry) };
+    }
 }
 
 /// Record that FUNCALL of `function` with `nargs` actuals runs its named
@@ -132,18 +159,14 @@ fn record_funcall_target(
     if !descriptor.accepts(nargs, ORDINARY_ENV_NONE) {
         return false;
     }
-    let index = probe.next.get();
-    probe.next.set((index + 1) % probe.entries.len());
-    unsafe {
-        probe.entries[index].get().write(egcl_compiler::t2::native_transfer::OrdinaryFuncallProbeEntry {
+    probe.record(egcl_compiler::t2::native_transfer::OrdinaryFuncallProbeEntry {
             function: bits,
             epoch,
             collections,
             revision_address: cell.revision_address() as u64,
             revision: descriptor.revision,
             descriptor: pointer as u64,
-        });
-    }
+    });
     true
 }
 
