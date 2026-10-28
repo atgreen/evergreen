@@ -8,6 +8,7 @@
 use super::{CallCell, linkage};
 use egcl_rt::call_table::{OrdinaryEntryDescriptor, OrdinaryCallHeat};
 use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -24,12 +25,54 @@ struct RetainedEntry<C> {
     callable: Option<Arc<egcl_rt::CrossThreadRoot<egcl_rt::value::EgclVal>>>,
 }
 
+// Every descriptor field participates, just as in its derived equality.
+// Indices/pointers are metadata only; ownership remains exclusively in entries.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct RetainedKey {
+    cell: usize,
+    wide: [u64; 4],
+    native: [usize; 6],
+}
+
+impl RetainedKey {
+    fn new(cell: &Arc<CallCell>, d: OrdinaryEntryDescriptor) -> Self {
+        Self {
+            cell: Arc::as_ptr(cell) as usize,
+            wide: [d.kind, d.version, d.revision, d.environment],
+            native: [
+                d.entry,
+                d.code_start,
+                d.code_len,
+                d.arity,
+                d.owner,
+                d.stack_required,
+            ],
+        }
+    }
+}
+
+// Disjoint address clusters. Identical shared ranges stay uniform and need
+// one index lookup regardless of the number of callable/descriptor aliases.
+// Nonidentical overlapping ranges retain exact first-insertion semantics by
+// searching only their cluster's insertion-ordered members.
+struct PcRange {
+    end: usize,
+    uniform: bool,
+    members: Vec<usize>,
+}
+
 struct RetainedEntries<C> {
     segments: usize,
     // Descriptor addresses are embedded in atomic slots and stay fixed while
     // publication/redefinition grows this directory.
     #[allow(clippy::vec_box)]
     entries: Vec<Box<RetainedEntry<C>>>,
+    by_descriptor: HashMap<RetainedKey, usize>,
+    by_pc: BTreeMap<usize, PcRange>,
+    #[cfg(test)]
+    lookup_candidates: std::cell::Cell<usize>,
+    #[cfg(test)]
+    duplicate_queries: usize,
     /// The publication epoch and entry count the last completed sweep saw.
     /// While both are unchanged a sweep would find every entry still
     /// published, so the outermost segment exit skips it (GitHub #487).
@@ -41,6 +84,12 @@ impl<C> Default for RetainedEntries<C> {
         Self {
             segments: 0,
             entries: Vec::new(),
+            by_descriptor: HashMap::new(),
+            by_pc: BTreeMap::new(),
+            #[cfg(test)]
+            lookup_candidates: std::cell::Cell::new(0),
+            #[cfg(test)]
+            duplicate_queries: 0,
             swept: None,
         }
     }
@@ -84,12 +133,12 @@ impl<C> RetainedEntries<C> {
         if !descriptor.is_compatible() || descriptor.owner != Rc::as_ptr(&code) as usize {
             return None;
         }
-        if let Some(entry) = self
-            .entries
-            .iter()
-            .find(|entry| Arc::ptr_eq(&entry.cell, &cell) && entry.descriptor == descriptor)
+        #[cfg(test)]
         {
-            return Some(&entry.descriptor);
+            self.duplicate_queries += 1;
+        }
+        if let Some(&index) = self.by_descriptor.get(&RetainedKey::new(&cell, descriptor)) {
+            return Some(&self.entries[index].descriptor);
         }
         let entry = Box::new(RetainedEntry {
             descriptor,
@@ -100,7 +149,79 @@ impl<C> RetainedEntries<C> {
         });
         let pointer = std::ptr::from_ref(&entry.descriptor);
         self.entries.push(entry);
+        self.index_entry(self.entries.len() - 1);
         Some(pointer)
+    }
+
+    fn index_entry(&mut self, index: usize) {
+        let entry = &self.entries[index];
+        let d = entry.descriptor;
+        self.by_descriptor
+            .insert(RetainedKey::new(&entry.cell, d), index);
+        let mut start = d.code_start;
+        let mut end = start
+            .checked_add(d.code_len)
+            .expect("compatible descriptor range");
+        if let Some(group) = self.by_pc.get_mut(&start)
+            && group.uniform
+            && group.end == end
+        {
+            group.members.push(index);
+            return;
+        }
+        let mut members = vec![index];
+        let mut uniform = true;
+        let previous = self
+            .by_pc
+            .range(..=start)
+            .next_back()
+            .filter(|(_, group)| group.end > start)
+            .map(|(&key, _)| key);
+        if let Some(key) = previous {
+            let group = self.by_pc.remove(&key).unwrap();
+            start = key;
+            end = end.max(group.end);
+            members.extend(group.members);
+            uniform = false;
+        }
+        loop {
+            let next = self.by_pc.range(start..end).next().map(|(&key, _)| key);
+            let Some(key) = next else {
+                break;
+            };
+            let group = self.by_pc.remove(&key).unwrap();
+            end = end.max(group.end);
+            members.extend(group.members);
+            uniform = false;
+        }
+        if !uniform {
+            members.sort_unstable();
+        }
+        self.by_pc.insert(
+            start,
+            PcRange {
+                end,
+                uniform,
+                members,
+            },
+        );
+    }
+
+    fn first_index_for_pc(&self, pc: usize) -> Option<usize> {
+        let (_, group) = self.by_pc.range(..=pc).next_back()?;
+        if pc >= group.end {
+            return None;
+        }
+        if group.uniform {
+            #[cfg(test)]
+            self.lookup_candidates.set(self.lookup_candidates.get() + 1);
+            return group.members.first().copied();
+        }
+        group.members.iter().copied().find(|&index| {
+            #[cfg(test)]
+            self.lookup_candidates.set(self.lookup_candidates.get() + 1);
+            self.entries[index].descriptor.contains_pc(pc)
+        })
     }
 
     fn sweep(&mut self) {
@@ -108,19 +229,25 @@ impl<C> RetainedEntries<C> {
             return;
         }
         let epoch = linkage::ordinary_epoch();
+        let before = self.entries.len();
         self.entries.retain(|entry| {
             let published =
                 unsafe { &*entry.cell.ordinary_entry_address() }.load(Ordering::Acquire);
             published == std::ptr::from_ref(&entry.descriptor) as usize
         });
+        if self.entries.len() != before {
+            self.by_descriptor.clear();
+            self.by_pc.clear();
+            for index in 0..self.entries.len() {
+                self.index_entry(index);
+            }
+        }
         self.swept = Some((epoch, self.entries.len()));
     }
 
     fn code_for_pc(&self, pc: usize) -> Option<Rc<C>> {
-        self.entries
-            .iter()
-            .find(|entry| entry.descriptor.contains_pc(pc))
-            .map(|entry| Rc::clone(&entry.code))
+        self.first_index_for_pc(pc)
+            .map(|index| Rc::clone(&self.entries[index].code))
     }
 }
 
@@ -210,14 +337,25 @@ impl OrdinaryCodeDirectory {
     }
 
     pub(in crate::cli::bytecode) fn callable_for_pc(
-        &self, pc: usize,
+        &self,
+        pc: usize,
     ) -> Option<Arc<egcl_rt::CrossThreadRoot<egcl_rt::value::EgclVal>>> {
-        self.retained.borrow().entries.iter()
-            .find(|entry| entry.descriptor.contains_pc(pc))
-            .and_then(|entry| entry.callable.clone())
-            .or_else(|| self.roots.borrow().iter()
-                .find(|root| pc.checked_sub(root.start).is_some_and(|offset| offset < root.len))
-                .map(|root| Arc::clone(&root.callable)))
+        {
+            let retained = self.retained.borrow();
+            retained
+                .first_index_for_pc(pc)
+                .and_then(|index| retained.entries[index].callable.clone())
+        }
+        .or_else(|| {
+            self.roots
+                .borrow()
+                .iter()
+                .find(|root| {
+                    pc.checked_sub(root.start)
+                        .is_some_and(|offset| offset < root.len)
+                })
+                .map(|root| Arc::clone(&root.callable))
+        })
     }
 
     pub(in crate::cli::bytecode) fn code_for_pc(&self, pc: usize) -> Option<Rc<TransferCode>> {
@@ -392,8 +530,9 @@ pub(in crate::cli::bytecode) unsafe fn publish_ordinary_with_heat(
         // Retention and publication do not allocate Lisp objects or yield.
         let heat_pointer = {
             let mut retained = directory.retained.borrow_mut();
-            let entry = retained.entries.iter_mut()
-                .find(|entry| std::ptr::eq(&entry.descriptor, pointer)).unwrap();
+            let index = retained.by_descriptor[&RetainedKey::new(&state.cell, descriptor)];
+            let entry = &mut retained.entries[index];
+            debug_assert!(std::ptr::eq(&entry.descriptor, pointer));
             if let Some(mut heat) = heat {
                 heat.descriptor = pointer as usize;
                 if entry.heat.last().is_none_or(|current| **current != heat) {
@@ -526,6 +665,175 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_index_key_preserves_every_descriptor_field_and_cell_identity() {
+        let cell = Arc::new(CallCell::new(0, 11, 12));
+        let other_cell = Arc::new(CallCell::new(0, 11, 12));
+        let owner = Rc::new(());
+        let original = descriptor(&owner, 1, 0x1000);
+        let key = RetainedKey::new(&cell, original);
+        assert_ne!(key, RetainedKey::new(&other_cell, original));
+        for field in 0..10 {
+            let mut changed = original;
+            match field {
+                0 => changed.kind += 1,
+                1 => changed.version += 1,
+                2 => changed.revision += 1,
+                3 => changed.entry += 1,
+                4 => changed.code_start += 1,
+                5 => changed.code_len += 1,
+                6 => changed.arity += 1,
+                7 => changed.environment += 1,
+                8 => changed.owner += 1,
+                9 => changed.stack_required += 8,
+                _ => unreachable!(),
+            }
+            assert_ne!(
+                key,
+                RetainedKey::new(&cell, changed),
+                "descriptor field {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_index_matches_linear_reference_for_mixed_overlaps_and_boundaries() {
+        let cell = Arc::new(CallCell::new(0, 11, 12));
+        let owner = Rc::new(());
+        let mut retained = RetainedEntries::default();
+        let mut seed = 17u64;
+        for revision in 0..200 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let start = 0x1000 + (seed as usize & 0xfff);
+            let mut d = descriptor(&owner, revision, start);
+            d.code_len = 16 + ((seed >> 32) as usize & 0x7f);
+            retained
+                .retain(Arc::clone(&cell), d, Rc::clone(&owner))
+                .unwrap();
+        }
+        for pc in 0xff0..0x2100 {
+            let expected = retained
+                .entries
+                .iter()
+                .position(|entry| entry.descriptor.contains_pc(pc));
+            assert_eq!(retained.first_index_for_pc(pc), expected, "PC {pc:#x}");
+        }
+    }
+
+    #[test]
+    fn ordinary_index_handles_thirteen_thousand_disjoint_and_shared_entries_without_scan() {
+        let cell = Arc::new(CallCell::new(0, 11, 12));
+        let owner = Rc::new(());
+        let mut retained = RetainedEntries::default();
+        const COUNT: usize = 13_000;
+        for index in 0..COUNT {
+            let d = descriptor(&owner, index as u64, 0x1000 + index * 128);
+            let pointer = retained
+                .retain(Arc::clone(&cell), d, Rc::clone(&owner))
+                .unwrap();
+            assert_eq!(
+                retained.retain(Arc::clone(&cell), d, Rc::clone(&owner)),
+                Some(pointer)
+            );
+        }
+        assert_eq!(retained.entries.len(), COUNT);
+        assert_eq!(retained.duplicate_queries, COUNT * 2);
+        for index in 0..COUNT {
+            let start = 0x1000 + index * 128;
+            assert_eq!(retained.first_index_for_pc(start + 1), Some(index));
+            assert_eq!(retained.first_index_for_pc(start + 63), Some(index));
+            assert_eq!(retained.first_index_for_pc(start + 64), None);
+        }
+        assert_eq!(retained.lookup_candidates.get(), COUNT * 2);
+        // Arbitrarily many descriptors/callable aliases of one exact code
+        // range stay in its uniform bucket, rather than becoming an overlap scan.
+        for revision in 0..COUNT {
+            let d = descriptor(&owner, (COUNT + revision) as u64, 0x1000);
+            retained
+                .retain(Arc::clone(&cell), d, Rc::clone(&owner))
+                .unwrap();
+        }
+        assert_eq!(retained.by_pc.len(), COUNT);
+        assert!(retained.by_pc.get(&0x1000).unwrap().uniform);
+        let before = retained.lookup_candidates.get();
+        for _ in 0..COUNT {
+            assert_eq!(retained.first_index_for_pc(0x1010), Some(0));
+        }
+        assert_eq!(retained.lookup_candidates.get() - before, COUNT);
+        assert_eq!(retained.duplicate_queries, COUNT * 3);
+    }
+
+    #[test]
+    fn ordinary_index_overlaps_preserve_first_retained_match_without_penalizing_other_ranges() {
+        let owner = Rc::new(());
+        let cell = Arc::new(CallCell::new(0, 11, 12));
+        let mut retained = RetainedEntries::default();
+        let mut first = descriptor(&owner, 1, 0x1040);
+        first.code_len = 16;
+        retained
+            .retain(Arc::clone(&cell), first, Rc::clone(&owner))
+            .unwrap();
+        let mut enclosing = descriptor(&owner, 2, 0x1000);
+        enclosing.code_len = 256;
+        retained
+            .retain(Arc::clone(&cell), enclosing, Rc::clone(&owner))
+            .unwrap();
+        let mut extension = descriptor(&owner, 3, 0x10f0);
+        extension.code_len = 64;
+        retained
+            .retain(Arc::clone(&cell), extension, Rc::clone(&owner))
+            .unwrap();
+        retained
+            .retain(cell, descriptor(&owner, 4, 0x2000), Rc::clone(&owner))
+            .unwrap();
+        assert_eq!(retained.by_pc.len(), 2);
+        assert!(!retained.by_pc.get(&0x1000).unwrap().uniform);
+        assert_eq!(retained.first_index_for_pc(0x1048), Some(0));
+        assert_eq!(retained.first_index_for_pc(0x1000), Some(1));
+        assert_eq!(retained.first_index_for_pc(0x10ff), Some(1));
+        assert_eq!(retained.first_index_for_pc(0x1100), Some(2));
+        assert_eq!(retained.first_index_for_pc(0x1130), None);
+        let before = retained.lookup_candidates.get();
+        assert_eq!(retained.first_index_for_pc(0x2010), Some(3));
+        assert_eq!(retained.lookup_candidates.get() - before, 1);
+    }
+
+    #[test]
+    fn ordinary_index_sweep_reindexes_survivors_without_retaining_dropped_owners() {
+        let mut retained = RetainedEntries::default();
+        let old = Rc::new(());
+        let old_weak = Rc::downgrade(&old);
+        let live = Rc::new(());
+        let dead_cell = Arc::new(CallCell::new(0, 11, 12));
+        let live_cell = Arc::new(CallCell::new(1, 11, 12));
+        retained.begin_segment();
+        retained
+            .retain(dead_cell, descriptor(&old, 1, 0x1000), old)
+            .unwrap();
+        let d = descriptor(&live, 2, 0x2000);
+        let pointer = retained
+            .retain(Arc::clone(&live_cell), d, Rc::clone(&live))
+            .unwrap();
+        unsafe { &*live_cell.ordinary_entry_address() }.store(pointer as usize, Ordering::Release);
+        retained.sweep();
+        assert!(
+            old_weak.upgrade().is_some(),
+            "suspended segment retains its exact owner"
+        );
+        retained.finish_segment();
+        assert!(old_weak.upgrade().is_none());
+        assert_eq!(retained.first_index_for_pc(0x2010), Some(0));
+        assert!(retained.code_for_pc(0x1010).is_none());
+        assert_eq!(
+            retained.retain(Arc::clone(&live_cell), d, Rc::clone(&live)),
+            Some(pointer)
+        );
+        unsafe { &*live_cell.ordinary_entry_address() }.store(0, Ordering::Release);
+        retained.sweep();
+        assert!(retained.by_pc.is_empty());
+        assert!(retained.by_descriptor.is_empty());
+    }
+
+    #[test]
     fn ordinary_explicit_directory_retains_the_exact_compiled_owner() {
         use crate::cli::{Env, reader};
         use egcl_rt::value::NIL;
@@ -588,6 +896,83 @@ mod tests {
             weak.upgrade().is_none(),
             "directory handle alone does not retain retired code"
         );
+    }
+
+    #[test]
+    fn ordinary_index_first_none_callable_keeps_root_fallback_instead_of_later_entry() {
+        use crate::cli::{Env, reader};
+        use egcl_rt::value::{NIL, T};
+        let _lock = crate::cli::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env = &mut env);
+        egcl_rt::rooted!(forms = reader::read_from_string("(42)").unwrap().0);
+        let body = Arc::new(
+            crate::cli::bytecode::compile_function(
+                "ORDINARY-FIRST-NONE",
+                NIL,
+                *forms,
+                &env,
+                false,
+                false,
+            )
+            .unwrap(),
+        );
+        let code = Rc::new(TransferCode::compile(body).unwrap());
+        let directory = OrdinaryCodeDirectory {
+            retained: RefCell::new(RetainedEntries::default()),
+            roots: RefCell::new(Vec::new()),
+        };
+        let descriptor = OrdinaryEntryDescriptor {
+            kind: linkage::ORDINARY_X64_LISP_KIND,
+            version: linkage::ORDINARY_X64_LISP_VERSION,
+            revision: 1,
+            entry: 0x1010,
+            code_start: 0x1000,
+            code_len: 64,
+            arity: 0,
+            environment: linkage::ORDINARY_ENV_NONE,
+            owner: Rc::as_ptr(&code) as usize,
+            stack_required: 8,
+        };
+        let later = Arc::new(egcl_rt::CrossThreadRoot::new(NIL));
+        directory
+            .retained
+            .borrow_mut()
+            .retain_with_callable(
+                Arc::new(CallCell::new(0, 11, 12)),
+                descriptor,
+                Rc::clone(&code),
+                None,
+            )
+            .unwrap();
+        let mut next = descriptor;
+        next.revision += 1;
+        directory
+            .retained
+            .borrow_mut()
+            .retain_with_callable(
+                Arc::new(CallCell::new(1, 11, 12)),
+                next,
+                Rc::clone(&code),
+                Some(later),
+            )
+            .unwrap();
+        assert!(
+            directory.callable_for_pc(0x1010).is_none(),
+            "first matching None is authoritative"
+        );
+        let fallback = Arc::new(egcl_rt::CrossThreadRoot::new(T));
+        directory.roots.borrow_mut().push(Rc::new(RootIdentity {
+            owner: Rc::as_ptr(&code),
+            start: 0x1000,
+            len: 64,
+            callable: Arc::clone(&fallback),
+        }));
+        let selected = directory.callable_for_pc(0x1010).unwrap();
+        assert!(Arc::ptr_eq(&selected, &fallback));
+        drop(directory.retained.borrow_mut()); // no borrow escapes the lookup
     }
 
     #[test]

@@ -8,6 +8,9 @@
   bytecode compilation, and loop bodies can enter tiered execution on their
   first invocation, including CFFI callbacks
   ([#743](https://github.com/atgreen/evergreen/pull/743)).
+- Native helper publication indexes retained code ranges and descriptors while
+  preserving suspended code ownership and overlapping-range lookup semantics
+  ([#744](https://github.com/atgreen/evergreen/pull/744)).
 
 - Bytecode calls constant quoted global function names directly while retaining
   normal argument evaluation, redefinition and lexical function semantics
