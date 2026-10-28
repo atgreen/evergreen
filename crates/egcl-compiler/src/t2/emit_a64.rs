@@ -820,11 +820,41 @@ impl Emitter<'_> {
         let roots = self.roots.get(&instruction).ok_or(unsupported!())?.clone();
         let root_base = i32::from(self.activation_slots) * 8;
         let argument_base = root_base + i32::from(self.root_slots) * 8;
-        // Clear the unused shadows as well: an earlier call may have had more live
-        // roots or arguments, and dead objects need not be retained indefinitely.
-        self.imm(W0, NIL.0);
-        for index in 0..u32::from(self.root_slots) + u32::from(self.argument_slots) {
-            self.store_at(W0, SLOTS, root_base + index as i32 * 8)?;
+        // Clear the shadows this site does NOT itself write: an earlier call may
+        // have left more live roots or arguments there, and a dead object need
+        // not be retained indefinitely.
+        //
+        // Only the UNWRITTEN suffix of each area, not the whole thing. The
+        // loops below store this site's roots into the first `roots.len()`
+        // root words and, for a `Call`, its arguments into the first
+        // `arguments` argument words, so clearing those first is a dead store
+        // on the path every runtime call takes.
+        //
+        // This buys SIZE, not time, and the measurement is worth recording so
+        // nobody re-derives it: over the 76 tier-corpus functions that reach
+        // AArch64 T2 the emitted code shrank 96,400 to 91,848 bytes (4.7%),
+        // and a call-heavy body with nine shadow words and six safepoints
+        // shrank 12% -- but 5 runs of two million invocations of that body
+        // were indistinguishable from before. The stores hit lines the next
+        // loop writes anyway, so the store buffer absorbs them (bliss-jtohn).
+        // What a runtime call here actually costs is the root save and reload
+        // around it, which is the checked ABI's design, not this loop.
+        let arguments = match data {
+            Some(data) if data.opcode == Opcode::Call => data.args.len(),
+            _ => 0,
+        };
+        let unwritten = (roots.len()..usize::from(self.root_slots))
+            .map(|index| root_base + index as i32 * 8)
+            .chain(
+                (arguments..usize::from(self.argument_slots))
+                    .map(|index| argument_base + index as i32 * 8),
+            )
+            .collect::<Vec<_>>();
+        if !unwritten.is_empty() {
+            self.imm(W0, NIL.0);
+            for offset in unwritten {
+                self.store_at(W0, SLOTS, offset)?;
+            }
         }
         for (index, &value) in roots.iter().enumerate() {
             self.load(value, W0)?;
