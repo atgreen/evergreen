@@ -4,6 +4,10 @@
 
 ### Changed
 
+- T2 uses bounded callee return expectations to choose guarded numeric
+  specializations before first-use arithmetic, while preserving redefinition,
+  effects and runtime checks ([#737](https://github.com/atgreen/evergreen/pull/737)).
+
 - T2 uses inferred numeric types to select arithmetic specializations ahead of
   stale profiles while preserving failed-site feedback and runtime checks
   ([#735](https://github.com/atgreen/evergreen/pull/735)).

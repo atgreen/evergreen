@@ -666,6 +666,9 @@ pub struct OsrEntry {
 /// A block-based SSA function.
 #[derive(Clone, Debug)]
 pub struct Function {
+    /// Expected return formats, never proofs. Only guarded speculation family
+    /// selection may consume these; inference and guard elimination must not.
+    pub(crate) return_type_hints: std::collections::HashMap<Value, IRType>,
     /// Immutable double payloads captured before the compiler releases its GC gate.
     /// Keys are rooted pool-slot addresses, never dereferenced by optimization.
     pub(crate) double_literals: std::collections::HashMap<usize, u64>,
@@ -714,6 +717,7 @@ impl Function {
     /// the builder adds the function parameters as entry-block parameters).
     pub fn new(name: impl Into<String>) -> Function {
         let mut f = Function {
+            return_type_hints: std::collections::HashMap::new(),
             double_literals: std::collections::HashMap::new(),
             blocks: Vec::new(),
             insts: Vec::new(),

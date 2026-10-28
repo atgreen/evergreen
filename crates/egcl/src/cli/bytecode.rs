@@ -22442,6 +22442,8 @@ static T2_COMPLETIONS: egcl_rt::execution_local::ExecutionLocal<
 #[derive(Clone)]
 struct T2BodySnapshot {
     generation: u64,
+    /// Available for guarded return prediction, never body inlining.
+    hint_only: bool,
     snapshot: Option<egcl_compiler::t2::constants::BytecodeSnapshot>,
     symbol: u32,
     body: std::sync::Arc<BytecodeFunction>,
@@ -22517,7 +22519,7 @@ impl T2CompileInput {
         let inline_bodies = self.inline_bodies.iter().map(|saved| {
             sources.push(CompilerSourceBody::capture(saved.symbol, &saved.body));
             let snapshot = if saved.symbol == self.sym { snapshot.clone() } else { BytecodeSnapshot::capture(&saved.body) };
-            T2BodySnapshot { generation: saved.generation, symbol: saved.symbol, body: Arc::clone(&snapshot.body), snapshot: Some(snapshot),
+            T2BodySnapshot { generation: saved.generation, hint_only: saved.hint_only, symbol: saved.symbol, body: Arc::clone(&snapshot.body), snapshot: Some(snapshot),
                 invocations: saved.invocations, call_sites: saved.call_sites.clone() }
         }).collect();
         Self {
@@ -23187,6 +23189,65 @@ fn t2_reachable_callees(
     reached
 }
 
+/// Native execution need not produce a T0 invocation sample. Small saved
+/// helpers can therefore be useful return-summary inputs even when the
+/// inliner's heat filter excludes them. Keep a separate, bounded admission
+/// policy, and preserve source order rather than spending the budget in hash
+/// iteration order. This reads registered metadata; it never compiles/evaluates
+/// a cold function or changes its dispatch.
+fn capture_return_hint_bodies(root: &Arc<BytecodeFunction>, sym: u32, bodies: &mut Vec<T2BodySnapshot>) {
+    if std::env::var_os("EGCL_DISABLE_RETURN_TYPE_HINTS").is_some()
+        || root.code.len() > 2048
+        || !root.code.iter().any(|instruction| matches!(instruction,
+            Instr::CallNamed { sym, nargs: 2 }
+                if matches!(egcl_rt::symbols::registry_key(*sym).as_deref(),
+                    Some("+" | "-" | "*" | "<" | ">" | "<=" | ">=" | "="))))
+    {
+        return;
+    }
+    let mut seen = std::collections::HashSet::from([sym]);
+    let mut queue = std::collections::VecDeque::from([(Arc::clone(root), 0)]);
+    let mut budget = 512usize;
+    let mut added = 0;
+    let mut owners_left = 64usize;
+    let mut instructions_left = root.code.len() + 512;
+    while let Some((owner, depth)) = queue.pop_front() {
+        if depth >= 3 { continue; }
+        if owners_left == 0 { break; }
+        owners_left -= 1;
+        if owner.code.len() > instructions_left { continue; }
+        instructions_left -= owner.code.len();
+        for (pc, instruction) in owner.code.iter().enumerate() {
+            let Instr::CallNamed { sym: callee, .. } = instruction else { continue; };
+            if owner.notinline_sites.contains(&(pc as u32)) || !seen.insert(*callee)
+                || replacement_function(*callee).is_some()
+            { continue; }
+            let Some(body) = registry_get(*callee) else { continue; };
+            if body.variadic || body.has_env || body.min_args != body.arity
+                || body.max_args != Some(body.arity) || body.code.len() > 128
+                || body.constants.len() > 128 || body.names.len() > 128
+                || body.n_locals > 64 || body.max_stack > 64
+                || !body.nested_functions.is_empty() || !body.restart_cases.is_empty()
+            { continue; }
+            if !bodies.iter().any(|saved| saved.symbol == *callee) {
+                if added >= 64 || body.code.len() > budget { continue; }
+                budget -= body.code.len();
+                added += 1;
+                bodies.push(T2BodySnapshot {
+                    generation: REGISTRY_GENERATION.with(|g| g.borrow().get(callee).copied().unwrap_or(0)),
+                    hint_only: true,
+                    snapshot: None,
+                    symbol: *callee,
+                    body: Arc::new((*body).clone()),
+                    invocations: 0,
+                    call_sites: vec![],
+                });
+            }
+            queue.push_back((body, depth + 1));
+        }
+    }
+}
+
 fn snapshot_t2_input(sym: u32, priority: u64) -> Option<T2CompileInput> {
     let root = registry_get(sym)?;
     let root_ptr = Arc::as_ptr(&root) as usize;
@@ -23261,7 +23322,7 @@ fn snapshot_t2_input(sym: u32, priority: u64) -> Option<T2CompileInput> {
     // to what this function can use. Unreachable-by-`CallNamed` targets (an
     // indirect `funcall`) are conservatively dropped: less inlining, never wrong.
     let reachable = t2_reachable_callees(&root, sym);
-    let inline_bodies: Vec<T2BodySnapshot> = REGISTRY.with(|registry| {
+    let mut inline_bodies: Vec<T2BodySnapshot> = REGISTRY.with(|registry| {
         let registry = registry.borrow();
         reachable
             .iter()
@@ -23280,6 +23341,7 @@ fn snapshot_t2_input(sym: u32, priority: u64) -> Option<T2CompileInput> {
                 }
                 Some(T2BodySnapshot {
                     generation: REGISTRY_GENERATION.with(|g| g.borrow().get(&symbol).copied().unwrap_or(0)),
+                    hint_only: false,
                     snapshot: None,
                     symbol,
                     body: std::sync::Arc::new((**body).clone()),
@@ -23289,6 +23351,7 @@ fn snapshot_t2_input(sym: u32, priority: u64) -> Option<T2CompileInput> {
             })
             .collect()
     });
+    capture_return_hint_bodies(&root, sym, &mut inline_bodies);
     if std::env::var_os("EGCL_T2_CANDIDATE_STATS").is_some() {
         let total = REGISTRY.with(|r| r.borrow().len());
         eprintln!(
@@ -23308,7 +23371,7 @@ fn snapshot_t2_input(sym: u32, priority: u64) -> Option<T2CompileInput> {
     let direct_natives = direct_native_targets(sym, generation, &root, &inline_bodies);
     let mut call_cells = Vec::new();
     if cfg!(any(target_arch = "x86_64", target_arch = "s390x")) {
-        for body in std::iter::once(&*root).chain(inline_bodies.iter().map(|saved| &*saved.body)) {
+        for body in std::iter::once(&*root).chain(inline_bodies.iter().filter(|saved| !saved.hint_only).map(|saved| &*saved.body)) {
             for instruction in &body.code {
                 // A backquote's AllocCons is built as a call to CONS (bliss-elwvl).
                 let sym = match instruction {
@@ -23363,7 +23426,7 @@ fn direct_native_targets(
         return Vec::new();
     }
     let mut sites: Vec<(u32, u16)> = Vec::new();
-    for body in std::iter::once(root).chain(inline_bodies.iter().map(|saved| &*saved.body)) {
+    for body in std::iter::once(root).chain(inline_bodies.iter().filter(|saved| !saved.hint_only).map(|saved| &*saved.body)) {
         for instruction in &body.code {
             if let Instr::CallNamed { sym, nargs } = instruction
                 && *sym != caller
@@ -23570,7 +23633,7 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
     for &(symbol, generation) in &done.dependencies {
         registry_get(symbol);
         if REGISTRY_GENERATION.with(|g| g.borrow().get(&symbol).copied().unwrap_or(0)) != generation {
-            t2_log_write(format_args!("{}: discard result after inlining dependency changed", sym_label(done.sym)));
+            t2_log_write(format_args!("{}: discard result after captured body dependency changed", sym_label(done.sym)));
             return None;
         }
     }
@@ -26634,7 +26697,15 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     inline_options.config.cross_function_recovery = checked_native_installation_allowed();
     for saved in &input.inline_bodies {
         inline_options = if let Some(snapshot) = &saved.snapshot {
-            inline_options.with_body_snapshot(saved.symbol, snapshot)
+            if saved.hint_only {
+                inline_options.with_return_hint_body_snapshot(saved.symbol, snapshot)
+            } else {
+                inline_options.with_body_snapshot(saved.symbol, snapshot)
+            }
+        } else if saved.hint_only {
+            // Synchronous test clients may supply undetached input. Never
+            // promote a hint-only owner into an inlining candidate.
+            continue;
         } else { inline_options.with_body(saved.symbol, Arc::clone(&saved.body)) };
         for &(bcp, calls) in &saved.call_sites {
             inline_options =
@@ -26674,6 +26745,18 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
             return None;
         }
     };
+    // Return summaries are expectations, not unchecked facts about a dynamic
+    // call. Keep them out of value types and ordinary inference: numeric
+    // specialization must still check the value actually returned, using its
+    // after-call recovery state. The captured bodies already participate in
+    // completion generation validation, including summaries of non-inlined
+    // callees. No live callee or movable constant is read on this worker.
+    if std::env::var_os("EGCL_DISABLE_RETURN_TYPE_HINTS").is_none() {
+        let hints = egcl_compiler::t2::return_hints::apply(&mut f, &array_inline_options);
+        if hints != 0 {
+            t2_log!("{name}: guarded return type hints: {hints} value(s)");
+        }
+    }
     if cfg!(all(target_arch = "x86_64", target_os = "linux"))
         && std::env::var_os("EGCL_DISABLE_INTEGER_EXTRACTION").is_none()
     {
