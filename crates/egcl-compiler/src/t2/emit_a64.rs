@@ -779,6 +779,87 @@ impl Emitter<'_> {
         Ok(())
     }
 
+    /// `(CHAR string index)` inline, answering NIL for anything this fast path
+    /// does not handle so the caller's `Brif` can branch to the real call.
+    ///
+    /// NEVER deopts and never signals -- that is the opcode's contract, and
+    /// what makes it different from every guard in this emitter. A non-string,
+    /// a complex or displaced string, a non-fixnum or out-of-range index all
+    /// take the NIL exit, and the slow arm then runs the original call with its
+    /// original frame state, so the error, restarts and backtrace are the ones
+    /// the program had before.
+    ///
+    /// A simple string is `header | char_len @8 | data @16`, one byte per
+    /// character for `SIMPLE_BASE_STRING` and a native-endian `u32` per
+    /// character for `SIMPLE_CHARACTER_STRING`. The length at +8 is the RAW
+    /// count, so the index is untagged before the bounds compare.
+    fn string_char_or_nil(&mut self, data: &InstData) -> Result<(), EmitError> {
+        use egcl_rt::object::type_id;
+        if data.args.len() != 2
+            || data.results.len() != 1
+            || data.flags.guard
+            || data.frame_state.is_some()
+        {
+            return Err(EmitError::UnsupportedOp(op_tag(Opcode::StringCharOrNil)));
+        }
+        let fail = self.asm.label();
+        let wide = self.asm.label();
+        let loaded = self.asm.label();
+        let done = self.asm.label();
+        self.load(data.args[0], W0)?;
+        self.load(data.args[1], W1)?;
+        // A heap object, or an immediate that cannot be a string.
+        self.branch_unless_tag(egcl_rt::value::TAG_HEAP_OBJECT, fail);
+        // A fixnum index: tag bits clear, and not negative. Both tests are on
+        // the TAGGED word, where the fixnum tag is zero.
+        self.asm
+            .word(a64::and_imm(T0, W1, 7).expect("7 is a logical immediate"));
+        self.compare_imm(T0, 0);
+        self.asm.jcc(Cc::Ne, fail);
+        self.compare_imm(W1, 0);
+        self.asm.jcc(Cc::L, fail);
+        self.asm.word(a64::asr_imm(T1, W1, 3));
+        self.asm
+            .word(a64::and_imm(ADDR, W0, !7u64).expect("!7 is a logical immediate"));
+        self.load_at(T0, ADDR, 8)?;
+        self.compare(T1, T0);
+        self.asm.jcc(Cc::Ge, fail);
+        // The type id decides the element width. Read it once: the wide arm
+        // compares the same byte again from T0 rather than reloading.
+        self.asm
+            .word(a64::ldrb_imm(T0, ADDR, 7).expect("7 fits the byte-form offset"));
+        self.compare_imm(T0, u64::from(type_id::SIMPLE_BASE_STRING));
+        self.asm.jcc(Cc::Ne, wide);
+        self.asm
+            .word(a64::add_imm(ADDR, ADDR, 16).expect("16 fits the immediate field"));
+        self.asm.word(a64::add(ADDR, ADDR, T1));
+        self.asm
+            .word(a64::ldrb_imm(W0, ADDR, 0).expect("0 fits the byte-form offset"));
+        self.asm.jmp(loaded);
+        self.asm.bind(wide);
+        self.compare_imm(T0, u64::from(type_id::SIMPLE_CHARACTER_STRING));
+        self.asm.jcc(Cc::Ne, fail);
+        self.asm
+            .word(a64::add_imm(ADDR, ADDR, 16).expect("16 fits the immediate field"));
+        self.asm
+            .word(a64::add_shifted(ADDR, ADDR, T1, a64::Shift::Lsl(2)));
+        // A 32-bit load, which zero-extends: a character code is 21 bits, so
+        // the upper half of the word must not be read as part of it.
+        self.asm
+            .word(a64::ldr_w_imm(W0, ADDR, 0).expect("0 fits the word-form offset"));
+        self.asm.bind(loaded);
+        self.asm.word(a64::lsl_imm(W0, W0, 3));
+        self.asm.word(
+            a64::orr_imm(W0, W0, egcl_rt::value::TAG_CHARACTER)
+                .expect("a tag is three bits"),
+        );
+        self.asm.jmp(done);
+        self.asm.bind(fail);
+        self.imm(W0, NIL.0);
+        self.asm.bind(done);
+        self.store(data.results[0], W0)
+    }
+
     // ── control flow ─────────────────────────────────────────────
 
     fn edge(&mut self, edge: &BlockCall) -> Result<(), EmitError> {
@@ -1174,6 +1255,7 @@ impl Emitter<'_> {
                 self.imm(W0, NIL.0);
                 return self.epilogue();
             }
+            StringCharOrNil => return self.string_char_or_nil(data),
             Jump if data.targets.len() == 1 => return self.edge(&data.targets[0]),
             Brif if data.args.len() == 1 && data.targets.len() == 2 => {
                 let otherwise = self.asm.label();

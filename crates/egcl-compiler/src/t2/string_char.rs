@@ -39,7 +39,8 @@
 //! * Only the canonical `COMMON-LISP` symbols are matched. Redefining a
 //!   standard CL function is unsupported (as for the open-coded `CAR`), and
 //!   a same-named symbol in another package stays an ordinary call.
-//! * Only x86-64 Linux emits `StringCharOrNil`; other targets keep the call.
+//! * Only a target whose emitter has the arm emits `StringCharOrNil` -- see
+//!   `target_support::simple_string_char_access`; others keep the call.
 //!   `EGCL_INLINE_STRING_CHAR=0` keeps the call everywhere, for comparison.
 
 use std::collections::{HashMap, HashSet};
@@ -60,7 +61,7 @@ fn enabled() -> bool {
 
 /// Whether `symbol` names the canonical `CL:CHAR`, `CL:SCHAR` or `CL:ELT`.
 pub(crate) fn is_string_char_accessor(symbol: u32) -> bool {
-    if !cfg!(all(target_arch = "x86_64", target_os = "linux")) || !enabled() {
+    if !super::target_support::simple_string_char_access() || !enabled() {
         return false;
     }
     let Some(key) = egcl_rt::symbols::registry_key(symbol) else {
