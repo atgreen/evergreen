@@ -5765,14 +5765,13 @@ fn resolve(name: &str) -> Option<Handler> {
                 }
                 i += 2;
             }
-            let mut print_binding = None;
-            egcl_rt::rooted_ref!(_print_binding_root = &mut print_binding);
-            if let Some(value) = print {
+            let mut print_binding = if let Some(value) = print {
                 let symbol = resolve_sym("*COMPILE-PRINT*").ok_or_else(|| {
                     EgclError::Internal("COMPILE-FILE: *COMPILE-PRINT* is unavailable".into())
                 })?;
-                print_binding = Some(DynBind::establish(symbol, if value { T } else { NIL }));
-            }
+                Some(DynBind::establish(symbol, if value { T } else { NIL }))
+            } else { None };
+            egcl_rt::rooted_ref!(_print_binding_root = &mut print_binding);
             let out_path = out_path.unwrap_or_else(|| {
                 // CLHS 3.2.3: COMPILE-FILE's default output MUST equal
                 // (COMPILE-FILE-PATHNAME input). Match COMPILE-FILE-PATHNAME

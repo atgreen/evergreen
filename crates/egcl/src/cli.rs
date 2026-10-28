@@ -15129,6 +15129,8 @@ fn run_deferred_lisp_finalizers(env: &mut Env) {
     env.mv_active = saved_mv_active;
 }
 
+type CompileReadForms = (Vec<EgclVal>, Vec<String>, Vec<usize>);
+
 /// Pre-read a source file's top-level forms for COMPILE-FILE, processing
 /// compile-time effects as it goes.
 ///
@@ -15145,7 +15147,7 @@ fn read_forms_for_compile(
     src_path: &str,
     compile_time_failure: &mut Option<()>,
     env: &mut Env,
-) -> Result<(Vec<EgclVal>, Vec<String>, Vec<usize>), EgclError> {
+) -> Result<CompileReadForms, EgclError> {
     with_eval_context(env, EvalContext::CompileFile, |env| {
         reader::set_read_eval_hook(Some(read_time_eval));
         reader::set_macro_handler_invoker(Some(reader_macro_invoker));

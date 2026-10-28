@@ -11954,9 +11954,9 @@ fn portable_load_thunk_form(form: EgclVal) -> Option<EgclVal> {
                 #[cfg(test)]
                 {
                     // Old addresses are comparison-only snapshots, never dereferenced.
-                    let before = ((*setq).0, (*quoted).0);
+                    let before = (setq.0, quoted.0);
                     if compile_file_print_group_tests::collect_portable_intermediates() {
-                        compile_file_print_group_tests::record_portable_movement(before, ((*setq).0, (*quoted).0));
+                        compile_file_print_group_tests::record_portable_movement(before, (setq.0, quoted.0));
                     }
                 }
                 egcl_rt::rooted!(boundp = form_list(&[resolve_sym("BOUNDP")?, *quoted]));
@@ -31616,10 +31616,10 @@ mod compile_file_print_group_tests {
         COLLECT_INTERMEDIATES.with(|active| active.set(false));
         let moved = INTERMEDIATE_MOVEMENT.with(|record| record.get());
         assert_eq!(moved, (true, true), "both newly built conses must really relocate");
-        let parts = list_to_vec(*rewritten);
+        egcl_rt::rooted!(parts = list_to_vec(*rewritten));
         assert_eq!(sym_bare_name_rc(parts[0]).as_ref(), "UNLESS");
-        let boundp = list_to_vec(parts[1]);
-        let assignment = list_to_vec(parts[2]);
+        egcl_rt::rooted!(boundp = list_to_vec(parts[1]));
+        egcl_rt::rooted!(assignment = list_to_vec(parts[2]));
         assert_eq!(sym_bare_name_rc(boundp[0]).as_ref(), "BOUNDP");
         assert_eq!(sym_bare_name_rc(cp(boundp[1]).0).as_ref(), "QUOTE");
         assert_eq!(sym_bare_name_rc(assignment[0]).as_ref(), "SETQ");
