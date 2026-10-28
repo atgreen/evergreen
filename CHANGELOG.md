@@ -218,6 +218,16 @@
 
 ### Performance
 
+- On ppc64le, a hot comparison of single-floats (`<`, `<=`, `>`, `>=`, `=`) and
+  a hot `MIN` or `MAX` of fixnums compile to native instructions instead of
+  calling the runtime from the loop. Both specializations existed only for
+  x86-64 because this backend had no emitter arm for them. A 2,000,000-iteration
+  single-float comparison loop drops from 5.02 us to 0.044 us per iteration,
+  which is what the same loop over fixnums costs; `MIN`/`MAX` likewise reaches
+  the fixnum baseline. `MOD`, `REM`, `FLOOR`, `TRUNCATE` and double-float
+  comparisons still need the x86-64 emitter and are unchanged
+  ([#753](https://github.com/atgreen/evergreen/pull/753)).
+
 - T2 inlines the signaling `ENDP` list-end check used by `DOLIST` and
   `LOOP FOR ... IN`, while preserving type errors and closure handling through
   guarded deoptimization
