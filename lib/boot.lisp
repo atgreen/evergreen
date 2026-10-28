@@ -5863,8 +5863,10 @@ a hook error aborts startup.")
 (defun egcl-ext::string-to-octets (string &key (external-format :utf-8) (start 0) end null-terminate)
   (check-type string string)
   (egcl::%text-codec :encode (subseq string start end) external-format null-terminate))
+;; Any vector of octets, not only an (unsigned-byte 8) array: a literal #(...)
+;; is a general vector. The codec signals TYPE-ERROR for a non-octet element.
 (defun egcl-ext::octets-to-string (vector &key (external-format :utf-8) (start 0) end)
-  (check-type vector (vector (unsigned-byte 8)))
+  (check-type vector vector)
   (egcl::%text-codec :decode (subseq vector start end) external-format nil))
 (export '(egcl-ext::string-to-octets egcl-ext::octets-to-string) :egcl-ext)
 

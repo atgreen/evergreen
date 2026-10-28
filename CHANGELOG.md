@@ -392,6 +392,18 @@
 
 ### Fixed
 
+- Two places that packed `(unsigned-byte 8)` arrays missed, each of which
+  broke every `ocicl install`:
+  - Ironclad's SHA3 and other Keccak digests work again. The native Keccak
+    absorb rejected Ironclad's packed buffer as "not of type "an octet
+    vector"". It now reads packed and general octet vectors alike, as the
+    other crypto kernels already did.
+  - `egcl-ext:string-to-octets` returns an `(unsigned-byte 8)` vector, and
+    `egcl-ext:octets-to-string` accepts any vector of octets again. The
+    encoder still made a general vector, which the decoder's
+    `(vector (unsigned-byte 8))` check now rejected, so pure-tls could not
+    parse a single PEM certificate and trusted no CA.
+
 - `ADJUST-ARRAY` preserves adjustable array identity, multidimensional shape,
   element storage, displacement aliases, and fill-pointer options. Bounded
   bit-equivalent element types consistently use bit storage, and `SVREF`

@@ -130,16 +130,31 @@ fn write_words(v: EgclVal, start: usize, words: &[u64], what: &str) -> Result<()
 }
 
 fn read_bytes<const N: usize>(v: EgclVal, start: usize) -> Result<[u8; N], EgclError> {
+    let mut out = [0u8; N];
+    read_bytes_into(v, start, &mut out)?;
+    Ok(out)
+}
+
+/// Fill OUT with the octets of V from START, packed or general storage alike.
+fn read_bytes_into(v: EgclVal, start: usize, out: &mut [u8]) -> Result<(), EgclError> {
     if let Some(length) = egcl_rt::packed_u8::len(v) {
-        if start > length || N > length - start {
+        if start > length || out.len() > length - start {
             return Err(type_error(v, "an octet vector containing the requested block"));
         }
-        return Ok(std::array::from_fn(|index| {
-            egcl_rt::packed_u8::get(v, start + index).unwrap()
-        }));
+        for (index, slot) in out.iter_mut().enumerate() {
+            *slot = egcl_rt::packed_u8::get(v, start + index).unwrap();
+        }
+        return Ok(());
     }
-    let words = read_words::<N>(v, start, 8, "an octet vector")?;
-    Ok(words.map(|w| w as u8))
+    let base = slots(v, start, out.len(), "an octet vector")?;
+    for (index, slot) in out.iter_mut().enumerate() {
+        let element = unsafe { *base.add(index) };
+        if !element.is_fixnum() || (element.as_fixnum() as u64) >> 8 != 0 {
+            return Err(type_error(element, "an octet vector"));
+        }
+        *slot = element.as_fixnum() as u8;
+    }
+    Ok(())
 }
 
 fn write_bytes(v: EgclVal, start: usize, bytes: &[u8]) -> Result<(), EgclError> {
@@ -660,15 +675,8 @@ fn keccak_absorb_values(
     }
     let start = index_arg(start)?;
     let mut lanes = read_u64s::<25>(state, 0, "a 25-lane (unsigned-byte 64) vector")?;
-    let base = slots(data, start, rate, "an octet vector")?;
     let mut block = [0u8; 200];
-    for (index, slot) in block.iter_mut().take(rate).enumerate() {
-        let element = unsafe { *base.add(index) };
-        if !element.is_fixnum() || (element.as_fixnum() as u64) >> 8 != 0 {
-            return Err(type_error(element, "an octet vector"));
-        }
-        *slot = element.as_fixnum() as u8;
-    }
+    read_bytes_into(data, start, &mut block[..rate])?;
     for (lane, chunk) in lanes.iter_mut().zip(block[..rate].chunks_exact(8)) {
         *lane ^= u64::from_le_bytes(chunk.try_into().expect("eight octets"));
     }
@@ -696,6 +704,33 @@ mod tests {
             assert_eq!(read_bytes::<16>(array, 8).unwrap(), block);
             assert!(read_bytes::<1>(array, usize::MAX).is_err());
             assert_eq!(read_bytes::<0>(array, 32).unwrap(), []);
+        }
+    }
+
+    /// Keccak absorption reads its rate block from packed octet vectors as
+    /// well as general ones: Ironclad's SHA3 buffer is an (unsigned-byte 8)
+    /// array, so every SHA3 digest failed once those became packed.
+    #[test]
+    fn keccak_absorb_reads_packed_and_general_octet_vectors() {
+        // SHA3-256 of the empty message: 0x06, then 0x80 at the end of the
+        // 136-octet rate block, at offset 4 of a 140-octet buffer.
+        egcl_rt::rooted!(packed = egcl_rt::packed_u8::make(140, 0).unwrap());
+        egcl_rt::rooted!(general = crate::sequences::build_filled_simple_vector(
+            140, EgclVal::from_fixnum(0)
+        ));
+        for data in [*packed, *general] {
+            write_bytes(data, 4, &[0x06]).unwrap();
+            write_bytes(data, 139, &[0x80]).unwrap();
+            egcl_rt::rooted!(state = crate::sequences::build_filled_simple_vector(
+                25, EgclVal::from_fixnum(0)
+            ));
+            keccak_absorb_values(*state, EgclVal::from_fixnum(136), data, EgclVal::from_fixnum(4))
+                .unwrap();
+            let lanes = read_u64s::<25>(*state, 0, "lanes").unwrap();
+            assert_eq!(lanes[0].to_le_bytes(), [0xa7, 0xff, 0xc6, 0xf8, 0xbf, 0x1e, 0xd7, 0x66]);
+            assert!(keccak_absorb_values(
+                *state, EgclVal::from_fixnum(136), data, EgclVal::from_fixnum(5)
+            ).is_err());
         }
     }
 
