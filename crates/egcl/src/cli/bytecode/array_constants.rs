@@ -281,7 +281,9 @@ pub(super) fn validate_values(
         // Direct accessors require physical flat storage. Only displaced
         // wrappers interpret another array through its row-major accessors.
         if metadata.displacement.is_none() {
-            let general = bbu_vector_elements(storage).is_some();
+            let general = storage.is_heap_object()
+                && unsafe { (*storage.as_ptr().cast::<egcl_rt::ObjectHeader>()).type_id() }
+                    == egcl_rt::object::type_id::SIMPLE_VECTOR;
             let direct = match metadata.element_type {
                 0 => general,
                 1 => storage.is_string() || general,

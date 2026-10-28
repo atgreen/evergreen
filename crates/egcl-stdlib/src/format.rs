@@ -1161,13 +1161,13 @@ pub fn u8_readable_representation(value: EgclVal) -> Option<String> {
     out.push_str(" :ELEMENT-TYPE '(COMMON-LISP:UNSIGNED-BYTE #10r8) :INITIAL-CONTENTS '");
     let mut index = 0;
     contents(value, &dims, &mut index, &mut out);
-    if crate::sequences::is_complex_vector(value) {
-        if crate::sequences::cvec_has_fill_pointer(value) {
-            out.push_str(&format!(
-                " :FILL-POINTER #10r{}",
-                crate::sequences::cvec_fill_pointer(value)
-            ));
-        }
+    if crate::sequences::is_complex_vector(value)
+        && crate::sequences::cvec_has_fill_pointer(value)
+    {
+        out.push_str(&format!(
+            " :FILL-POINTER #10r{}",
+            crate::sequences::cvec_fill_pointer(value)
+        ));
     }
     if crate::sequences::array_adjustable(value) {
         out.push_str(" :ADJUSTABLE COMMON-LISP:T");
