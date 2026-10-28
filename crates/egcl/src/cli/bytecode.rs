@@ -18985,7 +18985,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                     .map(|(_, tok)| tok.clone());
                 match token {
                     Some(tok) => {
-                        store_control_value(&tok, value);
+                        super::store_control_mv(&tok, value, env);
                         initiate_unwind(acts, stack, env, Pending::Token(tok))?;
                     }
                     None => {
