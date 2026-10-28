@@ -252,6 +252,10 @@
 
 ### Fixed
 
+- Qualified SETF function names retain their identity through compiled files
+  and saved images without creating bogus packages
+  ([#739](https://github.com/atgreen/evergreen/pull/739)).
+
 - The `#nA` reader accepts packed `(unsigned-byte 8)` vectors as contents,
   including empty vectors and multidimensional rows
   ([#721](https://github.com/atgreen/evergreen/pull/721)).
