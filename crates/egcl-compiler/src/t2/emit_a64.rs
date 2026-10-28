@@ -342,12 +342,26 @@ impl Emitter<'_> {
 
     /// Compare against a constant, through a register when it does not fit the
     /// immediate field — which tagged values generally do not.
+    ///
+    /// **CLOBBERS [`ADDR`] for any value `CMP`'s immediate cannot encode**,
+    /// which is anything outside 12 bits that is not a multiple of 4096. A
+    /// caller holding a live address there must use
+    /// [`Self::compare_imm_using`] and name a different scratch: this cost an
+    /// `0xFFFF` header test the array base it had just computed, and the
+    /// result was an unhandled memory fault on the first element access rather
+    /// than a wrong answer.
     fn compare_imm(&mut self, register: a64::Reg, value: u64) {
+        self.compare_imm_using(register, value, ADDR);
+    }
+
+    /// [`Self::compare_imm`] with the scratch register named, for a caller with
+    /// something live in [`ADDR`].
+    fn compare_imm_using(&mut self, register: a64::Reg, value: u64, scratch: a64::Reg) {
         match a64::cmp_imm(register, value) {
             Some(word) => self.asm.word(word),
             None => {
-                self.imm(ADDR, value);
-                self.asm.word(a64::cmp(register, ADDR));
+                self.imm(scratch, value);
+                self.asm.word(a64::cmp(register, scratch));
             }
         }
     }
@@ -942,6 +956,300 @@ impl Emitter<'_> {
         self.store(data.results[0], W0)
     }
 
+    /// `ADDR` <- the untagged body of `array`, advanced past the header to its
+    /// first metadata word, after checking the heap tag and the type id.
+    ///
+    /// Shared by all three element layouts because the header discipline is
+    /// shared: the LOW HALFWORD of the header word is the size class, and
+    /// `0xFFFF` there selects the extended header, whose metadata begins at +16
+    /// rather than +8. Packed storage exists in both allocation classes, so
+    /// this cannot be assumed either way.
+    fn array_body(
+        &mut self,
+        array: Value,
+        type_id: u8,
+        deopt: egcl_rt::asm::Label,
+    ) -> Result<(), EmitError> {
+        self.load(array, W0)?;
+        self.asm
+            .word(a64::and_imm(T0, W0, 7).expect("7 is a logical immediate"));
+        self.compare_imm(T0, egcl_rt::value::TAG_HEAP_OBJECT);
+        self.asm.jcc(Cc::Ne, deopt);
+        self.asm
+            .word(a64::and_imm(ADDR, W0, !7u64).expect("!7 is a logical immediate"));
+        self.asm
+            .word(a64::ldrb_imm(T0, ADDR, 7).expect("7 fits the byte-form offset"));
+        self.compare_imm(T0, u64::from(type_id));
+        self.asm.jcc(Cc::Ne, deopt);
+        let small = self.asm.label();
+        let body = self.asm.label();
+        self.asm
+            .word(a64::ldrh_imm(T0, ADDR, 0).expect("0 fits the halfword-form offset"));
+        // T1, not the default ADDR scratch: 0xFFFF does not fit `CMP`'s
+        // immediate, and ADDR is holding the array base this very sequence
+        // computed. T1 is dead until `checked_index` writes it below.
+        self.compare_imm_using(T0, 0xFFFF, T1);
+        self.asm.jcc(Cc::Ne, small);
+        self.asm
+            .word(a64::add_imm(ADDR, ADDR, 16).expect("16 fits the immediate field"));
+        self.asm.jmp(body);
+        self.asm.bind(small);
+        self.asm
+            .word(a64::add_imm(ADDR, ADDR, 8).expect("8 fits the immediate field"));
+        self.asm.bind(body);
+        Ok(())
+    }
+
+    /// `T1` <- the raw index, having checked that the TAGGED index already in
+    /// `W1` is a NONNEGATIVE fixnum below the length stored `length_offset`
+    /// from `ADDR`.
+    ///
+    /// Takes the index in a register rather than loading it, because by here
+    /// `ADDR` holds the array body and [`Self::load`] of a heap constant goes
+    /// through `ADDR`. Every caller loads its operands BEFORE the body address
+    /// exists, which is the only ordering that makes that impossible rather
+    /// than merely unlikely.
+    ///
+    /// Both halves of the check matter. The tag test rejects a non-fixnum
+    /// before it is shifted as if it were one, and the sign test is separate
+    /// because the bound is an UNSIGNED length compared signed: without it a
+    /// negative index would pass the upper comparison and address behind the
+    /// array.
+    fn checked_index(
+        &mut self,
+        length_offset: i32,
+        deopt: egcl_rt::asm::Label,
+    ) -> Result<(), EmitError> {
+        self.asm
+            .word(a64::tst_imm(W1, 7).expect("7 is a logical immediate"));
+        self.asm.jcc(Cc::Ne, deopt);
+        self.asm.word(a64::asr_imm(T1, W1, 3));
+        self.compare_imm(T1, 0);
+        self.asm.jcc(Cc::L, deopt);
+        self.load_at(T0, ADDR, length_offset)?;
+        self.compare(T1, T0);
+        self.asm.jcc(Cc::Ge, deopt);
+        Ok(())
+    }
+
+    /// `ADDR` <- the address of element `index` of the SIMPLE_VECTOR `array`.
+    ///
+    /// Elements follow the length word, so the scale is eight and the data
+    /// offset is eight past the metadata the body points at.
+    fn simple_vector_element(
+        &mut self,
+        array: Value,
+        index: Value,
+        deopt: egcl_rt::asm::Label,
+    ) -> Result<(), EmitError> {
+        // The index is loaded FIRST, while nothing is live in ADDR: see
+        // `checked_index`.
+        self.load(index, W1)?;
+        self.array_body(array, egcl_rt::object::type_id::SIMPLE_VECTOR, deopt)?;
+        self.checked_index(0, deopt)?;
+        self.asm
+            .word(a64::add_imm(ADDR, ADDR, 8).expect("8 fits the immediate field"));
+        self.asm
+            .word(a64::add_shifted(ADDR, ADDR, T1, a64::Shift::Lsl(3)));
+        Ok(())
+    }
+
+    /// `ADDR` <- the address of element `index` of a packed array of
+    /// `element_tag`, whose element width is `1 << log2_width` bytes and whose
+    /// data begins `data_offset` past the body.
+    ///
+    /// A packed array is a SIMPLE_ARRAY whose first metadata byte is the
+    /// element-type tag and whose length follows it, so the tag is checked
+    /// before the bound is read from the right place.
+    fn packed_element(
+        &mut self,
+        array: Value,
+        index: Value,
+        element_tag: u8,
+        log2_width: u32,
+        data_offset: i32,
+        deopt: egcl_rt::asm::Label,
+    ) -> Result<(), EmitError> {
+        self.load(index, W1)?;
+        self.array_body(array, egcl_rt::object::type_id::SIMPLE_ARRAY, deopt)?;
+        self.asm
+            .word(a64::ldrb_imm(T0, ADDR, 0).expect("0 fits the byte-form offset"));
+        self.compare_imm(T0, u64::from(element_tag));
+        self.asm.jcc(Cc::Ne, deopt);
+        self.checked_index(8, deopt)?;
+        self.asm.word(
+            a64::add_imm(ADDR, ADDR, u64::try_from(data_offset).map_err(|_| unsupported!())?)
+                .ok_or(unsupported!())?,
+        );
+        self.asm
+            .word(a64::add_shifted(ADDR, ADDR, T1, a64::Shift::Lsl(log2_width)));
+        Ok(())
+    }
+
+    /// `ADDR` <- the address of element `index` of a packed `double-float`
+    /// array, ready to be loaded or stored as a raw f64.
+    ///
+    /// Its own method rather than a `packed_element` call site because the
+    /// layout constants are the ones `egcl_rt::packed_f64` publishes, and
+    /// naming them here keeps this arm honest if they move.
+    fn packed_f64_element(
+        &mut self,
+        array: Value,
+        index: Value,
+        deopt: egcl_rt::asm::Label,
+    ) -> Result<(), EmitError> {
+        debug_assert_eq!(egcl_rt::packed_f64::LENGTH_OFFSET, 8);
+        self.packed_element(
+            array,
+            index,
+            egcl_rt::object::ElementTypeTag::DoubleFloat as u8,
+            3,
+            i32::try_from(egcl_rt::packed_f64::DATA_OFFSET).map_err(|_| unsupported!())?,
+            deopt,
+        )
+    }
+
+    /// `VecRef`, `VecSet` and `ArrayReadDiscarded`: a guarded element access
+    /// over the layouts `array_access` proved.
+    ///
+    /// Which layouts each shape must accept is decided by the opcode and its
+    /// `AuxData`, and getting that wrong is a wrong answer rather than a slow
+    /// path:
+    ///
+    ///   * `VecRef` with `ArrayRef` is `AREF`, which may be a SIMPLE_VECTOR or
+    ///     a packed `(unsigned-byte 8)` array. The vector case is tried first
+    ///     and falls through to the byte case, in emit.rs's order.
+    ///   * `VecRef` without it is `SVREF`: SIMPLE_VECTOR only.
+    ///   * `VecSet` with `SimpleVectorStore` is a proven simple-vector store.
+    ///   * `VecSet` without it probes the layouts in turn, and a packed store
+    ///     additionally RANGE-CHECKS the value: a byte array takes only
+    ///     0..=255, and anything else must deopt rather than truncate.
+    ///
+    /// A byte read is zero-extended and then tagged; a byte store untags and
+    /// narrows. No interior pointer survives a safepoint here, because nothing
+    /// in these sequences calls, allocates or polls.
+    fn element_access(&mut self, data: &InstData) -> Result<(), EmitError> {
+        use egcl_rt::object::ElementTypeTag;
+        let discarded = data.opcode == Opcode::ArrayReadDiscarded;
+        let load = discarded || data.opcode == Opcode::VecRef;
+        let arity = if load { 2 } else { 3 };
+        if data.args.len() != arity
+            || data.results.len() != usize::from(!discarded)
+            || !data.flags.guard
+            || !data.flags.effectful
+            || data.frame_state.is_none()
+        {
+            return Err(EmitError::UnsupportedOp(op_tag(data.opcode)));
+        }
+        let deopt = self.deopt_label(data)?;
+        let (array, index) = (data.args[0], data.args[1]);
+        // AREF may be a byte array; SVREF and a proven simple-vector store may
+        // not. A discarded AREF read still proves a layout, since the bounds
+        // check is the whole reason it survived.
+        let byte_layout = matches!(data.aux, AuxData::ArrayRef);
+        if discarded {
+            if byte_layout {
+                let not_vector = self.asm.label();
+                let not_u8 = self.asm.label();
+                let done = self.asm.label();
+                self.simple_vector_element(array, index, not_vector)?;
+                self.asm.jmp(done);
+                self.asm.bind(not_vector);
+                self.packed_element(array, index, ElementTypeTag::U8 as u8, 0, 16, not_u8)?;
+                self.asm.jmp(done);
+                self.asm.bind(not_u8);
+                self.packed_f64_element(array, index, deopt)?;
+                self.asm.bind(done);
+            } else {
+                self.simple_vector_element(array, index, deopt)?;
+            }
+            return Ok(());
+        }
+        let result = data.results[0];
+        if load {
+            if byte_layout {
+                let not_vector = self.asm.label();
+                let loaded = self.asm.label();
+                self.simple_vector_element(array, index, not_vector)?;
+                self.load_at(W0, ADDR, 0)?;
+                self.asm.jmp(loaded);
+                self.asm.bind(not_vector);
+                self.packed_element(array, index, ElementTypeTag::U8 as u8, 0, 16, deopt)?;
+                self.asm
+                    .word(a64::ldrb_imm(W0, ADDR, 0).expect("0 fits the byte-form offset"));
+                self.asm.word(a64::lsl_imm(W0, W0, 3));
+                self.asm.bind(loaded);
+            } else {
+                self.simple_vector_element(array, index, deopt)?;
+                self.load_at(W0, ADDR, 0)?;
+            }
+            return self.store(result, W0);
+        }
+        // A store, whose result is the stored value.
+        let value = data.args[2];
+        // Each store stashes the element address in T1 before loading the
+        // value: `load` of a heap constant goes through ADDR, and a stored
+        // value may well be one -- `(setf (aref v 0) "literal")`. Writing
+        // through a clobbered ADDR would corrupt memory silently.
+        if matches!(data.aux, AuxData::SimpleVectorStore) {
+            self.simple_vector_element(array, index, deopt)?;
+            self.mov(T1, ADDR);
+            self.load(value, W0)?;
+            self.store_at(W0, T1, 0)?;
+            return self.store(result, W0);
+        }
+        let not_vector = self.asm.label();
+        let stored = self.asm.label();
+        self.simple_vector_element(array, index, not_vector)?;
+        self.mov(T1, ADDR);
+        self.load(value, W0)?;
+        self.store_at(W0, T1, 0)?;
+        self.asm.jmp(stored);
+        self.asm.bind(not_vector);
+        let not_u8 = self.asm.label();
+        self.packed_element(array, index, ElementTypeTag::U8 as u8, 0, 16, not_u8)?;
+        self.mov(T1, ADDR);
+        // The value must be a fixnum in 0..=255. Both bounds are tested on the
+        // TAGGED word, where that range is 0..=255<<3, so neither test needs it
+        // untagged first -- and the deopt still sees the operand unchanged.
+        self.load(value, W0)?;
+        self.guard_fixnum(W0, deopt);
+        self.compare_imm(W0, 0);
+        self.asm.jcc(Cc::L, deopt);
+        self.compare_imm(W0, 255 << 3);
+        self.asm.jcc(Cc::G, deopt);
+        self.asm.word(a64::asr_imm(T0, W0, 3));
+        self.asm
+            .word(a64::strb_imm(T0, T1, 0).expect("0 fits the byte-form offset"));
+        self.asm.jmp(stored);
+        // A packed double array. Probing this layout rather than deopting here
+        // is not an optimisation: a function that stores doubles into one would
+        // otherwise deopt on EVERY call, which is worse than the runtime call
+        // it replaced. emit.rs probes all three for the same reason.
+        self.asm.bind(not_u8);
+        self.packed_f64_element(array, index, deopt)?;
+        // Keep the slot address across the value validation. x86 pushes it;
+        // here a register serves, since T1's raw index is dead from this point
+        // and nothing below calls, allocates or polls -- an interior pointer
+        // must not survive a safepoint, and none occurs in this span.
+        self.mov(T1, ADDR);
+        self.load(value, W0)?;
+        self.asm
+            .word(a64::and_imm(T0, W0, 7).expect("7 is a logical immediate"));
+        self.compare_imm(T0, egcl_rt::value::TAG_HEAP_OBJECT);
+        self.asm.jcc(Cc::Ne, deopt);
+        self.asm
+            .word(a64::and_imm(ADDR, W0, !7u64).expect("!7 is a logical immediate"));
+        self.asm
+            .word(a64::ldrb_imm(T0, ADDR, 7).expect("7 fits the byte-form offset"));
+        self.compare_imm(T0, u64::from(egcl_rt::object::type_id::DOUBLE_FLOAT));
+        self.asm.jcc(Cc::Ne, deopt);
+        self.load_at(T0, ADDR, 8)?;
+        self.store_at(T0, T1, 0)?;
+        self.asm.bind(stored);
+        self.store(result, W0)
+    }
+
     // ── control flow ─────────────────────────────────────────────
 
     fn edge(&mut self, edge: &BlockCall) -> Result<(), EmitError> {
@@ -1339,6 +1647,7 @@ impl Emitter<'_> {
             }
             StringCharOrNil => return self.string_char_or_nil(data),
             IntegerLowBits => return self.integer_low_bits(data),
+            VecRef | VecSet | ArrayReadDiscarded => return self.element_access(data),
             Jump if data.targets.len() == 1 => return self.edge(&data.targets[0]),
             Brif if data.args.len() == 1 && data.targets.len() == 2 => {
                 let otherwise = self.asm.label();

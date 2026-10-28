@@ -94,6 +94,31 @@ pub const fn integer_low_bits() -> bool {
     ))
 }
 
+/// Whether the host emitter encodes the guarded element accesses
+/// `array_access` selects: `VecRef`, `VecSet` and `ArrayReadDiscarded`.
+///
+/// This is the all-or-nothing one. The pass rewrites reads AND stores in the
+/// same function, so a target that handles only some of them loses the whole
+/// function the first time the other appears. An emitter claiming this must
+/// therefore cover: `VecRef` for both `AREF` (SIMPLE_VECTOR then packed
+/// `(unsigned-byte 8)`) and `SVREF` (SIMPLE_VECTOR only); `VecSet` both for a
+/// proven simple-vector store and for the general form that probes
+/// SIMPLE_VECTOR, packed-U8 and packed-`double-float` in turn; and
+/// `ArrayReadDiscarded`, whose only purpose is the bounds check.
+///
+/// Probing every layout matters even where one seems unreachable: deopting on
+/// a layout the pass admitted means deopting on EVERY call through that site,
+/// which is worse than the runtime call it replaced.
+///
+/// `VecSetInRange` and `SmallVectorRangeP` come from the separate
+/// `vector_ranges` pass, which is gated independently in the installer.
+pub const fn vector_element_access() -> bool {
+    cfg!(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        target_os = "linux"
+    ))
+}
+
 /// Whether the host emitter encodes the **raw `UnboxedF64`** double-float
 /// pipeline: `ConstDouble`, raw `FloatAdd`/`Sub`/`Mul`/`Div`/`Neg`/`Sqrt` and
 /// the raw double comparisons.

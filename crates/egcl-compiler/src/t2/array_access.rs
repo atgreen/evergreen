@@ -68,7 +68,7 @@ fn clear_mv(f: &mut Function, site: Inst, old: &InstData) {
 /// UnboxFloat uses. The tagged artifact accepts general vectors and packed U8 arrays;
 /// the raw candidate additionally loads packed or boxed doubles directly.
 pub fn specialize(f: &mut Function, raw: bool, options: &super::inlining::InlineOptions) -> usize {
-    if !cfg!(all(target_arch = "x86_64", target_os = "linux")) {
+    if !super::target_support::vector_element_access() {
         return 0;
     }
     let sites: Vec<_> = f
