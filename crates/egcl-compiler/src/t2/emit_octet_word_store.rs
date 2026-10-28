@@ -154,8 +154,8 @@ pub(super) fn emit_layout(
     constants: &std::collections::HashMap<crate::t2::ir::Value, u64>,
 ) -> Result<(), EmitError> {
     use crate::t2::ir::{AuxData, InstFlags, TypeBits, ValueRepresentation as Repr};
-    if data.opcode != Opcode::PackedU8Layout
-        || data.args.len() != 1
+    if !matches!(data.opcode, Opcode::PackedU8Layout | Opcode::PackedU8AllocationLayout)
+        || data.args.len() != if data.opcode == Opcode::PackedU8Layout { 1 } else { 2 }
         || data.results.len() != 1
         || data.flags != InstFlags::default()
         || data.frame_state.is_some()

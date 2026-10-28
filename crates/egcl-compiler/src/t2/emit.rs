@@ -380,6 +380,8 @@ fn is_global_special(symbol: u32) -> bool {
 #[path = "ordinary_primitives.rs"]
 mod ordinary_primitives;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub(crate) use ordinary_primitives::packed_u8_adapter;
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub use ordinary_primitives::{OrdinaryPrimitive, lower_ordinary_primitives,
     PackedU8AdapterSymbols, register_packed_u8_adapter};
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -3741,6 +3743,13 @@ fn emit_type_check(
                                         // bits 63:56, hence byte offset 7 on the supported little-endian x86-64.
         a.extend_from_slice(&[0x80, 0x7A, 0x07, egcl_rt::object::type_id::BIGNUM]);
         a.jcc(Cc::E, found);
+    } else if bits == TypeBits::DOUBLE_FLOAT {
+        single_tag(a, egcl_rt::value::TAG_HEAP_OBJECT as i32);
+        a.jcc(Cc::Ne, not_found);
+        mov_rr(a, SCRATCH, xr);
+        alu_r_imm(a, AND, SCRATCH, -8);
+        a.extend_from_slice(&[0x80, 0x7A, 0x07, egcl_rt::object::type_id::DOUBLE_FLOAT]);
+        a.jcc(Cc::E, found);
     } else if bits == TypeBits::STRING {
         // NOTE: `typep_class::STRING` is deliberately NOT accepted here, so it
         // falls through to the declining `else` below and T2 uses a real call
@@ -5493,7 +5502,13 @@ fn native_representations_supported(
                     || data.results.len() != 1
                     || f.value(data.results[0]).repr != Repr::UnboxedF64
                     || f.value(data.results[0]).ty.bits != TypeBits::DOUBLE_FLOAT
-                    || !data.flags.guard || !data.flags.effectful || data.frame_state.is_none()
+                    || if data.flags.guard {
+                        !data.flags.effectful || data.frame_state.is_none()
+                    } else {
+                        data.flags != crate::t2::ir::InstFlags::default()
+                            || data.frame_state.is_some() || data.args.len() != 1
+                            || !matches!(data.aux, crate::t2::ir::AuxData::None)
+                    }
                 {
                     return raw_reject(f, "double unboxing shape");
                 }
@@ -5674,7 +5689,7 @@ fn emit_transfer_function_with_storage(
                     | Opcode::Cdr
                     | Opcode::StringCharOrNil
                     | Opcode::VecRef | Opcode::VecSet | Opcode::VecSetInRange | Opcode::ArrayReadDiscarded | Opcode::PackedF64P
-                    | Opcode::MemoryFence | Opcode::TryIntegerShr | Opcode::SmallVectorRangeP | Opcode::PackedU8Layout
+                    | Opcode::MemoryFence | Opcode::TryIntegerShr | Opcode::SmallVectorRangeP | Opcode::PackedU8Layout | Opcode::PackedU8AllocationLayout
                     | Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8 | Opcode::TryStoreIntegerOctets1To8Layout | Opcode::NativePoll
             ) {
                 return Err(EmitError::UnsupportedOp(op_tag(f.inst(inst).opcode)));
@@ -6895,11 +6910,21 @@ fn emit_framed_inner(
                             | Opcode::TryIntegerShr
                             | Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8 | Opcode::TryStoreIntegerOctets1To8Layout
                             | Opcode::NativePoll
-                            | Opcode::SmallVectorRangeP | Opcode::PackedU8Layout
+                            | Opcode::SmallVectorRangeP | Opcode::PackedU8Layout | Opcode::PackedU8AllocationLayout
                             | Opcode::TryPackedF64Set
                             | Opcode::PackedF64P
                     )
                 {
+                    continue;
+                }
+                if d.opcode == Opcode::Guard && !d.flags.guard {
+                    // A verified local FIXNUM refinement is just a tagged SSA
+                    // copy. Its exact-site range proof owns no recovery PC.
+                    continue;
+                }
+                if d.opcode == Opcode::UnboxFloat && !d.flags.guard {
+                    // verify() has independently established the exact scoped
+                    // boxed-double precondition; no failure edge exists.
                     continue;
                 }
                 if d.opcode == Opcode::UnboxFixnum && !d.flags.guard
@@ -7314,6 +7339,8 @@ fn emit_framed_inner(
     let mut bcp_sites: Vec<(u32, u32)> = Vec::new();
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     let mut allocation_layout_completions = HashMap::new();
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let mut delayed_allocation_layouts = std::collections::HashSet::new();
 
     // Emit each block: bind its label, emit its instructions, then its terminator
     // (with block-parameter moves on each out-edge).
@@ -7511,7 +7538,7 @@ fn emit_framed_inner(
             });
             let (mut inst_reg, result_stores) = if stack_float.is_some()
                 || d.opcode == Opcode::TakeValuesToLocals
-                || d.opcode == Opcode::PackedU8Layout
+                || matches!(d.opcode, Opcode::PackedU8Layout | Opcode::PackedU8AllocationLayout)
                 || matches!(d.opcode, Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8 | Opcode::TryStoreIntegerOctets1To8Layout)
                 || d.opcode == Opcode::Invoke
                 || matches!(
@@ -7535,12 +7562,18 @@ fn emit_framed_inner(
             } else if ordinary_call_mode && d.opcode == Opcode::Call {
                 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
                 {
-                let fused = inline_packed_u8::adjacent_layout(f, b, inst, &straight_poll_sources,
-                    ordinary_call.unwrap().returns_at(inst)).is_some_and(|(probe, width)| {
+                let mut delayed_completion = None;
+                let fused = inline_packed_u8::allocation_layout(f, b, inst, &straight_poll_sources,
+                    ordinary_call.unwrap().returns_at(inst)).is_some_and(|layout| {
                     let done = a.label();
                     if inline_packed_u8::emit_ordinary_layout(&mut a, f, &d, &homes,
-                        &const_tagged, inline_alloc_single.contains(&inst), (width, done)).is_some() {
-                        allocation_layout_completions.insert(probe, done);
+                        &const_tagged, inline_alloc_single.contains(&inst), (layout.width, done)).is_some() {
+                        if layout.delayed {
+                            delayed_completion = Some((layout.width, done));
+                            delayed_allocation_layouts.insert(layout.probe);
+                        } else {
+                            allocation_layout_completions.insert(layout.probe, done);
+                        }
                         true
                     } else { false }
                 });
@@ -7559,6 +7592,14 @@ fn emit_framed_inner(
                         mv_known_empty: single_returns.contains(&inst),
                         self_stack_fixups: &mut ordinary_self_stack_fixups,
                         emit_epilogue: &emit_epilogue })?;
+                if let Some((width, done)) = delayed_completion {
+                    // Only the actual slow call reaches here. Publish NIL after
+                    // argument use/result transport, not before its allocating call.
+                    // Inline success already published width8 and jumps to DONE.
+                    mov_imm64(&mut a, RAX, egcl_rt::value::NIL.to_raw() as i64);
+                    store_home(&mut a, homes[&width], RAX, 0);
+                    a.bind(done);
+                }
                 if let Some(done) = inline_done { a.bind(done); } }
             } else if d.opcode == Opcode::ConstDouble {
                 let crate::t2::ir::AuxData::DoubleImm(bits) = d.aux else {
@@ -7814,10 +7855,17 @@ fn emit_framed_inner(
                 {
                     return Err(EmitError::UnsupportedOp(op_tag(d.opcode)));
                 }
-                let label = *inst_deopt.get(&inst)
-                    .ok_or(EmitError::UnsupportedOp(op_tag(d.opcode)))?;
                 let input = *inst_reg.get(&d.args[0]).ok_or(EmitError::UnsupportedOp(0xF2))?;
                 let dst = inst_reg[&d.results[0]];
+                if !d.flags.guard {
+                    // Proven boxed double: no call, allocation, failure branch,
+                    // or recovery PC. The masked pointer never escapes here.
+                    mov_rr(&mut a, SCRATCH, input);
+                    alu_r_imm(&mut a, 4, SCRATCH, -8);
+                    load_mem64_disp(&mut a, dst, SCRATCH, 8);
+                } else {
+                let label = *inst_deopt.get(&inst)
+                    .ok_or(EmitError::UnsupportedOp(op_tag(d.opcode)))?;
                 let done = a.label();
                 if contagion {
                     // Float contagion with a fixnum operand (bliss-thcbb): the
@@ -7851,6 +7899,7 @@ fn emit_framed_inner(
                 a.jcc(Cc::Ne, label);
                 load_mem64_disp(&mut a, dst, SCRATCH, 8);
                 a.bind(done);
+                }
             } else if d.opcode == Opcode::PackedF64P {
                 let failed = a.label();
                 let done = a.label();
@@ -7913,8 +7962,17 @@ fn emit_framed_inner(
                 a.bind(done);
             } else if matches!(d.opcode, Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8 | Opcode::TryStoreIntegerOctets1To8Layout) {
                 octet_word_store::emit_framed(&mut a, f, &d, &homes, &const_tagged)?;
-            } else if d.opcode == Opcode::PackedU8Layout {
-                octet_word_store::emit_layout(&mut a, f, &d, &homes, &const_tagged)?;
+            } else if matches!(d.opcode, Opcode::PackedU8Layout | Opcode::PackedU8AllocationLayout) {
+                #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+                let delayed = delayed_allocation_layouts.remove(&inst);
+                #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+                let delayed = false;
+                if delayed {
+                    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+                    inline_packed_u8::emit_delayed_layout(&mut a, f, &d, &homes, &const_tagged)?;
+                } else {
+                    octet_word_store::emit_layout(&mut a, f, &d, &homes, &const_tagged)?;
+                }
             } else if d.opcode == Opcode::TryIntegerShr {
                 integer_shift::emit(&mut a, &d, &inst_reg, &const_tagged)?;
             } else if d.opcode == Opcode::TryPackedF64Set {
@@ -8227,6 +8285,19 @@ fn emit_framed_inner(
                     label,
                 )?;
             } else if d.opcode == Opcode::Guard {
+                if !d.flags.guard {
+                    // verify() independently establishes the complete type and
+                    // inclusive range precondition; MOV preserves CF and roots.
+                    let dst = inst_reg[&d.results[0]];
+                    if let Some(&bits) = const_tagged.get(&d.args[0]) {
+                        mov_imm64(&mut a, dst, bits as i64);
+                    } else if let Some(&value) = consts.get(&d.args[0]) {
+                        mov_imm64(&mut a, dst, egcl_rt::value::EgclVal::from_fixnum(value).0 as i64);
+                    } else {
+                        mov_rr(&mut a, dst, inst_reg[&d.args[0]]);
+                    }
+                    proven.insert(d.results[0]);
+                } else {
                 let label = inst_deopt.get(&inst).copied().unwrap_or(deopt);
                 match d.aux {
                     AuxData::BuiltinBinding { address, expected } => {
@@ -8256,6 +8327,7 @@ fn emit_framed_inner(
                         }
                     }
                     _ => return Err(EmitError::UnsupportedOp(op_tag(Opcode::Guard))),
+                }
                 }
             } else if matches!(d.opcode, Opcode::Car | Opcode::Cdr) {
                 emit_cons_field_load(&mut a, &d, &mut inst_reg, &mut inst_pool)?;

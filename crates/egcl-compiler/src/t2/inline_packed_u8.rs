@@ -94,8 +94,13 @@ pub(super) fn adjacent_layout(
     let probe = *instructions.get(position + 1)?;
     let layout = f.inst(probe);
     if straight_polls.contains(&probe)
-        || layout.opcode != Opcode::PackedU8Layout
-        || layout.args.as_slice() != data.results.as_slice()
+        || !matches!(layout.opcode, Opcode::PackedU8Layout | Opcode::PackedU8AllocationLayout)
+        || (if layout.opcode == Opcode::PackedU8Layout {
+            layout.args.as_slice() != data.results.as_slice()
+        } else {
+            layout.args.len() != 2 || layout.args[0] != data.results[0]
+                || layout.args[1] != data.results[0]
+        })
         || layout.results.len() != 1
         || layout.flags != crate::t2::ir::InstFlags::default()
         || !matches!(layout.aux, AuxData::None)
@@ -108,6 +113,73 @@ pub(super) fn adjacent_layout(
         return None;
     }
     Some((probe, layout.results[0]))
+}
+
+/// An explicit producer can remain separated by an observable MV clear. Keep
+/// that instruction on BOTH execution paths; never jump over a poll or effect.
+#[derive(Clone, Copy)]
+pub(super) struct AllocationLayout {
+    pub probe: crate::t2::ir::Inst,
+    pub width: Value,
+    pub delayed: bool,
+}
+
+pub(super) fn allocation_layout(
+    f: &Function,
+    block: crate::t2::ir::Block,
+    call: crate::t2::ir::Inst,
+    straight_polls: &std::collections::HashSet<crate::t2::ir::Inst>,
+    tail: bool,
+) -> Option<AllocationLayout> {
+    if let Some((probe, width)) = adjacent_layout(f, block, call, straight_polls, tail) {
+        return Some(AllocationLayout { probe, width, delayed: false });
+    }
+    if tail || f.inst(call).opcode != Opcode::Call || shape(f, f.inst(call)).is_none() {
+        return None;
+    }
+    let instructions = &f.block(block).insts;
+    let position = instructions.iter().position(|&i| i == call)?;
+    let mut index = position + 1;
+    while let Some(&inst) = instructions.get(index) {
+        let d = f.inst(inst);
+        if straight_polls.contains(&inst) { return None; }
+        if d.opcode != Opcode::ClearMv { break; }
+        // This gap has no values/homes to overwrite the early scalar evidence.
+        // ClearMv remains emitted, even when the incoming MV state is empty.
+        if !d.args.is_empty() || !d.results.is_empty() || !d.targets.is_empty()
+            || d.flags.call || d.flags.safepoint || d.flags.terminator || d.flags.guard
+        { return None; }
+        index += 1;
+    }
+    let probe = *instructions.get(index)?;
+    if straight_polls.contains(&probe) || f.inst(probe).opcode != Opcode::PackedU8AllocationLayout {
+        return None;
+    }
+    let facts = crate::t2::value_facts::StructuralFacts::analyze(f);
+    if crate::t2::allocation_facts::allocation_site(f, probe, &facts) != Some(call) {
+        return None;
+    }
+    Some(AllocationLayout { probe, width: f.inst(probe).results[0], delayed: index != position + 1 })
+}
+
+/// Consume an early scalar completion after a retained MV clear. The scalar is
+/// initialized on both call outcomes; NIL requests the real slow-result probe.
+/// Original tagged array homes, not an allocation/interior pointer, are reloaded.
+pub(super) fn emit_delayed_layout(
+    a: &mut Asm,
+    f: &Function,
+    data: &InstData,
+    homes: &HashMap<Value, FramedHome>,
+    constants: &HashMap<Value, u64>,
+) -> Result<(), EmitError> {
+    let done = a.label();
+    let width = *data.results.first().ok_or(EmitError::UnsupportedOp(0xf2))?;
+    load_home(a, RAX, *homes.get(&width).ok_or(EmitError::UnsupportedOp(0xf2))?, 0);
+    alu_r_imm(a, 7, RAX, egcl_rt::value::NIL.to_raw() as i32);
+    a.jcc(Cc::Ne, done);
+    super::octet_word_store::emit_layout(a, f, data, homes, constants)?;
+    a.bind(done);
+    Ok(())
 }
 
 /// Only the runtime-validated bump success supplies this width. Every slow
@@ -649,4 +721,59 @@ mod tests {
             assert_eq!(observed[3], observed[6], "native stack remains balanced");
         }
     }
+    #[test]
+    fn explicit_allocation_evidence_crosses_retained_clear_but_not_poll_or_effect() {
+        let (mut f, call, probe, width) = paired_fixture();
+        assert_eq!(crate::t2::allocation_facts::specialize(&mut f), 1);
+        let block = f.entry();
+        let (clear, _) = f.push_inst(block, InstData {
+            opcode: Opcode::ClearMv, args: vec![], results: vec![], aux: AuxData::None,
+            flags: InstFlags { effectful: true, ..Default::default() },
+            frame_state: None, targets: vec![], source_pos: 0,
+        }, &[]);
+        assert_eq!(f.block_mut(block).insts.pop(), Some(clear));
+        f.block_mut(block).insts.insert(1, clear);
+        let mut polls = std::collections::HashSet::new();
+        let selected = allocation_layout(&f, block, call, &polls, false).unwrap();
+        assert_eq!(selected.probe, probe);
+        assert_eq!(selected.width, width);
+        assert!(selected.delayed);
+        assert!(allocation_layout(&f, block, call, &polls, true).is_none());
+        polls.insert(clear);
+        assert!(allocation_layout(&f, block, call, &polls, false).is_none());
+        polls.clear(); polls.insert(probe);
+        assert!(allocation_layout(&f, block, call, &polls, false).is_none());
+        polls.clear();
+        f.inst_mut(clear).flags.safepoint = true;
+        assert!(allocation_layout(&f, block, call, &polls, false).is_none());
+        f.inst_mut(clear).flags.safepoint = false;
+        f.inst_mut(clear).opcode = Opcode::Store;
+        assert!(allocation_layout(&f, block, call, &polls, false).is_none());
+    }
+
+    #[test]
+    fn explicit_allocation_native_consumer_uses_fast_scalar_or_real_slow_probe() {
+        let (mut f, _, probe, width) = paired_fixture();
+        assert_eq!(crate::t2::allocation_facts::specialize(&mut f), 1);
+        let input = f.inst(probe).args[0];
+        // Bare-leaf ABI: RDI holds the tagged object, RSI the prepublished
+        // completion. No pointer is retained and this leaf cannot collect.
+        let homes = HashMap::from([(input, FramedHome::Reg(7)), (width, FramedHome::Reg(6))]);
+        let mut a = Asm::new();
+        emit_delayed_layout(&mut a, &f, f.inst(probe), &homes, &HashMap::new()).unwrap();
+        mov_rr(&mut a, RAX, 6);
+        a.push(0xc3);
+        let code = a.finish().unwrap();
+        let jit = egcl_rt::jit::JitBuffer::new(&code).unwrap();
+        let run: extern "C" fn(u64, u64) -> u64 = unsafe { std::mem::transmute(jit.as_ptr()) };
+        egcl_rt::rooted!(array = egcl_rt::packed_u8::make(8, 0).unwrap());
+        let nil = egcl_rt::value::NIL.to_raw();
+        assert_eq!(run((*array).to_raw(), 8 << 3), 8 << 3, "validated fast completion");
+        assert_eq!(run((*array).to_raw(), nil), 8 << 3, "slow UB8 result is probed");
+        assert_eq!(run(egcl_rt::value::T.to_raw(), nil), nil,
+            "generic slow return has no unconditional allocation layout");
+        // Emission-only construction plus bare native execution checks the
+        // transport/consumer, not a moving collection or actual TLAB allocation.
+    }
+
 }

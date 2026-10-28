@@ -408,6 +408,12 @@ pub enum Opcode {
     /// Explicit block-entry poll around a bounded straight-line replacement.
     /// No operands/results; exact entry/exit recovery state is mandatory.
     NativePoll,
+    /// Allocation-backed immutable-layout witness. Inputs are (subject alias,
+    /// original canonical constructor result); result is tagged width 8/16 or
+    /// NIL. Only validated inline success supplies width 8 directly. The slow
+    /// collecting call remains generic and its result is probed normally.
+    /// Explicit SSA operands preserve the relation through ordinary cloning.
+    PackedU8AllocationLayout,
 }
 
 impl Opcode {

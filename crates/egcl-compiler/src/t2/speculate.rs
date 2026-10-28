@@ -375,6 +375,17 @@ impl OperandFacts for super::infer::InferenceResult {
     }
 }
 
+struct SiteOperandFacts<'a> {
+    facts: &'a super::infer::InferenceResult,
+    site: Inst,
+}
+
+impl OperandFacts for SiteOperandFacts<'_> {
+    fn bits(&self, value: Value) -> Option<TypeBits> {
+        Some(self.facts.ty_before(self.site, value).bits)
+    }
+}
+
 struct CapturedOperandFacts(Vec<(Value, TypeBits)>);
 
 impl OperandFacts for CapturedOperandFacts {
@@ -802,12 +813,26 @@ fn reconcile_with_operands(
 struct NumericConstraints(std::cell::OnceCell<super::infer::InferenceResult>);
 
 impl NumericConstraints {
-    fn inferred_for<'a>(&'a self, f: &Function, args: &[Value]) -> Option<&'a super::infer::InferenceResult> {
-        args.iter().any(|&arg| f.value(arg).ty.bits.0.count_ones() > 1)
-            .then(|| self.0.get_or_init(|| super::infer::infer(f)))
+    fn facts<'a>(&'a self, f: &Function) -> &'a super::infer::InferenceResult {
+        self.0.get_or_init(|| {
+            let sites: Vec<Inst> = f.block_order().iter()
+                .flat_map(|&block| f.block(block).insts.iter().copied())
+                .filter(|&inst| {
+                    let data = f.inst(inst);
+                    matches!(data.opcode, Opcode::Call | Opcode::Invoke)
+                        && matches!(data.aux, AuxData::CallTarget(symbol)
+                            if profiles_numeric_operands(symbol))
+                }).collect();
+            super::infer::infer_for_sites(f, &sites)
+        })
     }
 
-    fn excludes_numeric(&self, f: &Function, args: &[Value]) -> bool {
+    fn inferred_for<'a>(&'a self, f: &Function, args: &[Value]) -> Option<&'a super::infer::InferenceResult> {
+        args.iter().any(|&arg| f.value(arg).ty.bits.0.count_ones() > 1)
+            .then(|| self.facts(f))
+    }
+
+    fn excludes_numeric(&self, f: &Function, site: Inst, args: &[Value]) -> bool {
         let numeric = TypeBits::FIXNUM
             .join(TypeBits::BIGNUM)
             .join(TypeBits::RATIO)
@@ -826,8 +851,8 @@ impl NumericConstraints {
         }) {
             return false;
         }
-        let facts = self.0.get_or_init(|| super::infer::infer(f));
-        args.iter().any(|&arg| excludes(facts.ty(arg).bits))
+        let facts = self.facts(f);
+        args.iter().any(|&arg| excludes(facts.ty_before(site, arg).bits))
     }
 }
 
@@ -854,7 +879,7 @@ fn split_variadic_double_arithmetic(f: &mut Function, profile: &impl Fn(u32) -> 
             if arith_of(sym).is_none() || profile(frame_state_bcp(f, state)) != Some(SpecType::DoubleFloat) {
                 continue;
             }
-            if !constraints.excludes_numeric(f, &data.args) {
+            if !constraints.excludes_numeric(f, inst, &data.args) {
                 sites.push(inst);
             }
         }
@@ -981,8 +1006,10 @@ fn speculate_double_only_sites(
                 }
                 let state = data.frame_state?;
                 let observed = profile(frame_state_bcp(f, state))?;
-                if constraints.excludes_numeric(f, &data.args) { return None; }
-                let inferred = constraints.inferred_for(f, &data.args).map(|facts| facts as &dyn OperandFacts);
+                if constraints.excludes_numeric(f, site, &data.args) { return None; }
+                let scoped = constraints.inferred_for(f, &data.args)
+                    .map(|facts| SiteOperandFacts { facts, site });
+                let inferred = scoped.as_ref().map(|facts| facts as &dyn OperandFacts);
                 if conflicting_operand_facts(f, inferred, &data.args) { return None; }
                 let captured = CapturedOperandFacts(data.args.iter().map(|&value|
                     (value, operand_bits(f, inferred, value))).collect());
@@ -1204,9 +1231,10 @@ fn speculate_selected(
                     // site. None can encode a previous overflow/domain failure;
                     // operand types alone must not reactivate that speculation.
                     profile(bcp).and_then(|observed| {
-                        let inferred = profiles_numeric_operands(sym)
-                            .then(|| constraints.inferred_for(f, &data.args))
-                            .flatten().map(|facts| facts as &dyn OperandFacts);
+                        let scoped = profiles_numeric_operands(sym)
+                            .then(|| constraints.inferred_for(f, &data.args)).flatten()
+                            .map(|facts| SiteOperandFacts { facts, site: inst });
+                        let inferred = scoped.as_ref().map(|facts| facts as &dyn OperandFacts);
                         if conflicting_operand_facts(f, inferred, &data.args) { return None; }
                         let proven = options.double_float && cfg!(target_arch = "x86_64")
                             && (arith_of(sym).is_some() || comparison)
@@ -1230,8 +1258,24 @@ fn speculate_selected(
             else {
                 continue;
             };
-            if profiles_numeric_operands(sym) && constraints.excludes_numeric(f, &data.args) {
+            if profiles_numeric_operands(sym) && constraints.excludes_numeric(f, inst, &data.args) {
                 continue;
+            }
+            if spec == SpecType::Fixnum {
+                if let Some(operation) = super::numeric_result_facts::Operation::for_call(sym, argc) {
+                    let facts = constraints.facts(f);
+                    let integer = TypeBits::FIXNUM.join(TypeBits::BIGNUM);
+                    let ranges: Option<Vec<_>> = data.args.iter().map(|&value| {
+                        let ty = facts.ty_before(inst, value);
+                        (!ty.bits.is_bottom() && integer.contains(ty.bits))
+                            .then_some(ty.range).flatten()
+                    }).collect();
+                    if ranges.is_some_and(|ranges|
+                        super::numeric_result_facts::excludes_fixnum_result(operation, &ranges))
+                    {
+                        continue;
+                    }
+                }
             }
             if spec == SpecType::DoubleFloat {
                 // Only binary arithmetic and comparisons have a raw double form.
@@ -3052,4 +3096,306 @@ mod tests {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
+    fn bounded_result_join_call(
+        name: &str,
+        left: i64,
+        right: i64,
+        second: Option<i64>,
+    ) -> (Function, Inst) {
+        use egcl_rt::bytecode::{BytecodeFunction, Instr};
+        use egcl_rt::value::EgclVal;
+        let symbol = egcl_rt::symbols::intern(name);
+        let mut code = vec![
+            Instr::LoadLocal(0),
+            Instr::BrIfFalse(4),
+            Instr::Const(0),
+            Instr::Br(5),
+            Instr::Const(1),
+            Instr::StoreLocal(1),
+            Instr::LoadLocal(1),
+        ];
+        let mut constants = vec![EgclVal::from_fixnum(left), EgclVal::from_fixnum(right)];
+        if let Some(value) = second {
+            code.push(Instr::Const(2));
+            constants.push(EgclVal::from_fixnum(value));
+        }
+        code.push(Instr::CallNamed {
+            sym: symbol,
+            nargs: if second.is_some() { 2 } else { 1 },
+        });
+        code.push(Instr::Return);
+        let body = BytecodeFunction {
+            self_call_sites: vec![],
+            notinline_sites: vec![],
+            code,
+            constants,
+            load_time_values: vec![],
+            handler_cases: vec![],
+            handler_binds: vec![],
+            names: vec![],
+            restart_cases: vec![],
+            nested_functions: vec![],
+            param_layout: vec![],
+            param_types: vec![],
+            has_env: false,
+            n_locals: 2,
+            max_stack: 2,
+            arity: 1,
+            name: "bounded-result-join".into(),
+            params_form: egcl_rt::value::NIL,
+            min_args: 1,
+            max_args: Some(1),
+            variadic: false,
+            binder_cache: Default::default(),
+        };
+        let f = crate::t2::build::build_from_bytecode(&body).unwrap();
+        crate::t2::verify::verify(&f).unwrap();
+        let call = f
+            .block_order()
+            .iter()
+            .flat_map(|&b| &f.block(b).insts)
+            .copied()
+            .find(|&i| {
+                f.inst(i).opcode == Opcode::Call
+                    && matches!(f.inst(i).aux, AuxData::CallTarget(s) if s == symbol)
+            })
+            .unwrap();
+        if left != right {
+            assert_eq!(
+                f.value(f.inst(call).args[0]).ty,
+                IRType::TOP,
+                "real builder join must need inferred bounds"
+            );
+        }
+        let inferred = crate::t2::infer::infer(&f);
+        assert_eq!(
+            inferred.ty(f.inst(call).args[0]).range,
+            Some(crate::t2::ir::Range {
+                lo: left.min(right),
+                hi: left.max(right)
+            })
+        );
+        (f, call)
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn bounded_result_intervals_keep_guaranteed_overflow_calls_generic() {
+        let min = egcl_rt::bignum::FIXNUM_MIN;
+        let max = egcl_rt::bignum::FIXNUM_MAX;
+        for (name, lo, hi, second) in [
+            ("+", max - 1, max, Some(2)),
+            ("-", min, min + 1, Some(2)),
+            ("*", max / 2 + 1, max, Some(2)),
+            ("-", min, min, None),
+            ("1+", max, max, None),
+            ("1-", min, min, None),
+        ] {
+            let (mut f, call) = bounded_result_join_call(name, lo, hi, second);
+            let original = format!("{:?}", f.inst(call));
+            let state = f.inst(call).frame_state.unwrap();
+            let original_state = format!("{:?}", f.frame_states.get(state));
+            let count = f.num_insts();
+            assert_eq!(
+                speculate(&mut f, &|_| Some(SpecType::Fixnum)),
+                0,
+                "{name} [{lo},{hi}]"
+            );
+            assert_eq!(
+                f.num_insts(),
+                count,
+                "no doomed operand guards or MV rewrites"
+            );
+            assert_eq!(format!("{:?}", f.inst(call)), original);
+            assert_eq!(format!("{:?}", f.frame_states.get(state)), original_state);
+            crate::t2::verify::verify(&f).unwrap();
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn overlapping_result_interval_and_none_policy_keep_their_guards_and_policy() {
+        let max = egcl_rt::bignum::FIXNUM_MAX;
+        let (mut f, call) = bounded_result_join_call("+", max - 1, max, Some(1));
+        assert_eq!(speculate(&mut f, &|_| Some(SpecType::Fixnum)), 1);
+        assert_eq!(f.inst(call).opcode, Opcode::FixnumAdd);
+        assert!(f.inst(call).flags.guard && f.inst(call).frame_state.is_some());
+        crate::t2::verify::verify(&f).unwrap();
+        let (mut f, call) = bounded_result_join_call("+", 0, 9, Some(1));
+        let original = format!("{:?}", f.inst(call));
+        assert_eq!(
+            speculate(&mut f, &|_| None),
+            0,
+            "bounds cannot revive a declined profile"
+        );
+        assert_eq!(format!("{:?}", f.inst(call)), original);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn guaranteed_overflow_invoke_keeps_normal_and_exceptional_projections() {
+        use crate::t2::ir::{BlockCall, InstData};
+        let max = egcl_rt::bignum::FIXNUM_MAX;
+        let (mut f, call) = bounded_result_join_call("+", max - 1, max, Some(2));
+        let block = f
+            .block_order()
+            .iter()
+            .copied()
+            .find(|&b| f.block(b).insts.contains(&call))
+            .unwrap();
+        let returned = f.block_mut(block).insts.pop().unwrap();
+        assert_eq!(f.inst(returned).opcode, Opcode::Return);
+        let normal = f.make_block();
+        let cold = f.make_block();
+        let parameter = f.add_block_param(normal, IRType::TOP, ValueRepresentation::Tagged);
+        let result = f.inst(call).results[0];
+        let state = f.inst(call).frame_state.unwrap();
+        let invoke = f.inst_mut(call);
+        invoke.opcode = Opcode::Invoke;
+        invoke.flags.terminator = true;
+        invoke.targets = vec![
+            BlockCall {
+                block: normal,
+                args: vec![result],
+            },
+            BlockCall {
+                block: cold,
+                args: vec![],
+            },
+        ];
+        let mut ret = f.inst(returned).clone();
+        ret.args = vec![parameter];
+        f.set_terminator(normal, ret);
+        let transfer = f.set_terminator(
+            cold,
+            InstData {
+                opcode: Opcode::NlxTransfer,
+                args: vec![],
+                results: vec![],
+                aux: AuxData::TransferSite {
+                    origin_bcp: 8,
+                    scopes: vec![],
+                },
+                flags: InstFlags {
+                    effectful: true,
+                    call: true,
+                    safepoint: true,
+                    ..Default::default()
+                },
+                targets: vec![],
+                frame_state: Some(state),
+                source_pos: 0,
+            },
+        );
+        crate::t2::verify::verify(&f).unwrap();
+        let original = format!("{:?}", f.inst(call));
+        let state_before = format!("{:?}", f.frame_states.get(state));
+        let transfer_before = format!("{:?}", f.inst(transfer));
+        let count = f.num_insts();
+        assert_eq!(speculate(&mut f, &|_| Some(SpecType::Fixnum)), 0);
+        assert_eq!(f.num_insts(), count);
+        assert_eq!(format!("{:?}", f.inst(call)), original);
+        assert_eq!(format!("{:?}", f.frame_states.get(state)), state_before);
+        assert_eq!(format!("{:?}", f.inst(transfer)), transfer_before);
+        crate::t2::verify::verify(&f).unwrap();
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    fn checked_source_ranges_reach_existing_add_sub_overflow_elision() {
+        use egcl_rt::bytecode::{BytecodeFunction, DeclaredType, Instr};
+        use egcl_rt::value::EgclVal;
+        extern "C" fn deopt() -> u64 {
+            egcl_rt::value::NIL.to_raw()
+        }
+        extern "C" fn clear_mv(_: u64, _: u64, _: u64) -> u64 {
+            0
+        }
+        for name in ["+", "-"] {
+            let symbol = egcl_rt::symbols::intern(name);
+            let body = BytecodeFunction {
+                self_call_sites: vec![],
+                notinline_sites: vec![],
+                code: vec![
+                    Instr::LoadLocal(0),
+                    Instr::CheckResult(DeclaredType::FixnumRange {
+                        lower: -40,
+                        upper: 40,
+                    }),
+                    Instr::Const(0),
+                    Instr::CallNamed {
+                        sym: symbol,
+                        nargs: 2,
+                    },
+                    Instr::Return,
+                ],
+                constants: vec![EgclVal::from_fixnum(1)],
+                load_time_values: vec![],
+                handler_cases: vec![],
+                handler_binds: vec![],
+                names: vec![],
+                restart_cases: vec![],
+                nested_functions: vec![],
+                param_layout: vec![],
+                param_types: vec![],
+                has_env: false,
+                n_locals: 1,
+                max_stack: 2,
+                arity: 1,
+                name: "checked-source-range".into(),
+                params_form: egcl_rt::value::NIL,
+                min_args: 1,
+                max_args: Some(1),
+                variadic: false,
+                binder_cache: Default::default(),
+            };
+            let mut f = crate::t2::build::build_from_bytecode(&body).unwrap();
+            assert_eq!(speculate(&mut f, &|_| Some(SpecType::Fixnum)), 1);
+            let arithmetic = f
+                .block_order()
+                .iter()
+                .flat_map(|&b| &f.block(b).insts)
+                .copied()
+                .find(|&i| matches!(f.inst(i).opcode, Opcode::FixnumAdd | Opcode::FixnumSub))
+                .unwrap();
+            let bounded = f.inst(arithmetic).args[0];
+            assert_eq!(
+                f.value(bounded).ty.range,
+                Some(crate::t2::ir::Range { lo: -40, hi: 40 })
+            );
+            crate::t2::verify::verify(&f).unwrap();
+            let code = crate::t2::emit::emit_framed(
+                &f,
+                deopt as *const () as usize as u64,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                clear_mv as *const () as usize as u64,
+                None,
+            )
+            .unwrap()
+            .code;
+            assert!(
+                !iced_x86::Decoder::new(64, &code, iced_x86::DecoderOptions::NONE)
+                    .into_iter()
+                    .any(|i| i.mnemonic() == iced_x86::Mnemonic::Jo),
+                "range reaches existing emitter proof; no duplicate overflow mechanism"
+            );
+            let buffer = egcl_rt::jit::JitBuffer::new(&code).unwrap();
+            let function: extern "C" fn(*mut u64) -> u64 =
+                unsafe { std::mem::transmute(buffer.as_ptr()) };
+            for x in [-40, 0, 40] {
+                let mut frame = [egcl_rt::value::NIL.to_raw(); 16];
+                frame[0] = EgclVal::from_fixnum(x).to_raw();
+                assert_eq!(
+                    EgclVal(function(frame.as_mut_ptr())).as_fixnum(),
+                    if name == "+" { x + 1 } else { x - 1 }
+                );
+            }
+        }
+    }
 }

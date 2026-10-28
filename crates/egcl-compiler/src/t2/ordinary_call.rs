@@ -610,6 +610,9 @@ pub fn emit_framed_ordinary_function_with_self_call_facts(
                 | Opcode::FloatCmpGt | Opcode::FloatCmpGe
                     if data.args.iter().all(|&v| f.value(v).repr == ValueRepresentation::UnboxedF64) => {}
                 Opcode::ConstDouble | Opcode::BoxFloat | Opcode::BoxFixnum => {}
+                // The IR verifier independently proves every pure double load
+                // at its exact use site, including branch/guard dominance.
+                Opcode::UnboxFloat | Opcode::Guard if !data.flags.guard => {}
                 Opcode::UnboxFixnum if !data.flags.guard => {
                     if data.args.len() != 1 || !crate::t2::unbox_fixnum::proven_tagged_fixnum(f, data.args[0]) {
                         return Err(declined("unproven pure fixnum unbox"));
@@ -663,7 +666,7 @@ pub fn emit_framed_ordinary_function_with_self_call_facts(
                 | Opcode::Car | Opcode::Cdr | Opcode::ConstHeapObj
                 | Opcode::StringByteLength | Opcode::StringAsciiCharAt | Opcode::StringCharOrNil
                 | Opcode::MemoryFence | Opcode::TryIntegerShr | Opcode::SmallVectorRangeP
-                | Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8 | Opcode::TryStoreIntegerOctets1To8Layout | Opcode::PackedU8Layout | Opcode::NativePoll => {}
+                | Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8 | Opcode::TryStoreIntegerOctets1To8Layout | Opcode::PackedU8Layout | Opcode::PackedU8AllocationLayout | Opcode::NativePoll => {}
                 _ => return Err(EmitError::UnsupportedOp(super::op_tag(data.opcode))),
             }
         }

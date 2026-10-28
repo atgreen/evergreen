@@ -3274,13 +3274,16 @@ impl<'a> Builder<'a> {
                 let Instr::Const(cidx) = self.bf.code[bcp - 1] else {
                     return Ok(false);
                 };
-                let Some(super::constants::ConstantDescription::Symbol { name: Some(type_name), .. }) =
+                let Some(super::constants::ConstantDescription::Symbol { index: type_index, name: Some(type_name) }) =
                     self.constants.get(cidx as usize)
                 else {
                     return Ok(false);
                 };
                 match type_name.rsplit(':').next().unwrap_or(type_name) {
                     "FIXNUM" => Some(TypeBits::FIXNUM),
+                    "DOUBLE-FLOAT" if cfg!(all(target_arch = "x86_64", target_os = "linux"))
+                        && egcl_rt::symbols::registry_key(*type_index).as_deref() == Some("DOUBLE-FLOAT")
+                        => Some(TypeBits::DOUBLE_FLOAT),
                     // (TYPEP x 'CONS) is the same unsound tag test as CONSP
                     // above -- a closure would answer T.  See bliss-74rl.
                     "CONS" => return Ok(false),

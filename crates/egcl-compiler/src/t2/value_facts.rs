@@ -35,6 +35,9 @@ pub enum LayoutEvidence {
     RefinedValue,
     /// Header width or NIL: the consumer must retain its failure check.
     NullableHeaderWidth,
+    /// Inline allocation success supplies width 8; an unchanged generic slow
+    /// return is probed. Still nullable: never an unconditional U8 type fact.
+    AllocationOrProbeWidth,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -156,6 +159,20 @@ impl StructuralFacts {
         while let Some(block) = todo.pop() {
             if facts.osr_reachable.insert(block) {
                 todo.extend(f.succs(block));
+            }
+        }
+        // Forwarding is complete before validating the explicit allocation
+        // relation, so aliases and seeded phis use the same shared proof rules.
+        for &block in f.block_order() {
+            for &inst in &f.block(block).insts {
+                if f.inst(inst).opcode == Opcode::PackedU8AllocationLayout
+                    && super::allocation_facts::allocation_site(f, inst, &facts).is_some()
+                {
+                    let d = f.inst(inst);
+                    facts.layouts.push(LayoutFact { producer: inst, subject: d.args[0],
+                        evidence: d.results[0], kind: LayoutKind::PackedU8,
+                        encoding: LayoutEvidence::AllocationOrProbeWidth });
+                }
             }
         }
         facts
@@ -349,8 +366,8 @@ impl StructuralFacts {
     pub fn witness_for(&self, subject: Value, witness: Value, consumer: Inst) -> bool {
         self.layouts.iter().any(|fact| {
             fact.kind == LayoutKind::PackedU8
-                && fact.encoding == LayoutEvidence::NullableHeaderWidth
-                && fact.evidence == witness
+                && matches!(fact.encoding, LayoutEvidence::NullableHeaderWidth | LayoutEvidence::AllocationOrProbeWidth)
+                && self.same_identity_at(fact.evidence, witness, consumer)
                 && self.precedes(fact.producer, consumer)
                 && self.same_identity_at(fact.subject, subject, consumer)
         })

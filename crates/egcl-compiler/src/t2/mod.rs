@@ -91,6 +91,7 @@ pub mod lower; // IR → MachFunc instruction selection
 pub mod opt_clear_mv; // dead multiple-value-reset elimination
 pub mod opt_dce; // deopt-aware DCE + rematerialisation
 pub mod opt_guard; // guard elimination + hoisting
+pub mod opt_refine; // independently verified instruction-local refinements
 pub mod opt_gvn; // global value numbering / CSE
 pub mod opt_loop_peel; // profitable type-transition peeling with generic fallback
 pub mod vector_ranges;
@@ -153,8 +154,10 @@ pub mod integer_shift;
 
 /// Guarded whole-word replacement of bounded integer-to-octet loops.
 pub mod octet_word_fusion;
+pub mod allocation_facts;
 pub mod array_layout;
 pub mod value_facts;
 
 /// Guarded return-format expectations, deliberately separate from inference.
 pub mod return_hints;
+pub(crate) mod numeric_result_facts;

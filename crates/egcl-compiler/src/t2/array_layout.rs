@@ -132,6 +132,7 @@ pub fn hoist_layouts(f: &mut Function) -> usize {
         f.inst_mut(site).args.push(witness);
         changed += 1;
     }
+    super::allocation_facts::specialize(f);
     changed
 }
 
@@ -157,6 +158,11 @@ pub fn verify_accesses(f: &Function) -> Result<(), String> {
             {
                 return Err("malformed packed-U8 layout producer".into());
             }
+            if data.opcode == Opcode::PackedU8AllocationLayout
+                && super::allocation_facts::allocation_site(f, inst, &facts).is_none()
+            {
+                return Err("invalid allocation-backed layout producer".into());
+            }
             if data.opcode != Opcode::TryStoreIntegerOctets1To8Layout {
                 continue;
             }
@@ -178,17 +184,20 @@ pub fn verify_accesses(f: &Function) -> Result<(), String> {
             {
                 return Err("malformed layout-backed octet kernel".into());
             }
+            let Some(seed) = facts.origin(data.args[4]) else {
+                return Err("layout witness has no unique producer".into());
+            };
             let ValueDef::Result {
                 inst: probe,
                 num: 0,
-            } = f.value(data.args[4]).def
+            } = f.value(seed).def
             else {
                 return Err("layout witness is not a producer result".into());
             };
             let producer = f.inst(probe);
-            if producer.opcode != Opcode::PackedU8Layout
-                || producer.args.len() != 1
-                || producer.results.first() != Some(&data.args[4])
+            if !matches!(producer.opcode, Opcode::PackedU8Layout | Opcode::PackedU8AllocationLayout)
+                || producer.args.len() != if producer.opcode == Opcode::PackedU8Layout { 1 } else { 2 }
+                || producer.results.first() != Some(&seed)
                 || !facts.witness_for(data.args[0], data.args[4], inst)
             {
                 return Err("layout witness is not valid for this array on every entry".into());

@@ -679,10 +679,11 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                             format!("block{bi} requires a guarded tagged store and its SSA witness")));
                     }
                 }
-                if data.opcode == Opcode::PackedU8Layout {
+                if matches!(data.opcode, Opcode::PackedU8Layout | Opcode::PackedU8AllocationLayout) {
                     use crate::t2::ir::{TypeBits, ValueRepresentation as Repr};
                     let valid = data.args.iter().chain(&data.results).all(|v| valid_values.contains(&v.0));
-                    if !valid || data.args.len() != 1 || data.results.len() != 1
+                    if !valid || data.args.len() != if data.opcode == Opcode::PackedU8Layout { 1 } else { 2 }
+                        || data.results.len() != 1
                         || data.flags != crate::t2::ir::InstFlags::default()
                         || data.frame_state.is_some() || !data.targets.is_empty() || !matches!(data.aux, AuxData::None)
                         || (valid && data.results.len() == 1 &&
@@ -868,6 +869,11 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
     if errors.is_empty() {
         if let Err(error) = crate::t2::array_layout::verify_accesses(f) {
             errors.push(VerifyError::new("V8 packed-u8-layout-proof", error));
+        }
+    }
+    if errors.is_empty() {
+        if let Err(error) = super::opt_refine::verify_accesses(f) {
+            errors.push(VerifyError::new("V8 pure-double-unbox-proof", error));
         }
     }
     if errors.is_empty() {
