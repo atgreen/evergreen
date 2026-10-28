@@ -420,6 +420,21 @@ pub fn build_filled_simple_vector(len: usize, fill: EgclVal) -> EgclVal {
     build_vector(&vals)
 }
 
+/// Build fresh bit storage from validated portable bit values.
+pub fn build_bit_vector_from_bits(bits: &[u8]) -> Result<EgclVal, EgclError> {
+    if let Some(&bit) = bits.iter().find(|&&bit| bit > 1) {
+        return Err(EgclError::TypeError {
+            datum: EgclVal::from_fixnum(bit as i64),
+            expected: "BIT".into(),
+        });
+    }
+    let values: Vec<_> = bits
+        .iter()
+        .map(|&bit| EgclVal::from_fixnum(bit as i64))
+        .collect();
+    Ok(build_bit_vector_from_vals(&values))
+}
+
 /// Build a fresh simple bit-vector from a slice of element values (each a
 /// fixnum 0 or 1). Used by SUBSEQ/COPY-SEQ/REVERSE so a bit-vector input yields
 /// a bit-vector result (ANSI: the result of these on a bit-vector is a
@@ -625,8 +640,7 @@ pub fn is_double_float_array(v: EgclVal) -> bool {
     if is_complex_vector(v) {
         return unsafe { (*(v.as_ptr().add(32) as *const EgclVal)).as_fixnum() == 11 };
     }
-    egcl_rt::types::md_array_storage(v)
-        .is_some_and(egcl_rt::packed_f64::is_vector)
+    egcl_rt::types::md_array_storage(v).is_some_and(is_double_float_array)
 }
 
 /// Read numeric bits without allocating a box or retaining an interior pointer.
@@ -641,8 +655,10 @@ pub fn double_float_array_element(v: EgclVal, index: usize) -> Option<f64> {
             None => egcl_rt::packed_f64::get(cvec_storage(v), index),
         };
     }
-    let storage = egcl_rt::types::md_array_storage(v).unwrap_or(v);
-    egcl_rt::packed_f64::get(storage, index)
+    if let Some(storage) = egcl_rt::types::md_array_storage(v) {
+        return double_float_array_element(storage, index);
+    }
+    egcl_rt::packed_f64::get(v, index)
 }
 
 fn is_double_float_sequence(v: EgclVal) -> bool {
@@ -658,7 +674,10 @@ fn set_double_float_array_element(v: EgclVal, index: usize, value: f64) -> bool 
             None => egcl_rt::packed_f64::set(cvec_storage(v), index, value),
         };
     }
-    egcl_rt::packed_f64::set(egcl_rt::types::md_array_storage(v).unwrap_or(v), index, value)
+    if let Some(storage) = egcl_rt::types::md_array_storage(v) {
+        return set_double_float_array_element(storage, index, value);
+    }
+    egcl_rt::packed_f64::set(v, index, value)
 }
 
 fn double_float_value(v: EgclVal) -> Result<f64, EgclError> {
@@ -730,15 +749,16 @@ pub fn cvec_has_fill_pointer(v: EgclVal) -> bool {
 /// base string said CHARACTER and then refused a wide character, so `(setf
 /// subseq)` copied wide characters into it and died (ansi strings
 /// RANDOM-STRING-COMPARISON-TESTS).
-pub fn string_storage_is_base(v: EgclVal) -> bool {
-    if is_complex_vector(v) {
-        if let Some((base, _, _)) = cvec_displacement(v) {
-            return string_storage_is_base(base);
+pub fn string_storage_is_base(mut v: EgclVal) -> bool {
+    loop {
+        if let Some(storage) = egcl_rt::types::md_array_storage(v) {
+            v = storage;
+        } else if is_complex_vector(v) {
+            v = cvec_storage(v);
+        } else {
+            return v.is_heap_object() && v.is_base_string();
         }
-        let store = cvec_storage(v);
-        return store.is_heap_object() && store.is_base_string();
     }
-    v.is_heap_object() && v.is_base_string()
 }
 
 /// Displacement of a complex array (bliss-7o4y): `Some((base, offset, total))`
@@ -1130,6 +1150,125 @@ fn build_complex_array_body(
     unsafe { EgclVal::from_heap_ptr(ptr) }
 }
 
+/// The actual upgraded element storage, independent of the array's rank.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArrayElementKind {
+    General,
+    BaseChar,
+    Character,
+    Bit,
+    DoubleFloat,
+    U8,
+}
+
+pub fn array_element_kind(array: EgclVal) -> Option<ArrayElementKind> {
+    if let Some(storage) = egcl_rt::types::md_array_storage(array) {
+        return array_element_kind(storage);
+    }
+    if !egcl_rt::types::arrayp(array) {
+        return None;
+    }
+    Some(if is_u8_array(array) {
+        ArrayElementKind::U8
+    } else if is_double_float_array(array) {
+        ArrayElementKind::DoubleFloat
+    } else if is_bit_seq(array) {
+        ArrayElementKind::Bit
+    } else if is_char_seq(array) {
+        if string_storage_is_base(array) {
+            ArrayElementKind::BaseChar
+        } else {
+            ArrayElementKind::Character
+        }
+    } else {
+        ArrayElementKind::General
+    })
+}
+
+/// MD_ARRAY keeps its shape while its complex row-major backing carries the
+/// independent adjustable attribute. No new heap layout is needed.
+pub fn array_adjustable(array: EgclVal) -> bool {
+    let storage = egcl_rt::types::md_array_storage(array).unwrap_or(array);
+    is_complex_vector(storage) && cvec_adjustable(storage)
+}
+
+/// Commit a fully initialized replacement to an actually adjustable array.
+/// Validation precedes every write. There is no Lisp allocation or safepoint
+/// during validation/commit, and every new heap reference uses the GC barrier.
+pub fn adopt_adjusted_array(array: EgclVal, replacement: EgclVal) -> Result<EgclVal, EgclError> {
+    if !array_adjustable(array) {
+        return Err(EgclError::TypeError {
+            datum: array,
+            expected: "adjustable array".into(),
+        });
+    }
+    let rank = |value| egcl_rt::types::md_array_rank(value).map_or(1, |r| r.as_fixnum());
+    if !(egcl_rt::types::arrayp(replacement) || egcl_rt::types::md_array_p(replacement))
+        || rank(array) != rank(replacement)
+        || array_element_kind(array) != array_element_kind(replacement)
+    {
+        return Err(EgclError::ProgramError(
+            "adjusted array must retain its rank and element type".into(),
+        ));
+    }
+    // Never collapse a displacement chain: its intermediate objects must keep
+    // observing later adjustments. Reject a cycle before making it observable.
+    let mut seen = std::collections::HashSet::new();
+    let mut current = replacement;
+    loop {
+        if current == array || !seen.insert(current.to_raw()) {
+            return Err(EgclError::ProgramError(
+                "circular array displacement".into(),
+            ));
+        }
+        if let Some(storage) = egcl_rt::types::md_array_storage(current) {
+            current = storage;
+        } else if is_complex_vector(current) {
+            current = cvec_storage(current);
+        } else {
+            break;
+        }
+    }
+    if egcl_rt::types::md_array_p(array) {
+        if !egcl_rt::types::md_array_p(replacement) || !array_adjustable(replacement) {
+            return Err(EgclError::ProgramError(
+                "missing adjustable multidimensional replacement".into(),
+            ));
+        }
+        unsafe {
+            for offset in [8usize, 16] {
+                let value = *replacement.as_ptr().add(offset).cast::<EgclVal>();
+                egcl_rt::gc::store_ref(array.as_ptr().add(offset).cast::<EgclVal>(), value);
+            }
+            // Rank is immediate and equal, but preserve the complete metadata.
+            *array.as_ptr().add(24).cast::<EgclVal>() =
+                *replacement.as_ptr().add(24).cast::<EgclVal>();
+        }
+    } else {
+        if !is_complex_vector(replacement) || !cvec_adjustable(replacement) {
+            return Err(EgclError::ProgramError(
+                "missing adjustable vector replacement".into(),
+            ));
+        }
+        // Restored legacy wrappers can have only five body words. Never
+        // write displacement metadata beyond such an allocation.
+        let bytes = unsafe { (*(array.as_ptr() as *const ObjectHeader)).size_units() as usize * 8 };
+        if bytes < 64 && cvec_displacement(replacement).is_some() {
+            return Err(EgclError::ProgramError(
+                "legacy vector cannot hold displacement metadata".into(),
+            ));
+        }
+        cvec_set_storage(array, cvec_storage(replacement));
+        unsafe {
+            for offset in (16usize..bytes.min(64)).step_by(8) {
+                *array.as_ptr().add(offset).cast::<EgclVal>() =
+                    *replacement.as_ptr().add(offset).cast::<EgclVal>();
+            }
+        }
+    }
+    Ok(array)
+}
+
 /// Build a multidimensional (rank ≥ 2) array from row-major `elements`.
 ///
 /// GC-safe: `build_vector` roots its copied element vector before allocating;
@@ -1362,10 +1501,10 @@ pub fn adjust_complex_vector(
         let fill = double_float_value(initial_element)?;
         return resize_double_float_complex_vector(v, new_size, fp, fill);
     }
-    if new_size > cap {
+    if new_size != cap {
         let base_chars = cvec_holds_base_chars(v);
         let mut store: Vec<EgclVal> = Vec::with_capacity(new_size);
-        for i in 0..cap {
+        for i in 0..cap.min(new_size) {
             store.push(cvec_elt(v, i)?);
         }
         store.resize(new_size, initial_element);
@@ -1449,9 +1588,8 @@ fn sort_vector_in_place(
     if is_double_float_sequence(sequence) {
         egcl_rt::rooted!(inputs = (sequence, (predicate, key)));
         let mut elems = collect_elements(sequence).expect("packed sequence");
-        let compare = |a: &EgclVal, b: &EgclVal| {
-            compare_with_predicate(inputs.1.0, inputs.1.1, *a, *b)
-        };
+        let compare =
+            |a: &EgclVal, b: &EgclVal| compare_with_predicate(inputs.1.0, inputs.1.1, *a, *b);
         if stable {
             elems.sort_by(compare);
         } else {
@@ -2647,10 +2785,7 @@ pub fn result_type_is_bit_vector(result_type: EgclVal) -> bool {
         );
         if head_takes_element_type && cell.cdr.is_cons() {
             let elt = unsafe { (*(cell.cdr.as_ptr() as *const ConsCell)).car };
-            if elt.tag() == egcl_rt::value::TAG_SYMBOL {
-                return egcl_compiler::reader::symbol_name(elt.as_symbol_index()).as_deref()
-                    == Some("BIT");
-            }
+            return bit_element_type_p(elt);
         }
     }
     false
@@ -3503,9 +3638,9 @@ fn build_packed_u8(values: &[EgclVal]) -> Result<EgclVal, EgclError> {
     Ok(result)
 }
 
-/// Numeric requests whose upgraded representation is the packed octet class.
-/// Exact BIT requests keep their existing representation.
-pub fn u8_element_type_p(spec: EgclVal) -> bool {
+/// Bounded unsigned requests share one representation policy across public
+/// upgrading, TYPEP, and constructor admission. Only host data is allocated.
+fn small_unsigned_element_bits(spec: EgclVal) -> Option<u8> {
     fn parts(mut spec: EgclVal) -> Option<Vec<EgclVal>> {
         let mut result = Vec::new();
         while spec.is_cons() {
@@ -3522,17 +3657,39 @@ pub fn u8_element_type_p(spec: EgclVal) -> bool {
         if values.len() != 1 || !values[0].is_fixnum() { return None; }
         if lower { values[0].as_fixnum().checked_add(1) } else { values[0].as_fixnum().checked_sub(1) }
     }
-    let Some(values) = parts(spec) else { return false; };
-    if values.is_empty() || !values[0].is_symbol() { return false; }
-    match egcl_compiler::reader::symbol_name(values[0].as_symbol_index()).as_deref() {
-        Some("UNSIGNED-BYTE") if values.len() == 2 && values[1].is_fixnum() => (2..=8).contains(&values[1].as_fixnum()),
-        Some("MOD") if values.len() == 2 && values[1].is_fixnum() => (3..=256).contains(&values[1].as_fixnum()),
-        Some("INTEGER") if values.len() == 3 => {
-            let (Some(lo), Some(hi)) = (bound(values[1], true), bound(values[2], false)) else { return false; };
-            lo >= 0 && hi <= 255 && lo <= hi && (lo, hi) != (0, 1)
-        }
-        _ => false,
+    // NIL and T are symbols semantically, but have their own immediate tags.
+    if spec.is_nil() || spec == T { return None; }
+    if spec.is_symbol() {
+        return (egcl_compiler::reader::symbol_name(spec.as_symbol_index()).as_deref() == Some("BIT"))
+            .then_some(1);
     }
+    let values = parts(spec)?;
+    if values.is_empty() || !values[0].is_symbol() || values[0].is_nil() || values[0] == T { return None; }
+    let (lo, hi) = match egcl_compiler::reader::symbol_name(values[0].as_symbol_index()).as_deref() {
+        Some("UNSIGNED-BYTE") if values.len() == 2 && values[1].is_fixnum() => {
+            let width = values[1].as_fixnum();
+            if !(0..=8).contains(&width) { return None; }
+            (0, (1i64 << width) - 1)
+        }
+        Some("MOD") if values.len() == 2 && values[1].is_fixnum() => {
+            let modulus = values[1].as_fixnum();
+            if !(1..=256).contains(&modulus) { return None; }
+            (0, modulus - 1)
+        }
+        Some("INTEGER") if values.len() == 3 => (bound(values[1], true)?, bound(values[2], false)?),
+        _ => return None,
+    };
+    (lo >= 0 && lo <= hi && hi <= 255).then_some(if hi <= 1 { 1 } else { 8 })
+}
+
+/// Numeric requests whose upgraded representation is packed BIT storage.
+pub fn bit_element_type_p(spec: EgclVal) -> bool {
+    small_unsigned_element_bits(spec) == Some(1)
+}
+
+/// Numeric requests whose upgraded representation is packed octet storage.
+pub fn u8_element_type_p(spec: EgclVal) -> bool {
+    small_unsigned_element_bits(spec) == Some(8)
 }
 
 pub fn result_type_is_u8_vector(result_type: EgclVal) -> bool {

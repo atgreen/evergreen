@@ -128,9 +128,12 @@ abstract-interpretation rules for stack maps, type slots, and unwind metadata;
 a loader MAY reject an older verifier version if the unit lacks metadata needed
 by the current runtime's GC or deoptimizer.
 
-The current bytecode version is **2.2** (`0x0202`). Version 2.1 added bounded
-fixnum parameter metadata; version 2.2 adds `CHECK_RESULT` (`0x45`), described
-below. A unit claiming an earlier minor version cannot contain this opcode.
+The current bytecode version is **2.5** (`0x0205`). Version 2.1 added bounded
+fixnum parameter metadata; version 2.2 added `CHECK_RESULT` (`0x45`), described
+below. Version 2.3 added package, saved-image, and hash-table constants; version 2.4 added packed
+U8 constants and their multidimensional backing references. Version 2.5 adds
+mutable array storage graphs, described below. New opcodes and constant tags
+require their introducing minor version.
 Version-1 writers could
 replace calls to `LDB`, `BYTE`, `TYPEP`, class/structure readers, and literal
 memory fences with instructions that no longer identify the original callable.
@@ -192,10 +195,9 @@ package/name pair (R6.66).  Uninterned and gensym symbols are fresh per load,
 but references to the same pool entry within a unit MUST resolve to the same
 fresh symbol object.
 
-Structural constants (`Cons`, `Vector`, `Pathname`) are materialized after
-primitive constants.  Cycles are not allowed in the portable constant pool; a
-compiler that needs circular literal structure MUST emit load-time bytecode to
-construct it and store the result in a `LoadTimeCell`.
+Structural constants are materialized after primitive constants. Aggregate
+shell allocation and edge installation preserve shared references and the
+content cycles supported since bytecode version 1.14, described below.
 
 #### Exact numeric literals (bytecode version 1.10)
 
@@ -236,6 +238,37 @@ The loader allocates all aggregate shells before installing their edges through
 the GC write barrier. This preserves shared references and cycles even when
 allocation moves or promotes earlier shells. Every edge remains subject to
 constant-pool bounds validation. Older bytecode versions remain readable.
+
+#### Mutable array storage graphs (bytecode version 2.5)
+
+Version 2.5 preserves array specialization, capacity, fill-pointer presence and
+value, adjustability, and displacement aliases. The following constant tags
+extend the pool; all integers are little endian.
+
+| Tag | Constant | Payload |
+| --- | --- | --- |
+| 23 | `PackedU8` (version 2.4) | `u32 count`, `u8 elements[count]` |
+| 24 | `MdPackedU8` (version 2.4) | `u32 rank`, `u64 dimensions[rank]`, `u32 storage_ref` |
+| 25 | `MdStorage` | `u32 rank`, `u64 dimensions[rank]`, `u32 storage_ref` |
+| 26 | `ComplexArray` | `u64 fill_pointer`, `u8 adjustable`, `u8 element_type`, `u8 has_fill_pointer`, `u8 displaced`, optionally `u64 offset`, `u64 size`, then `u32 storage_ref` |
+| 27 | `PackedF64` | `u32 count`, `u64 ieee_bits[count]` |
+| 28 | `BitArray` | `u32 count`, `u8 elements[count]` (only 0 or 1) |
+| 29 | `ArrayString` | `u8 base_string`, `u32 utf8_byte_count`, UTF-8 bytes |
+
+Boolean flags are exactly zero or one. Complex element tags are 0 (general),
+1 (character), 2 (bit), 11 (double-float), and 12 (U8). A displaced storage
+reference names the actual base array, retaining intermediate aliases. Shape,
+capacity, fill-pointer, reference, and element-type checks precede publication.
+Storage/displacement cycles are rejected; cyclic array **contents** are allowed.
+The loader roots all shells before allocating or installing their edges.
+
+Array storage nodes retain same-object identity through rooted writer cache
+entries, including across moving collections. Distinct mutable array backings
+are not structurally coalesced: otherwise ADJUST-ARRAY or element mutation could
+change an unrelated literal. This is an intentional exception to structural
+constant interning (R6.75, SHOULD); ordinary symbol, name, numeric, and cons
+interning is unchanged. Saved-image references continue to name the actual
+saved objects, preserving identity with global bindings and function constants.
 
 ### 6.11.3.3 Function Table
 

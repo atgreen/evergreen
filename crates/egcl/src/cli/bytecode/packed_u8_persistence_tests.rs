@@ -144,7 +144,7 @@ fn packed_u8_image_registry_constants_keep_saved_heap_identity() {
 }
 
 #[test]
-fn packed_u8_bbu_flattens_complex_active_elements_and_displaced_md_extent() {
+fn packed_u8_bbu_preserves_complex_capacity_and_displaced_md_aliases() {
     let _lock = super::super::heap_test_lock()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -170,28 +170,32 @@ fn packed_u8_bbu_flattens_complex_active_elements_and_displaced_md_extent() {
         .value(*carrier)
         .expect("complex U8 constants must be poolable");
     egcl_rt::rooted!(values = materialize_bbu_constants(&parse_pool(&pool)).unwrap());
-    let carrier = values[reference as usize];
-    let complex = egcl_stdlib::elt(carrier, 0).unwrap();
-    assert_eq!(egcl_rt::packed_u8::len(complex), Some(2));
-    assert_eq!(egcl_rt::packed_u8::get(complex, 0), Some(17));
-    assert_eq!(egcl_rt::packed_u8::get(complex, 1), Some(17));
-    let view = egcl_stdlib::elt(carrier, 1).unwrap();
-    assert_eq!(view, egcl_stdlib::elt(carrier, 3).unwrap());
-    assert_eq!(egcl_rt::packed_u8::len(view), Some(2));
-    assert_eq!(egcl_rt::packed_u8::get(view, 0), Some(42));
-    assert_eq!(egcl_rt::packed_u8::get(view, 1), Some(43));
-    let md = egcl_stdlib::elt(carrier, 2).unwrap();
-    let storage = egcl_rt::types::md_array_storage(md).unwrap();
-    assert_eq!(egcl_rt::packed_u8::len(storage), Some(6));
+    egcl_rt::rooted!(carrier = values[reference as usize]);
+    egcl_rt::rooted!(complex = egcl_stdlib::elt(*carrier, 0).unwrap());
+    assert!(egcl_stdlib::is_complex_vector(*complex));
+    assert_eq!(egcl_stdlib::array_total_size(*complex), Some(6));
+    assert_eq!(egcl_stdlib::cvec_fill_pointer(*complex), 2);
+    assert!(egcl_stdlib::cvec_adjustable(*complex));
+    assert_eq!(egcl_stdlib::sequences::u8_array_element(*complex, 0), Some(17));
+    assert_eq!(egcl_stdlib::sequences::u8_array_element(*complex, 5), Some(99));
+    egcl_rt::rooted!(view = egcl_stdlib::elt(*carrier, 1).unwrap());
+    assert_eq!(*view, egcl_stdlib::elt(*carrier, 3).unwrap());
+    assert_eq!(egcl_stdlib::array_total_size(*view), Some(6));
+    assert_eq!(egcl_stdlib::cvec_fill_pointer(*view), 2);
+    let (_, offset, extent) = egcl_stdlib::cvec_displacement(*view).unwrap();
+    assert_eq!((offset, extent), (2, 6));
+    egcl_rt::rooted!(md = egcl_stdlib::elt(*carrier, 2).unwrap());
+    egcl_rt::rooted!(storage = egcl_rt::types::md_array_storage(*md).unwrap());
+    assert_eq!(*storage, *view);
     for index in 0..6 {
         assert_eq!(
-            egcl_rt::packed_u8::get(storage, index),
+            egcl_stdlib::sequences::u8_array_element(*storage, index),
             Some(42 + index as u8)
         );
     }
-    let dims = egcl_rt::types::md_array_dims(md).unwrap();
-    assert_eq!(egcl_stdlib::elt(dims, 0).unwrap(), EgclVal::from_fixnum(2));
-    assert_eq!(egcl_stdlib::elt(dims, 1).unwrap(), EgclVal::from_fixnum(3));
+    egcl_rt::rooted!(dims = egcl_rt::types::md_array_dims(*md).unwrap());
+    assert_eq!(egcl_stdlib::elt(*dims, 0).unwrap(), EgclVal::from_fixnum(2));
+    assert_eq!(egcl_stdlib::elt(*dims, 1).unwrap(), EgclVal::from_fixnum(3));
 }
 
 #[test]

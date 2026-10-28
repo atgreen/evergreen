@@ -61,13 +61,13 @@ fn make_array_fast_path_matches_the_full_option_parsing() {
     );
     assert!(
         stdout.contains(
-            r#"RESULT:(((SIMPLE-VECTOR 3) 3 (NIL NIL NIL)) ((SIMPLE-VECTOR 3) 3 (NIL NIL NIL)) ((SIMPLE-ARRAY (UNSIGNED-BYTE 8) (3)) 3 (0 0 0)) ((SIMPLE-VECTOR 3) 3 (-1 -1 -1)) ((SIMPLE-VECTOR 3) 3 (0 0 0)) ((SIMPLE-VECTOR 3) 3 (0 0 0)) ((SIMPLE-VECTOR 3) 3 (:X :X :X)) ((SIMPLE-VECTOR 3) 3 (1 1 1)) ((SIMPLE-VECTOR 3) 3 (0 0 0)) ((SIMPLE-BIT-VECTOR 3) 3 (0 0 0)) ((SIMPLE-ARRAY CHARACTER (3)) 3 (#\a #\a #\a)) ((SIMPLE-ARRAY DOUBLE-FLOAT (3)) 3 (0.0d0 0.0d0 0.0d0)) ((SIMPLE-VECTOR 3) 3 (7 7 7)) ((SIMPLE-VECTOR 3) 3 (A B C)) T (2 3) ((SIMPLE-VECTOR 0) 0 NIL) :NEGATIVE #(NIL NIL NIL))"#
+            r#"RESULT:(((SIMPLE-VECTOR 3) 3 (NIL NIL NIL)) ((SIMPLE-VECTOR 3) 3 (NIL NIL NIL)) ((SIMPLE-ARRAY (UNSIGNED-BYTE 8) (3)) 3 (0 0 0)) ((SIMPLE-VECTOR 3) 3 (-1 -1 -1)) ((SIMPLE-VECTOR 3) 3 (0 0 0)) ((SIMPLE-VECTOR 3) 3 (0 0 0)) ((SIMPLE-VECTOR 3) 3 (:X :X :X)) ((SIMPLE-VECTOR 3) 3 (1 1 1)) ((SIMPLE-BIT-VECTOR 3) 3 (0 0 0)) ((SIMPLE-BIT-VECTOR 3) 3 (0 0 0)) ((SIMPLE-ARRAY CHARACTER (3)) 3 (#\a #\a #\a)) ((SIMPLE-ARRAY DOUBLE-FLOAT (3)) 3 (0.0d0 0.0d0 0.0d0)) ((SIMPLE-VECTOR 3) 3 (7 7 7)) ((SIMPLE-VECTOR 3) 3 (A B C)) T (2 3) ((SIMPLE-VECTOR 0) 0 NIL) :NEGATIVE :BAD-KEY)"#
         ),
         "{stdout}"
     );
     assert!(
         stdout.contains(
-            r#"CONTENTS:(((SIMPLE-VECTOR 3) 3 (A B C)) ((SIMPLE-ARRAY (UNSIGNED-BYTE 8) (3)) 3 (1 2 3)) ((SIMPLE-VECTOR 2) 2 (#\x #\y)) ((SIMPLE-VECTOR 0) 0 NIL) ((SIMPLE-VECTOR 2) 2 (1.0d0 1.0d0)) :SHORT :IMPROPER ((SIMPLE-VECTOR 2) 2 (1 2)) ((SIMPLE-ARRAY CHARACTER (3)) 3 (#\a #\b #\c)) ((SIMPLE-BIT-VECTOR 4) 4 (1 0 1 1)))"#
+            r#"CONTENTS:(((SIMPLE-VECTOR 3) 3 (A B C)) ((SIMPLE-ARRAY (UNSIGNED-BYTE 8) (3)) 3 (1 2 3)) ((SIMPLE-VECTOR 2) 2 (#\x #\y)) ((SIMPLE-VECTOR 0) 0 NIL) ((SIMPLE-VECTOR 2) 2 (1.0d0 1.0d0)) :SHORT :IMPROPER :BOTH ((SIMPLE-ARRAY CHARACTER (3)) 3 (#\a #\b #\c)) ((SIMPLE-BIT-VECTOR 4) 4 (1 0 1 1)))"#
         ),
         "{stdout}"
     );

@@ -18073,21 +18073,8 @@ fn upgrade_elt(spec: EgclVal) -> EltU {
         if head.is_symbol() && matches!(sym_bare_name_rc(head).as_ref(), "DOUBLE-FLOAT" | "LONG-FLOAT") {
             return EltU::DoubleFloat;
         }
-        // (integer 0 1) / (mod 2) / (unsigned-byte 1) upgrade to BIT; other
-        // compound element types upgrade to T under egcl's policy.
-        if let Some(nt) = parse_num_type(spec) {
-            if matches!(nt.head, NumHead::Integer) {
-                if let (Bnd::Incl(lo), Bnd::Incl(hi)) = (&nt.lo, &nt.hi) {
-                    let zero = egcl_rt::bignum::BigRat::from_i64(0);
-                    let one = egcl_rt::bignum::BigRat::from_i64(1);
-                    if egcl_rt::bignum::bigrat_cmp(lo, &zero) == std::cmp::Ordering::Equal
-                        && egcl_rt::bignum::bigrat_cmp(hi, &one) == std::cmp::Ordering::Equal
-                    {
-                        return EltU::Bit;
-                    }
-
-                }
-            }
+        if egcl_stdlib::sequences::bit_element_type_p(spec) {
+            return EltU::Bit;
         }
     }
     if egcl_stdlib::sequences::u8_element_type_p(spec) { return EltU::U8; }
@@ -18271,16 +18258,13 @@ fn array_subtypep(t1: EgclVal, t2: EgclVal) -> Option<(bool, bool)> {
 /// Packed storage reports its actual element class. General vectors still
 /// report T; `upgrade_elt` separately classifies requested type specifiers.
 fn object_elt_class(object: EgclVal) -> Elt {
-    if is_string_value(object) {
-        Elt::AnyString
-    } else if is_bit_vector_value(object) {
-        Elt::Up(EltU::Bit)
-    } else if egcl_stdlib::sequences::is_u8_array(object) {
-        Elt::Up(EltU::U8)
-    } else if egcl_stdlib::sequences::is_double_float_array(object) {
-        Elt::Up(EltU::DoubleFloat)
-    } else {
-        Elt::Up(EltU::T)
+    use egcl_stdlib::sequences::ArrayElementKind;
+    match egcl_stdlib::sequences::array_element_kind(object) {
+        Some(ArrayElementKind::BaseChar | ArrayElementKind::Character) => Elt::AnyString,
+        Some(ArrayElementKind::Bit) => Elt::Up(EltU::Bit),
+        Some(ArrayElementKind::U8) => Elt::Up(EltU::U8),
+        Some(ArrayElementKind::DoubleFloat) => Elt::Up(EltU::DoubleFloat),
+        Some(ArrayElementKind::General) | None => Elt::Up(EltU::T),
     }
 }
 
@@ -21643,7 +21627,7 @@ fn set_aref_values(name: &str, args: &[EgclVal]) -> Result<EgclVal, EgclError> {
         // A multidimensional place lowered by aref_setf_place carries a
         // single (row-major) index — store straight into the backing
         // storage (bliss-rh0t).
-        egcl_stdlib::set_elt(storage, i, val)?;
+        egcl_stdlib::set_aref(storage, i, val)?;
     } else if !egcl_stdlib::is_complex_vector(seq) && is_string_value(seq) {
         // Char-typed complex vectors are STRINGP but store elements in
         // the backing vector; only simple strings use string_set_char
@@ -22142,7 +22126,8 @@ fn type_of_value(v: EgclVal) -> Result<EgclVal, EgclError> {
         return Ok(vec_to_list(&[head, *element, *dims_list]));
     }
     if egcl_stdlib::sequences::is_double_float_array(v) {
-        let complex = egcl_stdlib::is_complex_vector(v);
+        let complex = egcl_stdlib::is_complex_vector(v)
+            || egcl_rt::types::md_array_storage(v).is_some_and(egcl_stdlib::is_complex_vector);
         let dims = if egcl_rt::types::md_array_p(v) {
             md_dims(v)?
         } else {
@@ -22175,6 +22160,13 @@ fn type_of_value(v: EgclVal) -> Result<EgclVal, EgclError> {
     // object satisfies (ansi the.4, type-of.3, coerce.1).
     if egcl_rt::types::md_array_p(v) {
         let complex = egcl_rt::types::md_array_storage(v).is_some_and(egcl_stdlib::is_complex_vector);
+        use egcl_stdlib::sequences::ArrayElementKind;
+        let element = match egcl_stdlib::sequences::array_element_kind(v) {
+            Some(ArrayElementKind::BaseChar) => "BASE-CHAR",
+            Some(ArrayElementKind::Character) => "CHARACTER",
+            Some(ArrayElementKind::Bit) => "BIT",
+            _ => "T", // packed numeric cases were handled above
+        };
         let dims = md_dims(v)?;
         let dim_vals: Vec<EgclVal> = dims
             .iter()
@@ -22183,7 +22175,7 @@ fn type_of_value(v: EgclVal) -> Result<EgclVal, EgclError> {
         egcl_rt::rooted!(dims_list = vec_to_list(&dim_vals));
         let spec = vec![
             resolve_sym(if complex { "ARRAY" } else { "SIMPLE-ARRAY" }).unwrap_or(NIL),
-            resolve_sym("T").unwrap_or(T),
+            resolve_sym(element).unwrap_or(T),
             *dims_list,
         ];
         return Ok(vec_to_list(&spec));
@@ -25850,7 +25842,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                                     }
                                     let storage =
                                         egcl_rt::types::md_array_storage(*seq_r).unwrap();
-                                    egcl_stdlib::set_elt(storage, flat, *val)?;
+                                    egcl_stdlib::set_aref(storage, flat, *val)?;
                                     *c = *r2;
                                     result = *val;
                                     continue;
@@ -26590,7 +26582,8 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             "EGCL-INTERNAL::%EXPAND-TYPE-SPEC"
             | "EGCL-INTERNAL:%EXPAND-TYPE-SPEC"
             | "%EXPAND-TYPE-SPEC" => return eval_builtin_arguments(&name, cdr, env),
-            "EGCL-INTERNAL::%U8-ELEMENT-TYPE-P" | "EGCL-INTERNAL:%U8-ELEMENT-TYPE-P" | "%U8-ELEMENT-TYPE-P"
+            "EGCL-INTERNAL::%BIT-ELEMENT-TYPE-P" | "EGCL-INTERNAL:%BIT-ELEMENT-TYPE-P" | "%BIT-ELEMENT-TYPE-P"
+            | "EGCL-INTERNAL::%U8-ELEMENT-TYPE-P" | "EGCL-INTERNAL:%U8-ELEMENT-TYPE-P" | "%U8-ELEMENT-TYPE-P"
             | "EGCL-INTERNAL::%MAKE-U8-VECTOR" | "EGCL-INTERNAL:%MAKE-U8-VECTOR" | "%MAKE-U8-VECTOR" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL-INTERNAL::%MAKE-DOUBLE-FLOAT-VECTOR"
             | "EGCL-INTERNAL:%MAKE-DOUBLE-FLOAT-VECTOR"
@@ -43895,7 +43888,7 @@ fn is_builtin_function(name: &str) -> bool {
             | "ARRAYP" | "ARRAY-DIMENSIONS"
             | "ARRAY-DIMENSION" | "ARRAY-TOTAL-SIZE" | "VECTOR-PUSH" | "VECTOR-PUSH-EXTEND"
             | "VECTOR-POP" | "FILL-POINTER" | "%MAKE-COMPLEX-VECTOR" | "%MAKE-DISPLACED-ARRAY"
-            | "%MAKE-SIMPLE-VECTOR" | "%MAKE-DOUBLE-FLOAT-VECTOR" | "%MAKE-U8-VECTOR" | "%U8-ELEMENT-TYPE-P"
+            | "%MAKE-SIMPLE-VECTOR" | "%MAKE-DOUBLE-FLOAT-VECTOR" | "%MAKE-U8-VECTOR" | "%U8-ELEMENT-TYPE-P" | "%BIT-ELEMENT-TYPE-P"
             | "%EXPAND-TYPE-SPEC"
             | "ADJUSTABLE-ARRAY-P" | "ARRAY-HAS-FILL-POINTER-P" | "ARRAY-DISPLACEMENT"
             // Numbers

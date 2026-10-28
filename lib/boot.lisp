@@ -888,13 +888,14 @@
   ;; NIL, the empty type, upgrades to itself: the upgraded type must be a
   ;; supertype of TYPE and a subtype of every upgrade of its supertypes, and
   ;; only NIL is both (ansi arrays upgraded-array-element-type.nil.1).
-  (cond ((null type) nil)
-        ((egcl-internal::%u8-element-type-p (%expand-type-spec type)) '(unsigned-byte 8))
-        ((member (if (consp type) (car type) type) '(double-float long-float)) 'double-float)
-        ((eq type 'bit) 'bit)
-        ((member type '(base-char standard-char)) 'base-char)
-        ((member type '(character extended-char)) 'character)
-        (t t)))
+  (let ((type (%expand-type-spec type)))
+    (cond ((null type) nil)
+          ((egcl-internal::%bit-element-type-p type) 'bit)
+          ((egcl-internal::%u8-element-type-p type) '(unsigned-byte 8))
+          ((member (if (consp type) (car type) type) '(double-float long-float)) 'double-float)
+          ((member type '(base-char standard-char)) 'base-char)
+          ((member type '(character extended-char)) 'character)
+          (t t))))
 
 ;; UPGRADED-COMPLEX-PART-TYPE (CLHS 12.2.6): the part type used for a complex of
 ;; the given part type. egcl stores complex parts unspecialised, so a float part
@@ -2392,11 +2393,15 @@ Returns NIL."
 ;; Row-major flatten of nested :initial-contents matching DIMENSIONS: the
 ;; innermost axis contributes its elements; outer axes recurse and concatenate.
 (defun %flatten-md-contents (contents dimensions)
-  (if (null (cdr dimensions))
-      (coerce contents 'list)
-      (apply (function append)
-             (mapcar (lambda (sub) (%flatten-md-contents sub (cdr dimensions)))
-                     (coerce contents 'list)))))
+  (if (null dimensions)
+      (list contents)
+      (progn
+        (%check-initial-contents-length contents (car dimensions))
+        (if (null (cdr dimensions))
+            (coerce contents 'list)
+            (apply (function append)
+                   (mapcar (lambda (sub) (%flatten-md-contents sub (cdr dimensions)))
+                           (coerce contents 'list)))))))
 
 ;; Fill a freshly made multidimensional array from nested :initial-contents,
 ;; walking the array in row-major order.
@@ -2445,6 +2450,36 @@ Returns NIL."
     (error "There are ~D elements in the :INITIAL-CONTENTS, but the vector length is ~D."
            (length contents) size)))
 
+;; Keyword positions, rather than arbitrary MEMBER matches in values. The
+;; leftmost occurrence controls duplicate options, including ALLOW-OTHER-KEYS.
+(defun %array-keyword-cell (key keys)
+  (do ((rest keys (cddr rest))) ((null rest) nil)
+    (when (eq (car rest) key) (return rest))))
+
+(defun %check-array-keywords (keys allowed)
+  (let ((allow (%array-keyword-cell :allow-other-keys keys)))
+    (do ((rest keys (cddr rest))) ((null rest))
+      (unless (consp (cdr rest)) (error 'program-error))
+      (unless (or (eq (car rest) :allow-other-keys)
+                  (member (car rest) allowed)
+                  (and allow (cadr allow)))
+        (error 'program-error)))))
+
+(defun %checked-array-dimensions (dimensions)
+  (let ((dims (if (listp dimensions) dimensions (list dimensions)))
+        (total 1))
+    (%require-proper-list dims)
+    (when (>= (length dims) array-rank-limit)
+      (error "Array rank must be below ARRAY-RANK-LIMIT"))
+    (dolist (d dims)
+      (unless (and (integerp d) (>= d 0) (< d array-dimension-limit))
+        (error 'type-error :datum d
+               :expected-type (list 'integer 0 (list array-dimension-limit))))
+      (setq total (* total d)))
+    (when (>= total array-total-size-limit)
+      (error "Array total size must be below ARRAY-TOTAL-SIZE-LIMIT"))
+    dims))
+
 (defun make-array (dimensions &rest keys)
   ;; A vector of fixnum length with at most :ELEMENT-TYPE and :INITIAL-ELEMENT,
   ;; whose element type upgrades to T, is built natively without the option
@@ -2455,13 +2490,13 @@ Returns NIL."
   ;; Each dimension must be a non-negative integer (a list of them for rank ≥ 2,
   ;; or a bare integer for a vector). An empty list falls through to the
   ;; existing rank-0 path.
-  (if (listp dimensions)
-      (dolist (d dimensions) (%check-nonneg-index d))
-      (%check-nonneg-index dimensions))
+  (%check-array-keywords keys '(:element-type :initial-element :initial-contents
+                               :adjustable :fill-pointer :displaced-to :displaced-index-offset))
+  (%checked-array-dimensions dimensions)
   (let* ((size (if (consp dimensions) (car dimensions) dimensions))
-         (iel-cell (member :initial-element keys))
-         (ic-cell (member :initial-contents keys))
-         (et-cell (member :element-type keys))
+         (iel-cell (%array-keyword-cell :initial-element keys))
+         (ic-cell (%array-keyword-cell :initial-contents keys))
+         (et-cell (%array-keyword-cell :element-type keys))
          (et (%expand-type-spec (if et-cell (car (cdr et-cell)) t)))
          ;; DOUBLE-FLOAT uses packed storage. Other numeric requests currently
          ;; upgrade to T, but use numeric zero rather than NIL. This
@@ -2470,6 +2505,7 @@ Returns NIL."
          ;; this zero default is an EGCL convenience.
          (et-kind (if (consp et) (car et) et))
          (iel (cond (iel-cell (car (cdr iel-cell)))
+                    ((member et '(character base-char standard-char extended-char nil)) #\Null)
                     ((member et-kind '(short-float single-float float)) 0.0f0)
                     ((member et-kind '(double-float long-float)) 0.0d0)
                     ((member et-kind '(bit integer fixnum signed-byte unsigned-byte
@@ -2481,18 +2517,35 @@ Returns NIL."
          ;; MAKE-ARRAY builds string storage, not a general NIL-filled vector.
          ;; EXTENDED-CHAR upgrades to CHARACTER, so it too builds a string.
          (stringp (member et '(character base-char standard-char extended-char nil)))
-         (bitp (eq et 'bit))
+         (bitp (egcl-internal::%bit-element-type-p et))
          (doublep (member et-kind '(double-float long-float)))
          (u8p (egcl-internal::%u8-element-type-p et))
-         (fp-cell (member :fill-pointer keys))
-         (adj-cell (member :adjustable keys))
+         (fp-cell (%array-keyword-cell :fill-pointer keys))
+         (adj-cell (%array-keyword-cell :adjustable keys))
          (fp (and fp-cell (car (cdr fp-cell))))
          (adjustable (and adj-cell (car (cdr adj-cell))))
-         (dt-cell (member :displaced-to keys))
-         (dio-cell (member :displaced-index-offset keys))
+         (dt-cell (%array-keyword-cell :displaced-to keys))
+         (dio-cell (%array-keyword-cell :displaced-index-offset keys))
          ;; A dimension LIST of rank ≥ 2 ⇒ a real multidimensional array
          ;; (row-major storage). Rank-0/1 fall through to the vector paths.
-         (mdp (and (consp dimensions) (consp (cdr dimensions)))))
+         (mdp (or (null dimensions) (and (consp dimensions) (consp (cdr dimensions))))))
+    (when (or (and iel-cell ic-cell)
+              (and dt-cell (cadr dt-cell) (or iel-cell ic-cell)))
+      (error 'program-error))
+    (when (and dio-cell (not (and dt-cell (cadr dt-cell))))
+      (error 'program-error))
+    (when fp
+      (unless (and (not mdp) (or (eq fp t) (and (integerp fp) (<= 0 fp) (<= fp size))))
+        (error 'type-error :datum fp
+               :expected-type (if mdp '(eql nil) (list 'or '(eql t) (list 'integer 0 size))))))
+    (when (and dt-cell (cadr dt-cell))
+      (let* ((base (cadr dt-cell))
+             (offset (if dio-cell (cadr dio-cell) 0)))
+        (unless (arrayp base) (error 'type-error :datum base :expected-type 'array))
+        (unless (equal (upgraded-array-element-type et) (array-element-type base))
+          (error 'type-error :datum base :expected-type (list 'array (upgraded-array-element-type et))))
+        (unless (and (integerp offset) (<= 0 offset) (<= offset (array-total-size base)))
+          (error 'type-error :datum offset :expected-type (list 'integer 0 (array-total-size base))))))
     (cond
       ;; :displaced-to (rank-1): a complex vector whose element i reads and
       ;; writes BASE's row-major element (+ offset i) (bliss-7o4y). The
@@ -2516,20 +2569,17 @@ Returns NIL."
          (dolist (d dimensions) (setq total (* total d)))
          (egcl-internal::%make-md-array-with-storage
           dimensions
-          (%make-displaced-array base offset total total nil
+          (%make-displaced-array base offset total total (and adjustable t)
                                  (and stringp (not bitp) t) nil (and bitp t) (and doublep t) (and u8p t)))))
       (mdp
-       (let ((arr (%make-md-array dimensions iel (and doublep t) (and u8p t))))
-         (when ic-cell
-           (fill-md-array-from-contents arr dimensions (car (cdr ic-cell))))
-         arr))
-      ;; Rank-0 array (dimensions = NIL): a single-element MD array. Its lone
-      ;; element is the :initial-contents object itself (not a sequence) when
-      ;; given, else the :initial-element or default (bliss-30be: ansi-test
-      ;; universe.lsp builds (make-array nil)).
-      ((null dimensions)
-       (%make-md-array nil (cond (ic-cell (car (cdr ic-cell)))
-                                 (t iel)) (and doublep t) (and u8p t)))
+       (let ((total 1))
+         (dolist (d dimensions) (setq total (* total d)))
+         (let* ((storage (make-array total :element-type (upgraded-array-element-type et) :initial-element iel
+                                          :adjustable adjustable))
+                (arr (egcl-internal::%make-md-array-with-storage dimensions storage)))
+           (when ic-cell
+             (fill-md-array-from-contents arr dimensions (cadr ic-cell)))
+           arr)))
       ;; A :fill-pointer or :adjustable request ⇒ a complex (fill-pointer /
       ;; adjustable) vector. The fill pointer is the given value, SIZE for
       ;; :fill-pointer t, or SIZE when only :adjustable is supplied.
@@ -2615,70 +2665,60 @@ Returns NIL."
       (t
        (%make-simple-vector size iel)))))
 
-;; ADJUST-ARRAY array new-dimensions &key fill-pointer initial-element — grow (or
-;; shrink) a rank-1 fill-pointer/adjustable vector in place. cl-ppcre grows its
-;; adjustable char collectors this way (bliss-omw). Only the fill-pointer/
-;; adjustable rank-1 case is supported (delegated to %adjust-array); other cases
-;; are uncommon in the libraries we load.
-;; A fresh array of NEW-DIMENSIONS holding ARRAY's elements at the subscripts
-;; both arrays share, the rest INITIAL-ELEMENT (or INITIAL-CONTENTS when given):
-;; ADJUST-ARRAY's result for an array that is not actually adjustable, which
-;; ANSI permits to be a new array (CLHS ADJUST-ARRAY; ansi adjust-array.*).
-(defun %adjust-array-copy (array dims keys)
-  (let* ((dims (if (listp dims) dims (list dims)))
-         (iel-cell (member :initial-element keys))
-         (ic-cell (member :initial-contents keys))
-         (et-cell (member :element-type keys))
-         (fp-cell (member :fill-pointer keys))
-         (element-type (if et-cell (cadr et-cell) (array-element-type array)))
-         (new (if ic-cell
-                  (make-array dims :element-type element-type
-                                   :initial-contents (cadr ic-cell))
-                  (if iel-cell
-                      (make-array dims :element-type element-type
-                                       :initial-element (cadr iel-cell))
-                      (make-array dims :element-type element-type))))
-         (old-dims (array-dimensions array)))
-    (unless (or ic-cell (/= (length dims) (length old-dims)))
-      (dotimes (i (array-total-size new))
-        ;; Decompose the row-major index into subscripts, innermost last.
-        (let ((subs nil) (rest i) (inside t))
-          (dolist (d (reverse dims))
-            (push (mod rest d) subs)
-            (setq rest (floor rest d)))
-          (do ((ss subs (cdr ss)) (od old-dims (cdr od)))
-              ((or (null ss) (not inside)))
-            (when (>= (car ss) (car od)) (setq inside nil)))
-          (when inside
-            (setf (row-major-aref new i) (apply #'aref array subs))))))
-    (when (and fp-cell (cadr fp-cell) (= (length dims) 1))
-      (let ((fp (cadr fp-cell)))
-        (setq new (make-array dims :element-type element-type
-                                   :fill-pointer (if (eq fp t) (car dims) fp)
-                                   :initial-contents (coerce new 'list)))))
-    new))
+;; Prepare a complete candidate before changing an adjustable object's
+;; metadata. Errors leave ARRAY and every displaced alias unchanged.
+(defun %adjust-array-copy (array dimensions keys)
+  (%check-array-keywords keys '(:element-type :initial-element :initial-contents
+                               :fill-pointer :displaced-to :displaced-index-offset))
+  (let* ((old-dims (array-dimensions array))
+         (dims (%checked-array-dimensions dimensions))
+         (iel-cell (%array-keyword-cell :initial-element keys))
+         (ic-cell (%array-keyword-cell :initial-contents keys))
+         (et-cell (%array-keyword-cell :element-type keys))
+         (fp-cell (%array-keyword-cell :fill-pointer keys))
+         (dt-cell (%array-keyword-cell :displaced-to keys))
+         (dio-cell (%array-keyword-cell :displaced-index-offset keys))
+         (displaced-to (and dt-cell (cadr dt-cell)))
+         (element-type (array-element-type array))
+         (has-fp (array-has-fill-pointer-p array))
+         (fp (and fp-cell (cadr fp-cell)))
+         (options (list :element-type element-type :adjustable (adjustable-array-p array))))
+    (unless (= (length dims) (length old-dims))
+      (error "ADJUST-ARRAY cannot change array rank"))
+    (when (and et-cell (not (equal (upgraded-array-element-type (cadr et-cell)) element-type)))
+      (error 'type-error :datum (cadr et-cell) :expected-type (list 'eql element-type)))
+    (when (or (and iel-cell ic-cell) (and displaced-to (or iel-cell ic-cell)))
+      (error 'program-error))
+    (when (and dio-cell (not displaced-to)) (error 'program-error))
+    (when (and fp (not has-fp)) (error "Array has no fill pointer"))
+    (when has-fp
+      (setq options (append options (list :fill-pointer (if fp fp (fill-pointer array))))))
+    (cond (displaced-to
+           (setq options (append options (list :displaced-to displaced-to
+                                               :displaced-index-offset (if dio-cell (cadr dio-cell) 0)))))
+          (ic-cell (setq options (append options (list :initial-contents (cadr ic-cell)))))
+          (iel-cell (setq options (append options (list :initial-element (cadr iel-cell))))))
+    (let ((new (apply #'make-array dims options)))
+      (unless (or ic-cell displaced-to)
+        (dotimes (i (array-total-size new))
+          ;; Copy the intersection by subscripts, not by flat prefix or active
+          ;; fill-pointer length. A zero-sized result executes no divisions.
+          (let ((subs nil) (rest i) (inside t))
+            (dolist (d (reverse dims))
+              (push (mod rest d) subs)
+              (setq rest (floor rest d)))
+            (do ((ss subs (cdr ss)) (od old-dims (cdr od)))
+                ((or (null ss) (not inside)))
+              (when (>= (car ss) (car od)) (setq inside nil)))
+            (when inside
+              (setf (row-major-aref new i) (apply #'aref array subs))))))
+      new)))
 
 (defun adjust-array (array new-dimensions &rest keys)
-  (unless (and (adjustable-array-p array) (= (array-rank array) 1))
-    (return-from adjust-array (%adjust-array-copy array new-dimensions keys)))
-  (let* ((size (if (consp new-dimensions) (car new-dimensions) new-dimensions))
-         (fp-cell (member :fill-pointer keys))
-         (iel-cell (member :initial-element keys))
-         (fp (and fp-cell (car (cdr fp-cell))))
-         (iel (if iel-cell (car (cdr iel-cell))
-                  (cond ((eq (array-element-type array) 'double-float) 0d0)
-                        ((equal (array-element-type array) '(unsigned-byte 8)) 0)
-                        (t nil))))
-         ;; No :fill-pointer supplied. Per ANSI the array keeps its fill
-         ;; pointer if it has one; a plain adjustable array has none, so its
-         ;; length simply tracks the new SIZE. ARRAY-HAS-FILL-POINTER-P now
-         ;; distinguishes the two exactly (bliss-0x9y), replacing the old
-         ;; fp<total-size heuristic (bliss-6wng).
-         (fpn (cond ((eq fp t) size)
-                    ((integerp fp) fp)
-                    ((array-has-fill-pointer-p array) (fill-pointer array))
-                    (t size))))
-    (%adjust-array array size fpn iel)))
+  (let ((new (%adjust-array-copy array new-dimensions keys)))
+    (if (adjustable-array-p array)
+        (%adjust-array array new)
+        new)))
 
 ;; Bit-vector boolean operations (CLHS 14.2.1). Each takes two simple-bit-vectors
 ;; of the same length and returns a fresh SIMPLE-BIT-VECTOR of the elementwise
@@ -2805,7 +2845,7 @@ Returns NIL."
                            (member elt '(character base-char standard-char)))))
          (bitp (or (member head '(bit-vector simple-bit-vector))
                    (and (member head '(vector array simple-array simple-vector))
-                        (eq elt 'bit)))))
+                        (egcl-internal::%bit-element-type-p (%expand-type-spec elt))))))
     (%check-sequence-result-type rt head declared size result-type)
     (cond
       ((member head '(list cons null))

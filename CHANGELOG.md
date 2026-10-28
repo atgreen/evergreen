@@ -274,6 +274,13 @@
 
 ### Fixed
 
+- `ADJUST-ARRAY` preserves adjustable array identity, multidimensional shape,
+  element storage, displacement aliases, and fill-pointer options. Bounded
+  bit-equivalent element types consistently use bit storage, and `SVREF`
+  validates arity before array type. BFASL and saved images retain mutable
+  array storage graphs and shared references
+  ([#742](https://github.com/atgreen/evergreen/pull/742)).
+
 - Qualified SETF function names retain their identity through compiled files
   and saved images without creating bogus packages
   ([#739](https://github.com/atgreen/evergreen/pull/739)).

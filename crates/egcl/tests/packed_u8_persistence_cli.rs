@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
 //! Portable U8 literals cross COMPILE-FILE and a fresh loader process with no
-//! source file or source fallback section. Wrapper state need not survive
-//! constant externalization; specialization, dimensions and contents do.
+//! source file or source fallback section. BBU 2.5 also preserves complex/MD
+//! wrapper metadata and displacement aliases rather than flattening them.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -107,7 +107,7 @@ fn packed_u8_literals_load_in_fresh_processes_without_source_fallback() {
         .expect("compile-file must emit BYTECODE_UNIT");
     assert!(bbu.len() >= 40);
     assert_eq!(&bbu[..4], b"BBU\0");
-    assert!(u16::from_le_bytes(bbu[4..6].try_into().unwrap()) >= 0x0204);
+    assert!(u16::from_le_bytes(bbu[4..6].try_into().unwrap()) >= 0x0205);
     assert_ne!(
         u32::from_le_bytes(bbu[8..12].try_into().unwrap()) & 1,
         0,
@@ -138,11 +138,18 @@ fn packed_u8_literals_load_in_fresh_processes_without_source_fallback() {
         (assert (equalp base #(0 1 127 128 254 255 17 33)))
         (assert (equal (array-dimensions matrix) '(2 3)))
         (dotimes (i 6) (assert (= (row-major-aref matrix i) 255)))
-        (assert (equal (array-dimensions adjustable) '(3)))
+        (assert (equal (array-dimensions adjustable) '(6)))
+        (assert (adjustable-array-p adjustable))
+        (assert (= (fill-pointer adjustable) 3))
         (assert (equalp adjustable #(42 42 42)))
-        (assert (equal (array-dimensions view) '(2)))
+        (assert (equal (array-dimensions view) '(4)))
+        (assert (= (fill-pointer view) 2))
+        (assert (eq (array-displacement view) base))
+        (assert (= (nth-value 1 (array-displacement view)) 2))
         (assert (equalp view #(127 128)))
         (assert (equal (array-dimensions matrix-view) '(2 2)))
+        (assert (eq (array-displacement matrix-view) base))
+        (assert (= (nth-value 1 (array-displacement matrix-view)) 3))
         (dotimes (i 4)
           (assert (= (row-major-aref matrix-view i) (aref base (+ i 3)))))
         (setf (aref base 0) 255)
