@@ -61,6 +61,22 @@ pub const fn fixnum_division() -> bool {
     cfg!(any(target_arch = "x86_64", target_arch = "aarch64"))
 }
 
+/// Whether the host emitter encodes `StringCharOrNil`, the inline simple-string
+/// character read `CHAR`/`SCHAR`/`ELT` get a fast path from.
+///
+/// The pass in `string_char` rewrites the call into a `StringCharOrNil` test
+/// and a `Brif` over a fast arm and the original call, so a target without the
+/// arm must keep the plain call: emitting the opcode would decline the whole
+/// function instead. To add a target: give its emitter that arm -- the heap
+/// tag, fixnum and bounds tests all answering NIL rather than deopting, and
+/// both the one-byte and four-byte simple layouts -- then name it here.
+pub const fn simple_string_char_access() -> bool {
+    cfg!(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        target_os = "linux"
+    ))
+}
+
 /// Whether the host emitter encodes the **raw `UnboxedF64`** double-float
 /// pipeline: `ConstDouble`, raw `FloatAdd`/`Sub`/`Mul`/`Div`/`Neg`/`Sqrt` and
 /// the raw double comparisons.

@@ -10,6 +10,11 @@
 
 ### Changed
 
+- AArch64 T2 reads a character from a simple string inline instead of calling
+  the runtime, so `CHAR`, `SCHAR` and `ELT` cost 32x less per access and a
+  character-scanning loop runs 2.6x faster
+  ([#754](https://github.com/atgreen/evergreen/pull/754)).
+
 - AArch64 T2 reaches captured lexical variables, so a closure that reads or
   writes one is no longer barred from the optimizing tier: 114 of the 129
   functions in the tier corpus now compile there, against 76 before
