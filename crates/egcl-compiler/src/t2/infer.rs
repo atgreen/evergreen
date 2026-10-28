@@ -905,6 +905,11 @@ pub fn infer_for_sites(f: &Function, sites: &[Inst]) -> InferenceResult {
         }
     }
 
+    // These contracts depend only on the frozen IR, never the evolving
+    // lattice solution. Share one snapshot across widening iterations and the
+    // final requested-site replay; comparison edge bounds remain per-pass.
+    let check_refine = check_refinements(f, &rpo);
+
     for pass in 0..MAX_PASSES {
         let widen = pass >= WIDEN_AFTER;
         let mut changed = false;
@@ -915,7 +920,6 @@ pub fn infer_for_sites(f: &Function, sites: &[Inst]) -> InferenceResult {
         // holds successful `Guard` narrowings, valid only in blocks T strictly
         // dominates (a use before the check in T itself is handled in program order).
         let mut edge_refine: HashMap<usize, (super::ir::Block, Vec<Refine>)> = HashMap::new();
-        let check_refine = check_refinements(f, &rpo);
 
         for &b in &rpo {
             // 1. Block parameter facts = join over predecessor edges (or the
@@ -1022,7 +1026,7 @@ pub fn infer_for_sites(f: &Function, sites: &[Inst]) -> InferenceResult {
     let before = if sites.is_empty() {
         HashMap::new()
     } else {
-        capture_site_facts(f, sites, &g, &rpo, &dom, &structural)
+        capture_site_facts(f, sites, &g, &rpo, &dom, &structural, &check_refine)
     };
     InferenceResult {
         types: g.0,
@@ -1181,16 +1185,16 @@ fn capture_site_facts(
     rpo: &[Block],
     dom: &DominatorTree,
     structural: &super::value_facts::StructuralFacts,
+    checks: &CheckRefinements,
 ) -> HashMap<(Inst, Value), IRType> {
     let requested: HashSet<_> = sites.iter().copied().collect();
-    let checks = check_refinements(f, rpo);
     let mut edges = EdgeRefinements::new();
     for &block in rpo {
         add_edge_refinements(f, block, g, &mut edges);
     }
     let mut before = HashMap::new();
     for &block in rpo {
-        let mut env = entry_environment(block, g, dom, structural, &edges, &checks);
+        let mut env = entry_environment(block, g, dom, structural, &edges, checks);
         for &inst in &f.block(block).insts {
             let data = f.inst(inst);
             if requested.contains(&inst) {
