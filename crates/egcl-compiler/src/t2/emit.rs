@@ -4478,7 +4478,7 @@ pub fn emit_framed_with_direct_natives(
                 self_sym,
                 direct_natives: Vec::new(),
                 code_id,
-                environment: EnvironmentCalls::default(),
+                environment,
                 portable: portable.clone(),
                 named_calls: Vec::new(),
             },
