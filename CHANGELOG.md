@@ -12,6 +12,11 @@
   collection, preventing invalid-function failures during extended reads
   ([#773](https://github.com/atgreen/evergreen/pull/773)).
 
+- Compiling symbol macro definitions emitted by `MACROLET` preserves their
+  binding names and unevaluated expansion syntax, allowing the resulting
+  compiled file to load correctly
+  ([#774](https://github.com/atgreen/evergreen/pull/774)).
+
 - `SUBTYPEP` preserves both type operands when integer-type canonicalization
   triggers a moving collection, preventing incorrect range comparisons under
   allocation pressure ([#766](https://github.com/atgreen/evergreen/pull/766)).
