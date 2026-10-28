@@ -303,6 +303,8 @@ pub struct InlineOptions {
     pub config: InlineConfig,
     policies: HashMap<u32, InlinePolicy>,
     bodies: HashMap<u32, Arc<BytecodeFunction>>,
+    // Cold summaries are not candidates for body inlining.
+    hint_bodies: HashMap<u32, Arc<BytecodeFunction>>,
     constant_snapshots: HashMap<usize, Arc<super::constants::ConstantPoolSnapshot>>,
     call_sites: HashMap<(u32, u32), CallSiteProfile>,
     root_symbol: Option<u32>,
@@ -389,9 +391,37 @@ impl InlineOptions {
         self.with_constant_snapshot(snapshot)
     }
 
+    /// Register captured metadata for guarded return hints only. This never
+    /// makes a cold body available to the body inliner or changes its policy.
+    pub fn with_return_hint_body_snapshot(mut self, symbol: u32, snapshot: &super::constants::BytecodeSnapshot) -> Self {
+        self.hint_bodies.insert(symbol, Arc::clone(&snapshot.body));
+        self.with_constant_snapshot(snapshot)
+    }
+
     pub(crate) fn with_constant_snapshot(mut self, snapshot: &super::constants::BytecodeSnapshot) -> Self {
         self.constant_snapshots.insert(Arc::as_ptr(&snapshot.body) as usize, Arc::clone(&snapshot.constants));
         self
+    }
+
+    pub(crate) fn has_captured_body(&self, symbol: u32) -> bool {
+        self.bodies.get(&symbol).or_else(|| self.hint_bodies.get(&symbol)).is_some_and(|body|
+            body.nested_functions.is_empty() && body.restart_cases.is_empty()
+                && self.constant_snapshots.contains_key(&(Arc::as_ptr(body) as usize)))
+    }
+
+    /// Hints may inspect only already captured worker metadata, never fall
+    /// back to reading a live constant pool on a compiler thread. This is a
+    /// summary-only view: source_body names the sanitized owner, not the
+    /// runtime definition. Never install it or use it as a deopt owner.
+    pub(crate) fn captured_body_snapshot(&self, symbol: u32) -> Option<super::constants::BytecodeSnapshot> {
+        let body = self.bodies.get(&symbol).or_else(|| self.hint_bodies.get(&symbol))?;
+        if !body.nested_functions.is_empty() || !body.restart_cases.is_empty() { return None; }
+        Some(super::constants::BytecodeSnapshot {
+            body: Arc::clone(body),
+            constants: Arc::clone(self.constant_snapshots.get(&(Arc::as_ptr(body) as usize))?),
+            source_body: Arc::as_ptr(body) as usize,
+            nested_functions: vec![], restart_functions: vec![],
+        })
     }
 
     pub(crate) fn constants(&self, body: &BytecodeFunction) -> Arc<super::constants::ConstantPoolSnapshot> {

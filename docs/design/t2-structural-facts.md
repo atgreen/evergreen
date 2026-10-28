@@ -163,3 +163,42 @@ facts reject specialization. Exact literal conversions, operand guards, overflow
 NaN and domain checks, recovery states, and multiple-value effects remain in
 place. Global result/phi facts are covered here; using a branch-local constraint
 for an original input requires a separate per-use query.
+
+## Guarded expectations from callee bodies
+
+Return-type expectations are separate from proven types. For example:
+
+```lisp
+(defun as-float (x) (float x))
+(defun increment-converted ()
+  (let ((n (as-float 5)))
+    (incf n)))
+```
+
+An immutable snapshot of `as-float`, analyzed with the actual argument's type,
+can predict a SINGLE-FLOAT result. T2 can choose single-float arithmetic on the
+first increment even when that arithmetic has never run. A double argument or
+an explicit float prototype determines the corresponding format. Analysis is
+bounded; unknown calls, recursion and unsupported bodies remain conservative.
+
+The prediction never changes the call's result declaration or ordinary type
+inference. Numeric specialization still checks the actual returned value,
+using the arithmetic operation's recovery state after the call. This matters
+when a helper redefines the callee while the caller is suspended: generation
+validation rejects stale background compilations, but cannot validate a
+continuation that has already entered native code. A failed result check must
+resume without replaying the call or its effects.
+
+The first implementation consumes expectations for eligible binary numeric
+sites, respects failed-site feedback and excludes opaque NOTINLINE dispatch.
+It leaves function calls and their multiple-value behavior intact. Captured
+callee bodies already participate in worker completion generation validation;
+workers read sanitized snapshots, not movable heap constants. Set
+`EGCL_DISABLE_RETURN_TYPE_HINTS=1` to disable this analysis for comparison.
+
+Helper availability does not require a T0 invocation sample: a helper already
+running in T1 may have none. The owner captures a bounded set of small,
+registered direct callees in source order, with separate limits on traversal
+and copied bytecode. These hint-only bodies never become inlining candidates
+or additional native call targets. The disable flag skips their capture too,
+so an ablation includes both capture and analysis cost.

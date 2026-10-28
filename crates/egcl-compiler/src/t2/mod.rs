@@ -155,3 +155,6 @@ pub mod integer_shift;
 pub mod octet_word_fusion;
 pub mod array_layout;
 pub mod value_facts;
+
+/// Guarded return-format expectations, deliberately separate from inference.
+pub mod return_hints;

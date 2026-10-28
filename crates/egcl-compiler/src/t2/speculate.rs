@@ -428,6 +428,57 @@ fn statically_proven_spec_type(f: &Function, args: &[crate::t2::ir::Value], infe
     (all_single_numeric && has_single).then_some(SpecType::SingleFloat)
 }
 
+/// Hints choose a guarded guess, never operand admissibility or check removal.
+/// Consult only after real proofs, inside an admitted profileSome path.
+fn hinted_family(f: &Function, args: &[Value], inferred: Option<&dyn OperandFacts>,
+    options: SpeculateOptions) -> Option<SpecType> {
+    let mut hinted = false;
+    let mut single = false;
+    let mut double = false;
+    let mut integer = false;
+    for &value in args {
+        let actual = operand_bits(f, inferred, value);
+        let bits = if actual == TypeBits::TOP || actual.is_bottom() {
+            let Some(ty) = f.return_type_hints.get(&value) else { continue; };
+            hinted = true;
+            ty.bits
+        } else { actual };
+        if bits == TypeBits::SINGLE_FLOAT { single = true; }
+        else if bits == TypeBits::DOUBLE_FLOAT { double = true; }
+        else if bits == TypeBits::FIXNUM { integer = true; }
+        else if !bits.meet(TypeBits::SINGLE_FLOAT.join(TypeBits::DOUBLE_FLOAT)).is_bottom() {
+            return None; // A mixed prototype/format is not a precise hint.
+        }
+    }
+    if !hinted { return None; }
+    if double && options.double_float && cfg!(target_arch = "x86_64") { Some(SpecType::DoubleFloat) }
+    else if single && !double { Some(SpecType::SingleFloat) }
+    else if integer && !single && !double { Some(SpecType::Fixnum) }
+    else { None }
+}
+
+pub(crate) fn accepts_return_hints(symbol: u32, arity: usize) -> bool {
+    arity == 2 && (arith_of(symbol).is_some() || cmp_of(symbol).is_some())
+}
+
+/// An expectation can reject an incompatible guarded guess without proving
+/// anything about the runtime operand. Actual operand facts take precedence.
+fn hints_permit_family(f: &Function, args: &[Value], inferred: Option<&dyn OperandFacts>,
+    kind: SpecType, comparison: bool) -> bool {
+    let allowed = match kind {
+        SpecType::Fixnum => TypeBits::FIXNUM,
+        SpecType::SingleFloat => TypeBits::SINGLE_FLOAT.join(TypeBits::FIXNUM),
+        SpecType::DoubleFloat if comparison => TypeBits::DOUBLE_FLOAT,
+        SpecType::DoubleFloat => TypeBits::DOUBLE_FLOAT.join(TypeBits::FIXNUM),
+    };
+    args.iter().all(|&value| {
+        let actual = operand_bits(f, inferred, value);
+        if actual != TypeBits::TOP && !actual.is_bottom() { return true; }
+        f.return_type_hints.get(&value).is_none_or(|hint|
+            hint.bits.is_bottom() || !hint.bits.meet(allowed).is_bottom())
+    })
+}
+
 /// The IEEE bits of `value` when it is a compile-time double-float operand: a
 /// `ConstDouble`, or a `ConstHeapObj` whose literal is a double. The literal is
 /// described by the builder's immutable snapshot. Optimization never reads
@@ -1162,8 +1213,18 @@ fn speculate_selected(
                             && statically_proven_double(f, &data.args, &consts, comparison, inferred);
                         proven.then_some(SpecType::DoubleFloat)
                             .or_else(|| statically_proven_spec_type(f, &data.args, inferred))
+                            .or_else(|| {
+                                if !accepts_return_hints(sym, argc) { return None; }
+                                let hinted = hinted_family(f, &data.args, inferred, options)?;
+                                // Reconcile using ACTUAL facts, never hints as
+                                // proof. Expansion retains every operand check.
+                                reconcile_double(f, &data.args, &consts, comparison, hinted, options, inferred)
+                                    .and_then(|spec| reconcile_with_operands(f, &data.args, spec, inferred))
+                                    .filter(|&spec| hints_permit_family(f, &data.args, inferred, spec, comparison))
+                            })
                             .or_else(|| reconcile_double(f, &data.args, &consts, comparison, observed, options, inferred)
-                                .and_then(|spec| reconcile_with_operands(f, &data.args, spec, inferred)))
+                                .and_then(|spec| reconcile_with_operands(f, &data.args, spec, inferred))
+                                .filter(|&spec| hints_permit_family(f, &data.args, inferred, spec, comparison)))
                     })
                 })
             else {
