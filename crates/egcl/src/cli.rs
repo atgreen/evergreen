@@ -18745,7 +18745,12 @@ fn integer_range_within_bignum(t1: EgclVal) -> Option<(bool, bool)> {
     Some((below || above, true))
 }
 
-fn subtypep_relation(t1: EgclVal, t2: EgclVal) -> (bool, bool) {
+fn subtypep_relation(mut t1: EgclVal, mut t2: EgclVal) -> (bool, bool) {
+    // Either integer canonicalization can allocate before the recursive call.
+    // Root both callee-local operands before the first such allocation; roots
+    // in the caller do not rewrite these copies.
+    egcl_rt::rooted_ref!(_t1_root = &mut t1);
+    egcl_rt::rooted_ref!(_t2_root = &mut t2);
     // BASE-CHAR (code points below 256) is a proper subtype of CHARACTER and
     // EXTENDED-CHAR is the rest of it; the symbol hierarchy table carries both,
     // so neither needs a special case here. (EXTENDED-CHAR used to be the empty
@@ -18767,13 +18772,11 @@ fn subtypep_relation(t1: EgclVal, t2: EgclVal) -> (bool, bool) {
     }
     if let Some(canonical) = canonical_integer_type(t1) {
         egcl_rt::rooted!(canonical = canonical);
-        egcl_rt::rooted!(t2 = t2);
-        return subtypep_relation(*canonical, *t2);
+        return subtypep_relation(*canonical, t2);
     }
     if let Some(canonical) = canonical_integer_type(t2) {
         egcl_rt::rooted!(canonical = canonical);
-        egcl_rt::rooted!(t1 = t1);
-        return subtypep_relation(*t1, *canonical);
+        return subtypep_relation(t1, *canonical);
     }
     if t1.is_cons() && t2.is_cons() {
         let (head1, args1) = cp(t1);
@@ -50694,3 +50697,6 @@ mod evaluator_error_boundary_rooting_tests {
         assert_eq!(cp(value), (EgclVal::from_fixnum(42), NIL));
     }
 }
+
+#[cfg(test)]
+mod subtype_canonicalization_rooting_tests;
