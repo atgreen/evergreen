@@ -112,6 +112,7 @@
 
 use crate::t2::frame_state::FrameStateId;
 use crate::t2::ir::{AuxData, Function, IRType, Inst, InstFlags, Opcode, TypeBits, Value};
+use crate::t2::target_support;
 use std::collections::HashMap;
 
 /// The single type a call site may be speculated as (mutually exclusive).
@@ -298,9 +299,10 @@ pub fn profiles_numeric_operands(sym: u32) -> bool {
 }
 
 /// The typed comparison opcode for `(kind, speculated-type)`. Fixnum supports all
-/// five on every backend. Single-float comparisons have an emitter only on
-/// x86-64 (bliss-9bw59); elsewhere keep their ordinary calls rather than
-/// producing IR that would force the entire function out of T2.
+/// five on every backend. A float comparison is selected only where the host
+/// emitter has the arm — see [`target_support`]; elsewhere keep the ordinary
+/// call rather than producing IR that would force the entire function out of
+/// T2.
 fn typed_cmp_opcode(c: Cmp, s: SpecType) -> Option<Opcode> {
     use Opcode::*;
     Some(match (c, s) {
@@ -309,9 +311,8 @@ fn typed_cmp_opcode(c: Cmp, s: SpecType) -> Option<Opcode> {
         (Cmp::Le, SpecType::Fixnum) => FixnumCmpLe,
         (Cmp::Ge, SpecType::Fixnum) => FixnumCmpGe,
         (Cmp::Eq, SpecType::Fixnum) => FixnumCmpEq,
-        (_, SpecType::SingleFloat | SpecType::DoubleFloat) if !cfg!(target_arch = "x86_64") => {
-            return None
-        }
+        (_, SpecType::SingleFloat) if !target_support::single_float_comparison() => return None,
+        (_, SpecType::DoubleFloat) if !target_support::double_float() => return None,
         (Cmp::Lt, SpecType::SingleFloat) => FloatCmpLt,
         (Cmp::Gt, SpecType::SingleFloat) => FloatCmpGt,
         (Cmp::Le, SpecType::SingleFloat) => FloatCmpLe,
@@ -462,7 +463,7 @@ fn hinted_family(f: &Function, args: &[Value], inferred: Option<&dyn OperandFact
         }
     }
     if !hinted { return None; }
-    if double && options.double_float && cfg!(target_arch = "x86_64") { Some(SpecType::DoubleFloat) }
+    if double && options.double_float && target_support::double_float() { Some(SpecType::DoubleFloat) }
     else if single && !double { Some(SpecType::SingleFloat) }
     else if integer && !single && !double { Some(SpecType::Fixnum) }
     else { None }
@@ -613,7 +614,7 @@ fn reconcile_double(
     inferred: Option<&dyn OperandFacts>,
 ) -> Option<SpecType> {
     let admitted = options.double_float
-        && cfg!(target_arch = "x86_64")
+        && target_support::double_float()
         && double_operands_admissible(f, args, consts, comparison, inferred);
     let known_double = args.iter().any(|&arg| {
         operand_bits(f, inferred, arg) == TypeBits::DOUBLE_FLOAT || double_literal_bits(f, arg).is_some()
@@ -1183,7 +1184,7 @@ fn speculate_selected(
     selected: Option<&[crate::t2::ir::Block]>,
     permits: &dyn Fn(u32, SpecType) -> bool,
 ) -> usize {
-    if options.double_float && cfg!(target_arch = "x86_64") {
+    if options.double_float && target_support::double_float() {
         split_variadic_double_arithmetic(f, profile, permits);
     }
     // Read phase: collect the calls to rewrite (keeps the borrow off `f` for the
@@ -1244,7 +1245,7 @@ fn speculate_selected(
             let bcp = frame_state_bcp(f, fs);
             let comparison = cmp_of(sym).is_some();
             let proven_double = options.double_float
-                && cfg!(target_arch = "x86_64")
+                && target_support::double_float()
                 && (arith_of(sym).is_some() || comparison)
                 && statically_proven_double(f, &data.args, &consts, comparison, None);
             let Some(spec) = proven_double
@@ -1260,7 +1261,7 @@ fn speculate_selected(
                             .map(|facts| SiteOperandFacts { facts, site: inst });
                         let inferred = scoped.as_ref().map(|facts| facts as &dyn OperandFacts);
                         if conflicting_operand_facts(f, inferred, &data.args) { return None; }
-                        let proven = options.double_float && cfg!(target_arch = "x86_64")
+                        let proven = options.double_float && target_support::double_float()
                             && (arith_of(sym).is_some() || comparison)
                             && statically_proven_double(f, &data.args, &consts, comparison, inferred);
                         proven.then_some(SpecType::DoubleFloat)
@@ -1370,7 +1371,7 @@ fn speculate_selected(
                 if name == "MOD" && let Some(mask) = mod_mask_of(f, &data.args, &consts) {
                     work.push((inst, Opcode::LogAnd, result_type(spec),
                         ExtraArg::ReplaceSecondWithFixnum(mask)));
-                } else if cfg!(target_arch = "x86_64") {
+                } else if target_support::fixnum_division() {
                     let opcode = match name.as_str() {
                         "MIN" => Opcode::FixnumMin,
                         "MAX" => Opcode::FixnumMax,
@@ -1577,7 +1578,7 @@ fn speculate_selected(
             }
         }
     }
-    if options.double_float && cfg!(target_arch = "x86_64") {
+    if options.double_float && target_support::double_float() {
         n += speculate_double_only_sites(f, profile, &consts, permits);
     }
     let self_sym = f

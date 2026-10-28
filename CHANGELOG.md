@@ -4,6 +4,11 @@
 
 ### Changed
 
+- AArch64 T2 compiles `TRUNCATE`, `FLOOR`, `REM`, `MOD`, `MIN`, `MAX` and
+  single-float comparisons to native code instead of leaving each as a runtime
+  call, measuring 11x to 103x on hot loops built from them
+  ([#746](https://github.com/atgreen/evergreen/pull/746)).
+
 - Source closures expand captured macros and user-defined `SETF` places before
   bytecode compilation, and loop bodies can enter tiered execution on their
   first invocation, including CFFI callbacks
