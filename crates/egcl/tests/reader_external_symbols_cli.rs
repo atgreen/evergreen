@@ -71,3 +71,41 @@ fn single_colon_requires_external_symbols_without_interning() {
         }
     }
 }
+
+#[test]
+fn native_extensions_publish_exports_without_the_lisp_bootstrap() {
+    let program = r#"
+        (dolist (name '("FUNCALLABLE-STANDARD-CLASS" "SET-FUNCALLABLE-INSTANCE-FUNCTION"
+                        "FUNCALLABLE-INSTANCE-FUNCTION" "GC" "GETENV" "FUNCTION-TIER"))
+          (multiple-value-bind (symbol status) (find-symbol name "EGCL-EXT")
+            (assert (eq status :external))
+            (assert (eq (symbol-package symbol) (find-package "EGCL-EXT")))
+            (assert (eq symbol (read-from-string (concatenate 'string "EGCL-EXT:" name))))))
+        (defclass reader-native-callable () ()
+          (:metaclass egcl-ext:funcallable-standard-class))
+        (setq *reader-native-callable* (make-instance 'reader-native-callable))
+        (egcl-ext:set-funcallable-instance-function *reader-native-callable*
+          (lambda (x) (+ x 41)))
+        (assert (= (funcall *reader-native-callable* 1) 42))
+        (assert (null (find-symbol "GH763-NO-NATIVE-API" "EGCL-EXT")))
+        (assert (handler-case
+                  (progn (read-from-string "EGCL-EXT:GH763-NO-NATIVE-API") nil)
+                  (reader-error () t)))
+        (assert (null (find-symbol "GH763-NO-NATIVE-API" "EGCL-EXT")))
+        (assert (not (eq :external (nth-value 1 (find-symbol "%BUILD-FINGERPRINT" "EGCL-EXT")))))
+        (assert (handler-case
+                  (progn (read-from-string "EGCL-EXT:%BUILD-FINGERPRINT") nil)
+                  (reader-error () t)))
+        (format t "NATIVE-EXPORTS-OK~%")
+    "#;
+    let output = Command::new(env!("CARGO_BIN_EXE_egcl"))
+        .args(["--no-init", "--no-bootstrap", "--eval", program])
+        .output()
+        .expect("check authoritative native extension exports");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.contains("NATIVE-EXPORTS-OK"),
+        "{stdout}\n{stderr}"
+    );
+}

@@ -645,6 +645,80 @@ fn ensure_package_registry() {
     }
 }
 
+/// Native EXT operations/types exist before the Lisp prelude is loaded, so
+/// their authoritative package exports must exist in bootstrap-free environments
+/// too. Lisp wrapper APIs publish their exports before their definitions in boot.
+const NATIVE_EXT_EXPORTS: &[&str] = &[
+    "BAIL-REPORT",
+    "CANCEL-FINALIZATION",
+    "CHDIR",
+    "CRC32",
+    "CRYPTO-AES-DECRYPT-BLOCK",
+    "CRYPTO-AES-ENCRYPT-BLOCK",
+    "CRYPTO-GHASH-MUL",
+    "CRYPTO-KECCAK-ABSORB",
+    "CRYPTO-KECCAK-F1600",
+    "CRYPTO-SHA256-BLOCK",
+    "CRYPTO-SHA256-WORDS",
+    "CRYPTO-SHA512-BLOCK",
+    "CRYPTO-SHA512-WORDS",
+    "DECLARATION-SPECIFIER",
+    "DECLARATION-SPECIFIERS",
+    "DELETE-DIRECTORY",
+    "DEOPT-COUNT",
+    "EMBED-FILE",
+    "EMBEDDED-FILE-P",
+    "EMBEDDED-FILES",
+    "EVENTS-COUNT",
+    "EVENTS-JSON",
+    "EVENTS-REPORT",
+    "EVENTS-RESET",
+    "EVENTS-START",
+    "EVENTS-STOP",
+    "EVENTS-SUMMARY",
+    "FINALIZE",
+    "FUNCALLABLE-INSTANCE-FUNCTION",
+    "FUNCALLABLE-STANDARD-CLASS",
+    "FUNCTION-BACK-EDGE-COUNT",
+    "FUNCTION-INVOKE-COUNT",
+    "FUNCTION-OSR-COUNT",
+    "FUNCTION-TIER",
+    "GC",
+    "GENERIC-RECEIVER-PROFILE-COUNT",
+    "GENERIC-RECEIVER-PROFILE-DISTINCT-COUNT",
+    "GET-PRECISE-TIME",
+    "GETCWD",
+    "GETENV",
+    "HASH-TABLE-SYNCHRONIZED-P",
+    "HASH-TABLE-WEAKNESS",
+    "INFLATE",
+    "INTERRUPT-CONDITION",
+    "IO-TIMEOUT",
+    "MACROEXPAND-ALL",
+    "PROCLAIMED-DECLARATIONS",
+    "PROCLAIMED-OPTIMIZE",
+    "PROFILE",
+    "PROFILE-REPORT",
+    "PROFILE-REPORT-CALLS",
+    "PROFILE-RESET",
+    "RAW-COMMAND-LINE-ARGUMENTS",
+    "REAL-TIME-NANOSECONDS",
+    "RUN-PROGRAM",
+    "SAVE-IMAGE",
+    "SAVE-IMAGE-AND-DIE",
+    "SAVE-LISP-AND-DIE",
+    "SET-FUNCALLABLE-INSTANCE-FUNCTION",
+    "SETENV",
+    "SHA256",
+    "SOCKET-OS-ERROR",
+    "SPROF-FOLD",
+    "SPROF-START",
+    "SPROF-STOP",
+    "TIMEOUT-CONDITION",
+    "UNPROFILE",
+    "UNSETENV",
+];
+
 /// Seed the standard package layout into the active registry. Matches the layout
 /// the interpreter has always used: COMMON-LISP (nick CL); COMMON-LISP-USER
 /// (nick CL-USER) using COMMON-LISP; KEYWORD; EGCL-INTERNAL; EGCL-EXT using
@@ -691,6 +765,19 @@ fn seed_standard_packages_registry() {
     reader::register_package("EGCL-THREADS");
     // All 978 ANSI names live present+external in COMMON-LISP before boot.
     let _ = egcl_stdlib::seed_ansi_symbols();
+    if let Some(package) = egcl_stdlib::find_package("EGCL-EXT") {
+        egcl_rt::rooted!(package = package);
+        for name in NATIVE_EXT_EXPORTS {
+            // Match the existing native dispatch labels. Register these known
+            // public identities directly, rather than resolving arbitrary reader
+            // tokens or accidentally creating a second ::NAME registry identity.
+            let symbol = EgclVal::from_symbol_index(reader::intern_symbol(&format!("EGCL-EXT:{name}")));
+            egcl_stdlib::packages::intern_present(*package, name, symbol)
+                .and_then(|()| egcl_stdlib::export(&[symbol], *package))
+                .expect("publish native EXT package interface");
+            egcl_rt::symbols::set_symbol_package(symbol.as_symbol_index(), *package);
+        }
+    }
 }
 
 /// Keep the *PACKAGE* global value cell in sync with `env.current_package`

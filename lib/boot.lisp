@@ -4757,36 +4757,6 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
 ;;; loading; they can be wired to real system info later.
 ;;; ---------------------------------------------------------------------------
 
-;;; Existing public native extension entry points have implementations in the
-;;; evaluator rather than DEFUN forms. Publish their package interface before
-;;; any qualified reference is read, just as DEFPACKAGE does for Lisp code.
-(export (mapcar (lambda (name) (intern name "EGCL-EXT"))
-                '(
-                  "BAIL-REPORT" "CANCEL-FINALIZATION" "CHDIR"
-                  "CRC32" "CRYPTO-AES-DECRYPT-BLOCK" "CRYPTO-AES-ENCRYPT-BLOCK"
-                  "CRYPTO-GHASH-MUL" "CRYPTO-KECCAK-ABSORB" "CRYPTO-KECCAK-F1600"
-                  "CRYPTO-SHA256-BLOCK" "CRYPTO-SHA256-WORDS" "CRYPTO-SHA512-BLOCK"
-                  "CRYPTO-SHA512-WORDS" "DECLARATION-SPECIFIER" "DECLARATION-SPECIFIERS"
-                  "DELETE-DIRECTORY" "DEOPT-COUNT" "EMBED-FILE"
-                  "EMBEDDED-FILE-P" "EMBEDDED-FILES" "EVENTS-COUNT"
-                  "EVENTS-JSON" "EVENTS-REPORT" "EVENTS-RESET"
-                  "EVENTS-START" "EVENTS-STOP" "EVENTS-SUMMARY"
-                  "FINALIZE" "FUNCALLABLE-INSTANCE-FUNCTION" "FUNCTION-BACK-EDGE-COUNT"
-                  "FUNCTION-INVOKE-COUNT" "FUNCTION-OSR-COUNT" "FUNCTION-TIER"
-                  "GC" "GENERIC-RECEIVER-PROFILE-COUNT" "GENERIC-RECEIVER-PROFILE-DISTINCT-COUNT"
-                  "GET-PRECISE-TIME" "GETCWD" "GETENV"
-                  "HASH-TABLE-SYNCHRONIZED-P" "HASH-TABLE-WEAKNESS" "INFLATE"
-                  "INTERRUPT-CONDITION" "IO-TIMEOUT" "MACROEXPAND-ALL"
-                  "PROCLAIMED-DECLARATIONS" "PROCLAIMED-OPTIMIZE" "PROFILE"
-                  "PROFILE-REPORT" "PROFILE-REPORT-CALLS" "PROFILE-RESET"
-                  "RAW-COMMAND-LINE-ARGUMENTS" "REAL-TIME-NANOSECONDS" "RUN-PROGRAM"
-                  "SAVE-IMAGE" "SAVE-IMAGE-AND-DIE" "SAVE-LISP-AND-DIE"
-                  "SET-FUNCALLABLE-INSTANCE-FUNCTION" "SETENV" "SHA256"
-                  "SOCKET-OS-ERROR" "SPROF-FOLD" "SPROF-START"
-                  "SPROF-STOP" "TIMEOUT-CONDITION" "UNPROFILE"
-                  "UNSETENV"))
-        "EGCL-EXT")
-
 ;;; Publish the thread API before reading its qualified definitions.
 ;;; Native mutex policy lives here; %NATIVE-MUTEX delegates to the stdlib.
 (export (mapcar (lambda (name) (intern name "EGCL-THREAD"))
