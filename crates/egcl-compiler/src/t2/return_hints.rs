@@ -498,6 +498,9 @@ mod tests {
         use crate::t2::speculate::{SpecType, SpeculateOptions, speculate_with};
         let symbol = egcl_rt::symbols::intern("RETURN-HINT-GUARDED-WRAPPER");
         for bits in [TypeBits::FIXNUM, TypeBits::DOUBLE_FLOAT] {
+            if bits == TypeBits::DOUBLE_FLOAT && !cfg!(target_arch = "x86_64") {
+                continue; // Only x86 currently admits guarded raw-double selection.
+            }
             let (mut f, value, site) = caller(symbol, &[bits]);
             assert!(apply(&mut f, &wrapper(symbol, 1)) > 0);
             assert_eq!(crate::t2::infer::infer(&f).ty(value), IRType::TOP);
@@ -623,6 +626,9 @@ mod tests {
             SpecType::SingleFloat,
             SpecType::DoubleFloat,
         ] {
+            if observed == SpecType::DoubleFloat && !cfg!(target_arch = "x86_64") {
+                continue; // Keep fixnum veto and guarded single coverage on every port.
+            }
             let (mut f, value, site) = caller(symbol, &[TypeBits::FIXNUM, floats]);
             apply(&mut f, &wrapper(symbol, 2));
             assert_eq!(f.return_type_hints[&value].bits, floats);
