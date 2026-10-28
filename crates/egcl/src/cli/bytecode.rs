@@ -14621,7 +14621,10 @@ fn make_prepared_bytecode_closure(
     }));
     #[cfg(test)]
     closure_templates::collect_during_preparation_for_test();
-    // MakeClosure remains a cooperation opportunity even on allocation-free hits.
+    // MakeClosure remains a cooperation opportunity even on allocation-free
+    // hits: native loop polling may count this helper as its safepoint. Native
+    // callers already publish precise roots here for the allocating path.
+    egcl_rt::safepoint::poll_safepoint();
     collect_requested_major_before_closure();
     let cached = closure_templates::lookup(nested);
     let control_free = cached.map_or_else(
