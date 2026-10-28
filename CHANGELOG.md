@@ -24,6 +24,9 @@
   single-float comparisons to native code instead of leaving each as a runtime
   call, measuring 11x to 103x on hot loops built from them
   ([#746](https://github.com/atgreen/evergreen/pull/746)).
+- Bytecode closure construction reuses immutable template preparation and safe
+  noncapturing callables while preserving independent captured state and lexical
+  control exits ([#745](https://github.com/atgreen/evergreen/pull/745)).
 
 - Native loops can retain the ordinary calling convention when loading
   function objects, and variable symbol designators can use guarded native
