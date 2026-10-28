@@ -855,6 +855,54 @@ fn fresh_ldb_facts(f: &Function) -> HashMap<Value, IRType> {
     facts
 }
 
+// Presence-enabled compiler diagnostics, independent of inference semantics.
+// All subphase intervals are inclusive where documented in the output schema.
+#[derive(Default)]
+struct InferenceTimings {
+    start: Option<std::time::Instant>,
+    setup_ns: u128,
+    checks_ns: u128,
+    fixpoint_ns: u128,
+    entry_ns: u128,
+    edge_ns: u128,
+    replay_ns: u128,
+    replay_entry_ns: u128,
+    repr_ns: u128,
+    passes: usize,
+    block_visits: usize,
+    replay_blocks: usize,
+    replay_insts: usize,
+    entry_calls: usize,
+    idom_steps: usize,
+    dominance_queries: usize,
+}
+
+impl InferenceTimings {
+    fn new() -> Self {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let enabled = *ENABLED.get_or_init(|| std::env::var_os("EGCL_INFER_PHASE_LOG").is_some());
+        Self { start: enabled.then(std::time::Instant::now), ..Self::default() }
+    }
+
+    fn clock(&self) -> Option<std::time::Instant> {
+        self.start.map(|_| std::time::Instant::now())
+    }
+
+    fn elapsed(start: Option<std::time::Instant>) -> u128 {
+        start.map_or(0, |start| start.elapsed().as_nanos())
+    }
+
+    fn finish(&self, f: &Function, blocks: usize, sites: usize) {
+        let Some(start) = self.start else { return };
+        eprintln!("[infer-phases] function={:?} total_ns={} setup_ns={} checks_ns={} fixpoint_ns={} entry_ns={} edge_ns={} replay_ns={} replay_entry_ns={} repr_ns={} passes={} blocks={} block_visits={} replay_blocks={} replay_insts={} sites={} entry_calls={} idom_steps={} dominance_queries={}",
+            f.name(), start.elapsed().as_nanos(), self.setup_ns, self.checks_ns,
+            self.fixpoint_ns, self.entry_ns, self.edge_ns, self.replay_ns,
+            self.replay_entry_ns, self.repr_ns, self.passes, blocks,
+            self.block_visits, self.replay_blocks, self.replay_insts, sites,
+            self.entry_calls, self.idom_steps, self.dominance_queries);
+    }
+}
+
 /// Infer types, ranges, and representations for every reachable value in `f`.
 pub fn infer(f: &Function) -> InferenceResult {
     infer_for_sites(f, &[])
@@ -864,6 +912,8 @@ pub fn infer(f: &Function) -> InferenceResult {
 /// Scoped facts are replayed against the frozen final global solution, never
 /// copied from an intermediate/widening iteration or recomputed per site.
 pub fn infer_for_sites(f: &Function, sites: &[Inst]) -> InferenceResult {
+    let mut timings = InferenceTimings::new();
+    let setup_start = timings.clock();
     let ldb_facts = fresh_ldb_facts(f);
     let structural = super::value_facts::StructuralFacts::analyze(f);
     let rpo = f.reverse_postorder();
@@ -908,9 +958,14 @@ pub fn infer_for_sites(f: &Function, sites: &[Inst]) -> InferenceResult {
     // These contracts depend only on the frozen IR, never the evolving
     // lattice solution. Share one snapshot across widening iterations and the
     // final requested-site replay; comparison edge bounds remain per-pass.
+    timings.setup_ns = InferenceTimings::elapsed(setup_start);
+    let checks_start = timings.clock();
     let check_refine = check_refinements(f, &rpo);
+    timings.checks_ns = InferenceTimings::elapsed(checks_start);
+    let fixpoint_start = timings.clock();
 
     for pass in 0..MAX_PASSES {
+        if timings.start.is_some() { timings.passes += 1; }
         let widen = pass >= WIDEN_AFTER;
         let mut changed = false;
 
@@ -922,6 +977,7 @@ pub fn infer_for_sites(f: &Function, sites: &[Inst]) -> InferenceResult {
         let mut edge_refine: HashMap<usize, (super::ir::Block, Vec<Refine>)> = HashMap::new();
 
         for &b in &rpo {
+            if timings.start.is_some() { timings.block_visits += 1; }
             // 1. Block parameter facts = join over predecessor edges (or the
             //    declared type for pred-less blocks, seeded above).
             let preds = f.preds(b);
@@ -950,7 +1006,7 @@ pub fn infer_for_sites(f: &Function, sites: &[Inst]) -> InferenceResult {
                 }
             }
 
-            let mut env = entry_environment(b, &g, &dom, &structural, &edge_refine, &check_refine);
+            let mut env = entry_environment(b, &g, &dom, &structural, &edge_refine, &check_refine, &mut timings);
 
             // 3. Walk instructions in program order, using the local environment.
             let fact = |v: Value, env: &HashMap<Value, IRType>, g: &Facts| -> IRType {
@@ -1010,7 +1066,9 @@ pub fn infer_for_sites(f: &Function, sites: &[Inst]) -> InferenceResult {
             // its comparison operands (including constants) now have facts.
             // Global facts still accumulate monotonically, so a loop-carried
             // bound that grows on a later pass weakens the inferred result.
+            let edge_start = timings.clock();
             add_edge_refinements(f, b, &g, &mut edge_refine);
+            timings.edge_ns += InferenceTimings::elapsed(edge_start);
         }
 
         if !changed {
@@ -1018,16 +1076,25 @@ pub fn infer_for_sites(f: &Function, sites: &[Inst]) -> InferenceResult {
         }
     }
 
+    timings.fixpoint_ns = InferenceTimings::elapsed(fixpoint_start);
     // Derive representations from the final types.
+    let repr_start = timings.clock();
     let mut reprs = HashMap::new();
     for (&v, &t) in &g.0 {
         reprs.insert(v, repr_of(t));
     }
+    timings.repr_ns = InferenceTimings::elapsed(repr_start);
+    let replay_start = timings.clock();
+    let entry_before_replay = timings.entry_ns;
     let before = if sites.is_empty() {
         HashMap::new()
     } else {
-        capture_site_facts(f, sites, &g, &rpo, &dom, &structural, &check_refine)
+        capture_site_facts(f, sites, &g, &rpo, &dom, &structural,
+            CaptureContext { checks: &check_refine, timings: &mut timings })
     };
+    timings.replay_ns = InferenceTimings::elapsed(replay_start);
+    timings.replay_entry_ns = timings.entry_ns - entry_before_replay;
+    timings.finish(f, rpo.len(), sites.len());
     InferenceResult {
         types: g.0,
         reprs,
@@ -1121,13 +1188,20 @@ fn entry_environment(
     structural: &super::value_facts::StructuralFacts,
     edge_refine: &EdgeRefinements,
     check_refine: &CheckRefinements,
+    timings: &mut InferenceTimings,
 ) -> HashMap<Value, IRType> {
+    let entry_start = timings.clock();
+    if timings.start.is_some() { timings.entry_calls += 1; }
     let mut env: HashMap<Value, IRType> = HashMap::new();
     let mut d = b;
     loop {
+        if timings.start.is_some() { timings.idom_steps += 1; }
         if let Some((_, refs)) = edge_refine
             .get(&d.index())
-            .filter(|(source, _)| structural.block_dominates_all_entries(*source, b))
+            .filter(|(source, _)| {
+                if timings.start.is_some() { timings.dominance_queries += 1; }
+                structural.block_dominates_all_entries(*source, b)
+            })
         {
             for rf in refs {
                 let cur = env
@@ -1143,7 +1217,10 @@ fn entry_environment(
         if d != b {
             if let Some(refs) = check_refine
                 .get(&d.index())
-                .filter(|_| structural.block_dominates_all_entries(d, b))
+                .filter(|_| {
+                    if timings.start.is_some() { timings.dominance_queries += 1; }
+                    structural.block_dominates_all_entries(d, b)
+                })
             {
                 for rf in refs {
                     let cur = env
@@ -1163,6 +1240,7 @@ fn entry_environment(
         }
     }
 
+    timings.entry_ns += InferenceTimings::elapsed(entry_start);
     env
 }
 
@@ -1178,6 +1256,11 @@ fn apply_normal_return_facts(
     });
 }
 
+struct CaptureContext<'a> {
+    checks: &'a CheckRefinements,
+    timings: &'a mut InferenceTimings,
+}
+
 fn capture_site_facts(
     f: &Function,
     sites: &[Inst],
@@ -1185,12 +1268,15 @@ fn capture_site_facts(
     rpo: &[Block],
     dom: &DominatorTree,
     structural: &super::value_facts::StructuralFacts,
-    checks: &CheckRefinements,
+    context: CaptureContext<'_>,
 ) -> HashMap<(Inst, Value), IRType> {
+    let CaptureContext { checks, timings } = context;
     let requested: HashSet<_> = sites.iter().copied().collect();
     let mut edges = EdgeRefinements::new();
     for &block in rpo {
+        let edge_start = timings.clock();
         add_edge_refinements(f, block, g, &mut edges);
+        timings.edge_ns += InferenceTimings::elapsed(edge_start);
     }
     let mut before = HashMap::new();
     for &block in rpo {
@@ -1200,8 +1286,10 @@ fn capture_site_facts(
         };
         // Each replay starts from converged global facts and the complete
         // edge/check maps. Other blocks' local environments do not feed it.
-        let mut env = entry_environment(block, g, dom, structural, &edges, checks);
+        let mut env = entry_environment(block, g, dom, structural, &edges, checks, timings);
+        if timings.start.is_some() { timings.replay_blocks += 1; }
         for &inst in &instructions[..=last] {
+            if timings.start.is_some() { timings.replay_insts += 1; }
             let data = f.inst(inst);
             if requested.contains(&inst) {
                 for &value in &data.args {
