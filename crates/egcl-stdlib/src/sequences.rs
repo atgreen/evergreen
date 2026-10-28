@@ -2785,10 +2785,7 @@ pub fn result_type_is_bit_vector(result_type: EgclVal) -> bool {
         );
         if head_takes_element_type && cell.cdr.is_cons() {
             let elt = unsafe { (*(cell.cdr.as_ptr() as *const ConsCell)).car };
-            if elt.tag() == egcl_rt::value::TAG_SYMBOL {
-                return egcl_compiler::reader::symbol_name(elt.as_symbol_index()).as_deref()
-                    == Some("BIT");
-            }
+            return bit_element_type_p(elt);
         }
     }
     false

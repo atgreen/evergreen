@@ -2845,7 +2845,7 @@ Returns NIL."
                            (member elt '(character base-char standard-char)))))
          (bitp (or (member head '(bit-vector simple-bit-vector))
                    (and (member head '(vector array simple-array simple-vector))
-                        (eq elt 'bit)))))
+                        (egcl-internal::%bit-element-type-p (%expand-type-spec elt))))))
     (%check-sequence-result-type rt head declared size result-type)
     (cond
       ((member head '(list cons null))
