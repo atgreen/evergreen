@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- `DEFSTRUCT` reuses inherited symbols for generated accessors, constructors,
+  copiers, and predicates, preserving calls through exported package interfaces
+  ([#775](https://github.com/atgreen/evergreen/pull/775)).
+
 - Callable standard comment readers return zero values, so custom list readers
   skip comments without inserting spurious `NIL` elements
   ([#767](https://github.com/atgreen/evergreen/pull/767)).
