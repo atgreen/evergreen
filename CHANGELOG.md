@@ -4,6 +4,11 @@
 
 ### Changed
 
+- AArch64 T2 reaches captured lexical variables, so a closure that reads or
+  writes one is no longer barred from the optimizing tier: 114 of the 129
+  functions in the tier corpus now compile there, against 76 before
+  ([#749](https://github.com/atgreen/evergreen/pull/749)).
+
 - AArch64 T2 compiles `TRUNCATE`, `FLOOR`, `REM`, `MOD`, `MIN`, `MAX` and
   single-float comparisons to native code instead of leaving each as a runtime
   call, measuring 11x to 103x on hot loops built from them

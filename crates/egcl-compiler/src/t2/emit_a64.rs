@@ -62,8 +62,9 @@
 //!
 //! # Runtime calls and GC roots
 //!
-//! `Call`, `SymbolValue`, `SymbolFunction`, `SetSymbolValue`, `ClearMv` and
-//! `TakeValuesToLocals` go through [`RuntimeCalls`] adapters. Because the
+//! `Call`, `SymbolValue`, `SymbolFunction`, `SetSymbolValue`, `ClearMv`,
+//! `TakeValuesToLocals`, `EnvironmentValue` and `SetEnvironmentValue` go
+//! through [`RuntimeCalls`] adapters. Because the
 //! collector cannot see a home register or native spill slot, `runtime_call`
 //! clears every shadow slot to NIL, writes each live tagged value into the
 //! shadow area after `activation_slots` (roots, then call arguments), calls,
@@ -117,7 +118,10 @@
 //! allocates.
 
 use super::emit::{EmitError, FramedCode, RootSyncSite, op_tag};
-use super::emit_s390x::rematerialization_order;
+// `calls_runtime` is the same list the System Z emitter routes -- both
+// emitters read the same `RuntimeCalls` struct and reach the same opcodes
+// through it -- so it is defined once, there, beside that struct.
+use super::emit_s390x::{calls_runtime, rematerialization_order};
 use super::frame_state::{FrameState, FrameStateId, RematOp, ValueSource};
 use super::ir::{
     AuxData, Block, BlockCall, Function, Inst, InstData, Opcode, TypeBits, Value,
@@ -164,17 +168,6 @@ const REGISTER_ENTRY_ARGS_MAX: usize = 3;
 /// them. Re-exported rather than redefined so one call site fills both.
 pub use super::emit_s390x::RuntimeCalls;
 
-fn calls_runtime(opcode: Opcode) -> bool {
-    matches!(
-        opcode,
-        Opcode::Call
-            | Opcode::SymbolValue
-            | Opcode::SymbolFunction
-            | Opcode::SetSymbolValue
-            | Opcode::ClearMv
-            | Opcode::TakeValuesToLocals
-    )
-}
 
 #[derive(Clone, Copy)]
 enum Home {
@@ -865,6 +858,39 @@ impl Emitter<'_> {
                         Opcode::SymbolValue => self.runtime.load_global,
                         Opcode::SymbolFunction => self.runtime.load_function,
                         _ => self.runtime.store_global,
+                    }
+                }
+                Opcode::EnvironmentValue | Opcode::SetEnvironmentValue => {
+                    // `(body, name_index) -> value` and
+                    // `(body, name_index, value)`: the same C signatures the
+                    // x86 framed and System Z emitters call, so AAPCS64 puts
+                    // the body in x0, the index in x1 and the stored value in
+                    // x2. The value is staged FIRST, as on System Z: nothing
+                    // below writes x2, but loading a heap-constant value goes
+                    // through the address scratch, and keeping the order
+                    // identical across the two ports keeps the reason for it
+                    // in one place.
+                    //
+                    // Refusing these cost a closure that merely READS a
+                    // captured variable its whole T2 body, which is most
+                    // closures; `build.rs` emits the opcode unconditionally,
+                    // so there was no gate to widen, only this arm to add.
+                    let AuxData::EnvironmentName(index) = data.aux else {
+                        return Err(unsupported!());
+                    };
+                    let store = data.opcode == Opcode::SetEnvironmentValue;
+                    if self.runtime.environment.body == 0 {
+                        return Err(EmitError::UnsupportedOp(op_tag(data.opcode)));
+                    }
+                    if store {
+                        self.load(*data.args.first().ok_or(unsupported!())?, T0)?;
+                    }
+                    self.imm(W0, self.runtime.environment.body);
+                    self.imm(W1, u64::from(index));
+                    if store {
+                        self.runtime.environment.store
+                    } else {
+                        self.runtime.environment.load
                     }
                 }
                 Opcode::ClearMv => {

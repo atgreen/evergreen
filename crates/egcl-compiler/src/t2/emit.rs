@@ -4478,7 +4478,11 @@ pub fn emit_framed_with_direct_natives(
                 self_sym,
                 direct_natives: Vec::new(),
                 code_id,
-                environment: EnvironmentCalls::default(),
+                // The captured-lexical adapters, as System Z passes them: a
+                // closure that merely READS a captured variable was the single
+                // largest AArch64 T2 admission gap, declining 39 of the 129
+                // functions in the tier corpus on `EnvironmentValue` alone.
+                environment,
                 portable: portable.clone(),
                 named_calls: Vec::new(),
             },

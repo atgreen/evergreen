@@ -238,7 +238,15 @@ pub const REGISTER_ENTRY_ARGS_MAX: usize = 4;
 /// selected back edge, independently of x86's straight-line poll interval.
 const POLL_INTERVAL: u16 = 64;
 
-fn calls_runtime(opcode: Opcode) -> bool {
+/// Which opcodes this emitter reaches through a [`RuntimeCalls`] adapter
+/// rather than inline code.
+///
+/// Shared with `emit_a64`, which re-exports [`RuntimeCalls`] from here and
+/// routes the same set the same way. Keeping one list is safe in both
+/// directions: an opcode listed here that a port has no arm for reaches
+/// `runtime_call` and declines there by name, which is the same answer it
+/// would have given anyway.
+pub(crate) fn calls_runtime(opcode: Opcode) -> bool {
     matches!(
         opcode,
         Opcode::Call
