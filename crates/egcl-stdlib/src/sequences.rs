@@ -3660,12 +3660,14 @@ fn small_unsigned_element_bits(spec: EgclVal) -> Option<u8> {
         if values.len() != 1 || !values[0].is_fixnum() { return None; }
         if lower { values[0].as_fixnum().checked_add(1) } else { values[0].as_fixnum().checked_sub(1) }
     }
+    // NIL and T are symbols semantically, but have their own immediate tags.
+    if spec.is_nil() || spec == T { return None; }
     if spec.is_symbol() {
         return (egcl_compiler::reader::symbol_name(spec.as_symbol_index()).as_deref() == Some("BIT"))
             .then_some(1);
     }
     let values = parts(spec)?;
-    if values.is_empty() || !values[0].is_symbol() { return None; }
+    if values.is_empty() || !values[0].is_symbol() || values[0].is_nil() || values[0] == T { return None; }
     let (lo, hi) = match egcl_compiler::reader::symbol_name(values[0].as_symbol_index()).as_deref() {
         Some("UNSIGNED-BYTE") if values.len() == 2 && values[1].is_fixnum() => {
             let width = values[1].as_fixnum();
