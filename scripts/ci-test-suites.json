@@ -1,5 +1,6 @@
 {
   "fast": {
+    "egcl:test:standard_comment_reader_cli": [""],
     "egcl:test:reader_external_symbols_cli": [""],
     "egcl:test:unused_lexical_function_tiers": [""],
     "egcl:test:array_adjustment_cli": [""],
