@@ -252,6 +252,10 @@
 
 ### Fixed
 
+- The `#nA` reader accepts packed `(unsigned-byte 8)` vectors as contents,
+  including empty vectors and multidimensional rows
+  ([#721](https://github.com/atgreen/evergreen/pull/721)).
+
 - Interpreted `MULTIPLE-VALUE-BIND` preserves uninterned variable identity,
   preventing fresh SETF-expander store variables from permanently retaining
   their generated names during workloads such as TLS I/O

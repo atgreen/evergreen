@@ -4497,6 +4497,18 @@ fn read_nd_array_literal_and_equalp_roundtrip() {
             "(let ((v (read-from-string \"#1a#.(make-array 3 :element-type '(unsigned-byte 8) :initial-contents '(1 2 3))\"))) (list (typep v 'simple-vector) (equalp v #(1 2 3))))",
             "(T T)",
         ),
+        (
+            "(let ((v (read-from-string \"#1a#.(make-array 0 :element-type '(unsigned-byte 8))\"))) (list (array-dimensions v) (equalp v #())))",
+            "((0) T)",
+        ),
+        (
+            "(coerce (read-from-string \"#1a#.(make-array 3 :element-type '(unsigned-byte 8) :initial-contents '(0 128 255))\") 'list)",
+            "(0 128 255)",
+        ),
+        (
+            "(let ((v (read-from-string \"#2a(#.(make-array 2 :element-type '(unsigned-byte 8) :initial-contents '(0 255)) #.(make-array 2 :element-type '(unsigned-byte 8) :initial-contents '(128 1)))\"))) (list (array-dimensions v) (aref v 0 1) (aref v 1 0) (equalp v #2a((0 255) (128 1)))))",
+            "((2 2) 255 128 T)",
+        ),
     ];
     for (expr, expected) in cases {
         let out = egcl_bin()
