@@ -8,9 +8,11 @@ const PROGRAM: &str = r#"
 (defparameter *unused-local* (eval
  '(flet ((registration-helper () :unused))
     (macrolet ((advance (x) `(1+ ,x)))
-      (lambda (n)
-        (let ((sum 0))
-          (dotimes (i n sum) (setq sum (advance sum)))))))))
+      (labels ((generated-encoder (n)
+                 (let ((sum 0))
+                   (dotimes (i n) (setq sum (advance sum)))
+                   (return-from generated-encoder sum))))
+        #'generated-encoder)))))
 (defparameter *used-local* (eval
  '(flet ((encoding-helper (x) (+ x 11)))
     (lambda (n) (encoding-helper n)))))
@@ -27,10 +29,18 @@ const PROGRAM: &str = r#"
   (assert (= (funcall *function-local* 5) 22))
   (assert (= (funcall *macro-local* 5) 28)))
 ;; The initial proof intentionally rejects all references, even quoted data.
+(defparameter *recursive-local* (eval
+ '(labels ((recursive-helper (n)
+             (if (zerop n) 0 (1+ (recursive-helper (1- n))))))
+    #'recursive-helper)))
+(dotimes (i 20) (assert (= 4 (funcall *recursive-local* 4))))
 (defparameter *quoted-local* (eval
  '(flet ((encoding-helper () :unused))
     (lambda () 'encoding-helper))))
 (dotimes (i 20) (assert (eq (funcall *quoted-local*) 'encoding-helper)))
+(defparameter *quoted-control* (eval
+ '(labels ((encoding-helper () '(block encoding-helper))) #'encoding-helper)))
+(dotimes (i 20) (assert (equal (funcall *quoted-control*) '(block encoding-helper))))
 (format t "UNUSED-LEXICAL-FUNCTIONS-OK~%")
 "#;
 
@@ -48,7 +58,9 @@ fn source_closure_ignores_only_proven_unused_definition_site_functions() {
             let proof = if tier == "t2" && !disabled {
                 "(loop repeat 200 until (eql 2 (egcl-ext:function-tier *unused-local*))
                    do (funcall *unused-local* 4) (sleep 0.01))
-                 (assert (= 2 (egcl-ext:function-tier *unused-local*)))"
+                 (assert (= 2 (egcl-ext:function-tier *unused-local*)))
+                 (assert (null (egcl-ext:function-tier *recursive-local*)))
+                 (assert (null (egcl-ext:function-tier *quoted-control*)))"
             } else {
                 "nil"
             };
@@ -64,6 +76,7 @@ fn source_closure_ignores_only_proven_unused_definition_site_functions() {
                 .env("EGCL_T2_THREADS", "1");
             for key in [
                 "EGCL_DISABLE_TREE_CLOSURE_EXPANSION",
+                "EGCL_DISABLE_UNUSED_CLOSURE_FUNCTIONS",
                 "EGCL_PROFILING_DISABLED",
                 "EGCL_T2_NO_QUEUE",
                 "EGCL_GC_STRESS",
@@ -81,7 +94,11 @@ fn source_closure_ignores_only_proven_unused_definition_site_functions() {
                     .env("EGCL_GC_POISON", "1");
             }
             if disabled {
-                command.env("EGCL_DISABLE_TREE_CLOSURE_EXPANSION", "1");
+                command.env(
+                    "EGCL_DISABLE_TREE_CLOSURE_EXPANSION",
+                    "EGCL_DISABLE_UNUSED_CLOSURE_FUNCTIONS",
+                    "1",
+                );
             }
             let result = command.output().expect("run source closure regression");
             let stdout = String::from_utf8_lossy(&result.stdout);

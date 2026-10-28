@@ -15315,14 +15315,31 @@ fn closure_expansion_ignores_functions(lambda_list: EgclVal, body: EgclVal, env:
     // Local SETF function names need compound-name analysis; leave them on the
     // existing fallback rather than compare only their printed base names.
     if names.iter().any(|name| name.starts_with('(')) { return false; }
-    let mut pending = vec![lambda_list, body];
+    let block = reader::find_symbol_index("BLOCK");
+    let return_from = reader::find_symbol_index("RETURN-FROM");
+    let quote = reader::find_symbol_index("QUOTE");
+    let mut pending = vec![(lambda_list, true, false), (body, false, false)];
     let mut seen = std::collections::HashSet::new();
-    while let Some(form) = pending.pop() {
+    while let Some((form, datum, expression)) = pending.pop() {
         if form.is_symbol() && names.contains(&sym_name(form)) { return false; }
-        if form.is_cons() && seen.insert(form.0) {
+        if form.is_cons() && seen.insert((form.0, datum, expression)) {
             let (car, cdr) = cp(form);
-            pending.push(car);
-            pending.push(cdr);
+            // These literal positions belong exclusively to the control
+            // namespace. In particular NAMED-LAMBDA's implicit BLOCK does not
+            // imply a reference to its same-named LABELS function.
+            let control = car.symbol_index().is_some_and(|symbol|
+                Some(symbol) == block || Some(symbol) == return_from);
+            if expression && !datum && control && cdr.is_cons() {
+                let (label, rest) = cp(cdr);
+                if label.is_symbol() {
+                    pending.push((car, false, true));
+                    pending.push((rest, false, false));
+                    continue;
+                }
+            }
+            pending.push((car, datum, true));
+            pending.push((cdr, datum || car.symbol_index().is_some_and(|symbol|
+                Some(symbol) == quote), false));
         }
     }
     true
@@ -15403,7 +15420,10 @@ pub(super) fn compile_tree_closure(
     let mut filtered_env = has_local_functions.then(|| compile_env.clone());
     egcl_rt::rooted_ref!(_filtered_env_root = &mut filtered_env);
     let compile_env = if has_local_functions {
-        if !*PREEXPAND.get().expect("closure expansion policy initialized")
+        static UNUSED_FUNCTIONS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*UNUSED_FUNCTIONS.get_or_init(||
+            std::env::var_os("EGCL_DISABLE_UNUSED_CLOSURE_FUNCTIONS").is_none())
+            || !*PREEXPAND.get().expect("closure expansion policy initialized")
             || !closure_expansion_ignores_functions(lambda_list, body, compile_env)
         {
             log_not_compiled(label, "closure references captured local function namespace");
