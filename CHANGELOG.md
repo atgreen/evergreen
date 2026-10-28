@@ -4,6 +4,10 @@
 
 ### Changed
 
+- `TYPE-OF` identifies displaced multidimensional arrays as `ARRAY`, keeping
+  its result consistent with `TYPEP` and `SUBTYPEP`
+  ([#720](https://github.com/atgreen/evergreen/pull/720)).
+
 - T2 uses bounded callee return expectations to choose guarded numeric
   specializations before first-use arithmetic, while preserving redefinition,
   effects and runtime checks ([#737](https://github.com/atgreen/evergreen/pull/737)).
