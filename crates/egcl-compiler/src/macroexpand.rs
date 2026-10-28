@@ -1601,6 +1601,7 @@ fn is_known_special_operator(val: EgclVal) -> bool {
                 // parameters shadow an enclosing symbol macro, and the name,
                 // qualifiers and lambda list are not expressions (bliss-ump7).
                 | "DEFINE-COMPILER-MACRO"
+                | "DEFINE-SYMBOL-MACRO"
                 | "DEFMACRO"
                 | "DEFMETHOD"
                 | "DEFUN"
@@ -1704,6 +1705,11 @@ fn expand_special_form(
 
     match name_str {
         "QUOTE" => Ok(form),
+        // Neither operand is evaluated here: the name identifies the binding,
+        // and the expansion is syntax substituted at later variable uses.
+        // Walking a redefinition as a call would replace its name with the
+        // existing global symbol-macro expansion.
+        "DEFINE-SYMBOL-MACRO" => Ok(form),
         "GO" => Ok(form),
         "BLOCK" => expand_block(form, env),
         "RETURN-FROM" => expand_return_from(form, env),
