@@ -16161,6 +16161,11 @@ fn symbol_bare_name_is(name: &str, bare: &str) -> bool {
 /// uppercasing — the overwhelmingly common case — so callers skip the
 /// conversion entirely.
 fn symbol_bare_slice(name: &str) -> (&str, bool) {
+    // Synthetic function keys are opaque: the qualifier belongs to their
+    // place, not to the whole internal symbol. Keep lookup/printing identity.
+    if egcl_rt::symbols::is_setf_function_key(name) {
+        return (name, !name.bytes().all(|b| b.is_ascii() && !b.is_ascii_lowercase()));
+    }
     // A keyword's name is everything after its marker, colons included: the
     // keyword named "A:B" is keyed `KEYWORD:A:B`, and splitting that again at
     // its second colon made it "B" (GitHub #468).
@@ -49448,6 +49453,18 @@ mod macro_stream_environment_tests {
 #[cfg(test)]
 mod symbol_bare_name_tests {
     use super::symbol_bare_name;
+
+    #[test]
+    fn qualified_setf_function_keys_keep_the_complete_name_and_home() {
+        let _lock = super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for name in ["(SETF PKG:PLACE)", "(SETF PKG::PLACE)"] {
+            assert_eq!(symbol_bare_name(name), name);
+            let symbol = egcl_rt::value::EgclVal::from_symbol_index(egcl_rt::symbols::intern(name));
+            assert_eq!(super::symbol_home_package_name(symbol), "COMMON-LISP");
+        }
+    }
 
     /// The original expression `symbol_bare_name` was rewritten from, for keys
     /// outside KEYWORD. The rewrite is a pure optimization (bliss-mwpb), so the

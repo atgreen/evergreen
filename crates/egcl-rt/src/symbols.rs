@@ -301,6 +301,14 @@ pub fn rename_package_prefix(old_pkg: &str, new_pkg: &str) -> Vec<(u32, String, 
     renamed
 }
 
+/// Internal compound function names retain their entire registry spelling.
+/// Their place's package marker is not a marker for the synthetic symbol.
+pub fn is_setf_function_key(key: &str) -> bool {
+    key.strip_prefix("(SETF ")
+        .and_then(|place| place.strip_suffix(')'))
+        .is_some_and(|place| !place.is_empty())
+}
+
 /// Split a symbol REGISTRY KEY into its package and name parts at the package
 /// marker.
 ///
@@ -311,8 +319,13 @@ pub fn rename_package_prefix(old_pkg: &str, new_pkg: &str) -> Vec<(u32, String, 
 /// name and reports a package that does not exist (bliss-lgml). Callers that
 /// want only one half still go through here so the rule stays in one place.
 ///
-/// Returns `None` for an unqualified key (no marker at all).
+/// Returns `None` for an unqualified key, including an opaque internal
+/// `(SETF place)` function key. Splitting inside that key would serialize a
+/// fictitious package such as `(SETF ASDF/ACTION` and lose function identity.
 pub fn split_registry_key(key: &str) -> Option<(&str, &str)> {
+    if is_setf_function_key(key) {
+        return None;
+    }
     let colon = key.find(':')?;
     let marker_len = if key[colon..].starts_with("::") { 2 } else { 1 };
     Some((&key[..colon], &key[colon + marker_len..]))
@@ -1262,6 +1275,20 @@ mod tests {
         // The name is read back out of the symbol's heap name cell, not a side map.
         assert_eq!(symbol_name(a).as_deref(), Some("STAGE-A-ALPHA"));
         assert_eq!(symbol_name(b).as_deref(), Some("STAGE-A-BETA"));
+    }
+
+    #[test]
+    fn synthetic_setf_keys_are_opaque_but_outer_package_markers_still_split() {
+        for key in ["(SETF CAR)", "(SETF ASDF/ACTION:TIME)", "(SETF PKG::PLACE)"] {
+            assert!(is_setf_function_key(key));
+            assert_eq!(split_registry_key(key), None);
+        }
+        assert_eq!(
+            split_registry_key("PKG::(SETF OTHER:PLACE)"),
+            Some(("PKG", "(SETF OTHER:PLACE)"))
+        );
+        assert_eq!(split_registry_key("PKG::A:B"), Some(("PKG", "A:B")));
+        assert_eq!(split_registry_key("KEYWORD:A:B"), Some(("KEYWORD", "A:B")));
     }
 
     #[test]

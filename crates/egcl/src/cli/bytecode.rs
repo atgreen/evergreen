@@ -30631,6 +30631,49 @@ mod jtc4_stack_map_tests {
     }
 
     #[test]
+    fn bbu_setf_function_key_roundtrip_preserves_identity_without_package_records() {
+        let _lock = super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let key = "(SETF XVOGH-ROUNDTRIP::PLACE)";
+        let index = reader::intern_symbol(key);
+        let mut pool = BbuConstPool::default();
+        let reference = pool.symbol_by_index(index).unwrap();
+        let constants: Vec<_> = pool
+            .entries
+            .iter()
+            .map(|entry| {
+                let mut cursor = BbuCursor::new(entry);
+                let value = parse_bbu_constant(&mut cursor, BBU_BYTECODE_VERSION).unwrap();
+                assert!(cursor.done());
+                value
+            })
+            .collect();
+        assert!(
+            constants
+                .iter()
+                .all(|c| !matches!(c, BbuConstant::Package { .. }))
+        );
+        let BbuConstant::Symbol {
+            package_ref,
+            name_ref,
+            ..
+        } = constants[reference as usize]
+        else {
+            panic!("synthetic key must remain a symbol record");
+        };
+        assert_eq!(package_ref, BBU_NO_INDEX);
+        assert_eq!(bbu_string(&constants, name_ref).unwrap(), key);
+        egcl_rt::rooted!(values = materialize_bbu_constants(&constants).unwrap());
+        assert_eq!(
+            values[reference as usize],
+            EgclVal::from_symbol_index(index)
+        );
+        assert_eq!(egcl_rt::symbols::registry_key(index).as_deref(), Some(key));
+        assert!(!egcl_rt::packages::exists("(SETF XVOGH-ROUNDTRIP"));
+    }
+
+    #[test]
     fn bbu_v11_registry_key_symbol_tag_remains_readable() {
         let mut cursor = BbuCursor::new(&[14, 3, 0, 0, 0]);
         assert!(matches!(
