@@ -287,6 +287,10 @@
   array storage graphs and shared references
   ([#742](https://github.com/atgreen/evergreen/pull/742)).
 
+- Nonlocal `RETURN-FROM` from bytecode closures preserves zero and multiple
+  values through named block exits and cleanup
+  ([#747](https://github.com/atgreen/evergreen/pull/747)).
+
 - Qualified SETF function names retain their identity through compiled files
   and saved images without creating bogus packages
   ([#739](https://github.com/atgreen/evergreen/pull/739)).
