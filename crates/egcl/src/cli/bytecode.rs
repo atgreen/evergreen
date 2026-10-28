@@ -14627,8 +14627,15 @@ fn make_prepared_bytecode_closure(
     egcl_rt::safepoint::poll_safepoint();
     collect_requested_major_before_closure();
     let cached = closure_templates::lookup(nested);
+    // Disabled/fresh construction needs no identity-sharing analysis. Keep the
+    // uncached comparison free of work introduced solely to justify reuse.
     let control_free = cached.map_or_else(
-        || captured_env.is_none() && !bf_has_free_control_exit(nested),
+        || {
+            reuse
+                && closure_templates::enabled()
+                && captured_env.is_none()
+                && !bf_has_free_control_exit(nested)
+        },
         |p| p.control_free,
     );
     let reusable = reuse && captured_env.is_none() && control_free;

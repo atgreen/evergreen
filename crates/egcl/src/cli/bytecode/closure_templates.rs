@@ -34,7 +34,7 @@ struct Cache {
 static CACHE: egcl_rt::execution_local::ExecutionLocal<RefCell<Cache>> =
     unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(Cache::default())) };
 
-fn enabled() -> bool {
+pub(super) fn enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("EGCL_DISABLE_CLOSURE_TEMPLATE_CACHE").is_none())
 }

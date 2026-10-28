@@ -17,9 +17,11 @@ const PROGRAM: &str = r#"
 "#;
 const READY: &str = r#"
 (loop repeat 150 until
-  (every (lambda (s) (= 2 (egcl-ext:function-tier s))) '(ct-free ct-captured ct-control))
+  (every (lambda (s) (= 2 (egcl-ext:function-tier s))) '(ct-free ct-captured))
   do (ct-warm) (sleep 0.01))
-(dolist (s '(ct-free ct-captured ct-control)) (assert (= 2 (egcl-ext:function-tier s))))
+(dolist (s '(ct-free ct-captured)) (assert (= 2 (egcl-ext:function-tier s))))
+;; A creator of a free lexical RETURN-FROM must keep the existing safe T0 path.
+(assert (eql 0 (egcl-ext:function-tier 'ct-control)))
 "#;
 const CHECK: &str = r#"
 (let ((a (ct-captured 10)) (b (ct-captured 100)))
@@ -96,7 +98,7 @@ fn closure_templates_preserve_captures_control_and_actual_native_production() {
         );
         assert!(stdout.contains("CLOSURE-TEMPLATES-OK"));
         if tier == "t2" {
-            for name in ["CT-FREE", "CT-CAPTURED", "CT-CONTROL"] {
+            for name in ["CT-FREE", "CT-CAPTURED"] {
                 assert!(
                     stderr.lines().any(|line| line
                         .contains(&format!("{name}: optimized worker result installed with "))
