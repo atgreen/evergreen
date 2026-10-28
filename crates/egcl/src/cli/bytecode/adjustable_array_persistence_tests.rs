@@ -348,3 +348,41 @@ fn saved_image_array_constants_reference_actual_heap_objects_for_all_storage_kin
         );
     }
 }
+
+#[test]
+fn typed_direct_storage_rejects_nested_wrappers_but_displaced_chains_remain_valid() {
+    let _lock = super::super::heap_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let metadata = array_constants::ComplexMetadata {
+        fill_pointer: 2,
+        adjustable: true,
+        element_type: 12,
+        has_fill_pointer: false,
+        displacement: None,
+    };
+    let mut constants = vec![
+        BbuConstant::PackedU8(vec![1, 255]),
+        BbuConstant::ComplexArray {
+            storage_ref: 0,
+            metadata: metadata.clone(),
+        },
+        BbuConstant::ComplexArray {
+            storage_ref: 1,
+            metadata: metadata.clone(),
+        },
+    ];
+    assert!(materialize_bbu_constants(&constants).is_err());
+    constants[2] = BbuConstant::ComplexArray {
+        storage_ref: 1,
+        metadata: array_constants::ComplexMetadata {
+            displacement: Some((0, 2)),
+            ..metadata
+        },
+    };
+    egcl_rt::rooted!(values = materialize_bbu_constants(&constants).unwrap());
+    assert_eq!(
+        egcl_stdlib::sequences::u8_array_element(values[2], 1),
+        Some(255)
+    );
+}

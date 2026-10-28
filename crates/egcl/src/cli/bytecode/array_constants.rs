@@ -278,6 +278,22 @@ pub(super) fn validate_values(
             continue;
         };
         let storage = values[bbu_index(*storage_ref, values.len(), "array storage")?];
+        // Direct accessors require physical flat storage. Only displaced
+        // wrappers interpret another array through its row-major accessors.
+        if metadata.displacement.is_none() {
+            let general = bbu_vector_elements(storage).is_some();
+            let direct = match metadata.element_type {
+                0 => general,
+                1 => storage.is_string() || general,
+                2 => egcl_rt::types::bit_vector_len(storage).is_some() || general,
+                11 => egcl_rt::packed_f64::is_vector(storage),
+                12 => egcl_rt::packed_u8::is_vector(storage),
+                _ => false,
+            };
+            if !direct {
+                return Err(bbu_error("nondisplaced array requires flat storage"));
+            }
+        }
         let kind = egcl_stdlib::sequences::array_element_kind(storage)
             .ok_or_else(|| bbu_error("invalid array backing"))?;
         let matches = match metadata.element_type {
