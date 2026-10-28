@@ -25,6 +25,11 @@
   call, measuring 11x to 103x on hot loops built from them
   ([#746](https://github.com/atgreen/evergreen/pull/746)).
 
+- Native loops can retain the ordinary calling convention when loading
+  function objects, and variable symbol designators can use guarded native
+  `FUNCALL` entries while preserving redefinition and argument checks
+  ([#748](https://github.com/atgreen/evergreen/pull/748)).
+
 - Source closures expand captured macros and user-defined `SETF` places before
   bytecode compilation, and loop bodies can enter tiered execution on their
   first invocation, including CFFI callbacks

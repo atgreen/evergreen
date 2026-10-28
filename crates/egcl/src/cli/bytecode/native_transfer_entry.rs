@@ -1935,7 +1935,7 @@ fn scope_free_native_body(body: &BytecodeFunction, allow_values: bool) -> bool {
 /// A local `Go` names a tagbody of this same bytecode function: the compiler
 /// emits `GoNamed` for a tag owned by an enclosing function, and `NamedTag`
 /// (which `try_compile_variant` refuses) when a closure could capture a tag.
-/// With no closure, `#'`, catch, unwind or binding in the body, nothing
+/// With no closure, catch, unwind or binding in the body, nothing
 /// outside this activation can transfer to its tags, so T2 lowers each `Go`
 /// to a plain jump and the ordinary frame keeps no runtime handler record.
 /// Deoptimization rebuilds the record from the exact scope map, as it does for
@@ -1954,6 +1954,17 @@ pub(super) fn ordinary_native_body(body: &BytecodeFunction) -> bool {
 fn ordinary_native_op(op: &Instr) -> bool {
     local_control_op(op, false, false, true)
         || matches!(op, Instr::PushTag { .. } | Instr::Go { .. })
+        // The ordinary semantic-primitive pass already lowers function
+        // lookup through a published, collecting helper. It does not need
+        // a mapped activation or lexical scope.
+        || (matches!(op, Instr::LoadFunction(_)) && ordinary_function_designators_enabled())
+}
+
+pub(super) fn ordinary_function_designators_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("EGCL_DISABLE_ORDINARY_FUNCTION_DESIGNATORS").is_none()
+    })
 }
 
 /// Whether specialization removed every primary-value binder the body's

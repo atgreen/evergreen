@@ -25,9 +25,9 @@ pub(super) struct FuncallProbe {
     entries: [std::cell::UnsafeCell<egcl_compiler::t2::native_transfer::OrdinaryFuncallProbeEntry>;
         egcl_compiler::t2::native_transfer::ORDINARY_FUNCALL_PROBE_ENTRIES],
     next: std::cell::Cell<usize>,
-    /// The last (function, epoch, collection stamp) found ineligible, so a
+    /// The last (function, arity, epoch, collection stamp) found ineligible, so a
     /// call the probe can never take does not pay for selection each time.
-    rejected: std::cell::Cell<(u64, u64, u64)>,
+    rejected: std::cell::Cell<(u64, usize, u64, u64)>,
 }
 
 /// The revision word of an empty probe entry; no cell revision reaches it.
@@ -48,8 +48,35 @@ impl FuncallProbe {
                     descriptor: 0,
                 })),
             next: std::cell::Cell::new(0),
-            rejected: std::cell::Cell::new((NIL.0, u64::MAX, u64::MAX)),
+            rejected: std::cell::Cell::new((NIL.0, usize::MAX, u64::MAX, u64::MAX)),
         }
+    }
+
+    fn record(&self, entry: egcl_compiler::t2::native_transfer::OrdinaryFuncallProbeEntry) {
+        let index = if super::super::native_transfer_entry::ordinary_function_designators_enabled() {
+            // A newly selected hot callable should take the first generated
+            // comparison. Coalesce its old slot rather than filling the table
+            // with duplicates when a mapped caller repeatedly records it.
+            let previous = self.entries.iter().position(|slot| unsafe {
+                (*slot.get()).function == entry.function
+            }).unwrap_or(self.entries.len() - 1);
+            if previous == 0 && unsafe { *self.entries[0].get() == entry } {
+                return;
+            }
+            for index in (1..=previous).rev() {
+                // Only this execution writes, without allocating or yielding;
+                // no generated reader can observe this partial permutation.
+                unsafe {
+                    self.entries[index].get().write(*self.entries[index - 1].get());
+                }
+            }
+            0
+        } else {
+            let index = self.next.get();
+            self.next.set((index + 1) % self.entries.len());
+            index
+        };
+        unsafe { self.entries[index].get().write(entry) };
     }
 }
 
@@ -71,11 +98,11 @@ pub(super) fn record_funcall(state: &State, function: EgclVal, nargs: usize) {
     let epoch = egcl_rt::call_table::invalidation_epoch();
     let collections = super::super::native_transfer_entry::funcall_fast::collection_stamp();
     let bits = function.0;
-    if probe.rejected.get() == (bits, epoch, collections) {
+    if probe.rejected.get() == (bits, nargs, epoch, collections) {
         return;
     }
     if !record_funcall_target(&probe, bits, function, nargs, epoch, collections) {
-        probe.rejected.set((bits, epoch, collections));
+        probe.rejected.set((bits, nargs, epoch, collections));
     }
 }
 
@@ -83,10 +110,24 @@ fn record_funcall_target(
     probe: &FuncallProbe, bits: u64, function: EgclVal, nargs: usize, epoch: u64, collections: u64,
 ) -> bool {
     use std::sync::atomic::Ordering;
-    let Some((symbol, code)) = super::super::native_transfer_entry::funcall_fast::native_target(function, nargs) else {
+    // A symbol designator selects its current function after all actuals
+    // have been evaluated. The probe still keys on the original symbol;
+    // rebinding it changes the invalidation epoch before another hit.
+    let callable = if let Some(symbol) = function.symbol_index() {
+        if !super::super::native_transfer_entry::ordinary_function_designators_enabled() {
+            return false;
+        }
+        let Some(callable) = egcl_rt::symbols::symbol_function(symbol) else {
+            return false;
+        };
+        callable
+    } else {
+        function
+    };
+    let Some((symbol, code)) = super::super::native_transfer_entry::funcall_fast::native_target(callable, nargs) else {
         return false;
     };
-    if egcl_rt::symbols::symbol_function(symbol).map(|current| current.0) != Some(bits) {
+    if egcl_rt::symbols::symbol_function(symbol) != Some(callable) {
         return false;
     }
     let Some(cell) = resolve(symbol) else { return false };
@@ -118,18 +159,14 @@ fn record_funcall_target(
     if !descriptor.accepts(nargs, ORDINARY_ENV_NONE) {
         return false;
     }
-    let index = probe.next.get();
-    probe.next.set((index + 1) % probe.entries.len());
-    unsafe {
-        probe.entries[index].get().write(egcl_compiler::t2::native_transfer::OrdinaryFuncallProbeEntry {
+    probe.record(egcl_compiler::t2::native_transfer::OrdinaryFuncallProbeEntry {
             function: bits,
             epoch,
             collections,
             revision_address: cell.revision_address() as u64,
             revision: descriptor.revision,
             descriptor: pointer as u64,
-        });
-    }
+    });
     true
 }
 

@@ -231,3 +231,49 @@ fn a_fast_target_roots_arguments_that_move_during_the_call() {
     assert_eq!(value, args[0], "the callee returns the relocated argument");
     assert_eq!(cp(value).0, EgclVal::from_fixnum(73));
 }
+
+#[test]
+fn ordinary_function_lookup_and_symbol_designators_avoid_per_call_runtime_entries() {
+    let _lock = super::super::super::heap_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    super::super::super::read_eval_all_env(
+        "(defun fd-identity (x) x)
+         (defun fd-direct () (let ((r nil)) (dotimes (i 1000 r) (setq r (fd-identity i)))))
+         (defun fd-local () (let ((f #'fd-identity) (r nil))
+                              (dotimes (i 1000 r) (setq r (funcall f i)))))
+         (defun fd-symbol (f) (let ((r nil))
+                               (dotimes (i 1000 r) (setq r (funcall f i)))))",
+        &mut env,
+    ).unwrap();
+    let (target, _) = super::ordinary_t2::install("FD-IDENTITY", "(x)", "(x)", &mut env);
+    let (direct, _) = super::ordinary_t2::install(
+        "FD-DIRECT", "()",
+        "((let ((r nil)) (dotimes (i 1000 r) (setq r (fd-identity i)))))", &mut env,
+    );
+    let (local, local_code) = super::ordinary_t2::install(
+        "FD-LOCAL", "()",
+        "((let ((f #'fd-identity) (r nil)) (dotimes (i 1000 r) (setq r (funcall f i)))))",
+        &mut env,
+    );
+    let (symbol, symbol_code) = super::ordinary_t2::install(
+        "FD-SYMBOL", "(f)",
+        "((let ((r nil)) (dotimes (i 1000 r) (setq r (funcall f i)))))", &mut env,
+    );
+    for code in [&local_code, &symbol_code] {
+        let NativeCodeStorage::Mapped(mapped) = &code._storage else { panic!("T2 fixture") };
+        assert!(mapped.ordinary_entry.is_some(), "both callers require an ordinary entry");
+    }
+    super::super::native_transfer_entry::ordinary_calls::take_named_entries_for_test();
+    egcl_rt::rooted!(control = run_caller("FD-DIRECT-CALLER", "((+ (fd-direct) (fd-direct)))", 1, &mut env).unwrap());
+    let baseline = super::super::native_transfer_entry::ordinary_calls::take_named_entries_for_test();
+    egcl_rt::rooted!(result = run_caller("FD-CALLER", "((+ (fd-local) (fd-symbol 'fd-identity)))", 1, &mut env).unwrap());
+    let entries = super::super::native_transfer_entry::ordinary_calls::take_named_entries_for_test();
+    uninstall(&[target, direct, local, symbol]);
+    assert_eq!(*control, EgclVal::from_fixnum(1998));
+    assert_eq!(*result, *control);
+    assert!(entries <= baseline + 20,
+        "{entries} runtime entries versus {baseline} direct-call entries for 4000 calls");
+}
