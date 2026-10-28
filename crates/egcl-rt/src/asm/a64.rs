@@ -423,6 +423,28 @@ pub fn mul(d: Reg, n: Reg, m: Reg) -> u32 {
     madd(d, n, m, XZR)
 }
 
+/// `MSUB Xd, Xn, Xm, Xa` — `Xd = Xa - Xn * Xm`.
+///
+/// Paired with [`sdiv`] this is the remainder: AArch64 has no divide that
+/// yields both halves, so `rem = a - (a / b) * b` is how one is obtained.
+pub fn msub(d: Reg, n: Reg, m: Reg, a: Reg) -> u32 {
+    madd(d, n, m, a) | 1 << 15
+}
+
+// ---------------------------------------------------------------------------
+// Divide
+
+/// `SDIV Xd, Xn, Xm` — signed divide, truncating toward zero.
+///
+/// Two differences from x86's `IDIV` that a caller must handle itself, because
+/// this instruction reports nothing: a zero divisor yields **0** rather than
+/// trapping, and `i64::MIN / -1` yields `i64::MIN` rather than overflowing. A
+/// fixnum divide therefore tests the divisor explicitly and range-checks the
+/// quotient, rather than relying on a fault.
+pub fn sdiv(d: Reg, n: Reg, m: Reg) -> u32 {
+    0x9AC0_0C00 | ((m as u32) << 16) | ((n as u32) << 5) | d as u32
+}
+
 // ---------------------------------------------------------------------------
 // Loads and stores
 
@@ -1008,6 +1030,10 @@ mod tests {
             ("mul x1, x2, x3", 0x9B037C41, mul(1, 2, 3)),
             ("madd x1, x2, x3, x4", 0x9B031041, madd(1, 2, 3, 4)),
             ("smulh x5, x4, x3", 0x9B437C85, smulh(5, 4, 3)),
+            ("msub x1, x2, x3, x4", 0x9B039041, msub(1, 2, 3, 4)),
+            ("msub x0, x2, x1, x0", 0x9B018040, msub(0, 2, 1, 0)),
+            ("sdiv x1, x2, x3", 0x9AC30C41, sdiv(1, 2, 3)),
+            ("sdiv x5, x4, x9", 0x9AC90C85, sdiv(5, 4, 9)),
             (
                 "cmp x5, x2, asr #63",
                 0xEB82FCBF,

@@ -95,6 +95,15 @@
 //! `TypeCheck` and the simple-string layout guard read the header type-id
 //! byte; `MemoryFence` becomes a `dmb` of the matching kind.
 //!
+//! `FixnumMin`/`FixnumMax` are a tagged compare and a `csel`. The
+//! `FixnumDiv`/`FixnumFloor`/`FixnumRem`/`FixnumMod` family divides the tagged
+//! operands with `SDIV` -- which cancels the tags, so the quotient needs
+//! retagging while the `MSUB` remainder does not -- and tests the divisor and
+//! range-checks the quotient explicitly, because this architecture's divide
+//! faults on neither. `FloatCmpEq`/`Lt`/`Le`/`Gt`/`Ge` compare two guarded
+//! single-floats and `csel` T or NIL, deopting on an unordered compare so the
+//! interpreter decides NaN ordering.
+//!
 //! Anything else declines: a refused opcode carries `op_tag`, and a shape
 //! this emitter cannot encode carries [`A64_DECLINE_TAG`] with its line.
 //!
@@ -711,6 +720,72 @@ impl Emitter<'_> {
         self.asm.jcc(Cc::Ne, deopt);
     }
 
+    /// Tagged fixnum `MIN`/`MAX`, leaving the chosen operand in `W0`.
+    ///
+    /// Both operands carry the same tag, so the tagged comparison orders them
+    /// exactly as the untagged one would and the selected word is already the
+    /// tagged answer. Branchless, like the fixnum comparisons.
+    fn select_fixnum(&mut self, maximum: bool) {
+        self.compare(W0, W1);
+        self.asm
+            .word(a64::csel(W0, W0, W1, if maximum { Cc::Ge } else { Cc::Le }));
+    }
+
+    /// Divide the tagged fixnum in `W0` by the one in `W1` under the rule
+    /// `opcode` names, leaving the tagged answer in `W0`.
+    ///
+    /// `SDIV` of the two TAGGED operands cancels the tags, so the quotient
+    /// comes out UNTAGGED; `MSUB` then recovers `a_t - q * b_t`, which is the
+    /// remainder still scaled by the tag, i.e. already TAGGED. A
+    /// remainder-producing opcode therefore needs no retagging and a
+    /// quotient-producing one does.
+    ///
+    /// Two checks the hardware will not make for us, because AArch64's divide
+    /// reports nothing. `SDIV` by zero yields zero instead of faulting, so the
+    /// divisor is tested first -- a division by zero has to reach the
+    /// interpreter to signal. And `SDIV` of `MIN-FIXNUM` by -1 yields 2^60, a
+    /// perfectly good i64 that is not a fixnum, so the quotient is
+    /// range-checked before it is retagged. On x86-64 `IDIV` traps on both and
+    /// the emitter there leans on that; here each is an explicit branch.
+    fn divide_fixnums(
+        &mut self,
+        opcode: Opcode,
+        deopt: egcl_rt::asm::Label,
+    ) -> Result<(), EmitError> {
+        use Opcode::*;
+        self.compare_imm(W1, 0);
+        self.asm.jcc(Cc::E, deopt);
+        self.asm.word(a64::sdiv(T0, W0, W1));
+        self.asm.word(a64::msub(T1, T0, W1, W0));
+        if matches!(opcode, FixnumMod | FixnumFloor) {
+            // FLOOR and MOD differ from TRUNCATE and REM only when the
+            // division is inexact AND the remainder's sign disagrees with the
+            // divisor's: then the floored quotient is one lower and the
+            // floored remainder one divisor higher. The dividend in W0 is dead
+            // from here, so it serves as the scratch for the sign test.
+            let truncated = self.asm.label();
+            self.compare_imm(T1, 0);
+            self.asm.jcc(Cc::E, truncated);
+            self.asm.word(a64::eor(W0, T1, W1));
+            self.compare_imm(W0, 0);
+            self.asm.jcc(Cc::Ge, truncated);
+            self.asm.word(a64::sub_imm(T0, T0, 1).ok_or(unsupported!())?);
+            self.asm.word(a64::add(T1, T1, W1));
+            self.asm.bind(truncated);
+        }
+        if matches!(opcode, FixnumMod | FixnumRem) {
+            self.mov(W0, T1);
+            return Ok(());
+        }
+        // Only the positive end can overflow: |quotient| <= |dividend|, and
+        // MIN-FIXNUM is itself a fixnum, so a one-sided check is exact.
+        self.imm(W0, ((1_i64 << 60) - 1) as u64);
+        self.compare(T0, W0);
+        self.asm.jcc(Cc::G, deopt);
+        self.asm.word(a64::lsl_imm(W0, T0, 3));
+        Ok(())
+    }
+
     // ── control flow ─────────────────────────────────────────────
 
     fn edge(&mut self, edge: &BlockCall) -> Result<(), EmitError> {
@@ -1153,6 +1228,49 @@ impl Emitter<'_> {
             TypeCheck => {
                 self.type_check(first, data)?;
                 return self.store(result, W0);
+            }
+            FixnumMin | FixnumMax | FixnumDiv | FixnumFloor | FixnumRem | FixnumMod => {
+                let deopt = self.deopt_label(data)?;
+                self.guard_fixnum(W0, deopt);
+                self.load(*data.args.get(1).ok_or(unsupported!())?, W1)?;
+                self.guard_fixnum(W1, deopt);
+                match data.opcode {
+                    FixnumMin => self.select_fixnum(false),
+                    FixnumMax => self.select_fixnum(true),
+                    other => self.divide_fixnums(other, deopt)?,
+                }
+            }
+            FloatCmpEq | FloatCmpLt | FloatCmpLe | FloatCmpGt | FloatCmpGe => {
+                // A speculated single-float comparison yielding T or NIL, as
+                // emit.rs does it. Each variable operand is guarded to be a
+                // single-float exactly as `FloatAdd` guards its own, and an
+                // UNORDERED compare -- either operand a NaN -- deopts: the
+                // interpreter's NaN ordering is not IEEE's, so native code
+                // must not be the one to decide it.
+                //
+                // Taking that exit FIRST is also what makes the ordinary
+                // signed conditions usable below. An unordered `FCMP` sets C
+                // and V with N and Z clear, so `LT` (N != V) and `LE` would
+                // both read TRUE for a NaN -- the classic AArch64 float-compare
+                // trap. `VS` is consulted before either, so by the `csel` the
+                // comparison is known ordered and the codes mean what they say.
+                let deopt = self.deopt_label(data)?;
+                self.float_operand(first, W0, deopt)?;
+                self.float_operand(*data.args.get(1).ok_or(unsupported!())?, W1, deopt)?;
+                self.unbox_single(F0, W0);
+                self.unbox_single(F1, W1);
+                self.asm.word(a64::fcmp_single(F0, F1));
+                self.asm.jcc(Cc::O, deopt);
+                self.imm(T0, NIL.0);
+                self.imm(T1, T.0);
+                let cc = match data.opcode {
+                    FloatCmpEq => Cc::E,
+                    FloatCmpLt => Cc::L,
+                    FloatCmpLe => Cc::Le,
+                    FloatCmpGt => Cc::G,
+                    _ => Cc::Ge,
+                };
+                self.asm.word(a64::csel(W0, T1, T0, cc));
             }
             Guard if matches!(&data.aux, AuxData::StringLayout) => {
                 // The layout refinement every simple-string fast path is

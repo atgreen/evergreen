@@ -105,6 +105,9 @@ pub mod regalloc; // regalloc2 adapter + stack maps
 // answer instead of re-deriving the contract.
 pub mod register_entry;
 pub mod speculate; // profile-guided single-type speculative lowering
+// Which speculation families the host emitter can encode. One answer per
+// family, so growing a port's emitter has a single gate to widen.
+pub mod target_support;
 mod string_char; // inline CHAR/SCHAR/ELT fast path on simple strings
 
 // ── Machine-code emission ─────────────────────────────────────────
