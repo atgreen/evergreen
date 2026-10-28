@@ -126,6 +126,16 @@ fn compile_file_and_load_honor_pathnames_readtables_and_output_options() {
     (assert (find #\; text)))
   (assert (string= "" (with-output-to-string (*standard-output*)
                          (load "print.lisp" :verbose nil :print nil)))))
+(defun dynamic-file-options (*load-print* *load-verbose* *compile-verbose*)
+  (let ((text (make-array 0 :element-type 'character :adjustable t :fill-pointer 0)))
+    (with-output-to-string (*standard-output* text)
+      (load "print.lisp" :print t :verbose t)
+      (compile-file "print.lisp"))
+    (assert (search "LOAD-VALUE" text))
+    (assert (find #\; text))))
+(dynamic-file-options nil nil t)
+(with-open-file (stream "nested/input.lisp")
+  (assert (equal (compile-file-pathname stream) (compile-file-pathname "nested/input.lisp"))))
 (format t "SYSTEM-CONSTRUCTION-PASS~%")
 "##,
     );
@@ -214,5 +224,51 @@ fn load_print_preserves_source_groups_in_portable_fasl() {
     assert!(
         bytes.windows(4).any(|window| window == b"BBU\0"),
         "print grouping must exercise a portable bytecode unit"
+    );
+}
+
+#[test]
+fn compile_file_reports_muffled_and_nested_warnings_without_leaking_flags() {
+    let sandbox = Sandbox::new("warnings");
+    sandbox.write(
+        "style.lisp",
+        "(eval-when (:compile-toplevel) (warn 'style-warning))\n",
+    );
+    sandbox.write(
+        "warning.lisp",
+        "(eval-when (:compile-toplevel) (warn \"ordinary warning\"))\n",
+    );
+    sandbox.write(
+        "nested.lisp",
+        "(eval-when (:compile-toplevel) (compile-file \"style.lisp\" :verbose nil))\n",
+    );
+    sandbox.write(
+        "error.lisp",
+        "(eval-when (:compile-toplevel) (warn \"before error\") (error \"expected\"))\n",
+    );
+    sandbox.write(
+        "clean.lisp",
+        "(defun system-clean-warning-flags () :clean)\n",
+    );
+    sandbox.run(
+        r##"
+(defun checked-compile-flags (file)
+  (multiple-value-bind (path warnings failure) (compile-file file :verbose nil :print nil)
+    (assert path)
+    (list (not (null warnings)) (not (null failure)))))
+(let ((count 0))
+  (handler-bind ((warning (lambda (condition)
+                           (declare (ignore condition))
+                           (incf count)
+                           (muffle-warning))))
+    (assert (equal (checked-compile-flags "style.lisp") '(t nil)))
+    (assert (equal (checked-compile-flags "warning.lisp") '(t t)))
+    (assert (equal (checked-compile-flags "nested.lisp") '(t nil)))
+    (assert (handler-case (compile-file "error.lisp" :verbose nil)
+              (error () t))))
+  (assert (= count 4)))
+(assert (equal (checked-compile-flags "clean.lisp") '(nil nil)))
+(format t "SYSTEM-CONSTRUCTION-PASS~%")
+"##,
     );
 }

@@ -989,9 +989,9 @@ fn resolve(name: &str) -> Option<Handler> {
             }
             let mut stream = args[0];
             egcl_rt::rooted_ref!(_stream_root = &mut stream);
-            let read_base = env.lookup_var("*READ-BASE*").filter(|v| v.is_fixnum())
+            let read_base = dynamic_standard_variable(env, "*READ-BASE*").filter(|v| v.is_fixnum())
                 .map(|v| v.as_fixnum() as u32).filter(|b| (2..=36).contains(b)).unwrap_or(10);
-            let read_eval = env.lookup_var("*READ-EVAL*").is_none_or(|v| v != NIL);
+            let read_eval = dynamic_standard_variable(env, "*READ-EVAL*").is_none_or(|v| v != NIL);
             sync_reader_float_format(env);
             let previous_env = READ_EVAL_ENV.with(|slot| slot.replace(env as *mut Env));
             let result = reader::read_standard_macro_from_stream(
@@ -4830,6 +4830,12 @@ fn resolve(name: &str) -> Option<Handler> {
                     expected: "WARNING".into(),
                 });
             }
+            let style_warning = egcl_stdlib::find_package("COMMON-LISP")
+                .and_then(|package| egcl_stdlib::find_present_symbol(package, "STYLE-WARNING"))
+                .unwrap_or(NIL);
+            let is_style_warning = typep_matches(env, *cond, style_warning)?;
+            // Count a validated warning even when a handler muffles it.
+            record_compile_file_warning(is_style_warning);
             // Establish a MUFFLE-WARNING restart for the dynamic extent of the
             // signal so a handler can suppress the default warning message.
             let base_len = env.restarts.len();
@@ -5649,8 +5655,8 @@ fn resolve(name: &str) -> Option<Handler> {
                 let dynamic_package = global_value_cell(package_symbol.as_symbol_index())
                     .unwrap_or(egcl_rt::value::UNBOUND);
                 egcl_rt::rooted!(_package_binding = DynBind::establish(package_symbol, dynamic_package));
-                if env.lookup_var("*LOAD-VERBOSE*").is_some_and(|v| v != NIL) {
-                    egcl_rt::rooted!(output = env.lookup_var("*STANDARD-OUTPUT*").unwrap_or(T));
+                if dynamic_standard_variable(env, "*LOAD-VERBOSE*").is_some_and(|v| v != NIL) {
+                    egcl_rt::rooted!(output = dynamic_standard_variable(env, "*STANDARD-OUTPUT*").unwrap_or(T));
                     egcl_stdlib::format(*output, "; Loading stream~%", &[])?;
                 }
                 let result = with_eval_context(env, EvalContext::Load, |env| {
@@ -5793,8 +5799,9 @@ fn resolve(name: &str) -> Option<Handler> {
             // calls COMPILE-FILE only for a missing/stale fasl — so warm
             // loads stay silent.
             let compile_verbose = verbose.unwrap_or_else(|| {
-                env.lookup_var("*COMPILE-VERBOSE*").is_none_or(|v| v != NIL)
+                dynamic_standard_variable(env, "*COMPILE-VERBOSE*").is_none_or(|v| v != NIL)
             });
+            let warning_scope = CompileFileWarningScope::new();
             let compile_start = std::time::Instant::now();
             if compile_verbose {
                 let written = std::fs::metadata(&src_path)
@@ -5803,7 +5810,7 @@ fn resolve(name: &str) -> Option<Handler> {
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                     .map(|d| format!(" (written {})", format_compile_note_date(d.as_secs())))
                     .unwrap_or_default();
-                egcl_rt::rooted!(output = env.lookup_var("*STANDARD-OUTPUT*").unwrap_or(T));
+                egcl_rt::rooted!(output = dynamic_standard_variable(env, "*STANDARD-OUTPUT*").unwrap_or(T));
                 egcl_rt::rooted!(note = arena_str(&format!("; compiling file \"{src_path}\"{written}:\n")));
                 egcl_stdlib::format(*output, "~A", &[*note])?;
             }
@@ -5850,6 +5857,8 @@ fn resolve(name: &str) -> Option<Handler> {
                 build_bfasl_from_source(&source, &src_path, env)
             };
             let error_count = replace_compile_file_error_count(outer_error_count);
+            let warning_flags = warning_scope.flags();
+            drop(warning_scope);
             if env.current_package != saved_package {
                 env.current_package = saved_package.clone();
                 env.define_local("*PACKAGE*", package_object(&saved_package));
@@ -5873,7 +5882,7 @@ fn resolve(name: &str) -> Option<Handler> {
             if compile_verbose {
                 let el = compile_start.elapsed();
                 let secs = el.as_secs();
-                egcl_rt::rooted!(output = env.lookup_var("*STANDARD-OUTPUT*").unwrap_or(T));
+                egcl_rt::rooted!(output = dynamic_standard_variable(env, "*STANDARD-OUTPUT*").unwrap_or(T));
                 egcl_rt::rooted!(note = arena_str(&format!(
                     "; wrote {out_path}\n; compilation finished in {}:{:02}:{:02}.{:03}\n",
                     secs / 3600, (secs % 3600) / 60, secs % 60, el.subsec_millis()
@@ -5883,12 +5892,13 @@ fn resolve(name: &str) -> Option<Handler> {
             let (out_pn, _) = egcl_stdlib::parse_namestring(arena_str(&out_path), None, None)?;
             // An ERROR reported during compilation makes both WARNINGS-P and
             // FAILURE-P true (CLHS COMPILE-FILE, 3.2.5).
-            let failed = if error_count > 0 { T } else { NIL };
-            env.set_mv(vec![out_pn, failed, failed]);
+            let warned = if error_count > 0 || warning_flags.any { T } else { NIL };
+            let failed = if error_count > 0 || warning_flags.non_style { T } else { NIL };
+            env.set_mv(vec![out_pn, warned, failed]);
             Ok(out_pn)
         }),
 
-        "COMPILE-FILE-PATHNAME" => Some(|_operator, args, _env| {
+        "COMPILE-FILE-PATHNAME" => Some(|_operator, args, env| {
             let args = RootedVals::new(args.to_vec());
 
             // (compile-file-pathname input-file &key output-file &allow-other-keys)
@@ -5908,16 +5918,12 @@ fn resolve(name: &str) -> Option<Handler> {
                 let val = args[i + 1];
                 if key.is_symbol() && sym_bare_name_rc(key).as_ref() == "OUTPUT-FILE" && val != NIL
                 {
-                    let (pn, _) = egcl_stdlib::parse_namestring(
-                        arena_str(&path_designator_to_string(val)?),
-                        None,
-                        None,
-                    )?;
-                    return Ok(pn);
+                    return resolve_against_dpd(val, env);
                 }
                 i += 2;
             }
-            let src = path_designator_to_string(args[0])?;
+            egcl_rt::rooted!(source = resolve_against_dpd(args[0], env)?);
+            let src = path_designator_to_string(*source)?;
             let stem = src
                 .strip_suffix(".lisp")
                 .or_else(|| src.strip_suffix(".lsp"))

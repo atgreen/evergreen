@@ -15091,15 +15091,23 @@ fn read_eval_all_env(source: &str, env: &mut Env) -> Result<EgclVal, EgclError> 
     Ok(last)
 }
 
+/// Use symbol-aware lookup for standard specials: a captured frame can carry
+/// an older lexical copy while its live dynamic binding is in the value cell.
+fn dynamic_standard_variable(env: &Env, name: &str) -> Option<EgclVal> {
+    egcl_rt::symbols::find_index(name)
+        .and_then(|index| env.lookup_var_symbol(EgclVal::from_symbol_index(index)))
+        .or_else(|| env.lookup_var(name))
+}
+
 /// LOAD's result printing uses the Lisp output stream and the active printer.
 fn print_loaded_value(value: EgclVal, env: &mut Env) -> Result<(), EgclError> {
     if !matches!(env.eval_context, EvalContext::Load)
-        || !env.lookup_var("*LOAD-PRINT*").is_some_and(|v| v != NIL)
+        || !dynamic_standard_variable(env, "*LOAD-PRINT*").is_some_and(|v| v != NIL)
     {
         return Ok(());
     }
     egcl_rt::rooted!(value = value);
-    egcl_rt::rooted!(output = env.lookup_var("*STANDARD-OUTPUT*").unwrap_or(T));
+    egcl_rt::rooted!(output = dynamic_standard_variable(env, "*STANDARD-OUTPUT*").unwrap_or(T));
     let previous = PRINT_ENV.with(|slot| slot.replace(env as *mut Env));
     let result = egcl_stdlib::format(*output, "~&~S~%", &[*value]);
     PRINT_ENV.with(|slot| slot.set(previous));
@@ -15197,8 +15205,8 @@ fn read_forms_for_compile(
             // package, so its target symbol's home package is not necessarily
             // the package in which the expander was defined.
             let definition_package = env.current_package.clone();
-            if env.lookup_var("*COMPILE-PRINT*").is_some_and(|v| v != NIL) {
-                egcl_rt::rooted!(output = env.lookup_var("*STANDARD-OUTPUT*").unwrap_or(T));
+            if dynamic_standard_variable(env, "*COMPILE-PRINT*").is_some_and(|v| v != NIL) {
+                egcl_rt::rooted!(output = dynamic_standard_variable(env, "*STANDARD-OUTPUT*").unwrap_or(T));
                 let previous = PRINT_ENV.with(|slot| slot.replace(env as *mut Env));
                 let printed = egcl_stdlib::format(*output, "; ~S~%", &[val]);
                 PRINT_ENV.with(|slot| slot.set(previous));
@@ -19959,8 +19967,8 @@ fn load_path_into_env(path: &str, env: &mut Env) -> Result<EgclVal, EgclError> {
                 EgclError::FileError(format!("cannot read {}: {}", resolved_path, e))
             })?,
         };
-        if env.lookup_var("*LOAD-VERBOSE*").is_some_and(|v| v != NIL) {
-            egcl_rt::rooted!(output = env.lookup_var("*STANDARD-OUTPUT*").unwrap_or(T));
+        if dynamic_standard_variable(env, "*LOAD-VERBOSE*").is_some_and(|v| v != NIL) {
+            egcl_rt::rooted!(output = dynamic_standard_variable(env, "*STANDARD-OUTPUT*").unwrap_or(T));
             egcl_rt::rooted!(path = arena_str(&resolved_path));
             egcl_stdlib::format(*output, "; Loading ~A~%", &[*path])?;
         }
@@ -20069,6 +20077,49 @@ static COMPILE_FILE_ERROR_COUNT: egcl_rt::execution_local::ExecutionLocal<std::c
 /// Swap the COMPILE-FILE error count for `count`, returning the previous one.
 fn replace_compile_file_error_count(count: usize) -> usize {
     COMPILE_FILE_ERROR_COUNT.with(|cell| cell.replace(count))
+}
+
+#[derive(Clone, Copy, Default)]
+struct CompileFileWarningFlags {
+    any: bool,
+    non_style: bool,
+}
+
+static COMPILE_FILE_WARNINGS: egcl_rt::execution_local::ExecutionLocal<std::cell::Cell<Option<CompileFileWarningFlags>>> =
+    unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| const { std::cell::Cell::new(None) }) };
+
+/// Nested compilations return their own flags and also contribute actual
+/// warnings to the enclosing compilation. RAII restores state on error exits.
+struct CompileFileWarningScope {
+    previous: Option<CompileFileWarningFlags>,
+}
+impl CompileFileWarningScope {
+    fn new() -> Self {
+        Self { previous: COMPILE_FILE_WARNINGS.with(|state| state.replace(Some(CompileFileWarningFlags::default()))) }
+    }
+    fn flags(&self) -> CompileFileWarningFlags {
+        COMPILE_FILE_WARNINGS.with(|state| state.get().unwrap_or_default())
+    }
+}
+impl Drop for CompileFileWarningScope {
+    fn drop(&mut self) {
+        let current = self.flags();
+        let restored = self.previous.map(|mut outer| {
+            outer.any |= current.any;
+            outer.non_style |= current.non_style;
+            outer
+        });
+        COMPILE_FILE_WARNINGS.with(|state| state.set(restored));
+    }
+}
+fn record_compile_file_warning(style: bool) {
+    COMPILE_FILE_WARNINGS.with(|state| {
+        if let Some(mut flags) = state.get() {
+            flags.any = true;
+            flags.non_style |= !style;
+            state.set(Some(flags));
+        }
+    });
 }
 
 /// Print each compile-time error COMPILE-FILE found to `*ERROR-OUTPUT*`, in the

@@ -270,7 +270,8 @@
   ([#721](https://github.com/atgreen/evergreen/pull/721)).
 
 - `COMPILE-FILE` keeps ordinary function definitions out of the compiling image
-  and honors output pathnames and printing options. `LOAD` honors output options
+  and honors output pathnames, printing options, and style versus ordinary
+  warning flags. `LOAD` honors output options
   and copied reader-macro operations, and `REQUIRE` accepts explicit pathnames
   ([#738](https://github.com/atgreen/evergreen/pull/738)).
 
