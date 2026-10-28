@@ -415,6 +415,14 @@ fn prepare_native(
         // native-target guard: a newer generation must never bless old data.
         let builtin_generation = direct_call_gen();
         let builtin_slot = super::super::direct_builtin_slot(callee, usize::from(nargs));
+        // What T0 actually observed at this site, if anything yet.
+        let fixnum_speculation_ok = !matches!(
+            super::site_speculation_type(
+                bf as *const BytecodeFunction as usize,
+                index as u32,
+            ),
+            Some(super::SpecType::SingleFloat | super::SpecType::DoubleFloat)
+        );
         let profile = if builtin_slot.is_some() {
             builtin_generation
         } else if registry_get(callee).is_some() {
@@ -429,8 +437,26 @@ fn prepare_native(
                 direct,
                 builtin_slot,
                 profile,
-                unary: inlinable_unary_fixnum_op(callee),
-                binary: inlinable_fixnum_op(callee),
+                // Only guess fixnum where the profile does not already say
+                // otherwise. The checked T1 has no single-float arithmetic of
+                // its own, so for a site T0 observed as single-float the
+                // fixnum guard can never pass: it failed on every call, and
+                // after EGCL_DEOPT_BLACKLIST_THRESHOLD (8) failures the whole
+                // function was blacklisted to T0 permanently -- "T1 and T2 are
+                // not retried" -- which cost single-float code 2.4x and, worse,
+                // foreclosed the T2 that would have compiled it properly
+                // (bliss-zmx1a). Declining here keeps the ordinary call, so
+                // nothing deopts and the function survives to T2.
+                //
+                // A site with NO profile still guesses fixnum, as the mapped
+                // T1 does: that is a cold guess which a later recompile
+                // corrects, not a guess against evidence.
+                unary: fixnum_speculation_ok
+                    .then(|| inlinable_unary_fixnum_op(callee))
+                    .flatten(),
+                binary: fixnum_speculation_ok
+                    .then(|| inlinable_fixnum_op(callee))
+                    .flatten(),
                 binding: egcl_compiler::t2::builtin_binding::snapshot(callee),
             },
         );
