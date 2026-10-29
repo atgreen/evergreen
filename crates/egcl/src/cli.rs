@@ -26348,10 +26348,10 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     // function object, or reified builtin wrapper), so it is
                     // FUNCTIONP / TYPEP FUNCTION and CLOS dispatches it (bliss-5ir,
                     // bliss-uuh). An unbound name falls through to the bare-symbol
-                    // designator below (funcall/apply still accept it).
-                    if let Some(f) = symbol_function_object(env, name_form) {
-                        return Ok(f);
-                    }
+                    // lookup below. FUNCTION must not turn an undefined name
+                    // into a useful late-bound symbol designator.
+                    return symbol_function_object(env, name_form)
+                        .ok_or(EgclError::UndefinedFunction(name_form));
                 }
                 // `#'(setf place)` — the writer registered by
                 // `(defun (setf place) …)`. Those live in GLOBAL_SETF_FNS keyed
@@ -26418,7 +26418,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                         return Ok(register_tree_closure(closure));
                     }
                 }
-                return Ok(name_form);
+                return Err(EgclError::UndefinedFunction(name_form));
             }
             "LAMBDA" => {
                 // Bare (lambda (params) body...) — create a closure.
@@ -34989,6 +34989,31 @@ fn quote_form(quote: EgclVal, value: EgclVal) -> EgclVal {
 }
 
 // ── DEFUN ────────────────────────────────────────────────────────
+/// A definition retains enclosing FLET/LABELS and SPECIAL declaration scope,
+/// just like an escaped LAMBDA. Legacy/global FunDef entries have no definition
+/// frame and do not trigger this path; ordinary global definitions stay native.
+fn definition_function_capture(
+    params_form: EgclVal,
+    body: EgclVal,
+    env: &Env,
+) -> Option<EgclVal> {
+    let lexical = !env.locally_specials.is_empty()
+        || env.funs.borrow().values().any(|definition|
+            definition.defining_frame.is_some() || definition.defining_blocks.is_some());
+    if !lexical { return None; }
+    egcl_rt::rooted!(source = register_tree_closure(Closure {
+        params_form,
+        body,
+        captured_frame: Arc::clone(&env.frame),
+        captured_specials: env.locally_specials.clone(),
+        captured_blocks: env.block_stack.clone(),
+        captured_tags: env.tag_stack.clone(),
+        captured_funs: Some(Arc::clone(&env.funs)),
+        captured_macros: Some(capture_lexical_macros(env)),
+    }));
+    Some(coerce_installed_function(env, *source))
+}
+
 fn eval_defun(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     let (mut name_form, rest) = cp(cdr);
     let (mut params_form, mut body) = cp(rest);
@@ -35094,7 +35119,8 @@ fn eval_defun(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         // either: `redefine` resets tier, entry and both counters, so that state
         // is discarded whichever way the new definition lands.
         let idx = name_form.as_symbol_index();
-        egcl_rt::rooted!(f = egcl_rt::function::alloc_interpreted(params_form, body, NIL, name_form));
+        egcl_rt::rooted!(f = definition_function_capture(params_form, body, env)
+            .unwrap_or_else(|| egcl_rt::function::alloc_interpreted(params_form, body, NIL, name_form)));
         egcl_rt::symbols::set_symbol_function(idx, *f);
         // Retire the OLD compiled body: a redefinition replaces the definition,
         // and nothing else did this. `lazy_compile_defun` returns early when the
@@ -35172,8 +35198,9 @@ fn eval_defun(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                         // A NEW object, as for the plain-symbol case above: a
                         // saved `(setf place)` writer must keep its own
                         // definition (bliss-evpx).
-                        let f = egcl_rt::function::alloc_interpreted(params_form, body, NIL, msym);
-                        egcl_rt::symbols::set_symbol_function(midx, f);
+                        egcl_rt::rooted!(f = definition_function_capture(params_form, body, env)
+                            .unwrap_or_else(|| egcl_rt::function::alloc_interpreted(params_form, body, NIL, msym)));
+                        egcl_rt::symbols::set_symbol_function(midx, *f);
                     }
                 }
             }

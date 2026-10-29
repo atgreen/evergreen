@@ -4,6 +4,11 @@
 
 ### Fixed
 
+- Functions preserve definition-site local functions and `SPECIAL` declaration
+  scope across evaluation, tiered calls, and saved images. Undefined function
+  references signal `UNDEFINED-FUNCTION` before subsequent effects
+  ([#820](https://github.com/atgreen/evergreen/pull/820)).
+
 - Compiled class literals preserve their named class identity, and dependent
   load-form objects initialize in the required order
   ([#818](https://github.com/atgreen/evergreen/pull/818)).

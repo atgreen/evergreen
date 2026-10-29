@@ -1346,6 +1346,24 @@ pub fn call_registered(
     fn_val: EgclVal,
     env: &mut Env,
 ) -> Option<Result<EgclVal, EgclError>> {
+    // Caller-local declarations are lexical, not part of a callee's lambda
+    // initialization environment. The interpreted function entry already
+    // establishes this boundary; bytecode/native dispatch must do so too.
+    // Keep the overwhelmingly common empty declaration path unchanged.
+    if env.locally_specials.is_empty() {
+        call_registered_in_definition_scope(sym, args, fn_val, env)
+    } else {
+        super::with_special_declarations(env, Vec::new(), |env|
+            call_registered_in_definition_scope(sym, args, fn_val, env))
+    }
+}
+
+fn call_registered_in_definition_scope(
+    sym: u32,
+    args: &[EgclVal],
+    fn_val: EgclVal,
+    env: &mut Env,
+) -> Option<Result<EgclVal, EgclError>> {
     egcl_rt::rooted!(fn_val = fn_val);
     if debug_dispatch_enabled() {
         eprintln!(
@@ -18484,8 +18502,12 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                 // the semantics and must match, or (functionp #'car) => NIL
                 // (bliss-m285).
                 let name_sym = EgclVal::from_symbol_index(sym);
-                let v = super::symbol_function_object(env, name_sym).unwrap_or(name_sym);
-                acts[top_idx].push_op(v);
+                if let Some(value) = super::symbol_function_object(env, name_sym) {
+                    acts[top_idx].push_op(value);
+                } else {
+                    initiate_unwind(acts, stack, env,
+                        Pending::Propagate(EgclError::UndefinedFunction(name_sym)))?;
+                }
             }
             Instr::BindSpecial(sym) => {
                 let act = &mut acts[top_idx];
@@ -20043,9 +20065,8 @@ extern "C" fn c2i_load_global(sym: u64) -> u64 {
 
 /// `#'f` from T2 code: read the symbol's FUNCTION cell (bliss-m285). Mirrors
 /// the T0 `Instr::LoadFunction` semantics exactly — the heap function object
-/// when the symbol names an interpreted/compiled function (so it is FUNCTIONP
-/// and CLOS dispatches it), else the bare symbol designator, which funcall and
-/// apply still accept.
+/// when the symbol names a function (so it is FUNCTIONP and CLOS dispatches
+/// it), or UNDEFINED-FUNCTION when there is no definition.
 extern "C" fn c2i_load_function(sym: u64) -> u64 {
     let name_sym = EgclVal::from_symbol_index(sym as u32);
     let env_ptr = NATIVE_ENV.with(|e| e.get());
@@ -20056,9 +20077,11 @@ extern "C" fn c2i_load_function(sym: u64) -> u64 {
     // native call and native code calls this synchronously within that window
     // — the same contract as every other c2i helper here.
     let env = unsafe { &mut *env_ptr };
-    super::symbol_function_object(env, name_sym)
-        .unwrap_or(name_sym)
-        .0
+    match guard_c2i(|| super::symbol_function_object(env, name_sym)
+        .ok_or(EgclError::UndefinedFunction(name_sym))) {
+        Ok(value) => value.0,
+        Err(error) => { stash_native_error(error); NIL.0 }
+    }
 }
 
 /// The symbol object whose value cell T1 may access inline (bliss-csc8v), or

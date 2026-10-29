@@ -1265,6 +1265,18 @@ impl TransferCode {
     }
 
     pub(super) fn run_callable(&self, function: EgclVal, args: &[EgclVal], env: &mut Env) -> Result<EgclVal, EgclError> {
+        // A cached native target can bypass call_registered entirely. Its
+        // lambda-list initforms still have the callee's lexical declaration
+        // scope, never the caller's local SPECIAL declarations.
+        if env.locally_specials.is_empty() {
+            self.run_callable_in_definition_scope(function, args, env)
+        } else {
+            super::super::with_special_declarations(env, Vec::new(), |env|
+                self.run_callable_in_definition_scope(function, args, env))
+        }
+    }
+
+    fn run_callable_in_definition_scope(&self, function: EgclVal, args: &[EgclVal], env: &mut Env) -> Result<EgclVal, EgclError> {
         if let Some(offset) = self.lean_root_entry() {
             return self.run_ordinary_root(offset, function, args, env);
         }
@@ -2942,7 +2954,8 @@ unsafe fn call_or_throw_unpublished(
                     Ok(closure)
                 } else {
                     let symbol = EgclVal::from_symbol_index(call.symbol as u32);
-                    Ok(super::super::symbol_function_object(env, symbol).unwrap_or(symbol))
+                    super::super::symbol_function_object(env, symbol)
+                        .ok_or(EgclError::UndefinedFunction(symbol))
                 }
             });
             match result {
