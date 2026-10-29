@@ -1570,7 +1570,9 @@ pub fn read_standard_label_from_stream(
     read_eval: bool,
 ) -> Result<Vec<EgclVal>, EgclError> {
     if !matches!(sub, '=' | '#') {
-        return Err(EgclError::StreamError("not a circular-label reader macro".into()));
+        return Err(EgclError::StreamError(
+            "not a circular-label reader macro".into(),
+        ));
     }
     egcl_rt::rooted!(scope = CircularLabelScope::enter(true));
     let labels = scope.labels.clone();
