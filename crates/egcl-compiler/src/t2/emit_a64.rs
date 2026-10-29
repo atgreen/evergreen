@@ -3286,15 +3286,10 @@ mod environment_call_tests {
     fn environment_scope(enter: bool) -> Function {
         let mut function = Function::new("aarch64-environment-scope");
         let block = function.entry();
-        let survivor =
-            function.add_block_param(block, IRType::TOP, ValueRepresentation::Tagged);
+        let survivor = function.add_block_param(block, IRType::TOP, ValueRepresentation::Tagged);
         function.push_inst(
             block,
-            call(
-                Opcode::Call,
-                vec![],
-                AuxData::EnvironmentScope { enter },
-            ),
+            call(Opcode::Call, vec![], AuxData::EnvironmentScope { enter }),
             &[],
         );
         function.set_terminator(
@@ -3398,9 +3393,7 @@ mod environment_call_tests {
     fn environment_scope_selects_the_exact_portable_adapter() {
         const PUSH: u64 = 0x1111;
         const POP: u64 = 0x2222;
-        for (enter, push_env_child, pop_env_child) in
-            [(true, PUSH, 0), (false, 0, POP)]
-        {
+        for (enter, push_env_child, pop_env_child) in [(true, PUSH, 0), (false, 0, POP)] {
             let emitted = emit_framed_with_runtime(
                 &environment_scope(enter),
                 0,

@@ -4330,7 +4330,9 @@ mod tests {
         for (&call, (enter, bcp)) in scope_calls.iter().zip([(true, 1), (false, 4)].iter()) {
             let data = function.inst(call);
             assert_eq!(data.opcode, Opcode::Call);
-            assert!(matches!(data.aux, AuxData::EnvironmentScope { enter: actual } if actual == *enter));
+            assert!(
+                matches!(data.aux, AuxData::EnvironmentScope { enter: actual } if actual == *enter)
+            );
             assert!(data.args.is_empty());
             assert!(data.results.is_empty());
             assert!(data.flags.call && data.flags.effectful && data.flags.safepoint);

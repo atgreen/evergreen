@@ -556,7 +556,9 @@ pub enum AuxData {
     /// present as `value: false, result: false`.
     ///
     /// Stack-neutral and valueless: no operand, no result.
-    EnvironmentScope { enter: bool },
+    EnvironmentScope {
+        enter: bool,
+    },
     /// Binding operation identified by its exact retained bytecode PC. Exit
     /// decodes UnbindSpecial's count there; entry consumes one rooted value.
     SpecialBinding {

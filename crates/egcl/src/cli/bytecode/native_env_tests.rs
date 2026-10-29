@@ -170,8 +170,8 @@ fn native_scope_adapters_shadow_and_restore_the_parent_binding() {
         .vars
         .insert(key.into(), EgclVal::from_fixnum(11));
     egcl_rt::rooted!(form = reader::read_from_string("(nil)").unwrap().0);
-    let mut body = compile_function("NATIVE-SCOPE-ADAPTERS", NIL, *form, &env, false, false)
-        .unwrap();
+    let mut body =
+        compile_function("NATIVE-SCOPE-ADAPTERS", NIL, *form, &env, false, false).unwrap();
     body.names = vec![key.into()];
     let names = NativeEnvNames::new(&body);
     let _restore =
