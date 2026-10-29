@@ -104,9 +104,14 @@ struct RetainedEntries<C> {
     #[allow(clippy::vec_box)]
     entries: Vec<Box<RetainedEntry<C>>>,
     by_descriptor: HashMap<RetainedKey, usize>,
+    // Metadata only: entries retain the Rc owners, so keys cannot be reused
+    // while indexed. Preserve insertion order among aliases of one owner.
+    by_owner: HashMap<usize, Vec<usize>>,
     by_pc: BTreeMap<usize, PcRange>,
     #[cfg(test)]
     lookup_candidates: std::cell::Cell<usize>,
+    #[cfg(test)]
+    owner_candidates: std::cell::Cell<usize>,
     #[cfg(test)]
     duplicate_queries: usize,
     /// The publication epoch and entry count the last completed sweep saw.
@@ -123,9 +128,12 @@ impl<C> Default for RetainedEntries<C> {
             segments: 0,
             entries: Vec::new(),
             by_descriptor: HashMap::new(),
+            by_owner: HashMap::new(),
             by_pc: BTreeMap::new(),
             #[cfg(test)]
             lookup_candidates: std::cell::Cell::new(0),
+            #[cfg(test)]
+            owner_candidates: std::cell::Cell::new(0),
             #[cfg(test)]
             duplicate_queries: 0,
             swept: None,
@@ -233,6 +241,7 @@ impl<C> RetainedEntries<C> {
         let entry = &self.entries[index];
         let d = entry.descriptor;
         self.by_descriptor.insert(entry.lease.key(d), index);
+        self.by_owner.entry(d.owner).or_default().push(index);
         let mut start = d.code_start;
         let mut end = start
             .checked_add(d.code_len)
@@ -319,6 +328,7 @@ impl<C> RetainedEntries<C> {
         });
         if self.entries.len() != before {
             self.by_descriptor.clear();
+            self.by_owner.clear();
             self.by_pc.clear();
             for index in 0..self.entries.len() {
                 self.index_entry(index);
@@ -331,6 +341,31 @@ impl<C> RetainedEntries<C> {
             .count();
         self.private_stamp = super::super::native_transfer_entry::funcall_fast::collection_stamp();
         self.swept = Some((epoch, self.entries.len()));
+    }
+
+    fn entries_for_owner(&self, owner: *const C) -> impl Iterator<Item = &RetainedEntry<C>> {
+        self.by_owner
+            .get(&(owner as usize))
+            .into_iter()
+            .flatten()
+            .map(|&index| {
+                #[cfg(test)]
+                self.owner_candidates.set(self.owner_candidates.get() + 1);
+                self.entries[index].as_ref()
+            })
+    }
+
+    fn held_only_by(
+        &self,
+        owner: *const C,
+        callable: &Arc<egcl_rt::CrossThreadRoot<egcl_rt::value::EgclVal>>,
+    ) -> bool {
+        self.entries_for_owner(owner).all(|entry| {
+            entry
+                .callable
+                .as_ref()
+                .is_some_and(|root| Arc::ptr_eq(root, callable))
+        })
     }
 
     fn code_for_pc(&self, pc: usize) -> Option<Rc<C>> {
@@ -417,9 +452,7 @@ impl OrdinaryCodeDirectory {
         let mut retained: Vec<_> = self
             .retained
             .borrow()
-            .entries
-            .iter()
-            .filter(|entry| std::ptr::eq(Rc::as_ptr(&entry.code), code))
+            .entries_for_owner(std::ptr::from_ref(code))
             .map(|entry| entry.callable.clone())
             .collect();
         retained.extend(
@@ -443,15 +476,7 @@ impl OrdinaryCodeDirectory {
     ) -> bool {
         self.retained
             .borrow()
-            .entries
-            .iter()
-            .filter(|entry| std::ptr::eq(Rc::as_ptr(&entry.code), code))
-            .all(|entry| {
-                entry
-                    .callable
-                    .as_ref()
-                    .is_some_and(|root| Arc::ptr_eq(root, callable))
-            })
+            .held_only_by(std::ptr::from_ref(code), callable)
             && self
                 .roots
                 .borrow()
@@ -1039,6 +1064,94 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_owner_queries_skip_unrelated_entries_and_preserve_alias_constraints() {
+        use egcl_rt::value::NIL;
+        let _lock = crate::cli::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        egcl_rt::rooted!(_env = crate::cli::Env::new(false));
+        let mut retained = RetainedEntries::default();
+        let cell = Arc::new(CallCell::new(0, 11, 12));
+        for revision in 0..2_000 {
+            let owner = Rc::new(());
+            // Identical PC ranges exercise index_entry's uniform-range early
+            // return. Each distinct owner must nevertheless be indexed.
+            let d = descriptor(&owner, revision, 0x1000);
+            retained.retain(Arc::clone(&cell), d, owner).unwrap();
+        }
+        let owner = Rc::new(());
+        let callable = Arc::new(egcl_rt::CrossThreadRoot::new(NIL));
+        let d = descriptor(&owner, 3_000, 0x1000);
+        let pointer = retained
+            .retain_with_callable(
+                Arc::clone(&cell),
+                d,
+                Rc::clone(&owner),
+                Some(Arc::clone(&callable)),
+            )
+            .unwrap();
+        assert_eq!(
+            retained.retain_with_callable(
+                Arc::clone(&cell),
+                d,
+                Rc::clone(&owner),
+                Some(Arc::clone(&callable))
+            ),
+            Some(pointer)
+        );
+        let before = retained.owner_candidates.get();
+        assert!(retained.held_only_by(Rc::as_ptr(&owner), &callable));
+        assert_eq!(retained.owner_candidates.get() - before, 1);
+        let mut alias = d;
+        alias.revision += 1;
+        retained
+            .retain_with_callable(
+                Arc::clone(&cell),
+                alias,
+                Rc::clone(&owner),
+                Some(Arc::clone(&callable)),
+            )
+            .unwrap();
+        let before = retained.owner_candidates.get();
+        assert!(retained.held_only_by(Rc::as_ptr(&owner), &callable));
+        assert_eq!(retained.owner_candidates.get() - before, 2);
+        // Equal Lisp values in distinct root handles still disagree on the
+        // lock-free identity proof; the existing gated fallback decides them.
+        alias.revision += 1;
+        let other = Arc::new(egcl_rt::CrossThreadRoot::new(NIL));
+        retained
+            .retain_with_callable(Arc::clone(&cell), alias, Rc::clone(&owner), Some(other))
+            .unwrap();
+        assert!(!retained.held_only_by(Rc::as_ptr(&owner), &callable));
+        alias.revision += 1;
+        retained
+            .retain(Arc::clone(&cell), alias, Rc::clone(&owner))
+            .unwrap();
+        assert!(
+            retained
+                .entries_for_owner(Rc::as_ptr(&owner))
+                .last()
+                .unwrap()
+                .callable
+                .is_none()
+        );
+        assert!(!retained.held_only_by(Rc::as_ptr(&owner), &callable));
+        let absent = Rc::new(());
+        let before = retained.owner_candidates.get();
+        assert!(retained.held_only_by(Rc::as_ptr(&absent), &callable));
+        assert_eq!(retained.owner_candidates.get(), before);
+        assert_eq!(retained.entries_for_owner(Rc::as_ptr(&owner)).count(), 4);
+        let unconstrained = Rc::new(());
+        let d = descriptor(&unconstrained, 4_000, 0x1000);
+        retained
+            .retain(Arc::clone(&cell), d, Rc::clone(&unconstrained))
+            .unwrap();
+        let before = retained.owner_candidates.get();
+        assert!(!retained.held_only_by(Rc::as_ptr(&unconstrained), &callable));
+        assert_eq!(retained.owner_candidates.get() - before, 1);
+    }
+
+    #[test]
     fn ordinary_index_sweep_reindexes_survivors_without_retaining_dropped_owners() {
         let mut retained = RetainedEntries::default();
         let old = Rc::new(());
@@ -1062,6 +1175,12 @@ mod tests {
         );
         retained.finish_segment();
         assert!(old_weak.upgrade().is_none());
+        assert_eq!(retained.by_owner.len(), 1);
+        assert_eq!(retained.entries_for_owner(Rc::as_ptr(&live)).count(), 1);
+        assert_eq!(
+            retained.by_owner.get(&(Rc::as_ptr(&live) as usize)),
+            Some(&vec![0])
+        );
         assert_eq!(retained.first_index_for_pc(0x2010), Some(0));
         assert!(retained.code_for_pc(0x1010).is_none());
         assert_eq!(
@@ -1072,6 +1191,7 @@ mod tests {
         retained.sweep();
         assert!(retained.by_pc.is_empty());
         assert!(retained.by_descriptor.is_empty());
+        assert!(retained.by_owner.is_empty());
     }
 
     #[test]
