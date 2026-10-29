@@ -16,6 +16,11 @@
 
 ### Fixed
 
+- Generic dispatch cache keys distinguish ordinary callables from generic
+  functions after wrapper reification, preserving their different method
+  applicability across alternating calls
+  ([#908](https://github.com/atgreen/evergreen/pull/908)).
+
 - Macro-generated callback captures retain stable identities across top-level
   boxing retries, including private gensyms and lexical macro scopes
   ([#906](https://github.com/atgreen/evergreen/pull/906)).
