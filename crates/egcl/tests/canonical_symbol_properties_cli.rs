@@ -8,6 +8,12 @@ use std::{
 };
 
 const CHECKS: &str = r#"
+;; Compound function names carry no symbol plist. Defining these must keep the
+;; internal metadata writer's non-symbol behavior during boot and compilation.
+(defgeneric (setf canonical-property-accessor) (value object))
+(defmethod (setf canonical-property-accessor) (value object)
+  (declare (ignore object)) value)
+(assert (= (funcall #'(setf canonical-property-accessor) 46 nil) 46))
 (defun canonical-get-or-initialize (symbol indicator thunk)
   (let (result)
     (funcall (lambda ()

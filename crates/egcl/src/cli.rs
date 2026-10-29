@@ -33867,6 +33867,12 @@ fn plist_lookup(plist: EgclVal, key: EgclVal) -> Option<EgclVal> {
 /// first match, so the freshest binding wins; a superseded pair is left in place
 /// (REMPROP is unused by the code that needs this).
 fn symbol_plist_put(sym: EgclVal, key: EgclVal, val: EgclVal) {
+    // Internal definition metadata also passes compound (SETF name) function
+    // names here. They have no symbol plist; preserve that no-op while public
+    // SETF GET/SYMBOL-PLIST validate their symbol arguments before reaching us.
+    if !sym.is_symbol() {
+        return;
+    }
     let idx = egcl_rt::symbols::symbol_property_index(sym)
         .expect("symbol property cells initialized before evaluation");
     let existing = egcl_rt::symbols::symbol_plist(idx).unwrap_or(NIL);
