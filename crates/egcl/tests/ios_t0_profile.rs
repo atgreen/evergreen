@@ -19,7 +19,14 @@ fn source_loading_and_hot_lisp_remain_in_the_t0_profile() {
     );
     std::fs::write(&source.0, "(defun ios-loaded-source (x) (+ x 2))")
         .expect("application source fixture");
-    let source_path = source.0.to_str().expect("UTF-8 source path").to_owned();
+    // Common Lisp strings escape backslashes and quotes, rather than JSON's
+    // Unicode/control escape convention. Preserve all other pathname chars.
+    let source_path = source
+        .0
+        .to_str()
+        .expect("UTF-8 source path")
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
     let worker = std::thread::Builder::new()
         .name("egcl-ios-profile-test".into())
         .stack_size(16 * 1024 * 1024)
@@ -27,10 +34,10 @@ fn source_loading_and_hot_lisp_remain_in_the_t0_profile() {
             egcl::run(&[
                 "egcl".into(),
                 "--no-init".into(),
-                "--load".into(),
-                source_path,
                 "--eval".into(),
-                r#"(progn
+                format!(
+                    r#"(progn
+                    (load "{}")
                     (assert (member :ios *features*))
                     (assert (member :darwin *features*))
                     (assert (not (member :linux *features*)))
@@ -40,8 +47,9 @@ fn source_loading_and_hot_lisp_remain_in_the_t0_profile() {
                     (assert (= (egcl-ext:function-tier 'ios-profile-hot) 0))
                     (assert (= (ios-loaded-source 40) 42))
                     (assert (= (funcall (compile nil '(lambda (x) (+ x 2))) 40) 42))
-                    (assert (= (eval (read-from-string "(+ 20 22)")) 42)))"#
-                    .into(),
+                    (assert (= (eval (read-from-string "(+ 20 22)")) 42)))"#,
+                    source_path
+                ),
             ])
         })
         .expect("Lisp worker");

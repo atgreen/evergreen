@@ -208,3 +208,210 @@ fn a_mixed_signature_reaches_the_system_math_library() {
     );
     assert_eq!(f64::from_bits(result), 48.0, "3.0 * 2^4");
 }
+
+/// Single-float spills occupy four bytes on Apple and eight-byte slots on
+/// generic AAPCS64. The same statically compiled target exercises both policies.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "exhaust the FP argument registers"
+)]
+extern "C" fn ten_single_floats(
+    a: f32,
+    b: f32,
+    c: f32,
+    d: f32,
+    e: f32,
+    f: f32,
+    g: f32,
+    h: f32,
+    i: f32,
+    j: f32,
+) -> f64 {
+    f64::from(
+        a + b * 2.0
+            + c * 3.0
+            + d * 4.0
+            + e * 5.0
+            + f * 6.0
+            + g * 7.0
+            + h * 8.0
+            + i * 9.0
+            + j * 10.0,
+    )
+}
+
+#[test]
+fn fixed_single_float_spills_follow_the_platform_stack_layout() {
+    let args = (1..=10)
+        .map(|n| u64::from((n as f32).to_bits()))
+        .collect::<Vec<_>>();
+    let types: [AlienType; 10] = std::array::from_fn(|_| AlienType::Float);
+    let result = call(
+        ten_single_floats as *const () as usize,
+        AlienType::Double,
+        &types,
+        &args,
+    );
+    assert_eq!(f64::from_bits(result), 385.0);
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "exhaust GP registers then mix narrow spill widths"
+)]
+extern "C" fn packed_fixed_integers(
+    a: i64,
+    b: i64,
+    c: i64,
+    d: i64,
+    e: i64,
+    f: i64,
+    g: i64,
+    h: i64,
+    i: u8,
+    j: u8,
+    k: u16,
+    l: u32,
+    m: i8,
+    n: u64,
+) -> i64 {
+    a + b * 2
+        + c * 3
+        + d * 4
+        + e * 5
+        + f * 6
+        + g * 7
+        + h * 8
+        + i64::from(i) * 9
+        + i64::from(j) * 10
+        + i64::from(k) * 11
+        + i64::from(l) * 12
+        + i64::from(m) * 13
+        + (n as i64) * 14
+}
+
+#[test]
+fn fixed_integer_spills_preserve_natural_widths_alignment_and_signedness() {
+    let mut types = vec![int(64); 8];
+    types.extend([
+        AlienType::Int {
+            bits: 8,
+            signed: false,
+        },
+        AlienType::Int {
+            bits: 8,
+            signed: false,
+        },
+        AlienType::Int {
+            bits: 16,
+            signed: false,
+        },
+        AlienType::Int {
+            bits: 32,
+            signed: false,
+        },
+        int(8),
+        AlienType::Int {
+            bits: 64,
+            signed: false,
+        },
+    ]);
+    let args = [
+        1, 2, 3, 4, 5, 6, 7, 8, 0x12, 0x34, 0x5678, 0x12345678, 0xf9, 99,
+    ];
+    let result = call(
+        packed_fixed_integers as *const () as usize,
+        int(64),
+        &types,
+        &args,
+    );
+    assert_eq!(
+        result as i64,
+        packed_fixed_integers(
+            1, 2, 3, 4, 5, 6, 7, 8, 0x12, 0x34, 0x5678, 0x12345678, -7, 99
+        )
+    );
+}
+
+#[test]
+fn real_variadic_call_promotes_narrow_values_and_single_floats() {
+    let mut buffer = [0 as libc::c_char; 128];
+    let format = c"%d %d %.1f %llu";
+    let pointer = || AlienType::Pointer(Box::new(AlienType::Void));
+    let types = [
+        pointer(),
+        AlienType::Int {
+            bits: 64,
+            signed: false,
+        },
+        pointer(),
+        int(8),
+        AlienType::Int {
+            bits: 16,
+            signed: false,
+        },
+        AlienType::Float,
+        AlienType::Int {
+            bits: 64,
+            signed: false,
+        },
+    ];
+    let args = [
+        buffer.as_mut_ptr() as u64,
+        buffer.len() as u64,
+        format.as_ptr() as u64,
+        0xf9,
+        65535,
+        u64::from(1.5f32.to_bits()),
+        42,
+    ];
+    // SAFETY: snprintf's named signature and promoted anonymous values match
+    // the format; the native buffer and format remain alive throughout C.
+    let result = unsafe {
+        egcl_rt::ffi::ffi_call_variadic(libc::snprintf as *const (), &int(32), &types, &args, 3)
+            .expect("variadic scalar call")
+    };
+    let expected = c"-7 65535 1.5 42";
+    assert_eq!(result, expected.to_bytes().len() as u64);
+    // SAFETY: snprintf succeeded with more than enough capacity and a NUL.
+    assert_eq!(
+        unsafe { std::ffi::CStr::from_ptr(buffer.as_ptr()) },
+        expected
+    );
+}
+
+#[cfg(target_vendor = "apple")]
+#[test]
+fn apple_caller_extends_narrow_integer_registers_to_32_bits() {
+    #[unsafe(naked)]
+    unsafe extern "C" fn inspect_signed(_value: i8) -> u32 {
+        core::arch::naked_asm!("mov w0, w0", "ret");
+    }
+    #[unsafe(naked)]
+    unsafe extern "C" fn inspect_unsigned(_value: u16) -> u32 {
+        core::arch::naked_asm!("mov w0, w0", "ret");
+    }
+    let result = call(
+        inspect_signed as *const () as usize,
+        AlienType::Int {
+            bits: 32,
+            signed: false,
+        },
+        &[int(8)],
+        &[0xdeadbeef80],
+    );
+    assert_eq!(result, 0xffffff80);
+    let result = call(
+        inspect_unsigned as *const () as usize,
+        AlienType::Int {
+            bits: 32,
+            signed: false,
+        },
+        &[AlienType::Int {
+            bits: 16,
+            signed: false,
+        }],
+        &[0xdeadbeef8001],
+    );
+    assert_eq!(result, 0x8001);
+}

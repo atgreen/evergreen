@@ -4,7 +4,7 @@
 //! Initial iOS profile boundaries; source fixtures, not a device-support claim.
 #![cfg(all(target_os = "ios", target_arch = "aarch64"))]
 
-use egcl_rt::{EgclError, ffi, image, jit::JitBuffer, syscall};
+use egcl_rt::{ffi, image, jit::JitBuffer, syscall};
 
 #[test]
 fn ios_image_identity_distinguishes_device_and_simulator_from_other_platforms() {
@@ -85,24 +85,26 @@ fn nonexecutable_memory_still_supports_runtime_storage() {
 }
 
 #[test]
-fn apple_scalar_calls_fail_closed_until_the_calling_convention_is_implemented() {
-    static REACHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    extern "C" fn refused_target() {
-        REACHED.store(true, std::sync::atomic::Ordering::Relaxed);
+fn linked_scalar_calls_work_without_generated_executable_adapters() {
+    extern "C" fn sum(a: u64, b: u64) -> u64 {
+        a + b
     }
-    let target = refused_target as *const ();
-    // SAFETY: a valid statically compiled void(void) target, which must not be
-    // invoked at all by this profile. This is not a successful ABI probe.
-    for result in unsafe {
-        [
-            ffi::ffi_call(target, &ffi::AlienType::Void, &[], &[]),
-            ffi::ffi_call_variadic(target, &ffi::AlienType::Void, &[], &[], 0),
-        ]
-    } {
-        assert!(matches!(result, Err(EgclError::FfiError(message))
-            if message.contains("not supported by the initial iOS T0 profile")));
+    let word = ffi::AlienType::Int {
+        bits: 64,
+        signed: false,
+    };
+    // SAFETY: the static target takes and returns the advertised u64 scalars.
+    let result = unsafe {
+        ffi::ffi_call(
+            sum as *const (),
+            &word,
+            &[word.clone(), word.clone()],
+            &[20, 22],
+        )
     }
-    assert!(!REACHED.load(std::sync::atomic::Ordering::Relaxed));
+    .expect("linked scalar call");
+    assert_eq!(result, 42);
+    assert!(JitBuffer::new(&[0; 4]).is_none());
 }
 
 #[test]

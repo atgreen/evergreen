@@ -28,16 +28,17 @@ existing embedded bootstrap for the first application runtime.
 Foreign library lookup automatically uses the system-loader backend on iOS,
 including builds without the optional `c-ffi` feature. Registered statically
 linked native-library providers remain available through the existing library
-and symbol APIs. The ELF loader is excluded. **Scalar foreign calls currently
-signal an unsupported-operation FFI error on iOS.** The existing ARM64 call
-backend implements Linux/Android argument placement; enabling it on Apple
-platforms would silently use the wrong convention for some signatures. This
-foundation intentionally refuses calls until that backend is extended. Lisp
-callbacks are outside the initial calls-only port's scope.
+and symbol APIs. The ELF loader is excluded. Scalar foreign calls now have a
+source implementation of Apple's ARM64 convention: naturally aligned packed
+fixed stack arguments, caller extension of narrow integer registers, and
+promoted anonymous arguments in eight-byte stack slots. Calls use the existing
+statically compiled trampoline and do not allocate executable adapters. This
+implementation and its fixtures still require SDK/device validation. Aggregates
+and Lisp callbacks remain outside the initial calls-only port's scope.
 
 macOS retains its existing tiering, executable-memory and loader configuration.
-The iOS restrictions do not imply that the existing macOS scalar backend now
-implements every Apple ABI rule.
+macOS scalar calls share the Apple placement rules; aggregates and other
+unsupported types are still rejected.
 
 ## Remaining work
 
@@ -45,10 +46,11 @@ The first application runtime still needs a thin host-linked library and
 application scaffold: keep the host's main thread, start Lisp on an owned
 worker using `egcl::run`, locate bundled source/assets, provide writable
 application paths, and manage startup/shutdown. Subprocess creation needs an
-explicit rejection policy in the shared process library. Apple ARM64 scalar
-calling conventions need a separate implementation, including narrow fixed
-stack arguments and variadic stack placement. These are prerequisites, not
-features supplied by this foundation.
+explicit rejection policy in the shared process library. The scalar ABI source
+fixtures need actual execution on Apple ARM64, including
+narrow fixed stack arguments, signed/unsigned caller extension, mixed floating
+point spills and real variadic calls. These validation prerequisites are not
+satisfied by this foundation.
 
 Build and link both targets using the appropriate Xcode SDK before claiming
 support. Future validation must cover simulator and device startup, source
