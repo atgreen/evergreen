@@ -12585,7 +12585,7 @@ fn print_val_body(mut val: EgclVal, out: &mut String) {
         out.push_str(&text);
         return;
     }
-    if let Some(text) = egcl_stdlib::format::u8_readable_representation(val) {
+    if let Some(text) = egcl_stdlib::format::readable_array_representation(val) {
         out.push_str(&text);
         return;
     }

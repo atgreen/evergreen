@@ -1283,6 +1283,48 @@ unsafe fn object_payload_offset(ptr: *const u8) -> usize {
     }
 }
 
+/// Preserve empty multidimensional array metadata that #nA cannot encode.
+/// No elements are printed and no Lisp allocation is needed; the explicit
+/// dimensions also retain axes following a zero-length dimension.
+pub fn readable_array_representation(value: EgclVal) -> Option<String> {
+    if print_readably_active()
+        && let Some(dimensions) = egcl_rt::types::md_array_dims(value)
+    {
+        let dimensions = (0..crate::sequences::length(dimensions).ok()?)
+            .map(|index| {
+                crate::sequences::elt(dimensions, index)
+                    .ok()
+                    .map(|v| v.as_fixnum())
+            })
+            .collect::<Option<Vec<_>>>()?;
+        if dimensions.contains(&0) {
+            use crate::sequences::ArrayElementKind;
+            let element_type = match crate::sequences::array_element_kind(value)? {
+                ArrayElementKind::General => "COMMON-LISP:T",
+                ArrayElementKind::BaseChar => "COMMON-LISP:BASE-CHAR",
+                ArrayElementKind::Character => "COMMON-LISP:CHARACTER",
+                ArrayElementKind::Bit => "COMMON-LISP:BIT",
+                ArrayElementKind::DoubleFloat => "COMMON-LISP:DOUBLE-FLOAT",
+                ArrayElementKind::U8 => "(COMMON-LISP:UNSIGNED-BYTE #10r8)",
+            };
+            let mut text = String::from("#.(COMMON-LISP:MAKE-ARRAY '(");
+            for (index, dimension) in dimensions.iter().enumerate() {
+                if index != 0 {
+                    text.push(' ');
+                }
+                text.push_str(&format!("#10r{dimension}"));
+            }
+            text.push_str(&format!(") :ELEMENT-TYPE '{element_type}"));
+            if crate::sequences::array_adjustable(value) {
+                text.push_str(" :ADJUSTABLE COMMON-LISP:T");
+            }
+            text.push(')');
+            return Some(text);
+        }
+    }
+    u8_readable_representation(value)
+}
+
 /// Readable octet arrays use the existing standard read-time evaluation
 /// syntax. Reading this representation requires the normal *READ-EVAL* = T.
 /// Explicit decimal radix prefixes make reconstruction independent of the
@@ -1891,7 +1933,7 @@ fn egclval_to_print_body(mut v: EgclVal, escapep: bool) -> String {
     if let Some(text) = concise_array_representation(v) {
         return text;
     }
-    if let Some(text) = u8_readable_representation(v) {
+    if let Some(text) = readable_array_representation(v) {
         return text;
     }
     if crate::random_state::random_state_p(v) {
