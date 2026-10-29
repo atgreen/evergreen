@@ -2796,8 +2796,13 @@ Returns NIL."
   (and (consp result-type)
        (let* ((head (car result-type))
               (tail (cdr result-type))
-              (slot (cond ((member head '(vector array simple-array))
-                           (car (cdr tail)))
+              (slot (cond ((eq head 'vector) (car (cdr tail)))
+                          ((member head '(array simple-array))
+                           ;; An integer dimension specifier is the rank. Only
+                           ;; a singleton dimension list constrains LENGTH.
+                           (let ((dimensions (car (cdr tail))))
+                             (and (consp dimensions) (null (cdr dimensions))
+                                  (car dimensions))))
                           ((member head '(simple-vector string simple-string
                                           base-string simple-base-string
                                           bit-vector simple-bit-vector))
@@ -2816,7 +2821,7 @@ Returns NIL."
 ;; The size against the length the specifier demands is both truthful and
 ;; checkable.
 (defun %check-sequence-result-type (rt head declared size original)
-  (declare (ignore rt))
+  (egcl::%validate-sequence-result-type rt size)
   ;; A DEFTYPE alias names a sequence type just as well as a built-in name
   ;; does (CLHS make-sequence takes any type specifier). Expand it before
   ;; matching, or e.g. babel's UNICODE-STRING is rejected as not a sequence.

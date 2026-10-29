@@ -22,6 +22,8 @@
     "egcl:test:defstruct_constant_slots_cli": [""],
     "egcl:test:complex_subtype_bounds_cli": [""],
     "egcl:test:boa_aux_uninitialized_cli": [""],
+    "egcl:test:sequence_result_rank_cli": [""],
+    "egcl-stdlib:test:sequence_result_rank": [""],
     "egcl:test:make_load_form_cli": [""],
     "egcl:test:reader_skipped_operands_cli": [""],
     "egcl:test:standard_comment_reader_cli": [""],

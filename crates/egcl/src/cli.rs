@@ -20975,7 +20975,7 @@ fn mv_operator_preserves(name: &str) -> bool {
             | "GET-MACRO-CHARACTER"
             // A comment reader consumes input and returns zero values. Keep
             // that distinct from one NIL when its Lisp wrapper returns.
-            | "EGCL::%READ-STANDARD-MACRO"
+            | "EGCL::%VALIDATE-SEQUENCE-RESULT-TYPE" | "EGCL::%READ-STANDARD-MACRO"
             | "GET-PROPERTIES"
             | "GET-SETF-EXPANSION"
             | "EGCL-EXT:RUN-PROGRAM"
@@ -23605,7 +23605,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             "SET-SYNTAX-FROM-CHAR" => return eval_builtin_arguments(&name, cdr, env),
             "SET-MACRO-CHARACTER" => return eval_builtin_arguments(&name, cdr, env),
             "GET-MACRO-CHARACTER" => return eval_builtin_arguments(&name, cdr, env),
-            "EGCL::%READ-STANDARD-MACRO" => return eval_builtin_arguments(&name, cdr, env),
+            "EGCL::%VALIDATE-SEQUENCE-RESULT-TYPE" | "EGCL::%READ-STANDARD-MACRO" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::%COPY-READTABLE" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::%READTABLE-CASE" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::%SET-READTABLE-CASE" => return eval_builtin_arguments(&name, cdr, env),
@@ -33917,20 +33917,7 @@ fn require_coerce_type(
 /// the source sequence must be exactly that long or COERCE signals a TYPE-ERROR
 /// (ansi COERCE.ERROR.2/3). A `*` or absent size imposes no constraint.
 fn coerce_check_array_length(type_val: EgclVal, len: usize) -> Result<(), EgclError> {
-    if let Some(at) = parse_arr_type(type_val) {
-        if let Dims::List(dl) = &at.dims {
-            if !dl.is_empty() && dl.iter().all(|d| d.is_some()) {
-                let total: usize = dl.iter().map(|d| d.unwrap()).product();
-                if total != len {
-                    return Err(EgclError::TypeError {
-                        datum: type_val,
-                        expected: "sequence of the specified length".into(),
-                    });
-                }
-            }
-        }
-    }
-    Ok(())
+    egcl_stdlib::sequences::validate_sequence_result_type(type_val, len)
 }
 
 /// Is this compound type specifier's ELEMENT TYPE the symbol NIL?
@@ -34036,7 +34023,11 @@ fn coerce_evaluated(
             expected: "a function or the name of a function".into(),
         });
     }
-    coerce_value(*value, *type_val)
+    egcl_rt::rooted!(result = coerce_value(*value, *type_val)?);
+    if parse_arr_type(*type_val).is_some() && !typep_matches(env, *result, *type_val)? {
+        return Err(EgclError::TypeError { datum: *result, expected: "object satisfying the requested COERCE array result type".into() });
+    }
+    Ok(*result)
 }
 
 fn subseq_values(args: &[EgclVal]) -> Result<EgclVal, EgclError> {
@@ -34105,6 +34096,10 @@ fn coerce_to_character(value: EgclVal) -> Result<EgclVal, EgclError> {
 fn coerce_value(mut value: EgclVal, mut type_val: EgclVal) -> Result<EgclVal, EgclError> {
     egcl_rt::rooted_ref!(_value_root = &mut value);
     egcl_rt::rooted_ref!(_type_root = &mut type_val);
+    egcl_stdlib::sequences::validate_sequence_array_rank(type_val)?;
+    if parse_arr_type(type_val).is_some() {
+        coerce_check_array_length(type_val, egcl_stdlib::length(value)?)?;
+    }
     // Reduce the type spec to a bare head-symbol name.
     let head = if type_val.is_cons() {
         cp(type_val).0
@@ -44190,7 +44185,7 @@ fn is_builtin_function(name: &str) -> bool {
     if name == "PRINT-OBJECT" {
         return true;
     }
-    if matches!(name, "EGCL::%APPLY-RETAINED-GENERIC" | "EGCL::%READ-STANDARD-MACRO" | "EGCL::%STANDARD-CHARACTER-READER" | "EGCL::SET-FILL-POINTER"
+    if matches!(name, "EGCL::%APPLY-RETAINED-GENERIC" | "EGCL::%VALIDATE-SEQUENCE-RESULT-TYPE" | "EGCL::%READ-STANDARD-MACRO" | "EGCL::%STANDARD-CHARACTER-READER" | "EGCL::SET-FILL-POINTER"
         | "EGCL::%PPRINT-CIRCLE" | "EGCL::%PPRINT-NATIVE-COLUMN"
         | "EGCL::%PPRINT-RENDER-LAYOUT" | "EGCL::%FORMAT-CONSUMED"
         | "EGCL::%NATIVE-INTERACTIVE-STREAM-P") {
