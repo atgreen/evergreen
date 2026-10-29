@@ -10525,8 +10525,10 @@ const BBU_MAGIC: &[u8; 4] = b"BBU\0";
 // unit; hash-table constants (tag 22): test plus key/value refs.
 // 0x0204: packed U8 payloads (tag 23) and U8 multidimensional backing refs (tag 24).
 // 0x0205: full complex/MD storage graphs and fresh typed backing constants.
-const BBU_BYTECODE_VERSION: u16 = 0x0205;
+// 0x0206: deferred MAKE-LOAD-FORM objects (tag 30; actions 13/14).
+const BBU_BYTECODE_VERSION: u16 = 0x0206;
 mod array_constants;
+mod make_load_form;
 const BBU_VERIFIER_VERSION: u16 = 0x0100;
 const BBU_NO_INDEX: u32 = u32::MAX;
 /// Unit-flags bit: every load form is represented in `load_actions`, so the
@@ -10597,12 +10599,14 @@ struct BbuConstPool {
     /// Hash tables whose entries are being encoded, so one that contains itself
     /// is refused instead of recursing forever.
     open_tables: Vec<EgclVal>,
+    load_forms: make_load_form::Registry,
 }
 
 impl egcl_rt::gc::TraceHostRoots for BbuConstPool {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
         egcl_rt::gc::TraceHostRoots::trace_host_roots(&mut self.graph_values, visit);
         egcl_rt::gc::TraceHostRoots::trace_host_roots(&mut self.open_tables, visit);
+        egcl_rt::gc::TraceHostRoots::trace_host_roots(&mut self.load_forms, visit);
     }
 }
 
@@ -10813,6 +10817,7 @@ impl BbuConstPool {
         egcl_rt::rooted_ref!(_values_root = &mut values);
         let entry_count = self.entries.len();
         let graph_count = self.graph_values.len();
+        let load_form_count = self.load_forms.len();
         let result = self.encode_graph(&values, &nodes);
         if result.is_none() {
             // Unsupported leaves must not leave unresolved reserved entries in
@@ -10822,6 +10827,7 @@ impl BbuConstPool {
                 .retain(|_, index| (*index as usize) < entry_count);
             self.graph_values.truncate(graph_count);
             self.graph_refs.truncate(graph_count);
+            self.load_forms.truncate(load_form_count);
         }
         result
     }
@@ -11119,6 +11125,9 @@ impl BbuConstPool {
             put_u8(&mut bytes, 21);
             put_u64(&mut bytes, v.0);
             return Some(self.intern_encoded(bytes));
+        }
+        if !self.saved_heap_refs && egcl_stdlib::is_instance(v) {
+            return Some(self.reserve_load_form(v));
         }
         if egcl_stdlib::sequences::is_u8_array(v) {
             // Similar rank-one constants need their active elements and U8
@@ -12180,6 +12189,7 @@ pub fn build_bbu_from_forms(
         let mut form = forms[form_index];
         egcl_rt::rooted_ref!(_form_root = &mut form);
         let action_start = load_actions.len();
+        let function_start = functions.len();
         let constant_result = if let Some(value) = bbu_definer_result(form) {
             let Some(index) = pool.value(value) else { return Ok(None); };
             Some(index)
@@ -12431,6 +12441,11 @@ pub fn build_bbu_from_forms(
             }
             return Ok(None);
         }
+        let deferred = make_load_form::plan(
+            &mut pool, &functions, function_start, &load_actions[action_start..], env,
+        )?;
+        if let Some(index) = &mut explicit_result { *index += deferred.len(); }
+        load_actions.splice(action_start..action_start, deferred);
         form_results.push(if let Some(index) = constant_result {
             (2, index)
         } else if let Some(index) = explicit_result.or_else(||
@@ -12440,6 +12455,7 @@ pub fn build_bbu_from_forms(
         form_action_ends.push(load_actions.len());
     }
 
+    make_load_form::discard_unused(&mut pool);
     let mut print_groups = Vec::with_capacity(source_group_ends.len());
     let mut previous_end = 0;
     for &end in source_group_ends {
@@ -13163,6 +13179,7 @@ pub fn build_image_from_runtime(env: &Env) -> Result<Vec<u8>, EgclError> {
 enum BbuConstant {
     Nil,
     T,
+    LoadFormObject,
     Fixnum(i64),
     SingleFloat(u32),
     DoubleFloat(u64),
@@ -13355,6 +13372,7 @@ fn parse_bbu_constant(
     Ok(match cursor.u8()? {
         0 => BbuConstant::Nil,
         1 => BbuConstant::T,
+        30 if bytecode_version >= 0x0206 => BbuConstant::LoadFormObject,
         2 => BbuConstant::Fixnum(cursor.i64()?),
         3 if bytecode_version >= 0x010a => {
             let negative = match cursor.u8()? {
@@ -13734,15 +13752,17 @@ fn materialize_bbu_constants(constants: &[BbuConstant]) -> Result<Vec<EgclVal>, 
 // insertion can allocate; `values` is rooted by the caller and each entry is
 // read from it afresh.
 fn fill_bbu_hash_tables(constants: &[BbuConstant], values: &[EgclVal]) -> Result<(), EgclError> {
+    let deferred_unit = constants.iter().any(|c| matches!(c, BbuConstant::LoadFormObject));
     for (index, constant) in constants.iter().enumerate() {
         let BbuConstant::HashTable { entry_refs, .. } = constant else {
             continue;
         };
+        for &reference in entry_refs {
+            if reference as usize >= index { return Err(bbu_error("hash table entry refers forward")); }
+        }
+        if deferred_unit && make_load_form::has_deferred(constants, entry_refs)? { continue; }
         for pair in entry_refs.chunks_exact(2) {
             let (key, value) = (pair[0] as usize, pair[1] as usize);
-            if key >= index || value >= index {
-                return Err(bbu_error("hash table entry refers forward"));
-            }
             egcl_stdlib::set_gethash(values[key], values[index], values[value])?;
         }
     }
@@ -13758,7 +13778,7 @@ fn allocate_bbu_constants(constants: &[BbuConstant]) -> Result<Vec<EgclVal>, Egc
     egcl_rt::rooted_ref!(_values_root = &mut values);
     for (index, constant) in constants.iter().enumerate() {
         let value = match constant {
-            BbuConstant::Nil => NIL,
+            BbuConstant::Nil | BbuConstant::LoadFormObject => NIL,
             BbuConstant::T => T,
             BbuConstant::Fixnum(value) => {
                 if !(-(1_i64 << 60)..(1_i64 << 60)).contains(value) {
@@ -16731,9 +16751,12 @@ fn load_bbu_definitions(bytes: &[u8], env: &mut Env, restoring: bool) -> Result<
         }
     }
 
+    make_load_form::validate(&encoded_constants, &encoded_functions, &actions, bytecode_version)?;
+    make_load_form::validate_print_groups(&encoded_constants, &actions, print_groups.as_deref())?;
     // Validate the complete load plan before mutating any function/value cell.
     for action in &actions {
         match action.kind {
+            make_load_form::CREATE | make_load_form::INITIALIZE => {}
             12 => {
                 if bytecode_version < 0x010c
                     || action.flags != 0
@@ -16908,6 +16931,7 @@ fn load_bbu_definitions(bytes: &[u8], env: &mut Env, restoring: bool) -> Result<
     let mut constants = materialize_bbu_constants(&encoded_constants)?;
     egcl_rt::rooted_ref!(_constants_root = &mut constants);
     let mut decoded_functions: Vec<BytecodeFunction> = Vec::with_capacity(encoded_functions.len());
+    let mut nested_global_refs = Vec::with_capacity(encoded_functions.len());
     for (index, encoded) in encoded_functions.iter().enumerate() {
         let mut function = decode_bbu_function(
             encoded,
@@ -16979,6 +17003,9 @@ fn load_bbu_definitions(bytes: &[u8], env: &mut Env, restoring: bool) -> Result<
             }
         }
         function.nested_functions = nested_functions;
+        let mut nested_refs = vec![0; global_to_local.len()];
+        for (global, local) in global_to_local { nested_refs[local as usize] = global as usize; }
+        nested_global_refs.push(nested_refs);
         // Every `PushHandlerCase`/`PushRestartCase` selects a clause table by
         // index; an out-of-range index would panic when the instruction executes
         // (`func.handler_cases[hc]` / `restart_cases[rc]`). Reject it at load,
@@ -17026,8 +17053,38 @@ fn load_bbu_definitions(bytes: &[u8], env: &mut Env, restoring: bool) -> Result<
         if !restoring { super::print_loaded_value(value, env)?; }
         next_group += 1;
     }
+    let deferred_unit = encoded_constants.iter().any(|c| matches!(c, BbuConstant::LoadFormObject));
+    let mut deferred_runtime = if deferred_unit {
+        Some(make_load_form::Runtime::new(&encoded_constants)?)
+    } else { None };
     for (action_index, action) in actions.into_iter().enumerate() {
+        let function_index = match action.kind {
+            3 | 4 | 5 | 7 | 8 | 10 => Some(action.arg0 as usize),
+            11 => Some(action.arg1 as usize),
+            _ => None,
+        };
+        let live_function = function_index.map(|index| {
+            if deferred_unit {
+                make_load_form::instantiate(index, &functions, &encoded_functions,
+                    &nested_global_refs, &restart_tables, &constants)
+            } else { Arc::clone(&functions[index]) }
+        });
+        egcl_rt::rooted!(_live_function_root = live_function.as_ref().map(ActiveBytecodeRoot::new));
         match action.kind {
+            make_load_form::CREATE => {
+                let mut creation_env = env.null_lexical_child();
+                egcl_rt::rooted_ref!(_creation_env_root = &mut creation_env);
+                last = eval_form(constants[action.arg1 as usize], &mut creation_env)?;
+                constants[action.arg0 as usize] = last;
+                deferred_runtime.as_ref().unwrap().apply_fixups(action.arg0 as usize, &constants)?;
+                deferred_runtime.as_mut().unwrap().finish_creation(action.arg0 as usize, &encoded_constants, &constants)?;
+            }
+            make_load_form::INITIALIZE => {
+                let mut initialization_env = env.null_lexical_child();
+                egcl_rt::rooted_ref!(_initialization_env_root = &mut initialization_env);
+                last = eval_form(constants[action.arg1 as usize], &mut initialization_env)?;
+                deferred_runtime.as_mut().unwrap().finish_initialization(action.arg0 as usize, &encoded_constants, &constants)?;
+            }
             12 => {
                 let name = bbu_string(&encoded_constants, action.arg0)?;
                 let package = egcl_stdlib::find_package(name).ok_or_else(|| {
@@ -17052,9 +17109,8 @@ fn load_bbu_definitions(bytes: &[u8], env: &mut Env, restoring: bool) -> Result<
                 last = egcl_stdlib::intern(name, package)?.0;
             }
             3 => {
-                let function_index = action.arg0 as usize;
                 let sym = bbu_symbol(&constants, action.arg1)?;
-                let function = Arc::clone(&functions[function_index]);
+                let function = Arc::clone(live_function.as_ref().unwrap());
                 let mut symbol = EgclVal::from_symbol_index(sym);
                 egcl_rt::rooted_ref!(_symbol_root = &mut symbol);
                 let mut lambda_list = if function.variadic {
@@ -17097,7 +17153,7 @@ fn load_bbu_definitions(bytes: &[u8], env: &mut Env, restoring: bool) -> Result<
                 egcl_rt::rooted_ref!(_symbol_root = &mut symbol);
                 super::install_loaded_macro(
                     symbol,
-                    Arc::clone(&functions[action.arg0 as usize]),
+                    Arc::clone(live_function.as_ref().unwrap()),
                     env,
                 );
                 last = symbol;
@@ -17115,7 +17171,7 @@ fn load_bbu_definitions(bytes: &[u8], env: &mut Env, restoring: bool) -> Result<
                 };
                 super::install_loaded_compiler_macro(
                     symbol,
-                    Arc::clone(&functions[action.arg0 as usize]),
+                    Arc::clone(live_function.as_ref().unwrap()),
                     definition_package,
                     env,
                 )?;
@@ -17127,13 +17183,13 @@ fn load_bbu_definitions(bytes: &[u8], env: &mut Env, restoring: bool) -> Result<
                 egcl_rt::rooted_ref!(_symbol_root = &mut symbol);
                 super::install_loaded_setf_expander(
                     symbol,
-                    Arc::clone(&functions[action.arg0 as usize]),
+                    Arc::clone(live_function.as_ref().unwrap()),
                     env,
                 );
                 last = symbol;
             }
             7 => {
-                last = run(Arc::clone(&functions[action.arg0 as usize]), &[], NIL, env)?;
+                last = run(Arc::clone(live_function.as_ref().unwrap()), &[], NIL, env)?;
             }
             9 => {
                 // EvalSource: reconstruct the source form from the constant pool
@@ -17146,7 +17202,7 @@ fn load_bbu_definitions(bytes: &[u8], env: &mut Env, restoring: bool) -> Result<
                 let mut initializer_env = env.null_lexical_child();
                 egcl_rt::rooted_ref!(_env_root = &mut initializer_env);
                 last = run(
-                    Arc::clone(&functions[action.arg1 as usize]),
+                    Arc::clone(live_function.as_ref().unwrap()),
                     &[],
                     NIL,
                     &mut initializer_env,
@@ -17157,7 +17213,7 @@ fn load_bbu_definitions(bytes: &[u8], env: &mut Env, restoring: bool) -> Result<
                 // RegisterClosure (core images, bliss-zz6w): re-register a
                 // closure's bytecode under its image-stable uninterned symbol,
                 // including dispatch from workers started after restoration.
-                let body = &functions[action.arg0 as usize];
+                let body = live_function.as_ref().unwrap();
                 registry_put(action.arg1, Arc::clone(body));
                 closure_bodies()
                     .borrow_mut()

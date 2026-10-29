@@ -128,11 +128,13 @@ abstract-interpretation rules for stack maps, type slots, and unwind metadata;
 a loader MAY reject an older verifier version if the unit lacks metadata needed
 by the current runtime's GC or deoptimizer.
 
-The current bytecode version is **2.5** (`0x0205`). Version 2.1 added bounded
+The current bytecode version is **2.6** (`0x0206`). Version 2.1 added bounded
 fixnum parameter metadata; version 2.2 added `CHECK_RESULT` (`0x45`), described
 below. Version 2.3 added package, saved-image, and hash-table constants; version 2.4 added packed
 U8 constants and their multidimensional backing references. Version 2.5 adds
-mutable array storage graphs, described below. New opcodes and constant tags
+mutable array storage graphs, described below. Version 2.6 adds deferred
+`MAKE-LOAD-FORM` instance constants and ordered creation/initialization actions.
+New opcodes and constant tags
 require their introducing minor version.
 Version-1 writers could
 replace calls to `LDB`, `BYTE`, `TYPEP`, class/structure readers, and literal
@@ -188,6 +190,7 @@ payload : tag-specific bytes
 | 17 | `LayoutRef` | `u32 class_symbol_ref`, `u32 layout_hash_ref` |
 | 18 | `LoadTimeCell` | `u32 producing_action_index` |
 | 19 | `MdArray` | `u32 rank`, `u64 dimensions[rank]`, `u32 element_count`, `u32 row_major_element_refs[element_count]` |
+| 30 | `LoadFormObject` (version 2.6) | empty; identity reconstructed by creation/initialization load actions |
 
 `Symbol.symbol_kind` is `0 = interned`, `1 = uninterned`, `2 = gensym`,
 `3 = external`.  Interned and external symbols are reconstructed through their
@@ -198,6 +201,13 @@ fresh symbol object.
 Structural constants are materialized after primitive constants. Aggregate
 shell allocation and edge installation preserve shared references and the
 content cycles supported since bytecode version 1.14, described below.
+
+`LoadFormObject` reserves one identity for each externalized instance. Distinct
+instances keep distinct entries even when their load forms are equal. The
+compiler calls `CL:MAKE-LOAD-FORM` with its compilation environment and pools
+the expanded creation and initialization forms. Shared references and cycles
+through initialization forms resolve to the reserved reconstructed identities.
+Saved-image heap references retain their existing representation.
 
 #### Exact numeric literals (bytecode version 1.10)
 
@@ -503,6 +513,23 @@ arg2        : u32
 | 8 | `SetLoadTimeCell` | `arg0 = LoadTimeCell constant`, `arg1 = thunk function index` |
 | 9 | `ProvideFeature` | `arg0 = Symbol/String constant` |
 | 10 | `RequireDependency` | `arg0 = DependencyRecord index` |
+| 13 | `CreateLoadFormObject` (version 2.6) | `arg0 = LoadFormObject constant`, `arg1 = creation-form constant`, `arg2 = NO_INDEX`, `flags = 0` |
+| 14 | `InitializeLoadFormObject` (version 2.6) | `arg0 = LoadFormObject constant`, `arg1 = initialization-form constant`, `arg2 = NO_INDEX`, `flags = 0` |
+
+Creation and initialization actions execute the pooled forms in a null lexical
+environment after preceding definitions and before the first consuming action.
+Referenced objects are created first; independent initialization dependencies
+also finish first. A creation result replaces its reserved constant identity,
+and only graph edges awaiting that identity are patched. Initializers can
+therefore refer to themselves and to other created objects without overwriting
+unrelated mutations. Functions are reconstructed from the completed constants
+before publication, including nested functions and lambda-list defaults.
+
+Deferred hash tables are filled before a form reads them. Identity tests need
+created keys; structural tests wait for initialized keys. Unsatisfiable creation
+or hash-readiness cycles are rejected. The loader validates deferred targets,
+form references, unique paired actions, dependency ordering, and all consumer
+references before executing load effects. Hook and load-form errors propagate.
 
 Top-level forms are compiled into `load_time_thunk` functions and scheduled by
 `EvalThunk` or more specific install actions.  For example, a source `defun`
