@@ -11,6 +11,11 @@
 
 ### Fixed
 
+- AArch64 foreign calls with an odd number of stack arguments preserve the
+  actual readable input count while aligning the outgoing stack allocation,
+  avoiding a read of nonexistent source padding
+  ([#890](https://github.com/atgreen/evergreen/pull/890)).
+
 - User-package `%DEFCONSTANT` and similar private-helper names retain their
   own symbols instead of replacing bootstrap operations, including through
   compiled-file loading

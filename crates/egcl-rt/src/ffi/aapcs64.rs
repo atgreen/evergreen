@@ -309,11 +309,13 @@ macro_rules! aapcs64_trampoline {
                 "mov x10, x2",
                 "mov x11, x3",
                 "mov x12, x4",
-                // Round the outgoing area to an even number of words: AAPCS64
-                // requires SP 16-byte aligned at all times, not just at calls.
-                "add x12, x12, #1",
-                "bic x12, x12, #1",
-                "lsl x13, x12, #3",
+                // Round only the outgoing allocation to an even word count.
+                // Keep X12 as the actual readable input count: padding the
+                // destination never authorizes reading a source padding word.
+                // AAPCS64 requires SP 16-byte aligned throughout the call.
+                "add x13, x12, #1",
+                "bic x13, x13, #1",
+                "lsl x13, x13, #3",
                 "sub sp, sp, x13",
                 "mov x14, #0",
                 "1:",
@@ -357,3 +359,176 @@ macro_rules! aapcs64_trampoline {
 aapcs64_trampoline!(call_returning_word -> u64);
 aapcs64_trampoline!(call_returning_double -> f64);
 aapcs64_trampoline!(call_returning_float -> f32);
+
+#[cfg(all(test, target_arch = "aarch64", unix))]
+mod stack_input_tests {
+    use super::{call_returning_double, call_returning_float, call_returning_word};
+    use crate::syscall;
+    use std::mem::{size_of, size_of_val};
+
+    /// Put the last readable argument immediately before an inaccessible page.
+    /// Ordinary Vec spare capacity can conceal a one-word assembly overread.
+    struct GuardedStack {
+        mapping: *mut u8,
+        mapping_len: usize,
+        words: *const u64,
+    }
+
+    impl GuardedStack {
+        fn new(values: &[u64]) -> Self {
+            let page = syscall::page_size();
+            assert!(values.len() <= page / size_of::<u64>());
+            // SAFETY: own both anonymous pages until Drop; only the first is
+            // readable after protection. The source words lie inside it.
+            unsafe {
+                let mapping = syscall::mmap(
+                    std::ptr::null_mut(),
+                    page * 2,
+                    syscall::PROT_READ | syscall::PROT_WRITE,
+                    syscall::MAP_PRIVATE | syscall::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+                .expect("guarded source mapping");
+                let mut owned = Self {
+                    mapping,
+                    mapping_len: page * 2,
+                    words: std::ptr::null(),
+                };
+                syscall::mprotect(mapping.add(page), page, syscall::PROT_NONE)
+                    .expect("source guard page");
+                let words = mapping.add(page - size_of_val(values)).cast::<u64>();
+                std::ptr::copy_nonoverlapping(values.as_ptr(), words, values.len());
+                owned.words = words;
+                owned
+            }
+        }
+    }
+
+    impl Drop for GuardedStack {
+        fn drop(&mut self) {
+            // SAFETY: this object uniquely owns the original complete mapping.
+            let _ = unsafe { syscall::munmap(self.mapping, self.mapping_len) };
+        }
+    }
+
+    macro_rules! targets {
+        ($nine:ident, $ten:ident, $result:ty) => {
+            #[allow(clippy::too_many_arguments, reason = "exercise arguments beyond X0-X7")]
+            extern "C" fn $nine(
+                a: u64,
+                b: u64,
+                c: u64,
+                d: u64,
+                e: u64,
+                f: u64,
+                g: u64,
+                h: u64,
+                i: u64,
+            ) -> $result {
+                (a + b * 2 + c * 3 + d * 4 + e * 5 + f * 6 + g * 7 + h * 8 + i * 9) as $result
+            }
+            #[allow(clippy::too_many_arguments, reason = "exercise arguments beyond X0-X7")]
+            extern "C" fn $ten(
+                a: u64,
+                b: u64,
+                c: u64,
+                d: u64,
+                e: u64,
+                f: u64,
+                g: u64,
+                h: u64,
+                i: u64,
+                j: u64,
+            ) -> $result {
+                (a + b * 2 + c * 3 + d * 4 + e * 5 + f * 6 + g * 7 + h * 8 + i * 9 + j * 10)
+                    as $result
+            }
+        };
+    }
+
+    targets!(nine_word, ten_word, u64);
+    targets!(nine_float, ten_float, f32);
+    targets!(nine_double, ten_double, f64);
+
+    #[test]
+    fn guarded_odd_and_even_inputs_preserve_all_return_register_classes() {
+        let registers = [1, 2, 3, 4, 5, 6, 7, 8];
+        let floats = [0; 8];
+        for (values, word_target, float_target, double_target, expected) in [
+            (
+                &[9][..],
+                nine_word as *const (),
+                nine_float as *const (),
+                nine_double as *const (),
+                285,
+            ),
+            (
+                &[9, 10][..],
+                ten_word as *const (),
+                ten_float as *const (),
+                ten_double as *const (),
+                385,
+            ),
+        ] {
+            let stack = GuardedStack::new(values);
+            // SAFETY: each statically compiled C-ABI target takes eight u64
+            // register arguments followed by exactly values.len() u64 stack
+            // arguments, and has the selected X0/S0/D0 return type. Narrow
+            // packed Apple stack arguments are deliberately not under test.
+            unsafe {
+                assert_eq!(
+                    call_returning_word(
+                        word_target,
+                        registers.as_ptr(),
+                        floats.as_ptr(),
+                        stack.words,
+                        values.len()
+                    ),
+                    expected
+                );
+                assert_eq!(
+                    call_returning_float(
+                        float_target,
+                        registers.as_ptr(),
+                        floats.as_ptr(),
+                        stack.words,
+                        values.len()
+                    ),
+                    expected as f32
+                );
+                assert_eq!(
+                    call_returning_double(
+                        double_target,
+                        registers.as_ptr(),
+                        floats.as_ptr(),
+                        stack.words,
+                        values.len()
+                    ),
+                    expected as f64
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn zero_stack_arguments_do_not_read_the_inaccessible_input_pointer() {
+        extern "C" fn answer() -> u64 {
+            42
+        }
+        let stack = GuardedStack::new(&[]);
+        let registers = [0; 8];
+        // SAFETY: the target has no arguments. The input address deliberately
+        // points into PROT_NONE; count zero must cause no source load at all.
+        let result = unsafe {
+            call_returning_word(
+                answer as *const (),
+                registers.as_ptr(),
+                registers.as_ptr(),
+                stack.words,
+                0,
+            )
+        };
+        assert_eq!(result, 42);
+    }
+}
