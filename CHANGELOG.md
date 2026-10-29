@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- `PPRINT-TABULAR` preserves shared and circular references within one logical
+  printing context, including print limits and callback cleanup
+  ([#870](https://github.com/atgreen/evergreen/pull/870)).
+
 - Circular printing respects `*PRINT-LENGTH*` before emitting shared-tail
   references, avoiding labels for tails hidden by truncation
   ([#869](https://github.com/atgreen/evergreen/pull/869)).
