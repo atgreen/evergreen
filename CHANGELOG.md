@@ -12,6 +12,11 @@
   their operands, including comma syntax inside custom backquote readers
   ([#776](https://github.com/atgreen/evergreen/pull/776)).
 
+- Compiled files reconstruct instance literals through `MAKE-LOAD-FORM`,
+  preserving shared references, supported cycles, and initialization order
+  without re-reading source feature conditionals
+  ([#811](https://github.com/atgreen/evergreen/pull/811)).
+
 - Callable standard comment readers return zero values, so custom list readers
   skip comments without inserting spurious `NIL` elements
   ([#767](https://github.com/atgreen/evergreen/pull/767)).
