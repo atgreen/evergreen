@@ -91,6 +91,16 @@ impl NativeEntry {
             frame_flags: FLAG_CALL,
             num_slots: entry.code.num_slots,
             params,
+            // Prefer the register entry when this callee published one: its
+            // presence certifies a body that needs no activation, so the stub
+            // can pass the arguments in registers instead of building a frame
+            // and copying them into slots (bliss-9va4r). Zero keeps the framed
+            // path, which is every callee that did not qualify.
+            register_entry: if entry.code.compiled_entry != 0 {
+                entry.code.entry as u64 + entry.code.compiled_entry as u64
+            } else {
+                0
+            },
             clear_mv: c2i_clear_mv as extern "C" fn() as usize as u64,
             fallback: fallback[1] as u64,
         };

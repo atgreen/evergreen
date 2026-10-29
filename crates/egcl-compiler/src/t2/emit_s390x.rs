@@ -362,6 +362,17 @@ pub struct NativeCallEntry {
     pub num_slots: u16,
     /// The activation slot each parameter binds, in parameter order.
     pub params: Vec<u16>,
+    /// The callee's REGISTER entry, absolute, or 0 when it published none.
+    ///
+    /// When present the stub skips the EgclStack frame entirely and enters
+    /// here with the arguments in r2.. instead. A nonzero value is itself the
+    /// certificate that doing so is sound: an emitter publishes a register
+    /// entry only for a body that needs no activation (`root_slots == 0`, no
+    /// activation-backed instruction, non-variadic), which is exactly the
+    /// body that never reads r13. The arity guard this stub already runs is
+    /// what makes the register convention safe to use -- it has established
+    /// that the incoming count equals `params.len()` before this is reached.
+    pub register_entry: u64,
     /// The nonallocating multiple-value reset the callee's contract expects.
     pub clear_mv: u64,
     /// The Rust bridge a declined guard tail-jumps to, with the incoming
@@ -441,6 +452,60 @@ pub fn emit_native_call_entry(spec: &NativeCallEntry) -> Result<Vec<u8>, EmitErr
     a.address(1, 1, frame_bytes);
     a.compare(1, 0);
     a.branch(2, slow); // the callee's frame would not fit
+
+    // ── The register path, when the callee published a register entry and its
+    // arity fits the argument registers. It skips the EgclStack frame, the NIL
+    // fill and the slot copies: the callee's body needs no activation, which is
+    // precisely the condition under which an emitter publishes that entry.
+    //
+    // The arity guard above has already established that the incoming count is
+    // `params.len()`, so the fixed number of loads below cannot read past the
+    // staged slice -- that guard is what makes this convention safe here, and
+    // why this does not need its own arity check.
+    //
+    // r13 is left as it arrived. A register-entry body never reads it, and a
+    // deopt out of one does not either: the entry stamps its frame word with
+    // bit 63, and `c2i_deopt_t2_inline` answers that by pushing a fresh frame
+    // per scope rather than resuming on fp.
+    if spec.register_entry != 0 && spec.params.len() <= REGISTER_ENTRY_ARGS_MAX {
+        a.prologue_with(EXTRA);
+        a.store(4, 15, ARGS);
+        // The same depth and activity bookkeeping the framed path does: the
+        // cap exists to bound native recursion, which this path still deepens,
+        // and the activity counter is what keeps this version alive.
+        a.imm64(1, spec.active);
+        a.load(0, 1, 0);
+        a.add_imm(0, 1);
+        a.store(0, 1, 0);
+        a.imm64(1, spec.depth);
+        a.load_u32(0, 1, 0);
+        a.add_imm(0, 1);
+        a.store_u32(0, 1, 0);
+        // Before the arguments reach r2.., because this call clobbers them.
+        a.imm64(1, spec.clear_mv);
+        a.call_reg(1);
+        a.load(11, 15, ARGS);
+        for index in 0..spec.params.len() {
+            a.load(2 + index as u8, 11, 8 * index as i32);
+        }
+        a.imm64(1, spec.register_entry);
+        a.call_reg(1);
+        a.store(2, 15, RESULT);
+        a.imm64(1, spec.depth);
+        a.load_u32(0, 1, 0);
+        a.add_imm(0, -1);
+        a.store_u32(0, 1, 0);
+        a.imm64(1, spec.active);
+        a.load(0, 1, 0);
+        a.add_imm(0, -1);
+        a.store(0, 1, 0);
+        a.load(2, 15, RESULT);
+        a.epilogue_with(EXTRA);
+        a.bind(slow);
+        a.imm64(1, spec.fallback);
+        a.jump_reg(1);
+        return a.finish().ok_or(unsupported!());
+    }
 
     a.prologue_with(EXTRA);
     a.store(4, 15, ARGS);
@@ -3366,6 +3431,10 @@ mod tests {
             frame_flags: 0x21,
             num_slots: 3,
             params: vec![0],
+            // This test is about the FRAMED path -- it checks the frame header,
+            // the slot binding and that the frame is popped -- so it must not
+            // take the register one.
+            register_entry: 0,
             clear_mv: clear_mv as *const () as u64,
             fallback: fallback as *const () as u64,
         };
@@ -3424,6 +3493,8 @@ mod tests {
             frame_flags: 0x21,
             num_slots,
             params: vec![0],
+            // The framed path, which is what this bound applies to.
+            register_entry: 0,
             clear_mv: stub as *const () as u64,
             fallback: stub as *const () as u64,
         };
@@ -4854,6 +4925,131 @@ mod tests {
                 NIL.0,
                 "a non-string heap object"
             );
+        }
+    }
+
+    /// A published native call entry whose callee advertises a register entry
+    /// enters it with the arguments in r2.. and builds no EgclStack frame.
+    ///
+    /// The fixture is built so that only the register path can produce the
+    /// right answer: the callee sums its arguments from r2.. and returns, the
+    /// framed path's activation `entry` is a sentinel that would answer
+    /// SENTINEL instead, and the `fallback` is a third sentinel. So an answer
+    /// of the expected sum proves the register path ran -- emitting the framed
+    /// path would answer SENTINEL, and declining would answer FALLBACK.
+    ///
+    /// The arity guard is the safety property worth pinning here: it already
+    /// runs ahead of this path, so a wrong incoming count takes the fallback
+    /// rather than loading registers from past the end of the staged slice.
+    #[test]
+    fn a_callee_with_a_register_entry_is_entered_through_registers_without_a_frame() {
+        const SENTINEL: u64 = 0x5ced_0002;
+        const FALLBACK: u64 = 0x5ced_0003;
+
+        // The "callee": sums r2.. for the admitted arity and returns in r2.
+        // Built with this emitter so the convention under test is the real one.
+        fn summing_callee(arity: usize) -> Vec<u8> {
+            let mut a = Asm::new();
+            a.prologue();
+            for index in 1..arity {
+                a.add(2, 2 + index as u8);
+            }
+            a.epilogue();
+            a.ret();
+            a.finish().expect("the callee assembles")
+        }
+        extern "C" fn activation_entry(_: u64, _: u64) -> u64 {
+            SENTINEL
+        }
+        extern "C" fn fallback() -> u64 {
+            FALLBACK
+        }
+        // Counted, because the callee's contract is a fresh value context and
+        // nothing else in this test would notice its absence: a skipped reset
+        // leaves the answer correct. A mutation that dropped the call passed
+        // until this counter existed.
+        static CLEARS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        extern "C" fn clear_mv() {
+            CLEARS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        for arity in 1..=REGISTER_ENTRY_ARGS_MAX {
+            let callee = egcl_rt::jit::JitBuffer::new(&summing_callee(arity))
+                .expect("callee buffer");
+            let mut depth: u32 = 0;
+            let mut active: usize = 0;
+            // A real EgclStack header, at the runtime's own offsets. The
+            // frame-fits guard runs ahead of the register path and reads
+            // capacity and sp, so a header with a zero capacity sends every
+            // call to the fallback -- which is exactly how the first version
+            // of this test failed, and why it uses the offsets rather than
+            // guessing at them.
+            let base = egcl_rt::EgclStack::OFFSET_BASE / 8;
+            let sp = egcl_rt::EgclStack::OFFSET_SP_OFFSET / 8;
+            let fp = egcl_rt::EgclStack::OFFSET_FP / 8;
+            let capacity = egcl_rt::EgclStack::OFFSET_CAPACITY / 8;
+            let mut header = vec![0u64; 64];
+            let mut arena = vec![0u64; 4096];
+            header[base] = arena.as_mut_ptr() as u64;
+            header[sp] = 0;
+            header[fp] = 0;
+            header[capacity] = (arena.len() * 8) as u64;
+            let spec = NativeCallEntry {
+                stack: header.as_mut_ptr() as u64,
+                depth: std::ptr::from_mut(&mut depth) as u64,
+                depth_cap: 64,
+                active: std::ptr::from_mut(&mut active) as u64,
+                entry: activation_entry as *const () as u64,
+                code_info: 0,
+                frame_flags: 0x21,
+                num_slots: 8,
+                params: (0..arity as u16).collect(),
+                register_entry: callee.as_ptr() as u64,
+                clear_mv: clear_mv as *const () as u64,
+                fallback: fallback as *const () as u64,
+            };
+            let bytes = emit_native_call_entry(&spec).expect("the register path emits");
+            assert!(!bytes.is_empty());
+            let _ = (SENTINEL, FALLBACK);
+            #[cfg(all(target_arch = "s390x", unix))]
+            {
+                let stub = egcl_rt::jit::JitBuffer::new(&bytes).expect("stub buffer");
+                // SAFETY: the slice convention is (unused, nargs, args, 0).
+                let enter: unsafe extern "C" fn(u64, u64, *const u64, u64) -> u64 =
+                    unsafe { std::mem::transmute(stub.as_ptr()) };
+                let args: Vec<u64> = (0..arity).map(|i| 1u64 << (i + 1)).collect();
+                let expected: u64 = args.iter().sum();
+                CLEARS.store(0, std::sync::atomic::Ordering::Relaxed);
+                let answer = unsafe { enter(0, arity as u64, args.as_ptr(), 0) };
+                assert_eq!(
+                    CLEARS.load(std::sync::atomic::Ordering::Relaxed),
+                    1,
+                    "arity {arity}: the value context is reset exactly once"
+                );
+                assert_eq!(
+                    answer, expected,
+                    "arity {arity}: the register path must run (SENTINEL would mean \
+                     the framed path, FALLBACK the decline)"
+                );
+                // The depth and activity counters are restored on the way out,
+                // as the framed path restores them.
+                assert_eq!(depth, 0, "arity {arity}: depth restored");
+                assert_eq!(active, 0, "arity {arity}: activity restored");
+                // No EgclStack frame was built, which is the point: sp and fp
+                // come back exactly as they went in.
+                assert_eq!(header[sp], 0, "arity {arity}: sp untouched");
+                assert_eq!(header[fp], 0, "arity {arity}: fp untouched");
+                // A wrong incoming count must take the fallback rather than
+                // reading registers from past the staged slice.
+                CLEARS.store(0, std::sync::atomic::Ordering::Relaxed);
+                let wrong = unsafe { enter(0, arity as u64 + 1, args.as_ptr(), 0) };
+                assert_eq!(wrong, FALLBACK, "arity {arity}: a count mismatch declines");
+                assert_eq!(
+                    CLEARS.load(std::sync::atomic::Ordering::Relaxed),
+                    0,
+                    "arity {arity}: the decline enters nothing, so resets nothing"
+                );
+            }
         }
     }
 }
