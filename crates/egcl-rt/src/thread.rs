@@ -4445,11 +4445,14 @@ mod host_shutdown_tests {
     use super::*;
     use std::cell::RefCell;
     use std::sync::Barrier;
+
+    type PauseSlot = RefCell<Option<(Arc<Barrier>, Arc<Barrier>)>>;
+
     thread_local! {
-        static CLAIM: RefCell<Option<(Arc<Barrier>, Arc<Barrier>)>> = const { RefCell::new(None) };
-        static ENQUEUE: RefCell<Option<(Arc<Barrier>, Arc<Barrier>)>> = const { RefCell::new(None) };
+        static CLAIM: PauseSlot = const { RefCell::new(None) };
+        static ENQUEUE: PauseSlot = const { RefCell::new(None) };
     }
-    fn pause(slot: &'static std::thread::LocalKey<RefCell<Option<(Arc<Barrier>, Arc<Barrier>)>>>) {
+    fn pause(slot: &'static std::thread::LocalKey<PauseSlot>) {
         let barriers = slot.with(|value| value.borrow_mut().take());
         if let Some((arrived, release)) = barriers {
             arrived.wait();
