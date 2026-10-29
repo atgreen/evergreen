@@ -4402,11 +4402,10 @@ pub fn host_request_execution_shutdown(target: HostExecutionTarget) {
                 if !matches!(
                     thread.state(),
                     NativeThreadState::Dead | NativeThreadState::Aborted
-                ) {
-                    if enqueue_shutdown_once(&thread.shutdown_delivery, &thread.pending_signals) {
-                        thread.execution.request_poll();
-                        crate::execution_poll::request_carrier(thread.id.0);
-                    }
+                ) && enqueue_shutdown_once(&thread.shutdown_delivery, &thread.pending_signals)
+                {
+                    thread.execution.request_poll();
+                    crate::execution_poll::request_carrier(thread.id.0);
                 }
             }
         }
