@@ -6062,29 +6062,51 @@ declares no constraint, so it is returned unwrapped and costs nothing."
            (check-type ,value ,slot-type)
            ,value))))
 
-(defun egcl::%typed-struct-build-form (rep element-type total names slots values)
-  "A form building the sequence: NAMES mark the :NAMED positions, VALUES is an
-alist from slot name to the form supplying it."
-  (let ((elements (make-list total :initial-element nil)))
+(defun egcl::%typed-struct-build-form (rep element-type total names slots values
+                                         &optional uninitialized)
+  "Build the sequence, leaving bare BOA &AUX slots uninitialized."
+  (let ((elements (make-list total :initial-element nil))
+        (initialized '()))
     (dolist (entry names)
+      (push (cdr entry) initialized)
       (setf (nth (cdr entry) elements) `',(car entry)))
     (dolist (slot slots)
-      ;; Enforce the slot's :TYPE here, where both the keyword constructor and
-      ;; every BOA constructor pass through.
-      (setf (nth (second slot) elements)
-            (egcl::%typed-struct-check-form (cdr (assoc (first slot) values))
-                                            (fourth slot))))
-    (if (eq rep 'list)
-        `(list ,@elements)
-        `(make-array ,total :element-type ',element-type
-                            :initial-contents (list ,@elements)))))
+      (let ((form (cdr (assoc (first slot) values))))
+        (if (member (first slot) uninitialized)
+            ;; For lists the unspecified storage value is NIL. Do not check
+            ;; that implementation value against the eventual slot type.
+            (setf (nth (second slot) elements) nil)
+            (progn
+              (push (second slot) initialized)
+              (setf (nth (second slot) elements)
+                    (egcl::%typed-struct-check-form form (fourth slot)))))))
+    (cond ((eq rep 'list) `(list ,@elements))
+          ((null uninitialized)
+           `(make-array ,total :element-type ',element-type
+                              :initial-contents (list ,@elements)))
+          (t
+           ;; A specialized vector cannot accept NIL as an initialization
+           ;; value. Let MAKE-ARRAY choose its unspecified storage instead.
+           ;; Evaluate all real initializations/checks in the original order
+           ;; before allocation, then assign only the initialized positions.
+           (let ((array (gensym "BOA-VECTOR")) (bindings '()) (writes '()))
+             (loop for form in elements for index from 0
+                   when (member index initialized)
+                     do (let ((value (gensym "BOA-SLOT")))
+                          (push `(,value ,form) bindings)
+                          (push `(setf (aref ,array ,index) ,value) writes)))
+             `(let* (,@(nreverse bindings)
+                     (,array (make-array ,total :element-type ',element-type)))
+                ,@(nreverse writes)
+                ,array))))))
 
 (defun egcl::%typed-struct-boa-constructor (ctor-name lambda-list rep element-type
                                             total names slots)
   "A BOA constructor (CLHS 3.4.6): a parameter naming a slot supplies it; an
 &optional or &key parameter without a default takes the slot's default; slots
 no parameter names take their defaults."
-  (let ((section '&required) (new-lambda-list '()) (bound '()))
+  (let ((section '&required) (new-lambda-list '()) (bound '())
+        (uninitialized '()))
     (flet ((slot-default (var)
              (third (find var slots :key #'first))))
       (dolist (item lambda-list)
@@ -6100,6 +6122,9 @@ no parameter names take their defaults."
               ((eq section '&aux)
                (let ((var (if (consp item) (car item) item)))
                  (push var bound)
+                 (when (and (not (and (consp item) (cdr item)))
+                            (find var slots :key #'first))
+                   (push var uninitialized))
                  (push (if (consp item) item (list var nil)) new-lambda-list)))
               (t ;; &optional / &key
                (let* ((spec (if (consp item) item (list item)))
@@ -6117,7 +6142,8 @@ no parameter names take their defaults."
            (mapcar (lambda (slot)
                      (cons (first slot)
                            (if (member (first slot) bound) (first slot) (third slot))))
-                   slots))))))
+                   slots)
+           uninitialized)))))
 
 (defmacro egcl::%deftypedstruct (name-and-options &rest slot-descriptions)
   (let* ((name (if (consp name-and-options) (car name-and-options) name-and-options))

@@ -40294,6 +40294,9 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 egcl_rt::rooted!(new_params = Vec::<EgclVal>::new());
                 // Flat (initarg, var, initarg, var, …) of slots bound by a param.
                 egcl_rt::rooted!(make_call = vec![sym("MAKE-INSTANCE"), quote(name_sym)]);
+                // CLHS 3.4.6: bare &AUX variables suppress slot initialization,
+                // including its type check. Symbol indices are stable immediates.
+                let mut uninitialized_slots = Vec::<u32>::new();
                 let mut sec = Sec::Req;
                 for i in 0..src.len() {
                     let p = src[i];
@@ -40371,6 +40374,9 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                         }
                     }
                     if let Some((initarg, _)) = slot {
+                        if sec == Sec::Aux && !has_default {
+                            uninitialized_slots.push(initarg.as_symbol_index());
+                        }
                         make_call.push(initarg);
                         make_call.push(var);
                     }
@@ -40403,7 +40409,13 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                         i += 2;
                     }
                     let value_form = supplied.unwrap_or(slot_spec.default);
-                    positional.push(checked_struct_slot_form(value_form, slot_spec.slot_type));
+                    if uninitialized_slots.contains(&slot_spec.initarg.as_symbol_index()) {
+                        // The implementation's initial storage value is unspecified.
+                        // Do not interpret it as an assignment violating :TYPE.
+                        positional.push(value_form);
+                    } else {
+                        positional.push(checked_struct_slot_form(value_form, slot_spec.slot_type));
+                    }
                 }
                 egcl_rt::rooted!(boa_lambda = vec_to_list(&new_params));
                 egcl_rt::rooted!(boa_body = vec_to_list(&positional));

@@ -24,6 +24,10 @@
   different upgraded representations
   ([#821](https://github.com/atgreen/evergreen/pull/821)).
 
+- BOA structure constructors leave slots uninitialized when `&aux` defaults
+  are omitted, without premature type errors, including specialized vectors
+  ([#823](https://github.com/atgreen/evergreen/pull/823)).
+
 - Compiled class literals preserve their named class identity, and dependent
   load-form objects initialize in the required order
   ([#818](https://github.com/atgreen/evergreen/pull/818)).
