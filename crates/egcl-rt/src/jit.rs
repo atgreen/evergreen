@@ -43,7 +43,8 @@ impl JitBuffer {
     /// `new_with_windows_unwind` when emitting a frame.
     #[cfg(any(unix, windows))]
     pub fn new(code: &[u8]) -> Option<Self> {
-        if code.is_empty() {
+        // The iOS profile never asks the OS for generated executable memory.
+        if cfg!(target_os = "ios") || code.is_empty() {
             return None;
         }
         let page = crate::syscall::page_size();
@@ -249,7 +250,7 @@ impl JitBuffer {
 ///
 /// # Safety
 /// `ptr..ptr + len` must be a mapped range in this process.
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "ios")))]
 unsafe fn flush_instruction_cache(ptr: *const u8, len: usize) {
     unsafe extern "C" {
         fn sys_icache_invalidate(start: *mut core::ffi::c_void, len: usize);
@@ -260,7 +261,10 @@ unsafe fn flush_instruction_cache(ptr: *const u8, len: usize) {
     }
 }
 
-#[cfg(all(target_arch = "aarch64", not(target_os = "macos")))]
+#[cfg(all(
+    target_arch = "aarch64",
+    not(any(target_os = "macos", target_os = "ios"))
+))]
 unsafe fn flush_instruction_cache(ptr: *const u8, len: usize) {
     if len == 0 {
         return;

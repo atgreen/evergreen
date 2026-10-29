@@ -39,6 +39,9 @@ pub unsafe fn mmap(
     fd: i32,
     offset: i64,
 ) -> Result<*mut u8, i32> {
+    if cfg!(target_os = "ios") && prot & PROT_EXEC != 0 {
+        return Err(libc::EPERM);
+    }
     let ptr = unsafe { libc::mmap(addr.cast(), len, prot, flags, fd, offset) };
     if ptr == libc::MAP_FAILED {
         Err(errno())
@@ -60,6 +63,9 @@ pub unsafe fn munmap(addr: *mut u8, len: usize) -> Result<(), i32> {
 /// # Safety
 /// `addr` and `len` name a live mapping.
 pub unsafe fn mprotect(addr: *mut u8, len: usize, prot: i32) -> Result<(), i32> {
+    if cfg!(target_os = "ios") && prot & PROT_EXEC != 0 {
+        return Err(libc::EPERM);
+    }
     if unsafe { libc::mprotect(addr.cast(), len, prot) } == 0 {
         Ok(())
     } else {

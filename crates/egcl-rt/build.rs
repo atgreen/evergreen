@@ -61,7 +61,16 @@ fn main() {
     {
         println!("cargo:rustc-cfg=egcl_dlopen_embedded");
     }
-    if target == "aarch64-apple-darwin" {
+    println!("cargo:rustc-check-cfg=cfg(egcl_ios_simulator)");
+    if target == "aarch64-apple-ios-sim" {
+        println!("cargo:rustc-cfg=egcl_ios_simulator");
+    }
+    if arch == "aarch64"
+        && matches!(
+            std::env::var("CARGO_CFG_TARGET_OS").as_deref(),
+            Ok("macos" | "ios")
+        )
+    {
         println!("cargo:rerun-if-changed=src/syscall/macos_context.c");
         cc::Build::new()
             .file("src/syscall/macos_context.c")

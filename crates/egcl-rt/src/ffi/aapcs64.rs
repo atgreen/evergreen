@@ -143,6 +143,14 @@ pub unsafe fn ffi_call(
     arg_types: &[AlienType],
     args: &[u64],
 ) -> Result<u64, EgclError> {
+    // Darwin placement differs for narrow fixed spills and variadic arguments.
+    // Until an Apple ABI backend exists, the initial iOS profile must not call
+    // a native function with the Linux/Android placement implemented below.
+    if cfg!(target_os = "ios") {
+        return Err(EgclError::FfiError(
+            "scalar foreign calls are not supported by the initial iOS T0 profile".into(),
+        ));
+    }
     if fn_ptr.is_null() {
         return Err(EgclError::FfiError("null function pointer".into()));
     }

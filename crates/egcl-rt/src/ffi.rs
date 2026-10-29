@@ -678,7 +678,7 @@ impl Drop for Callback {
 // symbols via a host `SyntheticModule`. `DT_INIT_ARRAY` constructors run during
 // relocation. `ffi_call`/marshalling (which need no loader) are unchanged.
 //
-// The `c-ffi` build instead uses libc `dlopen` (below) — for dynamically-linked
+// The `c-ffi` build and iOS instead use libc `dlopen` (below) — for dynamically-linked
 // targets that load system (glibc) libraries. POWER and IBM Z also use this
 // backend by default because elf_loader has no native relocation support there.
 
@@ -746,7 +746,7 @@ pub(super) fn remember_foreign_symbol(address: *const (), name: &str) {
 
 #[cfg(all(
     unix,
-    not(feature = "c-ffi"),
+    not(any(feature = "c-ffi", target_os = "ios")),
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 mod elf_backend {
@@ -979,7 +979,7 @@ mod elf_backend {
 
 #[cfg(all(
     unix,
-    not(feature = "c-ffi"),
+    not(any(feature = "c-ffi", target_os = "ios")),
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 pub use elf_backend::{
@@ -987,7 +987,7 @@ pub use elf_backend::{
 };
 #[cfg(all(
     unix,
-    not(feature = "c-ffi"),
+    not(any(feature = "c-ffi", target_os = "ios")),
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 use elf_backend::{restore_libraries, saved_library_names};
@@ -996,6 +996,7 @@ use elf_backend::{restore_libraries, saved_library_names};
     unix,
     any(
         feature = "c-ffi",
+        target_os = "ios",
         not(any(target_arch = "x86_64", target_arch = "aarch64"))
     )
 ))]
@@ -1005,6 +1006,7 @@ struct DynamicLibrary(usize);
     unix,
     any(
         feature = "c-ffi",
+        target_os = "ios",
         not(any(target_arch = "x86_64", target_arch = "aarch64"))
     )
 ))]
@@ -1021,6 +1023,7 @@ impl Drop for DynamicLibrary {
     unix,
     any(
         feature = "c-ffi",
+        target_os = "ios",
         not(any(target_arch = "x86_64", target_arch = "aarch64"))
     )
 ))]
@@ -1032,6 +1035,7 @@ static DYNAMIC_LIBRARIES: registry::LibraryRegistry<
     unix,
     any(
         feature = "c-ffi",
+        target_os = "ios",
         not(any(target_arch = "x86_64", target_arch = "aarch64"))
     )
 ))]
@@ -1043,6 +1047,7 @@ fn saved_library_names() -> Vec<Option<String>> {
     unix,
     any(
         feature = "c-ffi",
+        target_os = "ios",
         not(any(target_arch = "x86_64", target_arch = "aarch64"))
     )
 ))]
@@ -1055,6 +1060,7 @@ fn restore_libraries(names: Vec<Option<String>>) {
     unix,
     any(
         feature = "c-ffi",
+        target_os = "ios",
         not(any(target_arch = "x86_64", target_arch = "aarch64"))
     )
 ))]
@@ -1067,6 +1073,7 @@ pub fn load_foreign_library(name: &str) -> Result<*mut (), EgclError> {
     unix,
     any(
         feature = "c-ffi",
+        target_os = "ios",
         not(any(target_arch = "x86_64", target_arch = "aarch64"))
     )
 ))]
@@ -1123,6 +1130,7 @@ fn open_dynamic_library(
     unix,
     any(
         feature = "c-ffi",
+        target_os = "ios",
         not(any(target_arch = "x86_64", target_arch = "aarch64"))
     )
 ))]
@@ -1140,6 +1148,7 @@ pub unsafe fn foreign_symbol(library: *mut (), name: &str) -> Result<*const (), 
     unix,
     any(
         feature = "c-ffi",
+        target_os = "ios",
         not(any(target_arch = "x86_64", target_arch = "aarch64"))
     )
 ))]
@@ -1173,6 +1182,7 @@ unsafe fn dynamic_symbol(library: *mut libc::c_void, name: &str) -> Result<*cons
     unix,
     any(
         feature = "c-ffi",
+        target_os = "ios",
         not(any(target_arch = "x86_64", target_arch = "aarch64"))
     )
 ))]
@@ -1190,6 +1200,7 @@ pub unsafe fn close_foreign_library(library: *mut ()) -> Result<(), EgclError> {
     unix,
     any(
         feature = "c-ffi",
+        target_os = "ios",
         not(any(target_arch = "x86_64", target_arch = "aarch64"))
     )
 ))]

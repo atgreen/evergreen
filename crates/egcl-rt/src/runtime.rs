@@ -1318,7 +1318,7 @@ fn install_process_signal_handlers() -> Result<(), EgclError> {
             syscall::SA_RESTART | syscall::SA_ONSTACK | syscall::SA_SIGINFO,
         )
         .map_err(|_| EgclError::SignalError(syscall::SIGSEGV))?;
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         install(
             syscall::SIGBUS,
             sigsegv_handler as *const () as usize,
@@ -1770,7 +1770,7 @@ fn sigsegv_stack_guard_contains(addr: usize) -> bool {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 fn siginfo_fault_addr(info: *mut core::ffi::c_void) -> usize {
     if info.is_null() {
         return usize::MAX;
@@ -1778,7 +1778,7 @@ fn siginfo_fault_addr(info: *mut core::ffi::c_void) -> usize {
     unsafe { (*(info as *const libc::siginfo_t)).si_addr as usize }
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
 fn siginfo_fault_addr(info: *mut core::ffi::c_void) -> usize {
     if info.is_null() {
         return usize::MAX;
@@ -1806,7 +1806,7 @@ fn rewrite_ucontext_ip(context: *mut core::ffi::c_void, ip: usize) -> bool {
     true
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
 fn rewrite_ucontext_ip(context: *mut core::ffi::c_void, ip: usize) -> bool {
     unsafe extern "C" {
         fn egcl_macos_rewrite_ucontext_pc(context: *mut core::ffi::c_void, pc: usize) -> bool;
@@ -1859,7 +1859,7 @@ fn rewrite_ucontext_ip(context: *mut core::ffi::c_void, ip: usize) -> bool {
 #[cfg(all(
     unix,
     not(target_arch = "x86_64"),
-    not(target_os = "macos"),
+    not(any(target_os = "macos", target_os = "ios")),
     not(all(
         target_os = "linux",
         any(target_arch = "s390x", target_arch = "riscv64")
