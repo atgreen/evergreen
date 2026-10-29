@@ -34,6 +34,10 @@
   type membership across interpreted and compiled representations
   ([#843](https://github.com/atgreen/evergreen/pull/843)).
 
+- Property lists on `NIL` and `T` retain updates through `GET`, `SYMBOL-PLIST`,
+  and `REMPROP`, including compiled calls and saved images
+  ([#855](https://github.com/atgreen/evergreen/pull/855)).
+
 - String and stream printers consistently honor `*PRINT-ARRAY*` for array
   layouts, and string printers render package objects through their print hook
   ([#830](https://github.com/atgreen/evergreen/pull/830)).
