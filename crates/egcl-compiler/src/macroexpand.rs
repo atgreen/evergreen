@@ -1721,6 +1721,7 @@ fn is_known_special_operator(val: EgclVal) -> bool {
                 | "LOAD-TIME-VALUE"
                 | "LOCALLY"
                 | "MACROLET"
+                | "MULTIPLE-VALUE-BIND"
                 | "MULTIPLE-VALUE-CALL"
                 | "MULTIPLE-VALUE-PROG1"
                 | "MULTIPLE-VALUE-SETQ"
@@ -1812,6 +1813,7 @@ fn expand_special_form(
         "SETQ" => expand_setq(form, env),
         "SETF" | "PSETF" | "EGCL::%SETF" => expand_setf(form, env),
         "MULTIPLE-VALUE-SETQ" => expand_multiple_value_setq(form, env),
+        "MULTIPLE-VALUE-BIND" => expand_multiple_value_bind(form, env),
         "THE" => expand_the(form, env),
         "EVAL-WHEN" => expand_eval_when(form, env),
         "FUNCTION" => expand_function_special(form, env),
@@ -1983,6 +1985,59 @@ fn expand_tagbody(mut form: EgclVal, env: &Environment) -> Result<EgclVal, EgclE
     } else {
         Ok(alloc_cons(operator, vec_to_cons(&expanded_items)))
     }
+}
+
+/// MULTIPLE-VALUE-BIND's names are data, not a function call. Its value form
+/// uses the outer scope; only the body sees the new variable bindings.
+fn expand_multiple_value_bind(form: EgclVal, env: &Environment) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted!(form = form);
+    let args = unsafe { cons_cdr(*form) };
+    if !args.is_cons() {
+        return Ok(*form);
+    }
+    let rest = unsafe { cons_cdr(args) };
+    if !rest.is_cons() {
+        return Ok(*form);
+    }
+    egcl_rt::rooted!(
+        parts = [
+            unsafe { cons_car(*form) },
+            unsafe { cons_car(args) },
+            unsafe { cons_car(rest) },
+            unsafe { cons_cdr(rest) },
+        ]
+    );
+    egcl_rt::rooted!(variables = Vec::<EgclVal>::new());
+    let mut cursor = parts[1];
+    let mut seen = HashSet::new();
+    while cursor.is_cons() {
+        if !seen.insert(cursor.0) {
+            return Ok(*form);
+        }
+        let variable = unsafe { cons_car(cursor) };
+        if !variable.is_symbol() || variable.is_nil() || variable == egcl_rt::value::T {
+            return Ok(*form);
+        }
+        variables.push(variable);
+        cursor = unsafe { cons_cdr(cursor) };
+    }
+    if !cursor.is_nil() {
+        return Ok(*form);
+    }
+    egcl_rt::rooted!(value = walk_macroexpand_all(parts[2], env)?);
+    egcl_rt::rooted!(body_env = env.clone());
+    for index in 0..variables.len() {
+        *body_env = body_env.augment_variable(variables[index], VariableInfo::Lexical);
+    }
+    // expand_body preserves declarations and augments their body environment.
+    // Variable bindings do not shadow same-named local function macros.
+    egcl_rt::rooted!(body = expand_body(parts[3], &body_env)?);
+    if *value == parts[2] && *body == parts[3] {
+        return Ok(*form);
+    }
+    egcl_rt::rooted!(tail = alloc_cons(*value, *body));
+    *tail = alloc_cons(parts[1], *tail);
+    Ok(alloc_cons(parts[0], *tail))
 }
 
 /// Expand MULTIPLE-VALUE-SETQ: (multiple-value-setq (var*) form)

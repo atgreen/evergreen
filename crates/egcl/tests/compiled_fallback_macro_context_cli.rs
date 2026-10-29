@@ -215,3 +215,54 @@ fn unexternalizable_frozen_function_cannot_silently_retain_original_source() {
     );
     fs::remove_dir_all(directory).unwrap();
 }
+
+#[test]
+fn multiple_value_binders_remain_data_under_same_named_local_macros() {
+    let directory = scratch("mvb");
+    let source = directory.join("mvb.lisp");
+    let artifact = directory.join("mvb.bfasl");
+    fs::write(
+        &source,
+        r#"
+      (defvar *mvb-producer-calls* 0)
+      (defun scoped-multiple-values (items)
+        (declare (special items))
+        (macrolet ((costs (&rest forms) `(list ,@forms)))
+          (let ((costs 8))
+            (multiple-value-bind (costs scs fixup)
+                (progn (incf *mvb-producer-calls*) (values (1+ costs) 2 3 4))
+              (declare (type fixnum costs))
+              (list costs scs fixup (costs costs))))))
+      (defun missing-multiple-values (items)
+        (declare (special items))
+        (multiple-value-bind (a b c) (values 7) (list a b c)))
+      (defun empty-multiple-values (items)
+        (declare (special items))
+        (multiple-value-bind () (progn (incf *mvb-producer-calls*) (values 1 2)) :empty))
+    "#,
+    )
+    .unwrap();
+    run(
+        &format!(
+            r#"
+      (multiple-value-bind (file warnings failure) (compile-file {source:?} :output-file {artifact:?})
+        (declare (ignore warnings)) (assert file) (assert (not failure)))
+      (write-line "FALLBACK-CONTEXT-OK")"#
+        ),
+        false,
+    );
+    require_bytecode(&artifact);
+    fs::remove_file(source).unwrap();
+    let program = format!(
+        r#"
+      (load {artifact:?})
+      (assert (equal (scoped-multiple-values nil) '(9 2 3 (9))))
+      (assert (= *mvb-producer-calls* 1))
+      (assert (equal (missing-multiple-values nil) '(7 nil nil)))
+      (assert (eq (empty-multiple-values nil) :empty))
+      (assert (= *mvb-producer-calls* 2))
+      (write-line "FALLBACK-CONTEXT-OK")"#
+    );
+    assert_eq!(run(&program, false), run(&program, true));
+    fs::remove_dir_all(directory).unwrap();
+}
