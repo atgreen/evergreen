@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- FORMAT right-justifies a lone text segment without adding between-segment
+  minimum padding to its implicit leading slot
+  ([#868](https://github.com/atgreen/evergreen/pull/868)).
+
 - Direct synonym-stream reads and writes avoid lock-order failures while
   retaining whole-operation ownership for bulk writes
   ([#866](https://github.com/atgreen/evergreen/pull/866)).
