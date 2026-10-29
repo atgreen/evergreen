@@ -4,6 +4,11 @@
 
 ### Fixed
 
+- FORMAT section tabs honor dynamic `*PRINT-PRETTY*` bindings, and mandatory
+  pretty newlines remain inert on ordinary streams while logical-block callback
+  columns stay consistent
+  ([#875](https://github.com/atgreen/evergreen/pull/875)).
+
 - Methods retain their actual class specializers when class names are rebound,
   including retained calls and saved images. Core format 15 requires rebuilding
   earlier images
