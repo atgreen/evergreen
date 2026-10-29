@@ -12594,18 +12594,31 @@ fn print_val_body(mut val: EgclVal, out: &mut String) {
         // matching the stdlib printer (bliss-i1i9).
         let class = egcl_stdlib::class_of(*val);
         if egcl_stdlib::is_structure_class(class) {
+            egcl_rt::rooted!(slots = egcl_stdlib::effective_slots(class));
+            let depth = PRINT_DEPTH.with(|depth| depth.get());
+            let plan = egcl_stdlib::format::structure_print_plan(depth, slots.len());
+            if plan.level_exceeded { out.push('#'); return; }
+            struct RestoreStructurePrint(usize, bool);
+            impl Drop for RestoreStructurePrint {
+                fn drop(&mut self) {
+                    PRINT_DEPTH.with(|depth| depth.set(self.0));
+                    PRINT_ESCAPE.with(|escape| escape.set(self.1));
+                }
+            }
+            let _state = RestoreStructurePrint(depth, PRINT_ESCAPE.with(|escape| escape.replace(true)));
+            PRINT_DEPTH.with(|current| current.set(depth + 1));
             out.push_str("#S(");
             out.push_str(&sym_bare_name_rc(egcl_stdlib::class_name(class)));
-            let prev = PRINT_ESCAPE.with(|c| c.replace(true));
-            for slot in egcl_stdlib::effective_slots(class) {
-                if let Ok(sv) = egcl_stdlib::slot_value(*val, slot) {
+            for slot_index in 0..plan.shown_slots {
+                let slot = slots[slot_index];
+                if let Ok(value) = egcl_stdlib::slot_value(*val, slot) {
                     out.push_str(" :");
                     out.push_str(&sym_bare_name_rc(slot));
                     out.push(' ');
-                    print_val_inner(sv, out);
+                    print_val_inner(value, out);
                 }
             }
-            PRINT_ESCAPE.with(|c| c.set(prev));
+            if plan.ellipsis { out.push_str(" ..."); }
             out.push(')');
             return;
         }

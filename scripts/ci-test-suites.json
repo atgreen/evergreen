@@ -5,6 +5,7 @@
     "egcl-stdlib:test:princ_binding_gc": [""],
     "egcl-stdlib:test:format_graphic_character": [""],
     "egcl:test:format_graphic_character_cli": [""],
+    "egcl:test:structure_print_controls_cli": [""],
     "egcl:test:print_array_policy_cli": [""],
     "egcl:test:symbol_print_radix_cli": [""],
     "egcl:test:gensym_printer_controls_cli": [""],
