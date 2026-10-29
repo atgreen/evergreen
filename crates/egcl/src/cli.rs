@@ -15053,6 +15053,28 @@ fn reader_symbol_resolver(pkg: Option<&str>, name: &str) -> Option<u32> {
     found.and_then(EgclVal::symbol_index)
 }
 
+/// Share LENGTH/ELT's fill-pointer, displacement and specialized-array rules.
+/// ELT can allocate boxed doubles, so both the source and prior results must
+/// remain precise roots until the complete snapshot reaches the reader.
+fn reader_sequence_elements(sequence: EgclVal) -> Result<Vec<EgclVal>, EgclError> {
+    egcl_rt::rooted!(sequence = sequence);
+    let length = egcl_stdlib::length(*sequence)?;
+    egcl_rt::rooted!(elements = Vec::with_capacity(length));
+    for index in 0..length {
+        elements.push(egcl_stdlib::elt(*sequence, index)?);
+        #[cfg(test)]
+        if index == 0 && reader_sequence_gc_tests::take_armed() {
+            let old_source = *sequence;
+            let old_element = elements[0];
+            egcl_rt::collect_t0_minor()?;
+            reader_sequence_gc_tests::record_relocation(
+                old_source, *sequence, old_element, elements[0],
+            );
+        }
+    }
+    Ok(std::mem::take(&mut *elements))
+}
+
 /// Reader hook: build a `#P"…"` literal as the stdlib's registry-backed pathname
 /// (the representation PATHNAMEP / NAMESTRING / LOAD understand), rather than the
 /// reader's own minimal PATHNAME object which the rest of the system does not
@@ -15314,6 +15336,7 @@ fn read_eval_all_env(source: &str, env: &mut Env) -> Result<EgclVal, EgclError> 
     reader::set_package_resolver(Some(reader_package_resolver));
     reader::set_pathname_constructor(Some(reader_pathname_constructor));
     reader::set_struct_constructor(Some(reader_struct_constructor));
+    reader::set_sequence_elements_hook(Some(reader_sequence_elements));
     egcl_stdlib::format::set_print_object_hook(Some(stdlib_print_object_hook));
     egcl_stdlib::format::set_pprint_dispatch_hook(Some(stdlib_pprint_dispatch_hook));
     egcl_stdlib::format::set_format_apply_hook(Some(stdlib_format_apply_hook));
@@ -51200,3 +51223,6 @@ mod printer_error_gc_tests;
 
 #[cfg(test)]
 mod princ_binding_gc_tests;
+
+#[cfg(test)]
+mod reader_sequence_gc_tests;
