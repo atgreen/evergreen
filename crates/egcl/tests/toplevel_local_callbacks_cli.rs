@@ -36,6 +36,30 @@ const DEFINITIONS: &str = r#"
 (defun callback-control ()
   (flet ((helper (value) (1+ value)))
     (lambda (value) (helper value))))
+;; Fresh private names must stop changing after the actual boxing bailout.
+(defmacro fresh-boxing-callback ()
+  (let ((offset (gensym "PRIVATE-CALLBACK-OFFSET")))
+    `(let ((,offset 40))
+       (flet ((helper (value) (+ ,offset value)))
+         (let ((callback (lambda (value) (helper value))))
+           (setq ,offset 41)
+           callback)))))
+(setf (gethash 'fresh-gensym *callbacks*) (fresh-boxing-callback))
+(symbol-macrolet ((offset 700))
+  (let ((offset 40))
+    (flet ((helper (value) (+ offset value)))
+      (register-callback shadowed-symbol-macro (value) (helper value)))))
+(defvar *callback-special* 7)
+(let ((*callback-special* 40))
+  (flet ((helper (value) (+ *callback-special* value)))
+    (declare (special *callback-special*))
+    (register-callback declared-special (value) (helper value))))
+;; Keep compile-file's phase processing in charge of definition availability.
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defmacro phase-local-callback () '(lambda (value) (helper value))))
+(flet ((helper (value) (+ value 19)))
+  (setf (gethash 'phase-order *callbacks*) (phase-local-callback)))
+
 "#;
 
 const CHECKS: &str = r#"
@@ -55,6 +79,11 @@ const CHECKS: &str = r#"
 (dotimes (i 100)
   (assert (equal (funcall (gethash 'push *callbacks*) i :reg) (list i :reg 80 6)))
   (assert (= (funcall (gethash 'hidden-capture *callbacks*) i) (+ i 41))))
+(assert (= (funcall (gethash 'fresh-gensym *callbacks*) 2) 43))
+(assert (= (funcall (gethash 'shadowed-symbol-macro *callbacks*) 2) 42))
+(assert (= (funcall (gethash 'declared-special *callbacks*) 2) 9))
+(assert (= (funcall (gethash 'phase-order *callbacks*) 2) 21))
+
 "#;
 
 fn run(program: &str, stress: bool) -> String {
