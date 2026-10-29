@@ -7,6 +7,9 @@
 - `*PRINT-CIRCLE*` preserves shared arrays and uninterned symbols, and prints
   cycles through vectors and multidimensional arrays without runaway expansion
   ([#822](https://github.com/atgreen/evergreen/pull/822)).
+- `PRIN1`, `PRINC`, and `PRINT` signal `PROGRAM-ERROR` for excess arguments
+  consistently across interpreted and compiled calls
+  ([#825](https://github.com/atgreen/evergreen/pull/825)).
 
 - Functions preserve definition-site local functions and `SPECIAL` declaration
   scope across evaluation, tiered calls, and saved images. Undefined function
