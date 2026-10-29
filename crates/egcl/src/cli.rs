@@ -6429,7 +6429,12 @@ fn funcallable_instance_function(v: EgclVal) -> Option<EgclVal> {
 /// of FUNCTION; ansi-test's universe.lsp asserts exactly that before any
 /// chapter can load.
 fn is_generic_function_value(v: EgclVal) -> bool {
-    generic_wrapper_name(v).is_some()
+    if v.is_meta_handle() {
+        return egcl_stdlib::clos::is_generic_function_object(v);
+    }
+    // The object-owned source identity distinguishes a reified generic wrapper
+    // from an ordinary compiled/interpreted callable without reading its cell.
+    generic_wrapper_name(reified_closure(v).unwrap_or(v)).is_some()
 }
 
 fn is_function_value(v: EgclVal) -> bool {
@@ -6469,6 +6474,37 @@ fn is_function_value(v: EgclVal) -> bool {
         return true;
     }
     false
+}
+
+/// Ordinary function representations use EGCL's compiled-function type policy.
+/// Generic functions and funcallable CLOS instances instead retain their actual
+/// class types, neither of which is a subtype of COMPILED-FUNCTION.
+fn is_compiled_function_value(v: EgclVal) -> bool {
+    !egcl_stdlib::is_instance(v) && !is_generic_function_value(v) && is_function_value(v)
+}
+
+/// The physical closure representation must not determine semantic membership.
+/// Used both before and after DEFTYPE expansion; unknown names still reach the
+/// ordinary class/type machinery rather than rejecting a custom callable class.
+fn callable_type_matches(object: EgclVal, name: &str) -> Option<bool> {
+    egcl_rt::rooted!(object = object);
+    if !is_function_value(*object) && !is_generic_function_value(*object) {
+        return None;
+    }
+    Some(match name {
+        "T" | "ATOM" | "FUNCTION" => true,
+        "COMPILED-FUNCTION" => is_compiled_function_value(*object),
+        "GENERIC-FUNCTION" | "STANDARD-GENERIC-FUNCTION" => is_generic_function_value(*object),
+        "STANDARD-OBJECT" | "FUNCALLABLE-STANDARD-OBJECT" => {
+            egcl_rt::rooted!(expected = resolve_sym(name).and_then(egcl_stdlib::find_class)?);
+            let actual = class_of_value(*object);
+            egcl_stdlib::compute_class_precedence_list(actual)
+                .ok()?
+                .contains(&*expected)
+        }
+        "CONS" | "LIST" => false,
+        _ => return None,
+    })
 }
 
 /// True iff `v` is the interpreter closure representation `(EGCL::CLOSURE . id)`
@@ -8336,7 +8372,8 @@ fn builtin_type_specializer_distance(name: &str, arg: EgclVal) -> Option<usize> 
         // FUNCTION class — and must NOT match CONS/LIST, else cl-ppcre's
         // `(create-scanner (scanner function))` method was skipped and a scanner
         // closure fell through to the `(parse-tree t)` method (bliss-5ir).
-        "FUNCTION" | "COMPILED-FUNCTION" => is_function_value(arg).then_some(3),
+        "FUNCTION" => is_function_value(arg).then_some(3),
+        "COMPILED-FUNCTION" => is_compiled_function_value(arg).then_some(3),
         "STANDARD-GENERIC-FUNCTION" => is_generic_function_value(arg).then_some(1),
         "GENERIC-FUNCTION" => is_generic_function_value(arg).then_some(2),
         // Method objects, readtables and the numeric leaf types, so a method
@@ -17876,6 +17913,8 @@ fn class_of_value(object: EgclVal) -> EgclVal {
         } else {
             "BUILT-IN-CLASS"
         }
+    } else if egcl_stdlib::is_instance(object) {
+        return egcl_stdlib::class_of(object);
     } else if egcl_stdlib::clos::is_method_object(object) {
         "STANDARD-METHOD"
     } else if egcl_stdlib::clos::is_generic_function_object(object) || is_generic_function_value(object)
@@ -18783,7 +18822,7 @@ fn parse_not_type(t: EgclVal) -> Option<EgclVal> {
 /// used elsewhere has false positives (every character satisfies its
 /// STANDARD-CHAR arm, which is untrue of `#\Null`), so it is not reused here.
 fn member_of_type_subtypep(t1: EgclVal, t2: EgclVal) -> Option<(bool, bool)> {
-    let elems = parse_member_type(t1)?;
+    egcl_rt::rooted!(elems = parse_member_type(t1)?);
     // The empty MEMBER type is the empty type, a subtype of everything.
     if elems.is_empty() {
         return Some((true, true));
@@ -18809,6 +18848,9 @@ fn member_of_type_subtypep(t1: EgclVal, t2: EgclVal) -> Option<(bool, bool)> {
             "CONS" => v.is_cons() && !is_function_value(v),
             "LIST" => v.is_list() && !is_function_value(v),
             "FUNCTION" => is_function_value(v),
+            "COMPILED-FUNCTION" => is_compiled_function_value(v),
+            "GENERIC-FUNCTION" | "STANDARD-GENERIC-FUNCTION" => is_generic_function_value(v),
+            "STANDARD-OBJECT" => callable_type_matches(v, "STANDARD-OBJECT")?,
             "STRING" => is_string_value(v),
             // Anything else -- STANDARD-CHAR, BASE-CHAR, FIXNUM, the array
             // types -- is not decided here rather than decided wrongly.
@@ -18816,8 +18858,8 @@ fn member_of_type_subtypep(t1: EgclVal, t2: EgclVal) -> Option<(bool, bool)> {
         })
     };
     let mut all = true;
-    for e in elems {
-        match exact(e) {
+    for index in 0..elems.len() {
+        match exact(elems[index]) {
             Some(true) => {}
             Some(false) => all = false,
             None => return None,
@@ -19389,30 +19431,19 @@ fn typep_matches(
                 "T" | "ATOM" | "METHOD" | "STANDARD-METHOD" | "STANDARD-OBJECT"
             ));
         }
-        if egcl_stdlib::clos::is_generic_function_object(object) {
-            return Ok(matches!(
-                sym_bare_name_rc(type_spec).as_ref(),
-                "T" | "ATOM"
-                    | "FUNCTION"
-                    | "GENERIC-FUNCTION"
-                    | "STANDARD-GENERIC-FUNCTION"
-                    | "FUNCALLABLE-STANDARD-OBJECT"
-                    | "STANDARD-OBJECT"
-            ));
+        if egcl_stdlib::clos::is_generic_function_object(object)
+            && let Some(matches) = callable_type_matches(object, sym_bare_name_rc(type_spec).as_ref())
+        {
+            return Ok(matches);
         }
     }
     // A closure's physical cons representation must not enter the CLOS
     // instance/class-of path below, where it would inherit CONS and LIST.
     // Resolve only unknown names later so DEFTYPE aliases still work.
-    if type_spec.is_symbol() && is_function_value(object) {
-        match sym_bare_name_rc(type_spec).as_ref() {
-            "T" | "ATOM" | "FUNCTION" | "COMPILED-FUNCTION" => return Ok(true),
-            "GENERIC-FUNCTION" | "STANDARD-GENERIC-FUNCTION" => {
-                return Ok(is_generic_function_value(object))
-            }
-            "CONS" | "LIST" => return Ok(false),
-            _ => {}
-        }
+    if type_spec.is_symbol()
+        && let Some(matches) = callable_type_matches(object, sym_bare_name_rc(type_spec).as_ref())
+    {
+        return Ok(matches);
     }
     // A CLOS instance matches any type name in its class precedence list,
     // regardless of a same-bare-name DEFTYPE in another package: a class name IS
@@ -19469,14 +19500,8 @@ fn typep_matches(
         // Common Lisp type is FUNCTION (and therefore ATOM), never CONS or
         // LIST.  Handle them before the generic CLOS/class-of route, which can
         // otherwise observe their representation and report the cons classes.
-        if is_function_value(object) {
-            return Ok(match type_name.as_ref() {
-                "T" | "ATOM" | "FUNCTION" | "COMPILED-FUNCTION" => true,
-                "GENERIC-FUNCTION" | "STANDARD-GENERIC-FUNCTION" => {
-                    is_generic_function_value(object)
-                }
-                _ => false,
-            });
+        if let Some(matches) = callable_type_matches(object, type_name.as_ref()) {
+            return Ok(matches);
         }
         // A class metaobject tested against a metaclass type. egcl represents a
         // user/struct class as its name symbol, so `(find-class 'foo)` is that
@@ -19635,7 +19660,8 @@ fn typep_matches(
             "BASE-CHAR" => is_base_char_value(object),
             "EXTENDED-CHAR" => object.is_character() && !is_base_char_value(object),
             "BOOLEAN" => object.is_nil() || object == T,
-            "FUNCTION" | "COMPILED-FUNCTION" => is_function_value(object),
+            "FUNCTION" => is_function_value(object),
+            "COMPILED-FUNCTION" => is_compiled_function_value(object),
             "GENERIC-FUNCTION" | "STANDARD-GENERIC-FUNCTION" => is_generic_function_value(object),
             "PACKAGE" => is_package_value(env, object),
             "HASH-TABLE" => egcl_stdlib::hash_table_count(object).is_ok(),
@@ -21132,7 +21158,8 @@ fn value_satisfies_declared_type(type_form: EgclVal, value: EgclVal) -> Result<b
         // would wrongly reject it. babel's string-to-octets funcalls through
         // `(the function (encoder mapping))`, where the encoder is exactly such
         // a closure.
-        "FUNCTION" | "COMPILED-FUNCTION" => is_function_value(value),
+        "FUNCTION" => is_function_value(value),
+        "COMPILED-FUNCTION" => is_compiled_function_value(value),
         "GENERIC-FUNCTION" | "STANDARD-GENERIC-FUNCTION" => is_generic_function_value(value),
         "CONS" => value.is_cons() && !is_function_value(value),
         "ATOM" => !value.is_cons() || is_function_value(value),
@@ -51229,3 +51256,6 @@ mod reader_sequence_gc_tests;
 
 #[cfg(test)]
 mod class_identity_tests;
+
+#[cfg(test)]
+mod generic_function_type_tests;
