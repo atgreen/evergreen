@@ -165,7 +165,9 @@ pub const IMAGE_MAGIC: u64 = u64::from_be_bytes(*b"EGCLIMG\0");
 // conflate user lists with random states, so require rebuilding the image.
 // Version 14 adds NIL-element storage; older readers cannot distinguish its
 // length-only payload from other specialized arrays. Rebuild older images.
-const FORMAT_VERSION: u32 = 14;
+// Version 15 stores live method class-specializer identities in the CLI host
+// registry. Older readers skip its subsection and would lose saved methods.
+const FORMAT_VERSION: u32 = 15;
 
 /// Image file header (128 bytes). D7.01.
 #[derive(Clone, Copy)]
