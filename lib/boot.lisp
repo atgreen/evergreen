@@ -581,6 +581,14 @@
 (defmethod make-load-form ((object structure-object) &optional environment)
   (declare (ignore environment))
   (error "MAKE-LOAD-FORM: no method has been defined for ~S" object))
+(defmethod make-load-form ((object class) &optional environment)
+  (declare (ignore environment))
+  ;; A name is proper only while it denotes this exact class. Reject stale or
+  ;; unregistered metaobjects instead of reconstructing an unrelated class.
+  (let ((name (class-name object)))
+    (unless (and (symbolp name) (eq (find-class name nil) object))
+      (error "MAKE-LOAD-FORM: the class ~S has no proper name" object))
+    `(find-class ',name)))
 (defmethod make-load-form ((object condition) &optional environment)
   (declare (ignore environment))
   (error "MAKE-LOAD-FORM: no method has been defined for ~S" object))

@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- Compiled class literals preserve their named class identity, and dependent
+  load-form objects initialize in the required order
+  ([#818](https://github.com/atgreen/evergreen/pull/818)).
+
 - Recursive reader operands skip reader macros that return no values, so
   feature conditionals work beneath quote, backquote, and dispatch literals
   ([#815](https://github.com/atgreen/evergreen/pull/815)).
