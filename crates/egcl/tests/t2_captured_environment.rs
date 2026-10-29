@@ -198,9 +198,18 @@ fn shared_template_feedback_preserves_numeric_phase_recovery() {
             .and_then(|count| count.parse().ok())
             .expect("deopt count");
         assert!((1..80).contains(&deopts), "{deopts}: {trace}");
-        assert_eq!(trace.lines().filter(|line| is_closure_t2_publication(line)).count(), 2,
-            "the stale version must recover through native recompilation: {trace}");
-        assert!(trace.contains("<flet-closure>: 0 speculatable sites"), "{trace}");
+        assert_eq!(
+            trace
+                .lines()
+                .filter(|line| is_closure_t2_publication(line))
+                .count(),
+            2,
+            "the stale version must recover through native recompilation: {trace}"
+        );
+        assert!(
+            trace.contains("<flet-closure>: 0 speculatable sites"),
+            "{trace}"
+        );
         return;
     }
     assert!(

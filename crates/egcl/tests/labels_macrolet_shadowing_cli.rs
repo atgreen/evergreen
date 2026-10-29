@@ -50,7 +50,13 @@ fn labels_functions_see_their_own_scope_under_an_inner_macrolet() {
     );
     for tier in ["interp", "t0", "t1", "t2"] {
         let stdout = run(tier, &program);
-        assert!(stdout.contains(&format!("EVAL {EXPECTED}")), "{tier}: {stdout}");
-        assert!(stdout.contains(&format!("DEFUN {EXPECTED}")), "{tier}: {stdout}");
+        assert!(
+            stdout.contains(&format!("EVAL {EXPECTED}")),
+            "{tier}: {stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("DEFUN {EXPECTED}")),
+            "{tier}: {stdout}"
+        );
     }
 }

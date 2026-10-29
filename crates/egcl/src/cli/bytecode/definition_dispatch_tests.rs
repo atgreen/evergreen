@@ -16,16 +16,17 @@ fn replaced_values_roots_its_argument_through_a_moving_collection() {
     egcl_rt::rooted!(params = reader::read_from_string("(x)").unwrap().0);
     egcl_rt::rooted!(forms = reader::read_from_string("((values x))").unwrap().0);
     let caller = Arc::new(
-        compile_function("MOVING-VALUES-CALLER", *params, *forms, &env, false, false)
-            .unwrap(),
+        compile_function("MOVING-VALUES-CALLER", *params, *forms, &env, false, false).unwrap(),
     );
     egcl_rt::rooted!(_caller = ActiveBytecodeRoot::new(&caller));
-    egcl_rt::rooted!(replacement_body = reader::read_from_string(
-        "((%force-minor-gc-for-test) x)"
-    ).unwrap().0);
-    egcl_rt::rooted!(replacement = egcl_rt::function::alloc_interpreted(
-        *params, *replacement_body, NIL, *name
-    ));
+    egcl_rt::rooted!(
+        replacement_body = reader::read_from_string("((%force-minor-gc-for-test) x)")
+            .unwrap()
+            .0
+    );
+    egcl_rt::rooted!(
+        replacement = egcl_rt::function::alloc_interpreted(*params, *replacement_body, NIL, *name)
+    );
     egcl_rt::symbols::set_symbol_function(symbol, *replacement);
     // Allocate last so the replacement's forced collection must move the
     // argument held by the ordinary call path selected from SetValues.

@@ -2,14 +2,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
 //! Tests for egcl-stdlib conditions module (spec §5.4).
+use egcl_rt::value::{EgclVal, NIL};
+use egcl_rt::{EgclError, FrameType, current_stack};
+use egcl_stdlib::conditions::*;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
-use egcl_rt::value::{NIL, EgclVal};
-use egcl_rt::{FrameType, EgclError, current_stack};
-use egcl_stdlib::conditions::*;
 
 fn sym(i: u32) -> EgclVal {
     EgclVal::from_symbol_index(i)

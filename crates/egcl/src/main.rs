@@ -109,14 +109,12 @@ mod tcache {
     /// The process-wide key whose destructor flushes an exiting thread's cache,
     /// or `None` if the key table was full.
     fn flush_key() -> Option<libc::pthread_key_t> {
-        static KEY: std::sync::OnceLock<Option<libc::pthread_key_t>> =
-            std::sync::OnceLock::new();
+        static KEY: std::sync::OnceLock<Option<libc::pthread_key_t>> = std::sync::OnceLock::new();
         *KEY.get_or_init(|| {
             let mut key: libc::pthread_key_t = 0;
             // SAFETY: `key` is a valid out-pointer and `flush_on_exit` has the
             // destructor signature. musl allocates no memory here.
-            (unsafe { libc::pthread_key_create(&mut key, Some(flush_on_exit)) } == 0)
-                .then_some(key)
+            (unsafe { libc::pthread_key_create(&mut key, Some(flush_on_exit)) } == 0).then_some(key)
         })
     }
 

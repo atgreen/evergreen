@@ -120,12 +120,7 @@ pub fn compare(args: &[EgclVal], key: CharKey, cmp: CharCmp) -> Result<bool, Cha
 /// Correct for `Ne` as well -- with exactly two arguments "pairwise distinct"
 /// and "adjacent pair differs" coincide.
 #[inline]
-pub fn compare2(
-    a: EgclVal,
-    b: EgclVal,
-    key: CharKey,
-    cmp: CharCmp,
-) -> Result<bool, CharCmpError> {
+pub fn compare2(a: EgclVal, b: EgclVal, key: CharKey, cmp: CharCmp) -> Result<bool, CharCmpError> {
     let ka = char_key(a, key)?;
     let kb = char_key(b, key)?;
     Ok(ordered(ka, kb, cmp))
@@ -135,11 +130,7 @@ pub fn compare2(
 #[inline]
 fn single(mut it: impl Iterator<Item = char>) -> Option<char> {
     let c = it.next()?;
-    if it.next().is_some() {
-        None
-    } else {
-        Some(c)
-    }
+    if it.next().is_some() { None } else { Some(c) }
 }
 
 /// Characters Unicode gives case mappings to that are not letters: the Roman

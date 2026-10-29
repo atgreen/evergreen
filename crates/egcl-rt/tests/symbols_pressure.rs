@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
-use egcl_rt::{init_heap, GcConfig};
+use egcl_rt::{GcConfig, init_heap};
 
 #[test]
 fn symbol_allocation_collects_before_reporting_exhaustion() {

@@ -22,7 +22,11 @@ use std::time::{Duration, Instant};
 fn run(program: &str, limit: u64) -> (String, String, bool, Duration) {
     let started = Instant::now();
     let output = Command::new("timeout")
-        .args(["--kill-after=10", &limit.to_string(), env!("CARGO_BIN_EXE_egcl")])
+        .args([
+            "--kill-after=10",
+            &limit.to_string(),
+            env!("CARGO_BIN_EXE_egcl"),
+        ])
         .args(["--no-init", "--eval", program])
         .env("EGCL_HEAP_SIZE", "256m")
         .output()

@@ -144,8 +144,14 @@ pub(crate) fn admit_string_char_calls(f: &mut Function, calls: &HashSet<Inst>) {
                 aux: AuxData::None,
                 flags: InstFlags::default(),
                 targets: vec![
-                    BlockCall { block: fast, args: vec![] },
-                    BlockCall { block: slow, args: vec![] },
+                    BlockCall {
+                        block: fast,
+                        args: vec![],
+                    },
+                    BlockCall {
+                        block: slow,
+                        args: vec![],
+                    },
                 ],
                 frame_state: None,
                 source_pos,
@@ -183,7 +189,10 @@ pub(crate) fn admit_string_char_calls(f: &mut Function, calls: &HashSet<Inst>) {
                 results: vec![],
                 aux: AuxData::None,
                 flags: InstFlags::default(),
-                targets: vec![BlockCall { block: join, args: vec![value] }],
+                targets: vec![BlockCall {
+                    block: join,
+                    args: vec![value],
+                }],
                 frame_state: None,
                 source_pos,
             },
@@ -253,7 +262,10 @@ mod tests {
         vec![
             Instr::LoadLocal(0),
             Instr::LoadLocal(1),
-            Instr::CallNamed { sym: egcl_rt::symbols::intern(name), nargs: 2 },
+            Instr::CallNamed {
+                sym: egcl_rt::symbols::intern(name),
+                nargs: 2,
+            },
             Instr::Return,
         ]
     }
@@ -264,17 +276,38 @@ mod tests {
             let f = build_from_bytecode(&body(accessor_call(name), 2)).expect("builds");
             super::super::verify::verify(&f).expect("split IR verifies");
             assert_eq!(count(&f, Opcode::StringCharOrNil), 1, "{name}");
-            assert_eq!(count(&f, Opcode::Call), 1, "{name}: the slow arm keeps the call");
+            assert_eq!(
+                count(&f, Opcode::Call),
+                1,
+                "{name}: the slow arm keeps the call"
+            );
             assert_eq!(count(&f, Opcode::Return), 2, "{name}: both arms return");
-            assert_eq!(count(&f, Opcode::ClearMv), 1, "{name}: the fast arm resets values");
+            assert_eq!(
+                count(&f, Opcode::ClearMv),
+                1,
+                "{name}: the fast arm resets values"
+            );
             // Emission maps every reset as a runtime-helper safepoint.
-            let reset = f.block_order().iter().flat_map(|&b| f.block(b).insts.iter())
-                .map(|&inst| f.inst(inst)).find(|data| data.opcode == Opcode::ClearMv).unwrap();
+            let reset = f
+                .block_order()
+                .iter()
+                .flat_map(|&b| f.block(b).insts.iter())
+                .map(|&inst| f.inst(inst))
+                .find(|data| data.opcode == Opcode::ClearMv)
+                .unwrap();
             assert!(reset.flags.call && reset.flags.safepoint && reset.frame_state.is_some());
             // The call is still immediately returned, with its frame state.
-            let block = f.block_order().iter().copied().find(|&block| {
-                f.block(block).insts.iter().any(|&inst| f.inst(inst).opcode == Opcode::Call)
-            }).unwrap();
+            let block = f
+                .block_order()
+                .iter()
+                .copied()
+                .find(|&block| {
+                    f.block(block)
+                        .insts
+                        .iter()
+                        .any(|&inst| f.inst(inst).opcode == Opcode::Call)
+                })
+                .unwrap();
             let insts = &f.block(block).insts;
             let call = f.inst(insts[0]);
             assert!(call.frame_state.is_some());
@@ -289,18 +322,33 @@ mod tests {
         code.pop();
         code.extend([
             Instr::LoadLocal(0),
-            Instr::CallNamed { sym: egcl_rt::symbols::intern("EQ"), nargs: 2 },
+            Instr::CallNamed {
+                sym: egcl_rt::symbols::intern("EQ"),
+                nargs: 2,
+            },
             Instr::Return,
         ]);
         let f = build_from_bytecode(&body(code, 2)).expect("builds");
         super::super::verify::verify(&f).expect("split IR verifies");
         assert_eq!(count(&f, Opcode::StringCharOrNil), 1);
-        assert_eq!(count(&f, Opcode::Return), 1, "the rest of the block runs once, in the join");
-        let join = f.block_order().iter().copied()
+        assert_eq!(
+            count(&f, Opcode::Return),
+            1,
+            "the rest of the block runs once, in the join"
+        );
+        let join = f
+            .block_order()
+            .iter()
+            .copied()
             .find(|&block| f.block(block).params.len() == 1 && block != f.entry())
             .expect("a join with the accessor's value");
-        let eq = f.block(join).insts.iter().map(|&inst| f.inst(inst))
-            .find(|data| data.opcode == Opcode::GenericEq).expect("EQ reads the join");
+        let eq = f
+            .block(join)
+            .insts
+            .iter()
+            .map(|&inst| f.inst(inst))
+            .find(|data| data.opcode == Opcode::GenericEq)
+            .expect("EQ reads the join");
         assert_eq!(eq.args[0], f.block(join).params[0]);
     }
 
@@ -309,7 +357,11 @@ mod tests {
         let options = InlineOptions::default().with_policy(2, InlinePolicy::NotInline);
         let f = build_from_bytecode_with_inline_options(&body(accessor_call("CHAR"), 2), options)
             .expect("builds");
-        assert_eq!(count(&f, Opcode::StringCharOrNil), 0, "NOTINLINE keeps the call");
+        assert_eq!(
+            count(&f, Opcode::StringCharOrNil),
+            0,
+            "NOTINLINE keeps the call"
+        );
         for name in ["STRING-CHAR-PROBE::CHAR", "AREF", "CHAR-CODE"] {
             let f = build_from_bytecode(&body(accessor_call(name), 2)).expect("builds");
             assert_eq!(count(&f, Opcode::StringCharOrNil), 0, "{name}");
@@ -318,7 +370,10 @@ mod tests {
         // Another arity is a different (erroneous) call; leave it alone.
         let one = vec![
             Instr::LoadLocal(0),
-            Instr::CallNamed { sym: egcl_rt::symbols::intern("CHAR"), nargs: 1 },
+            Instr::CallNamed {
+                sym: egcl_rt::symbols::intern("CHAR"),
+                nargs: 1,
+            },
             Instr::Return,
         ];
         let f = build_from_bytecode(&body(one, 1)).expect("builds");

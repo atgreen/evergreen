@@ -19,7 +19,7 @@
 use crate::error::EgclError;
 use crate::lock_order::{LockLevel, OrderedRwLock};
 use crate::object::{ObjectHeader, PackageData, type_id};
-use crate::value::{NIL, EgclVal};
+use crate::value::{EgclVal, NIL};
 use std::collections::HashMap;
 
 /// `PackageData` payload size: name + internal + external + use_list + nicknames

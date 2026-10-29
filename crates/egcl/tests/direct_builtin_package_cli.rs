@@ -66,7 +66,10 @@ fn compiled_calls_reach_another_packages_generic_length_and_first() {
         "CL-LENGTH 3",
         "CL-FIRST 1",
     ] {
-        assert!(stdout.contains(expected), "missing {expected:?} in:\n{stdout}");
+        assert!(
+            stdout.contains(expected),
+            "missing {expected:?} in:\n{stdout}"
+        );
     }
 }
 

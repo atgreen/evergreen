@@ -38,7 +38,9 @@ fn run(exe: &str, args: &[&str]) -> Output {
 /// Where a saved executable's core lies inside it: the `egcl/core` member of
 /// the zip archive after the runtime.
 fn core_extent(bytes: &[u8]) -> (usize, usize) {
-    let archive = egcl_rt::container::read(bytes).unwrap().expect("executable archive");
+    let archive = egcl_rt::container::read(bytes)
+        .unwrap()
+        .expect("executable archive");
     let core = archive.core().unwrap().expect("egcl/core member");
     (core.data_offset as usize, core.size as usize)
 }

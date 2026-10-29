@@ -76,7 +76,8 @@ fn initial(form: EgclVal) -> Initial {
     let immediate = |value: EgclVal| {
         value.is_fixnum() || value.is_character() || value.is_single_float() || value.is_symbol()
     };
-    if form.is_fixnum() || form.is_character() || form.is_single_float() || form == NIL || form == T {
+    if form.is_fixnum() || form.is_character() || form.is_single_float() || form == NIL || form == T
+    {
         return Initial::Constant(form);
     }
     if form.is_symbol() {
@@ -89,7 +90,8 @@ fn initial(form: EgclVal) -> Initial {
     }
     if form.is_cons() {
         let (head, tail) = cp(form);
-        if head.is_symbol() && super::super::sym_name_rc(head).as_ref() == "QUOTE" && tail.is_cons() {
+        if head.is_symbol() && super::super::sym_name_rc(head).as_ref() == "QUOTE" && tail.is_cons()
+        {
             let (quoted, end) = cp(tail);
             if end == NIL && immediate(quoted) {
                 return Initial::Constant(quoted);
@@ -192,8 +194,10 @@ impl VariadicPlan {
                     }
                     let (bare, _, form, supplied) = super::super::parse_key_spec(element);
                     let keys = plan.keys.as_mut()?;
-                    if bare.is_empty() || bare == "ALLOW-OTHER-KEYS"
-                        || keys.iter().any(|key| key.bare == bare) || keys.len() == MAX_KEYS
+                    if bare.is_empty()
+                        || bare == "ALLOW-OTHER-KEYS"
+                        || keys.iter().any(|key| key.bare == bare)
+                        || keys.len() == MAX_KEYS
                     {
                         return None;
                     }
@@ -217,7 +221,10 @@ impl VariadicPlan {
         }
         // A dotted lambda list, or one whose variables the compiler laid out
         // differently, stays with the general binder.
-        if cursor != NIL || mode == Mode::Rest && !plan.rest || plan.values != func.param_layout.len() {
+        if cursor != NIL
+            || mode == Mode::Rest && !plan.rest
+            || plan.values != func.param_layout.len()
+        {
             return None;
         }
         Some(plan)
@@ -240,7 +247,8 @@ impl VariadicPlan {
             return false;
         }
         let positional = self.required + self.optionals.len();
-        if args.len() < self.required || args.len() > usize::from(u16::MAX)
+        if args.len() < self.required
+            || args.len() > usize::from(u16::MAX)
             || self.keys.is_none() && !self.rest && args.len() > positional
         {
             return false;
@@ -260,7 +268,10 @@ impl VariadicPlan {
                 if !key.is_symbol() {
                     return false;
                 }
-                let index = match keys.iter().position(|spec| spec.seen.load(Ordering::Relaxed) == key.0) {
+                let index = match keys
+                    .iter()
+                    .position(|spec| spec.seen.load(Ordering::Relaxed) == key.0)
+                {
                     Some(index) => Some(index),
                     None => {
                         let bare = super::super::key_bare(key);
@@ -295,7 +306,11 @@ impl VariadicPlan {
                 return false;
             }
         }
-        if self.aux.iter().any(|initial| matches!(initial, Initial::Form)) {
+        if self
+            .aux
+            .iter()
+            .any(|initial| matches!(initial, Initial::Form))
+        {
             return false;
         }
 
@@ -340,7 +355,9 @@ impl VariadicPlan {
                     }
                 }
                 None => {
-                    let Initial::Constant(value) = optional.initial else { unreachable!() };
+                    let Initial::Constant(value) = optional.initial else {
+                        unreachable!()
+                    };
                     push(value);
                     if optional.supplied_p {
                         push(NIL);
@@ -358,7 +375,9 @@ impl VariadicPlan {
                     push(T);
                 }
             } else {
-                let Initial::Constant(value) = key.initial else { unreachable!() };
+                let Initial::Constant(value) = key.initial else {
+                    unreachable!()
+                };
                 push(value);
                 if key.supplied_p {
                     push(NIL);
@@ -366,7 +385,9 @@ impl VariadicPlan {
             }
         }
         for initial in &self.aux {
-            let Initial::Constant(value) = *initial else { unreachable!() };
+            let Initial::Constant(value) = *initial else {
+                unreachable!()
+            };
             push(value);
         }
         debug_assert_eq!(at, self.values);
@@ -416,7 +437,12 @@ impl VariadicPlan {
     /// by the symbol `bind` last matched, so it takes no lock, allocates
     /// nothing and cannot collect, signal or panic. Every call it declines,
     /// the general binder handles, and teaches it the keywords used.
-    fn bind_native(&self, args: impl Fn(usize) -> EgclVal, count: usize, out: &mut [EgclVal]) -> bool {
+    fn bind_native(
+        &self,
+        args: impl Fn(usize) -> EgclVal,
+        count: usize,
+        out: &mut [EgclVal],
+    ) -> bool {
         let Some(keys) = &self.keys else { return false };
         let positional = self.required + self.optionals.len();
         if count < self.required || out.len() != self.values {
@@ -436,7 +462,9 @@ impl VariadicPlan {
             let key = args(at);
             // `:allow-other-keys` and an unknown keyword never match a cached
             // spec; the general binder decides what they mean.
-            let index = keys.iter().position(|spec| key.is_symbol() && spec.seen.load(Ordering::Relaxed) == key.0);
+            let index = keys
+                .iter()
+                .position(|spec| key.is_symbol() && spec.seen.load(Ordering::Relaxed) == key.0);
             let Some(index) = index else { return false };
             // The first occurrence of a keyword supplies it (CLHS 3.4.1.4).
             if supplied & (1 << index) == 0 {
@@ -453,23 +481,37 @@ impl VariadicPlan {
             push(args(index));
         }
         for (index, optional) in self.optionals.iter().enumerate() {
-            let Initial::Constant(initial) = optional.initial else { return false };
+            let Initial::Constant(initial) = optional.initial else {
+                return false;
+            };
             let given = self.required + index < count;
-            push(if given { args(self.required + index) } else { initial });
+            push(if given {
+                args(self.required + index)
+            } else {
+                initial
+            });
             if optional.supplied_p {
                 push(if given { T } else { NIL });
             }
         }
         for (index, key) in keys.iter().enumerate() {
-            let Initial::Constant(initial) = key.initial else { return false };
+            let Initial::Constant(initial) = key.initial else {
+                return false;
+            };
             let given = supplied & (1 << index) != 0;
-            push(if given { args(key_values[index]) } else { initial });
+            push(if given {
+                args(key_values[index])
+            } else {
+                initial
+            });
             if key.supplied_p {
                 push(if given { T } else { NIL });
             }
         }
         for initial in &self.aux {
-            let Initial::Constant(initial) = *initial else { return false };
+            let Initial::Constant(initial) = *initial else {
+                return false;
+            };
             push(initial);
         }
         at == self.values
@@ -498,7 +540,11 @@ pub(super) unsafe extern "C" fn native_keyword_bind(
     }
     let plan = unsafe { &*plan };
     let args = |index: usize| unsafe {
-        if index < 3 { *registers.add(index) } else { *overflow.add(index - 3) }
+        if index < 3 {
+            *registers.add(index)
+        } else {
+            *overflow.add(index - 3)
+        }
     };
     let out = unsafe { std::slice::from_raw_parts_mut(out, plan.values) };
     u64::from(plan.bind_native(args, count, out))

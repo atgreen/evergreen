@@ -55,7 +55,10 @@ fn finished_unjoined_thread_still_joins_once_with_its_value() {
     "#;
     let (ok, stdout, stderr) = run(program);
     assert!(ok, "{stdout}\n{stderr}");
-    assert!(stdout.contains("RECLAIM-SEMANTICS-OK"), "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("RECLAIM-SEMANTICS-OK"),
+        "{stdout}\n{stderr}"
+    );
 }
 
 /// The issue's reproducer shape: batches of threads that finish and are never

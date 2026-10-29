@@ -3,7 +3,7 @@
 #![cfg(all(target_arch = "x86_64", target_os = "linux"))]
 
 use egcl_compiler::t2::native_transfer::{
-    emit_ordinary_published_veneer, OrdinaryHelperOutcome, SysvTransferCapture,
+    OrdinaryHelperOutcome, SysvTransferCapture, emit_ordinary_published_veneer,
 };
 use egcl_rt::native_transfer::{NativeExit, NativeOutcome, NativeReturnValues};
 use egcl_rt::{jit::JitBuffer, value::EgclVal};
@@ -108,7 +108,7 @@ fn published_ordinary_veneer_restores_roots_and_complete_return_tuple() {
     }
 }
 
-use egcl_compiler::t2::native_transfer::{emit_ordinary_arity_veneer, OrdinaryArityRequest};
+use egcl_compiler::t2::native_transfer::{OrdinaryArityRequest, emit_ordinary_arity_veneer};
 
 unsafe extern "C" fn arity_helper(
     request: *mut u8,

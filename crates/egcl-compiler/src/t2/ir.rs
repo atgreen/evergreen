@@ -506,7 +506,10 @@ pub enum AuxData {
     /// Exact absent function-cell binding required by a builtin expansion.
     /// The address points into a pinned symbol; comparison does not dereference
     /// a movable callable. This guard stays ordered with calls and stores.
-    BuiltinBinding { address: usize, expected: u64 },
+    BuiltinBinding {
+        address: usize,
+        expected: u64,
+    },
     CallTarget(u32),
     /// Named dispatch retained by NOTINLINE; no compiler intrinsic/body expansion.
     OpaqueCallTarget(u32),
@@ -526,12 +529,22 @@ pub enum AuxData {
     /// a capturing MakeClosure. The runtime decodes that instruction and applies
     /// it to the executing activation's heap EnvFrame. `value` says whether it
     /// consumes one operand and `result` whether it produces one.
-    LexicalEnvironment { bcp: u32, value: bool, result: bool },
+    LexicalEnvironment {
+        bcp: u32,
+        value: bool,
+        result: bool,
+    },
     /// Binding operation identified by its exact retained bytecode PC. Exit
     /// decodes UnbindSpecial's count there; entry consumes one rooted value.
-    SpecialBinding { bcp: u32, enter: bool },
+    SpecialBinding {
+        bcp: u32,
+        enter: bool,
+    },
     /// Execution-local symbol value access through the published bridge.
-    GlobalValue { symbol: u32, store: bool },
+    GlobalValue {
+        symbol: u32,
+        store: bool,
+    },
     /// Invoke a THROW with rooted tag and primary arguments; no normal result.
     TransferThrow,
     /// Establish/retire a dynamic CATCH binding in the owning activation.
@@ -604,7 +617,10 @@ pub enum AuxData {
     ClassRef(u32),
     /// Distinguish pre-effect and post-effect native poll origins. This is
     /// bookkeeping, not permission to ignore the instruction's FrameState.
-    BoundedPoll { exit: bool, scope: BoundedPollScope },
+    BoundedPoll {
+        exit: bool,
+        scope: BoundedPollScope,
+    },
 }
 
 impl AuxData {
@@ -906,12 +922,17 @@ impl Function {
     pub(crate) fn remove_block_param(&mut self, block: Block, index: usize) -> Value {
         let removed = self.blocks[block.index()].params.remove(index);
         for (num, value) in self.blocks[block.index()].params.iter().enumerate() {
-            self.values[value.index()].def = ValueDef::Param { block, num: num as u16 };
+            self.values[value.index()].def = ValueDef::Param {
+                block,
+                num: num as u16,
+            };
         }
         for source in self.block_order.clone() {
             if let Some(inst) = self.terminator(source) {
                 for edge in &mut self.insts[inst.index()].targets {
-                    if edge.block == block { edge.args.remove(index); }
+                    if edge.block == block {
+                        edge.args.remove(index);
+                    }
                 }
             }
         }
@@ -1112,8 +1133,14 @@ impl Function {
         let data = self.inst(call).clone();
         if data.opcode != Opcode::Call
             || data.frame_state.is_none()
-            || !matches!(data.aux, AuxData::CallTarget(_) | AuxData::OpaqueCallTarget(_) | AuxData::GlobalValue { .. }
-                | AuxData::FunctionLookup(_) | AuxData::ValuesToList)
+            || !matches!(
+                data.aux,
+                AuxData::CallTarget(_)
+                    | AuxData::OpaqueCallTarget(_)
+                    | AuxData::GlobalValue { .. }
+                    | AuxData::FunctionLookup(_)
+                    | AuxData::ValuesToList
+            )
             || !self.block_has_terminator(block)
         {
             return Err("exceptional conversion requires a mapped call in a finished block");
@@ -1182,7 +1209,12 @@ impl Function {
             return Err("callee entry arity does not match call");
         }
 
-        self.double_literals.extend(callee.double_literals.iter().map(|(&slot, &bits)| (slot, bits)));
+        self.double_literals.extend(
+            callee
+                .double_literals
+                .iter()
+                .map(|(&slot, &bits)| (slot, bits)),
+        );
 
         // Split after the call. The old instruction remains in the arena but is
         // no longer in block layout, exactly like other dead IR instructions.

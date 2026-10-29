@@ -58,7 +58,8 @@ fn defstruct_preserves_slot_metadata_across_a_collecting_initializer_expansion()
         VariableInfo::SymbolMacro(EgclVal::from_fixnum(999)),
     );
     egcl_rt::rooted!(environment = environment);
-    let control: u32 = egcl_rt::symbols::make_uninterned("UNOWNED-DEFSTRUCT-CONTROL").as_symbol_index();
+    let control: u32 =
+        egcl_rt::symbols::make_uninterned("UNOWNED-DEFSTRUCT-CONTROL").as_symbol_index();
     // Intern every source symbol/readtable setup before the movement probe,
     // so pinned symbol allocations cannot retain the type's nursery region.
     reader::read_from_string(SOURCE).unwrap();

@@ -4,9 +4,9 @@
 //! Tests for object.rs — ObjectHeader, heap object layouts, GC bits, type IDs,
 //! and struct field layouts.
 
-use std::mem;
 use egcl_rt::object::*;
 use egcl_rt::value::EgclVal;
+use std::mem;
 
 // ── ObjectHeader: new() and field extraction ──────────────────────
 

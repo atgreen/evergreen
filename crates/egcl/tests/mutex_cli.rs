@@ -14,8 +14,7 @@ fn saved_mutex_comes_back_usable_and_unheld() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let path =
-        std::env::temp_dir().join(format!("egcl-mutex-{}-{nonce}.bimg", std::process::id()));
+    let path = std::env::temp_dir().join(format!("egcl-mutex-{}-{nonce}.bimg", std::process::id()));
     let filename = path.to_str().unwrap();
     run(
         &format!(

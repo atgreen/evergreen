@@ -417,10 +417,7 @@ fn prepare_native(
         let builtin_slot = super::super::direct_builtin_slot(callee, usize::from(nargs));
         // What T0 actually observed at this site, if anything yet.
         let fixnum_speculation_ok = !matches!(
-            super::site_speculation_type(
-                bf as *const BytecodeFunction as usize,
-                index as u32,
-            ),
+            super::site_speculation_type(bf as *const BytecodeFunction as usize, index as u32,),
             Some(super::SpecType::SingleFloat | super::SpecType::DoubleFloat)
         );
         let profile = if builtin_slot.is_some() {

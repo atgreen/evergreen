@@ -147,8 +147,8 @@ impl CallbackAdapter {
         };
         #[cfg(windows)]
         let buffer = super::win64::finish(code, frame_bytes as u32, &unwind);
-        let code = buffer
-            .ok_or_else(|| EgclError::FfiError("cannot allocate callback adapter".into()))?;
+        let code =
+            buffer.ok_or_else(|| EgclError::FfiError("cannot allocate callback adapter".into()))?;
         Ok(Self { code })
     }
 

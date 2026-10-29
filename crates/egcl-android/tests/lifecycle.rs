@@ -64,7 +64,10 @@ fn key_backlog_keeps_recent_events_in_order() {
         state.key(1, code, 2);
     }
     let events: Vec<_> = std::iter::from_fn(|| state.poll_key()).collect();
-    assert_eq!(events, (36..100).map(|code| (1, code, 2)).collect::<Vec<_>>());
+    assert_eq!(
+        events,
+        (36..100).map(|code| (1, code, 2)).collect::<Vec<_>>()
+    );
     assert_eq!(state.poll_key(), None);
 }
 

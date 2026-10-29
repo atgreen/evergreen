@@ -386,46 +386,81 @@ impl InlineOptions {
 
     /// Register worker-owned metadata together with its original constant-slot
     /// descriptions. The caller retains and roots the original body separately.
-    pub fn with_body_snapshot(mut self, symbol: u32, snapshot: &super::constants::BytecodeSnapshot) -> Self {
+    pub fn with_body_snapshot(
+        mut self,
+        symbol: u32,
+        snapshot: &super::constants::BytecodeSnapshot,
+    ) -> Self {
         self.bodies.insert(symbol, Arc::clone(&snapshot.body));
         self.with_constant_snapshot(snapshot)
     }
 
     /// Register captured metadata for guarded return hints only. This never
     /// makes a cold body available to the body inliner or changes its policy.
-    pub fn with_return_hint_body_snapshot(mut self, symbol: u32, snapshot: &super::constants::BytecodeSnapshot) -> Self {
+    pub fn with_return_hint_body_snapshot(
+        mut self,
+        symbol: u32,
+        snapshot: &super::constants::BytecodeSnapshot,
+    ) -> Self {
         self.hint_bodies.insert(symbol, Arc::clone(&snapshot.body));
         self.with_constant_snapshot(snapshot)
     }
 
-    pub(crate) fn with_constant_snapshot(mut self, snapshot: &super::constants::BytecodeSnapshot) -> Self {
-        self.constant_snapshots.insert(Arc::as_ptr(&snapshot.body) as usize, Arc::clone(&snapshot.constants));
+    pub(crate) fn with_constant_snapshot(
+        mut self,
+        snapshot: &super::constants::BytecodeSnapshot,
+    ) -> Self {
+        self.constant_snapshots.insert(
+            Arc::as_ptr(&snapshot.body) as usize,
+            Arc::clone(&snapshot.constants),
+        );
         self
     }
 
     pub(crate) fn has_captured_body(&self, symbol: u32) -> bool {
-        self.bodies.get(&symbol).or_else(|| self.hint_bodies.get(&symbol)).is_some_and(|body|
-            body.nested_functions.is_empty() && body.restart_cases.is_empty()
-                && self.constant_snapshots.contains_key(&(Arc::as_ptr(body) as usize)))
+        self.bodies
+            .get(&symbol)
+            .or_else(|| self.hint_bodies.get(&symbol))
+            .is_some_and(|body| {
+                body.nested_functions.is_empty()
+                    && body.restart_cases.is_empty()
+                    && self
+                        .constant_snapshots
+                        .contains_key(&(Arc::as_ptr(body) as usize))
+            })
     }
 
     /// Hints may inspect only already captured worker metadata, never fall
     /// back to reading a live constant pool on a compiler thread. This is a
     /// summary-only view: source_body names the sanitized owner, not the
     /// runtime definition. Never install it or use it as a deopt owner.
-    pub(crate) fn captured_body_snapshot(&self, symbol: u32) -> Option<super::constants::BytecodeSnapshot> {
-        let body = self.bodies.get(&symbol).or_else(|| self.hint_bodies.get(&symbol))?;
-        if !body.nested_functions.is_empty() || !body.restart_cases.is_empty() { return None; }
+    pub(crate) fn captured_body_snapshot(
+        &self,
+        symbol: u32,
+    ) -> Option<super::constants::BytecodeSnapshot> {
+        let body = self
+            .bodies
+            .get(&symbol)
+            .or_else(|| self.hint_bodies.get(&symbol))?;
+        if !body.nested_functions.is_empty() || !body.restart_cases.is_empty() {
+            return None;
+        }
         Some(super::constants::BytecodeSnapshot {
             body: Arc::clone(body),
             constants: Arc::clone(self.constant_snapshots.get(&(Arc::as_ptr(body) as usize))?),
             source_body: Arc::as_ptr(body) as usize,
-            nested_functions: vec![], restart_functions: vec![],
+            nested_functions: vec![],
+            restart_functions: vec![],
         })
     }
 
-    pub(crate) fn constants(&self, body: &BytecodeFunction) -> Arc<super::constants::ConstantPoolSnapshot> {
-        self.constant_snapshots.get(&(body as *const _ as usize)).cloned()
+    pub(crate) fn constants(
+        &self,
+        body: &BytecodeFunction,
+    ) -> Arc<super::constants::ConstantPoolSnapshot> {
+        self.constant_snapshots
+            .get(&(body as *const _ as usize))
+            .cloned()
             .unwrap_or_else(|| Arc::new(super::constants::ConstantPoolSnapshot::capture(body)))
     }
 
@@ -618,7 +653,8 @@ mod tests {
         let root = 17;
         let source = saved_body(vec![Instr::LoadLocal(0), Instr::Return]);
         let snapshot = super::super::constants::BytecodeSnapshot::capture(&source);
-        let mut options = InlineOptions::default().with_root_symbol(root)
+        let mut options = InlineOptions::default()
+            .with_root_symbol(root)
             .with_constant_globals(HashMap::from([(42, 5)]))
             .with_body_snapshot(99, &snapshot)
             .with_policy(3, InlinePolicy::NotInline)

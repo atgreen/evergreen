@@ -80,10 +80,10 @@ pub mod x64_value_maps;
 
 // ── Front end ─────────────────────────────────────────────────────
 pub mod build; // bytecode → SSA
-pub mod infer; // type/range/representation inference
-pub mod normal_return_facts; // audited successful-continuation argument contracts
 pub mod builtin_binding; // exact binding guards for builtin specialization
+pub mod infer; // type/range/representation inference
 pub mod inlining; // call-site policy + compiler-known inline metadata
+pub mod normal_return_facts; // audited successful-continuation argument contracts
 pub mod verify; // IR verifier
 
 // ── Mid-end and back end ──────────────────────────────────────────
@@ -92,14 +92,14 @@ pub mod lower; // IR → MachFunc instruction selection
 pub mod opt_clear_mv; // dead multiple-value-reset elimination
 pub mod opt_dce; // deopt-aware DCE + rematerialisation
 pub mod opt_guard; // guard elimination + hoisting
-pub mod opt_refine; // independently verified instruction-local refinements
 pub mod opt_gvn; // global value numbering / CSE
-pub mod opt_loop_peel; // profitable type-transition peeling with generic fallback
-pub mod vector_ranges;
-pub(crate) mod vector_range_proof;
-mod region_clone;
 pub mod opt_licm; // loop-invariant code motion
-pub mod regalloc; // regalloc2 adapter + stack maps
+pub mod opt_loop_peel; // profitable type-transition peeling with generic fallback
+pub mod opt_refine; // independently verified instruction-local refinements
+pub mod regalloc;
+mod region_clone;
+pub(crate) mod vector_range_proof;
+pub mod vector_ranges; // regalloc2 adapter + stack maps
 // Shared by the framed backends: who may carry a register entry, and which
 // values need a shadow root. Pure IR analysis, so every port reads one
 // answer instead of re-deriving the contract.
@@ -107,8 +107,8 @@ pub mod register_entry;
 pub mod speculate; // profile-guided single-type speculative lowering
 // Which speculation families the host emitter can encode. One answer per
 // family, so growing a port's emitter has a single gate to widen.
-pub mod target_support;
-mod string_char; // inline CHAR/SCHAR/ELT fast path on simple strings
+mod string_char;
+pub mod target_support; // inline CHAR/SCHAR/ELT fast path on simple strings
 
 // ── Machine-code emission ─────────────────────────────────────────
 pub mod emit; // MachFunc → executable x86-64 bytes
@@ -116,9 +116,9 @@ pub mod emit_a64;
 pub mod emit_ppc64le;
 pub mod emit_riscv64;
 pub mod emit_s390x;
+pub mod native_return;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub mod native_transfer;
-pub mod native_return;
 #[cfg(all(
     target_arch = "powerpc64",
     target_endian = "little",
@@ -156,13 +156,13 @@ pub mod unbox_fixnum;
 /// Success-only integer shift fast paths with retained generic calls.
 pub mod integer_shift;
 
+pub mod allocation_extent;
+pub mod allocation_facts;
+pub mod array_layout;
 /// Guarded whole-word replacement of bounded integer-to-octet loops.
 pub mod octet_word_fusion;
-pub mod allocation_facts;
-pub mod allocation_extent;
-pub mod array_layout;
 pub mod value_facts;
 
+pub(crate) mod numeric_result_facts;
 /// Guarded return-format expectations, deliberately separate from inference.
 pub mod return_hints;
-pub(crate) mod numeric_result_facts;

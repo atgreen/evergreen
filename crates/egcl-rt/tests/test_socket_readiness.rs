@@ -151,11 +151,7 @@ fn a_directed_interrupt_ends_a_wait_parked_in_the_kernel() {
         // and publishes the kernel TID the directed signal needs.
         tx.send(current_thread_id()).unwrap();
         let started = Instant::now();
-        let result = wait_socket(
-            &socket,
-            IoInterest::Read,
-            Some(Duration::from_secs(30)),
-        );
+        let result = wait_socket(&socket, IoInterest::Read, Some(Duration::from_secs(30)));
         (result, started.elapsed())
     });
 

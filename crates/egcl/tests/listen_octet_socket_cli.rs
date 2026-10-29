@@ -60,7 +60,10 @@ fn listen_on_an_octet_socket_leaves_the_byte_for_read_byte() {
         "AGAIN T 8",
         "EOF NIL",
     ] {
-        assert!(stdout.contains(expected), "missing {expected:?} in: {stdout}");
+        assert!(
+            stdout.contains(expected),
+            "missing {expected:?} in: {stdout}"
+        );
     }
 }
 
@@ -95,6 +98,9 @@ fn listen_on_an_octet_file_stream_reports_pending_bytes_and_leaves_them() {
         "LISTEN then READ-BYTE on a file failed: {stdout}\n{stderr}"
     );
     for expected in ["FILE-FRESH T", "FILE-BYTES 97 T 98 99", "FILE-END NIL EOF"] {
-        assert!(stdout.contains(expected), "missing {expected:?} in: {stdout}");
+        assert!(
+            stdout.contains(expected),
+            "missing {expected:?} in: {stdout}"
+        );
     }
 }

@@ -927,7 +927,10 @@ impl InferenceTimings {
     fn new() -> Self {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let enabled = *ENABLED.get_or_init(|| std::env::var_os("EGCL_INFER_PHASE_LOG").is_some());
-        Self { start: enabled.then(std::time::Instant::now), ..Self::default() }
+        Self {
+            start: enabled.then(std::time::Instant::now),
+            ..Self::default()
+        }
     }
 
     fn clock(&self) -> Option<std::time::Instant> {
@@ -940,12 +943,28 @@ impl InferenceTimings {
 
     fn finish(&self, f: &Function, blocks: usize, sites: usize) {
         let Some(start) = self.start else { return };
-        eprintln!("[infer-phases] function={:?} total_ns={} setup_ns={} checks_ns={} fixpoint_ns={} entry_ns={} edge_ns={} replay_ns={} replay_entry_ns={} repr_ns={} passes={} blocks={} block_visits={} replay_blocks={} replay_insts={} sites={} entry_calls={} idom_steps={} dominance_queries={}",
-            f.name(), start.elapsed().as_nanos(), self.setup_ns, self.checks_ns,
-            self.fixpoint_ns, self.entry_ns, self.edge_ns, self.replay_ns,
-            self.replay_entry_ns, self.repr_ns, self.passes, blocks,
-            self.block_visits, self.replay_blocks, self.replay_insts, sites,
-            self.entry_calls, self.idom_steps, self.dominance_queries);
+        eprintln!(
+            "[infer-phases] function={:?} total_ns={} setup_ns={} checks_ns={} fixpoint_ns={} entry_ns={} edge_ns={} replay_ns={} replay_entry_ns={} repr_ns={} passes={} blocks={} block_visits={} replay_blocks={} replay_insts={} sites={} entry_calls={} idom_steps={} dominance_queries={}",
+            f.name(),
+            start.elapsed().as_nanos(),
+            self.setup_ns,
+            self.checks_ns,
+            self.fixpoint_ns,
+            self.entry_ns,
+            self.edge_ns,
+            self.replay_ns,
+            self.replay_entry_ns,
+            self.repr_ns,
+            self.passes,
+            blocks,
+            self.block_visits,
+            self.replay_blocks,
+            self.replay_insts,
+            sites,
+            self.entry_calls,
+            self.idom_steps,
+            self.dominance_queries
+        );
     }
 }
 
@@ -1028,7 +1047,9 @@ pub fn infer_for_sites(f: &Function, sites: &[Inst]) -> InferenceResult {
         if narrowing.is_none() && pass >= MAX_PASSES {
             break;
         }
-        if timings.start.is_some() { timings.passes += 1; }
+        if timings.start.is_some() {
+            timings.passes += 1;
+        }
         let widen = narrowing.is_none() && pass >= WIDEN_AFTER;
         let narrow = narrowing.is_some();
         let mut changed = false;
@@ -1041,7 +1062,9 @@ pub fn infer_for_sites(f: &Function, sites: &[Inst]) -> InferenceResult {
         let mut edge_refine: HashMap<usize, (super::ir::Block, Vec<Refine>)> = HashMap::new();
 
         for &b in &rpo {
-            if timings.start.is_some() { timings.block_visits += 1; }
+            if timings.start.is_some() {
+                timings.block_visits += 1;
+            }
             // 1. Block parameter facts = join over predecessor edges (or the
             //    declared type for pred-less blocks, seeded above).
             let preds = predecessors[b.index()].as_slice();
@@ -1080,7 +1103,15 @@ pub fn infer_for_sites(f: &Function, sites: &[Inst]) -> InferenceResult {
                 }
             }
 
-            let mut env = entry_environment(b, &g, &dom, &structural, &edge_refine, &check_refine, &mut timings);
+            let mut env = entry_environment(
+                b,
+                &g,
+                &dom,
+                &structural,
+                &edge_refine,
+                &check_refine,
+                &mut timings,
+            );
 
             // 3. Walk instructions in program order, using the local environment.
             let fact = |v: Value, env: &HashMap<Value, IRType>, g: &Facts| -> IRType {
@@ -1189,8 +1220,19 @@ pub fn infer_for_sites(f: &Function, sites: &[Inst]) -> InferenceResult {
     let before = if sites.is_empty() {
         HashMap::new()
     } else {
-        capture_site_facts(f, sites, &g, &rpo, &dom, &structural,
-            CaptureContext { checks: &check_refine, predecessors: &predecessors, timings: &mut timings })
+        capture_site_facts(
+            f,
+            sites,
+            &g,
+            &rpo,
+            &dom,
+            &structural,
+            CaptureContext {
+                checks: &check_refine,
+                predecessors: &predecessors,
+                timings: &mut timings,
+            },
+        )
     };
     timings.replay_ns = InferenceTimings::elapsed(replay_start);
     timings.replay_entry_ns = timings.entry_ns - entry_before_replay;
@@ -1212,7 +1254,10 @@ fn check_refinements(f: &Function, rpo: &[Block]) -> CheckRefinements {
         // Audited normal-return argument facts, for strictly dominated blocks.
         for &inst in &f.block(b).insts {
             super::normal_return_facts::visit_argument_facts(f, inst, |value, ty| {
-                check_refine.entry(b.index()).or_default().push(Refine { value, ty });
+                check_refine
+                    .entry(b.index())
+                    .or_default()
+                    .push(Refine { value, ty });
             });
         }
     }
@@ -1221,7 +1266,10 @@ fn check_refinements(f: &Function, rpo: &[Block]) -> CheckRefinements {
 }
 
 fn add_edge_refinements(
-    f: &Function, b: Block, g: &Facts, predecessors: &[Vec<Block>],
+    f: &Function,
+    b: Block,
+    g: &Facts,
+    predecessors: &[Vec<Block>],
     edge_refine: &mut EdgeRefinements,
 ) {
     if let Some(term) = f.terminator(b) {
@@ -1294,18 +1342,21 @@ fn entry_environment(
     timings: &mut InferenceTimings,
 ) -> HashMap<Value, IRType> {
     let entry_start = timings.clock();
-    if timings.start.is_some() { timings.entry_calls += 1; }
+    if timings.start.is_some() {
+        timings.entry_calls += 1;
+    }
     let mut env: HashMap<Value, IRType> = HashMap::new();
     let mut d = b;
     loop {
-        if timings.start.is_some() { timings.idom_steps += 1; }
-        if let Some((_, refs)) = edge_refine
-            .get(&d.index())
-            .filter(|(source, _)| {
-                if timings.start.is_some() { timings.dominance_queries += 1; }
-                structural.block_dominates_all_entries(*source, b)
-            })
-        {
+        if timings.start.is_some() {
+            timings.idom_steps += 1;
+        }
+        if let Some((_, refs)) = edge_refine.get(&d.index()).filter(|(source, _)| {
+            if timings.start.is_some() {
+                timings.dominance_queries += 1;
+            }
+            structural.block_dominates_all_entries(*source, b)
+        }) {
             for rf in refs {
                 let cur = env
                     .get(&rf.value)
@@ -1318,22 +1369,21 @@ fn entry_environment(
             }
         }
         if d != b {
-            if let Some(refs) = check_refine
-                .get(&d.index())
-                .filter(|_| {
-                    if timings.start.is_some() { timings.dominance_queries += 1; }
-                    structural.block_dominates_all_entries(d, b)
-                })
-            {
+            if let Some(refs) = check_refine.get(&d.index()).filter(|_| {
+                if timings.start.is_some() {
+                    timings.dominance_queries += 1;
+                }
+                structural.block_dominates_all_entries(d, b)
+            }) {
                 for rf in refs {
                     let cur = env
                         .get(&rf.value)
                         .copied()
                         .unwrap_or_else(|| g.get(rf.value));
                     let refined = ty_meet(cur, rf.ty);
-                if refined != cur {
-                    env.insert(rf.value, refined);
-                }
+                    if refined != cur {
+                        env.insert(rf.value, refined);
+                    }
                 }
             }
         }
@@ -1348,7 +1398,10 @@ fn entry_environment(
 }
 
 fn apply_normal_return_facts(
-    f: &Function, inst: Inst, g: &Facts, env: &mut HashMap<Value, IRType>,
+    f: &Function,
+    inst: Inst,
+    g: &Facts,
+    env: &mut HashMap<Value, IRType>,
 ) {
     super::normal_return_facts::visit_argument_facts(f, inst, |value, ty| {
         let current = env.get(&value).copied().unwrap_or_else(|| g.get(value));
@@ -1374,7 +1427,11 @@ fn capture_site_facts(
     structural: &super::value_facts::StructuralFacts,
     context: CaptureContext<'_>,
 ) -> HashMap<(Inst, Value), IRType> {
-    let CaptureContext { checks, predecessors, timings } = context;
+    let CaptureContext {
+        checks,
+        predecessors,
+        timings,
+    } = context;
     let requested: HashSet<_> = sites.iter().copied().collect();
     let mut edges = EdgeRefinements::new();
     for &block in rpo {
@@ -1385,16 +1442,23 @@ fn capture_site_facts(
     let mut before = HashMap::new();
     for &block in rpo {
         let instructions = &f.block(block).insts;
-        let Some(last) = instructions.iter().rposition(|inst| requested.contains(inst)) else {
+        let Some(last) = instructions
+            .iter()
+            .rposition(|inst| requested.contains(inst))
+        else {
             continue;
         };
         // Each replay starts from conservative global facts (the converged
         // solution or TOP fallback) and complete edge/check maps. Other blocks'
         // local environments do not feed it.
         let mut env = entry_environment(block, g, dom, structural, &edges, checks, timings);
-        if timings.start.is_some() { timings.replay_blocks += 1; }
+        if timings.start.is_some() {
+            timings.replay_blocks += 1;
+        }
         for &inst in &instructions[..=last] {
-            if timings.start.is_some() { timings.replay_insts += 1; }
+            if timings.start.is_some() {
+                timings.replay_insts += 1;
+            }
             let data = f.inst(inst);
             if requested.contains(&inst) {
                 for &value in &data.args {
@@ -2152,8 +2216,10 @@ mod tests {
             // The predecessor has no requested site in this replay. Its
             // branch contract still applies, unless an alternate OSR bypasses it.
             let only_successor = infer_for_sites(&f, &[true_site]);
-            assert_eq!(only_successor.ty_before(true_site, input),
-                facts.ty_before(true_site, input));
+            assert_eq!(
+                only_successor.ty_before(true_site, input),
+                facts.ty_before(true_site, input)
+            );
             // Unrequested sites and nonoperands never gain scoped proofs.
             assert_eq!(facts.ty_before(site(bool_use[0]), input), facts.ty(input));
             assert_eq!(
@@ -2359,7 +2425,8 @@ mod tests {
         let entry = f.entry();
         let input = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
         let state = f.frame_states.add(crate::t2::frame_state::FrameState {
-            scopes: vec![], remat: vec![],
+            scopes: vec![],
+            remat: vec![],
         });
         let (_, checked) = f.push_inst(
             entry,
@@ -2424,7 +2491,8 @@ mod tests {
         let e = f.entry();
         let p = f.add_block_param(e, IRType::TOP, ValueRepresentation::Tagged);
         let state = f.frame_states.add(crate::t2::frame_state::FrameState {
-            scopes: vec![], remat: vec![],
+            scopes: vec![],
+            remat: vec![],
         });
         f.push_inst(
             e,
@@ -3110,36 +3178,76 @@ mod tests {
         // SSA value's type in its normal continuation.
         let mut f = Function::new("checked-untrusted-double");
         let entry = f.entry();
-        let (_, literal) = f.push_inst(entry, InstData {
-            aux: AuxData::HeapLiteral { slot: 0x12340 },
-            ..inst(Opcode::ConstHeapObj)
-        }, &[(IRType::of(TypeBits::DOUBLE_FLOAT), ValueRepresentation::Tagged)]);
+        let (_, literal) = f.push_inst(
+            entry,
+            InstData {
+                aux: AuxData::HeapLiteral { slot: 0x12340 },
+                ..inst(Opcode::ConstHeapObj)
+            },
+            &[(
+                IRType::of(TypeBits::DOUBLE_FLOAT),
+                ValueRepresentation::Tagged,
+            )],
+        );
         let literal = literal[0];
         assert!(f.double_literals.is_empty());
         let state = f.frame_states.add(crate::t2::frame_state::FrameState {
-            scopes: vec![], remat: vec![],
+            scopes: vec![],
+            remat: vec![],
         });
-        let (guard, _) = f.push_inst(entry, InstData {
-            args: vec![literal], aux: AuxData::TypeTag(IRType::of(TypeBits::DOUBLE_FLOAT)),
-            flags: InstFlags { guard: true, effectful: true, ..Default::default() },
-            frame_state: Some(state), ..inst(Opcode::Guard)
-        }, &[]);
+        let (guard, _) = f.push_inst(
+            entry,
+            InstData {
+                args: vec![literal],
+                aux: AuxData::TypeTag(IRType::of(TypeBits::DOUBLE_FLOAT)),
+                flags: InstFlags {
+                    guard: true,
+                    effectful: true,
+                    ..Default::default()
+                },
+                frame_state: Some(state),
+                ..inst(Opcode::Guard)
+            },
+            &[],
+        );
         let successor = f.make_block();
-        f.set_terminator(entry, InstData { targets: vec![BlockCall {
-            block: successor, args: vec![] }], ..inst(Opcode::Jump) });
-        let (later, _) = f.push_inst(successor, InstData {
-            args: vec![literal, literal], ..inst(Opcode::GenericEq)
-        }, &[(IRType::TOP, ValueRepresentation::Tagged)]);
+        f.set_terminator(
+            entry,
+            InstData {
+                targets: vec![BlockCall {
+                    block: successor,
+                    args: vec![],
+                }],
+                ..inst(Opcode::Jump)
+            },
+        );
+        let (later, _) = f.push_inst(
+            successor,
+            InstData {
+                args: vec![literal, literal],
+                ..inst(Opcode::GenericEq)
+            },
+            &[(IRType::TOP, ValueRepresentation::Tagged)],
+        );
         f.set_terminator(successor, ret());
         let facts = infer_for_sites(&f, &[guard, later]);
-        assert_eq!(facts.ty(literal), IRType::TOP, "no heap read or declaration trust");
+        assert_eq!(
+            facts.ty(literal),
+            IRType::TOP,
+            "no heap read or declaration trust"
+        );
         assert_eq!(facts.ty_before(guard, literal), IRType::TOP);
-        assert_eq!(facts.ty_before(later, literal), IRType::of(TypeBits::DOUBLE_FLOAT),
-            "the checked predecessor must publish its fact across the edge");
-        let only_successor = infer_for_sites(&f, &[later]);
-        assert_eq!(only_successor.ty_before(later, literal),
+        assert_eq!(
+            facts.ty_before(later, literal),
             IRType::of(TypeBits::DOUBLE_FLOAT),
-            "an unrequested predecessor still publishes its checked contract");
+            "the checked predecessor must publish its fact across the edge"
+        );
+        let only_successor = infer_for_sites(&f, &[later]);
+        assert_eq!(
+            only_successor.ty_before(later, literal),
+            IRType::of(TypeBits::DOUBLE_FLOAT),
+            "an unrequested predecessor still publishes its checked contract"
+        );
     }
 
     #[test]
@@ -3148,7 +3256,8 @@ mod tests {
         let entry = f.entry();
         let input = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
         let state = f.frame_states.add(crate::t2::frame_state::FrameState {
-            scopes: vec![], remat: vec![],
+            scopes: vec![],
+            remat: vec![],
         });
         let (guard, _) = f.push_inst(
             entry,

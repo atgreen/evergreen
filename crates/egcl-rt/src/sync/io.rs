@@ -649,13 +649,7 @@ mod kqueue {
                 // installed after this one-shot event consumed the first.
                 for &filter in &[libc::EVFILT_READ, libc::EVFILT_WRITE] {
                     unsafe {
-                        change(
-                            queue_fd,
-                            registration.fd,
-                            filter,
-                            libc::EV_DELETE,
-                            id,
-                        );
+                        change(queue_fd, registration.fd, filter, libc::EV_DELETE, id);
                     }
                 }
                 descriptors.remove(&registration.fd);

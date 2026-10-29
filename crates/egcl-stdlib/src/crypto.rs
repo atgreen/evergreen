@@ -95,7 +95,10 @@ fn slots(v: EgclVal, start: usize, count: usize, what: &str) -> Result<*mut Egcl
     if start > len || count > len - start {
         return Err(type_error(
             v,
-            &format!("{what} with at least {} elements", start.saturating_add(count)),
+            &format!(
+                "{what} with at least {} elements",
+                start.saturating_add(count)
+            ),
         ));
     }
     Ok(unsafe { base.add(start) })
@@ -139,7 +142,10 @@ fn read_bytes<const N: usize>(v: EgclVal, start: usize) -> Result<[u8; N], EgclE
 fn read_bytes_into(v: EgclVal, start: usize, out: &mut [u8]) -> Result<(), EgclError> {
     if let Some(length) = egcl_rt::packed_u8::len(v) {
         if start > length || out.len() > length - start {
-            return Err(type_error(v, "an octet vector containing the requested block"));
+            return Err(type_error(
+                v,
+                "an octet vector containing the requested block",
+            ));
         }
         for (index, slot) in out.iter_mut().enumerate() {
             *slot = egcl_rt::packed_u8::get(v, start + index).unwrap();
@@ -160,7 +166,10 @@ fn read_bytes_into(v: EgclVal, start: usize, out: &mut [u8]) -> Result<(), EgclE
 fn write_bytes(v: EgclVal, start: usize, bytes: &[u8]) -> Result<(), EgclError> {
     if let Some(length) = egcl_rt::packed_u8::len(v) {
         if start > length || bytes.len() > length - start {
-            return Err(type_error(v, "an octet vector containing the requested block"));
+            return Err(type_error(
+                v,
+                "an octet vector containing the requested block",
+            ));
         }
         for (index, &byte) in bytes.iter().enumerate() {
             // All indices were checked before the first write. Raw bytes need
@@ -692,9 +701,9 @@ mod tests {
     #[test]
     fn packed_u8_crypto_blocks_keep_bounds_and_word_vector_compatibility() {
         egcl_rt::rooted!(packed = egcl_rt::packed_u8::make(32, 17).unwrap());
-        egcl_rt::rooted!(general = crate::sequences::build_filled_simple_vector(
-            32, EgclVal::from_fixnum(17)
-        ));
+        egcl_rt::rooted!(
+            general = crate::sequences::build_filled_simple_vector(32, EgclVal::from_fixnum(17))
+        );
         let block: [u8; 16] = std::array::from_fn(|index| (index * 17) as u8);
         for array in [*packed, *general] {
             write_bytes(array, 8, &block).unwrap();
@@ -715,22 +724,36 @@ mod tests {
         // SHA3-256 of the empty message: 0x06, then 0x80 at the end of the
         // 136-octet rate block, at offset 4 of a 140-octet buffer.
         egcl_rt::rooted!(packed = egcl_rt::packed_u8::make(140, 0).unwrap());
-        egcl_rt::rooted!(general = crate::sequences::build_filled_simple_vector(
-            140, EgclVal::from_fixnum(0)
-        ));
+        egcl_rt::rooted!(
+            general = crate::sequences::build_filled_simple_vector(140, EgclVal::from_fixnum(0))
+        );
         for data in [*packed, *general] {
             write_bytes(data, 4, &[0x06]).unwrap();
             write_bytes(data, 139, &[0x80]).unwrap();
-            egcl_rt::rooted!(state = crate::sequences::build_filled_simple_vector(
-                25, EgclVal::from_fixnum(0)
-            ));
-            keccak_absorb_values(*state, EgclVal::from_fixnum(136), data, EgclVal::from_fixnum(4))
-                .unwrap();
+            egcl_rt::rooted!(
+                state = crate::sequences::build_filled_simple_vector(25, EgclVal::from_fixnum(0))
+            );
+            keccak_absorb_values(
+                *state,
+                EgclVal::from_fixnum(136),
+                data,
+                EgclVal::from_fixnum(4),
+            )
+            .unwrap();
             let lanes = read_u64s::<25>(*state, 0, "lanes").unwrap();
-            assert_eq!(lanes[0].to_le_bytes(), [0xa7, 0xff, 0xc6, 0xf8, 0xbf, 0x1e, 0xd7, 0x66]);
-            assert!(keccak_absorb_values(
-                *state, EgclVal::from_fixnum(136), data, EgclVal::from_fixnum(5)
-            ).is_err());
+            assert_eq!(
+                lanes[0].to_le_bytes(),
+                [0xa7, 0xff, 0xc6, 0xf8, 0xbf, 0x1e, 0xd7, 0x66]
+            );
+            assert!(
+                keccak_absorb_values(
+                    *state,
+                    EgclVal::from_fixnum(136),
+                    data,
+                    EgclVal::from_fixnum(5)
+                )
+                .is_err()
+            );
         }
     }
 

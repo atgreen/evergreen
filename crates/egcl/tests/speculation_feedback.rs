@@ -44,7 +44,14 @@ fn mixed_lane_shift_recovers_to_stable_native_t2() {
         .output()
         .expect("run egcl");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(output.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(stdout.lines().any(|line| line == "initial=2"), "{stdout}");
-    assert!(stdout.lines().any(|line| line == "steady=0 tier=2"), "{stdout}");
+    assert!(
+        stdout.lines().any(|line| line == "steady=0 tier=2"),
+        "{stdout}"
+    );
 }

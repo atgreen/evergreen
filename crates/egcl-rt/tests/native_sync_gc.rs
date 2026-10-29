@@ -3,11 +3,11 @@
 
 //! Native waits must publish roots and cannot return into Lisp during a GC pause.
 
+use egcl_rt::sync::{EgclCondVar, EgclMutex, EgclSemaphore};
+use egcl_rt::{Collector, EgclVal, GcConfig, HeapCollector};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use egcl_rt::sync::{EgclCondVar, EgclMutex, EgclSemaphore};
-use egcl_rt::{Collector, GcConfig, HeapCollector, EgclVal};
 
 #[test]
 fn native_waits_publish_roots_and_wait_for_gc_resume() {

@@ -186,18 +186,37 @@ fn with_store_transport(mut f: Function, nvars: u16, escape: bool) -> Function {
     let primary = f.inst(store).args[2];
     let state = f.inst(store).frame_state.unwrap();
     let mut data = inst(Opcode::TakeValuesToLocals, vec![primary]);
-    data.aux = AuxData::ValuesLocals { nvars, slot_base: 0 };
+    data.aux = AuxData::ValuesLocals {
+        nvars,
+        slot_base: 0,
+    };
     data.frame_state = Some(state);
-    data.flags = InstFlags { call: true, safepoint: true, effectful: true, ..Default::default() };
+    data.flags = InstFlags {
+        call: true,
+        safepoint: true,
+        effectful: true,
+        ..Default::default()
+    };
     let types = vec![(IRType::TOP, Repr::Tagged); nvars as usize];
     let (transport, results) = f.push_inst(block, data, &types);
     assert_eq!(f.block_mut(block).insts.pop(), Some(transport));
-    let position = f.block(block).insts.iter().position(|&i| i == store).unwrap();
+    let position = f
+        .block(block)
+        .insts
+        .iter()
+        .position(|&i| i == store)
+        .unwrap();
     f.block_mut(block).insts.insert(position, transport);
     f.inst_mut(store).args[2] = results[0];
     let mut after = f.frame_states.get(state).clone();
-    after.scopes[0].stack = vec![ValueSource::Value { value: results[0], repr: Repr::Tagged }];
-    after.scopes[0].locals.push(ValueSource::Value { value: results[0], repr: Repr::Tagged });
+    after.scopes[0].stack = vec![ValueSource::Value {
+        value: results[0],
+        repr: Repr::Tagged,
+    }];
+    after.scopes[0].locals.push(ValueSource::Value {
+        value: results[0],
+        repr: Repr::Tagged,
+    });
     let after = f.frame_states.add(after);
     f.inst_mut(store).frame_state = Some(after);
     if escape {
@@ -212,17 +231,34 @@ fn with_store_transport(mut f: Function, nvars: u16, escape: bool) -> Function {
 fn boot_setf_single_value_transport_keeps_raw_graph_and_recovery() {
     let _lock = SYMBOLS.lock().unwrap();
     let mut f = with_store_transport(kernel(egcl_rt::symbols::intern("AREF"), false), 1, false);
-    let transported = f.block(f.entry()).insts.iter().find_map(|&i|
-        (f.inst(i).opcode == Opcode::TakeValuesToLocals).then(|| f.inst(i).results[0])).unwrap();
+    let transported = f
+        .block(f.entry())
+        .insts
+        .iter()
+        .find_map(|&i| {
+            (f.inst(i).opcode == Opcode::TakeValuesToLocals).then(|| f.inst(i).results[0])
+        })
+        .unwrap();
     assert_eq!(specialize(&mut f), 4);
     egcl_compiler::t2::verify::verify(&f).unwrap();
     assert_eq!(count(&f, Opcode::TakeValuesToLocals), 0);
-    assert_eq!(count(&f, Opcode::ClearMv), 4, "producer resets retained; binder does not add one");
+    assert_eq!(
+        count(&f, Opcode::ClearMv),
+        4,
+        "producer resets retained; binder does not add one"
+    );
     assert_eq!(count(&f, Opcode::PackedF64Set), 1);
     for (_, state) in f.frame_states.iter() {
-        for source in state.scopes.iter().flat_map(|s| s.locals.iter().chain(&s.stack)) {
+        for source in state
+            .scopes
+            .iter()
+            .flat_map(|s| s.locals.iter().chain(&s.stack))
+        {
             if let ValueSource::Value { value, repr } = source {
-                assert_ne!(*value, transported, "recovery must use the dominating primary");
+                assert_ne!(
+                    *value, transported,
+                    "recovery must use the dominating primary"
+                );
                 assert_eq!(*repr, f.value(*value).repr);
             }
         }
@@ -234,12 +270,21 @@ fn nonadjacent_store_transport_stays_outside_the_bounded_normalization() {
     let _lock = SYMBOLS.lock().unwrap();
     let mut f = with_store_transport(kernel(egcl_rt::symbols::intern("AREF"), false), 1, false);
     let block = f.entry();
-    let position = f.block(block).insts.iter().position(|&i|
-        f.inst(i).opcode == Opcode::TakeValuesToLocals).unwrap();
+    let position = f
+        .block(block)
+        .insts
+        .iter()
+        .position(|&i| f.inst(i).opcode == Opcode::TakeValuesToLocals)
+        .unwrap();
     let state = f.inst(f.block(block).insts[position]).frame_state;
     let mut call = inst(Opcode::Call, vec![]);
     call.aux = AuxData::CallTarget(egcl_rt::symbols::intern("UNKNOWN-MV-PRODUCER"));
-    call.flags = InstFlags { call: true, safepoint: true, effectful: true, ..Default::default() };
+    call.flags = InstFlags {
+        call: true,
+        safepoint: true,
+        effectful: true,
+        ..Default::default()
+    };
     call.frame_state = state;
     let (intervening, _) = f.push_inst(block, call, &[(IRType::TOP, Repr::Tagged)]);
     assert_eq!(f.block_mut(block).insts.pop(), Some(intervening));
@@ -256,14 +301,26 @@ fn store_transport_declines_multiple_values_unknown_producers_and_raw_escape() {
     for (nvars, escape, unknown) in [(2, false, false), (1, true, false), (1, false, true)] {
         let mut f = kernel(egcl_rt::symbols::intern("AREF"), false);
         if unknown {
-            let add = *f.block(f.entry()).insts.iter().find(|&&i| matches!(f.inst(i).aux,
-                AuxData::CallTarget(s) if egcl_rt::symbols::registry_key(s).as_deref() == Some("+"))).unwrap();
-            f.inst_mut(add).aux = AuxData::CallTarget(egcl_rt::symbols::intern("UNKNOWN-MV-PRODUCER"));
+            let add = *f
+                .block(f.entry())
+                .insts
+                .iter()
+                .find(|&&i| {
+                    matches!(f.inst(i).aux,
+                AuxData::CallTarget(s) if egcl_rt::symbols::registry_key(s).as_deref() == Some("+"))
+                })
+                .unwrap();
+            f.inst_mut(add).aux =
+                AuxData::CallTarget(egcl_rt::symbols::intern("UNKNOWN-MV-PRODUCER"));
         }
         let mut f = with_store_transport(f, nvars, escape);
         let before = format!("{f:?}");
         assert_eq!(specialize(&mut f), 0);
-        assert_eq!(format!("{f:?}"), before, "declines must preserve exact tagged IR");
+        assert_eq!(
+            format!("{f:?}"),
+            before,
+            "declines must preserve exact tagged IR"
+        );
     }
 }
 

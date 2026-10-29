@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-use egcl_rt::debug_stack::{capture_current, CallFrame, FrameOrigin};
-use egcl_rt::value::NIL;
 use egcl_rt::FrameType;
+use egcl_rt::debug_stack::{CallFrame, FrameOrigin, capture_current};
+use egcl_rt::value::NIL;
 
 static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 

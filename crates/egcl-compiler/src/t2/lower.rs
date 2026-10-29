@@ -678,10 +678,18 @@ fn lower_inst(lo: &mut Lowering, inst: Inst) {
         LogNot => un!(op::NOT),
         IntegerLowBits => un!(op::INTEGER_LOW_BITS),
         TryIntegerShr => lo.emit_annotated(inst, op::TRY_INTEGER_SHR, defs, uses),
-        TryStoreIntegerOctets8 => lo.emit_annotated(inst, op::TRY_STORE_INTEGER_OCTETS8, defs, uses),
-        TryStoreIntegerOctets1To8 => lo.emit_annotated(inst, op::TRY_STORE_INTEGER_OCTETS1_TO8, defs, uses),
-        PackedU8Layout | PackedU8AllocationLayout | PackedU8AllocationExtent => lo.emit_annotated(inst, op::PACKED_U8_LAYOUT, defs, uses),
-        TryStoreIntegerOctets1To8Layout | TryStoreIntegerOctets1To8Extent => lo.emit_annotated(inst, op::TRY_STORE_INTEGER_OCTETS1_TO8_LAYOUT, defs, uses),
+        TryStoreIntegerOctets8 => {
+            lo.emit_annotated(inst, op::TRY_STORE_INTEGER_OCTETS8, defs, uses)
+        }
+        TryStoreIntegerOctets1To8 => {
+            lo.emit_annotated(inst, op::TRY_STORE_INTEGER_OCTETS1_TO8, defs, uses)
+        }
+        PackedU8Layout | PackedU8AllocationLayout | PackedU8AllocationExtent => {
+            lo.emit_annotated(inst, op::PACKED_U8_LAYOUT, defs, uses)
+        }
+        TryStoreIntegerOctets1To8Layout | TryStoreIntegerOctets1To8Extent => {
+            lo.emit_annotated(inst, op::TRY_STORE_INTEGER_OCTETS1_TO8_LAYOUT, defs, uses)
+        }
         NativePoll => lo.emit_annotated(inst, op::NATIVE_POLL, defs, uses),
         SmallVectorRangeP => lo.emit_annotated(inst, op::SMALL_VECTOR_RANGE, defs, uses),
 
@@ -716,10 +724,11 @@ fn lower_inst(lo: &mut Lowering, inst: Inst) {
         }
 
         // ── memory loads (may be effectful) ──
-        Load | Car | Cdr | VecRef | PackedF64Ref | VecF64Ref => un_or_bin(lo, inst, op::LOAD, defs, uses),
-        StringByteLength | StringAsciiCharAt | StringCharOrNil | ArrayReadDiscarded | PackedF64P => {
-            lo.emit_annotated(inst, op::LOAD, defs, uses)
+        Load | Car | Cdr | VecRef | PackedF64Ref | VecF64Ref => {
+            un_or_bin(lo, inst, op::LOAD, defs, uses)
         }
+        StringByteLength | StringAsciiCharAt | StringCharOrNil | ArrayReadDiscarded
+        | PackedF64P => lo.emit_annotated(inst, op::LOAD, defs, uses),
         // A global read/write is emitted as a c2i helper CALL
         // (c2i_load_global / c2i_store_global), which clobbers every
         // caller-saved register — modelling it as a plain load/store let the

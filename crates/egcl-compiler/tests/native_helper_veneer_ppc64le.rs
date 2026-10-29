@@ -7,11 +7,11 @@
     target_os = "linux"
 ))]
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use egcl_compiler::t2::native_transfer_ppc64le::emit_helper_veneer;
 use egcl_rt::jit::JitBuffer;
 use egcl_rt::native_transfer::{NativeExit, NativeOutcome};
 use egcl_rt::value::{EgclVal, NIL};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[repr(C)]
 struct Request {

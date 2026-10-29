@@ -86,7 +86,10 @@ fn a_class_allocated_slot_still_shadows_an_inherited_one_after_a_restore() {
 
     // The restored class keeps its layout through its wrapper record.
     let restored = allocate_instance(derived).unwrap();
-    assert!(!slot_present_p(restored, x), "SS-DERIVED's own layout changed");
+    assert!(
+        !slot_present_p(restored, x),
+        "SS-DERIVED's own layout changed"
+    );
     assert!(slot_present_p(restored, other), "SS-DERIVED lost OTHER");
 
     // The decisive case: a subclass finalized for the first time now, from the

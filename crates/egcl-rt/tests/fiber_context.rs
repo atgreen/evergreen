@@ -32,12 +32,20 @@ fn suspend(fiber: bool) {
     unsafe {
         if fiber {
             #[cfg(egcl_tsan)]
-            context::swap_tsan(&raw mut (*state).fiber, (*state).scheduler, (*state).scheduler_tsan);
+            context::swap_tsan(
+                &raw mut (*state).fiber,
+                (*state).scheduler,
+                (*state).scheduler_tsan,
+            );
             #[cfg(not(egcl_tsan))]
             context::swap(&raw mut (*state).fiber, (*state).scheduler);
         } else {
             #[cfg(egcl_tsan)]
-            context::swap_tsan(&raw mut (*state).scheduler, (*state).fiber, (*state).fiber_tsan);
+            context::swap_tsan(
+                &raw mut (*state).scheduler,
+                (*state).fiber,
+                (*state).fiber_tsan,
+            );
             #[cfg(not(egcl_tsan))]
             context::swap(&raw mut (*state).scheduler, (*state).fiber);
         }
@@ -119,5 +127,7 @@ fn repeated_switches_preserve_both_stacks_and_live_values() {
     }
     STATE.set(std::ptr::null_mut());
     #[cfg(egcl_tsan)]
-    unsafe { context::__tsan_destroy_fiber(state.fiber_tsan as *mut _) };
+    unsafe {
+        context::__tsan_destroy_fiber(state.fiber_tsan as *mut _)
+    };
 }

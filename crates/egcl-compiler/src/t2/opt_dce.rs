@@ -298,7 +298,7 @@ fn resolve(
     // recipe cannot reconstruct which constant it represented.
     {
         use crate::t2::ir::AuxData;
-        use egcl_rt::value::{NIL, T, EgclVal};
+        use egcl_rt::value::{EgclVal, NIL, T};
         let data = f.inst(inst);
         let constant = match (data.opcode, &data.aux) {
             (Opcode::ConstFixnum, AuxData::FixnumImm(n)) => Some(EgclVal::from_fixnum(*n)),

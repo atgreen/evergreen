@@ -11,7 +11,7 @@ use super::ir::{
     AuxData, Block, Function, Inst, InstFlags, Opcode, TypeBits, Value, ValueDef,
     ValueRepresentation,
 };
-use super::opt_licm::{detect_loops, NaturalLoop};
+use super::opt_licm::{NaturalLoop, detect_loops};
 
 #[derive(Clone, Debug)]
 pub(crate) struct CountedVectorLoop {

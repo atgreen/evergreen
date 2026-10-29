@@ -180,9 +180,13 @@ impl StructuralFacts {
                     && super::allocation_facts::allocation_site(f, inst, &facts).is_some()
                 {
                     let d = f.inst(inst);
-                    facts.layouts.push(LayoutFact { producer: inst, subject: d.args[0],
-                        evidence: d.results[0], kind: LayoutKind::PackedU8,
-                        encoding: LayoutEvidence::AllocationOrProbeWidth });
+                    facts.layouts.push(LayoutFact {
+                        producer: inst,
+                        subject: d.args[0],
+                        evidence: d.results[0],
+                        kind: LayoutKind::PackedU8,
+                        encoding: LayoutEvidence::AllocationOrProbeWidth,
+                    });
                 }
             }
         }
@@ -192,8 +196,12 @@ impl StructuralFacts {
                     && super::allocation_extent::producer_site(f, inst, &facts).is_some()
                 {
                     let d = f.inst(inst);
-                    facts.extents.push(ExtentFact { producer: inst, subject: d.args[0],
-                        layout: d.args[1], evidence: d.results[0] });
+                    facts.extents.push(ExtentFact {
+                        producer: inst,
+                        subject: d.args[0],
+                        layout: d.args[1],
+                        evidence: d.results[0],
+                    });
                 }
             }
         }
@@ -386,21 +394,28 @@ impl StructuralFacts {
     }
 
     pub fn extent_before(&self, subject: Value, consumer: Inst) -> Option<ExtentFact> {
-        self.extents.iter().copied().find(|fact| self.precedes(fact.producer, consumer)
-            && self.same_identity_at(fact.subject, subject, consumer))
+        self.extents.iter().copied().find(|fact| {
+            self.precedes(fact.producer, consumer)
+                && self.same_identity_at(fact.subject, subject, consumer)
+        })
     }
 
     pub fn extent_for(&self, subject: Value, layout: Value, extent: Value, consumer: Inst) -> bool {
-        self.extents.iter().any(|fact| self.precedes(fact.producer, consumer)
-            && self.same_identity_at(fact.subject, subject, consumer)
-            && self.same_identity_at(fact.layout, layout, consumer)
-            && self.same_identity_at(fact.evidence, extent, consumer))
+        self.extents.iter().any(|fact| {
+            self.precedes(fact.producer, consumer)
+                && self.same_identity_at(fact.subject, subject, consumer)
+                && self.same_identity_at(fact.layout, layout, consumer)
+                && self.same_identity_at(fact.evidence, extent, consumer)
+        })
     }
 
     pub fn witness_for(&self, subject: Value, witness: Value, consumer: Inst) -> bool {
         self.layouts.iter().any(|fact| {
             fact.kind == LayoutKind::PackedU8
-                && matches!(fact.encoding, LayoutEvidence::NullableHeaderWidth | LayoutEvidence::AllocationOrProbeWidth)
+                && matches!(
+                    fact.encoding,
+                    LayoutEvidence::NullableHeaderWidth | LayoutEvidence::AllocationOrProbeWidth
+                )
                 && self.same_identity_at(fact.evidence, witness, consumer)
                 && self.precedes(fact.producer, consumer)
                 && self.same_identity_at(fact.subject, subject, consumer)

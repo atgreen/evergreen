@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-use std::cell::RefCell;
 use egcl_compiler::t2::deopt::{LoweredScope, Rebox, SlotDescriptor};
 use egcl_compiler::t2::ir::Inst;
 use egcl_compiler::t2::mach::{Location, StackSlot};
@@ -9,6 +8,7 @@ use egcl_compiler::t2::transfer_capture::TransferSnapshot;
 use egcl_compiler::t2::transfer_map::TransferCaptureMap;
 use egcl_rt::value::EgclVal;
 use egcl_rt::{Collector, HeapCollector};
+use std::cell::RefCell;
 
 fn double(value: f64) -> EgclVal {
     let body = egcl_rt::alloc_typed(8, egcl_rt::object::type_id::DOUBLE_FLOAT).unwrap();

@@ -5,7 +5,7 @@
 use egcl_rt::{
     bignum::{BigInt, bigint_from_val},
     ffi::{AlienType, marshal_to_c, unmarshal_from_c},
-    value::{NIL, EgclVal},
+    value::{EgclVal, NIL},
 };
 
 #[test]

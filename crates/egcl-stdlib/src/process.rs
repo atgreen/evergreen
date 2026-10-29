@@ -2,14 +2,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
 //! Owned subprocesses and synchronous capture for EGCL-EXT.
+use egcl_rt::error::EgclError;
+use egcl_rt::sync::{BlockingMode, EgclSemaphore, blocking_mode};
 use std::io;
 use std::process::{
     Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Output, Stdio,
 };
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use egcl_rt::error::EgclError;
-use egcl_rt::sync::{BlockingMode, EgclSemaphore, blocking_mode};
 
 pub enum ProcessCommand {
     Shell(String),

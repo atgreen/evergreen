@@ -65,13 +65,19 @@ fn restart_clauses_reach_macro_hidden_lexicals_from_a_fasl() {
     std::fs::write(&source, DEFINITIONS).unwrap();
     let compiled = run(
         None,
-        &["--eval", &format!(r#"(compile-file "{}")"#, source.display())],
+        &[
+            "--eval",
+            &format!(r#"(compile-file "{}")"#, source.display()),
+        ],
     );
     assert!(!compiled.contains("caught ERROR"), "{compiled}");
     let fasl = dir.join("restart-hidden.fasl");
     let stdout = run(
         None,
-        &["--eval", &format!(r#"(progn (load "{}") {PROBE})"#, fasl.display())],
+        &[
+            "--eval",
+            &format!(r#"(progn (load "{}") {PROBE})"#, fasl.display()),
+        ],
     );
     assert!(stdout.contains(EXPECTED), "{stdout}");
 }

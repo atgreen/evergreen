@@ -4,7 +4,9 @@ use std::{fs, path::PathBuf, process::Command};
 
 struct Fixture(PathBuf);
 impl Drop for Fixture {
-    fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
 }
 
 /// A macro defined inside a LET keeps its captured binding across a saved image,
@@ -21,7 +23,8 @@ fn saved_macros_preserve_their_captured_frames() {
     fs::create_dir_all(&dir).unwrap();
     let _fixture = Fixture(dir.clone());
     let core = dir.join("macro-capture.core");
-    let source = format!(r#"
+    let source = format!(
+        r#"
       ;; The reported shape, beside the DEFUN and DEFMETHOD that already worked.
       (let ((x 42)) (defun get-x () x))
       (let ((y (list 1 2))) (defmacro with-y () `',y))
@@ -45,13 +48,23 @@ fn saved_macros_preserve_their_captured_frames() {
       ;; u32::MAX path).
       (defmacro m-top () '(list :top))
       (egcl-ext:save-lisp-and-die {core:?})
-    "#);
+    "#
+    );
     let built = Command::new(env!("CARGO_BIN_EXE_egcl"))
-        .args(["--no-init", "--eval", &source]).output().unwrap();
-    assert!(built.status.success(), "{}", String::from_utf8_lossy(&built.stderr));
+        .args(["--no-init", "--eval", &source])
+        .output()
+        .unwrap();
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
     let restored = Command::new(env!("CARGO_BIN_EXE_egcl"))
-        .args(["--no-init", "--image"]).arg(&core)
-        .args(["--eval", r#"
+        .args(["--no-init", "--image"])
+        .arg(&core)
+        .args([
+            "--eval",
+            r#"
           (assert (eql (get-x) 42))
           (assert (eql (gz 1) 8))
           (assert (equal (eval '(with-y)) '(1 2)))
@@ -67,9 +80,16 @@ fn saved_macros_preserve_their_captured_frames() {
           (set-shared (list :b))
           (assert (equal (eval '(m-read)) '(:b)))
           (format t "RESTORED-MACRO-CAPTURES-OK~%")
-        "#]).output().unwrap();
-    assert!(restored.status.success(), "{}\n{}",
-        String::from_utf8_lossy(&restored.stdout), String::from_utf8_lossy(&restored.stderr));
+        "#,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        restored.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&restored.stdout),
+        String::from_utf8_lossy(&restored.stderr)
+    );
     assert!(String::from_utf8_lossy(&restored.stdout).contains("RESTORED-MACRO-CAPTURES-OK"));
 }
 
@@ -83,23 +103,43 @@ fn saved_closures_keep_their_captured_macrolets() {
     fs::create_dir_all(&dir).unwrap();
     let _fixture = Fixture(dir.clone());
     let core = dir.join("closure-macrolet.core");
-    let source = format!(r#"
+    let source = format!(
+        r#"
       (defvar *lambda* (eval '(macrolet ((m () :local)) (lambda () (m)))))
       (defvar *flet* (eval '(macrolet ((m () :local)) (flet ((h () (m))) #'h))))
       ;; The expansion refers to a variable of the closure's own frame.
       (defvar *lexical* (eval '(let ((y (list 1 2))) (macrolet ((m () '(reverse y))) (lambda () (m))))))
       (egcl-ext:save-lisp-and-die {core:?})
-    "#);
+    "#
+    );
     let built = Command::new(env!("CARGO_BIN_EXE_egcl"))
-        .args(["--no-init", "--eval", &source]).output().unwrap();
-    assert!(built.status.success(), "{}", String::from_utf8_lossy(&built.stderr));
+        .args(["--no-init", "--eval", &source])
+        .output()
+        .unwrap();
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
     let restored = Command::new(env!("CARGO_BIN_EXE_egcl"))
-        .args(["--no-init", "--image"]).arg(&core)
-        .args(["--eval", r#"(format t "~&RESULT ~s~%"
+        .args(["--no-init", "--image"])
+        .arg(&core)
+        .args([
+            "--eval",
+            r#"(format t "~&RESULT ~s~%"
              (list (funcall *lambda*) (funcall *flet*) (funcall *lexical*)
-                   (macrolet ((m () :caller)) (funcall *lambda*))))"#])
-        .output().unwrap();
+                   (macrolet ((m () :caller)) (funcall *lambda*))))"#,
+        ])
+        .output()
+        .unwrap();
     let stdout = String::from_utf8_lossy(&restored.stdout);
-    assert!(restored.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&restored.stderr));
-    assert!(stdout.contains("RESULT (:LOCAL :LOCAL (2 1) :LOCAL)"), "{stdout}");
+    assert!(
+        restored.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&restored.stderr)
+    );
+    assert!(
+        stdout.contains("RESULT (:LOCAL :LOCAL (2 1) :LOCAL)"),
+        "{stdout}"
+    );
 }

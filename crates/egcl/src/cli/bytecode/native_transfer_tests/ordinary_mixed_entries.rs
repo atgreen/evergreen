@@ -6,13 +6,14 @@
 
 use super::ordinary_t2::install;
 use super::*;
-use native_transfer_entry::{take_nested_entries, TransferCode};
+use native_transfer_entry::{TransferCode, take_nested_entries};
 
 fn legacy_caller(name: &str, forms: &str, env: &Env) -> TransferCode {
     egcl_rt::rooted!(params = reader::read_from_string("(a b c d)").unwrap().0);
     egcl_rt::rooted!(forms = reader::read_from_string(forms).unwrap().0);
     let body = Arc::new(compile_function(name, *params, *forms, env, false, false).unwrap());
-    let code = TransferCode::compile_mapped_for_test(body).expect("explicit managed activation caller");
+    let code =
+        TransferCode::compile_mapped_for_test(body).expect("explicit managed activation caller");
     assert!(code.ordinary_entry.is_none());
     assert!(code.mapped_entry().is_some());
     code

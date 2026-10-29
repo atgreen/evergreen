@@ -3,12 +3,12 @@
 
 //! Precise host-language shadow roots for the tree-walker (bliss-6b2.1).
 
-use std::sync::{Mutex, OnceLock};
-use egcl_rt::value::{TAG_MASK, EgclVal};
+use egcl_rt::value::{EgclVal, TAG_MASK};
 use egcl_rt::{
     Allocator, Collector, CrossThreadRoot, GcConfig, HeapAllocator, HeapCollector, ShadowRootScope,
     alloc_typed, full_gc, init_heap, walk_heap,
 };
+use std::sync::{Mutex, OnceLock};
 
 fn lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();

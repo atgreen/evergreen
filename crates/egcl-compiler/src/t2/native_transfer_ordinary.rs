@@ -3,7 +3,7 @@
 
 //! Collecting boundaries for the ordinary Lisp register ABI.
 
-use super::{capture_stack_word, SysvTransferCapture};
+use super::{SysvTransferCapture, capture_stack_word};
 use egcl_rt::asm::{Asm, Cc};
 use egcl_rt::native_transfer::{NativeOutcome, NativeReturnValues, NativeSegment};
 use egcl_rt::value::{EgclVal, NIL};
@@ -201,7 +201,7 @@ pub struct OrdinaryFuncallProbe {
 /// appends: the cell's published runtime veneer. The probe is a leaf with no
 /// safepoint; it clobbers only R8-R11 before deciding.
 pub fn emit_ordinary_funcall_probe(probe: OrdinaryFuncallProbe) -> Vec<u8> {
-    use egcl_rt::call_table::{OrdinaryEntryDescriptor, ORDINARY_ARITY_ANY};
+    use egcl_rt::call_table::{ORDINARY_ARITY_ANY, OrdinaryEntryDescriptor};
     const STRIDE: usize = size_of::<OrdinaryFuncallProbeEntry>();
     fn mem(a: &mut Asm, rex: u8, op: u8, reg: u8, base: u8, disp: i32) {
         // [base + disp32]; base is never RSP/R12 here.
@@ -231,19 +231,61 @@ pub fn emit_ordinary_funcall_probe(probe: OrdinaryFuncallProbe) -> Vec<u8> {
     for index in 0..ORDINARY_FUNCALL_PROBE_ENTRIES {
         let next = a.label();
         let field = |offset: usize| (index * STRIDE + offset) as i32;
-        mem(&mut a, 0x49, 0x3b, 7, 2, field(offset_of!(OrdinaryFuncallProbeEntry, function))); // cmp rdi,[r10+]
+        mem(
+            &mut a,
+            0x49,
+            0x3b,
+            7,
+            2,
+            field(offset_of!(OrdinaryFuncallProbeEntry, function)),
+        ); // cmp rdi,[r10+]
         a.jcc(Cc::Ne, next);
-        mem(&mut a, 0x4d, 0x3b, 9, 2, field(offset_of!(OrdinaryFuncallProbeEntry, epoch))); // cmp r9,[r10+]
+        mem(
+            &mut a,
+            0x4d,
+            0x3b,
+            9,
+            2,
+            field(offset_of!(OrdinaryFuncallProbeEntry, epoch)),
+        ); // cmp r9,[r10+]
         a.jcc(Cc::Ne, next);
-        mem(&mut a, 0x4d, 0x3b, 8, 2, field(offset_of!(OrdinaryFuncallProbeEntry, collections))); // cmp r8,[r10+]
+        mem(
+            &mut a,
+            0x4d,
+            0x3b,
+            8,
+            2,
+            field(offset_of!(OrdinaryFuncallProbeEntry, collections)),
+        ); // cmp r8,[r10+]
         a.jcc(Cc::Ne, next);
-        mem(&mut a, 0x4d, 0x8b, 11, 2, field(offset_of!(OrdinaryFuncallProbeEntry, revision_address))); // mov r11,[r10+]
+        mem(
+            &mut a,
+            0x4d,
+            0x8b,
+            11,
+            2,
+            field(offset_of!(OrdinaryFuncallProbeEntry, revision_address)),
+        ); // mov r11,[r10+]
         a.extend_from_slice(&[0x4d, 0x8b, 0x1b]); // mov r11,[r11]
-        mem(&mut a, 0x4d, 0x3b, 11, 2, field(offset_of!(OrdinaryFuncallProbeEntry, revision))); // cmp r11,[r10+]
+        mem(
+            &mut a,
+            0x4d,
+            0x3b,
+            11,
+            2,
+            field(offset_of!(OrdinaryFuncallProbeEntry, revision)),
+        ); // cmp r11,[r10+]
         a.jcc(Cc::Ne, next);
         // The revision is unchanged, so the cell still publishes, and its
         // execution still retains, this descriptor.
-        mem(&mut a, 0x4d, 0x8b, 11, 2, field(offset_of!(OrdinaryFuncallProbeEntry, descriptor))); // mov r11,[r10+]
+        mem(
+            &mut a,
+            0x4d,
+            0x8b,
+            11,
+            2,
+            field(offset_of!(OrdinaryFuncallProbeEntry, descriptor)),
+        ); // mov r11,[r10+]
         a.jmp(hit);
         a.bind(next);
     }
@@ -252,7 +294,14 @@ pub fn emit_ordinary_funcall_probe(probe: OrdinaryFuncallProbe) -> Vec<u8> {
     // Arity: count-1 actuals, or a descriptor that checks its own count.
     let arity_ok = a.label();
     a.extend_from_slice(&[0x4c, 0x8d, 0x51, 0xff]); // lea r10,[rcx-1]
-    mem(&mut a, 0x4d, 0x3b, 10, 3, offset_of!(OrdinaryEntryDescriptor, arity) as i32); // cmp r10,[r11+arity]
+    mem(
+        &mut a,
+        0x4d,
+        0x3b,
+        10,
+        3,
+        offset_of!(OrdinaryEntryDescriptor, arity) as i32,
+    ); // cmp r10,[r11+arity]
     a.jcc(Cc::E, arity_ok);
     debug_assert_eq!(ORDINARY_ARITY_ANY, usize::MAX);
     a.extend_from_slice(&[0x49, 0x83, 0xbb]); // cmp qword [r11+arity], -1
@@ -266,7 +315,14 @@ pub fn emit_ordinary_funcall_probe(probe: OrdinaryFuncallProbe) -> Vec<u8> {
     a.extend_from_slice(&[0x4d, 0x85, 0xd2]); // test r10,r10
     a.jcc(Cc::E, miss);
     a.extend_from_slice(&[0x49, 0x89, 0xe1]); // mov r9,rsp
-    mem(&mut a, 0x4d, 0x2b, 9, 3, offset_of!(OrdinaryEntryDescriptor, stack_required) as i32); // sub r9,[r11+..]
+    mem(
+        &mut a,
+        0x4d,
+        0x2b,
+        9,
+        3,
+        offset_of!(OrdinaryEntryDescriptor, stack_required) as i32,
+    ); // sub r9,[r11+..]
     unsigned_branch(&mut a, 0x82, miss); // jb: wrapped
     a.extend_from_slice(&[0x4d, 0x3b, 0x4a, probe.stack_limit]); // cmp r9,[r10+limit]
     unsigned_branch(&mut a, 0x86, miss); // jbe

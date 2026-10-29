@@ -41,6 +41,12 @@ fn compiling_a_file_does_not_install_its_methods() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stdout}\n{stderr}");
-    assert!(stdout.contains("COMPILED (:BASE NIL NIL)"), "{stdout}\n{stderr}");
-    assert!(stdout.contains("LOADED ((:BOUND :BASE) :FRESH)"), "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("COMPILED (:BASE NIL NIL)"),
+        "{stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("LOADED ((:BOUND :BASE) :FRESH)"),
+        "{stdout}\n{stderr}"
+    );
 }

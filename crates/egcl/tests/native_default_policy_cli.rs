@@ -105,7 +105,10 @@ fn linux_default_compiles_optional_parameters_and_preserves_transfers() {
         (format t \"POLICY-OPTIONAL=~D ESCAPE=~D CLEANUPS=~D~%\"
           (egcl-ext:function-tier 'policy-optional)
           (egcl-ext:function-tier 'policy-optional-escape) *policy-cleanups*)");
-    assert!(output.contains("POLICY-OPTIONAL=1 ESCAPE=1 CLEANUPS=40"), "{output}");
+    assert!(
+        output.contains("POLICY-OPTIONAL=1 ESCAPE=1 CLEANUPS=40"),
+        "{output}"
+    );
 }
 
 #[test]

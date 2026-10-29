@@ -149,7 +149,8 @@ fn install_with_protocol(name: &str, params: &str, forms: &str, env: &mut Env, m
         install_baseline_code(symbol, code)
     } else {
         install_baseline(symbol, Arc::clone(&body))
-    }.unwrap_or_else(|| {
+    }
+    .unwrap_or_else(|| {
         panic!(
             "{name}: matrix callee must be mapped native code: {:?}",
             body.code
@@ -174,9 +175,15 @@ fn install_collector(env: &mut Env) {
 fn observe_ordinary_producer_entry() {
     let probe = unsafe { &mut *PROBE.with(Cell::get) };
     let context = CAPTURE.with(Cell::get);
-    assert!(!context.is_null(), "ordinary producer has a retained context");
-    assert_eq!(Some(unsafe { (*context).owner } as usize), probe.ordinary_owner,
-        "the measured ordinary entry must belong to the installed producer");
+    assert!(
+        !context.is_null(),
+        "ordinary producer has a retained context"
+    );
+    assert_eq!(
+        Some(unsafe { (*context).owner } as usize),
+        probe.ordinary_owner,
+        "the measured ordinary entry must belong to the installed producer"
+    );
     probe.ordinary_entries += 1;
 }
 
@@ -215,11 +222,12 @@ fn run_probe_with_ordinary_owner(
     };
     PROBE.with(|slot| slot.set(&mut probe));
     let previous = OBSERVE.with(|slot| slot.replace(Some(observe)));
-    if ordinary_owner.is_some() { take_native_fallback_count(); }
+    if ordinary_owner.is_some() {
+        take_native_fallback_count();
+    }
     // Install after warmup so only the measured invocation can satisfy it.
     let result = if ordinary_owner.is_some() {
-        with_ordinary_entry_hook_for_test(observe_ordinary_producer_entry,
-            || code.run(&[], env))
+        with_ordinary_entry_hook_for_test(observe_ordinary_producer_entry, || code.run(&[], env))
     } else {
         code.run(&[], env)
     };
@@ -227,9 +235,15 @@ fn run_probe_with_ordinary_owner(
     PROBE.with(|slot| slot.set(std::ptr::null_mut()));
     let value = result.unwrap();
     if ordinary_owner.is_some() {
-        assert_eq!(take_native_fallback_count(), 0, "measured native owners must not fall back");
-        assert_eq!(probe.ordinary_entries, 1,
-            "the measured producer must execute its ordinary native entry");
+        assert_eq!(
+            take_native_fallback_count(),
+            0,
+            "measured native owners must not fall back"
+        );
+        assert_eq!(
+            probe.ordinary_entries, 1,
+            "the measured producer must execute its ordinary native entry"
+        );
     }
     assert!(
         probe.observed,
@@ -359,8 +373,13 @@ fn native_returned_primary_moves_after_becoming_a_caller_private_root() {
         &env,
     ))
     .expect("returned primary must stay in native code");
-    let value = run_probe_with_ordinary_owner(&code, &mut env, &[314159], None,
-        Some(ordinary_producer.expect("installed ordinary producer owner")));
+    let value = run_probe_with_ordinary_owner(
+        &code,
+        &mut env,
+        &[314159],
+        None,
+        Some(ordinary_producer.expect("installed ordinary producer owner")),
+    );
     assert_eq!(crate::cli::cp(value), (EgclVal::from_fixnum(314159), NIL));
     assert_eq!(
         take_nested_entries(),
@@ -512,8 +531,9 @@ fn native_private_root_survives_real_callee_osr() {
         .with_gc_stable_mutator(compile_t2_artifact)
         .expect("ordinary worker artifact");
     let next = install_t2_completion(T2Completion {
-                    panicked: false,
-                    _permit: None, dependencies: Vec::new(),
+        panicked: false,
+        _permit: None,
+        dependencies: Vec::new(),
         sym: symbol,
         generation,
         artifact: Some(artifact),

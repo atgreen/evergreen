@@ -342,7 +342,13 @@ mod tests {
         for (pc, values) in [
             (11, NativeCallValues::Unavailable),
             (12, NativeCallValues::Retired),
-            (12, NativeCallValues::Deoptimizing { native_slots: 3, f64_slots: Box::new([]) }),
+            (
+                12,
+                NativeCallValues::Deoptimizing {
+                    native_slots: 3,
+                    f64_slots: Box::new([]),
+                },
+            ),
         ] {
             assert!(
                 table
@@ -364,13 +370,22 @@ mod tests {
         let table = NativeCallSites::new(32, vec![deopt, restart])
             .unwrap()
             .with_value_maps(HashMap::from([
-                (12, NativeCallValues::Deoptimizing { native_slots: 3, f64_slots: Box::new([]) }),
+                (
+                    12,
+                    NativeCallValues::Deoptimizing {
+                        native_slots: 3,
+                        f64_slots: Box::new([]),
+                    },
+                ),
                 (24, NativeCallValues::Retired),
             ]))
             .unwrap();
         assert!(matches!(
             table.value_map(12),
-            Some(NativeCallValues::Deoptimizing { native_slots: 3, .. })
+            Some(NativeCallValues::Deoptimizing {
+                native_slots: 3,
+                ..
+            })
         ));
         assert!(matches!(
             table.value_map(24),

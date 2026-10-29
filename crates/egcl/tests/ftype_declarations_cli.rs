@@ -121,7 +121,10 @@ fn checked_tail_calls_cannot_skip_parameter_contracts() {
                   (type-error (condition) (= (type-error-datum condition) 2))))
         (format t "CHECKED-TAIL-ARGUMENT~%")
     "#;
-    for variables in [vec![], vec![("EGCL_FORCE_TIER", "t1"), ("EGCL_TCO_DISABLE", "1")]] {
+    for variables in [
+        vec![],
+        vec![("EGCL_FORCE_TIER", "t1"), ("EGCL_TCO_DISABLE", "1")],
+    ] {
         let output = run_with_env(source, &variables);
         assert!(output.contains("CHECKED-TAIL-ARGUMENT"));
         // The default rewrite may decline native compilation for its always-
@@ -304,8 +307,10 @@ fn native_result_checks_preserve_values_and_do_not_replay_effects() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stdout}\n{stderr}");
     assert!(stdout.contains("NATIVE-RESULT-CHECKED-ONCE"));
-    assert!(stderr.contains("NATIVE-CHECKED-RESULT: optimized worker result installed with"),
-        "checked function must install native T2 code: {stderr}");
+    assert!(
+        stderr.contains("NATIVE-CHECKED-RESULT: optimized worker result installed with"),
+        "checked function must install native T2 code: {stderr}"
+    );
 }
 
 #[test]
@@ -375,7 +380,10 @@ fn native_result_edges_cover_baseline_and_optimized_tiers() {
         assert!(stdout.contains("NATIVE-RESULT-EDGES-OK"));
         if tier == 2 {
             assert!(stderr.contains("RESULT-PLAIN: optimized worker result installed with ordinary x86-64 Lisp T2 ABI"), "{stderr}");
-            assert!(stderr.contains("RESULT-WRAPPER: optimized worker result installed with"), "{stderr}");
+            assert!(
+                stderr.contains("RESULT-WRAPPER: optimized worker result installed with"),
+                "{stderr}"
+            );
         }
     }
 }
@@ -457,11 +465,13 @@ fn source_free_bfasl_retains_ftype_at_compile_and_load_time() {
         builder = builder.section(kind, section);
     }
     fs::write(&old_version, builder.build()).unwrap();
-    run(&format!(r#"
+    run(&format!(
+        r#"
         (assert (handler-case (progn (load {old_version:?}) nil)
                   (error () t)))
         (assert (not (fboundp 'persisted-checked-result)))
-    "#));
+    "#
+    ));
     fs::remove_file(old_version).unwrap();
     fs::remove_file(fasl).unwrap();
     fs::remove_dir(directory).unwrap();

@@ -23,12 +23,12 @@ use std::sync::atomic::{
 };
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 
-#[cfg(all(target_arch = "x86_64", windows))]
-#[path = "thread/windows.rs"]
-mod windows;
 #[cfg(all(test, egcl_fibers))]
 #[path = "thread/wait_token_tests.rs"]
 pub(crate) mod wait_token_tests;
+#[cfg(all(target_arch = "x86_64", windows))]
+#[path = "thread/windows.rs"]
+mod windows;
 #[cfg(all(target_arch = "x86_64", windows))]
 use windows::FiberExecutionContext;
 
@@ -946,7 +946,9 @@ impl NativeThread {
         // Reserve before publishing: a concurrent take must not subtract
         // before the corresponding obligation has been counted.
         POSTED_PENDING_SIGNALS.fetch_add(1, Ordering::Release);
-        let previous = self.pending_signals.fetch_or(signal.bit(), Ordering::Release);
+        let previous = self
+            .pending_signals
+            .fetch_or(signal.bit(), Ordering::Release);
         if previous & signal.bit() != 0 {
             POSTED_PENDING_SIGNALS.fetch_sub(1, Ordering::Release);
         }
@@ -1806,7 +1808,9 @@ impl Fiber {
         // Reserve before publishing: a concurrent take must not subtract
         // before the corresponding obligation has been counted.
         POSTED_PENDING_SIGNALS.fetch_add(1, Ordering::Release);
-        let previous = self.pending_signals.fetch_or(signal.bit(), Ordering::Release);
+        let previous = self
+            .pending_signals
+            .fetch_or(signal.bit(), Ordering::Release);
         if previous & signal.bit() != 0 {
             POSTED_PENDING_SIGNALS.fetch_sub(1, Ordering::Release);
         }
@@ -2345,7 +2349,11 @@ fn run_worker_task(pool: &Arc<WorkerPool>, carrier_index: usize, task: WorkerTas
             target_os = "linux"
         ))]
         crate::native_transfer::test_hooks::before_requeue(thread.id());
-        let destination = pool.carrier_ids.lock().unwrap().iter()
+        let destination = pool
+            .carrier_ids
+            .lock()
+            .unwrap()
+            .iter()
             .position(|&id| id == previous_carrier)
             .expect("a suspended segment retains a carrier in its owning pool");
         pool.workers[destination]
@@ -2504,7 +2512,9 @@ unsafe fn swap_fiber_to_scheduler(fiber: &Fiber) -> Result<(), EgclError> {
         )
     };
     #[cfg(not(egcl_tsan))]
-    unsafe { crate::context::swap(fiber.execution_context.as_ptr(), *scheduler) };
+    unsafe {
+        crate::context::swap(fiber.execution_context.as_ptr(), *scheduler)
+    };
     Ok(())
 }
 
@@ -3272,7 +3282,8 @@ pub fn current_fiber() -> Option<&'static Fiber> {
 /// different execution or after the owning execution retires. Generated readers
 /// use the `exec_context::offsets` ABI and atomic field load orderings.
 #[inline(never)]
-pub fn current_execution_context_for_native() -> Option<*const crate::exec_context::LispExecutionContext> {
+pub fn current_execution_context_for_native()
+-> Option<*const crate::exec_context::LispExecutionContext> {
     let fiber = ACTIVE_FIBER
         .try_with(|slot| {
             let current = slot.try_borrow().ok()?;
@@ -3286,7 +3297,9 @@ pub fn current_execution_context_for_native() -> Option<*const crate::exec_conte
     CURRENT_NATIVE_THREAD
         .try_with(|slot| {
             let current = slot.try_borrow().ok()?;
-            current.as_ref().map(|current| current.thread.execution().as_ptr())
+            current
+                .as_ref()
+                .map(|current| current.thread.execution().as_ptr())
         })
         .ok()
         .flatten()
@@ -3323,11 +3336,17 @@ pub fn begin_current_execution_poll() -> bool {
 pub fn rearm_current_execution_poll() {
     let posted = current_fiber()
         .is_some_and(|fiber| fiber.pending_signals.load(Ordering::Acquire) != 0)
-        || CURRENT_NATIVE_THREAD.try_with(|slot| {
-            slot.try_borrow().ok().is_none_or(|current| current.as_ref()
-                .is_none_or(|current| current.thread.pending_signals.load(Ordering::Acquire) != 0))
-        }).unwrap_or(true);
-    if posted || crate::safepoint::poll_work_pending()
+        || CURRENT_NATIVE_THREAD
+            .try_with(|slot| {
+                slot.try_borrow().ok().is_none_or(|current| {
+                    current.as_ref().is_none_or(|current| {
+                        current.thread.pending_signals.load(Ordering::Acquire) != 0
+                    })
+                })
+            })
+            .unwrap_or(true);
+    if posted
+        || crate::safepoint::poll_work_pending()
         || crate::runtime::process_signal_activity_pending()
         || sandbox_cpu_deadline_armed()
     {
@@ -3345,7 +3364,9 @@ pub(crate) fn current_yield_requested() -> bool {
             let Ok(current) = slot.try_borrow() else {
                 return Some(true);
             };
-            current.as_ref().map(|fiber| fiber.execution().yield_requested())
+            current
+                .as_ref()
+                .map(|fiber| fiber.execution().yield_requested())
         })
         .unwrap_or(Some(true));
     if let Some(requested) = fiber {
@@ -3426,7 +3447,12 @@ pub fn request_fiber_cancellation(id: FiberId) -> Result<(), EgclError> {
         // An unmounted wait can only belong to an initialized scheduler pool.
         // Resolve it after observing the wait: cancellation may race the first
         // submission, so a pool snapshot taken before the state lock can be stale.
-        let pool = fiber.scheduler_pool.lock().unwrap().as_ref().and_then(Weak::upgrade)
+        let pool = fiber
+            .scheduler_pool
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(Weak::upgrade)
             .ok_or_else(|| EgclError::Internal("cancelled wait has no scheduler".into()))?;
         pool.submit(WorkerTask {
             result_cell: Arc::clone(&fiber.result),
@@ -3589,7 +3615,11 @@ pub(crate) fn current_backtrace(count: usize) -> Vec<crate::debug_stack::Logical
     // SAFETY: this execution owns its active stack; copying does not yield.
     unsafe {
         snapshot.copy_stack(current_stack().fp(), count);
-        snapshot.copy_native(crate::debug_stack::NativeBacktraceTarget::Current, current_stack(), count);
+        snapshot.copy_native(
+            crate::debug_stack::NativeBacktraceTarget::Current,
+            current_stack(),
+            count,
+        );
     }
     snapshot.resolve(count)
 }
@@ -3615,7 +3645,11 @@ pub(crate) fn fiber_logical_backtrace(
         // SAFETY: Arc owns the stack; the mount/state lock excludes a mutator.
         unsafe {
             snapshot.copy_stack(fiber.stack.published_fp(), count);
-            snapshot.copy_native(crate::debug_stack::NativeBacktraceTarget::StoppedFiber(id), &fiber.stack, count);
+            snapshot.copy_native(
+                crate::debug_stack::NativeBacktraceTarget::StoppedFiber(id),
+                &fiber.stack,
+                count,
+            );
         }
         if *state == FiberState::Created && count != 0 {
             snapshot.entry(fiber.entry());
@@ -3629,7 +3663,11 @@ pub fn fiber_backtrace(id: FiberId, count: usize) -> Result<Option<Vec<String>>,
     Ok(fiber_logical_backtrace(id, count)?.map(|frames| {
         frames
             .into_iter()
-            .map(|frame| frame.function.unwrap_or_else(|| "<anonymous function>".into()))
+            .map(|frame| {
+                frame
+                    .function
+                    .unwrap_or_else(|| "<anonymous function>".into())
+            })
             .collect()
     }))
 }
@@ -4147,10 +4185,19 @@ mod execution_poll_producer_tests {
 
     #[test]
     fn posted_signal_arms_its_owner_and_mounted_carrier_executions() {
-        let thread = NativeThread::new(NativeThreadId(91001), None, false, false,
-            NIL, Arc::new(ThreadResult::new()));
+        let thread = NativeThread::new(
+            NativeThreadId(91001),
+            None,
+            false,
+            false,
+            NIL,
+            Arc::new(ThreadResult::new()),
+        );
         let mounted = crate::exec_context::LispExecutionContext::new(
-            crate::exec_context::ExecutionKind::Fiber, 91002, 91001);
+            crate::exec_context::ExecutionKind::Fiber,
+            91002,
+            91001,
+        );
         thread.execution().begin_poll();
         mounted.begin_poll();
         thread.post_pending_signal(PendingSignal::Interrupt);
@@ -4161,8 +4208,14 @@ mod execution_poll_producer_tests {
 
     #[test]
     fn duplicate_signal_posts_leave_one_consumable_obligation() {
-        let thread = NativeThread::new(NativeThreadId(91003), None, false, false,
-            NIL, Arc::new(ThreadResult::new()));
+        let thread = NativeThread::new(
+            NativeThreadId(91003),
+            None,
+            false,
+            false,
+            NIL,
+            Arc::new(ThreadResult::new()),
+        );
         thread.execution().begin_poll();
         thread.post_pending_signal(PendingSignal::Interrupt);
         thread.post_pending_signal(PendingSignal::Interrupt);
@@ -4208,8 +4261,12 @@ mod cancellation_race_tests {
                 .env(CHILD, "1")
                 .output()
                 .unwrap();
-            assert!(output.status.success(), "{}\n{}",
-                String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
             return;
         }
         std::thread::spawn(|| {

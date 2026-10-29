@@ -50,7 +50,11 @@ fn run(prefix: &str, envs: &[(&str, &str)]) -> (String, String) {
         .expect("run inline-decline regression");
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-    assert!(out.status.success(), "{envs:?}: {}\n{stdout}\n{stderr}", out.status);
+    assert!(
+        out.status.success(),
+        "{envs:?}: {}\n{stdout}\n{stderr}",
+        out.status
+    );
     (stdout, stderr)
 }
 

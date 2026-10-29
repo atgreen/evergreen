@@ -48,7 +48,9 @@ fn sequence_bytes(sequence: EgclVal) -> Result<Vec<u8>, EgclError> {
 /// self-hosted APK build once hashing was native.
 pub fn crc32_of_sequence(sequence: EgclVal) -> Result<EgclVal, EgclError> {
     let bytes = sequence_bytes(sequence)?;
-    Ok(EgclVal::from_fixnum(i64::from(egcl_rt::digest::crc32(&bytes))))
+    Ok(EgclVal::from_fixnum(i64::from(egcl_rt::digest::crc32(
+        &bytes,
+    ))))
 }
 
 /// `(egcl-ext:inflate octets &optional format)`: decompress a sequence of

@@ -378,14 +378,8 @@ fn match_routing_with_wildcard_arm() {
         }),
         "type"
     );
-    assert_eq!(
-        classify(&EgclError::UnboundVariable(EgclVal(0))),
-        "unbound"
-    );
-    assert_eq!(
-        classify(&EgclError::UndefinedFunction(EgclVal(0))),
-        "undef"
-    );
+    assert_eq!(classify(&EgclError::UnboundVariable(EgclVal(0))), "unbound");
+    assert_eq!(classify(&EgclError::UndefinedFunction(EgclVal(0))), "undef");
     assert_eq!(classify(&EgclError::ArithmeticError("x".into())), "arith");
     assert_eq!(classify(&EgclError::PackageError("x".into())), "pkg");
     assert_eq!(classify(&EgclError::StreamError("x".into())), "stream");
@@ -446,7 +440,7 @@ fn capture_keeps_control_and_storage_failures_unwrapped() {
     assert!(
         matches!(EgclError::Internal("transfer".into()).capture_backtrace(), EgclError::Internal(token) if token == "transfer")
     );
-    let error =
-        EgclError::signalled(egcl_rt::value::NIL, "original".into(), Vec::new()).capture_backtrace();
+    let error = EgclError::signalled(egcl_rt::value::NIL, "original".into(), Vec::new())
+        .capture_backtrace();
     assert!(matches!(error, EgclError::Signalled(_)));
 }

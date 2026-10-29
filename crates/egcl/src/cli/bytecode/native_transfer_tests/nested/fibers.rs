@@ -216,7 +216,9 @@ pub(in crate::cli::bytecode::native_transfer_tests) fn pause() -> Result<EgclVal
     if before.is_some_and(|before| held.to_raw() != before) {
         MOVED.fetch_add(1, Ordering::Relaxed);
     }
-    if argument_before.is_some_and(|before| unsafe { *(probe.argument as *const EgclVal) }.to_raw() != before) {
+    if argument_before
+        .is_some_and(|before| unsafe { *(probe.argument as *const EgclVal) }.to_raw() != before)
+    {
         RECURSIVE_ARGUMENT_MOVES.fetch_add(1, Ordering::Relaxed);
     }
     assert_eq!(cp(*held), (*value, NIL));
@@ -297,8 +299,10 @@ fn child_fiber_checked() -> EgclVal {
             "fiber must suspend in a real guard continuation"
         );
         if mode == 5 {
-            assert!(code.ordinary_entry.is_some() && code.mapped_entry().is_none(),
-                "guarded child suspends through its ordinary segment boundary");
+            assert!(
+                code.ordinary_entry.is_some() && code.mapped_entry().is_none(),
+                "guarded child suspends through its ordinary segment boundary"
+            );
         }
         code
     } else {
@@ -312,13 +316,15 @@ fn child_fiber_checked() -> EgclVal {
             .unwrap() as u32;
         code = code.without_catch_destination(push);
     }
-    let _trace_pins = (mode >= 8).then(||
-        super::super::ordinary_t2::RecursiveFixturePins::new(&[&pause, &finish]));
+    let _trace_pins = (mode >= 8)
+        .then(|| super::super::ordinary_t2::RecursiveFixturePins::new(&[&pause, &finish]));
     let installed = if mode >= 8 {
-        let (selected, installed) = super::super::ordinary_t2::install(
-            &name, "(x active n)", &source, &mut env);
+        let (selected, installed) =
+            super::super::ordinary_t2::install(&name, "(x active n)", &source, &mut env);
         assert_eq!(selected, symbol);
-        let NativeCodeStorage::Mapped(mapped) = &installed._storage else { panic!("mapped T2") };
+        let NativeCodeStorage::Mapped(mapped) = &installed._storage else {
+            panic!("mapped T2")
+        };
         assert!(installed.is_t2 && mapped.native_entry_kind_slot.is_some());
         installed
     } else {
@@ -407,8 +413,11 @@ fn child_fiber_checked() -> EgclVal {
         assert_eq!(mapped.deopt_count(), 1);
     }
     if mode >= 8 {
-        assert_eq!(mapped.deopt_count(), 0,
-            "normal return and THROW must retire the original native chain without deoptimization");
+        assert_eq!(
+            mapped.deopt_count(),
+            0,
+            "normal return and THROW must retire the original native chain without deoptimization"
+        );
     }
     assert_eq!(
         take_nested_entries(),
@@ -489,30 +498,69 @@ fn stopped_native_rows(
             return frames;
         }
         egcl_rt::poll_safepoint();
-        assert!(std::time::Instant::now() < deadline, "native fiber did not stop");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "native fiber did not stop"
+        );
         std::thread::yield_now();
     }
 }
 
 fn assert_stopped_native_rows(frames: &[egcl_rt::debug_stack::LogicalFrame]) -> u64 {
     use egcl_rt::debug_stack::FrameOrigin;
-    let rows: Vec<_> = frames.iter().filter(|frame| frame.function.as_deref()
-        .is_some_and(|name| name.starts_with("MIGRATING-CHILD-"))).collect();
-    assert_eq!(rows.len(), 5, "four physical recursive children and one real managed anchor");
+    let rows: Vec<_> = frames
+        .iter()
+        .filter(|frame| {
+            frame
+                .function
+                .as_deref()
+                .is_some_and(|name| name.starts_with("MIGRATING-CHILD-"))
+        })
+        .collect();
+    assert_eq!(
+        rows.len(),
+        5,
+        "four physical recursive children and one real managed anchor"
+    );
     let name = rows[0].function.as_deref().unwrap();
-    let case: i64 = name.strip_prefix("MIGRATING-CHILD-").unwrap().parse().unwrap();
-    let argument = rows[0].arguments.as_ref().expect("original native arguments")[0];
+    let case: i64 = name
+        .strip_prefix("MIGRATING-CHILD-")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let argument = rows[0]
+        .arguments
+        .as_ref()
+        .expect("original native arguments")[0];
     assert_eq!(cp(argument), (EgclVal::from_fixnum(case), NIL));
     for (depth, row) in rows.iter().enumerate() {
         assert_eq!(row.function.as_deref(), Some(name));
-        assert_eq!(row.origin, if depth < 4 { FrameOrigin::Native } else { FrameOrigin::Managed });
-        assert_eq!(row.arguments.as_deref(),
-            Some(&[argument, T, EgclVal::from_fixnum(depth as i64)][..]));
+        assert_eq!(
+            row.origin,
+            if depth < 4 {
+                FrameOrigin::Native
+            } else {
+                FrameOrigin::Managed
+            }
+        );
+        assert_eq!(
+            row.arguments.as_deref(),
+            Some(&[argument, T, EgclVal::from_fixnum(depth as i64)][..])
+        );
     }
     let leaf_name = format!("CHILD-PAUSE-{case}");
-    let leaf = frames.iter().position(|frame| frame.function.as_deref() == Some(leaf_name.as_str())).unwrap();
-    let native = frames.iter().position(|frame| frame.function.as_deref() == Some(name)).unwrap();
-    assert!(leaf < native, "suspended interpreted leaf must precede native callers");
+    let leaf = frames
+        .iter()
+        .position(|frame| frame.function.as_deref() == Some(leaf_name.as_str()))
+        .unwrap();
+    let native = frames
+        .iter()
+        .position(|frame| frame.function.as_deref() == Some(name))
+        .unwrap();
+    assert!(
+        leaf < native,
+        "suspended interpreted leaf must precede native callers"
+    );
     argument.to_raw()
 }
 
@@ -560,7 +608,10 @@ fn ordinary_t2_recursive_fibers_use_their_stack_limit_after_cli_initialization()
     // direct-builtin initialization without starting an interactive session.
     assert_eq!(crate::cli::run(&["--runtime-info".into()]).unwrap(), 0);
     let carrier_limit = egcl_rt::stack::NATIVE_STACK_LIMIT.load(Ordering::Acquire);
-    assert_ne!(carrier_limit, 0, "the production carrier limit must be active");
+    assert_ne!(
+        carrier_limit, 0,
+        "the production carrier limit must be active"
+    );
     // Both normal return and THROW retain the existing exact four native child
     // entries, moving original arguments, stopped backtraces, and migration.
     run_child_modes(false, 8..10);
@@ -676,10 +727,13 @@ fn run_child_modes(refuse: bool, modes: std::ops::Range<usize>) {
             // Do not retain the first argument copies as roots: the suspended
             // execution alone must preserve and relocate its native arguments.
             let trace_before = if mode >= 8 {
-                fibers.iter().map(|&fiber|
-                    assert_stopped_native_rows(&stopped_native_rows(fiber, deadline)))
+                fibers
+                    .iter()
+                    .map(|&fiber| assert_stopped_native_rows(&stopped_native_rows(fiber, deadline)))
                     .collect::<Vec<_>>()
-            } else { Vec::new() };
+            } else {
+                Vec::new()
+            };
             if !refuse {
                 // Allocation stress can already have moved these arguments to
                 // Survivor space, which another minor collection does not visit.
@@ -690,9 +744,17 @@ fn run_child_modes(refuse: bool, modes: std::ops::Range<usize>) {
                 for &fiber in &fibers {
                     traces.push(stopped_native_rows(fiber, deadline));
                 }
-                let after: Vec<_> = traces.iter().map(|rows| assert_stopped_native_rows(rows)).collect();
-                assert!(trace_before.iter().zip(after).any(|(before, after)| *before != after),
-                    "native original arguments must actually relocate while their fibers are stopped");
+                let after: Vec<_> = traces
+                    .iter()
+                    .map(|rows| assert_stopped_native_rows(rows))
+                    .collect();
+                assert!(
+                    trace_before
+                        .iter()
+                        .zip(after)
+                        .any(|(before, after)| *before != after),
+                    "native original arguments must actually relocate while their fibers are stopped"
+                );
             }
             RELEASE.store(true, Ordering::Release);
             assert_eq!(

@@ -145,12 +145,14 @@ fn a_place_that_holds_a_place_keeps_both() {
 #[test]
 fn imported_common_lisp_accessor_keeps_its_builtin_writer() {
     assert_eq!(
-        eval(r#"(progn
+        eval(
+            r#"(progn
           (dotimes (i 64)
             (let ((package (make-package (format nil "GET-IMPORT-~D" i) :use nil)))
               (import 'cl:get package)))
           (setf (get 'target 'property) 73)
-          (format t "RESULT:~s" (get 'target 'property)))"#),
+          (format t "RESULT:~s" (get 'target 'property)))"#
+        ),
         "73"
     );
 }

@@ -948,7 +948,11 @@ mod tests {
         // offset and the top of each field's range.
         check(&[
             ("ldrb w0, [x1]", 0x39400020, ldrb_imm(0, 1, 0).unwrap()),
-            ("ldrb w2, [x3, #17]", 0x39404462, ldrb_imm(2, 3, 17).unwrap()),
+            (
+                "ldrb w2, [x3, #17]",
+                0x39404462,
+                ldrb_imm(2, 3, 17).unwrap(),
+            ),
             (
                 "ldrb w4, [x5, #4095]",
                 0x397FFCA4,
@@ -956,7 +960,11 @@ mod tests {
             ),
             ("strb w0, [x1, #7]", 0x39001C20, strb_imm(0, 1, 7).unwrap()),
             ("ldrh w0, [x1]", 0x79400020, ldrh_imm(0, 1, 0).unwrap()),
-            ("ldrh w2, [x3, #34]", 0x79404462, ldrh_imm(2, 3, 34).unwrap()),
+            (
+                "ldrh w2, [x3, #34]",
+                0x79404462,
+                ldrh_imm(2, 3, 34).unwrap(),
+            ),
             (
                 "strh w4, [x5, #8190]",
                 0x793FFCA4,
@@ -1053,7 +1061,11 @@ mod tests {
             ("sdiv x1, x2, x3", 0x9AC30C41, sdiv(1, 2, 3)),
             ("extr x0, x1, x0, #8", 0x93C02020, extr(0, 1, 0, 8)),
             ("adds x2, x6, #64", 0xB10100C2, adds_imm(2, 6, 64).unwrap()),
-            ("adds x0, x1, #4095", 0xB13FFC20, adds_imm(0, 1, 4095).unwrap()),
+            (
+                "adds x0, x1, #4095",
+                0xB13FFC20,
+                adds_imm(0, 1, 4095).unwrap(),
+            ),
             ("extr x10, x11, x10, #8", 0x93CA216A, extr(10, 11, 10, 8)),
             ("sdiv x5, x4, x9", 0x9AC90C85, sdiv(5, 4, 9)),
             (

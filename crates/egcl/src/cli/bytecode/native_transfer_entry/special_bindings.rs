@@ -4,8 +4,8 @@
 use super::*;
 use egcl_compiler::control_scope::{ControlScope, Ownership, ScopeKind};
 use egcl_compiler::t2::emit::{
-    TransferCallRequest, TRANSFER_GLOBAL_LOAD_REQUEST, TRANSFER_GLOBAL_STORE_REQUEST,
-    TRANSFER_SPECIAL_BIND_REQUEST, TRANSFER_SPECIAL_UNBIND_REQUEST,
+    TRANSFER_GLOBAL_LOAD_REQUEST, TRANSFER_GLOBAL_STORE_REQUEST, TRANSFER_SPECIAL_BIND_REQUEST,
+    TRANSFER_SPECIAL_UNBIND_REQUEST, TransferCallRequest,
 };
 
 /// Preserve the original binding guard; re-establishing a binding at OSR or
@@ -67,7 +67,10 @@ pub(super) unsafe fn special_request(call: &TransferCallRequest) -> Result<EgclV
     let tag = call.symbol & !u64::from(u32::MAX);
     let index = call.symbol as u32;
     #[cfg(test)]
-    if matches!(tag, TRANSFER_GLOBAL_LOAD_REQUEST | TRANSFER_GLOBAL_STORE_REQUEST) {
+    if matches!(
+        tag,
+        TRANSFER_GLOBAL_LOAD_REQUEST | TRANSFER_GLOBAL_STORE_REQUEST
+    ) {
         count_global_access_helper_call();
     }
     if tag == TRANSFER_GLOBAL_LOAD_REQUEST {
@@ -80,7 +83,8 @@ pub(super) unsafe fn special_request(call: &TransferCallRequest) -> Result<EgclV
         }
         let symbol = EgclVal::from_symbol_index(index);
         let env = unsafe { &*env };
-        return env.lookup_var_symbol(symbol)
+        return env
+            .lookup_var_symbol(symbol)
             .or_else(|| env.lookup_var(&sym_name(symbol)))
             .ok_or(EgclError::UnboundVariable(symbol));
     }

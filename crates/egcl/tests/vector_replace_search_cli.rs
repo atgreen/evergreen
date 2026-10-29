@@ -105,8 +105,8 @@ fn fill_stores_into_simple_vectors_and_strings() {
     "#,
     );
     assert!(
-        stdout.contains(r#"RESULT:#(1 1 0 0 0 1) "abcdzz" #(:X :X :X :X) (9 9 3) "---" :TYPE-ERROR"#),
+        stdout
+            .contains(r#"RESULT:#(1 1 0 0 0 1) "abcdzz" #(:X :X :X :X) (9 9 3) "---" :TYPE-ERROR"#),
         "{stdout}"
     );
 }
-

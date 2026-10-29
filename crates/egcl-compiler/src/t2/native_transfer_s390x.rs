@@ -243,10 +243,7 @@ pub fn emit_helper_veneer(helper: NativeHelperV2, cold_entry: *const u8) -> Vec<
 /// `dispatch` with the same three registers. Preparation returns normally
 /// before any frame is adjusted, so no Rust frame is ever jumped over, and
 /// only this stub's temporary frame is removed.
-pub fn emit_capture_stub(
-    prepare: NativeTransferPrepare,
-    dispatch: *const u8,
-) -> Vec<u8> {
+pub fn emit_capture_stub(prepare: NativeTransferPrepare, dispatch: *const u8) -> Vec<u8> {
     use std::mem::{offset_of, size_of};
     const {
         assert!(size_of::<S390xTransferCapture>() == 104);
@@ -286,7 +283,8 @@ pub fn emit_capture_stub(
     a.address(15, 15, frame_bytes);
     a.imm64(1, dispatch as usize as u64);
     a.jump_reg(1);
-    a.finish().expect("System Z capture stub has no unresolved labels")
+    a.finish()
+        .expect("System Z capture stub has no unresolved labels")
 }
 
 /// Emit the tail adapter from `(landing_packet, primary, exit)` in r2/r3/r4
@@ -452,16 +450,11 @@ mod tests {
             a.jump_reg(1);
             egcl_rt::jit::JitBuffer::new(&a.finish().unwrap()).unwrap()
         };
-        let capture = egcl_rt::jit::JitBuffer::new(&emit_capture_stub(
-            prepare,
-            trampoline.as_ptr(),
-        ))
-        .unwrap();
-        let veneer = egcl_rt::jit::JitBuffer::new(&emit_helper_veneer(
-            throwing_helper,
-            capture.as_ptr(),
-        ))
-        .unwrap();
+        let capture =
+            egcl_rt::jit::JitBuffer::new(&emit_capture_stub(prepare, trampoline.as_ptr())).unwrap();
+        let veneer =
+            egcl_rt::jit::JitBuffer::new(&emit_helper_veneer(throwing_helper, capture.as_ptr()))
+                .unwrap();
 
         // The generated caller. It owns r6-r13 across the call, so r6 is a
         // legal exception-live home; the pad returns whatever r6 holds.

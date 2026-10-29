@@ -164,10 +164,14 @@ pub fn verify_accesses(f: &Function) -> Result<(), String> {
                 return Err("invalid allocation-backed layout producer".into());
             }
             if data.opcode == Opcode::PackedU8AllocationExtent
-                && super::allocation_extent::producer_site(f, inst, &facts).is_none() {
+                && super::allocation_extent::producer_site(f, inst, &facts).is_none()
+            {
                 return Err("invalid allocation extent producer".into());
             }
-            if !matches!(data.opcode, Opcode::TryStoreIntegerOctets1To8Layout | Opcode::TryStoreIntegerOctets1To8Extent) {
+            if !matches!(
+                data.opcode,
+                Opcode::TryStoreIntegerOctets1To8Layout | Opcode::TryStoreIntegerOctets1To8Extent
+            ) {
                 continue;
             }
             let extent = data.opcode == Opcode::TryStoreIntegerOctets1To8Extent;
@@ -191,13 +195,17 @@ pub fn verify_accesses(f: &Function) -> Result<(), String> {
             {
                 return Err("malformed layout-backed octet kernel".into());
             }
-            if extent && (!facts.extent_for(data.args[0], data.args[4], data.args[5], inst)
-                || (matches!(data.aux, AuxData::AllocationExtentInBounds)
-                    && !super::allocation_extent::end_in_bounds(f, inst, &facts))) {
+            if extent
+                && (!facts.extent_for(data.args[0], data.args[4], data.args[5], inst)
+                    || (matches!(data.aux, AuxData::AllocationExtentInBounds)
+                        && !super::allocation_extent::end_in_bounds(f, inst, &facts)))
+            {
                 return Err("invalid correlated extent or unproved capacity bound".into());
             }
-            if !extent && matches!(data.aux, AuxData::AllocationDimensionInBounds)
-                && !super::allocation_extent::dimension_in_bounds(f, inst, &facts) {
+            if !extent
+                && matches!(data.aux, AuxData::AllocationDimensionInBounds)
+                && !super::allocation_extent::dimension_in_bounds(f, inst, &facts)
+            {
                 return Err("unproved allocation dimension capacity bound".into());
             }
             let Some(seed) = facts.origin(data.args[4]) else {
@@ -211,8 +219,15 @@ pub fn verify_accesses(f: &Function) -> Result<(), String> {
                 return Err("layout witness is not a producer result".into());
             };
             let producer = f.inst(probe);
-            if !matches!(producer.opcode, Opcode::PackedU8Layout | Opcode::PackedU8AllocationLayout)
-                || producer.args.len() != if producer.opcode == Opcode::PackedU8Layout { 1 } else { 2 }
+            if !matches!(
+                producer.opcode,
+                Opcode::PackedU8Layout | Opcode::PackedU8AllocationLayout
+            ) || producer.args.len()
+                != if producer.opcode == Opcode::PackedU8Layout {
+                    1
+                } else {
+                    2
+                }
                 || producer.results.first() != Some(&seed)
                 || !facts.witness_for(data.args[0], data.args[4], inst)
             {

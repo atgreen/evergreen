@@ -11,7 +11,7 @@ use super::ir::{
     ValueRepresentation,
 };
 use super::region_clone::{clone_region, repair_outside_uses};
-use super::vector_range_proof::{candidates, CountedVectorLoop};
+use super::vector_range_proof::{CountedVectorLoop, candidates};
 
 #[derive(Default, Debug)]
 pub struct VectorRangeStats {

@@ -101,19 +101,29 @@ fn native_v2_distinct_callee_preserves_live_handler_cluster() {
         let mut env = Env::new(false);
         egcl_rt::rooted_ref!(_env = &mut env);
         super::super::super::read_eval_all_env(
-            &format!("(setq *distinct-signals* 0)
+            &format!(
+                "(setq *distinct-signals* 0)
              (defun distinct-signal-handler (c)
                (declare (ignore c))
                (setq *distinct-signals* (+ *distinct-signals* 1))
                (invoke-restart 'distinct-resume))
-             (defun distinct-symbol-value (x) {body})"),
+             (defun distinct-symbol-value (x) {body})"
+            ),
             &mut env,
         )
         .unwrap();
         install_t2("DISTINCT-SYMBOL-VALUE", "(x)", &format!("({body})"), &env);
-        let installed = NATIVE_REGISTRY.with(|registry| registry.borrow()
-            .get(&egcl_rt::symbols::find_index("DISTINCT-SYMBOL-VALUE").unwrap()).cloned()).unwrap();
-        let NativeCodeStorage::Mapped(child) = &installed._storage else { unreachable!() };
+        let installed = NATIVE_REGISTRY
+            .with(|registry| {
+                registry
+                    .borrow()
+                    .get(&egcl_rt::symbols::find_index("DISTINCT-SYMBOL-VALUE").unwrap())
+                    .cloned()
+            })
+            .unwrap();
+        let NativeCodeStorage::Mapped(child) = &installed._storage else {
+            unreachable!()
+        };
         assert!(child.ordinary_entry.is_some() && child.mapped_entry().is_none());
         let code = compile_caller(
             "(x)",
@@ -130,7 +140,11 @@ fn native_v2_distinct_callee_preserves_live_handler_cluster() {
             egcl_rt::rooted!(args = vec![super::super::super::arena_cons(T, NIL)]);
             egcl_rt::rooted!(result = code.run(&args, &mut env).unwrap());
             assert_eq!(*result, reader::read_from_string(":resumed").unwrap().0);
-            assert_eq!(take_nested_entries(), 0, "ordinary child uses its own segment boundary");
+            assert_eq!(
+                take_nested_entries(),
+                0,
+                "ordinary child uses its own segment boundary"
+            );
             assert_eq!(stack.fp(), old_frame);
             assert_eq!(stack.sp(), old_sp);
             assert!(env.handlers.is_empty());
@@ -356,12 +370,14 @@ fn native_v2_distinct_callee_returns_to_recursive_parent_activation() {
         if invalid_capture {
             assert!(
                 matches!(&*result, Err(EgclError::Internal(message)) if message == "invalid native transfer capture"),
-                "{:?}", &*result
+                "{:?}",
+                &*result
             );
         } else if fail == T {
             assert!(
                 matches!(&*result, Err(EgclError::Signalled(_))),
-                "{:?}", &*result
+                "{:?}",
+                &*result
             );
         } else {
             assert_eq!(result.as_ref().unwrap(), &args[1]);
@@ -390,8 +406,8 @@ fn compile_caller(params: &str, forms: &str, env: &Env) -> TransferCode {
 fn compile_mapped_caller(params: &str, forms: &str, env: &Env) -> TransferCode {
     egcl_rt::rooted!(params = reader::read_from_string(params).unwrap().0);
     egcl_rt::rooted!(forms = reader::read_from_string(forms).unwrap().0);
-    let body = Arc::new(compile_function("DISTINCT-CALLER", *params, *forms,
-        env, false, false).unwrap());
+    let body =
+        Arc::new(compile_function("DISTINCT-CALLER", *params, *forms, env, false, false).unwrap());
     let code = TransferCode::compile_mapped_for_test(body).unwrap();
     assert!(code.ordinary_entry.is_none() && code.mapped_entry().is_some());
     code
@@ -411,8 +427,9 @@ fn install_t2(name: &str, params: &str, forms: &str, env: &Env) {
     let artifact = input.with_gc_stable(compile_t2_artifact).unwrap();
     assert!(
         install_t2_completion(T2Completion {
-                    panicked: false,
-                    _permit: None, dependencies: Vec::new(),
+            panicked: false,
+            _permit: None,
+            dependencies: Vec::new(),
             sym: symbol,
             generation,
             artifact: Some(artifact),

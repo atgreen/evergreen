@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
 //! Tests for egcl-stdlib CLOS module (spec §5.3).
-use egcl_rt::value::{NIL, T, EgclVal};
+use egcl_rt::value::{EgclVal, NIL, T};
 use egcl_stdlib::clos::*;
 
 fn test_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -607,4 +607,3 @@ fn metaobject_handles_are_off_the_fixnum_tag() {
     assert!(gf.is_meta_handle());
     assert_ne!(gf, EgclVal::from_fixnum(gf.as_meta_handle_id()));
 }
-

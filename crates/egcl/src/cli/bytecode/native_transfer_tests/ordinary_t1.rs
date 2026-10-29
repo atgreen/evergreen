@@ -118,14 +118,23 @@ fn ordinary_t1_keeps_arithmetic_guards_and_register_recursion() {
         code.t2_metadata.is_some(),
         "guards need exact retained reconstruction metadata"
     );
-    let NativeCodeStorage::Mapped(mapped) = &code._storage else { unreachable!() };
+    let NativeCodeStorage::Mapped(mapped) = &code._storage else {
+        unreachable!()
+    };
     assert!(mapped.ordinary_entry.is_some());
     assert!(mapped.mapped_entry().is_none());
     assert!(mapped.value_maps_for_test().iter().next().is_some());
     // Publish the self-call descriptor before resetting the measured counts.
-    assert_eq!(run_native(&code, symbol,
-        &[EgclVal::from_fixnum(4), EgclVal::from_fixnum(10)], &mut env).unwrap(),
-        EgclVal::from_fixnum(15));
+    assert_eq!(
+        run_native(
+            &code,
+            symbol,
+            &[EgclVal::from_fixnum(4), EgclVal::from_fixnum(10)],
+            &mut env
+        )
+        .unwrap(),
+        EgclVal::from_fixnum(15)
+    );
     for (x, expected) in [(10, "15"), ((1_i64 << 60) - 1, "1152921504606846980")] {
         super::super::super::read_eval_all_env("(setq *ordinary-t1-ticks* 0)", &mut env).unwrap();
         native_transfer_entry::take_recursive_entries();
@@ -153,12 +162,21 @@ fn ordinary_t1_keeps_arithmetic_guards_and_register_recursion() {
             0,
             "ordinary recursion must not enter legacy recursive frames"
         );
-        assert_eq!(native_transfer_entry::ordinary_calls::take_cold_calls_for_test(), 0,
-            "all ordinary recursive edges are admitted");
-        assert_eq!(native_transfer_entry::ordinary_calls::take_named_entries_for_test(), 5,
-            "only the five effect ticks use named adapters");
-        assert_eq!(mapped.deopt_count() - deopts, if x == 10 { 0 } else { 5 },
-            "each overflowing activation resumes its own continuation");
+        assert_eq!(
+            native_transfer_entry::ordinary_calls::take_cold_calls_for_test(),
+            0,
+            "all ordinary recursive edges are admitted"
+        );
+        assert_eq!(
+            native_transfer_entry::ordinary_calls::take_named_entries_for_test(),
+            5,
+            "only the five effect ticks use named adapters"
+        );
+        assert_eq!(
+            mapped.deopt_count() - deopts,
+            if x == 10 { 0 } else { 5 },
+            "each overflowing activation resumes its own continuation"
+        );
         assert_eq!(
             (
                 stack.fp(),

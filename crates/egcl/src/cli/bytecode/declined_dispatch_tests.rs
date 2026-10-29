@@ -19,7 +19,15 @@ fn a_declined_function_skips_tier_dispatch_after_its_decline() {
     egcl_rt::rooted!(forms = reader::read_from_string("((+ x 1))").unwrap().0);
     egcl_rt::rooted!(function = egcl_rt::function::alloc_interpreted(*params, *forms, NIL, *name));
     let body = Arc::new(
-        compile_function("DECLINED-DISPATCH-PROBE", *params, *forms, &env, false, false).unwrap(),
+        compile_function(
+            "DECLINED-DISPATCH-PROBE",
+            *params,
+            *forms,
+            &env,
+            false,
+            false,
+        )
+        .unwrap(),
     );
     egcl_rt::symbols::set_symbol_function(symbol, *function);
     assert!(publish_bytecode(symbol, body, None, *function));
@@ -31,9 +39,14 @@ fn a_declined_function_skips_tier_dispatch_after_its_decline() {
         // The tree-walker counts a named function's invocation before
         // dispatching it; do the same so the probe crosses the T1 threshold.
         egcl_rt::function::record_invocation(*function);
-        let result = call_registered(symbol, &[EgclVal::from_fixnum(i as i64)], *function, &mut env)
-            .expect("registered bytecode")
-            .unwrap();
+        let result = call_registered(
+            symbol,
+            &[EgclVal::from_fixnum(i as i64)],
+            *function,
+            &mut env,
+        )
+        .expect("registered bytecode")
+        .unwrap();
         assert_eq!(result, EgclVal::from_fixnum(i as i64 + 1));
     }
     let dispatches = TIER_DISPATCHES.with(std::cell::Cell::get) - before;

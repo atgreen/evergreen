@@ -12,8 +12,7 @@ fn run(program: &str) {
         .output()
         .unwrap();
     assert!(
-        output.status.success()
-            && String::from_utf8_lossy(&output.stdout).contains("READTABLE-OK"),
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("READTABLE-OK"),
         "{}\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)

@@ -298,10 +298,13 @@ fn foreign_name(value: EgclVal) -> Result<String, EgclError> {
 /// Explicit callback ownership, independent of the lifetime of its Lisp wrapper.
 /// The caller must retire all foreign pointer uses before FREE; the active check
 /// additionally rejects a callback trying to release its own executable entry.
-#[cfg(any(all(target_arch = "x86_64", any(unix, windows)), all(target_arch = "s390x", unix)))]
+#[cfg(any(
+    all(target_arch = "x86_64", any(unix, windows)),
+    all(target_arch = "s390x", unix)
+))]
 pub fn callback_call(args: &[EgclVal]) -> Result<EgclVal, EgclError> {
-    use std::sync::{Mutex, OnceLock};
     use egcl_rt::ffi::managed_callback::LispCallback;
+    use std::sync::{Mutex, OnceLock};
     static CALLBACKS: OnceLock<Mutex<Vec<Option<LispCallback>>>> = OnceLock::new();
     let registry = CALLBACKS.get_or_init(|| Mutex::new(Vec::new()));
     let is_callback = |value: EgclVal| {
@@ -369,9 +372,7 @@ pub fn callback_call(args: &[EgclVal]) -> Result<EgclVal, EgclError> {
                 }
                 "FREE" => {
                     if callback.is_active() {
-                        return Err(EgclError::FfiError(
-                            "cannot free an active callback".into(),
-                        ));
+                        return Err(EgclError::FfiError("cannot free an active callback".into()));
                     }
                     let released = slot.take();
                     drop(callbacks);
@@ -393,7 +394,10 @@ pub fn callback_call(args: &[EgclVal]) -> Result<EgclVal, EgclError> {
     }
 }
 
-#[cfg(not(any(all(target_arch = "x86_64", any(unix, windows)), all(target_arch = "s390x", unix))))]
+#[cfg(not(any(
+    all(target_arch = "x86_64", any(unix, windows)),
+    all(target_arch = "s390x", unix)
+)))]
 pub fn callback_call(_args: &[EgclVal]) -> Result<EgclVal, EgclError> {
     Err(EgclError::FfiError(
         "callbacks are not implemented for this target ABI".into(),
@@ -450,7 +454,11 @@ pub fn library_call(args: &[EgclVal]) -> Result<EgclVal, EgclError> {
             Ok(crate::sequences::build_list(&names))
         }
         ("EMBEDDED-P", [name]) => Ok(
-            if egcl_rt::ffi::embedded::is_embedded(&foreign_name(*name)?) { T } else { NIL },
+            if egcl_rt::ffi::embedded::is_embedded(&foreign_name(*name)?) {
+                T
+            } else {
+                NIL
+            },
         ),
         ("LOAD", [path]) => {
             let handle = egcl_rt::ffi::load_foreign_library(&foreign_name(*path)?)?;

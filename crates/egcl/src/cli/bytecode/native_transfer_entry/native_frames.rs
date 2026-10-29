@@ -76,7 +76,9 @@ pub(super) unsafe fn initialize_for(
         test_observer: std::ptr::null(),
         stack_limit: egcl_rt::stack::current_native_stack_limit(),
     };
-    unsafe { (*context).native_recursive = Some(control); }
+    unsafe {
+        (*context).native_recursive = Some(control);
+    }
     let control = unsafe { (*context).native_recursive.as_mut().unwrap() };
     #[cfg(test)]
     {
@@ -111,10 +113,16 @@ pub(super) unsafe extern "C" fn slow_call(
             let request = &mut *request.cast::<NativeRecursiveCallRequest>();
             request.admitted = 0;
             let context = CAPTURE.with(Cell::get);
-            let expected = (*context).native_recursive.as_mut()
-                .map(std::ptr::from_mut).expect("native recursive control");
+            let expected = (*context)
+                .native_recursive
+                .as_mut()
+                .map(std::ptr::from_mut)
+                .expect("native recursive control");
             assert_eq!(request.control, expected);
-            assert_eq!(Some(request.call.symbol as u32), (*(*context).owner).recursive_symbol);
+            assert_eq!(
+                Some(request.call.symbol as u32),
+                (*(*context).owner).recursive_symbol
+            );
             assert_eq!(request.call.nargs, usize::from((*(*context).body).arity));
             #[cfg(test)]
             root_publication::observe();
@@ -128,12 +136,16 @@ pub(super) unsafe extern "C" fn slow_call(
             // The cold request occupies 48 bytes below the caller's body SP.
             // Budget the child's exact prologue and CALL return word just as
             // the generated fast check does; a retry must not bypass that guard.
-            let frame_bytes = (*(*context).owner)._native_calls.unwind_recipe()
-                .expect("native recursive unwind recipe").frame_bytes() as usize;
+            let frame_bytes = (*(*context).owner)
+                ._native_calls
+                .unwind_recipe()
+                .expect("native recursive unwind recipe")
+                .frame_bytes() as usize;
             let child_sp = ((*image).caller_sp as usize)
                 .checked_add(std::mem::size_of::<NativeRecursiveCallRequest>())
                 .and_then(|sp| sp.checked_sub(frame_bytes + 8));
-            if !matches || NATIVE_DEPTH.with(Cell::get) >= native_depth_cap()
+            if !matches
+                || NATIVE_DEPTH.with(Cell::get) >= native_depth_cap()
                 || child_sp.is_none_or(|sp| sp as u64 <= limit)
             {
                 c2i_call_legacy_v2(std::ptr::from_mut(&mut request.call).cast(), out);
@@ -141,7 +153,10 @@ pub(super) unsafe extern "C" fn slow_call(
             }
             c2i_clear_mv();
             request.admitted = 1;
-            out.write(NativeOutcome { value: NIL, exit: NativeExit::Returned });
+            out.write(NativeOutcome {
+                value: NIL,
+                exit: NativeExit::Returned,
+            });
         });
     }
 }

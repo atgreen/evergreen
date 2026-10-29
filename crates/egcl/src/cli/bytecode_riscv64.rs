@@ -107,9 +107,13 @@ fn arithmetic(
 ) -> bool {
     let supported = (nargs == 1 && inlinable_unary_fixnum_op(sym).is_some())
         || (nargs == 2 && inlinable_fixnum_op(sym).is_some_and(|op| !matches!(op, FixnumOp::Mul)));
-    if !supported { return false; }
+    if !supported {
+        return false;
+    }
     use egcl_compiler::t2::builtin_binding::{self, Binding};
-    let Some(binding) = builtin_binding::snapshot(sym) else { return false; };
+    let Some(binding) = builtin_binding::snapshot(sym) else {
+        return false;
+    };
     if let Binding::Guarded { address, expected } = binding {
         let deopt = *deopts.entry(bcp).or_insert_with(|| a.label());
         a.imm64(A0, address as u64);

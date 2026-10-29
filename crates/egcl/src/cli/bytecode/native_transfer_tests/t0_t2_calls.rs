@@ -20,22 +20,43 @@ fn a_bytecode_caller_enters_an_installed_t2_leaf_directly() {
     let NativeCodeStorage::Mapped(mapped) = &code._storage else {
         panic!("the probe needs mapped T2 code")
     };
-    assert!(mapped.ordinary_entry.is_some(), "the leaf uses the ordinary ABI");
-    assert!(mapped.needs_callable_identity(), "each entry retains the leaf's root identity");
+    assert!(
+        mapped.ordinary_entry.is_some(),
+        "the leaf uses the ordinary ABI"
+    );
+    assert!(
+        mapped.needs_callable_identity(),
+        "each entry retains the leaf's root identity"
+    );
     egcl_rt::rooted!(function = egcl_rt::symbols::symbol_function(symbol).unwrap());
-    assert_eq!(egcl_rt::function::tier(*function), 2, "publication records the tier");
+    assert_eq!(
+        egcl_rt::function::tier(*function),
+        2,
+        "publication records the tier"
+    );
 
     // The caller runs once, so it stays bytecode while its loop calls the leaf.
     egcl_rt::rooted!(params = reader::read_from_string("(n)").unwrap().0);
-    egcl_rt::rooted!(forms = reader::read_from_string(
-        "((let ((s 0)) (dotimes (i n s) (setq s (t0-t2-leaf s 1)))))").unwrap().0);
-    let caller = Arc::new(
-        compile_function("T0-T2-CALLER", *params, *forms, &env, false, false).unwrap(),
+    egcl_rt::rooted!(
+        forms =
+            reader::read_from_string("((let ((s 0)) (dotimes (i n s) (setq s (t0-t2-leaf s 1)))))")
+                .unwrap()
+                .0
     );
+    let caller =
+        Arc::new(compile_function("T0-T2-CALLER", *params, *forms, &env, false, false).unwrap());
     let calls = 300;
     // Warm once so the first-call root identity is not counted below.
-    assert_eq!(run(Arc::clone(&caller), &[EgclVal::from_fixnum(1)], NIL, &mut env).unwrap(),
-        EgclVal::from_fixnum(1));
+    assert_eq!(
+        run(
+            Arc::clone(&caller),
+            &[EgclVal::from_fixnum(1)],
+            NIL,
+            &mut env
+        )
+        .unwrap(),
+        EgclVal::from_fixnum(1)
+    );
     TIER_DISPATCHES.with(|count| count.set(0));
     super::super::call_table::take_target_lookups_for_test();
     super::super::call_table::take_root_identities_for_test();
@@ -48,10 +69,22 @@ fn a_bytecode_caller_enters_an_installed_t2_leaf_directly() {
     egcl_rt::symbols::set_symbol_function(symbol, NIL);
     registry_remove(symbol);
     assert_eq!(result, EgclVal::from_fixnum(calls));
-    assert!(entries >= calls as usize, "only {entries} of {calls} calls entered native code");
-    assert_eq!(dispatches, 0, "an installed T2 callee needs no tier dispatch");
-    assert_eq!(identities, 0, "steady-state calls reuse their ordinary root identity");
-    assert!(lean >= calls as usize, "only {lean} of {calls} calls took the lean root entry");
+    assert!(
+        entries >= calls as usize,
+        "only {entries} of {calls} calls entered native code"
+    );
+    assert_eq!(
+        dispatches, 0,
+        "an installed T2 callee needs no tier dispatch"
+    );
+    assert_eq!(
+        identities, 0,
+        "steady-state calls reuse their ordinary root identity"
+    );
+    assert!(
+        lean >= calls as usize,
+        "only {lean} of {calls} calls took the lean root entry"
+    );
 }
 
 /// Compile `forms` as a bytecode caller taking `(n)`, run it once with 1 to
@@ -59,8 +92,10 @@ fn a_bytecode_caller_enters_an_installed_t2_leaf_directly() {
 fn run_caller(name: &str, forms: &str, n: i64, env: &mut Env) -> Result<EgclVal, EgclError> {
     egcl_rt::rooted!(params = reader::read_from_string("(n)").unwrap().0);
     egcl_rt::rooted!(forms = reader::read_from_string(forms).unwrap().0);
-    let caller = Arc::new(compile_function(name, *params, *forms, env, false, false)
-        .unwrap_or_else(|| panic!("{name}: {:?}", last_bail_reason())));
+    let caller = Arc::new(
+        compile_function(name, *params, *forms, env, false, false)
+            .unwrap_or_else(|| panic!("{name}: {:?}", last_bail_reason())),
+    );
     run(Arc::clone(&caller), &[EgclVal::from_fixnum(1)], NIL, env).unwrap();
     super::super::native_transfer_entry::take_lean_root_entries_for_test();
     super::super::native_transfer_entry::ordinary_calls::take_named_entries_for_test();
@@ -80,23 +115,36 @@ fn a_t2_leaf_reaches_a_builtin_through_its_cell_without_resolving_it() {
     let NativeCodeStorage::Mapped(mapped) = &code._storage else {
         panic!("the probe needs mapped T2 code")
     };
-    assert!(mapped.lean_root_entry().is_some(), "the leaf has a lean root entry");
+    assert!(
+        mapped.lean_root_entry().is_some(),
+        "the leaf has a lean root entry"
+    );
     let calls = 200;
     let result = run_caller(
         "T0-T2-ELT-CALLER",
         r#"((let ((s 0)) (dotimes (i n s) (setq s (+ s (t0-t2-elt '(1 2 3) 1))))))"#,
         calls,
         &mut env,
-    ).unwrap();
+    )
+    .unwrap();
     let lean = super::super::native_transfer_entry::take_lean_root_entries_for_test();
     let named = super::super::native_transfer_entry::ordinary_calls::take_named_entries_for_test();
     let resolves = super::super::call_table::take_resolves_for_test();
     egcl_rt::symbols::set_symbol_function(symbol, NIL);
     registry_remove(symbol);
     assert_eq!(result, EgclVal::from_fixnum(2 * calls));
-    assert!(lean >= calls as usize, "only {lean} of {calls} calls took the lean root entry");
-    assert!(named >= calls as usize, "only {named} of {calls} ELT calls used the named adapter");
-    assert_eq!(resolves, 0, "the named adapter carries its cell: no per-call resolution");
+    assert!(
+        lean >= calls as usize,
+        "only {lean} of {calls} calls took the lean root entry"
+    );
+    assert!(
+        named >= calls as usize,
+        "only {named} of {calls} ELT calls used the named adapter"
+    );
+    assert_eq!(
+        resolves, 0,
+        "the named adapter carries its cell: no per-call resolution"
+    );
 }
 
 #[test]
@@ -107,7 +155,10 @@ fn a_lean_root_entry_deoptimizes_and_signals_like_the_interpreter() {
     let mut env = Env::new(false);
     egcl_rt::rooted_ref!(_env = &mut env);
     super::super::super::read_eval_all_env(
-        "(defun t0-t2-guarded (a b) (+ a b)) (defun t0-t2-car (x) (car x))", &mut env).unwrap();
+        "(defun t0-t2-guarded (a b) (+ a b)) (defun t0-t2-car (x) (car x))",
+        &mut env,
+    )
+    .unwrap();
     let (guarded, _) = super::ordinary_t2::install("T0-T2-GUARDED", "(a b)", "((+ a b))", &mut env);
     let (car, _) = super::ordinary_t2::install("T0-T2-CAR", "(x)", "((car x))", &mut env);
     let deopts = deopt_count();
@@ -120,14 +171,26 @@ fn a_lean_root_entry_deoptimizes_and_signals_like_the_interpreter() {
             (or (= n 1) (= s (1+ most-positive-fixnum)))))",
         50,
         &mut env,
-    ).unwrap();
+    )
+    .unwrap();
     let lean = super::super::native_transfer_entry::take_lean_root_entries_for_test();
-    assert!(lean >= 50, "only {lean} of 50 calls took the lean root entry");
+    assert!(
+        lean >= 50,
+        "only {lean} of 50 calls took the lean root entry"
+    );
     assert_eq!(exact, T, "the overflowing sum must be exact");
-    assert!(deopt_count() > deopts, "the overflowing call must deoptimize");
+    assert!(
+        deopt_count() > deopts,
+        "the overflowing call must deoptimize"
+    );
     // A TYPE-ERROR signalled inside the lean root leaves it as an error.
-    let error = run_caller("T0-T2-ERROR-CALLER", "((t0-t2-car (if (= n 1) (list n) n)))", 7, &mut env)
-        .expect_err("CAR of a fixnum signals");
+    let error = run_caller(
+        "T0-T2-ERROR-CALLER",
+        "((t0-t2-car (if (= n 1) (list n) n)))",
+        7,
+        &mut env,
+    )
+    .expect_err("CAR of a fixnum signals");
     let lean = super::super::native_transfer_entry::take_lean_root_entries_for_test();
     for symbol in [guarded, car] {
         egcl_rt::symbols::set_symbol_function(symbol, NIL);
@@ -150,18 +213,30 @@ fn a_mapped_caller_enters_an_ordinary_t2_callee_through_its_lean_root() {
     super::super::super::read_eval_all_env(
         "(defun t0-t2-inner (a b) (+ a b)) (defun t0-t2-kw (a &key (b (1+ 0))) (t0-t2-inner a b))",
         &mut env,
-    ).unwrap();
-    let (inner, inner_code) = super::ordinary_t2::install("T0-T2-INNER", "(a b)", "((+ a b))", &mut env);
+    )
+    .unwrap();
+    let (inner, inner_code) =
+        super::ordinary_t2::install("T0-T2-INNER", "(a b)", "((+ a b))", &mut env);
     let NativeCodeStorage::Mapped(mapped) = &inner_code._storage else {
         panic!("the callee needs mapped T2 code")
     };
-    assert!(mapped.lean_root_entry().is_some(), "the callee has a lean root entry");
+    assert!(
+        mapped.lean_root_entry().is_some(),
+        "the callee has a lean root entry"
+    );
     let (outer, outer_code) = super::ordinary_t2::install(
-        "T0-T2-KW", "(a &key (b (1+ 0)))", "((t0-t2-inner a b))", &mut env);
+        "T0-T2-KW",
+        "(a &key (b (1+ 0)))",
+        "((t0-t2-inner a b))",
+        &mut env,
+    );
     let NativeCodeStorage::Mapped(mapped) = &outer_code._storage else {
         panic!("the caller needs mapped T2 code")
     };
-    assert!(mapped.ordinary_entry.is_none(), "a &key body with an evaluated default keeps the mapped ABI");
+    assert!(
+        mapped.ordinary_entry.is_none(),
+        "a &key body with an evaluated default keeps the mapped ABI"
+    );
     let calls = 100;
     super::super::native_transfer_entry::take_nested_entries();
     super::super::native_transfer_entry::take_lean_target_calls_for_test();
@@ -170,7 +245,8 @@ fn a_mapped_caller_enters_an_ordinary_t2_callee_through_its_lean_root() {
         "((let ((s 0)) (dotimes (i n s) (setq s (t0-t2-kw s :b 2)))))",
         calls,
         &mut env,
-    ).unwrap();
+    )
+    .unwrap();
     let lean = super::super::native_transfer_entry::take_lean_root_entries_for_test();
     let children = super::super::native_transfer_entry::take_nested_entries();
     let direct = super::super::native_transfer_entry::take_lean_target_calls_for_test();
@@ -179,9 +255,18 @@ fn a_mapped_caller_enters_an_ordinary_t2_callee_through_its_lean_root() {
         registry_remove(symbol);
     }
     assert_eq!(result, EgclVal::from_fixnum(2 * calls));
-    assert!(lean >= calls as usize, "only {lean} of {calls} inner calls took the lean root entry");
-    assert_eq!(children, 0, "no mapped child activation is prepared for an ordinary callee");
-    assert!(direct >= calls as usize, "only {direct} of {calls} calls left the &key body directly");
+    assert!(
+        lean >= calls as usize,
+        "only {lean} of {calls} inner calls took the lean root entry"
+    );
+    assert_eq!(
+        children, 0,
+        "no mapped child activation is prepared for an ordinary callee"
+    );
+    assert!(
+        direct >= calls as usize,
+        "only {direct} of {calls} calls left the &key body directly"
+    );
 }
 
 /// Calls that left an ordinary T2 body for the runtime: named builtin
@@ -209,37 +294,61 @@ fn t2_elt_reads_simple_strings_inline_and_calls_elt_for_anything_else() {
     ).unwrap();
     let (leaf, _) = super::ordinary_t2::install("T0-T2-STR-ELT", "(s i)", "((elt s i))", &mut env);
     let (keyed, keyed_code) = super::ordinary_t2::install(
-        "T0-T2-KW-ELT", "(s &key (start (1- 1)))", "((elt s start))", &mut env);
+        "T0-T2-KW-ELT",
+        "(s &key (start (1- 1)))",
+        "((elt s start))",
+        &mut env,
+    );
     let NativeCodeStorage::Mapped(mapped) = &keyed_code._storage else {
         panic!("the &key probe needs mapped T2 code")
     };
-    assert!(mapped.ordinary_entry.is_none(), "a &key body with an evaluated default keeps the mapped ABI");
+    assert!(
+        mapped.ordinary_entry.is_none(),
+        "a &key body with an evaluated default keeps the mapped ABI"
+    );
     let calls = 200;
     let sum = |text: &str| -> i64 {
-        (0..calls).map(|i| text.chars().nth((i % 5) as usize).unwrap() as i64).sum()
+        (0..calls)
+            .map(|i| text.chars().nth((i % 5) as usize).unwrap() as i64)
+            .sum()
     };
-    let take_mapped_calls = || super::super::native_transfer_entry::take_published_checked_calls_for_test()
-        + super::super::native_transfer_entry::take_nested_entries();
+    let take_mapped_calls = || {
+        super::super::native_transfer_entry::take_published_checked_calls_for_test()
+            + super::super::native_transfer_entry::take_nested_entries()
+    };
     // "hello" is a base string; the second literal needs 32-bit characters.
-    for (text, callee) in [("hello", "(t0-t2-str-elt s (mod i 5))"),
-                           ("hλllo", "(t0-t2-kw-elt s :start (mod i 5))")] {
+    for (text, callee) in [
+        ("hello", "(t0-t2-str-elt s (mod i 5))"),
+        ("hλllo", "(t0-t2-kw-elt s :start (mod i 5))"),
+    ] {
         let forms = format!(
-            "((let ((s \"{text}\") (sum 0)) (dotimes (i n sum) (setq sum (+ sum (char-code {callee}))))))");
+            "((let ((s \"{text}\") (sum 0)) (dotimes (i n sum) (setq sum (+ sum (char-code {callee}))))))"
+        );
         take_ordinary_outcalls();
         take_mapped_calls();
         let result = run_caller("T0-T2-ELT-STRING-CALLER", &forms, calls, &mut env).unwrap();
         let outcalls = take_ordinary_outcalls();
         let mapped_calls = take_mapped_calls();
         assert_eq!(result, EgclVal::from_fixnum(sum(text)), "{callee}");
-        assert_eq!((outcalls, mapped_calls), (0, 0), "{callee} called out for a simple string");
+        assert_eq!(
+            (outcalls, mapped_calls),
+            (0, 0),
+            "{callee} called out for a simple string"
+        );
     }
     // A list, a vector, an index past the end and a non-sequence reach ELT.
     let mut outcalls = 0;
-    for (callee, expected) in [("(t0-t2-str-elt '(1 2 3) 1)", 2), ("(t0-t2-kw-elt '(1 2 3) :start 1)", 2),
-                               ("(t0-t2-str-elt (vector 4 5) 1)", 5), ("(t0-t2-str-elt \"ab\" 5)", -1),
-                               ("(t0-t2-kw-elt \"ab\" :start -1)", -1), ("(t0-t2-kw-elt 7)", -1)] {
+    for (callee, expected) in [
+        ("(t0-t2-str-elt '(1 2 3) 1)", 2),
+        ("(t0-t2-kw-elt '(1 2 3) :start 1)", 2),
+        ("(t0-t2-str-elt (vector 4 5) 1)", 5),
+        ("(t0-t2-str-elt \"ab\" 5)", -1),
+        ("(t0-t2-kw-elt \"ab\" :start -1)", -1),
+        ("(t0-t2-kw-elt 7)", -1),
+    ] {
         let forms = format!(
-            "((let ((r nil)) (dotimes (i n r) (setq r (handler-case {callee} (error () -1))))))");
+            "((let ((r nil)) (dotimes (i n r) (setq r (handler-case {callee} (error () -1))))))"
+        );
         take_ordinary_outcalls();
         take_mapped_calls();
         let value = run_caller("T0-T2-ELT-SLOW-CALLER", &forms, 50, &mut env).unwrap();
@@ -250,7 +359,10 @@ fn t2_elt_reads_simple_strings_inline_and_calls_elt_for_anything_else() {
         egcl_rt::symbols::set_symbol_function(symbol, NIL);
         registry_remove(symbol);
     }
-    assert!(outcalls >= 6 * 50, "only {outcalls} of 300 other operands called ELT");
+    assert!(
+        outcalls >= 6 * 50,
+        "only {outcalls} of 300 other operands called ELT"
+    );
 }
 
 fn collect_at_ordinary_entry() {
@@ -269,20 +381,26 @@ fn a_lean_root_entry_relocates_its_actuals_before_machine_entry() {
     let mut env = Env::new(false);
     egcl_rt::rooted_ref!(_env = &mut env);
     super::super::super::read_eval_all_env("(defun t0-t2-second (a b) (cdr b))", &mut env).unwrap();
-    let (symbol, code) = super::ordinary_t2::install("T0-T2-SECOND", "(a b)", "((cdr b))", &mut env);
-    egcl_rt::rooted!(args = vec![
-        crate::cli::arena_cons(EgclVal::from_fixnum(1), NIL),
-        crate::cli::arena_cons(EgclVal::from_fixnum(2), EgclVal::from_fixnum(3)),
-    ]);
+    let (symbol, code) =
+        super::ordinary_t2::install("T0-T2-SECOND", "(a b)", "((cdr b))", &mut env);
+    egcl_rt::rooted!(
+        args = vec![
+            crate::cli::arena_cons(EgclVal::from_fixnum(1), NIL),
+            crate::cli::arena_cons(EgclVal::from_fixnum(2), EgclVal::from_fixnum(3)),
+        ]
+    );
     let before = args[1].to_raw();
     super::super::native_transfer_entry::take_lean_root_entries_for_test();
     // The callee's only copy of the second actual is the entry's rooted one;
     // the returned CDR is the original fixnum only if that copy was updated.
     let actuals: Vec<EgclVal> = args.to_vec();
-    egcl_rt::rooted!(result = super::super::native_transfer_entry::with_ordinary_entry_hook_for_test(
-        collect_at_ordinary_entry,
-        || run_native(&code, symbol, &actuals, &mut env),
-    ).unwrap());
+    egcl_rt::rooted!(
+        result = super::super::native_transfer_entry::with_ordinary_entry_hook_for_test(
+            collect_at_ordinary_entry,
+            || run_native(&code, symbol, &actuals, &mut env),
+        )
+        .unwrap()
+    );
     let lean = super::super::native_transfer_entry::take_lean_root_entries_for_test();
     let moved = args[1].to_raw() != before;
     egcl_rt::symbols::set_symbol_function(symbol, NIL);

@@ -155,8 +155,11 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
             let is_term = data.opcode.is_terminator();
             if matches!(data.aux, AuxData::OpaqueCallTarget(_))
                 && (!matches!(data.opcode, Opcode::Call | Opcode::Invoke)
-                    || !data.flags.call || !data.flags.effectful || !data.flags.safepoint
-                    || data.frame_state.is_none()) {
+                    || !data.flags.call
+                    || !data.flags.effectful
+                    || !data.flags.safepoint
+                    || data.frame_state.is_none())
+            {
                 errors.push(VerifyError::new("V8 opaque-call-contract",
                     format!("block{bi} NOTINLINE dispatch requires an effectful safepoint Call/Invoke with recovery state")));
             }
@@ -169,7 +172,8 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                     || !data.flags.safepoint
                     || !matches!(
                         data.aux,
-                        AuxData::CallTarget(_) | AuxData::OpaqueCallTarget(_)
+                        AuxData::CallTarget(_)
+                            | AuxData::OpaqueCallTarget(_)
                             | AuxData::HostEval(_)
                             | AuxData::FunctionLookup(_)
                             | AuxData::ValuesToList
@@ -209,8 +213,7 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
             // admits either opcode. Argument-free either way: the nested body
             // is named by the aux index, never passed on the operand stack.
             if matches!(data.aux, AuxData::NestedClosure(_))
-                && (!matches!(data.opcode, Opcode::Invoke | Opcode::Call)
-                    || !data.args.is_empty())
+                && (!matches!(data.opcode, Opcode::Invoke | Opcode::Call) || !data.args.is_empty())
             {
                 errors.push(VerifyError::new(
                     "V11 invoke-shape",
@@ -228,13 +231,19 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                 ));
             }
             if let AuxData::SpecialBinding { bcp, enter } = data.aux {
-                let identity_matches = data.frame_state
+                let identity_matches = data
+                    .frame_state
                     .filter(|id| (id.0 as usize) < f.frame_states.len())
                     .and_then(|id| f.frame_states.get(id).scopes.last())
                     .is_some_and(|scope| scope.bcp == bcp);
-                if data.opcode != Opcode::Invoke || data.args.len() != usize::from(enter)
-                    || !identity_matches {
-                    errors.push(VerifyError::new("V11 invoke-shape", "special binding requires exact bytecode identity and entry value"));
+                if data.opcode != Opcode::Invoke
+                    || data.args.len() != usize::from(enter)
+                    || !identity_matches
+                {
+                    errors.push(VerifyError::new(
+                        "V11 invoke-shape",
+                        "special binding requires exact bytecode identity and entry value",
+                    ));
                 }
             }
             if let AuxData::LexicalEnvironment { value, result, .. } = data.aux {
@@ -251,7 +260,10 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
             }
             if let AuxData::GlobalValue { store, .. } = data.aux {
                 if data.opcode != Opcode::Invoke || data.args.len() != usize::from(store) {
-                    errors.push(VerifyError::new("V11 invoke-shape", "global value access has invalid operands"));
+                    errors.push(VerifyError::new(
+                        "V11 invoke-shape",
+                        "global value access has invalid operands",
+                    ));
                 }
             }
             if let AuxData::HandlerScope { push_bcp, enter } = data.aux {
@@ -581,29 +593,48 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                 let array_read = matches!(data.opcode, Opcode::VecRef | Opcode::ArrayReadDiscarded);
                 if matches!(data.aux, AuxData::ArrayRef) && !array_read
                     || array_read && !matches!(data.aux, AuxData::None | AuxData::ArrayRef)
-                    || array_read && (data.args.len() != 2
-                        || data.results.len() != usize::from(data.opcode == Opcode::VecRef)
-                        || data.flags != (crate::t2::ir::InstFlags { guard: true, effectful: true, ..Default::default() })
-                        || data.frame_state.is_none()
-                        || data.args.iter().chain(&data.results).any(|v| valid_values.contains(&v.0)
-                            && f.value(*v).repr != super::ir::ValueRepresentation::Tagged))
+                    || array_read
+                        && (data.args.len() != 2
+                            || data.results.len() != usize::from(data.opcode == Opcode::VecRef)
+                            || data.flags
+                                != (crate::t2::ir::InstFlags {
+                                    guard: true,
+                                    effectful: true,
+                                    ..Default::default()
+                                })
+                            || data.frame_state.is_none()
+                            || data.args.iter().chain(&data.results).any(|v| {
+                                valid_values.contains(&v.0)
+                                    && f.value(*v).repr != super::ir::ValueRepresentation::Tagged
+                            }))
                 {
-                    errors.push(VerifyError::new("V8 array-read-contract",
-                        format!("block{bi} malformed {:?} array-read contract", data.opcode)));
+                    errors.push(VerifyError::new(
+                        "V8 array-read-contract",
+                        format!("block{bi} malformed {:?} array-read contract", data.opcode),
+                    ));
                 }
 
                 if matches!(data.aux, AuxData::SimpleVectorStore) && data.opcode != Opcode::VecSet
-                    || data.opcode == Opcode::VecSet && (
-                        !matches!(data.aux, AuxData::None | AuxData::SimpleVectorStore)
-                        || data.args.len() != 3 || data.results.len() != 1
-                        || data.flags != (crate::t2::ir::InstFlags {
-                            guard: true, effectful: true, ..Default::default() })
-                        || data.frame_state.is_none()
-                        || data.args.iter().chain(&data.results).any(|v| valid_values.contains(&v.0)
-                            && f.value(*v).repr != super::ir::ValueRepresentation::Tagged))
+                    || data.opcode == Opcode::VecSet
+                        && (!matches!(data.aux, AuxData::None | AuxData::SimpleVectorStore)
+                            || data.args.len() != 3
+                            || data.results.len() != 1
+                            || data.flags
+                                != (crate::t2::ir::InstFlags {
+                                    guard: true,
+                                    effectful: true,
+                                    ..Default::default()
+                                })
+                            || data.frame_state.is_none()
+                            || data.args.iter().chain(&data.results).any(|v| {
+                                valid_values.contains(&v.0)
+                                    && f.value(*v).repr != super::ir::ValueRepresentation::Tagged
+                            }))
                 {
-                    errors.push(VerifyError::new("V8 array-store-contract",
-                        format!("block{bi} malformed {:?} array-store contract", data.opcode)));
+                    errors.push(VerifyError::new(
+                        "V8 array-store-contract",
+                        format!("block{bi} malformed {:?} array-store contract", data.opcode),
+                    ));
                 }
 
                 // V8 — StringByteLength consumes an explicitly layout-refined
@@ -656,57 +687,148 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
 
                 if data.opcode == Opcode::SmallVectorRangeP {
                     use crate::t2::ir::{TypeBits, ValueRepresentation as Repr};
-                    let valid = data.args.iter().chain(&data.results).all(|v| valid_values.contains(&v.0));
-                    if !valid || data.args.len() != 3 || data.results.len() != 1
+                    let valid = data
+                        .args
+                        .iter()
+                        .chain(&data.results)
+                        .all(|v| valid_values.contains(&v.0));
+                    if !valid
+                        || data.args.len() != 3
+                        || data.results.len() != 1
                         || data.flags != crate::t2::ir::InstFlags::default()
-                        || data.frame_state.is_some() || !matches!(data.aux, AuxData::None)
-                        || (valid && data.results.len() == 1 &&
-                            (data.args.iter().chain(&data.results).any(|&v| f.value(v).repr != Repr::Tagged)
-                                || f.value(data.results[0]).ty.bits != TypeBits::SYMBOL.join(TypeBits::NULL))) {
+                        || data.frame_state.is_some()
+                        || !matches!(data.aux, AuxData::None)
+                        || (valid
+                            && data.results.len() == 1
+                            && (data
+                                .args
+                                .iter()
+                                .chain(&data.results)
+                                .any(|&v| f.value(v).repr != Repr::Tagged)
+                                || f.value(data.results[0]).ty.bits
+                                    != TypeBits::SYMBOL.join(TypeBits::NULL)))
+                    {
                         errors.push(VerifyError::new("V8 vector-range-predicate-contract",
                             format!("block{bi} requires three tagged operands and one pure Boolean result")));
                     }
                 }
                 if data.opcode == Opcode::VecSetInRange {
                     use crate::t2::ir::ValueRepresentation as Repr;
-                    let valid = data.args.iter().chain(&data.results).all(|v| valid_values.contains(&v.0));
-                    if !valid || data.args.len() != 4 || data.results.len() != 1
-                        || data.flags != (crate::t2::ir::InstFlags {
-                            effectful: true, guard: true, ..Default::default() })
-                        || data.frame_state.is_none() || !matches!(data.aux, AuxData::None)
-                        || data.args.iter().chain(&data.results).any(|&v| f.value(v).repr != Repr::Tagged) {
-                        errors.push(VerifyError::new("V8 vector-range-access-contract",
-                            format!("block{bi} requires a guarded tagged store and its SSA witness")));
+                    let valid = data
+                        .args
+                        .iter()
+                        .chain(&data.results)
+                        .all(|v| valid_values.contains(&v.0));
+                    if !valid
+                        || data.args.len() != 4
+                        || data.results.len() != 1
+                        || data.flags
+                            != (crate::t2::ir::InstFlags {
+                                effectful: true,
+                                guard: true,
+                                ..Default::default()
+                            })
+                        || data.frame_state.is_none()
+                        || !matches!(data.aux, AuxData::None)
+                        || data
+                            .args
+                            .iter()
+                            .chain(&data.results)
+                            .any(|&v| f.value(v).repr != Repr::Tagged)
+                    {
+                        errors.push(VerifyError::new(
+                            "V8 vector-range-access-contract",
+                            format!(
+                                "block{bi} requires a guarded tagged store and its SSA witness"
+                            ),
+                        ));
                     }
                 }
-                if matches!(data.opcode, Opcode::PackedU8Layout | Opcode::PackedU8AllocationLayout | Opcode::PackedU8AllocationExtent) {
+                if matches!(
+                    data.opcode,
+                    Opcode::PackedU8Layout
+                        | Opcode::PackedU8AllocationLayout
+                        | Opcode::PackedU8AllocationExtent
+                ) {
                     use crate::t2::ir::{TypeBits, ValueRepresentation as Repr};
-                    let valid = data.args.iter().chain(&data.results).all(|v| valid_values.contains(&v.0));
-                    if !valid || data.args.len() != if data.opcode == Opcode::PackedU8Layout { 1 } else if data.opcode == Opcode::PackedU8AllocationLayout { 2 } else { 3 }
+                    let valid = data
+                        .args
+                        .iter()
+                        .chain(&data.results)
+                        .all(|v| valid_values.contains(&v.0));
+                    if !valid
+                        || data.args.len()
+                            != if data.opcode == Opcode::PackedU8Layout {
+                                1
+                            } else if data.opcode == Opcode::PackedU8AllocationLayout {
+                                2
+                            } else {
+                                3
+                            }
                         || data.results.len() != 1
                         || data.flags != crate::t2::ir::InstFlags::default()
-                        || data.frame_state.is_some() || !data.targets.is_empty() || !matches!(data.aux, AuxData::None)
-                        || (valid && data.results.len() == 1 &&
-                            (data.args.iter().chain(&data.results).any(|&v| f.value(v).repr != Repr::Tagged)
-                                || f.value(data.results[0]).ty.bits != TypeBits::FIXNUM.join(TypeBits::NULL))) {
+                        || data.frame_state.is_some()
+                        || !data.targets.is_empty()
+                        || !matches!(data.aux, AuxData::None)
+                        || (valid
+                            && data.results.len() == 1
+                            && (data
+                                .args
+                                .iter()
+                                .chain(&data.results)
+                                .any(|&v| f.value(v).repr != Repr::Tagged)
+                                || f.value(data.results[0]).ty.bits
+                                    != TypeBits::FIXNUM.join(TypeBits::NULL)))
+                    {
                         errors.push(VerifyError::new("V8 packed-u8-layout-contract", format!("block{bi} requires one tagged array and a pure tagged width/NIL result")));
                     }
                 }
-                if matches!(data.opcode, Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8 | Opcode::TryStoreIntegerOctets1To8Layout | Opcode::TryStoreIntegerOctets1To8Extent) {
+                if matches!(
+                    data.opcode,
+                    Opcode::TryStoreIntegerOctets8
+                        | Opcode::TryStoreIntegerOctets1To8
+                        | Opcode::TryStoreIntegerOctets1To8Layout
+                        | Opcode::TryStoreIntegerOctets1To8Extent
+                ) {
                     use crate::t2::ir::{TypeBits, ValueRepresentation as Repr};
-                    let valid = data.args.iter().chain(&data.results)
+                    let valid = data
+                        .args
+                        .iter()
+                        .chain(&data.results)
                         .all(|value| valid_values.contains(&value.0));
-                    if !valid || data.args.len() != if data.opcode == Opcode::TryStoreIntegerOctets1To8Layout { 5 } else if data.opcode == Opcode::TryStoreIntegerOctets1To8Extent { 6 } else { 4 }
+                    if !valid
+                        || data.args.len()
+                            != if data.opcode == Opcode::TryStoreIntegerOctets1To8Layout {
+                                5
+                            } else if data.opcode == Opcode::TryStoreIntegerOctets1To8Extent {
+                                6
+                            } else {
+                                4
+                            }
                         || data.results.len() != 2
-                        || data.flags != (crate::t2::ir::InstFlags { effectful: true, ..Default::default() })
-                        || data.frame_state.is_some() || !data.targets.is_empty()
+                        || data.flags
+                            != (crate::t2::ir::InstFlags {
+                                effectful: true,
+                                ..Default::default()
+                            })
+                        || data.frame_state.is_some()
+                        || !data.targets.is_empty()
                         || !(matches!(data.aux, AuxData::None)
-                            || (data.opcode == Opcode::TryStoreIntegerOctets1To8Extent && matches!(data.aux, AuxData::AllocationExtentInBounds))
-                            || (data.opcode == Opcode::TryStoreIntegerOctets1To8Layout && matches!(data.aux, AuxData::AllocationDimensionInBounds)))
-                        || (valid && data.results.len() == 2 &&
-                            (data.args.iter().chain(&data.results).any(|&v| f.value(v).repr != Repr::Tagged)
-                                || f.value(data.results[0]).ty.bits != TypeBits::SYMBOL.join(TypeBits::NULL)
-                                || f.value(data.results[1]).ty.bits != TypeBits::FIXNUM)) {
+                            || (data.opcode == Opcode::TryStoreIntegerOctets1To8Extent
+                                && matches!(data.aux, AuxData::AllocationExtentInBounds))
+                            || (data.opcode == Opcode::TryStoreIntegerOctets1To8Layout
+                                && matches!(data.aux, AuxData::AllocationDimensionInBounds)))
+                        || (valid
+                            && data.results.len() == 2
+                            && (data
+                                .args
+                                .iter()
+                                .chain(&data.results)
+                                .any(|&v| f.value(v).repr != Repr::Tagged)
+                                || f.value(data.results[0]).ty.bits
+                                    != TypeBits::SYMBOL.join(TypeBits::NULL)
+                                || f.value(data.results[1]).ty.bits != TypeBits::FIXNUM))
+                    {
                         errors.push(VerifyError::new("V8 octet-word-store-contract",
                             format!("block{bi} requires four tagged operands and effectful-only (boolean, fixnum) results")));
                     }
@@ -714,18 +836,36 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                 if data.opcode == Opcode::NativePoll {
                     // Source-backed scope metadata survives ordinary lowering,
                     // which legitimately removes the OSR import records.
-                    let scope_proven = data.frame_state.filter(|id| (id.0 as usize) < f.frame_states.len())
+                    let scope_proven = data
+                        .frame_state
+                        .filter(|id| (id.0 as usize) < f.frame_states.len())
                         .is_some_and(|id| {
-                            let [frame] = f.frame_states.get(id).scopes.as_slice() else { return false; };
-                            let AuxData::BoundedPoll { scope, .. } = &data.aux else { return false; };
-                            scope.function == frame.function && scope.bcp == frame.bcp
-                                && crate::t2::octet_word_fusion::bounded_poll_scopes_supported(&scope.control_scopes)
+                            let [frame] = f.frame_states.get(id).scopes.as_slice() else {
+                                return false;
+                            };
+                            let AuxData::BoundedPoll { scope, .. } = &data.aux else {
+                                return false;
+                            };
+                            scope.function == frame.function
+                                && scope.bcp == frame.bcp
+                                && crate::t2::octet_word_fusion::bounded_poll_scopes_supported(
+                                    &scope.control_scopes,
+                                )
                         });
-                    if !scope_proven || pos != 0 || !data.args.is_empty() || !data.results.is_empty()
-                        || !data.targets.is_empty() || data.frame_state.is_none()
-                        || data.flags != (crate::t2::ir::InstFlags {
-                            effectful: true, safepoint: true, ..Default::default() })
-                        || !matches!(data.aux, AuxData::BoundedPoll { .. }) {
+                    if !scope_proven
+                        || pos != 0
+                        || !data.args.is_empty()
+                        || !data.results.is_empty()
+                        || !data.targets.is_empty()
+                        || data.frame_state.is_none()
+                        || data.flags
+                            != (crate::t2::ir::InstFlags {
+                                effectful: true,
+                                safepoint: true,
+                                ..Default::default()
+                            })
+                        || !matches!(data.aux, AuxData::BoundedPoll { .. })
+                    {
                         errors.push(VerifyError::new("V8 bounded-native-poll-contract",
                             format!("block{bi} requires a first-in-block effectful safepoint with an exact FrameState")));
                     }
@@ -733,14 +873,28 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
 
                 if data.opcode == Opcode::TryIntegerShr {
                     use crate::t2::ir::{TypeBits, ValueRepresentation as Repr};
-                    let valid = data.args.iter().chain(&data.results).all(|v| valid_values.contains(&v.0));
-                    if !valid || data.args.len() != 1 || data.results.len() != 2
+                    let valid = data
+                        .args
+                        .iter()
+                        .chain(&data.results)
+                        .all(|v| valid_values.contains(&v.0));
+                    if !valid
+                        || data.args.len() != 1
+                        || data.results.len() != 2
                         || data.flags != crate::t2::ir::InstFlags::default()
-                        || data.frame_state.is_some() || !matches!(data.aux, AuxData::FixnumImm(n) if n > 0)
-                        || (valid && data.results.len() == 2 &&
-                            (data.args.iter().chain(&data.results).any(|&v| f.value(v).repr != Repr::Tagged)
-                                || f.value(data.results[0]).ty.bits != TypeBits::SYMBOL.join(TypeBits::NULL)
-                                || f.value(data.results[1]).ty.bits != TypeBits::FIXNUM)) {
+                        || data.frame_state.is_some()
+                        || !matches!(data.aux, AuxData::FixnumImm(n) if n > 0)
+                        || (valid
+                            && data.results.len() == 2
+                            && (data
+                                .args
+                                .iter()
+                                .chain(&data.results)
+                                .any(|&v| f.value(v).repr != Repr::Tagged)
+                                || f.value(data.results[0]).ty.bits
+                                    != TypeBits::SYMBOL.join(TypeBits::NULL)
+                                || f.value(data.results[1]).ty.bits != TypeBits::FIXNUM))
+                    {
                         errors.push(VerifyError::new("V8 integer-shift-probe-contract",
                             format!("block{bi} requires tagged integer input and (boolean, fixnum) outputs")));
                     }
@@ -748,37 +902,68 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
 
                 if data.opcode == Opcode::TryPackedF64Set {
                     use crate::t2::ir::{TypeBits, ValueRepresentation as Repr};
-                    let valid = data.args.iter().chain(&data.results)
+                    let valid = data
+                        .args
+                        .iter()
+                        .chain(&data.results)
                         .all(|value| valid_values.contains(&value.0));
-                    if !valid || data.args.len() != 3 || data.results.len() != 1
-                        || data.flags != (crate::t2::ir::InstFlags {
-                            effectful: true, ..crate::t2::ir::InstFlags::default() })
-                        || data.frame_state.is_some() || !matches!(data.aux, AuxData::None)
-                        || (valid && data.args.len() == 3 && data.results.len() == 1
-                            && (data.args[..2].iter().any(|&v| f.value(v).repr != Repr::Tagged)
+                    if !valid
+                        || data.args.len() != 3
+                        || data.results.len() != 1
+                        || data.flags
+                            != (crate::t2::ir::InstFlags {
+                                effectful: true,
+                                ..crate::t2::ir::InstFlags::default()
+                            })
+                        || data.frame_state.is_some()
+                        || !matches!(data.aux, AuxData::None)
+                        || (valid
+                            && data.args.len() == 3
+                            && data.results.len() == 1
+                            && (data.args[..2]
+                                .iter()
+                                .any(|&v| f.value(v).repr != Repr::Tagged)
                                 || f.value(data.args[2]).repr != Repr::UnboxedF64
                                 || f.value(data.args[2]).ty.bits != TypeBits::DOUBLE_FLOAT
-                                || f.value(data.results[0]).repr != Repr::Tagged)) {
+                                || f.value(data.results[0]).repr != Repr::Tagged))
+                    {
                         errors.push(VerifyError::new("V8 packed-store-probe-contract",
                             format!("block{bi} requires tagged array/index, raw double and tagged success flag")));
                     }
                 }
 
-                if matches!(data.opcode, Opcode::PackedF64Ref | Opcode::VecF64Ref | Opcode::PackedF64Set) {
+                if matches!(
+                    data.opcode,
+                    Opcode::PackedF64Ref | Opcode::VecF64Ref | Opcode::PackedF64Set
+                ) {
                     use crate::t2::ir::{TypeBits, ValueRepresentation as Repr};
                     let load = matches!(data.opcode, Opcode::PackedF64Ref | Opcode::VecF64Ref);
-                    let valid = data.args.iter().chain(&data.results)
+                    let valid = data
+                        .args
+                        .iter()
+                        .chain(&data.results)
                         .all(|value| valid_values.contains(&value.0));
                     let shape = data.args.len() == (if load { 2 } else { 3 })
                         && data.results.len() == usize::from(load);
-                    let raw_double = |value| f.value(value).repr == Repr::UnboxedF64
-                        && f.value(value).ty.bits == TypeBits::DOUBLE_FLOAT;
-                    if !valid || !shape || !data.flags.guard || !data.flags.effectful
-                        || data.flags.call || data.flags.safepoint || data.flags.terminator
-                        || data.frame_state.is_none() || !matches!(data.aux, AuxData::None)
-                        || (valid && shape && (data.args[..2].iter().any(|&value|
-                            f.value(value).repr != Repr::Tagged)
-                            || !raw_double(if load { data.results[0] } else { data.args[2] })))
+                    let raw_double = |value| {
+                        f.value(value).repr == Repr::UnboxedF64
+                            && f.value(value).ty.bits == TypeBits::DOUBLE_FLOAT
+                    };
+                    if !valid
+                        || !shape
+                        || !data.flags.guard
+                        || !data.flags.effectful
+                        || data.flags.call
+                        || data.flags.safepoint
+                        || data.flags.terminator
+                        || data.frame_state.is_none()
+                        || !matches!(data.aux, AuxData::None)
+                        || (valid
+                            && shape
+                            && (data.args[..2]
+                                .iter()
+                                .any(|&value| f.value(value).repr != Repr::Tagged)
+                                || !raw_double(if load { data.results[0] } else { data.args[2] })))
                     {
                         errors.push(VerifyError::new("V8 packed-f64-contract",
                             format!("block{bi} {:?} requires tagged array/index, raw double and ordered recovery", data.opcode)));
@@ -849,13 +1034,26 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
         for &block in f.block_order() {
             for &inst in &f.block(block).insts {
                 let d = f.inst(inst);
-                if matches!(d.opcode, Opcode::StringByteLength | Opcode::StringAsciiCharAt)
-                    && !d.args.first().is_some_and(|&subject|
-                        facts.refined_layout_before(subject, super::value_facts::LayoutKind::SimpleString, inst)
-                            .is_some_and(|proof| proof.encoding == super::value_facts::LayoutEvidence::RefinedValue))
-                {
-                    errors.push(VerifyError::new("V8 layout-proof",
-                        format!("{inst:?} lacks a dominating successful simple-string layout proof")));
+                if matches!(
+                    d.opcode,
+                    Opcode::StringByteLength | Opcode::StringAsciiCharAt
+                ) && !d.args.first().is_some_and(|&subject| {
+                    facts
+                        .refined_layout_before(
+                            subject,
+                            super::value_facts::LayoutKind::SimpleString,
+                            inst,
+                        )
+                        .is_some_and(|proof| {
+                            proof.encoding == super::value_facts::LayoutEvidence::RefinedValue
+                        })
+                }) {
+                    errors.push(VerifyError::new(
+                        "V8 layout-proof",
+                        format!(
+                            "{inst:?} lacks a dominating successful simple-string layout proof"
+                        ),
+                    ));
                 }
             }
         }
@@ -1493,10 +1691,12 @@ mod tests {
     fn invoke_result_cannot_flow_to_exceptional_successor() {
         let (mut f, invoke, result) = invoke_graph();
         f.inst_mut(invoke).targets[1].args[0] = result;
-        assert!(verify(&f)
-            .unwrap_err()
-            .iter()
-            .any(|e| e.check == "V11 invoke-result"));
+        assert!(
+            verify(&f)
+                .unwrap_err()
+                .iter()
+                .any(|e| e.check == "V11 invoke-result")
+        );
     }
 
     #[test]
@@ -1504,10 +1704,12 @@ mod tests {
         let (mut f, _, result) = invoke_graph();
         let ret = f.terminator(Block(1)).unwrap();
         f.inst_mut(ret).args[0] = result;
-        assert!(verify(&f)
-            .unwrap_err()
-            .iter()
-            .any(|e| e.check == "V3 dominance"));
+        assert!(
+            verify(&f)
+                .unwrap_err()
+                .iter()
+                .any(|e| e.check == "V3 dominance")
+        );
     }
 
     #[test]
@@ -1524,10 +1726,12 @@ mod tests {
                 3 => d.flags.effectful = false,
                 _ => d.flags.safepoint = false,
             }
-            assert!(verify(&f)
-                .unwrap_err()
-                .iter()
-                .any(|e| e.check == "V11 invoke-shape"));
+            assert!(
+                verify(&f)
+                    .unwrap_err()
+                    .iter()
+                    .any(|e| e.check == "V11 invoke-shape")
+            );
         }
     }
 
@@ -1535,10 +1739,12 @@ mod tests {
     fn invoke_requires_frame_state_before_the_call() {
         let (mut f, invoke, _) = invoke_graph();
         f.inst_mut(invoke).frame_state = None;
-        assert!(verify(&f)
-            .unwrap_err()
-            .iter()
-            .any(|e| e.check == "V8 guard-framestate"));
+        assert!(
+            verify(&f)
+                .unwrap_err()
+                .iter()
+                .any(|e| e.check == "V8 guard-framestate")
+        );
     }
 
     #[test]
@@ -1554,20 +1760,24 @@ mod tests {
             }],
             stack: vec![],
         });
-        assert!(verify(&f)
-            .unwrap_err()
-            .iter()
-            .any(|e| e.check == "V8 framestate-dominance"));
+        assert!(
+            verify(&f)
+                .unwrap_err()
+                .iter()
+                .any(|e| e.check == "V8 framestate-dominance")
+        );
     }
 
     #[test]
     fn invoke_invalid_frame_handle_is_reported_without_panicking() {
         let (mut f, invoke, _) = invoke_graph();
         f.inst_mut(invoke).frame_state = Some(FrameStateId(u32::MAX));
-        assert!(verify(&f)
-            .unwrap_err()
-            .iter()
-            .any(|e| e.check == "V8 framestate-handle"));
+        assert!(
+            verify(&f)
+                .unwrap_err()
+                .iter()
+                .any(|e| e.check == "V8 framestate-handle")
+        );
     }
 
     #[test]
@@ -1590,7 +1800,7 @@ mod tests {
 
     #[test]
     fn invoke_machine_emission_is_explicitly_unsupported_until_landing_pads_exist() {
-        use crate::t2::emit::{emit, EmitError};
+        use crate::t2::emit::{EmitError, emit};
         use crate::t2::lower::op;
         let (f, _, _) = invoke_graph();
         let machine = crate::t2::lower::lower(&f);
@@ -1660,10 +1870,7 @@ mod tests {
         let (_, nil) = callee.push_inst(
             test,
             inst(Opcode::ConstNil),
-            &[(
-                IRType::of(TypeBits::NULL),
-                ValueRepresentation::Tagged,
-            )],
+            &[(IRType::of(TypeBits::NULL), ValueRepresentation::Tagged)],
         );
         let (_, is_nil) = callee.push_inst(
             test,
@@ -1951,11 +2158,11 @@ mod tests {
         // Define a first, then b; but wire an add that consumes b before b is
         // defined by putting the add first.
         let a = const_fixnum(&mut f, e, 1); // a == Value(0)
-                                            // The add is pushed at position 0 (after the const) and its own single
-                                            // result takes the next id, Value(a.0 + 1). The const `b` that follows
-                                            // then takes Value(a.0 + 2). We wire the add to read `b` — a value
-                                            // defined *later* in the same block — to trip the intra-block order
-                                            // check.
+        // The add is pushed at position 0 (after the const) and its own single
+        // result takes the next id, Value(a.0 + 1). The const `b` that follows
+        // then takes Value(a.0 + 2). We wire the add to read `b` — a value
+        // defined *later* in the same block — to trip the intra-block order
+        // check.
         let (_, addr) = f.push_inst(
             e,
             InstData {
@@ -2350,29 +2557,54 @@ mod tests {
         for malformed in 0..8 {
             let mut f = Function::new("bounded-poll-contract");
             let entry = f.entry();
-            let fs = f.frame_states.add(FrameState { scopes: vec![FrameScope {
-                function: 0, bcp: 0, locals: vec![], stack: vec![],
-            }], remat: vec![] });
-            if malformed == 4 { const_fixnum(&mut f, entry, 1); }
+            let fs = f.frame_states.add(FrameState {
+                scopes: vec![FrameScope {
+                    function: 0,
+                    bcp: 0,
+                    locals: vec![],
+                    stack: vec![],
+                }],
+                remat: vec![],
+            });
+            if malformed == 4 {
+                const_fixnum(&mut f, entry, 1);
+            }
             let mut d = inst(Opcode::NativePoll);
-            d.aux = AuxData::BoundedPoll { exit: false, scope: crate::t2::ir::BoundedPollScope {
-                function: 0, bcp: 0, control_scopes: vec![],
-            } };
-            d.flags = InstFlags { effectful: true, safepoint: true, ..Default::default() };
+            d.aux = AuxData::BoundedPoll {
+                exit: false,
+                scope: crate::t2::ir::BoundedPollScope {
+                    function: 0,
+                    bcp: 0,
+                    control_scopes: vec![],
+                },
+            };
+            d.flags = InstFlags {
+                effectful: true,
+                safepoint: true,
+                ..Default::default()
+            };
             d.frame_state = Some(fs);
             match malformed {
                 1 => d.frame_state = None,
                 2 => d.flags.call = true,
                 3 => d.aux = AuxData::None,
                 5 => {
-                    let AuxData::BoundedPoll { scope, .. } = &mut d.aux else { unreachable!(); };
+                    let AuxData::BoundedPoll { scope, .. } = &mut d.aux else {
+                        unreachable!();
+                    };
                     scope.function = 1;
                 }
                 7 => {
                     use crate::control_scope::{ControlScope, Ownership, ScopeKind};
-                    let AuxData::BoundedPoll { scope, .. } = &mut d.aux else { unreachable!(); };
-                    scope.control_scopes.push(ControlScope { push_bcp: 0, ownership: Ownership::Inherited,
-                        sp_restore: 0, kind: ScopeKind::Tagbody { id: 0 } });
+                    let AuxData::BoundedPoll { scope, .. } = &mut d.aux else {
+                        unreachable!();
+                    };
+                    scope.control_scopes.push(ControlScope {
+                        push_bcp: 0,
+                        ownership: Ownership::Inherited,
+                        sp_restore: 0,
+                        kind: ScopeKind::Tagbody { id: 0 },
+                    });
                 }
                 6 => {
                     let mut different = f.frame_states.get(fs).clone();
@@ -2383,12 +2615,18 @@ mod tests {
             }
             f.push_inst(entry, d, &[]);
             f.set_terminator(entry, ret(vec![]));
-            if malformed == 0 { assert!(f.osr_entries.is_empty()); verify(&f).unwrap(); }
-            else {
+            if malformed == 0 {
+                assert!(f.osr_entries.is_empty());
+                verify(&f).unwrap();
+            } else {
                 let errors = verify(&f).unwrap_err();
-                assert!(errors.iter().any(|e| e.check == "V8 bounded-native-poll-contract"), "{errors:?}");
+                assert!(
+                    errors
+                        .iter()
+                        .any(|e| e.check == "V8 bounded-native-poll-contract"),
+                    "{errors:?}"
+                );
             }
         }
     }
-
 }

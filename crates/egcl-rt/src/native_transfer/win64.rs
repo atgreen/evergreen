@@ -4,7 +4,7 @@
 //! Win64 physical boundary. The same instructions are compiled for Linux unit
 //! probes using Rust's `win64` ABI; only COFF unwind directives are omitted there.
 
-use super::{NativeExit, NativeOutcome, NativeSegment, EgclStack};
+use super::{EgclStack, NativeExit, NativeOutcome, NativeSegment};
 
 #[cfg(windows)]
 pub(super) fn is_supported() -> bool {

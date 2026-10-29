@@ -116,16 +116,23 @@ fn existing_improper_specializer_fails_instead_of_emitting_a_fresh_name_recipe()
 
 #[test]
 fn builtin_dispatch_and_metaclass_metadata_use_stored_class_identity() {
-    let _guard = heap_test_lock().lock().unwrap_or_else(|error| error.into_inner());
+    let _guard = heap_test_lock()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let mut env = Env::new(false);
     egcl_rt::rooted_ref!(_env = &mut env);
     egcl_rt::rooted!(integer = egcl_stdlib::find_class(resolve_sym("INTEGER").unwrap()).unwrap());
-    egcl_rt::rooted!(standard_class = egcl_stdlib::find_class(resolve_sym("STANDARD-CLASS").unwrap()).unwrap());
+    egcl_rt::rooted!(
+        standard_class = egcl_stdlib::find_class(resolve_sym("STANDARD-CLASS").unwrap()).unwrap()
+    );
     egcl_rt::rooted!(text = arena_str("not an integer"));
     let definition = |source: &str, class| MethodDef {
         method_id: next_stdlib_class_id(),
         captured_frame: None,
-        specializers: vec![MethodSpecializer::Class { source_name: source.into(), class }],
+        specializers: vec![MethodSpecializer::Class {
+            source_name: source.into(),
+            class,
+        }],
         lambda_list: NIL,
         qualifier: egcl_stdlib::MethodQualifier::Primary,
         combination: None,
@@ -134,10 +141,20 @@ fn builtin_dispatch_and_metaclass_metadata_use_stored_class_identity() {
     egcl_rt::rooted!(method = definition("FOREIGN::STRING", *integer));
     assert!(method_specificity_vector(&env, &method, &[EgclVal::from_fixnum(7)]).is_some());
     assert!(method_specificity_vector(&env, &method, &[*text]).is_none());
-    env.methods.borrow_mut().insert("IDENTITY-METACLASS-FLAG".into(),
-        vec![definition("FOREIGN::STANDARD-CLASS", *integer)]);
-    assert!(!generic_dispatches_on_a_metaclass(&env, "IDENTITY-METACLASS-FLAG"));
-    env.methods.borrow_mut().insert("IDENTITY-METACLASS-FLAG".into(),
-        vec![definition("FOREIGN::ORDINARY-NAME", *standard_class)]);
-    assert!(generic_dispatches_on_a_metaclass(&env, "IDENTITY-METACLASS-FLAG"));
+    env.methods.borrow_mut().insert(
+        "IDENTITY-METACLASS-FLAG".into(),
+        vec![definition("FOREIGN::STANDARD-CLASS", *integer)],
+    );
+    assert!(!generic_dispatches_on_a_metaclass(
+        &env,
+        "IDENTITY-METACLASS-FLAG"
+    ));
+    env.methods.borrow_mut().insert(
+        "IDENTITY-METACLASS-FLAG".into(),
+        vec![definition("FOREIGN::ORDINARY-NAME", *standard_class)],
+    );
+    assert!(generic_dispatches_on_a_metaclass(
+        &env,
+        "IDENTITY-METACLASS-FLAG"
+    ));
 }

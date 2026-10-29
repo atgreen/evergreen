@@ -130,24 +130,27 @@ fn semaphore_entry() -> EgclVal {
 /// permit must stay in the count, and the waiter must not also report it.
 #[test]
 fn semaphore_signal_losing_to_deadline_keeps_its_permit() {
-    isolated("semaphore_signal_losing_to_deadline_keeps_its_permit", || {
-        assert!(SEMAPHORE.set(EgclSemaphore::new(None, 0).unwrap()).is_ok());
-        let (pool, fiber, _descriptor, token) = start_parked(semaphore_entry);
-        *AFTER_WAIT_PARK.lock().unwrap() = Some(Box::new(gate));
-        // The deadline service completes the wait.
-        assert!(wake_fiber_wait(fiber, token));
-        wait_for(|| ARRIVED.load(Ordering::Acquire));
-        SEMAPHORE.get().unwrap().signal(1).unwrap();
-        GO.store(true, Ordering::Release);
-        let acquired = join_fiber(fiber).unwrap().as_fixnum();
-        let remaining = SEMAPHORE.get().unwrap().count();
-        assert_eq!(
-            acquired + remaining,
-            1,
-            "one permit became {acquired} acquisition(s) plus {remaining} left in the count"
-        );
-        pool.shutdown_and_join().unwrap();
-    });
+    isolated(
+        "semaphore_signal_losing_to_deadline_keeps_its_permit",
+        || {
+            assert!(SEMAPHORE.set(EgclSemaphore::new(None, 0).unwrap()).is_ok());
+            let (pool, fiber, _descriptor, token) = start_parked(semaphore_entry);
+            *AFTER_WAIT_PARK.lock().unwrap() = Some(Box::new(gate));
+            // The deadline service completes the wait.
+            assert!(wake_fiber_wait(fiber, token));
+            wait_for(|| ARRIVED.load(Ordering::Acquire));
+            SEMAPHORE.get().unwrap().signal(1).unwrap();
+            GO.store(true, Ordering::Release);
+            let acquired = join_fiber(fiber).unwrap().as_fixnum();
+            let remaining = SEMAPHORE.get().unwrap().count();
+            assert_eq!(
+                acquired + remaining,
+                1,
+                "one permit became {acquired} acquisition(s) plus {remaining} left in the count"
+            );
+            pool.shutdown_and_join().unwrap();
+        },
+    );
 }
 
 static COND_MUTEX: OnceLock<EgclMutex> = OnceLock::new();
@@ -248,7 +251,10 @@ fn only_one_waker_claims_a_wait_that_is_still_mounted() {
         let fiber = make_fiber(native_entry::entry(self_wake_entry)).unwrap();
         pool.submit(fiber).unwrap();
         let claims = join_fiber(fiber).unwrap().as_fixnum();
-        assert_eq!(claims, 2, "expected first=true second=false, got code {claims}");
+        assert_eq!(
+            claims, 2,
+            "expected first=true second=false, got code {claims}"
+        );
         pool.shutdown_and_join().unwrap();
     });
 }
@@ -258,23 +264,38 @@ fn only_one_waker_claims_a_wait_that_is_still_mounted() {
 /// them and the count never goes negative (bliss-8f1c1).
 #[test]
 fn signal_does_not_hand_off_a_permit_try_wait_already_took() {
-    isolated("signal_does_not_hand_off_a_permit_try_wait_already_took", || {
-        assert!(SEMAPHORE.set(EgclSemaphore::new(None, 0).unwrap()).is_ok());
-        let (pool, fiber, descriptor, _token) = start_parked(semaphore_entry);
-        let stolen = Arc::new(AtomicBool::new(false));
-        let thief = Arc::clone(&stolen);
-        *AFTER_SEMAPHORE_COUNT_RAISED.lock().unwrap() = Some(Box::new(move || {
-            thief.store(SEMAPHORE.get().unwrap().try_wait(1).unwrap(), Ordering::Release);
-        }));
-        SEMAPHORE.get().unwrap().signal(1).unwrap();
-        assert!(stolen.load(Ordering::Acquire), "the hook's TRY-WAIT took the permit");
-        let count = SEMAPHORE.get().unwrap().count();
-        assert_eq!(count, 0, "one permit, taken once, left the count at {count}");
-        assert!(parked_unmounted(&descriptor), "the waiter was also given the permit");
-        // A second permit is the waiter's.
-        SEMAPHORE.get().unwrap().signal(1).unwrap();
-        assert_eq!(join_fiber(fiber).unwrap().as_fixnum(), 1);
-        assert_eq!(SEMAPHORE.get().unwrap().count(), 0);
-        pool.shutdown_and_join().unwrap();
-    });
+    isolated(
+        "signal_does_not_hand_off_a_permit_try_wait_already_took",
+        || {
+            assert!(SEMAPHORE.set(EgclSemaphore::new(None, 0).unwrap()).is_ok());
+            let (pool, fiber, descriptor, _token) = start_parked(semaphore_entry);
+            let stolen = Arc::new(AtomicBool::new(false));
+            let thief = Arc::clone(&stolen);
+            *AFTER_SEMAPHORE_COUNT_RAISED.lock().unwrap() = Some(Box::new(move || {
+                thief.store(
+                    SEMAPHORE.get().unwrap().try_wait(1).unwrap(),
+                    Ordering::Release,
+                );
+            }));
+            SEMAPHORE.get().unwrap().signal(1).unwrap();
+            assert!(
+                stolen.load(Ordering::Acquire),
+                "the hook's TRY-WAIT took the permit"
+            );
+            let count = SEMAPHORE.get().unwrap().count();
+            assert_eq!(
+                count, 0,
+                "one permit, taken once, left the count at {count}"
+            );
+            assert!(
+                parked_unmounted(&descriptor),
+                "the waiter was also given the permit"
+            );
+            // A second permit is the waiter's.
+            SEMAPHORE.get().unwrap().signal(1).unwrap();
+            assert_eq!(join_fiber(fiber).unwrap().as_fixnum(), 1);
+            assert_eq!(SEMAPHORE.get().unwrap().count(), 0);
+            pool.shutdown_and_join().unwrap();
+        },
+    );
 }

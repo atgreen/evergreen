@@ -72,7 +72,9 @@ fn bbu_layout(bbu: &[u8]) -> (Vec<&[u8]>, usize) {
     let constant_count = u32::from_le_bytes(bbu[12..16].try_into().unwrap()) as usize;
     let function_count = u32::from_le_bytes(bbu[16..20].try_into().unwrap()) as usize;
     fn take<'a>(bbu: &'a [u8], pos: &mut usize, size: usize) -> &'a [u8] {
-        let end = pos.checked_add(size).expect("test BBU payload length overflow");
+        let end = pos
+            .checked_add(size)
+            .expect("test BBU payload length overflow");
         let bytes = bbu.get(*pos..end).expect("truncated test BBU payload");
         *pos = end;
         bytes
@@ -81,15 +83,25 @@ fn bbu_layout(bbu: &[u8]) -> (Vec<&[u8]>, usize) {
         u32::from_le_bytes(take(bbu, pos, 4).try_into().unwrap()) as usize
     }
     fn items<'a>(bbu: &'a [u8], pos: &mut usize, length: usize, width: usize) -> &'a [u8] {
-        take(bbu, pos, length.checked_mul(width).expect("test BBU item length overflow"))
+        take(
+            bbu,
+            pos,
+            length
+                .checked_mul(width)
+                .expect("test BBU item length overflow"),
+        )
     }
     let mut pos = 40usize;
     for _ in 0..constant_count {
         let tag = take(bbu, &mut pos, 1)[0];
         match tag {
             0 | 1 => {}
-            2 | 6 | 13 | 16 | 17 | 21 => { take(bbu, &mut pos, 8); }
-            5 | 7 | 12 | 18 | 20 => { take(bbu, &mut pos, 4); }
+            2 | 6 | 13 | 16 | 17 | 21 => {
+                take(bbu, &mut pos, 8);
+            }
+            5 | 7 | 12 | 18 | 20 => {
+                take(bbu, &mut pos, 4);
+            }
             3 => {
                 assert!(take(bbu, &mut pos, 1)[0] <= 1);
                 let length = count(bbu, &mut pos);
@@ -108,7 +120,9 @@ fn bbu_layout(bbu: &[u8]) -> (Vec<&[u8]>, usize) {
                 let length = count(bbu, &mut pos);
                 items(bbu, &mut pos, length, 4);
             }
-            11 => { take(bbu, &mut pos, 9); }
+            11 => {
+                take(bbu, &mut pos, 9);
+            }
             19 => {
                 let rank = count(bbu, &mut pos);
                 items(bbu, &mut pos, rank, 8);
@@ -123,7 +137,9 @@ fn bbu_layout(bbu: &[u8]) -> (Vec<&[u8]>, usize) {
             23 | 28 => {
                 let length = count(bbu, &mut pos);
                 let bytes = take(bbu, &mut pos, length);
-                if tag == 28 { assert!(bytes.iter().all(|&bit| bit <= 1)); }
+                if tag == 28 {
+                    assert!(bytes.iter().all(|&bit| bit <= 1));
+                }
             }
             24 | 25 => {
                 let rank = count(bbu, &mut pos);
@@ -135,7 +151,9 @@ fn bbu_layout(bbu: &[u8]) -> (Vec<&[u8]>, usize) {
                 let fields = take(bbu, &mut pos, 12);
                 assert!(fields[8] <= 1 && fields[10] <= 1 && fields[11] <= 1);
                 assert!(matches!(fields[9], 0 | 1 | 2 | 11 | 12));
-                if fields[11] == 1 { take(bbu, &mut pos, 16); }
+                if fields[11] == 1 {
+                    take(bbu, &mut pos, 16);
+                }
                 take(bbu, &mut pos, 4);
             }
             27 => {
@@ -326,15 +344,24 @@ fn memory_fence_call_persists_without_source_fallback() {
     assert!(String::from_utf8_lossy(&loaded.stdout).contains("FENCE-FASL NIL"));
     // A persisted call must retain the function binding. Erasing it into a
     // MemoryFence opcode made an artifact ignore replacements after loading.
-    let rebound = run(&format!(r#"(progn
+    let rebound = run(&format!(
+        r#"(progn
         (load {out:?})
         (dotimes (i 40) (persisted-fence))
         (setf (symbol-function 'egcl::%memory-fence)
           (lambda (kind) (declare (ignore kind)) (values 330 :fence)))
-        (format t "FENCE-REBOUND ~S~%" (multiple-value-list (persisted-fence))))"#));
-    assert!(rebound.status.success(), "{}", String::from_utf8_lossy(&rebound.stderr));
-    assert!(String::from_utf8_lossy(&rebound.stdout)
-        .lines().any(|line| line == "FENCE-REBOUND (330 :FENCE)"));
+        (format t "FENCE-REBOUND ~S~%" (multiple-value-list (persisted-fence))))"#
+    ));
+    assert!(
+        rebound.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rebound.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&rebound.stdout)
+            .lines()
+            .any(|line| line == "FENCE-REBOUND (330 :FENCE)")
+    );
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -3215,7 +3242,11 @@ fn compile_file_processes_not_compile_time_eval_when_body_as_toplevel_forms() {
     );
     // The first stdout line is PRINC's; the harness echoes the --eval value after it.
     assert_eq!(
-        String::from_utf8_lossy(&loaded.stdout).lines().next().unwrap_or("").trim(),
+        String::from_utf8_lossy(&loaded.stdout)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim(),
         "((EXPANDED (NO-SUCH-FUNCTION 1)) (LITERAL (NO-SUCH-FUNCTION 2)))"
     );
     let _ = fs::remove_dir_all(&dir);
@@ -3842,7 +3873,9 @@ fn incompatible_bytecode_versions_are_rejected_before_load_effects() {
     );
     let bytes = fs::read(&good).unwrap();
     let image = egcl_rt::bfasl::load(&bytes).unwrap();
-    for version in [0x0100u16, 0x010e, 0x010f, 0x0200, 0x0206, 0x0207, 0x0303, 0x0400] {
+    for version in [
+        0x0100u16, 0x010e, 0x010f, 0x0200, 0x0206, 0x0207, 0x0303, 0x0400,
+    ] {
         let bad = dir.join(format!("version-{version:04x}.bfasl"));
         let mut builder = egcl_rt::bfasl::BfaslBuilder::new();
         for (kind, section) in image.sections() {
@@ -3976,7 +4009,6 @@ fn source_free_accessor_callers_observe_replaced_bindings() {
     }
     fs::remove_dir_all(dir).unwrap();
 }
-
 
 #[test]
 fn present_bbu_is_authoritative_and_never_falls_back_to_legacy_source() {
@@ -4151,8 +4183,16 @@ fn asdf_bfasl_load_asd_runs_under_bytecode() {
     let asdf_src = root.join("lib/asdf.lisp");
     let asdf = dir.join("asdf.bfasl");
     let target_asd = root.join("lib/egcl-jvm/egcl-jvm.asd");
-    assert!(asdf_src.is_file(), "tracked source missing: {}", asdf_src.display());
-    assert!(target_asd.is_file(), "tracked asd missing: {}", target_asd.display());
+    assert!(
+        asdf_src.is_file(),
+        "tracked source missing: {}",
+        asdf_src.display()
+    );
+    assert!(
+        target_asd.is_file(),
+        "tracked asd missing: {}",
+        target_asd.display()
+    );
 
     let compiled = run(&format!(
         "(compile-file {asdf_src:?} :output-file {asdf:?})"
@@ -4300,9 +4340,7 @@ fn a_compiled_macros_environment_sees_the_call_sites_symbol_macrolet() {
     )
     .unwrap();
 
-    let compiled = run(&format!(
-        "(compile-file {macros:?} :output-file {fasl:?})"
-    ));
+    let compiled = run(&format!("(compile-file {macros:?} :output-file {fasl:?})"));
     assert!(
         compiled.status.success(),
         "{}",

@@ -204,13 +204,18 @@ impl LispExecutionContext {
             fn drop(&mut self) {
                 // SAFETY: the enclosing invocation still owns its storage and
                 // this private guard cannot escape the nested dynamic scope.
-                unsafe { self.execution.swap_active_native_control(self.previous); }
+                unsafe {
+                    self.execution.swap_active_native_control(self.previous);
+                }
             }
         }
         // SAFETY: obtaining the address does not move the pinned storage.
         let address = unsafe { control.as_mut().get_unchecked_mut() as *mut T as u64 };
         let previous = unsafe { self.swap_active_native_control(address) };
-        let _restore = Restore { execution: self, previous };
+        let _restore = Restore {
+            execution: self,
+            previous,
+        };
         run()
     }
 
@@ -282,7 +287,10 @@ mod tests {
             &ctx.active_native_control as *const _ as usize - base,
             offsets::ACTIVE_NATIVE_CONTROL
         );
-        assert_eq!(&ctx.poll_slot as *const _ as usize - base, offsets::POLL_SLOT);
+        assert_eq!(
+            &ctx.poll_slot as *const _ as usize - base,
+            offsets::POLL_SLOT
+        );
     }
 
     #[test]
@@ -404,15 +412,22 @@ mod execution_poll_tests {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", &name, "--nocapture"])
             .env("EGCL_EXECUTION_POLL_TEST", &name)
-            .output().unwrap();
-        assert!(output.status.success(), "{}\n{}",
-            String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
         true
     }
 
     #[test]
     fn directed_request_does_not_arm_an_unrelated_execution() {
-        if isolated() { return; }
+        if isolated() {
+            return;
+        }
         let a = LispExecutionContext::new(ExecutionKind::Fiber, 7001, 1);
         let b = LispExecutionContext::new(ExecutionKind::Fiber, 7002, 1);
         assert!(a.begin_poll());
@@ -426,7 +441,9 @@ mod execution_poll_tests {
 
     #[test]
     fn arrival_after_begin_survives_the_earlier_drain() {
-        if isolated() { return; }
+        if isolated() {
+            return;
+        }
         let execution = LispExecutionContext::new(ExecutionKind::Fiber, 7003, 1);
         execution.begin_poll();
         let payload = AtomicU64::new(0);
@@ -449,7 +466,9 @@ mod execution_poll_tests {
 
     #[test]
     fn migration_and_explicit_yield_arm_the_same_poll() {
-        if isolated() { return; }
+        if isolated() {
+            return;
+        }
         let execution = LispExecutionContext::new(ExecutionKind::Fiber, 7004, 1);
         execution.begin_poll();
         execution.set_carrier_id(2);
@@ -461,19 +480,25 @@ mod execution_poll_tests {
 
     #[test]
     fn broadcast_reaches_every_live_slot_and_new_registrations_start_armed() {
-        if isolated() { return; }
+        if isolated() {
+            return;
+        }
         let a = LispExecutionContext::new(ExecutionKind::NativeThread, 7005, 1);
         let b = LispExecutionContext::new(ExecutionKind::Fiber, 7006, 2);
-        a.begin_poll(); b.begin_poll();
+        a.begin_poll();
+        b.begin_poll();
         crate::execution_poll::request_all();
-        assert!(a.poll_pending()); assert!(b.poll_pending());
+        assert!(a.poll_pending());
+        assert!(b.poll_pending());
         let c = LispExecutionContext::new(ExecutionKind::Fiber, 7007, 2);
         assert!(c.poll_pending());
     }
 
     #[test]
     fn retired_slots_are_reused_and_broadcast_remains_safe_during_recycling() {
-        if isolated() { return; }
+        if isolated() {
+            return;
+        }
         let execution = LispExecutionContext::new(ExecutionKind::Fiber, 7010, 1);
         let slot = execution.poll_slot as *const crate::execution_poll::PollSlot;
         drop(execution);
@@ -498,5 +523,4 @@ mod execution_poll_tests {
         unsafe { &*slot }.request();
         assert!(reused.poll_pending());
     }
-
 }

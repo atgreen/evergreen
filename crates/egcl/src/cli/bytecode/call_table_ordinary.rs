@@ -6,7 +6,7 @@
 //! call allocates a managed activation or increments a Rust reference count.
 
 use super::{CallCell, linkage};
-use egcl_rt::call_table::{OrdinaryEntryDescriptor, OrdinaryCallHeat};
+use egcl_rt::call_table::{OrdinaryCallHeat, OrdinaryEntryDescriptor};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
@@ -268,7 +268,9 @@ pub(in crate::cli::bytecode) struct OrdinaryCodeDirectory {
 
 impl OrdinaryCodeDirectory {
     #[cfg(test)]
-    pub(in crate::cli::bytecode) fn for_walk_test(codes: &[(Rc<TransferCode>, usize, usize)]) -> Self {
+    pub(in crate::cli::bytecode) fn for_walk_test(
+        codes: &[(Rc<TransferCode>, usize, usize)],
+    ) -> Self {
         let mut retained = RetainedEntries::default();
         for (code, start, len) in codes {
             // Test-only ownership registration. Legacy fixture entries are
@@ -285,9 +287,20 @@ impl OrdinaryCodeDirectory {
                 owner: Rc::as_ptr(code) as usize,
                 stack_required: 8,
             };
-            assert!(retained.retain(Arc::new(CallCell::new(0, 11, 12)), descriptor, Rc::clone(code)).is_some());
+            assert!(
+                retained
+                    .retain(
+                        Arc::new(CallCell::new(0, 11, 12)),
+                        descriptor,
+                        Rc::clone(code)
+                    )
+                    .is_some()
+            );
         }
-        Self { retained: RefCell::new(retained), roots: RefCell::new(Vec::new()) }
+        Self {
+            retained: RefCell::new(retained),
+            roots: RefCell::new(Vec::new()),
+        }
     }
 
     /// Clone handles under the directory borrow; every GC-gated read happens
@@ -310,15 +323,24 @@ impl OrdinaryCodeDirectory {
             return true;
         }
         egcl_rt::rooted!(function = function);
-        let mut retained: Vec<_> = self.retained.borrow().entries.iter()
+        let mut retained: Vec<_> = self
+            .retained
+            .borrow()
+            .entries
+            .iter()
             .filter(|entry| std::ptr::eq(Rc::as_ptr(&entry.code), code))
             .map(|entry| entry.callable.clone())
             .collect();
-        retained.extend(self.roots.borrow().iter()
-            .filter(|root| std::ptr::eq(root.owner, code))
-            .map(|root| Some(Arc::clone(&root.callable))));
-        retained.into_iter().all(|root| root.is_some_and(|root|
-            root.with_gc_stable_mutator(|value| *value == *function)))
+        retained.extend(
+            self.roots
+                .borrow()
+                .iter()
+                .filter(|root| std::ptr::eq(root.owner, code))
+                .map(|root| Some(Arc::clone(&root.callable))),
+        );
+        retained.into_iter().all(|root| {
+            root.is_some_and(|root| root.with_gc_stable_mutator(|value| *value == *function))
+        })
     }
 
     /// Whether every handle constraining `code`'s identity is `callable`
@@ -328,10 +350,21 @@ impl OrdinaryCodeDirectory {
         code: &TransferCode,
         callable: &Arc<egcl_rt::CrossThreadRoot<egcl_rt::value::EgclVal>>,
     ) -> bool {
-        self.retained.borrow().entries.iter()
+        self.retained
+            .borrow()
+            .entries
+            .iter()
             .filter(|entry| std::ptr::eq(Rc::as_ptr(&entry.code), code))
-            .all(|entry| entry.callable.as_ref().is_some_and(|root| Arc::ptr_eq(root, callable)))
-            && self.roots.borrow().iter()
+            .all(|entry| {
+                entry
+                    .callable
+                    .as_ref()
+                    .is_some_and(|root| Arc::ptr_eq(root, callable))
+            })
+            && self
+                .roots
+                .borrow()
+                .iter()
                 .filter(|root| std::ptr::eq(root.owner, code))
                 .all(|root| Arc::ptr_eq(&root.callable, callable))
     }
@@ -376,7 +409,10 @@ static DIRECTORY: egcl_rt::execution_local::ExecutionLocal<Rc<OrdinaryCodeDirect
 /// The enclosing segment lease keeps retired owners until every frame returns.
 pub(in crate::cli::bytecode) fn active_ordinary_directory() -> Rc<OrdinaryCodeDirectory> {
     DIRECTORY.with(|directory| {
-        assert!(directory.retained.borrow().segments > 0, "native publication needs a segment lease");
+        assert!(
+            directory.retained.borrow().segments > 0,
+            "native publication needs a segment lease"
+        );
         Rc::clone(directory)
     })
 }
@@ -397,7 +433,9 @@ pub(in crate::cli::bytecode) struct OrdinaryRootGuard<'a> {
 
 impl Drop for OrdinaryRootGuard<'_> {
     fn drop(&mut self) {
-        let Some(identity) = self.identity.take() else { return };
+        let Some(identity) = self.identity.take() else {
+            return;
+        };
         {
             let mut roots = self.directory.roots.borrow_mut();
             // Guards nest, so this is nearly always the newest root.
@@ -416,36 +454,54 @@ impl Drop for OrdinaryRootGuard<'_> {
 
 impl OrdinarySegmentGuard {
     pub(in crate::cli::bytecode) fn retain_root<'a>(
-        &self, code: &'a TransferCode, function: egcl_rt::value::EgclVal,
+        &self,
+        code: &'a TransferCode,
+        function: egcl_rt::value::EgclVal,
     ) -> Option<OrdinaryRootGuard<'a>> {
         let (start, len) = code.ordinary_code_bounds()?;
         // Steady state: the same pinned function as the previous activation,
         // whose released identity is still spare. Pointer checks only, so no
         // root, gate, reference count or allocation (GitHub #487).
-        let reused = code.with_pinned_callable_root(function, |callable| {
-            if !self.directory.held_only_by(code, callable) {
-                return None;
-            }
-            code.take_spare_root_identity().filter(|identity| std::ptr::eq(identity.owner, code)
-                && identity.start == start && identity.len == len
-                && Arc::ptr_eq(&identity.callable, callable))
-        }).flatten();
+        let reused = code
+            .with_pinned_callable_root(function, |callable| {
+                if !self.directory.held_only_by(code, callable) {
+                    return None;
+                }
+                code.take_spare_root_identity().filter(|identity| {
+                    std::ptr::eq(identity.owner, code)
+                        && identity.start == start
+                        && identity.len == len
+                        && Arc::ptr_eq(&identity.callable, callable)
+                })
+            })
+            .flatten();
         if let Some(identity) = reused {
             self.directory.roots.borrow_mut().push(Rc::clone(&identity));
             return Some(OrdinaryRootGuard {
-                directory: Rc::clone(&self.directory), identity: Some(identity), code,
+                directory: Rc::clone(&self.directory),
+                identity: Some(identity),
+                code,
             });
         }
         egcl_rt::rooted!(function = function);
         let cached = code.cached_callable_root(&function);
-        if !self.directory.accepts_callable_root(code, *function, cached.as_ref()) { return None; }
+        if !self
+            .directory
+            .accepts_callable_root(code, *function, cached.as_ref())
+        {
+            return None;
+        }
         let callable = cached.unwrap_or_else(|| code.callable_root(*function));
         // The previous activation's identity, when it names the same root and
         // code range, saves an allocation and free on every call.
-        let identity = code.take_spare_root_identity()
-            .filter(|identity| std::ptr::eq(identity.owner, code)
-                && identity.start == start && identity.len == len
-                && Arc::ptr_eq(&identity.callable, &callable))
+        let identity = code
+            .take_spare_root_identity()
+            .filter(|identity| {
+                std::ptr::eq(identity.owner, code)
+                    && identity.start == start
+                    && identity.len == len
+                    && Arc::ptr_eq(&identity.callable, &callable)
+            })
             .unwrap_or_else(|| {
                 #[cfg(test)]
                 ROOT_IDENTITIES.with(|count| count.set(count.get() + 1));
@@ -458,11 +514,16 @@ impl OrdinarySegmentGuard {
             });
         self.directory.roots.borrow_mut().push(Rc::clone(&identity));
         Some(OrdinaryRootGuard {
-            directory: Rc::clone(&self.directory), identity: Some(identity), code,
+            directory: Rc::clone(&self.directory),
+            identity: Some(identity),
+            code,
         })
     }
 
-    #[cfg_attr(not(test), expect(dead_code, reason = "ordinary entry consumers follow in bliss-t8a48"))]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "ordinary entry consumers follow in bliss-t8a48")
+    )]
     pub(in crate::cli::bytecode) fn directory(&self) -> Rc<OrdinaryCodeDirectory> {
         Rc::clone(&self.directory)
     }
@@ -513,19 +574,18 @@ pub(in crate::cli::bytecode) unsafe fn publish_ordinary_with_heat(
     egcl_rt::rooted!(function = function);
     let state = unsafe { super::state(cell) };
     DIRECTORY.with(|directory| {
-        if code.needs_callable_identity()
-            && !directory.accepts_callable(&code, *function)
-        {
+        if code.needs_callable_identity() && !directory.accepts_callable(&code, *function) {
             return false;
         }
         // Share the code's own callable root, so ordinary entries for the same
         // function recognize this published identity by pointer.
         let callable = code.callable_root(*function);
-        let pointer =
-            directory
-                .retained
-                .borrow_mut()
-                .retain_with_callable(Arc::clone(&state.cell), descriptor, code, Some(callable));
+        let pointer = directory.retained.borrow_mut().retain_with_callable(
+            Arc::clone(&state.cell),
+            descriptor,
+            code,
+            Some(callable),
+        );
         let Some(pointer) = pointer else { return false };
         // Retention and publication do not allocate Lisp objects or yield.
         let heat_pointer = {
@@ -543,7 +603,8 @@ pub(in crate::cli::bytecode) unsafe fn publish_ordinary_with_heat(
                 0
             }
         };
-        let published = unsafe { linkage::publish_ordinary_with_heat(&state.cell, &*pointer, heat_pointer) };
+        let published =
+            unsafe { linkage::publish_ordinary_with_heat(&state.cell, &*pointer, heat_pointer) };
         directory.retained.borrow_mut().sweep();
         published
     })
@@ -578,52 +639,98 @@ pub(in crate::cli::bytecode) fn ordinary_segment_depth_for_test() -> usize {
 /// code. The caller supplies two distinct interpreted callable identities.
 #[cfg(test)]
 pub(in crate::cli::bytecode) fn assert_guarded_callable_publication_for_test(
-    code: Rc<TransferCode>, first: egcl_rt::value::EgclVal, second: egcl_rt::value::EgclVal,
+    code: Rc<TransferCode>,
+    first: egcl_rt::value::EgclVal,
+    second: egcl_rt::value::EgclVal,
 ) {
     egcl_rt::rooted!(first = first);
     egcl_rt::rooted!(second = second);
     assert_ne!(*first, *second);
     assert!(code.ordinary_entry.is_some() && code.has_deopt);
-    let symbol = crate::cli::resolve_sym("ORDINARY-IDENTITY-PUBLICATION-FIRST").unwrap().as_symbol_index();
-    let other = crate::cli::resolve_sym("ORDINARY-IDENTITY-PUBLICATION-OTHER").unwrap().as_symbol_index();
+    let symbol = crate::cli::resolve_sym("ORDINARY-IDENTITY-PUBLICATION-FIRST")
+        .unwrap()
+        .as_symbol_index();
+    let other = crate::cli::resolve_sym("ORDINARY-IDENTITY-PUBLICATION-OTHER")
+        .unwrap()
+        .as_symbol_index();
     let cell = super::resolve(symbol).unwrap();
     let other_cell = super::resolve(other).unwrap();
     linkage::invalidate(symbol);
     linkage::invalidate(other);
     let segment = enter_ordinary_segment();
     // An unpublished root already reserves the exact identity of this code.
-    let root = segment.retain_root(&code, *first).expect("first root identity");
+    let root = segment
+        .retain_root(&code, *first)
+        .expect("first root identity");
     assert!(segment.retain_root(&code, *second).is_none());
-    let nested_root = segment.retain_root(&code, *first).expect("same callable reentry");
+    let nested_root = segment
+        .retain_root(&code, *first)
+        .expect("same callable reentry");
     drop(nested_root);
     let root_pc = code.ordinary_descriptor(0).unwrap().entry;
-    segment.directory.callable_for_pc(root_pc).expect("unpublished root lookup")
+    segment
+        .directory
+        .callable_for_pc(root_pc)
+        .expect("unpublished root lookup")
         .with_gc_stable_mutator(|value| assert_eq!(*value, *first));
-    let rejected = code.ordinary_descriptor(linkage::revision(other_cell.ordinal())).unwrap();
-    assert!(!unsafe { publish_ordinary(Arc::as_ptr(&other_cell) as u64,
-        rejected, Rc::clone(&code), *second) });
-    let descriptor = code.ordinary_descriptor(linkage::revision(cell.ordinal())).unwrap();
+    let rejected = code
+        .ordinary_descriptor(linkage::revision(other_cell.ordinal()))
+        .unwrap();
+    assert!(!unsafe {
+        publish_ordinary(
+            Arc::as_ptr(&other_cell) as u64,
+            rejected,
+            Rc::clone(&code),
+            *second,
+        )
+    });
+    let descriptor = code
+        .ordinary_descriptor(linkage::revision(cell.ordinal()))
+        .unwrap();
     let address = Arc::as_ptr(&cell) as u64;
     assert!(unsafe { publish_ordinary(address, descriptor, Rc::clone(&code), *first) });
     let retained = unsafe { &*cell.ordinary_entry_address() }.load(Ordering::Acquire);
     assert_ne!(retained, 0);
-    let other_descriptor = code.ordinary_descriptor(linkage::revision(other_cell.ordinal())).unwrap();
-    assert!(!unsafe { publish_ordinary(Arc::as_ptr(&other_cell) as u64,
-        other_descriptor, Rc::clone(&code), *second) });
-    assert_eq!(unsafe { &*other_cell.ordinary_entry_address() }.load(Ordering::Acquire), 0);
-    assert_eq!(unsafe { &*cell.ordinary_entry_address() }.load(Ordering::Acquire), retained);
+    let other_descriptor = code
+        .ordinary_descriptor(linkage::revision(other_cell.ordinal()))
+        .unwrap();
+    assert!(!unsafe {
+        publish_ordinary(
+            Arc::as_ptr(&other_cell) as u64,
+            other_descriptor,
+            Rc::clone(&code),
+            *second,
+        )
+    });
+    assert_eq!(
+        unsafe { &*other_cell.ordinary_entry_address() }.load(Ordering::Acquire),
+        0
+    );
+    assert_eq!(
+        unsafe { &*cell.ordinary_entry_address() }.load(Ordering::Acquire),
+        retained
+    );
     // Redefinition clears the old slot, but the live segment still owns its
     // exact descriptor and callable. Legacy publication cannot bypass the gate.
     linkage::invalidate(symbol);
     let revision = linkage::revision(cell.ordinal());
     let bridges = super::bridge_entries().unwrap();
     assert!(linkage::publish(&cell, revision, bridges[2], bridges[3]));
-    assert_eq!(unsafe { &*cell.ordinary_entry_address() }.load(Ordering::Acquire), 0);
+    assert_eq!(
+        unsafe { &*cell.ordinary_entry_address() }.load(Ordering::Acquire),
+        0
+    );
     let replacement = code.ordinary_descriptor(revision).unwrap();
     assert!(!unsafe { publish_ordinary(address, replacement, Rc::clone(&code), *second) });
-    assert_eq!(unsafe { &*cell.ordinary_entry_address() }.load(Ordering::Acquire), 0);
+    assert_eq!(
+        unsafe { &*cell.ordinary_entry_address() }.load(Ordering::Acquire),
+        0
+    );
     assert!(unsafe { publish_ordinary(address, replacement, Rc::clone(&code), *first) });
-    assert_ne!(unsafe { &*cell.ordinary_entry_address() }.load(Ordering::Acquire), 0);
+    assert_ne!(
+        unsafe { &*cell.ordinary_entry_address() }.load(Ordering::Acquire),
+        0
+    );
     linkage::invalidate(symbol);
     linkage::invalidate(other);
     assert!(segment.retain_root(&code, *second).is_none());
@@ -632,8 +739,13 @@ pub(in crate::cli::bytecode) fn assert_guarded_callable_publication_for_test(
     // Once both the root and retired descriptors disappear, a new identity
     // may enter the same code without inheriting the previous callable.
     let segment = enter_ordinary_segment();
-    let replacement_root = segment.retain_root(&code, *second).expect("retired identity released");
-    segment.directory.callable_for_pc(root_pc).unwrap()
+    let replacement_root = segment
+        .retain_root(&code, *second)
+        .expect("retired identity released");
+    segment
+        .directory
+        .callable_for_pc(root_pc)
+        .unwrap()
         .with_gc_stable_mutator(|value| assert_eq!(*value, *second));
     drop(replacement_root);
     drop(segment);
@@ -979,44 +1091,78 @@ mod tests {
     fn ordinary_callable_identity_includes_retired_entries_and_roots_lookup() {
         use crate::cli::{Env, reader};
         use egcl_rt::value::NIL;
-        let _lock = crate::cli::heap_test_lock().lock()
+        let _lock = crate::cli::heap_test_lock()
+            .lock()
             .unwrap_or_else(|error| error.into_inner());
         let mut env = Env::new(false);
         egcl_rt::rooted_ref!(_env = &mut env);
         egcl_rt::rooted!(forms = reader::read_from_string("(42)").unwrap().0);
-        let body = Arc::new(crate::cli::bytecode::compile_function(
-            "ORDINARY-CALLABLE-OWNER", NIL, *forms, &env, false, false,
-        ).unwrap());
+        let body = Arc::new(
+            crate::cli::bytecode::compile_function(
+                "ORDINARY-CALLABLE-OWNER",
+                NIL,
+                *forms,
+                &env,
+                false,
+                false,
+            )
+            .unwrap(),
+        );
         let code = Rc::new(TransferCode::compile(body).unwrap());
-        egcl_rt::rooted!(first = crate::cli::read_eval_all_env("(function (lambda () 42))", &mut env).unwrap());
-        egcl_rt::rooted!(second = crate::cli::read_eval_all_env("(function (lambda () 42))", &mut env).unwrap());
+        egcl_rt::rooted!(
+            first = crate::cli::read_eval_all_env("(function (lambda () 42))", &mut env).unwrap()
+        );
+        egcl_rt::rooted!(
+            second = crate::cli::read_eval_all_env("(function (lambda () 42))", &mut env).unwrap()
+        );
         assert_ne!(*first, *second, "distinct callable identities");
-        let directory = OrdinaryCodeDirectory { retained: RefCell::new(RetainedEntries::default()), roots: RefCell::new(Vec::new()) };
+        let directory = OrdinaryCodeDirectory {
+            retained: RefCell::new(RetainedEntries::default()),
+            roots: RefCell::new(Vec::new()),
+        };
         let descriptor = OrdinaryEntryDescriptor {
             kind: linkage::ORDINARY_X64_LISP_KIND,
             version: linkage::ORDINARY_X64_LISP_VERSION,
-            revision: 0, entry: 0x1010, code_start: 0x1000, code_len: 64,
-            arity: 0, environment: linkage::ORDINARY_ENV_NONE,
-            owner: Rc::as_ptr(&code) as usize, stack_required: 8,
+            revision: 0,
+            entry: 0x1010,
+            code_start: 0x1000,
+            code_len: 64,
+            arity: 0,
+            environment: linkage::ORDINARY_ENV_NONE,
+            owner: Rc::as_ptr(&code) as usize,
+            stack_required: 8,
         };
         directory.retained.borrow_mut().begin_segment();
         assert!(directory.accepts_callable(&code, *first));
         let callable = Arc::new(egcl_rt::CrossThreadRoot::new(*first));
-        assert!(directory.retained.borrow_mut().retain_with_callable(
-            Arc::new(CallCell::new(0, 11, 12)), descriptor,
-            Rc::clone(&code), Some(callable),
-        ).is_some());
+        assert!(
+            directory
+                .retained
+                .borrow_mut()
+                .retain_with_callable(
+                    Arc::new(CallCell::new(0, 11, 12)),
+                    descriptor,
+                    Rc::clone(&code),
+                    Some(callable),
+                )
+                .is_some()
+        );
         directory.retained.borrow_mut().sweep();
         assert!(directory.accepts_callable(&code, *first));
-        assert!(!directory.accepts_callable(&code, *second),
-            "unpublished but in-flight owner still constrains identity");
+        assert!(
+            !directory.accepts_callable(&code, *second),
+            "unpublished but in-flight owner still constrains identity"
+        );
         let retained = directory.callable_for_pc(0x1010).unwrap();
         // Lookup must release the directory borrow before callers enter a GC gate.
         drop(directory.retained.borrow_mut());
         retained.with_gc_stable_mutator(|value| assert_eq!(*value, *first));
         directory.retained.borrow_mut().finish_segment();
         assert!(directory.callable_for_pc(0x1010).is_none());
-        assert!(directory.accepts_callable(&code, *second), "retired last segment releases identity");
+        assert!(
+            directory.accepts_callable(&code, *second),
+            "retired last segment releases identity"
+        );
         // A returned handle retains its callable independently of directory sweeping.
         egcl_rt::gc::collect_t0_minor().unwrap();
         retained.with_gc_stable_mutator(|value| assert_eq!(*value, *first));

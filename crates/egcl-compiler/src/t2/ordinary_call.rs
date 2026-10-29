@@ -4,9 +4,7 @@
 //! Bounded ordinary calls with explicit continuation and final-result policies.
 use super::*;
 use crate::t2::ir::{AuxData, Inst, InstData, Opcode, TypeBits, Value, ValueRepresentation};
-use egcl_rt::call_table::{
-    OrdinaryCallHeat, ORDINARY_ENV_NONE, OrdinaryEntryDescriptor,
-};
+use egcl_rt::call_table::{ORDINARY_ENV_NONE, OrdinaryCallHeat, OrdinaryEntryDescriptor};
 use std::collections::HashMap;
 
 #[derive(Clone, Copy)]
@@ -176,9 +174,14 @@ fn emit_ordinary_call_body(
     if insts.len() < 2 || insts.len() > 64 {
         return Err(bad());
     }
-    let calls: Vec<_> = insts.iter().enumerate()
-        .filter(|(_, inst)| f.inst(**inst).opcode == Opcode::Call).collect();
-    if calls.len() != 1 { return Err(bad()); }
+    let calls: Vec<_> = insts
+        .iter()
+        .enumerate()
+        .filter(|(_, inst)| f.inst(**inst).opcode == Opcode::Call)
+        .collect();
+    if calls.len() != 1 {
+        return Err(bad());
+    }
     let (call_position, &call_inst) = calls[0];
     let call = f.inst(call_inst);
     let ret = f.inst(insts[insts.len() - 1]);
@@ -211,7 +214,9 @@ fn emit_ordinary_call_body(
         // explicitly normalize MV before its final return.
         if !crate::t2::opt_clear_mv::single_value_state(f, true)
             .contains(insts.last().ok_or_else(bad)?)
-        { return Err(bad()); }
+        {
+            return Err(bad());
+        }
         let state = f.frame_states.get(call.frame_state.ok_or_else(bad)?);
         if state.scopes.len() != 1 || state.scopes[0].function == target.symbol {
             // Direct recursion is outside this first continuation slice.
@@ -227,27 +232,38 @@ fn emit_ordinary_call_body(
                 if state.scopes.len() != 1
                     || state.scopes[0].function != before.function
                     || state.scopes[0].bcp > before.bcp
-                { return Err(bad()); }
+                {
+                    return Err(bad());
+                }
             }
         }
         let mut guards = 0;
         for &inst in &insts[call_position + 1..insts.len() - 1] {
             let data = f.inst(inst);
             match data.opcode {
-                Opcode::ConstFixnum | Opcode::ConstFloat | Opcode::ConstNil | Opcode::ConstT
-                | Opcode::ConstSymbol | Opcode::ConstChar | Opcode::ClearMv => {}
+                Opcode::ConstFixnum
+                | Opcode::ConstFloat
+                | Opcode::ConstNil
+                | Opcode::ConstT
+                | Opcode::ConstSymbol
+                | Opcode::ConstChar
+                | Opcode::ClearMv => {}
                 Opcode::Guard | Opcode::FixnumAdd | Opcode::FixnumSub | Opcode::FixnumMul => {
                     let state = f.frame_states.get(data.frame_state.ok_or_else(bad)?);
                     if state.scopes.len() != 1
                         || state.scopes[0].function != before.function
                         || state.scopes[0].bcp <= before.bcp
-                    { return Err(bad()); }
+                    {
+                        return Err(bad());
+                    }
                     guards += 1;
                 }
                 _ => return Err(bad()),
             }
         }
-        if guards == 0 { return Err(bad()); }
+        if guards == 0 {
+            return Err(bad());
+        }
     }
     super::emit_framed_inner(
         f,
@@ -272,20 +288,29 @@ fn emit_ordinary_call_body(
             target,
             targets: &[],
             second_target: None,
-            return_policy: if guard.is_some() { OrdinaryReturnPolicy::Continuation }
-                else { OrdinaryReturnPolicy::Call(call_inst) },
+            return_policy: if guard.is_some() {
+                OrdinaryReturnPolicy::Continuation
+            } else {
+                OrdinaryReturnPolicy::Call(call_inst)
+            },
             cold,
             // Under the bounded 0–4 signature, rounded capacity is 0 or 16.
             tail: allow_tail && (call.args.len() <= 3 || entry.arity == 4),
             guard,
-            poll_veneer: None, self_calls: &[], direct_self: false, self_facts: OrdinarySelfCallFacts::default(),
+            poll_veneer: None,
+            self_calls: &[],
+            direct_self: false,
+            self_facts: OrdinarySelfCallFacts::default(),
         }),
     )
 }
 
 fn validate_entry(
-    f: &Function, entry: OrdinaryLispEntryOptions, targets: &[OrdinaryCallTarget],
-    flags: OrdinaryCallFlags, cold: u64,
+    f: &Function,
+    entry: OrdinaryLispEntryOptions,
+    targets: &[OrdinaryCallTarget],
+    flags: OrdinaryCallFlags,
+    cold: u64,
 ) -> Result<(), EmitError> {
     let bad = || EmitError::UnsupportedOp(0xFA);
     if f.block_order().len() != 1
@@ -304,7 +329,9 @@ fn validate_entry(
             flags.signal_epoch,
         ]
         .contains(&0)
-        || targets.iter().any(|target| target.descriptor_slot == 0 || target.revision_address == 0)
+        || targets
+            .iter()
+            .any(|target| target.descriptor_slot == 0 || target.revision_address == 0)
         || crate::t2::verify::verify(f).is_err()
         || (0..f.num_values()).any(|v| f.value(Value(v as u32)).repr != ValueRepresentation::Tagged)
     {
@@ -319,43 +346,102 @@ fn validate_entry(
 /// or tail retirement are admitted. The MV helper's zero-count arm must be a
 /// nonallocating, nonpolling, nonsignaling clear operation.
 pub fn emit_framed_ordinary_two_calls(
-    f: &Function, entry: OrdinaryLispEntryOptions, targets: [OrdinaryCallTarget; 2],
-    flags: OrdinaryCallFlags, cold: u64, multiple_values: u64,
+    f: &Function,
+    entry: OrdinaryLispEntryOptions,
+    targets: [OrdinaryCallTarget; 2],
+    flags: OrdinaryCallFlags,
+    cold: u64,
+    multiple_values: u64,
 ) -> Result<FramedCode, EmitError> {
     let bad = || EmitError::UnsupportedOp(0xFA);
     validate_entry(f, entry, &targets, flags, cold)?;
-    if multiple_values == 0 { return Err(bad()); }
+    if multiple_values == 0 {
+        return Err(bad());
+    }
     let insts = &f.block(f.entry()).insts;
-    if insts.len() < 4 || insts.len() > 64 { return Err(bad()); }
-    let calls: Vec<_> = insts.iter().enumerate()
-        .filter(|(_, inst)| f.inst(**inst).opcode == Opcode::Call).collect();
-    if calls.len() != 2 { return Err(bad()); }
+    if insts.len() < 4 || insts.len() > 64 {
+        return Err(bad());
+    }
+    let calls: Vec<_> = insts
+        .iter()
+        .enumerate()
+        .filter(|(_, inst)| f.inst(**inst).opcode == Opcode::Call)
+        .collect();
+    if calls.len() != 2 {
+        return Err(bad());
+    }
     let (first_position, &first) = calls[0];
     let (last_position, &last) = calls[1];
     for (&inst, target) in [first, last].iter().zip(targets) {
         let call = f.inst(inst);
-        if call.args.len() > 4 || call.results.len() != 1 || !call.flags.call || !call.flags.safepoint
+        if call.args.len() > 4
+            || call.results.len() != 1
+            || !call.flags.call
+            || !call.flags.safepoint
             || call.aux.named_call_target() != Some(target.symbol)
-        { return Err(bad()); }
+        {
+            return Err(bad());
+        }
     }
     let ret = f.inst(*insts.last().ok_or_else(bad)?);
-    if last_position != insts.len() - 2 || ret.opcode != Opcode::Return
+    if last_position != insts.len() - 2
+        || ret.opcode != Opcode::Return
         || ret.args != f.inst(last).results
-    { return Err(bad()); }
-    let immediate = |inst: Inst| matches!(f.inst(inst).opcode,
-        Opcode::ConstFixnum | Opcode::ConstFloat | Opcode::ConstNil | Opcode::ConstT
-            | Opcode::ConstSymbol | Opcode::ConstChar);
+    {
+        return Err(bad());
+    }
+    let immediate = |inst: Inst| {
+        matches!(
+            f.inst(inst).opcode,
+            Opcode::ConstFixnum
+                | Opcode::ConstFloat
+                | Opcode::ConstNil
+                | Opcode::ConstT
+                | Opcode::ConstSymbol
+                | Opcode::ConstChar
+        )
+    };
     if insts[..first_position].iter().any(|&inst| !immediate(inst))
-        || insts[first_position + 1..last_position].iter()
+        || insts[first_position + 1..last_position]
+            .iter()
             .any(|&inst| !immediate(inst) && f.inst(inst).opcode != Opcode::ClearMv)
         || !crate::t2::opt_clear_mv::single_value_state(f, true).contains(&last)
-    { return Err(bad()); }
-    super::emit_framed_inner(f, 0, 0, 0, 0, 0, 0, 0, multiple_values, 0, 0,
-        Some(entry.arity as u16), None, &[], 0, EnvironmentCalls::default(), None,
-        Some(entry), Some(OrdinaryCallEmission {
-            target: targets[0], targets: &[], second_target: Some((last, targets[1])),
-            return_policy: OrdinaryReturnPolicy::Call(last), cold, tail: false, guard: None, poll_veneer: None, self_calls: &[], direct_self: false, self_facts: OrdinarySelfCallFacts::default(),
-        }))
+    {
+        return Err(bad());
+    }
+    super::emit_framed_inner(
+        f,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        multiple_values,
+        0,
+        0,
+        Some(entry.arity as u16),
+        None,
+        &[],
+        0,
+        EnvironmentCalls::default(),
+        None,
+        Some(entry),
+        Some(OrdinaryCallEmission {
+            target: targets[0],
+            targets: &[],
+            second_target: Some((last, targets[1])),
+            return_policy: OrdinaryReturnPolicy::Call(last),
+            cold,
+            tail: false,
+            guard: None,
+            poll_veneer: None,
+            self_calls: &[],
+            direct_self: false,
+            self_facts: OrdinarySelfCallFacts::default(),
+        }),
+    )
 }
 
 /// Compile an ordinary fixed-arity function with per-instruction named targets.
@@ -364,9 +450,12 @@ pub fn emit_framed_ordinary_two_calls(
 /// Control-region operations and raw values require their own native transition
 /// protocols and are rejected here rather than invoking a zero helper address.
 pub fn emit_framed_ordinary_function(
-    f: &Function, entry: OrdinaryLispEntryOptions,
-    targets: &[(Inst, OrdinaryCallTarget)], flags: OrdinaryCallFlags,
-    cold: u64, guard: OrdinaryGuardOptions,
+    f: &Function,
+    entry: OrdinaryLispEntryOptions,
+    targets: &[(Inst, OrdinaryCallTarget)],
+    flags: OrdinaryCallFlags,
+    cold: u64,
+    guard: OrdinaryGuardOptions,
 ) -> Result<FramedCode, EmitError> {
     emit_framed_ordinary_function_with_poll(f, entry, targets, flags, cold, guard, 0)
 }
@@ -376,11 +465,24 @@ pub fn emit_framed_ordinary_function(
 /// homes before collecting, yielding or delivering a nonlocal transfer.
 #[allow(clippy::too_many_arguments)]
 pub fn emit_framed_ordinary_function_with_poll(
-    f: &Function, entry: OrdinaryLispEntryOptions,
-    targets: &[(Inst, OrdinaryCallTarget)], flags: OrdinaryCallFlags,
-    cold: u64, guard: OrdinaryGuardOptions, poll_veneer: u64,
+    f: &Function,
+    entry: OrdinaryLispEntryOptions,
+    targets: &[(Inst, OrdinaryCallTarget)],
+    flags: OrdinaryCallFlags,
+    cold: u64,
+    guard: OrdinaryGuardOptions,
+    poll_veneer: u64,
 ) -> Result<FramedCode, EmitError> {
-    emit_framed_ordinary_function_with_self_calls(f, entry, targets, flags, cold, guard, poll_veneer, &[])
+    emit_framed_ordinary_function_with_self_calls(
+        f,
+        entry,
+        targets,
+        flags,
+        cold,
+        guard,
+        poll_veneer,
+        &[],
+    )
 }
 
 /// Emit source-proven self calls to this artifact's ordinary entry. The caller
@@ -389,12 +491,26 @@ pub fn emit_framed_ordinary_function_with_poll(
 /// need no global binding lookup or invocation heat (the body is already T2).
 #[allow(clippy::too_many_arguments)]
 pub fn emit_framed_ordinary_function_with_self_calls(
-    f: &Function, entry: OrdinaryLispEntryOptions,
-    targets: &[(Inst, OrdinaryCallTarget)], flags: OrdinaryCallFlags,
-    cold: u64, guard: OrdinaryGuardOptions, poll_veneer: u64, self_calls: &[Inst],
+    f: &Function,
+    entry: OrdinaryLispEntryOptions,
+    targets: &[(Inst, OrdinaryCallTarget)],
+    flags: OrdinaryCallFlags,
+    cold: u64,
+    guard: OrdinaryGuardOptions,
+    poll_veneer: u64,
+    self_calls: &[Inst],
 ) -> Result<FramedCode, EmitError> {
-    emit_framed_ordinary_function_with_self_call_facts(f, entry, targets, flags,
-        cold, guard, poll_veneer, self_calls, OrdinarySelfCallFacts::default())
+    emit_framed_ordinary_function_with_self_call_facts(
+        f,
+        entry,
+        targets,
+        flags,
+        cold,
+        guard,
+        poll_veneer,
+        self_calls,
+        OrdinarySelfCallFacts::default(),
+    )
 }
 
 /// Emit using invariants established at every ingress by the artifact owner.
@@ -435,10 +551,14 @@ fn duplicate_join_returns_once(f: &Function) -> Option<Function> {
     let mut joins = Vec::new();
     for &block in f.block_order() {
         let data = f.block(block);
-        if block == f.entry() || data.insts.len() != 1 { continue; }
+        if block == f.entry() || data.insts.len() != 1 {
+            continue;
+        }
         let ret = f.inst(data.insts[0]);
         let [returned] = ret.args[..] else { continue };
-        if ret.opcode != Opcode::Return { continue; }
+        if ret.opcode != Opcode::Return {
+            continue;
+        }
         // A returned block parameter takes each edge's argument. A value
         // defined elsewhere dominates the block, and so every predecessor:
         // a jump returns it directly (`(call x)` followed by an empty jump).
@@ -451,16 +571,25 @@ fn duplicate_join_returns_once(f: &Function) -> Option<Function> {
         // Every (terminator, edge index) that enters the join. A join that
         // returns a dominating value is copied only into jumps: a branch
         // edge would gain a block identical to the join itself.
-        let edges: Vec<(Inst, usize)> = source.preds(join).into_iter().filter_map(|pred| {
-            source.terminator(pred)
-        }).filter(|&term| param.is_some() || source.inst(term).opcode == Opcode::Jump)
-        .flat_map(|term| {
-            source.inst(term).targets.iter().enumerate()
-                .filter(|(_, edge)| edge.block == join)
-                .map(move |(index, _)| (term, index))
-                .collect::<Vec<_>>()
-        }).collect();
-        if edges.is_empty() { continue; }
+        let edges: Vec<(Inst, usize)> = source
+            .preds(join)
+            .into_iter()
+            .filter_map(|pred| source.terminator(pred))
+            .filter(|&term| param.is_some() || source.inst(term).opcode == Opcode::Jump)
+            .flat_map(|term| {
+                source
+                    .inst(term)
+                    .targets
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, edge)| edge.block == join)
+                    .map(move |(index, _)| (term, index))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        if edges.is_empty() {
+            continue;
+        }
         let g = copy.get_or_insert_with(|| f.clone());
         for (term, index) in edges {
             let value = match param {
@@ -501,46 +630,81 @@ fn duplicate_join_returns_once(f: &Function) -> Option<Function> {
 
 #[allow(clippy::too_many_arguments)]
 pub fn emit_framed_ordinary_function_with_self_call_facts(
-    f: &Function, entry: OrdinaryLispEntryOptions,
-    targets: &[(Inst, OrdinaryCallTarget)], flags: OrdinaryCallFlags,
-    cold: u64, guard: OrdinaryGuardOptions, poll_veneer: u64, self_calls: &[Inst],
+    f: &Function,
+    entry: OrdinaryLispEntryOptions,
+    targets: &[(Inst, OrdinaryCallTarget)],
+    flags: OrdinaryCallFlags,
+    cold: u64,
+    guard: OrdinaryGuardOptions,
+    poll_veneer: u64,
+    self_calls: &[Inst],
     self_facts: OrdinarySelfCallFacts,
 ) -> Result<FramedCode, EmitError> {
     let declined = EmitError::Declined;
     let duplicated = duplicate_join_returns(f);
     let f = duplicated.as_ref().unwrap_or(f);
-    if f.is_variadic() { return Err(declined("variadic")); }
-    if !f.osr_entries.is_empty() { return Err(declined("OSR entries")); }
-    if !f.handler_cases.is_empty() { return Err(declined("handler cases")); }
-    if entry.arity > u16::MAX as usize || entry.arity_error_veneer == 0
+    if f.is_variadic() {
+        return Err(declined("variadic"));
+    }
+    if !f.osr_entries.is_empty() {
+        return Err(declined("OSR entries"));
+    }
+    if !f.handler_cases.is_empty() {
+        return Err(declined("handler cases"));
+    }
+    if entry.arity > u16::MAX as usize
+        || entry.arity_error_veneer == 0
         || f.block(f.entry()).params.len() != entry.arity
-    { return Err(declined("entry arity")); }
-    if [cold, guard.veneer, guard.multiple_values, flags.gc_requested,
-        flags.sigusr1_pending, flags.posted_signal, flags.native_errors,
-        flags.signal_epoch].contains(&0)
-    { return Err(declined("missing veneer or flag address")); }
-    if crate::t2::verify::verify(f).is_err() { return Err(declined("IR verification")); }
+    {
+        return Err(declined("entry arity"));
+    }
+    if [
+        cold,
+        guard.veneer,
+        guard.multiple_values,
+        flags.gc_requested,
+        flags.sigusr1_pending,
+        flags.posted_signal,
+        flags.native_errors,
+        flags.signal_epoch,
+    ]
+    .contains(&0)
+    {
+        return Err(declined("missing veneer or flag address"));
+    }
+    if crate::t2::verify::verify(f).is_err() {
+        return Err(declined("IR verification"));
+    }
     // Ordinary calls retain the same authoritative native homes, precise cold
     // reconstruction and GC maps as the mapped backend. Admit raw fixnums only
     // through that shared validator: speculative type annotations alone never
     // authorize a pure unbox, and entry/call/return boundaries stay tagged.
-    if !super::native_representations_supported(f, NativeRootPublication::PublishedHomes,
-        NativeCallStorage::NativeStack, true)
-    {
+    if !super::native_representations_supported(
+        f,
+        NativeRootPublication::PublishedHomes,
+        NativeCallStorage::NativeStack,
+        true,
+    ) {
         return Err(declined("unsupported native representation contract"));
     }
     if std::env::var_os("EGCL_DISABLE_RAW_ORDINARY_ABI").is_some()
-        && (0..f.num_values()).any(|v|
-            f.value(Value(v as u32)).repr == ValueRepresentation::UnboxedFixnum)
+        && (0..f.num_values())
+            .any(|v| f.value(Value(v as u32)).repr == ValueRepresentation::UnboxedFixnum)
     {
         return Err(declined("raw ordinary ABI disabled"));
     }
     if f.frame_states.iter().any(|(_, state)| {
         // Retained self expansion shares one body's scope-free recovery
         // protocol. Cross-function logical frames need separate admission.
-        state.scopes.first().is_none_or(|outer|
-            state.scopes.iter().any(|scope| scope.function != outer.function))
-    }) { return Err(declined("frame state spans inlined functions")); }
+        state.scopes.first().is_none_or(|outer| {
+            state
+                .scopes
+                .iter()
+                .any(|scope| scope.function != outer.function)
+        })
+    }) {
+        return Err(declined("frame state spans inlined functions"));
+    }
     let single = crate::t2::opt_clear_mv::single_value_state(f, true);
     let mut returns = Vec::new();
     let mut call_count = 0;
@@ -550,19 +714,30 @@ pub fn emit_framed_ordinary_function_with_self_call_facts(
             let data = f.inst(inst);
             match data.opcode {
                 Opcode::Call => {
-                    if data.args.iter().chain(&data.results).any(|&value|
-                        f.value(value).repr != ValueRepresentation::Tagged) {
+                    if data
+                        .args
+                        .iter()
+                        .chain(&data.results)
+                        .any(|&value| f.value(value).repr != ValueRepresentation::Tagged)
+                    {
                         return Err(declined("raw ordinary call boundary"));
                     }
                     call_count += 1;
                     let mut matches = targets.iter().filter(|(site, _)| *site == inst);
-                    let (_, target) = matches.next()
+                    let (_, target) = matches
+                        .next()
                         .ok_or(declined("call site without a call cell"))?;
-                    if matches.next().is_some() || target.descriptor_slot == 0
-                        || target.revision_address == 0 || data.args.len() > u16::MAX as usize
-                        || data.results.len() > 1 || !data.flags.call || !data.flags.safepoint
+                    if matches.next().is_some()
+                        || target.descriptor_slot == 0
+                        || target.revision_address == 0
+                        || data.args.len() > u16::MAX as usize
+                        || data.results.len() > 1
+                        || !data.flags.call
+                        || !data.flags.safepoint
                         || data.aux.named_call_target() != Some(target.symbol)
-                    { return Err(declined("call site shape")); }
+                    {
+                        return Err(declined("call site shape"));
+                    }
                     if position + 2 == insts.len() {
                         let ret = f.inst(insts[position + 1]);
                         if ret.opcode == Opcode::Return && ret.args == data.results {
@@ -571,50 +746,89 @@ pub fn emit_framed_ordinary_function_with_self_call_facts(
                     }
                 }
                 Opcode::Return => {
-                    if data.args.iter().any(|&value| f.value(value).repr != ValueRepresentation::Tagged) {
+                    if data
+                        .args
+                        .iter()
+                        .any(|&value| f.value(value).repr != ValueRepresentation::Tagged)
+                    {
                         return Err(declined("raw ordinary return"));
                     }
-                    if data.args.len() != 1 || (!single.contains(&inst)
-                        && (position == 0 || !returns.contains(&insts[position - 1])))
-                    { return Err(declined("return of possibly multiple values")); }
+                    if data.args.len() != 1
+                        || (!single.contains(&inst)
+                            && (position == 0 || !returns.contains(&insts[position - 1])))
+                    {
+                        return Err(declined("return of possibly multiple values"));
+                    }
                 }
                 Opcode::FixnumMin | Opcode::FixnumMax => {
-                    if data.args.len() != 2 || data.results.len() != 1
-                        || data.args.iter().chain(&data.results).any(|&value|
-                            f.value(value).repr != ValueRepresentation::Tagged)
+                    if data.args.len() != 2
+                        || data.results.len() != 1
+                        || data
+                            .args
+                            .iter()
+                            .chain(&data.results)
+                            .any(|&value| f.value(value).repr != ValueRepresentation::Tagged)
                         || f.value(data.results[0]).ty.bits != TypeBits::FIXNUM
-                        || data.flags != (crate::t2::ir::InstFlags {
-                            guard: true, effectful: true, ..Default::default() })
+                        || data.flags
+                            != (crate::t2::ir::InstFlags {
+                                guard: true,
+                                effectful: true,
+                                ..Default::default()
+                            })
                         || data.frame_state.is_none()
-                    { return Err(declined("guarded fixnum selection shape")); }
+                    {
+                        return Err(declined("guarded fixnum selection shape"));
+                    }
                 }
                 Opcode::PackedF64Ref => {
                     // Shared representation validation and the IR verifier
                     // establish exact packed/generic-double layouts. Retain
                     // ordered type/bounds recovery before exposing a raw word.
-                    if data.args.len() != 2 || data.results.len() != 1
-                        || data.args.iter().any(|&value| f.value(value).repr != ValueRepresentation::Tagged)
+                    if data.args.len() != 2
+                        || data.results.len() != 1
+                        || data
+                            .args
+                            .iter()
+                            .any(|&value| f.value(value).repr != ValueRepresentation::Tagged)
                         || f.value(data.results[0]).repr != ValueRepresentation::UnboxedF64
                         || f.value(data.results[0]).ty.bits != TypeBits::DOUBLE_FLOAT
-                        || data.flags != (crate::t2::ir::InstFlags {
-                            guard: true, effectful: true, ..Default::default() })
+                        || data.flags
+                            != (crate::t2::ir::InstFlags {
+                                guard: true,
+                                effectful: true,
+                                ..Default::default()
+                            })
                         || data.frame_state.is_none()
-                    { return Err(declined("guarded packed-double read shape")); }
+                    {
+                        return Err(declined("guarded packed-double read shape"));
+                    }
                 }
                 // Raw double operations. Their shapes, including the deopt
                 // states of sqrt and division (bliss-lhy89), are checked by
                 // the raw representation validator.
-                Opcode::FloatAdd | Opcode::FloatSub | Opcode::FloatMul | Opcode::FloatDiv
-                | Opcode::FloatSqrt | Opcode::FloatNeg
-                | Opcode::FloatCmpEq | Opcode::FloatCmpLt | Opcode::FloatCmpLe
-                | Opcode::FloatCmpGt | Opcode::FloatCmpGe
-                    if data.args.iter().all(|&v| f.value(v).repr == ValueRepresentation::UnboxedF64) => {}
+                Opcode::FloatAdd
+                | Opcode::FloatSub
+                | Opcode::FloatMul
+                | Opcode::FloatDiv
+                | Opcode::FloatSqrt
+                | Opcode::FloatNeg
+                | Opcode::FloatCmpEq
+                | Opcode::FloatCmpLt
+                | Opcode::FloatCmpLe
+                | Opcode::FloatCmpGt
+                | Opcode::FloatCmpGe
+                    if data
+                        .args
+                        .iter()
+                        .all(|&v| f.value(v).repr == ValueRepresentation::UnboxedF64) => {}
                 Opcode::ConstDouble | Opcode::BoxFloat | Opcode::BoxFixnum => {}
                 // The IR verifier independently proves every pure double load
                 // at its exact use site, including branch/guard dominance.
                 Opcode::UnboxFloat | Opcode::Guard if !data.flags.guard => {}
                 Opcode::UnboxFixnum if !data.flags.guard => {
-                    if data.args.len() != 1 || !crate::t2::unbox_fixnum::proven_tagged_fixnum(f, data.args[0]) {
+                    if data.args.len() != 1
+                        || !crate::t2::unbox_fixnum::proven_tagged_fixnum(f, data.args[0])
+                    {
                         return Err(declined("unproven pure fixnum unbox"));
                     }
                 }
@@ -622,20 +836,38 @@ pub fn emit_framed_ordinary_function_with_self_call_facts(
                     if !matches!(data.aux, AuxData::None | AuxData::ArrayRef)
                         || data.args.len() != 2
                         || data.results.len() != usize::from(data.opcode == Opcode::VecRef)
-                        || data.flags != (crate::t2::ir::InstFlags { guard: true, effectful: true, ..Default::default() })
+                        || data.flags
+                            != (crate::t2::ir::InstFlags {
+                                guard: true,
+                                effectful: true,
+                                ..Default::default()
+                            })
                         || data.frame_state.is_none()
-                        || data.args.iter().chain(&data.results).any(|&v| f.value(v).repr != ValueRepresentation::Tagged)
+                        || data
+                            .args
+                            .iter()
+                            .chain(&data.results)
+                            .any(|&v| f.value(v).repr != ValueRepresentation::Tagged)
                     {
                         return Err(declined("invalid tagged array-read layout contract"));
                     }
                 }
                 Opcode::VecSet => {
                     if !matches!(data.aux, AuxData::None | AuxData::SimpleVectorStore)
-                        || data.args.len() != 3 || data.results.len() != 1
-                        || data.flags != (crate::t2::ir::InstFlags {
-                            guard: true, effectful: true, ..Default::default() })
+                        || data.args.len() != 3
+                        || data.results.len() != 1
+                        || data.flags
+                            != (crate::t2::ir::InstFlags {
+                                guard: true,
+                                effectful: true,
+                                ..Default::default()
+                            })
                         || data.frame_state.is_none()
-                        || data.args.iter().chain(&data.results).any(|&v| f.value(v).repr != ValueRepresentation::Tagged)
+                        || data
+                            .args
+                            .iter()
+                            .chain(&data.results)
+                            .any(|&v| f.value(v).repr != ValueRepresentation::Tagged)
                     {
                         return Err(declined("invalid tagged array-store layout contract"));
                     }
@@ -646,64 +878,158 @@ pub fn emit_framed_ordinary_function_with_self_call_facts(
                     }
                 }
                 Opcode::PackedF64P => {}
-                Opcode::Guard | Opcode::FixnumAdd | Opcode::FixnumSub | Opcode::FixnumMul
-                | Opcode::FixnumNeg | Opcode::FixnumShl | Opcode::FixnumShr
-                | Opcode::FloatAdd | Opcode::FloatSub | Opcode::FloatMul
-                | Opcode::FloatCmpEq | Opcode::FloatCmpLt | Opcode::FloatCmpLe
-                | Opcode::FloatCmpGt | Opcode::FloatCmpGe | Opcode::UnboxFloat => {
+                Opcode::Guard
+                | Opcode::FixnumAdd
+                | Opcode::FixnumSub
+                | Opcode::FixnumMul
+                | Opcode::FixnumNeg
+                | Opcode::FixnumShl
+                | Opcode::FixnumShr
+                | Opcode::FloatAdd
+                | Opcode::FloatSub
+                | Opcode::FloatMul
+                | Opcode::FloatCmpEq
+                | Opcode::FloatCmpLt
+                | Opcode::FloatCmpLe
+                | Opcode::FloatCmpGt
+                | Opcode::FloatCmpGe
+                | Opcode::UnboxFloat => {
                     if data.frame_state.is_none() {
                         // Name the operation: an unguarded one is a shape
                         // this emitter does not model, not a missing state.
                         return Err(EmitError::UnsupportedOp(super::op_tag(data.opcode)));
                     }
                 }
-                Opcode::ConstFixnum | Opcode::ConstFloat | Opcode::ConstNil | Opcode::ConstT
-                | Opcode::ConstSymbol | Opcode::ConstChar | Opcode::ClearMv
-                | Opcode::FixnumCmpEq | Opcode::FixnumCmpLt | Opcode::FixnumCmpLe
-                | Opcode::FixnumCmpGt | Opcode::FixnumCmpGe | Opcode::GenericEq
-                | Opcode::TypeCheck | Opcode::LogAnd | Opcode::LogOr | Opcode::LogXor
-                | Opcode::LogNot | Opcode::Jump | Opcode::Brif
-                | Opcode::Car | Opcode::Cdr | Opcode::ConstHeapObj
-                | Opcode::StringByteLength | Opcode::StringAsciiCharAt | Opcode::StringCharOrNil
-                | Opcode::MemoryFence | Opcode::TryIntegerShr | Opcode::SmallVectorRangeP
-                | Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8 | Opcode::TryStoreIntegerOctets1To8Layout | Opcode::PackedU8Layout | Opcode::PackedU8AllocationLayout | Opcode::PackedU8AllocationExtent | Opcode::TryStoreIntegerOctets1To8Extent | Opcode::NativePoll => {}
+                Opcode::ConstFixnum
+                | Opcode::ConstFloat
+                | Opcode::ConstNil
+                | Opcode::ConstT
+                | Opcode::ConstSymbol
+                | Opcode::ConstChar
+                | Opcode::ClearMv
+                | Opcode::FixnumCmpEq
+                | Opcode::FixnumCmpLt
+                | Opcode::FixnumCmpLe
+                | Opcode::FixnumCmpGt
+                | Opcode::FixnumCmpGe
+                | Opcode::GenericEq
+                | Opcode::TypeCheck
+                | Opcode::LogAnd
+                | Opcode::LogOr
+                | Opcode::LogXor
+                | Opcode::LogNot
+                | Opcode::Jump
+                | Opcode::Brif
+                | Opcode::Car
+                | Opcode::Cdr
+                | Opcode::ConstHeapObj
+                | Opcode::StringByteLength
+                | Opcode::StringAsciiCharAt
+                | Opcode::StringCharOrNil
+                | Opcode::MemoryFence
+                | Opcode::TryIntegerShr
+                | Opcode::SmallVectorRangeP
+                | Opcode::TryStoreIntegerOctets8
+                | Opcode::TryStoreIntegerOctets1To8
+                | Opcode::TryStoreIntegerOctets1To8Layout
+                | Opcode::PackedU8Layout
+                | Opcode::PackedU8AllocationLayout
+                | Opcode::PackedU8AllocationExtent
+                | Opcode::TryStoreIntegerOctets1To8Extent
+                | Opcode::NativePoll => {}
                 _ => return Err(EmitError::UnsupportedOp(super::op_tag(data.opcode))),
             }
         }
     }
-    if targets.len() != call_count { return Err(declined("call cells do not match calls")); }
-    if self_calls.iter().any(|site| !targets.iter().any(|(inst, target)| {
-        if inst != site { return false; }
-        let data = f.inst(*inst);
-        data.args.len() == entry.arity && data.frame_state.is_some_and(|state| {
-            let scopes = &f.frame_states.get(state).scopes;
-            !scopes.is_empty() && scopes.iter().all(|scope| scope.function == target.symbol)
+    if targets.len() != call_count {
+        return Err(declined("call cells do not match calls"));
+    }
+    if self_calls.iter().any(|site| {
+        !targets.iter().any(|(inst, target)| {
+            if inst != site {
+                return false;
+            }
+            let data = f.inst(*inst);
+            data.args.len() == entry.arity
+                && data.frame_state.is_some_and(|state| {
+                    let scopes = &f.frame_states.get(state).scopes;
+                    !scopes.is_empty() && scopes.iter().all(|scope| scope.function == target.symbol)
+                })
         })
-    })) { return Err(declined("self call shape")); }
+    }) {
+        return Err(declined("self call shape"));
+    }
 
     // Calls contain the complete lifecycle poll. A cycle without a call would
     // otherwise suppress signals, collection and fiber yielding indefinitely.
     // Remove call-containing blocks and require the remaining graph acyclic.
-    let mut pending: std::collections::HashSet<_> = f.block_order().iter().copied()
-        .filter(|&block| !f.block(block).insts.iter().any(|&inst| f.inst(inst).opcode == Opcode::Call))
+    let mut pending: std::collections::HashSet<_> = f
+        .block_order()
+        .iter()
+        .copied()
+        .filter(|&block| {
+            !f.block(block)
+                .insts
+                .iter()
+                .any(|&inst| f.inst(inst).opcode == Opcode::Call)
+        })
         .collect();
     while poll_veneer == 0 && !pending.is_empty() {
-        let ready = pending.iter().copied().find(|&block|
-            !pending.iter().any(|&predecessor| f.terminator(predecessor).is_some_and(|inst|
-                f.inst(inst).targets.iter().any(|target| target.block == block))));
-        let Some(block) = ready else { return Err(declined("call-free loop without a poll")); };
+        let ready = pending.iter().copied().find(|&block| {
+            !pending.iter().any(|&predecessor| {
+                f.terminator(predecessor).is_some_and(|inst| {
+                    f.inst(inst)
+                        .targets
+                        .iter()
+                        .any(|target| target.block == block)
+                })
+            })
+        });
+        let Some(block) = ready else {
+            return Err(declined("call-free loop without a poll"));
+        };
         pending.remove(&block);
     }
     // A call-free guarded function still needs native homes and guard control.
-    let unused = OrdinaryCallTarget { symbol: 0, descriptor_slot: 0, revision_address: 0 , heat_slot: 0};
-    super::emit_framed_inner(f, 0, 0, 0, 0, 0, 0, 0, guard.multiple_values, 0, 0,
-        Some(entry.arity as u16), None, &[], 0, EnvironmentCalls::default(), None,
-        Some(entry), Some(OrdinaryCallEmission {
-            target: unused, targets, second_target: None,
-            return_policy: OrdinaryReturnPolicy::Calls(&returns), cold,
-            tail: false, guard: Some(guard), poll_veneer: (poll_veneer != 0).then_some(poll_veneer),
-            self_calls, direct_self: false, self_facts,
-        }))
+    let unused = OrdinaryCallTarget {
+        symbol: 0,
+        descriptor_slot: 0,
+        revision_address: 0,
+        heat_slot: 0,
+    };
+    super::emit_framed_inner(
+        f,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        guard.multiple_values,
+        0,
+        0,
+        Some(entry.arity as u16),
+        None,
+        &[],
+        0,
+        EnvironmentCalls::default(),
+        None,
+        Some(entry),
+        Some(OrdinaryCallEmission {
+            target: unused,
+            targets,
+            second_target: None,
+            return_policy: OrdinaryReturnPolicy::Calls(&returns),
+            cold,
+            tail: false,
+            guard: Some(guard),
+            poll_veneer: (poll_veneer != 0).then_some(poll_veneer),
+            self_calls,
+            direct_self: false,
+            self_facts,
+        }),
+    )
 }
 
 /// Reserve ordinary stack space without jumping over a guard page.
@@ -735,9 +1061,15 @@ fn retire(a: &mut Asm, bytes: u32) {
 /// load. All admission observations still occur before the ordinary call.
 fn compare_zero_memory(a: &mut Asm, base: u8, displacement: u8, byte: bool) {
     debug_assert_ne!(base & 7, 4, "rsp/r12 requires SIB addressing");
-    if !byte || base >= 8 { a.push(if byte { 0x40 } else { 0x48 } | (base >> 3)); }
-    a.extend_from_slice(&[if byte { 0x80 } else { 0x83 },
-        0x78 | (base & 7), displacement, 0]); // CMP r/m8 or r/m64, imm8=0
+    if !byte || base >= 8 {
+        a.push(if byte { 0x40 } else { 0x48 } | (base >> 3));
+    }
+    a.extend_from_slice(&[
+        if byte { 0x80 } else { 0x83 },
+        0x78 | (base & 7),
+        displacement,
+        0,
+    ]); // CMP r/m8 or r/m64, imm8=0
 }
 
 /// The frame storage and its matching callee-save retirement sequence.
@@ -771,7 +1103,10 @@ impl OrdinaryCallEmission<'_> {
             self.target = *target;
         }
         if let Some((second, target)) = self.second_target
-            && second == inst { self.target = target; }
+            && second == inst
+        {
+            self.target = target;
+        }
         self
     }
 
@@ -837,17 +1172,24 @@ impl OrdinaryCallEmission<'_> {
                 return Err(EmitError::UnsupportedOp(0xFA));
             }
             for (index, (&parameter, &argument)) in parameters.iter().zip(&data.args).enumerate() {
-                if !function.is_entry_param_checked(parameter) { continue; }
+                if !function.is_entry_param_checked(parameter) {
+                    continue;
+                }
                 let expected = function.value(parameter).ty;
                 let actual = inference.ty(argument);
                 let tag_proven = !actual.bits.is_bottom() && expected.bits.contains(actual.bits);
                 let actual_range = if tag_proven { actual.range } else { None };
-                let range_proven = expected.range.is_none_or(|range| actual_range.is_some_and(
-                    |got| got.lo >= range.lo && got.hi <= range.hi));
-                if tag_proven && range_proven { continue; }
+                let range_proven = expected.range.is_none_or(|range| {
+                    actual_range.is_some_and(|got| got.lo >= range.lo && got.hi <= range.hi)
+                });
+                if tag_proven && range_proven {
+                    continue;
+                }
                 load_home(a, RAX, FramedHome::Stack(base + index as u32), 0);
                 if expected.bits == TypeBits::FIXNUM {
-                    if !tag_proven { guard_fixnum(a, RAX, cold); }
+                    if !tag_proven {
+                        guard_fixnum(a, RAX, cold);
+                    }
                     if let Some(range) = expected.range {
                         // Declared fixnum intervals must fit the tagged word.
                         if range.lo < FIXNUM_MIN || range.hi > FIXNUM_MAX || range.lo > range.hi {
@@ -895,49 +1237,49 @@ impl OrdinaryCallEmission<'_> {
             mov_imm64(a, SCRATCH, 0);
             self_stack_fixups.push(at + 2);
         } else {
-        mov_imm64(a, 11, self.target.descriptor_slot as i64);
-        load_mem64_disp(a, 11, 11, 0);
-        alu_r_imm(a, 7, 11, 0);
-        a.jcc(Cc::E, cold);
-        for (offset, expected) in [
-            (
-                std::mem::offset_of!(OrdinaryEntryDescriptor, arity),
-                data.args.len() as u64,
-            ),
-            (
-                std::mem::offset_of!(OrdinaryEntryDescriptor, environment),
-                ORDINARY_ENV_NONE,
-            ),
-        ] {
-            load_mem64_disp(a, RAX, 11, offset as i32);
-            mov_imm64(a, SCRATCH, expected as i64);
-            if offset == std::mem::offset_of!(OrdinaryEntryDescriptor, arity) {
-                let accepted = a.label();
-                cmp_rr(a, RAX, SCRATCH);
-                a.jcc(Cc::E, accepted);
-                alu_r_imm(a, 7, RAX, -1);
-                a.jcc(Cc::Ne, cold);
-                a.bind(accepted);
-            } else {
-                cmp_rr(a, RAX, SCRATCH);
-                a.jcc(Cc::Ne, cold);
+            mov_imm64(a, 11, self.target.descriptor_slot as i64);
+            load_mem64_disp(a, 11, 11, 0);
+            alu_r_imm(a, 7, 11, 0);
+            a.jcc(Cc::E, cold);
+            for (offset, expected) in [
+                (
+                    std::mem::offset_of!(OrdinaryEntryDescriptor, arity),
+                    data.args.len() as u64,
+                ),
+                (
+                    std::mem::offset_of!(OrdinaryEntryDescriptor, environment),
+                    ORDINARY_ENV_NONE,
+                ),
+            ] {
+                load_mem64_disp(a, RAX, 11, offset as i32);
+                mov_imm64(a, SCRATCH, expected as i64);
+                if offset == std::mem::offset_of!(OrdinaryEntryDescriptor, arity) {
+                    let accepted = a.label();
+                    cmp_rr(a, RAX, SCRATCH);
+                    a.jcc(Cc::E, accepted);
+                    alu_r_imm(a, 7, RAX, -1);
+                    a.jcc(Cc::Ne, cold);
+                    a.bind(accepted);
+                } else {
+                    cmp_rr(a, RAX, SCRATCH);
+                    a.jcc(Cc::Ne, cold);
+                }
             }
-        }
-        mov_imm64(a, SCRATCH, self.target.revision_address as i64);
-        load_mem64_disp(a, RAX, SCRATCH, 0);
-        cmp_mem64_disp8(
-            a,
-            RAX,
-            11,
-            std::mem::offset_of!(OrdinaryEntryDescriptor, revision) as u8,
-        );
-        a.jcc(Cc::Ne, cold);
-        load_mem64_disp(
-            a,
-            SCRATCH,
-            11,
-            std::mem::offset_of!(OrdinaryEntryDescriptor, stack_required) as i32,
-        );
+            mov_imm64(a, SCRATCH, self.target.revision_address as i64);
+            load_mem64_disp(a, RAX, SCRATCH, 0);
+            cmp_mem64_disp8(
+                a,
+                RAX,
+                11,
+                std::mem::offset_of!(OrdinaryEntryDescriptor, revision) as u8,
+            );
+            a.jcc(Cc::Ne, cold);
+            load_mem64_disp(
+                a,
+                SCRATCH,
+                11,
+                std::mem::offset_of!(OrdinaryEntryDescriptor, stack_required) as i32,
+            );
         }
         if self.tail {
             // Ordinary RBP names the first saved word. Retiring this frame
@@ -960,41 +1302,59 @@ impl OrdinaryCallEmission<'_> {
             load_mem64_disp(a, 10, 10, 0);
             alu_r_imm(a, 7, 10, 0);
             a.jcc(Cc::E, no_heat);
-            load_mem64_disp(a, RAX, 10, std::mem::offset_of!(OrdinaryCallHeat, descriptor) as i32);
+            load_mem64_disp(
+                a,
+                RAX,
+                10,
+                std::mem::offset_of!(OrdinaryCallHeat, descriptor) as i32,
+            );
             cmp_rr(a, RAX, 11);
             a.jcc(Cc::Ne, no_heat);
             // No collecting operation separates descriptor validation from
             // the atomic increment. Its retained owner roots both counters.
             for (counter, threshold, invocation) in [
-                (std::mem::offset_of!(OrdinaryCallHeat, invocation_counter),
-                 std::mem::offset_of!(OrdinaryCallHeat, invocation_threshold), true),
-                (std::mem::offset_of!(OrdinaryCallHeat, back_edge_counter),
-                 std::mem::offset_of!(OrdinaryCallHeat, back_edge_threshold), false),
+                (
+                    std::mem::offset_of!(OrdinaryCallHeat, invocation_counter),
+                    std::mem::offset_of!(OrdinaryCallHeat, invocation_threshold),
+                    true,
+                ),
+                (
+                    std::mem::offset_of!(OrdinaryCallHeat, back_edge_counter),
+                    std::mem::offset_of!(OrdinaryCallHeat, back_edge_threshold),
+                    false,
+                ),
             ] {
                 let disabled = a.label();
                 a.extend_from_slice(&[0x41, 0x8b, 0x52, threshold as u8]); // edx=threshold
                 alu_r_imm(a, 7, SCRATCH, 0);
                 a.jcc(Cc::E, disabled);
-                if invocation { alu_r_imm(a, 5, SCRATCH, 1); }
+                if invocation {
+                    alu_r_imm(a, 5, SCRATCH, 1);
+                }
                 load_mem64_disp(a, RAX, 10, counter as i32);
                 a.extend_from_slice(&[0x8b, 0x00]); // eax=*counter
                 cmp_rr(a, SCRATCH, RAX);
                 unsigned_branch(a, true, cold); // threshold <= count
                 a.bind(disabled);
             }
-            load_mem64_disp(a, RAX, 10, std::mem::offset_of!(OrdinaryCallHeat, invocation_counter) as i32);
+            load_mem64_disp(
+                a,
+                RAX,
+                10,
+                std::mem::offset_of!(OrdinaryCallHeat, invocation_counter) as i32,
+            );
             alu_r_imm(a, 7, RAX, 0);
             a.jcc(Cc::E, no_heat);
             a.extend_from_slice(&[0xf0, 0xff, 0x00]); // lock inc dword [rax]
             a.bind(no_heat);
         }
         if !self.direct_self {
-        load_mem64_disp(
-            a,
-            11,
-            11,
-            std::mem::offset_of!(OrdinaryEntryDescriptor, entry) as i32,
-        );
+            load_mem64_disp(
+                a,
+                11,
+                11,
+                std::mem::offset_of!(OrdinaryEntryDescriptor, entry) as i32,
+            );
         }
         let direct = if self.tail {
             // Every source was copied above before any incoming area is
@@ -1104,28 +1464,58 @@ mod join_return_tests {
         let mut f = Function::new("first-char");
         let entry = f.entry();
         let s = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
-        let (inner, call_arm, nil_arm, join, outer_nil) =
-            (f.make_block(), f.make_block(), f.make_block(), f.make_block(), f.make_block());
+        let (inner, call_arm, nil_arm, join, outer_nil) = (
+            f.make_block(),
+            f.make_block(),
+            f.make_block(),
+            f.make_block(),
+            f.make_block(),
+        );
         let (_, nil) = f.push_inst(entry, inst(Opcode::ConstNil, vec![], vec![]), &[TAGGED]);
         let (_, test) = f.push_inst(entry, inst(Opcode::Call, vec![s], vec![]), &[TAGGED]);
-        f.set_terminator(entry, inst(Opcode::Brif, vec![test[0]],
-            vec![edge(inner, vec![]), edge(outer_nil, vec![])]));
+        f.set_terminator(
+            entry,
+            inst(
+                Opcode::Brif,
+                vec![test[0]],
+                vec![edge(inner, vec![]), edge(outer_nil, vec![])],
+            ),
+        );
         let (_, inner_test) = f.push_inst(inner, inst(Opcode::Call, vec![s], vec![]), &[TAGGED]);
-        f.set_terminator(inner, inst(Opcode::Brif, vec![inner_test[0]],
-            vec![edge(call_arm, vec![]), edge(nil_arm, vec![])]));
+        f.set_terminator(
+            inner,
+            inst(
+                Opcode::Brif,
+                vec![inner_test[0]],
+                vec![edge(call_arm, vec![]), edge(nil_arm, vec![])],
+            ),
+        );
         let (call, result) = f.push_inst(call_arm, inst(Opcode::Call, vec![s], vec![]), &[TAGGED]);
-        f.set_terminator(call_arm, inst(Opcode::Jump, vec![], vec![edge(join, vec![result[0]])]));
-        f.set_terminator(nil_arm, inst(Opcode::Jump, vec![], vec![edge(join, vec![nil[0]])]));
+        f.set_terminator(
+            call_arm,
+            inst(Opcode::Jump, vec![], vec![edge(join, vec![result[0]])]),
+        );
+        f.set_terminator(
+            nil_arm,
+            inst(Opcode::Jump, vec![], vec![edge(join, vec![nil[0]])]),
+        );
         let merged = f.add_block_param(join, IRType::TOP, ValueRepresentation::Tagged);
         f.set_terminator(join, inst(Opcode::Return, vec![merged], vec![]));
         f.set_terminator(outer_nil, inst(Opcode::Return, vec![nil[0]], vec![]));
 
         let g = duplicate_join_returns(&f).expect("the join qualifies");
-        assert!(!g.block_order().contains(&join), "the emptied join leaves the layout");
+        assert!(
+            !g.block_order().contains(&join),
+            "the emptied join leaves the layout"
+        );
         let tail = |block| g.inst(g.terminator(block).unwrap()).clone();
         assert_eq!(tail(call_arm).opcode, Opcode::Return);
         assert_eq!(tail(call_arm).args, result);
-        assert_eq!(*g.block(call_arm).insts.first().unwrap(), call, "the call is kept");
+        assert_eq!(
+            *g.block(call_arm).insts.first().unwrap(),
+            call,
+            "the call is kept"
+        );
         assert_eq!(tail(nil_arm).opcode, Opcode::Return);
         assert_eq!(tail(nil_arm).args, nil);
         assert!(crate::t2::verify::verify(&g).is_ok());
@@ -1140,10 +1530,19 @@ mod join_return_tests {
         let x = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
         let (call_arm, join) = (f.make_block(), f.make_block());
         let (_, test) = f.push_inst(entry, inst(Opcode::Call, vec![x], vec![]), &[TAGGED]);
-        f.set_terminator(entry, inst(Opcode::Brif, vec![test[0]],
-            vec![edge(join, vec![x]), edge(call_arm, vec![])]));
+        f.set_terminator(
+            entry,
+            inst(
+                Opcode::Brif,
+                vec![test[0]],
+                vec![edge(join, vec![x]), edge(call_arm, vec![])],
+            ),
+        );
         let (_, list) = f.push_inst(call_arm, inst(Opcode::Call, vec![x], vec![]), &[TAGGED]);
-        f.set_terminator(call_arm, inst(Opcode::Jump, vec![], vec![edge(join, vec![list[0]])]));
+        f.set_terminator(
+            call_arm,
+            inst(Opcode::Jump, vec![], vec![edge(join, vec![list[0]])]),
+        );
         let merged = f.add_block_param(join, IRType::TOP, ValueRepresentation::Tagged);
         f.set_terminator(join, inst(Opcode::Return, vec![merged], vec![]));
 
@@ -1165,19 +1564,53 @@ mod join_return_tests {
         let mut f = Function::new("and-call");
         let entry = f.entry();
         let x = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
-        let (second, call_arm, nil_arm, inner_join, outer_nil, join) = (f.make_block(),
-            f.make_block(), f.make_block(), f.make_block(), f.make_block(), f.make_block());
+        let (second, call_arm, nil_arm, inner_join, outer_nil, join) = (
+            f.make_block(),
+            f.make_block(),
+            f.make_block(),
+            f.make_block(),
+            f.make_block(),
+            f.make_block(),
+        );
         let (_, nil) = f.push_inst(entry, inst(Opcode::ConstNil, vec![], vec![]), &[TAGGED]);
-        f.set_terminator(entry, inst(Opcode::Brif, vec![x],
-            vec![edge(second, vec![]), edge(outer_nil, vec![])]));
-        f.set_terminator(second, inst(Opcode::Brif, vec![x],
-            vec![edge(call_arm, vec![]), edge(nil_arm, vec![])]));
+        f.set_terminator(
+            entry,
+            inst(
+                Opcode::Brif,
+                vec![x],
+                vec![edge(second, vec![]), edge(outer_nil, vec![])],
+            ),
+        );
+        f.set_terminator(
+            second,
+            inst(
+                Opcode::Brif,
+                vec![x],
+                vec![edge(call_arm, vec![]), edge(nil_arm, vec![])],
+            ),
+        );
         let (call, result) = f.push_inst(call_arm, inst(Opcode::Call, vec![x], vec![]), &[TAGGED]);
-        f.set_terminator(call_arm, inst(Opcode::Jump, vec![], vec![edge(inner_join, vec![result[0]])]));
-        f.set_terminator(nil_arm, inst(Opcode::Jump, vec![], vec![edge(inner_join, vec![nil[0]])]));
+        f.set_terminator(
+            call_arm,
+            inst(
+                Opcode::Jump,
+                vec![],
+                vec![edge(inner_join, vec![result[0]])],
+            ),
+        );
+        f.set_terminator(
+            nil_arm,
+            inst(Opcode::Jump, vec![], vec![edge(inner_join, vec![nil[0]])]),
+        );
         let forwarded = f.add_block_param(inner_join, IRType::TOP, ValueRepresentation::Tagged);
-        f.set_terminator(inner_join, inst(Opcode::Jump, vec![], vec![edge(join, vec![forwarded])]));
-        f.set_terminator(outer_nil, inst(Opcode::Jump, vec![], vec![edge(join, vec![nil[0]])]));
+        f.set_terminator(
+            inner_join,
+            inst(Opcode::Jump, vec![], vec![edge(join, vec![forwarded])]),
+        );
+        f.set_terminator(
+            outer_nil,
+            inst(Opcode::Jump, vec![], vec![edge(join, vec![nil[0]])]),
+        );
         let merged = f.add_block_param(join, IRType::TOP, ValueRepresentation::Tagged);
         f.set_terminator(join, inst(Opcode::Return, vec![merged], vec![]));
 
@@ -1202,7 +1635,10 @@ mod join_return_tests {
         let x = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
         let ret_block = f.make_block();
         let (call, result) = f.push_inst(entry, inst(Opcode::Call, vec![x], vec![]), &[TAGGED]);
-        f.set_terminator(entry, inst(Opcode::Jump, vec![], vec![edge(ret_block, vec![])]));
+        f.set_terminator(
+            entry,
+            inst(Opcode::Jump, vec![], vec![edge(ret_block, vec![])]),
+        );
         f.set_terminator(ret_block, inst(Opcode::Return, vec![result[0]], vec![]));
 
         let g = duplicate_join_returns(&f).expect("the jump qualifies");
@@ -1211,7 +1647,10 @@ mod join_return_tests {
         assert_eq!(tail.args, result);
         assert_eq!(*g.block(entry).insts.first().unwrap(), call);
         assert!(!g.block_order().contains(&ret_block));
-        assert_eq!(crate::t2::verify::verify(&g).map_err(|e| format!("{e:?}")), Ok(()));
+        assert_eq!(
+            crate::t2::verify::verify(&g).map_err(|e| format!("{e:?}")),
+            Ok(())
+        );
 
         let mut branching = Function::new("branch-to-return");
         let entry = branching.entry();
@@ -1219,8 +1658,14 @@ mod join_return_tests {
         let (ret_block, other) = (branching.make_block(), branching.make_block());
         let (_, result) =
             branching.push_inst(entry, inst(Opcode::Call, vec![x], vec![]), &[TAGGED]);
-        branching.set_terminator(entry, inst(Opcode::Brif, vec![x],
-            vec![edge(ret_block, vec![]), edge(other, vec![])]));
+        branching.set_terminator(
+            entry,
+            inst(
+                Opcode::Brif,
+                vec![x],
+                vec![edge(ret_block, vec![]), edge(other, vec![])],
+            ),
+        );
         branching.set_terminator(ret_block, inst(Opcode::Return, vec![result[0]], vec![]));
         branching.set_terminator(other, inst(Opcode::Return, vec![x], vec![]));
         assert!(duplicate_join_returns(&branching).is_none());

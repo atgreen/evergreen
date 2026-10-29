@@ -13,16 +13,19 @@ fn native_v2_heap_literal_moves_across_a_collecting_call() {
     let mut env = Env::new(false);
     egcl_rt::rooted_ref!(_env = &mut env);
     super::super::super::read_eval_all_env(
-        "(defun native-literal-collect () (%force-minor-gc-for-test))", &mut env,
-    ).unwrap();
+        "(defun native-literal-collect () (%force-minor-gc-for-test))",
+        &mut env,
+    )
+    .unwrap();
     // Intern before creating the literal so compilation needs no Lisp allocation.
     let _name = resolve_sym("NATIVE-MOVING-LITERAL").unwrap();
-    egcl_rt::rooted!(forms = reader::read_from_string(
-        "((let ((x nil)) (native-literal-collect) x))"
-    ).unwrap().0);
-    let mut body = compile_function(
-        "NATIVE-MOVING-LITERAL", NIL, *forms, &env, false, false,
-    ).unwrap();
+    egcl_rt::rooted!(
+        forms = reader::read_from_string("((let ((x nil)) (native-literal-collect) x))")
+            .unwrap()
+            .0
+    );
+    let mut body =
+        compile_function("NATIVE-MOVING-LITERAL", NIL, *forms, &env, false, false).unwrap();
     assert_eq!(body.constants, vec![NIL]);
     // Allocate last, after lowering. The real native call must collect while
     // this literal is live in both the constant pool and a native value home.
@@ -34,8 +37,15 @@ fn native_v2_heap_literal_moves_across_a_collecting_call() {
     let before = body.constants[0].to_raw();
     take_native_fallback_count();
     egcl_rt::rooted!(result = code.run(&[], &mut env).unwrap());
-    assert_ne!(body.constants[0].to_raw(), before, "the literal must actually relocate");
-    assert_eq!(*result, body.constants[0], "native home and constant slot must agree");
+    assert_ne!(
+        body.constants[0].to_raw(),
+        before,
+        "the literal must actually relocate"
+    );
+    assert_eq!(
+        *result, body.constants[0],
+        "native home and constant slot must agree"
+    );
     assert_eq!(cp(*result), (NIL, NIL));
     assert_eq!(take_native_fallback_count(), 0);
 }
@@ -63,18 +73,31 @@ fn native_v2_rebound_error_keeps_native_normal_cleanup() {
            (%force-minor-gc-for-test)
            (setq *native-error-cleanups* (1+ *native-error-cleanups*)))",
         &mut env,
-    ).unwrap();
+    )
+    .unwrap();
     egcl_rt::rooted!(params = reader::read_from_string("(armed)").unwrap().0);
-    egcl_rt::rooted!(forms = reader::read_from_string(
-        "((handler-case
+    egcl_rt::rooted!(
+        forms = reader::read_from_string(
+            "((handler-case
             (unwind-protect
                 (progn (native-error-arm armed) (native-user-error \"original\") (values 42 43))
               (native-error-cleanup))
             (error () (values 7 8))))"
-    ).unwrap().0);
-    let body = Arc::new(compile_function(
-        "NATIVE-RETURNING-ERROR", *params, *forms, &env, false, false,
-    ).unwrap());
+        )
+        .unwrap()
+        .0
+    );
+    let body = Arc::new(
+        compile_function(
+            "NATIVE-RETURNING-ERROR",
+            *params,
+            *forms,
+            &env,
+            false,
+            false,
+        )
+        .unwrap(),
+    );
     let code = TransferCode::compile(Arc::clone(&body))
         .unwrap_or_else(|| panic!("compile real native protected entry: {:?}", body.code));
     let error = egcl_rt::symbols::intern("NATIVE-USER-ERROR");
@@ -87,13 +110,33 @@ fn native_v2_rebound_error_keeps_native_normal_cleanup() {
         egcl_rt::rooted!(result = code.run(&[armed], &mut env));
         egcl_rt::symbols::set_symbol_function(error, *original);
         assert_eq!(*result.as_ref().unwrap(), EgclVal::from_fixnum(primary));
-        assert_eq!(env.mv, vec![EgclVal::from_fixnum(primary), EgclVal::from_fixnum(secondary)]);
-        assert_eq!(take_native_cleanup_count(), landings, "exceptional cleanup landings for {armed:?}");
-        assert_eq!(take_native_fallback_count(), 0, "bytecode fallback must not hide the result");
+        assert_eq!(
+            env.mv,
+            vec![
+                EgclVal::from_fixnum(primary),
+                EgclVal::from_fixnum(secondary)
+            ]
+        );
+        assert_eq!(
+            take_native_cleanup_count(),
+            landings,
+            "exceptional cleanup landings for {armed:?}"
+        );
+        assert_eq!(
+            take_native_fallback_count(),
+            0,
+            "bytecode fallback must not hide the result"
+        );
     }
-    assert_eq!(super::super::super::read_eval_all_env(
-        "(list *native-error-effects* *native-error-cleanups*)", &mut env,
-    ).map(list_to_vec).unwrap(), vec![EgclVal::from_fixnum(2); 2]);
+    assert_eq!(
+        super::super::super::read_eval_all_env(
+            "(list *native-error-effects* *native-error-cleanups*)",
+            &mut env,
+        )
+        .map(list_to_vec)
+        .unwrap(),
+        vec![EgclVal::from_fixnum(2); 2]
+    );
 }
 
 #[test]

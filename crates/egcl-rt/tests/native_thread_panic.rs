@@ -1,13 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
 use egcl_rt::thread::{
     all_thread_ids, current_thread_id, interrupt_thread, join_thread, make_thread,
     set_thread_entry_runner,
 };
-use egcl_rt::value::{T, EgclVal};
+use egcl_rt::value::{EgclVal, T};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 fn panic_entry() -> EgclVal {
     // A pending interrupt must not turn a panic into successful completion.

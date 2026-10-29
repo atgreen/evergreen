@@ -13,17 +13,17 @@ use egcl_rt::call_table::{self as linkage, CallCell};
 #[path = "call_table_ordinary.rs"]
 mod ordinary;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-pub(super) use ordinary::{active_ordinary_directory, enter_ordinary_segment};
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub(super) use ordinary::OrdinaryCodeDirectory;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub(super) use ordinary::RootIdentity;
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+pub(super) use ordinary::assert_guarded_callable_publication_for_test;
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 pub(super) use ordinary::ordinary_segment_depth_for_test;
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 pub(super) use ordinary::take_root_identities_for_test;
-#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
-pub(super) use ordinary::assert_guarded_callable_publication_for_test;
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub(super) use ordinary::{active_ordinary_directory, enter_ordinary_segment};
 
 #[derive(Clone)]
 enum Target {
@@ -82,7 +82,10 @@ impl Target {
     }
 
     fn is_bridge(&self) -> bool {
-        matches!(self, Self::Builtin { .. } | Self::Accessor { .. } | Self::MakeInstance)
+        matches!(
+            self,
+            Self::Builtin { .. } | Self::Accessor { .. } | Self::MakeInstance
+        )
     }
 
     /// The bridge call for `nargs` arguments, or `None` when this is not a
@@ -120,7 +123,10 @@ struct State {
     // across fiber migration. Read the cell at entry, not the Env it held when
     // this target was resolved: nested native activations replace that Env.
     native_env: *const std::cell::Cell<*mut Env>,
-    #[cfg(any(all(target_arch = "x86_64", unix), all(target_arch = "s390x", target_os = "linux")))]
+    #[cfg(any(
+        all(target_arch = "x86_64", unix),
+        all(target_arch = "s390x", target_os = "linux")
+    ))]
     #[allow(clippy::vec_box)] // generated entries embed stable descriptor addresses
     versions: RefCell<Vec<Box<super::call_table_native::NativeEntry>>>,
     #[cfg(all(target_arch = "x86_64", unix))]
@@ -197,7 +203,10 @@ pub(super) fn resolve(symbol: u32) -> Option<Arc<CallCell>> {
                 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
                 mapped: RefCell::new(None),
                 native_env: NATIVE_ENV.with(std::ptr::from_ref),
-                #[cfg(any(all(target_arch = "x86_64", unix), all(target_arch = "s390x", target_os = "linux")))]
+                #[cfg(any(
+                    all(target_arch = "x86_64", unix),
+                    all(target_arch = "s390x", target_os = "linux")
+                ))]
                 versions: RefCell::new(Vec::new()),
                 #[cfg(all(target_arch = "x86_64", unix))]
                 funcall: RefCell::new(None),
@@ -228,7 +237,10 @@ pub(super) unsafe fn scan(visit: &mut dyn FnMut(*mut EgclVal)) {
                 if let Some(cache) = state.funcall.borrow_mut().as_mut() {
                     cache.scan();
                 }
-                #[cfg(any(all(target_arch = "x86_64", unix), all(target_arch = "s390x", target_os = "linux")))]
+                #[cfg(any(
+                    all(target_arch = "x86_64", unix),
+                    all(target_arch = "s390x", target_os = "linux")
+                ))]
                 {
                     let mut versions = state.versions.borrow_mut();
                     versions.retain(|version| version.keep(&state.cell));
@@ -400,12 +412,19 @@ pub(super) unsafe fn mapped_callee(cell: u64) -> Option<MappedCallee> {
     let key = Arc::as_ptr(&body) as usize;
     if let Some((cached_key, entry)) = state.mapped.borrow().as_ref()
         && *cached_key == key
-        && entry.code.as_ref().is_none_or(|code| !code.needs_recompile())
+        && entry
+            .code
+            .as_ref()
+            .is_none_or(|code| !code.needs_recompile())
     {
-        return entry.code.clone().filter(|code| code.mapped_entry().is_some()).map(|code| MappedCallee {
-            code,
-            function: *function,
-        });
+        return entry
+            .code
+            .clone()
+            .filter(|code| code.mapped_entry().is_some())
+            .map(|code| MappedCallee {
+                code,
+                function: *function,
+            });
     }
     // No borrow spans compilation or another cell's resolution/root scanner.
     let code =
@@ -414,10 +433,11 @@ pub(super) unsafe fn mapped_callee(cell: u64) -> Option<MappedCallee> {
         key,
         super::native_segment_cache::SegmentCacheEntry::new(&body, code.clone()),
     ));
-    code.filter(|code| code.mapped_entry().is_some()).map(|code| MappedCallee {
-        code,
-        function: *function,
-    })
+    code.filter(|code| code.mapped_entry().is_some())
+        .map(|code| MappedCallee {
+            code,
+            function: *function,
+        })
 }
 
 /// Exact callable lookup reuses named code only while that registry still
@@ -522,7 +542,10 @@ fn publish_target(state: &State, revision: u64, target: Option<Target>) {
         } else {
             [entries[2], entries[3]]
         };
-        #[cfg(any(all(target_arch = "x86_64", unix), all(target_arch = "s390x", target_os = "linux")))]
+        #[cfg(any(
+            all(target_arch = "x86_64", unix),
+            all(target_arch = "s390x", target_os = "linux")
+        ))]
         if let Some(Target::Native {
             function,
             code,
@@ -542,12 +565,18 @@ fn publish_target(state: &State, revision: u64, target: Option<Target>) {
         let ordinary = match target.as_ref() {
             // Private semantic operations must keep their named adapter even
             // if a user binds this interned name and FUNCALL warms that body.
-            Some(Target::Native { code, function, promote })
-                if !super::native_transfer_entry::ordinary_primitives::is_private(state.symbol) => match &code._storage {
-                NativeCodeStorage::Mapped(code) => code.ordinary_descriptor(revision)
-                    .map(|descriptor| (descriptor, Rc::clone(code), *function, *promote)),
-                _ => None,
-            },
+            Some(Target::Native {
+                code,
+                function,
+                promote,
+            }) if !super::native_transfer_entry::ordinary_primitives::is_private(state.symbol) => {
+                match &code._storage {
+                    NativeCodeStorage::Mapped(code) => code
+                        .ordinary_descriptor(revision)
+                        .map(|descriptor| (descriptor, Rc::clone(code), *function, *promote)),
+                    _ => None,
+                }
+            }
             _ => None,
         };
         *state.target.borrow_mut() = target;
@@ -556,25 +585,38 @@ fn publish_target(state: &State, revision: u64, target: Option<Target>) {
         if let Some((descriptor, code, function, promote)) = ordinary {
             // The immutable owner is retained before the revision-checked slot
             // becomes visible to generated calls in this execution.
-            let heat = (!profiling_disabled() && egcl_rt::function::tier(function) < 2).then(|| {
-                egcl_rt::call_table::OrdinaryCallHeat {
-                    descriptor: 0, // filled with the retained descriptor identity
-                    invocation_counter: egcl_rt::function::invocation_counter_address(function)
-                        .expect("native interpreted callable has a pinned counter") as usize,
-                    back_edge_counter: egcl_rt::function::back_edge_counter_address(function)
-                        .expect("native interpreted callable has a pinned loop counter") as usize,
-                    invocation_threshold: if promote { t2_invoke_threshold() } else { 0 },
-                    back_edge_threshold: if promote { t2_backedge_threshold() } else { 0 },
-                }
-            });
-            unsafe { ordinary::publish_ordinary_with_heat(Arc::as_ptr(&state.cell) as u64,
-                descriptor, code, function, heat); }
+            let heat =
+                (!profiling_disabled() && egcl_rt::function::tier(function) < 2).then(|| {
+                    egcl_rt::call_table::OrdinaryCallHeat {
+                        descriptor: 0, // filled with the retained descriptor identity
+                        invocation_counter: egcl_rt::function::invocation_counter_address(function)
+                            .expect("native interpreted callable has a pinned counter")
+                            as usize,
+                        back_edge_counter: egcl_rt::function::back_edge_counter_address(function)
+                            .expect("native interpreted callable has a pinned loop counter")
+                            as usize,
+                        invocation_threshold: if promote { t2_invoke_threshold() } else { 0 },
+                        back_edge_threshold: if promote { t2_backedge_threshold() } else { 0 },
+                    }
+                });
+            unsafe {
+                ordinary::publish_ordinary_with_heat(
+                    Arc::as_ptr(&state.cell) as u64,
+                    descriptor,
+                    code,
+                    function,
+                    heat,
+                );
+            }
         }
         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
         if super::native_transfer_entry::ordinary_primitives::is_private(state.symbol) {
             adapter::ensure(state);
         }
-        #[cfg(any(all(target_arch = "x86_64", unix), all(target_arch = "s390x", target_os = "linux")))]
+        #[cfg(any(
+            all(target_arch = "x86_64", unix),
+            all(target_arch = "s390x", target_os = "linux")
+        ))]
         state
             .versions
             .borrow_mut()
@@ -596,7 +638,11 @@ pub(super) fn ordinary_call(symbol: u32, args: &[EgclVal]) -> Result<EgclVal, Eg
     if let Some(result) = ordinary_funcall_fast(state, args) {
         return result;
     }
-    if cell.is_cold() { cold(state, args) } else { warm(state, args) }
+    if cell.is_cold() {
+        cold(state, args)
+    } else {
+        warm(state, args)
+    }
 }
 
 /// FUNCALL or APPLY reached from an ordinary-ABI caller (bliss-6m6ca). The
@@ -623,14 +669,18 @@ fn ordinary_funcall_fast(state: &State, args: &[EgclVal]) -> Option<Result<EgclV
     let apply = |call: &[EgclVal], env: &mut super::super::Env| {
         let (&function, rest) = call.split_first()?;
         let admit = super::native_transfer_entry::funcall_fast::Admit::Any;
-        if let Some(result) = super::native_transfer_entry::funcall_fast::apply(function, rest, env, admit) {
+        if let Some(result) =
+            super::native_transfer_entry::funcall_fast::apply(function, rest, env, admit)
+        {
             return Some(result);
         }
         // A symbol names its global function, which the cache never holds;
         // `cold` would evaluate it generically and republish. A function
         // object that missed keeps the general path, whose selection the
         // next call then finds in the cache.
-        call[0].is_symbol().then(|| super::super::apply_function_impl(call[0], &call[1..], env))
+        call[0]
+            .is_symbol()
+            .then(|| super::super::apply_function_impl(call[0], &call[1..], env))
     };
     if super::call_table_funcall::is_builtin(state.symbol) {
         // Teach the cell's generated probe first: the call below may tier,
@@ -660,7 +710,9 @@ fn ordinary_funcall_fast(state: &State, args: &[EgclVal]) -> Option<Result<EgclV
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub(super) unsafe fn ordinary_call_cell(cell: u64, args: &[EgclVal]) -> Result<EgclVal, EgclError> {
     let state = unsafe { state(cell) };
-    if let Some(result) = super::native_transfer_entry::ordinary_primitives::invoke(state.symbol, args) {
+    if let Some(result) =
+        super::native_transfer_entry::ordinary_primitives::invoke(state.symbol, args)
+    {
         return result;
     }
     if let Some(result) = ordinary_funcall_fast(state, args) {
@@ -713,13 +765,23 @@ fn run_bridge_call(
 pub(super) unsafe fn lean_native_target(
     cell: u64,
     nargs: usize,
-) -> Option<(Rc<super::native_transfer_entry::TransferCode>, EgclVal, u32, usize)> {
+) -> Option<(
+    Rc<super::native_transfer_entry::TransferCode>,
+    EgclVal,
+    u32,
+    usize,
+)> {
     let state = unsafe { state(cell) };
     if state.cell.is_cold() {
         return None;
     }
     let target = state.target.borrow();
-    let Some(Target::Native { code, function, promote: false }) = target.as_ref() else {
+    let Some(Target::Native {
+        code,
+        function,
+        promote: false,
+    }) = target.as_ref()
+    else {
         return None;
     };
     let NativeCodeStorage::Mapped(mapped) = &code._storage else {
@@ -728,7 +790,10 @@ pub(super) unsafe fn lean_native_target(
     // Only T2 code: `warm` counts invocations below T2.
     if !code.is_t2
         || mapped.needs_recompile()
-        || !code.body.as_ref().is_some_and(|body| arity_accepts(body, nargs))
+        || !code
+            .body
+            .as_ref()
+            .is_some_and(|body| arity_accepts(body, nargs))
         || NATIVE_DEPTH.with(|depth| depth.get()) >= native_depth_cap()
     {
         return None;
@@ -762,7 +827,9 @@ pub(super) unsafe fn mapped_callee_declines(cell: u64) -> bool {
         return false;
     }
     match state.target.borrow().as_ref() {
-        Some(Target::Builtin { .. }) => !super::call_table_funcall::names_funcall_or_apply(state.symbol),
+        Some(Target::Builtin { .. }) => {
+            !super::call_table_funcall::names_funcall_or_apply(state.symbol)
+        }
         Some(Target::Accessor { .. } | Target::MakeInstance) => true,
         Some(Target::Native { code, .. }) => match &code._storage {
             NativeCodeStorage::Mapped(mapped) => mapped.mapped_entry().is_none(),
@@ -810,13 +877,7 @@ fn warm(state: &State, args: &[EgclVal]) -> Result<EgclVal, EgclError> {
                 egcl_rt::function::record_invocation(*function);
             }
             if NATIVE_DEPTH.with(|depth| depth.get()) >= native_depth_cap() {
-                run_with_sym(
-                    Arc::clone(body),
-                    args,
-                    *function,
-                    state.symbol,
-                    env,
-                )
+                run_with_sym(Arc::clone(body), args, *function, state.symbol, env)
             } else {
                 run_native_callable(&code, state.symbol, *function, args, env)
             }
@@ -860,11 +921,13 @@ fn with_register_args(n: u64, args: [EgclVal; 3], call: impl FnOnce(&[EgclVal]) 
     }
     // The native ABI leaves unused argument registers unspecified. They must
     // never enter the precise root set, even though the callee ignores them.
-    egcl_rt::rooted!(args = [
-        if n > 0 { args[0] } else { NIL },
-        if n > 1 { args[1] } else { NIL },
-        if n > 2 { args[2] } else { NIL },
-    ]);
+    egcl_rt::rooted!(
+        args = [
+            if n > 0 { args[0] } else { NIL },
+            if n > 1 { args[1] } else { NIL },
+            if n > 2 { args[2] } else { NIL },
+        ]
+    );
     call(&args[..n as usize])
 }
 extern "C" fn cold_slice(cell: u64, n: u64, args: *const EgclVal, _: u64) -> u64 {
@@ -991,38 +1054,82 @@ mod tests {
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     fn private_primitive_keeps_its_adapter_after_public_callable_warming() {
         use std::sync::atomic::Ordering;
-        let _lock = crate::cli::heap_test_lock().lock()
+        let _lock = crate::cli::heap_test_lock()
+            .lock()
             .unwrap_or_else(|error| error.into_inner());
         let mut env = Env::new(false);
         egcl_rt::rooted_ref!(_env = &mut env);
         crate::cli::read_eval_all_env(
             "(setq *ordinary-private-cell-value* 73)
-             (defun ordinary-private-cell-reader () *ordinary-private-cell-value*)", &mut env).unwrap();
+             (defun ordinary-private-cell-reader () *ordinary-private-cell-value*)",
+            &mut env,
+        )
+        .unwrap();
         let reader_symbol = egcl_rt::symbols::intern("ORDINARY-PRIVATE-CELL-READER");
         egcl_rt::rooted!(params = reader::read_from_string("()").unwrap().0);
-        egcl_rt::rooted!(forms = reader::read_from_string("(*ordinary-private-cell-value*)").unwrap().0);
-        let body = Arc::new(compile_function("ORDINARY-PRIVATE-CELL-READER", *params, *forms,
-            &env, false, false).unwrap());
+        egcl_rt::rooted!(
+            forms = reader::read_from_string("(*ordinary-private-cell-value*)")
+                .unwrap()
+                .0
+        );
+        let body = Arc::new(
+            compile_function(
+                "ORDINARY-PRIVATE-CELL-READER",
+                *params,
+                *forms,
+                &env,
+                false,
+                false,
+            )
+            .unwrap(),
+        );
         registry_put(reader_symbol, Arc::clone(&body));
         let reader_code = native_transfer_entry::install_t1(reader_symbol, body, false).unwrap();
-        let NativeCodeStorage::Mapped(reader_owner) = &reader_code._storage else { unreachable!() };
+        let NativeCodeStorage::Mapped(reader_owner) = &reader_code._storage else {
+            unreachable!()
+        };
         assert!(reader_owner.ordinary_entry.is_some());
-        egcl_rt::rooted!(reader_function = egcl_rt::symbols::symbol_function(reader_symbol).unwrap());
+        egcl_rt::rooted!(
+            reader_function = egcl_rt::symbols::symbol_function(reader_symbol).unwrap()
+        );
         publish_native(reader_symbol, Some(*reader_function), &reader_code);
         let private_symbol = egcl_rt::symbols::find_index("%EGCL-ORDINARY-LOADGLOBAL").unwrap();
-        assert!(native_transfer_entry::ordinary_primitives::is_private(private_symbol));
-        egcl_rt::rooted!(previous = egcl_rt::symbols::symbol_function(private_symbol)
-            .unwrap_or(egcl_rt::value::UNBOUND));
+        assert!(native_transfer_entry::ordinary_primitives::is_private(
+            private_symbol
+        ));
+        egcl_rt::rooted!(
+            previous = egcl_rt::symbols::symbol_function(private_symbol)
+                .unwrap_or(egcl_rt::value::UNBOUND)
+        );
         for replacement in [991, 992] {
-            crate::cli::read_eval_all_env(&format!(
-                "(defun %egcl-ordinary-loadglobal (x) {replacement})"), &mut env).unwrap();
+            crate::cli::read_eval_all_env(
+                &format!("(defun %egcl-ordinary-loadglobal (x) {replacement})"),
+                &mut env,
+            )
+            .unwrap();
             egcl_rt::rooted!(params = reader::read_from_string("(x)").unwrap().0);
-            egcl_rt::rooted!(forms = reader::read_from_string(&format!("({replacement})")).unwrap().0);
-            let body = Arc::new(compile_function("%EGCL-ORDINARY-LOADGLOBAL", *params, *forms,
-                &env, false, false).unwrap());
+            egcl_rt::rooted!(
+                forms = reader::read_from_string(&format!("({replacement})"))
+                    .unwrap()
+                    .0
+            );
+            let body = Arc::new(
+                compile_function(
+                    "%EGCL-ORDINARY-LOADGLOBAL",
+                    *params,
+                    *forms,
+                    &env,
+                    false,
+                    false,
+                )
+                .unwrap(),
+            );
             registry_put(private_symbol, Arc::clone(&body));
-            let replacement_code = native_transfer_entry::install_t1(private_symbol, body, false).unwrap();
-            let NativeCodeStorage::Mapped(replacement_owner) = &replacement_code._storage else { unreachable!() };
+            let replacement_code =
+                native_transfer_entry::install_t1(private_symbol, body, false).unwrap();
+            let NativeCodeStorage::Mapped(replacement_owner) = &replacement_code._storage else {
+                unreachable!()
+            };
             assert!(replacement_owner.ordinary_entry.is_some());
             egcl_rt::rooted!(function = egcl_rt::symbols::symbol_function(private_symbol).unwrap());
             publish_native(private_symbol, Some(*function), &replacement_code);
@@ -1032,31 +1139,55 @@ mod tests {
             assert!(mapped_callable(*function, 1).is_some());
             let warmed = unsafe { &*cell.ordinary_entry_address() }.load(Ordering::Acquire);
             assert_ne!(warmed, 0);
-            assert_eq!(unsafe { (*(warmed as *const linkage::OrdinaryEntryDescriptor)).arity },
-                linkage::ORDINARY_ARITY_ANY, "warming must preserve the semantic adapter immediately");
+            assert_eq!(
+                unsafe { (*(warmed as *const linkage::OrdinaryEntryDescriptor)).arity },
+                linkage::ORDINARY_ARITY_ANY,
+                "warming must preserve the semantic adapter immediately"
+            );
             // Reproduce an earlier native publication from before the private
             // IDs were initialized. Its exact owner must remain retained while
             // resolve replaces the stale public-body descriptor.
-            let descriptor = replacement_owner.ordinary_descriptor(linkage::revision(cell.ordinal())).unwrap();
+            let descriptor = replacement_owner
+                .ordinary_descriptor(linkage::revision(cell.ordinal()))
+                .unwrap();
             unsafe {
-                ordinary::publish_ordinary_with_heat(Arc::as_ptr(&cell) as u64,
-                    descriptor, Rc::clone(replacement_owner), *function, None);
+                ordinary::publish_ordinary_with_heat(
+                    Arc::as_ptr(&cell) as u64,
+                    descriptor,
+                    Rc::clone(replacement_owner),
+                    *function,
+                    None,
+                );
             }
             let seeded = unsafe { &*cell.ordinary_entry_address() }.load(Ordering::Acquire);
-            assert_eq!(unsafe { (*(seeded as *const linkage::OrdinaryEntryDescriptor)).owner },
-                Rc::as_ptr(replacement_owner) as usize);
+            assert_eq!(
+                unsafe { (*(seeded as *const linkage::OrdinaryEntryDescriptor)).owner },
+                Rc::as_ptr(replacement_owner) as usize
+            );
             resolve(private_symbol).unwrap();
             let pointer = unsafe { &*cell.ordinary_entry_address() }.load(Ordering::Acquire);
             assert_ne!(pointer, 0);
             let descriptor = unsafe { &*(pointer as *const linkage::OrdinaryEntryDescriptor) };
             assert_eq!(descriptor.arity, linkage::ORDINARY_ARITY_ANY);
             assert_ne!(descriptor.owner, Rc::as_ptr(replacement_owner) as usize);
-            assert_eq!(unsafe { &*cell.ordinary_heat_address() }.load(Ordering::Acquire), 0);
-            assert_eq!(crate::cli::read_eval_all_env(
-                "(funcall #'%egcl-ordinary-loadglobal nil)", &mut env).unwrap(),
-                EgclVal::from_fixnum(replacement));
-            assert_eq!(run_native_callable(&reader_code, reader_symbol, *reader_function, &[], &mut env).unwrap(),
-                EgclVal::from_fixnum(73), "compiled global reads retain primitive semantics");
+            assert_eq!(
+                unsafe { &*cell.ordinary_heat_address() }.load(Ordering::Acquire),
+                0
+            );
+            assert_eq!(
+                crate::cli::read_eval_all_env(
+                    "(funcall #'%egcl-ordinary-loadglobal nil)",
+                    &mut env
+                )
+                .unwrap(),
+                EgclVal::from_fixnum(replacement)
+            );
+            assert_eq!(
+                run_native_callable(&reader_code, reader_symbol, *reader_function, &[], &mut env)
+                    .unwrap(),
+                EgclVal::from_fixnum(73),
+                "compiled global reads retain primitive semantics"
+            );
         }
         egcl_rt::symbols::set_symbol_function(private_symbol, *previous);
         registry_remove(private_symbol);
@@ -1066,13 +1197,14 @@ mod tests {
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     fn promotable_t1_publishes_real_ordinary_code_and_retained_heat() {
         use std::sync::atomic::Ordering;
-        let _lock = super::super::super::heap_test_lock().lock()
+        let _lock = super::super::super::heap_test_lock()
+            .lock()
             .unwrap_or_else(|error| error.into_inner());
         let mut env = Env::new(false);
         egcl_rt::rooted_ref!(_env = &mut env);
         let name = "ORDINARY-PROMOTABLE-T1";
-        super::super::super::read_eval_all_env(
-            "(defun ordinary-promotable-t1 (x) x)", &mut env).unwrap();
+        super::super::super::read_eval_all_env("(defun ordinary-promotable-t1 (x) x)", &mut env)
+            .unwrap();
         let symbol = egcl_rt::symbols::intern(name);
         egcl_rt::rooted!(params = reader::read_from_string("(x)").unwrap().0);
         egcl_rt::rooted!(forms = reader::read_from_string("(x)").unwrap().0);
@@ -1080,46 +1212,76 @@ mod tests {
         registry_put(symbol, body);
         let code = try_promote_to_t1_with_speculation(symbol, false).unwrap();
         assert!(!code.is_t2);
-        let NativeCodeStorage::Mapped(mapped) = &code._storage else { panic!("ordinary T1") };
+        let NativeCodeStorage::Mapped(mapped) = &code._storage else {
+            panic!("ordinary T1")
+        };
         let owner = Rc::as_ptr(mapped) as usize;
         egcl_rt::rooted!(function = egcl_rt::symbols::symbol_function(symbol).unwrap());
         let cell = resolve(symbol).unwrap();
         let state = unsafe { state(Arc::as_ptr(&cell) as u64) };
         let revision = linkage::revision(cell.ordinal());
-        publish_target(state, revision, Some(Target::Native {
-            code: Rc::clone(&code), function: *function, promote: true,
-        }));
+        publish_target(
+            state,
+            revision,
+            Some(Target::Native {
+                code: Rc::clone(&code),
+                function: *function,
+                promote: true,
+            }),
+        );
         let pointer = unsafe { &*cell.ordinary_entry_address() }.load(Ordering::Acquire);
         assert_ne!(pointer, 0);
         let descriptor = unsafe { &*(pointer as *const linkage::OrdinaryEntryDescriptor) };
-        assert_eq!(descriptor.owner, owner, "promotable T1 must bypass the named adapter");
+        assert_eq!(
+            descriptor.owner, owner,
+            "promotable T1 must bypass the named adapter"
+        );
         if !profiling_disabled() {
             let heat = unsafe { &*cell.ordinary_heat_address() }.load(Ordering::Acquire);
             assert_ne!(heat, 0);
             let heat = unsafe { &*(heat as *const linkage::OrdinaryCallHeat) };
             assert_eq!(heat.descriptor, pointer);
-            assert_eq!(heat.invocation_counter,
-                egcl_rt::function::invocation_counter_address(*function).unwrap() as usize);
+            assert_eq!(
+                heat.invocation_counter,
+                egcl_rt::function::invocation_counter_address(*function).unwrap() as usize
+            );
             assert_eq!(heat.invocation_threshold, t2_invoke_threshold());
             assert_eq!(heat.back_edge_threshold, t2_backedge_threshold());
             let original_heat = heat as *const linkage::OrdinaryCallHeat;
-            publish_target(state, revision, Some(Target::Native {
-                code: Rc::clone(&code), function: *function, promote: false,
-            }));
+            publish_target(
+                state,
+                revision,
+                Some(Target::Native {
+                    code: Rc::clone(&code),
+                    function: *function,
+                    promote: false,
+                }),
+            );
             let updated = unsafe { &*cell.ordinary_heat_address() }.load(Ordering::Acquire);
-            assert_ne!(updated, original_heat as usize,
-                "declined T2 replaces heat policy without mutating an in-flight record");
+            assert_ne!(
+                updated, original_heat as usize,
+                "declined T2 replaces heat policy without mutating an in-flight record"
+            );
             let updated = unsafe { &*(updated as *const linkage::OrdinaryCallHeat) };
             assert_eq!(updated.descriptor, pointer);
             assert_eq!(updated.invocation_threshold, 0);
             assert_eq!(updated.back_edge_threshold, 0);
-            assert_eq!(unsafe { (*original_heat).invocation_threshold }, t2_invoke_threshold());
+            assert_eq!(
+                unsafe { (*original_heat).invocation_threshold },
+                t2_invoke_threshold()
+            );
         }
         linkage::invalidate(symbol);
-        assert_eq!(unsafe { &*cell.ordinary_heat_address() }.load(Ordering::Acquire), 0);
+        assert_eq!(
+            unsafe { &*cell.ordinary_heat_address() }.load(Ordering::Acquire),
+            0
+        );
         adapter::ensure(state);
-        assert_eq!(unsafe { &*cell.ordinary_heat_address() }.load(Ordering::Acquire), 0,
-            "replacement named adapter must not count the old callable");
+        assert_eq!(
+            unsafe { &*cell.ordinary_heat_address() }.load(Ordering::Acquire),
+            0,
+            "replacement named adapter must not count the old callable"
+        );
     }
 
     #[test]
@@ -1145,7 +1307,10 @@ mod tests {
                     });
                 })
                 .unwrap();
-                assert!(!found_unused, "unused register words became precise GC roots");
+                assert!(
+                    !found_unused,
+                    "unused register words became precise GC roots"
+                );
                 assert_eq!(found_used, n != 0, "only supplied arguments may be rooted");
                 NIL.0
             });
@@ -1229,10 +1394,14 @@ mod tests {
             .unwrap_or_else(|error| error.into_inner());
         let mut env = Env::new(false);
         egcl_rt::rooted_ref!(_env_root = &mut env);
-        egcl_rt::rooted!(table = super::super::super::read_eval_all_env(
-            "(make-hash-table :test 'eql)", &mut env,
-        ).unwrap());
-        let symbol = super::super::super::resolve_sym("GETHASH").unwrap().as_symbol_index();
+        egcl_rt::rooted!(
+            table =
+                super::super::super::read_eval_all_env("(make-hash-table :test 'eql)", &mut env,)
+                    .unwrap()
+        );
+        let symbol = super::super::super::resolve_sym("GETHASH")
+            .unwrap()
+            .as_symbol_index();
         let cell = resolve(symbol).unwrap();
         let state = unsafe { state(Arc::as_ptr(&cell) as u64) };
         struct RestoreEnv(*mut Env);
@@ -1250,7 +1419,10 @@ mod tests {
             assert_eq!(env.mv, vec![default, NIL]);
             assert!(env.mv_active);
             assert!(!cell.is_cold(), "GETHASH must install its builtin target");
-            assert!(matches!(*state.target.borrow(), Some(Target::Builtin { .. })));
+            assert!(matches!(
+                *state.target.borrow(),
+                Some(Target::Builtin { .. })
+            ));
             egcl_stdlib::set_gethash(args[0], *table, NIL).unwrap();
             TARGET_LOOKUPS.with(|count| count.set(0));
             GENERAL_DISPATCHES.with(|count| count.set(0));
@@ -1259,22 +1431,43 @@ mod tests {
                     .load(std::sync::atomic::Ordering::Acquire);
                 let call: extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 =
                     unsafe { std::mem::transmute(entry) };
-                assert_eq!(call(Arc::as_ptr(&cell) as u64, nargs as u64,
-                    args[0].0, args[1].0, args[2].0, 0), NIL.0);
+                assert_eq!(
+                    call(
+                        Arc::as_ptr(&cell) as u64,
+                        nargs as u64,
+                        args[0].0,
+                        args[1].0,
+                        args[2].0,
+                        0
+                    ),
+                    NIL.0
+                );
                 assert_eq!(env.mv, vec![NIL, T], "a stored NIL is present");
                 assert!(env.mv_active);
             }
-            assert_eq!(TARGET_LOOKUPS.with(|count| count.get()), 0,
-                "warmed GETHASH calls must not resolve their target again");
-            assert_eq!(GENERAL_DISPATCHES.with(|count| count.get()), 0,
-                "warmed builtins must bypass general target dispatch");
+            assert_eq!(
+                TARGET_LOOKUPS.with(|count| count.get()),
+                0,
+                "warmed GETHASH calls must not resolve their target again"
+            );
+            assert_eq!(
+                GENERAL_DISPATCHES.with(|count| count.get()),
+                0,
+                "warmed builtins must bypass general target dispatch"
+            );
         }
         // Ordinary callable entry attaches its native backtrace to errors.
         // Check the original condition rather than requiring an untraced enum.
         let arity_error = warm(state, &args[..1]).unwrap_err();
-        assert!(matches!(arity_error.without_backtrace(), EgclError::ProgramError(_)));
+        assert!(matches!(
+            arity_error.without_backtrace(),
+            EgclError::ProgramError(_)
+        ));
         let type_error = warm(state, &[args[0], NIL]).unwrap_err();
-        assert!(matches!(type_error.without_backtrace(), EgclError::TypeError { .. }));
+        assert!(matches!(
+            type_error.without_backtrace(),
+            EgclError::TypeError { .. }
+        ));
     }
 
     #[test]
@@ -1308,7 +1501,10 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Acquire);
             let call: extern "C" fn(u64, u64, *const EgclVal, u64) -> u64 =
                 unsafe { std::mem::transmute(entry) };
-            assert_eq!(call(Arc::as_ptr(&cell) as u64, 4, args.as_ptr(), 0), args[0].0);
+            assert_eq!(
+                call(Arc::as_ptr(&cell) as u64, 4, args.as_ptr(), 0),
+                args[0].0
+            );
             assert_eq!(second.mv, args);
             assert!(second.mv_active);
             assert!(first.mv.is_empty());
@@ -1321,7 +1517,10 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Acquire);
             let call: extern "C" fn(u64, u64, *const EgclVal, u64) -> u64 =
                 unsafe { std::mem::transmute(entry) };
-            assert_eq!(call(Arc::as_ptr(&cell) as u64, 0, std::ptr::null(), 0), NIL.0);
+            assert_eq!(
+                call(Arc::as_ptr(&cell) as u64, 0, std::ptr::null(), 0),
+                NIL.0
+            );
             assert!(second.mv.is_empty());
             assert!(second.mv_active);
         }
@@ -1385,14 +1584,26 @@ mod tests {
             ("PIC-INDEPENDENT", "(+ x 2)"),
         ] {
             super::super::super::read_eval_all_env(
-                &format!("(defun {name} (x) {expression})"), &mut env,
-            ).unwrap();
+                &format!("(defun {name} (x) {expression})"),
+                &mut env,
+            )
+            .unwrap();
             let symbol = egcl_rt::symbols::intern(name);
             egcl_rt::rooted!(params = reader::read_from_string("(x)").unwrap().0);
-            egcl_rt::rooted!(form = reader::read_from_string(&format!("({expression})")).unwrap().0);
-            let body = Arc::new(compile_function(name, *params, *form, &env, false, false).unwrap());
+            egcl_rt::rooted!(
+                form = reader::read_from_string(&format!("({expression})"))
+                    .unwrap()
+                    .0
+            );
+            let body =
+                Arc::new(compile_function(name, *params, *form, &env, false, false).unwrap());
             let needs_function_lookup = matches!(name, "PIC-MIDDLE" | "PIC-OUTER");
-            assert_eq!(body.code.iter().any(|op| matches!(op, Instr::LoadFunction(_))), needs_function_lookup);
+            assert_eq!(
+                body.code
+                    .iter()
+                    .any(|op| matches!(op, Instr::LoadFunction(_))),
+                needs_function_lookup
+            );
             registry_put(symbol, body);
             let input = snapshot_t2_input(symbol, 0).unwrap();
             let generation = input.generation;
@@ -1401,44 +1612,74 @@ mod tests {
             // Callers that look up a global function (LoadFunction) are
             // admitted to mapped T2 on x86-64 Linux as well (#460).
             let code = install_t2_completion(T2Completion {
-                    panicked: false,
-                    _permit: None, dependencies: Vec::new(),
-                sym: symbol, generation,
-                artifact: Some(artifact.expect("compile admitted callback")), input,
-            }).unwrap();
+                panicked: false,
+                _permit: None,
+                dependencies: Vec::new(),
+                sym: symbol,
+                generation,
+                artifact: Some(artifact.expect("compile admitted callback")),
+                input,
+            })
+            .unwrap();
             assert!(code.is_t2);
             #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
             {
                 assert!(matches!(code._storage, NativeCodeStorage::Mapped(_)));
                 let expected = if name == "PIC-INDEPENDENT" { 43 } else { 42 };
-                assert_eq!(run_native(&code, symbol, &[EgclVal::from_fixnum(41)], &mut env).unwrap(),
-                    EgclVal::from_fixnum(expected));
+                assert_eq!(
+                    run_native(&code, symbol, &[EgclVal::from_fixnum(41)], &mut env).unwrap(),
+                    EgclVal::from_fixnum(expected)
+                );
             }
         }
         let cell = resolve(egcl_rt::symbols::intern("FUNCALL")).unwrap();
         let state = unsafe { state(Arc::as_ptr(&cell) as u64) };
-        egcl_rt::rooted!(function = egcl_rt::symbols::symbol_function(egcl_rt::symbols::intern("PIC-OUTER")).unwrap());
+        egcl_rt::rooted!(
+            function =
+                egcl_rt::symbols::symbol_function(egcl_rt::symbols::intern("PIC-OUTER")).unwrap()
+        );
         egcl_rt::rooted!(args = [*function, EgclVal::from_fixnum(41)]);
         struct RestoreEnv(*mut Env);
         impl Drop for RestoreEnv {
-            fn drop(&mut self) { NATIVE_ENV.with(|slot| slot.set(self.0)); }
+            fn drop(&mut self) {
+                NATIVE_ENV.with(|slot| slot.set(self.0));
+            }
         }
         let _restore = RestoreEnv(NATIVE_ENV.with(|slot| slot.replace(&mut env)));
-        for _ in 0..3 { assert_eq!(cold(state, &args[..]).unwrap(), EgclVal::from_fixnum(42)); }
+        for _ in 0..3 {
+            assert_eq!(cold(state, &args[..]).unwrap(), EgclVal::from_fixnum(42));
+        }
         TARGET_LOOKUPS.with(|count| count.set(0));
         for _ in 0..100 {
-            let entry = unsafe { &*cell.checked_entry_address(false) }.load(std::sync::atomic::Ordering::Acquire);
-            let call: extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 = unsafe { std::mem::transmute(entry) };
-            assert_eq!(call(Arc::as_ptr(&cell) as u64, 2, args[0].0, args[1].0, NIL.0, 0), EgclVal::from_fixnum(42).0);
+            let entry = unsafe { &*cell.checked_entry_address(false) }
+                .load(std::sync::atomic::Ordering::Acquire);
+            let call: extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 =
+                unsafe { std::mem::transmute(entry) };
+            assert_eq!(
+                call(Arc::as_ptr(&cell) as u64, 2, args[0].0, args[1].0, NIL.0, 0),
+                EgclVal::from_fixnum(42).0
+            );
         }
         if checked_native_installation_allowed() {
-            assert_eq!(TARGET_LOOKUPS.with(|count| count.get()), 0,
-                "nested callbacks must not evict each other's warmed native identity");
+            assert_eq!(
+                TARGET_LOOKUPS.with(|count| count.get()),
+                0,
+                "nested callbacks must not evict each other's warmed native identity"
+            );
         } else {
-            assert!(TARGET_LOOKUPS.with(|count| count.get()) >= 100,
-                "Linux calls through checked_entry_address must retain bridge dispatch");
-            assert!(!state.funcall.borrow_mut().as_mut().unwrap().select(*function),
-                "the checked native PIC must reject a mapped callback");
+            assert!(
+                TARGET_LOOKUPS.with(|count| count.get()) >= 100,
+                "Linux calls through checked_entry_address must retain bridge dispatch"
+            );
+            assert!(
+                !state
+                    .funcall
+                    .borrow_mut()
+                    .as_mut()
+                    .unwrap()
+                    .select(*function),
+                "the checked native PIC must reject a mapped callback"
+            );
         }
         let symbol = egcl_rt::symbols::intern("PIC-LEAF");
         let input = snapshot_t2_input(symbol, 0).unwrap();
@@ -1446,28 +1687,46 @@ mod tests {
         let input = egcl_rt::CrossThreadRoot::new(input);
         let artifact = input.with_gc_stable(compile_t2_artifact).unwrap();
         install_t2_completion(T2Completion {
-                    panicked: false,
-                    _permit: None, dependencies: Vec::new(),
-            sym: symbol, generation, artifact: Some(artifact), input,
-        }).unwrap();
-        args[0] = egcl_rt::symbols::symbol_function(egcl_rt::symbols::intern("PIC-INDEPENDENT")).unwrap();
+            panicked: false,
+            _permit: None,
+            dependencies: Vec::new(),
+            sym: symbol,
+            generation,
+            artifact: Some(artifact),
+            input,
+        })
+        .unwrap();
+        args[0] =
+            egcl_rt::symbols::symbol_function(egcl_rt::symbols::intern("PIC-INDEPENDENT")).unwrap();
         assert_eq!(cold(state, &args[..]).unwrap(), EgclVal::from_fixnum(43));
         args[0] = egcl_rt::symbols::symbol_function(symbol).unwrap();
         TARGET_LOOKUPS.with(|count| count.set(0));
-        let entry = unsafe { &*cell.checked_entry_address(false) }.load(std::sync::atomic::Ordering::Acquire);
-        let call: extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 = unsafe { std::mem::transmute(entry) };
-        assert_eq!(call(Arc::as_ptr(&cell) as u64, 2, args[0].0, args[1].0, NIL.0, 0), EgclVal::from_fixnum(42).0);
-        assert!(TARGET_LOOKUPS.with(|count| count.get()) > 0,
-            "republication must invalidate every identity, even when another callback refills first");
+        let entry = unsafe { &*cell.checked_entry_address(false) }
+            .load(std::sync::atomic::Ordering::Acquire);
+        let call: extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 =
+            unsafe { std::mem::transmute(entry) };
+        assert_eq!(
+            call(Arc::as_ptr(&cell) as u64, 2, args[0].0, args[1].0, NIL.0, 0),
+            EgclVal::from_fixnum(42).0
+        );
+        assert!(
+            TARGET_LOOKUPS.with(|count| count.get()) > 0,
+            "republication must invalidate every identity, even when another callback refills first"
+        );
         args[0] = *function;
         assert_eq!(cold(state, &args[..]).unwrap(), EgclVal::from_fixnum(42));
         egcl_rt::gc::full_gc().unwrap();
         for name in ["PIC-LEAF", "PIC-MIDDLE", "PIC-OUTER"] {
             args[0] = egcl_rt::symbols::symbol_function(egcl_rt::symbols::intern(name)).unwrap();
             TARGET_LOOKUPS.with(|count| count.set(0));
-            let entry = unsafe { &*cell.checked_entry_address(false) }.load(std::sync::atomic::Ordering::Acquire);
-            let call: extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 = unsafe { std::mem::transmute(entry) };
-            assert_eq!(call(Arc::as_ptr(&cell) as u64, 2, args[0].0, args[1].0, NIL.0, 0), EgclVal::from_fixnum(42).0);
+            let entry = unsafe { &*cell.checked_entry_address(false) }
+                .load(std::sync::atomic::Ordering::Acquire);
+            let call: extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 =
+                unsafe { std::mem::transmute(entry) };
+            assert_eq!(
+                call(Arc::as_ptr(&cell) as u64, 2, args[0].0, args[1].0, NIL.0, 0),
+                EgclVal::from_fixnum(42).0
+            );
             assert!(TARGET_LOOKUPS.with(|count| count.get()) > 0);
             if !checked_native_installation_allowed() {
                 // Linux has no checked-native PIC identity to invalidate. It
@@ -1476,29 +1735,41 @@ mod tests {
             }
         }
         if !checked_native_installation_allowed() {
-            egcl_rt::rooted!(selected_leaf = egcl_rt::symbols::symbol_function(
-                egcl_rt::symbols::intern("PIC-LEAF")).unwrap());
-            super::super::super::read_eval_all_env(
-                "(defun pic-leaf (x) (+ x 10))", &mut env,
-            ).unwrap();
+            egcl_rt::rooted!(
+                selected_leaf =
+                    egcl_rt::symbols::symbol_function(egcl_rt::symbols::intern("PIC-LEAF"))
+                        .unwrap()
+            );
+            super::super::super::read_eval_all_env("(defun pic-leaf (x) (+ x 10))", &mut env)
+                .unwrap();
             // The selected leaf is an old callable; the selected OUTER performs
             // FUNCTION lookup inside its unchanged body and sees the new leaf.
             for collect in [false, true] {
-                if collect { egcl_rt::gc::full_gc().unwrap(); }
-                egcl_rt::rooted!(callbacks = vec![
-                    *selected_leaf,
-                    *function,
-                    egcl_rt::symbols::symbol_function(egcl_rt::symbols::intern("PIC-INDEPENDENT")).unwrap(),
-                    egcl_rt::symbols::symbol_function(egcl_rt::symbols::intern("PIC-LEAF")).unwrap(),
-                ]);
+                if collect {
+                    egcl_rt::gc::full_gc().unwrap();
+                }
+                egcl_rt::rooted!(
+                    callbacks = vec![
+                        *selected_leaf,
+                        *function,
+                        egcl_rt::symbols::symbol_function(egcl_rt::symbols::intern(
+                            "PIC-INDEPENDENT"
+                        ))
+                        .unwrap(),
+                        egcl_rt::symbols::symbol_function(egcl_rt::symbols::intern("PIC-LEAF"))
+                            .unwrap(),
+                    ]
+                );
                 for (index, expected) in [42, 51, 43, 51].into_iter().enumerate() {
                     args[0] = callbacks[index];
                     let entry = unsafe { &*cell.checked_entry_address(false) }
                         .load(std::sync::atomic::Ordering::Acquire);
                     let call: extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 =
                         unsafe { std::mem::transmute(entry) };
-                    assert_eq!(call(Arc::as_ptr(&cell) as u64, 2, args[0].0, args[1].0, NIL.0, 0),
-                        EgclVal::from_fixnum(expected).0);
+                    assert_eq!(
+                        call(Arc::as_ptr(&cell) as u64, 2, args[0].0, args[1].0, NIL.0, 0),
+                        EgclVal::from_fixnum(expected).0
+                    );
                 }
             }
         }
@@ -1535,7 +1806,8 @@ mod tests {
             assert!(
                 install_t2_completion(T2Completion {
                     panicked: false,
-                    _permit: None, dependencies: Vec::new(),
+                    _permit: None,
+                    dependencies: Vec::new(),
                     sym: symbol,
                     generation,
                     artifact: Some(artifact),
@@ -1575,12 +1847,19 @@ mod tests {
             let artifact = input.with_gc_stable(compile_t2_artifact);
             // Closure bodies that read captured bindings reach mapped native
             // code on x86-64 Linux as well (#494).
-            assert!(install_t2_completion(T2Completion {
+            assert!(
+                install_t2_completion(T2Completion {
                     panicked: false,
-                    _permit: None, dependencies: Vec::new(),
-                sym: symbol, generation,
-                artifact: Some(artifact.expect("compile captured callback")), input,
-            }).unwrap().is_t2);
+                    _permit: None,
+                    dependencies: Vec::new(),
+                    sym: symbol,
+                    generation,
+                    artifact: Some(artifact.expect("compile captured callback")),
+                    input,
+                })
+                .unwrap()
+                .is_t2
+            );
         }
         egcl_rt::rooted!(args = [*function, EgclVal::from_fixnum(41)]);
         let cell = resolve(egcl_rt::symbols::intern("OBJECT-CALL-CALLER")).unwrap();
@@ -1597,8 +1876,8 @@ mod tests {
         assert!(TARGET_LOOKUPS.with(|count| count.get()) > 0);
         TARGET_LOOKUPS.with(|count| count.set(0));
         for _ in 0..100 {
-            let entry =
-                unsafe { &*cell.checked_entry_address(false) }.load(std::sync::atomic::Ordering::Acquire);
+            let entry = unsafe { &*cell.checked_entry_address(false) }
+                .load(std::sync::atomic::Ordering::Acquire);
             let call: extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 =
                 unsafe { std::mem::transmute(entry) };
             assert_eq!(
@@ -1607,26 +1886,38 @@ mod tests {
             );
         }
         if checked_native_installation_allowed() {
-            assert_eq!(TARGET_LOOKUPS.with(|count| count.get()), 0,
-                "native FUNCALL must bypass target lookup and Rust frame setup");
+            assert_eq!(
+                TARGET_LOOKUPS.with(|count| count.get()),
+                0,
+                "native FUNCALL must bypass target lookup and Rust frame setup"
+            );
         } else {
-            assert!(TARGET_LOOKUPS.with(|count| count.get()) >= 100,
-                "checked FUNCALL entries must use the Linux bridge");
+            assert!(
+                TARGET_LOOKUPS.with(|count| count.get()) >= 100,
+                "checked FUNCALL entries must use the Linux bridge"
+            );
         }
         let symbol = egcl_rt::function::name(*function).as_symbol_index();
         let input = snapshot_t2_input(symbol, 0).unwrap();
         let generation = input.generation;
         let input = egcl_rt::CrossThreadRoot::new(input);
         let artifact = input.with_gc_stable(compile_t2_artifact);
-        assert!(install_t2_completion(T2Completion {
-                    panicked: false,
-                    _permit: None, dependencies: Vec::new(),
-            sym: symbol, generation,
-            artifact: Some(artifact.expect("recompile callback")), input,
-        }).unwrap().is_t2);
+        assert!(
+            install_t2_completion(T2Completion {
+                panicked: false,
+                _permit: None,
+                dependencies: Vec::new(),
+                sym: symbol,
+                generation,
+                artifact: Some(artifact.expect("recompile callback")),
+                input,
+            })
+            .unwrap()
+            .is_t2
+        );
         TARGET_LOOKUPS.with(|count| count.set(0));
-        let entry =
-            unsafe { &*cell.checked_entry_address(false) }.load(std::sync::atomic::Ordering::Acquire);
+        let entry = unsafe { &*cell.checked_entry_address(false) }
+            .load(std::sync::atomic::Ordering::Acquire);
         let call: extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 =
             unsafe { std::mem::transmute(entry) };
         assert_eq!(
@@ -1643,17 +1934,24 @@ mod tests {
         let funcall_state = unsafe { super::state(Arc::as_ptr(&funcall_cell) as u64) };
         let obsolete_symbol = {
             egcl_rt::rooted!(form = super::super::super::vec_to_list(&[NIL]));
-            let body = Arc::new(compile_function("OBSOLETE-FUNCALL-TARGET", NIL, *form, &env, false, false).unwrap());
+            let body = Arc::new(
+                compile_function("OBSOLETE-FUNCALL-TARGET", NIL, *form, &env, false, false)
+                    .unwrap(),
+            );
             egcl_rt::rooted!(obsolete = make_bytecode_closure(&body, None));
             *funcall_state.target.borrow_mut() = Some(Target::Function(*obsolete));
             egcl_rt::function::name(*obsolete).as_symbol_index()
         };
-        assert_eq!(cold(funcall_state, &args[..]).unwrap(), EgclVal::from_fixnum(42));
+        assert_eq!(
+            cold(funcall_state, &args[..]).unwrap(),
+            EgclVal::from_fixnum(42)
+        );
         env.mv.clear();
         egcl_rt::gc::full_gc().unwrap();
-        assert!(!is_registered(obsolete_symbol),
-            "installing native FUNCALL must release the previous generic target");
-
+        assert!(
+            !is_registered(obsolete_symbol),
+            "installing native FUNCALL must release the previous generic target"
+        );
     }
 
     fn check_native_slot(name: &str, params: &str, expression: &str, args: &[i64], expected: i64) {
@@ -1685,11 +1983,15 @@ mod tests {
         let artifact = input.with_gc_stable(compile_t2_artifact);
         // &optional bodies reach mapped T1/T2 on x86-64 Linux too (#457).
         let code = install_t2_completion(T2Completion {
-                    panicked: false,
-                    _permit: None, dependencies: Vec::new(),
-            sym: symbol, generation,
-            artifact: Some(artifact.expect("compile T2 leaf")), input,
-        }).expect("install T2 leaf");
+            panicked: false,
+            _permit: None,
+            dependencies: Vec::new(),
+            sym: symbol,
+            generation,
+            artifact: Some(artifact.expect("compile T2 leaf")),
+            input,
+        })
+        .expect("install T2 leaf");
         assert!(code.is_t2);
         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
         assert!(matches!(code._storage, NativeCodeStorage::Mapped(_)));
@@ -1709,7 +2011,10 @@ mod tests {
             "cold-call probe must be live"
         );
         assert!(!cell.is_cold());
-        assert!(matches!(*state.target.borrow(), Some(Target::Native { .. })));
+        assert!(matches!(
+            *state.target.borrow(),
+            Some(Target::Native { .. })
+        ));
         TARGET_LOOKUPS.with(|count| count.set(0));
         for _ in 0..100 {
             let entry = unsafe { &*cell.checked_entry_address(args.len() > 3) }
@@ -1739,13 +2044,18 @@ mod tests {
             assert_eq!(result, EgclVal::from_fixnum(expected).0);
         }
         if checked_native_installation_allowed() {
-            assert_eq!(TARGET_LOOKUPS.with(|count| count.get()), 0,
-                "warm checked-native calls bypass target resolution");
+            assert_eq!(
+                TARGET_LOOKUPS.with(|count| count.get()),
+                0,
+                "warm checked-native calls bypass target resolution"
+            );
         } else {
             // This probe deliberately enters checked_entry_address. Mapped
             // callers use the separate published cell entry tested by linkage.
-            assert!(TARGET_LOOKUPS.with(|count| count.get()) >= 100,
-                "checked bridge calls must resolve their Linux mapped/interpreter target");
+            assert!(
+                TARGET_LOOKUPS.with(|count| count.get()) >= 100,
+                "checked bridge calls must resolve their Linux mapped/interpreter target"
+            );
         }
         registry_remove(symbol);
     }

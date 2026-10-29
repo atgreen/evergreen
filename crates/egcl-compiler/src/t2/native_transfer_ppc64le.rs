@@ -38,7 +38,7 @@
 //! ppc64le segment probe.
 
 use egcl_rt::asm::Cc;
-use egcl_rt::asm_ppc64le::{frame, Asm};
+use egcl_rt::asm_ppc64le::{Asm, frame};
 use egcl_rt::native_transfer::{NativeExit, NativeOutcome};
 
 /// Version-two helper ABI shared with the runtime: `(request, outcome*)`.

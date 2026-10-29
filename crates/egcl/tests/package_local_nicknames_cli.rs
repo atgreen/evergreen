@@ -151,7 +151,10 @@ fn compile_file_reads_a_local_nickname_declared_earlier_in_the_file() {
         output.status.success(),
         "compile-file with a local nickname failed: {stdout}\n{stderr}"
     );
-    assert!(stdout.contains("PLN-COMPILE-OK"), "missing PLN-COMPILE-OK in: {stdout}");
+    assert!(
+        stdout.contains("PLN-COMPILE-OK"),
+        "missing PLN-COMPILE-OK in: {stdout}"
+    );
     assert!(
         !stdout.contains("could not pre-read") && !stderr.contains("could not pre-read"),
         "the pre-read fell back to a source-only artifact: {stdout}\n{stderr}"

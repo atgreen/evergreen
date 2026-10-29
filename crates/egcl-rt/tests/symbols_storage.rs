@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 use egcl_rt::value::NIL;
-use egcl_rt::{init_heap, GcConfig};
+use egcl_rt::{GcConfig, init_heap};
 
 #[test]
 fn discarded_symbols_reuse_storage_and_surviving_names_move() {

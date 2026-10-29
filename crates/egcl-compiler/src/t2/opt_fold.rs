@@ -172,8 +172,10 @@ impl Pass for ConstFold {
                 // Dynamic identities (x+0, x*1) must not erase its type check.
                 // The opcode-specific folds below still reject overflow; other
                 // effects, including binding guards, have no folding rule.
-                let constant_guard = guard && args.iter()
-                    .all(|&value| cval(&consts, &replacement, value).is_some());
+                let constant_guard = guard
+                    && args
+                        .iter()
+                        .all(|&value| cval(&consts, &replacement, value).is_some());
                 if call || (effectful && !constant_guard) {
                     continue;
                 }
@@ -210,7 +212,8 @@ impl Pass for ConstFold {
                             FixnumFloor if y != 0 => {
                                 let q = x as i128 / y as i128;
                                 let r = x as i128 % y as i128;
-                                in_fixnum_range(q - i128::from(r != 0 && (r < 0) != (y < 0))).map(Fold::Fix)
+                                in_fixnum_range(q - i128::from(r != 0 && (r < 0) != (y < 0)))
+                                    .map(Fold::Fix)
                             }
                             FixnumDiv if y != 0 => {
                                 in_fixnum_range(x as i128 / y as i128).map(Fold::Fix)

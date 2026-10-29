@@ -14,7 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use egcl_rt::error::EgclError;
 use egcl_rt::object::{ConsCell, ObjectHeader, type_id};
-use egcl_rt::value::{EOF, NIL, T, EgclVal};
+use egcl_rt::value::{EOF, EgclVal, NIL, T};
 use egcl_stdlib::hashtable::{
     HashTest, MakeHashTableOptions, Weakness, clrhash, gethash, hash_table_count, hash_table_size,
     make_hash_table, remhash, set_gethash, sxhash,
@@ -22,16 +22,15 @@ use egcl_stdlib::hashtable::{
 use egcl_stdlib::pathnames::register_string;
 use egcl_stdlib::sequences;
 use egcl_stdlib::streams::{
-    ExternalFormat, IF_DOES_NOT_EXIST_CREATE_VAL, IF_EXISTS_SUPERSEDE_VAL, StreamDirection,
-    close, file_length_fn, file_position,
-    get_output_stream_string, make_broadcast_stream, make_concatenated_stream, make_echo_stream,
-    make_lisp_string, make_lisp_string_fresh, make_string_input_stream, make_string_output_stream,
-    make_synonym_stream, make_two_way_stream, open, open_stream_p, set_file_position,
-    set_symbol_stream, stream_advance_to_column, stream_element_type, stream_external_format,
-    stream_finish_output, stream_force_output, stream_fresh_line, stream_listen, stream_peek_char,
-    stream_read_char, stream_read_char_no_hang, stream_read_line, stream_read_sequence,
-    stream_start_line_p, stream_unread_char, stream_write_char, stream_write_sequence,
-    stream_write_string,
+    ExternalFormat, IF_DOES_NOT_EXIST_CREATE_VAL, IF_EXISTS_SUPERSEDE_VAL, StreamDirection, close,
+    file_length_fn, file_position, get_output_stream_string, make_broadcast_stream,
+    make_concatenated_stream, make_echo_stream, make_lisp_string, make_lisp_string_fresh,
+    make_string_input_stream, make_string_output_stream, make_synonym_stream, make_two_way_stream,
+    open, open_stream_p, set_file_position, set_symbol_stream, stream_advance_to_column,
+    stream_element_type, stream_external_format, stream_finish_output, stream_force_output,
+    stream_fresh_line, stream_listen, stream_peek_char, stream_read_char, stream_read_char_no_hang,
+    stream_read_line, stream_read_sequence, stream_start_line_p, stream_unread_char,
+    stream_write_char, stream_write_sequence, stream_write_string,
 };
 
 fn make_list(vals: &[i64]) -> EgclVal {
@@ -137,11 +136,7 @@ fn stream_string_entrypoints_round_trip_and_dispatch() {
     assert!(stream_fresh_line(output).unwrap());
     assert!(stream_start_line_p(output));
     assert!(stream_advance_to_column(output, 3).unwrap());
-    stream_write_sequence(
-        output,
-        &[EgclVal::from_char('x'), EgclVal::from_char('y')],
-    )
-    .unwrap();
+    stream_write_sequence(output, &[EgclVal::from_char('x'), EgclVal::from_char('y')]).unwrap();
 
     let rendered = lisp_string_to_string(get_output_stream_string(output).unwrap());
     assert_eq!(rendered, "abc\n   xy");
@@ -442,12 +437,7 @@ fn robin_hood_growth_and_shrink_are_observable() {
     let initial_size = hash_table_size(table).unwrap();
 
     for i in 0..20 {
-        set_gethash(
-            EgclVal::from_fixnum(i),
-            table,
-            EgclVal::from_fixnum(i * 10),
-        )
-        .unwrap();
+        set_gethash(EgclVal::from_fixnum(i), table, EgclVal::from_fixnum(i * 10)).unwrap();
     }
     assert_eq!(hash_table_size(table).unwrap(), initial_size * 2);
     for i in 0..20 {

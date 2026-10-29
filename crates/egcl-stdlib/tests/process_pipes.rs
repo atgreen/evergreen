@@ -1,10 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-use std::io::{BufRead, Read, Write};
-use std::process::{Command, Stdio};
 use egcl_rt::value::{EOF, NIL};
 use egcl_stdlib::streams::*;
+use std::io::{BufRead, Read, Write};
+use std::process::{Command, Stdio};
 
 #[test]
 fn pipe_peer() {
@@ -110,10 +110,10 @@ fn string_text(value: egcl_rt::EgclVal) -> String {
 #[cfg(target_arch = "x86_64")]
 mod scheduling {
     use super::*;
+    use egcl_rt::thread::{FiberState, fiber_state, make_fiber};
+    use egcl_rt::{EgclVal, SchedulerConfig, SchedulerGroup};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::Duration;
-    use egcl_rt::thread::{FiberState, fiber_state, make_fiber};
-    use egcl_rt::{SchedulerConfig, SchedulerGroup, EgclVal};
 
     static PIN_CLOSE: AtomicBool = AtomicBool::new(false);
     static PRESSURE: AtomicBool = AtomicBool::new(false);
@@ -530,9 +530,9 @@ fn close_reports_broken_pipe_and_abort_releases_it() {
 /// stall in-process.
 #[test]
 fn a_parked_pipe_read_does_not_lock_other_threads_out_of_the_stream() {
+    use egcl_rt::EgclVal;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
-    use egcl_rt::EgclVal;
 
     const CHILD: &str = "EGCL_PARKED_PIPE_LOCK_CHILD";
     if std::env::var_os(CHILD).is_none() {

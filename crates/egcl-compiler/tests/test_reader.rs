@@ -680,10 +680,7 @@ fn read_sharpsign_complex_float() {
     let result = read_from_string("#C(1.0 2.0)");
     assert!(result.is_ok(), "#C(1.0 2.0) should parse successfully");
     let (v, _) = result.unwrap();
-    assert!(
-        egcl_rt::types::complexp(v),
-        "#C(1.0 2.0) should be complex"
-    );
+    assert!(egcl_rt::types::complexp(v), "#C(1.0 2.0) should be complex");
 }
 
 // ── #* bit-vectors (Issue #4) ────────────────────────────────────
@@ -707,10 +704,7 @@ fn read_sharpsign_empty_bitvector() {
         "#* (empty bit vector) should parse successfully"
     );
     let (v, _) = result.unwrap();
-    assert!(
-        egcl_rt::types::bit_vector_p(v),
-        "#* should be a bit vector"
-    );
+    assert!(egcl_rt::types::bit_vector_p(v), "#* should be a bit vector");
 }
 
 // ── #< unreadable object error (Issue #4) ────────────────────────

@@ -22,7 +22,9 @@ thread_local! {
 extern "C" fn initialize() -> *mut NativePollControl {
     CONTROL.with(Cell::get)
 }
-extern "C" fn unrelated_helper(_: *mut u64) -> u64 { NIL.0 }
+extern "C" fn unrelated_helper(_: *mut u64) -> u64 {
+    NIL.0
+}
 extern "C" fn poll(_: *mut u64) -> u64 {
     use egcl_rt::{Collector, HeapCollector};
     CALLS.with(|calls| calls.set(calls.get() + 1));
@@ -35,7 +37,10 @@ extern "C" fn poll(_: *mut u64) -> u64 {
 #[test]
 fn generated_loop_poll_checks_each_pending_source_and_reloads_moved_roots() {
     let execution = LispExecutionContext::new(ExecutionKind::NativeThread, 1, 1);
-    assert!(execution.begin_poll(), "new execution must enter through a poll");
+    assert!(
+        execution.begin_poll(),
+        "new execution must enter through a poll"
+    );
     let observer = Cell::new(0usize);
     let skips = Cell::new(0usize);
     let mut control = NativePollControl {
@@ -142,10 +147,20 @@ fn generated_loop_poll_checks_each_pending_source_and_reloads_moved_roots() {
                 egcl_compiler::t2::x64_calls::NativeCallOrigin::LoopPoll(_)
             ))
     );
-    for address in [fast.gc_requested, fast.sigusr1_pending, fast.posted_signal,
-        fast.native_errors, fast.signal_epoch] {
-        assert!(!framed.code.windows(8).any(|bytes| bytes == address.to_le_bytes()),
-            "generated poll must observe execution-local work, not a process-global source");
+    for address in [
+        fast.gc_requested,
+        fast.sigusr1_pending,
+        fast.posted_signal,
+        fast.native_errors,
+        fast.signal_epoch,
+    ] {
+        assert!(
+            !framed
+                .code
+                .windows(8)
+                .any(|bytes| bytes == address.to_le_bytes()),
+            "generated poll must observe execution-local work, not a process-global source"
+        );
     }
     let buffer = egcl_rt::jit::JitBuffer::new(&framed.code).unwrap();
     let run: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buffer.as_ptr()) };
@@ -171,7 +186,10 @@ fn generated_loop_poll_checks_each_pending_source_and_reloads_moved_roots() {
     check(true);
     assert!(execution.begin_poll());
     check(false);
-    assert!(other.poll_pending(), "draining this execution cannot acknowledge another");
+    assert!(
+        other.poll_pending(),
+        "draining this execution cannot acknowledge another"
+    );
     execution.request_yield();
     check(true);
     execution.take_yield_request();

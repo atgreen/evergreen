@@ -8,7 +8,7 @@
 
 use egcl_rt::error::EgclError;
 use egcl_rt::object::{ConsCell, ObjectHeader, type_id};
-use egcl_rt::value::{NIL, T, EgclVal};
+use egcl_rt::value::{EgclVal, NIL, T};
 
 // ── Internal helpers ──────────────────────────────────────────────
 
@@ -104,7 +104,9 @@ fn is_vector(v: EgclVal) -> bool {
 /// registry-backed sentinel (whose bits are a hash, never dereferenced) — or
 /// None for a non-string. Pathnames are excluded (they are not sequences).
 pub(crate) fn string_content(v: EgclVal) -> Option<String> {
-    if is_nil_sequence(v) { return (length(v).ok()? == 0).then(String::new); }
+    if is_nil_sequence(v) {
+        return (length(v).ok()? == 0).then(String::new);
+    }
     if crate::pathnames::is_pathname(v) {
         return None;
     }
@@ -139,7 +141,9 @@ pub fn string_char_at(v: EgclVal, index: usize) -> Option<char> {
 /// The character (not byte) length of a string sequence, or `None` if `v` is
 /// not a string. Simple strings store their character count in the payload.
 pub fn string_char_count(v: EgclVal) -> Option<usize> {
-    if is_nil_sequence(v) { return length(v).ok(); }
+    if is_nil_sequence(v) {
+        return length(v).ok();
+    }
     if v.is_string() {
         return Some(unsafe { egcl_rt::object::simple_string_char_count(v.as_ptr()) });
     }
@@ -212,7 +216,13 @@ fn reject_improper_tail(tail: EgclVal) -> Result<(), EgclError> {
 }
 
 fn collect_elements(sequence: EgclVal) -> Result<Vec<EgclVal>, EgclError> {
-    if is_nil_sequence(sequence) { return if length(sequence)? == 0 { Ok(Vec::new()) } else { Err(nil_element_error(sequence)) }; }
+    if is_nil_sequence(sequence) {
+        return if length(sequence)? == 0 {
+            Ok(Vec::new())
+        } else {
+            Err(nil_element_error(sequence))
+        };
+    }
     if sequence.is_nil() {
         return Ok(Vec::new());
     }
@@ -502,7 +512,10 @@ pub(crate) fn simple_vector_slots(v: EgclVal) -> Option<(*mut EgclVal, usize)> {
     }
     let ptr = unsafe { v.as_ptr() };
     let off = vector_payload_offset(ptr);
-    Some((unsafe { ptr.add(off + 8) } as *mut EgclVal, vector_length(v)))
+    Some((
+        unsafe { ptr.add(off + 8) } as *mut EgclVal,
+        vector_length(v),
+    ))
 }
 
 /// Atomically compare and exchange one SIMPLE-VECTOR element.
@@ -598,11 +611,7 @@ fn cvec_set_storage(v: EgclVal, storage: EgclVal) {
 /// The fill pointer (= active LENGTH) of a complex vector.
 #[inline]
 pub fn cvec_fill_pointer(v: EgclVal) -> usize {
-    unsafe {
-        (*(v.as_ptr().add(16) as *const EgclVal))
-            .as_fixnum()
-            .max(0) as usize
-    }
+    unsafe { (*(v.as_ptr().add(16) as *const EgclVal)).as_fixnum().max(0) as usize }
 }
 #[inline]
 fn cvec_set_fill_pointer_raw(v: EgclVal, n: usize) {
@@ -670,9 +679,12 @@ fn is_double_float_sequence(v: EgclVal) -> bool {
 
 fn set_double_float_array_element(v: EgclVal, index: usize, value: f64) -> bool {
     if is_complex_vector(v) {
-        if index >= cvec_capacity(v) { return false; }
+        if index >= cvec_capacity(v) {
+            return false;
+        }
         return match cvec_displacement(v) {
-            Some((base, offset, _)) => offset.checked_add(index)
+            Some((base, offset, _)) => offset
+                .checked_add(index)
                 .is_some_and(|index| set_double_float_array_element(base, index, value)),
             None => egcl_rt::packed_f64::set(cvec_storage(v), index, value),
         };
@@ -687,7 +699,10 @@ fn double_float_value(v: EgclVal) -> Result<f64, EgclError> {
     if v.is_double_float() {
         Ok(v.as_double_float())
     } else {
-        Err(EgclError::TypeError { datum: v, expected: "DOUBLE-FLOAT".into() })
+        Err(EgclError::TypeError {
+            datum: v,
+            expected: "DOUBLE-FLOAT".into(),
+        })
     }
 }
 
@@ -812,11 +827,7 @@ fn array_row_major_elt(base: EgclVal, index: usize) -> Result<EgclVal, EgclError
 }
 
 /// Row-major element write matching [`array_row_major_elt`].
-fn array_row_major_set_elt(
-    base: EgclVal,
-    index: usize,
-    value: EgclVal,
-) -> Result<(), EgclError> {
+fn array_row_major_set_elt(base: EgclVal, index: usize, value: EgclVal) -> Result<(), EgclError> {
     if is_complex_vector(base) {
         if let Some((inner, off, _)) = cvec_displacement(base) {
             return array_row_major_set_elt(inner, off + index, value);
@@ -838,7 +849,9 @@ fn array_row_major_set_elt(
 /// capacity, ignoring fill pointers), string, bit-vector, or multidimensional
 /// array. `None` when `v` is not an array.
 pub fn array_total_size(v: EgclVal) -> Option<usize> {
-    if let Some(length) = egcl_rt::nil_array::len(v) { return Some(length); }
+    if let Some(length) = egcl_rt::nil_array::len(v) {
+        return Some(length);
+    }
     if is_complex_vector(v) {
         return Some(cvec_capacity(v));
     }
@@ -1071,8 +1084,13 @@ pub fn build_double_float_displaced_vector(
             expected: "array with DOUBLE-FLOAT elements".into(),
         });
     }
-    if offset.checked_add(length).is_none_or(|end| end > array_total_size(base).unwrap()) {
-        return Err(EgclError::ProgramError("displaced array exceeds base storage".into()));
+    if offset
+        .checked_add(length)
+        .is_none_or(|end| end > array_total_size(base).unwrap())
+    {
+        return Err(EgclError::ProgramError(
+            "displaced array exceeds base storage".into(),
+        ));
     }
     Ok(build_complex_array_body(
         base,
@@ -1299,7 +1317,9 @@ pub fn build_md_array_from_elements(
 
 /// Build rank-zero or multidimensional packed DOUBLE-FLOAT storage.
 pub fn build_double_float_md_array(dims: &[usize], fill: f64) -> Result<EgclVal, EgclError> {
-    let total = dims.iter().try_fold(1usize, |n, d| n.checked_mul(*d))
+    let total = dims
+        .iter()
+        .try_fold(1usize, |n, d| n.checked_mul(*d))
         .ok_or(EgclError::Oom)?;
     let storage = egcl_rt::packed_f64::make(total, fill)?;
     build_md_array_with_storage(dims, storage)
@@ -1365,7 +1385,9 @@ pub fn set_fill_pointer(v: EgclVal, n: usize) -> Result<usize, EgclError> {
 /// CL `VECTOR-PUSH`: store `value` at the fill pointer and increment it. Returns
 /// the index used, or NIL if the vector is full (no extension).
 pub fn vector_push(v: EgclVal, value: EgclVal) -> Result<EgclVal, EgclError> {
-    if is_nil_array(v) { return Err(nil_element_error(value)); }
+    if is_nil_array(v) {
+        return Err(nil_element_error(value));
+    }
     if !is_complex_vector(v) {
         return Err(EgclError::TypeError {
             datum: v,
@@ -1388,7 +1410,9 @@ pub fn vector_push_extend(
     value: EgclVal,
     extension: Option<usize>,
 ) -> Result<EgclVal, EgclError> {
-    if is_nil_array(v) { return Err(nil_element_error(value)); }
+    if is_nil_array(v) {
+        return Err(nil_element_error(value));
+    }
     if !is_complex_vector(v) {
         return Err(EgclError::TypeError {
             datum: v,
@@ -1423,10 +1447,12 @@ pub fn vector_push_extend(
         if fp >= cap {
             if !cvec_adjustable(*v) {
                 return Err(EgclError::TypeError {
-                    datum: *v, expected: "adjustable vector".into(),
+                    datum: *v,
+                    expected: "adjustable vector".into(),
                 });
             }
-            let new_cap = cap.checked_add(extension.unwrap_or(cap.max(8)).max(1))
+            let new_cap = cap
+                .checked_add(extension.unwrap_or(cap.max(8)).max(1))
                 .ok_or(EgclError::Oom)?;
             resize_double_float_complex_vector(*v, new_cap, fp, 0.0)?;
         }
@@ -1885,7 +1911,9 @@ fn apply_fn(func: EgclVal, args: &[EgclVal]) -> EgclVal {
 
 /// Get the length of a sequence.
 pub fn length(sequence: EgclVal) -> Result<usize, EgclError> {
-    if let Some(length) = egcl_rt::nil_array::len(sequence) { return Ok(length); }
+    if let Some(length) = egcl_rt::nil_array::len(sequence) {
+        return Ok(length);
+    }
     if sequence.is_nil() {
         return Ok(0);
     }
@@ -1928,7 +1956,9 @@ pub fn length(sequence: EgclVal) -> Result<usize, EgclError> {
 
 /// Get element at index (CL `ELT`).
 pub fn elt(sequence: EgclVal, index: usize) -> Result<EgclVal, EgclError> {
-    if is_nil_array(sequence) { return Err(nil_element_error(EgclVal::from_fixnum(index as i64))); }
+    if is_nil_array(sequence) {
+        return Err(nil_element_error(EgclVal::from_fixnum(index as i64)));
+    }
     if sequence.is_nil() {
         return Err(EgclError::TypeError {
             datum: sequence,
@@ -1971,12 +2001,11 @@ pub fn elt(sequence: EgclVal, index: usize) -> Result<EgclVal, EgclError> {
             });
     }
     if egcl_rt::packed_f64::is_vector(sequence) {
-        let value = egcl_rt::packed_f64::get(sequence, index).ok_or_else(|| {
-            EgclError::TypeError {
+        let value =
+            egcl_rt::packed_f64::get(sequence, index).ok_or_else(|| EgclError::TypeError {
                 datum: sequence,
                 expected: "valid packed double-float array index".into(),
-            }
-        })?;
+            })?;
         return Ok(egcl_rt::gc::alloc_double_float(value));
     }
     if is_complex_vector(sequence) {
@@ -2116,7 +2145,9 @@ pub fn vector_octets(sequence: EgclVal, start: usize, end: usize) -> Option<Vec<
 }
 
 pub fn set_elt(sequence: EgclVal, index: usize, value: EgclVal) -> Result<(), EgclError> {
-    if is_nil_array(sequence) { return Err(nil_element_error(value)); }
+    if is_nil_array(sequence) {
+        return Err(nil_element_error(value));
+    }
     if is_vector(sequence) {
         let len = vector_length(sequence);
         if index >= len {
@@ -2287,7 +2318,12 @@ pub fn replace_direct(
 /// Boot FILL's native case: store ITEM in `seq[start..end]`, the caller
 /// having checked the bounds. Returns `false` without storing when `seq` is
 /// not a [`direct_vector`]. Nothing here allocates.
-pub fn fill_direct(seq: EgclVal, item: EgclVal, start: usize, end: usize) -> Result<bool, EgclError> {
+pub fn fill_direct(
+    seq: EgclVal,
+    item: EgclVal,
+    start: usize,
+    end: usize,
+) -> Result<bool, EgclError> {
     if !direct_vector(seq) {
         return Ok(false);
     }
@@ -2364,7 +2400,9 @@ pub fn search_direct(
 
 /// Copy a sequence (CL `COPY-SEQ`).
 pub fn copy_seq(sequence: EgclVal) -> Result<EgclVal, EgclError> {
-    if is_nil_sequence(sequence) { return subseq(sequence, 0, None); }
+    if is_nil_sequence(sequence) {
+        return subseq(sequence, 0, None);
+    }
     if is_u8_sequence(sequence) {
         return subseq(sequence, 0, None);
     }
@@ -2424,7 +2462,12 @@ pub fn subseq(sequence: EgclVal, start: usize, end: Option<usize>) -> Result<Egc
     if is_nil_sequence(sequence) {
         let len = length(sequence)?;
         let end = end.unwrap_or(len);
-        if start > end || end > len { return Err(EgclError::TypeError { datum: sequence, expected: "valid subsequence bounds".into() }); }
+        if start > end || end > len {
+            return Err(EgclError::TypeError {
+                datum: sequence,
+                expected: "valid subsequence bounds".into(),
+            });
+        }
         return egcl_rt::nil_array::make(end - start);
     }
     if is_u8_sequence(sequence) {
@@ -2551,7 +2594,9 @@ pub fn subseq(sequence: EgclVal, start: usize, end: Option<usize>) -> Result<Egc
 
 /// Reverse a sequence (non-destructive, CL `REVERSE`).
 pub fn reverse(sequence: EgclVal) -> Result<EgclVal, EgclError> {
-    if is_nil_sequence(sequence) { return subseq(sequence, 0, None); }
+    if is_nil_sequence(sequence) {
+        return subseq(sequence, 0, None);
+    }
     if is_u8_sequence(sequence) {
         return nreverse(subseq(sequence, 0, None)?);
     }
@@ -2580,7 +2625,9 @@ pub fn reverse(sequence: EgclVal) -> Result<EgclVal, EgclError> {
 
 /// Reverse a sequence destructively (CL `NREVERSE`).
 pub fn nreverse(sequence: EgclVal) -> Result<EgclVal, EgclError> {
-    if is_nil_sequence(sequence) { return Ok(sequence); }
+    if is_nil_sequence(sequence) {
+        return Ok(sequence);
+    }
     if is_u8_sequence(sequence) {
         let len = length(sequence)?;
         for i in 0..len / 2 {
@@ -2900,7 +2947,9 @@ fn is_sequence_result_type(result_type: EgclVal) -> bool {
     } else {
         return false;
     };
-    if !array_sequence_rank_is_valid(result_type) { return false; }
+    if !array_sequence_rank_is_valid(result_type) {
+        return false;
+    }
     matches!(
         egcl_compiler::reader::symbol_name(head).as_deref(),
         Some(
@@ -2926,15 +2975,32 @@ fn is_sequence_result_type(result_type: EgclVal) -> bool {
 /// Unspecified dimensions retain the existing general-array extension, while
 /// every explicit rank/list must permit a rank-one result.
 fn array_sequence_rank_is_valid(result_type: EgclVal) -> bool {
-    if !result_type.is_cons() { return true; }
+    if !result_type.is_cons() {
+        return true;
+    }
     let cell = unsafe { &*result_type.as_ptr().cast::<ConsCell>() };
-    if !cell.car.is_symbol() || !matches!(egcl_compiler::reader::symbol_name(cell.car.as_symbol_index()).as_deref(), Some("ARRAY" | "SIMPLE-ARRAY")) { return true; }
-    if !cell.cdr.is_cons() { return true; }
+    if !cell.car.is_symbol()
+        || !matches!(
+            egcl_compiler::reader::symbol_name(cell.car.as_symbol_index()).as_deref(),
+            Some("ARRAY" | "SIMPLE-ARRAY")
+        )
+    {
+        return true;
+    }
+    if !cell.cdr.is_cons() {
+        return true;
+    }
     let after_element = unsafe { (*cell.cdr.as_ptr().cast::<ConsCell>()).cdr };
-    if !after_element.is_cons() { return true; }
+    if !after_element.is_cons() {
+        return true;
+    }
     let dims = unsafe { (*after_element.as_ptr().cast::<ConsCell>()).car };
-    if dims.is_fixnum() { return dims.as_fixnum() == 1; }
-    if dims.is_nil() { return false; }
+    if dims.is_fixnum() {
+        return dims.as_fixnum() == 1;
+    }
+    if dims.is_nil() {
+        return false;
+    }
     if dims.is_cons() {
         return unsafe { (*dims.as_ptr().cast::<ConsCell>()).cdr.is_nil() };
     }
@@ -2946,7 +3012,10 @@ fn array_sequence_rank_is_valid(result_type: EgclVal) -> bool {
 pub fn validate_sequence_result_type(result_type: EgclVal, length: usize) -> Result<(), EgclError> {
     validate_sequence_array_rank(result_type)?;
     if !is_sequence_result_type(result_type) {
-        return Err(EgclError::TypeError { datum: result_type, expected: "sequence type specifier".into() });
+        return Err(EgclError::TypeError {
+            datum: result_type,
+            expected: "sequence type specifier".into(),
+        });
     }
     if let Some(declared) = declared_sequence_length(result_type)
         && declared != length
@@ -2954,7 +3023,9 @@ pub fn validate_sequence_result_type(result_type: EgclVal, length: usize) -> Res
         let size = i64::try_from(length)
             .ok()
             .filter(|size| *size <= egcl_rt::bignum::FIXNUM_MAX)
-            .ok_or_else(|| EgclError::ProgramError("sequence length exceeds fixnum range".into()))?;
+            .ok_or_else(|| {
+                EgclError::ProgramError("sequence length exceeds fixnum range".into())
+            })?;
         return Err(EgclError::TypeError {
             datum: EgclVal::from_fixnum(size),
             expected: format!("(EQL {declared})"),
@@ -2965,7 +3036,9 @@ pub fn validate_sequence_result_type(result_type: EgclVal, length: usize) -> Res
 
 /// Check only a stated array rank, leaving non-array coercions unchanged.
 pub fn validate_sequence_array_rank(result_type: EgclVal) -> Result<(), EgclError> {
-    if array_sequence_rank_is_valid(result_type) { Ok(()) } else {
+    if array_sequence_rank_is_valid(result_type) {
+        Ok(())
+    } else {
         // The invalid dimension slot is present when the classifier rejects a
         // rank. Report that rank, rather than a type-specifier list which can
         // itself satisfy a generic SEQUENCE expected type.
@@ -2986,11 +3059,17 @@ pub fn validate_sequence_array_rank(result_type: EgclVal) -> Result<(), EgclErro
                 cursor = unsafe { (*cursor.as_ptr().cast::<ConsCell>()).cdr };
             }
             if !cursor.is_nil() {
-                return Err(EgclError::TypeError { datum: cursor, expected: "NULL".into() });
+                return Err(EgclError::TypeError {
+                    datum: cursor,
+                    expected: "NULL".into(),
+                });
             }
             EgclVal::from_fixnum(count)
         };
-        Err(EgclError::TypeError { datum: rank, expected: "(EQL 1)".into() })
+        Err(EgclError::TypeError {
+            datum: rank,
+            expected: "(EQL 1)".into(),
+        })
     }
 }
 
@@ -3003,8 +3082,10 @@ pub fn result_type_is_double_float_vector(result_type: EgclVal) -> bool {
     if cell.car.tag() != egcl_rt::value::TAG_SYMBOL || !cell.cdr.is_cons() {
         return false;
     }
-    if !matches!(egcl_compiler::reader::symbol_name(cell.car.as_symbol_index()).as_deref(),
-        Some("VECTOR" | "ARRAY" | "SIMPLE-ARRAY")) {
+    if !matches!(
+        egcl_compiler::reader::symbol_name(cell.car.as_symbol_index()).as_deref(),
+        Some("VECTOR" | "ARRAY" | "SIMPLE-ARRAY")
+    ) {
         return false;
     }
     let mut element = unsafe { (*(cell.cdr.as_ptr() as *const ConsCell)).car };
@@ -3012,8 +3093,10 @@ pub fn result_type_is_double_float_vector(result_type: EgclVal) -> bool {
         element = unsafe { (*(element.as_ptr() as *const ConsCell)).car };
     }
     element.tag() == egcl_rt::value::TAG_SYMBOL
-        && matches!(egcl_compiler::reader::symbol_name(element.as_symbol_index()).as_deref(),
-            Some("DOUBLE-FLOAT" | "LONG-FLOAT"))
+        && matches!(
+            egcl_compiler::reader::symbol_name(element.as_symbol_index()).as_deref(),
+            Some("DOUBLE-FLOAT" | "LONG-FLOAT")
+        )
 }
 
 pub fn build_result_sequence(
@@ -3022,7 +3105,9 @@ pub fn build_result_sequence(
 ) -> Result<EgclVal, EgclError> {
     validate_sequence_result_type(result_type, elems.len())?;
     if result_type_is_nil_vector(result_type) {
-        if let Some(value) = elems.first() { return Err(nil_element_error(*value)); }
+        if let Some(value) = elems.first() {
+            return Err(nil_element_error(*value));
+        }
         return egcl_rt::nil_array::make(0);
     }
     if result_type_is_u8_vector(result_type) {
@@ -3085,16 +3170,19 @@ pub fn build_result_sequence(
 }
 
 fn build_packed_f64(values: &[EgclVal]) -> Result<EgclVal, EgclError> {
-    let raw: Vec<f64> = values.iter().map(|&value| {
-        if value.is_double_float() {
-            Ok(value.as_double_float())
-        } else {
-            Err(EgclError::TypeError {
-                datum: value,
-                expected: "DOUBLE-FLOAT".into(),
-            })
-        }
-    }).collect::<Result<_, _>>()?;
+    let raw: Vec<f64> = values
+        .iter()
+        .map(|&value| {
+            if value.is_double_float() {
+                Ok(value.as_double_float())
+            } else {
+                Err(EgclError::TypeError {
+                    datum: value,
+                    expected: "DOUBLE-FLOAT".into(),
+                })
+            }
+        })
+        .collect::<Result<_, _>>()?;
     let array = egcl_rt::packed_f64::make(raw.len(), 0.0)?;
     for (index, value) in raw.into_iter().enumerate() {
         egcl_rt::packed_f64::set(array, index, value);
@@ -3714,7 +3802,9 @@ fn small_unsigned_element_bits(spec: EgclVal) -> Option<u8> {
     fn parts(mut spec: EgclVal) -> Option<Vec<EgclVal>> {
         let mut result = Vec::new();
         while spec.is_cons() {
-            if result.len() == 4 { return None; }
+            if result.len() == 4 {
+                return None;
+            }
             let cell = unsafe { &*(spec.as_ptr() as *const ConsCell) };
             result.push(cell.car);
             spec = cell.cdr;
@@ -3722,28 +3812,46 @@ fn small_unsigned_element_bits(spec: EgclVal) -> Option<u8> {
         spec.is_nil().then_some(result)
     }
     fn bound(v: EgclVal, lower: bool) -> Option<i64> {
-        if v.is_fixnum() { return Some(v.as_fixnum()); }
+        if v.is_fixnum() {
+            return Some(v.as_fixnum());
+        }
         let values = parts(v)?;
-        if values.len() != 1 || !values[0].is_fixnum() { return None; }
-        if lower { values[0].as_fixnum().checked_add(1) } else { values[0].as_fixnum().checked_sub(1) }
+        if values.len() != 1 || !values[0].is_fixnum() {
+            return None;
+        }
+        if lower {
+            values[0].as_fixnum().checked_add(1)
+        } else {
+            values[0].as_fixnum().checked_sub(1)
+        }
     }
     // NIL and T are symbols semantically, but have their own immediate tags.
-    if spec.is_nil() || spec == T { return None; }
+    if spec.is_nil() || spec == T {
+        return None;
+    }
     if spec.is_symbol() {
-        return (egcl_compiler::reader::symbol_name(spec.as_symbol_index()).as_deref() == Some("BIT"))
-            .then_some(1);
+        return (egcl_compiler::reader::symbol_name(spec.as_symbol_index()).as_deref()
+            == Some("BIT"))
+        .then_some(1);
     }
     let values = parts(spec)?;
-    if values.is_empty() || !values[0].is_symbol() || values[0].is_nil() || values[0] == T { return None; }
-    let (lo, hi) = match egcl_compiler::reader::symbol_name(values[0].as_symbol_index()).as_deref() {
+    if values.is_empty() || !values[0].is_symbol() || values[0].is_nil() || values[0] == T {
+        return None;
+    }
+    let (lo, hi) = match egcl_compiler::reader::symbol_name(values[0].as_symbol_index()).as_deref()
+    {
         Some("UNSIGNED-BYTE") if values.len() == 2 && values[1].is_fixnum() => {
             let width = values[1].as_fixnum();
-            if !(0..=8).contains(&width) { return None; }
+            if !(0..=8).contains(&width) {
+                return None;
+            }
             (0, (1i64 << width) - 1)
         }
         Some("MOD") if values.len() == 2 && values[1].is_fixnum() => {
             let modulus = values[1].as_fixnum();
-            if !(1..=256).contains(&modulus) { return None; }
+            if !(1..=256).contains(&modulus) {
+                return None;
+            }
             (0, modulus - 1)
         }
         Some("INTEGER") if values.len() == 3 => (bound(values[1], true)?, bound(values[2], false)?),
@@ -3763,27 +3871,48 @@ pub fn u8_element_type_p(spec: EgclVal) -> bool {
 }
 
 pub fn result_type_is_u8_vector(result_type: EgclVal) -> bool {
-    if !result_type.is_cons() { return false; }
+    if !result_type.is_cons() {
+        return false;
+    }
     let cell = unsafe { &*(result_type.as_ptr() as *const ConsCell) };
-    if !cell.car.is_symbol() || !cell.cdr.is_cons() { return false; }
-    if !matches!(egcl_compiler::reader::symbol_name(cell.car.as_symbol_index()).as_deref(), Some("VECTOR" | "ARRAY" | "SIMPLE-ARRAY")) { return false; }
+    if !cell.car.is_symbol() || !cell.cdr.is_cons() {
+        return false;
+    }
+    if !matches!(
+        egcl_compiler::reader::symbol_name(cell.car.as_symbol_index()).as_deref(),
+        Some("VECTOR" | "ARRAY" | "SIMPLE-ARRAY")
+    ) {
+        return false;
+    }
     u8_element_type_p(unsafe { (*(cell.cdr.as_ptr() as *const ConsCell)).car })
 }
 
 /// SVREF is restricted to a general simple vector, unlike AREF.
 pub fn svref(vector: EgclVal, index: usize) -> Result<EgclVal, EgclError> {
-    if !is_vector(vector) { return Err(EgclError::TypeError { datum: vector, expected: "SIMPLE-VECTOR".into() }); }
+    if !is_vector(vector) {
+        return Err(EgclError::TypeError {
+            datum: vector,
+            expected: "SIMPLE-VECTOR".into(),
+        });
+    }
     elt(vector, index)
 }
 
 pub fn set_svref(vector: EgclVal, index: usize, value: EgclVal) -> Result<(), EgclError> {
-    if !is_vector(vector) { return Err(EgclError::TypeError { datum: vector, expected: "SIMPLE-VECTOR".into() }); }
+    if !is_vector(vector) {
+        return Err(EgclError::TypeError {
+            datum: vector,
+            expected: "SIMPLE-VECTOR".into(),
+        });
+    }
     set_aref(vector, index, value)
 }
 
 /// Whether the array's actual storage has no inhabitable element type.
 pub fn is_nil_array(value: EgclVal) -> bool {
-    if egcl_rt::nil_array::is_vector(value) { return true; }
+    if egcl_rt::nil_array::is_vector(value) {
+        return true;
+    }
     if is_complex_vector(value) {
         return unsafe { (*(value.as_ptr().add(32).cast::<EgclVal>())).as_fixnum() == 14 };
     }
@@ -3793,24 +3922,76 @@ pub fn is_nil_sequence(value: EgclVal) -> bool {
     !egcl_rt::types::md_array_p(value) && is_nil_array(value)
 }
 fn nil_element_error(datum: EgclVal) -> EgclError {
-    EgclError::TypeError { datum, expected: "NIL".into() }
+    EgclError::TypeError {
+        datum,
+        expected: "NIL".into(),
+    }
 }
-pub fn build_nil_complex_vector(capacity: usize, fill_pointer: usize, adjustable: bool, has_fill_pointer: bool) -> Result<EgclVal, EgclError> {
+pub fn build_nil_complex_vector(
+    capacity: usize,
+    fill_pointer: usize,
+    adjustable: bool,
+    has_fill_pointer: bool,
+) -> Result<EgclVal, EgclError> {
     egcl_rt::rooted!(storage = egcl_rt::nil_array::make(capacity)?);
-    Ok(build_complex_array_body(*storage, EgclVal::from_fixnum(fill_pointer.min(capacity) as i64), if adjustable { T } else { NIL }, EgclVal::from_fixnum(14), EgclVal::from_fixnum(i64::from(has_fill_pointer)), NIL, NIL))
+    Ok(build_complex_array_body(
+        *storage,
+        EgclVal::from_fixnum(fill_pointer.min(capacity) as i64),
+        if adjustable { T } else { NIL },
+        EgclVal::from_fixnum(14),
+        EgclVal::from_fixnum(i64::from(has_fill_pointer)),
+        NIL,
+        NIL,
+    ))
 }
-pub fn build_nil_displaced_vector(base: EgclVal, offset: usize, length: usize, fill_pointer: usize, adjustable: bool, has_fill_pointer: bool) -> Result<EgclVal, EgclError> {
-    if !is_nil_array(base) { return Err(nil_element_error(base)); }
-    if offset.checked_add(length).is_none_or(|end| end > array_total_size(base).unwrap()) { return Err(EgclError::ProgramError("displaced array exceeds base storage".into())); }
-    Ok(build_complex_array_body(base, EgclVal::from_fixnum(fill_pointer.min(length) as i64), if adjustable { T } else { NIL }, EgclVal::from_fixnum(14), EgclVal::from_fixnum(i64::from(has_fill_pointer)), EgclVal::from_fixnum(offset as i64), EgclVal::from_fixnum(length as i64)))
+pub fn build_nil_displaced_vector(
+    base: EgclVal,
+    offset: usize,
+    length: usize,
+    fill_pointer: usize,
+    adjustable: bool,
+    has_fill_pointer: bool,
+) -> Result<EgclVal, EgclError> {
+    if !is_nil_array(base) {
+        return Err(nil_element_error(base));
+    }
+    if offset
+        .checked_add(length)
+        .is_none_or(|end| end > array_total_size(base).unwrap())
+    {
+        return Err(EgclError::ProgramError(
+            "displaced array exceeds base storage".into(),
+        ));
+    }
+    Ok(build_complex_array_body(
+        base,
+        EgclVal::from_fixnum(fill_pointer.min(length) as i64),
+        if adjustable { T } else { NIL },
+        EgclVal::from_fixnum(14),
+        EgclVal::from_fixnum(i64::from(has_fill_pointer)),
+        EgclVal::from_fixnum(offset as i64),
+        EgclVal::from_fixnum(length as i64),
+    ))
 }
 
 /// Actual requested NIL element type, not a missing optional element slot.
 pub fn result_type_is_nil_vector(result_type: EgclVal) -> bool {
-    if !result_type.is_cons() { return false; }
-    let (head, tail) = unsafe { let cell = &*result_type.as_ptr().cast::<ConsCell>(); (cell.car, cell.cdr) };
-    if !tail.is_cons() || !head.is_symbol() { return false; }
+    if !result_type.is_cons() {
+        return false;
+    }
+    let (head, tail) = unsafe {
+        let cell = &*result_type.as_ptr().cast::<ConsCell>();
+        (cell.car, cell.cdr)
+    };
+    if !tail.is_cons() || !head.is_symbol() {
+        return false;
+    }
     let name = egcl_rt::symbols::symbol_name(head.as_symbol_index()).unwrap_or_default();
-    if !matches!(name.rsplit(':').next().unwrap_or(&name), "VECTOR" | "ARRAY" | "SIMPLE-ARRAY") { return false; }
+    if !matches!(
+        name.rsplit(':').next().unwrap_or(&name),
+        "VECTOR" | "ARRAY" | "SIMPLE-ARRAY"
+    ) {
+        return false;
+    }
     unsafe { (*tail.as_ptr().cast::<ConsCell>()).car.is_nil() }
 }

@@ -23,8 +23,8 @@
 //! function worth redefining. Confirmed on the device at the time: the symbol
 //! came back, FBOUNDP was true, and the old body kept drawing.
 
-use std::process::Command;
 use std::io::Write;
+use std::process::Command;
 
 const BIN: &str = env!("CARGO_BIN_EXE_egcl");
 

@@ -6,19 +6,58 @@ use std::process::Command;
 #[test]
 fn loop_finish_preserves_accumulation_and_lexical_scope() {
     let cases = [
-        ("(let ((n 0)) (loop repeat 5 do (incf n) (loop-finish)) n)", "1"),
-        ("(let ((n 0)) (loop for i from 0 below 5 do (incf n) (when (= i 2) (loop-finish))) n)", "3"),
-        ("(let ((n 0)) (loop for i in '(1 2 3 4) do (when (= i 3) (loop-finish)) (incf n i)) n)", "3"),
-        ("(let ((n 0)) (loop for tail on '(1 2 3 4) do (when (= (car tail) 3) (loop-finish)) (incf n (car tail))) n)", "3"),
-        ("(let ((n 0)) (loop while (< n 5) do (incf n) (loop-finish)) n)", "1"),
-        ("(let ((n 0)) (loop until (= n 5) do (incf n) (loop-finish)) n)", "1"),
-        ("(loop for i from 0 below 5 collect (if (= i 3) (loop-finish) i))", "(0 1 2)"),
-        ("(loop repeat 3 sum (loop repeat 5 sum (progn (loop-finish) 9)))", "0"),
-        ("(let ((n 0)) (loop repeat 3 do (flet ((done () (loop-finish))) (loop repeat 5 do (incf n) (done)))) n)", "1"),
-        ("(let ((n 0)) (loop repeat 3 do (let ((done (lambda () (loop-finish)))) (loop repeat 5 do (incf n) (funcall done)))) n)", "1"),
-        ("(let ((n 0)) (loop repeat 3 do (unwind-protect (loop-finish) (incf n)) finally (incf n 10)) n)", "11"),
-        ("(let ((n 0)) (loop repeat 3 do (loop (incf n) (loop-finish))) n)", "1"),
-        ("(let ((n 0)) (loop repeat 3 do (incf n) (hidden-finish) finally (incf n 10)) n)", "11"),
+        (
+            "(let ((n 0)) (loop repeat 5 do (incf n) (loop-finish)) n)",
+            "1",
+        ),
+        (
+            "(let ((n 0)) (loop for i from 0 below 5 do (incf n) (when (= i 2) (loop-finish))) n)",
+            "3",
+        ),
+        (
+            "(let ((n 0)) (loop for i in '(1 2 3 4) do (when (= i 3) (loop-finish)) (incf n i)) n)",
+            "3",
+        ),
+        (
+            "(let ((n 0)) (loop for tail on '(1 2 3 4) do (when (= (car tail) 3) (loop-finish)) (incf n (car tail))) n)",
+            "3",
+        ),
+        (
+            "(let ((n 0)) (loop while (< n 5) do (incf n) (loop-finish)) n)",
+            "1",
+        ),
+        (
+            "(let ((n 0)) (loop until (= n 5) do (incf n) (loop-finish)) n)",
+            "1",
+        ),
+        (
+            "(loop for i from 0 below 5 collect (if (= i 3) (loop-finish) i))",
+            "(0 1 2)",
+        ),
+        (
+            "(loop repeat 3 sum (loop repeat 5 sum (progn (loop-finish) 9)))",
+            "0",
+        ),
+        (
+            "(let ((n 0)) (loop repeat 3 do (flet ((done () (loop-finish))) (loop repeat 5 do (incf n) (done)))) n)",
+            "1",
+        ),
+        (
+            "(let ((n 0)) (loop repeat 3 do (let ((done (lambda () (loop-finish)))) (loop repeat 5 do (incf n) (funcall done)))) n)",
+            "1",
+        ),
+        (
+            "(let ((n 0)) (loop repeat 3 do (unwind-protect (loop-finish) (incf n)) finally (incf n 10)) n)",
+            "11",
+        ),
+        (
+            "(let ((n 0)) (loop repeat 3 do (loop (incf n) (loop-finish))) n)",
+            "1",
+        ),
+        (
+            "(let ((n 0)) (loop repeat 3 do (incf n) (hidden-finish) finally (incf n 10)) n)",
+            "11",
+        ),
     ];
     // Batch the cases in one process: bootstrap dominates GC-stress runtime.
     let mut program =
@@ -122,17 +161,50 @@ fn compiled_loop_finish_runs_finally() {
 /// caller's lexical macros, so a closure written in an outer LOOP finished the
 /// inner loop that called it (or failed to find its GO tag).
 const LEXICAL_FINISH_CASES: [(&str, &str); 11] = [
-    ("(let ((n 0)) (loop repeat 3 do (flet ((done () (loop-finish))) (loop repeat 5 do (incf n) (done)))) n)", "1"),
-    ("(let ((n 0)) (loop repeat 3 do (let ((done (lambda () (loop-finish)))) (loop repeat 5 do (incf n) (funcall done)))) n)", "1"),
-    ("(let ((n 0)) (loop repeat 3 do (labels ((done () (loop-finish))) (loop repeat 5 do (incf n) (done)))) n)", "1"),
-    ("(loop for i from 0 collect i do (lexical-finish-call (lambda () (when (= i 2) (loop-finish)))) finally (return (list :done i)))", "(:DONE 2)"),
-    ("(loop for i below 4 collect (let ((k (lambda () (loop-finish)))) (loop for j below 3 collect j do (when (and (= i 1) (= j 1)) (funcall k)))))", "((0 1 2))"),
-    ("(loop for x in '(1 2 3 4) sum x into s do (flet ((stop () (loop-finish))) (when (= x 2) (stop))) finally (return (list :sum s)))", "(:SUM 3)"),
-    ("(loop for i below 3 collect (loop for j from 0 collect j do (flet ((stop () (loop-finish))) (when (= j 1) (stop)))))", "((0 1) (0 1) (0 1))"),
-    ("(macrolet ((m () 1)) (let ((f (lambda () (m)))) (macrolet ((m () 2)) (funcall f))))", "1"),
-    ("(macrolet ((m () 1)) (flet ((f () (m))) (macrolet ((m () 2)) (f))))", "1"),
-    ("(let ((f (lambda () (lexical-finish-global)))) (macrolet ((lexical-finish-global () ''macro)) (funcall f)))", "GLOBAL"),
-    ("(let ((f (macrolet ((m () 1)) (flet ((g () (m))) #'g)))) (funcall f))", "1"),
+    (
+        "(let ((n 0)) (loop repeat 3 do (flet ((done () (loop-finish))) (loop repeat 5 do (incf n) (done)))) n)",
+        "1",
+    ),
+    (
+        "(let ((n 0)) (loop repeat 3 do (let ((done (lambda () (loop-finish)))) (loop repeat 5 do (incf n) (funcall done)))) n)",
+        "1",
+    ),
+    (
+        "(let ((n 0)) (loop repeat 3 do (labels ((done () (loop-finish))) (loop repeat 5 do (incf n) (done)))) n)",
+        "1",
+    ),
+    (
+        "(loop for i from 0 collect i do (lexical-finish-call (lambda () (when (= i 2) (loop-finish)))) finally (return (list :done i)))",
+        "(:DONE 2)",
+    ),
+    (
+        "(loop for i below 4 collect (let ((k (lambda () (loop-finish)))) (loop for j below 3 collect j do (when (and (= i 1) (= j 1)) (funcall k)))))",
+        "((0 1 2))",
+    ),
+    (
+        "(loop for x in '(1 2 3 4) sum x into s do (flet ((stop () (loop-finish))) (when (= x 2) (stop))) finally (return (list :sum s)))",
+        "(:SUM 3)",
+    ),
+    (
+        "(loop for i below 3 collect (loop for j from 0 collect j do (flet ((stop () (loop-finish))) (when (= j 1) (stop)))))",
+        "((0 1) (0 1) (0 1))",
+    ),
+    (
+        "(macrolet ((m () 1)) (let ((f (lambda () (m)))) (macrolet ((m () 2)) (funcall f))))",
+        "1",
+    ),
+    (
+        "(macrolet ((m () 1)) (flet ((f () (m))) (macrolet ((m () 2)) (f))))",
+        "1",
+    ),
+    (
+        "(let ((f (lambda () (lexical-finish-global)))) (macrolet ((lexical-finish-global () ''macro)) (funcall f)))",
+        "GLOBAL",
+    ),
+    (
+        "(let ((f (macrolet ((m () 1)) (flet ((g () (m))) #'g)))) (funcall f))",
+        "1",
+    ),
 ];
 
 const LEXICAL_FINISH_PRELUDE: &str = "(defun lexical-finish-call (f) (funcall f)) \

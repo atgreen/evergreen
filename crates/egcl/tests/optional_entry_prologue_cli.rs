@@ -93,20 +93,32 @@ fn assert_ok(output: &Output) {
 #[test]
 fn optional_parameters_bind_and_promote_from_source() {
     let dir = scratch("optional-prologue-source");
-    assert_ok(&egcl(&dir, &["--eval", r#"(load "definitions.lisp")"#, "--eval", CHECKS], &[]));
+    assert_ok(&egcl(
+        &dir,
+        &["--eval", r#"(load "definitions.lisp")"#, "--eval", CHECKS],
+        &[],
+    ));
 }
 
 #[test]
 fn optional_parameters_bind_and_promote_from_a_fasl() {
     let dir = scratch("optional-prologue-fasl");
-    let compiled = egcl(&dir, &["--eval", r#"(compile-file "definitions.lisp")"#], &[]);
+    let compiled = egcl(
+        &dir,
+        &["--eval", r#"(compile-file "definitions.lisp")"#],
+        &[],
+    );
     assert!(
         compiled.status.success(),
         "{}\n{}",
         String::from_utf8_lossy(&compiled.stdout),
         String::from_utf8_lossy(&compiled.stderr)
     );
-    assert_ok(&egcl(&dir, &["--eval", r#"(load "definitions.fasl")"#, "--eval", CHECKS], &[]));
+    assert_ok(&egcl(
+        &dir,
+        &["--eval", r#"(load "definitions.fasl")"#, "--eval", CHECKS],
+        &[],
+    ));
 }
 
 /// The prologue rewrite allocates while it builds the new lambda list and body.

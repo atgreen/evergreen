@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-use std::sync::{Mutex, OnceLock};
 use egcl_rt::gc;
 use egcl_rt::image::*;
+use std::sync::{Mutex, OnceLock};
 
 /// Serialize every test that touches the process-global heap (init_heap,
 /// record_object, restore_heap, save_image). The heap is a single

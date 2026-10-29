@@ -3,12 +3,12 @@
 
 //! Automatic nursery collection on the allocator slow path (bliss-5tb).
 
-use std::sync::{Mutex, OnceLock};
-use egcl_rt::value::{TAG_HEAP_OBJECT, TAG_MASK, EgclVal};
+use egcl_rt::value::{EgclVal, TAG_HEAP_OBJECT, TAG_MASK};
 use egcl_rt::{
-    Allocator, GcConfig, HeapAllocator, ShadowRootScope, EgclStack, alloc_typed, current_thread,
+    Allocator, EgclStack, GcConfig, HeapAllocator, ShadowRootScope, alloc_typed, current_thread,
     heap_stats, init_heap,
 };
+use std::sync::{Mutex, OnceLock};
 
 fn lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -98,7 +98,11 @@ fn native_blocking_publishes_roots_and_invalidates_collected_tlab() {
             .join()
             .unwrap();
     }
-    assert_ne!(value.to_raw(), original, "the collection must move the root");
+    assert_ne!(
+        value.to_raw(),
+        original,
+        "the collection must move the root"
+    );
     // Reenter before an allocation refreshes the stale allocator. Neither
     // publishing nor retiring roots may write through its old nursery cursor.
     {

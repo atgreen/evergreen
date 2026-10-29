@@ -42,12 +42,12 @@ pub mod conditions;
 // ── Streams ───────────────────────────────────────────────────────
 pub mod ffi;
 pub mod fibers;
-pub mod process;
 pub mod posix;
+pub mod process;
 pub mod streams;
 pub mod synchronization;
-pub mod threads;
 pub mod text_codec;
+pub mod threads;
 
 // ── Sequences & hash tables ───────────────────────────────────────
 pub mod hashtable;
@@ -57,9 +57,9 @@ pub mod sequences;
 pub mod format;
 
 // ── Pathnames ─────────────────────────────────────────────────────
+pub mod embedded_files;
 pub mod offheap_image;
 pub mod pathnames;
-pub mod embedded_files;
 
 // ── Readtables ────────────────────────────────────────────────────
 pub mod readtables;
@@ -146,28 +146,27 @@ pub use sequences::{
     cvec_capacity, cvec_char_contents, cvec_displacement, cvec_element, cvec_fill_pointer,
     cvec_has_fill_pointer, cvec_is_bit, cvec_is_string, elt, find, is_complex_vector, length, map,
     nreverse, position, reduce, remove, result_type_is_base_string, result_type_is_bit_vector,
-    result_type_is_string, reverse, set_aref, string_storage_is_base, set_elt, set_fill_pointer, sort, stable_sort, string_char_at, string_char_count,
-    string_set_char, subseq, substitute, vector_pop, vector_push, vector_push_extend,
+    result_type_is_string, reverse, set_aref, set_elt, set_fill_pointer, sort, stable_sort,
+    string_char_at, string_char_count, string_set_char, string_storage_is_base, subseq, substitute,
+    vector_pop, vector_push, vector_push_extend,
 };
 pub use streams::GrayStream;
 pub use streams::stream_class_name;
-pub use streams::{broadcast_stream_streams, concatenated_stream_streams, is_binary_stream};
 pub use streams::{
     ExternalFormat, StreamDirection, StreamElementType, close, file_length_fn, file_position,
     get_output_stream_string, input_stream_p, interactive_stream_p, is_byte_stream,
-    make_broadcast_stream, make_concatenated_stream, make_echo_stream, make_lisp_string,
-    make_lisp_base_string_fresh, make_lisp_string_fresh, make_lisp_string_fresh_like, make_stderr,
-    make_stdin, make_stdout,
-    make_string_input_stream, make_string_output_stream, make_synonym_stream, make_two_way_stream,
-    open, open_stream_p,
-    output_stream_p, set_file_position, set_file_position_to_end, socket_accept,
-    socket_close_listener, socket_connect, socket_listen, socket_listener_ready, socket_local_port,
-    stream_advance_to_column, stream_clear_input, stream_clear_output, stream_element_type,
-    stream_external_format, stream_finish_output, stream_force_output, stream_fresh_line,
-    stream_line_column, stream_line_number, stream_listen, stream_peek_char, stream_raw_fd,
-    stream_read_byte, stream_read_char, stream_read_char_no_hang, stream_read_line,
-    stream_read_sequence, stream_start_line_p, stream_terpri, stream_unread_char,
+    make_broadcast_stream, make_concatenated_stream, make_echo_stream, make_lisp_base_string_fresh,
+    make_lisp_string, make_lisp_string_fresh, make_lisp_string_fresh_like, make_stderr, make_stdin,
+    make_stdout, make_string_input_stream, make_string_output_stream, make_synonym_stream,
+    make_two_way_stream, open, open_stream_p, output_stream_p, set_file_position,
+    set_file_position_to_end, socket_accept, socket_close_listener, socket_connect, socket_listen,
+    socket_listener_ready, socket_local_port, stream_advance_to_column, stream_clear_input,
+    stream_clear_output, stream_element_type, stream_external_format, stream_finish_output,
+    stream_force_output, stream_fresh_line, stream_line_column, stream_line_number, stream_listen,
+    stream_peek_char, stream_raw_fd, stream_read_byte, stream_read_char, stream_read_char_no_hang,
+    stream_read_line, stream_read_sequence, stream_start_line_p, stream_terpri, stream_unread_char,
     stream_wait_for_input, stream_write_byte, stream_write_char, stream_write_sequence,
     stream_write_string, synonym_stream_symbol, two_way_stream_input_stream,
     two_way_stream_output_stream,
 };
+pub use streams::{broadcast_stream_streams, concatenated_stream_streams, is_binary_stream};

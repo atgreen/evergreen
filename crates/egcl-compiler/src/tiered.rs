@@ -42,13 +42,11 @@
 //! as calls, and there is no package system, no macros, and no standard
 //! library beyond what the caller defines into the environment.
 
+use egcl_rt::error::EgclError;
+use egcl_rt::value::{EgclVal, NIL_BITS, T_BITS, TAG_CONS, TAG_FUNCTION, TAG_SPECIAL, TAG_SYMBOL};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicU16, AtomicU32, Ordering};
-use egcl_rt::error::EgclError;
-use egcl_rt::value::{
-    NIL_BITS, T_BITS, TAG_CONS, TAG_FUNCTION, TAG_SPECIAL, TAG_SYMBOL, EgclVal,
-};
 
 // ── FnMeta: per-function metadata shared across tiers ──
 
@@ -741,9 +739,7 @@ impl Interpreter {
                 // (LAMBDA params body...) -> create interpreted closure
                 let args_vec = list_to_vec(args)?;
                 if args_vec.is_empty() {
-                    return Err(EgclError::Internal(
-                        "LAMBDA: missing parameter list".into(),
-                    ));
+                    return Err(EgclError::Internal("LAMBDA: missing parameter list".into()));
                 }
                 let params = args_vec[0];
                 // Count arity from param list

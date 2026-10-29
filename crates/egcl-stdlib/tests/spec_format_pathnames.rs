@@ -13,7 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use egcl_rt::error::EgclError;
 use egcl_rt::object::ConsCell;
 use egcl_rt::object::{ObjectHeader, type_id};
-use egcl_rt::value::{NIL, T, EgclVal};
+use egcl_rt::value::{EgclVal, NIL, T};
 use egcl_stdlib::{
     NewlineKind, TabKind, directory, ensure_directories_exist, format, get_output_stream_string,
     logical_pathname_translations, make_lisp_string, make_pathname, make_string_output_stream,

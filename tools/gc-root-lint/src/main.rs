@@ -392,11 +392,7 @@ fn local_is_typed_egclval(local: &syn::Local) -> bool {
     if let syn::Pat::Type(t) = &local.pat
         && let syn::Type::Path(p) = &*t.ty
     {
-        return p
-            .path
-            .segments
-            .last()
-            .is_some_and(|s| s.ident == "EgclVal");
+        return p.path.segments.last().is_some_and(|s| s.ident == "EgclVal");
     }
     false
 }

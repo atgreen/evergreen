@@ -57,8 +57,12 @@ fn a_mapped_caller_funcalls_an_installed_t2_object_through_its_fast_target() {
         mapped.lean_root_entry().is_some(),
         "the callee has a lean root entry"
     );
-    let (outer, outer_code) =
-        super::ordinary_t2::install("FC-KW", "(f a &key (b (1+ 0)))", "((funcall f a b))", &mut env);
+    let (outer, outer_code) = super::ordinary_t2::install(
+        "FC-KW",
+        "(f a &key (b (1+ 0)))",
+        "((funcall f a b))",
+        &mut env,
+    );
     let NativeCodeStorage::Mapped(mapped) = &outer_code._storage else {
         panic!("the caller needs mapped T2 code")
     };
@@ -78,8 +82,12 @@ fn a_mapped_caller_funcalls_an_installed_t2_object_through_its_fast_target() {
     let (fast, _) = funcall_fast::take_fast_calls_for_test();
     // One argument short: the fast target declines and the general route
     // signals the standard argument-count error.
-    let (one, _) =
-        super::ordinary_t2::install("FC-ONE", "(f a &key (b (1+ 0)))", "((funcall f a))", &mut env);
+    let (one, _) = super::ordinary_t2::install(
+        "FC-ONE",
+        "(f a &key (b (1+ 0)))",
+        "((funcall f a))",
+        &mut env,
+    );
     funcall_fast::take_fast_calls_for_test();
     let error = run_caller("FC-ARITY-CALLER", "((fc-one #'fc-inner n))", 1, &mut env);
     let (declined, _) = funcall_fast::take_fast_calls_for_test();
@@ -163,8 +171,12 @@ fn a_collection_retires_fast_targets() {
     )
     .unwrap();
     let (inner, _) = super::ordinary_t2::install("FG-INNER", "(a b)", "((+ a b))", &mut env);
-    let (outer, _) =
-        super::ordinary_t2::install("FG-KW", "(f a &key (b (1+ 0)))", "((funcall f a b))", &mut env);
+    let (outer, _) = super::ordinary_t2::install(
+        "FG-KW",
+        "(f a &key (b (1+ 0)))",
+        "((funcall f a b))",
+        &mut env,
+    );
     let first = run_caller("FG-CALLER", "((fg-kw #'fg-inner n :b 2))", 5, &mut env).unwrap();
     let function = egcl_rt::symbols::symbol_function(inner).unwrap();
     let cached = funcall_fast::is_cached_for_test(function);
@@ -247,33 +259,64 @@ fn ordinary_function_lookup_and_symbol_designators_avoid_per_call_runtime_entrie
          (defun fd-symbol (f) (let ((r nil))
                                (dotimes (i 1000 r) (setq r (funcall f i)))))",
         &mut env,
-    ).unwrap();
+    )
+    .unwrap();
     let (target, _) = super::ordinary_t2::install("FD-IDENTITY", "(x)", "(x)", &mut env);
     let (direct, _) = super::ordinary_t2::install(
-        "FD-DIRECT", "()",
-        "((let ((r nil)) (dotimes (i 1000 r) (setq r (fd-identity i)))))", &mut env,
+        "FD-DIRECT",
+        "()",
+        "((let ((r nil)) (dotimes (i 1000 r) (setq r (fd-identity i)))))",
+        &mut env,
     );
     let (local, local_code) = super::ordinary_t2::install(
-        "FD-LOCAL", "()",
+        "FD-LOCAL",
+        "()",
         "((let ((f #'fd-identity) (r nil)) (dotimes (i 1000 r) (setq r (funcall f i)))))",
         &mut env,
     );
     let (symbol, symbol_code) = super::ordinary_t2::install(
-        "FD-SYMBOL", "(f)",
-        "((let ((r nil)) (dotimes (i 1000 r) (setq r (funcall f i)))))", &mut env,
+        "FD-SYMBOL",
+        "(f)",
+        "((let ((r nil)) (dotimes (i 1000 r) (setq r (funcall f i)))))",
+        &mut env,
     );
     for code in [&local_code, &symbol_code] {
-        let NativeCodeStorage::Mapped(mapped) = &code._storage else { panic!("T2 fixture") };
-        assert!(mapped.ordinary_entry.is_some(), "both callers require an ordinary entry");
+        let NativeCodeStorage::Mapped(mapped) = &code._storage else {
+            panic!("T2 fixture")
+        };
+        assert!(
+            mapped.ordinary_entry.is_some(),
+            "both callers require an ordinary entry"
+        );
     }
     super::super::native_transfer_entry::ordinary_calls::take_named_entries_for_test();
-    egcl_rt::rooted!(control = run_caller("FD-DIRECT-CALLER", "((+ (fd-direct) (fd-direct)))", 1, &mut env).unwrap());
-    let baseline = super::super::native_transfer_entry::ordinary_calls::take_named_entries_for_test();
-    egcl_rt::rooted!(result = run_caller("FD-CALLER", "((+ (fd-local) (fd-symbol 'fd-identity)))", 1, &mut env).unwrap());
-    let entries = super::super::native_transfer_entry::ordinary_calls::take_named_entries_for_test();
+    egcl_rt::rooted!(
+        control = run_caller(
+            "FD-DIRECT-CALLER",
+            "((+ (fd-direct) (fd-direct)))",
+            1,
+            &mut env
+        )
+        .unwrap()
+    );
+    let baseline =
+        super::super::native_transfer_entry::ordinary_calls::take_named_entries_for_test();
+    egcl_rt::rooted!(
+        result = run_caller(
+            "FD-CALLER",
+            "((+ (fd-local) (fd-symbol 'fd-identity)))",
+            1,
+            &mut env
+        )
+        .unwrap()
+    );
+    let entries =
+        super::super::native_transfer_entry::ordinary_calls::take_named_entries_for_test();
     uninstall(&[target, direct, local, symbol]);
     assert_eq!(*control, EgclVal::from_fixnum(1998));
     assert_eq!(*result, *control);
-    assert!(entries <= baseline + 20,
-        "{entries} runtime entries versus {baseline} direct-call entries for 4000 calls");
+    assert!(
+        entries <= baseline + 20,
+        "{entries} runtime entries versus {baseline} direct-call entries for 4000 calls"
+    );
 }

@@ -15,12 +15,12 @@ use egcl_rt::lock_order::{
     LockLevel, OrderedExecutionMutex, OrderedExecutionMutexGuard, OrderedMutex,
 };
 
-#[cfg(all(test, target_arch = "x86_64", any(unix, windows)))]
-mod fiber_tests;
 #[cfg(test)]
 mod delegation_tests;
+#[cfg(all(test, target_arch = "x86_64", any(unix, windows)))]
+mod fiber_tests;
 use egcl_rt::object::{ObjectHeader, type_id};
-use egcl_rt::value::{EOF, NIL, T, EgclVal};
+use egcl_rt::value::{EOF, EgclVal, NIL, T};
 
 mod transport;
 use transport::StreamHandle;
@@ -117,7 +117,10 @@ pub enum StreamElementType {
     /// `(unsigned-byte BITS)` / `(signed-byte BITS)` for any other width.
     /// Each element occupies `BITS.div_ceil(8)` octets, little-endian, two's
     /// complement when signed (ansi streams open.*, file-length.*).
-    Integer { bits: u16, signed: bool },
+    Integer {
+        bits: u16,
+        signed: bool,
+    },
 }
 
 impl StreamElementType {
@@ -171,7 +174,15 @@ impl StreamElementType {
             StreamElementType::Character => "CHARACTER".into(),
             StreamElementType::UnsignedByte8 => "(UNSIGNED-BYTE 8)".into(),
             StreamElementType::Integer { bits, signed } => {
-                format!("({} {})", if signed { "SIGNED-BYTE" } else { "UNSIGNED-BYTE" }, bits)
+                format!(
+                    "({} {})",
+                    if signed {
+                        "SIGNED-BYTE"
+                    } else {
+                        "UNSIGNED-BYTE"
+                    },
+                    bits
+                )
             }
         }
     }
@@ -228,7 +239,11 @@ fn integer_to_octets(value: &egcl_rt::bignum::BigInt, bits: u16, signed: bool) -
         return None;
     }
     let limbs = twos_limbs(value, n_limbs.max(value.mag.len()));
-    Some((0..n_octets).map(|i| (limbs[i / 8] >> (8 * (i % 8))) as u8).collect())
+    Some(
+        (0..n_octets)
+            .map(|i| (limbs[i / 8] >> (8 * (i % 8))) as u8)
+            .collect(),
+    )
 }
 
 // ── if_exists keyword constants ───────────────────────────────────
@@ -483,11 +498,22 @@ impl StreamMutableState {
             return Ok(());
         }
         match &mut self.inner {
-            StreamInner::StringOutput { buffer, line, col, element } => {
+            StreamInner::StringOutput {
+                buffer,
+                line,
+                col,
+                element,
+            } => {
                 if *element == StringOutputElement::Nil {
-                    let datum = std::str::from_utf8(octets).ok().and_then(|text| text.chars().next()).map(EgclVal::from_char)
+                    let datum = std::str::from_utf8(octets)
+                        .ok()
+                        .and_then(|text| text.chars().next())
+                        .map(EgclVal::from_char)
                         .unwrap_or_else(|| EgclVal::from_fixnum(i64::from(octets[0])));
-                    return Err(EgclError::TypeError { datum, expected: "NIL".into() });
+                    return Err(EgclError::TypeError {
+                        datum,
+                        expected: "NIL".into(),
+                    });
                 }
                 buffer.extend_from_slice(octets);
                 advance_line_col(octets, line, col);
@@ -621,8 +647,9 @@ fn stdin_read_would_not_block() -> Result<bool, EgclError> {
         revents: 0,
     };
     // SAFETY: one descriptor, owned by the process for the duration of the call.
-    unsafe { egcl_rt::syscall::poll(&mut descriptor, 1, 0) }
-        .map_err(|errno| EgclError::StreamError(format!("read-char-no-hang: errno {}", errno.abs())))?;
+    unsafe { egcl_rt::syscall::poll(&mut descriptor, 1, 0) }.map_err(|errno| {
+        EgclError::StreamError(format!("read-char-no-hang: errno {}", errno.abs()))
+    })?;
     Ok(descriptor.revents & (POLLIN | POLLHUP | POLLERR) != 0)
 }
 
@@ -929,7 +956,10 @@ fn file_read_line_buffered(
 fn stream_io_error(operation: &str, error: std::io::Error) -> EgclError {
     let message = format!("{operation}: {error}");
     if error.kind() == std::io::ErrorKind::TimedOut {
-        EgclError::IoTimeout { stream: NIL, message }
+        EgclError::IoTimeout {
+            stream: NIL,
+            message,
+        }
     } else {
         EgclError::StreamError(message)
     }
@@ -985,7 +1015,14 @@ impl StreamMutableState {
                 external_format,
                 ..
             } => file_read_char_without_parking(
-                file, read_buf, buf_pos, buf_fill, line, col, unread, *external_format,
+                file,
+                read_buf,
+                buf_pos,
+                buf_fill,
+                line,
+                col,
+                unread,
+                *external_format,
             ),
             StreamInner::FileIo {
                 file,
@@ -1001,7 +1038,14 @@ impl StreamMutableState {
             } => {
                 file_flush_write_buf(file, write_buf)?;
                 file_read_char_without_parking(
-                    file, read_buf, buf_pos, buf_fill, line, col, unread, *external_format,
+                    file,
+                    read_buf,
+                    buf_pos,
+                    buf_fill,
+                    line,
+                    col,
+                    unread,
+                    *external_format,
                 )
             }
             _ => self.stream_read_char().map(InputStep::Done),
@@ -1037,9 +1081,7 @@ impl StreamMutableState {
                 buf_pos,
                 buf_fill,
                 ..
-            } if byte_stream => {
-                file_read_byte_without_parking(file, read_buf, buf_pos, buf_fill)
-            }
+            } if byte_stream => file_read_byte_without_parking(file, read_buf, buf_pos, buf_fill),
             _ => self.stream_read_byte().map(InputStep::Done),
         }
     }
@@ -1276,8 +1318,14 @@ fn file_flush_write_buf(file: &mut impl Write, write_buf: &mut Vec<u8>) -> Resul
 /// fixed-width chars, not UTF-8 bytes.
 fn extract_string_str(val: EgclVal) -> Result<String, EgclError> {
     if crate::sequences::is_nil_sequence(val) {
-        return if crate::sequences::length(val)? == 0 { Ok(String::new()) }
-            else { Err(EgclError::TypeError { datum: val, expected: "NIL".into() }) };
+        return if crate::sequences::length(val)? == 0 {
+            Ok(String::new())
+        } else {
+            Err(EgclError::TypeError {
+                datum: val,
+                expected: "NIL".into(),
+            })
+        };
     }
     if !val.is_heap_object() {
         return Err(EgclError::TypeError {
@@ -1341,7 +1389,15 @@ impl GrayStream for StreamMutableState {
                 external_format,
                 ..
             } => file_read_char_buffered(
-                file, read_buf, buf_pos, buf_fill, line, col, unread, true, *external_format,
+                file,
+                read_buf,
+                buf_pos,
+                buf_fill,
+                line,
+                col,
+                unread,
+                true,
+                *external_format,
             ),
             StreamInner::FileIo {
                 file,
@@ -1357,7 +1413,15 @@ impl GrayStream for StreamMutableState {
             } => {
                 file_flush_write_buf(file, write_buf)?;
                 file_read_char_buffered(
-                    file, read_buf, buf_pos, buf_fill, line, col, unread, true, *external_format,
+                    file,
+                    read_buf,
+                    buf_pos,
+                    buf_fill,
+                    line,
+                    col,
+                    unread,
+                    true,
+                    *external_format,
                 )
             }
             // Issue #1: Handle TwoWay and Echo as separate arms to avoid
@@ -1567,8 +1631,18 @@ impl GrayStream for StreamMutableState {
         let mut comps = self.components().to_vec();
         egcl_rt::rooted_ref!(_components_root = &mut comps);
         match &mut self.inner {
-            StreamInner::StringOutput { buffer, line, col, element } => {
-                if *element == StringOutputElement::Nil { return Err(EgclError::TypeError { datum: ch, expected: "NIL".into() }); }
+            StreamInner::StringOutput {
+                buffer,
+                line,
+                col,
+                element,
+            } => {
+                if *element == StringOutputElement::Nil {
+                    return Err(EgclError::TypeError {
+                        datum: ch,
+                        expected: "NIL".into(),
+                    });
+                }
                 let mut buf = [0u8; 4];
                 let encoded = c.encode_utf8(&mut buf);
                 buffer.extend_from_slice(encoded.as_bytes());
@@ -1708,8 +1782,18 @@ impl GrayStream for StreamMutableState {
         let mut comps = self.components().to_vec();
         egcl_rt::rooted_ref!(_components_root = &mut comps);
         match &mut self.inner {
-            StreamInner::StringOutput { buffer, line, col, element } => {
-                if *element == StringOutputElement::Nil { return Err(EgclError::TypeError { datum: byte, expected: "NIL".into() }); }
+            StreamInner::StringOutput {
+                buffer,
+                line,
+                col,
+                element,
+            } => {
+                if *element == StringOutputElement::Nil {
+                    return Err(EgclError::TypeError {
+                        datum: byte,
+                        expected: "NIL".into(),
+                    });
+                }
                 buffer.push(b);
                 if b == b'\n' {
                     *line += 1;
@@ -1806,8 +1890,18 @@ impl GrayStream for StreamMutableState {
         let mut comps = self.components().to_vec();
         egcl_rt::rooted_ref!(_components_root = &mut comps);
         match &mut self.inner {
-            StreamInner::StringOutput { buffer, line, col, element } => {
-                if *element == StringOutputElement::Nil && !slice.is_empty() { return Err(EgclError::TypeError { datum: EgclVal::from_char(str_slice.chars().next().unwrap()), expected: "NIL".into() }); }
+            StreamInner::StringOutput {
+                buffer,
+                line,
+                col,
+                element,
+            } => {
+                if *element == StringOutputElement::Nil && !slice.is_empty() {
+                    return Err(EgclError::TypeError {
+                        datum: EgclVal::from_char(str_slice.chars().next().unwrap()),
+                        expected: "NIL".into(),
+                    });
+                }
                 buffer.extend_from_slice(slice);
                 for c in str_slice.chars() {
                     if c == '\n' {
@@ -2014,7 +2108,9 @@ impl GrayStream for StreamMutableState {
             }
             StreamInner::Concatenated { cursor } => Ok(*cursor < comps.len()),
             StreamInner::Echo { unread: Some(_) } => Ok(true),
-            StreamInner::TwoWay | StreamInner::Echo { .. } => crate::streams::stream_listen(comps[0]),
+            StreamInner::TwoWay | StreamInner::Echo { .. } => {
+                crate::streams::stream_listen(comps[0])
+            }
             StreamInner::Synonym => {
                 let target = resolve_synonym(comps[0])?;
                 crate::streams::stream_listen(target)
@@ -2081,7 +2177,15 @@ impl GrayStream for StreamMutableState {
                 // Do not flush pending writes: a NO-HANG input call must not
                 // block on a peer that has stopped reading our output.
                 return file_read_char_buffered(
-                    file, read_buf, buf_pos, buf_fill, line, col, unread, false, *external_format,
+                    file,
+                    read_buf,
+                    buf_pos,
+                    buf_fill,
+                    line,
+                    col,
+                    unread,
+                    false,
+                    *external_format,
                 );
             }
         }
@@ -2147,7 +2251,14 @@ impl GrayStream for StreamMutableState {
                 )
             {
                 return file_read_line_buffered(
-                    file, read_buf, buf_pos, buf_fill, line, col, unread, *external_format,
+                    file,
+                    read_buf,
+                    buf_pos,
+                    buf_fill,
+                    line,
+                    col,
+                    unread,
+                    *external_format,
                 );
             }
         }
@@ -2607,8 +2718,12 @@ fn alloc_stream(
     // finalizer (registered below) drops the box when the stream becomes
     // unreachable — closing the fd and warning if it was an unclosed file
     // stream (R5.121, egcl-jtc.7a).
-    let body = egcl_rt::gc::alloc_typed(8, type_id::STREAM)
-        .unwrap_or_else(|| panic!("{}", egcl_rt::gc::allocation_failure_message("stream handle")));
+    let body = egcl_rt::gc::alloc_typed(8, type_id::STREAM).unwrap_or_else(|| {
+        panic!(
+            "{}",
+            egcl_rt::gc::allocation_failure_message("stream handle")
+        )
+    });
     // The handle is now the traceable owner. Publish any component forwarding
     // performed while it was being allocated before exposing the handle.
     for (component, root) in boxed.components.iter_mut().zip(component_roots.iter()) {
@@ -2922,7 +3037,10 @@ fn missing_file_policy(if_does_not_exist: EgclVal, path_str: &str) -> Result<(),
     if if_does_not_exist == IF_DOES_NOT_EXIST_CREATE_VAL {
         return Ok(());
     }
-    Err(EgclError::FileError(format!("file not found: {}", path_str)))
+    Err(EgclError::FileError(format!(
+        "file not found: {}",
+        path_str
+    )))
 }
 
 pub fn open(
@@ -2987,22 +3105,24 @@ fn open_file(
                 path_str
             )));
         }
-        egcl_rt::rooted!(stream = alloc_stream(
-            elt,
-            StreamInner::FileInput {
-                file: StreamHandle::Memory(std::io::Cursor::new(bytes)),
-                read_buf: Vec::with_capacity(FILE_BUF_SIZE),
-                buf_pos: 0,
-                buf_fill: 0,
-                line: 0,
-                col: 0,
-                unread: None,
-                external_format,
-                element_type: elt,
-            },
-            vec![],
-            Some(absolute_path),
-        ));
+        egcl_rt::rooted!(
+            stream = alloc_stream(
+                elt,
+                StreamInner::FileInput {
+                    file: StreamHandle::Memory(std::io::Cursor::new(bytes)),
+                    read_buf: Vec::with_capacity(FILE_BUF_SIZE),
+                    buf_pos: 0,
+                    buf_fill: 0,
+                    line: 0,
+                    col: 0,
+                    unread: None,
+                    external_format,
+                    element_type: elt,
+                },
+                vec![],
+                Some(absolute_path),
+            )
+        );
         if direction == StreamDirection::Probe {
             close(*stream, false)?;
         }
@@ -3031,7 +3151,9 @@ fn open_file(
                             .create(true)
                             .truncate(false)
                             .open(path)
-                            .map_err(|e| EgclError::FileError(format!("cannot create file: {}", e)))?
+                            .map_err(|e| {
+                                EgclError::FileError(format!("cannot create file: {}", e))
+                            })?
                     } else {
                         return Err(EgclError::FileError(format!(
                             "file not found: {}",
@@ -3043,22 +3165,24 @@ fn open_file(
                     return Err(EgclError::FileError(format!("cannot open file: {}", e)));
                 }
             };
-            egcl_rt::rooted!(stream = alloc_stream(
-                elt,
-                StreamInner::FileInput {
-                    file: StreamHandle::File(file),
-                    read_buf: Vec::with_capacity(FILE_BUF_SIZE),
-                    buf_pos: 0,
-                    buf_fill: 0,
-                    line: 0,
-                    col: 0,
-                    unread: None,
-                    external_format,
-                    element_type: elt,
-                },
-                vec![],
-                Some(absolute_path),
-            ));
+            egcl_rt::rooted!(
+                stream = alloc_stream(
+                    elt,
+                    StreamInner::FileInput {
+                        file: StreamHandle::File(file),
+                        read_buf: Vec::with_capacity(FILE_BUF_SIZE),
+                        buf_pos: 0,
+                        buf_fill: 0,
+                        line: 0,
+                        col: 0,
+                        unread: None,
+                        external_format,
+                        element_type: elt,
+                    },
+                    vec![],
+                    Some(absolute_path),
+                )
+            );
             if direction == StreamDirection::Probe {
                 close(*stream, false)?;
             }
@@ -3244,13 +3368,28 @@ pub fn make_string_input_stream(
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
-pub enum StringOutputElement { Character, BaseChar, Nil }
+pub enum StringOutputElement {
+    Character,
+    BaseChar,
+    Nil,
+}
 
 /// Explicit public flavor; internal NIL-placeholder callers retain the
 /// historical CHARACTER default of make_string_output_stream.
-pub fn make_string_output_stream_with_element(element: StringOutputElement) -> Result<EgclVal, EgclError> {
-    Ok(alloc_stream(StreamElementType::Character,
-        StreamInner::StringOutput { buffer: Vec::new(), line: 0, col: 0, element }, vec![], None))
+pub fn make_string_output_stream_with_element(
+    element: StringOutputElement,
+) -> Result<EgclVal, EgclError> {
+    Ok(alloc_stream(
+        StreamElementType::Character,
+        StreamInner::StringOutput {
+            buffer: Vec::new(),
+            line: 0,
+            col: 0,
+            element,
+        },
+        vec![],
+        None,
+    ))
 }
 
 pub fn make_string_output_stream(_element_type: EgclVal) -> Result<EgclVal, EgclError> {
@@ -3261,12 +3400,21 @@ pub fn make_string_output_stream(_element_type: EgclVal) -> Result<EgclVal, Egcl
 /// SIMPLE-BASE-STRING when `base` (its element type is a subtype of BASE-CHAR)
 /// and a CHARACTER string otherwise.
 pub fn make_string_output_stream_of(base: bool) -> Result<EgclVal, EgclError> {
-    make_string_output_stream_with_element(if base { StringOutputElement::BaseChar } else { StringOutputElement::Character })
+    make_string_output_stream_with_element(if base {
+        StringOutputElement::BaseChar
+    } else {
+        StringOutputElement::Character
+    })
 }
 
 pub fn get_output_stream_string(stream: EgclVal) -> Result<EgclVal, EgclError> {
     with_stream(stream, |guard| match &mut guard.inner {
-        StreamInner::StringOutput { buffer, col, line, element } => {
+        StreamInner::StringOutput {
+            buffer,
+            col,
+            line,
+            element,
+        } => {
             let s = std::str::from_utf8(buffer)
                 .map_err(|_| EgclError::StreamError("invalid UTF-8 in output buffer".into()))?;
             // A fresh heap string: CLHS requires a new string, and an interned
@@ -3276,7 +3424,9 @@ pub fn get_output_stream_string(stream: EgclVal) -> Result<EgclVal, EgclError> {
             // as long as everything written to it really is a base char.
             let result = if *element == StringOutputElement::Nil {
                 egcl_rt::nil_array::make(0)?
-            } else if *element == StringOutputElement::BaseChar && egcl_rt::object::is_all_base_char(s) {
+            } else if *element == StringOutputElement::BaseChar
+                && egcl_rt::object::is_all_base_char(s)
+            {
                 make_lisp_base_string_fresh(s)
             } else {
                 make_lisp_string_fresh(s)
@@ -3566,9 +3716,7 @@ fn composite_read_char(stream: EgclVal) -> Result<EgclVal, EgclError> {
                 // was first read; return it without echoing it again.
                 StreamInner::Echo { unread: Some(_) } => CompositeByteRead::InMutex,
                 StreamInner::Echo { .. } => CompositeByteRead::Echo(comps[0], comps[1]),
-                StreamInner::Synonym => {
-                    CompositeByteRead::Delegate(resolve_synonym(comps[0])?)
-                }
+                StreamInner::Synonym => CompositeByteRead::Delegate(resolve_synonym(comps[0])?),
                 StreamInner::Concatenated { cursor } => {
                     if *cursor < comps.len() {
                         CompositeByteRead::Concatenated(comps[*cursor], *cursor)
@@ -3768,7 +3916,6 @@ pub fn is_binary_stream(stream: EgclVal) -> bool {
         };
     }
 }
-
 
 pub fn stream_write_char(stream: EgclVal, ch: EgclVal) -> Result<(), EgclError> {
     let mut ch = ch;
@@ -4516,11 +4663,12 @@ impl SocketListener {
         self.check_open()?;
         // Each parked operation needs its own poller registration. Duplicates
         // share the listening socket and its shutdown, but have distinct fds.
-        let waiter = self.socket.try_clone()
+        let waiter = self
+            .socket
+            .try_clone()
             .map_err(|e| socket_error("socket listener wait", e))?;
-        let ready = egcl_rt::sync::wait_fd(
-            waiter.as_raw_fd(), egcl_rt::sync::IoInterest::Read, timeout,
-        )?;
+        let ready =
+            egcl_rt::sync::wait_fd(waiter.as_raw_fd(), egcl_rt::sync::IoInterest::Read, timeout)?;
         self.check_open()?;
         Ok(ready)
     }
@@ -4589,8 +4737,8 @@ pub fn socket_listen_with_options(
         }
         Err(last_error)
     };
-    let listener = bind()
-        .map_err(|e| socket_error(format_args!("socket-listen {host}:{port}"), e))?;
+    let listener =
+        bind().map_err(|e| socket_error(format_args!("socket-listen {host}:{port}"), e))?;
     #[cfg(unix)]
     listener
         .set_nonblocking(true)
@@ -4910,10 +5058,7 @@ pub fn stream_raw_fd(stream: EgclVal) -> Option<i32> {
 
 /// Wait for buffered or OS input, including EOF. Duplicate the handle under
 /// the lock so a concurrent CLOSE cannot recycle it while the wait is running.
-pub fn stream_wait_for_input(
-    stream: EgclVal,
-    timeout_ms: Option<i32>,
-) -> Result<bool, EgclError> {
+pub fn stream_wait_for_input(stream: EgclVal, timeout_ms: Option<i32>) -> Result<bool, EgclError> {
     egcl_rt::rooted!(stream = stream);
     let handle = {
         let guard = lock_stream(*stream)?;

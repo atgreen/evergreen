@@ -109,14 +109,14 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::t2::frame_state::{FrameScope, FrameState, ValueSource};
 use crate::t2::inlining::{
-    body_cost, decide, metadata_for_symbol, InlineDecision, InlineOptions, InlinePolicy,
-    IntrinsicId,
+    InlineDecision, InlineOptions, InlinePolicy, IntrinsicId, body_cost, decide,
+    metadata_for_symbol,
 };
 use crate::t2::ir::{
     AuxData, Block, Function, IRType, Inst, InstData, InstFlags, Opcode, TypeBits, Value,
     ValueRepresentation,
 };
-use egcl_rt::bytecode::{typep_class, BytecodeFunction, DeclaredType, Instr, VarLoc};
+use egcl_rt::bytecode::{BytecodeFunction, DeclaredType, Instr, VarLoc, typep_class};
 
 /// Why the builder could not produce IR for a function (e.g. an opcode not yet
 /// modelled). The caller keeps such a function at T1.
@@ -165,14 +165,21 @@ pub fn build_from_snapshot(
     if options.root_symbol().is_none() {
         return Err(BuildError::Unsupported("snapshot requires a root symbol"));
     }
-    build_from_bytecode_with_inline_options(&snapshot.body, options.with_constant_snapshot(snapshot))
+    build_from_bytecode_with_inline_options(
+        &snapshot.body,
+        options.with_constant_snapshot(snapshot),
+    )
 }
 
 pub fn build_for_transfer_optimization_snapshot(
     snapshot: &super::constants::BytecodeSnapshot,
     symbol: u32,
 ) -> Result<Function, BuildError> {
-    build_for_transfer_optimization_snapshot_with_inline_options(snapshot, symbol, InlineOptions::default())
+    build_for_transfer_optimization_snapshot_with_inline_options(
+        snapshot,
+        symbol,
+        InlineOptions::default(),
+    )
 }
 
 pub fn build_for_transfer_optimization_snapshot_with_inline_options(
@@ -180,14 +187,22 @@ pub fn build_for_transfer_optimization_snapshot_with_inline_options(
     symbol: u32,
     options: InlineOptions,
 ) -> Result<Function, BuildError> {
-    build_for_transfer_optimization_with_inline_options(&snapshot.body, symbol, options.with_constant_snapshot(snapshot))
+    build_for_transfer_optimization_with_inline_options(
+        &snapshot.body,
+        symbol,
+        options.with_constant_snapshot(snapshot),
+    )
 }
 
 pub fn build_for_native_scope_optimization_snapshot(
     snapshot: &super::constants::BytecodeSnapshot,
     symbol: u32,
 ) -> Result<Function, BuildError> {
-    build_for_native_scope_optimization_snapshot_with_inline_options(snapshot, symbol, InlineOptions::default())
+    build_for_native_scope_optimization_snapshot_with_inline_options(
+        snapshot,
+        symbol,
+        InlineOptions::default(),
+    )
 }
 
 pub fn build_for_native_scope_optimization_snapshot_with_inline_options(
@@ -195,7 +210,11 @@ pub fn build_for_native_scope_optimization_snapshot_with_inline_options(
     symbol: u32,
     options: InlineOptions,
 ) -> Result<Function, BuildError> {
-    build_for_native_scope_optimization_with_inline_options(&snapshot.body, symbol, options.with_constant_snapshot(snapshot))
+    build_for_native_scope_optimization_with_inline_options(
+        &snapshot.body,
+        symbol,
+        options.with_constant_snapshot(snapshot),
+    )
 }
 
 pub fn build_from_bytecode_for_native_cleanups_snapshot(
@@ -296,20 +315,35 @@ pub fn legalize_transfer_calls(f: &mut Function, scopes: &ScopeMap) -> Result<()
         .block_order()
         .iter()
         .flat_map(|&b| f.block(b).insts.iter().copied())
-        .filter(|&i| matches!(f.inst(i).opcode,
-            Opcode::Call | Opcode::SymbolValue | Opcode::SetSymbolValue | Opcode::SymbolFunction))
+        .filter(|&i| {
+            matches!(
+                f.inst(i).opcode,
+                Opcode::Call
+                    | Opcode::SymbolValue
+                    | Opcode::SetSymbolValue
+                    | Opcode::SymbolFunction
+            )
+        })
         .collect();
     for call in calls {
         let operation = f.inst(call).opcode;
         if operation != Opcode::Call {
             let AuxData::SymbolRef(symbol) = f.inst(call).aux else {
-                return Err(BuildError::Unsupported("symbol operation without symbol identity"));
+                return Err(BuildError::Unsupported(
+                    "symbol operation without symbol identity",
+                ));
             };
             let data = f.inst_mut(call);
             data.opcode = Opcode::Call;
             data.aux = match operation {
-                Opcode::SymbolValue => AuxData::GlobalValue { symbol, store: false },
-                Opcode::SetSymbolValue => AuxData::GlobalValue { symbol, store: true },
+                Opcode::SymbolValue => AuxData::GlobalValue {
+                    symbol,
+                    store: false,
+                },
+                Opcode::SetSymbolValue => AuxData::GlobalValue {
+                    symbol,
+                    store: true,
+                },
                 Opcode::SymbolFunction => AuxData::FunctionLookup(symbol),
                 _ => unreachable!(),
             };
@@ -469,7 +503,13 @@ fn build_with_saved_bodies(
             // an independent copy of the available growth allowance.
             *remaining_budget -= cost;
             let callee = build_with_saved_bodies(
-                &body, options, Some(symbol), depth + 1, remaining_budget, active, false,
+                &body,
+                options,
+                Some(symbol),
+                depth + 1,
+                remaining_budget,
+                active,
+                false,
             )?;
             check_self_inline_arguments(&mut f, call, &body)?;
             callee
@@ -477,7 +517,13 @@ fn build_with_saved_bodies(
             active.insert(symbol);
             let mut callee_budget = *remaining_budget;
             let callee = build_with_saved_bodies(
-                &body, options, Some(symbol), depth + 1, &mut callee_budget, active, false,
+                &body,
+                options,
+                Some(symbol),
+                depth + 1,
+                &mut callee_budget,
+                active,
+                false,
             )?;
             active.remove(&symbol);
             // Every cloned FrameState is prefixed with the suspended caller,
@@ -509,7 +555,10 @@ fn build_with_saved_bodies(
 /// that `Function::inline_call` would clone with the caller's scopes prefixed.
 fn has_deopt_point(f: &Function) -> bool {
     f.reverse_postorder().iter().any(|&block| {
-        f.block(block).insts.iter().any(|&inst| f.inst(inst).frame_state.is_some())
+        f.block(block)
+            .insts
+            .iter()
+            .any(|&inst| f.inst(inst).frame_state.is_some())
     })
 }
 
@@ -537,10 +586,14 @@ fn self_inline_cost(body: &BytecodeFunction) -> Option<u32> {
     {
         return None;
     }
-    let charged = body.code.iter().filter(|op| !matches!(op, Instr::ClearMv)).count();
-    u32::try_from(charged).ok()?.checked_add(
-        u32::try_from(body.param_types.iter().filter(|ty| !ty.is_any()).count()).ok()?,
-    )
+    let charged = body
+        .code
+        .iter()
+        .filter(|op| !matches!(op, Instr::ClearMv))
+        .count();
+    u32::try_from(charged)
+        .ok()?
+        .checked_add(u32::try_from(body.param_types.iter().filter(|ty| !ty.is_any()).count()).ok()?)
 }
 
 /// An erased call must still establish the declared callee-entry facts. Failure
@@ -553,28 +606,53 @@ fn check_self_inline_arguments(
     body: &BytecodeFunction,
 ) -> Result<(), BuildError> {
     let data = f.inst(call).clone();
-    let (block, mut position) = f.block_order().iter().find_map(|&block| {
-        f.block(block).insts.iter().position(|&inst| inst == call).map(|at| (block, at))
-    }).ok_or(BuildError::Unsupported("self-inline call is absent from layout"))?;
+    let (block, mut position) = f
+        .block_order()
+        .iter()
+        .find_map(|&block| {
+            f.block(block)
+                .insts
+                .iter()
+                .position(|&inst| inst == call)
+                .map(|at| (block, at))
+        })
+        .ok_or(BuildError::Unsupported(
+            "self-inline call is absent from layout",
+        ))?;
     for (index, declaration) in body.param_types.iter().enumerate() {
         let checked_type = match declaration {
             DeclaredType::Any => continue,
             DeclaredType::Fixnum => IRType::of(TypeBits::FIXNUM),
             DeclaredType::FixnumRange { lower, upper } => IRType {
                 bits: TypeBits::FIXNUM,
-                range: Some(crate::t2::ir::Range { lo: *lower, hi: *upper }),
+                range: Some(crate::t2::ir::Range {
+                    lo: *lower,
+                    hi: *upper,
+                }),
                 class_id: None,
             },
-            DeclaredType::SingleFloat => return Err(BuildError::Unsupported("self-inline float argument")),
+            DeclaredType::SingleFloat => {
+                return Err(BuildError::Unsupported("self-inline float argument"));
+            }
         };
-        let (guard, values) = f.push_inst(block, InstData {
-            opcode: Opcode::Guard,
-            args: vec![data.args[index]],
-            results: vec![],
-            aux: AuxData::TypeTag(checked_type),
-            flags: InstFlags { effectful: true, guard: true, ..Default::default() },
-            targets: vec![], frame_state: data.frame_state, source_pos: data.source_pos,
-        }, &[(checked_type, ValueRepresentation::Tagged)]);
+        let (guard, values) = f.push_inst(
+            block,
+            InstData {
+                opcode: Opcode::Guard,
+                args: vec![data.args[index]],
+                results: vec![],
+                aux: AuxData::TypeTag(checked_type),
+                flags: InstFlags {
+                    effectful: true,
+                    guard: true,
+                    ..Default::default()
+                },
+                targets: vec![],
+                frame_state: data.frame_state,
+                source_pos: data.source_pos,
+            },
+            &[(checked_type, ValueRepresentation::Tagged)],
+        );
         let layout = &mut f.block_mut(block).insts;
         let appended = layout.pop();
         debug_assert_eq!(appended, Some(guard));
@@ -669,26 +747,59 @@ impl<'a> Builder<'a> {
     }
 
     fn special_or_global_access(&self, bcp: usize) -> Option<AuxData> {
-        if !self.native_cleanups { return None; }
+        if !self.native_cleanups {
+            return None;
+        }
         match self.bf.code.get(bcp)? {
-            Instr::BindSpecial(_) => Some(AuxData::SpecialBinding { bcp: bcp as u32, enter: true }),
-            Instr::UnbindSpecial(_) => Some(AuxData::SpecialBinding { bcp: bcp as u32, enter: false }),
-            Instr::LoadGlobal(symbol) if self.inline_options.constant_global(self.root_symbol, *symbol).is_none()
-                => Some(AuxData::GlobalValue { symbol: *symbol, store: false }),
-            Instr::StoreGlobal(symbol) => Some(AuxData::GlobalValue { symbol: *symbol, store: true }),
+            Instr::BindSpecial(_) => Some(AuxData::SpecialBinding {
+                bcp: bcp as u32,
+                enter: true,
+            }),
+            Instr::UnbindSpecial(_) => Some(AuxData::SpecialBinding {
+                bcp: bcp as u32,
+                enter: false,
+            }),
+            Instr::LoadGlobal(symbol)
+                if self
+                    .inline_options
+                    .constant_global(self.root_symbol, *symbol)
+                    .is_none() =>
+            {
+                Some(AuxData::GlobalValue {
+                    symbol: *symbol,
+                    store: false,
+                })
+            }
+            Instr::StoreGlobal(symbol) => Some(AuxData::GlobalValue {
+                symbol: *symbol,
+                store: true,
+            }),
             // Captured variables live in the activation's heap EnvFrame, which
             // only the runtime owns; it decodes the instruction at this PC.
             Instr::LoadEnvVar(index) | Instr::StoreEnvVar(index) | Instr::DefineEnvVar(index) => {
                 self.bf.names.get(*index as usize)?;
                 let value = !matches!(self.bf.code[bcp], Instr::LoadEnvVar(_));
-                Some(AuxData::LexicalEnvironment { bcp: bcp as u32, value, result: !value })
+                Some(AuxData::LexicalEnvironment {
+                    bcp: bcp as u32,
+                    value,
+                    result: !value,
+                })
             }
-            Instr::PushEnvChild | Instr::PopEnvChild => {
-                Some(AuxData::LexicalEnvironment { bcp: bcp as u32, value: false, result: false })
-            }
-            Instr::MakeClosure { func, capture_env: true } => {
+            Instr::PushEnvChild | Instr::PopEnvChild => Some(AuxData::LexicalEnvironment {
+                bcp: bcp as u32,
+                value: false,
+                result: false,
+            }),
+            Instr::MakeClosure {
+                func,
+                capture_env: true,
+            } => {
                 self.bf.nested_functions.get(*func as usize)?;
-                Some(AuxData::LexicalEnvironment { bcp: bcp as u32, value: false, result: true })
+                Some(AuxData::LexicalEnvironment {
+                    bcp: bcp as u32,
+                    value: false,
+                    result: true,
+                })
             }
             _ => None,
         }
@@ -855,9 +966,15 @@ impl<'a> Builder<'a> {
 
     fn run(mut self) -> Result<Function, BuildError> {
         if self.bf.notinline_sites.windows(2).any(|p| p[0] >= p[1])
-            || self.bf.notinline_sites.iter().any(|&pc|
-                !matches!(self.bf.code.get(pc as usize), Some(Instr::CallNamed { .. }))) {
-            return Err(BuildError::Unsupported("invalid NOTINLINE call-site metadata"));
+            || self
+                .bf
+                .notinline_sites
+                .iter()
+                .any(|&pc| !matches!(self.bf.code.get(pc as usize), Some(Instr::CallNamed { .. })))
+        {
+            return Err(BuildError::Unsupported(
+                "invalid NOTINLINE call-site metadata",
+            ));
         }
 
         let code = &self.bf.code;
@@ -966,8 +1083,11 @@ impl<'a> Builder<'a> {
             let Some(&block) = self.block_of.get(&(bcp as usize)) else {
                 continue;
             };
-            let Some(control_scopes) = self.control_scopes.as_ref()
-                .and_then(|scopes| scopes.before(bcp)).map(<[_]>::to_vec)
+            let Some(control_scopes) = self
+                .control_scopes
+                .as_ref()
+                .and_then(|scopes| scopes.before(bcp))
+                .map(<[_]>::to_vec)
             else {
                 continue; // no entry may advertise an unknown control state
             };
@@ -1146,17 +1266,23 @@ impl<'a> Builder<'a> {
                     push(i + 1, d + 1, &mut depth_at, &mut work); // -> closure
                 }
                 Instr::BindSpecial(_) if self.native_cleanups => {
-                    if d < 1 { return Err(BuildError::Unsupported("special binding without value")); }
+                    if d < 1 {
+                        return Err(BuildError::Unsupported("special binding without value"));
+                    }
                     push(i + 1, d - 1, &mut depth_at, &mut work);
                 }
                 Instr::DefineEnvVar(_) if self.native_cleanups => {
-                    if d < 1 { return Err(BuildError::Unsupported("environment binding without value")); }
+                    if d < 1 {
+                        return Err(BuildError::Unsupported("environment binding without value"));
+                    }
                     push(i + 1, d - 1, &mut depth_at, &mut work);
                 }
                 Instr::PushEnvChild | Instr::PopEnvChild if self.native_cleanups => {
                     push(i + 1, d, &mut depth_at, &mut work);
                 }
-                Instr::MakeClosure { capture_env: true, .. } if self.native_cleanups => {
+                Instr::MakeClosure {
+                    capture_env: true, ..
+                } if self.native_cleanups => {
                     push(i + 1, d + 1, &mut depth_at, &mut work);
                 }
                 Instr::UnbindSpecial(_) if self.native_cleanups => {
@@ -1211,7 +1337,10 @@ impl<'a> Builder<'a> {
                 Instr::MemoryFence(_) => {
                     push(i + 1, d + 1, &mut depth_at, &mut work);
                 }
-                Instr::StoreLocal(_) | Instr::StoreGlobal(_) | Instr::StoreEnvVar(_) | Instr::Pop => {
+                Instr::StoreLocal(_)
+                | Instr::StoreGlobal(_)
+                | Instr::StoreEnvVar(_)
+                | Instr::Pop => {
                     push(i + 1, d - 1, &mut depth_at, &mut work);
                 }
                 Instr::Throw if self.native_cleanups => {}
@@ -1697,7 +1826,10 @@ impl<'a> Builder<'a> {
                 DeclaredType::Any => IRType::TOP,
                 DeclaredType::Fixnum => IRType::of(TypeBits::FIXNUM),
                 DeclaredType::FixnumRange { lower, upper } => IRType {
-                    range: Some(crate::t2::ir::Range { lo: lower, hi: upper }),
+                    range: Some(crate::t2::ir::Range {
+                        lo: lower,
+                        hi: upper,
+                    }),
                     ..IRType::of(TypeBits::FIXNUM)
                 },
                 DeclaredType::SingleFloat => IRType::of(TypeBits::SINGLE_FLOAT),
@@ -1806,15 +1938,34 @@ impl<'a> Builder<'a> {
                 // The cold state is BEFORE consuming a binding/store operand.
                 // The runtime commits only after all fallible preparation.
                 let fs = self.build_frame_state(block, &stack, i as u32);
-                let args = if matches!(aux, AuxData::SpecialBinding { enter: true, .. }
-                    | AuxData::GlobalValue { store: true, .. }
-                    | AuxData::LexicalEnvironment { value: true, .. }) {
-                    vec![stack.pop().ok_or(BuildError::Unsupported("special operation without value"))?]
-                } else { vec![] };
-                let (inst, results) = self.f.push_inst(block, InstData {
-                    opcode: Opcode::Call, args, results: vec![], aux,
-                    flags: runtime_call_flags(), targets: vec![], frame_state: Some(fs), source_pos: 0,
-                }, &[(IRType::TOP, ValueRepresentation::Tagged)]);
+                let args = if matches!(
+                    aux,
+                    AuxData::SpecialBinding { enter: true, .. }
+                        | AuxData::GlobalValue { store: true, .. }
+                        | AuxData::LexicalEnvironment { value: true, .. }
+                ) {
+                    vec![
+                        stack
+                            .pop()
+                            .ok_or(BuildError::Unsupported("special operation without value"))?,
+                    ]
+                } else {
+                    vec![]
+                };
+                let (inst, results) = self.f.push_inst(
+                    block,
+                    InstData {
+                        opcode: Opcode::Call,
+                        args,
+                        results: vec![],
+                        aux,
+                        flags: runtime_call_flags(),
+                        targets: vec![],
+                        frame_state: Some(fs),
+                        source_pos: 0,
+                    },
+                    &[(IRType::TOP, ValueRepresentation::Tagged)],
+                );
                 self.finish_native_invoke(block, inst, stack, results[0], i as u32, Some(end))?;
                 return Ok(());
             }
@@ -1942,9 +2093,11 @@ impl<'a> Builder<'a> {
             if let Some((push_bcp, enter)) = self.catch_transition(i) {
                 let fs = self.build_frame_state(block, &stack, i as u32);
                 let args = if enter {
-                    vec![stack
-                        .pop()
-                        .ok_or(BuildError::Unsupported("CATCH without tag"))?]
+                    vec![
+                        stack
+                            .pop()
+                            .ok_or(BuildError::Unsupported("CATCH without tag"))?,
+                    ]
                 } else {
                     vec![]
                 };
@@ -1986,25 +2139,45 @@ impl<'a> Builder<'a> {
                     }
                     let fs = self.build_frame_state(block, &stack, i as u32);
                     if matches!(instruction, Instr::LoadEnvVar(_)) {
-                        let value = self.emit(
-                            block, Opcode::EnvironmentValue, vec![],
-                            AuxData::EnvironmentName(*index), runtime_call_flags(),
-                            Some(fs), IRType::TOP,
-                        ).expect("environment read has a result");
+                        let value = self
+                            .emit(
+                                block,
+                                Opcode::EnvironmentValue,
+                                vec![],
+                                AuxData::EnvironmentName(*index),
+                                runtime_call_flags(),
+                                Some(fs),
+                                IRType::TOP,
+                            )
+                            .expect("environment read has a result");
                         stack.push(value);
                     } else {
-                        let value = stack.pop().ok_or(BuildError::Unsupported(
-                            "stack underflow (StoreEnvVar)",
-                        ))?;
-                        self.emit_effect(block, Opcode::SetEnvironmentValue, vec![value],
-                            AuxData::EnvironmentName(*index), Some(fs));
+                        let value = stack
+                            .pop()
+                            .ok_or(BuildError::Unsupported("stack underflow (StoreEnvVar)"))?;
+                        self.emit_effect(
+                            block,
+                            Opcode::SetEnvironmentValue,
+                            vec![value],
+                            AuxData::EnvironmentName(*index),
+                            Some(fs),
+                        );
                     }
                 }
                 Instr::LoadGlobal(sym) => {
-                    if let Some(value) = self.inline_options.constant_global(self.root_symbol, *sym) {
-                        let value = self.emit(block, Opcode::ConstFixnum, vec![],
-                            AuxData::FixnumImm(value), InstFlags::default(), None,
-                            IRType::of(TypeBits::FIXNUM)).expect("constant global has a result");
+                    if let Some(value) = self.inline_options.constant_global(self.root_symbol, *sym)
+                    {
+                        let value = self
+                            .emit(
+                                block,
+                                Opcode::ConstFixnum,
+                                vec![],
+                                AuxData::FixnumImm(value),
+                                InstFlags::default(),
+                                None,
+                                IRType::of(TypeBits::FIXNUM),
+                            )
+                            .expect("constant global has a result");
                         stack.push(value);
                         continue;
                     }
@@ -2361,7 +2534,9 @@ impl<'a> Builder<'a> {
                     }
                     let policy = if self.bf.notinline_sites.binary_search(&(i as u32)).is_ok() {
                         InlinePolicy::NotInline
-                    } else { self.inline_options.policy_at(i as u32) };
+                    } else {
+                        self.inline_options.policy_at(i as u32)
+                    };
                     // Compiler-known functions reach T2 through shared metadata
                     // and call-site policy. An expansion hook can still decline
                     // for operand-shape reasons (for example dynamic TYPEP),
@@ -2385,13 +2560,21 @@ impl<'a> Builder<'a> {
                                 let position = self.f.block(block).insts.len();
                                 if self.expand_intrinsic(intrinsic, block, &mut stack, i, start)? {
                                     super::builtin_binding::insert(
-                                        &mut self.f, block, position, state, binding,
+                                        &mut self.f,
+                                        block,
+                                        position,
+                                        state,
+                                        binding,
                                     );
                                     // Every supported intrinsic returns one value.
                                     // Keep that effect after its binding/type guards,
                                     // even if its pure result is folded or discarded.
                                     self.emit_effect(
-                                        block, Opcode::ClearMv, vec![], AuxData::None, Some(state),
+                                        block,
+                                        Opcode::ClearMv,
+                                        vec![],
+                                        AuxData::None,
+                                        Some(state),
                                     );
                                     self.remaining_inline_budget -= metadata.cost;
                                     continue;
@@ -2412,7 +2595,9 @@ impl<'a> Builder<'a> {
                             results: vec![],
                             aux: if policy == InlinePolicy::NotInline {
                                 AuxData::OpaqueCallTarget(*sym)
-                            } else { AuxData::CallTarget(*sym) },
+                            } else {
+                                AuxData::CallTarget(*sym)
+                            },
                             flags: InstFlags {
                                 effectful: true,
                                 call: true,
@@ -2454,7 +2639,10 @@ impl<'a> Builder<'a> {
                         DeclaredType::Fixnum => IRType::of(TypeBits::FIXNUM),
                         DeclaredType::FixnumRange { lower, upper } => IRType {
                             bits: TypeBits::FIXNUM,
-                            range: Some(crate::t2::ir::Range { lo: *lower, hi: *upper }),
+                            range: Some(crate::t2::ir::Range {
+                                lo: *lower,
+                                hi: *upper,
+                            }),
                             class_id: None,
                         },
                         DeclaredType::SingleFloat => {
@@ -2465,17 +2653,24 @@ impl<'a> Builder<'a> {
                     // assertion with its primary still on the stack, never at
                     // the producer call. Unlike TYPEP, this preserves MV state.
                     let fs = self.build_frame_state(block, &stack, i as u32);
-                    let value = stack.pop()
+                    let value = stack
+                        .pop()
                         .ok_or(BuildError::Unsupported("stack underflow (CheckResult)"))?;
-                    let checked = self.emit(
-                        block,
-                        Opcode::Guard,
-                        vec![value],
-                        AuxData::TypeTag(checked_type),
-                        InstFlags { effectful: true, guard: true, ..Default::default() },
-                        Some(fs),
-                        checked_type,
-                    ).ok_or(BuildError::Unsupported("result guard has a result"))?;
+                    let checked = self
+                        .emit(
+                            block,
+                            Opcode::Guard,
+                            vec![value],
+                            AuxData::TypeTag(checked_type),
+                            InstFlags {
+                                effectful: true,
+                                guard: true,
+                                ..Default::default()
+                            },
+                            Some(fs),
+                            checked_type,
+                        )
+                        .ok_or(BuildError::Unsupported("result guard has a result"))?;
                     stack.push(checked);
                 }
                 Instr::TypeP(class) => {
@@ -3274,16 +3469,22 @@ impl<'a> Builder<'a> {
                 let Instr::Const(cidx) = self.bf.code[bcp - 1] else {
                     return Ok(false);
                 };
-                let Some(super::constants::ConstantDescription::Symbol { index: type_index, name: Some(type_name) }) =
-                    self.constants.get(cidx as usize)
+                let Some(super::constants::ConstantDescription::Symbol {
+                    index: type_index,
+                    name: Some(type_name),
+                }) = self.constants.get(cidx as usize)
                 else {
                     return Ok(false);
                 };
                 match type_name.rsplit(':').next().unwrap_or(type_name) {
                     "FIXNUM" => Some(TypeBits::FIXNUM),
-                    "DOUBLE-FLOAT" if cfg!(all(target_arch = "x86_64", target_os = "linux"))
-                        && egcl_rt::symbols::registry_key(*type_index).as_deref() == Some("DOUBLE-FLOAT")
-                        => Some(TypeBits::DOUBLE_FLOAT),
+                    "DOUBLE-FLOAT"
+                        if cfg!(all(target_arch = "x86_64", target_os = "linux"))
+                            && egcl_rt::symbols::registry_key(*type_index).as_deref()
+                                == Some("DOUBLE-FLOAT") =>
+                    {
+                        Some(TypeBits::DOUBLE_FLOAT)
+                    }
                     // (TYPEP x 'CONS) is the same unsound tag test as CONSP
                     // above -- a closure would answer T.  See bliss-74rl.
                     "CONS" => return Ok(false),
@@ -3444,19 +3645,46 @@ impl<'a> Builder<'a> {
     /// Classify a constant-pool `EgclVal` and emit the matching `Const*`.
     fn emit_const(&mut self, block: Block, idx: u16) -> Result<Value, BuildError> {
         use super::constants::ConstantDescription as Constant;
-        let constant = self.constants.get(idx as usize)
+        let constant = self
+            .constants
+            .get(idx as usize)
             .ok_or(BuildError::Unsupported("constant index out of range"))?;
         let (opcode, aux, ty) = match constant {
             Constant::Nil => (Opcode::ConstNil, AuxData::None, IRType::of(TypeBits::NULL)),
             Constant::True => (Opcode::ConstT, AuxData::None, IRType::of(TypeBits::SYMBOL)),
-            Constant::Fixnum(value) => (Opcode::ConstFixnum, AuxData::FixnumImm(*value), IRType::of(TypeBits::FIXNUM)),
-            Constant::Character(value) => (Opcode::ConstChar, AuxData::CharImm(*value), IRType::of(TypeBits::CHARACTER)),
-            Constant::SingleFloat(value) => (Opcode::ConstFloat, AuxData::FloatImm(*value), IRType::of(TypeBits::SINGLE_FLOAT)),
-            Constant::Symbol { index, .. } => (Opcode::ConstSymbol, AuxData::SymbolRef(*index), IRType::of(TypeBits::SYMBOL)),
+            Constant::Fixnum(value) => (
+                Opcode::ConstFixnum,
+                AuxData::FixnumImm(*value),
+                IRType::of(TypeBits::FIXNUM),
+            ),
+            Constant::Character(value) => (
+                Opcode::ConstChar,
+                AuxData::CharImm(*value),
+                IRType::of(TypeBits::CHARACTER),
+            ),
+            Constant::SingleFloat(value) => (
+                Opcode::ConstFloat,
+                AuxData::FloatImm(*value),
+                IRType::of(TypeBits::SINGLE_FLOAT),
+            ),
+            Constant::Symbol { index, .. } => (
+                Opcode::ConstSymbol,
+                AuxData::SymbolRef(*index),
+                IRType::of(TypeBits::SYMBOL),
+            ),
             Constant::Heap { slot, double_bits } => {
-                if let Some(bits) = double_bits { self.f.double_literals.insert(*slot, *bits); }
-                (Opcode::ConstHeapObj, AuxData::HeapLiteral { slot: *slot },
-                    if double_bits.is_some() { IRType::of(TypeBits::DOUBLE_FLOAT) } else { IRType::TOP })
+                if let Some(bits) = double_bits {
+                    self.f.double_literals.insert(*slot, *bits);
+                }
+                (
+                    Opcode::ConstHeapObj,
+                    AuxData::HeapLiteral { slot: *slot },
+                    if double_bits.is_some() {
+                        IRType::of(TypeBits::DOUBLE_FLOAT)
+                    } else {
+                        IRType::TOP
+                    },
+                )
             }
         };
 
@@ -3919,8 +4147,16 @@ mod tests {
             .with_constant_globals(HashMap::from([(constant, 5)]));
         for function in [
             build_from_bytecode_with_inline_options(&body, options.clone()),
-            build_for_transfer_optimization_snapshot_with_inline_options(&snapshot, root, options.clone()),
-            build_for_native_scope_optimization_snapshot_with_inline_options(&snapshot, root, options.clone()),
+            build_for_transfer_optimization_snapshot_with_inline_options(
+                &snapshot,
+                root,
+                options.clone(),
+            ),
+            build_for_native_scope_optimization_snapshot_with_inline_options(
+                &snapshot,
+                root,
+                options.clone(),
+            ),
         ] {
             let function = function.expect("constant-aware builder");
             let instructions: Vec<_> = function
@@ -3978,22 +4214,41 @@ mod tests {
 
     #[test]
     fn result_check_refines_only_its_result_and_recovers_at_the_assertion() {
-        let body = bf("checked-result", vec![
-            Instr::LoadLocal(0),
-            Instr::CheckResult(DeclaredType::FixnumRange { lower: 0, upper: 10 }),
-            Instr::Return,
-        ], vec![], 1, 1, 1);
+        let body = bf(
+            "checked-result",
+            vec![
+                Instr::LoadLocal(0),
+                Instr::CheckResult(DeclaredType::FixnumRange {
+                    lower: 0,
+                    upper: 10,
+                }),
+                Instr::Return,
+            ],
+            vec![],
+            1,
+            1,
+            1,
+        );
         let f = build_from_bytecode(&body).expect("build result assertion");
         let entry = f.entry();
         let input = f.block(entry).params[0];
-        let guard = f.block(entry).insts.iter().copied()
-            .find(|&inst| f.inst(inst).opcode == Opcode::Guard).expect("result guard");
+        let guard = f
+            .block(entry)
+            .insts
+            .iter()
+            .copied()
+            .find(|&inst| f.inst(inst).opcode == Opcode::Guard)
+            .expect("result guard");
         let data = f.inst(guard);
         assert_eq!(data.args, vec![input]);
         assert_eq!(f.value(input).ty, IRType::TOP);
-        assert_eq!(f.value(data.results[0]).ty.range,
-            Some(crate::t2::ir::Range { lo: 0, hi: 10 }));
-        let state = f.frame_states.get(data.frame_state.expect("recovery state"));
+        assert_eq!(
+            f.value(data.results[0]).ty.range,
+            Some(crate::t2::ir::Range { lo: 0, hi: 10 })
+        );
+        let state = f
+            .frame_states
+            .get(data.frame_state.expect("recovery state"));
         assert_eq!(state.scopes[0].bcp, 1);
         assert!(matches!(state.scopes[0].stack.as_slice(),
             [ValueSource::Value { value, .. }] if *value == input));
@@ -4005,16 +4260,27 @@ mod tests {
     #[test]
     fn declared_parameter_range_seeds_entry_ssa() {
         use crate::t2::ir::Range;
-        let mut typed = bf("bounded", vec![Instr::LoadLocal(0), Instr::Return],
-            vec![], 1, 1, 1);
-        typed.param_types = vec![DeclaredType::FixnumRange { lower: 0, upper: 40 }];
+        let mut typed = bf(
+            "bounded",
+            vec![Instr::LoadLocal(0), Instr::Return],
+            vec![],
+            1,
+            1,
+            1,
+        );
+        typed.param_types = vec![DeclaredType::FixnumRange {
+            lower: 0,
+            upper: 40,
+        }];
         let f = build_from_bytecode(&typed).expect("build bounded function");
         let parameter = f.block(f.entry()).params[0];
         assert_eq!(f.value(parameter).ty.bits, TypeBits::FIXNUM);
         assert_eq!(f.value(parameter).ty.range, Some(Range { lo: 0, hi: 40 }));
         assert!(f.is_entry_param_checked(parameter));
-        assert_eq!(crate::t2::infer::infer(&f).range(parameter),
-            Some(Range { lo: 0, hi: 40 }));
+        assert_eq!(
+            crate::t2::infer::infer(&f).range(parameter),
+            Some(Range { lo: 0, hi: 40 })
+        );
     }
 
     #[test]
@@ -4343,7 +4609,10 @@ mod tests {
         let input = bf(
             "returning-error",
             vec![
-                Instr::CallNamed { sym: error, nargs: 0 },
+                Instr::CallNamed {
+                    sym: error,
+                    nargs: 0,
+                },
                 Instr::Pop,
                 Instr::Const(0),
                 Instr::Return,
@@ -4362,11 +4631,16 @@ mod tests {
         ] {
             let function = result.unwrap();
             crate::t2::verify::verify(&function).unwrap();
-            assert!(function.block_order().iter().any(|&block| {
-                function.block(block).insts.iter().any(|&inst| {
-                    function.inst(inst).opcode == Opcode::Return
-                })
-            }), "the caller must retain its return after the named call");
+            assert!(
+                function.block_order().iter().any(|&block| {
+                    function
+                        .block(block)
+                        .insts
+                        .iter()
+                        .any(|&inst| function.inst(inst).opcode == Opcode::Return)
+                }),
+                "the caller must retain its return after the named call"
+            );
         }
     }
 
@@ -4687,10 +4961,10 @@ mod tests {
             // System Z, POWER and RISC-V emitters carry their own
             // host-independent assemblers and run everywhere (bliss-d2ter).
             #[cfg_attr(
-            not(any(target_arch = "x86_64", target_arch = "aarch64")),
-            allow(unused_mut)
-        )]
-        let mut backends = vec![
+                not(any(target_arch = "x86_64", target_arch = "aarch64")),
+                allow(unused_mut)
+            )]
+            let mut backends = vec![
                 (
                     "s390x",
                     emit_s390x::emit_framed_with_runtime(
@@ -4770,22 +5044,13 @@ mod tests {
         let function = build_from_bytecode(&input).expect("ENDP must reach T2");
         crate::t2::verify::verify(&function).unwrap();
         assert!(!has_opcode(&function, function.entry(), Opcode::Call));
-        assert!(has_opcode(
-            &function,
-            function.entry(),
-            Opcode::GenericEq
-        ));
+        assert!(has_opcode(&function, function.entry(), Opcode::GenericEq));
         let guard = function
             .block(function.entry())
             .insts
             .iter()
             .map(|&inst| function.inst(inst))
-            .find(|data| {
-                matches!(
-                    data.aux,
-                    AuxData::EndpList
-                )
-            })
+            .find(|data| matches!(data.aux, AuxData::EndpList))
             .expect("ENDP must guard NIL-or-data-cons before comparing with NIL");
         assert_eq!(guard.opcode, Opcode::Guard);
         assert!(guard.flags.guard && guard.flags.effectful);
@@ -4843,12 +5108,7 @@ mod tests {
         #[cfg(target_arch = "aarch64")]
         emissions.push((
             "aarch64",
-            crate::t2::emit_a64::emit_framed_with_runtime(
-                &function,
-                1,
-                input.num_slots(),
-                runtime,
-            ),
+            crate::t2::emit_a64::emit_framed_with_runtime(&function, 1, input.num_slots(), runtime),
         ));
         for (backend, emission) in emissions {
             assert!(
@@ -4991,23 +5251,47 @@ mod tests {
     fn double_typep_intrinsic_requires_canonical_type_symbol_identity() {
         let typep = egcl_rt::symbols::intern("TYPEP");
         let canonical = EgclVal::from_symbol_index(egcl_rt::symbols::intern("DOUBLE-FLOAT"));
-        let qualified = EgclVal::from_symbol_index(
-            egcl_rt::symbols::intern("SCOPED-DOUBLE-BOUNDARY::DOUBLE-FLOAT"));
+        let qualified = EgclVal::from_symbol_index(egcl_rt::symbols::intern(
+            "SCOPED-DOUBLE-BOUNDARY::DOUBLE-FLOAT",
+        ));
         let uninterned = egcl_rt::symbols::make_uninterned("DOUBLE-FLOAT");
-        for (type_symbol, primitive) in [(canonical, true), (qualified, false), (uninterned, false)] {
-            let input = bf("double-type-identity", vec![
-                Instr::LoadLocal(0), Instr::Const(0),
-                Instr::CallNamed { sym: typep, nargs: 2 }, Instr::Return,
-            ], vec![type_symbol], 1, 1, 2);
+        for (type_symbol, primitive) in [(canonical, true), (qualified, false), (uninterned, false)]
+        {
+            let input = bf(
+                "double-type-identity",
+                vec![
+                    Instr::LoadLocal(0),
+                    Instr::Const(0),
+                    Instr::CallNamed {
+                        sym: typep,
+                        nargs: 2,
+                    },
+                    Instr::Return,
+                ],
+                vec![type_symbol],
+                1,
+                1,
+                2,
+            );
             let f = build_from_bytecode(&input).expect("constant TYPEP builds");
-            let instructions: Vec<_> = f.block_order().iter()
-                .flat_map(|&b| f.block(b).insts.iter().map(|&i| f.inst(i))).collect();
-            assert_eq!(instructions.iter().any(|d| d.opcode == Opcode::TypeCheck
-                && matches!(d.aux, AuxData::TypeTag(ty) if ty.bits == TypeBits::DOUBLE_FLOAT)),
-                primitive, "a same-leaf-name symbol is not a primitive layout proof");
+            let instructions: Vec<_> = f
+                .block_order()
+                .iter()
+                .flat_map(|&b| f.block(b).insts.iter().map(|&i| f.inst(i)))
+                .collect();
+            assert_eq!(
+                instructions.iter().any(|d| d.opcode == Opcode::TypeCheck
+                    && matches!(d.aux, AuxData::TypeTag(ty) if ty.bits == TypeBits::DOUBLE_FLOAT)),
+                primitive,
+                "a same-leaf-name symbol is not a primitive layout proof"
+            );
             if !primitive {
-                let call = instructions.iter().find(|d| d.opcode == Opcode::Call
-                    && matches!(d.aux, AuxData::CallTarget(sym) if sym == typep))
+                let call = instructions
+                    .iter()
+                    .find(|d| {
+                        d.opcode == Opcode::Call
+                            && matches!(d.aux, AuxData::CallTarget(sym) if sym == typep)
+                    })
                     .expect("qualified/uninterned type keeps the actual TYPEP call");
                 assert!(call.frame_state.is_some());
                 assert!(!instructions.iter().any(|d| d.opcode == Opcode::TypeCheck));
@@ -5162,10 +5446,7 @@ mod tests {
             "BODY-INLINE-CAR",
             vec![
                 Instr::LoadLocal(0),
-                Instr::CallNamed {
-                    sym: car,
-                    nargs: 1,
-                },
+                Instr::CallNamed { sym: car, nargs: 1 },
                 Instr::Return,
             ],
             vec![],
@@ -5203,9 +5484,11 @@ mod tests {
         assert_eq!(scopes.len(), 2);
         assert_eq!(scopes[0].function, caller);
         assert_eq!(scopes[1].function, helper);
-        assert!(f.source_positions[data.source_pos as usize]
-            .inlined_at
-            .is_some());
+        assert!(
+            f.source_positions[data.source_pos as usize]
+                .inlined_at
+                .is_some()
+        );
         crate::t2::verify::verify(&f).expect("nested metadata verifies");
     }
 
@@ -5242,8 +5525,14 @@ mod tests {
             "SINGLE-FRAME-CALLER",
             vec![
                 Instr::LoadLocal(0),
-                Instr::CallNamed { sym: plain, nargs: 1 },
-                Instr::CallNamed { sym: guarded, nargs: 1 },
+                Instr::CallNamed {
+                    sym: plain,
+                    nargs: 1,
+                },
+                Instr::CallNamed {
+                    sym: guarded,
+                    nargs: 1,
+                },
                 Instr::Return,
             ],
             vec![],
@@ -5272,14 +5561,27 @@ mod tests {
         };
 
         let nested = build_from_bytecode_with_inline_options(&input, base.clone()).unwrap();
-        assert!(calls(&nested).is_empty(), "default recovery clones both bodies");
-        assert!(!single_frame(&nested), "the cloned CAR guard needs two frames");
+        assert!(
+            calls(&nested).is_empty(),
+            "default recovery clones both bodies"
+        );
+        assert!(
+            !single_frame(&nested),
+            "the cloned CAR guard needs two frames"
+        );
 
         let mut restricted = base;
         restricted.config.cross_function_recovery = false;
         let f = build_from_bytecode_with_inline_options(&input, restricted).unwrap();
-        assert_eq!(calls(&f), vec![guarded], "only the deoptimizing body stays a call");
-        assert!(single_frame(&f), "every FrameState reconstructs one logical frame");
+        assert_eq!(
+            calls(&f),
+            vec![guarded],
+            "only the deoptimizing body stays a call"
+        );
+        assert!(
+            single_frame(&f),
+            "every FrameState reconstructs one logical frame"
+        );
         crate::t2::verify::verify(&f).expect("restricted inline verifies");
     }
 
@@ -5363,20 +5665,41 @@ mod tests {
     fn self_inline_cost_admits_a_tested_calls_clear_mv_without_charging_it() {
         let less = egcl_rt::symbols::intern("<");
         let with_test = |clear: bool| {
-            let mut code = vec![Instr::LoadLocal(0), Instr::Const(0),
-                Instr::CallNamed { sym: less, nargs: 2 }];
+            let mut code = vec![
+                Instr::LoadLocal(0),
+                Instr::Const(0),
+                Instr::CallNamed {
+                    sym: less,
+                    nargs: 2,
+                },
+            ];
             if clear {
                 code.push(Instr::ClearMv);
             }
-            code.extend([Instr::BrIfFalse(code.len() as u32 + 3), Instr::LoadLocal(0),
-                Instr::Return, Instr::Const(0), Instr::Return]);
-            let mut body = bf("SELF-INLINE-CLEAR-MV", code, vec![EgclVal::from_fixnum(1)], 1, 1, 2);
+            code.extend([
+                Instr::BrIfFalse(code.len() as u32 + 3),
+                Instr::LoadLocal(0),
+                Instr::Return,
+                Instr::Const(0),
+                Instr::Return,
+            ]);
+            let mut body = bf(
+                "SELF-INLINE-CLEAR-MV",
+                code,
+                vec![EgclVal::from_fixnum(1)],
+                1,
+                1,
+                2,
+            );
             body.param_layout = vec![("N".into(), VarLoc::Slot(0))];
             body
         };
         let plain = self_inline_cost(&with_test(false)).expect("plain test body is eligible");
-        assert_eq!(self_inline_cost(&with_test(true)), Some(plain),
-            "the IF test's ClearMv (#419) must not disqualify or enlarge the body");
+        assert_eq!(
+            self_inline_cost(&with_test(true)),
+            Some(plain),
+            "the IF test's ClearMv (#419) must not disqualify or enlarge the body"
+        );
     }
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -5386,40 +5709,84 @@ mod tests {
         let symbol = egcl_rt::symbols::intern("BOUNDED-SELF-INLINE");
         let less = egcl_rt::symbols::intern("<");
         let minus = egcl_rt::symbols::intern("-");
-        let mut body = bf("BOUNDED-SELF-INLINE", vec![
-            Instr::LoadLocal(0), Instr::Const(0),
-            Instr::CallNamed { sym: less, nargs: 2 }, Instr::BrIfFalse(6),
-            Instr::LoadLocal(0), Instr::Return,
-            Instr::LoadLocal(0), Instr::Const(1),
-            Instr::CallNamed { sym: minus, nargs: 2 },
-            Instr::CallNamed { sym: symbol, nargs: 1 }, Instr::Return,
-        ], vec![EgclVal::from_fixnum(2), EgclVal::from_fixnum(1)], 1, 1, 2);
+        let mut body = bf(
+            "BOUNDED-SELF-INLINE",
+            vec![
+                Instr::LoadLocal(0),
+                Instr::Const(0),
+                Instr::CallNamed {
+                    sym: less,
+                    nargs: 2,
+                },
+                Instr::BrIfFalse(6),
+                Instr::LoadLocal(0),
+                Instr::Return,
+                Instr::LoadLocal(0),
+                Instr::Const(1),
+                Instr::CallNamed {
+                    sym: minus,
+                    nargs: 2,
+                },
+                Instr::CallNamed {
+                    sym: symbol,
+                    nargs: 1,
+                },
+                Instr::Return,
+            ],
+            vec![EgclVal::from_fixnum(2), EgclVal::from_fixnum(1)],
+            1,
+            1,
+            2,
+        );
         body.self_call_sites = vec![9];
         body.param_layout = vec![("N".into(), VarLoc::Slot(0))];
-        body.param_types = vec![DeclaredType::FixnumRange { lower: 0, upper: 40 }];
+        body.param_types = vec![DeclaredType::FixnumRange {
+            lower: 0,
+            upper: 40,
+        }];
         let body = Arc::new(body);
-        let mut options = InlineOptions::default().with_root_symbol(symbol)
+        let mut options = InlineOptions::default()
+            .with_root_symbol(symbol)
             .with_body(symbol, Arc::clone(&body));
         options.config.self_inline_depth = 2;
         let f = build_from_bytecode_with_inline_options(&body, options.clone()).unwrap();
         crate::t2::verify::verify(&f).expect("bounded self CFG verifies");
-        let instructions: Vec<_> = f.block_order().iter()
-            .flat_map(|&block| f.block(block).insts.iter().copied()).collect();
-        let leaves: Vec<_> = instructions.iter().copied().filter(|&inst| {
-            f.inst(inst).opcode == Opcode::Call
-                && matches!(f.inst(inst).aux, AuxData::CallTarget(target) if target == symbol)
-        }).collect();
+        let instructions: Vec<_> = f
+            .block_order()
+            .iter()
+            .flat_map(|&block| f.block(block).insts.iter().copied())
+            .collect();
+        let leaves: Vec<_> = instructions
+            .iter()
+            .copied()
+            .filter(|&inst| {
+                f.inst(inst).opcode == Opcode::Call
+                    && matches!(f.inst(inst).aux, AuxData::CallTarget(target) if target == symbol)
+            })
+            .collect();
         assert_eq!(leaves.len(), 1, "one residual recursive leaf remains");
         let leaf = f.frame_states.get(f.inst(leaves[0]).frame_state.unwrap());
-        assert_eq!(leaf.scopes.len(), 3, "two bounded expansions must actually occur");
+        assert_eq!(
+            leaf.scopes.len(),
+            3,
+            "two bounded expansions must actually occur"
+        );
         assert!(leaf.scopes.iter().all(|scope| scope.function == symbol));
         assert_eq!(leaf.scopes.last().unwrap().bcp, 9);
-        let guards: Vec<_> = instructions.iter().copied().filter(|&inst| {
-            f.inst(inst).opcode == Opcode::Guard
-                && matches!(f.inst(inst).aux, AuxData::TypeTag(ty)
+        let guards: Vec<_> = instructions
+            .iter()
+            .copied()
+            .filter(|&inst| {
+                f.inst(inst).opcode == Opcode::Guard
+                    && matches!(f.inst(inst).aux, AuxData::TypeTag(ty)
                     if ty.range == Some(Range { lo: 0, hi: 40 }))
-        }).collect();
-        assert_eq!(guards.len(), 2, "each erased call retains its argument contract");
+            })
+            .collect();
+        assert_eq!(
+            guards.len(),
+            2,
+            "each erased call retains its argument contract"
+        );
         let mut depths = Vec::new();
         for guard in guards {
             let state = f.frame_states.get(f.inst(guard).frame_state.unwrap());
@@ -5428,7 +5795,10 @@ mod tests {
             assert_eq!(current.stack.len(), 1, "original argument remains pending");
             for parent in &state.scopes[..state.scopes.len() - 1] {
                 assert_eq!(parent.bcp, 10);
-                assert!(parent.stack.is_empty(), "suspended parent awaits the result");
+                assert!(
+                    parent.stack.is_empty(),
+                    "suspended parent awaits the result"
+                );
             }
             depths.push(state.scopes.len());
         }
@@ -5445,14 +5815,25 @@ mod tests {
         let different_body = options.clone().with_body(symbol, Arc::new((*body).clone()));
         for options in [disabled, notinline, no_budget, no_depth, different_body] {
             let declined = build_from_bytecode_with_inline_options(&body, options).unwrap();
-            assert!(declined.frame_states.iter().all(|(_, state)| state.scopes.len() == 1));
+            assert!(
+                declined
+                    .frame_states
+                    .iter()
+                    .all(|(_, state)| state.scopes.len() == 1)
+            );
         }
         let mut unproven = (*body).clone();
         unproven.self_call_sites.clear();
         let unproven = Arc::new(unproven);
         let unproven_options = options.with_body(symbol, Arc::clone(&unproven));
-        let declined = build_from_bytecode_with_inline_options(&unproven, unproven_options).unwrap();
-        assert!(declined.frame_states.iter().all(|(_, state)| state.scopes.len() == 1));
+        let declined =
+            build_from_bytecode_with_inline_options(&unproven, unproven_options).unwrap();
+        assert!(
+            declined
+                .frame_states
+                .iter()
+                .all(|(_, state)| state.scopes.len() == 1)
+        );
     }
 
     #[test]
@@ -5463,19 +5844,29 @@ mod tests {
             "BOUNDED-SELF-SIBLINGS",
             vec![
                 Instr::LoadLocal(0),
-                Instr::CallNamed { sym: symbol, nargs: 1 },
+                Instr::CallNamed {
+                    sym: symbol,
+                    nargs: 1,
+                },
                 Instr::Pop,
                 Instr::LoadLocal(0),
-                Instr::CallNamed { sym: symbol, nargs: 1 },
+                Instr::CallNamed {
+                    sym: symbol,
+                    nargs: 1,
+                },
                 Instr::Return,
             ],
-            vec![], 1, 1, 1,
+            vec![],
+            1,
+            1,
+            1,
         );
         body.self_call_sites = vec![1, 4];
         body.param_layout = vec![("N".into(), VarLoc::Slot(0))];
         body.param_types = vec![DeclaredType::Fixnum];
         let body = Arc::new(body);
-        let mut options = InlineOptions::default().with_root_symbol(symbol)
+        let mut options = InlineOptions::default()
+            .with_root_symbol(symbol)
             .with_body(symbol, Arc::clone(&body));
         options.config.self_inline_depth = 3;
         options.config.node_budget = self_inline_cost(&body).unwrap();
@@ -5497,7 +5888,11 @@ mod tests {
             }
         }
         leaf_depths.sort_unstable();
-        assert_eq!(leaf_depths, vec![1, 2, 2], "only one sibling may spend the one-copy budget");
+        assert_eq!(
+            leaf_depths,
+            vec![1, 2, 2],
+            "only one sibling may spend the one-copy budget"
+        );
         assert_eq!(guards, 1, "exactly one call boundary was expanded");
 
         let mut unsupported = (*body).clone();
@@ -5542,17 +5937,19 @@ mod tests {
         let mut budget = base.clone();
         budget.config.node_budget = 0;
         let f = build_from_bytecode_with_inline_options(&input, budget).unwrap();
-        assert!(f
-            .block_order()
-            .iter()
-            .any(|&b| has_opcode(&f, b, Opcode::Call)));
+        assert!(
+            f.block_order()
+                .iter()
+                .any(|&b| has_opcode(&f, b, Opcode::Call))
+        );
 
         let notinline = base.clone().with_policy(1, InlinePolicy::NotInline);
         let f = build_from_bytecode_with_inline_options(&input, notinline).unwrap();
-        assert!(f
-            .block_order()
-            .iter()
-            .any(|&b| has_opcode(&f, b, Opcode::Call)));
+        assert!(
+            f.block_order()
+                .iter()
+                .any(|&b| has_opcode(&f, b, Opcode::Call))
+        );
 
         let recursive = Arc::new(bf(
             "BODY-INLINE-LIMITED",
@@ -5573,9 +5970,10 @@ mod tests {
             .with_root_symbol(caller)
             .with_body(helper, recursive);
         let f = build_from_bytecode_with_inline_options(&input, recursive_options).unwrap();
-        assert!(f
-            .block_order()
-            .iter()
-            .any(|&b| has_opcode(&f, b, Opcode::Call)));
+        assert!(
+            f.block_order()
+                .iter()
+                .any(|&b| has_opcode(&f, b, Opcode::Call))
+        );
     }
 }

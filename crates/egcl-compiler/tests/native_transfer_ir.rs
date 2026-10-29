@@ -77,8 +77,12 @@ fn function_with_capture_only_local() -> Function {
             repr: ValueRepresentation::Tagged,
         };
     }
-    assert!(f.block_order().iter().all(|&block| f.block(block).insts.iter()
-        .all(|&inst| !f.inst(inst).args.contains(&value))));
+    assert!(f.block_order().iter().all(|&block| {
+        f.block(block)
+            .insts
+            .iter()
+            .all(|&inst| !f.inst(inst).args.contains(&value))
+    }));
     f
 }
 
@@ -104,15 +108,14 @@ fn builder_automatically_routes_calls_to_mapped_transfer_continuations() {
             .last()
             .unwrap();
         assert_eq!(frame.bcp, *origin_bcp);
-        assert_eq!(
-            frame.locals.len(),
-            2,
-            "local slot numbering is preserved"
+        assert_eq!(frame.locals.len(), 2, "local slot numbering is preserved");
+        assert!(
+            matches!(
+                frame.locals[1],
+                egcl_compiler::t2::frame_state::ValueSource::Unbound
+            ),
+            "the source bytecode never reads its second local"
         );
-        assert!(matches!(
-            frame.locals[1],
-            egcl_compiler::t2::frame_state::ValueSource::Unbound
-        ), "the source bytecode never reads its second local");
         assert_eq!(frame.stack.len(), 1, "capture pre-call operands");
         if *origin_bcp == 2 {
             assert!(
@@ -514,13 +517,13 @@ fn capture_maps_exclude_unboxed_words_and_refuse_uncomposed_inline_scopes() {
 
 #[test]
 fn framed_capture_uses_the_emitters_final_home_for_a_split_value() {
-    use std::collections::HashMap;
     use egcl_compiler::t2::deopt::{Rebox, SlotDescriptor};
     use egcl_compiler::t2::lower::lower;
     use egcl_compiler::t2::mach::{Location, StackSlot};
     use egcl_compiler::t2::regalloc::allocate_framed;
     use egcl_compiler::t2::transfer_map::lower_framed_transfer_maps;
     use egcl_compiler::t2::x64_frame::{ValueHome, select_frame_homes};
+    use std::collections::HashMap;
     let f = function_with_capture_only_local();
     let mut machine = lower(&f);
     allocate_framed(&mut machine).unwrap();
@@ -538,11 +541,14 @@ fn framed_capture_uses_the_emitters_final_home_for_a_split_value() {
     let ValueHome::Stack(slot) = homes.values[&split] else {
         panic!("split range needs a stable spill");
     };
-    let maps = egcl_compiler::t2::x64_frame::resolve_safepoint_maps(
-        &f, &machine, &homes, &HashMap::new(),
-    ).unwrap();
+    let maps =
+        egcl_compiler::t2::x64_frame::resolve_safepoint_maps(&f, &machine, &homes, &HashMap::new())
+            .unwrap();
     for map in maps.iter() {
-        assert_eq!(map.value(split).unwrap().gc_home(), Some(ValueHome::Stack(slot)));
+        assert_eq!(
+            map.value(split).unwrap().gc_home(),
+            Some(ValueHome::Stack(slot))
+        );
     }
     let captures = lower_framed_transfer_maps(&f, &machine, &homes, &HashMap::new()).unwrap();
     for capture in captures {
@@ -556,13 +562,13 @@ fn framed_capture_uses_the_emitters_final_home_for_a_split_value() {
 
 #[test]
 fn framed_capture_materializes_excluded_immediates_but_rejects_heap_literals() {
-    use std::collections::HashMap;
     use egcl_compiler::t2::deopt::SlotDescriptor;
     use egcl_compiler::t2::lower::lower;
     use egcl_compiler::t2::regalloc::allocate_framed;
     use egcl_compiler::t2::transfer_map::lower_framed_transfer_maps;
     use egcl_compiler::t2::x64_frame::select_frame_homes;
     use egcl_rt::value::EgclVal;
+    use std::collections::HashMap;
     let mut source = body();
     source.code = vec![
         Instr::Const(0),
@@ -632,13 +638,29 @@ fn optimize_arithmetic_before_legalizing_remaining_calls() {
     let plus = egcl_rt::symbols::intern("+");
     let symbol = egcl_rt::symbols::intern("optimized-transfer-probe");
     let mut source = body();
-    source.code = vec![Instr::LoadLocal(0), Instr::LoadLocal(1),
-        Instr::CallNamed { sym: plus, nargs: 2 },
-        Instr::CallNamed { sym: 123456, nargs: 1 }, Instr::Return];
+    source.code = vec![
+        Instr::LoadLocal(0),
+        Instr::LoadLocal(1),
+        Instr::CallNamed {
+            sym: plus,
+            nargs: 2,
+        },
+        Instr::CallNamed {
+            sym: 123456,
+            nargs: 1,
+        },
+        Instr::Return,
+    ];
     let mut ir = build::build_for_transfer_optimization(&source, symbol).unwrap();
-    assert_eq!(speculate::speculate(&mut ir, &|_| Some(speculate::SpecType::Fixnum)), 1);
-    build::legalize_transfer_calls(&mut ir,
-        &egcl_compiler::control_scope::ScopeMap::analyze_function(&source).unwrap()).unwrap();
+    assert_eq!(
+        speculate::speculate(&mut ir, &|_| Some(speculate::SpecType::Fixnum)),
+        1
+    );
+    build::legalize_transfer_calls(
+        &mut ir,
+        &egcl_compiler::control_scope::ScopeMap::analyze_function(&source).unwrap(),
+    )
+    .unwrap();
     verify(&ir).unwrap();
     assert_eq!(instructions(&ir, Opcode::FixnumAdd).len(), 1);
     assert_eq!(instructions(&ir, Opcode::Invoke).len(), 1);
@@ -648,22 +670,27 @@ fn optimize_arithmetic_before_legalizing_remaining_calls() {
     assert_eq!(state.scopes[0].function, symbol);
     assert_eq!(state.scopes[0].bcp, 2);
     let invoke = ir.inst(instructions(&ir, Opcode::Invoke)[0]);
-    assert_eq!(ir.frame_states.get(invoke.frame_state.unwrap()).scopes[0].bcp, 3);
+    assert_eq!(
+        ir.frame_states.get(invoke.frame_state.unwrap()).scopes[0].bcp,
+        3
+    );
 }
 
 #[test]
 fn framed_capture_rejects_a_home_outside_the_emitted_frame() {
-    use std::collections::HashMap;
     use egcl_compiler::t2::lower::lower;
     use egcl_compiler::t2::regalloc::allocate_framed;
     use egcl_compiler::t2::transfer_map::lower_framed_transfer_maps;
-    use egcl_compiler::t2::x64_frame::{select_frame_homes, ValueHome};
+    use egcl_compiler::t2::x64_frame::{ValueHome, select_frame_homes};
+    use std::collections::HashMap;
     let f = function_with_capture_only_local();
     let mut machine = lower(&f);
     allocate_framed(&mut machine).unwrap();
     let captured = f.block(f.entry()).params[1];
     let mut homes = select_frame_homes(&f, &machine, |_| false).unwrap();
-    homes.values.insert(captured, ValueHome::Stack(homes.stack_slots));
+    homes
+        .values
+        .insert(captured, ValueHome::Stack(homes.stack_slots));
     assert!(
         lower_framed_transfer_maps(&f, &machine, &homes, &HashMap::new()).is_err(),
         "a live value cannot be recovered from a slot outside the final frame"
@@ -672,10 +699,10 @@ fn framed_capture_rejects_a_home_outside_the_emitted_frame() {
 
 #[test]
 fn resolved_frame_maps_refuse_missing_live_values() {
-    use std::collections::HashMap;
     use egcl_compiler::t2::lower::lower;
     use egcl_compiler::t2::regalloc::allocate_framed;
     use egcl_compiler::t2::x64_frame::{resolve_safepoint_maps, select_frame_homes};
+    use std::collections::HashMap;
     let f = function_with_capture_only_local();
     let mut machine = lower(&f);
     allocate_framed(&mut machine).unwrap();
@@ -694,12 +721,21 @@ fn full_register_pool_preserves_optimized_transfer_guards() {
     use egcl_compiler::t2::{build, emit, pass, speculate};
     if std::env::var("EGCL_TRANSFER_FULL_POOL_CHILD").as_deref() != Ok("1") {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "full_register_pool_preserves_optimized_transfer_guards", "--nocapture"])
+            .args([
+                "--exact",
+                "full_register_pool_preserves_optimized_transfer_guards",
+                "--nocapture",
+            ])
             .env("EGCL_TRANSFER_FULL_POOL_CHILD", "1")
             .env("EGCL_T2_FRAME_ENV", "full")
-            .output().unwrap();
-        assert!(output.status.success(), "{}\n{}",
-            String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
         return;
     }
     let plus = egcl_rt::symbols::intern("+");
@@ -712,10 +748,24 @@ fn full_register_pool_preserves_optimized_transfer_guards() {
     source.min_args = 3;
     source.max_args = Some(3);
     source.code = vec![
-        Instr::CallNamed { sym: 123456, nargs: 0 }, Instr::Pop,
-        Instr::LoadLocal(0), Instr::LoadLocal(1), Instr::Const(0),
-        Instr::CallNamed { sym: plus, nargs: 2 },
-        Instr::LoadLocal(2), Instr::CallNamed { sym: 123457, nargs: 3 }, Instr::Return,
+        Instr::CallNamed {
+            sym: 123456,
+            nargs: 0,
+        },
+        Instr::Pop,
+        Instr::LoadLocal(0),
+        Instr::LoadLocal(1),
+        Instr::Const(0),
+        Instr::CallNamed {
+            sym: plus,
+            nargs: 2,
+        },
+        Instr::LoadLocal(2),
+        Instr::CallNamed {
+            sym: 123457,
+            nargs: 3,
+        },
+        Instr::Return,
     ];
     let mut ir = build::build_for_transfer_optimization(&source, symbol).unwrap();
     assert!(speculate::speculate(&mut ir, &|_| Some(speculate::SpecType::Fixnum)) > 0);
@@ -726,54 +776,123 @@ fn full_register_pool_preserves_optimized_transfer_guards() {
     passes.add(Box::new(egcl_compiler::t2::opt_clear_mv::ClearMvElim));
     passes.add(Box::new(egcl_compiler::t2::opt_dce::Dce));
     passes.run(&mut ir);
-    build::legalize_transfer_calls(&mut ir,
-        &egcl_compiler::control_scope::ScopeMap::analyze_function(&source).unwrap()).unwrap();
+    build::legalize_transfer_calls(
+        &mut ir,
+        &egcl_compiler::control_scope::ScopeMap::analyze_function(&source).unwrap(),
+    )
+    .unwrap();
     let (emitted, _) = emit::emit_framed_native_handlers_with_recursion(
-        &ir, 1, source.num_slots(), 1, 1, 1, 1, 1, 1, None, Some(1),
-    ).expect("the full register pool must retain optimized native admission");
-    assert!(emitted.has_deopt, "do not silently replace the guarded body with baseline code");
+        &ir,
+        1,
+        source.num_slots(),
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        None,
+        Some(1),
+    )
+    .expect("the full register pool must retain optimized native admission");
+    assert!(
+        emitted.has_deopt,
+        "do not silently replace the guarded body with baseline code"
+    );
 }
 
 #[test]
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 fn global_operations_after_unknown_mv_keep_an_optimized_mapped_continuation() {
-    use egcl_compiler::t2::{build, emit};
     use egcl_compiler::control_scope::ScopeMap;
+    use egcl_compiler::t2::{build, emit};
     let mut source = body();
     source.code = vec![
-        Instr::CallNamed { sym: 123456, nargs: 0 }, Instr::Pop,
-        Instr::LoadGlobal(123457), Instr::StoreGlobal(123458),
-        Instr::LoadFunction(123459), Instr::Return,
+        Instr::CallNamed {
+            sym: 123456,
+            nargs: 0,
+        },
+        Instr::Pop,
+        Instr::LoadGlobal(123457),
+        Instr::StoreGlobal(123458),
+        Instr::LoadFunction(123459),
+        Instr::Return,
     ];
     let ordinary = build::build_for_transfer_optimization(&source, 123455).unwrap();
-    let sites: Vec<_> = ordinary.block_order().iter()
+    let sites: Vec<_> = ordinary
+        .block_order()
+        .iter()
         .flat_map(|&block| ordinary.block(block).insts.iter().copied())
-        .filter(|&inst| matches!(ordinary.inst(inst).opcode,
-            Opcode::SymbolValue | Opcode::SetSymbolValue | Opcode::SymbolFunction))
-        .map(|inst| (inst, ordinary.inst(inst).opcode, ordinary.inst(inst).frame_state,
-            ordinary.inst(inst).source_pos)).collect();
+        .filter(|&inst| {
+            matches!(
+                ordinary.inst(inst).opcode,
+                Opcode::SymbolValue | Opcode::SetSymbolValue | Opcode::SymbolFunction
+            )
+        })
+        .map(|inst| {
+            (
+                inst,
+                ordinary.inst(inst).opcode,
+                ordinary.inst(inst).frame_state,
+                ordinary.inst(inst).source_pos,
+            )
+        })
+        .collect();
     assert_eq!(sites.len(), 3);
-    assert!(emit::lower_ordinary_primitives(&mut ordinary.clone(), |_| Some(123460)).is_err(),
-        "the preceding call leaves an unknown MV tuple which primitives must preserve");
+    assert!(
+        emit::lower_ordinary_primitives(&mut ordinary.clone(), |_| Some(123460)).is_err(),
+        "the preceding call leaves an unknown MV tuple which primitives must preserve"
+    );
     let mut mapped = ordinary.clone();
-    build::legalize_transfer_calls(&mut mapped, &ScopeMap::analyze_function(&source).unwrap()).unwrap();
+    build::legalize_transfer_calls(&mut mapped, &ScopeMap::analyze_function(&source).unwrap())
+        .unwrap();
     verify(&mapped).unwrap();
     for (inst, opcode, state, position) in sites {
-        assert_eq!(ordinary.inst(inst).opcode, opcode, "ordinary candidate remains untouched");
+        assert_eq!(
+            ordinary.inst(inst).opcode,
+            opcode,
+            "ordinary candidate remains untouched"
+        );
         let data = mapped.inst(inst);
         assert_eq!(data.opcode, Opcode::Invoke);
-        assert_eq!(data.frame_state, state, "retain the exact pre-effect continuation");
+        assert_eq!(
+            data.frame_state, state,
+            "retain the exact pre-effect continuation"
+        );
         assert_eq!(data.source_pos, position);
-        assert!(matches!((&data.aux, opcode),
-            (AuxData::GlobalValue { symbol: 123457, store: false }, Opcode::SymbolValue)
-            | (AuxData::GlobalValue { symbol: 123458, store: true }, Opcode::SetSymbolValue)
-            | (AuxData::FunctionLookup(123459), Opcode::SymbolFunction)));
+        assert!(matches!(
+            (&data.aux, opcode),
+            (
+                AuxData::GlobalValue {
+                    symbol: 123457,
+                    store: false
+                },
+                Opcode::SymbolValue
+            ) | (
+                AuxData::GlobalValue {
+                    symbol: 123458,
+                    store: true
+                },
+                Opcode::SetSymbolValue
+            ) | (AuxData::FunctionLookup(123459), Opcode::SymbolFunction)
+        ));
         let cold = mapped.inst(mapped.terminator(data.targets[1].block).unwrap());
         assert_eq!(cold.opcode, Opcode::NlxTransfer);
         assert_eq!(cold.frame_state, state);
     }
     let (emitted, _) = emit::emit_framed_native_handlers_with_recursion(
-        &mapped, 1, source.num_slots(), 1, 1, 1, 1, 1, 1, None, Some(1),
-    ).expect("mapped fallback must emit the same optimized IR after ordinary rejection");
+        &mapped,
+        1,
+        source.num_slots(),
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        None,
+        Some(1),
+    )
+    .expect("mapped fallback must emit the same optimized IR after ordinary rejection");
     assert!(emitted.frame_entry.is_some());
 }

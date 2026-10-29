@@ -198,8 +198,20 @@ fn redundant_bounded_cycle_polls(
         }
         let kernel = f.inst(body[body.len() - 2]);
         let branch = f.inst(body[body.len() - 1]);
-        if !matches!(kernel.opcode, Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8 | Opcode::TryStoreIntegerOctets1To8Layout | Opcode::TryStoreIntegerOctets1To8Extent)
-            || kernel.args.len() != if kernel.opcode == Opcode::TryStoreIntegerOctets1To8Layout { 5 } else if kernel.opcode == Opcode::TryStoreIntegerOctets1To8Extent { 6 } else { 4 }
+        if !matches!(
+            kernel.opcode,
+            Opcode::TryStoreIntegerOctets8
+                | Opcode::TryStoreIntegerOctets1To8
+                | Opcode::TryStoreIntegerOctets1To8Layout
+                | Opcode::TryStoreIntegerOctets1To8Extent
+        ) || kernel.args.len()
+            != if kernel.opcode == Opcode::TryStoreIntegerOctets1To8Layout {
+                5
+            } else if kernel.opcode == Opcode::TryStoreIntegerOctets1To8Extent {
+                6
+            } else {
+                4
+            }
             || kernel.results.len() != 2
             || !kernel.flags.effectful
             || kernel.flags.call
@@ -240,8 +252,13 @@ fn redundant_bounded_cycle_polls(
         // still remove the success-entry check.
         if body[..body.len() - 2].iter().any(|&inst| {
             let d = f.inst(inst);
-            matches!(d.opcode, Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8 | Opcode::TryStoreIntegerOctets1To8Layout | Opcode::TryStoreIntegerOctets1To8Extent)
-                || !d.targets.is_empty()
+            matches!(
+                d.opcode,
+                Opcode::TryStoreIntegerOctets8
+                    | Opcode::TryStoreIntegerOctets1To8
+                    | Opcode::TryStoreIntegerOctets1To8Layout
+                    | Opcode::TryStoreIntegerOctets1To8Extent
+            ) || !d.targets.is_empty()
                 || d.flags.terminator
         }) {
             continue;
@@ -306,16 +323,16 @@ fn redundant_bounded_cycle_polls(
 use crate::t2::x64_calls::{
     CallReturn, NativeCallOrigin, NativeCallSites, NativeCallValues, NativeStackBase,
 };
-use crate::t2::x64_value_maps::{NativeFrameLayout, NativeFrameValues, NativeValueArea};
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 use crate::t2::x64_value_maps::NativeValueLocation;
+use crate::t2::x64_value_maps::{NativeFrameLayout, NativeFrameValues, NativeValueArea};
 use egcl_rt::asm::{Asm, Cc};
 
 use crate::t2::ir::Function;
 use crate::t2::mach::{EditPosition, Location, MachFunc, MachInst, PhysReg, RegClass, VReg};
 use crate::t2::slot_map;
 use crate::t2::slot_map::ConversionKind;
-use crate::t2::x64_frame::{select_frame_homes, ValueHome as FramedHome, GPR_X86};
+use crate::t2::x64_frame::{GPR_X86, ValueHome as FramedHome, select_frame_homes};
 
 #[path = "emit_integer_shift.rs"]
 mod integer_shift;
@@ -333,8 +350,10 @@ mod octet_word_store;
 #[path = "ordinary_leaf.rs"]
 mod ordinary_leaf;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-pub use ordinary_leaf::{emit_framed_ordinary_leaf, OrdinaryArgumentBinding, OrdinaryKeywordArguments,
-    OrdinaryLispEntryOptions, OrdinaryOptionalArguments};
+pub use ordinary_leaf::{
+    OrdinaryArgumentBinding, OrdinaryKeywordArguments, OrdinaryLispEntryOptions,
+    OrdinaryOptionalArguments, emit_framed_ordinary_leaf,
+};
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[path = "ordinary_call.rs"]
 mod ordinary_call;
@@ -348,14 +367,14 @@ mod ordinary_prefix;
 mod inline_alloc;
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-#[path = "shared_deopt.rs"]
-mod shared_deopt;
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[path = "branch_relax.rs"]
 mod branch_relax;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[path = "inline_packed_u8.rs"]
 mod inline_packed_u8;
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[path = "shared_deopt.rs"]
+mod shared_deopt;
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[path = "inline_special.rs"]
@@ -380,14 +399,21 @@ fn is_global_special(symbol: u32) -> bool {
 #[path = "ordinary_primitives.rs"]
 mod ordinary_primitives;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub use ordinary_call::{
+    OrdinaryCallFlags, OrdinaryCallTarget, OrdinaryColdRequest, OrdinaryGuardOptions,
+    OrdinaryGuardRequest, OrdinarySelfCallFacts, emit_framed_ordinary_call,
+    emit_framed_ordinary_function, emit_framed_ordinary_function_with_poll,
+    emit_framed_ordinary_function_with_self_call_facts,
+    emit_framed_ordinary_function_with_self_calls, emit_framed_ordinary_guarded_call,
+    emit_framed_ordinary_tail_call, emit_framed_ordinary_two_calls,
+};
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub(crate) use ordinary_primitives::packed_u8_adapter;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-pub use ordinary_primitives::{OrdinaryPrimitive, lower_ordinary_primitives,
-    PackedU8AdapterSymbols, register_packed_u8_adapter};
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-pub use ordinary_call::{emit_framed_ordinary_call, emit_framed_ordinary_tail_call,
-    emit_framed_ordinary_guarded_call, emit_framed_ordinary_two_calls, emit_framed_ordinary_function, emit_framed_ordinary_function_with_poll, emit_framed_ordinary_function_with_self_calls, emit_framed_ordinary_function_with_self_call_facts, OrdinarySelfCallFacts, OrdinaryCallTarget, OrdinaryCallFlags,
-    OrdinaryColdRequest, OrdinaryGuardOptions, OrdinaryGuardRequest};
+pub use ordinary_primitives::{
+    OrdinaryPrimitive, PackedU8AdapterSymbols, lower_ordinary_primitives,
+    register_packed_u8_adapter,
+};
 
 #[cfg(all(test, target_arch = "x86_64"))]
 #[path = "frame_tests.rs"]
@@ -815,18 +841,24 @@ fn add_sub_cannot_overflow(
     right: Option<crate::t2::ir::Range>,
     subtract: bool,
 ) -> bool {
-    let (Some(left), Some(right)) = (left, right) else { return false };
+    let (Some(left), Some(right)) = (left, right) else {
+        return false;
+    };
     for range in [left, right] {
         if range.lo > range.hi || range.lo < FIXNUM_MIN || range.hi > FIXNUM_MAX {
             return false;
         }
     }
     let (lo, hi) = if subtract {
-        (i128::from(left.lo) - i128::from(right.hi),
-         i128::from(left.hi) - i128::from(right.lo))
+        (
+            i128::from(left.lo) - i128::from(right.hi),
+            i128::from(left.hi) - i128::from(right.lo),
+        )
     } else {
-        (i128::from(left.lo) + i128::from(right.lo),
-         i128::from(left.hi) + i128::from(right.hi))
+        (
+            i128::from(left.lo) + i128::from(right.lo),
+            i128::from(left.hi) + i128::from(right.hi),
+        )
     };
     lo >= i128::from(FIXNUM_MIN) && hi <= i128::from(FIXNUM_MAX)
 }
@@ -924,13 +956,23 @@ fn float_operand_to_xmm(
             mov_rr(a, SCRATCH, r);
             sar_imm(a, SCRATCH, 3); // the fixnum's integer value
             // cvtsi2ss xmm, rdx
-            a.extend_from_slice(&[0xF3, 0x48 | (((xmm >> 3) & 1) << 2), 0x0F, 0x2A,
-                modrm_rr(xmm, SCRATCH)]);
+            a.extend_from_slice(&[
+                0xF3,
+                0x48 | (((xmm >> 3) & 1) << 2),
+                0x0F,
+                0x2A,
+                modrm_rr(xmm, SCRATCH),
+            ]);
             // Round-trip through RAX, preserved in xmm2: cvttss2si rax, xmm
             // gives the integer back only when the conversion was exact.
             a.extend_from_slice(&[0x66, 0x48, 0x0F, 0x6E, modrm_rr(2, RAX)]); // movq xmm2, rax
-            a.extend_from_slice(&[0xF3, 0x48 | ((xmm >> 3) & 1), 0x0F, 0x2C,
-                modrm_rr(RAX, xmm)]);
+            a.extend_from_slice(&[
+                0xF3,
+                0x48 | ((xmm >> 3) & 1),
+                0x0F,
+                0x2C,
+                modrm_rr(RAX, xmm),
+            ]);
             cmp_rr(a, RAX, SCRATCH);
             a.extend_from_slice(&[0x66, 0x48, 0x0F, 0x7E, modrm_rr(2, RAX)]); // movq rax, xmm2
             a.jcc(Cc::Ne, deopt);
@@ -986,8 +1028,17 @@ fn float_operands_to_xmm(
     for (xmm, (value, other)) in [(lhs, rhs), (rhs, lhs)].into_iter().enumerate() {
         // A fixnum constant partner would make a fixnum variable a fixnum pair.
         let accept_fixnum = !consts.contains_key(other);
-        float_operand_to_xmm(a, xmm as u8, *value, reg, consts, float_consts,
-            proven_single_float, accept_fixnum, deopt)?;
+        float_operand_to_xmm(
+            a,
+            xmm as u8,
+            *value,
+            reg,
+            consts,
+            float_consts,
+            proven_single_float,
+            accept_fixnum,
+            deopt,
+        )?;
     }
     Ok(())
 }
@@ -1333,11 +1384,18 @@ fn emit_call_root_sync(
     slots: u16,
 ) -> Result<(), EmitError> {
     match area {
-        NativeValueArea::Activation(base) => emit_shadow_root_sync(a, roots, homes, frame_base, base, slots),
+        NativeValueArea::Activation(base) => {
+            emit_shadow_root_sync(a, roots, homes, frame_base, base, slots)
+        }
         NativeValueArea::NativeStack(base) => {
             // Exact native maps scan only live copies; unused slots need no NIL clearing.
             for (index, value) in roots.iter().enumerate() {
-                load_home(a, RAX, *homes.get(value).ok_or(EmitError::UnsupportedOp(0xFC))?, 0);
+                load_home(
+                    a,
+                    RAX,
+                    *homes.get(value).ok_or(EmitError::UnsupportedOp(0xFC))?,
+                    0,
+                );
                 store_home(a, FramedHome::Stack(base + index as u32), RAX, 0);
             }
             Ok(())
@@ -1354,12 +1412,19 @@ fn emit_call_root_restore(
     area: NativeValueArea,
 ) -> Result<(), EmitError> {
     match area {
-        NativeValueArea::Activation(base) => emit_shadow_root_restore(a, roots, restore, homes, frame_base, base),
+        NativeValueArea::Activation(base) => {
+            emit_shadow_root_restore(a, roots, restore, homes, frame_base, base)
+        }
         NativeValueArea::NativeStack(base) => {
             for (index, value) in roots.iter().enumerate() {
                 if restore.contains(value) {
                     load_home(a, RAX, FramedHome::Stack(base + index as u32), 0);
-                    store_home(a, *homes.get(value).ok_or(EmitError::UnsupportedOp(0xFC))?, RAX, 0);
+                    store_home(
+                        a,
+                        *homes.get(value).ok_or(EmitError::UnsupportedOp(0xFC))?,
+                        RAX,
+                        0,
+                    );
                 }
             }
             Ok(())
@@ -1457,7 +1522,12 @@ pub struct NativePollFastPath {
 /// poll clears the notification, before draining its authoritative sources.
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 fn emit_execution_poll_guard(a: &mut Asm, execution: u8, slow: egcl_rt::asm::Label) {
-    load_mem64_disp(a, SCRATCH, execution, egcl_rt::exec_context::offsets::POLL_SLOT as i32);
+    load_mem64_disp(
+        a,
+        SCRATCH,
+        execution,
+        egcl_rt::exec_context::offsets::POLL_SLOT as i32,
+    );
     load_mem64_disp(a, RAX, SCRATCH, 0);
     alu_r_imm(a, 7, RAX, 0);
     a.jcc(Cc::Ne, slow);
@@ -1467,19 +1537,32 @@ fn emit_execution_poll_guard(a: &mut Asm, execution: u8, slow: egcl_rt::asm::Lab
 /// the caller has not spilled or published any roots yet. x86 loads provide the
 /// required Acquire/SeqCst load ordering for these runtime atomic cells.
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-fn emit_idle_poll_guard(a: &mut Asm, fast: NativePollFastPath, home: FramedHome,
-    idle: egcl_rt::asm::Label)
-{
+fn emit_idle_poll_guard(
+    a: &mut Asm,
+    fast: NativePollFastPath,
+    home: FramedHome,
+    idle: egcl_rt::asm::Label,
+) {
     use std::mem::offset_of;
     let slow = a.label();
     load_home(a, 7, home, 0);
     alu_r_imm(a, 7, 7, 0);
     a.jcc(Cc::E, slow);
-    load_mem64_disp(a, SCRATCH, 7, offset_of!(NativePollControl, execution) as i32);
+    load_mem64_disp(
+        a,
+        SCRATCH,
+        7,
+        offset_of!(NativePollControl, execution) as i32,
+    );
     emit_execution_poll_guard(a, SCRATCH, slow);
     if fast.observe_forces_cold {
         let no_observer = a.label();
-        load_mem64_disp(a, SCRATCH, 7, offset_of!(NativePollControl, test_observer) as i32);
+        load_mem64_disp(
+            a,
+            SCRATCH,
+            7,
+            offset_of!(NativePollControl, test_observer) as i32,
+        );
         alu_r_imm(a, 7, SCRATCH, 0);
         a.jcc(Cc::E, no_observer);
         load_mem64_disp(a, RAX, SCRATCH, 0);
@@ -1488,7 +1571,12 @@ fn emit_idle_poll_guard(a: &mut Asm, fast: NativePollFastPath, home: FramedHome,
         a.bind(no_observer);
     }
     if fast.instrument_skips {
-        load_mem64_disp(a, SCRATCH, 7, offset_of!(NativePollControl, test_skips) as i32);
+        load_mem64_disp(
+            a,
+            SCRATCH,
+            7,
+            offset_of!(NativePollControl, test_skips) as i32,
+        );
         alu_r_imm(a, 7, SCRATCH, 0);
         a.jcc(Cc::E, slow);
         a.extend_from_slice(&[0x48, 0xff, 0x02]); // inc qword [rdx]
@@ -1523,20 +1611,25 @@ fn emit_mapped_poll(
     veneer: u64,
     heat: bool,
 ) -> Result<(CallReturn, std::sync::Arc<NativeFrameValues>), EmitError> {
-    let idle = frame.fast_path.map(|(fast, home)| {
-        let idle = a.label();
-        emit_idle_poll_guard(a, fast, home, idle);
-        idle
-    }).or_else(|| frame.execution_idle.then(|| {
-        // The ordinary entry holds the current execution in R13 for its
-        // whole extent; ordinary call admission reads this same slot.
-        let idle = a.label();
-        let slow = a.label();
-        emit_execution_poll_guard(a, 13, slow);
-        a.jmp(idle);
-        a.bind(slow);
-        idle
-    }));
+    let idle = frame
+        .fast_path
+        .map(|(fast, home)| {
+            let idle = a.label();
+            emit_idle_poll_guard(a, fast, home, idle);
+            idle
+        })
+        .or_else(|| {
+            frame.execution_idle.then(|| {
+                // The ordinary entry holds the current execution in R13 for its
+                // whole extent; ordinary call admission reads this same slot.
+                let idle = a.label();
+                let slow = a.label();
+                emit_execution_poll_guard(a, 13, slow);
+                a.jmp(idle);
+                a.bind(slow);
+                idle
+            })
+        });
     for (index, home) in values.raw_registers().enumerate() {
         load_home(a, RAX, home, 0);
         store_home(
@@ -1548,14 +1641,22 @@ fn emit_mapped_poll(
     }
     let layout = NativeFrameLayout {
         native_slots: frame.native_slots,
-        activation_base_slot: if frame.native_frame_mode { None } else { match frame.base {
-            FramedHome::Stack(slot) => Some(slot),
-            _ => return Err(EmitError::UnsupportedOp(0xFE)),
-        } },
-        activation_slots: if frame.native_frame_mode { 0 } else { frame
-            .activation_slots
-            .checked_add(frame.shadow_slots)
-            .ok_or(EmitError::UnsupportedOp(0xFE))? },
+        activation_base_slot: if frame.native_frame_mode {
+            None
+        } else {
+            match frame.base {
+                FramedHome::Stack(slot) => Some(slot),
+                _ => return Err(EmitError::UnsupportedOp(0xFE)),
+            }
+        },
+        activation_slots: if frame.native_frame_mode {
+            0
+        } else {
+            frame
+                .activation_slots
+                .checked_add(frame.shadow_slots)
+                .ok_or(EmitError::UnsupportedOp(0xFE))?
+        },
     };
     let map = std::sync::Arc::new(
         NativeFrameValues::for_call_in_area(
@@ -1579,22 +1680,18 @@ fn emit_mapped_poll(
         frame.spill_area,
         frame.shadow_slots,
     )?;
-    if frame.native_frame_mode { mov_imm64(a, 7, 0); }
-    else { load_home(a, 7, frame.base, 0); }
+    if frame.native_frame_mode {
+        mov_imm64(a, 7, 0);
+    } else {
+        load_home(a, 7, frame.base, 0);
+    }
     if heat && frame.fast_path.is_none() && !frame.execution_idle {
         a.extend_from_slice(&[0x48, 0x83, 0xcf, 0x01]); // or rdi,1
     }
     mov_imm64(a, RAX, veneer as i64);
     let site = emit_runtime_helper_call(a, 0, None);
     let restore = roots.iter().copied().collect();
-    emit_call_root_restore(
-        a,
-        roots,
-        &restore,
-        homes,
-        frame.base,
-        frame.spill_area,
-    )?;
+    emit_call_root_restore(a, roots, &restore, homes, frame.base, frame.spill_area)?;
     for (index, home) in values.raw_registers().enumerate() {
         load_home(
             a,
@@ -1604,7 +1701,9 @@ fn emit_mapped_poll(
         );
         store_home(a, home, RAX, 0);
     }
-    if let Some(idle) = idle { a.bind(idle); }
+    if let Some(idle) = idle {
+        a.bind(idle);
+    }
     Ok((site, map))
 }
 
@@ -1629,18 +1728,31 @@ fn emit_mapped_box(
 ) -> Result<(CallReturn, std::sync::Arc<NativeFrameValues>), EmitError> {
     for (index, home) in values.raw_registers().enumerate() {
         load_home(a, RAX, home, 0);
-        store_home(a, FramedHome::Stack(frame.raw_spill_start + index as u32), RAX, 0);
+        store_home(
+            a,
+            FramedHome::Stack(frame.raw_spill_start + index as u32),
+            RAX,
+            0,
+        );
     }
     let layout = NativeFrameLayout {
         native_slots: frame.native_slots,
-        activation_base_slot: if frame.native_frame_mode { None } else { match frame.base {
-            FramedHome::Stack(slot) => Some(slot),
-            _ => return Err(EmitError::UnsupportedOp(0xFE)),
-        } },
-        activation_slots: if frame.native_frame_mode { 0 } else { frame
-            .activation_slots
-            .checked_add(frame.shadow_slots)
-            .ok_or(EmitError::UnsupportedOp(0xFE))? },
+        activation_base_slot: if frame.native_frame_mode {
+            None
+        } else {
+            match frame.base {
+                FramedHome::Stack(slot) => Some(slot),
+                _ => return Err(EmitError::UnsupportedOp(0xFE)),
+            }
+        },
+        activation_slots: if frame.native_frame_mode {
+            0
+        } else {
+            frame
+                .activation_slots
+                .checked_add(frame.shadow_slots)
+                .ok_or(EmitError::UnsupportedOp(0xFE))?
+        },
     };
     let map = std::sync::Arc::new(
         NativeFrameValues::for_call_in_area(
@@ -1656,7 +1768,14 @@ fn emit_mapped_box(
         .and_then(|map| map.with_native_arguments(&frame.arguments, |_| false))
         .map_err(|_| EmitError::UnsupportedOp(0xFE))?,
     );
-    emit_call_root_sync(a, roots, homes, frame.base, frame.spill_area, frame.shadow_slots)?;
+    emit_call_root_sync(
+        a,
+        roots,
+        homes,
+        frame.base,
+        frame.spill_area,
+        frame.shadow_slots,
+    )?;
     // The raw input is read from its own home after the copies above, which
     // only store; the request word is the double's IEEE bits.
     load_home(a, 7, input, 0);
@@ -1667,7 +1786,12 @@ fn emit_mapped_box(
     let restore = roots.iter().copied().collect();
     emit_call_root_restore(a, roots, &restore, homes, frame.base, frame.spill_area)?;
     for (index, home) in values.raw_registers().enumerate() {
-        load_home(a, RAX, FramedHome::Stack(frame.raw_spill_start + index as u32), 0);
+        load_home(
+            a,
+            RAX,
+            FramedHome::Stack(frame.raw_spill_start + index as u32),
+            0,
+        );
         store_home(a, home, RAX, 0);
     }
     // Last, so a dying input sharing the result's home cannot overwrite it.
@@ -1747,16 +1871,22 @@ fn parallel_home_move(a: &mut Asm, moves: &[(FramedHome, HomeMoveSrc)]) {
 fn parallel_home_move_cycles(a: &mut Asm, moves: &[(FramedHome, HomeMoveSrc)]) -> bool {
     use std::collections::{HashMap, HashSet};
     let valid_home = |home| match home {
-        FramedHome::Reg(reg) => crate::t2::x64_frame::FRAME_GPRS.iter()
+        FramedHome::Reg(reg) => crate::t2::x64_frame::FRAME_GPRS
+            .iter()
             .any(|&index| crate::t2::x64_frame::GPR_X86[index] == reg),
         FramedHome::Stack(slot) => slot <= i32::MAX as u32 / 8,
     };
     let mut edges = HashMap::new();
     let mut sources = HashSet::new();
     for &(dst, src) in moves {
-        let HomeMoveSrc::Home(src) = src else { return false; };
-        if !valid_home(dst) || !valid_home(src) || edges.insert(dst, src).is_some()
-            || !sources.insert(src) {
+        let HomeMoveSrc::Home(src) = src else {
+            return false;
+        };
+        if !valid_home(dst)
+            || !valid_home(src)
+            || edges.insert(dst, src).is_some()
+            || !sources.insert(src)
+        {
             return false;
         }
     }
@@ -1765,7 +1895,9 @@ fn parallel_home_move_cycles(a: &mut Asm, moves: &[(FramedHome, HomeMoveSrc)]) -
     }
     // Follow input order, not HashMap iteration, for deterministic emission.
     for &(first, _) in moves {
-        if !edges.contains_key(&first) { continue; }
+        if !edges.contains_key(&first) {
+            continue;
+        }
         load_home(a, 7, first, 0);
         let mut dst = first;
         loop {
@@ -1815,19 +1947,30 @@ fn parallel_home_move_snapshot(a: &mut Asm, moves: &[(FramedHome, HomeMoveSrc)])
 /// Raw fixnums remain signed 61-bit mathematical integers. Compute into reserved
 /// registers so a failed range guard leaves every pre-operation SSA home intact.
 fn emit_raw_fixnum_inst(
-    a: &mut Asm, f: &Function, data: &crate::t2::ir::InstData,
+    a: &mut Asm,
+    f: &Function,
+    data: &crate::t2::ir::InstData,
     reg: &std::collections::HashMap<crate::t2::ir::Value, u8>,
     consts: &std::collections::HashMap<crate::t2::ir::Value, i64>,
     deopt: egcl_rt::asm::Label,
 ) -> Result<(), EmitError> {
     use crate::t2::ir::Opcode;
     let load = |a: &mut Asm, value, target| -> Result<(), EmitError> {
-        if let Some(&n) = consts.get(&value) { mov_imm64(a, target, n); }
-        else { mov_rr(a, target, *reg.get(&value).ok_or(EmitError::UnsupportedOp(0xF2))?); }
+        if let Some(&n) = consts.get(&value) {
+            mov_imm64(a, target, n);
+        } else {
+            mov_rr(
+                a,
+                target,
+                *reg.get(&value).ok_or(EmitError::UnsupportedOp(0xF2))?,
+            );
+        }
         Ok(())
     };
     load(a, data.args[0], RAX)?;
-    if data.args.len() > 1 { load(a, data.args[1], 7)?; }
+    if data.args.len() > 1 {
+        load(a, data.args[1], 7)?;
+    }
     let mut range_guard = false;
     if let Some(cc) = fixnum_cmp_cc(data.opcode) {
         cmp_rr(a, RAX, 7);
@@ -1840,38 +1983,65 @@ fn emit_raw_fixnum_inst(
         return Ok(());
     }
     match data.opcode {
-        Opcode::FixnumAdd => { alu_rr(a, 0x01, RAX, 7);
-            range_guard = !add_sub_cannot_overflow(f.value(data.args[0]).ty.range, f.value(data.args[1]).ty.range, false); }
-        Opcode::FixnumSub => { alu_rr(a, 0x29, RAX, 7);
-            range_guard = !add_sub_cannot_overflow(f.value(data.args[0]).ty.range, f.value(data.args[1]).ty.range, true); }
-        Opcode::FixnumMul => { imul_rr(a, RAX, 7); a.jcc(Cc::O, deopt); range_guard = true; }
-        Opcode::FixnumNeg => { neg_r(a, RAX); range_guard = true; }
+        Opcode::FixnumAdd => {
+            alu_rr(a, 0x01, RAX, 7);
+            range_guard = !add_sub_cannot_overflow(
+                f.value(data.args[0]).ty.range,
+                f.value(data.args[1]).ty.range,
+                false,
+            );
+        }
+        Opcode::FixnumSub => {
+            alu_rr(a, 0x29, RAX, 7);
+            range_guard = !add_sub_cannot_overflow(
+                f.value(data.args[0]).ty.range,
+                f.value(data.args[1]).ty.range,
+                true,
+            );
+        }
+        Opcode::FixnumMul => {
+            imul_rr(a, RAX, 7);
+            a.jcc(Cc::O, deopt);
+            range_guard = true;
+        }
+        Opcode::FixnumNeg => {
+            neg_r(a, RAX);
+            range_guard = true;
+        }
         Opcode::LogAnd => alu_rr(a, 0x21, RAX, 7),
         Opcode::LogOr => alu_rr(a, 0x09, RAX, 7),
         Opcode::LogXor => alu_rr(a, 0x31, RAX, 7),
         Opcode::LogNot => not_r(a, RAX),
         Opcode::FixnumShl | Opcode::FixnumShr => {
-            let amount = *consts.get(&data.args[1]).ok_or(EmitError::UnsupportedOp(op_tag(data.opcode)))?;
+            let amount = *consts
+                .get(&data.args[1])
+                .ok_or(EmitError::UnsupportedOp(op_tag(data.opcode)))?;
             if data.opcode == Opcode::FixnumShr || amount < 0 {
                 sar_imm(a, RAX, amount.unsigned_abs().min(63) as u8);
             } else if amount <= 60 {
                 // Guard the original operand before shifting: a 64-bit shift
                 // alone cannot distinguish values whose high bits were lost.
                 mov_imm64(a, SCRATCH, FIXNUM_MAX >> amount);
-                cmp_rr(a, RAX, SCRATCH); a.jcc(Cc::G, deopt);
+                cmp_rr(a, RAX, SCRATCH);
+                a.jcc(Cc::G, deopt);
                 mov_imm64(a, SCRATCH, FIXNUM_MIN >> amount);
-                cmp_rr(a, RAX, SCRATCH); a.jcc(Cc::L, deopt);
+                cmp_rr(a, RAX, SCRATCH);
+                a.jcc(Cc::L, deopt);
                 shl_imm(a, RAX, amount as u8);
             } else {
-                alu_r_imm(a, 7, RAX, 0); a.jcc(Cc::Ne, deopt);
+                alu_r_imm(a, 7, RAX, 0);
+                a.jcc(Cc::Ne, deopt);
             }
         }
         _ => return Err(EmitError::UnsupportedOp(op_tag(data.opcode))),
     }
     if range_guard {
         // OF only detects signed64 overflow; fixnums require exactly signed61.
-        mov_rr(a, SCRATCH, RAX); shl_imm(a, SCRATCH, 3); sar_imm(a, SCRATCH, 3);
-        cmp_rr(a, RAX, SCRATCH); a.jcc(Cc::Ne, deopt);
+        mov_rr(a, SCRATCH, RAX);
+        shl_imm(a, SCRATCH, 3);
+        sar_imm(a, SCRATCH, 3);
+        cmp_rr(a, RAX, SCRATCH);
+        a.jcc(Cc::Ne, deopt);
     }
     mov_rr(a, reg[&data.results[0]], RAX);
     Ok(())
@@ -1897,8 +2067,9 @@ fn emit_arith_inst(
     use crate::t2::ir::Opcode;
     // Robustness: never index past the operands — decline (=> stay T1) instead of
     // panicking in the JIT path if a speculated op has an unexpected shape.
-    if data.results.first().is_some_and(|&value|
-        f.value(value).repr == crate::t2::ir::ValueRepresentation::UnboxedFixnum) {
+    if data.results.first().is_some_and(|&value| {
+        f.value(value).repr == crate::t2::ir::ValueRepresentation::UnboxedFixnum
+    }) {
         return emit_raw_fixnum_inst(a, f, data, reg, consts, deopt);
     }
     let is_unary = matches!(data.opcode, Opcode::FixnumNeg | Opcode::LogNot);
@@ -1923,14 +2094,22 @@ fn emit_arith_inst(
         }
     };
     match data.opcode {
-        Opcode::FixnumMin | Opcode::FixnumMax | Opcode::FixnumDiv
-        | Opcode::FixnumFloor | Opcode::FixnumRem | Opcode::FixnumMod => {
+        Opcode::FixnumMin
+        | Opcode::FixnumMax
+        | Opcode::FixnumDiv
+        | Opcode::FixnumFloor
+        | Opcode::FixnumRem
+        | Opcode::FixnumMod => {
             // RAX, RDX and RDI are reserved by the framed allocator.
             // Load constants independently: framed_mat's shared RDX scratch
             // would otherwise overwrite a constant dividend or divisor.
             for (value, target) in [(data.args[0], RAX), (data.args[1], 7)] {
                 if let Some(&constant) = consts.get(&value) {
-                    mov_imm64(a, target, egcl_rt::value::EgclVal::from_fixnum(constant).0 as i64);
+                    mov_imm64(
+                        a,
+                        target,
+                        egcl_rt::value::EgclVal::from_fixnum(constant).0 as i64,
+                    );
                 } else {
                     let source = *reg.get(&value).ok_or(EmitError::UnsupportedOp(0xF2))?;
                     guard(a, value, source);
@@ -1940,7 +2119,14 @@ fn emit_arith_inst(
             if matches!(data.opcode, Opcode::FixnumMin | Opcode::FixnumMax) {
                 let chosen = a.label();
                 cmp_rr(a, RAX, 7);
-                a.jcc(if data.opcode == Opcode::FixnumMin { Cc::Le } else { Cc::Ge }, chosen);
+                a.jcc(
+                    if data.opcode == Opcode::FixnumMin {
+                        Cc::Le
+                    } else {
+                        Cc::Ge
+                    },
+                    chosen,
+                );
                 mov_rr(a, RAX, 7);
                 a.bind(chosen);
             } else {
@@ -2050,9 +2236,12 @@ fn emit_arith_inst(
         Opcode::FixnumAdd | Opcode::FixnumSub => {
             let is_add = data.opcode == Opcode::FixnumAdd;
             let (a0, b0) = (data.args[0], data.args[1]);
-            let range = |v| consts.get(&v)
-                .map(|&n| crate::t2::ir::Range { lo: n, hi: n })
-                .or(f.value(v).ty.range);
+            let range = |v| {
+                consts
+                    .get(&v)
+                    .map(|&n| crate::t2::ir::Range { lo: n, hi: n })
+                    .or(f.value(v).ty.range)
+            };
             let needs_overflow_check = !add_sub_cannot_overflow(range(a0), range(b0), !is_add);
             // Fold a constant right operand (add/sub var, const), or a constant left
             // operand for the commutative add.
@@ -2203,8 +2392,15 @@ fn emit_arith_inst(
             }
         }
         Opcode::FloatMul | Opcode::FloatAdd | Opcode::FloatSub => {
-            float_operands_to_xmm(a, &data.args, reg, consts, float_consts,
-                proven_single_float, deopt)?;
+            float_operands_to_xmm(
+                a,
+                &data.args,
+                reg,
+                consts,
+                float_consts,
+                proven_single_float,
+                deopt,
+            )?;
             let sub = match data.opcode {
                 Opcode::FloatAdd => 0x58,
                 Opcode::FloatMul => 0x59,
@@ -2425,20 +2621,20 @@ fn emit_call(
     // registers, so our live values survive).
     if let (Some(ss), Some(entry)) = (self_sym, self_entry) {
         const ARG_REGS: [u8; 4] = [1, 8, 9, 10]; // rcx, r8, r9, r10
-                                                 // EGCL_NO_DIRECT_SELF_CALL routes self-calls back through c2i.
-                                                 //
-                                                 // The direct self-call skips c2i_call_args, and with it the
-                                                 // native_depth_cap() check that is the ONLY bound on recursion depth in
-                                                 // compiled code — the T2 prologue has no stack guard. A deeply
-                                                 // self-recursive function therefore runs off the C stack and returns a
-                                                 // WRONG ANSWER rather than signalling: (deep 400000) answers 30, and
-                                                 // (deep 200000) answers a raw stack address. T0 and T1 both raise the
-                                                 // STORAGE-CONDITION they should (bliss-b4fd).
-                                                 //
-                                                 // This flag is the workaround and the bisection tool, not the fix. The
-                                                 // fix is a stack guard in the prologue, because the optimization is
-                                                 // worth far too much to simply drop: without it fib(30) goes from 3ms to
-                                                 // 498ms, a 166x regression.
+        // EGCL_NO_DIRECT_SELF_CALL routes self-calls back through c2i.
+        //
+        // The direct self-call skips c2i_call_args, and with it the
+        // native_depth_cap() check that is the ONLY bound on recursion depth in
+        // compiled code — the T2 prologue has no stack guard. A deeply
+        // self-recursive function therefore runs off the C stack and returns a
+        // WRONG ANSWER rather than signalling: (deep 400000) answers 30, and
+        // (deep 200000) answers a raw stack address. T0 and T1 both raise the
+        // STORAGE-CONDITION they should (bliss-b4fd).
+        //
+        // This flag is the workaround and the bisection tool, not the fix. The
+        // fix is a stack guard in the prologue, because the optimization is
+        // worth far too much to simply drop: without it fib(30) goes from 3ms to
+        // 498ms, a 166x regression.
         let self_call_disabled = std::env::var_os("EGCL_NO_DIRECT_SELF_CALL").is_some();
         // Wider calls need an activation-backed argument slice, including on
         // the stack-limit path; they cannot use this register-only entry.
@@ -2446,8 +2642,11 @@ fn emit_call(
         // A self-call with the wrong argument count must reach c2i, which
         // raises PROGRAM-ERROR; the register entry would bind whatever is in
         // the argument registers (bliss-w6aki).
-        if !self_call_disabled && matches!(data.aux, AuxData::CallTarget(_))
-            && sym == ss && nargs <= C2I_ARGS_SELF.len() && nargs == self_arity
+        if !self_call_disabled
+            && matches!(data.aux, AuxData::CallTarget(_))
+            && sym == ss
+            && nargs <= C2I_ARGS_SELF.len()
+            && nargs == self_arity
         {
             // Stack guard. The direct call below takes a REAL C frame and does
             // not reach c2i_call_args, so it never sees native_depth_cap() —
@@ -2614,7 +2813,8 @@ fn emit_invoke_call(
     recursion: Option<(RecursiveTransfer, egcl_rt::asm::Label)>,
 ) -> Result<(Vec<u32>, u32), EmitError> {
     let (request_word0, request_word1, cleanup) = match data.aux {
-        crate::t2::ir::AuxData::CallTarget(symbol) | crate::t2::ir::AuxData::OpaqueCallTarget(symbol) => {
+        crate::t2::ir::AuxData::CallTarget(symbol)
+        | crate::t2::ir::AuxData::OpaqueCallTarget(symbol) => {
             (u64::from(symbol), data.args.len() as u64, false)
         }
         crate::t2::ir::AuxData::TransferThrow => (TRANSFER_THROW_REQUEST, 2, false),
@@ -2655,12 +2855,22 @@ fn emit_invoke_call(
             false,
         ),
         crate::t2::ir::AuxData::SpecialBinding { bcp, enter } => (
-            (if enter { TRANSFER_SPECIAL_BIND_REQUEST } else { TRANSFER_SPECIAL_UNBIND_REQUEST }) | u64::from(bcp),
-            u64::from(enter), false,
+            (if enter {
+                TRANSFER_SPECIAL_BIND_REQUEST
+            } else {
+                TRANSFER_SPECIAL_UNBIND_REQUEST
+            }) | u64::from(bcp),
+            u64::from(enter),
+            false,
         ),
         crate::t2::ir::AuxData::GlobalValue { symbol, store } => (
-            (if store { TRANSFER_GLOBAL_STORE_REQUEST } else { TRANSFER_GLOBAL_LOAD_REQUEST }) | u64::from(symbol),
-            u64::from(store), false,
+            (if store {
+                TRANSFER_GLOBAL_STORE_REQUEST
+            } else {
+                TRANSFER_GLOBAL_LOAD_REQUEST
+            }) | u64::from(symbol),
+            u64::from(store),
+            false,
         ),
         crate::t2::ir::AuxData::HostEval(index) => {
             (TRANSFER_HOST_EVAL_REQUEST | u64::from(index), 0, false)
@@ -2674,9 +2884,11 @@ fn emit_invoke_call(
         crate::t2::ir::AuxData::NestedClosure(index) => {
             (TRANSFER_MAKE_CLOSURE_REQUEST | u64::from(index), 0, false)
         }
-        crate::t2::ir::AuxData::LexicalEnvironment { bcp, value, .. } => {
-            (TRANSFER_LEXICAL_ENVIRONMENT_REQUEST | u64::from(bcp), u64::from(value), false)
-        }
+        crate::t2::ir::AuxData::LexicalEnvironment { bcp, value, .. } => (
+            TRANSFER_LEXICAL_ENVIRONMENT_REQUEST | u64::from(bcp),
+            u64::from(value),
+            false,
+        ),
         crate::t2::ir::AuxData::CleanupContinuation {
             cleanup_bcp,
             resume_bcp,
@@ -2686,7 +2898,9 @@ fn emit_invoke_call(
     load_home(a, SCRATCH, frame_base, 0);
     let args_slot = match outgoing_area {
         NativeValueArea::Activation(base) => i32::from(base),
-        NativeValueArea::NativeStack(base) => i32::try_from(base).map_err(|_| EmitError::UnsupportedOp(0xFD))?,
+        NativeValueArea::NativeStack(base) => {
+            i32::try_from(base).map_err(|_| EmitError::UnsupportedOp(0xFD))?
+        }
     };
     for (index, value) in data.args.iter().enumerate() {
         if let Some(&bits) = constants.get(value) {
@@ -2700,7 +2914,9 @@ fn emit_invoke_call(
             );
         }
         match outgoing_area {
-            NativeValueArea::Activation(_) => store_mem64_disp(a, SCRATCH, (args_slot + index as i32) * 8, RAX),
+            NativeValueArea::Activation(_) => {
+                store_mem64_disp(a, SCRATCH, (args_slot + index as i32) * 8, RAX)
+            }
             NativeValueArea::NativeStack(_) => store_to_rsp(a, RAX, (args_slot + index as i32) * 8),
         }
     }
@@ -2792,8 +3008,16 @@ fn emit_native_recursive_call(
     let commit = a.label();
     let done = a.label();
     for (index, value) in data.args.iter().enumerate() {
-        if let Some(&bits) = constants.get(value) { mov_imm64(a, RAX, bits as i64); }
-        else { load_home(a, RAX, *homes.get(value).ok_or(EmitError::UnsupportedOp(0xF2))?, 0); }
+        if let Some(&bits) = constants.get(value) {
+            mov_imm64(a, RAX, bits as i64);
+        } else {
+            load_home(
+                a,
+                RAX,
+                *homes.get(value).ok_or(EmitError::UnsupportedOp(0xF2))?,
+                0,
+            );
+        }
         store_home(a, FramedHome::Stack(argument_base + index as u32), RAX, 0);
     }
     // RDI/RAX/SCRATCH/R11 are not final value homes. The control pointer is raw,
@@ -2828,8 +3052,12 @@ fn emit_native_recursive_call(
     a.jcc(Cc::Ge, slow);
     mov_rr(a, RAX, 4);
     alu_r_imm(a, 5, RAX, child_frame_bytes as i32);
-    load_mem64_disp(a, SCRATCH, 7,
-        std::mem::offset_of!(NativeRecursiveControl, stack_limit) as i32);
+    load_mem64_disp(
+        a,
+        SCRATCH,
+        7,
+        std::mem::offset_of!(NativeRecursiveControl, stack_limit) as i32,
+    );
     cmp_rr(a, RAX, SCRATCH);
     a.jcc(Cc::Le, slow);
     a.jmp(commit);
@@ -2850,7 +3078,10 @@ fn emit_native_recursive_call(
     mov_rr(a, 7, 4);
     mov_imm64(a, RAX, recursion.cold_veneer as i64);
     a.extend_from_slice(&[0xff, 0xd0]);
-    let cold_return = CallReturn { return_offset: a.here(), stack_adjust: 48 };
+    let cold_return = CallReturn {
+        return_offset: a.here(),
+        stack_adjust: 48,
+    };
     load_from_rsp(a, SCRATCH, 40);
     alu_r_imm(a, 0, 4, 48);
     alu_r_imm(a, 7, SCRATCH, 1);
@@ -2874,13 +3105,21 @@ fn emit_native_recursive_call(
     }
     load_home(a, 6, stack_home, 0);
     a.call(entry);
-    let direct_return = CallReturn { return_offset: a.here(), stack_adjust: 0 };
+    let direct_return = CallReturn {
+        return_offset: a.here(),
+        stack_adjust: 0,
+    };
     load_home(a, 7, control_home, 0);
     load_mem64_disp(a, 11, 7, 8);
     a.extend_from_slice(&[0x41, 0xff, 0x0b]); // dec dword ptr[r11]; preserve CF/RDX/RCX
     a.bind(done);
     if let Some(value) = data.results.first() {
-        store_home(a, *homes.get(value).ok_or(EmitError::UnsupportedOp(0xF2))?, RAX, 0);
+        store_home(
+            a,
+            *homes.get(value).ok_or(EmitError::UnsupportedOp(0xF2))?,
+            RAX,
+            0,
+        );
     }
     Ok(vec![cold_return, direct_return])
 }
@@ -3224,8 +3463,11 @@ fn emit_deopt_source(
     use crate::t2::frame_state::{RematOp, ValueSource};
     match source {
         ValueSource::Value { value, repr } => {
-            if !matches!(repr, crate::t2::ir::ValueRepresentation::Tagged
-                | crate::t2::ir::ValueRepresentation::UnboxedFixnum) {
+            if !matches!(
+                repr,
+                crate::t2::ir::ValueRepresentation::Tagged
+                    | crate::t2::ir::ValueRepresentation::UnboxedFixnum
+            ) {
                 return Err(EmitError::UnsupportedOp(0xF5));
             }
             if let Some(&bits) = const_tagged.get(value) {
@@ -3238,7 +3480,9 @@ fn emit_deopt_source(
                     rsp_adjust,
                 );
             }
-            if *repr == crate::t2::ir::ValueRepresentation::UnboxedFixnum { shl_imm(a, RAX, 3); }
+            if *repr == crate::t2::ir::ValueRepresentation::UnboxedFixnum {
+                shl_imm(a, RAX, 3);
+            }
         }
         ValueSource::Const(value) => {
             if is_moving_gc_reference(*value) {
@@ -3520,7 +3764,9 @@ fn emit_raw_double_unary_or_div(
         sources.push(*reg.get(value).ok_or(EmitError::UnsupportedOp(0xF2))?);
     }
     if data.opcode == Opcode::FloatNeg {
-        let [source] = sources[..] else { return Err(EmitError::UnsupportedOp(op_tag(data.opcode))) };
+        let [source] = sources[..] else {
+            return Err(EmitError::UnsupportedOp(op_tag(data.opcode)));
+        };
         mov_rr(a, dst, source);
         // btc dst, 63
         a.extend_from_slice(&[rex_w(0, dst), 0x0F, 0xBA, 0xF8 | (dst & 7), 63]);
@@ -3529,7 +3775,13 @@ fn emit_raw_double_unary_or_div(
     let deopt = deopt.ok_or(EmitError::UnsupportedOp(op_tag(data.opcode)))?;
     for (xmm, &source) in sources.iter().enumerate() {
         // movq xmm, r64
-        a.extend_from_slice(&[0x66, rex_w(xmm as u8, source), 0x0f, 0x6e, modrm_rr(xmm as u8, source)]);
+        a.extend_from_slice(&[
+            0x66,
+            rex_w(xmm as u8, source),
+            0x0f,
+            0x6e,
+            modrm_rr(xmm as u8, source),
+        ]);
     }
     let checked = sources.len() - 1; // the operand or the divisor
     a.extend_from_slice(&[0x66, 0x0F, 0x57, 0xD2]); // xorpd xmm2, xmm2
@@ -3554,7 +3806,10 @@ fn emit_raw_double_unary_or_div(
 /// Is `op` a typed single-float comparison?
 fn is_float_cmp(op: crate::t2::ir::Opcode) -> bool {
     use crate::t2::ir::Opcode::*;
-    matches!(op, FloatCmpEq | FloatCmpLt | FloatCmpLe | FloatCmpGt | FloatCmpGe)
+    matches!(
+        op,
+        FloatCmpEq | FloatCmpLt | FloatCmpLe | FloatCmpGt | FloatCmpGe
+    )
 }
 
 /// Emit a speculated single-float comparison producing `T`/`NIL` (bliss-9bw59).
@@ -3584,7 +3839,15 @@ fn emit_float_cmp_value(
     if data.results.len() != 1 || data.args.len() != 2 {
         return Err(EmitError::UnsupportedOp(op_tag(data.opcode)));
     }
-    float_operands_to_xmm(a, &data.args, reg, consts, float_consts, proven_single_float, deopt)?;
+    float_operands_to_xmm(
+        a,
+        &data.args,
+        reg,
+        consts,
+        float_consts,
+        proven_single_float,
+        deopt,
+    )?;
     // (first ucomiss operand, second, setcc opcode byte)
     let (x, y, setcc) = match data.opcode {
         Opcode::FloatCmpEq => (0, 1, 0x94), // sete
@@ -3630,8 +3893,13 @@ fn emit_raw_double_cmp_value(
     for (xmm, value) in data.args.iter().enumerate() {
         let register = *reg.get(value).ok_or(EmitError::UnsupportedOp(0xF2))?;
         // movq xmm, r64
-        a.extend_from_slice(&[0x66, rex_w(xmm as u8, register), 0x0f, 0x6e,
-            modrm_rr(xmm as u8, register)]);
+        a.extend_from_slice(&[
+            0x66,
+            rex_w(xmm as u8, register),
+            0x0f,
+            0x6e,
+            modrm_rr(xmm as u8, register),
+        ]);
     }
     let (x, y, setcc) = match data.opcode {
         Opcode::FloatCmpEq => (0, 1, 0x94), // sete
@@ -3739,8 +4007,8 @@ fn emit_type_check(
         a.jcc(Cc::Ne, not_found);
         mov_rr(a, SCRATCH, xr);
         alu_r_imm(a, AND, SCRATCH, -8); // clear the low tag bits
-                                        // cmp byte ptr [scratch + 7], BIGNUM. ObjectHeader::type_id occupies
-                                        // bits 63:56, hence byte offset 7 on the supported little-endian x86-64.
+        // cmp byte ptr [scratch + 7], BIGNUM. ObjectHeader::type_id occupies
+        // bits 63:56, hence byte offset 7 on the supported little-endian x86-64.
         a.extend_from_slice(&[0x80, 0x7A, 0x07, egcl_rt::object::type_id::BIGNUM]);
         a.jcc(Cc::E, found);
     } else if bits == TypeBits::DOUBLE_FLOAT {
@@ -4188,7 +4456,12 @@ fn emit_string_char_or_nil(
     // Heap tag, then SCRATCH = untagged object.
     mov_rr(a, SCRATCH, xr);
     alu_r_imm(a, 4 /* AND */, SCRATCH, 7);
-    alu_r_imm(a, 7 /* CMP */, SCRATCH, egcl_rt::value::TAG_HEAP_OBJECT as i32);
+    alu_r_imm(
+        a,
+        7, /* CMP */
+        SCRATCH,
+        egcl_rt::value::TAG_HEAP_OBJECT as i32,
+    );
     a.jcc(Cc::Ne, fail);
     mov_rr(a, SCRATCH, xr);
     alu_r_imm(a, 4 /* AND */, SCRATCH, -8);
@@ -4868,11 +5141,23 @@ pub fn emit_framed_transfers_with_storage(
     activation_slots: u16,
     storage: NativeCallStorage,
 ) -> Result<(FramedCode, crate::t2::transfer_sites::SysvTransferTable), EmitError> {
-    emit_transfer_function_with_storage(f, call_veneer, activation_slots, None, None,
-        None, None, &[], match storage {
+    emit_transfer_function_with_storage(
+        f,
+        call_veneer,
+        activation_slots,
+        None,
+        None,
+        None,
+        None,
+        &[],
+        match storage {
             NativeCallStorage::ManagedActivation => NativeRootPublication::ActivationShadows,
             NativeCallStorage::NativeStack => NativeRootPublication::PublishedHomes,
-        }, storage, None, None)
+        },
+        storage,
+        None,
+        None,
+    )
 }
 
 /// Cleanup helpers take `(cleanup_bcp, resume_bcp, primary)` and return the
@@ -5057,9 +5342,22 @@ pub fn emit_framed_native_handlers_with_entries(
     named_veneers: &[(u32, u64)],
     roots: NativeRootPublication,
 ) -> Result<(FramedCode, crate::t2::transfer_sites::SysvTransferTable), EmitError> {
-    emit_framed_native_handlers_with_entries_and_storage(f, call_veneer, activation_slots,
-        save, complete, multiple_values, catch_landing, handler_landing, poll_veneer,
-        recursion, deopt_veneer, named_veneers, roots, NativeCallStorage::ManagedActivation)
+    emit_framed_native_handlers_with_entries_and_storage(
+        f,
+        call_veneer,
+        activation_slots,
+        save,
+        complete,
+        multiple_values,
+        catch_landing,
+        handler_landing,
+        poll_veneer,
+        recursion,
+        deopt_veneer,
+        named_veneers,
+        roots,
+        NativeCallStorage::ManagedActivation,
+    )
 }
 
 /// Mapped worker T2 polls may bypass the entire published helper on an idle
@@ -5069,17 +5367,38 @@ pub fn emit_framed_native_handlers_with_entries(
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[allow(clippy::too_many_arguments)]
 pub fn emit_framed_native_handlers_with_entries_and_poll_fast_path(
-    f: &Function, call_veneer: u64, activation_slots: u16,
-    save: u64, complete: u64, multiple_values: u64,
-    catch_landing: u64, handler_landing: u64, poll_veneer: u64,
-    recursion: Option<RecursiveTransfer>, deopt_veneer: Option<u64>,
-    named_veneers: &[(u32, u64)], roots: NativeRootPublication,
+    f: &Function,
+    call_veneer: u64,
+    activation_slots: u16,
+    save: u64,
+    complete: u64,
+    multiple_values: u64,
+    catch_landing: u64,
+    handler_landing: u64,
+    poll_veneer: u64,
+    recursion: Option<RecursiveTransfer>,
+    deopt_veneer: Option<u64>,
+    named_veneers: &[(u32, u64)],
+    roots: NativeRootPublication,
     poll_fast_path: Option<NativePollFastPath>,
 ) -> Result<(FramedCode, crate::t2::transfer_sites::SysvTransferTable), EmitError> {
     emit_framed_native_handlers_with_entries_storage_and_poll_fast_path(
-        f, call_veneer, activation_slots, save, complete, multiple_values,
-        catch_landing, handler_landing, poll_veneer, recursion, deopt_veneer,
-        named_veneers, roots, NativeCallStorage::ManagedActivation, poll_fast_path)
+        f,
+        call_veneer,
+        activation_slots,
+        save,
+        complete,
+        multiple_values,
+        catch_landing,
+        handler_landing,
+        poll_veneer,
+        recursion,
+        deopt_veneer,
+        named_veneers,
+        roots,
+        NativeCallStorage::ManagedActivation,
+        poll_fast_path,
+    )
 }
 
 /// Published managed entry with explicitly represented native homes and the
@@ -5088,18 +5407,45 @@ pub fn emit_framed_native_handlers_with_entries_and_poll_fast_path(
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[allow(clippy::too_many_arguments)]
 pub fn emit_framed_native_handlers_with_entries_storage_and_poll_fast_path(
-    f: &Function, call_veneer: u64, activation_slots: u16,
-    save: u64, complete: u64, multiple_values: u64,
-    catch_landing: u64, handler_landing: u64, poll_veneer: u64,
-    recursion: Option<RecursiveTransfer>, deopt_veneer: Option<u64>,
-    named_veneers: &[(u32, u64)], roots: NativeRootPublication,
-    storage: NativeCallStorage, poll_fast_path: Option<NativePollFastPath>,
+    f: &Function,
+    call_veneer: u64,
+    activation_slots: u16,
+    save: u64,
+    complete: u64,
+    multiple_values: u64,
+    catch_landing: u64,
+    handler_landing: u64,
+    poll_veneer: u64,
+    recursion: Option<RecursiveTransfer>,
+    deopt_veneer: Option<u64>,
+    named_veneers: &[(u32, u64)],
+    roots: NativeRootPublication,
+    storage: NativeCallStorage,
+    poll_fast_path: Option<NativePollFastPath>,
 ) -> Result<(FramedCode, crate::t2::transfer_sites::SysvTransferTable), EmitError> {
-    if catch_landing == 0 || handler_landing == 0 { return Err(EmitError::UnsupportedOp(0xFA)); }
-    emit_transfer_function_with_storage(f, call_veneer, activation_slots,
-        Some(CleanupEmission::Native { save, complete, multiple_values, catch_landing, handler_landing }),
-        (poll_veneer != 0).then_some(poll_veneer), recursion, deopt_veneer, named_veneers,
-        roots, storage, None, poll_fast_path)
+    if catch_landing == 0 || handler_landing == 0 {
+        return Err(EmitError::UnsupportedOp(0xFA));
+    }
+    emit_transfer_function_with_storage(
+        f,
+        call_veneer,
+        activation_slots,
+        Some(CleanupEmission::Native {
+            save,
+            complete,
+            multiple_values,
+            catch_landing,
+            handler_landing,
+        }),
+        (poll_veneer != 0).then_some(poll_veneer),
+        recursion,
+        deopt_veneer,
+        named_veneers,
+        roots,
+        storage,
+        None,
+        poll_fast_path,
+    )
 }
 
 /// Scope-free fixed-arity worker T2 entry with physical native recursion.
@@ -5108,32 +5454,78 @@ pub fn emit_framed_native_handlers_with_entries_storage_and_poll_fast_path(
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[allow(clippy::too_many_arguments)]
 pub fn emit_framed_native_handlers_with_native_recursion(
-    f: &Function, call_veneer: u64, activation_slots: u16,
-    save: u64, complete: u64, multiple_values: u64,
-    catch_landing: u64, handler_landing: u64, poll_veneer: u64,
-    deopt_veneer: u64, named_veneers: &[(u32, u64)], recursion: NativeRecursiveTransfer,
+    f: &Function,
+    call_veneer: u64,
+    activation_slots: u16,
+    save: u64,
+    complete: u64,
+    multiple_values: u64,
+    catch_landing: u64,
+    handler_landing: u64,
+    poll_veneer: u64,
+    deopt_veneer: u64,
+    named_veneers: &[(u32, u64)],
+    recursion: NativeRecursiveTransfer,
 ) -> Result<(FramedCode, crate::t2::transfer_sites::SysvTransferTable), EmitError> {
     use crate::t2::ir::{AuxData, Opcode};
-    if f.is_variadic() || recursion.arity > 4 || recursion.arity != f.block(f.entry()).params.len()
-        || !f.osr_entries.is_empty() || recursion.initialize == 0 || recursion.cold_veneer == 0
+    if f.is_variadic()
+        || recursion.arity > 4
+        || recursion.arity != f.block(f.entry()).params.len()
+        || !f.osr_entries.is_empty()
+        || recursion.initialize == 0
+        || recursion.cold_veneer == 0
         || deopt_veneer == 0
-        || [recursion.flags.gc_requested, recursion.flags.sigusr1_pending,
-            recursion.flags.posted_signal, recursion.flags.native_errors,
-            recursion.flags.signal_epoch, recursion.flags.generation]
-            .contains(&0)
-        || f.block_order().iter().flat_map(|&block| &f.block(block).insts).any(|&inst| {
-            let data = f.inst(inst);
-            matches!(data.opcode, Opcode::CleanupSave | Opcode::CleanupRestore | Opcode::CleanupLanding
-                | Opcode::CatchLanding | Opcode::HandlerLanding | Opcode::TakeValuesToLocals)
-                || (data.opcode == Opcode::Invoke && !matches!(data.aux, AuxData::CallTarget(_) | AuxData::OpaqueCallTarget(_)))
-        })
+        || [
+            recursion.flags.gc_requested,
+            recursion.flags.sigusr1_pending,
+            recursion.flags.posted_signal,
+            recursion.flags.native_errors,
+            recursion.flags.signal_epoch,
+            recursion.flags.generation,
+        ]
+        .contains(&0)
+        || f.block_order()
+            .iter()
+            .flat_map(|&block| &f.block(block).insts)
+            .any(|&inst| {
+                let data = f.inst(inst);
+                matches!(
+                    data.opcode,
+                    Opcode::CleanupSave
+                        | Opcode::CleanupRestore
+                        | Opcode::CleanupLanding
+                        | Opcode::CatchLanding
+                        | Opcode::HandlerLanding
+                        | Opcode::TakeValuesToLocals
+                ) || (data.opcode == Opcode::Invoke
+                    && !matches!(
+                        data.aux,
+                        AuxData::CallTarget(_) | AuxData::OpaqueCallTarget(_)
+                    ))
+            })
     {
         return Err(EmitError::UnsupportedOp(0xFA));
     }
-    emit_transfer_function_with_storage(f, call_veneer, activation_slots,
-        Some(CleanupEmission::Native { save, complete, multiple_values, catch_landing, handler_landing }),
-        (poll_veneer != 0).then_some(poll_veneer), None, Some(deopt_veneer), named_veneers,
-        NativeRootPublication::PublishedHomes, NativeCallStorage::NativeStack, Some(recursion), None)
+    emit_transfer_function_with_storage(
+        f,
+        call_veneer,
+        activation_slots,
+        Some(CleanupEmission::Native {
+            save,
+            complete,
+            multiple_values,
+            catch_landing,
+            handler_landing,
+        }),
+        (poll_veneer != 0).then_some(poll_veneer),
+        None,
+        Some(deopt_veneer),
+        named_veneers,
+        NativeRootPublication::PublishedHomes,
+        NativeCallStorage::NativeStack,
+        Some(recursion),
+        None,
+    )
 }
 
 /// Explicit backing storage for the existing managed-entry helper contract.
@@ -5194,8 +5586,20 @@ fn emit_transfer_function(
     named_veneers: &[(u32, u64)],
     roots: NativeRootPublication,
 ) -> Result<(FramedCode, crate::t2::transfer_sites::SysvTransferTable), EmitError> {
-    emit_transfer_function_with_storage(f, call_veneer, activation_slots, cleanup,
-        poll_veneer, recursion, deopt_veneer, named_veneers, roots, NativeCallStorage::ManagedActivation, None, None)
+    emit_transfer_function_with_storage(
+        f,
+        call_veneer,
+        activation_slots,
+        cleanup,
+        poll_veneer,
+        recursion,
+        deopt_veneer,
+        named_veneers,
+        roots,
+        NativeCallStorage::ManagedActivation,
+        None,
+        None,
+    )
 }
 
 /// Derive the element address from a tagged root for this access only. Both
@@ -5228,15 +5632,25 @@ fn packed_f64_element_address(
     a.bind(small);
     alu_r_imm(a, 0, SCRATCH, 8);
     a.bind(body);
-    a.extend_from_slice(&[0x80, 0x3a, egcl_rt::object::ElementTypeTag::DoubleFloat as u8]);
+    a.extend_from_slice(&[
+        0x80,
+        0x3a,
+        egcl_rt::object::ElementTypeTag::DoubleFloat as u8,
+    ]);
     a.jcc(Cc::Ne, deopt);
-    if let Some(bits) = constant_index { mov_imm64(a, RAX, bits as i64); }
-    else { mov_rr(a, RAX, index); }
+    if let Some(bits) = constant_index {
+        mov_imm64(a, RAX, bits as i64);
+    } else {
+        mov_rr(a, RAX, index);
+    }
     alu_r_imm(a, 4, RAX, 7);
     alu_r_imm(a, 7, RAX, egcl_rt::value::TAG_FIXNUM as i32);
     a.jcc(Cc::Ne, deopt);
-    if let Some(bits) = constant_index { mov_imm64(a, RAX, bits as i64); }
-    else { mov_rr(a, RAX, index); }
+    if let Some(bits) = constant_index {
+        mov_imm64(a, RAX, bits as i64);
+    } else {
+        mov_rr(a, RAX, index);
+    }
     sar_imm(a, RAX, 3);
     alu_r_imm(a, 7, RAX, 0);
     a.jcc(Cc::L, deopt);
@@ -5310,8 +5724,13 @@ unsafe extern "C" fn store_vector_element(slot: *mut egcl_rt::EgclVal, value: u6
 
 /// Leave the simple-vector element's slot address in rdx. Small and large
 /// headers share the same body layout: raw length, then tagged elements.
-fn vector_element_address(a: &mut Asm, array: u8, index: u8,
-    constant_index: Option<u64>, deopt: egcl_rt::asm::Label) {
+fn vector_element_address(
+    a: &mut Asm,
+    array: u8,
+    index: u8,
+    constant_index: Option<u64>,
+    deopt: egcl_rt::asm::Label,
+) {
     mov_rr(a, SCRATCH, array);
     alu_r_imm(a, 4, SCRATCH, 7);
     alu_r_imm(a, 7, SCRATCH, egcl_rt::value::TAG_HEAP_OBJECT as i32);
@@ -5329,12 +5748,18 @@ fn vector_element_address(a: &mut Asm, array: u8, index: u8,
     a.bind(small);
     alu_r_imm(a, 0, SCRATCH, 8);
     a.bind(body);
-    if let Some(bits) = constant_index { mov_imm64(a, RAX, bits as i64); }
-    else { mov_rr(a, RAX, index); }
+    if let Some(bits) = constant_index {
+        mov_imm64(a, RAX, bits as i64);
+    } else {
+        mov_rr(a, RAX, index);
+    }
     alu_r_imm(a, 4, RAX, 7);
     a.jcc(Cc::Ne, deopt);
-    if let Some(bits) = constant_index { mov_imm64(a, RAX, bits as i64); }
-    else { mov_rr(a, RAX, index); }
+    if let Some(bits) = constant_index {
+        mov_imm64(a, RAX, bits as i64);
+    } else {
+        mov_rr(a, RAX, index);
+    }
     sar_imm(a, RAX, 3);
     alu_r_imm(a, 7, RAX, 0);
     a.jcc(Cc::L, deopt);
@@ -5371,20 +5796,34 @@ fn native_representations_supported(
 ) -> bool {
     use crate::t2::ir::{Opcode, TypeBits, Value, ValueRepresentation as Repr};
     let raw = |value| f.value(value).repr != Repr::Tagged;
-    if std::env::var_os("EGCL_RAW_DBG").is_some() && (0..f.num_values()).any(|i| raw(Value(i as u32))) {
+    if std::env::var_os("EGCL_RAW_DBG").is_some()
+        && (0..f.num_values()).any(|i| raw(Value(i as u32)))
+    {
         eprintln!("[raw-ir] {}\n{}", f.name(), crate::t2::unbox_f64::render(f));
     }
     let has_raw = (0..f.num_values()).any(|i| raw(Value(i as u32)));
-    if has_raw && (roots != NativeRootPublication::PublishedHomes
-        || storage != NativeCallStorage::NativeStack || !precise_deopt
-        || f.block(f.entry()).params.iter().copied().any(raw)
-        || (0..f.num_values()).any(|i| !matches!(f.value(Value(i as u32)).repr,
-            Repr::Tagged | Repr::UnboxedF64 | Repr::UnboxedFixnum)))
+    if has_raw
+        && (roots != NativeRootPublication::PublishedHomes
+            || storage != NativeCallStorage::NativeStack
+            || !precise_deopt
+            || f.block(f.entry()).params.iter().copied().any(raw)
+            || (0..f.num_values()).any(|i| {
+                !matches!(
+                    f.value(Value(i as u32)).repr,
+                    Repr::Tagged | Repr::UnboxedF64 | Repr::UnboxedFixnum
+                )
+            }))
     {
-        return raw_reject(f, "raw values need published homes, native storage, precise deopt and no raw entry parameter");
+        return raw_reject(
+            f,
+            "raw values need published homes, native storage, precise deopt and no raw entry parameter",
+        );
     }
     for (_, state) in f.frame_states.iter() {
-        let sources = state.scopes.iter().flat_map(|scope| scope.locals.iter().chain(&scope.stack))
+        let sources = state
+            .scopes
+            .iter()
+            .flat_map(|scope| scope.locals.iter().chain(&scope.stack))
             .chain(state.remat.iter().flat_map(|recipe| &recipe.inputs));
         for source in sources {
             if let crate::t2::frame_state::ValueSource::Value { value, repr } = source {
@@ -5400,12 +5839,20 @@ fn native_representations_supported(
             if matches!(data.opcode, Opcode::BoxFixnum | Opcode::UnboxFixnum) {
                 let (input, output) = if data.opcode == Opcode::BoxFixnum {
                     (Repr::UnboxedFixnum, Repr::Tagged)
-                } else { (Repr::Tagged, Repr::UnboxedFixnum) };
-                if data.args.len() != 1 || data.results.len() != 1
-                    || f.value(data.args[0]).repr != input || f.value(data.results[0]).repr != output
+                } else {
+                    (Repr::Tagged, Repr::UnboxedFixnum)
+                };
+                if data.args.len() != 1
+                    || data.results.len() != 1
+                    || f.value(data.args[0]).repr != input
+                    || f.value(data.results[0]).repr != output
                     || data.opcode == Opcode::UnboxFixnum
-                        && (if data.flags.guard { data.frame_state.is_none() }
-                            else { !crate::t2::unbox_fixnum::proven_tagged_fixnum(f, data.args[0]) }) {
+                        && (if data.flags.guard {
+                            data.frame_state.is_none()
+                        } else {
+                            !crate::t2::unbox_fixnum::proven_tagged_fixnum(f, data.args[0])
+                        })
+                {
                     return raw_reject(f, "fixnum conversion shape");
                 }
                 continue;
@@ -5427,18 +5874,28 @@ fn native_representations_supported(
             }
             // Edges carry raw values only through equally represented block
             // parameters, checked by the ordinary IR verifier.
-            if matches!(data.opcode, Opcode::PackedF64Ref | Opcode::VecF64Ref | Opcode::PackedF64Set | Opcode::TryPackedF64Set) {
+            if matches!(
+                data.opcode,
+                Opcode::PackedF64Ref
+                    | Opcode::VecF64Ref
+                    | Opcode::PackedF64Set
+                    | Opcode::TryPackedF64Set
+            ) {
                 // The verifier checks the exact operand, representation and
                 // ordered recovery contract for these operations.
                 continue;
             }
-            if matches!(data.opcode, Opcode::FloatAdd | Opcode::FloatSub | Opcode::FloatMul)
-                && data.results.iter().copied().any(raw)
+            if matches!(
+                data.opcode,
+                Opcode::FloatAdd | Opcode::FloatSub | Opcode::FloatMul
+            ) && data.results.iter().copied().any(raw)
             {
-                if data.args.len() != 2 || data.results.len() != 1
-                    || data.args.iter().chain(&data.results).any(|&value|
+                if data.args.len() != 2
+                    || data.results.len() != 1
+                    || data.args.iter().chain(&data.results).any(|&value| {
                         f.value(value).repr != Repr::UnboxedF64
-                            || f.value(value).ty.bits != TypeBits::DOUBLE_FLOAT)
+                            || f.value(value).ty.bits != TypeBits::DOUBLE_FLOAT
+                    })
                     || data.flags != crate::t2::ir::InstFlags::default()
                     || data.frame_state.is_some()
                 {
@@ -5448,20 +5905,33 @@ fn native_representations_supported(
             }
             // Raw sqrt, negation and division (bliss-lhy89). Sqrt and divide
             // deopt (negative operand, zero divisor) with their own state.
-            if matches!(data.opcode, Opcode::FloatSqrt | Opcode::FloatNeg | Opcode::FloatDiv) {
-                let arity = if data.opcode == Opcode::FloatDiv { 2 } else { 1 };
+            if matches!(
+                data.opcode,
+                Opcode::FloatSqrt | Opcode::FloatNeg | Opcode::FloatDiv
+            ) {
+                let arity = if data.opcode == Opcode::FloatDiv {
+                    2
+                } else {
+                    1
+                };
                 let guarded = data.opcode != Opcode::FloatNeg;
                 let flags = if guarded {
-                    crate::t2::ir::InstFlags { guard: true, effectful: true,
-                        ..crate::t2::ir::InstFlags::default() }
+                    crate::t2::ir::InstFlags {
+                        guard: true,
+                        effectful: true,
+                        ..crate::t2::ir::InstFlags::default()
+                    }
                 } else {
                     crate::t2::ir::InstFlags::default()
                 };
-                if data.args.len() != arity || data.results.len() != 1
-                    || data.args.iter().chain(&data.results).any(|&value|
+                if data.args.len() != arity
+                    || data.results.len() != 1
+                    || data.args.iter().chain(&data.results).any(|&value| {
                         f.value(value).repr != Repr::UnboxedF64
-                            || f.value(value).ty.bits != TypeBits::DOUBLE_FLOAT)
-                    || data.flags != flags || data.frame_state.is_some() != guarded
+                            || f.value(value).ty.bits != TypeBits::DOUBLE_FLOAT
+                    })
+                    || data.flags != flags
+                    || data.frame_state.is_some() != guarded
                 {
                     return raw_reject(f, "raw double sqrt, negation or division shape");
                 }
@@ -5469,7 +5939,8 @@ fn native_representations_supported(
             }
             // Raw double constants, comparisons and escape boxes (bliss-thcbb).
             if data.opcode == Opcode::ConstDouble {
-                if !data.args.is_empty() || data.results.len() != 1
+                if !data.args.is_empty()
+                    || data.results.len() != 1
                     || !matches!(data.aux, crate::t2::ir::AuxData::DoubleImm(_))
                     || f.value(data.results[0]).repr != Repr::UnboxedF64
                 {
@@ -5478,10 +5949,15 @@ fn native_representations_supported(
                 continue;
             }
             if is_float_cmp(data.opcode) && data.args.iter().copied().any(raw) {
-                if data.args.len() != 2 || data.results.len() != 1
-                    || data.args.iter().any(|&value| f.value(value).repr != Repr::UnboxedF64)
+                if data.args.len() != 2
+                    || data.results.len() != 1
+                    || data
+                        .args
+                        .iter()
+                        .any(|&value| f.value(value).repr != Repr::UnboxedF64)
                     || raw(data.results[0])
-                    || data.frame_state.is_none() || !data.flags.guard
+                    || data.frame_state.is_none()
+                    || !data.flags.guard
                 {
                     return raw_reject(f, "raw double comparison shape");
                 }
@@ -5489,7 +5965,8 @@ fn native_representations_supported(
             }
             if data.opcode == Opcode::BoxFloat {
                 if box_double_veneer().is_none()
-                    || data.args.len() != 1 || data.results.len() != 1
+                    || data.args.len() != 1
+                    || data.results.len() != 1
                     || f.value(data.args[0]).repr != Repr::UnboxedF64
                     || raw(data.results[0])
                 {
@@ -5510,7 +5987,8 @@ fn native_representations_supported(
                         !data.flags.effectful || data.frame_state.is_none()
                     } else {
                         data.flags != crate::t2::ir::InstFlags::default()
-                            || data.frame_state.is_some() || data.args.len() != 1
+                            || data.frame_state.is_some()
+                            || data.args.len() != 1
                             || !matches!(data.aux, crate::t2::ir::AuxData::None)
                     }
                 {
@@ -5541,8 +6019,17 @@ fn emit_transfer_function_with_storage(
     poll_fast_path: Option<NativePollFastPath>,
 ) -> Result<(FramedCode, crate::t2::transfer_sites::SysvTransferTable), EmitError> {
     use crate::t2::ir::{AuxData, Opcode};
-    if poll_fast_path.is_some_and(|fast| [fast.initialize, fast.gc_requested,
-        fast.sigusr1_pending, fast.posted_signal, fast.native_errors, fast.signal_epoch].contains(&0)) {
+    if poll_fast_path.is_some_and(|fast| {
+        [
+            fast.initialize,
+            fast.gc_requested,
+            fast.sigusr1_pending,
+            fast.posted_signal,
+            fast.native_errors,
+            fast.signal_epoch,
+        ]
+        .contains(&0)
+    }) {
         return Err(EmitError::UnsupportedOp(0xFA));
     }
     if deopt_veneer == Some(0) || named_veneers.iter().any(|(_, entry)| *entry == 0) {
@@ -5570,15 +6057,32 @@ fn emit_transfer_function_with_storage(
     for &block in f.block_order() {
         for &inst in &f.block(block).insts {
             let data = f.inst(inst);
-            if matches!(data.opcode, Opcode::BoxFixnum | Opcode::UnboxFixnum) { continue; }
-            if matches!(data.opcode, Opcode::UnboxFloat | Opcode::PackedF64Ref | Opcode::VecF64Ref | Opcode::PackedF64Set | Opcode::TryPackedF64Set
-                | Opcode::ConstDouble | Opcode::BoxFloat)
-                || (matches!(data.opcode, Opcode::FloatAdd | Opcode::FloatSub | Opcode::FloatMul
-                    | Opcode::FloatDiv | Opcode::FloatSqrt | Opcode::FloatNeg)
-                    && data.results.len() == 1
-                    && f.value(data.results[0]).repr == crate::t2::ir::ValueRepresentation::UnboxedF64)
-                || (is_float_cmp(data.opcode) && data.args.iter().any(|&value|
-                    f.value(value).repr == crate::t2::ir::ValueRepresentation::UnboxedF64))
+            if matches!(data.opcode, Opcode::BoxFixnum | Opcode::UnboxFixnum) {
+                continue;
+            }
+            if matches!(
+                data.opcode,
+                Opcode::UnboxFloat
+                    | Opcode::PackedF64Ref
+                    | Opcode::VecF64Ref
+                    | Opcode::PackedF64Set
+                    | Opcode::TryPackedF64Set
+                    | Opcode::ConstDouble
+                    | Opcode::BoxFloat
+            ) || (matches!(
+                data.opcode,
+                Opcode::FloatAdd
+                    | Opcode::FloatSub
+                    | Opcode::FloatMul
+                    | Opcode::FloatDiv
+                    | Opcode::FloatSqrt
+                    | Opcode::FloatNeg
+            ) && data.results.len() == 1
+                && f.value(data.results[0]).repr == crate::t2::ir::ValueRepresentation::UnboxedF64)
+                || (is_float_cmp(data.opcode)
+                    && data.args.iter().any(|&value| {
+                        f.value(value).repr == crate::t2::ir::ValueRepresentation::UnboxedF64
+                    }))
             {
                 // Representation and operand contracts were checked above.
                 continue;
@@ -5611,9 +6115,12 @@ fn emit_transfer_function_with_storage(
                 let AuxData::ValuesLocals { nvars, slot_base } = data.aux else {
                     return Err(EmitError::UnsupportedOp(op_tag(data.opcode)));
                 };
-                if !native_cleanups || data.args.len() != 1
+                if !native_cleanups
+                    || data.args.len() != 1
                     || data.results.len() != usize::from(nvars)
-                    || slot_base.checked_add(nvars).is_none_or(|end| end > activation_slots)
+                    || slot_base
+                        .checked_add(nvars)
+                        .is_none_or(|end| end > activation_slots)
                 {
                     return Err(EmitError::UnsupportedOp(op_tag(data.opcode)));
                 }
@@ -5648,15 +6155,33 @@ fn emit_transfer_function_with_storage(
             {
                 return Err(EmitError::UnsupportedOp(op_tag(data.opcode)));
             }
-            if deopt_veneer.is_some() && matches!(data.opcode,
-                Opcode::Guard | Opcode::FixnumAdd | Opcode::FixnumSub
-                    | Opcode::FixnumMul | Opcode::FixnumNeg
-                    | Opcode::FixnumDiv | Opcode::FixnumFloor | Opcode::FixnumRem
-                    | Opcode::FixnumMod | Opcode::FixnumMin | Opcode::FixnumMax
-                    | Opcode::FixnumCmpEq | Opcode::FixnumCmpLt | Opcode::FixnumCmpLe
-                    | Opcode::FixnumCmpGt | Opcode::FixnumCmpGe
-                    | Opcode::LogAnd | Opcode::LogOr | Opcode::LogXor | Opcode::LogNot
-                    | Opcode::FixnumShl | Opcode::FixnumShr | Opcode::IntegerLowBits)
+            if deopt_veneer.is_some()
+                && matches!(
+                    data.opcode,
+                    Opcode::Guard
+                        | Opcode::FixnumAdd
+                        | Opcode::FixnumSub
+                        | Opcode::FixnumMul
+                        | Opcode::FixnumNeg
+                        | Opcode::FixnumDiv
+                        | Opcode::FixnumFloor
+                        | Opcode::FixnumRem
+                        | Opcode::FixnumMod
+                        | Opcode::FixnumMin
+                        | Opcode::FixnumMax
+                        | Opcode::FixnumCmpEq
+                        | Opcode::FixnumCmpLt
+                        | Opcode::FixnumCmpLe
+                        | Opcode::FixnumCmpGt
+                        | Opcode::FixnumCmpGe
+                        | Opcode::LogAnd
+                        | Opcode::LogOr
+                        | Opcode::LogXor
+                        | Opcode::LogNot
+                        | Opcode::FixnumShl
+                        | Opcode::FixnumShr
+                        | Opcode::IntegerLowBits
+                )
             {
                 continue;
             }
@@ -5664,11 +6189,16 @@ fn emit_transfer_function_with_storage(
             // and resume through the same precise deopt veneer (bliss-9bw59).
             // Raw double arithmetic was admitted above.
             if deopt_veneer.is_some()
-                && (matches!(data.opcode, Opcode::FloatAdd | Opcode::FloatSub | Opcode::FloatMul)
-                    || is_float_cmp(data.opcode))
+                && (matches!(
+                    data.opcode,
+                    Opcode::FloatAdd | Opcode::FloatSub | Opcode::FloatMul
+                ) || is_float_cmp(data.opcode))
                 && data.frame_state.is_some()
-                && data.args.iter().chain(&data.results).all(|&value|
-                    f.value(value).repr == crate::t2::ir::ValueRepresentation::Tagged)
+                && data
+                    .args
+                    .iter()
+                    .chain(&data.results)
+                    .all(|&value| f.value(value).repr == crate::t2::ir::ValueRepresentation::Tagged)
             {
                 continue;
             }
@@ -5692,9 +6222,22 @@ fn emit_transfer_function_with_storage(
                     | Opcode::Car
                     | Opcode::Cdr
                     | Opcode::StringCharOrNil
-                    | Opcode::VecRef | Opcode::VecSet | Opcode::VecSetInRange | Opcode::ArrayReadDiscarded | Opcode::PackedF64P
-                    | Opcode::MemoryFence | Opcode::TryIntegerShr | Opcode::SmallVectorRangeP | Opcode::PackedU8Layout | Opcode::PackedU8AllocationLayout | Opcode::PackedU8AllocationExtent
-                    | Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8 | Opcode::TryStoreIntegerOctets1To8Layout | Opcode::TryStoreIntegerOctets1To8Extent | Opcode::NativePoll
+                    | Opcode::VecRef
+                    | Opcode::VecSet
+                    | Opcode::VecSetInRange
+                    | Opcode::ArrayReadDiscarded
+                    | Opcode::PackedF64P
+                    | Opcode::MemoryFence
+                    | Opcode::TryIntegerShr
+                    | Opcode::SmallVectorRangeP
+                    | Opcode::PackedU8Layout
+                    | Opcode::PackedU8AllocationLayout
+                    | Opcode::PackedU8AllocationExtent
+                    | Opcode::TryStoreIntegerOctets8
+                    | Opcode::TryStoreIntegerOctets1To8
+                    | Opcode::TryStoreIntegerOctets1To8Layout
+                    | Opcode::TryStoreIntegerOctets1To8Extent
+                    | Opcode::NativePoll
             ) {
                 return Err(EmitError::UnsupportedOp(op_tag(f.inst(inst).opcode)));
             }
@@ -5727,7 +6270,9 @@ fn emit_transfer_function_with_storage(
         0,
         0,
         match cleanup {
-            Some(CleanupEmission::Native { multiple_values, .. }) => multiple_values,
+            Some(CleanupEmission::Native {
+                multiple_values, ..
+            }) => multiple_values,
             _ => 0,
         },
         0,
@@ -5811,8 +6356,12 @@ fn emit_framed_inner(
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))] mut transfers: Option<
         &mut TransferEmission,
     >,
-    #[cfg(all(target_arch = "x86_64", target_os = "linux"))] ordinary: Option<OrdinaryLispEntryOptions>,
-    #[cfg(all(target_arch = "x86_64", target_os = "linux"))] ordinary_call: Option<ordinary_call::OrdinaryCallEmission<'_>>,
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))] ordinary: Option<
+        OrdinaryLispEntryOptions,
+    >,
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))] ordinary_call: Option<
+        ordinary_call::OrdinaryCallEmission<'_>,
+    >,
 ) -> Result<FramedCode, EmitError> {
     use crate::t2::frame_state::ValueSource;
     use crate::t2::ir::{
@@ -5825,21 +6374,31 @@ fn emit_framed_inner(
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
     let ordinary_call_mode = false;
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    let ordinary_returns_from_call = ordinary_call.is_some_and(|call| matches!(call.return_policy, ordinary_call::OrdinaryReturnPolicy::Call(_)));
+    let ordinary_returns_from_call = ordinary_call.is_some_and(|call| {
+        matches!(
+            call.return_policy,
+            ordinary_call::OrdinaryReturnPolicy::Call(_)
+        )
+    });
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
     let ordinary_returns_from_call = false;
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    let ordinary_guard_veneer = ordinary_call.and_then(|call| call.guard).map(|guard| guard.veneer);
+    let ordinary_guard_veneer = ordinary_call
+        .and_then(|call| call.guard)
+        .map(|guard| guard.veneer);
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
     let ordinary_guard_veneer: Option<u64> = None;
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    let native_poll_veneer = ordinary_call.and_then(|call| call.poll_veneer)
+    let native_poll_veneer = ordinary_call
+        .and_then(|call| call.poll_veneer)
         .or_else(|| transfers.as_ref().and_then(|transfer| transfer.poll_veneer));
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     let transfer_mode = transfers.is_some();
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    let native_returns = ordinary.is_some() || transfers.as_ref().is_some_and(|emission|
-        matches!(emission.cleanup, Some(CleanupEmission::Native { .. })));
+    let native_returns = ordinary.is_some()
+        || transfers.as_ref().is_some_and(|emission| {
+            matches!(emission.cleanup, Some(CleanupEmission::Native { .. }))
+        });
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
     let native_returns = false;
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -5848,33 +6407,59 @@ fn emit_framed_inner(
     let ordinary_mode = false;
     let normalized_calls = if ordinary_call_mode {
         crate::t2::opt_clear_mv::calls_with_discarded_multiple_values(f)
-    } else { HashSet::new() };
+    } else {
+        HashSet::new()
+    };
     let single_returns = if native_returns {
-        crate::t2::opt_clear_mv::single_value_state_after_normalized_calls(f, true, &normalized_calls)
-    } else { HashSet::new() };
+        crate::t2::opt_clear_mv::single_value_state_after_normalized_calls(
+            f,
+            true,
+            &normalized_calls,
+        )
+    } else {
+        HashSet::new()
+    };
     // List constructors and the registered packed-U8 adapter return one value.
     // Their inline paths preserve MV only when the incoming buffer is empty.
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     let inline_alloc_single = if ordinary_call_mode && native_returns {
         let mut normalized = normalized_calls.clone();
-        normalized.extend(f.block_order().iter().flat_map(|&block| f.block(block).insts.iter().copied())
-            .filter(|&inst| f.inst(inst).opcode == Opcode::Call
-                && (inline_alloc::list_shape(f.inst(inst)).is_some()
-                    || inline_packed_u8::eligible(f, f.inst(inst)))));
+        normalized.extend(
+            f.block_order()
+                .iter()
+                .flat_map(|&block| f.block(block).insts.iter().copied())
+                .filter(|&inst| {
+                    f.inst(inst).opcode == Opcode::Call
+                        && (inline_alloc::list_shape(f.inst(inst)).is_some()
+                            || inline_packed_u8::eligible(f, f.inst(inst)))
+                }),
+        );
         crate::t2::opt_clear_mv::single_value_state_after_normalized_calls(f, true, &normalized)
-    } else { HashSet::new() };
+    } else {
+        HashSet::new()
+    };
     // Mapped code empties the MV buffer only at explicit resets, so an inline
     // allocation may also leave a state that nothing reads before the next one.
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    let inline_alloc_mv_free: HashSet<Inst> = if ordinary_call_mode { HashSet::new() } else {
-        let sites: HashSet<Inst> = f.block_order().iter()
+    let inline_alloc_mv_free: HashSet<Inst> = if ordinary_call_mode {
+        HashSet::new()
+    } else {
+        let sites: HashSet<Inst> = f
+            .block_order()
+            .iter()
             .flat_map(|&block| f.block(block).insts.iter().copied())
-            .filter(|&inst| matches!(f.inst(inst).opcode, Opcode::Call | Opcode::Invoke)
-                && (inline_alloc::list_shape(f.inst(inst)).is_some()
-                    || inline_packed_u8::eligible(f, f.inst(inst))))
+            .filter(|&inst| {
+                matches!(f.inst(inst).opcode, Opcode::Call | Opcode::Invoke)
+                    && (inline_alloc::list_shape(f.inst(inst)).is_some()
+                        || inline_packed_u8::eligible(f, f.inst(inst)))
+            })
             .collect();
-        if sites.is_empty() { HashSet::new() } else {
-            let mut free = crate::t2::opt_clear_mv::single_value_state_after_normalized_calls(f, false, &sites);
+        if sites.is_empty() {
+            HashSet::new()
+        } else {
+            let mut free = crate::t2::opt_clear_mv::single_value_state_after_normalized_calls(
+                f, false, &sites,
+            );
             free.extend(crate::t2::opt_clear_mv::dead_after(f));
             free.retain(|inst| sites.contains(inst));
             free
@@ -5883,17 +6468,23 @@ fn emit_framed_inner(
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
     let transfer_mode = false;
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    let published_native_roots = ordinary_call_mode || transfers.as_ref()
-        .is_some_and(|emission| emission.roots == NativeRootPublication::PublishedHomes);
+    let published_native_roots = ordinary_call_mode
+        || transfers
+            .as_ref()
+            .is_some_and(|emission| emission.roots == NativeRootPublication::PublishedHomes);
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
     let published_native_roots = false;
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    let native_call_storage = ordinary_call_mode || transfers.as_ref()
-        .is_some_and(|emission| emission.storage == NativeCallStorage::NativeStack);
+    let native_call_storage = ordinary_call_mode
+        || transfers
+            .as_ref()
+            .is_some_and(|emission| emission.storage == NativeCallStorage::NativeStack);
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
     let native_call_storage = false;
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    let native_recursion = transfers.as_ref().and_then(|emission| emission.native_recursion);
+    let native_recursion = transfers
+        .as_ref()
+        .and_then(|emission| emission.native_recursion);
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     let native_frame_mode = native_recursion.is_some() || ordinary_call_mode;
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
@@ -6008,8 +6599,12 @@ fn emit_framed_inner(
     // Checked OSR entries call the precise reconstruction callback on failure,
     // even when the ordinary body contains no calls or guards.
     let has_checked_osr = f.osr_entries.iter().any(|osr| !osr.checks.is_empty());
-    let has_calls = has_ir_calls || has_inlined_scopes || has_segment_calls || has_checked_osr
-        || code_id != 0 || ordinary_call_mode;
+    let has_calls = has_ir_calls
+        || has_inlined_scopes
+        || has_segment_calls
+        || has_checked_osr
+        || code_id != 0
+        || ordinary_call_mode;
 
     // Precise state-transfer deopt (bliss-mba): a function that CALLS other code
     // can commit a visible side effect before a later guard fails, so re-running
@@ -6081,9 +6676,14 @@ fn emit_framed_inner(
             match (d.opcode, &d.aux) {
                 (Opcode::ConstFixnum, AuxData::FixnumImm(v)) => {
                     consts.insert(r, *v);
-                    const_tagged.insert(r, if f.value(r).repr == ValueRepresentation::UnboxedFixnum {
-                        *v as u64
-                    } else { egcl_rt::value::EgclVal::from_fixnum(*v).0 });
+                    const_tagged.insert(
+                        r,
+                        if f.value(r).repr == ValueRepresentation::UnboxedFixnum {
+                            *v as u64
+                        } else {
+                            egcl_rt::value::EgclVal::from_fixnum(*v).0
+                        },
+                    );
                 }
                 (Opcode::ConstFloat, AuxData::FloatImm(v)) => {
                     float_consts.insert(r, v.to_bits());
@@ -6270,7 +6870,8 @@ fn emit_framed_inner(
         crate::t2::regalloc::allocate_framed_ordinary(&mut machine)
     } else {
         crate::t2::regalloc::allocate_framed(&mut machine)
-    }.map_err(|error| EmitError::RegAlloc(format!("{error:?}")))?;
+    }
+    .map_err(|error| EmitError::RegAlloc(format!("{error:?}")))?;
     if !machine.insts.is_empty() && machine.inst_allocations.len() != machine.insts.len() {
         return Err(EmitError::UnsupportedOp(0xFA));
     }
@@ -6311,14 +6912,24 @@ fn emit_framed_inner(
     for &block in &blocks {
         for (index, &inst) in f.block(block).insts.iter().enumerate() {
             let data = f.inst(inst);
-            if data.opcode != Opcode::NativePoll { continue; }
+            if data.opcode != Opcode::NativePoll {
+                continue;
+            }
             let AuxData::BoundedPoll { exit, .. } = data.aux else {
                 return Err(EmitError::UnsupportedOp(op_tag(data.opcode)));
             };
-            if index != 0 || !data.args.is_empty() || !data.results.is_empty()
-                || data.frame_state.is_none() || !data.flags.effectful || !data.flags.safepoint
-                || data.flags.call || data.flags.guard || data.flags.terminator || !data.targets.is_empty()
-                || native_poll_veneer.is_none() || !(transfer_mode || ordinary_call_mode)
+            if index != 0
+                || !data.args.is_empty()
+                || !data.results.is_empty()
+                || data.frame_state.is_none()
+                || !data.flags.effectful
+                || !data.flags.safepoint
+                || data.flags.call
+                || data.flags.guard
+                || data.flags.terminator
+                || !data.targets.is_empty()
+                || native_poll_veneer.is_none()
+                || !(transfer_mode || ordinary_call_mode)
             {
                 return Err(EmitError::UnsupportedOp(op_tag(data.opcode)));
             }
@@ -6335,8 +6946,7 @@ fn emit_framed_inner(
     let (backedge_headers, loop_points): (
         HashSet<crate::t2::ir::Block>,
         HashMap<crate::t2::ir::Block, usize>,
-    ) = if native_poll_veneer.is_some()
-    {
+    ) = if native_poll_veneer.is_some() {
         let mut successors: HashMap<_, Vec<_>> = HashMap::new();
         for &block in &blocks {
             successors.insert(
@@ -6387,18 +6997,25 @@ fn emit_framed_inner(
         for pair in blocks.windows(2).rev() {
             let (block, next) = (pair[0], pair[1]);
             let data = f.block(block);
-            if block == entry || !headers.contains(&block) || !headers.contains(&next)
-                || heat_headers.contains(&block) || bounded_polls.contains_key(&block)
+            if block == entry
+                || !headers.contains(&block)
+                || !headers.contains(&next)
+                || heat_headers.contains(&block)
+                || bounded_polls.contains_key(&block)
                 || f.osr_entries.iter().any(|osr| osr.block == block)
-                || !data.params.is_empty() || !f.block(next).params.is_empty()
+                || !data.params.is_empty()
+                || !f.block(next).params.is_empty()
                 || data.insts.len() != 1
             {
                 continue;
             }
             let jump = f.inst(data.insts[0]);
-            if jump.opcode == Opcode::Jump && jump.args.is_empty()
-                && jump.results.is_empty() && jump.frame_state.is_none()
-                && jump.targets.len() == 1 && jump.targets[0].block == next
+            if jump.opcode == Opcode::Jump
+                && jump.args.is_empty()
+                && jump.results.is_empty()
+                && jump.frame_state.is_none()
+                && jump.targets.len() == 1
+                && jump.targets[0].block == next
                 && jump.targets[0].args.is_empty()
             {
                 headers.remove(&block);
@@ -6406,11 +7023,12 @@ fn emit_framed_inner(
         }
         if std::env::var_os("EGCL_DISABLE_BOUNDED_POLL_COALESCING").is_none() {
             let redundant = redundant_bounded_cycle_polls(f, &blocks, &headers, &heat_headers);
-            if !redundant.is_empty()
-                && std::env::var_os("EGCL_BOUNDED_POLL_LOG").is_some()
-            {
-                eprintln!("[bounded-poll] {}: removed {} implicit poll(s)",
-                    f.name(), redundant.len());
+            if !redundant.is_empty() && std::env::var_os("EGCL_BOUNDED_POLL_LOG").is_some() {
+                eprintln!(
+                    "[bounded-poll] {}: removed {} implicit poll(s)",
+                    f.name(),
+                    redundant.len()
+                );
             }
             headers.retain(|block| !redundant.contains(block));
         }
@@ -6433,48 +7051,46 @@ fn emit_framed_inner(
     // values live at that exact machine program point, not a guessed block-wide
     // set; an incomplete map rejects this native artifact before installation.
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    let (straight_poll_sources, straight_poll_points): (
-        HashSet<Inst>,
-        HashMap<Inst, usize>,
-    ) = if native_poll_veneer.is_some()
-    {
-        const POLL_INTERVAL: usize = 64;
-        let mut sources = HashSet::new();
-        let mut count = 0usize;
-        for &block in &blocks {
-            for &inst in &f.block(block).insts {
-                let opcode = f.inst(inst).opcode;
-                if opcode.is_terminator()
-                    || opcode == Opcode::CleanupLanding || opcode == Opcode::NativePoll
-                    || is_const_opcode(opcode)
-                {
+    let (straight_poll_sources, straight_poll_points): (HashSet<Inst>, HashMap<Inst, usize>) =
+        if native_poll_veneer.is_some() {
+            const POLL_INTERVAL: usize = 64;
+            let mut sources = HashSet::new();
+            let mut count = 0usize;
+            for &block in &blocks {
+                for &inst in &f.block(block).insts {
+                    let opcode = f.inst(inst).opcode;
+                    if opcode.is_terminator()
+                        || opcode == Opcode::CleanupLanding
+                        || opcode == Opcode::NativePoll
+                        || is_const_opcode(opcode)
+                    {
+                        continue;
+                    }
+                    count = count.saturating_add(1);
+                    if count % POLL_INTERVAL == 0 {
+                        sources.insert(inst);
+                    }
+                }
+            }
+            let mut points = HashMap::new();
+            for (mi, machine_inst) in machine.insts.iter().enumerate() {
+                let Some(source) = machine_inst.source_inst else {
+                    continue;
+                };
+                if !sources.contains(&source) || points.contains_key(&source) {
                     continue;
                 }
-                count = count.saturating_add(1);
-                if count % POLL_INTERVAL == 0 {
-                    sources.insert(inst);
+                points.insert(source, mi);
+            }
+            for source in &sources {
+                if !points.contains_key(source) {
+                    return Err(EmitError::UnsupportedOp(0xFE));
                 }
             }
-        }
-        let mut points = HashMap::new();
-        for (mi, machine_inst) in machine.insts.iter().enumerate() {
-            let Some(source) = machine_inst.source_inst else {
-                continue;
-            };
-            if !sources.contains(&source) || points.contains_key(&source) {
-                continue;
-            }
-            points.insert(source, mi);
-        }
-        for source in &sources {
-            if !points.contains_key(source) {
-                return Err(EmitError::UnsupportedOp(0xFE));
-            }
-        }
-        (sources, points)
-    } else {
-        (HashSet::new(), HashMap::new())
-    };
+            (sources, points)
+        } else {
+            (HashSet::new(), HashMap::new())
+        };
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
     let straight_poll_points: HashMap<crate::t2::ir::Inst, usize> = HashMap::new();
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
@@ -6484,38 +7100,57 @@ fn emit_framed_inner(
     // takes the poll treatment: an exact map of the values live before it.
     let mut box_points: HashMap<Inst, usize> = HashMap::new();
     for (mi, machine_inst) in machine.insts.iter().enumerate() {
-        let Some(source) = machine_inst.source_inst else { continue };
+        let Some(source) = machine_inst.source_inst else {
+            continue;
+        };
         if f.inst(source).opcode == Opcode::BoxFloat {
             box_points.entry(source).or_insert(mi);
         }
     }
-    if box_points.len() != blocks.iter()
-        .flat_map(|&block| f.block(block).insts.iter())
-        .filter(|&&inst| f.inst(inst).opcode == Opcode::BoxFloat)
-        .count()
+    if box_points.len()
+        != blocks
+            .iter()
+            .flat_map(|&block| f.block(block).insts.iter())
+            .filter(|&&inst| f.inst(inst).opcode == Opcode::BoxFloat)
+            .count()
     {
         return Err(EmitError::UnsupportedOp(op_tag(Opcode::BoxFloat)));
     }
     // A branch-only result may still be live across a call or inserted poll,
     // or needed for recovery. It must be materialized before that boundary.
-    let mut safepoint_values: HashSet<_> = machine.stack_maps.iter()
+    let mut safepoint_values: HashSet<_> = machine
+        .stack_maps
+        .iter()
         .flat_map(|map| map.values.iter().map(|entry| Value(entry.vreg.num)))
         .collect();
     let read_vregs = machine.read_vregs();
-    for &point in loop_points.values().chain(straight_poll_points.values()).chain(box_points.values()) {
-        let live = machine.live_vregs_before(point, &read_vregs)
+    for &point in loop_points
+        .values()
+        .chain(straight_poll_points.values())
+        .chain(box_points.values())
+    {
+        let live = machine
+            .live_vregs_before(point, &read_vregs)
             .ok_or(EmitError::UnsupportedOp(0xFE))?;
         safepoint_values.extend(live.into_iter().map(|vreg| Value(vreg.num)));
     }
     fused.retain(|&inst| {
-        !f.inst(inst).results.iter().any(|value| safepoint_values.contains(value))
+        !f.inst(inst)
+            .results
+            .iter()
+            .any(|value| safepoint_values.contains(value))
     });
     let mut layout = select_frame_homes(f, &machine, |value| {
         const_tagged.contains_key(&value)
             || fused.iter().any(|&i| f.inst(i).results.contains(&value))
     })
     .map_err(|_| EmitError::UnsupportedOp(0xFA))?;
-    if ordinary_mode && layout.values.values().any(|home| *home == FramedHome::Reg(13)) {
+    if ordinary_mode
+        && layout
+            .values
+            .values()
+            .any(|home| *home == FramedHome::Reg(13))
+    {
         return Err(EmitError::UnsupportedOp(0xFA));
     }
     // The conditional MV cleanup runs after Call defines its primary. The
@@ -6523,10 +7158,15 @@ fn emit_framed_inner(
     // Give it a preserved home before deriving any root or recovery maps.
     for &call in &normalized_calls {
         for result in &f.inst(call).results {
-            let home = layout.values.get_mut(result).ok_or(EmitError::UnsupportedOp(0xFD))?;
+            let home = layout
+                .values
+                .get_mut(result)
+                .ok_or(EmitError::UnsupportedOp(0xFD))?;
             if !home.survives_sysv_call() {
                 *home = FramedHome::Stack(layout.stack_slots);
-                layout.stack_slots = layout.stack_slots.checked_add(1)
+                layout.stack_slots = layout
+                    .stack_slots
+                    .checked_add(1)
                     .ok_or(EmitError::UnsupportedOp(0xFD))?;
             }
         }
@@ -6537,26 +7177,43 @@ fn emit_framed_inner(
     // Give those recovery values preserved homes before deriving ANY maps;
     // normal polls, OSR imports and exceptional captures must agree.
     if transfer_mode || ordinary_call_mode {
-        let poll_states = f.osr_entries.iter()
-            .filter(|entry| loop_points.contains_key(&entry.block)).map(|entry| entry.frame_state)
-            .chain(bounded_polls.values().map(|&(inst, _)| f.inst(inst).frame_state.unwrap()));
+        let poll_states = f
+            .osr_entries
+            .iter()
+            .filter(|entry| loop_points.contains_key(&entry.block))
+            .map(|entry| entry.frame_state)
+            .chain(
+                bounded_polls
+                    .values()
+                    .map(|&(inst, _)| f.inst(inst).frame_state.unwrap()),
+            );
         for frame_state in poll_states {
             let state = f.frame_states.get(frame_state);
-            let sources = state.scopes.iter().flat_map(|scope| scope.locals.iter().chain(&scope.stack))
+            let sources = state
+                .scopes
+                .iter()
+                .flat_map(|scope| scope.locals.iter().chain(&scope.stack))
                 .chain(state.remat.iter().flat_map(|recipe| &recipe.inputs));
             for source in sources {
-                let ValueSource::Value { value, .. } = source else { continue };
-                let Some(home) = layout.values.get_mut(value) else { continue };
+                let ValueSource::Value { value, .. } = source else {
+                    continue;
+                };
+                let Some(home) = layout.values.get_mut(value) else {
+                    continue;
+                };
                 if matches!(home, FramedHome::Reg(_)) && !home.survives_sysv_call() {
                     *home = FramedHome::Stack(layout.stack_slots);
-                    layout.stack_slots = layout.stack_slots.checked_add(1)
+                    layout.stack_slots = layout
+                        .stack_slots
+                        .checked_add(1)
                         .ok_or(EmitError::UnsupportedOp(0xFD))?;
                 }
             }
         }
     }
-    let resolved = crate::t2::x64_frame::resolve_safepoint_maps(f, &machine, &layout, &const_tagged)
-        .map_err(|_| EmitError::UnsupportedOp(0xFD))?;
+    let resolved =
+        crate::t2::x64_frame::resolve_safepoint_maps(f, &machine, &layout, &const_tagged)
+            .map_err(|_| EmitError::UnsupportedOp(0xFD))?;
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     let mut transfer_maps = if transfer_mode {
         crate::t2::transfer_map::lower_resolved_transfer_maps(f, &machine, &resolved)
@@ -6565,9 +7222,12 @@ fn emit_framed_inner(
         vec![]
     };
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    let local_osr_scopes = transfer_maps.iter().all(|map| map.control_scopes.iter().all(|scope| {
-        scope.ownership == crate::control_scope::Ownership::Local
-            && matches!(scope.kind, crate::control_scope::ScopeKind::Block { register: false, .. }
+    let local_osr_scopes = transfer_maps.iter().all(|map| {
+        map.control_scopes.iter().all(|scope| {
+            scope.ownership == crate::control_scope::Ownership::Local
+                && matches!(
+                    scope.kind,
+                    crate::control_scope::ScopeKind::Block { register: false, .. }
                 | crate::control_scope::ScopeKind::Tagbody { .. }
                 | crate::control_scope::ScopeKind::Catch { .. }
                 | crate::control_scope::ScopeKind::Unwind { .. }
@@ -6577,30 +7237,48 @@ fn emit_framed_inner(
                 | crate::control_scope::ScopeKind::RestartCase { .. }
                 | crate::control_scope::ScopeKind::SpecialBinding { .. }
                 // The runtime moves the activation's EnvFrame with OSR state.
-                | crate::control_scope::ScopeKind::LexicalEnvironment)
-    }));
+                | crate::control_scope::ScopeKind::LexicalEnvironment
+                )
+        })
+    });
     let resolve_poll = |point| {
-        crate::t2::x64_frame::resolve_values_before_reading(f, &machine, &layout, &const_tagged, point, &read_vregs)
-            .map_err(|_| EmitError::UnsupportedOp(0xFE))
+        crate::t2::x64_frame::resolve_values_before_reading(
+            f,
+            &machine,
+            &layout,
+            &const_tagged,
+            point,
+            &read_vregs,
+        )
+        .map_err(|_| EmitError::UnsupportedOp(0xFE))
     };
-    let loop_maps: HashMap<_, _> = loop_points.iter()
+    let loop_maps: HashMap<_, _> = loop_points
+        .iter()
         .map(|(&block, &point)| Ok((block, resolve_poll(point)?)))
         .collect::<Result<_, EmitError>>()?;
-    let straight_poll_maps: HashMap<_, _> = straight_poll_points.iter()
+    let straight_poll_maps: HashMap<_, _> = straight_poll_points
+        .iter()
         .map(|(&inst, &point)| Ok((inst, resolve_poll(point)?)))
         .collect::<Result<_, EmitError>>()?;
-    let box_maps: HashMap<_, _> = box_points.iter()
+    let box_maps: HashMap<_, _> = box_points
+        .iter()
         .map(|(&inst, &point)| Ok((inst, resolve_poll(point)?)))
         .collect::<Result<_, EmitError>>()?;
     let homes = layout.values;
     let mut next_stack = layout.stack_slots;
-    let raw_poll_spills = loop_maps.values().chain(straight_poll_maps.values()).chain(box_maps.values())
-        .map(|values| values.raw_registers().count()).max().unwrap_or(0);
-    let raw_poll_spills = u32::try_from(raw_poll_spills)
-        .map_err(|_| EmitError::UnsupportedOp(0xFE))?;
+    let raw_poll_spills = loop_maps
+        .values()
+        .chain(straight_poll_maps.values())
+        .chain(box_maps.values())
+        .map(|values| values.raw_registers().count())
+        .max()
+        .unwrap_or(0);
+    let raw_poll_spills =
+        u32::try_from(raw_poll_spills).map_err(|_| EmitError::UnsupportedOp(0xFE))?;
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     let raw_poll_spill_start = next_stack;
-    next_stack = next_stack.checked_add(raw_poll_spills)
+    next_stack = next_stack
+        .checked_add(raw_poll_spills)
         .filter(|&slots| slots <= i32::MAX as u32 / 8)
         .ok_or(EmitError::UnsupportedOp(0xFE))?;
 
@@ -6670,7 +7348,9 @@ fn emit_framed_inner(
     let proven_immediate =
         |value: Value| super::register_entry::proven_immediate(&inference, value);
     let needs_shadow = |entry: &crate::t2::x64_frame::FrameValue| {
-        entry.gc_home().is_some_and(|home| !published_native_roots || !home.survives_sysv_call())
+        entry
+            .gc_home()
+            .is_some_and(|home| !published_native_roots || !home.survives_sysv_call())
     };
     let mut safepoint_roots: HashMap<Inst, Vec<Value>> = HashMap::new();
     if activation_slots.is_some() {
@@ -6681,7 +7361,9 @@ fn emit_framed_inner(
             // This is the same checked final-home map consumed by transfer
             // recovery. Before liveness includes dying call arguments and
             // excludes the call's as-yet-unwritten result.
-            let mut live: Vec<_> = point.values().iter()
+            let mut live: Vec<_> = point
+                .values()
+                .iter()
                 .filter(|entry| needs_shadow(entry) && !proven_immediate(entry.value))
                 .map(|entry| entry.value)
                 .collect();
@@ -6725,15 +7407,25 @@ fn emit_framed_inner(
     // Polls preserve tagged immediates as well as moving candidates because
     // their calls were inserted after allocation's clobber analysis.
     let poll_roots = |values: &crate::t2::x64_frame::FrameValues| {
-        values.values().iter().filter(|value| needs_shadow(value))
-            .map(|value| value.value).collect::<Vec<_>>()
+        values
+            .values()
+            .iter()
+            .filter(|value| needs_shadow(value))
+            .map(|value| value.value)
+            .collect::<Vec<_>>()
     };
-    let loop_roots: HashMap<_, _> = loop_maps.iter()
-        .map(|(&block, values)| (block, poll_roots(values))).collect();
-    let straight_poll_roots: HashMap<_, _> = straight_poll_maps.iter()
-        .map(|(&inst, values)| (inst, poll_roots(values))).collect();
-    let box_roots: HashMap<_, _> = box_maps.iter()
-        .map(|(&inst, values)| (inst, poll_roots(values))).collect();
+    let loop_roots: HashMap<_, _> = loop_maps
+        .iter()
+        .map(|(&block, values)| (block, poll_roots(values)))
+        .collect();
+    let straight_poll_roots: HashMap<_, _> = straight_poll_maps
+        .iter()
+        .map(|(&inst, values)| (inst, poll_roots(values)))
+        .collect();
+    let box_roots: HashMap<_, _> = box_maps
+        .iter()
+        .map(|(&inst, values)| (inst, poll_roots(values)))
+        .collect();
     let root_shadow_slots = safepoint_roots
         .values()
         .map(Vec::len)
@@ -6753,30 +7445,41 @@ fn emit_framed_inner(
         .flat_map(|&block| f.block(block).insts.iter().copied())
         .map(|inst| f.inst(inst))
         .filter(|data| {
-            (data.opcode == Opcode::Call && (ordinary_call_mode || data.args.len() > 3)) || data.opcode == Opcode::Invoke
+            (data.opcode == Opcode::Call && (ordinary_call_mode || data.args.len() > 3))
+                || data.opcode == Opcode::Invoke
         })
         .map(|data| data.args.len())
         .max()
         .unwrap_or(0);
     let call_arg_slots =
         u16::try_from(call_arg_slots).map_err(|_| EmitError::UnsupportedOp(0xFD))?;
-    let call_storage_slots = root_shadow_slots.checked_add(call_arg_slots)
+    let call_storage_slots = root_shadow_slots
+        .checked_add(call_arg_slots)
         .ok_or(EmitError::UnsupportedOp(0xFD))?;
     let spill_area = if native_call_storage {
         let start = next_stack;
-        next_stack = next_stack.checked_add(u32::from(call_storage_slots))
+        next_stack = next_stack
+            .checked_add(u32::from(call_storage_slots))
             .ok_or(EmitError::UnsupportedOp(0xFD))?;
         NativeValueArea::NativeStack(start)
     } else {
         NativeValueArea::Activation(activation_slots.unwrap_or(0))
     };
     let outgoing_area = match spill_area {
-        NativeValueArea::Activation(base) => NativeValueArea::Activation(base.checked_add(root_shadow_slots)
-            .ok_or(EmitError::UnsupportedOp(0xFD))?),
-        NativeValueArea::NativeStack(base) => NativeValueArea::NativeStack(base.checked_add(u32::from(root_shadow_slots))
-            .ok_or(EmitError::UnsupportedOp(0xFD))?),
+        NativeValueArea::Activation(base) => NativeValueArea::Activation(
+            base.checked_add(root_shadow_slots)
+                .ok_or(EmitError::UnsupportedOp(0xFD))?,
+        ),
+        NativeValueArea::NativeStack(base) => NativeValueArea::NativeStack(
+            base.checked_add(u32::from(root_shadow_slots))
+                .ok_or(EmitError::UnsupportedOp(0xFD))?,
+        ),
     };
-    let shadow_root_slots = if native_call_storage { 0 } else { call_storage_slots };
+    let shadow_root_slots = if native_call_storage {
+        0
+    } else {
+        call_storage_slots
+    };
     let needs_activation_frame = transfer_mode
         || f.block_order().iter().any(|&block| {
             f.block(block)
@@ -6790,13 +7493,14 @@ fn emit_framed_inner(
     if call_arg_slots != 0 && activation_slots.is_none() {
         return Err(EmitError::UnsupportedOp(0xF9));
     }
-    let frame_base_home = if shadow_root_slots == 0 && !needs_activation_frame && !ordinary_call_mode {
-        None
-    } else {
-        let home = FramedHome::Stack(next_stack);
-        next_stack += 1;
-        Some(home)
-    };
+    let frame_base_home =
+        if shadow_root_slots == 0 && !needs_activation_frame && !ordinary_call_mode {
+            None
+        } else {
+            let home = FramedHome::Stack(next_stack);
+            next_stack += 1;
+            Some(home)
+        };
     // Native callees resume their own deoptimization, including register-entry
     // recursion. Record whether this activation owns an EgclStack frame.
     let entry_kind_home = (code_id != 0 || (native_frame_mode && !ordinary_call_mode)).then(|| {
@@ -6805,25 +7509,40 @@ fn emit_framed_inner(
         home
     });
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    let poll_fast_path = transfers.as_ref().and_then(|transfer| transfer.poll_fast_path)
+    let poll_fast_path = transfers
+        .as_ref()
+        .and_then(|transfer| transfer.poll_fast_path)
         .filter(|_| !backedge_headers.is_empty() || !straight_poll_sources.is_empty());
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     let poll_control_home = poll_fast_path.map(|_| {
-        let home = FramedHome::Stack(next_stack); next_stack += 1; home
+        let home = FramedHome::Stack(next_stack);
+        next_stack += 1;
+        home
     });
     let native_control_home = native_frame_mode.then(|| {
-        let home = FramedHome::Stack(next_stack); next_stack += 1; home
+        let home = FramedHome::Stack(next_stack);
+        next_stack += 1;
+        home
     });
     let native_stack_home = (native_frame_mode && !ordinary_call_mode).then(|| {
-        let home = FramedHome::Stack(next_stack); next_stack += 1; home
+        let home = FramedHome::Stack(next_stack);
+        next_stack += 1;
+        home
     });
     let native_argument_base = native_frame_mode.then(|| {
         let base = next_stack;
         next_stack += f.block(entry).params.len() as u32;
         base
     });
-    let native_arguments: Vec<_> = native_argument_base.into_iter().flat_map(|base|
-        f.block(entry).params.iter().enumerate().map(move |(index, &value)| (value, base + index as u32)))
+    let native_arguments: Vec<_> = native_argument_base
+        .into_iter()
+        .flat_map(|base| {
+            f.block(entry)
+                .params
+                .iter()
+                .enumerate()
+                .map(move |(index, &value)| (value, base + index as u32))
+        })
         .collect();
     let native_spill_slots = next_stack;
     let regalloc_spill_slots = machine.num_spill_slots;
@@ -6855,10 +7574,12 @@ fn emit_framed_inner(
     if native_frame_mode && has_declared_params && !ordinary_call_mode {
         return Err(EmitError::UnsupportedOp(0xFA));
     }
-    let has_reg_entry = !ordinary_call_mode && (native_frame_mode || (!has_declared_params
-        && !f.is_variadic()
-        && frame_base_home.is_none()
-        && f.block(entry).params.len() <= arg_regs.len()));
+    let has_reg_entry = !ordinary_call_mode
+        && (native_frame_mode
+            || (!has_declared_params
+                && !f.is_variadic()
+                && frame_base_home.is_none()
+                && f.block(entry).params.len() <= arg_regs.len()));
     // Even pure self-recursion can enter c2i at the stack limit or deoptimize.
     // Every native caller must propagate a transfer raised by that fallback.
     let transfer_check = (c2i_transfer_pending_addr != 0).then(|| NativeTransferCheck {
@@ -6931,15 +7652,17 @@ fn emit_framed_inner(
                     // boxed-double precondition; no failure edge exists.
                     continue;
                 }
-                if d.opcode == Opcode::UnboxFixnum && !d.flags.guard
+                if d.opcode == Opcode::UnboxFixnum
+                    && !d.flags.guard
                     && crate::t2::unbox_fixnum::proven_tagged_fixnum(f, d.args[0])
                 {
                     // A dominating runtime proof makes this a total tag shift.
                     continue;
                 }
-                if (matches!(d.opcode, Opcode::FloatAdd | Opcode::FloatSub | Opcode::FloatMul
-                    | Opcode::FloatNeg)
-                    && d.results.len() == 1
+                if (matches!(
+                    d.opcode,
+                    Opcode::FloatAdd | Opcode::FloatSub | Opcode::FloatMul | Opcode::FloatNeg
+                ) && d.results.len() == 1
                     && f.value(d.results[0]).repr == ValueRepresentation::UnboxedF64)
                     || matches!(d.opcode, Opcode::ConstDouble | Opcode::BoxFloat)
                 {
@@ -6973,7 +7696,9 @@ fn emit_framed_inner(
             .into_iter()
             .collect();
         s.sort_unstable();
-        if ordinary_mode { s.insert(0, 5); } // RBP is the first saved word.
+        if ordinary_mode {
+            s.insert(0, 5);
+        } // RBP is the first saved word.
         s
     };
     #[cfg(not(all(target_arch = "x86_64", windows)))]
@@ -6989,7 +7714,9 @@ fn emit_framed_inner(
         {
             for &r in &saved {
                 push_reg(a, r);
-                if ordinary_mode && r == 5 { mov_rr(a, 5, 4); } // mov rbp, rsp
+                if ordinary_mode && r == 5 {
+                    mov_rr(a, 5, 4);
+                } // mov rbp, rsp
             }
             if pad {
                 a.extend_from_slice(&[0x48, 0x83, 0xEC, 0x08]);
@@ -7042,7 +7769,9 @@ fn emit_framed_inner(
     let frame_entry_label = a.label();
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     a.bind(frame_entry_label);
-    if ordinary_call_mode { a.extend_from_slice(&[0x0f, 0x0b]); } // no legacy entry for this artifact
+    if ordinary_call_mode {
+        a.extend_from_slice(&[0x0f, 0x0b]);
+    } // no legacy entry for this artifact
     let _unwind_info = emit_prologue(&mut a);
     if let Some(home) = entry_kind_home {
         mov_imm64(&mut a, RAX, code_id as i64);
@@ -7086,12 +7815,22 @@ fn emit_framed_inner(
         if native_frame_mode {
             native_recursive_entry = Some(a.here());
             compiled_entry = 0;
-        } else { compiled_entry = a.here(); }
+        } else {
+            compiled_entry = a.here();
+        }
         // Register entry: same prologue, but args arrive in the arg registers and
         // move into the (callee-saved) value registers; then fall into the body.
         emit_prologue(&mut a);
         if let Some(home) = entry_kind_home {
-            mov_imm64(&mut a, RAX, if native_frame_mode { 1 } else { (code_id | (1 << 63)) as i64 });
+            mov_imm64(
+                &mut a,
+                RAX,
+                if native_frame_mode {
+                    1
+                } else {
+                    (code_id | (1 << 63)) as i64
+                },
+            );
             store_home(&mut a, home, RAX, 0);
         }
         if native_frame_mode {
@@ -7132,11 +7871,15 @@ fn emit_framed_inner(
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     let mut ordinary_self_stack_fixups = Vec::new();
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    let ordinary_self_prefix = ordinary.and_then(|options|
-        ordinary_prefix::select(f, options.arity, &single_returns));
+    let ordinary_self_prefix =
+        ordinary.and_then(|options| ordinary_prefix::select(f, options.arity, &single_returns));
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    let ordinary_self_specializations = ordinary.zip(ordinary_call).map_or_else(Vec::new,
-        |(options, calls)| ordinary_prefix::specialize(f, options.arity, &single_returns, calls.self_calls));
+    let ordinary_self_specializations =
+        ordinary
+            .zip(ordinary_call)
+            .map_or_else(Vec::new, |(options, calls)| {
+                ordinary_prefix::specialize(f, options.arity, &single_returns, calls.self_calls)
+            });
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     let mut ordinary_bound_entry = None;
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -7191,109 +7934,133 @@ fn emit_framed_inner(
             mov_imm64(&mut a, 11, keywords.decline as i64);
             a.extend_from_slice(&[0x41, 0xFF, 0xE3]); // jmp r11, all incoming values intact
         } else {
-        // Declared parameter types are checked here for every caller except
-        // proven self calls, which check at their call site and enter at
-        // `ordinary_self_entry`. A failed check reaches the same rooted
-        // veneer as a wrong count, with every incoming value intact; its
-        // runtime helper signals the declaration's TYPE-ERROR.
-        let checked: Vec<(usize, crate::t2::ir::IRType)> = f.block(entry).params.iter().enumerate()
-            .filter(|&(_, &param)| f.is_entry_param_checked(param))
-            .map(|(index, &param)| (index, f.value(param).ty))
-            .collect();
-        let checks = a.label();
-        alu_r_imm(&mut a, 7, 1, options.arity as i32); // cmp rcx, supplied arity
-        a.jcc(Cc::E, if checked.is_empty() { accepted } else { checks });
-        if !checked.is_empty() && options.binding.is_some() {
-            return Err(EmitError::UnsupportedOp(0xFA));
-        }
-        if let Some(OrdinaryArgumentBinding::Optional(optional)) = options.binding {
-            // A shorter supplied count binds each omitted trailing parameter
-            // to the unsupplied marker, as the managed entry's bind_params
-            // does. Every accepted argument is a register argument, so no
-            // caller-owned stack slot is ever missing.
-            if optional.min_arity >= options.arity || options.arity > 3 {
+            // Declared parameter types are checked here for every caller except
+            // proven self calls, which check at their call site and enter at
+            // `ordinary_self_entry`. A failed check reaches the same rooted
+            // veneer as a wrong count, with every incoming value intact; its
+            // runtime helper signals the declaration's TYPE-ERROR.
+            let checked: Vec<(usize, crate::t2::ir::IRType)> = f
+                .block(entry)
+                .params
+                .iter()
+                .enumerate()
+                .filter(|&(_, &param)| f.is_entry_param_checked(param))
+                .map(|(index, &param)| (index, f.value(param).ty))
+                .collect();
+            let checks = a.label();
+            alu_r_imm(&mut a, 7, 1, options.arity as i32); // cmp rcx, supplied arity
+            a.jcc(Cc::E, if checked.is_empty() { accepted } else { checks });
+            if !checked.is_empty() && options.binding.is_some() {
                 return Err(EmitError::UnsupportedOp(0xFA));
             }
-            let rejected = a.label();
-            alu_r_imm(&mut a, 7, 1, optional.min_arity as i32);
-            a.jcc(Cc::L, rejected); // the count is a small nonnegative integer
-            alu_r_imm(&mut a, 7, 1, options.arity as i32);
-            a.jcc(Cc::G, rejected);
-            for (index, reg) in [7u8, 6, 2].into_iter().enumerate()
-                .take(options.arity).skip(optional.min_arity)
-            {
-                let supplied = a.label();
-                alu_r_imm(&mut a, 7, 1, index as i32);
-                a.jcc(Cc::G, supplied); // count > index: argument `index` arrived
-                mov_imm64(&mut a, reg, optional.unsupplied as i64);
-                a.bind(supplied);
-            }
-            // Past this point the entry sees a full-arity call.
-            mov_imm64(&mut a, 1, options.arity as i64);
-            a.jmp(accepted);
-            a.bind(rejected);
-        }
-        let rejected = a.label();
-        a.bind(rejected);
-        mov_imm64(&mut a, 11, options.arity_error_veneer as i64);
-        a.extend_from_slice(&[0x41, 0xFF, 0xE3]); // jmp r11, all incoming values intact
-        if !checked.is_empty() {
-            a.bind(checks);
-            for (index, ty) in checked {
-                // Only R10 and R11 change before the decision.
-                match index {
-                    0..=2 => mov_rr(&mut a, 10, [7u8, 6, 2][index]),
-                    _ => load_from_rsp(&mut a, 10, 8 + (index as i32 - 3) * 8),
-                }
-                if ty.bits == crate::t2::ir::TypeBits::FIXNUM {
-                    a.extend_from_slice(&[0x41, 0xf6, 0xc2, 0x07]); // test r10b,7
-                    a.jcc(Cc::Ne, rejected);
-                    if let Some(range) = ty.range {
-                        if range.lo < FIXNUM_MIN || range.hi > FIXNUM_MAX || range.lo > range.hi {
-                            return Err(EmitError::UnsupportedOp(0xFA));
-                        }
-                        mov_imm64(&mut a, 11, range.lo << 3);
-                        cmp_rr(&mut a, 10, 11);
-                        a.jcc(Cc::L, rejected);
-                        mov_imm64(&mut a, 11, range.hi << 3);
-                        cmp_rr(&mut a, 10, 11);
-                        a.jcc(Cc::G, rejected);
-                    }
-                } else if ty.bits == crate::t2::ir::TypeBits::SINGLE_FLOAT && ty.range.is_none() {
-                    mov_rr(&mut a, 11, 10);
-                    a.extend_from_slice(&[0x41, 0x80, 0xe3, 0x07]); // and r11b,7
-                    a.extend_from_slice(&[0x41, 0x80, 0xfb, 0x04]); // cmp r11b,4
-                    a.jcc(Cc::Ne, rejected);
-                } else {
+            if let Some(OrdinaryArgumentBinding::Optional(optional)) = options.binding {
+                // A shorter supplied count binds each omitted trailing parameter
+                // to the unsupplied marker, as the managed entry's bind_params
+                // does. Every accepted argument is a register argument, so no
+                // caller-owned stack slot is ever missing.
+                if optional.min_arity >= options.arity || options.arity > 3 {
                     return Err(EmitError::UnsupportedOp(0xFA));
                 }
+                let rejected = a.label();
+                alu_r_imm(&mut a, 7, 1, optional.min_arity as i32);
+                a.jcc(Cc::L, rejected); // the count is a small nonnegative integer
+                alu_r_imm(&mut a, 7, 1, options.arity as i32);
+                a.jcc(Cc::G, rejected);
+                for (index, reg) in [7u8, 6, 2]
+                    .into_iter()
+                    .enumerate()
+                    .take(options.arity)
+                    .skip(optional.min_arity)
+                {
+                    let supplied = a.label();
+                    alu_r_imm(&mut a, 7, 1, index as i32);
+                    a.jcc(Cc::G, supplied); // count > index: argument `index` arrived
+                    mov_imm64(&mut a, reg, optional.unsupplied as i64);
+                    a.bind(supplied);
+                }
+                // Past this point the entry sees a full-arity call.
+                mov_imm64(&mut a, 1, options.arity as i64);
+                a.jmp(accepted);
+                a.bind(rejected);
             }
-            ordinary_checks_params = true;
-        }
+            let rejected = a.label();
+            a.bind(rejected);
+            mov_imm64(&mut a, 11, options.arity_error_veneer as i64);
+            a.extend_from_slice(&[0x41, 0xFF, 0xE3]); // jmp r11, all incoming values intact
+            if !checked.is_empty() {
+                a.bind(checks);
+                for (index, ty) in checked {
+                    // Only R10 and R11 change before the decision.
+                    match index {
+                        0..=2 => mov_rr(&mut a, 10, [7u8, 6, 2][index]),
+                        _ => load_from_rsp(&mut a, 10, 8 + (index as i32 - 3) * 8),
+                    }
+                    if ty.bits == crate::t2::ir::TypeBits::FIXNUM {
+                        a.extend_from_slice(&[0x41, 0xf6, 0xc2, 0x07]); // test r10b,7
+                        a.jcc(Cc::Ne, rejected);
+                        if let Some(range) = ty.range {
+                            if range.lo < FIXNUM_MIN || range.hi > FIXNUM_MAX || range.lo > range.hi
+                            {
+                                return Err(EmitError::UnsupportedOp(0xFA));
+                            }
+                            mov_imm64(&mut a, 11, range.lo << 3);
+                            cmp_rr(&mut a, 10, 11);
+                            a.jcc(Cc::L, rejected);
+                            mov_imm64(&mut a, 11, range.hi << 3);
+                            cmp_rr(&mut a, 10, 11);
+                            a.jcc(Cc::G, rejected);
+                        }
+                    } else if ty.bits == crate::t2::ir::TypeBits::SINGLE_FLOAT && ty.range.is_none()
+                    {
+                        mov_rr(&mut a, 11, 10);
+                        a.extend_from_slice(&[0x41, 0x80, 0xe3, 0x07]); // and r11b,7
+                        a.extend_from_slice(&[0x41, 0x80, 0xfb, 0x04]); // cmp r11b,4
+                        a.jcc(Cc::Ne, rejected);
+                    } else {
+                        return Err(EmitError::UnsupportedOp(0xFA));
+                    }
+                }
+                ordinary_checks_params = true;
+            }
         }
         a.bind(accepted);
-        ordinary_bound_entry = matches!(options.binding, Some(OrdinaryArgumentBinding::Keywords(_)))
-            .then(|| a.here());
+        ordinary_bound_entry =
+            matches!(options.binding, Some(OrdinaryArgumentBinding::Keywords(_))).then(|| a.here());
         a.bind(ordinary_self_entry);
         ordinary_prefix::emit(&mut a, f, options.arity, &single_returns);
         emit_prologue(&mut a);
         let incoming = [7, 6, 2]; // RDI, RSI, RDX; overflow follows return PC.
         let incoming_stack = spill_bytes / 8 + usize::from(pad) + saved.len() + 1;
-        let moves = f.block(entry).params.iter().enumerate().map(|(index, value)| {
-            let source = if index < incoming.len() {
-                FramedHome::Reg(incoming[index])
-            } else {
-                FramedHome::Stack(u32::try_from(incoming_stack + index - 3)
-                    .map_err(|_| EmitError::BadBranch)?)
-            };
-            Ok((*homes.get(value).ok_or(EmitError::UnsupportedOp(0xF2))?,
-                HomeMoveSrc::Home(source)))
-        }).collect::<Result<Vec<_>, EmitError>>()?;
+        let moves = f
+            .block(entry)
+            .params
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                let source = if index < incoming.len() {
+                    FramedHome::Reg(incoming[index])
+                } else {
+                    FramedHome::Stack(
+                        u32::try_from(incoming_stack + index - 3)
+                            .map_err(|_| EmitError::BadBranch)?,
+                    )
+                };
+                Ok((
+                    *homes.get(value).ok_or(EmitError::UnsupportedOp(0xF2))?,
+                    HomeMoveSrc::Home(source),
+                ))
+            })
+            .collect::<Result<Vec<_>, EmitError>>()?;
         parallel_home_move(&mut a, &moves);
         if ordinary_call_mode {
             mov_imm64(&mut a, RAX, 0);
             store_home(&mut a, frame_base_home.unwrap(), RAX, 0);
-            load_mem64_disp(&mut a, RAX, 13, egcl_rt::exec_context::offsets::ACTIVE_NATIVE_CONTROL as i32);
+            load_mem64_disp(
+                &mut a,
+                RAX,
+                13,
+                egcl_rt::exec_context::offsets::ACTIVE_NATIVE_CONTROL as i32,
+            );
             store_home(&mut a, native_control_home.unwrap(), RAX, 0);
             for &(value, slot) in &native_arguments {
                 load_home(&mut a, RAX, homes[&value], 0);
@@ -7301,29 +8068,46 @@ fn emit_framed_inner(
             }
         }
         Some(offset)
-    } else { None };
+    } else {
+        None
+    };
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
     let ordinary_entry = None;
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    let poll_frame = frame_base_home.zip(activation_slots).map(|(base, activation_slots)| PollFrame {
-        fast_path: poll_fast_path.zip(poll_control_home),
-        execution_idle: ordinary_call.is_some_and(|call| call.self_facts.top_tier),
-        arguments: native_arguments.clone(), native_frame_mode,
-        spill_area, base, activation_slots, shadow_slots: shadow_root_slots, raw_spill_start: raw_poll_spill_start,
-        native_slots: native_spill_slots,
-    });
+    let poll_frame = frame_base_home
+        .zip(activation_slots)
+        .map(|(base, activation_slots)| PollFrame {
+            fast_path: poll_fast_path.zip(poll_control_home),
+            execution_idle: ordinary_call.is_some_and(|call| call.self_facts.top_tier),
+            arguments: native_arguments.clone(),
+            native_frame_mode,
+            spill_area,
+            base,
+            activation_slots,
+            shadow_slots: shadow_root_slots,
+            raw_spill_start: raw_poll_spill_start,
+            native_slots: native_spill_slots,
+        });
     let native_layout = NativeFrameLayout {
         native_slots: native_spill_slots,
-        activation_base_slot: if native_frame_mode { None } else { match frame_base_home {
-            Some(FramedHome::Stack(slot)) => Some(slot),
-            None => None,
-            _ => return Err(EmitError::UnsupportedOp(0xFD)),
-        } },
-        activation_slots: if native_frame_mode { 0 } else { activation_slots
-            .unwrap_or(0)
-            .checked_add(shadow_root_slots)
-            .ok_or(EmitError::UnsupportedOp(0xFD))? },
+        activation_base_slot: if native_frame_mode {
+            None
+        } else {
+            match frame_base_home {
+                Some(FramedHome::Stack(slot)) => Some(slot),
+                None => None,
+                _ => return Err(EmitError::UnsupportedOp(0xFD)),
+            }
+        },
+        activation_slots: if native_frame_mode {
+            0
+        } else {
+            activation_slots
+                .unwrap_or(0)
+                .checked_add(shadow_root_slots)
+                .ok_or(EmitError::UnsupportedOp(0xFD))?
+        },
     };
     let resolved_by_source: HashMap<_, _> = resolved
         .iter()
@@ -7370,31 +8154,62 @@ fn emit_framed_inner(
             };
             native_calls.push(call.site(origin, NativeStackBase::Body));
             let map = if let Some(&(inst, _)) = bounded_polls.get(&b) {
-                Some(crate::t2::transfer_map::lower_explicit_poll_transfer_map(
-                    f, inst, loop_points[&b], &loop_maps[&b],
-                ).ok_or(EmitError::UnsupportedOp(0xFE))?)
+                Some(
+                    crate::t2::transfer_map::lower_explicit_poll_transfer_map(
+                        f,
+                        inst,
+                        loop_points[&b],
+                        &loop_maps[&b],
+                    )
+                    .ok_or(EmitError::UnsupportedOp(0xFE))?,
+                )
             } else if transfer_mode && local_osr_scopes {
-                crate::t2::transfer_map::lower_poll_transfer_map(f, b, loop_points[&b], &loop_maps[&b])
-            } else { None };
+                crate::t2::transfer_map::lower_poll_transfer_map(
+                    f,
+                    b,
+                    loop_points[&b],
+                    &loop_maps[&b],
+                )
+            } else {
+                None
+            };
             if let Some(map) = map {
                 let mut shadow_roots = Vec::new();
                 let mut native_spills = Vec::new();
                 for (index, value) in loop_roots[&b].iter().enumerate() {
-                    let location = homes[value].location().ok_or(EmitError::UnsupportedOp(0xFE))?;
+                    let location = homes[value]
+                        .location()
+                        .ok_or(EmitError::UnsupportedOp(0xFE))?;
                     if map.roots.contains(&location) {
-                        match spill_area.location(index).map_err(|_| EmitError::UnsupportedOp(0xFE))? {
-                            NativeValueLocation::Activation(slot) => shadow_roots.push((location, slot)),
-                            NativeValueLocation::Stack(offset) => native_spills.push((location, offset as u32 / 8)),
+                        match spill_area
+                            .location(index)
+                            .map_err(|_| EmitError::UnsupportedOp(0xFE))?
+                        {
+                            NativeValueLocation::Activation(slot) => {
+                                shadow_roots.push((location, slot))
+                            }
+                            NativeValueLocation::Stack(offset) => {
+                                native_spills.push((location, offset as u32 / 8))
+                            }
                             _ => unreachable!(),
                         }
                     }
                 }
                 let site = crate::t2::transfer_sites::SysvTransferSite {
-                    return_offset: call.return_offset.try_into().map_err(|_| EmitError::BadBranch)?,
+                    return_offset: call
+                        .return_offset
+                        .try_into()
+                        .map_err(|_| EmitError::BadBranch)?,
                     stack_slots: native_spill_slots,
                     call_stack_adjust: call.stack_adjust,
-                    activation_slots: if native_frame_mode { 0 } else { activation_slots.unwrap().checked_add(shadow_root_slots)
-                        .ok_or(EmitError::UnsupportedOp(0xFE))? },
+                    activation_slots: if native_frame_mode {
+                        0
+                    } else {
+                        activation_slots
+                            .unwrap()
+                            .checked_add(shadow_root_slots)
+                            .ok_or(EmitError::UnsupportedOp(0xFE))?
+                    },
                     shadow_roots,
                     native_spills,
                     map,
@@ -7424,21 +8239,31 @@ fn emit_framed_inner(
                 let poll_veneer = native_poll_veneer.ok_or(EmitError::UnsupportedOp(0xFE))?;
                 let (call, values) = emit_mapped_poll(
                     &mut a,
-                    straight_poll_maps.get(&inst).ok_or(EmitError::UnsupportedOp(0xFE))?,
-                    straight_poll_roots.get(&inst).ok_or(EmitError::UnsupportedOp(0xFE))?,
+                    straight_poll_maps
+                        .get(&inst)
+                        .ok_or(EmitError::UnsupportedOp(0xFE))?,
+                    straight_poll_roots
+                        .get(&inst)
+                        .ok_or(EmitError::UnsupportedOp(0xFE))?,
                     &homes,
                     poll_frame.as_ref().ok_or(EmitError::UnsupportedOp(0xFE))?,
                     poll_veneer,
                     false,
                 )?;
                 native_value_maps.insert(call.return_offset, NativeCallValues::Frame(values));
-                native_calls.push(call.site(NativeCallOrigin::StraightPoll(inst), NativeStackBase::Body));
+                native_calls
+                    .push(call.site(NativeCallOrigin::StraightPoll(inst), NativeStackBase::Body));
             }
             #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
             if d.opcode == Opcode::BoxFloat {
-                let veneer = box_double_veneer().ok_or(EmitError::UnsupportedOp(op_tag(d.opcode)))?;
-                let input = *homes.get(&d.args[0]).ok_or(EmitError::UnsupportedOp(0xF2))?;
-                let result = *homes.get(&d.results[0]).ok_or(EmitError::UnsupportedOp(0xF2))?;
+                let veneer =
+                    box_double_veneer().ok_or(EmitError::UnsupportedOp(op_tag(d.opcode)))?;
+                let input = *homes
+                    .get(&d.args[0])
+                    .ok_or(EmitError::UnsupportedOp(0xF2))?;
+                let result = *homes
+                    .get(&d.results[0])
+                    .ok_or(EmitError::UnsupportedOp(0xF2))?;
                 let inline_done = inline_alloc::emit_box_double_fast_path(&mut a, input, result);
                 let (call, values) = emit_mapped_box(
                     &mut a,
@@ -7451,12 +8276,16 @@ fn emit_framed_inner(
                     result,
                 )?;
                 native_value_maps.insert(call.return_offset, NativeCallValues::Frame(values));
-                native_calls.push(call.site(NativeCallOrigin::StraightPoll(inst), NativeStackBase::Body));
-                if let Some(done) = inline_done { a.bind(done); }
+                native_calls
+                    .push(call.site(NativeCallOrigin::StraightPoll(inst), NativeStackBase::Body));
+                if let Some(done) = inline_done {
+                    a.bind(done);
+                }
                 continue;
             }
             if (is_const_opcode(d.opcode) && d.opcode != Opcode::ConstHeapObj)
-                || d.opcode == Opcode::CleanupLanding || d.opcode == Opcode::NativePoll
+                || d.opcode == Opcode::CleanupLanding
+                || d.opcode == Opcode::NativePoll
                 || (d.opcode.is_terminator() && d.opcode != Opcode::Invoke)
                 || fused.contains(&inst)
             {
@@ -7503,14 +8332,25 @@ fn emit_framed_inner(
             #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
             let inline_alloc_done = if !ordinary_call_mode && inline_alloc_mv_free.contains(&inst) {
                 inline_alloc::emit_framed_fast_path(&mut a, &d, &homes, &const_tagged, true)
-                    .or_else(|| inline_packed_u8::emit_framed(&mut a, f, &d, &homes, &const_tagged, true))
+                    .or_else(|| {
+                        inline_packed_u8::emit_framed(&mut a, f, &d, &homes, &const_tagged, true)
+                    })
             } else if !ordinary_call_mode && d.opcode == Opcode::Invoke {
                 inline_special::emit_transfer_fast_path(&mut a, &d, &homes, &const_tagged)
-            } else { None };
+            } else {
+                None
+            };
             if let (Some(roots), Some(frame_base), Some(_)) =
                 (roots, frame_base_home, activation_slots)
             {
-                emit_call_root_sync(&mut a, roots, &homes, frame_base, spill_area, shadow_root_slots)?;
+                emit_call_root_sync(
+                    &mut a,
+                    roots,
+                    &homes,
+                    frame_base,
+                    spill_area,
+                    shadow_root_slots,
+                )?;
             }
             let sync_offset = a.here();
             // Record the bytecode position this instruction reconstructs, at its
@@ -7523,18 +8363,31 @@ fn emit_framed_inner(
                 }
             }
             let wide_call = d.opcode == Opcode::Call && d.args.len() > 3;
-            let stack_float = if published_native_roots && native_call_storage
+            let stack_float = if published_native_roots
+                && native_call_storage
                 && matches!(d.opcode, Opcode::FloatAdd | Opcode::FloatMul)
-                && d.args.len() == 2 && d.results.len() == 1
-                && d.args.iter().chain(&d.results).all(|&value|
-                    f.value(value).repr == ValueRepresentation::UnboxedF64)
+                && d.args.len() == 2
+                && d.results.len() == 1
+                && d.args
+                    .iter()
+                    .chain(&d.results)
+                    .all(|&value| f.value(value).repr == ValueRepresentation::UnboxedF64)
             {
-                match (homes.get(&d.args[0]), homes.get(&d.args[1]), homes.get(&d.results[0])) {
-                    (Some(FramedHome::Stack(lhs)), Some(FramedHome::Stack(rhs)),
-                        Some(FramedHome::Stack(result))) => Some([*lhs, *rhs, *result]),
+                match (
+                    homes.get(&d.args[0]),
+                    homes.get(&d.args[1]),
+                    homes.get(&d.results[0]),
+                ) {
+                    (
+                        Some(FramedHome::Stack(lhs)),
+                        Some(FramedHome::Stack(rhs)),
+                        Some(FramedHome::Stack(result)),
+                    ) => Some([*lhs, *rhs, *result]),
                     _ => None,
                 }
-            } else { None };
+            } else {
+                None
+            };
             let runtime_data = (d.opcode == Opcode::VecSetInRange).then(|| {
                 let mut operands = d.clone();
                 operands.args.truncate(3);
@@ -7542,8 +8395,19 @@ fn emit_framed_inner(
             });
             let (mut inst_reg, result_stores) = if stack_float.is_some()
                 || d.opcode == Opcode::TakeValuesToLocals
-                || matches!(d.opcode, Opcode::PackedU8Layout | Opcode::PackedU8AllocationLayout | Opcode::PackedU8AllocationExtent)
-                || matches!(d.opcode, Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8 | Opcode::TryStoreIntegerOctets1To8Layout | Opcode::TryStoreIntegerOctets1To8Extent)
+                || matches!(
+                    d.opcode,
+                    Opcode::PackedU8Layout
+                        | Opcode::PackedU8AllocationLayout
+                        | Opcode::PackedU8AllocationExtent
+                )
+                || matches!(
+                    d.opcode,
+                    Opcode::TryStoreIntegerOctets8
+                        | Opcode::TryStoreIntegerOctets1To8
+                        | Opcode::TryStoreIntegerOctets1To8Layout
+                        | Opcode::TryStoreIntegerOctets1To8Extent
+                )
                 || d.opcode == Opcode::Invoke
                 || matches!(
                     d.opcode,
@@ -7552,66 +8416,133 @@ fn emit_framed_inner(
                         | Opcode::CatchLanding
                         | Opcode::HandlerLanding
                 )
-                || wide_call || (ordinary_call_mode && d.opcode == Opcode::Call)
+                || wide_call
+                || (ordinary_call_mode && d.opcode == Opcode::Call)
             {
                 (HashMap::new(), Vec::new())
             } else {
-                prepare_framed_inst(&mut a, runtime_data.as_ref().unwrap_or(&d), &homes, &const_tagged)?
+                prepare_framed_inst(
+                    &mut a,
+                    runtime_data.as_ref().unwrap_or(&d),
+                    &homes,
+                    &const_tagged,
+                )?
             };
             let mut inst_calls = Vec::new();
             let mut inst_pool = Vec::new();
             if let Some(slots) = stack_float {
-                emit_stack_float(&mut a, d.opcode, slots,
-                    d.opcode == Opcode::FloatAdd && raw_add_needs_zero_fixup(f, &d.args));
+                emit_stack_float(
+                    &mut a,
+                    d.opcode,
+                    slots,
+                    d.opcode == Opcode::FloatAdd && raw_add_needs_zero_fixup(f, &d.args),
+                );
             } else if ordinary_call_mode && d.opcode == Opcode::Call {
                 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
                 {
-                let mut delayed_completion = None;
-                let fused = inline_packed_u8::allocation_layout(f, b, inst, &straight_poll_sources,
-                    ordinary_call.unwrap().returns_at(inst)).is_some_and(|layout| {
-                    let done = a.label();
-                    if inline_packed_u8::emit_ordinary_layout_extent(&mut a, f, &d, &homes,
-                        &const_tagged, inline_alloc_single.contains(&inst),
-                        (layout.width, done, layout.extent.map(|(_, value)| value))).is_some() {
-                        if layout.delayed {
-                            delayed_completion = Some((layout.width, done));
-                            delayed_allocation_layouts.insert(layout.probe);
+                    let mut delayed_completion = None;
+                    let fused = inline_packed_u8::allocation_layout(
+                        f,
+                        b,
+                        inst,
+                        &straight_poll_sources,
+                        ordinary_call.unwrap().returns_at(inst),
+                    )
+                    .is_some_and(|layout| {
+                        let done = a.label();
+                        if inline_packed_u8::emit_ordinary_layout_extent(
+                            &mut a,
+                            f,
+                            &d,
+                            &homes,
+                            &const_tagged,
+                            inline_alloc_single.contains(&inst),
+                            (layout.width, done, layout.extent.map(|(_, value)| value)),
+                        )
+                        .is_some()
+                        {
+                            if layout.delayed {
+                                delayed_completion = Some((layout.width, done));
+                                delayed_allocation_layouts.insert(layout.probe);
+                            } else {
+                                allocation_layout_completions.insert(
+                                    layout.extent.map_or(layout.probe, |(inst, _)| inst),
+                                    done,
+                                );
+                            }
+                            true
                         } else {
-                            allocation_layout_completions.insert(layout.extent.map_or(layout.probe, |(inst, _)| inst), done);
+                            false
                         }
-                        true
-                    } else { false }
-                });
-                let inline_done = if fused { None } else { inline_alloc::emit_ordinary_fast_path(&mut a, &d, &homes,
-                    &const_tagged, inline_alloc_single.contains(&inst))
-                    .or_else(|| inline_packed_u8::emit_ordinary(&mut a, f, &d, &homes,
-                        &const_tagged, inline_alloc_single.contains(&inst)))
-                    .or_else(|| inline_special::emit_ordinary_fast_path(&mut a, &d, &homes,
-                        &const_tagged, inline_alloc_single.contains(&inst))) };
-                inst_calls = ordinary_call.unwrap().for_inst(inst).emit(&mut a, &d, &homes, &const_tagged,
-                    ordinary_call::OrdinaryCallFrame { function: f, inference: &inference,
-                        outgoing: outgoing_area,
-                        control_home: native_control_home.unwrap(), self_entry: ordinary_self_entry,
-                        self_prefix: ordinary_self_prefix.as_ref(),
-                        self_specializations: &ordinary_self_specializations,
-                        mv_known_empty: single_returns.contains(&inst),
-                        self_stack_fixups: &mut ordinary_self_stack_fixups,
-                        emit_epilogue: &emit_epilogue })?;
-                if let Some((width, done)) = delayed_completion {
-                    // Only the actual slow call reaches here. Publish NIL after
-                    // argument use/result transport, not before its allocating call.
-                    // Inline success already published width8 and jumps to DONE.
-                    mov_imm64(&mut a, RAX, egcl_rt::value::NIL.to_raw() as i64);
-                    store_home(&mut a, homes[&width], RAX, 0);
-                    a.bind(done);
+                    });
+                    let inline_done = if fused {
+                        None
+                    } else {
+                        inline_alloc::emit_ordinary_fast_path(
+                            &mut a,
+                            &d,
+                            &homes,
+                            &const_tagged,
+                            inline_alloc_single.contains(&inst),
+                        )
+                        .or_else(|| {
+                            inline_packed_u8::emit_ordinary(
+                                &mut a,
+                                f,
+                                &d,
+                                &homes,
+                                &const_tagged,
+                                inline_alloc_single.contains(&inst),
+                            )
+                        })
+                        .or_else(|| {
+                            inline_special::emit_ordinary_fast_path(
+                                &mut a,
+                                &d,
+                                &homes,
+                                &const_tagged,
+                                inline_alloc_single.contains(&inst),
+                            )
+                        })
+                    };
+                    inst_calls = ordinary_call.unwrap().for_inst(inst).emit(
+                        &mut a,
+                        &d,
+                        &homes,
+                        &const_tagged,
+                        ordinary_call::OrdinaryCallFrame {
+                            function: f,
+                            inference: &inference,
+                            outgoing: outgoing_area,
+                            control_home: native_control_home.unwrap(),
+                            self_entry: ordinary_self_entry,
+                            self_prefix: ordinary_self_prefix.as_ref(),
+                            self_specializations: &ordinary_self_specializations,
+                            mv_known_empty: single_returns.contains(&inst),
+                            self_stack_fixups: &mut ordinary_self_stack_fixups,
+                            emit_epilogue: &emit_epilogue,
+                        },
+                    )?;
+                    if let Some((width, done)) = delayed_completion {
+                        // Only the actual slow call reaches here. Publish NIL after
+                        // argument use/result transport, not before its allocating call.
+                        // Inline success already published width8 and jumps to DONE.
+                        mov_imm64(&mut a, RAX, egcl_rt::value::NIL.to_raw() as i64);
+                        store_home(&mut a, homes[&width], RAX, 0);
+                        a.bind(done);
+                    }
+                    if let Some(done) = inline_done {
+                        a.bind(done);
+                    }
                 }
-                if let Some(done) = inline_done { a.bind(done); } }
             } else if d.opcode == Opcode::ConstDouble {
                 let crate::t2::ir::AuxData::DoubleImm(bits) = d.aux else {
                     return Err(EmitError::UnsupportedOp(op_tag(d.opcode)));
                 };
                 let result = *d.results.first().ok_or(EmitError::UnsupportedOp(0xF2))?;
-                let dst = *inst_reg.get(&result).ok_or(EmitError::UnsupportedOp(0xF2))?;
+                let dst = *inst_reg
+                    .get(&result)
+                    .ok_or(EmitError::UnsupportedOp(0xF2))?;
                 mov_imm64(&mut a, dst, bits as i64);
             } else if d.opcode == Opcode::ConstHeapObj {
                 let result = *d.results.first().ok_or(EmitError::UnsupportedOp(0xF2))?;
@@ -7657,19 +8588,43 @@ fn emit_framed_inner(
                         matches!(d.aux, AuxData::CallTarget(symbol) if symbol == r.symbol)
                             && d.args.len() == r.arity
                     });
-                    let calls = if let Some(recursion) = transfer.native_recursion.filter(|r|
+                    let calls = if let Some(recursion) = transfer.native_recursion.filter(|r| {
                         matches!(d.aux, AuxData::CallTarget(symbol) if symbol == r.symbol)
-                            && d.args.len() == r.arity) {
-                        let child_bytes = u32::try_from(spill_bytes + usize::from(pad) * 8 + saved.len() * 8 + 8)
-                            .map_err(|_| EmitError::UnsupportedOp(0xFD))?;
-                        emit_native_recursive_call(&mut a, &d, &homes, &const_tagged, outgoing_area,
-                            native_control_home.unwrap(), native_stack_home.unwrap(), recursion,
-                            reg_entry_label, child_bytes)?
+                            && d.args.len() == r.arity
+                    }) {
+                        let child_bytes =
+                            u32::try_from(spill_bytes + usize::from(pad) * 8 + saved.len() * 8 + 8)
+                                .map_err(|_| EmitError::UnsupportedOp(0xFD))?;
+                        emit_native_recursive_call(
+                            &mut a,
+                            &d,
+                            &homes,
+                            &const_tagged,
+                            outgoing_area,
+                            native_control_home.unwrap(),
+                            native_stack_home.unwrap(),
+                            recursion,
+                            reg_entry_label,
+                            child_bytes,
+                        )?
                     } else {
-                        let (offsets, stack_adjust) = emit_invoke_call(&mut a, &d, &homes,
-                            &const_tagged, frame_base_home.ok_or(EmitError::UnsupportedOp(0xFD))?,
-                            outgoing_area, veneer, recursion.map(|r| (r, frame_entry_label)))?;
-                        offsets.into_iter().map(|offset| CallReturn { return_offset: offset as usize, stack_adjust }).collect()
+                        let (offsets, stack_adjust) = emit_invoke_call(
+                            &mut a,
+                            &d,
+                            &homes,
+                            &const_tagged,
+                            frame_base_home.ok_or(EmitError::UnsupportedOp(0xFD))?,
+                            outgoing_area,
+                            veneer,
+                            recursion.map(|r| (r, frame_entry_label)),
+                        )?;
+                        offsets
+                            .into_iter()
+                            .map(|offset| CallReturn {
+                                return_offset: offset as usize,
+                                stack_adjust,
+                            })
+                            .collect()
                     };
                     let index = transfer_maps
                         .iter()
@@ -7687,9 +8642,16 @@ fn emit_framed_inner(
                             .location()
                             .ok_or(EmitError::UnsupportedOp(0xFD))?;
                         if map.roots.contains(&location) {
-                            match spill_area.location(index).map_err(|_| EmitError::UnsupportedOp(0xFD))? {
-                                NativeValueLocation::Activation(slot) => shadow_roots.push((location, slot)),
-                                NativeValueLocation::Stack(offset) => native_spills.push((location, offset as u32 / 8)),
+                            match spill_area
+                                .location(index)
+                                .map_err(|_| EmitError::UnsupportedOp(0xFD))?
+                            {
+                                NativeValueLocation::Activation(slot) => {
+                                    shadow_roots.push((location, slot))
+                                }
+                                NativeValueLocation::Stack(offset) => {
+                                    native_spills.push((location, offset as u32 / 8))
+                                }
                                 _ => unreachable!(),
                             }
                         }
@@ -7702,37 +8664,53 @@ fn emit_framed_inner(
                         .ok_or(EmitError::UnsupportedOp(0xFD))?;
                     for root in &map.roots {
                         if shadow_roots.iter().any(|(location, _)| location == root)
-                            || native_spills.iter().any(|(location, _)| location == root) {
+                            || native_spills.iter().any(|(location, _)| location == root)
+                        {
                             continue;
                         }
                         let values: Vec<_> = point
                             .values()
                             .iter()
-                            .filter(|entry| entry.gc_home()
-                                .is_some_and(|home| home.location() == Some(*root)))
+                            .filter(|entry| {
+                                entry
+                                    .gc_home()
+                                    .is_some_and(|home| home.location() == Some(*root))
+                            })
                             .map(|entry| entry.value)
                             .collect();
-                        if values.is_empty() || !values.into_iter().all(|value| {
-                            proven_immediate(value) || (published_native_roots && homes[&value].survives_sysv_call())
-                        }) {
+                        if values.is_empty()
+                            || !values.into_iter().all(|value| {
+                                proven_immediate(value)
+                                    || (published_native_roots
+                                        && homes[&value].survives_sysv_call())
+                            })
+                        {
                             return Err(EmitError::UnsupportedOp(0xFD));
                         }
                     }
                     for call in calls {
-                        let return_offset = u32::try_from(call.return_offset).map_err(|_| EmitError::BadBranch)?;
+                        let return_offset =
+                            u32::try_from(call.return_offset).map_err(|_| EmitError::BadBranch)?;
                         let call_stack_adjust = call.stack_adjust;
                         inst_calls.push(call);
-                        transfer.sites.push(crate::t2::transfer_sites::SysvTransferSite {
-                            return_offset,
-                            stack_slots: native_spill_slots,
-                            call_stack_adjust,
-                            activation_slots: if native_frame_mode { 0 } else { activation_slots
-                                .unwrap().checked_add(shadow_root_slots)
-                                .ok_or(EmitError::UnsupportedOp(0xFD))? },
-                            shadow_roots: shadow_roots.clone(),
-                            native_spills: native_spills.clone(),
-                            map: map.clone(),
-                        });
+                        transfer
+                            .sites
+                            .push(crate::t2::transfer_sites::SysvTransferSite {
+                                return_offset,
+                                stack_slots: native_spill_slots,
+                                call_stack_adjust,
+                                activation_slots: if native_frame_mode {
+                                    0
+                                } else {
+                                    activation_slots
+                                        .unwrap()
+                                        .checked_add(shadow_root_slots)
+                                        .ok_or(EmitError::UnsupportedOp(0xFD))?
+                                },
+                                shadow_roots: shadow_roots.clone(),
+                                native_spills: native_spills.clone(),
+                                map: map.clone(),
+                            });
                     }
                 }
                 #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
@@ -7852,15 +8830,20 @@ fn emit_framed_inner(
                 }
             } else if d.opcode == Opcode::UnboxFloat {
                 let contagion = crate::t2::speculate::unbox_accepts_fixnum(&d.aux);
-                if !published_native_roots || !native_call_storage
+                if !published_native_roots
+                    || !native_call_storage
                     || !(d.args.len() == 1 || (contagion && d.args.len() == 2))
                     || d.results.len() != 1
-                    || d.args.iter().any(|&value| f.value(value).repr != ValueRepresentation::Tagged)
+                    || d.args
+                        .iter()
+                        .any(|&value| f.value(value).repr != ValueRepresentation::Tagged)
                     || f.value(d.results[0]).repr != ValueRepresentation::UnboxedF64
                 {
                     return Err(EmitError::UnsupportedOp(op_tag(d.opcode)));
                 }
-                let input = *inst_reg.get(&d.args[0]).ok_or(EmitError::UnsupportedOp(0xF2))?;
+                let input = *inst_reg
+                    .get(&d.args[0])
+                    .ok_or(EmitError::UnsupportedOp(0xF2))?;
                 let dst = inst_reg[&d.results[0]];
                 if !d.flags.guard {
                     // Proven boxed double: no call, allocation, failure branch,
@@ -7869,48 +8852,59 @@ fn emit_framed_inner(
                     alu_r_imm(&mut a, 4, SCRATCH, -8);
                     load_mem64_disp(&mut a, dst, SCRATCH, 8);
                 } else {
-                let label = *inst_deopt.get(&inst)
-                    .ok_or(EmitError::UnsupportedOp(op_tag(d.opcode)))?;
-                let done = a.label();
-                if contagion {
-                    // Float contagion with a fixnum operand (bliss-thcbb): the
-                    // interpreter rounds the fixnum to the nearest double, as
-                    // cvtsi2sd does. Two fixnums would make an integer there.
-                    if let Some(partner) = d.args.get(1) {
-                        let partner = *inst_reg.get(partner).ok_or(EmitError::UnsupportedOp(0xF2))?;
+                    let label = *inst_deopt
+                        .get(&inst)
+                        .ok_or(EmitError::UnsupportedOp(op_tag(d.opcode)))?;
+                    let done = a.label();
+                    if contagion {
+                        // Float contagion with a fixnum operand (bliss-thcbb): the
+                        // interpreter rounds the fixnum to the nearest double, as
+                        // cvtsi2sd does. Two fixnums would make an integer there.
+                        if let Some(partner) = d.args.get(1) {
+                            let partner = *inst_reg
+                                .get(partner)
+                                .ok_or(EmitError::UnsupportedOp(0xF2))?;
+                            mov_rr(&mut a, SCRATCH, input);
+                            alu_rr(&mut a, 0x09, SCRATCH, partner); // or rdx, partner
+                            a.extend_from_slice(&[0xF6, 0xC2, 0x07]); // test dl, 7
+                            a.jcc(Cc::E, label); // both fixnum-tagged
+                        }
+                        let boxed = a.label();
                         mov_rr(&mut a, SCRATCH, input);
-                        alu_rr(&mut a, 0x09, SCRATCH, partner); // or rdx, partner
                         a.extend_from_slice(&[0xF6, 0xC2, 0x07]); // test dl, 7
-                        a.jcc(Cc::E, label); // both fixnum-tagged
+                        a.jcc(Cc::Ne, boxed);
+                        sar_imm(&mut a, SCRATCH, 3); // the fixnum's integer value
+                        a.extend_from_slice(&[0xF2, 0x48, 0x0F, 0x2A, 0xC2]); // cvtsi2sd xmm0, rdx
+                        a.extend_from_slice(&[0x66, rex_w(0, dst), 0x0f, 0x7e, modrm_rr(0, dst)]); // movq dst, xmm0
+                        a.jmp(done);
+                        a.bind(boxed);
                     }
-                    let boxed = a.label();
                     mov_rr(&mut a, SCRATCH, input);
-                    a.extend_from_slice(&[0xF6, 0xC2, 0x07]); // test dl, 7
-                    a.jcc(Cc::Ne, boxed);
-                    sar_imm(&mut a, SCRATCH, 3); // the fixnum's integer value
-                    a.extend_from_slice(&[0xF2, 0x48, 0x0F, 0x2A, 0xC2]); // cvtsi2sd xmm0, rdx
-                    a.extend_from_slice(&[0x66, rex_w(0, dst), 0x0f, 0x7e, modrm_rr(0, dst)]); // movq dst, xmm0
-                    a.jmp(done);
-                    a.bind(boxed);
-                }
-                mov_rr(&mut a, SCRATCH, input);
-                alu_r_imm(&mut a, 4, SCRATCH, 7);
-                alu_r_imm(&mut a, 7, SCRATCH, egcl_rt::value::TAG_HEAP_OBJECT as i32);
-                a.jcc(Cc::Ne, label);
-                mov_rr(&mut a, SCRATCH, input);
-                alu_r_imm(&mut a, 4, SCRATCH, -8);
-                // Only the exact boxed-double layout admits a raw word load.
-                a.extend_from_slice(&[0x80, 0x7a, 0x07, egcl_rt::object::type_id::DOUBLE_FLOAT]);
-                a.jcc(Cc::Ne, label);
-                load_mem64_disp(&mut a, dst, SCRATCH, 8);
-                a.bind(done);
+                    alu_r_imm(&mut a, 4, SCRATCH, 7);
+                    alu_r_imm(&mut a, 7, SCRATCH, egcl_rt::value::TAG_HEAP_OBJECT as i32);
+                    a.jcc(Cc::Ne, label);
+                    mov_rr(&mut a, SCRATCH, input);
+                    alu_r_imm(&mut a, 4, SCRATCH, -8);
+                    // Only the exact boxed-double layout admits a raw word load.
+                    a.extend_from_slice(&[
+                        0x80,
+                        0x7a,
+                        0x07,
+                        egcl_rt::object::type_id::DOUBLE_FLOAT,
+                    ]);
+                    a.jcc(Cc::Ne, label);
+                    load_mem64_disp(&mut a, dst, SCRATCH, 8);
+                    a.bind(done);
                 }
             } else if d.opcode == Opcode::PackedF64P {
                 let failed = a.label();
                 let done = a.label();
                 let array = if let Some(&bits) = const_tagged.get(&d.args[0]) {
-                    mov_imm64(&mut a, RAX, bits as i64); RAX
-                } else { inst_reg[&d.args[0]] };
+                    mov_imm64(&mut a, RAX, bits as i64);
+                    RAX
+                } else {
+                    inst_reg[&d.args[0]]
+                };
                 mov_rr(&mut a, SCRATCH, array);
                 alu_r_imm(&mut a, 4, SCRATCH, 7);
                 alu_r_imm(&mut a, 7, SCRATCH, egcl_rt::value::TAG_HEAP_OBJECT as i32);
@@ -7919,57 +8913,100 @@ fn emit_framed_inner(
                 alu_r_imm(&mut a, 4, SCRATCH, -8);
                 a.extend_from_slice(&[0x80, 0x7a, 0x07, egcl_rt::object::type_id::SIMPLE_ARRAY]);
                 a.jcc(Cc::Ne, failed);
-                let small = a.label(); let body = a.label();
+                let small = a.label();
+                let body = a.label();
                 a.extend_from_slice(&[0x66, 0x81, 0x3a, 0xff, 0xff]);
                 a.jcc(Cc::Ne, small);
-                alu_r_imm(&mut a, 0, SCRATCH, 16); a.jmp(body);
-                a.bind(small); alu_r_imm(&mut a, 0, SCRATCH, 8); a.bind(body);
-                a.extend_from_slice(&[0x80, 0x3a, egcl_rt::object::ElementTypeTag::DoubleFloat as u8]);
+                alu_r_imm(&mut a, 0, SCRATCH, 16);
+                a.jmp(body);
+                a.bind(small);
+                alu_r_imm(&mut a, 0, SCRATCH, 8);
+                a.bind(body);
+                a.extend_from_slice(&[
+                    0x80,
+                    0x3a,
+                    egcl_rt::object::ElementTypeTag::DoubleFloat as u8,
+                ]);
                 a.jcc(Cc::Ne, failed);
                 let dst = inst_reg[&d.results[0]];
-                mov_imm64(&mut a, dst, egcl_rt::value::T.0 as i64); a.jmp(done);
-                a.bind(failed); mov_imm64(&mut a, dst, egcl_rt::value::NIL.0 as i64);
+                mov_imm64(&mut a, dst, egcl_rt::value::T.0 as i64);
+                a.jmp(done);
+                a.bind(failed);
+                mov_imm64(&mut a, dst, egcl_rt::value::NIL.0 as i64);
                 a.bind(done);
             } else if d.opcode == Opcode::ArrayReadDiscarded {
-                let label = *inst_deopt.get(&inst)
+                let label = *inst_deopt
+                    .get(&inst)
                     .ok_or(EmitError::UnsupportedOp(op_tag(d.opcode)))?;
                 if !matches!(d.aux, AuxData::None | AuxData::ArrayRef) {
                     return Err(EmitError::UnsupportedOp(op_tag(d.opcode)));
                 }
                 let array = if let Some(&bits) = const_tagged.get(&d.args[0]) {
-                    mov_imm64(&mut a, RAX, bits as i64); RAX
-                } else { inst_reg[&d.args[0]] };
+                    mov_imm64(&mut a, RAX, bits as i64);
+                    RAX
+                } else {
+                    inst_reg[&d.args[0]]
+                };
                 let index = inst_reg.get(&d.args[1]).copied().unwrap_or(RAX);
                 let done = a.label();
                 if matches!(d.aux, AuxData::ArrayRef) {
                     let not_vector = a.label();
-                    vector_element_address(&mut a, array, index,
-                        const_tagged.get(&d.args[1]).copied(), not_vector);
+                    vector_element_address(
+                        &mut a,
+                        array,
+                        index,
+                        const_tagged.get(&d.args[1]).copied(),
+                        not_vector,
+                    );
                     a.jmp(done);
                     a.bind(not_vector);
                     if let Some(&bits) = const_tagged.get(&d.args[0]) {
                         mov_imm64(&mut a, RAX, bits as i64);
                     }
                     let not_u8 = a.label();
-                    packed_u8_element_address(&mut a, array, index,
-                        const_tagged.get(&d.args[1]).copied(), not_u8);
+                    packed_u8_element_address(
+                        &mut a,
+                        array,
+                        index,
+                        const_tagged.get(&d.args[1]).copied(),
+                        not_u8,
+                    );
                     a.jmp(done);
                     a.bind(not_u8);
                     if let Some(&bits) = const_tagged.get(&d.args[0]) {
                         mov_imm64(&mut a, RAX, bits as i64);
                     }
-                    packed_f64_element_address(&mut a, array, index,
-                        const_tagged.get(&d.args[1]).copied(), label);
+                    packed_f64_element_address(
+                        &mut a,
+                        array,
+                        index,
+                        const_tagged.get(&d.args[1]).copied(),
+                        label,
+                    );
                 } else {
-                    vector_element_address(&mut a, array, index,
-                        const_tagged.get(&d.args[1]).copied(), label);
+                    vector_element_address(
+                        &mut a,
+                        array,
+                        index,
+                        const_tagged.get(&d.args[1]).copied(),
+                        label,
+                    );
                 }
                 a.bind(done);
-            } else if matches!(d.opcode, Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8 | Opcode::TryStoreIntegerOctets1To8Layout | Opcode::TryStoreIntegerOctets1To8Extent) {
+            } else if matches!(
+                d.opcode,
+                Opcode::TryStoreIntegerOctets8
+                    | Opcode::TryStoreIntegerOctets1To8
+                    | Opcode::TryStoreIntegerOctets1To8Layout
+                    | Opcode::TryStoreIntegerOctets1To8Extent
+            ) {
                 octet_word_store::emit_framed(&mut a, f, &d, &homes, &const_tagged)?;
             } else if d.opcode == Opcode::PackedU8AllocationExtent {
                 octet_word_store::emit_extent(&mut a, f, &d, &homes, &const_tagged)?;
-            } else if matches!(d.opcode, Opcode::PackedU8Layout | Opcode::PackedU8AllocationLayout) {
+            } else if matches!(
+                d.opcode,
+                Opcode::PackedU8Layout | Opcode::PackedU8AllocationLayout
+            ) {
                 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
                 let delayed = delayed_allocation_layouts.remove(&inst);
                 #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
@@ -7986,13 +9023,25 @@ fn emit_framed_inner(
                 let failed = a.label();
                 let done = a.label();
                 let array = if let Some(&bits) = const_tagged.get(&d.args[0]) {
-                    mov_imm64(&mut a, RAX, bits as i64); RAX
-                } else { inst_reg[&d.args[0]] };
+                    mov_imm64(&mut a, RAX, bits as i64);
+                    RAX
+                } else {
+                    inst_reg[&d.args[0]]
+                };
                 let index = inst_reg.get(&d.args[1]).copied().unwrap_or(RAX);
-                packed_f64_element_address(&mut a, array, index,
-                    const_tagged.get(&d.args[1]).copied(), failed);
-                store_mem64_disp(&mut a, SCRATCH, egcl_rt::packed_f64::DATA_OFFSET as i32,
-                    inst_reg[&d.args[2]]);
+                packed_f64_element_address(
+                    &mut a,
+                    array,
+                    index,
+                    const_tagged.get(&d.args[1]).copied(),
+                    failed,
+                );
+                store_mem64_disp(
+                    &mut a,
+                    SCRATCH,
+                    egcl_rt::packed_f64::DATA_OFFSET as i32,
+                    inst_reg[&d.args[2]],
+                );
                 let dst = inst_reg[&d.results[0]];
                 mov_imm64(&mut a, dst, egcl_rt::value::T.0 as i64);
                 a.jmp(done);
@@ -8001,28 +9050,45 @@ fn emit_framed_inner(
                 a.bind(done);
             } else if d.opcode == Opcode::SmallVectorRangeP {
                 vector_range::emit(&mut a, f, &d, &mut inst_reg, &mut inst_pool, &const_tagged)?;
-            } else if matches!(d.opcode, Opcode::VecRef | Opcode::VecSet | Opcode::VecSetInRange) {
-                let label = *inst_deopt.get(&inst)
+            } else if matches!(
+                d.opcode,
+                Opcode::VecRef | Opcode::VecSet | Opcode::VecSetInRange
+            ) {
+                let label = *inst_deopt
+                    .get(&inst)
                     .ok_or(EmitError::UnsupportedOp(op_tag(d.opcode)))?;
                 let array = if let Some(&bits) = const_tagged.get(&d.args[0]) {
-                    mov_imm64(&mut a, RAX, bits as i64); RAX
-                } else { inst_reg[&d.args[0]] };
+                    mov_imm64(&mut a, RAX, bits as i64);
+                    RAX
+                } else {
+                    inst_reg[&d.args[0]]
+                };
                 let index = inst_reg.get(&d.args[1]).copied().unwrap_or(RAX);
                 let vector = a.label();
                 let stored = a.label();
                 if d.opcode == Opcode::VecRef && matches!(d.aux, AuxData::ArrayRef) {
                     let not_vector = a.label();
                     // Keep the existing SIMPLE_VECTOR success path first.
-                    vector_element_address(&mut a, array, index,
-                        const_tagged.get(&d.args[1]).copied(), not_vector);
+                    vector_element_address(
+                        &mut a,
+                        array,
+                        index,
+                        const_tagged.get(&d.args[1]).copied(),
+                        not_vector,
+                    );
                     load_mem64_disp(&mut a, inst_reg[&d.results[0]], SCRATCH, 0);
                     a.jmp(stored);
                     a.bind(not_vector);
                     if let Some(&bits) = const_tagged.get(&d.args[0]) {
                         mov_imm64(&mut a, RAX, bits as i64);
                     }
-                    packed_u8_element_address(&mut a, array, index,
-                        const_tagged.get(&d.args[1]).copied(), label);
+                    packed_u8_element_address(
+                        &mut a,
+                        array,
+                        index,
+                        const_tagged.get(&d.args[1]).copied(),
+                        label,
+                    );
                     a.extend_from_slice(&[0x0f, 0xb6, 0x02]); // movzx eax,byte [rdx]
                     shl_imm(&mut a, RAX, 3);
                     mov_rr(&mut a, inst_reg[&d.results[0]], RAX);
@@ -8035,16 +9101,28 @@ fn emit_framed_inner(
                     a.jcc(Cc::Ne, label);
                     mov_rr(&mut a, SCRATCH, array);
                     alu_r_imm(&mut a, 4, SCRATCH, -8);
-                    a.extend_from_slice(&[0x80, 0x7a, 0x07, egcl_rt::object::type_id::SIMPLE_VECTOR]);
+                    a.extend_from_slice(&[
+                        0x80,
+                        0x7a,
+                        0x07,
+                        egcl_rt::object::type_id::SIMPLE_VECTOR,
+                    ]);
                     a.jcc(Cc::E, vector);
                     // A general-vector store skips byte-layout probing entirely.
                     let not_u8 = a.label();
-                    packed_u8_element_address(&mut a, array, index,
-                        const_tagged.get(&d.args[1]).copied(), not_u8);
+                    packed_u8_element_address(
+                        &mut a,
+                        array,
+                        index,
+                        const_tagged.get(&d.args[1]).copied(),
+                        not_u8,
+                    );
                     let value = d.args[2];
                     if let Some(&bits) = const_tagged.get(&value) {
                         mov_imm64(&mut a, RAX, bits as i64);
-                    } else { mov_rr(&mut a, RAX, inst_reg[&value]); }
+                    } else {
+                        mov_rr(&mut a, RAX, inst_reg[&value]);
+                    }
                     guard_fixnum(&mut a, RAX, label);
                     alu_r_imm(&mut a, 7, RAX, 0);
                     a.jcc(Cc::L, label);
@@ -8059,29 +9137,50 @@ fn emit_framed_inner(
                     if let Some(&bits) = const_tagged.get(&d.args[0]) {
                         mov_imm64(&mut a, RAX, bits as i64);
                     }
-                    packed_f64_element_address(&mut a, array, index,
-                        const_tagged.get(&d.args[1]).copied(), label);
+                    packed_f64_element_address(
+                        &mut a,
+                        array,
+                        index,
+                        const_tagged.get(&d.args[1]).copied(),
+                        label,
+                    );
                     // Preserve the interior slot address while validating the
                     // tagged double. No call or safepoint occurs in this span.
                     push_reg(&mut a, SCRATCH);
                     let failed = a.label();
                     let value = d.args[2];
-                    if let Some(&bits) = const_tagged.get(&value) { mov_imm64(&mut a, RAX, bits as i64); }
-                    else { mov_rr(&mut a, RAX, inst_reg[&value]); }
+                    if let Some(&bits) = const_tagged.get(&value) {
+                        mov_imm64(&mut a, RAX, bits as i64);
+                    } else {
+                        mov_rr(&mut a, RAX, inst_reg[&value]);
+                    }
                     mov_rr(&mut a, SCRATCH, RAX);
                     alu_r_imm(&mut a, 4, SCRATCH, 7);
                     alu_r_imm(&mut a, 7, SCRATCH, egcl_rt::value::TAG_HEAP_OBJECT as i32);
                     a.jcc(Cc::Ne, failed);
                     mov_rr(&mut a, SCRATCH, RAX);
                     alu_r_imm(&mut a, 4, SCRATCH, -8);
-                    a.extend_from_slice(&[0x80, 0x7a, 0x07, egcl_rt::object::type_id::DOUBLE_FLOAT]);
+                    a.extend_from_slice(&[
+                        0x80,
+                        0x7a,
+                        0x07,
+                        egcl_rt::object::type_id::DOUBLE_FLOAT,
+                    ]);
                     a.jcc(Cc::Ne, failed);
                     load_mem64_disp(&mut a, RAX, SCRATCH, 8);
                     pop_reg(&mut a, SCRATCH);
-                    store_mem64_disp(&mut a, SCRATCH, egcl_rt::packed_f64::DATA_OFFSET as i32, RAX);
+                    store_mem64_disp(
+                        &mut a,
+                        SCRATCH,
+                        egcl_rt::packed_f64::DATA_OFFSET as i32,
+                        RAX,
+                    );
                     let dst = inst_reg[&d.results[0]];
-                    if let Some(&bits) = const_tagged.get(&value) { mov_imm64(&mut a, dst, bits as i64); }
-                    else { mov_rr(&mut a, dst, inst_reg[&value]); }
+                    if let Some(&bits) = const_tagged.get(&value) {
+                        mov_imm64(&mut a, dst, bits as i64);
+                    } else {
+                        mov_rr(&mut a, dst, inst_reg[&value]);
+                    }
                     a.jmp(stored);
                     a.bind(failed);
                     pop_reg(&mut a, SCRATCH);
@@ -8103,8 +9202,13 @@ fn emit_framed_inner(
                     }
                     alu_r_imm(&mut a, 0, SCRATCH, 16);
                 } else {
-                    vector_element_address(&mut a, array, index,
-                        const_tagged.get(&d.args[1]).copied(), label);
+                    vector_element_address(
+                        &mut a,
+                        array,
+                        index,
+                        const_tagged.get(&d.args[1]).copied(),
+                        label,
+                    );
                 }
                 if d.opcode == Opcode::VecRef {
                     load_mem64_disp(&mut a, inst_reg[&d.results[0]], SCRATCH, 0);
@@ -8125,7 +9229,9 @@ fn emit_framed_inner(
                         guard_fixnum(&mut a, RAX, barrier);
                         if let Some(&bits) = const_tagged.get(&value) {
                             mov_imm64(&mut a, RAX, bits as i64);
-                        } else { mov_rr(&mut a, RAX, inst_reg[&value]); }
+                        } else {
+                            mov_rr(&mut a, RAX, inst_reg[&value]);
+                        }
                         store_mem64_disp(&mut a, SCRATCH, 0, RAX);
                         mov_rr(&mut a, inst_reg[&d.results[0]], RAX);
                         a.jmp(stored);
@@ -8134,7 +9240,9 @@ fn emit_framed_inner(
                     // Preserve every caller-save home around the noncollecting
                     // barrier leaf. No map or safepoint exposes the slot pointer.
                     let volatile = [RAX, 1, 2, 6, 7, 8, 9, 10, 11];
-                    for &reg in &volatile { push_reg(&mut a, reg); }
+                    for &reg in &volatile {
+                        push_reg(&mut a, reg);
+                    }
                     a.extend_from_slice(&[0x48, 0x83, 0xec, 8]);
                     mov_rr(&mut a, 7, SCRATCH);
                     let value = d.args[2];
@@ -8144,22 +9252,33 @@ fn emit_framed_inner(
                         let reg = inst_reg[&value];
                         if let Some(pos) = volatile.iter().position(|&r| r == reg) {
                             load_from_rsp(&mut a, 6, (8 + (8 - pos) * 8) as i32);
-                        } else { mov_rr(&mut a, 6, reg); }
+                        } else {
+                            mov_rr(&mut a, 6, reg);
+                        }
                     }
                     mov_imm64(&mut a, RAX, store_vector_element as *const () as i64);
                     a.extend_from_slice(&[0xff, 0xd0]);
                     a.extend_from_slice(&[0x48, 0x83, 0xc4, 8]);
-                    for &reg in volatile.iter().rev() { pop_reg(&mut a, reg); }
+                    for &reg in volatile.iter().rev() {
+                        pop_reg(&mut a, reg);
+                    }
                     let dst = inst_reg[&d.results[0]];
-                    if let Some(&bits) = const_tagged.get(&value) { mov_imm64(&mut a, dst, bits as i64); }
-                    else { mov_rr(&mut a, dst, inst_reg[&value]); }
+                    if let Some(&bits) = const_tagged.get(&value) {
+                        mov_imm64(&mut a, dst, bits as i64);
+                    } else {
+                        mov_rr(&mut a, dst, inst_reg[&value]);
+                    }
                 }
                 a.bind(stored);
-            } else if matches!(d.opcode, Opcode::PackedF64Ref | Opcode::VecF64Ref | Opcode::PackedF64Set) {
+            } else if matches!(
+                d.opcode,
+                Opcode::PackedF64Ref | Opcode::VecF64Ref | Opcode::PackedF64Set
+            ) {
                 if !published_native_roots || !native_call_storage {
                     return Err(EmitError::UnsupportedOp(op_tag(d.opcode)));
                 }
-                let label = *inst_deopt.get(&inst)
+                let label = *inst_deopt
+                    .get(&inst)
                     .ok_or(EmitError::UnsupportedOp(op_tag(d.opcode)))?;
                 // A constant array may use rax until copied to rdx. Constant
                 // indexes are materialized only after that copy and its guards,
@@ -8167,7 +9286,9 @@ fn emit_framed_inner(
                 let array = if let Some(&bits) = const_tagged.get(&d.args[0]) {
                     mov_imm64(&mut a, RAX, bits as i64);
                     RAX
-                } else { inst_reg[&d.args[0]] };
+                } else {
+                    inst_reg[&d.args[0]]
+                };
                 let index = inst_reg.get(&d.args[1]).copied().unwrap_or(RAX);
                 let packed = a.label();
                 let loaded = a.label();
@@ -8178,43 +9299,93 @@ fn emit_framed_inner(
                     a.jcc(Cc::Ne, label);
                     mov_rr(&mut a, SCRATCH, array);
                     alu_r_imm(&mut a, 4, SCRATCH, -8);
-                    a.extend_from_slice(&[0x80, 0x7a, 0x07, egcl_rt::object::type_id::SIMPLE_VECTOR]);
-                    a.jcc(Cc::Ne, if d.opcode == Opcode::VecF64Ref { label } else { packed });
-                    vector_element_address(&mut a, array, index,
-                        const_tagged.get(&d.args[1]).copied(), label);
+                    a.extend_from_slice(&[
+                        0x80,
+                        0x7a,
+                        0x07,
+                        egcl_rt::object::type_id::SIMPLE_VECTOR,
+                    ]);
+                    a.jcc(
+                        Cc::Ne,
+                        if d.opcode == Opcode::VecF64Ref {
+                            label
+                        } else {
+                            packed
+                        },
+                    );
+                    vector_element_address(
+                        &mut a,
+                        array,
+                        index,
+                        const_tagged.get(&d.args[1]).copied(),
+                        label,
+                    );
                     load_mem64_disp(&mut a, SCRATCH, SCRATCH, 0);
                     mov_rr(&mut a, RAX, SCRATCH);
                     alu_r_imm(&mut a, 4, RAX, 7);
                     alu_r_imm(&mut a, 7, RAX, egcl_rt::value::TAG_HEAP_OBJECT as i32);
                     a.jcc(Cc::Ne, label);
                     alu_r_imm(&mut a, 4, SCRATCH, -8);
-                    a.extend_from_slice(&[0x80, 0x7a, 0x07, egcl_rt::object::type_id::DOUBLE_FLOAT]);
+                    a.extend_from_slice(&[
+                        0x80,
+                        0x7a,
+                        0x07,
+                        egcl_rt::object::type_id::DOUBLE_FLOAT,
+                    ]);
                     a.jcc(Cc::Ne, label);
                     load_mem64_disp(&mut a, inst_reg[&d.results[0]], SCRATCH, 8);
                     a.jmp(loaded);
                     a.bind(packed);
                 }
-                packed_f64_element_address(&mut a, array, index,
-                    const_tagged.get(&d.args[1]).copied(), label);
+                packed_f64_element_address(
+                    &mut a,
+                    array,
+                    index,
+                    const_tagged.get(&d.args[1]).copied(),
+                    label,
+                );
                 if matches!(d.opcode, Opcode::PackedF64Ref | Opcode::VecF64Ref) {
-                    load_mem64_disp(&mut a, inst_reg[&d.results[0]], SCRATCH,
-                        egcl_rt::packed_f64::DATA_OFFSET as i32);
+                    load_mem64_disp(
+                        &mut a,
+                        inst_reg[&d.results[0]],
+                        SCRATCH,
+                        egcl_rt::packed_f64::DATA_OFFSET as i32,
+                    );
                 } else {
-                    store_mem64_disp(&mut a, SCRATCH, egcl_rt::packed_f64::DATA_OFFSET as i32,
-                        inst_reg[&d.args[2]]);
+                    store_mem64_disp(
+                        &mut a,
+                        SCRATCH,
+                        egcl_rt::packed_f64::DATA_OFFSET as i32,
+                        inst_reg[&d.args[2]],
+                    );
                 }
-                if matches!(d.opcode, Opcode::PackedF64Ref | Opcode::VecF64Ref) { a.bind(loaded); }
-            } else if matches!(d.opcode, Opcode::FloatSqrt | Opcode::FloatNeg | Opcode::FloatDiv)
-                && d.results.first().is_some_and(|&value|
-                    f.value(value).repr == ValueRepresentation::UnboxedF64)
+                if matches!(d.opcode, Opcode::PackedF64Ref | Opcode::VecF64Ref) {
+                    a.bind(loaded);
+                }
+            } else if matches!(
+                d.opcode,
+                Opcode::FloatSqrt | Opcode::FloatNeg | Opcode::FloatDiv
+            ) && d
+                .results
+                .first()
+                .is_some_and(|&value| f.value(value).repr == ValueRepresentation::UnboxedF64)
             {
                 if !published_native_roots || !native_call_storage {
                     return Err(EmitError::UnsupportedOp(op_tag(d.opcode)));
                 }
-                emit_raw_double_unary_or_div(&mut a, &d, &inst_reg, inst_deopt.get(&inst).copied())?;
-            } else if matches!(d.opcode, Opcode::FloatAdd | Opcode::FloatSub | Opcode::FloatMul)
-                && d.results.first().is_some_and(|&value|
-                    f.value(value).repr == ValueRepresentation::UnboxedF64)
+                emit_raw_double_unary_or_div(
+                    &mut a,
+                    &d,
+                    &inst_reg,
+                    inst_deopt.get(&inst).copied(),
+                )?;
+            } else if matches!(
+                d.opcode,
+                Opcode::FloatAdd | Opcode::FloatSub | Opcode::FloatMul
+            ) && d
+                .results
+                .first()
+                .is_some_and(|&value| f.value(value).repr == ValueRepresentation::UnboxedF64)
             {
                 if !published_native_roots || !native_call_storage {
                     return Err(EmitError::UnsupportedOp(op_tag(d.opcode)));
@@ -8223,14 +9394,24 @@ fn emit_framed_inner(
                 // F64 homes remain ordinary eight-byte nonroot frame values.
                 for (xmm, value) in d.args.iter().enumerate() {
                     let register = inst_reg[value];
-                    a.extend_from_slice(&[0x66, rex_w(xmm as u8, register), 0x0f, 0x6e,
-                        modrm_rr(xmm as u8, register)]);
+                    a.extend_from_slice(&[
+                        0x66,
+                        rex_w(xmm as u8, register),
+                        0x0f,
+                        0x6e,
+                        modrm_rr(xmm as u8, register),
+                    ]);
                 }
-                a.extend_from_slice(&[0xf2, 0x0f, match d.opcode {
-                    Opcode::FloatAdd => 0x58,
-                    Opcode::FloatSub => 0x5c,
-                    _ => 0x59,
-                }, 0xc1]);
+                a.extend_from_slice(&[
+                    0xf2,
+                    0x0f,
+                    match d.opcode {
+                        Opcode::FloatAdd => 0x58,
+                        Opcode::FloatSub => 0x5c,
+                        _ => 0x59,
+                    },
+                    0xc1,
+                ]);
                 if d.opcode == Opcode::FloatAdd && raw_add_needs_zero_fixup(f, &d.args) {
                     // The interpreter adds onto a +0.0 seed, so the sum of two
                     // -0.0 is +0.0 there; adding +0.0 maps exactly that -0.0
@@ -8242,25 +9423,43 @@ fn emit_framed_inner(
                 a.extend_from_slice(&[0x66, rex_w(0, register), 0x0f, 0x7e, modrm_rr(0, register)]);
             } else if matches!(d.opcode, Opcode::BoxFixnum | Opcode::UnboxFixnum) {
                 let source = d.args[0];
-                if let Some(&bits) = const_tagged.get(&source) { mov_imm64(&mut a, RAX, bits as i64); }
-                else { mov_rr(&mut a, RAX, inst_reg[&source]); }
+                if let Some(&bits) = const_tagged.get(&source) {
+                    mov_imm64(&mut a, RAX, bits as i64);
+                } else {
+                    mov_rr(&mut a, RAX, inst_reg[&source]);
+                }
                 if d.opcode == Opcode::UnboxFixnum {
                     let label = inst_deopt.get(&inst).copied().unwrap_or(deopt);
-                    if d.flags.guard { guard_fixnum(&mut a, RAX, label); }
+                    if d.flags.guard {
+                        guard_fixnum(&mut a, RAX, label);
+                    }
                     sar_imm(&mut a, RAX, 3);
-                } else { shl_imm(&mut a, RAX, 3); }
+                } else {
+                    shl_imm(&mut a, RAX, 3);
+                }
                 mov_rr(&mut a, inst_reg[&d.results[0]], RAX);
             } else if d.opcode == Opcode::IntegerLowBits {
                 let label = inst_deopt.get(&inst).copied().unwrap_or(deopt);
-                integer_low_bits::emit(&mut a, f, &d, &mut inst_reg, &mut inst_pool, &const_tagged, label)?;
+                integer_low_bits::emit(
+                    &mut a,
+                    f,
+                    &d,
+                    &mut inst_reg,
+                    &mut inst_pool,
+                    &const_tagged,
+                    label,
+                )?;
             } else if d.opcode == Opcode::GenericEq {
                 emit_generic_eq(&mut a, &d, &mut inst_reg, &mut inst_pool, &const_tagged)?;
             } else if d.opcode == Opcode::TypeCheck {
                 emit_type_check(&mut a, &d, &mut inst_reg, &mut inst_pool, &const_tagged)?;
-            } else if is_float_cmp(d.opcode) && d.args.iter().any(|&value|
-                f.value(value).repr == ValueRepresentation::UnboxedF64)
+            } else if is_float_cmp(d.opcode)
+                && d.args
+                    .iter()
+                    .any(|&value| f.value(value).repr == ValueRepresentation::UnboxedF64)
             {
-                let label = *inst_deopt.get(&inst)
+                let label = *inst_deopt
+                    .get(&inst)
                     .ok_or(EmitError::UnsupportedOp(op_tag(d.opcode)))?;
                 emit_raw_double_cmp_value(&mut a, &d, &mut inst_reg, &mut inst_pool, label)?;
             } else if is_float_cmp(d.opcode) {
@@ -8275,8 +9474,11 @@ fn emit_framed_inner(
                     &declared_single_floats,
                     label,
                 )?;
-            } else if fixnum_cmp_cc(d.opcode).is_some() && d.args.iter().any(|&v|
-                f.value(v).repr == ValueRepresentation::UnboxedFixnum) {
+            } else if fixnum_cmp_cc(d.opcode).is_some()
+                && d.args
+                    .iter()
+                    .any(|&v| f.value(v).repr == ValueRepresentation::UnboxedFixnum)
+            {
                 let label = inst_deopt.get(&inst).copied().unwrap_or(deopt);
                 emit_raw_fixnum_inst(&mut a, f, &d, &inst_reg, &consts, label)?;
             } else if fixnum_cmp_cc(d.opcode).is_some() {
@@ -8299,42 +9501,56 @@ fn emit_framed_inner(
                     if let Some(&bits) = const_tagged.get(&d.args[0]) {
                         mov_imm64(&mut a, dst, bits as i64);
                     } else if let Some(&value) = consts.get(&d.args[0]) {
-                        mov_imm64(&mut a, dst, egcl_rt::value::EgclVal::from_fixnum(value).0 as i64);
+                        mov_imm64(
+                            &mut a,
+                            dst,
+                            egcl_rt::value::EgclVal::from_fixnum(value).0 as i64,
+                        );
                     } else {
                         mov_rr(&mut a, dst, inst_reg[&d.args[0]]);
                     }
                     proven.insert(d.results[0]);
                 } else {
-                let label = inst_deopt.get(&inst).copied().unwrap_or(deopt);
-                match d.aux {
-                    AuxData::BuiltinBinding { address, expected } => {
-                        // RDX is reserved scratch, never an SSA value register.
-                        // Both absent-binding sentinels fit a signed immediate.
-                        let expected = i8::try_from(expected)
-                            .map_err(|_| EmitError::UnsupportedOp(op_tag(Opcode::Guard)))?;
-                        mov_imm64(&mut a, SCRATCH, address as i64);
-                        a.extend_from_slice(&[0x48, 0x83, 0x3A, expected as u8]);
-                        a.jcc(Cc::Ne, label);
-                    }
-                    AuxData::StringLayout => {
-                        emit_string_layout_guard(&mut a, &d, &mut inst_reg, &mut inst_pool, label)?
-                    }
-                    AuxData::TypeTag(t) if t.bits == TypeBits::CONS => {
-                        emit_cons_guard(&mut a, &d, &mut inst_reg, &mut inst_pool, label)?
-                    }
-                    AuxData::EndpList => {
-                        emit_list_guard(&mut a, &d, &mut inst_reg, &mut inst_pool, label)?
-                    }
-                    AuxData::TypeTag(t) if t.bits == TypeBits::FIXNUM => {
-                        emit_fixnum_value_guard(&mut a, &d, &mut inst_reg, &mut inst_pool, label)?;
-                        // The result is fixnum by construction; later typed ops
-                        // in this block need not re-test it.
-                        if let Some(&r0) = d.results.first() {
-                            proven.insert(r0);
+                    let label = inst_deopt.get(&inst).copied().unwrap_or(deopt);
+                    match d.aux {
+                        AuxData::BuiltinBinding { address, expected } => {
+                            // RDX is reserved scratch, never an SSA value register.
+                            // Both absent-binding sentinels fit a signed immediate.
+                            let expected = i8::try_from(expected)
+                                .map_err(|_| EmitError::UnsupportedOp(op_tag(Opcode::Guard)))?;
+                            mov_imm64(&mut a, SCRATCH, address as i64);
+                            a.extend_from_slice(&[0x48, 0x83, 0x3A, expected as u8]);
+                            a.jcc(Cc::Ne, label);
                         }
+                        AuxData::StringLayout => emit_string_layout_guard(
+                            &mut a,
+                            &d,
+                            &mut inst_reg,
+                            &mut inst_pool,
+                            label,
+                        )?,
+                        AuxData::TypeTag(t) if t.bits == TypeBits::CONS => {
+                            emit_cons_guard(&mut a, &d, &mut inst_reg, &mut inst_pool, label)?
+                        }
+                        AuxData::EndpList => {
+                            emit_list_guard(&mut a, &d, &mut inst_reg, &mut inst_pool, label)?
+                        }
+                        AuxData::TypeTag(t) if t.bits == TypeBits::FIXNUM => {
+                            emit_fixnum_value_guard(
+                                &mut a,
+                                &d,
+                                &mut inst_reg,
+                                &mut inst_pool,
+                                label,
+                            )?;
+                            // The result is fixnum by construction; later typed ops
+                            // in this block need not re-test it.
+                            if let Some(&r0) = d.results.first() {
+                                proven.insert(r0);
+                            }
+                        }
+                        _ => return Err(EmitError::UnsupportedOp(op_tag(Opcode::Guard))),
                     }
-                    _ => return Err(EmitError::UnsupportedOp(op_tag(Opcode::Guard))),
-                }
                 }
             } else if matches!(d.opcode, Opcode::Car | Opcode::Cdr) {
                 emit_cons_field_load(&mut a, &d, &mut inst_reg, &mut inst_pool)?;
@@ -8352,22 +9568,36 @@ fn emit_framed_inner(
                     &const_tagged,
                     label,
                 )?;
-            } else if matches!(d.opcode, Opcode::EnvironmentValue | Opcode::SetEnvironmentValue) {
+            } else if matches!(
+                d.opcode,
+                Opcode::EnvironmentValue | Opcode::SetEnvironmentValue
+            ) {
                 let index = match d.aux {
                     AuxData::EnvironmentName(index) => index,
                     _ => return Err(EmitError::UnsupportedOp(op_tag(d.opcode))),
                 };
                 let store = d.opcode == Opcode::SetEnvironmentValue;
-                let helper = if store { environment.store } else { environment.load };
+                let helper = if store {
+                    environment.store
+                } else {
+                    environment.load
+                };
                 if environment.body == 0 || helper == 0 {
                     return Err(EmitError::UnsupportedOp(op_tag(d.opcode)));
                 }
                 if store {
-                    let value = *d.args.first().ok_or(EmitError::UnsupportedOp(op_tag(d.opcode)))?;
+                    let value = *d
+                        .args
+                        .first()
+                        .ok_or(EmitError::UnsupportedOp(op_tag(d.opcode)))?;
                     if let Some(&bits) = const_tagged.get(&value) {
                         mov_imm64(&mut a, 2, bits as i64); // rdx = tagged value
                     } else {
-                        mov_rr(&mut a, 2, *inst_reg.get(&value).ok_or(EmitError::UnsupportedOp(0xF2))?);
+                        mov_rr(
+                            &mut a,
+                            2,
+                            *inst_reg.get(&value).ok_or(EmitError::UnsupportedOp(0xF2))?,
+                        );
                     }
                 }
                 mov_imm64(&mut a, 7, environment.body as i64); // rdi = retained body
@@ -8379,8 +9609,13 @@ fn emit_framed_inner(
                     transfer_check,
                 ));
                 if !store {
-                    let result = *d.results.first().ok_or(EmitError::UnsupportedOp(op_tag(d.opcode)))?;
-                    let dst = *inst_reg.get(&result).ok_or(EmitError::UnsupportedOp(0xF2))?;
+                    let result = *d
+                        .results
+                        .first()
+                        .ok_or(EmitError::UnsupportedOp(op_tag(d.opcode)))?;
+                    let dst = *inst_reg
+                        .get(&result)
+                        .ok_or(EmitError::UnsupportedOp(0xF2))?;
                     mov_rr(&mut a, dst, 0);
                 }
             } else if d.opcode == Opcode::SymbolValue {
@@ -8525,9 +9760,11 @@ fn emit_framed_inner(
                 }
             }
 
-            native_calls.extend(inst_calls.into_iter().map(|call| {
-                call.site(NativeCallOrigin::Instruction(inst), NativeStackBase::Body)
-            }));
+            native_calls.extend(
+                inst_calls.into_iter().map(|call| {
+                    call.site(NativeCallOrigin::Instruction(inst), NativeStackBase::Body)
+                }),
+            );
             if ordinary_call_mode && d.opcode == Opcode::Call {
                 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
                 if ordinary_call.unwrap().returns_at(inst) {
@@ -8558,9 +9795,16 @@ fn emit_framed_inner(
             }
             if let Some(roots) = roots {
                 if let (Some(frame_base), Some(_)) = (frame_base_home, activation_slots) {
-                    emit_call_root_restore(&mut a, roots,
-                        restore_roots.as_ref().expect("root-sync site has restore metadata"),
-                        &homes, frame_base, spill_area)?;
+                    emit_call_root_restore(
+                        &mut a,
+                        roots,
+                        restore_roots
+                            .as_ref()
+                            .expect("root-sync site has restore metadata"),
+                        &homes,
+                        frame_base,
+                        spill_area,
+                    )?;
                 }
                 root_sync_sites.push(RootSyncSite {
                     code_offset: u32::try_from(sync_offset)
@@ -8584,14 +9828,22 @@ fn emit_framed_inner(
                 });
             }
             #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-            if let Some(done) = inline_alloc_done { a.bind(done); }
+            if let Some(done) = inline_alloc_done {
+                a.bind(done);
+            }
             #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-            if let Some(done) = allocation_layout_completions.remove(&inst) { a.bind(done); }
+            if let Some(done) = allocation_layout_completions.remove(&inst) {
+                a.bind(done);
+            }
         }
 
-        if ordinary_returns_from_call { continue; }
+        if ordinary_returns_from_call {
+            continue;
+        }
         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-        if ordinary_call.is_some_and(|call| f.block(b).insts.iter().any(|&inst| call.returns_at(inst))) {
+        if ordinary_call
+            .is_some_and(|call| f.block(b).insts.iter().any(|&inst| call.returns_at(inst)))
+        {
             continue;
         }
         let next = blocks.get(bi + 1).copied();
@@ -8738,7 +9990,11 @@ fn emit_framed_inner(
                             Cc::E
                         } else {
                             emit_fused_compare(
-                                &mut a, &cmp_data, &cmp_regs, &consts, &proven,
+                                &mut a,
+                                &cmp_data,
+                                &cmp_regs,
+                                &consts,
+                                &proven,
                                 inst_deopt.get(&inst).copied().unwrap_or(deopt),
                             )?
                         }
@@ -8815,7 +10071,9 @@ fn emit_framed_inner(
     if ordinary_mode {
         // The admitted leaf subset cannot deoptimize. Keep its artifact free
         // of unreachable runtime calls and refuse any newly introduced edge.
-        if a.label_is_referenced(deopt) { return Err(EmitError::UnsupportedOp(0xF4)); }
+        if a.label_is_referenced(deopt) {
+            return Err(EmitError::UnsupportedOp(0xF4));
+        }
     } else {
         // Deopt stub: restore callee-saved (so the caller's registers are intact),
         // then align rsp and call c2i_deopt, unwind the alignment, return (the value is
@@ -8826,8 +10084,8 @@ fn emit_framed_inner(
             a.extend_from_slice(&[0x48, 0x83, 0xEC, 0x08]); // sub rsp, 8
         }
         mov_imm64(&mut a, 0, c2i_deopt_addr as i64); // mov rax, c2i_deopt
-                                                     // Deopt stubs have their own temporary stack layout and return immediately;
-                                                     // they must finish that cleanup instead of taking the normal transfer exit.
+        // Deopt stubs have their own temporary stack layout and return immediately;
+        // they must finish that cleanup instead of taking the normal transfer exit.
         let mut call = emit_runtime_helper_call(&mut a, c2i_recovery_toggle_addr, None);
         if !cfg!(windows) {
             call.stack_adjust += 8;
@@ -8835,7 +10093,11 @@ fn emit_framed_inner(
         }
         native_calls.push(call.site(
             NativeCallOrigin::RestartDeopt,
-            if cfg!(windows) { NativeStackBase::Body } else { NativeStackBase::Entry },
+            if cfg!(windows) {
+                NativeStackBase::Body
+            } else {
+                NativeStackBase::Entry
+            },
         ));
         if cfg!(windows) {
             emit_epilogue(&mut a);
@@ -8872,9 +10134,8 @@ fn emit_framed_inner(
         String,
     )> = Vec::new();
     static KEEP_UNUSED_DEOPT_STUBS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let keep_unused = *KEEP_UNUSED_DEOPT_STUBS.get_or_init(|| {
-        std::env::var_os("EGCL_DISABLE_UNUSED_DEOPT_STUB_ELISION").is_some()
-    });
+    let keep_unused = *KEEP_UNUSED_DEOPT_STUBS
+        .get_or_init(|| std::env::var_os("EGCL_DISABLE_UNUSED_DEOPT_STUB_ELISION").is_some());
     for (&inst, &label) in &inst_deopt {
         // All instruction branches are emitted. A range/type proof can leave
         // this label unused; no call-PC/value-map entry is needed either.
@@ -8894,8 +10155,9 @@ fn emit_framed_inner(
         }
     }
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    let shared_trial = (shared_deopt::enabled() && ordinary_guard_veneer.is_some()
-        && f.osr_entries.is_empty()).then(|| (a.clone(), native_calls.clone(), native_value_maps.clone()));
+    let shared_trial =
+        (shared_deopt::enabled() && ordinary_guard_veneer.is_some() && f.osr_entries.is_empty())
+            .then(|| (a.clone(), native_calls.clone(), native_value_maps.clone()));
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     let mut shared_sites = Vec::new();
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -8946,19 +10208,32 @@ fn emit_framed_inner(
                 let s = match vs {
                     ValueSource::Value { value, repr } => {
                         if *repr == ValueRepresentation::UnboxedF64
-                            && published_native_roots && native_call_storage
+                            && published_native_roots
+                            && native_call_storage
                             && fs.scopes.len() == 1
                         {
-                            f64_slots.push(u32::try_from(srcs.len() - 4)
-                                .map_err(|_| EmitError::UnsupportedOp(0xF5))?);
-                        } else if !matches!(repr, ValueRepresentation::Tagged | ValueRepresentation::UnboxedFixnum) {
+                            f64_slots.push(
+                                u32::try_from(srcs.len() - 4)
+                                    .map_err(|_| EmitError::UnsupportedOp(0xF5))?,
+                            );
+                        } else if !matches!(
+                            repr,
+                            ValueRepresentation::Tagged | ValueRepresentation::UnboxedFixnum
+                        ) {
                             return Err(EmitError::UnsupportedOp(0xF5));
                         }
                         if let Some(&bits) = const_tagged.get(value) {
-                            SlotSrc::Imm(if *repr == ValueRepresentation::UnboxedFixnum { bits << 3 } else { bits })
+                            SlotSrc::Imm(if *repr == ValueRepresentation::UnboxedFixnum {
+                                bits << 3
+                            } else {
+                                bits
+                            })
                         } else if let Some(&home) = homes.get(value) {
-                            if *repr == ValueRepresentation::UnboxedFixnum { SlotSrc::FixnumHome(home) }
-                            else { SlotSrc::Home(home) }
+                            if *repr == ValueRepresentation::UnboxedFixnum {
+                                SlotSrc::FixnumHome(home)
+                            } else {
+                                SlotSrc::Home(home)
+                            }
                         } else {
                             return Err(EmitError::UnsupportedOp(0xF6));
                         }
@@ -8988,23 +10263,41 @@ fn emit_framed_inner(
         let segment_deopt = transfers.as_ref().and_then(|t| t.deopt_veneer);
         #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
         let segment_deopt: Option<u64> = None;
-        let request_bytes = if segment_deopt.is_some() || ordinary_guard_veneer.is_some() { 32 } else { 0 };
+        let request_bytes = if segment_deopt.is_some() || ordinary_guard_veneer.is_some() {
+            32
+        } else {
+            0
+        };
         let alloc = ((n_words * 8) + request_bytes + 15) & !15;
 
         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
         if shared_trial.is_some() {
-            let sources = srcs.iter().map(|source| match source {
-                SlotSrc::Home(home) => Some(shared_deopt::Source::Home(*home, false)),
-                SlotSrc::FixnumHome(home) => Some(shared_deopt::Source::Home(*home, true)),
-                SlotSrc::Imm(bits) => Some(shared_deopt::Source::Imm(*bits)),
-                SlotSrc::Remat(id) => shared_deopt::source(&ValueSource::Remat(*id), fs, &homes, &const_tagged, 0),
-            }).collect::<Option<Vec<_>>>();
+            let sources = srcs
+                .iter()
+                .map(|source| match source {
+                    SlotSrc::Home(home) => Some(shared_deopt::Source::Home(*home, false)),
+                    SlotSrc::FixnumHome(home) => Some(shared_deopt::Source::Home(*home, true)),
+                    SlotSrc::Imm(bits) => Some(shared_deopt::Source::Imm(*bits)),
+                    SlotSrc::Remat(id) => {
+                        shared_deopt::source(&ValueSource::Remat(*id), fs, &homes, &const_tagged, 0)
+                    }
+                })
+                .collect::<Option<Vec<_>>>();
             if let Some(sources) = sources {
                 if let Ok(n_scopes) = u32::try_from(fs.scopes.len()) {
-                    shared_sites.push(shared_deopt::Site { label, frame_state: fsid, n_scopes,
-                        sources, f64_slots: f64_slots.clone().into_boxed_slice() });
-                } else { shared_supported = false; }
-            } else { shared_supported = false; }
+                    shared_sites.push(shared_deopt::Site {
+                        label,
+                        frame_state: fsid,
+                        n_scopes,
+                        sources,
+                        f64_slots: f64_slots.clone().into_boxed_slice(),
+                    });
+                } else {
+                    shared_supported = false;
+                }
+            } else {
+                shared_supported = false;
+            }
         }
         a.bind(label);
         #[cfg(all(target_arch = "x86_64", windows))]
@@ -9052,19 +10345,29 @@ fn emit_framed_inner(
             store_to_rsp(&mut a, RAX, request + 8);
             mov_rr(&mut a, RAX, 4);
             store_to_rsp(&mut a, RAX, request + 16);
-            load_home(&mut a, RAX, native_control_home.ok_or(EmitError::UnsupportedOp(0xFD))?, alloc as i32);
+            load_home(
+                &mut a,
+                RAX,
+                native_control_home.ok_or(EmitError::UnsupportedOp(0xFD))?,
+                alloc as i32,
+            );
             store_to_rsp(&mut a, RAX, request + 24);
             a.extend_from_slice(&[0x48, 0x8d, 0xbc, 0x24]);
             a.extend_from_slice(&request.to_le_bytes());
             mov_imm64(&mut a, RAX, veneer as i64);
             let mut call = emit_runtime_helper_call(&mut a, 0, None);
-            call.stack_adjust = call.stack_adjust.checked_add(
-                u32::try_from(alloc).map_err(|_| EmitError::BadBranch)?)
+            call.stack_adjust = call
+                .stack_adjust
+                .checked_add(u32::try_from(alloc).map_err(|_| EmitError::BadBranch)?)
                 .ok_or(EmitError::BadBranch)?;
             // Ordinary recovery reboxes these raw payload words (bliss-k4psf).
-            native_value_maps.insert(call.return_offset, NativeCallValues::Deoptimizing {
-                native_slots: native_spill_slots, f64_slots: f64_slots.clone().into_boxed_slice(),
-            });
+            native_value_maps.insert(
+                call.return_offset,
+                NativeCallValues::Deoptimizing {
+                    native_slots: native_spill_slots,
+                    f64_slots: f64_slots.clone().into_boxed_slice(),
+                },
+            );
             native_calls.push(call.site(NativeCallOrigin::Deopt(fsid), NativeStackBase::Body));
             // The ordinary helper already returned the complete result tuple.
             // LEA and the ordinary epilogue preserve its carry discriminator.
@@ -9086,8 +10389,12 @@ fn emit_framed_inner(
             load_home(
                 &mut a,
                 RAX,
-                (if native_frame_mode { entry_kind_home } else { frame_base_home })
-                    .ok_or(EmitError::UnsupportedOp(0xFD))?,
+                (if native_frame_mode {
+                    entry_kind_home
+                } else {
+                    frame_base_home
+                })
+                .ok_or(EmitError::UnsupportedOp(0xFD))?,
                 alloc as i32,
             );
             store_to_rsp(&mut a, RAX, request + 24);
@@ -9096,9 +10403,13 @@ fn emit_framed_inner(
             a.extend_from_slice(&request.to_le_bytes());
             mov_imm64(&mut a, RAX, veneer as i64);
             let mut call = emit_runtime_helper_call(&mut a, 0, None);
-            transfers.as_mut().unwrap().deopt_returns.push(
-                u32::try_from(call.return_offset).map_err(|_| EmitError::BadBranch)?);
-            call.stack_adjust = call.stack_adjust
+            transfers
+                .as_mut()
+                .unwrap()
+                .deopt_returns
+                .push(u32::try_from(call.return_offset).map_err(|_| EmitError::BadBranch)?);
+            call.stack_adjust = call
+                .stack_adjust
                 .checked_add(u32::try_from(alloc).map_err(|_| EmitError::BadBranch)?)
                 .ok_or(EmitError::BadBranch)?;
             if cfg!(all(target_arch = "x86_64", unix)) {
@@ -9124,7 +10435,8 @@ fn emit_framed_inner(
             mov_rr(&mut a, 2, 4); // mov rdx, rsp
             mov_imm64(&mut a, 0, c2i_deopt_t2_addr as i64);
             let mut call = emit_runtime_helper_call(&mut a, c2i_recovery_toggle_addr, None);
-            call.stack_adjust = call.stack_adjust
+            call.stack_adjust = call
+                .stack_adjust
                 .checked_add(u32::try_from(alloc).map_err(|_| EmitError::BadBranch)?)
                 .ok_or(EmitError::BadBranch)?;
             if cfg!(all(target_arch = "x86_64", unix)) {
@@ -9157,23 +10469,50 @@ fn emit_framed_inner(
         let old_cold_bytes = a.here() - cold_start;
         if shared_supported {
             if let (Some(control), Some(veneer)) = (native_control_home, ordinary_guard_veneer) {
-                if let Some(candidate) = shared_deopt::emit_candidate(prefix, &shared_sites,
-                    native_spill_slots, control, veneer, emit_epilogue)
-                {
+                if let Some(candidate) = shared_deopt::emit_candidate(
+                    prefix,
+                    &shared_sites,
+                    native_spill_slots,
+                    control,
+                    veneer,
+                    emit_epilogue,
+                ) {
                     let new_cold_bytes = candidate.asm.here() - cold_start;
                     // No OSR entries follow shared recovery. Compare complete
                     // final layouts: unequal branch shortening can reverse a
                     // small pre-layout saving. Reject malformed layouts.
                     let (old_size, new_size, old_cold, new_cold) = if branch_relax::enabled() {
-                        let (old_code, old_map) = a.clone().finish_relaxed().ok_or(EmitError::BadBranch)?;
-                        let (new_code, new_map) = candidate.asm.clone().finish_relaxed().ok_or(EmitError::BadBranch)?;
-                        (old_code.len(), new_code.len(),
+                        let (old_code, old_map) =
+                            a.clone().finish_relaxed().ok_or(EmitError::BadBranch)?;
+                        let (new_code, new_map) = candidate
+                            .asm
+                            .clone()
+                            .finish_relaxed()
+                            .ok_or(EmitError::BadBranch)?;
+                        (
+                            old_code.len(),
+                            new_code.len(),
                             old_code.len() - branch_relax::offset(Some(&old_map), cold_start)?,
-                            new_code.len() - branch_relax::offset(Some(&new_map), cold_start)?)
-                    } else { (a.here(), candidate.asm.here(), old_cold_bytes, new_cold_bytes) };
+                            new_code.len() - branch_relax::offset(Some(&new_map), cold_start)?,
+                        )
+                    } else {
+                        (
+                            a.here(),
+                            candidate.asm.here(),
+                            old_cold_bytes,
+                            new_cold_bytes,
+                        )
+                    };
                     if new_size < old_size {
-                        shared_diagnostic = Some((shared_sites.len(), old_cold, new_cold,
-                            candidate.data_offset, candidate.data_bytes, candidate.helper_start, candidate.helper_end));
+                        shared_diagnostic = Some((
+                            shared_sites.len(),
+                            old_cold,
+                            new_cold,
+                            candidate.data_offset,
+                            candidate.data_bytes,
+                            candidate.helper_start,
+                            candidate.helper_end,
+                        ));
                         calls.extend(candidate.calls);
                         values.extend(candidate.values);
                         a = candidate.asm;
@@ -9221,11 +10560,14 @@ fn emit_framed_inner(
         // the in-stub test is a trap, never a deopt from half-imported homes.
         let specs = slot_map::slot_specs(scope, fs);
         let raw_double_imports = transfer_mode && published_native_roots && native_call_storage;
-        if specs.iter().any(|s| match ConversionKind::for_repr(s.repr) {
-            Some(ConversionKind::None) => false,
-            Some(ConversionKind::UnboxDouble) => !raw_double_imports,
-            _ => true,
-        }) {
+        if specs
+            .iter()
+            .any(|s| match ConversionKind::for_repr(s.repr) {
+                Some(ConversionKind::None) => false,
+                Some(ConversionKind::UnboxDouble) => !raw_double_imports,
+                _ => true,
+            })
+        {
             continue;
         }
         // Liveness at the target, read from regalloc2's precise per-ProgPoint
@@ -9244,7 +10586,11 @@ fn emit_framed_inner(
         };
         let raw_double = |value: Value| f.value(value).repr == ValueRepresentation::UnboxedF64;
         let live_at_target = |value: Value| -> bool {
-            let class = if raw_double(value) { RegClass::Xmm } else { RegClass::Gpr };
+            let class = if raw_double(value) {
+                RegClass::Xmm
+            } else {
+                RegClass::Gpr
+            };
             live.iter()
                 .any(|vreg| vreg.class == class && vreg.num == value.0)
         };
@@ -9254,7 +10600,10 @@ fn emit_framed_inner(
             ValueDef::Result { inst, .. } => match (f.inst(inst).opcode, &f.inst(inst).aux) {
                 (Opcode::ConstDouble, AuxData::DoubleImm(bits)) => Some(*bits),
                 (Opcode::ConstFixnum, AuxData::FixnumImm(n))
-                    if f.value(value).repr == ValueRepresentation::UnboxedFixnum => Some(*n as u64),
+                    if f.value(value).repr == ValueRepresentation::UnboxedFixnum =>
+                {
+                    Some(*n as u64)
+                }
                 _ => None,
             },
             _ => None,
@@ -9274,12 +10623,14 @@ fn emit_framed_inner(
         let complete_imports = live.iter().all(|vreg| {
             let value = Value(vreg.num);
             if (vreg.num as usize) < f.num_values() && raw_double(value) {
-                return raw_double_imports && vreg.class == RegClass::Xmm
+                return raw_double_imports
+                    && vreg.class == RegClass::Xmm
                     && (imported(value)
                         || (raw_constant(value).is_some() && homes.contains_key(&value)));
             }
             if (vreg.num as usize) < f.num_values()
-                && f.value(value).repr == ValueRepresentation::UnboxedFixnum {
+                && f.value(value).repr == ValueRepresentation::UnboxedFixnum
+            {
                 return vreg.class == RegClass::Gpr && raw_constant(value).is_some();
             }
             vreg.class == RegClass::Gpr
@@ -9325,7 +10676,11 @@ fn emit_framed_inner(
             if let ValueSource::Value { value, .. } = &spec.source {
                 if !live_at_target(*value) {
                     if let Some(&home) = homes.get(value) {
-                        let filler = if raw_double(*value) { 0 } else { egcl_rt::value::NIL.0 as i64 };
+                        let filler = if raw_double(*value) {
+                            0
+                        } else {
+                            egcl_rt::value::NIL.0 as i64
+                        };
                         mov_imm64(&mut a, RAX, filler);
                         store_home(&mut a, home, RAX, 0);
                     }
@@ -9335,7 +10690,10 @@ fn emit_framed_inner(
         for vreg in &live {
             let value = Value(vreg.num);
             if (vreg.num as usize) < f.num_values()
-                && matches!(f.value(value).repr, ValueRepresentation::UnboxedF64 | ValueRepresentation::UnboxedFixnum)
+                && matches!(
+                    f.value(value).repr,
+                    ValueRepresentation::UnboxedF64 | ValueRepresentation::UnboxedFixnum
+                )
                 && !imported(value)
                 && let (Some(bits), Some(&home)) = (raw_constant(value), homes.get(&value))
             {
@@ -9381,7 +10739,12 @@ fn emit_framed_inner(
                         a.jcc(Cc::Ne, import_trap);
                         mov_rr(&mut a, SCRATCH, RAX);
                         alu_r_imm(&mut a, 4, SCRATCH, -8);
-                        a.extend_from_slice(&[0x80, 0x7a, 0x07, egcl_rt::object::type_id::DOUBLE_FLOAT]);
+                        a.extend_from_slice(&[
+                            0x80,
+                            0x7a,
+                            0x07,
+                            egcl_rt::object::type_id::DOUBLE_FLOAT,
+                        ]);
                         a.jcc(Cc::Ne, import_trap);
                         load_mem64_disp(&mut a, RAX, SCRATCH, 8);
                         store_home(&mut a, home, RAX, 0);
@@ -9464,9 +10827,10 @@ fn emit_framed_inner(
         for site in &mut native_calls {
             site.return_offset = branch_relax::offset(map, site.return_offset)?;
         }
-        native_value_maps = native_value_maps.into_iter().map(|(pc, values)| {
-            Ok((branch_relax::offset(map, pc)?, values))
-        }).collect::<Result<_, EmitError>>()?;
+        native_value_maps = native_value_maps
+            .into_iter()
+            .map(|(pc, values)| Ok((branch_relax::offset(map, pc)?, values)))
+            .collect::<Result<_, EmitError>>()?;
         for site in &mut native_poll_transfer_sites {
             site.return_offset = branch_relax::offset32(map, site.return_offset)?;
         }
@@ -9477,16 +10841,19 @@ fn emit_framed_inner(
             *patch = branch_relax::offset(map, *patch)?;
         }
         if let Some((_, _, _, data, bytes, start, end)) = &mut shared_diagnostic {
-            let data_end = branch_relax::offset(map, data.checked_add(*bytes).ok_or(EmitError::BadBranch)?)?;
+            let data_end =
+                branch_relax::offset(map, data.checked_add(*bytes).ok_or(EmitError::BadBranch)?)?;
             *data = branch_relax::offset(map, *data)?;
             *bytes = data_end.checked_sub(*data).ok_or(EmitError::BadBranch)?;
             *start = branch_relax::offset(map, *start)?;
             *end = branch_relax::offset(map, *end)?;
         }
-        (branch_relax::offset(map, compiled_entry)?,
+        (
+            branch_relax::offset(map, compiled_entry)?,
             branch_relax::optional(map, ordinary_entry)?,
             branch_relax::optional(map, ordinary_bound_entry)?,
-            branch_relax::optional(map, native_recursive_entry)?)
+            branch_relax::optional(map, native_recursive_entry)?,
+        )
     };
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     let mut code = code;
@@ -9553,39 +10920,77 @@ fn emit_framed_inner(
             .unwind_recipe()
             .ok_or(EmitError::BadBranch)?
             .frame_bytes() as usize;
-        let move_values = f.block_order().iter()
+        let move_values = f
+            .block_order()
+            .iter()
             .map(|&b| f.block(b).params.len())
-            .max().unwrap_or(0);
-        let leaf_bound = ordinary_leaf::stack_requirement(frame_bytes, move_values).ok_or(EmitError::BadBranch)?;
+            .max()
+            .unwrap_or(0);
+        let leaf_bound = ordinary_leaf::stack_requirement(frame_bytes, move_values)
+            .ok_or(EmitError::BadBranch)?;
         // The cold request is 64 bytes plus its machine return address.
         let guard_bytes = if ordinary_guard_veneer.is_some() {
-            f.frame_states.iter().map(|(_, state)| {
-                state.scopes.iter().map(|scope| 4 + scope.locals.len() + scope.stack.len()).sum::<usize>()
-            }).max().unwrap_or(0).checked_mul(8)
+            f.frame_states
+                .iter()
+                .map(|(_, state)| {
+                    state
+                        .scopes
+                        .iter()
+                        .map(|scope| 4 + scope.locals.len() + scope.stack.len())
+                        .sum::<usize>()
+                })
+                .max()
+                .unwrap_or(0)
+                .checked_mul(8)
                 .and_then(|bytes| bytes.checked_add(32 + 15))
-                .map(|bytes| (bytes & !15) + 8).ok_or(EmitError::BadBranch)?
-        } else { 0 };
+                .map(|bytes| (bytes & !15) + 8)
+                .ok_or(EmitError::BadBranch)?
+        } else {
+            0
+        };
         // Shared serialization reserves a fixed snapshot/payload extent which
         // can exceed any individual legacy stream. Admit the ACTUAL call frame.
-        let guard_bytes = native_calls.iter().filter(|site| matches!(site.origin, NativeCallOrigin::Deopt(_)))
-            .try_fold(guard_bytes, |bound, site| (site.stack_adjust as usize).checked_add(8)
-                .map(|required| bound.max(required))).ok_or(EmitError::BadBranch)?;
-        Some(if ordinary_call_mode {
-            let outgoing_bytes = f.block_order().iter().flat_map(|&block| &f.block(block).insts)
-                .filter_map(|&inst| {
-                    let data = f.inst(inst);
-                    (data.opcode == Opcode::Call).then_some(data.args.len().saturating_sub(3))
-                }).max().unwrap_or(0).checked_mul(8)
-                .and_then(|bytes| bytes.checked_add(15))
-                .and_then(|bytes| (bytes & !15).checked_add(8))
-                .ok_or(EmitError::BadBranch)?;
-            leaf_bound.max(frame_bytes.checked_add(72.max(guard_bytes).max(outgoing_bytes))
-                .ok_or(EmitError::BadBranch)?)
-        } else { leaf_bound }.max(if ordinary_bound_entry.is_some() {
-            // The keyword entry's 56-byte area, its call's return address and
-            // the bind helper's own Rust frame, which this bounds generously.
-            KEYWORD_BIND_STACK
-        } else { 0 }))
+        let guard_bytes = native_calls
+            .iter()
+            .filter(|site| matches!(site.origin, NativeCallOrigin::Deopt(_)))
+            .try_fold(guard_bytes, |bound, site| {
+                (site.stack_adjust as usize)
+                    .checked_add(8)
+                    .map(|required| bound.max(required))
+            })
+            .ok_or(EmitError::BadBranch)?;
+        Some(
+            if ordinary_call_mode {
+                let outgoing_bytes = f
+                    .block_order()
+                    .iter()
+                    .flat_map(|&block| &f.block(block).insts)
+                    .filter_map(|&inst| {
+                        let data = f.inst(inst);
+                        (data.opcode == Opcode::Call).then_some(data.args.len().saturating_sub(3))
+                    })
+                    .max()
+                    .unwrap_or(0)
+                    .checked_mul(8)
+                    .and_then(|bytes| bytes.checked_add(15))
+                    .and_then(|bytes| (bytes & !15).checked_add(8))
+                    .ok_or(EmitError::BadBranch)?;
+                leaf_bound.max(
+                    frame_bytes
+                        .checked_add(72.max(guard_bytes).max(outgoing_bytes))
+                        .ok_or(EmitError::BadBranch)?,
+                )
+            } else {
+                leaf_bound
+            }
+            .max(if ordinary_bound_entry.is_some() {
+                // The keyword entry's 56-byte area, its call's return address and
+                // the bind helper's own Rust frame, which this bounds generously.
+                KEYWORD_BIND_STACK
+            } else {
+                0
+            }),
+        )
     } else {
         None
     };
@@ -9595,18 +11000,33 @@ fn emit_framed_inner(
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     for offset in ordinary_self_stack_fixups {
         let bound = ordinary_stack_required.ok_or(EmitError::BadBranch)? as u64;
-        code.get_mut(offset..offset + 8).ok_or(EmitError::BadBranch)?
+        code.get_mut(offset..offset + 8)
+            .ok_or(EmitError::BadBranch)?
             .copy_from_slice(&bound.to_le_bytes());
     }
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    if let Some((sites, old_bytes, new_bytes, data_offset, data_bytes, helper_start, helper_end)) = shared_diagnostic {
+    if let Some((sites, old_bytes, new_bytes, data_offset, data_bytes, helper_start, helper_end)) =
+        shared_diagnostic
+    {
         static LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *LOG.get_or_init(|| std::env::var_os("EGCL_SHARED_DEOPT_LOG").is_some()) {
-            let fingerprint = code.iter().fold(0xcbf2_9ce4_8422_2325u64,
-                |hash, byte| (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3));
-            eprintln!("[shared-deopt] function={} chosen sites={} old_cold_bytes={} new_cold_bytes={} data_offset={} data_bytes={} helper_start={} helper_end={} code_len={} fingerprint={:016x}",
-                f.name(), sites, old_bytes, new_bytes, data_offset, data_bytes, helper_start, helper_end, code.len(), fingerprint);
+            let fingerprint = code.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+            });
+            eprintln!(
+                "[shared-deopt] function={} chosen sites={} old_cold_bytes={} new_cold_bytes={} data_offset={} data_bytes={} helper_start={} helper_end={} code_len={} fingerprint={:016x}",
+                f.name(),
+                sites,
+                old_bytes,
+                new_bytes,
+                data_offset,
+                data_bytes,
+                helper_start,
+                helper_end,
+                code.len(),
+                fingerprint
+            );
         }
     }
     Ok(FramedCode {
@@ -9616,10 +11036,24 @@ fn emit_framed_inner(
         ordinary_checks_params,
         ordinary_stack_required,
         native_recursive_entry,
-        native_entry_kind_slot: if native_frame_mode { entry_kind_home.and_then(|home| match home { FramedHome::Stack(slot) => Some(slot), _ => None }) } else { None },
-        native_control_slot: native_control_home.and_then(|home| match home { FramedHome::Stack(slot) => Some(slot), _ => None }),
+        native_entry_kind_slot: if native_frame_mode {
+            entry_kind_home.and_then(|home| match home {
+                FramedHome::Stack(slot) => Some(slot),
+                _ => None,
+            })
+        } else {
+            None
+        },
+        native_control_slot: native_control_home.and_then(|home| match home {
+            FramedHome::Stack(slot) => Some(slot),
+            _ => None,
+        }),
         native_argument_base,
-        native_argument_count: if native_frame_mode { f.block(entry).params.len() as u16 } else { 0 },
+        native_argument_count: if native_frame_mode {
+            f.block(entry).params.len() as u16
+        } else {
+            0
+        },
         native_calls: Some(native_calls),
         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
         native_poll_transfer_sites,
@@ -10471,7 +11905,7 @@ mod tests {
     // Build and speculate `(lambda (x) (* x 5))` into single-guarded-FixnumMul IR.
     #[cfg(all(target_arch = "x86_64", unix))]
     fn speculated_mul5() -> crate::t2::ir::Function {
-        use crate::t2::speculate::{speculate, SpecType};
+        use crate::t2::speculate::{SpecType, speculate};
         use egcl_rt::bytecode::{BytecodeFunction, Instr};
         use egcl_rt::value::EgclVal;
         let star = egcl_rt::symbols::intern("*");
@@ -10625,7 +12059,7 @@ mod tests {
 
     #[cfg(all(target_arch = "x86_64", unix))]
     fn test_string(bytes: &[u8]) -> egcl_rt::value::EgclVal {
-        use egcl_rt::object::{type_id, ObjectHeader};
+        use egcl_rt::object::{ObjectHeader, type_id};
         let total = (16 + bytes.len() + 7) & !7;
         let layout = std::alloc::Layout::from_size_align(total, 8).unwrap();
         unsafe {
@@ -10683,7 +12117,9 @@ mod tests {
                 opcode: Opcode::Call,
                 args: vec![],
                 results: vec![],
-                aux: AuxData::OpaqueCallTarget(egcl_rt::symbols::intern("STRING-LAYOUT-EFFECT-TEST")),
+                aux: AuxData::OpaqueCallTarget(egcl_rt::symbols::intern(
+                    "STRING-LAYOUT-EFFECT-TEST",
+                )),
                 flags: crate::t2::ir::InstFlags {
                     call: true,
                     safepoint: true,
@@ -10718,9 +12154,13 @@ mod tests {
         let mut type_guard = f.inst(second).clone();
         type_guard.args = vec![results[0]];
         type_guard.results.clear();
-        type_guard.aux = AuxData::TypeTag(crate::t2::ir::IRType::of(crate::t2::ir::TypeBits::STRING));
-        let (type_check, typed) = f.push_inst(entry, type_guard,
-            &[(f.value(proof).ty, f.value(proof).repr)]);
+        type_guard.aux =
+            AuxData::TypeTag(crate::t2::ir::IRType::of(crate::t2::ir::TypeBits::STRING));
+        let (type_check, typed) = f.push_inst(
+            entry,
+            type_guard,
+            &[(f.value(proof).ty, f.value(proof).repr)],
+        );
         assert_eq!(f.block_mut(entry).insts.pop(), Some(type_check));
         f.block_mut(entry).insts.insert(3, type_check);
         f.inst_mut(load).args = vec![typed[0]];
@@ -10749,8 +12189,10 @@ mod tests {
             vec![proof],
             "consumer keeps the surviving proof SSA value"
         );
-        assert!(!f.block(entry).insts.contains(&type_check),
-            "the successful layout fact implies STRING and removes its redundant type guard");
+        assert!(
+            !f.block(entry).insts.contains(&type_check),
+            "the successful layout fact implies STRING and removes its redundant type guard"
+        );
         assert_eq!(f.inst(first).frame_state, Some(original_state));
         crate::t2::verify::verify(&f).expect("forwarded string layout still verifies");
         let emitted = emit_framed_with_activation_slots(
@@ -10787,7 +12229,11 @@ mod tests {
             0,
             "valid string stays native"
         );
-        assert_eq!(EFFECTS.load(Ordering::SeqCst), 1, "valid path commits the prefix once");
+        assert_eq!(
+            EFFECTS.load(Ordering::SeqCst),
+            1,
+            "valid path commits the prefix once"
+        );
         // This synthetic header is not a moving-GC fixture. The surviving
         // guard must reject it before interpreting any string body fields.
         let mut pathname = Box::new(egcl_rt::object::ObjectHeader::new(
@@ -10925,17 +12371,40 @@ mod tests {
         std::thread_local! {
             static REJECTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         }
-        extern "C" fn reject() { REJECTED.with(|seen| seen.set(true)); }
+        extern "C" fn reject() {
+            REJECTED.with(|seen| seen.set(true));
+        }
         let mut missed = Vec::new();
         for range in [
             Range { lo: -3, hi: 5 },
-            Range { lo: 1 << 40, hi: (1 << 40) + 5 },
-            Range { lo: FIXNUM_MIN, hi: FIXNUM_MIN + 1 },
-            Range { lo: FIXNUM_MAX - 1, hi: FIXNUM_MAX },
-            Range { lo: FIXNUM_MIN, hi: FIXNUM_MAX },
-            Range { lo: i64::MIN, hi: i64::MAX },
-            Range { lo: FIXNUM_MIN - 2, hi: FIXNUM_MIN - 1 },
-            Range { lo: FIXNUM_MAX + 1, hi: FIXNUM_MAX + 2 },
+            Range {
+                lo: 1 << 40,
+                hi: (1 << 40) + 5,
+            },
+            Range {
+                lo: FIXNUM_MIN,
+                hi: FIXNUM_MIN + 1,
+            },
+            Range {
+                lo: FIXNUM_MAX - 1,
+                hi: FIXNUM_MAX,
+            },
+            Range {
+                lo: FIXNUM_MIN,
+                hi: FIXNUM_MAX,
+            },
+            Range {
+                lo: i64::MIN,
+                hi: i64::MAX,
+            },
+            Range {
+                lo: FIXNUM_MIN - 2,
+                hi: FIXNUM_MIN - 1,
+            },
+            Range {
+                lo: FIXNUM_MAX + 1,
+                hi: FIXNUM_MAX + 2,
+            },
             Range { lo: 5, hi: -3 },
             Range { lo: 0, hi: 0 },
         ] {
@@ -10943,44 +12412,113 @@ mod tests {
             let entry = f.entry();
             let input = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
             let state = f.frame_states.add(FrameState {
-                scopes: vec![FrameScope { function: 0, bcp: 7,
-                    locals: vec![ValueSource::Value { value: input, repr: ValueRepresentation::Tagged }],
+                scopes: vec![FrameScope {
+                    function: 0,
+                    bcp: 7,
+                    locals: vec![ValueSource::Value {
+                        value: input,
+                        repr: ValueRepresentation::Tagged,
+                    }],
                     stack: vec![],
                 }],
                 remat: vec![],
             });
-            let checked_type = IRType { bits: TypeBits::FIXNUM, range: Some(range), class_id: None };
+            let checked_type = IRType {
+                bits: TypeBits::FIXNUM,
+                range: Some(range),
+                class_id: None,
+            };
             // A dominating tag proof must not erase the narrower range guard.
-            let (_, tagged) = f.push_inst(entry, InstData {
-                opcode: Opcode::Guard, args: vec![input], results: vec![],
-                aux: AuxData::TypeTag(IRType::of(TypeBits::FIXNUM)),
-                flags: InstFlags { guard: true, effectful: true, ..Default::default() },
-                targets: vec![], frame_state: Some(state), source_pos: 0,
-            }, &[(IRType::of(TypeBits::FIXNUM), ValueRepresentation::Tagged)]);
-            let (_, checked) = f.push_inst(entry, InstData {
-                opcode: Opcode::Guard, args: vec![tagged[0]], results: vec![],
-                aux: AuxData::TypeTag(checked_type),
-                flags: InstFlags { guard: true, effectful: true, ..Default::default() },
-                targets: vec![], frame_state: Some(state), source_pos: 0,
-            }, &[(checked_type, ValueRepresentation::Tagged)]);
-            f.set_terminator(entry, InstData {
-                opcode: Opcode::Return, args: vec![checked[0]], results: vec![],
-                aux: AuxData::None, flags: InstFlags { terminator: true, ..Default::default() }, targets: vec![],
-                frame_state: None, source_pos: 0,
-            });
+            let (_, tagged) = f.push_inst(
+                entry,
+                InstData {
+                    opcode: Opcode::Guard,
+                    args: vec![input],
+                    results: vec![],
+                    aux: AuxData::TypeTag(IRType::of(TypeBits::FIXNUM)),
+                    flags: InstFlags {
+                        guard: true,
+                        effectful: true,
+                        ..Default::default()
+                    },
+                    targets: vec![],
+                    frame_state: Some(state),
+                    source_pos: 0,
+                },
+                &[(IRType::of(TypeBits::FIXNUM), ValueRepresentation::Tagged)],
+            );
+            let (_, checked) = f.push_inst(
+                entry,
+                InstData {
+                    opcode: Opcode::Guard,
+                    args: vec![tagged[0]],
+                    results: vec![],
+                    aux: AuxData::TypeTag(checked_type),
+                    flags: InstFlags {
+                        guard: true,
+                        effectful: true,
+                        ..Default::default()
+                    },
+                    targets: vec![],
+                    frame_state: Some(state),
+                    source_pos: 0,
+                },
+                &[(checked_type, ValueRepresentation::Tagged)],
+            );
+            f.set_terminator(
+                entry,
+                InstData {
+                    opcode: Opcode::Return,
+                    args: vec![checked[0]],
+                    results: vec![],
+                    aux: AuxData::None,
+                    flags: InstFlags {
+                        terminator: true,
+                        ..Default::default()
+                    },
+                    targets: vec![],
+                    frame_state: None,
+                    source_pos: 0,
+                },
+            );
             crate::t2::verify::verify(&f).expect("bounded guard IR");
-            crate::t2::pass::Pass::run(&mut crate::t2::opt_guard::GuardElim,
-                &mut f, &mut crate::t2::pass::Analyses::new());
+            crate::t2::pass::Pass::run(
+                &mut crate::t2::opt_guard::GuardElim,
+                &mut f,
+                &mut crate::t2::pass::Analyses::new(),
+            );
             crate::t2::verify::verify(&f).expect("optimized bounded guard IR");
-            let code = emit_framed(&f, reject as *const () as usize as u64,
-                0, 0, 0, 0, 0, 0, 0, None).expect("emit bounded guard");
+            let code = emit_framed(
+                &f,
+                reject as *const () as usize as u64,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                None,
+            )
+            .expect("emit bounded guard");
             let buffer = egcl_rt::jit::JitBuffer::new(&code.code).unwrap();
             let function: extern "C" fn(*mut u64) -> u64 =
                 unsafe { std::mem::transmute(buffer.as_ptr()) };
-            let mut values = vec![EgclVal::from_fixnum(FIXNUM_MIN), EgclVal::from_fixnum(FIXNUM_MAX),
-                EgclVal::from_fixnum(0), NIL, EgclVal::from_single_float(1.0)];
-            for number in [Some(range.lo), Some(range.hi), range.lo.checked_sub(1), range.hi.checked_add(1)]
-                .into_iter().flatten()
+            let mut values = vec![
+                EgclVal::from_fixnum(FIXNUM_MIN),
+                EgclVal::from_fixnum(FIXNUM_MAX),
+                EgclVal::from_fixnum(0),
+                NIL,
+                EgclVal::from_single_float(1.0),
+            ];
+            for number in [
+                Some(range.lo),
+                Some(range.hi),
+                range.lo.checked_sub(1),
+                range.hi.checked_add(1),
+            ]
+            .into_iter()
+            .flatten()
             {
                 if (FIXNUM_MIN..=FIXNUM_MAX).contains(&number) {
                     values.push(EgclVal::from_fixnum(number));
@@ -10990,13 +12528,20 @@ mod tests {
                 REJECTED.with(|seen| seen.set(false));
                 let mut frame = [value.0, 0, 0];
                 let result = function(frame.as_mut_ptr());
-                let accepted = value.is_fixnum()
-                    && (range.lo..=range.hi).contains(&value.as_fixnum());
-                if REJECTED.with(|seen| seen.get()) == accepted { missed.push((range, value)); }
-                if accepted { assert_eq!(result, value.0, "guard preserves the argument"); }
+                let accepted =
+                    value.is_fixnum() && (range.lo..=range.hi).contains(&value.as_fixnum());
+                if REJECTED.with(|seen| seen.get()) == accepted {
+                    missed.push((range, value));
+                }
+                if accepted {
+                    assert_eq!(result, value.0, "guard preserves the argument");
+                }
             }
         }
-        assert!(missed.is_empty(), "incorrect bounded guard decisions: {missed:?}");
+        assert!(
+            missed.is_empty(),
+            "incorrect bounded guard decisions: {missed:?}"
+        );
     }
 
     /// The framed-emitter milestone: a T2-emitted `(* x 5)` runs via the
@@ -11058,7 +12603,11 @@ mod tests {
             DEOPTED.load(Ordering::SeqCst),
             "a float operand must deopt to the interpreter"
         );
-        assert_eq!(CLEARS.load(Ordering::SeqCst), 1, "failed guards must not clear values");
+        assert_eq!(
+            CLEARS.load(Ordering::SeqCst),
+            1,
+            "failed guards must not clear values"
+        );
     }
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -11067,35 +12616,75 @@ mod tests {
     /// Use exactly the published/native-stack entry protocol required in
     /// production; the legacy framed wrapper cannot transport raw GC maps.
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    fn run_raw_native(f: &Function, input: egcl_rt::value::EgclVal) -> Option<egcl_rt::value::EgclVal> {
-        use egcl_rt::native_transfer::{self, NativeOutcome, NativeExit, NativeReturnValues};
-        unsafe extern "C" fn deopt(request: *mut u8, out: *mut NativeOutcome,
-            _: *mut crate::t2::native_transfer::SysvTransferCapture) {
+    fn run_raw_native(
+        f: &Function,
+        input: egcl_rt::value::EgclVal,
+    ) -> Option<egcl_rt::value::EgclVal> {
+        use egcl_rt::native_transfer::{self, NativeExit, NativeOutcome, NativeReturnValues};
+        unsafe extern "C" fn deopt(
+            request: *mut u8,
+            out: *mut NativeOutcome,
+            _: *mut crate::t2::native_transfer::SysvTransferCapture,
+        ) {
             let request = unsafe { &*request.cast::<TransferDeoptRequest>() };
             WIDE_DEOPTED.with(|seen| seen.set(true));
             if request.n_words >= 6 {
                 RAW_RECOVERED.with(|value| value.set(unsafe { *request.words.add(5) }));
             }
-            unsafe { out.write(NativeOutcome { value: egcl_rt::value::NIL, exit: NativeExit::Returned }); }
-        }
-        unsafe extern "C" fn values(_: u64, destination: *mut egcl_rt::value::EgclVal, operation: u64) {
-            if operation == native_transfer::SNAPSHOT_NATIVE_RETURN_VALUES {
-                unsafe { destination.cast::<NativeReturnValues>().write(NativeReturnValues::SINGLE); }
+            unsafe {
+                out.write(NativeOutcome {
+                    value: egcl_rt::value::NIL,
+                    exit: NativeExit::Returned,
+                });
             }
         }
-        let veneer = egcl_rt::jit::JitBuffer::new(&crate::t2::native_transfer::emit_published_helper_veneer(
-            deopt, std::ptr::null())).unwrap();
-        let (artifact, _) = emit_framed_native_handlers_with_entries_and_storage(f,
-            1, 1, 1, 1, values as *const () as u64, 1, 1, 0, None,
-            Some(veneer.as_ptr() as u64), &[], NativeRootPublication::PublishedHomes,
-            NativeCallStorage::NativeStack).expect("production mapped raw fixnum artifact");
+        unsafe extern "C" fn values(
+            _: u64,
+            destination: *mut egcl_rt::value::EgclVal,
+            operation: u64,
+        ) {
+            if operation == native_transfer::SNAPSHOT_NATIVE_RETURN_VALUES {
+                unsafe {
+                    destination
+                        .cast::<NativeReturnValues>()
+                        .write(NativeReturnValues::SINGLE);
+                }
+            }
+        }
+        let veneer = egcl_rt::jit::JitBuffer::new(
+            &crate::t2::native_transfer::emit_published_helper_veneer(deopt, std::ptr::null()),
+        )
+        .unwrap();
+        let (artifact, _) = emit_framed_native_handlers_with_entries_and_storage(
+            f,
+            1,
+            1,
+            1,
+            1,
+            values as *const () as u64,
+            1,
+            1,
+            0,
+            None,
+            Some(veneer.as_ptr() as u64),
+            &[],
+            NativeRootPublication::PublishedHomes,
+            NativeCallStorage::NativeStack,
+        )
+        .expect("production mapped raw fixnum artifact");
         let code = egcl_rt::jit::JitBuffer::new(&artifact.code).unwrap();
         let mut activation = vec![egcl_rt::value::NIL; 1 + usize::from(artifact.shadow_root_slots)];
         activation[0] = input;
         let stack = egcl_rt::EgclStack::new(64 * 1024);
         WIDE_DEOPTED.with(|seen| seen.set(false));
-        let result = unsafe { native_transfer::invoke_native_segment(code.as_ptr(),
-            activation.as_mut_ptr().cast(), &stack) }.unwrap();
+        let result = unsafe {
+            native_transfer::invoke_native_segment(
+                code.as_ptr(),
+                activation.as_mut_ptr().cast(),
+                &stack,
+            )
+        }
+        .unwrap();
         assert_eq!(result.exit, NativeExit::Returned);
         (!WIDE_DEOPTED.with(|seen| seen.get())).then_some(result.value)
     }
@@ -11107,13 +12696,24 @@ mod tests {
         use egcl_rt::value::EgclVal;
         let mut f = speculated_mul5();
         assert!(crate::t2::unbox_fixnum::run(&mut f) > 0);
-        assert!(f.block_order().iter().flat_map(|&b| &f.block(b).insts)
-            .any(|&i| f.inst(i).opcode == Opcode::UnboxFixnum));
-        assert!(f.block_order().iter().flat_map(|&b| &f.block(b).insts)
-            .any(|&i| f.inst(i).opcode == Opcode::FixnumMul
-                && f.value(f.inst(i).results[0]).repr == Repr::UnboxedFixnum));
+        assert!(
+            f.block_order()
+                .iter()
+                .flat_map(|&b| &f.block(b).insts)
+                .any(|&i| f.inst(i).opcode == Opcode::UnboxFixnum)
+        );
+        assert!(
+            f.block_order()
+                .iter()
+                .flat_map(|&b| &f.block(b).insts)
+                .any(|&i| f.inst(i).opcode == Opcode::FixnumMul
+                    && f.value(f.inst(i).results[0]).repr == Repr::UnboxedFixnum)
+        );
         for x in [-123, 0, 42, FIXNUM_MAX / 5] {
-            assert_eq!(run_raw_native(&f, EgclVal::from_fixnum(x)).map(|v| v.as_fixnum()), Some(x * 5));
+            assert_eq!(
+                run_raw_native(&f, EgclVal::from_fixnum(x)).map(|v| v.as_fixnum()),
+                Some(x * 5)
+            );
         }
         // This product fits i64 but not a fixnum: OF alone would miss it.
         assert!(run_raw_native(&f, EgclVal::from_fixnum(FIXNUM_MAX / 5 + 1)).is_none());
@@ -11123,25 +12723,68 @@ mod tests {
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     #[test]
     fn raw_fixnum_cold_exit_reboxes_live_intermediate_before_serializing() {
-        use crate::t2::frame_state::{FrameState, FrameScope, ValueSource};
-        use crate::t2::ir::{Opcode, AuxData, InstData, InstFlags, IRType, TypeBits, ValueRepresentation as Repr};
+        use crate::t2::frame_state::{FrameScope, FrameState, ValueSource};
+        use crate::t2::ir::{
+            AuxData, IRType, InstData, InstFlags, Opcode, TypeBits, ValueRepresentation as Repr,
+        };
         let mut f = speculated_mul5();
         let block = f.entry();
-        let mul = f.block(block).insts.iter().copied().find(|&i| f.inst(i).opcode == Opcode::FixnumMul).unwrap();
+        let mul = f
+            .block(block)
+            .insts
+            .iter()
+            .copied()
+            .find(|&i| f.inst(i).opcode == Opcode::FixnumMul)
+            .unwrap();
         let value = f.inst(mul).results[0];
         let x = f.block(block).params[0];
-        let fs = f.frame_states.add(FrameState { scopes: vec![FrameScope { function: 0, bcp: 3,
-            locals: vec![ValueSource::Value { value: x, repr: Repr::Tagged }],
-            stack: vec![ValueSource::Value { value, repr: Repr::Tagged }] }], remat: vec![] });
+        let fs = f.frame_states.add(FrameState {
+            scopes: vec![FrameScope {
+                function: 0,
+                bcp: 3,
+                locals: vec![ValueSource::Value {
+                    value: x,
+                    repr: Repr::Tagged,
+                }],
+                stack: vec![ValueSource::Value {
+                    value,
+                    repr: Repr::Tagged,
+                }],
+            }],
+            remat: vec![],
+        });
         let term = f.terminator(block).unwrap();
-        let (constant, c) = f.push_inst(block, InstData { opcode: Opcode::ConstFixnum,
-            args: vec![], results: vec![], aux: AuxData::FixnumImm(FIXNUM_MAX),
-            flags: InstFlags::default(), targets: vec![], frame_state: None, source_pos: 0 },
-            &[(IRType::of(TypeBits::FIXNUM), Repr::Tagged)]);
-        let (add, result) = f.push_inst(block, InstData { opcode: Opcode::FixnumAdd,
-            args: vec![value, c[0]], results: vec![], aux: AuxData::None,
-            flags: InstFlags { guard: true, ..InstFlags::default() }, targets: vec![], frame_state: Some(fs), source_pos: 0 },
-            &[(IRType::of(TypeBits::FIXNUM), Repr::Tagged)]);
+        let (constant, c) = f.push_inst(
+            block,
+            InstData {
+                opcode: Opcode::ConstFixnum,
+                args: vec![],
+                results: vec![],
+                aux: AuxData::FixnumImm(FIXNUM_MAX),
+                flags: InstFlags::default(),
+                targets: vec![],
+                frame_state: None,
+                source_pos: 0,
+            },
+            &[(IRType::of(TypeBits::FIXNUM), Repr::Tagged)],
+        );
+        let (add, result) = f.push_inst(
+            block,
+            InstData {
+                opcode: Opcode::FixnumAdd,
+                args: vec![value, c[0]],
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags {
+                    guard: true,
+                    ..InstFlags::default()
+                },
+                targets: vec![],
+                frame_state: Some(fs),
+                source_pos: 0,
+            },
+            &[(IRType::of(TypeBits::FIXNUM), Repr::Tagged)],
+        );
         let body = &mut f.block_mut(block).insts;
         body.retain(|&i| i != constant && i != add);
         let pos = body.iter().position(|&i| i == term).unwrap();
@@ -11150,7 +12793,10 @@ mod tests {
         assert!(crate::t2::unbox_fixnum::run(&mut f) > 0);
         RAW_RECOVERED.with(|value| value.set(0));
         assert!(run_raw_native(&f, egcl_rt::value::EgclVal::from_fixnum(7)).is_none());
-        assert_eq!(egcl_rt::value::EgclVal(RAW_RECOVERED.with(|value| value.get())).as_fixnum(), 35);
+        assert_eq!(
+            egcl_rt::value::EgclVal(RAW_RECOVERED.with(|value| value.get())).as_fixnum(),
+            35
+        );
     }
 
     /// Build post-speculation IR for `(x) -> x * c` where the param `x` carries
@@ -11239,22 +12885,41 @@ mod tests {
         let arithmetic = f.block(entry).insts[1];
         f.inst_mut(arithmetic).opcode = opcode;
         if let Err(range) = right {
-            let y = f.add_block_param(entry, IRType {
-                bits: TypeBits::FIXNUM, range: Some(range), class_id: None,
-            }, ValueRepresentation::Tagged);
+            let y = f.add_block_param(
+                entry,
+                IRType {
+                    bits: TypeBits::FIXNUM,
+                    range: Some(range),
+                    class_id: None,
+                },
+                ValueRepresentation::Tagged,
+            );
             f.inst_mut(arithmetic).args[1] = y;
         }
         if constant_on_left {
             f.inst_mut(arithmetic).args.swap(0, 1);
         }
-        emit_framed(&f, deopt.unwrap_or(mock_c2i_deopt) as *const () as usize as u64,
-            0, 0, 0, 0, 0, 0, 0, None).expect("emit ranged arithmetic").code
+        emit_framed(
+            &f,
+            deopt.unwrap_or(mock_c2i_deopt) as *const () as usize as u64,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            None,
+        )
+        .expect("emit ranged arithmetic")
+        .code
     }
 
     #[cfg(all(target_arch = "x86_64", unix))]
     fn has_overflow_branch(code: &[u8]) -> bool {
         iced_x86::Decoder::new(64, code, iced_x86::DecoderOptions::NONE)
-            .into_iter().any(|instruction| instruction.mnemonic() == iced_x86::Mnemonic::Jo)
+            .into_iter()
+            .any(|instruction| instruction.mnemonic() == iced_x86::Mnemonic::Jo)
     }
 
     #[cfg(all(target_arch = "x86_64", unix))]
@@ -11265,20 +12930,35 @@ mod tests {
         for opcode in [Opcode::FixnumAdd, Opcode::FixnumSub] {
             for right in [Ok(2), Ok(-2), Err(Range { lo: -2, hi: 2 })] {
                 for constant_on_left in [false, true] {
-                    let code = add_sub_range_code(opcode, Some(Range { lo: -40, hi: 40 }),
-                        right, constant_on_left, None);
-                    assert!(!has_overflow_branch(&code),
-                        "bounded {opcode:?} {right:?}, swapped={constant_on_left}, cannot overflow");
+                    let code = add_sub_range_code(
+                        opcode,
+                        Some(Range { lo: -40, hi: 40 }),
+                        right,
+                        constant_on_left,
+                        None,
+                    );
+                    assert!(
+                        !has_overflow_branch(&code),
+                        "bounded {opcode:?} {right:?}, swapped={constant_on_left}, cannot overflow"
+                    );
                     let buffer = egcl_rt::jit::JitBuffer::new(&code).unwrap();
                     let function: extern "C" fn(*mut u64) -> u64 =
                         unsafe { std::mem::transmute(buffer.as_ptr()) };
                     for x in [-40, 0, 40] {
                         let y = right.unwrap_or(-2);
                         let (a, b) = if constant_on_left { (y, x) } else { (x, y) };
-                        let expected = if opcode == Opcode::FixnumAdd { a + b } else { a - b };
-                        let mut frame = [EgclVal::from_fixnum(x).0, EgclVal::from_fixnum(y).0, 0, 0];
-                        assert_eq!(EgclVal(function(frame.as_mut_ptr())).as_fixnum(), expected,
-                            "{opcode:?}, {right:?}, swapped={constant_on_left}, x={x}");
+                        let expected = if opcode == Opcode::FixnumAdd {
+                            a + b
+                        } else {
+                            a - b
+                        };
+                        let mut frame =
+                            [EgclVal::from_fixnum(x).0, EgclVal::from_fixnum(y).0, 0, 0];
+                        assert_eq!(
+                            EgclVal(function(frame.as_mut_ptr())).as_fixnum(),
+                            expected,
+                            "{opcode:?}, {right:?}, swapped={constant_on_left}, x={x}"
+                        );
                     }
                 }
             }
@@ -11291,19 +12971,53 @@ mod tests {
         use crate::t2::ir::{Opcode, Range};
         use egcl_rt::value::EgclVal;
         for (opcode, range, constant) in [
-            (Opcode::FixnumAdd, Range { lo: FIXNUM_MIN, hi: FIXNUM_MAX - 1 }, 1),
-            (Opcode::FixnumSub, Range { lo: FIXNUM_MIN + 1, hi: FIXNUM_MAX }, 1),
-            (Opcode::FixnumAdd, Range { lo: FIXNUM_MIN + 1, hi: FIXNUM_MAX }, -1),
-            (Opcode::FixnumSub, Range { lo: FIXNUM_MIN, hi: FIXNUM_MAX - 1 }, -1),
+            (
+                Opcode::FixnumAdd,
+                Range {
+                    lo: FIXNUM_MIN,
+                    hi: FIXNUM_MAX - 1,
+                },
+                1,
+            ),
+            (
+                Opcode::FixnumSub,
+                Range {
+                    lo: FIXNUM_MIN + 1,
+                    hi: FIXNUM_MAX,
+                },
+                1,
+            ),
+            (
+                Opcode::FixnumAdd,
+                Range {
+                    lo: FIXNUM_MIN + 1,
+                    hi: FIXNUM_MAX,
+                },
+                -1,
+            ),
+            (
+                Opcode::FixnumSub,
+                Range {
+                    lo: FIXNUM_MIN,
+                    hi: FIXNUM_MAX - 1,
+                },
+                -1,
+            ),
         ] {
             let code = add_sub_range_code(opcode, Some(range), Ok(constant), false, None);
-            assert!(!has_overflow_branch(&code),
-                "inclusive fixnum endpoints are safe for {opcode:?}, {range:?}, {constant}");
+            assert!(
+                !has_overflow_branch(&code),
+                "inclusive fixnum endpoints are safe for {opcode:?}, {range:?}, {constant}"
+            );
             let buffer = egcl_rt::jit::JitBuffer::new(&code).unwrap();
             let function: extern "C" fn(*mut u64) -> u64 =
                 unsafe { std::mem::transmute(buffer.as_ptr()) };
             for x in [range.lo, range.hi] {
-                let expected = if opcode == Opcode::FixnumAdd { x + constant } else { x - constant };
+                let expected = if opcode == Opcode::FixnumAdd {
+                    x + constant
+                } else {
+                    x - constant
+                };
                 let mut frame = [EgclVal::from_fixnum(x).0, 0, 0];
                 assert_eq!(EgclVal(function(frame.as_mut_ptr())).as_fixnum(), expected);
             }
@@ -11315,19 +13029,40 @@ mod tests {
     fn range_safe_add_sub_keeps_overflow_for_unknown_or_excessive_ranges() {
         use crate::t2::ir::{Opcode, Range};
         for opcode in [Opcode::FixnumAdd, Opcode::FixnumSub] {
-            for range in [None, Some(Range { lo: FIXNUM_MIN, hi: FIXNUM_MAX }),
-                Some(Range { lo: i64::MIN, hi: i64::MAX }),
-                Some(Range { lo: 40, hi: 0 })] {
+            for range in [
+                None,
+                Some(Range {
+                    lo: FIXNUM_MIN,
+                    hi: FIXNUM_MAX,
+                }),
+                Some(Range {
+                    lo: i64::MIN,
+                    hi: i64::MAX,
+                }),
+                Some(Range { lo: 40, hi: 0 }),
+            ] {
                 let code = add_sub_range_code(opcode, range, Ok(1), false, None);
-                assert!(has_overflow_branch(&code),
-                    "no sound overflow proof for {opcode:?}, {range:?}");
+                assert!(
+                    has_overflow_branch(&code),
+                    "no sound overflow proof for {opcode:?}, {range:?}"
+                );
             }
             for swapped in [false, true] {
                 for right in [Ok(1), Err(Range { lo: -1, hi: 1 })] {
-                    let code = add_sub_range_code(opcode,
-                        Some(Range { lo: FIXNUM_MIN, hi: FIXNUM_MAX }), right, swapped, None);
-                    assert!(has_overflow_branch(&code),
-                        "overflow remains possible for {opcode:?}, {right:?}, swapped={swapped}");
+                    let code = add_sub_range_code(
+                        opcode,
+                        Some(Range {
+                            lo: FIXNUM_MIN,
+                            hi: FIXNUM_MAX,
+                        }),
+                        right,
+                        swapped,
+                        None,
+                    );
+                    assert!(
+                        has_overflow_branch(&code),
+                        "overflow remains possible for {opcode:?}, {right:?}, swapped={swapped}"
+                    );
                 }
             }
         }
@@ -11355,7 +13090,10 @@ mod tests {
         assert!(!OVERFLOWED.with(|seen| seen.get()));
         frame[0] = EgclVal::from_fixnum(FIXNUM_MIN).0;
         let _ = function(frame.as_mut_ptr());
-        assert!(OVERFLOWED.with(|seen| seen.get()), "MOV must preserve OF for deoptimization");
+        assert!(
+            OVERFLOWED.with(|seen| seen.get()),
+            "MOV must preserve OF for deoptimization"
+        );
     }
 
     #[cfg(all(target_arch = "x86_64", unix))]
@@ -11389,25 +13127,47 @@ mod tests {
         use egcl_rt::value::EgclVal;
         for c in [1_000_000_000_000i64, 2_147_483_648, -1_000_000_000_000] {
             for constant_on_left in [false, true] {
-                let code = add_sub_range_code(Opcode::FixnumMul, None, Ok(c), constant_on_left,
-                    Some(wide_deopt));
-                assert!(has_overflow_branch(&code), "unbounded * {c} must check overflow");
+                let code = add_sub_range_code(
+                    Opcode::FixnumMul,
+                    None,
+                    Ok(c),
+                    constant_on_left,
+                    Some(wide_deopt),
+                );
+                assert!(
+                    has_overflow_branch(&code),
+                    "unbounded * {c} must check overflow"
+                );
                 for x in [0i64, 7, -3, 1_000_000] {
                     let r = run_wide(&code, EgclVal::from_fixnum(x));
                     assert_eq!(r.map(|v| v.as_fixnum()), Some(x * c), "{x} * {c}");
                 }
-                assert!(run_wide(&code, EgclVal::from_fixnum(1 << 40)).is_none(),
-                    "(1<<40) * {c} overflows a fixnum and must deopt");
-                assert!(run_wide(&code, EgclVal::from_single_float(2.0)).is_none(),
-                    "a float operand must deopt");
+                assert!(
+                    run_wide(&code, EgclVal::from_fixnum(1 << 40)).is_none(),
+                    "(1<<40) * {c} overflows a fixnum and must deopt"
+                );
+                assert!(
+                    run_wide(&code, EgclVal::from_single_float(2.0)).is_none(),
+                    "a float operand must deopt"
+                );
             }
         }
-        let code = add_sub_range_code(Opcode::FixnumMul, Some(Range { lo: 0, hi: 100 }),
-            Ok(1_000_000_000_000), false, Some(wide_deopt));
-        assert!(!has_overflow_branch(&code), "a bounded operand cannot overflow");
+        let code = add_sub_range_code(
+            Opcode::FixnumMul,
+            Some(Range { lo: 0, hi: 100 }),
+            Ok(1_000_000_000_000),
+            false,
+            Some(wide_deopt),
+        );
+        assert!(
+            !has_overflow_branch(&code),
+            "a bounded operand cannot overflow"
+        );
         for x in [0i64, 1, 100] {
-            assert_eq!(run_wide(&code, EgclVal::from_fixnum(x)).map(|v| v.as_fixnum()),
-                Some(x * 1_000_000_000_000));
+            assert_eq!(
+                run_wide(&code, EgclVal::from_fixnum(x)).map(|v| v.as_fixnum()),
+                Some(x * 1_000_000_000_000)
+            );
         }
     }
 
@@ -11418,13 +13178,16 @@ mod tests {
         use crate::t2::ir::Opcode;
         use egcl_rt::value::EgclVal;
         for n in [31i64, 40, 59, 62] {
-            let code = add_sub_range_code(Opcode::FixnumShl, None, Ok(n), false,
-                Some(wide_deopt));
+            let code = add_sub_range_code(Opcode::FixnumShl, None, Ok(n), false, Some(wide_deopt));
             for x in [0i64, 3, -1, 1 << 25] {
                 let expected = (x as i128) << n;
                 let r = run_wide(&code, EgclVal::from_fixnum(x));
                 if (FIXNUM_MIN as i128..=FIXNUM_MAX as i128).contains(&expected) {
-                    assert_eq!(r.map(|v| v.as_fixnum() as i128), Some(expected), "{x} << {n}");
+                    assert_eq!(
+                        r.map(|v| v.as_fixnum() as i128),
+                        Some(expected),
+                        "{x} << {n}"
+                    );
                 } else {
                     assert!(r.is_none(), "{x} << {n} overflows and must deopt");
                 }
@@ -11438,8 +13201,9 @@ mod tests {
     #[cfg(all(target_arch = "x86_64", unix))]
     #[test]
     fn masked_left_shift_overflow_is_checked() {
-        use crate::t2::ir::{AuxData, IRType, InstData, InstFlags, Opcode, TypeBits,
-            ValueRepresentation};
+        use crate::t2::ir::{
+            AuxData, IRType, InstData, InstFlags, Opcode, TypeBits, ValueRepresentation,
+        };
         use egcl_rt::value::EgclVal;
         let build = |mask: i64, n: i64| {
             let mut f = build_mul_ranged(mask, None);
@@ -11448,36 +13212,89 @@ mod tests {
             f.inst_mut(masked).opcode = Opcode::LogAnd;
             let masked = f.inst(masked).results[0];
             let fixnum = (IRType::of(TypeBits::FIXNUM), ValueRepresentation::Tagged);
-            let (_, amount) = f.push_inst(entry, InstData {
-                opcode: Opcode::ConstFixnum, args: vec![], results: vec![],
-                aux: AuxData::FixnumImm(n), flags: InstFlags::default(), targets: vec![],
-                frame_state: None, source_pos: 0,
-            }, &[fixnum]);
-            let (_, shifted) = f.push_inst(entry, InstData {
-                opcode: Opcode::FixnumShl, args: vec![masked, amount[0]], results: vec![],
-                aux: AuxData::None,
-                flags: InstFlags { guard: true, effectful: true, ..Default::default() },
-                targets: vec![], frame_state: None, source_pos: 0,
-            }, &[fixnum]);
-            f.set_terminator(entry, InstData {
-                opcode: Opcode::Return, args: vec![shifted[0]], results: vec![],
-                aux: AuxData::None, flags: InstFlags::default(), targets: vec![],
-                frame_state: None, source_pos: 0,
-            });
-            emit_framed(&f, wide_deopt as *const () as usize as u64, 0, 0, 0, 0, 0, 0, 0, None)
-                .expect("emit masked shift").code
+            let (_, amount) = f.push_inst(
+                entry,
+                InstData {
+                    opcode: Opcode::ConstFixnum,
+                    args: vec![],
+                    results: vec![],
+                    aux: AuxData::FixnumImm(n),
+                    flags: InstFlags::default(),
+                    targets: vec![],
+                    frame_state: None,
+                    source_pos: 0,
+                },
+                &[fixnum],
+            );
+            let (_, shifted) = f.push_inst(
+                entry,
+                InstData {
+                    opcode: Opcode::FixnumShl,
+                    args: vec![masked, amount[0]],
+                    results: vec![],
+                    aux: AuxData::None,
+                    flags: InstFlags {
+                        guard: true,
+                        effectful: true,
+                        ..Default::default()
+                    },
+                    targets: vec![],
+                    frame_state: None,
+                    source_pos: 0,
+                },
+                &[fixnum],
+            );
+            f.set_terminator(
+                entry,
+                InstData {
+                    opcode: Opcode::Return,
+                    args: vec![shifted[0]],
+                    results: vec![],
+                    aux: AuxData::None,
+                    flags: InstFlags::default(),
+                    targets: vec![],
+                    frame_state: None,
+                    source_pos: 0,
+                },
+            );
+            emit_framed(
+                &f,
+                wide_deopt as *const () as usize as u64,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                None,
+            )
+            .expect("emit masked shift")
+            .code
         };
         let code = build(0xFF_FFFF_FFFF, 30);
-        assert!(has_overflow_branch(&code), "a 40-bit mask shifted by 30 can overflow");
-        assert_eq!(run_wide(&code, EgclVal::from_fixnum(3)).map(|v| v.as_fixnum()),
-            Some(3 << 30));
-        assert!(run_wide(&code, EgclVal::from_fixnum(0xFF_FFFF_FFFF)).is_none(),
-            "2^70-scale result must deopt, not wrap");
+        assert!(
+            has_overflow_branch(&code),
+            "a 40-bit mask shifted by 30 can overflow"
+        );
+        assert_eq!(
+            run_wide(&code, EgclVal::from_fixnum(3)).map(|v| v.as_fixnum()),
+            Some(3 << 30)
+        );
+        assert!(
+            run_wide(&code, EgclVal::from_fixnum(0xFF_FFFF_FFFF)).is_none(),
+            "2^70-scale result must deopt, not wrap"
+        );
         // A mask that really does bound the result keeps the plain shift.
         let code = build(0xFFFF, 30);
-        assert!(!has_overflow_branch(&code), "a 16-bit mask shifted by 30 cannot overflow");
-        assert_eq!(run_wide(&code, EgclVal::from_fixnum(-1)).map(|v| v.as_fixnum()),
-            Some(0xFFFF << 30));
+        assert!(
+            !has_overflow_branch(&code),
+            "a 16-bit mask shifted by 30 cannot overflow"
+        );
+        assert_eq!(
+            run_wide(&code, EgclVal::from_fixnum(-1)).map(|v| v.as_fixnum()),
+            Some(0xFFFF << 30)
+        );
     }
 
     /// A comparison against a constant whose tagged form exceeds imm32 compares
@@ -11497,10 +13314,13 @@ mod tests {
             (Opcode::FixnumCmpEq, true, BIG + 1, NIL),
             (Opcode::FixnumCmpGe, false, -BIG, NIL),
         ] {
-            let code = add_sub_range_code(opcode, None, Ok(BIG), constant_on_left,
-                Some(wide_deopt));
-            assert_eq!(run_wide(&code, EgclVal::from_fixnum(x)), Some(expected),
-                "{opcode:?} swapped={constant_on_left} x={x}");
+            let code =
+                add_sub_range_code(opcode, None, Ok(BIG), constant_on_left, Some(wide_deopt));
+            assert_eq!(
+                run_wide(&code, EgclVal::from_fixnum(x)),
+                Some(expected),
+                "{opcode:?} swapped={constant_on_left} x={x}"
+            );
         }
     }
 
@@ -11531,11 +13351,16 @@ mod tests {
         let code = framed.code;
         // Recognize the arithmetic LEA and overflow condition independently
         // of register assignment and near/short branch layout.
-        assert!(iced_x86::Decoder::new(64, &code, iced_x86::DecoderOptions::NONE)
-            .into_iter().any(|instruction| instruction.mnemonic() == iced_x86::Mnemonic::Lea
-                && instruction.memory_index_scale() == 4
-                && instruction.memory_base() == instruction.memory_index()),
-            "must emit arithmetic lea for a range-safe *5");
+        assert!(
+            iced_x86::Decoder::new(64, &code, iced_x86::DecoderOptions::NONE)
+                .into_iter()
+                .any(
+                    |instruction| instruction.mnemonic() == iced_x86::Mnemonic::Lea
+                        && instruction.memory_index_scale() == 4
+                        && instruction.memory_base() == instruction.memory_index()
+                ),
+            "must emit arithmetic lea for a range-safe *5"
+        );
         assert!(
             !has_overflow_branch(&code),
             "range proves no overflow → no jo deopt"
@@ -11575,9 +13400,12 @@ mod tests {
             "the emitted overflow edge must make the artifact deopt-capable"
         );
         let code = framed.code;
-        assert!(iced_x86::Decoder::new(64, &code, iced_x86::DecoderOptions::NONE)
-            .into_iter().any(|instruction| instruction.mnemonic() == iced_x86::Mnemonic::Imul),
-            "unknown range → imul r64,r64,5");
+        assert!(
+            iced_x86::Decoder::new(64, &code, iced_x86::DecoderOptions::NONE)
+                .into_iter()
+                .any(|instruction| instruction.mnemonic() == iced_x86::Mnemonic::Imul),
+            "unknown range → imul r64,r64,5"
+        );
         assert!(
             has_overflow_branch(&code),
             "unknown range → keep the jo overflow deopt"
@@ -11886,7 +13714,16 @@ mod tests {
         });
         crate::t2::verify::verify(&f).expect("OSR identity IR verifies");
         let framed = emit_framed(
-            &f, 0, reconstruct as *const () as usize as u64, 0, 0, 0, 0, 0, 0, None,
+            &f,
+            0,
+            reconstruct as *const () as usize as u64,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            None,
         )
         .expect("emit OSR identity");
         assert_eq!(framed.osr_entries.len(), 1, "checked OSR entry is emitted");
@@ -11895,9 +13732,8 @@ mod tests {
             "an OSR guard needs deopt source snapshots even without instruction guards"
         );
         let buf = egcl_rt::jit::JitBuffer::new(&framed.code).expect("mmap");
-        let osr: extern "C" fn(*mut u64) -> u64 = unsafe {
-            std::mem::transmute(buf.as_ptr().add(framed.osr_entries[0].1))
-        };
+        let osr: extern "C" fn(*mut u64) -> u64 =
+            unsafe { std::mem::transmute(buf.as_ptr().add(framed.osr_entries[0].1)) };
         let mut slots = [EgclVal::from_fixnum(7).0];
         assert_eq!(osr(slots.as_mut_ptr()), slots[0]);
         slots[0] = EgclVal::from_single_float(2.0).0;
@@ -12112,23 +13948,52 @@ mod poll_map_tests {
         let entry = f.entry();
         let stack = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
         let register = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
-        f.set_terminator(entry, InstData {
-            opcode: Opcode::Return, args: vec![stack, register], results: vec![],
-            aux: AuxData::None, flags: InstFlags::default(), targets: vec![],
-            frame_state: None, source_pos: 0,
-        });
+        f.set_terminator(
+            entry,
+            InstData {
+                opcode: Opcode::Return,
+                args: vec![stack, register],
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags::default(),
+                targets: vec![],
+                frame_state: None,
+                source_pos: 0,
+            },
+        );
         let mut machine = crate::t2::lower::lower(&f);
         crate::t2::regalloc::allocate_framed(&mut machine).unwrap();
         let homes = FrameHomes {
-            values: HashMap::from([(stack, FramedHome::Stack(0)), (register, FramedHome::Reg(12))]),
+            values: HashMap::from([
+                (stack, FramedHome::Stack(0)),
+                (register, FramedHome::Reg(12)),
+            ]),
             stack_slots: 1,
         };
         let values = resolve_values_before(&f, &machine, &homes, &HashMap::new(), 0).unwrap();
         let emit = |roots: &[crate::t2::ir::Value], shadow_slots| {
             let mut a = Asm::new();
-            let (_, map) = emit_mapped_poll(&mut a, &values, roots, &homes.values,
-                &PollFrame { fast_path: None, execution_idle: false, arguments: Vec::new(), native_frame_mode: false, spill_area: NativeValueArea::Activation(0), base: FramedHome::Stack(1), activation_slots: 0, shadow_slots,
-                    raw_spill_start: 2, native_slots: 3 }, 0x12345678, false).unwrap();
+            let (_, map) = emit_mapped_poll(
+                &mut a,
+                &values,
+                roots,
+                &homes.values,
+                &PollFrame {
+                    fast_path: None,
+                    execution_idle: false,
+                    arguments: Vec::new(),
+                    native_frame_mode: false,
+                    spill_area: NativeValueArea::Activation(0),
+                    base: FramedHome::Stack(1),
+                    activation_slots: 0,
+                    shadow_slots,
+                    raw_spill_start: 2,
+                    native_slots: 3,
+                },
+                0x12345678,
+                false,
+            )
+            .unwrap();
             (a.finish().unwrap(), map)
         };
         let memory_moves = |bytes: &[u8]| {
@@ -12147,18 +14012,40 @@ mod poll_map_tests {
         let (shadowed, _) = emit(&[stack, register], 2);
         let (shared_area, map) = emit(&[], 2);
         let (native_only, _) = emit(&[], 0);
-        eprintln!("published stable-home poll: shadowed={} bytes {:?} loads/stores; \
+        eprintln!(
+            "published stable-home poll: shadowed={} bytes {:?} loads/stores; \
             shared area={} bytes {:?}; no area={} bytes {:?}",
-            shadowed.len(), memory_moves(&shadowed), shared_area.len(), memory_moves(&shared_area),
-            native_only.len(), memory_moves(&native_only));
-        assert_eq!(map.gc_locations().copied().collect::<Vec<_>>(), vec![
-            NativeValueLocation::Stack(0), NativeValueLocation::Register(12),
-        ]);
+            shadowed.len(),
+            memory_moves(&shadowed),
+            shared_area.len(),
+            memory_moves(&shared_area),
+            native_only.len(),
+            memory_moves(&native_only)
+        );
+        assert_eq!(
+            map.gc_locations().copied().collect::<Vec<_>>(),
+            vec![
+                NativeValueLocation::Stack(0),
+                NativeValueLocation::Register(12),
+            ]
+        );
         let (old_reads, old_writes) = memory_moves(&shadowed);
         let (reads, writes) = memory_moves(&shared_area);
-        assert_eq!(old_reads - reads, 4, "remove native read, restore base, and two shadow reads");
-        assert_eq!(old_writes - writes, 3, "remove two shadow writes and native stack restore");
-        assert_eq!(memory_moves(&native_only), (1, 0), "only the poll activation pointer load remains");
+        assert_eq!(
+            old_reads - reads,
+            4,
+            "remove native read, restore base, and two shadow reads"
+        );
+        assert_eq!(
+            old_writes - writes,
+            3,
+            "remove two shadow writes and native stack restore"
+        );
+        assert_eq!(
+            memory_moves(&native_only),
+            (1, 0),
+            "only the poll activation pointer load remains"
+        );
         assert!(native_only.len() < shared_area.len() && shared_area.len() < shadowed.len());
     }
 
@@ -12215,7 +14102,9 @@ mod poll_map_tests {
             struct MappedRoots(Vec<*mut EgclVal>);
             impl egcl_rt::gc::TraceHostRoots for MappedRoots {
                 fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
-                    for &slot in &self.0 { visit(slot); }
+                    for &slot in &self.0 {
+                        visit(slot);
+                    }
                 }
             }
             let mut roots = MappedRoots(Vec::new());
@@ -12224,7 +14113,11 @@ mod poll_map_tests {
                     let NativeValueLocation::Stack(offset) = *location else {
                         panic!("native volatile root must be in the native frame");
                     };
-                    roots.0.push(unsafe { body_rsp.byte_offset(offset as isize) }.cast_mut().cast());
+                    roots.0.push(
+                        unsafe { body_rsp.byte_offset(offset as isize) }
+                            .cast_mut()
+                            .cast(),
+                    );
                 }
             }
             egcl_rt::rooted_ref!(_native_roots = &mut roots);
@@ -12292,9 +14185,15 @@ mod poll_map_tests {
                 &[tagged],
                 &homes.values,
                 &PollFrame {
-                    fast_path: None, execution_idle: false,
-                    arguments: Vec::new(), native_frame_mode: false,
-                    spill_area: if native_storage { NativeValueArea::NativeStack(3) } else { NativeValueArea::Activation(1) },
+                    fast_path: None,
+                    execution_idle: false,
+                    arguments: Vec::new(),
+                    native_frame_mode: false,
+                    spill_area: if native_storage {
+                        NativeValueArea::NativeStack(3)
+                    } else {
+                        NativeValueArea::Activation(1)
+                    },
                     base: FramedHome::Stack(1),
                     activation_slots: 1,
                     shadow_slots: u16::from(!native_storage),
@@ -12371,7 +14270,9 @@ mod adjacent_home_tests {
     fn home_reload_after_label_or_stack_change_stays_in_memory() {
         let mut a = Asm::new();
         store_home(&mut a, FramedHome::Stack(3), RAX, 0);
-        let end = a.here(); let label = a.label(); a.bind(label);
+        let end = a.here();
+        let label = a.label();
+        a.bind(label);
         load_home(&mut a, RAX, FramedHome::Stack(3), 0);
         assert!(a.here() > end);
         store_home(&mut a, FramedHome::Stack(3), RAX, 0);

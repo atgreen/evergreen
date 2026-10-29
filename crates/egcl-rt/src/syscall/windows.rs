@@ -148,7 +148,9 @@ pub fn process_cpu_time_ns() -> Result<u64, i32> {
             return Err(GetLastError() as i32);
         }
         let ticks = |t: FILETIME| (u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime);
-        Ok(ticks(kernel).saturating_add(ticks(user)).saturating_mul(100))
+        Ok(ticks(kernel)
+            .saturating_add(ticks(user))
+            .saturating_mul(100))
     }
 }
 

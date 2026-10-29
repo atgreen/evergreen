@@ -75,25 +75,40 @@ mod tests {
                 ("((setq value 99) (egcl::%debug-backtrace 32 0 nil))", false),
             ] {
                 egcl_rt::rooted!(forms = reader::read_from_string(source).unwrap().0);
-                let body = Arc::new(compile_function(
-                    "NATIVE-SEGMENT-ARGUMENTS", *params, *forms, &env, true, false,
-                ).unwrap());
+                let body = Arc::new(
+                    compile_function(
+                        "NATIVE-SEGMENT-ARGUMENTS",
+                        *params,
+                        *forms,
+                        &env,
+                        true,
+                        false,
+                    )
+                    .unwrap(),
+                );
                 // This test needs the caller alive while the builtin captures it.
                 // Production tail handoff correctly retires those native homes.
                 let code = if ordinary {
                     with_ordinary_non_tail_emission_for_test(|| TransferCode::compile(body))
                 } else {
                     TransferCode::compile_mapped_for_test(body)
-                }.expect("native argument fixture");
+                }
+                .expect("native argument fixture");
                 assert_eq!(code.ordinary_entry.is_some(), ordinary);
                 take_native_fallback_count();
-                egcl_rt::rooted!(snapshot = code.run(&[EgclVal::from_fixnum(42)], &mut env).unwrap());
+                egcl_rt::rooted!(
+                    snapshot = code.run(&[EgclVal::from_fixnum(42)], &mut env).unwrap()
+                );
                 assert_eq!(take_native_fallback_count(), 0);
                 // Captured names and arguments must survive retirement of the
                 // executable mapping and its debugger registration.
                 drop(code);
-                let row = list_to_vec(*snapshot).into_iter().map(list_to_vec)
-                    .find(|row| super::super::super::val_as_str(row[0]) == "NATIVE-SEGMENT-ARGUMENTS")
+                let row = list_to_vec(*snapshot)
+                    .into_iter()
+                    .map(list_to_vec)
+                    .find(|row| {
+                        super::super::super::val_as_str(row[0]) == "NATIVE-SEGMENT-ARGUMENTS"
+                    })
                     .expect("retained segment identity");
                 assert_eq!(row[2], if available { T } else { NIL });
                 if available {
@@ -136,7 +151,8 @@ mod tests {
                     .expect("compile real T2 collector");
                 install_t2_completion(T2Completion {
                     panicked: false,
-                    _permit: None, dependencies: Vec::new(),
+                    _permit: None,
+                    dependencies: Vec::new(),
                     sym: symbol,
                     generation,
                     artifact: Some(artifact),

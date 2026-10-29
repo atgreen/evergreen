@@ -153,9 +153,17 @@ pub(in crate::cli::bytecode) fn collection_stamp_address() -> usize {
 /// actuals, when that is `function`'s own code (not a wrapper's or a
 /// tree-walker closure's compiled object), with the symbol owning it.
 /// Selection may fill the table; it does not collect.
-pub(in crate::cli::bytecode) fn native_target(function: EgclVal, nargs: usize) -> Option<(u32, Rc<TransferCode>)> {
+pub(in crate::cli::bytecode) fn native_target(
+    function: EgclVal,
+    nargs: usize,
+) -> Option<(u32, Rc<TransferCode>)> {
     match lookup_or_fill(function, nargs)? {
-        Target::Native { code, function: callable, symbol, .. } if callable == function => Some((symbol, code)),
+        Target::Native {
+            code,
+            function: callable,
+            symbol,
+            ..
+        } if callable == function => Some((symbol, code)),
         _ => None,
     }
 }

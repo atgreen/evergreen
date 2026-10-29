@@ -21,9 +21,9 @@
 //! `call_compiled_entry` is the bridge from the host ABI to the compiler's
 //! register convention and is shared by the Linux and Windows cases.
 use super::*;
+use egcl_rt::jit::JitBuffer;
 #[cfg(windows)]
 use iced_x86::{Decoder, DecoderOptions, Mnemonic, OpKind, Register};
-use egcl_rt::jit::JitBuffer;
 #[cfg(windows)]
 use windows_sys::Win32::System::Diagnostics::Debug::*;
 
@@ -433,10 +433,14 @@ fn windows_t2_stack_probe_preserves_four_compiled_arguments() {
 #[cfg(target_os = "linux")]
 fn large_snapshot_fallback_probes_the_stack_pages() {
     use iced_x86::{Decoder, DecoderOptions, Mnemonic, Register};
-    let moves: Vec<_> = (0..1030).map(|index| (
-        FramedHome::Stack(index),
-        HomeMoveSrc::Home(FramedHome::Stack((index + 1) % 1030)),
-    )).collect();
+    let moves: Vec<_> = (0..1030)
+        .map(|index| {
+            (
+                FramedHome::Stack(index),
+                HomeMoveSrc::Home(FramedHome::Stack((index + 1) % 1030)),
+            )
+        })
+        .collect();
     let mut asm = Asm::new();
     parallel_home_move_snapshot(&mut asm, &moves);
     let bytes = asm.finish().unwrap();

@@ -2,13 +2,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
 //! Condition handles move, retain native queues during waits, and finalize.
-use std::sync::Arc;
-use std::time::Duration;
 use egcl_rt::sync::EgclCondVar;
 use egcl_stdlib::synchronization::{
     condition_notify, condition_variable_p, condition_wait, grab_mutex, make_condition_variable,
     make_mutex, release_mutex,
 };
+use std::sync::Arc;
+use std::time::Duration;
 
 #[test]
 fn condition_handle_moves_finalizes_and_serializes_without_native_pointer() {

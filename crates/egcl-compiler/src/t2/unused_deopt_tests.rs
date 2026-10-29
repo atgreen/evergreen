@@ -216,7 +216,10 @@ fn unused_deopt_elision_preserves_referenced_recovery_and_future_osr() {
             );
             let length = stdout
                 .lines()
-                .find_map(|line| line.split_once("PROVEN-CODE-BYTES ").map(|(_, value)| value))
+                .find_map(|line| {
+                    line.split_once("PROVEN-CODE-BYTES ")
+                        .map(|(_, value)| value)
+                })
                 .unwrap()
                 .parse::<usize>()
                 .unwrap();

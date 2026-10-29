@@ -24,7 +24,11 @@ fn deopt_scope_count_is_bounded_before_allocation() {
         // not require exhausting memory or constructing an invalid raw slice.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             materialize_t2_deopt_scopes(
-                count, words.len() as u64, words.as_ptr(), None, Some(Arc::clone(&metadata)),
+                count,
+                words.len() as u64,
+                words.as_ptr(),
+                None,
+                Some(Arc::clone(&metadata)),
             )
         }));
         match result {
@@ -35,7 +39,10 @@ fn deopt_scope_count_is_bounded_before_allocation() {
         assert_eq!(stack.fp(), before_fp);
         assert_eq!(stack.sp(), before_sp);
     }
-    assert!(panicked.is_empty(), "scope counts must reject without panicking: {panicked:?}");
+    assert!(
+        panicked.is_empty(),
+        "scope counts must reject without panicking: {panicked:?}"
+    );
 }
 
 #[test]
@@ -65,9 +72,14 @@ fn deopt_outer_frame_has_room_for_the_resumed_body() {
     let before_sp = stack.sp();
     let mut mismatches = Vec::new();
     for (capacity, accepted) in [(1, false), (2, true), (3, true)] {
-        let frame = stack.push_frame(
-            EgclVal::from_symbol_index(owner), std::ptr::null(), capacity, FLAG_CALL,
-        ).unwrap();
+        let frame = stack
+            .push_frame(
+                EgclVal::from_symbol_index(owner),
+                std::ptr::null(),
+                capacity,
+                FLAG_CALL,
+            )
+            .unwrap();
         let original = EgclVal::from_fixnum(17);
         unsafe { slot_set(frame, 0, original) };
         let frame_sp = stack.sp();
@@ -76,11 +88,21 @@ fn deopt_outer_frame_has_room_for_the_resumed_body() {
         // a second slot despite the empty saved operand stack.
         let words = [u64::from(owner), 0, 1, 0, EgclVal::from_fixnum(23).0];
         let result = materialize_t2_deopt_scopes(
-            1, words.len() as u64, words.as_ptr(), Some(frame), Some(Arc::clone(&metadata)),
+            1,
+            words.len() as u64,
+            words.as_ptr(),
+            Some(frame),
+            Some(Arc::clone(&metadata)),
         );
-        if result.is_ok() != accepted { mismatches.push(capacity); }
+        if result.is_ok() != accepted {
+            mismatches.push(capacity);
+        }
         if result.is_err() {
-            assert_eq!(unsafe { slot_get(frame, 0) }, original, "rejection preserves locals");
+            assert_eq!(
+                unsafe { slot_get(frame, 0) },
+                original,
+                "rejection preserves locals"
+            );
         }
         assert_eq!(stack.fp(), frame);
         assert_eq!(stack.sp(), frame_sp);
@@ -88,7 +110,10 @@ fn deopt_outer_frame_has_room_for_the_resumed_body() {
         assert_eq!(stack.fp(), before_fp);
         assert_eq!(stack.sp(), before_sp);
     }
-    assert!(mismatches.is_empty(), "incorrect outer-frame capacity acceptance: {mismatches:?}");
+    assert!(
+        mismatches.is_empty(),
+        "incorrect outer-frame capacity acceptance: {mismatches:?}"
+    );
 }
 
 #[test]
@@ -101,21 +126,41 @@ fn deopt_scope_chain_matches_call_continuations() {
     egcl_rt::rooted!(child_forms = reader::read_from_string("((+ x 1))").unwrap().0);
     let child_symbol = egcl_rt::symbols::intern("DEOPT-CHAIN-CHILD");
     let child = Arc::new(
-        compile_function("DEOPT-CHAIN-CHILD", *params, *child_forms, &env, false, false)
-            .expect("compile retained child"),
+        compile_function(
+            "DEOPT-CHAIN-CHILD",
+            *params,
+            *child_forms,
+            &env,
+            false,
+            false,
+        )
+        .expect("compile retained child"),
     );
     let _child_root = egcl_rt::CrossThreadRoot::new(T2InstalledBodies {
         bodies: vec![Arc::clone(&child)],
     });
-    egcl_rt::rooted!(parent_forms = reader::read_from_string("((+ 3 (deopt-chain-child x)))").unwrap().0);
+    egcl_rt::rooted!(
+        parent_forms = reader::read_from_string("((+ 3 (deopt-chain-child x)))")
+            .unwrap()
+            .0
+    );
     let parent_symbol = egcl_rt::symbols::intern("DEOPT-CHAIN-PARENT");
     let parent = Arc::new(
-        compile_function("DEOPT-CHAIN-PARENT", *params, *parent_forms, &env, false, false)
-            .expect("compile retained parent"),
+        compile_function(
+            "DEOPT-CHAIN-PARENT",
+            *params,
+            *parent_forms,
+            &env,
+            false,
+            false,
+        )
+        .expect("compile retained parent"),
     );
-    let call_pc = parent.code.iter().position(|op| {
-        matches!(op, Instr::CallNamed { sym, nargs: 1 } if *sym == child_symbol)
-    }).expect("parent must call the retained child") as u64;
+    let call_pc = parent
+        .code
+        .iter()
+        .position(|op| matches!(op, Instr::CallNamed { sym, nargs: 1 } if *sym == child_symbol))
+        .expect("parent must call the retained child") as u64;
     assert_eq!(parent.n_locals, 1);
     assert_eq!(child.n_locals, 1);
     assert!(parent.max_stack >= 2);
@@ -127,27 +172,43 @@ fn deopt_scope_chain_matches_call_continuations() {
         Instr::Const(0),
         Instr::Const(1),
         Instr::Br(4),
-        Instr::CallNamed { sym: child_symbol, nargs: 1 },
-        Instr::CallNamed { sym: egcl_rt::symbols::intern("+"), nargs: 2 },
+        Instr::CallNamed {
+            sym: child_symbol,
+            nargs: 1,
+        },
+        Instr::CallNamed {
+            sym: egcl_rt::symbols::intern("+"),
+            nargs: 2,
+        },
         Instr::Return,
     ];
     skipped.max_stack = 2;
     let skipped = Arc::new(skipped);
     let depths = verified_operand_stack_depths(&skipped).expect("valid branch-over-call bytecode");
     assert_eq!(depths[3], None, "the alleged suspended call is unreachable");
-    assert_eq!(depths[4], Some(2), "its successor is reachable by the branch");
+    assert_eq!(
+        depths[4],
+        Some(2),
+        "its successor is reachable by the branch"
+    );
     let metadata = Arc::new(T2InstalledMetadata {
         speculations: Vec::new(),
         cold_guesses: Vec::new(),
         _roots: egcl_rt::CrossThreadRoot::new(T2InstalledBodies {
-            bodies: vec![Arc::clone(&parent), Arc::clone(&child), Arc::clone(&skipped)],
+            bodies: vec![
+                Arc::clone(&parent),
+                Arc::clone(&child),
+                Arc::clone(&skipped),
+            ],
         }),
         deopt_bodies: [
             (parent_symbol, Arc::clone(&parent)),
             (child_symbol, Arc::clone(&child)),
             (other_symbol, Arc::clone(&child)),
             (skipped_symbol, skipped),
-        ].into_iter().collect(),
+        ]
+        .into_iter()
+        .collect(),
     });
     let scope = |owner: u32, bcp, values: &[EgclVal]| {
         let mut words = vec![u64::from(owner), bcp, 1, values.len() as u64];
@@ -172,12 +233,26 @@ fn deopt_scope_chain_matches_call_continuations() {
     unreachable_call.extend(scope(child_symbol, 0, &[]));
     let cases = [
         ("valid retained chain", valid, 2, true),
-        ("valid post-call root", scope(parent_symbol, call_pc + 1, &[three, EgclVal::from_fixnum(18)]), 1, true),
+        (
+            "valid post-call root",
+            scope(
+                parent_symbol,
+                call_pc + 1,
+                &[three, EgclVal::from_fixnum(18)],
+            ),
+            1,
+            true,
+        ),
         ("wrong call target", wrong_target, 2, false),
         ("parent not after call", wrong_parent_pc, 2, false),
         ("wrong pending parent depth", wrong_parent_depth, 2, false),
         ("wrong child guard depth", wrong_child_depth, 2, false),
-        ("wrong root guard depth", scope(child_symbol, 0, &[three]), 1, false),
+        (
+            "wrong root guard depth",
+            scope(child_symbol, 0, &[three]),
+            1,
+            false,
+        ),
         ("unreachable suspended call", unreachable_call, 2, false),
         ("trailing word after valid chain", trailing_word, 2, false),
     ];
@@ -187,9 +262,15 @@ fn deopt_scope_chain_matches_call_continuations() {
     let mut mismatches = Vec::new();
     for (name, words, count, accepted) in cases {
         let result = materialize_t2_deopt_scopes(
-            count, words.len() as u64, words.as_ptr(), None, Some(Arc::clone(&metadata)),
+            count,
+            words.len() as u64,
+            words.as_ptr(),
+            None,
+            Some(Arc::clone(&metadata)),
         );
-        if result.is_ok() != accepted { mismatches.push(name); }
+        if result.is_ok() != accepted {
+            mismatches.push(name);
+        }
         if let Ok((scopes, retained)) = result {
             if accepted {
                 assert_eq!(
@@ -199,13 +280,18 @@ fn deopt_scope_chain_matches_call_continuations() {
                 );
             } else {
                 // Malformed activations are never executed.
-                for _ in scopes { stack.pop_frame(); }
+                for _ in scopes {
+                    stack.pop_frame();
+                }
             }
         }
         assert_eq!(stack.fp(), before_fp, "{name}: frame cleanup");
         assert_eq!(stack.sp(), before_sp, "{name}: stack cleanup");
     }
-    assert!(mismatches.is_empty(), "incorrect continuation acceptance: {mismatches:?}");
+    assert!(
+        mismatches.is_empty(),
+        "incorrect continuation acceptance: {mismatches:?}"
+    );
 }
 
 #[test]
@@ -215,14 +301,22 @@ fn deopt_scope_headers_match_retained_bodies() {
     egcl_rt::rooted_ref!(_env = &mut env);
     read_eval_all_env("(defun deopt-header-target (x) x)", &mut env).unwrap();
     egcl_rt::rooted!(params = reader::read_from_string("(x)").unwrap().0);
-    egcl_rt::rooted!(forms = reader::read_from_string("((deopt-header-target x))").unwrap().0);
+    egcl_rt::rooted!(
+        forms = reader::read_from_string("((deopt-header-target x))")
+            .unwrap()
+            .0
+    );
     let symbol = egcl_rt::symbols::intern("DEOPT-HEADER-OWNER");
     let body = Arc::new(
         compile_function("DEOPT-HEADER-OWNER", *params, *forms, &env, false, false).unwrap(),
     );
     assert_eq!(body.n_locals, 1);
-    let after_call = body.code.iter().position(|op| matches!(op, Instr::CallNamed { .. }))
-        .expect("fixture must have a suspended call") as u64 + 1;
+    let after_call = body
+        .code
+        .iter()
+        .position(|op| matches!(op, Instr::CallNamed { .. }))
+        .expect("fixture must have a suspended call") as u64
+        + 1;
     let metadata = Arc::new(T2InstalledMetadata {
         speculations: Vec::new(),
         cold_guesses: Vec::new(),
@@ -243,13 +337,38 @@ fn deopt_scope_headers_match_retained_bodies() {
     valid_parent.extend(scope(owner, 0, 1, 0));
     let cases = [
         ("valid root", scope(owner, 0, 1, 0), 1, true),
-        ("header-shaped but mismatched callee", valid_parent, 2, false),
+        (
+            "header-shaped but mismatched callee",
+            valid_parent,
+            2,
+            false,
+        ),
         ("missing local", scope(owner, 0, 0, 0), 1, false),
         ("extra local", scope(owner, 0, 2, 0), 1, false),
-        ("truncated function id", scope(owner + (1u64 << 32), 0, 1, 0), 1, false),
-        ("truncated resume position", scope(owner, 1u64 << 32, 1, 0), 1, false),
-        ("resume past body", scope(owner, body.code.len() as u64, 1, 0), 1, false),
-        ("excess operand depth", scope(owner, 0, 1, u64::from(body.max_stack) + 1), 1, false),
+        (
+            "truncated function id",
+            scope(owner + (1u64 << 32), 0, 1, 0),
+            1,
+            false,
+        ),
+        (
+            "truncated resume position",
+            scope(owner, 1u64 << 32, 1, 0),
+            1,
+            false,
+        ),
+        (
+            "resume past body",
+            scope(owner, body.code.len() as u64, 1, 0),
+            1,
+            false,
+        ),
+        (
+            "excess operand depth",
+            scope(owner, 0, 1, u64::from(body.max_stack) + 1),
+            1,
+            false,
+        ),
         ("no room for child result", full_parent, 2, false),
     ];
     let stack = egcl_rt::current_stack();
@@ -260,18 +379,27 @@ fn deopt_scope_headers_match_retained_bodies() {
         // Never resume malformed activations. All writes are into fresh frames
         // allocated from the retained body, so this probes rejection safely.
         let result = materialize_t2_deopt_scopes(
-            count, words.len() as u64, words.as_ptr(), None, Some(Arc::clone(&metadata)),
+            count,
+            words.len() as u64,
+            words.as_ptr(),
+            None,
+            Some(Arc::clone(&metadata)),
         );
         if result.is_ok() != accepted {
             mismatches.push(name);
         }
         if let Ok((scopes, _)) = result {
-            for _ in scopes { stack.pop_frame(); }
+            for _ in scopes {
+                stack.pop_frame();
+            }
         }
         assert_eq!(stack.fp(), parent, "{name}: frame rollback");
         assert_eq!(stack.sp(), before_sp, "{name}: stack rollback");
     }
-    assert!(mismatches.is_empty(), "incorrect frame-header acceptance: {mismatches:?}");
+    assert!(
+        mismatches.is_empty(),
+        "incorrect frame-header acceptance: {mismatches:?}"
+    );
 }
 
 #[test]
@@ -283,8 +411,15 @@ fn malformed_inner_deopt_scope_preserves_outer_frame() {
     egcl_rt::rooted!(forms = reader::read_from_string("(x)").unwrap().0);
     let symbol = egcl_rt::symbols::intern("DEOPT-VALIDATE-BEFORE-WRITE");
     let body = Arc::new(
-        compile_function("DEOPT-VALIDATE-BEFORE-WRITE", *params, *forms, &env, false, false)
-            .unwrap(),
+        compile_function(
+            "DEOPT-VALIDATE-BEFORE-WRITE",
+            *params,
+            *forms,
+            &env,
+            false,
+            false,
+        )
+        .unwrap(),
     );
     assert_eq!(body.n_locals, 1);
     let metadata = Arc::new(T2InstalledMetadata {
@@ -298,15 +433,34 @@ fn malformed_inner_deopt_scope_preserves_outer_frame() {
     let stack = egcl_rt::current_stack();
     let parent = stack.fp();
     let frame = stack
-        .push_frame(EgclVal::from_symbol_index(symbol), std::ptr::null(), body.num_slots(), FLAG_CALL)
+        .push_frame(
+            EgclVal::from_symbol_index(symbol),
+            std::ptr::null(),
+            body.num_slots(),
+            FLAG_CALL,
+        )
         .unwrap();
     let original = EgclVal::from_fixnum(17);
     unsafe { slot_set(frame, 0, original) };
     // The second scope is structurally complete but has no retained body.
     let absent = egcl_rt::symbols::intern("DEOPT-MISSING-INNER-BODY");
-    let words = [u64::from(symbol), 0, 1, 0, NIL.0, u64::from(absent), 0, 0, 0];
+    let words = [
+        u64::from(symbol),
+        0,
+        1,
+        0,
+        NIL.0,
+        u64::from(absent),
+        0,
+        0,
+        0,
+    ];
     let result = materialize_t2_deopt_scopes(
-        2, words.len() as u64, words.as_ptr(), Some(frame), Some(metadata),
+        2,
+        words.len() as u64,
+        words.as_ptr(),
+        Some(frame),
+        Some(metadata),
     );
     let after = unsafe { slot_get(frame, 0) };
     let restored_fp = stack.fp();
@@ -314,7 +468,10 @@ fn malformed_inner_deopt_scope_preserves_outer_frame() {
     assert!(result.is_err(), "an unknown retained body must be rejected");
     assert_eq!(restored_fp, frame);
     assert_eq!(stack.fp(), parent);
-    assert_eq!(after, original, "reject the whole stream before writing outer slots");
+    assert_eq!(
+        after, original,
+        "reject the whole stream before writing outer slots"
+    );
 }
 
 #[test]
@@ -362,7 +519,11 @@ fn native_v2_optimized_child_guard_returns_and_escapes_without_replay() {
         egcl_rt::rooted!(args = vec![arena_cons(T, NIL), EgclVal::from_single_float(1.5), fail]);
         let address = args[0].to_raw();
         egcl_rt::rooted!(result = caller.run(&args, &mut env).unwrap());
-        assert_eq!(take_nested_entries(), 0, "ordinary child uses its own segment boundary");
+        assert_eq!(
+            take_nested_entries(),
+            0,
+            "ordinary child uses its own segment boundary"
+        );
         assert_eq!(mapped.deopt_count(), deopts + 1);
         assert_eq!(*result, args[0]);
         assert_ne!(args[0].to_raw(), address, "child T0 must move caller roots");
@@ -398,8 +559,14 @@ fn install_guarded_child(name: &str, params: &str, forms: &str, env: &Env) -> Rc
     registry_put(symbol, Arc::clone(&body));
     let code = TransferCode::compile(Arc::clone(&body)).expect("optimized mapped child");
     assert!(code.has_deopt, "{:?}", body.code);
-    assert!(code.ordinary_entry.is_some(), "guarded child uses the ordinary register ABI");
-    assert!(code.mapped_entry().is_none(), "no legacy child entry is available");
+    assert!(
+        code.ordinary_entry.is_some(),
+        "guarded child uses the ordinary register ABI"
+    );
+    assert!(
+        code.mapped_entry().is_none(),
+        "no legacy child entry is available"
+    );
     let installed =
         super::super::super::native_transfer_entry::install_baseline_code(symbol, code).unwrap();
     mark_fresh_promotion(symbol);
@@ -422,9 +589,17 @@ fn native_v2_published_t2_child_uses_guards_and_relearns_numeric_phase() {
     egcl_rt::rooted_ref!(_env = &mut env);
     read_eval_all_env("(defun child-phase (x) (+ x 1))", &mut env).unwrap();
     install_t2("CHILD-PHASE", "(x)", "((+ x 1))", &env);
-    let installed = NATIVE_REGISTRY.with(|registry| registry.borrow()
-        .get(&egcl_rt::symbols::find_index("CHILD-PHASE").unwrap()).cloned()).unwrap();
-    let NativeCodeStorage::Mapped(owner) = &installed._storage else { unreachable!() };
+    let installed = NATIVE_REGISTRY
+        .with(|registry| {
+            registry
+                .borrow()
+                .get(&egcl_rt::symbols::find_index("CHILD-PHASE").unwrap())
+                .cloned()
+        })
+        .unwrap();
+    let NativeCodeStorage::Mapped(owner) = &installed._storage else {
+        unreachable!()
+    };
     assert!(owner.ordinary_entry.is_some() && owner.mapped_entry().is_none());
     let caller = compile_caller("(x)", "((catch :phase (child-phase x)))", &env);
     caller.run(&[EgclVal::from_fixnum(1)], &mut env).unwrap();
@@ -436,7 +611,11 @@ fn native_v2_published_t2_child_uses_guards_and_relearns_numeric_phase() {
             .unwrap(),
         EgclVal::from_single_float(2.5)
     );
-    assert_eq!(take_nested_entries(), 0, "ordinary child uses its own segment boundary");
+    assert_eq!(
+        take_nested_entries(),
+        0,
+        "ordinary child uses its own segment boundary"
+    );
     assert_eq!(
         DEOPT_COUNT.load(std::sync::atomic::Ordering::Relaxed),
         before + 1,
@@ -547,7 +726,8 @@ fn native_v2_installed_child_rebuilds_failed_guard_version() {
     let symbol = egcl_rt::symbols::intern("CHILD-INSTALLED-PHASE");
     // Guard retirement queues its replacement; wait for owner-side publication
     // without executing the Lisp body again.
-    let replacement = background_t1::wait(symbol).expect("publish replacement after guard retirement");
+    let replacement =
+        background_t1::wait(symbol).expect("publish replacement after guard retirement");
     let NativeCodeStorage::Mapped(mapped) = &replacement._storage else {
         panic!("mapped replacement")
     };
@@ -594,7 +774,11 @@ fn native_v2_child_guard_signals_with_live_parent_restart() {
     take_nested_entries();
     egcl_rt::rooted!(result = caller.run(&args, &mut env).unwrap());
     assert_eq!(*result, args[0]);
-    assert_eq!(take_nested_entries(), 0, "ordinary child uses its own segment boundary");
+    assert_eq!(
+        take_nested_entries(),
+        0,
+        "ordinary child uses its own segment boundary"
+    );
     assert_eq!(mapped.deopt_count(), 1);
     assert_ne!(args[0].to_raw(), before);
     assert_eq!(env.mv.len(), 2);
@@ -651,7 +835,11 @@ fn native_v2_child_redefinition_before_guard_keeps_original_result() {
             .unwrap(),
         EgclVal::from_single_float(2.5)
     );
-    assert_eq!(take_nested_entries(), 0, "ordinary child uses its own segment boundary");
+    assert_eq!(
+        take_nested_entries(),
+        0,
+        "ordinary child uses its own segment boundary"
+    );
     assert_eq!(old.deopt_count(), 1);
     assert_eq!(env.mv.len(), 2);
     assert_eq!(cp(env.mv[1]), (EgclVal::from_single_float(2.5), NIL));
@@ -663,9 +851,15 @@ fn native_v2_child_redefinition_before_guard_keeps_original_result() {
         read_eval_all_env("(guard-old-child 1.5 nil)", &mut env).unwrap(),
         EgclVal::from_single_float(901.5)
     );
-    assert!(old_maps.upgrade().is_some(), "redefinition must retain old code maps");
+    assert!(
+        old_maps.upgrade().is_some(),
+        "redefinition must retain old code maps"
+    );
     drop(old);
-    assert!(old_maps.upgrade().is_none(), "maps retire with their code owner");
+    assert!(
+        old_maps.upgrade().is_none(),
+        "maps retire with their code owner"
+    );
 }
 
 #[test]

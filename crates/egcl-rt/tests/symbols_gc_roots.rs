@@ -9,9 +9,9 @@
 //! takes a process-global lock so they run one at a time and no parallel test in
 //! this binary allocates underneath a collection.
 
-use std::sync::{Mutex, OnceLock};
 use egcl_rt::object::type_id;
-use egcl_rt::value::{NIL, EgclVal};
+use egcl_rt::value::{EgclVal, NIL};
+use std::sync::{Mutex, OnceLock};
 
 fn lock() -> &'static Mutex<()> {
     static L: OnceLock<Mutex<()>> = OnceLock::new();

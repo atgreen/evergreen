@@ -10,9 +10,9 @@ use crate::t2::ir::{Inst, Value, ValueRepresentation};
 use crate::t2::x64_frame::{FrameValue, FrameValueLocation, ValueHome};
 use crate::t2::x64_unwind::SYSV_PRESERVED_REGISTERS;
 use crate::t2::x64_value_maps::{NativeFrameLayout, NativeValueArea, NativeValueLocation};
+use egcl_rt::EgclVal;
 use egcl_rt::gc::TraceHostRoots;
 use egcl_rt::jit::JitBuffer;
-use egcl_rt::EgclVal;
 use std::cell::Cell;
 
 struct Owner {

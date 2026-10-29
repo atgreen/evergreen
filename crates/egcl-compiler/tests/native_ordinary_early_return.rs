@@ -154,7 +154,8 @@ fn emit() -> FramedCode {
         &f,
         OrdinaryLispEntryOptions {
             arity: 1,
-            arity_error_veneer: wrong_arity as *const () as u64, binding: None,
+            arity_error_veneer: wrong_arity as *const () as u64,
+            binding: None,
         },
         &[],
         OrdinaryCallFlags {

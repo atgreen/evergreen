@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
 use egcl_rt::WriteBarrier;
 use egcl_rt::gc::{
     Allocator, Collector, GcConfig, HeapAllocator, HeapCollector, SatbCardBarrier, WeakPointer,
@@ -11,6 +9,8 @@ use egcl_rt::gc::{
     set_gc_marking_in_progress, walk_heap,
 };
 use egcl_rt::value::EgclVal;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 fn gc_config() -> GcConfig {
     GcConfig {

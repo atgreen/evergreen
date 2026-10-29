@@ -299,5 +299,4 @@ mod tests {
                 .any(|&i| matches!(ir.inst(i).aux, AuxData::OpaqueCallTarget(s) if s == symbol))
         );
     }
-
 }

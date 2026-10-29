@@ -8,7 +8,7 @@
 //! so every test is expected to fail (panic) until the real code is written.
 
 use egcl_rt::error::EgclError;
-use egcl_rt::value::{NIL, EgclVal};
+use egcl_rt::value::{EgclVal, NIL};
 use egcl_stdlib::pathnames::*;
 use egcl_stdlib::streams;
 
@@ -515,7 +515,7 @@ fn directory_traverses_exact_wildcard_levels() {
 #[test]
 fn probe_file_accepts_open_and_closed_file_streams() {
     use egcl_rt::value::T;
-    use egcl_stdlib::streams::{close, open, ExternalFormat, StreamDirection};
+    use egcl_stdlib::streams::{ExternalFormat, StreamDirection, close, open};
     let file = temp_path("probe_file_stream");
     std::fs::write(&file, "fixture").unwrap();
     for direction in [

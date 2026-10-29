@@ -154,10 +154,7 @@ fn division_in_a_hot_loop_agrees_at_every_tier() {
               (digit-sum 0) (digit-sum 123456789) (digit-sum 999999999))
       (format t "COLLATZ ~s ~s ~s~%" (collatz 1) (collatz 27) (collatz 97))
     "#;
-    agrees_at_every_tier(
-        program,
-        &["DIGITS 0 45 81", "COLLATZ 0 111 118"],
-    );
+    agrees_at_every_tier(program, &["DIGITS 0 45 81", "COLLATZ 0 111 118"]);
 }
 
 /// Single-float comparisons, including the unordered case that must deopt

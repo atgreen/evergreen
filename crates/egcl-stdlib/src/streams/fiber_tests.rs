@@ -3,12 +3,12 @@
 
 //! Stream ownership must survive a parked operation without blocking its carrier.
 use super::*;
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
 use egcl_rt::sync::EgclSemaphore;
 use egcl_rt::thread::{FiberState, fiber_state, make_fiber};
 use egcl_rt::{SchedulerConfig, SchedulerGroup};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
 static FORMAT: AtomicBool = AtomicBool::new(false);
 static STREAM: AtomicU64 = AtomicU64::new(0);

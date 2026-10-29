@@ -37,8 +37,14 @@ fn native_v2_optimized_recursive_overflow_resumes_without_replay() {
     let code = TransferCode::compile(body).expect("compile guarded segment");
     assert!(code.ordinary_entry.is_some() && code.mapped_entry().is_none());
     let installed = native_transfer_entry::install_baseline_code(symbol, code).unwrap();
-    publish_native(symbol, egcl_rt::symbols::symbol_function(symbol), &installed);
-    let NativeCodeStorage::Mapped(code) = &installed._storage else { unreachable!() };
+    publish_native(
+        symbol,
+        egcl_rt::symbols::symbol_function(symbol),
+        &installed,
+    );
+    let NativeCodeStorage::Mapped(code) = &installed._storage else {
+        unreachable!()
+    };
     assert!(
         code.has_deopt,
         "arithmetic must use native speculative guards"

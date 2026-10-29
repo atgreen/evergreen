@@ -27,6 +27,9 @@ fn mod_types_accept_bignum_objects_and_moduli() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(output.status.success(), "{tier}: {stdout}\n{stderr}");
-        assert!(stdout.contains("RESULT (T NIL T NIL T NIL NIL NIL NIL)"), "{tier}: {stdout}\n{stderr}");
+        assert!(
+            stdout.contains("RESULT (T NIL T NIL T NIL NIL NIL NIL)"),
+            "{tier}: {stdout}\n{stderr}"
+        );
     }
 }

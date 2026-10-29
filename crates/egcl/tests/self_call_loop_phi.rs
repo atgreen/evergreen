@@ -62,7 +62,10 @@ fn tak_reaches_t2_with_platform_root_metadata() {
              (egcl-ext:function-tier 'tak) (- (egcl-ext:deopt-count) before)))"
     );
     let (stdout, log) = run(&program, &[("EGCL_T2_LOG", "stderr")]);
-    assert!(stdout.contains("RESULT 7 TIER 2 DEOPTS 0"), "{stdout}\n{log}");
+    assert!(
+        stdout.contains("RESULT 7 TIER 2 DEOPTS 0"),
+        "{stdout}\n{log}"
+    );
     if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
         assert!(
             log.lines().any(|line| line.contains(

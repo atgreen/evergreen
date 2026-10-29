@@ -64,10 +64,8 @@ fn check(tier: &str) {
         // every MV effect natively (bliss-6z1hh). ppc64le admits it at T2 too,
         // through its framed emitter's portable adapter; the remaining
         // checked-ABI targets still decline the optimizing tier and run T1.
-        let t2_declines_values_to_list = !cfg!(all(
-            target_arch = "x86_64",
-            target_os = "linux"
-        )) && !cfg!(all(target_arch = "powerpc64", target_endian = "little"));
+        let t2_declines_values_to_list = !cfg!(all(target_arch = "x86_64", target_os = "linux"))
+            && !cfg!(all(target_arch = "powerpc64", target_endian = "little"));
         let installed = if tier == "t2" && t2_declines_values_to_list {
             "T1"
         } else {

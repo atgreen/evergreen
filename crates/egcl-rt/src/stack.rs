@@ -875,8 +875,9 @@ pub fn native_stack_limit_addr() -> u64 {
 /// may retain the result while its execution remains alive: migrating a fiber
 /// changes its carrier, not its native stack allocation.
 pub fn current_native_stack_limit() -> u64 {
-    if let Some((low, high)) = crate::thread::current_fiber()
-        .and_then(|fiber| fiber.native_stack_bounds()) {
+    if let Some((low, high)) =
+        crate::thread::current_fiber().and_then(|fiber| fiber.native_stack_bounds())
+    {
         return low.saturating_add(128 * 1024).min(high) as u64;
     }
     #[cfg(target_os = "linux")]
@@ -918,7 +919,9 @@ fn linux_native_stack_limit() -> Option<u64> {
     if unsafe { libc::syscall(libc::SYS_gettid) == libc::getpid() as libc::c_long } {
         // musl reports only the main stack's currently mapped pages. Unlike a
         // pthread reservation, this mapping grows down to RLIMIT_STACK.
-        let limit = crate::syscall::getrlimit(crate::syscall::RLIMIT_STACK).ok()?.rlim_cur;
+        let limit = crate::syscall::getrlimit(crate::syscall::RLIMIT_STACK)
+            .ok()?
+            .rlim_cur;
         let configured = NATIVE_STACK_LIMIT.load(std::sync::atomic::Ordering::Acquire);
         if limit == crate::syscall::RLIM_INFINITY {
             return main_native_stack_limit(probe, high, limit, configured);
@@ -938,7 +941,12 @@ fn linux_native_stack_limit() -> Option<u64> {
 }
 
 #[cfg(target_os = "linux")]
-fn main_native_stack_limit(probe: usize, high: usize, soft_limit: u64, configured: u64) -> Option<u64> {
+fn main_native_stack_limit(
+    probe: usize,
+    high: usize,
+    soft_limit: u64,
+    configured: u64,
+) -> Option<u64> {
     if soft_limit == crate::syscall::RLIM_INFINITY {
         // An unlimited grow-down stack has no finite OS lower bound. Preserve
         // the CLI's deliberate main-thread cap; without one, fail closed.
@@ -956,57 +964,90 @@ mod native_stack_limit_tests {
         let probe = high - 4096;
         let limit = super::main_native_stack_limit(probe, high, 8 * 1024 * 1024, 0).unwrap();
         assert_eq!(limit, (high - 8 * 1024 * 1024 + 128 * 1024) as u64);
-        assert!(limit < (high - 128 * 1024) as u64, "grow below initial musl mapping");
+        assert!(
+            limit < (high - 128 * 1024) as u64,
+            "grow below initial musl mapping"
+        );
         assert!(limit < probe as u64);
     }
 
     #[test]
     fn unlimited_main_stack_requires_a_valid_configured_cap() {
         let unlimited = crate::syscall::RLIM_INFINITY;
-        assert_eq!(super::main_native_stack_limit(1000, 1100, unlimited, 500), Some(500));
-        assert_eq!(super::main_native_stack_limit(1000, 1100, unlimited, 0), None);
-        assert_eq!(super::main_native_stack_limit(1000, 1100, unlimited, 1000), None);
-        assert_eq!(super::main_native_stack_limit(1000, 1100, unlimited, 1200), None);
+        assert_eq!(
+            super::main_native_stack_limit(1000, 1100, unlimited, 500),
+            Some(500)
+        );
+        assert_eq!(
+            super::main_native_stack_limit(1000, 1100, unlimited, 0),
+            None
+        );
+        assert_eq!(
+            super::main_native_stack_limit(1000, 1100, unlimited, 1000),
+            None
+        );
+        assert_eq!(
+            super::main_native_stack_limit(1000, 1100, unlimited, 1200),
+            None
+        );
     }
 
     #[test]
     fn worker_limits_belong_to_their_actual_stack_reservations() {
-        let workers: Vec<_> = [512 * 1024, 2 * 1024 * 1024].into_iter().map(|size| {
-            std::thread::Builder::new().stack_size(size).spawn(move || {
-                let local = 0u64;
-                let probe = &local as *const _ as u64;
-                let limit = super::current_native_stack_limit();
-                let mut attributes = std::mem::MaybeUninit::<libc::pthread_attr_t>::uninit();
-                assert_eq!(
-                    unsafe {
-                        libc::pthread_getattr_np(libc::pthread_self(), attributes.as_mut_ptr())
-                    },
-                    0
-                );
-                let mut attributes = unsafe { attributes.assume_init() };
-                let mut base = std::ptr::null_mut();
-                let mut actual_size = 0;
-                assert_eq!(
-                    unsafe {
-                        libc::pthread_attr_getstack(&attributes, &mut base, &mut actual_size)
-                    },
-                    0
-                );
-                assert_eq!(unsafe { libc::pthread_attr_destroy(&mut attributes) }, 0);
-                assert!(limit < probe, "fresh worker must have native call headroom");
-                // pthreads may reuse a larger cached reservation than requested.
-                // Validate ownership and headroom against the actual allocation.
-                let low = base as usize;
-                let high = low.checked_add(actual_size).unwrap();
-                assert!((low..high).contains(&(probe as usize)));
-                assert_eq!(
-                    limit,
-                    low.saturating_add(128 * 1024).min(high) as u64,
-                    "limit must belong to this worker's actual reservation"
-                );
-                assert_eq!(limit, super::current_native_stack_limit(), "cached bounds are stable");
-            }).unwrap()
-        }).collect();
+        let workers: Vec<_> = [512 * 1024, 2 * 1024 * 1024]
+            .into_iter()
+            .map(|size| {
+                std::thread::Builder::new()
+                    .stack_size(size)
+                    .spawn(move || {
+                        let local = 0u64;
+                        let probe = &local as *const _ as u64;
+                        let limit = super::current_native_stack_limit();
+                        let mut attributes =
+                            std::mem::MaybeUninit::<libc::pthread_attr_t>::uninit();
+                        assert_eq!(
+                            unsafe {
+                                libc::pthread_getattr_np(
+                                    libc::pthread_self(),
+                                    attributes.as_mut_ptr(),
+                                )
+                            },
+                            0
+                        );
+                        let mut attributes = unsafe { attributes.assume_init() };
+                        let mut base = std::ptr::null_mut();
+                        let mut actual_size = 0;
+                        assert_eq!(
+                            unsafe {
+                                libc::pthread_attr_getstack(
+                                    &attributes,
+                                    &mut base,
+                                    &mut actual_size,
+                                )
+                            },
+                            0
+                        );
+                        assert_eq!(unsafe { libc::pthread_attr_destroy(&mut attributes) }, 0);
+                        assert!(limit < probe, "fresh worker must have native call headroom");
+                        // pthreads may reuse a larger cached reservation than requested.
+                        // Validate ownership and headroom against the actual allocation.
+                        let low = base as usize;
+                        let high = low.checked_add(actual_size).unwrap();
+                        assert!((low..high).contains(&(probe as usize)));
+                        assert_eq!(
+                            limit,
+                            low.saturating_add(128 * 1024).min(high) as u64,
+                            "limit must belong to this worker's actual reservation"
+                        );
+                        assert_eq!(
+                            limit,
+                            super::current_native_stack_limit(),
+                            "cached bounds are stable"
+                        );
+                    })
+                    .unwrap()
+            })
+            .collect();
         for worker in workers {
             worker.join().unwrap();
         }

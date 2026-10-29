@@ -63,12 +63,14 @@ fn dwarf_argument_homes_distinguish_missing_and_zero_arguments() {
     use egcl_rt::jit_debug::NativeArguments;
     if egcl_rt::jit_debug::managed_entry_register().is_none() {
         let mut buffer = JitBuffer::new(&[0; 16]).unwrap();
-        assert!(buffer
-            .install_debug_info_with_arguments(
-                "UNSUPPORTED-ABI",
-                Some(&NativeArguments { parameters: vec![] }),
-            )
-            .is_err());
+        assert!(
+            buffer
+                .install_debug_info_with_arguments(
+                    "UNSUPPORTED-ABI",
+                    Some(&NativeArguments { parameters: vec![] }),
+                )
+                .is_err()
+        );
         return;
     }
     for (parameters, expected) in [

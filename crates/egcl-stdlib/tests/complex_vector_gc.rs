@@ -18,7 +18,7 @@
 //! which is why the same code path looks clean in a long-running REPL).
 
 use egcl_rt::gc::{GcConfig, init_heap};
-use egcl_rt::value::{NIL, EgclVal};
+use egcl_rt::value::{EgclVal, NIL};
 
 fn gc_config() -> GcConfig {
     GcConfig {

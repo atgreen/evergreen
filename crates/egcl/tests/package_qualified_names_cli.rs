@@ -47,15 +47,13 @@ fn run(program: &str) -> String {
 /// in another package, then an ordinary one, then instantiating the ordinary one.
 #[test]
 fn a_foreign_condition_named_error_does_not_break_make_condition() {
-    let stdout = run(
-        r#"
+    let stdout = run(r#"
         (defpackage "KLIZ" (:use "COMMON-LISP") (:shadow "ERROR"))
         (eval (read-from-string
                "(define-condition kliz::error (cl:error) ((k :initarg :k)))"))
         (define-condition kliz-later (error) ((k :initarg :k)))
         (format t "MADE ~a~%" (typep (make-condition 'kliz-later :k 5) 'kliz-later))
-        "#,
-    );
+        "#);
     assert_eq!(
         stdout
             .lines()
@@ -69,8 +67,7 @@ fn a_foreign_condition_named_error_does_not_break_make_condition() {
 /// the hierarchy — and COMMON-LISP's is untouched.
 #[test]
 fn each_packages_type_of_a_shared_bare_name_stays_its_own() {
-    let stdout = run(
-        r#"
+    let stdout = run(r#"
         (defpackage "KLIZ2" (:use "COMMON-LISP") (:shadow "ERROR" "LIST"))
         (eval (read-from-string "(progn
           (define-condition kliz2::error (cl:error) ((k :initarg :k :reader kliz2::k)))
@@ -88,8 +85,7 @@ fn each_packages_type_of_a_shared_bare_name_stays_its_own() {
                  ;; The same for a plain DEFCLASS, which is the other registry.
                  (and (find-class 'cl:list) (typep '(1 2) 'cl:list))
                  (not (eq (find-class 'kliz2::list) (find-class 'cl:list)))))
-        "#,
-    );
+        "#);
     assert_eq!(
         stdout
             .lines()
@@ -109,8 +105,7 @@ fn each_packages_type_of_a_shared_bare_name_stays_its_own() {
 /// clause.
 #[test]
 fn a_handler_catches_only_the_type_it_named() {
-    let stdout = run(
-        r#"
+    let stdout = run(r#"
         (defpackage "KLIZ4A" (:use "COMMON-LISP") (:shadow "ERROR"))
         (defpackage "KLIZ4B" (:use "COMMON-LISP") (:shadow "ERROR"))
         (eval (read-from-string "(progn
@@ -130,8 +125,7 @@ fn a_handler_catches_only_the_type_it_named() {
                  ;; And CL:ERROR must still catch both, which they inherit from.
                  (handler-case (error 'kliz4a::error) (cl:error () :right))
                  (handler-case (error 'kliz4b::error) (cl:error () :right))))
-        "#,
-    );
+        "#);
     assert_eq!(
         stdout
             .lines()
@@ -148,8 +142,7 @@ fn a_handler_catches_only_the_type_it_named() {
 /// matters most: nearly every HANDLER-CASE in existence names one of these.
 #[test]
 fn standard_and_qualified_condition_types_still_match() {
-    let stdout = run(
-        r#"
+    let stdout = run(r#"
         (format t "STD ~S~%"
                 (list
                  (handler-case (error "boom") (simple-error () :ok))
@@ -168,8 +161,7 @@ fn standard_and_qualified_condition_types_still_match() {
                    (error () :ok))
                  ;; And T catches anything.
                  (handler-case (error "boom") (t () :ok))))
-        "#,
-    );
+        "#);
     assert_eq!(
         stdout
             .lines()
@@ -191,8 +183,7 @@ fn standard_and_qualified_condition_types_still_match() {
 fn a_bare_read_interns_into_its_own_package() {
     // IN-PACKAGE rather than read-from-string gymnastics: the point is what a BARE
     // read does in each package, which means actually reading in that package.
-    let stdout = run(
-        r#"
+    let stdout = run(r#"
         (defpackage "NNA" (:use "COMMON-LISP"))
         (defpackage "NNB" (:use "COMMON-LISP"))
         (in-package "NNA")
@@ -208,8 +199,7 @@ fn a_bare_read_interns_into_its_own_package() {
         (defvar *distinct* (not (eq 'nna::value 'nnb::value)))
         (cl:in-package "COMMON-LISP-USER")
         (format t "BARE ~S ~S ~S~%" nna::*a-home* nnb::*b-home* nnb::*distinct*)
-        "#,
-    );
+        "#);
     assert_eq!(
         stdout
             .lines()
@@ -224,16 +214,14 @@ fn a_bare_read_interns_into_its_own_package() {
 /// INVOKE-TOOL-BASIC test failed with "The variable A is unbound").
 #[test]
 fn an_interned_parameter_name_matches_the_body() {
-    let stdout = run(
-        r#"
+    let stdout = run(r#"
         (defpackage "NNTOOL" (:use "COMMON-LISP"))
         (in-package "NNTOOL")
         (defmacro m (args &body body)
           `(lambda ,(mapcar (lambda (a) (intern (string-upcase (symbol-name a)))) args)
              ,@body))
         (format t "TOOL ~S~%" (funcall (m (a b) (+ a b)) 3 4))
-        "#,
-    );
+        "#);
     assert_eq!(
         stdout
             .lines()
@@ -279,8 +267,7 @@ got: {combined}"
 /// the normalization that makes `ERROR` and `COMMON-LISP:ERROR` one key.
 #[test]
 fn a_standard_type_resolves_bare_or_qualified() {
-    let stdout = run(
-        r#"
+    let stdout = run(r#"
         (define-condition kliz3-c (cl:error) ((k :initarg :k)))
         (format t "STANDARD ~S~%"
                 (list (eq (find-class 'error) (find-class 'cl:error))
@@ -288,8 +275,7 @@ fn a_standard_type_resolves_bare_or_qualified() {
                       (typep (make-condition 'kliz3-c :k 1) 'error)
                       (typep (make-condition 'kliz3-c :k 1) 'common-lisp:error)
                       (typep (make-condition 'kliz3-c :k 1) 'serious-condition)))
-        "#,
-    );
+        "#);
     assert_eq!(
         stdout
             .lines()

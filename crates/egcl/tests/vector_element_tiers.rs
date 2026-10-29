@@ -94,8 +94,11 @@ fn the_accessors_reach_the_optimising_tier() {
         .expect("run egcl");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "{stdout}
-{stderr}");
+    assert!(
+        out.status.success(),
+        "{stdout}
+{stderr}"
+    );
     assert!(
         stdout.lines().any(|l| l.trim() == "HOT 3 3 0 3 0"),
         "wrong answers:
@@ -107,7 +110,13 @@ fn the_accessors_reach_the_optimising_tier() {
     // and x86-64's mapped entry says "installed with ordinary x86-64 Lisp T2
     // ABI". Matching only one of them makes this assertion silently vacuous on
     // the other architecture, which is the failure it exists to prevent.
-    for name in ["HOT-READ", "HOT-AREF", "HOT-WRITE", "HOT-U8", "HOT-U8-WRITE"] {
+    for name in [
+        "HOT-READ",
+        "HOT-AREF",
+        "HOT-WRITE",
+        "HOT-U8",
+        "HOT-U8-WRITE",
+    ] {
         let reached = stderr.lines().any(|line| {
             line.contains(&format!("{name}:"))
                 && (line.contains("T2 EMITTED") || line.contains("Lisp T2 ABI"))

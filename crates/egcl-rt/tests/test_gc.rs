@@ -6,7 +6,7 @@
 
 use egcl_rt::error::EgclError;
 use egcl_rt::gc::*;
-use egcl_rt::value::{NIL, T, EgclVal};
+use egcl_rt::value::{EgclVal, NIL, T};
 
 // ── RegionKind ────────────────────────────────────────────────────
 

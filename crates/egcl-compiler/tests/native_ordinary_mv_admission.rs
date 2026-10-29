@@ -108,7 +108,12 @@ fn exercise(clear_between: bool) {
     for symbol in [71, 72] {
         if symbol == 72 && clear_between {
             let mut clear = inst(Opcode::ClearMv, vec![], AuxData::None);
-            clear.flags = InstFlags { call: true, safepoint: true, effectful: true, ..InstFlags::default() };
+            clear.flags = InstFlags {
+                call: true,
+                safepoint: true,
+                effectful: true,
+                ..InstFlags::default()
+            };
             f.push_inst(entry, clear, &[]);
         }
         let mut call = inst(Opcode::Call, vec![], AuxData::CallTarget(symbol));
@@ -185,7 +190,8 @@ fn exercise(clear_between: bool) {
         &f,
         OrdinaryLispEntryOptions {
             arity: 0,
-            arity_error_veneer: rejected as *const () as u64, binding: None,
+            arity_error_veneer: rejected as *const () as u64,
+            binding: None,
         },
         &targets,
         flags,

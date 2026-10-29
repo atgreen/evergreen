@@ -779,7 +779,9 @@ impl EmittedTransfer {
             ordinary_entry: emitted.ordinary_entry,
             allocation_extent_counts: if emitted.ordinary_entry.is_some() {
                 allocation_extent_counts
-            } else { (0, 0, 0) },
+            } else {
+                (0, 0, 0)
+            },
             ordinary_stack_required: emitted.ordinary_stack_required,
             ordinary_bound_entry: emitted.ordinary_bound_entry,
             ordinary_checks_params: emitted.ordinary_checks_params,
@@ -966,32 +968,40 @@ pub(in crate::cli::bytecode) fn compile_background_t1(input: PreparedT1) -> Opti
             .map_err(EmitDecline::Build)?;
             if optimize && scope_free_native_body(body, false) {
                 let cold = RefCell::new(Vec::new());
-                egcl_compiler::t2::speculate::speculate_with_feedback(&mut ir, &|bcp| {
-                    use egcl_compiler::t2::speculate::SpecType as CompilerType;
-                    match input.profiles.get(&bcp) {
-                        None => {
-                            if !cold.borrow().contains(&bcp) {
-                                cold.borrow_mut().push(bcp);
+                egcl_compiler::t2::speculate::speculate_with_feedback(
+                    &mut ir,
+                    &|bcp| {
+                        use egcl_compiler::t2::speculate::SpecType as CompilerType;
+                        match input.profiles.get(&bcp) {
+                            None => {
+                                if !cold.borrow().contains(&bcp) {
+                                    cold.borrow_mut().push(bcp);
+                                }
+                                Some(CompilerType::Fixnum)
                             }
-                            Some(CompilerType::Fixnum)
+                            Some(profile) => match profile.speculation() {
+                                Some(SpecType::Fixnum) => Some(CompilerType::Fixnum),
+                                Some(SpecType::SingleFloat) => Some(CompilerType::SingleFloat),
+                                _ => None,
+                            },
                         }
-                        Some(profile) => match profile.speculation() {
-                            Some(SpecType::Fixnum) => Some(CompilerType::Fixnum),
-                            Some(SpecType::SingleFloat) => Some(CompilerType::SingleFloat),
-                            _ => None,
-                        },
-                    }
-                }, egcl_compiler::t2::speculate::SpeculateOptions::default(), &|bcp, kind| {
-                    use egcl_compiler::t2::speculate::SpecType as CompilerType;
-                    let kind = match kind {
-                        CompilerType::Fixnum => SpecType::Fixnum,
-                        CompilerType::SingleFloat => SpecType::SingleFloat,
-                        CompilerType::DoubleFloat => SpecType::DoubleFloat,
-                    };
-                    // Use the immutable profiles captured for this exact body,
-                    // never live worker-thread feedback or declarations alone.
-                    input.profiles.get(&bcp).is_none_or(|profile| profile.permits(kind))
-                });
+                    },
+                    egcl_compiler::t2::speculate::SpeculateOptions::default(),
+                    &|bcp, kind| {
+                        use egcl_compiler::t2::speculate::SpecType as CompilerType;
+                        let kind = match kind {
+                            CompilerType::Fixnum => SpecType::Fixnum,
+                            CompilerType::SingleFloat => SpecType::SingleFloat,
+                            CompilerType::DoubleFloat => SpecType::DoubleFloat,
+                        };
+                        // Use the immutable profiles captured for this exact body,
+                        // never live worker-thread feedback or declarations alone.
+                        input
+                            .profiles
+                            .get(&bcp)
+                            .is_none_or(|profile| profile.permits(kind))
+                    },
+                );
                 cold_guesses = cold.into_inner();
             }
             let speculations = t2_numeric_speculations(&ir, input.symbol);

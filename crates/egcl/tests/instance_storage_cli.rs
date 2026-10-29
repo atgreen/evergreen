@@ -27,7 +27,14 @@ const BIN: &str = env!("CARGO_BIN_EXE_egcl");
 
 fn run_with(env: &[(&str, &str)], program: &str) -> String {
     let mut command = Command::new("timeout");
-    command.args(["--kill-after=10", "600", BIN, "--no-init", "--eval", program]);
+    command.args([
+        "--kill-after=10",
+        "600",
+        BIN,
+        "--no-init",
+        "--eval",
+        program,
+    ]);
     // Inherited stress settings would make these rows measure the harness.
     command
         .env_remove("EGCL_GC_STRESS")
@@ -93,13 +100,24 @@ fn an_instance_keeps_its_address_across_every_update() {
       (format t "CHANGE-NEW ~a~%" (list (slot-value *j* 'p) (slot-value *j* 'q)))
       (format t "STORAGE-OK~%")
     "#);
-    expect(&stdout, &[
-        "GROW-ALIAS T", "GROW-HASH KEYED", "GROW-KEPT 5",
-        "SHRINK-ALIAS T", "SHRINK-HASH KEYED", "SHRINK-KEPT 5",
-        "REORDER-KEPT 5", "REORDER-NEW 9", "REORDER-ALIAS T",
-        "CHANGE-ALIAS T", "CHANGE-KEPT 3", "CHANGE-NEW (7 8)",
-        "STORAGE-OK",
-    ]);
+    expect(
+        &stdout,
+        &[
+            "GROW-ALIAS T",
+            "GROW-HASH KEYED",
+            "GROW-KEPT 5",
+            "SHRINK-ALIAS T",
+            "SHRINK-HASH KEYED",
+            "SHRINK-KEPT 5",
+            "REORDER-KEPT 5",
+            "REORDER-NEW 9",
+            "REORDER-ALIAS T",
+            "CHANGE-ALIAS T",
+            "CHANGE-KEPT 3",
+            "CHANGE-NEW (7 8)",
+            "STORAGE-OK",
+        ],
+    );
 }
 
 /// bliss-k4gev: a metaclass that gains a slot gives its existing classes that
@@ -181,11 +199,19 @@ fn a_placeholder_captured_before_its_definition_stays_eq() {
       (format t "SUB-INHERITS ~a~%" (typep (make-instance 'sub) 'undef))
       (format t "PLACEHOLDER-OK~%")
     "#);
-    expect(&stdout, &[
-        "EQ T", "NAME UNDEF", "TYPEP T", "INITFORM 1",
-        "VIA-CAPTURED 1", "DISPATCH META", "SUB-INHERITS T",
-        "PLACEHOLDER-OK",
-    ]);
+    expect(
+        &stdout,
+        &[
+            "EQ T",
+            "NAME UNDEF",
+            "TYPEP T",
+            "INITFORM 1",
+            "VIA-CAPTURED 1",
+            "DISPATCH META",
+            "SUB-INHERITS T",
+            "PLACEHOLDER-OK",
+        ],
+    );
 }
 
 /// A saved image carries the storage vector like any other heap object, and a
@@ -225,8 +251,16 @@ fn instances_survive_an_image_round_trip() {
         .expect("restore image");
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     assert!(output.status.success(), "{stdout}");
-    expect(&stdout, &[
-        "SLOT-A 42", "SLOT-B 2", "EQ-HASH KEYED", "WRITE 7", "FRESH 1", "IMAGE-OK",
-    ]);
+    expect(
+        &stdout,
+        &[
+            "SLOT-A 42",
+            "SLOT-B 2",
+            "EQ-HASH KEYED",
+            "WRITE 7",
+            "FRESH 1",
+            "IMAGE-OK",
+        ],
+    );
     let _ = std::fs::remove_file(&image);
 }

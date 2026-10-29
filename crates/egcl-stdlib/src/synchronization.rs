@@ -2,27 +2,33 @@
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
 //! GC-managed handles for stable, Rust-owned synchronization primitives.
-use std::sync::Arc;
-use std::sync::atomic::{AtomicPtr, Ordering};
-use std::time::Duration;
 use egcl_rt::EgclError;
 use egcl_rt::object::{ObjectHeader, mutex_flags, type_id};
 use egcl_rt::sync::{EgclCondVar, EgclMutex};
-use egcl_rt::value::{NIL, T, EgclVal};
+use egcl_rt::value::{EgclVal, NIL, T};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicPtr, Ordering};
+use std::time::Duration;
 
 /// Order memory accesses on the current native thread. This must stay an
 /// effectful runtime call in the Lisp compiler, never a pure/constant builtin.
 pub fn memory_barrier(args: &[EgclVal]) -> Result<EgclVal, EgclError> {
     use std::sync::atomic::{Ordering, fence};
     let [kind] = args else {
-        return Err(EgclError::ProgramError("memory barrier requires one kind".into()));
+        return Err(EgclError::ProgramError(
+            "memory barrier requires one kind".into(),
+        ));
     };
     let name = egcl_rt::symbols::symbol_name_of(*kind).unwrap_or_default();
     let order = match name.rsplit(':').next().unwrap_or_default() {
         "READ" | "DATA-DEPENDENCY" => Ordering::Acquire,
         "WRITE" => Ordering::Release,
         "FULL" => Ordering::SeqCst,
-        _ => return Err(EgclError::ProgramError(format!("invalid memory barrier kind: {name}"))),
+        _ => {
+            return Err(EgclError::ProgramError(format!(
+                "invalid memory barrier kind: {name}"
+            )));
+        }
     };
     fence(order);
     Ok(NIL)

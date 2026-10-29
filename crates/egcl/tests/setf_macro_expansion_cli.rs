@@ -162,9 +162,13 @@ fn explicit_setf_writer_takes_precedence_over_reader_macro() {
     "#;
     let output = Command::new(env!("CARGO_BIN_EXE_egcl"))
         .args(["--no-init", "--eval", program])
-        .output().unwrap();
-    assert!(output.status.success(), "{}\n{}",
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
         String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr));
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(String::from_utf8_lossy(&output.stdout).contains("SETF-WRITER-PRECEDENCE-OK"));
 }

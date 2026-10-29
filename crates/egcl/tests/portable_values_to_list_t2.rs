@@ -39,7 +39,10 @@ fn run(envs: &[(&str, &str)]) -> String {
     for (key, value) in envs {
         command.env(key, value);
     }
-    let output = command.args(["--no-init", "--eval", PROGRAM]).output().unwrap();
+    let output = command
+        .args(["--no-init", "--eval", PROGRAM])
+        .output()
+        .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stdout}\n{stderr}");

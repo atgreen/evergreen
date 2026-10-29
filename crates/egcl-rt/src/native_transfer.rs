@@ -25,7 +25,7 @@ use std::cell::Cell;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 mod ordinary_x64;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-pub use ordinary_x64::{invoke_ordinary_native_segment, OrdinaryNativeOutcome};
+pub use ordinary_x64::{OrdinaryNativeOutcome, invoke_ordinary_native_segment};
 
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 pub(crate) mod migration_tests;
@@ -114,7 +114,10 @@ pub struct NativeReturnValues {
 }
 
 impl NativeReturnValues {
-    pub const SINGLE: Self = Self { count: 1, payload: std::ptr::null() };
+    pub const SINGLE: Self = Self {
+        count: 1,
+        payload: std::ptr::null(),
+    };
 }
 
 /// Reserved operation in the T2 multiple-value helper: write a
@@ -230,7 +233,10 @@ fn prepare_carrier_resume_with(
     let mut anchor = segment;
     while !anchor.is_null() {
         let saved = unsafe { &*anchor };
-        assert_eq!(saved.owner, owner, "native segment belongs to another execution");
+        assert_eq!(
+            saved.owner, owner,
+            "native segment belongs to another execution"
+        );
         changed |= saved.carrier != current;
         anchor = saved.previous;
     }
@@ -411,12 +417,20 @@ pub unsafe fn invoke_native_segment(
     slots: *mut u64,
     stack: &EgclStack,
 ) -> Result<NativeOutcome, SegmentUnavailable> {
-    unsafe { with_native_segment(stack, |anchor, out| enter_platform(entry, slots, stack, anchor, out)) }
+    unsafe {
+        with_native_segment(stack, |anchor, out| {
+            enter_platform(entry, slots, stack, anchor, out)
+        })
+    }
 }
 
 #[cfg(any(
     all(target_arch = "x86_64", any(target_os = "linux", windows)),
-    all(target_arch = "powerpc64", target_endian = "little", target_os = "linux"),
+    all(
+        target_arch = "powerpc64",
+        target_endian = "little",
+        target_os = "linux"
+    ),
     all(target_arch = "aarch64", unix),
     all(target_arch = "s390x", unix),
     all(target_arch = "riscv64", unix),

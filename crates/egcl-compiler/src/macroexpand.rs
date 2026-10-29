@@ -86,7 +86,7 @@ use std::sync::{Arc, LazyLock};
 
 use egcl_rt::error::EgclError;
 use egcl_rt::lock_order::{LockLevel, OrderedRwLock};
-use egcl_rt::value::{TAG_CONS, TAG_MASK, EgclVal};
+use egcl_rt::value::{EgclVal, TAG_CONS, TAG_MASK};
 
 use crate::reader::{intern_symbol, symbol_name};
 
@@ -491,7 +491,9 @@ impl Environment {
         let mut variables = HashMap::new();
         for declaration in &decls {
             if let DeclInfo::Custom(_, specifier) = declaration {
-                if specifier.is_cons() && is_symbol_named(unsafe { cons_car(*specifier) }, "SPECIAL") {
+                if specifier.is_cons()
+                    && is_symbol_named(unsafe { cons_car(*specifier) }, "SPECIAL")
+                {
                     for name in cons_to_vec(unsafe { cons_cdr(*specifier) }) {
                         variables.insert(name.0, VariableInfo::Special);
                     }
@@ -973,11 +975,7 @@ pub type MacroexpandHook = fn(EgclVal, EgclVal, &Environment) -> Result<EgclVal,
 ///
 /// For full funcall semantics with arbitrary Lisp functions, the runtime must
 /// register each macro's expander via `register_macro_function`.
-fn default_hook(
-    expander: EgclVal,
-    form: EgclVal,
-    env: &Environment,
-) -> Result<EgclVal, EgclError> {
+fn default_hook(expander: EgclVal, form: EgclVal, env: &Environment) -> Result<EgclVal, EgclError> {
     invoke_macro_expander(expander, form, env)
 }
 
@@ -1461,9 +1459,9 @@ pub fn macroexpand_all(form: EgclVal, env: &Environment) -> Result<EgclVal, Egcl
     let unsupported_atomic = |value: EgclVal| {
         TOOL_EXPANSION.with(Cell::get)
             && value.is_cons()
-            && ATOMIC_UPDATE_OPERATOR.get().is_some_and(|test| {
-                test(unsafe { cons_car(value) })
-            })
+            && ATOMIC_UPDATE_OPERATOR
+                .get()
+                .is_some_and(|test| test(unsafe { cons_car(value) }))
     };
     let (mut expanded, _) = macroexpand_until(form, env, unsupported_atomic)?;
     if unsupported_atomic(expanded) {
@@ -1941,9 +1939,7 @@ fn expand_multiple_value_setq(mut form: EgclVal, env: &Environment) -> Result<Eg
     // truncates to the primary value, which is what MULTIPLE-VALUE-SETQ returns.
     let values_sym = make_symbol("VALUES");
     egcl_rt::rooted!(values_place = alloc_cons(values_sym, vec_to_cons(&places)));
-    egcl_rt::rooted!(
-        setf_form = vec_to_cons(&[make_symbol("SETF"), *values_place, *expanded_val])
-    );
+    egcl_rt::rooted!(setf_form = vec_to_cons(&[make_symbol("SETF"), *values_place, *expanded_val]));
     egcl_rt::rooted!(wrapped = vec_to_cons(&[make_symbol("VALUES"), *setf_form]));
     macroexpand_all(*wrapped, env)
 }
@@ -2305,8 +2301,11 @@ fn expand_lambda_list(
     egcl_rt::rooted_ref!(_scope_root = &mut scope);
     let special_parameters: HashSet<u64> = scope.variables.keys().copied().collect();
     let binding_info = |name: EgclVal| {
-        if special_parameters.contains(&name.0) { VariableInfo::Special }
-        else { VariableInfo::Lexical }
+        if special_parameters.contains(&name.0) {
+            VariableInfo::Special
+        } else {
+            VariableInfo::Lexical
+        }
     };
     // Binding declarations govern each parameter when its binding begins,
     // not its own initializer. Free SPECIAL declarations already apply.
@@ -2324,9 +2323,13 @@ fn expand_lambda_list(
             let name = if section == "key" && first.is_cons() {
                 let pair = cons_to_vec(first);
                 pair.get(1).copied().unwrap_or(egcl_rt::value::NIL)
-            } else { first };
+            } else {
+                first
+            };
             scope.variables.remove(&name.0);
-            if parts.len() > 2 { scope.variables.remove(&parts[2].0); }
+            if parts.len() > 2 {
+                scope.variables.remove(&parts[2].0);
+            }
         }
     }
     let mut section = "required";
@@ -2387,11 +2390,13 @@ fn expand_lambda_list(
         }
         expanded.push(vec_to_cons(&parts));
     }
-    egcl_rt::rooted!(result = if changed {
-        vec_to_cons(&expanded)
-    } else {
-        *params
-    });
+    egcl_rt::rooted!(
+        result = if changed {
+            vec_to_cons(&expanded)
+        } else {
+            *params
+        }
+    );
     Ok((*result, scope.clone()))
 }
 
@@ -2459,11 +2464,15 @@ fn expand_definer_body(
     };
 
     let operator = get_symbol_name(items[0]);
-    if matches!(operator.as_deref().and_then(|name| name.rsplit(':').next()),
-        Some("DEFUN" | "DEFMETHOD" | "METHOD")) {
+    if matches!(
+        operator.as_deref().and_then(|name| name.rsplit(':').next()),
+        Some("DEFUN" | "DEFMETHOD" | "METHOD")
+    ) {
         egcl_rt::rooted!(body = vec_to_cons(&items[(lambda_list_index + 1)..]));
         let (mut params, mut body_env) = expand_lambda_list(
-            items[lambda_list_index], *body, env,
+            items[lambda_list_index],
+            *body,
+            env,
             operator.as_deref() != Some("DEFUN"),
         )?;
         egcl_rt::rooted_ref!(_params_root = &mut params);
@@ -2611,9 +2620,8 @@ fn expand_defstruct(form: EgclVal, env: &Environment) -> Result<EgclVal, EgclErr
                     }
                 }
                 "CONSTRUCTOR" if option.len() == 3 => {
-                    let (params, _) = expand_lambda_list(
-                        option[2], egcl_rt::value::NIL, env, false,
-                    )?;
+                    let (params, _) =
+                        expand_lambda_list(option[2], egcl_rt::value::NIL, env, false)?;
                     option_changed = params != option[2];
                     option[2] = params;
                 }
@@ -2633,7 +2641,11 @@ fn expand_defstruct(form: EgclVal, env: &Environment) -> Result<EgclVal, EgclErr
         changed |= expanded != items[index];
         items[index] = expanded;
     }
-    if changed { Ok(vec_to_cons(&items)) } else { Ok(*form) }
+    if changed {
+        Ok(vec_to_cons(&items))
+    } else {
+        Ok(*form)
+    }
 }
 
 /// Expand a lambda call: ((lambda (params...) body...) arg1 arg2 ...)
@@ -2894,7 +2906,8 @@ fn expand_labels(mut form: EgclVal, env: &Environment) -> Result<EgclVal, EgclEr
         let mut fn_body = unsafe { cons_cdr(fn_rest) };
         egcl_rt::rooted_ref!(_fn_body_root = &mut fn_body);
 
-        let (mut expanded_params, mut fn_env) = expand_lambda_list(params, fn_body, &augmented_env, false)?;
+        let (mut expanded_params, mut fn_env) =
+            expand_lambda_list(params, fn_body, &augmented_env, false)?;
         egcl_rt::rooted_ref!(_expanded_params_root = &mut expanded_params);
         egcl_rt::rooted_ref!(_fn_env_root = &mut fn_env);
         let mut expanded_fn_body = expand_body(fn_body, &fn_env)?;
@@ -3128,8 +3141,8 @@ type MacroFn = dyn Fn(EgclVal, &Environment) -> Result<EgclVal, EgclError> + Sen
 
 /// A hosting Lisp evaluator can execute arbitrary local macro bodies. The
 /// standalone compiler keeps its small evaluator when no host is installed.
-pub type LocalMacroEvaluator = fn(EgclVal, EgclVal, EgclVal, &Environment, &Environment)
-    -> Result<EgclVal, EgclError>;
+pub type LocalMacroEvaluator =
+    fn(EgclVal, EgclVal, EgclVal, &Environment, &Environment) -> Result<EgclVal, EgclError>;
 thread_local! {
     static LOCAL_MACRO_EVALUATOR: Cell<Option<LocalMacroEvaluator>> = const { Cell::new(None) };
 }

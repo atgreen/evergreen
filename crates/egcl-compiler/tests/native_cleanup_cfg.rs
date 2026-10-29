@@ -388,8 +388,10 @@ mod execution {
     }
     unsafe extern "C" fn single_values(_: u64, dst: *mut EgclVal, count: u64) {
         if count == egcl_rt::native_transfer::SNAPSHOT_NATIVE_RETURN_VALUES {
-            unsafe { dst.cast::<egcl_rt::native_transfer::NativeReturnValues>()
-                .write(egcl_rt::native_transfer::NativeReturnValues::SINGLE); }
+            unsafe {
+                dst.cast::<egcl_rt::native_transfer::NativeReturnValues>()
+                    .write(egcl_rt::native_transfer::NativeReturnValues::SINGLE);
+            }
         } else {
             assert_eq!(count, 0);
         }

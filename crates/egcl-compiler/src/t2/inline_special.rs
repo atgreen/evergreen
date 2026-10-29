@@ -21,7 +21,9 @@
 //! is a root of every collection, so the store needs no write barrier.
 //! Only interned symbols qualify: their objects are pinned and never freed.
 
-use super::{Asm, Cc, FramedHome, RAX, SCRATCH, load_home, mov_imm64, store_home, store_mem64_disp};
+use super::{
+    Asm, Cc, FramedHome, RAX, SCRATCH, load_home, mov_imm64, store_home, store_mem64_disp,
+};
 use crate::t2::ir::{AuxData, InstData, Value};
 use std::collections::HashMap;
 
@@ -91,12 +93,13 @@ pub(super) fn emit_mapped_store(a: &mut Asm, symbol: u32, src: u8) -> Option<egc
 /// the global read and `Some(true)` for the assignment.
 fn ordinary_adapter(target: u32) -> Option<bool> {
     use super::OrdinaryPrimitive;
-    [(OrdinaryPrimitive::LoadGlobal, false), (OrdinaryPrimitive::StoreGlobal, true)]
-        .into_iter()
-        .find(|(primitive, _)| {
-            egcl_rt::symbols::find_index(&primitive.adapter_name()) == Some(target)
-        })
-        .map(|(_, store)| store)
+    [
+        (OrdinaryPrimitive::LoadGlobal, false),
+        (OrdinaryPrimitive::StoreGlobal, true),
+    ]
+    .into_iter()
+    .find(|(primitive, _)| egcl_rt::symbols::find_index(&primitive.adapter_name()) == Some(target))
+    .map(|(_, store)| store)
 }
 
 /// The `(store, symbol)` of an ordinary call to the global read or assignment
@@ -187,7 +190,10 @@ pub(super) fn emit_transfer_fast_path(
     let AuxData::GlobalValue { symbol, store } = data.aux else {
         return None;
     };
-    if data.args.len() != usize::from(store) || data.results.len() > 1 || !super::is_global_special(symbol) {
+    if data.args.len() != usize::from(store)
+        || data.results.len() > 1
+        || !super::is_global_special(symbol)
+    {
         return None;
     }
     let object = object(symbol)?;

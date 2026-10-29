@@ -4,10 +4,10 @@
 //! Reader objects live on the shared GC heap and survive collection with their
 //! structure and identity intact (bliss-jtc.15).
 
-use std::sync::{Mutex, OnceLock};
 use egcl_compiler::read_from_string;
-use egcl_rt::value::{TAG_MASK, EgclVal};
-use egcl_rt::{Collector, HeapCollector, EgclStack, current_thread};
+use egcl_rt::value::{EgclVal, TAG_MASK};
+use egcl_rt::{Collector, EgclStack, HeapCollector, current_thread};
+use std::sync::{Mutex, OnceLock};
 
 /// Serialize the GC-forcing tests: they collect the shared per-process heap, so
 /// they must not run while another such test holds unrooted young objects.

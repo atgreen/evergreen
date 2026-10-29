@@ -12,7 +12,7 @@
 #![cfg(feature = "python")]
 
 use egcl_rt::python::{self, PythonScope};
-use egcl_rt::value::{NIL, T, EgclVal};
+use egcl_rt::value::{EgclVal, NIL, T};
 use egcl_rt::{Collector, GcConfig, HeapCollector, ShadowRootScope, init_heap};
 
 fn config() -> GcConfig {

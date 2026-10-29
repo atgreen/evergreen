@@ -6,7 +6,7 @@
 //! These tests exercise multiple stdlib modules working together through
 //! their public APIs, proving that the modules integrate correctly.
 
-use egcl_rt::value::{NIL, T, EgclVal};
+use egcl_rt::value::{EgclVal, NIL, T};
 
 // Tests reset the process-wide CLOS registry. Keep each fixture intact while
 // other cross-module tests may initialize condition classes on the same heap.
@@ -355,8 +355,13 @@ fn clos_make_instance_and_slots() {
     // Instances have a fixed inline slot layout: declare the slot (reusing the
     // same EgclVal so layout keying by identity resolves it on access).
     let slot_name = make_lisp_string("X");
-    define_class(user_class_name, user_class, &[standard_object], &[slot_name])
-        .expect("define_class");
+    define_class(
+        user_class_name,
+        user_class,
+        &[standard_object],
+        &[slot_name],
+    )
+    .expect("define_class");
     let instance = make_instance(user_class, &[]).expect("make_instance");
 
     // Slot should be unbound initially

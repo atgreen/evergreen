@@ -29,8 +29,7 @@ fn crate_root_reexports_devtools_surface() {
         egcl_rt::value::EgclVal,
         egcl_rt::value::EgclVal,
     ) -> Result<(), egcl_rt::error::EgclError> = describe;
-    let _inspect: fn(egcl_rt::value::EgclVal) -> Result<(), egcl_rt::error::EgclError> =
-        inspect;
+    let _inspect: fn(egcl_rt::value::EgclVal) -> Result<(), egcl_rt::error::EgclError> = inspect;
     let _room: fn(
         Option<egcl_rt::value::EgclVal>,
         egcl_rt::value::EgclVal,

@@ -13,7 +13,7 @@ use egcl_compiler::t2::transfer_sites::{SysvSiteSnapshot, SysvTransferSite, Sysv
 use egcl_rt::jit::JitBuffer;
 use egcl_rt::native_transfer::{self, NativeExit, NativeOutcome, NativeSegment};
 use egcl_rt::value::EgclVal;
-use egcl_rt::{Collector, HeapCollector, EgclStack};
+use egcl_rt::{Collector, EgclStack, HeapCollector};
 
 #[repr(C)]
 struct Request {
@@ -217,7 +217,7 @@ fn exercise_capture(exit: NativeExit, call_adjust: u32) {
                 call_stack_adjust: call_adjust,
                 activation_slots: 2,
                 native_spills: vec![],
-        shadow_roots: vec![(reg, 0), (heap_spill, 1)],
+                shadow_roots: vec![(reg, 0), (heap_spill, 1)],
                 map: first_map,
             },
             SysvTransferSite {
@@ -226,7 +226,7 @@ fn exercise_capture(exit: NativeExit, call_adjust: u32) {
                 call_stack_adjust: call_adjust,
                 activation_slots: 2,
                 native_spills: vec![],
-        shadow_roots: vec![(reg, 0), (heap_spill, 1)],
+                shadow_roots: vec![(reg, 0), (heap_spill, 1)],
                 map,
             },
         ],

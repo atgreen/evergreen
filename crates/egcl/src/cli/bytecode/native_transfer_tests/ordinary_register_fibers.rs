@@ -95,8 +95,11 @@ fn ordinary_fiber() -> EgclVal {
     native_transfer_entry::ordinary_calls::take_cold_calls_for_test();
     native_transfer_entry::ordinary_calls::take_named_entries_for_test();
     let result = run_native(&outer, symbol, &arguments, &mut env).unwrap();
-    assert_eq!(native_transfer_entry::ordinary_calls::take_cold_calls_for_test(), 0,
-        "all generated edges are admitted");
+    assert_eq!(
+        native_transfer_entry::ordinary_calls::take_cold_calls_for_test(),
+        0,
+        "all generated edges are admitted"
+    );
     assert_eq!(
         native_transfer_entry::ordinary_calls::take_named_entries_for_test(),
         1,

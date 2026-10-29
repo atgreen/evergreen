@@ -223,7 +223,10 @@ fn global_safepoint_page() -> &'static SafepointPage {
 /// protected polling page itself through either of these pointers.
 pub fn native_poll_flag_addresses() -> Option<(*const AtomicBool, *const AtomicBool)> {
     let page = PAGE.get()?;
-    Some((std::ptr::addr_of!(page.requested), std::ptr::addr_of!(SIGUSR1_PENDING)))
+    Some((
+        std::ptr::addr_of!(page.requested),
+        std::ptr::addr_of!(SIGUSR1_PENDING),
+    ))
 }
 
 /// Whether a safepoint poll needs its published runtime path. This only reads
@@ -622,9 +625,10 @@ pub fn wait_for_all_threads() -> Result<(), EgclError> {
     // resume its mutators. A competing requester remains a mutator: poll while
     // waiting for ownership so the current owner can finish its handshake.
     loop {
-        match coord.owner.compare_exchange(
-            0, current.0, Ordering::AcqRel, Ordering::Acquire,
-        ) {
+        match coord
+            .owner
+            .compare_exchange(0, current.0, Ordering::AcqRel, Ordering::Acquire)
+        {
             Ok(_) => break,
             Err(owner) if owner == current.0 => {
                 return Err(EgclError::Internal("nested safepoint request".into()));
@@ -761,7 +765,9 @@ pub fn resume_all_threads() -> Result<(), EgclError> {
         return Ok(());
     }
     if owner != crate::thread::current_thread_id().0 {
-        return Err(EgclError::Internal("safepoint resume by a non-owner".into()));
+        return Err(EgclError::Internal(
+            "safepoint resume by a non-owner".into(),
+        ));
     }
 
     // Clear the safepoint page — new polls will no longer enter.
@@ -803,7 +809,8 @@ mod gc_pause_tests {
                 .output()
                 .unwrap();
             assert!(
-                output.status.success(), "{}\n{}",
+                output.status.success(),
+                "{}\n{}",
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
@@ -853,7 +860,10 @@ mod gc_pause_tests {
             let _blocked = unsafe { NativeBlockingScope::enter() };
             worker.join().unwrap()
         };
-        assert!(worker_result.is_ok(), "first pause failed: {worker_result:?}");
+        assert!(
+            worker_result.is_ok(),
+            "first pause failed: {worker_result:?}"
+        );
         assert!(paused.is_ok(), "second pause failed: {paused:?}");
         assert!(previous_finished, "second pause overlapped the first");
     }
@@ -1131,7 +1141,10 @@ mod pending_work_tests {
 
         thread.execution().request_yield();
         assert!(unsafe { &*execution }.yield_requested());
-        assert_eq!(crate::thread::current_execution_context_for_native(), Some(execution));
+        assert_eq!(
+            crate::thread::current_execution_context_for_native(),
+            Some(execution)
+        );
         assert!(poll_work_pending());
         assert!(poll_work_pending());
         assert!(thread.check_and_clear_yield());

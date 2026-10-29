@@ -31,20 +31,28 @@ fn source_loop_factory_compiles_callbacks_with_independent_captures() {
       (format t "EAGER-CAPTURES-OK~%")
     "#;
     for tier in ["t0", "t1", "t2"] {
-        let program = program.replace("NATIVE-FACTORY-CHECK", if tier == "t0" {
-            ""
-        } else if factory_tier() == 0 {
-            "(assert (= (egcl-ext:function-tier 'eager-counter) 0))"
-        } else {
-            "(assert (> (egcl-ext:function-tier 'eager-counter) 0))"
-        });
+        let program = program.replace(
+            "NATIVE-FACTORY-CHECK",
+            if tier == "t0" {
+                ""
+            } else if factory_tier() == 0 {
+                "(assert (= (egcl-ext:function-tier 'eager-counter) 0))"
+            } else {
+                "(assert (> (egcl-ext:function-tier 'eager-counter) 0))"
+            },
+        );
         let output = Command::new(env!("CARGO_BIN_EXE_egcl"))
             .args(["--no-init", "--eval", &program])
             .env("EGCL_FORCE_TIER", tier)
             .env("EGCL_LAZY_COMPILE", "0")
-            .output().unwrap();
+            .output()
+            .unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(output.status.success(), "{tier}: {stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "{tier}: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert!(stdout.contains("EAGER-CAPTURES-OK"));
     }
 }
@@ -57,8 +65,13 @@ fn run_case(name: &str, definitions: &str, probe: &str, envs: &[(&str, &str)]) -
     let program = format!("(load (compile-file {source:?}))\n{probe}");
     let mut command = Command::new(env!("CARGO_BIN_EXE_egcl"));
     command.env_remove("EGCL_FORCE_TIER");
-    for (key, value) in envs { command.env(key, value); }
-    let output = command.args(["--no-init", "--eval", &program]).output().unwrap();
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let output = command
+        .args(["--no-init", "--eval", &program])
+        .output()
+        .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let _ = fs::remove_dir_all(&dir);
@@ -68,27 +81,38 @@ fn run_case(name: &str, definitions: &str, probe: &str, envs: &[(&str, &str)]) -
 
 #[test]
 fn fasl_closure_factory_retains_independent_captures() {
-    let out = run_case("captures", r#"
+    let out = run_case(
+        "captures",
+        r#"
       (defun portable-counter (start) (lambda (delta) (incf start delta)))
-    "#, r#"
+    "#,
+        r#"
       (dotimes (i 20) (portable-counter i))
       (let ((a (portable-counter 10)) (b (portable-counter 100)))
         (assert (= (funcall a 2) 12))
         (assert (= (funcall b 3) 103))
         (assert (= (funcall a 4) 16)))
       (format t "FACTORY-TIER=~D~%" (egcl-ext:function-tier 'portable-counter))
-    "#, &[("EGCL_FORCE_TIER", "t1")]);
-    assert!(out.contains(&format!("FACTORY-TIER={}", factory_tier())), "{out}");
+    "#,
+        &[("EGCL_FORCE_TIER", "t1")],
+    );
+    assert!(
+        out.contains(&format!("FACTORY-TIER={}", factory_tier())),
+        "{out}"
+    );
 }
 
 #[test]
 fn closure_factory_keeps_original_nested_body_across_redefinition() {
-    let out = run_case("redefine", r#"
+    let out = run_case(
+        "redefine",
+        r#"
       (defun original-factory (callback value)
         (funcall callback)
         (lambda () (list "original literal" value)))
       (defun call-factory (callback value) (original-factory callback value))
-    "#, r#"
+    "#,
+        r#"
       (dotimes (i 20)
         (funcall (fdefinition 'original-factory) (lambda () nil) i)
         (call-factory (lambda () nil) i))
@@ -103,8 +127,13 @@ fn closure_factory_keeps_original_nested_body_across_redefinition() {
         (assert (equal (funcall f) '("original literal" (17 23)))))
       (assert (eq (original-factory nil nil) :new))
       (format t "ORIGINAL-BODY-OK~%")
-    "#, &[("EGCL_FORCE_TIER", "t1")]);
-    assert!(out.contains(&format!("ORIGINAL-TIER={}", factory_tier())), "{out}");
+    "#,
+        &[("EGCL_FORCE_TIER", "t1")],
+    );
+    assert!(
+        out.contains(&format!("ORIGINAL-TIER={}", factory_tier())),
+        "{out}"
+    );
     assert!(out.contains("ORIGINAL-BODY-OK"), "{out}");
 }
 
@@ -112,16 +141,21 @@ fn closure_factory_keeps_original_nested_body_across_redefinition() {
 fn captured_nonlocal_exit_keeps_safe_fallback() {
     // Native handler setup cannot yet represent captured block/tag scopes.
     // Adding native closure allocation must preserve this safety fallback.
-    let out = run_case("exit", r#"
+    let out = run_case(
+        "exit",
+        r#"
       (defun invoke-escape (f) (funcall f))
       (defun escape-factory (value)
         (block destination
           (invoke-escape (lambda () (return-from destination value)))
           :wrong))
-    "#, r#"
+    "#,
+        r#"
       (dotimes (i 20) (assert (= (funcall (fdefinition 'escape-factory) i) i)))
       (format t "ESCAPE-TIER=~D~%" (egcl-ext:function-tier 'escape-factory))
-    "#, &[("EGCL_FORCE_TIER", "t1")]);
+    "#,
+        &[("EGCL_FORCE_TIER", "t1")],
+    );
     assert!(out.contains("ESCAPE-TIER=0"), "{out}");
 }
 
@@ -174,23 +208,34 @@ fn closure_creation_survives_osr_entry() {
 
 #[test]
 fn closure_factory_binds_more_captured_parameters_than_stack_slots() {
-    let out = run_case("wide-captures", r#"
+    let out = run_case(
+        "wide-captures",
+        r#"
       (defun capture-five (a b c d e)
         (lambda () (list a b c d e)))
-    "#, r#"
+    "#,
+        r#"
       (dotimes (i 20)
         (assert (equal (funcall (capture-five i 2 3 4 5)) (list i 2 3 4 5))))
       (format t "WIDE-CAPTURE-TIER=~D~%" (egcl-ext:function-tier 'capture-five))
-    "#, &[("EGCL_FORCE_TIER", "t1")]);
-    assert!(out.contains(&format!("WIDE-CAPTURE-TIER={}", factory_tier())), "{out}");
+    "#,
+        &[("EGCL_FORCE_TIER", "t1")],
+    );
+    assert!(
+        out.contains(&format!("WIDE-CAPTURE-TIER={}", factory_tier())),
+        "{out}"
+    );
 }
 
 #[test]
 fn saved_fasl_function_retains_bytecode_after_function_cell_replacement() {
-    let out = run_case("saved-fasl-call", r#"
+    let out = run_case(
+        "saved-fasl-call",
+        r#"
       (defun saved-fasl-target (x) (+ x 1))
       (defun saved-fasl-invoke (f x) (funcall f x))
-    "#, r#"
+    "#,
+        r#"
       (defvar *saved-fasl* #'saved-fasl-target)
       (dotimes (i 40) (assert (= (saved-fasl-invoke *saved-fasl* i) (+ i 1))))
       (setf (symbol-function 'saved-fasl-target) (lambda (x) (+ x 100)))
@@ -198,7 +243,9 @@ fn saved_fasl_function_retains_bytecode_after_function_cell_replacement() {
         (assert (= (saved-fasl-target i) (+ i 100)))
         (assert (= (saved-fasl-invoke *saved-fasl* i) (+ i 1))))
       (format t "SAVED-FASL-OK~%")
-    "#, &[("EGCL_FORCE_TIER", "t2")]);
+    "#,
+        &[("EGCL_FORCE_TIER", "t2")],
+    );
     assert!(out.contains("SAVED-FASL-OK"));
 }
 

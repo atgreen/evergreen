@@ -6,11 +6,11 @@
 //! with their structure and identity intact — every internal reference and root
 //! is relocated before any region is reclaimed (bliss-jtc.17).
 
-use std::sync::{Mutex, OnceLock};
 use egcl_rt::object::{ObjectHeader, type_id};
-use egcl_rt::value::{NIL, TAG_CONS, TAG_MASK, EgclVal};
-use egcl_rt::{Allocator, Collector, GcConfig, EgclStack, current_thread, init_heap, walk_heap};
+use egcl_rt::value::{EgclVal, NIL, TAG_CONS, TAG_MASK};
+use egcl_rt::{Allocator, Collector, EgclStack, GcConfig, current_thread, init_heap, walk_heap};
 use egcl_rt::{HeapAllocator, HeapCollector};
+use std::sync::{Mutex, OnceLock};
 
 fn lock() -> &'static Mutex<()> {
     static L: OnceLock<Mutex<()>> = OnceLock::new();

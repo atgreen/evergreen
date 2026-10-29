@@ -3,7 +3,7 @@
 
 use egcl_rt::bignum::alloc_ratio_cli;
 use egcl_rt::error::EgclError;
-use egcl_rt::value::{NIL, EgclVal};
+use egcl_rt::value::{EgclVal, NIL};
 use egcl_stdlib::numbers::{ash, minusp, plusp, zerop};
 
 /// Serializes every test in this target that touches the heap (bliss-ifho).
@@ -76,9 +76,7 @@ fn numeric_predicate_type_errors_name_their_domains() {
     assert!(
         matches!(zerop(NIL), Err(EgclError::TypeError { expected, .. }) if expected == "number")
     );
-    assert!(
-        matches!(plusp(NIL), Err(EgclError::TypeError { expected, .. }) if expected == "real")
-    );
+    assert!(matches!(plusp(NIL), Err(EgclError::TypeError { expected, .. }) if expected == "real"));
     assert!(
         matches!(minusp(NIL), Err(EgclError::TypeError { expected, .. }) if expected == "real")
     );

@@ -170,7 +170,10 @@ unsafe fn decline_to_checked(record: *mut MappedCallRecord) {
         (*record).activation = std::ptr::null_mut();
         (*record).owner = std::ptr::null_mut();
         (*record).forward = std::ptr::null();
-        (*record).outcome = NativeOutcome { value: NIL, exit: NativeExit::Returned };
+        (*record).outcome = NativeOutcome {
+            value: NIL,
+            exit: NativeExit::Returned,
+        };
     }
 }
 
@@ -369,7 +372,9 @@ pub(in crate::cli::bytecode) unsafe extern "C" fn finish_nested(record: *mut Map
     // The Rust retirement boundary does not promise to preserve native result
     // registers or flags. Reconstruct them from the still-materialized tuple
     // after every potentially mutating retirement operation has finished.
-    unsafe { (*record).return_values = (*env).native_return_values(); }
+    unsafe {
+        (*record).return_values = (*env).native_return_values();
+    }
 }
 
 /// Code owning the PC the adapter saved for this record's caller.

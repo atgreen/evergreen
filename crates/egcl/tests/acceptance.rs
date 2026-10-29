@@ -1430,7 +1430,8 @@ fn eval_instance_not_confused_with_fixnum() {
 #[test]
 fn reinitialize_instance_runs_shared_initialization_methods() {
     run_expression_cases_batched(&[
-        (r#"(progn
+        (
+            r#"(progn
           (defvar *si-log* nil)
           (defclass si-target () ((x :initarg :value :initform 1) (y :initform 7)))
           (defmethod shared-initialize :around ((o si-target) names &rest args)
@@ -1446,15 +1447,18 @@ fn reinitialize_instance_runs_shared_initialization_methods() {
             (setf *si-log* nil)
             (list (eq o (apply #'reinitialize-instance o '(:value 42)))
                   (slot-value o 'x) (slot-boundp o 'y) (reverse *si-log*))))"#,
-         "(T 42 NIL (:AROUND-IN (:BEFORE NIL 42) (:AFTER NIL 42 42) :AROUND-OUT :REINITIALIZED))"),
-        (r#"(progn
+            "(T 42 NIL (:AROUND-IN (:BEFORE NIL 42) (:AFTER NIL 42 42) :AROUND-OUT :REINITIALIZED))",
+        ),
+        (
+            r#"(progn
           (defclass si-slots () ((x :initarg :value :initform 1) (y :initform 7) (z :initform 9)))
           (let ((o (make-instance 'si-slots)))
             (slot-makunbound o 'y) (slot-makunbound o 'z)
             (list (eq o (shared-initialize o '(y) :value 42))
                   (slot-value o 'x) (slot-value o 'y) (slot-boundp o 'z)
                   (progn (shared-initialize o t) (slot-value o 'z)))))"#,
-         "(T 42 7 NIL 9)"),
+            "(T 42 7 NIL 9)",
+        ),
     ]);
 }
 
@@ -1998,7 +2002,12 @@ fn image_save_and_load_cycle() {
 
     // Step 2: Restore both code and live data from the core.
     let output = egcl_bin()
-        .args(["--image", image_path.to_str().unwrap(), "--eval", "(list (my-fn) *saved-state*)"])
+        .args([
+            "--image",
+            image_path.to_str().unwrap(),
+            "--eval",
+            "(list (my-fn) *saved-state*)",
+        ])
         .output()
         .expect("failed to run egcl for load");
 
@@ -2448,7 +2457,10 @@ fn an_arithmetic_loop_variable_is_the_iteration_counter() {
         ),
         // A constant cannot be a loop variable. Signal a Lisp condition,
         // never panic while interpreting or lowering the binding.
-        ("(handler-case (loop for t from 1 to 3 collect 1) (program-error () :pe))", ":PE"),
+        (
+            "(handler-case (loop for t from 1 to 3 collect 1) (program-error () :pe))",
+            ":PE",
+        ),
     ];
     run_expression_cases_batched(&cases);
 }
@@ -3406,19 +3418,31 @@ fn type_of_agrees_with_subtypep_for_characters_and_strings() {
         ("(type-of #\\Rubout)", "BASE-CHAR"),
         ("(type-of (code-char 955))", "EXTENDED-CHAR"),
         ("(subtypep (type-of #\\a) 'base-char)", "T"),
-        ("(subtypep (type-of (make-string 2 :initial-element (code-char 955))) 'sequence)", "T"),
+        (
+            "(subtypep (type-of (make-string 2 :initial-element (code-char 955))) 'sequence)",
+            "T",
+        ),
         ("(subtypep '(simple-array character (3)) 'vector)", "T"),
         ("(subtypep '(array t (*)) 'sequence)", "T"),
         ("(subtypep '(simple-array t (2 3)) 'sequence)", "NIL"),
-        ("(subtypep '(simple-array character (3)) 'simple-array)", "T"),
+        (
+            "(subtypep '(simple-array character (3)) 'simple-array)",
+            "T",
+        ),
         // Built-in objects answer their class's name, a generic function its
         // class, a structure type is an ATOM, and only a simple vector is a
         // SIMPLE-ARRAY (ansi type-of.1/.4).
         ("(type-of (find-package :cl))", "PACKAGE"),
         ("(type-of (make-hash-table))", "HASH-TABLE"),
         ("(type-of (make-string-output-stream))", "STRING-STREAM"),
-        ("(progn (defgeneric tos-gf (x)) (type-of #'tos-gf))", "STANDARD-GENERIC-FUNCTION"),
-        ("(progn (defstruct tos-s a) (multiple-value-list (subtypep 'tos-s 'atom)))", "(T T)"),
+        (
+            "(progn (defgeneric tos-gf (x)) (type-of #'tos-gf))",
+            "STANDARD-GENERIC-FUNCTION",
+        ),
+        (
+            "(progn (defstruct tos-s a) (multiple-value-list (subtypep 'tos-s 'atom)))",
+            "(T T)",
+        ),
         ("(typep (make-array 2 :adjustable t) 'simple-array)", "NIL"),
         ("(typep (make-array 2) 'simple-array)", "T"),
         ("(typep (make-array 2 :adjustable t) 'array)", "T"),
@@ -3470,7 +3494,8 @@ fn type_of_agrees_with_subtypep_for_characters_and_strings() {
             .find(|l| !l.is_empty())
             .unwrap_or("");
         assert_eq!(
-            got, expected,
+            got,
+            expected,
             "{expr} => expected {expected}, got: {got} (stderr: {})",
             String::from_utf8_lossy(&out.stderr)
         );
@@ -4063,7 +4088,8 @@ fn format_exponential_sign_width_and_scale() {
             .find(|l| !l.is_empty())
             .unwrap_or("");
         assert_eq!(
-            got, expected,
+            got,
+            expected,
             "{expr} => expected {expected}, got: {got} (stderr: {})",
             String::from_utf8_lossy(&out.stderr)
         );
@@ -4207,10 +4233,16 @@ fn misc_time_type_and_pathname_designators() {
 fn format_indirection_takes_a_function_control() {
     let cases = [
         ("(format nil \"~?\" (formatter \"<~a>\") '(1))", "\"<1>\""),
-        ("(format nil \"~?|~a\" (formatter \"~a\") '(1 2) 3)", "\"1|3\""),
+        (
+            "(format nil \"~?|~a\" (formatter \"~a\") '(1 2) 3)",
+            "\"1|3\"",
+        ),
         ("(format nil \"~@?|~a\" (formatter \"~a\") 1 2)", "\"1|2\""),
         ("(format nil \"~?\" \"[~a]\" '(4))", "\"[4]\""),
-        ("(handler-case (format nil \"~?\" 42 nil) (type-error () :type-error))", ":TYPE-ERROR"),
+        (
+            "(handler-case (format nil \"~?\" 42 nil) (type-error () :type-error))",
+            ":TYPE-ERROR",
+        ),
         (
             "(handler-case (format nil \"~?\" '(lambda (stream &rest args) (declare (ignore stream args)) nil) nil) (type-error () :type-error))",
             ":TYPE-ERROR",
@@ -4228,7 +4260,8 @@ fn format_indirection_takes_a_function_control() {
             .find(|l| !l.is_empty())
             .unwrap_or("");
         assert_eq!(
-            got, expected,
+            got,
+            expected,
             "{expr} => expected {expected}, got: {got} (stderr: {})",
             String::from_utf8_lossy(&out.stderr)
         );
@@ -4292,14 +4325,38 @@ fn subtypep_compound_subtypes() {
 #[test]
 fn subtypep_treats_merged_float_formats_as_one_type() {
     let cases = [
-        ("(multiple-value-list (subtypep 'short-float 'single-float))", "(T T)"),
-        ("(multiple-value-list (subtypep 'single-float 'short-float))", "(T T)"),
-        ("(multiple-value-list (subtypep 'long-float 'double-float))", "(T T)"),
-        ("(multiple-value-list (subtypep 'double-float 'long-float))", "(T T)"),
-        ("(multiple-value-list (subtypep '(short-float 0.0 1.0) '(single-float 0.0)))", "(T T)"),
-        ("(multiple-value-list (subtypep 'single-float 'double-float))", "(NIL T)"),
-        ("(multiple-value-list (subtypep 'short-float 'long-float))", "(NIL T)"),
-        ("(multiple-value-list (subtypep 'long-float 'float))", "(T T)"),
+        (
+            "(multiple-value-list (subtypep 'short-float 'single-float))",
+            "(T T)",
+        ),
+        (
+            "(multiple-value-list (subtypep 'single-float 'short-float))",
+            "(T T)",
+        ),
+        (
+            "(multiple-value-list (subtypep 'long-float 'double-float))",
+            "(T T)",
+        ),
+        (
+            "(multiple-value-list (subtypep 'double-float 'long-float))",
+            "(T T)",
+        ),
+        (
+            "(multiple-value-list (subtypep '(short-float 0.0 1.0) '(single-float 0.0)))",
+            "(T T)",
+        ),
+        (
+            "(multiple-value-list (subtypep 'single-float 'double-float))",
+            "(NIL T)",
+        ),
+        (
+            "(multiple-value-list (subtypep 'short-float 'long-float))",
+            "(NIL T)",
+        ),
+        (
+            "(multiple-value-list (subtypep 'long-float 'float))",
+            "(T T)",
+        ),
     ];
     for (expr, expected) in cases {
         let out = egcl_bin()
@@ -4313,7 +4370,8 @@ fn subtypep_treats_merged_float_formats_as_one_type() {
             .find(|l| !l.is_empty())
             .unwrap_or("");
         assert_eq!(
-            got, expected,
+            got,
+            expected,
             "{expr} => expected {expected}, got: {got} (stderr: {})",
             String::from_utf8_lossy(&out.stderr)
         );
@@ -4482,9 +4540,15 @@ fn read_nd_array_literal_and_equalp_roundtrip() {
         ),
         // A bit vector supplies a level like any sequence, and an empty level
         // gives the axes below it length 0 (syntax.sharp-a.7, .18, .22-23).
-        ("(coerce (read-from-string \"#1a#*000110\") 'list)", "(0 0 0 1 1 0)"),
+        (
+            "(coerce (read-from-string \"#1a#*000110\") 'list)",
+            "(0 0 0 1 1 0)",
+        ),
         ("(array-dimensions (read-from-string \"#2anil\"))", "(0 0)"),
-        ("(array-dimensions (read-from-string \"#2a\\\"\\\"\"))", "(0 0)"),
+        (
+            "(array-dimensions (read-from-string \"#2a\\\"\\\"\"))",
+            "(0 0)",
+        ),
         ("(array-dimensions (read-from-string \"#2a#*\"))", "(0 0)"),
         ("(array-dimensions (read-from-string \"#3a()\"))", "(0 0 0)"),
         ("(array-dimensions (read-from-string \"#2a(())\"))", "(1 0)"),
@@ -4999,7 +5063,8 @@ fn char_name_round_trips() {
 /// CHAR-NAME keeps answering the standard name, so round trips are unchanged.
 #[test]
 fn name_char_reads_the_shared_implementation_aliases() {
-    let prog = "(prin1 (list (char-code #\\ff) (char-code #\\Formfeed) (char-code #\\lf) (char-code #\\cr)
+    let prog =
+        "(prin1 (list (char-code #\\ff) (char-code #\\Formfeed) (char-code #\\lf) (char-code #\\cr)
                       (char-code #\\bs) (char-code #\\ht) (char-code #\\sp) (char-code #\\del)
                       (char-code #\\altmode) (char-name #\\ff) (char-name #\\del)))";
     let out = egcl_bin()
@@ -6937,7 +7002,12 @@ fn defstruct_empty_string_conc_name_interns_accessors_in_the_current_package() {
                 (cn-slots::cn-b (make-cn-none :cn-b 2)) \
                 (fboundp 'cn-b)))";
     let out = egcl_bin()
-        .args(["--eval", "(defpackage :cn-slots (:use))", "--eval", &format!("(progn {prog})")])
+        .args([
+            "--eval",
+            "(defpackage :cn-slots (:use))",
+            "--eval",
+            &format!("(progn {prog})"),
+        ])
         .output()
         .expect("run egcl");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -7460,17 +7530,35 @@ fn print_level_and_length_apply_to_arrays_and_vectors() {
             "(write-to-string #2A((4 (17)) (9 (a)) ((b) 0)) :level 2 :pretty nil)",
             "\"#2A((4 #) (9 #) (# 0))\"",
         ),
-        ("(write-to-string #2A(()) :level 1 :pretty nil)", "\"#2A(#)\""),
+        (
+            "(write-to-string #2A(()) :level 1 :pretty nil)",
+            "\"#2A(#)\"",
+        ),
         ("(write-to-string #2A(()) :level 0 :pretty nil)", "\"#\""),
-        ("(write-to-string '(#2A((a))) :level 2 :pretty nil)", "\"(#2A(#))\""),
-        ("(write-to-string #2A((1 2) (3 4)) :length 1 :pretty nil)", "\"#2A((1 ...) ...)\""),
-        ("(write-to-string #2A((1)) :length 0 :pretty nil)", "\"#2A(...)\""),
+        (
+            "(write-to-string '(#2A((a))) :level 2 :pretty nil)",
+            "\"(#2A(#))\"",
+        ),
+        (
+            "(write-to-string #2A((1 2) (3 4)) :length 1 :pretty nil)",
+            "\"#2A((1 ...) ...)\"",
+        ),
+        (
+            "(write-to-string #2A((1)) :length 0 :pretty nil)",
+            "\"#2A(...)\"",
+        ),
         (
             "(let ((*print-length* 1)) (prin1-to-string #2A((1 2) (3 4))))",
             "\"#2A((1 ...) ...)\"",
         ),
-        ("(let ((*print-length* 2)) (prin1-to-string #(1 2 3 4)))", "\"#(1 2 ...)\""),
-        ("(let ((*print-level* 1)) (format nil \"~s\" (list #(1 2))))", "\"(#)\""),
+        (
+            "(let ((*print-length* 2)) (prin1-to-string #(1 2 3 4)))",
+            "\"#(1 2 ...)\"",
+        ),
+        (
+            "(let ((*print-level* 1)) (format nil \"~s\" (list #(1 2))))",
+            "\"(#)\"",
+        ),
         (
             "(let ((v (make-array 4 :element-type '(unsigned-byte 8) :initial-contents '(1 2 3 4)))) (write-to-string v :length 2 :pretty nil))",
             "\"#(1 2 ...)\"",
@@ -7517,7 +7605,8 @@ fn print_level_and_length_apply_to_arrays_and_vectors() {
             .find(|l| !l.is_empty())
             .unwrap_or("");
         assert_eq!(
-            got, expected,
+            got,
+            expected,
             "{expr} => expected {expected}, got: {got} (stderr: {})",
             String::from_utf8_lossy(&out.stderr)
         );
@@ -9273,9 +9362,11 @@ fn deep_recursion_raises_catchable_storage_condition_not_sigsegv() {
         .output()
         .expect("run egcl");
     assert_eq!(ok.status.code(), Some(0));
-    assert!(String::from_utf8_lossy(&ok.stdout)
-        .to_uppercase()
-        .contains("DONE"));
+    assert!(
+        String::from_utf8_lossy(&ok.stdout)
+            .to_uppercase()
+            .contains("DONE")
+    );
 }
 
 /// bliss-j5fo: a HANDLER-BIND handler must fire for a STORAGE-CONDITION (stack
@@ -9509,20 +9600,38 @@ fn gcd_lcm_and_string_trim() {
 #[test]
 fn format_colon_tab_needs_pretty_printing() {
     let cases = [
-        ("(let ((*print-pretty* nil)) (format nil \"XX~10:tYY\"))", "\"XXYY\""),
-        ("(let ((*print-pretty* nil)) (format nil \"XX~10,20:@tYY\"))", "\"XXYY\""),
-        ("(let ((*print-pretty* nil)) (format nil \"~v:t~a\" 10 \"x\"))", "\"x\""),
+        (
+            "(let ((*print-pretty* nil)) (format nil \"XX~10:tYY\"))",
+            "\"XXYY\"",
+        ),
+        (
+            "(let ((*print-pretty* nil)) (format nil \"XX~10,20:@tYY\"))",
+            "\"XXYY\"",
+        ),
+        (
+            "(let ((*print-pretty* nil)) (format nil \"~v:t~a\" 10 \"x\"))",
+            "\"x\"",
+        ),
         (
             "(let ((*print-pretty* nil)) (format nil \"~v,v:@t~a\" 10 20 \"x\"))",
             "\"x\"",
         ),
-        ("(let ((*print-pretty* t)) (format nil \"XX~10:tYY\"))", "\"XXYY\""),
+        (
+            "(let ((*print-pretty* t)) (format nil \"XX~10:tYY\"))",
+            "\"XXYY\"",
+        ),
         (
             "(let ((*print-pretty* t)) (format nil \"XX~10,20:@tYY\"))",
             "\"XXYY\"",
         ),
-        ("(let ((*print-pretty* nil)) (format nil \"XX~4tYY\"))", "\"XX  YY\""),
-        ("(let ((*print-pretty* nil)) (format nil \"XX~2@tYY\"))", "\"XX  YY\""),
+        (
+            "(let ((*print-pretty* nil)) (format nil \"XX~4tYY\"))",
+            "\"XX  YY\"",
+        ),
+        (
+            "(let ((*print-pretty* nil)) (format nil \"XX~2@tYY\"))",
+            "\"XX  YY\"",
+        ),
     ];
     for (expr, expected) in cases {
         let out = egcl_bin()
@@ -9536,7 +9645,8 @@ fn format_colon_tab_needs_pretty_printing() {
             .find(|l| !l.is_empty())
             .unwrap_or("");
         assert_eq!(
-            got, expected,
+            got,
+            expected,
             "{expr} => expected {expected}, got: {got} (stderr: {})",
             String::from_utf8_lossy(&out.stderr)
         );
@@ -10834,8 +10944,7 @@ fn random_returns_a_value_in_range() {
 fn pathname_directory_returns_a_list_not_a_namestring() {
     // bliss-lb6: PATHNAME-DIRECTORY must return (:absolute|:relative comp…) so
     // UIOP/ANSI directory-list arithmetic works, not a namestring string.
-    let prog =
-        "(let ((d (pathname-directory (make-pathname :directory (list :absolute \"a\" \"b\"))))) \
+    let prog = "(let ((d (pathname-directory (make-pathname :directory (list :absolute \"a\" \"b\"))))) \
        (format t \"~a ~a ~a\" (eq (car d) :absolute) (second d) (third d)))";
     let output = egcl_bin()
         .args(["--eval", prog])
@@ -11134,7 +11243,8 @@ fn compiled_macro_whole_includes_operator_and_all_args() {
 /// then found *SIMILARITY-LIST* unbound in 27 printer tests.
 #[test]
 fn compile_file_declaim_special_takes_effect_for_the_rest_of_the_file() {
-    let dir = std::env::temp_dir().join(format!("egcl_test_declaim_special_{}", std::process::id()));
+    let dir =
+        std::env::temp_dir().join(format!("egcl_test_declaim_special_{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create declaim special test dir");
     let src = dir.join("ds.lisp");
     std::fs::write(
@@ -11225,7 +11335,11 @@ fn closure_retention(extra_env: &[(&str, &str)]) -> Vec<(String, i64)> {
         cmd.env(key, value);
     }
     let output = cmd
-        .args(["--no-init", "--eval", &format!("(progn {CLOSURE_RETENTION_PROGRAM})")])
+        .args([
+            "--no-init",
+            "--eval",
+            &format!("(progn {CLOSURE_RETENTION_PROGRAM})"),
+        ])
         .output()
         .expect("run egcl");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -14514,17 +14628,47 @@ fn multiple_value_setq_assigns_to_an_uninterned_variable() {
 #[test]
 fn make_array_numeric_defaults_support_read_modify_write() {
     run_expression_cases_batched(&[
-        ("(make-array 4 :element-type '(unsigned-byte 8))", "#(0 0 0 0)"),
-        ("(make-array '(2) :element-type '(signed-byte 32))", "#(0 0)"),
-        ("(make-array '(2 2) :element-type '(unsigned-byte 32))", "#2A((0 0) (0 0))"),
+        (
+            "(make-array 4 :element-type '(unsigned-byte 8))",
+            "#(0 0 0 0)",
+        ),
+        (
+            "(make-array '(2) :element-type '(signed-byte 32))",
+            "#(0 0)",
+        ),
+        (
+            "(make-array '(2 2) :element-type '(unsigned-byte 32))",
+            "#2A((0 0) (0 0))",
+        ),
         ("(aref (make-array nil :element-type 'integer))", "0"),
-        ("(aref (make-array 2 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 1) 1)", "0"),
-        ("(let ((a (make-array 4 :element-type '(unsigned-byte 8)))) (setf (ldb (byte 8 0) (aref a 0)) 255) a)", "#(255 0 0 0)"),
-        ("(let ((a (make-array 1 :element-type '(unsigned-byte 32)))) (setf (ldb (byte 8 8) (aref a 0)) 171) (setf (ldb (byte 8 0) (aref a 0)) 205) (aref a 0))", "43981"),
-        ("(let ((x (aref (make-array 1 :element-type 'single-float) 0))) (and (typep x 'single-float) (zerop x)))", "T"),
-        ("(let ((x (aref (make-array 1 :element-type 'double-float) 0))) (and (typep x 'double-float) (zerop x)))", "T"),
-        ("(make-array 2 :element-type '(unsigned-byte 8) :initial-element 17)", "#(17 17)"),
-        ("(make-array 2 :element-type '(unsigned-byte 8) :initial-contents '(3 4))", "#(3 4)"),
+        (
+            "(aref (make-array 2 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 1) 1)",
+            "0",
+        ),
+        (
+            "(let ((a (make-array 4 :element-type '(unsigned-byte 8)))) (setf (ldb (byte 8 0) (aref a 0)) 255) a)",
+            "#(255 0 0 0)",
+        ),
+        (
+            "(let ((a (make-array 1 :element-type '(unsigned-byte 32)))) (setf (ldb (byte 8 8) (aref a 0)) 171) (setf (ldb (byte 8 0) (aref a 0)) 205) (aref a 0))",
+            "43981",
+        ),
+        (
+            "(let ((x (aref (make-array 1 :element-type 'single-float) 0))) (and (typep x 'single-float) (zerop x)))",
+            "T",
+        ),
+        (
+            "(let ((x (aref (make-array 1 :element-type 'double-float) 0))) (and (typep x 'double-float) (zerop x)))",
+            "T",
+        ),
+        (
+            "(make-array 2 :element-type '(unsigned-byte 8) :initial-element 17)",
+            "#(17 17)",
+        ),
+        (
+            "(make-array 2 :element-type '(unsigned-byte 8) :initial-contents '(3 4))",
+            "#(3 4)",
+        ),
         ("(make-array 2 :initial-element nil)", "#(NIL NIL)"),
     ]);
 }
@@ -18194,11 +18338,26 @@ fn stringp_keeps_its_answer_across_tier_promotion() {
 #[test]
 fn constant_let_bindings_signal_before_initializers_run() {
     run_expression_cases_batched(&[
-        ("(handler-case (let ((t 1)) t) (program-error () :pe))", ":PE"),
-        ("(handler-case (let* ((nil 1)) nil) (program-error () :pe))", ":PE"),
-        ("(handler-case (let ((:key 1)) :key) (program-error () :pe))", ":PE"),
-        ("(handler-case (let ((pi 1)) pi) (program-error () :pe))", ":PE"),
-        ("(let ((hit nil)) (handler-case (let ((t (setq hit t))) t) (program-error () nil)) hit)", "NIL"),
+        (
+            "(handler-case (let ((t 1)) t) (program-error () :pe))",
+            ":PE",
+        ),
+        (
+            "(handler-case (let* ((nil 1)) nil) (program-error () :pe))",
+            ":PE",
+        ),
+        (
+            "(handler-case (let ((:key 1)) :key) (program-error () :pe))",
+            ":PE",
+        ),
+        (
+            "(handler-case (let ((pi 1)) pi) (program-error () :pe))",
+            ":PE",
+        ),
+        (
+            "(let ((hit nil)) (handler-case (let ((t (setq hit t))) t) (program-error () nil)) hit)",
+            "NIL",
+        ),
         ("(let ((x 1)) (let* ((y x) (x 2)) (list x y)))", "(2 1)"),
     ]);
 }
@@ -20457,34 +20616,67 @@ fn print_unreadable_object_macro() {
 #[test]
 fn typep_compound_cons_checks_both_parts() {
     run_expression_cases(&[
-        (r#"(typep '(input "") '(cons symbol (cons vector null)))"#, "T"),
+        (
+            r#"(typep '(input "") '(cons symbol (cons vector null)))"#,
+            "T",
+        ),
         ("(typep '(1 . a) '(cons integer symbol))", "T"),
         ("(typep '(1 . 2) '(cons integer symbol))", "NIL"),
         ("(typep '(a . 2) '(cons integer integer))", "NIL"),
         ("(typep nil '(cons))", "NIL"),
         ("(typep (lambda () 1) '(cons * *))", "NIL"),
-        ("(list (typep '(1) '(cons)) (typep '(1) '(cons integer)) (typep '(a . 1) '(cons * integer)) (typep '(a) '(cons nil *)))", "(T T T NIL)"),
-        ("(progn (deftype cons-positive () '(integer 1 *)) (typep '(2 . 3) '(cons cons-positive cons-positive)))", "T"),
-        ("(typep '(1 . 2) '(cons (satisfies oddp) (satisfies evenp)))", "T"),
+        (
+            "(list (typep '(1) '(cons)) (typep '(1) '(cons integer)) (typep '(a . 1) '(cons * integer)) (typep '(a) '(cons nil *)))",
+            "(T T T NIL)",
+        ),
+        (
+            "(progn (deftype cons-positive () '(integer 1 *)) (typep '(2 . 3) '(cons cons-positive cons-positive)))",
+            "T",
+        ),
+        (
+            "(typep '(1 . 2) '(cons (satisfies oddp) (satisfies evenp)))",
+            "T",
+        ),
     ]);
 }
 
 #[test]
 fn loop_driver_bindings_exist_before_initially_and_after_empty_iteration() {
     run_expression_cases(&[
-        ("(loop for (v . tail) on nil finally (return (list v tail)))", "(NIL NIL)"),
-        ("(loop for (v . tail) in nil finally (return (list v tail)))", "(NIL NIL)"),
-        ("(let ((tail :outer)) (list (loop for (v . tail) on nil finally (return tail)) tail))", "(NIL :OUTER)"),
-        ("(loop for (v . tail) on '(1 2) finally (return (list v tail)))", "(2 NIL)"),
+        (
+            "(loop for (v . tail) on nil finally (return (list v tail)))",
+            "(NIL NIL)",
+        ),
+        (
+            "(loop for (v . tail) in nil finally (return (list v tail)))",
+            "(NIL NIL)",
+        ),
+        (
+            "(let ((tail :outer)) (list (loop for (v . tail) on nil finally (return tail)) tail))",
+            "(NIL :OUTER)",
+        ),
+        (
+            "(loop for (v . tail) on '(1 2) finally (return (list v tail)))",
+            "(2 NIL)",
+        ),
         ("(loop for tail on '(1 2) finally (return tail))", "NIL"),
-        ("(loop for (v . tail) on '(1 2) initially (return (list v tail)))", "(NIL NIL)"),
+        (
+            "(loop for (v . tail) on '(1 2) initially (return (list v tail)))",
+            "(NIL NIL)",
+        ),
         ("(loop for tail on '(1 2) initially (return tail))", "(1 2)"),
         ("(loop for x in '(1 2) initially (return x))", "NIL"),
         ("(loop for x from 7 below 9 initially (return x))", "7"),
         ("(loop for x = 42 initially (return x))", "NIL"),
         ("(loop for x across #() finally (return x))", "NIL"),
-        ("(loop for k being the hash-keys of (make-hash-table) using (hash-value v) finally (return (list k v)))", "(NIL NIL)"),
-        ("(let ((xs '(1 2))) (loop for xs on xs initially (return xs)))", "(1 2)"),
+        (
+            "(loop for k being the hash-keys of (make-hash-table) using (hash-value v) finally (return (list k v)))",
+            "(NIL NIL)",
+        ),
+        (
+            "(let ((xs '(1 2))) (loop for xs on xs initially (return xs)))",
+            "(1 2)",
+        ),
     ]);
 }
 

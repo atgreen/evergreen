@@ -100,7 +100,7 @@ pub(super) fn emit(
 mod tests {
     use super::*;
     use crate::t2::ir::{AuxData, IRType, InstData, InstFlags, Opcode, ValueRepresentation};
-    use egcl_rt::object::{type_id, ObjectHeader};
+    use egcl_rt::object::{ObjectHeader, type_id};
     use egcl_rt::value::{EgclVal, NIL, T};
     use std::collections::HashMap;
 

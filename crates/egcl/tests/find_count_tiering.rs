@@ -143,7 +143,8 @@ fn find_and_count_no_longer_decline_for_a_closure_environment() {
     for name in NAMES {
         let prefix = format!("[T2] {name}:");
         assert!(
-            !log.lines().any(|l| l.starts_with(&prefix) && l.contains("closure environment")),
+            !log.lines()
+                .any(|l| l.starts_with(&prefix) && l.contains("closure environment")),
             "{name} still builds a capturing closure:\n{log}"
         );
         let tier = stdout

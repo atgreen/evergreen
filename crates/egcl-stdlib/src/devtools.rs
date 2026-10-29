@@ -4,6 +4,14 @@
 //! Developer tools — REPL, debugger, profiler, disassembler, Slynk support primitives.
 //! See spec §6.
 
+use egcl_rt::error::EgclError;
+use egcl_rt::lock_order::{LockLevel, OrderedMutex};
+use egcl_rt::object::{ConsCell, type_id};
+use egcl_rt::value::{
+    EOF_BITS, EgclVal, MISSING_BITS, NIL, NIL_BITS, T, T_BITS, TAG_CHARACTER, TAG_CONS, TAG_FIXNUM,
+    TAG_FUNCTION, TAG_HEAP_OBJECT, TAG_MASK, TAG_SINGLE_FLOAT, TAG_SPECIAL, TAG_SYMBOL,
+    UNBOUND_BITS,
+};
 use rustyline::completion::{Completer, FilenameCompleter, Pair};
 use rustyline::error::ReadlineError;
 use rustyline::highlight::{CmdKind, Highlighter, MatchingBracketHighlighter};
@@ -13,14 +21,6 @@ use rustyline::validate::{
     MatchingBracketValidator, ValidationContext, ValidationResult, Validator,
 };
 use rustyline::{CompletionType, Config, Context, Editor, Helper};
-use egcl_rt::error::EgclError;
-use egcl_rt::lock_order::{LockLevel, OrderedMutex};
-use egcl_rt::object::{ConsCell, type_id};
-use egcl_rt::value::{
-    EOF_BITS, MISSING_BITS, NIL, NIL_BITS, T, T_BITS, TAG_CHARACTER, TAG_CONS, TAG_FIXNUM,
-    TAG_FUNCTION, TAG_HEAP_OBJECT, TAG_MASK, TAG_SINGLE_FLOAT, TAG_SPECIAL, TAG_SYMBOL, EgclVal,
-    UNBOUND_BITS,
-};
 
 use std::collections::HashMap;
 use std::fmt::Write as FmtWrite;
@@ -681,7 +681,8 @@ pub fn backtrace_call(args: &[EgclVal]) -> Result<EgclVal, EgclError> {
         );
         let origin = match frames[index].origin {
             egcl_rt::debug_stack::FrameOrigin::Interpreted => 0,
-            egcl_rt::debug_stack::FrameOrigin::Managed | egcl_rt::debug_stack::FrameOrigin::Native => 1,
+            egcl_rt::debug_stack::FrameOrigin::Managed
+            | egcl_rt::debug_stack::FrameOrigin::Native => 1,
             egcl_rt::debug_stack::FrameOrigin::Entry => 2,
             egcl_rt::debug_stack::FrameOrigin::Foreign => 3,
         };
@@ -764,7 +765,9 @@ pub fn format_logical_frame(
     }
     let mut text = format!(
         "({}",
-        frame.function.as_deref()
+        frame
+            .function
+            .as_deref()
             .map(|name| crate::format::print_qualified_symbol_name(name, true))
             .unwrap_or_else(|| "<anonymous function>".into())
     );
@@ -1006,7 +1009,13 @@ pub fn invoke_debugger_ui(
     if let Some(historical) = &historical_frames {
         print_historical_frames(&mut stdout, historical, initial_count, 0);
     } else {
-        for (i, frame) in frames.as_ref().unwrap().iter().enumerate().take(initial_count) {
+        for (i, frame) in frames
+            .as_ref()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .take(initial_count)
+        {
             print_frame(&mut stdout, i, frame);
         }
     }
@@ -1076,13 +1085,7 @@ pub fn invoke_debugger_ui(
                 if let Some(historical) = &historical_frames {
                     print_historical_frames(&mut stdout, historical, count, 0);
                 } else {
-                    for (i, frame) in frames
-                        .as_ref()
-                        .unwrap()
-                        .iter()
-                        .enumerate()
-                        .take(count)
-                    {
+                    for (i, frame) in frames.as_ref().unwrap().iter().enumerate().take(count) {
                         print_frame(&mut stdout, i, frame);
                     }
                 }

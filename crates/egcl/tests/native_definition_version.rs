@@ -67,8 +67,14 @@ fn check_deopt_cleanup_roots(tier: &str, tier_number: u8) {
         // Ordinary guard recovery has its own entry, without the checked ABI's
         // Single/Inlined diagnostic. Tier, real guard failure, exact values and
         // stressed cleanup roots remain mandatory above.
-        assert!(stdout.contains("Ordinary x86-64 Lisp ABI"), "{stdout}\n{stderr}");
-        assert!(stdout.contains("native precise deopt veneer"), "{stdout}\n{stderr}");
+        assert!(
+            stdout.contains("Ordinary x86-64 Lisp ABI"),
+            "{stdout}\n{stderr}"
+        );
+        assert!(
+            stdout.contains("native precise deopt veneer"),
+            "{stdout}\n{stderr}"
+        );
     } else {
         let path = if tier == "t1" { "Single" } else { "Inlined" };
         assert!(
@@ -301,9 +307,13 @@ fn t2_deopt_retains_both_active_mapped_definitions() {
         .env_remove("EGCL_BACKEND")
         .env("EGCL_FORCE_TIER", "t2")
         .env("EGCL_LAZY_COMPILE", "0")
-        .output().expect("run mapped frame version regression");
+        .output()
+        .expect("run mapped frame version regression");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stdout}\n{stderr}");
-    assert!(stdout.contains("NESTED-DEOPT-VERSION-OK"), "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("NESTED-DEOPT-VERSION-OK"),
+        "{stdout}\n{stderr}"
+    );
 }

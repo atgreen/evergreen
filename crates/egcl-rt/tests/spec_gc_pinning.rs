@@ -5,11 +5,11 @@
 //! object keeps its address across collections, references to it from moved
 //! objects stay valid, and large objects are never copied.
 
-use std::sync::{Mutex, OnceLock};
 use egcl_rt::object::{ObjectHeader, type_id};
-use egcl_rt::value::{NIL, TAG_CONS, TAG_MASK, EgclVal};
-use egcl_rt::{Allocator, Collector, GcConfig, EgclStack, current_thread, init_heap, pin};
+use egcl_rt::value::{EgclVal, NIL, TAG_CONS, TAG_MASK};
+use egcl_rt::{Allocator, Collector, EgclStack, GcConfig, current_thread, init_heap, pin};
 use egcl_rt::{HeapAllocator, HeapCollector, full_gc, walk_heap};
+use std::sync::{Mutex, OnceLock};
 
 fn lock() -> &'static Mutex<()> {
     static L: OnceLock<Mutex<()>> = OnceLock::new();

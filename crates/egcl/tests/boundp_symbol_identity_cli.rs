@@ -129,6 +129,12 @@ fn boundp_identity_survives_compile_file_and_source_free_load() {
         "BOUNDP-COMPILE-OK",
     );
     fs::remove_file(source).unwrap();
-    run(&format!("(progn (load {artifact:?}) (funcall (find-symbol \"VERIFY\" \"BOUNDP-IDENTITY-PROBE\")))"), true, "BOUNDP-SYMBOL-IDENTITY-OK");
+    run(
+        &format!(
+            "(progn (load {artifact:?}) (funcall (find-symbol \"VERIFY\" \"BOUNDP-IDENTITY-PROBE\")))"
+        ),
+        true,
+        "BOUNDP-SYMBOL-IDENTITY-OK",
+    );
     fs::remove_dir_all(directory).unwrap();
 }

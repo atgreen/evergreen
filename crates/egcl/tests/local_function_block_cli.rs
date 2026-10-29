@@ -37,7 +37,10 @@ fn return_from_a_local_function_is_compiled() {
         "#
         );
         let stdout = eval(&program);
-        assert!(stdout.contains("RESULT:5 NIL"), "{local_operator}: {stdout}");
+        assert!(
+            stdout.contains("RESULT:5 NIL"),
+            "{local_operator}: {stdout}"
+        );
         assert!(
             stdout.contains("; FIRST-OVER —"),
             "{local_operator} function remained interpreted: {stdout}"

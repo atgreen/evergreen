@@ -64,7 +64,11 @@ fn expected() -> Vec<String> {
         .map(|&x| {
             let cl_mod = |a: i64, b: i64| {
                 let r = a % b;
-                if r != 0 && (r < 0) != (b < 0) { r + b } else { r }
+                if r != 0 && (r < 0) != (b < 0) {
+                    r + b
+                } else {
+                    r
+                }
             };
             format!(
                 "{x} {} {} {} {} {} {}",

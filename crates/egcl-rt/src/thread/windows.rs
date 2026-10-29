@@ -6,7 +6,7 @@
 //! The scheduler serializes mounts, including migration between carriers.
 //! Handles are deleted only after the last owner releases an unmounted fiber.
 
-use super::{Ordering, EgclError};
+use super::{EgclError, Ordering};
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::sync::atomic::AtomicUsize;

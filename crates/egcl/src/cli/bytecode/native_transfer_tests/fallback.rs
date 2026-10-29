@@ -111,20 +111,13 @@ fn native_v2_fallback_runs_nested_caller_cleanups_and_replacing_transfer() {
                     original.code
                 )
             });
-        egcl_compiler::t2::emit::emit_framed_native_cleanups(
-            &ir,
-            1,
-            original.num_slots(),
-            2,
-            3,
-            4,
-        )
-        .unwrap_or_else(|error| {
-            panic!(
-                "cleanup emission replace={replace}: {error:?}; {:?}",
-                original.code
-            )
-        });
+        egcl_compiler::t2::emit::emit_framed_native_cleanups(&ir, 1, original.num_slots(), 2, 3, 4)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "cleanup emission replace={replace}: {error:?}; {:?}",
+                    original.code
+                )
+            });
         let code = TransferCode::compile(original)
             .expect("exceptional protected region has a mapped fallback");
         let token = super::super::super::next_control_token("REPLACEMENT");

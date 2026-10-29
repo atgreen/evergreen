@@ -2,13 +2,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
 use super::*;
-use std::cell::Cell;
 use egcl_compiler::t2::native_transfer::{
     SysvTransferCapture, emit_capture_stub, emit_helper_veneer,
 };
 use egcl_compiler::t2::transfer_sites::{SysvSiteSnapshot, SysvTransferTable};
 use egcl_rt::jit::JitBuffer;
 use egcl_rt::native_transfer;
+use std::cell::Cell;
 
 struct CaptureState {
     code_base: usize,
@@ -142,12 +142,9 @@ fn native_v2_bridge_runs_compiled_lisp_callers_through_real_callees() {
         let veneer =
             JitBuffer::new(&emit_helper_veneer(observed_bridge, capture.as_ptr())).unwrap();
         let base_slots = body.n_locals + body.max_stack;
-        let (emitted, table) = egcl_compiler::t2::emit::emit_framed_transfers(
-            &ir,
-            veneer.as_ptr() as u64,
-            base_slots,
-        )
-        .unwrap();
+        let (emitted, table) =
+            egcl_compiler::t2::emit::emit_framed_transfers(&ir, veneer.as_ptr() as u64, base_slots)
+                .unwrap();
         assert_eq!(table.sites().count(), 2);
         let code = JitBuffer::new(&emitted.code).unwrap();
         let mut snapshots: Vec<_> = table

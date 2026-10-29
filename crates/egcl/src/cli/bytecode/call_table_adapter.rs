@@ -36,30 +36,36 @@ static NO_REVISION: u64 = u64::MAX;
 impl FuncallProbe {
     fn new() -> Self {
         Self {
-            entries: std::array::from_fn(|_| std::cell::UnsafeCell::new(
-                egcl_compiler::t2::native_transfer::OrdinaryFuncallProbeEntry {
-                    function: NIL.0,
-                    // No epoch reaches this value, so an empty entry never
-                    // reads its revision word.
-                    epoch: u64::MAX,
-                    collections: u64::MAX,
-                    revision_address: std::ptr::from_ref(&NO_REVISION) as u64,
-                    revision: 0,
-                    descriptor: 0,
-                })),
+            entries: std::array::from_fn(|_| {
+                std::cell::UnsafeCell::new(
+                    egcl_compiler::t2::native_transfer::OrdinaryFuncallProbeEntry {
+                        function: NIL.0,
+                        // No epoch reaches this value, so an empty entry never
+                        // reads its revision word.
+                        epoch: u64::MAX,
+                        collections: u64::MAX,
+                        revision_address: std::ptr::from_ref(&NO_REVISION) as u64,
+                        revision: 0,
+                        descriptor: 0,
+                    },
+                )
+            }),
             next: std::cell::Cell::new(0),
             rejected: std::cell::Cell::new((NIL.0, usize::MAX, u64::MAX, u64::MAX)),
         }
     }
 
     fn record(&self, entry: egcl_compiler::t2::native_transfer::OrdinaryFuncallProbeEntry) {
-        let index = if super::super::native_transfer_entry::ordinary_function_designators_enabled() {
+        let index = if super::super::native_transfer_entry::ordinary_function_designators_enabled()
+        {
             // A newly selected hot callable should take the first generated
             // comparison. Coalesce its old slot rather than filling the table
             // with duplicates when a mapped caller repeatedly records it.
-            let previous = self.entries.iter().position(|slot| unsafe {
-                (*slot.get()).function == entry.function
-            }).unwrap_or(self.entries.len() - 1);
+            let previous = self
+                .entries
+                .iter()
+                .position(|slot| unsafe { (*slot.get()).function == entry.function })
+                .unwrap_or(self.entries.len() - 1);
             if previous == 0 && unsafe { *self.entries[0].get() == entry } {
                 return;
             }
@@ -67,7 +73,9 @@ impl FuncallProbe {
                 // Only this execution writes, without allocating or yielding;
                 // no generated reader can observe this partial permutation.
                 unsafe {
-                    self.entries[index].get().write(*self.entries[index - 1].get());
+                    self.entries[index]
+                        .get()
+                        .write(*self.entries[index - 1].get());
                 }
             }
             0
@@ -92,7 +100,12 @@ pub(super) fn record_funcall(state: &State, function: EgclVal, nargs: usize) {
     if nargs > 3 {
         return;
     }
-    let Some(probe) = state.ordinary_adapters.borrow().first().and_then(|adapter| adapter.probe.clone()) else {
+    let Some(probe) = state
+        .ordinary_adapters
+        .borrow()
+        .first()
+        .and_then(|adapter| adapter.probe.clone())
+    else {
         return;
     };
     let epoch = egcl_rt::call_table::invalidation_epoch();
@@ -107,7 +120,12 @@ pub(super) fn record_funcall(state: &State, function: EgclVal, nargs: usize) {
 }
 
 fn record_funcall_target(
-    probe: &FuncallProbe, bits: u64, function: EgclVal, nargs: usize, epoch: u64, collections: u64,
+    probe: &FuncallProbe,
+    bits: u64,
+    function: EgclVal,
+    nargs: usize,
+    epoch: u64,
+    collections: u64,
 ) -> bool {
     use std::sync::atomic::Ordering;
     // A symbol designator selects its current function after all actuals
@@ -124,20 +142,26 @@ fn record_funcall_target(
     } else {
         function
     };
-    let Some((symbol, code)) = super::super::native_transfer_entry::funcall_fast::native_target(callable, nargs) else {
+    let Some((symbol, code)) =
+        super::super::native_transfer_entry::funcall_fast::native_target(callable, nargs)
+    else {
         return false;
     };
     if egcl_rt::symbols::symbol_function(symbol) != Some(callable) {
         return false;
     }
-    let Some(cell) = resolve(symbol) else { return false };
+    let Some(cell) = resolve(symbol) else {
+        return false;
+    };
     let current = || {
         let pointer = unsafe { &*cell.ordinary_entry_address() }.load(Ordering::Acquire);
-        (pointer != 0 && !cell.is_cold()).then_some(pointer).filter(|&pointer| {
-            let descriptor = unsafe { &*(pointer as *const OrdinaryEntryDescriptor) };
-            descriptor.owner == Rc::as_ptr(&code) as usize
-                && descriptor.revision == linkage::revision(cell.ordinal())
-        })
+        (pointer != 0 && !cell.is_cold())
+            .then_some(pointer)
+            .filter(|&pointer| {
+                let descriptor = unsafe { &*(pointer as *const OrdinaryEntryDescriptor) };
+                descriptor.owner == Rc::as_ptr(&code) as usize
+                    && descriptor.revision == linkage::revision(cell.ordinal())
+            })
     };
     // A cell that only FUNCALL reaches is never re-resolved by a named call,
     // so after an invalidation it stays cold. Publish what a named call would
@@ -148,7 +172,11 @@ fn record_funcall_target(
         None if !cell.is_cold() => return false,
         None => {
             let target_state = unsafe { super::state(Arc::as_ptr(&cell) as u64) };
-            super::publish_target(target_state, linkage::revision(cell.ordinal()), super::select_target(symbol, nargs));
+            super::publish_target(
+                target_state,
+                linkage::revision(cell.ordinal()),
+                super::select_target(symbol, nargs),
+            );
             let Some(pointer) = current() else {
                 return false;
             };
@@ -159,14 +187,16 @@ fn record_funcall_target(
     if !descriptor.accepts(nargs, ORDINARY_ENV_NONE) {
         return false;
     }
-    probe.record(egcl_compiler::t2::native_transfer::OrdinaryFuncallProbeEntry {
+    probe.record(
+        egcl_compiler::t2::native_transfer::OrdinaryFuncallProbeEntry {
             function: bits,
             epoch,
             collections,
             revision_address: cell.revision_address() as u64,
             revision: descriptor.revision,
             descriptor: pointer as u64,
-    });
+        },
+    );
     true
 }
 
@@ -176,14 +206,21 @@ fn funcall_adapter_code(state: &State, probe: &FuncallProbe) -> Vec<u8> {
         egcl_compiler::t2::native_transfer::OrdinaryFuncallProbe {
             table: probe.entries.as_ptr() as u64,
             epoch: egcl_rt::call_table::invalidation_epoch_address() as u64,
-            collections: super::super::native_transfer_entry::funcall_fast::collection_stamp_address() as u64,
+            collections: super::super::native_transfer_entry::funcall_fast::collection_stamp_address(
+            ) as u64,
             active_control: egcl_rt::exec_context::offsets::ACTIVE_NATIVE_CONTROL as i32,
-            stack_limit: std::mem::offset_of!(egcl_compiler::t2::emit::NativeRecursiveControl, stack_limit) as u8,
-        });
-    bytes.extend_from_slice(&egcl_compiler::t2::native_transfer::emit_ordinary_entry_veneer(
-        super::super::native_transfer_entry::ordinary_calls::named_entry,
-        Arc::as_ptr(&state.cell) as usize,
-    ));
+            stack_limit: std::mem::offset_of!(
+                egcl_compiler::t2::emit::NativeRecursiveControl,
+                stack_limit
+            ) as u8,
+        },
+    );
+    bytes.extend_from_slice(
+        &egcl_compiler::t2::native_transfer::emit_ordinary_entry_veneer(
+            super::super::native_transfer_entry::ordinary_calls::named_entry,
+            Arc::as_ptr(&state.cell) as usize,
+        ),
+    );
     bytes
 }
 
@@ -194,9 +231,14 @@ pub(super) fn ensure(state: &State) {
         // A public binding may have been warmed before primitive IDs were
         // initialized. Once reserved, only this state's semantic adapters may
         // remain in its ordinary slot; an earlier native body must be replaced.
-        let private = super::super::native_transfer_entry::ordinary_primitives::is_private(state.symbol);
-        if !private || state.ordinary_adapters.borrow().iter().any(|adapter|
-            std::ptr::from_ref(&adapter.descriptor) as usize == current)
+        let private =
+            super::super::native_transfer_entry::ordinary_primitives::is_private(state.symbol);
+        if !private
+            || state
+                .ordinary_adapters
+                .borrow()
+                .iter()
+                .any(|adapter| std::ptr::from_ref(&adapter.descriptor) as usize == current)
         {
             return;
         }
@@ -215,10 +257,15 @@ pub(super) fn ensure(state: &State) {
         return;
     }
     let (code, probe, code_len) = if let Some(previous) = adapters.first() {
-        (Rc::clone(&previous._code), previous.probe.clone(), previous.descriptor.code_len)
+        (
+            Rc::clone(&previous._code),
+            previous.probe.clone(),
+            previous.descriptor.code_len,
+        )
     } else {
         // The builtin FUNCALL cell first probes for a recorded target.
-        let probe = super::super::call_table_funcall::is_builtin(state.symbol).then(|| Rc::new(FuncallProbe::new()));
+        let probe = super::super::call_table_funcall::is_builtin(state.symbol)
+            .then(|| Rc::new(FuncallProbe::new()));
         // The adapter carries its call cell, which outlives it: the state
         // owns both, so the helper need not resolve the symbol per call.
         let bytes = match &probe {

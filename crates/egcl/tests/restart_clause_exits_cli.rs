@@ -73,7 +73,9 @@ fn restart_clauses_transfer_to_enclosing_exits_in_every_tier() {
 fn functions_with_exiting_restart_clauses_compile() {
     let stdout = run(
         Some("t0"),
-        &format!("(progn {DEFINITIONS} (restart-go) (restart-loop 2) (disassemble 'restart-go) (disassemble 'restart-loop))"),
+        &format!(
+            "(progn {DEFINITIONS} (restart-go) (restart-loop 2) (disassemble 'restart-go) (disassemble 'restart-loop))"
+        ),
     );
     assert!(stdout.contains("RESTART-GO —"), "{stdout}");
     assert!(stdout.contains("RESTART-LOOP —"), "{stdout}");
@@ -90,7 +92,10 @@ fn exiting_restart_clauses_work_from_a_fasl() {
     run(None, &format!(r#"(compile-file "{}")"#, source.display()));
     let stdout = run(
         None,
-        &format!(r#"(progn (load "{}") {PROBE})"#, dir.join("restart-exits.fasl").display()),
+        &format!(
+            r#"(progn (load "{}") {PROBE})"#,
+            dir.join("restart-exits.fasl").display()
+        ),
     );
     assert!(stdout.contains(EXPECTED), "{stdout}");
 }

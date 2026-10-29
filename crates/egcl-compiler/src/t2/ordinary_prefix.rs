@@ -85,7 +85,8 @@ fn walk(
         // Speculation marks guards and typed comparisons effectful to preserve
         // deopt ordering. Their successful paths are pure; failed prefix tests
         // enter the original framed guards. No other effects may be bypassed.
-        if d.flags.call || d.flags.safepoint
+        if d.flags.call
+            || d.flags.safepoint
             || (d.flags.effectful && !matches!(d.opcode, Opcode::Guard | Opcode::FixnumCmpLt))
         {
             return None;
@@ -125,7 +126,9 @@ fn walk(
                 if let Some(range) = ty.range {
                     let lo = range.lo.max(-(1_i64 << 60));
                     let hi = range.hi.min((1_i64 << 60) - 1);
-                    if lo > hi { return None; }
+                    if lo > hi {
+                        return None;
+                    }
                     // Keep type bounds distinct from source branch conditions:
                     // only the latter choose recursive specialization inputs.
                     checks.push(Check::Range(value, lo, hi));
@@ -253,9 +256,7 @@ pub(super) fn emit(a: &mut Asm, f: &Function, arity: usize, single: &HashSet<Ins
     emit_selected(a, &prefix, None);
 }
 
-fn emit_less_check(
-    a: &mut Asm, lhs: Atom, rhs: Atom, accepted: bool, miss: egcl_rt::asm::Label,
-) {
+fn emit_less_check(a: &mut Asm, lhs: Atom, rhs: Atom, accepted: bool, miss: egcl_rt::asm::Label) {
     let register = match lhs {
         Atom::Argument(register) => register,
         Atom::Constant(_) => {
@@ -276,7 +277,11 @@ fn emit_less_check(
 
 /// A call-site prefix joins its caller's result continuation without creating
 /// or retiring a frame. The caller has already checked poll and MV state.
-pub(super) fn emit_selected(a: &mut Asm, prefix: &Prefix, continuation: Option<egcl_rt::asm::Label>) {
+pub(super) fn emit_selected(
+    a: &mut Asm,
+    prefix: &Prefix,
+    continuation: Option<egcl_rt::asm::Label>,
+) {
     // A statically impossible guard must not produce an unconditional return.
     if prefix
         .checks
@@ -342,15 +347,24 @@ fn evaluate_pure(
         // just like the emitted shortcut. A valid outer argument cannot make
         // an invalid deeper call pure: preserve the original declaration error.
         let declared = f.value(parameter).ty;
-        if declared.class_id.is_some() { return None; }
+        if declared.class_id.is_some() {
+            return None;
+        }
         if declared.bits == TypeBits::FIXNUM {
-            if argument & 7 != 0 { return None; }
+            if argument & 7 != 0 {
+                return None;
+            }
             let value = (argument as i64) >> 3;
-            if declared.range.is_some_and(|range| value < range.lo || value > range.hi) {
+            if declared
+                .range
+                .is_some_and(|range| value < range.lo || value > range.hi)
+            {
                 return None;
             }
         } else if declared.bits == TypeBits::SINGLE_FLOAT && declared.range.is_none() {
-            if argument & 7 != 4 { return None; }
+            if argument & 7 != 4 {
+                return None;
+            }
         } else {
             return None;
         }
@@ -361,12 +375,17 @@ fn evaluate_pure(
         for &inst in &f.block(block).insts {
             *budget = budget.checked_sub(1)?;
             let d = f.inst(inst);
-            if d.args.iter().chain(&d.results)
+            if d.args
+                .iter()
+                .chain(&d.results)
                 .any(|&value| f.value(value).repr != ValueRepresentation::Tagged)
             {
                 return None;
             }
-            let args: Vec<u64> = d.args.iter().map(|v| values.get(v).copied())
+            let args: Vec<u64> = d
+                .args
+                .iter()
+                .map(|v| values.get(v).copied())
                 .collect::<Option<_>>()?;
             // Nothing below mutates the MV buffer. A successfully evaluated
             // recursive call also returns exactly one value, so every reset on
@@ -377,35 +396,58 @@ fn evaluate_pure(
             if d.opcode != Opcode::Call && (d.flags.call || d.flags.safepoint) {
                 return None;
             }
-            if d.flags.effectful && !matches!(d.opcode,
-                Opcode::Guard | Opcode::FixnumCmpLt | Opcode::FixnumAdd
-                    | Opcode::FixnumSub | Opcode::Call)
+            if d.flags.effectful
+                && !matches!(
+                    d.opcode,
+                    Opcode::Guard
+                        | Opcode::FixnumCmpLt
+                        | Opcode::FixnumAdd
+                        | Opcode::FixnumSub
+                        | Opcode::Call
+                )
             {
                 return None;
             }
             let result = match d.opcode {
                 Opcode::ConstFixnum => {
-                    let AuxData::FixnumImm(value) = d.aux else { return None };
-                    if !(-(1_i64 << 60)..(1_i64 << 60)).contains(&value) { return None; }
+                    let AuxData::FixnumImm(value) = d.aux else {
+                        return None;
+                    };
+                    if !(-(1_i64 << 60)..(1_i64 << 60)).contains(&value) {
+                        return None;
+                    }
                     (value as u64) << 3
                 }
                 Opcode::ConstNil => egcl_rt::value::NIL.0,
                 Opcode::ConstT => egcl_rt::value::T.0,
                 Opcode::Guard => {
-                    let AuxData::TypeTag(ty) = d.aux else { return None };
+                    let AuxData::TypeTag(ty) = d.aux else {
+                        return None;
+                    };
                     if ty.bits != TypeBits::FIXNUM
-                        || ty.class_id.is_some() || args.len() != 1 || args[0] & 7 != 0
+                        || ty.class_id.is_some()
+                        || args.len() != 1
+                        || args[0] & 7 != 0
                         || d.results.len() > 1
-                    { return None; }
-                    let value = (args[0] as i64) >> 3;
-                    if ty.range.is_some_and(|range| value < range.lo || value > range.hi) {
+                    {
                         return None;
                     }
-                    if d.results.is_empty() { continue; }
+                    let value = (args[0] as i64) >> 3;
+                    if ty
+                        .range
+                        .is_some_and(|range| value < range.lo || value > range.hi)
+                    {
+                        return None;
+                    }
+                    if d.results.is_empty() {
+                        continue;
+                    }
                     args[0]
                 }
                 Opcode::FixnumAdd | Opcode::FixnumSub | Opcode::FixnumCmpLt => {
-                    if args.len() != 2 || (args[0] | args[1]) & 7 != 0 { return None; }
+                    if args.len() != 2 || (args[0] | args[1]) & 7 != 0 {
+                        return None;
+                    }
                     let (lhs, rhs) = (args[0] as i64, args[1] as i64);
                     // Evaluate every executed checked operation, even if its
                     // result is dead. A failed check must preserve the original
@@ -413,31 +455,56 @@ fn evaluate_pure(
                     match d.opcode {
                         Opcode::FixnumAdd => lhs.checked_add(rhs)? as u64,
                         Opcode::FixnumSub => lhs.checked_sub(rhs)? as u64,
-                        _ => if lhs < rhs { egcl_rt::value::T.0 } else { egcl_rt::value::NIL.0 },
+                        _ => {
+                            if lhs < rhs {
+                                egcl_rt::value::T.0
+                            } else {
+                                egcl_rt::value::NIL.0
+                            }
+                        }
                     }
                 }
                 Opcode::Call => {
-                    if !self_calls.contains(&inst) || args.len() != 1
-                        || !d.flags.call || !d.flags.safepoint
-                    { return None; }
-                    let AuxData::CallTarget(symbol) = d.aux else { return None };
+                    if !self_calls.contains(&inst)
+                        || args.len() != 1
+                        || !d.flags.call
+                        || !d.flags.safepoint
+                    {
+                        return None;
+                    }
+                    let AuxData::CallTarget(symbol) = d.aux else {
+                        return None;
+                    };
                     let state = f.frame_states.get(d.frame_state?);
                     if state.scopes.len() != 1 || state.scopes[0].function != symbol {
                         return None;
                     }
                     *saw_call = true;
-                    evaluate_pure(f, args[0], self_calls, depth.checked_sub(1)?, budget, saw_call)?
+                    evaluate_pure(
+                        f,
+                        args[0],
+                        self_calls,
+                        depth.checked_sub(1)?,
+                        budget,
+                        saw_call,
+                    )?
                 }
                 Opcode::Jump | Opcode::Brif => {
                     let target = match d.opcode {
                         Opcode::Jump if args.is_empty() && d.targets.len() == 1 => &d.targets[0],
-                        Opcode::Brif if args.len() == 1 && d.targets.len() == 2 =>
-                            &d.targets[usize::from(args[0] == egcl_rt::value::NIL.0)],
+                        Opcode::Brif if args.len() == 1 && d.targets.len() == 2 => {
+                            &d.targets[usize::from(args[0] == egcl_rt::value::NIL.0)]
+                        }
                         _ => return None,
                     };
                     let params = &f.block(target.block).params;
-                    if params.len() != target.args.len() { return None; }
-                    let incoming: Vec<_> = target.args.iter().map(|v| values.get(v).copied())
+                    if params.len() != target.args.len() {
+                        return None;
+                    }
+                    let incoming: Vec<_> = target
+                        .args
+                        .iter()
+                        .map(|v| values.get(v).copied())
                         .collect::<Option<_>>()?;
                     for (&param, value) in params.iter().zip(incoming) {
                         values.insert(param, value);
@@ -448,7 +515,9 @@ fn evaluate_pure(
                 Opcode::Return if args.len() == 1 => return Some(args[0]),
                 _ => return None,
             };
-            if d.results.len() != 1 { return None; }
+            if d.results.len() != 1 {
+                return None;
+            }
             values.insert(d.results[0], result);
         }
         return None;
@@ -456,24 +525,39 @@ fn evaluate_pure(
 }
 
 pub(super) fn specialize(
-    f: &Function, arity: usize, single: &HashSet<Inst>, self_calls: &[Inst],
+    f: &Function,
+    arity: usize,
+    single: &HashSet<Inst>,
+    self_calls: &[Inst],
 ) -> Vec<Specialization> {
-    if arity != 1 || self_calls.is_empty() { return Vec::new(); }
-    let Some(prefix) = select(f, arity, single) else { return Vec::new() };
+    if arity != 1 || self_calls.is_empty() {
+        return Vec::new();
+    }
+    let Some(prefix) = select(f, arity, single) else {
+        return Vec::new();
+    };
     let Some((boundary, accepted)) = prefix.checks.iter().find_map(|check| match check {
-        Check::Less(Atom::Argument(7), Atom::Constant(bits), accepted) if bits & 7 == 0 =>
-            Some(((*bits as i64) >> 3, *accepted)),
+        Check::Less(Atom::Argument(7), Atom::Constant(bits), accepted) if bits & 7 == 0 => {
+            Some(((*bits as i64) >> 3, *accepted))
+        }
         _ => None,
-    }) else { return Vec::new() };
+    }) else {
+        return Vec::new();
+    };
     let mut specializations = Vec::new();
     // Bound both compile-time work and the amount of execution skipped between
     // polls: four candidates, at most three recursive edges deep and 512 IR
     // instructions per candidate. There is no runtime lookup table or helper.
     for offset in 0..4 {
-        let candidate = if accepted { boundary.checked_add(offset) }
-            else { boundary.checked_sub(offset + 1) };
+        let candidate = if accepted {
+            boundary.checked_add(offset)
+        } else {
+            boundary.checked_sub(offset + 1)
+        };
         let Some(candidate) = candidate.filter(|n| (-(1_i64 << 60)..(1_i64 << 60)).contains(n))
-            else { continue };
+        else {
+            continue;
+        };
         let argument = (candidate as u64) << 3;
         let mut saw_call = false;
         if let Some(result) = evaluate_pure(f, argument, self_calls, 3, &mut 512, &mut saw_call)
@@ -486,7 +570,9 @@ pub(super) fn specialize(
 }
 
 pub(super) fn emit_specializations(
-    a: &mut Asm, specializations: &[Specialization], continuation: egcl_rt::asm::Label,
+    a: &mut Asm,
+    specializations: &[Specialization],
+    continuation: egcl_rt::asm::Label,
 ) {
     for specialization in specializations {
         let miss = a.label();
@@ -542,33 +628,84 @@ mod tests {
         let base = f.make_block();
         let recur = f.make_block();
         let tagged = [(IRType::of(TypeBits::FIXNUM), ValueRepresentation::Tagged)];
-        let zero = f.push_inst(entry,
-            instruction(Opcode::ConstFixnum, vec![], AuxData::FixnumImm(0)), &tagged).1[0];
-        let less = f.push_inst(entry,
-            instruction(Opcode::FixnumCmpLt, vec![x, zero], AuxData::None), &tagged).1[0];
+        let zero = f
+            .push_inst(
+                entry,
+                instruction(Opcode::ConstFixnum, vec![], AuxData::FixnumImm(0)),
+                &tagged,
+            )
+            .1[0];
+        let less = f
+            .push_inst(
+                entry,
+                instruction(Opcode::FixnumCmpLt, vec![x, zero], AuxData::None),
+                &tagged,
+            )
+            .1[0];
         let mut branch = instruction(Opcode::Brif, vec![less], AuxData::None);
-        branch.targets = (if reverse { [recur, base] } else { [base, recur] }).into_iter()
-            .map(|block| BlockCall { block, args: vec![] }).collect();
+        branch.targets = (if reverse {
+            [recur, base]
+        } else {
+            [base, recur]
+        })
+        .into_iter()
+        .map(|block| BlockCall {
+            block,
+            args: vec![],
+        })
+        .collect();
         f.set_terminator(entry, branch);
         f.set_terminator(base, instruction(Opcode::Return, vec![x], AuxData::None));
-        let delta = f.push_inst(recur, instruction(Opcode::ConstFixnum, vec![],
-            AuxData::FixnumImm(if reverse { 1 } else { -1 })), &tagged).1[0];
-        let next = f.push_inst(recur,
-            instruction(Opcode::FixnumAdd, vec![x, delta], AuxData::None), &tagged).1[0];
+        let delta = f
+            .push_inst(
+                recur,
+                instruction(
+                    Opcode::ConstFixnum,
+                    vec![],
+                    AuxData::FixnumImm(if reverse { 1 } else { -1 }),
+                ),
+                &tagged,
+            )
+            .1[0];
+        let next = f
+            .push_inst(
+                recur,
+                instruction(Opcode::FixnumAdd, vec![x, delta], AuxData::None),
+                &tagged,
+            )
+            .1[0];
         let mut call = instruction(Opcode::Call, vec![next], AuxData::CallTarget(17));
         call.flags.call = true;
         call.flags.safepoint = true;
         call.flags.effectful = true;
         call.frame_state = Some(f.frame_states.add(FrameState {
-            scopes: vec![FrameScope { function: 17, bcp: 0, locals: vec![], stack: vec![] }],
+            scopes: vec![FrameScope {
+                function: 17,
+                bcp: 0,
+                locals: vec![],
+                stack: vec![],
+            }],
             remat: vec![],
         }));
         let (call, result) = f.push_inst(recur, call, &tagged);
-        let two = f.push_inst(recur,
-            instruction(Opcode::ConstFixnum, vec![], AuxData::FixnumImm(2)), &tagged).1[0];
-        let result = f.push_inst(recur,
-            instruction(Opcode::FixnumAdd, vec![result[0], two], AuxData::None), &tagged).1[0];
-        f.set_terminator(recur, instruction(Opcode::Return, vec![result], AuxData::None));
+        let two = f
+            .push_inst(
+                recur,
+                instruction(Opcode::ConstFixnum, vec![], AuxData::FixnumImm(2)),
+                &tagged,
+            )
+            .1[0];
+        let result = f
+            .push_inst(
+                recur,
+                instruction(Opcode::FixnumAdd, vec![result[0], two], AuxData::None),
+                &tagged,
+            )
+            .1[0];
+        f.set_terminator(
+            recur,
+            instruction(Opcode::Return, vec![result], AuxData::None),
+        );
         (f, call)
     }
 
@@ -588,12 +725,16 @@ mod tests {
             guard_return(&mut f, entry, lo, hi);
             for input in inputs {
                 let bits = (input as u64) << 3;
-                assert_eq!(evaluate_pure(&f, bits, &[], 3, &mut 512, &mut false),
+                assert_eq!(
+                    evaluate_pure(&f, bits, &[], 3, &mut 512, &mut false),
                     (lo..=hi).contains(&input).then_some(bits),
-                    "range [{lo}, {hi}], input {input}");
+                    "range [{lo}, {hi}], input {input}"
+                );
             }
-            assert_eq!(evaluate_pure(&f, egcl_rt::value::NIL.0,
-                &[], 3, &mut 512, &mut false), None);
+            assert_eq!(
+                evaluate_pure(&f, egcl_rt::value::NIL.0, &[], 3, &mut 512, &mut false),
+                None
+            );
         }
     }
 
@@ -608,7 +749,9 @@ mod tests {
         let mut guard = instruction(Opcode::Guard, vec![value], AuxData::TypeTag(ty));
         guard.flags.guard = true;
         guard.flags.effectful = true;
-        let checked = f.push_inst(block, guard, &[(ty, ValueRepresentation::Tagged)]).1[0];
+        let checked = f
+            .push_inst(block, guard, &[(ty, ValueRepresentation::Tagged)])
+            .1[0];
         f.inst_mut(ret).args = vec![checked];
         f.block_mut(block).insts.push(ret);
     }
@@ -640,8 +783,11 @@ mod tests {
             let code = egcl_rt::jit::JitBuffer::new(&a.finish().unwrap()).unwrap();
             let run: extern "C" fn(u64) -> u64 = unsafe { std::mem::transmute(code.as_ptr()) };
             for input in inputs {
-                assert_eq!(run((input as u64) << 3), u64::from((lo..=hi).contains(&input)),
-                    "range [{lo}, {hi}], input {input}");
+                assert_eq!(
+                    run((input as u64) << 3),
+                    u64::from((lo..=hi).contains(&input)),
+                    "range [{lo}, {hi}], input {input}"
+                );
             }
             assert_eq!(run(egcl_rt::value::NIL.0), 0);
         }
@@ -653,25 +799,45 @@ mod tests {
             let (mut f, call) = counter(reverse);
             let entry = f.entry();
             let parameter = f.block(entry).params[0];
-            let mut guard = instruction(Opcode::Guard, vec![parameter], AuxData::TypeTag(IRType {
-                range: Some(crate::t2::ir::Range { lo: -10, hi: 10 }),
-                ..IRType::of(TypeBits::FIXNUM)
-            }));
+            let mut guard = instruction(
+                Opcode::Guard,
+                vec![parameter],
+                AuxData::TypeTag(IRType {
+                    range: Some(crate::t2::ir::Range { lo: -10, hi: 10 }),
+                    ..IRType::of(TypeBits::FIXNUM)
+                }),
+            );
             guard.flags.guard = true;
             guard.flags.effectful = true;
             let (guard, _) = f.push_inst(entry, guard, &[]);
             assert_eq!(f.block_mut(entry).insts.pop(), Some(guard));
             f.block_mut(entry).insts.insert(0, guard);
-            let returns: Vec<_> = f.block_order().iter().copied().filter(|&block| {
-                f.terminator(block).is_some_and(|ret| f.inst(ret).opcode == Opcode::Return)
-            }).collect();
+            let returns: Vec<_> = f
+                .block_order()
+                .iter()
+                .copied()
+                .filter(|&block| {
+                    f.terminator(block)
+                        .is_some_and(|ret| f.inst(ret).opcode == Opcode::Return)
+                })
+                .collect();
             let (lo, hi) = if reverse { (0, 4) } else { (-1, 3) };
-            for block in returns { guard_return(&mut f, block, lo, hi); }
+            for block in returns {
+                guard_return(&mut f, block, lo, hi);
+            }
             let single = crate::t2::opt_clear_mv::single_value_state(&f, true);
-            let cases: Vec<_> = specialize(&f, 1, &single, &[call]).iter()
-                .map(|case| ((case.argument as i64) >> 3, (case.result as i64) >> 3)).collect();
-            assert_eq!(cases, if reverse { vec![(-1, 2), (-2, 4)] }
-                else { vec![(0, 1), (1, 3)] });
+            let cases: Vec<_> = specialize(&f, 1, &single, &[call])
+                .iter()
+                .map(|case| ((case.argument as i64) >> 3, (case.result as i64) >> 3))
+                .collect();
+            assert_eq!(
+                cases,
+                if reverse {
+                    vec![(-1, 2), (-2, 4)]
+                } else {
+                    vec![(0, 1), (1, 3)]
+                }
+            );
         }
     }
 
@@ -681,32 +847,62 @@ mod tests {
             let (f, call) = counter(reverse);
             let single = crate::t2::opt_clear_mv::single_value_state(&f, true);
             let cases = specialize(&f, 1, &single, &[call]);
-            let cases: Vec<_> = cases.iter()
-                .map(|case| ((case.argument as i64) >> 3, (case.result as i64) >> 3)).collect();
-            assert_eq!(cases, if reverse { vec![(-1, 2), (-2, 4), (-3, 6)] }
-                else { vec![(0, 1), (1, 3), (2, 5)] });
-            assert!(specialize(&f, 1, &single, &[]).is_empty(), "source proof is required");
-            assert!(specialize(&f, 2, &single, &[call]).is_empty(), "all inputs must be known");
+            let cases: Vec<_> = cases
+                .iter()
+                .map(|case| ((case.argument as i64) >> 3, (case.result as i64) >> 3))
+                .collect();
+            assert_eq!(
+                cases,
+                if reverse {
+                    vec![(-1, 2), (-2, 4), (-3, 6)]
+                } else {
+                    vec![(0, 1), (1, 3), (2, 5)]
+                }
+            );
+            assert!(
+                specialize(&f, 1, &single, &[]).is_empty(),
+                "source proof is required"
+            );
+            assert!(
+                specialize(&f, 2, &single, &[call]).is_empty(),
+                "all inputs must be known"
+            );
         }
     }
 
     #[test]
     fn partial_evaluation_preserves_unused_overflow_and_type_failures() {
-        for (opcode, input) in [(Opcode::FixnumAdd, (1_i64 << 60) - 1),
-            (Opcode::FixnumSub, -(1_i64 << 60))]
-        {
+        for (opcode, input) in [
+            (Opcode::FixnumAdd, (1_i64 << 60) - 1),
+            (Opcode::FixnumSub, -(1_i64 << 60)),
+        ] {
             let mut f = identity();
             let entry = f.entry();
             let x = f.block(entry).params[0];
             f.block_mut(entry).insts.clear();
             let tagged = [(IRType::of(TypeBits::FIXNUM), ValueRepresentation::Tagged)];
-            let one = f.push_inst(entry,
-                instruction(Opcode::ConstFixnum, vec![], AuxData::FixnumImm(1)), &tagged).1[0];
-            f.push_inst(entry, instruction(opcode, vec![x, one], AuxData::None), &tagged);
+            let one = f
+                .push_inst(
+                    entry,
+                    instruction(Opcode::ConstFixnum, vec![], AuxData::FixnumImm(1)),
+                    &tagged,
+                )
+                .1[0];
+            f.push_inst(
+                entry,
+                instruction(opcode, vec![x, one], AuxData::None),
+                &tagged,
+            );
             f.set_terminator(entry, instruction(Opcode::Return, vec![one], AuxData::None));
             assert_eq!(evaluate_pure(&f, 0, &[], 3, &mut 512, &mut false), Some(8));
-            assert_eq!(evaluate_pure(&f, (input as u64) << 3, &[], 3, &mut 512, &mut false), None);
-            assert_eq!(evaluate_pure(&f, egcl_rt::value::NIL.0, &[], 3, &mut 512, &mut false), None);
+            assert_eq!(
+                evaluate_pure(&f, (input as u64) << 3, &[], 3, &mut 512, &mut false),
+                None
+            );
+            assert_eq!(
+                evaluate_pure(&f, egcl_rt::value::NIL.0, &[], 3, &mut 512, &mut false),
+                None
+            );
         }
     }
 
@@ -716,32 +912,53 @@ mod tests {
         let (mut f, call) = counter(false);
         let parameter = f.block(f.entry()).params[0];
         f.mark_entry_param_checked(parameter);
-        f.refine_type(parameter, IRType {
-            range: Some(Range { lo: 0, hi: 0 }),
-            ..IRType::of(TypeBits::FIXNUM)
-        });
+        f.refine_type(
+            parameter,
+            IRType {
+                range: Some(Range { lo: 0, hi: 0 }),
+                ..IRType::of(TypeBits::FIXNUM)
+            },
+        );
         // The outer argument is valid; its nested call with -1 is not.
         assert_eq!(evaluate_pure(&f, 0, &[call], 3, &mut 512, &mut false), None);
         let single = crate::t2::opt_clear_mv::single_value_state(&f, true);
         assert!(specialize(&f, 1, &single, &[call]).is_empty());
-        f.refine_type(parameter, IRType {
-            range: Some(Range { lo: -1, hi: 2 }),
-            ..IRType::of(TypeBits::FIXNUM)
-        });
-        assert_eq!(evaluate_pure(&f, 0, &[call], 3, &mut 512, &mut false), Some(8));
+        f.refine_type(
+            parameter,
+            IRType {
+                range: Some(Range { lo: -1, hi: 2 }),
+                ..IRType::of(TypeBits::FIXNUM)
+            },
+        );
+        assert_eq!(
+            evaluate_pure(&f, 0, &[call], 3, &mut 512, &mut false),
+            Some(8)
+        );
         assert!(!specialize(&f, 1, &single, &[call]).is_empty());
         let mut identity = identity();
         let parameter = identity.block(identity.entry()).params[0];
         identity.mark_entry_param_checked(parameter);
         identity.refine_type(parameter, IRType::of(TypeBits::FIXNUM));
-        assert_eq!(evaluate_pure(&identity, egcl_rt::value::NIL.0,
-            &[], 3, &mut 512, &mut false), None);
+        assert_eq!(
+            evaluate_pure(
+                &identity,
+                egcl_rt::value::NIL.0,
+                &[],
+                3,
+                &mut 512,
+                &mut false
+            ),
+            None
+        );
     }
 
     #[test]
     fn partial_evaluation_requires_identity_and_finite_work() {
         let (mut f, call) = counter(false);
-        assert_eq!(evaluate_pure(&f, 0, &[call], 3, &mut 512, &mut false), Some(8));
+        assert_eq!(
+            evaluate_pure(&f, 0, &[call], 3, &mut 512, &mut false),
+            Some(8)
+        );
         assert_eq!(evaluate_pure(&f, 0, &[], 3, &mut 512, &mut false), None);
         assert_eq!(evaluate_pure(&f, 0, &[call], 0, &mut 512, &mut false), None);
         assert_eq!(evaluate_pure(&f, 0, &[call], 3, &mut 2, &mut false), None);
@@ -752,20 +969,34 @@ mod tests {
     #[test]
     fn partial_evaluation_rejects_later_effects_and_failed_second_calls() {
         let (mut f, call) = counter(false);
-        let recur = *f.block_order().iter()
-            .find(|&&block| f.block(block).insts.contains(&call)).unwrap();
+        let recur = *f
+            .block_order()
+            .iter()
+            .find(|&&block| f.block(block).insts.contains(&call))
+            .unwrap();
         let ret = f.block_mut(recur).insts.pop().unwrap();
         let tagged = [(IRType::of(TypeBits::FIXNUM), ValueRepresentation::Tagged)];
-        let nil = f.push_inst(recur,
-            instruction(Opcode::ConstNil, vec![], AuxData::None), &tagged).1[0];
+        let nil = f
+            .push_inst(
+                recur,
+                instruction(Opcode::ConstNil, vec![], AuxData::None),
+                &tagged,
+            )
+            .1[0];
         let mut later = f.inst(call).clone();
         later.args = vec![nil];
         later.results.clear();
         let (later, _) = f.push_inst(recur, later, &tagged);
         f.block_mut(recur).insts.push(ret);
         let mut saw_call = false;
-        assert_eq!(evaluate_pure(&f, 0, &[call, later], 3, &mut 512, &mut saw_call), None);
-        assert!(saw_call, "the first recursive operand completed before the second failed");
+        assert_eq!(
+            evaluate_pure(&f, 0, &[call, later], 3, &mut 512, &mut saw_call),
+            None
+        );
+        assert!(
+            saw_call,
+            "the first recursive operand completed before the second failed"
+        );
         f.inst_mut(later).opcode = Opcode::MemoryFence;
         assert_eq!(evaluate_pure(&f, 0, &[call], 3, &mut 512, &mut false), None);
     }

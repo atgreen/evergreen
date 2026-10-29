@@ -6,7 +6,7 @@
 
 use egcl_compiler::macroexpand::*;
 use egcl_rt::error::EgclError;
-use egcl_rt::value::{NIL, T, EgclVal};
+use egcl_rt::value::{EgclVal, NIL, T};
 
 // ── Environment construction ─────────────────────────────────────
 
@@ -83,10 +83,7 @@ fn augment_variable_does_not_mutate_original() {
 #[test]
 fn null_env_has_no_function_info() {
     let env = Environment::null();
-    assert!(
-        env.function_information(EgclVal::from_fixnum(10))
-            .is_none()
-    );
+    assert!(env.function_information(EgclVal::from_fixnum(10)).is_none());
 }
 
 #[test]

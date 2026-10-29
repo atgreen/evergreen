@@ -181,11 +181,19 @@ fn bytecode_references_with_params(
     }
     refs.extend(function.load_time_values.iter().map(|(_, value)| *value));
     for (key, _) in &function.param_layout {
-        if let Some(symbol) = super::lexical_identity::symbol(key) { refs.push(symbol); }
+        if let Some(symbol) = super::lexical_identity::symbol(key) {
+            refs.push(symbol);
+        }
     }
     for instruction in &function.code {
-        if let Instr::LoadEnvVar(index) | Instr::StoreEnvVar(index) | Instr::DefineEnvVar(index) = instruction {
-            if let Some(symbol) = function.names.get(*index as usize).and_then(|key| super::lexical_identity::symbol(key)) {
+        if let Instr::LoadEnvVar(index) | Instr::StoreEnvVar(index) | Instr::DefineEnvVar(index) =
+            instruction
+        {
+            if let Some(symbol) = function
+                .names
+                .get(*index as usize)
+                .and_then(|key| super::lexical_identity::symbol(key))
+            {
                 refs.push(symbol);
             }
         }
@@ -512,8 +520,10 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
                         Some("source function body")
                     } else {
                         let identity = egcl_rt::function::definition_index(value);
-                        match compiled.get(&identity).or_else(||
-                            name.symbol_index().and_then(|index| compiled.get(&index))) {
+                        match compiled
+                            .get(&identity)
+                            .or_else(|| name.symbol_index().and_then(|index| compiled.get(&index)))
+                        {
                             Some(reason) => *reason,
                             None => Some("function without saved bytecode"),
                         }
@@ -568,10 +578,7 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
                     // designate native builtins through FUNCALL or saved data.
                     // The omitted-&optional marker is a constant in an
                     // optional-range prologue, never a function to call.
-                    if callable_data
-                        && !functions.contains_key(&index)
-                        && value != unsupplied
-                    {
+                    if callable_data && !functions.contains_key(&index) && value != unsupplied {
                         let name = symbols::symbol_name(index).unwrap_or_default();
                         let runtime_symbol = is_builtin_function(&name)
                             || name.starts_with("EGCL")
@@ -1100,7 +1107,8 @@ pub(super) fn run(args: &CliArgs, env: &mut Env) -> Result<i32, EgclError> {
 /// trailer-located images of executables produced by older runtimes, which
 /// appended new images without removing the preceding one.
 pub(super) fn remove_embedded_images(bytes: &mut Vec<u8>) -> io::Result<()> {
-    if let Some(archive) = egcl_rt::container::read(&bytes[..]).map_err(|e| io::Error::other(e.to_string()))?
+    if let Some(archive) =
+        egcl_rt::container::read(&bytes[..]).map_err(|e| io::Error::other(e.to_string()))?
         && archive.member(egcl_rt::container::CORE).is_some()
     {
         if archive.start == 0 {

@@ -1350,9 +1350,8 @@ impl PythonScope {
             return Ok(crate::gc::alloc_double_float(value));
         }
         if self.is_instance_of_type(object.pointer, self.api.unicode_type) {
-            let text = utf8_of(self.api, &object).ok_or_else(|| {
-                EgclError::FfiError("a Python string was not valid UTF-8".into())
-            })?;
+            let text = utf8_of(self.api, &object)
+                .ok_or_else(|| EgclError::FfiError("a Python string was not valid UTF-8".into()))?;
             // Copied, per the policy: the Lisp string owns its own storage and the
             // Python object's death cannot invalidate it.
             return Ok(crate::gc::alloc_character_string(&text));
@@ -1747,7 +1746,8 @@ const METH_VARARGS: i32 = 0x0001;
 /// A registered function pointer rather than a direct call, because running Lisp
 /// means evaluating with the interpreter, which lives in a crate above this one —
 /// the same arrangement as the GC's finalizer dispatch.
-pub type ExportDispatch = fn(u64, &[crate::value::EgclVal]) -> Result<crate::value::EgclVal, EgclError>;
+pub type ExportDispatch =
+    fn(u64, &[crate::value::EgclVal]) -> Result<crate::value::EgclVal, EgclError>;
 
 static EXPORT_DISPATCH: OnceLock<ExportDispatch> = OnceLock::new();
 
@@ -1799,12 +1799,18 @@ unsafe extern "C" fn call_exported(
         Some((handle, values))
     })();
     let Some((handle, mut values)) = read else {
-        return raise_from_lisp(api, "an exported Lisp function's arguments could not be read");
+        return raise_from_lisp(
+            api,
+            "an exported Lisp function's arguments could not be read",
+        );
     };
 
     // Phase 2: into Lisp. The arguments must be rooted across it.
     let Some(dispatch) = EXPORT_DISPATCH.get() else {
-        return raise_from_lisp(api, "no Lisp dispatcher is registered for exported functions");
+        return raise_from_lisp(
+            api,
+            "no Lisp dispatcher is registered for exported functions",
+        );
     };
     let outcome = {
         let _managed = crate::safepoint::ForeignStateScope::lisp();
@@ -1820,7 +1826,10 @@ unsafe extern "C" fn call_exported(
                 Some(scope.to_python(value).ok()?.into_raw())
             })();
             converted.unwrap_or_else(|| {
-                raise_from_lisp(api, "an exported Lisp function's result has no Python equivalent")
+                raise_from_lisp(
+                    api,
+                    "an exported Lisp function's result has no Python equivalent",
+                )
             })
         }
         Err(error) => raise_from_lisp(api, &format!("{error}")),
@@ -1879,10 +1888,13 @@ impl PythonScope {
         let dict = self.main_dict()?;
         let key = CString::new(name).expect("checked above");
         // SAFETY: a borrowed dictionary and a live callable, GIL held.
-        let status = unsafe { (self.api.dict_set_item_string)(dict, key.as_ptr(), callable.as_ptr()) };
+        let status =
+            unsafe { (self.api.dict_set_item_string)(dict, key.as_ptr(), callable.as_ptr()) };
         if status != 0 {
             check(self, "binding an exported function")?;
-            return Err(EgclError::FfiError("binding an exported function failed".into()));
+            return Err(EgclError::FfiError(
+                "binding an exported function failed".into(),
+            ));
         }
         Ok(())
     }

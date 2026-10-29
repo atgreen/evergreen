@@ -31,7 +31,8 @@ struct RestoreHooks {
 
 impl Drop for RestoreHooks {
     fn drop(&mut self) {
-        native_transfer_entry::ordinary_calls::YIELD_AFTER_RETURN_TO_OWNER.with(|target| target.set(0));
+        native_transfer_entry::ordinary_calls::YIELD_AFTER_RETURN_TO_OWNER
+            .with(|target| target.set(0));
         ordinary_t2::RECURSIVE_LEAF_OBSERVER.with(|hook| hook.set(self.observer));
         native_transfer_entry::ordinary_calls::SELF_COLD_OBSERVER
             .with(|hook| hook.set(self.cold_self));

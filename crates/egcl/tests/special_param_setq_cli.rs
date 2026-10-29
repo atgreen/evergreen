@@ -78,6 +78,9 @@ fn setq_of_a_special_parameter_reaches_the_dynamic_binding() {
         "GLOBAL-AFTER NIL",
         "SPECIAL-PARAM-OK",
     ] {
-        assert!(stdout.contains(expected), "missing {expected:?} in:\n{stdout}");
+        assert!(
+            stdout.contains(expected),
+            "missing {expected:?} in:\n{stdout}"
+        );
     }
 }

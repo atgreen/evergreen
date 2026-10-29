@@ -6,9 +6,9 @@
 //! This lives in its own test binary so `EGCL_GC_STRESS` is set before any
 //! EGCL allocation in the process. The stress stride is cached on first use.
 
-use std::sync::{Mutex, OnceLock};
 use egcl_rt::heap_stats;
 use egcl_rt::value::NIL;
+use std::sync::{Mutex, OnceLock};
 
 fn lock() -> &'static Mutex<()> {
     static L: OnceLock<Mutex<()>> = OnceLock::new();

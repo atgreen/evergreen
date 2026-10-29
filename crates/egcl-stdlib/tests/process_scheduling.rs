@@ -4,10 +4,10 @@
 //! A child waits for a collecting peer: capture must release GC and carriers.
 #![cfg(all(target_arch = "x86_64", any(unix, windows)))]
 
+use egcl_rt::{EgclVal, SchedulerConfig, SchedulerGroup};
+use egcl_stdlib::process::{ProcessCommand, launch_program, run_program};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
-use egcl_rt::{SchedulerConfig, SchedulerGroup, EgclVal};
-use egcl_stdlib::process::{ProcessCommand, launch_program, run_program};
 
 fn marker(name: &str) -> PathBuf {
     PathBuf::from(std::env::var_os("EGCL_PROCESS_TEST_DIR").unwrap()).join(name)

@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-use egcl_rt::object::{type_id, ConsCell};
+use egcl_rt::object::{ConsCell, type_id};
 use egcl_rt::value::{EgclVal, T};
-use egcl_stdlib::format::{circle_active, circle_enter, circle_exit, circle_visit, CircleMark};
+use egcl_stdlib::format::{CircleMark, circle_active, circle_enter, circle_exit, circle_visit};
 
 fn cycle() -> EgclVal {
     let body = egcl_rt::alloc_typed(16, type_id::CONS).unwrap();

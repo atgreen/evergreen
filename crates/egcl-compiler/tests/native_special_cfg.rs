@@ -96,10 +96,12 @@ fn native_special_operations_preserve_preoperation_stack_and_scope_maps() {
         };
         assert_eq!(*origin_bcp, bcp);
         assert_eq!(scopes.len(), bindings);
-        assert!(scopes
-            .iter()
-            .all(|scope| scope.ownership == Ownership::Local
-                && matches!(scope.kind, ScopeKind::SpecialBinding { .. })));
+        assert!(
+            scopes
+                .iter()
+                .all(|scope| scope.ownership == Ownership::Local
+                    && matches!(scope.kind, ScopeKind::SpecialBinding { .. }))
+        );
     }
     assert!(
         !ir.block_order()
@@ -175,9 +177,11 @@ fn native_special_operations_emit_published_requests_and_scoped_osr() {
             "missing helper request {request:x}"
         );
     }
-    assert!(sites
-        .sites()
-        .any(|site| site.map().origin_bcp == 9 && site.map().control_scopes.len() == 2));
+    assert!(
+        sites
+            .sites()
+            .any(|site| site.map().origin_bcp == 9 && site.map().control_scopes.len() == 2)
+    );
 }
 
 #[test]

@@ -65,7 +65,9 @@ pub(super) fn pprint_layout_events(
             "CASE-END" if fields.len() == 1 => events.push(LayoutEvent::CaseEnd),
             "BLOCK" if fields.len() == 5 => {
                 if !is_string_value(fields[1]) || !is_string_value(fields[3]) {
-                    return Err(EgclError::Internal("non-string logical-block delimiter".into()));
+                    return Err(EgclError::Internal(
+                        "non-string logical-block delimiter".into(),
+                    ));
                 }
                 let prefix = val_as_str(fields[1]);
                 events.push(LayoutEvent::Block {
@@ -119,7 +121,9 @@ pub(super) fn pprint_layout_events(
         }
     }
     if !remaining.is_nil() {
-        return Err(EgclError::Internal("improper pretty-printer event list".into()));
+        return Err(EgclError::Internal(
+            "improper pretty-printer event list".into(),
+        ));
     }
     Ok(events)
 }
@@ -187,10 +191,7 @@ fn resolved(name: &str) -> (Option<Handler>, bool) {
     // Only names with a handler are kept, so a stream of arbitrary unknown
     // names cannot grow the table.
     if handler.is_some() {
-        MEMO.with(|memo| {
-            memo.borrow_mut()
-                .insert(name.into(), (handler, preserve))
-        });
+        MEMO.with(|memo| memo.borrow_mut().insert(name.into(), (handler, preserve)));
     }
     (handler, preserve)
 }
@@ -248,7 +249,11 @@ fn resolve(name: &str) -> Option<Handler> {
                     format::circle_exit();
                     Ok(NIL)
                 }
-                "SHARED" => Ok(if format::circle_is_shared(args[1]) { T } else { NIL }),
+                "SHARED" => Ok(if format::circle_is_shared(args[1]) {
+                    T
+                } else {
+                    NIL
+                }),
                 "MARK" => Ok(EgclVal::from_fixnum(match format::circle_visit(args[1]) {
                     CircleMark::NotShared => 0,
                     CircleMark::First(label) => i64::from(label),
@@ -414,9 +419,22 @@ fn resolve(name: &str) -> Option<Handler> {
                 "WRITE",
                 &args[1..],
                 &[
-                    "STREAM", "ESCAPE", "ARRAY", "BASE", "CASE", "CIRCLE", "GENSYM", "LENGTH",
-                    "LEVEL", "LINES", "MISER-WIDTH", "PPRINT-DISPATCH", "PRETTY", "RADIX",
-                    "READABLY", "RIGHT-MARGIN",
+                    "STREAM",
+                    "ESCAPE",
+                    "ARRAY",
+                    "BASE",
+                    "CASE",
+                    "CIRCLE",
+                    "GENSYM",
+                    "LENGTH",
+                    "LEVEL",
+                    "LINES",
+                    "MISER-WIDTH",
+                    "PPRINT-DISPATCH",
+                    "PRETTY",
+                    "RADIX",
+                    "READABLY",
+                    "RIGHT-MARGIN",
                 ],
             )?;
             // Printer callbacks allocate while prior special values are saved.
@@ -492,10 +510,22 @@ fn resolve(name: &str) -> Option<Handler> {
         }),
 
         "EGCL::%VALIDATE-SEQUENCE-RESULT-TYPE" => Some(|_, args, _| {
-            if args.len() != 2 { return Err(EgclError::ProgramError("%VALIDATE-SEQUENCE-RESULT-TYPE requires two arguments".into())); }
+            if args.len() != 2 {
+                return Err(EgclError::ProgramError(
+                    "%VALIDATE-SEQUENCE-RESULT-TYPE requires two arguments".into(),
+                ));
+            }
             let length = args[1];
-            if !length.is_fixnum() || length.as_fixnum() < 0 { return Err(EgclError::TypeError { datum: length, expected: "nonnegative sequence length".into() }); }
-            egcl_stdlib::sequences::validate_sequence_result_type(args[0], length.as_fixnum() as usize)?;
+            if !length.is_fixnum() || length.as_fixnum() < 0 {
+                return Err(EgclError::TypeError {
+                    datum: length,
+                    expected: "nonnegative sequence length".into(),
+                });
+            }
+            egcl_stdlib::sequences::validate_sequence_result_type(
+                args[0],
+                length.as_fixnum() as usize,
+            )?;
             Ok(T)
         }),
 
@@ -602,10 +632,22 @@ fn resolve(name: &str) -> Option<Handler> {
             }
             if nil_elements {
                 if size.as_fixnum() >= egcl_rt::bignum::FIXNUM_MAX {
-                    return Err(EgclError::TypeError { datum: size, expected: "valid array dimension".into() });
+                    return Err(EgclError::TypeError {
+                        datum: size,
+                        expected: "valid array dimension".into(),
+                    });
                 }
-                if fill_set { return Err(EgclError::TypeError { datum: fill_val, expected: "NIL".into() }); }
-                let length = usize::try_from(size.as_fixnum()).map_err(|_| EgclError::TypeError { datum: size, expected: "representable array dimension".into() })?;
+                if fill_set {
+                    return Err(EgclError::TypeError {
+                        datum: fill_val,
+                        expected: "NIL".into(),
+                    });
+                }
+                let length =
+                    usize::try_from(size.as_fixnum()).map_err(|_| EgclError::TypeError {
+                        datum: size,
+                        expected: "representable array dimension".into(),
+                    })?;
                 return egcl_rt::nil_array::make(length);
             }
             // A base string never promotes: a wide :initial-element is the
@@ -729,7 +771,11 @@ fn resolve(name: &str) -> Option<Handler> {
                     "%NATIVE-INTERACTIVE-STREAM-P requires one stream".into(),
                 ));
             }
-            Ok(if egcl_stdlib::interactive_stream_p(args[0]) { T } else { NIL })
+            Ok(if egcl_stdlib::interactive_stream_p(args[0]) {
+                T
+            } else {
+                NIL
+            })
         }),
         "EGCL::%NATIVE-STREAM-ELEMENT-TYPE" => Some(|_operator, args, _env| {
             let args = RootedVals::new(args.to_vec());
@@ -971,8 +1017,11 @@ fn resolve(name: &str) -> Option<Handler> {
                 .filter(|v| v.is_heap_object())
                 .unwrap_or_else(cli_current_readtable);
             for source in ['(', ')', '\'', '"', ';', '`', ','] {
-                if is_standard_reader_stand_in(args[1], *handler,
-                    ordinary_standard_reader_name(source).unwrap()) {
+                if is_standard_reader_stand_in(
+                    args[1],
+                    *handler,
+                    ordinary_standard_reader_name(source).unwrap(),
+                ) {
                     reader::set_standard_macro_alias(rt, args[0].as_char(), source, non_term);
                     return Ok(T);
                 }
@@ -1028,9 +1077,15 @@ fn resolve(name: &str) -> Option<Handler> {
                 // (get-macro-character.1/.3 only check functionp/fboundp).
                 _ => match reader::standard_macro_source(rt, ch) {
                     Some((source, standard_nt)) => {
-                        let name = resolve_sym(ordinary_standard_reader_name(source)
-                            .unwrap_or("EGCL::%STANDARD-READER-MACRO")).unwrap_or(NIL);
-                        (symbol_function_object(env, name).unwrap_or(NIL), standard_nt)
+                        let name = resolve_sym(
+                            ordinary_standard_reader_name(source)
+                                .unwrap_or("EGCL::%STANDARD-READER-MACRO"),
+                        )
+                        .unwrap_or(NIL);
+                        (
+                            symbol_function_object(env, name).unwrap_or(NIL),
+                            standard_nt,
+                        )
                     }
                     None => (NIL, false),
                 },
@@ -1042,18 +1097,29 @@ fn resolve(name: &str) -> Option<Handler> {
         "EGCL::%READ-STANDARD-MACRO" => Some(|_operator, args, env| {
             let args = RootedVals::new(args.to_vec());
             if args.len() != 3 || !args[1].is_character() || !args[2].is_character() {
-                return Err(EgclError::ProgramError("standard reader requires stream, source and invocation characters".into()));
+                return Err(EgclError::ProgramError(
+                    "standard reader requires stream, source and invocation characters".into(),
+                ));
             }
             let mut stream = args[0];
             egcl_rt::rooted_ref!(_stream_root = &mut stream);
-            let read_base = dynamic_standard_variable(env, "*READ-BASE*").filter(|v| v.is_fixnum())
-                .map(|v| v.as_fixnum() as u32).filter(|b| (2..=36).contains(b)).unwrap_or(10);
+            let read_base = dynamic_standard_variable(env, "*READ-BASE*")
+                .filter(|v| v.is_fixnum())
+                .map(|v| v.as_fixnum() as u32)
+                .filter(|b| (2..=36).contains(b))
+                .unwrap_or(10);
             let read_eval = dynamic_standard_variable(env, "*READ-EVAL*").is_none_or(|v| v != NIL);
             sync_reader_float_format(env);
             let previous_env = READ_EVAL_ENV.with(|slot| slot.replace(env as *mut Env));
             let result = reader::read_standard_macro_from_stream(
-                &mut LispReaderStream { stream: &mut stream, env },
-                args[1].as_char(), args[2].as_char(), read_base, read_eval,
+                &mut LispReaderStream {
+                    stream: &mut stream,
+                    env,
+                },
+                args[1].as_char(),
+                args[2].as_char(),
+                read_base,
+                read_eval,
             );
             READ_EVAL_ENV.with(|slot| slot.set(previous_env));
             let values = result?;
@@ -1182,7 +1248,10 @@ fn resolve(name: &str) -> Option<Handler> {
         // the interval since that sample, exactly as the TIME special form does.
         "EGCL::%TIME-START" => Some(|_operator, _args, _env| {
             let sample = time_sample()?;
-            let words: Vec<EgclVal> = sample.iter().map(|&word| EgclVal::from_fixnum(word)).collect();
+            let words: Vec<EgclVal> = sample
+                .iter()
+                .map(|&word| EgclVal::from_fixnum(word))
+                .collect();
             // Fixnums are immediates: nothing to root while the list is built.
             Ok(vec_to_list(&words))
         }),
@@ -1204,9 +1273,14 @@ fn resolve(name: &str) -> Option<Handler> {
 
         "EGCL::%TIME-REPORT" => Some(|_operator, args, env| {
             let mut start: TimeSample = [0; 6];
-            let words = args.first().map(|&list| list_to_vec(list)).unwrap_or_default();
+            let words = args
+                .first()
+                .map(|&list| list_to_vec(list))
+                .unwrap_or_default();
             if words.len() != start.len() || !words.iter().all(|word| word.is_fixnum()) {
-                return Err(EgclError::ProgramError("%TIME-REPORT: not a TIME sample".into()));
+                return Err(EgclError::ProgramError(
+                    "%TIME-REPORT: not a TIME sample".into(),
+                ));
             }
             for (slot, word) in start.iter_mut().zip(&words) {
                 *slot = word.as_fixnum();
@@ -1355,9 +1429,7 @@ fn resolve(name: &str) -> Option<Handler> {
                     sym_name(args[1])
                 ))
             })?;
-            egcl_stdlib::clos::atomic_update_slot_value(
-                args[0], slot, args[2], !args[3].is_nil(),
-            )
+            egcl_stdlib::clos::atomic_update_slot_value(args[0], slot, args[2], !args[3].is_nil())
         }),
         "EGCL-EXT:INFLATE" => Some(|_operator, args, env| {
             env.clear_mv();
@@ -1427,7 +1499,13 @@ fn resolve(name: &str) -> Option<Handler> {
                     "%DECLARATION-TYPEP takes two arguments".into(),
                 ));
             };
-            Ok(if declaration_typep_matches(env, *object, *spec, false, 0)? { T } else { NIL })
+            Ok(
+                if declaration_typep_matches(env, *object, *spec, false, 0)? {
+                    T
+                } else {
+                    NIL
+                },
+            )
         }),
         // The declared type of SLOT in OBJECT's own structure class, or T.
         // Boot's %CHECKED-STRUCTURE-SLOT-VALUE checks a typed structure's writer
@@ -1448,19 +1526,55 @@ fn resolve(name: &str) -> Option<Handler> {
         // an element type that upgrades to T or packed U8. NIL means another
         // case, which boot parses in full.
         "EGCL::%MAKE-NIL-VECTOR" => Some(|_, args, _| {
-            if args.len() != 6 { return Err(EgclError::ProgramError("%MAKE-NIL-VECTOR requires six arguments".into())); }
-            let size = |value: EgclVal| if value.is_fixnum() && value.as_fixnum() >= 0 && value.as_fixnum() < egcl_rt::bignum::FIXNUM_MAX {
-                usize::try_from(value.as_fixnum()).map_err(|_| EgclError::TypeError { datum: value, expected: "representable array dimension".into() })
-            } else { Err(EgclError::TypeError { datum: value, expected: "valid nonnegative array dimension".into() }) };
+            if args.len() != 6 {
+                return Err(EgclError::ProgramError(
+                    "%MAKE-NIL-VECTOR requires six arguments".into(),
+                ));
+            }
+            let size = |value: EgclVal| {
+                if value.is_fixnum()
+                    && value.as_fixnum() >= 0
+                    && value.as_fixnum() < egcl_rt::bignum::FIXNUM_MAX
+                {
+                    usize::try_from(value.as_fixnum()).map_err(|_| EgclError::TypeError {
+                        datum: value,
+                        expected: "representable array dimension".into(),
+                    })
+                } else {
+                    Err(EgclError::TypeError {
+                        datum: value,
+                        expected: "valid nonnegative array dimension".into(),
+                    })
+                }
+            };
             let length = size(args[0])?;
             let fill = size(args[1])?;
-            if fill > length { return Err(EgclError::TypeError { datum: args[1], expected: "fill pointer within capacity".into() }); }
+            if fill > length {
+                return Err(EgclError::TypeError {
+                    datum: args[1],
+                    expected: "fill pointer within capacity".into(),
+                });
+            }
             if !args[4].is_nil() {
-                return egcl_stdlib::sequences::build_nil_displaced_vector(args[4], size(args[5])?, length, fill, !args[2].is_nil(), !args[3].is_nil());
+                return egcl_stdlib::sequences::build_nil_displaced_vector(
+                    args[4],
+                    size(args[5])?,
+                    length,
+                    fill,
+                    !args[2].is_nil(),
+                    !args[3].is_nil(),
+                );
             }
             if !args[2].is_nil() || !args[3].is_nil() {
-                egcl_stdlib::sequences::build_nil_complex_vector(length, fill, !args[2].is_nil(), !args[3].is_nil())
-            } else { egcl_rt::nil_array::make(length) }
+                egcl_stdlib::sequences::build_nil_complex_vector(
+                    length,
+                    fill,
+                    !args[2].is_nil(),
+                    !args[3].is_nil(),
+                )
+            } else {
+                egcl_rt::nil_array::make(length)
+            }
         }),
         "EGCL::%MAKE-SIMPLE-ARRAY" => Some(|_operator, args, env| {
             env.clear_mv();
@@ -1529,7 +1643,8 @@ fn resolve(name: &str) -> Option<Handler> {
             let length = length.as_fixnum() as usize;
             let Some(contents) = initial_contents else {
                 if packed_u8 {
-                    let fill = egcl_stdlib::sequences::u8_value(initial_element.unwrap_or(default))?;
+                    let fill =
+                        egcl_stdlib::sequences::u8_value(initial_element.unwrap_or(default))?;
                     return egcl_rt::packed_u8::make(length, fill);
                 }
                 return Ok(egcl_stdlib::build_filled_simple_vector(
@@ -1543,11 +1658,13 @@ fn resolve(name: &str) -> Option<Handler> {
                 return Ok(NIL);
             }
             egcl_rt::rooted!(contents = contents);
-            egcl_rt::rooted!(vector = if packed_u8 {
-                egcl_rt::packed_u8::make(length, 0)?
-            } else {
-                egcl_stdlib::build_filled_simple_vector(length, NIL)
-            });
+            egcl_rt::rooted!(
+                vector = if packed_u8 {
+                    egcl_rt::packed_u8::make(length, 0)?
+                } else {
+                    egcl_stdlib::build_filled_simple_vector(length, NIL)
+                }
+            );
             if contents.is_cons() {
                 // Walk a list once; ELT on it would rescan from the head.
                 let mut rest = *contents;
@@ -1666,7 +1783,10 @@ fn resolve(name: &str) -> Option<Handler> {
             };
             let reuse_address = args.get(3).map_or(cfg!(unix), |value| !value.is_nil());
             let id = egcl_stdlib::streams::socket_listen_with_options(
-                &host, port, backlog, reuse_address,
+                &host,
+                port,
+                backlog,
+                reuse_address,
             )?;
             Ok(EgclVal::from_fixnum(id as i64))
         }),
@@ -1850,7 +1970,13 @@ fn resolve(name: &str) -> Option<Handler> {
             // Like SYMBOL-VALUE, inspect only this symbol's dynamic cell.
             // Lexical frames and qualified-to-bare fallback do not establish
             // a binding for BOUNDP and can hide an unbound shadowing symbol.
-            Ok(if sym.symbol_index().and_then(global_value_cell).is_some() { T } else { NIL })
+            Ok(
+                if sym.symbol_index().and_then(global_value_cell).is_some() {
+                    T
+                } else {
+                    NIL
+                },
+            )
         }),
         "FIND-CLASS" => Some(|_operator, args, env| {
             // (find-class name &optional (errorp t) environment) — the class
@@ -1956,8 +2082,12 @@ fn resolve(name: &str) -> Option<Handler> {
             let v = args.first().copied().unwrap_or(NIL);
             require_array(v)?;
             use egcl_stdlib::sequences::ArrayElementKind;
-            let kind = egcl_stdlib::sequences::array_element_kind(v)
-                .ok_or_else(|| EgclError::TypeError { datum: v, expected: "ARRAY".into() })?;
+            let kind = egcl_stdlib::sequences::array_element_kind(v).ok_or_else(|| {
+                EgclError::TypeError {
+                    datum: v,
+                    expected: "ARRAY".into(),
+                }
+            })?;
             if kind == ArrayElementKind::U8 {
                 let symbol = EgclVal::from_symbol_index(egcl_rt::symbols::intern("UNSIGNED-BYTE"));
                 return Ok(vec_to_list(&[symbol, EgclVal::from_fixnum(8)]));
@@ -2016,21 +2146,31 @@ fn resolve(name: &str) -> Option<Handler> {
         }),
         "EGCL::%MAKE-RANDOM-STATE" => Some(|_, args, _| {
             if args.len() != 2 {
-                return Err(EgclError::ProgramError("%MAKE-RANDOM-STATE requires two arguments".into()));
+                return Err(EgclError::ProgramError(
+                    "%MAKE-RANDOM-STATE requires two arguments".into(),
+                ));
             }
             egcl_stdlib::random_state::make_random_state(args[0], args[1])
         }),
         "EGCL::%RANDOM-STATE-FROM-SEED" => Some(|_, args, _| {
             if args.len() != 1 {
-                return Err(EgclError::ProgramError("%RANDOM-STATE-FROM-SEED requires one argument".into()));
+                return Err(EgclError::ProgramError(
+                    "%RANDOM-STATE-FROM-SEED requires one argument".into(),
+                ));
             }
             egcl_stdlib::random_state::from_seed(args[0])
         }),
         "EGCL::%RANDOM-STATE-P" => Some(|_, args, _| {
             if args.len() != 1 {
-                return Err(EgclError::ProgramError("%RANDOM-STATE-P requires one argument".into()));
+                return Err(EgclError::ProgramError(
+                    "%RANDOM-STATE-P requires one argument".into(),
+                ));
             }
-            Ok(if egcl_stdlib::random_state::random_state_p(args[0]) { T } else { NIL })
+            Ok(if egcl_stdlib::random_state::random_state_p(args[0]) {
+                T
+            } else {
+                NIL
+            })
         }),
         "RANDOM" => Some(|_operator, args, env| super::random_values(args, env)),
         "MAKE-STRING-OUTPUT-STREAM" => Some(|_operator, args, env| {
@@ -2041,13 +2181,21 @@ fn resolve(name: &str) -> Option<Handler> {
             // GET-OUTPUT-STREAM-STRING answer a SIMPLE-BASE-STRING (ansi
             // WITH-OUTPUT-TO-STRING.8); any other type, a CHARACTER string.
             super::check_keyword_args("MAKE-STRING-OUTPUT-STREAM", &args, &["ELEMENT-TYPE"])?;
-            let request = args.chunks_exact(2).find(|pair| pair[0].is_symbol() && sym_bare_name_rc(pair[0]).as_ref() == "ELEMENT-TYPE")
-                .map(|pair| pair[1]).unwrap_or_else(|| resolve_sym("CHARACTER").unwrap());
+            let request = args
+                .chunks_exact(2)
+                .find(|pair| {
+                    pair[0].is_symbol() && sym_bare_name_rc(pair[0]).as_ref() == "ELEMENT-TYPE"
+                })
+                .map(|pair| pair[1])
+                .unwrap_or_else(|| resolve_sym("CHARACTER").unwrap());
             egcl_rt::rooted!(element_type = resolve_type_spec(env, request)?);
             if element_type.is_nil() {
-                return egcl_stdlib::streams::make_string_output_stream_with_element(egcl_stdlib::streams::StringOutputElement::Nil);
+                return egcl_stdlib::streams::make_string_output_stream_with_element(
+                    egcl_stdlib::streams::StringOutputElement::Nil,
+                );
             }
-            let base = resolve_sym("BASE-CHAR").is_some_and(|base_char| super::subtypep_relation(*element_type, base_char).0);
+            let base = resolve_sym("BASE-CHAR")
+                .is_some_and(|base_char| super::subtypep_relation(*element_type, base_char).0);
             egcl_stdlib::streams::make_string_output_stream_of(base)
         }),
         "CONCATENATE" => Some(|_operator, args, env| {
@@ -2191,11 +2339,7 @@ fn resolve(name: &str) -> Option<Handler> {
             let want_num = name == "NUMERATOR";
             let v = super::one_arg(name, args)?;
             if egcl_rt::types::integerp(v) {
-                return Ok(if want_num {
-                    v
-                } else {
-                    EgclVal::from_fixnum(1)
-                });
+                return Ok(if want_num { v } else { EgclVal::from_fixnum(1) });
             }
             // A ratio (rational but not integer) stores numerator@8 /
             // denominator@16 in its RatioData body.
@@ -2265,7 +2409,11 @@ fn resolve(name: &str) -> Option<Handler> {
             // second.
             egcl_rt::rooted!(significand = box_float(significand, kind));
             egcl_rt::rooted!(sign = box_float(sign as f64, kind));
-            env.set_mv(vec![*significand, EgclVal::from_fixnum(exponent as i64), *sign]);
+            env.set_mv(vec![
+                *significand,
+                EgclVal::from_fixnum(exponent as i64),
+                *sign,
+            ]);
             Ok(*significand)
         }),
         "EXP" | "SIN" | "COS" | "TAN" | "ASIN" | "ACOS" | "SINH" | "COSH" | "TANH" | "ASINH"
@@ -2412,9 +2560,9 @@ fn resolve(name: &str) -> Option<Handler> {
             super::sort_values(operator, args, env)
         }),
         "FIND-PACKAGE" => Some(|_operator, args, env| {
-            Ok(args
-                .first()
-                .map_or(NIL, |&designator| super::find_package_value(env, designator)))
+            Ok(args.first().map_or(NIL, |&designator| {
+                super::find_package_value(env, designator)
+            }))
         }),
         "GENSYM" => Some(|_operator, args, env| {
             if args.len() > 1 {
@@ -2632,7 +2780,11 @@ fn resolve(name: &str) -> Option<Handler> {
 
             let s = args.first().copied().unwrap_or(NIL);
             require_stream(s)?;
-            Ok(if egcl_stdlib::stream_listen(s)? { T } else { NIL })
+            Ok(if egcl_stdlib::stream_listen(s)? {
+                T
+            } else {
+                NIL
+            })
         }),
 
         "WRITE-BYTE" => Some(|_operator, args, env| {
@@ -2782,12 +2934,12 @@ fn resolve(name: &str) -> Option<Handler> {
             Ok(NIL)
         }),
 
-        "EGCL::%INVOKE-REGISTERED-MACRO" => Some(|_operator, args, _env| {
-            super::invoke_registered_macro(args)
-        }),
-        "EGCL::%INVOKE-COMPILER-MACRO" => Some(|_operator, args, env| {
-            super::invoke_compiler_macro_function(args, env)
-        }),
+        "EGCL::%INVOKE-REGISTERED-MACRO" => {
+            Some(|_operator, args, _env| super::invoke_registered_macro(args))
+        }
+        "EGCL::%INVOKE-COMPILER-MACRO" => {
+            Some(|_operator, args, env| super::invoke_compiler_macro_function(args, env))
+        }
         "COMPILER-MACRO-FUNCTION" => Some(|_operator, args, _env| {
             Ok(args
                 .first()
@@ -2867,13 +3019,13 @@ fn resolve(name: &str) -> Option<Handler> {
             }
             // A fill-pointer or displaced string is read through its elements
             // into a simple copy (ansi make-string-input-stream.7-9).
-            egcl_rt::rooted!(string = if is_string_value(args[0])
-                && egcl_stdlib::is_complex_vector(args[0])
-            {
-                arena_str(&val_as_str(args[0]))
-            } else {
-                args[0]
-            });
+            egcl_rt::rooted!(
+                string = if is_string_value(args[0]) && egcl_stdlib::is_complex_vector(args[0]) {
+                    arena_str(&val_as_str(args[0]))
+                } else {
+                    args[0]
+                }
+            );
             let start = if args.len() > 1 && args[1].is_fixnum() {
                 args[1].as_fixnum() as usize
             } else {
@@ -3245,27 +3397,23 @@ fn resolve(name: &str) -> Option<Handler> {
                         "EGCL-THREAD:CURRENT-THREAD takes no arguments".into(),
                     ));
                 }
-                Ok(EgclVal::from_fixnum(
-                    egcl_rt::current_thread_id().0 as i64,
-                ))
+                Ok(EgclVal::from_fixnum(egcl_rt::current_thread_id().0 as i64))
             })
         }
 
-        "EGCL-THREAD::THREAD-NAME" | "EGCL-THREAD:THREAD-NAME" => {
-            Some(|_operator, args, _env| {
-                let args = RootedVals::new(args.to_vec());
+        "EGCL-THREAD::THREAD-NAME" | "EGCL-THREAD:THREAD-NAME" => Some(|_operator, args, _env| {
+            let args = RootedVals::new(args.to_vec());
 
-                if args.len() != 1 || !args[0].is_fixnum() {
-                    return Err(EgclError::ProgramError(
-                        "EGCL-THREAD:THREAD-NAME requires one thread handle".into(),
-                    ));
-                }
-                let id = egcl_rt::NativeThreadId(args[0].as_fixnum() as u64);
-                Ok(egcl_rt::thread_name(id)
-                    .map(|name| arena_str(&name))
-                    .unwrap_or(NIL))
-            })
-        }
+            if args.len() != 1 || !args[0].is_fixnum() {
+                return Err(EgclError::ProgramError(
+                    "EGCL-THREAD:THREAD-NAME requires one thread handle".into(),
+                ));
+            }
+            let id = egcl_rt::NativeThreadId(args[0].as_fixnum() as u64);
+            Ok(egcl_rt::thread_name(id)
+                .map(|name| arena_str(&name))
+                .unwrap_or(NIL))
+        }),
 
         "EGCL-THREAD::THREAD-ALIVE-P" | "EGCL-THREAD:THREAD-ALIVE-P" => {
             Some(|_operator, args, _env| {
@@ -3285,24 +3433,22 @@ fn resolve(name: &str) -> Option<Handler> {
             })
         }
 
-        "EGCL-THREAD::ALL-THREADS" | "EGCL-THREAD:ALL-THREADS" => {
-            Some(|_operator, args, _env| {
-                let args = RootedVals::new(args.to_vec());
+        "EGCL-THREAD::ALL-THREADS" | "EGCL-THREAD:ALL-THREADS" => Some(|_operator, args, _env| {
+            let args = RootedVals::new(args.to_vec());
 
-                if !args.is_empty() {
-                    return Err(EgclError::ProgramError(
-                        "EGCL-THREAD:ALL-THREADS takes no arguments".into(),
-                    ));
-                }
-                let mut ids = egcl_rt::live_thread_ids();
-                ids.sort_by_key(|id| id.0);
-                egcl_rt::rooted!(threads = NIL);
-                for id in ids.into_iter().rev() {
-                    *threads = arena_cons(EgclVal::from_fixnum(id.0 as i64), *threads);
-                }
-                Ok(*threads)
-            })
-        }
+            if !args.is_empty() {
+                return Err(EgclError::ProgramError(
+                    "EGCL-THREAD:ALL-THREADS takes no arguments".into(),
+                ));
+            }
+            let mut ids = egcl_rt::live_thread_ids();
+            ids.sort_by_key(|id| id.0);
+            egcl_rt::rooted!(threads = NIL);
+            for id in ids.into_iter().rev() {
+                *threads = arena_cons(EgclVal::from_fixnum(id.0 as i64), *threads);
+            }
+            Ok(*threads)
+        }),
 
         "EGCL-THREAD::THREAD-YIELD" | "EGCL-THREAD:THREAD-YIELD" => {
             Some(|_operator, args, _env| {
@@ -3352,7 +3498,11 @@ fn resolve(name: &str) -> Option<Handler> {
                         }
                         None => val_as_str(*control),
                     };
-                    Err(EgclError::signalled(*condition, report, std::mem::take(&mut *backtrace)))
+                    Err(EgclError::signalled(
+                        *condition,
+                        report,
+                        std::mem::take(&mut *backtrace),
+                    ))
                 }
                 Err(error) => Err(error),
             }
@@ -3386,11 +3536,17 @@ fn resolve(name: &str) -> Option<Handler> {
             // BIT/SBIT read a bit array exactly like AREF (rank-1 here).
 
             if name == "SVREF" && args.len() != 2 {
-                return Err(EgclError::ProgramError(format!("SVREF requires exactly 2 arguments, got {}", args.len())));
+                return Err(EgclError::ProgramError(format!(
+                    "SVREF requires exactly 2 arguments, got {}",
+                    args.len()
+                )));
             }
             let arr0 = args.first().copied().unwrap_or(NIL);
             if name == "SVREF" && !is_simple_vector_value(arr0) {
-                return Err(EgclError::TypeError { datum: arr0, expected: "SIMPLE-VECTOR".into() });
+                return Err(EgclError::TypeError {
+                    datum: arr0,
+                    expected: "SIMPLE-VECTOR".into(),
+                });
             }
             // Multidimensional (rank ≥ 2) array: AREF takes one subscript per
             // axis (row-major); ROW-MAJOR-AREF takes a single flat index.
@@ -3478,7 +3634,16 @@ fn resolve(name: &str) -> Option<Handler> {
         "EGCL-INTERNAL::%BIT-ELEMENT-TYPE-P"
         | "EGCL-INTERNAL:%BIT-ELEMENT-TYPE-P"
         | "%BIT-ELEMENT-TYPE-P" => Some(|_, args, _| {
-            Ok(if args.first().is_some_and(|&v| egcl_stdlib::sequences::bit_element_type_p(v)) { T } else { NIL })
+            Ok(
+                if args
+                    .first()
+                    .is_some_and(|&v| egcl_stdlib::sequences::bit_element_type_p(v))
+                {
+                    T
+                } else {
+                    NIL
+                },
+            )
         }),
         "EGCL-INTERNAL::%U8-ELEMENT-TYPE-P"
         | "EGCL-INTERNAL:%U8-ELEMENT-TYPE-P"
@@ -3512,12 +3677,16 @@ fn resolve(name: &str) -> Option<Handler> {
             let size = args.first().copied().unwrap_or(NIL);
             if !size.is_fixnum() || size.as_fixnum() < 0 {
                 return Err(EgclError::TypeError {
-                    datum: size, expected: "non-negative array dimension".into(),
+                    datum: size,
+                    expected: "non-negative array dimension".into(),
                 });
             }
             let fill = args.get(1).copied().unwrap_or(NIL);
             if !fill.is_double_float() {
-                return Err(EgclError::TypeError { datum: fill, expected: "DOUBLE-FLOAT".into() });
+                return Err(EgclError::TypeError {
+                    datum: fill,
+                    expected: "DOUBLE-FLOAT".into(),
+                });
             }
             egcl_rt::packed_f64::make(size.as_fixnum() as usize, fill.as_double_float())
         }),
@@ -3568,9 +3737,15 @@ fn resolve(name: &str) -> Option<Handler> {
                 }
                 if args.get(2).is_some_and(|v| !v.is_nil()) {
                     if !fill.is_double_float() {
-                        return Err(EgclError::TypeError { datum: *fill, expected: "DOUBLE-FLOAT".into() });
+                        return Err(EgclError::TypeError {
+                            datum: *fill,
+                            expected: "DOUBLE-FLOAT".into(),
+                        });
                     }
-                    return egcl_stdlib::sequences::build_double_float_md_array(&dims, fill.as_double_float());
+                    return egcl_stdlib::sequences::build_double_float_md_array(
+                        &dims,
+                        fill.as_double_float(),
+                    );
                 }
                 Ok(egcl_stdlib::build_md_array(&dims, *fill))
             })
@@ -3624,10 +3799,17 @@ fn resolve(name: &str) -> Option<Handler> {
             }
             if args.get(7).is_some_and(|v| !v.is_nil()) {
                 if !iel.is_double_float() {
-                    return Err(EgclError::TypeError { datum: iel, expected: "DOUBLE-FLOAT".into() });
+                    return Err(EgclError::TypeError {
+                        datum: iel,
+                        expected: "DOUBLE-FLOAT".into(),
+                    });
                 }
                 return egcl_stdlib::sequences::build_double_float_complex_vector(
-                    size, fp, adjustable, iel.as_double_float(), has_fill_pointer,
+                    size,
+                    fp,
+                    adjustable,
+                    iel.as_double_float(),
+                    has_fill_pointer,
                 );
             }
             // 9th arg (optional): non-NIL ⇒ element-type BASE-CHAR, a string
@@ -3644,7 +3826,11 @@ fn resolve(name: &str) -> Option<Handler> {
                     });
                 };
                 return egcl_stdlib::sequences::build_base_char_complex_vector(
-                    size, fp, adjustable, fill, has_fill_pointer,
+                    size,
+                    fp,
+                    adjustable,
+                    fill,
+                    has_fill_pointer,
                 );
             }
             let elems = vec![iel; size];
@@ -3690,7 +3876,10 @@ fn resolve(name: &str) -> Option<Handler> {
                     expected: "array (:displaced-to)".to_string(),
                 });
             };
-            if offset.checked_add(length).is_none_or(|end| end > base_total) {
+            if offset
+                .checked_add(length)
+                .is_none_or(|end| end > base_total)
+            {
                 return Err(EgclError::TypeError {
                     datum: base,
                     expected: format!(
@@ -3726,11 +3915,19 @@ fn resolve(name: &str) -> Option<Handler> {
             }
             if args.get(8).is_some_and(|v| !v.is_nil()) {
                 return egcl_stdlib::sequences::build_double_float_displaced_vector(
-                    base, offset, length, fp, adjustable, has_fill_pointer,
+                    base,
+                    offset,
+                    length,
+                    fp,
+                    adjustable,
+                    has_fill_pointer,
                 );
             }
             if egcl_stdlib::sequences::is_double_float_array(base) {
-                return Err(EgclError::TypeError { datum: base, expected: "matching displaced array element type".into() });
+                return Err(EgclError::TypeError {
+                    datum: base,
+                    expected: "matching displaced array element type".into(),
+                });
             }
             Ok(egcl_stdlib::build_displaced_vector(
                 base,
@@ -3963,26 +4160,30 @@ fn resolve(name: &str) -> Option<Handler> {
             Ok(plist)
         }),
 
-        "EGCL-INTERNAL:%SET-CLASS-NAME" | "EGCL-INTERNAL::%SET-CLASS-NAME" => Some(|_, args, env| {
-            if args.len() != 2 {
-                return Err(EgclError::ProgramError(format!("%SET-CLASS-NAME requires 2 arguments, got {}", args.len())));
-            }
-            if egcl_stdlib::clos::update_class_name(args[1], args[0])? {
-                // Name-based fast paths must recheck only an actual change.
-                bump_accessor_slot_gen();
-                invalidate_gf_dispatch_cache();
-                bytecode::bump_direct_call_gen();
-            }
-            env.clear_mv();
-            Ok(args[0])
-        }),
+        "EGCL-INTERNAL:%SET-CLASS-NAME" | "EGCL-INTERNAL::%SET-CLASS-NAME" => {
+            Some(|_, args, env| {
+                if args.len() != 2 {
+                    return Err(EgclError::ProgramError(format!(
+                        "%SET-CLASS-NAME requires 2 arguments, got {}",
+                        args.len()
+                    )));
+                }
+                if egcl_stdlib::clos::update_class_name(args[1], args[0])? {
+                    // Name-based fast paths must recheck only an actual change.
+                    bump_accessor_slot_gen();
+                    invalidate_gf_dispatch_cache();
+                    bytecode::bump_direct_call_gen();
+                }
+                env.clear_mv();
+                Ok(args[0])
+            })
+        }
 
         "EGCL-INTERNAL:%RAW-SLOT-VALUE"
         | "EGCL-INTERNAL:%STANDARD-SLOT-VALUE-USING-CLASS"
         | "EGCL-INTERNAL:%STANDARD-SET-SLOT-VALUE-USING-CLASS"
         | "EGCL-INTERNAL:%STANDARD-SLOT-BOUNDP-USING-CLASS"
-        | "EGCL-INTERNAL:%STANDARD-SLOT-MAKUNBOUND-USING-CLASS" =>
-            Some(slot_access::raw),
+        | "EGCL-INTERNAL:%STANDARD-SLOT-MAKUNBOUND-USING-CLASS" => Some(slot_access::raw),
 
         "EGCL::SET-SLOT-VALUE" => Some(|_operator, args, env| {
             let args = RootedVals::new(args.to_vec());
@@ -4347,9 +4548,9 @@ fn resolve(name: &str) -> Option<Handler> {
             Ok(seconds)
         }),
 
-        "ENCODE-UNIVERSAL-TIME" => Some(|_operator, args, _env| {
-            egcl_stdlib::time::encode_universal_time_checked(args)
-        }),
+        "ENCODE-UNIVERSAL-TIME" => {
+            Some(|_operator, args, _env| egcl_stdlib::time::encode_universal_time_checked(args))
+        }
 
         "DECODE-UNIVERSAL-TIME" => Some(|_operator, args, env| {
             let args = RootedVals::new(args.to_vec());
@@ -4478,7 +4679,9 @@ fn resolve(name: &str) -> Option<Handler> {
 
             let pathname =
                 coerce_pathname_designator(pathname_accessor_arg("PATHNAME-NAME", &args)?)?;
-            Ok(lisp_pathname_component(egcl_stdlib::pathname_name(pathname)))
+            Ok(lisp_pathname_component(egcl_stdlib::pathname_name(
+                pathname,
+            )))
         }),
 
         "PATHNAME-TYPE" => Some(|_operator, args, _env| {
@@ -4486,7 +4689,9 @@ fn resolve(name: &str) -> Option<Handler> {
 
             let pathname =
                 coerce_pathname_designator(pathname_accessor_arg("PATHNAME-TYPE", &args)?)?;
-            Ok(lisp_pathname_component(egcl_stdlib::pathname_type(pathname)))
+            Ok(lisp_pathname_component(egcl_stdlib::pathname_type(
+                pathname,
+            )))
         }),
 
         "PATHNAME-DIRECTORY" => Some(|_operator, args, _env| {
@@ -4564,9 +4769,9 @@ fn resolve(name: &str) -> Option<Handler> {
                 )));
             }
             let pathname = coerce_pathname_designator(args[0])?;
-            Ok(super::lisp_pathname_component(egcl_stdlib::pathname_version(
-                pathname,
-            )))
+            Ok(super::lisp_pathname_component(
+                egcl_stdlib::pathname_version(pathname),
+            ))
         }),
 
         "WILD-PATHNAME-P" => Some(|_operator, args, _env| {
@@ -5075,7 +5280,9 @@ fn resolve(name: &str) -> Option<Handler> {
             egcl_stdlib::clos::allocate_instance(*class)
         }),
 
-        "METHOD-QUALIFIERS" | "METHOD-SPECIALIZERS" | "METHOD-LAMBDA-LIST"
+        "METHOD-QUALIFIERS"
+        | "METHOD-SPECIALIZERS"
+        | "METHOD-LAMBDA-LIST"
         | "METHOD-GENERIC-FUNCTION" => Some(|operator, args, env| {
             let args = RootedVals::new(args.to_vec());
             let Some((owner, def)) = method_def_by_id(env, args[0]) else {
@@ -5086,9 +5293,12 @@ fn resolve(name: &str) -> Option<Handler> {
             };
             egcl_rt::rooted!(def = def);
             match operator {
-                "METHOD-QUALIFIERS" => {
-                    Ok(method_qualifier_list(env, &owner, def.qualifier, def.combination))
-                }
+                "METHOD-QUALIFIERS" => Ok(method_qualifier_list(
+                    env,
+                    &owner,
+                    def.qualifier,
+                    def.combination,
+                )),
                 "METHOD-SPECIALIZERS" => Ok(method_specializer_list(&def.specializers)),
                 "METHOD-LAMBDA-LIST" => Ok(def.lambda_list),
                 _ => {
@@ -5395,21 +5605,29 @@ fn resolve(name: &str) -> Option<Handler> {
                 &args[2..],
                 &["UPDATE-INSTANCE-FOR-DIFFERENT-CLASS", "SHARED-INITIALIZE"],
             )?;
-            egcl_rt::rooted!(previous =
-                egcl_stdlib::clos::copy_instance_for_class_change(args[0])?);
+            egcl_rt::rooted!(
+                previous = egcl_stdlib::clos::copy_instance_for_class_change(args[0])?
+            );
             let old_class = egcl_stdlib::class_of(args[0]);
             let new_class = *class;
-            let old_shared = runtime_class_slots(env, old_class).into_iter()
+            let old_shared = runtime_class_slots(env, old_class)
+                .into_iter()
                 .filter(|slot| matches!(slot.allocation, SlotAllocation::Class))
-                .map(|slot| slot.name).collect::<std::collections::HashSet<_>>();
-            let inherited_shared = runtime_class_slots(env, new_class).into_iter()
-                .filter(|slot| matches!(slot.allocation, SlotAllocation::Instance)
-                    && old_shared.contains(&slot.name))
-                .map(|slot| slot.name).collect::<Vec<_>>();
+                .map(|slot| slot.name)
+                .collect::<std::collections::HashSet<_>>();
+            let inherited_shared = runtime_class_slots(env, new_class)
+                .into_iter()
+                .filter(|slot| {
+                    matches!(slot.allocation, SlotAllocation::Instance)
+                        && old_shared.contains(&slot.name)
+                })
+                .map(|slot| slot.name)
+                .collect::<Vec<_>>();
             egcl_rt::rooted!(shared_values = Vec::<(EgclVal, EgclVal)>::new());
             for name in inherited_shared {
-                let symbol = resolve_sym(&name)
-                    .ok_or_else(|| EgclError::Internal("class-change slot symbol unavailable".into()))?;
+                let symbol = resolve_sym(&name).ok_or_else(|| {
+                    EgclError::Internal("class-change slot symbol unavailable".into())
+                })?;
                 let bare = symbol_bare_name(&name);
                 let value = runtime_class_slot_cell(env, old_class, &bare)
                     .and_then(|cell| cell.lock().unwrap().get(&bare).copied().flatten());
@@ -5424,36 +5642,45 @@ fn resolve(name: &str) -> Option<Handler> {
             }
             egcl_rt::rooted!(hook_args = vec![*previous, args[0]]);
             hook_args.extend_from_slice(&args[2..]);
-            let hook = resolve_sym("UPDATE-INSTANCE-FOR-DIFFERENT-CLASS")
-                .ok_or_else(|| EgclError::Internal("class-change hook symbol unavailable".into()))?;
+            let hook = resolve_sym("UPDATE-INSTANCE-FOR-DIFFERENT-CLASS").ok_or_else(|| {
+                EgclError::Internal("class-change hook symbol unavailable".into())
+            })?;
             apply_function(hook, &hook_args, env)?;
             Ok(args[0])
         }),
 
-        "EGCL-INTERNAL::%CLASS-CHANGE-ADDED-SLOTS"
-        | "EGCL-INTERNAL:%CLASS-CHANGE-ADDED-SLOTS" => Some(|_operator, args, env| {
-            if args.len() != 2 {
-                return Err(EgclError::ProgramError(
-                    "class-change slot comparison requires two instances".into(),
-                ));
-            }
-            let old_class = egcl_stdlib::class_of(args[0]);
-            let new_class = egcl_stdlib::class_of(args[1]);
-            let old_slots: std::collections::HashSet<String> =
-                runtime_class_slots(env, old_class).into_iter()
-                    .map(|slot| slot.name).collect();
-            let added = runtime_class_slots(env, new_class).into_iter()
-                .filter(|slot| matches!(slot.allocation, SlotAllocation::Instance)
-                    && !old_slots.contains(&slot.name))
-                .map(|slot| slot.name).collect::<Vec<_>>();
-            egcl_rt::rooted!(names = Vec::with_capacity(added.len()));
-            for name in added {
-                let symbol = resolve_sym(&name)
-                    .ok_or_else(|| EgclError::Internal("class-change slot symbol unavailable".into()))?;
-                names.push(symbol);
-            }
-            Ok(vec_to_list(&names))
-        }),
+        "EGCL-INTERNAL::%CLASS-CHANGE-ADDED-SLOTS" | "EGCL-INTERNAL:%CLASS-CHANGE-ADDED-SLOTS" => {
+            Some(|_operator, args, env| {
+                if args.len() != 2 {
+                    return Err(EgclError::ProgramError(
+                        "class-change slot comparison requires two instances".into(),
+                    ));
+                }
+                let old_class = egcl_stdlib::class_of(args[0]);
+                let new_class = egcl_stdlib::class_of(args[1]);
+                let old_slots: std::collections::HashSet<String> =
+                    runtime_class_slots(env, old_class)
+                        .into_iter()
+                        .map(|slot| slot.name)
+                        .collect();
+                let added = runtime_class_slots(env, new_class)
+                    .into_iter()
+                    .filter(|slot| {
+                        matches!(slot.allocation, SlotAllocation::Instance)
+                            && !old_slots.contains(&slot.name)
+                    })
+                    .map(|slot| slot.name)
+                    .collect::<Vec<_>>();
+                egcl_rt::rooted!(names = Vec::with_capacity(added.len()));
+                for name in added {
+                    let symbol = resolve_sym(&name).ok_or_else(|| {
+                        EgclError::Internal("class-change slot symbol unavailable".into())
+                    })?;
+                    names.push(symbol);
+                }
+                Ok(vec_to_list(&names))
+            })
+        }
 
         "EGCL-INTERNAL::%STANDARD-SHARED-INITIALIZE"
         | "EGCL-INTERNAL:%STANDARD-SHARED-INITIALIZE" => Some(|_operator, args, env| {
@@ -5473,11 +5700,7 @@ fn resolve(name: &str) -> Option<Handler> {
                         "SHARED-INITIALIZE slot names must be T or a list of symbols".into(),
                     ));
                 }
-                Some(
-                    names.iter()
-                        .map(|name| sym_name(*name))
-                        .collect::<Vec<_>>(),
-                )
+                Some(names.iter().map(|name| sym_name(*name)).collect::<Vec<_>>())
             };
             let class = egcl_stdlib::class_of(args[0]);
             egcl_rt::rooted!(raw_initargs = list_to_vec(args[2]));
@@ -5489,12 +5712,11 @@ fn resolve(name: &str) -> Option<Handler> {
             // Explicit initargs apply regardless of SLOT-NAMES. That argument
             // only selects unbound slots whose initforms may run afterwards.
             reinitialize_instance_values(args[0], &initargs, env)?;
-            let explicit_slots = initargs.chunks_exact(2)
+            let explicit_slots = initargs
+                .chunks_exact(2)
                 .map(|pair| sym_bare_name_rc(pair[0]).to_string())
                 .collect::<Vec<_>>();
-            apply_class_initforms(
-                args[0], env, eligible.as_deref(), &explicit_slots,
-            )?;
+            apply_class_initforms(args[0], env, eligible.as_deref(), &explicit_slots)?;
             Ok(args[0])
         }),
 
@@ -5503,59 +5725,63 @@ fn resolve(name: &str) -> Option<Handler> {
         // new lambda list must be congruent with every existing method; a new
         // :argument-precedence-order re-sorts dispatch (ansi
         // ensure-generic-function.6/8).
-        "EGCL-INTERNAL::%ENSURE-GENERIC-OPTIONS"
-        | "EGCL-INTERNAL:%ENSURE-GENERIC-OPTIONS" => Some(|_operator, args, env| {
-            let args = RootedVals::new(args.to_vec());
-            if args.len() != 5 {
-                return Err(EgclError::ProgramError(
-                    "EGCL-INTERNAL:%ENSURE-GENERIC-OPTIONS requires 5 arguments".into(),
-                ));
-            }
-            let name_form = args[0];
-            let name = function_name_key(name_form);
-            if !args[2].is_nil() {
-                let lambda_list = args[1];
-                let existing: Vec<EgclVal> = env
-                    .methods
-                    .borrow()
-                    .get(&name)
-                    .map(|list| list.iter().map(|method| method.lambda_list).collect())
-                    .unwrap_or_default();
-                for method_lambda_list in existing {
-                    if !method_lambda_list_congruent(lambda_list, method_lambda_list) {
-                        return Err(EgclError::ProgramError(format!(
-                            "ENSURE-GENERIC-FUNCTION {name}: an existing method's lambda list is not congruent with {}",
-                            format_val(lambda_list)
-                        )));
+        "EGCL-INTERNAL::%ENSURE-GENERIC-OPTIONS" | "EGCL-INTERNAL:%ENSURE-GENERIC-OPTIONS" => {
+            Some(|_operator, args, env| {
+                let args = RootedVals::new(args.to_vec());
+                if args.len() != 5 {
+                    return Err(EgclError::ProgramError(
+                        "EGCL-INTERNAL:%ENSURE-GENERIC-OPTIONS requires 5 arguments".into(),
+                    ));
+                }
+                let name_form = args[0];
+                let name = function_name_key(name_form);
+                if !args[2].is_nil() {
+                    let lambda_list = args[1];
+                    let existing: Vec<EgclVal> = env
+                        .methods
+                        .borrow()
+                        .get(&name)
+                        .map(|list| list.iter().map(|method| method.lambda_list).collect())
+                        .unwrap_or_default();
+                    for method_lambda_list in existing {
+                        if !method_lambda_list_congruent(lambda_list, method_lambda_list) {
+                            return Err(EgclError::ProgramError(format!(
+                                "ENSURE-GENERIC-FUNCTION {name}: an existing method's lambda list is not congruent with {}",
+                                format_val(lambda_list)
+                            )));
+                        }
+                    }
+                    if name_form.is_symbol() {
+                        store_generic_lambda_list(name_form, lambda_list);
                     }
                 }
-                if name_form.is_symbol() {
-                    store_generic_lambda_list(name_form, lambda_list);
+                if !args[4].is_nil() && name_form.is_symbol() {
+                    let lambda_list = stored_generic_lambda_list(name_form).unwrap_or(args[1]);
+                    let precedence =
+                        parse_argument_precedence_order(name_form, lambda_list, args[3])?;
+                    store_argument_precedence_order(name_form, &precedence);
+                    invalidate_gf_dispatch_cache();
                 }
-            }
-            if !args[4].is_nil() && name_form.is_symbol() {
-                let lambda_list = stored_generic_lambda_list(name_form).unwrap_or(args[1]);
-                let precedence = parse_argument_precedence_order(name_form, lambda_list, args[3])?;
-                store_argument_precedence_order(name_form, &precedence);
-                invalidate_gf_dispatch_cache();
-            }
-            Ok(name_form)
-        }),
+                Ok(name_form)
+            })
+        }
 
         // (character): CHAR-NAME's table, shared with the reader and printer so
         // every `#\` the printer emits reads back (ansi format.c.*, char-name.*).
-        "EGCL-INTERNAL::%CHAR-NAME" | "EGCL-INTERNAL:%CHAR-NAME" => Some(|_operator, args, _env| {
-            if args.len() != 1 || !args[0].is_character() {
-                return Err(EgclError::TypeError {
-                    datum: args.first().copied().unwrap_or(NIL),
-                    expected: "CHARACTER".into(),
-                });
-            }
-            Ok(match egcl_compiler::reader::char_name(args[0].as_char()) {
-                Some(name) => egcl_stdlib::make_lisp_string_fresh(&name),
-                None => NIL,
+        "EGCL-INTERNAL::%CHAR-NAME" | "EGCL-INTERNAL:%CHAR-NAME" => {
+            Some(|_operator, args, _env| {
+                if args.len() != 1 || !args[0].is_character() {
+                    return Err(EgclError::TypeError {
+                        datum: args.first().copied().unwrap_or(NIL),
+                        expected: "CHARACTER".into(),
+                    });
+                }
+                Ok(match egcl_compiler::reader::char_name(args[0].as_char()) {
+                    Some(name) => egcl_stdlib::make_lisp_string_fresh(&name),
+                    None => NIL,
+                })
             })
-        }),
+        }
         // (dims-list storage): a multidimensional array over an existing
         // row-major storage vector.  MAKE-ARRAY (boot.lisp) uses it for a
         // :displaced-to array of rank >= 2, the storage being a vector
@@ -5565,7 +5791,8 @@ fn resolve(name: &str) -> Option<Handler> {
             let args = RootedVals::new(args.to_vec());
             if args.len() != 2 {
                 return Err(EgclError::ProgramError(
-                    "EGCL-INTERNAL:%MAKE-MD-ARRAY-WITH-STORAGE requires dimensions and storage".into(),
+                    "EGCL-INTERNAL:%MAKE-MD-ARRAY-WITH-STORAGE requires dimensions and storage"
+                        .into(),
                 ));
             }
             let mut dims = Vec::new();
@@ -5591,51 +5818,57 @@ fn resolve(name: &str) -> Option<Handler> {
             egcl_stdlib::sequences::build_md_array_with_storage(&dims, args[1])
         }),
         // (string-designator): NAME-CHAR over the same table.
-        "EGCL-INTERNAL::%NAME-CHAR" | "EGCL-INTERNAL:%NAME-CHAR" => Some(|_operator, args, _env| {
-            if args.len() != 1 {
-                return Err(EgclError::ProgramError(
-                    "EGCL-INTERNAL:%NAME-CHAR requires one string designator".into(),
-                ));
-            }
-            let name = if is_string_value(args[0]) {
-                val_as_str(args[0])
-            } else if args[0].is_character() {
-                args[0].as_char().to_string()
-            } else if args[0].is_symbol() {
-                sym_bare_name_rc(args[0]).to_string()
-            } else {
-                return Err(EgclError::TypeError {
-                    datum: args[0],
-                    expected: "(OR STRING SYMBOL CHARACTER)".into(),
-                });
-            };
-            Ok(match egcl_compiler::reader::char_from_name(&name) {
-                Some(c) => EgclVal::from_char(c),
-                None if name.chars().count() == 1 => EgclVal::from_char(name.chars().next().unwrap()),
-                None => NIL,
+        "EGCL-INTERNAL::%NAME-CHAR" | "EGCL-INTERNAL:%NAME-CHAR" => {
+            Some(|_operator, args, _env| {
+                if args.len() != 1 {
+                    return Err(EgclError::ProgramError(
+                        "EGCL-INTERNAL:%NAME-CHAR requires one string designator".into(),
+                    ));
+                }
+                let name = if is_string_value(args[0]) {
+                    val_as_str(args[0])
+                } else if args[0].is_character() {
+                    args[0].as_char().to_string()
+                } else if args[0].is_symbol() {
+                    sym_bare_name_rc(args[0]).to_string()
+                } else {
+                    return Err(EgclError::TypeError {
+                        datum: args[0],
+                        expected: "(OR STRING SYMBOL CHARACTER)".into(),
+                    });
+                };
+                Ok(match egcl_compiler::reader::char_from_name(&name) {
+                    Some(c) => EgclVal::from_char(c),
+                    None if name.chars().count() == 1 => {
+                        EgclVal::from_char(name.chars().next().unwrap())
+                    }
+                    None => NIL,
+                })
             })
-        }),
+        }
 
         // (instance initargs): the CLHS 7.1.2 validity check REINITIALIZE-INSTANCE
         // performs before SHARED-INITIALIZE runs (ansi reinitialize-instance.error.1).
-        "EGCL-INTERNAL::%CHECK-INITARGS"
-        | "EGCL-INTERNAL:%CHECK-INITARGS" => Some(|_operator, args, env| {
-            let args = RootedVals::new(args.to_vec());
-            if args.len() != 2 {
-                return Err(EgclError::ProgramError(
-                    "EGCL-INTERNAL:%CHECK-INITARGS requires an instance and an initarg list".into(),
-                ));
-            }
-            let class = egcl_stdlib::class_of(args[0]);
-            let initargs = list_to_vec(args[1]);
-            check_initargs_valid(
-                env,
-                class,
-                &initargs,
-                &["REINITIALIZE-INSTANCE", "SHARED-INITIALIZE"],
-            )?;
-            Ok(args[0])
-        }),
+        "EGCL-INTERNAL::%CHECK-INITARGS" | "EGCL-INTERNAL:%CHECK-INITARGS" => {
+            Some(|_operator, args, env| {
+                let args = RootedVals::new(args.to_vec());
+                if args.len() != 2 {
+                    return Err(EgclError::ProgramError(
+                        "EGCL-INTERNAL:%CHECK-INITARGS requires an instance and an initarg list"
+                            .into(),
+                    ));
+                }
+                let class = egcl_stdlib::class_of(args[0]);
+                let initargs = list_to_vec(args[1]);
+                check_initargs_valid(
+                    env,
+                    class,
+                    &initargs,
+                    &["REINITIALIZE-INSTANCE", "SHARED-INITIALIZE"],
+                )?;
+                Ok(args[0])
+            })
+        }
 
         "EGCL-INTERNAL::%STANDARD-REINITIALIZE-INSTANCE"
         | "EGCL-INTERNAL:%STANDARD-REINITIALIZE-INSTANCE" => Some(|_operator, args, env| {
@@ -5701,8 +5934,7 @@ fn resolve(name: &str) -> Option<Handler> {
             let allow_other_keys = args[1..]
                 .chunks(2)
                 .find(|kv| {
-                    is_keyword_arg(kv[0])
-                        && sym_bare_name_rc(kv[0]).as_ref() == "ALLOW-OTHER-KEYS"
+                    is_keyword_arg(kv[0]) && sym_bare_name_rc(kv[0]).as_ref() == "ALLOW-OTHER-KEYS"
                 })
                 .is_some_and(|kv| kv[1] != NIL);
             if !allow_other_keys {
@@ -5710,7 +5942,11 @@ fn resolve(name: &str) -> Option<Handler> {
                     let known = is_keyword_arg(kv[0])
                         && matches!(
                             sym_bare_name_rc(kv[0]).as_ref(),
-                            "VERBOSE" | "PRINT" | "IF-DOES-NOT-EXIST" | "EXTERNAL-FORMAT" | "ALLOW-OTHER-KEYS"
+                            "VERBOSE"
+                                | "PRINT"
+                                | "IF-DOES-NOT-EXIST"
+                                | "EXTERNAL-FORMAT"
+                                | "ALLOW-OTHER-KEYS"
                         );
                     if !known {
                         return Err(EgclError::ProgramError(format!(
@@ -5779,9 +6015,13 @@ fn resolve(name: &str) -> Option<Handler> {
                 // CURRENT_PACKAGE as well as the value cell: it is the reader's
                 // bare-symbol resolution context and what the prompt shows, and
                 // the two are kept in step deliberately (bliss-lb6.12).
-                let mut readtable_binding = egcl_rt::symbols::find_index("*READTABLE*").map(|index| {
-                    DynBind::establish(EgclVal::from_symbol_index(index), cli_current_readtable())
-                });
+                let mut readtable_binding =
+                    egcl_rt::symbols::find_index("*READTABLE*").map(|index| {
+                        DynBind::establish(
+                            EgclVal::from_symbol_index(index),
+                            cli_current_readtable(),
+                        )
+                    });
                 egcl_rt::rooted_ref!(_readtable_binding_root = &mut readtable_binding);
                 let saved_package = env.current_package.clone();
                 // And a real dynamic binding of *PACKAGE*, as for a file LOAD
@@ -5791,9 +6031,13 @@ fn resolve(name: &str) -> Option<Handler> {
                     .ok_or_else(|| EgclError::Internal("LOAD: *PACKAGE* is unavailable".into()))?;
                 let dynamic_package = global_value_cell(package_symbol.as_symbol_index())
                     .unwrap_or(egcl_rt::value::UNBOUND);
-                egcl_rt::rooted!(_package_binding = DynBind::establish(package_symbol, dynamic_package));
+                egcl_rt::rooted!(
+                    _package_binding = DynBind::establish(package_symbol, dynamic_package)
+                );
                 if dynamic_standard_variable(env, "*LOAD-VERBOSE*").is_some_and(|v| v != NIL) {
-                    egcl_rt::rooted!(output = dynamic_standard_variable(env, "*STANDARD-OUTPUT*").unwrap_or(T));
+                    egcl_rt::rooted!(
+                        output = dynamic_standard_variable(env, "*STANDARD-OUTPUT*").unwrap_or(T)
+                    );
                     egcl_stdlib::format(*output, "; Loading stream~%", &[])?;
                 }
                 let result = with_eval_context(env, EvalContext::Load, |env| {
@@ -5895,14 +6139,21 @@ fn resolve(name: &str) -> Option<Handler> {
                         format_val(key)
                     )));
                 }
-                if sym_bare_name_rc(key).as_ref() == "OUTPUT-FILE" && val != NIL && out_path.is_none() {
+                if sym_bare_name_rc(key).as_ref() == "OUTPUT-FILE"
+                    && val != NIL
+                    && out_path.is_none()
+                {
                     egcl_rt::rooted!(pathname = resolve_against_dpd(val, env)?);
                     out_path = Some(path_designator_to_string(*pathname)?);
                 }
                 if is_keyword_arg(key) {
                     match sym_bare_name_rc(key).as_ref() {
-                        "VERBOSE" => { verbose.get_or_insert(val != NIL); }
-                        "PRINT" => { print.get_or_insert(val != NIL); }
+                        "VERBOSE" => {
+                            verbose.get_or_insert(val != NIL);
+                        }
+                        "PRINT" => {
+                            print.get_or_insert(val != NIL);
+                        }
                         _ => {}
                     }
                 }
@@ -5913,7 +6164,9 @@ fn resolve(name: &str) -> Option<Handler> {
                     EgclError::Internal("COMPILE-FILE: *COMPILE-PRINT* is unavailable".into())
                 })?;
                 Some(DynBind::establish(symbol, if value { T } else { NIL }))
-            } else { None };
+            } else {
+                None
+            };
             egcl_rt::rooted_ref!(_print_binding_root = &mut print_binding);
             let out_path = out_path.unwrap_or_else(|| {
                 // CLHS 3.2.3: COMPILE-FILE's default output MUST equal
@@ -5947,8 +6200,12 @@ fn resolve(name: &str) -> Option<Handler> {
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                     .map(|d| format!(" (written {})", format_compile_note_date(d.as_secs())))
                     .unwrap_or_default();
-                egcl_rt::rooted!(output = dynamic_standard_variable(env, "*STANDARD-OUTPUT*").unwrap_or(T));
-                egcl_rt::rooted!(note = arena_str(&format!("; compiling file \"{src_path}\"{written}:\n")));
+                egcl_rt::rooted!(
+                    output = dynamic_standard_variable(env, "*STANDARD-OUTPUT*").unwrap_or(T)
+                );
+                egcl_rt::rooted!(
+                    note = arena_str(&format!("; compiling file \"{src_path}\"{written}:\n"))
+                );
                 egcl_stdlib::format(*output, "~A", &[*note])?;
             }
             // ANSI COMPILE-FILE binds *PACKAGE* (and *READTABLE*) for the
@@ -5967,8 +6224,9 @@ fn resolve(name: &str) -> Option<Handler> {
             let compile_package_symbol = resolve_sym("*PACKAGE*").ok_or_else(|| {
                 EgclError::Internal("COMPILE-FILE: *PACKAGE* is unavailable".into())
             })?;
-            let compile_dynamic_package = global_value_cell(compile_package_symbol.as_symbol_index())
-                .unwrap_or(egcl_rt::value::UNBOUND);
+            let compile_dynamic_package =
+                global_value_cell(compile_package_symbol.as_symbol_index())
+                    .unwrap_or(egcl_rt::value::UNBOUND);
             egcl_rt::rooted!(
                 _compile_package_binding =
                     DynBind::establish(compile_package_symbol, compile_dynamic_package)
@@ -6019,18 +6277,33 @@ fn resolve(name: &str) -> Option<Handler> {
             if compile_verbose {
                 let el = compile_start.elapsed();
                 let secs = el.as_secs();
-                egcl_rt::rooted!(output = dynamic_standard_variable(env, "*STANDARD-OUTPUT*").unwrap_or(T));
-                egcl_rt::rooted!(note = arena_str(&format!(
-                    "; wrote {out_path}\n; compilation finished in {}:{:02}:{:02}.{:03}\n",
-                    secs / 3600, (secs % 3600) / 60, secs % 60, el.subsec_millis()
-                )));
+                egcl_rt::rooted!(
+                    output = dynamic_standard_variable(env, "*STANDARD-OUTPUT*").unwrap_or(T)
+                );
+                egcl_rt::rooted!(
+                    note = arena_str(&format!(
+                        "; wrote {out_path}\n; compilation finished in {}:{:02}:{:02}.{:03}\n",
+                        secs / 3600,
+                        (secs % 3600) / 60,
+                        secs % 60,
+                        el.subsec_millis()
+                    ))
+                );
                 egcl_stdlib::format(*output, "~A", &[*note])?;
             }
             let (out_pn, _) = egcl_stdlib::parse_namestring(arena_str(&out_path), None, None)?;
             // An ERROR reported during compilation makes both WARNINGS-P and
             // FAILURE-P true (CLHS COMPILE-FILE, 3.2.5).
-            let warned = if error_count > 0 || warning_flags.any { T } else { NIL };
-            let failed = if error_count > 0 || warning_flags.non_style { T } else { NIL };
+            let warned = if error_count > 0 || warning_flags.any {
+                T
+            } else {
+                NIL
+            };
+            let failed = if error_count > 0 || warning_flags.non_style {
+                T
+            } else {
+                NIL
+            };
             env.set_mv(vec![out_pn, warned, failed]);
             Ok(out_pn)
         }),
@@ -6070,9 +6343,9 @@ fn resolve(name: &str) -> Option<Handler> {
             Ok(pn)
         }),
 
-        "EGCL-EXT:MACROEXPAND-ALL" => Some(|_operator, args, env| {
-            macroexpand_all_builtin(args, env)
-        }),
+        "EGCL-EXT:MACROEXPAND-ALL" => {
+            Some(|_operator, args, env| macroexpand_all_builtin(args, env))
+        }
 
         "EGCL-EXT:DECLARATION-SPECIFIER" => Some(|_operator, args, _env| {
             let args = RootedVals::new(args.to_vec());
@@ -6133,7 +6406,11 @@ fn resolve(name: &str) -> Option<Handler> {
                     args.len()
                 )));
             }
-            Ok(if egcl_stdlib::hash_table_synchronized_p(args[0])? { T } else { NIL })
+            Ok(if egcl_stdlib::hash_table_synchronized_p(args[0])? {
+                T
+            } else {
+                NIL
+            })
         }),
 
         // ── Package-local nicknames (CDR 10) ──
@@ -6178,11 +6455,13 @@ fn resolve(name: &str) -> Option<Handler> {
             }
             let nickname = normalize_package_name(&string_designator_name(args[0]));
             let owner = designated_package(env, args[1], "REMOVE-PACKAGE-LOCAL-NICKNAME")?;
-            Ok(if egcl_stdlib::remove_package_local_nickname(owner, &nickname)?.is_some() {
-                T
-            } else {
-                NIL
-            })
+            Ok(
+                if egcl_stdlib::remove_package_local_nickname(owner, &nickname)?.is_some() {
+                    T
+                } else {
+                    NIL
+                },
+            )
         }),
 
         "EGCL::%PACKAGE-LOCAL-NICKNAMES" => Some(|_operator, args, env| {
@@ -6221,7 +6500,9 @@ fn resolve(name: &str) -> Option<Handler> {
                 )));
             }
             let target = designated_package(env, args[0], "PACKAGE-LOCALLY-NICKNAMED-BY-LIST")?;
-            Ok(vec_to_list(&egcl_stdlib::package_locally_nicknamed_by_list(target)?))
+            Ok(vec_to_list(
+                &egcl_stdlib::package_locally_nicknamed_by_list(target)?,
+            ))
         }),
 
         "EGCL-EXT:PROCLAIMED-OPTIMIZE" => Some(|_operator, args, _env| {
@@ -6479,7 +6760,8 @@ fn resolve(name: &str) -> Option<Handler> {
                 (NIL, 1)
             };
             let chars: Vec<char> = full.chars().collect();
-            let (kstart, kend) = read_start_end_keys_checked("WRITE-LINE", &args[kv_from..], chars.len())?;
+            let (kstart, kend) =
+                read_start_end_keys_checked("WRITE-LINE", &args[kv_from..], chars.len())?;
             let s: String = chars[kstart..kend].iter().collect();
             let mut out = resolve_output_stream(stream, env);
             egcl_rt::rooted_ref!(_output_root = &mut out);
@@ -6853,9 +7135,7 @@ fn resolve(name: &str) -> Option<Handler> {
         // The package functions UIOP's DEFINE-PACKAGE calls once per symbol.
         // Compiled code reached each through a synthesized, re-evaluated form
         // (bliss-a2bso).
-        "EXPORT" | "IMPORT" | "SHADOWING-IMPORT" => {
-            Some(super::export_import_values)
-        }
+        "EXPORT" | "IMPORT" | "SHADOWING-IMPORT" => Some(super::export_import_values),
         "PACKAGE-NAME" => Some(|_operator, args, env| {
             args.first()
                 .map_or(Ok(NIL), |&v| super::package_name_value(env, v))
@@ -7073,7 +7353,11 @@ impl SimpleVectorTypes {
             return None;
         }
         let (head, tail) = cp(element_type);
-        let (width, end) = if tail.is_cons() { cp(tail) } else { return None };
+        let (width, end) = if tail.is_cons() {
+            cp(tail)
+        } else {
+            return None;
+        };
         let byte_type = head == self.unsigned_byte || head == self.signed_byte;
         (byte_type && end.is_nil() && width.is_fixnum() && width.as_fixnum() >= 2)
             .then(|| EgclVal::from_fixnum(0))

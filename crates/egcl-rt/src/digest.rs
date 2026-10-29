@@ -180,13 +180,13 @@ mod tests {
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
         assert_eq!(
-            hex(sha256(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")),
+            hex(sha256(
+                b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+            )),
             "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
         );
         assert_eq!(
-            hex(sha256(
-                b"The quick brown fox jumps over the lazy dog"
-            )),
+            hex(sha256(b"The quick brown fox jumps over the lazy dog")),
             "d7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592"
         );
     }
@@ -195,7 +195,9 @@ mod tests {
     fn length_boundaries_pad_into_the_right_number_of_blocks() {
         // 55 fits with the length word; 56..63 and 64 force a second block --
         // the case a one-shot implementation most often gets wrong.
-        for len in [0usize, 1, 54, 55, 56, 57, 63, 64, 65, 119, 120, 127, 128, 1000] {
+        for len in [
+            0usize, 1, 54, 55, 56, 57, 63, 64, 65, 119, 120, 127, 128, 1000,
+        ] {
             let data = vec![0x61u8; len];
             let mut incremental = Sha256::new();
             for piece in data.chunks(7) {
@@ -233,7 +235,11 @@ fn crc32_table() -> &'static [u32; 256] {
         for (i, slot) in table.iter_mut().enumerate() {
             let mut c = i as u32;
             for _ in 0..8 {
-                c = if c & 1 != 0 { 0xedb8_8320 ^ (c >> 1) } else { c >> 1 };
+                c = if c & 1 != 0 {
+                    0xedb8_8320 ^ (c >> 1)
+                } else {
+                    c >> 1
+                };
             }
             *slot = c;
         }

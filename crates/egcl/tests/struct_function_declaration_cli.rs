@@ -161,7 +161,9 @@ fn function_slot_declarations_persist_without_source() {
     );
     fs::remove_file(&source).unwrap();
     run(
-        &format!("(progn (load {artifact:?}) (funcall (find-symbol \"VERIFY\" \"SLOT-FUNCTION-PROBE\")))"),
+        &format!(
+            "(progn (load {artifact:?}) (funcall (find-symbol \"VERIFY\" \"SLOT-FUNCTION-PROBE\")))"
+        ),
         true,
     );
     fs::remove_dir_all(directory).unwrap();

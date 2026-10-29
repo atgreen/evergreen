@@ -64,7 +64,9 @@ const PROBES: &str = "\
 fn run(envs: &[(&str, &str)]) -> String {
     let program = format!("(progn {DEFINITIONS} {PROBES})");
     let mut command = Command::new(BIN);
-    command.args(["--no-init", "--eval", &program]).env("EGCL_LAZY_COMPILE", "0");
+    command
+        .args(["--no-init", "--eval", &program])
+        .env("EGCL_LAZY_COMPILE", "0");
     for (key, value) in envs {
         command.env(key, value);
     }
@@ -99,7 +101,10 @@ fn single_float_results_match_the_interpreter_at_every_tier() {
     assert_eq!(interpreted, expected);
     for tier in ["t0", "t1", "t2"] {
         let compiled = run(&[("EGCL_FORCE_TIER", tier)]);
-        assert_eq!(compiled, interpreted, "tier {tier} differs from the interpreter");
+        assert_eq!(
+            compiled, interpreted,
+            "tier {tier} differs from the interpreter"
+        );
     }
     // The ordinary promotion path, with a warm profile rather than a forced tier.
     let promoted = run(&[
@@ -107,14 +112,19 @@ fn single_float_results_match_the_interpreter_at_every_tier() {
         ("EGCL_T2_THRESHOLD", "20"),
         ("EGCL_T2_THREADS", "1"),
     ]);
-    assert_eq!(promoted, interpreted, "promoted tiers differ from the interpreter");
+    assert_eq!(
+        promoted, interpreted,
+        "promoted tiers differ from the interpreter"
+    );
 }
 
 /// Run `program` and return (stdout, stderr).
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 fn run_logged(program: &str, envs: &[(&str, &str)]) -> (String, String) {
     let mut command = Command::new(BIN);
-    command.args(["--no-init", "--eval", program]).env("EGCL_LAZY_COMPILE", "0");
+    command
+        .args(["--no-init", "--eval", program])
+        .env("EGCL_LAZY_COMPILE", "0");
     for (key, value) in envs {
         command.env(key, value);
     }
@@ -145,11 +155,18 @@ fn single_float_t1_runs_native_and_guards() {
                 (- (egcl-ext:deopt-count) before))))))";
     let (stdout, stderr) = run_logged(
         program,
-        &[("EGCL_T0_T1_THRESHOLD", "2"), ("EGCL_DISABLE_T2", "1"), ("EGCL_T2_LOG", "stderr")],
+        &[
+            ("EGCL_T0_T1_THRESHOLD", "2"),
+            ("EGCL_DISABLE_T2", "1"),
+            ("EGCL_T2_LOG", "stderr"),
+        ],
     );
     assert!(stdout.contains("T1 1000.0 0 1 1"), "{stdout}\n{stderr}");
     assert!(!stderr.contains("FADD1: T1 declined"), "{stderr}");
-    assert!(stdout.contains("GUARD 1.5 T 2"), "both native guards must fail once: {stdout}\n{stderr}");
+    assert!(
+        stdout.contains("GUARD 1.5 T 2"),
+        "both native guards must fail once: {stdout}\n{stderr}"
+    );
 }
 
 /// A single-float combined with a fixnum VARIABLE profiles as single-float
@@ -168,28 +185,44 @@ fn single_float_with_fixnum_variable_runs_natively_without_deopts() {
           (dotimes (i 1000) (fmixv 1.5 i) (fltv 2.5 i)) \
           (format t \"STEADY ~S ~S ~S~%\" (- (egcl-ext:deopt-count) before) \
             (egcl-ext:function-tier 'fmixv) (egcl-ext:function-tier 'fltv)))";
-    let t1 = format!("(progn {definitions} \
+    let t1 = format!(
+        "(progn {definitions} \
         (dotimes (i 40) (fmixv 1.5 2) (fltv 1.5 2)) {measure} \
         (let ((before (egcl-ext:deopt-count))) \
           (format t \"GUARD ~S ~S~%\" (list (fmixv 2 3) (fmixv 1.5 1/2) (fltv 1 2)) \
-            (- (egcl-ext:deopt-count) before))))");
-    let (stdout, stderr) = run_logged(&t1,
-        &[("EGCL_T0_T1_THRESHOLD", "10"), ("EGCL_DISABLE_T2", "1"), ("EGCL_T2_LOG", "stderr")]);
+            (- (egcl-ext:deopt-count) before))))"
+    );
+    let (stdout, stderr) = run_logged(
+        &t1,
+        &[
+            ("EGCL_T0_T1_THRESHOLD", "10"),
+            ("EGCL_DISABLE_T2", "1"),
+            ("EGCL_T2_LOG", "stderr"),
+        ],
+    );
     assert!(stdout.contains("STEADY 0 1 1"), "{stdout}\n{stderr}");
-    assert!(stdout.contains("GUARD (5 2.0 T) 3"), "speculated guards must still fire: {stdout}\n{stderr}");
+    assert!(
+        stdout.contains("GUARD (5 2.0 T) 3"),
+        "speculated guards must still fire: {stdout}\n{stderr}"
+    );
 
-    let t2 = format!("(progn {definitions} \
+    let t2 = format!(
+        "(progn {definitions} \
         (loop repeat 20000 \
               until (and (eql 2 (egcl-ext:function-tier 'fmixv)) \
                          (eql 2 (egcl-ext:function-tier 'fltv))) \
               do (fmixv 1.5 2) (fltv 1.5 2)) \
-        {measure})");
-    let (stdout, stderr) = run_logged(&t2, &[
-        ("EGCL_T0_T1_THRESHOLD", "2"),
-        ("EGCL_T2_THRESHOLD", "20"),
-        ("EGCL_T2_THREADS", "1"),
-        ("EGCL_T2_LOG", "stderr"),
-    ]);
+        {measure})"
+    );
+    let (stdout, stderr) = run_logged(
+        &t2,
+        &[
+            ("EGCL_T0_T1_THRESHOLD", "2"),
+            ("EGCL_T2_THRESHOLD", "20"),
+            ("EGCL_T2_THREADS", "1"),
+            ("EGCL_T2_LOG", "stderr"),
+        ],
+    );
     assert!(stdout.contains("STEADY 0 2 2"), "{stdout}\n{stderr}");
     assert!(stderr.contains("FMIXV: speculated 1 site(s)"), "{stderr}");
     assert!(stderr.contains("FLTV: speculated 1 site(s)"), "{stderr}");

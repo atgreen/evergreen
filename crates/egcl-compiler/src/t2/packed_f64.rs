@@ -51,7 +51,12 @@ struct Expansion {
     binding: Binding,
 }
 
-fn expansion(f: &Function, inst: Inst, kind: Kind, permits: &dyn Fn(u32, super::speculate::SpecType) -> bool) -> Option<Expansion> {
+fn expansion(
+    f: &Function,
+    inst: Inst,
+    kind: Kind,
+    permits: &dyn Fn(u32, super::speculate::SpecType) -> bool,
+) -> Option<Expansion> {
     let data = f.inst(inst);
     if data.args.len() != (if kind == Kind::Store { 3 } else { 2 })
         || data.results.len() != 1
@@ -63,8 +68,15 @@ fn expansion(f: &Function, inst: Inst, kind: Kind, permits: &dyn Fn(u32, super::
     let AuxData::CallTarget(symbol) = data.aux else {
         return None;
     };
-    let bcp = f.frame_states.get(data.frame_state?).scopes.last().map_or(0, |scope| scope.bcp);
-    if !permits(bcp, super::speculate::SpecType::DoubleFloat) { return None; }
+    let bcp = f
+        .frame_states
+        .get(data.frame_state?)
+        .scopes
+        .last()
+        .map_or(0, |scope| scope.bcp);
+    if !permits(bcp, super::speculate::SpecType::DoubleFloat) {
+        return None;
+    }
     Some(Expansion {
         kind,
         binding: builtin_binding::snapshot(symbol)?,
@@ -108,7 +120,10 @@ fn expression(
     Some(true)
 }
 
-fn plan(f: &Function, permits: &dyn Fn(u32, super::speculate::SpecType) -> bool) -> Option<HashMap<Inst, Expansion>> {
+fn plan(
+    f: &Function,
+    permits: &dyn Fn(u32, super::speculate::SpecType) -> bool,
+) -> Option<HashMap<Inst, Expansion>> {
     if super::verify::verify(f).is_err()
         || (0..f.num_values()).any(|i| f.value(Value(i as u32)).repr != Repr::Tagged)
     {
@@ -126,7 +141,14 @@ fn plan(f: &Function, permits: &dyn Fn(u32, super::speculate::SpecType) -> bool)
                 continue;
             }
             let selected = expansion(f, inst, Kind::Store, permits)?;
-            if expression(f, f.inst(inst).args[2], block, &locations, &mut plan, permits)? {
+            if expression(
+                f,
+                f.inst(inst).args[2],
+                block,
+                &locations,
+                &mut plan,
+                permits,
+            )? {
                 plan.insert(inst, selected);
             }
         }
@@ -208,16 +230,22 @@ fn insert_before(f: &mut Function, block: Block, before: Inst, data: InstData) -
 /// MV state. Keep the producer's eventual ClearMv; add no binder reset.
 /// Restrict this normalization to adjacent producers in the same block, and
 /// require those producers to belong to the final closed raw graph below.
-fn bypass_store_transports(f: &mut Function, permits: &dyn Fn(u32, super::speculate::SpecType) -> bool) -> HashMap<Value, Value> {
+fn bypass_store_transports(
+    f: &mut Function,
+    permits: &dyn Fn(u32, super::speculate::SpecType) -> bool,
+) -> HashMap<Value, Value> {
     let mut aliases = HashMap::new();
     let mut removed = HashSet::new();
     for &block in f.block_order() {
         for pair in f.block(block).insts.windows(2) {
-            let [producer, transport] = pair else { unreachable!() };
+            let [producer, transport] = pair else {
+                unreachable!()
+            };
             let data = f.inst(*transport);
             if data.opcode != Opcode::TakeValuesToLocals
                 || !matches!(data.aux, AuxData::ValuesLocals { nvars: 1, .. })
-                || data.args.len() != 1 || data.results.len() != 1
+                || data.args.len() != 1
+                || data.results.len() != 1
                 || !data.targets.is_empty()
                 || f.inst(*producer).results != data.args
             {
@@ -226,32 +254,48 @@ fn bypass_store_transports(f: &mut Function, permits: &dyn Fn(u32, super::specul
             let Some(kind @ (Kind::Load | Kind::Add | Kind::Mul)) = kind(f, *producer) else {
                 continue;
             };
-            if expansion(f, *producer, kind, permits).is_none() { continue; }
+            if expansion(f, *producer, kind, permits).is_none() {
+                continue;
+            }
             aliases.insert(data.results[0], data.args[0]);
             removed.insert(*transport);
         }
     }
-    if aliases.is_empty() { return aliases; }
+    if aliases.is_empty() {
+        return aliases;
+    }
     for index in 0..f.num_insts() {
         let data = f.inst_mut(Inst(index as u32));
-        for value in data.args.iter_mut().chain(data.targets.iter_mut().flat_map(|edge| &mut edge.args)) {
-            if let Some(&primary) = aliases.get(value) { *value = primary; }
+        for value in data
+            .args
+            .iter_mut()
+            .chain(data.targets.iter_mut().flat_map(|edge| &mut edge.args))
+        {
+            if let Some(&primary) = aliases.get(value) {
+                *value = primary;
+            }
         }
     }
     let states: Vec<_> = f.frame_states.iter().map(|(id, _)| id).collect();
     for id in states {
         let state = f.frame_states.get_mut(id);
-        for source in state.scopes.iter_mut()
+        for source in state
+            .scopes
+            .iter_mut()
             .flat_map(|scope| scope.locals.iter_mut().chain(&mut scope.stack))
             .chain(state.remat.iter_mut().flat_map(|recipe| &mut recipe.inputs))
         {
             if let ValueSource::Value { value, .. } = source
                 && let Some(&primary) = aliases.get(value)
-            { *value = primary; }
+            {
+                *value = primary;
+            }
         }
     }
     for block in f.block_order().to_vec() {
-        f.block_mut(block).insts.retain(|inst| !removed.contains(inst));
+        f.block_mut(block)
+            .insts
+            .retain(|inst| !removed.contains(inst));
     }
     aliases
 }
@@ -264,17 +308,26 @@ pub fn specialize(original: &mut Function) -> usize {
 
 /// A rejected family leaves the whole original closed expression unchanged.
 /// Do not commit a partially raw graph after any selected guard site is vetoed.
-pub fn specialize_with_feedback(original: &mut Function, permits: &dyn Fn(u32, super::speculate::SpecType) -> bool) -> usize {
-    if super::verify::verify(original).is_err() { return 0; }
+pub fn specialize_with_feedback(
+    original: &mut Function,
+    permits: &dyn Fn(u32, super::speculate::SpecType) -> bool,
+) -> usize {
+    if super::verify::verify(original).is_err() {
+        return 0;
+    }
     let mut candidate = original.clone();
     let aliases = bypass_store_transports(&mut candidate, permits);
-    let Some(plan) = plan(&candidate, permits) else { return 0 };
+    let Some(plan) = plan(&candidate, permits) else {
+        return 0;
+    };
     let raw: HashSet<_> = plan
         .iter()
         .filter(|(_, e)| e.kind != Kind::Store)
         .map(|(&inst, _)| candidate.inst(inst).results[0])
         .collect();
-    if aliases.values().any(|primary| !raw.contains(primary)) { return 0; }
+    if aliases.values().any(|primary| !raw.contains(primary)) {
+        return 0;
+    }
     let f = &mut candidate;
     for &value in &raw {
         f.set_repr(value, Repr::UnboxedF64);

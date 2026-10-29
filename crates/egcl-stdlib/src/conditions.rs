@@ -18,10 +18,10 @@ use crate::clos::{
 };
 use crate::streams::make_lisp_string_fresh;
 use egcl_rt::error::EgclError;
-use egcl_rt::stack::{Frame, FrameType, EgclStack};
+use egcl_rt::stack::{EgclStack, Frame, FrameType};
 use egcl_rt::thread::current_stack;
 use egcl_rt::thread::{ConditionHandlerCluster, ConditionRestartCluster};
-use egcl_rt::value::{NIL, TAG_SYMBOL, EgclVal};
+use egcl_rt::value::{EgclVal, NIL, TAG_SYMBOL};
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -734,10 +734,7 @@ pub fn make_type_error(datum: EgclVal, expected_type: EgclVal) -> EgclVal {
 
 /// Check if a EgclVal is a condition instance rooted at CONDITION.
 fn is_condition(val: EgclVal) -> bool {
-    class_inherits_from(
-        class_of(val),
-        EgclVal::from_symbol_index(*SYMBOL_CONDITION),
-    )
+    class_inherits_from(class_of(val), EgclVal::from_symbol_index(*SYMBOL_CONDITION))
 }
 
 /// Check if a handler's condition-type specification matches a given condition.
@@ -845,9 +842,7 @@ pub fn error_condition(condition: EgclVal) -> Result<(), EgclError> {
 
     // If invoke_debugger returned Ok (hook handled it), still report as
     // an unhandled error per CL semantics — ERROR never returns normally.
-    Err(EgclError::Internal(
-        "unhandled error condition".to_string(),
-    ))
+    Err(EgclError::Internal("unhandled error condition".to_string()))
 }
 
 /// Signal a continuable error (CL `CERROR`).
@@ -952,10 +947,7 @@ impl HandlerBinding {
 /// it is returned directly (no conditions can be signalled during a
 /// pre-evaluated body).  For real body evaluation with conditions
 /// active, use `handler_bind_fn`.
-pub fn handler_bind(
-    bindings: &[(EgclVal, EgclVal)],
-    body: EgclVal,
-) -> Result<EgclVal, EgclError> {
+pub fn handler_bind(bindings: &[(EgclVal, EgclVal)], body: EgclVal) -> Result<EgclVal, EgclError> {
     let _cluster = establish_handler_cluster(bindings)?;
 
     // Evaluate the body via funcall if the value looks like a callable
@@ -988,10 +980,7 @@ pub fn handler_bind_fn(
 /// If the form is a registered condition and there are clauses, the first
 /// clause's handler value is returned (simulating the handler catching the
 /// condition). Otherwise, the form value is returned directly.
-pub fn handler_case(
-    form: EgclVal,
-    clauses: &[(EgclVal, EgclVal)],
-) -> Result<EgclVal, EgclError> {
+pub fn handler_case(form: EgclVal, clauses: &[(EgclVal, EgclVal)]) -> Result<EgclVal, EgclError> {
     if is_condition(form) {
         for (clause_type, handler_val) in clauses {
             if condition_type_matches(form, *clause_type) {
@@ -1312,9 +1301,7 @@ pub fn invoke_debugger(condition: EgclVal) -> Result<(), EgclError> {
 
 /// Signal a runtime low-memory/storage failure using a preallocated
 /// `STORAGE-CONDITION` instance per R5.110.
-pub fn signal_storage_condition_for_runtime_error(
-    error: &EgclError,
-) -> Result<EgclVal, EgclError> {
+pub fn signal_storage_condition_for_runtime_error(error: &EgclError) -> Result<EgclVal, EgclError> {
     match error {
         EgclError::Oom | EgclError::StackOverflow(_) => {
             let condition = acquire_preallocated_storage_condition()?;

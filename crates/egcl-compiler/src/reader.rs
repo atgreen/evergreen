@@ -84,14 +84,14 @@
 //! error rather than a stack overflow. `read` over a `ReaderState` accepts
 //! only simple strings; live streams must use `read_from_stream`.
 
-use std::collections::{HashMap, HashSet};
 use egcl_rt::error::EgclError;
 use egcl_rt::lock_order::{LockLevel, OrderedMutex};
 use egcl_rt::object::{
     ComplexData, ConsCell, ElementTypeTag, ObjectHeader, PathnameData, RatioData, ReadtableData,
     type_id,
 };
-use egcl_rt::value::{EOF, MISSING, NIL, T, TAG_HEAP_OBJECT, EgclVal};
+use egcl_rt::value::{EOF, EgclVal, MISSING, NIL, T, TAG_HEAP_OBJECT};
+use std::collections::{HashMap, HashSet};
 
 type MacroCharTable = HashMap<(u64, char), (EgclVal, bool)>;
 type DispatchCharTable = HashMap<(u64, char), bool>;
@@ -433,17 +433,18 @@ fn resolve_symbol_via_hook(pkg: Option<&str>, name: &str) -> Option<u32> {
 // to creating a new internal one. Bootstrap-only readers without a package
 // system retain their existing registry-key resolution.
 type ExternalSymbolResolver = fn(&str, &str) -> Result<EgclVal, EgclError>;
-static EXTERNAL_SYMBOL_RESOLVER: OrderedMutex<Option<ExternalSymbolResolver>> =
-    OrderedMutex::new(LockLevel::CodeCache, 13, "reader external symbol resolver", None);
+static EXTERNAL_SYMBOL_RESOLVER: OrderedMutex<Option<ExternalSymbolResolver>> = OrderedMutex::new(
+    LockLevel::CodeCache,
+    13,
+    "reader external symbol resolver",
+    None,
+);
 
 pub fn set_external_symbol_resolver(hook: Option<ExternalSymbolResolver>) {
     *EXTERNAL_SYMBOL_RESOLVER.lock().unwrap() = hook;
 }
 
-fn resolve_external_symbol_via_hook(
-    pkg: &str,
-    name: &str,
-) -> Option<Result<EgclVal, EgclError>> {
+fn resolve_external_symbol_via_hook(pkg: &str, name: &str) -> Option<Result<EgclVal, EgclError>> {
     let hook = *EXTERNAL_SYMBOL_RESOLVER.lock().unwrap();
     hook.map(|resolve| resolve(pkg, name))
 }
@@ -643,11 +644,7 @@ fn lookup_custom_macro(readtable: EgclVal, ch: char) -> Option<(EgclVal, bool)> 
         .and_then(|table| table.get(&(key, ch)).copied())
 }
 
-fn lookup_custom_dispatch(
-    readtable: EgclVal,
-    disp_char: char,
-    sub_char: char,
-) -> Option<EgclVal> {
+fn lookup_custom_dispatch(readtable: EgclVal, disp_char: char, sub_char: char) -> Option<EgclVal> {
     let key = readtable_key(readtable);
     let guard = DISPATCH_SUB_CHARS.lock().unwrap();
     guard
@@ -976,9 +973,11 @@ fn nd_collect(
     // Collect this level's elements: any sequence may supply a level of a #nA
     // literal (CLHS 2.4.8.12), so #1a"abcd" and #1a#(1 2) read as well as a
     // proper list (syntax.sharp-a.4-26).
-    egcl_rt::rooted!(items = sequence_items(node)?.ok_or_else(|| {
-        EgclError::StreamError("#nA array literal contents must be sequences".into())
-    })?);
+    egcl_rt::rooted!(
+        items = sequence_items(node)?.ok_or_else(|| {
+            EgclError::StreamError("#nA array literal contents must be sequences".into())
+        })?
+    );
     if dims.len() <= level {
         dims.push(items.len());
     } else if dims[level] != items.len() {
@@ -1017,7 +1016,9 @@ fn bootstrap_sequence_items(node: EgclVal) -> Option<Vec<EgclVal>> {
     if let Some(length) = egcl_rt::packed_u8::len(node) {
         return Some(
             (0..length)
-                .map(|i| EgclVal::from_fixnum(i64::from(egcl_rt::packed_u8::get(node, i).unwrap_or(0))))
+                .map(|i| {
+                    EgclVal::from_fixnum(i64::from(egcl_rt::packed_u8::get(node, i).unwrap_or(0)))
+                })
                 .collect(),
         );
     }
@@ -1037,7 +1038,11 @@ fn bootstrap_sequence_items(node: EgclVal) -> Option<Vec<EgclVal>> {
     if let Some(length) = egcl_rt::types::bit_vector_len(node) {
         return Some(
             (0..length)
-                .map(|i| EgclVal::from_fixnum(i64::from(egcl_rt::types::bit_vector_ref(node, i).unwrap_or(0))))
+                .map(|i| {
+                    EgclVal::from_fixnum(i64::from(
+                        egcl_rt::types::bit_vector_ref(node, i).unwrap_or(0),
+                    ))
+                })
                 .collect(),
         );
     }
@@ -1515,7 +1520,9 @@ pub fn read_standard_macro_from_stream(
     read_eval: bool,
 ) -> Result<Vec<EgclVal>, EgclError> {
     if !matches!(source, '(' | ')' | '\'' | '"' | ';' | '`' | ',') {
-        return Err(EgclError::StreamError("not an ordinary standard reader macro".into()));
+        return Err(EgclError::StreamError(
+            "not an ordinary standard reader macro".into(),
+        ));
     }
     let mut input = ReaderInput {
         chars: InputChars::Buffered(vec![invoked_character]),
@@ -1526,7 +1533,9 @@ pub fn read_standard_macro_from_stream(
     if source == ';' {
         let mut pos = 1;
         while input.has(pos)? {
-            if input.at(pos)? == '\n' { break; }
+            if input.at(pos)? == '\n' {
+                break;
+            }
             pos += 1;
         }
         return Ok(Vec::new());
@@ -1534,12 +1543,21 @@ pub fn read_standard_macro_from_stream(
     egcl_rt::rooted!(label_scope = CircularLabelScope::enter(true));
     let labels = label_scope.labels.clone();
     let (value, consumed) = read_token_with_base(
-        &mut input, 0, &labels, read_base, read_eval,
-        default_string_reader_circular_mode(), 0,
+        &mut input,
+        0,
+        &labels,
+        read_base,
+        read_eval,
+        default_string_reader_circular_mode(),
+        0,
     )?;
     egcl_rt::rooted!(value = value);
     input.unread_lookahead(consumed)?;
-    Ok(if *value == MISSING { Vec::new() } else { vec![*value] })
+    Ok(if *value == MISSING {
+        Vec::new()
+    } else {
+        vec![*value]
+    })
 }
 
 // ── Core reader ───────────────────────────────────────────────────
@@ -1648,7 +1666,13 @@ pub fn read_form_at_recursive(
     read_eval: bool,
     recursive: bool,
 ) -> Result<(EgclVal, usize), EgclError> {
-    read_form_input(&mut ReaderInput::slice(chars), start, read_base, read_eval, recursive)
+    read_form_input(
+        &mut ReaderInput::slice(chars),
+        start,
+        read_base,
+        read_eval,
+        recursive,
+    )
 }
 
 pub fn read_char_literal(chars: &[char], pos: usize) -> Result<(EgclVal, usize), EgclError> {
@@ -2735,9 +2759,38 @@ pub fn read_symbol_token(name: &str) -> Result<Option<EgclVal>, EgclError> {
 /// and the ASCII mnemonics for the rest, matching SBCL.  Code 0 and code 7
 /// print as "Null" and "Bell"; "Nul" and "Bel" read back too.
 pub const CONTROL_CHAR_NAMES: [&str; 32] = [
-    "Null", "Soh", "Stx", "Etx", "Eot", "Enq", "Ack", "Bell", "Backspace", "Tab", "Newline",
-    "Vt", "Page", "Return", "So", "Si", "Dle", "Dc1", "Dc2", "Dc3", "Dc4", "Nak", "Syn",
-    "Etb", "Can", "Em", "Sub", "Escape", "Fs", "Gs", "Rs", "Us",
+    "Null",
+    "Soh",
+    "Stx",
+    "Etx",
+    "Eot",
+    "Enq",
+    "Ack",
+    "Bell",
+    "Backspace",
+    "Tab",
+    "Newline",
+    "Vt",
+    "Page",
+    "Return",
+    "So",
+    "Si",
+    "Dle",
+    "Dc1",
+    "Dc2",
+    "Dc3",
+    "Dc4",
+    "Nak",
+    "Syn",
+    "Etb",
+    "Can",
+    "Em",
+    "Sub",
+    "Escape",
+    "Fs",
+    "Gs",
+    "Rs",
+    "Us",
 ];
 
 /// CHAR-NAME: the name of `c`, when it has one.  Every non-graphic character
@@ -2823,9 +2876,7 @@ fn try_package_qualified(
         // A leading ':' and an explicit KEYWORD prefix retain keyword
         // interning. Every other single-colon token denotes an already
         // external symbol, including the otherwise special-cased CL/EGCL.
-        if !internal
-            && let Some(symbol) = resolve_external_symbol_via_hook(pkg, sym_name)
-        {
+        if !internal && let Some(symbol) = resolve_external_symbol_via_hook(pkg, sym_name) {
             return symbol.map(Some);
         }
         // Known packages: CL, KEYWORD, EGCL, COMMON-LISP
@@ -3806,15 +3857,21 @@ fn read_complex_literal_with_base(
     )?;
     egcl_rt::rooted!(contents = contents);
     if !contents.is_cons() {
-        return Err(EgclError::StreamError("expected two components after #C".into()));
+        return Err(EgclError::StreamError(
+            "expected two components after #C".into(),
+        ));
     }
     let (real, rest) = cons_parts(*contents);
     if !rest.is_cons() {
-        return Err(EgclError::StreamError("expected two components after #C".into()));
+        return Err(EgclError::StreamError(
+            "expected two components after #C".into(),
+        ));
     }
     let (imag, end_of_list) = cons_parts(rest);
     if end_of_list != NIL {
-        return Err(EgclError::StreamError("expected two components after #C".into()));
+        return Err(EgclError::StreamError(
+            "expected two components after #C".into(),
+        ));
     }
     Ok((alloc_complex(real, imag), end))
 }
@@ -4712,7 +4769,9 @@ fn read_struct_literal_with_base(
         rest = tail;
     }
     if rest != NIL {
-        return Err(EgclError::StreamError("expected proper list after #S".into()));
+        return Err(EgclError::StreamError(
+            "expected proper list after #S".into(),
+        ));
     }
     if parts.is_empty() {
         return Err(EgclError::StreamError("#S() requires a struct name".into()));
@@ -4943,7 +5002,8 @@ pub fn set_standard_macro_alias(readtable: EgclVal, to: char, source: char, non_
     set_standard_macro_syntax(readtable, to, non_terminating);
     let key = readtable_key(readtable);
     let mut guard = CHAR_SYNTAX.lock().unwrap();
-    guard.get_or_insert_with(HashMap::new)
+    guard
+        .get_or_insert_with(HashMap::new)
         .insert((key, to), (if non_terminating { 3 } else { 2 }, source));
 }
 

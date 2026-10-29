@@ -271,8 +271,7 @@ fn condition_clause_unwinds_cluster_but_handler_bind_stays_in_context() {
         Instr::PopHandlerBind,
         Instr::Return,
     ]);
-    body.handler_binds
-        .push(HandlerBindInfo { types: vec![] });
+    body.handler_binds.push(HandlerBindInfo { types: vec![] });
     body.handler_cases.push(HandlerCaseInfo {
         clauses: vec![ClauseInfo {
             type_name: "ERROR".into(),
