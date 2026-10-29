@@ -13223,7 +13223,9 @@ fn symbol_package_value(env: &Env, sym: EgclVal) -> EgclVal {
             // UNLESS the uninterned symbol was later IMPORTed, which sets its
             // heap package cell and gives it a real home (CLHS IMPORT; ansi
             // IMPORT.5).
-            if symbol_is_homeless(idx) {
+            if egcl_rt::symbols::symbol_package(idx).is_some_and(|p| p.is_nil())
+                && (symbol_is_homeless(idx) || egcl_rt::symbols::registry_key(idx).is_none())
+            {
                 return NIL;
             }
             if reader::is_uninterned(idx)
@@ -13249,7 +13251,7 @@ fn symbol_package_value(env: &Env, sym: EgclVal) -> EgclVal {
         return home;
     }
     let pkg = symbol_home_package_name(sym);
-    package_object(&resolve_package_name(env, &pkg))
+    egcl_stdlib::find_package(&resolve_package_name(env, &pkg)).unwrap_or(NIL)
 }
 
 /// The live top-level environment's definitional registries, recorded by the

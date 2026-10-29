@@ -67,7 +67,8 @@ struct SymbolRegistry {
     /// under, indexed by symbol index. The key uniquely identifies the symbol
     /// (package-qualified where needed), so `intern(index_to_key[i])` round-trips
     /// to `i` — which faithful bytecode serialization relies on to reference the
-    /// same symbol across a compile/load boundary (bliss-jtc.23).
+    /// same symbol across a compile/load boundary (bliss-jtc.23). Empty keys
+    /// are detached names: the object/index remains, but interning is fresh.
     index_to_key: Vec<String>,
 }
 
@@ -212,6 +213,65 @@ pub fn intern(name: &str) -> u32 {
         crate::gc::unpin(name_str);
     }
     idx
+}
+
+// Remove active name lookup without destroying the old symbol or its cells.
+// Empty reverse keys already round-trip through symbol-object images as slots
+// with no name binding; the heap symbol retains its original printable name.
+fn detach_package_symbol(reg: &mut SymbolRegistry, idx: u32, package: EgclVal) -> bool {
+    let Some(object) = object_for_index(reg, idx) else {
+        return false;
+    };
+    // A trimmed image may retain a dense index whose object was omitted.
+    // The bounds/header probe is nonallocating and takes no heap lock.
+    if crate::gc::heap_object_type_id(object) != Some(type_id::SYMBOL) {
+        return false;
+    }
+    // SAFETY: the object is a live symbol, and the exclusive registry guard
+    // excludes symbol-cell writes and root scans.
+    unsafe {
+        let data = symbol_data(object);
+        if (*data).package != package {
+            return false;
+        }
+        (*data).package = NIL;
+    }
+    if let Some(key) = reg.index_to_key.get_mut(idx as usize) {
+        let old_key = std::mem::take(key);
+        if reg.name_to_index.get(&old_key) == Some(&idx) {
+            reg.name_to_index.remove(&old_key);
+        }
+    }
+    true
+}
+
+/// Remove a symbol's home and active interning key only when PACKAGE is its
+/// actual home. Imported symbols owned by another package remain unchanged.
+/// No Lisp allocation or callbacks occur under the symbol-registry lock.
+pub fn detach_symbol_from_package(idx: u32, package: EgclVal) {
+    with_registry_mut(|reg| {
+        if detach_package_symbol(reg, idx, package) {
+            NAME_GENERATION.fetch_add(1, Ordering::Release);
+        }
+    });
+}
+
+/// Retire the symbol bindings owned by a deleted package by package identity.
+/// Old symbol indices/cells stay valid, while reusing the name creates fresh
+/// symbols. This adds no ownership map or image-format extension.
+pub fn detach_package_symbols(package: EgclVal) {
+    with_registry_mut(|reg| {
+        let indices: Vec<u32> = (0..reg.interned.len() as u32)
+            .chain(reg.uninterned.keys().copied())
+            .collect();
+        let mut changed = false;
+        for idx in indices {
+            changed |= detach_package_symbol(reg, idx, package);
+        }
+        if changed {
+            NAME_GENERATION.fetch_add(1, Ordering::Release);
+        }
+    });
 }
 
 /// Rewrite the package qualifier in the registry keys of every interned symbol
@@ -362,9 +422,14 @@ pub fn keyword_key_name(key: &str) -> Option<&str> {
 /// The exact registry key an interned symbol was created under (bliss-jtc.23).
 /// `intern(registry_key(idx))` returns `idx`, so this is a faithful,
 /// round-trippable identity for cross-process bytecode references. Returns
-/// `None` for uninterned symbols (which have no registry key).
+/// `None` for uninterned or detached symbols (which have no active registry key).
 pub fn registry_key(idx: u32) -> Option<String> {
-    with_registry(|reg| reg?.index_to_key.get(idx as usize).cloned())
+    with_registry(|reg| {
+        reg?.index_to_key
+            .get(idx as usize)
+            .filter(|key| !key.is_empty())
+            .cloned()
+    })
 }
 
 /// Look up an already-interned symbol index by name without interning it.

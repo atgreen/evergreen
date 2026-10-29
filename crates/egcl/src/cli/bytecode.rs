@@ -11056,12 +11056,20 @@ impl BbuConstPool {
             if let Some(r) = self.symbol_by_index(idx) {
                 return Some(r);
             }
+            // A detached dense-index symbol is already restored at this exact
+            // index by the image's symbol-object section. Preserve its identity
+            // with other image roots; portable artifacts still use tag 16.
+            if self.saved_heap_refs && !egcl_rt::symbols::is_uninterned(idx) {
+                let mut bytes = vec![21];
+                put_u64(&mut bytes, v.to_raw());
+                return Some(self.intern_encoded(bytes));
+            }
             // An uninterned / homeless symbol (no registry key), e.g. a gensym
             // embedded in macro output or a symbol whose home package is NIL.
             // Encode by name plus the process-local index: the index keeps
             // distinct symbols distinct (so the pool does not merge two same-named
             // gensyms), while load reconstructs a fresh uninterned symbol.
-            let name = egcl_rt::symbols::symbol_name(idx)?;
+            let name = super::symbol_name_of(v);
             let name_ref = self.string(&name);
             let mut bytes = Vec::new();
             put_u8(&mut bytes, 16);
@@ -31846,6 +31854,8 @@ fn mixed_local_sibling_inlines_a_transitive_capture() {
     assert_eq!(take_native_fallback_count(), 0, "the sibling must run natively");
 }
 
+#[cfg(test)]
+mod detached_symbol_persistence_tests;
 #[cfg(test)]
 mod packed_u8_persistence_tests;
 
