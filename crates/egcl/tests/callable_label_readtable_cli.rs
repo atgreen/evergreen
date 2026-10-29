@@ -48,11 +48,15 @@ const DEFINITIONS: &str = r##"
       (assert (eq result (second result))))
     (let ((definition (get-dispatch-macro-character #\# #\=))
           (reference (get-dispatch-macro-character #\# #\#)))
-      #+egcl
-      (dolist (invalid '(nil -1 18446744073709551616))
-        (assert (handler-case
-                  (progn (funcall definition (make-string-input-stream "x") #\= invalid) nil)
-                  (reader-error () t))))
+      ;; Missing labels are invalid portably; the remaining two cases check
+      ;; EGCL's nonnegative unsigned-64-bit label representation explicitly.
+      (dolist (invalid '(nil #+egcl -1 #+egcl 18446744073709551616))
+        (let ((input (make-string-input-stream "x")))
+          (assert (handler-case
+                    (progn (funcall definition input #\= invalid) nil)
+                    (reader-error (condition)
+                      (assert (eq (stream-error-stream condition) input))
+                      t)))))
       (set-macro-character #\@ (lambda (s c) (declare (ignore c)) (funcall definition s #\= 7)))
       (set-macro-character #\% (lambda (s c) (declare (ignore c)) (funcall reference s #\# 7)))
       (let* ((result (read-from-string "`(@,x %)")) (items (second result)))
