@@ -4,6 +4,11 @@
 
 ### Fixed
 
+- FORMAT logical blocks ending in `~:@>` insert automatic fill newlines after
+  literal body blanks, including nested blocks and per-line prefixes; logical
+  block prefixes and suffixes require constant text
+  ([#883](https://github.com/atgreen/evergreen/pull/883)).
+
 - FORMAT rejects section tabs and logical blocks inside justification, and
   detects incompatible pretty directives alongside nested overflow justification
   ([#881](https://github.com/atgreen/evergreen/pull/881)).
