@@ -2,6 +2,7 @@
   "fast": {
     "egcl:test:raw_structure_subtype_cli": [""],
     "egcl:test:native_typep_identity_cli": [""],
+    "egcl:test:format_justification_validation_cli": [""],
     "egcl:test:format_pretty_policy_cli": [""],
     "egcl:test:class_name_writer_cli": [""],
     "egcl-stdlib:test:class_name_writer": [""],
@@ -93,7 +94,7 @@
     "egcl-rt:test:gc_sparse_old_regions": [""],
     "egcl-rt:test:large_allocation_retry": [""],
     "egcl:test:large_allocation_retry_cli": [""],
-    "egcl-stdlib:lib:egcl_stdlib": ["streams::delegation_tests::", "clos::cpl_tests::missing_constant_slot_names_report_errors_without_symbol_index_panics", "hashtable::tests::minor_root_tracking_mark_relocate_full_and_weak_halves"],
+    "egcl-stdlib:lib:egcl_stdlib": ["format::control_validation::tests::", "streams::delegation_tests::", "clos::cpl_tests::missing_constant_slot_names_report_errors_without_symbol_index_panics", "hashtable::tests::minor_root_tracking_mark_relocate_full_and_weak_halves"],
     "egcl-stdlib:test:hashtable_minor_roots": [""],
     "egcl-stdlib:test:hashtable_gc": [""],
     "egcl-stdlib:test:hashtable_large_gc": [""],

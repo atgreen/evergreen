@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- FORMAT rejects section tabs and logical blocks inside justification, and
+  detects incompatible pretty directives alongside nested overflow justification
+  ([#881](https://github.com/atgreen/evergreen/pull/881)).
+
 - `(SETF CLASS-NAME)` renames or unnames classes without changing `FIND-CLASS`
   registrations, existing instances, slots, or method specializers. Runtime
   definitions follow class identity across compiled files and saved images.
