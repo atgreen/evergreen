@@ -223,6 +223,17 @@ impl Asm {
         self.xo(31, d, a, b, 233 << 1);
     }
 
+    /// `divd rD, rA, rB` — signed 64-bit divide, truncating toward zero.
+    ///
+    /// Division by zero and `i64::MIN / -1` are architecturally UNDEFINED here
+    /// rather than trapping, so a caller has to rule both out before issuing
+    /// this. The fixnum emitter tests the divisor for zero explicitly; the
+    /// overflow case cannot arise from tagged operands, because a tagged
+    /// divisor is a multiple of eight and so is never -1.
+    pub fn divd(&mut self, d: u8, a: u8, b: u8) {
+        self.xo(31, d, a, b, 489 << 1);
+    }
+
     /// `mulhd rD, rA, rB` — the high 64 bits of the signed product.
     ///
     /// This is how a fixnum multiply detects overflow, for the same reason AArch64
@@ -653,6 +664,7 @@ mod tests {
             ("xor 3, 4, 5", 0x7C832A78, one(|a| a.xor(3, 4, 5))),
             ("nand 3, 4, 4", 0x7C8323B8, one(|a| a.nand(3, 4, 4))),
             ("mulld 3, 4, 5", 0x7C6429D2, one(|a| a.mulld(3, 4, 5))),
+            ("divd 3, 4, 5", 0x7C642BD2, one(|a| a.divd(3, 4, 5))),
             ("mulhd 3, 4, 5", 0x7C642892, one(|a| a.mulhd(3, 4, 5))),
             ("extsw 3, 4", 0x7C8307B4, one(|a| a.extsw(3, 4))),
         ]);

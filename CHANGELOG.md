@@ -329,6 +329,14 @@
 
 ### Performance
 
+- On ppc64le, a hot `MOD`, `REM`, `FLOOR` or `TRUNCATE` of fixnums compiles to
+  a native divide instead of calling the runtime from the loop. A
+  2,000,000-iteration `(mod i 7)` loop drops from 0.99 us to 0.044 us per
+  iteration, which is what the same loop costs over plain fixnum arithmetic.
+  A zero divisor still signals `DIVISION-BY-ZERO`, and a quotient too large for
+  a fixnum -- `(floor most-negative-fixnum -1)` -- still answers the bignum
+  ([#853](https://github.com/atgreen/evergreen/pull/853)).
+
 - On ppc64le, a hot comparison of single-floats (`<`, `<=`, `>`, `>=`, `=`) and
   a hot `MIN` or `MAX` of fixnums compile to native instructions instead of
   calling the runtime from the loop. Both specializations existed only for
