@@ -38,6 +38,10 @@
   and `REMPROP`, including compiled calls and saved images
   ([#855](https://github.com/atgreen/evergreen/pull/855)).
 
+- Slot introspection and compiled structure literals work after compatible
+  structure redefinitions, preserving slot defaults and native layouts
+  ([#841](https://github.com/atgreen/evergreen/pull/841)).
+
 - String and stream printers consistently honor `*PRINT-ARRAY*` for array
   layouts, and string printers render package objects through their print hook
   ([#830](https://github.com/atgreen/evergreen/pull/830)).
