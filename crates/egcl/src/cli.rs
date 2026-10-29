@@ -15929,21 +15929,29 @@ fn eval_when_has_situation(
     Ok(found)
 }
 
-fn expand_compile_toplevel_form(form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
+enum CompileToplevelExpansion {
+    Ready(EgclVal),
+    DeferredError(EgclVal),
+}
+
+fn expand_compile_toplevel_form(
+    form: EgclVal,
+    env: &mut Env,
+) -> Result<CompileToplevelExpansion, EgclError> {
     // Macro expansion allocates. Keep the current expansion rooted so each
     // iteration observes its post-GC address rather than a stale nursery copy.
     egcl_rt::rooted!(form = form);
     for _ in 0..256 {
         if !form.is_cons() {
-            return Ok(*form);
+            return Ok(CompileToplevelExpansion::Ready(*form));
         }
         let (op, rest) = cp(*form);
         if !op.is_symbol() {
-            return Ok(*form);
+            return Ok(CompileToplevelExpansion::Ready(*form));
         }
         let name = sym_name(op);
         let Some(mdef) = lookup_macro(env, &name) else {
-            return Ok(*form);
+            return Ok(CompileToplevelExpansion::Ready(*form));
         };
         match expand_macro(&mdef, rest, env, *form) {
             Ok(expanded) if expanded != *form => *form = expanded,
@@ -15951,10 +15959,13 @@ fn expand_compile_toplevel_form(form: EgclVal, env: &mut Env) -> Result<EgclVal,
             // A failed expansion keeps the macro call; lowering it repeats the
             // expansion, reports the error and compiles the form to code that
             // signals it (GitHub #514).
-            _ => return Ok(*form),
+            Err(_) => return Ok(CompileToplevelExpansion::DeferredError(*form)),
+            // Protected defining syntax can deliberately remain unchanged;
+            // it still needs its mandatory compilation effects.
+            Ok(_) => return Ok(CompileToplevelExpansion::Ready(*form)),
         }
     }
-    Ok(*form)
+    Ok(CompileToplevelExpansion::Ready(*form))
 }
 
 /// Format a UNIX timestamp as SBCL's compile-note date, e.g. "16 AUG 2026
@@ -16150,6 +16161,7 @@ fn compile_file_process_form(
 ) -> Result<Vec<EgclVal>, CompileToplevelError> {
     egcl_rt::rooted_ref!(_env_root = &mut *env);
     egcl_rt::rooted!(form = form);
+    let mut expansion_failed = false;
     if depth > 100 {
         return Ok(vec![*form]);
     }
@@ -16245,9 +16257,15 @@ fn compile_file_process_form(
                 }
                 _ => {}
             }
-            let expanded = expand_compile_toplevel_form(*form, env)?;
-            if expanded != *form {
-                return compile_file_process_form(expanded, env, mode, lexical, depth + 1);
+            match expand_compile_toplevel_form(*form, env)? {
+                CompileToplevelExpansion::Ready(expanded) if expanded != *form => {
+                    return compile_file_process_form(expanded, env, mode, lexical, depth + 1);
+                }
+                CompileToplevelExpansion::Ready(_) => {}
+                CompileToplevelExpansion::DeferredError(expanded) => {
+                    *form = expanded;
+                    expansion_failed = true;
+                }
             }
         }
     }
@@ -16258,8 +16276,10 @@ fn compile_file_process_form(
         *form = compiler_macroexpand::macroexpand_all(*form, &menv)
             .map_err(CompileToplevelError::Residual)?;
     }
+    // A failed user macro named like a definer is still an unresolved macro,
+    // not that definer's mandatory effect. Let lowering report it under NCT.
     if matches!(mode, CompileToplevelMode::CompileTimeToo)
-        || compile_toplevel_form_has_effect(*form, env)
+        || (!expansion_failed && compile_toplevel_form_has_effect(*form, env))
     {
         with_eval_context(env, EvalContext::Eval, |env| eval_form(*form, env))?;
     }
