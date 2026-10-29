@@ -158,3 +158,51 @@ fn macro_optional_and_keyword_supplied_variables_keep_exact_identity() {
         variables.iter().copied().map(var_name).collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn portable_control_names_require_strings_without_lexical_key_decoding() {
+    let _lock = super::super::heap_test_lock()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    // Control names retain their original string namespace, even when a legal
+    // name resembles an encoded lexical variable. Symbols are not accepted as
+    // an alternate wire representation in this namespace.
+    let name = "\0egcl-lexical:symbol:2147483648";
+    egcl_rt::rooted!(constants = vec![arena_str(name)]);
+    egcl_rt::rooted!(symbol = egcl_rt::symbols::make_uninterned(name));
+    constants.push(*symbol);
+    constants.push(EgclVal::from_fixnum(42));
+    constants.push(NIL);
+    egcl_rt::rooted!(cons = arena_cons(NIL, NIL));
+    constants.push(*cons);
+    for opcode in [0x3f, 0x40, 0x41] {
+        let mut encoded = EncodedBbuFunction {
+            self_call_sites: vec![],
+            notinline_sites: vec![],
+            name_ref: BBU_NO_INDEX,
+            lambda_list_ref: BBU_NO_INDEX,
+            flags: 0,
+            arity_min: 0,
+            arity_max: 0,
+            n_locals: 0,
+            max_stack: 0,
+            code: vec![opcode],
+            literal_refs: vec![],
+            metadata: None,
+        };
+        put_u32(&mut encoded.code, 0);
+        if opcode == 0x41 {
+            put_u32(&mut encoded.code, 0); // Valid instruction-boundary target.
+        }
+        let decoded = decode_bbu_function(&encoded, &constants, &[], &[], 0x0301)
+            .expect("a string control name remains supported");
+        assert_eq!(decoded.names, vec![name.to_owned()]);
+        for reference in 1..constants.len() as u32 {
+            encoded.code[1..5].copy_from_slice(&reference.to_le_bytes());
+            assert!(
+                decode_bbu_function(&encoded, &constants, &[], &[], 0x0301).is_err(),
+                "opcode={opcode:#x}, non-string reference={reference}"
+            );
+        }
+    }
+}
