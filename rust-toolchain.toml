@@ -23,8 +23,7 @@
 # accident (bliss-75yx).
 [toolchain]
 channel = "1.94.1"
-# rustfmt and clippy are both gates: `make fmt-check` and CI's
-# `cargo clippy --workspace --all-targets -- -D warnings`.
+# CI runs both `make fmt-check` and `make clippy` through scripts/ci-lint.sh.
 components = ["rustfmt", "clippy"]
 # .cargo/config.toml builds for musl by default, so a fresh checkout needs this
 # target before anything compiles. The cross-compiled ports get their targets from

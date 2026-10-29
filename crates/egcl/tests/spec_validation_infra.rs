@@ -110,6 +110,7 @@ fn ansi_expected_failures_and_ci_contracts() {
     // test checks that failures propagate while the remaining gates still run.
     assert_has(&ci, "run: bash scripts/ci-lint.sh", "ci.yml");
     let driver = read("scripts/ci-lint.sh");
+    assert_has(&driver, "check 'rustfmt' make fmt-check", "lint driver");
     assert_has(&driver, "make clippy", "lint driver");
     assert_has(
         &driver,
