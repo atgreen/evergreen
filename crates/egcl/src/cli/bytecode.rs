@@ -27680,9 +27680,18 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
 /// decline `AuxData::NestedClosure` on a zero, so a host without the helper
 /// keeps closure creators at T1 instead of calling into nothing.
 #[cfg(not(egcl_no_t2))]
+/// The `PortableCalls::make_closure` adapter, or 0 where no emitter reads it.
+///
+/// A zero declines just the `AuxData::NestedClosure` operation, so a target
+/// missing from this list loses native code for any body that creates a
+/// non-capturing closure -- and silently, because the emitter arm looks
+/// correct and simply never fires. AArch64 was in exactly that position: the
+/// arm was written and a function returning `(lambda (x) (+ x 1))` still
+/// declined, because this returned 0.
 fn make_bytecode_closure_address() -> u64 {
     #[cfg(any(
         target_arch = "x86_64",
+        target_arch = "aarch64",
         target_arch = "s390x",
         all(target_arch = "powerpc64", target_endian = "little")
     ))]
@@ -27690,6 +27699,7 @@ fn make_bytecode_closure_address() -> u64 {
         as extern "C" fn(*const Arc<BytecodeFunction>, u64) -> u64 as usize as u64;
     #[cfg(not(any(
         target_arch = "x86_64",
+        target_arch = "aarch64",
         target_arch = "s390x",
         all(target_arch = "powerpc64", target_endian = "little")
     )))]

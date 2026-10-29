@@ -64,7 +64,12 @@
 //!
 //! `Call`, `SymbolValue`, `SymbolFunction`, `SetSymbolValue`, `ClearMv`,
 //! `TakeValuesToLocals`, `EnvironmentValue` and `SetEnvironmentValue` go
-//! through [`RuntimeCalls`] adapters. Because the
+//! through [`RuntimeCalls`] adapters. Two further `Call` shapes go through
+//! [`super::emit::PortableCalls`], because x86-64 reaches them only through
+//! its mapped transfer protocol and a checked-ABI target would otherwise
+//! decline the whole function: `AuxData::ValuesToList`
+//! (`MULTIPLE-VALUE-LIST`) and `AuxData::NestedClosure` (a `(lambda ...)`
+//! that captures nothing, including one a function merely RETURNS). Because the
 //! collector cannot see a home register or native spill slot, `runtime_call`
 //! clears every shadow slot to NIL, writes each live tagged value into the
 //! shadow area after `activation_slots` (roots, then call arguments), calls,
@@ -1333,6 +1338,53 @@ impl Emitter<'_> {
         }
         let helper = if let Some(data) = data {
             match data.opcode {
+                // `MULTIPLE-VALUE-LIST`. x86-64 services this through its
+                // mapped TRANSFER_VALUES_TO_LIST_REQUEST, which only the
+                // mapped entry can answer, so a checked-ABI target saw an
+                // `AuxData` the general arm below rejects and declined the
+                // whole function. The plain adapter reads the runtime tuple
+                // the argument's producer left and returns a fresh list. Same
+                // arm System Z carries (bliss-3pw4m).
+                Opcode::Call if matches!(data.aux, AuxData::ValuesToList) => {
+                    if data.args.len() != 1 || data.results.len() != 1 {
+                        return Err(unsupported!());
+                    }
+                    if self.runtime.portable.values_to_list == 0 {
+                        return Err(unsupported!());
+                    }
+                    self.load(*data.args.first().ok_or(unsupported!())?, W0)?;
+                    self.runtime.portable.values_to_list
+                }
+                // `(lambda ...)` capturing nothing -- the ordinary
+                // `(mapcar (lambda ..) ..)` shape, and any function that
+                // RETURNS such a lambda. Same story as `ValuesToList`:
+                // x86-64 uses its mapped TRANSFER_MAKE_CLOSURE_REQUEST, so the
+                // checked ABI needs the plain adapter plus the address of the
+                // retained nested body. NEVER capturing: a capturing closure
+                // needs an activation-owned `EnvFrame` this emitter does not
+                // publish, and the builder keeps that case out.
+                Opcode::Call if matches!(data.aux, AuxData::NestedClosure(_)) => {
+                    let AuxData::NestedClosure(index) = data.aux else {
+                        return Err(unsupported!());
+                    };
+                    if !data.args.is_empty() || data.results.len() != 1 {
+                        return Err(unsupported!());
+                    }
+                    let body = *self
+                        .runtime
+                        .portable
+                        .nested_bodies
+                        .get(index as usize)
+                        .ok_or(unsupported!())?;
+                    // A zero entry means the runtime did not retain that body;
+                    // baking the address anyway would outlive its owner.
+                    if body == 0 || self.runtime.portable.make_closure == 0 {
+                        return Err(unsupported!());
+                    }
+                    self.imm(W0, body);
+                    self.imm(W1, 0);
+                    self.runtime.portable.make_closure
+                }
                 Opcode::Call => {
                     let Some(symbol) = data.aux.named_call_target() else {
                         return Err(unsupported!());
