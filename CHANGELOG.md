@@ -25,6 +25,11 @@
   while preserving custom printer precedence
   ([#856](https://github.com/atgreen/evergreen/pull/856)).
 
+- SETF-named generic functions retain their declared argument contracts, so
+  missing arguments signal `PROGRAM-ERROR` before method selection; keyword
+  and method-congruence checks use the same metadata as ordinary generics
+  ([#847](https://github.com/atgreen/evergreen/pull/847)).
+
 - String and stream printers consistently honor `*PRINT-ARRAY*` for array
   layouts, and string printers render package objects through their print hook
   ([#830](https://github.com/atgreen/evergreen/pull/830)).
