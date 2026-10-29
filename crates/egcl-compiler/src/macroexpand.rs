@@ -2576,11 +2576,11 @@ fn expand_structure_slot(slot: EgclVal, env: &Environment) -> Result<EgclVal, Eg
     if parts.len() < 2 {
         return Ok(*slot);
     }
-    let value = macroexpand_all(parts[1], env)?;
-    if value == parts[1] {
+    egcl_rt::rooted!(value = macroexpand_all(parts[1], env)?);
+    if *value == parts[1] {
         return Ok(*slot);
     }
-    parts[1] = value;
+    parts[1] = *value;
     Ok(vec_to_cons(&parts))
 }
 
