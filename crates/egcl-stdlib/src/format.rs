@@ -5865,8 +5865,7 @@ fn format_arguments(control: &str, args: &Arguments, output: &mut LayoutDoc) -> 
                                     "too few args for V param".into(),
                                 )));
                             }
-                            let v = next_format_argument(args, output)?;
-                            v
+                            next_format_argument(args, output)?
                         }
                         Param::Hash => EgclVal::from_fixnum(
                             i64::try_from(args.remaining_count()?).map_err(|_| {
@@ -6055,29 +6054,6 @@ fn conditional_default_index(body: &str) -> Option<usize> {
         }
     }
     None
-}
-
-/// The elements of a proper list; a dotted tail is a TYPE-ERROR (what `~{`
-/// signals for `(x y . z)`, ansi format.{.error.5).
-fn proper_list_elements(list: EgclVal) -> Result<Vec<EgclVal>, EgclError> {
-    let mut elements = Vec::new();
-    let mut cur = list;
-    while cur.is_cons() {
-        // SAFETY: `cur` is a cons, so its payload is a ConsCell.
-        unsafe {
-            let ptr = cur.as_ptr() as *const egcl_rt::object::ConsCell;
-            elements.push((*ptr).car);
-            cur = (*ptr).cdr;
-        }
-    }
-    if !cur.is_nil() {
-        // The offending datum is the dotted tail, as SBCL reports it.
-        return Err(EgclError::TypeError {
-            datum: cur,
-            expected: "LIST".into(),
-        });
-    }
-    Ok(elements)
 }
 
 /// For a justification body whose FIRST top-level separator is `~n,m:;`,
