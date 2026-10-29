@@ -12351,7 +12351,8 @@ fn print_val(val: EgclVal, out: &mut String) {
     egcl_stdlib::format::circle_exit();
 }
 
-fn print_val_inner(val: EgclVal, out: &mut String) {
+fn print_val_inner(mut val: EgclVal, out: &mut String) {
+    egcl_rt::rooted_ref!(_val_root = &mut val);
     // See egclval_to_print_string: unbounded recursion on circular structure
     // printed without *PRINT-CIRCLE* ends at the stack budget, not the guard page.
     if egcl_rt::host_stack_budget_exhausted() {
@@ -12364,6 +12365,28 @@ fn print_val_inner(val: EgclVal, out: &mut String) {
         out.push_str(&s);
         return;
     }
+    if egcl_stdlib::format::circle_active() && !val.is_cons() {
+        if val.is_heap_object()
+            && egcl_stdlib::format::print_level().is_some_and(|level| PRINT_DEPTH.with(|depth| depth.get()) >= level)
+            && egcl_stdlib::format::circle_array_length(val).is_some()
+        {
+            out.push('#');
+            return;
+        }
+        match egcl_stdlib::format::circle_visit(val) {
+            egcl_stdlib::format::CircleMark::Repeat(label) => {
+                out.push_str(&format!("#{label}#"));
+                return;
+            }
+            egcl_stdlib::format::CircleMark::First(label) => out.push_str(&format!("#{label}=")),
+            egcl_stdlib::format::CircleMark::NotShared => {}
+        }
+    }
+    print_val_body(val, out);
+}
+
+fn print_val_body(mut val: EgclVal, out: &mut String) {
+    egcl_rt::rooted_ref!(_val_root = &mut val);
     if let Some(text) = egcl_stdlib::format::u8_readable_representation(val) {
         out.push_str(&text);
         return;
@@ -50882,3 +50905,6 @@ mod evaluator_error_boundary_rooting_tests {
 
 #[cfg(test)]
 mod subtype_canonicalization_rooting_tests;
+
+#[cfg(test)]
+mod print_circle_gc_tests;

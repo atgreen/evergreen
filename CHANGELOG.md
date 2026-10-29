@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- `*PRINT-CIRCLE*` preserves shared arrays and uninterned symbols, and prints
+  cycles through vectors and multidimensional arrays without runaway expansion
+  ([#822](https://github.com/atgreen/evergreen/pull/822)).
+
 - Functions preserve definition-site local functions and `SPECIAL` declaration
   scope across evaluation, tiered calls, and saved images. Undefined function
   references signal `UNDEFINED-FUNCTION` before subsequent effects

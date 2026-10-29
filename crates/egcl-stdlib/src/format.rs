@@ -666,21 +666,21 @@ pub fn print_gensym() -> bool {
 // `prin1-to-string`/`format ~S` behave identically:
 //
 //   Pass 1 (`CircleTable::build`) walks the structure once, counting how many
-//   times each cons is reached by object identity (its `as_ptr()` address).
-//   Conses reached ≥2 times are "shared" (this includes a circular back-edge,
+//   times each cons, array, or uninterned symbol is reached by EQ identity.
+//   Objects reached ≥2 times are "shared" (this includes a circular back-edge,
 //   which reaches the head a second time). Cycles can't diverge because the
-//   scan stops recursing the moment a cons is seen again.
+//   scan stops following a node the moment it is seen again.
 //
 //   Pass 2 is the normal recursive print, but each printer asks the table,
-//   per cons, whether to emit a `#N=` label (first visit of a shared node),
+//   per object, whether to emit a `#N=` label (first visit of a shared node),
 //   a `#N#` back-reference (subsequent visit — do NOT recurse), or nothing.
 //
 // Circle identities are relocated by the root scanner, including tables
 // belonging to fibers suspended inside a user PRINT-OBJECT method.
 
-/// What to emit for a given cons under `*print-circle*`.
+/// What to emit for a shared object under `*print-circle*`.
 pub enum CircleMark {
-    /// Not shared — print the cons normally.
+    /// Not shared — print the object normally.
     NotShared,
     /// First time this shared node is printed: emit `#N=` then its contents.
     First(u32),
@@ -689,11 +689,60 @@ pub enum CircleMark {
 }
 
 struct CircleTable {
-    /// All reachable cons addresses and their multiplicities.
-    counts: std::collections::HashMap<usize, u32>,
-    /// address → label number, assigned lazily in first-print order.
-    labels: std::collections::HashMap<usize, u32>,
+    /// Tagged object identities and their multiplicities. Preserve tags when
+    /// tracing: arrays and conses have different GC pointer encodings.
+    counts: std::collections::HashMap<u64, u32>,
+    /// Tagged identity → label number, assigned in first-print order.
+    labels: std::collections::HashMap<u64, u32>,
     next_label: u32,
+}
+
+/// Visible vector length, or total row-major size of an array. Scalars and
+/// opaque pseudo-heap handles are excluded before any header access.
+pub fn circle_array_length(value: EgclVal) -> Option<usize> {
+    if !value.is_heap_object() || crate::pathnames::is_pathname(value) { return None; }
+    if crate::sequences::is_complex_vector(value) {
+        Some(crate::sequences::cvec_fill_pointer(value))
+    } else {
+        crate::sequences::array_total_size(value)
+    }
+}
+
+/// Read only reference-bearing array storage. Specialized scalar storage has
+/// no outgoing graph edges, and reading it through ELT could allocate a box.
+fn circle_array_reference(mut value: EgclVal, mut index: usize) -> Option<EgclVal> {
+    loop {
+        if !value.is_heap_object() { return None; }
+        unsafe {
+            let pointer = value.as_ptr();
+            match (*(pointer as *const ObjectHeader)).type_id() {
+                type_id::SIMPLE_VECTOR => {
+                    return Some(*(pointer.add(object_payload_offset(pointer) + 8 + index * 8) as *const EgclVal));
+                }
+                type_id::MD_ARRAY => value = *(pointer.add(8) as *const EgclVal),
+                type_id::COMPLEX_ARRAY => {
+                    if let Some((base, offset, _)) = crate::sequences::cvec_displacement(value) {
+                        value = base;
+                        index += offset;
+                    } else {
+                        value = *(pointer.add(8) as *const EgclVal);
+                    }
+                }
+                _ => return None,
+            }
+        }
+    }
+}
+
+// A retained low-index symbol can become homeless after UNINTERN or
+// DELETE-PACKAGE. A nil home alone is insufficient: internal interned symbols
+// can still have a lazy home, so require the retired interning key as well.
+fn circle_uninterned_symbol(value: EgclVal) -> bool {
+    value.symbol_index().is_some_and(|index| {
+        egcl_rt::symbols::is_uninterned(index)
+            || (egcl_rt::symbols::registry_key(index).is_none()
+                && egcl_rt::symbols::symbol_package(index).is_some_and(|home| home.is_nil()))
+    })
 }
 
 impl CircleTable {
@@ -710,42 +759,50 @@ impl CircleTable {
         if t.counts.is_empty() { None } else { Some(t) }
     }
 
-    /// Count cons multiplicities. Recurses on cars (bounded by nesting depth)
-    /// and iterates the cdr spine (bounded by nothing, but adds no stack), and
-    /// stops at any cons seen a second time so cycles terminate.
+    /// Walk reference-bearing storage without allocating Lisp values. In
+    /// particular, generic ELT can box packed floats and cannot run while the
+    /// new table and pending graph are not registered as GC roots.
     fn scan(&mut self, root: EgclVal) {
-        let mut cur = root;
-        loop {
-            if !cur.is_cons() {
-                return;
+        let mut pending = vec![root];
+        while let Some(value) = pending.pop() {
+            let array = circle_array_length(value);
+            if !value.is_cons() && array.is_none()
+                && !(circle_uninterned_symbol(value))
+            {
+                continue;
             }
-            let addr = unsafe { cur.as_ptr() } as usize;
-            let c = self.counts.entry(addr).or_insert(0);
-            *c += 1;
-            if *c > 1 {
-                return;
-            }
-            unsafe {
-                let ptr = cur.as_ptr() as *const egcl_rt::object::ConsCell;
-                self.scan((*ptr).car);
-                cur = (*ptr).cdr;
+            let count = self.counts.entry(value.0).or_insert(0);
+            *count += 1;
+            if *count > 1 { continue; }
+            if value.is_cons() {
+                unsafe {
+                    let cell = &*(value.as_ptr() as *const egcl_rt::object::ConsCell);
+                    pending.push(cell.cdr);
+                    pending.push(cell.car);
+                }
+            } else if let Some(length) = array {
+                // Only elements belong to the printed graph. Array backing
+                // storage and displacement bases are implementation details.
+                for index in (0..length).rev() {
+                    if let Some(element) = circle_array_reference(value, index) {
+                        pending.push(element);
+                    } else {
+                        break; // Packed scalar storage has no reference edges.
+                    }
+                }
             }
         }
     }
 
-    fn is_shared(&self, v: EgclVal) -> bool {
-        v.is_cons()
-            && self
-                .counts
-                .get(&(unsafe { v.as_ptr() } as usize))
-                .is_some_and(|n| *n >= 2)
+    fn is_shared(&self, value: EgclVal) -> bool {
+        self.counts.get(&value.0).is_some_and(|count| *count >= 2)
     }
 
     fn visit(&mut self, v: EgclVal) -> CircleMark {
         if !self.is_shared(v) {
             return CircleMark::NotShared;
         }
-        let addr = unsafe { v.as_ptr() } as usize;
+        let addr = v.0;
         if let Some(&n) = self.labels.get(&addr) {
             CircleMark::Repeat(n)
         } else {
@@ -783,9 +840,9 @@ pub fn circle_enter(root: EgclVal) {
                         let mut counts = std::collections::HashMap::new();
                         let mut labels = std::collections::HashMap::new();
                         for (address, count) in table.counts.drain() {
-                            let mut value = EgclVal::from_cons_ptr(address as *mut u8);
+                            let mut value = EgclVal(address);
                             visit(&mut value);
-                            let relocated = value.as_ptr() as usize;
+                            let relocated = value.0;
                             counts.insert(relocated, count);
                             if let Some(label) = table.labels.remove(&address) {
                                 labels.insert(relocated, label);
@@ -799,12 +856,7 @@ pub fn circle_enter(root: EgclVal) {
         })
     });
     let covered = CIRCLE.with(|c| {
-        !root.is_cons()
-            || c.borrow().tables.last().is_some_and(|table| {
-                table
-                    .counts
-                    .contains_key(&(unsafe { root.as_ptr() } as usize))
-            })
+        c.borrow().tables.last().is_some_and(|table| table.counts.contains_key(&root.0))
     });
     let table = if covered {
         None
@@ -842,17 +894,17 @@ pub fn circle_exit() {
     });
 }
 
-/// True when a cons graph is being tracked for sharing or circularity.
+/// True when an object graph is being tracked for sharing or circularity.
 pub fn circle_active() -> bool {
     CIRCLE.with(|c| !c.borrow().tables.is_empty())
 }
 
-/// True when `v` is a shared/circular cons (used to force a dotted tail).
+/// True when `v` is shared/circular (also used to force a dotted cons tail).
 pub fn circle_is_shared(v: EgclVal) -> bool {
     CIRCLE.with(|c| c.borrow().tables.last().is_some_and(|t| t.is_shared(v)))
 }
 
-/// Register a visit to cons `v`, assigning a label on first sight.
+/// Register a visit to `v`, assigning a label on first sight.
 pub fn circle_visit(v: EgclVal) -> CircleMark {
     CIRCLE.with(|c| {
         let mut b = c.borrow_mut();
@@ -1721,6 +1773,23 @@ fn egclval_to_print_inner(mut v: EgclVal, escapep: bool, dispatch_pretty: bool) 
             return s;
         }
     }
+    // Pretty-dispatch implementations own their logical-block marks. The
+    // ordinary printer also labels arrays and uninterned symbols.
+    if circle_active() && !v.is_cons() {
+        if circle_array_length(v).is_some()
+            && print_level().is_some_and(|level| PRINT_DEPTH.with(|depth| depth.get()) >= level)
+        { return "#".into(); }
+        match circle_visit(v) {
+            CircleMark::Repeat(label) => return format!("#{label}#"),
+            CircleMark::First(label) => return format!("#{label}={}", egclval_to_print_body(v, escapep)),
+            CircleMark::NotShared => {}
+        }
+    }
+    egclval_to_print_body(v, escapep)
+}
+
+fn egclval_to_print_body(mut v: EgclVal, escapep: bool) -> String {
+    egcl_rt::rooted_ref!(_v_root = &mut v);
     if let Some(text) = u8_readable_representation(v) {
         return text;
     }
