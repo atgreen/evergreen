@@ -16,6 +16,11 @@
 
 ### Fixed
 
+- Callbacks created inside compiled top-level FLET/LABELS forms retain their
+  lexical function bindings, including callbacks introduced by macros and
+  helpers sharing mutable captured variables
+  ([#904](https://github.com/atgreen/evergreen/pull/904)).
+
 - Apple ARM64 scalar foreign calls use natural-width fixed stack arguments,
   stack-based variadic arguments and caller-side narrow integer extension.
   ARM64 variadic promotions also transform float and small-integer values

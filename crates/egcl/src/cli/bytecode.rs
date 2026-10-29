@@ -7827,7 +7827,12 @@ impl<'e> Lowerer<'e> {
         // to one inside this closure body must bail, not resolve as a global
         // (bliss-9u6d).
         let enclosing_slots = self.enclosing_slot_names();
-        let bf = if captured.is_empty() {
+        // A lambda can capture the FUNCTION namespace without capturing any
+        // variable. Preserve the compiled FLET/LABELS names rather than
+        // recompiling its body against only the global environment.
+        let capture_env =
+            !captured.is_empty() || !self.local_fns.is_empty() || !self.closure_fns.is_empty();
+        let bf = if !capture_env {
             compile_function_in(
                 "<lambda>",
                 params_form,
@@ -7895,7 +7900,7 @@ impl<'e> Lowerer<'e> {
         self.nested_functions.push(Arc::new(bf));
         self.emit(Instr::MakeClosure {
             func: idx as u32,
-            capture_env: !captured.is_empty(),
+            capture_env,
         });
         self.push_n(1);
         Ok(())
@@ -7905,7 +7910,11 @@ impl<'e> Lowerer<'e> {
     fn lower_lambda(&mut self, op: EgclVal, rest: EgclVal) -> LowerResult<()> {
         let (params_form, body) = cp(rest);
         let captured = self.lambda_captured_locals(params_form, body);
-        if self.portable || self.loop_finish_tag.is_some() {
+        if self.portable
+            || self.loop_finish_tag.is_some()
+            || !self.local_fns.is_empty()
+            || !self.closure_fns.is_empty()
+        {
             return self.emit_portable_closure(params_form, body, &captured);
         }
         egcl_rt::rooted!(form = arena_cons(op, rest));
@@ -7959,7 +7968,11 @@ impl<'e> Lowerer<'e> {
             if t_op.is_symbol() && sym_name(t_op) == "LAMBDA" {
                 let (params_form, body) = cp(t_rest);
                 let captured = self.lambda_captured_locals(params_form, body);
-                if self.portable || self.loop_finish_tag.is_some() {
+                if self.portable
+                    || self.loop_finish_tag.is_some()
+                    || !self.local_fns.is_empty()
+                    || !self.closure_fns.is_empty()
+                {
                     return self
                         .emit_portable_closure(params_form, body, &captured)
                         .inspect_err(|_e| {
@@ -7998,6 +8011,10 @@ impl<'e> Lowerer<'e> {
             for definition in list_to_vec(definitions) {
                 collect_symbol_names(flet_def_forms(definition).1, &mut used);
             }
+            // Body macros can introduce escaping lambdas too. Reuse this
+            // expansion for lowering before deciding that no runtime local
+            // function binding is needed.
+            collect_symbol_names(body, &mut used);
             if used
                 .iter()
                 .any(|name| inline_local_macro_reference(self.env, name))
@@ -11231,10 +11248,45 @@ fn compile_thunk(form: EgclVal, env: &Env, portable: bool) -> Option<BytecodeFun
         return None;
     }
     egcl_rt::rooted!(form = form);
+    let mut forced = std::collections::HashSet::new();
+    egcl_rt::rooted!(forced_symbols = Vec::<EgclVal>::new());
+    let mut names = std::collections::HashSet::new();
+    collect_variable_names(*form, &mut names);
+    // A body macro may reveal a closure only after the initial capture scan.
+    // As with ordinary functions, retry only when a failed attempt identifies
+    // another binding that must be boxed, with a finite source-derived budget.
+    for _ in 0..names.len().saturating_add(1).max(4) {
+        let _ = take_box_request();
+        if let Some(function) = compile_thunk_forcing_boxed(*form, env, portable, &forced) {
+            return Some(function);
+        }
+        let requested = take_box_request();
+        if requested.is_empty() || requested.is_subset(&forced) {
+            return None;
+        }
+        // Encoded variable keys alone do not retain uninterned symbol cells.
+        forced_symbols.extend(
+            requested
+                .iter()
+                .filter_map(|name| lexical_identity::symbol(name)),
+        );
+        forced.extend(requested);
+    }
+    None
+}
+
+fn compile_thunk_forcing_boxed(
+    form: EgclVal,
+    env: &Env,
+    portable: bool,
+    forced: &std::collections::HashSet<String>,
+) -> Option<BytecodeFunction> {
+    egcl_rt::rooted!(form = form);
     let mut lo = Lowerer::new(env);
     egcl_rt::rooted_ref!(_const_guard = &mut lo);
     lo.portable = portable;
     lo.captured_names = compute_captured_names(arena_cons(*form, NIL));
+    lo.captured_names.extend(forced.iter().cloned());
     if lo.lower_expr(*form).is_err() {
         return None;
     }
@@ -34702,6 +34754,9 @@ mod native_typep_identity_tests;
 
 #[cfg(test)]
 mod aux_entry_prologue_tests;
+
+#[cfg(test)]
+mod toplevel_local_callback_tests;
 
 #[cfg(all(test, target_os = "ios"))]
 mod ios_tier_profile_tests {
