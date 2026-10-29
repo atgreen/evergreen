@@ -82,11 +82,13 @@ fn rank_one_dimension_lists_match_the_full_make_array_path() {
         ;; Assert helper admission independently of public result equivalence.
         (let ((fast (egcl::%make-simple-array '(3) '(:element-type (unsigned-byte 8)))))
           __CHECK_ADMISSION__)
+        (let ((fast (egcl::%make-simple-array '(3) '(:element-type bit))))
+          __CHECK_BIT_ADMISSION__)
         (assert (egcl::%make-simple-array 3 '(:element-type (unsigned-byte 8))))
         (dolist (dimensions '(nil (2 3) (2 . 3) (-1) (1.5) ((2))))
           (assert (null (egcl::%make-simple-array dimensions nil))))
         (dolist (options '((:fill-pointer 0) (:adjustable t) (:displaced-to #(1 2 3))
-                           (:element-type bit) (:element-type character)
+                           (:element-type character)
                            (:element-type double-float) (:unsupported-option t)))
           (assert (null (egcl::%make-simple-array '(3) options))))
         (assert (null (egcl::%make-simple-array '(3) '(:initial-contents (1 2)))))
@@ -127,7 +129,14 @@ fn rank_one_dimension_lists_match_the_full_make_array_path() {
         } else {
             "(assert (null fast))"
         };
-        let case = program.replace("__CHECK_ADMISSION__", admission);
+        let bit_admission = if enabled {
+            "(assert fast) (assert (eq (array-element-type fast) 'bit)) (assert (equal (coerce fast 'list) '(0 0 0)))"
+        } else {
+            "(assert (null fast))"
+        };
+        let case = program
+            .replace("__CHECK_ADMISSION__", admission)
+            .replace("__CHECK_BIT_ADMISSION__", bit_admission);
         let mut command = Command::new(env!("CARGO_BIN_EXE_egcl"));
         command.args(["--no-init", "--eval", &case]);
         if enabled {

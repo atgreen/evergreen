@@ -273,7 +273,10 @@ fn native_filled_bit_constructor_reaches_public_fast_storage_under_gc() {
         assert!(
             stderr
                 .lines()
-                .any(|line| line.contains("lowered NATIVE-FILLED-BIT-ARRAY")),
+                .any(|line| {
+                    line.contains("[native-array-constructor] lowered ")
+                        && line.ends_with("NATIVE-FILLED-BIT-ARRAY sites=1")
+                }),
             "native BIT constructor site was not emitted: {stderr}"
         );
         assert!(
