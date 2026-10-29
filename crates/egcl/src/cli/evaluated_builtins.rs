@@ -1409,6 +1409,15 @@ fn resolve(name: &str) -> Option<Handler> {
             )?
             .unwrap_or(T))
         }),
+        "EGCL::%DECLARATION-TYPEP" => Some(|_operator, args, env| {
+            env.clear_mv();
+            let [object, spec] = args else {
+                return Err(EgclError::ProgramError(
+                    "%DECLARATION-TYPEP takes two arguments".into(),
+                ));
+            };
+            Ok(if declaration_typep_matches(env, *object, *spec, false, 0)? { T } else { NIL })
+        }),
         // The declared type of SLOT in OBJECT's own structure class, or T.
         // Boot's %CHECKED-STRUCTURE-SLOT-VALUE checks a typed structure's writer
         // values against it; from interpreted code CLASS-OF, CLASS-NAME, GET and

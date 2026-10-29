@@ -485,7 +485,7 @@
 ;; CHECK-TYPE 6-8 times per package symbol, so this dominated ASDF/package load.
 ;; Keeping the restart-case out of line makes CHECK-TYPE's fast path a bare TYPEP
 ;; and lets its callers promote to native.
-(defun %check-type-fail (value typespec)
+(defun %check-type-fail (value typespec &optional (predicate #'typep))
   ;; Signal a correctable TYPE-ERROR with a STORE-VALUE restart; loop until the
   ;; supplied value conforms; return the conforming value (the CHECK-TYPE
   ;; expansion stores it back into PLACE).
@@ -493,7 +493,7 @@
     (restart-case
         (error 'type-error :datum value :expected-type typespec)
       (store-value (v) (setf value v)))
-    (when (typep value typespec) (return value))))
+    (when (funcall predicate value typespec) (return value))))
 
 (defmacro check-type (place typespec &rest ignore)
   (declare (ignore ignore))
@@ -506,13 +506,22 @@
        (setf ,place (%check-type-fail ,place ',typespec)))
      nil))
 
+(defmacro egcl::%check-structure-type (place typespec)
+  ;; Slot declarations can contain FUNCTION signatures, which public TYPEP
+  ;; cannot discriminate. Keep the original declaration in failure conditions.
+  `(progn
+     (unless (egcl::%declaration-typep ,place ',typespec)
+       (setf ,place (%check-type-fail ,place ',typespec
+                                     #'egcl::%declaration-typep)))
+     nil))
+
 (defun egcl::%checked-structure-slot-value (value object slot)
   ;; An inherited writer must honor the actual structure's narrowed type, so
   ;; the type comes from OBJECT's own class, looked up natively.
   (let ((typespec (egcl::%struct-slot-typespec object slot)))
-    (if (or (eq typespec t) (typep value typespec))
+    (if (or (eq typespec t) (egcl::%declaration-typep value typespec))
         value
-        (%check-type-fail value typespec))))
+        (%check-type-fail value typespec #'egcl::%declaration-typep))))
 
 (defmacro assert (test-form &rest more)
   ;; (assert test [(place*) [datum arg*]]) — CLHS 9.2. Signal a correctable
