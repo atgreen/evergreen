@@ -11798,9 +11798,10 @@ impl Env {
         // A LOCALLY-declared special reference is dynamic for the same reason,
         // even though the name is neither earmuffed nor proclaimed (bliss-9kww).
         if is_special_var(symbol) || self.locally_specials.contains(&idx) {
-            if let Some(val) = global_value_cell(idx) {
-                return Some(val);
-            }
+            // An unbound dynamic cell stays unbound. Falling through to a
+            // same-named lexical or bare-name binding can borrow another
+            // package's special value after MAKUNBOUND or an unbound PROGV.
+            return global_value_cell(idx);
         }
         let frame = self.frame.borrow();
         if let Some(val) = frame.symbol_vars.get(&idx) {
