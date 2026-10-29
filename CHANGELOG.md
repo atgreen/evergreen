@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- String and stream printers consistently honor `*PRINT-ARRAY*` for array
+  layouts, and string printers render package objects through their print hook
+  ([#830](https://github.com/atgreen/evergreen/pull/830)).
+
 - `*PRINT-CIRCLE*` preserves shared arrays and uninterned symbols, and prints
   cycles through vectors and multidimensional arrays without runaway expansion
   ([#822](https://github.com/atgreen/evergreen/pull/822)).

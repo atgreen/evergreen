@@ -624,6 +624,37 @@ pub fn print_array_active() -> bool {
         .unwrap_or(true)
 }
 
+/// Concise standard array output shared by stream and string printers.
+/// Pretty dispatch and circle/depth handling run before the ordinary body;
+/// readable output overrides PRINT-ARRAY, and character arrays remain strings.
+pub fn concise_array_representation(value: EgclVal) -> Option<String> {
+    if print_array_active() { return None; }
+    let kind = egcl_rt::gc::heap_object_type_id(value)?;
+    match kind {
+        type_id::SIMPLE_VECTOR => Some(format!(
+            "#<SIMPLE-VECTOR {}>", crate::sequences::length(value).ok()?,
+        )),
+        type_id::MD_ARRAY => Some("#<ARRAY>".into()),
+        type_id::COMPLEX_ARRAY if !crate::sequences::cvec_is_string(value) => {
+            let kind = if crate::sequences::cvec_is_bit(value) { "BIT-VECTOR" } else { "VECTOR" };
+            Some(format!("#<{kind} {}>", crate::sequences::cvec_fill_pointer(value)))
+        }
+        type_id::SIMPLE_ARRAY => {
+            let (kind, length) = if let Some(length) = egcl_rt::packed_u8::len(value) {
+                ("UB8-VECTOR", length)
+            } else if let Some(length) = egcl_rt::packed_f64::len(value) {
+                ("DOUBLE-FLOAT-VECTOR", length)
+            } else if let Some(length) = egcl_rt::types::bit_vector_len(value) {
+                ("BIT-VECTOR", length)
+            } else {
+                return Some("#<ARRAY>".into());
+            };
+            Some(format!("#<{kind} {length}>"))
+        }
+        _ => None,
+    }
+}
+
 /// Whether `*READ-DEFAULT-FLOAT-FORMAT*` names DOUBLE-FLOAT or LONG-FLOAT, so a
 /// double prints without an exponent marker and a single float needs `f`.
 fn default_float_format_is_double() -> bool {
@@ -1257,9 +1288,6 @@ fn heap_vector_string(v: EgclVal, escapep: bool) -> Option<String> {
         return None;
     }
     if let Some(length) = egcl_rt::packed_u8::len(v) {
-        if !print_array_active() {
-            return Some(format!("#<UB8-VECTOR {length}>"));
-        }
         egcl_rt::rooted!(v = v);
         return Some(vector_elements_string(length, |i| {
             egclval_to_print_string(
@@ -1309,9 +1337,6 @@ fn heap_vector_string(v: EgclVal, escapep: bool) -> Option<String> {
             if crate::sequences::cvec_is_bit(v) {
                 // A fill-pointer / adjustable / displaced bit vector prints
                 // like a simple one (ansi print.bit-vector.5-7).
-                if !print_array_active() {
-                    return Some(format!("#<BIT-VECTOR {count}>"));
-                }
                 let mut s = String::from("#*");
                 for i in 0..count {
                     let e = crate::sequences::cvec_element(v, i).unwrap_or(NIL);
@@ -1322,9 +1347,6 @@ fn heap_vector_string(v: EgclVal, escapep: bool) -> Option<String> {
                     });
                 }
                 return Some(s);
-            }
-            if !print_array_active() {
-                return Some(format!("#<VECTOR {count}>"));
             }
             egcl_rt::rooted!(v = v);
             return Some(vector_elements_string(count, |i| {
@@ -1790,6 +1812,9 @@ fn egclval_to_print_inner(mut v: EgclVal, escapep: bool, dispatch_pretty: bool) 
 
 fn egclval_to_print_body(mut v: EgclVal, escapep: bool) -> String {
     egcl_rt::rooted_ref!(_v_root = &mut v);
+    if let Some(text) = concise_array_representation(v) {
+        return text;
+    }
     if let Some(text) = u8_readable_representation(v) {
         return text;
     }
@@ -1962,6 +1987,11 @@ fn egclval_to_print_body(mut v: EgclVal, escapep: bool) -> String {
         // Vectors (simple and complex/fill-pointer) render as #(...).
         if let Some(s) = heap_vector_string(v, escapep) {
             return s;
+        }
+        // Heap-backed opaque values (including packages) use the same host
+        // PRINT-OBJECT hook as non-heap handles. V stays rooted if it declines.
+        if let Some(text) = dispatch_print_object(v, escapep) {
+            return text;
         }
         return format!("#<heap-object {:?}>", v);
     }
