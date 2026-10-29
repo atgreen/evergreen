@@ -3209,6 +3209,9 @@ mod vector_store_barrier_tests {
     fn in_range_heap_store_calls_the_reference_barrier() {
         let emitted = emit_framed(&in_range_store(), 0, 4).expect("emit AArch64 store");
         let call = a64::blr(ADDR).to_le_bytes();
+        // On a non-AArch64 host the shared label assembler still selects that
+        // host's variable-width branch encoding, so A64 words after a branch
+        // need not start at a four-byte offset in this cross-host fixture.
         assert!(
             emitted.code.windows(call.len()).any(|word| word == call),
             "the call-free fixture emitted no BLR x16: VecSetInRange bypassed the reference barrier"

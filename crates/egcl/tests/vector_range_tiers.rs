@@ -1,13 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+#![cfg(all(target_arch = "x86_64", target_os = "linux"))]
 
 //! A counted loop storing over a proven vector range must give the same
-//! answers at every tier, on every architecture — and must still signal
-//! wherever the range cannot be proven.
+//! answers at every tier on x86-64 Linux, where vector-range versioning is
+//! enabled, and must still signal wherever the range cannot be proven.
 //!
-//! ARCHITECTURE-AGNOSTIC ON PURPOSE, like `bitwise_shift_tiers.rs`: one program
-//! runs at all four tiers and the answers are compared, so the file exercises
-//! whichever emitter the test binary was built for.
+//! AArch64 carries the same emitter arms, but its installer gate remains off
+//! because the versioned loop currently regresses both measured shapes. Its
+//! machine-code contracts are covered by cross-host emitter tests instead.
 //!
 //! `vector_ranges` clones the loop body behind a TOTAL runtime predicate
 //! (`SmallVectorRangeP`) and lets the clone's stores (`VecSetInRange`) skip
@@ -96,7 +97,7 @@ fn ranged_vector_stores_agree_at_every_tier() {
       (let ((small (make-array 8 :initial-element -1))
             ;; Large enough for the extended header, which the predicate must
             ;; refuse rather than read a length from the wrong word.
-            (big (make-array 4096 :initial-element -1))
+            (big (make-array 70000 :initial-element -1))
             (fp (make-array 8 :fill-pointer 4 :initial-element -1))
             (adj (make-array 8 :adjustable t :initial-element -1)))
         (dotimes (i 4000) (fill-range small 0 8 7) (fill-range big 0 16 7))
@@ -106,7 +107,7 @@ fn ranged_vector_stores_agree_at_every_tier() {
         (format t "PART ~a ~a ~a~%"
                 (aref (fill-range small 2 5 9) 1) (aref small 2) (aref small 5))
         (format t "BIG ~a ~a~%"
-                (aref (fill-range big 0 4096 3) 0) (aref big 4095))
+                (aref (fill-range big 0 70000 3) 0) (aref big 69999))
         ;; An empty range stores nothing.
         (format t "EMPTY ~a~%" (aref (fill-range small 3 3 77) 3))
         ;; Non-simple layouts still work, through the checked path.
