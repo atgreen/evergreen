@@ -4,6 +4,11 @@
 
 ### Fixed
 
+- Methods retain their actual class specializers when class names are rebound,
+  including retained calls and saved images. Core format 15 requires rebuilding
+  earlier images
+  ([#873](https://github.com/atgreen/evergreen/pull/873)).
+
 - `DOCUMENTATION` and `(SETF DOCUMENTATION)` are standard generic functions,
   allowing user methods and metaclass-specific documentation behavior
   ([#871](https://github.com/atgreen/evergreen/pull/871)).

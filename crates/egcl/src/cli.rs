@@ -3051,7 +3051,7 @@ struct GenericDef {
 #[derive(Clone, Debug)]
 enum MethodSpecializer {
     Any,
-    Class(String),
+    Class { source_name: String, class: EgclVal },
     Eql(EgclVal),
 }
 
@@ -3641,7 +3641,8 @@ pub(crate) fn global_setf_fn_source(place: &str) -> Option<(EgclVal, EgclVal)> {
 // constructs the root `Env` (see `drain_pending_host_registries`).
 
 /// A serialized method-specializer: (tag, class-name, eql-raw). tag 0 = Any,
-/// 1 = Class(name), 2 = Eql(raw value, remapped on restore).
+/// 1 = Class(source spelling, raw class identity), 2 = Eql(raw value).
+/// Both raw values are remapped on restore; source spelling never selects a class.
 type SpecRec = (u8, String, u64);
 /// A serialized MethodDef: (method_id_raw, lambda_list_raw, body_raw,
 /// qualifier, specializers).
@@ -3903,7 +3904,7 @@ fn host_serialize_registries() -> Vec<u8> {
     // which a fresh post-load Env lacks — without this block every GF call in a
     // loaded core is "undefined function". The Env's maps are reached through
     // the SAVE_GENERICS/SAVE_METHODS stash (shared, globally GC-scanned).
-    out.extend_from_slice(b"GFNS");
+    out.extend_from_slice(b"GFSI");
     let generics: Vec<(String, u64, u8)> = SAVE_GENERICS.with(|g| {
         g.borrow().as_ref().map_or_else(Vec::new, |map| {
             map.borrow()
@@ -3943,7 +3944,7 @@ fn host_serialize_registries() -> Vec<u8> {
                                         .iter()
                                         .map(|s| match s {
                                             MethodSpecializer::Any => (0u8, String::new(), 0u64),
-                                            MethodSpecializer::Class(n) => (1, n.clone(), 0),
+                                            MethodSpecializer::Class { source_name, class } => (1, source_name.clone(), class.to_raw()),
                                             MethodSpecializer::Eql(v) => {
                                                 (2, String::new(), v.to_raw())
                                             }
@@ -4464,9 +4465,12 @@ fn host_restore_registries(data: &[u8]) -> Result<(), EgclError> {
     if off < data.len() {
         off += egcl_stdlib::clos::restore_clos_state(&data[off..], &remap)?;
     }
-    // Generic-function registry block (egcl-x0f2.7a): stash remapped records
-    // for the post-Env::new drain, like the macro/setf records above.
     if off + 4 <= data.len() && &data[off..off + 4] == b"GFNS" {
+        return Err(EgclError::InvalidImage("host registry: obsolete name-based method specializers".into()));
+    }
+    // Generic-function registry block: stash remapped identity records
+    // for the post-Env::new drain, like the macro/setf records above.
+    if off + 4 <= data.len() && &data[off..off + 4] == b"GFSI" {
         off += 4;
         let bad = || EgclError::InvalidImage("host registry: truncated (generics)".into());
         let n_gf = {
@@ -4545,7 +4549,12 @@ fn host_restore_registries(data: &[u8]) -> Result<(), EgclError> {
                     off += 1;
                     let cname = hr_get_str(data, &mut off).ok_or_else(bad)?;
                     let eql_raw = hr_get_u64(data, &mut off).ok_or_else(bad)?;
-                    specs.push((tag, cname, if tag == 2 { remap(eql_raw) } else { eql_raw }));
+                    if tag > 2 { return Err(bad()); }
+                    let value = if tag == 1 || tag == 2 { remap(eql_raw) } else { eql_raw };
+                    if tag == 1 && !egcl_stdlib::clos::is_class_object(EgclVal::from_raw(value)) {
+                        return Err(EgclError::InvalidImage("host registry: invalid method class specializer".into()));
+                    }
+                    specs.push((tag, cname, value));
                 }
                 defs.push((remap(mid), remap(ll), remap(body), qual, frame_id, specs));
             }
@@ -5092,7 +5101,7 @@ fn drain_pending_host_generics(env: &Env) {
                 specializers: specs
                     .into_iter()
                     .map(|(tag, cname, eql_raw)| match tag {
-                        1 => MethodSpecializer::Class(cname),
+                        1 => MethodSpecializer::Class { source_name: cname, class: EgclVal::from_raw(eql_raw) },
                         2 => MethodSpecializer::Eql(EgclVal::from_raw(eql_raw)),
                         _ => MethodSpecializer::Any,
                     })
@@ -7305,6 +7314,35 @@ fn resolve_class_metaobject(env: &Env, class: EgclVal) -> Result<EgclVal, EgclEr
     Ok(class)
 }
 
+/// Resolve the original source symbol once, before publishing a method.
+/// Unregistered symbols are not class specializers: preserving their names
+/// would otherwise attach an existing method to a later, unrelated class.
+fn resolve_method_class(env: &Env, designator: EgclVal) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted!(designator = designator);
+    let class = resolve_class_metaobject(env, *designator)?;
+    if !egcl_stdlib::clos::is_class_object(class) {
+        return Err(EgclError::ProgramError(format!(
+            "DEFMETHOD: no class named {}",
+            format_val(*designator),
+        )));
+    }
+    Ok(class)
+}
+
+fn method_class_specializer(
+    env: &Env,
+    designator: EgclVal,
+) -> Result<MethodSpecializer, EgclError> {
+    egcl_rt::rooted!(designator = designator);
+    let source_name = sym_name(*designator);
+    let class = resolve_method_class(env, *designator)?;
+    if egcl_stdlib::find_class(T) == Some(class) {
+        Ok(MethodSpecializer::Any)
+    } else {
+        Ok(MethodSpecializer::Class { source_name, class })
+    }
+}
+
 /// Every slot of `class_name` (own and inherited, most specific class first)
 /// that declares `initarg`: CLHS 7.1.4 fills all of them from one initarg
 /// (ansi shared-initialize.6.*, class-21).
@@ -7412,16 +7450,13 @@ fn valid_initarg_names(env: &Env, class_name: &str, generic_names: &[&str]) -> O
         // Only methods applicable to an instance of the class count: one whose
         // first parameter is unspecialized, or specialized on a class in the
         // precedence list. An EQL specializer is accepted as applicable.
-        let precedence: Vec<String> = class_precedence_names(env, class_name)
-            .iter()
-            .map(|name| symbol_bare_name(name))
-            .collect();
+        let class = resolve_sym(class_name).and_then(egcl_stdlib::find_class);
+        let precedence = class
+            .and_then(|class| egcl_stdlib::compute_class_precedence_list(class).ok())
+            .unwrap_or_default();
         let applies = |def: &MethodDef| match def.specializers.first() {
             None | Some(MethodSpecializer::Any) | Some(MethodSpecializer::Eql(_)) => true,
-            Some(MethodSpecializer::Class(name)) => {
-                let bare = symbol_bare_name(name);
-                bare == "T" || bare == "STANDARD-OBJECT" || precedence.contains(&bare)
-            }
+            Some(MethodSpecializer::Class { class, .. }) => precedence.contains(class),
         };
         // Copy the applicable methods' lambda lists out from under the
         // methods borrow before reading them: naming their symbols can take
@@ -8491,7 +8526,7 @@ fn dispatch_builtin_discriminator(arg: EgclVal) -> u32 {
 const UNSPECIALIZED_DISTANCE: usize = usize::MAX / 4;
 
 fn method_specificity_vector(
-    env: &Env,
+    _env: &Env,
     method: &MethodDef,
     args: &[EgclVal],
 ) -> Option<Vec<usize>> {
@@ -8508,59 +8543,29 @@ fn method_specificity_vector(
                 }
                 distances.push(0);
             }
-            MethodSpecializer::Class(name) => {
-                // A CLOS INSTANCE dispatches through its class precedence list;
-                // anything else through the built-in type table.
-                //
-                // The table comes FIRST for non-instances because `class_of`
-                // answers one catch-all class for every heap object — a string, a
-                // vector, a bignum and a stream all report the same class — so a
-                // CPL lookup made a STRING method applicable to ANY heap object,
-                // and `(defmethod enc ((x string)))` swallowed vectors
-                // (bliss-qvv3). The table knows the real predicates and gives the
-                // CLHS precedence order among them.
+            MethodSpecializer::Class { class, .. } => {
                 let distance = if egcl_stdlib::is_instance(*arg) {
-                    let specializer_sym = resolve_sym(name).unwrap_or(NIL);
-                    let arg_class = egcl_stdlib::class_of(*arg);
-                    resolve_class_metaobject(env, specializer_sym)
-                        .ok()
-                        .and_then(|specializer_class| {
-                            egcl_stdlib::compute_class_precedence_list(arg_class)
-                                .ok()
-                                .and_then(|cpl| {
-                                    cpl.iter().position(|&class| class == specializer_class)
-                                })
-                                .map(|pos| pos + 1)
-                        })?
-                } else if let Some(builtin) = builtin_type_specializer_distance(name, *arg) {
-                    builtin
+                    egcl_stdlib::compute_class_precedence_list(egcl_stdlib::class_of(*arg))
+                        .ok()?
+                        .iter()
+                        .position(|candidate| candidate == class)?
+                        + 1
+                } else if let Some(distance) = is_built_in_class_metaobject(*class)
+                    .then(|| {
+                        let name = egcl_stdlib::class_name(*class);
+                        builtin_type_specializer_distance(&sym_name(name), *arg)
+                    })
+                    .flatten()
+                {
+                    // Physical predicates belong only to actual built-in classes,
+                    // never a user class or alias selected by source spelling.
+                    distance
                 } else {
-                    // Not a name the table knows: fall back to the class graph, so
-                    // a method on a class a non-instance value still belongs to
-                    // (STRUCTURE-OBJECT, a condition class, …) keeps working.
-                    //
-                    // The table also answers None for a name it knows but that
-                    // does not apply, so this runs for those too, and it must ask
-                    // the class CLASS-OF answers. `egcl_stdlib::class_of` reads the
-                    // representation: an interpreter closure is physically the cons
-                    // `(EGCL::CLOSURE . id)`, so it answered CONS, whose precedence
-                    // list holds LIST -- and a LIST method applied to every
-                    // interpreted lambda and outranked the FUNCTION method the
-                    // table had already found. cl-ppcre's BUILD-REPLACEMENT-TEMPLATE
-                    // then returned a replacement function unwrapped, and every
-                    // REGEX-REPLACE with a function replacement failed.
-                    let specializer_sym = resolve_sym(name).unwrap_or(NIL);
-                    let arg_class = class_of_value(*arg);
-                    resolve_class_metaobject(env, specializer_sym)
-                        .ok()
-                        .and_then(|specializer_class| {
-                            egcl_stdlib::compute_class_precedence_list(arg_class)
-                                .ok()
-                                .and_then(|cpl| {
-                                    cpl.iter().position(|&class| class == specializer_class)
-                                })
-                                .map(|pos| pos + 1)
-                        })?
+                    egcl_stdlib::compute_class_precedence_list(class_of_value(*arg))
+                        .ok()?
+                        .iter()
+                        .position(|candidate| candidate == class)?
+                        + 1
                 };
                 distances.push(distance);
             }
@@ -9472,18 +9477,20 @@ fn generic_has_eql_specializer(env: &Env, name: &str) -> bool {
 /// here now would mean walking each specializer's precedence list per generic
 /// to ask whether it is a subclass of CLASS, and buying nothing.
 fn generic_dispatches_on_a_metaclass(env: &Env, name: &str) -> bool {
+    // Source aliases and later registration changes must not choose dispatch
+    // metadata. These canonical classes already exist; the lookup never interns.
+    egcl_rt::rooted!(classes = [
+        "STANDARD-CLASS", "STRUCTURE-CLASS", "BUILT-IN-CLASS",
+        "CLASS", "METAOBJECT", "STANDARD-OBJECT",
+    ].map(|name| {
+        egcl_rt::symbols::find_index(name)
+            .and_then(|index| egcl_stdlib::find_class(EgclVal::from_symbol_index(index)))
+            .unwrap_or(NIL)
+    }));
     env.methods.borrow().get(name).is_some_and(|methods| {
-        methods.iter().any(|m| {
-            m.specializers.iter().any(|s| match s {
-                MethodSpecializer::Class(class) => matches!(
-                    symbol_bare_name(class).as_str(),
-                    "STANDARD-CLASS"
-                        | "STRUCTURE-CLASS"
-                        | "BUILT-IN-CLASS"
-                        | "CLASS"
-                        | "METAOBJECT"
-                        | "STANDARD-OBJECT"
-                ),
+        methods.iter().any(|method| {
+            method.specializers.iter().any(|specializer| match specializer {
+                MethodSpecializer::Class { class, .. } => classes.contains(class),
                 _ => false,
             })
         })
@@ -9558,15 +9565,9 @@ fn qualifiers_to_method_qualifier(qualifiers: EgclVal) -> Option<egcl_stdlib::Me
 /// list. `MethodSpecializer::Any` (an unspecialized parameter) matches the class
 /// named T (bliss-7y1s).
 fn method_specializer_matches_designator(ms: &MethodSpecializer, arg: EgclVal) -> bool {
-    let arg_class_name = || {
-        let n = egcl_stdlib::class_name(arg);
-        n.is_symbol().then(|| sym_bare_name_rc(n))
-    };
     match ms {
-        MethodSpecializer::Any => arg_class_name().as_deref() == Some("T"),
-        MethodSpecializer::Class(cname) => {
-            arg_class_name().as_deref() == Some(symbol_bare_name(cname).as_str())
-        }
+        MethodSpecializer::Any => egcl_stdlib::find_class(T) == Some(arg),
+        MethodSpecializer::Class { class, .. } => *class == arg,
         MethodSpecializer::Eql(v) => {
             // `(EQL object)` designator — compare the object with EQL.
             if arg.is_cons() {
@@ -10665,7 +10666,7 @@ fn visit_method_def_roots(
     }
     visit(&mut def.method_id);
     for specializer in &mut def.specializers {
-        if let MethodSpecializer::Eql(value) = specializer {
+        if let MethodSpecializer::Eql(value) | MethodSpecializer::Class { class: value, .. } = specializer {
             visit(value);
         }
     }
@@ -10818,7 +10819,7 @@ impl egcl_rt::gc::TraceHostRoots for HandlerEntry {
 
 impl egcl_rt::gc::TraceHostRoots for MethodSpecializer {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
-        if let MethodSpecializer::Eql(value) = self {
+        if let MethodSpecializer::Eql(value) | MethodSpecializer::Class { class: value, .. } = self {
             visit(value);
         }
     }
@@ -41207,15 +41208,14 @@ fn method_combination_name(combination: egcl_stdlib::MethodCombinationType) -> &
 /// The specializers of a method as class metaobjects, an unspecialized
 /// parameter being the class T; an EQL specializer is rendered `(EQL object)`.
 fn method_specializer_list(specializers: &[MethodSpecializer]) -> EgclVal {
+    egcl_rt::rooted!(specializers = specializers.to_vec());
     egcl_rt::rooted!(items = Vec::<EgclVal>::with_capacity(specializers.len()));
-    for specializer in specializers {
+    for specializer in specializers.iter() {
         let value = match specializer {
             MethodSpecializer::Any => resolve_sym("T")
                 .and_then(egcl_stdlib::find_class)
                 .unwrap_or(T),
-            MethodSpecializer::Class(name) => resolve_sym(name)
-                .and_then(egcl_stdlib::find_class)
-                .unwrap_or(NIL),
+            MethodSpecializer::Class { class, .. } => *class,
             MethodSpecializer::Eql(object) => {
                 egcl_rt::rooted!(object = *object);
                 vec_to_list(&[resolve_sym("EQL").unwrap_or(NIL), *object])
@@ -41267,60 +41267,29 @@ fn method_class_specializers(
     gf_name: &str,
 ) -> Vec<(EgclVal, Vec<egcl_stdlib::clos::ClassSpecializer>)> {
     use egcl_stdlib::clos::ClassSpecializer;
-    enum Pending {
-        Any,
-        Class(String),
-        Eql(usize),
-    }
-    // Copied out under the registry borrow, which no allocation may outlive.
-    // The EQL objects are heap values the resolution below could see moved, so
-    // they go in a rooted vector and are referred to by index.
-    let mut eql_objects: Vec<EgclVal> = Vec::new();
-    let pending: Vec<(EgclVal, Vec<Pending>)> = env
-        .methods
-        .borrow()
-        .get(gf_name)
-        .map(|defs| {
-            defs.iter()
-                .map(|def| {
-                    let specializers = def
-                        .specializers
-                        .iter()
-                        .map(|specializer| match specializer {
-                            MethodSpecializer::Any => Pending::Any,
-                            MethodSpecializer::Class(name) => Pending::Class(name.clone()),
-                            MethodSpecializer::Eql(object) => {
-                                eql_objects.push(*object);
-                                Pending::Eql(eql_objects.len() - 1)
-                            }
-                        })
-                        .collect();
-                    (def.method_id, specializers)
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    egcl_rt::rooted_ref!(_eql_root = &mut eql_objects);
-    pending
-        .into_iter()
-        .map(|(method, specializers)| {
-            let specializers = specializers
-                .into_iter()
+    egcl_rt::rooted!(
+        definitions = env
+            .methods
+            .borrow()
+            .get(gf_name)
+            .cloned()
+            .unwrap_or_default()
+    );
+    definitions
+        .iter()
+        .map(|def| {
+            let specializers = def
+                .specializers
+                .iter()
                 .map(|specializer| match specializer {
-                    Pending::Any => ClassSpecializer::Any,
-                    Pending::Class(name) => {
-                        let symbol = resolve_sym(&name).unwrap_or(NIL);
-                        // Class metaobjects are pinned, so the value stays put.
-                        ClassSpecializer::Class(
-                            resolve_class_metaobject(env, symbol).unwrap_or(symbol),
-                        )
-                    }
-                    Pending::Eql(index) => {
-                        ClassSpecializer::EqlOfClass(class_of_value(eql_objects[index]))
+                    MethodSpecializer::Any => ClassSpecializer::Any,
+                    MethodSpecializer::Class { class, .. } => ClassSpecializer::Class(*class),
+                    MethodSpecializer::Eql(object) => {
+                        ClassSpecializer::EqlOfClass(class_of_value(*object))
                     }
                 })
                 .collect();
-            (method, specializers)
+            (def.method_id, specializers)
         })
         .collect()
 }
@@ -41375,34 +41344,14 @@ fn specializer_direct_method_ids(
     }
     let class = resolve_class_metaobject(env, specializer)?;
     let is_t = resolve_sym("T").and_then(egcl_stdlib::find_class) == Some(class);
-    // Names only, copied under the borrow; resolved after it is released.
-    let candidates: Vec<(EgclVal, Vec<Option<String>>)> = sorted_live(&env.methods.borrow())
-        .map(|def| {
-            let names = def
-                .specializers
-                .iter()
-                .filter_map(|s| match s {
-                    MethodSpecializer::Any => Some(None),
-                    MethodSpecializer::Class(name) => Some(Some(name.clone())),
-                    MethodSpecializer::Eql(_) => None,
-                })
-                .collect();
-            (def.method_id, names)
-        })
+    let ids = sorted_live(&env.methods.borrow())
+        .filter(|def| def.specializers.iter().any(|specializer| match specializer {
+            MethodSpecializer::Any => is_t,
+            MethodSpecializer::Class { class: candidate, .. } => *candidate == class,
+            MethodSpecializer::Eql(_) => false,
+        }))
+        .map(|def| def.method_id)
         .collect();
-    let mut ids = Vec::new();
-    for (method, names) in candidates {
-        let specialized = names.iter().any(|name| match name {
-            None => is_t,
-            Some(name) => {
-                let symbol = resolve_sym(name).unwrap_or(NIL);
-                resolve_class_metaobject(env, symbol).unwrap_or(symbol) == class
-            }
-        });
-        if specialized {
-            ids.push(method);
-        }
-    }
     Ok(ids)
 }
 
@@ -42043,7 +41992,7 @@ fn eval_defmethod(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     // parameters are ordinary (unspecialized) and are passed through verbatim so
     // the standard lambda-list binder handles them.
     egcl_rt::rooted!(params_list = list_to_vec(spec_params_form));
-    let mut specializers = Vec::new();
+    egcl_rt::rooted!(specializers = Vec::<MethodSpecializer>::new());
     egcl_rt::rooted!(plain_params = Vec::<EgclVal>::new());
     let mut past_required = false;
 
@@ -42074,15 +42023,12 @@ fn eval_defmethod(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 if head.is_symbol() && sym_bare_name_rc(head).as_ref() == "EQL" {
                     specializers.push(MethodSpecializer::Eql(eval_form(cp(value_rest).0, env)?));
                 } else {
-                    specializers.push(MethodSpecializer::Class(sym_name(class_form)));
+                    specializers.push(method_class_specializer(env, class_form)?);
                 }
+            } else if class_form == T {
+                specializers.push(MethodSpecializer::Any);
             } else {
-                let specializer_name = sym_name(class_form);
-                if symbol_bare_name(&specializer_name) == "T" {
-                    specializers.push(MethodSpecializer::Any);
-                } else {
-                    specializers.push(MethodSpecializer::Class(specializer_name));
-                }
+                specializers.push(method_class_specializer(env, class_form)?);
             }
         }
     }
@@ -42122,7 +42068,19 @@ fn eval_defmethod(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         gf
     };
     egcl_stdlib::clos::add_method(generic_function, method_id)?;
-    egcl_stdlib::set_method_specializers(method_id, vec![], qualifier);
+    // Keep the runtime's existing metadata rooted by the same class objects.
+    // Its class-only applicability API represents an EQL parameter by its
+    // object's class; precise EQL dispatch remains in MethodDef.
+    egcl_rt::rooted!(runtime_specializers = Vec::<EgclVal>::new());
+    for index in 0..specializers.len() {
+        let class = match &specializers[index] {
+            MethodSpecializer::Any => resolve_sym("T").and_then(egcl_stdlib::find_class).unwrap_or(T),
+            MethodSpecializer::Class { class, .. } => *class,
+            MethodSpecializer::Eql(object) => class_of_value(*object),
+        };
+        runtime_specializers.push(class);
+    }
+    egcl_stdlib::set_method_specializers(method_id, runtime_specializers.clone(), qualifier);
 
     // Capture before publishing the method so a concurrent caller cannot see
     // its body without the lexical locations against which it must execute.
@@ -42160,7 +42118,7 @@ fn eval_defmethod(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         list.push(MethodDef {
             method_id,
             captured_frame: nested_in_binding.then(|| Arc::clone(&env.frame)),
-            specializers,
+            specializers: specializers.clone(),
             lambda_list: *lambda_list,
             qualifier,
             combination,
@@ -42214,14 +42172,17 @@ fn eval_defmethod(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
 }
 
 /// Structural equality of two method specializer lists, for CLHS 7.6.2 method
-/// replacement: same length and each position matches (Any/Class-by-name/Eql-by
+/// replacement: same length and each position matches (Any/Class-by-identity/Eql-by
 /// -value). Eql values are compared by identity bits (the reader interns equal
 /// literals; this matches how the tree-walker's EQL dispatch resolves them).
 fn specializers_equal(a: &[MethodSpecializer], b: &[MethodSpecializer]) -> bool {
     a.len() == b.len()
         && a.iter().zip(b).all(|(x, y)| match (x, y) {
             (MethodSpecializer::Any, MethodSpecializer::Any) => true,
-            (MethodSpecializer::Class(n1), MethodSpecializer::Class(n2)) => n1 == n2,
+            (
+                MethodSpecializer::Class { class: a, .. },
+                MethodSpecializer::Class { class: b, .. },
+            ) => a == b,
             (MethodSpecializer::Eql(v1), MethodSpecializer::Eql(v2)) => v1.0 == v2.0,
             _ => false,
         })
@@ -51446,3 +51407,6 @@ mod generic_function_type_tests;
 
 #[cfg(test)]
 mod generic_wrapper_identity_tests;
+
+#[cfg(test)]
+mod method_class_identity_tests;

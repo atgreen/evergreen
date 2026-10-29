@@ -12764,6 +12764,18 @@ fn image_class_symbol(bare: &str) -> Option<EgclVal> {
     Some(probe)
 }
 
+/// A source recipe for an existing method may use only a proper class name.
+/// There is no implicit name-based substitute for an anonymous class literal.
+fn image_method_class_name(class: EgclVal) -> Result<EgclVal, EgclError> {
+    let name = egcl_stdlib::class_name(class);
+    if !name.is_symbol() || name.is_nil() || egcl_stdlib::find_class(name) != Some(class) {
+        return Err(EgclError::ProgramError(
+            "cannot serialize an existing method with an unnamed or improperly named class specializer without MAKE-LOAD-FORM".into(),
+        ));
+    }
+    Ok(name)
+}
+
 /// The home-package name of an interned symbol (the prefix of its registry key),
 /// or None for an unqualified (COMMON-LISP) symbol.
 #[allow(dead_code)] // build_image_from_runtime helper (image writer, awaiting wiring)
@@ -12822,6 +12834,17 @@ fn image_combination_name(c: egcl_stdlib::MethodCombinationType) -> Option<&'sta
 /// source actions from the retained metaobject definitions.
 #[allow(dead_code)] // alternate save-lisp-and-die image writer; not yet wired (image.rs save_image is the live path)
 pub fn build_image_from_runtime(env: &Env) -> Result<Vec<u8>, EgclError> {
+    // Validate existing method identities before constructing any source recipes.
+    // Fresh COMPILE-FILE DEFMETHOD forms do not use this path: their symbols
+    // deliberately resolve in the loading environment.
+    egcl_rt::rooted!(classes = env.methods.borrow().values().flatten()
+        .flat_map(|method| method.specializers.iter())
+        .filter_map(|specializer| match specializer {
+            super::MethodSpecializer::Class { class, .. } => Some(*class),
+            _ => None,
+        }).collect::<Vec<EgclVal>>());
+    for class in classes.iter() { image_method_class_name(*class)?; }
+
     let mut pool = BbuConstPool::default();
     egcl_rt::rooted_ref!(_pool_root = &mut pool);
     let source_file_ref = pool.string("<image>");
@@ -13062,14 +13085,12 @@ pub fn build_image_from_runtime(env: &Env) -> Result<Vec<u8>, EgclError> {
                     }
                     match &m.specializers[i] {
                         super::MethodSpecializer::Any => spec_params.push(*p),
-                        super::MethodSpecializer::Class(c) => {
-                            match image_class_symbol(c).or_else(|| resolve_sym(c)) {
-                                Some(csym) => spec_params.push(vec_to_list(&[*p, csym])),
-                                None => {
-                                    ok = false;
-                                    break;
-                                }
-                            }
+                        super::MethodSpecializer::Class { class, .. } => {
+                            // This emits an EXISTING method, not a freshly compiled
+                            // source DEFMETHOD recipe. Re-resolving an improper name
+                            // could silently attach the saved method to another class.
+                            let name = image_method_class_name(*class)?;
+                            spec_params.push(vec_to_list(&[*p, name]));
                         }
                         super::MethodSpecializer::Eql(v) => match (resolve_sym("EQL"), quote) {
                             (Some(eql), Some(q)) => {
