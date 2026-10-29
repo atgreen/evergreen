@@ -1,5 +1,6 @@
 {
   "fast": {
+    "egcl:test:format_slash_lookup_cli": [""],
     "egcl:test:method_continuations_cli": [""],
     "egcl:test:private_bootstrap_identity_cli": [""],
     "egcl:test:lexical_forwarding_cli": [""],

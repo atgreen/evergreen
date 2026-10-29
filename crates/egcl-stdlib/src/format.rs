@@ -5839,7 +5839,7 @@ fn format_arguments(control: &str, args: &Arguments, output: &mut LayoutDoc) -> 
             }
             '/' => {
                 // ~/name/ — call the function NAME names (CLHS 22.3.5.4) with
-                // (stream arg colon-p at-sign-p . params).  NAME is read as a
+                // (stream arg colon-p at-sign-p . params). NAME names a literal
                 // symbol in COMMON-LISP-USER unless it carries a package prefix;
                 // the function writes to a string stream whose text goes into
                 // the output.  Consumes one argument.
@@ -6525,21 +6525,21 @@ pub fn register_format_function(name: &str, function: EgclVal) {
         .insert(name.to_uppercase(), function);
 }
 
-/// The function a `~/name/` directive names: NAME read as a symbol in
-/// COMMON-LISP-USER unless it carries a package prefix (CLHS 22.3.5.4).  The
-/// symbol itself is returned; applying it selects its global function, and an
-/// unbound one signals UNDEFINED-FUNCTION with that symbol.
+/// FORMAT uppercases the literal name, then looks up its package and symbol.
+/// Unlike reader syntax, one and two colons have identical access semantics;
+/// the remaining characters are a literal symbol name, including reader escapes.
+/// Return the actual symbol so applying it observes its global definition.
 fn format_function_designator(name: &str) -> Option<EgclVal> {
     let upper = name.to_uppercase();
-    let qualified = if upper.contains(':') {
-        upper
-    } else {
-        format!("COMMON-LISP-USER::{}", upper)
+    let (package_name, symbol_name) = match upper.split_once(':') {
+        Some((package, rest)) => (package, rest.strip_prefix(':').unwrap_or(rest)),
+        None => ("COMMON-LISP-USER", upper.as_str()),
     };
-    egcl_compiler::reader::read_symbol_token(&qualified)
+    let package = crate::packages::find_package(package_name)?;
+    crate::packages::find_symbol(symbol_name, package)
         .ok()
         .flatten()
-        .filter(|v| v.is_symbol())
+        .map(|(symbol, _status)| symbol)
 }
 
 /// Look up a registered format function by name.
