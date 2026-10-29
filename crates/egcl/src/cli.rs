@@ -18705,8 +18705,8 @@ fn is_real_numeric_type(t: EgclVal) -> bool {
     )
 }
 
-/// The element-type name of a `(complex elt)` spec, or None for `*`/absent.
-fn complex_elt_name(t: EgclVal) -> Option<String> {
+/// The full part type of a `(complex elt)` spec, or None for `*`/absent.
+fn complex_part_type(t: EgclVal) -> Option<EgclVal> {
     if !t.is_cons() {
         return None;
     }
@@ -18715,16 +18715,16 @@ fn complex_elt_name(t: EgclVal) -> Option<String> {
     if e.is_symbol() && sym_bare_name_rc(e).as_ref() == "*" {
         return None;
     }
-    Some(sym_bare_name_rc(if e.is_cons() { cp(e).0 } else { e }).to_string())
+    Some(e)
 }
 
 fn complex_subtypep(t1: EgclVal, t2: EgclVal) -> Option<(bool, bool)> {
     let c1 = is_complex_type(t1);
     let c2 = is_complex_type(t2);
     if c1 && c2 {
-        // Part types compare as their upgraded complex part types: every
-        // rational subtype upgrades to RATIONAL, the float types to themselves
-        // (ansi subtypep-complex.8).
+        // CLHS SUBTYPEP: either the original part types are in a subtype
+        // relation, or their upgraded representations are equivalent. Merely
+        // having ordered upgraded types does not imply the original bounds.
         fn upgraded(name: &str) -> Option<&'static str> {
             Some(match name {
                 "INTEGER" | "FIXNUM" | "BIGNUM" | "BIT" | "RATIO" | "RATIONAL" | "MOD"
@@ -18736,19 +18736,18 @@ fn complex_subtypep(t1: EgclVal, t2: EgclVal) -> Option<(bool, bool)> {
                 _ => return None,
             })
         }
-        match complex_elt_name(t2) {
+        match complex_part_type(t2) {
             None => Some((true, true)),
-            Some(e2) => match complex_elt_name(t1) {
-                Some(e1) if e1 == e2 => Some((true, true)),
-                Some(e1) => match (upgraded(&e1), upgraded(&e2)) {
-                    (Some(u1), Some(u2)) if u1 == u2 => Some((true, true)),
-                    (Some(u1), Some(u2)) => {
-                        let s1 = resolve_sym(u1).unwrap_or(NIL);
-                        let s2 = resolve_sym(u2).unwrap_or(NIL);
-                        Some(subtypep_relation(s1, s2))
+            Some(e2) => match complex_part_type(t1) {
+                Some(e1) => {
+                    let u1 = type_head_name(e1).and_then(|name| upgraded(&name));
+                    let u2 = type_head_name(e2).and_then(|name| upgraded(&name));
+                    if u1.is_some() && u1 == u2 {
+                        Some((true, true))
+                    } else {
+                        Some(subtypep_relation(e1, e2))
                     }
-                    _ => Some((false, false)),
-                },
+                }
                 None => Some((false, true)),
             },
         }
