@@ -57,6 +57,10 @@ fn agrees_at_every_tier(program: &str, expected: &[&str]) {
 /// The probe must actually be reached, or the rest of this file proves nothing
 /// about the emitter arm — the lesson from `vector_element_tiers.rs`, where a
 /// test passed on hardware while the arm it covered was never executed.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 #[test]
 fn the_shift_probe_reaches_the_optimising_tier() {
     let program = r#"
