@@ -180,6 +180,8 @@ pub struct Environment {
     /// this, sharing the base would make every GC trace copy it, which is worse
     /// than the per-expansion clone it replaces (bliss-htff).
     no_gc_roots: bool,
+    // Private to one snapshot walk. Public/reentrant walks clear this policy.
+    snapshot_walk: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Block names in scope (for RETURN-FROM), keyed by EgclVal.0.
     blocks: HashSet<u64>,
     /// Tag names in scope (for GO), keyed by EgclVal.0.
@@ -237,6 +239,7 @@ impl Environment {
             functions: HashMap::new(),
             declarations: Vec::new(),
             no_gc_roots: false,
+            snapshot_walk: None,
             blocks: HashSet::new(),
             tags: HashSet::new(),
         }
@@ -463,6 +466,7 @@ impl Environment {
             functions: HashMap::new(),
             declarations: Vec::new(),
             no_gc_roots: false,
+            snapshot_walk: self.snapshot_walk.clone(),
             blocks: HashSet::new(),
             tags: HashSet::new(),
         }
@@ -480,6 +484,7 @@ impl Environment {
             functions,
             declarations: Vec::new(),
             no_gc_roots: false,
+            snapshot_walk: self.snapshot_walk.clone(),
             blocks: HashSet::new(),
             tags: HashSet::new(),
         }
@@ -506,6 +511,7 @@ impl Environment {
             functions: HashMap::new(),
             declarations: decls,
             no_gc_roots: false,
+            snapshot_walk: self.snapshot_walk.clone(),
             blocks: HashSet::new(),
             tags: HashSet::new(),
         }
@@ -521,6 +527,7 @@ impl Environment {
             functions: HashMap::new(),
             declarations: Vec::new(),
             no_gc_roots: false,
+            snapshot_walk: self.snapshot_walk.clone(),
             blocks,
             tags: HashSet::new(),
         }
@@ -536,6 +543,7 @@ impl Environment {
             functions: HashMap::new(),
             declarations: Vec::new(),
             no_gc_roots: false,
+            snapshot_walk: self.snapshot_walk.clone(),
             blocks: HashSet::new(),
             tags,
         }
@@ -580,12 +588,14 @@ impl Environment {
         for (name, info) in functions {
             fn_map.insert(name.0, info);
         }
+        let snapshot_walk = parent.snapshot_walk.clone();
         Environment {
             parent: Some(parent),
             variables: var_map,
             functions: fn_map,
             declarations,
             no_gc_roots: false,
+            snapshot_walk,
             blocks: HashSet::new(),
             tags: HashSet::new(),
         }
@@ -611,6 +621,7 @@ impl Environment {
             functions: fn_map,
             declarations,
             no_gc_roots: false,
+            snapshot_walk: self.snapshot_walk.clone(),
             blocks: HashSet::new(),
             tags: HashSet::new(),
         }
@@ -1405,7 +1416,7 @@ fn expand_body_items(
         let expanded = if index < declaration_end {
             items[index]
         } else {
-            macroexpand_all(items[index], env)?
+            walk_macroexpand_all(items[index], env)?
         };
         changed |= expanded != items[index];
         expanded_items.push(expanded);
@@ -1420,6 +1431,25 @@ fn is_lambda_expression(val: EgclVal) -> bool {
     }
     let car = unsafe { cons_car(val) };
     is_symbol_named(car, "LAMBDA")
+}
+
+/// Expand a retry snapshot only after ordinary lowering requested boxing.
+/// A phase boundary declines before its body or later siblings are walked.
+/// The ordinary public walker is unchanged, including a reentrant call made by
+/// an expander with its &ENVIRONMENT argument.
+pub fn macroexpand_all_for_boxing(
+    form: EgclVal,
+    env: &Environment,
+) -> Result<Option<EgclVal>, EgclError> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    egcl_rt::rooted!(form = form);
+    egcl_rt::rooted!(scope = env.clone());
+    let declined = Arc::new(AtomicBool::new(false));
+    scope.snapshot_walk = Some(Arc::clone(&declined));
+    match walk_macroexpand_all(*form, &scope) {
+        Err(_) if declined.load(Ordering::Relaxed) => Ok(None),
+        result => result.map(Some),
+    }
 }
 
 /// Fully expand a form and all its subforms (recursive code-walk).
@@ -1438,7 +1468,68 @@ fn is_lambda_expression(val: EgclVal) -> bool {
 ///    e. The operator is NOT
 ///    recursively code-walked (only arguments are expanded). The
 ///    operator was already checked for macros by macroexpand above.
+///
+/// A public walk never inherits a caller's private retry policy. Recursive
+/// walker helpers use walk_macroexpand_all directly instead.
 pub fn macroexpand_all(form: EgclVal, env: &Environment) -> Result<EgclVal, EgclError> {
+    if env.snapshot_walk.is_none() {
+        return walk_macroexpand_all(form, env);
+    }
+    egcl_rt::rooted!(form = form);
+    egcl_rt::rooted!(scope = env.clone());
+    scope.snapshot_walk = None;
+    walk_macroexpand_all(*form, &scope)
+}
+
+fn snapshot_boundary(form: EgclVal, env: &Environment) -> bool {
+    if env.snapshot_walk.is_none() || !form.is_cons() {
+        return false;
+    }
+    let operator = unsafe { cons_car(form) };
+    let name = get_symbol_name(operator);
+    matches!(
+        name.as_deref(),
+        Some(
+            "EVAL-WHEN"
+                | "LOAD-TIME-VALUE"
+                | "DEFUN"
+                | "DEFMACRO"
+                | "DEFMETHOD"
+                | "DEFGENERIC"
+                | "DEFCLASS"
+                | "DEFSTRUCT"
+                | "DEFTYPE"
+                | "DEFVAR"
+                | "DEFPARAMETER"
+                | "DEFCONSTANT"
+                | "DEFPACKAGE"
+                | "IN-PACKAGE"
+                | "DEFINE-COMPILER-MACRO"
+                | "DEFINE-SYMBOL-MACRO"
+                | "DEFINE-SETF-EXPANDER"
+                | "DEFSETF"
+                | "DEFINE-CONDITION"
+                | "DEFINE-METHOD-COMBINATION"
+        )
+    ) || ATOMIC_UPDATE_OPERATOR
+        .get()
+        .is_some_and(|test| test(operator))
+}
+
+fn decline_snapshot(env: &Environment) -> EgclError {
+    // The flag, not an error-string sentinel, distinguishes a conservative
+    // boundary decline from a real expander error at the private API boundary.
+    env.snapshot_walk
+        .as_ref()
+        .unwrap()
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    EgclError::Internal("boxing snapshot crosses a compilation phase boundary".into())
+}
+
+fn walk_macroexpand_all(form: EgclVal, env: &Environment) -> Result<EgclVal, EgclError> {
+    if snapshot_boundary(form, env) {
+        return Err(decline_snapshot(env));
+    }
     if form.is_cons() {
         let operator = unsafe { cons_car(form) };
         if ATOMIC_UPDATE_OPERATOR
@@ -1463,7 +1554,12 @@ pub fn macroexpand_all(form: EgclVal, env: &Environment) -> Result<EgclVal, Egcl
                 .get()
                 .is_some_and(|test| test(unsafe { cons_car(value) }))
     };
-    let (mut expanded, _) = macroexpand_until(form, env, unsupported_atomic)?;
+    let (mut expanded, _) = macroexpand_until(form, env, |value| {
+        unsupported_atomic(value) || snapshot_boundary(value, env)
+    })?;
+    if snapshot_boundary(expanded, env) {
+        return Err(decline_snapshot(env));
+    }
     if unsupported_atomic(expanded) {
         return Err(EgclError::ProgramError(
             "MACROEXPAND-ALL does not support atomic update places".into(),
@@ -1545,7 +1641,7 @@ pub fn macroexpand_all(form: EgclVal, env: &Environment) -> Result<EgclVal, Egcl
             // If the compiler macro returns a form that is NOT pointer-equal
             // to the input, it accepted — re-enter expand-form on the result.
             if cm_result.0 != expanded.0 {
-                return macroexpand_all(cm_result, env);
+                return walk_macroexpand_all(cm_result, env);
             }
             // Otherwise it declined — fall through to normal expansion.
         }
@@ -1668,7 +1764,7 @@ fn expand_quasiquote_template(
             egcl_rt::value::NIL
         };
         let mut new_arg = if depth <= 1 {
-            macroexpand_all(arg, env)?
+            walk_macroexpand_all(arg, env)?
         } else {
             expand_quasiquote_template(arg, env, depth - 1)?
         };
@@ -1775,7 +1871,7 @@ fn expand_cond(mut form: EgclVal, env: &Environment) -> Result<EgclVal, EgclErro
         // alloc_cons all allocate; moving GC — bliss-noh).
         egcl_rt::rooted!(test = unsafe { cons_car(clause) });
         egcl_rt::rooted!(cbody = unsafe { cons_cdr(clause) });
-        egcl_rt::rooted!(etest = macroexpand_all(*test, env)?);
+        egcl_rt::rooted!(etest = walk_macroexpand_all(*test, env)?);
         egcl_rt::rooted!(ebody = expand_body(*cbody, env)?);
         out.push(alloc_cons(*etest, *ebody));
     }
@@ -1832,7 +1928,7 @@ fn expand_return_from(mut form: EgclVal, env: &Environment) -> Result<EgclVal, E
     egcl_rt::rooted_ref!(_operator_root = &mut operator);
     egcl_rt::rooted_ref!(_block_name_root = &mut block_name);
     egcl_rt::rooted_ref!(_result_form_root = &mut result_form);
-    let expanded_result = macroexpand_all(result_form, env)?;
+    let expanded_result = walk_macroexpand_all(result_form, env)?;
 
     if expanded_result == result_form {
         Ok(form)
@@ -1874,7 +1970,7 @@ fn expand_tagbody(mut form: EgclVal, env: &Environment) -> Result<EgclVal, EgclE
             // Tags: symbols and integers are NOT expanded
             expanded_items.push(items[i]);
         } else {
-            let exp = macroexpand_all(items[i], &new_env)?;
+            let exp = walk_macroexpand_all(items[i], &new_env)?;
             if exp != items[i] {
                 changed = true;
             }
@@ -1915,7 +2011,7 @@ fn expand_multiple_value_setq(mut form: EgclVal, env: &Environment) -> Result<Eg
     }
     egcl_rt::rooted!(vars = cons_to_vec(items[0]));
     let val_form = items.get(1).copied().unwrap_or(egcl_rt::value::NIL);
-    egcl_rt::rooted!(expanded_val = macroexpand_all(val_form, env)?);
+    egcl_rt::rooted!(expanded_val = walk_macroexpand_all(val_form, env)?);
 
     egcl_rt::rooted!(places = Vec::<EgclVal>::new());
     let mut any_symbol_macro = false;
@@ -1941,7 +2037,7 @@ fn expand_multiple_value_setq(mut form: EgclVal, env: &Environment) -> Result<Eg
     egcl_rt::rooted!(values_place = alloc_cons(values_sym, vec_to_cons(&places)));
     egcl_rt::rooted!(setf_form = vec_to_cons(&[make_symbol("SETF"), *values_place, *expanded_val]));
     egcl_rt::rooted!(wrapped = vec_to_cons(&[make_symbol("VALUES"), *setf_form]));
-    macroexpand_all(*wrapped, env)
+    walk_macroexpand_all(*wrapped, env)
 }
 
 /// Expand SETF: `(setf {place value}*)`.
@@ -1972,7 +2068,7 @@ fn expand_setf(mut form: EgclVal, env: &Environment) -> Result<EgclVal, EgclErro
         let place = expand_place(items[i], env, 0)?;
         changed |= place != items[i];
         rebuilt.push(place);
-        let value = macroexpand_all(items[i + 1], env)?;
+        let value = walk_macroexpand_all(items[i + 1], env)?;
         changed |= value != items[i + 1];
         rebuilt.push(value);
     }
@@ -2004,7 +2100,7 @@ fn expand_place(mut place: EgclVal, env: &Environment, depth: usize) -> Result<E
         return Ok(place);
     }
     if !place.is_cons() {
-        return macroexpand_all(place, env);
+        return walk_macroexpand_all(place, env);
     }
     let mut head = unsafe { cons_car(place) };
     egcl_rt::rooted_ref!(_head_root = &mut head);
@@ -2041,7 +2137,7 @@ fn expand_place(mut place: EgclVal, env: &Environment, depth: usize) -> Result<E
         let expanded = match nested[index.min(nested.len() - 1)] {
             PlaceArgument::Verbatim => argument,
             PlaceArgument::Place => expand_place(argument, env, depth + 1)?,
-            PlaceArgument::Expression => macroexpand_all(argument, env)?,
+            PlaceArgument::Expression => walk_macroexpand_all(argument, env)?,
         };
         changed |= expanded != argument;
         arguments.push(expanded);
@@ -2106,7 +2202,7 @@ fn expand_setq(mut form: EgclVal, env: &Environment) -> Result<EgclVal, EgclErro
             any_symbol_macro = true;
             let mut expansion = expansion;
             egcl_rt::rooted_ref!(_expansion_root = &mut expansion);
-            let mut expanded_val = macroexpand_all(val_form, env)?;
+            let mut expanded_val = walk_macroexpand_all(val_form, env)?;
             egcl_rt::rooted_ref!(_expanded_val_root = &mut expanded_val);
             let setf_sym = make_symbol("SETF");
             let setf_form = alloc_cons(
@@ -2114,13 +2210,13 @@ fn expand_setq(mut form: EgclVal, env: &Environment) -> Result<EgclVal, EgclErro
                 alloc_cons(expansion, alloc_cons(expanded_val, egcl_rt::value::NIL)),
             );
             // Re-enter expand-form on the setf form
-            let expanded_setf = macroexpand_all(setf_form, env)?;
+            let expanded_setf = walk_macroexpand_all(setf_form, env)?;
             rp_vars.push(items[i]);
             rp_valforms.push(items[i + 1]);
             rp_setf.push(Some(expanded_setf));
         } else {
             // Normal case: expand value, don't expand var
-            let expanded_val = macroexpand_all(val_form, env)?;
+            let expanded_val = walk_macroexpand_all(val_form, env)?;
             if expanded_val != items[i + 1] {
                 changed = true;
             }
@@ -2149,7 +2245,7 @@ fn expand_setq(mut form: EgclVal, env: &Environment) -> Result<EgclVal, EgclErro
                 }
                 setf_forms.push(rp_setf[idx].unwrap());
             } else {
-                let expanded_val = macroexpand_all(rp_valforms[idx], env)?;
+                let expanded_val = walk_macroexpand_all(rp_valforms[idx], env)?;
                 normal_pairs.push((rp_vars[idx], expanded_val));
             }
         }
@@ -2185,7 +2281,7 @@ fn expand_setq(mut form: EgclVal, env: &Environment) -> Result<EgclVal, EgclErro
     egcl_rt::rooted!(final_args = Vec::<EgclVal>::with_capacity(items.len()));
     for i in (0..items.len()).step_by(2) {
         final_args.push(items[i]); // var unchanged
-        final_args.push(macroexpand_all(items[i + 1], env)?); // expand value
+        final_args.push(walk_macroexpand_all(items[i + 1], env)?); // expand value
     }
     Ok(alloc_cons(operator, vec_to_cons(&final_args)))
 }
@@ -2209,7 +2305,7 @@ fn expand_the(mut form: EgclVal, env: &Environment) -> Result<EgclVal, EgclError
     }
     let mut value_form = unsafe { cons_car(rest) };
     egcl_rt::rooted_ref!(_value_form_root = &mut value_form);
-    let expanded_value = macroexpand_all(value_form, env)?;
+    let expanded_value = walk_macroexpand_all(value_form, env)?;
 
     if expanded_value == value_form {
         Ok(form)
@@ -2371,7 +2467,7 @@ fn expand_lambda_list(
         // Expand before extending scope. Root the complete parts vector: its
         // parameter names and initializer may move while a macro allocates.
         if parts.len() > 1 {
-            let value = macroexpand_all(parts[1], &scope)?;
+            let value = walk_macroexpand_all(parts[1], &scope)?;
             changed |= value != parts[1];
             parts[1] = value;
         }
@@ -2533,7 +2629,7 @@ fn expand_definer_body(
             expanded.push(items[index]);
             continue;
         }
-        let out = macroexpand_all(items[index], &body_env)?;
+        let out = walk_macroexpand_all(items[index], &body_env)?;
         changed |= out != items[index];
         expanded.push(out);
     }
@@ -2585,7 +2681,7 @@ fn expand_structure_slot(slot: EgclVal, env: &Environment) -> Result<EgclVal, Eg
     if parts.len() < 2 {
         return Ok(*slot);
     }
-    egcl_rt::rooted!(value = macroexpand_all(parts[1], env)?);
+    egcl_rt::rooted!(value = walk_macroexpand_all(parts[1], env)?);
     if *value == parts[1] {
         return Ok(*slot);
     }
@@ -2726,7 +2822,7 @@ fn expand_let(
             // For LET*, expand in the progressively-augmented env
             // For LET, expand in the outer env
             let expand_env = if sequential { &current_env } else { env };
-            let expanded_init = macroexpand_all(init_form, expand_env)?;
+            let expanded_init = walk_macroexpand_all(init_form, expand_env)?;
 
             if expanded_init != init_form {
                 bindings_changed = true;
@@ -3101,7 +3197,7 @@ fn walk_cons(form: EgclVal, env: &Environment) -> Result<EgclVal, EgclError> {
         // Re-read through the rooted cursor each time: the expansion below
         // allocates and may have relocated this cell.
         let car = unsafe { cons_car(*cursor) };
-        let expanded_car = macroexpand_all(car, env)?;
+        let expanded_car = walk_macroexpand_all(car, env)?;
         // Compare against the car AS IT IS NOW, not the pre-expansion copy: a
         // collection during the expansion would have moved it.
         changed |= expanded_car != unsafe { cons_car(*cursor) };

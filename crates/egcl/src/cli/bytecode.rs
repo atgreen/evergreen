@@ -11249,12 +11249,40 @@ fn compile_thunk(form: EgclVal, env: &Env, portable: bool) -> Option<BytecodeFun
     }
     egcl_rt::rooted!(form = form);
     let mut forced = std::collections::HashSet::new();
-    egcl_rt::rooted!(forced_symbols = Vec::<EgclVal>::new());
+    let _ = take_box_request();
+    if let Some(function) = compile_thunk_forcing_boxed(*form, env, portable, &forced) {
+        return Some(function);
+    }
+    let requested = take_box_request();
+    if requested.is_empty() {
+        return None;
+    }
+    // Requests contain encoded identities, not owning symbol references. Root
+    // them BEFORE allocating the snapshot environment or invoking any macro.
+    egcl_rt::rooted!(
+        forced_symbols = requested
+            .iter()
+            .filter_map(|name| lexical_identity::symbol(name))
+            .collect::<Vec<_>>()
+    );
+    egcl_rt::rooted!(menv = super::macroexpand_environment_from_cli(env));
+    *form = match compiler_macroexpand::macroexpand_all_for_boxing(*form, &menv) {
+        Ok(Some(snapshot)) => snapshot,
+        // Do not move expansion across EVAL-WHEN/defining/load-time boundaries.
+        // Ordinary top-level processing/fallback retains their phase ordering.
+        Ok(None) => return None,
+        Err(error) => match file_expansion_failure(*form, &error) {
+            Some(replacement) => replacement,
+            None => return None,
+        },
+    };
+    // The snapshot is one scope-aware WALK, not an EQ cache: two occurrences
+    // sharing an input cons can expand under different MACROLET/declaration
+    // environments. Subsequent attempts see these exact rooted gensyms.
+    // Recompute captures and the finite budget from this expanded source; old
+    // requests may name bindings that the snapshot generated afresh.
     let mut names = std::collections::HashSet::new();
     collect_variable_names(*form, &mut names);
-    // A body macro may reveal a closure only after the initial capture scan.
-    // As with ordinary functions, retry only when a failed attempt identifies
-    // another binding that must be boxed, with a finite source-derived budget.
     for _ in 0..names.len().saturating_add(1).max(4) {
         let _ = take_box_request();
         if let Some(function) = compile_thunk_forcing_boxed(*form, env, portable, &forced) {
@@ -11264,7 +11292,6 @@ fn compile_thunk(form: EgclVal, env: &Env, portable: bool) -> Option<BytecodeFun
         if requested.is_empty() || requested.is_subset(&forced) {
             return None;
         }
-        // Encoded variable keys alone do not retain uninterned symbol cells.
         forced_symbols.extend(
             requested
                 .iter()

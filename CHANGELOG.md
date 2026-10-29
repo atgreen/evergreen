@@ -16,6 +16,10 @@
 
 ### Fixed
 
+- Macro-generated callback captures retain stable identities across top-level
+  boxing retries, including private gensyms and lexical macro scopes
+  ([#906](https://github.com/atgreen/evergreen/pull/906)).
+
 - Generic functions named by uninterned symbols retain their original name
   identity across repeated calls and method-continuation snapshots
   ([#905](https://github.com/atgreen/evergreen/pull/905)).
