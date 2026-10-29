@@ -38149,6 +38149,19 @@ fn macroexpand_all(
         "QUOTE" | "EGCL::QUASIQUOTE" | "MACROLET" | "SYMBOL-MACROLET" | "LOOP" | "DOTIMES"
         | "DOLIST" | "DECLARE" | "GO" => form,
 
+        // THE's first operand is a type specifier, not executable syntax.
+        // Compound types such as (OR INTEGER NULL) must retain their identity
+        // while only the value form undergoes recursive macro expansion.
+        "THE" if cdr.is_cons() && cp(cdr).1.is_cons() && cp(cp(cdr).1).1.is_nil() => {
+            let (type_form, rest) = cp(cdr);
+            egcl_rt::rooted!(parts = [car, type_form, cp(rest).0]);
+            parts[2] = macroexpand_all(parts[2], env, d, local_functions)?;
+            let tail = arena_cons(parts[2], NIL);
+            let tail = arena_cons(parts[1], tail);
+            arena_cons(parts[0], tail)
+        }
+        "THE" => form,
+
         // Binding forms: expand init-forms and bodies but preserve the bound
         // names (a variable named like a macro must not be expanded away).
         // Every cp() result held across an allocating expansion (mx_each /
@@ -38347,7 +38360,7 @@ fn macroexpand_all(
         }
 
         // Everything else — other special forms whose arguments are all code
-        // (PROGN, WHEN, IF, AND, OR, TAGBODY, BLOCK, SETQ, SETF, CATCH, THE,
+        // (PROGN, WHEN, IF, AND, OR, TAGBODY, BLOCK, SETQ, SETF, CATCH,
         // RETURN-FROM, UNWIND-PROTECT, EVAL-WHEN, …) and ordinary function
         // calls — expand each argument independently. Symbols in argument
         // position (tags, block names, setq/setf place symbols) pass through.

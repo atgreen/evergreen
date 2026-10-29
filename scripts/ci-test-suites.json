@@ -1,5 +1,6 @@
 {
   "fast": {
+    "egcl:test:the_type_position_cli": [""],
     "egcl:test:octet_word_store_tiers": [""],
     "egcl:test:struct_function_declaration_cli": [""],
     "egcl:test:deftype_symbol_identity_cli": [""],
