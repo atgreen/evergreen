@@ -1628,6 +1628,119 @@ impl Emitter<'_> {
         self.store(data.results[0], K_FLAG)
     }
 
+    /// `SmallVectorRangeP(vector, start, end)` -> T or NIL: does `vector` hold
+    /// a SMALL SIMPLE_VECTOR whose `start..end` is in bounds?
+    ///
+    /// Call-free and total -- it NEVER deopts and never signals, which is what
+    /// lets `vector_ranges` branch on it to choose a bounds-check-free clone of
+    /// a counted loop. Anything it cannot prove answers NIL and the original
+    /// checked loop runs.
+    ///
+    /// Only the SMALL layout passes: a header whose low halfword is `0xFFFF`
+    /// selects the extended header, where the length is NOT at +8, so that case
+    /// is refused rather than read from the wrong word.
+    ///
+    /// Unlike x86-64 this needs no stack snapshots. That emitter pushes its
+    /// three inputs because its allocator may give the result a home that
+    /// aliases an input; here every operand is loaded into a fixed working
+    /// register and the result home is written last, so nothing can alias.
+    fn small_vector_range_p(&mut self, data: &InstData) -> Result<(), EmitError> {
+        use egcl_rt::object::type_id;
+        if data.args.len() != 3
+            || data.results.len() != 1
+            || !matches!(data.aux, AuxData::None)
+            || data.flags != crate::t2::ir::InstFlags::default()
+            || data.frame_state.is_some()
+            || !data.targets.is_empty()
+        {
+            return Err(EmitError::UnsupportedOp(op_tag(data.opcode)));
+        }
+        let failed = self.asm.label();
+        let done = self.asm.label();
+        self.load(data.args[0], W0)?;
+        self.asm
+            .word(a64::and_imm(T0, W0, 7).expect("7 is a logical immediate"));
+        self.compare_imm(T0, egcl_rt::value::TAG_HEAP_OBJECT);
+        self.asm.jcc(Cc::Ne, failed);
+        // T1 keeps the body for the length read below; the tagged vector is
+        // not needed again, so W0 is free for the endpoints.
+        self.asm
+            .word(a64::and_imm(T1, W0, !7u64).expect("!7 is a logical immediate"));
+        self.asm
+            .word(a64::ldrb_imm(T0, T1, 7).expect("7 fits the byte-form offset"));
+        self.compare_imm(T0, u64::from(type_id::SIMPLE_VECTOR));
+        self.asm.jcc(Cc::Ne, failed);
+        self.asm
+            .word(a64::ldrh_imm(T0, T1, 0).expect("0 fits the halfword-form offset"));
+        // 0xFFFF does not fit CMP's immediate, so `compare_imm` materialises it
+        // through ADDR -- which is free here, the body being in T1.
+        self.compare_imm(T0, 0xFFFF);
+        self.asm.jcc(Cc::E, failed);
+        // start: a nonnegative fixnum.
+        self.load(data.args[1], W0)?;
+        self.asm
+            .word(a64::tst_imm(W0, 7).expect("7 is a logical immediate"));
+        self.asm.jcc(Cc::Ne, failed);
+        self.compare_imm(W0, 0);
+        self.asm.jcc(Cc::L, failed);
+        // end: a fixnum, and at least start. Tagged order IS signed integer
+        // order, so comparing the tagged words orders the endpoints, and
+        // end >= start >= 0 also proves end nonnegative.
+        self.load(data.args[2], W1)?;
+        self.asm
+            .word(a64::tst_imm(W1, 7).expect("7 is a logical immediate"));
+        self.asm.jcc(Cc::Ne, failed);
+        self.compare(W1, W0);
+        self.asm.jcc(Cc::L, failed);
+        self.asm.word(a64::asr_imm(W1, W1, 3));
+        self.load_at(T0, T1, 8)?;
+        self.compare(W1, T0);
+        self.asm.jcc(Cc::G, failed);
+        self.imm(W0, T.0);
+        self.asm.jmp(done);
+        self.asm.bind(failed);
+        self.imm(W0, NIL.0);
+        self.asm.bind(done);
+        self.store(data.results[0], W0)
+    }
+
+    /// `VecSetInRange`: a simple-vector store whose layout and bounds a
+    /// dominating `SmallVectorRangeP` has already proved, so it checks neither.
+    ///
+    /// The fourth operand is the predicate's witness, carried only to keep that
+    /// edge dominating this store; nothing is loaded from it. The address
+    /// arithmetic exploits the representation: a tagged fixnum index is the raw
+    /// index times eight, which is exactly the element stride, so the tagged
+    /// word can be added to the body directly without untagging. The interior
+    /// slot pointer then goes only to the noncollecting reference-barrier leaf;
+    /// it never survives a safepoint.
+    fn vector_set_in_range(&mut self, data: &InstData) -> Result<(), EmitError> {
+        if data.args.len() != 4 || data.results.len() != 1 {
+            return Err(EmitError::UnsupportedOp(op_tag(data.opcode)));
+        }
+        self.load(data.args[0], W0)?;
+        self.asm
+            .word(a64::and_imm(ADDR, W0, !7u64).expect("!7 is a logical immediate"));
+        self.load(data.args[1], W1)?;
+        self.asm.word(a64::add(ADDR, ADDR, W1));
+        self.asm
+            .word(a64::add_imm(ADDR, ADDR, 16).expect("16 fits the immediate field"));
+        // AAPCS64 arguments: x0 is the slot and x1 the tagged value. Save the
+        // slot before loading a heap constant, which may materialise through
+        // ADDR. The helper can grow host bookkeeping but cannot collect Lisp
+        // memory, so the interior pointer is valid for the duration of the call
+        // and no GC root map is needed.
+        self.mov(W0, ADDR);
+        self.load(data.args[2], W1)?;
+        self.imm(ADDR, super::emit::store_vector_element as *const () as u64);
+        self.call_register(ADDR);
+        // The C leaf returns void and may clobber x0/x1. Reload the stored value
+        // from its callee-saved home (or rematerialise its constant) as the SETF
+        // result.
+        self.load(data.args[2], W0)?;
+        self.store(data.results[0], W0)
+    }
+
     // ── control flow ─────────────────────────────────────────────
 
     fn edge(&mut self, edge: &BlockCall) -> Result<(), EmitError> {
@@ -2099,6 +2212,8 @@ impl Emitter<'_> {
                 return self.try_store_integer_octets(data);
             }
             VecRef | VecSet | ArrayReadDiscarded => return self.element_access(data),
+            SmallVectorRangeP => return self.small_vector_range_p(data),
+            VecSetInRange => return self.vector_set_in_range(data),
             Jump if data.targets.len() == 1 => return self.edge(&data.targets[0]),
             Brif if data.args.len() == 1 && data.targets.len() == 2 => {
                 let otherwise = self.asm.label();
@@ -3025,6 +3140,83 @@ pub fn emit_framed_with_runtime(
         heap_constant_slots: emitter.heap_constants.values().copied().collect(),
         has_deopt,
     })
+}
+
+#[cfg(test)]
+mod vector_store_barrier_tests {
+    use super::*;
+    use crate::t2::frame_state::{FrameScope, FrameState, ValueSource};
+    use crate::t2::ir::{IRType, InstFlags};
+
+    fn in_range_store() -> Function {
+        let mut function = Function::new("aarch64-in-range-vector-store");
+        let block = function.entry();
+        let operands: Vec<_> = (0..4)
+            .map(|_| function.add_block_param(block, IRType::TOP, ValueRepresentation::Tagged))
+            .collect();
+        let sources = operands
+            .iter()
+            .copied()
+            .map(|value| ValueSource::Value {
+                value,
+                repr: ValueRepresentation::Tagged,
+            })
+            .collect();
+        let state = function.frame_states.add(FrameState {
+            scopes: vec![FrameScope {
+                function: 0,
+                bcp: 0,
+                locals: sources,
+                stack: vec![],
+            }],
+            remat: vec![],
+        });
+        let (_, result) = function.push_inst(
+            block,
+            InstData {
+                opcode: Opcode::VecSetInRange,
+                args: operands,
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags {
+                    effectful: true,
+                    guard: true,
+                    ..Default::default()
+                },
+                targets: vec![],
+                frame_state: Some(state),
+                source_pos: 0,
+            },
+            &[(IRType::TOP, ValueRepresentation::Tagged)],
+        );
+        function.set_terminator(
+            block,
+            InstData {
+                opcode: Opcode::Return,
+                args: result,
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags::default(),
+                targets: vec![],
+                frame_state: None,
+                source_pos: 1,
+            },
+        );
+        function
+    }
+
+    #[test]
+    fn in_range_heap_store_calls_the_reference_barrier() {
+        let emitted = emit_framed(&in_range_store(), 0, 4).expect("emit AArch64 store");
+        let call = a64::blr(ADDR).to_le_bytes();
+        // On a non-AArch64 host the shared label assembler still selects that
+        // host's variable-width branch encoding, so A64 words after a branch
+        // need not start at a four-byte offset in this cross-host fixture.
+        assert!(
+            emitted.code.windows(call.len()).any(|word| word == call),
+            "the call-free fixture emitted no BLR x16: VecSetInRange bypassed the reference barrier"
+        );
+    }
 }
 
 #[cfg(test)]

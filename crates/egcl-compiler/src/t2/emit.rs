@@ -5721,7 +5721,7 @@ fn packed_u8_element_address(
 
 /// Noncollecting barrier leaf. Host bookkeeping may grow, but this cannot
 /// initiate Lisp GC or retain the interior pointer after returning.
-unsafe extern "C" fn store_vector_element(slot: *mut egcl_rt::EgclVal, value: u64) {
+pub(crate) unsafe extern "C" fn store_vector_element(slot: *mut egcl_rt::EgclVal, value: u64) {
     unsafe { egcl_rt::gc::store_ref(slot, egcl_rt::EgclVal::from_raw(value)) };
 }
 
