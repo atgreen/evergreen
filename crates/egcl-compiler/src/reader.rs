@@ -505,6 +505,17 @@ fn construct_pathname(namestring: EgclVal) -> EgclVal {
         .unwrap_or_else(|| alloc_pathname(namestring))
 }
 
+// Array contents use the host's sequence implementation when available, so
+// adjustable/displaced vectors and specialized element boxing share the same
+// behavior as MAKE-ARRAY without a compiler-to-stdlib dependency.
+type SequenceElements = fn(EgclVal) -> Result<Vec<EgclVal>, EgclError>;
+static SEQUENCE_ELEMENTS: OrderedMutex<Option<SequenceElements>> =
+    OrderedMutex::new(LockLevel::CodeCache, 14, "reader sequence elements", None);
+
+pub fn set_sequence_elements_hook(hook: Option<SequenceElements>) {
+    *SEQUENCE_ELEMENTS.lock().unwrap() = hook;
+}
+
 fn readtable_key(readtable: EgclVal) -> u64 {
     readtable.0 & !egcl_rt::value::TAG_MASK
 }
@@ -925,9 +936,9 @@ fn nd_collect(
     // Collect this level's elements: any sequence may supply a level of a #nA
     // literal (CLHS 2.4.8.12), so #1a"abcd" and #1a#(1 2) read as well as a
     // proper list (syntax.sharp-a.4-26).
-    let items = sequence_items(node).ok_or_else(|| {
+    egcl_rt::rooted!(items = sequence_items(node)?.ok_or_else(|| {
         EgclError::StreamError("#nA array literal contents must be sequences".into())
-    })?;
+    })?);
     if dims.len() <= level {
         dims.push(items.len());
     } else if dims[level] != items.len() {
@@ -935,18 +946,27 @@ fn nd_collect(
             "non-rectangular #nA array literal".into(),
         ));
     }
-    for item in items {
-        nd_collect(item, rank - 1, level + 1, dims, flat)?;
+    // A recursive level can box specialized vector elements and move values
+    // still waiting in sibling positions. Keep the vector rooted in place.
+    for index in 0..items.len() {
+        nd_collect(items[index], rank - 1, level + 1, dims, flat)?;
     }
     Ok(())
 }
 
-/// The elements of a list, simple vector, bit vector, packed byte vector
-/// or string, in order; None for a non-sequence. (A
-/// vector with a fill pointer, or an adjustable or displaced one, is not
-/// read here: its element accessors live in egcl-stdlib, which this crate
-/// cannot reach.)
-fn sequence_items(node: EgclVal) -> Option<Vec<EgclVal>> {
+/// Use the installed library adapter for vectors, including non-simple ones.
+/// The standalone compiler retains its bootstrap sequence implementation.
+fn sequence_items(node: EgclVal) -> Result<Option<Vec<EgclVal>>, EgclError> {
+    let hook = *SEQUENCE_ELEMENTS.lock().unwrap();
+    if egcl_rt::types::vectorp(node) {
+        if let Some(elements) = hook {
+            return elements(node).map(Some);
+        }
+    }
+    Ok(bootstrap_sequence_items(node))
+}
+
+fn bootstrap_sequence_items(node: EgclVal) -> Option<Vec<EgclVal>> {
     if node == NIL {
         return Some(Vec::new());
     }

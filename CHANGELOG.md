@@ -26,6 +26,10 @@
   including explicit `NIL` controls
   ([#829](https://github.com/atgreen/evergreen/pull/829)).
 
+- Array literals accept adjustable, displaced, and fill-pointer vectors as
+  initial contents, including nested and specialized vectors
+  ([#827](https://github.com/atgreen/evergreen/pull/827)).
+
 - `*PRINT-CIRCLE*` preserves shared arrays and uninterned symbols, and prints
   cycles through vectors and multidimensional arrays without runaway expansion
   ([#822](https://github.com/atgreen/evergreen/pull/822)).
