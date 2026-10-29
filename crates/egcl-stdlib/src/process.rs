@@ -17,6 +17,11 @@ pub enum ProcessCommand {
 }
 
 fn command(spec: ProcessCommand) -> Result<Command, EgclError> {
+    if cfg!(target_os = "ios") {
+        return Err(EgclError::FileError(
+            "subprocess creation is unsupported on iOS".into(),
+        ));
+    }
     Ok(match spec {
         ProcessCommand::Shell(text) => shell_command(&text),
         ProcessCommand::Argv(parts) => {

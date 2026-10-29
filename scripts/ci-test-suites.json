@@ -1,5 +1,7 @@
 {
   "fast": {
+    "egcl:test:embedded_exit_cli": [""],
+    "egcl-ios:test:portable_boundary": [""],
     "egcl:test:generic_dispatch_cache_cli": [""],
     "egcl:test:condition_slot_metadata_cli": [""],
     "egcl:test:toplevel_local_callbacks_cli": [""],
@@ -105,7 +107,7 @@
     "egcl-compiler:test:packed_f64_specialization": [""],
     "egcl-compiler:test:callable_label_reader_gc": [""],
     "egcl-compiler:test:reader_handler_gc": [""],
-    "egcl-rt:lib:egcl_rt": ["ffi::aapcs64::layout_tests::", "asm::x86_relax::tests::", "gc::root_kind_tests::", "gc_soft_dirty::tests::", "gc_async_wp::imp::tests::", "gc::native_packed_u8_small_header_contract_matches_allocator", "symbols::tests::synthetic_setf_keys_are_opaque_but_outer_package_markers_still_split", "gc::root_preparer_tests::", "ffi::aapcs64::stack_input_tests::"],
+    "egcl-rt:lib:egcl_rt": ["thread::host_shutdown_tests::", "ffi::aapcs64::layout_tests::", "asm::x86_relax::tests::", "gc::root_kind_tests::", "gc_soft_dirty::tests::", "gc_async_wp::imp::tests::", "gc::native_packed_u8_small_header_contract_matches_allocator", "symbols::tests::synthetic_setf_keys_are_opaque_but_outer_package_markers_still_split", "gc::root_preparer_tests::", "ffi::aapcs64::stack_input_tests::"],
     "egcl-rt:test:gc_async_old_roots": [""],
     "egcl-rt:test:gc_sparse_old_regions": [""],
     "egcl-rt:test:large_allocation_retry": [""],

@@ -10,6 +10,7 @@ members = [
     # can build it; the .so is produced with `cargo rustc --crate-type cdylib`
     # for an Android target (bliss-w2vp).
     "crates/egcl-android",
+    "crates/egcl-ios",
     "tools/gc-root-lint",
 ]
 

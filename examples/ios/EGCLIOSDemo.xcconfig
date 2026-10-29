@@ -1,0 +1,12 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+// Point EGCL_REPOSITORY_ROOT at the repository's absolute checkout path.
+HEADER_SEARCH_PATHS = $(inherited) "$(EGCL_REPOSITORY_ROOT)/crates/egcl-ios/include"
+EGCL_RUST_TARGET[sdk=iphoneos*] = aarch64-apple-ios
+EGCL_RUST_TARGET[sdk=iphonesimulator*] = aarch64-apple-ios-sim
+LIBRARY_SEARCH_PATHS = $(inherited) "$(EGCL_REPOSITORY_ROOT)/target/$(EGCL_RUST_TARGET)/release"
+OTHER_LDFLAGS = $(inherited) -legcl_ios
+SWIFT_OBJC_BRIDGING_HEADER = $(EGCL_REPOSITORY_ROOT)/examples/ios/EGCLIOSDemo-Bridging-Header.h
+SWIFT_VERSION = 5.0
+IPHONEOS_DEPLOYMENT_TARGET = 15.0
+EXCLUDED_ARCHS[sdk=iphonesimulator*] = x86_64

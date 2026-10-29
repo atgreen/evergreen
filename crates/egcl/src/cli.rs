@@ -48515,6 +48515,15 @@ fn wrap_executable(image: &[u8], application: bool) -> Result<Vec<u8>, EgclError
 /// appended to a copy of the runtime binary (reusing the `EGCLEXE` trailer
 /// scheme, recovered by `embedded_image_header` at startup). GC-safe: no EGCL
 /// allocation between the GC and the serialize walk.
+fn exit_lisp_or_process(code: i32) -> Result<(), EgclError> {
+    if egcl_rt::host::is_embedded() {
+        egcl_rt::host::request_exit(code);
+        Err(EgclError::Shutdown)
+    } else {
+        std::process::exit(code)
+    }
+}
+
 fn save_core_and_die(
     path: &str,
     executable: bool,
@@ -48524,11 +48533,16 @@ fn save_core_and_die(
     save_core(path, executable, false, application, env)?;
     use std::io::Write;
     let _ = std::io::stdout().flush();
+    let ending = if egcl_rt::host::is_embedded() {
+        "ending Lisp execution"
+    } else {
+        "exiting"
+    };
     eprintln!(
-        ";; wrote core {} to {path}; exiting",
+        ";; wrote core {} to {path}; {ending}",
         if executable { "executable" } else { "image" }
     );
-    std::process::exit(0);
+    exit_lisp_or_process(0)
 }
 
 fn save_core(
@@ -48538,6 +48552,12 @@ fn save_core(
     application: bool,
     env: &Env,
 ) -> Result<(), EgclError> {
+    if cfg!(target_os = "ios") && executable {
+        return Err(EgclError::ProgramError(
+            "executable image delivery is unsupported on iOS; bundle Lisp source".into(),
+        ));
+    }
+
     // Expose this Env's generic-function registries to the serialize hook
     // (whose signature has no Env). Rc shares — the full_gc below relocates
     // objects and the Env root scan updates this same storage (egcl-x0f2.7a).

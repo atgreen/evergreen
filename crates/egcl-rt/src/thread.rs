@@ -270,6 +270,73 @@ pub enum NativeThreadState {
     Aborted = 5,
 }
 
+// Host shutdown phases: idle, pending, unwinding/terminal. Consumers gate
+// delivery through this state, so a late queue publication after direct EXIT
+// is drained without injecting a second error into cleanup. No target spins.
+fn enqueue_signal(pending: &AtomicU8, signal: PendingSignal) {
+    POSTED_PENDING_SIGNALS.fetch_add(1, Ordering::Release);
+    let previous = pending.fetch_or(signal.bit(), Ordering::Release);
+    if previous & signal.bit() != 0 {
+        POSTED_PENDING_SIGNALS.fetch_sub(1, Ordering::Release);
+    }
+}
+
+fn clear_queued_shutdown(pending: &AtomicU8) {
+    if pending.fetch_and(!PendingSignal::Shutdown.bit(), Ordering::AcqRel)
+        & PendingSignal::Shutdown.bit()
+        != 0
+    {
+        POSTED_PENDING_SIGNALS.fetch_sub(1, Ordering::Release);
+    }
+}
+
+fn enqueue_shutdown_once(delivery: &AtomicU8, pending: &AtomicU8) -> bool {
+    if delivery
+        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return false;
+    }
+    #[cfg(test)]
+    host_shutdown_tests::after_claim();
+    enqueue_signal(pending, PendingSignal::Shutdown);
+    #[cfg(test)]
+    host_shutdown_tests::after_enqueue();
+    // EXIT or terminal publication may have raced the producer. Either this
+    // clear or the consuming CAS removes the bit/count, never both.
+    if delivery.load(Ordering::Acquire) == 2 {
+        clear_queued_shutdown(pending);
+        return false;
+    }
+    true
+}
+
+fn begin_shutdown_unwind(delivery: &AtomicU8, pending: &AtomicU8) {
+    delivery.store(2, Ordering::Release);
+    clear_queued_shutdown(pending);
+}
+
+fn take_signal(pending: &AtomicU8, delivery: &AtomicU8) -> Option<PendingSignal> {
+    loop {
+        let bits = pending.load(Ordering::Acquire);
+        let signal = PendingSignal::from_bits(bits)?;
+        let new_bits = bits & !signal.bit();
+        if pending
+            .compare_exchange(bits, new_bits, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            POSTED_PENDING_SIGNALS.fetch_sub(1, Ordering::Release);
+            if signal == PendingSignal::Shutdown
+                && crate::host::is_embedded()
+                && delivery.swap(2, Ordering::AcqRel) == 2
+            {
+                continue;
+            }
+            return Some(signal);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingSignal {
     Interrupt,
@@ -742,6 +809,7 @@ pub struct NativeThread {
     #[cfg(unix)]
     os_thread_id: AtomicUsize,
     pending_signals: AtomicU8,
+    shutdown_delivery: AtomicU8,
 }
 
 unsafe impl Send for NativeThread {}
@@ -803,6 +871,7 @@ impl NativeThread {
             #[cfg(unix)]
             os_thread_id: AtomicUsize::new(0),
             pending_signals: AtomicU8::new(0),
+            shutdown_delivery: AtomicU8::new(0),
         }
     }
 
@@ -843,6 +912,9 @@ impl NativeThread {
     }
 
     pub(crate) fn set_state(&self, state: NativeThreadState) {
+        if matches!(state, NativeThreadState::Dead | NativeThreadState::Aborted) {
+            begin_shutdown_unwind(&self.shutdown_delivery, &self.pending_signals);
+        }
         self.state.store(state as u8, Ordering::Release);
     }
 
@@ -943,33 +1015,13 @@ impl NativeThread {
     }
 
     fn post_pending_signal(&self, signal: PendingSignal) {
-        // Reserve before publishing: a concurrent take must not subtract
-        // before the corresponding obligation has been counted.
-        POSTED_PENDING_SIGNALS.fetch_add(1, Ordering::Release);
-        let previous = self
-            .pending_signals
-            .fetch_or(signal.bit(), Ordering::Release);
-        if previous & signal.bit() != 0 {
-            POSTED_PENDING_SIGNALS.fetch_sub(1, Ordering::Release);
-        }
+        enqueue_signal(&self.pending_signals, signal);
         self.execution.request_poll();
         crate::execution_poll::request_carrier(self.id.0);
     }
 
     fn take_pending_signal(&self) -> Option<PendingSignal> {
-        loop {
-            let bits = self.pending_signals.load(Ordering::Acquire);
-            let signal = PendingSignal::from_bits(bits)?;
-            let new_bits = bits & !signal.bit();
-            if self
-                .pending_signals
-                .compare_exchange(bits, new_bits, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                POSTED_PENDING_SIGNALS.fetch_sub(1, Ordering::Release);
-                return Some(signal);
-            }
-        }
+        take_signal(&self.pending_signals, &self.shutdown_delivery)
     }
 
     fn trace_execution_roots(&self, visit: &mut dyn FnMut(*mut EgclVal)) {
@@ -1215,6 +1267,7 @@ impl CurrentNativeThread {
 
 impl Drop for CurrentNativeThread {
     fn drop(&mut self) {
+        begin_shutdown_unwind(&self.thread.shutdown_delivery, &self.thread.pending_signals);
         crate::execution_local::retire_native(std::thread::current().id());
         crate::safepoint::retire_native_thread(&self.thread);
     }
@@ -1552,6 +1605,7 @@ pub struct Fiber {
     published_sp: AtomicUsize,
     published_fp: AtomicUsize,
     pending_signals: AtomicU8,
+    shutdown_delivery: AtomicU8,
 }
 
 impl Fiber {
@@ -1659,6 +1713,7 @@ impl Fiber {
 
 impl Drop for Fiber {
     fn drop(&mut self) {
+        begin_shutdown_unwind(&self.shutdown_delivery, &self.pending_signals);
         crate::execution_local::retire_fiber(self.id);
     }
 }
@@ -1740,6 +1795,9 @@ impl Fiber {
 
     /// Set the thread state.
     pub(crate) fn set_state(&self, new_state: FiberState) {
+        if new_state == FiberState::Dead {
+            begin_shutdown_unwind(&self.shutdown_delivery, &self.pending_signals);
+        }
         *self.state.lock().unwrap() = new_state;
     }
 
@@ -1805,32 +1863,12 @@ impl Fiber {
     }
 
     fn post_pending_signal(&self, signal: PendingSignal) {
-        // Reserve before publishing: a concurrent take must not subtract
-        // before the corresponding obligation has been counted.
-        POSTED_PENDING_SIGNALS.fetch_add(1, Ordering::Release);
-        let previous = self
-            .pending_signals
-            .fetch_or(signal.bit(), Ordering::Release);
-        if previous & signal.bit() != 0 {
-            POSTED_PENDING_SIGNALS.fetch_sub(1, Ordering::Release);
-        }
+        enqueue_signal(&self.pending_signals, signal);
         self.execution.request_poll();
     }
 
     fn take_pending_signal(&self) -> Option<PendingSignal> {
-        loop {
-            let bits = self.pending_signals.load(Ordering::Acquire);
-            let signal = PendingSignal::from_bits(bits)?;
-            let new_bits = bits & !signal.bit();
-            if self
-                .pending_signals
-                .compare_exchange(bits, new_bits, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                POSTED_PENDING_SIGNALS.fetch_sub(1, Ordering::Release);
-                return Some(signal);
-            }
-        }
+        take_signal(&self.pending_signals, &self.shutdown_delivery)
     }
 
     fn trace_execution_roots(&self, visit: &mut dyn FnMut(*mut EgclVal)) {
@@ -2455,10 +2493,12 @@ fn run_worker_task(pool: &Arc<WorkerPool>, carrier_index: usize, task: WorkerTas
             }
         }
         SUSPEND_DEAD => {
+            begin_shutdown_unwind(&thread.shutdown_delivery, &thread.pending_signals);
             *state = FiberState::Dead;
         }
         _ => {
             let old_state = *state;
+            begin_shutdown_unwind(&thread.shutdown_delivery, &thread.pending_signals);
             *state = FiberState::Dead;
             drop(state);
             task.result_cell.complete(Err(EgclError::Internal(format!(
@@ -2611,6 +2651,7 @@ pub fn make_thread_named_with_setup<F, G>(
 where
     F: FnOnce() -> G + Send + 'static,
 {
+    let _creation = crate::host::admit_creation()?;
     // Creating a thread is the natural point to reclaim those that finished
     // unjoined: a thread-per-connection server never joins its workers.
     reap_finished_native_threads();
@@ -3062,6 +3103,7 @@ pub fn make_fiber(entry: EgclVal) -> Result<FiberId, EgclError> {
 
 /// Allocate a fiber with an explicit native stack reservation in bytes.
 pub fn make_fiber_with_stack_size(entry: EgclVal, stack_size: usize) -> Result<FiberId, EgclError> {
+    let _creation = crate::host::admit_creation()?;
     if !(64 * 1024..=1024 * 1024 * 1024).contains(&stack_size) {
         return Err(EgclError::ProgramError(
             "fiber stack size must be between 64 KiB and 1 GiB".into(),
@@ -3156,6 +3198,7 @@ pub fn make_fiber_with_stack_size(entry: EgclVal, stack_size: usize) -> Result<F
         published_sp: AtomicUsize::new(0),
         published_fp: AtomicUsize::new(0),
         pending_signals: AtomicU8::new(0),
+        shutdown_delivery: AtomicU8::new(0),
     });
     fiber_registry()
         .lock()
@@ -3175,6 +3218,13 @@ fn submit_fiber_to_pool(id: FiberId, pool: &Arc<WorkerPool>) -> Result<(), EgclE
         .get(&id)
         .cloned()
         .ok_or_else(|| EgclError::Internal(format!("no fiber with id {}", id.0)))?;
+    // Waking an existing wait remains legal during drain; admitting a new
+    // Created execution does not. Keep admission through queue publication.
+    let _creation = if fiber.state() == FiberState::Created {
+        Some(crate::host::admit_creation()?)
+    } else {
+        None
+    };
     {
         let mut owner = fiber.scheduler_pool.lock().unwrap();
         match owner.as_ref().and_then(Weak::upgrade) {
@@ -4301,4 +4351,228 @@ mod cancellation_race_tests {
         assert_eq!(join_fiber(fiber).unwrap(), T);
         pool.shutdown_and_join().unwrap();
     }
+}
+
+/// Opaque, non-reused execution identity for an embedding supervisor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum HostExecutionTarget {
+    Native(u64),
+    Fiber(u64),
+}
+
+/// Snapshot explicit Lisp native threads and submitted fibers. The embedding
+/// supervisor separately tracks its owned root worker and its exact target.
+/// Auto-registered host, collector and IO helper threads are not Lisp children.
+/// This initial calls-only host profile does not admit foreign Lisp callbacks.
+/// Only Rust identity/state metadata is accessed; no roots are pruned here.
+pub fn host_active_executions() -> Vec<HostExecutionTarget> {
+    let mut targets = Vec::new();
+    {
+        let registry = native_thread_registry().lock().unwrap();
+        for (id, thread) in registry.iter() {
+            if !thread.auto_registered
+                && !thread.is_carrier()
+                && !matches!(
+                    thread.state(),
+                    NativeThreadState::Dead | NativeThreadState::Aborted
+                )
+            {
+                targets.push(HostExecutionTarget::Native(id.0));
+            }
+        }
+    }
+    {
+        let registry = fiber_registry().lock().unwrap();
+        for (id, fiber) in registry.iter() {
+            if !matches!(fiber.state(), FiberState::Created | FiberState::Dead) {
+                targets.push(HostExecutionTarget::Fiber(id.0));
+            }
+        }
+    }
+    targets
+}
+
+/// Post once per identity during a host drain. Does not send a process signal,
+/// kill a thread, or force a non-cancellable wait to release its resources.
+pub fn host_request_execution_shutdown(target: HostExecutionTarget) {
+    match target {
+        HostExecutionTarget::Native(id) => {
+            let registry = native_thread_registry().lock().unwrap();
+            if let Some(thread) = registry.get(&NativeThreadId(id)) {
+                if !matches!(
+                    thread.state(),
+                    NativeThreadState::Dead | NativeThreadState::Aborted
+                ) {
+                    if enqueue_shutdown_once(&thread.shutdown_delivery, &thread.pending_signals) {
+                        thread.execution.request_poll();
+                        crate::execution_poll::request_carrier(thread.id.0);
+                    }
+                }
+            }
+        }
+        HostExecutionTarget::Fiber(id) => {
+            {
+                let registry = fiber_registry().lock().unwrap();
+                if let Some(fiber) = registry.get(&FiberId(id)) {
+                    if !matches!(fiber.state(), FiberState::Created | FiberState::Dead)
+                        && enqueue_shutdown_once(&fiber.shutdown_delivery, &fiber.pending_signals)
+                    {
+                        fiber.execution.request_poll();
+                    } else {
+                        return;
+                    }
+                }
+            }
+            // Use the existing opt-in cancellation wake protocol. Arbitrary
+            // semaphore/IO waits are not forcibly released by host shutdown.
+            let _ = request_fiber_cancellation(FiberId(id));
+        }
+    }
+}
+
+/// Mark an EXIT-origin transfer before its global stop request is observable.
+/// This is execution-affine and touches only transient atomic control state.
+pub fn host_begin_current_shutdown_unwind() {
+    if let Some(fiber) = current_fiber() {
+        begin_shutdown_unwind(&fiber.shutdown_delivery, &fiber.pending_signals);
+    } else {
+        let thread = current_thread();
+        begin_shutdown_unwind(&thread.shutdown_delivery, &thread.pending_signals);
+    }
+}
+
+#[cfg(all(test, not(target_os = "ios")))]
+mod host_shutdown_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::sync::Barrier;
+    thread_local! {
+        static CLAIM: RefCell<Option<(Arc<Barrier>, Arc<Barrier>)>> = const { RefCell::new(None) };
+        static ENQUEUE: RefCell<Option<(Arc<Barrier>, Arc<Barrier>)>> = const { RefCell::new(None) };
+    }
+    fn pause(slot: &'static std::thread::LocalKey<RefCell<Option<(Arc<Barrier>, Arc<Barrier>)>>>) {
+        let barriers = slot.with(|value| value.borrow_mut().take());
+        if let Some((arrived, release)) = barriers {
+            arrived.wait();
+            release.wait();
+        }
+    }
+    pub(super) fn after_claim() {
+        pause(&CLAIM);
+    }
+    pub(super) fn after_enqueue() {
+        pause(&ENQUEUE);
+    }
+
+    fn isolated(name: &str) -> bool {
+        const CHILD: &str = "EGCL_HOST_SHUTDOWN_CHILD";
+        if std::env::var(CHILD).as_deref() == Ok(name) {
+            return true;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture", "--test-threads=1"])
+            .env(CHILD, name)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        false
+    }
+
+    fn late_publication(after_queue: bool) {
+        crate::host::select_embedded().unwrap();
+        let delivery = Arc::new(AtomicU8::new(0));
+        let pending = Arc::new(AtomicU8::new(0));
+        let arrived = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let worker_delivery = Arc::clone(&delivery);
+        let worker_pending = Arc::clone(&pending);
+        let barriers = (Arc::clone(&arrived), Arc::clone(&release));
+        let producer = std::thread::spawn(move || {
+            if after_queue {
+                ENQUEUE.with(|slot| *slot.borrow_mut() = Some(barriers));
+            } else {
+                CLAIM.with(|slot| *slot.borrow_mut() = Some(barriers));
+            }
+            enqueue_shutdown_once(&worker_delivery, &worker_pending)
+        });
+        arrived.wait();
+        // Simulate direct EXIT while the publisher is parked. It must never
+        // spin waiting for the publisher or inject another cleanup error.
+        begin_shutdown_unwind(&delivery, &pending);
+        release.wait();
+        assert!(!producer.join().unwrap());
+        assert_eq!(take_signal(&pending, &delivery), None);
+        assert_eq!(pending.load(Ordering::Acquire), 0);
+        assert_eq!(POSTED_PENDING_SIGNALS.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn late_publication_after_direct_exit_is_ignored() {
+        if isolated("thread::host_shutdown_tests::late_publication_after_direct_exit_is_ignored") {
+            late_publication(false);
+        }
+    }
+    #[test]
+    fn queued_publication_racing_direct_exit_does_not_underflow_count() {
+        if isolated(
+            "thread::host_shutdown_tests::queued_publication_racing_direct_exit_does_not_underflow_count",
+        ) {
+            late_publication(true);
+        }
+    }
+    #[test]
+    fn queued_shutdown_is_consumed_once_without_hiding_other_signals() {
+        if !isolated(
+            "thread::host_shutdown_tests::queued_shutdown_is_consumed_once_without_hiding_other_signals",
+        ) {
+            return;
+        }
+        crate::host::select_embedded().unwrap();
+        let delivery = AtomicU8::new(0);
+        let pending = AtomicU8::new(0);
+        assert!(enqueue_shutdown_once(&delivery, &pending));
+        assert_eq!(
+            take_signal(&pending, &delivery),
+            Some(PendingSignal::Shutdown)
+        );
+        assert!(!enqueue_shutdown_once(&delivery, &pending));
+        enqueue_signal(&pending, PendingSignal::Shutdown); // late external queue
+        enqueue_signal(&pending, PendingSignal::Interrupt);
+        assert_eq!(
+            take_signal(&pending, &delivery),
+            Some(PendingSignal::Interrupt)
+        );
+        assert_eq!(take_signal(&pending, &delivery), None);
+        assert_eq!(POSTED_PENDING_SIGNALS.load(Ordering::Acquire), 0);
+    }
+    #[test]
+    fn creation_admission_closes_without_losing_inflight_publication() {
+        if !isolated(
+            "thread::host_shutdown_tests::creation_admission_closes_without_losing_inflight_publication",
+        ) {
+            return;
+        }
+        crate::host::select_embedded().unwrap();
+        let admitted = crate::host::admit_creation().unwrap();
+        assert_eq!(crate::host::creations_in_flight(), 1);
+        crate::host::request_stop();
+        assert!(matches!(
+            crate::host::admit_creation(),
+            Err(EgclError::Shutdown)
+        ));
+        assert_eq!(crate::host::creations_in_flight(), 1);
+        drop(admitted);
+        assert_eq!(crate::host::creations_in_flight(), 0);
+    }
+}
+
+#[cfg(all(test, target_os = "ios"))]
+mod host_shutdown_tests {
+    pub(super) fn after_claim() {}
+    pub(super) fn after_enqueue() {}
 }

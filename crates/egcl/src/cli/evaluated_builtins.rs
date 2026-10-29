@@ -2909,7 +2909,7 @@ fn resolve(name: &str) -> Option<Handler> {
         "EGCL::%EXIT" => Some(|_operator, args, _env| {
             let args = RootedVals::new(args.to_vec());
 
-            // (%exit &optional code) — flush and terminate the process.
+            // (%exit &optional code) — process exit for CLI, control unwind for hosts.
 
             let code = if !args.is_empty() && args[0].is_fixnum() {
                 args[0].as_fixnum() as i32
@@ -2918,7 +2918,8 @@ fn resolve(name: &str) -> Option<Handler> {
             };
             use std::io::Write;
             let _ = std::io::stdout().flush();
-            std::process::exit(code);
+            exit_lisp_or_process(code)?;
+            unreachable!("process exit or embedded shutdown must leave the call")
         }),
 
         "MACRO-FUNCTION" => Some(|_operator, args, env| {

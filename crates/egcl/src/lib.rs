@@ -15,3 +15,14 @@ pub use cli::{CliArgs, ReplConfig, help_text, print_help, print_version, run, ru
 pub mod prelude {
     pub use crate::{CliArgs, ReplConfig, run, run_repl};
 }
+
+/// Run one embedded root without process-exit semantics. Descendants may still
+/// be active on return: the embedding supervisor must drain them separately.
+/// Only one embedded root may start during this process lifetime.
+pub fn run_embedded(args: &[String]) -> Result<i32, egcl_rt::EgclError> {
+    egcl_rt::host::begin_embedded_root()?;
+    match cli::run(args) {
+        Err(egcl_rt::EgclError::Shutdown) => Ok(egcl_rt::host::exit_code().unwrap_or(0)),
+        result => result,
+    }
+}
