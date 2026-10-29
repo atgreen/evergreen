@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-use egcl_rt::{EgclVal, NIL};
+use egcl_rt::EgclVal;
+use egcl_rt::value::NIL;
 use egcl_stdlib::sequences::{build_filled_bit_vector, elt, set_elt};
 
 #[test]
