@@ -32147,6 +32147,10 @@ mod function_literal_tests {
     use super::super::{Closure, closure_registry, register_tree_closure};
     use std::collections::HashSet;
 
+    fn closure_id(identity: EgclVal) -> u64 {
+        cp(identity).1.as_fixnum() as u64
+    }
+
     #[test]
     fn expanded_literal_identity_moves_with_its_compiled_constant_owner() {
         let _lock = super::super::heap_test_lock()
@@ -32172,9 +32176,9 @@ mod function_literal_tests {
             captured_macros: None,
         };
         egcl_rt::rooted!(function = register_tree_closure(closure()));
-        let id = cp(*function).1.as_fixnum() as u64;
+        let id: u64 = closure_id(*function);
         let control = register_tree_closure(closure());
-        let control_id = cp(control).1.as_fixnum() as u64;
+        let control_id: u64 = closure_id(control);
         egcl_rt::rooted!(
             expanded =
                 super::super::macroexpand_all(*function, &mut env, 0, &HashSet::new(),).unwrap()
