@@ -1,5 +1,6 @@
 {
   "fast": {
+    "egcl:test:deftype_symbol_identity_cli": [""],
     "egcl:test:compile_toplevel_expansion_cli": [""],
     "egcl:test:compile_toplevel_order_cli": [""],
     "egcl:test:compile_file_macroexpansion_error_cli": [""],
