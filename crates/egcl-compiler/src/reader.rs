@@ -328,7 +328,7 @@ fn any_custom_macros() -> bool {
 fn continue_after_silent_macro(
     chars: &mut ReaderInput<'_>,
     pos: usize,
-    labels: &mut CircularLabels,
+    labels: &CircularLabels,
     read_base: u32,
     read_eval: bool,
     read_circular: bool,
@@ -347,7 +347,7 @@ fn try_custom_sharp_dispatch(
     pos_after_sub: usize,
     sub: char,
     infix: Option<i64>,
-    labels: &mut CircularLabels,
+    labels: &CircularLabels,
     read_base: u32,
     read_eval: bool,
     read_circular: bool,
@@ -727,19 +727,59 @@ impl Drop for BackquoteLevel {
     }
 }
 
+#[derive(Clone, Default)]
 struct CircularLabels {
-    labels: HashMap<u64, EgclVal>,
+    labels: std::rc::Rc<std::cell::RefCell<HashMap<u64, EgclVal>>>,
 }
 
-// The labeled (`#n=`) values live across arbitrarily many subsequent reads,
-// each of which allocates and can fire a relocating minor GC — so the table
-// must be a scanned GC root for the duration of a read (bliss-wlf). The
-// construction sites wrap it in `HostRoot`.
+// Every active parser roots its handle. Only these short, nonallocating map
+// operations borrow the contents; recursive Lisp READs never inherit a borrow.
 impl egcl_rt::gc::TraceHostRoots for CircularLabels {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
-        for value in self.labels.values_mut() {
+        for value in self.labels.borrow_mut().values_mut() {
             visit(value);
         }
+    }
+}
+
+// A reader callback can yield and migrate with its Lisp execution. Keep the
+// active context execution-local, and own it rather than publishing a pointer
+// to a parser's stack or holding a RefCell borrow while calling Lisp.
+// SAFETY: handles are owned by one Lisp execution, including across fiber
+// migration. Initialization and destruction do not allocate Lisp objects.
+static ACTIVE_CIRCULAR_LABELS: egcl_rt::execution_local::ExecutionLocal<
+    std::cell::RefCell<Option<CircularLabels>>,
+> = unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| std::cell::RefCell::new(None)) };
+
+struct CircularLabelScope {
+    labels: CircularLabels,
+    previous: Option<CircularLabels>,
+}
+impl CircularLabelScope {
+    fn enter(recursive: bool) -> Self {
+        let labels = if recursive {
+            ACTIVE_CIRCULAR_LABELS
+                .with(|active| active.borrow().clone())
+                .unwrap_or_default()
+        } else {
+            CircularLabels::default()
+        };
+        let previous = ACTIVE_CIRCULAR_LABELS.with(|active| active.replace(Some(labels.clone())));
+        Self { labels, previous }
+    }
+}
+impl egcl_rt::gc::TraceHostRoots for CircularLabelScope {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
+        egcl_rt::gc::TraceHostRoots::trace_host_roots(&mut self.labels, visit);
+        if let Some(previous) = &mut self.previous {
+            egcl_rt::gc::TraceHostRoots::trace_host_roots(previous, visit);
+        }
+    }
+}
+
+impl Drop for CircularLabelScope {
+    fn drop(&mut self) {
+        ACTIVE_CIRCULAR_LABELS.with(|active| active.replace(self.previous.take()));
     }
 }
 
@@ -876,7 +916,7 @@ fn alloc_md_array(dims: &[usize], flat: &[EgclVal]) -> EgclVal {
 fn read_nd_array_literal(
     chars: &mut ReaderInput<'_>,
     mut pos: usize,
-    labels: &mut CircularLabels,
+    labels: &CircularLabels,
     read_base: u32,
     read_eval: bool,
     read_circular: bool,
@@ -1427,13 +1467,26 @@ pub fn read_from_stream(
     read_eval: bool,
     preserve_whitespace: bool,
 ) -> Result<EgclVal, EgclError> {
+    read_from_stream_recursive(stream, read_base, read_eval, preserve_whitespace, false)
+}
+
+/// READ's recursive operation shares the enclosing label context when present.
+pub fn read_from_stream_recursive(
+    stream: &mut dyn ReaderStream,
+    read_base: u32,
+    read_eval: bool,
+    preserve_whitespace: bool,
+    recursive: bool,
+) -> Result<EgclVal, EgclError> {
+    // Keep the scope active through stream lookahead/unread callbacks too.
+    egcl_rt::rooted!(_label_scope = CircularLabelScope::enter(recursive));
     let mut input = ReaderInput {
         chars: InputChars::Buffered(Vec::new()),
         stream: Some(stream),
         eof: false,
         initial_standard_macro: None,
     };
-    let (value, mut consumed) = read_form_input(&mut input, 0, read_base, read_eval)?;
+    let (value, mut consumed) = read_form_input(&mut input, 0, read_base, read_eval, true)?;
     egcl_rt::rooted!(value = value);
     // Only consume whitespace that was already read as the token terminator.
     // A self-delimiting form needs no extra read from an interactive stream.
@@ -1478,9 +1531,10 @@ pub fn read_standard_macro_from_stream(
         }
         return Ok(Vec::new());
     }
-    egcl_rt::rooted!(labels = CircularLabels { labels: HashMap::new() });
+    egcl_rt::rooted!(label_scope = CircularLabelScope::enter(true));
+    let labels = label_scope.labels.clone();
     let (value, consumed) = read_token_with_base(
-        &mut input, 0, &mut labels, read_base, read_eval,
+        &mut input, 0, &labels, read_base, read_eval,
         default_string_reader_circular_mode(), 0,
     )?;
     egcl_rt::rooted!(value = value);
@@ -1514,11 +1568,8 @@ pub fn read(state: &mut ReaderState) -> Result<EgclVal, EgclError> {
                     let s = egcl_rt::object::read_simple_string(ptr);
                     let chars: Vec<char> = s.chars().collect();
                     ensure_nesting_within_limit(&chars)?;
-                    egcl_rt::rooted!(
-                        labels = CircularLabels {
-                            labels: HashMap::new(),
-                        }
-                    );
+                    egcl_rt::rooted!(label_scope = CircularLabelScope::enter(false));
+                    let labels = label_scope.labels.clone();
 
                     // Honor custom readtable entries before falling back to built-ins.
                     let first_pos =
@@ -1532,7 +1583,7 @@ pub fn read(state: &mut ReaderState) -> Result<EgclVal, EgclError> {
                     let (val, _pos) = read_token_with_base(
                         &mut ReaderInput::slice(&chars),
                         0,
-                        &mut labels,
+                        &labels,
                         state.read_base,
                         state.read_eval,
                         state.read_circular,
@@ -1586,7 +1637,18 @@ pub fn read_form_at(
     read_base: u32,
     read_eval: bool,
 ) -> Result<(EgclVal, usize), EgclError> {
-    read_form_input(&mut ReaderInput::slice(chars), start, read_base, read_eval)
+    read_form_at_recursive(chars, start, read_base, read_eval, false)
+}
+
+/// Buffered READ with an explicit recursive-p label-scope policy.
+pub fn read_form_at_recursive(
+    chars: &[char],
+    start: usize,
+    read_base: u32,
+    read_eval: bool,
+    recursive: bool,
+) -> Result<(EgclVal, usize), EgclError> {
+    read_form_input(&mut ReaderInput::slice(chars), start, read_base, read_eval, recursive)
 }
 
 pub fn read_char_literal(chars: &[char], pos: usize) -> Result<(EgclVal, usize), EgclError> {
@@ -1598,7 +1660,9 @@ fn read_form_input(
     start: usize,
     read_base: u32,
     read_eval: bool,
+    recursive: bool,
 ) -> Result<(EgclVal, usize), EgclError> {
+    egcl_rt::rooted!(label_scope = CircularLabelScope::enter(recursive));
     // `*READ-SUPPRESS*`: parse the form's syntax, discard it, return NIL while
     // still consuming the characters. `skip_form` implements exactly this
     // parse-and-discard traversal (it also drives suppressed #+/#- branches).
@@ -1610,17 +1674,13 @@ fn read_form_input(
         p = skip_form(chars, p, 0)?;
         return Ok((NIL, p));
     }
-    egcl_rt::rooted!(
-        labels = CircularLabels {
-            labels: HashMap::new(),
-        }
-    );
+    let labels = label_scope.labels.clone();
     let mut pos = start;
     loop {
         let (val, next) = read_token_with_base(
             chars,
             pos,
-            &mut labels,
+            &labels,
             read_base,
             read_eval,
             default_string_reader_circular_mode(),
@@ -1669,7 +1729,7 @@ fn default_string_reader_circular_mode() -> bool {
 fn read_token(
     chars: &mut ReaderInput<'_>,
     pos: usize,
-    labels: &mut CircularLabels,
+    labels: &CircularLabels,
 ) -> Result<(EgclVal, usize), EgclError> {
     read_token_with_base(chars, pos, labels, 10, false, true, 0)
 }
@@ -1684,7 +1744,7 @@ fn read_custom_dispatch_char(
     pos: usize,
     mut rt: EgclVal,
     disp: char,
-    labels: &mut CircularLabels,
+    labels: &CircularLabels,
     read_base: u32,
     read_eval: bool,
     read_circular: bool,
@@ -1746,7 +1806,7 @@ fn read_custom_dispatch_char(
 fn read_object_with_base(
     chars: &mut ReaderInput<'_>,
     mut pos: usize,
-    labels: &mut CircularLabels,
+    labels: &CircularLabels,
     read_base: u32,
     read_eval: bool,
     read_circular: bool,
@@ -1772,7 +1832,7 @@ fn read_object_with_base(
 fn read_token_with_base(
     chars: &mut ReaderInput<'_>,
     mut pos: usize,
-    labels: &mut CircularLabels,
+    labels: &CircularLabels,
     read_base: u32,
     read_eval: bool,
     read_circular: bool,
@@ -2134,7 +2194,7 @@ fn ensure_nesting_within_limit(chars: &[char]) -> Result<(), EgclError> {
 fn read_list(
     chars: &mut ReaderInput<'_>,
     pos: usize,
-    labels: &mut CircularLabels,
+    labels: &CircularLabels,
 ) -> Result<(EgclVal, usize), EgclError> {
     read_list_with_base(chars, pos, labels, 10, false, true, 0)
 }
@@ -2142,7 +2202,7 @@ fn read_list(
 fn read_list_with_base(
     chars: &mut ReaderInput<'_>,
     mut pos: usize,
-    labels: &mut CircularLabels,
+    labels: &CircularLabels,
     read_base: u32,
     read_eval: bool,
     read_circular: bool,
@@ -3237,7 +3297,7 @@ fn alloc_bignum(sign: i32, limbs: &[u64]) -> EgclVal {
 fn read_sharpsign(
     chars: &mut ReaderInput<'_>,
     pos: usize,
-    labels: &mut CircularLabels,
+    labels: &CircularLabels,
 ) -> Result<(EgclVal, usize), EgclError> {
     read_sharpsign_with_base(chars, pos, labels, 10, false, true, 0)
 }
@@ -3245,7 +3305,7 @@ fn read_sharpsign(
 fn read_sharpsign_with_base(
     chars: &mut ReaderInput<'_>,
     mut pos: usize,
-    labels: &mut CircularLabels,
+    labels: &CircularLabels,
     read_base: u32,
     read_eval: bool,
     read_circular: bool,
@@ -3341,11 +3401,11 @@ fn read_sharpsign_with_base(
                 // Pre-allocate a placeholder cons cell for circular references
                 let mut placeholder = alloc_cons(NIL, NIL);
                 // The labeled read below allocates and can fire a relocating
-                // minor GC; the labels-table copy is rooted (HostRoot) but this
+                // minor GC; the shared labels-table copy is rooted but this
                 // Rust local is not — root it so the patch below writes into
                 // the placeholder's post-GC address (bliss-wlf).
                 egcl_rt::rooted_ref!(_ph_root = &mut placeholder);
-                labels.labels.insert(num, placeholder);
+                labels.labels.borrow_mut().insert(num, placeholder);
                 let (val, p) = read_object_with_base(
                     chars,
                     pos,
@@ -3355,13 +3415,13 @@ fn read_sharpsign_with_base(
                     read_circular,
                     depth + 1,
                 )?;
-                labels.labels.insert(num, val);
-                for labeled in labels.labels.values_mut() {
+                labels.labels.borrow_mut().insert(num, val);
+                for labeled in labels.labels.borrow_mut().values_mut() {
                     if *labeled == placeholder {
                         *labeled = val;
                     }
                 }
-                patch_circular_label(val, placeholder, labels.labels.values().copied());
+                patch_circular_label(val, placeholder, labels.labels.borrow().values().copied());
                 return Ok((val, p));
             }
             '#' => {
@@ -3371,7 +3431,7 @@ fn read_sharpsign_with_base(
                     ));
                 }
                 pos += 1;
-                if let Some(&val) = labels.labels.get(&num) {
+                if let Some(&val) = labels.labels.borrow().get(&num) {
                     return Ok((val, pos));
                 }
                 return Err(EgclError::StreamError(format!("undefined label #{}", num)));
@@ -3628,7 +3688,7 @@ fn read_char_literal_input(
 fn read_vector_literal(
     chars: &mut ReaderInput<'_>,
     pos: usize,
-    labels: &mut CircularLabels,
+    labels: &CircularLabels,
 ) -> Result<(EgclVal, usize), EgclError> {
     read_vector_literal_with_base(chars, pos, labels, 10, false, true, 0)
 }
@@ -3636,7 +3696,7 @@ fn read_vector_literal(
 fn read_vector_literal_with_base(
     chars: &mut ReaderInput<'_>,
     pos: usize,
-    labels: &mut CircularLabels,
+    labels: &CircularLabels,
     read_base: u32,
     read_eval: bool,
     read_circular: bool,
@@ -3661,7 +3721,7 @@ fn read_vector_literal_with_base(
 fn read_vector_literal_sized(
     chars: &mut ReaderInput<'_>,
     mut pos: usize,
-    labels: &mut CircularLabels,
+    labels: &CircularLabels,
     read_base: u32,
     read_eval: bool,
     read_circular: bool,
@@ -3721,7 +3781,7 @@ fn read_vector_literal_sized(
 fn read_complex_literal(
     chars: &mut ReaderInput<'_>,
     pos: usize,
-    labels: &mut CircularLabels,
+    labels: &CircularLabels,
 ) -> Result<(EgclVal, usize), EgclError> {
     read_complex_literal_with_base(chars, pos, labels, 10, false, true, 0)
 }
@@ -3729,7 +3789,7 @@ fn read_complex_literal(
 fn read_complex_literal_with_base(
     chars: &mut ReaderInput<'_>,
     pos: usize,
-    labels: &mut CircularLabels,
+    labels: &CircularLabels,
     read_base: u32,
     read_eval: bool,
     read_circular: bool,
@@ -3964,7 +4024,7 @@ fn skip_block_comment(chars: &mut ReaderInput<'_>, mut pos: usize) -> Result<usi
 fn read_feature_expr(
     chars: &mut ReaderInput<'_>,
     pos: usize,
-    labels: &mut CircularLabels,
+    labels: &CircularLabels,
     include_if_present: bool,
 ) -> Result<(EgclVal, usize), EgclError> {
     read_feature_expr_with_base(
@@ -3992,7 +4052,7 @@ struct ReaderOptions {
 fn read_feature_expr_with_base(
     chars: &mut ReaderInput<'_>,
     mut pos: usize,
-    labels: &mut CircularLabels,
+    labels: &CircularLabels,
     include_if_present: bool,
     options: ReaderOptions,
 ) -> Result<(EgclVal, usize), EgclError> {
@@ -4573,7 +4633,7 @@ fn eval_read_time_arithmetic(op: &str, args: EgclVal) -> Result<EgclVal, EgclErr
 fn read_pathname_literal(
     chars: &mut ReaderInput<'_>,
     pos: usize,
-    labels: &mut CircularLabels,
+    labels: &CircularLabels,
     read_base: u32,
     read_eval: bool,
     read_circular: bool,
@@ -4616,7 +4676,7 @@ fn read_pathname_literal(
 fn read_struct_literal(
     chars: &mut ReaderInput<'_>,
     pos: usize,
-    labels: &mut CircularLabels,
+    labels: &CircularLabels,
 ) -> Result<(EgclVal, usize), EgclError> {
     read_struct_literal_with_base(chars, pos, labels, 10, false, true, 0)
 }
@@ -4624,7 +4684,7 @@ fn read_struct_literal(
 fn read_struct_literal_with_base(
     chars: &mut ReaderInput<'_>,
     pos: usize,
-    labels: &mut CircularLabels,
+    labels: &CircularLabels,
     read_base: u32,
     read_eval: bool,
     read_circular: bool,

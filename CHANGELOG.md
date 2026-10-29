@@ -50,6 +50,10 @@
   structure redefinitions, preserving slot defaults and native layouts
   ([#841](https://github.com/atgreen/evergreen/pull/841)).
 
+- Recursive reader calls preserve shared and circular object labels across
+  custom reader macros and callable standard reader handlers
+  ([#837](https://github.com/atgreen/evergreen/pull/837)).
+
 - String and stream printers consistently honor `*PRINT-ARRAY*` for array
   layouts, and string printers render package objects through their print hook
   ([#830](https://github.com/atgreen/evergreen/pull/830)).
