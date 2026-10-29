@@ -879,7 +879,7 @@ fn read_nd_array_literal(
         )));
     }
     pos = skip_whitespace_and_comments(chars, pos)?;
-    let (mut contents, p) = read_token_with_base(
+    let (mut contents, p) = read_object_with_base(
         chars,
         pos,
         labels,
@@ -1720,6 +1720,35 @@ fn read_custom_dispatch_char(
     }
 }
 
+/// Read one object, retrying when a reader macro contributes zero values.
+/// Lists and vectors consume individual tokens so they can close after a silent
+/// macro; reader macros taking an operand must instead complete a recursive read.
+fn read_object_with_base(
+    chars: &mut ReaderInput<'_>,
+    mut pos: usize,
+    labels: &mut CircularLabels,
+    read_base: u32,
+    read_eval: bool,
+    read_circular: bool,
+    depth: usize,
+) -> Result<(EgclVal, usize), EgclError> {
+    loop {
+        let (value, next) = read_token_with_base(
+            chars,
+            pos,
+            labels,
+            read_base,
+            read_eval,
+            read_circular,
+            depth,
+        )?;
+        if value != MISSING {
+            return Ok((value, next));
+        }
+        pos = next;
+    }
+}
+
 fn read_token_with_base(
     chars: &mut ReaderInput<'_>,
     mut pos: usize,
@@ -1856,7 +1885,7 @@ fn read_token_with_base(
         // been given string syntax by SET-SYNTAX-FROM-CHAR.
         '"' => read_string(chars, pos + 1, ch),
         '\'' => {
-            let (mut val, p) = read_token_with_base(
+            let (mut val, p) = read_object_with_base(
                 chars,
                 pos + 1,
                 labels,
@@ -1881,7 +1910,7 @@ fn read_token_with_base(
         '`' => {
             let (mut val, p) = {
                 let _nested = BackquoteLevel::enter(1);
-                read_token_with_base(
+                read_object_with_base(
                     chars,
                     pos + 1,
                     labels,
@@ -1911,7 +1940,7 @@ fn read_token_with_base(
                 // `,@` splices; `,.` is the destructive-splice variant (CLHS
                 // 2.4.6) — append semantics are a conforming implementation and
                 // what iterate's `(progn ,.body)` skeleton needs (bliss-tzc2).
-                let (mut val, p) = read_token_with_base(
+                let (mut val, p) = read_object_with_base(
                     chars,
                     pos + 2,
                     labels,
@@ -1927,7 +1956,7 @@ fn read_token_with_base(
                 let uqs_sym = EgclVal::from_symbol_index(intern_symbol("EGCL::UNQUOTE-SPLICING"));
                 Ok((make_list(&[uqs_sym, val]), p))
             } else {
-                let (mut val, p) = read_token_with_base(
+                let (mut val, p) = read_object_with_base(
                     chars,
                     pos + 1,
                     labels,
@@ -2117,7 +2146,7 @@ fn read_list_with_base(
                 }
                 pos += 1;
                 pos = skip_whitespace_and_comments(chars, pos)?;
-                let (mut cdr_val, p) = read_token_with_base(
+                let (mut cdr_val, p) = read_object_with_base(
                     chars,
                     pos,
                     labels,
@@ -2727,9 +2756,7 @@ fn try_package_qualified(
                 let idx = intern_symbol(sym_name);
                 Ok(Some(EgclVal::from_symbol_index(idx)))
             }
-            "KEYWORD" => {
-                Ok(Some(intern_keyword_symbol(sym_name)))
-            }
+            "KEYWORD" => Ok(Some(intern_keyword_symbol(sym_name))),
             "EGCL" => {
                 let full = format!("EGCL::{}", sym_name);
                 let idx = intern_symbol(&full);
@@ -3013,9 +3040,7 @@ fn fits_fixnum(n: i64) -> bool {
 /// host resolves the dynamic variable and sets this before each toplevel
 /// read (bliss-un1x); marker-less and e/E-marked literals read in this
 /// format (CLHS 2.3.2.2 — `e` selects the DEFAULT format, not single).
-static READ_DEFAULT_FLOAT_DOUBLE: egcl_rt::execution_local::ExecutionLocal<
-    core::cell::Cell<bool>,
-> = unsafe {
+static READ_DEFAULT_FLOAT_DOUBLE: egcl_rt::execution_local::ExecutionLocal<core::cell::Cell<bool>> = unsafe {
     egcl_rt::execution_local::ExecutionLocal::new(|| const { core::cell::Cell::new(false) })
 };
 
@@ -3297,7 +3322,7 @@ fn read_sharpsign_with_base(
                 // the placeholder's post-GC address (bliss-wlf).
                 egcl_rt::rooted_ref!(_ph_root = &mut placeholder);
                 labels.labels.insert(num, placeholder);
-                let (val, p) = read_token_with_base(
+                let (val, p) = read_object_with_base(
                     chars,
                     pos,
                     labels,
@@ -3365,7 +3390,7 @@ fn read_sharpsign_with_base(
     }
     match dispatch {
         '\'' => {
-            let (mut val, p) = read_token_with_base(
+            let (mut val, p) = read_object_with_base(
                 chars,
                 pos,
                 labels,
@@ -3487,7 +3512,7 @@ fn read_sharpsign_with_base(
             if !read_eval {
                 return Err(EgclError::StreamError("*READ-EVAL* is false".into()));
             }
-            let (mut form, p) = read_token_with_base(
+            let (mut form, p) = read_object_with_base(
                 chars,
                 pos,
                 labels,
@@ -3593,7 +3618,16 @@ fn read_vector_literal_with_base(
     read_circular: bool,
     depth: usize,
 ) -> Result<(EgclVal, usize), EgclError> {
-    read_vector_literal_sized(chars, pos, labels, read_base, read_eval, read_circular, depth, None)
+    read_vector_literal_sized(
+        chars,
+        pos,
+        labels,
+        read_base,
+        read_eval,
+        read_circular,
+        depth,
+        None,
+    )
 }
 
 /// `#(…)` / `#n(…)`. With a length n the elements supplied may not exceed n, at
@@ -3620,9 +3654,8 @@ fn read_vector_literal_sized(
         }
         if chars.at(pos)? == ')' {
             if let Some(n) = size {
-                let n = usize::try_from(n).map_err(|_| {
-                    EgclError::StreamError("illegal #n( length: too large".into())
-                })?;
+                let n = usize::try_from(n)
+                    .map_err(|_| EgclError::StreamError("illegal #n( length: too large".into()))?;
                 if elements.len() > n {
                     return Err(EgclError::StreamError(
                         "illegal #n(: more elements than the length allows".into(),
@@ -3671,55 +3704,38 @@ fn read_complex_literal(
 
 fn read_complex_literal_with_base(
     chars: &mut ReaderInput<'_>,
-    mut pos: usize,
+    pos: usize,
     labels: &mut CircularLabels,
     read_base: u32,
     read_eval: bool,
     read_circular: bool,
     depth: usize,
 ) -> Result<(EgclVal, usize), EgclError> {
-    pos = skip_whitespace_and_comments(chars, pos)?;
-    if !chars.has(pos)? || chars.at(pos)? != '(' {
-        return Err(EgclError::StreamError("expected ( after #C".into()));
-    }
-    pos += 1;
-    pos = skip_whitespace_and_comments(chars, pos)?;
-    let (mut real, p) = read_token_with_base(
+    let (contents, end) = read_object_with_base(
         chars,
         pos,
         labels,
         read_base,
         read_eval,
         read_circular,
-        depth + 1,
+        depth,
     )?;
-    // Root `real` across the second component's read, which allocates and can
-    // fire a relocating minor GC (bliss-wlf).
-    egcl_rt::rooted_ref!(_real_root = &mut real);
-    pos = skip_whitespace_and_comments(chars, p)?;
-    let (mut imag, p) = read_token_with_base(
-        chars,
-        pos,
-        labels,
-        read_base,
-        read_eval,
-        read_circular,
-        depth + 1,
-    )?;
-    egcl_rt::rooted_ref!(_imag_root = &mut imag);
-    pos = skip_whitespace_and_comments(chars, p)?;
-    if !chars.has(pos)? || chars.at(pos)? != ')' {
-        return Err(EgclError::StreamError(
-            "expected ) after #C(real imag".into(),
-        ));
+    egcl_rt::rooted!(contents = contents);
+    if !contents.is_cons() {
+        return Err(EgclError::StreamError("expected two components after #C".into()));
     }
-    Ok((alloc_complex(real, imag), pos + 1))
+    let (real, rest) = cons_parts(*contents);
+    if !rest.is_cons() {
+        return Err(EgclError::StreamError("expected two components after #C".into()));
+    }
+    let (imag, end_of_list) = cons_parts(rest);
+    if end_of_list != NIL {
+        return Err(EgclError::StreamError("expected two components after #C".into()));
+    }
+    Ok((alloc_complex(real, imag), end))
 }
 
-fn read_bit_vector(
-    chars: &mut ReaderInput<'_>,
-    pos: usize,
-) -> Result<(EgclVal, usize), EgclError> {
+fn read_bit_vector(chars: &mut ReaderInput<'_>, pos: usize) -> Result<(EgclVal, usize), EgclError> {
     read_bit_vector_sized(chars, pos, None)
 }
 
@@ -3960,7 +3976,7 @@ fn read_feature_expr_with_base(
     // such as (or sbcl ccl), with bare symbols interned in KEYWORD.
     let (feature, p) = {
         let _keyword_package = FeatureExpressionRead::enter();
-        read_token_with_base(
+        read_object_with_base(
             chars,
             pos,
             labels,
@@ -3975,7 +3991,7 @@ fn read_feature_expr_with_base(
 
     if (include_if_present && feature_present) || (!include_if_present && !feature_present) {
         // Include the next form
-        read_token_with_base(
+        read_object_with_base(
             chars,
             pos,
             labels,
@@ -4549,8 +4565,15 @@ fn read_pathname_literal(
     let (string_val, end) = if chars.at(pos)? == '"' {
         read_string(chars, pos + 1, '"')?
     } else {
-        let (val, end) =
-            read_token_with_base(chars, pos, labels, read_base, read_eval, read_circular, depth)?;
+        let (val, end) = read_object_with_base(
+            chars,
+            pos,
+            labels,
+            read_base,
+            read_eval,
+            read_circular,
+            depth,
+        )?;
         if val == EOF {
             return Err(EgclError::StreamError("unexpected end after #P".into()));
         }
@@ -4576,65 +4599,41 @@ fn read_struct_literal(
 
 fn read_struct_literal_with_base(
     chars: &mut ReaderInput<'_>,
-    mut pos: usize,
+    pos: usize,
     labels: &mut CircularLabels,
     read_base: u32,
     read_eval: bool,
     read_circular: bool,
     depth: usize,
 ) -> Result<(EgclVal, usize), EgclError> {
-    // #S(name slot-key slot-value ...) — parse struct literal
-    pos = skip_whitespace_and_comments(chars, pos)?;
-    if !chars.has(pos)? || chars.at(pos)? != '(' {
-        return Err(EgclError::StreamError("expected ( after #S".into()));
-    }
-    pos += 1;
-    pos = skip_whitespace_and_comments(chars, pos)?;
-    if !chars.has(pos)? {
-        return Err(EgclError::StreamError("unterminated #S literal".into()));
-    }
-    if chars.at(pos)? == ')' {
-        return Err(EgclError::StreamError("#S() requires a struct name".into()));
-    }
-    // Read struct name
-    let (mut name_val, p) = read_token_with_base(
+    let (contents, end) = read_object_with_base(
         chars,
         pos,
         labels,
         read_base,
         read_eval,
         read_circular,
-        depth + 1,
+        depth,
     )?;
-    // Root the name and the accumulating slot values across the remaining
-    // reads, each of which allocates and can fire a relocating minor GC
-    // (bliss-wlf).
-    egcl_rt::rooted_ref!(_name_root = &mut name_val);
-    pos = p;
-    // Read remaining slot key-value pairs as a flat list
-    egcl_rt::rooted!(slots = Vec::new());
-    loop {
-        pos = skip_whitespace_and_comments(chars, pos)?;
-        if !chars.has(pos)? {
-            return Err(EgclError::StreamError("unterminated #S literal".into()));
+    egcl_rt::rooted!(contents = contents);
+    egcl_rt::rooted!(parts = Vec::new());
+    let mut seen = HashSet::new();
+    let mut rest = *contents;
+    while rest.is_cons() {
+        if !seen.insert(rest.0) {
+            return Err(EgclError::StreamError("circular #S contents".into()));
         }
-        if chars.at(pos)? == ')' {
-            pos += 1;
-            break;
-        }
-        let (val, p) = read_token_with_base(
-            chars,
-            pos,
-            labels,
-            read_base,
-            read_eval,
-            read_circular,
-            depth + 1,
-        )?;
-        slots.push(val);
-        pos = p;
+        let (item, tail) = cons_parts(rest);
+        parts.push(item);
+        rest = tail;
     }
-    Ok((alloc_structure(name_val, &slots), pos))
+    if rest != NIL {
+        return Err(EgclError::StreamError("expected proper list after #S".into()));
+    }
+    if parts.is_empty() {
+        return Err(EgclError::StreamError("#S() requires a struct name".into()));
+    }
+    Ok((alloc_structure(parts[0], &parts[1..]), end))
 }
 
 // ── Readtable operations ──────────────────────────────────────────
