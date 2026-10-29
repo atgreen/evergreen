@@ -47409,7 +47409,7 @@ fn format_values(
             } else {
                 0
             };
-            egcl_stdlib::format::format_to_layout_at_column(&fs, &av, start_column)
+            egcl_stdlib::format::format_to_layout_in_context(&fs, &av, start_column, true)
         })();
         PRINT_ENV.with(|c| c.set(prev_env));
         let doc = match result {
