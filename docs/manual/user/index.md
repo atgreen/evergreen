@@ -10,6 +10,7 @@ running Lisp, defining a function, and passing arguments to a script.
 - [Save an executable](how-to/save-executable.md) with your application loaded.
 - [Build for another platform](how-to/cross-build.md) using Fedora target packages.
 - [Build an Android app](how-to/android.md) using the EGL project template.
+- [Create an experimental iOS app](how-to/ios.md) with a host-linked T0 worker.
 
 ## Look things up
 
