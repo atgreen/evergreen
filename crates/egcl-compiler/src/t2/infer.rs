@@ -28,16 +28,18 @@
 //! block parameters, where a fact must hold on every incoming edge, and when
 //! accumulating a result across iterations. `ty_meet` moves down
 //! (intersection of bits and ranges, class id from either side) and is used
-//! for guard and branch narrowing, where both facts hold. `ty_widen` saturates
-//! a bound that is still growing to `i64::MIN`/`i64::MAX` so loops with
-//! non-constant trip counts terminate.
+//! for guard and branch narrowing, where both facts hold. `ty_widen` moves a
+//! loop-header bound that is still growing to the fixnum bound, then to
+//! `i64::MIN`/`i64::MAX`, so the ascending chain terminates.
 //!
 //! # Algorithm
 //!
 //! 1. Seed the parameters of predecessor-less blocks (the entry; an OSR entry
 //!    region) from their declared types.
-//! 2. Iterate up to `MAX_PASSES` times over reverse postorder; widening is
-//!    switched on after `WIDEN_AFTER` passes. Each pass:
+//! 2. Iterate over reverse postorder until no fact changes (at most
+//!    `MAX_PASSES` times). From pass `WIDEN_AFTER` on, the parameters of loop
+//!    headers — targets of retreating edges, which every cycle contains — are
+//!    widened. Each pass:
 //!    1. Collect `check_refine[B]`, the narrowings of every
 //!       `Guard` with a `TypeTag`/`StringLayout` in block `B`.
 //!    2. For each block: join its parameters over predecessor edge
@@ -53,8 +55,14 @@
 //!       unique edge into `T` from a fixnum comparison (`!=` yields nothing).
 //!       Producing these before visiting successors avoids permanently joining
 //!       coarse results before the comparison's constant bounds are known.
-//!    3. Stop early when no fact changed.
-//! 3. Derive representations: a fact confined to fixnum, single-float or
+//!    3. Stop when no fact changed.
+//! 3. Narrow, if a widening step fired (otherwise the ascent already reached
+//!    the least fixpoint): up to `NARROWING_PASSES` more passes in which every fact is
+//!    recomputed rather than joined with its previous value (parameters still
+//!    join their entry/OSR seed). Starting from a post-fixpoint, each such pass
+//!    stays sound and recovers what widening discarded: the edge refinement
+//!    `i < 10` bounds the body's `i + 1`, and so the header's `i`, again.
+//! 4. Derive representations: a fact confined to fixnum, single-float or
 //!    double-float bits becomes the corresponding unboxed representation,
 //!    anything else `Tagged`.
 //!
@@ -85,10 +93,10 @@
 //!   Speculation reifies guards as fresh SSA values for that reason.
 //! * Range tracking covers add, sub, mul and neg only.
 //! * Class ids are propagated but never derived here.
-//! * Fixed iteration budget (`WIDEN_AFTER` = 400, then 8 widened passes);
-//!   a function that has not converged by then discards unfinished facts to
-//!   TOP before representation selection or scoped replay. An ascending prefix
-//!   is not necessarily a sound final over-approximation.
+//! * Widening plus narrowing can be less precise than the least fixpoint where
+//!   a bound is carried around a loop without a comparison that re-establishes
+//!   it. The ascending phase is capped at `MAX_PASSES`; a function that has
+//!   not converged by then discards unfinished facts to TOP and is not narrowed.
 //!
 //! # Debugging
 //!
@@ -263,13 +271,26 @@ fn ty_meet(a: IRType, b: IRType) -> IRType {
     }
 }
 
-/// Widening (▽): once past the iteration threshold, extend a still-growing bound
-/// to saturation so the ascending chain terminates. Sound (over-approximates).
+/// Widening (▽): extend a still-growing bound to the next threshold — the
+/// fixnum bound, then saturation — so the ascending chain terminates. Sound
+/// (over-approximates); narrowing recovers precision afterwards.
 fn ty_widen(old: IRType, new: IRType) -> IRType {
     let range = match (old.range, new.range) {
         (Some(o), Some(n)) => Some(Range {
-            lo: if n.lo < o.lo { i64::MIN } else { o.lo },
-            hi: if n.hi > o.hi { i64::MAX } else { o.hi },
+            lo: if n.lo >= o.lo {
+                o.lo
+            } else if n.lo >= FIXNUM_BOUNDS.lo {
+                FIXNUM_BOUNDS.lo
+            } else {
+                i64::MIN
+            },
+            hi: if n.hi <= o.hi {
+                o.hi
+            } else if n.hi <= FIXNUM_BOUNDS.hi {
+                FIXNUM_BOUNDS.hi
+            } else {
+                i64::MAX
+            },
         }),
         _ => new.range,
     };
@@ -721,10 +742,35 @@ impl Facts {
     }
 }
 
-/// Past this many full passes, switch on widening so non-constant loop bounds
-/// terminate. Constant-bounded loops used in practice converge well before this.
-const WIDEN_AFTER: usize = 400;
-const MAX_PASSES: usize = WIDEN_AFTER + 8;
+/// Loop-header parameters are widened from this pass on. A loop accumulator
+/// never converges without widening, so the former 400-pass delay made every
+/// loop pay all 400 passes (97% of inference time under `EGCL_FORCE_TIER=t2`).
+const WIDEN_AFTER: usize = 2;
+/// Hard cap on ascending passes. Widening at every loop header bounds the
+/// chain well below this; reaching it means the facts are not a post-fixpoint,
+/// so narrowing is skipped.
+const MAX_PASSES: usize = 64;
+/// Descending passes from the post-fixpoint, to recover bounds that widening
+/// discarded (`i ∈ [0, 10]` for `i < 10` rather than the widened fixnum range).
+const NARROWING_PASSES: usize = 2;
+
+/// Targets of retreating edges in reverse postorder. Every CFG cycle, even an
+/// irreducible one, contains such an edge, so widening these parameters alone
+/// terminates the ascending chain.
+fn loop_headers(rpo: &[Block], predecessors: &[Vec<Block>]) -> HashSet<Block> {
+    let mut order = HashMap::new();
+    for (index, &b) in rpo.iter().enumerate() {
+        order.insert(b, index);
+    }
+    rpo.iter()
+        .copied()
+        .filter(|b| {
+            predecessors[b.index()]
+                .iter()
+                .any(|p| order.get(p).is_some_and(|&pi| pi >= order[b]))
+        })
+        .collect()
+}
 
 /// A fresh BYTE descriptor may be mutable in this implementation. Infer an
 /// LDB result only while that descriptor has one executable consumer, crosses
@@ -967,11 +1013,24 @@ pub fn infer_for_sites(f: &Function, sites: &[Inst]) -> InferenceResult {
     let check_refine = check_refinements(f, &rpo);
     timings.checks_ns = InferenceTimings::elapsed(checks_start);
     let fixpoint_start = timings.clock();
+    let headers = loop_headers(&rpo, &predecessors);
+    // Parameter facts that hold independent of any IR edge (entry declarations,
+    // OSR imports). Narrowing recomputes parameters from their edges, so it
+    // must keep joining these in.
+    let seeds = g.0.clone();
+    let mut narrowing: Option<usize> = None;
+    // Without a widening step the ascent reached the least fixpoint exactly,
+    // and narrowing has nothing to recover.
+    let mut widened = false;
 
     let mut converged = false;
-    for pass in 0..MAX_PASSES {
+    for pass in 0.. {
+        if narrowing.is_none() && pass >= MAX_PASSES {
+            break;
+        }
         if timings.start.is_some() { timings.passes += 1; }
-        let widen = pass >= WIDEN_AFTER;
+        let widen = narrowing.is_none() && pass >= WIDEN_AFTER;
+        let narrow = narrowing.is_some();
         let mut changed = false;
 
         // Recompute branch/guard refinements against the current facts. A
@@ -1002,8 +1061,18 @@ pub fn infer_for_sites(f: &Function, sites: &[Inst]) -> InferenceResult {
                         }
                     }
                     let old = g.get(p);
-                    let joined = ty_join(old, acc);
-                    let next = if widen { ty_widen(old, joined) } else { joined };
+                    let next = if narrow {
+                        ty_join(seeds.get(&p).copied().unwrap_or(IRType::BOTTOM), acc)
+                    } else {
+                        let joined = ty_join(old, acc);
+                        if widen && headers.contains(&b) {
+                            let next = ty_widen(old, joined);
+                            widened |= next != joined;
+                            next
+                        } else {
+                            joined
+                        }
+                    };
                     if next != old {
                         g.0.insert(p, next);
                         changed = true;
@@ -1056,7 +1125,7 @@ pub fn infer_for_sites(f: &Function, sites: &[Inst]) -> InferenceResult {
                         res
                     };
                     let old = g.get(rv);
-                    let joined = ty_join(old, res);
+                    let joined = if narrow { res } else { ty_join(old, res) };
                     if joined != old {
                         g.0.insert(rv, joined);
                         changed = true;
@@ -1076,10 +1145,18 @@ pub fn infer_for_sites(f: &Function, sites: &[Inst]) -> InferenceResult {
             timings.edge_ns += InferenceTimings::elapsed(edge_start);
         }
 
-        if !changed {
+        if narrowing.is_none() && !changed {
             converged = true;
-            break;
         }
+        // Descending from a post-fixpoint stays above the least fixpoint, so
+        // stopping after any narrowing pass is sound.
+        narrowing = match narrowing {
+            None if changed => None,
+            None if !widened => break,
+            None => Some(NARROWING_PASSES),
+            Some(left) if changed && left > 1 => Some(left - 1),
+            Some(_) => break,
+        };
     }
 
     if !converged {
@@ -2713,6 +2790,95 @@ mod tests {
         assert_eq!(r.range(i1[0]), Some(Range { lo: 1, hi: 10 }));
         assert_eq!(r.repr(i), Some(ValueRepresentation::UnboxedFixnum));
     }
+
+    #[test]
+    fn widened_accumulator_keeps_counted_index_exact() {
+        // for (i = 0, s = 0; i < 10; i++) s += i — `s` grows on every pass, so
+        // only header widening terminates the ascent; narrowing restores `i`.
+        let mut f = Function::new("sum-loop");
+        let e = f.entry();
+        let header = f.make_block();
+        let i = f.add_block_param(header, fixnum(), ValueRepresentation::UnboxedFixnum);
+        let s = f.add_block_param(header, fixnum(), ValueRepresentation::UnboxedFixnum);
+        let body = f.make_block();
+        let exit = f.make_block();
+        let zero = const_fixnum(&mut f, e, 0);
+        let bound = const_fixnum(&mut f, e, 10);
+        f.set_terminator(
+            e,
+            InstData {
+                targets: vec![BlockCall {
+                    block: header,
+                    args: vec![zero, zero],
+                }],
+                ..inst(Opcode::Jump)
+            },
+        );
+        let (_, cond) = f.push_inst(
+            header,
+            InstData {
+                args: vec![i, bound],
+                ..inst(Opcode::FixnumCmpLt)
+            },
+            &[(fixnum(), ValueRepresentation::Tagged)],
+        );
+        f.set_terminator(
+            header,
+            InstData {
+                args: vec![cond[0]],
+                targets: vec![
+                    BlockCall {
+                        block: body,
+                        args: vec![],
+                    },
+                    BlockCall {
+                        block: exit,
+                        args: vec![],
+                    },
+                ],
+                ..inst(Opcode::Brif)
+            },
+        );
+        let one = const_fixnum(&mut f, body, 1);
+        let (_, i1) = f.push_inst(
+            body,
+            InstData {
+                args: vec![i, one],
+                ..inst(Opcode::FixnumAdd)
+            },
+            &[(fixnum(), ValueRepresentation::UnboxedFixnum)],
+        );
+        let (_, s1) = f.push_inst(
+            body,
+            InstData {
+                args: vec![s, i],
+                ..inst(Opcode::FixnumAdd)
+            },
+            &[(fixnum(), ValueRepresentation::UnboxedFixnum)],
+        );
+        f.set_terminator(
+            body,
+            InstData {
+                targets: vec![BlockCall {
+                    block: header,
+                    args: vec![i1[0], s1[0]],
+                }],
+                ..inst(Opcode::Jump)
+            },
+        );
+        f.set_terminator(exit, ret());
+
+        let r = infer(&f);
+        assert_eq!(r.range(i), Some(Range { lo: 0, hi: 10 }));
+        assert_eq!(r.range(i1[0]), Some(Range { lo: 1, hi: 10 }));
+        // The accumulator has no re-establishing comparison: it stays widened,
+        // but its lower bound and fixnum tag survive.
+        assert_eq!(r.ty(s).bits, TypeBits::FIXNUM);
+        let sr = r.range(s).expect("accumulator keeps a range");
+        assert_eq!(sr.lo, 0);
+        assert!(sr.hi >= 45, "widened bound must cover the real sum");
+    }
+
     #[test]
     fn exhausted_ascent_discards_long_phi_type_guesses() {
         use crate::t2::frame_state::{FrameScope, FrameState, ValueSource};
