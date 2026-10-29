@@ -14,6 +14,9 @@
 - `GENSYM` uses decimal suffixes independently of printer controls and avoids
   recursive pretty-printer calls while generating symbol names
   ([#834](https://github.com/atgreen/evergreen/pull/834)).
+- `WRITE` and `WRITE-TO-STRING` honor the leftmost duplicate printer keyword,
+  including explicit `NIL` controls
+  ([#829](https://github.com/atgreen/evergreen/pull/829)).
 
 - `*PRINT-CIRCLE*` preserves shared arrays and uninterned symbols, and prints
   cycles through vectors and multidimensional arrays without runaway expansion
