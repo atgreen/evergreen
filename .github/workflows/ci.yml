@@ -140,7 +140,7 @@ jobs:
           BUILD_TARGET: ${{ matrix.config.target }}
           BUILD_FEATURES: ${{ matrix.config.features }}
           CI_SUITE: ${{ needs.plan.outputs.full == 'true' && 'full' || 'fast' }}
-          CI_SHARDS: ${{ needs.plan.outputs.full == 'true' && '8' || '1' }}
+          CI_SHARDS: ${{ needs.plan.outputs.full == 'true' && '8' || '2' }}
           CI_AREAS: ${{ needs.plan.outputs.areas }}
           EGCL_MEM_MAX: 6G
           EGCL_TIMEOUT: 1200
@@ -183,7 +183,7 @@ jobs:
       max-parallel: 8
       matrix:
         config: ${{ fromJSON(needs.plan.outputs.full == 'true' && '["musl","gnu"]' || '["musl"]') }}
-        shard: ${{ fromJSON(needs.plan.outputs.full == 'true' && '[0,1,2,3,4,5,6,7]' || '[0]') }}
+        shard: ${{ fromJSON(needs.plan.outputs.full == 'true' && '[0,1,2,3,4,5,6,7]' || '[0,1]') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -206,7 +206,7 @@ jobs:
         env:
           CI_SHARD: ${{ matrix.shard }}
           EGCL_MEM_MAX: 6G
-          EGCL_TIMEOUT: ${{ needs.plan.outputs.full == 'true' && '2400' || '600' }}
+          EGCL_TIMEOUT: ${{ needs.plan.outputs.full == 'true' && '2400' || '1200' }}
         run: scripts/egcl-limited.sh python3 scripts/ci-tests.py run --manifest target/ci-tests/manifest.json --shard "$CI_SHARD" --results "target/ci-tests/results-$CI_SHARD.json"
       - name: Preserve timings and failure evidence
         if: always()
