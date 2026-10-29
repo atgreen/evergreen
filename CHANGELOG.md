@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- Recursive macro expansion preserves `THE` type specifiers while expanding
+  their value forms, so compound type assertions accept valid arguments
+  ([#860](https://github.com/atgreen/evergreen/pull/860)).
+
 - `PRINC` and FORMAT aesthetic output expose the correct printer controls to
   callbacks and restore prior bindings across conditions and nonlocal transfers
   ([#836](https://github.com/atgreen/evergreen/pull/836)).
