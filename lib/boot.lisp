@@ -1309,14 +1309,9 @@
   (cond ((char= char #\;) (read-line stream nil nil) (values))
         ((char= char #\)) (error 'reader-error :stream stream))
         ((char= char #\#)
-         ;; The dispatching character: an optional decimal argument, the
-         ;; sub-character, then that sub-character's standard reader below.
-         (let ((arg nil) (sub nil))
-           (loop (let ((c (read-char stream t nil t)))
-                   (if (digit-char-p c)
-                       (setq arg (+ (* 10 (or arg 0)) (digit-char-p c)))
-                       (progn (setq sub c) (return)))))
-           (egcl::%standard-dispatch-reader-macro stream sub arg)))
+         ;; Dispatching syntax consults the caller's sub-character table,
+         ;; including custom feature readers, rather than forcing builtins.
+         (egcl::%dispatch-macro-reader stream char))
         (t (let ((*readtable* (or egcl::*standard-readtable-for-macro-functions*
                                   (setq egcl::*standard-readtable-for-macro-functions*
                                         (copy-readtable nil))))
