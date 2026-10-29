@@ -968,13 +968,14 @@ thread_local! {
 /// directives.
 fn push_non_integer_in_radix(
     output: &mut LayoutDoc,
-    val: EgclVal,
+    mut val: EgclVal,
     radix: u32,
     mincol: usize,
     padchar: char,
 ) {
+    egcl_rt::rooted_ref!(_val_root = &mut val);
     let prev = PRINT_BASE_OVERRIDE.with(|c| c.replace(radix));
-    let text = egclval_to_print_string(val, false);
+    let text = with_princ_bindings(|| egclval_to_print_string(val, false));
     PRINT_BASE_OVERRIDE.with(|c| c.set(prev));
     push_padded_left(output, &text, mincol, padchar);
 }
@@ -2015,7 +2016,9 @@ fn egclval_to_print_body(mut v: EgclVal, escapep: bool) -> String {
     format!("#<object {:?}>", v)
 }
 
-fn print_value_layout(output: &mut LayoutDoc, value: EgclVal, escapep: bool) -> LayoutDoc {
+fn print_value_layout(output: &mut LayoutDoc, mut value: EgclVal, escapep: bool) -> LayoutDoc {
+    // A declining pretty hook can allocate before the ordinary fallback.
+    egcl_rt::rooted_ref!(_value_root = &mut value);
     if let Some(doc) = dispatch_pprint_layout(value, escapep, output.current_column()) {
         doc
     } else {
@@ -2865,6 +2868,14 @@ impl Drop for PrintDynamicBinding {
     fn drop(&mut self) {
         egcl_rt::symbols::restore_symbol_binding(self.index, self.saved);
     }
+}
+
+/// PRINC and FORMAT's aesthetic operations bind actual Lisp-visible specials.
+/// Root saved bindings: generalized booleans may be movable heap values.
+pub fn with_princ_bindings<R>(body: impl FnOnce() -> R) -> R {
+    egcl_rt::rooted!(_escape = PrintDynamicBinding::establish("*PRINT-ESCAPE*", NIL));
+    egcl_rt::rooted!(_readably = PrintDynamicBinding::establish("*PRINT-READABLY*", NIL));
+    body()
 }
 
 /// A semantic operation in a queued pretty-print document.
@@ -3831,15 +3842,18 @@ fn format_impl(
                     }
                     return Err(EgclError::ControlError("too few args for ~A".into()));
                 }
-                let val = args[*arg_idx];
+                let mut val = args[*arg_idx];
+                egcl_rt::rooted_ref!(_val_root = &mut val);
                 *arg_idx += 1;
-                let doc = if colon && val.is_nil() {
-                    let mut doc = LayoutDoc::default();
-                    doc.text("()");
-                    doc
-                } else {
-                    print_value_layout(output, val, false)
-                };
+                let doc = with_princ_bindings(|| {
+                    if colon && val.is_nil() {
+                        let mut doc = LayoutDoc::default();
+                        doc.text("()");
+                        doc
+                    } else {
+                        print_value_layout(output, val, false)
+                    }
+                });
                 pad_layout_field(output, doc, mincol, colinc, minpad, padchar, at_sign);
             }
             'S' => {
@@ -4076,13 +4090,14 @@ fn format_impl(
                 if *arg_idx >= args.len() {
                     return Err(EgclError::ControlError("too few args for ~F".into()));
                 }
-                let val = args[*arg_idx];
+                let mut val = args[*arg_idx];
+                egcl_rt::rooted_ref!(_val_root = &mut val);
                 *arg_idx += 1;
                 // A non-number prints as ~wD (CLHS 22.3.3.1).
                 if !egcl_rt::types::numberp(val) || egcl_rt::types::complexp(val) {
                     push_padded_left(
                         output,
-                        &egclval_to_print_string(val, false),
+                        &with_princ_bindings(|| egclval_to_print_string(val, false)),
                         w_opt.unwrap_or(0),
                         pad_char,
                     );

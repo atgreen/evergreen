@@ -364,12 +364,14 @@ fn resolve(name: &str) -> Option<Handler> {
             if args.is_empty() {
                 return Err(EgclError::ProgramError("PRINC requires an object".into()));
             }
-            let mut s = String::new();
-            princ_val_env(args[0], env, &mut s);
-            let stream = if args.len() > 1 { args[1] } else { NIL };
-            let out = resolve_output_stream(stream, env);
-            write_str_to(out, &s, env)?;
-            Ok(args[0])
+            egcl_stdlib::format::with_princ_bindings(|| {
+                let mut s = String::new();
+                princ_val_env(args[0], env, &mut s);
+                let stream = if args.len() > 1 { args[1] } else { NIL };
+                let out = resolve_output_stream(stream, env);
+                write_str_to(out, &s, env)?;
+                Ok(args[0])
+            })
         }),
 
         "PRIN1" => Some(|_operator, args, env| {
@@ -417,7 +419,8 @@ fn resolve(name: &str) -> Option<Handler> {
                     "READABLY", "RIGHT-MARGIN",
                 ],
             )?;
-            let mut bindings: Vec<DynBind> = Vec::new();
+            // Printer callbacks allocate while prior special values are saved.
+            egcl_rt::rooted!(bindings = Vec::<DynBind>::new());
             let mut seen = std::collections::HashSet::new();
             let mut i = 1;
             while i + 1 < args.len() {

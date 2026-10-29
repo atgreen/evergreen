@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- `PRINC` and FORMAT aesthetic output expose the correct printer controls to
+  callbacks and restore prior bindings across conditions and nonlocal transfers
+  ([#836](https://github.com/atgreen/evergreen/pull/836)).
+
 - Compiled printer calls preserve callback conditions, restarts, and nonlocal
   transfers without leaking errors into later operations
   ([#835](https://github.com/atgreen/evergreen/pull/835)).

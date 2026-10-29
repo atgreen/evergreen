@@ -51197,3 +51197,6 @@ mod print_circle_gc_tests;
 
 #[cfg(test)]
 mod printer_error_gc_tests;
+
+#[cfg(test)]
+mod princ_binding_gc_tests;
