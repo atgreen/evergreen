@@ -38,7 +38,7 @@ pub mod random_state;
 pub mod symbols;
 /// Runtime OS services for Linux, Windows, and macOS.
 #[cfg_attr(windows, path = "syscall/windows.rs")]
-#[cfg_attr(target_os = "macos", path = "syscall/macos.rs")]
+#[cfg_attr(any(target_os = "macos", target_os = "ios"), path = "syscall/macos.rs")]
 pub mod syscall;
 pub mod types;
 pub mod value;
@@ -128,3 +128,8 @@ pub use thread::{
     thread_is_carrier, thread_name, thread_yield, with_current_condition_state_mut,
 };
 pub use value::EgclVal;
+
+#[cfg(all(target_os = "ios", not(target_arch = "aarch64")))]
+compile_error!(
+    "the initial iOS T0 runtime profile supports ARM64 device and simulator targets only"
+);

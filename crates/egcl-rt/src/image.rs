@@ -75,6 +75,9 @@ pub enum Os {
     /// tests assert that number; neither tag has shipped, so the numbering is
     /// arbitrary beyond staying stable from here on.
     Android = 5,
+    /// Device and simulator use distinct SDK/runtime environments.
+    Ios = 6,
+    IosSimulator = 7,
 }
 
 /// Encode architecture and OS into a 64-bit platform tag.
@@ -109,6 +112,10 @@ pub fn current_platform_tag() -> u64 {
     let os = Os::Android;
     #[cfg(target_os = "macos")]
     let os = Os::MacOS;
+    #[cfg(all(target_os = "ios", not(egcl_ios_simulator)))]
+    let os = Os::Ios;
+    #[cfg(all(target_os = "ios", egcl_ios_simulator))]
+    let os = Os::IosSimulator;
     #[cfg(target_os = "freebsd")]
     let os = Os::FreeBSD;
     #[cfg(windows)]
@@ -117,6 +124,7 @@ pub fn current_platform_tag() -> u64 {
         target_os = "linux",
         target_os = "android",
         target_os = "macos",
+        target_os = "ios",
         target_os = "freebsd",
         windows
     )))]

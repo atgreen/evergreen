@@ -19,7 +19,7 @@ libc = { version = "0.2", optional = true }
 
 # The static ELF loader currently supports neither POWER nor IBM Z. These
 # targets use the system dynamic loader; their Linux ABI wrappers also use libc.
-[target.'cfg(all(unix, any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
+[target.'cfg(all(unix, not(target_os = "ios"), any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
 elf_loader = { version = "0.16", default-features = false, features = ["use-syscall", "version", "tls"] }
 
 [target.'cfg(any(target_os = "linux", not(target_arch = "x86_64")))'.dependencies]

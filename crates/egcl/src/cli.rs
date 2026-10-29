@@ -11497,8 +11497,10 @@ impl Env {
         features.push(resolve_sym(":LINUX").unwrap_or(NIL));
         #[cfg(target_os = "android")]
         features.push(resolve_sym(":ANDROID").unwrap_or(NIL));
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         features.push(resolve_sym(":DARWIN").unwrap_or(NIL));
+        #[cfg(target_os = "ios")]
+        features.push(resolve_sym(":IOS").unwrap_or(NIL));
         #[cfg(windows)]
         {
             features.push(resolve_sym(":WINDOWS").unwrap_or(NIL));

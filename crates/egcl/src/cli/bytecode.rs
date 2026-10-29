@@ -268,6 +268,7 @@ pub(super) fn forced_tier() -> Option<ForcedTier> {
             },
             Err(_) => None,
         }
+        .or_else(|| cfg!(target_os = "ios").then_some(ForcedTier::T0))
         .map(|tier| match tier {
             ForcedTier::T1 | ForcedTier::T2 if cfg!(egcl_no_t1) => ForcedTier::T0,
             ForcedTier::T2 if cfg!(egcl_no_t2) => ForcedTier::T1,
@@ -34693,3 +34694,15 @@ mod native_typep_identity_tests;
 
 #[cfg(test)]
 mod aux_entry_prologue_tests;
+
+#[cfg(all(test, target_os = "ios"))]
+mod ios_tier_profile_tests {
+    #[test]
+    fn native_requests_cannot_override_the_ios_tier_ceiling() {
+        assert!(matches!(
+            super::forced_tier(),
+            Some(super::ForcedTier::T0 | super::ForcedTier::Interp)
+        ));
+        assert_eq!(super::t1_threshold(), u32::MAX);
+    }
+}

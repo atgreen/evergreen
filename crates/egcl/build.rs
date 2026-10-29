@@ -125,7 +125,12 @@ fn configure_runtime() {
             .map(|b| format!("{b:02x}"))
             .collect(),
         builtins: None,
-        max_tier: runtime_contract::NativeTier::T2,
+        // iOS supports dynamic Lisp source/bytecode, never generated native code.
+        max_tier: if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("ios") {
+            runtime_contract::NativeTier::T0
+        } else {
+            runtime_contract::NativeTier::T2
+        },
         capabilities: runtime_contract::CAPABILITIES
             .iter()
             .map(|s| (*s).to_owned())
