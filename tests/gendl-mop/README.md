@@ -10,7 +10,9 @@ dependencies are `base` and `gendl-asdf`; UIOP comes with ASDF. Loading the full
 `gendl` system would bring unrelated geometry and web dependencies. The runner
 requires the actual 166/0 tally, preserves upstream assertions, and checks that
 all three systems came from the pinned local tree. Runtime downloads and
-inherited ASDF source registries are disabled.
+inherited ASDF source registries are disabled. The pinned monorepo is
+registered as a source tree so BASE can query other real system descriptions
+at read time; those systems and their components are not loaded.
 
 ## Run
 
@@ -61,9 +63,10 @@ system in the repository and discovers their unrelated dependencies.
 
 ## Validation status
 
-The GitLab pin and directory/ASD paths were checked against the official source
-and ocicl's documented Git-source/parser/restore implementation. The committed
-CSV was prepared from that source audit; a fresh ocicl restore and both runtime
-commands remain **unrun**. This is a reproducible validation scenario, not a
-claim that EGCL already passes the suite. Any later compatibility changes must
-live in an `atgreen` fork and be pinned here; never patch the downloaded tree.
+A fresh ocicl restore preserves the committed lockfile byte-for-byte. The
+scenario passes all 166 checks against the GNU/CFFI release built from
+`c66c4f465e870ebe0091d3d4990b9a875e0d8852` (binary SHA-256
+`c05a58e9bbd5d21a41dd72d3a56f37ff9e5d34266bcd0e15e3b0c83733374d54`).
+The independent SBCL command above remains unrun for this fresh scenario.
+Any later compatibility changes must live in an `atgreen` fork and be pinned
+here; never patch the downloaded tree.
