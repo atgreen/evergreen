@@ -271,6 +271,7 @@ fn lookup_string(val: EgclVal) -> Option<String> {
 /// Read string content, preferring the registry cache before decoding a real
 /// heap string (SIMPLE_BASE_STRING or SIMPLE_CHARACTER_STRING).
 fn component_string(val: EgclVal) -> Option<String> {
+    if crate::sequences::is_nil_sequence(val) && crate::sequences::length(val).ok() == Some(0) { return Some(String::new()); }
     lookup_string(val).or_else(|| {
         if val.is_string() {
             Some(val.as_string())
@@ -1106,14 +1107,7 @@ pub fn parse_namestring(
 
     // Accept an ordinary heap string not present in the pathname registry —
     // e.g. a namestring passed through a function call or built by FORMAT.
-    let s = lookup_string(thing)
-        .or_else(|| {
-            if thing.is_string() {
-                Some(thing.as_string())
-            } else {
-                None
-            }
-        })
+    let s = component_string(thing)
         .ok_or_else(|| EgclError::TypeError {
             datum: thing,
             expected: "string or pathname".to_string(),

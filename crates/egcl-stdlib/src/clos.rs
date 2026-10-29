@@ -2515,7 +2515,7 @@ pub fn class_of(object: EgclVal) -> EgclVal {
         // Was a hardcoded `from_fixnum(-23)` that bypassed the registry
         // entirely; it is just another standard class (bliss-rj5o).
         Some("HASH-TABLE")
-    } else if egcl_rt::types::stringp(object) {
+    } else if crate::sequences::is_nil_sequence(object) || egcl_rt::types::stringp(object) {
         Some("STRING")
     } else if egcl_rt::types::bit_vector_p(object) {
         Some("BIT-VECTOR")

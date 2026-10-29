@@ -17,6 +17,8 @@ use egcl_rt::lock_order::{
 
 #[cfg(all(test, target_arch = "x86_64", any(unix, windows)))]
 mod fiber_tests;
+#[cfg(test)]
+mod delegation_tests;
 use egcl_rt::object::{ObjectHeader, type_id};
 use egcl_rt::value::{EOF, NIL, T, EgclVal};
 
@@ -407,7 +409,7 @@ enum StreamInner {
         /// The stream was made with an element type that is a subtype of
         /// BASE-CHAR, so GET-OUTPUT-STREAM-STRING answers a BASE-STRING
         /// (CLHS MAKE-STRING-OUTPUT-STREAM; ansi WITH-OUTPUT-TO-STRING.8).
-        base: bool,
+        element: StringOutputElement,
     },
     FileInput {
         file: StreamHandle,
@@ -481,7 +483,12 @@ impl StreamMutableState {
             return Ok(());
         }
         match &mut self.inner {
-            StreamInner::StringOutput { buffer, line, col, .. } => {
+            StreamInner::StringOutput { buffer, line, col, element } => {
+                if *element == StringOutputElement::Nil {
+                    let datum = std::str::from_utf8(octets).ok().and_then(|text| text.chars().next()).map(EgclVal::from_char)
+                        .unwrap_or_else(|| EgclVal::from_fixnum(i64::from(octets[0])));
+                    return Err(EgclError::TypeError { datum, expected: "NIL".into() });
+                }
                 buffer.extend_from_slice(octets);
                 advance_line_col(octets, line, col);
                 Ok(())
@@ -1268,6 +1275,10 @@ fn file_flush_write_buf(file: &mut impl Write, write_buf: &mut Vec<u8>) -> Resul
 /// fixed-width layout). Owned because the on-heap elements are the type's
 /// fixed-width chars, not UTF-8 bytes.
 fn extract_string_str(val: EgclVal) -> Result<String, EgclError> {
+    if crate::sequences::is_nil_sequence(val) {
+        return if crate::sequences::length(val)? == 0 { Ok(String::new()) }
+            else { Err(EgclError::TypeError { datum: val, expected: "NIL".into() }) };
+    }
     if !val.is_heap_object() {
         return Err(EgclError::TypeError {
             datum: val,
@@ -1556,7 +1567,8 @@ impl GrayStream for StreamMutableState {
         let mut comps = self.components().to_vec();
         egcl_rt::rooted_ref!(_components_root = &mut comps);
         match &mut self.inner {
-            StreamInner::StringOutput { buffer, line, col, .. } => {
+            StreamInner::StringOutput { buffer, line, col, element } => {
+                if *element == StringOutputElement::Nil { return Err(EgclError::TypeError { datum: ch, expected: "NIL".into() }); }
                 let mut buf = [0u8; 4];
                 let encoded = c.encode_utf8(&mut buf);
                 buffer.extend_from_slice(encoded.as_bytes());
@@ -1696,7 +1708,8 @@ impl GrayStream for StreamMutableState {
         let mut comps = self.components().to_vec();
         egcl_rt::rooted_ref!(_components_root = &mut comps);
         match &mut self.inner {
-            StreamInner::StringOutput { buffer, line, col, .. } => {
+            StreamInner::StringOutput { buffer, line, col, element } => {
+                if *element == StringOutputElement::Nil { return Err(EgclError::TypeError { datum: byte, expected: "NIL".into() }); }
                 buffer.push(b);
                 if b == b'\n' {
                     *line += 1;
@@ -1793,7 +1806,8 @@ impl GrayStream for StreamMutableState {
         let mut comps = self.components().to_vec();
         egcl_rt::rooted_ref!(_components_root = &mut comps);
         match &mut self.inner {
-            StreamInner::StringOutput { buffer, line, col, .. } => {
+            StreamInner::StringOutput { buffer, line, col, element } => {
+                if *element == StringOutputElement::Nil && !slice.is_empty() { return Err(EgclError::TypeError { datum: EgclVal::from_char(str_slice.chars().next().unwrap()), expected: "NIL".into() }); }
                 buffer.extend_from_slice(slice);
                 for c in str_slice.chars() {
                     if c == '\n' {
@@ -2357,6 +2371,9 @@ pub fn make_lisp_base_string_fresh(s: &str) -> EgclVal {
 /// `s` normally come from `like` and so fit; the base-char check covers a
 /// caller that widened one.
 pub fn make_lisp_string_fresh_like(like: EgclVal, s: &str) -> EgclVal {
+    if crate::sequences::is_nil_sequence(like) && s.is_empty() {
+        return egcl_rt::nil_array::make(0).expect("empty nil string allocation");
+    }
     // `string_storage_is_base` looks through a displaced or adjustable string
     // to the storage that holds its characters, the same way
     // ARRAY-ELEMENT-TYPE does, so a copy of a string displaced onto a base
@@ -3226,6 +3243,16 @@ pub fn make_string_input_stream(
     ))
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum StringOutputElement { Character, BaseChar, Nil }
+
+/// Explicit public flavor; internal NIL-placeholder callers retain the
+/// historical CHARACTER default of make_string_output_stream.
+pub fn make_string_output_stream_with_element(element: StringOutputElement) -> Result<EgclVal, EgclError> {
+    Ok(alloc_stream(StreamElementType::Character,
+        StreamInner::StringOutput { buffer: Vec::new(), line: 0, col: 0, element }, vec![], None))
+}
+
 pub fn make_string_output_stream(_element_type: EgclVal) -> Result<EgclVal, EgclError> {
     make_string_output_stream_of(false)
 }
@@ -3234,22 +3261,12 @@ pub fn make_string_output_stream(_element_type: EgclVal) -> Result<EgclVal, Egcl
 /// SIMPLE-BASE-STRING when `base` (its element type is a subtype of BASE-CHAR)
 /// and a CHARACTER string otherwise.
 pub fn make_string_output_stream_of(base: bool) -> Result<EgclVal, EgclError> {
-    Ok(alloc_stream(
-        StreamElementType::Character,
-        StreamInner::StringOutput {
-            buffer: Vec::new(),
-            line: 0,
-            col: 0,
-            base,
-        },
-        vec![],
-        None,
-    ))
+    make_string_output_stream_with_element(if base { StringOutputElement::BaseChar } else { StringOutputElement::Character })
 }
 
 pub fn get_output_stream_string(stream: EgclVal) -> Result<EgclVal, EgclError> {
     with_stream(stream, |guard| match &mut guard.inner {
-        StreamInner::StringOutput { buffer, col, line, base } => {
+        StreamInner::StringOutput { buffer, col, line, element } => {
             let s = std::str::from_utf8(buffer)
                 .map_err(|_| EgclError::StreamError("invalid UTF-8 in output buffer".into()))?;
             // A fresh heap string: CLHS requires a new string, and an interned
@@ -3257,7 +3274,9 @@ pub fn get_output_stream_string(stream: EgclVal) -> Result<EgclVal, EgclError> {
             // (bliss-4due). It keeps the stream's element type: a BASE-CHAR
             // stream answers a SIMPLE-BASE-STRING (ansi WITH-OUTPUT-TO-STRING.8),
             // as long as everything written to it really is a base char.
-            let result = if *base && egcl_rt::object::is_all_base_char(s) {
+            let result = if *element == StringOutputElement::Nil {
+                egcl_rt::nil_array::make(0)?
+            } else if *element == StringOutputElement::BaseChar && egcl_rt::object::is_all_base_char(s) {
                 make_lisp_base_string_fresh(s)
             } else {
                 make_lisp_string_fresh(s)
@@ -3414,25 +3433,79 @@ pub fn stream_class_name(stream: EgclVal) -> Option<&'static str> {
 }
 
 pub fn input_stream_p(stream: EgclVal) -> bool {
+    let Ok(stream) = resolve_synonym_stream(stream, false) else {
+        return false;
+    };
     with_stream(stream, |guard| Ok(guard.is_input())).unwrap_or(false)
 }
 
 pub fn output_stream_p(stream: EgclVal) -> bool {
+    let Ok(stream) = resolve_synonym_stream(stream, false) else {
+        return false;
+    };
     with_stream(stream, |guard| Ok(guard.is_output())).unwrap_or(false)
 }
 
-pub fn stream_element_type(stream: EgclVal) -> EgclVal {
+/// Resolve the current binding without retaining a stream-state borrow. The
+/// visited handles are roots: mutex acquisition/release can admit collection.
+fn resolve_synonym_stream(stream: EgclVal, require_open: bool) -> Result<EgclVal, EgclError> {
     egcl_rt::rooted!(stream = stream);
-    match lock_stream(*stream) {
-        Ok(guard) => guard.element_type.to_code(),
-        Err(_) => NIL,
+    egcl_rt::rooted!(visited = Vec::<EgclVal>::new());
+    loop {
+        if get_stream_alloc(*stream)?.components.is_empty() {
+            return Ok(*stream);
+        }
+        if visited.contains(&*stream) {
+            return Err(EgclError::StreamError("cyclic synonym stream".into()));
+        }
+        let symbol = with_stream(*stream, |guard| {
+            if matches!(guard.inner, StreamInner::Synonym) && require_open {
+                guard.check_open()?;
+            }
+            Ok(match &guard.inner {
+                StreamInner::Synonym => guard.components().first().copied(),
+                _ => None,
+            })
+        })?;
+        let Some(symbol) = symbol else {
+            return Ok(*stream);
+        };
+        #[cfg(test)]
+        if delegation_tests::relocate_on_this_visit() {
+            let before = visited[0].to_raw();
+            egcl_rt::collect_t0_minor()?;
+            assert_ne!(
+                visited[0].to_raw(),
+                before,
+                "visited synonym must physically move"
+            );
+        }
+        visited.push(*stream);
+        *stream = resolve_synonym(symbol)?;
     }
+}
+
+pub fn stream_element_type(stream: EgclVal) -> EgclVal {
+    let Ok(stream) = resolve_synonym_stream(stream, false) else {
+        return NIL;
+    };
+    with_stream(stream, |guard| {
+        Ok(match &guard.inner {
+            StreamInner::StringOutput {
+                element: StringOutputElement::Nil,
+                ..
+            } => NIL,
+            _ => guard.element_type.to_code(),
+        })
+    })
+    .unwrap_or(NIL)
 }
 
 // ── GrayStream free-function wrappers ─────────────────────────────
 // Each wrapper acquires the per-stream mutex (R5.120).
 
 pub fn stream_read_char(stream: EgclVal) -> Result<EgclVal, EgclError> {
+    let stream = resolve_synonym_stream(stream, true)?;
     // Composites delegate to a component, whose read can park; do that with
     // the outer guard released (bliss-ifed5 for bytes, same shape here).
     // `components` is outside the mutex and empty for non-composites, so this
@@ -3449,10 +3522,12 @@ pub fn stream_read_char(stream: EgclVal) -> Result<EgclVal, EgclError> {
 pub fn stream_unread_char(stream: EgclVal, ch: EgclVal) -> Result<(), EgclError> {
     let mut ch = ch;
     egcl_rt::rooted_ref!(_ch_root = &mut ch);
+    let stream = resolve_synonym_stream(stream, true)?;
     with_stream(stream, |guard| guard.stream_unread_char(ch))
 }
 
 pub fn stream_read_byte(stream: EgclVal) -> Result<EgclVal, EgclError> {
+    let stream = resolve_synonym_stream(stream, true)?;
     // A composite delegates to a component, and that inner read can park. Do
     // it with the OUTER stream's state mutex released, or a TWO-WAY / ECHO /
     // CONCATENATED stream reproduces bliss-vupo0 one level up (bliss-ifed5).
@@ -3637,6 +3712,9 @@ fn composite_read_byte(stream: EgclVal) -> Result<EgclVal, EgclError> {
 /// True if STREAM has element-type (unsigned-byte 8), so sequence I/O over it
 /// should transfer octets rather than characters.
 pub fn is_byte_stream(stream: EgclVal) -> bool {
+    let Ok(stream) = resolve_synonym_stream(stream, false) else {
+        return false;
+    };
     with_stream(stream, |guard| {
         Ok(guard.element_type == StreamElementType::UnsignedByte8)
     })
@@ -3647,35 +3725,62 @@ pub fn is_byte_stream(stream: EgclVal) -> bool {
 /// over it transfers elements with READ-BYTE / WRITE-BYTE rather than
 /// characters.
 pub fn is_binary_stream(stream: EgclVal) -> bool {
-    // A composite stream is binary when the component it reads from or writes
-    // to is (ansi make-two-way-stream.12, make-concatenated-stream.22).
-    let (binary, delegate) = with_stream(stream, |guard| {
-        let comps = guard.components();
-        Ok((
-            guard.element_type.is_binary(),
-            match &guard.inner {
-                StreamInner::TwoWay | StreamInner::Echo { .. } => comps.first().copied(),
-                StreamInner::Concatenated { cursor } => {
-                    comps.get(*cursor).copied().or_else(|| comps.first().copied())
-                }
-                StreamInner::Synonym => resolve_synonym(comps[0]).ok(),
-                _ => None,
-            },
-        ))
-    })
-    .unwrap_or((false, None));
-    binary || delegate.is_some_and(is_binary_stream)
+    egcl_rt::rooted!(stream = stream);
+    egcl_rt::rooted!(visited = Vec::<EgclVal>::new());
+    loop {
+        if visited.contains(&*stream) {
+            return false;
+        }
+        visited.push(*stream);
+        let Ok((binary, (delegate, synonym))) = with_stream(*stream, |guard| {
+            let comps = guard.components();
+            Ok((
+                guard.element_type.is_binary(),
+                (
+                    match &guard.inner {
+                        StreamInner::TwoWay | StreamInner::Echo { .. } => comps.first().copied(),
+                        StreamInner::Concatenated { cursor } => comps
+                            .get(*cursor)
+                            .copied()
+                            .or_else(|| comps.first().copied()),
+                        StreamInner::Synonym => comps.first().copied(),
+                        _ => None,
+                    },
+                    matches!(guard.inner, StreamInner::Synonym),
+                ),
+            ))
+        }) else {
+            return false;
+        };
+        if binary {
+            return true;
+        }
+        let Some(delegate) = delegate else {
+            return false;
+        };
+        *stream = if synonym {
+            match resolve_synonym(delegate) {
+                Ok(target) => target,
+                Err(_) => return false,
+            }
+        } else {
+            delegate
+        };
+    }
 }
+
 
 pub fn stream_write_char(stream: EgclVal, ch: EgclVal) -> Result<(), EgclError> {
     let mut ch = ch;
     egcl_rt::rooted_ref!(_ch_root = &mut ch);
+    let stream = resolve_synonym_stream(stream, true)?;
     with_stream(stream, |guard| guard.stream_write_char(ch))
 }
 
 pub fn stream_write_byte(stream: EgclVal, byte: EgclVal) -> Result<(), EgclError> {
     let mut byte = byte;
     egcl_rt::rooted_ref!(_byte_root = &mut byte);
+    let stream = resolve_synonym_stream(stream, true)?;
     with_stream(stream, |guard| guard.stream_write_byte(byte))
 }
 
@@ -3687,38 +3792,50 @@ pub fn stream_write_string(
 ) -> Result<(), EgclError> {
     let mut string = string;
     egcl_rt::rooted_ref!(_string_root = &mut string);
+    let stream = resolve_synonym_stream(stream, true)?;
     with_stream(stream, |guard| {
         guard.stream_write_string(string, start, end)
     })
 }
 
 pub fn stream_force_output(stream: EgclVal) -> Result<(), EgclError> {
+    let stream = resolve_synonym_stream(stream, true)?;
     with_stream(stream, |guard| guard.stream_force_output())
 }
 
 pub fn stream_finish_output(stream: EgclVal) -> Result<(), EgclError> {
+    let stream = resolve_synonym_stream(stream, true)?;
     with_stream(stream, |guard| guard.stream_finish_output())
 }
 
 pub fn stream_clear_input(stream: EgclVal) -> Result<(), EgclError> {
+    let stream = resolve_synonym_stream(stream, true)?;
     with_stream(stream, |guard| guard.stream_clear_input())
 }
 
 pub fn stream_listen(stream: EgclVal) -> Result<bool, EgclError> {
+    let stream = resolve_synonym_stream(stream, true)?;
     with_stream(stream, |guard| guard.stream_listen())
 }
 
 pub fn stream_line_number(stream: EgclVal) -> Option<u64> {
+    let Ok(stream) = resolve_synonym_stream(stream, false) else {
+        return None;
+    };
     with_stream(stream, |guard| Ok(guard.stream_line_number())).unwrap_or(None)
 }
 
 pub fn stream_line_column(stream: EgclVal) -> Option<u64> {
+    let Ok(stream) = resolve_synonym_stream(stream, false) else {
+        return None;
+    };
     with_stream(stream, |guard| Ok(guard.stream_line_column())).unwrap_or(None)
 }
 
 // ── R5.113 additional Gray protocol free-function wrappers ────────
 
 pub fn stream_read_char_no_hang(stream: EgclVal) -> Result<EgclVal, EgclError> {
+    let stream = resolve_synonym_stream(stream, true)?;
     with_stream(stream, |guard| guard.stream_read_char_no_hang())
 }
 
@@ -3729,6 +3846,7 @@ pub fn stream_read_char_no_hang(stream: EgclVal) -> Result<EgclVal, EgclError> {
 /// composite's lock. An ECHO stream peeks its input stream and echoes nothing:
 /// only a character actually read is echoed (ansi PEEK-CHAR.17).
 pub fn stream_peek_char(stream: EgclVal) -> Result<EgclVal, EgclError> {
+    let stream = resolve_synonym_stream(stream, true)?;
     egcl_rt::rooted!(stream = stream);
     if get_stream_alloc(*stream)?.components.is_empty() {
         return with_stream(*stream, |guard| guard.stream_peek_char());
@@ -3758,26 +3876,34 @@ pub fn stream_peek_char(stream: EgclVal) -> Result<EgclVal, EgclError> {
 }
 
 pub fn stream_read_line(stream: EgclVal) -> Result<(EgclVal, bool), EgclError> {
+    let stream = resolve_synonym_stream(stream, true)?;
     with_stream(stream, |guard| guard.stream_read_line())
 }
 
 pub fn stream_terpri(stream: EgclVal) -> Result<(), EgclError> {
+    let stream = resolve_synonym_stream(stream, true)?;
     with_stream(stream, |guard| guard.stream_terpri())
 }
 
 pub fn stream_fresh_line(stream: EgclVal) -> Result<bool, EgclError> {
+    let stream = resolve_synonym_stream(stream, true)?;
     with_stream(stream, |guard| guard.stream_fresh_line())
 }
 
 pub fn stream_clear_output(stream: EgclVal) -> Result<(), EgclError> {
+    let stream = resolve_synonym_stream(stream, true)?;
     with_stream(stream, |guard| guard.stream_clear_output())
 }
 
 pub fn stream_advance_to_column(stream: EgclVal, col: u64) -> Result<bool, EgclError> {
+    let stream = resolve_synonym_stream(stream, true)?;
     with_stream(stream, |guard| guard.stream_advance_to_column(col))
 }
 
 pub fn stream_start_line_p(stream: EgclVal) -> bool {
+    let Ok(stream) = resolve_synonym_stream(stream, false) else {
+        return false;
+    };
     with_stream(stream, |guard| Ok(guard.stream_start_line_p())).unwrap_or(false)
 }
 
@@ -3789,6 +3915,7 @@ pub fn stream_start_line_p(stream: EgclVal) -> bool {
 /// It is rooted in place because the elements are Lisp values and a collection
 /// can relocate them while this thread waits (bliss-mclc6).
 pub fn stream_read_sequence(stream: EgclVal, count: usize) -> Result<Vec<EgclVal>, EgclError> {
+    let stream = resolve_synonym_stream(stream, true)?;
     let mut out: Vec<EgclVal> = Vec::with_capacity(count.min(1 << 22));
     egcl_rt::rooted_ref!(_out_root = &mut out);
     let filled = with_stream_input(stream, |guard| {
@@ -3816,10 +3943,8 @@ pub fn stream_read_sequence(stream: EgclVal, count: usize) -> Result<Vec<EgclVal
 /// and lock. Reading the 6.76 MB Android runtime that way measured 5.1 s, about
 /// 750 ns a byte, nearly all of it the per-byte lock rather than the read.
 /// Stops early at end of file, like the character form above.
-pub fn stream_read_byte_sequence(
-    stream: EgclVal,
-    count: usize,
-) -> Result<Vec<EgclVal>, EgclError> {
+pub fn stream_read_byte_sequence(stream: EgclVal, count: usize) -> Result<Vec<EgclVal>, EgclError> {
+    let stream = resolve_synonym_stream(stream, true)?;
     let mut out: Vec<EgclVal> = Vec::with_capacity(count.min(1 << 22));
     egcl_rt::rooted_ref!(_out_root = &mut out);
     let filled = with_stream_input(stream, |guard| {
@@ -3846,6 +3971,7 @@ pub fn stream_read_byte_sequence(
 /// a `Vec<EgclVal>`, which for a 6.76 MB file is a 54 MB intermediate on top of
 /// a dispatch per byte.
 pub fn stream_read_octets(stream: EgclVal, count: usize) -> Result<Vec<u8>, EgclError> {
+    let stream = resolve_synonym_stream(stream, true)?;
     // The accumulator needs no rooting: plain octets hold no Lisp value for the
     // collector to trace or relocate. It still lives outside the step so the
     // bytes already transferred survive a park, as the sequence forms above do.
@@ -3856,6 +3982,7 @@ pub fn stream_read_octets(stream: EgclVal, count: usize) -> Result<Vec<u8>, Egcl
 
 /// Write OCTETS to STREAM as bytes, taking the stream lock once.
 pub fn stream_write_octets(stream: EgclVal, octets: &[u8]) -> Result<(), EgclError> {
+    let stream = resolve_synonym_stream(stream, true)?;
     // As in `stream_read_octets`: octets hold no Lisp value, so only the stream
     // needs rooting.
     egcl_rt::rooted!(stream = stream);
@@ -3866,14 +3993,21 @@ pub fn stream_write_octets(stream: EgclVal, octets: &[u8]) -> Result<(), EgclErr
 pub fn stream_write_sequence(stream: EgclVal, elements: &[EgclVal]) -> Result<(), EgclError> {
     let mut elements = elements.to_vec();
     egcl_rt::rooted_ref!(_elements_root = &mut elements);
+    let stream = resolve_synonym_stream(stream, true)?;
     with_stream(stream, |guard| guard.stream_write_sequence(&elements))
 }
 
 pub fn interactive_stream_p(stream: EgclVal) -> bool {
+    let Ok(stream) = resolve_synonym_stream(stream, false) else {
+        return false;
+    };
     with_stream(stream, |guard| Ok(guard.interactive_stream_p())).unwrap_or(false)
 }
 
 pub fn stream_external_format(stream: EgclVal) -> ExternalFormat {
+    let Ok(stream) = resolve_synonym_stream(stream, false) else {
+        return ExternalFormat::Utf8;
+    };
     egcl_rt::rooted!(stream = stream);
     match lock_stream(*stream) {
         Ok(guard) => guard.stream_external_format(),
@@ -3885,6 +4019,7 @@ pub fn stream_external_format(stream: EgclVal) -> ExternalFormat {
 
 /// Return the current file position, or `NIL` for non-positionable streams. R5.124.
 pub fn file_position(stream: EgclVal) -> Result<EgclVal, EgclError> {
+    let stream = resolve_synonym_stream(stream, true)?;
     with_stream(stream, |guard| {
         guard.check_open()?;
         let per_element = guard.element_type.octets_per_element() as u64;
@@ -3914,7 +4049,9 @@ pub fn file_position(stream: EgclVal) -> Result<EgclVal, EgclError> {
                     .stream_position()
                     .map_err(|e| EgclError::StreamError(format!("file-position error: {}", e)))?;
                 let buffered_unread = (*buf_fill - *buf_pos) as u64;
-                Ok(EgclVal::from_fixnum(((os_pos - buffered_unread) / per_element) as i64))
+                Ok(EgclVal::from_fixnum(
+                    ((os_pos - buffered_unread) / per_element) as i64,
+                ))
             }
             StreamInner::FileOutput {
                 file, write_buf, ..
@@ -3923,7 +4060,9 @@ pub fn file_position(stream: EgclVal) -> Result<EgclVal, EgclError> {
                     .stream_position()
                     .map_err(|e| EgclError::StreamError(format!("file-position error: {}", e)))?;
                 let pending = write_buf.len() as u64;
-                Ok(EgclVal::from_fixnum(((os_pos + pending) / per_element) as i64))
+                Ok(EgclVal::from_fixnum(
+                    ((os_pos + pending) / per_element) as i64,
+                ))
             }
             StreamInner::FileIo {
                 file,
@@ -3950,9 +4089,7 @@ pub fn file_position(stream: EgclVal) -> Result<EgclVal, EgclError> {
                 // bliss-r4mk) overshoot by one and swallow the delimiter the
                 // handler pushed back.
                 let pending = usize::from(unread.is_some());
-                Ok(EgclVal::from_fixnum(
-                    position.saturating_sub(pending) as i64
-                ))
+                Ok(EgclVal::from_fixnum(position.saturating_sub(pending) as i64))
             }
             StreamInner::StringOutput { buffer, .. } => {
                 Ok(EgclVal::from_fixnum(buffer.len() as i64))
@@ -3998,6 +4135,7 @@ fn element_octet_offset(position: EgclVal, per_element: u64) -> Result<u64, Egcl
 pub fn set_file_position(stream: EgclVal, position: EgclVal) -> Result<EgclVal, EgclError> {
     let mut position = position;
     egcl_rt::rooted_ref!(_position_root = &mut position);
+    let stream = resolve_synonym_stream(stream, true)?;
     with_stream(stream, |guard| {
         guard.check_open()?;
         let per_element = guard.element_type.octets_per_element() as u64;
@@ -4091,6 +4229,7 @@ pub fn set_file_position(stream: EgclVal, position: EgclVal) -> Result<EgclVal, 
 /// (R5.124). Kept in the stdlib because only it knows each stream variant's end.
 /// Returns `T` on success, `NIL` for a non-positionable stream.
 pub fn set_file_position_to_end(stream: EgclVal) -> Result<EgclVal, EgclError> {
+    let stream = resolve_synonym_stream(stream, true)?;
     with_stream(stream, |guard| {
         guard.check_open()?;
         let mut comps = guard.components().to_vec();
@@ -4173,6 +4312,7 @@ pub fn set_file_position_to_end(stream: EgclVal) -> Result<EgclVal, EgclError> {
 /// Return the length of the file underlying the stream, or NIL for
 /// non-positionable streams. R5.124.
 pub fn file_length_fn(stream: EgclVal) -> Result<EgclVal, EgclError> {
+    let stream = resolve_synonym_stream(stream, true)?;
     with_stream(stream, |guard| {
         guard.check_open()?;
         let per_element = guard.element_type.octets_per_element();
@@ -4201,7 +4341,9 @@ pub fn file_length_fn(stream: EgclVal) -> Result<EgclVal, EgclError> {
                 let metadata = file
                     .metadata()
                     .map_err(|e| EgclError::StreamError(format!("file-length error: {}", e)))?;
-                Ok(EgclVal::from_fixnum((metadata.len() / per_element as u64) as i64))
+                Ok(EgclVal::from_fixnum(
+                    (metadata.len() / per_element as u64) as i64,
+                ))
             }
             StreamInner::Synonym => {
                 let target = resolve_synonym(comps[0])?;

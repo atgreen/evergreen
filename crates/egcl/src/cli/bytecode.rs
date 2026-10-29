@@ -10584,11 +10584,14 @@ const BBU_MAGIC: &[u8; 4] = b"BBU\0";
 // Reject all earlier-major units before installing or executing anything.
 // 0x0301: variable environment operands/parameter keys may reference pooled
 // uninterned symbols, reconstructed with fresh identities on portable load.
-const BBU_BYTECODE_VERSION: u16 = 0x0301;
+// 0x0302: length-only NIL array storage (tag 32).
+const BBU_BYTECODE_VERSION: u16 = 0x0302;
 mod array_constants;
 mod make_load_form;
 #[cfg(test)]
 mod random_state_persistence_tests;
+#[cfg(test)]
+mod nil_array_persistence_tests;
 const BBU_VERIFIER_VERSION: u16 = 0x0100;
 const BBU_NO_INDEX: u32 = u32::MAX;
 /// Unit-flags bit: every load form is represented in `load_actions`, so the
@@ -11082,6 +11085,17 @@ impl BbuConstPool {
 
     fn value_leaf(&mut self, mut v: EgclVal) -> Option<u32> {
         egcl_rt::rooted_ref!(_v_root = &mut v);
+        if let Some(length) = egcl_rt::nil_array::len(v) {
+            if self.saved_heap_refs {
+                let mut bytes = vec![21]; put_u64(&mut bytes, v.to_raw());
+                return Some(self.intern_encoded(bytes));
+            }
+            if let Some(index) = self.graph_values.iter().position(|value| *value == v) { return Some(self.graph_refs[index]); }
+            let mut bytes = vec![32]; put_u64(&mut bytes, length as u64);
+            let reference = u32::try_from(self.entries.len()).ok()?;
+            self.entries.push(bytes); self.graph_values.push(v); self.graph_refs.push(reference);
+            return Some(reference);
+        }
         if let Some(seed) = egcl_rt::random_state::snapshot(v) {
             if self.saved_heap_refs {
                 let mut bytes = vec![21];
@@ -13304,6 +13318,7 @@ enum BbuConstant {
     SingleFloat(u32),
     DoubleFloat(u64),
     RandomState { seed: u64 },
+    NilArray { length: usize },
     Bignum {
         negative: bool,
         magnitude: Vec<u8>,
@@ -13541,6 +13556,11 @@ fn parse_bbu_constant(
         0 => BbuConstant::Nil,
         1 => BbuConstant::T,
         30 if bytecode_version >= 0x0206 => BbuConstant::LoadFormObject,
+        32 if bytecode_version >= 0x0302 => {
+            let length = usize::try_from(cursor.u64()?).map_err(|_| bbu_error("nil array length overflow"))?;
+            if length >= egcl_rt::bignum::FIXNUM_MAX as usize { return Err(bbu_error("nil array length exceeds array limit")); }
+            BbuConstant::NilArray { length }
+        }
         31 if bytecode_version >= 0x0300 => {
             let seed = cursor.u64()?;
             BbuConstant::RandomState { seed }
@@ -13959,6 +13979,7 @@ fn allocate_bbu_constants(constants: &[BbuConstant]) -> Result<Vec<EgclVal>, Egc
                 EgclVal::from_fixnum(*value)
             }
             BbuConstant::RandomState { seed } => egcl_rt::random_state::make(*seed)?,
+            BbuConstant::NilArray { length } => egcl_rt::nil_array::make(*length)?,
             BbuConstant::SingleFloat(bits) => EgclVal::from_single_float(f32::from_bits(*bits)),
             BbuConstant::DoubleFloat(bits) => {
                 egcl_rt::gc::alloc_double_float(f64::from_bits(*bits))

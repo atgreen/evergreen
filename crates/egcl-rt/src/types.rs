@@ -81,10 +81,15 @@ pub fn heap_object_p(v: EgclVal) -> bool {
 
 /// `STRINGP` — simple-base-string, simple-character-string, or complex string.
 pub fn stringp(v: EgclVal) -> bool {
-    matches!(
-        heap_type_id(v),
-        Some(type_id::SIMPLE_BASE_STRING) | Some(type_id::SIMPLE_CHARACTER_STRING)
-    )
+    if crate::nil_array::is_vector(v) { return true; }
+    match heap_type_id(v) {
+        Some(type_id::SIMPLE_BASE_STRING | type_id::SIMPLE_CHARACTER_STRING) => true,
+        Some(type_id::COMPLEX_ARRAY) => unsafe {
+            let element = *v.as_ptr().add(32).cast::<EgclVal>();
+            element.is_fixnum() && matches!(element.as_fixnum(), 1 | 14)
+        },
+        _ => false,
+    }
 }
 
 /// `VECTORP` — rank-1 array of any kind.

@@ -2553,6 +2553,22 @@ Returns NIL."
           (error 'type-error :datum base :expected-type (list 'array (upgraded-array-element-type et))))
         (unless (and (integerp offset) (<= 0 offset) (<= offset (array-total-size base)))
           (error 'type-error :datum offset :expected-type (list 'integer 0 (array-total-size base))))))
+    ;; NIL is an actual specialized representation, not CHARACTER storage.
+    ;; There is no admissible supplied initializer, even for zero total size.
+    (when (null et)
+      (when iel-cell (error 'type-error :datum (cadr iel-cell) :expected-type nil))
+      (let* ((dims (if (listp dimensions) dimensions (list dimensions)))
+             (total (reduce #'* dims :initial-value 1))
+             (fpn (if mdp total (cond ((eq fp t) total) ((integerp fp) fp) (t total))))
+             (storage (egcl::%make-nil-vector total fpn adjustable (and fp t)
+                         (and dt-cell (cadr dt-cell)) (if dio-cell (cadr dio-cell) 0)))
+             (array (if mdp (egcl-internal::%make-md-array-with-storage dims storage) storage)))
+        (when ic-cell
+          (if mdp
+              (fill-md-array-from-contents array dims (cadr ic-cell))
+              (progn (%check-initial-contents-length (cadr ic-cell) total)
+                     (dotimes (i total) (setf (aref array i) (elt (cadr ic-cell) i))))))
+        (return-from make-array array)))
     (cond
       ;; :displaced-to (rank-1): a complex vector whose element i reads and
       ;; writes BASE's row-major element (+ offset i) (bliss-7o4y). The
@@ -2706,7 +2722,7 @@ Returns NIL."
           (ic-cell (setq options (append options (list :initial-contents (cadr ic-cell)))))
           (iel-cell (setq options (append options (list :initial-element (cadr iel-cell))))))
     (let ((new (apply #'make-array dims options)))
-      (unless (or ic-cell displaced-to)
+      (unless (or ic-cell displaced-to (null element-type))
         (dotimes (i (array-total-size new))
           ;; Copy the intersection by subscripts, not by flat prefix or active
           ;; fill-pointer length. A zero-sized result executes no divisions.
@@ -2859,6 +2875,11 @@ Returns NIL."
                    (and (member head '(vector array simple-array simple-vector))
                         (egcl-internal::%bit-element-type-p (%expand-type-spec elt))))))
     (%check-sequence-result-type rt head declared size result-type)
+    (when (and (member head '(vector array simple-array)) (consp rt) (consp (cdr rt))
+               (null (%expand-type-spec elt)))
+      (return-from make-sequence
+        (if iel-cell (make-array size :element-type nil :initial-element initial-element)
+                     (make-array size :element-type nil))))
     (cond
       ((member head '(list cons null))
        (make-list size :initial-element iel))
@@ -4523,8 +4544,9 @@ Returns NIL."
 (defmethod output-stream-p ((stream fundamental-stream)) nil)
 (defmethod output-stream-p ((stream fundamental-output-stream)) t)
 (defmethod stream-element-type ((stream t))
-  (let ((element-type (egcl::%native-stream-element-type stream)))
-    (cond ((eq element-type t) 'character)
+  (let ((element-type (egcl::%native-stream-element-type (egcl::%check-stream stream))))
+    (cond ((null element-type) nil)
+          ((eq element-type t) 'character)
           ((eql element-type 8) '(unsigned-byte 8))
           ;; The native code is the bit width, negated for a signed type.
           ((and (integerp element-type) (plusp element-type))
