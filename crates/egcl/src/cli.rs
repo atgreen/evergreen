@@ -25274,17 +25274,48 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 } else {
                     false
                 };
+                let definition = direct_only
+                    .then(|| runtime_class_definition(env, class))
+                    .flatten();
+                let raw = direct_only && definition.is_none();
                 let mut slots = if direct_only {
-                    runtime_class_definition(env, class)
+                    definition
                         .map(|definition| definition.slots)
                         .unwrap_or_default()
                 } else {
                     runtime_class_slots(env, class)
                 };
-                // SlotDef::initform is a EgclVal and every list built below
-                // allocates, so root the whole Vec: SlotDef's TraceHostRoots impl
-                // exists for exactly this (moving GC; bliss-wlf).
                 egcl_rt::rooted_ref!(_slots_root = &mut slots);
+                // Runtime-defined classes (notably standard conditions) have
+                // physical direct slots even when no rich ClassDef was stored.
+                // Returning an empty list here lets CLASS-SLOTS finalize those
+                // real slots out of the class. Preserve their declarations and
+                // exact symbol identities through the ordinary AMOP protocol.
+                egcl_rt::rooted!(raw_names = Vec::<EgclVal>::new());
+                if raw {
+                    let (instance, shared) =
+                        egcl_stdlib::clos::class_direct_slot_declarations(class);
+                    for (names, allocation) in [
+                        (instance, SlotAllocation::Instance),
+                        (shared, SlotAllocation::Class),
+                    ] {
+                        for symbol in names {
+                            raw_names.push(symbol);
+                            slots.push(SlotDef {
+                                name: sym_name(symbol),
+                                initargs: Vec::new(),
+                                accessor: None,
+                                readers: Vec::new(),
+                                writers: Vec::new(),
+                                initform: None,
+                                source_initform: None,
+                                initfunction: None,
+                                mop_options: Vec::new(),
+                                allocation,
+                            });
+                        }
+                    }
+                }
                 let mut out: Vec<EgclVal> = Vec::with_capacity(slots.len());
                 egcl_rt::rooted_ref!(_out_root = &mut out);
                 let kw = |name: &str| {
@@ -25328,7 +25359,11 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     let mut entry: Vec<EgclVal> = Vec::new();
                     egcl_rt::rooted_ref!(_entry_root = &mut entry);
                     entry.push(kw("NAME"));
-                    entry.push(resolve_sym(&slots[i].name).unwrap_or(NIL));
+                    entry.push(if raw {
+                        raw_names[i]
+                    } else {
+                        resolve_sym(&slots[i].name).unwrap_or(NIL)
+                    });
                     entry.push(kw("INITARGS"));
                     entry.push(vec_to_list(&initargs));
                     entry.push(kw("INITFORM"));

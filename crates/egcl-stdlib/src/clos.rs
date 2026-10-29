@@ -3015,6 +3015,18 @@ pub fn class_slots(class: EgclVal) -> Vec<EgclVal> {
     })
 }
 
+/// Physical direct slot declarations for classes registered without a rich
+/// source definition. Names retain their exact symbol identity; shared slots
+/// remain distinct from inline instance slots. This only copies Rust vectors.
+pub fn class_direct_slot_declarations(class: EgclVal) -> (Vec<EgclVal>, Vec<EgclVal>) {
+    with_state(|st| {
+        st.class_meta
+            .get(&class)
+            .map(|meta| (meta.slots.clone(), meta.shared_slots.clone()))
+            .unwrap_or_default()
+    })
+}
+
 /// All effective slot names of `class` — its own direct slots plus every
 /// inherited slot — in precedence order (most-general superclass first, so an
 /// :include parent's slots precede the child's), de-duplicated. Used for #S
