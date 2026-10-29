@@ -61,6 +61,40 @@ const ERROR_SOURCE: &str = r#"
 (defparameter *mlf-broken-result* '#.(make-mlf-broken :value 1))
 "#;
 
+const ORDER_SOURCE: &str = r#"
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defvar *mlf-save-calls* 0)
+  (defvar *mlf-save-hook* (constantly nil))
+  (defparameter *mlf-order-events* nil)
+  (defstruct mlf-ordered kind value dependency)
+  (defmethod make-load-form ((object mlf-ordered) &optional environment)
+    (declare (ignore environment))
+    (incf *mlf-save-calls*)
+    (funcall *mlf-save-hook*)
+    (let ((dependency (mlf-ordered-dependency object)))
+      (case (mlf-ordered-kind object)
+        (:leaf
+         (values '(make-mlf-ordered :kind :leaf)
+                 `(progn (setf (mlf-ordered-value ',object) 1)
+                         (push :initialize-leaf *mlf-order-events*))))
+        (:dependency
+         (values '(make-mlf-ordered :kind :dependency)
+                 `(progn (assert (= (mlf-ordered-value ',dependency) 1))
+                         (setf (mlf-ordered-value ',object) 42)
+                         (push :initialize-dependency *mlf-order-events*))))
+        (:consumer
+         (values `(let ((created (make-mlf-ordered
+                                   :kind :consumer
+                                   :value (mlf-ordered-value ',dependency))))
+                    (push :create-consumer *mlf-order-events*)
+                    created)
+                 `(setf (mlf-ordered-dependency ',object) ',dependency)))))))
+(defparameter *mlf-ordered-result*
+  '#.(let* ((leaf (make-mlf-ordered :kind :leaf :value 1))
+            (dependency (make-mlf-ordered :kind :dependency :value 42 :dependency leaf)))
+       (make-mlf-ordered :kind :consumer :value 42 :dependency dependency)))
+"#;
+
 // Force collection inside user callbacks, where the compiler and loader must
 // keep their temporary graphs rooted. The portable fixtures themselves do not
 // depend on an implementation's collector API.
@@ -217,5 +251,27 @@ fn make_load_form_failure_is_not_reported_as_successful_compilation() {
         ),
         false,
     );
+    fixture.finish();
+}
+
+#[test]
+fn make_load_form_initializes_independent_dependencies_before_creation_use() {
+    let fixture = Fixture::new("order", ORDER_SOURCE);
+    fixture.compile(3);
+    fixture.delete_source();
+    let program = format!(
+        "(progn
+           (load {artifact:?})
+           (assert (= (mlf-ordered-value *mlf-ordered-result*) 42))
+           (let ((events (reverse *mlf-order-events*)))
+             (assert (< (position :initialize-leaf events)
+                        (position :initialize-dependency events)))
+             (assert (< (position :initialize-dependency events)
+                        (position :create-consumer events))))
+           (write-line \"MAKE-LOAD-FORM-OK\"))",
+        artifact = fixture.artifact
+    );
+    run(&program, false);
+    run(&program, true);
     fixture.finish();
 }
