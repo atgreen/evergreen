@@ -2989,6 +2989,9 @@ fn parse_directives(control: &str) -> Result<Vec<Directive>, EgclError> {
 pub struct LayoutDoc {
     events: Vec<LayoutEvent>,
     start_column: usize,
+    // A direct FORMAT logical-block body is queried before it is wrapped in
+    // its final Block event. Keep that context for speculative callback columns.
+    logical_body: bool,
 }
 
 impl LayoutDoc {
@@ -2996,6 +2999,7 @@ impl LayoutDoc {
         Self {
             events,
             start_column: 0,
+            logical_body: false,
         }
     }
 
@@ -3065,7 +3069,19 @@ impl LayoutDoc {
             start_column: self.start_column,
             pretty: print_pretty_active(),
         };
-        let rendered = render_layout(self, &options);
+        let body;
+        let doc = if self.logical_body {
+            body = LayoutDoc::from_events(vec![LayoutEvent::Block {
+                prefix: String::new(),
+                per_line_prefix: None,
+                suffix: String::new(),
+                events: self.events.clone(),
+            }]);
+            &body
+        } else {
+            self
+        };
+        let rendered = render_layout(doc, &options);
         let last_line = rendered.rsplit('\n').next().unwrap_or_default();
         if rendered.contains('\n') {
             last_line.chars().count()
@@ -3480,9 +3496,6 @@ fn render_events(events: &[LayoutEvent], state: &mut LayoutState<'_>, section: u
                 suffix,
                 events,
             } => render_block(prefix, per_line_prefix.as_deref(), suffix, events, state),
-            LayoutEvent::Newline(NewlineKind::Mandatory) if state.options.pretty => {
-                state.newline(section, true)
-            }
             // Conditional directives outside a logical block are inert, as
             // are all PPRINT-NEWLINE kinds when pretty printing is disabled.
             LayoutEvent::Newline(_) | LayoutEvent::Indent { .. } => {}
@@ -3792,6 +3805,18 @@ pub fn format_to_layout_at_column(
     args: &[EgclVal],
     start_column: usize,
 ) -> Result<LayoutDoc, EgclError> {
+    format_to_layout_in_context(control_string, args, start_column, false)
+}
+
+/// Produce events for an already established pretty-stream logical context.
+/// Plain destinations use `format_to_layout_at_column`; this flag only affects
+/// speculative callback columns, not the returned event nesting or rendering.
+pub fn format_to_layout_in_context(
+    control_string: &str,
+    args: &[EgclVal],
+    start_column: usize,
+    logical_body: bool,
+) -> Result<LayoutDoc, EgclError> {
     let mut args = args.to_vec();
     egcl_rt::rooted_ref!(_args_root = &mut args);
     validate_matching(control_string)?;
@@ -3806,6 +3831,7 @@ pub fn format_to_layout_at_column(
     let mut output = LayoutDoc {
         events: Vec::new(),
         start_column,
+        logical_body,
     };
     let mut arg_idx = 0;
     take_escape();
@@ -4693,7 +4719,11 @@ fn format_impl(
                     (false, true) => NewlineKind::Miser,
                     (true, true) => NewlineKind::Mandatory,
                 };
-                output.events.push(LayoutEvent::Newline(kind));
+                // Snapshot the dynamic policy when the directive executes:
+                // an enclosing pretty stream may be rendered after this binding ends.
+                if print_pretty_active() {
+                    output.events.push(LayoutEvent::Newline(kind));
+                }
             }
             '~' => {
                 let count = if !params.is_empty() {
@@ -4728,21 +4758,25 @@ fn format_impl(
                 } else {
                     1
                 };
-                output.events.push(LayoutEvent::Tab {
-                    kind: if colon {
-                        if at_sign {
-                            TabKind::SectionRelative
+                // Resolve V parameters even for an inert PPRINT-TAB, then
+                // retain ordinary ~T/~@T independently of *PRINT-PRETTY*.
+                if !colon || print_pretty_active() {
+                    output.events.push(LayoutEvent::Tab {
+                        kind: if colon {
+                            if at_sign {
+                                TabKind::SectionRelative
+                            } else {
+                                TabKind::Section
+                            }
+                        } else if at_sign {
+                            TabKind::LineRelative
                         } else {
-                            TabKind::Section
-                        }
-                    } else if at_sign {
-                        TabKind::LineRelative
-                    } else {
-                        TabKind::Line
-                    },
-                    colnum: first,
-                    colinc,
-                });
+                            TabKind::Line
+                        },
+                        colnum: first,
+                        colinc,
+                    });
+                }
             }
             '*' => {
                 // ~n* skips n (default 1); ~n:* backs up n; ~n@* goes to
@@ -5284,7 +5318,10 @@ fn format_impl(
                 let body_end = find_matching_close(&chars, i, '(')?;
                 let body: String = chars[body_start..body_end].iter().collect();
                 i = skip_close_directive(&chars, body_end);
-                let mut inner = LayoutDoc::default();
+                let mut inner = LayoutDoc {
+                    logical_body: output.logical_body,
+                    ..LayoutDoc::default()
+                };
                 format_impl(&body, args, arg_idx, &mut inner)?;
                 let mode = match (colon, at_sign) {
                     (true, true) => CaseMode::Upper,
@@ -5357,7 +5394,10 @@ fn format_impl(
                     let prefix = format_const(&prefix)?;
                     let suffix = format_const(&suffix)?;
                     if at_sign {
-                        let mut body_doc = LayoutDoc::default();
+                        let mut body_doc = LayoutDoc {
+                            logical_body: true,
+                            ..LayoutDoc::default()
+                        };
                         format_impl(&body_seg, args, arg_idx, &mut body_doc)?;
                         take_escape();
                         output.events.push(LayoutEvent::Block {
@@ -5376,7 +5416,10 @@ fn format_impl(
                             let mut sub_args = cons_list_to_vec(val);
                             egcl_rt::rooted_ref!(_sub_args_root = &mut sub_args);
                             let mut sub_idx = 0;
-                            let mut body_doc = LayoutDoc::default();
+                            let mut body_doc = LayoutDoc {
+                                logical_body: true,
+                                ..LayoutDoc::default()
+                            };
                             // One graph-wide table makes repeated elements share
                             // labels across separate ~A/~S directives.
                             circle_enter(val);
