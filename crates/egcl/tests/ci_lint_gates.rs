@@ -21,7 +21,7 @@ fn lint_driver_runs_all_checks_and_propagates_each_failure() {
             r#"#!/bin/sh
 name=${0##*/}
 printf '%s %s\n' "$name" "$*" >> "$GATE_TRACE"
-if [ "$name" = "$FAIL_GATE" ] || [ "$FAIL_GATE" = all ]; then
+if [ "$name" = "$FAIL_GATE" ] || [ "$name $*" = "$FAIL_GATE" ] || [ "$FAIL_GATE" = all ]; then
     echo "injected failure: $name" >&2
     exit 7
 fi
@@ -34,7 +34,15 @@ fi
         std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
     ))
     .unwrap();
-    for failing in ["none", "python3", "make", "bash", "cargo", "all"] {
+    for failing in [
+        "none",
+        "python3",
+        "make",
+        "make fmt-check",
+        "bash",
+        "cargo",
+        "all",
+    ] {
         fs::write(&trace, "").unwrap();
         let output = Command::new("/bin/bash")
             .arg(root.join("scripts/ci-lint.sh"))
@@ -56,6 +64,7 @@ fi
             concat!(
                 "python3 scripts/test_spec_coverage.py\n",
                 "python3 scripts/spec-coverage.py --gate --debt-baseline spec/coverage-debt.json\n",
+                "make fmt-check\n",
                 "make clippy\n",
                 "make clippy-ports\n",
                 "bash scripts/gc-root-lint.sh\n",
