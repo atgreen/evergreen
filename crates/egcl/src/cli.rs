@@ -23,6 +23,7 @@ pub(super) use egcl_rt::bignum::{
 use egcl_rt::lock_order::{LockLevel, OrderedMutex};
 
 mod bytecode;
+mod lexical_identity;
 mod control_payload;
 mod shake;
 mod evaluated_builtins;
@@ -11821,6 +11822,9 @@ impl Env {
         if let Some(val) = global_value_cell(idx) {
             return Some(val);
         }
+        if egcl_rt::symbols::is_uninterned(idx) {
+            return None;
+        }
         let name = sym_name(symbol);
         if let Some(val) = self.lookup_var(&name) {
             return Some(val);
@@ -11853,6 +11857,9 @@ impl Env {
     fn set_frame_var_symbol(&mut self, symbol: EgclVal, val: EgclVal) -> bool {
         if Self::set_symbol_frame_var(&self.frame, symbol.as_symbol_index(), val) {
             return true;
+        }
+        if egcl_rt::symbols::is_uninterned(symbol.as_symbol_index()) {
+            return false;
         }
         let name = sym_name(symbol);
         Self::set_frame_var(&self.frame, &name, val)
@@ -11943,10 +11950,50 @@ impl Env {
     }
 
     fn define_local_symbol(&mut self, symbol: EgclVal, val: EgclVal) {
-        let name = sym_name(symbol);
+        let index = symbol.as_symbol_index();
+        let name = (!egcl_rt::symbols::is_uninterned(index)).then(|| sym_name(symbol));
         let mut frame = self.frame.borrow_mut();
-        frame.symbol_vars.insert(symbol.as_symbol_index(), val);
-        frame.vars.insert(name, val);
+        frame.symbol_vars.insert(index, val);
+        if let Some(name) = name {
+            frame.vars.insert(name, val);
+        }
+    }
+
+    fn define_lexical_local(&mut self, key: &str, value: EgclVal) {
+        if let Some(symbol) = lexical_identity::symbol(key) {
+            self.define_local_symbol(symbol, value);
+        } else {
+            self.define_local(lexical_identity::name(key), value);
+        }
+    }
+
+    fn lookup_lexical_frame(frame: &Arc<SharedCell<EnvFrame>>, key: &str) -> Option<EgclVal> {
+        if let Some(index) = lexical_identity::symbol_index(key) {
+            Self::lookup_symbol_frame(frame, index)
+        } else {
+            Self::lookup_frame(frame, lexical_identity::name(key))
+        }
+    }
+
+    fn set_lexical_frame(frame: &Arc<SharedCell<EnvFrame>>, key: &str, value: EgclVal) -> bool {
+        if let Some(index) = lexical_identity::symbol_index(key) {
+            Self::set_symbol_frame_var(frame, index, value)
+        } else {
+            Self::set_frame_var(frame, lexical_identity::name(key), value)
+        }
+    }
+
+    fn define_lexical_frame(frame: &Arc<SharedCell<EnvFrame>>, key: &str, value: EgclVal) {
+        let index = lexical_identity::symbol_index(key);
+        let name = lexical_identity::name(key);
+        let ordinary_index = index.or_else(|| egcl_rt::symbols::find_index(name));
+        let mut frame = frame.borrow_mut();
+        if let Some(index) = ordinary_index {
+            frame.symbol_vars.insert(index, value);
+        }
+        if index.is_none() {
+            frame.vars.insert(name.to_owned(), value);
+        }
     }
 
     fn seed_standard_constant(&mut self, name: &str, val: EgclVal) {
@@ -12071,7 +12118,7 @@ impl Env {
             drop(borrowed);
             let name = sym_name_rc(EgclVal::from_symbol_index(symbol_index));
             let mut borrowed = frame.borrow_mut();
-            if borrowed.vars.contains_key(&*name) {
+            if !egcl_rt::symbols::is_uninterned(symbol_index) && borrowed.vars.contains_key(&*name) {
                 borrowed.symbol_vars.insert(symbol_index, val);
                 // Update the legacy name map in place when the entry exists, so
                 // the common assignment path allocates nothing.
@@ -20908,8 +20955,10 @@ fn eval_form(form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 return Ok(form);
             }
             // Check variable environment
-            if let Some(val) = env.lookup_var(&name) {
-                return Ok(val);
+            if !egcl_rt::symbols::is_uninterned(form.as_symbol_index()) {
+                if let Some(val) = env.lookup_var(&name) {
+                    return Ok(val);
+                }
             }
             if std::env::var_os("EGCL_UNBOUND_DBG").is_some() {
                 eprintln!(
@@ -35854,17 +35903,17 @@ fn key_bare(sym: EgclVal) -> String {
 /// Parse an &optional/&aux element: `var` | `(var [default [supplied-p]])`.
 fn parse_var_spec(elem: EgclVal) -> (String, EgclVal, Option<String>) {
     if elem.is_symbol() {
-        return (sym_name(elem), NIL, None);
+        return (lexical_identity::key(elem), NIL, None);
     }
     if elem.is_cons() {
         let (var, r) = cp(elem);
         let (default, r2) = if r.is_cons() { cp(r) } else { (NIL, NIL) };
         let supp = if r2.is_cons() {
-            Some(sym_name(cp(r2).0))
+            Some(lexical_identity::key(cp(r2).0))
         } else {
             None
         };
-        return (sym_name(var), default, supp);
+        return (lexical_identity::key(var), default, supp);
     }
     (String::new(), NIL, None)
 }
@@ -35880,25 +35929,25 @@ fn parse_key_spec(elem: EgclVal) -> (String, String, EgclVal, Option<String>) {
     // bound variable name stays the full symbol name so the body's references
     // (which resolve to the same symbol) find the binding.
     if elem.is_symbol() {
-        let var = sym_name(elem);
-        return (symbol_bare_name(&var), var, NIL, None);
+        let var = lexical_identity::key(elem);
+        return (symbol_bare_name(&sym_name(elem)), var, NIL, None);
     }
     if elem.is_cons() {
         let (head, r) = cp(elem);
         let (default, r2) = if r.is_cons() { cp(r) } else { (NIL, NIL) };
         let supp = if r2.is_cons() {
-            Some(sym_name(cp(r2).0))
+            Some(lexical_identity::key(cp(r2).0))
         } else {
             None
         };
         if head.is_symbol() {
-            let var = sym_name(head);
-            return (symbol_bare_name(&var), var, default, supp);
+            let var = lexical_identity::key(head);
+            return (symbol_bare_name(&sym_name(head)), var, default, supp);
         }
         if head.is_cons() {
             let (kw_sym, r3) = cp(head);
             let var = if r3.is_cons() {
-                sym_name(cp(r3).0)
+                lexical_identity::key(cp(r3).0)
             } else {
                 String::new()
             };
@@ -36058,7 +36107,7 @@ fn bind_parameter(
 ) {
     bind_lexical_parameter(env, name, value);
     if let Some(early) = early.as_deref_mut()
-        && let Some(index) = egcl_rt::symbols::find_index(name)
+        && let Some(index) = lexical_identity::index(name)
     {
         early.bind(EgclVal::from_symbol_index(index), value);
     }
@@ -36071,8 +36120,8 @@ fn bind_parameter(
 /// reject a keyword another applicable method declares (bliss-lb6.14: ASDF's
 /// OPERATE :around declares :verbose, the primary method does not).
 fn bind_lexical_parameter(env: &mut Env, name: &str, value: EgclVal) {
-    env.define_local(name, value);
-    if let Some(index) = egcl_rt::symbols::find_index(name) {
+    env.define_lexical_local(name, value);
+    if let Some(index) = lexical_identity::index(name) {
         shadow_locally_special(env, EgclVal::from_symbol_index(index));
     }
 }
@@ -36188,7 +36237,7 @@ fn bind_lambda_list_ex(
                     ));
                 }
                 let remaining = args.get(arg_i..).unwrap_or(&[]);
-                bind_parameter(env, &sym_name(elem), vec_to_list(remaining), &mut early);
+                bind_parameter(env, &lexical_identity::key(elem), vec_to_list(remaining), &mut early);
                 key_start.get_or_insert(arg_i);
                 rest_bound = true;
             }
@@ -36621,7 +36670,7 @@ fn bind_macro_lambda_list_with_environment(
                     let (pat, r) = cp(elem);
                     let (default, r2) = if r.is_cons() { cp(r) } else { (NIL, NIL) };
                     let supp = if r2.is_cons() {
-                        Some(sym_name(cp(r2).0))
+                        Some(lexical_identity::key(cp(r2).0))
                     } else {
                         None
                     };
@@ -36638,7 +36687,7 @@ fn bind_macro_lambda_list_with_environment(
                     bind_macro_param(pattern, value, env, macroexpand_env)?;
                     arg_i += 1;
                     if let Some(sp) = supp {
-                        env.define_local(&sp, T);
+                        env.define_lexical_local(&sp, T);
                     }
                 } else {
                     let mut dv = if default_form == NIL {
@@ -36649,7 +36698,7 @@ fn bind_macro_lambda_list_with_environment(
                     egcl_rt::rooted_ref!(_default_value_root = &mut dv);
                     bind_macro_param(pattern, dv, env, macroexpand_env)?;
                     if let Some(sp) = supp {
-                        env.define_local(&sp, NIL);
+                        env.define_lexical_local(&sp, NIL);
                     }
                 }
             }
@@ -36683,7 +36732,7 @@ fn bind_macro_lambda_list_with_environment(
                     let (head, r) = cp(elem);
                     let (default, r2) = if r.is_cons() { cp(r) } else { (NIL, NIL) };
                     let supp = if r2.is_cons() {
-                        Some(sym_name(cp(r2).0))
+                        Some(lexical_identity::key(cp(r2).0))
                     } else {
                         None
                     };
@@ -36787,7 +36836,7 @@ fn bind_macro_lambda_list_with_environment(
                 egcl_rt::rooted_ref!(_value_root = &mut v);
                 bind_macro_param(pattern, v, env, macroexpand_env)?;
                 if let Some(sp) = supp {
-                    env.define_local(sp, T);
+                    env.define_lexical_local(sp, T);
                 }
             } else {
                 let mut dv = if default_form == NIL {
@@ -36798,7 +36847,7 @@ fn bind_macro_lambda_list_with_environment(
                 egcl_rt::rooted_ref!(_default_value_root = &mut dv);
                 bind_macro_param(pattern, dv, env, macroexpand_env)?;
                 if let Some(sp) = supp {
-                    env.define_local(sp, NIL);
+                    env.define_lexical_local(sp, NIL);
                 }
             }
         }
