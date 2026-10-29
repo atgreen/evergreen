@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- Compiled printer calls preserve callback conditions, restarts, and nonlocal
+  transfers without leaking errors into later operations
+  ([#835](https://github.com/atgreen/evergreen/pull/835)).
+
 - String and stream printers consistently honor `*PRINT-ARRAY*` for array
   layouts, and string printers render package objects through their print hook
   ([#830](https://github.com/atgreen/evergreen/pull/830)).
