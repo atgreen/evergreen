@@ -1452,6 +1452,8 @@
         (t (error "~S is not a feature expression" expression))))
 (defun egcl::%standard-dispatch-reader-macro (stream sub-char arg)
   (case sub-char
+    ((#\= #\#)
+     (egcl::%read-standard-macro stream #\# sub-char arg))
     (#\'
      ;; FUNCTION's operand is read recursively in the caller's readtable.
      ;; Re-reading a synthesized #' prefix with the standard readtable would

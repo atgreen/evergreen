@@ -1560,6 +1560,95 @@ pub fn read_standard_macro_from_stream(
     })
 }
 
+/// Invoke the native circular-label operation in the caller's readtable.
+/// The macro character and numeric parameter have already been consumed.
+pub fn read_standard_label_from_stream(
+    stream: &mut dyn ReaderStream,
+    sub: char,
+    label: u64,
+    read_base: u32,
+    read_eval: bool,
+) -> Result<Vec<EgclVal>, EgclError> {
+    if !matches!(sub, '=' | '#') {
+        return Err(EgclError::StreamError("not a circular-label reader macro".into()));
+    }
+    egcl_rt::rooted!(scope = CircularLabelScope::enter(true));
+    let labels = scope.labels.clone();
+    let mut input = ReaderInput {
+        chars: InputChars::Buffered(Vec::new()),
+        stream: Some(stream),
+        eof: false,
+        initial_standard_macro: None,
+    };
+    let (value, consumed) = read_circular_label(
+        &mut input,
+        0,
+        &labels,
+        label,
+        sub == '=',
+        read_base,
+        read_eval,
+        default_string_reader_circular_mode(),
+        0,
+    )?;
+    egcl_rt::rooted!(value = value);
+    input.unread_lookahead(consumed)?;
+    Ok(vec![*value])
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_circular_label(
+    chars: &mut ReaderInput<'_>,
+    pos: usize,
+    labels: &CircularLabels,
+    num: u64,
+    definition: bool,
+    read_base: u32,
+    read_eval: bool,
+    read_circular: bool,
+    depth: usize,
+) -> Result<(EgclVal, usize), EgclError> {
+    if !read_circular {
+        return Err(EgclError::StreamError(
+            "circular reader notation is disabled".into(),
+        ));
+    }
+    if !definition {
+        return labels
+            .labels
+            .borrow()
+            .get(&num)
+            .copied()
+            .map(|value| (value, pos))
+            .ok_or_else(|| EgclError::StreamError(format!("undefined label #{}", num)));
+    }
+    // Pre-allocate a placeholder cons cell for circular references
+    let mut placeholder = alloc_cons(NIL, NIL);
+    // The labeled read below allocates and can fire a relocating
+    // minor GC; the shared labels-table copy is rooted but this
+    // Rust local is not — root it so the patch below writes into
+    // the placeholder's post-GC address (bliss-wlf).
+    egcl_rt::rooted_ref!(_ph_root = &mut placeholder);
+    labels.labels.borrow_mut().insert(num, placeholder);
+    let (val, p) = read_object_with_base(
+        chars,
+        pos,
+        labels,
+        read_base,
+        read_eval,
+        read_circular,
+        depth + 1,
+    )?;
+    labels.labels.borrow_mut().insert(num, val);
+    for labeled in labels.labels.borrow_mut().values_mut() {
+        if *labeled == placeholder {
+            *labeled = val;
+        }
+    }
+    patch_circular_label(val, placeholder, labels.labels.borrow().values().copied());
+    Ok((val, p))
+}
+
 // ── Core reader ───────────────────────────────────────────────────
 
 pub fn read(state: &mut ReaderState) -> Result<EgclVal, EgclError> {
@@ -3442,50 +3531,19 @@ fn read_sharpsign_with_base(
                     u32::try_from(num).unwrap_or(u32::MAX),
                 );
             }
-            '=' => {
-                if !read_circular {
-                    return Err(EgclError::StreamError(
-                        "circular reader notation is disabled".into(),
-                    ));
-                }
-                pos += 1;
-                // Pre-allocate a placeholder cons cell for circular references
-                let mut placeholder = alloc_cons(NIL, NIL);
-                // The labeled read below allocates and can fire a relocating
-                // minor GC; the shared labels-table copy is rooted but this
-                // Rust local is not — root it so the patch below writes into
-                // the placeholder's post-GC address (bliss-wlf).
-                egcl_rt::rooted_ref!(_ph_root = &mut placeholder);
-                labels.labels.borrow_mut().insert(num, placeholder);
-                let (val, p) = read_object_with_base(
+            '=' | '#' => {
+                let definition = chars.at(pos)? == '=';
+                return read_circular_label(
                     chars,
-                    pos,
+                    pos + 1,
                     labels,
+                    num,
+                    definition,
                     read_base,
                     read_eval,
                     read_circular,
-                    depth + 1,
-                )?;
-                labels.labels.borrow_mut().insert(num, val);
-                for labeled in labels.labels.borrow_mut().values_mut() {
-                    if *labeled == placeholder {
-                        *labeled = val;
-                    }
-                }
-                patch_circular_label(val, placeholder, labels.labels.borrow().values().copied());
-                return Ok((val, p));
-            }
-            '#' => {
-                if !read_circular {
-                    return Err(EgclError::StreamError(
-                        "circular reader notation is disabled".into(),
-                    ));
-                }
-                pos += 1;
-                if let Some(&val) = labels.labels.borrow().get(&num) {
-                    return Ok((val, pos));
-                }
-                return Err(EgclError::StreamError(format!("undefined label #{}", num)));
+                    depth,
+                );
             }
             other => {
                 if let Some(result) = try_custom_sharp_dispatch(
