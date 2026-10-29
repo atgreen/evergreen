@@ -1609,6 +1609,7 @@ fn is_known_special_operator(val: EgclVal) -> bool {
                 // options are not expressions; only :METHOD bodies are code
                 // (GitHub #441).
                 | "DEFGENERIC"
+                | "DEFSTRUCT"
                 // COND is lowered directly (not a macro): macroexpand must expand
                 // its clauses so symbol-macros inside them are handled (bliss-x5y.20).
                 | "COND"
@@ -1743,6 +1744,7 @@ fn expand_special_form(
             expand_definer_body(form, env, 2)
         }
         "DEFGENERIC" => expand_defgeneric(form, env),
+        "DEFSTRUCT" => expand_defstruct(form, env),
         // For IF, PROGN, CATCH, THROW, UNWIND-PROTECT, MULTIPLE-VALUE-CALL,
         // MULTIPLE-VALUE-PROG1, PROGV — all subforms are
         // expression positions, so the generic walk is correct.
@@ -2562,6 +2564,76 @@ fn expand_defgeneric(mut form: EgclVal, env: &Environment) -> Result<EgclVal, Eg
         return Ok(form);
     }
     Ok(vec_to_cons(&expanded))
+}
+
+/// A structure slot's name and options are data; only its initializer is code.
+fn expand_structure_slot(slot: EgclVal, env: &Environment) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted!(slot = slot);
+    if !slot.is_cons() {
+        return Ok(*slot);
+    }
+    egcl_rt::rooted!(parts = cons_to_vec(*slot));
+    if parts.len() < 2 {
+        return Ok(*slot);
+    }
+    let value = macroexpand_all(parts[1], env)?;
+    if value == parts[1] {
+        return Ok(*slot);
+    }
+    parts[1] = value;
+    Ok(vec_to_cons(&parts))
+}
+
+/// Preserve DEFSTRUCT's structural syntax while resolving lexical macros in
+/// slot initializers, inherited initializer overrides, and BOA defaults.
+fn expand_defstruct(form: EgclVal, env: &Environment) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted!(form = form);
+    egcl_rt::rooted!(items = cons_to_vec(*form));
+    if items.len() < 2 {
+        return Ok(*form);
+    }
+    let mut changed = false;
+    if items[1].is_cons() {
+        egcl_rt::rooted!(name_options = cons_to_vec(items[1]));
+        for index in 1..name_options.len() {
+            if !name_options[index].is_cons() {
+                continue;
+            }
+            egcl_rt::rooted!(option = cons_to_vec(name_options[index]));
+            let kind = get_symbol_name(option[0]).unwrap_or_default();
+            let mut option_changed = false;
+            match kind.rsplit(':').next().unwrap_or("") {
+                "INCLUDE" => {
+                    for slot in 2..option.len() {
+                        let expanded = expand_structure_slot(option[slot], env)?;
+                        option_changed |= expanded != option[slot];
+                        option[slot] = expanded;
+                    }
+                }
+                "CONSTRUCTOR" if option.len() == 3 => {
+                    let (params, _) = expand_lambda_list(
+                        option[2], egcl_rt::value::NIL, env, false,
+                    )?;
+                    option_changed = params != option[2];
+                    option[2] = params;
+                }
+                _ => {}
+            }
+            if option_changed {
+                name_options[index] = vec_to_cons(&option);
+                changed = true;
+            }
+        }
+        if changed {
+            items[1] = vec_to_cons(&name_options);
+        }
+    }
+    for index in 2..items.len() {
+        let expanded = expand_structure_slot(items[index], env)?;
+        changed |= expanded != items[index];
+        items[index] = expanded;
+    }
+    if changed { Ok(vec_to_cons(&items)) } else { Ok(*form) }
 }
 
 /// Expand a lambda call: ((lambda (params...) body...) arg1 arg2 ...)
