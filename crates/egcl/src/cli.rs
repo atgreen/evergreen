@@ -48475,6 +48475,9 @@ fn image_toplevel() -> Option<EgclVal> {
 
 // ── CLI driver ─────────────────────────────────────────────────────
 pub fn run(args: &[String]) -> Result<i32, EgclError> {
+    // Saved FFI handles are reopened during image restore, so publish linked
+    // native providers before selecting or restoring any saved world.
+    native_runtime::register_linked_libraries()?;
     // Publish the stack limit compiled code guards its direct self-calls
     // against, from a frame near the base of this thread's stack.
     //

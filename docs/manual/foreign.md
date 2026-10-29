@@ -8,9 +8,11 @@ operation.
 
 ## Runtime and ABI requirements
 
-Dynamic library loading requires a dynamic EGCL build with `egcl-rt/c-ffi`.
-The Fedora native RPM and Android APK runtime provide dynamic builds. The
-static Android CLI and default static musl CLI do not dynamically load libraries.
+Registered static archives work without a dynamic loader; see
+[Static builds and native libraries](../static-build.md). Default x86-64 and
+AArch64 Unix builds also have a Rust ELF loader for compatible shared objects
+with a limited host symbol surface. System dynamic loading uses `egcl-rt/c-ffi`;
+embedded shared objects currently require that backend.
 Foreign call and callback support are architecture-specific; ordinary Lisp
 execution on a target does not establish FFI parity.
 
@@ -119,7 +121,11 @@ promise to pin the Lisp vector in place. Cleanup also runs on nonlocal exit.
 (egcl-ffi:close-foreign-library library)
 ```
 
-Supply a pathname understood by the platform's dynamic loader. A library object
+Supply a registered static-library name or alias, or a pathname understood by
+the selected loader. Static providers take precedence under their registered
+names. Closing a static handle invalidates it but does not unload linked code.
+Look up foreign symbol pointers again after image restore; saved pointers are
+cleared, while saved library handles are reopened. A library object
 is distinct from a foreign pointer. Supplying the library to symbol lookup
 makes the lookup scope explicit; omitting it uses the default lookup scope.
 Close the library only when no code can call its symbols or use its data.

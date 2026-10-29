@@ -1,5 +1,7 @@
 {
   "fast": {
+    "egcl:test:static_foreign_manifest": [""],
+    "egcl-rt:test:ffi_static_libraries": [""],
     "egcl:test:shake_cli": ["native_shake_distinguishes_qualified_operations_and_actual_builtin_aliases"],
     "egcl:test:format_logical_fill_cli": [""],
     "egcl:test:local_function_aux_cli": [""],
