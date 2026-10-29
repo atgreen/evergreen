@@ -1255,6 +1255,131 @@ impl Emitter<'_> {
         self.store(result, W0)
     }
 
+    /// `TryIntegerShr`: a success-only `(ash x -bits)` probe over a fixnum or a
+    /// ONE-LIMB bignum. Two results -- `results[0]` is T or NIL, `results[1]`
+    /// the answer -- and the caller branches on the flag to the retained ASH
+    /// call, so this never deopts and never signals.
+    ///
+    /// Why a bignum arm is the point: a fixnum right shift is already native
+    /// everywhere, so the operation only earns its keep on values that are
+    /// bignums. Measured on this machine before the arm existed, a bignum
+    /// `(ash x -8)` cost 50x a fixnum one; on x86-64, where the arm is
+    /// enabled, the same ratio is 4x.
+    ///
+    /// The negative case is the subtle one. The magnitude is UNSIGNED, so it is
+    /// shifted logically, and CL's ASH floors rather than truncating -- so when
+    /// any discarded bit was set the negated quotient is one further down.
+    /// Getting that wrong is off-by-one on exactly the inputs that have a
+    /// remainder, which positive-only testing never reaches.
+    fn try_integer_shr(&mut self, data: &InstData) -> Result<(), EmitError> {
+        use egcl_rt::object::type_id;
+        const FIXNUM_MAX: i64 = (1 << 60) - 1;
+        const FIXNUM_MIN: i64 = -(1 << 60);
+        let AuxData::FixnumImm(bits) = data.aux else {
+            return Err(EmitError::UnsupportedOp(op_tag(data.opcode)));
+        };
+        if data.args.len() != 1 || data.results.len() != 2 || bits <= 0 {
+            return Err(EmitError::UnsupportedOp(op_tag(data.opcode)));
+        }
+        if self
+            .function
+            .value(data.args[0])
+            .repr
+            != ValueRepresentation::Tagged
+        {
+            return Err(EmitError::UnsupportedOp(op_tag(data.opcode)));
+        }
+        let failed = self.asm.label();
+        let fixnum = self.asm.label();
+        let positive = self.asm.label();
+        let success = self.asm.label();
+        let done = self.asm.label();
+        self.load(data.args[0], W0)?;
+        self.asm
+            .word(a64::and_imm(T0, W0, 7).expect("7 is a logical immediate"));
+        self.compare_imm(T0, 0);
+        self.asm.jcc(Cc::E, fixnum);
+        self.compare_imm(T0, egcl_rt::value::TAG_HEAP_OBJECT);
+        self.asm.jcc(Cc::Ne, failed);
+        self.asm
+            .word(a64::and_imm(W0, W0, !7u64).expect("!7 is a logical immediate"));
+        self.asm
+            .word(a64::ldrb_imm(T0, W0, 7).expect("7 fits the byte-form offset"));
+        self.compare_imm(T0, u64::from(type_id::BIGNUM));
+        self.asm.jcc(Cc::Ne, failed);
+        // One limb only: a wider magnitude needs the general call.
+        self.asm
+            .word(a64::ldr_w_imm(T0, W0, 12).expect("12 fits the word-form offset"));
+        self.compare_imm(T0, 1);
+        self.asm.jcc(Cc::Ne, failed);
+        self.asm
+            .word(a64::ldr_w_imm(T1, W0, 8).expect("8 fits the word-form offset"));
+        self.load_at(W0, W0, 16)?;
+        // A canonical bignum's magnitude is nonzero; zero is a fixnum.
+        self.compare_imm(W0, 0);
+        self.asm.jcc(Cc::E, failed);
+        self.compare_imm(T1, 1);
+        self.asm.jcc(Cc::E, positive);
+        // `sign` is an i32 read zero-extended, so -1 arrives as 0xFFFFFFFF.
+        // Materialised into T0 explicitly rather than through `compare_imm`,
+        // whose fallback for a value `CMP` cannot encode -- and 0xFFFFFFFF is
+        // one -- goes through the ADDR scratch.
+        self.imm(T0, u64::from(u32::MAX));
+        self.compare(T1, T0);
+        self.asm.jcc(Cc::Ne, failed);
+        if bits >= 64 {
+            // Every bit of a one-limb magnitude is discarded, and flooring a
+            // negative value leaves -1.
+            self.imm(W0, (-1i64) as u64);
+        } else {
+            let shift = bits as u32;
+            self.imm(T0, (1u64 << shift) - 1);
+            self.asm.word(a64::and(T0, W0, T0));
+            self.asm.word(a64::lsr_imm(W0, W0, shift));
+            self.asm.word(a64::neg(W0, W0));
+            let exact = self.asm.label();
+            self.compare_imm(T0, 0);
+            self.asm.jcc(Cc::E, exact);
+            self.asm
+                .word(a64::sub_imm(W0, W0, 1).expect("1 fits the immediate field"));
+            self.asm.bind(exact);
+            if bits < 4 {
+                self.imm(T0, FIXNUM_MIN as u64);
+                self.compare(W0, T0);
+                self.asm.jcc(Cc::L, failed);
+            }
+        }
+        self.asm.jmp(success);
+        self.asm.bind(positive);
+        if bits >= 64 {
+            self.imm(W0, 0);
+        } else {
+            self.asm.word(a64::lsr_imm(W0, W0, bits as u32));
+            if bits < 4 {
+                self.imm(T0, FIXNUM_MAX as u64);
+                self.compare(W0, T0);
+                self.asm.jcc(Cc::G, failed);
+            }
+        }
+        self.asm.jmp(success);
+        self.asm.bind(fixnum);
+        // Untag, then shift. Saturated at 63 because a 61-bit payload shifted
+        // further only ever yields 0 or -1, which the shift already gives.
+        self.asm.word(a64::asr_imm(W0, W0, 3));
+        self.asm
+            .word(a64::asr_imm(W0, W0, bits.min(63) as u32));
+        self.asm.bind(success);
+        self.asm.word(a64::lsl_imm(W0, W0, 3));
+        self.imm(W1, T.0);
+        self.asm.jmp(done);
+        self.asm.bind(failed);
+        self.imm(W0, 0);
+        self.imm(W1, NIL.0);
+        self.asm.bind(done);
+        self.store(data.results[1], W0)?;
+        self.store(data.results[0], W1)
+    }
+
     // ── control flow ─────────────────────────────────────────────
 
     fn edge(&mut self, edge: &BlockCall) -> Result<(), EmitError> {
@@ -1699,6 +1824,7 @@ impl Emitter<'_> {
             }
             StringCharOrNil => return self.string_char_or_nil(data),
             IntegerLowBits => return self.integer_low_bits(data),
+            TryIntegerShr => return self.try_integer_shr(data),
             VecRef | VecSet | ArrayReadDiscarded => return self.element_access(data),
             Jump if data.targets.len() == 1 => return self.edge(&data.targets[0]),
             Brif if data.args.len() == 1 && data.targets.len() == 2 => {
