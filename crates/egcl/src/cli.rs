@@ -51820,6 +51820,81 @@ mod setf_environment_tests {
     fn fasl_cleanup_on_error() {
         check_cleanup(true, true);
     }
+
+    fn check_ordinary_macro_place_relocation(fail: bool) {
+        let _lock = heap_test_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        egcl_rt::rooted!(env = Env::new(false));
+        let definition = if fail {
+            r#"(defmacro ordinary-moving-place (argument &environment e)
+               (declare (ignore argument))
+               (%force-minor-gc-for-test)
+               (if e (error "expected ordinary place error") nil))"#
+        } else {
+            r#"(defmacro ordinary-moving-place (argument &environment e)
+               (%force-minor-gc-for-test)
+               (if e (list 'car argument) (error "missing macro environment")))"#
+        };
+        read_eval_all_env(definition, &mut env).unwrap();
+        let _outer_scope = MacroexpandEnvScope::new();
+        egcl_rt::rooted!(outer = store_macroexpand_environment(MacroexpandEnv::null()));
+        const SOURCE: &str = "(ordinary-moving-place '(original))";
+        let _ = read_from_string_in_env(SOURCE, &mut env).unwrap();
+        egcl_rt::gc::collect_t0_minor().unwrap();
+        let _ = arena_cons(NIL, NIL);
+        egcl_rt::rooted!(place = read_from_string_in_env(SOURCE, &mut env).unwrap().0);
+        egcl_rt::rooted!(argument = cp(cp(*place).1).0);
+        let before_place = place.to_raw();
+        let before_argument = argument.to_raw();
+        let environments_before = MACROEXPAND_ENVIRONMENTS.with(|envs| envs.borrow().len());
+        let result = get_setf_expansion(*place, &mut env);
+        assert_ne!(
+            place.to_raw(),
+            before_place,
+            "ordinary macro callback must run and relocate its place"
+        );
+        assert_ne!(
+            argument.to_raw(),
+            before_argument,
+            "argument syntax must actually relocate"
+        );
+        if fail {
+            assert!(result.is_err(), "ordinary place macro error must propagate");
+        } else {
+            let expansion = result.unwrap();
+            assert_eq!(expansion.temps.len(), 1);
+            assert_eq!(
+                expansion.vals,
+                vec![*argument],
+                "value expression preserves exact argument identity"
+            );
+            assert_eq!(expansion.stores.len(), 1);
+            let access = list_to_vec(expansion.access_form);
+            assert_eq!(symbol_bare_name(&sym_name(access[0])), "CAR");
+            assert_eq!(access[1..], expansion.temps);
+            let store = list_to_vec(expansion.store_form);
+            assert_eq!(symbol_bare_name(&sym_name(store[0])), "%SETF");
+            assert_eq!(store[1], expansion.access_form);
+            assert_eq!(store[2], expansion.stores[0]);
+        }
+        assert!(load_macroexpand_environment(*outer).is_some());
+        assert_eq!(
+            MACROEXPAND_ENVIRONMENTS.with(|envs| envs.borrow().len()),
+            environments_before,
+            "ordinary place macro must release its temporary expansion environment"
+        );
+    }
+
+    #[test]
+    fn ordinary_macro_place_relocates_and_cleans_environment() {
+        check_ordinary_macro_place_relocation(false);
+    }
+
+    #[test]
+    fn ordinary_macro_place_error_relocates_and_cleans_environment() {
+        check_ordinary_macro_place_relocation(true);
+    }
 }
 
 #[cfg(test)]
