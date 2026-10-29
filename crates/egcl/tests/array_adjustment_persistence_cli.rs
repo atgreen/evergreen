@@ -91,7 +91,7 @@ fn adjustable_array_graph_loads_without_source_and_preserves_metadata_and_aliase
     let unit = image
         .section(egcl_rt::bfasl::section::BYTECODE_UNIT)
         .unwrap();
-    assert_eq!(u16::from_le_bytes(unit[4..6].try_into().unwrap()), 0x0300);
+    assert_eq!(u16::from_le_bytes(unit[4..6].try_into().unwrap()), 0x0301);
     assert_ne!(u32::from_le_bytes(unit[8..12].try_into().unwrap()) & 1, 0);
     std::fs::write(
         dir.0.join("portable.bfasl"),

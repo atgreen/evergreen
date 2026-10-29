@@ -180,6 +180,16 @@ fn bytecode_references_with_params(
         refs.push(function.params_form);
     }
     refs.extend(function.load_time_values.iter().map(|(_, value)| *value));
+    for (key, _) in &function.param_layout {
+        if let Some(symbol) = super::lexical_identity::symbol(key) { refs.push(symbol); }
+    }
+    for instruction in &function.code {
+        if let Instr::LoadEnvVar(index) | Instr::StoreEnvVar(index) | Instr::DefineEnvVar(index) = instruction {
+            if let Some(symbol) = function.names.get(*index as usize).and_then(|key| super::lexical_identity::symbol(key)) {
+                refs.push(symbol);
+            }
+        }
+    }
     for instruction in &function.code {
         if let Instr::CallNamed { sym, .. }
         | Instr::LoadFunction(sym)

@@ -6,7 +6,10 @@ use egcl_rt::symbols::ResolvedSymbolName;
 
 /// Stable metadata addressed by native code, owned from emission until the
 /// last activation/direct caller releases that exact installed code version.
-/// Contains no Lisp heap pointers and needs no GC root registration.
+/// Contains no Lisp heap pointers and needs no separate GC root registration:
+/// the native owner's retained BytecodeFunction traces any symbol identities in
+/// its lexical keys. Encoded keys stay opaque here; lexical helpers decode them
+/// instead of using a ResolvedSymbolName cache entry as their symbol identity.
 #[derive(Default)]
 pub(super) struct NativeEnvNames(Vec<ResolvedSymbolName>);
 

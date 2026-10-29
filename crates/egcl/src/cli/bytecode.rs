@@ -101,6 +101,7 @@ pub(super) use native_transfer_tests::ordinary_special_osr::ordinary_special_osr
 mod native_env_tests;
 mod native_env;
 use native_env::NativeEnvNames;
+use super::lexical_identity::{self, key as var_name};
 mod pending_error;
 mod call_table;
 #[path = "bytecode/variadic_plan.rs"]
@@ -474,7 +475,17 @@ unsafe fn trace_bytecode_graph(
             trace_bytecode_graph(Arc::as_ptr(nested) as *mut BytecodeFunction, visit, seen);
         }
     }
+    trace_lexical_keys(&function.code, &function.names, visit);
+    for (key, _) in &function.param_layout { lexical_identity::trace(key, visit); }
     trace_instruction_roots(&function.code, visit, seen);
+}
+
+fn trace_lexical_keys(code: &[Instr], names: &[String], visit: &mut dyn FnMut(*mut EgclVal)) {
+    for instruction in code {
+        if let Instr::LoadEnvVar(index) | Instr::StoreEnvVar(index) | Instr::DefineEnvVar(index) = instruction {
+            if let Some(key) = names.get(*index as usize) { lexical_identity::trace(key, visit); }
+        }
+    }
 }
 
 fn trace_instruction_roots(
@@ -2668,9 +2679,9 @@ impl InlineLocal {
     /// materialized closure installs its original environment for the call.
     fn can_inline_in(&self, lowerer: &Lowerer<'_>) -> bool {
         let (params, body) = flet_def_forms(self.definition);
-        let params: std::collections::HashSet<_> = list_to_vec(params).into_iter().map(sym_name).collect();
+        let params: std::collections::HashSet<_> = list_to_vec(params).into_iter().map(var_name).collect();
         let mut used = std::collections::HashSet::new();
-        collect_symbol_names(body, &mut used);
+        collect_variable_names(body, &mut used);
         used.iter().filter(|name| !params.contains(*name)).all(|name| {
             if self.declared_special.contains_key(name) || is_special_name(name) { return true; }
             let definition = self.scopes.iter().enumerate().rev()
@@ -2690,6 +2701,10 @@ impl InlineLocal {
 impl egcl_rt::gc::TraceHostRoots for InlineLocal {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
         visit(&mut self.definition);
+        for key in self.scopes.iter().flat_map(|scope| scope.keys())
+            .chain(self.declared_special.keys()) {
+            lexical_identity::trace(key, visit);
+        }
         let mut seen = std::collections::HashSet::new();
         for &symbol in self.local_fns.values() {
             trace_private_function_roots(symbol, visit, &mut seen);
@@ -2736,6 +2751,12 @@ impl egcl_rt::gc::TraceHostRoots for Lowerer<'_> {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
         let mut seen = std::collections::HashSet::new();
         trace_instruction_roots(&self.code, visit, &mut seen);
+        trace_lexical_keys(&self.code, &self.names, visit);
+        for key in self.scopes.iter().flat_map(|scope| scope.keys())
+            .chain(self.captured_names.iter()).chain(self.enclosing_slots.iter())
+            .chain(self.declared_special.keys()) {
+            lexical_identity::trace(key, visit);
+        }
         for &symbol in self.local_fns.values() {
             trace_private_function_roots(symbol, visit, &mut seen);
         }
@@ -3015,7 +3036,7 @@ impl<'e> Lowerer<'e> {
         }
         // Keyword symbols self-evaluate; other symbols are variable refs.
         if form.is_symbol() {
-            let name = sym_name(form);
+            let name = var_name(form);
             if name.starts_with(':') || name.starts_with("KEYWORD:") {
                 let c = self.add_const(form);
                 self.emit(Instr::Const(c));
@@ -3761,7 +3782,7 @@ impl<'e> Lowerer<'e> {
                 let (name, init) = binding_name_init(binding_forms[bi])?;
                 self.lower_expr(init)?;
                 if is_here_special(&name) {
-                    let symbol = resolve_sym(&name).ok_or(Bail)?.as_symbol_index();
+                    let symbol = lexical_identity::resolve(&name).ok_or(Bail)?.as_symbol_index();
                     self.emit(Instr::BindSpecial(symbol));
                 } else {
                     let loc = self.alloc_local(&name);
@@ -3803,7 +3824,7 @@ impl<'e> Lowerer<'e> {
                     // sees these lexical bindings.
                     self.shadow_declared_special(&name, &mut shadowed);
                 } else {
-                    let symbol = resolve_sym(&name).ok_or(Bail)?.as_symbol_index();
+                    let symbol = lexical_identity::resolve(&name).ok_or(Bail)?.as_symbol_index();
                     self.emit(Instr::BindSpecial(symbol));
                 }
                 self.pop_n(1);
@@ -3841,7 +3862,7 @@ impl<'e> Lowerer<'e> {
         egcl_rt::rooted_ref!(_helper = &mut helper);
         egcl_rt::rooted!(args = list_to_vec(rest));
         let (params, _) = flet_def_forms(helper.definition);
-        let names: Vec<String> = list_to_vec(params).into_iter().map(sym_name).collect();
+        let names: Vec<String> = list_to_vec(params).into_iter().map(var_name).collect();
         if names.len() != args.len() || self.next_local as usize + names.len() > u16::MAX as usize {
             return Err(Bail);
         }
@@ -4234,7 +4255,7 @@ impl<'e> Lowerer<'e> {
         if self.env.has_symbol_macro(var.as_symbol_index()) {
             return Err(Bail);
         }
-        let name = sym_name(var);
+        let name = var_name(var);
         // A name only DECLARED special (LOCALLY, or a binding form's DECLARE)
         // is stored in its dynamic value, even where a lexical binding of the
         // same name encloses the declaration (bliss-35xxb). STORE-GLOBAL cannot
@@ -4646,7 +4667,7 @@ impl<'e> Lowerer<'e> {
             if !form.is_symbol() {
                 return false;
             }
-            let var = sym_name(form);
+            let var = var_name(form);
             !is_special_name(&var)
                 && !self.declared_special.contains_key(&var)
                 && matches!(self.lookup_local(&var), Some(VarLoc::Slot(_)))
@@ -6441,16 +6462,16 @@ impl<'e> Lowerer<'e> {
                 if !var.is_symbol() {
                     return Err(Bail);
                 }
-                let var_name = sym_name(var);
+                let var_key = var_name(var);
                 let decl_special = body_declared_special(body);
-                if is_special_name(&var_name) || decl_special.contains(&var_name) {
+                if is_special_name(&var_key) || decl_special.contains(&var_key) {
                     // A special clause variable binds DYNAMICALLY, like the same
                     // variable in a LET (CLHS 3.3.4; ansi HANDLER-CASE.11). The
                     // driver stores the condition in a hidden lexical slot and
                     // the body runs inside `(let ((VAR hidden)) (declare (special
                     // VAR)) ...)`, whose lowering establishes the dynamic binding.
                     egcl_rt::rooted!(hidden = super::gensym_symbol("HANDLER-CASE-CONDITION"));
-                    let slot = self.alloc_slot(&sym_name(*hidden));
+                    let slot = self.alloc_slot(&var_name(*hidden));
                     let let_sym = super::resolve_sym("LET").ok_or(Bail)?;
                     let declare_sym = super::resolve_sym("DECLARE").ok_or(Bail)?;
                     let special_sym = super::resolve_sym("SPECIAL").ok_or(Bail)?;
@@ -6464,7 +6485,7 @@ impl<'e> Lowerer<'e> {
                     *clause_body = arena_cons(*let_form, NIL);
                     Some(slot)
                 } else {
-                    Some(self.alloc_slot(&var_name))
+                    Some(self.alloc_slot(&var_key))
                 }
             } else {
                 None
@@ -6590,11 +6611,11 @@ impl<'e> Lowerer<'e> {
             let params: std::collections::HashSet<String> = list_to_vec(params_form)
                 .iter()
                 .filter(|p| p.is_symbol())
-                .map(|p| sym_name(*p))
+                .map(|p| var_name(*p))
                 .filter(|n| !n.starts_with('&'))
                 .collect();
             let mut used = std::collections::HashSet::new();
-            collect_symbol_names(body, &mut used);
+            collect_variable_names(body, &mut used);
             // Every boxed local in scope is reachable too, as for a closure: a
             // clause can name one only through a macro expansion, which this
             // scan of its raw source cannot see (bliss-uamr7).
@@ -6980,7 +7001,7 @@ impl<'e> Lowerer<'e> {
         self.enter_scope();
         let slot_base = self.next_local;
         for i in 0..vars.len() {
-            self.alloc_slot(&sym_name(vars[i]));
+            self.alloc_slot(&var_name(vars[i]));
         }
         self.emit(Instr::TakeValuesToLocals {
             nvars: vars.len() as u16,
@@ -6999,11 +7020,11 @@ impl<'e> Lowerer<'e> {
         let decl_special = body_declared_special(body);
         let mut special_count: u16 = 0;
         for i in 0..vars.len() {
-            let name = sym_name(vars[i]);
+            let name = var_name(vars[i]);
             if !(is_special_name(&name) || decl_special.contains(&name)) {
                 continue;
             }
-            let symbol = resolve_sym(&name).ok_or(Bail)?.as_symbol_index();
+            let symbol = lexical_identity::resolve(&name).ok_or(Bail)?.as_symbol_index();
             self.emit(Instr::LoadLocal(slot_base + i as u16));
             self.push_n(1);
             self.emit(Instr::BindSpecial(symbol));
@@ -7022,7 +7043,7 @@ impl<'e> Lowerer<'e> {
         // instead of its own binding (bliss-7v68).
         let mut shadowed = Vec::new();
         for i in 0..vars.len() {
-            let name = sym_name(vars[i]);
+            let name = var_name(vars[i]);
             if !(is_special_name(&name) || decl_special.contains(&name)) {
                 self.shadow_declared_special(&name, &mut shadowed);
             }
@@ -7268,7 +7289,7 @@ impl<'e> Lowerer<'e> {
         let params: std::collections::HashSet<String> = list_to_vec(params_form)
             .iter()
             .filter(|p| p.is_symbol())
-            .map(|p| sym_name(*p))
+            .map(|p| var_name(*p))
             .filter(|n| !n.starts_with('&'))
             .collect();
         let mut used = std::collections::HashSet::new();
@@ -7278,7 +7299,7 @@ impl<'e> Lowerer<'e> {
         // closure carries no environment and the default signals UNBOUND-VARIABLE.
         collect_lambda_list_init_names(params_form, &mut used);
         for f in list_to_vec(body) {
-            collect_symbol_names(f, &mut used);
+            collect_variable_names(f, &mut used);
         }
         let enclosing: std::collections::HashSet<&String> =
             self.scopes.iter().flat_map(|s| s.keys()).collect();
@@ -7318,7 +7339,7 @@ impl<'e> Lowerer<'e> {
         if !self.declared_special.is_empty() {
             egcl_rt::rooted!(specials = vec![resolve_sym("SPECIAL").ok_or(Bail)?]);
             for name in self.declared_special.keys() {
-                specials.push(resolve_sym(name).ok_or(Bail)?);
+                specials.push(lexical_identity::resolve(name).ok_or(Bail)?);
             }
             egcl_rt::rooted!(declaration = form_list(&specials));
             *declaration = form_list(&[resolve_sym("DECLARE").ok_or(Bail)?, *declaration]);
@@ -7622,7 +7643,7 @@ impl<'e> Lowerer<'e> {
             let binds_a_declared_special = list_to_vec(params_form)
                 .iter()
                 .filter(|p| p.is_symbol())
-                .map(|p| sym_name(*p))
+                .map(|p| var_name(*p))
                 .any(|n| decl_special.contains(&n));
             if binds_a_declared_special {
                 return Err(record_bail(|| "declare:special-parameter-flet".to_string()));
@@ -7685,12 +7706,12 @@ impl<'e> Lowerer<'e> {
             let params: std::collections::HashSet<String> = list_to_vec(params_form)
                 .iter()
                 .filter(|p| p.is_symbol())
-                .map(|p| sym_name(*p))
+                .map(|p| var_name(*p))
                 .filter(|n| !n.starts_with('&'))
                 .collect();
             let mut used = std::collections::HashSet::new();
             for f in list_to_vec(fbody) {
-                collect_symbol_names(f, &mut used);
+                collect_variable_names(f, &mut used);
             }
             used.iter()
                 .any(|u| enclosing.contains(u) && !params.contains(u))
@@ -7854,11 +7875,11 @@ impl<'e> Lowerer<'e> {
             let params: std::collections::HashSet<String> = list_to_vec(params_form)
                 .iter()
                 .filter(|p| p.is_symbol())
-                .map(|p| sym_name(*p))
+                .map(|p| var_name(*p))
                 .collect();
             let mut used = std::collections::HashSet::new();
             for f in list_to_vec(fbody) {
-                collect_symbol_names(f, &mut used);
+                collect_variable_names(f, &mut used);
             }
             slot_captured.extend(used.into_iter().filter(|u| {
                 enclosing_slots.contains(u)
@@ -8912,8 +8933,12 @@ fn compile_restart_clause(
 }
 
 /// Collect symbols outside QUOTE as a conservative free-variable approximation.
+fn collect_variable_names(form: EgclVal, out: &mut std::collections::HashSet<String>) {
+    collect_symbol_names_qq(form, out, 0, true);
+}
+
 fn collect_symbol_names(form: EgclVal, out: &mut std::collections::HashSet<String>) {
-    collect_symbol_names_qq(form, out, 0);
+    collect_symbol_names_qq(form, out, 0, false);
 }
 
 /// [`collect_symbol_names`] with quasiquote awareness (bliss-t9o1). `qq` is the
@@ -8927,10 +8952,10 @@ fn collect_symbol_names(form: EgclVal, out: &mut std::collections::HashSet<Strin
 /// Inside a template (`qq > 0`) bare symbols are DATA (not collected), every
 /// cons is scanned structurally, QUASIQUOTE deepens, and UNQUOTE /
 /// UNQUOTE-SPLICING return to evaluated code one level up.
-fn collect_symbol_names_qq(form: EgclVal, out: &mut std::collections::HashSet<String>, qq: u32) {
+fn collect_symbol_names_qq(form: EgclVal, out: &mut std::collections::HashSet<String>, qq: u32, lexical: bool) {
     if form.is_symbol() {
         if qq == 0 {
-            out.insert(sym_name(form));
+            out.insert(if lexical { var_name(form) } else { sym_name(form) });
         }
         return;
     }
@@ -8940,19 +8965,19 @@ fn collect_symbol_names_qq(form: EgclVal, out: &mut std::collections::HashSet<St
             let head = sym_bare_name_rc(car);
             match head.as_ref() {
                 "QUASIQUOTE" => {
-                    collect_symbol_names_qq(cdr, out, qq + 1);
+                    collect_symbol_names_qq(cdr, out, qq + 1, lexical);
                     return;
                 }
                 "UNQUOTE" | "UNQUOTE-SPLICING" if qq > 0 => {
-                    collect_symbol_names_qq(cdr, out, qq - 1);
+                    collect_symbol_names_qq(cdr, out, qq - 1, lexical);
                     return;
                 }
                 "QUOTE" if qq == 0 => return,
                 _ => {}
             }
         }
-        collect_symbol_names_qq(car, out, qq);
-        collect_symbol_names_qq(cdr, out, qq);
+        collect_symbol_names_qq(car, out, qq, lexical);
+        collect_symbol_names_qq(cdr, out, qq, lexical);
     }
 }
 
@@ -8994,6 +9019,10 @@ fn closure_fn_binding_key(name: &str) -> String {
 }
 
 fn is_special_name(name: &str) -> bool {
+    if let Some(symbol) = lexical_identity::symbol(name) {
+        return super::is_special_var(symbol);
+    }
+    let name = lexical_identity::name(name);
     let bare = name.rsplit(':').next().unwrap_or(name);
     let b = bare.as_bytes();
     if b.len() > 2 && b[0] == b'*' && b[b.len() - 1] == b'*' && super::earmuff_convention_active() {
@@ -9010,7 +9039,7 @@ fn binding_name_init(b: EgclVal) -> LowerResult<(String, EgclVal)> {
     let name = if b.is_cons() { cp(b).0 } else { b };
     super::reject_assignment_to_constant(name).map_err(|_| Bail)?;
     if b.is_symbol() {
-        return Ok((sym_name(b), NIL));
+        return Ok((var_name(b), NIL));
     }
     if b.is_cons() {
         let (name, rest) = cp(b);
@@ -9018,7 +9047,7 @@ fn binding_name_init(b: EgclVal) -> LowerResult<(String, EgclVal)> {
             return Err(Bail);
         }
         let init = if rest.is_cons() { cp(rest).0 } else { NIL };
-        return Ok((sym_name(name), init));
+        return Ok((var_name(name), init));
     }
     Err(Bail)
 }
@@ -9093,16 +9122,16 @@ fn is_bail_special(name: &str) -> bool {
 /// or `None` for a shape the binder can't handle (e.g. destructuring).
 fn parse_opt_aux_spec(elem: EgclVal) -> Option<(String, Option<String>)> {
     if elem.is_symbol() {
-        return Some((sym_name(elem), None));
+        return Some((var_name(elem), None));
     }
     if elem.is_cons() {
         let items = list_to_vec(elem);
         if items.is_empty() || !items[0].is_symbol() {
             return None;
         }
-        let var = sym_name(items[0]);
+        let var = var_name(items[0]);
         // items: [var], [var default], [var default supplied-p]
-        let sp = items.get(2).filter(|v| v.is_symbol()).map(|v| sym_name(*v));
+        let sp = items.get(2).filter(|v| v.is_symbol()).map(|v| var_name(*v));
         return Some((var, sp));
     }
     None
@@ -9112,7 +9141,7 @@ fn parse_opt_aux_spec(elem: EgclVal) -> Option<(String, Option<String>)> {
 /// `((keyword var) …)`. Returns `(var, supplied_p?)`.
 fn parse_key_spec(elem: EgclVal) -> Option<(String, Option<String>)> {
     if elem.is_symbol() {
-        return Some((sym_name(elem), None));
+        return Some((var_name(elem), None));
     }
     if elem.is_cons() {
         let items = list_to_vec(elem);
@@ -9121,17 +9150,17 @@ fn parse_key_spec(elem: EgclVal) -> Option<(String, Option<String>)> {
         }
         // The name is either `var` or `(keyword var)`.
         let var = if items[0].is_symbol() {
-            sym_name(items[0])
+            var_name(items[0])
         } else if items[0].is_cons() {
             let kv = list_to_vec(items[0]);
             if kv.len() != 2 || !kv[1].is_symbol() {
                 return None;
             }
-            sym_name(kv[1])
+            var_name(kv[1])
         } else {
             return None;
         };
-        let sp = items.get(2).filter(|v| v.is_symbol()).map(|v| sym_name(*v));
+        let sp = items.get(2).filter(|v| v.is_symbol()).map(|v| var_name(*v));
         return Some((var, sp));
     }
     None
@@ -9383,7 +9412,7 @@ fn parse_lambda_list(params_form: EgclVal) -> Option<(Vec<String>, u16, Option<u
                 if !elem.is_symbol() {
                     return None; // destructuring not supported
                 }
-                names.push(sym_name(elem));
+                names.push(var_name(elem));
                 n_required += 1;
             }
             Mode::Opt => {
@@ -9398,7 +9427,7 @@ fn parse_lambda_list(params_form: EgclVal) -> Option<(Vec<String>, u16, Option<u
                 if !elem.is_symbol() {
                     return None;
                 }
-                names.push(sym_name(elem));
+                names.push(var_name(elem));
             }
             Mode::Key => {
                 let (var, sp) = parse_key_spec(elem)?;
@@ -9451,7 +9480,7 @@ fn parse_macro_lambda_list(params_form: EgclVal) -> Option<(Vec<String>, u16, Op
             return Some(());
         }
         if pattern.is_symbol() {
-            names.push(sym_name(pattern));
+            names.push(var_name(pattern));
             return Some(());
         }
         if !pattern.is_cons() {
@@ -9523,7 +9552,7 @@ fn parse_macro_lambda_list(params_form: EgclVal) -> Option<(Vec<String>, u16, Op
                 };
                 collect_pattern(pattern, &mut names)?;
                 if let Some(supplied) = parts.get(2).filter(|value| value.is_symbol()) {
-                    names.push(sym_name(*supplied));
+                    names.push(var_name(*supplied));
                 }
                 optional = optional.checked_add(1)?;
             }
@@ -9542,7 +9571,7 @@ fn parse_macro_lambda_list(params_form: EgclVal) -> Option<(Vec<String>, u16, Op
                 };
                 collect_pattern(pattern, &mut names)?;
                 if let Some(supplied) = parts.get(2).filter(|value| value.is_symbol()) {
-                    names.push(sym_name(*supplied));
+                    names.push(var_name(*supplied));
                 }
             }
             Mode::Aux => {
@@ -9703,7 +9732,7 @@ fn body_declared_special(body: EgclVal) -> std::collections::HashSet<String> {
             if head.is_symbol() && sym_bare_name_rc(head).as_ref() == "SPECIAL" {
                 for v in list_to_vec(vars) {
                     if v.is_symbol() {
-                        out.insert(sym_name(v));
+                        out.insert(var_name(v));
                     }
                 }
             }
@@ -9760,10 +9789,13 @@ fn declared_parameter_types(body: EgclVal, params: &[String]) -> Option<Vec<Decl
                 if !variable.is_symbol() {
                     continue;
                 }
-                let variable_name = sym_name(variable);
+                let variable_name = var_name(variable);
                 let Some(index) = params.iter().position(|param| {
                     param == &variable_name
-                        || symbol_bare_name(param) == symbol_bare_name(&variable_name)
+                        || (lexical_identity::symbol_index(param).is_none()
+                            && lexical_identity::symbol_index(&variable_name).is_none()
+                            && symbol_bare_name(lexical_identity::name(param))
+                                == symbol_bare_name(lexical_identity::name(&variable_name)))
                 }) else {
                     continue;
                 };
@@ -9888,8 +9920,8 @@ fn compile_function_in(
     egcl_rt::rooted!(body = body);
     let mut forced: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut source_names = std::collections::HashSet::new();
-    collect_symbol_names(*params_form, &mut source_names);
-    collect_symbol_names(*body, &mut source_names);
+    collect_variable_names(*params_form, &mut source_names);
+    collect_variable_names(*body, &mut source_names);
     let retry_budget = source_names.len().saturating_add(1).max(4);
     for _ in 0..retry_budget {
         let _ = take_box_request();
@@ -10234,7 +10266,7 @@ fn collect_lambda_list_init_names(
         // `(var init …)` or, for &key, `((:keyword var) init …)`: everything
         // after the variable specifier is a form evaluated in this scope.
         let (_var, init_forms) = cp(elem);
-        collect_symbol_names(init_forms, out);
+        collect_variable_names(init_forms, out);
     }
 }
 
@@ -10335,12 +10367,12 @@ fn compute_captured_names(body: EgclVal) -> std::collections::HashSet<String> {
                 let params: std::collections::HashSet<String> = list_to_vec(params_form)
                     .iter()
                     .filter(|p| p.is_symbol())
-                    .map(|p| sym_name(*p))
+                    .map(|p| var_name(*p))
                     .collect();
                 let mut used = std::collections::HashSet::new();
                 collect_lambda_list_init_names(params_form, &mut used);
                 for f in list_to_vec(lbody) {
-                    collect_symbol_names(f, &mut used);
+                    collect_variable_names(f, &mut used);
                     walk(f, out); // nested lambdas
                 }
                 for u in used {
@@ -10362,10 +10394,10 @@ fn compute_captured_names(body: EgclVal) -> std::collections::HashSet<String> {
                     let params = list_to_vec(params_form)
                         .into_iter()
                         .filter(|param| param.is_symbol())
-                        .map(sym_name)
+                        .map(var_name)
                         .collect::<std::collections::HashSet<_>>();
                     let mut used = std::collections::HashSet::new();
-                    collect_symbol_names(clause_body, &mut used);
+                    collect_variable_names(clause_body, &mut used);
                     for name in used {
                         if !params.contains(&name) {
                             out.insert(name);
@@ -10397,10 +10429,10 @@ fn compute_captured_names(body: EgclVal) -> std::collections::HashSet<String> {
                     let params = list_to_vec(params_form)
                         .into_iter()
                         .filter(|param| param.is_symbol())
-                        .map(sym_name)
+                        .map(var_name)
                         .collect::<std::collections::HashSet<_>>();
                     let mut used = std::collections::HashSet::new();
-                    collect_symbol_names(fbody, &mut used);
+                    collect_variable_names(fbody, &mut used);
                     collect_lambda_list_init_names(params_form, &mut used);
                     for name in used {
                         if !params.contains(&name) {
@@ -10423,7 +10455,7 @@ fn compute_captured_names(body: EgclVal) -> std::collections::HashSet<String> {
                 let (vals_form, body) = cp(tail);
                 walk(syms_form, out);
                 walk(vals_form, out);
-                collect_symbol_names(body, out);
+                collect_variable_names(body, out);
                 for form in list_to_vec(body) {
                     walk(form, out);
                 }
@@ -10550,7 +10582,9 @@ const BBU_MAGIC: &[u8; 4] = b"BBU\0";
 // 0x0300: opaque random-state constants (tag 31). Older bodies can construct
 // cons-shaped states, which cannot be distinguished from ordinary user lists.
 // Reject all earlier-major units before installing or executing anything.
-const BBU_BYTECODE_VERSION: u16 = 0x0300;
+// 0x0301: variable environment operands/parameter keys may reference pooled
+// uninterned symbols, reconstructed with fresh identities on portable load.
+const BBU_BYTECODE_VERSION: u16 = 0x0301;
 mod array_constants;
 mod make_load_form;
 #[cfg(test)]
@@ -10762,6 +10796,15 @@ impl BbuConstPool {
             ))
         } else {
             Ok(())
+        }
+    }
+
+
+    fn lexical_name(&mut self, key: &str) -> Option<u32> {
+        if let Some(symbol) = lexical_identity::symbol(key) {
+            self.value(symbol)
+        } else {
+            Some(self.string(lexical_identity::name(key)))
         }
     }
 
@@ -11118,10 +11161,11 @@ impl BbuConstPool {
             if let Some(r) = self.symbol_by_index(idx) {
                 return Some(r);
             }
-            // A detached dense-index symbol is already restored at this exact
-            // index by the image's symbol-object section. Preserve its identity
-            // with other image roots; portable artifacts still use tag 16.
-            if self.saved_heap_refs && !egcl_rt::symbols::is_uninterned(idx) {
+            // Homeless symbols are restored at their exact indices by the
+            // image's symbol-object section. Lambda-list leaves, lexical keys,
+            // and captured frames must all retain that same identity.
+            // Portable artifacts instead reconstruct fresh symbols with tag 16.
+            if self.saved_heap_refs {
                 let mut bytes = vec![21];
                 put_u64(&mut bytes, v.to_raw());
                 return Some(self.intern_encoded(bytes));
@@ -11419,15 +11463,15 @@ fn serialize_bbu_function(
             Instr::ValuesToList => put_u8(&mut code, 0x16),
             Instr::LoadEnvVar(name_idx) => {
                 put_u8(&mut code, 0x3c);
-                put_u32(&mut code, pool.string(bf.names.get(*name_idx as usize)?));
+                put_u32(&mut code, pool.lexical_name(bf.names.get(*name_idx as usize)?)?);
             }
             Instr::StoreEnvVar(name_idx) => {
                 put_u8(&mut code, 0x3d);
-                put_u32(&mut code, pool.string(bf.names.get(*name_idx as usize)?));
+                put_u32(&mut code, pool.lexical_name(bf.names.get(*name_idx as usize)?)?);
             }
             Instr::DefineEnvVar(name_idx) => {
                 put_u8(&mut code, 0x3e);
-                put_u32(&mut code, pool.string(bf.names.get(*name_idx as usize)?));
+                put_u32(&mut code, pool.lexical_name(bf.names.get(*name_idx as usize)?)?);
             }
             Instr::PushEnvChild => put_u8(&mut code, 0x36),
             Instr::PopEnvChild => put_u8(&mut code, 0x37),
@@ -11616,16 +11660,16 @@ fn serialize_bbu_function(
         .iter()
         .enumerate()
         .map(|(index, (name, location))| {
-            (
-                pool.string(name),
+            Some((
+                pool.lexical_name(name)?,
                 *location,
                 bf.param_types
                     .get(index)
                     .copied()
                     .unwrap_or(DeclaredType::Any),
-            )
+            ))
         })
-        .collect();
+        .collect::<Option<Vec<_>>>()?;
     Some(BbuFunction {
         self_call_sites: bf.self_call_sites.iter().map(|&pc| bbu_pc(pc, &offsets, end_pc)).collect::<Option<Vec<_>>>()?,
         notinline_sites: bf.notinline_sites.iter().map(|&pc| bbu_pc(pc, &offsets, end_pc)).collect::<Option<Vec<_>>>()?,
@@ -13418,6 +13462,53 @@ fn bbu_string(constants: &[BbuConstant], index: u32) -> Result<&str, EgclError> 
     }
 }
 
+fn validate_bbu_lexical_name(constants: &[BbuConstant], reference: u32, version: u16) -> Result<(), EgclError> {
+    match &constants[bbu_index(reference, constants.len(), "lexical name")?] {
+        BbuConstant::String(_) => Ok(()),
+        BbuConstant::UninternedSymbol(name) if version >= 0x0301 => {
+            bbu_string(constants, *name).map(|_| ())
+        }
+        BbuConstant::SavedHeapRef(raw) if version >= 0x0301
+            && EgclVal::from_raw(*raw).symbol_index()
+                .is_some_and(|index| egcl_rt::symbols::is_uninterned(index)
+                    && egcl_rt::symbols::symbol_name(index).is_some()) => Ok(()),
+        _ => Err(bbu_error("lexical name must reference a string or supported uninterned symbol")),
+    }
+}
+
+/// Validate typed variable-name operands before materializing packages, symbols,
+/// or executing any load action. Every wire instruction has bounded fixed width
+/// except CHECK_RESULT's explicitly tagged scalar-range payload.
+fn validate_bbu_lexical_operands(code: &[u8], constants: &[BbuConstant], version: u16) -> Result<(), EgclError> {
+    let mut cursor = BbuCursor::new(code);
+    while !cursor.done() {
+        let count = match cursor.u8()? {
+            0x3c..=0x3e => {
+                validate_bbu_lexical_name(constants, cursor.u32()?, version)?;
+                0
+            }
+            0x01 | 0x07 | 0x08 | 0x09 | 0x1c | 0x15 | 0x18 | 0x19 | 0x1a
+                | 0x1f | 0x3f | 0x40 | 0x2a | 0x46 | 0x47 => 4,
+            0x02 | 0x03 | 0x1d | 0x13 | 0x10 | 0x42 => 2,
+            0x0d | 0x0b | 0x20 | 0x22 | 0x24 | 0x28 => 6,
+            0x1e | 0x43 => 14,
+            0x23 | 0x25 | 0x41 => 8,
+            0x2c => 10,
+            0x44 => 1,
+            0x45 => match cursor.u8()? {
+                0..=2 => 0,
+                3 => 16,
+                _ => return Err(bbu_error("invalid result type")),
+            },
+            0x11 | 0x12 | 0x14 | 0x16 | 0x21 | 0x26 | 0x27 | 0x30 | 0x29
+                | 0x2b | 0x2d | 0x36 | 0x37 => 0,
+            opcode => return Err(bbu_error(format!("unknown opcode 0x{opcode:02x}"))),
+        };
+        cursor.take(count)?;
+    }
+    Ok(())
+}
+
 fn bbu_package(constants: &[BbuConstant], index: u32) -> Result<(&str, &[u32]), EgclError> {
     match &constants[bbu_index(index, constants.len(), "package constant")?] {
         BbuConstant::Package {
@@ -14166,6 +14257,17 @@ fn bbu_string_from_values(constants: &[EgclVal], index: u32) -> Result<String, E
     Ok(val_as_str(value))
 }
 
+fn bbu_lexical_key_from_values(constants: &[EgclVal], reference: u32, version: u16) -> Result<String, EgclError> {
+    let value = constants[bbu_index(reference, constants.len(), "lexical name")?];
+    if value.is_string() {
+        return Ok(lexical_identity::ordinary(&val_as_str(value)));
+    }
+    if version >= 0x0301 && value.symbol_index().is_some_and(egcl_rt::symbols::is_uninterned) {
+        return Ok(var_name(value));
+    }
+    Err(bbu_error("invalid lexical name constant"))
+}
+
 fn decode_bbu_function(
     encoded: &EncodedBbuFunction,
     constants: &[EgclVal],
@@ -14369,7 +14471,7 @@ fn decode_bbu_function(
             0x37 => Instr::PopEnvChild,
             0x3c..=0x3e => {
                 let opcode = encoded.code[starts.last().copied().unwrap() as usize];
-                let name = bbu_string_from_values(constants, cursor.u32()?)?;
+                let name = bbu_lexical_key_from_values(constants, cursor.u32()?, bytecode_version)?;
                 let index = names.len();
                 if index > u16::MAX as usize {
                     return Err(bbu_error("too many environment names"));
@@ -14484,7 +14586,7 @@ fn decode_bbu_function(
         let mut layout = Vec::with_capacity(metadata.params.len());
         let mut types = Vec::with_capacity(metadata.params.len());
         for &(name_ref, location, declared_type) in &metadata.params {
-            layout.push((bbu_string_from_values(constants, name_ref)?, location));
+            layout.push((bbu_lexical_key_from_values(constants, name_ref, bytecode_version)?, location));
             types.push(declared_type);
         }
         (layout, types, metadata.has_env, metadata.variadic)
@@ -15399,10 +15501,10 @@ fn frame_capture_names(frame: Arc<SharedCell<EnvFrame>>) -> std::collections::Ha
     let mut current = Some(frame);
     while let Some(frame) = current {
         let frame = frame.borrow();
-        captures.extend(frame.vars.keys().filter(|name| !is_special_name(name)).cloned());
+        captures.extend(frame.vars.keys().map(|name| lexical_identity::ordinary(name)).filter(|name| !is_special_name(name)));
         captures.extend(
             frame.symbol_vars.keys()
-                .map(|&index| sym_name(EgclVal::from_symbol_index(index)))
+                .map(|&index| var_name(EgclVal::from_symbol_index(index)))
                 .filter(|name| !is_special_name(name)),
         );
         current = frame.parent.clone();
@@ -16783,6 +16885,7 @@ fn load_bbu_definitions(bytes: &[u8], env: &mut Env, restoring: bool) -> Result<
         }
     }
     for function in &encoded_functions {
+        validate_bbu_lexical_operands(&function.code, &encoded_constants, bytecode_version)?;
         if let Some(metadata) = &function.metadata {
             // From 0x0203 a positional function may be optional-range: it
             // requires arity_min arguments of its arity_max slots.
@@ -16802,7 +16905,7 @@ fn load_bbu_definitions(bytes: &[u8], env: &mut Env, restoring: bool) -> Result<
                 return Err(bbu_error("macro function has no lambda-list metadata"));
             }
             for &(name_ref, location, _) in &metadata.params {
-                bbu_string(&encoded_constants, name_ref)?;
+                validate_bbu_lexical_name(&encoded_constants, name_ref, bytecode_version)?;
                 match location {
                     VarLoc::Slot(slot) if slot < function.n_locals => {}
                     VarLoc::Boxed if metadata.has_env => {}
@@ -17749,12 +17852,7 @@ fn pop_env_child(env_frame: &mut Option<Arc<SharedCell<EnvFrame>>>) {
 /// Define a captured parameter in an activation's heap environment. Keep the
 /// name and symbol-index maps in sync, just like `DefineEnvVar`.
 fn bind_boxed_param(env_frame: &Arc<SharedCell<EnvFrame>>, name: &str, value: EgclVal) {
-    let symbol_index = egcl_rt::symbols::find_index(name);
-    let mut borrowed = env_frame.borrow_mut();
-    if let Some(idx) = symbol_index {
-        borrowed.symbol_vars.insert(idx, value);
-    }
-    borrowed.vars.insert(name.to_string(), value);
+    Env::define_lexical_frame(env_frame, name, value);
 }
 
 #[inline]
@@ -17922,8 +18020,8 @@ fn bind_variadic(
         .map(Arc::clone)
         .unwrap_or_else(|| Arc::clone(&env.frame));
     // `param_layout` names are frozen into the .bfasl at compile time, but
-    // `bind_lambda_list` binds each parameter under its *live* symbol's
-    // rendered name (`define_local_symbol` keys `vars` by `sym_name`). A
+    // `bind_lambda_list` binds each parameter under its live symbol identity.
+    // Ordinary interned symbols also retain legacy name-based frame entries. A
     // symbol's rendered name can differ between compile and load — e.g. a
     // package-internal symbol renders `PKG::NAME` after a source-free load but
     // was `PKG:NAME` when the layout string was captured — so the frozen key
@@ -17943,7 +18041,7 @@ fn bind_variadic(
                 .and_then(|n| n.get(i))
                 .map(String::as_str)
                 .unwrap_or(name.as_str());
-            let v = super::Env::lookup_frame(&cur, key).unwrap_or(NIL);
+            let v = super::Env::lookup_lexical_frame(&cur, key).unwrap_or(NIL);
             match loc {
                 VarLoc::Slot(s) => unsafe { slot_set(frame, *s, v) },
                 VarLoc::Boxed => bind_boxed_param(
@@ -18062,7 +18160,7 @@ fn bind_macro_variadic(
                 .and_then(|n| n.get(i))
                 .map(String::as_str)
                 .unwrap_or(name.as_str());
-            let value = super::Env::lookup_frame(&current, key).unwrap_or(NIL);
+            let value = super::Env::lookup_lexical_frame(&current, key).unwrap_or(NIL);
             match location {
                 VarLoc::Slot(slot) => unsafe { slot_set(frame, *slot, value) },
                 VarLoc::Boxed => bind_boxed_param(
@@ -18523,7 +18621,8 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                 let s = EgclVal::from_symbol_index(sym);
                 let val = env
                     .lookup_var_symbol(s)
-                    .or_else(|| env.lookup_var(&sym_name(s)));
+                    .or_else(|| (!egcl_rt::symbols::is_uninterned(sym))
+                        .then(|| env.lookup_var(&sym_name(s))).flatten());
                 match val {
                     Some(v) => acts[top_idx].push_op(v),
                     None => {
@@ -18641,10 +18740,10 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                     .env_frame
                     .clone()
                     .expect("LoadEnvVar without a heap EnvFrame");
-                match Env::lookup_frame(&ef, &name) {
+                match Env::lookup_lexical_frame(&ef, &name) {
                     Some(v) => acts[top_idx].push_op(v),
                     None => {
-                        let s = resolve_sym(&name).unwrap_or(NIL);
+                        let s = lexical_identity::resolve(&name).unwrap_or(NIL);
                         initiate_unwind(
                             acts,
                             stack,
@@ -18661,7 +18760,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                     .env_frame
                     .clone()
                     .expect("StoreEnvVar without a heap EnvFrame");
-                Env::set_frame_var(&ef, &name, v);
+                Env::set_lexical_frame(&ef, &name, v);
             }
             Instr::DefineEnvVar(name_idx) => {
                 let name = acts[top_idx].func.names[name_idx as usize].clone();
@@ -18670,12 +18769,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                     .env_frame
                     .clone()
                     .expect("DefineEnvVar without a heap EnvFrame");
-                let symbol_index = egcl_rt::symbols::find_index(&name);
-                let mut borrowed = ef.borrow_mut();
-                if let Some(idx) = symbol_index {
-                    borrowed.symbol_vars.insert(idx, v);
-                }
-                borrowed.vars.insert(name, v);
+                Env::define_lexical_frame(&ef, &name, v);
             }
             Instr::PushEnvChild => push_env_child(&mut acts[top_idx].env_frame),
             Instr::PopEnvChild => pop_env_child(&mut acts[top_idx].env_frame),
@@ -20484,11 +20578,13 @@ extern "C" fn c2i_load_env(names: *const NativeEnvNames, name_index: u64) -> u64
         let frame = slot.borrow();
         match frame
             .as_ref()
-            .and_then(|frame| Env::lookup_resolved_frame(frame, name, symbol_index))
+            .and_then(|frame| if lexical_identity::encoded(name) {
+                Env::lookup_lexical_frame(frame, name)
+            } else { Env::lookup_resolved_frame(frame, name, symbol_index) })
         {
             Some(value) => value.0,
             None => {
-                let symbol = resolve_sym(name).unwrap_or(NIL);
+                let symbol = lexical_identity::resolve(name).unwrap_or(NIL);
                 stash_native_error(EgclError::UnboundVariable(symbol));
                 NIL.0
             }
@@ -20509,9 +20605,12 @@ extern "C" fn c2i_store_env(names: *const NativeEnvNames, name_index: u64, value
     let symbol_index = resolved.index();
     NATIVE_ENV_FRAME.with(|slot| {
         if let Some(frame) = slot.borrow().as_ref() {
-            if !Env::set_resolved_frame_var(frame, name, symbol_index, EgclVal(value)) {
+            let updated = if lexical_identity::encoded(name) {
+                Env::set_lexical_frame(frame, name, EgclVal(value))
+            } else { Env::set_resolved_frame_var(frame, name, symbol_index, EgclVal(value)) };
+            if !updated {
                 stash_native_error(EgclError::UnboundVariable(
-                    resolve_sym(name).unwrap_or(NIL),
+                    lexical_identity::resolve(name).unwrap_or(NIL),
                 ));
             }
         }
@@ -20528,14 +20627,9 @@ extern "C" fn c2i_define_env(names: *const NativeEnvNames, name_index: u64, valu
         return;
     };
     let name = resolved.name();
-    let symbol_index = resolved.index();
     NATIVE_ENV_FRAME.with(|slot| {
         if let Some(frame) = slot.borrow().as_ref() {
-            let mut borrowed = frame.borrow_mut();
-            if let Some(symbol_index) = symbol_index {
-                borrowed.symbol_vars.insert(symbol_index, EgclVal(value));
-            }
-            borrowed.vars.insert(name.to_owned(), EgclVal(value));
+            Env::define_lexical_frame(frame, name, EgclVal(value));
         }
     });
 }
@@ -32010,6 +32104,10 @@ fn mixed_local_sibling_inlines_a_transitive_capture() {
 
 #[cfg(test)]
 mod detached_symbol_persistence_tests;
+#[cfg(test)]
+mod lexical_wire_tests;
+#[cfg(test)]
+mod lexical_identity_tests;
 #[cfg(test)]
 mod packed_u8_persistence_tests;
 

@@ -307,7 +307,7 @@ fn memory_fence_call_persists_without_source_fallback() {
         "must not embed legacy source"
     );
     let bbu = bfasl_section(&bytes, 12).expect("compiled bytecode unit");
-    assert_eq!(u16::from_le_bytes(bbu[4..6].try_into().unwrap()), 0x0300);
+    assert_eq!(u16::from_le_bytes(bbu[4..6].try_into().unwrap()), 0x0301);
     let start = bbu_action_start(bbu);
     let (_, _, count) = bbu_counts(&bytes);
     for action in bbu[start..start + count as usize * 14].chunks_exact(14) {
