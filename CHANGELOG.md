@@ -4,6 +4,11 @@
 
 ### Fixed
 
+- Delivery distinguishes application functions such as `MY-PARSER::READ`
+  from Common Lisp code-opening operations, avoiding unnecessary whole-world
+  retention while preserving actual builtin aliases
+  ([#886](https://github.com/atgreen/evergreen/pull/886)).
+
 - Class metadata fallback resolves symbol names before locking its source
   table, avoiding lock-order panics during condition construction
   ([#884](https://github.com/atgreen/evergreen/pull/884)).
