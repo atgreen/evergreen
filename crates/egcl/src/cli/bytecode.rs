@@ -13415,16 +13415,6 @@ pub fn build_bbu_from_forms(
             }
         }
 
-        let form_errors = take_file_expansion_errors();
-        if !form_errors.is_empty() {
-            let context = toplevel_form_context(form);
-            expansion_errors.extend(
-                form_errors
-                    .into_iter()
-                    .map(|error| format!("in: {context}\n{error}")),
-            );
-        }
-
         pool.check_portable_function_literals()?;
         if !done {
             if std::env::var_os("EGCL_BFASL_FORM").is_some() {
@@ -13444,14 +13434,56 @@ pub fn build_bbu_from_forms(
             // interpreted.
             // Its macros are expanded now, in the compilation environment, so
             // the loader does not expand them again in its own (GitHub #530).
-            // An expansion the pool cannot externalize keeps the source form.
-            egcl_rt::rooted!(expanded = super::expand_load_source_form(form, env)?);
-            if let Some(form_ref) = pool.value(*expanded).or_else(|| pool.value(form)) {
+            // Only non-function fallbacks may retain an original form when its
+            // expansion cannot be externalized.
+            let function_definition = as_defun(form).is_some();
+            egcl_rt::rooted!(
+                expanded = if function_definition {
+                    match super::expand_load_source_function(form, env) {
+                        Ok(expanded) => expanded,
+                        Err(error) => match file_expansion_failure(form, &error) {
+                            Some(replacement) => {
+                                // Keep a failed compiled function's error in its
+                                // body: loading its definition must not execute it.
+                                let (operator, tail) = cp(form);
+                                let (name, tail) = cp(tail);
+                                let (params, _) = cp(tail);
+                                egcl_rt::rooted!(parts = [operator, name, params, replacement]);
+                                vec_to_list(&parts)
+                            }
+                            None => return Err(error),
+                        },
+                    }
+                } else {
+                    super::expand_load_source_form(form, env)?
+                }
+            );
+            let frozen_ref = pool.value(*expanded);
+            // A compiled DEFUN must never silently revert to executable source
+            // with unexpanded local scopes, including whole-file text fallback.
+            // Its macros have already observed the compilation environment.
+            if frozen_ref.is_none() && function_definition {
+                return Err(bbu_error(
+                    "cannot externalize a function's compile-time macroexpansion",
+                ));
+            }
+            if let Some(form_ref) = frozen_ref.or_else(|| pool.value(form)) {
                 load_actions.push((9, 0, form_ref, BBU_NO_INDEX, BBU_NO_INDEX));
                 done = true;
             }
         }
         pool.check_portable_function_literals()?;
+        // Source-freezing can itself invoke user macro expanders. Drain after
+        // that final walk too, including errors in the last form of a file.
+        let form_errors = take_file_expansion_errors();
+        if !form_errors.is_empty() {
+            let context = toplevel_form_context(form);
+            expansion_errors.extend(
+                form_errors
+                    .into_iter()
+                    .map(|error| format!("in: {context}\n{error}")),
+            );
+        }
         if !done {
             // CLHS 3.2.3: COMPILE-FILE must always produce loadable output.
             // A form whose literals the portable pool cannot externalize —

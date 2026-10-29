@@ -29,9 +29,9 @@ fn fallback_function_freezes_local_scopes_and_preserves_moving_data() {
     egcl_rt::gc::collect_t0_minor().unwrap();
     let _ = arena_cons(NIL, NIL);
     egcl_rt::rooted!(source = read_from_string_in_env(SOURCE, &mut env).unwrap().0);
-    let parts = list_to_vec(*source);
-    let declaration = list_to_vec(parts[3]);
-    let type_declaration = list_to_vec(declaration[1]);
+    egcl_rt::rooted!(parts = list_to_vec(*source));
+    egcl_rt::rooted!(source_declaration = list_to_vec(parts[3]));
+    let type_declaration = list_to_vec(source_declaration[1]);
     egcl_rt::rooted!(type_data = type_declaration[1]);
     egcl_rt::rooted!(quoted_data = cp(cp(parts[6]).1).0);
     egcl_rt::rooted!(load_form = parts[7]);
@@ -48,29 +48,29 @@ fn fallback_function_freezes_local_scopes_and_preserves_moving_data() {
         before_quote,
         "quoted data must really relocate"
     );
-    let output = list_to_vec(*expanded);
-    let declaration = list_to_vec(output[3]);
+    egcl_rt::rooted!(output = list_to_vec(*expanded));
+    egcl_rt::rooted!(output_declaration = list_to_vec(output[3]));
     assert_eq!(
-        list_to_vec(declaration[1])[1],
+        list_to_vec(output_declaration[1])[1],
         *type_data,
         "compound type syntax is data, retaining its exact identity"
     );
-    let value = cp(output[2]).0;
+    egcl_rt::rooted!(value = cp(output[2]).0);
     assert_eq!(
         list_to_vec(output[4]),
         vec![
             EgclVal::from_symbol_index(reader::find_symbol_index("LIST").unwrap()),
-            value,
+            *value,
             EgclVal::from_fixnum(42)
         ],
         "both local macro scopes must be frozen, including symbol-macro arguments"
     );
-    let local_function = list_to_vec(output[5]);
-    let definition = cp(local_function[1]).0;
-    let local_name = cp(definition).0;
+    egcl_rt::rooted!(local_function = list_to_vec(output[5]));
+    egcl_rt::rooted!(definition = cp(local_function[1]).0);
+    egcl_rt::rooted!(local_name = cp(*definition).0);
     assert_eq!(
         list_to_vec(local_function[2]),
-        vec![local_name, value],
+        vec![*local_name, *value],
         "lexical function binding must suppress the same-named global macro"
     );
     assert_eq!(
