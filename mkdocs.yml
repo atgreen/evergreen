@@ -103,6 +103,8 @@ nav:
       - Cross-target executables: user/how-to/cross-build.md
       - Android applications: user/how-to/android.md
       - Android project dictionary: user/reference/android.md
+      - Experimental iOS applications: user/how-to/ios.md
+      - iOS project dictionary: user/reference/ios.md
   - Examples:
       - user/index.md
       - First program: user/tutorials/first-program.md

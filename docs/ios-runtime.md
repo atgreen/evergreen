@@ -50,6 +50,14 @@ creation and runtime cargo rebuilding are refused on iOS. The adapter uses
 [permanent embedded ownership](embedding.md); Lisp exit never intentionally
 terminates the Swift application. This scaffold has not been built or run.
 
+The source checkout also provides `packaging/ios/egcl-ios-new`, which generates
+an ARM64 device/simulator Xcode project around this host API, copies the Lisp
+resource folder intact and builds the static runtime with the selected SDK.
+Runtime paths are JSON data and native link flags come from rustc's ordered
+report. See the [manual](manual/user/how-to/ios.md). The generator, generated
+project, native linker response and SDK build have not been executed; this is
+not working-application evidence.
+
 The scalar ABI and lifecycle source fixtures still need actual execution on
 Apple ARM64, including caller extension, variadic calls, process-handler
 ownership, descendant cleanup, first-explicit-exit codes and post-init GC

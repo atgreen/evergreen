@@ -4,6 +4,11 @@
 
 ### Added
 
+- Add an experimental iOS Xcode project generator with bundled Lisp source,
+  host-worker UI integration and SDK-selected static-runtime linking. Generated
+  projects and Apple execution remain unvalidated
+  ([#910](https://github.com/atgreen/evergreen/pull/910)).
+
 - Add an initial iOS C worker-host API and SwiftUI source scaffold with
   cooperative Lisp shutdown, preserved host control signals, scoped application
   paths and explicit subprocess rejection. Full app/device validation remains

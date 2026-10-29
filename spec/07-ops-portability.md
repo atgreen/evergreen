@@ -364,6 +364,15 @@ compiled-in fallback path (R7.07).
 | macOS | x86-64 | 2 | Rosetta 2 testing accepted; native CI nightly |
 | FreeBSD | x86-64 | 3 | Community-maintained; POSIX layer mostly shared with Linux |
 
+iOS device and ARM64 simulator source implementations are experimental and
+unassigned to a support tier. They enforce a T0 ceiling, use a host-owned UI
+thread and bundled Lisp source, and reject runtime executable mappings and
+subprocess creation. Scalar calls use Apple's ARM64 convention and static
+trampolines; foreign Lisp callbacks and aggregate calls are excluded. No Apple
+SDK linking, simulator/device, signal-recovery, GC-stress or release-binary
+evidence is established by this source implementation. This does not change
+R7.08–R7.13 or advance their stage. See [iOS runtime notes](../docs/ios-runtime.md).
+
 ### 7.5.3  Platform-Specific Concerns
 
 **macOS aarch64:**
