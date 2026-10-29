@@ -13449,7 +13449,7 @@ pub fn build_bbu_from_forms(
                                 let (name, tail) = cp(tail);
                                 let (params, _) = cp(tail);
                                 egcl_rt::rooted!(parts = [operator, name, params, replacement]);
-                                vec_to_list(&parts)
+                                vec_to_list(&parts[..])
                             }
                             None => return Err(error),
                         },
