@@ -12,6 +12,10 @@
   transfers without leaking errors into later operations
   ([#835](https://github.com/atgreen/evergreen/pull/835)).
 
+
+- Sequence construction and coercion validate explicit array ranks and lengths,
+  distinguishing rank-one array specifiers from fixed-length dimension lists
+  ([#844](https://github.com/atgreen/evergreen/pull/844)).
 - String and stream printers consistently honor `*PRINT-ARRAY*` for array
   layouts, and string printers render package objects through their print hook
   ([#830](https://github.com/atgreen/evergreen/pull/830)).
