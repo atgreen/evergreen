@@ -1650,22 +1650,24 @@ pub fn add_symbol(
 /// Seed all 978 ANSI names PRESENT and EXTERNAL in the active registry's
 /// COMMON-LISP package before Lisp bootstrap. This is an identity table, not an
 /// implementation inventory: unimplemented functions and types are still CL
-/// symbols. The special immediate values NIL and T have no symbol-registry cell;
-/// every other name receives a pinned symbol whose home-package cell points at
-/// CL. Idempotent; callers seed after the package exists.
+/// symbols. NIL and T keep their special immediate identities in the package table,
+/// with registry-backed property cells. Every backing symbol has CL as its home
+/// package. Idempotent; callers seed after the package exists.
 pub fn seed_ansi_symbols() -> Result<(), EgclError> {
     let Some(common_lisp) = find_package("COMMON-LISP") else {
         return Ok(());
     };
     for &name in &crate::ansi_symbols::ANSI_SYMBOLS {
+        let index = egcl_rt::symbols::intern(name);
         let sym = match name {
             "NIL" => egcl_rt::value::NIL,
             "T" => egcl_rt::value::T,
-            _ => EgclVal::from_symbol_index(egcl_rt::symbols::intern(name)),
+            _ => EgclVal::from_symbol_index(index),
         };
         add_symbol(common_lisp, name, sym, true)?;
-        if let Some(index) = sym.symbol_index() {
-            egcl_rt::symbols::set_symbol_package(index, common_lisp);
+        egcl_rt::symbols::set_symbol_package(index, common_lisp);
+        if sym == egcl_rt::value::NIL || sym == egcl_rt::value::T {
+            egcl_rt::symbols::define_symbol_constant(index, sym);
         }
     }
     Ok(())

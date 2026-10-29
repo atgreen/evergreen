@@ -1271,7 +1271,8 @@ fn resolve(name: &str) -> Option<Handler> {
                 )));
             }
             egcl_rt::symbols::compare_exchange_symbol_plist(
-                args[0].as_symbol_index(),
+                egcl_rt::symbols::symbol_property_index(args[0])
+                    .ok_or_else(|| EgclError::Internal("unknown symbol plist cell".into()))?,
                 args[1],
                 args[2],
             )
@@ -2797,13 +2798,8 @@ fn resolve(name: &str) -> Option<Handler> {
                     expected: "SYMBOL".to_string(),
                 });
             }
-            // NIL and T report is_symbol()=true but carry the SPECIAL tag, not
-            // TAG_SYMBOL, so as_symbol_index() panics/aborts on them; they have
-            // no registry-backed plist, so nothing to remove (bliss-x7aa).
-            if s == NIL || s == T {
-                return Ok(NIL);
-            }
-            let idx = s.as_symbol_index();
+            let idx = egcl_rt::symbols::symbol_property_index(s)
+                .ok_or_else(|| EgclError::Internal("unknown symbol plist cell".into()))?;
             let plist = egcl_rt::symbols::symbol_plist(idx).unwrap_or(NIL);
             let mut kept: Vec<EgclVal> = Vec::new();
             let mut removed = false;
@@ -3930,9 +3926,9 @@ fn resolve(name: &str) -> Option<Handler> {
                     expected: "SYMBOL".to_string(),
                 });
             }
-            if let Some(idx) = sym.symbol_index() {
-                egcl_rt::symbols::set_symbol_plist(idx, plist);
-            }
+            let idx = egcl_rt::symbols::symbol_property_index(sym)
+                .ok_or_else(|| EgclError::Internal("unknown symbol plist cell".into()))?;
+            egcl_rt::symbols::set_symbol_plist(idx, plist);
             Ok(plist)
         }),
 

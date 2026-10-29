@@ -26116,9 +26116,9 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                                         expected: "SYMBOL".to_string(),
                                     });
                                 }
-                                if let Some(idx) = sym.symbol_index() {
-                                    egcl_rt::symbols::set_symbol_plist(idx, *val);
-                                }
+                                let idx = egcl_rt::symbols::symbol_property_index(sym)
+                                    .expect("symbol property cells initialized before evaluation");
+                                egcl_rt::symbols::set_symbol_plist(idx, *val);
                             }
                             "SLOT-VALUE" => {
                                 // (setf (slot-value instance slot-name) val)
@@ -33830,13 +33830,9 @@ fn snapshot_macro_expander(env: &Env, definition: &MacroDef) -> EgclVal {
 }
 
 fn symbol_plist_of(sym: EgclVal) -> EgclVal {
-    // symbol_index (not as_symbol_index): is_symbol reports NIL/T as symbols
-    // but they carry no symbol-table index, so `(get nil …)` — legal CL,
-    // cl-ppcre does it — panicked here (bliss-d0b). NIL/T's plist is ().
-    match sym.symbol_index() {
-        Some(idx) => egcl_rt::symbols::symbol_plist(idx).unwrap_or(NIL),
-        None => NIL,
-    }
+    egcl_rt::symbols::symbol_property_index(sym)
+        .and_then(egcl_rt::symbols::symbol_plist)
+        .unwrap_or(NIL)
 }
 
 /// The declared type of `slot` in `object`'s own structure class, or T. A typed
@@ -33871,11 +33867,14 @@ fn plist_lookup(plist: EgclVal, key: EgclVal) -> Option<EgclVal> {
 /// first match, so the freshest binding wins; a superseded pair is left in place
 /// (REMPROP is unused by the code that needs this).
 fn symbol_plist_put(sym: EgclVal, key: EgclVal, val: EgclVal) {
-    // symbol_index: is_symbol includes NIL/T, which have no table index
-    // (see symbol_plist_of; bliss-d0b).
-    let Some(idx) = sym.symbol_index() else {
+    // Internal definition metadata also passes compound (SETF name) function
+    // names here. They have no symbol plist; preserve that no-op while public
+    // SETF GET/SYMBOL-PLIST validate their symbol arguments before reaching us.
+    if !sym.is_symbol() {
         return;
-    };
+    }
+    let idx = egcl_rt::symbols::symbol_property_index(sym)
+        .expect("symbol property cells initialized before evaluation");
     let existing = egcl_rt::symbols::symbol_plist(idx).unwrap_or(NIL);
     // Update an EXISTING property in place. CLHS compares indicators with EQ, and
     // GET returns the FIRST match — so unconditionally prepending still read back

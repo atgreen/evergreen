@@ -1200,6 +1200,23 @@ pub fn symbol_object_ptr(idx: u32) -> Option<usize> {
     with_registry(|reg| object_for_index(reg?, idx).map(|o| unsafe { o.as_ptr() } as usize))
 }
 
+/// Find the registry cell backing a symbol's mutable properties without allocating.
+/// NIL and T retain their special-tag Lisp identities; ANSI package seeding
+/// creates ordinary registry storage for their property cells. Those objects
+/// use the same GC scanner, write barrier, and image representation as all
+/// other symbols. Resolve by name after image restoration rather than caching
+/// an index from the previous registry. Before ANSI seeding, an absent backing
+/// cell returns None; evaluator environments seed before permitting evaluation.
+pub fn symbol_property_index(symbol: EgclVal) -> Option<u32> {
+    if symbol == NIL {
+        find_index("NIL")
+    } else if symbol == crate::value::T {
+        find_index("T")
+    } else {
+        symbol.symbol_index()
+    }
+}
+
 /// The property list (`NIL` or a cons).
 pub fn symbol_plist(idx: u32) -> Option<EgclVal> {
     read_cell(idx, |s| s.plist)
