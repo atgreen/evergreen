@@ -16,6 +16,10 @@
   columns stay consistent
   ([#875](https://github.com/atgreen/evergreen/pull/875)).
 
+- Native `TYPEP`, `TYPECASE`, and `ETYPECASE` calls honor type aliases defined
+  in other packages while retaining primitive checks for Common Lisp types
+  ([#867](https://github.com/atgreen/evergreen/pull/867)).
+
 - Methods retain their actual class specializers when class names are rebound,
   including retained calls and saved images. Core format 15 requires rebuilding
   earlier images

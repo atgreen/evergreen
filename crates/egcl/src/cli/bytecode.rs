@@ -34067,3 +34067,6 @@ mod function_literal_tests {
         ));
     }
 }
+
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+mod native_typep_identity_tests;
