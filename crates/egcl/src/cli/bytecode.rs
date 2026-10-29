@@ -22544,6 +22544,22 @@ fn record_type_profile(func_ptr: usize, bcp: u32, args: &[EgclVal]) {
 }
 
 /// The profile observed at call site `(func_ptr, bcp)`, if any.
+/// The type a site's accumulated profile would speculate, if any.
+///
+/// Narrow accessor for the checked T1 emitters, which must not guess fixnum at
+/// a site T0 has already observed as floating point (bliss-zmx1a). Kept here
+/// because both `type_profile_at` and `TypeProfile::speculation` are private.
+///
+/// Gated to match its only caller, the System Z T1 emitter: on any other host
+/// `bytecode_s390x.rs` is not compiled, so an ungated helper is dead code that
+/// `-D warnings` rejects. Widen this `cfg` when another checked T1 grows the
+/// same profile check (bliss-nk3fb covers the fact that no CI job compiles
+/// either side of this).
+#[cfg(all(target_arch = "s390x", unix))]
+pub(super) fn site_speculation_type(func_ptr: usize, bcp: u32) -> Option<SpecType> {
+    type_profile_at(func_ptr, bcp).and_then(|profile| profile.speculation())
+}
+
 fn type_profile_at(func_ptr: usize, bcp: u32) -> Option<TypeProfile> {
     TYPE_PROFILE.with(|m| m.borrow().get(&(func_ptr, bcp)).copied())
 }
