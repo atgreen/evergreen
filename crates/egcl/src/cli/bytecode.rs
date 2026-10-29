@@ -32146,6 +32146,67 @@ mod function_literal_tests {
     use super::*;
 
     #[test]
+    fn expanded_literal_identity_moves_with_its_compiled_constant_owner() {
+        let _lock = super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env = &mut env);
+        egcl_rt::rooted!(body = reader::read_from_string("(held)").unwrap().0);
+        let captured = Arc::new(SharedCell::new(EnvFrame::default()));
+        captured
+            .borrow_mut()
+            .vars
+            .insert("HELD".into(), EgclVal::from_fixnum(42));
+        egcl_rt::gc::collect_t0_minor().unwrap();
+        let closure = || Closure {
+            params_form: NIL,
+            body: *body,
+            captured_frame: Arc::clone(&captured),
+            captured_specials: Vec::new(),
+            captured_blocks: Vec::new(),
+            captured_tags: Vec::new(),
+            captured_funs: Some(Arc::clone(&env.funs)),
+            captured_macros: None,
+        };
+        egcl_rt::rooted!(function = register_tree_closure(closure()));
+        let id = cp(*function).1.as_fixnum() as u64;
+        let control = register_tree_closure(closure());
+        let control_id = cp(control).1.as_fixnum() as u64;
+        egcl_rt::rooted!(
+            expanded =
+                super::super::macroexpand_all(*function, &mut env, 0, &HashSet::new(),).unwrap()
+        );
+        assert_eq!(
+            *expanded, *function,
+            "logical function atoms retain exact identity"
+        );
+        let compiled = Arc::new(compile_thunk(*expanded, &env, false).unwrap());
+        egcl_rt::rooted!(_compiled = ActiveBytecodeRoot::new(&compiled));
+        let before = (*function).to_raw();
+        drop(expanded);
+        drop(function);
+        // Only the compiled constant pool now owns the tracked identity.
+        egcl_rt::gc::collect_t0_minor().unwrap();
+        let retained = compiled.constants[0];
+        assert_ne!(
+            retained.to_raw(),
+            before,
+            "the function identity must actually move"
+        );
+        assert_eq!(
+            super::super::CLOSURE_IDENTITIES.borrow().get(&id),
+            Some(&retained)
+        );
+        assert!(closure_registry().borrow().contains_key(&id));
+        assert!(!closure_registry().borrow().contains_key(&control_id));
+        assert_eq!(
+            apply_function(retained, &[], &mut env).unwrap(),
+            EgclVal::from_fixnum(42)
+        );
+    }
+
+    #[test]
     fn closure_literals_lower_to_constants_and_never_portable_cons_ids() {
         let _lock = super::super::heap_test_lock()
             .lock()
