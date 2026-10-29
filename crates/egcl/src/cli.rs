@@ -7584,7 +7584,10 @@ fn runtime_class_definition(env: &Env, class: EgclVal) -> Option<ClassDef> {
         if !name.is_symbol() || name.is_nil() {
             return None;
         }
-        let definition = env.classes.borrow().get(&sym_name(name)).cloned()?;
+        // Resolve the symbol registry key before taking the class-table lock.
+        // Receiver-first evaluation otherwise holds that lock during sym_name.
+        let key = sym_name(name);
+        let definition = env.classes.borrow().get(&key).cloned()?;
         (definition.owner == class
             || (definition.owner.is_nil() && egcl_stdlib::find_class(name) == Some(class)))
         .then_some(definition)

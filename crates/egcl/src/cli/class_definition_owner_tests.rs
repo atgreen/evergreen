@@ -4,6 +4,47 @@
 use super::*;
 
 #[test]
+fn cold_named_fallback_releases_class_lock_before_registry_lookups() {
+    let _guard = heap_test_lock()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    // Uninterned symbols deliberately bypass the CLI name cache, so every
+    // lookup must really acquire the symbol registry, including repeated calls.
+    egcl_rt::rooted!(name = egcl_rt::symbols::make_uninterned("COLD-OWNER-FALLBACK"));
+    egcl_rt::rooted!(class = egcl_stdlib::clos::new_class_metaobject(NIL).unwrap());
+    egcl_stdlib::clos::define_class(*name, *class, &[], &[]).unwrap();
+    assert!(egcl_stdlib::clos::class_runtime_definition(*class).is_none());
+    let key = sym_name(*name);
+    env.classes.borrow_mut().insert(
+        key.clone(),
+        ClassDef {
+            owner: NIL,
+            name: key.clone(),
+            supers: Vec::new(),
+            slots: Vec::new(),
+            class_slot_values: Arc::new(Mutex::new(HashMap::new())),
+            default_initargs: Vec::new(),
+            direct_default_metadata: NIL,
+        },
+    );
+    // An ownerless bootstrap view needs FIND-CLASS after cloning the view.
+    assert!(runtime_class_definition(&env, *class).is_some());
+    env.classes.borrow_mut().get_mut(&key).unwrap().owner = *class;
+    assert_eq!(
+        runtime_class_definition(&env, *class).unwrap().owner,
+        *class
+    );
+    egcl_rt::rooted!(other = egcl_stdlib::clos::new_class_metaobject(NIL).unwrap());
+    env.classes.borrow_mut().get_mut(&key).unwrap().owner = *other;
+    assert!(runtime_class_definition(&env, *class).is_none());
+    env.classes.borrow_mut().get_mut(&key).unwrap().owner = NIL;
+    egcl_stdlib::clos::bind_class_name(*name, *other).unwrap();
+    assert!(runtime_class_definition(&env, *class).is_none());
+}
+
+#[test]
 fn restored_named_views_share_the_exact_class_owned_cells() {
     let _guard = heap_test_lock()
         .lock()
