@@ -57,9 +57,10 @@ const CHECKS: &str = r##"
 "##;
 
 fn run(program: &str, stress: bool, marker: &str) -> String {
+    let program = format!("(progn {program})");
     let mut command = Command::new(env!("CARGO_BIN_EXE_egcl"));
     command
-        .args(["--no-init", "--eval", program])
+        .args(["--no-init", "--eval", &program])
         .env_remove("EGCL_GC_STRESS")
         .env_remove("EGCL_GC_POISON")
         .env_remove("EGCL_GC_STRESS_AFTER_INIT");
@@ -109,6 +110,29 @@ fn custom_reader_labels_survive_compile_file_and_source_free_load() {
         false,
         "LABELS-COMPILED",
     );
+    // A source-only artifact would re-read with the standard table at LOAD,
+    // masking the custom reader's compile-time label failure. Check EGCL's
+    // section directory; the SBCL oracle uses its own artifact format.
+    let bytes = fs::read(&artifact).unwrap();
+    if bytes.starts_with(b"BFASL\0") {
+        let count = u32::from_le_bytes(bytes[20..24].try_into().unwrap());
+        let mut offset = 24;
+        let mut bytecode = false;
+        for _ in 0..count {
+            let kind = u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap());
+            let size =
+                u32::from_le_bytes(bytes[offset + 2..offset + 6].try_into().unwrap()) as usize;
+            offset += 6;
+            if kind == 12 {
+                bytecode = bytes[offset..offset + size].starts_with(b"BBU\0");
+            }
+            offset += size;
+        }
+        assert!(
+            bytecode,
+            "custom reader compilation must emit portable bytecode"
+        );
+    }
     fs::remove_file(source).unwrap();
     let program = format!(
         r#"(progn (load {artifact:?})
