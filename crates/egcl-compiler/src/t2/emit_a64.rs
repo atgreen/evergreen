@@ -1831,6 +1831,36 @@ impl Emitter<'_> {
                 // whole function. The plain adapter reads the runtime tuple
                 // the argument's producer left and returns a fresh list. Same
                 // arm System Z carries (bliss-3pw4m).
+                // Entering or leaving a child lexical `EnvFrame`. Both
+                // adapters take no argument and return nothing, so there is
+                // nothing to stage -- but the root synchronisation around the
+                // call still matters, because the adapter allocates the new
+                // frame and so can collect.
+                //
+                // x86-64 reaches these through its mapped
+                // TRANSFER_LEXICAL_ENVIRONMENT_REQUEST, which decodes the
+                // instruction at the retained PC. A checked-ABI target cannot
+                // service that, so the builder lowers the pair to this call
+                // and the aux says which it is -- `LexicalEnvironment`'s flags
+                // cannot, since push and pop both present as
+                // `value: false, result: false` (bliss-9kci1).
+                Opcode::Call if matches!(data.aux, AuxData::EnvironmentScope { .. }) => {
+                    let AuxData::EnvironmentScope { enter } = data.aux else {
+                        return Err(unsupported!());
+                    };
+                    if !data.args.is_empty() || !data.results.is_empty() {
+                        return Err(unsupported!());
+                    }
+                    let helper = if enter {
+                        self.runtime.portable.push_env_child
+                    } else {
+                        self.runtime.portable.pop_env_child
+                    };
+                    if helper == 0 {
+                        return Err(unsupported!());
+                    }
+                    helper
+                }
                 Opcode::Call if matches!(data.aux, AuxData::ValuesToList) => {
                     if data.args.len() != 1 || data.results.len() != 1 {
                         return Err(unsupported!());

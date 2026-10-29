@@ -1310,7 +1310,17 @@ impl<'a> Builder<'a> {
                     }
                     push(i + 1, d - 1, &mut depth_at, &mut work);
                 }
-                Instr::PushEnvChild | Instr::PopEnvChild if self.native_cleanups => {
+                // Stack-neutral on EVERY ABI: entering or leaving a lexical
+                // scope moves no operand, so the depth walk has nothing
+                // ABI-specific to decide. The mapped path services these
+                // through TRANSFER_LEXICAL_ENVIRONMENT_REQUEST and a
+                // checked-ABI target through the plain adapters in
+                // `PortableCalls` -- see the `AuxData::EnvironmentScope` arm
+                // below -- so refusing them here cost a checked target the
+                // whole function for any body that opens a scope
+                // (bliss-9kci1). Same reasoning as the ungated
+                // `MakeClosure { capture_env: false }` arm above.
+                Instr::PushEnvChild | Instr::PopEnvChild => {
                     push(i + 1, d, &mut depth_at, &mut work);
                 }
                 Instr::MakeClosure {
@@ -2165,6 +2175,26 @@ impl<'a> Builder<'a> {
                         .pop()
                         .ok_or(BuildError::Unsupported("stack underflow (StoreLocal)"))?;
                     self.write_var(Var::Local(*s), block, v);
+                }
+                // Entering or leaving a child lexical EnvFrame. x86-64 services
+                // these through its mapped transfer protocol, which decodes the
+                // instruction at the retained PC; a checked-ABI target has no
+                // mapped entry, so lower them to a plain adapter call and let
+                // the aux say which of the two it is. Valueless and
+                // stack-neutral, so nothing is pushed or popped -- but the
+                // frame state still matters, because the scope change is
+                // observable to a deopt that resumes after it.
+                Instr::PushEnvChild | Instr::PopEnvChild if !self.native_cleanups => {
+                    let fs = self.build_frame_state(block, &stack, i as u32);
+                    self.emit_effect(
+                        block,
+                        Opcode::Call,
+                        vec![],
+                        AuxData::EnvironmentScope {
+                            enter: matches!(instruction, Instr::PushEnvChild),
+                        },
+                        Some(fs),
+                    );
                 }
                 Instr::LoadEnvVar(index) | Instr::StoreEnvVar(index) => {
                     if self.bf.names.get(*index as usize).is_none() {

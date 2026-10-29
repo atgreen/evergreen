@@ -539,6 +539,20 @@ pub enum AuxData {
         value: bool,
         result: bool,
     },
+    /// Entering or leaving a child lexical `EnvFrame`, for a CHECKED-ABI
+    /// target.
+    ///
+    /// x86-64 reaches `PushEnvChild`/`PopEnvChild` through
+    /// [`AuxData::LexicalEnvironment`] and its mapped
+    /// `TRANSFER_LEXICAL_ENVIRONMENT_REQUEST`, where the runtime decodes the
+    /// instruction at the retained PC. A checked-ABI emitter has no mapped
+    /// entry to service that, so the builder lowers the pair to a plain
+    /// adapter call instead and this variant says WHICH of the two it is --
+    /// the `LexicalEnvironment` flags cannot, because both push and pop
+    /// present as `value: false, result: false`.
+    ///
+    /// Stack-neutral and valueless: no operand, no result.
+    EnvironmentScope { enter: bool },
     /// Binding operation identified by its exact retained bytecode PC. Exit
     /// decodes UnbindSpecial's count there; entry consumes one rooted value.
     SpecialBinding {

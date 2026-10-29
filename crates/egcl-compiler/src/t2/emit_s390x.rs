@@ -3508,6 +3508,10 @@ mod tests {
                 values_to_list: values_to_list as *const () as u64,
                 make_closure: make_closure as *const () as u64,
                 nested_bodies: vec![BODY],
+                // This test exercises only the two portable Call arms System Z
+                // has; the scope adapters are left absent so a stray use would
+                // decline rather than jump to zero.
+                ..Default::default()
             },
             ..Default::default()
         };
