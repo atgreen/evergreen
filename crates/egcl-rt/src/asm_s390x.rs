@@ -80,6 +80,35 @@ impl Asm {
         self.rre(0xb986, even, src);
     }
 
+    /// DSGR: signed 64-bit divide over an even/odd pair. The dividend is the
+    /// 64-bit value in `even + 1`; the REMAINDER lands in `even` and the
+    /// QUOTIENT in `even + 1`. `src` must therefore be outside the pair.
+    ///
+    /// That direction is the one thing here worth stating, because swapping it
+    /// is a silent wrong answer rather than a fault. Verified by executing it
+    /// on a z16: with the dividend in r3, `dsgr %r2, %r4` leaves 47/5 as
+    /// r2=2 r3=9, and -47/5 as r2=-2 r3=-9 — so it truncates toward zero and
+    /// the remainder takes the dividend's sign, as SDIV/MSUB do on AArch64.
+    ///
+    /// Unlike AArch64's `SDIV`, this FAULTS rather than returning a value: a
+    /// zero divisor and the one overflowing quotient (-2^63 / -1) both raise a
+    /// fixed-point-divide exception. The caller must therefore test the divisor
+    /// against zero — a deopt, not a fault.
+    ///
+    /// The overflow case cannot arise when both operands are TAGGED fixnums,
+    /// and that is worth recording because it is not obvious: `-2^63 / -1`
+    /// needs a divisor of -1, but a tagged fixnum is a multiple of 8, so the
+    /// smallest-magnitude nonzero divisor is ±8 and the quotient's magnitude is
+    /// at most the dividend's eighth. The quotient can still exceed the FIXNUM
+    /// range once it is shifted back (min-fixnum / -1 is 2^60, one past the
+    /// maximum), so the caller range-checks before retagging — but the
+    /// instruction itself will not trap.
+    pub fn divide_signed(&mut self, even: u8, src: u8) {
+        assert!(even < 15 && even % 2 == 0);
+        assert!(src != even && src != even + 1, "divisor aliases the pair");
+        self.rre(0xb90d, even, src);
+    }
+
     pub fn load_float_bits(&mut self, float_dst: u8, general_src: u8) {
         self.rre(0xb3c1, float_dst, general_src);
     }

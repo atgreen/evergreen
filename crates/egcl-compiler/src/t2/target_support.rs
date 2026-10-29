@@ -69,10 +69,15 @@ pub const fn single_float_comparison() -> bool {
 /// comparison is the operands' own order, the winner is already tagged, and
 /// nothing can overflow. ppc64le has this and not the division family. To add
 /// a target: give its emitter that select, then name it here.
+///
+/// System Z reaches it by compare-and-branch rather than a conditional select:
+/// `LOCGR` needs the load-store-on-cond facility (z196) and that emitter
+/// targets z10, so it branches as its `FixnumCmp` arm already does.
 pub const fn fixnum_select() -> bool {
     cfg!(any(
         target_arch = "x86_64",
         target_arch = "aarch64",
+        target_arch = "s390x",
         all(target_arch = "powerpc64", target_endian = "little")
     ))
 }
@@ -85,8 +90,20 @@ pub const fn fixnum_select() -> bool {
 /// secondary value. To add a target: give its emitter those arms — including
 /// the divide-by-zero exit and the quotient range check, which `MIN-FIXNUM /
 /// -1` needs on any machine — then name it here.
+///
+/// The two exits are not symmetric across hosts, which is worth knowing before
+/// porting. AArch64's `SDIV` returns a value for both cases, so its checks are
+/// about correctness alone. System Z's `DSGR` *faults* on either, so there the
+/// zero test is what stops a `SIGFPE` — while its overflow fault turns out to
+/// be unreachable, because a tagged fixnum divisor is a multiple of eight and
+/// `-2^63 / -1` needs a divisor of -1. The range check is still required on
+/// every host, since it guards the retagged quotient rather than the divide.
 pub const fn fixnum_division() -> bool {
-    cfg!(any(target_arch = "x86_64", target_arch = "aarch64"))
+    cfg!(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "s390x"
+    ))
 }
 
 /// Whether the host emitter encodes `StringCharOrNil`, the inline simple-string
