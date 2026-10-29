@@ -9,6 +9,10 @@
   references signal `UNDEFINED-FUNCTION` before subsequent effects
   ([#820](https://github.com/atgreen/evergreen/pull/820)).
 
+- Newline characters given comment syntax skip their complete comment body,
+  and copied readtables retain character syntax overrides
+  ([#824](https://github.com/atgreen/evergreen/pull/824)).
+
 - Compiled class literals preserve their named class identity, and dependent
   load-form objects initialize in the required order
   ([#818](https://github.com/atgreen/evergreen/pull/818)).
