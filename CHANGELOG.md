@@ -4,6 +4,11 @@
 
 ### Added
 
+- Add an ARM64 iOS device/simulator foundation with Darwin OS routing and an
+  enforced T0/no-executable-memory profile. SDK/device validation, the host app
+  scaffold and Apple scalar FFI support remain unfinished
+  ([#899](https://github.com/atgreen/evergreen/pull/899)).
+
 - Static applications can link foreign native archives declared with
   `EGCL_STATIC_FOREIGN_MANIFEST`, exposing listed C functions and data through
   the existing FFI APIs without shipping shared libraries
