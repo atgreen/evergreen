@@ -3,6 +3,7 @@
     "egcl:test:print_array_policy_cli": [""],
     "egcl:test:symbol_print_radix_cli": [""],
     "egcl:test:gensym_printer_controls_cli": [""],
+    "egcl:test:print_keyword_precedence_cli": [""],
     "egcl:test:print_circle_graph_cli": [""],
     "egcl-stdlib:test:pprint_circle_gc": [""],
     "egcl:test:printer_arity_cli": [""],
