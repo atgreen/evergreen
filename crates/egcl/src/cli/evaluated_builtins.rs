@@ -491,6 +491,14 @@ fn resolve(name: &str) -> Option<Handler> {
             Ok(ch)
         }),
 
+        "EGCL::%VALIDATE-SEQUENCE-RESULT-TYPE" => Some(|_, args, _| {
+            if args.len() != 2 { return Err(EgclError::ProgramError("%VALIDATE-SEQUENCE-RESULT-TYPE requires two arguments".into())); }
+            let length = args[1];
+            if !length.is_fixnum() || length.as_fixnum() < 0 { return Err(EgclError::TypeError { datum: length, expected: "nonnegative sequence length".into() }); }
+            egcl_stdlib::sequences::validate_sequence_result_type(args[0], length.as_fixnum() as usize)?;
+            Ok(T)
+        }),
+
         "MAKE-STRING" => Some(|_operator, args, _env| {
             let args = RootedVals::new(args.to_vec());
 

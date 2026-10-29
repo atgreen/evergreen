@@ -2871,26 +2871,7 @@ fn is_sequence_result_type(result_type: EgclVal) -> bool {
     } else {
         return false;
     };
-    if matches!(
-        egcl_compiler::reader::symbol_name(head).as_deref(),
-        Some("ARRAY" | "SIMPLE-ARRAY")
-    ) && result_type.is_cons()
-    {
-        let rest = unsafe { (*(result_type.as_ptr() as *const ConsCell)).cdr };
-        if rest.is_cons() {
-            let dims_arg = unsafe { (*(rest.as_ptr() as *const ConsCell)).cdr };
-            if dims_arg.is_cons() {
-                let dims = unsafe { (*(dims_arg.as_ptr() as *const ConsCell)).car };
-                if dims.is_nil()
-                    || (dims.is_fixnum() && dims.as_fixnum() != 1)
-                    || (dims.is_cons()
-                        && !unsafe { (*(dims.as_ptr() as *const ConsCell)).cdr }.is_nil())
-                {
-                    return false;
-                }
-            }
-        }
-    }
+    if !array_sequence_rank_is_valid(result_type) { return false; }
     matches!(
         egcl_compiler::reader::symbol_name(head).as_deref(),
         Some(
@@ -2910,6 +2891,78 @@ fn is_sequence_result_type(result_type: EgclVal) -> bool {
                 | "SIMPLE-BIT-VECTOR"
         )
     )
+}
+
+/// Validate a stated ARRAY/SIMPLE-ARRAY rank before constructing a sequence.
+/// Unspecified dimensions retain the existing general-array extension, while
+/// every explicit rank/list must permit a rank-one result.
+fn array_sequence_rank_is_valid(result_type: EgclVal) -> bool {
+    if !result_type.is_cons() { return true; }
+    let cell = unsafe { &*result_type.as_ptr().cast::<ConsCell>() };
+    if !cell.car.is_symbol() || !matches!(egcl_compiler::reader::symbol_name(cell.car.as_symbol_index()).as_deref(), Some("ARRAY" | "SIMPLE-ARRAY")) { return true; }
+    if !cell.cdr.is_cons() { return true; }
+    let after_element = unsafe { (*cell.cdr.as_ptr().cast::<ConsCell>()).cdr };
+    if !after_element.is_cons() { return true; }
+    let dims = unsafe { (*after_element.as_ptr().cast::<ConsCell>()).car };
+    if dims.is_fixnum() { return dims.as_fixnum() == 1; }
+    if dims.is_nil() { return false; }
+    if dims.is_cons() {
+        return unsafe { (*dims.as_ptr().cast::<ConsCell>()).cdr.is_nil() };
+    }
+    true
+}
+
+/// Shared by MAKE-SEQUENCE, COERCE, MAP and CONCATENATE. Validation does not
+/// allocate Lisp objects or invoke callbacks, and precedes result allocation.
+pub fn validate_sequence_result_type(result_type: EgclVal, length: usize) -> Result<(), EgclError> {
+    validate_sequence_array_rank(result_type)?;
+    if !is_sequence_result_type(result_type) {
+        return Err(EgclError::TypeError { datum: result_type, expected: "sequence type specifier".into() });
+    }
+    if let Some(declared) = declared_sequence_length(result_type)
+        && declared != length
+    {
+        let size = i64::try_from(length)
+            .ok()
+            .filter(|size| *size <= egcl_rt::bignum::FIXNUM_MAX)
+            .ok_or_else(|| EgclError::ProgramError("sequence length exceeds fixnum range".into()))?;
+        return Err(EgclError::TypeError {
+            datum: EgclVal::from_fixnum(size),
+            expected: format!("(EQL {declared})"),
+        });
+    }
+    Ok(())
+}
+
+/// Check only a stated array rank, leaving non-array coercions unchanged.
+pub fn validate_sequence_array_rank(result_type: EgclVal) -> Result<(), EgclError> {
+    if array_sequence_rank_is_valid(result_type) { Ok(()) } else {
+        // The invalid dimension slot is present when the classifier rejects a
+        // rank. Report that rank, rather than a type-specifier list which can
+        // itself satisfy a generic SEQUENCE expected type.
+        let tail = unsafe { (*result_type.as_ptr().cast::<ConsCell>()).cdr };
+        let dimensions = unsafe { (*tail.as_ptr().cast::<ConsCell>()).cdr };
+        let dimensions = unsafe { (*dimensions.as_ptr().cast::<ConsCell>()).car };
+        let rank = if dimensions.is_fixnum() {
+            dimensions
+        } else {
+            let mut cursor = dimensions;
+            let mut count = 0;
+            let mut seen = std::collections::HashSet::new();
+            while cursor.is_cons() {
+                if !seen.insert(cursor) {
+                    return Err(EgclError::ProgramError("cyclic array dimensions".into()));
+                }
+                count += 1;
+                cursor = unsafe { (*cursor.as_ptr().cast::<ConsCell>()).cdr };
+            }
+            if !cursor.is_nil() {
+                return Err(EgclError::TypeError { datum: cursor, expected: "NULL".into() });
+            }
+            EgclVal::from_fixnum(count)
+        };
+        Err(EgclError::TypeError { datum: rank, expected: "(EQL 1)".into() })
+    }
 }
 
 /// Recognize a concrete DOUBLE-FLOAT sequence element type.
@@ -2938,23 +2991,7 @@ pub fn build_result_sequence(
     result_type: EgclVal,
     elems: &[EgclVal],
 ) -> Result<EgclVal, EgclError> {
-    if !is_sequence_result_type(result_type) {
-        return Err(EgclError::TypeError {
-            datum: result_type,
-            expected: "sequence type specifier".to_string(),
-        });
-    }
-    // A length the specifier declares must match what was actually produced —
-    // `(concatenate '(vector * 3) '(a b c d e))` is a TYPE-ERROR, not a
-    // five-element vector (ansi CONCATENATE.ERROR.4, MAP.ERROR.2).
-    if let Some(declared) = declared_sequence_length(result_type)
-        && declared != elems.len()
-    {
-        return Err(EgclError::TypeError {
-            datum: result_type,
-            expected: format!("sequence type specifier matching length {}", elems.len()),
-        });
-    }
+    validate_sequence_result_type(result_type, elems.len())?;
     if result_type_is_u8_vector(result_type) {
         return build_packed_u8(elems);
     }
