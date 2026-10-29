@@ -1,5 +1,6 @@
 {
   "fast": {
+    "egcl:test:pathname_readably_cli": [""],
     "egcl:test:canonical_symbol_properties_cli": [""],
     "egcl-rt:test:canonical_symbol_properties": [""],
     "egcl-rt:test:random_state_leaf": [""],

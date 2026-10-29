@@ -12809,24 +12809,9 @@ fn print_val_body(mut val: EgclVal, out: &mut String) {
             out.push(')');
         }
     } else if val.is_heap_object() {
-        // Pathnames FIRST: a pathname's namestring is also present in the string
-        // registry, so the string branch below would otherwise print it as a bare
-        // string. Under escaping (prin1 / WRITE :readably) a pathname prints as
-        // `#P"namestring"` so it reads back to an EQUAL pathname (ansi
-        // pathnames-print-and-read-properly). bliss-lb6.
-        if egcl_stdlib::is_pathname(val) {
-            if let Ok(ns) = egcl_stdlib::namestring(val) {
-                let s = val_as_str(ns);
-                out.push_str("#P\"");
-                for c in s.chars() {
-                    if c == '"' || c == '\\' {
-                        out.push('\\');
-                    }
-                    out.push(c);
-                }
-                out.push('"');
-                return;
-            }
+        if let Some(text) = egcl_stdlib::format::pathname_representation(val, true) {
+            out.push_str(&text);
+            return;
         }
         if let Some(s) = egcl_stdlib::registered_string(val) {
             out.push('"');
@@ -12838,24 +12823,6 @@ fn print_val_body(mut val: EgclVal, out: &mut String) {
             }
             out.push('"');
             return;
-        }
-        // Pathnames are registry-backed pseudo-heap values: render via their
-        // namestring rather than dereferencing them as a heap object (which
-        // would crash for a pathname whose namestring is not separately
-        // registered, e.g. a MERGE-PATHNAMES result). bliss-lb6.
-        if egcl_stdlib::is_pathname(val) {
-            if let Ok(ns) = egcl_stdlib::namestring(val) {
-                let s = val_as_str(ns);
-                out.push_str("#P\"");
-                for c in s.chars() {
-                    if c == '"' || c == '\\' {
-                        out.push('\\');
-                    }
-                    out.push(c);
-                }
-                out.push('"');
-                return;
-            }
         }
         unsafe {
             let ptr = val.as_ptr();
@@ -13198,13 +13165,9 @@ fn princ_val(val: EgclVal, out: &mut String) {
         }
         return;
     }
-    // A pathname prints as its bare namestring under PRINC/~A (no `#P"…"`
-    // escaping — that is the prin1/~S form emitted by print_val).
-    if egcl_stdlib::is_pathname(val) {
-        if let Ok(ns) = egcl_stdlib::namestring(val) {
-            out.push_str(&val_as_str(ns));
-            return;
-        }
+    if let Some(text) = egcl_stdlib::format::pathname_representation(val, false) {
+        out.push_str(&text);
+        return;
     }
     print_val(val, out);
 }
@@ -14782,6 +14745,30 @@ fn stdlib_pprint_dispatch_hook(
     }
 }
 
+fn stdlib_print_not_readable_hook(value: EgclVal) {
+    egcl_rt::rooted!(value = value);
+    if PENDING_PRINT_ERROR.with(|cell| cell.borrow().is_some()) {
+        return;
+    }
+    let ptr = PRINT_ENV.with(|cell| cell.get());
+    if ptr.is_null() {
+        park_print_error(EgclError::Internal(
+            "PRINT-NOT-READABLE requires a printing environment".into(),
+        ));
+        return;
+    }
+    // The same parked, dormant outer Env used by PRINT-OBJECT callbacks.
+    let env = unsafe { &mut *ptr };
+    let object = resolve_sym("OBJECT").unwrap_or(NIL);
+    let error = match build_condition_instance(env, "PRINT-NOT-READABLE", &[object, *value]) {
+        Ok(condition) => {
+            signal_and_raise(env, condition, "object cannot be printed readably".into())
+        }
+        Err(error) => error,
+    };
+    park_print_error(error);
+}
+
 fn stdlib_print_object_hook(val: EgclVal, escape: bool) -> Option<String> {
     // Root VAL for the whole hook. `dispatch_print_object` allocates (a string
     // output stream, the applicable-method search) and usually declines, and the
@@ -15392,6 +15379,7 @@ fn read_eval_all_env(source: &str, env: &mut Env) -> Result<EgclVal, EgclError> 
     reader::set_struct_constructor(Some(reader_struct_constructor));
     reader::set_sequence_elements_hook(Some(reader_sequence_elements));
     egcl_stdlib::format::set_print_object_hook(Some(stdlib_print_object_hook));
+    egcl_stdlib::format::set_print_not_readable_hook(Some(stdlib_print_not_readable_hook));
     egcl_stdlib::format::set_pprint_dispatch_hook(Some(stdlib_pprint_dispatch_hook));
     egcl_stdlib::format::set_format_apply_hook(Some(stdlib_format_apply_hook));
     egcl_stdlib::format::set_format_layout_apply_hook(Some(stdlib_format_layout_apply_hook));
@@ -47793,6 +47781,7 @@ pub fn run(args: &[String]) -> Result<i32, EgclError> {
     // A restored entry point can run without reading any source. Its formatter
     // still needs to dispatch saved PRINT-OBJECT methods and condition reports.
     egcl_stdlib::format::set_print_object_hook(Some(stdlib_print_object_hook));
+    egcl_stdlib::format::set_print_not_readable_hook(Some(stdlib_print_not_readable_hook));
     egcl_stdlib::format::set_pprint_dispatch_hook(Some(stdlib_pprint_dispatch_hook));
     egcl_stdlib::format::set_format_apply_hook(Some(stdlib_format_apply_hook));
     egcl_stdlib::format::set_format_layout_apply_hook(Some(stdlib_format_layout_apply_hook));

@@ -16,7 +16,7 @@ use std::sync::Once;
 
 // ── Internal data ─────────────────────────────────────────────────
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 enum DirPart {
     Literal(String),
     Wild,
@@ -24,13 +24,13 @@ enum DirPart {
     Up,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct DirectorySpec {
     absolute: bool,
     parts: Vec<DirPart>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 enum ComponentSpec {
     Literal(String),
     Wild,
@@ -67,7 +67,7 @@ fn version_to_val(version: Option<VersionSpec>) -> EgclVal {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct ParsedPathname {
     is_logical: bool,
     host_name: Option<String>,
@@ -1283,6 +1283,19 @@ pub fn namestring(pathname: EgclVal) -> Result<EgclVal, EgclError> {
         .namestring
         .unwrap_or_else(|| render_namestring_from_parsed(&rec.parsed));
     Ok(make_string_bv(&rendered))
+}
+
+/// Snapshot printer text and check its components without allocating Lisp
+/// objects. The registry lock is released before any printer callback runs.
+pub fn printed_namestring(pathname: EgclVal) -> Option<(String, bool)> {
+    let (text, parsed) = with_record(pathname, |record| {
+        (
+            record_namestring(record).into_owned(),
+            record.parsed.clone(),
+        )
+    })?;
+    let faithful = parse_namestring_model(&text, None).is_ok_and(|read_back| read_back == parsed);
+    Some((text, faithful))
 }
 
 /// The rendered namestring of a record, as borrowed or freshly-built Rust text.
