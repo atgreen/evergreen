@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- Arrays and string-output streams preserve requested NIL element types,
+  including adjustable and displaced storage, compiled files, and saved images
+  ([#865](https://github.com/atgreen/evergreen/pull/865)).
+
 - AArch64 loop polling uses control-flow order, avoiding redundant polls on
   acyclic exits from cloned loops
   ([#864](https://github.com/atgreen/evergreen/pull/864)).

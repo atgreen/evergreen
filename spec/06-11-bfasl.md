@@ -140,7 +140,7 @@ undrawn state preserves its future sequence. The payload has no Lisp references.
 Repeated references retain state identity; independent states are not coalesced.
 Version 3.2 adds length-only NIL-element array constants (tag 32), including
 positive-length uninitialized storage. Shared references retain object identity;
-no element references are encoded. Readers at 3.0 reject the newer minor
+no element references are encoded. Readers at 3.0 and 3.1 reject the newer minor
 before installation or load effects. Core images require format 14 and must
 be rebuilt from earlier formats, including format 13.
 Version-2 bodies can construct legacy cons-shaped states, which cannot be
