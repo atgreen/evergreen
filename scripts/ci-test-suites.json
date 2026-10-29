@@ -45,6 +45,7 @@
     "egcl-stdlib:test:sequence_result_rank": [""],
     "egcl:test:make_load_form_cli": [""],
     "egcl:test:reader_skipped_operands_cli": [""],
+    "egcl:test:boundp_symbol_identity_cli": [""],
     "egcl:test:standard_comment_reader_cli": [""],
     "egcl:test:reader_external_symbols_cli": [""],
     "egcl:test:recursive_reader_labels_cli": [""],
