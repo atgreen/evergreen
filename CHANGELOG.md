@@ -99,6 +99,11 @@
 
 ### Changed
 
+- AArch64 T2 right-shifts a one-limb bignum natively instead of calling the
+  runtime, so `(ASH x -n)` over bignums costs 15x less — down from 48x the
+  price of a fixnum shift to 3x
+  ([#840](https://github.com/atgreen/evergreen/pull/840)).
+
 - AArch64 T2 reads and writes vector elements inline instead of calling the
   runtime, so `AREF`, `SVREF`, `ELT` and `(SETF AREF)` on simple vectors and
   packed `(unsigned-byte 8)` arrays cost 30x to 43x less per access

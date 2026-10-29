@@ -147,6 +147,23 @@ pub const fn vector_element_access() -> bool {
     ))
 }
 
+/// Whether the host emitter encodes `TryIntegerShr`, the success-only
+/// `(ash x -n)` probe over a fixnum or a ONE-LIMB bignum.
+///
+/// The pass in `integer_shift` rewrites the call into this probe plus a `Brif`
+/// over the retained ASH call, so a target without the arm must not be offered
+/// it. The arm earns its keep only on BIGNUM operands -- a fixnum right shift
+/// is already native everywhere -- so it must carry the bignum half: one-limb
+/// check, sign of +1 or -1, a logical shift of the unsigned magnitude, and
+/// CL's FLOORING correction when any discarded bit was set. To add a target:
+/// give its emitter that arm, then name it here.
+pub const fn integer_right_shift_probe() -> bool {
+    cfg!(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        target_os = "linux"
+    ))
+}
+
 /// Whether the host emitter encodes the **raw `UnboxedF64`** double-float
 /// pipeline: `ConstDouble`, raw `FloatAdd`/`Sub`/`Mul`/`Div`/`Neg`/`Sqrt` and
 /// the raw double comparisons.

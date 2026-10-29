@@ -12,7 +12,7 @@ use super::ir::{
 /// Invoke is deliberately excluded: its normal-result dominance is a separate
 /// contract. The later legalizer gives the retained slow call its usual edges.
 pub fn specialize(f: &mut Function, options: &super::inlining::InlineOptions) -> usize {
-    if !cfg!(all(target_arch = "x86_64", target_os = "linux")) {
+    if !super::target_support::integer_right_shift_probe() {
         return 0;
     }
     let sites: Vec<_> = f
