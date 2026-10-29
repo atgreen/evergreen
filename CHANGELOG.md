@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- Recursive reader operands skip reader macros that return no values, so
+  feature conditionals work beneath quote, backquote, and dispatch literals
+  ([#815](https://github.com/atgreen/evergreen/pull/815)).
+
 - `DEFSTRUCT` reuses inherited symbols for generated accessors, constructors,
   copiers, and predicates, preserving calls through exported package interfaces
   ([#775](https://github.com/atgreen/evergreen/pull/775)).
