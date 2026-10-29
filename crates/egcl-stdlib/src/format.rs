@@ -620,6 +620,25 @@ pub fn print_level() -> Option<usize> {
         .map(|v| v.as_fixnum().max(0) as usize)
 }
 
+/// Common default-structure policy for both printer front ends. A slot name
+/// and its value count together as one component; the type name is the header.
+/// Existing control readers make readable output independent of both limits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StructurePrintPlan {
+    pub level_exceeded: bool,
+    pub shown_slots: usize,
+    pub ellipsis: bool,
+}
+
+pub fn structure_print_plan(depth: usize, available_slots: usize) -> StructurePrintPlan {
+    let shown_slots = print_length().unwrap_or(available_slots).min(available_slots);
+    StructurePrintPlan {
+        level_exceeded: print_level().is_some_and(|level| depth >= level),
+        shown_slots,
+        ellipsis: shown_slots < available_slots,
+    }
+}
+
 /// `*PRINT-CIRCLE*`: when non-NIL, shared and circular structure is printed
 /// with `#N=`/`#N#` labels instead of looping forever.
 /// `*PRINT-ARRAY*`: whether arrays other than strings print readably as
@@ -2105,18 +2124,32 @@ fn format_instance(v: EgclVal, escapep: bool) -> String {
 /// escaped (prin1-style) so the form round-trips. Slots are emitted in the
 /// class's slot order (CLHS 22.1.3.12; bliss-i1i9).
 fn format_struct(v: EgclVal, class: EgclVal) -> String {
+    egcl_rt::rooted!(v = v);
+    egcl_rt::rooted!(slots = crate::clos::effective_slots(class));
+    let depth = PRINT_DEPTH.with(|depth| depth.get());
+    let plan = structure_print_plan(depth, slots.len());
+    if plan.level_exceeded { return "#".into(); }
+    struct RestoreDepth(usize);
+    impl Drop for RestoreDepth {
+        fn drop(&mut self) { PRINT_DEPTH.with(|depth| depth.set(self.0)); }
+    }
+    let _depth = RestoreDepth(depth);
+    PRINT_DEPTH.with(|current| current.set(depth + 1));
     let name = crate::clos::class_name(class);
     let mut out = String::from("#S(");
     out.push_str(&egclval_to_print_string(name, false));
-    for slot in crate::clos::effective_slots(class) {
-        if let Ok(val) = crate::clos::slot_value(v, slot) {
+    for slot_index in 0..plan.shown_slots {
+        let slot = slots[slot_index];
+        if let Ok(value) = crate::clos::slot_value(*v, slot) {
+            egcl_rt::rooted!(value = value);
             out.push(' ');
             out.push(':');
             out.push_str(&egclval_to_print_string(slot, false));
             out.push(' ');
-            out.push_str(&egclval_to_print_string(val, true));
+            out.push_str(&egclval_to_print_string(*value, true));
         }
     }
+    if plan.ellipsis { out.push_str(" ..."); }
     out.push(')');
     out
 }
