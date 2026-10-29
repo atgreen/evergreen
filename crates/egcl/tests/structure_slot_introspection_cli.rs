@@ -28,8 +28,11 @@ const SOURCE: &str = r#"
 (let ((slots (raw-mop "CLASS-SLOTS" (find-class 'raw-slot-child))))
   (assert (equal (sort (raw-slot-names slots) #'string<) '("X" "Y")))
   (let ((slot (find "X" slots :key (lambda (slot) (symbol-name (raw-mop "SLOT-DEFINITION-NAME" slot))) :test #'string=)))
-    (assert (= (raw-mop "SLOT-DEFINITION-INITFORM" slot)
-               (raw-slot-child-x (make-raw-slot-child))))))
+    ;; An inherited initializer may be an executable closure invocation rather
+    ;; than a numeric literal. Check its value and initfunction independently.
+    (let ((expected (raw-slot-child-x (make-raw-slot-child))))
+      (assert (= (eval (raw-mop "SLOT-DEFINITION-INITFORM" slot)) expected))
+      (assert (= (funcall (raw-mop "SLOT-DEFINITION-INITFUNCTION" slot)) expected)))))
 (defstruct (raw-slot-child (:include raw-slot-parent)) (y 55))
 (defvar *raw-saved-slots* (raw-mop "CLASS-SLOTS" (find-class 'raw-slot-child)))
 (defvar *raw-saved-direct* (raw-mop "CLASS-DIRECT-SLOTS" (find-class 'raw-slot-child)))
