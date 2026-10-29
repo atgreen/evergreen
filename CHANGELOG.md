@@ -26,6 +26,11 @@
 
 ### Fixed
 
+- Compiled-file function fallbacks preserve local macro expansions in their
+  compilation environment when called from another package, including
+  MACROLET and SYMBOL-MACROLET scopes
+  ([#912](https://github.com/atgreen/evergreen/pull/912)).
+
 - Generic dispatch cache keys distinguish ordinary callables from generic
   functions after wrapper reification, preserving their different method
   applicability across alternating calls
