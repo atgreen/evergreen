@@ -271,7 +271,8 @@ fn initialization_depends_on(
             .prepared
             .as_ref()
             .unwrap();
-        pending.extend(prepared.creation_deps.iter().copied());
+        // Creation references require identity, not completion of initialization.
+        // In particular a self reference must not import its creation edges.
         pending.extend(prepared.initialization_deps.iter().copied());
     }
     Ok(false)

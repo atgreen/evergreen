@@ -269,3 +269,37 @@ fn printed_constants_cannot_observe_uninitialized_placeholders() {
     assert!(validate_print_groups(&constants, &actions, Some(&early)).is_err());
     assert!(validate_print_groups(&constants, &actions, Some(&ready)).is_ok());
 }
+
+#[test]
+fn creation_backreferences_do_not_reverse_initialization_order() {
+    for count in [2, 3] {
+        let mut pool = BbuConstPool {
+            entries: vec![vec![30]; count],
+            ..Default::default()
+        };
+        pool.entries.push(vec![0]);
+        for reference in 0..count as u32 {
+            pool.load_forms.records.push(Record {
+                object: NIL,
+                reference,
+                creation: NIL,
+                initialization: NIL,
+                prepared: Some(Prepared {
+                    creation: count as u32,
+                    initialization: count as u32,
+                    creation_deps: (0..reference).collect(),
+                    initialization_deps: (reference..count as u32).collect(),
+                }),
+                created: false,
+                initialized: false,
+            });
+        }
+        let actions = schedule(&mut pool, &(0..count as u32).collect::<Vec<_>>()).unwrap();
+        let actual = actions.iter().map(|a| (a.0, a.2)).collect::<Vec<_>>();
+        let expected = (0..count as u32)
+            .map(|r| (CREATE, r))
+            .chain((0..count as u32).rev().map(|r| (INITIALIZE, r)))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+}

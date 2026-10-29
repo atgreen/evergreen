@@ -340,3 +340,38 @@ fn make_load_form_restores_literals_in_nested_functions_and_restart_clauses() {
     run(&program, true);
     fixture.finish();
 }
+
+#[test]
+fn make_load_form_named_class_identity_and_unregistered_rejection() {
+    let fixture = Fixture::new(
+        "class",
+        r#"
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defvar *mlf-save-calls* 0)
+  (defclass mlf-named-class () ()))
+(defparameter *mlf-class-result* '#.(find-class 'mlf-named-class))
+"#,
+    );
+    fixture.compile(0);
+    fixture.delete_source();
+    let program = format!(
+        r#"(progn
+      (load {artifact:?})
+      (assert (eq *mlf-class-result* (find-class 'mlf-named-class)))
+      (let ((class (find-class 'mlf-named-class)))
+        (multiple-value-bind (creation initialization) (make-load-form class)
+          (assert (null initialization))
+          (assert (eq (eval creation) class)))
+        (unwind-protect
+            (progn
+              (setf (find-class 'mlf-named-class) nil)
+              (assert (handler-case (progn (make-load-form class) nil)
+                        (error () t))))
+          (setf (find-class 'mlf-named-class) class)))
+      (write-line "MAKE-LOAD-FORM-OK"))"#,
+        artifact = fixture.artifact
+    );
+    run(&program, false);
+    run(&program, true);
+    fixture.finish();
+}
