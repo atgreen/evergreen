@@ -608,6 +608,8 @@ pub enum ElementTypeTag {
     DoubleFloat = 11,
     Character = 12,
     BaseChar = 13,
+    /// Empty element type: raw length only, no element slots.
+    Nil = 14,
 }
 
 // ── Numeric heap types ─────────────────────────────────────────────

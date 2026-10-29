@@ -6,7 +6,7 @@
 //! See spec §5.5.
 
 use std::alloc::Layout;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, Write};
 use std::sync::OnceLock;
 
@@ -407,7 +407,7 @@ enum StreamInner {
         /// The stream was made with an element type that is a subtype of
         /// BASE-CHAR, so GET-OUTPUT-STREAM-STRING answers a BASE-STRING
         /// (CLHS MAKE-STRING-OUTPUT-STREAM; ansi WITH-OUTPUT-TO-STRING.8).
-        base: bool,
+        element: StringOutputElement,
     },
     FileInput {
         file: StreamHandle,
@@ -481,7 +481,12 @@ impl StreamMutableState {
             return Ok(());
         }
         match &mut self.inner {
-            StreamInner::StringOutput { buffer, line, col, .. } => {
+            StreamInner::StringOutput { buffer, line, col, element } => {
+                if *element == StringOutputElement::Nil {
+                    let datum = std::str::from_utf8(octets).ok().and_then(|text| text.chars().next()).map(EgclVal::from_char)
+                        .unwrap_or_else(|| EgclVal::from_fixnum(i64::from(octets[0])));
+                    return Err(EgclError::TypeError { datum, expected: "NIL".into() });
+                }
                 buffer.extend_from_slice(octets);
                 advance_line_col(octets, line, col);
                 Ok(())
@@ -1268,6 +1273,10 @@ fn file_flush_write_buf(file: &mut impl Write, write_buf: &mut Vec<u8>) -> Resul
 /// fixed-width layout). Owned because the on-heap elements are the type's
 /// fixed-width chars, not UTF-8 bytes.
 fn extract_string_str(val: EgclVal) -> Result<String, EgclError> {
+    if crate::sequences::is_nil_sequence(val) {
+        return if crate::sequences::length(val)? == 0 { Ok(String::new()) }
+            else { Err(EgclError::TypeError { datum: val, expected: "NIL".into() }) };
+    }
     if !val.is_heap_object() {
         return Err(EgclError::TypeError {
             datum: val,
@@ -1556,7 +1565,8 @@ impl GrayStream for StreamMutableState {
         let mut comps = self.components().to_vec();
         egcl_rt::rooted_ref!(_components_root = &mut comps);
         match &mut self.inner {
-            StreamInner::StringOutput { buffer, line, col, .. } => {
+            StreamInner::StringOutput { buffer, line, col, element } => {
+                if *element == StringOutputElement::Nil { return Err(EgclError::TypeError { datum: ch, expected: "NIL".into() }); }
                 let mut buf = [0u8; 4];
                 let encoded = c.encode_utf8(&mut buf);
                 buffer.extend_from_slice(encoded.as_bytes());
@@ -1696,7 +1706,8 @@ impl GrayStream for StreamMutableState {
         let mut comps = self.components().to_vec();
         egcl_rt::rooted_ref!(_components_root = &mut comps);
         match &mut self.inner {
-            StreamInner::StringOutput { buffer, line, col, .. } => {
+            StreamInner::StringOutput { buffer, line, col, element } => {
+                if *element == StringOutputElement::Nil { return Err(EgclError::TypeError { datum: byte, expected: "NIL".into() }); }
                 buffer.push(b);
                 if b == b'\n' {
                     *line += 1;
@@ -1793,7 +1804,8 @@ impl GrayStream for StreamMutableState {
         let mut comps = self.components().to_vec();
         egcl_rt::rooted_ref!(_components_root = &mut comps);
         match &mut self.inner {
-            StreamInner::StringOutput { buffer, line, col, .. } => {
+            StreamInner::StringOutput { buffer, line, col, element } => {
+                if *element == StringOutputElement::Nil && !slice.is_empty() { return Err(EgclError::TypeError { datum: EgclVal::from_char(str_slice.chars().next().unwrap()), expected: "NIL".into() }); }
                 buffer.extend_from_slice(slice);
                 for c in str_slice.chars() {
                     if c == '\n' {
@@ -2357,6 +2369,9 @@ pub fn make_lisp_base_string_fresh(s: &str) -> EgclVal {
 /// `s` normally come from `like` and so fit; the base-char check covers a
 /// caller that widened one.
 pub fn make_lisp_string_fresh_like(like: EgclVal, s: &str) -> EgclVal {
+    if crate::sequences::is_nil_sequence(like) && s.is_empty() {
+        return egcl_rt::nil_array::make(0).expect("empty nil string allocation");
+    }
     // `string_storage_is_base` looks through a displaced or adjustable string
     // to the storage that holds its characters, the same way
     // ARRAY-ELEMENT-TYPE does, so a copy of a string displaced onto a base
@@ -3226,6 +3241,16 @@ pub fn make_string_input_stream(
     ))
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum StringOutputElement { Character, BaseChar, Nil }
+
+/// Explicit public flavor; internal NIL-placeholder callers retain the
+/// historical CHARACTER default of make_string_output_stream.
+pub fn make_string_output_stream_with_element(element: StringOutputElement) -> Result<EgclVal, EgclError> {
+    Ok(alloc_stream(StreamElementType::Character,
+        StreamInner::StringOutput { buffer: Vec::new(), line: 0, col: 0, element }, vec![], None))
+}
+
 pub fn make_string_output_stream(_element_type: EgclVal) -> Result<EgclVal, EgclError> {
     make_string_output_stream_of(false)
 }
@@ -3234,22 +3259,12 @@ pub fn make_string_output_stream(_element_type: EgclVal) -> Result<EgclVal, Egcl
 /// SIMPLE-BASE-STRING when `base` (its element type is a subtype of BASE-CHAR)
 /// and a CHARACTER string otherwise.
 pub fn make_string_output_stream_of(base: bool) -> Result<EgclVal, EgclError> {
-    Ok(alloc_stream(
-        StreamElementType::Character,
-        StreamInner::StringOutput {
-            buffer: Vec::new(),
-            line: 0,
-            col: 0,
-            base,
-        },
-        vec![],
-        None,
-    ))
+    make_string_output_stream_with_element(if base { StringOutputElement::BaseChar } else { StringOutputElement::Character })
 }
 
 pub fn get_output_stream_string(stream: EgclVal) -> Result<EgclVal, EgclError> {
     with_stream(stream, |guard| match &mut guard.inner {
-        StreamInner::StringOutput { buffer, col, line, base } => {
+        StreamInner::StringOutput { buffer, col, line, element } => {
             let s = std::str::from_utf8(buffer)
                 .map_err(|_| EgclError::StreamError("invalid UTF-8 in output buffer".into()))?;
             // A fresh heap string: CLHS requires a new string, and an interned
@@ -3257,7 +3272,9 @@ pub fn get_output_stream_string(stream: EgclVal) -> Result<EgclVal, EgclError> {
             // (bliss-4due). It keeps the stream's element type: a BASE-CHAR
             // stream answers a SIMPLE-BASE-STRING (ansi WITH-OUTPUT-TO-STRING.8),
             // as long as everything written to it really is a base char.
-            let result = if *base && egcl_rt::object::is_all_base_char(s) {
+            let result = if *element == StringOutputElement::Nil {
+                egcl_rt::nil_array::make(0)?
+            } else if *element == StringOutputElement::BaseChar && egcl_rt::object::is_all_base_char(s) {
                 make_lisp_base_string_fresh(s)
             } else {
                 make_lisp_string_fresh(s)
@@ -3423,9 +3440,24 @@ pub fn output_stream_p(stream: EgclVal) -> bool {
 
 pub fn stream_element_type(stream: EgclVal) -> EgclVal {
     egcl_rt::rooted!(stream = stream);
-    match lock_stream(*stream) {
-        Ok(guard) => guard.element_type.to_code(),
-        Err(_) => NIL,
+    // A synonym's element type follows its current target. Release its lock
+    // before resolving/delegating, including when the target is a NIL stream.
+    // These identity keys span no Lisp allocation or poll: resolving a synonym
+    // only reads its current binding. Rust set growth cannot move Lisp values.
+    let mut visited = HashSet::new();
+    loop {
+        if !visited.insert(stream.to_raw()) { return NIL; }
+        let symbol = match lock_stream(*stream) {
+            Ok(guard) => match &guard.inner {
+                StreamInner::Synonym => guard.components().first().copied(),
+                StreamInner::StringOutput { element: StringOutputElement::Nil, .. } => return NIL,
+                _ => return guard.element_type.to_code(),
+            },
+            Err(_) => return NIL,
+        };
+        let Some(symbol) = symbol else { return NIL; };
+        let Ok(target) = resolve_synonym(symbol) else { return NIL; };
+        *stream = target;
     }
 }
 

@@ -499,7 +499,7 @@ fn resolve(name: &str) -> Option<Handler> {
             Ok(T)
         }),
 
-        "MAKE-STRING" => Some(|_operator, args, _env| {
+        "MAKE-STRING" => Some(|_operator, args, env| {
             let args = RootedVals::new(args.to_vec());
 
             // (make-string size &key initial-element element-type) → a FRESH
@@ -551,6 +551,7 @@ fn resolve(name: &str) -> Option<Handler> {
             // sequences LENGTH.STRING.6).
             let mut base = false;
             let mut et_set = false;
+            let mut nil_elements = false;
             let mut i = 0;
             while i < kv.len() {
                 let key = kv[i];
@@ -579,9 +580,11 @@ fn resolve(name: &str) -> Option<Handler> {
                     "ELEMENT-TYPE" => {
                         if !et_set {
                             et_set = true;
-                            base = val.is_symbol()
+                            let expanded = resolve_type_spec(env, val)?;
+                            nil_elements = expanded.is_nil();
+                            base = expanded.is_symbol()
                                 && matches!(
-                                    sym_bare_name_rc(val).as_ref(),
+                                    sym_bare_name_rc(expanded).as_ref(),
                                     "BASE-CHAR" | "STANDARD-CHAR"
                                 );
                         }
@@ -596,6 +599,14 @@ fn resolve(name: &str) -> Option<Handler> {
                     }
                 }
                 i += 2;
+            }
+            if nil_elements {
+                if size.as_fixnum() >= egcl_rt::bignum::FIXNUM_MAX {
+                    return Err(EgclError::TypeError { datum: size, expected: "valid array dimension".into() });
+                }
+                if fill_set { return Err(EgclError::TypeError { datum: fill_val, expected: "NIL".into() }); }
+                let length = usize::try_from(size.as_fixnum()).map_err(|_| EgclError::TypeError { datum: size, expected: "representable array dimension".into() })?;
+                return egcl_rt::nil_array::make(length);
             }
             // A base string never promotes: a wide :initial-element is the
             // TYPE-ERROR the store would signal, raised before any store.
@@ -1436,6 +1447,21 @@ fn resolve(name: &str) -> Option<Handler> {
         // :ELEMENT-TYPE and either :INITIAL-ELEMENT or :INITIAL-CONTENTS, and
         // an element type that upgrades to T or packed U8. NIL means another
         // case, which boot parses in full.
+        "EGCL::%MAKE-NIL-VECTOR" => Some(|_, args, _| {
+            if args.len() != 6 { return Err(EgclError::ProgramError("%MAKE-NIL-VECTOR requires six arguments".into())); }
+            let size = |value: EgclVal| if value.is_fixnum() && value.as_fixnum() >= 0 && value.as_fixnum() < egcl_rt::bignum::FIXNUM_MAX {
+                usize::try_from(value.as_fixnum()).map_err(|_| EgclError::TypeError { datum: value, expected: "representable array dimension".into() })
+            } else { Err(EgclError::TypeError { datum: value, expected: "valid nonnegative array dimension".into() }) };
+            let length = size(args[0])?;
+            let fill = size(args[1])?;
+            if fill > length { return Err(EgclError::TypeError { datum: args[1], expected: "fill pointer within capacity".into() }); }
+            if !args[4].is_nil() {
+                return egcl_stdlib::sequences::build_nil_displaced_vector(args[4], size(args[5])?, length, fill, !args[2].is_nil(), !args[3].is_nil());
+            }
+            if !args[2].is_nil() || !args[3].is_nil() {
+                egcl_stdlib::sequences::build_nil_complex_vector(length, fill, !args[2].is_nil(), !args[3].is_nil())
+            } else { egcl_rt::nil_array::make(length) }
+        }),
         "EGCL::%MAKE-SIMPLE-ARRAY" => Some(|_operator, args, env| {
             env.clear_mv();
             // Resolving a symbol can allocate, so do it before reading ARGS.
@@ -1937,6 +1963,7 @@ fn resolve(name: &str) -> Option<Handler> {
                 return Ok(vec_to_list(&[symbol, EgclVal::from_fixnum(8)]));
             }
             let name = match kind {
+                ArrayElementKind::Nil => return Ok(NIL),
                 ArrayElementKind::BaseChar => "BASE-CHAR",
                 ArrayElementKind::Character => "CHARACTER",
                 ArrayElementKind::Bit => "BIT",
@@ -2006,24 +2033,21 @@ fn resolve(name: &str) -> Option<Handler> {
             Ok(if egcl_stdlib::random_state::random_state_p(args[0]) { T } else { NIL })
         }),
         "RANDOM" => Some(|_operator, args, env| super::random_values(args, env)),
-        "MAKE-STRING-OUTPUT-STREAM" => Some(|_operator, args, _env| {
+        "MAKE-STRING-OUTPUT-STREAM" => Some(|_operator, args, env| {
+            let args = RootedVals::new(args.to_vec());
             // (make-string-output-stream &key element-type): the keywords are
             // validated (ansi make-string-output-stream.*). A BASE-CHAR element
             // type (or any non-empty subtype of it) makes
             // GET-OUTPUT-STREAM-STRING answer a SIMPLE-BASE-STRING (ansi
             // WITH-OUTPUT-TO-STRING.8); any other type, a CHARACTER string.
-            super::check_keyword_args("MAKE-STRING-OUTPUT-STREAM", args, &["ELEMENT-TYPE"])?;
-            let element_type = args
-                .chunks_exact(2)
-                .find(|pair| {
-                    pair[0].is_symbol() && sym_bare_name_rc(pair[0]).as_ref() == "ELEMENT-TYPE"
-                })
-                .map(|pair| pair[1]);
-            let base = element_type.is_some_and(|et| {
-                !et.is_nil()
-                    && resolve_sym("BASE-CHAR")
-                        .is_some_and(|base_char| super::subtypep_relation(et, base_char).0)
-            });
+            super::check_keyword_args("MAKE-STRING-OUTPUT-STREAM", &args, &["ELEMENT-TYPE"])?;
+            let request = args.chunks_exact(2).find(|pair| pair[0].is_symbol() && sym_bare_name_rc(pair[0]).as_ref() == "ELEMENT-TYPE")
+                .map(|pair| pair[1]).unwrap_or_else(|| resolve_sym("CHARACTER").unwrap());
+            egcl_rt::rooted!(element_type = resolve_type_spec(env, request)?);
+            if element_type.is_nil() {
+                return egcl_stdlib::streams::make_string_output_stream_with_element(egcl_stdlib::streams::StringOutputElement::Nil);
+            }
+            let base = resolve_sym("BASE-CHAR").is_some_and(|base_char| super::subtypep_relation(*element_type, base_char).0);
             egcl_stdlib::streams::make_string_output_stream_of(base)
         }),
         "CONCATENATE" => Some(|_operator, args, env| {

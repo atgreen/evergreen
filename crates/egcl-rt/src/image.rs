@@ -163,7 +163,9 @@ pub const IMAGE_MAGIC: u64 = u64::from_be_bytes(*b"EGCLIMG\0");
 // Version 13 uses opaque random states. Older images can retain cons-based
 // state constructors and values; interpreting ordinary conses as states would
 // conflate user lists with random states, so require rebuilding the image.
-const FORMAT_VERSION: u32 = 13;
+// Version 14 adds NIL-element storage; older readers cannot distinguish its
+// length-only payload from other specialized arrays. Rebuild older images.
+const FORMAT_VERSION: u32 = 14;
 
 /// Image file header (128 bytes). D7.01.
 #[derive(Clone, Copy)]

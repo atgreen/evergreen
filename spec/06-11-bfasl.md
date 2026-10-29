@@ -128,7 +128,7 @@ abstract-interpretation rules for stack maps, type slots, and unwind metadata;
 a loader MAY reject an older verifier version if the unit lacks metadata needed
 by the current runtime's GC or deoptimizer.
 
-The current bytecode version is **3.1** (`0x0301`). Version 2.1 added bounded
+The current bytecode version is **3.2** (`0x0302`). Version 2.1 added bounded
 fixnum parameter metadata; version 2.2 added `CHECK_RESULT` (`0x45`), described
 below. Version 2.3 added package, saved-image, and hash-table constants; version 2.4 added packed
 U8 constants and their multidimensional backing references. Version 2.5 adds
@@ -138,6 +138,11 @@ Version 3.0 adds opaque random-state constants (tag 31: a raw 64-bit seed
 with no lazy initialization flag). States are seeded at creation, so even an
 undrawn state preserves its future sequence. The payload has no Lisp references.
 Repeated references retain state identity; independent states are not coalesced.
+Version 3.2 adds length-only NIL-element array constants (tag 32), including
+positive-length uninitialized storage. Shared references retain object identity;
+no element references are encoded. Readers at 3.0 reject the newer minor
+before installation or load effects. Core images require format 14 and must
+be rebuilt from earlier formats, including format 13.
 Version-2 bodies can construct legacy cons-shaped states, which cannot be
 reinterpreted without conflating ordinary user lists with random states. All
 version-2 units are rejected before constants, definitions, or load actions are
@@ -218,6 +223,7 @@ payload : tag-specific bytes
 | 19 | `MdArray` | `u32 rank`, `u64 dimensions[rank]`, `u32 element_count`, `u32 row_major_element_refs[element_count]` |
 | 30 | `LoadFormObject` (version 2.6) | empty; identity reconstructed by creation/initialization load actions |
 | 31 | `RandomState` (version 3.0) | `u64 seed`; eagerly seeded, raw reference-free payload |
+| 32 | `NilArray` (version 3.2) | `u64 length`; raw length-only NIL-element storage, no elements |
 
 `Symbol.symbol_kind` is `0 = interned`, `1 = uninterned`, `2 = gensym`,
 `3 = external`.  Interned and external symbols are reconstructed through their

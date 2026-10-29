@@ -293,6 +293,7 @@ Element type tags:
 | `11` | `DOUBLE-FLOAT` | 64 |
 | `12` | `CHARACTER` | 32 (UCS-4) |
 | `13` | `BASE-CHAR` | 8 (ASCII/Latin-1) |
+| `14` | `NIL` | no element slots; raw logical length only |
 
 Data region is packed and padded to the next 8-byte boundary (R1.20).
 
@@ -741,7 +742,7 @@ fn stringp(v: EgclVal) -> bool {
         let underlying = unsafe { *((ptr.add(8)) as *const u64) };
         let und_ptr = (underlying & !0x7) as *const u8;
         let elt = unsafe { *und_ptr.add(17) };  // element_type_tag at offset 17
-        return elt == 12 || elt == 13; // CHARACTER or BASE-CHAR
+        return elt == 12 || elt == 13 || elt == 14; // CHARACTER, BASE-CHAR, or NIL
     }
     false
 }

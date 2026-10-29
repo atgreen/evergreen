@@ -880,6 +880,7 @@ impl CircleTable {
             if !value.is_cons() && array.is_none()
                 && !(circle_uninterned_symbol(value))
                 && !egcl_rt::random_state::is_random_state(value)
+                && !crate::sequences::is_nil_array(value)
             {
                 continue;
             }
@@ -1311,6 +1312,7 @@ pub fn readable_array_representation(value: EgclVal) -> Option<String> {
             use crate::sequences::ArrayElementKind;
             let element_type = match crate::sequences::array_element_kind(value)? {
                 ArrayElementKind::General => "COMMON-LISP:T",
+                ArrayElementKind::Nil => "COMMON-LISP:NIL",
                 ArrayElementKind::BaseChar => "COMMON-LISP:BASE-CHAR",
                 ArrayElementKind::Character => "COMMON-LISP:CHARACTER",
                 ArrayElementKind::Bit => "COMMON-LISP:BIT",
@@ -1943,6 +1945,7 @@ fn egclval_to_print_inner(mut v: EgclVal, escapep: bool, dispatch_pretty: bool) 
 
 fn egclval_to_print_body(mut v: EgclVal, escapep: bool) -> String {
     egcl_rt::rooted_ref!(_v_root = &mut v);
+    if let Some(text) = nil_array_representation(v, escapep) { return text; }
     if let Some(text) = concise_array_representation(v) {
         return text;
     }
@@ -6395,4 +6398,25 @@ pub fn random_state_representation(value: EgclVal, escapep: bool) -> String {
     } else {
         dispatch_print_object(value, escapep).unwrap_or_else(|| "#<RANDOM-STATE>".into())
     }
+}
+
+/// NIL storage must never be rendered by reading an imaginary character.
+/// Readable syntax reconstructs its exact empty element type and shape.
+pub fn nil_array_representation(value: EgclVal, escapep: bool) -> Option<String> {
+    if !crate::sequences::is_nil_array(value) { return None; }
+    if !print_readably_active() {
+        return Some(if crate::sequences::is_nil_sequence(value) && crate::sequences::length(value).ok() == Some(0) { if escapep { "\"\"".into() } else { String::new() } } else { "#<NIL-ELEMENT-ARRAY>".into() });
+    }
+    if !read_eval_active() { return Some(print_not_readable(value)); }
+    let dimensions = if let Some(dims) = egcl_rt::types::md_array_dims(value) {
+        let length = crate::sequences::length(dims).ok()?;
+        (0..length).map(|i| crate::sequences::elt(dims, i).ok().map(|d| d.as_fixnum() as usize)).collect::<Option<Vec<_>>>()?
+    } else { vec![crate::sequences::array_total_size(value)?] };
+    let shape = dimensions.iter().map(|d| format!("#10r{d}")).collect::<Vec<_>>().join(" ");
+    let mut text = format!("#.(|COMMON-LISP|:|MAKE-ARRAY| '({shape}) :|ELEMENT-TYPE| |COMMON-LISP|:|NIL|");
+    if crate::sequences::array_adjustable(value) { text.push_str(" :|ADJUSTABLE| |COMMON-LISP|:|T|"); }
+    if crate::sequences::is_complex_vector(value) && crate::sequences::cvec_has_fill_pointer(value) {
+        text.push_str(&format!(" :|FILL-POINTER| #10r{}", crate::sequences::cvec_fill_pointer(value)));
+    }
+    text.push(')'); Some(text)
 }

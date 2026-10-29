@@ -42,7 +42,7 @@ impl ComplexMetadata {
     fn validate(&self) -> Result<(), EgclError> {
         let limit = (1u64 << 60) - 1;
         if self.fill_pointer > limit
-            || !matches!(self.element_type, 0 | 1 | 2 | 11 | 12)
+            || !matches!(self.element_type, 0 | 1 | 2 | 11 | 12 | 14)
             || self
                 .displacement
                 .is_some_and(|(offset, size)| offset > limit || size > limit)
@@ -170,6 +170,7 @@ pub(super) fn validate_graph(constants: &[BbuConstant]) -> Result<(), EgclError>
                 continue;
             }
             let size = match &constants[index] {
+                BbuConstant::NilArray { length } => *length as u64,
                 BbuConstant::Vector(values) => values.len() as u64,
                 BbuConstant::PackedU8(values) => values.len() as u64,
                 BbuConstant::PackedF64(values) => values.len() as u64,
@@ -290,6 +291,7 @@ pub(super) fn validate_values(
                 2 => egcl_rt::types::bit_vector_len(storage).is_some() || general,
                 11 => egcl_rt::packed_f64::is_vector(storage),
                 12 => egcl_rt::packed_u8::is_vector(storage),
+                14 => egcl_rt::nil_array::is_vector(storage),
                 _ => false,
             };
             if !direct {
@@ -304,6 +306,7 @@ pub(super) fn validate_values(
             2 => kind == Kind::Bit,
             11 => kind == Kind::DoubleFloat,
             12 => kind == Kind::U8,
+            14 => kind == Kind::Nil,
             _ => false,
         };
         // Legacy complex bit/character arrays used a general vector internally.

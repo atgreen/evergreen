@@ -12637,6 +12637,7 @@ fn print_val_inner(mut val: EgclVal, out: &mut String) {
 
 fn print_val_body(mut val: EgclVal, out: &mut String) {
     egcl_rt::rooted_ref!(_val_root = &mut val);
+    if let Some(text) = egcl_stdlib::format::nil_array_representation(val, PRINT_ESCAPE.with(|c| c.get())) { out.push_str(&text); return; }
     if let Some(text) = egcl_stdlib::format::concise_array_representation(val) {
         out.push_str(&text);
         return;
@@ -13671,6 +13672,7 @@ fn directory_designator_to_namestring(dir: EgclVal) -> Option<String> {
 /// back to reading a genuine heap-string header. Pathnames are a distinct type
 /// and never strings.
 fn is_string_value(v: EgclVal) -> bool {
+    if egcl_stdlib::sequences::is_nil_sequence(v) { return true; }
     // Exclude pathnames FIRST: a pathname is a distinct type and never a string,
     // yet its value can also be present in the string registry (its namestring),
     // so a registry check ahead of this would wrongly report STRINGP true — which
@@ -18492,8 +18494,8 @@ enum EltU {
     /// egcl really does store base strings 8 bits per character. Collapsing
     /// the two made STRING and BASE-STRING mutual subtypes (bliss-7kmw).
     BaseChar,
-    /// The empty element type, `(array nil (*))`. It has no representation of
-    /// its own; it exists so a nil-array can be recognised as one of the three
+    /// The empty element type, `(array nil (*))`. It has a representation of
+    /// its own raw length-only storage, and is one of the three
     /// arms of the STRING union below.
     Nil,
     Bit,
@@ -18733,6 +18735,7 @@ fn object_elt_class(object: EgclVal) -> Elt {
     use egcl_stdlib::sequences::ArrayElementKind;
     match egcl_stdlib::sequences::array_element_kind(object) {
         Some(ArrayElementKind::BaseChar | ArrayElementKind::Character) => Elt::AnyString,
+        Some(ArrayElementKind::Nil) => Elt::Up(EltU::Nil),
         Some(ArrayElementKind::Bit) => Elt::Up(EltU::Bit),
         Some(ArrayElementKind::U8) => Elt::Up(EltU::U8),
         Some(ArrayElementKind::DoubleFloat) => Elt::Up(EltU::DoubleFloat),
@@ -18760,6 +18763,8 @@ fn arr_elt_admits(obj: Elt, spec: Elt) -> bool {
     }
     match (obj, spec) {
         (_, Elt::Star) => true,
+        (Elt::Up(EltU::Nil), Elt::AnyString | Elt::Up(EltU::Nil)) => true,
+        (Elt::Up(EltU::Nil), _) | (_, Elt::Up(EltU::Nil)) => false,
         (o, s) if charish(o) || charish(s) => charish(o) && charish(s),
         (Elt::Up(a), Elt::Up(b)) => a == b,
         _ => false,
@@ -19694,7 +19699,8 @@ fn typep_matches(
             "CONS" => object.is_cons() && !is_function_value(object),
             "SYMBOL" => object.is_symbol(),
             "KEYWORD" => is_keyword_arg(object),
-            "STRING" | "SIMPLE-STRING" => is_string_value(object),
+            "STRING" => is_string_value(object),
+            "SIMPLE-STRING" => is_string_value(object) && !egcl_stdlib::is_complex_vector(object),
             // BIT-VECTOR / SIMPLE-BIT-VECTOR: keyed off the runtime predicate,
             // which BIT-VECTOR-P and TYPE-OF already use. Without these arms
             // typep fell through to NIL even though (bit-vector-p #*1011) and
@@ -20173,7 +20179,7 @@ fn typep_matches(
         // the given length (or `*`). The bare STRING/… symbols are handled by the
         // atom path; only the compound (with a size) reaches here.
         "STRING" | "SIMPLE-STRING" => {
-            if !is_string_value(object) {
+            if !is_string_value(object) || (op.as_ref() == "SIMPLE-STRING" && egcl_stdlib::is_complex_vector(object)) {
                 return Ok(false);
             }
             Ok(vector_length_matches(&list_to_vec(args), object))
@@ -22608,6 +22614,14 @@ fn type_of_value(v: EgclVal) -> Result<EgclVal, EgclError> {
             return Ok(class);
         }
     }
+    if egcl_stdlib::sequences::is_nil_array(v) {
+        let complex = egcl_stdlib::sequences::array_adjustable(v) || egcl_stdlib::is_complex_vector(v);
+        let dims = if egcl_rt::types::md_array_p(v) { md_dims(v)? } else { vec![egcl_stdlib::array_total_size(v).unwrap()] };
+        let values: Vec<_> = dims.into_iter().map(|d| EgclVal::from_fixnum(d as i64)).collect();
+        egcl_rt::rooted!(shape = vec_to_list(&values));
+        let head = resolve_sym(if complex { "ARRAY" } else { "SIMPLE-ARRAY" }).unwrap();
+        return Ok(vec_to_list(&[head, NIL, *shape]));
+    }
     if egcl_stdlib::sequences::is_u8_array(v) {
         let complex = egcl_stdlib::is_complex_vector(v)
             || egcl_rt::types::md_array_storage(v).is_some_and(egcl_stdlib::is_complex_vector);
@@ -23642,7 +23656,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     }
                 }
             }
-            "EGCL::%MAKE-RANDOM-STATE" | "EGCL::%RANDOM-STATE-P" | "EGCL::%RANDOM-STATE-FROM-SEED" => {
+            "EGCL::%MAKE-NIL-VECTOR" | "EGCL::%MAKE-RANDOM-STATE" | "EGCL::%RANDOM-STATE-P" | "EGCL::%RANDOM-STATE-FROM-SEED" => {
                 return eval_builtin_arguments(&name, cdr, env);
             }
             "PRINT" => return eval_builtin_arguments(&name, cdr, env),
@@ -34017,6 +34031,7 @@ fn symbol_plist_put(sym: EgclVal, key: EgclVal, val: EgclVal) {
 }
 
 fn seq_elements(seq: EgclVal) -> Result<Vec<EgclVal>, EgclError> {
+    if egcl_stdlib::sequences::is_nil_sequence(seq) { return if egcl_stdlib::length(seq)? == 0 { Ok(Vec::new()) } else { Err(EgclError::TypeError { datum: seq, expected: "NIL".into() }) }; }
     if seq.is_nil() {
         return Ok(Vec::new());
     }
@@ -34304,6 +34319,8 @@ fn coerce_value(mut value: EgclVal, mut type_val: EgclVal) -> Result<EgclVal, Eg
                     expected: "(array nil (*))".into(),
                 });
             }
+            coerce_check_array_length(type_val, 0)?;
+            return egcl_rt::nil_array::make(0);
         }
         return coerce_to_string_value(value, egcl_stdlib::result_type_is_base_string(type_val));
     }
@@ -44413,7 +44430,7 @@ fn is_builtin_function(name: &str) -> bool {
     if name == "PRINT-OBJECT" {
         return true;
     }
-    if matches!(name, "EGCL::%APPLY-RETAINED-GENERIC" | "EGCL::%MAKE-RANDOM-STATE" | "EGCL::%RANDOM-STATE-P" | "EGCL::%RANDOM-STATE-FROM-SEED" | "EGCL::%VALIDATE-SEQUENCE-RESULT-TYPE" | "EGCL::%READ-STANDARD-MACRO" | "EGCL::%STANDARD-CHARACTER-READER" | "EGCL::SET-FILL-POINTER"
+    if matches!(name, "EGCL::%MAKE-NIL-VECTOR" | "EGCL::%APPLY-RETAINED-GENERIC" | "EGCL::%MAKE-RANDOM-STATE" | "EGCL::%RANDOM-STATE-P" | "EGCL::%RANDOM-STATE-FROM-SEED" | "EGCL::%VALIDATE-SEQUENCE-RESULT-TYPE" | "EGCL::%READ-STANDARD-MACRO" | "EGCL::%STANDARD-CHARACTER-READER" | "EGCL::SET-FILL-POINTER"
         | "EGCL::%PPRINT-CIRCLE" | "EGCL::%PPRINT-NATIVE-COLUMN"
         | "EGCL::%PPRINT-RENDER-LAYOUT" | "EGCL::%FORMAT-CONSUMED"
         | "EGCL::%NATIVE-INTERACTIVE-STREAM-P") {
@@ -47450,6 +47467,7 @@ fn format_values(
 }
 
 fn val_as_str(val: EgclVal) -> String {
+    if egcl_stdlib::sequences::is_nil_sequence(val) && egcl_stdlib::length(val).ok() == Some(0) { return String::new(); }
     // A package object stringifies to its name, so the many package builtins that
     // resolve a designator via `val_as_str` accept a package object transparently
     // (bliss-bhs).
