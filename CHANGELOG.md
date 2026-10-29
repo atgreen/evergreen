@@ -11,6 +11,12 @@
 
 ### Fixed
 
+- Methods bind first-class lexical `CALL-NEXT-METHOD` and `NEXT-METHOD-P`
+  functions, retain their original continuation across redefinition, and check
+  the complete applicable-method order when replacement arguments are supplied.
+  Proven context-free single-method calls can omit continuation construction
+  ([#894](https://github.com/atgreen/evergreen/pull/894)).
+
 - AArch64 foreign calls with an odd number of stack arguments preserve the
   actual readable input count while aligning the outgoing stack allocation,
   avoiding a read of nonexistent source padding
