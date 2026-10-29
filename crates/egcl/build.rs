@@ -3,6 +3,8 @@
 
 #[path = "src/runtime_contract.rs"]
 mod runtime_contract;
+#[path = "src/static_foreign_manifest.rs"]
+mod static_foreign_manifest;
 use std::{env, fs, path::Path, process::Command};
 
 // Deterministic content identity, not a security signature. Include runtime
@@ -70,6 +72,14 @@ fn fingerprint(root: &Path) -> String {
 }
 
 fn configure_runtime() {
+    let static_foreign = static_foreign_manifest::configure(Path::new(
+        &env::var_os("OUT_DIR").expect("Cargo OUT_DIR"),
+    ))
+    .expect("configure static foreign archives");
+    println!(
+        "cargo:rustc-env=EGCL_STATIC_FOREIGN_MANIFEST={}",
+        static_foreign.manifest
+    );
     println!("cargo:rerun-if-env-changed=EGCL_RUNTIME_MANIFEST");
     println!("cargo:rustc-check-cfg=cfg(egcl_no_t1)");
     println!("cargo:rustc-check-cfg=cfg(egcl_no_t2)");
@@ -87,7 +97,13 @@ fn configure_runtime() {
         .expect("query rustc identity");
     assert!(rustc.status.success(), "query rustc identity failed");
     let mut full = runtime_contract::Contract {
-        source: fingerprint(root),
+        source: {
+            let source = fingerprint(root);
+            static_foreign.identity.as_ref().map_or_else(
+                || source.clone(),
+                |identity| static_foreign_manifest::combine_identity(&source, identity),
+            )
+        },
         target: env::var("TARGET").unwrap(),
         toolchain: String::from_utf8(rustc.stdout)
             .unwrap()

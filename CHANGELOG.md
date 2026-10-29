@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Added
+
+- Static applications can link foreign native archives declared with
+  `EGCL_STATIC_FOREIGN_MANIFEST`, exposing listed C functions and data through
+  the existing FFI APIs without shipping shared libraries
+  ([#887](https://github.com/atgreen/evergreen/pull/887)).
+
 ### Fixed
 
 - Delivery distinguishes application functions such as `MY-PARSER::READ`

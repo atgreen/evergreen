@@ -12,6 +12,8 @@ use crate::value::EgclVal;
 pub mod embedded;
 pub mod memory;
 mod registry;
+mod static_libraries;
+pub use static_libraries::register_static_library;
 
 #[cfg(all(egcl_tsan, not(feature = "c-ffi")))]
 mod tsan_mmap;
@@ -780,8 +782,9 @@ mod elf_backend {
     }
 
     /// Non-reused 1-based tokens; see `registry`.
-    static LIBS: super::registry::LibraryRegistry<Arc<dyn ForeignLib>> =
-        super::registry::LibraryRegistry::new();
+    static LIBS: super::registry::LibraryRegistry<
+        super::static_libraries::Provider<Arc<dyn ForeignLib>>,
+    > = super::registry::LibraryRegistry::new();
 
     /// The image record of the open libraries, in load order.
     pub(crate) fn saved_library_names() -> Vec<Option<String>> {
@@ -869,7 +872,12 @@ mod elf_backend {
         Ok(LIBS.insert(name, library))
     }
 
-    fn open_library(name: &str) -> Result<Arc<dyn ForeignLib>, EgclError> {
+    fn open_library(
+        name: &str,
+    ) -> Result<super::static_libraries::Provider<Arc<dyn ForeignLib>>, EgclError> {
+        if let Some(library) = super::static_libraries::lookup(name) {
+            return Ok(super::static_libraries::Provider::Static(library));
+        }
         if super::embedded::is_embedded(name) {
             return Err(EgclError::FfiError(format!(
                 "'{name}' is an embedded foreign library, which this build cannot load yet; \
@@ -901,7 +909,7 @@ mod elf_backend {
             .relocate::<()>()
             .map_err(|e| EgclError::FfiError(format!("cannot link '{name}': {e}")))?;
         // relocate() already ran the library's DT_INIT_ARRAY constructors.
-        Ok(Arc::new(lib))
+        Ok(super::static_libraries::Provider::Loaded(Arc::new(lib)))
     }
 
     /// Look up a symbol in a previously loaded library.
@@ -917,6 +925,10 @@ mod elf_backend {
             return Err(EgclError::FfiError("symbol name contains null byte".into()));
         }
         let lib = LIBS.get(library)?;
+        let lib = match lib {
+            super::static_libraries::Provider::Static(library) => return library.symbol(name),
+            super::static_libraries::Provider::Loaded(library) => library,
+        };
         let symbol = lib
             .symbol(name)
             .ok_or_else(|| EgclError::FfiError(format!("symbol '{name}' not found")))?;
@@ -941,8 +953,15 @@ mod elf_backend {
         if name.contains('\0') {
             return Err(EgclError::FfiError("symbol name contains null byte".into()));
         }
+        if let Some(symbol) = super::static_libraries::global_symbol(name) {
+            return Ok(symbol);
+        }
         let libs = LIBS.open_libraries();
         for lib in libs {
+            let lib = match lib {
+                super::static_libraries::Provider::Static(_) => continue,
+                super::static_libraries::Provider::Loaded(library) => library,
+            };
             if let Some(symbol) = lib.symbol(name) {
                 super::remember_foreign_symbol(symbol, name);
                 return Ok(symbol);
@@ -1005,8 +1024,9 @@ impl Drop for DynamicLibrary {
         not(any(target_arch = "x86_64", target_arch = "aarch64"))
     )
 ))]
-static DYNAMIC_LIBRARIES: registry::LibraryRegistry<std::sync::Arc<DynamicLibrary>> =
-    registry::LibraryRegistry::new();
+static DYNAMIC_LIBRARIES: registry::LibraryRegistry<
+    static_libraries::Provider<std::sync::Arc<DynamicLibrary>>,
+> = registry::LibraryRegistry::new();
 
 #[cfg(all(
     unix,
@@ -1050,12 +1070,19 @@ pub fn load_foreign_library(name: &str) -> Result<*mut (), EgclError> {
         not(any(target_arch = "x86_64", target_arch = "aarch64"))
     )
 ))]
-fn open_dynamic_library(name: &str) -> Result<std::sync::Arc<DynamicLibrary>, EgclError> {
+fn open_dynamic_library(
+    name: &str,
+) -> Result<static_libraries::Provider<std::sync::Arc<DynamicLibrary>>, EgclError> {
     use std::ffi::CString;
+    if let Some(library) = static_libraries::lookup(name) {
+        return Ok(static_libraries::Provider::Static(library));
+    }
     // An embedded library shadows the file system, as embedded files do.
     #[cfg(egcl_dlopen_embedded)]
     if let Some(handle) = embedded::open(name) {
-        return Ok(std::sync::Arc::new(DynamicLibrary(handle? as usize)));
+        return Ok(static_libraries::Provider::Loaded(std::sync::Arc::new(
+            DynamicLibrary(handle? as usize),
+        )));
     }
     #[cfg(not(egcl_dlopen_embedded))]
     if embedded::is_embedded(name) {
@@ -1082,7 +1109,9 @@ fn open_dynamic_library(name: &str) -> Result<std::sync::Arc<DynamicLibrary>, Eg
             name, err
         )))
     } else {
-        Ok(std::sync::Arc::new(DynamicLibrary(handle as usize)))
+        Ok(static_libraries::Provider::Loaded(std::sync::Arc::new(
+            DynamicLibrary(handle as usize),
+        )))
     }
 }
 
@@ -1099,6 +1128,10 @@ fn open_dynamic_library(name: &str) -> Result<std::sync::Arc<DynamicLibrary>, Eg
 ))]
 pub unsafe fn foreign_symbol(library: *mut (), name: &str) -> Result<*const (), EgclError> {
     let library = DYNAMIC_LIBRARIES.get(library)?;
+    let library = match library {
+        static_libraries::Provider::Static(library) => return library.symbol(name),
+        static_libraries::Provider::Loaded(library) => library,
+    };
     // SAFETY: the Arc retains a live dlopen reference through lookup.
     unsafe { dynamic_symbol(library.0 as *mut libc::c_void, name) }
 }
@@ -1161,6 +1194,9 @@ pub unsafe fn close_foreign_library(library: *mut ()) -> Result<(), EgclError> {
     )
 ))]
 pub unsafe fn foreign_symbol_global(name: &str) -> Result<*const (), EgclError> {
+    if let Some(symbol) = static_libraries::global_symbol(name) {
+        return Ok(symbol);
+    }
     // RTLD_DEFAULT makes glibc add a lookup dependency from this executable to
     // the provider (elf/dl-sym.c: DL_LOOKUP_ADD_DEPENDENCY), preventing explicit
     // unload after a global lookup. A process handle searches the same global

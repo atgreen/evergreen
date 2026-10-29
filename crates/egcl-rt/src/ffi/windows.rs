@@ -15,8 +15,9 @@ impl Drop for Library {
         }
     }
 }
-static LIBRARIES: super::registry::LibraryRegistry<Arc<Library>> =
-    super::registry::LibraryRegistry::new();
+static LIBRARIES: super::registry::LibraryRegistry<
+    super::static_libraries::Provider<Arc<Library>>,
+> = super::registry::LibraryRegistry::new();
 
 pub(super) fn saved_library_names() -> Vec<Option<String>> {
     LIBRARIES.saved_names()
@@ -31,7 +32,10 @@ pub fn load_foreign_library(name: &str) -> Result<*mut (), EgclError> {
     Ok(LIBRARIES.insert(name, library))
 }
 
-fn open_library(name: &str) -> Result<Arc<Library>, EgclError> {
+fn open_library(name: &str) -> Result<super::static_libraries::Provider<Arc<Library>>, EgclError> {
+    if let Some(library) = super::static_libraries::lookup(name) {
+        return Ok(super::static_libraries::Provider::Static(library));
+    }
     if name.contains('\0') {
         return Err(EgclError::FfiError(
             "library name contains null byte".into(),
@@ -42,18 +46,24 @@ fn open_library(name: &str) -> Result<Arc<Library>, EgclError> {
     if handle.is_null() {
         return Err(loader_error(name));
     }
-    Ok(Arc::new(Library(handle as usize)))
+    Ok(super::static_libraries::Provider::Loaded(Arc::new(
+        Library(handle as usize),
+    )))
 }
 fn loader_error(name: &str) -> EgclError {
     EgclError::FfiError(format!("{name}: {}", std::io::Error::last_os_error()))
 }
-fn library(token: *mut ()) -> Result<Arc<Library>, EgclError> {
+fn library(token: *mut ()) -> Result<super::static_libraries::Provider<Arc<Library>>, EgclError> {
     LIBRARIES.get(token)
 }
 /// # Safety
 /// The library must remain loaded while the returned address is used.
 pub unsafe fn foreign_symbol(token: *mut (), name: &str) -> Result<*const (), EgclError> {
     let lib = library(token)?;
+    let lib = match lib {
+        super::static_libraries::Provider::Static(library) => return library.symbol(name),
+        super::static_libraries::Provider::Loaded(library) => library,
+    };
     let name_c = std::ffi::CString::new(name)
         .map_err(|_| EgclError::FfiError("symbol name contains null byte".into()))?;
     let symbol = unsafe { GetProcAddress(lib.0 as _, name_c.as_ptr().cast()) }
@@ -71,7 +81,10 @@ pub unsafe fn close_foreign_library(token: *mut ()) -> Result<(), EgclError> {
 }
 /// # Safety
 /// Windows has no RTLD_DEFAULT namespace; callers must select a DLL explicitly.
-pub unsafe fn foreign_symbol_global(_name: &str) -> Result<*const (), EgclError> {
+pub unsafe fn foreign_symbol_global(name: &str) -> Result<*const (), EgclError> {
+    if let Some(symbol) = super::static_libraries::global_symbol(name) {
+        return Ok(symbol);
+    }
     Err(EgclError::FfiError(
         "Windows symbol lookup requires an explicit DLL".into(),
     ))

@@ -3,6 +3,7 @@
 
 //! Capability selection and matching-runtime builds for saved-image shake.
 use crate::runtime_contract::Contract;
+include!(concat!(env!("OUT_DIR"), "/static-foreign.rs"));
 pub(super) fn contract() -> Contract {
     let mut contract = Contract::parse(include_str!(concat!(
         env!("OUT_DIR"),
@@ -60,7 +61,19 @@ pub(super) fn build(
         .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
         .collect();
     let flags = String::from_utf8(flags).map_err(|e| fail(e.to_string()))?;
-    let output = Command::new("cargo")
+    let mut command = Command::new("cargo");
+    // Match the archive/config identity baked into the driver, never an
+    // unrelated caller environment. The built program uses linked addresses;
+    // only this optional source rebuild needs the original build inputs.
+    if env!("EGCL_STATIC_FOREIGN_MANIFEST").is_empty() {
+        command.env_remove("EGCL_STATIC_FOREIGN_MANIFEST");
+    } else {
+        command.env(
+            "EGCL_STATIC_FOREIGN_MANIFEST",
+            env!("EGCL_STATIC_FOREIGN_MANIFEST"),
+        );
+    }
+    let output = command
         .current_dir(&source)
         .arg("--config")
         .arg("build.jobs=2")
