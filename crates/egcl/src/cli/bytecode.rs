@@ -8274,6 +8274,10 @@ fn compile_local_function(
     // Root the source subforms across the allocating lowering (moving GC; bliss-wlf).
     egcl_rt::rooted_ref!(_params_root = &mut params_form);
     egcl_rt::rooted_ref!(_fbody_root = &mut fbody);
+    if let Some((params, body)) = aux_entry_prologue(params_form, fbody) {
+        params_form = params;
+        fbody = body;
+    }
     let optional_required =
         optional_entry_prologue(params_form, fbody).map(|(params, body, required)| {
             params_form = params;
@@ -8367,6 +8371,10 @@ fn compile_capturing_local(
     // Root the source subforms across the allocating lowering (moving GC; bliss-wlf).
     egcl_rt::rooted_ref!(_params_root = &mut params_form);
     egcl_rt::rooted_ref!(_fbody_root = &mut fbody);
+    if let Some((params, body)) = aux_entry_prologue(params_form, fbody) {
+        params_form = params;
+        fbody = body;
+    }
     let optional_required =
         optional_entry_prologue(params_form, fbody).map(|(params, body, required)| {
             params_form = params;
@@ -9397,6 +9405,82 @@ pub(super) fn optional_range(body: &BytecodeFunction) -> bool {
     !body.variadic && body.min_args < body.arity
 }
 
+/// Lower ordinary &AUX initialization in the same lexical function namespace
+/// as the compiled body. The general lambda-list binder evaluates source forms
+/// and does not carry the lowerer's local-function bindings. LET* also preserves
+/// the required sequential visibility of earlier auxiliary variables.
+///
+/// As for the optional entry prologue, SPECIAL declarations keep the original
+/// binder path: moving a parameter's dynamic binding inside its body is unsound.
+fn aux_entry_prologue(params_form: EgclVal, body: EgclVal) -> Option<(EgclVal, EgclVal)> {
+    // Reject improper/cyclic syntax rather than silently normalizing it. The
+    // original lambda-list path remains responsible for its diagnostics.
+    fn proper_items(mut form: EgclVal) -> Option<Vec<EgclVal>> {
+        let mut seen = std::collections::HashSet::new();
+        let mut items = Vec::new();
+        while form.is_cons() {
+            if !seen.insert(form.to_raw()) {
+                return None;
+            }
+            let (item, tail) = cp(form);
+            items.push(item);
+            form = tail;
+        }
+        form.is_nil().then_some(items)
+    }
+    egcl_rt::rooted!(params = proper_items(params_form)?);
+    egcl_rt::rooted!(forms = proper_items(body)?);
+    let aux_at = params.iter().position(|parameter| {
+        parameter.is_symbol() && super::sym_name_rc(*parameter).as_ref() == "&AUX"
+    })?;
+    egcl_rt::rooted!(declarations = Vec::<EgclVal>::new());
+    let mut start = 0;
+    let mut seen_doc = false;
+    while start < forms.len() {
+        let form = forms[start];
+        if form.is_string() && !seen_doc && start + 1 < forms.len() {
+            seen_doc = true;
+        } else if form.is_cons()
+            && cp(form).0.is_symbol()
+            && super::sym_name_rc(cp(form).0).as_ref() == "DECLARE"
+        {
+            if declares_special(form) {
+                return None;
+            }
+            declarations.push(form);
+        } else {
+            break;
+        }
+        start += 1;
+    }
+    egcl_rt::rooted!(bindings = Vec::<EgclVal>::new());
+    for index in aux_at + 1..params.len() {
+        egcl_rt::rooted!(
+            spec = if params[index].is_cons() {
+                proper_items(params[index])?
+            } else {
+                vec![params[index]]
+            }
+        );
+        if spec.is_empty()
+            || spec.len() > 2
+            || !spec[0].is_symbol()
+            || super::sym_name_rc(spec[0]).starts_with('&')
+        {
+            return None;
+        }
+        egcl_rt::rooted!(binding = form_list(&[spec[0], spec.get(1).copied().unwrap_or(NIL)]));
+        bindings.push(*binding);
+    }
+    egcl_rt::rooted!(let_form = vec![resolve_sym("LET*")?, form_list(&bindings)]);
+    let_form.extend(declarations.iter().copied());
+    let_form.extend(forms[start..].iter().copied());
+    egcl_rt::rooted!(wrapped = form_list(&let_form));
+    egcl_rt::rooted!(new_body = arena_cons(*wrapped, NIL));
+    let new_params = form_list(&params[..aux_at]);
+    Some((new_params, *new_body))
+}
+
 /// SBCL-style `&optional` entry: rewrite a lambda list of required parameters
 /// and `&optional` ones (nothing else) into fixed positional parameters plus a
 /// prologue that computes the defaults, so the function binds its arguments
@@ -10208,6 +10292,10 @@ fn compile_function_forcing_boxed(
     // fall short of the arity, by the omitted optionals.
     let mut optional_required = None;
     if !macro_lambda_list {
+        if let Some((params, prologue_body)) = aux_entry_prologue(*params_form, *body) {
+            *params_form = params;
+            *body = prologue_body;
+        }
         if let Some((params, prologue_body, required)) =
             optional_entry_prologue(*params_form, *body)
         {
@@ -34070,3 +34158,6 @@ mod function_literal_tests {
 
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 mod native_typep_identity_tests;
+
+#[cfg(test)]
+mod aux_entry_prologue_tests;
