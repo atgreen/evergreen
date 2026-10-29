@@ -4,6 +4,11 @@
 
 ### Fixed
 
+- User-package `%DEFCONSTANT` and similar private-helper names retain their
+  own symbols instead of replacing bootstrap operations, including through
+  compiled-file loading
+  ([#889](https://github.com/atgreen/evergreen/pull/889)).
+
 - Delivery distinguishes application functions such as `MY-PARSER::READ`
   from Common Lisp code-opening operations, avoiding unnecessary whole-world
   retention while preserving actual builtin aliases
