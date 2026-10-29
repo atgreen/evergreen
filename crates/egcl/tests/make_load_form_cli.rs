@@ -275,3 +275,39 @@ fn make_load_form_initializes_independent_dependencies_before_creation_use() {
     run(&program, true);
     fixture.finish();
 }
+
+#[test]
+fn make_load_form_uses_standard_hook_when_current_package_shadows_its_name() {
+    let fixture = Fixture::new(
+        "shadow",
+        r#"
+(defpackage "MLF-SHADOW" (:use "CL") (:shadow "MAKE-LOAD-FORM"))
+(in-package "MLF-SHADOW")
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defvar cl-user::*mlf-save-calls* 0)
+  (defstruct shadow-node value)
+  (defun make-load-form (&rest arguments)
+    (declare (ignore arguments))
+    (error "The compiler called a package-local lookalike"))
+  (defmethod cl:make-load-form ((object shadow-node) &optional environment)
+    (incf cl-user::*mlf-save-calls*)
+    (make-load-form-saving-slots object :environment environment)))
+(defparameter cl-user::*mlf-shadow-result* '#.(make-shadow-node :value 42))
+(in-package "CL-USER")
+"#,
+    );
+    fixture.compile(1);
+    fixture.delete_source();
+    let program = format!(
+        "(progn
+           (load {artifact:?})
+           (assert (= (funcall (find-symbol \"SHADOW-NODE-VALUE\" \"MLF-SHADOW\")
+                              *mlf-shadow-result*) 42))
+           (assert (zerop *mlf-save-calls*))
+           (write-line \"MAKE-LOAD-FORM-OK\"))",
+        artifact = fixture.artifact
+    );
+    run(&program, false);
+    run(&program, true);
+    fixture.finish();
+}
