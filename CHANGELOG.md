@@ -16,6 +16,11 @@
 - Sequence construction and coercion validate explicit array ranks and lengths,
   distinguishing rank-one array specifiers from fixed-length dimension lists
   ([#844](https://github.com/atgreen/evergreen/pull/844)).
+
+- FORMAT `~:C` and `~:@C` render graphic Unicode characters directly, including
+  graphic whitespace, while retaining names for Space and nongraphic characters
+  ([#846](https://github.com/atgreen/evergreen/pull/846)).
+
 - String and stream printers consistently honor `*PRINT-ARRAY*` for array
   layouts, and string printers render package objects through their print hook
   ([#830](https://github.com/atgreen/evergreen/pull/830)).
