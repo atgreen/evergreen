@@ -22336,22 +22336,36 @@ fn export_import_values(
     Ok(T)
 }
 
+/// Decimal suffix of an already validated nonnegative GENSYM integer.
+fn gensym_integer_suffix(value: EgclVal) -> String {
+    // Symbol names use decimal digits independently of printer controls.
+    // Calling the Lisp printer here can recursively reenter pprint dispatch
+    // while that dispatch's macro expansion is itself requesting a gensym.
+    if value.is_fixnum() {
+        value.as_fixnum().to_string()
+    } else {
+        let integer = bigint_from_val(value).expect("validated GENSYM integer");
+        egcl_stdlib::format::bignum_to_decimal(i32::from(integer.sign), &integer.mag)
+    }
+}
+
 /// `GENSYM` of an optional evaluated argument, shared by operator position and
 /// compiled calls (bliss-qoy0k).
 fn gensym_value(env: &mut Env, arg: Option<EgclVal>) -> Result<EgclVal, EgclError> {
     let (name, bump) = match arg {
         None => {
             let counter = read_gensym_counter(env)?;
-            (format!("G{}", format_val(counter)), Some(counter))
+            (format!("G{}", gensym_integer_suffix(counter)), Some(counter))
         }
         Some(a) if a.is_fixnum() && a.as_fixnum() >= 0 => (format!("G{}", a.as_fixnum()), None),
         Some(a) if !a.is_fixnum() && bigint_from_val(a).is_some_and(|b| b.sign >= 0) => {
-            (format!("G{}", format_val(a)), None)
+            (format!("G{}", gensym_integer_suffix(a)), None)
         }
         Some(a) if is_string_value(a) => {
+            let prefix = val_as_str(a);
             let counter = read_gensym_counter(env)?;
             (
-                format!("{}{}", val_as_str(a), format_val(counter)),
+                format!("{}{}", prefix, gensym_integer_suffix(counter)),
                 Some(counter),
             )
         }
