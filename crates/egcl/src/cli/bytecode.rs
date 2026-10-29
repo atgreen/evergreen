@@ -27425,7 +27425,7 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
         let extracted = egcl_compiler::t2::integer_extract::specialize(&mut f, &array_inline_options);
         if extracted != 0 { t2_log!("{name}: native integer extraction: {extracted} site(s)"); }
     }
-    if cfg!(all(target_arch = "x86_64", target_os = "linux"))
+    if egcl_compiler::t2::target_support::integer_octet_word_store()
         && std::env::var_os("EGCL_DISABLE_OCTET_WORD_STORES").is_none()
     {
         let words = egcl_compiler::t2::octet_word_fusion::fuse_octet_words(&mut f, &array_inline_options);

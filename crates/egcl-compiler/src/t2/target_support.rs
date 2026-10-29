@@ -191,6 +191,26 @@ pub const fn integer_right_shift_probe() -> bool {
     ))
 }
 
+/// Whether the host emitter encodes `TryStoreIntegerOctets8` and
+/// `TryStoreIntegerOctets1To8`, the wide-store kernel `octet_word_fusion`
+/// replaces a counted integer-to-octet loop with.
+///
+/// Only those two: the `Layout` and `Extent` variants and the `PackedU8*`
+/// family come from `array_layout` and `allocation_extent`, which run only on
+/// the mapped path, so a checked-ABI target never sees them.
+///
+/// The kernel makes a single unaligned little-endian 64-bit write into an
+/// untraced byte payload, which both x86-64 and AArch64 Linux permit. To add a
+/// target: give its emitter that arm -- the canonical one-limb bignum decode
+/// included, since a magnitude at or below `abs(MIN-FIXNUM)` would have been a
+/// fixnum -- then name it here.
+pub const fn integer_octet_word_store() -> bool {
+    cfg!(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        target_os = "linux"
+    ))
+}
+
 /// Whether the host emitter encodes the **raw `UnboxedF64`** double-float
 /// pipeline: `ConstDouble`, raw `FloatAdd`/`Sub`/`Mul`/`Div`/`Neg`/`Sqrt` and
 /// the raw double comparisons.
