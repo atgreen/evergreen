@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
-use std::{fs, process::Command};
+use std::{fs, path::Path, process::Command};
 
 const SOURCE: &str = r#"
 (defmacro captured-function-literal ()
@@ -32,7 +32,15 @@ const SOURCE: &str = r#"
 "#;
 
 fn run(program: &str, stress: bool) -> String {
-    let output = Command::new(env!("CARGO_BIN_EXE_egcl"))
+    run_with_image(program, stress, None)
+}
+
+fn run_with_image(program: &str, stress: bool, image: Option<&Path>) -> String {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_egcl"));
+    if let Some(image) = image {
+        command.args(["--image", image.to_str().unwrap()]);
+    }
+    let output = command
         .args(["--no-init", "--eval", &format!("(progn {program})")])
         .env_remove("EGCL_GC_STRESS")
         .env_remove("EGCL_GC_POISON")
@@ -138,6 +146,46 @@ fn compile_file_never_persists_a_process_local_closure_id() {
         if stdout.contains("FUNCTION-LITERAL-EGCL") {
             assert!(!artifact.exists(), "EGCL rejected before artifact writing");
         }
+    }
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn saved_core_preserves_literal_function_identity_and_shared_capture() {
+    let directory = std::env::temp_dir().join(format!(
+        "egcl-function-literal-image-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&directory).unwrap();
+    let image = directory.join("literal.core");
+    let save = format!(
+        r#"
+#+egcl (progn
+ (defparameter *image-function* (eval '(let ((state 40)) (lambda () (incf state)))))
+ (defmacro image-function-value () *image-function*)
+ (defmacro image-function-call () (list 'funcall *image-function*))
+ (setf (symbol-function 'image-function-get) (compile nil '(lambda () (image-function-value))))
+ (setf (symbol-function 'image-function-invoke) (compile nil '(lambda () (image-function-call))))
+ (assert (eq (image-function-get) *image-function*))
+ (assert (= (image-function-invoke) 41))
+ (write-line "FUNCTION-LITERAL-OK")
+ (egcl-ext:save-lisp-and-die {image:?}))
+#-egcl (progn (write-line "FUNCTION-LITERAL-IMAGE-SKIPPED") (write-line "FUNCTION-LITERAL-OK"))
+"#
+    );
+    let stdout = run(&save, false);
+    if !stdout.contains("FUNCTION-LITERAL-IMAGE-SKIPPED") {
+        assert!(image.exists());
+        run_with_image(
+            r#"
+(assert (eq (image-function-get) *image-function*))
+(assert (= (image-function-invoke) 42))
+(assert (= (funcall *image-function*) 43))
+(assert (eq (image-function-get) *image-function*))
+(write-line "FUNCTION-LITERAL-OK")"#,
+            true,
+            Some(&image),
+        );
     }
     fs::remove_dir_all(directory).unwrap();
 }

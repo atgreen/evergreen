@@ -10705,6 +10705,9 @@ fn capture_bbu_graph(
         let value = values[nodes.len()];
         let node = if let Some(&reference) = existing.get(&value) {
             BbuGraphNode::Existing(reference)
+        } else if super::is_closure_cons(value) {
+            // A logical FUNCTION atom must never be copied as a data cons.
+            BbuGraphNode::Leaf
         } else if value.is_cons() {
             let (car, cdr) = cp(value);
             BbuGraphNode::Cons(vec![
@@ -11187,7 +11190,7 @@ impl BbuConstPool {
         // Without this the function was left out of the image, and its restored
         // stub silently ran a NIL body — ironclad's MASSAGE-SYMBOL answered NIL
         // for every digest name in a saved executable.
-        if self.saved_heap_refs && v.is_heap_object() {
+        if self.saved_heap_refs && (v.is_heap_object() || super::is_closure_cons(v)) {
             let mut bytes = Vec::new();
             put_u8(&mut bytes, 21);
             put_u64(&mut bytes, v.0);
@@ -32180,5 +32183,10 @@ mod function_literal_tests {
         egcl_rt::rooted_ref!(_image = &mut image);
         assert!(image.value(*aggregate).is_some());
         assert!(image.check_portable_function_literals().is_ok());
+        let reference = image.value(*function).unwrap();
+        assert!(matches!(
+            parse_bbu_constant(&mut BbuCursor::new(&image.entries[reference as usize]), BBU_BYTECODE_VERSION).unwrap(),
+            BbuConstant::SavedHeapRef(raw) if raw == (*function).to_raw()
+        ));
     }
 }
