@@ -9994,35 +9994,6 @@ fn mentions_the(form: EgclVal) -> bool {
     false
 }
 
-/// Whether `form` mentions CALL-NEXT-METHOD or NEXT-METHOD-P anywhere, so a
-/// compiled body containing it needs its next-method context published.
-/// Conservative: a quoted occurrence counts too.
-fn mentions_next_method(form: EgclVal) -> bool {
-    let mut pending = vec![form];
-    let mut visited = 0usize;
-    while let Some(item) = pending.pop() {
-        visited += 1;
-        // A pathological or circular body is treated as mentioning it.
-        if visited > 100_000 {
-            return true;
-        }
-        if item.is_cons() {
-            let (car, cdr) = cp(item);
-            pending.push(cdr);
-            pending.push(car);
-        } else if item.is_symbol()
-            && !item.is_nil()
-            && matches!(
-                sym_bare_name_rc(item).as_ref(),
-                "CALL-NEXT-METHOD" | "NEXT-METHOD-P" | "%CALL-NEXT-METHOD" | "%NEXT-METHOD-P"
-            )
-        {
-            return true;
-        }
-    }
-    false
-}
-
 /// True if `name` is a slot reader/accessor on some class. Used to preserve the
 /// "reader on a non-instance yields NIL" behavior (bliss-lb6.14) uniformly across
 /// dispatch paths — the tree-walker's operator-position fast path has it, but a
