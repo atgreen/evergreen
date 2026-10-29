@@ -1711,7 +1711,9 @@ impl Emitter<'_> {
     /// edge dominating this store; nothing is loaded from it. The address
     /// arithmetic exploits the representation: a tagged fixnum index is the raw
     /// index times eight, which is exactly the element stride, so the tagged
-    /// word can be added to the body directly without untagging.
+    /// word can be added to the body directly without untagging. The interior
+    /// slot pointer then goes only to the noncollecting reference-barrier leaf;
+    /// it never survives a safepoint.
     fn vector_set_in_range(&mut self, data: &InstData) -> Result<(), EmitError> {
         if data.args.len() != 4 || data.results.len() != 1 {
             return Err(EmitError::UnsupportedOp(op_tag(data.opcode)));
@@ -1723,11 +1725,19 @@ impl Emitter<'_> {
         self.asm.word(a64::add(ADDR, ADDR, W1));
         self.asm
             .word(a64::add_imm(ADDR, ADDR, 16).expect("16 fits the immediate field"));
-        // Stash the slot before loading the value: `load` of a heap constant
-        // goes through ADDR, and a stored value may well be one.
-        self.mov(T1, ADDR);
+        // AAPCS64 arguments: x0 is the slot and x1 the tagged value. Save the
+        // slot before loading a heap constant, which may materialise through
+        // ADDR. The helper can grow host bookkeeping but cannot collect Lisp
+        // memory, so the interior pointer is valid for the duration of the call
+        // and no GC root map is needed.
+        self.mov(W0, ADDR);
+        self.load(data.args[2], W1)?;
+        self.imm(ADDR, super::emit::store_vector_element as *const () as u64);
+        self.call_register(ADDR);
+        // The C leaf returns void and may clobber x0/x1. Reload the stored value
+        // from its callee-saved home (or rematerialise its constant) as the SETF
+        // result.
         self.load(data.args[2], W0)?;
-        self.store_at(W0, T1, 0)?;
         self.store(data.results[0], W0)
     }
 
@@ -3142,9 +3152,7 @@ mod vector_store_barrier_tests {
         let mut function = Function::new("aarch64-in-range-vector-store");
         let block = function.entry();
         let operands: Vec<_> = (0..4)
-            .map(|_| {
-                function.add_block_param(block, IRType::TOP, ValueRepresentation::Tagged)
-            })
+            .map(|_| function.add_block_param(block, IRType::TOP, ValueRepresentation::Tagged))
             .collect();
         let sources = operands
             .iter()
