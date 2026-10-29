@@ -736,7 +736,9 @@
   (error condition))
 
 ;; String-producing printers, built on FORMAT now that ~A/~S print lists.
-(defun princ-to-string (x) (format nil "~a" x))
+(defun princ-to-string (x)
+  (let ((*print-escape* nil) (*print-readably* nil))
+    (format nil "~a" x)))
 (defun prin1-to-string (x) (format nil "~s" x))
 (defun write-to-string (x &rest keys)
   ;; WRITE to a string stream: WRITE binds every printer-control keyword
