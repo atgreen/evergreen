@@ -211,6 +211,24 @@ pub const fn integer_octet_word_store() -> bool {
     ))
 }
 
+/// Whether the host emitter encodes `SmallVectorRangeP` and `VecSetInRange`,
+/// the pair `vector_ranges` uses to version a counted loop.
+///
+/// The pass clones the loop body behind a total runtime predicate: the clone's
+/// stores skip their bounds checks because the predicate proved the range.
+/// Both opcodes are needed -- the predicate alone is useless and the
+/// unchecked store alone is unsound -- so a target claiming this must have
+/// both arms. To add a target: give its emitter those two arms, then name it
+/// here.
+///
+/// AArch64 has emitter arms for both opcodes, but the pass remains disabled
+/// there: its current code-size and safepoint cost regresses both measured
+/// vector-loop shapes. Keeping the arms available lets the target be enabled
+/// once the pass earns that cost without making the regression the default.
+pub const fn vector_range_versioning() -> bool {
+    cfg!(all(target_arch = "x86_64", target_os = "linux"))
+}
+
 /// Whether the host emitter encodes the **raw `UnboxedF64`** double-float
 /// pipeline: `ConstDouble`, raw `FloatAdd`/`Sub`/`Mul`/`Div`/`Neg`/`Sqrt` and
 /// the raw double comparisons.
