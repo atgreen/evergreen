@@ -41459,9 +41459,9 @@ fn implicit_generic_lambda_list(method_lambda_list: EgclVal) -> EgclVal {
 const GENERIC_LAMBDA_LIST_PROPERTY: &str = "EGCL::%GENERIC-LAMBDA-LIST";
 
 fn store_generic_lambda_list(name_form: EgclVal, lambda_list: EgclVal) {
-    if let Some(indicator) = resolve_sym(GENERIC_LAMBDA_LIST_PROPERTY) {
-        symbol_plist_put(name_form, indicator, lambda_list);
-    }
+    // SETF function names are lists, so their metadata must use the same
+    // synthetic symbol holder as every other generic-function option.
+    store_generic_option(name_form, GENERIC_LAMBDA_LIST_PROPERTY, lambda_list);
 }
 
 /// DEFGENERIC's `(:method-class name)`, NIL when it gave none (GitHub #508).
@@ -41497,7 +41497,7 @@ fn stored_generic_option(name_form: EgclVal, property: &str) -> Option<EgclVal> 
 }
 
 fn stored_generic_lambda_list(name_form: EgclVal) -> Option<EgclVal> {
-    plist_symbol_property(name_form, GENERIC_LAMBDA_LIST_PROPERTY)
+    stored_generic_option(name_form, GENERIC_LAMBDA_LIST_PROPERTY)
 }
 
 /// The value of the property named `property` on `symbol`'s property list.
