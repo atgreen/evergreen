@@ -4658,6 +4658,13 @@ pub struct EnvironmentCalls {
     pub body: u64,
     pub load: u64,
     pub store: u64,
+    /// `c2i_define_env(body, name_index, value)`: BIND the name in the current
+    /// frame, as `DefineEnvVar` does, rather than assign an existing binding
+    /// as `store` does. Same signature as `store`, different meaning -- a
+    /// `LET` that opens a scope emits `PushEnvChild` and then one
+    /// `DefineEnvVar` per variable, so a target that handles the scope markers
+    /// but not this still declines the whole function (bliss-9kci1).
+    pub define: u64,
 }
 
 /// Runtime adapters a *checked*-ABI emitter needs for operations x86-64

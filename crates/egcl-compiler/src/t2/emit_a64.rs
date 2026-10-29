@@ -1929,7 +1929,9 @@ impl Emitter<'_> {
                         _ => self.runtime.store_global,
                     }
                 }
-                Opcode::EnvironmentValue | Opcode::SetEnvironmentValue => {
+                Opcode::EnvironmentValue
+                | Opcode::SetEnvironmentValue
+                | Opcode::DefineEnvironmentValue => {
                     // `(body, name_index) -> value` and
                     // `(body, name_index, value)`: the same C signatures the
                     // x86 framed and System Z emitters call, so AAPCS64 puts
@@ -1947,20 +1949,27 @@ impl Emitter<'_> {
                     let AuxData::EnvironmentName(index) = data.aux else {
                         return Err(unsupported!());
                     };
-                    let store = data.opcode == Opcode::SetEnvironmentValue;
-                    if self.runtime.environment.body == 0 {
+                    // `store` AND `define` both take the value in x2; only
+                    // `load` does not. Getting that condition wrong would call
+                    // `define` with whatever x2 happened to hold.
+                    let takes_value = matches!(
+                        data.opcode,
+                        Opcode::SetEnvironmentValue | Opcode::DefineEnvironmentValue
+                    );
+                    let helper = match data.opcode {
+                        Opcode::DefineEnvironmentValue => self.runtime.environment.define,
+                        Opcode::SetEnvironmentValue => self.runtime.environment.store,
+                        _ => self.runtime.environment.load,
+                    };
+                    if self.runtime.environment.body == 0 || helper == 0 {
                         return Err(EmitError::UnsupportedOp(op_tag(data.opcode)));
                     }
-                    if store {
+                    if takes_value {
                         self.load(*data.args.first().ok_or(unsupported!())?, T0)?;
                     }
                     self.imm(W0, self.runtime.environment.body);
                     self.imm(W1, u64::from(index));
-                    if store {
-                        self.runtime.environment.store
-                    } else {
-                        self.runtime.environment.load
-                    }
+                    helper
                 }
                 // "Explicit block-entry poll around a bounded straight-line
                 // replacement": the poll a fused kernel inherits from the loop

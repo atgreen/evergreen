@@ -734,7 +734,8 @@ fn lower_inst(lo: &mut Lowering, inst: Inst) {
         // caller-saved register — modelling it as a plain load/store let the
         // allocator keep a live value in a caller-saved register across it
         // (latent corruption; found during bliss-x5y.29's zero-push audit).
-        SymbolValue | SymbolFunction | SetSymbolValue | EnvironmentValue | SetEnvironmentValue => {
+        SymbolValue | SymbolFunction | SetSymbolValue | EnvironmentValue | SetEnvironmentValue
+        | DefineEnvironmentValue => {
             lo.emit_annotated(inst, op::CALL_RUNTIME, defs, uses);
         }
 

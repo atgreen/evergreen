@@ -29829,6 +29829,7 @@ fn compile_checked_t2_artifact(
             body: std::ptr::from_ref(&*env_names) as u64,
             load: c2i_load_env as extern "C" fn(*const NativeEnvNames, u64) -> u64 as usize as u64,
             store: c2i_store_env as extern "C" fn(*const NativeEnvNames, u64, u64) as usize as u64,
+            define: c2i_define_env as extern "C" fn(*const NativeEnvNames, u64, u64) as usize as u64,
         },
         &egcl_compiler::t2::emit::PortableCalls {
             values_to_list: c2i_values_to_list as extern "C" fn(u64) -> u64 as usize as u64,

@@ -258,6 +258,7 @@ pub(crate) fn calls_runtime(opcode: Opcode) -> bool {
             | Opcode::EnvironmentValue
             | Opcode::SetEnvironmentValue
             | Opcode::NativePoll
+            | Opcode::DefineEnvironmentValue
     )
 }
 
@@ -3064,6 +3065,9 @@ mod tests {
                     body: BODY,
                     load: load_env as *const () as u64,
                     store: store_env as *const () as u64,
+                    // This test covers only the load/store arms; a `define`
+                    // reaching it would decline rather than call zero.
+                    ..Default::default()
                 },
                 ..Default::default()
             };

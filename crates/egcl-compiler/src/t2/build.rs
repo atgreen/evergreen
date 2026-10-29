@@ -1304,7 +1304,12 @@ impl<'a> Builder<'a> {
                     }
                     push(i + 1, d - 1, &mut depth_at, &mut work);
                 }
-                Instr::DefineEnvVar(_) if self.native_cleanups => {
+                // Consumes its value on every ABI. A `LET` that opens a scope
+                // emits PushEnvChild and then one of these per variable, so
+                // accepting the scope markers without this one just moved the
+                // decline from PushEnvChild to here -- measured, 7 of each in
+                // the tier corpus (bliss-9kci1).
+                Instr::DefineEnvVar(_) => {
                     if d < 1 {
                         return Err(BuildError::Unsupported("environment binding without value"));
                     }
@@ -2193,6 +2198,22 @@ impl<'a> Builder<'a> {
                         AuxData::EnvironmentScope {
                             enter: matches!(instruction, Instr::PushEnvChild),
                         },
+                        Some(fs),
+                    );
+                }
+                Instr::DefineEnvVar(index) if !self.native_cleanups => {
+                    if self.bf.names.get(*index as usize).is_none() {
+                        return Err(BuildError::Unsupported("invalid environment name index"));
+                    }
+                    let value = stack
+                        .pop()
+                        .ok_or(BuildError::Unsupported("stack underflow (DefineEnvVar)"))?;
+                    let fs = self.build_frame_state(block, &stack, i as u32);
+                    self.emit_effect(
+                        block,
+                        Opcode::DefineEnvironmentValue,
+                        vec![value],
+                        AuxData::EnvironmentName(*index),
                         Some(fs),
                     );
                 }
