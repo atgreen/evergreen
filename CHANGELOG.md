@@ -130,6 +130,10 @@
   signaling `UNBOUND-SLOT`, and subsequent access to those slots no longer
   panics the runtime ([#816](https://github.com/atgreen/evergreen/pull/816)).
 
+- Compiling top-level macros retains their computed expansions across
+  compile-time effects, preserving captured values and metadata registration
+  ([#814](https://github.com/atgreen/evergreen/pull/814)).
+
 - `DEFSTRUCT` reuses inherited symbols for generated accessors, constructors,
   copiers, and predicates, preserving calls through exported package interfaces
   ([#775](https://github.com/atgreen/evergreen/pull/775)).
