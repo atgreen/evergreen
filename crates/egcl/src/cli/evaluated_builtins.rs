@@ -3963,6 +3963,20 @@ fn resolve(name: &str) -> Option<Handler> {
             Ok(plist)
         }),
 
+        "EGCL-INTERNAL:%SET-CLASS-NAME" | "EGCL-INTERNAL::%SET-CLASS-NAME" => Some(|_, args, env| {
+            if args.len() != 2 {
+                return Err(EgclError::ProgramError(format!("%SET-CLASS-NAME requires 2 arguments, got {}", args.len())));
+            }
+            if egcl_stdlib::clos::update_class_name(args[1], args[0])? {
+                // Name-based fast paths must recheck only an actual change.
+                bump_accessor_slot_gen();
+                invalidate_gf_dispatch_cache();
+                bytecode::bump_direct_call_gen();
+            }
+            env.clear_mv();
+            Ok(args[0])
+        }),
+
         "EGCL-INTERNAL:%RAW-SLOT-VALUE"
         | "EGCL-INTERNAL:%STANDARD-SLOT-VALUE-USING-CLASS"
         | "EGCL-INTERNAL:%STANDARD-SET-SLOT-VALUE-USING-CLASS"

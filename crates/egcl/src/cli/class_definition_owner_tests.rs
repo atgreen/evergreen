@@ -221,3 +221,22 @@ fn name_reuse_cannot_reuse_another_class_accessor_cache_entry() {
         Some(right)
     );
 }
+
+#[test]
+fn unchanged_primary_name_does_not_invalidate_native_calls() {
+    let _guard = heap_test_lock().lock().unwrap_or_else(|error| error.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    read_eval_all_env("(defclass unchanged-primary-name () ())", &mut env).unwrap();
+    egcl_rt::rooted!(class = egcl_stdlib::find_class(resolve_sym("UNCHANGED-PRIMARY-NAME").unwrap()).unwrap());
+    egcl_rt::rooted!(name = egcl_stdlib::class_name(*class));
+    let operator = "EGCL-INTERNAL:%SET-CLASS-NAME";
+    let before = bytecode::direct_call_gen();
+    assert_eq!(evaluated_builtins::call(operator, &[*name, *class], &mut env).unwrap().unwrap(), *name);
+    assert_eq!(bytecode::direct_call_gen(), before);
+    assert_eq!(evaluated_builtins::call(operator, &[NIL, *class], &mut env).unwrap().unwrap(), NIL);
+    let changed = bytecode::direct_call_gen();
+    assert_ne!(changed, before);
+    assert_eq!(evaluated_builtins::call(operator, &[NIL, *class], &mut env).unwrap().unwrap(), NIL);
+    assert_eq!(bytecode::direct_call_gen(), changed);
+}
