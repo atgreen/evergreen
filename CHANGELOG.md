@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- Circular printing respects `*PRINT-LENGTH*` before emitting shared-tail
+  references, avoiding labels for tails hidden by truncation
+  ([#869](https://github.com/atgreen/evergreen/pull/869)).
+
 - FORMAT right-justifies a lone text segment without adding between-segment
   minimum padding to its implicit leading slot
   ([#868](https://github.com/atgreen/evergreen/pull/868)).
