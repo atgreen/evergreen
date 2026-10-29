@@ -2,6 +2,7 @@
   "fast": {
     "egcl:test:compile_toplevel_expansion_cli": [""],
     "egcl:test:compile_toplevel_order_cli": [""],
+    "egcl:test:compile_file_macroexpansion_error_cli": [""],
     "egcl:test:function_literal_lowering_cli": [""],
     "egcl:test:pathname_readably_cli": [""],
     "egcl:test:canonical_symbol_properties_cli": [""],
@@ -52,7 +53,7 @@
     "egcl:test:array_adjustment_cli": [""],
     "egcl:test:array_adjustment_persistence_cli": [""],
     "egcl-stdlib:test:array_adjustment": [""],
-    "egcl:test:bfasl_cli": ["memory_fence_call_persists_without_source_fallback", "incompatible_bytecode_versions_are_rejected_before_load_effects"],
+    "egcl:test:bfasl_cli": ["memory_fence_call_persists_without_source_fallback", "incompatible_bytecode_versions_are_rejected_before_load_effects", "compile_file_does_not_hide_bootstrap_named_macro_expansion_errors"],
     "egcl:test:acceptance": ["type_of_agrees_with_subtypep_for_characters_and_strings", "read_nd_array_literal_and_equalp_roundtrip"],
     "egcl:test:system_construction_cli": [""],
     "egcl:test:defstruct_inherited_accessor_cli": [""],
