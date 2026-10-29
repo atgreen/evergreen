@@ -1816,6 +1816,28 @@ impl Emitter<'_> {
                         self.runtime.environment.load
                     }
                 }
+                // "Explicit block-entry poll around a bounded straight-line
+                // replacement": the poll a fused kernel inherits from the loop
+                // it replaced, which must still be reached even though the
+                // back edge is gone. This emitter already routes every
+                // back-edge poll through `runtime_call(_, None)` and the same
+                // `poll` adapter with full root synchronisation, so the
+                // explicit form is that same call -- it simply arrives as an
+                // opcode rather than as a terminator.
+                //
+                // Without this arm `octet_word_fusion` produced a kernel whose
+                // poll nothing could emit, and the function declined: measured
+                // at 40x SLOWER than leaving the pass off, because the whole
+                // body fell back to T1.
+                Opcode::NativePoll => {
+                    if !data.args.is_empty() || !data.results.is_empty() {
+                        return Err(unsupported!());
+                    }
+                    if self.runtime.poll == 0 {
+                        return Err(unsupported!());
+                    }
+                    self.runtime.poll
+                }
                 Opcode::ClearMv => {
                     self.imm(W0, NIL.0);
                     self.imm(W1, 0);

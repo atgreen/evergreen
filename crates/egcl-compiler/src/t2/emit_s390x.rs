@@ -257,6 +257,7 @@ pub(crate) fn calls_runtime(opcode: Opcode) -> bool {
             | Opcode::TakeValuesToLocals
             | Opcode::EnvironmentValue
             | Opcode::SetEnvironmentValue
+            | Opcode::NativePoll
     )
 }
 
