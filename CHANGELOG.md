@@ -4,9 +4,14 @@
 
 ### Added
 
+- Add an initial iOS C worker-host API and SwiftUI source scaffold with
+  cooperative Lisp shutdown, preserved host control signals, scoped application
+  paths and explicit subprocess rejection. Full app/device validation remains
+  pending ([#909](https://github.com/atgreen/evergreen/pull/909)).
+
 - Add an ARM64 iOS device/simulator foundation with Darwin OS routing and an
-  enforced T0/no-executable-memory profile. SDK/device validation, the host app
-  scaffold and Apple scalar FFI support remain unfinished
+  enforced T0/no-executable-memory profile. Full application support and
+  SDK/device validation remain unfinished
   ([#899](https://github.com/atgreen/evergreen/pull/899)).
 
 - Static applications can link foreign native archives declared with

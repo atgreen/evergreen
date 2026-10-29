@@ -1,0 +1,16 @@
+[package]
+name = "egcl-ios"
+description = "Host-linked iOS worker runtime for Evergreen Common Lisp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Keep ordinary workspace builds portable. Produce the application archive
+# explicitly with cargo rustc --crate-type staticlib for the chosen iOS SDK.
+[lib]
+crate-type = ["rlib"]
+
+[target.'cfg(target_os = "ios")'.dependencies]
+egcl = { path = "../egcl" }
+egcl-rt = { path = "../egcl-rt" }

@@ -1260,6 +1260,7 @@ pub fn install_signal_handlers() -> Result<(), EgclError> {
 
 #[cfg(unix)]
 fn install_process_signal_handlers() -> Result<(), EgclError> {
+    let process_signals = crate::host::claim_process_signals();
     use crate::syscall;
     // Dynamic GNU builds can participate in HotSpot's documented libjsig
     // interposition. Refuse JVM-first startup without it before changing any
@@ -1325,24 +1326,26 @@ fn install_process_signal_handlers() -> Result<(), EgclError> {
             syscall::SA_RESTART | syscall::SA_ONSTACK | syscall::SA_SIGINFO,
         )
         .map_err(|_| EgclError::SignalError(syscall::SIGBUS))?;
-        install(
-            syscall::SIGINT,
-            sigint_handler as *const () as usize,
-            syscall::SA_RESTART,
-        )
-        .map_err(|_| EgclError::SignalError(syscall::SIGINT))?;
-        install(
-            syscall::SIGTERM,
-            sigterm_handler as *const () as usize,
-            syscall::SA_RESTART,
-        )
-        .map_err(|_| EgclError::SignalError(syscall::SIGTERM))?;
-        install(
-            syscall::SIGALRM,
-            sigalrm_handler as *const () as usize,
-            syscall::SA_RESTART,
-        )
-        .map_err(|_| EgclError::SignalError(syscall::SIGALRM))?;
+        if process_signals {
+            install(
+                syscall::SIGINT,
+                sigint_handler as *const () as usize,
+                syscall::SA_RESTART,
+            )
+            .map_err(|_| EgclError::SignalError(syscall::SIGINT))?;
+            install(
+                syscall::SIGTERM,
+                sigterm_handler as *const () as usize,
+                syscall::SA_RESTART,
+            )
+            .map_err(|_| EgclError::SignalError(syscall::SIGTERM))?;
+            install(
+                syscall::SIGALRM,
+                sigalrm_handler as *const () as usize,
+                syscall::SA_RESTART,
+            )
+            .map_err(|_| EgclError::SignalError(syscall::SIGALRM))?;
+        }
         install(
             syscall::SIGFPE,
             sigfpe_handler as *const () as usize,
@@ -1378,6 +1381,10 @@ const SIGTERM_GRACE_SECS: u32 = 5;
 
 #[cfg(unix)]
 extern "C" fn sigterm_handler(_sig: i32) {
+    if crate::host::is_embedded() {
+        crate::host::request_stop_signal_safe();
+        return;
+    }
     SIGTERM_RECEIVED.store(true, std::sync::atomic::Ordering::Relaxed);
     mark_process_signal_activity();
     // Arm a hard deadline (bliss-siv7): the cooperative shutdown flag only
@@ -1391,6 +1398,9 @@ extern "C" fn sigterm_handler(_sig: i32) {
 
 #[cfg(unix)]
 extern "C" fn sigalrm_handler(_sig: i32) {
+    if crate::host::is_embedded() {
+        return;
+    }
     // Only armed by sigterm_handler. Still alive => the cooperative shutdown
     // never ran (or stalled); terminate every thread now.
     crate::syscall::dbg_write(b"egcl: SIGTERM grace period expired; exiting\n");
@@ -3168,6 +3178,9 @@ fn arith_builtin(args: &[EgclVal], op: ArithOp) -> Result<EgclVal, EgclError> {
 /// Register cooperative console interruption without Unix signal layouts.
 #[cfg(windows)]
 pub fn install_signal_handlers() -> Result<(), EgclError> {
+    if !crate::host::claim_process_signals() {
+        return Ok(());
+    }
     use windows_sys::Win32::System::Console::*;
     unsafe extern "system" fn handler(event: u32) -> i32 {
         match event {

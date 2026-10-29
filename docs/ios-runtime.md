@@ -42,15 +42,19 @@ unsupported types are still rejected.
 
 ## Remaining work
 
-The first application runtime still needs a thin host-linked library and
-application scaffold: keep the host's main thread, start Lisp on an owned
-worker using `egcl::run`, locate bundled source/assets, provide writable
-application paths, and manage startup/shutdown. Subprocess creation needs an
-explicit rejection policy in the shared process library. The scalar ABI source
-fixtures need actual execution on Apple ARM64, including
-narrow fixed stack arguments, signed/unsigned caller extension, mixed floating
-point spills and real variadic calls. These validation prerequisites are not
-satisfied by this foundation.
+The repository now includes a thin host-linked worker library, C API and
+[SwiftUI source scaffold](../examples/ios/README.md). It keeps the host main
+thread, loads bundled Lisp source, exposes a separate application-writable
+pathname and supervises cooperative root/descendant shutdown. Subprocess
+creation and runtime cargo rebuilding are refused on iOS. The adapter uses
+[permanent embedded ownership](embedding.md); Lisp exit never intentionally
+terminates the Swift application. This scaffold has not been built or run.
+
+The scalar ABI and lifecycle source fixtures still need actual execution on
+Apple ARM64, including caller extension, variadic calls, process-handler
+ownership, descendant cleanup, first-explicit-exit codes and post-init GC
+stress. Native linking/project integration and simulator/device validation
+remain prerequisites, not completed support evidence.
 
 Build and link both targets using the appropriate Xcode SDK before claiming
 support. Future validation must cover simulator and device startup, source

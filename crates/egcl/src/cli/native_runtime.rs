@@ -26,6 +26,11 @@ pub(super) fn build(
     source: Option<&str>,
     selected: &Contract,
 ) -> Result<Vec<u8>, egcl_rt::error::EgclError> {
+    if cfg!(target_os = "ios") {
+        return Err(egcl_rt::EgclError::ProgramError(
+            "native runtime rebuilding cannot spawn build tools on iOS".into(),
+        ));
+    }
     use std::{fs, path::Path, process::Command};
     let fail = |message: String| {
         egcl_rt::error::EgclError::ProgramError(format!("native shake: {message}"))

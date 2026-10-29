@@ -28,6 +28,7 @@ pub mod execution_local;
 pub mod execution_poll;
 pub mod function;
 pub mod fxhash;
+pub mod host;
 pub mod native_transfer;
 pub mod nil_array;
 pub mod object;
