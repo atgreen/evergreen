@@ -138,6 +138,10 @@
   without re-reading source feature conditionals
   ([#811](https://github.com/atgreen/evergreen/pull/811)).
 
+- Callable dispatching reader macros honor the current readtable's custom
+  sub-character handlers, including custom feature conditionals used while
+  compiling files ([#777](https://github.com/atgreen/evergreen/pull/777)).
+
 - Callable standard comment readers return zero values, so custom list readers
   skip comments without inserting spurious `NIL` elements
   ([#767](https://github.com/atgreen/evergreen/pull/767)).

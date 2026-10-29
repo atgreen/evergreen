@@ -44,6 +44,7 @@
     "egcl:test:reader_external_symbols_cli": [""],
     "egcl:test:recursive_reader_labels_cli": [""],
     "egcl:test:function_reader_readtable_cli": [""],
+    "egcl:test:dispatch_reader_readtable_cli": [""],
     "egcl:test:unused_lexical_function_tiers": [""],
     "egcl:test:array_adjustment_cli": [""],
     "egcl:test:array_adjustment_persistence_cli": [""],
