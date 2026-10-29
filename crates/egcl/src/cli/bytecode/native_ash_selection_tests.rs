@@ -33,6 +33,7 @@ fn generic_variable_ash_executes_in_ordinary_and_mapped_t2_without_deopt() {
         .unwrap_or_else(|e| e.into_inner());
     egcl_rt::rooted!(env = Env::new(false));
     egcl_rt::rooted!(wide = egcl_rt::bignum::alloc_bignum_cli(1, &[0, 1 << 36]));
+    egcl_rt::rooted!(marker = crate::cli::arena_cons(EgclVal::from_fixnum(42), NIL));
     let cases = [(7, 2), (-7, -1), (7, -100), (-7, -100), (1, 100)];
     egcl_rt::rooted!(
         expected_values = [
@@ -47,8 +48,9 @@ fn generic_variable_ash_executes_in_ordinary_and_mapped_t2_without_deopt() {
         let _mapped = mapped.then(native_transfer_entry::MappedOnlyForTest::new);
         let (symbol, code) = native_transfer_tests::ordinary_t2::install(
             "NATIVE-VARIABLE-ASH",
-            "(value count)",
-            "((declare (type fixnum value count)) (ash value count))",
+            "(value count marker)",
+            "((declare (type fixnum value count))
+              (let ((shifted (ash value count))) (cons shifted marker)))",
             &mut env,
         );
         assert!(code.is_t2);
@@ -65,12 +67,23 @@ fn generic_variable_ash_executes_in_ordinary_and_mapped_t2_without_deopt() {
                 result = run_native(
                     &code,
                     symbol,
-                    &[EgclVal::from_fixnum(value), EgclVal::from_fixnum(count)],
+                    &[
+                        EgclVal::from_fixnum(value),
+                        EgclVal::from_fixnum(count),
+                        *marker
+                    ],
                     &mut env
                 )
                 .unwrap()
             );
-            assert!(crate::cli::numeric_equal(*result, expected_values[index]).unwrap());
+            assert!(result.is_cons());
+            let (shifted, saved_marker) = crate::cli::cp(*result);
+            assert_eq!(
+                saved_marker, *marker,
+                "native call must retain the exact heap marker"
+            );
+            egcl_rt::rooted!(shifted = shifted);
+            assert!(crate::cli::numeric_equal(*shifted, expected_values[index]).unwrap());
         }
         assert!(
             VISITS.with(Cell::get) > 0,
