@@ -14359,8 +14359,7 @@ fn decode_bbu_function(
                 block_id: cursor.u32()?,
             },
             0x3f => {
-                let reference = cursor.u32()?;
-                let name = val_as_str(constants[bbu_index(reference, constants.len(), "control name")?]);
+                let name = bbu_string_from_values(constants, cursor.u32()?)?;
                 let index = names.len();
                 if index > u16::MAX as usize {
                     return Err(bbu_error("too many block names"));
@@ -14371,8 +14370,7 @@ fn decode_bbu_function(
                 }
             }
             0x40 => {
-                let reference = cursor.u32()?;
-                let name = val_as_str(constants[bbu_index(reference, constants.len(), "control name")?]);
+                let name = bbu_string_from_values(constants, cursor.u32()?)?;
                 let index = names.len();
                 if index > u16::MAX as usize {
                     return Err(bbu_error("too many tag names"));
@@ -14383,8 +14381,7 @@ fn decode_bbu_function(
                 }
             }
             0x41 => {
-                let reference = cursor.u32()?;
-                let name = val_as_str(constants[bbu_index(reference, constants.len(), "control name")?]);
+                let name = bbu_string_from_values(constants, cursor.u32()?)?;
                 let tag_bcp = cursor.u32()?;
                 let index = names.len();
                 if index > u16::MAX as usize {
