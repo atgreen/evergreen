@@ -2205,10 +2205,10 @@ impl<'a> Builder<'a> {
                     if self.bf.names.get(*index as usize).is_none() {
                         return Err(BuildError::Unsupported("invalid environment name index"));
                     }
+                    let fs = self.build_frame_state(block, &stack, i as u32);
                     let value = stack
                         .pop()
                         .ok_or(BuildError::Unsupported("stack underflow (DefineEnvVar)"))?;
-                    let fs = self.build_frame_state(block, &stack, i as u32);
                     self.emit_effect(
                         block,
                         Opcode::DefineEnvironmentValue,
