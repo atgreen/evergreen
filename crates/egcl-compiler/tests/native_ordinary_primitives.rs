@@ -67,6 +67,7 @@ fn global_value_read_compiles_through_the_ordinary_abi() {
     let result = emit_framed_ordinary_function(
         &f,
         OrdinaryLispEntryOptions {
+            require_callable_home: false,
             arity: 0,
             arity_error_veneer: 1,
             binding: None,
@@ -187,6 +188,7 @@ fn semantic_store_keeps_its_continuation_and_discards_the_primary() {
     let code = emit_framed_ordinary_function(
         &f,
         OrdinaryLispEntryOptions {
+            require_callable_home: false,
             arity: 0,
             arity_error_veneer: 1,
             binding: None,

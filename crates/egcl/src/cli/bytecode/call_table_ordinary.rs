@@ -15,12 +15,41 @@ use std::sync::atomic::Ordering;
 
 use super::super::native_transfer_entry::TransferCode;
 
+enum DescriptorLease {
+    Named(Arc<CallCell>),
+    Private {
+        native: std::rc::Weak<super::super::NativeCode>,
+        revision: Arc<std::sync::atomic::AtomicU64>,
+    },
+}
+
+impl DescriptorLease {
+    fn key(&self, descriptor: OrdinaryEntryDescriptor) -> RetainedKey {
+        match self {
+            Self::Named(cell) => RetainedKey::new(cell, descriptor),
+            Self::Private { .. } => RetainedKey::private(descriptor),
+        }
+    }
+    fn is_live(&self, descriptor: &OrdinaryEntryDescriptor) -> bool {
+        match self {
+            Self::Named(cell) => {
+                unsafe { &*cell.ordinary_entry_address() }.load(Ordering::Acquire)
+                    == std::ptr::from_ref(descriptor) as usize
+            }
+            Self::Private { native, revision } => {
+                native.strong_count() != 0
+                    && revision.load(Ordering::Acquire) == descriptor.revision
+            }
+        }
+    }
+}
+
 struct RetainedEntry<C> {
     descriptor: OrdinaryEntryDescriptor,
     // Past policies can still be loaded by suspended native activations.
     #[allow(clippy::vec_box)]
     heat: Vec<Box<OrdinaryCallHeat>>,
-    cell: Arc<CallCell>,
+    lease: DescriptorLease,
     code: Rc<C>,
     callable: Option<Arc<egcl_rt::CrossThreadRoot<egcl_rt::value::EgclVal>>>,
 }
@@ -36,8 +65,15 @@ struct RetainedKey {
 
 impl RetainedKey {
     fn new(cell: &Arc<CallCell>, d: OrdinaryEntryDescriptor) -> Self {
+        Self::with_cell(Arc::as_ptr(cell) as usize, d)
+    }
+    fn private(d: OrdinaryEntryDescriptor) -> Self {
+        // An Arc allocation is never null, so this cannot alias a named cell.
+        Self::with_cell(0, d)
+    }
+    fn with_cell(cell: usize, d: OrdinaryEntryDescriptor) -> Self {
         Self {
-            cell: Arc::as_ptr(cell) as usize,
+            cell,
             wide: [d.kind, d.version, d.revision, d.environment],
             native: [
                 d.entry,
@@ -77,6 +113,8 @@ struct RetainedEntries<C> {
     /// While both are unchanged a sweep would find every entry still
     /// published, so the outermost segment exit skips it (GitHub #487).
     swept: Option<(u64, usize)>,
+    private_entries: usize,
+    private_stamp: u64,
 }
 
 impl<C> Default for RetainedEntries<C> {
@@ -91,6 +129,8 @@ impl<C> Default for RetainedEntries<C> {
             #[cfg(test)]
             duplicate_queries: 0,
             swept: None,
+            private_entries: 0,
+            private_stamp: u64::MAX,
         }
     }
 }
@@ -108,7 +148,11 @@ impl<C> RetainedEntries<C> {
             .segments
             .checked_sub(1)
             .expect("unbalanced native segment retirement");
-        if self.swept != Some((linkage::ordinary_epoch(), self.entries.len())) {
+        if self.swept != Some((linkage::ordinary_epoch(), self.entries.len()))
+            || self.private_entries != 0
+                && self.private_stamp
+                    != super::super::native_transfer_entry::funcall_fast::collection_stamp()
+        {
             self.sweep();
         }
     }
@@ -143,7 +187,7 @@ impl<C> RetainedEntries<C> {
         let entry = Box::new(RetainedEntry {
             descriptor,
             heat: Vec::new(),
-            cell,
+            lease: DescriptorLease::Named(cell),
             code,
             callable,
         });
@@ -153,11 +197,42 @@ impl<C> RetainedEntries<C> {
         Some(pointer)
     }
 
+    fn retain_private(
+        &mut self,
+        descriptor: OrdinaryEntryDescriptor,
+        code: Rc<C>,
+        native: std::rc::Weak<super::super::NativeCode>,
+        revision: Arc<std::sync::atomic::AtomicU64>,
+    ) -> Option<*const OrdinaryEntryDescriptor> {
+        if !descriptor.is_compatible()
+            || descriptor.owner != Rc::as_ptr(&code) as usize
+            || native.strong_count() == 0
+            || revision.load(Ordering::Acquire) != descriptor.revision
+        {
+            return None;
+        }
+        let key = RetainedKey::private(descriptor);
+        if let Some(&index) = self.by_descriptor.get(&key) {
+            return Some(&self.entries[index].descriptor);
+        }
+        let entry = Box::new(RetainedEntry {
+            descriptor,
+            heat: Vec::new(),
+            lease: DescriptorLease::Private { native, revision },
+            code,
+            callable: None,
+        });
+        let pointer = std::ptr::from_ref(&entry.descriptor);
+        self.entries.push(entry);
+        self.private_entries += 1;
+        self.index_entry(self.entries.len() - 1);
+        Some(pointer)
+    }
+
     fn index_entry(&mut self, index: usize) {
         let entry = &self.entries[index];
         let d = entry.descriptor;
-        self.by_descriptor
-            .insert(RetainedKey::new(&entry.cell, d), index);
+        self.by_descriptor.insert(entry.lease.key(d), index);
         let mut start = d.code_start;
         let mut end = start
             .checked_add(d.code_len)
@@ -230,10 +305,17 @@ impl<C> RetainedEntries<C> {
         }
         let epoch = linkage::ordinary_epoch();
         let before = self.entries.len();
+        let mut retired = false;
         self.entries.retain(|entry| {
-            let published =
-                unsafe { &*entry.cell.ordinary_entry_address() }.load(Ordering::Acquire);
-            published == std::ptr::from_ref(&entry.descriptor) as usize
+            let keep = entry.lease.is_live(&entry.descriptor);
+            if !keep && !retired {
+                // Vec::retain runs this predicate before dropping its rejected
+                // Box. Retire every weak cached pointer before its first owner
+                // is destroyed, even without a revision change or collection.
+                super::super::native_transfer_entry::funcall_fast::retire_native_probes();
+                retired = true;
+            }
+            keep
         });
         if self.entries.len() != before {
             self.by_descriptor.clear();
@@ -242,6 +324,12 @@ impl<C> RetainedEntries<C> {
                 self.index_entry(index);
             }
         }
+        self.private_entries = self
+            .entries
+            .iter()
+            .filter(|entry| matches!(entry.lease, DescriptorLease::Private { .. }))
+            .count();
+        self.private_stamp = super::super::native_transfer_entry::funcall_fast::collection_stamp();
         self.swept = Some((epoch, self.entries.len()));
     }
 
@@ -319,6 +407,9 @@ impl OrdinaryCodeDirectory {
         function: egcl_rt::value::EgclVal,
         callable: Option<&Arc<egcl_rt::CrossThreadRoot<egcl_rt::value::EgclVal>>>,
     ) -> bool {
+        if code.accepts_explicit_callable(function) {
+            return true;
+        }
         if callable.is_some_and(|callable| self.held_only_by(code, callable)) {
             return true;
         }
@@ -579,12 +670,18 @@ pub(in crate::cli::bytecode) unsafe fn publish_ordinary_with_heat(
         }
         // Share the code's own callable root, so ordinary entries for the same
         // function recognize this published identity by pointer.
-        let callable = code.callable_root(*function);
+        let callable = if descriptor.environment == linkage::ORDINARY_ENV_CLOSURE {
+            // Identity is rooted in each physical frame, not permanently in
+            // this shared-template cache. Do not retain otherwise-dead closures.
+            None
+        } else {
+            Some(code.callable_root(*function))
+        };
         let pointer = directory.retained.borrow_mut().retain_with_callable(
             Arc::clone(&state.cell),
             descriptor,
             code,
-            Some(callable),
+            callable,
         );
         let Some(pointer) = pointer else { return false };
         // Retention and publication do not allocate Lisp objects or yield.
@@ -607,6 +704,38 @@ pub(in crate::cli::bytecode) unsafe fn publish_ordinary_with_heat(
             unsafe { linkage::publish_ordinary_with_heat(&state.cell, &*pointer, heat_pointer) };
         directory.retained.borrow_mut().sweep();
         published
+    })
+}
+
+/// A collectable compilation owner has no global named ordinal. Its private
+/// descriptor is retained by physical-code lifetime, with a weak installed
+/// owner and a separately stable admission word. No callable is cached here.
+pub(in crate::cli::bytecode) fn private_probe_target(
+    code: Rc<TransferCode>,
+    native: std::rc::Weak<super::super::NativeCode>,
+) -> Option<(usize, usize, u64)> {
+    if code.native_callable_slot.is_none() || code.needs_recompile() {
+        return None;
+    }
+    let owner = native.upgrade()?;
+    if !matches!(&owner._storage, super::super::NativeCodeStorage::Mapped(current)
+        if Rc::ptr_eq(current, &code))
+    {
+        return None;
+    }
+    let revision = code.private_entry_revision();
+    let seen = revision.load(Ordering::Acquire);
+    let descriptor = code.ordinary_descriptor(seen)?;
+    if descriptor.environment != linkage::ORDINARY_ENV_CLOSURE {
+        return None;
+    }
+    let address = revision.as_ptr() as usize;
+    DIRECTORY.with(|directory| {
+        let pointer = directory
+            .retained
+            .borrow_mut()
+            .retain_private(descriptor, code, native, revision)?;
+        Some((pointer as usize, address, seen))
     })
 }
 
@@ -761,7 +890,7 @@ pub(super) fn has_active_segments() -> bool {
 mod tests {
     use super::*;
 
-    fn descriptor(owner: &Rc<()>, revision: u64, start: usize) -> OrdinaryEntryDescriptor {
+    fn descriptor<T>(owner: &Rc<T>, revision: u64, start: usize) -> OrdinaryEntryDescriptor {
         OrdinaryEntryDescriptor {
             kind: linkage::ORDINARY_X64_LISP_KIND,
             version: linkage::ORDINARY_X64_LISP_VERSION,
@@ -1218,6 +1347,52 @@ mod tests {
         assert!(
             weak.upgrade().is_none(),
             "last segment retires invalidated owners"
+        );
+    }
+
+    #[test]
+    fn weak_native_probes_retire_before_descriptor_owner_drops() {
+        use super::super::native_transfer_entry::funcall_fast::probe_retirements_for_test;
+        struct ObserveDrop {
+            before: usize,
+            observed: Rc<std::cell::Cell<bool>>,
+        }
+        impl Drop for ObserveDrop {
+            fn drop(&mut self) {
+                self.observed
+                    .set(probe_retirements_for_test() > self.before);
+            }
+        }
+        let before = probe_retirements_for_test();
+        let observed = Rc::new(std::cell::Cell::new(false));
+        let owner = Rc::new(ObserveDrop {
+            before,
+            observed: Rc::clone(&observed),
+        });
+        let mut entries = RetainedEntries::default();
+        entries.begin_segment();
+        let cell = Arc::new(CallCell::new(0, 11, 12));
+        entries
+            .retain(Arc::clone(&cell), descriptor(&owner, 0, 0x1000), owner)
+            .unwrap();
+        entries.sweep();
+        assert_eq!(
+            probe_retirements_for_test(),
+            before,
+            "active native segment must retain every descriptor"
+        );
+        assert!(!observed.get());
+        entries.finish_segment();
+        assert_eq!(probe_retirements_for_test(), before + 1);
+        assert!(
+            observed.get(),
+            "the weak-probe stamp must change BEFORE owner destruction"
+        );
+        entries.sweep();
+        assert_eq!(
+            probe_retirements_for_test(),
+            before + 1,
+            "an empty/no-removal sweep has no invalidation work"
         );
     }
 

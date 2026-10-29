@@ -50,7 +50,9 @@ impl TransferCode {
         // tagged parameters; restate the facts this entry relies on.
         self.ordinary_entry.filter(|_| {
             !self.body.variadic
-                && !self.body.has_env
+                && (!self.body.has_env
+                    || self.native_callable_slot.is_some()
+                        && ordinary_outer_capture_body(&self.body))
                 && self.body.min_args == self.body.arity
                 && self
                     .body
@@ -94,6 +96,7 @@ impl TransferCode {
         egcl_rt::rooted!(
             roots = EntryRoots {
                 function,
+                code_owner: self.installed_symbol,
                 args: EntryArgs::new(args),
                 env,
                 state: &mut *state,
@@ -103,6 +106,15 @@ impl TransferCode {
         );
         // The rooted copy stays in place; the collector updates it there.
         let args: &[EgclVal] = unsafe { &*std::ptr::from_ref(roots.args.as_slice()) };
+        if self.native_callable_slot.is_some() {
+            if !self.accepts_explicit_callable(roots.function) {
+                return Err(invalid_capture());
+            }
+            // Interpreter resumption after a guard uses this same authoritative
+            // captured parent. No new lexical frame or captured parameters are
+            // created for this admitted outer-frame-only cohort.
+            state.env_frame = closure_captured_env(roots.function);
+        }
         unsafe {
             *depth += 1;
         }
@@ -163,15 +175,16 @@ impl TransferCode {
         // A safepoint may have migrated a fiber: the execution context is
         // per execution and stays put, so `execution` is still this one.
         let _ordinary_segment = super::super::call_table::enter_ordinary_segment();
-        let _ordinary_root = if self.needs_callable_identity() {
-            Some(
-                _ordinary_segment
-                    .retain_root(self, roots.function)
-                    .ok_or_else(invalid_capture)?,
-            )
-        } else {
-            None
-        };
+        let _ordinary_root =
+            if self.needs_callable_identity() && self.native_callable_slot.is_none() {
+                Some(
+                    _ordinary_segment
+                        .retain_root(self, roots.function)
+                        .ok_or_else(invalid_capture)?,
+                )
+            } else {
+                None
+            };
         let control = unsafe { native_frames::initialize_for(&mut context, env, execution, depth) };
         // Keep the existing execution-specific emergency stack reserve, as
         // the general entry does; generated child calls check their own bounds.
@@ -213,7 +226,11 @@ impl TransferCode {
                     native_transfer::invoke_ordinary_native_segment(
                         self.code.as_ptr().add(offset),
                         execution,
-                        NIL,
+                        if self.native_callable_slot.is_some() {
+                            roots.function
+                        } else {
+                            NIL
+                        },
                         args,
                         stack,
                     )
@@ -285,6 +302,9 @@ impl Drop for EntryState {
 /// enclosing pending error the entry holds aside while it runs.
 pub(super) struct EntryRoots {
     pub(super) function: EgclVal,
+    // Trace code identity separately from the actual callable's captures,
+    // sharing this existing root registration rather than linking another.
+    pub(super) code_owner: Option<u32>,
     pub(super) args: EntryArgs,
     pub(super) env: *mut Env,
     pub(super) state: *mut ActivationState,
@@ -315,6 +335,9 @@ impl EntryRoots {
 impl egcl_rt::gc::TraceHostRoots for EntryRoots {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
         visit(&mut self.function);
+        if let Some(owner) = self.code_owner {
+            egcl_rt::symbols::trace_symbol_index(owner, visit);
+        }
         self.args.trace_host_roots(visit);
         // The entry declares the state and child ledger before linking this
         // root and drops them after unlinking it; Env outlives the entry.

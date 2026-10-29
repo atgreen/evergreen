@@ -153,6 +153,24 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
         for (pos, &inst) in bd.insts.iter().enumerate() {
             let data = f.inst(inst);
             let is_term = data.opcode.is_terminator();
+            if data.opcode == Opcode::CurrentCallable
+                && (!data.args.is_empty()
+                    || data.results.len() != 1
+                    || !data.targets.is_empty()
+                    || !matches!(data.aux, AuxData::None)
+                    || data.flags != crate::t2::ir::InstFlags::default()
+                    || data.frame_state.is_some()
+                    || data.results.first().is_some_and(|&value| {
+                        !f.is_valid_value(value)
+                            || f.value(value).repr != crate::t2::ir::ValueRepresentation::Tagged
+                            || f.value(value).ty != crate::t2::ir::IRType::TOP
+                    }))
+            {
+                errors.push(VerifyError::new(
+                    "V8 current-callable-contract",
+                    format!("{inst:?}: malformed hidden callable read"),
+                ));
+            }
             if matches!(data.aux, AuxData::OpaqueCallTarget(_))
                 && (!matches!(data.opcode, Opcode::Call | Opcode::Invoke)
                     || !data.flags.call

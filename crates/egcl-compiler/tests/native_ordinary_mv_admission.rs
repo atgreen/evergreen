@@ -189,6 +189,7 @@ fn exercise(clear_between: bool) {
     let emitted = emit_framed_ordinary_function_with_poll(
         &f,
         OrdinaryLispEntryOptions {
+            require_callable_home: false,
             arity: 0,
             arity_error_veneer: rejected as *const () as u64,
             binding: None,

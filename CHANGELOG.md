@@ -11,6 +11,12 @@
 
 ### Fixed
 
+- Eligible private closures retain shared compiled code while native calls and
+  deoptimization use each actual instance's identity and captures. Captured
+  lexical loads can reuse proven values within a basic block, reducing repeated
+  environment lookups while preserving stores and synchronization boundaries
+  ([#764](https://github.com/atgreen/evergreen/pull/764)).
+
 - Logical FORMAT blocks preserve circular and shared argument tails for
   `*PRINT-CIRCLE*` and `*PRINT-LENGTH*`, including nested indirection and
   FORMATTER callbacks. Explicitly compiled formatter copies preserve their

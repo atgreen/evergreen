@@ -429,13 +429,18 @@ static REGISTRY_GENERATION: egcl_rt::execution_local::ExecutionLocal<
 
 // Host code forms a graph too: private bodies are owned by live callables or
 // active/calling code, not by the dispatch caches that happen to store Arcs.
-fn traced_bytecode_bodies() -> &'static SharedCell<(u64, std::collections::HashSet<usize>)> {
-    static TRACED: std::sync::OnceLock<SharedCell<(u64, std::collections::HashSet<usize>)>> =
+// These keys are runtime-generated addresses and symbol IDs, never user hash
+// keys. Use the same integer hasher as the native registries they describe.
+type CodeIdentitySet<T> = std::collections::HashSet<T, egcl_rt::fxhash::FxBuildHasher>;
+type CodeOwnerBodies = HashMap<u32, usize, egcl_rt::fxhash::FxBuildHasher>;
+
+fn traced_bytecode_bodies() -> &'static SharedCell<(u64, CodeIdentitySet<usize>)> {
+    static TRACED: std::sync::OnceLock<SharedCell<(u64, CodeIdentitySet<usize>)>> =
         std::sync::OnceLock::new();
-    TRACED.get_or_init(|| SharedCell::new((0, std::collections::HashSet::new())))
+    TRACED.get_or_init(|| SharedCell::new((0, CodeIdentitySet::default())))
 }
 
-fn with_traced_bytecode_bodies<R>(f: impl FnOnce(&mut std::collections::HashSet<usize>) -> R) -> R {
+fn with_traced_bytecode_bodies<R>(f: impl FnOnce(&mut CodeIdentitySet<usize>) -> R) -> R {
     let mut traced = traced_bytecode_bodies().borrow_mut();
     let pass = egcl_rt::gc::root_scan_pass();
     if traced.0 != pass {
@@ -445,13 +450,56 @@ fn with_traced_bytecode_bodies<R>(f: impl FnOnce(&mut std::collections::HashSet<
     f(&mut traced.1)
 }
 
+// Semantic ownership is distinct from tracing native/cache constant slots. A
+// cache's own Arc must never prove that its compilation owner is still live.
+fn with_semantic_bytecode_bodies<R>(f: impl FnOnce(&mut CodeIdentitySet<usize>) -> R) -> R {
+    static LIVE: std::sync::OnceLock<SharedCell<(u64, CodeIdentitySet<usize>)>> =
+        std::sync::OnceLock::new();
+    let mut live = LIVE
+        .get_or_init(|| SharedCell::new((0, CodeIdentitySet::default())))
+        .borrow_mut();
+    let pass = egcl_rt::gc::root_scan_pass();
+    if live.0 != pass {
+        live.0 = pass;
+        live.1.clear();
+    }
+    f(&mut live.1)
+}
+
+fn mark_semantic_bytecode_body(body: &BytecodeFunction) {
+    // No Lisp allocation or visitor under this borrow: only immutable Rust
+    // body edges are traversed. Separate from slot tracing/deduplication.
+    with_semantic_bytecode_bodies(|live| {
+        // Instances share immutable bodies. Most visits are duplicates, and
+        // flat bodies have no outgoing body edges; neither needs a worklist.
+        if !live.insert(body as *const BytecodeFunction as usize)
+            || (body.nested_functions.is_empty() && body.restart_cases.is_empty())
+        {
+            return;
+        }
+        let mut pending: Vec<_> = body.nested_functions.iter().map(Arc::as_ref).collect();
+        for table in &body.restart_cases {
+            pending.extend(table.restarts.iter().map(|restart| &*restart.function));
+        }
+        while let Some(body) = pending.pop() {
+            if !live.insert(body as *const BytecodeFunction as usize) {
+                continue;
+            }
+            pending.extend(body.nested_functions.iter().map(Arc::as_ref));
+            for table in &body.restart_cases {
+                pending.extend(table.restarts.iter().map(|restart| &*restart.function));
+            }
+        }
+    });
+}
+
 // A shared template can outlive every closure made from it. Keeping its code
 // alive must not keep each instance's captured environment alive as well.
-fn with_traced_callables<R>(f: impl FnOnce(&mut std::collections::HashSet<u32>) -> R) -> R {
-    static TRACED: std::sync::OnceLock<SharedCell<(u64, std::collections::HashSet<u32>)>> =
+fn with_traced_callables<R>(f: impl FnOnce(&mut CodeIdentitySet<u32>) -> R) -> R {
+    static TRACED: std::sync::OnceLock<SharedCell<(u64, CodeIdentitySet<u32>)>> =
         std::sync::OnceLock::new();
     let mut traced = TRACED
-        .get_or_init(|| SharedCell::new((0, std::collections::HashSet::new())))
+        .get_or_init(|| SharedCell::new((0, CodeIdentitySet::default())))
         .borrow_mut();
     let pass = egcl_rt::gc::root_scan_pass();
     if traced.0 != pass {
@@ -460,12 +508,29 @@ fn with_traced_callables<R>(f: impl FnOnce(&mut std::collections::HashSet<u32>) 
     }
     f(&mut traced.1)
 }
+/// Only a live execution/recovery owns this code identity. Unlike a callable
+/// root it never looks up the old compilation owner's captured environment.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+struct ActiveCodeOwnerRoot(Option<u32>);
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+impl egcl_rt::gc::TraceHostRoots for ActiveCodeOwnerRoot {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
+        if let Some(symbol) = self.0 {
+            egcl_rt::symbols::trace_symbol_index(symbol, visit);
+        }
+    }
+}
+
 /// An active call owns its identity even if the heap function object has died.
 struct ActiveCallableRoot(u32);
 
 impl egcl_rt::gc::TraceHostRoots for ActiveCallableRoot {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
         if self.0 != u32::MAX {
+            let body = closure_bodies().borrow().get(&self.0).cloned();
+            if let Some(body) = body {
+                mark_semantic_bytecode_body(&body);
+            }
             trace_private_function_roots(self.0, visit, &mut std::collections::HashSet::new());
         }
     }
@@ -599,6 +664,11 @@ fn scan_bytecode_roots(visit: &mut dyn FnMut(*mut EgclVal)) {
         visit(&mut definition.function);
     }
 
+    // Snapshot metadata owners once across all stopped executions. The symbol
+    // is a code-only edge: do NOT visit that instance's captured environment.
+    for symbol in persistent_closure_code_owner_bodies().keys() {
+        egcl_rt::symbols::trace_symbol_index(*symbol, visit);
+    }
     let private_pools: std::collections::HashSet<_> = closure_bodies()
         .borrow()
         .values()
@@ -619,6 +689,9 @@ fn scan_bytecode_roots(visit: &mut dyn FnMut(*mut EgclVal)) {
         let identity = Arc::as_ptr(&function) as usize;
         if private_pools.contains(&identity) && !named_pools.contains(&identity) {
             continue;
+        }
+        if named_pools.contains(&identity) {
+            mark_semantic_bytecode_body(&function);
         }
         // All mutators are stopped. Trace the same Arc allocation used by its
         // owning thread, including dormant named functions in that thread's
@@ -674,6 +747,11 @@ fn sweep_dead_function_captures(names: &[EgclVal]) {
         .filter_map(|name| name.symbol_index())
         .collect();
     let traced = with_traced_bytecode_bodies(|bodies| bodies.clone());
+    let live_templates = with_semantic_bytecode_bodies(|bodies| bodies.clone());
+    let callables = with_traced_callables(|callables| callables.clone());
+    let code_owners = closure_code_owner_bodies();
+    let mut preserve_code = CodeIdentitySet::default();
+    let mut retire_code = CodeIdentitySet::default();
     // The last instance can die before its template. Sweep address-keyed
     // feedback even when this collection finds no newly dead callable.
     unsafe {
@@ -693,9 +771,29 @@ fn sweep_dead_function_captures(names: &[EgclVal]) {
                 .retain(|body, _| traced.contains(body))
         });
         CLOSURE_COMPILATION.scan(|registry| {
-            registry
-                .borrow_mut()
-                .retain(|body, _| traced.contains(body))
+            registry.borrow_mut().retain(|body, state| {
+                if code_owners.get(&state.owner) == Some(body) {
+                    if live_templates.contains(body)
+                        && egcl_rt::symbols::symbol_global_cells_are_pristine(state.owner)
+                    {
+                        preserve_code.insert(state.owner);
+                        true
+                    } else {
+                        // The original instance may have been removed during
+                        // an earlier major. Remember its code ID explicitly;
+                        // closure_bodies no longer necessarily contains it.
+                        if !callables.contains(&state.owner) {
+                            retire_code.insert(state.owner);
+                        }
+                        false
+                    }
+                } else {
+                    // A formerly eligible owner's mutable global cells or
+                    // current definition no longer justify the new lease.
+                    // Do not derive persistence from cache-only body tracing.
+                    !state.persistent_owner && traced.contains(body)
+                }
+            })
         });
         ANON_OSR_REGISTRY.scan(|registry| {
             registry
@@ -726,7 +824,7 @@ fn sweep_dead_function_captures(names: &[EgclVal]) {
                 .filter(|symbol| !callables.contains(symbol)),
         );
     });
-    if dead.is_empty() {
+    if dead.is_empty() && retire_code.is_empty() {
         return;
     }
     closure_envs()
@@ -738,12 +836,40 @@ fn sweep_dead_function_captures(names: &[EgclVal]) {
     // Named definitions are invalidated by FMAKUNBOUND/redefinition. Only
     // private closure code is owned solely by the collected function objects.
     dead.retain(|&symbol| egcl_rt::symbols::is_uninterned(symbol));
-    if dead.is_empty() {
-        return;
-    }
+    let old_instance_bodies: CodeOwnerBodies = closure_bodies()
+        .borrow()
+        .iter()
+        .filter(|(symbol, _)| dead.contains(*symbol))
+        .map(|(&symbol, body)| (symbol, Arc::as_ptr(body) as usize))
+        .collect();
     closure_bodies()
         .borrow_mut()
         .retain(|symbol, _| !dead.contains(symbol));
+    // Instance state above follows actual callable reachability. Metadata
+    // below may instead be owned by another live instance of the same body.
+    dead.retain(|symbol| !preserve_code.contains(symbol));
+    dead.extend(retire_code);
+    // An old private identity may have been rebound while another instance
+    // retains its old template. Never delete a newer execution's definition.
+    let mut rebound = CodeIdentitySet::default();
+    unsafe {
+        REGISTRY.scan(|registry| {
+            for (&symbol, body) in registry.borrow().iter() {
+                if dead.contains(&symbol) {
+                    let expected = code_owners
+                        .get(&symbol)
+                        .or_else(|| old_instance_bodies.get(&symbol));
+                    if expected.is_some_and(|expected| *expected != Arc::as_ptr(body) as usize) {
+                        rebound.insert(symbol);
+                    }
+                }
+            }
+        });
+    }
+    dead.retain(|symbol| !rebound.contains(symbol));
+    if dead.is_empty() {
+        return;
+    }
     // The major collector has stopped every execution before this callback.
     unsafe {
         REGISTRY.scan(|registry| {
@@ -815,6 +941,115 @@ fn sweep_dead_function_captures(names: &[EgclVal]) {
     bump_direct_call_gen();
 }
 
+/// Exact anonymous code-owner provenance, read only during the stopped-world
+/// major sweep. A user-rebound owner or a mismatched execution's definition
+/// must never be preserved/deleted through an old template's lease.
+/// Mutable cells are checked separately for new roots/persistence; an old
+/// exact-body lease still needs retirement after a function-cell change.
+fn persistent_closure_code_owner_bodies() -> CodeOwnerBodies {
+    let mut owners = closure_code_owner_bodies();
+    owners.retain(|symbol, _| egcl_rt::symbols::symbol_global_cells_are_pristine(*symbol));
+    owners
+}
+
+fn closure_code_owner_bodies() -> CodeOwnerBodies {
+    // This helper is GC-only: scan reads every execution, not the collector's
+    // current registry. No callbacks run while any registry is borrowed.
+    let mut owners = CodeOwnerBodies::default();
+    let mut ambiguous = CodeIdentitySet::default();
+    unsafe {
+        CLOSURE_COMPILATION.scan(|cache| {
+            for (&body, state) in cache.borrow().iter() {
+                if !state.persistent_owner {
+                    continue;
+                }
+                if owners
+                    .insert(state.owner, body)
+                    .is_some_and(|old| old != body)
+                {
+                    ambiguous.insert(state.owner);
+                }
+            }
+        });
+        if owners.is_empty() {
+            return owners;
+        }
+        let mut matched = CodeIdentitySet::default();
+        REGISTRY.scan(|registry| {
+            let registry = registry.borrow();
+            for (&symbol, &expected) in &owners {
+                if let Some(body) = registry.get(&symbol) {
+                    if expected == Arc::as_ptr(body) as usize {
+                        matched.insert(symbol);
+                    } else {
+                        ambiguous.insert(symbol);
+                    }
+                }
+            }
+        });
+        owners.retain(|symbol, _| matched.contains(symbol));
+    }
+    let named = named_definitions().borrow();
+    owners.retain(|symbol, _| {
+        !ambiguous.contains(symbol)
+            && !named.contains_key(symbol)
+            && egcl_rt::symbols::is_uninterned(*symbol)
+    });
+    owners
+}
+
+/// A deliberately small acyclic constant graph for the new metadata lease.
+/// Unsupported bodies still execute normally; only persistence across the
+/// original instance's death falls back to the existing recompilation policy.
+fn closure_body_has_acyclic_owner_lease(body: &BytecodeFunction) -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("EGCL_DISABLE_CLOSURE_CODE_OWNER_LEASE").is_none())
+    {
+        return false;
+    }
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let cohort = native_transfer_entry::ordinary_code_owner_body(body);
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+    let cohort = false;
+    if !cohort {
+        return false;
+    }
+    if !body.params_form.is_nil()
+        || !body.load_time_values.is_empty()
+        || !body.nested_functions.is_empty()
+        || !body.restart_cases.is_empty()
+        || !body.handler_cases.is_empty()
+        || !body.handler_binds.is_empty()
+        || body.variadic
+    {
+        return false;
+    }
+    let immediate = |value: EgclVal| {
+        value.is_nil()
+            || value == egcl_rt::value::T
+            || value.is_fixnum()
+            || value.is_character()
+            || value.is_single_float()
+            || value
+                .symbol_index()
+                .is_some_and(|symbol| !egcl_rt::symbols::is_uninterned(symbol))
+    };
+    if !body.constants.iter().copied().all(immediate) {
+        return false;
+    }
+    body.code.iter().all(|instruction| match instruction {
+        Instr::CallNamed { sym, .. }
+        | Instr::LoadFunction(sym)
+        | Instr::LoadGlobal(sym)
+        | Instr::StoreGlobal(sym)
+        | Instr::BindSpecial(sym) => !egcl_rt::symbols::is_uninterned(*sym),
+        // These instructions retain executable forms/control metadata or can
+        // manufacture code edges beyond the immutable constant graph above.
+        Instr::EvalHost(_) | Instr::MakeClosureEnv(_) | Instr::MakeClosure { .. } => false,
+        _ => true,
+    })
+}
+
 fn trace_function_captures(name: EgclVal, visit: &mut dyn FnMut(*mut EgclVal)) {
     let Some(symbol) = name.symbol_index() else {
         return;
@@ -824,6 +1059,7 @@ fn trace_function_captures(name: EgclVal, visit: &mut dyn FnMut(*mut EgclVal)) {
     });
     let body = closure_bodies().borrow().get(&symbol).cloned();
     if let Some(body) = body {
+        mark_semantic_bytecode_body(&body);
         unsafe { trace_bytecode_function(Arc::as_ptr(&body) as *mut BytecodeFunction, visit) };
     }
     let frame = closure_envs().borrow().get(&symbol).cloned();
@@ -962,6 +1198,7 @@ impl ActiveBytecodeRoot {
 
 impl egcl_rt::gc::TraceHostRoots for ActiveBytecodeRoot {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
+        mark_semantic_bytecode_body(&self._function);
         // SAFETY: host roots are visited while all mutators are stopped. Trace
         // the original pool so the executing/compiling body sees relocations.
         unsafe {
@@ -18641,7 +18878,12 @@ struct Activation {
 
 impl egcl_rt::gc::TraceHostRoots for Activation {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
-        ActiveCallableRoot(self.sym).trace_host_roots(visit);
+        let instance = self
+            .fn_obj
+            .filter(|value| self.func.has_env && egcl_rt::function::is_interpreted_function(*value))
+            .map(egcl_rt::function::definition_index)
+            .unwrap_or(self.sym);
+        ActiveCallableRoot(instance).trace_host_roots(visit);
         if let Some(fn_obj) = &mut self.fn_obj {
             visit(fn_obj);
         }
@@ -19178,7 +19420,13 @@ fn run_with_binding(
         environment: mut explicit_environment,
         lexical_environment: call_menv,
     } = context;
-    egcl_rt::rooted!(_active_callable_root = ActiveCallableRoot(entry_sym));
+    let actual_instance =
+        if entry.has_env && egcl_rt::function::is_interpreted_function(entry_fn_val) {
+            egcl_rt::function::definition_index(entry_fn_val)
+        } else {
+            entry_sym
+        };
+    egcl_rt::rooted!(_active_callable_root = ActiveCallableRoot(actual_instance));
     egcl_rt::rooted!(_active_bytecode_root = ActiveBytecodeRoot::new(&entry));
     egcl_rt::rooted!(args = args.to_vec());
     egcl_rt::rooted_ref!(_macro_whole_root = &mut macro_whole);
@@ -23178,6 +23426,20 @@ struct NativeCode {
     t2_metadata: Option<Arc<T2InstalledMetadata>>,
 }
 
+impl NativeCode {
+    fn retire_entry_leases(&self) {
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        if let NativeCodeStorage::Mapped(code) = &self._storage {
+            code.retire_private_entries();
+        }
+    }
+}
+impl Drop for NativeCode {
+    fn drop(&mut self) {
+        self.retire_entry_leases();
+    }
+}
+
 const NATIVE_TRANSFER_ABI_VERSION: u16 = 1;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 const MAPPED_TRANSFER_ABI_VERSION: u16 = 3;
@@ -23954,16 +24216,66 @@ static CALL_SITE_PROFILE: egcl_rt::execution_local::ExecutionLocal<
 static GENERIC_RECEIVER_PROFILE: egcl_rt::execution_local::ExecutionLocal<
     RefCell<HashMap<String, &'static ReceiverTypeProfile, egcl_rt::fxhash::FxBuildHasher>>,
 > = unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(HashMap::default())) };
+// All mutable registry operations revoke native admission before publishing
+// replacements or dropping owners. Read-only Deref deliberately exposes no
+// mutable entry/value escape that could bypass this retirement protocol.
+type NativeCodeMap = HashMap<u32, Rc<NativeCode>, egcl_rt::fxhash::FxBuildHasher>;
+#[derive(Default)]
+struct NativeRegistry(NativeCodeMap);
+impl std::ops::Deref for NativeRegistry {
+    type Target = NativeCodeMap;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl NativeRegistry {
+    fn insert(&mut self, symbol: u32, code: Rc<NativeCode>) -> Option<Rc<NativeCode>> {
+        if let Some(old) = self.0.get(&symbol)
+            && !Rc::ptr_eq(old, &code)
+        {
+            old.retire_entry_leases();
+        }
+        self.0.insert(symbol, code)
+    }
+    fn remove(&mut self, symbol: &u32) -> Option<Rc<NativeCode>> {
+        if let Some(old) = self.0.get(symbol) {
+            old.retire_entry_leases();
+        }
+        self.0.remove(symbol)
+    }
+    fn retain(&mut self, mut keep: impl FnMut(&u32, &Rc<NativeCode>) -> bool) {
+        self.0.retain(|symbol, code| {
+            if keep(symbol, code) {
+                true
+            } else {
+                code.retire_entry_leases();
+                false
+            }
+        });
+    }
+    fn clear(&mut self) {
+        for code in self.0.values() {
+            code.retire_entry_leases();
+        }
+        self.0.clear();
+    }
+}
+impl Drop for NativeRegistry {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
 /// Installed T1/T2 code keyed by the same symbol index as the bytecode registry.
-static NATIVE_REGISTRY: egcl_rt::execution_local::ExecutionLocal<
-    RefCell<HashMap<u32, Rc<NativeCode>, egcl_rt::fxhash::FxBuildHasher>>,
-> = unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(HashMap::default())) };
+static NATIVE_REGISTRY: egcl_rt::execution_local::ExecutionLocal<RefCell<NativeRegistry>> = unsafe {
+    egcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(NativeRegistry::default()))
+};
 /// A template shares compilation state, never its instances' captured frames.
 /// Weak ownership keeps this cache from retaining dead templates or callables.
 struct ClosureCompilation {
     body: std::sync::Weak<BytecodeFunction>,
     owner: u32,
     invocations: u32,
+    persistent_owner: bool,
 }
 static CLOSURE_COMPILATION: egcl_rt::execution_local::ExecutionLocal<
     RefCell<HashMap<usize, ClosureCompilation, egcl_rt::fxhash::FxBuildHasher>>,
@@ -23997,6 +24309,7 @@ fn closure_compilation_owner(sym: u32, count: u32) -> (u32, u32) {
             body: Arc::downgrade(&body),
             owner,
             invocations: 0,
+            persistent_owner: closure_body_has_acyclic_owner_lease(&body),
         });
         debug_assert!(
             state
@@ -25234,7 +25547,9 @@ fn snapshot_t2_input(sym: u32, priority: u64) -> Option<T2CompileInput> {
         }
     }
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    let mapped_context = Some(native_transfer_entry::EmissionContext::capture(&body, true));
+    let mapped_context = Some(native_transfer_entry::EmissionContext::capture_for_owner(
+        &body, true, sym,
+    ));
     Some(T2CompileInput {
         snapshot: None,
         sources: Vec::new(),
@@ -26167,7 +26482,30 @@ fn run_native_callable(
     args: &[EgclVal],
     env: &mut Env,
 ) -> Result<EgclVal, EgclError> {
-    egcl_rt::rooted!(_active_callable_root = ActiveCallableRoot(sym));
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let function = if let NativeCodeStorage::Mapped(code) = &nc._storage {
+        if code.native_callable_slot.is_some() {
+            native_transfer_entry::funcall_fast::closure_carrier(function)
+                .filter(|value| code.accepts_explicit_callable(*value))
+                .unwrap_or(function)
+        } else {
+            function
+        }
+    } else {
+        function
+    };
+    let actual_instance = sym;
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let actual_instance = match &nc._storage {
+        NativeCodeStorage::Mapped(code)
+            if (code.native_callable_slot.is_some() || egcl_rt::symbols::is_uninterned(sym))
+                && egcl_rt::function::is_interpreted_function(function) =>
+        {
+            egcl_rt::function::definition_index(function)
+        }
+        _ => actual_instance,
+    };
+    egcl_rt::rooted!(_active_callable_root = ActiveCallableRoot(actual_instance));
     #[cfg(test)]
     call_table::record_target_lookup();
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -28762,7 +29100,32 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
         }
     }
     let array_inline_options = inline_options.clone();
-    let built = if cfg!(all(target_arch = "x86_64", target_os = "linux"))
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let ordinary_outer_capture = native_transfer_entry::ordinary_outer_capture_body(bf)
+        && input
+            .mapped_context
+            .as_ref()
+            .is_some_and(|context| context.captured_entry_profitable());
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+    let ordinary_outer_capture = false;
+    let built = if ordinary_outer_capture {
+        // Keep lexical operations semantic for the explicit-callable ordinary
+        // adapter. prepare_ordinary_t2 legalizes a separate mapped clone using
+        // the retained bytecode scope/BCP protocol if ordinary emission declines.
+        if let Some(snapshot) = &input.snapshot {
+            egcl_compiler::t2::build::build_for_transfer_optimization_snapshot_with_inline_options(
+                snapshot,
+                sym,
+                inline_options,
+            )
+        } else {
+            egcl_compiler::t2::build::build_for_transfer_optimization_with_inline_options(
+                bf,
+                sym,
+                inline_options,
+            )
+        }
+    } else if cfg!(all(target_arch = "x86_64", target_os = "linux"))
         && bf.code.iter().any(|op| {
             matches!(
                 op,
@@ -28780,7 +29143,8 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
                     | Instr::PushEnvChild
                     | Instr::PopEnvChild
             )
-        }) {
+        })
+    {
         if let Some(snapshot) = &input.snapshot {
             egcl_compiler::t2::build::build_for_native_scope_optimization_snapshot_with_inline_options(snapshot, sym, inline_options)
         } else {

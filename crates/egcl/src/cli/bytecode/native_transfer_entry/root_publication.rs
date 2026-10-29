@@ -127,6 +127,22 @@ pub(in super::super) fn native_poll_origin_for_test()
     .then_some(origin)
 }
 
+/// Inspect exact physical owners without creating a callable root.
+#[cfg(test)]
+pub(in super::super) fn published_frame_has_owner_for_test(owner: usize) -> bool {
+    let Some(boundary) = (unsafe { ACTIVE.with(Cell::get).as_ref() }) else {
+        return false;
+    };
+    let mut found = false;
+    unsafe {
+        walk_boundary_frames(boundary, true, &mut |code, _, _, _, _, _| {
+            found |= std::ptr::from_ref(code) as usize == owner;
+            0
+        });
+    }
+    found
+}
+
 /// Locate a fixture value only at an actual published generated poll, and
 /// require that no managed activation or MV buffer is keeping it alive.
 #[cfg(test)]
@@ -766,24 +782,125 @@ unsafe fn walk_boundary(
     visit: &mut dyn FnMut(*mut EgclVal),
 ) -> usize {
     unsafe {
-        walk_boundary_frames(boundary, true, &mut |_, _, map, cursor, body_sp, walk| {
-            let visited = visit_frame(map, cursor, body_sp, walk, visit);
-            #[cfg(test)]
-            boundary.visited.set(boundary.visited.get() + visited);
-            visited
-        })
+        walk_boundary_frames(
+            boundary,
+            true,
+            &mut |code, _, map, cursor, body_sp, walk| {
+                // A serializer's logical payload contains arguments/locals, not the
+                // hidden closure. Keep this physical word live even while that payload
+                // is being boxed and its normal value map is Deoptimizing.
+                let mut visited = 0;
+                if let Some(symbol) = code.installed_symbol.filter(|symbol| {
+                    code.native_callable_slot.is_some() || egcl_rt::symbols::is_uninterned(*symbol)
+                }) {
+                    egcl_rt::symbols::trace_symbol_index(symbol, visit);
+                }
+                if code.native_callable_slot.is_some() {
+                    let slot = callable_slot(code, body_sp, walk)
+                        .expect("published ordinary closure has an owned callable home");
+                    visit(slot);
+                    visited += 1;
+                }
+                if let Some(map) = map {
+                    visited += visit_frame(map, cursor, body_sp, walk, visit);
+                }
+                #[cfg(test)]
+                boundary.visited.set(boundary.visited.get() + visited);
+                visited
+            },
+        )
     }
 }
 
 type NativeFrameVisitor<'a> = dyn FnMut(
         &TransferCode,
         *mut CaptureContext,
-        &NativeFrameValues,
+        Option<&NativeFrameValues>,
         &NativeFrameCursor,
         Option<usize>,
         &Walk<'_>,
     ) -> usize
     + 'a;
+
+fn callable_slot(
+    code: &TransferCode,
+    body_sp: Option<usize>,
+    walk: &Walk<'_>,
+) -> Option<*mut EgclVal> {
+    let slot = code.native_callable_slot?;
+    let address = body_sp?.checked_add(usize::try_from(slot).ok()?.checked_mul(8)?)?;
+    walk.slot(address).map(|address| address as *mut EgclVal)
+}
+
+/// Inspect an exact ordinary helper caller without publishing or polling.
+/// The callback must neither allocate Lisp objects nor retain borrowed state.
+pub(super) unsafe fn with_leaf_callable<R>(
+    image: *mut SysvTransferCapture,
+    body: impl FnOnce(&TransferCode, EgclVal) -> Option<R>,
+) -> Option<R> {
+    let context = unsafe { CAPTURE.with(Cell::get).as_ref() }?;
+    if context.selected.is_some()
+        || context.failure.is_some()
+        || context.osr.is_some()
+        || context.recursive_escape
+    {
+        return None;
+    }
+    let root = unsafe { context.owner.as_ref() }?;
+    let image_ref = unsafe { image.as_ref() }?;
+    let cursor = NativeFrameCursor {
+        pc: image_ref.return_pc as usize,
+        call_sp: image_ref.caller_sp as usize,
+        registers: std::array::from_fn(|index| {
+            Some(std::ptr::addr_of!(image_ref.preserved[index]) as usize)
+        }),
+    };
+    let segment = unsafe { native_transfer::current_segment().as_ref() }?;
+    let bounds = image as usize..segment.saved_sp;
+    if bounds.start >= cursor.call_sp || cursor.call_sp > bounds.end {
+        return None;
+    }
+    let directory = super::super::call_table::active_ordinary_directory();
+    let retained = if cursor
+        .pc
+        .checked_sub(root.code.as_ptr() as usize)
+        .is_some_and(|offset| offset < root.code_len)
+    {
+        None
+    } else {
+        Some(directory.code_for_pc(cursor.pc)?)
+    };
+    let code = retained.as_deref().unwrap_or(root);
+    let offset = cursor.pc.checked_sub(code.code.as_ptr() as usize)?;
+    if offset >= code.code_len || code._native_calls.value_map(offset).is_none() {
+        return None;
+    }
+    let stack = egcl_rt::current_stack();
+    let walk = Walk::new(bounds, stack);
+    let step = code._native_calls.unwind(
+        code.code.as_ptr() as usize,
+        &cursor,
+        walk.bounds.clone(),
+        |address| walk.word(address),
+    )?;
+    let callable = unsafe { callable_slot(code, step.body_sp, &walk)?.read() };
+    body(code, callable)
+}
+
+/// Exact identity of this physical suspended frame. A code address alone is
+/// insufficient when several closures share one immutable template.
+pub(super) fn frame_callable(boundary: &PublishedBoundary) -> Option<EgclVal> {
+    let code = unsafe { boundary.owner.as_ref() }?;
+    let walk = Walk::new(boundary.bounds.clone(), unsafe { &*boundary.stack });
+    let step = code._native_calls.unwind(
+        code.code.as_ptr() as usize,
+        &boundary.cursor,
+        walk.bounds.clone(),
+        |address| walk.word(address),
+    )?;
+    let slot = callable_slot(code, step.body_sp, &walk)?;
+    Some(unsafe { slot.read() })
+}
 
 unsafe fn walk_boundary_frames(
     boundary: &PublishedBoundary,
@@ -927,10 +1044,15 @@ unsafe fn walk_boundary_frames_to(
         };
         match code._native_calls.value_map(offset) {
             Some(NativeCallValues::Frame(map)) => {
-                total += visit(code, context, map, &cursor, step.body_sp, &walk);
+                total += visit(code, context, Some(map), &cursor, step.body_sp, &walk);
             }
-            // T0 owns these roots while the native frame is being replaced.
-            Some(NativeCallValues::Deoptimizing { .. } | NativeCallValues::Retired) => {}
+            Some(NativeCallValues::Deoptimizing { .. }) => {
+                if _count_gc_walks {
+                    total += visit(code, context, None, &cursor, step.body_sp, &walk);
+                }
+            }
+            // Its epilogue has already removed every physical frame word.
+            Some(NativeCallValues::Retired) => {}
             Some(NativeCallValues::Unavailable) => {
                 note_bail(Bail::MapUnavailable);
                 return total;

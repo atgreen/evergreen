@@ -4374,6 +4374,41 @@ pub fn register_root_scanner(f: RootScanner) {
     }
 }
 
+/// Host-cache preparation performed before any external roots are enumerated.
+/// Runs under the same stopped-world/heap-snapshot exclusion as root scanners.
+/// It may discard host-owned cache roots, but must not allocate Lisp objects,
+/// evaluate, poll, or recursively enumerate roots. Active references must retain
+/// their own precise roots independently of an evictable cache.
+pub type RootPreparer = fn();
+
+fn root_preparers() -> &'static OrderedMutex<Vec<RootPreparer>> {
+    static PREPARERS: OnceLock<OrderedMutex<Vec<RootPreparer>>> = OnceLock::new();
+    PREPARERS
+        .get_or_init(|| OrderedMutex::new(LockLevel::GcWorld, 4, "GC root preparers", Vec::new()))
+}
+
+/// Register host-cache preparation, idempotently by function pointer.
+/// Registration is expected once at startup. Preparers always run before all
+/// external scanners, regardless of the two registration orders. No preparer
+/// or scanner registry lock is held while a preparer runs, so discarding a
+/// host root may safely unregister it from its own root registry.
+pub fn register_root_preparer(prepare: RootPreparer) {
+    let mut preparers = root_preparers().lock().unwrap();
+    if !preparers
+        .iter()
+        .any(|&other| other as usize == prepare as usize)
+    {
+        preparers.push(prepare);
+    }
+}
+
+fn prepare_external_roots() {
+    let preparers = root_preparers().lock().unwrap().clone();
+    for prepare in preparers {
+        prepare();
+    }
+}
+
 /// Monotone id of the current external-root scan pass. Bumped once each time
 /// the collector begins a full pass over the registered scanners, so host-side
 /// visitors can share one visited set per pass — deduplicating structures (env
@@ -4434,6 +4469,7 @@ fn scan_external_roots(visit: impl FnMut(*mut EgclVal)) {
 fn scan_external_roots_with_kind(kind: ExternalRootScanKind, mut visit: impl FnMut(*mut EgclVal)) {
     let _kind = root_kind::Scope::enter(kind);
     SCAN_PASS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    prepare_external_roots();
     let scanners = root_scanners().lock().unwrap().clone();
     for s in scanners {
         let root_clock = root_phase::start();
@@ -4455,6 +4491,7 @@ pub unsafe fn visit_shake_host_roots(
 ) {
     let _kind = root_kind::Scope::enter(ExternalRootScanKind::Full);
     advance_root_scan_pass();
+    prepare_external_roots();
     let scanners = root_scanners().lock().unwrap().clone();
     for scanner in scanners {
         if !excluded
@@ -10630,3 +10667,7 @@ mod allocation_failure_message_tests {
 #[cfg(test)]
 #[path = "gc_root_kind_tests.rs"]
 mod root_kind_tests;
+
+#[cfg(test)]
+#[path = "gc_root_preparer_tests.rs"]
+mod root_preparer_tests;

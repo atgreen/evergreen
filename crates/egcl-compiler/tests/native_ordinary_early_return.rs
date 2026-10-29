@@ -153,6 +153,7 @@ fn emit() -> FramedCode {
     emit_framed_ordinary_function_with_poll(
         &f,
         OrdinaryLispEntryOptions {
+            require_callable_home: false,
             arity: 1,
             arity_error_veneer: wrong_arity as *const () as u64,
             binding: None,

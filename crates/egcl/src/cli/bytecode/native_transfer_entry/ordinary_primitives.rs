@@ -112,11 +112,14 @@ fn make_array(args: &[EgclVal], env: *mut Env) -> Result<EgclVal, EgclError> {
 }
 
 static SYMBOLS: std::sync::OnceLock<Vec<(OrdinaryPrimitive, u32)>> = std::sync::OnceLock::new();
+// Derived from the same process-lifetime interned IDs as SYMBOLS. Publish
+// during lowering, before a call cell or executable can name either adapter.
+static LEXICAL_SYMBOLS: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
 
 fn symbols() -> &'static Vec<(OrdinaryPrimitive, u32)> {
     SYMBOLS.get_or_init(|| {
         ARRAY_SYMBOLS.get_or_init(ArraySymbols::capture);
-        OrdinaryPrimitive::ALL
+        let symbols: Vec<_> = OrdinaryPrimitive::ALL
             .into_iter()
             .map(|primitive| {
                 let target = egcl_rt::symbols::intern(&primitive.adapter_name());
@@ -134,7 +137,21 @@ fn symbols() -> &'static Vec<(OrdinaryPrimitive, u32)> {
                 }
                 (primitive, target)
             })
-            .collect()
+            .collect();
+        let load = symbols
+            .iter()
+            .find(|(kind, _)| *kind == OrdinaryPrimitive::LoadEnvironment)
+            .expect("registered lexical load")
+            .1;
+        let store = symbols
+            .iter()
+            .find(|(kind, _)| *kind == OrdinaryPrimitive::StoreEnvironment)
+            .expect("registered lexical store")
+            .1;
+        LEXICAL_SYMBOLS
+            .set((load, store))
+            .expect("lexical adapters initialized once");
+        symbols
     })
 }
 
@@ -159,6 +176,17 @@ pub(in crate::cli::bytecode) fn is_private(symbol: u32) -> bool {
         .is_some_and(|symbols| symbols.iter().any(|(_, id)| *id == symbol))
 }
 
+pub(super) fn lexical_store(symbol: u32) -> Option<bool> {
+    let &(load, store) = LEXICAL_SYMBOLS.get()?;
+    if symbol == load {
+        Some(false)
+    } else if symbol == store {
+        Some(true)
+    } else {
+        None
+    }
+}
+
 pub(in crate::cli::bytecode) fn invoke(
     symbol: u32,
     args: &[EgclVal],
@@ -177,7 +205,7 @@ pub(in crate::cli::bytecode) fn invoke(
         use OrdinaryPrimitive::*;
         let expected = match primitive {
             LoadGlobal | LoadFunction => 1,
-            MakeArray => 3,
+            MakeArray | StoreEnvironment => 3,
             _ => 2,
         };
         if args.len() != expected {
@@ -192,6 +220,8 @@ pub(in crate::cli::bytecode) fn invoke(
             }
             Cons => EgclVal(c2i_alloc_cons(args[0].to_raw(), args[1].to_raw())),
             MakeArray => make_array(args, env)?,
+            LoadEnvironment => super::ordinary_closure_context::access(args, false)?,
+            StoreEnvironment => super::ordinary_closure_context::access(args, true)?,
             _ => {
                 let name = match primitive {
                     Add => "+",

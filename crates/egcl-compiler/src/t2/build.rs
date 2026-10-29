@@ -322,12 +322,45 @@ pub fn legalize_transfer_calls(f: &mut Function, scopes: &ScopeMap) -> Result<()
                     | Opcode::SymbolValue
                     | Opcode::SetSymbolValue
                     | Opcode::SymbolFunction
+                    | Opcode::EnvironmentValue
+                    | Opcode::SetEnvironmentValue
             )
         })
         .collect();
     for call in calls {
         let operation = f.inst(call).opcode;
-        if operation != Opcode::Call {
+        if matches!(
+            operation,
+            Opcode::EnvironmentValue | Opcode::SetEnvironmentValue
+        ) {
+            if !matches!(f.inst(call).aux, AuxData::EnvironmentName(_)) {
+                return Err(BuildError::Unsupported(
+                    "environment operation without name identity",
+                ));
+            }
+            let state = f
+                .inst(call)
+                .frame_state
+                .ok_or(BuildError::Unsupported("unmapped environment operation"))?;
+            let bcp = f
+                .frame_states
+                .get(state)
+                .scopes
+                .last()
+                .ok_or(BuildError::Unsupported(
+                    "environment operation without logical frame",
+                ))?
+                .bcp;
+            let store = operation == Opcode::SetEnvironmentValue;
+            let data = f.inst_mut(call);
+            data.opcode = Opcode::Call;
+            data.aux = AuxData::LexicalEnvironment {
+                bcp,
+                value: store,
+                result: !store,
+            };
+            data.flags = runtime_call_flags();
+        } else if operation != Opcode::Call {
             let AuxData::SymbolRef(symbol) = f.inst(call).aux else {
                 return Err(BuildError::Unsupported(
                     "symbol operation without symbol identity",
@@ -4128,6 +4161,73 @@ mod tests {
 
     fn has_opcode(f: &Function, b: Block, op: Opcode) -> bool {
         f.block(b).insts.iter().any(|&i| f.inst(i).opcode == op)
+    }
+
+    #[test]
+    fn captured_transfer_builder_retains_semantics_and_legalizes_only_mapped_clone() {
+        let root = egcl_rt::symbols::intern("CAPTURED-ORDINARY-TRANSFER-TEST");
+        let mut body = bf(
+            "CAPTURED-ORDINARY-TRANSFER-TEST",
+            vec![
+                Instr::LoadLocal(0),
+                Instr::StoreEnvVar(0),
+                Instr::LoadEnvVar(0),
+                Instr::Return,
+            ],
+            vec![],
+            1,
+            1,
+            1,
+        );
+        body.has_env = true;
+        body.names.push("CAPTURED-CELL".to_owned());
+        body.param_layout.push(("NEXT".to_owned(), VarLoc::Slot(0)));
+        let semantic = build_for_transfer_optimization(&body, root).unwrap();
+        let count = |f: &Function, op| {
+            f.block_order()
+                .iter()
+                .flat_map(|&b| f.block(b).insts.iter())
+                .filter(|&&i| f.inst(i).opcode == op)
+                .count()
+        };
+        assert_eq!(count(&semantic, Opcode::EnvironmentValue), 1);
+        assert_eq!(count(&semantic, Opcode::SetEnvironmentValue), 1);
+        assert_eq!(count(&semantic, Opcode::Invoke), 0);
+        let mut mapped = semantic.clone();
+        legalize_transfer_calls(&mut mapped, &ScopeMap::analyze_function(&body).unwrap()).unwrap();
+        assert!(crate::t2::verify::verify(&mapped).is_ok());
+        let contracts: Vec<_> = mapped
+            .block_order()
+            .iter()
+            .flat_map(|&b| &mapped.block(b).insts)
+            .filter_map(|&i| match mapped.inst(i).aux {
+                AuxData::LexicalEnvironment { bcp, value, result } => {
+                    Some((mapped.inst(i).opcode, bcp, value, result))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            contracts,
+            vec![
+                (Opcode::Invoke, 1, true, false),
+                (Opcode::Invoke, 2, false, true)
+            ]
+        );
+        assert_eq!(count(&mapped, Opcode::EnvironmentValue), 0);
+        assert_eq!(
+            count(&semantic, Opcode::EnvironmentValue),
+            1,
+            "mapped lowering must not mutate ordinary input"
+        );
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        {
+            let mut ordinary = semantic.clone();
+            crate::t2::emit::lower_ordinary_primitives(&mut ordinary, |_| Some(root)).unwrap();
+            assert_eq!(count(&ordinary, Opcode::CurrentCallable), 1);
+            assert_eq!(count(&ordinary, Opcode::Invoke), 0);
+            assert!(crate::t2::verify::verify(&ordinary).is_ok());
+        }
     }
 
     #[test]

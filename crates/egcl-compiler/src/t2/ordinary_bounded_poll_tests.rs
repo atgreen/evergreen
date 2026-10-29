@@ -92,6 +92,7 @@ fn ordinary_bounded_polls_retain_exact_recovery_and_native_roots_without_transfe
     let mut code = emit_framed_ordinary_function_with_poll(
         &function,
         OrdinaryLispEntryOptions {
+            require_callable_home: false,
             arity: 1,
             arity_error_veneer: 1,
             binding: None,

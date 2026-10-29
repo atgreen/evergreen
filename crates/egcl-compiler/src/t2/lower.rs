@@ -647,7 +647,7 @@ fn lower_inst(lo: &mut Lowering, inst: Inst) {
         ConstFloat => un!(op::LOAD_FCONST),
         ConstChar => un!(op::MOV_IMM),
         ConstDouble => un!(op::MOV_IMM),
-        ConstSymbol | ConstNil | ConstT | ConstHeapObj => un!(op::MOV_TAGGED),
+        ConstSymbol | ConstNil | ConstT | ConstHeapObj | CurrentCallable => un!(op::MOV_TAGGED),
 
         // ── unboxed-fixnum arithmetic (native, no tag manip) ──
         FixnumAdd => bin!(op::ADD),
