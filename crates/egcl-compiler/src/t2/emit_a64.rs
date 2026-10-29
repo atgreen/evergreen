@@ -2509,6 +2509,43 @@ pub fn emit_framed(
     )
 }
 
+/// Select cycle-poll terminators from CFG order, independently of code layout.
+/// Every directed cycle has a non-increasing edge in any total vertex order;
+/// selecting all such RPO edges therefore covers self and irreducible cycles.
+/// Unranked regions and edges into alternative entries remain conservative.
+fn cycle_poll_terminators(function: &Function) -> Result<HashSet<Inst>, EmitError> {
+    let ranks: HashMap<Block, usize> = function
+        .reverse_postorder()
+        .into_iter()
+        .enumerate()
+        .map(|(rank, block)| (block, rank))
+        .collect();
+    let alternative_entries: HashSet<Block> = function
+        .osr_entries
+        .iter()
+        .map(|entry| entry.block)
+        .collect();
+    let mut polls = HashSet::new();
+    for &block in function.block_order() {
+        let terminator = function
+            .block(block)
+            .insts
+            .last()
+            .copied()
+            .ok_or(unsupported!())?;
+        if function.inst(terminator).targets.iter().any(|target| {
+            alternative_entries.contains(&target.block)
+                || match (ranks.get(&block), ranks.get(&target.block)) {
+                    (Some(source), Some(destination)) => destination <= source,
+                    _ => true,
+                }
+        }) {
+            polls.insert(terminator);
+        }
+    }
+    Ok(polls)
+}
+
 /// Emit optimized AArch64 code with native roots synchronized through extra
 /// activation slots at runtime calls. Every cycle crosses a GC/signal poll
 /// before its edge transfers, so a hot loop stays interruptible and reachable by
@@ -2525,27 +2562,13 @@ pub fn emit_framed_with_runtime(
         .enumerate()
         .map(|(index, &block)| (block, index))
         .collect();
-    // Any edge that can close a cycle must carry a poll, or a hot loop would spin
-    // without ever reaching a safepoint.
-    let mut polls = HashSet::new();
-    for (index, &block) in function.block_order().iter().enumerate() {
-        let terminator = function
-            .block(block)
-            .insts
-            .last()
-            .copied()
-            .ok_or(unsupported!())?;
-        if function
-            .inst(terminator)
-            .targets
-            .iter()
-            .any(|target| positions.get(&target.block).is_none_or(|&t| t <= index))
-        {
-            if runtime.poll == 0 {
-                return Err(unsupported!());
-            }
-            polls.insert(terminator);
-        }
+    // Appended loop versions can jump to an earlier-layout acyclic exit.
+    // Layout order would poll that header on every iteration, in addition to
+    // its latch. Keep layout positions for OSR/machine indexing below, but
+    // classify retreating edges in CFG RPO instead.
+    let polls = cycle_poll_terminators(function)?;
+    if !polls.is_empty() && runtime.poll == 0 {
+        return Err(unsupported!());
     }
 
     let mut machine = super::lower::lower(function);
@@ -2998,4 +3021,254 @@ pub fn emit_framed_with_runtime(
         heap_constant_slots: emitter.heap_constants.values().copied().collect(),
         has_deopt,
     })
+}
+
+#[cfg(test)]
+mod cycle_poll_tests {
+    use super::*;
+    use crate::t2::frame_state::FrameScope;
+    use crate::t2::ir::{IRType, InstFlags, OsrEntry};
+
+    fn data(opcode: Opcode) -> InstData {
+        InstData {
+            opcode,
+            args: vec![],
+            results: vec![],
+            aux: AuxData::None,
+            flags: InstFlags::default(),
+            targets: vec![],
+            frame_state: None,
+            source_pos: 0,
+        }
+    }
+
+    fn jump(f: &mut Function, from: Block, to: Block) -> Inst {
+        f.set_terminator(
+            from,
+            InstData {
+                targets: vec![BlockCall {
+                    block: to,
+                    args: vec![],
+                }],
+                ..data(Opcode::Jump)
+            },
+        )
+    }
+
+    fn branch(f: &mut Function, from: Block, condition: Value, yes: Block, no: Block) -> Inst {
+        f.set_terminator(
+            from,
+            InstData {
+                args: vec![condition],
+                targets: vec![
+                    BlockCall {
+                        block: yes,
+                        args: vec![],
+                    },
+                    BlockCall {
+                        block: no,
+                        args: vec![],
+                    },
+                ],
+                ..data(Opcode::Brif)
+            },
+        )
+    }
+
+    fn boolean(f: &mut Function) -> Value {
+        f.add_block_param(
+            f.entry(),
+            IRType::of(TypeBits::SYMBOL.join(TypeBits::NULL)),
+            ValueRepresentation::Tagged,
+        )
+    }
+
+    // Check the safety property rather than reproducing the classifier: cutting
+    // every poll-bearing terminator must leave no cycle in the reachable CFG.
+    fn no_poll_free_cycle(f: &Function, polls: &HashSet<Inst>) -> bool {
+        fn visit(
+            f: &Function,
+            block: Block,
+            polls: &HashSet<Inst>,
+            colors: &mut HashMap<Block, u8>,
+        ) -> bool {
+            match colors.get(&block) {
+                Some(1) => return false,
+                Some(2) => return true,
+                _ => {}
+            }
+            colors.insert(block, 1);
+            let term = f.terminator(block).unwrap();
+            if !polls.contains(&term) {
+                for edge in &f.inst(term).targets {
+                    if !visit(f, edge.block, polls, colors) {
+                        return false;
+                    }
+                }
+            }
+            colors.insert(block, 2);
+            true
+        }
+        let mut colors = HashMap::new();
+        f.block_order()
+            .iter()
+            .all(|&block| visit(f, block, polls, &mut colors))
+    }
+
+    struct Versions {
+        function: Function,
+        slow_header: Inst,
+        slow_latch: Inst,
+        fast_header: Inst,
+        fast_latch: Inst,
+    }
+
+    fn appended_versions() -> Versions {
+        let mut f = Function::new("appended-loop-versions");
+        let choose_fast = boolean(&mut f);
+        let keep_going = boolean(&mut f);
+        let entry = f.entry();
+        let header = f.make_block();
+        let body = f.make_block();
+        let exit = f.make_block();
+        jump(&mut f, entry, header);
+        let slow_header = branch(&mut f, header, keep_going, body, exit);
+        let slow_latch = jump(&mut f, body, header);
+        f.set_terminator(exit, data(Opcode::Return));
+        // The real cloner appends both fast blocks AFTER the shared exit.
+        let fast = crate::t2::region_clone::clone_region(&mut f, &[header, body]).unwrap();
+        let fast_header = f.terminator(fast.block_map[&header]).unwrap();
+        let fast_latch = f.terminator(fast.block_map[&body]).unwrap();
+        f.block_mut(entry).insts.pop().unwrap();
+        branch(&mut f, entry, choose_fast, fast.block_map[&header], header);
+        crate::t2::verify::verify(&f).unwrap();
+        Versions {
+            function: f,
+            slow_header,
+            slow_latch,
+            fast_header,
+            fast_latch,
+        }
+    }
+
+    #[test]
+    fn appended_clone_exit_does_not_poll_the_continuing_fast_header() {
+        let v = appended_versions();
+        let polls = cycle_poll_terminators(&v.function).unwrap();
+        assert_eq!(polls, HashSet::from([v.slow_latch, v.fast_latch]));
+        assert!(!polls.contains(&v.slow_header));
+        assert!(!polls.contains(&v.fast_header));
+        assert!(no_poll_free_cycle(&v.function, &polls));
+        assert!(!no_poll_free_cycle(&v.function, &HashSet::new()));
+    }
+
+    #[test]
+    fn acyclic_backward_layout_edges_need_no_cycle_poll() {
+        let mut f = Function::new("acyclic-layout-inversion");
+        let entry = f.entry();
+        let early = f.make_block();
+        let late = f.make_block();
+        let exit = f.make_block();
+        jump(&mut f, entry, late);
+        jump(&mut f, late, early);
+        jump(&mut f, early, exit);
+        f.set_terminator(exit, data(Opcode::Return));
+        crate::t2::verify::verify(&f).unwrap();
+        let polls = cycle_poll_terminators(&f).unwrap();
+        assert!(polls.is_empty());
+        assert!(no_poll_free_cycle(&f, &polls));
+    }
+
+    #[test]
+    fn self_and_irreducible_cycles_still_cross_a_selected_poll() {
+        let mut f = Function::new("self-cycle");
+        let entry = f.entry();
+        let body = f.make_block();
+        jump(&mut f, entry, body);
+        let back = jump(&mut f, body, body);
+        crate::t2::verify::verify(&f).unwrap();
+        let polls = cycle_poll_terminators(&f).unwrap();
+        assert_eq!(polls, HashSet::from([back]));
+        assert!(no_poll_free_cycle(&f, &polls));
+
+        let mut f = Function::new("irreducible-two-entry-cycle");
+        let condition = boolean(&mut f);
+        let entry = f.entry();
+        let left = f.make_block();
+        let right = f.make_block();
+        let exit = f.make_block();
+        branch(&mut f, entry, condition, left, right);
+        jump(&mut f, left, right);
+        branch(&mut f, right, condition, left, exit);
+        f.set_terminator(exit, data(Opcode::Return));
+        crate::t2::verify::verify(&f).unwrap();
+        let polls = cycle_poll_terminators(&f).unwrap();
+        assert!(!polls.is_empty());
+        assert!(no_poll_free_cycle(&f, &polls));
+        assert!(!no_poll_free_cycle(&f, &HashSet::new()));
+    }
+
+    #[test]
+    fn unranked_regions_and_alternative_entry_edges_remain_conservative() {
+        let mut f = Function::new("unranked-entry-region");
+        f.set_terminator(f.entry(), data(Opcode::Return));
+        let alternative = f.make_block();
+        let exit = f.make_block();
+        let edge = jump(&mut f, alternative, exit);
+        f.set_terminator(exit, data(Opcode::Return));
+        crate::t2::verify::verify(&f).unwrap();
+        assert!(cycle_poll_terminators(&f).unwrap().contains(&edge));
+
+        let mut f = Function::new("ranked-alternative-entry");
+        let entry = f.entry();
+        let alternative = f.make_block();
+        let edge = jump(&mut f, entry, alternative);
+        f.set_terminator(alternative, data(Opcode::Return));
+        let frame_state = f.frame_states.add(FrameState {
+            scopes: vec![FrameScope {
+                function: 0,
+                bcp: 0,
+                locals: vec![],
+                stack: vec![],
+            }],
+            remat: vec![],
+        });
+        f.osr_entries.push(OsrEntry {
+            block: alternative,
+            bcp: 0,
+            frame_state,
+            checks: vec![],
+            control_scopes: vec![],
+        });
+        crate::t2::verify::verify(&f).unwrap();
+        assert!(cycle_poll_terminators(&f).unwrap().contains(&edge));
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn appended_versions_emit_only_two_rooted_poll_calls() {
+        let v = appended_versions();
+        // Code generation only: never execute this synthetic adapter address.
+        let emitted = emit_framed_with_runtime(
+            &v.function,
+            0,
+            2,
+            RuntimeCalls {
+                poll: 0x1234,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(emitted.emitted_safepoints, 2);
+        assert_eq!(emitted.root_sync_sites.len(), 2);
+        let call_words = emitted
+            .code
+            .chunks_exact(4)
+            .filter(|word| u32::from_le_bytes((*word).try_into().unwrap()) == a64::blr(ADDR))
+            .count();
+        assert_eq!(
+            call_words, 2,
+            "one rooted call per real latch, no header call"
+        );
+    }
 }

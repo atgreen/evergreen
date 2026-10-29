@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- AArch64 loop polling uses control-flow order, avoiding redundant polls on
+  acyclic exits from cloned loops
+  ([#864](https://github.com/atgreen/evergreen/pull/864)).
+
 - Recursive macro expansion preserves `THE` type specifiers while expanding
   their value forms, so compound type assertions accept valid arguments
   ([#860](https://github.com/atgreen/evergreen/pull/860)).
