@@ -8494,7 +8494,17 @@ fn dispatch_builtin_discriminator(arg: EgclVal) -> u32 {
     set(egcl_rt::types::md_array_rank(arg).is_some(), 3);
     set(egcl_rt::types::vectorp(arg), 4);
     set(is_keyword_arg(arg), 5);
-    set(is_function_value(arg), 6);
+    let function = is_function_value(arg);
+    set(function, 6);
+    // Reified generic wrappers and ordinary callables have the same physical
+    // FUNCTION representation, but different semantic specializers. Legacy
+    // immediate generic handles also need a bit: their physical class is the
+    // catch-all heap class and FUNCTIONP alone does not distinguish them.
+    let generic = (function || arg.is_meta_handle()) && is_generic_function_value(arg);
+    set(generic, 22);
+    // Instances returned above retain their real class. For every remaining
+    // representation this is exactly is_compiled_function_value's policy.
+    set(function && !generic, 23);
     set(egcl_stdlib::is_pathname(arg), 7);
     set(egcl_rt::types::streamp(arg), 8);
     set(egcl_rt::types::packagep(arg), 9);
@@ -9517,7 +9527,7 @@ fn generic_dispatches_on_a_metaclass(env: &Env, name: &str) -> bool {
 /// 'fixnum)` IS the fixnum class, which is exactly what `class_of` reports for
 /// the integer 7. Keying the class on itself alone would hand those two the
 /// same entry, with identical type bits. Bit 21 — `dispatch_builtin_discriminator`
-/// uses 0..=20.
+/// uses 0..=20 and 22..=23.
 const DISPATCH_BIT_CLASS_METAOBJECT: u32 = 1 << 21;
 
 /// The `classes` entry a dispatch-cache key records for one argument.
@@ -52317,3 +52327,6 @@ mod class_definition_owner_tests;
 
 #[cfg(test)]
 mod raw_structure_subtype_tests;
+
+#[cfg(test)]
+mod generic_dispatch_cache_tests;
