@@ -23178,6 +23178,16 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 return bytecode::native_reentry_event_for_test(phase);
             }
             #[cfg(test)]
+            "%PARK-NATIVE-FIBER-FOR-TEST" => {
+                if !cdr.is_nil() {
+                    return Err(EgclError::ProgramError(
+                        "test fiber park requires no arguments".into(),
+                    ));
+                }
+                egcl_rt::thread::park_current_fiber()?;
+                return Ok(NIL);
+            }
+            #[cfg(test)]
             "%FORCE-MINOR-GC-FOR-TEST" => {
                 egcl_rt::collect_t0_minor()?;
                 return Ok(NIL);
