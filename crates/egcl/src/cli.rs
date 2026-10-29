@@ -17089,29 +17089,27 @@ fn names_a_standard_condition(type_name: &str) -> bool {
     !condition_type_key(type_name).contains(':')
 }
 
-fn plist_get(list: EgclVal, key: &str) -> Option<EgclVal> {
-    let mut cur = list;
-    while cur.is_cons() {
-        let (entry, rest) = cp(cur);
+/// DEFTYPE registries store the actual name symbol, including in legacy
+/// zero-argument entries. Imported aliases share that identity; unrelated
+/// same-named symbols must never select each other's expander or expansion.
+fn type_definition_lookup(list: EgclVal, name: EgclVal) -> Option<EgclVal> {
+    let mut cursor = list;
+    while cursor.is_cons() {
+        let (entry, rest) = cp(cursor);
         if entry.is_cons() {
-            let (entry_key, entry_vals) = cp(entry);
-            if symbol_bare_name(&val_as_str(entry_key)) == key {
-                return Some(cp(entry_vals).0);
+            let (key, values) = cp(entry);
+            if key == name {
+                return Some(cp(values).0);
             }
         }
-        cur = rest;
+        cursor = rest;
     }
     None
 }
 
-/// Like [`plist_get`] but matching the FULL, package-qualified name — for the
+/// Match the FULL, package-qualified name for the
 /// condition registries, whose keys must distinguish `MYPKG:ERROR` from `CL:ERROR`.
-///
-/// Deliberately not a change to `plist_get` itself: its other caller is the DEFTYPE
-/// registry, which is keyed by bare name ON PURPOSE (`resolve_type_spec`, bliss-66ny)
-/// and guards the collision a different way, by checking for a class of that name
-/// first. Making `plist_get` package-aware broke `(typep cv
-/// 'egcl-thread:condition-variable)`, because the deftype lookup passes a bare name.
+/// DEFTYPE names instead use exact symbol identity in [`type_definition_lookup`].
 fn plist_get_qualified(list: EgclVal, key: &str) -> Option<EgclVal> {
     let mut cur = list;
     while cur.is_cons() {
@@ -17203,10 +17201,9 @@ fn resolve_type_spec_once(env: &Env, type_spec: EgclVal) -> Result<EgclVal, Egcl
     if !name.is_symbol() || egcl_stdlib::find_class(name).is_some() {
         return Ok(type_spec);
     }
-    let bare_name = sym_bare_name_rc(name);
-    if let Some(expander) = plist_get(
+    if let Some(expander) = type_definition_lookup(
         env.lookup_var("*TYPE-EXPANDERS*").unwrap_or(NIL),
-        &bare_name,
+        name,
     ) {
         if !expander.is_nil() {
             let mut expansion_env = env.clone();
@@ -17216,9 +17213,9 @@ fn resolve_type_spec_once(env: &Env, type_spec: EgclVal) -> Result<EgclVal, Egcl
     }
     // Zero-argument aliases (including older boot images) carry concrete expansions.
     if args.is_nil() {
-        if let Some(expanded) = plist_get(
+        if let Some(expanded) = type_definition_lookup(
             env.lookup_var("*TYPE-DEFINITIONS*").unwrap_or(NIL),
-            &bare_name,
+            name,
         ) {
             return Ok(expanded);
         }
@@ -19525,13 +19522,9 @@ fn typep_matches(
     {
         return Ok(matches);
     }
-    // A CLOS instance matches any type name in its class precedence list,
-    // regardless of a same-bare-name DEFTYPE in another package: a class name IS
-    // a type and DEFTYPE cannot shadow it. Check this against the UNRESOLVED
-    // spec, before deftype expansion — the deftype registry is keyed by bare
-    // name, so e.g. bordeaux-threads v1's `(deftype thread () 'integer)` would
-    // otherwise expand v2's THREAD *class* spec to INTEGER and make
-    // `(typep thread-instance 'thread)` wrongly NIL (bliss-66ny). The STANDARD-
+    // A CLOS instance matches any class in its precedence list. Check the
+    // unresolved class symbol before alias expansion: a registered class name
+    // is itself a type and cannot be redefined as a DEFTYPE. The STANDARD-
     // OBJECT / STRUCTURE-OBJECT / CONDITION distinctions are left to the general
     // instance handling below.
     if type_spec.is_symbol()
