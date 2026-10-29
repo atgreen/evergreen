@@ -32144,6 +32144,8 @@ mod adjustable_array_persistence_tests;
 #[cfg(test)]
 mod function_literal_tests {
     use super::*;
+    use super::super::{Closure, closure_registry, register_tree_closure};
+    use std::collections::HashSet;
 
     #[test]
     fn expanded_literal_identity_moves_with_its_compiled_constant_owner() {
