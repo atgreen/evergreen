@@ -5,8 +5,19 @@
 //!
 //! See spec §5.9.
 
+mod arguments;
+mod callback_context;
 mod control_validation;
 mod fill_normalization;
+
+use arguments::{
+    ArgumentStep, Arguments, ExitMarker, FormatFlow, FormatResult, FrameToken, IterationGuard,
+    LogicalExit,
+};
+use callback_context::InvocationScope;
+pub use callback_context::{
+    FormatterActivation, FormatterEntry, claim_formatter_entry, pending_formatter_callable,
+};
 
 use egcl_rt::error::EgclError;
 use egcl_rt::lock_order::{LockLevel, OrderedMutex};
@@ -161,30 +172,91 @@ fn body_function_arg(v: EgclVal) -> Option<EgclVal> {
     (!v.is_nil()).then_some(v)
 }
 
+/// Constructor-owned FORMATTER provenance supplied by the host. This hook
+/// only inspects the exact callable's directly owned descriptor; it MUST NOT
+/// allocate, invoke Lisp, inspect an ancestor frame or recognize source/code.
+/// Returned control is rooted immediately by the caller before any allocation.
+pub type FormatterControlHook = fn(EgclVal) -> Option<EgclVal>;
+static FORMATTER_CONTROL_HOOK: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+pub fn set_formatter_control_hook(hook: Option<FormatterControlHook>) {
+    FORMATTER_CONTROL_HOOK.store(
+        hook.map_or(0, |hook| hook as usize),
+        std::sync::atomic::Ordering::Release,
+    );
+}
+
+fn constructor_formatter_control(function: EgclVal) -> Option<EgclVal> {
+    let pointer = FORMATTER_CONTROL_HOOK.load(std::sync::atomic::Ordering::Acquire);
+    if pointer == 0 {
+        return None;
+    }
+    // SAFETY: only set_formatter_control_hook writes this nonzero function pointer.
+    let hook: FormatterControlHook = unsafe { std::mem::transmute(pointer) };
+    hook(function)
+}
+
 /// One pass over a `~{` body. An empty body takes its control from the first
 /// argument (CLHS 22.3.7.4): a string is formatted in place; a function (a
 /// FORMATTER) is called with a string stream and the remaining arguments and
 /// returns the arguments it did not consume (ansi format.{.17-19).
-fn run_iteration_body(
+fn run_iteration_arguments(
     body: &str,
     body_function: Option<EgclVal>,
-    elements: &[EgclVal],
-    idx: &mut usize,
+    arguments: &Arguments,
     output: &mut LayoutDoc,
-) -> Result<(), EgclError> {
+) -> FormatResult<()> {
     let Some(func) = body_function else {
-        return format_impl(body, elements, idx, output);
+        return format_arguments(body, arguments, output);
     };
     egcl_rt::rooted!(func = func);
-    let (tail, doc) =
-        apply_format_function_to_layout(*func, &elements[*idx..], output.current_column())?;
-    let remaining = if tail.is_cons() {
-        cons_list_to_vec(tail).len()
-    } else {
-        0
-    };
-    *idx += (elements.len() - *idx).saturating_sub(remaining);
+    egcl_rt::rooted!(invocation = InvocationScope::enter(*func, arguments.clone()));
+    if let Some(control) = constructor_formatter_control(*func) {
+        // A constructor-owned formatter can consume a circular continuation
+        // lazily. It needs no fictitious finite APPLY list or speculative call.
+        egcl_rt::rooted!(control = control);
+        let text = extract_egcl_string(*control).ok_or_else(|| {
+            EgclError::Internal("FORMATTER constructor retained a non-string control".into())
+        })?;
+        let entry = claim_formatter_entry(invocation.activation()).ok_or_else(|| {
+            EgclError::Internal("FORMATTER invocation lost its owned activation".into())
+        })?;
+        egcl_rt::rooted!(entry = entry);
+        egcl_rt::rooted!(
+            rendered = formatter_entry_to_layout(
+                &text,
+                NIL,
+                Some((*entry).clone()),
+                output.current_column(),
+                output.logical_body,
+            )?
+        );
+        output.append(std::mem::take(&mut rendered.layout));
+        if let Some(exit) = invocation.take_exit() {
+            return Err(FormatFlow::ExitLogicalBlock(exit));
+        }
+        return Ok(());
+    }
+    egcl_rt::rooted!(values = arguments.remaining_values()?);
+    let original = values.len();
+    let (tail, doc) = apply_format_function_to_layout(*func, &values, output.current_column())?;
+    egcl_rt::rooted!(tail = tail);
     output.append(doc);
+    if let Some(exit) = invocation.take_exit() {
+        return Err(FormatFlow::ExitLogicalBlock(exit));
+    }
+    if !invocation.claimed() {
+        // Arbitrary function controls retain their returned-tail convention.
+        // An explicit FORMATTER entry has already advanced its shared cursor.
+        egcl_rt::rooted!(remaining = Arguments::list(*tail));
+        let count = if tail.is_cons() {
+            remaining.remaining_count()?
+        } else {
+            0
+        };
+        arguments.advance_without_pop(original.saturating_sub(count))?;
+    }
     Ok(())
 }
 
@@ -3685,12 +3757,43 @@ pub fn render_layout(doc: &LayoutDoc, options: &LayoutOptions) -> String {
 // (CLHS 22.2.1.3), which only the directive interpreter knows.
 thread_local! {
     static LAST_CONSUMED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /// Raised by `~^` (1) or `~:^` (2).  `format_impl` returns at its next
-    /// step, and the enclosing iteration, `~?` or `~<` decides what ends.
-    static FORMAT_ESCAPE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
-    /// Inside `~:{` / `~:@{`: how many sublists remain after the current
-    /// pass, which is what a parameterless `~:^` tests.
-    static OUTER_REMAINING: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+#[derive(Clone, Copy)]
+struct ColonIterationState {
+    owner: FrameToken,
+    has_remaining: bool,
+}
+
+// These contexts belong to the Lisp execution, including fiber migration.
+// Their fields contain only Rust tokens/booleans, not untraced Lisp pointers.
+static FORMAT_ESCAPE: egcl_rt::execution_local::ExecutionLocal<std::cell::Cell<u8>> =
+    unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| std::cell::Cell::new(0)) };
+static OUTER_REMAINING: egcl_rt::execution_local::ExecutionLocal<
+    std::cell::Cell<Option<ColonIterationState>>,
+> = unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| std::cell::Cell::new(None)) };
+
+/// Independent operations never borrow a caller's colon-exit authority.
+/// Restore the caller's state even after a real error or transfer.
+struct FormatOperationScope {
+    escape: u8,
+    iteration: Option<ColonIterationState>,
+}
+
+impl FormatOperationScope {
+    fn enter() -> Self {
+        Self {
+            escape: FORMAT_ESCAPE.with(|slot| slot.replace(0)),
+            iteration: OUTER_REMAINING.with(|slot| slot.replace(None)),
+        }
+    }
+}
+
+impl Drop for FormatOperationScope {
+    fn drop(&mut self) {
+        FORMAT_ESCAPE.with(|slot| slot.set(self.escape));
+        OUTER_REMAINING.with(|slot| slot.set(self.iteration));
+    }
 }
 
 /// How many arguments the last completed `format` call consumed.
@@ -3699,7 +3802,7 @@ pub fn last_consumed_arg_count() -> usize {
 }
 
 /// Execute a FORMAT directive string. R5.40.
-/// Clear and return the pending `~^` escape level (0 when none).
+/// Clear the ordinary `~^` escape (0 when none). Colon exits use typed owners.
 fn take_escape() -> u8 {
     FORMAT_ESCAPE.with(|c| c.replace(0))
 }
@@ -3708,13 +3811,14 @@ fn escape_pending() -> bool {
     FORMAT_ESCAPE.with(|c| c.get()) != 0
 }
 
-pub fn format(
-    destination: EgclVal,
-    control_string: &str,
-    args: &[EgclVal],
-) -> Result<EgclVal, EgclError> {
-    let mut destination = destination;
-    egcl_rt::rooted_ref!(_destination_root = &mut destination);
+#[derive(Clone, Copy)]
+struct FormatDestination {
+    to_string: bool,
+    to_stdout: bool,
+    to_stream: bool,
+}
+
+fn format_destination(destination: EgclVal) -> Result<FormatDestination, EgclError> {
     // Validate destination
     let to_string = destination.is_nil();
     let to_stdout = destination == T;
@@ -3741,12 +3845,52 @@ pub fn format(
         }
     }
 
+    Ok(FormatDestination {
+        to_string,
+        to_stdout,
+        to_stream,
+    })
+}
+
+pub fn format(
+    destination: EgclVal,
+    control_string: &str,
+    args: &[EgclVal],
+) -> Result<EgclVal, EgclError> {
+    let mut destination = destination;
+    egcl_rt::rooted_ref!(_destination_root = &mut destination);
+    let target = format_destination(destination)?;
+    let to_stream = target.to_stream;
     let start_column = if to_stream {
         crate::streams::stream_line_column(destination).unwrap_or(0) as usize
     } else {
         0
     };
     let doc = format_to_layout_at_column(control_string, args, start_column)?;
+    write_layout_to_destination(destination, &doc, target)
+}
+
+/// Emit already interpreted semantic FORMAT events through the same destination
+/// and dynamic rendering policy as string controls. FORMATTER uses this after
+/// interpreting its original (possibly shared or circular) argument list.
+pub fn write_layout(destination: EgclVal, doc: &LayoutDoc) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted!(destination = destination);
+    let target = format_destination(*destination)?;
+    write_layout_to_destination(*destination, doc, target)
+}
+
+fn write_layout_to_destination(
+    destination: EgclVal,
+    doc: &LayoutDoc,
+    target: FormatDestination,
+) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted!(destination = destination);
+    let FormatDestination {
+        to_string,
+        to_stdout,
+        to_stream,
+    } = target;
+    let start_column = doc.start_column;
     let options = LayoutOptions {
         margin: print_integer_variable("*PRINT-RIGHT-MARGIN*").unwrap_or(80),
         miser_width: print_integer_variable("*PRINT-MISER-WIDTH*"),
@@ -3756,7 +3900,7 @@ pub fn format(
         start_column,
         pretty: print_pretty_active(),
     };
-    let output = render_layout(&doc, &options);
+    let output = render_layout(doc, &options);
 
     if to_stdout {
         print!("{}", output);
@@ -3768,16 +3912,16 @@ pub fn format(
     } else if to_stream {
         // Write each character to the stream using the Gray streams API.
         for ch in output.chars() {
-            crate::streams::stream_write_char(destination, EgclVal::from_char(ch))?;
+            crate::streams::stream_write_char(*destination, EgclVal::from_char(ch))?;
         }
         Ok(NIL)
-    } else if destination.is_heap_object() {
+    } else if (*destination).is_heap_object() {
         // String with fill pointer — append formatted output in place.
         // We refuse to grow beyond the original allocation because realloc
         // may move the underlying buffer and EgclVal is a value type
         // holding the old pointer — growing would be undefined behavior.
         unsafe {
-            let ptr = destination.as_ptr();
+            let ptr = (*destination).as_ptr();
             let old_header = *(ptr as *const ObjectHeader);
             // A large object's true footprint lives in the size-extension word
             // at +8; size_units() is the 0xFFFF sentinel there (bliss-e9hb).
@@ -3851,11 +3995,10 @@ pub fn format_to_layout_in_context(
     start_column: usize,
     logical_body: bool,
 ) -> Result<LayoutDoc, EgclError> {
+    let _operation = FormatOperationScope::enter();
     let mut args = args.to_vec();
     egcl_rt::rooted_ref!(_args_root = &mut args);
-    validate_matching(control_string)?;
-    let control_string = fill_normalization::normalize(control_string)?;
-    control_validation::validate(&control_string)?;
+    let control_string = prepare_format_control(control_string)?;
 
     let mut output = LayoutDoc {
         events: Vec::new(),
@@ -3958,12 +4101,274 @@ fn validate_matching(control: &str) -> Result<(), EgclError> {
     Ok(())
 }
 
+struct IterationScope(Option<ColonIterationState>);
+
+impl IterationScope {
+    fn enter(owner: Option<FrameToken>, has_remaining: bool) -> Self {
+        let state = owner.map(|owner| ColonIterationState {
+            owner,
+            has_remaining,
+        });
+        Self(OUTER_REMAINING.with(|cell| cell.replace(state)))
+    }
+}
+
+impl Drop for IterationScope {
+    fn drop(&mut self) {
+        OUTER_REMAINING.with(|cell| cell.set(self.0));
+    }
+}
+
+/// Pure lexical constructor validation. Store RAW control, never normalized
+/// text: each independent entry performs its own single fill normalization.
+pub fn validate_formatter_control(raw: &str) -> Result<(), EgclError> {
+    control_validation::validate(raw)
+}
+
+fn prepare_format_control(raw: &str) -> Result<std::borrow::Cow<'_, str>, EgclError> {
+    let eligible = OUTER_REMAINING.with(|slot| slot.get().is_some());
+    prepare_format_control_in_iteration(raw, eligible)
+}
+
+fn prepare_format_control_in_iteration(
+    raw: &str,
+    eligible: bool,
+) -> Result<std::borrow::Cow<'_, str>, EgclError> {
+    validate_matching(raw)?;
+    let normalized = fill_normalization::normalize(raw)?;
+    control_validation::validate_with_iteration(&normalized, eligible)?;
+    Ok(normalized)
+}
+
+/// A private FORMATTER entry returns its real remaining argument continuation
+/// plus emitted events; it does not consult LAST_CONSUMED from a nested call.
+pub struct FormatterLayout {
+    pub remaining: EgclVal,
+    pub layout: LayoutDoc,
+}
+
+impl egcl_rt::gc::TraceHostRoots for FormatterLayout {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
+        visit(&mut self.remaining);
+    }
+}
+
+pub fn formatter_entry_to_layout(
+    control: &str,
+    rest: EgclVal,
+    entry: Option<FormatterEntry>,
+    start_column: usize,
+    logical_body: bool,
+) -> Result<FormatterLayout, EgclError> {
+    let _operation = FormatOperationScope::enter();
+    egcl_rt::rooted!(entry = entry);
+    egcl_rt::rooted!(
+        args = match &*entry {
+            Some(entry) => entry.arguments(),
+            None => Arguments::list(rest),
+        }
+    );
+    let control = prepare_format_control(control)?;
+    let mut layout = LayoutDoc {
+        start_column,
+        logical_body,
+        ..LayoutDoc::default()
+    };
+    take_escape();
+    let result = format_arguments(&control, &args, &mut layout);
+    take_escape();
+    match result {
+        Ok(()) => {}
+        Err(FormatFlow::Error(error)) => return Err(error),
+        Err(FormatFlow::ExitColonIteration(_)) => {
+            return Err(EgclError::Internal(
+                "FORMATTER colon exit escaped its owning iteration".into(),
+            ));
+        }
+        Err(FormatFlow::ExitLogicalBlock(exit)) => {
+            let Some(entry) = &*entry else {
+                return Err(EgclError::Internal("unowned FORMATTER logical exit".into()));
+            };
+            // Store the typed, GC-traced exit before capture/queue allocations.
+            entry.record_exit(exit);
+        }
+    }
+    let remaining = args.remaining_tail();
+    Ok(FormatterLayout { remaining, layout })
+}
+
 fn format_impl(
     control: &str,
     args: &[EgclVal],
     arg_idx: &mut usize,
     output: &mut LayoutDoc,
 ) -> Result<(), EgclError> {
+    egcl_rt::rooted!(arguments = Arguments::values(args));
+    arguments.seek(*arg_idx)?;
+    let result = format_arguments(control, &arguments, output);
+    *arg_idx = arguments.position();
+    match result {
+        Ok(()) => Ok(()),
+        Err(FormatFlow::Error(error)) => Err(error),
+        Err(FormatFlow::ExitLogicalBlock(_)) => Err(EgclError::Internal(
+            "FORMAT logical-block exit escaped its owner".into(),
+        )),
+        Err(FormatFlow::ExitColonIteration(_)) => Err(EgclError::Internal(
+            "FORMAT colon exit escaped its owning iteration".into(),
+        )),
+    }
+}
+
+fn next_format_argument(args: &Arguments, _output: &mut LayoutDoc) -> FormatResult<EgclVal> {
+    match args.pop()? {
+        ArgumentStep::Value(value) => Ok(value),
+        ArgumentStep::Exit { owner, marker } => {
+            Err(FormatFlow::ExitLogicalBlock(LogicalExit { owner, marker }))
+        }
+    }
+}
+
+struct LogicalCircleScope;
+
+impl LogicalCircleScope {
+    fn enter(value: EgclVal) -> Self {
+        circle_enter(value);
+        Self
+    }
+}
+
+impl Drop for LogicalCircleScope {
+    fn drop(&mut self) {
+        circle_exit();
+    }
+}
+
+fn format_logical_arguments(
+    control: &str,
+    args: &Arguments,
+    output: &mut LayoutDoc,
+    prefix: String,
+    suffix: String,
+    per_line: bool,
+    at_sign: bool,
+) -> FormatResult<()> {
+    egcl_rt::rooted!(
+        object = if at_sign {
+            if let Some(head) = args.current_list() {
+                head
+            } else {
+                egcl_rt::rooted!(values = args.remaining_values()?);
+                crate::sequences::build_list(&values)
+            }
+        } else {
+            next_format_argument(args, output)?
+        }
+    );
+    if !object.is_nil() && !object.is_cons() {
+        let escape = print_readably_active()
+            || egcl_rt::symbols::find_index("*PRINT-ESCAPE*")
+                .and_then(egcl_rt::symbols::symbol_value)
+                .is_none_or(|value| !value.is_nil());
+        let doc = print_value_layout(output, *object, escape);
+        output.append(doc);
+        if at_sign {
+            args.exhaust_remaining();
+        }
+        return Ok(());
+    }
+    let _circle = LogicalCircleScope::enter(*object);
+    if print_level() == Some(0) {
+        output.character('#');
+        if at_sign {
+            args.exhaust_remaining();
+        }
+        return Ok(());
+    }
+    // Top-level opening-@ argument spines are implementation-created data;
+    // sharing of their ELEMENTS still uses the same graph-wide circle table.
+    if !at_sign || args.has_logical_pop() {
+        match circle_visit(*object) {
+            CircleMark::Repeat(label) => {
+                output.text(&format!("#{label}#"));
+                if at_sign {
+                    args.exhaust_remaining();
+                }
+                return Ok(());
+            }
+            CircleMark::First(label) => output.text(&format!("#{label}=")),
+            CircleMark::NotShared => {}
+        }
+    }
+    let owner = FrameToken::fresh();
+    egcl_rt::rooted!(
+        body_args = if at_sign {
+            args.with_logical_pop(owner)
+        } else {
+            Arguments::logical_list(*object, owner)
+        }
+    );
+    let mut level_binding = print_level().and_then(|level| {
+        PrintDynamicBinding::establish(
+            "*PRINT-LEVEL*",
+            EgclVal::from_fixnum(level.saturating_sub(1) as i64),
+        )
+    });
+    egcl_rt::rooted_ref!(_level_binding_root = &mut level_binding);
+    let start_column = if prefix.contains('\n') {
+        prefix
+            .rsplit('\n')
+            .next()
+            .unwrap_or_default()
+            .chars()
+            .count()
+    } else {
+        output.current_column() + prefix.chars().count()
+    };
+    let mut body = LayoutDoc {
+        start_column,
+        logical_body: true,
+        ..LayoutDoc::default()
+    };
+    let result = format_arguments(control, &body_args, &mut body);
+    take_escape();
+    let propagated = match result {
+        Ok(()) => None,
+        Err(FormatFlow::Error(error)) => return Err(FormatFlow::Error(error)),
+        Err(FormatFlow::ExitLogicalBlock(exit)) if exit.owner == owner => {
+            egcl_rt::rooted!(exit = exit);
+            match &exit.marker {
+                ExitMarker::Length => body.text("..."),
+                ExitMarker::Dotted(value) => {
+                    body.text(". ");
+                    let escape = print_readably_active()
+                        || egcl_rt::symbols::find_index("*PRINT-ESCAPE*")
+                            .and_then(egcl_rt::symbols::symbol_value)
+                            .is_none_or(|value| !value.is_nil());
+                    let doc = print_value_layout(&mut body, *value, escape);
+                    body.append(doc);
+                }
+            }
+            None
+        }
+        Err(FormatFlow::ExitLogicalBlock(exit)) => Some(FormatFlow::ExitLogicalBlock(exit)),
+        Err(FormatFlow::ExitColonIteration(owner)) => Some(FormatFlow::ExitColonIteration(owner)),
+    };
+    output.events.push(LayoutEvent::Block {
+        prefix: prefix.clone(),
+        per_line_prefix: per_line.then_some(prefix),
+        suffix,
+        events: body.into_events(),
+    });
+    if let Some(flow) = propagated {
+        return Err(flow);
+    }
+    if at_sign {
+        args.exhaust_remaining();
+    }
+    Ok(())
+}
+
+fn format_arguments(control: &str, args: &Arguments, output: &mut LayoutDoc) -> FormatResult<()> {
     let chars: Vec<char> = control.chars().collect();
     let mut i = 0;
     while i < chars.len() {
@@ -3977,13 +4382,15 @@ fn format_impl(
         }
         i += 1; // skip ~
         if i >= chars.len() {
-            return Err(EgclError::Internal("dangling ~ in format string".into()));
+            return Err(FormatFlow::Error(EgclError::Internal(
+                "dangling ~ in format string".into(),
+            )));
         }
         // Parse params
         let mut params: Vec<Param> = Vec::new();
         loop {
             if i >= chars.len() {
-                return Err(EgclError::Internal("dangling ~".into()));
+                return Err(FormatFlow::Error(EgclError::Internal("dangling ~".into())));
             }
             let c = chars[i];
             if c == 'v' || c == 'V' {
@@ -4052,21 +4459,20 @@ fn format_impl(
             }
         }
         if i >= chars.len() {
-            return Err(EgclError::Internal("dangling ~".into()));
+            return Err(FormatFlow::Error(EgclError::Internal("dangling ~".into())));
         }
         let directive = chars[i].to_ascii_uppercase();
         i += 1;
 
-        let resolve_param = |p: &Param, default: i64, aidx: &mut usize| -> Result<i64, EgclError> {
+        let resolve_param = |p: &Param,
+                             default: i64,
+                             output: &mut LayoutDoc|
+         -> FormatResult<i64> {
             match p {
                 Param::Num(n) => Ok(*n),
                 Param::Char(c) => Ok(*c as i64),
                 Param::V => {
-                    if *aidx >= args.len() {
-                        return Err(EgclError::ControlError("too few args for V param".into()));
-                    }
-                    let v = args[*aidx];
-                    *aidx += 1;
+                    let v = next_format_argument(args, output)?;
                     if v.is_nil() {
                         Ok(default)
                     } else if v.is_fixnum() {
@@ -4081,16 +4487,18 @@ fn format_impl(
                         // hugely negative MINCOL pads nothing (ansi format.d.29).
                         Ok(if negative { i64::MIN } else { i64::MAX })
                     } else {
-                        Err(EgclError::TypeError {
+                        Err(FormatFlow::Error(EgclError::TypeError {
                             datum: v,
                             expected: "integer".into(),
-                        })
+                        }))
                     }
                 }
                 // `#` counts the arguments remaining when IT is resolved, so
                 // a `v` before it has already taken its argument
                 // (ansi format.:^.:{.20: `~V,#:^`).
-                Param::Hash => Ok(args.len().saturating_sub(*aidx) as i64),
+                Param::Hash => Ok(i64::try_from(args.remaining_count()?).map_err(|_| {
+                    EgclError::ControlError("FORMAT argument count exceeds integer range".into())
+                })?),
                 Param::None => Ok(default),
             }
         };
@@ -4102,36 +4510,37 @@ fn format_impl(
                 // honour minpad and padchar (padchar was ignored — bliss-znib).
                 let mincol = params
                     .first()
-                    .map_or(Ok(0), |p| resolve_param(p, 0, arg_idx))?
+                    .map_or(Ok(0), |p| resolve_param(p, 0, output))?
                     .max(0) as usize;
                 let colinc = params
                     .get(1)
-                    .map_or(Ok(1), |p| resolve_param(p, 1, arg_idx))?
+                    .map_or(Ok(1), |p| resolve_param(p, 1, output))?
                     .max(1) as usize;
                 let minpad = params
                     .get(2)
-                    .map_or(Ok(0), |p| resolve_param(p, 0, arg_idx))?
+                    .map_or(Ok(0), |p| resolve_param(p, 0, output))?
                     .max(0) as usize;
                 let padchar = match params.get(3) {
                     Some(p) => {
-                        char::from_u32(resolve_param(p, ' ' as i64, arg_idx)? as u32).unwrap_or(' ')
+                        char::from_u32(resolve_param(p, ' ' as i64, output)? as u32).unwrap_or(' ')
                     }
                     None => ' ',
                 };
-                if *arg_idx >= args.len() {
+                if !args.has_remaining() {
                     if std::env::var_os("EGCL_FMT_DBG").is_some() {
                         eprintln!(
                             ";; fmt too-few ~~A: arg_idx={} nargs={} control={:?}",
-                            arg_idx,
-                            args.len(),
+                            args.position(),
+                            args.remaining_count().unwrap_or(0),
                             control.chars().take(80).collect::<String>()
                         );
                     }
-                    return Err(EgclError::ControlError("too few args for ~A".into()));
+                    return Err(FormatFlow::Error(EgclError::ControlError(
+                        "too few args for ~A".into(),
+                    )));
                 }
-                let mut val = args[*arg_idx];
+                let mut val = next_format_argument(args, output)?;
                 egcl_rt::rooted_ref!(_val_root = &mut val);
-                *arg_idx += 1;
                 let doc = with_princ_bindings(|| {
                     if colon && val.is_nil() {
                         let mut doc = LayoutDoc::default();
@@ -4147,27 +4556,28 @@ fn format_impl(
                 // ~mincol,colinc,minpad,padchar S — same padding as ~A (bliss-znib).
                 let mincol = params
                     .first()
-                    .map_or(Ok(0), |p| resolve_param(p, 0, arg_idx))?
+                    .map_or(Ok(0), |p| resolve_param(p, 0, output))?
                     .max(0) as usize;
                 let colinc = params
                     .get(1)
-                    .map_or(Ok(1), |p| resolve_param(p, 1, arg_idx))?
+                    .map_or(Ok(1), |p| resolve_param(p, 1, output))?
                     .max(1) as usize;
                 let minpad = params
                     .get(2)
-                    .map_or(Ok(0), |p| resolve_param(p, 0, arg_idx))?
+                    .map_or(Ok(0), |p| resolve_param(p, 0, output))?
                     .max(0) as usize;
                 let padchar = match params.get(3) {
                     Some(p) => {
-                        char::from_u32(resolve_param(p, ' ' as i64, arg_idx)? as u32).unwrap_or(' ')
+                        char::from_u32(resolve_param(p, ' ' as i64, output)? as u32).unwrap_or(' ')
                     }
                     None => ' ',
                 };
-                if *arg_idx >= args.len() {
-                    return Err(EgclError::ControlError("too few args for ~S".into()));
+                if !args.has_remaining() {
+                    return Err(FormatFlow::Error(EgclError::ControlError(
+                        "too few args for ~S".into(),
+                    )));
                 }
-                let val = args[*arg_idx];
-                *arg_idx += 1;
+                let val = next_format_argument(args, output)?;
                 let doc = if colon && val.is_nil() {
                     let mut doc = LayoutDoc::default();
                     doc.text("()");
@@ -4189,12 +4599,12 @@ fn format_impl(
                 // negative i64 wrapped to a huge width and panicked in
                 // repeat_n with "capacity overflow".
                 let mincol = if !params.is_empty() {
-                    resolve_param(&params[0], 0, arg_idx)?.max(0) as usize
+                    resolve_param(&params[0], 0, output)?.max(0) as usize
                 } else {
                     0
                 };
                 let padchar = if params.len() > 1 {
-                    param_char(resolve_param(&params[1], ' ' as i64, arg_idx)?, ' ')
+                    param_char(resolve_param(&params[1], ' ' as i64, output)?, ' ')
                 } else {
                     ' '
                 };
@@ -4202,23 +4612,22 @@ fn format_impl(
                 // interval (CLHS 22.3.2.1); `~,,' ,4:d` groups every 4 digits
                 // with a space. Previously both were ignored (hardcoded ",", 3).
                 let commachar = if params.len() > 2 {
-                    param_char(resolve_param(&params[2], ',' as i64, arg_idx)?, ',')
+                    param_char(resolve_param(&params[2], ',' as i64, output)?, ',')
                 } else {
                     ','
                 };
                 let comma_interval = if params.len() > 3 {
-                    resolve_param(&params[3], 3, arg_idx)?.max(0) as usize
+                    resolve_param(&params[3], 3, output)?.max(0) as usize
                 } else {
                     3
                 };
-                if *arg_idx >= args.len() {
-                    return Err(EgclError::ControlError(format!(
+                if !args.has_remaining() {
+                    return Err(FormatFlow::Error(EgclError::ControlError(format!(
                         "too few args for ~{}",
                         directive
-                    )));
+                    ))));
                 }
-                let val = args[*arg_idx];
-                *arg_idx += 1;
+                let val = next_format_argument(args, output)?;
                 // Accept fixnums AND bignums (previously bignums type-errored,
                 // even though ~A/PRINT render them). integer_magnitude returns
                 // None for non-integers -> TYPE-ERROR.
@@ -4249,26 +4658,26 @@ fn format_impl(
                 // English / roman spellings instead (ansi format.r.8).
                 let radix_given = match params.first() {
                     None | Some(Param::None) => false,
-                    Some(Param::V) => !args.get(*arg_idx).is_some_and(|v| v.is_nil()),
+                    Some(Param::V) => !args.peek().is_some_and(|v| v.is_nil()),
                     Some(_) => true,
                 };
                 let radix_param = if radix_given {
-                    let radix = resolve_param(&params[0], 10, arg_idx)?;
+                    let radix = resolve_param(&params[0], 10, output)?;
                     // CLHS 22.3.2.2: radix is an integer between 2 and 36.
                     // Out-of-range values used to reach from_digit / `% 0` and
                     // panic; signal a FORMAT error instead.
                     if !(2..=36).contains(&radix) {
-                        return Err(EgclError::ControlError(format!(
+                        return Err(FormatFlow::Error(EgclError::ControlError(format!(
                             "~R radix must be between 2 and 36, got {}",
                             radix
-                        )));
+                        ))));
                     }
                     Some(radix as u32)
                 } else {
                     // An omitted (or NIL `v`) radix: still consume the `v`
                     // argument, then print in English or roman numerals.
                     if let Some(p @ Param::V) = params.first() {
-                        resolve_param(p, 10, arg_idx)?;
+                        resolve_param(p, 10, output)?;
                     }
                     None
                 };
@@ -4276,25 +4685,26 @@ fn format_impl(
                 // remaining prefix parameters mean what they do for ~D.
                 let mincol = params
                     .get(1)
-                    .map_or(Ok(0), |p| resolve_param(p, 0, arg_idx))?
+                    .map_or(Ok(0), |p| resolve_param(p, 0, output))?
                     .max(0) as usize;
                 let padchar = params
                     .get(2)
-                    .map_or(Ok(' ' as i64), |p| resolve_param(p, ' ' as i64, arg_idx))
+                    .map_or(Ok(' ' as i64), |p| resolve_param(p, ' ' as i64, output))
                     .map(|code| param_char(code, ' '))?;
                 let commachar = params
                     .get(3)
-                    .map_or(Ok(',' as i64), |p| resolve_param(p, ',' as i64, arg_idx))
+                    .map_or(Ok(',' as i64), |p| resolve_param(p, ',' as i64, output))
                     .map(|code| param_char(code, ','))?;
                 let comma_interval = params
                     .get(4)
-                    .map_or(Ok(3), |p| resolve_param(p, 3, arg_idx))?
+                    .map_or(Ok(3), |p| resolve_param(p, 3, output))?
                     .max(0) as usize;
-                if *arg_idx >= args.len() {
-                    return Err(EgclError::ControlError("too few args for ~R".into()));
+                if !args.has_remaining() {
+                    return Err(FormatFlow::Error(EgclError::ControlError(
+                        "too few args for ~R".into(),
+                    )));
                 }
-                let val = args[*arg_idx];
-                *arg_idx += 1;
+                let val = next_format_argument(args, output)?;
                 if let Some(radix) = radix_param {
                     // Fixnums and bignums alike, through the ~D machinery.
                     let (negative, digits) = match integer_magnitude(val, radix) {
@@ -4320,10 +4730,10 @@ fn format_impl(
                 // Bignums are integers too: `~R` used to accept only fixnums
                 // and signal a TYPE-ERROR claiming 10^20 was not an integer.
                 let Some((negative, digits)) = integer_magnitude(val, 10) else {
-                    return Err(EgclError::TypeError {
+                    return Err(FormatFlow::Error(EgclError::TypeError {
                         datum: val,
                         expected: "integer".into(),
-                    });
+                    }));
                 };
                 if at_sign {
                     // Roman numerals stop at 4999; to_roman prints anything
@@ -4355,15 +4765,14 @@ fn format_impl(
                 let mut fixed_params: Vec<Option<i64>> = Vec::with_capacity(5);
                 for p in params.iter().take(5) {
                     let omitted = matches!(p, Param::None)
-                        || (matches!(p, Param::V)
-                            && args.get(*arg_idx).is_some_and(|v| v.is_nil()));
+                        || (matches!(p, Param::V) && args.peek().is_some_and(|v| v.is_nil()));
                     if omitted {
                         if matches!(p, Param::V) {
-                            *arg_idx += 1;
+                            let _ = next_format_argument(args, output)?;
                         }
                         fixed_params.push(None);
                     } else {
-                        fixed_params.push(Some(resolve_param(p, 0, arg_idx)?));
+                        fixed_params.push(Some(resolve_param(p, 0, output)?));
                     }
                 }
                 let param = |k: usize| fixed_params.get(k).copied().flatten();
@@ -4374,12 +4783,13 @@ fn format_impl(
                 let pad_char = param(4)
                     .and_then(|c| char::from_u32(c as u32))
                     .unwrap_or(' ');
-                if *arg_idx >= args.len() {
-                    return Err(EgclError::ControlError("too few args for ~F".into()));
+                if !args.has_remaining() {
+                    return Err(FormatFlow::Error(EgclError::ControlError(
+                        "too few args for ~F".into(),
+                    )));
                 }
-                let mut val = args[*arg_idx];
+                let mut val = next_format_argument(args, output)?;
                 egcl_rt::rooted_ref!(_val_root = &mut val);
-                *arg_idx += 1;
                 // A non-number prints as ~wD (CLHS 22.3.3.1).
                 if !egcl_rt::types::numberp(val) || egcl_rt::types::complexp(val) {
                     push_padded_left(
@@ -4494,31 +4904,32 @@ fn format_impl(
                 // args rather than mis-binding the value (CLHS 22.3.1; bliss-8rs1).
                 let w = params
                     .first()
-                    .map_or(Ok(-1), |p| resolve_param(p, -1, arg_idx))?;
+                    .map_or(Ok(-1), |p| resolve_param(p, -1, output))?;
                 let d = params
                     .get(1)
-                    .map_or(Ok(-1), |p| resolve_param(p, -1, arg_idx))?;
+                    .map_or(Ok(-1), |p| resolve_param(p, -1, output))?;
                 let e = params
                     .get(2)
-                    .map_or(Ok(-1), |p| resolve_param(p, -1, arg_idx))?;
+                    .map_or(Ok(-1), |p| resolve_param(p, -1, output))?;
                 let k = params
                     .get(3)
-                    .map_or(Ok(1), |p| resolve_param(p, 1, arg_idx))?;
+                    .map_or(Ok(1), |p| resolve_param(p, 1, output))?;
                 let overflow = params
                     .get(4)
-                    .map_or(Ok(-1), |p| resolve_param(p, -1, arg_idx))?;
+                    .map_or(Ok(-1), |p| resolve_param(p, -1, output))?;
                 let pad_param = params
                     .get(5)
-                    .map_or(Ok(-1), |p| resolve_param(p, -1, arg_idx))?;
+                    .map_or(Ok(-1), |p| resolve_param(p, -1, output))?;
                 let expc = params
                     .get(6)
-                    .map_or(Ok('e' as i64), |p| resolve_param(p, 'e' as i64, arg_idx))?;
+                    .map_or(Ok('e' as i64), |p| resolve_param(p, 'e' as i64, output))?;
                 let exp_char = char::from_u32(expc as u32).unwrap_or('e');
-                if *arg_idx >= args.len() {
-                    return Err(EgclError::ControlError("too few args for ~E".into()));
+                if !args.has_remaining() {
+                    return Err(FormatFlow::Error(EgclError::ControlError(
+                        "too few args for ~E".into(),
+                    )));
                 }
-                let val = args[*arg_idx];
-                *arg_idx += 1;
+                let val = next_format_argument(args, output)?;
                 let f = real_format_value(val)?;
                 let mut s = if d < 0 {
                     // No explicit fraction-digit count: shortest round-trip. Format
@@ -4585,27 +4996,28 @@ fn format_impl(
                 // round-trip — but the params (and width) now apply.
                 let w = params
                     .first()
-                    .map_or(Ok(-1), |p| resolve_param(p, -1, arg_idx))?;
+                    .map_or(Ok(-1), |p| resolve_param(p, -1, output))?;
                 let _d = params
                     .get(1)
-                    .map_or(Ok(-1), |p| resolve_param(p, -1, arg_idx))?;
+                    .map_or(Ok(-1), |p| resolve_param(p, -1, output))?;
                 let _e = params
                     .get(2)
-                    .map_or(Ok(-1), |p| resolve_param(p, -1, arg_idx))?;
+                    .map_or(Ok(-1), |p| resolve_param(p, -1, output))?;
                 let _k = params
                     .get(3)
-                    .map_or(Ok(1), |p| resolve_param(p, 1, arg_idx))?;
+                    .map_or(Ok(1), |p| resolve_param(p, 1, output))?;
                 let _of = params
                     .get(4)
-                    .map_or(Ok(-1), |p| resolve_param(p, -1, arg_idx))?;
+                    .map_or(Ok(-1), |p| resolve_param(p, -1, output))?;
                 let pad_param = params
                     .get(5)
-                    .map_or(Ok(-1), |p| resolve_param(p, -1, arg_idx))?;
-                if *arg_idx >= args.len() {
-                    return Err(EgclError::ControlError("too few args for ~G".into()));
+                    .map_or(Ok(-1), |p| resolve_param(p, -1, output))?;
+                if !args.has_remaining() {
+                    return Err(FormatFlow::Error(EgclError::ControlError(
+                        "too few args for ~G".into(),
+                    )));
                 }
-                let val = args[*arg_idx];
-                *arg_idx += 1;
+                let val = next_format_argument(args, output)?;
                 // Shortest round-trip from the f32 for single-floats (bliss-8zrb).
                 let mut s = if val.is_single_float() {
                     format!("{}", val.as_single_float())
@@ -4633,25 +5045,26 @@ fn format_impl(
                 // the parameter args, not the value (CLHS 22.3.1; bliss-8rs1).
                 let d = params
                     .first()
-                    .map_or(Ok(2), |p| resolve_param(p, 2, arg_idx))?
+                    .map_or(Ok(2), |p| resolve_param(p, 2, output))?
                     .max(0) as usize;
                 let n = params
                     .get(1)
-                    .map_or(Ok(1), |p| resolve_param(p, 1, arg_idx))?
+                    .map_or(Ok(1), |p| resolve_param(p, 1, output))?
                     .max(1) as usize;
                 let w = params
                     .get(2)
-                    .map_or(Ok(0), |p| resolve_param(p, 0, arg_idx))?
+                    .map_or(Ok(0), |p| resolve_param(p, 0, output))?
                     .max(0) as usize;
                 let padchar = params.get(3).map_or(Ok(' '), |p| {
-                    resolve_param(p, ' ' as i64, arg_idx)
+                    resolve_param(p, ' ' as i64, output)
                         .map(|c| char::from_u32(c as u32).unwrap_or(' '))
                 })?;
-                if *arg_idx >= args.len() {
-                    return Err(EgclError::ControlError("too few args for ~$".into()));
+                if !args.has_remaining() {
+                    return Err(FormatFlow::Error(EgclError::ControlError(
+                        "too few args for ~$".into(),
+                    )));
                 }
-                let val = args[*arg_idx];
-                *arg_idx += 1;
+                let val = next_format_argument(args, output)?;
                 let f = real_format_value(val)?;
                 let body = format!("{:.*}", d, f.abs());
                 let (int_part, frac_part) = match body.split_once('.') {
@@ -4690,7 +5103,7 @@ fn format_impl(
             }
             '%' => {
                 let count = if !params.is_empty() {
-                    resolve_param(&params[0], 1, arg_idx)?
+                    resolve_param(&params[0], 1, output)?
                 } else {
                     1
                 };
@@ -4700,7 +5113,7 @@ fn format_impl(
             }
             '&' => {
                 let count = if !params.is_empty() {
-                    resolve_param(&params[0], 1, arg_idx)?
+                    resolve_param(&params[0], 1, output)?
                 } else {
                     1
                 };
@@ -4714,7 +5127,7 @@ fn format_impl(
             }
             '|' => {
                 let count = if !params.is_empty() {
-                    resolve_param(&params[0], 1, arg_idx)?
+                    resolve_param(&params[0], 1, output)?
                 } else {
                     1
                 };
@@ -4728,7 +5141,7 @@ fn format_impl(
             'I' => {
                 let amount = params
                     .first()
-                    .map_or(Ok(0), |param| resolve_param(param, 0, arg_idx))?
+                    .map_or(Ok(0), |param| resolve_param(param, 0, output))?
                     .clamp(i32::MIN as i64, i32::MAX as i64) as i32;
                 output.events.push(LayoutEvent::Indent {
                     // CLHS ~:I is relative to the current column; plain ~I is
@@ -4756,7 +5169,7 @@ fn format_impl(
             }
             '~' => {
                 let count = if !params.is_empty() {
-                    resolve_param(&params[0], 1, arg_idx)?
+                    resolve_param(&params[0], 1, output)?
                 } else {
                     1
                 };
@@ -4778,12 +5191,12 @@ fn format_impl(
                 // inside a logical block while *PRINT-PRETTY* is true (ansi
                 // format.:t.2-3, format.:@t.4-5).
                 let first = if !params.is_empty() {
-                    resolve_param(&params[0], 1, arg_idx)?.clamp(0, u32::MAX as i64) as u32
+                    resolve_param(&params[0], 1, output)?.clamp(0, u32::MAX as i64) as u32
                 } else {
                     1
                 };
                 let colinc = if params.len() > 1 {
-                    resolve_param(&params[1], 1, arg_idx)?.clamp(0, u32::MAX as i64) as u32
+                    resolve_param(&params[1], 1, output)?.clamp(0, u32::MAX as i64) as u32
                 } else {
                     1
                 };
@@ -4812,33 +5225,32 @@ fn format_impl(
                 // argument n (default 0).
                 let default = if at_sign { 0 } else { 1 };
                 let n = if !params.is_empty() {
-                    resolve_param(&params[0], default, arg_idx)?.max(0) as usize
+                    resolve_param(&params[0], default, output)?.max(0) as usize
                 } else {
                     default as usize
                 };
                 if at_sign {
-                    *arg_idx = n.min(args.len());
+                    args.seek(n)?;
                 } else if colon {
-                    if *arg_idx >= n {
-                        *arg_idx -= n;
-                    } else {
-                        *arg_idx = 0;
-                    }
+                    args.rewind(n)?;
                 } else {
-                    *arg_idx += n;
+                    for _ in 0..n {
+                        let _ = next_format_argument(args, output)?;
+                    }
                 }
             }
             'C' => {
-                if *arg_idx >= args.len() {
-                    return Err(EgclError::ControlError("too few args for ~C".into()));
+                if !args.has_remaining() {
+                    return Err(FormatFlow::Error(EgclError::ControlError(
+                        "too few args for ~C".into(),
+                    )));
                 }
-                let val = args[*arg_idx];
-                *arg_idx += 1;
+                let val = next_format_argument(args, output)?;
                 if !val.is_character() {
-                    return Err(EgclError::TypeError {
+                    return Err(FormatFlow::Error(EgclError::TypeError {
                         datum: val,
                         expected: "character".into(),
-                    });
+                    }));
                 }
                 let c = val.as_char();
                 if colon {
@@ -4864,11 +5276,12 @@ fn format_impl(
                 }
             }
             'W' => {
-                if *arg_idx >= args.len() {
-                    return Err(EgclError::ControlError("too few args for ~W".into()));
+                if !args.has_remaining() {
+                    return Err(FormatFlow::Error(EgclError::ControlError(
+                        "too few args for ~W".into(),
+                    )));
                 }
-                let val = args[*arg_idx];
-                *arg_idx += 1;
+                egcl_rt::rooted!(val = next_format_argument(args, output)?);
                 let mut pretty_binding = colon
                     .then(|| PrintDynamicBinding::establish("*PRINT-PRETTY*", T))
                     .flatten();
@@ -4881,106 +5294,63 @@ fn format_impl(
                 egcl_rt::rooted_ref!(_pretty_binding_root = &mut pretty_binding);
                 egcl_rt::rooted_ref!(_level_binding_root = &mut level_binding);
                 egcl_rt::rooted_ref!(_length_binding_root = &mut length_binding);
-                let doc = print_value_layout(output, val, true);
+                let doc = print_value_layout(output, *val, true);
                 output.append(doc);
             }
             '?' => {
-                if *arg_idx >= args.len() {
-                    return Err(EgclError::ControlError("too few args for ~?".into()));
-                }
-                let ctrl_val = args[*arg_idx];
-                *arg_idx += 1;
-                // The control is a format string or, as for `~{~}`, a function
-                // such as FORMATTER returns (CLHS 22.3.7.6): it is called with
-                // a string stream and the arguments, and returns those it did
-                // not consume (ansi format.?.6-11, format.@?.6-9). An
-                // interpreted closure is cons-tagged; the apply hook calls it.
-                let is_string = ctrl_val.is_heap_object() && egcl_rt::types::stringp(ctrl_val);
+                egcl_rt::rooted!(control = next_format_argument(args, output)?);
+                let is_string = control.is_heap_object() && egcl_rt::types::stringp(*control);
                 let callable =
-                    ctrl_val.is_function() || ctrl_val.is_heap_object() || ctrl_val.is_cons();
-                if !is_string && callable {
-                    if at_sign {
-                        run_iteration_body("", Some(ctrl_val), args, arg_idx, output)?;
-                    } else {
-                        if *arg_idx >= args.len() {
-                            return Err(EgclError::ControlError("too few args for ~?".into()));
-                        }
-                        let args_val = args[*arg_idx];
-                        *arg_idx += 1;
-                        let mut sub_args = if args_val.is_nil() {
-                            Vec::new()
-                        } else {
-                            cons_list_to_vec(args_val)
-                        };
-                        egcl_rt::rooted_ref!(_sub_args_root = &mut sub_args);
-                        let mut sub_idx = 0;
-                        run_iteration_body("", Some(ctrl_val), &sub_args, &mut sub_idx, output)?;
-                    }
-                    take_escape();
-                } else if !is_string {
-                    return Err(EgclError::TypeError {
-                        datum: ctrl_val,
+                    control.is_function() || control.is_heap_object() || control.is_cons();
+                if !is_string && !callable {
+                    return Err(FormatFlow::Error(EgclError::TypeError {
+                        datum: *control,
                         expected: "(OR STRING FUNCTION)".into(),
-                    });
-                } else {
-                    let sub_control = extract_egcl_string(ctrl_val).ok_or_else(|| {
-                        EgclError::Internal("failed to extract format string".into())
-                    })?;
-                    let sub_control = fill_normalization::normalize(&sub_control)?;
-                    control_validation::validate(&sub_control)?;
-                    if at_sign {
-                        // ~@? — use the enclosing argument list from current position
-                        format_impl(&sub_control, args, arg_idx, output)?;
-                        // A `~^` inside ends the ~? control string only.
-                        take_escape();
+                    }));
+                }
+                if at_sign {
+                    if is_string {
+                        let text = extract_egcl_string(*control).unwrap_or_default();
+                        let text = prepare_format_control(&text)?;
+                        egcl_rt::rooted!(indirect = args.without_logical_pop());
+                        format_arguments(&text, &indirect, output)?;
                     } else {
-                        // ~? — consume a separate list argument for the sub-format's args
-                        if *arg_idx >= args.len() {
-                            return Err(EgclError::ControlError("too few args for ~?".into()));
-                        }
-                        let args_val = args[*arg_idx];
-                        *arg_idx += 1;
-                        let sub_args = if args_val.is_nil() {
-                            Vec::new()
-                        } else {
-                            cons_list_to_vec(args_val)
-                        };
-                        let mut sub_idx = 0;
-                        format_impl(&sub_control, &sub_args, &mut sub_idx, output)?;
-                        take_escape();
+                        run_iteration_arguments("", Some(*control), args, output)?;
+                    }
+                } else {
+                    egcl_rt::rooted!(list = next_format_argument(args, output)?);
+                    if !list.is_nil() && !list.is_cons() {
+                        return Err(FormatFlow::Error(EgclError::TypeError {
+                            datum: *list,
+                            expected: "LIST".into(),
+                        }));
+                    }
+                    egcl_rt::rooted!(indirect = Arguments::list(*list));
+                    if is_string {
+                        let text = extract_egcl_string(*control).unwrap_or_default();
+                        let text = prepare_format_control(&text)?;
+                        format_arguments(&text, &indirect, output)?;
+                    } else {
+                        run_iteration_arguments("", Some(*control), &indirect, output)?;
                     }
                 }
+                take_escape();
             }
             'P' => {
-                // Per CL spec §22.3.8.3: ~:P backs up one argument
-                // (does ~:* first) then checks if the value equals 1.
-                // Plain ~P consumes the next argument directly.
-                if colon {
-                    // ~:P — explicitly back up one argument position.
-                    if *arg_idx > 0 {
-                        *arg_idx -= 1;
-                    }
-                }
-                if *arg_idx >= args.len() {
-                    // No more arguments available.  If this is plain ~P
-                    // following a directive that consumed the last arg
-                    // (e.g. "~D item~P" with one arg), re-examine the
-                    // previous argument as a compatibility fallback.
-                    if !colon && *arg_idx > 0 {
-                        *arg_idx -= 1;
-                    } else {
-                        return Err(EgclError::ControlError("too few args for ~P".into()));
-                    }
-                }
-                let val = args[*arg_idx];
-                *arg_idx += 1;
-                let is_one = val.is_fixnum() && val.as_fixnum() == 1;
+                let value = if colon || !args.has_remaining() {
+                    let previous = args.position().checked_sub(1).ok_or_else(|| {
+                        EgclError::ControlError("no previous FORMAT argument for ~:P".into())
+                    })?;
+                    args.value_at(previous)?
+                        .ok_or_else(|| EgclError::ControlError("too few args for ~P".into()))?
+                } else {
+                    next_format_argument(args, output)?
+                };
+                let is_one = value.is_fixnum() && value.as_fixnum() == 1;
                 if at_sign {
                     output.text(if is_one { "y" } else { "ies" });
-                } else {
-                    if !is_one {
-                        output.character('s');
-                    }
+                } else if !is_one {
+                    output.character('s');
                 }
             }
             '^' => {
@@ -4991,276 +5361,179 @@ fn format_impl(
                 // `~?` or `~<` sees the flag and decides what it ends.
                 // A `v` parameter whose argument is NIL counts as omitted
                 // (ansi format.^.{.25/33), so `~1,1,v^` with NIL compares two.
+                let colon_owner = if colon {
+                    Some(OUTER_REMAINING.with(|slot| slot.get()).ok_or_else(|| {
+                        EgclError::ControlError("~:^ requires a current colon iteration".into())
+                    })?)
+                } else {
+                    None
+                };
                 let mut vals: Vec<i64> = Vec::with_capacity(params.len());
                 for p in &params {
-                    if matches!(p, Param::V) && args.get(*arg_idx).is_some_and(|v| v.is_nil()) {
-                        *arg_idx += 1;
+                    if matches!(p, Param::V) && args.peek().is_some_and(|v| v.is_nil()) {
+                        let _ = next_format_argument(args, output)?;
                         continue;
                     }
                     if matches!(p, Param::None) {
                         continue;
                     }
-                    vals.push(resolve_param(p, 0, arg_idx)?);
+                    vals.push(resolve_param(p, 0, output)?);
                 }
                 let terminate = match vals.len() {
-                    0 if colon => OUTER_REMAINING
-                        .with(|c| c.get())
-                        .map_or(*arg_idx >= args.len(), |n| n == 0),
-                    0 => *arg_idx >= args.len(),
+                    0 if colon => {
+                        !colon_owner
+                            .expect("checked colon eligibility")
+                            .has_remaining
+                    }
+                    0 => !args.has_remaining(),
                     1 => vals[0] == 0,
                     2 => vals[0] == vals[1],
                     _ => vals[0] <= vals[1] && vals[1] <= vals[2],
                 };
                 if terminate {
-                    FORMAT_ESCAPE.with(|c| c.set(if colon { 2 } else { 1 }));
+                    if let Some(iteration) = colon_owner {
+                        return Err(FormatFlow::ExitColonIteration(iteration.owner));
+                    }
+                    FORMAT_ESCAPE.with(|c| c.set(1));
                     return Ok(());
                 }
             }
             '{' => {
-                // Find matching ~}
-                let body_start = i;
                 let body_end = find_matching_close(&chars, i, '{')?;
-                let mut body: String = chars[body_start..body_end].iter().collect();
-                // `~:}` runs the body at least once even over no arguments.
-                let at_least_once = {
-                    let mut k = body_end + 1;
-                    let mut found = false;
-                    while k < chars.len() && chars[k] != '}' {
-                        if chars[k] == ':' {
-                            found = true;
-                        }
-                        k += 1;
-                    }
-                    found
-                };
+                let mut body: String = chars[i..body_end].iter().collect();
+                let at_least_once =
+                    chars[body_end + 1..skip_close_directive(&chars, body_end)].contains(&':');
                 i = skip_close_directive(&chars, body_end);
-                // The prefix parameter of ~{ is the maximum iteration count; a
-                // NIL `v` argument means no limit (ansi format.{.33).
                 let count_given = match params.first() {
                     None | Some(Param::None) => false,
-                    Some(Param::V) => {
-                        let is_nil = args.get(*arg_idx).is_some_and(|v| v.is_nil());
-                        if is_nil {
-                            *arg_idx += 1;
-                        }
-                        !is_nil
+                    Some(Param::V) if args.peek().is_some_and(|value| value.is_nil()) => {
+                        let _ = next_format_argument(args, output)?;
+                        false
                     }
-                    Some(_) => true,
+                    _ => true,
                 };
-                let max_iter: Option<i64> = if count_given {
-                    Some(resolve_param(&params[0], 0, arg_idx)?)
+                let max_iter = if count_given {
+                    Some(resolve_param(&params[0], 0, output)?)
                 } else {
                     None
                 };
-                // An empty body takes the control -- a string or a FORMATTER
-                // function -- from the next argument (CLHS 22.3.7.4).
-                // Root the body FORMATTER function across the iteration calls
-                // below. Each run_iteration_body invokes Lisp and allocates (the
-                // nested format, its argument lists, the output string), so a
-                // relocating GC would leave an unrooted copy stale for the NEXT
-                // pass -- and the directive may iterate many times. Held as a
-                // EgclVal with NIL for "no function" because the root macros
-                // take a EgclVal, not an Option (bliss-gppm7).
-                let mut body_function: EgclVal = NIL;
-                egcl_rt::rooted_ref!(_body_function_root = &mut body_function);
+                let reached = |iterations: i64| max_iter.is_some_and(|limit| iterations >= limit);
+                let mut dynamic_string = false;
+                egcl_rt::rooted!(body_function = NIL);
                 if body.is_empty() {
-                    if *arg_idx >= args.len() {
-                        return Err(EgclError::ControlError("too few args for ~{~}".into()));
-                    }
-                    let control = args[*arg_idx];
-                    *arg_idx += 1;
-                    match extract_egcl_string(control) {
-                        Some(text) => {
-                            let normalized = fill_normalization::normalize(&text)?;
-                            control_validation::validate(&normalized)?;
-                            body = normalized.into_owned();
-                        }
-                        None => body_function = control,
+                    egcl_rt::rooted!(control = next_format_argument(args, output)?);
+                    if let Some(text) = extract_egcl_string(*control) {
+                        body = prepare_format_control_in_iteration(&text, colon)?.into_owned();
+                        dynamic_string = true;
+                    } else {
+                        *body_function = *control;
                     }
                 }
-                let reached = |n: i64| max_iter.is_some_and(|m| n >= m);
-                if at_sign && colon {
-                    // ~:@{ : each remaining argument is a sublist for one pass.
-                    let mut iters = 0i64;
-                    let saved_outer = OUTER_REMAINING.with(|c| c.get());
-                    if at_least_once && *arg_idx >= args.len() && !reached(0) {
-                        let mut sub_idx = 0;
-                        OUTER_REMAINING.with(|c| c.set(Some(0)));
-                        run_iteration_body(
+                if colon {
+                    let owner = FrameToken::fresh();
+                    // Each sublist is an independent argument continuation;
+                    // only extraction of that sublist consumes the parent POP.
+                    egcl_rt::rooted!(
+                        outer = if at_sign {
+                            args.clone()
+                        } else {
+                            let list = next_format_argument(args, output)?;
+                            Arguments::list(list)
+                        }
+                    );
+                    egcl_rt::rooted!(iterations_seen = IterationGuard::default());
+                    let mut iterations = 0i64;
+                    if at_least_once && !outer.has_remaining() && !reached(0) {
+                        egcl_rt::rooted!(empty = Arguments::values(&[]));
+                        let _outer = IterationScope::enter(Some(owner), false);
+                        match run_iteration_arguments(
                             &body,
-                            body_function_arg(body_function),
-                            &[],
-                            &mut sub_idx,
+                            body_function_arg(*body_function),
+                            &empty,
                             output,
-                        )?;
+                        ) {
+                            Ok(()) => {}
+                            Err(FormatFlow::ExitColonIteration(target)) if target == owner => {}
+                            Err(flow) => return Err(flow),
+                        }
                         take_escape();
                     }
-                    while *arg_idx < args.len() && !reached(iters) {
-                        let sub = args[*arg_idx];
-                        *arg_idx += 1;
-                        iters += 1;
-                        if !sub.is_nil() && !sub.is_cons() {
-                            return Err(EgclError::TypeError {
-                                datum: sub,
+                    while outer.has_remaining() && !reached(iterations) {
+                        if max_iter.is_none() {
+                            iterations_seen.check(&outer)?;
+                        }
+                        egcl_rt::rooted!(sublist = next_format_argument(&outer, output)?);
+                        if !sublist.is_nil() && !sublist.is_cons() {
+                            return Err(FormatFlow::Error(EgclError::TypeError {
+                                datum: *sublist,
                                 expected: "LIST".into(),
-                            });
+                            }));
                         }
-                        let sub_args = proper_list_elements(sub)?;
-                        let mut sub_idx = 0;
-                        OUTER_REMAINING.with(|c| c.set(Some(args.len() - *arg_idx)));
-                        run_iteration_body(
+                        egcl_rt::rooted!(sub = Arguments::list(*sublist));
+                        let _outer = IterationScope::enter(Some(owner), outer.has_remaining());
+                        match run_iteration_arguments(
                             &body,
-                            body_function_arg(body_function),
-                            &sub_args,
-                            &mut sub_idx,
+                            body_function_arg(*body_function),
+                            &sub,
                             output,
-                        )?;
-                        // `~^` ends this sublist's pass; `~:^` the iteration.
-                        if take_escape() == 2 {
-                            break;
+                        ) {
+                            Ok(()) => {}
+                            Err(FormatFlow::ExitColonIteration(target)) if target == owner => break,
+                            Err(flow) => return Err(flow),
                         }
+                        iterations += 1;
+                        take_escape();
                     }
-                    OUTER_REMAINING.with(|c| c.set(saved_outer));
-                } else if at_sign {
-                    // ~@{ : iterate over the remaining arguments themselves.
-                    let mut iters = 0i64;
-                    if at_least_once && *arg_idx >= args.len() && !reached(0) {
-                        run_iteration_body(
+                } else {
+                    egcl_rt::rooted!(
+                        items = if at_sign {
+                            if dynamic_string {
+                                args.without_logical_pop()
+                            } else {
+                                args.clone()
+                            }
+                        } else {
+                            let list = next_format_argument(args, output)?;
+                            Arguments::list(list)
+                        }
+                    );
+                    let _iteration = IterationScope::enter(None, false);
+                    egcl_rt::rooted!(iterations_seen = IterationGuard::default());
+                    let mut iterations = 0i64;
+                    if at_least_once && !items.has_remaining() && !reached(0) {
+                        run_iteration_arguments(
                             &body,
-                            body_function_arg(body_function),
-                            args,
-                            arg_idx,
+                            body_function_arg(*body_function),
+                            &items,
                             output,
                         )?;
                         take_escape();
                     }
-                    while *arg_idx < args.len() && !reached(iters) {
-                        let before = *arg_idx;
-                        run_iteration_body(
+                    while items.has_remaining() && !reached(iterations) {
+                        if max_iter.is_none() {
+                            iterations_seen.check(&items)?;
+                        }
+                        let before = items.position();
+                        run_iteration_arguments(
                             &body,
-                            body_function_arg(body_function),
-                            args,
-                            arg_idx,
+                            body_function_arg(*body_function),
+                            &items,
                             output,
                         )?;
+                        iterations += 1;
                         if take_escape() != 0 {
                             break;
                         }
-                        iters += 1;
-                        // A pass that consumed nothing would never end.
-                        if *arg_idx == before && max_iter.is_none() {
+                        if items.position() == before && max_iter.is_none() {
                             break;
-                        }
-                    }
-                } else if colon {
-                    // ~:{ : the argument is a list of sublists, one per pass.
-                    if *arg_idx >= args.len() {
-                        return Err(EgclError::ControlError("too few args for ~:{".into()));
-                    }
-                    let list_val = args[*arg_idx];
-                    *arg_idx += 1;
-                    if !list_val.is_nil() && !list_val.is_cons() {
-                        return Err(EgclError::TypeError {
-                            datum: list_val,
-                            expected: "LIST".into(),
-                        });
-                    }
-                    if list_val.is_nil() && at_least_once && !reached(0) {
-                        let saved_outer = OUTER_REMAINING.with(|c| c.get());
-                        OUTER_REMAINING.with(|c| c.set(Some(0)));
-                        let mut sub_idx = 0;
-                        run_iteration_body(
-                            &body,
-                            body_function_arg(body_function),
-                            &[],
-                            &mut sub_idx,
-                            output,
-                        )?;
-                        take_escape();
-                        OUTER_REMAINING.with(|c| c.set(saved_outer));
-                    }
-                    if !list_val.is_nil() {
-                        let mut sublists = proper_list_elements(list_val)?;
-                        egcl_rt::rooted_ref!(_sublists_root = &mut sublists);
-                        let saved_outer = OUTER_REMAINING.with(|c| c.get());
-                        for (iters, sublist) in sublists.iter().enumerate() {
-                            if reached(iters as i64) {
-                                break;
-                            }
-                            if !sublist.is_nil() && !sublist.is_cons() {
-                                return Err(EgclError::TypeError {
-                                    datum: *sublist,
-                                    expected: "LIST".into(),
-                                });
-                            }
-                            let sub_args = proper_list_elements(*sublist)?;
-                            let mut sub_idx = 0;
-                            OUTER_REMAINING.with(|c| c.set(Some(sublists.len() - iters - 1)));
-                            run_iteration_body(
-                                &body,
-                                body_function_arg(body_function),
-                                &sub_args,
-                                &mut sub_idx,
-                                output,
-                            )?;
-                            if take_escape() == 2 {
-                                break;
-                            }
-                        }
-                        OUTER_REMAINING.with(|c| c.set(saved_outer));
-                    }
-                } else {
-                    // ~{ : the argument is the list of arguments for the passes.
-                    if *arg_idx >= args.len() {
-                        return Err(EgclError::ControlError("too few args for ~{".into()));
-                    }
-                    let list_val = args[*arg_idx];
-                    *arg_idx += 1;
-                    if !list_val.is_nil() && !list_val.is_cons() {
-                        return Err(EgclError::TypeError {
-                            datum: list_val,
-                            expected: "LIST".into(),
-                        });
-                    }
-                    if list_val.is_nil() && at_least_once && !reached(0) {
-                        let mut sub_idx = 0;
-                        run_iteration_body(
-                            &body,
-                            body_function_arg(body_function),
-                            &[],
-                            &mut sub_idx,
-                            output,
-                        )?;
-                        take_escape();
-                    }
-                    if !list_val.is_nil() {
-                        let mut list_elements = proper_list_elements(list_val)?;
-                        egcl_rt::rooted_ref!(_list_elements_root = &mut list_elements);
-                        let mut sub_idx = 0;
-                        let mut iters = 0i64;
-                        while sub_idx < list_elements.len() && !reached(iters) {
-                            let before = sub_idx;
-                            run_iteration_body(
-                                &body,
-                                body_function_arg(body_function),
-                                &list_elements,
-                                &mut sub_idx,
-                                output,
-                            )?;
-                            if take_escape() != 0 {
-                                break;
-                            }
-                            iters += 1;
-                            // A pass that consumed nothing would never end.
-                            if sub_idx == before && max_iter.is_none() {
-                                break;
-                            }
                         }
                     }
                 }
             }
             '}' => {
-                return Err(EgclError::Internal("unmatched ~}".into()));
+                return Err(FormatFlow::Error(EgclError::Internal(
+                    "unmatched ~}".into(),
+                )));
             }
             '[' => {
                 let body_start = i;
@@ -5271,28 +5544,34 @@ fn format_impl(
                 let clauses = split_clauses(&body);
                 if colon {
                     // ~:[false~;true~] boolean conditional
-                    if *arg_idx >= args.len() {
-                        return Err(EgclError::ControlError("too few args for ~:[".into()));
+                    if !args.has_remaining() {
+                        return Err(FormatFlow::Error(EgclError::ControlError(
+                            "too few args for ~:[".into(),
+                        )));
                     }
-                    let val = args[*arg_idx];
-                    *arg_idx += 1;
+                    let val = next_format_argument(args, output)?;
                     let idx = if val.is_nil() { 0 } else { 1 };
                     if idx < clauses.len() {
-                        format_impl(&clauses[idx], args, arg_idx, output)?;
+                        format_arguments(&clauses[idx], args, output)?;
                     }
                 } else if at_sign {
                     // ~@[clause~] true-test
-                    if *arg_idx >= args.len() {
-                        return Err(EgclError::ControlError("too few args for ~@[".into()));
+                    if !args.has_remaining() {
+                        return Err(FormatFlow::Error(EgclError::ControlError(
+                            "too few args for ~@[".into(),
+                        )));
                     }
-                    let val = args[*arg_idx];
-                    if !val.is_nil() {
-                        // Don't consume arg - it remains for use inside clause
-                        if !clauses.is_empty() {
-                            format_impl(&clauses[0], args, arg_idx, output)?;
+                    let val = match args.pop_conditional_test()? {
+                        ArgumentStep::Value(value) => value,
+                        ArgumentStep::Exit { owner, marker } => {
+                            return Err(FormatFlow::ExitLogicalBlock(LogicalExit {
+                                owner,
+                                marker,
+                            }));
                         }
-                    } else {
-                        *arg_idx += 1; // consume the nil
+                    };
+                    if !val.is_nil() && !clauses.is_empty() {
+                        format_arguments(&clauses[0], args, output)?;
                     }
                 } else {
                     // Numeric conditional. An explicit prefix parameter (~n[ or
@@ -5305,29 +5584,30 @@ fn format_impl(
                     // (ansi format.cond.14): consume it and use the next
                     // argument as the selector.
                     let nil_v = matches!(params.first(), Some(Param::V))
-                        && args.get(*arg_idx).is_some_and(|v| v.is_nil());
+                        && args.peek().is_some_and(|v| v.is_nil());
                     if nil_v {
-                        *arg_idx += 1;
+                        let _ = next_format_argument(args, output)?;
                     }
                     let idx_i64 =
                         if !nil_v && params.first().is_some_and(|p| !matches!(p, Param::None)) {
-                            resolve_param(&params[0], 0, arg_idx)?
+                            resolve_param(&params[0], 0, output)?
                         } else {
-                            if *arg_idx >= args.len() {
-                                return Err(EgclError::ControlError("too few args for ~[".into()));
+                            if !args.has_remaining() {
+                                return Err(FormatFlow::Error(EgclError::ControlError(
+                                    "too few args for ~[".into(),
+                                )));
                             }
-                            let val = args[*arg_idx];
-                            *arg_idx += 1;
+                            let val = next_format_argument(args, output)?;
                             if val.is_fixnum() {
                                 val.as_fixnum()
                             } else if let Some((negative, _)) = integer_magnitude(val, 10) {
                                 // A bignum selects no clause (ansi format.cond.4).
                                 if negative { i64::MIN } else { i64::MAX }
                             } else {
-                                return Err(EgclError::TypeError {
+                                return Err(FormatFlow::Error(EgclError::TypeError {
                                     datum: val,
                                     expected: "integer".into(),
-                                });
+                                }));
                             }
                         };
                     // A negative selector wraps to a huge usize -> out of range ->
@@ -5341,12 +5621,14 @@ fn format_impl(
                         conditional_default_index(&body)
                     };
                     if let Some(c) = chosen {
-                        format_impl(&clauses[c], args, arg_idx, output)?;
+                        format_arguments(&clauses[c], args, output)?;
                     }
                 }
             }
             ']' => {
-                return Err(EgclError::Internal("unmatched ~]".into()));
+                return Err(FormatFlow::Error(EgclError::Internal(
+                    "unmatched ~]".into(),
+                )));
             }
             '(' => {
                 let body_start = i;
@@ -5357,7 +5639,7 @@ fn format_impl(
                     logical_body: output.logical_body,
                     ..LayoutDoc::default()
                 };
-                format_impl(&body, args, arg_idx, &mut inner)?;
+                let result = format_arguments(&body, args, &mut inner);
                 let mode = match (colon, at_sign) {
                     (true, true) => CaseMode::Upper,
                     (true, false) => CaseMode::CapitalizeWords,
@@ -5367,9 +5649,12 @@ fn format_impl(
                 output.events.push(LayoutEvent::CaseStart(mode));
                 output.events.extend(inner.into_events());
                 output.events.push(LayoutEvent::CaseEnd);
+                result?;
             }
             ')' => {
-                return Err(EgclError::Internal("unmatched ~)".into()));
+                return Err(FormatFlow::Error(EgclError::Internal(
+                    "unmatched ~)".into(),
+                )));
             }
             '<' => {
                 let body_start = i;
@@ -5428,67 +5713,31 @@ fn format_impl(
                     };
                     let prefix = format_const(&prefix)?;
                     let suffix = format_const(&suffix)?;
-                    if at_sign {
-                        let mut body_doc = LayoutDoc {
-                            logical_body: true,
-                            ..LayoutDoc::default()
-                        };
-                        format_impl(&body_seg, args, arg_idx, &mut body_doc)?;
-                        take_escape();
-                        output.events.push(LayoutEvent::Block {
-                            prefix: prefix.clone(),
-                            per_line_prefix: per_line_prefix.then_some(prefix),
-                            suffix,
-                            events: body_doc.into_events(),
-                        });
-                    } else {
-                        if *arg_idx >= args.len() {
-                            return Err(EgclError::ControlError("too few args for ~<".into()));
-                        }
-                        let val = args[*arg_idx];
-                        *arg_idx += 1;
-                        if val.is_cons() || val.is_nil() {
-                            let mut sub_args = cons_list_to_vec(val);
-                            egcl_rt::rooted_ref!(_sub_args_root = &mut sub_args);
-                            let mut sub_idx = 0;
-                            let mut body_doc = LayoutDoc {
-                                logical_body: true,
-                                ..LayoutDoc::default()
-                            };
-                            // One graph-wide table makes repeated elements share
-                            // labels across separate ~A/~S directives.
-                            circle_enter(val);
-                            let body_result =
-                                format_impl(&body_seg, &sub_args, &mut sub_idx, &mut body_doc);
-                            circle_exit();
-                            body_result?;
-                            take_escape();
-                            output.events.push(LayoutEvent::Block {
-                                prefix: prefix.clone(),
-                                per_line_prefix: per_line_prefix.then_some(prefix),
-                                suffix,
-                                events: body_doc.into_events(),
-                            });
-                        } else {
-                            output.text(&egclval_to_print_string(val, true));
-                        }
-                    }
+                    format_logical_arguments(
+                        &body_seg,
+                        args,
+                        output,
+                        prefix,
+                        suffix,
+                        per_line_prefix,
+                        at_sign,
+                    )?;
                 } else {
                     // Justification: ~mincol,colinc,minpad,padchar<...~>.
                     let mincol = params
                         .first()
-                        .map_or(Ok(0), |p| resolve_param(p, 0, arg_idx))?
+                        .map_or(Ok(0), |p| resolve_param(p, 0, output))?
                         .max(0) as usize;
                     let colinc = params
                         .get(1)
-                        .map_or(Ok(1), |p| resolve_param(p, 1, arg_idx))?
+                        .map_or(Ok(1), |p| resolve_param(p, 1, output))?
                         .max(1) as usize;
                     let minpad = params
                         .get(2)
-                        .map_or(Ok(0), |p| resolve_param(p, 0, arg_idx))?
+                        .map_or(Ok(0), |p| resolve_param(p, 0, output))?
                         .max(0) as usize;
                     let padchar = params.get(3).map_or(Ok(' '), |p| {
-                        resolve_param(p, ' ' as i64, arg_idx)
+                        resolve_param(p, ' ' as i64, output)
                             .map(|c| char::from_u32(c as u32).unwrap_or(' '))
                     })?;
                     let mut clauses = split_clauses(&body);
@@ -5500,7 +5749,7 @@ fn format_impl(
                     if overflow.is_some() && !clauses.is_empty() {
                         let first = clauses.remove(0);
                         let mut text = LayoutDoc::default();
-                        format_impl(&first, args, arg_idx, &mut text)?;
+                        format_arguments(&first, args, &mut text)?;
                         if take_escape() != 0 {
                             clauses.clear();
                         }
@@ -5509,7 +5758,7 @@ fn format_impl(
                     let mut parts = Vec::new();
                     for clause in &clauses {
                         let mut part = LayoutDoc::default();
-                        format_impl(clause, args, arg_idx, &mut part)?;
+                        format_arguments(clause, args, &mut part)?;
                         // `~^` in a segment discards that segment and ends the
                         // clause; the segments so far are justified.
                         if take_escape() != 0 {
@@ -5584,7 +5833,9 @@ fn format_impl(
                 }
             }
             '>' => {
-                return Err(EgclError::Internal("unmatched ~>".into()));
+                return Err(FormatFlow::Error(EgclError::Internal(
+                    "unmatched ~>".into(),
+                )));
             }
             '/' => {
                 // ~/name/ — call the function NAME names (CLHS 22.3.5.4) with
@@ -5603,44 +5854,48 @@ fn format_impl(
                 // Prefix parameters come first in the argument list, so a `v`
                 // parameter takes its value before the directive's own argument.
                 let mut param_vals: Vec<EgclVal> = Vec::with_capacity(params.len());
+                egcl_rt::rooted_ref!(_param_vals_root = &mut param_vals);
                 for p in &params {
                     param_vals.push(match p {
                         Param::Num(n) => EgclVal::from_fixnum(*n),
                         Param::Char(c) => EgclVal::from_char(*c),
                         Param::V => {
-                            if *arg_idx >= args.len() {
-                                return Err(EgclError::ControlError(
+                            if !args.has_remaining() {
+                                return Err(FormatFlow::Error(EgclError::ControlError(
                                     "too few args for V param".into(),
-                                ));
+                                )));
                             }
-                            let v = args[*arg_idx];
-                            *arg_idx += 1;
+                            let v = next_format_argument(args, output)?;
                             v
                         }
-                        Param::Hash => {
-                            EgclVal::from_fixnum(args.len().saturating_sub(*arg_idx) as i64)
-                        }
+                        Param::Hash => EgclVal::from_fixnum(
+                            i64::try_from(args.remaining_count()?).map_err(|_| {
+                                EgclError::ControlError(
+                                    "FORMAT argument count exceeds integer parameter range".into(),
+                                )
+                            })?,
+                        ),
                         Param::None => NIL,
                     });
                 }
-                if *arg_idx >= args.len() {
-                    return Err(EgclError::Internal(format!("too few args for ~/{}/", name)));
+                if !args.has_remaining() {
+                    return Err(FormatFlow::Error(EgclError::Internal(format!(
+                        "too few args for ~/{}/",
+                        name
+                    ))));
                 }
-                let arg = args[*arg_idx];
-                *arg_idx += 1;
+                egcl_rt::rooted!(arg = next_format_argument(args, output)?);
                 let Some(func) =
                     lookup_format_function(&name).or_else(|| format_function_designator(&name))
                 else {
-                    return Err(EgclError::UndefinedFunction(
+                    return Err(FormatFlow::Error(EgclError::UndefinedFunction(
                         egcl_compiler::reader::read_symbol_token(&name.to_uppercase())
                             .ok()
                             .flatten()
                             .unwrap_or_else(|| make_egcl_string(&name)),
-                    ));
+                    )));
                 };
                 egcl_rt::rooted!(func = func);
-                egcl_rt::rooted!(arg = arg);
-                egcl_rt::rooted_ref!(_param_vals_root = &mut param_vals);
                 let mut call_args: Vec<EgclVal> = Vec::with_capacity(3 + param_vals.len());
                 call_args.push(*arg);
                 call_args.push(if colon { T } else { NIL });
@@ -5665,10 +5920,10 @@ fn format_impl(
                 }
             }
             _ => {
-                return Err(EgclError::Internal(format!(
+                return Err(FormatFlow::Error(EgclError::Internal(format!(
                     "unknown format directive ~{}",
                     directive
-                )));
+                ))));
             }
         }
     }

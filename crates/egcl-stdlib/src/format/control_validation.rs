@@ -9,6 +9,7 @@ struct Frame {
     pretty: bool,
     overflow: bool,
     first_separator: Option<bool>,
+    iteration_colon: bool,
 }
 
 fn error(message: &str) -> EgclError {
@@ -19,6 +20,12 @@ fn error(message: &str) -> EgclError {
 /// string controls are checked separately, without merging their syntax into
 /// the caller's control. Parameters are inspected, never evaluated/consumed.
 pub(super) fn validate(control: &str) -> Result<(), EgclError> {
+    validate_with_iteration(control, false)
+}
+
+/// A supplied string control can inherit the current colon-iteration target.
+/// Every nested iteration overrides that eligibility with its OWN modifier.
+pub(super) fn validate_with_iteration(control: &str, caller_colon: bool) -> Result<(), EgclError> {
     let chars: Vec<char> = control.chars().collect();
     let mut frames = vec![Frame::default()];
     let mut cursor = 0;
@@ -66,6 +73,7 @@ pub(super) fn validate(control: &str) -> Result<(), EgclError> {
         match code {
             '<' | '(' | '[' | '{' => frames.push(Frame {
                 opener: Some(code),
+                iteration_colon: code == '{' && colon,
                 ..Frame::default()
             }),
             '>' | ')' | ']' | '}' => {
@@ -104,6 +112,16 @@ pub(super) fn validate(control: &str) -> Result<(), EgclError> {
                     frame.first_separator = Some(colon);
                 }
             }
+            '^' if colon => {
+                let allowed = frames
+                    .iter()
+                    .rev()
+                    .find(|frame| frame.opener == Some('{'))
+                    .map_or(caller_colon, |frame| frame.iteration_colon);
+                if !allowed {
+                    return Err(error("~:^ requires a current colon iteration"));
+                }
+            }
             'W' | 'I' | '_' => frames.last_mut().unwrap().pretty = true,
             'T' if colon => frames.last_mut().unwrap().pretty = true,
             _ => {}
@@ -124,6 +142,18 @@ pub(super) fn validate(control: &str) -> Result<(), EgclError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn colon_exit_eligibility_uses_the_current_iteration_and_private_entry_context() {
+        assert!(validate("~:^").is_err());
+        assert!(validate("~v:^").is_err());
+        assert!(validate("~:{~<~A~:^~:>Z~}").is_ok());
+        assert!(validate("~:{~{~A~:^~}Z~}").is_err());
+        assert!(validate_with_iteration("~A~:^", true).is_ok());
+        assert!(validate_with_iteration("~{~:^~}", true).is_err());
+        assert!(validate_with_iteration("~:{~:^~}", false).is_ok());
+        assert!(validate_with_iteration("~'~A~/|NOT~:^A~DIRECTIVE|/", false).is_ok());
+    }
 
     #[test]
     fn rejects_all_pretty_families_and_nested_overflow_independent_of_order() {

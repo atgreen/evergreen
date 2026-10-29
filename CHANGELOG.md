@@ -11,6 +11,12 @@
 
 ### Fixed
 
+- Logical FORMAT blocks preserve circular and shared argument tails for
+  `*PRINT-CIRCLE*` and `*PRINT-LENGTH*`, including nested indirection and
+  FORMATTER callbacks. Explicitly compiled formatter copies preserve their
+  independent state and support SETF function names
+  ([#888](https://github.com/atgreen/evergreen/pull/888)).
+
 - Delivery distinguishes application functions such as `MY-PARSER::READ`
   from Common Lisp code-opening operations, avoiding unnecessary whole-world
   retention while preserving actual builtin aliases
