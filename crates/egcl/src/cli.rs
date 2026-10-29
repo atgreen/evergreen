@@ -43283,9 +43283,7 @@ fn make_instance_plan_parts(
     generation: u64,
     env: &mut Env,
 ) -> Option<MakeInstancePlan> {
-    if runtime_class_definition(env, class).is_none() {
-        return None;
-    }
+    runtime_class_definition(env, class)?;
     let mut effective = runtime_class_slots(env, class);
     egcl_rt::rooted_ref!(_effective_root = &mut effective);
     if effective
