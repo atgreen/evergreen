@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- Direct synonym-stream reads and writes avoid lock-order failures while
+  retaining whole-operation ownership for bulk writes
+  ([#866](https://github.com/atgreen/evergreen/pull/866)).
+
 - Arrays and string-output streams preserve requested NIL element types,
   including adjustable and displaced storage, compiled files, and saved images
   ([#865](https://github.com/atgreen/evergreen/pull/865)).
