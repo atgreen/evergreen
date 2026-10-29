@@ -1290,8 +1290,9 @@ unsafe fn object_payload_offset(ptr: *const u8) -> usize {
 }
 
 /// Preserve empty multidimensional array metadata that #nA cannot encode.
-/// No elements are printed and no Lisp allocation is needed; the explicit
-/// dimensions also retain axes following a zero-length dimension.
+/// No elements are printed; explicit dimensions retain axes following a
+/// zero-length dimension. An unreadable result invokes the condition hook,
+/// which may allocate Lisp objects.
 pub fn readable_array_representation(value: EgclVal) -> Option<String> {
     if print_readably_active()
         && let Some(dimensions) = egcl_rt::types::md_array_dims(value)
