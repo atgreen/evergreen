@@ -96,6 +96,11 @@
 
 ### Changed
 
+- AArch64 T2 reads and writes vector elements inline instead of calling the
+  runtime, so `AREF`, `SVREF`, `ELT` and `(SETF AREF)` on simple vectors and
+  packed `(unsigned-byte 8)` arrays cost 30x to 43x less per access
+  ([#760](https://github.com/atgreen/evergreen/pull/760)).
+
 - Source closures inside unused lexical function bindings can enter tiered
   compilation, including generated string encoders and counters; closures that
   reference those bindings retain their lexical behavior
