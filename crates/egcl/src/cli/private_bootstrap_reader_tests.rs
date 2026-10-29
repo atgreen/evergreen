@@ -99,6 +99,20 @@ fn reader_keeps_defined_ordinary_helpers_but_isolates_private_bootstrap_names() 
             EgclVal::from_symbol_index(local)
         );
     }
+    // The documented image-control alias is an explicit compatibility case,
+    // separate from sharing ordinary private implementation helpers.
+    let save_core = reader::intern_symbol("%SAVE-CORE");
+    assert_eq!(
+        reader_symbol_resolver(Some("COMMON-LISP-USER"), "%SAVE-CORE"),
+        Some(save_core)
+    );
+    let foreign_save_core = reader_symbol_resolver(Some("PRIVATE-READER-FOREIGN"), "%SAVE-CORE")
+        .expect("foreign image-control spelling must intern locally");
+    assert_ne!(foreign_save_core, save_core);
+    assert_eq!(
+        egcl_rt::symbols::symbol_package(foreign_save_core),
+        Some(*foreign)
+    );
     // An intentional import is a real package binding and must win before the
     // private bootstrap compatibility rule. Import last: importing a homeless
     // symbol can establish its first home package.

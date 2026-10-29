@@ -15191,9 +15191,10 @@ fn reader_symbol_resolver(pkg: Option<&str>, name: &str) -> Option<u32> {
                     "SAVE-IMAGE" | "SAVE-LISP-AND-DIE" | "SAVE-IMAGE-AND-DIE" | "%SAVE-CORE"
                 );
                 (!cl_owns_name
-                    && private_bootstrap_name_accessible(&pkg_name, name)
                     && (pkg.is_none() || legacy_package)
-                    && (is_builtin_function(name) || (legacy_image_name && legacy_package)))
+                    && ((is_builtin_function(name)
+                        && private_bootstrap_name_accessible(&pkg_name, name))
+                        || (legacy_image_name && legacy_package)))
                     .then(|| EgclVal::from_symbol_index(egcl_rt::symbols::intern(name)))
             })
             .or_else(|| {
