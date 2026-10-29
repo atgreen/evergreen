@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- Compiled lexical bindings distinguish same-named uninterned symbols across
+  closures, portable compiled files, and saved images
+  ([#859](https://github.com/atgreen/evergreen/pull/859)).
+
 - `PRINC` and FORMAT aesthetic output expose the correct printer controls to
   callbacks and restore prior bindings across conditions and nonlocal transfers
   ([#836](https://github.com/atgreen/evergreen/pull/836)).
