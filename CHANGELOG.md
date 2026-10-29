@@ -77,7 +77,8 @@
   or reused, including anonymous classes and saved images
   ([#833](https://github.com/atgreen/evergreen/pull/833)).
 - Readable printing preserves the dimensions, element type, and adjustability
-  of empty multidimensional arrays, including dimensions following a zero axis
+  of empty multidimensional arrays, including dimensions following a zero axis.
+  Array constructors signal `PRINT-NOT-READABLE` when `*READ-EVAL*` is `NIL`
   ([#832](https://github.com/atgreen/evergreen/pull/832)).
 
 - `*PRINT-CIRCLE*` preserves shared arrays and uninterned symbols, and prints

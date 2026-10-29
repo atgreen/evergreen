@@ -639,6 +639,12 @@ pub fn print_readably_active() -> bool {
         .unwrap_or(false)
 }
 
+fn read_eval_active() -> bool {
+    egcl_rt::symbols::find_index("*READ-EVAL*")
+        .and_then(egcl_rt::symbols::symbol_value)
+        .is_none_or(|value| value != NIL)
+}
+
 /// `*PRINT-LENGTH*`: the max number of elements of a list/vector to print before
 /// `...`, or `None` (unbounded) when the variable is NIL/unset or
 /// *PRINT-READABLY* is true.
@@ -1298,6 +1304,9 @@ pub fn readable_array_representation(value: EgclVal) -> Option<String> {
             })
             .collect::<Option<Vec<_>>>()?;
         if dimensions.contains(&0) {
+            if !read_eval_active() {
+                return Some(print_not_readable(value));
+            }
             use crate::sequences::ArrayElementKind;
             let element_type = match crate::sequences::array_element_kind(value)? {
                 ArrayElementKind::General => "COMMON-LISP:T",
@@ -1334,6 +1343,9 @@ pub fn readable_array_representation(value: EgclVal) -> Option<String> {
 pub fn u8_readable_representation(value: EgclVal) -> Option<String> {
     if !print_readably_active() || !crate::sequences::is_u8_array(value) {
         return None;
+    }
+    if !read_eval_active() {
+        return Some(print_not_readable(value));
     }
     fn contents(value: EgclVal, dims: &[usize], index: &mut usize, out: &mut String) {
         if let Some((&length, rest)) = dims.split_first() {

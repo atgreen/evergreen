@@ -62,6 +62,49 @@ const PROGRAM: &str = r##"
   (assert (eq (row-major-aref copy 0) 'rank-zero-control)))
 (let ((*print-readably* t) (*print-array* nil))
   (assert (equal (read-from-string (prin1-to-string "text")) "text")))
+
+;; Read-time constructor syntax is unavailable when READ-EVAL is NIL.
+(dolist (pretty '(nil t))
+  (let ((*print-readably* t) (*read-eval* nil) (*print-pretty* pretty))
+    (dolist (array (list (make-array '(0 2))
+                        (make-array '(2 0 3) :element-type 'double-float)
+                        (make-array '(0 2) :element-type '(unsigned-byte 8))
+                        (make-array 3 :element-type '(unsigned-byte 8) :initial-element 7)))
+      (dolist (renderer (list #'empty-array-readable-text #'prin1-to-string
+                             (lambda (x) (format nil "~S" x))
+                             (lambda (x) (with-output-to-string (s) (write x :stream s)))
+                             (lambda (x) (write-to-string x :escape nil :readably t))
+                             (lambda (x) (write-to-string (list x x) :circle t))))
+        (let ((seen nil))
+          (assert
+            (handler-case
+                (handler-bind ((print-not-readable
+                                 (lambda (condition)
+                                   (assert (eq (print-not-readable-object condition) array))
+                                   (setq seen t))))
+                  (funcall renderer array) nil)
+              (print-not-readable (condition)
+                (assert (eq (print-not-readable-object condition) array)) t)))
+          (assert seen)))
+      (assert (= (read-from-string (prin1-to-string 42)) 42)))))
+;; Ordinary display does not require read-time evaluation.
+(let ((*print-readably* nil) (*read-eval* nil))
+  (assert (not (search "#." (write-to-string (make-array '(0 2))))))
+  (assert (not (search "#." (prin1-to-string (make-array 3 :element-type '(unsigned-byte 8) :initial-element 7))))))
+;; A user pretty-printer is consulted before the built-in constructor policy.
+(let ((*print-readably* t) (*read-eval* nil) (*print-pretty* t)
+      (*print-pprint-dispatch* (copy-pprint-dispatch nil))
+      (called nil) (array (make-array '(0 2))))
+  (set-pprint-dispatch 'array
+    (lambda (stream object)
+      (declare (ignore stream))
+      (setq called t)
+      (error 'print-not-readable :object object)))
+  (assert (handler-case (progn (prin1-to-string array) nil)
+            (print-not-readable (condition)
+              (assert (eq (print-not-readable-object condition) array)) t)))
+  (assert called))
+
 (write-line "EMPTY-ARRAY-READABLE-OK")
 "##;
 
