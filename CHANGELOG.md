@@ -142,6 +142,10 @@
   compile-time effects, preserving captured values and metadata registration
   ([#814](https://github.com/atgreen/evergreen/pull/814)).
 
+- Structure constructors and writers accept function-signature declarations
+  and their type aliases while preserving ordinary slot checks and correctable
+  type errors ([#812](https://github.com/atgreen/evergreen/pull/812)).
+
 - `DEFSTRUCT` reuses inherited symbols for generated accessors, constructors,
   copiers, and predicates, preserving calls through exported package interfaces
   ([#775](https://github.com/atgreen/evergreen/pull/775)).
