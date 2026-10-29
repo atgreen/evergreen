@@ -390,6 +390,12 @@ pub fn cmp_imm_w(n: Reg, value: u64) -> Option<u32> {
     addsub_imm(0x7100_0000, XZR, n, value)
 }
 
+/// `ADDS Xd, Xn, #value` — add setting the flags, so a `Cc::O` branch can
+/// read the signed overflow the plain [`add_imm`] does not report.
+pub fn adds_imm(d: Reg, n: Reg, value: u64) -> Option<u32> {
+    addsub_imm(0xB100_0000, d, n, value)
+}
+
 /// `SUBS Xd, Xn, #value`.
 pub fn subs_imm(d: Reg, n: Reg, value: u64) -> Option<u32> {
     addsub_imm(0xF100_0000, d, n, value)
@@ -433,6 +439,18 @@ pub fn msub(d: Reg, n: Reg, m: Reg, a: Reg) -> u32 {
 
 // ---------------------------------------------------------------------------
 // Divide
+
+/// `EXTR Xd, Xn, Xm, #lsb` — the 64-bit field starting at bit `lsb` of the
+/// 128-bit value `Xn:Xm`, i.e. `(Xn:Xm) >> lsb` truncated to 64 bits.
+///
+/// This is AArch64's answer to x86's `SHRD`: shift `Xm` right by `lsb` while
+/// feeding the vacated high bits from `Xn`. The octet-store kernel uses it to
+/// walk a 64-bit magnitude one byte at a time while the sign extension streams
+/// in from above, so a partial span writes the same bytes a full one would.
+pub fn extr(d: Reg, n: Reg, m: Reg, lsb: u32) -> u32 {
+    debug_assert!(lsb < 64, "EXTR's lsb field holds six bits");
+    0x93C0_0000 | ((m as u32) << 16) | (lsb << 10) | ((n as u32) << 5) | d as u32
+}
 
 /// `SDIV Xd, Xn, Xm` — signed divide, truncating toward zero.
 ///
@@ -1033,6 +1051,10 @@ mod tests {
             ("msub x1, x2, x3, x4", 0x9B039041, msub(1, 2, 3, 4)),
             ("msub x0, x2, x1, x0", 0x9B018040, msub(0, 2, 1, 0)),
             ("sdiv x1, x2, x3", 0x9AC30C41, sdiv(1, 2, 3)),
+            ("extr x0, x1, x0, #8", 0x93C02020, extr(0, 1, 0, 8)),
+            ("adds x2, x6, #64", 0xB10100C2, adds_imm(2, 6, 64).unwrap()),
+            ("adds x0, x1, #4095", 0xB13FFC20, adds_imm(0, 1, 4095).unwrap()),
+            ("extr x10, x11, x10, #8", 0x93CA216A, extr(10, 11, 10, 8)),
             ("sdiv x5, x4, x9", 0x9AC90C85, sdiv(5, 4, 9)),
             (
                 "cmp x5, x2, asr #63",

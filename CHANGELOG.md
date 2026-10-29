@@ -196,6 +196,10 @@
   price of a fixnum shift to 3x
   ([#840](https://github.com/atgreen/evergreen/pull/840)).
 
+- AArch64 T2 writes a fused integer-to-octet loop as one wide store instead of
+  calling the runtime per byte, measuring 1.09x on the loop it replaces
+  ([#854](https://github.com/atgreen/evergreen/pull/854)).
+
 - AArch64 T2 reads and writes vector elements inline instead of calling the
   runtime, so `AREF`, `SVREF`, `ELT` and `(SETF AREF)` on simple vectors and
   packed `(unsigned-byte 8)` arrays cost 30x to 43x less per access

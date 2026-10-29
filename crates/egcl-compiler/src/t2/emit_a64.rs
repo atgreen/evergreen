@@ -149,6 +149,26 @@ const T1: a64::Reg = 3;
 const ADDR: a64::Reg = 16;
 /// Holds the frame-slots pointer for the whole body.
 const SLOTS: a64::Reg = 28;
+/// Extra scratch for the octet-store kernel, which needs more live values at
+/// once than W0/W1/T0/T1 can hold.
+///
+/// x4-x12 are caller-saved under AAPCS64 and sit outside the allocator pool
+/// (x19-x27), so no value home can ever live there. That is only safe because
+/// the kernel is CALL-FREE and contains no safepoint: nothing can observe or
+/// clobber them between entry and exit. The x86 emitter spills the same values
+/// to an RSP-relative frame because it has two scratch registers to work with;
+/// here the registers are simply available, which is why this arm is shorter
+/// than its x86 counterpart rather than longer.
+const K_INT: a64::Reg = 4;
+const K_END: a64::Reg = 5;
+const K_START: a64::Reg = 6;
+const K_ARRAY: a64::Reg = 7;
+const K_WORD: a64::Reg = 8;
+const K_HIGH: a64::Reg = 9;
+const K_SLOT: a64::Reg = 10;
+const K_FLAG: a64::Reg = 11;
+const K_FINAL: a64::Reg = 12;
+
 /// Working float registers.
 const F0: a64::Fpr = 0;
 const F1: a64::Fpr = 1;
@@ -1380,6 +1400,231 @@ impl Emitter<'_> {
         self.store(data.results[0], W1)
     }
 
+    /// `TryStoreIntegerOctets8` / `TryStoreIntegerOctets1To8`: store the low
+    /// octets of an integer into a packed `(unsigned-byte 8)` array as ONE wide
+    /// write, replacing the counted byte loop `octet_word_fusion` found.
+    ///
+    /// Two results: `results[0]` is T or NIL and `results[1]` the integer
+    /// shifted past the bytes consumed. Success-only -- it never deopts and
+    /// never signals; anything it cannot prove answers NIL and the retained
+    /// scalar loop runs.
+    ///
+    /// Only the two opcodes `octet_word_fusion` itself produces are handled.
+    /// The `Layout` and `Extent` variants, and the `PackedU8*` family, come
+    /// from `array_layout` and `allocation_extent`, which run only on the
+    /// mapped path -- so a checked-ABI target never sees them and this arm does
+    /// not carry their branches.
+    ///
+    /// The integer decode is the delicate half. A fixnum untags and sign
+    /// extends. A one-limb bignum must be CANONICAL: a positive magnitude is
+    /// at least 2^60 and a negative one strictly greater than `abs(MIN-FIXNUM)`,
+    /// because anything smaller would have been a fixnum. A negative magnitude
+    /// is negated, which modulo 2^64 yields exactly the low two's-complement
+    /// octets the store wants.
+    fn try_store_integer_octets(&mut self, data: &InstData) -> Result<(), EmitError> {
+        use egcl_rt::object::{type_id, ElementTypeTag};
+        // `...1To8` admits a span of 1..=8 bytes; `...8` is exactly eight.
+        let partial = data.opcode == Opcode::TryStoreIntegerOctets1To8;
+        if !matches!(
+            data.opcode,
+            Opcode::TryStoreIntegerOctets8 | Opcode::TryStoreIntegerOctets1To8
+        ) || data.args.len() != 4
+            || data.results.len() != 2
+            || !matches!(data.aux, AuxData::None)
+            || data.flags
+                != (crate::t2::ir::InstFlags {
+                    effectful: true,
+                    ..Default::default()
+                })
+            || data.frame_state.is_some()
+            || !data.targets.is_empty()
+            || data
+                .args
+                .iter()
+                .chain(&data.results)
+                .any(|&v| self.function.value(v).repr != ValueRepresentation::Tagged)
+        {
+            return Err(EmitError::UnsupportedOp(op_tag(data.opcode)));
+        }
+        // Operands into their own registers once, before anything else: `load`
+        // of a heap constant goes through ADDR, so no address may be live yet.
+        self.load(data.args[0], K_ARRAY)?;
+        self.load(data.args[1], K_START)?;
+        self.load(data.args[2], K_END)?;
+        self.load(data.args[3], K_INT)?;
+
+        let failed = self.asm.label();
+        let fixnum = self.asm.label();
+        let positive = self.asm.label();
+        let negative = self.asm.label();
+        let decoded = self.asm.label();
+        let short = self.asm.label();
+        let done = self.asm.label();
+
+        // ---- decode the integer into K_WORD (low 64 bits) and K_HIGH (the
+        // tagged ASH-by-64 remainder, i.e. 0 or -8 for one limb) ----
+        self.asm
+            .word(a64::and_imm(T0, K_INT, 7).expect("7 is a logical immediate"));
+        self.compare_imm(T0, 0);
+        self.asm.jcc(Cc::E, fixnum);
+        self.compare_imm(T0, egcl_rt::value::TAG_HEAP_OBJECT);
+        self.asm.jcc(Cc::Ne, failed);
+        self.asm
+            .word(a64::and_imm(T1, K_INT, !7u64).expect("!7 is a logical immediate"));
+        self.asm
+            .word(a64::ldrb_imm(T0, T1, 7).expect("7 fits the byte-form offset"));
+        self.compare_imm(T0, u64::from(type_id::BIGNUM));
+        self.asm.jcc(Cc::Ne, failed);
+        self.asm
+            .word(a64::ldr_w_imm(T0, T1, 12).expect("12 fits the word-form offset"));
+        self.compare_imm(T0, 1);
+        self.asm.jcc(Cc::Ne, failed);
+        self.asm
+            .word(a64::ldr_w_imm(T0, T1, 8).expect("8 fits the word-form offset"));
+        self.compare_imm(T0, 1);
+        self.asm.jcc(Cc::E, positive);
+        // sign is an i32 read zero-extended, so -1 arrives as 0xFFFFFFFF.
+        self.imm(W1, u64::from(u32::MAX));
+        self.compare(T0, W1);
+        self.asm.jcc(Cc::Ne, failed);
+        self.load_at(K_WORD, T1, 16)?;
+        // A canonical negative magnitude exceeds abs(MIN-FIXNUM) = 2^60;
+        // anything at or below it would have been a fixnum. Compare the top
+        // nibble first so a full unsigned magnitude stays signed-safe.
+        self.asm.word(a64::lsr_imm(T0, K_WORD, 60));
+        self.compare_imm(T0, 1);
+        self.asm.jcc(Cc::L, failed);
+        self.asm.jcc(Cc::G, negative);
+        self.imm(W1, 1u64 << 60);
+        self.compare(K_WORD, W1);
+        self.asm.jcc(Cc::E, failed);
+        self.asm.bind(negative);
+        // Negating modulo 2^64 gives exactly the low two's-complement octets.
+        self.asm.word(a64::neg(K_WORD, K_WORD));
+        self.imm(K_HIGH, (-8i64) as u64);
+        self.asm.jmp(decoded);
+        self.asm.bind(positive);
+        self.load_at(K_WORD, T1, 16)?;
+        self.asm.word(a64::lsr_imm(T0, K_WORD, 60));
+        self.compare_imm(T0, 0);
+        self.asm.jcc(Cc::E, failed);
+        self.imm(K_HIGH, 0);
+        self.asm.jmp(decoded);
+        self.asm.bind(fixnum);
+        self.asm.word(a64::asr_imm(K_WORD, K_INT, 3));
+        // The tagged ASH-by-64 result of a fixnum is its sign: 0 or -8.
+        self.asm.word(a64::asr_imm(K_HIGH, K_WORD, 63));
+        self.asm.word(a64::lsl_imm(K_HIGH, K_HIGH, 3));
+        self.asm.bind(decoded);
+
+        // ---- prove the array is a packed U8 body, leaving K_SLOT at its
+        // metadata word ----
+        self.asm
+            .word(a64::and_imm(T0, K_ARRAY, 7).expect("7 is a logical immediate"));
+        self.compare_imm(T0, egcl_rt::value::TAG_HEAP_OBJECT);
+        self.asm.jcc(Cc::Ne, failed);
+        self.asm
+            .word(a64::and_imm(K_SLOT, K_ARRAY, !7u64).expect("!7 is a logical immediate"));
+        self.asm
+            .word(a64::ldrb_imm(T0, K_SLOT, 7).expect("7 fits the byte-form offset"));
+        self.compare_imm(T0, u64::from(type_id::SIMPLE_ARRAY));
+        self.asm.jcc(Cc::Ne, failed);
+        let small = self.asm.label();
+        let body = self.asm.label();
+        self.asm
+            .word(a64::ldrh_imm(T0, K_SLOT, 0).expect("0 fits the halfword-form offset"));
+        // 0xFFFF cannot be a CMP immediate; T1 is the scratch because K_SLOT is
+        // live and `compare_imm` would route through ADDR.
+        self.compare_imm_using(T0, 0xFFFF, T1);
+        self.asm.jcc(Cc::Ne, small);
+        self.asm
+            .word(a64::add_imm(K_SLOT, K_SLOT, 16).expect("16 fits the immediate field"));
+        self.asm.jmp(body);
+        self.asm.bind(small);
+        self.asm
+            .word(a64::add_imm(K_SLOT, K_SLOT, 8).expect("8 fits the immediate field"));
+        self.asm.bind(body);
+        self.asm
+            .word(a64::ldrb_imm(T0, K_SLOT, 0).expect("0 fits the byte-form offset"));
+        self.compare_imm(T0, u64::from(ElementTypeTag::U8 as u8));
+        self.asm.jcc(Cc::Ne, failed);
+
+        // ---- the span: start a nonnegative fixnum, end a fixnum, and
+        // end == start + 8 for the wide store ----
+        self.asm
+            .word(a64::tst_imm(K_START, 7).expect("7 is a logical immediate"));
+        self.asm.jcc(Cc::Ne, failed);
+        self.compare_imm(K_START, 0);
+        self.asm.jcc(Cc::L, failed);
+        self.asm
+            .word(a64::tst_imm(K_END, 7).expect("7 is a logical immediate"));
+        self.asm.jcc(Cc::Ne, failed);
+        // start + 8 in the TAGGED domain, overflow-checked as the x86 arm does.
+        self.asm.word(a64::adds_imm(T0, K_START, 8 << 3).ok_or(unsupported!())?);
+        self.asm.jcc(Cc::O, failed);
+        self.compare(K_END, T0);
+        self.asm.jcc(Cc::Ne, if partial { short } else { failed });
+        // end (raw) must not exceed the stored length.
+        self.asm.word(a64::asr_imm(T0, K_END, 3));
+        self.load_at(T1, K_SLOT, 8)?;
+        self.compare(T0, T1);
+        self.asm.jcc(Cc::G, failed);
+        // The byte cursor: body + 16 + raw start.
+        self.asm.word(a64::asr_imm(T0, K_START, 3));
+        self.asm
+            .word(a64::add_imm(ADDR, K_SLOT, 16).expect("16 fits the immediate field"));
+        self.asm.word(a64::add(ADDR, ADDR, T0));
+        // ONE unaligned little-endian 64-bit write. AArch64 permits unaligned
+        // normal-memory accesses and is little-endian on Linux, so this is the
+        // same single store the x86 kernel makes. No failure edge and no
+        // safepoint remains after it, into an UNTRACED byte payload.
+        self.store_at(K_WORD, ADDR, 0)?;
+        self.imm(K_FLAG, T.0);
+        self.mov(K_FINAL, K_HIGH);
+        self.asm.jmp(done);
+
+        if partial {
+            // A span of 1..=7 bytes: walk them, streaming the sign extension
+            // in from above with EXTR, which is what x86 uses SHRD for.
+            self.asm.bind(short);
+            self.compare(K_END, K_START);
+            self.asm.jcc(Cc::Le, failed);
+            self.asm.word(a64::sub(T0, K_END, K_START));
+            self.compare_imm(T0, 7 << 3);
+            self.asm.jcc(Cc::G, failed);
+            self.asm.word(a64::asr_imm(T1, K_END, 3));
+            self.load_at(W1, K_SLOT, 8)?;
+            self.compare(T1, W1);
+            self.asm.jcc(Cc::G, failed);
+            self.asm.word(a64::asr_imm(T1, K_START, 3));
+            self.asm
+                .word(a64::add_imm(ADDR, K_SLOT, 16).expect("16 fits the immediate field"));
+            self.asm.word(a64::add(ADDR, ADDR, T1));
+            // T0 counts remaining bytes, tagged; K_HIGH feeds the high word.
+            self.asm.word(a64::asr_imm(W1, K_HIGH, 3));
+            let again = self.asm.label();
+            self.asm.bind(again);
+            self.asm
+                .word(a64::strb_imm(K_WORD, ADDR, 0).expect("0 fits the byte-form offset"));
+            self.asm.word(a64::extr(K_WORD, W1, K_WORD, 8));
+            self.asm
+                .word(a64::add_imm(ADDR, ADDR, 1).expect("1 fits the immediate field"));
+            self.asm.word(a64::subs_imm(T0, T0, 8).ok_or(unsupported!())?);
+            self.asm.jcc(Cc::Ne, again);
+            // Any canonical one-limb integer shifted right by 8 fits a fixnum.
+            self.asm.word(a64::lsl_imm(K_FINAL, K_WORD, 3));
+            self.imm(K_FLAG, T.0);
+            self.asm.jmp(done);
+        }
+
+        self.asm.bind(failed);
+        self.imm(K_FLAG, NIL.0);
+        self.imm(K_FINAL, 0);
+        self.asm.bind(done);
+        self.store(data.results[1], K_FINAL)?;
+        self.store(data.results[0], K_FLAG)
+    }
+
     // ── control flow ─────────────────────────────────────────────
 
     fn edge(&mut self, edge: &BlockCall) -> Result<(), EmitError> {
@@ -1570,6 +1815,28 @@ impl Emitter<'_> {
                     } else {
                         self.runtime.environment.load
                     }
+                }
+                // "Explicit block-entry poll around a bounded straight-line
+                // replacement": the poll a fused kernel inherits from the loop
+                // it replaced, which must still be reached even though the
+                // back edge is gone. This emitter already routes every
+                // back-edge poll through `runtime_call(_, None)` and the same
+                // `poll` adapter with full root synchronisation, so the
+                // explicit form is that same call -- it simply arrives as an
+                // opcode rather than as a terminator.
+                //
+                // Without this arm `octet_word_fusion` produced a kernel whose
+                // poll nothing could emit, and the function declined: measured
+                // at 40x SLOWER than leaving the pass off, because the whole
+                // body fell back to T1.
+                Opcode::NativePoll => {
+                    if !data.args.is_empty() || !data.results.is_empty() {
+                        return Err(unsupported!());
+                    }
+                    if self.runtime.poll == 0 {
+                        return Err(unsupported!());
+                    }
+                    self.runtime.poll
                 }
                 Opcode::ClearMv => {
                     self.imm(W0, NIL.0);
@@ -1825,6 +2092,9 @@ impl Emitter<'_> {
             StringCharOrNil => return self.string_char_or_nil(data),
             IntegerLowBits => return self.integer_low_bits(data),
             TryIntegerShr => return self.try_integer_shr(data),
+            TryStoreIntegerOctets8 | TryStoreIntegerOctets1To8 => {
+                return self.try_store_integer_octets(data);
+            }
             VecRef | VecSet | ArrayReadDiscarded => return self.element_access(data),
             Jump if data.targets.len() == 1 => return self.edge(&data.targets[0]),
             Brif if data.args.len() == 1 && data.targets.len() == 2 => {
