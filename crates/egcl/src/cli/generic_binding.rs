@@ -7,8 +7,12 @@
 use super::*;
 
 fn cached_wrapper_is(name: &str, function: EgclVal) -> bool {
+    let Some(cached) = generic_wrapper_cache().borrow().values.get(name).copied() else {
+        return false;
+    };
+    let cached = reified_closure(cached).unwrap_or(cached);
     let function = reified_closure(function).unwrap_or(function);
-    generic_wrapper_cache().borrow().values.get(name).copied() == Some(function)
+    cached == function
 }
 
 fn name_index(name: &str) -> Option<u32> {

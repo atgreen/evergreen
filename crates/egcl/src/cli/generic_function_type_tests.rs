@@ -12,8 +12,10 @@ fn raw_and_reified_generic_wrappers_have_the_same_semantic_types() {
     egcl_rt::rooted_ref!(_env = &mut env);
     read_eval_all_env("(defgeneric gf801-unit (object))", &mut env).unwrap();
     let name = resolve_sym("GF801-UNIT").unwrap();
-    egcl_rt::rooted!(source = generic_fn_wrapper(&mut env, name, "GF801-UNIT"));
-    egcl_rt::rooted!(function = coerce_installed_function(&env, *source));
+    egcl_rt::rooted!(function = generic_fn_wrapper(&mut env, name, "GF801-UNIT"));
+    egcl_rt::rooted!(source = reified_closure(*function).expect("legacy source closure"));
+    assert!(source.is_cons());
+    assert!(egcl_rt::function::is_interpreted_function(*function));
     assert!(reified_closure(*function).is_some());
     egcl_rt::rooted!(metadata = env.generics.borrow()["GF801-UNIT"].generic_function);
     assert!(

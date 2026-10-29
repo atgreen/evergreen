@@ -21494,18 +21494,27 @@ fn builtin_fn_wrapper(env: &mut Env, name_sym: EgclVal, bare: &str) -> EgclVal {
 // The private operator makes retained dispatch explicit in the serialized body;
 // unlike an ordinary APPLY wrapper it survives public unbinding after restore.
 fn generic_fn_wrapper(env: &mut Env, name_sym: EgclVal, name: &str) -> EgclVal {
+    let cached = generic_wrapper_cache().borrow().values.get(name).copied();
+    if let Some(cached) = cached
+        && egcl_rt::function::is_interpreted_function(cached)
     {
-        let cache = generic_wrapper_cache().borrow();
-        if let Some(reference) = cache.values.get(name).copied() {
-            return reference;
-        }
+        return cached;
     }
-    egcl_rt::rooted!(v = named_apply_wrapper(env, name_sym, true));
+    // Legacy cache values need the same normalization as newly built wrappers.
+    // Drop the cache borrow and root the source before reification can collect.
+    egcl_rt::rooted!(original = cached.unwrap_or_else(|| named_apply_wrapper(env, name_sym, true)));
+    egcl_rt::rooted!(canonical = coerce_installed_function(env, *original));
     let mut cache = generic_wrapper_cache().borrow_mut();
-    let winner = *cache.values.entry(name.to_string()).or_insert(*v);
+    let entry = cache.values.entry(name.to_string()).or_insert(*canonical);
+    if *entry == *original {
+        *entry = *canonical;
+    }
+    // A competing normalizer may have published the canonical winner already.
+    let winner = *entry;
+    let source = reified_closure(winner).expect("generic source closure");
     cache
         .names
-        .insert(cp(winner).1.as_fixnum() as u64, name.to_string());
+        .insert(cp(source).1.as_fixnum() as u64, name.to_string());
     winner
 }
 
@@ -21513,6 +21522,7 @@ fn generic_fn_wrapper(env: &mut Env, name_sym: EgclVal, name: &str) -> EgclVal {
 /// wrappers dispatch through the method registry directly, so replacing the
 /// symbol's function cell cannot redirect a previously retained wrapper.
 fn generic_wrapper_name(v: EgclVal) -> Option<String> {
+    let v = reified_closure(v).unwrap_or(v);
     if !v.is_cons() {
         return None;
     }
@@ -21636,6 +21646,12 @@ fn symbol_function_object_ex(
     }
     if generic_binding::undefined(&fn_name) {
         return None;
+    }
+    // A live generic definition takes precedence over the builtin inventory.
+    // Keep actual installed replacements above this check: a retained generic
+    // must not make an ordinary replacement look like a generic function.
+    if generic_binding::current(&fn_name) {
+        return Some(generic_fn_wrapper(env, name_sym, &fn_name));
     }
     if is_builtin_function(&fn_name) {
         // Cached bare name too, and only on the branch that needs it.
@@ -51427,3 +51443,6 @@ mod class_identity_tests;
 
 #[cfg(test)]
 mod generic_function_type_tests;
+
+#[cfg(test)]
+mod generic_wrapper_identity_tests;
