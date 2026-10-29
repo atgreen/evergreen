@@ -1,5 +1,7 @@
 {
   "fast": {
+    "egcl:test:print_circle_graph_cli": [""],
+    "egcl-stdlib:test:pprint_circle_gc": [""],
     "egcl:test:definition_function_scope_cli": [""],
     "egcl:test:lambda_init_declaration_scope_cli": [""],
     "egcl-stdlib:test:test_packages": ["package_lifecycle_retires_owned_keys_and_preserves_retained_symbol_cells"],

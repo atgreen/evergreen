@@ -55,4 +55,17 @@ fn nested_circle_tables_relocate_and_restore_the_enclosing_graph() {
     assert!(!circle_active());
     circle_exit();
     assert!(!circle_active());
+
+    // Heap-object tags must survive tracing just as cons tags do. A vector
+    // cycle is counted at top level and its assigned label follows relocation.
+    egcl_rt::rooted!(vector = egcl_stdlib::sequences::build_simple_vector(&[egcl_rt::value::NIL]));
+    egcl_stdlib::sequences::set_svref(*vector, 0, *vector).unwrap();
+    let before = *vector;
+    circle_enter(*vector);
+    assert!(matches!(circle_visit(*vector), CircleMark::First(1)));
+    egcl_rt::collect_t0_minor().unwrap();
+    assert_ne!(*vector, before, "vector graph must actually relocate");
+    assert!(matches!(circle_visit(*vector), CircleMark::Repeat(1)));
+    circle_exit();
+    assert!(!circle_active());
 }
