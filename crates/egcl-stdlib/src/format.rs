@@ -25,6 +25,50 @@ pub fn set_print_object_hook(hook: Option<PrintObjectHook>) {
     *PRINT_OBJECT_HOOK.lock().unwrap() = hook;
 }
 
+/// The host condition system supplies PRINT-NOT-READABLE and propagates it at
+/// the public printing boundary. No Lisp values are stored in this hook.
+pub type PrintNotReadableHook = fn(EgclVal);
+static PRINT_NOT_READABLE_HOOK: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+pub fn set_print_not_readable_hook(hook: Option<PrintNotReadableHook>) {
+    PRINT_NOT_READABLE_HOOK.store(
+        hook.map_or(0, |hook| hook as usize),
+        std::sync::atomic::Ordering::Release,
+    );
+}
+
+/// Returns only partial output: an installed host MUST propagate the parked
+/// condition before reporting a successful print. Bare Rust printers without
+/// a condition hook cannot provide Lisp condition signalling.
+pub fn print_not_readable(value: EgclVal) -> String {
+    let hook = PRINT_NOT_READABLE_HOOK.load(std::sync::atomic::Ordering::Acquire);
+    if hook != 0 {
+        let hook: PrintNotReadableHook = unsafe { std::mem::transmute(hook) };
+        hook(value);
+    }
+    String::new()
+}
+
+/// Shared pathname policy for stream and string printers. A namestring is
+/// readable only if reparsing preserves its components; dotfiles make the
+/// missing-name/nonempty-type case ambiguous.
+pub fn pathname_representation(value: EgclVal, escape: bool) -> Option<String> {
+    let (text, faithful) = crate::pathnames::printed_namestring(value)?;
+    if print_readably_active() && !faithful {
+        egcl_rt::rooted!(value = value);
+        if let Some(rendered) = dispatch_print_object(*value, true) {
+            return Some(rendered);
+        }
+        return Some(print_not_readable(*value));
+    }
+    Some(if escape || print_readably_active() {
+        format!("#P\"{}\"", escape_string_body(&text))
+    } else {
+        text
+    })
+}
+
 /// Structural nesting depth for *PRINT-LEVEL* (0 at the top level).
 /// Incremented around each list body; balanced, so it returns to 0.
 static PRINT_DEPTH: egcl_rt::execution_local::ExecutionLocal<std::cell::Cell<usize>> =
@@ -1960,24 +2004,8 @@ fn egclval_to_print_body(mut v: EgclVal, escapep: bool) -> String {
         return s;
     }
     if v.is_heap_object() {
-        // Pathnames are registry-backed pseudo-heap values: render via their
-        // namestring rather than falling through to `#<heap-object>` (which is
-        // what a MERGE-PATHNAMES / MAKE-PATHNAME result — not separately string-
-        // interned — used to show, e.g. ocicl's "; loading ~A" messages).
-        if crate::pathnames::is_pathname(v) {
-            if let Ok(ns) = crate::pathnames::namestring(v) {
-                if let Some(s) = extract_egcl_string(ns) {
-                    // Match cli's print_val: `#P"namestring"` under prin1/~S so
-                    // it reads back as an EQUAL pathname (ansi
-                    // pathnames-print-and-read-properly), bare namestring under
-                    // princ/~A.
-                    return if escapep {
-                        format!("#P\"{}\"", escape_string_body(&s))
-                    } else {
-                        s
-                    };
-                }
-            }
+        if let Some(text) = pathname_representation(v, escapep) {
+            return text;
         }
         // Check if it's a string and extract its content. This runs BEFORE the
         // number check because a registered-string sentinel is a pseudo-heap
