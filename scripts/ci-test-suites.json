@@ -1,6 +1,7 @@
 {
   "fast": {
     "egcl:test:generic_dispatch_cache_cli": [""],
+    "egcl:test:condition_slot_metadata_cli": [""],
     "egcl:test:toplevel_local_callbacks_cli": [""],
     "egcl:test:format_slash_lookup_cli": [""],
     "egcl:test:method_continuations_cli": [""],

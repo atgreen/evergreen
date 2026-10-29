@@ -21,6 +21,11 @@
   applicability across alternating calls
   ([#908](https://github.com/atgreen/evergreen/pull/908)).
 
+- AMOP introspection preserves runtime-defined class slot declarations, so
+  finalizing standard condition metadata no longer removes slots used by
+  condition readers such as `TYPE-ERROR-DATUM` and `CELL-ERROR-NAME`
+  ([#907](https://github.com/atgreen/evergreen/pull/907)).
+
 - Macro-generated callback captures retain stable identities across top-level
   boxing retries, including private gensyms and lexical macro scopes
   ([#906](https://github.com/atgreen/evergreen/pull/906)).
