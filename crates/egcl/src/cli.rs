@@ -26981,9 +26981,25 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             "DEFINE-SETF-EXPANDER" => return eval_define_setf_expander(cdr, env),
             "GET-SETF-EXPANSION" => {
                 // (get-setf-expansion place &optional environment) → five values.
-                let (place_form, _) = cp(cdr);
-                let place = eval_form(place_form, env)?;
-                let mut ex = get_setf_expansion(place, env)?;
+                let (place_form, rest) = cp(cdr);
+                egcl_rt::rooted!(rest = rest);
+                egcl_rt::rooted!(place = eval_form(place_form, env)?);
+                let macro_env = if rest.is_cons() {
+                    egcl_rt::rooted!(environment = eval_form(cp(*rest).0, env)?);
+                    if environment.is_nil() {
+                        macroexpand_global_environment()
+                    } else {
+                        load_macroexpand_environment(*environment).ok_or_else(|| {
+                            EgclError::ProgramError(
+                                "GET-SETF-EXPANSION: invalid lexical environment".into(),
+                            )
+                        })?
+                    }
+                } else {
+                    macroexpand_global_environment()
+                };
+                egcl_rt::rooted!(macro_env = macro_env);
+                let mut ex = get_setf_expansion_in(*place, env, &macro_env, 0)?;
                 // The store/access FORMS and the temp/val/store lists are freshly
                 // built conses; the vec_to_list calls below allocate and can fire
                 // a relocating minor GC that would move them, leaving stale
@@ -37502,11 +37518,34 @@ struct SetfExpansion {
 
 /// Compute the setf-expansion of PLACE (CLHS GET-SETF-EXPANSION).
 fn get_setf_expansion(place: EgclVal, env: &mut Env) -> Result<SetfExpansion, EgclError> {
+    egcl_rt::rooted!(place = place);
+    egcl_rt::rooted!(macro_env = macroexpand_environment_from_cli(env));
+    get_setf_expansion_in(*place, env, &macro_env, 0)
+}
+
+fn get_setf_expansion_in(
+    place: EgclVal,
+    env: &mut Env,
+    macro_env: &MacroexpandEnv,
+    depth: usize,
+) -> Result<SetfExpansion, EgclError> {
+    if depth > 100 {
+        return Err(EgclError::ProgramError(
+            "circular SETF place expansion".into(),
+        ));
+    }
+    egcl_rt::rooted!(place = place);
+    // Ordinary macros and symbol macros describe places too. Stop before an
+    // explicit SETF expander, whose protocol takes precedence over DEFMACRO.
+    *place = with_macroexpand_dynamic_context(env, || {
+        compiler_macroexpand::macroexpand_until(*place, macro_env, |candidate| {
+            place_has_user_setf_expander(candidate, env)
+        })
+    })?
+    .0;
+    let place = *place;
     // A variable (or symbol-macro) place: no temporaries; store via SETQ.
     if place.is_symbol() {
-        if let Some(expansion) = env.lookup_symbol_macro(place) {
-            return get_setf_expansion(expansion, env);
-        }
         // gensym / resolve_sym / vec_to_list all allocate and can fire a minor
         // GC; root PLACE and the store gensym so the SETQ store form and the
         // access form do not capture relocated (stale) symbol pointers.
@@ -37545,7 +37584,7 @@ fn get_setf_expansion(place: EgclVal, env: &mut Env) -> Result<SetfExpansion, Eg
             let inner_place = cp(rest).0;
             egcl_rt::rooted!(type_form = type_form);
             egcl_rt::rooted!(inner_place = inner_place);
-            let mut sub = get_setf_expansion(*inner_place, env)?;
+            let mut sub = get_setf_expansion_in(*inner_place, env, macro_env, depth + 1)?;
             egcl_rt::rooted_ref!(_sub_temps = &mut sub.temps);
             egcl_rt::rooted_ref!(_sub_vals = &mut sub.vals);
             egcl_rt::rooted_ref!(_sub_stores = &mut sub.stores);
@@ -37595,7 +37634,7 @@ fn get_setf_expansion(place: EgclVal, env: &mut Env) -> Result<SetfExpansion, Eg
             egcl_rt::rooted_ref!(_arg_forms = &mut arg_forms);
             if !arg_forms.is_empty() {
                 let place_form = arg_forms[0];
-                let mut sub = get_setf_expansion(place_form, env)?;
+                let mut sub = get_setf_expansion_in(place_form, env, macro_env, depth + 1)?;
                 egcl_rt::rooted_ref!(_sub_temps = &mut sub.temps);
                 egcl_rt::rooted_ref!(_sub_vals = &mut sub.vals);
                 egcl_rt::rooted_ref!(_sub_stores = &mut sub.stores);
@@ -37679,7 +37718,7 @@ fn get_setf_expansion(place: EgclVal, env: &mut Env) -> Result<SetfExpansion, Eg
                         // would describe the expander rather than the call site
                         // (bliss-1pve).
                         let call_menv = if params_form_uses_environment(*params_form) {
-                            Some(macroexpand_environment_from_cli(env))
+                            Some(macro_env.clone())
                         } else {
                             None
                         };
@@ -37692,7 +37731,7 @@ fn get_setf_expansion(place: EgclVal, env: &mut Env) -> Result<SetfExpansion, Eg
                         )?
                     } else {
                         let macroexpand_env = if params_form_uses_environment(*params_form) {
-                            Some(macroexpand_environment_from_cli(env))
+                            Some(macro_env.clone())
                         } else {
                             None
                         };

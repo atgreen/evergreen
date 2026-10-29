@@ -1,6 +1,7 @@
 {
   "fast": {
     "egcl:test:compiled_fallback_macro_context_cli": [""],
+    "egcl:test:macro_setf_place_cli": [""],
     "egcl:test:embedded_exit_cli": [""],
     "egcl-ios:test:portable_boundary": [""],
     "egcl:test:generic_dispatch_cache_cli": [""],
