@@ -37539,7 +37539,12 @@ fn get_setf_expansion_in(
     // explicit SETF expander, whose protocol takes precedence over DEFMACRO.
     *place = with_macroexpand_dynamic_context(env, || {
         compiler_macroexpand::macroexpand_until(*place, macro_env, |candidate| {
-            place_has_user_setf_expander(candidate, env)
+            candidate.is_cons()
+                && cp(candidate).0.is_symbol()
+                && env
+                    .setf_expanders
+                    .borrow()
+                    .contains_key(&sym_name(cp(candidate).0))
         })
     })?
     .0;
