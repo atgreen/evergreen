@@ -145,6 +145,14 @@ struct CircularityDetector {
 
 Recursive descent over the format string producing `Vec<FormatOp>`.
 
+Validate directive compatibility before consuming argument-dependent parameters.
+Ordinary justification cannot contain `~W`, `~I`, `~_`, section tabs (`~:T`
+or `~:@T`), or logical blocks. Overflow justification (`~<...~:;...~>`)
+cannot share a control string with those directives, including nested forms.
+Quoted parameter characters, escaped tildes, and slash-function names are
+opaque to this scan. Each dynamically supplied string control is validated
+independently; separate control strings do not form one lexical scope.
+
 ```text
 PROCEDURE parse_format(s: &str) -> Vec<FormatOp>:
   ops = []; i = 0

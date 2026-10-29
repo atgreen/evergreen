@@ -5,6 +5,8 @@
 //!
 //! See spec §5.9.
 
+mod control_validation;
+
 use egcl_rt::error::EgclError;
 use egcl_rt::lock_order::{LockLevel, OrderedMutex};
 use egcl_rt::object::{ObjectHeader, type_id};
@@ -3851,13 +3853,7 @@ pub fn format_to_layout_in_context(
     let mut args = args.to_vec();
     egcl_rt::rooted_ref!(_args_root = &mut args);
     validate_matching(control_string)?;
-    if control_has_overflow_justification(control_string) {
-        if let Some(d) = clause_directive_among(control_string, &['W', 'I', '_']) {
-            return Err(EgclError::ControlError(format!(
-                "~{d} is not allowed in a control string with a ~<...~:;...~> justification"
-            )));
-        }
-    }
+    control_validation::validate(control_string)?;
 
     let mut output = LayoutDoc {
         events: Vec::new(),
@@ -4928,6 +4924,7 @@ fn format_impl(
                     let sub_control = extract_egcl_string(ctrl_val).ok_or_else(|| {
                         EgclError::Internal("failed to extract format string".into())
                     })?;
+                    control_validation::validate(&sub_control)?;
                     if at_sign {
                         // ~@? — use the enclosing argument list from current position
                         format_impl(&sub_control, args, arg_idx, output)?;
@@ -5070,7 +5067,10 @@ fn format_impl(
                     let control = args[*arg_idx];
                     *arg_idx += 1;
                     match extract_egcl_string(control) {
-                        Some(text) => body = text,
+                        Some(text) => {
+                            control_validation::validate(&text)?;
+                            body = text;
+                        }
                         None => body_function = control,
                     }
                 }
@@ -5488,15 +5488,6 @@ fn format_impl(
                             .map(|c| char::from_u32(c as u32).unwrap_or(' '))
                     })?;
                     let mut clauses = split_clauses(&body);
-                    // ~W, ~I and ~_ belong to the pretty printer and are
-                    // errors inside a justification (CLHS 22.3.6.2).
-                    for clause in &clauses {
-                        if let Some(d) = clause_directive_among(clause, &['W', 'I', '_']) {
-                            return Err(EgclError::ControlError(format!(
-                                "~{d} is not allowed inside ~<...~> justification"
-                            )));
-                        }
-                    }
                     // `~n,m:;` after the first segment makes it an overflow
                     // prefix: printed only when the justified text plus `n`
                     // spare columns would not fit in a line of `m` columns.
@@ -5828,89 +5819,6 @@ fn proper_list_elements(list: EgclVal) -> Result<Vec<EgclVal>, EgclError> {
         });
     }
     Ok(elements)
-}
-
-/// Does `control` contain a justification with a `~:;` overflow clause?
-/// CLHS 22.3.6.2 forbids `~W`, `~I` and `~_` anywhere in such a control
-/// string (ansi format.justify.error.*).
-fn control_has_overflow_justification(control: &str) -> bool {
-    let chars: Vec<char> = control.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        if chars[i] != '~' {
-            i += 1;
-            continue;
-        }
-        i += 1;
-        while i < chars.len()
-            && (chars[i].is_ascii_digit()
-                || matches!(
-                    chars[i],
-                    ',' | '\'' | 'v' | 'V' | '#' | ':' | '@' | '-' | '+'
-                ))
-        {
-            if chars[i] == '\'' {
-                i += 1;
-            }
-            i += 1;
-        }
-        if i < chars.len() && chars[i] == '<' {
-            let body_start = i + 1;
-            let Ok(body_end) = find_matching_close(&chars, body_start, '<') else {
-                return false;
-            };
-            let mut k = body_end + 1;
-            let mut close_colon = false;
-            while k < chars.len() && chars[k] != '>' {
-                if chars[k] == ':' {
-                    close_colon = true;
-                }
-                k += 1;
-            }
-            let body: String = chars[body_start..body_end].iter().collect();
-            if !close_colon && justify_overflow_params(&body).is_some() {
-                return true;
-            }
-            i = k;
-        }
-        i += 1;
-    }
-    false
-}
-
-/// Scan `clause` for a directive whose character (upper-cased) is one of
-/// `wanted`, skipping prefix parameters and modifiers; `~~` and `~'x`
-/// parameters do not count.
-fn clause_directive_among(clause: &str, wanted: &[char]) -> Option<char> {
-    let chars: Vec<char> = clause.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        if chars[i] != '~' {
-            i += 1;
-            continue;
-        }
-        i += 1;
-        while i < chars.len()
-            && (chars[i].is_ascii_digit()
-                || matches!(
-                    chars[i],
-                    ',' | '\'' | 'v' | 'V' | '#' | ':' | '@' | '-' | '+'
-                ))
-        {
-            if chars[i] == '\'' {
-                i += 1;
-            }
-            i += 1;
-        }
-        if i < chars.len() {
-            let d = chars[i].to_ascii_uppercase();
-            if wanted.contains(&d) {
-                return Some(d);
-            }
-            i += 1;
-        }
-    }
-    None
 }
 
 /// For a justification body whose FIRST top-level separator is `~n,m:;`,
