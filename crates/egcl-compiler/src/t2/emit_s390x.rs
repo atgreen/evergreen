@@ -1741,6 +1741,41 @@ impl Emitter<'_> {
                 self.asm.and(2, 3);
                 self.asm.add_imm(2, 4);
             }
+            // Speculated single-float comparison, answering T or NIL. The
+            // operands are guarded exactly as the arithmetic arm guards them,
+            // and the two values reach FPR 0 and FPR 2 the same way, so the
+            // short BFP compare sees them in the high half of each register.
+            FloatCmpEq | FloatCmpLt | FloatCmpLe | FloatCmpGt | FloatCmpGe => {
+                let deopt = self.deopt_label(data)?;
+                self.float_operand(first, 2, deopt)?;
+                self.float_operand(*data.args.get(1).ok_or(unsupported!())?, 3, deopt)?;
+                self.asm.load_float_bits(0, 2);
+                self.asm.load_float_bits(2, 3);
+                self.asm.compare_single(0, 2);
+                // CC3 is unordered -- at least one operand is a NaN. Deopt
+                // rather than decide it: the interpreter's NaN ordering is not
+                // IEEE's, so native code must not answer where the two would
+                // disagree. emit.rs deopts on x86's parity flag for the same
+                // reason. Doing it FIRST also means the masks below never have
+                // to account for CC3, so each is exactly its ordering.
+                self.asm.branch(1, deopt);
+                let yes = self.asm.label();
+                let done = self.asm.label();
+                let mask = match data.opcode {
+                    FloatCmpEq => 8,
+                    FloatCmpLt => 4,
+                    FloatCmpLe => 12,
+                    FloatCmpGt => 2,
+                    _ => 10,
+                };
+                self.asm.branch(mask, yes);
+                self.asm.imm64(2, NIL.0);
+                self.asm.branch(15, done);
+                self.asm.bind(yes);
+                self.asm.imm64(2, T.0);
+                self.asm.bind(done);
+                return self.store(result, 2);
+            }
             FixnumAdd | FixnumSub | FixnumMul | FixnumNeg | FixnumCmpEq | FixnumCmpLt
             | FixnumCmpLe | FixnumCmpGt | FixnumCmpGe => {
                 let deopt = self.deopt_label(data)?;
@@ -4198,6 +4233,125 @@ mod tests {
             slots[1] = EgclVal::from_fixnum(0).0;
             assert_eq!(unsafe { entry(slots.as_mut_ptr()) }, NIL.0);
             assert!(DEOPTED.with(std::cell::Cell::get), "a fixnum is not an array");
+        }
+    }
+
+    /// Speculated single-float comparisons answer T/NIL, and an unordered
+    /// compare deopts instead of inventing an ordering.
+    ///
+    /// The NaN cases are the point. CEBR reports unordered as condition code
+    /// 3, which is a DIFFERENT code from less/equal/greater -- so unlike a
+    /// two-way integer compare, failing to handle it does not merely pick the
+    /// wrong side, it falls through every ordering mask to NIL. That would
+    /// make `(= nan nan)` and `(< nan 1.0)` both answer NIL natively, where
+    /// the interpreter is free to disagree. Deopting keeps the one answer.
+    #[test]
+    fn single_float_comparisons_answer_t_or_nil_and_deopt_on_nan() {
+        use crate::t2::frame_state::{FrameScope, FrameState, ValueSource};
+
+        thread_local! {
+            static DEOPTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        }
+        extern "C" fn deopt(_: u64, _: u64, _: *const u64, _: u64) -> u64 {
+            DEOPTED.with(|flag| flag.set(true));
+            NIL.0
+        }
+
+        fn compare(opcode: Opcode) -> Function {
+            let mut f = Function::new("z-float-cmp");
+            let block = f.entry();
+            let x = f.add_block_param(block, IRType::TOP, ValueRepresentation::Tagged);
+            let y = f.add_block_param(block, IRType::TOP, ValueRepresentation::Tagged);
+            let state = f.frame_states.add(FrameState {
+                scopes: vec![FrameScope {
+                    function: 0,
+                    bcp: 0,
+                    locals: vec![
+                        ValueSource::Value { value: x, repr: ValueRepresentation::Tagged },
+                        ValueSource::Value { value: y, repr: ValueRepresentation::Tagged },
+                    ],
+                    stack: vec![],
+                }],
+                remat: vec![],
+            });
+            let (_, answer) = f.push_inst(
+                block,
+                InstData {
+                    opcode,
+                    args: vec![x, y],
+                    results: vec![],
+                    aux: AuxData::None,
+                    flags: InstFlags::default(),
+                    targets: vec![],
+                    frame_state: Some(state),
+                    source_pos: 0,
+                },
+                &[(IRType::TOP, ValueRepresentation::Tagged)],
+            );
+            f.set_terminator(
+                block,
+                InstData {
+                    opcode: Opcode::Return,
+                    args: vec![answer[0]],
+                    results: vec![],
+                    aux: AuxData::None,
+                    flags: InstFlags::default(),
+                    targets: vec![],
+                    frame_state: None,
+                    source_pos: 0,
+                },
+            );
+            f
+        }
+
+        // (opcode, a<b, a>b, a==b)
+        let cases = [
+            (Opcode::FloatCmpLt, true, false, false),
+            (Opcode::FloatCmpLe, true, false, true),
+            (Opcode::FloatCmpGt, false, true, false),
+            (Opcode::FloatCmpGe, false, true, true),
+            (Opcode::FloatCmpEq, false, false, true),
+        ];
+        for (opcode, lt, gt, eq) in cases {
+            let compiled =
+                emit_framed(&compare(opcode), deopt as *const () as u64, 2).expect("emits");
+            assert!(!compiled.code.is_empty());
+            // The expectations drive the hardware assertions below and have no
+            // other consumer, so a non-System-Z host would see three unused
+            // bindings, which `-D warnings` makes errors. Name them rather than
+            // underscoring them: an underscore would also hide a real mistake.
+            let _ = (lt, gt, eq);
+            #[cfg(all(target_arch = "s390x", unix))]
+            {
+                let code = egcl_rt::jit::JitBuffer::new(&compiled.code).unwrap();
+                // SAFETY: the buffer owns the generated C-ABI activation entry.
+                let entry: unsafe extern "C" fn(*mut u64) -> u64 =
+                    unsafe { std::mem::transmute(code.as_ptr()) };
+                let run = |a: f32, b: f32| {
+                    DEOPTED.with(|flag| flag.set(false));
+                    let mut slots = vec![
+                        EgclVal::from_single_float(a).0,
+                        EgclVal::from_single_float(b).0,
+                        0,
+                        0,
+                    ];
+                    let answer = unsafe { entry(slots.as_mut_ptr()) };
+                    (answer, DEOPTED.with(std::cell::Cell::get))
+                };
+                let want = |yes: bool| if yes { T.0 } else { NIL.0 };
+                assert_eq!(run(1.5, 2.5), (want(lt), false), "{opcode:?}: 1.5 ? 2.5");
+                assert_eq!(run(2.5, 1.5), (want(gt), false), "{opcode:?}: 2.5 ? 1.5");
+                assert_eq!(run(2.5, 2.5), (want(eq), false), "{opcode:?}: 2.5 ? 2.5");
+                // Negative zero compares EQUAL to zero in IEEE, and that is an
+                // ordered answer, so it must NOT deopt.
+                assert_eq!(run(0.0, -0.0), (want(eq), false), "{opcode:?}: 0.0 ? -0.0");
+                // Unordered: CC3. Both operand positions, and NaN against
+                // itself, which is the case a mask-only implementation would
+                // silently answer NIL for.
+                assert!(run(f32::NAN, 1.5).1, "{opcode:?}: NaN on the left");
+                assert!(run(1.5, f32::NAN).1, "{opcode:?}: NaN on the right");
+                assert!(run(f32::NAN, f32::NAN).1, "{opcode:?}: NaN vs NaN");
+            }
         }
     }
 }

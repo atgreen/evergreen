@@ -40,16 +40,25 @@
 /// Whether the host emitter encodes `FloatCmpEq`/`Lt`/`Le`/`Gt`/`Ge` on
 /// **boxed single-floats**.
 ///
-/// x86-64 `emit.rs` (bliss-9bw59), AArch64 `emit_a64.rs` and ppc64le
-/// `emit_ppc64le.rs` all guard each operand to be a single-float, compare, and
-/// select `T`/`NIL`, deopting on an unordered compare so the interpreter —
-/// whose NaN ordering is not IEEE's — decides that case. To add a target: give
-/// its emitter that arm, then name it here.
+/// x86-64 `emit.rs` (bliss-9bw59), AArch64 `emit_a64.rs`, ppc64le
+/// `emit_ppc64le.rs` and System Z `emit_s390x.rs` (bliss-x4cxy) all guard each
+/// operand to be a single-float, compare, and select `T`/`NIL`, deopting on an
+/// unordered compare so the interpreter — whose NaN ordering is not IEEE's —
+/// decides that case. To add a target: give its emitter that arm, then name it
+/// here.
+///
+/// System Z reaches the same place from the other direction: `CEBR` reports
+/// unordered as condition code 3, a code *distinct* from less, equal and
+/// greater, so there the hazard is not that an ordering mask reads true for a
+/// NaN but that every one of them reads false — a mask-only implementation
+/// would quietly answer `NIL` for `(= nan nan)`. Taking the CC3 exit first
+/// settles both shapes.
 pub const fn single_float_comparison() -> bool {
     cfg!(any(
         target_arch = "x86_64",
         target_arch = "aarch64",
-        all(target_arch = "powerpc64", target_endian = "little")
+        all(target_arch = "powerpc64", target_endian = "little"),
+        target_arch = "s390x"
     ))
 }
 
