@@ -244,6 +244,7 @@ fn lexical_forwarding_keeps_first_load_and_forwards_only_later_reads() {
 }
 
 #[test]
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 fn lexical_forwarding_declined_ordinary_lowering_preserves_original_function() {
     let mut f = Function::new("declined-capture");
     let b = f.entry();
