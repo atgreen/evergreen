@@ -26,6 +26,10 @@
 
 ### Fixed
 
+- Expand macro and symbol-macro places in `GET-SETF-EXPANSION` using the supplied
+  lexical environment, preserving explicit SETF expanders and nested byte-field
+  updates ([#916](https://github.com/atgreen/evergreen/pull/916)).
+
 - Compiled-file function fallbacks preserve local macro expansions in their
   compilation environment when called from another package, including
   MACROLET and SYMBOL-MACROLET scopes
