@@ -134,6 +134,9 @@
 - Structure copiers preserve the values of slots named `T` or `NIL` instead of
   signaling `UNBOUND-SLOT`, and subsequent access to those slots no longer
   panics the runtime ([#816](https://github.com/atgreen/evergreen/pull/816)).
+- `BOUNDP` and unbound special-variable reads preserve symbol identity across
+  packages and dynamic bindings, so `DEFVAR` initializes shadowing variables
+  correctly ([#813](https://github.com/atgreen/evergreen/pull/813)).
 
 - Compiling top-level macros retains their computed expansions across
   compile-time effects, preserving captured values and metadata registration
