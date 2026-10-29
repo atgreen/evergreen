@@ -89,27 +89,42 @@ fn reset() {
 }
 
 fn code(forms: &str, env: &Env) -> TransferCode {
+    code_with_key(forms, env, None)
+}
+
+fn code_with_key(forms: &str, env: &Env, key: Option<&str>) -> TransferCode {
     egcl_rt::rooted!(params = reader::read_from_string("(next)").unwrap().0);
     egcl_rt::rooted!(forms = reader::read_from_string(forms).unwrap().0);
     let captures = std::collections::HashSet::from(["LEXICAL-LEAF-CAPTURE".to_owned()]);
     let empty = std::collections::HashSet::new();
-    let body = Arc::new(
-        compile_function_in(
-            "LEXICAL-LEAF-TEST",
-            *params,
-            *forms,
-            env,
-            &HashMap::new(),
-            false,
-            false,
-            &empty,
-            &empty,
-            &empty,
-            &captures,
-            None,
-        )
-        .expect("compile capturing bytecode"),
-    );
+    let mut body = compile_function_in(
+        "LEXICAL-LEAF-TEST",
+        *params,
+        *forms,
+        env,
+        &HashMap::new(),
+        false,
+        false,
+        &empty,
+        &empty,
+        &empty,
+        &captures,
+        None,
+    )
+    .expect("compile capturing bytecode");
+    if let Some(key) = key {
+        // Replace only the already-lowered capture metadata. This isolates the
+        // native boundary from the lowerer's separate identity-key regression.
+        let mut replaced = false;
+        for name in &mut body.names {
+            if name == "LEXICAL-LEAF-CAPTURE" {
+                *name = key.to_owned();
+                replaced = true;
+            }
+        }
+        assert!(replaced);
+    }
+    let body = Arc::new(body);
     assert!(body.has_env);
     egcl_rt::rooted!(_body = ActiveBytecodeRoot::new(&body));
     TransferCode::compile_mapped_for_test(body).expect("compile actual native capturing body")
@@ -305,5 +320,173 @@ fn lexical_leaf_published_poll_relocates_outgoing_value_before_store() {
         published,
         published_reads + published_stores,
         "the total must account for every published lexical operation"
+    );
+}
+
+#[test]
+fn lexical_identity_keys_preserve_native_leaf_and_published_store_semantics() {
+    let _lock = super::super::super::heap_test_lock()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    egcl_rt::rooted!(left = egcl_rt::symbols::make_uninterned("G"));
+    egcl_rt::rooted!(right = egcl_rt::symbols::make_uninterned("G"));
+    let ordinary = resolve_sym("G").unwrap();
+    env.define_local_symbol(ordinary, EgclVal::from_fixnum(999));
+    env.define_local_symbol(*left, EgclVal::from_fixnum(11));
+    env.define_local_symbol(*right, EgclVal::from_fixnum(22));
+    let parent = Arc::clone(&env.frame);
+    env.frame = Arc::new(SharedCell::new(EnvFrame {
+        vars: super::super::super::VecMap::default(),
+        symbol_vars: super::super::super::VecMap::default(),
+        parent: Some(Arc::clone(&parent)),
+    }));
+    env.define_local_symbol(*left, EgclVal::from_fixnum(33));
+    let left_key = lexical_identity::key(*left);
+    let right_key = lexical_identity::key(*right);
+    assert_ne!(left_key, right_key);
+    // A legal ordinary name may look exactly like a private identity key.
+    let lookalike = EgclVal::from_symbol_index(egcl_rt::symbols::intern(&left_key));
+    env.define_local_symbol(lookalike, EgclVal::from_fixnum(666));
+    let lookalike_key = lexical_identity::key(lookalike);
+    assert_ne!(lookalike_key, left_key);
+    let forms = "((setq lexical-leaf-capture next) lexical-leaf-capture)";
+    let native_left = code_with_key(forms, &env, Some(&left_key));
+    let native_right = code_with_key(forms, &env, Some(&right_key));
+    let native_lookalike = code_with_key(forms, &env, Some(&lookalike_key));
+
+    reset();
+    assert_eq!(
+        native_lookalike
+            .run(&[EgclVal::from_fixnum(88)], &mut env)
+            .unwrap(),
+        EgclVal::from_fixnum(88)
+    );
+    assert_eq!(COUNTS.with(Cell::get), (2, 1, 0));
+    assert_eq!(
+        env.lookup_var_symbol(lookalike),
+        Some(EgclVal::from_fixnum(88))
+    );
+    assert_eq!(env.lookup_var_symbol(*left), Some(EgclVal::from_fixnum(33)));
+
+    reset();
+    assert_eq!(
+        native_left
+            .run(&[EgclVal::from_fixnum(42)], &mut env)
+            .unwrap(),
+        EgclVal::from_fixnum(42)
+    );
+    assert_eq!(
+        COUNTS.with(Cell::get),
+        (2, 1, 0),
+        "encoded read/write must really take the native leaf"
+    );
+    assert_eq!(
+        Env::lookup_lexical_frame(&parent, &left_key),
+        Some(EgclVal::from_fixnum(11))
+    );
+    assert_eq!(env.lookup_var_symbol(*left), Some(EgclVal::from_fixnum(42)));
+    assert_eq!(
+        env.lookup_var_symbol(*right),
+        Some(EgclVal::from_fixnum(22))
+    );
+    assert_eq!(
+        env.lookup_var_symbol(ordinary),
+        Some(EgclVal::from_fixnum(999))
+    );
+
+    reset();
+    REQUEST_POLL.with(|request| request.set(true));
+    assert_eq!(
+        native_right
+            .run(&[EgclVal::from_fixnum(77)], &mut env)
+            .unwrap(),
+        EgclVal::from_fixnum(77)
+    );
+    assert_eq!(
+        COUNTS.with(Cell::get),
+        (2, 0, 1),
+        "encoded store must cooperate through the published path"
+    );
+    assert!(!egcl_rt::thread::current_execution_poll_pending());
+    assert_eq!(
+        Env::lookup_lexical_frame(&parent, &right_key),
+        Some(EgclVal::from_fixnum(77))
+    );
+    assert_eq!(env.lookup_var_symbol(*left), Some(EgclVal::from_fixnum(42)));
+
+    // The same identity-aware published setter must consume a relocated value
+    // from the outgoing native argument area, not an unrooted stale copy.
+    egcl_rt::gc::collect_t0_minor().unwrap();
+    egcl_rt::rooted!(datum = super::super::super::arena_str("encoded outgoing store moves"));
+    reset();
+    COLLECT_NEXT_STORE.with(|collect| collect.set(true));
+    REQUEST_POLL.with(|request| request.set(true));
+    egcl_rt::rooted!(result = native_left.run(&[*datum], &mut env).unwrap());
+    let (before, after, published, collected) = OUTGOING_MOVE
+        .with(Cell::get)
+        .expect("encoded setter must reach the published collecting hook");
+    assert!(published && collected);
+    assert_ne!(before, after, "the actual encoded store argument must move");
+    assert_eq!(after, datum.to_raw());
+    assert_eq!(*result, *datum);
+    assert_eq!(env.lookup_var_symbol(*left), Some(*datum));
+    assert_eq!(
+        env.lookup_var_symbol(*right),
+        Some(EgclVal::from_fixnum(77))
+    );
+    assert_eq!(
+        env.lookup_var_symbol(ordinary),
+        Some(EgclVal::from_fixnum(999))
+    );
+    let (reads, writes, total_published) = COUNTS.with(Cell::get);
+    let (published_reads, published_stores) = PUBLISHED_ACCESSES.with(Cell::get);
+    assert_eq!(published_stores, 1);
+    assert_eq!(writes, 0);
+    assert_eq!(reads + published_reads, 2);
+    assert_eq!(total_published, published_reads + published_stores);
+}
+
+#[test]
+fn lexical_identity_missing_capture_publishes_its_exact_symbol() {
+    let _lock = super::super::super::heap_test_lock()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    egcl_rt::rooted!(missing = egcl_rt::symbols::make_uninterned("G"));
+    egcl_rt::rooted!(other = egcl_rt::symbols::make_uninterned("G"));
+    env.define_local_symbol(*other, EgclVal::from_fixnum(999));
+    let name_slot = resolve_sym("NAME").unwrap();
+    let native = code_with_key(
+        "(lexical-leaf-capture)",
+        &env,
+        Some(&lexical_identity::key(*missing)),
+    );
+    reset();
+    egcl_rt::rooted!(
+        error = native
+            .run(&[NIL], &mut env)
+            .expect_err("a same-named symbol must not supply an unbound capture")
+    );
+    let condition = match error.without_backtrace() {
+        EgclError::Signalled(details) => details.condition,
+        other => panic!("expected signalled UNBOUND-VARIABLE, got {other:?}"),
+    };
+    egcl_rt::rooted!(condition = condition);
+    assert!(super::super::super::condition_matches_handler(
+        &env,
+        *condition,
+        "UNBOUND-VARIABLE"
+    ));
+    assert_eq!(
+        super::super::super::read_slot_value(*condition, name_slot, &env).unwrap(),
+        *missing
+    );
+    assert_eq!(COUNTS.with(Cell::get), (0, 0, 1));
+    assert_eq!(
+        env.lookup_var_symbol(*other),
+        Some(EgclVal::from_fixnum(999))
     );
 }
