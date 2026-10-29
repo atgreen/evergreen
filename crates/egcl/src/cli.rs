@@ -10898,6 +10898,9 @@ fn scan_evaluator_roots(visit: &mut dyn FnMut(*mut EgclVal), root_definitions: b
                 visit(value);
             }
         });
+        PENDING_PRINT_ERROR.scan(|error| {
+            egcl_rt::gc::TraceHostRoots::trace_host_roots(&mut *error.borrow_mut(), visit);
+        });
         // The cached `#'<builtin>` wrapper conses (bliss-hb0q). Visiting them is
         // what lets the cache hold a EgclVal at all: the collector rewrites each
         // entry in place, so a cached `#'car` stays valid across a relocation
@@ -14630,19 +14633,20 @@ fn stdlib_format_layout_apply_hook(
     ))
 }
 
-thread_local! {
-    /// An error, or a non-local transfer, raised by Lisp that the PRINTER called
-    /// back into: a user `PRINT-OBJECT` method or a `*PRINT-PPRINT-DISPATCH*`
-    /// entry. Both hooks return `Option<String>` and the rendering chain behind
-    /// them returns a plain `String`, so there is nowhere to hand a `Result`
-    /// back; discarding the error instead made a signalling pprint entry read as
-    /// "no applicable entry, print normally", so `(format nil "~S" 1)` answered
-    /// "1" where SBCL signals, and a THROW out of an entry was swallowed
-    /// outright (bliss-gppm7). The error is parked here and re-signalled at the
-    /// boundary of the printing operation itself.
-    static PENDING_PRINT_ERROR: std::cell::RefCell<Option<EgclError>> =
-        const { std::cell::RefCell::new(None) };
-}
+/// An error, or a non-local transfer, raised by Lisp that the PRINTER called
+/// back into: a user `PRINT-OBJECT` method or a `*PRINT-PPRINT-DISPATCH*`
+/// entry. Both hooks return `Option<String>` and the rendering chain behind
+/// them returns a plain `String`, so there is nowhere to hand a `Result`
+/// back; discarding the error instead made a signalling pprint entry read as
+/// "no applicable entry, print normally", so `(format nil "~S" 1)` answered
+/// "1" where SBCL signals, and a THROW out of an entry was swallowed
+/// outright (bliss-gppm7). The error is parked here and re-signalled at the
+/// boundary of the printing operation itself.
+static PENDING_PRINT_ERROR: egcl_rt::execution_local::ExecutionLocal<
+    std::cell::RefCell<Option<EgclError>>,
+> = unsafe {
+    egcl_rt::execution_local::ExecutionLocal::new(|| const { std::cell::RefCell::new(None) })
+};
 
 /// Park an error raised by Lisp called from the printer. The FIRST one wins:
 /// rendering continues after a declined hook and may call back again, and the
@@ -22863,12 +22867,7 @@ fn eval_builtin_arguments(
     env: &mut Env,
 ) -> Result<EgclVal, EgclError> {
     let args = eval_args(forms, env)?;
-    let result =
-        evaluated_builtins::call(name, &args, env).expect("source builtin has an evaluated handler");
-    // WRITE, PRIN1, PRINC, PRINT and friends render through the printer, which
-    // cannot return a Result from its callbacks into Lisp; re-signal anything a
-    // callback parked, and clear it either way so it cannot leak (bliss-gppm7).
-    resignal_print_error(result)
+    evaluated_builtins::call(name, &args, env).expect("source builtin has an evaluated handler")
 }
 
 /// True for EGCL-EXT:ATOMIC-INCF and EGCL-EXT:ATOMIC-DECF themselves, which
@@ -51195,3 +51194,6 @@ mod subtype_canonicalization_rooting_tests;
 
 #[cfg(test)]
 mod print_circle_gc_tests;
+
+#[cfg(test)]
+mod printer_error_gc_tests;

@@ -150,6 +150,14 @@ pub(super) fn call(
     let handler = handler?;
     env.clear_mv();
     let result = handler(name, args, env);
+    // Printer callbacks park errors because their rendering hooks return text.
+    // Drain at the shared operation boundary, including compiled callers, and
+    // leave unrelated nested builtins alone while a printer error is pending.
+    let result = if matches!(name, "PRINT" | "PRIN1" | "PRINC" | "WRITE") {
+        resignal_print_error(result)
+    } else {
+        result
+    };
     if result.is_ok() && !preserve {
         env.clear_mv();
     }
