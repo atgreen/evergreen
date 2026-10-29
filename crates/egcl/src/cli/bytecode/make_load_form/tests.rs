@@ -216,8 +216,10 @@ fn identity_registry_and_fixup_owners_follow_actual_relocation() {
 
 #[test]
 fn independent_initialization_closure_precedes_dependent_creation() {
-    let mut pool = BbuConstPool::default();
-    pool.entries = vec![vec![30], vec![30], vec![30], vec![0]];
+    let mut pool = BbuConstPool {
+        entries: vec![vec![30], vec![30], vec![30], vec![0]],
+        ..Default::default()
+    };
     for (reference, creation_deps, initialization_deps) in [
         (0, vec![1], vec![0]),
         (1, vec![], vec![1, 2]),

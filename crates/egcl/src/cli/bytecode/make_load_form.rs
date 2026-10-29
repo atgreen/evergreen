@@ -669,7 +669,7 @@ pub(super) fn instantiate(
             .zip(&restart_tables[index])
         {
             for (clause, &(_, child)) in table.restarts.iter_mut().zip(refs) {
-                clause.function = Box::new((*instantiated[&(child as usize)]).clone());
+                *clause.function = (*instantiated[&(child as usize)]).clone();
             }
         }
         instantiated.insert(index, Arc::new(function));
