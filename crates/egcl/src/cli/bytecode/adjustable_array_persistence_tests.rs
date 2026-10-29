@@ -326,7 +326,7 @@ fn array_graph_version_accepts_legacy_minor_and_rejects_future_minor_before_inst
     let mut unit = assemble_bbu(&pool, &[], &[], BBU_NO_INDEX, b"array-version");
     let mut env = Env::new(false);
     egcl_rt::rooted_ref!(_env = &mut env);
-    unit[4..6].copy_from_slice(&0x0206u16.to_le_bytes());
+    unit[4..6].copy_from_slice(&0x0207u16.to_le_bytes());
     assert!(load_bbu_definitions(&unit, &mut env, false).is_err());
     unit[4..6].copy_from_slice(&0x0204u16.to_le_bytes());
     assert_eq!(load_bbu_definitions(&unit, &mut env, false).unwrap(), NIL);
