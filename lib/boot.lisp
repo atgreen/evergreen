@@ -6211,60 +6211,6 @@ had none, as for a host name that did not resolve."
   (egcl::%designated-output-stream stream)
   nil)
 
-;; PPRINT-TABULAR (CLHS 22.4): columns are not laid out yet; the elements are
-;; printed like PPRINT-FILL, which is the non-pretty rendering.
-;; PPRINT-TABULAR (CLHS 22.2.2): each element starts at a column that is a
-;; multiple of TABSIZE from the start of the block; elements that would pass
-;; *PRINT-RIGHT-MARGIN* continue on a new line (ansi pprint-tabular.*).
-(defun pprint-tabular (stream list &optional (colon-p t) at-sign-p tabsize)
-  (declare (ignore at-sign-p))
-  ;; A NIL tabsize (what `~v/pprint-tabular/` passes for a NIL argument)
-  ;; selects the default of 16.
-  (setf tabsize (or tabsize 16))
-  (check-type tabsize (integer 0))
-  (let ((stream (cond ((null stream) *standard-output*)
-                      ((eq stream t) *terminal-io*)
-                      (t stream))))
-    (if (not (listp list))
-        (write list :stream stream)
-        (let* ((prefix (if colon-p "(" ""))
-               (suffix (if colon-p ")" ""))
-               (items (mapcar #'write-to-string list))
-               (margin (or *print-right-margin* 72))
-               ;; Columns are absolute: the block starts wherever the stream
-               ;; already is, and continuation lines indent to the first item.
-               (origin (or (egcl::%pprint-native-column stream) 0))
-               (start (+ origin (length prefix)))
-               (lines '())
-               (line (copy-seq prefix))
-               (col start))
-          (flet ((next-tab (c)
-                   (if (zerop tabsize)
-                       (1+ c)
-                       (+ start (* tabsize (ceiling (- (1+ c) start) tabsize))))))
-            (loop for (item . rest) on items
-                  ;; A fill-style break: the section after ITEM (its tab
-                  ;; padding, or the suffix) must also fit on the line.
-                  do (when (and (> col start)
-                                (> (if rest
-                                       (next-tab (+ col (length item)))
-                                       (+ col (length item) (length suffix)))
-                                   margin))
-                       ;; The tab padding never ends a broken line.
-                       (push (string-right-trim " " line) lines)
-                       (setf line (make-string start :initial-element #\Space)
-                             col start))
-                     (setf line (concatenate 'string line item))
-                     (incf col (length item))
-                     (when rest
-                       (let ((next (next-tab col)))
-                         (setf line (concatenate 'string line
-                                                 (make-string (- next col) :initial-element #\Space))
-                               col next)))))
-          (push (concatenate 'string line suffix) lines)
-          (format stream "~{~a~^~%~}" (nreverse lines))))
-    nil))
-
 ;;; ---------------------------------------------------------------------------
 ;;; Typed structures: DEFSTRUCT with (:TYPE LIST) or (:TYPE VECTOR) (CLHS
 ;;; DEFSTRUCT).  The evaluator hands such a definition to %DEFTYPEDSTRUCT.  The

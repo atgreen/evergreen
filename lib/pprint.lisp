@@ -249,4 +249,17 @@
           (write-char #\Space stream)
           (pprint-newline :linear stream))))
 
+(defun pprint-tabular (stream object &optional (colon-p t) at-sign-p tabsize)
+  "Print list elements in columns within one logical block and circle context."
+  (declare (ignore at-sign-p))
+  (setf tabsize (or tabsize 16))
+  (check-type tabsize (integer 0))
+  (pprint-logical-block (stream object :prefix (if colon-p "(" "") :suffix (if colon-p ")" ""))
+    (pprint-exit-if-list-exhausted)
+    (loop (write (pprint-pop) :stream stream)
+          (pprint-exit-if-list-exhausted)
+          (write-char #\Space stream)
+          (pprint-tab :section-relative 0 tabsize stream)
+          (pprint-newline :fill stream))))
+
 (in-package :cl-user)

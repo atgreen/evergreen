@@ -34,6 +34,7 @@
     "egcl:test:format_justification_minpad_cli": [""],
     "egcl-stdlib:test:test_format": ["format_tilde_angle_justification_matches_sbcl", "format_tilde_angle_logical_block_is_keyed_on_the_closing_colon"],
     "egcl:test:circle_print_length_cli": [""],
+    "egcl:test:pprint_tabular_circle_cli": [""],
     "egcl:test:print_array_policy_cli": [""],
     "egcl:test:symbol_print_radix_cli": [""],
     "egcl:test:gensym_printer_controls_cli": [""],
