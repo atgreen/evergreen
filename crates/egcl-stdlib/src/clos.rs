@@ -2612,6 +2612,38 @@ pub fn class_name(class: EgclVal) -> EgclVal {
     with_state(|st| st.class_meta.get(&class).map(|m| m.name).unwrap_or(NIL))
 }
 
+/// Set only the primary name stored in a class metaobject. In particular this
+/// does not add, remove, or retarget any FIND-CLASS registration. Definition
+/// metadata, layouts, CPLs and shared cells remain owned by the same class.
+/// No Lisp allocation or callbacks occur while CLOS state is borrowed.
+pub fn set_class_name(class: EgclVal, new_name: EgclVal) -> Result<EgclVal, EgclError> {
+    update_class_name(class, new_name)?;
+    Ok(new_name)
+}
+
+/// Atomically report whether the primary name actually changed, so callers
+/// can avoid invalidating caches for a no-op without a separate racy read.
+pub fn update_class_name(class: EgclVal, new_name: EgclVal) -> Result<bool, EgclError> {
+    if !new_name.is_symbol() {
+        return Err(EgclError::TypeError { datum: new_name, expected: "SYMBOL".into() });
+    }
+    with_state_mut(|st| {
+        let meta = st.class_meta.get(&class).ok_or_else(|| EgclError::TypeError {
+            datum: class, expected: "CLASS".into(),
+        })?;
+        if meta.name == new_name {
+            return Ok(false);
+        }
+        // Physical builtin predicates use their canonical metadata names.
+        // User structure classes and forward references are not builtins.
+        if !meta.forward_referenced && is_builtin_class(st, class) {
+            return Err(EgclError::ProgramError("cannot rename a built-in class".into()));
+        }
+        st.class_meta.get_mut(&class).unwrap().name = new_name;
+        Ok(true)
+    })
+}
+
 /// Compute the class precedence list by the standard's rule (R5.67).
 pub fn compute_class_precedence_list(class: EgclVal) -> Result<Vec<EgclVal>, EgclError> {
     with_state(|st| {

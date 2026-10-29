@@ -1,6 +1,8 @@
 {
   "fast": {
     "egcl:test:format_pretty_policy_cli": [""],
+    "egcl:test:class_name_writer_cli": [""],
+    "egcl-stdlib:test:class_name_writer": [""],
     "egcl:test:stream_delegation_cli": [""],
     "egcl:test:the_type_position_cli": [""],
     "egcl:test:defstruct_macroexpand_cli": [""],

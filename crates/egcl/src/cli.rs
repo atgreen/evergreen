@@ -22424,12 +22424,10 @@ fn type_of_value(v: EgclVal) -> Result<EgclVal, EgclError> {
     if egcl_stdlib::is_instance(v) {
         let class = egcl_stdlib::class_of(v);
         let name = egcl_stdlib::class_name(class);
-        if !name.is_nil() {
-            if egcl_stdlib::find_class(name) == Some(class) {
-                return Ok(name);
-            }
-            return Ok(class);
+        if !name.is_nil() && egcl_stdlib::find_class(name) == Some(class) {
+            return Ok(name);
         }
+        return Ok(class);
     }
     if egcl_stdlib::sequences::is_nil_array(v) {
         let complex = egcl_stdlib::sequences::array_adjustable(v) || egcl_stdlib::is_complex_vector(v);
@@ -28040,6 +28038,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             "SIGNAL" => return eval_builtin_arguments(&name, cdr, env),
             "WARN" => return eval_builtin_arguments(&name, cdr, env),
             "MAKE-CONDITION" => return eval_builtin_arguments(&name, cdr, env),
+            "EGCL-INTERNAL:%SET-CLASS-NAME" | "EGCL-INTERNAL::%SET-CLASS-NAME" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL-INTERNAL:%RAW-SLOT-VALUE"
             | "EGCL-INTERNAL:%STANDARD-SLOT-VALUE-USING-CLASS"
             | "EGCL-INTERNAL:%STANDARD-SET-SLOT-VALUE-USING-CLASS"
@@ -44244,6 +44243,7 @@ fn is_builtin_function(name: &str) -> bool {
             | "EGCL-INTERNAL::%NAME-CHAR"
             | "EGCL-INTERNAL:%MAKE-MD-ARRAY-WITH-STORAGE"
             | "EGCL-INTERNAL::%MAKE-MD-ARRAY-WITH-STORAGE"
+            | "EGCL-INTERNAL:%SET-CLASS-NAME" | "EGCL-INTERNAL::%SET-CLASS-NAME"
             | "EGCL-INTERNAL:%STANDARD-SHARED-INITIALIZE"
             | "EGCL-INTERNAL::%STANDARD-SHARED-INITIALIZE"
             | "EGCL-INTERNAL:%CLASS-CHANGE-ADDED-SLOTS"
