@@ -83,3 +83,67 @@ fn fallback_function_freezes_local_scopes_and_preserves_moving_data() {
         "LOAD-TIME-VALUE remains a separate compilation boundary"
     );
 }
+
+#[test]
+fn fallback_multiple_value_bind_preserves_data_and_separate_namespaces() {
+    let _lock = heap_test_lock()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    egcl_rt::rooted!(env = Env::new(false));
+    read_eval_all_env(
+        "(defmacro mvb-moving-source () (%force-minor-gc-for-test) 42)",
+        &mut env,
+    )
+    .unwrap();
+    const SOURCE: &str = "
+      (defun frozen-mvb-fixture ()
+        (symbol-macrolet ((costs :outer-value))
+          (macrolet ((costs (&rest args)
+                       (if args (list 'list (car args)) :binder-was-expanded)))
+            (multiple-value-bind (costs) costs
+              (declare (type (or integer null) costs))
+              (mvb-moving-source)
+              (costs costs)))))";
+    let _ = read_from_string_in_env(SOURCE, &mut env).unwrap();
+    egcl_rt::gc::collect_t0_minor().unwrap();
+    let _ = arena_cons(NIL, NIL);
+    egcl_rt::rooted!(source = read_from_string_in_env(SOURCE, &mut env).unwrap().0);
+    egcl_rt::rooted!(source_parts = list_to_vec(*source));
+    egcl_rt::rooted!(symbol_scope = list_to_vec(source_parts[3]));
+    egcl_rt::rooted!(outer_value = cp(cp(cp(symbol_scope[1]).0).1).0);
+    egcl_rt::rooted!(macro_scope = list_to_vec(symbol_scope[2]));
+    egcl_rt::rooted!(original_mvb = list_to_vec(macro_scope[2]));
+    egcl_rt::rooted!(binders = original_mvb[1]);
+    egcl_rt::rooted!(variable = cp(*binders).0);
+    egcl_rt::rooted!(declaration = original_mvb[3]);
+    let before_binders = binders.to_raw();
+    egcl_rt::rooted!(expanded = expand_load_source_function(*source, &env).unwrap());
+    assert_ne!(
+        binders.to_raw(),
+        before_binders,
+        "binding-name list must actually relocate during expansion"
+    );
+    egcl_rt::rooted!(output = list_to_vec(*expanded));
+    egcl_rt::rooted!(mvb = list_to_vec(output[3]));
+    assert_eq!(
+        mvb[1], *binders,
+        "binding names are exact data, not a macro call"
+    );
+    assert_eq!(
+        mvb[2], *outer_value,
+        "value form sees the outer symbol macro before MVB bindings"
+    );
+    assert_eq!(
+        mvb[3], *declaration,
+        "declarations and compound type data stay intact"
+    );
+    assert_eq!(mvb[4], EgclVal::from_fixnum(42));
+    assert_eq!(
+        list_to_vec(mvb[5]),
+        vec![
+            EgclVal::from_symbol_index(reader::find_symbol_index("LIST").unwrap()),
+            *variable,
+        ],
+        "body variable shadows the symbol macro while its function macro remains visible"
+    );
+}
