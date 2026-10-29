@@ -750,6 +750,7 @@ impl PackageRegistry {
             .map_err(|_| lock_poisoned_error("package deletion"))?;
         let deleted = pkg.object;
         drop(pkg);
+        egcl_rt::symbols::detach_package_symbols(deleted);
         egcl_rt::packages::unregister(deleted);
 
         for package in store.packages.values() {
@@ -1039,6 +1040,10 @@ pub fn unintern(symbol: EgclVal, package: EgclVal) -> Result<bool, EgclError> {
     target.internal_symbols.remove(&name);
     target.external_symbols.remove(&name);
     target.shadowing_symbols.remove(&name);
+    drop(target);
+    if let Some(index) = symbol.symbol_index() {
+        egcl_rt::symbols::detach_symbol_from_package(index, package);
+    }
 
     Ok(true)
 }
@@ -1171,11 +1176,27 @@ pub fn shadowing_import(symbols: &[EgclVal], package: EgclVal) -> Result<(), Egc
         .write()
         .map_err(|_| lock_poisoned_error("shadowing-import"))?;
 
+    let mut displaced = Vec::new();
     for (&sym, name) in symbols.iter().zip(resolved) {
-        target.internal_symbols.remove(&name);
-        target.external_symbols.remove(&name);
+        for old in [
+            target.internal_symbols.remove(&name),
+            target.external_symbols.remove(&name),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if old != sym {
+                displaced.push(old);
+            }
+        }
         target.internal_symbols.insert(&name, sym);
         target.shadowing_symbols.insert(name);
+    }
+    drop(target);
+    for symbol in displaced {
+        if let Some(index) = symbol.symbol_index() {
+            egcl_rt::symbols::detach_symbol_from_package(index, package);
+        }
     }
     Ok(())
 }
@@ -1763,6 +1784,7 @@ pub fn delete_package(name: &str) -> Result<(), EgclError> {
     if let Some(pkg) = g.packages.remove(&id) {
         if let Ok(pkg) = pkg.read() {
             drop(pkg);
+            egcl_rt::symbols::detach_package_symbols(package);
             egcl_rt::packages::unregister(package);
         }
     }

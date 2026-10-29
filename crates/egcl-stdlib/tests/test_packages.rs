@@ -370,3 +370,54 @@ fn activation_guard_restores_previous_active_store() {
         Some((inner_sym, InternStatus::Internal))
     );
 }
+
+#[test]
+fn package_lifecycle_retires_owned_keys_and_preserves_retained_symbol_cells() {
+    let mut registry = fresh_registry();
+    let first = registry.make_package("LIFECYCLE-STDLIB", &[], &[]).unwrap();
+    let (old, _) = intern("FOO", first).unwrap();
+    let index = old.as_symbol_index();
+    let value = egcl_rt::EgclVal::from_fixnum(71);
+    egcl_rt::symbols::set_symbol_value(index, value);
+    egcl_rt::symbols::set_symbol_function(index, value);
+    egcl_rt::symbols::set_symbol_plist(index, value);
+    assert!(unintern(old, first).unwrap());
+    assert_eq!(egcl_rt::symbols::registry_key(index), None);
+    assert_eq!(egcl_rt::symbols::symbol_package(index), Some(egcl_rt::value::NIL));
+    let (current, status) = intern("FOO", first).unwrap();
+    assert_eq!(status, InternStatus::New);
+    assert_ne!(current, old);
+    assert_eq!(
+        egcl_rt::symbols::symbol_package(current.as_symbol_index()),
+        Some(first)
+    );
+    // Repeating retirement of an old detached symbol cannot erase the newer
+    // binding of the same spelling.
+    egcl_rt::symbols::detach_symbol_from_package(index, first);
+    assert_eq!(intern("FOO", first).unwrap().0, current);
+    registry.delete_package("LIFECYCLE-STDLIB").unwrap();
+    assert_eq!(
+        egcl_rt::symbols::registry_key(current.as_symbol_index()),
+        None
+    );
+    let next = registry.make_package("LIFECYCLE-STDLIB", &[], &[]).unwrap();
+    shadow(&["FOO"], next).unwrap();
+    let newest = find_symbol("FOO", next).unwrap().unwrap().0;
+    assert_ne!(newest, old);
+    assert_ne!(newest, current);
+    // An old package object's cleanup cannot erase the new incarnation.
+    egcl_rt::symbols::detach_package_symbols(first);
+    assert_eq!(intern("FOO", next).unwrap().0, newest);
+    assert_eq!(egcl_rt::symbols::symbol_value(index), Some(value));
+    assert_eq!(egcl_rt::symbols::symbol_function(index), Some(value));
+    assert_eq!(egcl_rt::symbols::symbol_plist(index), Some(value));
+    assert_eq!(
+        egcl_rt::symbols::symbol_name(index).as_deref(),
+        Some("LIFECYCLE-STDLIB::FOO")
+    );
+    delete_package("LIFECYCLE-STDLIB").unwrap();
+    assert_eq!(
+        egcl_rt::symbols::symbol_package(newest.as_symbol_index()),
+        Some(egcl_rt::value::NIL)
+    );
+}

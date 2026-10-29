@@ -452,6 +452,24 @@ pub fn print_symbol_name(name: &str, escapep: bool) -> String {
 /// bare is a single token quoted whole (`|PR2::ZED|`). Without `*print-escape*`
 /// only the name's characters are output (CLHS 22.1.3.3).
 pub fn print_symbol_for_output(symbol: EgclVal, escapep: bool) -> String {
+    // A low-index symbol can lose its home through UNINTERN/DELETE-PACKAGE.
+    // Its saved name still carries the old qualifier, which must not point at
+    // a new package incarnation when printing the retained homeless symbol.
+    if let Some(index) = symbol.symbol_index()
+        && !egcl_rt::symbols::is_uninterned(index)
+        && egcl_rt::symbols::registry_key(index).is_none()
+        && egcl_rt::symbols::symbol_package(index).is_some_and(|home| home.is_nil())
+        && let Some(name) = egcl_rt::symbols::symbol_name(index)
+    {
+        let bare = egcl_rt::symbols::split_registry_key(&name)
+            .map_or(name.as_str(), |(_, bare)| bare);
+        let printed = print_symbol_name(bare, escapep);
+        return if escapep && print_gensym() {
+            format!("#:{printed}")
+        } else {
+            printed
+        };
+    }
     let (qualifier, name) = symbol_print_parts(symbol);
     match qualifier {
         None => print_symbol_name(&name, escapep),

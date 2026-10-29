@@ -8,6 +8,10 @@
   load-form objects initialize in the required order
   ([#818](https://github.com/atgreen/evergreen/pull/818)).
 
+- Reusing a deleted package name creates fresh symbols, and `SYMBOL-PACKAGE`
+  no longer recreates deleted packages. Retained symbols preserve their cells
+  and saved-image identity ([#819](https://github.com/atgreen/evergreen/pull/819)).
+
 - Recursive reader operands skip reader macros that return no values, so
   feature conditionals work beneath quote, backquote, and dispatch literals
   ([#815](https://github.com/atgreen/evergreen/pull/815)).
