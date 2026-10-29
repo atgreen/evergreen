@@ -50905,3 +50905,6 @@ mod evaluator_error_boundary_rooting_tests {
 
 #[cfg(test)]
 mod subtype_canonicalization_rooting_tests;
+
+#[cfg(test)]
+mod print_circle_gc_tests;
