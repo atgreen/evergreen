@@ -16,6 +16,12 @@
 
 ### Fixed
 
+- Apple ARM64 scalar foreign calls use natural-width fixed stack arguments,
+  stack-based variadic arguments and caller-side narrow integer extension.
+  ARM64 variadic promotions also transform float and small-integer values
+  correctly. SDK/device and neighboring ARM64 execution remain unvalidated
+  ([#900](https://github.com/atgreen/evergreen/pull/900)).
+
 - FORMAT slash directives look up internal functions with either `~/pkg:name/`
   or `~/pkg::name/`, treating the remaining name literally instead of applying
   reader export and escape rules
