@@ -12541,6 +12541,10 @@ fn print_val_inner(mut val: EgclVal, out: &mut String) {
 
 fn print_val_body(mut val: EgclVal, out: &mut String) {
     egcl_rt::rooted_ref!(_val_root = &mut val);
+    if let Some(text) = egcl_stdlib::format::concise_array_representation(val) {
+        out.push_str(&text);
+        return;
+    }
     if let Some(text) = egcl_stdlib::format::u8_readable_representation(val) {
         out.push_str(&text);
         return;
