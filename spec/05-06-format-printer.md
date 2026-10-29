@@ -257,7 +257,7 @@ thread-local LRU (capacity: 256, keyed by string `eq`).
 
 ### Justification `~<...~>`
 
-- **Text mode**: triggered by `~>` without a colon. Segments are spaced within mincol; modifiers on the opening directive retain their justification meanings (`~@<` right-justifies and `~:@<` centers).
+- **Text mode**: triggered by `~>` without a colon. Segments are spaced within mincol; `minpad` sets the minimum between-segment padding. An opening colon adds leading padding, and an opening at-sign adds trailing padding. With neither modifier, a lone segment is right-justified without applying `minpad` to its implicit leading slot.
 - **Logical-block mode**: triggered by `~:>` (colon modifier on the closing directive). Provides prefix/suffix/body for the pretty-printer; `~;` separates those segments and `~@;` selects a per-line prefix. A colon on the opening `~<` supplies the default parenthesis prefix and suffix; it does not select the mode. Pretty-printer-only directives in a text justification are an error (`format-error`).
 
 ### Up-and-Out `~^`

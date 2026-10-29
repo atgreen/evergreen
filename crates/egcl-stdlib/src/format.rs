@@ -5346,15 +5346,20 @@ fn format_impl(
                     // segment with neither modifier would have no gap at all, so
                     // CLHS gives it the leading one — that is what makes plain
                     // ~mincol<text~> right-justify.
-                    let pad_before = colon || (parts.len() == 1 && !at_sign);
+                    let implicit_before = parts.len() == 1 && !colon && !at_sign;
+                    let pad_before = colon || implicit_before;
                     let pad_after = at_sign;
+                    // A lone segment's implicit leading slot only distributes
+                    // field slack: it is not a between-segment minpad gap.
+                    // Explicit :/@ slots retain their minimum padding.
+                    let gap_minpad = if implicit_before { 0 } else { minpad };
                     let gaps = parts.len().saturating_sub(1)
                         + usize::from(pad_before)
                         + usize::from(pad_after);
 
                     // Field width is mincol, grown by whole multiples of colinc
                     // until the segments and their minimum padding fit.
-                    let needed = total_len + gaps * minpad;
+                    let needed = total_len + gaps * gap_minpad;
                     let width = if needed <= mincol {
                         mincol
                     } else {
@@ -5363,11 +5368,11 @@ fn format_impl(
 
                     // Spread the slack evenly; the remainder favours the LATER
                     // gaps (verified against SBCL: ~10:@<abc~> is "   abc    ").
-                    let extra = width - total_len - gaps * minpad;
+                    let extra = width - total_len - gaps * gap_minpad;
                     let per_gap = if gaps > 0 { extra / gaps } else { 0 };
                     let rem = if gaps > 0 { extra % gaps } else { 0 };
                     let gap_width =
-                        |g: usize| -> usize { minpad + per_gap + usize::from(g + rem >= gaps) };
+                        |g: usize| -> usize { gap_minpad + per_gap + usize::from(g + rem >= gaps) };
 
                     let mut g = 0usize;
                     let mut justified = String::new();
