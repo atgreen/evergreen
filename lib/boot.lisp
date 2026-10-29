@@ -1351,6 +1351,13 @@
         (t (error "~S is not a feature expression" expression))))
 (defun egcl::%standard-dispatch-reader-macro (stream sub-char arg)
   (case sub-char
+    (#\'
+     ;; FUNCTION's operand is read recursively in the caller's readtable.
+     ;; Re-reading a synthesized #' prefix with the standard readtable would
+     ;; bypass user comma/list readers inside a custom backquote reader.
+     ;; Like the ordinary reader, ignore a numeric parameter; READ applies
+     ;; *READ-SUPPRESS* while consuming the operand.
+     (list 'function (read stream t nil t)))
     ((#\+ #\-)
      (let* ((feature (let ((*package* (find-package :keyword))
                            (*read-suppress* nil))
