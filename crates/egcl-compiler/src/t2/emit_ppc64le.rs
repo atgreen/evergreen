@@ -93,7 +93,9 @@
 //! overflow; `Guard` for CONS and (CONS OR NULL), `Car`/`Cdr` on a proven cons, `GenericEq`,
 //! the five single-float comparisons (`fcmpu` then `isel` of T/NIL, deopting
 //! on an unordered compare so the interpreter decides NaN ordering),
-//! `FixnumMin`/`FixnumMax` as a plain select of a tagged operand,
+//! `FixnumMin`/`FixnumMax` as a plain select of a tagged operand, the
+//! `FixnumDiv`/`FixnumFloor`/`FixnumRem`/`FixnumMod` family through `divd`
+//! with an explicit zero-divisor exit and a quotient range check,
 //! `LogAnd/Or/Xor/Not` and `FixnumShl/Shr` by a constant, and the builder's
 //! target-free `Call` for `MULTIPLE-VALUE-LIST` (`AuxData::ValuesToList`) and
 //! for non-capturing closure creation (`AuxData::NestedClosure`), both of which
@@ -418,6 +420,54 @@ impl Emitter<'_> {
         self.asm.sradi(ADDR, W0, 63);
         self.asm.compare(0, T1, ADDR);
         self.asm.branch(Cc::Ne, 0, deopt);
+    }
+
+    /// Divide tagged fixnums, as emit_a64.rs's `divide_fixnums` does it.
+    ///
+    /// Both operands arrive tagged by the same shift, so `divd` of the tagged
+    /// words yields an UNTAGGED quotient, and the remainder derived from it is
+    /// already tagged. POWER has no fused multiply-subtract, so the remainder
+    /// is `mulld` then `subf` rather than AArch64's single `msub`.
+    ///
+    /// A zero divisor deopts before the divide: `divd` by zero is
+    /// architecturally undefined on this machine rather than trapping, so
+    /// native code must not reach it. The other undefined case, `i64::MIN /
+    /// -1`, cannot arise -- a tagged divisor is a multiple of eight and so is
+    /// never -1 -- which is the same reason emit.rs can ignore IDIV's trap.
+    fn divide_fixnums(&mut self, opcode: Opcode, deopt: Label) -> Result<(), EmitError> {
+        use Opcode::*;
+        self.asm.compare_imm(0, W1, 0);
+        self.asm.branch(Cc::E, 0, deopt);
+        self.asm.divd(T0, W0, W1);
+        self.asm.mulld(T1, T0, W1);
+        // `subf rD, rA, rB` is rB - rA, so this is dividend - quotient*divisor.
+        self.asm.subf(T1, T1, W0);
+        if matches!(opcode, FixnumMod | FixnumFloor) {
+            // FLOOR and MOD differ from TRUNCATE and REM only when the
+            // division is inexact AND the remainder's sign disagrees with the
+            // divisor's: then the floored quotient is one lower and the
+            // floored remainder one divisor higher. The dividend in W0 is dead
+            // from here, so it serves as the scratch for the sign test.
+            let truncated = self.asm.label();
+            self.asm.compare_imm(0, T1, 0);
+            self.asm.branch(Cc::E, 0, truncated);
+            self.asm.xor(W0, T1, W1);
+            self.asm.compare_imm(0, W0, 0);
+            self.asm.branch(Cc::Ge, 0, truncated);
+            self.asm.addi(T0, T0, -1);
+            self.asm.add(T1, T1, W1);
+            self.asm.bind(truncated);
+        }
+        if matches!(opcode, FixnumMod | FixnumRem) {
+            self.asm.mov(W0, T1);
+            return Ok(());
+        }
+        // Only the positive end can overflow: |quotient| <= |dividend|, and
+        // MIN-FIXNUM is itself a fixnum, so a one-sided check is exact.
+        self.compare_imm(T0, ((1_i64 << 60) - 1) as u64);
+        self.asm.branch(Cc::G, 0, deopt);
+        self.asm.sldi(W0, T0, 3);
+        Ok(())
     }
 
     /// Add or subtract tagged fixnums with an explicit sign-overflow test, for the
@@ -772,22 +822,28 @@ impl Emitter<'_> {
                 self.asm.isel(W0, T0, T1, cc, 0);
                 return self.store(result, W0);
             }
-            FixnumMin | FixnumMax => {
-                // Both operands are tagged by the same shift, so the signed
-                // order of the tagged words is the operands' order, the winner
-                // is already tagged, and nothing can overflow. Ties keep the
-                // first operand, as emit.rs's `jcc Le/Ge` does.
+            FixnumMin | FixnumMax | FixnumDiv | FixnumFloor | FixnumRem | FixnumMod => {
                 let deopt = self.deopt_label(data)?;
                 self.guard_fixnum(W0, deopt);
                 self.load(*data.args.get(1).ok_or_else(unsupported)?, W1)?;
                 self.guard_fixnum(W1, deopt);
-                self.asm.compare(0, W0, W1);
-                let cc = if data.opcode == FixnumMin {
-                    Cc::Le
-                } else {
-                    Cc::Ge
-                };
-                self.asm.isel(W0, W0, W1, cc, 0);
+                match data.opcode {
+                    // Selecting one of two operands tagged by the same shift:
+                    // the signed order of the tagged words is the operands'
+                    // order, the winner is already tagged, and nothing can
+                    // overflow. Ties keep the first operand, as emit.rs's
+                    // `jcc Le/Ge` does.
+                    FixnumMin | FixnumMax => {
+                        self.asm.compare(0, W0, W1);
+                        let cc = if data.opcode == FixnumMin {
+                            Cc::Le
+                        } else {
+                            Cc::Ge
+                        };
+                        self.asm.isel(W0, W0, W1, cc, 0);
+                    }
+                    other => self.divide_fixnums(other, deopt)?,
+                }
                 return self.store(result, W0);
             }
             FixnumAdd | FixnumSub | FixnumMul | FixnumNeg | FixnumCmpEq | FixnumCmpLt
@@ -1543,6 +1599,10 @@ mod tests {
         for (name, opcode, ty) in [
             ("ppc64le-min", Opcode::FixnumMin, TypeBits::FIXNUM),
             ("ppc64le-max", Opcode::FixnumMax, TypeBits::FIXNUM),
+            ("ppc64le-div", Opcode::FixnumDiv, TypeBits::FIXNUM),
+            ("ppc64le-floor", Opcode::FixnumFloor, TypeBits::FIXNUM),
+            ("ppc64le-rem", Opcode::FixnumRem, TypeBits::FIXNUM),
+            ("ppc64le-mod", Opcode::FixnumMod, TypeBits::FIXNUM),
             ("ppc64le-flt", Opcode::FloatCmpLt, TypeBits::SINGLE_FLOAT),
             ("ppc64le-fle", Opcode::FloatCmpLe, TypeBits::SINGLE_FLOAT),
             ("ppc64le-fgt", Opcode::FloatCmpGt, TypeBits::SINGLE_FLOAT),
@@ -1629,6 +1689,68 @@ mod tests {
             for (a, b) in [(f32::NAN, 1.5f32), (1.5, f32::NAN), (f32::NAN, f32::NAN)] {
                 assert!(run(&f, sf(a), sf(b)).1, "{a} {name} {b} must deopt");
             }
+        }
+    }
+
+    /// TRUNCATE/REM against FLOOR/MOD, which differ exactly when the division
+    /// is inexact and the remainder's sign disagrees with the divisor's -- so
+    /// the four mixed-sign rows are the ones that distinguish them, and a
+    /// quotient correction that fires in the wrong direction shows up here.
+    /// Expected values are written out from the Common Lisp definitions rather
+    /// than recomputed with the emitter's own formula, which would only
+    /// confirm itself. A zero divisor must reach the deopt exit: `divd` by
+    /// zero is architecturally undefined on this machine.
+    #[test]
+    #[cfg(all(target_arch = "powerpc64", target_endian = "little"))]
+    fn divides_fixnums_with_common_lisp_truncation_and_flooring() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static DEOPTED: AtomicBool = AtomicBool::new(false);
+        extern "C" fn deopt(_: u64, _: u64, _: *const u64, _: u64) {
+            DEOPTED.store(true, Ordering::Relaxed);
+        }
+        let deopt = deopt as *const () as usize as u64;
+        let run = |opcode: Opcode, a: i64, b: i64| {
+            DEOPTED.store(false, Ordering::Relaxed);
+            let f = binary("div", opcode, IRType::of(TypeBits::FIXNUM));
+            let compiled = emit_framed(&f, deopt, 2).expect("emit");
+            let buffer = egcl_rt::jit::JitBuffer::new(&compiled.code).unwrap();
+            let entry: extern "C" fn(*mut u64) -> u64 =
+                unsafe { std::mem::transmute(buffer.as_ptr()) };
+            let mut slots = [EgclVal::from_fixnum(a).0, EgclVal::from_fixnum(b).0];
+            let answer = entry(slots.as_mut_ptr());
+            (answer, DEOPTED.load(Ordering::Relaxed))
+        };
+
+        //        a    b   trunc-q  rem  floor-q  mod
+        for (a, b, tq, rem, fq, md) in [
+            (7_i64, 3_i64, 2_i64, 1_i64, 2_i64, 1_i64),
+            (-7, 3, -2, -1, -3, 2),
+            (7, -3, -2, 1, -3, -2),
+            (-7, -3, 2, -1, 2, -1),
+            (6, 3, 2, 0, 2, 0),
+            (-6, 3, -2, 0, -2, 0),
+        ] {
+            for (opcode, expected, what) in [
+                (Opcode::FixnumDiv, tq, "truncate quotient"),
+                (Opcode::FixnumRem, rem, "truncate remainder"),
+                (Opcode::FixnumFloor, fq, "floor quotient"),
+                (Opcode::FixnumMod, md, "floor remainder"),
+            ] {
+                let (answer, deopted) = run(opcode, a, b);
+                assert!(!deopted, "{a} {b} {what} must not deopt");
+                assert_eq!(answer, EgclVal::from_fixnum(expected).0, "{a} {b}: {what}");
+            }
+        }
+
+        // A zero divisor leaves the decision to the interpreter, which signals
+        // DIVISION-BY-ZERO with the program's own restarts and backtrace.
+        for opcode in [
+            Opcode::FixnumDiv,
+            Opcode::FixnumRem,
+            Opcode::FixnumFloor,
+            Opcode::FixnumMod,
+        ] {
+            assert!(run(opcode, 7, 0).1, "a zero divisor must deopt");
         }
     }
 
