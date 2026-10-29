@@ -115,9 +115,18 @@ pub const fn fixnum_division() -> bool {
 /// function instead. To add a target: give its emitter that arm -- the heap
 /// tag, fixnum and bounds tests all answering NIL rather than deopting, and
 /// both the one-byte and four-byte simple layouts -- then name it here.
+///
+/// One portability trap on the way: the header's type id is its HIGH byte, so
+/// it is at offset 7 on a little-endian host and offset 0 on a big-endian one.
+/// emit_s390x reads it through a helper that already knows which end that is,
+/// rather than repeating a literal offset per site.
 pub const fn simple_string_char_access() -> bool {
     cfg!(all(
-        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            target_arch = "s390x"
+        ),
         target_os = "linux"
     ))
 }

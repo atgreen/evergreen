@@ -1389,6 +1389,97 @@ impl Emitter<'_> {
         Ok(())
     }
 
+    /// `(CHAR string index)` inline, answering NIL for anything this fast path
+    /// does not handle, so the caller's `Brif` can take the original call.
+    ///
+    /// NEVER deopts and never signals -- that is the opcode's contract, and
+    /// what separates it from every guard in this emitter. A non-string, a
+    /// complex or displaced string, a non-fixnum or an out-of-range index all
+    /// take the NIL exit, and the slow arm then runs the original call with its
+    /// own frame state, so the error, restarts and backtrace stay the ones the
+    /// program already had.
+    ///
+    /// Layout: `header | char_len @8 | data @16`, one byte per character for
+    /// `SIMPLE_BASE_STRING` and a native-endian `u32` per character for
+    /// `SIMPLE_CHARACTER_STRING`. The length at +8 is the RAW count, so the
+    /// comparison shifts it rather than untagging the index.
+    ///
+    /// The type id sits at offset 0 of the header here, not offset 7 as on a
+    /// little-endian host: it is the header word's HIGH byte, and which end
+    /// that is moves with the byte order. `load_type_id` already reads the
+    /// right end, so this reuses it rather than repeating the offset.
+    fn string_char_or_nil(&mut self, data: &InstData) -> Result<(), EmitError> {
+        use egcl_rt::object::type_id;
+        if data.args.len() != 2
+            || data.results.len() != 1
+            || data.flags.guard
+            || data.frame_state.is_some()
+        {
+            return Err(EmitError::UnsupportedOp(super::emit::op_tag(data.opcode)));
+        }
+        let fail = self.asm.label();
+        let wide = self.asm.label();
+        let loaded = self.asm.label();
+        let done = self.asm.label();
+        self.load(data.args[0], 2)?;
+        self.load(data.args[1], 3)?;
+        // A heap object; an immediate can never be a string.
+        self.asm.mov(4, 2);
+        self.asm.imm64(5, 7);
+        self.asm.and(4, 5);
+        self.asm.imm64(5, egcl_rt::value::TAG_HEAP_OBJECT);
+        self.asm.compare(4, 5);
+        self.asm.branch(6, fail);
+        // A fixnum index: NGR sets the condition code, so nonzero tag bits
+        // fall straight out.
+        self.asm.mov(4, 3);
+        self.asm.imm64(5, 7);
+        self.asm.and(4, 5);
+        self.asm.branch(6, fail);
+        // Non-negative, and below the character count. Both compare as tagged
+        // fixnums, which preserves the order of every representable length.
+        self.asm.imm64(4, 0);
+        self.asm.compare(3, 4);
+        self.asm.branch(4, fail);
+        self.load_type_id();
+        // r1 is the address scratch, as in packed_f64_element_address.
+        self.asm.mov(1, 2);
+        self.asm.imm64(5, !7u64);
+        self.asm.and(1, 5);
+        self.asm.load(5, 1, 8);
+        self.asm.shift_left(5, 5, 3);
+        self.asm.compare(3, 5);
+        self.asm.branch(10, fail);
+        // r3 becomes the raw index; r4 still holds the type id.
+        self.asm.shift_right_signed(3, 3, 3);
+        self.asm.imm64(5, u64::from(type_id::SIMPLE_BASE_STRING));
+        self.asm.compare(4, 5);
+        self.asm.branch(6, wide);
+        self.asm.address(1, 1, 16);
+        self.asm.add(1, 3);
+        self.asm.load_u8(2, 1, 0);
+        self.asm.branch(15, loaded);
+        self.asm.bind(wide);
+        self.asm.imm64(5, u64::from(type_id::SIMPLE_CHARACTER_STRING));
+        self.asm.compare(4, 5);
+        self.asm.branch(6, fail);
+        self.asm.address(1, 1, 16);
+        self.asm.shift_left(3, 3, 2);
+        self.asm.add(1, 3);
+        // LLGF zero-extends: a character code is 21 bits, so the rest of the
+        // word must not be read as part of it.
+        self.asm.load_u32(2, 1, 0);
+        self.asm.bind(loaded);
+        self.asm.shift_left(2, 2, 3);
+        self.asm.imm64(3, egcl_rt::value::TAG_CHARACTER);
+        self.asm.or(2, 3);
+        self.asm.branch(15, done);
+        self.asm.bind(fail);
+        self.asm.imm64(2, NIL.0);
+        self.asm.bind(done);
+        Ok(())
+    }
+
     /// Leave the address of packed element `index` of `array` in r1, or
     /// deopt. Mirrors emit.rs's packed_f64_element_address guard for guard,
     /// reading the header as a whole word rather than at byte offsets, since
@@ -2045,6 +2136,7 @@ impl Emitter<'_> {
                 self.asm.load(2, 4, 8);
                 self.asm.shift_left(2, 2, 3);
             }
+            StringCharOrNil => self.string_char_or_nil(data)?,
             StringAsciiCharAt => {
                 if data.args.len() != 2
                     || !data.flags.guard
@@ -4625,6 +4717,143 @@ mod tests {
                     assert_eq!(answer, EgclVal::from_fixnum(0).0, "{opcode:?} remainder");
                 }
             }
+        }
+    }
+
+    /// `StringCharOrNil` reads both simple-string layouts and answers NIL --
+    /// never deopts, never signals -- for everything it does not handle.
+    ///
+    /// Two things here are this target's rather than ported. The header's type
+    /// id is its HIGH byte, which is offset 0 big-endian where a little-endian
+    /// host finds it at 7, so a literal offset copied across would read the
+    /// size class instead. And the four-byte layout is read with LLGF, which
+    /// zero-extends: a character code is 21 bits and the rest of the word must
+    /// not join it.
+    #[test]
+    fn string_char_or_nil_reads_both_layouts_and_answers_nil_otherwise() {
+        fn char_at() -> Function {
+            let mut f = Function::new("z-string-char");
+            let block = f.entry();
+            let s = f.add_block_param(block, IRType::TOP, ValueRepresentation::Tagged);
+            let i = f.add_block_param(block, IRType::TOP, ValueRepresentation::Tagged);
+            let (_, out) = f.push_inst(
+                block,
+                InstData {
+                    opcode: Opcode::StringCharOrNil,
+                    args: vec![s, i],
+                    results: vec![],
+                    aux: AuxData::None,
+                    flags: InstFlags::default(),
+                    targets: vec![],
+                    frame_state: None,
+                    source_pos: 0,
+                },
+                &[(IRType::TOP, ValueRepresentation::Tagged)],
+            );
+            f.set_terminator(
+                block,
+                InstData {
+                    opcode: Opcode::Return,
+                    args: vec![out[0]],
+                    results: vec![],
+                    aux: AuxData::None,
+                    flags: InstFlags::default(),
+                    targets: vec![],
+                    frame_state: None,
+                    source_pos: 0,
+                },
+            );
+            f
+        }
+
+        extern "C" fn never(_: u64, _: u64, _: *const u64, _: u64) -> u64 {
+            panic!("StringCharOrNil must never deopt");
+        }
+        let compiled =
+            emit_framed(&char_at(), never as *const () as u64, 2).expect("emits");
+        assert!(!compiled.code.is_empty());
+        #[cfg(all(target_arch = "s390x", unix))]
+        {
+            // Imported here rather than at the top of the test: the
+            // layout constants are read only by this block, so on any
+            // other host the import is dead and `-D warnings` rejects it.
+            use egcl_rt::object::type_id;
+            let code = egcl_rt::jit::JitBuffer::new(&compiled.code).unwrap();
+            // SAFETY: the buffer owns the generated C-ABI activation entry.
+            let entry: unsafe extern "C" fn(*mut u64) -> u64 =
+                unsafe { std::mem::transmute(code.as_ptr()) };
+
+            // header | char_len @8 | data @16. The type id is the header's
+            // high byte, which big-endian puts at offset 0.
+            let mut base: Vec<u64> = vec![0; 6];
+            base[0] = u64::from(type_id::SIMPLE_BASE_STRING) << 56 | 1;
+            base[1] = 3; // three characters
+            let bytes = unsafe {
+                std::slice::from_raw_parts_mut(base.as_mut_ptr().cast::<u8>().add(16), 3)
+            };
+            bytes.copy_from_slice(b"abc");
+
+            let mut wide: Vec<u64> = vec![0; 8];
+            wide[0] = u64::from(type_id::SIMPLE_CHARACTER_STRING) << 56 | 1;
+            wide[1] = 3;
+            let words = unsafe {
+                std::slice::from_raw_parts_mut(wide.as_mut_ptr().cast::<u32>().add(4), 3)
+            };
+            // A code above 0xFFFF, so a truncating or sign-extending load shows.
+            words.copy_from_slice(&[b'x' as u32, 0x1F600, 0x10FFFF]);
+
+            let tagged = |v: &mut Vec<u64>| {
+                v.as_mut_ptr() as u64 | egcl_rt::value::TAG_HEAP_OBJECT
+            };
+            let run = |s: u64, i: u64| {
+                let mut slots = vec![s, i, 0, 0];
+                unsafe { entry(slots.as_mut_ptr()) }
+            };
+            let ch = |c: u32| (u64::from(c) << 3) | egcl_rt::value::TAG_CHARACTER;
+
+            let bs = tagged(&mut base);
+            for (index, want) in [(0u32, b'a'), (1, b'b'), (2, b'c')] {
+                assert_eq!(
+                    run(bs, EgclVal::from_fixnum(i64::from(index)).0),
+                    ch(u32::from(want)),
+                    "base string index {index}"
+                );
+            }
+            let ws = tagged(&mut wide);
+            for (index, want) in [(0u32, u32::from(b'x')), (1, 0x1F600), (2, 0x10FFFF)] {
+                assert_eq!(
+                    run(ws, EgclVal::from_fixnum(i64::from(index)).0),
+                    ch(want),
+                    "character string index {index}"
+                );
+            }
+            // Every rejected shape answers NIL rather than deopting. The deopt
+            // adapter panics, so a wrong exit fails loudly rather than quietly.
+            assert_eq!(run(bs, EgclVal::from_fixnum(3).0), NIL.0, "index == length");
+            assert_eq!(run(bs, EgclVal::from_fixnum(99).0), NIL.0, "far past the end");
+            assert_eq!(run(bs, EgclVal::from_fixnum(-1).0), NIL.0, "negative index");
+            assert_eq!(run(ws, EgclVal::from_fixnum(3).0), NIL.0, "wide: past the end");
+            assert_eq!(run(bs, NIL.0), NIL.0, "non-fixnum index");
+            assert_eq!(
+                run(bs, EgclVal::from_single_float(1.0).0),
+                NIL.0,
+                "single-float index"
+            );
+            assert_eq!(
+                run(EgclVal::from_fixnum(7).0, EgclVal::from_fixnum(0).0),
+                NIL.0,
+                "a fixnum is not a string"
+            );
+            assert_eq!(run(NIL.0, EgclVal::from_fixnum(0).0), NIL.0, "NIL is not a string");
+            // A heap object of some other type: right tag, wrong type id.
+            let mut other: Vec<u64> = vec![0; 4];
+            other[0] = u64::from(type_id::HASH_TABLE) << 56 | 1;
+            other[1] = 3;
+            assert_eq!(
+                run(tagged(&mut other), EgclVal::from_fixnum(0).0),
+                NIL.0,
+                "a non-string heap object"
+            );
         }
     }
 }
