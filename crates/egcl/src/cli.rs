@@ -13140,19 +13140,19 @@ fn print_list_body(val: EgclVal, out: &mut String) {
     let mut count = 0usize;
     let mut first = true;
     while cur.is_cons() {
+        if limit.is_some_and(|n| count >= n) {
+            if count > 0 {
+                out.push(' ');
+            }
+            out.push_str("...");
+            return;
+        }
         // *PRINT-CIRCLE*: a shared/circular cons in the cdr position prints as a
         // dotted tail so its own #N=/#N# label appears (the head cons, `first`,
         // was already labelled by the caller).
         if !first && circle && egcl_stdlib::format::circle_is_shared(*cur) {
             out.push_str(" . ");
             print_val(*cur, out);
-            return;
-        }
-        if limit.is_some_and(|n| count >= n) {
-            if count > 0 {
-                out.push(' ');
-            }
-            out.push_str("...");
             return;
         }
         if count > 0 {
