@@ -46,8 +46,10 @@ fn observe_osr() {
                     .map(|code| (state.symbol, code, state.replacement_function));
             }
         } else if owner == state.next_owner {
-            assert!(native_transfer_entry::native_poll::initialized_for_test(),
-                "the alternate T2 OSR entry must initialize its generated poll control");
+            assert!(
+                native_transfer_entry::native_poll::initialized_for_test(),
+                "the alternate T2 OSR entry must initialize its generated poll control"
+            );
             assert_eq!(
                 frame, state.frame,
                 "OSR must retain this managed activation"
@@ -217,8 +219,9 @@ fn exercise_ordinary_osr(inherited_scopes: bool, fail_entry_guard: bool, replace
         .with_gc_stable_mutator(compile_t2_artifact)
         .expect("ordinary worker artifact");
     let next = install_t2_completion(T2Completion {
-                    panicked: false,
-                    _permit: None, dependencies: Vec::new(),
+        panicked: false,
+        _permit: None,
+        dependencies: Vec::new(),
         sym: symbol,
         generation,
         artifact: Some(artifact),
@@ -610,8 +613,9 @@ fn ordinary_mapped_child_osr_retains_parent_and_current_child_activation() {
         .with_gc_stable_mutator(compile_t2_artifact)
         .expect("ordinary child worker artifact");
     let next = install_t2_completion(T2Completion {
-                    panicked: false,
-                    _permit: None, dependencies: Vec::new(),
+        panicked: false,
+        _permit: None,
+        dependencies: Vec::new(),
         sym: symbol,
         generation,
         artifact: Some(artifact),

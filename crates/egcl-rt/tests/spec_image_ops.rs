@@ -1,9 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-use std::fs;
-use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
 use egcl_rt::gc::{
     GcConfig, heap_base_address, init_heap, record_object, set_entry_continuation, walk_heap,
 };
@@ -11,6 +8,9 @@ use egcl_rt::image::{
     ImageCompression, SaveImageOptions, load_image, save_image, validate_image_header,
 };
 use egcl_rt::value::EgclVal;
+use std::fs;
+use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 
 fn gc_config() -> GcConfig {
     GcConfig {
@@ -347,7 +347,10 @@ fn spec_image_loader_preserves_unboxed_pointer_shaped_data() {
         .find(|(_, type_id, _)| *type_id == 0x72)
         .map(|(_, _, data)| u64::from_ne_bytes(data[..8].try_into().unwrap()))
         .expect("restored holder");
-    assert_eq!(holder_field, target_ptr as u64, "unboxed words are not pointer slots");
+    assert_eq!(
+        holder_field, target_ptr as u64,
+        "unboxed words are not pointer slots"
+    );
 }
 
 #[test]

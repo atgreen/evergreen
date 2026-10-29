@@ -372,8 +372,8 @@ fn unregistered_blocks_and_tags_reach_t1_and_t2() {
     for name in ELIDED {
         let prefix = format!(" {name}: ");
         assert!(
-            !log.lines().any(|line| line.contains(&prefix)
-                && line.contains("needs an executing identity")),
+            !log.lines()
+                .any(|line| line.contains(&prefix) && line.contains("needs an executing identity")),
             "{name} still registers a block or tag:\n{log}"
         );
     }

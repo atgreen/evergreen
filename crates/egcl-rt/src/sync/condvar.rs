@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-use super::{BlockingMode, FiberWaiter, EgclMutex, blocking_mode, timer};
+use super::{BlockingMode, EgclMutex, FiberWaiter, blocking_mode, timer};
 use crate::error::EgclError;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};

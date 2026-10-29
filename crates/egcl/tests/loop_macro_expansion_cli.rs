@@ -29,8 +29,12 @@ fn loop_expansion_rejects_duplicate_variable_bindings() {
         .args(["--no-init", "--eval", source])
         .output()
         .unwrap();
-    assert!(output.status.success(), "{}\n{}",
-        String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(String::from_utf8_lossy(&output.stdout).contains("LOOP-DUPLICATE-BINDINGS-OK"));
 }
 
@@ -55,8 +59,12 @@ fn loop_expansion_rejects_incompatible_implicit_results() {
         .args(["--no-init", "--eval", source])
         .output()
         .unwrap();
-    assert!(output.status.success(), "{}\n{}",
-        String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(String::from_utf8_lossy(&output.stdout).contains("LOOP-RESULT-COMPATIBILITY-OK"));
 }
 
@@ -82,8 +90,12 @@ fn loop_list_step_form_is_evaluated_once() {
         .args(["--no-init", "--eval", source])
         .output()
         .unwrap();
-    assert!(output.status.success(), "{}\n{}",
-        String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(String::from_utf8_lossy(&output.stdout).contains("LOOP-LIST-STEP-OK"));
 }
 
@@ -116,8 +128,12 @@ fn loop_arithmetic_options_preserve_source_order() {
         .args(["--no-init", "--eval", source])
         .output()
         .unwrap();
-    assert!(output.status.success(), "{}\n{}",
-        String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(String::from_utf8_lossy(&output.stdout).contains("LOOP-ARITHMETIC-ORDER-OK"));
 }
 
@@ -154,8 +170,12 @@ fn loop_expansion_handles_package_paths_and_parallel_hash_values() {
         .args(["--no-init", "--eval", source])
         .output()
         .unwrap();
-    assert!(output.status.success(), "{}\n{}",
-        String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(String::from_utf8_lossy(&output.stdout).contains("LOOP-PATHS-OK"));
 }
 
@@ -270,8 +290,13 @@ fn conditional_it_is_limited_to_the_first_following_clause() {
     "#;
     let output = Command::new(env!("CARGO_BIN_EXE_egcl"))
         .args(["--no-init", "--eval", source])
-        .output().unwrap();
-    assert!(output.status.success(), "{}\n{}",
-        String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(String::from_utf8_lossy(&output.stdout).contains("LOOP-CONDITIONAL-IT-OK"));
 }

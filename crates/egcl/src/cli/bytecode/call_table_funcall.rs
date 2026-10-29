@@ -239,7 +239,9 @@ pub(super) fn names_funcall_or_apply(symbol: u32) -> bool {
     }
     NAMES.with(|names| {
         let mut names = names.borrow_mut();
-        names.iter_mut().any(|name| name.refreshed_index() == Some(symbol))
+        names
+            .iter_mut()
+            .any(|name| name.refreshed_index() == Some(symbol))
     })
 }
 
@@ -388,7 +390,8 @@ mod tests {
             codes.push(
                 install_t2_completion(T2Completion {
                     panicked: false,
-                    _permit: None, dependencies: Vec::new(),
+                    _permit: None,
+                    dependencies: Vec::new(),
                     sym: symbol,
                     generation,
                     artifact: Some(artifact),
@@ -402,19 +405,30 @@ mod tests {
             if checked_native_installation_allowed() {
                 assert!(cache.select(functions[0]));
                 assert!(cache.select(functions[1]));
-                assert!(cache.versions.iter().any(|entry| entry.owns(&codes[0])),
-                    "switching callbacks must retain the previous checked adapter");
+                assert!(
+                    cache.versions.iter().any(|entry| entry.owns(&codes[0])),
+                    "switching callbacks must retain the previous checked adapter"
+                );
                 assert_eq!(cache.versions.len(), 2);
             } else {
                 assert!(!cache.select(functions[0]));
                 assert!(!cache.select(functions[1]));
-                assert!(cache.versions.is_empty(), "checked adapters must reject mapped code");
+                assert!(
+                    cache.versions.is_empty(),
+                    "checked adapters must reject mapped code"
+                );
                 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
                 for (index, expected) in [17, 23].into_iter().enumerate() {
-                    assert!(matches!(codes[index]._storage, NativeCodeStorage::Mapped(_)));
+                    assert!(matches!(
+                        codes[index]._storage,
+                        NativeCodeStorage::Mapped(_)
+                    ));
                     let symbol = egcl_rt::function::name(functions[index]).as_symbol_index();
-                    assert_eq!(run_native_callable(&codes[index], symbol, functions[index], &[], &mut env).unwrap(),
-                        EgclVal::from_fixnum(expected));
+                    assert_eq!(
+                        run_native_callable(&codes[index], symbol, functions[index], &[], &mut env)
+                            .unwrap(),
+                        EgclVal::from_fixnum(expected)
+                    );
                 }
             }
         }

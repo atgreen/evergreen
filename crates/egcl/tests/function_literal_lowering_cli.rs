@@ -74,7 +74,12 @@ fn loaded_bytecode_compiles_function_literals_and_warms_boa_constructors() {
     let source = directory.join("literal.lisp");
     let artifact = directory.join("literal.bfasl");
     fs::write(&source, SOURCE).unwrap();
-    run(&format!("(multiple-value-bind (path warnings failure) (compile-file {source:?} :output-file {artifact:?}) (declare (ignore warnings)) (assert path) (assert (not failure))) (write-line \"FUNCTION-LITERAL-OK\")"), false);
+    run(
+        &format!(
+            "(multiple-value-bind (path warnings failure) (compile-file {source:?} :output-file {artifact:?}) (declare (ignore warnings)) (assert path) (assert (not failure))) (write-line \"FUNCTION-LITERAL-OK\")"
+        ),
+        false,
+    );
     let bytes = fs::read(&artifact).unwrap();
     if bytes.starts_with(b"BFASL\0") {
         let count = u32::from_le_bytes(bytes[20..24].try_into().unwrap());
@@ -137,7 +142,9 @@ fn compile_file_never_persists_a_process_local_closure_id() {
     let stdout = run(&compile, false);
     fs::remove_file(source).unwrap();
     if stdout.contains("FUNCTION-LITERAL-COMPILED") {
-        let program = format!("(load {artifact:?}) (assert (= (saved-function-literal) 42)) (write-line \"FUNCTION-LITERAL-OK\")");
+        let program = format!(
+            "(load {artifact:?}) (assert (= (saved-function-literal) 42)) (write-line \"FUNCTION-LITERAL-OK\")"
+        );
         assert_eq!(run(&program, false), run(&program, true));
     } else {
         assert!(stdout.contains("FUNCTION-LITERAL-REJECTED"));

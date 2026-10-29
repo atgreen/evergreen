@@ -8,7 +8,7 @@ use egcl_rt::{
     jit::JitBuffer,
     value::NIL,
 };
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 // SysV adapter used only by this test: 7 actual tagged arguments, full ordinary
 // register contract, and writable output independent of the callee's registers.
@@ -35,8 +35,12 @@ unsafe extern "C" fn run(
 }
 #[unsafe(naked)]
 unsafe extern "C" fn run_with_stack_bound(
-    _entry: *const u8, _args: *const u64, _count: usize,
-    _execution: *const LispExecutionContext, _out: *mut u64, _distance: usize,
+    _entry: *const u8,
+    _args: *const u64,
+    _count: usize,
+    _execution: *const LispExecutionContext,
+    _out: *mut u64,
+    _distance: usize,
 ) {
     core::arch::naked_asm!(
         "push rbp", "push rbx", "push r12", "push r13", "push r14", "push r15",
@@ -72,21 +76,46 @@ thread_local! {
 #[test]
 fn recursive_single_values_do_not_call_the_mv_clear_helper() {
     CLEAR_MV_CALLS.with(|calls| calls.set(0));
-    execute_with_self_calls(&fib(), 1, &[12 * 8, 0, 0, 0, 0, 0, 0], 144 * 8,
-        0, None, true);
-    assert_eq!(CLEAR_MV_CALLS.with(std::cell::Cell::get), 0,
-        "inactive recursive results require no runtime MV reset");
+    execute_with_self_calls(
+        &fib(),
+        1,
+        &[12 * 8, 0, 0, 0, 0, 0, 0],
+        144 * 8,
+        0,
+        None,
+        true,
+    );
+    assert_eq!(
+        CLEAR_MV_CALLS.with(std::cell::Cell::get),
+        0,
+        "inactive recursive results require no runtime MV reset"
+    );
 }
 
 #[test]
 fn recursive_scalar_results_consume_return_carry_before_clobbering_it() {
     use iced_x86::{Decoder, DecoderOptions, Mnemonic, OpKind};
-    let code = execute_with_self_calls(&fib(), 1, &[12 * 8, 0, 0, 0, 0, 0, 0],
-        144 * 8, 0, None, true);
-    let instructions: Vec<_> = Decoder::new(64, &code, DecoderOptions::NONE).into_iter().collect();
-    let calls: Vec<_> = instructions.iter().enumerate().filter(|(_, instruction)|
-        instruction.mnemonic() == Mnemonic::Call && instruction.op0_kind() == OpKind::NearBranch64)
-        .map(|(index, _)| index).collect();
+    let code = execute_with_self_calls(
+        &fib(),
+        1,
+        &[12 * 8, 0, 0, 0, 0, 0, 0],
+        144 * 8,
+        0,
+        None,
+        true,
+    );
+    let instructions: Vec<_> = Decoder::new(64, &code, DecoderOptions::NONE)
+        .into_iter()
+        .collect();
+    let calls: Vec<_> = instructions
+        .iter()
+        .enumerate()
+        .filter(|(_, instruction)| {
+            instruction.mnemonic() == Mnemonic::Call
+                && instruction.op0_kind() == OpKind::NearBranch64
+        })
+        .map(|(index, _)| index)
+        .collect();
     assert_eq!(calls.len(), 2);
     for call in calls {
         let mut index = call + 1;
@@ -95,10 +124,16 @@ fn recursive_scalar_results_consume_return_carry_before_clobbering_it() {
             match instruction.mnemonic() {
                 Mnemonic::Jae => break, // JNC: consume the ordinary result descriptor.
                 Mnemonic::Mov | Mnemonic::Dec | Mnemonic::Lea => index += 1,
-                Mnemonic::Jmp => index = instructions.iter().position(|candidate|
-                    candidate.ip() == instruction.near_branch_target()).unwrap(),
-                unexpected => panic!("{unexpected:?} at {} precedes consumption of return carry",
-                    instruction.ip()),
+                Mnemonic::Jmp => {
+                    index = instructions
+                        .iter()
+                        .position(|candidate| candidate.ip() == instruction.near_branch_target())
+                        .unwrap()
+                }
+                unexpected => panic!(
+                    "{unexpected:?} at {} precedes consumption of return carry",
+                    instruction.ip()
+                ),
             }
         }
     }
@@ -107,44 +142,91 @@ fn recursive_scalar_results_consume_return_carry_before_clobbering_it() {
 #[test]
 fn recursive_calls_enter_the_frameless_base_case_prefix() {
     use iced_x86::{Decoder, DecoderOptions, Mnemonic, OpKind, Register};
-    let code = execute_with_self_calls(&fib(), 1, &[12 * 8, 0, 0, 0, 0, 0, 0],
-        144 * 8, 0, None, true);
-    let instructions: Vec<_> = Decoder::new(64, &code, DecoderOptions::NONE).into_iter().collect();
-    let calls: Vec<_> = instructions.iter().filter(|instruction|
-        instruction.mnemonic() == Mnemonic::Call && instruction.op0_kind() == OpKind::NearBranch64)
+    let code = execute_with_self_calls(
+        &fib(),
+        1,
+        &[12 * 8, 0, 0, 0, 0, 0, 0],
+        144 * 8,
+        0,
+        None,
+        true,
+    );
+    let instructions: Vec<_> = Decoder::new(64, &code, DecoderOptions::NONE)
+        .into_iter()
+        .collect();
+    let calls: Vec<_> = instructions
+        .iter()
+        .filter(|instruction| {
+            instruction.mnemonic() == Mnemonic::Call
+                && instruction.op0_kind() == OpKind::NearBranch64
+        })
         .collect();
     assert_eq!(calls.len(), 2);
     assert_eq!(calls[0].near_branch_target(), calls[1].near_branch_target());
-    let start = instructions.iter().position(|instruction|
-        instruction.ip() == calls[0].near_branch_target()).unwrap();
-    let frame = instructions[start..].iter().position(|instruction|
-        instruction.mnemonic() == Mnemonic::Push && instruction.op0_register() == Register::RBP)
-        .unwrap() + start;
-    assert!(instructions[start..frame].iter().any(|instruction|
-        instruction.mnemonic() == Mnemonic::Ret),
-        "both recursive edges must enter the base-case return before frame setup");
+    let start = instructions
+        .iter()
+        .position(|instruction| instruction.ip() == calls[0].near_branch_target())
+        .unwrap();
+    let frame = instructions[start..]
+        .iter()
+        .position(|instruction| {
+            instruction.mnemonic() == Mnemonic::Push && instruction.op0_register() == Register::RBP
+        })
+        .unwrap()
+        + start;
+    assert!(
+        instructions[start..frame]
+            .iter()
+            .any(|instruction| instruction.mnemonic() == Mnemonic::Ret),
+        "both recursive edges must enter the base-case return before frame setup"
+    );
 }
 
 #[test]
 fn recursive_admission_tests_flags_without_register_round_trips() {
     use iced_x86::{Decoder, DecoderOptions, MemorySize, Mnemonic};
-    let code = execute_with_self_calls(&fib(), 1, &[12 * 8, 0, 0, 0, 0, 0, 0],
-        144 * 8, 0, None, true);
-    let instructions: Vec<_> = Decoder::new(64, &code, DecoderOptions::NONE).into_iter().collect();
+    let code = execute_with_self_calls(
+        &fib(),
+        1,
+        &[12 * 8, 0, 0, 0, 0, 0, 0],
+        144 * 8,
+        0,
+        None,
+        true,
+    );
+    let instructions: Vec<_> = Decoder::new(64, &code, DecoderOptions::NONE)
+        .into_iter()
+        .collect();
     // Compact recovery legitimately zero-extends WORD recipes. Admission's
     // BYTE flags must still be tested directly, without byte-load round trips.
-    let byte_loads = instructions.iter().filter(|instruction|
-        instruction.mnemonic() == Mnemonic::Movzx
-            && instruction.memory_size() == MemorySize::UInt8).count();
-    assert_eq!(byte_loads, 0, "admission must test byte flags directly in memory");
+    let byte_loads = instructions
+        .iter()
+        .filter(|instruction| {
+            instruction.mnemonic() == Mnemonic::Movzx
+                && instruction.memory_size() == MemorySize::UInt8
+        })
+        .count();
+    assert_eq!(
+        byte_loads, 0,
+        "admission must test byte flags directly in memory"
+    );
 }
 
 #[test]
 fn recursive_admission_observes_execution_poll_requests() {
     for pending in 1..=3 {
         // Both children of fib(2) are refused and return the cold sentinel -1.
-        execute_with_self_stack_bound(&fib(), 1, &[2 * 8, 0, 0, 0, 0, 0, 0],
-            (-16_i64) as u64, 0, None, true, None, pending);
+        execute_with_self_stack_bound(
+            &fib(),
+            1,
+            &[2 * 8, 0, 0, 0, 0, 0, 0],
+            (-16_i64) as u64,
+            0,
+            None,
+            true,
+            None,
+            pending,
+        );
     }
 }
 fn instruction(opcode: Opcode, args: Vec<Value>, aux: AuxData) -> InstData {
@@ -275,18 +357,40 @@ fn execute(f: &Function, arity: usize, args: &[u64; 7], expected: u64) {
 fn execute_with_poll(f: &Function, arity: usize, args: &[u64; 7], expected: u64, poll: u64) {
     execute_with_heat(f, arity, args, expected, poll, None);
 }
-fn execute_with_heat(f: &Function, arity: usize, args: &[u64; 7], expected: u64, poll: u64,
-    heat: Option<(&AtomicU32, u32, &AtomicU32, u32, bool)>) {
+fn execute_with_heat(
+    f: &Function,
+    arity: usize,
+    args: &[u64; 7],
+    expected: u64,
+    poll: u64,
+    heat: Option<(&AtomicU32, u32, &AtomicU32, u32, bool)>,
+) {
     execute_with_self_calls(f, arity, args, expected, poll, heat, false);
 }
 #[allow(clippy::too_many_arguments)]
-fn execute_with_self_calls(f: &Function, arity: usize, args: &[u64; 7], expected: u64, poll: u64,
-    heat: Option<(&AtomicU32, u32, &AtomicU32, u32, bool)>, direct_self: bool) -> Vec<u8> {
+fn execute_with_self_calls(
+    f: &Function,
+    arity: usize,
+    args: &[u64; 7],
+    expected: u64,
+    poll: u64,
+    heat: Option<(&AtomicU32, u32, &AtomicU32, u32, bool)>,
+    direct_self: bool,
+) -> Vec<u8> {
     execute_with_self_stack_bound(f, arity, args, expected, poll, heat, direct_self, None, 0)
 }
 #[allow(clippy::too_many_arguments)]
-fn execute_with_self_stack_bound(f: &Function, arity: usize, args: &[u64; 7], expected: u64, poll: u64,
-    heat: Option<(&AtomicU32, u32, &AtomicU32, u32, bool)>, direct_self: bool, below_bottom: Option<i64>, pending: u8) -> Vec<u8> {
+fn execute_with_self_stack_bound(
+    f: &Function,
+    arity: usize,
+    args: &[u64; 7],
+    expected: u64,
+    poll: u64,
+    heat: Option<(&AtomicU32, u32, &AtomicU32, u32, bool)>,
+    direct_self: bool,
+    below_bottom: Option<i64>,
+    pending: u8,
+) -> Vec<u8> {
     let heat_slot = AtomicUsize::new(0);
     let slot = AtomicUsize::new(0);
     let revision = AtomicU64::new(7);
@@ -310,17 +414,23 @@ fn execute_with_self_stack_bound(f: &Function, arity: usize, args: &[u64; 7], ex
                 OrdinaryCallTarget {
                     symbol: 77,
                     descriptor_slot: slot.as_ptr() as u64,
-                    revision_address: revision.as_ptr() as u64, heat_slot: heat_slot.as_ptr() as u64,
+                    revision_address: revision.as_ptr() as u64,
+                    heat_slot: heat_slot.as_ptr() as u64,
                 },
             )
         })
         .collect();
-    let self_sites = if direct_self { targets.iter().map(|(inst, _)| *inst).collect() } else { Vec::new() };
+    let self_sites = if direct_self {
+        targets.iter().map(|(inst, _)| *inst).collect()
+    } else {
+        Vec::new()
+    };
     let code = emit_framed_ordinary_function_with_self_calls(
         f,
         OrdinaryLispEntryOptions {
             arity,
-            arity_error_veneer: rejected as *const () as u64, binding: None,
+            arity_error_veneer: rejected as *const () as u64,
+            binding: None,
         },
         &targets,
         flags,
@@ -348,13 +458,20 @@ fn execute_with_self_stack_bound(f: &Function, arity: usize, args: &[u64; 7], ex
         owner: buffer.as_ptr() as usize,
         stack_required: code.ordinary_stack_required.unwrap(),
     };
-    let heat_record = heat.map(|(calls, threshold, backedges, backedge_threshold, stale)| OrdinaryCallHeat {
-        descriptor: if stale { 1 } else { &descriptor as *const _ as usize },
-        invocation_counter: calls.as_ptr() as usize,
-        back_edge_counter: backedges.as_ptr() as usize,
-        invocation_threshold: threshold,
-        back_edge_threshold: backedge_threshold,
-    });
+    let heat_record =
+        heat.map(
+            |(calls, threshold, backedges, backedge_threshold, stale)| OrdinaryCallHeat {
+                descriptor: if stale {
+                    1
+                } else {
+                    &descriptor as *const _ as usize
+                },
+                invocation_counter: calls.as_ptr() as usize,
+                back_edge_counter: backedges.as_ptr() as usize,
+                invocation_threshold: threshold,
+                back_edge_threshold: backedge_threshold,
+            },
+        );
     if let Some(record) = &heat_record {
         heat_slot.store(record as *const _ as usize, Ordering::Release);
     }
@@ -383,7 +500,7 @@ fn execute_with_self_stack_bound(f: &Function, arity: usize, args: &[u64; 7], ex
         stack_limit: 0,
     };
     match pending {
-        0 => {},
+        0 => {}
         // Producers are tested in the runtime; generated code sees only this
         // execution's poll, including requests made by mount and explicit yield.
         1 => execution.request_poll(),
@@ -397,19 +514,37 @@ fn execute_with_self_stack_bound(f: &Function, arity: usize, args: &[u64; 7], ex
     let mut out = [0; 4];
     unsafe {
         if let Some(below_bottom) = below_bottom {
-            assert_eq!(arity, 1, "boundary fixture has no outgoing overflow arguments");
-            let parent_frame = code.native_calls.as_ref().unwrap().unwind_recipe().unwrap().frame_bytes() as usize;
+            assert_eq!(
+                arity, 1,
+                "boundary fixture has no outgoing overflow arguments"
+            );
+            let parent_frame = code
+                .native_calls
+                .as_ref()
+                .unwrap()
+                .unwind_recipe()
+                .unwrap()
+                .frame_bytes() as usize;
             // Root CALL + parent prologue + child CALL + complete child budget.
-            let distance = (16 + parent_frame + code.ordinary_stack_required.unwrap()) as i64 + below_bottom;
-            run_with_stack_bound(entry, args.as_ptr(), arity, execution.as_ptr(), out.as_mut_ptr(),
-                usize::try_from(distance).unwrap());
-        } else { run(
-            entry,
-            args.as_ptr(),
-            arity,
-            execution.as_ptr(),
-            out.as_mut_ptr(),
-        ); }
+            let distance =
+                (16 + parent_frame + code.ordinary_stack_required.unwrap()) as i64 + below_bottom;
+            run_with_stack_bound(
+                entry,
+                args.as_ptr(),
+                arity,
+                execution.as_ptr(),
+                out.as_mut_ptr(),
+                usize::try_from(distance).unwrap(),
+            );
+        } else {
+            run(
+                entry,
+                args.as_ptr(),
+                arity,
+                execution.as_ptr(),
+                out.as_mut_ptr(),
+            );
+        }
     }
     assert_eq!(out[0], expected);
     assert_eq!(out[3], 0, "exactly one value returns with clear carry");
@@ -489,7 +624,8 @@ fn seven_argument_recursive_call_marshals_every_overflow_word() {
             stack: call.args.iter().map(|&value| ValueSource::Value {
                 value, repr: ValueRepresentation::Tagged,
             }).collect(),
-        }], remat: vec![],
+        }],
+        remat: vec![],
     }));
     let result = value(&mut f, recurse, call);
     f.set_terminator(
@@ -514,7 +650,8 @@ fn ordinary_entry_rejects_unpolled_cycles() {
         &f,
         OrdinaryLispEntryOptions {
             arity: 0,
-            arity_error_veneer: 1, binding: None,
+            arity_error_veneer: 1,
+            binding: None,
         },
         &[],
         OrdinaryCallFlags {
@@ -701,17 +838,61 @@ fn ordinary_direct_calls_count_exact_admissions_and_preserve_promotion() {
     let backedges = AtomicU32::new(0);
     let f = fib();
     let args = [2 << 3, 0, 0, 0, 0, 0, 0];
-    execute_with_heat(&f, 1, &args, 1 << 3, 0, Some((&calls, 100, &backedges, 100, false)));
-    assert_eq!(calls.load(Ordering::Relaxed), 2, "both direct children record invocation heat");
+    execute_with_heat(
+        &f,
+        1,
+        &args,
+        1 << 3,
+        0,
+        Some((&calls, 100, &backedges, 100, false)),
+    );
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        2,
+        "both direct children record invocation heat"
+    );
     calls.store(0, Ordering::Relaxed);
-    execute_with_heat(&f, 1, &args, 0, 0, Some((&calls, 2, &backedges, 100, false)));
-    assert_eq!(calls.load(Ordering::Relaxed), 1, "threshold edge delegates counting to cold dispatch");
+    execute_with_heat(
+        &f,
+        1,
+        &args,
+        0,
+        0,
+        Some((&calls, 2, &backedges, 100, false)),
+    );
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        1,
+        "threshold edge delegates counting to cold dispatch"
+    );
     calls.store(0, Ordering::Relaxed);
-    execute_with_heat(&f, 1, &args, 1 << 3, 0, Some((&calls, 1, &backedges, 100, true)));
-    assert_eq!(calls.load(Ordering::Relaxed), 0, "stale descriptor cannot access old heat");
+    execute_with_heat(
+        &f,
+        1,
+        &args,
+        1 << 3,
+        0,
+        Some((&calls, 1, &backedges, 100, true)),
+    );
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        0,
+        "stale descriptor cannot access old heat"
+    );
     backedges.store(10, Ordering::Relaxed);
-    execute_with_heat(&f, 1, &args, (-2_i64 << 3) as u64, 0, Some((&calls, 100, &backedges, 10, false)));
-    assert_eq!(calls.load(Ordering::Relaxed), 0, "hot loops preserve the promotion cold edge");
+    execute_with_heat(
+        &f,
+        1,
+        &args,
+        (-2_i64 << 3) as u64,
+        0,
+        Some((&calls, 100, &backedges, 10, false)),
+    );
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        0,
+        "hot loops preserve the promotion cold edge"
+    );
 }
 
 #[test]
@@ -719,15 +900,30 @@ fn direct_recursive_fib_does_not_resolve_a_global_descriptor() {
     let f = fib();
     // The global slot stays empty. Every recursive edge must use the exact
     // current artifact, with balanced native depth and actual ordinary returns.
-    execute_with_self_calls(&f, 1, &[24 << 3, 0, 0, 0, 0, 0, 0], 46368 << 3, 0, None, true);
+    execute_with_self_calls(
+        &f,
+        1,
+        &[24 << 3, 0, 0, 0, 0, 0, 0],
+        46368 << 3,
+        0,
+        None,
+        true,
+    );
 }
 
 #[test]
 fn direct_recursive_fib_does_not_charge_global_invocation_heat() {
     let calls = AtomicU32::new(17);
     let backedges = AtomicU32::new(23);
-    execute_with_self_calls(&fib(), 1, &[12 << 3, 0, 0, 0, 0, 0, 0], 144 << 3,
-        0, Some((&calls, 1, &backedges, 1, false)), true);
+    execute_with_self_calls(
+        &fib(),
+        1,
+        &[12 << 3, 0, 0, 0, 0, 0, 0],
+        144 << 3,
+        0,
+        Some((&calls, 1, &backedges, 1, false)),
+        true,
+    );
     assert_eq!(calls.load(Ordering::Relaxed), 17);
     assert_eq!(backedges.load(Ordering::Relaxed), 23);
 }
@@ -740,8 +936,17 @@ fn direct_self_stack_admission_checks_exact_child_budget_and_balances_depth() {
     // reject it with the cold sentinel for -1+3=2. fib(2) would not exercise
     // stack admission at all: both calls are eliminated before this check.
     for (below_bottom, expected) in [(1, 8_i64), (0, 2), (-1, 2)] {
-        execute_with_self_stack_bound(&f, 1, &[6 << 3, 0, 0, 0, 0, 0, 0],
-            (expected << 3) as u64, 0, None, true, Some(below_bottom), 0);
+        execute_with_self_stack_bound(
+            &f,
+            1,
+            &[6 << 3, 0, 0, 0, 0, 0, 0],
+            (expected << 3) as u64,
+            0,
+            None,
+            true,
+            Some(below_bottom),
+            0,
+        );
     }
 }
 
@@ -749,8 +954,17 @@ fn direct_self_stack_admission_checks_exact_child_budget_and_balances_depth() {
 fn eliminated_self_calls_do_not_require_child_stack_space() {
     let f = fib();
     for below_bottom in [1, 0, -1] {
-        execute_with_self_stack_bound(&f, 1, &[2 << 3, 0, 0, 0, 0, 0, 0],
-            1 << 3, 0, None, true, Some(below_bottom), 0);
+        execute_with_self_stack_bound(
+            &f,
+            1,
+            &[2 << 3, 0, 0, 0, 0, 0, 0],
+            1 << 3,
+            0,
+            None,
+            true,
+            Some(below_bottom),
+            0,
+        );
     }
 }
 
@@ -759,18 +973,29 @@ fn raw_fixnum_math_executes_through_the_ordinary_native_abi() {
     let mut f = Function::new("ordinary-raw-fixnum-arithmetic");
     let entry = f.entry();
     let x = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
-    let one = value(&mut f, entry,
-        instruction(Opcode::ConstFixnum, vec![], AuxData::FixnumImm(1)));
+    let one = value(
+        &mut f,
+        entry,
+        instruction(Opcode::ConstFixnum, vec![], AuxData::FixnumImm(1)),
+    );
     let mut add = instruction(Opcode::FixnumAdd, vec![x, one], AuxData::None);
     add.flags.guard = true;
     add.frame_state = Some(state(&mut f, x, &[x, one], 0));
     let result = value(&mut f, entry, add);
-    f.set_terminator(entry, instruction(Opcode::Return, vec![result], AuxData::None));
+    f.set_terminator(
+        entry,
+        instruction(Opcode::Return, vec![result], AuxData::None),
+    );
     // This is a backend capability test, not permission to make isolated
     // additions raw in the production profitability selector.
     assert!(egcl_compiler::t2::unbox_fixnum::run(&mut f) > 0);
     execute(&f, 1, &[40 << 3, 0, 0, 0, 0, 0, 0], 41 << 3);
-    execute(&f, 1, &[(-43i64 << 3) as u64, 0, 0, 0, 0, 0, 0], (-42i64 << 3) as u64);
+    execute(
+        &f,
+        1,
+        &[(-43i64 << 3) as u64, 0, 0, 0, 0, 0, 0],
+        (-42i64 << 3) as u64,
+    );
 }
 
 #[test]
@@ -781,15 +1006,36 @@ fn ordinary_guarded_min_max_execute_signed_fixnum_selection() {
         let x = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
         let y = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
         let mut select = instruction(opcode, vec![x, y], AuxData::None);
-        select.flags = InstFlags { guard: true, effectful: true, ..Default::default() };
+        select.flags = InstFlags {
+            guard: true,
+            effectful: true,
+            ..Default::default()
+        };
         select.frame_state = Some(state(&mut f, x, &[x, y], 0));
         let result = value(&mut f, entry, select);
-        f.set_terminator(entry, instruction(Opcode::Return, vec![result], AuxData::None));
-        for (left, right) in [(9i64, 3i64), (-9, -3), (-3, 9), (7, 7),
-            (egcl_rt::bignum::FIXNUM_MIN, egcl_rt::bignum::FIXNUM_MAX)] {
+        f.set_terminator(
+            entry,
+            instruction(Opcode::Return, vec![result], AuxData::None),
+        );
+        for (left, right) in [
+            (9i64, 3i64),
+            (-9, -3),
+            (-3, 9),
+            (7, 7),
+            (egcl_rt::bignum::FIXNUM_MIN, egcl_rt::bignum::FIXNUM_MAX),
+        ] {
             for (x, y) in [(left, right), (right, left)] {
-                let expected = if opcode == Opcode::FixnumMin { x.min(y) } else { x.max(y) };
-                execute(&f, 2, &[(x << 3) as u64, (y << 3) as u64, 0, 0, 0, 0, 0], (expected << 3) as u64);
+                let expected = if opcode == Opcode::FixnumMin {
+                    x.min(y)
+                } else {
+                    x.max(y)
+                };
+                execute(
+                    &f,
+                    2,
+                    &[(x << 3) as u64, (y << 3) as u64, 0, 0, 0, 0, 0],
+                    (expected << 3) as u64,
+                );
             }
         }
     }
@@ -803,16 +1049,57 @@ fn ordinary_packed_double_read_executes_raw_load_with_tagged_return_boundary() {
     let index = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
     let recovery = state(&mut f, array, &[array, index], 0);
     let mut load = instruction(Opcode::PackedF64Ref, vec![array, index], AuxData::None);
-    load.flags = InstFlags { guard: true, effectful: true, ..Default::default() };
+    load.flags = InstFlags {
+        guard: true,
+        effectful: true,
+        ..Default::default()
+    };
     load.frame_state = Some(recovery);
-    let raw = f.push_inst(entry, load, &[(IRType::of(TypeBits::DOUBLE_FLOAT), ValueRepresentation::UnboxedF64)]).1[0];
-    let constant = f.push_inst(entry, instruction(Opcode::ConstDouble, vec![], AuxData::DoubleImm(1.25f64.to_bits())),
-        &[(IRType::of(TypeBits::DOUBLE_FLOAT), ValueRepresentation::UnboxedF64)]).1[0];
+    let raw = f
+        .push_inst(
+            entry,
+            load,
+            &[(
+                IRType::of(TypeBits::DOUBLE_FLOAT),
+                ValueRepresentation::UnboxedF64,
+            )],
+        )
+        .1[0];
+    let constant = f
+        .push_inst(
+            entry,
+            instruction(
+                Opcode::ConstDouble,
+                vec![],
+                AuxData::DoubleImm(1.25f64.to_bits()),
+            ),
+            &[(
+                IRType::of(TypeBits::DOUBLE_FLOAT),
+                ValueRepresentation::UnboxedF64,
+            )],
+        )
+        .1[0];
     let mut compare = instruction(Opcode::FloatCmpEq, vec![raw, constant], AuxData::None);
-    compare.flags = InstFlags { guard: true, effectful: true, ..Default::default() };
+    compare.flags = InstFlags {
+        guard: true,
+        effectful: true,
+        ..Default::default()
+    };
     compare.frame_state = Some(recovery);
-    let result = f.push_inst(entry, compare, &[(IRType::of(TypeBits::SYMBOL.join(TypeBits::NULL)), ValueRepresentation::Tagged)]).1[0];
-    f.set_terminator(entry, instruction(Opcode::Return, vec![result], AuxData::None));
+    let result = f
+        .push_inst(
+            entry,
+            compare,
+            &[(
+                IRType::of(TypeBits::SYMBOL.join(TypeBits::NULL)),
+                ValueRepresentation::Tagged,
+            )],
+        )
+        .1[0];
+    f.set_terminator(
+        entry,
+        instruction(Opcode::Return, vec![result], AuxData::None),
+    );
     egcl_rt::rooted!(packed = egcl_rt::packed_f64::make(2, 1.25).unwrap());
     execute(&f, 2, &[packed.0, 0, 0, 0, 0, 0, 0], egcl_rt::value::T.0);
     assert!(egcl_rt::packed_f64::set(*packed, 1, 2.5));

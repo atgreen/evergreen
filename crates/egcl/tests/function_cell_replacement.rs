@@ -7,7 +7,10 @@ use std::process::Command;
 #[test]
 fn t2_named_call_uses_current_published_target() {
     let output = Command::new(env!("CARGO_BIN_EXE_egcl"))
-        .args(["--no-init", "--eval", r#"
+        .args([
+            "--no-init",
+            "--eval",
+            r#"
           (declaim (notinline slot-target))
           (defun slot-target (x) (list x))
           (defun slot-caller (x) (slot-target x))
@@ -22,12 +25,18 @@ fn t2_named_call_uses_current_published_target() {
           (assert (handler-case (progn (slot-caller 43) nil)
                     (undefined-function () t)))
           (format t "PUBLISHED-CALL-REBIND-OK~%")
-        "#])
+        "#,
+        ])
         .env("EGCL_FORCE_TIER", "t2")
         .env("EGCL_LAZY_COMPILE", "0")
-        .output().unwrap();
+        .output()
+        .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(output.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(stdout.contains("PUBLISHED-CALL-REBIND-OK"), "{stdout}");
     if cfg!(target_os = "linux") {
         // This supported tagged caller uses the ordinary descriptor-selected
@@ -37,11 +46,15 @@ fn t2_named_call_uses_current_published_target() {
         assert!(!stdout.contains("Legacy checked ABI"), "{stdout}");
         assert!(stdout.contains("+0000:"), "{stdout}");
     } else {
-        assert!(stdout.contains("call qword [rax]"),
-            "named calls must load their executable target from a fixed slot: {stdout}");
+        assert!(
+            stdout.contains("call qword [rax]"),
+            "named calls must load their executable target from a fixed slot: {stdout}"
+        );
         let before_call = stdout.split("call qword [rax]").next().unwrap();
-        assert!(!before_call.contains("set SIGSEGV recovery IP"),
-            "a named native call must not enter the Rust-helper ABI at its call site: {stdout}");
+        assert!(
+            !before_call.contains("set SIGSEGV recovery IP"),
+            "a named native call must not enter the Rust-helper ABI at its call site: {stdout}"
+        );
     }
 }
 
@@ -57,7 +70,10 @@ fn run(program: &str, tier: &str) -> std::process::Output {
 #[test]
 fn warm_named_calls_honor_replaced_function_cells() {
     let output = Command::new(env!("CARGO_BIN_EXE_egcl"))
-        .args(["--no-init", "--eval", r#"
+        .args([
+            "--no-init",
+            "--eval",
+            r#"
           (defun original-target (x) (list :old x))
           (defun target-caller (x) (original-target x))
           (dotimes (i 10000) (target-caller i))
@@ -73,10 +89,16 @@ fn warm_named_calls_honor_replaced_function_cells() {
               (setf (symbol-function 'original-target) saved)))
           (assert (equal (target-caller 7) '(:old 7)))
           (format t "FUNCTION-CELL-REPLACEMENT-OK~%")
-        "#])
-        .output().unwrap();
-    assert!(output.status.success(), "{}\n{}",
-        String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        "#,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(String::from_utf8_lossy(&output.stdout).contains("FUNCTION-CELL-REPLACEMENT-OK"));
 }
 
@@ -173,7 +195,8 @@ fn t2_named_calls_follow_redefinition_for_register_and_slice_arguments() {
 
 #[test]
 fn unprofile_releases_a_callee_cached_by_a_t2_call_slot() {
-    let output = run(r#"
+    let output = run(
+        r#"
       (declaim (notinline slot-profile-target))
       (defun slot-profile-target (x) (list x))
       (defun slot-profile-caller (x) (slot-profile-target x))
@@ -191,7 +214,9 @@ fn unprofile_releases_a_callee_cached_by_a_t2_call_slot() {
       (dotimes (i 30) (slot-profile-caller i))
       (format t "UNPROFILE-TIER ~D~%" (egcl-ext:function-tier 'slot-profile-target))
       (assert (= 2 (egcl-ext:function-tier 'slot-profile-target)))
-    "#, "t2");
+    "#,
+        "t2",
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stdout}\n{stderr}");
@@ -200,7 +225,8 @@ fn unprofile_releases_a_callee_cached_by_a_t2_call_slot() {
 
 #[test]
 fn a_warmed_worker_call_slot_observes_main_thread_redefinition() {
-    let output = run(r#"
+    let output = run(
+        r#"
       (declaim (notinline thread-slot-target))
       (defun thread-slot-target (x) (list :before x))
       (defun thread-slot-caller (x) (thread-slot-target x))
@@ -236,7 +262,9 @@ fn a_warmed_worker_call_slot_observes_main_thread_redefinition() {
         (assert (equal before '(:before 41)))
         (assert (equal after '(:after 42))))
       (format t "THREAD-CALL-SLOT-OK~%")
-    "#, "t2");
+    "#,
+        "t2",
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stdout}\n{stderr}");
@@ -246,7 +274,10 @@ fn a_warmed_worker_call_slot_observes_main_thread_redefinition() {
 #[test]
 fn active_native_slot_survives_replacement_and_callee_local_deopt() {
     let output = Command::new(env!("CARGO_BIN_EXE_egcl"))
-        .args(["--no-init", "--eval", r#"
+        .args([
+            "--no-init",
+            "--eval",
+            r#"
           (declaim (notinline active-slot-target active-slot-hook))
           (defvar *replace-active-slot* nil)
           (defun active-slot-hook (x)
@@ -268,14 +299,19 @@ fn active_native_slot_survives_replacement_and_callee_local_deopt() {
             (assert (> (egcl-ext:deopt-count) before))
             (assert (= (active-slot-caller input) (+ input 100))))
           (format t "ACTIVE-NATIVE-SLOT-OK~%")
-        "#])
+        "#,
+        ])
         .env("EGCL_FORCE_TIER", "t2")
         .env("EGCL_LAZY_COMPILE", "0")
-        .output().unwrap();
+        .output()
+        .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stdout}\n{stderr}");
-    assert!(stdout.contains("ACTIVE-NATIVE-SLOT-OK"), "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("ACTIVE-NATIVE-SLOT-OK"),
+        "{stdout}\n{stderr}"
+    );
 }
 
 #[test]
@@ -307,11 +343,15 @@ fn native_optional_entry_preserves_defaults_and_single_values() {
         .args(["--no-init", "--eval", program])
         .env("EGCL_FORCE_TIER", "t2")
         .env("EGCL_LAZY_COMPILE", "0")
-        .output().unwrap();
+        .output()
+        .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stdout}\n{stderr}");
-    assert!(stdout.contains("NATIVE-OPTIONAL-ENTRY-OK"), "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("NATIVE-OPTIONAL-ENTRY-OK"),
+        "{stdout}\n{stderr}"
+    );
 }
 
 #[test]
@@ -338,13 +378,21 @@ fn native_slot_callee_preserves_values_after_numeric_phase_changes() {
         .args(["--no-init", "--eval", program])
         .env("EGCL_FORCE_TIER", "t2")
         .env("EGCL_LAZY_COMPILE", "0")
-        .output().unwrap();
+        .output()
+        .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(output.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(stdout.contains("NATIVE-SLOT-PHASE-OK"));
     if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
-        assert_eq!(stdout.matches("Ordinary x86-64 Lisp ABI").count(), 2,
-            "both phase-adapted leaf and caller must retain ordinary T2 entry: {stdout}");
+        assert_eq!(
+            stdout.matches("Ordinary x86-64 Lisp ABI").count(),
+            2,
+            "both phase-adapted leaf and caller must retain ordinary T2 entry: {stdout}"
+        );
         assert!(!stdout.contains("Mapped native transfer ABI"), "{stdout}");
     }
 }
@@ -405,9 +453,17 @@ fn saved_builtin_alias_preserves_values_errors_and_restoration() {
             .args(["--no-init", "--eval", &program])
             .env("EGCL_FORCE_TIER", tier)
             .env("EGCL_LAZY_COMPILE", "0")
-            .output().unwrap();
+            .output()
+            .unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(output.status.success(), "{tier}: {stdout}\n{}", String::from_utf8_lossy(&output.stderr));
-        assert!(stdout.contains("SAVED-BUILTIN-RESTORE-CORRECT"), "{tier}: {stdout}");
+        assert!(
+            output.status.success(),
+            "{tier}: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains("SAVED-BUILTIN-RESTORE-CORRECT"),
+            "{tier}: {stdout}"
+        );
     }
 }

@@ -1,11 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
+use egcl_compiler::reader::{read_from_string, symbol_name};
+use egcl_rt::value::{EgclVal, NIL, T};
 use proptest::prelude::*;
 use std::fs;
 use std::path::Path;
-use egcl_compiler::reader::{read_from_string, symbol_name};
-use egcl_rt::value::{NIL, T, EgclVal};
 
 #[path = "../../../tests/proptest/generators/mod.rs"]
 mod generators;

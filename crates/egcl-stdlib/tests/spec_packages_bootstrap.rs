@@ -219,9 +219,7 @@ fn import_conflict_leaves_existing_binding_unchanged() {
 fn import_conflict_leaves_inherited_binding_unchanged() {
     let mut registry = fresh_registry();
 
-    let provider = registry
-        .make_package("AH2QI-PROVIDER", &[], &[])
-        .unwrap();
+    let provider = registry.make_package("AH2QI-PROVIDER", &[], &[]).unwrap();
     let alternative = registry
         .make_package("AH2QI-ALTERNATIVE", &[], &[])
         .unwrap();

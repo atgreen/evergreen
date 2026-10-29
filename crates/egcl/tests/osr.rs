@@ -432,13 +432,20 @@ fn once_called_loops_enter_native_code_and_match_interpretation() {
             command.env("EGCL_FORCE_TIER", tier);
         }
         let output = command.output().expect("run once-called loops");
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         String::from_utf8_lossy(&output.stdout).into_owned()
     };
     let tiered = run(None);
     let oracle = run(Some("interp"));
     assert_eq!(tiered.lines().next(), oracle.lines().next(), "{tiered}");
-    assert!(tiered.contains("OSR T"), "the once-called loops must enter native code: {tiered}");
+    assert!(
+        tiered.contains("OSR T"),
+        "the once-called loops must enter native code: {tiered}"
+    );
 }
 
 /// Optimized code proves a loop-invariant parameter a fixnum before its loop.
@@ -463,7 +470,11 @@ fn osr_entry_rechecks_a_proof_made_before_the_loop() {
         .output()
         .expect("run OSR bound regression");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(output.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(stdout.contains("BOUND 6 51 T"), "{stdout}");
 }
 
@@ -525,15 +536,27 @@ fn toplevel_and_closure_loops_enter_native_code_and_match_interpretation() {
     let (oracle, _) = run(Some("interp"));
     std::fs::remove_file(&file).unwrap();
     assert_eq!(tiered, oracle, "{log}");
-    let toplevel = log.matches("<toplevel>: T0 activation entered mapped").count();
-    assert!(toplevel >= 10, "top-level loops must enter native code ({toplevel}):\n{log}");
-    assert!(log.contains("<lambda>: T0 activation entered mapped"), "{log}");
+    let toplevel = log
+        .matches("<toplevel>: T0 activation entered mapped")
+        .count();
+    assert!(
+        toplevel >= 10,
+        "top-level loops must enter native code ({toplevel}):\n{log}"
+    );
+    assert!(
+        log.contains("<lambda>: T0 activation entered mapped"),
+        "{log}"
+    );
 }
 
 /// Runs `program` from a file with low promotion thresholds, natively and under
 /// the tree-walker, and returns both outputs and the native run's log.
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-fn run_against_interpreter(name: &str, program: &str, env: &[(&str, &str)]) -> (String, String, String) {
+fn run_against_interpreter(
+    name: &str,
+    program: &str,
+    env: &[(&str, &str)],
+) -> (String, String, String) {
     let file = std::env::temp_dir().join(format!("egcl-{name}-{}.lisp", std::process::id()));
     std::fs::write(&file, program).unwrap();
     let run = |tier: Option<&str>| {
@@ -565,7 +588,11 @@ fn run_against_interpreter(name: &str, program: &str, env: &[(&str, &str)]) -> (
 /// The program's output without its final native-entry report.
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 fn without_osr_report(output: &str) -> String {
-    output.lines().filter(|line| !line.starts_with("OSR ")).collect::<Vec<_>>().join("\n")
+    output
+        .lines()
+        .filter(|line| !line.starts_with("OSR "))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Native code reads and assigns a special's value cell inline while no
@@ -626,12 +653,26 @@ fn special_variable_access_in_native_loops_matches_interpretation() {
                                               '(sv-sum sv-read-u sv-set sv-setf sv-deopt sv-heap))))
 "#;
     let (tiered, oracle, log) = run_against_interpreter("special-access", program, &[]);
-    assert_eq!(without_osr_report(&tiered), without_osr_report(&oracle), "{log}");
-    assert!(tiered.contains("OSR T"), "the loops must enter native code: {tiered}\n{log}");
+    assert_eq!(
+        without_osr_report(&tiered),
+        without_osr_report(&oracle),
+        "{log}"
+    );
+    assert!(
+        tiered.contains("OSR T"),
+        "the loops must enter native code: {tiered}\n{log}"
+    );
     // The inline path is what this exercises; the runtime path must agree too.
-    let (fallback, _, log) =
-        run_against_interpreter("special-access-off", program, &[("EGCL_NO_INLINE_SPECIALS", "1")]);
-    assert_eq!(without_osr_report(&fallback), without_osr_report(&oracle), "{log}");
+    let (fallback, _, log) = run_against_interpreter(
+        "special-access-off",
+        program,
+        &[("EGCL_NO_INLINE_SPECIALS", "1")],
+    );
+    assert_eq!(
+        without_osr_report(&fallback),
+        without_osr_report(&oracle),
+        "{log}"
+    );
 }
 
 /// A hot loop running inside its own LET of a special leaves T0 with the
@@ -672,10 +713,20 @@ fn loops_inside_special_bindings_enter_native_code_and_match_interpretation() {
                                               '(sb-around sb-deopt sb-float sb-error sb-nested sb-callee))))
 "#;
     let (tiered, oracle, log) = run_against_interpreter("special-bindings", program, &[]);
-    assert_eq!(without_osr_report(&tiered), without_osr_report(&oracle), "{log}");
-    assert!(tiered.contains("OSR T"), "the bound loops must enter native code: {tiered}\n{log}");
+    assert_eq!(
+        without_osr_report(&tiered),
+        without_osr_report(&oracle),
+        "{log}"
+    );
+    assert!(
+        tiered.contains("OSR T"),
+        "the bound loops must enter native code: {tiered}\n{log}"
+    );
     for name in ["SB-AROUND", "SB-DEOPT", "SB-ERROR", "SB-NESTED"] {
-        assert!(log.contains(&format!("{name}: T0 activation entered mapped")), "{name}:\n{log}");
+        assert!(
+            log.contains(&format!("{name}: T0 activation entered mapped")),
+            "{name}:\n{log}"
+        );
     }
 }
 
@@ -731,10 +782,16 @@ fn a_deoptimized_long_loop_reenters_native_code_after_its_phase_change() {
         Some("(20000.0 10000 (20000 20000) 40000.0 20000.0 10000 (20000 20000) 40000.0)"),
         "{log}"
     );
-    let reentries = |name: &str| log.matches(&format!("{name}: loop re-warmed after a guard deopt")).count();
+    let reentries = |name: &str| {
+        log.matches(&format!("{name}: loop re-warmed after a guard deopt"))
+            .count()
+    };
     for name in ["PC-FLOAT", "PC-BIGNUM", "PC-FIXNUM"] {
         let count = reentries(name);
-        assert!((1..=4).contains(&count), "{name} re-entered {count} times:\n{log}");
+        assert!(
+            (1..=4).contains(&count),
+            "{name} re-entered {count} times:\n{log}"
+        );
     }
     assert!(reentries("PC-ALTERNATE") <= 4, "{log}");
 }
@@ -796,6 +853,12 @@ fn once_called_double_float_loops_enter_t2_and_match_interpretation() {
         Some("OSR ((2 T) (2 T) (2 T) (2 T) (2 T) (2 T) (2 T))"),
         "each once-called double loop must reach T2 by OSR:\n{log}"
     );
-    assert!(log.contains("DF-SUM: raw double OSR companion emitted"), "{log}");
-    assert!(log.contains("DF-SUM: double-float loop enters T2 by OSR"), "{log}");
+    assert!(
+        log.contains("DF-SUM: raw double OSR companion emitted"),
+        "{log}"
+    );
+    assert!(
+        log.contains("DF-SUM: double-float loop enters T2 by OSR"),
+        "{log}"
+    );
 }

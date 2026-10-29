@@ -11,8 +11,10 @@ use std::process::Command;
 
 #[test]
 fn compile_time_constants_do_not_leak_into_other_packages() {
-    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("compile-time-binding-isolation-{}", std::process::id()));
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "compile-time-binding-isolation-{}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     let first = dir.join("first.lisp");
     let second = dir.join("second.lisp");

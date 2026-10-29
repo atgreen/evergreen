@@ -3,7 +3,7 @@
 
 //! Tests for egcl-stdlib format module (FORMAT & pretty-printer).
 
-use egcl_rt::value::{NIL, T, EgclVal};
+use egcl_rt::value::{EgclVal, NIL, T};
 use egcl_stdlib::format::*;
 
 // ── Helper ───────────────────────────────────────────────────────
@@ -608,11 +608,18 @@ fn format_tilde_w_f_drops_trailing_fraction_zeros() {
         ("~F", -112.400000000001, "-112.400000000001"),
     ] {
         egcl_rt::rooted!(float = egcl_rt::gc::alloc_double_float(number));
-        assert_eq!(format_nil_string(control, &[*float]), expected, "{control} {number:?}");
+        assert_eq!(
+            format_nil_string(control, &[*float]),
+            expected,
+            "{control} {number:?}"
+        );
     }
     let single = EgclVal::from_single_float(-112.399994f32);
     assert_eq!(format_nil_string("~8F", &[single]), "  -112.4");
-    assert_eq!(format_nil_string("~8F", &[EgclVal::from_single_float(100.0)]), "   100.0");
+    assert_eq!(
+        format_nil_string("~8F", &[EgclVal::from_single_float(100.0)]),
+        "   100.0"
+    );
 }
 
 // ~E — exponential float
@@ -641,15 +648,21 @@ fn format_directive_tilde_g_general_float() {
 // ~$ — monetary/dollars float (R5.157)
 #[test]
 fn format_floating_directives_accept_rationals() {
-    for (numerator, denominator, number) in [(5, 4, 1.25), (-5, 4, -1.25), (155, 512, 0.302734375)] {
-        egcl_rt::rooted!(ratio = egcl_rt::bignum::alloc_ratio_cli(
-            EgclVal::from_fixnum(numerator),
-            EgclVal::from_fixnum(denominator),
-        ));
+    for (numerator, denominator, number) in [(5, 4, 1.25), (-5, 4, -1.25), (155, 512, 0.302734375)]
+    {
+        egcl_rt::rooted!(
+            ratio = egcl_rt::bignum::alloc_ratio_cli(
+                EgclVal::from_fixnum(numerator),
+                EgclVal::from_fixnum(denominator),
+            )
+        );
         egcl_rt::rooted!(float = egcl_rt::gc::alloc_double_float(number));
         for control in ["~,3F", "~,2E", "~G", "~$", "~@$", "~v$"] {
             let (rational_args, float_args) = if control == "~v$" {
-                (vec![EgclVal::from_fixnum(3), *ratio], vec![EgclVal::from_fixnum(3), *float])
+                (
+                    vec![EgclVal::from_fixnum(3), *ratio],
+                    vec![EgclVal::from_fixnum(3), *float],
+                )
             } else {
                 (vec![*ratio], vec![*float])
             };
@@ -670,7 +683,11 @@ fn format_floating_directives_accept_bignums() {
     egcl_rt::rooted!(float = egcl_rt::gc::alloc_double_float(18446744073709551616.0));
     for control in ["~,3F", "~,2E", "~G", "~$"] {
         let expected = format_nil_string(control, &[*float]);
-        assert_eq!(format_nil_string(control, &[*integer]), expected, "{control}");
+        assert_eq!(
+            format_nil_string(control, &[*integer]),
+            expected,
+            "{control}"
+        );
     }
 }
 
@@ -680,14 +697,18 @@ fn format_floating_directives_handle_large_ratio_components() {
     numerator[0] = 1;
     numerator[32] = 1;
     egcl_rt::rooted!(numerator = egcl_rt::bignum::BigInt::from_mag(1, numerator).to_val());
-    egcl_rt::rooted!(denominator = egcl_rt::bignum::BigInt::from_mag(1, vec![u64::MAX; 32]).to_val());
+    egcl_rt::rooted!(
+        denominator = egcl_rt::bignum::BigInt::from_mag(1, vec![u64::MAX; 32]).to_val()
+    );
     egcl_rt::rooted!(ratio = egcl_rt::bignum::alloc_ratio_cli(*numerator, *denominator));
     assert_eq!(format_nil_string("~,3F", &[*ratio]), "1.000");
 
     let mut denominator = vec![0; 17];
     denominator[16] = 1 << 16;
     egcl_rt::rooted!(denominator = egcl_rt::bignum::BigInt::from_mag(1, denominator).to_val());
-    egcl_rt::rooted!(tiny = egcl_rt::bignum::alloc_ratio_cli(EgclVal::from_fixnum(1), *denominator));
+    egcl_rt::rooted!(
+        tiny = egcl_rt::bignum::alloc_ratio_cli(EgclVal::from_fixnum(1), *denominator)
+    );
     egcl_rt::rooted!(float = egcl_rt::gc::alloc_double_float(f64::from_bits(1 << 34)));
     let expected = format_nil_string("~E", &[*float]);
     assert_eq!(format_nil_string("~E", &[*tiny]), expected);
@@ -698,7 +719,9 @@ fn format_floating_directives_preserve_negative_underflow_sign() {
     let mut magnitude = vec![0; 33];
     magnitude[32] = 1;
     egcl_rt::rooted!(denominator = egcl_rt::bignum::BigInt::from_mag(1, magnitude).to_val());
-    egcl_rt::rooted!(tiny = egcl_rt::bignum::alloc_ratio_cli(EgclVal::from_fixnum(-1), *denominator));
+    egcl_rt::rooted!(
+        tiny = egcl_rt::bignum::alloc_ratio_cli(EgclVal::from_fixnum(-1), *denominator)
+    );
     for (control, expected) in [("~$", "-0.00"), ("~@$", "-0.00"), ("~,3@F", "-0.000")] {
         assert_eq!(format_nil_string(control, &[*tiny]), expected, "{control}");
     }
@@ -710,10 +733,13 @@ fn format_floating_directives_signal_rational_overflow() {
     magnitude[32] = 1;
     egcl_rt::rooted!(huge = egcl_rt::bignum::BigInt::from_mag(1, magnitude).to_val());
     for control in ["~,3F", "~E", "~G", "~$"] {
-        assert!(matches!(
-            format_nil(control, &[*huge]),
-            Err(egcl_rt::error::EgclError::ArithmeticError(_))
-        ), "{control}");
+        assert!(
+            matches!(
+                format_nil(control, &[*huge]),
+                Err(egcl_rt::error::EgclError::ArithmeticError(_))
+            ),
+            "{control}"
+        );
     }
 }
 
@@ -782,10 +808,7 @@ fn format_directive_tilde_t_tabulate() {
 #[test]
 fn format_directive_tilde_star_goto() {
     // ~* skips first arg, ~A prints second arg
-    let s = format_nil_string(
-        "~*~A",
-        &[EgclVal::from_fixnum(1), EgclVal::from_fixnum(2)],
-    );
+    let s = format_nil_string("~*~A", &[EgclVal::from_fixnum(1), EgclVal::from_fixnum(2)]);
     assert!(
         s.contains("2"),
         "~* should skip first arg; ~A prints second (2), got: {:?}",
@@ -840,7 +863,7 @@ fn format_directive_tilde_question_recursive() {
             // Since we can't construct these yet, we verify the interface
             // compiles and would exercise recursive processing.
             EgclVal::from_fixnum(0), // placeholder: should be a string EgclVal
-            NIL,                      // placeholder: should be a list of args
+            NIL,                     // placeholder: should be a list of args
         ],
     );
     // This should either succeed (if the implementation handles the recursive
@@ -1156,10 +1179,7 @@ fn format_directive_tilde_at_d_forced_sign() {
 #[test]
 fn format_directive_v_parameter() {
     // ~VD uses the next argument as the mincol parameter for ~D
-    let s = format_nil_string(
-        "~VD",
-        &[EgclVal::from_fixnum(10), EgclVal::from_fixnum(42)],
-    );
+    let s = format_nil_string("~VD", &[EgclVal::from_fixnum(10), EgclVal::from_fixnum(42)]);
     // mincol=10 means at least 10 chars wide
     assert!(
         s.len() >= 10,

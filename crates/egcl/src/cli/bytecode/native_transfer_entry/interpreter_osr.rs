@@ -65,15 +65,30 @@ fn handlers_match_scopes(
                 }
                 push_bcps.push(scope.push_bcp);
             }
-            ScopeKind::Block { id, register: false, .. } => {
-                let Some(Handler::Block { block_id, token, .. }) = records.next() else { return None };
+            ScopeKind::Block {
+                id,
+                register: false,
+                ..
+            } => {
+                let Some(Handler::Block {
+                    block_id, token, ..
+                }) = records.next()
+                else {
+                    return None;
+                };
                 if *block_id != id || !token.is_empty() {
                     return None;
                 }
                 depth += 1;
             }
             ScopeKind::Tagbody { id } => {
-                let Some(Handler::Tag { tagbody_id, token: None, tag_bcps, .. }) = records.next() else {
+                let Some(Handler::Tag {
+                    tagbody_id,
+                    token: None,
+                    tag_bcps,
+                    ..
+                }) = records.next()
+                else {
                     return None;
                 };
                 if *tagbody_id != id || !tag_bcps.is_empty() {
@@ -105,7 +120,9 @@ pub(in crate::cli::bytecode) fn enter(
     env_frame: Option<Arc<SharedCell<EnvFrame>>>,
     env: &mut Env,
 ) -> InterpreterOsr {
-    let NativeCodeStorage::Mapped(code) = &native._storage else { return InterpreterOsr::Declined };
+    let NativeCodeStorage::Mapped(code) = &native._storage else {
+        return InterpreterOsr::Declined;
+    };
     let destination = code.osr_destination();
     let Some(offset) = destination.osr_entries.get(&header).copied() else {
         return InterpreterOsr::Declined;
@@ -134,11 +151,15 @@ pub(in crate::cli::bytecode) fn enter(
     // The raw imports' current words, compared (never dereferenced) after
     // `prepare` to show a collection relocated them in place (osr=debug).
     let raw_words = |slots: &[u16]| -> Vec<u64> {
-        slots.iter().map(|&slot| unsafe { slot_get(frame, slot) }.0).collect()
+        slots
+            .iter()
+            .map(|&slot| unsafe { slot_get(frame, slot) }.0)
+            .collect()
     };
-    let raw_slots = destination.osr_raw_doubles.get(&header).filter(|_| {
-        egcl_rt::log::enabled("osr", egcl_rt::log::DEBUG)
-    });
+    let raw_slots = destination
+        .osr_raw_doubles
+        .get(&header)
+        .filter(|_| egcl_rt::log::enabled("osr", egcl_rt::log::DEBUG));
     let before = raw_slots.map(|slots| raw_words(slots));
     // Reserve every ledger while failure still means "keep interpreting".
     // `prepare` may collect: the frame's slots are scanned where they are.
@@ -147,10 +168,17 @@ pub(in crate::cli::bytecode) fn enter(
     };
     if let (Some(slots), Some(before)) = (raw_slots, before) {
         let after = raw_words(slots);
-        egcl_rt::blog!("osr", egcl_rt::log::DEBUG,
+        egcl_rt::blog!(
+            "osr",
+            egcl_rt::log::DEBUG,
             "{}: raw double imports at header {header}: slots {slots:?} {} ({before:#x?} -> {after:#x?})",
             display_fn_name(&destination.body.name),
-            if before == after { "unmoved" } else { "relocated before entry" });
+            if before == after {
+                "unmoved"
+            } else {
+                "relocated before entry"
+            }
+        );
     }
     let mut state = Box::new(state);
     // The ledger is reserved for every BindSpecial of the body, so moving the
@@ -165,15 +193,21 @@ pub(in crate::cli::bytecode) fn enter(
     // destination committing its own map in `run_activation`. New slots are
     // NIL; the locals stay where T0 left them, which is where the managed
     // homes read them. The frame is the top one, so no Special suffix moves.
-    if unsafe { stack.grow_frame_with_special_suffix(frame, slots, destination.code_info) }.is_none() {
+    if unsafe { stack.grow_frame_with_special_suffix(frame, slots, destination.code_info) }
+        .is_none()
+    {
         return InterpreterOsr::Declined;
     }
     drop(_state);
     // Hand the live bindings over without restoring them: the mapped activation
     // now unbinds each at its UnbindSpecial or on unwind, and a deoptimization
     // returns them to a rebuilt T0 activation. A move, not an allocation.
-    state.specials.extend(push_bcps.into_iter().zip(bindings.drain(..))
-        .map(|(push_bcp, binding)| SavedSpecial { push_bcp, binding }));
+    state.specials.extend(
+        push_bcps
+            .into_iter()
+            .zip(bindings.drain(..))
+            .map(|(push_bcp, binding)| SavedSpecial { push_bcp, binding }),
+    );
     if let Some(symbol) = destination.installed_symbol {
         OSR_ENTRY_COUNTS.with(|counts| {
             let mut counts = counts.borrow_mut();
@@ -181,13 +215,21 @@ pub(in crate::cli::bytecode) fn enter(
             *count = count.saturating_add(1);
         });
     }
-    egcl_rt::blog!("osr", egcl_rt::log::DEBUG,
+    egcl_rt::blog!(
+        "osr",
+        egcl_rt::log::DEBUG,
         "{}: T0 activation entered mapped {} code at header {header}",
-        display_fn_name(&destination.body.name), if destination.is_t2 { "T2" } else { "T1" });
+        display_fn_name(&destination.body.name),
+        if destination.is_t2 { "T2" } else { "T1" }
+    );
     // A T0 source never entered native code, so count this activation against
     // the native depth cap as an ordinary entry does.
     NATIVE_DEPTH.with(|depth| depth.set(depth.get() + 1));
     let _depth = NativeDepthGuard;
-    let resume = OsrResume { frame, offset, state };
+    let resume = OsrResume {
+        frame,
+        offset,
+        state,
+    };
     InterpreterOsr::Retired(destination.run_activation(&[], env, Some(resume), NIL))
 }

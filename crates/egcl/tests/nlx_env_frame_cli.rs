@@ -150,12 +150,19 @@ fn nonlocal_exits_leave_captured_let_frames_at_every_tier() {
         &[("EGCL_FORCE_TIER", "t0")][..],
         &[("EGCL_FORCE_TIER", "t1")][..],
         &[("EGCL_FORCE_TIER", "t2")][..],
-        &[("EGCL_T0_T1_THRESHOLD", "2"), ("EGCL_T1_T2_INVOKE_THRESHOLD", "5")][..],
+        &[
+            ("EGCL_T0_T1_THRESHOLD", "2"),
+            ("EGCL_T1_T2_INVOKE_THRESHOLD", "5"),
+        ][..],
     ] {
         let (result, tiers) = run(PROGRAM, envs);
         assert_eq!(result, EXPECTED, "{envs:?} ({tiers})");
         if MAPPED_LINUX && envs[0] == ("EGCL_FORCE_TIER", "t2") {
-            assert_eq!(tiers, format!("TIERS {ALL_T2}"), "{envs:?} did not reach T2");
+            assert_eq!(
+                tiers,
+                format!("TIERS {ALL_T2}"),
+                "{envs:?} did not reach T2"
+            );
         }
     }
 }
@@ -170,12 +177,15 @@ fn nonlocal_exit_frames_survive_gc_stress() {
     // loop suffices and keeps the stressed T0 run brief.
     let program = PROGRAM.replace("below 3000", "below 3");
     for tier in ["t0", "t2"] {
-        let (result, tiers) = run(&program, &[
-            ("EGCL_FORCE_TIER", tier),
-            ("EGCL_GC_STRESS", "1"),
-            ("EGCL_GC_POISON", "1"),
-            ("EGCL_GC_STRESS_AFTER_INIT", "1"),
-        ]);
+        let (result, tiers) = run(
+            &program,
+            &[
+                ("EGCL_FORCE_TIER", tier),
+                ("EGCL_GC_STRESS", "1"),
+                ("EGCL_GC_POISON", "1"),
+                ("EGCL_GC_STRESS_AFTER_INIT", "1"),
+            ],
+        );
         assert_eq!(result, EXPECTED, "{tier} under GC stress ({tiers})");
         if MAPPED_LINUX && tier == "t2" {
             assert_eq!(tiers, format!("TIERS {ALL_T2}"));

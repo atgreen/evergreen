@@ -156,7 +156,8 @@ pub(super) fn stack_requirement(frame_bytes: usize, move_values: usize) -> Optio
 #[cfg(test)]
 mod tests {
     use super::super::{
-        FramedHome, HomeMoveSrc, mov_rr, parallel_home_move, parallel_home_move_snapshot, pop_reg, push_reg, store_mem64_disp,
+        FramedHome, HomeMoveSrc, mov_rr, parallel_home_move, parallel_home_move_snapshot, pop_reg,
+        push_reg, store_mem64_disp,
     };
     use super::*;
     use egcl_rt::{asm::Asm, jit::JitBuffer};
@@ -213,11 +214,20 @@ mod tests {
                 maximum = maximum.max(depth);
             }
             assert_eq!(depth, 0);
-            assert_eq!(maximum, if snapshot { 24 } else { 8 },
-                "snapshot needs scratch storage; register rotation only saves RBP");
+            assert_eq!(
+                maximum,
+                if snapshot { 24 } else { 8 },
+                "snapshot needs scratch storage; register rotation only saves RBP"
+            );
             let admitted = stack_requirement(8, 2).unwrap();
-            assert_eq!(admitted, 24, "admission retains capacity for the snapshot fallback");
-            assert!(admitted >= maximum, "admission must cover the executed move path");
+            assert_eq!(
+                admitted, 24,
+                "admission retains capacity for the snapshot fallback"
+            );
+            assert!(
+                admitted >= maximum,
+                "admission must cover the executed move path"
+            );
             assert_eq!(stack_requirement(usize::MAX, 2), None);
             assert_eq!(stack_requirement(8, usize::MAX), None);
         }

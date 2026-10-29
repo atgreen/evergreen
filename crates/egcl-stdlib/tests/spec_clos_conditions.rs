@@ -9,7 +9,7 @@ use std::thread;
 use egcl_rt::error::EgclError;
 use egcl_rt::gc::{alloc_typed, heap_stats};
 use egcl_rt::object::type_id;
-use egcl_rt::value::{NIL, T, EgclVal};
+use egcl_rt::value::{EgclVal, NIL, T};
 use egcl_stdlib::clos::{
     MethodCombinationType, MethodQualifier, add_method, define_class, get_effective_method,
     get_short_form_method, remove_method, shared_initialize_with_list,

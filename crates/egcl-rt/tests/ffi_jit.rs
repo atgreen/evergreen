@@ -106,16 +106,17 @@ fn c_symbol(name: &str) -> *const () {
             // cargo and cc-rs own. -fno-stack-protector keeps the fixture minimal; its
             // __stack_chk_guard reference does not resolve through host-symbol lookup on
             // aarch64 (bliss-d3smh).
-            let compilation = Command::new(std::env::var("EGCL_TEST_CC").as_deref().unwrap_or("cc"))
-                .args(["-shared", "-fPIC", "-O2", "-fno-stack-protector"])
-                .arg(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/tests/fixtures/ffi_scalars.c"
-                ))
-                .arg("-o")
-                .arg(&output)
-                .output()
-                .expect("C compiler required for ABI oracle");
+            let compilation =
+                Command::new(std::env::var("EGCL_TEST_CC").as_deref().unwrap_or("cc"))
+                    .args(["-shared", "-fPIC", "-O2", "-fno-stack-protector"])
+                    .arg(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/tests/fixtures/ffi_scalars.c"
+                    ))
+                    .arg("-o")
+                    .arg(&output)
+                    .output()
+                    .expect("C compiler required for ABI oracle");
             assert!(
                 compilation.status.success(),
                 "{}",

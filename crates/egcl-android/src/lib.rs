@@ -359,11 +359,11 @@ extern "C" fn drain_input(_fd: c_int, _events: c_int, data: *mut c_void) -> c_in
             }
             1 => {
                 let code = unsafe { AKeyEvent_getKeyCode(event) };
-                context(activity).state.key(
-                    unsafe { AKeyEvent_getAction(event) },
-                    code,
-                    unsafe { AKeyEvent_getMetaState(event) },
-                );
+                context(activity)
+                    .state
+                    .key(unsafe { AKeyEvent_getAction(event) }, code, unsafe {
+                        AKeyEvent_getMetaState(event)
+                    });
                 // BACK stays the system's. Reporting it handled would trap the
                 // user in the application with no way out, which is a far worse
                 // failure than an application not seeing the key.
@@ -446,12 +446,7 @@ unsafe extern "C" fn egcl_android_call_on_main(
         0 => &[][..],
         count => unsafe { std::slice::from_raw_parts(args, count as usize) },
     };
-    match main_thread::call_on_main(
-        function as usize,
-        args,
-        promote as usize,
-        release as usize,
-    ) {
+    match main_thread::call_on_main(function as usize, args, promote as usize, release as usize) {
         Ok(result) => {
             if !out.is_null() {
                 unsafe { *out = result };
@@ -624,10 +619,7 @@ fn log_tagged(tag: &str, message: &str) {
     unsafe extern "C" {
         fn __android_log_write(prio: c_int, tag: *const c_char, text: *const c_char) -> c_int;
     }
-    if let (Ok(tag), Ok(text)) = (
-        std::ffi::CString::new(tag),
-        std::ffi::CString::new(message),
-    ) {
+    if let (Ok(tag), Ok(text)) = (std::ffi::CString::new(tag), std::ffi::CString::new(message)) {
         unsafe { __android_log_write(4, tag.as_ptr(), text.as_ptr()) };
     }
 }

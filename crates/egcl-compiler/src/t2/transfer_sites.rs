@@ -186,7 +186,9 @@ impl SysvTransferTable {
     }
 
     pub fn is_deopt_return(&self, code_base: usize, return_pc: usize) -> bool {
-        return_pc.checked_sub(code_base).and_then(|n| u32::try_from(n).ok())
+        return_pc
+            .checked_sub(code_base)
+            .and_then(|n| u32::try_from(n).ok())
             .is_some_and(|offset| self.deopt_returns.binary_search(&offset).is_ok())
     }
     pub fn sites(&self) -> impl Iterator<Item = &CheckedSysvSite> {
@@ -231,11 +233,17 @@ impl SysvTransferTable {
             for (index, &(location, slot)) in site.native_spills.iter().enumerate() {
                 if !site.map.roots.contains(&location)
                     || slot >= site.stack_slots
-                    || site.shadow_roots.iter().any(|&(prior, _)| prior == location)
-                    || snapshot.locations().any(|other| other != location
-                        && other == Location::Stack(crate::t2::mach::StackSlot(slot)))
-                    || site.native_spills[..index].iter().any(|&(prior, prior_slot)|
-                        prior == location || prior_slot == slot)
+                    || site
+                        .shadow_roots
+                        .iter()
+                        .any(|&(prior, _)| prior == location)
+                    || snapshot.locations().any(|other| {
+                        other != location
+                            && other == Location::Stack(crate::t2::mach::StackSlot(slot))
+                    })
+                    || site.native_spills[..index]
+                        .iter()
+                        .any(|&(prior, prior_slot)| prior == location || prior_slot == slot)
                 {
                     return Err(TransferSiteError::InvalidShadowRoot(location));
                 }
@@ -253,16 +261,30 @@ impl SysvTransferTable {
                     }
                     _ => return Err(TransferSiteError::UnsupportedRegister(location)),
                 };
-                let native_spill = site.native_spills.iter()
+                let native_spill = site
+                    .native_spills
+                    .iter()
                     .find(|(native, _)| *native == location)
-                    .map(|(_, slot)| SysvCaptureLocation::for_home(
-                        ValueHome::Stack(*slot), site.stack_slots, site.call_stack_adjust))
-                    .transpose().map_err(TransferSiteError::Physical)?;
-                let recipe = match SysvCaptureLocation::for_home(home, site.stack_slots, site.call_stack_adjust) {
+                    .map(|(_, slot)| {
+                        SysvCaptureLocation::for_home(
+                            ValueHome::Stack(*slot),
+                            site.stack_slots,
+                            site.call_stack_adjust,
+                        )
+                    })
+                    .transpose()
+                    .map_err(TransferSiteError::Physical)?;
+                let recipe = match SysvCaptureLocation::for_home(
+                    home,
+                    site.stack_slots,
+                    site.call_stack_adjust,
+                ) {
                     Ok(recipe) => Some(recipe),
                     // Volatile registers are absent from a helper's capture.
                     // An explicitly mapped native spill supplies their value.
-                    Err(CaptureLocationError::UnavailableRegister(_)) if native_spill.is_some() => None,
+                    Err(CaptureLocationError::UnavailableRegister(_)) if native_spill.is_some() => {
+                        None
+                    }
                     Err(error) => return Err(TransferSiteError::Physical(error)),
                 };
                 let shadow_slot = site
@@ -599,8 +621,7 @@ impl SysvSiteSnapshot {
         code_base: usize,
         capture: &SysvTransferCapture,
     ) -> Result<(), TransferSiteError> {
-        if (capture.return_pc as usize).checked_sub(code_base)
-            == Some(self.return_offset as usize)
+        if (capture.return_pc as usize).checked_sub(code_base) == Some(self.return_offset as usize)
         {
             Ok(())
         } else {
@@ -651,8 +672,11 @@ impl SysvSiteSnapshot {
                     .1;
                 match recipe.shadow_slot {
                     Some(slot) => activation[slot].to_raw(),
-                    None => recipe.native_spill.or(recipe.native)
-                        .expect("validated native capture recipe").read(capture),
+                    None => recipe
+                        .native_spill
+                        .or(recipe.native)
+                        .expect("validated native capture recipe")
+                        .read(capture),
                 }
             });
         }
@@ -678,10 +702,18 @@ impl SysvSiteSnapshot {
         unsafe {
             self.snapshot
                 .write_back(|location, word| {
-                    let recipe = &self.recipes.iter().find(|(key, _)| *key == location)
-                        .expect("validated descriptor location").1;
-                    if let Some(native) = recipe.native { native.write(capture, word); }
-                    if let Some(spill) = recipe.native_spill { spill.write(capture, word); }
+                    let recipe = &self
+                        .recipes
+                        .iter()
+                        .find(|(key, _)| *key == location)
+                        .expect("validated descriptor location")
+                        .1;
+                    if let Some(native) = recipe.native {
+                        native.write(capture, word);
+                    }
+                    if let Some(spill) = recipe.native_spill {
+                        spill.write(capture, word);
+                    }
                 })
                 .map_err(TransferSiteError::Capture)
         }

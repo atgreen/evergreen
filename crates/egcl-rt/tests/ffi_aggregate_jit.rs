@@ -191,16 +191,18 @@ fn symbol(name: &str) -> *const () {
             // cargo and cc-rs own. -fno-stack-protector keeps the fixture minimal; its
             // __stack_chk_guard reference does not resolve through host-symbol lookup on
             // aarch64 (bliss-d3smh).
-            let result = std::process::Command::new(std::env::var("EGCL_TEST_CC").as_deref().unwrap_or("cc"))
-                .args(["-shared", "-fPIC", "-O2", "-fno-stack-protector"])
-                .arg(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/tests/fixtures/ffi_aggregates.c"
-                ))
-                .arg("-o")
-                .arg(&path)
-                .output()
-                .unwrap();
+            let result = std::process::Command::new(
+                std::env::var("EGCL_TEST_CC").as_deref().unwrap_or("cc"),
+            )
+            .args(["-shared", "-fPIC", "-O2", "-fno-stack-protector"])
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/ffi_aggregates.c"
+            ))
+            .arg("-o")
+            .arg(&path)
+            .output()
+            .unwrap();
             assert!(
                 result.status.success(),
                 "{}",
@@ -748,9 +750,7 @@ fn aggregate_calls_preserve_callback_gc_transitions_and_error_containment() {
         if closure == egcl_rt::value::NIL {
             Ok(egcl_rt::gc::alloc_double_float(42.0))
         } else {
-            Err(EgclError::ProgramError(
-                "aggregate callback fixture".into(),
-            ))
+            Err(EgclError::ProgramError("aggregate callback fixture".into()))
         }
     }
     set_callback_runner(runner);

@@ -145,8 +145,8 @@ fn apply_format_function_to_layout(
     call_args.extend_from_slice(args);
     egcl_rt::rooted_ref!(_call_args_root = &mut call_args);
     let tail = apply_format_function(*func, &call_args)?;
-    let text = extract_egcl_string(crate::streams::get_output_stream_string(*stream)?)
-        .unwrap_or_default();
+    let text =
+        extract_egcl_string(crate::streams::get_output_stream_string(*stream)?).unwrap_or_default();
     let mut doc = LayoutDoc::default();
     doc.text(&text);
     Ok((tail, doc))
@@ -173,11 +173,8 @@ fn run_iteration_body(
         return format_impl(body, elements, idx, output);
     };
     egcl_rt::rooted!(func = func);
-    let (tail, doc) = apply_format_function_to_layout(
-        *func,
-        &elements[*idx..],
-        output.current_column(),
-    )?;
+    let (tail, doc) =
+        apply_format_function_to_layout(*func, &elements[*idx..], output.current_column())?;
     let remaining = if tail.is_cons() {
         cons_list_to_vec(tail).len()
     } else {
@@ -233,11 +230,7 @@ pub fn set_pprint_dispatch_hook(hook: Option<PprintDispatchHook>) {
 /// The text a *PRINT-PPRINT-DISPATCH* entry prints for `v`, when *PRINT-PRETTY*
 /// is true, a dispatch hook is installed and an entry applies. Shared with the
 /// interpreter's own printer so WRITE and FORMAT agree.
-pub fn dispatch_pprint_layout(
-    v: EgclVal,
-    escapep: bool,
-    start_column: usize,
-) -> Option<LayoutDoc> {
+pub fn dispatch_pprint_layout(v: EgclVal, escapep: bool, start_column: usize) -> Option<LayoutDoc> {
     let raw = PPRINT_DISPATCH_HOOK.load(std::sync::atomic::Ordering::Acquire);
     if raw == 0 || !print_pretty_active() {
         return None;
@@ -516,8 +509,8 @@ pub fn print_symbol_for_output(symbol: EgclVal, escapep: bool) -> String {
         && egcl_rt::symbols::symbol_package(index).is_some_and(|home| home.is_nil())
         && let Some(name) = egcl_rt::symbols::symbol_name(index)
     {
-        let bare = egcl_rt::symbols::split_registry_key(&name)
-            .map_or(name.as_str(), |(_, bare)| bare);
+        let bare =
+            egcl_rt::symbols::split_registry_key(&name).map_or(name.as_str(), |(_, bare)| bare);
         let printed = print_symbol_name(bare, escapep);
         return if escapep && print_gensym() {
             format!("#:{printed}")
@@ -681,7 +674,9 @@ pub struct StructurePrintPlan {
 }
 
 pub fn structure_print_plan(depth: usize, available_slots: usize) -> StructurePrintPlan {
-    let shown_slots = print_length().unwrap_or(available_slots).min(available_slots);
+    let shown_slots = print_length()
+        .unwrap_or(available_slots)
+        .min(available_slots);
     StructurePrintPlan {
         level_exceeded: print_level().is_some_and(|level| depth >= level),
         shown_slots,
@@ -708,16 +703,26 @@ pub fn print_array_active() -> bool {
 /// Pretty dispatch and circle/depth handling run before the ordinary body;
 /// readable output overrides PRINT-ARRAY, and character arrays remain strings.
 pub fn concise_array_representation(value: EgclVal) -> Option<String> {
-    if print_array_active() { return None; }
+    if print_array_active() {
+        return None;
+    }
     let kind = egcl_rt::gc::heap_object_type_id(value)?;
     match kind {
         type_id::SIMPLE_VECTOR => Some(format!(
-            "#<SIMPLE-VECTOR {}>", crate::sequences::length(value).ok()?,
+            "#<SIMPLE-VECTOR {}>",
+            crate::sequences::length(value).ok()?,
         )),
         type_id::MD_ARRAY => Some("#<ARRAY>".into()),
         type_id::COMPLEX_ARRAY if !crate::sequences::cvec_is_string(value) => {
-            let kind = if crate::sequences::cvec_is_bit(value) { "BIT-VECTOR" } else { "VECTOR" };
-            Some(format!("#<{kind} {}>", crate::sequences::cvec_fill_pointer(value)))
+            let kind = if crate::sequences::cvec_is_bit(value) {
+                "BIT-VECTOR"
+            } else {
+                "VECTOR"
+            };
+            Some(format!(
+                "#<{kind} {}>",
+                crate::sequences::cvec_fill_pointer(value)
+            ))
         }
         type_id::SIMPLE_ARRAY => {
             let (kind, length) = if let Some(length) = egcl_rt::packed_u8::len(value) {
@@ -811,7 +816,9 @@ struct CircleTable {
 /// Visible vector length, or total row-major size of an array. Scalars and
 /// opaque pseudo-heap handles are excluded before any header access.
 pub fn circle_array_length(value: EgclVal) -> Option<usize> {
-    if !value.is_heap_object() || crate::pathnames::is_pathname(value) { return None; }
+    if !value.is_heap_object() || crate::pathnames::is_pathname(value) {
+        return None;
+    }
     if crate::sequences::is_complex_vector(value) {
         Some(crate::sequences::cvec_fill_pointer(value))
     } else {
@@ -823,12 +830,17 @@ pub fn circle_array_length(value: EgclVal) -> Option<usize> {
 /// no outgoing graph edges, and reading it through ELT could allocate a box.
 fn circle_array_reference(mut value: EgclVal, mut index: usize) -> Option<EgclVal> {
     loop {
-        if !value.is_heap_object() { return None; }
+        if !value.is_heap_object() {
+            return None;
+        }
         unsafe {
             let pointer = value.as_ptr();
             match (*(pointer as *const ObjectHeader)).type_id() {
                 type_id::SIMPLE_VECTOR => {
-                    return Some(*(pointer.add(object_payload_offset(pointer) + 8 + index * 8) as *const EgclVal));
+                    return Some(
+                        *(pointer.add(object_payload_offset(pointer) + 8 + index * 8)
+                            as *const EgclVal),
+                    );
                 }
                 type_id::MD_ARRAY => value = *(pointer.add(8) as *const EgclVal),
                 type_id::COMPLEX_ARRAY => {
@@ -881,7 +893,8 @@ impl CircleTable {
         let mut pending = vec![root];
         while let Some(value) = pending.pop() {
             let array = circle_array_length(value);
-            if !value.is_cons() && array.is_none()
+            if !value.is_cons()
+                && array.is_none()
                 && !(circle_uninterned_symbol(value))
                 && !egcl_rt::random_state::is_random_state(value)
                 && !crate::sequences::is_nil_array(value)
@@ -890,7 +903,9 @@ impl CircleTable {
             }
             let count = self.counts.entry(value.0).or_insert(0);
             *count += 1;
-            if *count > 1 { continue; }
+            if *count > 1 {
+                continue;
+            }
             if value.is_cons() {
                 unsafe {
                     let cell = &*(value.as_ptr() as *const egcl_rt::object::ConsCell);
@@ -921,7 +936,9 @@ impl CircleTable {
         let mut spine_budgets = std::collections::HashMap::<u64, usize>::new();
         while let Some((value, remaining, reference)) = pending.pop() {
             let array = circle_array_length(value);
-            if !value.is_cons() && array.is_none() && !circle_uninterned_symbol(value)
+            if !value.is_cons()
+                && array.is_none()
+                && !circle_uninterned_symbol(value)
                 && !egcl_rt::random_state::is_random_state(value)
                 && !crate::sequences::is_nil_array(value)
             {
@@ -1078,7 +1095,10 @@ pub fn circle_enter(root: EgclVal) {
         })
     });
     let covered = CIRCLE.with(|c| {
-        c.borrow().tables.last().is_some_and(|table| table.counts.contains_key(&root.0))
+        c.borrow()
+            .tables
+            .last()
+            .is_some_and(|table| table.counts.contains_key(&root.0))
     });
     let table = if covered {
         None
@@ -1504,8 +1524,7 @@ pub fn u8_readable_representation(value: EgclVal) -> Option<String> {
     out.push_str(" :ELEMENT-TYPE '(COMMON-LISP:UNSIGNED-BYTE #10r8) :INITIAL-CONTENTS '");
     let mut index = 0;
     contents(value, &dims, &mut index, &mut out);
-    if crate::sequences::is_complex_vector(value)
-        && crate::sequences::cvec_has_fill_pointer(value)
+    if crate::sequences::is_complex_vector(value) && crate::sequences::cvec_has_fill_pointer(value)
     {
         out.push_str(&format!(
             " :FILL-POINTER #10r{}",
@@ -2042,10 +2061,14 @@ fn egclval_to_print_inner(mut v: EgclVal, escapep: bool, dispatch_pretty: bool) 
     if circle_active() && !v.is_cons() {
         if circle_array_length(v).is_some()
             && print_level().is_some_and(|level| PRINT_DEPTH.with(|depth| depth.get()) >= level)
-        { return "#".into(); }
+        {
+            return "#".into();
+        }
         match circle_visit(v) {
             CircleMark::Repeat(label) => return format!("#{label}#"),
-            CircleMark::First(label) => return format!("#{label}={}", egclval_to_print_body(v, escapep)),
+            CircleMark::First(label) => {
+                return format!("#{label}={}", egclval_to_print_body(v, escapep));
+            }
             CircleMark::NotShared => {}
         }
     }
@@ -2054,7 +2077,9 @@ fn egclval_to_print_inner(mut v: EgclVal, escapep: bool, dispatch_pretty: bool) 
 
 fn egclval_to_print_body(mut v: EgclVal, escapep: bool) -> String {
     egcl_rt::rooted_ref!(_v_root = &mut v);
-    if let Some(text) = nil_array_representation(v, escapep) { return text; }
+    if let Some(text) = nil_array_representation(v, escapep) {
+        return text;
+    }
     if let Some(text) = concise_array_representation(v) {
         return text;
     }
@@ -2327,10 +2352,14 @@ fn format_struct(v: EgclVal, class: EgclVal) -> String {
     egcl_rt::rooted!(slots = crate::clos::effective_slots(class));
     let depth = PRINT_DEPTH.with(|depth| depth.get());
     let plan = structure_print_plan(depth, slots.len());
-    if plan.level_exceeded { return "#".into(); }
+    if plan.level_exceeded {
+        return "#".into();
+    }
     struct RestoreDepth(usize);
     impl Drop for RestoreDepth {
-        fn drop(&mut self) { PRINT_DEPTH.with(|depth| depth.set(self.0)); }
+        fn drop(&mut self) {
+            PRINT_DEPTH.with(|depth| depth.set(self.0));
+        }
     }
     let _depth = RestoreDepth(depth);
     PRINT_DEPTH.with(|current| current.set(depth + 1));
@@ -2348,7 +2377,9 @@ fn format_struct(v: EgclVal, class: EgclVal) -> String {
             out.push_str(&egclval_to_print_string(*value, true));
         }
     }
-    if plan.ellipsis { out.push_str(" ..."); }
+    if plan.ellipsis {
+        out.push_str(" ...");
+    }
     out.push(')');
     out
 }
@@ -5621,11 +5652,8 @@ fn format_impl(
                 call_args.push(if at_sign { T } else { NIL });
                 call_args.extend_from_slice(&param_vals);
                 egcl_rt::rooted_ref!(_call_args_root = &mut call_args);
-                let (_, doc) = apply_format_function_to_layout(
-                    *func,
-                    &call_args,
-                    output.current_column(),
-                )?;
+                let (_, doc) =
+                    apply_format_function_to_layout(*func, &call_args, output.current_column())?;
                 output.append(doc);
             }
             '\n' => {
@@ -6560,20 +6588,56 @@ pub fn random_state_representation(value: EgclVal, escapep: bool) -> String {
 /// NIL storage must never be rendered by reading an imaginary character.
 /// Readable syntax reconstructs its exact empty element type and shape.
 pub fn nil_array_representation(value: EgclVal, escapep: bool) -> Option<String> {
-    if !crate::sequences::is_nil_array(value) { return None; }
-    if !print_readably_active() {
-        return Some(if crate::sequences::is_nil_sequence(value) && crate::sequences::length(value).ok() == Some(0) { if escapep { "\"\"".into() } else { String::new() } } else { "#<NIL-ELEMENT-ARRAY>".into() });
+    if !crate::sequences::is_nil_array(value) {
+        return None;
     }
-    if !read_eval_active() { return Some(print_not_readable(value)); }
+    if !print_readably_active() {
+        return Some(
+            if crate::sequences::is_nil_sequence(value)
+                && crate::sequences::length(value).ok() == Some(0)
+            {
+                if escapep {
+                    "\"\"".into()
+                } else {
+                    String::new()
+                }
+            } else {
+                "#<NIL-ELEMENT-ARRAY>".into()
+            },
+        );
+    }
+    if !read_eval_active() {
+        return Some(print_not_readable(value));
+    }
     let dimensions = if let Some(dims) = egcl_rt::types::md_array_dims(value) {
         let length = crate::sequences::length(dims).ok()?;
-        (0..length).map(|i| crate::sequences::elt(dims, i).ok().map(|d| d.as_fixnum() as usize)).collect::<Option<Vec<_>>>()?
-    } else { vec![crate::sequences::array_total_size(value)?] };
-    let shape = dimensions.iter().map(|d| format!("#10r{d}")).collect::<Vec<_>>().join(" ");
-    let mut text = format!("#.(|COMMON-LISP|:|MAKE-ARRAY| '({shape}) :|ELEMENT-TYPE| |COMMON-LISP|:|NIL|");
-    if crate::sequences::array_adjustable(value) { text.push_str(" :|ADJUSTABLE| |COMMON-LISP|:|T|"); }
-    if crate::sequences::is_complex_vector(value) && crate::sequences::cvec_has_fill_pointer(value) {
-        text.push_str(&format!(" :|FILL-POINTER| #10r{}", crate::sequences::cvec_fill_pointer(value)));
+        (0..length)
+            .map(|i| {
+                crate::sequences::elt(dims, i)
+                    .ok()
+                    .map(|d| d.as_fixnum() as usize)
+            })
+            .collect::<Option<Vec<_>>>()?
+    } else {
+        vec![crate::sequences::array_total_size(value)?]
+    };
+    let shape = dimensions
+        .iter()
+        .map(|d| format!("#10r{d}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut text =
+        format!("#.(|COMMON-LISP|:|MAKE-ARRAY| '({shape}) :|ELEMENT-TYPE| |COMMON-LISP|:|NIL|");
+    if crate::sequences::array_adjustable(value) {
+        text.push_str(" :|ADJUSTABLE| |COMMON-LISP|:|T|");
     }
-    text.push(')'); Some(text)
+    if crate::sequences::is_complex_vector(value) && crate::sequences::cvec_has_fill_pointer(value)
+    {
+        text.push_str(&format!(
+            " :|FILL-POINTER| #10r{}",
+            crate::sequences::cvec_fill_pointer(value)
+        ));
+    }
+    text.push(')');
+    Some(text)
 }

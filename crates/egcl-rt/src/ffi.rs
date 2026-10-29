@@ -45,8 +45,6 @@ pub mod callback;
 #[cfg(all(target_arch = "aarch64", unix))]
 mod aapcs64;
 // riscv64 likewise: one LP64D trampoline covers every scalar signature.
-#[cfg(all(target_arch = "riscv64", unix))]
-mod lp64d;
 /// ELFv2 foreign calls. Compiled on every host — the placement rules are pure
 /// logic, and their tests are what pin the difference from AAPCS64 that would
 /// otherwise be found only by running on POWER. Only the trampolines and the
@@ -59,6 +57,21 @@ mod lp64d;
     )
 )]
 mod elfv2;
+#[cfg(not(any(
+    all(target_arch = "x86_64", any(unix, windows)),
+    all(target_arch = "aarch64", unix),
+    all(target_arch = "riscv64", unix),
+    all(target_arch = "powerpc64", target_endian = "little", unix),
+    all(target_arch = "s390x", unix)
+)))]
+mod legacy;
+#[cfg(all(target_arch = "riscv64", unix))]
+mod lp64d;
+#[cfg(any(
+    all(target_arch = "x86_64", any(unix, windows)),
+    all(target_arch = "s390x", unix)
+))]
+pub mod managed_callback;
 /// s390x foreign calls, compiled on every host for the same reason as ELFv2:
 /// the placement tests pin the two independent register counters and the
 /// big-endian stack layout of a single, which otherwise only a z machine checks.
@@ -70,26 +83,12 @@ mod elfv2;
     )
 )]
 mod s390x;
-#[cfg(not(any(
-    all(target_arch = "x86_64", any(unix, windows)),
-    all(target_arch = "aarch64", unix),
-    all(target_arch = "riscv64", unix),
-    all(target_arch = "powerpc64", target_endian = "little", unix),
-    all(target_arch = "s390x", unix)
-)))]
-mod legacy;
-#[cfg(any(all(target_arch = "x86_64", any(unix, windows)), all(target_arch = "s390x", unix)))]
-pub mod managed_callback;
 #[cfg(all(target_arch = "x86_64", windows))]
 mod win64;
 #[cfg(all(target_arch = "aarch64", unix))]
 pub use aapcs64::{ffi_call, ffi_call_variadic};
-#[cfg(all(target_arch = "riscv64", unix))]
-pub use lp64d::{ffi_call, ffi_call_variadic};
 #[cfg(all(target_arch = "powerpc64", target_endian = "little", unix))]
 pub use elfv2::{ffi_call, ffi_call_variadic};
-#[cfg(all(target_arch = "s390x", unix))]
-pub use s390x::{ffi_call, ffi_call_variadic};
 #[cfg(not(any(
     all(target_arch = "x86_64", any(unix, windows)),
     all(target_arch = "aarch64", unix),
@@ -98,6 +97,10 @@ pub use s390x::{ffi_call, ffi_call_variadic};
     all(target_arch = "s390x", unix)
 )))]
 pub use legacy::{ffi_call, ffi_call_variadic};
+#[cfg(all(target_arch = "riscv64", unix))]
+pub use lp64d::{ffi_call, ffi_call_variadic};
+#[cfg(all(target_arch = "s390x", unix))]
+pub use s390x::{ffi_call, ffi_call_variadic};
 
 #[cfg(any(
     all(target_arch = "x86_64", any(unix, windows)),
@@ -336,7 +339,11 @@ unsafe fn ffi_call_impl(
     // function, which is far more than the CPU gap, so the split matters more
     // than the total (bliss-1dp).
     let profile = ffi_profile_enabled();
-    let t0 = if profile { Some(std::time::Instant::now()) } else { None };
+    let t0 = if profile {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
 
     // Compile/cache before publishing Native state. The adapter's Arc remains
     // live across foreign execution; no cache lock is held during callbacks.
@@ -425,9 +432,7 @@ pub fn marshal_to_c(value: EgclVal, alien_type: &AlienType) -> Result<u64, EgclE
             } else if value.is_fixnum() {
                 Ok(f64::to_bits(value.as_fixnum() as f64))
             } else {
-                Err(EgclError::FfiError(
-                    "cannot marshal value to double".into(),
-                ))
+                Err(EgclError::FfiError("cannot marshal value to double".into()))
             }
         }
         AlienType::Pointer(_) | AlienType::FnPtr { .. } => {
@@ -841,8 +846,7 @@ mod elf_backend {
             fn free(ptr: *mut c_void);
         }
         let mut syms = host_syms![
-            strcmp, strncmp, strcpy, strncpy, strncat, strcat,
-            abort, abs, sqrt, qsort,
+            strcmp, strncmp, strcpy, strncpy, strncat, strcat, abort, abs, sqrt, qsort,
         ];
         syms.extend_from_slice(&[
             ("memcpy", memcpy as *const ()),
@@ -910,9 +914,7 @@ mod elf_backend {
             return Err(EgclError::FfiError("null library handle".into()));
         }
         if name.contains('\0') {
-            return Err(EgclError::FfiError(
-                "symbol name contains null byte".into(),
-            ));
+            return Err(EgclError::FfiError("symbol name contains null byte".into()));
         }
         let lib = LIBS.get(library)?;
         let symbol = lib
@@ -937,9 +939,7 @@ mod elf_backend {
     /// The provider must remain loaded while the returned pointer is used.
     pub unsafe fn foreign_symbol_global(name: &str) -> Result<*const (), EgclError> {
         if name.contains('\0') {
-            return Err(EgclError::FfiError(
-                "symbol name contains null byte".into(),
-            ));
+            return Err(EgclError::FfiError("symbol name contains null byte".into()));
         }
         let libs = LIBS.open_libraries();
         for lib in libs {

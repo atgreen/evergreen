@@ -3,9 +3,9 @@
 
 // Microbench: StackRoot (mutex + registry) vs rooted! (intrusive, lock-free).
 // Simulates the walk_cons pattern: N nested scopes, 4 roots each, LIFO drops.
-use std::time::Instant;
 use egcl_rt::gc::StackRoot;
 use egcl_rt::value::EgclVal;
+use std::time::Instant;
 
 fn nested_stackroot(depth: usize) {
     if depth == 0 {

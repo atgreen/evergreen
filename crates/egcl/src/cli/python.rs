@@ -163,11 +163,7 @@ mod enabled {
         })
     }
 
-    pub fn setattr(
-        object: EgclVal,
-        name: EgclVal,
-        value: EgclVal,
-    ) -> Result<EgclVal, EgclError> {
+    pub fn setattr(object: EgclVal, name: EgclVal, value: EgclVal) -> Result<EgclVal, EgclError> {
         let name = name.as_string();
         crossing(|scope| {
             let receiver = scope.to_python(object)?;

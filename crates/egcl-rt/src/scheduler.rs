@@ -83,10 +83,7 @@ impl SchedulerGroup {
                 "fiber {} is not parked",
                 fiber.0
             ))),
-            None => Err(EgclError::Internal(format!(
-                "fiber {} is unknown",
-                fiber.0
-            ))),
+            None => Err(EgclError::Internal(format!("fiber {} is unknown", fiber.0))),
         }
     }
 
@@ -149,10 +146,7 @@ impl SchedulerGroup {
 /// scheduler or a thread-ID bookkeeping set.
 pub type Scheduler = SchedulerGroup;
 
-pub fn run_fibers(
-    fibers: &[FiberId],
-    config: &SchedulerConfig,
-) -> Result<Vec<EgclVal>, EgclError> {
+pub fn run_fibers(fibers: &[FiberId], config: &SchedulerConfig) -> Result<Vec<EgclVal>, EgclError> {
     let group = SchedulerGroup::init(config)?;
     for &fiber in fibers {
         group.submit(fiber)?;

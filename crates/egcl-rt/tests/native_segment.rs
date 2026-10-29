@@ -4,8 +4,8 @@
 //! Physical segment exits must abandon generated frames only, never Rust frames.
 #![cfg(all(target_arch = "x86_64", target_os = "linux"))]
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use egcl_rt::native_transfer::{self, NativeExit, NativeSegment};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[unsafe(naked)]
 unsafe extern "C" fn normal_entry() -> u64 {

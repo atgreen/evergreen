@@ -91,7 +91,9 @@ const PROBES: &str = "\
 fn run(envs: &[(&str, &str)]) -> String {
     let program = format!("(progn {DEFINITIONS} {PROBES})");
     let mut command = Command::new(BIN);
-    command.args(["--no-init", "--eval", &program]).env("EGCL_LAZY_COMPILE", "0");
+    command
+        .args(["--no-init", "--eval", &program])
+        .env("EGCL_LAZY_COMPILE", "0");
     for (key, value) in envs {
         command.env(key, value);
     }
@@ -132,7 +134,10 @@ fn double_float_results_match_the_interpreter_at_every_tier() {
     assert_eq!(interpreted, expected);
     for tier in ["t0", "t1", "t2"] {
         let compiled = run(&[("EGCL_FORCE_TIER", tier)]);
-        assert_eq!(compiled, interpreted, "tier {tier} differs from the interpreter");
+        assert_eq!(
+            compiled, interpreted,
+            "tier {tier} differs from the interpreter"
+        );
     }
     // The ordinary promotion path, with a warm profile rather than a forced tier.
     let promoted = run(&[
@@ -140,14 +145,19 @@ fn double_float_results_match_the_interpreter_at_every_tier() {
         ("EGCL_T2_THRESHOLD", "20"),
         ("EGCL_T2_THREADS", "1"),
     ]);
-    assert_eq!(promoted, interpreted, "promoted tiers differ from the interpreter");
+    assert_eq!(
+        promoted, interpreted,
+        "promoted tiers differ from the interpreter"
+    );
 }
 
 /// Run `program` and return (stdout, stderr).
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 fn run_logged(program: &str, envs: &[(&str, &str)]) -> (String, String) {
     let mut command = Command::new(BIN);
-    command.args(["--no-init", "--eval", program]).env("EGCL_LAZY_COMPILE", "0");
+    command
+        .args(["--no-init", "--eval", program])
+        .env("EGCL_LAZY_COMPILE", "0");
     for (key, value) in envs {
         command.env(key, value);
     }
@@ -196,8 +206,16 @@ fn double_float_loops_and_recursion_run_raw_at_t2() {
         stdout.contains("T2 100000.0d0 50000.5d0 250.25d0 6765.0d0 0 (2 2 2 2)"),
         "{stdout}\n{stderr}"
     );
-    for name in ["LOOP-DOUBLE-LITERAL", "LOOP-DOUBLE-ARG", "LOOP-DOUBLE-DECLARED", "DFIB"] {
-        assert!(stderr.contains(&format!("{name}: raw double candidate: speculated")), "{name}\n{stderr}");
+    for name in [
+        "LOOP-DOUBLE-LITERAL",
+        "LOOP-DOUBLE-ARG",
+        "LOOP-DOUBLE-DECLARED",
+        "DFIB",
+    ] {
+        assert!(
+            stderr.contains(&format!("{name}: raw double candidate: speculated")),
+            "{name}\n{stderr}"
+        );
         // Either ABI holds raw values: a raw body now usually gets the
         // ordinary x86-64 Lisp entry (bliss-k4psf).
         let raw_emitted = stderr.lines().any(|line| {
@@ -206,7 +224,10 @@ fn double_float_loops_and_recursion_run_raw_at_t2() {
                 && !line.ends_with("raw_f64_values=0")
         });
         assert!(raw_emitted, "{name} must install raw f64 code\n{stderr}");
-        assert!(!stderr.contains(&format!("{name}: raw double T2 emission declined")), "{stderr}");
+        assert!(
+            !stderr.contains(&format!("{name}: raw double T2 emission declined")),
+            "{stderr}"
+        );
     }
 }
 
@@ -232,10 +253,20 @@ fn failed_double_guard_retires_the_raw_speculation() {
             (- (egcl-ext:deopt-count) before) (egcl-ext:function-tier 'dadd))))";
     let (stdout, stderr) = run_logged(program, &PROMOTE);
     assert!(stdout.contains("STEADY 0"), "{stdout}\n{stderr}");
-    assert!(stdout.contains("GUARD 1.5d0 1"), "the native guard must fail once: {stdout}\n{stderr}");
-    assert!(stderr.contains("DADD: native guard deopt #1 => resuming interpreted (raw double speculation failed"),
-        "{stderr}");
-    assert!(stdout.contains("AFTER (5 1 3.0d0) 0 2"), "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("GUARD 1.5d0 1"),
+        "the native guard must fail once: {stdout}\n{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "DADD: native guard deopt #1 => resuming interpreted (raw double speculation failed"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        stdout.contains("AFTER (5 1 3.0d0) 0 2"),
+        "{stdout}\n{stderr}"
+    );
 }
 
 /// The escape box allocates, so a collection can run while raw and tagged
@@ -259,15 +290,25 @@ fn escape_boxes_survive_gc_stress() {
     let plain = &[("EGCL_FORCE_TIER", "t2")];
     let (expected, stderr) = run_logged(program, plain);
     assert!(expected.contains("TIERS (2 2 2)"), "{expected}\n{stderr}");
-    let (stressed, stderr) = run_logged(program, &[
-        ("EGCL_FORCE_TIER", "t2"),
-        ("EGCL_GC_STRESS", "1"),
-        ("EGCL_GC_POISON", "1"),
-        ("EGCL_GC_STRESS_AFTER_INIT", "1"),
-    ]);
-    assert!(stressed.contains("TIERS (2 2 2)"), "{stressed}
-{stderr}");
-    let result = |out: &str| out.lines().find(|line| line.starts_with("RESULT")).map(str::to_owned);
+    let (stressed, stderr) = run_logged(
+        program,
+        &[
+            ("EGCL_FORCE_TIER", "t2"),
+            ("EGCL_GC_STRESS", "1"),
+            ("EGCL_GC_POISON", "1"),
+            ("EGCL_GC_STRESS_AFTER_INIT", "1"),
+        ],
+    );
+    assert!(
+        stressed.contains("TIERS (2 2 2)"),
+        "{stressed}
+{stderr}"
+    );
+    let result = |out: &str| {
+        out.lines()
+            .find(|line| line.starts_with("RESULT"))
+            .map(str::to_owned)
+    };
     assert!(result(&expected).is_some(), "{expected}");
     assert_eq!(result(&stressed), result(&expected), "{stressed}\n{stderr}");
 }
@@ -306,8 +347,14 @@ fn fixnum_contagion_and_variadic_arithmetic_run_raw_at_t2() {
             || line.starts_with("[T2] STEP-PLAIN: ordinary x86-64 Lisp T2 emitted"))
             && !line.ends_with("raw_f64_values=0")
     });
-    assert!(raw_emitted, "STEP-PLAIN must install raw f64 code\n{stderr}");
-    assert!(!stderr.contains("STEP-PLAIN: raw double T2 emission declined"), "{stderr}");
+    assert!(
+        raw_emitted,
+        "STEP-PLAIN must install raw f64 code\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("STEP-PLAIN: raw double T2 emission declined"),
+        "{stderr}"
+    );
 }
 
 /// Raw `SQRT`, unary `-` and `/` on doubles (bliss-lhy89), and fixnum
@@ -369,7 +416,9 @@ const DOUBLE_ONLY_EXPECTED: &str = "\
 
 fn run_program(program: &str, envs: &[(&str, &str)]) -> String {
     let mut command = Command::new(BIN);
-    command.args(["--no-init", "--eval", program]).env("EGCL_LAZY_COMPILE", "0");
+    command
+        .args(["--no-init", "--eval", program])
+        .env("EGCL_LAZY_COMPILE", "0");
     for (key, value) in envs {
         command.env(key, value);
     }
@@ -387,8 +436,11 @@ fn run_program(program: &str, envs: &[(&str, &str)]) -> String {
         .to_string()
 }
 
-const PROMOTE_QUIET: [(&str, &str); 3] =
-    [("EGCL_T0_T1_THRESHOLD", "2"), ("EGCL_T2_THRESHOLD", "20"), ("EGCL_T2_THREADS", "1")];
+const PROMOTE_QUIET: [(&str, &str); 3] = [
+    ("EGCL_T0_T1_THRESHOLD", "2"),
+    ("EGCL_T2_THRESHOLD", "20"),
+    ("EGCL_T2_THREADS", "1"),
+];
 
 #[test]
 fn sqrt_negation_and_division_match_the_interpreter_at_every_tier() {
@@ -396,10 +448,16 @@ fn sqrt_negation_and_division_match_the_interpreter_at_every_tier() {
     assert_eq!(interpreted, DOUBLE_ONLY_EXPECTED);
     for tier in ["t0", "t1", "t2"] {
         let compiled = run_program(DOUBLE_ONLY_PROGRAM, &[("EGCL_FORCE_TIER", tier)]);
-        assert_eq!(compiled, interpreted, "tier {tier} differs from the interpreter");
+        assert_eq!(
+            compiled, interpreted,
+            "tier {tier} differs from the interpreter"
+        );
     }
     let promoted = run_program(DOUBLE_ONLY_PROGRAM, &PROMOTE_QUIET);
-    assert_eq!(promoted, interpreted, "promoted tiers differ from the interpreter");
+    assert_eq!(
+        promoted, interpreted,
+        "promoted tiers differ from the interpreter"
+    );
 }
 
 /// Under forced collections and nursery poisoning, the raw sqrt, negation and
@@ -410,12 +468,17 @@ fn sqrt_negation_and_division_match_the_interpreter_at_every_tier() {
 fn sqrt_negation_and_division_survive_gc_stress() {
     let expected = run_program(DOUBLE_ONLY_PROGRAM, &PROMOTE_QUIET);
     let [threshold, t2, threads] = PROMOTE_QUIET;
-    let stressed = run_program(DOUBLE_ONLY_PROGRAM, &[
-        threshold, t2, threads,
-        ("EGCL_GC_STRESS", "1"),
-        ("EGCL_GC_POISON", "1"),
-        ("EGCL_GC_STRESS_AFTER_INIT", "1"),
-    ]);
+    let stressed = run_program(
+        DOUBLE_ONLY_PROGRAM,
+        &[
+            threshold,
+            t2,
+            threads,
+            ("EGCL_GC_STRESS", "1"),
+            ("EGCL_GC_POISON", "1"),
+            ("EGCL_GC_STRESS_AFTER_INIT", "1"),
+        ],
+    );
     assert_eq!(stressed, expected);
 }
 
@@ -446,7 +509,8 @@ fn sqrt_and_division_run_raw_and_retire_on_a_failed_guard() {
             (- (egcl-ext:deopt-count) before))))";
     let (stdout, stderr) = run_logged(program, &PROMOTE);
     assert!(
-        stdout.contains("STEADY (1.5000816644436397d0 5.0d0 0.0d0 0.25d0 -0.5d0 NaN -0.0d0 2.0d0) 0"),
+        stdout
+            .contains("STEADY (1.5000816644436397d0 5.0d0 0.0d0 0.25d0 -0.5d0 NaN -0.0d0 2.0d0) 0"),
         "{stdout}\n{stderr}"
     );
     for name in ["STEP-SQRT", "HYP", "QUOT", "NEG"] {
@@ -456,9 +520,16 @@ fn sqrt_and_division_run_raw_and_retire_on_a_failed_guard() {
                 && !line.ends_with("raw_f64_values=0")
         });
         assert!(raw_emitted, "{name} must install raw f64 code\n{stderr}");
-        assert!(!stderr.contains(&format!("{name}: raw double T2 emission declined")), "{stderr}");
+        assert!(
+            !stderr.contains(&format!("{name}: raw double T2 emission declined")),
+            "{stderr}"
+        );
     }
     assert!(stdout.contains("GUARD :DBZ 1"), "{stdout}\n{stderr}");
-    assert!(stderr.contains("QUOT: native guard deopt #1 => resuming interpreted (raw double speculation failed"),
-        "{stderr}");
+    assert!(
+        stderr.contains(
+            "QUOT: native guard deopt #1 => resuming interpreted (raw double speculation failed"
+        ),
+        "{stderr}"
+    );
 }

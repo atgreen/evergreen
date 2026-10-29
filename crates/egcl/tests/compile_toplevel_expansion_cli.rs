@@ -45,7 +45,9 @@ fn run(program: &str, stress: bool) {
             .env("EGCL_GC_POISON", "1")
             .env("EGCL_GC_STRESS_AFTER_INIT", "1");
     }
-    let output = command.output().expect("run top-level expansion regression");
+    let output = command
+        .output()
+        .expect("run top-level expansion regression");
     assert!(
         output.status.success(),
         "stress={stress}: stdout={} stderr={}",

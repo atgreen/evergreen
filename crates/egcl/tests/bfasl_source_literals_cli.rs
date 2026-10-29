@@ -76,5 +76,8 @@ fn source_only_fasl_reads_against_the_source_file() {
       (assert (null *compile-file-pathname*))
       (format t "LITERALS-OK~%"))"##,
     );
-    assert!(stdout.contains("source-only"), "the probe must exercise a source-only fasl: {stdout}");
+    assert!(
+        stdout.contains("source-only"),
+        "the probe must exercise a source-only fasl: {stdout}"
+    );
 }

@@ -28,7 +28,14 @@ const BIN: &str = env!("CARGO_BIN_EXE_egcl");
 
 fn run(program: &str) -> String {
     let output = Command::new("timeout")
-        .args(["--kill-after=10", "120", BIN, "--no-init", "--eval", program])
+        .args([
+            "--kill-after=10",
+            "120",
+            BIN,
+            "--no-init",
+            "--eval",
+            program,
+        ])
         .output()
         .expect("run egcl");
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -73,13 +80,16 @@ fn the_answer_does_not_depend_on_which_class_was_dispatched_first() {
       (format t "COMPILED-THREE-WAY ~s~%" (compiled-three-way))
       (format t "ORDER-OK~%")
     "#);
-    expect(&stdout, &[
-        "STRUCT-FIRST :STRUCT :STD",
-        "USER-FIRST :STD :STRUCT",
-        "THREE-WAY :STD :BUILTIN :STRUCT",
-        "COMPILED-THREE-WAY (:STD :BUILTIN :STRUCT)",
-        "ORDER-OK",
-    ]);
+    expect(
+        &stdout,
+        &[
+            "STRUCT-FIRST :STRUCT :STD",
+            "USER-FIRST :STD :STRUCT",
+            "THREE-WAY :STD :BUILTIN :STRUCT",
+            "COMPILED-THREE-WAY (:STD :BUILTIN :STRUCT)",
+            "ORDER-OK",
+        ],
+    );
 }
 
 /// One method is enough: a cached APPLICABLE decision was replayed for an
@@ -99,13 +109,16 @@ fn a_cached_decision_is_not_replayed_for_an_inapplicable_argument() {
       (format t "AND-USER-AGAIN ~s~%" (applies #'only-std (find-class 'uc)))
       (format t "REPLAY-OK~%")
     "#);
-    expect(&stdout, &[
-        "PRIMED :STD",
-        "THEN-STRUCT :NONE",
-        "THEN-BUILTIN :NONE",
-        "AND-USER-AGAIN :STD",
-        "REPLAY-OK",
-    ]);
+    expect(
+        &stdout,
+        &[
+            "PRIMED :STD",
+            "THEN-STRUCT :NONE",
+            "THEN-BUILTIN :NONE",
+            "AND-USER-AGAIN :STD",
+            "REPLAY-OK",
+        ],
+    );
 }
 
 /// A built-in class metaobject is a negative fixnum, so it shared a key with
@@ -124,11 +137,10 @@ fn a_built_in_class_does_not_share_a_key_with_an_ordinary_integer() {
       (format t "BIC-FIRST ~s ~s~%" (h2 (find-class 'integer)) (h2 7))
       (format t "BUILTIN-OK~%")
     "#);
-    expect(&stdout, &[
-        "INT-FIRST :INT :BIC",
-        "BIC-FIRST :BIC :INT",
-        "BUILTIN-OK",
-    ]);
+    expect(
+        &stdout,
+        &["INT-FIRST :INT :BIC", "BIC-FIRST :BIC :INT", "BUILTIN-OK"],
+    );
 }
 
 /// The finer key is computed only for generics whose methods specialize on a
@@ -159,12 +171,15 @@ fn ordinary_dispatch_is_unaffected() {
                     (speak (make-instance 'dog))))
       (format t "ORDINARY-OK~%")
     "#);
-    expect(&stdout, &[
-        "INSTANCES :DOG :ANIMAL",
-        "VEC-STR :STRING :VECTOR",
-        "STR-VEC :STRING :VECTOR",
-        "IMMEDIATES :INT :SYMBOL :CONS",
-        "REPEAT (:STRING :VECTOR :INT :SYMBOL :DOG)",
-        "ORDINARY-OK",
-    ]);
+    expect(
+        &stdout,
+        &[
+            "INSTANCES :DOG :ANIMAL",
+            "VEC-STR :STRING :VECTOR",
+            "STR-VEC :STRING :VECTOR",
+            "IMMEDIATES :INT :SYMBOL :CONS",
+            "REPEAT (:STRING :VECTOR :INT :SYMBOL :DOG)",
+            "ORDINARY-OK",
+        ],
+    );
 }

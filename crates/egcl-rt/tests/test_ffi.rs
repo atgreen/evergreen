@@ -6,7 +6,7 @@
 #![cfg(feature = "c-ffi")]
 
 use egcl_rt::ffi::*;
-use egcl_rt::value::{NIL, EgclVal};
+use egcl_rt::value::{EgclVal, NIL};
 
 #[test]
 fn alien_type_variants_constructible() {

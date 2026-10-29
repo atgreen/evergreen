@@ -4,10 +4,10 @@
 
 use egcl_compiler::t2::build::build_from_bytecode_for_transfers;
 use egcl_compiler::t2::emit::{emit_framed, emit_framed_transfers};
-use egcl_rt::bytecode::{BytecodeFunction, Instr};
-use egcl_rt::value::NIL;
 use egcl_compiler::t2::x64_calls::{NativeCallSites, NativeCallValues};
 use egcl_compiler::t2::x64_value_maps::NativeValueLocation;
+use egcl_rt::bytecode::{BytecodeFunction, Instr};
+use egcl_rt::value::NIL;
 
 fn body() -> BytecodeFunction {
     BytecodeFunction {
@@ -76,7 +76,6 @@ fn transfer_entry_refuses_missing_adapter_storage_and_raw_argument_representatio
     assert!(emit_framed_transfers(&ir, 0x12345678, 4).is_err());
 }
 
-use std::cell::Cell;
 use egcl_compiler::t2::emit::TransferCallRequest;
 use egcl_compiler::t2::native_transfer::{
     SysvTransferCapture, emit_capture_stub, emit_helper_veneer,
@@ -85,7 +84,8 @@ use egcl_compiler::t2::transfer_sites::{SysvSiteSnapshot, SysvTransferTable};
 use egcl_rt::jit::JitBuffer;
 use egcl_rt::native_transfer::{self, NativeExit, NativeOutcome, NativeSegment};
 use egcl_rt::value::EgclVal;
-use egcl_rt::{Collector, HeapCollector, EgclStack};
+use egcl_rt::{Collector, EgclStack, HeapCollector};
+use std::cell::Cell;
 
 struct RunState {
     anchor: *mut NativeSegment,
@@ -137,73 +137,114 @@ unsafe extern "C" fn helper(request: *mut u8, out: *mut NativeOutcome) {
     let calls = unsafe { &*state.value_maps };
     let [return_pc, call_rsp] = unsafe { *state.call_capture };
     let offset = return_pc - state.code_base;
-    let site = calls.get(offset).expect("actual primary return PC must be indexed");
+    let site = calls
+        .get(offset)
+        .expect("actual primary return PC must be indexed");
     assert_eq!(site.stack_adjust, 64);
     let Some(NativeCallValues::Frame(map)) = calls.value_map(offset) else {
         panic!("collecting Invoke must have an authoritative map");
     };
     if state.native_storage {
-        assert!(map.values().iter().flat_map(|value| value.locations()).all(|location|
-            !matches!(location, NativeValueLocation::Activation(_))),
-            "native-storage calls must publish native homes, not activation copies");
+        assert!(
+            map.values()
+                .iter()
+                .flat_map(|value| value.locations())
+                .all(|location| !matches!(location, NativeValueLocation::Activation(_))),
+            "native-storage calls must publish native homes, not activation copies"
+        );
     }
     let entry = unsafe { *state.entry_capture };
     let cursor = egcl_compiler::t2::x64_unwind::NativeFrameCursor {
-        pc: return_pc, call_sp: call_rsp, registers: [None; 6],
+        pc: return_pc,
+        call_sp: call_rsp,
+        registers: [None; 6],
     };
-    let step = calls.unwind(state.code_base, &cursor, call_rsp..entry[1], |address| {
-        Some(unsafe { (address as *const usize).read() })
-    }).expect("emitted frame must unwind at the actual Invoke PC");
+    let step = calls
+        .unwind(state.code_base, &cursor, call_rsp..entry[1], |address| {
+            Some(unsafe { (address as *const usize).read() })
+        })
+        .expect("emitted frame must unwind at the actual Invoke PC");
     assert_eq!((step.caller.pc, step.caller.call_sp), (entry[0], entry[1]));
     for (index, location) in step.caller.registers.iter().enumerate() {
         if let Some(location) = location {
-            assert_eq!(unsafe { (*location as *const usize).read() }, entry[index + 2]);
+            assert_eq!(
+                unsafe { (*location as *const usize).read() },
+                entry[index + 2]
+            );
         }
     }
     assert_eq!(step.body_sp, Some(call_rsp + site.stack_adjust as usize));
     let body_rsp = (call_rsp + site.stack_adjust as usize) as *const usize;
-    let activation = unsafe { body_rsp.add(map.layout().activation_base_slot.unwrap() as usize).read() };
+    let activation = unsafe {
+        body_rsp
+            .add(map.layout().activation_base_slot.unwrap() as usize)
+            .read()
+    };
     assert_eq!(activation, request.activation as usize);
     // This compiler fixture bypasses the evaluator's root publication. Consume
     // its exact native maps explicitly, including the newly described aliases.
     struct MappedRoots(Vec<*mut EgclVal>);
     impl egcl_rt::gc::TraceHostRoots for MappedRoots {
         fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
-            for &slot in &self.0 { visit(slot); }
+            for &slot in &self.0 {
+                visit(slot);
+            }
         }
     }
-    let copies: Vec<Vec<*mut EgclVal>> = map.values().iter()
+    let copies: Vec<Vec<*mut EgclVal>> = map
+        .values()
+        .iter()
         .filter(|value| value.may_reference_heap())
-        .map(|value| value.locations().iter().map(|location| match *location {
-            NativeValueLocation::Activation(slot) => unsafe { request.activation.add(slot as usize) },
-            NativeValueLocation::Stack(offset) =>
-                (body_rsp as usize).wrapping_add_signed(offset as isize) as *mut EgclVal,
-            _ => panic!("this fixture expects stack-homed roots"),
-        }).collect()).collect();
+        .map(|value| {
+            value
+                .locations()
+                .iter()
+                .map(|location| match *location {
+                    NativeValueLocation::Activation(slot) => unsafe {
+                        request.activation.add(slot as usize)
+                    },
+                    NativeValueLocation::Stack(offset) => {
+                        (body_rsp as usize).wrapping_add_signed(offset as isize) as *mut EgclVal
+                    }
+                    _ => panic!("this fixture expects stack-homed roots"),
+                })
+                .collect()
+        })
+        .collect();
     let mut roots = MappedRoots(copies.iter().flatten().copied().collect());
     egcl_rt::rooted_ref!(_roots = &mut roots);
     for slots in &copies {
-        assert!(slots.iter().all(|slot| unsafe { **slot == *slots[0] }),
-            "native and shadow copies must agree before relocation");
+        assert!(
+            slots.iter().all(|slot| unsafe { **slot == *slots[0] }),
+            "native and shadow copies must agree before relocation"
+        );
     }
     HeapCollector::new().minor_gc().unwrap();
     for slots in &copies {
-        assert!(slots.iter().all(|slot| unsafe { **slot == *slots[0] }),
-            "every alias must be updated by GC");
+        assert!(
+            slots.iter().all(|slot| unsafe { **slot == *slots[0] }),
+            "every alias must be updated by GC"
+        );
         let expected = unsafe { std::slice::from_raw_parts(state.expected, state.expected_len) };
-        assert!(expected.contains(unsafe { &*slots[0] }), "map must describe a relocated live value");
+        assert!(
+            expected.contains(unsafe { &*slots[0] }),
+            "map must describe a relocated live value"
+        );
     }
     for index in 0..request.nargs {
         let outgoing = if state.native_storage {
-            let offset = (request.args as usize + index * 8).checked_sub(body_rsp as usize)
+            let offset = (request.args as usize + index * 8)
+                .checked_sub(body_rsp as usize)
                 .expect("outgoing arguments live in the native body frame");
             NativeValueLocation::Stack(i32::try_from(offset).unwrap())
         } else {
             let slot = unsafe { request.args.add(index).offset_from(request.activation) };
             NativeValueLocation::Activation(u16::try_from(slot).unwrap())
         };
-        assert!(map.gc_locations().any(|location| *location == outgoing),
-            "every outgoing argument copy must be rooted");
+        assert!(
+            map.gc_locations().any(|location| *location == outgoing),
+            "every outgoing argument copy must be rooted"
+        );
         assert_eq!(unsafe { request.args.add(index).read() }, unsafe {
             state
                 .expected
@@ -270,7 +311,12 @@ unsafe extern "C" fn prepare(capture: *mut SysvTransferCapture) {
     // result on the operand stack belongs to this continuation. Keep the live
     // payload/relocation assertions below instead of retaining dead roots.
     assert_eq!(frames[0].locals.len(), state.expected_len);
-    assert!(frames[0].locals.iter().all(|value| *value == egcl_rt::value::UNBOUND));
+    assert!(
+        frames[0]
+            .locals
+            .iter()
+            .all(|value| *value == egcl_rt::value::UNBOUND)
+    );
     assert_eq!(frames[0].stack.as_slice(), &[*payload]);
     unsafe {
         snapshot.write_back(state.code_base, capture).unwrap();
@@ -338,22 +384,38 @@ fn exercise_collecting_calls(native_storage: bool) {
             let veneer = JitBuffer::new(&emit_helper_veneer(helper, capture.as_ptr())).unwrap();
             let mut call_capture = Box::new([0usize; 2]);
             // Tail-jump after observing the actual primary CALL coordinates.
-            let probe = native_unwind::capture_call(veneer.as_ptr(), call_capture.as_mut_ptr(), false);
+            let probe =
+                native_unwind::capture_call(veneer.as_ptr(), call_capture.as_mut_ptr(), false);
             let (emitted, table) = if native_storage {
-                egcl_compiler::t2::emit::emit_framed_transfers_with_storage(&ir,
-                    probe.as_ptr() as u64, activation_slots,
-                    egcl_compiler::t2::emit::NativeCallStorage::NativeStack)
+                egcl_compiler::t2::emit::emit_framed_transfers_with_storage(
+                    &ir,
+                    probe.as_ptr() as u64,
+                    activation_slots,
+                    egcl_compiler::t2::emit::NativeCallStorage::NativeStack,
+                )
             } else {
                 emit_framed_transfers(&ir, probe.as_ptr() as u64, activation_slots)
-            }.unwrap();
-            if native_storage {
-                assert_eq!(emitted.shadow_root_slots, 0,
-                    "native storage must not request tagged activation copies");
             }
-            assert!(emitted.native_calls.as_ref().unwrap().unwind_recipe().is_some(), "SysV emitted code needs its exact prologue recipe");
+            .unwrap();
+            if native_storage {
+                assert_eq!(
+                    emitted.shadow_root_slots, 0,
+                    "native storage must not request tagged activation copies"
+                );
+            }
+            assert!(
+                emitted
+                    .native_calls
+                    .as_ref()
+                    .unwrap()
+                    .unwind_recipe()
+                    .is_some(),
+                "SysV emitted code needs its exact prologue recipe"
+            );
             let code = JitBuffer::new(&emitted.code).unwrap();
             let mut entry_capture = Box::new([0usize; 8]);
-            let entry_probe = native_unwind::capture_call(code.as_ptr(), entry_capture.as_mut_ptr(), true);
+            let entry_probe =
+                native_unwind::capture_call(code.as_ptr(), entry_capture.as_mut_ptr(), true);
             let mut snapshots: Vec<_> = table
                 .sites()
                 .map(|site| (site.return_offset(), site.reserve_snapshot().unwrap()))
@@ -496,8 +558,10 @@ fn guarded_leaf_without_poll_has_a_call_capable_deopt_frame() {
     let probe = native_unwind::capture_call(veneer.as_ptr(), top.as_mut_ptr(), false);
     unsafe extern "C" fn single_values(_: u64, dst: *mut EgclVal, count: u64) {
         if count == egcl_rt::native_transfer::SNAPSHOT_NATIVE_RETURN_VALUES {
-            unsafe { dst.cast::<egcl_rt::native_transfer::NativeReturnValues>()
-                .write(egcl_rt::native_transfer::NativeReturnValues::SINGLE); }
+            unsafe {
+                dst.cast::<egcl_rt::native_transfer::NativeReturnValues>()
+                    .write(egcl_rt::native_transfer::NativeReturnValues::SINGLE);
+            }
         } else {
             assert_eq!(count, 0);
         }
@@ -519,28 +583,80 @@ fn guarded_leaf_without_poll_has_a_call_capable_deopt_frame() {
     assert!(emitted.has_deopt);
     // One scope header (four words), one local, and the native request area:
     // 40 + 32 bytes rounded to 16-byte call alignment = 80 bytes.
-    let deopts: Vec<_> = emitted.native_calls.as_ref().unwrap().iter().filter(|site|
-        matches!(site.origin, egcl_compiler::t2::x64_calls::NativeCallOrigin::Deopt(_))).collect();
+    let deopts: Vec<_> = emitted
+        .native_calls
+        .as_ref()
+        .unwrap()
+        .iter()
+        .filter(|site| {
+            matches!(
+                site.origin,
+                egcl_compiler::t2::x64_calls::NativeCallOrigin::Deopt(_)
+            )
+        })
+        .collect();
     assert_eq!(deopts.len(), 1);
     assert_eq!(deopts[0].stack_adjust, 80);
-    assert!(matches!(emitted.native_calls.as_ref().unwrap().value_map(deopts[0].return_offset),
-        Some(NativeCallValues::Deoptimizing { .. })));
-    assert_eq!(&emitted.code[deopts[0].return_offset - 2..deopts[0].return_offset], &[0xff, 0xd0]);
+    assert!(matches!(
+        emitted
+            .native_calls
+            .as_ref()
+            .unwrap()
+            .value_map(deopts[0].return_offset),
+        Some(NativeCallValues::Deoptimizing { .. })
+    ));
+    assert_eq!(
+        &emitted.code[deopts[0].return_offset - 2..deopts[0].return_offset],
+        &[0xff, 0xd0]
+    );
     let legacy = egcl_compiler::t2::emit::emit_framed_with_direct_natives(
-        &ir, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 0, 1, None, &[], 1, &[], Default::default(),
+        &ir,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        0,
+        0,
+        1,
+        None,
+        &[],
+        1,
+        &[],
+        Default::default(),
         &Default::default(),
-    ).unwrap();
-    let legacy_deopts: Vec<_> = legacy.native_calls.as_ref().unwrap().iter().filter(|site|
-        matches!(site.origin, egcl_compiler::t2::x64_calls::NativeCallOrigin::Deopt(_))).collect();
+    )
+    .unwrap();
+    let legacy_deopts: Vec<_> = legacy
+        .native_calls
+        .as_ref()
+        .unwrap()
+        .iter()
+        .filter(|site| {
+            matches!(
+                site.origin,
+                egcl_compiler::t2::x64_calls::NativeCallOrigin::Deopt(_)
+            )
+        })
+        .collect();
     assert_eq!(legacy_deopts.len(), 1);
-    assert_eq!(legacy_deopts[0].stack_adjust, 48, "legacy serialization has no native request");
+    assert_eq!(
+        legacy_deopts[0].stack_adjust, 48,
+        "legacy serialization has no native request"
+    );
     let code = JitBuffer::new(&emitted.code).unwrap();
     let mut entry = Box::new([0usize; 8]);
     let entry_probe = native_unwind::capture_call(code.as_ptr(), entry.as_mut_ptr(), true);
     let mut walk = native_unwind::DeoptWalk {
         calls: emitted.native_calls.as_ref().unwrap(),
         code_base: code.as_ptr() as usize,
-        top: &*top, entry: &*entry, checked: 0,
+        top: &*top,
+        entry: &*entry,
+        checked: 0,
     };
     native_unwind::DEOPT_WALK.with(|slot| slot.set(&mut walk));
     let stack = EgclStack::new(64 * 1024);

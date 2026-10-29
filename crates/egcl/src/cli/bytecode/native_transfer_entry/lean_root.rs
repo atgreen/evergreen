@@ -21,8 +21,8 @@
 //! already clear, and an entry poll that tests whether there is anything to
 //! service before servicing it.
 
-use super::*;
 use super::activation::PooledActivation;
+use super::*;
 
 /// Root entries taken, for the structural tests: a counter, not a timing.
 #[cfg(test)]
@@ -38,7 +38,8 @@ pub(in crate::cli::bytecode) fn take_lean_root_entries_for_test() -> usize {
 /// entry, for comparison. Read once.
 fn lean_root_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("EGCL_LEAN_ROOT_ENTRY").is_none_or(|value| value != "0"))
+    *ENABLED
+        .get_or_init(|| std::env::var_os("EGCL_LEAN_ROOT_ENTRY").is_none_or(|value| value != "0"))
 }
 
 impl TransferCode {
@@ -51,7 +52,11 @@ impl TransferCode {
             !self.body.variadic
                 && !self.body.has_env
                 && self.body.min_args == self.body.arity
-                && self.body.param_types.iter().all(|ty| matches!(ty, DeclaredType::Any))
+                && self
+                    .body
+                    .param_types
+                    .iter()
+                    .all(|ty| matches!(ty, DeclaredType::Any))
                 && self.osr_entries.is_empty()
                 && lean_root_enabled()
         })
@@ -78,28 +83,36 @@ impl TransferCode {
         // Declared first, so it pops the managed frame last, as in the
         // general entry.
         let mut frame_guard = FrameGuard(None);
-        let _catch_guard = CatchScopeGuard { base: env.catch_stack.len(), env };
+        let _catch_guard = CatchScopeGuard {
+            base: env.catch_stack.len(),
+            env,
+        };
         // Preparation reserves Rust storage only; it cannot collect.
         let mut state = PooledActivation::new(self, ActivationState::prepare_reusing(self, env)?);
         let mut children = SegmentActivations::default();
         let depth = NATIVE_DEPTH.with(Cell::as_ptr);
-        egcl_rt::rooted!(roots = EntryRoots {
-            function,
-            args: EntryArgs::new(args),
-            env,
-            state: &mut *state,
-            children: &mut children,
-            entry: None,
-        });
+        egcl_rt::rooted!(
+            roots = EntryRoots {
+                function,
+                args: EntryArgs::new(args),
+                env,
+                state: &mut *state,
+                children: &mut children,
+                entry: None,
+            }
+        );
         // The rooted copy stays in place; the collector updates it there.
         let args: &[EgclVal] = unsafe { &*std::ptr::from_ref(roots.args.as_slice()) };
-        unsafe { *depth += 1; }
+        unsafe {
+            *depth += 1;
+        }
         let _depth = LeanDepthGuard(depth);
         let stack = egcl_rt::current_stack();
         let frame_function = if egcl_rt::function::is_interpreted_function(roots.function) {
             roots.function
         } else {
-            self.deopt_metadata.as_ref()
+            self.deopt_metadata
+                .as_ref()
                 .and_then(|metadata| metadata.deopt_bodies.keys().next().copied())
                 .or(self.installed_symbol)
                 .map(EgclVal::from_symbol_index)
@@ -151,7 +164,11 @@ impl TransferCode {
         // per execution and stays put, so `execution` is still this one.
         let _ordinary_segment = super::super::call_table::enter_ordinary_segment();
         let _ordinary_root = if self.needs_callable_identity() {
-            Some(_ordinary_segment.retain_root(self, roots.function).ok_or_else(invalid_capture)?)
+            Some(
+                _ordinary_segment
+                    .retain_root(self, roots.function)
+                    .ok_or_else(invalid_capture)?,
+            )
         } else {
             None
         };
@@ -159,25 +176,49 @@ impl TransferCode {
         // Keep the existing execution-specific emergency stack reserve, as
         // the general entry does; generated child calls check their own bounds.
         let sp: usize;
-        unsafe { std::arch::asm!("mov {}, rsp", out(reg) sp, options(nomem, nostack, preserves_flags)); }
-        let overflow_bytes = args.len().saturating_sub(3).checked_mul(8)
-            .and_then(|size| size.checked_add(15)).map(|size| size & !15)
+        unsafe {
+            std::arch::asm!("mov {}, rsp", out(reg) sp, options(nomem, nostack, preserves_flags));
+        }
+        let overflow_bytes = args
+            .len()
+            .saturating_sub(3)
+            .checked_mul(8)
+            .and_then(|size| size.checked_add(15))
+            .map(|size| size & !15)
             .ok_or_else(invalid_capture)?;
-        let required = self.ordinary_stack_required.expect("ordinary stack admission bound")
-            .checked_add(4096).and_then(|size| size.checked_add(overflow_bytes))
+        let required = self
+            .ordinary_stack_required
+            .expect("ordinary stack admission bound")
+            .checked_add(4096)
+            .and_then(|size| size.checked_add(overflow_bytes))
             .ok_or_else(invalid_capture)?;
-        if sp.checked_sub(required).is_none_or(|bottom| bottom as u64 <= unsafe { (*control).stack_limit }) {
-            return Err(EgclError::StackOverflow(egcl_rt::current_fiber_id()
-                .unwrap_or_else(|| egcl_rt::FiberId(egcl_rt::current_thread_id().0))));
+        if sp
+            .checked_sub(required)
+            .is_none_or(|bottom| bottom as u64 <= unsafe { (*control).stack_limit })
+        {
+            return Err(EgclError::StackOverflow(
+                egcl_rt::current_fiber_id()
+                    .unwrap_or_else(|| egcl_rt::FiberId(egcl_rt::current_thread_id().0)),
+            ));
         }
         let outcome = unsafe {
             let execution = &*execution;
-            execution.with_active_native_control(std::pin::Pin::new_unchecked(&mut *control), || {
-                #[cfg(test)]
-                if let Some(observe) = ORDINARY_ENTRY_HOOK.with(|hook| hook.take()) { observe(); }
-                native_transfer::invoke_ordinary_native_segment(
-                    self.code.as_ptr().add(offset), execution, NIL, args, stack)
-            })
+            execution.with_active_native_control(
+                std::pin::Pin::new_unchecked(&mut *control),
+                || {
+                    #[cfg(test)]
+                    if let Some(observe) = ORDINARY_ENTRY_HOOK.with(|hook| hook.take()) {
+                        observe();
+                    }
+                    native_transfer::invoke_ordinary_native_segment(
+                        self.code.as_ptr().add(offset),
+                        execution,
+                        NIL,
+                        args,
+                        stack,
+                    )
+                },
+            )
         }
         .map(|returned| returned.outcome)
         .map_err(|_| EgclError::Internal("native segment is unavailable".into()))?;
@@ -185,8 +226,12 @@ impl TransferCode {
         // or taking ownership of the execution-local error.
         let primary = outcome.value;
         let error = take_native_error();
-        if outcome.exit == NativeExit::Returned && error.is_none() && context.failure.is_none()
-            && context.osr.is_none() && context.selected.is_none() && state.is_quiescent()
+        if outcome.exit == NativeExit::Returned
+            && error.is_none()
+            && context.failure.is_none()
+            && context.osr.is_none()
+            && context.selected.is_none()
+            && state.is_quiescent()
         {
             return Ok(primary);
         }

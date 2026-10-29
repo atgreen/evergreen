@@ -233,7 +233,10 @@ pub fn mag_divmod(a: &[u64], b: &[u64]) -> (Vec<u64>, Vec<u64>) {
         return (Vec::new(), a.to_vec());
     }
     let n = b.len();
-    debug_assert!(n > 0 && b[n - 1] != 0, "divisor must be nonzero and trimmed");
+    debug_assert!(
+        n > 0 && b[n - 1] != 0,
+        "divisor must be nonzero and trimmed"
+    );
 
     // A single-limb divisor needs no normalisation or correction: each step is
     // one 128-by-64 divide.
@@ -246,7 +249,11 @@ pub fn mag_divmod(a: &[u64], b: &[u64]) -> (Vec<u64>, Vec<u64>) {
             q[i] = (cur / d) as u64;
             rem = cur % d;
         }
-        let r = if rem == 0 { Vec::new() } else { vec![rem as u64] };
+        let r = if rem == 0 {
+            Vec::new()
+        } else {
+            vec![rem as u64]
+        };
         return (mag_trim(q), r);
     }
 
@@ -265,9 +272,7 @@ pub fn mag_divmod(a: &[u64], b: &[u64]) -> (Vec<u64>, Vec<u64>) {
         let top = ((u[j + n] as u128) << 64) | u[j + n - 1] as u128;
         let mut qhat = top / v[n - 1] as u128;
         let mut rhat = top % v[n - 1] as u128;
-        while qhat >= BASE
-            || qhat * v[n - 2] as u128 > (rhat << 64) | u[j + n - 2] as u128
-        {
+        while qhat >= BASE || qhat * v[n - 2] as u128 > (rhat << 64) | u[j + n - 2] as u128 {
             qhat -= 1;
             rhat += v[n - 1] as u128;
             if rhat >= BASE {

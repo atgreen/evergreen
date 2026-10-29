@@ -98,7 +98,9 @@ pub fn peel_for_numeric_types_with_feedback(
         }
         let mut trial = f.clone();
         let before = trial.num_insts();
-        if let Err(error) = transform(&mut trial, lp.header, &lp.body, parameter, latch, range, permits) {
+        if let Err(error) = transform(
+            &mut trial, lp.header, &lp.body, parameter, latch, range, permits,
+        ) {
             stats
                 .declined
                 .push(format!("header {}: {error}", lp.header.0));

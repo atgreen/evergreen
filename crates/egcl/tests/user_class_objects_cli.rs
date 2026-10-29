@@ -16,7 +16,14 @@ const BIN: &str = env!("CARGO_BIN_EXE_egcl");
 
 fn run(program: &str) -> String {
     let output = Command::new("timeout")
-        .args(["--kill-after=10", "180", BIN, "--no-init", "--eval", program])
+        .args([
+            "--kill-after=10",
+            "180",
+            BIN,
+            "--no-init",
+            "--eval",
+            program,
+        ])
         .output()
         .expect("run egcl");
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -56,20 +63,23 @@ fn a_user_class_is_an_object_and_defclass_returns_it() {
       (format t "STRUCT ~a~%" (st-x (make-st :x 5)))
       (format t "USER-CLASS-OK~%")
     "#);
-    expect(&stdout, &[
-        "SYMBOLP NIL",
-        "META-UC STANDARD-CLASS",
-        "META-ST STRUCTURE-CLASS",
-        "META-CC STANDARD-CLASS",
-        "NAME UC",
-        "IS-CLASS T",
-        "RETURNS-CLASS T",
-        "REDEF-SAME T",
-        "INSTANCE 1",
-        "TYPEP-INSTANCE T",
-        "STRUCT 5",
-        "USER-CLASS-OK",
-    ]);
+    expect(
+        &stdout,
+        &[
+            "SYMBOLP NIL",
+            "META-UC STANDARD-CLASS",
+            "META-ST STRUCTURE-CLASS",
+            "META-CC STANDARD-CLASS",
+            "NAME UC",
+            "IS-CLASS T",
+            "RETURNS-CLASS T",
+            "REDEF-SAME T",
+            "INSTANCE 1",
+            "TYPEP-INSTANCE T",
+            "STRUCT 5",
+            "USER-CLASS-OK",
+        ],
+    );
 }
 
 /// CLHS TYPE-OF answers the class's PROPER name, and the class itself when it
@@ -88,12 +98,15 @@ fn type_of_answers_the_class_when_it_has_no_proper_name() {
                 (and (make-instance c) (not (slot-boundp (make-instance c) 'a)))))
       (format t "TYPE-OF-OK~%")
     "#);
-    expect(&stdout, &[
-        "WITH-NAME TN",
-        "WITHOUT-NAME T",
-        "STILL-INSTANTIABLE T",
-        "TYPE-OF-OK",
-    ]);
+    expect(
+        &stdout,
+        &[
+            "WITH-NAME TN",
+            "WITHOUT-NAME T",
+            "STILL-INSTANTIABLE T",
+            "TYPE-OF-OK",
+        ],
+    );
 }
 
 /// A superclass that is not defined yet gets a placeholder metaobject the
@@ -111,14 +124,17 @@ fn a_forward_referenced_superclass_resolves_when_it_is_defined() {
         (format t "INHERITED-SLOT ~a~%" (slot-value (make-instance 'fr-sub) 'a)))
       (format t "FORWARD-REF-OK~%")
     "#);
-    expect(&stdout, &[
-        "SUB-IS-CLASS T",
-        "SUPER-IS-CLASS T",
-        "SUPER-REUSED T",
-        "INHERITS T",
-        "INHERITED-SLOT 1",
-        "FORWARD-REF-OK",
-    ]);
+    expect(
+        &stdout,
+        &[
+            "SUB-IS-CLASS T",
+            "SUPER-IS-CLASS T",
+            "SUPER-REUSED T",
+            "INHERITS T",
+            "INHERITED-SLOT 1",
+            "FORWARD-REF-OK",
+        ],
+    );
 }
 
 /// The metaclass half of GitHub #384: a class with a user `:metaclass` IS an
@@ -165,21 +181,24 @@ fn a_class_with_a_user_metaclass_is_an_instance_of_it() {
         (format t "DIRECT-INSTANCE ~a ~a~%" (typep m 'meta) (meta-x m)))
       (format t "METACLASS-OK~%")
     "#);
-    expect(&stdout, &[
-        "CLASS-OF-IS-META T",
-        "TYPEP-META T",
-        "TYPEP-STD T",
-        "SLOT-EXISTS T",
-        "INITFORM 1",
-        "INITFORM-VIA-ACCESSOR 1",
-        "REDEF-KEEPS-SLOT 99",
-        "DISPATCH-META META",
-        "DISPATCH-PREFERS-META META",
-        "SLOT-ROUNDTRIP 42",
-        "ACCESSOR-ROUNDTRIP 7",
-        "DIRECT-INSTANCE T 1",
-        "METACLASS-OK",
-    ]);
+    expect(
+        &stdout,
+        &[
+            "CLASS-OF-IS-META T",
+            "TYPEP-META T",
+            "TYPEP-STD T",
+            "SLOT-EXISTS T",
+            "INITFORM 1",
+            "INITFORM-VIA-ACCESSOR 1",
+            "REDEF-KEEPS-SLOT 99",
+            "DISPATCH-META META",
+            "DISPATCH-PREFERS-META META",
+            "SLOT-ROUNDTRIP 42",
+            "ACCESSOR-ROUNDTRIP 7",
+            "DIRECT-INSTANCE T 1",
+            "METACLASS-OK",
+        ],
+    );
 }
 
 /// A class NAMED AS A SUPERCLASS BEFORE IT IS DEFINED and then defined with a
@@ -276,27 +295,30 @@ fn a_forward_referenced_class_with_a_user_metaclass_is_an_instance_of_it() {
       (format t "PLAIN-INHERITED-SLOT ~a~%" (slot-value (make-instance 'plain-sub) 's))
       (format t "FORWARD-METACLASS-OK~%")
     "#);
-    expect(&stdout, &[
-        "CLASS-OF-IS-META T",
-        "TYPEP-META T",
-        "TYPE-OF FMETA",
-        "SLOT-EXISTS T",
-        "INITFORM 1",
-        "DISPATCH-PREFERS-META META",
-        "ACCESSOR-ROUNDTRIP 7",
-        "SUPER-IS-REGISTERED T",
-        "SUB-IS-RECORDED T",
-        "SUB-INHERITS T",
-        "CLASS-NAME LATE",
-        "COMPILED (T T 7 META)",
-        "INSTANCE-REFUSED T",
-        "INSTANCE-AFTER-DEFINITION 3",
-        "BARE-TYPEP T",
-        "BARE-SUB-INHERITS T",
-        "PLAIN-SUPER-EQ T",
-        "PLAIN-INHERITED-SLOT 7",
-        "FORWARD-METACLASS-OK",
-    ]);
+    expect(
+        &stdout,
+        &[
+            "CLASS-OF-IS-META T",
+            "TYPEP-META T",
+            "TYPE-OF FMETA",
+            "SLOT-EXISTS T",
+            "INITFORM 1",
+            "DISPATCH-PREFERS-META META",
+            "ACCESSOR-ROUNDTRIP 7",
+            "SUPER-IS-REGISTERED T",
+            "SUB-IS-RECORDED T",
+            "SUB-INHERITS T",
+            "CLASS-NAME LATE",
+            "COMPILED (T T 7 META)",
+            "INSTANCE-REFUSED T",
+            "INSTANCE-AFTER-DEFINITION 3",
+            "BARE-TYPEP T",
+            "BARE-SUB-INHERITS T",
+            "PLAIN-SUPER-EQ T",
+            "PLAIN-INHERITED-SLOT 7",
+            "FORWARD-METACLASS-OK",
+        ],
+    );
 }
 
 /// A class that is only a forward reference cannot be instantiated, and does not
@@ -368,25 +390,28 @@ fn a_forward_referenced_class_cannot_be_instantiated_or_finalized() {
       (format t "AFTER-INHERITED-SLOT ~a~%" (slot-value (make-instance 'fr-sub2) 'a))
       (format t "FORWARD-REFUSAL-OK~%")
     "#);
-    expect(&stdout, &[
-        "MAKE-INSTANCE T",
-        "ALLOCATE-INSTANCE T",
-        "ALLOCATE-VIA-FUNCALL T",
-        "CHANGE-CLASS T",
-        "DEFINED-CLASS-OK T",
-        "FINALIZED-UNDEF NIL",
-        "FINALIZED-SUB NIL",
-        "FINALIZED-STANDARD-OBJECT T",
-        "FINALIZE-SIGNALS T",
-        "COMPILED (T T NIL T)",
-        "AFTER-MAKE-INSTANCE 1",
-        "AFTER-ALLOCATE T",
-        "AFTER-CHANGE-CLASS T",
-        "AFTER-FINALIZED (T T)",
-        "AFTER-FINALIZE T",
-        "AFTER-INHERITED-SLOT 1",
-        "FORWARD-REFUSAL-OK",
-    ]);
+    expect(
+        &stdout,
+        &[
+            "MAKE-INSTANCE T",
+            "ALLOCATE-INSTANCE T",
+            "ALLOCATE-VIA-FUNCALL T",
+            "CHANGE-CLASS T",
+            "DEFINED-CLASS-OK T",
+            "FINALIZED-UNDEF NIL",
+            "FINALIZED-SUB NIL",
+            "FINALIZED-STANDARD-OBJECT T",
+            "FINALIZE-SIGNALS T",
+            "COMPILED (T T NIL T)",
+            "AFTER-MAKE-INSTANCE 1",
+            "AFTER-ALLOCATE T",
+            "AFTER-CHANGE-CLASS T",
+            "AFTER-FINALIZED (T T)",
+            "AFTER-FINALIZE T",
+            "AFTER-INHERITED-SLOT 1",
+            "FORWARD-REFUSAL-OK",
+        ],
+    );
 }
 
 /// A class named as a superclass before it is defined is an instance of
@@ -440,26 +465,29 @@ fn a_forward_reference_is_an_instance_of_forward_referenced_class() {
       (format t "SUB-INHERITS ~a~%" (typep (make-instance 'fr-sub3) 'fr-pending))
       (format t "FRC-OK~%")
     "#);
-    expect(&stdout, &[
-        "CLASS-OF FORWARD-REFERENCED-CLASS",
-        "PRINTS #<FORWARD-REFERENCED-CLASS FR-PENDING>",
-        "TYPEP-FRC T",
-        "TYPEP-STD NIL",
-        "TYPEP-CLASS T",
-        "HOME-PACKAGE EGCL-MOP",
-        "FINALIZED NIL",
-        "SUB-FINALIZED NIL",
-        "REFUSED T",
-        "ACCEPTED-AS-SUPER T",
-        "EQ-AFTER T",
-        "CLASS-OF-AFTER STANDARD-CLASS",
-        "TYPEP-FRC-AFTER NIL",
-        "TYPEP-STD-AFTER T",
-        "FINALIZED-AFTER T",
-        "INSTANCE 7",
-        "SUB-INHERITS T",
-        "FRC-OK",
-    ]);
+    expect(
+        &stdout,
+        &[
+            "CLASS-OF FORWARD-REFERENCED-CLASS",
+            "PRINTS #<FORWARD-REFERENCED-CLASS FR-PENDING>",
+            "TYPEP-FRC T",
+            "TYPEP-STD NIL",
+            "TYPEP-CLASS T",
+            "HOME-PACKAGE EGCL-MOP",
+            "FINALIZED NIL",
+            "SUB-FINALIZED NIL",
+            "REFUSED T",
+            "ACCEPTED-AS-SUPER T",
+            "EQ-AFTER T",
+            "CLASS-OF-AFTER STANDARD-CLASS",
+            "TYPEP-FRC-AFTER NIL",
+            "TYPEP-STD-AFTER T",
+            "FINALIZED-AFTER T",
+            "INSTANCE 7",
+            "SUB-INHERITS T",
+            "FRC-OK",
+        ],
+    );
 }
 
 /// The condition hierarchy must survive, and a built-in or condition class
@@ -489,12 +517,15 @@ fn the_condition_hierarchy_and_the_redefinition_refusals_are_intact() {
                 (error () :refused)))
       (format t "CONDITION-OK~%")
     "#);
-    expect(&stdout, &[
-        "ERROR-CPL (ERROR SERIOUS-CONDITION CONDITION STANDARD-OBJECT T)",
-        "PROGRAM-ERROR-CPL (PROGRAM-ERROR ERROR SERIOUS-CONDITION CONDITION STANDARD-OBJECT T)",
-        "REDEF-BUILTIN REFUSED",
-        "REDEF-CONDITION REFUSED",
-        "BUILTIN-SUPERCLASS REFUSED",
-        "CONDITION-OK",
-    ]);
+    expect(
+        &stdout,
+        &[
+            "ERROR-CPL (ERROR SERIOUS-CONDITION CONDITION STANDARD-OBJECT T)",
+            "PROGRAM-ERROR-CPL (PROGRAM-ERROR ERROR SERIOUS-CONDITION CONDITION STANDARD-OBJECT T)",
+            "REDEF-BUILTIN REFUSED",
+            "REDEF-CONDITION REFUSED",
+            "BUILTIN-SUPERCLASS REFUSED",
+            "CONDITION-OK",
+        ],
+    );
 }

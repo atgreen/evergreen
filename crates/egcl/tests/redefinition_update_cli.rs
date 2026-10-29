@@ -23,7 +23,14 @@ const BIN: &str = env!("CARGO_BIN_EXE_egcl");
 
 fn run(program: &str) -> String {
     let output = Command::new("timeout")
-        .args(["--kill-after=10", "180", BIN, "--no-init", "--eval", program])
+        .args([
+            "--kill-after=10",
+            "180",
+            BIN,
+            "--no-init",
+            "--eval",
+            program,
+        ])
         .output()
         .expect("run egcl");
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -76,14 +83,17 @@ fn a_slot_added_by_a_redefinition_takes_its_initform() {
       (format t "PROTOCOL-RUNS ~a~%" *n*)
       (format t "REDEFINITION-UPDATE-OK~%")
     "#);
-    expect(&stdout, &[
-        "ADDED-SLOT 42",
-        "KEPT-SLOT 1",
-        "WRITE-WINS 7",
-        "NO-INITFORM NIL",
-        "PROTOCOL-RUNS 1",
-        "REDEFINITION-UPDATE-OK",
-    ]);
+    expect(
+        &stdout,
+        &[
+            "ADDED-SLOT 42",
+            "KEPT-SLOT 1",
+            "WRITE-WINS 7",
+            "NO-INITFORM NIL",
+            "PROTOCOL-RUNS 1",
+            "REDEFINITION-UPDATE-OK",
+        ],
+    );
 }
 
 /// The migrated address must not escape into Lisp. `EQ` compares tagged words
@@ -119,13 +129,16 @@ fn the_migrations_replacement_address_does_not_escape_into_lisp() {
       (format t "EQ-HASH ~a~%" (gethash *k* *h*))
       (format t "IDENTITY-OK~%")
     "#);
-    expect(&stdout, &[
-        "MAKUNBOUND-EQ T",
-        "ALIAS-EQ T",
-        "AFTER-READ-EQ T",
-        "EQ-HASH FOUND",
-        "IDENTITY-OK",
-    ]);
+    expect(
+        &stdout,
+        &[
+            "MAKUNBOUND-EQ T",
+            "ALIAS-EQ T",
+            "AFTER-READ-EQ T",
+            "EQ-HASH FOUND",
+            "IDENTITY-OK",
+        ],
+    );
 }
 
 /// A user method receives the arguments CLHS specifies, including the values of
@@ -148,13 +161,16 @@ fn a_user_method_sees_the_added_discarded_and_property_list() {
       (format t "KEPT ~a~%" (slot-value *k* 'keep))
       (format t "PROTOCOL-ARGS-OK~%")
     "#);
-    expect(&stdout, &[
-        "PROTOCOL-ARGS (ADDED (FRESH) DISCARDED (DROP) PLIST (DROP 2))",
-        "FRESH-INITFORM 3",
-        "DISCARDED-GONE NIL",
-        "KEPT 1",
-        "PROTOCOL-ARGS-OK",
-    ]);
+    expect(
+        &stdout,
+        &[
+            "PROTOCOL-ARGS (ADDED (FRESH) DISCARDED (DROP) PLIST (DROP 2))",
+            "FRESH-INITFORM 3",
+            "DISCARDED-GONE NIL",
+            "KEPT 1",
+            "PROTOCOL-ARGS-OK",
+        ],
+    );
 }
 
 /// Every first-touch path triggers it, in both tiers. SLOT-BOUNDP answered NIL
@@ -187,13 +203,16 @@ fn every_first_touch_runs_the_update_in_both_tiers() {
       (format t "COMPILED-BOUNDP ~a~%" (compiled-boundp))
       (format t "FIRST-TOUCH-OK~%")
     "#);
-    expect(&stdout, &[
-        "BOUNDP-FIRST T",
-        "ACCESSOR-FIRST 42",
-        "MAKUNBOUND-STICKS NIL",
-        "MAKUNBOUND-READ-SIGNALS T",
-        "COMPILED-READ 42",
-        "COMPILED-BOUNDP T",
-        "FIRST-TOUCH-OK",
-    ]);
+    expect(
+        &stdout,
+        &[
+            "BOUNDP-FIRST T",
+            "ACCESSOR-FIRST 42",
+            "MAKUNBOUND-STICKS NIL",
+            "MAKUNBOUND-READ-SIGNALS T",
+            "COMPILED-READ 42",
+            "COMPILED-BOUNDP T",
+            "FIRST-TOUCH-OK",
+        ],
+    );
 }

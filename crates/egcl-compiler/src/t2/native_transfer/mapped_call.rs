@@ -238,7 +238,12 @@ pub fn emit_published_call_entry_descriptor(
     let mut bytes = a.finish().expect("local mapped entry labels");
     let relative = i32::try_from(cold_offset as isize - (cold_displacement + 4) as isize).unwrap();
     bytes[cold_displacement..cold_displacement + 4].copy_from_slice(&relative.to_le_bytes());
-    PublishedCallEntry { code: bytes, child_return_offset, cold_offset, frame_bytes: SIZE as usize }
+    PublishedCallEntry {
+        code: bytes,
+        child_return_offset,
+        cold_offset,
+        frame_bytes: SIZE as usize,
+    }
 }
 
 /// A named caller only marshals its explicit continuation context and loads the

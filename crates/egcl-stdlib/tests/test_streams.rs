@@ -6,7 +6,7 @@
 //! Covers: StreamDirection, ExternalFormat, GrayStream trait operations,
 //! stream constructors, composite streams, stream queries, and error conditions.
 
-use egcl_rt::value::{EOF, NIL, EgclVal};
+use egcl_rt::value::{EOF, EgclVal, NIL};
 use egcl_stdlib::streams::*;
 
 // ── StreamDirection enum ──────────────────────────────────────────

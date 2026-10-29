@@ -17,7 +17,12 @@ static MV_RETURN_PAYLOAD: [EgclVal; 3] = [EgclVal(336), EgclVal(344), EgclVal(35
 
 #[repr(C)]
 #[derive(Default, Debug)]
-struct ObservedReturn { primary: u64, count: usize, payload: usize, carry: u8 }
+struct ObservedReturn {
+    primary: u64,
+    count: usize,
+    payload: usize,
+    carry: u8,
+}
 
 #[unsafe(naked)]
 unsafe extern "C" fn observe_return(
@@ -26,10 +31,20 @@ unsafe extern "C" fn observe_return(
     _out: *mut ObservedReturn,
 ) {
     core::arch::naked_asm!(
-        "push rbx", "mov rbx, rdx", "mov rax, rdi", "mov rcx, rsi",
-        "xor edi, edi", "xor esi, esi", "xor edx, edx", "call rax",
-        "setc byte ptr [rbx + 24]", "mov [rbx], rax", "mov [rbx + 8], rdx",
-        "mov [rbx + 16], rcx", "pop rbx", "ret",
+        "push rbx",
+        "mov rbx, rdx",
+        "mov rax, rdi",
+        "mov rcx, rsi",
+        "xor edi, edi",
+        "xor esi, esi",
+        "xor edx, edx",
+        "call rax",
+        "setc byte ptr [rbx + 24]",
+        "mov [rbx], rax",
+        "mov [rbx + 8], rdx",
+        "mov [rbx + 16], rcx",
+        "pop rbx",
+        "ret",
     )
 }
 
@@ -40,27 +55,45 @@ unsafe extern "C" fn prepare_values(_: u64, record: *mut MappedCallRecord) {
     record.owner = std::ptr::null_mut();
     record.entry = if MV_RETURN_FALLBACK.with(std::cell::Cell::get) {
         std::ptr::null()
-    } else { child_values as *const u8 };
-    record.outcome = NativeOutcome { value: NIL, exit: NativeExit::Returned };
+    } else {
+        child_values as *const u8
+    };
+    record.outcome = NativeOutcome {
+        value: NIL,
+        exit: NativeExit::Returned,
+    };
 }
 
-unsafe extern "C" fn child_values(_: *mut u8) -> EgclVal { EgclVal::from_fixnum(42) }
+unsafe extern "C" fn child_values(_: *mut u8) -> EgclVal {
+    EgclVal::from_fixnum(42)
+}
 
 unsafe extern "C" fn finish_values(record: *mut MappedCallRecord) {
     let count = MV_RETURN_COUNT.with(std::cell::Cell::get);
-    unsafe { (*record).return_values = egcl_rt::native_transfer::NativeReturnValues {
-        count,
-        payload: if count > 1 { MV_RETURN_PAYLOAD.as_ptr() } else { std::ptr::null() },
-    }; }
+    unsafe {
+        (*record).return_values = egcl_rt::native_transfer::NativeReturnValues {
+            count,
+            payload: if count > 1 {
+                MV_RETURN_PAYLOAD.as_ptr()
+            } else {
+                std::ptr::null()
+            },
+        };
+    }
     // The callback is a C boundary: deliberately destroy the result registers
     // and CF after materializing its tuple. The adapter must reconstruct them.
-    unsafe { core::arch::asm!("xor eax,eax", "xor edx,edx", "xor ecx,ecx",
-        out("rax") _, out("rdx") _, out("rcx") _, options(nostack)); }
+    unsafe {
+        core::arch::asm!("xor eax,eax", "xor edx,edx", "xor ecx,ecx",
+        out("rax") _, out("rdx") _, out("rcx") _, options(nostack));
+    }
 }
 
 unsafe extern "C" fn fallback_values(_: u64, record: *mut MappedCallRecord) {
     unsafe {
-        (*record).outcome = NativeOutcome { value: EgclVal::from_fixnum(42), exit: NativeExit::Returned };
+        (*record).outcome = NativeOutcome {
+            value: EgclVal::from_fixnum(42),
+            exit: NativeExit::Returned,
+        };
         finish_values(record);
     }
 }
@@ -69,23 +102,43 @@ unsafe extern "C" fn fallback_values(_: u64, record: *mut MappedCallRecord) {
 fn published_returns_reconstruct_zero_one_many_after_rust_retirement_and_fallback() {
     use egcl_compiler::t2::native_transfer::emit_published_call_entry;
     let code = JitBuffer::new(&emit_published_call_entry(
-        true, prepare_values, finish_values, finish_values, fallback_values,
-    )).unwrap();
+        true,
+        prepare_values,
+        finish_values,
+        finish_values,
+        fallback_values,
+    ))
+    .unwrap();
     for fallback in [false, true] {
         MV_RETURN_FALLBACK.with(|state| state.set(fallback));
         for count in [0, 1, 3] {
             MV_RETURN_COUNT.with(|state| state.set(count));
             let mut context = egcl_rt::call_table::NativeCallContext {
-                request: std::ptr::null_mut(), capture: std::ptr::null(),
-                args: std::ptr::null_mut(), nargs: 0,
+                request: std::ptr::null_mut(),
+                capture: std::ptr::null(),
+                args: std::ptr::null_mut(),
+                nargs: 0,
             };
             let mut observed = ObservedReturn::default();
-            unsafe { observe_return(code.as_ptr(), &mut context, &mut observed); }
+            unsafe {
+                observe_return(code.as_ptr(), &mut context, &mut observed);
+            }
             assert_eq!(observed.primary, EgclVal::from_fixnum(42).0);
-            assert_eq!(observed.carry, u8::from(count != 1), "{observed:?}; fallback={fallback}");
+            assert_eq!(
+                observed.carry,
+                u8::from(count != 1),
+                "{observed:?}; fallback={fallback}"
+            );
             if count != 1 {
                 assert_eq!(observed.count, count);
-                assert_eq!(observed.payload, if count > 1 { MV_RETURN_PAYLOAD.as_ptr() as usize } else { 0 });
+                assert_eq!(
+                    observed.payload,
+                    if count > 1 {
+                        MV_RETURN_PAYLOAD.as_ptr() as usize
+                    } else {
+                        0
+                    }
+                );
             }
         }
     }
@@ -153,7 +206,9 @@ unsafe extern "C" fn child(activation: *mut u8) -> EgclVal {
     EgclVal::from_fixnum(42)
 }
 unsafe extern "C" fn finish(record: *mut MappedCallRecord) {
-    unsafe { (*record).return_values = egcl_rt::native_transfer::NativeReturnValues::SINGLE; }
+    unsafe {
+        (*record).return_values = egcl_rt::native_transfer::NativeReturnValues::SINGLE;
+    }
     STATE.with_borrow_mut(|state| {
         let state = state.as_mut().unwrap();
         assert_eq!(unsafe { (*record).request }, state.request);

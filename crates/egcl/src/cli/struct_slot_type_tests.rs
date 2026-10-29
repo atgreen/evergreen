@@ -96,6 +96,9 @@ fn constructor_check_forms_follow_relocated_inputs() {
             form == symbol
         }
     }
-    assert!(contains(method.body, check), "the checked writer body must survive GC");
+    assert!(
+        contains(method.body, check),
+        "the checked writer body must survive GC"
+    );
     println!("STRUCT-INPUTS-RELOCATED");
 }

@@ -1,13 +1,15 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-use super::*;
 use super::super::super::native_transfer_entry;
+use super::*;
 
 #[test]
 #[ignore = "requires a platform-supported native segment transition"]
 fn native_v2_protected_child_catch_and_cleanup_preserve_values() {
-    use super::super::super::native_transfer_entry::root_publication::{take_adapter_crossings, take_completeness, describe_bails};
+    use super::super::super::native_transfer_entry::root_publication::{
+        describe_bails, take_adapter_crossings, take_completeness,
+    };
     let _lock = super::super::super::super::heap_test_lock()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -85,9 +87,16 @@ fn native_v2_protected_child_catch_and_cleanup_preserve_values() {
             egcl_rt::rooted!(result = code.run(&args, &mut env).unwrap());
             let (expected, resolved, bails) = take_completeness();
             assert!(expected > 0, "cleanup GC must reach published roots");
-            assert_eq!(expected, resolved, "resolve every declared root across the child adapter");
-            assert_eq!(bails.iter().sum::<usize>(), 0,
-                "protected-child walk bailed: {}", describe_bails(bails));
+            assert_eq!(
+                expected, resolved,
+                "resolve every declared root across the child adapter"
+            );
+            assert_eq!(
+                bails.iter().sum::<usize>(),
+                0,
+                "protected-child walk bailed: {}",
+                describe_bails(bails)
+            );
             assert_eq!(*result, args[0]);
             assert_ne!(args[0].to_raw(), before);
             assert_eq!(env.mv.len(), 2);
@@ -116,8 +125,10 @@ fn native_v2_protected_child_catch_and_cleanup_preserve_values() {
             EgclVal::from_fixnum(3)
         );
     }
-    assert!(take_adapter_crossings() > 0,
-        "cleanup collection must cross a mapped child into its native caller");
+    assert!(
+        take_adapter_crossings() > 0,
+        "cleanup collection must cross a mapped child into its native caller"
+    );
 }
 
 #[test]
@@ -418,25 +429,36 @@ fn native_v2_loop_heat_retains_validated_callable_during_cell_replacement() {
             .env_remove("EGCL_PROFILING_DISABLED")
             .output()
             .unwrap();
-        assert!(output.status.success(), "heat child failed: {:?}\n{}\n{}",
+        assert!(
+            output.status.success(),
+            "heat child failed: {:?}\n{}\n{}",
             output.status,
             String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr));
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
         return;
     }
     let _lock = super::super::super::super::heap_test_lock()
-        .lock().unwrap_or_else(|error| error.into_inner());
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let mut env = Env::new(false);
     egcl_rt::rooted_ref!(_env = &mut env);
     super::super::super::super::read_eval_all_env(
         "(defun heat-cell-loop (n) (catch :heat-cell (dotimes (i n))) n)
-         (defun heat-cell-replacement (n) n)", &mut env).unwrap();
+         (defun heat-cell-replacement (n) n)",
+        &mut env,
+    )
+    .unwrap();
     egcl_rt::rooted!(params = reader::read_from_string("(n)").unwrap().0);
-    egcl_rt::rooted!(forms = reader::read_from_string(
-        "((catch :heat-cell (dotimes (i n))) n)").unwrap().0);
+    egcl_rt::rooted!(
+        forms = reader::read_from_string("((catch :heat-cell (dotimes (i n))) n)")
+            .unwrap()
+            .0
+    );
     let symbol = egcl_rt::symbols::intern("HEAT-CELL-LOOP");
-    let body = Arc::new(compile_function("HEAT-CELL-LOOP", *params, *forms, &env, false, false).unwrap());
+    let body =
+        Arc::new(compile_function("HEAT-CELL-LOOP", *params, *forms, &env, false, false).unwrap());
     registry_put(symbol, Arc::clone(&body));
     let installed = native_transfer_entry::install_baseline(symbol, body).unwrap();
     let NativeCodeStorage::Mapped(mapped) = &installed._storage else {
@@ -451,29 +473,67 @@ fn native_v2_loop_heat_retains_validated_callable_during_cell_replacement() {
         let original_before = egcl_rt::function::back_edge_count(*original);
         let replacement_before = egcl_rt::function::back_edge_count(*replacement);
         let stack = egcl_rt::current_stack();
-        let before_stack = (stack.fp(), stack.sp(), NATIVE_DEPTH.with(std::cell::Cell::get));
+        let before_stack = (
+            stack.fp(),
+            stack.sp(),
+            NATIVE_DEPTH.with(std::cell::Cell::get),
+        );
         {
-            let _restore = HeatMutationGuard { symbol, original: &mut *original };
-            HEAT_MUTATED.with(|done| done.set(false));
-            HEAT_MUTATION.with(|state| state.set(Some(HeatMutation {
+            let _restore = HeatMutationGuard {
                 symbol,
-                owner: Rc::as_ptr(mapped) as usize,
                 original: &mut *original,
-                replacement: if unbind { std::ptr::null_mut() } else { &mut *replacement },
-            })));
-            native_transfer_entry::AFTER_HEAT_VALIDATION.with(|hook|
-                hook.set(Some(replace_validated_heat_callable)));
-            let result = run_native_callable(&installed, symbol, *original,
-                &[EgclVal::from_fixnum(8)], &mut env).unwrap();
+            };
+            HEAT_MUTATED.with(|done| done.set(false));
+            HEAT_MUTATION.with(|state| {
+                state.set(Some(HeatMutation {
+                    symbol,
+                    owner: Rc::as_ptr(mapped) as usize,
+                    original: &mut *original,
+                    replacement: if unbind {
+                        std::ptr::null_mut()
+                    } else {
+                        &mut *replacement
+                    },
+                }))
+            });
+            native_transfer_entry::AFTER_HEAT_VALIDATION
+                .with(|hook| hook.set(Some(replace_validated_heat_callable)));
+            let result = run_native_callable(
+                &installed,
+                symbol,
+                *original,
+                &[EgclVal::from_fixnum(8)],
+                &mut env,
+            )
+            .unwrap();
             assert_eq!(result, EgclVal::from_fixnum(8));
             assert!(HEAT_MUTATED.with(std::cell::Cell::get));
-            assert_eq!(egcl_rt::symbols::symbol_function(symbol),
-                Some(if unbind { egcl_rt::value::UNBOUND } else { *replacement }));
-            assert_eq!(egcl_rt::function::back_edge_count(*original) - original_before, 1,
-                "the validated header belongs to the original; subsequent headers must decline (unbind={unbind})");
-            assert_eq!(egcl_rt::function::back_edge_count(*replacement), replacement_before,
-                "replacement must receive no heat from the retained old body");
-            assert_eq!((stack.fp(), stack.sp(), NATIVE_DEPTH.with(std::cell::Cell::get)), before_stack);
+            assert_eq!(
+                egcl_rt::symbols::symbol_function(symbol),
+                Some(if unbind {
+                    egcl_rt::value::UNBOUND
+                } else {
+                    *replacement
+                })
+            );
+            assert_eq!(
+                egcl_rt::function::back_edge_count(*original) - original_before,
+                1,
+                "the validated header belongs to the original; subsequent headers must decline (unbind={unbind})"
+            );
+            assert_eq!(
+                egcl_rt::function::back_edge_count(*replacement),
+                replacement_before,
+                "replacement must receive no heat from the retained old body"
+            );
+            assert_eq!(
+                (
+                    stack.fp(),
+                    stack.sp(),
+                    NATIVE_DEPTH.with(std::cell::Cell::get)
+                ),
+                before_stack
+            );
             assert!(env.catch_stack.is_empty());
         }
         assert_eq!(egcl_rt::symbols::symbol_function(symbol), Some(*original));

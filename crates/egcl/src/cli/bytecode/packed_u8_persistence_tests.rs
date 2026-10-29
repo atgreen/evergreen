@@ -25,7 +25,9 @@ fn packed_u8_bbu_preserves_payload_sharing_and_md_backing() {
     for (index, &byte) in expected.iter().enumerate() {
         assert!(egcl_rt::packed_u8::set(*bytes, index, byte));
     }
-    egcl_rt::rooted!(md = egcl_stdlib::sequences::build_md_array_with_storage(&[16, 16], *bytes).unwrap());
+    egcl_rt::rooted!(
+        md = egcl_stdlib::sequences::build_md_array_with_storage(&[16, 16], *bytes).unwrap()
+    );
     egcl_rt::rooted!(carrier = egcl_stdlib::build_simple_vector(&[*bytes, *bytes, *md]));
     let mut pool = BbuConstPool::default();
     egcl_rt::rooted_ref!(_pool_root = &mut pool);
@@ -126,7 +128,9 @@ fn packed_u8_image_registry_constants_keep_saved_heap_identity() {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     egcl_rt::rooted!(bytes = egcl_rt::packed_u8::make(3, 42).unwrap());
-    egcl_rt::rooted!(md = egcl_stdlib::sequences::build_md_array_with_storage(&[1, 3], *bytes).unwrap());
+    egcl_rt::rooted!(
+        md = egcl_stdlib::sequences::build_md_array_with_storage(&[1, 3], *bytes).unwrap()
+    );
     let mut pool = BbuConstPool {
         saved_heap_refs: true,
         ..Default::default()
@@ -176,8 +180,14 @@ fn packed_u8_bbu_preserves_complex_capacity_and_displaced_md_aliases() {
     assert_eq!(egcl_stdlib::array_total_size(*complex), Some(6));
     assert_eq!(egcl_stdlib::cvec_fill_pointer(*complex), 2);
     assert!(egcl_stdlib::cvec_adjustable(*complex));
-    assert_eq!(egcl_stdlib::sequences::u8_array_element(*complex, 0), Some(17));
-    assert_eq!(egcl_stdlib::sequences::u8_array_element(*complex, 5), Some(99));
+    assert_eq!(
+        egcl_stdlib::sequences::u8_array_element(*complex, 0),
+        Some(17)
+    );
+    assert_eq!(
+        egcl_stdlib::sequences::u8_array_element(*complex, 5),
+        Some(99)
+    );
     egcl_rt::rooted!(view = egcl_stdlib::elt(*carrier, 1).unwrap());
     assert_eq!(*view, egcl_stdlib::elt(*carrier, 3).unwrap());
     assert_eq!(egcl_stdlib::array_total_size(*view), Some(6));

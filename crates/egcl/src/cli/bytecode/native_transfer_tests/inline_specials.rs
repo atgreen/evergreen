@@ -55,15 +55,30 @@ fn native_special_access_uses_the_value_cell_and_survives_relocation() {
     // Unbound by any execution: every access stays in native code.
     helper_calls();
     eval("(inline-cell-store 50)", &mut env).unwrap();
-    assert_eq!(helper_calls(), 0, "unbound-by-binding accesses must not call the runtime");
+    assert_eq!(
+        helper_calls(),
+        0,
+        "unbound-by-binding accesses must not call the runtime"
+    );
     // The list the native store left in the value cell is young; a minor
     // collection moves it and updates the cell, which is a root.
     let stored = egcl_rt::symbols::symbol_value(cell).unwrap();
     egcl_rt::collect_t0_minor().unwrap();
     let relocated = egcl_rt::symbols::symbol_value(cell).unwrap();
-    assert_ne!(stored.to_raw(), relocated.to_raw(), "the stored list must actually move");
-    assert_eq!(eval("(inline-cell-car)", &mut env).unwrap(), EgclVal::from_fixnum(49));
-    assert_eq!(helper_calls(), 0, "the inline read must see the relocated list");
+    assert_ne!(
+        stored.to_raw(),
+        relocated.to_raw(),
+        "the stored list must actually move"
+    );
+    assert_eq!(
+        eval("(inline-cell-car)", &mut env).unwrap(),
+        EgclVal::from_fixnum(49)
+    );
+    assert_eq!(
+        helper_calls(),
+        0,
+        "the inline read must see the relocated list"
+    );
     assert_eq!(
         eval("(car (cdr *inline-cell*))", &mut env).unwrap(),
         EgclVal::from_fixnum(49)
@@ -72,18 +87,34 @@ fn native_special_access_uses_the_value_cell_and_survives_relocation() {
     // A dynamic binding sends the same code to the runtime, which sees it.
     helper_calls();
     assert_eq!(
-        eval("(let ((*inline-cell* (list 7))) (inline-cell-car))", &mut env).unwrap(),
+        eval(
+            "(let ((*inline-cell* (list 7))) (inline-cell-car))",
+            &mut env
+        )
+        .unwrap(),
         EgclVal::from_fixnum(7)
     );
-    assert!(helper_calls() > 0, "a bound special must take the runtime path");
-    assert_eq!(egcl_rt::symbols::binding_guard(cell), Some(0), "the binding released its guard");
-    assert_eq!(eval("(inline-cell-car)", &mut env).unwrap(), EgclVal::from_fixnum(49));
+    assert!(
+        helper_calls() > 0,
+        "a bound special must take the runtime path"
+    );
+    assert_eq!(
+        egcl_rt::symbols::binding_guard(cell),
+        Some(0),
+        "the binding released its guard"
+    );
+    assert_eq!(
+        eval("(inline-cell-car)", &mut env).unwrap(),
+        EgclVal::from_fixnum(49)
+    );
 
     // An unbound cell falls through to the runtime, which signals.
     egcl_rt::symbols::set_symbol_value(cell, egcl_rt::value::UNBOUND);
     let unbound = format!("{:?}", eval("(inline-cell-car)", &mut env));
-    assert!(unbound.contains("*INLINE-CELL*") && unbound.to_ascii_lowercase().contains("unbound"),
-        "an unbound read must signal: {unbound}");
+    assert!(
+        unbound.contains("*INLINE-CELL*") && unbound.to_ascii_lowercase().contains("unbound"),
+        "an unbound read must signal: {unbound}"
+    );
 }
 
 #[test]
@@ -106,7 +137,11 @@ fn binding_guard_counts_executions_and_constants() {
     })
     .join()
     .unwrap();
-    assert_eq!(other, Some(2), "a second execution's binding counts separately");
+    assert_eq!(
+        other,
+        Some(2),
+        "a second execution's binding counts separately"
+    );
     egcl_rt::symbols::restore_symbol_binding(symbol, inner);
     assert_eq!(egcl_rt::symbols::binding_guard(symbol), Some(1));
     egcl_rt::symbols::restore_symbol_binding(symbol, outer);

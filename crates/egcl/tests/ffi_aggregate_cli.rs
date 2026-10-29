@@ -34,17 +34,19 @@ fn lisp_native_buffers_support_aggregates_and_checked_lifetimes() {
         // Keep this fixture independent of the host libc: distro compiler
         // defaults can introduce __stack_chk_fail, which the musl ELF loader
         // cannot resolve. The runtime aggregate fixture uses the same flag.
-        assert!(Command::new("cc")
-            .args(["-shared", "-fPIC", "-O2", "-fno-stack-protector"])
-            .arg(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../egcl-rt/tests/fixtures/ffi_aggregates.c"
-            ))
-            .arg("-o")
-            .arg(&library)
-            .status()
-            .unwrap()
-            .success());
+        assert!(
+            Command::new("cc")
+                .args(["-shared", "-fPIC", "-O2", "-fno-stack-protector"])
+                .arg(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../egcl-rt/tests/fixtures/ffi_aggregates.c"
+                ))
+                .arg("-o")
+                .arg(&library)
+                .status()
+                .unwrap()
+                .success()
+        );
         library
     };
     #[cfg(windows)]

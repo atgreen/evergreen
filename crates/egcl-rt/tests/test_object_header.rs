@@ -7,11 +7,11 @@
 //! functions, and numeric heap objects — the object kinds the allocator, heap
 //! walker, tracer, and evacuator must all agree on (spec §1.3).
 
-use std::mem::{offset_of, size_of};
 use egcl_rt::object::{
     BignumHeader, ClosureData, CompiledFunctionData, ComplexData, ConsCell, DoubleFloatData,
     InterpretedFunctionData, ObjectHeader, RatioData, SymbolData, gc_bit, type_id,
 };
+use std::mem::{offset_of, size_of};
 
 /// The base header is exactly 8 bytes and its bit-fields round-trip (§1.3).
 #[test]

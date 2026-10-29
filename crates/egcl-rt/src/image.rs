@@ -821,7 +821,10 @@ fn save_image_impl(
 pub fn load_image(path: &str) -> Result<EgclVal, EgclError> {
     let file = std::fs::File::open(path)
         .map_err(|e| EgclError::InvalidImage(format!("cannot open image: {e}")))?;
-    let len = file.metadata().map_err(|e| EgclError::InvalidImage(e.to_string()))?.len();
+    let len = file
+        .metadata()
+        .map_err(|e| EgclError::InvalidImage(e.to_string()))?
+        .len();
     load_image_from_file(&file, 0, len)
 }
 
@@ -829,34 +832,71 @@ pub fn load_image(path: &str) -> Result<EgclVal, EgclError> {
 /// Image files must not be modified in place while their restored heap is in
 /// use. Atomic replacement and unlinking are supported: mappings keep the old
 /// inode alive. The file descriptor need not remain open after this returns.
-pub fn load_image_from_file(file: &std::fs::File, offset: u64, len: u64) -> Result<EgclVal, EgclError> {
+pub fn load_image_from_file(
+    file: &std::fs::File,
+    offset: u64,
+    len: u64,
+) -> Result<EgclVal, EgclError> {
     let invalid = || EgclError::InvalidImage("invalid image file extent".into());
     let end = offset.checked_add(len).ok_or_else(invalid)?;
-    if len == 0 || end > file.metadata().map_err(|e| EgclError::InvalidImage(e.to_string()))?.len()
-        || end > isize::MAX as u64 { return Err(invalid()); }
+    if len == 0
+        || end
+            > file
+                .metadata()
+                .map_err(|e| EgclError::InvalidImage(e.to_string()))?
+                .len()
+        || end > isize::MAX as u64
+    {
+        return Err(invalid());
+    }
     #[cfg(target_os = "linux")]
     {
         use std::os::fd::AsRawFd;
-        struct Mapping { ptr: *mut u8, len: usize }
+        struct Mapping {
+            ptr: *mut u8,
+            len: usize,
+        }
         impl Drop for Mapping {
-            fn drop(&mut self) { unsafe { let _ = crate::syscall::munmap(self.ptr, self.len); } }
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = crate::syscall::munmap(self.ptr, self.len);
+                }
+            }
         }
         // Map from offset zero so embedded image offsets need not match the OS
         // page size. Pages before the image are never touched by this reader.
-        let ptr = unsafe { crate::syscall::mmap(std::ptr::null_mut(), end as usize,
-            crate::syscall::PROT_READ, crate::syscall::MAP_PRIVATE, file.as_raw_fd(), 0) }
-            .map_err(|errno| EgclError::InvalidImage(format!("image mmap failed: errno {errno}")))?;
-        let mapping = Mapping { ptr, len: end as usize };
-        let bytes = unsafe { std::slice::from_raw_parts(mapping.ptr.add(offset as usize), len as usize) };
+        let ptr = unsafe {
+            crate::syscall::mmap(
+                std::ptr::null_mut(),
+                end as usize,
+                crate::syscall::PROT_READ,
+                crate::syscall::MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        }
+        .map_err(|errno| EgclError::InvalidImage(format!("image mmap failed: errno {errno}")))?;
+        let mapping = Mapping {
+            ptr,
+            len: end as usize,
+        };
+        let bytes =
+            unsafe { std::slice::from_raw_parts(mapping.ptr.add(offset as usize), len as usize) };
         load_image_contents(bytes, Some((file, offset)))
     }
     #[cfg(not(target_os = "linux"))]
     {
         use std::io::{Read, Seek, SeekFrom};
-        let mut reader = file.try_clone().map_err(|e| EgclError::InvalidImage(e.to_string()))?;
-        reader.seek(SeekFrom::Start(offset)).map_err(|e| EgclError::InvalidImage(e.to_string()))?;
+        let mut reader = file
+            .try_clone()
+            .map_err(|e| EgclError::InvalidImage(e.to_string()))?;
+        reader
+            .seek(SeekFrom::Start(offset))
+            .map_err(|e| EgclError::InvalidImage(e.to_string()))?;
         let mut bytes = vec![0; usize::try_from(len).map_err(|_| invalid())?];
-        reader.read_exact(&mut bytes).map_err(|e| EgclError::InvalidImage(e.to_string()))?;
+        reader
+            .read_exact(&mut bytes)
+            .map_err(|e| EgclError::InvalidImage(e.to_string()))?;
         load_image_from_bytes(&bytes)
     }
 }
@@ -869,7 +909,10 @@ pub fn load_image_from_bytes(file_data: &[u8]) -> Result<EgclVal, EgclError> {
     load_image_contents(file_data, None)
 }
 
-fn load_image_contents(file_data: &[u8], backing: Option<(&std::fs::File, u64)>) -> Result<EgclVal, EgclError> {
+fn load_image_contents(
+    file_data: &[u8],
+    backing: Option<(&std::fs::File, u64)>,
+) -> Result<EgclVal, EgclError> {
     if file_data.len() < HEADER_SIZE {
         return Err(EgclError::InvalidImage(
             "image file too small to contain header".into(),
@@ -922,22 +965,27 @@ fn load_image_contents(file_data: &[u8], backing: Option<(&std::fs::File, u64)>)
     let is_compressed = (header.flags & image_flags::COMPRESSED) != 0;
 
     // Helper to read and optionally decompress a section's data.
-    let read_section_data = |entry: &SectionEntry| -> Result<std::borrow::Cow<'_, [u8]>, EgclError> {
-        let data_start = usize::try_from(entry.file_offset).map_err(|_| EgclError::InvalidImage("section offset overflow".into()))?;
-        let size = usize::try_from(entry.size).map_err(|_| EgclError::InvalidImage("section size overflow".into()))?;
-        let data_end = data_start.checked_add(size).ok_or_else(|| EgclError::InvalidImage("section extent overflow".into()))?;
-        if file_data.len() < data_end {
-            return Err(EgclError::InvalidImage(
-                "image file too small for section data".into(),
-            ));
-        }
-        let raw = &file_data[data_start..data_end];
-        if is_compressed && entry.size > 0 {
-            decompress_data(raw).map(std::borrow::Cow::Owned)
-        } else {
-            Ok(std::borrow::Cow::Borrowed(raw))
-        }
-    };
+    let read_section_data =
+        |entry: &SectionEntry| -> Result<std::borrow::Cow<'_, [u8]>, EgclError> {
+            let data_start = usize::try_from(entry.file_offset)
+                .map_err(|_| EgclError::InvalidImage("section offset overflow".into()))?;
+            let size = usize::try_from(entry.size)
+                .map_err(|_| EgclError::InvalidImage("section size overflow".into()))?;
+            let data_end = data_start
+                .checked_add(size)
+                .ok_or_else(|| EgclError::InvalidImage("section extent overflow".into()))?;
+            if file_data.len() < data_end {
+                return Err(EgclError::InvalidImage(
+                    "image file too small for section data".into(),
+                ));
+            }
+            let raw = &file_data[data_start..data_end];
+            if is_compressed && entry.size > 0 {
+                decompress_data(raw).map(std::borrow::Cow::Owned)
+            } else {
+                Ok(std::borrow::Cow::Borrowed(raw))
+            }
+        };
 
     // Collect all sections first so we can process them in the right order.
     // We need the relocation table before restoring the heap if bases differ.
@@ -958,13 +1006,22 @@ fn load_image_contents(file_data: &[u8], backing: Option<(&std::fs::File, u64)>)
         let entry: SectionEntry = bytes_to_struct(&file_data[entry_offset..])
             .ok_or_else(|| EgclError::InvalidImage(format!("cannot parse section entry {}", i)))?;
 
-        let end = entry.file_offset.checked_add(entry.size)
+        let end = entry
+            .file_offset
+            .checked_add(entry.size)
             .ok_or_else(|| EgclError::InvalidImage("section extent overflow".into()))?;
-        if !seen_sections.insert(entry.section_type) || entry.file_offset < section_dir_end as u64
-            || entry.file_offset % 4096 != 0 || end > file_data.len() as u64 {
-            return Err(EgclError::InvalidImage("invalid or duplicate image section".into()));
+        if !seen_sections.insert(entry.section_type)
+            || entry.file_offset < section_dir_end as u64
+            || entry.file_offset % 4096 != 0
+            || end > file_data.len() as u64
+        {
+            return Err(EgclError::InvalidImage(
+                "invalid or duplicate image section".into(),
+            ));
         }
-        if entry.size != 0 { extents.push((entry.file_offset, end)); }
+        if entry.size != 0 {
+            extents.push((entry.file_offset, end));
+        }
 
         match entry.section_type {
             t if t == SectionType::Settings as u32 => {
@@ -981,9 +1038,7 @@ fn load_image_contents(file_data: &[u8], backing: Option<(&std::fs::File, u64)>)
             t if t == SectionType::GcMeta as u32 => gc_meta_entry = Some(entry),
             t if t == SectionType::HostRegistries as u32 => host_entry = Some(entry),
             t if t == SectionType::OffHeap as u32 => offheap_entry = Some(entry),
-            t if t == SectionType::ForeignLibraries as u32 => {
-                foreign_libraries_entry = Some(entry)
-            }
+            t if t == SectionType::ForeignLibraries as u32 => foreign_libraries_entry = Some(entry),
             _ => {
                 // Unknown section type — skip for forward compatibility.
             }
@@ -1024,9 +1079,16 @@ fn load_image_contents(file_data: &[u8], backing: Option<(&std::fs::File, u64)>)
         .ok_or_else(|| EgclError::InvalidImage("image contains no heap section".into()))?;
     let heap_bytes = read_section_data(&heap_entry)?;
 
-    let heap_backing = if is_compressed { None } else {
-        backing.map(|(file, offset)| offset.checked_add(heap_entry.file_offset)
-            .map(|offset| (file, offset)).ok_or_else(|| EgclError::InvalidImage("heap file offset overflow".into())))
+    let heap_backing = if is_compressed {
+        None
+    } else {
+        backing
+            .map(|(file, offset)| {
+                offset
+                    .checked_add(heap_entry.file_offset)
+                    .map(|offset| (file, offset))
+                    .ok_or_else(|| EgclError::InvalidImage("heap file offset overflow".into()))
+            })
             .transpose()?
     };
     // Native images are runtime-specific; the header and runtime contract were

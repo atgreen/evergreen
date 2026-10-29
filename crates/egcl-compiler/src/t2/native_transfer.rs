@@ -75,8 +75,14 @@
 mod mapped_call;
 #[path = "native_transfer_ordinary.rs"]
 mod ordinary;
-pub use ordinary::{OrdinaryEntryRequest, emit_ordinary_entry_veneer, OrdinaryArityRequest, OrdinaryHelperOutcome, OrdinaryPublishedHelper, emit_ordinary_arity_veneer, emit_ordinary_published_veneer};
-pub use ordinary::{OrdinaryFuncallProbe, OrdinaryFuncallProbeEntry, ORDINARY_FUNCALL_PROBE_ENTRIES, emit_ordinary_funcall_probe};
+pub use ordinary::{
+    ORDINARY_FUNCALL_PROBE_ENTRIES, OrdinaryFuncallProbe, OrdinaryFuncallProbeEntry,
+    emit_ordinary_funcall_probe,
+};
+pub use ordinary::{
+    OrdinaryArityRequest, OrdinaryEntryRequest, OrdinaryHelperOutcome, OrdinaryPublishedHelper,
+    emit_ordinary_arity_veneer, emit_ordinary_entry_veneer, emit_ordinary_published_veneer,
+};
 
 pub use mapped_call::{
     ADAPTER_FRAME_BYTES, MappedCallRecord, PublishedCallEntry, emit_published_call_entry,
@@ -308,7 +314,11 @@ fn capture_stack_word(a: &mut Asm, load: bool, reg: u8, offset: usize) {
     if let Some(displacement) = short {
         a.push(displacement as u8);
     } else {
-        a.extend_from_slice(&i32::try_from(offset).expect("capture frame fits disp32").to_le_bytes());
+        a.extend_from_slice(
+            &i32::try_from(offset)
+                .expect("capture frame fits disp32")
+                .to_le_bytes(),
+        );
     }
 }
 
@@ -337,7 +347,7 @@ pub fn emit_helper_veneer(helper: NativeHelperV2, cold_entry: *const u8) -> Vec<
     let mut a = Asm::new();
     let exceptional = a.label();
     a.extend_from_slice(&[0xf3, 0x0f, 0x1e, 0xfa]); // endbr64
-                                                    // 16 bytes for NativeOutcome and 8 for request; align RSP before Rust CALL.
+    // 16 bytes for NativeOutcome and 8 for request; align RSP before Rust CALL.
     a.extend_from_slice(&[0x48, 0x83, 0xec, 24]); // sub rsp,24
     a.extend_from_slice(&[0x48, 0x89, 0x7c, 0x24, 16]); // mov [rsp+16],rdi
     a.extend_from_slice(&[0x48, 0x89, 0xe6]); // mov rsi,rsp (out)
@@ -380,7 +390,9 @@ pub fn emit_published_helper_veneer(
     const {
         assert!(size_of::<SysvTransferCapture>() == 88);
         assert!(size_of::<NativeOutcome>() == 16);
-        assert!(offset_of!(SysvTransferCapture, exit) == offset_of!(SysvTransferCapture, value) + 8);
+        assert!(
+            offset_of!(SysvTransferCapture, exit) == offset_of!(SysvTransferCapture, value) + 8
+        );
         assert!(offset_of!(NativeOutcome, value) == 0);
         assert!(offset_of!(NativeOutcome, exit) == 8);
         assert!(NativeExit::Returned as u64 == 0);
@@ -403,7 +415,13 @@ pub fn emit_published_helper_veneer(
     capture_stack_word(&mut a, false, 0, offset_of!(SysvTransferCapture, value));
     a.extend_from_slice(&[0x31, 0xc0]);
     capture_stack_word(&mut a, false, 0, offset_of!(SysvTransferCapture, exit));
-    a.extend_from_slice(&[0x48, 0x8d, 0x74, 0x24, offset_of!(SysvTransferCapture, value) as u8]);
+    a.extend_from_slice(&[
+        0x48,
+        0x8d,
+        0x74,
+        0x24,
+        offset_of!(SysvTransferCapture, value) as u8,
+    ]);
     a.extend_from_slice(&[0x48, 0x89, 0xe2]); // rdx=image; rdi=request; rsi=out
     a.extend_from_slice(&[0x48, 0xb8]);
     a.extend_from_slice(&(helper as usize as u64).to_le_bytes());

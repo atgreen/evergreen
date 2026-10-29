@@ -22,8 +22,10 @@ fn internal_packed_vectors_preserve_values_and_storage_under_gc_stress() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(String::from_utf8_lossy(&output.stderr)
-        .contains("[gc-stress] EGCL_GC_STRESS_AFTER_INIT: stressing from allocation"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("[gc-stress] EGCL_GC_STRESS_AFTER_INIT: stressing from allocation")
+    );
     assert!(
         String::from_utf8_lossy(&output.stdout)
             .contains("Packed double-float vector checks passed.")
@@ -49,8 +51,10 @@ fn public_double_float_array_representations_agree_under_gc_stress() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(String::from_utf8_lossy(&output.stderr)
-        .contains("[gc-stress] EGCL_GC_STRESS_AFTER_INIT: stressing from allocation"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("[gc-stress] EGCL_GC_STRESS_AFTER_INIT: stressing from allocation")
+    );
     assert!(
         String::from_utf8_lossy(&output.stdout)
             .contains("Public packed double-float array checks passed.")

@@ -169,7 +169,10 @@ fn a_class_metaobjects_metaclass_is_decided_by_the_class_graph() {
         "COMPILED-DISPATCH STD",
         "CLASS-METACLASS-OK",
     ] {
-        assert!(stdout.contains(expected), "missing {expected:?} in:\n{stdout}");
+        assert!(
+            stdout.contains(expected),
+            "missing {expected:?} in:\n{stdout}"
+        );
     }
 }
 
@@ -215,6 +218,9 @@ fn restart_is_a_standard_class_consistently_with_its_precedence_list() {
         "SO-SUBTYPEP (NIL T)",
         "RESTART-OK",
     ] {
-        assert!(stdout.contains(expected), "missing {expected:?} in:\n{stdout}");
+        assert!(
+            stdout.contains(expected),
+            "missing {expected:?} in:\n{stdout}"
+        );
     }
 }

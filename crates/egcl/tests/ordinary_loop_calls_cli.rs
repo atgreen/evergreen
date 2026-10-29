@@ -224,10 +224,15 @@ fn a_dotimes_caller_installs_the_ordinary_entry() {
             (egcl-ext:function-tier 'ol-caller) (- (egcl-ext:deopt-count) before))))
 "#;
     let (out, log) = run(None, program, &[("EGCL_T2_LOG", "stderr")]);
-    assert_eq!(result_line(None, &out), "RESULT 4999950000 TIER 2 DEOPTS 0", "{out}\n{log}");
+    assert_eq!(
+        result_line(None, &out),
+        "RESULT 4999950000 TIER 2 DEOPTS 0",
+        "{out}\n{log}"
+    );
     assert!(
-        log.lines().any(|line| line
-            .contains("OL-CALLER: optimized worker result installed with ordinary x86-64 Lisp T2 ABI")),
+        log.lines().any(|line| line.contains(
+            "OL-CALLER: optimized worker result installed with ordinary x86-64 Lisp T2 ABI"
+        )),
         "{log}"
     );
 }
@@ -250,7 +255,11 @@ fn deep_recursion_through_looping_frames_signals_storage_condition() {
 "#;
     for tier in [Some("t2"), None] {
         let (out, _) = run(tier, program, &[]);
-        assert_eq!(result_line(tier, &out), "RESULT (2000 :STORAGE-CONDITION)", "tier {tier:?}:\n{out}");
+        assert_eq!(
+            result_line(tier, &out),
+            "RESULT (2000 :STORAGE-CONDITION)",
+            "tier {tier:?}:\n{out}"
+        );
     }
 }
 
@@ -359,10 +368,15 @@ fn a_keyword_callee_installs_the_ordinary_entry() {
   (format t "RESULT ~D TIER ~D~%" (ok-key-caller 100000) (egcl-ext:function-tier 'ok-key)))
 "#;
     let (out, log) = run(None, program, &[("EGCL_T2_LOG", "stderr")]);
-    assert_eq!(result_line(None, &out), "RESULT 100000 TIER 2", "{out}\n{log}");
+    assert_eq!(
+        result_line(None, &out),
+        "RESULT 100000 TIER 2",
+        "{out}\n{log}"
+    );
     assert!(
-        log.lines().any(|line| line
-            .contains("OK-KEY: optimized worker result installed with ordinary x86-64 Lisp T2 ABI")),
+        log.lines().any(|line| line.contains(
+            "OK-KEY: optimized worker result installed with ordinary x86-64 Lisp T2 ABI"
+        )),
         "{log}"
     );
 }

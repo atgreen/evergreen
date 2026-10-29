@@ -22,8 +22,14 @@ fn drakma_stream_and_type_prerequisites() {
                 .expect("run Drakma prerequisite regression");
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
-            assert!(output.status.success(), "{backend} {file}: {stdout}\n{stderr}");
-            assert!(stdout.lines().any(|line| line == marker), "{stdout}\n{stderr}");
+            assert!(
+                output.status.success(),
+                "{backend} {file}: {stdout}\n{stderr}"
+            );
+            assert!(
+                stdout.lines().any(|line| line == marker),
+                "{stdout}\n{stderr}"
+            );
         }
     }
 }

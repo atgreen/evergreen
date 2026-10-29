@@ -11,8 +11,8 @@
 
 #![allow(dead_code)]
 
-use super::*;
 use super::native_segment_cache::SegmentCacheEntry;
+use super::*;
 use std::cell::RefCell;
 
 use egcl_compiler::t2::build::build_from_bytecode;
@@ -47,7 +47,9 @@ pub(super) fn try_run(
     fn opted_in() -> bool {
         use std::sync::OnceLock;
         static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("EGCL_NATIVE_TRANSFER").as_deref() == Some("1".as_ref()))
+        *ON.get_or_init(|| {
+            std::env::var_os("EGCL_NATIVE_TRANSFER").as_deref() == Some("1".as_ref())
+        })
     }
     if !opted_in()
         || !native_transfer::is_supported()

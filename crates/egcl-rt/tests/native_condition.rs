@@ -3,9 +3,9 @@
 
 //! Condition notifications must belong to the waiters selected by the notifier.
 
+use egcl_rt::sync::{EgclCondVar, EgclMutex};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
-use egcl_rt::sync::{EgclCondVar, EgclMutex};
 
 #[test]
 fn condition_wait_releases_and_restores_all_recursive_acquisitions() {

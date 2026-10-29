@@ -109,9 +109,13 @@ fn deftype_defaults_and_named_blocks_survive_compiled_file() {
     let src = dir.join("types.lisp");
     let artifact = dir.join("types.bfasl");
     std::fs::write(&src, format!("{DEFAULTS}\n{BLOCKS}")).unwrap();
-    eval(&format!("(progn (compile-file {src:?} :output-file {artifact:?}) (assert (probe-file {artifact:?})) (format t \"DEFTYPE-CONTRACT-OK~%\"))"));
+    eval(&format!(
+        "(progn (compile-file {src:?} :output-file {artifact:?}) (assert (probe-file {artifact:?})) (format t \"DEFTYPE-CONTRACT-OK~%\"))"
+    ));
     std::fs::remove_file(src).unwrap();
-    eval(&format!("(progn (load {artifact:?}) {DEFAULT_CHECKS} {BLOCK_CHECKS} (format t \"DEFTYPE-CONTRACT-OK~%\"))"));
+    eval(&format!(
+        "(progn (load {artifact:?}) {DEFAULT_CHECKS} {BLOCK_CHECKS} (format t \"DEFTYPE-CONTRACT-OK~%\"))"
+    ));
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -132,7 +136,9 @@ fn compiled_closure_keeps_parameter_declarations_during_capture_expansion() {
     "#,
     )
     .unwrap();
-    eval(&format!("(progn (compile-file {src:?} :output-file {artifact:?}) (assert (probe-file {artifact:?})) (format t \"DEFTYPE-CONTRACT-OK~%\"))"));
+    eval(&format!(
+        "(progn (compile-file {src:?} :output-file {artifact:?}) (assert (probe-file {artifact:?})) (format t \"DEFTYPE-CONTRACT-OK~%\"))"
+    ));
     std::fs::remove_file(src).unwrap();
     eval(&format!(
         r#"(progn (load {artifact:?})

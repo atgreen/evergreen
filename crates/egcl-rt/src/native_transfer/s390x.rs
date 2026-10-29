@@ -6,7 +6,7 @@
 //! The generated entry receives `(slots, stack, anchor)` in r2-r4. The fixed
 //! frame saves the ELF64 callee-saved GPRs r6-r13 and FP registers f8-f15.
 
-use super::{NativeOutcome, NativeSegment, EgclStack};
+use super::{EgclStack, NativeOutcome, NativeSegment};
 
 const _: () = {
     assert!(std::mem::offset_of!(NativeSegment, saved_sp) == 0);

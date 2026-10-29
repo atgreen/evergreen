@@ -129,7 +129,10 @@ fn egcl_mop_provides_the_introspection_and_an_effective_metaclass() {
         "CPL-IMPL-INTACT (PROBE-B PROBE-A STANDARD-OBJECT T)",
         "EGCL-MOP-OK",
     ] {
-        assert!(stdout.contains(expected), "missing {expected:?} in:\n{stdout}");
+        assert!(
+            stdout.contains(expected),
+            "missing {expected:?} in:\n{stdout}"
+        );
     }
 }
 
@@ -191,7 +194,10 @@ fn egcl_mop_owns_its_mop_readers_and_a_library_defun_cannot_reach_them() {
         "MS-OWN T",
         "MS-IMPL-INTACT (INTEGER)",
     ] {
-        assert!(stdout.contains(expected), "missing {expected:?} in:\n{stdout}");
+        assert!(
+            stdout.contains(expected),
+            "missing {expected:?} in:\n{stdout}"
+        );
     }
 }
 
@@ -326,7 +332,10 @@ fn run_gf_program(stress: bool) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stdout}\n{stderr}");
     for expected in GF_EXPECTED {
-        assert!(stdout.contains(expected), "missing {expected:?} in:\n{stdout}");
+        assert!(
+            stdout.contains(expected),
+            "missing {expected:?} in:\n{stdout}"
+        );
     }
     stdout
         .lines()

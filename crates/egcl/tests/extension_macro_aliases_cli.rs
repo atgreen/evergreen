@@ -141,8 +141,14 @@ fn local_macro_scopes_under_allocation_stress() {
             .unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(output.status.success(), "stress={stress}: {stdout}\n{stderr}");
+        assert!(
+            output.status.success(),
+            "stress={stress}: {stdout}\n{stderr}"
+        );
         assert!(stdout.contains("FLET-SNAPSHOT-PASS"), "{stdout}\n{stderr}");
-        assert!(stdout.contains("LABELS-SNAPSHOT-PASS"), "{stdout}\n{stderr}");
+        assert!(
+            stdout.contains("LABELS-SNAPSHOT-PASS"),
+            "{stdout}\n{stderr}"
+        );
     }
 }

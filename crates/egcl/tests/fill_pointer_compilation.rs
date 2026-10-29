@@ -7,7 +7,10 @@ fn fill_pointer_stores_compile_and_preserve_evaluation_order() {
     let output = Command::new(env!("CARGO_BIN_EXE_egcl"))
         .env("EGCL_FORCE_TIER", "t0")
         .env("EGCL_LAZY_THRESHOLD", "1")
-        .args(["--no-init", "--eval", r#"
+        .args([
+            "--no-init",
+            "--eval",
+            r#"
           (defun reset-vector (v)
             (let ((order nil))
               (assert (= (setf (fill-pointer (progn (push :vector order) v))
@@ -20,9 +23,16 @@ fn fill_pointer_stores_compile_and_preserve_evaluation_order() {
             (dotimes (i 4) (reset-vector v)))
           (disassemble 'reset-vector)
           (format t "FILL-POINTER-OK~%")
-        "#]).output().unwrap();
+        "#,
+        ])
+        .output()
+        .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(output.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(stdout.contains("FILL-POINTER-OK"), "{stdout}");
     assert!(!stdout.contains("not a compiled EGCL function"), "{stdout}");
 }

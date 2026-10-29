@@ -89,9 +89,7 @@ fn run(tier: Option<&str>, program: &str) -> String {
 fn unicode_case_matches_sbcl_interpreted_and_compiled() {
     // Call the probe enough times to clear the tier-up thresholds before the
     // printed call, so the forced T2 run executes compiled code.
-    let program = format!(
-        "{PROBE}\n(dotimes (i 30) (case-probe))\n(print (case-probe))\n(terpri)"
-    );
+    let program = format!("{PROBE}\n(dotimes (i 30) (case-probe))\n(print (case-probe))\n(terpri)");
     for tier in [None, Some("t2")] {
         let out = normalise(&run(tier, &program));
         assert!(

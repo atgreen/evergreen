@@ -48,7 +48,8 @@ const PROGRAM: &str = r#"
 
 #[test]
 fn open_honors_latin_1_and_ascii_external_formats() {
-    let path = std::env::temp_dir().join(format!("egcl-external-format-{}.txt", std::process::id()));
+    let path =
+        std::env::temp_dir().join(format!("egcl-external-format-{}.txt", std::process::id()));
     std::fs::write(&path, LATIN1_BYTES).expect("write latin-1 bytes");
     let program = PROGRAM.replace("FILE_PATH", &path.display().to_string());
     let output = Command::new(BIN)
@@ -72,6 +73,9 @@ fn open_honors_latin_1_and_ascii_external_formats() {
         "OCTETS (99 97 102 233)",
         "UTF-16 (:ERROR STREAM-ERROR)",
     ] {
-        assert!(stdout.contains(expected), "missing {expected:?} in: {stdout}");
+        assert!(
+            stdout.contains(expected),
+            "missing {expected:?} in: {stdout}"
+        );
     }
 }

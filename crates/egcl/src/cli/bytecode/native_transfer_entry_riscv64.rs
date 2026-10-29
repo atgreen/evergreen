@@ -11,8 +11,8 @@
 
 #![allow(dead_code)]
 
-use super::*;
 use super::native_segment_cache::SegmentCacheEntry;
+use super::*;
 use std::cell::RefCell;
 
 use egcl_compiler::t2::build::build_from_bytecode;

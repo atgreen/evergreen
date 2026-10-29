@@ -27,11 +27,7 @@ impl ConditionCase {
         matches!(self, Self::Restart | Self::Mixed)
     }
     fn clusters(self) -> usize {
-        if self == Self::Mixed {
-            2
-        } else {
-            1
-        }
+        if self == Self::Mixed { 2 } else { 1 }
     }
     fn matches_scope(self, scope: &egcl_compiler::control_scope::ControlScope) -> bool {
         use egcl_compiler::control_scope::{Ownership, ScopeKind};
@@ -154,7 +150,10 @@ fn condition_cluster_addresses(callable: *mut Frame) -> Vec<usize> {
     let mut cursor = egcl_rt::current_stack().fp() as *mut Frame;
     let mut traversed = 0;
     while cursor != callable {
-        assert!(!cursor.is_null(), "retained callable must remain on the stack");
+        assert!(
+            !cursor.is_null(),
+            "retained callable must remain on the stack"
+        );
         traversed += 1;
         assert!(traversed < 128, "condition frame chain must terminate");
         // A T0 observer can have younger ordinary callback frames. Record only
@@ -172,14 +171,21 @@ fn assert_condition_suffix_moved() {
         let mut state = state.borrow_mut();
         let callable = state.frame as *mut Frame;
         let current_slots = unsafe { (*callable).num_locals };
-        assert!(current_slots >= state.source_slots.checked_add(8).unwrap(),
-            "fixture must force actual callable growth beneath condition frames");
-        let delta = usize::from(current_slots - state.source_slots) * std::mem::size_of::<EgclVal>();
+        assert!(
+            current_slots >= state.source_slots.checked_add(8).unwrap(),
+            "fixture must force actual callable growth beneath condition frames"
+        );
+        let delta =
+            usize::from(current_slots - state.source_slots) * std::mem::size_of::<EgclVal>();
         let current = condition_cluster_addresses(callable);
         assert_eq!(current.len(), state.case.unwrap().clusters());
         assert_eq!(current.len(), state.source_cluster_frames.len());
         for (moved, original) in current.iter().zip(&state.source_cluster_frames) {
-            assert_eq!(*moved, original + delta, "each Special frame must shift by the measured growth");
+            assert_eq!(
+                *moved,
+                original + delta,
+                "each Special frame must shift by the measured growth"
+            );
             assert_ne!(moved, original);
         }
         state.cluster_suffix_moved = true;
@@ -293,7 +299,10 @@ fn observe_condition_osr_poll() {
                     .collect();
                 state.source_slots = unsafe { (*frame).num_locals };
                 state.source_cluster_frames = condition_cluster_addresses(frame);
-                assert_eq!(state.source_cluster_frames.len(), state.case.unwrap().clusters());
+                assert_eq!(
+                    state.source_cluster_frames.len(),
+                    state.case.unwrap().clusters()
+                );
                 native_transfer_entry::force_next_osr_frame_growth_for_test(8);
                 state.steps_at_handoff = steps;
                 let symbol = state.symbol;
@@ -418,19 +427,39 @@ fn exercise_condition_osr_entry(case: ConditionCase, guard: bool, nested_child: 
     let work = "(dotimes (i n) (setq sum (+ sum i)) (setf (cdr marker) (1+ (cdr marker))))
                 (ordinary-condition-osr-observe)";
     let finish = match case {
-        ConditionCase::Bind => format!("{work} (signal 'simple-condition) (setf (cdr hits) (1+ (cdr hits))) (values payload sum hits)"),
-        ConditionCase::Case => format!("{work} (setf (cdr hits) (1+ (cdr hits))) (signal 'simple-condition) (values :wrong)"),
-        ConditionCase::Restart | ConditionCase::Mixed => format!("{work} {} (setf (cdr hits) (1+ (cdr hits))) (invoke-restart 'condition-osr-done payload sum hits) (values :wrong)",
-            if case == ConditionCase::Mixed { "(signal 'simple-condition)" } else { "nil" }),
+        ConditionCase::Bind => format!(
+            "{work} (signal 'simple-condition) (setf (cdr hits) (1+ (cdr hits))) (values payload sum hits)"
+        ),
+        ConditionCase::Case => format!(
+            "{work} (setf (cdr hits) (1+ (cdr hits))) (signal 'simple-condition) (values :wrong)"
+        ),
+        ConditionCase::Restart | ConditionCase::Mixed => format!(
+            "{work} {} (setf (cdr hits) (1+ (cdr hits))) (invoke-restart 'condition-osr-done payload sum hits) (values :wrong)",
+            if case == ConditionCase::Mixed {
+                "(signal 'simple-condition)"
+            } else {
+                "nil"
+            }
+        ),
     };
     let protected = match case {
-        ConditionCase::Bind => format!("(handler-bind ((simple-condition (progn (setf (car setup) (1+ (car setup))) handler))) (setq handler nil) {finish})"),
-        ConditionCase::Case => format!("(progn (setf (car setup) (1+ (car setup))) (handler-case (progn {finish}) (simple-condition (c) (declare (ignore c)) (setf (car hits) (1+ (car hits))) (values payload sum hits))))"),
+        ConditionCase::Bind => format!(
+            "(handler-bind ((simple-condition (progn (setf (car setup) (1+ (car setup))) handler))) (setq handler nil) {finish})"
+        ),
+        ConditionCase::Case => format!(
+            "(progn (setf (car setup) (1+ (car setup))) (handler-case (progn {finish}) (simple-condition (c) (declare (ignore c)) (setf (car hits) (1+ (car hits))) (values payload sum hits))))"
+        ),
         ConditionCase::Restart | ConditionCase::Mixed => {
-            let restart = format!("(restart-case (progn {finish}) (condition-osr-done (answer total cell) (setf (car cell) (1+ (car cell))) (values answer total cell)))");
+            let restart = format!(
+                "(restart-case (progn {finish}) (condition-osr-done (answer total cell) (setf (car cell) (1+ (car cell))) (values answer total cell)))"
+            );
             if case == ConditionCase::Mixed {
-                format!("(handler-bind ((simple-condition (progn (setf (car setup) (1+ (car setup))) handler))) (setq handler nil) {restart})")
-            } else { format!("(progn (setf (car setup) (1+ (car setup))) {restart})") }
+                format!(
+                    "(handler-bind ((simple-condition (progn (setf (car setup) (1+ (car setup))) handler))) (setq handler nil) {restart})"
+                )
+            } else {
+                format!("(progn (setf (car setup) (1+ (car setup))) {restart})")
+            }
         }
     };
     let source =
@@ -451,12 +480,30 @@ fn exercise_condition_osr_entry(case: ConditionCase, guard: bool, nested_child: 
     let symbol = egcl_rt::symbols::intern(&name);
     let body = Arc::new(compile_function(&name, *params, *forms, &env, false, false).unwrap());
     let scopes = ScopeMap::analyze_function(&body).unwrap();
-    let sum_sites: Vec<_> = body.code.windows(4).enumerate().filter_map(|(start, window)| {
-        let [Instr::LoadLocal(sum), Instr::LoadLocal(index), Instr::CallNamed { sym, nargs: 2 }, Instr::StoreLocal(destination)] = window else { return None };
-        let bcp = (start + 2) as u32;
-        (sum == destination && sum != index && egcl_rt::symbols::symbol_name(*sym).as_deref() == Some("+")
-            && scopes.before(bcp).is_some_and(|active| active.iter().any(|scope| case.matches_scope(scope)))).then_some(bcp)
-    }).collect();
+    let sum_sites: Vec<_> = body
+        .code
+        .windows(4)
+        .enumerate()
+        .filter_map(|(start, window)| {
+            let [
+                Instr::LoadLocal(sum),
+                Instr::LoadLocal(index),
+                Instr::CallNamed { sym, nargs: 2 },
+                Instr::StoreLocal(destination),
+            ] = window
+            else {
+                return None;
+            };
+            let bcp = (start + 2) as u32;
+            (sum == destination
+                && sum != index
+                && egcl_rt::symbols::symbol_name(*sym).as_deref() == Some("+")
+                && scopes
+                    .before(bcp)
+                    .is_some_and(|active| active.iter().any(|scope| case.matches_scope(scope))))
+            .then_some(bcp)
+        })
+        .collect();
     let [sum_bcp] = sum_sites.as_slice() else {
         panic!("unique scoped sum site: {sum_sites:?}")
     };
@@ -479,8 +526,9 @@ fn exercise_condition_osr_entry(case: ConditionCase, guard: bool, nested_child: 
         "real scoped numeric speculation required"
     );
     let next = install_t2_completion(T2Completion {
-                    panicked: false,
-                    _permit: None, dependencies: Vec::new(),
+        panicked: false,
+        _permit: None,
+        dependencies: Vec::new(),
         sym: symbol,
         generation,
         artifact: Some(artifact),

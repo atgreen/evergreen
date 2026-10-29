@@ -38,9 +38,13 @@ impl NativeValueArea {
         let invalid = NativeValueMapError::InvalidLocation;
         match self {
             Self::Activation(base) => Ok(NativeValueLocation::Activation(
-                base.checked_add(u16::try_from(index).map_err(|_| invalid)?).ok_or(invalid)?)),
+                base.checked_add(u16::try_from(index).map_err(|_| invalid)?)
+                    .ok_or(invalid)?,
+            )),
             Self::NativeStack(base) => Ok(NativeValueLocation::Stack(stack_offset(
-                base.checked_add(u32::try_from(index).map_err(|_| invalid)?).ok_or(invalid)?)?)),
+                base.checked_add(u32::try_from(index).map_err(|_| invalid)?)
+                    .ok_or(invalid)?,
+            )?)),
         }
     }
 }
@@ -118,8 +122,16 @@ impl NativeFrameValues {
         poll_spill_start: Option<u32>,
         nonmoving: impl Fn(Value) -> bool,
     ) -> Result<Self, NativeValueMapError> {
-        Self::for_call_in_area(values, roots, NativeValueArea::Activation(shadow_base),
-            outgoing, outgoing_base.map(NativeValueArea::Activation), layout, poll_spill_start, nonmoving)
+        Self::for_call_in_area(
+            values,
+            roots,
+            NativeValueArea::Activation(shadow_base),
+            outgoing,
+            outgoing_base.map(NativeValueArea::Activation),
+            layout,
+            poll_spill_start,
+            nonmoving,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -146,9 +158,7 @@ impl NativeFrameValues {
         let shadows = roots
             .iter()
             .enumerate()
-            .map(|(index, &value)| {
-                Ok((value, spill_area.location(index)?))
-            })
+            .map(|(index, &value)| Ok((value, spill_area.location(index)?)))
             .collect::<Result<HashMap<_, _>, Error>>()?;
         let mut raw_slot = poll_spill_start.unwrap_or(0);
         let mut mapped = Vec::with_capacity(values.len());
@@ -158,8 +168,10 @@ impl NativeFrameValues {
                 return Err(Error::InvalidValues);
             }
             let moving = entry.gc_home().is_some() && !nonmoving(entry.value);
-            if moving && shadow.is_none()
-                && !entry.gc_home().is_some_and(ValueHome::survives_sysv_call) {
+            if moving
+                && shadow.is_none()
+                && !entry.gc_home().is_some_and(ValueHome::survives_sysv_call)
+            {
                 return Err(Error::MissingRoot(entry.value));
             }
             let location = match entry.location {
@@ -169,13 +181,12 @@ impl NativeFrameValues {
                         return Err(Error::InvalidValues);
                     }
                     NativeValueLocation::RawConstant(bits)
-                },
-                FrameValueLocation::Home(_) if shadow.is_some() => {
-                    shadow.unwrap()
                 }
+                FrameValueLocation::Home(_) if shadow.is_some() => shadow.unwrap(),
                 FrameValueLocation::Home(ValueHome::Reg(reg))
                     if entry.repr == ValueRepresentation::Tagged
-                        && ValueHome::Reg(reg).survives_sysv_call() => {
+                        && ValueHome::Reg(reg).survives_sysv_call() =>
+                {
                     NativeValueLocation::Register(reg)
                 }
                 FrameValueLocation::Home(ValueHome::Reg(_)) if poll_spill_start.is_some() => {
@@ -249,11 +260,15 @@ impl NativeFrameValues {
         for &(value, slot) in arguments {
             let location = NativeValueLocation::Stack(stack_offset(slot)?);
             if let Some(entry) = self.values.iter_mut().find(|entry| entry.value == value) {
-                if !entry.locations.contains(&location) { entry.locations.push(location); }
+                if !entry.locations.contains(&location) {
+                    entry.locations.push(location);
+                }
             } else {
                 self.values.push(NativeValue {
-                    value, repr: ValueRepresentation::Tagged,
-                    may_reference_heap: !nonmoving(value), locations: vec![location],
+                    value,
+                    repr: ValueRepresentation::Tagged,
+                    may_reference_heap: !nonmoving(value),
+                    locations: vec![location],
                 });
             }
         }
@@ -303,16 +318,21 @@ impl NativeFrameValues {
                         return Err(Error::InvalidLocation);
                     }
                     NativeValueLocation::Constant(constant)
-                        if value.repr != ValueRepresentation::Tagged || egcl_rt::gc::is_heap_ref(constant) =>
+                        if value.repr != ValueRepresentation::Tagged
+                            || egcl_rt::gc::is_heap_ref(constant) =>
                     {
                         return Err(Error::InvalidValues);
                     }
                     NativeValueLocation::RawConstant(bits)
                         if value.repr != ValueRepresentation::UnboxedFixnum
-                            || !(egcl_rt::bignum::FIXNUM_MIN..=egcl_rt::bignum::FIXNUM_MAX).contains(&(bits as i64)) => {
+                            || !(egcl_rt::bignum::FIXNUM_MIN..=egcl_rt::bignum::FIXNUM_MAX)
+                                .contains(&(bits as i64)) =>
+                    {
                         return Err(Error::InvalidValues);
                     }
-                    NativeValueLocation::Constant(_) | NativeValueLocation::RawConstant(_) | NativeValueLocation::Unavailable => {
+                    NativeValueLocation::Constant(_)
+                    | NativeValueLocation::RawConstant(_)
+                    | NativeValueLocation::Unavailable => {
                         if value.may_reference_heap {
                             return Err(Error::InvalidValues);
                         }
@@ -370,24 +390,53 @@ mod tests {
     #[test]
     fn raw_constants_with_pointer_like_bits_are_never_tagged_roots() {
         for bits in [1u64, 3, 5, 7, u64::MAX] {
-            let values = [FrameValue { value: Value(0), repr: Repr::UnboxedFixnum,
-                location: FrameValueLocation::RawImmediate(bits) }];
-            let map = NativeFrameValues::for_call(&values, &[], 0, &[], None,
-                layout(), None, |_| false).unwrap();
-            assert_eq!(map.ssa_value(Value(0)).unwrap().locations(), &[NativeValueLocation::RawConstant(bits)]);
+            let values = [FrameValue {
+                value: Value(0),
+                repr: Repr::UnboxedFixnum,
+                location: FrameValueLocation::RawImmediate(bits),
+            }];
+            let map =
+                NativeFrameValues::for_call(&values, &[], 0, &[], None, layout(), None, |_| false)
+                    .unwrap();
+            assert_eq!(
+                map.ssa_value(Value(0)).unwrap().locations(),
+                &[NativeValueLocation::RawConstant(bits)]
+            );
             assert_eq!(map.gc_locations().count(), 0);
-            assert!(NativeFrameValues::for_call(&values, &[Value(0)], 0, &[], None,
-                layout(), None, |_| false).is_err(), "a raw constant cannot be requested as a root");
-            let invalid = [FrameValue { repr: Repr::Tagged, ..values[0] }];
-            assert!(NativeFrameValues::for_call(&invalid, &[], 0, &[], None,
-                layout(), None, |_| false).is_err());
+            assert!(
+                NativeFrameValues::for_call(
+                    &values,
+                    &[Value(0)],
+                    0,
+                    &[],
+                    None,
+                    layout(),
+                    None,
+                    |_| false
+                )
+                .is_err(),
+                "a raw constant cannot be requested as a root"
+            );
+            let invalid = [FrameValue {
+                repr: Repr::Tagged,
+                ..values[0]
+            }];
+            assert!(
+                NativeFrameValues::for_call(&invalid, &[], 0, &[], None, layout(), None, |_| false)
+                    .is_err()
+            );
         }
         // The original tagged immediate rule remains strict.
-        let tagged = [FrameValue { value: Value(0), repr: Repr::Tagged,
-            location: FrameValueLocation::Immediate(EgclVal(1)) }];
+        let tagged = [FrameValue {
+            value: Value(0),
+            repr: Repr::Tagged,
+            location: FrameValueLocation::Immediate(EgclVal(1)),
+        }];
         assert!(egcl_rt::gc::is_heap_ref(EgclVal(1)));
-        assert!(NativeFrameValues::for_call(&tagged, &[], 0, &[], None,
-            layout(), None, |_| false).is_err());
+        assert!(
+            NativeFrameValues::for_call(&tagged, &[], 0, &[], None, layout(), None, |_| false)
+                .is_err()
+        );
     }
 
     #[test]
@@ -400,23 +449,44 @@ mod tests {
         ];
         for poll in [None, Some(2)] {
             let map = NativeFrameValues::for_call(
-                &values, &[Value(0), Value(1), Value(2)], 4,
-                &[Value(0)], Some(8), layout(), poll, |_| false,
-            ).unwrap();
-            assert_eq!(map.ssa_value(Value(0)).unwrap().locations(), &[
-                NativeValueLocation::Activation(4), NativeValueLocation::Stack(0),
-                NativeValueLocation::Activation(8),
-            ]);
-            assert_eq!(map.ssa_value(Value(1)).unwrap().locations(), &[
-                NativeValueLocation::Activation(5), NativeValueLocation::Register(12),
-            ]);
-            assert_eq!(map.ssa_value(Value(2)).unwrap().locations(), &[
-                NativeValueLocation::Activation(6),
-            ]);
-            assert_eq!(map.ssa_value(Value(3)).unwrap().locations(), &[
-                if poll.is_some() { NativeValueLocation::Stack(16) }
-                else { NativeValueLocation::Unavailable },
-            ], "tagged poll registers must not consume raw spill positions");
+                &values,
+                &[Value(0), Value(1), Value(2)],
+                4,
+                &[Value(0)],
+                Some(8),
+                layout(),
+                poll,
+                |_| false,
+            )
+            .unwrap();
+            assert_eq!(
+                map.ssa_value(Value(0)).unwrap().locations(),
+                &[
+                    NativeValueLocation::Activation(4),
+                    NativeValueLocation::Stack(0),
+                    NativeValueLocation::Activation(8),
+                ]
+            );
+            assert_eq!(
+                map.ssa_value(Value(1)).unwrap().locations(),
+                &[
+                    NativeValueLocation::Activation(5),
+                    NativeValueLocation::Register(12),
+                ]
+            );
+            assert_eq!(
+                map.ssa_value(Value(2)).unwrap().locations(),
+                &[NativeValueLocation::Activation(6),]
+            );
+            assert_eq!(
+                map.ssa_value(Value(3)).unwrap().locations(),
+                &[if poll.is_some() {
+                    NativeValueLocation::Stack(16)
+                } else {
+                    NativeValueLocation::Unavailable
+                },],
+                "tagged poll registers must not consume raw spill positions"
+            );
         }
     }
 
@@ -431,18 +501,34 @@ mod tests {
         ];
         for poll in [None, Some(2)] {
             let map = NativeFrameValues::for_call(
-                &values, &[Value(3)], 4, &[], None, layout(), poll, |_| false,
-            ).expect("stable native homes are sufficient roots");
-            assert_eq!(map.gc_locations().copied().collect::<Vec<_>>(), vec![
-                NativeValueLocation::Stack(0), NativeValueLocation::Register(12),
-                NativeValueLocation::Activation(4),
-            ]);
+                &values,
+                &[Value(3)],
+                4,
+                &[],
+                None,
+                layout(),
+                poll,
+                |_| false,
+            )
+            .expect("stable native homes are sufficient roots");
+            assert_eq!(
+                map.gc_locations().copied().collect::<Vec<_>>(),
+                vec![
+                    NativeValueLocation::Stack(0),
+                    NativeValueLocation::Register(12),
+                    NativeValueLocation::Activation(4),
+                ]
+            );
             if poll.is_some() {
-                assert_eq!(map.ssa_value(Value(2)).unwrap().locations(),
-                    &[NativeValueLocation::Stack(16)]);
-                assert_eq!(map.ssa_value(Value(4)).unwrap().locations(),
+                assert_eq!(
+                    map.ssa_value(Value(2)).unwrap().locations(),
+                    &[NativeValueLocation::Stack(16)]
+                );
+                assert_eq!(
+                    map.ssa_value(Value(4)).unwrap().locations(),
                     &[NativeValueLocation::Stack(24)],
-                    "tagged native homes must not consume raw poll spill slots");
+                    "tagged native homes must not consume raw poll spill slots"
+                );
             }
         }
     }

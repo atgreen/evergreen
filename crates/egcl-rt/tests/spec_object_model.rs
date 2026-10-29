@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-use std::mem::{align_of, offset_of, size_of};
 use egcl_rt::object::{
     BignumHeader, ConsCell, DoubleFloatData, ElementTypeTag, ObjectHeader, RatioData, SymbolData,
     gc_bit, type_id,
@@ -9,10 +8,11 @@ use egcl_rt::object::{
 use egcl_rt::runtime::{LogLevel, Runtime, RuntimeConfig};
 use egcl_rt::types;
 use egcl_rt::value::{
-    EOF, EOF_BITS, MISSING, MISSING_BITS, NIL, NIL_BITS, T, T_BITS, TAG_CHARACTER, TAG_CONS,
-    TAG_FIXNUM, TAG_FUNCTION, TAG_HEAP_OBJECT, TAG_MASK, TAG_SINGLE_FLOAT, TAG_SPECIAL, TAG_SYMBOL,
-    EgclVal, UNBOUND, UNBOUND_BITS,
+    EOF, EOF_BITS, EgclVal, MISSING, MISSING_BITS, NIL, NIL_BITS, T, T_BITS, TAG_CHARACTER,
+    TAG_CONS, TAG_FIXNUM, TAG_FUNCTION, TAG_HEAP_OBJECT, TAG_MASK, TAG_SINGLE_FLOAT, TAG_SPECIAL,
+    TAG_SYMBOL, UNBOUND, UNBOUND_BITS,
 };
+use std::mem::{align_of, offset_of, size_of};
 
 #[repr(C, align(8))]
 struct HeaderAndByte {

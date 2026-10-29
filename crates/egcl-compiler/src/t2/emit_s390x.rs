@@ -738,8 +738,7 @@ impl Emitter<'_> {
                     let register_target = direct
                         .as_ref()
                         .filter(|target| {
-                            target.register_entry != 0
-                                && data.args.len() <= REGISTER_ENTRY_ARGS_MAX
+                            target.register_entry != 0 && data.args.len() <= REGISTER_ENTRY_ARGS_MAX
                         })
                         .cloned();
                     if let Some(target) = &register_target {
@@ -1461,7 +1460,8 @@ impl Emitter<'_> {
         self.asm.load_u8(2, 1, 0);
         self.asm.branch(15, loaded);
         self.asm.bind(wide);
-        self.asm.imm64(5, u64::from(type_id::SIMPLE_CHARACTER_STRING));
+        self.asm
+            .imm64(5, u64::from(type_id::SIMPLE_CHARACTER_STRING));
         self.asm.compare(4, 5);
         self.asm.branch(6, fail);
         self.asm.address(1, 1, 16);
@@ -1543,13 +1543,15 @@ impl Emitter<'_> {
         self.asm.shift_right_signed(4, 3, 3);
         self.asm.compare_imm(4, 0);
         self.asm.branch(4, deopt);
-        self.asm.load(5, 1, egcl_rt::packed_f64::LENGTH_OFFSET as i32);
+        self.asm
+            .load(5, 1, egcl_rt::packed_f64::LENGTH_OFFSET as i32);
         self.asm.compare(4, 5);
         self.asm.branch(10, deopt);
         // address = body + DATA_OFFSET + index * 8
         self.asm.shift_left(4, 4, 3);
         self.asm.add(1, 4);
-        self.asm.address(1, 1, egcl_rt::packed_f64::DATA_OFFSET as i32);
+        self.asm
+            .address(1, 1, egcl_rt::packed_f64::DATA_OFFSET as i32);
         Ok(())
     }
 
@@ -1857,7 +1859,9 @@ impl Emitter<'_> {
         };
         self.load(first, 2)?;
         match data.opcode {
-            Guard if matches!(&data.aux, AuxData::TypeTag(ty) if ty.bits == TypeBits::FIXNUM || ty.bits == TypeBits::SINGLE_FLOAT || ty.bits == TypeBits::CONS) || matches!(&data.aux, AuxData::EndpList) =>
+            Guard
+                if matches!(&data.aux, AuxData::TypeTag(ty) if ty.bits == TypeBits::FIXNUM || ty.bits == TypeBits::SINGLE_FLOAT || ty.bits == TypeBits::CONS)
+                    || matches!(&data.aux, AuxData::EndpList) =>
             {
                 // CONS matters as much as the numeric tags: build.rs emits a
                 // separate Guard(TypeTag(CONS)) ahead of every Car/Cdr, so
@@ -1869,9 +1873,7 @@ impl Emitter<'_> {
                         self.guard_fixnum(2, deopt)
                     }
                     AuxData::TypeTag(ty) if ty.bits == TypeBits::CONS => self.guard_cons(2, deopt),
-                    AuxData::EndpList => {
-                        self.guard_endp_list(2, deopt)
-                    }
+                    AuxData::EndpList => self.guard_endp_list(2, deopt),
                     _ => self.guard_single_float(2, deopt),
                 }
             }
@@ -2366,9 +2368,7 @@ pub fn emit_framed_with_runtime(
     // treat as a Lisp object. Refuse the function instead -- its caller still
     // holds the fully tagged artifact to fall back on.
     for (_, state) in function.frame_states.iter() {
-        let raw = |source: &ValueSource| {
-            matches!(source, ValueSource::Value { repr, .. } if *repr != ValueRepresentation::Tagged)
-        };
+        let raw = |source: &ValueSource| matches!(source, ValueSource::Value { repr, .. } if *repr != ValueRepresentation::Tagged);
         if state
             .scopes
             .iter()
@@ -2464,9 +2464,7 @@ pub fn emit_framed_with_runtime(
             .filter(|value| !proven_immediate(*value))
             // A raw double's home holds IEEE bits. Publishing it as a root
             // would hand the collector a bit pattern to trace as an object.
-            .filter(|value| {
-                function.value(*value).repr == ValueRepresentation::Tagged
-            })
+            .filter(|value| function.value(*value).repr == ValueRepresentation::Tagged)
             .collect();
         roots.sort_by_key(|value| value.0);
         roots.dedup();
@@ -2510,9 +2508,7 @@ pub fn emit_framed_with_runtime(
             .filter(|value| !proven_immediate(*value))
             // A raw double's home holds IEEE bits. Publishing it as a root
             // would hand the collector a bit pattern to trace as an object.
-            .filter(|value| {
-                function.value(*value).repr == ValueRepresentation::Tagged
-            })
+            .filter(|value| function.value(*value).repr == ValueRepresentation::Tagged)
             .collect();
         roots.sort_by_key(|value| value.0);
         roots.dedup();
@@ -3031,7 +3027,11 @@ mod tests {
             );
             let (_, loaded) = f.push_inst(
                 block,
-                call(Opcode::EnvironmentValue, vec![], AuxData::EnvironmentName(7)),
+                call(
+                    Opcode::EnvironmentValue,
+                    vec![],
+                    AuxData::EnvironmentName(7),
+                ),
                 &[(IRType::TOP, ValueRepresentation::Tagged)],
             );
             f.set_terminator(
@@ -4334,11 +4334,7 @@ mod tests {
         );
         f.push_inst(
             block,
-            guarded(
-                Opcode::PackedF64Set,
-                vec![array, index, doubled[0]],
-                vec![],
-            ),
+            guarded(Opcode::PackedF64Set, vec![array, index, doubled[0]], vec![]),
             &[],
         );
         f.set_terminator(
@@ -4365,8 +4361,8 @@ mod tests {
             DEOPTED.with(|flag| flag.set(true));
             NIL.0
         }
-        let compiled = emit_framed(&f, deopt as *const () as u64, 2)
-            .expect("a packed load/add/store emits");
+        let compiled =
+            emit_framed(&f, deopt as *const () as u64, 2).expect("a packed load/add/store emits");
         assert!(!compiled.code.is_empty(), "the packed arms emit code");
         #[cfg(all(target_arch = "s390x", unix))]
         {
@@ -4405,14 +4401,20 @@ mod tests {
                 slots[0] = array_value;
                 slots[1] = bad;
                 assert_eq!(unsafe { entry(slots.as_mut_ptr()) }, NIL.0);
-                assert!(DEOPTED.with(std::cell::Cell::get), "index {bad:#x} must deopt");
+                assert!(
+                    DEOPTED.with(std::cell::Cell::get),
+                    "index {bad:#x} must deopt"
+                );
             }
             // A non-array operand deopts on the header guard.
             DEOPTED.with(|flag| flag.set(false));
             slots[0] = EgclVal::from_fixnum(3).0;
             slots[1] = EgclVal::from_fixnum(0).0;
             assert_eq!(unsafe { entry(slots.as_mut_ptr()) }, NIL.0);
-            assert!(DEOPTED.with(std::cell::Cell::get), "a fixnum is not an array");
+            assert!(
+                DEOPTED.with(std::cell::Cell::get),
+                "a fixnum is not an array"
+            );
         }
     }
 
@@ -4447,8 +4449,14 @@ mod tests {
                     function: 0,
                     bcp: 0,
                     locals: vec![
-                        ValueSource::Value { value: x, repr: ValueRepresentation::Tagged },
-                        ValueSource::Value { value: y, repr: ValueRepresentation::Tagged },
+                        ValueSource::Value {
+                            value: x,
+                            repr: ValueRepresentation::Tagged,
+                        },
+                        ValueSource::Value {
+                            value: y,
+                            repr: ValueRepresentation::Tagged,
+                        },
                     ],
                     stack: vec![],
                 }],
@@ -4567,8 +4575,14 @@ mod tests {
                     function: 0,
                     bcp: 0,
                     locals: vec![
-                        ValueSource::Value { value: a, repr: ValueRepresentation::Tagged },
-                        ValueSource::Value { value: b, repr: ValueRepresentation::Tagged },
+                        ValueSource::Value {
+                            value: a,
+                            repr: ValueRepresentation::Tagged,
+                        },
+                        ValueSource::Value {
+                            value: b,
+                            repr: ValueRepresentation::Tagged,
+                        },
                     ],
                     stack: vec![],
                 }],
@@ -4639,9 +4653,18 @@ mod tests {
         ];
         // All four sign combinations, exact and inexact, plus zero dividends.
         let pairs: [(i64, i64); 12] = [
-            (47, 5), (-47, 5), (47, -5), (-47, -5),
-            (50, 5), (-50, 5), (50, -5), (-50, -5),
-            (0, 7), (0, -7), (3, 100), (-3, 100),
+            (47, 5),
+            (-47, 5),
+            (47, -5),
+            (-47, -5),
+            (50, 5),
+            (-50, 5),
+            (50, -5),
+            (-50, -5),
+            (0, 7),
+            (0, -7),
+            (3, 100),
+            (-3, 100),
         ];
         for opcode in ops {
             let compiled = emit_framed(&binop(opcode), deopt as *const () as u64, 2)
@@ -4695,8 +4718,7 @@ mod tests {
                 (Opcode::FixnumRem, false),
                 (Opcode::FixnumMod, false),
             ] {
-                let compiled =
-                    emit_framed(&binop(opcode), deopt as *const () as u64, 2).unwrap();
+                let compiled = emit_framed(&binop(opcode), deopt as *const () as u64, 2).unwrap();
                 let code = egcl_rt::jit::JitBuffer::new(&compiled.code).unwrap();
                 // SAFETY: as above.
                 let entry: unsafe extern "C" fn(*mut u64) -> u64 =
@@ -4770,8 +4792,7 @@ mod tests {
         extern "C" fn never(_: u64, _: u64, _: *const u64, _: u64) -> u64 {
             panic!("StringCharOrNil must never deopt");
         }
-        let compiled =
-            emit_framed(&char_at(), never as *const () as u64, 2).expect("emits");
+        let compiled = emit_framed(&char_at(), never as *const () as u64, 2).expect("emits");
         assert!(!compiled.code.is_empty());
         #[cfg(all(target_arch = "s390x", unix))]
         {
@@ -4803,9 +4824,7 @@ mod tests {
             // A code above 0xFFFF, so a truncating or sign-extending load shows.
             words.copy_from_slice(&[b'x' as u32, 0x1F600, 0x10FFFF]);
 
-            let tagged = |v: &mut Vec<u64>| {
-                v.as_mut_ptr() as u64 | egcl_rt::value::TAG_HEAP_OBJECT
-            };
+            let tagged = |v: &mut Vec<u64>| v.as_mut_ptr() as u64 | egcl_rt::value::TAG_HEAP_OBJECT;
             let run = |s: u64, i: u64| {
                 let mut slots = vec![s, i, 0, 0];
                 unsafe { entry(slots.as_mut_ptr()) }
@@ -4831,9 +4850,17 @@ mod tests {
             // Every rejected shape answers NIL rather than deopting. The deopt
             // adapter panics, so a wrong exit fails loudly rather than quietly.
             assert_eq!(run(bs, EgclVal::from_fixnum(3).0), NIL.0, "index == length");
-            assert_eq!(run(bs, EgclVal::from_fixnum(99).0), NIL.0, "far past the end");
+            assert_eq!(
+                run(bs, EgclVal::from_fixnum(99).0),
+                NIL.0,
+                "far past the end"
+            );
             assert_eq!(run(bs, EgclVal::from_fixnum(-1).0), NIL.0, "negative index");
-            assert_eq!(run(ws, EgclVal::from_fixnum(3).0), NIL.0, "wide: past the end");
+            assert_eq!(
+                run(ws, EgclVal::from_fixnum(3).0),
+                NIL.0,
+                "wide: past the end"
+            );
             assert_eq!(run(bs, NIL.0), NIL.0, "non-fixnum index");
             assert_eq!(
                 run(bs, EgclVal::from_single_float(1.0).0),
@@ -4845,7 +4872,11 @@ mod tests {
                 NIL.0,
                 "a fixnum is not a string"
             );
-            assert_eq!(run(NIL.0, EgclVal::from_fixnum(0).0), NIL.0, "NIL is not a string");
+            assert_eq!(
+                run(NIL.0, EgclVal::from_fixnum(0).0),
+                NIL.0,
+                "NIL is not a string"
+            );
             // A heap object of some other type: right tag, wrong type id.
             let mut other: Vec<u64> = vec![0; 4];
             other[0] = u64::from(type_id::HASH_TABLE) << 56 | 1;

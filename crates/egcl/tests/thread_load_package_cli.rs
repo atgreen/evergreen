@@ -61,7 +61,10 @@ fn a_thread_cannot_move_the_package_of_a_file_being_loaded() {
         "AFTER-THREAD-SETQ TLP",
         "BARE-SYMBOL TLP",
     ] {
-        assert!(stdout.contains(expected), "missing {expected:?} in:\n{stdout}");
+        assert!(
+            stdout.contains(expected),
+            "missing {expected:?} in:\n{stdout}"
+        );
     }
 }
 
@@ -75,7 +78,16 @@ fn a_stream_load_binds_the_package_too() {
     );
     let stdout = egcl(&program);
     let _ = std::fs::remove_file(&path);
-    for expected in ["AFTER-SETQ TLP", "AFTER-THREAD TLP", "AFTER-THREAD-SETQ TLP", "BARE-SYMBOL TLP", "DONE"] {
-        assert!(stdout.contains(expected), "missing {expected:?} in:\n{stdout}");
+    for expected in [
+        "AFTER-SETQ TLP",
+        "AFTER-THREAD TLP",
+        "AFTER-THREAD-SETQ TLP",
+        "BARE-SYMBOL TLP",
+        "DONE",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "missing {expected:?} in:\n{stdout}"
+        );
     }
 }

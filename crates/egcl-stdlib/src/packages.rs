@@ -15,8 +15,7 @@ use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Arc;
 
 use crate::hashtable::{
-    HashTest, MakeHashTableOptions, hash_table_entries, make_hash_table, remhash,
-    set_gethash,
+    HashTest, MakeHashTableOptions, hash_table_entries, make_hash_table, remhash, set_gethash,
 };
 use crate::streams::make_lisp_string;
 
@@ -885,9 +884,7 @@ fn find_symbol_in_store(
     context: &str,
 ) -> Result<Option<(EgclVal, InternStatus)>, EgclError> {
     let package = lookup_package_arc(registry, package)?;
-    let package = package
-        .read()
-        .map_err(|_| lock_poisoned_error(context))?;
+    let package = package.read().map_err(|_| lock_poisoned_error(context))?;
 
     if let Some(sym) = package.internal_symbols.get(name) {
         return Ok(Some((sym, InternStatus::Internal)));
@@ -990,9 +987,7 @@ pub fn unintern(symbol: EgclVal, package: EgclVal) -> Result<bool, EgclError> {
         .map_err(|_| lock_poisoned_error("unintern"))?;
     let target = lookup_package_arc(&registry, package)?;
     let (name, package_name, used_packages) = {
-        let target = target
-            .read()
-            .map_err(|_| lock_poisoned_error("unintern"))?;
+        let target = target.read().map_err(|_| lock_poisoned_error("unintern"))?;
         let present = symbol_table_name(symbol)
             .filter(|name| {
                 target.internal_symbols.get(name) == Some(symbol)

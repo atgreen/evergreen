@@ -72,7 +72,9 @@ pub fn single_value_state(f: &Function, single_entry: bool) -> HashSet<Inst> {
 /// with that normalization may be supplied here; result types alone do not
 /// establish an empty, inactive buffer.
 pub fn single_value_state_after_normalized_calls(
-    f: &Function, single_entry: bool, normalized_calls: &HashSet<Inst>,
+    f: &Function,
+    single_entry: bool,
+    normalized_calls: &HashSet<Inst>,
 ) -> HashSet<Inst> {
     let blocks = f.block_order();
     let pred_lists = f.pred_lists();
@@ -82,17 +84,27 @@ pub fn single_value_state_after_normalized_calls(
         }
         let preds = &pred_lists[b.index()];
         let entry = b == f.entry();
-        (if entry { single_entry } else { !preds.is_empty() })
-            && preds.iter().all(|pred| outgoing[pred])
+        (if entry {
+            single_entry
+        } else {
+            !preds.is_empty()
+        }) && preds.iter().all(|pred| outgoing[pred])
     };
     let advance = |inst, single| {
         let data = f.inst(inst);
         if data.opcode == Opcode::ClearMv || normalized_calls.contains(&inst) {
             true
-        } else if data.flags.call || matches!(data.opcode,
-            Opcode::Call | Opcode::Invoke | Opcode::CleanupSave
-                | Opcode::CleanupRestore | Opcode::CleanupLanding
-                | Opcode::CatchLanding | Opcode::HandlerLanding)
+        } else if data.flags.call
+            || matches!(
+                data.opcode,
+                Opcode::Call
+                    | Opcode::Invoke
+                    | Opcode::CleanupSave
+                    | Opcode::CleanupRestore
+                    | Opcode::CleanupLanding
+                    | Opcode::CatchLanding
+                    | Opcode::HandlerLanding
+            )
         {
             false
         } else {
@@ -114,13 +126,17 @@ pub fn single_value_state_after_normalized_calls(
                 changed = true;
             }
         }
-        if !changed { break; }
+        if !changed {
+            break;
+        }
     }
     let mut known = HashSet::new();
     for &block in blocks {
         let mut single = incoming(block, &outgoing);
         for &inst in &f.block(block).insts {
-            if single { known.insert(inst); }
+            if single {
+                known.insert(inst);
+            }
             single = advance(inst, single);
         }
     }
@@ -132,10 +148,14 @@ pub fn single_value_state_after_normalized_calls(
 /// a reset across a safepoint or assumes that a call returns one value.
 pub fn eliminate_redundant(f: &mut Function, single_entry: bool) -> usize {
     let known = single_value_state(f, single_entry);
-    let redundant: HashSet<_> = known.into_iter()
-        .filter(|&inst| f.inst(inst).opcode == Opcode::ClearMv).collect();
+    let redundant: HashSet<_> = known
+        .into_iter()
+        .filter(|&inst| f.inst(inst).opcode == Opcode::ClearMv)
+        .collect();
     for block in f.block_order().to_vec() {
-        f.block_mut(block).insts.retain(|inst| !redundant.contains(inst));
+        f.block_mut(block)
+            .insts
+            .retain(|inst| !redundant.contains(inst));
     }
     redundant.len()
 }
@@ -228,7 +248,9 @@ pub fn unobserved_multiple_value_state(f: &Function) -> HashSet<Inst> {
             } else if reads_mv(f, inst) {
                 live = true;
             }
-            if !live { unobserved.insert(inst); }
+            if !live {
+                unobserved.insert(inst);
+            }
         }
     }
     unobserved
@@ -244,7 +266,9 @@ pub fn calls_with_discarded_multiple_values(f: &Function) -> HashSet<Inst> {
     for &block in f.block_order() {
         let mut live = f.succs(block).iter().any(|successor| live_in[successor]);
         for &inst in f.block(block).insts.iter().rev() {
-            if f.inst(inst).opcode == Opcode::Call && !live { calls.insert(inst); }
+            if f.inst(inst).opcode == Opcode::Call && !live {
+                calls.insert(inst);
+            }
             if f.inst(inst).opcode == Opcode::ClearMv {
                 live = false;
             } else if reads_mv(f, inst) {
@@ -275,7 +299,9 @@ pub fn dead_after(f: &Function) -> HashSet<Inst> {
             }
         }
         for &inst in f.block(block).insts.iter().rev() {
-            if !live && f.inst(inst).opcode != Opcode::Invoke { dead.insert(inst); }
+            if !live && f.inst(inst).opcode != Opcode::Invoke {
+                dead.insert(inst);
+            }
             if f.inst(inst).opcode == Opcode::ClearMv {
                 live = false;
             } else if reads_mv(f, inst) {
@@ -439,11 +465,12 @@ mod tests {
         f.set_terminator(exit, base(Opcode::Return));
         assert_eq!(eliminate(&mut f), 1);
         assert_eq!(count_clear_mv(&f), 1);
-        assert!(f
-            .block(body)
-            .insts
-            .iter()
-            .all(|&i| f.inst(i).opcode != Opcode::ClearMv));
+        assert!(
+            f.block(body)
+                .insts
+                .iter()
+                .all(|&i| f.inst(i).opcode != Opcode::ClearMv)
+        );
     }
 
     #[test]
@@ -497,9 +524,13 @@ mod tests {
 
     #[test]
     fn calls_and_control_landings_forget_single_value_state() {
-        for op in [Opcode::Call, Opcode::CleanupRestore,
-            Opcode::CleanupLanding, Opcode::CatchLanding, Opcode::HandlerLanding]
-        {
+        for op in [
+            Opcode::Call,
+            Opcode::CleanupRestore,
+            Opcode::CleanupLanding,
+            Opcode::CatchLanding,
+            Opcode::HandlerLanding,
+        ] {
             let mut f = Function::new("effect");
             let e = f.entry();
             f.push_inst(e, base(op), &[]);
@@ -515,11 +546,22 @@ mod tests {
         let e = f.entry();
         let normal = f.make_block();
         let exceptional = f.make_block();
-        f.set_terminator(e, InstData {
-            targets: vec![BlockCall { block: normal, args: vec![] },
-                BlockCall { block: exceptional, args: vec![] }],
-            ..base(Opcode::Invoke)
-        });
+        f.set_terminator(
+            e,
+            InstData {
+                targets: vec![
+                    BlockCall {
+                        block: normal,
+                        args: vec![],
+                    },
+                    BlockCall {
+                        block: exceptional,
+                        args: vec![],
+                    },
+                ],
+                ..base(Opcode::Invoke)
+            },
+        );
         for b in [normal, exceptional] {
             f.push_inst(b, clear_mv(), &[]);
             f.set_terminator(b, base(Opcode::Return));
@@ -554,7 +596,10 @@ mod tests {
             f.set_terminator(exit, base(Opcode::Return));
             if osr {
                 f.osr_entries.push(crate::t2::ir::OsrEntry {
-                    block: header, bcp: 0, control_scopes: vec![], checks: vec![],
+                    block: header,
+                    bcp: 0,
+                    control_scopes: vec![],
+                    checks: vec![],
                     frame_state: crate::t2::frame_state::FrameStateId(0),
                 });
             }
@@ -573,8 +618,10 @@ mod tests {
         f.push_inst(left, clear_mv(), &[]);
         f.set_terminator(left, base(Opcode::Return));
         f.set_terminator(right, base(Opcode::Return));
-        assert!(!unobserved_multiple_value_state(&f).contains(&point),
-            "the right return can still observe the old tuple");
+        assert!(
+            !unobserved_multiple_value_state(&f).contains(&point),
+            "the right return can still observe the old tuple"
+        );
         let ret = f.block_mut(right).insts.pop().unwrap();
         f.push_inst(right, clear_mv(), &[]);
         f.block_mut(right).insts.push(ret);
@@ -596,8 +643,10 @@ mod tests {
         let branch = f.block_mut(loop_body).insts.pop().unwrap();
         f.push_inst(loop_body, call(), &[]);
         f.block_mut(loop_body).insts.push(branch);
-        assert!(!unobserved_multiple_value_state(&f).contains(&point),
-            "a reader on the cycle must keep the incoming tuple live");
+        assert!(
+            !unobserved_multiple_value_state(&f).contains(&point),
+            "a reader on the cycle must keep the incoming tuple live"
+        );
     }
 
     #[test]
@@ -657,10 +706,18 @@ mod tests {
         let entry = f.entry();
         let normal = f.make_block();
         let landing = f.make_block();
-        let invoke = f.set_terminator(entry, InstData {
-            flags: InstFlags { effectful: true, call: true, ..InstFlags::default() },
-            ..brif(normal, landing)
-        }.with_opcode(Opcode::Invoke));
+        let invoke = f.set_terminator(
+            entry,
+            InstData {
+                flags: InstFlags {
+                    effectful: true,
+                    call: true,
+                    ..InstFlags::default()
+                },
+                ..brif(normal, landing)
+            }
+            .with_opcode(Opcode::Invoke),
+        );
         f.push_inst(normal, clear_mv(), &[]);
         f.set_terminator(normal, base(Opcode::Return));
         f.set_terminator(landing, base(Opcode::Return));

@@ -10,8 +10,7 @@
 //! real stdlib GC hooks (finalizer dispatch + stream tracing), so they are
 //! serialized on a file-local lock like the other GC tests in the tree.
 
-use std::sync::{Mutex, OnceLock};
-use egcl_rt::value::{NIL, EgclVal};
+use egcl_rt::value::{EgclVal, NIL};
 use egcl_stdlib::streams::{
     IF_DOES_NOT_EXIST_CREATE_VAL, IF_EXISTS_SUPERSEDE_VAL, install_gc_hooks, set_symbol_stream,
 };
@@ -20,6 +19,7 @@ use egcl_stdlib::{
     make_string_input_stream, make_string_output_stream, make_synonym_stream, open,
     register_string, stream_read_char, stream_write_string,
 };
+use std::sync::{Mutex, OnceLock};
 
 fn lock() -> &'static Mutex<()> {
     static L: OnceLock<Mutex<()>> = OnceLock::new();

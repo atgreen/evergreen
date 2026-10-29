@@ -178,7 +178,11 @@ fn arith_of(sym: u32) -> Option<Arith> {
 /// A negative divisor is refused: `(mod 7 -8)` is -1, which the mask does not
 /// give. Zero cannot appear (`is_power_of_two` excludes it), so the
 /// DIVISION-BY-ZERO path is untouched and still signals from the generic call.
-fn mod_mask_of(f: &Function, args: &[crate::t2::ir::Value], consts: &HashMap<Value, i64>) -> Option<i64> {
+fn mod_mask_of(
+    f: &Function,
+    args: &[crate::t2::ir::Value],
+    consts: &HashMap<Value, i64>,
+) -> Option<i64> {
     let _ = f;
     if args.len() != 2 {
         return None;
@@ -293,9 +297,10 @@ pub fn profiles_numeric_operands(sym: u32) -> bool {
         || incdec_of(sym).is_some()
         || cmp_of(sym).is_some()
         || bitwise_of(sym).is_some()
-        || matches!(egcl_rt::symbols::symbol_name(sym).as_deref(),
-            Some("ASH" | "MIN" | "MAX" | "MOD" | "REM" | "FLOOR" | "TRUNCATE"
-                | "SQRT" | "/"))
+        || matches!(
+            egcl_rt::symbols::symbol_name(sym).as_deref(),
+            Some("ASH" | "MIN" | "MAX" | "MOD" | "REM" | "FLOOR" | "TRUNCATE" | "SQRT" | "/")
+        )
 }
 
 /// The typed comparison opcode for `(kind, speculated-type)`. Fixnum supports all
@@ -391,26 +396,35 @@ struct CapturedOperandFacts(Vec<(Value, TypeBits)>);
 
 impl OperandFacts for CapturedOperandFacts {
     fn bits(&self, value: Value) -> Option<TypeBits> {
-        self.0.iter().find_map(|&(v, bits)| (v == value).then_some(bits))
+        self.0
+            .iter()
+            .find_map(|&(v, bits)| (v == value).then_some(bits))
     }
 }
 
-fn operand_bits(
-    f: &Function,
-    inferred: Option<&dyn OperandFacts>,
-    value: Value,
-) -> TypeBits {
+fn operand_bits(f: &Function, inferred: Option<&dyn OperandFacts>, value: Value) -> TypeBits {
     let declared = f.value(value).ty.bits;
-    let Some(bits) = inferred.and_then(|facts| facts.bits(value)) else { return declared };
-    if bits.is_bottom() || declared.is_bottom() { return declared; }
+    let Some(bits) = inferred.and_then(|facts| facts.bits(value)) else {
+        return declared;
+    };
+    if bits.is_bottom() || declared.is_bottom() {
+        return declared;
+    }
     declared.meet(bits)
 }
 
-fn conflicting_operand_facts(f: &Function, inferred: Option<&dyn OperandFacts>, args: &[Value]) -> bool {
+fn conflicting_operand_facts(
+    f: &Function,
+    inferred: Option<&dyn OperandFacts>,
+    args: &[Value],
+) -> bool {
     args.iter().any(|&value| {
         let declared = f.value(value).ty.bits;
-        inferred.and_then(|facts| facts.bits(value)).is_some_and(|bits|
-            !declared.is_bottom() && !bits.is_bottom() && declared.meet(bits).is_bottom())
+        inferred
+            .and_then(|facts| facts.bits(value))
+            .is_some_and(|bits| {
+                !declared.is_bottom() && !bits.is_bottom() && declared.meet(bits).is_bottom()
+            })
     })
 }
 
@@ -418,7 +432,11 @@ fn conflicting_operand_facts(f: &Function, inferred: Option<&dyn OperandFacts>, 
 /// used by declared parameters: no sampled type is needed, and a stale profile
 /// can never contradict the source assertion. A fixnum constant participates
 /// in a single-float operation through CL float contagion.
-fn statically_proven_spec_type(f: &Function, args: &[crate::t2::ir::Value], inferred: Option<&dyn OperandFacts>) -> Option<SpecType> {
+fn statically_proven_spec_type(
+    f: &Function,
+    args: &[crate::t2::ir::Value],
+    inferred: Option<&dyn OperandFacts>,
+) -> Option<SpecType> {
     let subset =
         |bits: TypeBits, allowed: TypeBits| !bits.is_bottom() && bits.meet(allowed) == bits;
     if !args.is_empty()
@@ -442,8 +460,12 @@ fn statically_proven_spec_type(f: &Function, args: &[crate::t2::ir::Value], infe
 
 /// Hints choose a guarded guess, never operand admissibility or check removal.
 /// Consult only after real proofs, inside an admitted profileSome path.
-fn hinted_family(f: &Function, args: &[Value], inferred: Option<&dyn OperandFacts>,
-    options: SpeculateOptions) -> Option<SpecType> {
+fn hinted_family(
+    f: &Function,
+    args: &[Value],
+    inferred: Option<&dyn OperandFacts>,
+    options: SpeculateOptions,
+) -> Option<SpecType> {
     let mut hinted = false;
     let mut single = false;
     let mut double = false;
@@ -451,22 +473,39 @@ fn hinted_family(f: &Function, args: &[Value], inferred: Option<&dyn OperandFact
     for &value in args {
         let actual = operand_bits(f, inferred, value);
         let bits = if actual == TypeBits::TOP || actual.is_bottom() {
-            let Some(ty) = f.return_type_hints.get(&value) else { continue; };
+            let Some(ty) = f.return_type_hints.get(&value) else {
+                continue;
+            };
             hinted = true;
             ty.bits
-        } else { actual };
-        if bits == TypeBits::SINGLE_FLOAT { single = true; }
-        else if bits == TypeBits::DOUBLE_FLOAT { double = true; }
-        else if bits == TypeBits::FIXNUM { integer = true; }
-        else if !bits.meet(TypeBits::SINGLE_FLOAT.join(TypeBits::DOUBLE_FLOAT)).is_bottom() {
+        } else {
+            actual
+        };
+        if bits == TypeBits::SINGLE_FLOAT {
+            single = true;
+        } else if bits == TypeBits::DOUBLE_FLOAT {
+            double = true;
+        } else if bits == TypeBits::FIXNUM {
+            integer = true;
+        } else if !bits
+            .meet(TypeBits::SINGLE_FLOAT.join(TypeBits::DOUBLE_FLOAT))
+            .is_bottom()
+        {
             return None; // A mixed prototype/format is not a precise hint.
         }
     }
-    if !hinted { return None; }
-    if double && options.double_float && target_support::double_float() { Some(SpecType::DoubleFloat) }
-    else if single && !double { Some(SpecType::SingleFloat) }
-    else if integer && !single && !double { Some(SpecType::Fixnum) }
-    else { None }
+    if !hinted {
+        return None;
+    }
+    if double && options.double_float && target_support::double_float() {
+        Some(SpecType::DoubleFloat)
+    } else if single && !double {
+        Some(SpecType::SingleFloat)
+    } else if integer && !single && !double {
+        Some(SpecType::Fixnum)
+    } else {
+        None
+    }
 }
 
 pub(crate) fn accepts_return_hints(symbol: u32, arity: usize) -> bool {
@@ -475,8 +514,13 @@ pub(crate) fn accepts_return_hints(symbol: u32, arity: usize) -> bool {
 
 /// An expectation can reject an incompatible guarded guess without proving
 /// anything about the runtime operand. Actual operand facts take precedence.
-fn hints_permit_family(f: &Function, args: &[Value], inferred: Option<&dyn OperandFacts>,
-    kind: SpecType, comparison: bool) -> bool {
+fn hints_permit_family(
+    f: &Function,
+    args: &[Value],
+    inferred: Option<&dyn OperandFacts>,
+    kind: SpecType,
+    comparison: bool,
+) -> bool {
     let allowed = match kind {
         SpecType::Fixnum => TypeBits::FIXNUM,
         SpecType::SingleFloat => TypeBits::SINGLE_FLOAT.join(TypeBits::FIXNUM),
@@ -485,9 +529,12 @@ fn hints_permit_family(f: &Function, args: &[Value], inferred: Option<&dyn Opera
     };
     args.iter().all(|&value| {
         let actual = operand_bits(f, inferred, value);
-        if actual != TypeBits::TOP && !actual.is_bottom() { return true; }
-        f.return_type_hints.get(&value).is_none_or(|hint|
-            hint.bits.is_bottom() || !hint.bits.meet(allowed).is_bottom())
+        if actual != TypeBits::TOP && !actual.is_bottom() {
+            return true;
+        }
+        f.return_type_hints
+            .get(&value)
+            .is_none_or(|hint| hint.bits.is_bottom() || !hint.bits.meet(allowed).is_bottom())
     })
 }
 
@@ -617,7 +664,8 @@ fn reconcile_double(
         && target_support::double_float()
         && double_operands_admissible(f, args, consts, comparison, inferred);
     let known_double = args.iter().any(|&arg| {
-        operand_bits(f, inferred, arg) == TypeBits::DOUBLE_FLOAT || double_literal_bits(f, arg).is_some()
+        operand_bits(f, inferred, arg) == TypeBits::DOUBLE_FLOAT
+            || double_literal_bits(f, arg).is_some()
     });
     match spec {
         SpecType::DoubleFloat => admitted.then_some(SpecType::DoubleFloat),
@@ -629,7 +677,10 @@ fn reconcile_double(
 fn is_float_compare(op: Opcode) -> bool {
     matches!(
         op,
-        Opcode::FloatCmpEq | Opcode::FloatCmpLt | Opcode::FloatCmpLe | Opcode::FloatCmpGt
+        Opcode::FloatCmpEq
+            | Opcode::FloatCmpLt
+            | Opcode::FloatCmpLe
+            | Opcode::FloatCmpGt
             | Opcode::FloatCmpGe
     )
 }
@@ -651,7 +702,10 @@ fn insert_before_site(
     let insts = &mut f.block_mut(block).insts;
     let appended = insts.pop();
     debug_assert_eq!(appended, Some(inst));
-    let position = insts.iter().position(|&i| i == site).expect("site is in its block");
+    let position = insts
+        .iter()
+        .position(|&i| i == site)
+        .expect("site is in its block");
     insts.insert(position, inst);
     results[0]
 }
@@ -686,8 +740,12 @@ fn expand_double_site(f: &mut Function, site: Inst, opcode: Opcode, consts: &Has
     let comparison = is_float_compare(opcode);
     let data = f.inst(site).clone();
     let state = data.frame_state.expect("double site keeps its frame state");
-    let raw_double = (IRType::of(TypeBits::DOUBLE_FLOAT), ValueRepresentation::UnboxedF64);
-    let constant = |f: &Function, value: Value| double_constant_operand(f, value, consts, comparison);
+    let raw_double = (
+        IRType::of(TypeBits::DOUBLE_FLOAT),
+        ValueRepresentation::UnboxedF64,
+    );
+    let constant =
+        |f: &Function, value: Value| double_constant_operand(f, value, consts, comparison);
     // A double partner (literal or proven) makes the result a double whatever
     // this operand is. Beside a fixnum or single-float constant the variable
     // must itself be a double: the interpreter's answer would otherwise be
@@ -792,15 +850,25 @@ fn reconcile_with_operands(
         let bits = operand_bits(f, inferred, *arg);
         (!bits.is_bottom() && bits != TypeBits::TOP).then_some(bits)
     };
-    if args.iter().filter_map(known).any(|bits| bits.meet(numeric).is_bottom()) {
+    if args
+        .iter()
+        .filter_map(known)
+        .any(|bits| bits.meet(numeric).is_bottom())
+    {
         return None;
     }
     let single = |bits: TypeBits| bits.meet(TypeBits::SINGLE_FLOAT) == bits;
     match spec {
         SpecType::Fixnum
-            if args.iter().filter_map(known).any(|bits| bits.meet(TypeBits::FIXNUM).is_bottom()) =>
+            if args
+                .iter()
+                .filter_map(known)
+                .any(|bits| bits.meet(TypeBits::FIXNUM).is_bottom()) =>
         {
-            args.iter().filter_map(known).any(single).then_some(SpecType::SingleFloat)
+            args.iter()
+                .filter_map(known)
+                .any(single)
+                .then_some(SpecType::SingleFloat)
         }
         _ => Some(spec),
     }
@@ -816,20 +884,28 @@ struct NumericConstraints(std::cell::OnceCell<super::infer::InferenceResult>);
 impl NumericConstraints {
     fn facts<'a>(&'a self, f: &Function) -> &'a super::infer::InferenceResult {
         self.0.get_or_init(|| {
-            let sites: Vec<Inst> = f.block_order().iter()
+            let sites: Vec<Inst> = f
+                .block_order()
+                .iter()
                 .flat_map(|&block| f.block(block).insts.iter().copied())
                 .filter(|&inst| {
                     let data = f.inst(inst);
                     matches!(data.opcode, Opcode::Call | Opcode::Invoke)
                         && matches!(data.aux, AuxData::CallTarget(symbol)
                             if profiles_numeric_operands(symbol))
-                }).collect();
+                })
+                .collect();
             super::infer::infer_for_sites(f, &sites)
         })
     }
 
-    fn inferred_for<'a>(&'a self, f: &Function, args: &[Value]) -> Option<&'a super::infer::InferenceResult> {
-        args.iter().any(|&arg| f.value(arg).ty.bits.0.count_ones() > 1)
+    fn inferred_for<'a>(
+        &'a self,
+        f: &Function,
+        args: &[Value],
+    ) -> Option<&'a super::infer::InferenceResult> {
+        args.iter()
+            .any(|&arg| f.value(arg).ty.bits.0.count_ones() > 1)
             .then(|| self.facts(f))
     }
 
@@ -853,7 +929,8 @@ impl NumericConstraints {
             return false;
         }
         let facts = self.facts(f);
-        args.iter().any(|&arg| excludes(facts.ty_before(site, arg).bits))
+        args.iter()
+            .any(|&arg| excludes(facts.ty_before(site, arg).bits))
     }
 }
 
@@ -865,7 +942,11 @@ impl NumericConstraints {
 /// into +0.0) every raw `FloatAdd` already reproduces. Each link deoptimizes
 /// with the whole call's frame state: arithmetic has no effects, so the
 /// interpreter simply evaluates the original call again.
-fn split_variadic_double_arithmetic(f: &mut Function, profile: &impl Fn(u32) -> Option<SpecType>, permits: &dyn Fn(u32, SpecType) -> bool) {
+fn split_variadic_double_arithmetic(
+    f: &mut Function,
+    profile: &impl Fn(u32) -> Option<SpecType>,
+    permits: &dyn Fn(u32, SpecType) -> bool,
+) {
     use crate::t2::ir::{InstData, ValueRepresentation};
     let constraints = NumericConstraints::default();
     let mut sites = Vec::new();
@@ -875,10 +956,16 @@ fn split_variadic_double_arithmetic(f: &mut Function, profile: &impl Fn(u32) -> 
             if data.opcode != Opcode::Call || data.args.len() < 3 || data.results.len() != 1 {
                 continue;
             }
-            let AuxData::CallTarget(sym) = data.aux else { continue };
-            let Some(state) = data.frame_state else { continue };
-            if arith_of(sym).is_none() || !permits(frame_state_bcp(f, state), SpecType::DoubleFloat)
-                || profile(frame_state_bcp(f, state)) != Some(SpecType::DoubleFloat) {
+            let AuxData::CallTarget(sym) = data.aux else {
+                continue;
+            };
+            let Some(state) = data.frame_state else {
+                continue;
+            };
+            if arith_of(sym).is_none()
+                || !permits(frame_state_bcp(f, state), SpecType::DoubleFloat)
+                || profile(frame_state_bcp(f, state)) != Some(SpecType::DoubleFloat)
+            {
                 continue;
             }
             if !constraints.excludes_numeric(f, inst, &data.args) {
@@ -944,7 +1031,8 @@ fn double_only_operands(
     inferred: Option<&dyn OperandFacts>,
 ) -> bool {
     let proven = |value: Value| {
-        double_literal_bits(f, value).is_some() || operand_bits(f, inferred, value) == TypeBits::DOUBLE_FLOAT
+        double_literal_bits(f, value).is_some()
+            || operand_bits(f, inferred, value) == TypeBits::DOUBLE_FLOAT
     };
     let may_be_double = |value: Value| {
         let bits = operand_bits(f, inferred, value);
@@ -953,7 +1041,8 @@ fn double_only_operands(
     let constant = |value: Value| double_constant_operand(f, value, consts, false);
     if opcode != Opcode::FloatDiv {
         return args.len() == 1
-            && (proven(args[0]) || (observed && constant(args[0]).is_none() && may_be_double(args[0])));
+            && (proven(args[0])
+                || (observed && constant(args[0]).is_none() && may_be_double(args[0])));
     }
     let fixnum = |value: Value| {
         let bits = operand_bits(f, inferred, value);
@@ -961,13 +1050,17 @@ fn double_only_operands(
     };
     let statically = args.len() == 2
         && args.iter().any(|&arg| proven(arg))
-        && args.iter().all(|&arg| proven(arg) || constant(arg).is_some() || fixnum(arg))
-        && (0..2).all(|index| !fixnum(args[index]) || constant(args[index]).is_some()
-            || proven(args[1 - index]));
+        && args
+            .iter()
+            .all(|&arg| proven(arg) || constant(arg).is_some() || fixnum(arg))
+        && (0..2).all(|index| {
+            !fixnum(args[index]) || constant(args[index]).is_some() || proven(args[1 - index])
+        });
     args.len() == 2
         && args.iter().any(|&arg| constant(arg).is_none())
         && constant(args[1]).is_none_or(|bits| f64::from_bits(bits) != 0.0)
-        && (statically || (observed && double_operands_admissible(f, args, consts, false, inferred)))
+        && (statically
+            || (observed && double_operands_admissible(f, args, consts, false, inferred)))
 }
 
 /// Compile `SQRT`, unary `-` and binary `/` of doubles to raw operations
@@ -991,32 +1084,50 @@ fn speculate_double_only_sites(
     permits: &dyn Fn(u32, SpecType) -> bool,
 ) -> usize {
     use crate::t2::ir::{InstData, ValueRepresentation};
-    let raw_double = (IRType::of(TypeBits::DOUBLE_FLOAT), ValueRepresentation::UnboxedF64);
+    let raw_double = (
+        IRType::of(TypeBits::DOUBLE_FLOAT),
+        ValueRepresentation::UnboxedF64,
+    );
     let mut n = 0;
     // Program order, so a site sees the refined type of an earlier one.
     let constraints = NumericConstraints::default();
     let sites: Vec<(Inst, SpecType, CapturedOperandFacts)> = {
-        f.block_order().iter()
+        f.block_order()
+            .iter()
             .flat_map(|&block| f.block(block).insts.iter().copied())
             .filter_map(|site| {
                 let data = f.inst(site);
-                let AuxData::CallTarget(symbol) = data.aux else { return None };
-                if data.opcode != Opcode::Call || data.results.len() != 1
+                let AuxData::CallTarget(symbol) = data.aux else {
+                    return None;
+                };
+                if data.opcode != Opcode::Call
+                    || data.results.len() != 1
                     || !data.targets.is_empty()
                     || double_only_opcode(symbol, data.args.len()).is_none()
                 {
                     return None;
                 }
                 let state = data.frame_state?;
-                if !permits(frame_state_bcp(f, state), SpecType::DoubleFloat) { return None; }
+                if !permits(frame_state_bcp(f, state), SpecType::DoubleFloat) {
+                    return None;
+                }
                 let observed = profile(frame_state_bcp(f, state))?;
-                if constraints.excludes_numeric(f, site, &data.args) { return None; }
-                let scoped = constraints.inferred_for(f, &data.args)
+                if constraints.excludes_numeric(f, site, &data.args) {
+                    return None;
+                }
+                let scoped = constraints
+                    .inferred_for(f, &data.args)
                     .map(|facts| SiteOperandFacts { facts, site });
                 let inferred = scoped.as_ref().map(|facts| facts as &dyn OperandFacts);
-                if conflicting_operand_facts(f, inferred, &data.args) { return None; }
-                let captured = CapturedOperandFacts(data.args.iter().map(|&value|
-                    (value, operand_bits(f, inferred, value))).collect());
+                if conflicting_operand_facts(f, inferred, &data.args) {
+                    return None;
+                }
+                let captured = CapturedOperandFacts(
+                    data.args
+                        .iter()
+                        .map(|&value| (value, operand_bits(f, inferred, value)))
+                        .collect(),
+                );
                 Some((site, observed, captured))
             })
             .collect()
@@ -1024,30 +1135,53 @@ fn speculate_double_only_sites(
     drop(constraints);
     for (site, observed, facts) in sites {
         let data = f.inst(site).clone();
-        let AuxData::CallTarget(symbol) = data.aux else { continue };
+        let AuxData::CallTarget(symbol) = data.aux else {
+            continue;
+        };
         if data.opcode != Opcode::Call || data.results.len() != 1 || !data.targets.is_empty() {
             continue;
         }
-        let Some(opcode) = double_only_opcode(symbol, data.args.len()) else { continue };
-        let Some(state) = data.frame_state else { continue };
+        let Some(opcode) = double_only_opcode(symbol, data.args.len()) else {
+            continue;
+        };
+        let Some(state) = data.frame_state else {
+            continue;
+        };
         // Declined sites were excluded during the immutable selection phase.
         // Earlier expansions preserve these operands' successful values and
         // can strengthen their declarations. Intersect both sources of type
         // evidence; captured TOP never hides a newly declared double, while a
         // known incompatible type cannot be forgotten by the fallback.
         if conflicting_operand_facts(f, Some(&facts), &data.args)
-            || !double_only_operands(f, opcode, &data.args, consts,
-                observed == SpecType::DoubleFloat, Some(&facts))
+            || !double_only_operands(
+                f,
+                opcode,
+                &data.args,
+                consts,
+                observed == SpecType::DoubleFloat,
+                Some(&facts),
+            )
         {
             continue;
         }
-        let Some(binding) = super::builtin_binding::snapshot(symbol) else { continue };
+        let Some(binding) = super::builtin_binding::snapshot(symbol) else {
+            continue;
+        };
         let Some((block, position)) = f.block_order().iter().find_map(|&block| {
-            f.block(block).insts.iter().position(|&candidate| candidate == site)
+            f.block(block)
+                .insts
+                .iter()
+                .position(|&candidate| candidate == site)
                 .map(|position| (block, position))
-        }) else { continue };
+        }) else {
+            continue;
+        };
         super::builtin_binding::insert(f, block, position, state, binding);
-        let guarded = InstFlags { guard: true, effectful: true, ..InstFlags::default() };
+        let guarded = InstFlags {
+            guard: true,
+            effectful: true,
+            ..InstFlags::default()
+        };
         let raw = if opcode == Opcode::FloatDiv {
             expand_double_site(f, site, opcode, consts);
             let raw = f.inst(site).args[0];
@@ -1062,71 +1196,103 @@ fn speculate_double_only_sites(
         } else {
             let operand = data.args[0];
             let input = if let Some(bits) = double_literal_bits(f, operand) {
-                insert_before_site(f, site, InstData {
-                    opcode: Opcode::ConstDouble,
-                    args: vec![],
-                    results: vec![],
-                    aux: AuxData::DoubleImm(bits),
-                    flags: InstFlags::default(),
-                    targets: vec![],
-                    frame_state: None,
-                    source_pos: data.source_pos,
-                }, raw_double)
+                insert_before_site(
+                    f,
+                    site,
+                    InstData {
+                        opcode: Opcode::ConstDouble,
+                        args: vec![],
+                        results: vec![],
+                        aux: AuxData::DoubleImm(bits),
+                        flags: InstFlags::default(),
+                        targets: vec![],
+                        frame_state: None,
+                        source_pos: data.source_pos,
+                    },
+                    raw_double,
+                )
             } else {
                 let guard_state = f.frame_states.add(f.frame_states.get(state).clone());
-                insert_before_site(f, site, InstData {
-                    opcode: Opcode::UnboxFloat,
-                    args: vec![operand],
-                    results: vec![],
-                    aux: AuxData::None,
-                    flags: guarded,
-                    targets: vec![],
-                    frame_state: Some(guard_state),
-                    source_pos: data.source_pos,
-                }, raw_double)
+                insert_before_site(
+                    f,
+                    site,
+                    InstData {
+                        opcode: Opcode::UnboxFloat,
+                        args: vec![operand],
+                        results: vec![],
+                        aux: AuxData::None,
+                        flags: guarded,
+                        targets: vec![],
+                        frame_state: Some(guard_state),
+                        source_pos: data.source_pos,
+                    },
+                    raw_double,
+                )
             };
             let (flags, frame_state) = if opcode == Opcode::FloatSqrt {
-                (guarded, Some(f.frame_states.add(f.frame_states.get(state).clone())))
+                (
+                    guarded,
+                    Some(f.frame_states.add(f.frame_states.get(state).clone())),
+                )
             } else {
                 (InstFlags::default(), None)
             };
-            insert_before_site(f, site, InstData {
-                opcode,
-                args: vec![input],
-                results: vec![],
-                aux: AuxData::None,
-                flags,
-                targets: vec![],
-                frame_state,
-                source_pos: data.source_pos,
-            }, raw_double)
+            insert_before_site(
+                f,
+                site,
+                InstData {
+                    opcode,
+                    args: vec![input],
+                    results: vec![],
+                    aux: AuxData::None,
+                    flags,
+                    targets: vec![],
+                    frame_state,
+                    source_pos: data.source_pos,
+                },
+                raw_double,
+            )
         };
         {
             let site_data = f.inst_mut(site);
             site_data.opcode = Opcode::BoxFloat;
             site_data.args = vec![raw];
             site_data.aux = AuxData::None;
-            site_data.flags = InstFlags { effectful: true, ..InstFlags::default() };
+            site_data.flags = InstFlags {
+                effectful: true,
+                ..InstFlags::default()
+            };
             site_data.frame_state = None;
         }
         f.refine_type(data.results[0], IRType::of(TypeBits::DOUBLE_FLOAT));
         // A successful builtin call resets the multiple values, as in the
         // main rewrite.
         let return_state = f.frame_states.add(f.frame_states.get(state).clone());
-        let (clear, _) = f.push_inst(block, InstData {
-            opcode: Opcode::ClearMv,
-            args: vec![],
-            results: vec![],
-            aux: AuxData::None,
-            flags: InstFlags { effectful: true, call: true, safepoint: true, ..InstFlags::default() },
-            targets: vec![],
-            frame_state: Some(return_state),
-            source_pos: data.source_pos,
-        }, &[]);
+        let (clear, _) = f.push_inst(
+            block,
+            InstData {
+                opcode: Opcode::ClearMv,
+                args: vec![],
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags {
+                    effectful: true,
+                    call: true,
+                    safepoint: true,
+                    ..InstFlags::default()
+                },
+                targets: vec![],
+                frame_state: Some(return_state),
+                source_pos: data.source_pos,
+            },
+            &[],
+        );
         let insts = &mut f.block_mut(block).insts;
         let appended = insts.pop();
         debug_assert_eq!(appended, Some(clear));
-        let position = insts.iter().position(|&candidate| candidate == site)
+        let position = insts
+            .iter()
+            .position(|&candidate| candidate == site)
             .expect("speculation site remains in its block");
         insts.insert(position + 1, clear);
         n += 1;
@@ -1171,10 +1337,19 @@ pub(crate) fn speculate_blocks(f: &mut Function, blocks: &[crate::t2::ir::Block]
 }
 
 pub(crate) fn speculate_blocks_with_feedback(
-    f: &mut Function, blocks: &[crate::t2::ir::Block],
+    f: &mut Function,
+    blocks: &[crate::t2::ir::Block],
     permits: &dyn Fn(u32, SpecType) -> bool,
 ) -> usize {
-    speculate_selected(f, &|_| None, SpeculateOptions { double_float: false }, Some(blocks), permits)
+    speculate_selected(
+        f,
+        &|_| None,
+        SpeculateOptions {
+            double_float: false,
+        },
+        Some(blocks),
+        permits,
+    )
 }
 
 fn speculate_selected(
@@ -1216,7 +1391,9 @@ fn speculate_selected(
         }
     }
     for &b in f.block_order() {
-        if selected.is_some_and(|blocks| !blocks.contains(&b)) { continue; }
+        if selected.is_some_and(|blocks| !blocks.contains(&b)) {
+            continue;
+        }
         for &inst in &f.block(b).insts {
             let data = f.inst(inst);
             if !matches!(data.opcode, Opcode::Call | Opcode::Invoke) {
@@ -1232,7 +1409,12 @@ fn speculate_selected(
                 && egcl_rt::symbols::registry_key(sym).as_deref() == Some("EGCL::%MEMORY-FENCE")
                 && let Some(&kind) = fences.get(&data.args[0])
             {
-                work.push((inst, Opcode::MemoryFence, IRType::of(TypeBits::NULL), ExtraArg::Fence(kind)));
+                work.push((
+                    inst,
+                    Opcode::MemoryFence,
+                    IRType::of(TypeBits::NULL),
+                    ExtraArg::Fence(kind),
+                ));
                 continue;
             }
             // NOT/NULL rewrite first: profile-free (correct for every type).
@@ -1257,48 +1439,79 @@ fn speculate_selected(
                     // operand types alone must not reactivate that speculation.
                     profile(bcp).and_then(|observed| {
                         let scoped = profiles_numeric_operands(sym)
-                            .then(|| constraints.inferred_for(f, &data.args)).flatten()
+                            .then(|| constraints.inferred_for(f, &data.args))
+                            .flatten()
                             .map(|facts| SiteOperandFacts { facts, site: inst });
                         let inferred = scoped.as_ref().map(|facts| facts as &dyn OperandFacts);
-                        if conflicting_operand_facts(f, inferred, &data.args) { return None; }
-                        let proven = options.double_float && target_support::double_float()
+                        if conflicting_operand_facts(f, inferred, &data.args) {
+                            return None;
+                        }
+                        let proven = options.double_float
+                            && target_support::double_float()
                             && (arith_of(sym).is_some() || comparison)
-                            && statically_proven_double(f, &data.args, &consts, comparison, inferred);
-                        proven.then_some(SpecType::DoubleFloat)
+                            && statically_proven_double(
+                                f, &data.args, &consts, comparison, inferred,
+                            );
+                        proven
+                            .then_some(SpecType::DoubleFloat)
                             .or_else(|| statically_proven_spec_type(f, &data.args, inferred))
                             .or_else(|| {
-                                if !accepts_return_hints(sym, argc) { return None; }
+                                if !accepts_return_hints(sym, argc) {
+                                    return None;
+                                }
                                 let hinted = hinted_family(f, &data.args, inferred, options)?;
                                 // Reconcile using ACTUAL facts, never hints as
                                 // proof. Expansion retains every operand check.
-                                reconcile_double(f, &data.args, &consts, comparison, hinted, options, inferred)
-                                    .and_then(|spec| reconcile_with_operands(f, &data.args, spec, inferred))
-                                    .filter(|&spec| hints_permit_family(f, &data.args, inferred, spec, comparison))
+                                reconcile_double(
+                                    f, &data.args, &consts, comparison, hinted, options, inferred,
+                                )
+                                .and_then(|spec| {
+                                    reconcile_with_operands(f, &data.args, spec, inferred)
+                                })
+                                .filter(|&spec| {
+                                    hints_permit_family(f, &data.args, inferred, spec, comparison)
+                                })
                             })
-                            .or_else(|| reconcile_double(f, &data.args, &consts, comparison, observed, options, inferred)
-                                .and_then(|spec| reconcile_with_operands(f, &data.args, spec, inferred))
-                                .filter(|&spec| hints_permit_family(f, &data.args, inferred, spec, comparison)))
+                            .or_else(|| {
+                                reconcile_double(
+                                    f, &data.args, &consts, comparison, observed, options, inferred,
+                                )
+                                .and_then(|spec| {
+                                    reconcile_with_operands(f, &data.args, spec, inferred)
+                                })
+                                .filter(|&spec| {
+                                    hints_permit_family(f, &data.args, inferred, spec, comparison)
+                                })
+                            })
                     })
                 })
             else {
                 continue;
             };
-            if !permits(bcp, spec) { continue; }
+            if !permits(bcp, spec) {
+                continue;
+            }
             if profiles_numeric_operands(sym) && constraints.excludes_numeric(f, inst, &data.args) {
                 continue;
             }
             if spec == SpecType::Fixnum {
-                if let Some(operation) = super::numeric_result_facts::Operation::for_call(sym, argc) {
+                if let Some(operation) = super::numeric_result_facts::Operation::for_call(sym, argc)
+                {
                     let facts = constraints.facts(f);
                     let integer = TypeBits::FIXNUM.join(TypeBits::BIGNUM);
-                    let ranges: Option<Vec<_>> = data.args.iter().map(|&value| {
-                        let ty = facts.ty_before(inst, value);
-                        (!ty.bits.is_bottom() && integer.contains(ty.bits))
-                            .then_some(ty.range).flatten()
-                    }).collect();
-                    if ranges.is_some_and(|ranges|
-                        super::numeric_result_facts::excludes_fixnum_result(operation, &ranges))
-                    {
+                    let ranges: Option<Vec<_>> = data
+                        .args
+                        .iter()
+                        .map(|&value| {
+                            let ty = facts.ty_before(inst, value);
+                            (!ty.bits.is_bottom() && integer.contains(ty.bits))
+                                .then_some(ty.range)
+                                .flatten()
+                        })
+                        .collect();
+                    if ranges.is_some_and(|ranges| {
+                        super::numeric_result_facts::excludes_fixnum_result(operation, &ranges)
+                    }) {
                         continue;
                     }
                 }
@@ -1313,7 +1526,11 @@ fn speculate_selected(
                     },
                     _ => continue,
                 };
-                let ty = if comparison { boolean_type() } else { result_type(spec) };
+                let ty = if comparison {
+                    boolean_type()
+                } else {
+                    result_type(spec)
+                };
                 work.push((inst, opcode, ty, ExtraArg::DoubleFloat));
                 continue;
             }
@@ -1362,15 +1579,23 @@ fn speculate_selected(
                         ExtraArg::None,
                     ));
                 }
-            } else if spec == SpecType::Fixnum && argc == 2
-                && matches!(egcl_rt::symbols::registry_key(sym).as_deref(),
-                    Some("MIN" | "MAX" | "MOD"
-                        | "REM" | "FLOOR" | "TRUNCATE"))
+            } else if spec == SpecType::Fixnum
+                && argc == 2
+                && matches!(
+                    egcl_rt::symbols::registry_key(sym).as_deref(),
+                    Some("MIN" | "MAX" | "MOD" | "REM" | "FLOOR" | "TRUNCATE")
+                )
             {
                 let name = egcl_rt::symbols::symbol_name(sym).unwrap();
-                if name == "MOD" && let Some(mask) = mod_mask_of(f, &data.args, &consts) {
-                    work.push((inst, Opcode::LogAnd, result_type(spec),
-                        ExtraArg::ReplaceSecondWithFixnum(mask)));
+                if name == "MOD"
+                    && let Some(mask) = mod_mask_of(f, &data.args, &consts)
+                {
+                    work.push((
+                        inst,
+                        Opcode::LogAnd,
+                        result_type(spec),
+                        ExtraArg::ReplaceSecondWithFixnum(mask),
+                    ));
                 } else {
                     // Two families, because a port reaches the select first:
                     // ppc64le encodes MIN/MAX with `isel` but has no arm for
@@ -1421,21 +1646,36 @@ fn speculate_selected(
     let mut n = 0;
     let mut fixnum_sites: Vec<Inst> = Vec::new();
     for (inst, opcode, ty, extra) in work {
-        let AuxData::CallTarget(symbol) = f.inst(inst).aux else { continue };
-        let Some(binding) = super::builtin_binding::snapshot(symbol) else { continue };
-        let Some(state) = f.inst(inst).frame_state else { continue };
-        let (block, position) = f.block_order().iter().find_map(|&block| {
-            f.block(block).insts.iter().position(|&candidate| candidate == inst)
-                .map(|position| (block, position))
-        }).expect("speculation site belongs to a block");
+        let AuxData::CallTarget(symbol) = f.inst(inst).aux else {
+            continue;
+        };
+        let Some(binding) = super::builtin_binding::snapshot(symbol) else {
+            continue;
+        };
+        let Some(state) = f.inst(inst).frame_state else {
+            continue;
+        };
+        let (block, position) = f
+            .block_order()
+            .iter()
+            .find_map(|&block| {
+                f.block(block)
+                    .insts
+                    .iter()
+                    .position(|&candidate| candidate == inst)
+                    .map(|position| (block, position))
+            })
+            .expect("speculation site belongs to a block");
         let normal = if f.inst(inst).opcode == Opcode::Invoke {
             // Removing a cold edge must not strand an OSR header or its
             // preheader definitions. Keep the generic call in that case.
             let before = reachable_blocks(f, None, false);
             let after = reachable_blocks(f, Some(inst), false);
-            if !before[block.index()] || f.osr_entries.iter().any(|entry| {
-                before[entry.block.index()] && !after[entry.block.index()]
-            }) {
+            if !before[block.index()]
+                || f.osr_entries
+                    .iter()
+                    .any(|entry| before[entry.block.index()] && !after[entry.block.index()])
+            {
                 continue;
             }
             initially_reachable.get_or_insert_with(|| reachable_blocks(f, None, true));
@@ -1552,20 +1792,25 @@ fn speculate_selected(
         let insts = &mut f.block_mut(block).insts;
         let appended = insts.pop();
         debug_assert_eq!(appended, Some(clear));
-        let position = insts.iter().position(|&candidate| candidate == inst)
+        let position = insts
+            .iter()
+            .position(|&candidate| candidate == inst)
             .expect("speculation site remains in its block");
         insts.insert(position + 1, clear);
         if let Some(normal) = normal {
-            f.set_terminator(block, crate::t2::ir::InstData {
-                opcode: Opcode::Jump,
-                args: vec![],
-                results: vec![],
-                aux: AuxData::None,
-                flags: InstFlags::default(),
-                targets: vec![normal],
-                frame_state: None,
-                source_pos: 0,
-            });
+            f.set_terminator(
+                block,
+                crate::t2::ir::InstData {
+                    opcode: Opcode::Jump,
+                    args: vec![],
+                    results: vec![],
+                    aux: AuxData::None,
+                    flags: InstFlags::default(),
+                    targets: vec![normal],
+                    frame_state: None,
+                    source_pos: 0,
+                },
+            );
         }
         if fixnum_family(opcode) {
             fixnum_sites.push(inst);
@@ -1580,16 +1825,19 @@ fn speculate_selected(
                 let block = crate::t2::ir::Block(index as u32);
                 fixnum_sites.retain(|site| !f.block(block).insts.contains(site));
                 f.block_mut(block).insts.clear();
-                f.set_terminator(block, crate::t2::ir::InstData {
-                    opcode: Opcode::Trap,
-                    args: vec![],
-                    results: vec![],
-                    aux: AuxData::None,
-                    flags: InstFlags::default(),
-                    targets: vec![],
-                    frame_state: None,
-                    source_pos: 0,
-                });
+                f.set_terminator(
+                    block,
+                    crate::t2::ir::InstData {
+                        opcode: Opcode::Trap,
+                        args: vec![],
+                        results: vec![],
+                        aux: AuxData::None,
+                        flags: InstFlags::default(),
+                        targets: vec![],
+                        frame_state: None,
+                        source_pos: 0,
+                    },
+                );
             }
         }
     }
@@ -1600,7 +1848,9 @@ fn speculate_selected(
         .entry_frame_state
         .map(|id| f.frame_states.get(id).scopes[0].function);
     materialize_entry_param_preguards(f, &fixnum_sites, self_sym);
-    if selected.is_none() { materialize_self_call_result_guards(f, self_sym); }
+    if selected.is_none() {
+        materialize_self_call_result_guards(f, self_sym);
+    }
     materialize_fixnum_operand_guards(f, &fixnum_sites);
     n
 }
@@ -1618,7 +1868,11 @@ fn reachable_blocks(f: &Function, normal_only: Option<Inst>, include_osr: bool) 
         }
         if let Some(term) = f.terminator(block) {
             let targets = &f.inst(term).targets;
-            let count = if Some(term) == normal_only { 1 } else { targets.len() };
+            let count = if Some(term) == normal_only {
+                1
+            } else {
+                targets.len()
+            };
             pending.extend(targets[..count].iter().map(|edge| edge.block));
         }
     }
@@ -2535,7 +2789,11 @@ mod tests {
     /// The opcodes of the entry block, in order.
     #[cfg(target_arch = "x86_64")]
     fn entry_opcodes(f: &Function) -> Vec<Opcode> {
-        f.block(f.entry()).insts.iter().map(|&inst| f.inst(inst).opcode).collect()
+        f.block(f.entry())
+            .insts
+            .iter()
+            .map(|&inst| f.inst(inst).opcode)
+            .collect()
     }
 
     #[test]
@@ -2549,31 +2807,50 @@ mod tests {
         assert_eq!(tagged.inst(call).opcode, Opcode::Call);
 
         let mut raw = f.clone();
-        assert_eq!(speculate_with(&mut raw, &|_| Some(SpecType::DoubleFloat), DOUBLE_FLOAT), 1);
+        assert_eq!(
+            speculate_with(&mut raw, &|_| Some(SpecType::DoubleFloat), DOUBLE_FLOAT),
+            1
+        );
         let ops = entry_opcodes(&raw);
-        let unboxes: Vec<Inst> = raw.block(raw.entry()).insts.iter().copied()
+        let unboxes: Vec<Inst> = raw
+            .block(raw.entry())
+            .insts
+            .iter()
+            .copied()
             .filter(|&inst| raw.inst(inst).opcode == Opcode::UnboxFloat)
             .collect();
         assert_eq!(unboxes.len(), 2, "{ops:?}");
         for &unbox in &unboxes {
             let data = raw.inst(unbox);
             assert!(data.flags.guard && data.frame_state.is_some());
-            assert!(unbox_accepts_fixnum(&data.aux), "arithmetic takes fixnum contagion");
+            assert!(
+                unbox_accepts_fixnum(&data.aux),
+                "arithmetic takes fixnum contagion"
+            );
             assert_eq!(raw.value(data.results[0]).repr, Repr::UnboxedF64);
         }
         // The second of two unproven variables checks the pair for fixnums.
         assert_eq!(raw.inst(unboxes[0]).args.len(), 1);
         assert_eq!(raw.inst(unboxes[1]).args.len(), 2);
-        let multiply = *raw.block(raw.entry()).insts.iter()
+        let multiply = *raw
+            .block(raw.entry())
+            .insts
+            .iter()
             .find(|&&inst| raw.inst(inst).opcode == Opcode::FloatMul)
             .expect("raw multiply");
         assert!(raw.inst(multiply).frame_state.is_none());
-        assert_eq!(raw.value(raw.inst(multiply).results[0]).repr, Repr::UnboxedF64);
+        assert_eq!(
+            raw.value(raw.inst(multiply).results[0]).repr,
+            Repr::UnboxedF64
+        );
         // The site itself boxes the raw result into its original value.
         assert_eq!(raw.inst(call).opcode, Opcode::BoxFloat);
         assert_eq!(raw.inst(call).args, raw.inst(multiply).results);
         assert_eq!(raw.value(raw.inst(call).results[0]).repr, Repr::Tagged);
-        assert_eq!(raw.value(raw.inst(call).results[0]).ty.bits, TypeBits::DOUBLE_FLOAT);
+        assert_eq!(
+            raw.value(raw.inst(call).results[0]).ty.bits,
+            TypeBits::DOUBLE_FLOAT
+        );
         assert!(crate::t2::verify::verify(&raw).is_ok());
     }
 
@@ -2587,9 +2864,13 @@ mod tests {
         assert_eq!(speculate_with(&mut f, &|_| None, DOUBLE_FLOAT), 1);
         assert_eq!(f.inst(call).opcode, Opcode::BoxFloat);
         // Proven doubles need no fixnum pair check.
-        assert!(f.block(f.entry()).insts.iter()
-            .filter(|&&inst| f.inst(inst).opcode == Opcode::UnboxFloat)
-            .all(|&inst| f.inst(inst).args.len() == 1));
+        assert!(
+            f.block(f.entry())
+                .insts
+                .iter()
+                .filter(|&&inst| f.inst(inst).opcode == Opcode::UnboxFloat)
+                .all(|&inst| f.inst(inst).args.len() == 1)
+        );
     }
 
     #[test]
@@ -2598,7 +2879,10 @@ mod tests {
         let (mut f, call) = build_star();
         let second = f.block(f.entry()).params[1];
         f.refine_type(second, IRType::of(TypeBits::DOUBLE_FLOAT));
-        assert_eq!(speculate_with(&mut f, &|_| Some(SpecType::Fixnum), DOUBLE_FLOAT), 1);
+        assert_eq!(
+            speculate_with(&mut f, &|_| Some(SpecType::Fixnum), DOUBLE_FLOAT),
+            1
+        );
         assert_eq!(f.inst(call).opcode, Opcode::BoxFloat);
     }
 
@@ -2613,7 +2897,12 @@ mod tests {
         let mut g = f.clone();
         speculate_with(&mut g, &|_| Some(SpecType::DoubleFloat), DOUBLE_FLOAT);
         assert_ne!(g.inst(call).opcode, Opcode::BoxFloat);
-        assert!(!g.block(g.entry()).insts.iter().any(|&inst| g.inst(inst).opcode == Opcode::UnboxFloat));
+        assert!(
+            !g.block(g.entry())
+                .insts
+                .iter()
+                .any(|&inst| g.inst(inst).opcode == Opcode::UnboxFloat)
+        );
     }
 
     #[test]
@@ -2662,15 +2951,24 @@ mod tests {
         let x = f.block(f.entry()).params[0];
         f.refine_type(x, IRType::of(TypeBits::DOUBLE_FLOAT));
         // An unprofiled site answers a cold fixnum guess.
-        assert_eq!(speculate_with(&mut f, &|_| Some(SpecType::Fixnum), DOUBLE_FLOAT), 1);
+        assert_eq!(
+            speculate_with(&mut f, &|_| Some(SpecType::Fixnum), DOUBLE_FLOAT),
+            1
+        );
         let root = raw_operation(&f, call);
         assert_eq!(root.opcode, Opcode::FloatSqrt);
-        assert!(root.flags.guard && root.frame_state.is_some(), "a negative operand deopts");
+        assert!(
+            root.flags.guard && root.frame_state.is_some(),
+            "a negative operand deopts"
+        );
         let crate::t2::ir::ValueDef::Result { inst: unbox, .. } = f.value(root.args[0]).def else {
             panic!("unboxed operand");
         };
         assert_eq!(f.inst(unbox).opcode, Opcode::UnboxFloat);
-        assert!(!unbox_accepts_fixnum(&f.inst(unbox).aux), "(sqrt 4) is a single-float");
+        assert!(
+            !unbox_accepts_fixnum(&f.inst(unbox).aux),
+            "(sqrt 4) is a single-float"
+        );
         assert!(entry_opcodes(&f).contains(&Opcode::ClearMv));
         assert!(crate::t2::verify::verify(&f).is_ok());
     }
@@ -2680,11 +2978,17 @@ mod tests {
     fn sqrt_needs_a_double_operand_and_an_undeclined_site() {
         // Unknown operand, cold: stays generic.
         let (mut f, call) = build_call("SQRT", 1);
-        assert_eq!(speculate_with(&mut f, &|_| Some(SpecType::Fixnum), DOUBLE_FLOAT), 0);
+        assert_eq!(
+            speculate_with(&mut f, &|_| Some(SpecType::Fixnum), DOUBLE_FLOAT),
+            0
+        );
         assert_eq!(f.inst(call).opcode, Opcode::Call);
         // Unknown operand profiled as a double: raw.
         let (mut f, call) = build_call("SQRT", 1);
-        assert_eq!(speculate_with(&mut f, &|_| Some(SpecType::DoubleFloat), DOUBLE_FLOAT), 1);
+        assert_eq!(
+            speculate_with(&mut f, &|_| Some(SpecType::DoubleFloat), DOUBLE_FLOAT),
+            1
+        );
         assert_eq!(raw_operation(&f, call).opcode, Opcode::FloatSqrt);
         // A declined site (the profile answers None) stays generic.
         let (mut f, call) = build_call("SQRT", 1);
@@ -2706,7 +3010,10 @@ mod tests {
         let (mut f, call) = build_call("-", 1);
         let x = f.block(f.entry()).params[0];
         f.refine_type(x, IRType::of(TypeBits::DOUBLE_FLOAT));
-        assert_eq!(speculate_with(&mut f, &|_| Some(SpecType::Fixnum), DOUBLE_FLOAT), 1);
+        assert_eq!(
+            speculate_with(&mut f, &|_| Some(SpecType::Fixnum), DOUBLE_FLOAT),
+            1
+        );
         let negate = raw_operation(&f, call);
         assert_eq!(negate.opcode, Opcode::FloatNeg);
         assert!(!negate.flags.guard && negate.frame_state.is_none());
@@ -2720,24 +3027,36 @@ mod tests {
         for param in f.block(f.entry()).params.clone() {
             f.refine_type(param, IRType::of(TypeBits::DOUBLE_FLOAT));
         }
-        assert_eq!(speculate_with(&mut f, &|_| Some(SpecType::Fixnum), DOUBLE_FLOAT), 1);
+        assert_eq!(
+            speculate_with(&mut f, &|_| Some(SpecType::Fixnum), DOUBLE_FLOAT),
+            1
+        );
         let divide = raw_operation(&f, call);
         assert_eq!(divide.opcode, Opcode::FloatDiv);
-        assert!(divide.flags.guard && divide.frame_state.is_some(), "a zero divisor deopts");
+        assert!(
+            divide.flags.guard && divide.frame_state.is_some(),
+            "a zero divisor deopts"
+        );
         assert!(crate::t2::verify::verify(&f).is_ok());
         // A declared fixnum dividend joins a double divisor by contagion.
         let (mut f, call) = build_call("/", 2);
         let params = f.block(f.entry()).params.clone();
         f.refine_type(params[0], IRType::of(TypeBits::FIXNUM));
         f.refine_type(params[1], IRType::of(TypeBits::DOUBLE_FLOAT));
-        assert_eq!(speculate_with(&mut f, &|_| Some(SpecType::Fixnum), DOUBLE_FLOAT), 1);
+        assert_eq!(
+            speculate_with(&mut f, &|_| Some(SpecType::Fixnum), DOUBLE_FLOAT),
+            1
+        );
         assert_eq!(raw_operation(&f, call).opcode, Opcode::FloatDiv);
         // Two fixnums divide rationally, whatever the profile says.
         let (mut f, call) = build_call("/", 2);
         for param in f.block(f.entry()).params.clone() {
             f.refine_type(param, IRType::of(TypeBits::FIXNUM));
         }
-        assert_eq!(speculate_with(&mut f, &|_| Some(SpecType::DoubleFloat), DOUBLE_FLOAT), 0);
+        assert_eq!(
+            speculate_with(&mut f, &|_| Some(SpecType::DoubleFloat), DOUBLE_FLOAT),
+            0
+        );
         assert_eq!(f.inst(call).opcode, Opcode::Call);
     }
     // The producer deliberately declares TOP: only inference knows it returns
@@ -3009,20 +3328,24 @@ mod tests {
         use egcl_rt::value::EgclVal;
         let plus = egcl_rt::symbols::intern("+");
         let owner = egcl_rt::symbols::intern("INFERRED-NUMERIC-JOIN");
-        egcl_rt::rooted!(a = if left == TypeBits::DOUBLE_FLOAT {
-            egcl_rt::gc::alloc_double_float(1.25)
-        } else if left == TypeBits::SINGLE_FLOAT {
-            EgclVal::from_single_float(1.25)
-        } else {
-            EgclVal::from_fixnum(3)
-        });
-        egcl_rt::rooted!(b = if right == TypeBits::DOUBLE_FLOAT {
-            egcl_rt::gc::alloc_double_float(2.5)
-        } else if right == TypeBits::SINGLE_FLOAT {
-            EgclVal::from_single_float(2.5)
-        } else {
-            EgclVal::from_fixnum(7)
-        });
+        egcl_rt::rooted!(
+            a = if left == TypeBits::DOUBLE_FLOAT {
+                egcl_rt::gc::alloc_double_float(1.25)
+            } else if left == TypeBits::SINGLE_FLOAT {
+                EgclVal::from_single_float(1.25)
+            } else {
+                EgclVal::from_fixnum(3)
+            }
+        );
+        egcl_rt::rooted!(
+            b = if right == TypeBits::DOUBLE_FLOAT {
+                egcl_rt::gc::alloc_double_float(2.5)
+            } else if right == TypeBits::SINGLE_FLOAT {
+                EgclVal::from_single_float(2.5)
+            } else {
+                EgclVal::from_fixnum(7)
+            }
+        );
         let body = BytecodeFunction {
             self_call_sites: vec![],
             notinline_sites: vec![],
@@ -3035,7 +3358,10 @@ mod tests {
                 Instr::StoreLocal(1),
                 Instr::LoadLocal(1),
                 Instr::LoadLocal(1),
-                Instr::CallNamed { sym: plus, nargs: 2 },
+                Instr::CallNamed {
+                    sym: plus,
+                    nargs: 2,
+                },
                 Instr::Return,
             ],
             constants: vec![*a, *b],
@@ -3064,18 +3390,25 @@ mod tests {
         let f = crate::t2::build::build_from_snapshot(
             &snapshot,
             crate::t2::inlining::InlineOptions::default().with_root_symbol(owner),
-        ).unwrap();
+        )
+        .unwrap();
         crate::t2::verify::verify(&f).unwrap();
-        let call = f.block_order().iter()
+        let call = f
+            .block_order()
+            .iter()
             .flat_map(|&block| f.block(block).insts.iter().copied())
-            .find(|&inst| matches!(f.inst(inst).opcode, Opcode::Call | Opcode::Invoke)
-                && matches!(f.inst(inst).aux, AuxData::CallTarget(symbol) if symbol == plus))
+            .find(|&inst| {
+                matches!(f.inst(inst).opcode, Opcode::Call | Opcode::Invoke)
+                    && matches!(f.inst(inst).aux, AuxData::CallTarget(symbol) if symbol == plus)
+            })
             .expect("the builder must retain the generic arithmetic call");
         let facts = crate::t2::infer::infer(&f);
         for &operand in &f.inst(call).args {
             assert_eq!(f.value(operand).ty, IRType::TOP, "join stays undeclared");
-            assert!(matches!(f.value(operand).def, crate::t2::ir::ValueDef::Param { .. }),
-                "the arithmetic consumes a real forwarding/join parameter");
+            assert!(
+                matches!(f.value(operand).def, crate::t2::ir::ValueDef::Param { .. }),
+                "the arithmetic consumes a real forwarding/join parameter"
+            );
             assert_eq!(facts.ty(operand).bits, left.join(right));
         }
         (f, call)
@@ -3094,8 +3427,10 @@ mod tests {
             assert_eq!(f.inst(call).opcode, expected, "inferred family {family:?}");
             if family == TypeBits::DOUBLE_FLOAT {
                 assert_eq!(raw_operation(&f, call).opcode, Opcode::FloatAdd);
-                assert_eq!(f.value(raw_operation(&f, call).results[0]).repr,
-                    ValueRepresentation::UnboxedF64);
+                assert_eq!(
+                    f.value(raw_operation(&f, call).results[0]).repr,
+                    ValueRepresentation::UnboxedF64
+                );
             } else {
                 assert_eq!(f.value(f.inst(call).results[0]).ty.bits, family);
             }
@@ -3106,7 +3441,11 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn inferred_numeric_joins_do_not_reenable_a_site_without_feedback() {
-        for family in [TypeBits::FIXNUM, TypeBits::SINGLE_FLOAT, TypeBits::DOUBLE_FLOAT] {
+        for family in [
+            TypeBits::FIXNUM,
+            TypeBits::SINGLE_FLOAT,
+            TypeBits::DOUBLE_FLOAT,
+        ] {
             let (mut f, call) = numeric_join_from_bytecode(family, family);
             let before = format!("{:?}", f.inst(call));
             let state = f.inst(call).frame_state.unwrap();
@@ -3115,7 +3454,11 @@ mod tests {
             assert_eq!(speculate_with(&mut f, &|_| None, DOUBLE_FLOAT), 0);
             assert_eq!(format!("{:?}", f.inst(call)), before);
             assert_eq!(format!("{:?}", f.frame_states.get(state)), before_state);
-            assert_eq!(f.num_insts(), count, "absent/declined feedback is not a new license");
+            assert_eq!(
+                f.num_insts(),
+                count,
+                "absent/declined feedback is not a new license"
+            );
             crate::t2::verify::verify(&f).unwrap();
         }
     }
@@ -3131,8 +3474,10 @@ mod tests {
             let mut g = f.clone();
             assert_eq!(speculate_with(&mut g, &|_| Some(profile), DOUBLE_FLOAT), 1);
             assert_eq!(g.inst(call).opcode, expected);
-            assert!(g.inst(call).flags.guard && g.inst(call).frame_state.is_some(),
-                "ambiguous joins must retain the typed operation's runtime checks and recovery state");
+            assert!(
+                g.inst(call).flags.guard && g.inst(call).frame_state.is_some(),
+                "ambiguous joins must retain the typed operation's runtime checks and recovery state"
+            );
             crate::t2::verify::verify(&g).unwrap();
         }
     }

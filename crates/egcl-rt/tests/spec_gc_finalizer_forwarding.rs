@@ -14,13 +14,13 @@
 //! root is cleared before the second collection. This exercises both forwarding
 //! and death without relying on unreachable nursery garbage being promoted.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, Once, OnceLock};
 use egcl_rt::gc::{
     Collector, GcConfig, HeapCollector, WeakPointer, alloc_typed, init_heap, register_finalizer,
     register_root_scanner, register_weak_pointer, set_finalizer_dispatch, walk_heap,
 };
-use egcl_rt::value::{NIL, EgclVal};
+use egcl_rt::value::{EgclVal, NIL};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, Once, OnceLock};
 
 /// Serialize every test in this file: they all mutate the process-global heap.
 fn lock() -> &'static Mutex<()> {

@@ -8,7 +8,7 @@
 use egcl_rt::error::EgclError;
 use egcl_rt::lock_order::{LockLevel, OrderedMutex};
 use egcl_rt::object::{ConsCell, ObjectHeader, type_id};
-use egcl_rt::value::{NIL, T, TAG_HEAP_OBJECT, EgclVal};
+use egcl_rt::value::{EgclVal, NIL, T, TAG_HEAP_OBJECT};
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -271,7 +271,9 @@ fn lookup_string(val: EgclVal) -> Option<String> {
 /// Read string content, preferring the registry cache before decoding a real
 /// heap string (SIMPLE_BASE_STRING or SIMPLE_CHARACTER_STRING).
 fn component_string(val: EgclVal) -> Option<String> {
-    if crate::sequences::is_nil_sequence(val) && crate::sequences::length(val).ok() == Some(0) { return Some(String::new()); }
+    if crate::sequences::is_nil_sequence(val) && crate::sequences::length(val).ok() == Some(0) {
+        return Some(String::new());
+    }
     lookup_string(val).or_else(|| {
         if val.is_string() {
             Some(val.as_string())
@@ -1107,11 +1109,10 @@ pub fn parse_namestring(
 
     // Accept an ordinary heap string not present in the pathname registry —
     // e.g. a namestring passed through a function call or built by FORMAT.
-    let s = component_string(thing)
-        .ok_or_else(|| EgclError::TypeError {
-            datum: thing,
-            expected: "string or pathname".to_string(),
-        })?;
+    let s = component_string(thing).ok_or_else(|| EgclError::TypeError {
+        datum: thing,
+        expected: "string or pathname".to_string(),
+    })?;
     let parsed = parse_namestring_model(&s, host)?;
     let position = s.len();
     let pn = make_record_value(build_record_from_namestring(parsed, host));
@@ -2180,7 +2181,9 @@ fn pathname_from_listed_path(path: &Path) -> Result<EgclVal, EgclError> {
 /// already absolute, so no filesystem canonicalisation is involved.
 fn pathname_from_embedded(path_str: &str) -> Result<EgclVal, EgclError> {
     let parsed = parse_namestring_model(&crate::embedded_files::normalize(path_str), None)?;
-    Ok(make_record_value(build_record_from_namestring(parsed, None)))
+    Ok(make_record_value(build_record_from_namestring(
+        parsed, None,
+    )))
 }
 
 pub fn probe_file(pathname: EgclVal) -> Result<Option<EgclVal>, EgclError> {
@@ -2427,7 +2430,9 @@ fn embedded_entries_in(root: &Path) -> Result<Vec<EgclVal>, EgclError> {
             path.push('/');
         }
         let parsed = parse_namestring_model(&path, None)?;
-        result.push(make_record_value(build_record_from_namestring(parsed, None)));
+        result.push(make_record_value(build_record_from_namestring(
+            parsed, None,
+        )));
     }
     Ok(result)
 }
@@ -2544,8 +2549,7 @@ fn pn_put_opt_str(out: &mut Vec<u8>, s: &Option<String>) {
 }
 
 fn pn_put_slot(out: &mut Vec<u8>, v: EgclVal) {
-    let off_heap_string =
-        v.is_string() && !egcl_rt::gc::is_in_heap(unsafe { v.as_ptr() } as usize);
+    let off_heap_string = v.is_string() && !egcl_rt::gc::is_in_heap(unsafe { v.as_ptr() } as usize);
     if off_heap_string {
         out.push(1);
         pn_put_str(out, &v.as_string());

@@ -2,14 +2,14 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-use std::mem::offset_of;
 use egcl_compiler::t2::native_transfer::{
     SysvNativeLanding, SysvTransferCapture, emit_capture_stub, emit_helper_veneer,
     emit_native_landing_stub,
 };
 use egcl_rt::jit::JitBuffer;
 use egcl_rt::native_transfer::{self, NativeExit, NativeOutcome};
-use egcl_rt::{Collector, HeapCollector, EgclStack, EgclVal};
+use egcl_rt::{Collector, EgclStack, EgclVal, HeapCollector};
+use std::mem::offset_of;
 
 #[repr(C)]
 struct Request {

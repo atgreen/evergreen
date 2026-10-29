@@ -3,13 +3,13 @@
 
 //! Numeric primitives shared by interpreted and compiled calls (§5.2.1).
 
-use std::cmp::Ordering;
 use egcl_rt::bignum::{
     BigInt, BigRat, big_cmp, bigint_from_val, fixnum_from_i128, mag_add, mag_bitlen, mag_sub,
     ratio_parts_val, try_small_integer_right_shift,
 };
 use egcl_rt::error::EgclError;
 use egcl_rt::value::EgclVal;
+use std::cmp::Ordering;
 
 /// Compare a real number with zero without rounding exact rationals through a
 /// float. None denotes an unordered floating-point value (NaN). This path only
@@ -129,7 +129,8 @@ pub fn ash(value: EgclVal, count: EgclVal) -> Result<EgclVal, EgclError> {
     // The count's type is known before this success-only leaf. All other
     // counts, multi-limb inputs and non-fixnum results retain the generic path.
     if count.is_fixnum() && count.as_fixnum() < 0 {
-        if let Some(result) = try_small_integer_right_shift(value, count.as_fixnum().unsigned_abs()) {
+        if let Some(result) = try_small_integer_right_shift(value, count.as_fixnum().unsigned_abs())
+        {
             return Ok(result);
         }
     }

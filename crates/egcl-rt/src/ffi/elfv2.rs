@@ -84,10 +84,7 @@ struct Placement {
 /// `also_in_save_area` is set for the variadic tail: a variadic callee reads those
 /// arguments from the parameter save area, so a float must be written to its GPR or
 /// stack slot in addition to its FPR.
-fn classify(
-    arguments: &[Scalar],
-    fixed_count: Option<usize>,
-) -> Result<Vec<Placement>, EgclError> {
+fn classify(arguments: &[Scalar], fixed_count: Option<usize>) -> Result<Vec<Placement>, EgclError> {
     let mut floats = 0usize;
     let mut placements = Vec::with_capacity(arguments.len());
     for (position, scalar) in arguments.iter().enumerate() {

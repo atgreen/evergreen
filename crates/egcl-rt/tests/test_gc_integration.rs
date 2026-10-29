@@ -14,10 +14,10 @@
 //! order-independent invariants (e.g. capacity > 0, regions > 0) rather
 //! than exact equality with a specific config.
 
-use std::sync::{Mutex, OnceLock};
 use egcl_rt::gc::{WeakPointer, heap_stats, init_heap, register_finalizer, walk_heap};
 use egcl_rt::runtime::{Runtime, RuntimeConfig};
-use egcl_rt::value::{TAG_HEAP_OBJECT, EgclVal};
+use egcl_rt::value::{EgclVal, TAG_HEAP_OBJECT};
+use std::sync::{Mutex, OnceLock};
 
 /// Serialize every test that touches the process-global heap. The heap is a
 /// single OnceLock<Mutex<Option<HeapState>>>; running Runtime::init / GC /

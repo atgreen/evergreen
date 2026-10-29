@@ -57,7 +57,10 @@ fn getf_and_list_are_correct_builtins() {
         let output = command.output().expect("run egcl");
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(output.status.success(), "stress={stress}: {stdout}\n{stderr}");
+        assert!(
+            output.status.success(),
+            "stress={stress}: {stdout}\n{stderr}"
+        );
         for expected in [
             "FOUND 4",
             "MISSING NIL",

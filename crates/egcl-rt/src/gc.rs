@@ -8,10 +8,10 @@
 #[path = "gc_minor_phase.rs"]
 mod minor_phase;
 use minor_phase::{MinorPhaseLog, Phase as MinorPhase};
-#[path = "gc_root_phase.rs"]
-mod root_phase;
 #[path = "gc_root_kind.rs"]
 mod root_kind;
+#[path = "gc_root_phase.rs"]
+mod root_phase;
 pub use root_kind::{ExternalRootScanKind, external_root_scan_kind};
 
 use crate::error::EgclError;
@@ -19,9 +19,9 @@ use crate::image_relocation::ImageRelocations;
 use crate::value::EgclVal;
 
 use std::alloc::Layout;
-use std::cell::RefCell;
 #[cfg(debug_assertions)]
 use std::cell::Cell;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
@@ -1714,21 +1714,25 @@ fn old_generation_bytes(state: &HeapState) -> usize {
 /// recycling happens only during major/reset paths, which disarm tracking; a
 /// kind transition/new extent is a new token and initially reads fully dirty.
 fn older_tracking_regions(state: &HeapState) -> Vec<crate::gc_async_wp::Range> {
-    state.regions.iter().filter_map(|region| {
-        (is_old_scan_kind(region.header.kind)
-            && region.header.alloc_top as usize > region.base as usize).then_some(
-            crate::gc_async_wp::Range {
-                start: region.base as usize,
-                // Large-object heads can extend over continuation regions
-                // whose alloc_top is empty. Cover the entire used tail too.
-                end: (region.header.alloc_limit as usize).max(
-                    (region.header.alloc_top as usize).saturating_add(crate::syscall::page_size() - 1)
-                        & !(crate::syscall::page_size() - 1)
-                ),
-                kind: region.header.kind as u8,
-            }
-        )
-    }).collect()
+    state
+        .regions
+        .iter()
+        .filter_map(|region| {
+            (is_old_scan_kind(region.header.kind)
+                && region.header.alloc_top as usize > region.base as usize)
+                .then_some(crate::gc_async_wp::Range {
+                    start: region.base as usize,
+                    // Large-object heads can extend over continuation regions
+                    // whose alloc_top is empty. Cover the entire used tail too.
+                    end: (region.header.alloc_limit as usize).max(
+                        (region.header.alloc_top as usize)
+                            .saturating_add(crate::syscall::page_size() - 1)
+                            & !(crate::syscall::page_size() - 1),
+                    ),
+                    kind: region.header.kind as u8,
+                })
+        })
+        .collect()
 }
 
 #[inline]
@@ -1816,7 +1820,11 @@ impl OldGenScan {
             }
         }
         crate::gc_soft_dirty::read_dirty_pages(
-            heap.0, heap.1, &self.ranges, &older_tracking_regions(state), &mut self.dirty,
+            heap.0,
+            heap.1,
+            &self.ranges,
+            &older_tracking_regions(state),
+            &mut self.dirty,
         )
     }
 
@@ -2470,7 +2478,12 @@ impl HeapCollector {
         );
         let root_clock = root_phase::start();
         Self::scan_cl_stack_roots(|v| mark_ref(v, &mut nursery_index, &mut mark_worklist));
-        root_phase::finish(root_clock, b"minor_mark_cl_stack", state.stats.minor_gc_count + 1, 0);
+        root_phase::finish(
+            root_clock,
+            b"minor_mark_cl_stack",
+            state.stats.minor_gc_count + 1,
+            0,
+        );
         let tracing = gc_verify_enabled();
         if tracing {
             VERIFY_TRACE.with(|t| {
@@ -2487,7 +2500,12 @@ impl HeapCollector {
             }
             mark_ref(v, &mut nursery_index, &mut mark_worklist);
         });
-        root_phase::finish(root_clock, b"minor_mark_symbols", state.stats.minor_gc_count + 1, 0);
+        root_phase::finish(
+            root_clock,
+            b"minor_mark_symbols",
+            state.stats.minor_gc_count + 1,
+            0,
+        );
         scan_external_mark_roots(ExternalRootScanKind::MinorMark, |slot| {
             let v = unsafe { *slot };
             if tracing {
@@ -2503,7 +2521,8 @@ impl HeapCollector {
         for &slot_addr in &state.remembered {
             // A slot in a nursery holder is no root (see `write_barrier`); a
             // live holder is traced, a dead one must not keep its referent.
-            if slot_addr >= heap_base_addr && slot_addr + 8 <= heap_end
+            if slot_addr >= heap_base_addr
+                && slot_addr + 8 <= heap_end
                 && !slot_in_nursery(state, slot_addr)
             {
                 mark_ref(
@@ -2829,7 +2848,8 @@ impl HeapCollector {
         for slot_addr in remembered {
             // Nursery holders were not roots; a live one's copy is relocated
             // with the evacuated objects below.
-            if slot_addr < heap_base_addr || slot_addr + 8 > heap_end
+            if slot_addr < heap_base_addr
+                || slot_addr + 8 > heap_end
                 || slot_in_nursery(state, slot_addr)
             {
                 continue;
@@ -2866,7 +2886,12 @@ impl HeapCollector {
         // still intact and before the nursery is reset.
         let root_clock = root_phase::start();
         Self::relocate_cl_stack_refs(heap_base_addr, state.config.heap_size);
-        root_phase::finish(root_clock, b"minor_relocate_cl_stack", state.stats.minor_gc_count + 1, 0);
+        root_phase::finish(
+            root_clock,
+            b"minor_relocate_cl_stack",
+            state.stats.minor_gc_count + 1,
+            0,
+        );
         relocate_entry_continuation(heap_base_addr, heap_end);
         // Symbol-table roots (bliss-jtc.6 Stage C): a nursery object may be
         // reachable only from a global symbol's cell; rewrite those cells to the
@@ -2880,7 +2905,12 @@ impl HeapCollector {
                 VERIFY_TRACE.with(|t| t.borrow_mut().reloc.insert(slot as usize, (before, after)));
             }
         });
-        root_phase::finish(root_clock, b"minor_relocate_symbols", state.stats.minor_gc_count + 1, 0);
+        root_phase::finish(
+            root_clock,
+            b"minor_relocate_symbols",
+            state.stats.minor_gc_count + 1,
+            0,
+        );
         scan_external_roots_with_kind(ExternalRootScanKind::MinorRelocate, |slot| unsafe {
             let before = (*slot).0;
             relocate_slot(slot, heap_base_addr, heap_end);
@@ -3174,7 +3204,12 @@ impl HeapCollector {
         MINOR_OBJECT_MAP.with(|s| *s.borrow_mut() = std::mem::take(&mut nursery_index));
         MINOR_WORKLIST.with(|s| *s.borrow_mut() = std::mem::take(&mut mark_worklist));
         phases.mark(MinorPhase::ReclaimRearm);
-        phases.finish(state.stats.minor_gc_count, dirty_scan, phase_indexed, elapsed_us);
+        phases.finish(
+            state.stats.minor_gc_count,
+            dirty_scan,
+            phase_indexed,
+            elapsed_us,
+        );
 
         Ok(())
     }
@@ -3196,7 +3231,11 @@ impl HeapCollector {
         });
         if let Some(start) = start {
             minor_phase::log_stw(
-                self.gc_stats.minor_gc_count, start, entered, finished, result.is_ok(),
+                self.gc_stats.minor_gc_count,
+                start,
+                entered,
+                finished,
+                result.is_ok(),
             );
         }
         result
@@ -3590,12 +3629,16 @@ impl HeapCollector {
                             // per-region (a continuation carries no header at
                             // its base, so per-region liveness is meaningless
                             // there).
-                            if type_id == crate::object::type_id::FUNCTION_INTERPRETED && body_size >= 32 {
+                            if type_id == crate::object::type_id::FUNCTION_INTERPRETED
+                                && body_size >= 32
+                            {
                                 let payload = unsafe { header_ptr.add(body_offset(header_ptr)) };
                                 let name = unsafe { *(payload as *const EgclVal).add(3) };
                                 let definition = if body_size >= 56 {
-                                    let offset = core::mem::offset_of!(crate::object::FunctionData, definition_index)
-                                        - core::mem::size_of::<ObjectHeader>();
+                                    let offset = core::mem::offset_of!(
+                                        crate::object::FunctionData,
+                                        definition_index
+                                    ) - core::mem::size_of::<ObjectHeader>();
                                     let index = unsafe { *payload.add(offset).cast::<u32>() };
                                     (index != 0).then(|| EgclVal::from_symbol_index(index))
                                 } else {
@@ -3773,7 +3816,8 @@ impl HeapCollector {
                     if !evacuation_target.is_some_and(|idx| {
                         let region = &state.regions[idx];
                         (region.header.alloc_limit as usize)
-                            .saturating_sub(region.header.alloc_top as usize) >= total_size
+                            .saturating_sub(region.header.alloc_top as usize)
+                            >= total_size
                     }) {
                         // Compaction is optional; it must not spend the
                         // emergency reserve (GitHub #471). An object left
@@ -4667,7 +4711,10 @@ mod native_tlab_tests {
             .map(|_| std::thread::spawn(native_tlab_thread_offset))
             .map(|thread| thread.join().unwrap())
             .collect();
-        assert!(offsets.iter().all(|offset| *offset == expected), "{offsets:?} vs {expected:?}");
+        assert!(
+            offsets.iter().all(|offset| *offset == expected),
+            "{offsets:?} vs {expected:?}"
+        );
     }
 
     #[test]
@@ -4688,8 +4735,14 @@ mod native_tlab_tests {
             (!refilled).then_some((first, inline, next))
         });
         // Bodies follow their one-word headers, each cons 32 bytes apart.
-        assert_eq!(inline, first - OBJECT_HEADER_SIZE + layout.cons_footprint as usize);
-        assert_eq!(next, inline + layout.cons_footprint as usize + OBJECT_HEADER_SIZE);
+        assert_eq!(
+            inline,
+            first - OBJECT_HEADER_SIZE + layout.cons_footprint as usize
+        );
+        assert_eq!(
+            next,
+            inline + layout.cons_footprint as usize + OBJECT_HEADER_SIZE
+        );
         // SAFETY: the inline cons is still allocated and was not overwritten.
         assert_eq!(unsafe { *(inline as *const u64) }, layout.cons_header);
     }
@@ -4699,7 +4752,8 @@ mod native_tlab_tests {
         let layout = native_alloc_layout().unwrap();
         let counted = without_collection(|| {
             alloc_typed(16, crate::object::type_id::CONS)?;
-            let before = T0_ALLOCATOR.with(|cell| cell.borrow().as_ref().map(|(_, a)| a.pending_bytes))?;
+            let before =
+                T0_ALLOCATOR.with(|cell| cell.borrow().as_ref().map(|(_, a)| a.pending_bytes))?;
             native_cons(layout)?;
             native_cons(layout)?;
             T0_ALLOCATOR.with(|cell| {
@@ -4721,7 +4775,9 @@ mod native_tlab_tests {
             let inline = native_cons(layout)?;
             publish_current_t0_tlab_for_safepoint();
             let cursor = T0_ALLOCATOR.with(|cell| {
-                cell.borrow().as_ref().map(|(_, allocator)| allocator.tlab.cursor as usize)
+                cell.borrow()
+                    .as_ref()
+                    .map(|(_, allocator)| allocator.tlab.cursor as usize)
             })?;
             Some((inline, cursor))
         });
@@ -4729,7 +4785,11 @@ mod native_tlab_tests {
         // SAFETY: both words lie in this thread's live TLAB.
         unsafe {
             assert_eq!(*(inline as *const u64), layout.cons_header);
-            assert_eq!(ObjectHeader(*(cursor as *const u64)).type_id(), 0, "tail filler");
+            assert_eq!(
+                ObjectHeader(*(cursor as *const u64)).type_id(),
+                0,
+                "tail filler"
+            );
         }
     }
 
@@ -6599,7 +6659,9 @@ const STRESS_WINDOW_BYTES: usize = 128;
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 fn native_tlab_thread_offset() -> Option<i64> {
-    let window = NATIVE_TLAB.try_with(|window| window as *const NativeTlab as usize).ok()?;
+    let window = NATIVE_TLAB
+        .try_with(|window| window as *const NativeTlab as usize)
+        .ok()?;
     let thread_pointer: usize;
     // SAFETY: on x86-64 Linux (glibc and musl) the word at %fs:0 is the
     // thread pointer itself; reading it has no side effect.
@@ -6668,7 +6730,9 @@ fn absorb_native_tlab(allocator: &mut HeapAllocator, epoch: u64) {
 /// Hand this thread's TLAB to generated code. Disabled windows (limit zero)
 /// make every inline allocation take the runtime path.
 fn publish_native_tlab(allocator: &HeapAllocator, epoch: u64) {
-    let Some(expected) = native_alloc_offset() else { return };
+    let Some(expected) = native_alloc_offset() else {
+        return;
+    };
     let _ = NATIVE_TLAB.try_with(|window| {
         let cursor = allocator.tlab.cursor as usize;
         let mut limit = allocator.tlab.limit as usize;
@@ -7338,12 +7402,15 @@ pub fn request_major_gc() {
 /// every live reference they hold must be rooted. A minor collection consumes
 /// the request and escalates to the major one.
 pub fn collect_if_major_requested() -> Result<(), EgclError> {
-    if !MAJOR_GC_REQUESTED.load(Ordering::Acquire)
-        || std::env::var_os("EGCL_GC_DISABLE").is_some()
+    if !MAJOR_GC_REQUESTED.load(Ordering::Acquire) || std::env::var_os("EGCL_GC_DISABLE").is_some()
     {
         return Ok(());
     }
-    if heap_state().lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+    if heap_state()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_none()
+    {
         return Ok(());
     }
     HeapCollector::new().minor_gc()
@@ -7424,10 +7491,7 @@ pub fn finalizer_key(object: EgclVal) -> Result<EgclVal, EgclError> {
 /// multiple finalizers on one object.  The callback is a strong external root,
 /// while the opaque object key is intentionally weak.  Collection only queues
 /// the callback; the evaluator invokes it later, outside collector locks.
-pub fn register_deferred_finalizer(
-    object: EgclVal,
-    finalizer: EgclVal,
-) -> Result<(), EgclError> {
+pub fn register_deferred_finalizer(object: EgclVal, finalizer: EgclVal) -> Result<(), EgclError> {
     install_finalizer_root_scanner();
     finalizer_registry()
         .lock()
@@ -7713,9 +7777,7 @@ fn allocate_heap_state(config: &GcConfig) -> Result<HeapState, EgclError> {
         return Err(EgclError::Internal("heap_size exceeds heap_max".into()));
     }
     if config.nursery_size > config.heap_size {
-        return Err(EgclError::Internal(
-            "nursery_size exceeds heap_size".into(),
-        ));
+        return Err(EgclError::Internal("nursery_size exceeds heap_size".into()));
     }
     if config.region_size == 0 {
         return Err(EgclError::Internal("region_size must be non-zero".into()));
@@ -8953,9 +9015,7 @@ pub fn apply_relocations(
         return Ok(());
     }
     if reloc_data.len() < 8 {
-        return Err(EgclError::InvalidImage(
-            "relocation table too small".into(),
-        ));
+        return Err(EgclError::InvalidImage("relocation table too small".into()));
     }
 
     let count = u64::from_le_bytes(reloc_data[..8].try_into().unwrap()) as usize;
@@ -10555,7 +10615,10 @@ mod allocation_failure_message_tests {
     fn names_the_recorded_cause_once() {
         note_allocation_failure(&EgclError::Internal("safepoint handshake failed".into()));
         let message = allocation_failure_message("double-float");
-        assert!(message.starts_with("GC heap unavailable for double-float: "), "{message}");
+        assert!(
+            message.starts_with("GC heap unavailable for double-float: "),
+            "{message}"
+        );
         assert!(message.contains("safepoint handshake failed"), "{message}");
         assert_eq!(
             allocation_failure_message("double-float"),

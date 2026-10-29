@@ -150,11 +150,23 @@ fn run(force_interp: bool) -> String {
 fn bytecode_callers_see_t2_callees_exactly_as_interpreted_ones() {
     let native = run(false);
     let interpreted = run(true);
-    assert!(native.contains("TIERS 2 0"), "callees must be T2 and the caller bytecode: {native}");
-    assert!(native.contains("LEAN-TIERS 2 2 2 2"), "the new callees must be T2: {native}");
-    assert!(native.contains("STR-TIERS 2 2 2 2 2 2"), "the CHAR callers must be T2: {native}");
+    assert!(
+        native.contains("TIERS 2 0"),
+        "callees must be T2 and the caller bytecode: {native}"
+    );
+    assert!(
+        native.contains("LEAN-TIERS 2 2 2 2"),
+        "the new callees must be T2: {native}"
+    );
+    assert!(
+        native.contains("STR-TIERS 2 2 2 2 2 2"),
+        "the CHAR callers must be T2: {native}"
+    );
     let strip = |text: &str| -> String {
-        text.lines().filter(|line| !line.contains("TIERS")).collect::<Vec<_>>().join("\n")
+        text.lines()
+            .filter(|line| !line.contains("TIERS"))
+            .collect::<Vec<_>>()
+            .join("\n")
     };
     assert_eq!(strip(&native), strip(&interpreted));
     for expected in [
@@ -174,6 +186,9 @@ fn bytecode_callers_see_t2_callees_exactly_as_interpreted_ones() {
         "FIB 6765",
         "REDEF 13 42",
     ] {
-        assert!(native.contains(expected), "missing {expected:?} in {native}");
+        assert!(
+            native.contains(expected),
+            "missing {expected:?} in {native}"
+        );
     }
 }

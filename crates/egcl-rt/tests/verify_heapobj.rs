@@ -3,8 +3,8 @@
 
 // Verify whether a TAG_HEAP_OBJECT value (EgclVal → header) survives a moving GC.
 use egcl_rt::object::{ObjectHeader, type_id};
-use egcl_rt::value::{TAG_HEAP_OBJECT, TAG_MASK, EgclVal};
-use egcl_rt::{Allocator, Collector, GcConfig, EgclStack, current_thread, init_heap};
+use egcl_rt::value::{EgclVal, TAG_HEAP_OBJECT, TAG_MASK};
+use egcl_rt::{Allocator, Collector, EgclStack, GcConfig, current_thread, init_heap};
 use egcl_rt::{HeapAllocator, HeapCollector};
 
 fn cfg() -> GcConfig {

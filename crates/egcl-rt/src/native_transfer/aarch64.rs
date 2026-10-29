@@ -7,7 +7,7 @@
 //! `enter_aarch64` preserves the AAPCS64 callee-saved registers in a fixed
 //! frame. A generated body may return normally or call the cold leave helper.
 
-use super::{NativeOutcome, NativeSegment, EgclStack};
+use super::{EgclStack, NativeOutcome, NativeSegment};
 
 const _: () = {
     assert!(std::mem::offset_of!(NativeSegment, saved_sp) == 0);

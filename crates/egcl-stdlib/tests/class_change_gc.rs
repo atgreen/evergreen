@@ -37,8 +37,7 @@ fn class_change_snapshot_keeps_relocated_slot_values() {
     assert_eq!(class_of(*copy), class);
     assert_eq!(slot_value(*copy, slot).unwrap(), *value);
     assert!(
-        bigint_from_val(slot_value(*copy, slot).unwrap()).unwrap()
-            == BigInt::from_i64(i64::MAX)
+        bigint_from_val(slot_value(*copy, slot).unwrap()).unwrap() == BigInt::from_i64(i64::MAX)
     );
     assert!(!slot_boundp(*copy, unbound).unwrap());
     set_slot_value(*instance, slot, EgclVal::from_fixnum(7)).unwrap();

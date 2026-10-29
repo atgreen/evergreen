@@ -23,7 +23,10 @@ fn check_saved_values_move(native: bool) {
     registry_put(symbol, Arc::clone(&body));
     let code = if native {
         let code = try_promote_to_t1_with_speculation(symbol, false);
-        assert!(code.is_some(), "ValuesToList must admit native installation");
+        assert!(
+            code.is_some(),
+            "ValuesToList must admit native installation"
+        );
         code
     } else {
         None

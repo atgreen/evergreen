@@ -11,10 +11,10 @@
 
 #![cfg(feature = "python")]
 
-use std::sync::{Mutex, OnceLock};
 use egcl_rt::python::{self, LispHandle};
-use egcl_rt::value::{TAG_MASK, EgclVal};
+use egcl_rt::value::{EgclVal, TAG_MASK};
 use egcl_rt::{Allocator, Collector, GcConfig, HeapAllocator, HeapCollector, init_heap};
+use std::sync::{Mutex, OnceLock};
 
 /// `init_heap` is global, so these tests cannot run concurrently.
 fn lock() -> &'static Mutex<()> {

@@ -38,7 +38,11 @@ impl PublishedAdapter {
     ) -> Option<Self> {
         let code = JitBuffer::new(&entry.code)?;
         let child_return_pc = code.as_ptr() as usize + entry.child_return_offset;
-        Some(Self { code, child_return_pc, frame_bytes: entry.frame_bytes })
+        Some(Self {
+            code,
+            child_return_pc,
+            frame_bytes: entry.frame_bytes,
+        })
     }
 
     pub(in crate::cli::bytecode) fn contains_return(&self, pc: usize) -> bool {
@@ -90,8 +94,9 @@ pub(in super::super) static OBSERVE: egcl_rt::execution_local::ExecutionLocal<Ce
 /// Test observer after runtime poll work drains, while native roots remain
 /// published and before OSR preparation or generated-request refresh.
 #[cfg(test)]
-pub(in super::super) static OBSERVE_AFTER: egcl_rt::execution_local::ExecutionLocal<Cell<ObserveHook>> =
-    unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| Cell::new(None)) };
+pub(in super::super) static OBSERVE_AFTER: egcl_rt::execution_local::ExecutionLocal<
+    Cell<ObserveHook>,
+> = unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| Cell::new(None)) };
 
 #[cfg(test)]
 pub(super) fn observe_after() {
@@ -102,14 +107,24 @@ pub(super) fn observe_after() {
 
 /// Read the exact currently published poll origin without changing its state.
 #[cfg(test)]
-pub(in super::super) fn native_poll_origin_for_test() -> Option<egcl_compiler::t2::x64_calls::NativeCallOrigin> {
+pub(in super::super) fn native_poll_origin_for_test()
+-> Option<egcl_compiler::t2::x64_calls::NativeCallOrigin> {
     use egcl_compiler::t2::x64_calls::NativeCallOrigin;
     let published = unsafe { ACTIVE.with(Cell::get).as_ref() }?;
     let owner = unsafe { &*published.owner };
-    let offset = published.cursor.pc.checked_sub(owner.code.as_ptr() as usize)?;
+    let offset = published
+        .cursor
+        .pc
+        .checked_sub(owner.code.as_ptr() as usize)?;
     let origin = owner._native_calls.get(offset)?.origin;
-    matches!(origin, NativeCallOrigin::LoopPoll(_) | NativeCallOrigin::StraightPoll(_)
-        | NativeCallOrigin::BoundedLoopEntry(_) | NativeCallOrigin::BoundedLoopExit(_)).then_some(origin)
+    matches!(
+        origin,
+        NativeCallOrigin::LoopPoll(_)
+            | NativeCallOrigin::StraightPoll(_)
+            | NativeCallOrigin::BoundedLoopEntry(_)
+            | NativeCallOrigin::BoundedLoopExit(_)
+    )
+    .then_some(origin)
 }
 
 /// Locate a fixture value only at an actual published generated poll, and
@@ -119,10 +134,18 @@ pub(in super::super) fn native_poll_root_for_test(marker: i64) -> Option<*mut Eg
     use egcl_compiler::t2::x64_calls::NativeCallOrigin;
     let published = unsafe { ACTIVE.with(Cell::get).as_ref() }?;
     let owner = unsafe { &*published.owner };
-    let offset = published.cursor.pc.checked_sub(owner.code.as_ptr() as usize)?;
+    let offset = published
+        .cursor
+        .pc
+        .checked_sub(owner.code.as_ptr() as usize)?;
     let site = owner._native_calls.get(offset)?;
-    if !matches!(site.origin, NativeCallOrigin::LoopPoll(_) | NativeCallOrigin::StraightPoll(_)
-        | NativeCallOrigin::BoundedLoopEntry(_) | NativeCallOrigin::BoundedLoopExit(_)) {
+    if !matches!(
+        site.origin,
+        NativeCallOrigin::LoopPoll(_)
+            | NativeCallOrigin::StraightPoll(_)
+            | NativeCallOrigin::BoundedLoopEntry(_)
+            | NativeCallOrigin::BoundedLoopExit(_)
+    ) {
         return None;
     }
     tests::native_only_slot_for(published, marker)
@@ -192,8 +215,11 @@ thread_local! {
 fn note_bail(bail: Bail) {
     #[cfg(test)]
     {
-        assert_eq!(EXPECTED_BAIL.with(Cell::get), Some(bail),
-            "unexpected native root-walk bailout: {bail:?}");
+        assert_eq!(
+            EXPECTED_BAIL.with(Cell::get),
+            Some(bail),
+            "unexpected native root-walk bailout: {bail:?}"
+        );
         BAILS[bail as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     #[cfg(not(test))]
@@ -236,9 +262,17 @@ pub(in crate::cli::bytecode) fn take_completeness() -> (usize, usize, [usize; BA
 #[cfg(test)]
 pub(in crate::cli::bytecode) fn describe_bails(bails: [usize; BAIL_KINDS]) -> String {
     const NAMES: [&str; BAIL_KINDS] = [
-        "NullOwner", "NullSegment", "NullStack", "PcOutsideOwner",
-        "UnwindRefused", "MapUnavailable", "MapMissing", "LocationUnresolved",
-        "AdapterRecordUnowned", "AdapterOwnerMissing", "AdapterCallerUnmapped",
+        "NullOwner",
+        "NullSegment",
+        "NullStack",
+        "PcOutsideOwner",
+        "UnwindRefused",
+        "MapUnavailable",
+        "MapMissing",
+        "LocationUnresolved",
+        "AdapterRecordUnowned",
+        "AdapterOwnerMissing",
+        "AdapterCallerUnmapped",
     ];
     let mut parts = Vec::new();
     for (name, count) in NAMES.iter().zip(bails) {
@@ -246,7 +280,11 @@ pub(in crate::cli::bytecode) fn describe_bails(bails: [usize; BAIL_KINDS]) -> St
             parts.push(format!("{name}={count}"));
         }
     }
-    if parts.is_empty() { "none".into() } else { parts.join(" ") }
+    if parts.is_empty() {
+        "none".into()
+    } else {
+        parts.join(" ")
+    }
 }
 
 /// Root slots the walk actually visited, split by home kind. Only the
@@ -346,8 +384,15 @@ unsafe fn publish_with<R>(
     });
     let context = context.unwrap_or_else(|| CAPTURE.with(Cell::get));
     let segment = native_transfer::current_segment();
-    debug_assert!(!segment.is_null(), "publication needs an active native segment");
-    let saved_sp = if segment.is_null() { 0 } else { unsafe { (*segment).saved_sp } };
+    debug_assert!(
+        !segment.is_null(),
+        "publication needs an active native segment"
+    );
+    let saved_sp = if segment.is_null() {
+        0
+    } else {
+        unsafe { (*segment).saved_sp }
+    };
     // A rejected pre-prologue root entry has no compiled caller to publish.
     // Its arity helper separately roots every incoming argument and closure.
     if !segment.is_null()
@@ -355,26 +400,43 @@ unsafe fn publish_with<R>(
     {
         return body();
     }
-    assert!(!context.is_null() && !segment.is_null(), "native publication needs an active root");
+    assert!(
+        !context.is_null() && !segment.is_null(),
+        "native publication needs an active root"
+    );
     let root_owner = unsafe { (*context).owner };
-    assert!(!root_owner.is_null(), "native publication needs its root owner");
+    assert!(
+        !root_owner.is_null(),
+        "native publication needs its root owner"
+    );
     let root = unsafe { &*root_owner };
     let directory = super::super::call_table::active_ordinary_directory();
-    let retained_owner = if cursor.pc.checked_sub(root.code.as_ptr() as usize)
+    let retained_owner = if cursor
+        .pc
+        .checked_sub(root.code.as_ptr() as usize)
         .is_some_and(|offset| offset < root.code_len)
     {
         None
     } else {
-        Some(directory.code_for_pc(cursor.pc)
-            .expect("native publication PC needs a retained code owner"))
+        Some(
+            directory
+                .code_for_pc(cursor.pc)
+                .expect("native publication PC needs a retained code owner"),
+        )
     };
-    let owner = retained_owner.as_ref().map_or(root_owner, std::rc::Rc::as_ptr);
+    let owner = retained_owner
+        .as_ref()
+        .map_or(root_owner, std::rc::Rc::as_ptr);
     let code = unsafe { &*owner };
-    let offset = cursor.pc.checked_sub(code.code.as_ptr() as usize)
+    let offset = cursor
+        .pc
+        .checked_sub(code.code.as_ptr() as usize)
         .filter(|offset| *offset < code.code_len)
         .expect("native publication PC must belong to its retained owner");
-    assert!(code._native_calls.value_map(offset).is_some(),
-        "native publication PC must have an exact value map");
+    assert!(
+        code._native_calls.value_map(offset).is_some(),
+        "native publication PC must have an exact value map"
+    );
     let mut boundary = PublishedBoundary {
         owner,
         root_owner,
@@ -448,7 +510,10 @@ pub(super) unsafe fn published_mapped_resuming<R>(
     // belongs to the parent. A missing owner publishes null, which makes any
     // collection fail explicitly before it can lose the parent's native roots.
     let context = unsafe { super::nested::record_parent_context(record) };
-    debug_assert!(context.is_some(), "a live child must yield its parent's context");
+    debug_assert!(
+        context.is_some(),
+        "a live child must yield its parent's context"
+    );
     let context = context.unwrap_or(std::ptr::null_mut());
     unsafe { publish_with(mapped_cursor(record), Some(context), record as usize, body) }
 }
@@ -505,14 +570,17 @@ pub(super) unsafe fn verify_dual_homes() -> (usize, usize, usize) {
         let walk = Walk::new(published.bounds.clone(), unsafe { &*published.stack });
         let mut cursor = published.cursor;
         loop {
-            let Some(offset) =
-                cursor.pc.checked_sub(base).filter(|offset| *offset < code.code_len)
+            let Some(offset) = cursor
+                .pc
+                .checked_sub(base)
+                .filter(|offset| *offset < code.code_len)
             else {
                 break;
             };
-            let Some(step) = code._native_calls.unwind(base, &cursor, walk.bounds.clone(), |a| {
-                walk.word(a)
-            }) else {
+            let Some(step) = code
+                ._native_calls
+                .unwind(base, &cursor, walk.bounds.clone(), |a| walk.word(a))
+            else {
                 break;
             };
             if let Some(NativeCallValues::Frame(map)) = code._native_calls.value_map(offset) {
@@ -524,8 +592,12 @@ pub(super) unsafe fn verify_dual_homes() -> (usize, usize, usize) {
                         .iter()
                         .filter_map(|location| unsafe {
                             resolve_location(
-                                *location, &cursor, step.body_sp, activation,
-                                layout.activation_slots, &walk,
+                                *location,
+                                &cursor,
+                                step.body_sp,
+                                activation,
+                                layout.activation_slots,
+                                &walk,
                             )
                         })
                         .map(|slot| unsafe { slot.read() })
@@ -562,7 +634,11 @@ fn scan_published_roots(visit: &mut dyn FnMut(*mut EgclVal)) {
             return;
         }
         #[cfg(test)]
-        SCAN_VISIT_HOOK.with(|hook| { if let Some(hook) = hook.get() { hook(slot); } });
+        SCAN_VISIT_HOOK.with(|hook| {
+            if let Some(hook) = hook.get() {
+                hook(slot);
+            }
+        });
         visit(slot);
     };
     #[cfg(test)]
@@ -605,7 +681,11 @@ struct Walk<'a> {
 
 impl<'a> Walk<'a> {
     fn new(bounds: Range<usize>, stack: &'a egcl_rt::stack::EgclStack) -> Self {
-        Self { bounds, stack, frame_cursor: Cell::new(stack.fp()) }
+        Self {
+            bounds,
+            stack,
+            frame_cursor: Cell::new(stack.fp()),
+        }
     }
 
     /// Match an actual linked header before reading its declared slot count.
@@ -632,8 +712,10 @@ impl<'a> Walk<'a> {
         }
         while !frame.is_null() && frame as usize >= header {
             let current = frame as usize;
-            if current < base || current % std::mem::align_of::<Frame>() != 0
-                || current.checked_add(std::mem::size_of::<Frame>())? > top {
+            if current < base
+                || current % std::mem::align_of::<Frame>() != 0
+                || current.checked_add(std::mem::size_of::<Frame>())? > top
+            {
                 return None;
             }
             // Start at the real top and follow only its actual frame links.
@@ -655,7 +737,8 @@ impl<'a> Walk<'a> {
 
     /// A native stack word this publication actually owns.
     fn word(&self, address: usize) -> Option<usize> {
-        self.slot(address).map(|slot| unsafe { (slot as *const usize).read() })
+        self.slot(address)
+            .map(|slot| unsafe { (slot as *const usize).read() })
     }
 
     /// Address of an owned, aligned native stack word, without reading it.
@@ -682,22 +765,25 @@ unsafe fn walk_boundary(
     boundary: &PublishedBoundary,
     visit: &mut dyn FnMut(*mut EgclVal),
 ) -> usize {
-    unsafe { walk_boundary_frames(boundary, true, &mut |_, _, map, cursor, body_sp, walk| {
-        let visited = visit_frame(map, cursor, body_sp, walk, visit);
-        #[cfg(test)]
-        boundary.visited.set(boundary.visited.get() + visited);
-        visited
-    }) }
+    unsafe {
+        walk_boundary_frames(boundary, true, &mut |_, _, map, cursor, body_sp, walk| {
+            let visited = visit_frame(map, cursor, body_sp, walk, visit);
+            #[cfg(test)]
+            boundary.visited.set(boundary.visited.get() + visited);
+            visited
+        })
+    }
 }
 
 type NativeFrameVisitor<'a> = dyn FnMut(
-    &TransferCode,
-    *mut CaptureContext,
-    &NativeFrameValues,
-    &NativeFrameCursor,
-    Option<usize>,
-    &Walk<'_>,
-) -> usize + 'a;
+        &TransferCode,
+        *mut CaptureContext,
+        &NativeFrameValues,
+        &NativeFrameCursor,
+        Option<usize>,
+        &Walk<'_>,
+    ) -> usize
+    + 'a;
 
 unsafe fn walk_boundary_frames(
     boundary: &PublishedBoundary,
@@ -715,8 +801,14 @@ unsafe fn walk_boundary_frames(
         return 0;
     }
     let segment = unsafe { &*boundary.segment };
-    unsafe { walk_boundary_frames_to(boundary,
-        (segment.saved_sp, segment.return_pc()), _count_gc_walks, visit) }
+    unsafe {
+        walk_boundary_frames_to(
+            boundary,
+            (segment.saved_sp, segment.return_pc()),
+            _count_gc_walks,
+            visit,
+        )
+    }
 }
 
 unsafe fn walk_boundary_frames_to(
@@ -732,23 +824,35 @@ unsafe fn walk_boundary_frames_to(
     let mut _retained_owner = None;
     let mut context = if boundary.owner == boundary.root_owner {
         boundary.context
-    } else { std::ptr::null_mut() };
+    } else {
+        std::ptr::null_mut()
+    };
     let walk = Walk::new(boundary.bounds.clone(), unsafe { &*boundary.stack });
     let mut cursor = boundary.cursor;
     let mut total = 0;
     loop {
         let base = code.code.as_ptr() as usize;
-        let Some(offset) = cursor.pc.checked_sub(base).filter(|offset| *offset < code.code_len)
+        let Some(offset) = cursor
+            .pc
+            .checked_sub(base)
+            .filter(|offset| *offset < code.code_len)
         else {
             let root_base = root_owner.code.as_ptr() as usize;
-            if cursor.pc.checked_sub(root_base).is_some_and(|offset| offset < root_owner.code_len) {
+            if cursor
+                .pc
+                .checked_sub(root_base)
+                .is_some_and(|offset| offset < root_owner.code_len)
+            {
                 code = root_owner;
                 context = boundary.context;
                 continue;
             }
             if let Some(owner) = boundary.directory.code_for_pc(cursor.pc) {
-                if cursor.pc.checked_sub(owner.code.as_ptr() as usize)
-                    .is_none_or(|offset| offset >= owner.code_len) {
+                if cursor
+                    .pc
+                    .checked_sub(owner.code.as_ptr() as usize)
+                    .is_none_or(|offset| offset >= owner.code_len)
+                {
                     note_bail(Bail::PcOutsideOwner);
                     return total;
                 }
@@ -772,12 +876,17 @@ unsafe fn walk_boundary_frames_to(
             // Validate the whole adapter record and its caller return slot
             // before reading its initialized child owner or any saved word.
             if walk.slot(record).is_none()
-                || record.checked_add(adapter.frame_bytes).and_then(|p| walk.slot(p)).is_none() {
+                || record
+                    .checked_add(adapter.frame_bytes)
+                    .and_then(|p| walk.slot(p))
+                    .is_none()
+            {
                 note_bail(Bail::AdapterRecordUnowned);
                 return total;
             }
             let record = record as *mut egcl_compiler::t2::native_transfer::MappedCallRecord;
-            let Some(parent_context) = (unsafe { super::nested::record_parent_context(record) }) else {
+            let Some(parent_context) = (unsafe { super::nested::record_parent_context(record) })
+            else {
                 note_bail(Bail::AdapterOwnerMissing);
                 return total;
             };
@@ -807,9 +916,11 @@ unsafe fn walk_boundary_frames_to(
             }
             continue;
         };
-        let Some(step) =
-            code._native_calls
-                .unwind(base, &cursor, walk.bounds.clone(), |address| walk.word(address))
+        let Some(step) = code
+            ._native_calls
+            .unwind(base, &cursor, walk.bounds.clone(), |address| {
+                walk.word(address)
+            })
         else {
             note_bail(Bail::UnwindRefused);
             return total;
@@ -845,85 +956,142 @@ unsafe fn copy_native_backtrace(
     limit: usize,
     sink: &mut dyn FnMut(egcl_rt::debug_stack::AnchoredNativeFrame),
 ) {
-    use egcl_rt::debug_stack::{AnchoredNativeFrame, FrameOrigin, LogicalFrame, NativeBacktraceTarget};
+    use egcl_rt::debug_stack::{
+        AnchoredNativeFrame, FrameOrigin, LogicalFrame, NativeBacktraceTarget,
+    };
     let mut copy = |slot: &Cell<*mut PublishedBoundary>| {
         let mut boundary = slot.get();
         let mut seen = std::collections::HashSet::new();
         let mut copied = 0;
         while !boundary.is_null() && copied < limit {
             let published = unsafe { &*boundary };
-            assert_eq!(published.stack, stack, "native backtrace belongs to the protected execution");
-            unsafe { walk_boundary_frames(published, false, &mut |code, context, _, cursor, body_sp, walk| {
-                let ordinary = code.ordinary_entry.is_some();
-                if !ordinary && code.native_entry_kind_slot.is_none() { return 0; }
-                let context = if ordinary { published.context } else { context };
-                if copied == limit { return 0; }
-                let body_sp = body_sp.expect("live native frame has an owned body SP");
-                if !seen.insert(body_sp) { return 0; }
-                assert!(!context.is_null(), "native backtrace needs its retained context");
-                if !ordinary {
-                    assert!(std::ptr::eq((*context).owner, code), "native owner/context mismatch");
-                }
-                let word = |slot: u32| body_sp.checked_add(slot as usize * 8)
-                    .and_then(|address| walk.word(address));
-                let control_slot = code.native_control_slot.expect("native control recipe");
-                let expected_control = (*context).native_recursive.as_ref()
-                    .map(|control| std::ptr::from_ref(control) as usize)
-                    .expect("native recursive anchor control");
-                assert_eq!(word(control_slot), Some(expected_control), "native frame must belong to its exact anchor");
-                let kind = if ordinary {
-                    // A repeated code owner is not necessarily the root frame.
-                    // Only the physical caller at the segment end enriches the
-                    // managed anchor; every inner frame is a separate call.
-                    let step = code._native_calls.unwind(code.code.as_ptr() as usize,
-                        cursor, walk.bounds.clone(), |address| walk.word(address))
-                        .expect("validated ordinary unwind");
-                    let segment = &*published.segment;
-                    usize::from((step.caller.call_sp, step.caller.pc)
-                        != (segment.saved_sp, segment.return_pc()))
-                } else {
-                    word(code.native_entry_kind_slot.unwrap()).expect("owned native entry-kind word")
-                };
-                assert!(kind <= 1, "known native entry kind");
-                let anchor = (*context).frame;
-                let activation = anchor.add(1).cast::<EgclVal>();
-                assert_eq!(walk.activation(activation, 0), Some(activation),
-                    "native children must attach to a real live managed anchor");
-                // Keep the existing all-or-unavailable original-argument policy.
-                // Native homes are immutable entry copies, not current locals.
-                let arguments = native_debug::arguments(&code.body, false)
-                    .filter(|recipe| recipe.parameters.iter().all(|(_, slot)| slot.is_some()))
-                    .and_then(|recipe| {
-                        if recipe.parameters.len() != usize::from(code.native_argument_count) {
-                            return None;
+            assert_eq!(
+                published.stack, stack,
+                "native backtrace belongs to the protected execution"
+            );
+            unsafe {
+                walk_boundary_frames(
+                    published,
+                    false,
+                    &mut |code, context, _, cursor, body_sp, walk| {
+                        let ordinary = code.ordinary_entry.is_some();
+                        if !ordinary && code.native_entry_kind_slot.is_none() {
+                            return 0;
                         }
-                        if code.native_argument_count == 0 { return Some(Vec::new()); }
-                        let base = code.native_argument_base?;
-                        (0..u32::from(code.native_argument_count))
-                            .map(|index| word(base.checked_add(index)?).map(|bits| EgclVal(bits as u64)))
-                            .collect::<Option<Vec<_>>>()
-                    });
-                sink(AnchoredNativeFrame {
-                    managed_anchor: anchor as usize,
-                    enrich_anchor: kind == 0,
-                    frame: LogicalFrame {
-                        function: Some(code.body.name.clone()),
-                        origin: FrameOrigin::Native,
-                        arguments,
+                        let context = if ordinary { published.context } else { context };
+                        if copied == limit {
+                            return 0;
+                        }
+                        let body_sp = body_sp.expect("live native frame has an owned body SP");
+                        if !seen.insert(body_sp) {
+                            return 0;
+                        }
+                        assert!(
+                            !context.is_null(),
+                            "native backtrace needs its retained context"
+                        );
+                        if !ordinary {
+                            assert!(
+                                std::ptr::eq((*context).owner, code),
+                                "native owner/context mismatch"
+                            );
+                        }
+                        let word = |slot: u32| {
+                            body_sp
+                                .checked_add(slot as usize * 8)
+                                .and_then(|address| walk.word(address))
+                        };
+                        let control_slot = code.native_control_slot.expect("native control recipe");
+                        let expected_control = (*context)
+                            .native_recursive
+                            .as_ref()
+                            .map(|control| std::ptr::from_ref(control) as usize)
+                            .expect("native recursive anchor control");
+                        assert_eq!(
+                            word(control_slot),
+                            Some(expected_control),
+                            "native frame must belong to its exact anchor"
+                        );
+                        let kind = if ordinary {
+                            // A repeated code owner is not necessarily the root frame.
+                            // Only the physical caller at the segment end enriches the
+                            // managed anchor; every inner frame is a separate call.
+                            let step = code
+                                ._native_calls
+                                .unwind(
+                                    code.code.as_ptr() as usize,
+                                    cursor,
+                                    walk.bounds.clone(),
+                                    |address| walk.word(address),
+                                )
+                                .expect("validated ordinary unwind");
+                            let segment = &*published.segment;
+                            usize::from(
+                                (step.caller.call_sp, step.caller.pc)
+                                    != (segment.saved_sp, segment.return_pc()),
+                            )
+                        } else {
+                            word(code.native_entry_kind_slot.unwrap())
+                                .expect("owned native entry-kind word")
+                        };
+                        assert!(kind <= 1, "known native entry kind");
+                        let anchor = (*context).frame;
+                        let activation = anchor.add(1).cast::<EgclVal>();
+                        assert_eq!(
+                            walk.activation(activation, 0),
+                            Some(activation),
+                            "native children must attach to a real live managed anchor"
+                        );
+                        // Keep the existing all-or-unavailable original-argument policy.
+                        // Native homes are immutable entry copies, not current locals.
+                        let arguments = native_debug::arguments(&code.body, false)
+                            .filter(|recipe| {
+                                recipe.parameters.iter().all(|(_, slot)| slot.is_some())
+                            })
+                            .and_then(|recipe| {
+                                if recipe.parameters.len()
+                                    != usize::from(code.native_argument_count)
+                                {
+                                    return None;
+                                }
+                                if code.native_argument_count == 0 {
+                                    return Some(Vec::new());
+                                }
+                                let base = code.native_argument_base?;
+                                (0..u32::from(code.native_argument_count))
+                                    .map(|index| {
+                                        word(base.checked_add(index)?)
+                                            .map(|bits| EgclVal(bits as u64))
+                                    })
+                                    .collect::<Option<Vec<_>>>()
+                            });
+                        sink(AnchoredNativeFrame {
+                            managed_anchor: anchor as usize,
+                            enrich_anchor: kind == 0,
+                            frame: LogicalFrame {
+                                function: Some(code.body.name.clone()),
+                                origin: FrameOrigin::Native,
+                                arguments,
+                            },
+                        });
+                        copied += 1;
+                        0
                     },
-                });
-                copied += 1;
-                0
-            }); }
+                );
+            }
             boundary = published.previous;
         }
     };
     match target {
-        NativeBacktraceTarget::Current => { ACTIVE.try_with(&mut copy); }
+        NativeBacktraceTarget::Current => {
+            ACTIVE.try_with(&mut copy);
+        }
         NativeBacktraceTarget::StoppedFiber(id) => {
             // SAFETY: debug_stack's provider contract requires the fiber owner
             // and its mount/state exclusion throughout this uninterrupted copy.
-            unsafe { ACTIVE.try_with_stopped_fiber(id, &mut copy); }
+            unsafe {
+                ACTIVE.try_with_stopped_fiber(id, &mut copy);
+            }
         }
     }
 }
@@ -963,7 +1131,9 @@ unsafe fn resolve_location(
             .and_then(|index| cursor.registers[index])
             .and_then(|address| walk.slot(address))
             .map(|address| address as *mut EgclVal),
-        NativeValueLocation::Constant(_) | NativeValueLocation::RawConstant(_) | NativeValueLocation::Unavailable => None,
+        NativeValueLocation::Constant(_)
+        | NativeValueLocation::RawConstant(_)
+        | NativeValueLocation::Unavailable => None,
     }
 }
 
@@ -976,11 +1146,12 @@ unsafe fn frame_activation(
 ) -> Option<*mut EgclVal> {
     let layout = map.layout();
     match (layout.activation_base_slot, body_sp) {
-        (Some(slot), Some(body_sp)) => walk
-            .word(body_sp.checked_add(slot as usize * 8)?)
-            .and_then(|activation| {
-                walk.activation(activation as *mut EgclVal, layout.activation_slots)
-            }),
+        (Some(slot), Some(body_sp)) => {
+            walk.word(body_sp.checked_add(slot as usize * 8)?)
+                .and_then(|activation| {
+                    walk.activation(activation as *mut EgclVal, layout.activation_slots)
+                })
+        }
         _ => None,
     }
 }
@@ -994,8 +1165,9 @@ unsafe fn visit_frame(
 ) -> usize {
     #[cfg(debug_assertions)]
     if egcl_rt::gc::marking_external_roots() {
-        let compared = verify_frame_aliases(map, cursor, body_sp, walk)
-            .unwrap_or_else(|error| panic!("native root aliases at PC {:#x}: {error:?}", cursor.pc));
+        let compared = verify_frame_aliases(map, cursor, body_sp, walk).unwrap_or_else(|error| {
+            panic!("native root aliases at PC {:#x}: {error:?}", cursor.pc)
+        });
         #[cfg(test)]
         VERIFIED_ALIASES.fetch_add(compared, std::sync::atomic::Ordering::Relaxed);
         #[cfg(not(test))]
@@ -1006,10 +1178,22 @@ unsafe fn visit_frame(
     let mut visited = 0;
     for &location in map.gc_locations() {
         let resolved = unsafe {
-            resolve_location(location, cursor, body_sp, activation, layout.activation_slots, walk)
+            resolve_location(
+                location,
+                cursor,
+                body_sp,
+                activation,
+                layout.activation_slots,
+                walk,
+            )
         };
         #[cfg(test)]
-        if !matches!(location, NativeValueLocation::Constant(_) | NativeValueLocation::RawConstant(_) | NativeValueLocation::Unavailable) {
+        if !matches!(
+            location,
+            NativeValueLocation::Constant(_)
+                | NativeValueLocation::RawConstant(_)
+                | NativeValueLocation::Unavailable
+        ) {
             use std::sync::atomic::Ordering::Relaxed;
             EXPECTED.fetch_add(1, Relaxed);
             if resolved.is_some() {
@@ -1017,7 +1201,12 @@ unsafe fn visit_frame(
             }
         }
         let Some(slot) = resolved else {
-            if !matches!(location, NativeValueLocation::Constant(_) | NativeValueLocation::RawConstant(_) | NativeValueLocation::Unavailable) {
+            if !matches!(
+                location,
+                NativeValueLocation::Constant(_)
+                    | NativeValueLocation::RawConstant(_)
+                    | NativeValueLocation::Unavailable
+            ) {
                 note_bail(Bail::LocationUnresolved);
             }
             continue;
@@ -1034,8 +1223,11 @@ unsafe fn visit_frame(
             .fetch_add(1, Relaxed);
         }
         #[cfg(test)]
-        if matches!(location, NativeValueLocation::Stack(_) | NativeValueLocation::Register(_))
-            && OMIT_NATIVE_ROOT_BITS.with(Cell::get) == unsafe { slot.read() }.to_raw() {
+        if matches!(
+            location,
+            NativeValueLocation::Stack(_) | NativeValueLocation::Register(_)
+        ) && OMIT_NATIVE_ROOT_BITS.with(Cell::get) == unsafe { slot.read() }.to_raw()
+        {
             continue;
         }
         visited += 1;
@@ -1056,17 +1248,32 @@ fn verify_frame_aliases(
 ) -> Result<usize, String> {
     let activation = unsafe { frame_activation(map, body_sp, walk) };
     let mut compared = 0;
-    for value in map.values().iter().filter(|value| value.may_reference_heap()) {
+    for value in map
+        .values()
+        .iter()
+        .filter(|value| value.may_reference_heap())
+    {
         let mut first = None;
         for &location in value.locations() {
-            let slot = unsafe { resolve_location(location, cursor, body_sp, activation,
-                map.layout().activation_slots, walk) }
-                .ok_or_else(|| format!("unresolved {:?} at {location:?}", value.value))?;
+            let slot = unsafe {
+                resolve_location(
+                    location,
+                    cursor,
+                    body_sp,
+                    activation,
+                    map.layout().activation_slots,
+                    walk,
+                )
+            }
+            .ok_or_else(|| format!("unresolved {:?} at {location:?}", value.value))?;
             let bits = unsafe { slot.read() };
             if let Some((original_slot, original)) = first {
                 if original != bits {
-                    return Err(format!("{:?}: {original_slot:p} holds {original:?}, \
-                        {slot:p} ({location:?}) holds {bits:?}", value.value));
+                    return Err(format!(
+                        "{:?}: {original_slot:p} holds {original:?}, \
+                        {slot:p} ({location:?}) holds {bits:?}",
+                        value.value
+                    ));
                 }
                 compared += 1;
             } else {
@@ -1094,7 +1301,8 @@ mod tests {
     #[should_panic(expected = "unexpected native root-walk bailout")]
     fn unexpected_walk_bailout_fails_the_test() {
         let _lock = crate::cli::heap_test_lock()
-            .lock().unwrap_or_else(|e| e.into_inner());
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         note_bail(Bail::PcOutsideOwner);
     }
 
@@ -1102,17 +1310,22 @@ mod tests {
     #[should_panic(expected = "unexpected native root-walk bailout")]
     fn expected_bailout_does_not_allow_another_failure_reason() {
         let _lock = crate::cli::heap_test_lock()
-            .lock().unwrap_or_else(|e| e.into_inner());
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         with_expected_bail(Bail::NullOwner, || note_bail(Bail::PcOutsideOwner));
     }
 
     #[test]
     fn expected_bailout_permission_ends_when_the_fixture_unwinds() {
         let _lock = crate::cli::heap_test_lock()
-            .lock().unwrap_or_else(|e| e.into_inner());
-        assert!(std::panic::catch_unwind(|| {
-            with_expected_bail(Bail::NullOwner, || panic!("leave malformed fixture"));
-        }).is_err());
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(
+            std::panic::catch_unwind(|| {
+                with_expected_bail(Bail::NullOwner, || panic!("leave malformed fixture"));
+            })
+            .is_err()
+        );
         assert!(std::panic::catch_unwind(|| note_bail(Bail::NullOwner)).is_err());
     }
 
@@ -1155,38 +1368,67 @@ mod tests {
     }
 
     fn observe() {
-        assert_eq!(crate::cli::bytecode::call_table::ordinary_segment_depth_for_test(), 1);
+        assert_eq!(
+            crate::cli::bytecode::call_table::ordinary_segment_depth_for_test(),
+            1
+        );
         let probe = probe();
         let publication = ACTIVE.with(Cell::get);
-        assert!(!publication.is_null(), "publish before the helper can collect");
+        assert!(
+            !publication.is_null(),
+            "publish before the helper can collect"
+        );
         let published = unsafe { &*publication };
         let code = unsafe { &*published.owner };
         let offset = published.cursor.pc - code.code.as_ptr() as usize;
-        let step = code._native_calls.unwind(code.code.as_ptr() as usize,
-            &published.cursor, published.bounds.clone(), read_stack_word).unwrap();
-        assert_eq!(step.caller.call_sp, unsafe { (*published.segment).saved_sp });
+        let step = code
+            ._native_calls
+            .unwind(
+                code.code.as_ptr() as usize,
+                &published.cursor,
+                published.bounds.clone(),
+                read_stack_word,
+            )
+            .unwrap();
+        assert_eq!(step.caller.call_sp, unsafe {
+            (*published.segment).saved_sp
+        });
         assert_eq!(step.caller.pc, unsafe { (*published.segment).return_pc() });
         probe.calls += 1;
         if probe.calls == 1 {
-            assert!(matches!(code._native_calls.value_map(offset),
-                Some(egcl_compiler::t2::x64_calls::NativeCallValues::Frame(_))));
+            assert!(matches!(
+                code._native_calls.value_map(offset),
+                Some(egcl_compiler::t2::x64_calls::NativeCallValues::Frame(_))
+            ));
             // Rust reenters another generated segment while this publication
             // remains live. The inner poll must link to this physical caller.
             let previous_observer = OBSERVE.with(|slot| slot.replace(Some(observe_inner)));
             let value = unsafe { (&*probe.code).run(&*probe.args, &mut *probe.env) }.unwrap();
             OBSERVE.with(|slot| slot.set(previous_observer));
             assert_eq!(value, unsafe { (&*probe.args)[0] });
-            assert_eq!(ACTIVE.with(Cell::get), publication, "restore outer publication after reentry");
-            assert_eq!(crate::cli::bytecode::call_table::ordinary_segment_depth_for_test(), 1);
+            assert_eq!(
+                ACTIVE.with(Cell::get),
+                publication,
+                "restore outer publication after reentry"
+            );
+            assert_eq!(
+                crate::cli::bytecode::call_table::ordinary_segment_depth_for_test(),
+                1
+            );
         }
     }
 
     fn observe_inner() {
-        assert_eq!(crate::cli::bytecode::call_table::ordinary_segment_depth_for_test(), 2);
+        assert_eq!(
+            crate::cli::bytecode::call_table::ordinary_segment_depth_for_test(),
+            2
+        );
         let current = ACTIVE.with(Cell::get);
         let publication = unsafe { &*current };
         assert!(!publication.previous.is_null());
-        assert_ne!(publication.segment, unsafe { (*publication.previous).segment });
+        assert_ne!(publication.segment, unsafe {
+            (*publication.previous).segment
+        });
         let probe = probe();
         let before = unsafe { (&*probe.args)[0] };
         // Oracle on the walk's address arithmetic: a value's shadow slot and
@@ -1200,17 +1442,34 @@ mod tests {
         let Some(NativeCallValues::Frame(map)) = code._native_calls.value_map(offset) else {
             panic!("inner poll needs a frame map");
         };
-        let step = code._native_calls.unwind(code.code.as_ptr() as usize,
-            &publication.cursor, publication.bounds.clone(), read_stack_word).unwrap();
+        let step = code
+            ._native_calls
+            .unwind(
+                code.code.as_ptr() as usize,
+                &publication.cursor,
+                publication.bounds.clone(),
+                read_stack_word,
+            )
+            .unwrap();
         let walk = Walk::new(publication.bounds.clone(), unsafe { &*publication.stack });
         verify_frame_aliases(map, &publication.cursor, step.body_sp, &walk).unwrap();
-        let native = map.gc_locations().find_map(|location| match location {
-            NativeValueLocation::Stack(_) | NativeValueLocation::Register(_) =>
-                unsafe { resolve_location(*location, &publication.cursor, step.body_sp,
-                    frame_activation(map, step.body_sp, &walk), map.layout().activation_slots, &walk) }
-                    .filter(|slot| unsafe { **slot == before }),
-            _ => None,
-        }).expect("a real native home");
+        let native = map
+            .gc_locations()
+            .find_map(|location| match location {
+                NativeValueLocation::Stack(_) | NativeValueLocation::Register(_) => unsafe {
+                    resolve_location(
+                        *location,
+                        &publication.cursor,
+                        step.body_sp,
+                        frame_activation(map, step.body_sp, &walk),
+                        map.layout().activation_slots,
+                        &walk,
+                    )
+                }
+                .filter(|slot| unsafe { **slot == before }),
+                _ => None,
+            })
+            .expect("a real native home");
         take_visits_by_kind();
         take_completeness();
         force_minor_gc();
@@ -1218,18 +1477,34 @@ mod tests {
         // Every location the maps declared addressable must have been reached.
         // A shortfall could discard the only copy of a live native root.
         let (expected, resolved, bails) = take_completeness();
-        eprintln!("  completeness: expected={expected} resolved={resolved} bails=[{}]",
-                  describe_bails(bails));
-        assert!(expected > 0, "the collection must reach addressable locations");
-        assert_eq!(expected, resolved,
-                   "the walk failed to resolve a location its own map declared addressable");
-        assert_eq!(bails.iter().sum::<usize>(), 0,
-                   "the walk bailed: [{}]", describe_bails(bails));
+        eprintln!(
+            "  completeness: expected={expected} resolved={resolved} bails=[{}]",
+            describe_bails(bails)
+        );
+        assert!(
+            expected > 0,
+            "the collection must reach addressable locations"
+        );
+        assert_eq!(
+            expected, resolved,
+            "the walk failed to resolve a location its own map declared addressable"
+        );
+        assert_eq!(
+            bails.iter().sum::<usize>(),
+            0,
+            "the walk bailed: [{}]",
+            describe_bails(bails)
+        );
 
-        assert!(verify_frame_aliases(map, &publication.cursor, step.body_sp, &walk).is_ok(),
-            "relocate native homes and shadows alike");
-        assert_eq!(unsafe { native.read() }, unsafe { (&*probe.args)[0] },
-            "the native home must contain the relocated input");
+        assert!(
+            verify_frame_aliases(map, &publication.cursor, step.body_sp, &walk).is_ok(),
+            "relocate native homes and shadows alike"
+        );
+        assert_eq!(
+            unsafe { native.read() },
+            unsafe { (&*probe.args)[0] },
+            "the native home must contain the relocated input"
+        );
         probe.visited += chain_visited(current);
         probe.native_visits += stack + register;
         eprintln!(
@@ -1242,28 +1517,59 @@ mod tests {
     #[test]
     fn native_helper_publication_survives_rust_lisp_reentry_and_gc() {
         let _lock = crate::cli::heap_test_lock()
-            .lock().unwrap_or_else(|e| e.into_inner());
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut env = Env::new(false);
         egcl_rt::rooted_ref!(_env = &mut env);
         egcl_rt::rooted!(params = reader::read_from_string("(x)").unwrap().0);
-        egcl_rt::rooted!(forms = reader::read_from_string(
-            "((let ((n 0)) (tagbody again (setq n (+ n 1)) (if (< n 3) (go again))) x))"
-        ).unwrap().0);
-        let body = Arc::new(compile_function("PUBLICATION-REENTRY", *params, *forms, &env, false, false).unwrap());
+        egcl_rt::rooted!(
+            forms = reader::read_from_string(
+                "((let ((n 0)) (tagbody again (setq n (+ n 1)) (if (< n 3) (go again))) x))"
+            )
+            .unwrap()
+            .0
+        );
+        let body = Arc::new(
+            compile_function("PUBLICATION-REENTRY", *params, *forms, &env, false, false).unwrap(),
+        );
         let code = TransferCode::compile(body).unwrap();
         egcl_rt::rooted!(args = vec![crate::cli::arena_cons(T, NIL)]);
-        let mut probe = Probe { code: &code, env: &mut env, args: &*args, calls: 0, moved: false, visited: 0, native_visits: 0, frames: 0 };
+        let mut probe = Probe {
+            code: &code,
+            env: &mut env,
+            args: &*args,
+            calls: 0,
+            moved: false,
+            visited: 0,
+            native_visits: 0,
+            frames: 0,
+        };
         PROBE.with(|slot| slot.set(&mut probe));
         assert!(ACTIVE.with(Cell::get).is_null());
         OBSERVE.with(|slot| slot.set(Some(observe)));
         let value = code.run(&args, &mut env).unwrap();
         OBSERVE.with(|slot| slot.set(None));
         PROBE.with(|slot| slot.set(std::ptr::null_mut()));
-        assert!(ACTIVE.with(Cell::get).is_null(), "retire publication before machine storage disappears");
-        assert_eq!(crate::cli::bytecode::call_table::ordinary_segment_depth_for_test(), 0);
-        assert!(probe.calls > 0, "the compiled loop must enter a published poll");
-        assert!(probe.moved, "the nested collection must relocate a live input");
-        assert!(probe.visited > 0, "the collection must reach roots through the published chain");
+        assert!(
+            ACTIVE.with(Cell::get).is_null(),
+            "retire publication before machine storage disappears"
+        );
+        assert_eq!(
+            crate::cli::bytecode::call_table::ordinary_segment_depth_for_test(),
+            0
+        );
+        assert!(
+            probe.calls > 0,
+            "the compiled loop must enter a published poll"
+        );
+        assert!(
+            probe.moved,
+            "the nested collection must relocate a live input"
+        );
+        assert!(
+            probe.visited > 0,
+            "the collection must reach roots through the published chain"
+        );
         assert!(
             probe.native_visits > 0,
             "the walk must relocate through at least one native stack slot or register save \
@@ -1276,17 +1582,24 @@ mod tests {
     #[test]
     fn ordinary_segment_lease_retires_after_native_error() {
         let _lock = crate::cli::heap_test_lock()
-            .lock().unwrap_or_else(|e| e.into_inner());
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut env = Env::new(false);
         egcl_rt::rooted_ref!(_env = &mut env);
-        egcl_rt::rooted!(forms = reader::read_from_string(
-            "((error \"ordinary segment retirement\"))"
-        ).unwrap().0);
-        let body = Arc::new(compile_function("ORDINARY-SEGMENT-ERROR", NIL, *forms,
-            &env, false, false).unwrap());
+        egcl_rt::rooted!(
+            forms = reader::read_from_string("((error \"ordinary segment retirement\"))")
+                .unwrap()
+                .0
+        );
+        let body = Arc::new(
+            compile_function("ORDINARY-SEGMENT-ERROR", NIL, *forms, &env, false, false).unwrap(),
+        );
         let code = TransferCode::compile(body).expect("native error fixture must be admitted");
         assert!(code.run(&[], &mut env).is_err());
-        assert_eq!(crate::cli::bytecode::call_table::ordinary_segment_depth_for_test(), 0);
+        assert_eq!(
+            crate::cli::bytecode::call_table::ordinary_segment_depth_for_test(),
+            0
+        );
     }
 
     struct NativeOnlyProbe {
@@ -1308,25 +1621,41 @@ mod tests {
         let mut boundary = published as *const PublishedBoundary;
         while !boundary.is_null() {
             let current = unsafe { &*boundary };
-            unsafe { walk_boundary(current, &mut |slot| {
-                if !current.bounds.contains(&(slot as usize)) { return; }
-                let value = slot.read();
-                if value.is_cons() && crate::cli::cp(value) == (EgclVal::from_fixnum(marker), NIL) {
-                    native = Some(slot);
-                }
-            }); }
+            unsafe {
+                walk_boundary(current, &mut |slot| {
+                    if !current.bounds.contains(&(slot as usize)) {
+                        return;
+                    }
+                    let value = slot.read();
+                    if value.is_cons()
+                        && crate::cli::cp(value) == (EgclVal::from_fixnum(marker), NIL)
+                    {
+                        native = Some(slot);
+                    }
+                });
+            }
             boundary = current.previous;
         }
         let native = native?;
         let before = unsafe { native.read() }.to_raw();
         let mut managed_copies = 0;
-        unsafe { egcl_rt::stack::visit_stack_refs((*published.stack).fp(), |value| {
-            managed_copies += usize::from(value.to_raw() == before);
-        }); }
-        assert_eq!(managed_copies, 0, "the target must have no scanned activation copy");
+        unsafe {
+            egcl_rt::stack::visit_stack_refs((*published.stack).fp(), |value| {
+                managed_copies += usize::from(value.to_raw() == before);
+            });
+        }
+        assert_eq!(
+            managed_copies, 0,
+            "the target must have no scanned activation copy"
+        );
         let env = NATIVE_ENV.with(Cell::get);
-        assert!(!unsafe { &*env }.mv.iter().any(|value| value.to_raw() == before),
-            "the current native environment must not retain the target");
+        assert!(
+            !unsafe { &*env }
+                .mv
+                .iter()
+                .any(|value| value.to_raw() == before),
+            "the current native environment must not retain the target"
+        );
         Some(native)
     }
 
@@ -1336,17 +1665,28 @@ mod tests {
 
     fn observe_native_only() {
         let probe = unsafe { &mut *NATIVE_ONLY_PROBE.with(Cell::get) };
-        if probe.observed { return; }
+        if probe.observed {
+            return;
+        }
         let published = unsafe { &*ACTIVE.with(Cell::get) };
-        let Some(native) = native_only_slot(published) else { return };
+        let Some(native) = native_only_slot(published) else {
+            return;
+        };
         // Keep only diagnostic bits in Rust. The fixture's fresh cons is never
         // an argument, literal, or rooted host local.
         let before = unsafe { native.read() }.to_raw();
-        assert!(!unsafe { &*probe.env }.mv.iter().any(|value| value.to_raw() == before),
-            "the target must not survive through multiple-value state");
+        assert!(
+            !unsafe { &*probe.env }
+                .mv
+                .iter()
+                .any(|value| value.to_raw() == before),
+            "the target must not survive through multiple-value state"
+        );
         probe.observed = true;
         let omit = std::env::var_os("EGCL_TEST_OMIT_NATIVE_ONLY_ROOT").is_some();
-        if omit { OMIT_NATIVE_ROOT_BITS.with(|slot| slot.set(before)); }
+        if omit {
+            OMIT_NATIVE_ROOT_BITS.with(|slot| slot.set(before));
+        }
         force_minor_gc();
         OMIT_NATIVE_ROOT_BITS.with(|slot| slot.set(0));
         probe.moved = unsafe { native.read() }.to_raw() != before;
@@ -1355,28 +1695,41 @@ mod tests {
     #[test]
     fn native_only_value_moves_at_a_published_poll() {
         let _lock = crate::cli::heap_test_lock()
-            .lock().unwrap_or_else(|e| e.into_inner());
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut env = Env::new(false);
         egcl_rt::rooted_ref!(_env = &mut env);
-        egcl_rt::rooted!(forms = reader::read_from_string(
-            "((let ((x (cons 314159 nil)))
+        egcl_rt::rooted!(
+            forms = reader::read_from_string(
+                "((let ((x (cons 314159 nil)))
                 (values nil)
                 (let ((n 0)) (tagbody again (setq n (+ n 1)) (if (< n 2) (go again))))
                 x))"
-        ).unwrap().0);
-        let body = Arc::new(compile_function("PUBLICATION-NATIVE-ONLY", NIL, *forms,
-            &env, false, false).unwrap());
+            )
+            .unwrap()
+            .0
+        );
+        let body = Arc::new(
+            compile_function("PUBLICATION-NATIVE-ONLY", NIL, *forms, &env, false, false).unwrap(),
+        );
         let code = TransferCode::compile(body).expect("native-only fixture must be admitted");
         code.run(&[], &mut env).unwrap();
         env.mv.clear();
         force_minor_gc();
-        let mut probe = NativeOnlyProbe { env: &mut env, observed: false, moved: false };
+        let mut probe = NativeOnlyProbe {
+            env: &mut env,
+            observed: false,
+            moved: false,
+        };
         NATIVE_ONLY_PROBE.with(|slot| slot.set(&mut probe));
         OBSERVE.with(|slot| slot.set(Some(observe_native_only)));
         let value = code.run(&[], &mut env).unwrap();
         OBSERVE.with(|slot| slot.set(None));
         NATIVE_ONLY_PROBE.with(|slot| slot.set(std::ptr::null_mut()));
-        assert!(probe.observed, "the poll must expose the fresh cons in a native-only home");
+        assert!(
+            probe.observed,
+            "the poll must expose the fresh cons in a native-only home"
+        );
         assert!(probe.moved, "native-only root must move");
         assert_eq!(crate::cli::cp(value), (EgclVal::from_fixnum(314159), NIL));
     }
@@ -1391,16 +1744,24 @@ mod tests {
                 "--nocapture"])
             .env("EGCL_TEST_OMIT_NATIVE_ONLY_ROOT", "1")
             .output().unwrap();
-        assert!(!output.status.success(), "omitting the sole roots must fail");
+        assert!(
+            !output.status.success(),
+            "omitting the sole roots must fail"
+        );
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains("native-only root must move"), "{stderr}");
-        assert_eq!(output.status.code(), Some(101), "must fail the movement assertion: {stderr}");
+        assert_eq!(
+            output.status.code(),
+            Some(101),
+            "must fail the movement assertion: {stderr}"
+        );
     }
 
     #[test]
     fn native_only_caller_value_moves_across_a_mapped_child() {
         let _lock = crate::cli::heap_test_lock()
-            .lock().unwrap_or_else(|e| e.into_inner());
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Since #420 the caller reaches this child on the ordinary ABI; this
         // fixture covers the mapped adapter, so it must take it (bliss-lzdkm).
         let _mapped = crate::cli::bytecode::native_transfer_entry::MappedOnlyForTest::new();
@@ -1410,44 +1771,96 @@ mod tests {
             (tagbody again (setq n (+ n 1)) (if (< n 2) (go again)))))";
         let child_forms = "((publication-native-loop)
             (if (eq fail t) (publication-native-throw) (if fail (+ fail 1) nil)))";
-        crate::cli::read_eval_all_env(&format!(
-            "(defun publication-native-loop () {})
+        crate::cli::read_eval_all_env(
+            &format!(
+                "(defun publication-native-loop () {})
              (defun publication-native-throw () (throw :outer nil))
              (defun publication-native-child (fail) {})",
-            &loop_forms[1..loop_forms.len()-1], &child_forms[1..child_forms.len()-1]),
-            &mut env).unwrap();
+                &loop_forms[1..loop_forms.len() - 1],
+                &child_forms[1..child_forms.len() - 1]
+            ),
+            &mut env,
+        )
+        .unwrap();
         egcl_rt::rooted!(forms = reader::read_from_string(loop_forms).unwrap().0);
-        let body = Arc::new(compile_function("PUBLICATION-NATIVE-LOOP", NIL, *forms,
-            &env, false, false).unwrap());
-        let symbol = crate::cli::resolve_sym("PUBLICATION-NATIVE-LOOP").unwrap().as_symbol_index();
+        let body = Arc::new(
+            compile_function("PUBLICATION-NATIVE-LOOP", NIL, *forms, &env, false, false).unwrap(),
+        );
+        let symbol = crate::cli::resolve_sym("PUBLICATION-NATIVE-LOOP")
+            .unwrap()
+            .as_symbol_index();
         registry_put(symbol, Arc::clone(&body));
         let installed_loop = install_baseline(symbol, body).expect("install collecting loop");
-        publish_native(symbol, egcl_rt::symbols::symbol_function(symbol), &installed_loop);
+        publish_native(
+            symbol,
+            egcl_rt::symbols::symbol_function(symbol),
+            &installed_loop,
+        );
         egcl_rt::rooted!(params = reader::read_from_string("(fail)").unwrap().0);
         egcl_rt::rooted!(forms = reader::read_from_string(child_forms).unwrap().0);
-        let body = Arc::new(compile_function("PUBLICATION-NATIVE-CHILD", *params, *forms,
-            &env, false, false).unwrap());
-        let symbol = crate::cli::resolve_sym("PUBLICATION-NATIVE-CHILD").unwrap().as_symbol_index();
+        let body = Arc::new(
+            compile_function(
+                "PUBLICATION-NATIVE-CHILD",
+                *params,
+                *forms,
+                &env,
+                false,
+                false,
+            )
+            .unwrap(),
+        );
+        let symbol = crate::cli::resolve_sym("PUBLICATION-NATIVE-CHILD")
+            .unwrap()
+            .as_symbol_index();
         registry_put(symbol, Arc::clone(&body));
         let child = TransferCode::compile(body).expect("compile guarded child");
-        assert!(child.has_deopt && child.deopt_metadata.is_some(),
-            "the numeric child path must use optimized speculative guards");
+        assert!(
+            child.has_deopt && child.deopt_metadata.is_some(),
+            "the numeric child path must use optimized speculative guards"
+        );
         let installed = install_baseline_code(symbol, child).expect("install mapped child");
-        let NativeCodeStorage::Mapped(child) = &installed._storage else { unreachable!() };
-        publish_native(symbol, egcl_rt::symbols::symbol_function(symbol), &installed);
+        let NativeCodeStorage::Mapped(child) = &installed._storage else {
+            unreachable!()
+        };
+        publish_native(
+            symbol,
+            egcl_rt::symbols::symbol_function(symbol),
+            &installed,
+        );
         egcl_rt::rooted!(caller_params = reader::read_from_string("(mode)").unwrap().0);
-        for (fail, argument) in [("nil", NIL), ("t", T), ("1.5", EgclVal::from_single_float(1.5))] {
-            egcl_rt::rooted!(forms = reader::read_from_string(
-                "((let ((x (cons 314159 nil))) (values nil)
+        for (fail, argument) in [
+            ("nil", NIL),
+            ("t", T),
+            ("1.5", EgclVal::from_single_float(1.5)),
+        ] {
+            egcl_rt::rooted!(
+                forms = reader::read_from_string(
+                    "((let ((x (cons 314159 nil))) (values nil)
                     (catch :outer (publication-native-child mode)) x))"
-            ).unwrap().0);
-            let body = Arc::new(compile_function("PUBLICATION-NATIVE-CALLER", *caller_params, *forms,
-                &env, false, false).unwrap());
+                )
+                .unwrap()
+                .0
+            );
+            let body = Arc::new(
+                compile_function(
+                    "PUBLICATION-NATIVE-CALLER",
+                    *caller_params,
+                    *forms,
+                    &env,
+                    false,
+                    false,
+                )
+                .unwrap(),
+            );
             let code = TransferCode::compile(body).expect("admit caller-only root");
             code.run(&[NIL], &mut env).unwrap();
             env.mv.clear();
             force_minor_gc();
-            let mut probe = NativeOnlyProbe { env: &mut env, observed: false, moved: false };
+            let mut probe = NativeOnlyProbe {
+                env: &mut env,
+                observed: false,
+                moved: false,
+            };
             NATIVE_ONLY_PROBE.with(|slot| slot.set(&mut probe));
             take_adapter_crossings();
             take_nested_entries();
@@ -1456,12 +1869,28 @@ mod tests {
             let value = code.run(&[argument], &mut env).unwrap();
             OBSERVE.with(|slot| slot.set(None));
             NATIVE_ONLY_PROBE.with(|slot| slot.set(std::ptr::null_mut()));
-            assert!(probe.observed, "child poll must find its caller's sole native root");
-            assert!(probe.moved, "caller-only native root must move, fail={fail}");
-            assert!(take_adapter_crossings() > 0, "root walk must cross the mapped child adapter");
-            assert_eq!(take_nested_entries(), 2, "child and loop must share the caller's segment");
-            assert_eq!(child.deopt_count() - deopts, u32::from(fail == "1.5"),
-                "the float path must really deoptimize the child");
+            assert!(
+                probe.observed,
+                "child poll must find its caller's sole native root"
+            );
+            assert!(
+                probe.moved,
+                "caller-only native root must move, fail={fail}"
+            );
+            assert!(
+                take_adapter_crossings() > 0,
+                "root walk must cross the mapped child adapter"
+            );
+            assert_eq!(
+                take_nested_entries(),
+                2,
+                "child and loop must share the caller's segment"
+            );
+            assert_eq!(
+                child.deopt_count() - deopts,
+                u32::from(fail == "1.5"),
+                "the float path must really deoptimize the child"
+            );
             assert_eq!(crate::cli::cp(value), (EgclVal::from_fixnum(314159), NIL));
         }
     }
@@ -1471,12 +1900,26 @@ mod tests {
     fn compile_mapped_recursion(body: Arc<BytecodeFunction>) -> TransferCode {
         let roots = retain_native_body(&body);
         let ir = egcl_compiler::t2::build::build_from_bytecode_for_native_cleanups(&body).unwrap();
-        let call_cells: Vec<_> = body.code.iter().filter_map(|instruction| {
-            let Instr::CallNamed { sym, .. } = instruction else { return None };
-            call_table::resolve(*sym).map(|cell| (*sym, cell))
-        }).collect();
-        let code = TransferCode::emit_prepared(body, roots, &ir, None, &call_cells,
-            true, CompilationTier::T1).expect("explicit mapped recursion fixture");
+        let call_cells: Vec<_> = body
+            .code
+            .iter()
+            .filter_map(|instruction| {
+                let Instr::CallNamed { sym, .. } = instruction else {
+                    return None;
+                };
+                call_table::resolve(*sym).map(|cell| (*sym, cell))
+            })
+            .collect();
+        let code = TransferCode::emit_prepared(
+            body,
+            roots,
+            &ir,
+            None,
+            &call_cells,
+            true,
+            CompilationTier::T1,
+        )
+        .expect("explicit mapped recursion fixture");
         assert!(code.ordinary_entry.is_none() && code.mapped_entry().is_some());
         assert!(code.recursive_symbol.is_some());
         code
@@ -1491,13 +1934,18 @@ mod tests {
     #[test]
     fn native_only_values_move_across_recursive_callers() {
         let _lock = crate::cli::heap_test_lock()
-            .lock().unwrap_or_else(|e| e.into_inner());
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut env = Env::new(false);
         egcl_rt::rooted_ref!(_env = &mut env);
         let name = "PUBLICATION-NATIVE-RECURSION";
         let form = "(if (= n 0) nil (let ((x (if (= n 3) (cons 314159 nil) nil)))
             (publication-clear) (publication-native-recursion (- n 1)) x))";
-        crate::cli::read_eval_all_env(&format!("(defun publication-clear () nil) (defun {name} (n) {form})"), &mut env).unwrap();
+        crate::cli::read_eval_all_env(
+            &format!("(defun publication-clear () nil) (defun {name} (n) {form})"),
+            &mut env,
+        )
+        .unwrap();
         egcl_rt::rooted!(params = reader::read_from_string("(n)").unwrap().0);
         egcl_rt::rooted!(forms = reader::read_from_string(&format!("({form})")).unwrap().0);
         let body = Arc::new(compile_function(name, *params, *forms, &env, false, false).unwrap());
@@ -1508,15 +1956,26 @@ mod tests {
         code.run(&args, &mut env).unwrap();
         env.mv.clear();
         force_minor_gc();
-        let mut probe = NativeOnlyProbe { env: &mut env, observed: false, moved: false };
+        let mut probe = NativeOnlyProbe {
+            env: &mut env,
+            observed: false,
+            moved: false,
+        };
         NATIVE_ONLY_PROBE.with(|slot| slot.set(&mut probe));
         take_recursive_entries();
         OBSERVE.with(|slot| slot.set(Some(observe_native_only_recursion)));
         let value = code.run(&args, &mut env).unwrap();
         OBSERVE.with(|slot| slot.set(None));
         NATIVE_ONLY_PROBE.with(|slot| slot.set(std::ptr::null_mut()));
-        assert_eq!(take_recursive_entries(), 3, "all calls must recurse natively");
-        assert!(probe.observed && probe.moved, "an older caller's sole native root must move");
+        assert_eq!(
+            take_recursive_entries(),
+            3,
+            "all calls must recurse natively"
+        );
+        assert!(
+            probe.observed && probe.moved,
+            "an older caller's sole native root must move"
+        );
         assert_eq!(crate::cli::cp(value), (EgclVal::from_fixnum(314159), NIL));
     }
 
@@ -1531,15 +1990,22 @@ mod tests {
             return;
         }
         let published = ACTIVE.with(Cell::get);
-        assert!(!published.is_null(), "the leaf helper must retain real published native frames");
+        assert!(
+            !published.is_null(),
+            "the leaf helper must retain real published native frames"
+        );
         let published = unsafe { &*published };
         let mut roots = Vec::new();
         for marker in 1..=6 {
             let slot = native_only_slot_for(published, marker)
                 .expect("every suspended caller must retain its private value in a native home");
             let bits = unsafe { slot.read() }.to_raw();
-            assert!(roots.iter().all(|&(_, previous, before)| previous != slot && before != bits),
-                "each caller must own a distinct heap value and native home");
+            assert!(
+                roots
+                    .iter()
+                    .all(|&(_, previous, before)| previous != slot && before != bits),
+                "each caller must own a distinct heap value and native home"
+            );
             // Raw diagnostic bits and slot addresses do not root the objects.
             // native_only_slot_for also rejects managed-stack and MV aliases.
             roots.push((marker, slot, bits));
@@ -1550,8 +2016,11 @@ mod tests {
         egcl_rt::gc::full_gc().unwrap();
         for (marker, slot, before) in roots {
             let after = unsafe { slot.read() };
-            assert_ne!(after.to_raw(), before,
-                "caller {marker}'s sole native root must actually relocate");
+            assert_ne!(
+                after.to_raw(),
+                before,
+                "caller {marker}'s sole native root must actually relocate"
+            );
             assert_eq!(crate::cli::cp(after), (EgclVal::from_fixnum(marker), NIL));
         }
     }
@@ -1560,11 +2029,12 @@ mod tests {
     #[ignore = "requires a platform-supported native segment transition"]
     fn ordinary_t2_distinct_caller_only_roots_move_across_recursion() {
         use crate::cli::bytecode::native_transfer_tests::ordinary_t2::{
-            expect_entry, RecursiveFixturePins, RECURSIVE_LEAF_OBSERVER,
+            RECURSIVE_LEAF_OBSERVER, RecursiveFixturePins, expect_entry,
         };
         assert!(egcl_rt::native_transfer::is_supported());
         let _lock = crate::cli::heap_test_lock()
-            .lock().unwrap_or_else(|error| error.into_inner());
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let mut env = Env::new(false);
         egcl_rt::rooted_ref!(_env = &mut env);
         // Publication of native caller roots belongs to the mapped ABI's native
@@ -1578,23 +2048,43 @@ mod tests {
             (let ((held (cons n nil)))
               (ordinary-t2-private-root-clear)
               (+ (ordinary-t2-private-recursive-roots (- n 1)) (car held))))";
-        crate::cli::read_eval_all_env(&format!(
-            "(defun ordinary-t2-private-root-clear () nil)
+        crate::cli::read_eval_all_env(
+            &format!(
+                "(defun ordinary-t2-private-root-clear () nil)
              (defun ordinary-t2-private-root-leaf () (%ordinary-t2-entry-for-test) 0)
-             (defun {name} (n) {form})"), &mut env).unwrap();
+             (defun {name} (n) {form})"
+            ),
+            &mut env,
+        )
+        .unwrap();
         let _pins = RecursiveFixturePins::new(&[
-            "ORDINARY-T2-PRIVATE-ROOT-CLEAR", "ORDINARY-T2-PRIVATE-ROOT-LEAF",
+            "ORDINARY-T2-PRIVATE-ROOT-CLEAR",
+            "ORDINARY-T2-PRIVATE-ROOT-LEAF",
         ]);
         let (symbol, code) = crate::cli::bytecode::native_transfer_tests::ordinary_t2::install(
-            name, "(n)", &format!("({form})"), &mut env);
-        assert!(code.is_t2, "exercise the ordinary optimized worker artifact");
+            name,
+            "(n)",
+            &format!("({form})"),
+            &mut env,
+        );
+        assert!(
+            code.is_t2,
+            "exercise the ordinary optimized worker artifact"
+        );
         let NativeCodeStorage::Mapped(mapped) = &code._storage else {
             panic!("ordinary worker must publish mapped T2");
         };
-        assert_eq!(mapped.recursive_symbol, Some(symbol), "fixture must admit direct native self calls");
+        assert_eq!(
+            mapped.recursive_symbol,
+            Some(symbol),
+            "fixture must admit direct native self calls"
+        );
         expect_entry(&code);
         let args = [EgclVal::from_fixnum(6)];
-        assert_eq!(run_native(&code, symbol, &args, &mut env).unwrap(), EgclVal::from_fixnum(21));
+        assert_eq!(
+            run_native(&code, symbol, &args, &mut env).unwrap(),
+            EgclVal::from_fixnum(21)
+        );
         env.mv.clear();
         force_minor_gc();
         let stack = egcl_rt::current_stack();
@@ -1612,18 +2102,37 @@ mod tests {
                 DISTINCT_RECURSIVE_ROOTS_MOVED.with(|moved| moved.set(0));
             }
         }
-        let _observer = ClearObserver(RECURSIVE_LEAF_OBSERVER.with(|hook| hook.replace(Some(observe_distinct_recursive_roots))));
+        let _observer = ClearObserver(
+            RECURSIVE_LEAF_OBSERVER
+                .with(|hook| hook.replace(Some(observe_distinct_recursive_roots))),
+        );
         let answer = run_native(&code, symbol, &args, &mut env).unwrap();
-        assert_eq!(take_recursive_entries(), 6, "all six self calls execute natively");
-        assert_eq!(DISTINCT_RECURSIVE_ROOTS_MOVED.with(Cell::get), 6,
-            "the published leaf helper must relocate all six private caller values");
-        assert_eq!(answer, EgclVal::from_fixnum(21),
-            "every suspended caller must consume its own relocated cons after its child returns");
+        assert_eq!(
+            take_recursive_entries(),
+            6,
+            "all six self calls execute natively"
+        );
+        assert_eq!(
+            DISTINCT_RECURSIVE_ROOTS_MOVED.with(Cell::get),
+            6,
+            "the published leaf helper must relocate all six private caller values"
+        );
+        assert_eq!(
+            answer,
+            EgclVal::from_fixnum(21),
+            "every suspended caller must consume its own relocated cons after its child returns"
+        );
         assert_eq!(take_native_fallback_count(), 0);
         assert_eq!(mapped.deopt_count(), deopts);
         assert_eq!(take_recursive_helper_calls(), (0, 0));
-        assert_eq!((stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get)), before);
-        assert!(ACTIVE.with(Cell::get).is_null(), "retire all native publication before return");
+        assert_eq!(
+            (stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get)),
+            before
+        );
+        assert!(
+            ACTIVE.with(Cell::get).is_null(),
+            "retire all native publication before return"
+        );
     }
 
     thread_local! {
@@ -1637,7 +2146,9 @@ mod tests {
         assert!(!target.is_null());
         // The fixture roots this Vec before entry; snapshot copies must stay
         // valid through another collection and after the native stack retires.
-        unsafe { *target = egcl_rt::debug_stack::capture_current(64); }
+        unsafe {
+            *target = egcl_rt::debug_stack::capture_current(64);
+        }
         force_minor_gc();
     }
 
@@ -1645,11 +2156,12 @@ mod tests {
     #[ignore = "requires a platform-supported native segment transition"]
     fn ordinary_t2_native_recursive_backtrace_keeps_order_and_original_arguments() {
         use crate::cli::bytecode::native_transfer_tests::ordinary_t2::{
-            expect_entry, install, RecursiveFixturePins, RECURSIVE_LEAF_OBSERVER,
+            RECURSIVE_LEAF_OBSERVER, RecursiveFixturePins, expect_entry, install,
         };
         use egcl_rt::debug_stack::FrameOrigin;
         let _lock = crate::cli::heap_test_lock()
-            .lock().unwrap_or_else(|error| error.into_inner());
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let mut env = Env::new(false);
         egcl_rt::rooted_ref!(_env = &mut env);
         // Publication of native caller roots belongs to the mapped ABI's native
@@ -1661,12 +2173,19 @@ mod tests {
         let form = "(if (= n 0) (ordinary-t2-native-trace-leaf)
             (let ((answer (ordinary-t2-native-trace (- n 1) marker)))
               (car marker) (+ answer 1)))";
-        crate::cli::read_eval_all_env(&format!(
-            "(defun ordinary-t2-native-trace-leaf () (%ordinary-t2-entry-for-test) 0)
-             (defun {name} (n marker) {form})"), &mut env).unwrap();
+        crate::cli::read_eval_all_env(
+            &format!(
+                "(defun ordinary-t2-native-trace-leaf () (%ordinary-t2-entry-for-test) 0)
+             (defun {name} (n marker) {form})"
+            ),
+            &mut env,
+        )
+        .unwrap();
         let _pins = RecursiveFixturePins::new(&["ORDINARY-T2-NATIVE-TRACE-LEAF"]);
         let (symbol, code) = install(name, "(n marker)", &format!("({form})"), &mut env);
-        let NativeCodeStorage::Mapped(mapped) = &code._storage else { panic!("mapped T2") };
+        let NativeCodeStorage::Mapped(mapped) = &code._storage else {
+            panic!("mapped T2")
+        };
         assert!(code.is_t2 && mapped.native_entry_kind_slot.is_some());
         assert_eq!(mapped.recursive_symbol, Some(symbol));
         expect_entry(&code);
@@ -1681,27 +2200,63 @@ mod tests {
             }
         }
         NATIVE_TRACE_SNAPSHOT.with(|slot| slot.set(&mut *snapshot));
-        let _restore = RestoreTrace(RECURSIVE_LEAF_OBSERVER.with(|hook|
-            hook.replace(Some(capture_native_recursive_trace))));
+        let _restore = RestoreTrace(
+            RECURSIVE_LEAF_OBSERVER.with(|hook| hook.replace(Some(capture_native_recursive_trace))),
+        );
         take_recursive_entries();
         let stack = egcl_rt::current_stack();
         let before = (stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get));
-        assert_eq!(run_native(&code, symbol, &[EgclVal::from_fixnum(4), *marker], &mut env).unwrap(),
-            EgclVal::from_fixnum(4));
+        assert_eq!(
+            run_native(&code, symbol, &[EgclVal::from_fixnum(4), *marker], &mut env).unwrap(),
+            EgclVal::from_fixnum(4)
+        );
         assert_eq!(take_recursive_entries(), 4);
-        assert_ne!(marker.to_raw(), original, "arguments must actually move before snapshot capture");
-        assert_eq!((stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get)), before);
+        assert_ne!(
+            marker.to_raw(),
+            original,
+            "arguments must actually move before snapshot capture"
+        );
+        assert_eq!(
+            (stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get)),
+            before
+        );
         assert!(ACTIVE.with(Cell::get).is_null());
         drop(code);
-        let rows: Vec<_> = snapshot.iter().filter(|row| row.function.as_deref() == Some(name)).collect();
-        assert_eq!(rows.len(), 5, "four physical-only callers and the original managed anchor");
+        let rows: Vec<_> = snapshot
+            .iter()
+            .filter(|row| row.function.as_deref() == Some(name))
+            .collect();
+        assert_eq!(
+            rows.len(),
+            5,
+            "four physical-only callers and the original managed anchor"
+        );
         for (index, row) in rows.iter().enumerate() {
-            assert_eq!(row.arguments.as_deref(), Some(&[EgclVal::from_fixnum(index as i64), *marker][..]));
-            assert_eq!(row.origin, if index < 4 { FrameOrigin::Native } else { FrameOrigin::Managed });
+            assert_eq!(
+                row.arguments.as_deref(),
+                Some(&[EgclVal::from_fixnum(index as i64), *marker][..])
+            );
+            assert_eq!(
+                row.origin,
+                if index < 4 {
+                    FrameOrigin::Native
+                } else {
+                    FrameOrigin::Managed
+                }
+            );
         }
-        let leaf = snapshot.iter().position(|row| row.function.as_deref() == Some("ORDINARY-T2-NATIVE-TRACE-LEAF")).unwrap();
-        let first_native = snapshot.iter().position(|row| row.function.as_deref() == Some(name)).unwrap();
-        assert!(leaf < first_native, "interpreted leaf precedes its native caller chain");
+        let leaf = snapshot
+            .iter()
+            .position(|row| row.function.as_deref() == Some("ORDINARY-T2-NATIVE-TRACE-LEAF"))
+            .unwrap();
+        let first_native = snapshot
+            .iter()
+            .position(|row| row.function.as_deref() == Some(name))
+            .unwrap();
+        assert!(
+            leaf < first_native,
+            "interpreted leaf precedes its native caller chain"
+        );
     }
 
     const RECURSION_DEPTH: usize = 6;
@@ -1714,7 +2269,10 @@ mod tests {
         let probe = probe();
         let publication = ACTIVE.with(Cell::get);
         let published = unsafe { &*publication };
-        assert!(published.previous.is_null(), "native self-calls publish no Rust frame");
+        assert!(
+            published.previous.is_null(),
+            "native self-calls publish no Rust frame"
+        );
         let code = unsafe { &*published.owner };
         let base = code.code.as_ptr() as usize;
         let segment = unsafe { &*published.segment };
@@ -1722,17 +2280,29 @@ mod tests {
         let mut frames = 0;
         loop {
             let offset = cursor.pc - base;
-            assert!(offset < code.code_len, "every crossed PC stays inside the owner");
-            assert!(matches!(code._native_calls.value_map(offset),
-                Some(egcl_compiler::t2::x64_calls::NativeCallValues::Frame(_))),
-                "exact value map at crossed frame {frames}");
-            let step = code._native_calls.unwind(base, &cursor, published.bounds.clone(), read_stack_word)
+            assert!(
+                offset < code.code_len,
+                "every crossed PC stays inside the owner"
+            );
+            assert!(
+                matches!(
+                    code._native_calls.value_map(offset),
+                    Some(egcl_compiler::t2::x64_calls::NativeCallValues::Frame(_))
+                ),
+                "exact value map at crossed frame {frames}"
+            );
+            let step = code
+                ._native_calls
+                .unwind(base, &cursor, published.bounds.clone(), read_stack_word)
                 .unwrap_or_else(|| panic!("exact unwind recipe at crossed frame {frames}"));
             frames += 1;
             if step.caller.call_sp == segment.saved_sp && step.caller.pc == segment.return_pc() {
                 break;
             }
-            assert!(frames <= RECURSION_DEPTH + 1, "the walk must end at the segment entry");
+            assert!(
+                frames <= RECURSION_DEPTH + 1,
+                "the walk must end at the segment entry"
+            );
             cursor = step.caller;
         }
         probe.frames = probe.frames.max(frames);
@@ -1740,30 +2310,55 @@ mod tests {
         let Some(NativeCallValues::Frame(map)) = code._native_calls.value_map(offset) else {
             panic!("recursive preparation needs a frame map");
         };
-        let step = code._native_calls.unwind(base, &published.cursor,
-            published.bounds.clone(), read_stack_word).unwrap();
+        let step = code
+            ._native_calls
+            .unwind(
+                base,
+                &published.cursor,
+                published.bounds.clone(),
+                read_stack_word,
+            )
+            .unwrap();
         let walk = Walk::new(published.bounds.clone(), unsafe { &*published.stack });
-        assert!(verify_frame_aliases(map, &published.cursor, step.body_sp, &walk).unwrap() > 0,
-            "outgoing arguments must duplicate a native home");
-        let native = map.values().iter().filter(|value| value.locations().len() > 1)
-            .flat_map(|value| value.locations()).find_map(|location| match location {
-                NativeValueLocation::Stack(_) | NativeValueLocation::Register(_) =>
-                    unsafe { resolve_location(*location, &published.cursor, step.body_sp,
-                        frame_activation(map, step.body_sp, &walk), map.layout().activation_slots, &walk) }
-                        .filter(|slot| unsafe { **slot == (&*probe.args)[1] }),
+        assert!(
+            verify_frame_aliases(map, &published.cursor, step.body_sp, &walk).unwrap() > 0,
+            "outgoing arguments must duplicate a native home"
+        );
+        let native = map
+            .values()
+            .iter()
+            .filter(|value| value.locations().len() > 1)
+            .flat_map(|value| value.locations())
+            .find_map(|location| match location {
+                NativeValueLocation::Stack(_) | NativeValueLocation::Register(_) => unsafe {
+                    resolve_location(
+                        *location,
+                        &published.cursor,
+                        step.body_sp,
+                        frame_activation(map, step.body_sp, &walk),
+                        map.layout().activation_slots,
+                        &walk,
+                    )
+                }
+                .filter(|slot| unsafe { **slot == (&*probe.args)[1] }),
                 _ => None,
-            }).expect("a duplicated native heap home");
+            })
+            .expect("a duplicated native heap home");
         let original = unsafe { native.read() };
         unsafe { native.write(NIL) };
-        assert!(verify_frame_aliases(map, &published.cursor, step.body_sp, &walk).is_err(),
-            "a wrong native home must fail the alias oracle");
+        assert!(
+            verify_frame_aliases(map, &published.cursor, step.body_sp, &walk).is_err(),
+            "a wrong native home must fail the alias oracle"
+        );
         unsafe { native.write(original) };
         #[cfg(debug_assertions)]
         let checked = VERIFIED_ALIASES.load(std::sync::atomic::Ordering::Relaxed);
         force_minor_gc();
         #[cfg(debug_assertions)]
-        assert!(VERIFIED_ALIASES.load(std::sync::atomic::Ordering::Relaxed) > checked,
-            "the collector must compare aliases in its mark pass");
+        assert!(
+            VERIFIED_ALIASES.load(std::sync::atomic::Ordering::Relaxed) > checked,
+            "the collector must compare aliases in its mark pass"
+        );
         assert_eq!(unsafe { native.read() }, unsafe { (&*probe.args)[1] });
         probe.visited += chain_visited(publication);
         probe.calls += 1;
@@ -1772,7 +2367,8 @@ mod tests {
     #[test]
     fn published_chain_crosses_direct_recursion_to_the_segment_entry() {
         let _lock = crate::cli::heap_test_lock()
-            .lock().unwrap_or_else(|e| e.into_inner());
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut env = Env::new(false);
         egcl_rt::rooted_ref!(_env = &mut env);
         let name = "PUBLICATION-RECURSION";
@@ -1786,24 +2382,52 @@ mod tests {
         let symbol = crate::cli::resolve_sym(name).unwrap().as_symbol_index();
         crate::cli::bytecode::registry_put(symbol, Arc::clone(&body));
         let code = compile_mapped_recursion(Arc::clone(&body));
-        egcl_rt::rooted!(args = vec![
-            EgclVal::from_fixnum(RECURSION_DEPTH as i64),
-            crate::cli::arena_cons(EgclVal::from_fixnum(42), NIL),
-        ]);
+        egcl_rt::rooted!(
+            args = vec![
+                EgclVal::from_fixnum(RECURSION_DEPTH as i64),
+                crate::cli::arena_cons(EgclVal::from_fixnum(42), NIL),
+            ]
+        );
         let old_pointer = args[1].to_raw();
-        let mut probe = Probe { code: &code, env: &mut env, args: &*args, calls: 0, moved: false, visited: 0, native_visits: 0, frames: 0 };
+        let mut probe = Probe {
+            code: &code,
+            env: &mut env,
+            args: &*args,
+            calls: 0,
+            moved: false,
+            visited: 0,
+            native_visits: 0,
+            frames: 0,
+        };
         PROBE.with(|slot| slot.set(&mut probe));
         take_recursive_entries();
         OBSERVE.with(|slot| slot.set(Some(observe_recursion)));
         let value = code.run(&args, &mut env);
         OBSERVE.with(|slot| slot.set(None));
         PROBE.with(|slot| slot.set(std::ptr::null_mut()));
-        assert_eq!(take_recursive_entries(), RECURSION_DEPTH, "all recursive calls entered native code");
+        assert_eq!(
+            take_recursive_entries(),
+            RECURSION_DEPTH,
+            "all recursive calls entered native code"
+        );
         assert!(ACTIVE.with(Cell::get).is_null());
-        assert_eq!(probe.calls, RECURSION_DEPTH, "every recursive call runs its published preparation");
-        assert_eq!(probe.frames, RECURSION_DEPTH, "one native frame per preparing activation, then the segment");
-        assert!(probe.visited > 0, "the collection must reach roots through the recursive chain");
-        assert_ne!(args[1].to_raw(), old_pointer, "the suspended callers' heap value actually moved");
+        assert_eq!(
+            probe.calls, RECURSION_DEPTH,
+            "every recursive call runs its published preparation"
+        );
+        assert_eq!(
+            probe.frames, RECURSION_DEPTH,
+            "one native frame per preparing activation, then the segment"
+        );
+        assert!(
+            probe.visited > 0,
+            "the collection must reach roots through the recursive chain"
+        );
+        assert_ne!(
+            args[1].to_raw(),
+            old_pointer,
+            "the suspended callers' heap value actually moved"
+        );
         assert_eq!(crate::cli::cp(args[1]), (EgclVal::from_fixnum(42), NIL));
         assert_eq!(value.unwrap(), EgclVal::from_fixnum(42));
     }
@@ -1817,7 +2441,10 @@ mod tests {
     fn observe_cold_publication() {
         use std::sync::atomic::Ordering::SeqCst;
         let current = ACTIVE.with(Cell::get);
-        assert!(!current.is_null(), "publish before cold preparation can signal");
+        assert!(
+            !current.is_null(),
+            "publish before cold preparation can signal"
+        );
         COLD_CALLS.fetch_add(1, SeqCst);
         force_minor_gc();
         COLD_VISITED.fetch_add(chain_visited(current), SeqCst);
@@ -1827,17 +2454,22 @@ mod tests {
     fn cold_transfer_preparation_publishes_before_it_signals() {
         use std::sync::atomic::Ordering::SeqCst;
         let _lock = crate::cli::heap_test_lock()
-            .lock().unwrap_or_else(|e| e.into_inner());
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut env = Env::new(false);
         egcl_rt::rooted_ref!(_env = &mut env);
         let token = crate::cli::next_control_token("PUBLICATION-COLD");
         let tag = reader::read_from_string(":publication-cold-tag").unwrap().0;
         env.catch_stack.push((tag, token.clone()));
         egcl_rt::rooted!(params = reader::read_from_string("(x)").unwrap().0);
-        egcl_rt::rooted!(forms = reader::read_from_string(
-            "((progn (let ((n 0)) (tagbody again (setq n (+ n 1)) (if (< n 3) (go again))))
+        egcl_rt::rooted!(
+            forms = reader::read_from_string(
+                "((progn (let ((n 0)) (tagbody again (setq n (+ n 1)) (if (< n 3) (go again))))
                      (throw :publication-cold-tag x)))"
-        ).unwrap().0);
+            )
+            .unwrap()
+            .0
+        );
         let body = Arc::new(
             compile_function("PUBLICATION-COLD", *params, *forms, &env, false, false).unwrap(),
         );
@@ -1848,8 +2480,14 @@ mod tests {
         OBSERVE_COLD.with(|slot| slot.set(Some(observe_cold_publication)));
         let result = code.run(&args, &mut env);
         OBSERVE_COLD.with(|slot| slot.set(None));
-        assert!(ACTIVE.with(Cell::get).is_null(), "retire before the stub discards its image");
-        assert!(COLD_CALLS.load(SeqCst) > 0, "the throw must enter the cold route");
+        assert!(
+            ACTIVE.with(Cell::get).is_null(),
+            "retire before the stub discards its image"
+        );
+        assert!(
+            COLD_CALLS.load(SeqCst) > 0,
+            "the throw must enter the cold route"
+        );
         assert!(
             COLD_VISITED.load(SeqCst) > 0,
             "a collection during cold preparation must reach roots through the publication"
@@ -1859,7 +2497,11 @@ mod tests {
             "the throw still reaches its catch: {result:?}"
         );
         assert_eq!(crate::cli::take_control_mv(&token, &mut env), args[0]);
-        assert_eq!(crate::cli::cp(args[0]).0, T, "the thrown value survived collection");
+        assert_eq!(
+            crate::cli::cp(args[0]).0,
+            T,
+            "the thrown value survived collection"
+        );
         env.catch_stack.pop();
     }
 
@@ -1877,12 +2519,19 @@ mod tests {
         }
         let publication = ACTIVE.with(Cell::get);
         assert!(!publication.is_null(), "parked inside a publication");
-        let slot = native_only_slot(unsafe { &*publication }).expect("park with a sole native root");
+        let slot =
+            native_only_slot(unsafe { &*publication }).expect("park with a sole native root");
         let before = unsafe { slot.read() }.to_raw();
-        assert_eq!(crate::cli::bytecode::call_table::ordinary_segment_depth_for_test(), 1);
+        assert_eq!(
+            crate::cli::bytecode::call_table::ordinary_segment_depth_for_test(),
+            1
+        );
         SUSPENDED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         egcl_rt::sync::fiber_sleep(std::time::Duration::from_millis(400)).unwrap();
-        assert_eq!(crate::cli::bytecode::call_table::ordinary_segment_depth_for_test(), 1);
+        assert_eq!(
+            crate::cli::bytecode::call_table::ordinary_segment_depth_for_test(),
+            1
+        );
         if unsafe { slot.read() }.to_raw() != before {
             PARKED_MOVED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
@@ -1892,10 +2541,14 @@ mod tests {
         // Match thread_entry_runner: workers share initialized classes/packages.
         let mut env = Env::new_impl(false, false, false);
         egcl_rt::rooted_ref!(_env = &mut env);
-        egcl_rt::rooted!(forms = reader::read_from_string(
-            "((let ((x (cons 314159 nil))) (values nil)
+        egcl_rt::rooted!(
+            forms = reader::read_from_string(
+                "((let ((x (cons 314159 nil))) (values nil)
                 (let ((n 0)) (tagbody again (setq n (+ n 1)) (if (< n 3) (go again)))) x))"
-        ).unwrap().0);
+            )
+            .unwrap()
+            .0
+        );
         let body = Arc::new(
             compile_function("PUBLICATION-FIBER", NIL, *forms, &env, false, false).unwrap(),
         );
@@ -1906,9 +2559,19 @@ mod tests {
         OBSERVE.with(|slot| slot.set(Some(park_while_published)));
         let value = code.run(&[], &mut env).unwrap();
         OBSERVE.with(|slot| slot.set(None));
-        assert!(ACTIVE.with(Cell::get).is_null(), "retire before the fiber returns");
-        assert_eq!(crate::cli::bytecode::call_table::ordinary_segment_depth_for_test(), 0);
-        assert_eq!(crate::cli::cp(value), (EgclVal::from_fixnum(314159), NIL), "the private value stayed intact");
+        assert!(
+            ACTIVE.with(Cell::get).is_null(),
+            "retire before the fiber returns"
+        );
+        assert_eq!(
+            crate::cli::bytecode::call_table::ordinary_segment_depth_for_test(),
+            0
+        );
+        assert_eq!(
+            crate::cli::cp(value),
+            (EgclVal::from_fixnum(314159), NIL),
+            "the private value stayed intact"
+        );
         EgclVal::from_fixnum(1)
     }
 
@@ -1916,20 +2579,22 @@ mod tests {
     #[ignore = "requires a platform-supported native segment transition"]
     fn suspended_fiber_publications_are_walked_against_their_own_stack() {
         let _lock = crate::cli::heap_test_lock()
-            .lock().unwrap_or_else(|e| e.into_inner());
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         assert!(egcl_rt::native_transfer::is_supported());
         let mut startup = Env::new(false);
         egcl_rt::rooted_ref!(_startup = &mut startup);
         SUSPENDED.store(0, std::sync::atomic::Ordering::SeqCst);
         PARKED_MOVED.store(0, std::sync::atomic::Ordering::SeqCst);
         const FIBERS: usize = 4;
-        let group = egcl_rt::SchedulerGroup::init(
-            &egcl_rt::SchedulerConfig { num_workers: 2 }).unwrap();
+        let group =
+            egcl_rt::SchedulerGroup::init(&egcl_rt::SchedulerConfig { num_workers: 2 }).unwrap();
         for _ in 0..FIBERS {
-            let entry = unsafe {
-                EgclVal::from_function_ptr(publication_fiber as *const () as *mut u8)
-            };
-            group.submit(egcl_rt::thread::make_fiber(entry).unwrap()).unwrap();
+            let entry =
+                unsafe { EgclVal::from_function_ptr(publication_fiber as *const () as *mut u8) };
+            group
+                .submit(egcl_rt::thread::make_fiber(entry).unwrap())
+                .unwrap();
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while SUSPENDED.load(std::sync::atomic::Ordering::SeqCst) < 2 {
@@ -1945,14 +2610,22 @@ mod tests {
         take_foreign_walk_counts();
         egcl_rt::HeapCollector::new().minor_gc().unwrap();
         let (walks, visited) = take_foreign_walk_counts();
-        assert!(walks >= 2, "walk every suspended execution's chain, saw {walks}");
+        assert!(
+            walks >= 2,
+            "walk every suspended execution's chain, saw {walks}"
+        );
         assert!(
             visited > 0,
             "activations must validate against each fiber's own stack, not the collector's"
         );
-        assert_eq!(group.finish().unwrap(), vec![EgclVal::from_fixnum(1); FIBERS]);
-        assert!(PARKED_MOVED.load(std::sync::atomic::Ordering::SeqCst) >= 2,
-            "both parked fibers must relocate their sole native roots");
+        assert_eq!(
+            group.finish().unwrap(),
+            vec![EgclVal::from_fixnum(1); FIBERS]
+        );
+        assert!(
+            PARKED_MOVED.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "both parked fibers must relocate their sole native roots"
+        );
     }
 
     /// Compiled maps must expose stable native-only homes, while retaining
@@ -1960,22 +2633,32 @@ mod tests {
     #[test]
     fn relocatable_values_record_their_real_native_home() {
         let _lock = crate::cli::heap_test_lock()
-            .lock().unwrap_or_else(|e| e.into_inner());
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut env = Env::new(false);
         egcl_rt::rooted_ref!(_env = &mut env);
         crate::cli::read_eval_all_env(
             "(defun publication-callee (y) y)
-             (defun publication-callee2 (a b) (cons a b))", &mut env).unwrap();
+             (defun publication-callee2 (a b) (cons a b))",
+            &mut env,
+        )
+        .unwrap();
         let shapes = [
             // a plain mapped call with a value live across it
             ("MAPPED", "(x)", "((progn (publication-callee x) (car x)))"),
             // a loop poll, the shape every other fixture here uses
-            ("POLL", "(x)",
-             "((let ((n 0)) (tagbody again (setq n (+ n 1)) (if (< n 3) (go again))) x))"),
+            (
+                "POLL",
+                "(x)",
+                "((let ((n 0)) (tagbody again (setq n (+ n 1)) (if (< n 3) (go again))) x))",
+            ),
             // several simultaneously live heap values across two calls
-            ("MANYLIVE", "(x)",
-             "((let ((a (cons x x)) (b (cons x nil)) (c (list x x)))
-                 (publication-callee2 a b) (publication-callee c) (list a b c)))"),
+            (
+                "MANYLIVE",
+                "(x)",
+                "((let ((a (cons x x)) (b (cons x nil)) (c (list x x)))
+                 (publication-callee2 a b) (publication-callee c) (list a b c)))",
+            ),
         ];
         let mut non_activation = 0;
         let mut native_only = 0;
@@ -1984,8 +2667,13 @@ mod tests {
             egcl_rt::rooted!(params = reader::read_from_string(params).unwrap().0);
             egcl_rt::rooted!(forms = reader::read_from_string(forms).unwrap().0);
             let Some(body) = compile_function(
-                &format!("PUBLICATION-SHAPE-{name}"), *params, *forms, &env, false, false)
-            else {
+                &format!("PUBLICATION-SHAPE-{name}"),
+                *params,
+                *forms,
+                &env,
+                false,
+                false,
+            ) else {
                 panic!("{name}: fixture must compile");
             };
             let code = TransferCode::compile(Arc::new(body))
@@ -1995,8 +2683,15 @@ mod tests {
                     Some(NativeCallValues::Frame(map)) => {
                         frames += 1;
                         for value in map.values().iter().filter(|v| v.may_reference_heap()) {
-                            if !value.locations().is_empty() && value.locations().iter().all(|location|
-                                matches!(location, NativeValueLocation::Stack(_) | NativeValueLocation::Register(_))) {
+                            if !value.locations().is_empty()
+                                && value.locations().iter().all(|location| {
+                                    matches!(
+                                        location,
+                                        NativeValueLocation::Stack(_)
+                                            | NativeValueLocation::Register(_)
+                                    )
+                                })
+                            {
                                 native_only += 1;
                             }
                         }
@@ -2007,8 +2702,14 @@ mod tests {
                         for location in map.gc_locations() {
                             match location {
                                 NativeValueLocation::Activation(_) => act += 1,
-                                NativeValueLocation::Stack(_) => { stk += 1; non_activation += 1 }
-                                NativeValueLocation::Register(_) => { reg += 1; non_activation += 1 }
+                                NativeValueLocation::Stack(_) => {
+                                    stk += 1;
+                                    non_activation += 1
+                                }
+                                NativeValueLocation::Register(_) => {
+                                    reg += 1;
+                                    non_activation += 1
+                                }
                                 _ => other += 1,
                             }
                         }
@@ -2023,7 +2724,10 @@ mod tests {
             }
         }
         assert!(frames > 0, "the shapes must produce real value maps");
-        assert!(native_only > 0, "stable native homes must not retain redundant shadows");
+        assert!(
+            native_only > 0,
+            "stable native homes must not retain redundant shadows"
+        );
         assert!(
             non_activation > 0,
             "every heap location is an activation slot again: for_call has gone back to masking \
@@ -2038,29 +2742,62 @@ mod tests {
     fn activation_validation_requires_a_real_frame_with_enough_slots() {
         use egcl_rt::stack::{EgclStack, Frame};
         let stack = EgclStack::new(64 * 1024);
-        let frame = stack.push_frame(NIL, std::ptr::null(), 4, 0).expect("push a frame");
+        let frame = stack
+            .push_frame(NIL, std::ptr::null(), 4, 0)
+            .expect("push a frame");
         let activation = unsafe { frame.add(1) }.cast::<EgclVal>();
 
-        assert_eq!(validated_activation(activation, 4, &stack), Some(activation),
-            "the frame's own slots are addressable");
-        assert_eq!(validated_activation(activation, 3, &stack), Some(activation),
-            "addressing fewer slots than declared is fine");
-        assert_eq!(validated_activation(activation, 5, &stack), None,
-            "a map claiming more slots than the header declares is rejected");
-        assert_eq!(validated_activation(std::ptr::null_mut(), 1, &stack), None, "null");
-        assert_eq!(validated_activation(activation.wrapping_byte_add(1), 1, &stack), None,
-            "misaligned");
-        assert_eq!(validated_activation(stack.base() as *mut EgclVal, 1, &stack), None,
-            "no room for a header below the stack base");
-        assert_eq!(validated_activation(stack.sp() as *mut EgclVal, 1, &stack), None,
-            "slots must end at or below the stack pointer");
-        assert_eq!(validated_activation(usize::MAX as *mut EgclVal, 1, &stack), None,
-            "an address whose header or slot area would overflow is rejected");
+        assert_eq!(
+            validated_activation(activation, 4, &stack),
+            Some(activation),
+            "the frame's own slots are addressable"
+        );
+        assert_eq!(
+            validated_activation(activation, 3, &stack),
+            Some(activation),
+            "addressing fewer slots than declared is fine"
+        );
+        assert_eq!(
+            validated_activation(activation, 5, &stack),
+            None,
+            "a map claiming more slots than the header declares is rejected"
+        );
+        assert_eq!(
+            validated_activation(std::ptr::null_mut(), 1, &stack),
+            None,
+            "null"
+        );
+        assert_eq!(
+            validated_activation(activation.wrapping_byte_add(1), 1, &stack),
+            None,
+            "misaligned"
+        );
+        assert_eq!(
+            validated_activation(stack.base() as *mut EgclVal, 1, &stack),
+            None,
+            "no room for a header below the stack base"
+        );
+        assert_eq!(
+            validated_activation(stack.sp() as *mut EgclVal, 1, &stack),
+            None,
+            "slots must end at or below the stack pointer"
+        );
+        assert_eq!(
+            validated_activation(usize::MAX as *mut EgclVal, 1, &stack),
+            None,
+            "an address whose header or slot area would overflow is rejected"
+        );
         // A frame header inside the stack but belonging to no pushed frame is
         // still rejected when it cannot declare the slots.
         let unpushed = unsafe { (stack.base() as *const Frame).add(1) } as usize;
-        assert_eq!(validated_activation(
-            (unpushed + std::mem::size_of::<Frame>()) as *mut EgclVal, u16::MAX, &stack), None);
+        assert_eq!(
+            validated_activation(
+                (unpushed + std::mem::size_of::<Frame>()) as *mut EgclVal,
+                u16::MAX,
+                &stack
+            ),
+            None
+        );
     }
 
     #[test]
@@ -2073,9 +2810,15 @@ mod tests {
         // The address and full claimed extent are inside the owning stack.
         unsafe { activation.write(EgclVal::from_fixnum(1 << 29)) };
         let interior = unsafe { activation.add(1) };
-        assert_eq!(validated_activation(activation, 4, &stack), Some(activation));
-        assert_eq!(validated_activation(interior, 1, &stack), None,
-            "in-bounds bytes resembling a header do not identify a linked frame");
+        assert_eq!(
+            validated_activation(activation, 4, &stack),
+            Some(activation)
+        );
+        assert_eq!(
+            validated_activation(interior, 1, &stack),
+            None,
+            "in-bounds bytes resembling a header do not identify a linked frame"
+        );
     }
 
     #[test]
@@ -2109,7 +2852,10 @@ mod tests {
             root_owner: published.root_owner,
             directory: std::rc::Rc::clone(&published.directory),
             context: published.context,
-            cursor: NativeFrameCursor { pc, ..published.cursor },
+            cursor: NativeFrameCursor {
+                pc,
+                ..published.cursor
+            },
             bounds,
             segment: published.segment,
             stack,
@@ -2121,14 +2867,41 @@ mod tests {
         };
         let past_the_code = code.code.as_ptr() as usize + code.code_len;
         let mut cases = [
-            ("PC outside the owner", Bail::PcOutsideOwner,
-                malformed(published.owner, past_the_code, published.bounds.clone(), published.stack)),
-            ("empty stack bounds", Bail::UnwindRefused,
-                malformed(published.owner, published.cursor.pc, 0..0, published.stack)),
-            ("no owner", Bail::NullOwner,
-                malformed(std::ptr::null(), published.cursor.pc, published.bounds.clone(), published.stack)),
-            ("no managed stack", Bail::NullStack,
-                malformed(published.owner, published.cursor.pc, published.bounds.clone(), std::ptr::null())),
+            (
+                "PC outside the owner",
+                Bail::PcOutsideOwner,
+                malformed(
+                    published.owner,
+                    past_the_code,
+                    published.bounds.clone(),
+                    published.stack,
+                ),
+            ),
+            (
+                "empty stack bounds",
+                Bail::UnwindRefused,
+                malformed(published.owner, published.cursor.pc, 0..0, published.stack),
+            ),
+            (
+                "no owner",
+                Bail::NullOwner,
+                malformed(
+                    std::ptr::null(),
+                    published.cursor.pc,
+                    published.bounds.clone(),
+                    published.stack,
+                ),
+            ),
+            (
+                "no managed stack",
+                Bail::NullStack,
+                malformed(
+                    published.owner,
+                    published.cursor.pc,
+                    published.bounds.clone(),
+                    std::ptr::null(),
+                ),
+            ),
         ];
         for (label, reason, boundary) in &mut cases {
             ACTIVE.with(|slot| slot.set(boundary));
@@ -2141,17 +2914,26 @@ mod tests {
             // dropped.
             let (_, _, bails) = take_completeness();
             ACTIVE.with(|slot| slot.set(real));
-            assert_eq!(boundary.visited.get(), 0, "{label}: the walk must stop without guessing");
+            assert_eq!(
+                boundary.visited.get(),
+                0,
+                "{label}: the walk must stop without guessing"
+            );
             let mut expected = [0; BAIL_KINDS];
             // Exactly the malformed head in the mark and relocation scans;
             // an unrelated bad publication cannot hide behind this allowance.
             expected[*reason as usize] = 2;
-            assert_eq!(bails, expected,
-                "{label}: only the deliberate malformed publication may decline");
+            assert_eq!(
+                bails, expected,
+                "{label}: only the deliberate malformed publication may decline"
+            );
             eprintln!("  {label}: bails=[{}]", describe_bails(bails));
         }
         force_minor_gc();
-        assert!(published.visited.get() > 0, "the real publication still reaches its roots");
+        assert!(
+            published.visited.get() > 0,
+            "the real publication still reaches its roots"
+        );
         probe.visited += published.visited.get();
         probe.calls += 1;
     }
@@ -2159,24 +2941,43 @@ mod tests {
     #[test]
     fn malformed_publications_end_the_walk_without_dereferencing() {
         let _lock = crate::cli::heap_test_lock()
-            .lock().unwrap_or_else(|e| e.into_inner());
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut env = Env::new(false);
         egcl_rt::rooted_ref!(_env = &mut env);
         egcl_rt::rooted!(params = reader::read_from_string("(x)").unwrap().0);
-        egcl_rt::rooted!(forms = reader::read_from_string(
-            "((let ((n 0)) (tagbody again (setq n (+ n 1)) (if (< n 3) (go again))) x))"
-        ).unwrap().0);
-        let body = Arc::new(compile_function("PUBLICATION-MALFORMED", *params, *forms, &env, false, false).unwrap());
+        egcl_rt::rooted!(
+            forms = reader::read_from_string(
+                "((let ((n 0)) (tagbody again (setq n (+ n 1)) (if (< n 3) (go again))) x))"
+            )
+            .unwrap()
+            .0
+        );
+        let body = Arc::new(
+            compile_function("PUBLICATION-MALFORMED", *params, *forms, &env, false, false).unwrap(),
+        );
         let code = TransferCode::compile(body).unwrap();
         egcl_rt::rooted!(args = vec![crate::cli::arena_cons(T, NIL)]);
-        let mut probe = Probe { code: &code, env: &mut env, args: &*args, calls: 0, moved: false, visited: 0, native_visits: 0, frames: 0 };
+        let mut probe = Probe {
+            code: &code,
+            env: &mut env,
+            args: &*args,
+            calls: 0,
+            moved: false,
+            visited: 0,
+            native_visits: 0,
+            frames: 0,
+        };
         PROBE.with(|slot| slot.set(&mut probe));
         OBSERVE.with(|slot| slot.set(Some(observe_malformed)));
         let value = code.run(&args, &mut env).unwrap();
         OBSERVE.with(|slot| slot.set(None));
         PROBE.with(|slot| slot.set(std::ptr::null_mut()));
         assert!(ACTIVE.with(Cell::get).is_null());
-        assert!(probe.calls > 0, "the compiled loop must enter a published poll");
+        assert!(
+            probe.calls > 0,
+            "the compiled loop must enter a published poll"
+        );
         assert!(probe.visited > 0);
         assert_eq!(value, args[0]);
     }

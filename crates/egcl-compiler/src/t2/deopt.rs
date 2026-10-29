@@ -667,7 +667,7 @@ mod tests {
                 EgclVal::from_fixnum(99), // Tagged, read through unchanged
                 EgclVal::from_fixnum(5),  // UnboxedFixnum reboxed via n<<3
                 EgclVal::from_fixnum(7),  // Const materialised
-                UNBOUND,                   // Unbound-marker
+                UNBOUND,                  // Unbound-marker
             ]
         );
         assert!(frame.stack.is_empty());

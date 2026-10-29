@@ -102,9 +102,9 @@ impl NativeEntry {
     pub(super) fn entries(&self) -> [usize; 2] {
         [
             self.register,
-            self.slice.as_ref().map_or(self.register, |buffer| {
-                buffer.as_ptr() as usize
-            }),
+            self.slice
+                .as_ref()
+                .map_or(self.register, |buffer| buffer.as_ptr() as usize),
         ]
     }
 

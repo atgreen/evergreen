@@ -102,9 +102,6 @@ fn octet_sequences_and_wrappers_preserve_storage_across_real_relocation() {
     egcl_rt::rooted!(matrix = sequences::build_u8_md_array(&[2, 3], 255).unwrap());
     assert!(sequences::is_u8_array(*matrix));
     assert_eq!(sequences::array_total_size(*matrix), Some(6));
-    assert_eq!(
-        sequences::u8_array_element(*matrix, 5),
-        Some(255)
-    );
+    assert_eq!(sequences::u8_array_element(*matrix, 5), Some(255));
     assert_eq!(sequences::u8_array_element(*matrix, 6), None);
 }

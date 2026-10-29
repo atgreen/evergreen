@@ -9,7 +9,7 @@
 //! may return normally or jump through [`leave_native_segment`] without
 //! corrupting ELFv2 nonvolatile state.
 
-use super::{NativeOutcome, NativeSegment, EgclStack};
+use super::{EgclStack, NativeOutcome, NativeSegment};
 
 const _: () = {
     assert!(std::mem::offset_of!(NativeSegment, saved_sp) == 0);

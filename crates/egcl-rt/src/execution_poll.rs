@@ -12,8 +12,8 @@
 //! objects or registry locks. Retired slots are reused under the writer mutex;
 //! a stale broadcast can only arm the next owner unnecessarily. New owners start
 //! armed, including owners registered after a broadcast passed their chunk.
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 
 #[repr(C)]
 pub struct PollSlot {

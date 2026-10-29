@@ -32,9 +32,12 @@ fn native_v2_named_calls_use_live_call_cells() {
     let cell = call_table::resolve(symbol).unwrap();
     let published = native_transfer_entry::published_entries().unwrap();
     for (index, slice) in [false, true].into_iter().enumerate() {
-        let entry = unsafe { &*cell.entry_address(slice) }
-            .load(std::sync::atomic::Ordering::Acquire);
-        assert_eq!(entry, published[index], "cold cells expose the native contract");
+        let entry =
+            unsafe { &*cell.entry_address(slice) }.load(std::sync::atomic::Ordering::Acquire);
+        assert_eq!(
+            entry, published[index],
+            "cold cells expose the native contract"
+        );
         assert_ne!(cell.entry_address(slice), cell.checked_entry_address(slice));
     }
     assert!(cell.is_cold());
@@ -172,8 +175,9 @@ fn native_v2_call_cells_capture_after_rust_reentry_and_run_cleanup_once() {
     let artifact = input.with_gc_stable(compile_t2_artifact).unwrap();
     assert!(
         install_t2_completion(T2Completion {
-                    panicked: false,
-                    _permit: None, dependencies: Vec::new(),
+            panicked: false,
+            _permit: None,
+            dependencies: Vec::new(),
             sym: symbol,
             generation,
             artifact: Some(artifact),

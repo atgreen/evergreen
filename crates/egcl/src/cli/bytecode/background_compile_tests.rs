@@ -401,22 +401,36 @@ fn background_t2_rejects_changed_return_hint_dependency() {
         &mut env,
     )
     .unwrap();
-    let callee = resolve_sym("BACKGROUND-FLOAT-SOURCE").unwrap().as_symbol_index();
-    let caller = resolve_sym("BACKGROUND-FLOAT-USER").unwrap().as_symbol_index();
+    let callee = resolve_sym("BACKGROUND-FLOAT-SOURCE")
+        .unwrap()
+        .as_symbol_index();
+    let caller = resolve_sym("BACKGROUND-FLOAT-USER")
+        .unwrap()
+        .as_symbol_index();
     let input = snapshot_t2_input(caller, 1).unwrap();
-    assert!(input.inline_bodies.iter().any(|saved| saved.symbol == callee && saved.hint_only),
-        "a cold helper must supply a completion dependency without enabling inlining");
+    assert!(
+        input
+            .inline_bodies
+            .iter()
+            .any(|saved| saved.symbol == callee && saved.hint_only),
+        "a cold helper must supply a completion dependency without enabling inlining"
+    );
     let hold = Hold::new(caller, true);
     assert!(request_t2_compilation(caller, 1));
     hold.await_worker();
     super::super::read_eval_all_env("(defun background-float-source (x) 29)", &mut env).unwrap();
     drop(hold);
-    assert!(wait_for_t2(caller).is_none(),
-        "a summary captured before redefinition must not install afterwards");
+    assert!(
+        wait_for_t2(caller).is_none(),
+        "a summary captured before redefinition must not install afterwards"
+    );
     assert!(!T2_DECLINED.with(|declined| declined.borrow().contains(&caller)));
     assert!(request_t2_compilation(caller, 1));
     let code = wait_for_t2(caller).unwrap();
-    assert_eq!(run_native(&code, caller, &[NIL], &mut env).unwrap(), EgclVal::from_fixnum(29));
+    assert_eq!(
+        run_native(&code, caller, &[NIL], &mut env).unwrap(),
+        EgclVal::from_fixnum(29)
+    );
     registry_remove(caller);
     registry_remove(callee);
 }

@@ -8,10 +8,10 @@
 //! These tests exercise `full_gc`, so — like the other GC tests in the tree —
 //! they serialize on a process-global lock and live in their own binary.
 
-use std::sync::{Mutex, OnceLock};
 use egcl_rt::object::type_id;
-use egcl_rt::value::{NIL, EgclVal};
+use egcl_rt::value::{EgclVal, NIL};
 use egcl_stdlib::{MakeHashTableOptions, gethash, make_hash_table, set_gethash};
+use std::sync::{Mutex, OnceLock};
 
 fn lock() -> &'static Mutex<()> {
     static L: OnceLock<Mutex<()>> = OnceLock::new();

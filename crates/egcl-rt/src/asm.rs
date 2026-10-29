@@ -403,8 +403,11 @@ impl Asm {
     #[cfg(target_arch = "x86_64")]
     pub fn lea_rip_label(&mut self, register: u8, label: Label) {
         assert!(register < 16);
-        self.extend_from_slice(&[0x48 | if register >= 8 { 4 } else { 0 }, 0x8d,
-            ((register & 7) << 3) | 5]);
+        self.extend_from_slice(&[
+            0x48 | if register >= 8 { 4 } else { 0 },
+            0x8d,
+            ((register & 7) << 3) | 5,
+        ]);
         self.reserve_rel32(label);
     }
 
@@ -749,13 +752,18 @@ mod adjacent_store_tests {
     }
     #[test]
     fn bytes_calls_and_patches_invalidate_store_knowledge() {
-        let mut a = stored(); a.push(0x90);
+        let mut a = stored();
+        a.push(0x90);
         assert_eq!(a.preceding_rsp_store(24), None);
-        let mut a = stored(); a.extend_from_slice(&[0x48, 0x31, 0xc0]);
+        let mut a = stored();
+        a.extend_from_slice(&[0x48, 0x31, 0xc0]);
         assert_eq!(a.preceding_rsp_store(24), None);
-        let mut a = stored(); let l = a.label(); a.call(l);
+        let mut a = stored();
+        let l = a.label();
+        a.call(l);
         assert_eq!(a.preceding_rsp_store(24), None);
-        let mut a = stored(); a.patch_u8(0, 0x49);
+        let mut a = stored();
+        a.patch_u8(0, 0x49);
         assert_eq!(a.preceding_rsp_store(24), None);
     }
     #[test]

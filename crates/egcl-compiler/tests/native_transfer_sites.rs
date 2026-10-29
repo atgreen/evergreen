@@ -636,26 +636,44 @@ fn native_spill_capture_uses_updated_copy_and_repairs_the_original_home() {
     let mut emitted = site(12, 0);
     emitted.native_spills = vec![(Location::Stack(StackSlot(0)), 1)];
     let table = SysvTransferTable::new(64, vec![emitted]).unwrap();
-    let mut snapshot = table.lookup(0x1000, 0x100c).unwrap().reserve_snapshot().unwrap();
+    let mut snapshot = table
+        .lookup(0x1000, 0x100c)
+        .unwrap()
+        .reserve_snapshot()
+        .unwrap();
     let stale = EgclVal::from_fixnum(1);
     let current = EgclVal::from_fixnum(2);
     let mut words = [0, 0, stale.to_raw(), current.to_raw()];
     let mut capture = SysvTransferCapture {
-        request: std::ptr::null_mut(), value: NIL, exit: NativeExit::Transfer,
-        preserved: [0; 6], caller_sp: words.as_mut_ptr(), return_pc: 0x100c as *const u8,
+        request: std::ptr::null_mut(),
+        value: NIL,
+        exit: NativeExit::Transfer,
+        preserved: [0; 6],
+        caller_sp: words.as_mut_ptr(),
+        return_pc: 0x100c as *const u8,
     };
     // There is no activation storage to supply or scan.
-    unsafe { snapshot.capture(0x1000, &capture).unwrap(); }
-    assert_eq!(snapshot.reconstruct(|_| panic!("no floats")).unwrap()[0].locals, vec![current]);
-    unsafe { snapshot.write_back(0x1000, &mut capture).unwrap(); }
+    unsafe {
+        snapshot.capture(0x1000, &capture).unwrap();
+    }
+    assert_eq!(
+        snapshot.reconstruct(|_| panic!("no floats")).unwrap()[0].locals,
+        vec![current]
+    );
+    unsafe {
+        snapshot.write_back(0x1000, &mut capture).unwrap();
+    }
     assert_eq!(&words[2..], &[current.to_raw(), current.to_raw()]);
 }
 
 #[test]
 fn native_spill_maps_reject_out_of_bounds_or_ambiguous_backing() {
     let root = Location::Stack(StackSlot(0));
-    for spills in [vec![(root, 2)], vec![(root, 1), (root, 1)],
-        vec![(Location::Stack(StackSlot(1)), 0)]] {
+    for spills in [
+        vec![(root, 2)],
+        vec![(root, 1), (root, 1)],
+        vec![(Location::Stack(StackSlot(1)), 0)],
+    ] {
         let mut emitted = site(12, 0);
         emitted.native_spills = spills;
         assert!(SysvTransferTable::new(64, vec![emitted]).is_err());

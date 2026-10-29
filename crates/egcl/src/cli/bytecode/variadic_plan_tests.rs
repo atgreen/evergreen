@@ -15,7 +15,11 @@ fn general_binds() -> u64 {
 /// list in `calls`, returning the printed result or `ERROR` for each.
 fn outcomes(source: &str, vars: &str, calls: &[&str], env: &mut Env) -> Vec<String> {
     egcl_rt::rooted!(params = reader::read_from_string(source).unwrap().0);
-    egcl_rt::rooted!(forms = reader::read_from_string(&format!("((list {vars}))")).unwrap().0);
+    egcl_rt::rooted!(
+        forms = reader::read_from_string(&format!("((list {vars}))"))
+            .unwrap()
+            .0
+    );
     let body = Arc::new(
         compile_function("VARIADIC-PLAN-PROBE", *params, *forms, env, false, false)
             .expect("probe compiles to bytecode"),
@@ -61,14 +65,20 @@ fn a_keyword_call_binds_without_the_general_binder() {
         &mut env,
     );
     assert_eq!(results, ["(1 2)", "(1 NIL)", "(1 2)"]);
-    assert_eq!(fallbacks, 0, "an ordinary &key call must not re-parse its lambda list");
+    assert_eq!(
+        fallbacks, 0,
+        "an ordinary &key call must not re-parse its lambda list"
+    );
     let (_, fallbacks) = both(
         "(x &optional (y 3 y-p) &rest r)",
         "x y y-p r",
         &["(1)", "(1 2)", "(1 2 3 4)"],
         &mut env,
     );
-    assert_eq!(fallbacks, 0, "constant &optional defaults and &rest are planned");
+    assert_eq!(
+        fallbacks, 0,
+        "constant &optional defaults and &rest are planned"
+    );
 }
 
 #[test]
@@ -83,7 +93,13 @@ fn the_plan_matches_the_general_binder() {
     let (results, fallbacks) = both(
         "(x &key a)",
         "x a",
-        &["(1 :b 2)", "(1 :a)", "(1 2 3)", "()", "(1 :allow-other-keys t :b 2)"],
+        &[
+            "(1 :b 2)",
+            "(1 :a)",
+            "(1 2 3)",
+            "()",
+            "(1 :allow-other-keys t :b 2)",
+        ],
         &mut env,
     );
     assert_eq!(results[..4], ["ERROR", "ERROR", "ERROR", "ERROR"]);
@@ -122,7 +138,12 @@ fn the_plan_matches_the_general_binder() {
     );
     assert_eq!(results, ["(1 5 NIL)", "(1 2 2)"]);
     assert_eq!(fallbacks, 1);
-    both("(x &optional (y x) &rest r)", "x y r", &["(1)", "(1 2)", "(1 2 3)"], &mut env);
+    both(
+        "(x &optional (y x) &rest r)",
+        "x y r",
+        &["(1)", "(1 2)", "(1 2 3)"],
+        &mut env,
+    );
     both(
         "(&optional a b &key c)",
         "a b c",

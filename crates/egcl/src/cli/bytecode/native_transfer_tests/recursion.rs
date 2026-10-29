@@ -50,8 +50,14 @@ fn native_v2_recursive_frames_preserve_moving_roots_and_retire_on_error() {
         assert!(code.value_maps_for_test().iter().next().is_some());
         let symbol = egcl_rt::symbols::intern(name);
         let installed = native_transfer_entry::install_baseline_code(symbol, code).unwrap();
-        publish_native(symbol, egcl_rt::symbols::symbol_function(symbol), &installed);
-        let NativeCodeStorage::Mapped(code) = &installed._storage else { unreachable!() };
+        publish_native(
+            symbol,
+            egcl_rt::symbols::symbol_function(symbol),
+            &installed,
+        );
+        let NativeCodeStorage::Mapped(code) = &installed._storage else {
+            unreachable!()
+        };
         egcl_rt::rooted!(
             args = vec![
                 EgclVal::from_fixnum(8),

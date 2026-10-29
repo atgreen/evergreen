@@ -383,7 +383,10 @@ fn package_lifecycle_retires_owned_keys_and_preserves_retained_symbol_cells() {
     egcl_rt::symbols::set_symbol_plist(index, value);
     assert!(unintern(old, first).unwrap());
     assert_eq!(egcl_rt::symbols::registry_key(index), None);
-    assert_eq!(egcl_rt::symbols::symbol_package(index), Some(egcl_rt::value::NIL));
+    assert_eq!(
+        egcl_rt::symbols::symbol_package(index),
+        Some(egcl_rt::value::NIL)
+    );
     let (current, status) = intern("FOO", first).unwrap();
     assert_eq!(status, InternStatus::New);
     assert_ne!(current, old);

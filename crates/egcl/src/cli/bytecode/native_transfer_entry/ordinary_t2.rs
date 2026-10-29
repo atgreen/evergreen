@@ -33,7 +33,10 @@ pub(in crate::cli::bytecode) fn prepare_ordinary_t2(
     }
     if !local_control_native_body(&input.body, true, true, false) {
         let op = first_refused_local_control_op(&input.body, true, true, false);
-        return decline(&format!("unsupported instruction {}", op.as_deref().unwrap_or("?")));
+        return decline(&format!(
+            "unsupported instruction {}",
+            op.as_deref().unwrap_or("?")
+        ));
     }
     // Transfer capture currently reconstructs one logical frame. In particular,
     // never attach the root body's scope map to an inlined callee's bytecode PC.
@@ -47,11 +50,16 @@ pub(in crate::cli::bytecode) fn prepare_ordinary_t2(
     let has_raw = (0..optimized.num_values())
         .any(|index| optimized.value(Value(index as u32)).repr != ValueRepresentation::Tagged);
     let admitted_body = raw_numeric_native_body(&input.body, optimized);
-    if has_raw && (!admitted_body
-        || (0..optimized.num_values()).any(|index| !matches!(
-            optimized.value(Value(index as u32)).repr,
-            ValueRepresentation::Tagged | ValueRepresentation::UnboxedF64
-                | ValueRepresentation::UnboxedFixnum)))
+    if has_raw
+        && (!admitted_body
+            || (0..optimized.num_values()).any(|index| {
+                !matches!(
+                    optimized.value(Value(index as u32)).repr,
+                    ValueRepresentation::Tagged
+                        | ValueRepresentation::UnboxedF64
+                        | ValueRepresentation::UnboxedFixnum
+                )
+            }))
     {
         return decline("unsupported raw representation or control scope");
     }
@@ -71,25 +79,42 @@ pub(in crate::cli::bytecode) fn prepare_ordinary_t2(
     }
     let context = input.mapped_context.as_ref()?;
     let emitted = match EmittedTransfer::try_emit_prepared_with_ordinary(
-        &input.body, &mapped, Some(optimized), true,
-        &input.call_cells, context, CompilationTier::T2,
+        &input.body,
+        &mapped,
+        Some(optimized),
+        true,
+        &input.call_cells,
+        context,
+        CompilationTier::T2,
     ) {
         Ok(emitted) => emitted,
         Err(error) => return decline(&format!("emission: {error}")),
     };
-    let clear_mv_resets = mapped.block_order().iter()
+    let clear_mv_resets = mapped
+        .block_order()
+        .iter()
         .flat_map(|&block| mapped.block(block).insts.iter())
         .filter(|&&inst| mapped.inst(inst).opcode == egcl_compiler::t2::ir::Opcode::ClearMv)
         .count();
-    let raw_f64_values = (0..mapped.num_values()).filter(|&index|
-        mapped.value(Value(index as u32)).repr == ValueRepresentation::UnboxedF64
-    ).count();
-    let raw_fixnum_values = (0..mapped.num_values()).filter(|&index|
-        mapped.value(Value(index as u32)).repr == ValueRepresentation::UnboxedFixnum
-    ).count();
-    let (allocation_extent_values, extent_bounds_proofs, allocation_dimension_proofs) = emitted.allocation_extent_counts();
-    Some(PreparedT2 { emitted, clear_mv_resets, raw_f64_values, raw_fixnum_values,
-        allocation_extent_values, extent_bounds_proofs, allocation_dimension_proofs })
+    let raw_f64_values = (0..mapped.num_values())
+        .filter(|&index| mapped.value(Value(index as u32)).repr == ValueRepresentation::UnboxedF64)
+        .count();
+    let raw_fixnum_values = (0..mapped.num_values())
+        .filter(|&index| {
+            mapped.value(Value(index as u32)).repr == ValueRepresentation::UnboxedFixnum
+        })
+        .count();
+    let (allocation_extent_values, extent_bounds_proofs, allocation_dimension_proofs) =
+        emitted.allocation_extent_counts();
+    Some(PreparedT2 {
+        emitted,
+        clear_mv_resets,
+        raw_f64_values,
+        raw_fixnum_values,
+        allocation_extent_values,
+        extent_bounds_proofs,
+        allocation_dimension_proofs,
+    })
 }
 
 pub(in crate::cli::bytecode) fn install_ordinary_t2(
@@ -121,27 +146,31 @@ pub(in crate::cli::bytecode) fn install_ordinary_t2(
         deopt_bodies,
     });
     let roots = retain_native_body(body);
-    let mut code = match prepared.emitted.install(Arc::clone(body), roots, Some(Arc::clone(&metadata))) {
-        Ok(code) => code,
-        Err(decline) => {
-            if let Some((tagged, speculations)) = artifact.mapped_fallback.take() {
-                // A raw double candidate declined; install the tagged artifact
-                // with its own speculation metadata instead (bliss-thcbb).
+    let mut code =
+        match prepared
+            .emitted
+            .install(Arc::clone(body), roots, Some(Arc::clone(&metadata)))
+        {
+            Ok(code) => code,
+            Err(decline) => {
+                if let Some((tagged, speculations)) = artifact.mapped_fallback.take() {
+                    // A raw double candidate declined; install the tagged artifact
+                    // with its own speculation metadata instead (bliss-thcbb).
+                    t2_log_write(format_args!(
+                        "{}: raw numeric T2 emission declined ({decline}); installing tagged T2",
+                        display_fn_name(&body.name)
+                    ));
+                    artifact.mapped = Some(tagged);
+                    artifact.speculations = speculations;
+                    return install_ordinary_t2(symbol, body, artifact);
+                }
                 t2_log_write(format_args!(
-                    "{}: raw numeric T2 emission declined ({decline}); installing tagged T2",
+                    "{}: mapped T2 emission declined ({decline}); keep mapped T1 or interpreter",
                     display_fn_name(&body.name)
                 ));
-                artifact.mapped = Some(tagged);
-                artifact.speculations = speculations;
-                return install_ordinary_t2(symbol, body, artifact);
+                return None;
             }
-            t2_log_write(format_args!(
-                "{}: mapped T2 emission declined ({decline}); keep mapped T1 or interpreter",
-                display_fn_name(&body.name)
-            ));
-            return None;
-        }
-    };
+        };
     code.set_installed_symbol(symbol);
     let code = Rc::new(code);
     let entry = code.code.as_ptr();
@@ -177,7 +206,9 @@ pub(in crate::cli::bytecode) fn install_ordinary_t2(
         let extent_bounds_proofs = prepared.extent_bounds_proofs;
         let allocation_dimension_proofs = prepared.allocation_dimension_proofs;
         let abi = match &native._storage {
-            NativeCodeStorage::Mapped(code) if code.ordinary_entry.is_some() => "ordinary x86-64 Lisp",
+            NativeCodeStorage::Mapped(code) if code.ordinary_entry.is_some() => {
+                "ordinary x86-64 Lisp"
+            }
             _ => "mapped",
         };
         t2_log_write(format_args!(
@@ -191,37 +222,59 @@ pub(in crate::cli::bytecode) fn install_ordinary_t2(
 /// Only source-proven calls in this retained body's logical frame chain can
 /// bind directly. Each suspended parent must itself be a proven self expansion;
 /// matching names in arbitrary inlined frames do not establish identity.
-pub(super) fn proven_self_calls(ir: &Function, body: &BytecodeFunction, symbol: u32) -> Vec<egcl_compiler::t2::ir::Inst> {
+pub(super) fn proven_self_calls(
+    ir: &Function,
+    body: &BytecodeFunction,
+    symbol: u32,
+) -> Vec<egcl_compiler::t2::ir::Inst> {
     use egcl_compiler::t2::ir::{AuxData, Opcode};
-    let Ok(depths) = verified_operand_stack_depths(body) else { return Vec::new() };
+    let Ok(depths) = verified_operand_stack_depths(body) else {
+        return Vec::new();
+    };
     let proven_site = |pc: u32| {
         body.self_call_sites.binary_search(&pc).is_ok()
             && matches!(body.code.get(pc as usize), Some(Instr::CallNamed { sym, nargs })
                 if *sym == symbol && *nargs == body.arity)
     };
-    ir.block_order().iter().flat_map(|&block| ir.block(block).insts.iter().copied())
+    ir.block_order()
+        .iter()
+        .flat_map(|&block| ir.block(block).insts.iter().copied())
         .filter(|&inst| {
             let data = ir.inst(inst);
-            if data.opcode != Opcode::Call || !matches!(data.aux, AuxData::CallTarget(target) if target == symbol) {
+            if data.opcode != Opcode::Call
+                || !matches!(data.aux, AuxData::CallTarget(target) if target == symbol)
+            {
                 return false;
             }
-            let Some(state) = data.frame_state else { return false };
+            let Some(state) = data.frame_state else {
+                return false;
+            };
             let scopes = &ir.frame_states.get(state).scopes;
-            !scopes.is_empty() && data.args.len() == usize::from(body.arity)
+            !scopes.is_empty()
+                && data.args.len() == usize::from(body.arity)
                 && scopes.iter().enumerate().all(|(index, scope)| {
                     let suspended = index + 1 < scopes.len();
-                    if scope.function != symbol || scope.locals.len() != usize::from(body.n_locals)
+                    if scope.function != symbol
+                        || scope.locals.len() != usize::from(body.n_locals)
                         || depths.get(scope.bcp as usize).copied().flatten()
                             != Some(scope.stack.len() as u32 + u32::from(suspended))
-                    { return false; }
+                    {
+                        return false;
+                    }
                     if suspended {
-                        scope.bcp.checked_sub(1).is_some_and(|pc| proven_site(pc)
-                            && depths.get(pc as usize).copied().flatten()
-                                .and_then(|depth| depth.checked_sub(u32::from(body.arity)))
-                                == Some(scope.stack.len() as u32))
+                        scope.bcp.checked_sub(1).is_some_and(|pc| {
+                            proven_site(pc)
+                                && depths
+                                    .get(pc as usize)
+                                    .copied()
+                                    .flatten()
+                                    .and_then(|depth| depth.checked_sub(u32::from(body.arity)))
+                                    == Some(scope.stack.len() as u32)
+                        })
                     } else {
                         proven_site(scope.bcp)
                     }
                 })
-        }).collect()
+        })
+        .collect()
 }

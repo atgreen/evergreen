@@ -5,13 +5,13 @@
 //! segment landing, without skipping any live Rust helper or its destructor.
 #![cfg(all(target_arch = "x86_64", target_os = "linux"))]
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use egcl_rt::EgclVal;
 use egcl_rt::native_transfer::{self, NativeExit, NativeSegment};
 use egcl_rt::runtime::{
     check_sigsegv_null_guard, check_sigsegv_stack_guard, current_sigsegv_null_guard_recovery_ip,
     current_sigsegv_stack_guard_recovery_ip, set_sigsegv_recovery_ips,
 };
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 static DROPS: AtomicUsize = AtomicUsize::new(0);
 

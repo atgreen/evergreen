@@ -14,11 +14,13 @@ use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use egcl_rt::error::EgclError;
 use egcl_rt::lock_order::{LockLevel, OrderedMutex};
 use egcl_rt::object::type_id;
-use egcl_rt::value::{NIL, T, EgclVal, UNBOUND};
+use egcl_rt::value::{EgclVal, NIL, T, UNBOUND};
 
 mod runtime_definition;
-pub use runtime_definition::{RuntimeClassDefinition, RuntimeSlotDefinition, RuntimeClassSlotCells, SlotAllocation,
-    class_runtime_definition, class_runtime_shared_cells, set_class_runtime_definition};
+pub use runtime_definition::{
+    RuntimeClassDefinition, RuntimeClassSlotCells, RuntimeSlotDefinition, SlotAllocation,
+    class_runtime_definition, class_runtime_shared_cells, set_class_runtime_definition,
+};
 
 // ── Method combination ─────────────────────────────────────────────
 
@@ -372,7 +374,11 @@ unsafe fn migrate_obsolete(inst: EgclVal) -> (EgclVal, Option<RedefinitionUpdate
         let update = {
             let old_names = &(*w).layout.order;
             let empty: Vec<EgclVal> = Vec::new();
-            let new_names = if nw.is_null() { &empty } else { &(*nw).layout.order };
+            let new_names = if nw.is_null() {
+                &empty
+            } else {
+                &(*nw).layout.order
+            };
             let added: Vec<EgclVal> = new_names
                 .iter()
                 .copied()
@@ -849,10 +855,14 @@ fn visit_clos_roots(visit: &mut dyn FnMut(*mut EgclVal), root_definitions: bool)
             visit(&mut meta.protocol.runtime_default_initargs);
             visit(&mut meta.protocol.runtime_slots);
             if let Some(cpl) = &mut meta.protocol.cpl {
-                for value in cpl { visit(value); }
+                for value in cpl {
+                    visit(value);
+                }
             }
             if let Some(slots) = &mut meta.protocol.instance_slots {
-                for value in slots { visit(value); }
+                for value in slots {
+                    visit(value);
+                }
             }
             visit(&mut meta.name);
             for value in &mut meta.direct_supers {
@@ -1233,7 +1243,10 @@ pub fn serialize_clos_state() -> Vec<u8> {
             out.push(meta.protocol.cpl.is_some() as u8);
             cs_put_vals(&mut out, meta.protocol.cpl.as_deref().unwrap_or(&[]));
             out.push(meta.protocol.instance_slots.is_some() as u8);
-            cs_put_vals(&mut out, meta.protocol.instance_slots.as_deref().unwrap_or(&[]));
+            cs_put_vals(
+                &mut out,
+                meta.protocol.instance_slots.as_deref().unwrap_or(&[]),
+            );
             out.push(meta.runtime_definition.is_some() as u8);
             if let Some(definition) = &meta.runtime_definition {
                 runtime_definition::snapshot_definition(&mut out, definition);
@@ -1403,16 +1416,31 @@ pub fn restore_clos_state(data: &[u8], remap: &dyn Fn(u64) -> u64) -> Result<usi
         let instance_slots = cs_get_vals(data, &mut off, remap).ok_or_else(bad)?;
         let runtime_definition = match cs_get_u8(data, &mut off).ok_or_else(bad)? {
             0 => None,
-            1 => Some(runtime_definition::restore_definition(data, &mut off, remap)
-                .ok_or_else(bad)?),
+            1 => Some(
+                runtime_definition::restore_definition(data, &mut off, remap).ok_or_else(bad)?,
+            ),
             _ => return Err(bad()),
         };
-        if runtime_definition.as_ref().is_some_and(|definition| definition.owner != class) {
-            return Err(EgclError::InvalidImage("CLOS state section: mismatched runtime class owner".into()));
+        if runtime_definition
+            .as_ref()
+            .is_some_and(|definition| definition.owner != class)
+        {
+            return Err(EgclError::InvalidImage(
+                "CLOS state section: mismatched runtime class owner".into(),
+            ));
         }
-        let protocol = ClassProtocol { direct_slots, direct_ready, effective_slots,
-            default_initargs, runtime_default_initargs, runtime_slots, computed, finalized, cpl: has_cpl.then_some(cpl),
-            instance_slots: has_slots.then_some(instance_slots) };
+        let protocol = ClassProtocol {
+            direct_slots,
+            direct_ready,
+            effective_slots,
+            default_initargs,
+            runtime_default_initargs,
+            runtime_slots,
+            computed,
+            finalized,
+            cpl: has_cpl.then_some(cpl),
+            instance_slots: has_slots.then_some(instance_slots),
+        };
         st.class_meta.insert(
             class,
             ClassMeta {
@@ -1860,11 +1888,42 @@ fn initialize_clos(reset: bool) -> Result<(), EgclError> {
         unsafe { set_instance_wrapper(class, standard_class_wrapper) };
     }
     for class in [
-        t_cls, fix_cls, chr_cls, sym_cls, nul_cls, con_cls, flt_cls, fun_cls, hpo_cls, num_cls,
-        real_cls, ratl_cls, int_cls, ratio_cls, cplx_cls, seq_cls, list_cls, arr_cls, vec_cls,
-        str_cls, bitv_cls, htbl_cls, stream_cls, bstream_cls, cstream_cls, estream_cls,
-        fstream_cls, sstream_cls, ystream_cls, tstream_cls, path_cls, lpath_cls, pkg_cls,
-        rstate_cls, rtable_cls, sobj_cls,
+        t_cls,
+        fix_cls,
+        chr_cls,
+        sym_cls,
+        nul_cls,
+        con_cls,
+        flt_cls,
+        fun_cls,
+        hpo_cls,
+        num_cls,
+        real_cls,
+        ratl_cls,
+        int_cls,
+        ratio_cls,
+        cplx_cls,
+        seq_cls,
+        list_cls,
+        arr_cls,
+        vec_cls,
+        str_cls,
+        bitv_cls,
+        htbl_cls,
+        stream_cls,
+        bstream_cls,
+        cstream_cls,
+        estream_cls,
+        fstream_cls,
+        sstream_cls,
+        ystream_cls,
+        tstream_cls,
+        path_cls,
+        lpath_cls,
+        pkg_cls,
+        rstate_cls,
+        rtable_cls,
+        sobj_cls,
     ] {
         unsafe { set_instance_wrapper(class, builtin_class_wrapper) };
     }
@@ -2314,149 +2373,161 @@ fn define_class_with_shared_slots_mode(
     staged: bool,
 ) -> Result<(), EgclError> {
     let key = class_name_key(name);
-    let (was_forward_referenced, standard_class) = with_state_mut(|st| -> Result<(bool, EgclVal), EgclError> {
-        // Track handle-id registration order (for diamond-hierarchy inference)
-        if class.is_meta_handle() {
-            let fv = class.as_meta_handle_id();
-            if !st.fixnum_registrations.iter().any(|(v, _)| *v == fv) {
-                st.fixnum_registrations.push((fv, class));
-            }
-        }
-
-        st.class_registry.insert(name, class);
-        if let Some(key) = key {
-            st.class_by_name.insert(key, class);
-        }
-
-        let supers =
-            if direct_supers.is_empty() && st.bootstrapped && st.standard_object_class != NIL {
-                vec![st.standard_object_class]
-            } else {
-                direct_supers.to_vec()
-            };
-
-        // Register as subclass of each superclass
-        for &s in &supers {
-            if let Some(meta) = st.class_meta.get_mut(&s) {
-                if !meta.direct_subs.contains(&class) {
-                    meta.direct_subs.push(class);
+    let (was_forward_referenced, standard_class) =
+        with_state_mut(|st| -> Result<(bool, EgclVal), EgclError> {
+            // Track handle-id registration order (for diamond-hierarchy inference)
+            if class.is_meta_handle() {
+                let fv = class.as_meta_handle_id();
+                if !st.fixnum_registrations.iter().any(|(v, _)| *v == fv) {
+                    st.fixnum_registrations.push((fv, class));
                 }
             }
-        }
 
-        // Preserve any existing wrapper pointer so we can obsolete it on
-        // redefinition (below); the layout is recomputed fresh regardless.
-        let prev_wrapper = st
-            .class_meta
-            .get(&class)
-            .and_then(|m| m.wrapper)
-            .map(|wrapper| wrapper as *const ClassWrapper as *mut ClassWrapper)
-            .unwrap_or(std::ptr::null_mut());
-
-        // Whether this class is a forward reference being DEFINED. Its own
-        // wrapper still says FORWARD-REFERENCED-CLASS, and defining it makes
-        // that false: the wrapper has to be repointed, or `class_of` keeps
-        // answering the placeholder metaclass while the metadata says otherwise
-        // (R9.39). Repointed by the caller below, outside this lock, because
-        // repointing allocates storage.
-        let was_forward_referenced = st
-            .class_meta
-            .get(&class)
-            .is_some_and(|m| m.forward_referenced);
-
-        // Subclasses already recorded for this class survive a redefinition.
-        // The insert below used to reset them to empty, which silently cut a
-        // class off from its own subclasses -- and they are what the layout
-        // refresh at the end of this function walks.
-        let prev_subs = st
-            .class_meta
-            .get(&class)
-            .map(|m| m.direct_subs.clone())
-            .unwrap_or_default();
-
-        st.class_meta.insert(
-            class,
-            ClassMeta {
-                runtime_definition: None,
-                protocol: ClassProtocol { finalized: !staged, ..ClassProtocol::default() },
-                shared_slots: shared_slots.to_vec(),
-                name,
-                direct_supers: supers,
-                direct_subs: prev_subs,
-                slots: slots.to_vec(),
-                wrapper: if staged && !prev_wrapper.is_null() { Some(unsafe { &*prev_wrapper }) } else { None },
-                metaclass: NIL,
-                forward_referenced: false,
-            },
-        );
-
-        // Compute the effective slot layout and mint a fresh wrapper. On
-        // redefinition, mark the previous wrapper obsolete so instances created
-        // against it take the slow path on next access (they keep working
-        // against their frozen layout). See bliss-xyo / spec §5.3.4.
-        if !staged { finalize_class_layout(st, class); }
-        if !staged && !prev_wrapper.is_null() {
-            unsafe {
-                (*prev_wrapper)
-                    .state
-                    .store(WRAPPER_OBSOLETE, Ordering::Release);
+            st.class_registry.insert(name, class);
+            if let Some(key) = key {
+                st.class_by_name.insert(key, class);
             }
-        }
 
-        // Propagate to the subclasses (CLHS 4.3.6: redefining a class updates
-        // the instance structure of its subclasses too). A subclass's layout is
-        // frozen in its wrapper at ITS definition, so a subclass defined before
-        // this class had slots -- a forward-referenced superclass, say -- would
-        // otherwise keep a layout with none of them and `slot-value` would
-        // report the inherited slot as not present in the layout. Measured:
-        // (defclass sub (super) ...) then (defclass super () ((a))) left A
-        // unreachable on an instance of SUB.
-        //
-        // Breadth-first over the recorded subclass graph, visiting each class
-        // once so a diamond or a cycle cannot loop. Only classes that already
-        // have a wrapper are re-finalized; one that has never been instantiated
-        // builds its layout on first use anyway.
-        let mut queue: Vec<EgclVal> = st
-            .class_meta
-            .get(&class)
-            .map(|m| m.direct_subs.clone())
-            .unwrap_or_default();
-        let mut seen: HashSet<EgclVal> = HashSet::new();
-        seen.insert(class);
-        while let Some(sub) = queue.pop() {
-            if !seen.insert(sub) {
-                continue;
+            let supers =
+                if direct_supers.is_empty() && st.bootstrapped && st.standard_object_class != NIL {
+                    vec![st.standard_object_class]
+                } else {
+                    direct_supers.to_vec()
+                };
+
+            // Register as subclass of each superclass
+            for &s in &supers {
+                if let Some(meta) = st.class_meta.get_mut(&s) {
+                    if !meta.direct_subs.contains(&class) {
+                        meta.direct_subs.push(class);
+                    }
+                }
             }
-            let (had_wrapper, subs) = match st.class_meta.get(&sub) {
-                Some(meta) => (meta.wrapper.is_some(), meta.direct_subs.clone()),
-                None => continue,
-            };
-            queue.extend(subs);
-            if let Some(meta) = st.class_meta.get_mut(&sub) {
-                meta.protocol.invalidate_computed();
-                if !staged { meta.protocol.finalized = true; }
-            }
-            if staged || !had_wrapper {
-                continue;
-            }
-            let stale = st
+
+            // Preserve any existing wrapper pointer so we can obsolete it on
+            // redefinition (below); the layout is recomputed fresh regardless.
+            let prev_wrapper = st
                 .class_meta
-                .get(&sub)
+                .get(&class)
                 .and_then(|m| m.wrapper)
-                .map(|w| w as *const ClassWrapper as *mut ClassWrapper)
+                .map(|wrapper| wrapper as *const ClassWrapper as *mut ClassWrapper)
                 .unwrap_or(std::ptr::null_mut());
-            if let Some(meta) = st.class_meta.get_mut(&sub) {
-                meta.wrapper = None;
-                meta.protocol.finalized = true;
-            }
-            finalize_class_layout(st, sub);
-            if !stale.is_null() {
-                unsafe { (*stale).state.store(WRAPPER_OBSOLETE, Ordering::Release) };
-            }
-        }
 
-        Ok((was_forward_referenced, st.standard_class))
-    })?;
+            // Whether this class is a forward reference being DEFINED. Its own
+            // wrapper still says FORWARD-REFERENCED-CLASS, and defining it makes
+            // that false: the wrapper has to be repointed, or `class_of` keeps
+            // answering the placeholder metaclass while the metadata says otherwise
+            // (R9.39). Repointed by the caller below, outside this lock, because
+            // repointing allocates storage.
+            let was_forward_referenced = st
+                .class_meta
+                .get(&class)
+                .is_some_and(|m| m.forward_referenced);
+
+            // Subclasses already recorded for this class survive a redefinition.
+            // The insert below used to reset them to empty, which silently cut a
+            // class off from its own subclasses -- and they are what the layout
+            // refresh at the end of this function walks.
+            let prev_subs = st
+                .class_meta
+                .get(&class)
+                .map(|m| m.direct_subs.clone())
+                .unwrap_or_default();
+
+            st.class_meta.insert(
+                class,
+                ClassMeta {
+                    runtime_definition: None,
+                    protocol: ClassProtocol {
+                        finalized: !staged,
+                        ..ClassProtocol::default()
+                    },
+                    shared_slots: shared_slots.to_vec(),
+                    name,
+                    direct_supers: supers,
+                    direct_subs: prev_subs,
+                    slots: slots.to_vec(),
+                    wrapper: if staged && !prev_wrapper.is_null() {
+                        Some(unsafe { &*prev_wrapper })
+                    } else {
+                        None
+                    },
+                    metaclass: NIL,
+                    forward_referenced: false,
+                },
+            );
+
+            // Compute the effective slot layout and mint a fresh wrapper. On
+            // redefinition, mark the previous wrapper obsolete so instances created
+            // against it take the slow path on next access (they keep working
+            // against their frozen layout). See bliss-xyo / spec §5.3.4.
+            if !staged {
+                finalize_class_layout(st, class);
+            }
+            if !staged && !prev_wrapper.is_null() {
+                unsafe {
+                    (*prev_wrapper)
+                        .state
+                        .store(WRAPPER_OBSOLETE, Ordering::Release);
+                }
+            }
+
+            // Propagate to the subclasses (CLHS 4.3.6: redefining a class updates
+            // the instance structure of its subclasses too). A subclass's layout is
+            // frozen in its wrapper at ITS definition, so a subclass defined before
+            // this class had slots -- a forward-referenced superclass, say -- would
+            // otherwise keep a layout with none of them and `slot-value` would
+            // report the inherited slot as not present in the layout. Measured:
+            // (defclass sub (super) ...) then (defclass super () ((a))) left A
+            // unreachable on an instance of SUB.
+            //
+            // Breadth-first over the recorded subclass graph, visiting each class
+            // once so a diamond or a cycle cannot loop. Only classes that already
+            // have a wrapper are re-finalized; one that has never been instantiated
+            // builds its layout on first use anyway.
+            let mut queue: Vec<EgclVal> = st
+                .class_meta
+                .get(&class)
+                .map(|m| m.direct_subs.clone())
+                .unwrap_or_default();
+            let mut seen: HashSet<EgclVal> = HashSet::new();
+            seen.insert(class);
+            while let Some(sub) = queue.pop() {
+                if !seen.insert(sub) {
+                    continue;
+                }
+                let (had_wrapper, subs) = match st.class_meta.get(&sub) {
+                    Some(meta) => (meta.wrapper.is_some(), meta.direct_subs.clone()),
+                    None => continue,
+                };
+                queue.extend(subs);
+                if let Some(meta) = st.class_meta.get_mut(&sub) {
+                    meta.protocol.invalidate_computed();
+                    if !staged {
+                        meta.protocol.finalized = true;
+                    }
+                }
+                if staged || !had_wrapper {
+                    continue;
+                }
+                let stale = st
+                    .class_meta
+                    .get(&sub)
+                    .and_then(|m| m.wrapper)
+                    .map(|w| w as *const ClassWrapper as *mut ClassWrapper)
+                    .unwrap_or(std::ptr::null_mut());
+                if let Some(meta) = st.class_meta.get_mut(&sub) {
+                    meta.wrapper = None;
+                    meta.protocol.finalized = true;
+                }
+                finalize_class_layout(st, sub);
+                if !stale.is_null() {
+                    unsafe { (*stale).state.store(WRAPPER_OBSOLETE, Ordering::Release) };
+                }
+            }
+
+            Ok((was_forward_referenced, st.standard_class))
+        })?;
     // Outside the lock, because repointing allocates slot storage: a class that
     // was a forward reference until a moment ago is now an ordinary standard
     // class, and its wrapper must say so. DEFSTRUCT and a `:metaclass` option
@@ -2472,7 +2543,13 @@ fn define_class_with_shared_slots_mode(
 /// `ClassWrapper` referencing a leaked, frozen `SlotLayout`. Built-in classes
 /// (never instantiated) are skipped and keep a null wrapper.
 fn finalize_class_layout(st: &mut ClosState, class: EgclVal) {
-    if st.class_meta.get(&class).is_some_and(|meta| !meta.protocol.finalized) { return; }
+    if st
+        .class_meta
+        .get(&class)
+        .is_some_and(|meta| !meta.protocol.finalized)
+    {
+        return;
+    }
     if is_builtin_class(st, class) {
         return;
     }
@@ -2482,22 +2559,31 @@ fn finalize_class_layout(st: &mut ClosState, class: EgclVal) {
     // A slot a more specific class declares :allocation :class shadows the
     // instance slot of the same name in a less specific class (CLHS 7.5.3).
     let mut shadowed: HashSet<EgclVal> = HashSet::new();
-    if let Some(names) = st.class_meta.get(&class).and_then(|meta| meta.protocol.instance_slots.as_ref()) {
-        for &name in names { index.insert(name, order.len()); order.push(name); }
-    } else { for c in &cpl {
-        if let Some(meta) = st.class_meta.get(c) {
-            for &slot_name in &meta.slots {
-                if shadowed.contains(&slot_name) {
-                    continue;
-                }
-                if let std::collections::hash_map::Entry::Vacant(e) = index.entry(slot_name) {
-                    e.insert(order.len());
-                    order.push(slot_name);
-                }
-            }
-            shadowed.extend(meta.shared_slots.iter().copied());
+    if let Some(names) = st
+        .class_meta
+        .get(&class)
+        .and_then(|meta| meta.protocol.instance_slots.as_ref())
+    {
+        for &name in names {
+            index.insert(name, order.len());
+            order.push(name);
         }
-    } }
+    } else {
+        for c in &cpl {
+            if let Some(meta) = st.class_meta.get(c) {
+                for &slot_name in &meta.slots {
+                    if shadowed.contains(&slot_name) {
+                        continue;
+                    }
+                    if let std::collections::hash_map::Entry::Vacant(e) = index.entry(slot_name) {
+                        e.insert(order.len());
+                        order.push(slot_name);
+                    }
+                }
+                shadowed.extend(meta.shared_slots.iter().copied());
+            }
+        }
+    }
     let slot_count = order.len() as u32;
     let layout = Box::leak(Box::new(SlotLayout { order, index }));
     let wrapper: &'static ClassWrapper = Box::leak(Box::new(ClassWrapper {
@@ -2625,19 +2711,28 @@ pub fn set_class_name(class: EgclVal, new_name: EgclVal) -> Result<EgclVal, Egcl
 /// can avoid invalidating caches for a no-op without a separate racy read.
 pub fn update_class_name(class: EgclVal, new_name: EgclVal) -> Result<bool, EgclError> {
     if !new_name.is_symbol() {
-        return Err(EgclError::TypeError { datum: new_name, expected: "SYMBOL".into() });
+        return Err(EgclError::TypeError {
+            datum: new_name,
+            expected: "SYMBOL".into(),
+        });
     }
     with_state_mut(|st| {
-        let meta = st.class_meta.get(&class).ok_or_else(|| EgclError::TypeError {
-            datum: class, expected: "CLASS".into(),
-        })?;
+        let meta = st
+            .class_meta
+            .get(&class)
+            .ok_or_else(|| EgclError::TypeError {
+                datum: class,
+                expected: "CLASS".into(),
+            })?;
         if meta.name == new_name {
             return Ok(false);
         }
         // Physical builtin predicates use their canonical metadata names.
         // User structure classes and forward references are not builtins.
         if !meta.forward_referenced && is_builtin_class(st, class) {
-            return Err(EgclError::ProgramError("cannot rename a built-in class".into()));
+            return Err(EgclError::ProgramError(
+                "cannot rename a built-in class".into(),
+            ));
         }
         st.class_meta.get_mut(&class).unwrap().name = new_name;
         Ok(true)
@@ -2796,7 +2891,12 @@ fn repoint_class_metaclass(class: EgclVal, metaclass: EgclVal) -> bool {
 /// Finalized on demand: a metaclass need never have been instantiated.
 fn metaclass_instance_wrapper(metaclass: EgclVal) -> *mut ClassWrapper {
     with_state_mut(|st| {
-        if st.class_meta.get(&metaclass).and_then(|m| m.wrapper).is_none() {
+        if st
+            .class_meta
+            .get(&metaclass)
+            .and_then(|m| m.wrapper)
+            .is_none()
+        {
             finalize_class_layout(st, metaclass);
         }
         st.class_meta
@@ -3052,13 +3152,20 @@ fn collect_hierarchy(
 /// list decides method order, so code ported from them must see the same
 /// order here.
 fn linearize_class_precedence(st: &ClosState, class: EgclVal) -> Result<Vec<EgclVal>, EgclError> {
-    if let Some(cpl) = st.class_meta.get(&class).and_then(|meta| meta.protocol.cpl.as_ref()) {
+    if let Some(cpl) = st
+        .class_meta
+        .get(&class)
+        .and_then(|meta| meta.protocol.cpl.as_ref())
+    {
         return Ok(cpl.clone());
     }
     compute_class_precedence_default(st, class)
 }
 
-fn compute_class_precedence_default(st: &ClosState, class: EgclVal) -> Result<Vec<EgclVal>, EgclError> {
+fn compute_class_precedence_default(
+    st: &ClosState,
+    class: EgclVal,
+) -> Result<Vec<EgclVal>, EgclError> {
     #[cfg(test)]
     cpl_tests::LINEARIZATIONS.with(|count| count.set(count.get() + 1));
     let mut classes: Vec<(EgclVal, Vec<EgclVal>)> = Vec::new();
@@ -3130,7 +3237,9 @@ fn compute_class_precedence_default(st: &ClosState, class: EgclVal) -> Result<Ve
 /// objects. See spec §5.3.4 / issue bliss-xyo.
 pub fn allocate_instance(class: EgclVal) -> Result<EgclVal, EgclError> {
     if !class_protocol_finalized(class) {
-        return Err(EgclError::ProgramError("class must be finalized before allocation".into()));
+        return Err(EgclError::ProgramError(
+            "class must be finalized before allocation".into(),
+        ));
     }
     // A class that exists only because another class named it as a superclass
     // is not finalized: nobody has said what slots it has, so an instance of it
@@ -3760,10 +3869,7 @@ pub fn slot_makunbound(instance: EgclVal, slot_name: EgclVal) -> Result<(), Egcl
 // ── Generic function dispatch ──────────────────────────────────────
 
 /// Create a generic function.
-pub fn make_generic_function(
-    name: EgclVal,
-    lambda_list: EgclVal,
-) -> Result<EgclVal, EgclError> {
+pub fn make_generic_function(name: EgclVal, lambda_list: EgclVal) -> Result<EgclVal, EgclError> {
     with_state_mut(|st| {
         let id = st.alloc_gf_id();
         st.generic_functions.insert(
@@ -4263,7 +4369,8 @@ pub fn compute_effective_method_with_standard_primary(
             });
             if invalid_qualifier {
                 return Err(EgclError::ProgramError(
-                    "an applicable method has a qualifier its method combination does not accept".into(),
+                    "an applicable method has a qualifier its method combination does not accept"
+                        .into(),
                 ));
             }
 
@@ -4624,7 +4731,10 @@ mod cpl_tests {
             vec![h, f, d, c, g, e, b, a]
         );
         // And the same classes' own lists, where the two rules agree.
-        assert_eq!(compute_class_precedence_list(f).unwrap(), vec![f, d, b, c, a]);
+        assert_eq!(
+            compute_class_precedence_list(f).unwrap(),
+            vec![f, d, b, c, a]
+        );
         assert_eq!(compute_class_precedence_list(g).unwrap(), vec![g, e, b, a]);
     }
 

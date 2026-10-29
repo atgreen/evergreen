@@ -52,9 +52,9 @@ use crate::t2::deopt::{
 };
 use crate::t2::mach::Location;
 use crate::t2::transfer_map::TransferCaptureMap;
-use std::cell::Cell;
 use egcl_rt::gc::TraceHostRoots;
-use egcl_rt::value::{NIL, EgclVal};
+use egcl_rt::value::{EgclVal, NIL};
+use std::cell::Cell;
 
 enum SavedWord {
     Tagged(Cell<EgclVal>),

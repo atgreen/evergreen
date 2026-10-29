@@ -146,7 +146,11 @@ pub fn specialize(f: &mut Function, raw: bool, options: &super::inlining::Inline
         if discarded {
             let data = f.inst_mut(site);
             data.opcode = Opcode::ArrayReadDiscarded;
-            data.aux = if key == "AREF" { AuxData::ArrayRef } else { AuxData::None };
+            data.aux = if key == "AREF" {
+                AuxData::ArrayRef
+            } else {
+                AuxData::None
+            };
             data.results.clear();
             data.flags = InstFlags {
                 effectful: true,
@@ -196,8 +200,13 @@ pub fn specialize(f: &mut Function, raw: bool, options: &super::inlining::Inline
         } else {
             let data = f.inst_mut(site);
             data.opcode = if load { Opcode::VecRef } else { Opcode::VecSet };
-            data.aux = if load && key == "AREF" { AuxData::ArrayRef }
-                else if simple_store { AuxData::SimpleVectorStore } else { AuxData::None };
+            data.aux = if load && key == "AREF" {
+                AuxData::ArrayRef
+            } else if simple_store {
+                AuxData::SimpleVectorStore
+            } else {
+                AuxData::None
+            };
             data.flags = InstFlags {
                 effectful: true,
                 guard: true,
@@ -223,8 +232,7 @@ fn specialize_raw_stores(f: &mut Function) -> usize {
         .block_order()
         .iter()
         .flat_map(|&b| f.block(b).insts.clone())
-        .filter(|&i| f.inst(i).opcode == Opcode::VecSet
-            && matches!(f.inst(i).aux, AuxData::None))
+        .filter(|&i| f.inst(i).opcode == Opcode::VecSet && matches!(f.inst(i).aux, AuxData::None))
         .collect();
     let mut count = 0;
     for store in stores {
@@ -721,5 +729,4 @@ mod tests {
         assert_eq!(specialize_raw_stores(&mut f), 1);
         super::super::verify::verify(&f).unwrap();
     }
-
 }

@@ -127,7 +127,8 @@ fn compile_file_invokes_hook_and_fasl_loads_without_source() {
     let source = directory.join("hook.lisp");
     let fasl = directory.join("hook.bfasl");
     std::fs::write(&source, "(defun hook-compiled-answer () (hook-target 41))").unwrap();
-    run(&format!(r#"(progn
+    run(&format!(
+        r#"(progn
       (defvar *compile-hook-calls* 0)
       (defmacro hook-target (x) (list '+ x 1))
       (let ((*macroexpand-hook*
@@ -140,10 +141,13 @@ fn compile_file_invokes_hook_and_fasl_loads_without_source() {
           (assert path)
           (assert (not failure))))
       (assert (> *compile-hook-calls* 0))
-      (write-line "HOOK-PASS"))"#));
+      (write-line "HOOK-PASS"))"#
+    ));
     std::fs::remove_file(&source).unwrap();
-    run(&format!(r#"(progn (load {fasl:?})
-      (assert (= 42 (hook-compiled-answer))) (write-line "HOOK-PASS"))"#));
+    run(&format!(
+        r#"(progn (load {fasl:?})
+      (assert (= 42 (hook-compiled-answer))) (write-line "HOOK-PASS"))"#
+    ));
     std::fs::remove_file(&fasl).unwrap();
     std::fs::remove_dir(directory).unwrap();
 }

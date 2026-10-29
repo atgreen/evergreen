@@ -185,9 +185,12 @@ fn lazy_deftype_survives_fresh_process_compiled_file_loading() {
     "#,
     )
     .unwrap();
-    assert_eq!(eval(&format!(
-        "(progn (compile-file {source:?} :output-file {artifact:?}) (format t \"RESULT:~s\" (not (null (probe-file {artifact:?})))) )"
-    )), "T");
+    assert_eq!(
+        eval(&format!(
+            "(progn (compile-file {source:?} :output-file {artifact:?}) (format t \"RESULT:~s\" (not (null (probe-file {artifact:?})))) )"
+        )),
+        "T"
+    );
     std::fs::remove_file(&source).unwrap();
     assert_eq!(
         eval(&format!(

@@ -92,13 +92,15 @@ fn deferred_hashes_keep_backward_references_and_initialization_readiness() {
         },
         BbuConstant::Nil,
     ];
-    assert!(validate(
-        &constants,
-        &[],
-        &[action(CREATE, 0, 2), action(INITIALIZE, 0, 2)],
-        0x0206
-    )
-    .is_err());
+    assert!(
+        validate(
+            &constants,
+            &[],
+            &[action(CREATE, 0, 2), action(INITIALIZE, 0, 2)],
+            0x0206
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -134,13 +136,15 @@ fn function_metadata_and_nested_record_literals_require_initialized_objects() {
     ] {
         let consume = action(7, (functions.len() - 1) as u32, BBU_NO_INDEX);
         assert!(validate(&constants, &functions, &[consume], 0x0206).is_err());
-        assert!(validate(
-            &constants,
-            &functions,
-            &[action(CREATE, 0, 1), action(INITIALIZE, 0, 1), consume],
-            0x0206
-        )
-        .is_ok());
+        assert!(
+            validate(
+                &constants,
+                &functions,
+                &[action(CREATE, 0, 1), action(INITIALIZE, 0, 1), consume],
+                0x0206
+            )
+            .is_ok()
+        );
     }
 }
 

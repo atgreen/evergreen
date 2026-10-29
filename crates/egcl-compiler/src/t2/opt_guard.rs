@@ -154,7 +154,9 @@ fn check_imported_guard_results(f: &mut Function, dom: &crate::t2::ir::Dominator
     for index in 0..f.osr_entries.len() {
         let header = f.osr_entries[index].block;
         let state = f.frame_states.get(f.osr_entries[index].frame_state);
-        let imported: Vec<Value> = state.scopes.iter()
+        let imported: Vec<Value> = state
+            .scopes
+            .iter()
             .flat_map(|scope| scope.locals.iter().chain(&scope.stack))
             .filter_map(|source| match source {
                 ValueSource::Value { value, .. } => Some(*value),
@@ -162,9 +164,13 @@ fn check_imported_guard_results(f: &mut Function, dom: &crate::t2::ir::Dominator
             })
             .collect();
         for value in imported {
-            let ValueDef::Result { inst, .. } = f.value(value).def else { continue };
+            let ValueDef::Result { inst, .. } = f.value(value).def else {
+                continue;
+            };
             let data = f.inst(inst);
-            if data.opcode != Opcode::Guard { continue; }
+            if data.opcode != Opcode::Guard {
+                continue;
+            }
             let ty = match &data.aux {
                 AuxData::TypeTag(ty) => *ty,
                 // This establishes only the semantic STRING constraint for
@@ -173,7 +179,10 @@ fn check_imported_guard_results(f: &mut Function, dom: &crate::t2::ir::Dominator
                 _ => continue,
             };
             // A guard the header dominates runs again after the entry.
-            if inst_block.get(inst.index()).copied().flatten()
+            if inst_block
+                .get(inst.index())
+                .copied()
+                .flatten()
                 .is_some_and(|block| dom.dominates(header, block))
             {
                 continue;
@@ -209,7 +218,10 @@ fn remove_inference_proven(f: &mut Function) -> bool {
             // contagion, say) cannot be forwarded to its tagged operand even
             // when its check is proven: the result is a different value
             // (bliss-thcbb.1).
-            if d.results.iter().any(|&result| f.value(result).repr != f.value(v).repr) {
+            if d.results
+                .iter()
+                .any(|&result| f.value(result).repr != f.value(v).repr)
+            {
                 continue;
             }
             let got = inf.ty(v);
@@ -471,9 +483,11 @@ pub fn reuse_layout_evidence(f: &mut Function) -> usize {
         .iter()
         .flat_map(|&b| f.block(b).insts.iter())
         .filter(|&&inst| {
-            matches!(f.inst(inst).opcode, Opcode::PackedU8Layout | Opcode::PackedU8AllocationLayout)
-                || (f.inst(inst).opcode == Opcode::Guard
-                    && matches!(f.inst(inst).aux, AuxData::StringLayout))
+            matches!(
+                f.inst(inst).opcode,
+                Opcode::PackedU8Layout | Opcode::PackedU8AllocationLayout
+            ) || (f.inst(inst).opcode == Opcode::Guard
+                && matches!(f.inst(inst).aux, AuxData::StringLayout))
         })
         .take(2)
         .count();
@@ -1509,21 +1523,39 @@ mod tests {
         );
         f.set_terminator(inner, brif(condition[0], inner, vec![], outer_latch));
         f.set_terminator(outer_latch, brif(condition[0], outer, vec![phi], exit));
-        f.set_terminator(exit, InstData { args: vec![result[0]], ..ret() });
+        f.set_terminator(
+            exit,
+            InstData {
+                args: vec![result[0]],
+                ..ret()
+            },
+        );
         crate::t2::verify::verify(&f).expect("valid nested loop before splitting");
 
         run(&mut f);
         crate::t2::verify::verify(&f).expect("valid nested loop after splitting");
         assert_eq!(f.value(phi).ty.bits, TypeBits::FIXNUM);
-        assert!(!f.block(inner).insts.contains(&proof), "keep loop guard splitting");
-        assert_eq!(f.inst(add).args[0], phi, "arithmetic now trusts the outer phi");
+        assert!(
+            !f.block(inner).insts.contains(&proof),
+            "keep loop guard splitting"
+        );
+        assert_eq!(
+            f.inst(add).args[0],
+            phi,
+            "arithmetic now trusts the outer phi"
+        );
         for osr in &f.osr_entries {
             let state = f.frame_states.get(osr.frame_state);
-            assert!(matches!(state.scopes[0].locals[0],
+            assert!(
+                matches!(state.scopes[0].locals[0],
                 ValueSource::Value { value, .. } if value == phi),
-                "the value has an import; this is a missing proof, not a missing home");
-            assert_eq!(osr.checks, vec![(phi, fixnum())],
-                "each direct import must establish the refinement before arithmetic");
+                "the value has an import; this is a missing proof, not a missing home"
+            );
+            assert_eq!(
+                osr.checks,
+                vec![(phi, fixnum())],
+                "each direct import must establish the refinement before arithmetic"
+            );
         }
     }
 
@@ -1751,7 +1783,12 @@ mod tests {
         let e = f.entry();
         let i = f.add_block_param(e, fixnum(), ValueRepresentation::Tagged);
         let state = f.frame_states.add(FrameState {
-            scopes: vec![FrameScope { function: 0, bcp: 3, locals: vec![], stack: vec![] }],
+            scopes: vec![FrameScope {
+                function: 0,
+                bcp: 3,
+                locals: vec![],
+                stack: vec![],
+            }],
             remat: vec![],
         });
         let (unbox, raw) = f.push_inst(
@@ -1759,16 +1796,29 @@ mod tests {
             InstData {
                 args: vec![i],
                 aux: crate::t2::speculate::contagion_unbox_aux(),
-                flags: InstFlags { guard: true, effectful: true, ..InstFlags::default() },
+                flags: InstFlags {
+                    guard: true,
+                    effectful: true,
+                    ..InstFlags::default()
+                },
                 frame_state: Some(state),
                 ..base(Opcode::UnboxFloat)
             },
-            &[(IRType::of(TypeBits::DOUBLE_FLOAT), ValueRepresentation::UnboxedF64)],
+            &[(
+                IRType::of(TypeBits::DOUBLE_FLOAT),
+                ValueRepresentation::UnboxedF64,
+            )],
         );
         let (mul, _) = f.push_inst(
             e,
-            InstData { args: vec![raw[0], raw[0]], ..base(Opcode::FloatMul) },
-            &[(IRType::of(TypeBits::DOUBLE_FLOAT), ValueRepresentation::UnboxedF64)],
+            InstData {
+                args: vec![raw[0], raw[0]],
+                ..base(Opcode::FloatMul)
+            },
+            &[(
+                IRType::of(TypeBits::DOUBLE_FLOAT),
+                ValueRepresentation::UnboxedF64,
+            )],
         );
         f.set_terminator(e, ret());
 
@@ -2506,7 +2556,10 @@ mod invariant_bounds_tests {
         let (predicate, _) = x.f.push_inst(
             x.header,
             predicate,
-            &[(IRType::of(TypeBits::SYMBOL.join(TypeBits::NULL)), Repr::Tagged)],
+            &[(
+                IRType::of(TypeBits::SYMBOL.join(TypeBits::NULL)),
+                Repr::Tagged,
+            )],
         );
         let instructions = &mut x.f.block_mut(x.header).insts;
         assert_eq!(instructions.pop(), Some(predicate));

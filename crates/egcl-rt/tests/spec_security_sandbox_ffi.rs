@@ -5,16 +5,16 @@
 //! `c-ffi` feature (bliss-bca.5). Marshalling is also covered by spec_runtime_core.
 #![cfg(feature = "c-ffi")]
 
-use std::ffi::CString;
-use std::fs;
-use std::path::{Path, PathBuf};
 use egcl_rt::error::EgclError;
 use egcl_rt::ffi::{
     AlienType, Callback, ffi_call, foreign_symbol, load_foreign_library, marshal_to_c,
     unmarshal_from_c,
 };
 use egcl_rt::sandbox::{Sandbox, SandboxPolicy};
-use egcl_rt::value::{NIL, EgclVal};
+use egcl_rt::value::{EgclVal, NIL};
+use std::ffi::CString;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 fn libc_handle() -> *mut () {
     load_foreign_library("libc.so.6")

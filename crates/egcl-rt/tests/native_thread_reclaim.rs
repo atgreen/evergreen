@@ -6,13 +6,13 @@
 //! name, liveness and still-rooted result stay observable until one JOIN.
 //!
 //! One test in its own binary: the registry count it reads is process-wide.
-use std::time::{Duration, Instant};
 use egcl_rt::thread::{
     all_thread_ids, current_thread_id, dedicated_native_thread_record_count, interrupt_thread,
     join_thread, join_thread_timeout, live_thread_ids, make_thread, thread_alive,
     thread_is_carrier, thread_name,
 };
 use egcl_rt::value::{EgclVal, T};
+use std::time::{Duration, Instant};
 
 const WORKERS: usize = 64;
 
@@ -101,8 +101,15 @@ fn finished_unjoined_threads_are_reclaimed_and_join_exactly_once() {
             moved += 1;
         }
         assert!(join_thread(*id).is_err(), "a second join must fail");
-        assert_eq!(thread_alive(*id), None, "a joined handle leaves the registry");
+        assert_eq!(
+            thread_alive(*id),
+            None,
+            "a joined handle leaves the registry"
+        );
         assert_eq!(thread_name(*id), None);
     }
-    assert!(moved > 0, "no result was relocated, so rooting went untested");
+    assert!(
+        moved > 0,
+        "no result was relocated, so rooting went untested"
+    );
 }

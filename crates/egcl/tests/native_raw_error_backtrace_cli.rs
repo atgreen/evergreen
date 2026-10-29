@@ -228,6 +228,10 @@ fn native_keyword_binding_error_keeps_its_callee() {
             1,
             "{tier}: {stderr}"
         );
-        assert_eq!(stderr.matches("NATIVE-KEYWORD-CALLER").count(), 1, "{tier}: {stderr}");
+        assert_eq!(
+            stderr.matches("NATIVE-KEYWORD-CALLER").count(),
+            1,
+            "{tier}: {stderr}"
+        );
     }
 }

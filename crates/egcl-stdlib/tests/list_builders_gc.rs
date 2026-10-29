@@ -7,11 +7,11 @@
 //! managed GC heap so the collector can trace car/cdr fields and relocate
 //! referenced nursery objects.
 
-use std::sync::{Mutex, OnceLock};
 use egcl_rt::gc::{GcConfig, init_heap, walk_heap};
 use egcl_rt::object::{ConsCell, type_id};
-use egcl_rt::value::{NIL, EgclVal};
+use egcl_rt::value::{EgclVal, NIL};
 use egcl_stdlib::sequences;
+use std::sync::{Mutex, OnceLock};
 
 fn lock() -> &'static Mutex<()> {
     static L: OnceLock<Mutex<()>> = OnceLock::new();

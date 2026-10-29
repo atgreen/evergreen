@@ -10,13 +10,13 @@
 //!
 //! See spec §5.7.
 
-use std::collections::HashSet;
-use std::sync::{Once, OnceLock};
-use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use egcl_rt::error::EgclError;
 use egcl_rt::lock_order::{LockLevel, OrderedMutex};
 use egcl_rt::object::{CompiledFunctionData, ConsCell, ObjectHeader, type_id};
-use egcl_rt::value::{TAG_CONS, TAG_FUNCTION, TAG_HEAP_OBJECT, TAG_SYMBOL, EgclVal};
+use egcl_rt::value::{EgclVal, TAG_CONS, TAG_FUNCTION, TAG_HEAP_OBJECT, TAG_SYMBOL};
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Once, OnceLock};
 
 // ── GC root tracking for hash-table storage (bliss-jtc.8) ────────────────────
 //
@@ -1269,8 +1269,7 @@ enum SlotRec {
 }
 
 fn serialize_slot(out: &mut Vec<u8>, v: EgclVal) {
-    let off_heap_string =
-        v.is_string() && !egcl_rt::gc::is_in_heap(unsafe { v.as_ptr() } as usize);
+    let off_heap_string = v.is_string() && !egcl_rt::gc::is_in_heap(unsafe { v.as_ptr() } as usize);
     if off_heap_string {
         let s = v.as_string();
         out.push(1u8);
@@ -1932,7 +1931,9 @@ mod tests {
             lock: TableLock::new(),
         };
         buckets_mut(&mut inner.buckets).entries[0] = Some(RHEntry {
-            key: EgclVal::from_fixnum(1), value: EgclVal::from_fixnum(2), probe_dist: 0,
+            key: EgclVal::from_fixnum(1),
+            value: EgclVal::from_fixnum(2),
+            probe_dist: 0,
         });
         let scan = |inner: &mut HashTableInner, kind, disabled| {
             let mut visits = 0;
@@ -1950,16 +1951,25 @@ mod tests {
         assert_eq!(scan(&mut inner, MinorRelocate, false), 2);
         assert_eq!(scan(&mut inner, MinorMark, true), 2);
         assert_eq!(scan(&mut inner, MinorRelocate, true), 2);
-        assert!(inner.minor_roots_dirty, "disabled tracking stays conservative");
+        assert!(
+            inner.minor_roots_dirty,
+            "disabled tracking stays conservative"
+        );
         for weakness in [Weakness::Key, Weakness::Value, Weakness::KeyAndValue] {
             inner.weakness = Some(weakness);
-            let expected = if matches!(weakness, Weakness::KeyAndValue) { 0 } else { 1 };
+            let expected = if matches!(weakness, Weakness::KeyAndValue) {
+                0
+            } else {
+                1
+            };
             assert_eq!(scan(&mut inner, MinorMark, false), expected);
             assert_eq!(scan(&mut inner, MinorRelocate, false), expected);
             assert_eq!(scan(&mut inner, Full, false), expected);
         }
         // No readers or registered scanner can retain these local buckets.
-        unsafe { drop(Box::from_raw(*inner.buckets.get_mut())); }
+        unsafe {
+            drop(Box::from_raw(*inner.buckets.get_mut()));
+        }
     }
 
     /// Two numbers EQUALP calls equal must land in the same bucket of an

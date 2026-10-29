@@ -29,8 +29,8 @@ fn inspect_mounted_fiber() -> EgclVal {
     // Read-only preflight must leave this fiber's yield request available for
     // the real scheduler poll.
     fiber.request_yield();
-    let pending = egcl_rt::safepoint::poll_work_pending()
-        && egcl_rt::safepoint::poll_work_pending();
+    let pending =
+        egcl_rt::safepoint::poll_work_pending() && egcl_rt::safepoint::poll_work_pending();
     let retained = fiber.check_and_clear_yield();
     fiber.unpin().unwrap();
     if !pending || !retained {

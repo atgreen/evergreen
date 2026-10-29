@@ -21,7 +21,14 @@ const BIN: &str = env!("CARGO_BIN_EXE_egcl");
 
 fn run(program: &str) -> String {
     let output = Command::new("timeout")
-        .args(["--kill-after=10", "180", BIN, "--no-init", "--eval", program])
+        .args([
+            "--kill-after=10",
+            "180",
+            BIN,
+            "--no-init",
+            "--eval",
+            program,
+        ])
         .output()
         .expect("run egcl");
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -90,23 +97,26 @@ fn each_kind_of_class_prints_its_metaclass_and_name() {
         (format t "P ~s~%" (find-class c)))
       (format t "KINDS-OK~%")
     "#);
-    expect(&stdout, &[
-        "P #<STANDARD-CLASS UC>",
-        "P #<STRUCTURE-CLASS ST>",
-        "P #<STANDARD-CLASS CC>",
-        // a user metaclass names itself in its instances' tags
-        "P #<META WITHMETA>",
-        "P #<STANDARD-CLASS META>",
-        "P #<BUILT-IN-CLASS INTEGER>",
-        "P #<BUILT-IN-CLASS T>",
-        "P #<BUILT-IN-CLASS HASH-TABLE>",
-        // the metaobject classes are instances of STANDARD-CLASS
-        "P #<STANDARD-CLASS STANDARD-CLASS>",
-        "P #<STANDARD-CLASS BUILT-IN-CLASS>",
-        "P #<STANDARD-CLASS STRUCTURE-CLASS>",
-        "P #<STANDARD-CLASS STANDARD-OBJECT>",
-        "KINDS-OK",
-    ]);
+    expect(
+        &stdout,
+        &[
+            "P #<STANDARD-CLASS UC>",
+            "P #<STRUCTURE-CLASS ST>",
+            "P #<STANDARD-CLASS CC>",
+            // a user metaclass names itself in its instances' tags
+            "P #<META WITHMETA>",
+            "P #<STANDARD-CLASS META>",
+            "P #<BUILT-IN-CLASS INTEGER>",
+            "P #<BUILT-IN-CLASS T>",
+            "P #<BUILT-IN-CLASS HASH-TABLE>",
+            // the metaobject classes are instances of STANDARD-CLASS
+            "P #<STANDARD-CLASS STANDARD-CLASS>",
+            "P #<STANDARD-CLASS BUILT-IN-CLASS>",
+            "P #<STANDARD-CLASS STRUCTURE-CLASS>",
+            "P #<STANDARD-CLASS STANDARD-OBJECT>",
+            "KINDS-OK",
+        ],
+    );
 }
 
 /// The printer is shared with structures, ordinary instances, conditions and
@@ -124,12 +134,15 @@ fn nothing_else_that_shares_the_printer_changes() {
       (write-string "INSTANCE-WRITE ") (write (make-instance 'plain)) (terpri)
       (format t "SHARED-OK~%")
     "#);
-    expect(&stdout, &[
-        "STRUCT #S(PT :X 1 :Y 2)",
-        "INSTANCE #<PLAIN>",
-        "CONDITION #<MY-ERR>",
-        "STRUCT-WRITE #S(PT :X 1 :Y 2)",
-        "INSTANCE-WRITE #<PLAIN>",
-        "SHARED-OK",
-    ]);
+    expect(
+        &stdout,
+        &[
+            "STRUCT #S(PT :X 1 :Y 2)",
+            "INSTANCE #<PLAIN>",
+            "CONDITION #<MY-ERR>",
+            "STRUCT-WRITE #S(PT :X 1 :Y 2)",
+            "INSTANCE-WRITE #<PLAIN>",
+            "SHARED-OK",
+        ],
+    );
 }

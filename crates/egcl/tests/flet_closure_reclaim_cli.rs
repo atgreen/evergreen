@@ -38,11 +38,23 @@ fn short_lived_flet_closures_are_reclaimed_without_explicit_gc() {
         .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
-    assert!(stdout.contains("SUM 1799970000"), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("SUM 1799970000"),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     // 60 escaped closures for i = 0, 1000, ..., 59000.
-    assert!(stdout.contains("KEPT 60 1770000"), "stdout:\n{stdout}\nstderr:\n{stderr}");
-    assert!(stdout.contains("EQ T"), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stdout.contains("KEPT 60 1770000"),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("EQ T"),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     let registry: usize = stdout
         .lines()
         .find_map(|line| line.strip_prefix("REGISTRY "))

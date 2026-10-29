@@ -10,7 +10,7 @@
 //! high bits, and FrameWalker with longer chains.
 
 use egcl_rt::stack::*;
-use egcl_rt::value::{NIL, EgclVal};
+use egcl_rt::value::{EgclVal, NIL};
 
 // ═══════════════════════════════════════════════════════════════════
 // SourceLocation — construction and field access

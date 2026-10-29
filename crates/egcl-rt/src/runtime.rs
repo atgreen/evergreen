@@ -1020,7 +1020,10 @@ pub fn current_sigsegv_recovery_ips() -> (usize, usize) {
             SIGSEGV_STACK_GUARD_RECOVERY_IPS[slot].load(std::sync::atomic::Ordering::Acquire),
         );
     }
-    (current_sigsegv_null_guard_recovery_ip(), current_sigsegv_stack_guard_recovery_ip())
+    (
+        current_sigsegv_null_guard_recovery_ip(),
+        current_sigsegv_stack_guard_recovery_ip(),
+    )
 }
 
 /// Fault state belongs to an execution, while signal handlers find the mounted

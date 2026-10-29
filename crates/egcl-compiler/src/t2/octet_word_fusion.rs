@@ -16,7 +16,7 @@ use super::ir::{
     AuxData, Block, BlockCall, BoundedPollScope, Function, IRType, Inst, InstData, InstFlags,
     Opcode, TypeBits, Value, ValueDef, ValueRepresentation as Repr,
 };
-use super::opt_licm::{detect_loops, NaturalLoop};
+use super::opt_licm::{NaturalLoop, detect_loops};
 use super::region_clone::{clone_region, repair_outside_uses};
 use std::collections::{HashMap, HashSet};
 
@@ -1249,12 +1249,12 @@ mod tests {
                 })
                 .collect();
         assert_eq!(kernels.len(), 1);
-        assert!(!x
-            .f
-            .block(kernels[0])
-            .insts
-            .iter()
-            .any(|&i| x.f.inst(i).opcode == Opcode::ClearMv));
+        assert!(
+            !x.f.block(kernels[0])
+                .insts
+                .iter()
+                .any(|&i| x.f.inst(i).opcode == Opcode::ClearMv)
+        );
     }
 
     #[test]

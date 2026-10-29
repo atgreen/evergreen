@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
 //! Real child lifecycles: interactive pipes, repeatable waits, and termination.
+use egcl_stdlib::process::{ProcessCommand, launch_program};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::time::{Duration, Instant};
-use egcl_stdlib::process::{ProcessCommand, launch_program};
 
 #[test]
 #[ignore = "child fixture selected by lifecycle tests"]

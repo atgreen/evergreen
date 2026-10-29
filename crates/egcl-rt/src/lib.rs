@@ -16,6 +16,7 @@ pub mod asm_s390x;
 pub mod bfasl;
 pub mod bignum;
 pub mod bytecode;
+pub mod call_table;
 /// Portable fiber context switch (no libc ucontext) — bliss-bca.5.
 pub mod context;
 pub mod debug_stack;
@@ -23,30 +24,29 @@ pub mod digest;
 /// Lisp execution context reached from generated code (§2.3.1, R4.72).
 /// NOT `context` above, which is the machine/stack-pointer switch.
 pub mod exec_context;
-pub mod execution_poll;
 pub mod execution_local;
-pub mod call_table;
+pub mod execution_poll;
 pub mod function;
 pub mod fxhash;
 pub mod native_transfer;
+pub mod nil_array;
 pub mod object;
 pub mod packages;
+pub mod packed_f64;
+pub mod packed_u8;
+pub mod random_state;
 pub mod symbols;
 /// Runtime OS services for Linux, Windows, and macOS.
 #[cfg_attr(windows, path = "syscall/windows.rs")]
 #[cfg_attr(target_os = "macos", path = "syscall/macos.rs")]
 pub mod syscall;
 pub mod types;
-pub mod packed_f64;
-pub mod packed_u8;
-pub mod random_state;
-pub mod nil_array;
 pub mod value;
 
 // ── Memory / GC ───────────────────────────────────────────────────
 pub mod gc;
-pub(crate) mod gc_soft_dirty;
 pub(crate) mod gc_async_wp;
+pub(crate) mod gc_soft_dirty;
 pub mod jit;
 pub mod jit_debug;
 pub mod lock_order;
@@ -108,11 +108,11 @@ pub use safepoint::{
 pub use sandbox::{Sandbox, SandboxPolicy};
 pub use scheduler::{Scheduler, SchedulerConfig, SchedulerGroup, run_fibers};
 pub use stack::{
-    CodeInfo, Frame, FrameType, FrameWalker, SourceLocation, SourceLocationEntry, StackMapEntry,
-    EgclStack, eval_stack_budget, host_stack_budget_exhausted, visit_stack_refs,
+    CodeInfo, EgclStack, Frame, FrameType, FrameWalker, SourceLocation, SourceLocationEntry,
+    StackMapEntry, eval_stack_budget, host_stack_budget_exhausted, visit_stack_refs,
 };
 pub use sync::{
-    IoInterest, PinnedBlockingAction, EgclCondVar, EgclMutex, EgclSemaphore, fiber_sleep,
+    EgclCondVar, EgclMutex, EgclSemaphore, IoInterest, PinnedBlockingAction, fiber_sleep,
     set_pinned_blocking_action, wait_fd,
 };
 pub use thread::{

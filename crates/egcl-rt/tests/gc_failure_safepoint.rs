@@ -20,13 +20,20 @@ fn collector_panic_releases_the_safepoint_request() {
     let Ok(kind) = std::env::var(CHILD) else {
         for kind in ["minor", "major", "full"] {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "collector_panic_releases_the_safepoint_request", "--nocapture"])
+                .args([
+                    "--exact",
+                    "collector_panic_releases_the_safepoint_request",
+                    "--nocapture",
+                ])
                 .env(CHILD, kind)
                 .output()
                 .unwrap();
-            assert!(output.status.success(), "{kind}: {}\n{}",
+            assert!(
+                output.status.success(),
+                "{kind}: {}\n{}",
                 String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr));
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
         return;
     };
@@ -55,7 +62,10 @@ fn collector_panic_releases_the_safepoint_request() {
     let next_pause = egcl_rt::safepoint::wait_for_all_threads();
     egcl_rt::safepoint::resume_all_threads().unwrap();
     assert!(result.is_err() && SCANNER_PANICKED.load(Ordering::Relaxed));
-    assert!(next_pause.is_ok(), "collector panic stranded its pause: {next_pause:?}");
+    assert!(
+        next_pause.is_ok(),
+        "collector panic stranded its pause: {next_pause:?}"
+    );
     if kind != "minor" {
         // The nursery drain really relocated a live value before the major
         // scanner failed; this is not a stress run in which nothing moved.

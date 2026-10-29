@@ -78,7 +78,9 @@ fn the_shift_probe_reaches_the_optimising_tier() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{stdout}\n{stderr}");
     assert!(
-        stdout.lines().any(|l| l.trim() == "HOT 1 18014398509482032"),
+        stdout
+            .lines()
+            .any(|l| l.trim() == "HOT 1 18014398509482032"),
         "wrong answers:\n{stdout}\n{stderr}"
     );
     // Either ABI's admission marker: "T2 EMITTED" for the framed emitters,

@@ -58,8 +58,7 @@ fn simple_ub8_length(args: &[EgclVal], symbols: ArraySymbols) -> Option<usize> {
     }
     let length = dimension.as_fixnum() as usize;
     let bytes = length.checked_add(egcl_rt::packed_u8::DATA_OFFSET)?;
-    (bytes <= u32::MAX as usize - 32 && bytes <= isize::MAX as usize - 32)
-        .then_some(length)
+    (bytes <= u32::MAX as usize - 32 && bytes <= isize::MAX as usize - 32).then_some(length)
 }
 
 fn note_array_constructor(fast: bool) {

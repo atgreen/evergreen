@@ -52,9 +52,8 @@ fn methods_on_a_builtin_generic_reach_the_builtin_as_next_method() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(output.status.success(), "{tier}: {stdout}\n{stderr}");
         assert!(
-            stdout.contains(
-                "RESULT (:X (:AROUND 5) T :X 7 (:NMP NIL) (:INNER (:NMP NIL) :NUMBER))"
-            ),
+            stdout
+                .contains("RESULT (:X (:AROUND 5) T :X 7 (:NMP NIL) (:INNER (:NMP NIL) :NUMBER))"),
             "{tier}: {stdout}\n{stderr}"
         );
     }

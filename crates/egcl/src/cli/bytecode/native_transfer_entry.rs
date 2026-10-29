@@ -7,15 +7,15 @@
 //! retain bytecode *unwinding* as the fallback.
 #![allow(dead_code)]
 
-use super::*;
-use super::native_segment_cache::SegmentCacheEntry;
 use super::super::{CONTROL_COUNTER, lexical_identity};
+use super::native_segment_cache::SegmentCacheEntry;
+use super::*;
 use egcl_compiler::control_scope::{Ownership, ScopeKind};
+use egcl_compiler::native_unwind::{NativeUnwindStep, SelectedTarget, next_unwind_step};
 use egcl_compiler::t2::emit::{RecursiveActivation, RecursiveCallRequest, RecursiveTransfer};
-use egcl_compiler::native_unwind::{next_unwind_step, NativeUnwindStep, SelectedTarget};
 use egcl_compiler::t2::native_transfer::{
-    emit_capture_stub, emit_native_landing_stub, emit_published_helper_veneer,
-    SysvNativeLanding, SysvTransferCapture,
+    SysvNativeLanding, SysvTransferCapture, emit_capture_stub, emit_native_landing_stub,
+    emit_published_helper_veneer,
 };
 use egcl_compiler::t2::transfer_sites::{SysvSiteSnapshot, SysvTransferTable, TransferSiteError};
 use egcl_rt::jit::JitBuffer;
@@ -23,26 +23,26 @@ use egcl_rt::native_transfer::{self, NativeExit, NativeOutcome};
 use std::cell::Cell;
 use std::sync::OnceLock;
 
-pub(super) mod root_publication;
 mod activation;
 mod condition_osr;
 pub(super) mod interpreter_osr;
+pub(super) mod root_publication;
 mod special_bindings;
-use special_bindings::{SavedSpecial, validate_special_bindings, special_request};
-use condition_osr::{validate_condition_clusters, relocate_condition_clusters};
+use activation::ActivationState;
 #[cfg(test)]
 pub(super) use activation::fail_next_guard_reservation_for_test;
 #[cfg(test)]
 pub(super) use activation::take_fresh_prepares_for_test;
-use activation::ActivationState;
+use condition_osr::{relocate_condition_clusters, validate_condition_clusters};
+use special_bindings::{SavedSpecial, special_request, validate_special_bindings};
 mod deopt;
 #[cfg(test)]
-pub(super) use deopt::with_ordinary_guard_resume_observer_for_test;
-#[cfg(test)]
 pub(super) use deopt::with_ordinary_guard_payload_observer_for_test;
-mod native_frames;
-mod lean_root;
+#[cfg(test)]
+pub(super) use deopt::with_ordinary_guard_resume_observer_for_test;
 pub(super) mod funcall_fast;
+mod lean_root;
+mod native_frames;
 #[cfg(test)]
 pub(super) use lean_root::take_lean_root_entries_for_test;
 pub(super) mod ordinary_calls;
@@ -59,26 +59,31 @@ pub(super) fn with_ordinary_non_tail_emission_for_test<R>(body: impl FnOnce() ->
     ORDINARY_TAIL_EMISSION.with(|enabled| {
         struct Restore<'a>(&'a Cell<bool>, bool);
         impl Drop for Restore<'_> {
-            fn drop(&mut self) { self.0.set(self.1); }
+            fn drop(&mut self) {
+                self.0.set(self.1);
+            }
         }
         let _restore = Restore(enabled, enabled.replace(false));
         body()
     })
 }
-pub(super) mod native_poll;
 mod background_compilation;
+pub(super) mod native_poll;
 use background_compilation::EmittedTransfer;
-pub(super) use background_compilation::{EmissionContext, PreparedT1, CompiledT1, prepare_background_t1, compile_background_t1, install_background_t1};
+pub(super) use background_compilation::{
+    CompiledT1, EmissionContext, PreparedT1, compile_background_t1, install_background_t1,
+    prepare_background_t1,
+};
 mod ordinary_t2;
 pub(super) use ordinary_t2::{PreparedT2, install_ordinary_t2, prepare_ordinary_t2};
 mod nested;
+#[cfg(test)]
+pub(super) use nested::pending_argument_count;
 use nested::{SegmentActivations, finish_nested, prepare_nested, resume_nested};
 pub(super) use nested::{
     finish_nested as finish_callable, prepare_callable, resume_nested as resume_callable,
     take_call_arguments,
 };
-#[cfg(test)]
-pub(super) use nested::pending_argument_count;
 #[cfg(test)]
 mod cache_tests;
 use deopt::{prepare_completed_deopt, resume_guard};
@@ -98,7 +103,10 @@ static SEGMENT_CACHE: egcl_rt::execution_local::ExecutionLocal<
 pub(super) fn cached_listing(body: &Arc<BytecodeFunction>) -> Option<String> {
     let key = Arc::as_ptr(body) as usize;
     let code = SEGMENT_CACHE.with(|cache| cache.borrow().get(&key)?.code.clone())?;
-    Some(format_listing(&code, "; Native segment ABI — cached entry.\n"))
+    Some(format_listing(
+        &code,
+        "; Native segment ABI — cached entry.\n",
+    ))
 }
 
 /// Decode the actual installed owner, including its precise transfer veneers.
@@ -133,10 +141,26 @@ fn format_listing(code: &TransferCode, header: &str) -> String {
             for (target, name) in [
                 (code._veneer.as_ptr(), "native call veneer"),
                 (code._poll.as_ptr(), "native poll veneer"),
-                (code._completion.as_ptr(), "native cleanup completion veneer"),
-                (code._recursive_prepare.as_ref().map_or(std::ptr::null(), |code| code.as_ptr()), "native recursive entry veneer"),
-                (finish_recursive as *const u8, "native recursive frame retirement"),
-                (code._deopt_veneer.as_ref().map_or(std::ptr::null(), |code| code.as_ptr()), "native precise deopt veneer"),
+                (
+                    code._completion.as_ptr(),
+                    "native cleanup completion veneer",
+                ),
+                (
+                    code._recursive_prepare
+                        .as_ref()
+                        .map_or(std::ptr::null(), |code| code.as_ptr()),
+                    "native recursive entry veneer",
+                ),
+                (
+                    finish_recursive as *const u8,
+                    "native recursive frame retirement",
+                ),
+                (
+                    code._deopt_veneer
+                        .as_ref()
+                        .map_or(std::ptr::null(), |code| code.as_ptr()),
+                    "native precise deopt veneer",
+                ),
             ] {
                 if !target.is_null() && immediate == target as u64 {
                     let _ = write!(out, "    ; {name}");
@@ -149,8 +173,7 @@ fn format_listing(code: &TransferCode, header: &str) -> String {
 }
 
 #[cfg(test)]
-static SEGMENT_RUNS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static SEGMENT_RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 // #420 admitted recursive shapes that branch between a call and arithmetic onto
 // the ordinary ABI. The mapped managed-activation path they used to take still
@@ -163,8 +186,7 @@ static SEGMENT_RUNS: std::sync::atomic::AtomicU64 =
 // `MappedOnlyForTest`, and only in tests that already serialize on
 // `heap_test_lock()`.
 #[cfg(test)]
-static MAPPED_ONLY: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static MAPPED_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(test)]
 pub(in crate::cli::bytecode) struct MappedOnlyForTest;
@@ -232,9 +254,7 @@ fn try_control_token(prefix: &str) -> Result<String, EgclError> {
     Ok(token)
 }
 
-fn try_clone_control_stack(
-    stack: &[(String, String)],
-) -> Result<Vec<(String, String)>, EgclError> {
+fn try_clone_control_stack(stack: &[(String, String)]) -> Result<Vec<(String, String)>, EgclError> {
     let mut copy = Vec::new();
     copy.try_reserve(stack.len()).map_err(|_| EgclError::Oom)?;
     for (name, token) in stack {
@@ -476,7 +496,8 @@ impl std::fmt::Display for EmitDecline {
 pub(super) fn mapped_t1_decline_reason(symbol: u32, body: &Arc<BytecodeFunction>) -> String {
     let kind = |op: &Instr| {
         let full = format!("{op:?}");
-        full.find(['(', ' ', '{']).map_or(full.clone(), |i| full[..i].to_string())
+        full.find(['(', ' ', '{'])
+            .map_or(full.clone(), |i| full[..i].to_string())
     };
     if !native_transfer::is_supported() {
         return "mapped transfer unsupported on this platform".into();
@@ -492,7 +513,10 @@ pub(super) fn mapped_t1_decline_reason(symbol: u32, body: &Arc<BytecodeFunction>
         };
     }
     if let Some(op) = body.code.iter().find(|op| {
-        matches!(op, Instr::PushBlock { register: true, .. } | Instr::NamedTag { .. })
+        matches!(
+            op,
+            Instr::PushBlock { register: true, .. } | Instr::NamedTag { .. }
+        )
     }) {
         return format!("{} needs an executing identity", kind(op));
     }
@@ -555,8 +579,10 @@ pub(super) fn refresh_installed(expected: &NativeCode) -> Option<Rc<NativeCode>>
     // A closure template's code is owned by an instance's private symbol,
     // whose function cell holds no function; the registry alone names its
     // definition.
-    let callable = || egcl_rt::symbols::symbol_function(symbol)
-        .filter(|&value| egcl_rt::function::is_interpreted_function(value));
+    let callable = || {
+        egcl_rt::symbols::symbol_function(symbol)
+            .filter(|&value| egcl_rt::function::is_interpreted_function(value))
+    };
     let closure = egcl_rt::symbols::is_uninterned(symbol) && callable().is_none();
     let current = || {
         registry_get(symbol).is_some_and(|current| Arc::ptr_eq(&current, &body))
@@ -586,8 +612,7 @@ pub(super) fn refresh_installed(expected: &NativeCode) -> Option<Rc<NativeCode>>
     // A T2 guard failure falls back to non-speculating T1; a T1 refresh may
     // use its newer profile. The broker rejects superseded compilation tickets.
     background_t1::request_with_speculation(symbol, !expected.is_t2);
-    let forced = matches!(forced_tier(), Some(ForcedTier::T1 | ForcedTier::T2))
-        || egcl_t2_forced();
+    let forced = matches!(forced_tier(), Some(ForcedTier::T1 | ForcedTier::T2)) || egcl_t2_forced();
     let replacement = if forced {
         background_t1::wait(symbol)
     } else {
@@ -596,7 +621,10 @@ pub(super) fn refresh_installed(expected: &NativeCode) -> Option<Rc<NativeCode>>
     }?;
     // A stale caller must still interpret its original body if the definition
     // changed while preparation or cooperative waiting ran runtime services.
-    if replacement.body.as_ref().is_none_or(|current| !Arc::ptr_eq(current, &body))
+    if replacement
+        .body
+        .as_ref()
+        .is_none_or(|current| !Arc::ptr_eq(current, &body))
         || callable() != *function
     {
         return None;
@@ -758,7 +786,11 @@ unsafe fn call_lean_target(
     unsafe {
         (*record).outcome = NativeOutcome {
             value,
-            exit: if native_error_pending() { NativeExit::Transfer } else { NativeExit::Returned },
+            exit: if native_error_pending() {
+                NativeExit::Transfer
+            } else {
+                NativeExit::Returned
+            },
         };
     }
     true
@@ -786,10 +818,15 @@ pub(super) fn take_published_checked_calls_for_test() -> usize {
     PUBLISHED_CHECKED_CALLS.with(|count| count.replace(0))
 }
 
-static PUBLISHED_ENTRIES: OnceLock<Option<[root_publication::PublishedAdapter; 2]>> = OnceLock::new();
+static PUBLISHED_ENTRIES: OnceLock<Option<[root_publication::PublishedAdapter; 2]>> =
+    OnceLock::new();
 
 fn mapped_adapter(pc: usize) -> Option<&'static root_publication::PublishedAdapter> {
-    PUBLISHED_ENTRIES.get()?.as_ref()?.iter().find(|entry| entry.contains_return(pc))
+    PUBLISHED_ENTRIES
+        .get()?
+        .as_ref()?
+        .iter()
+        .find(|entry| entry.contains_return(pc))
 }
 
 pub(super) fn published_entries() -> Option<[usize; 2]> {
@@ -824,8 +861,7 @@ pub(super) fn take_nested_entries() -> usize {
 
 impl TransferCode {
     pub(super) fn needs_callable_identity(&self) -> bool {
-        self.ordinary_entry.is_some()
-            && (self.has_deopt || !self.body.self_call_sites.is_empty())
+        self.ordinary_entry.is_some() && (self.has_deopt || !self.body.self_call_sites.is_empty())
     }
 
     /// Arguments the ordinary entry's body receives: a `&key` body's bound
@@ -848,12 +884,19 @@ impl TransferCode {
     /// the register ABI: it is used only to retain the already validated root
     /// callable while its generated body is executing.
     pub(super) fn ordinary_code_bounds(&self) -> Option<(usize, usize)> {
-        self.ordinary_entry.filter(|offset| *offset < self.code_len)?;
+        self.ordinary_entry
+            .filter(|offset| *offset < self.code_len)?;
         Some((self.code.as_ptr() as usize, self.code_len))
     }
 
-    pub(super) fn ordinary_descriptor(&self, revision: u64) -> Option<egcl_rt::call_table::OrdinaryEntryDescriptor> {
-        use egcl_rt::call_table::{OrdinaryEntryDescriptor, ORDINARY_X64_LISP_KIND, ORDINARY_X64_LISP_VERSION, ORDINARY_ENV_NONE};
+    pub(super) fn ordinary_descriptor(
+        &self,
+        revision: u64,
+    ) -> Option<egcl_rt::call_table::OrdinaryEntryDescriptor> {
+        use egcl_rt::call_table::{
+            ORDINARY_ENV_NONE, ORDINARY_X64_LISP_KIND, ORDINARY_X64_LISP_VERSION,
+            OrdinaryEntryDescriptor,
+        };
         // Root ingress validates declared parameters before entering generated
         // code, and source-proven self calls preserve those established facts.
         // A named ordinary caller can enter a typed body only when its entry
@@ -862,11 +905,16 @@ impl TransferCode {
         if !self.ordinary_checks_params && self.body.param_types.iter().any(|ty| !ty.is_any()) {
             return None;
         }
-        let offset = self.ordinary_entry.filter(|offset| *offset < self.code_len)?;
+        let offset = self
+            .ordinary_entry
+            .filter(|offset| *offset < self.code_len)?;
         Some(OrdinaryEntryDescriptor {
-            kind: ORDINARY_X64_LISP_KIND, version: ORDINARY_X64_LISP_VERSION, revision,
+            kind: ORDINARY_X64_LISP_KIND,
+            version: ORDINARY_X64_LISP_VERSION,
+            revision,
             entry: (self.code.as_ptr() as usize).checked_add(offset)?,
-            code_start: self.code.as_ptr() as usize, code_len: self.code_len,
+            code_start: self.code.as_ptr() as usize,
+            code_len: self.code_len,
             // An `&optional` entry checks its own count range.
             arity: if self.body.min_args < self.body.arity || self.body.variadic {
                 egcl_rt::call_table::ORDINARY_ARITY_ANY
@@ -874,7 +922,8 @@ impl TransferCode {
                 usize::from(self.body.arity)
             },
             environment: ORDINARY_ENV_NONE,
-            owner: self as *const Self as usize, stack_required: self.ordinary_stack_required?,
+            owner: self as *const Self as usize,
+            stack_required: self.ordinary_stack_required?,
         })
     }
 
@@ -898,7 +947,9 @@ impl TransferCode {
     }
 
     #[cfg(test)]
-    pub(super) fn value_maps_for_test(&self) -> &Arc<egcl_compiler::t2::x64_calls::NativeCallSites> {
+    pub(super) fn value_maps_for_test(
+        &self,
+    ) -> &Arc<egcl_compiler::t2::x64_calls::NativeCallSites> {
         &self._native_calls
     }
 
@@ -950,7 +1001,15 @@ impl TransferCode {
         let roots = retain_native_body(&body);
         let ir = egcl_compiler::t2::build::build_from_bytecode_for_native_cleanups(&body).ok()?;
         let call_cells = named_call_cells(&body);
-        Self::emit_prepared(body, roots, &ir, None, &call_cells, false, CompilationTier::T1)
+        Self::emit_prepared(
+            body,
+            roots,
+            &ir,
+            None,
+            &call_cells,
+            false,
+            CompilationTier::T1,
+        )
     }
 
     pub(super) fn compile_nested(body: Arc<BytecodeFunction>) -> Option<Self> {
@@ -987,7 +1046,8 @@ impl TransferCode {
     /// unboxes into a raw double home holds a double-float (bliss-vwpaz). A
     /// loop whose accumulator is momentarily a fixnum keeps running where it is.
     pub(super) fn osr_imports_admit(&self, header: u32, local: impl Fn(u16) -> EgclVal) -> bool {
-        self.osr_raw_doubles.get(&header)
+        self.osr_raw_doubles
+            .get(&header)
             .is_none_or(|slots| slots.iter().all(|&slot| local(slot).is_double_float()))
     }
 
@@ -1053,8 +1113,13 @@ impl TransferCode {
         // baseline tier, including when VALUES produced the checked primary.
         // This does not enable speculation for multiple-value bodies.
         let result_recovery = scope_free_native_body(&body, true)
-            && body.code.iter().any(|op| matches!(op, Instr::CheckResult(_)));
-        let (ir, ordinary_ir, deopt_metadata) = if scope_free_native_body(&body, false) || result_recovery {
+            && body
+                .code
+                .iter()
+                .any(|op| matches!(op, Instr::CheckResult(_)));
+        let (ir, ordinary_ir, deopt_metadata) = if scope_free_native_body(&body, false)
+            || result_recovery
+        {
             // A method's callable lives in an uninterned symbol whose name,
             // "(METHOD ...)", does not read back; the installed symbol is its
             // identity for self calls and deopt frames (bliss-6tf0e).
@@ -1090,7 +1155,9 @@ impl TransferCode {
                 // A retired family is a failure constraint, not missing type
                 // samples. Static declarations must not bypass it in mapped T1.
                 egcl_compiler::t2::speculate::speculate_with_feedback(
-                    &mut ir, &profile, egcl_compiler::t2::speculate::SpeculateOptions::default(),
+                    &mut ir,
+                    &profile,
+                    egcl_compiler::t2::speculate::SpeculateOptions::default(),
                     &|bcp, kind| {
                         use egcl_compiler::t2::speculate::SpecType as CompilerType;
                         let kind = match kind {
@@ -1119,7 +1186,9 @@ impl TransferCode {
             let metadata = Arc::new(T2InstalledMetadata {
                 speculations,
                 cold_guesses: cold_guesses.into_inner(),
-                _roots: egcl_rt::CrossThreadRoot::new(T2InstalledBodies { bodies: vec![Arc::clone(&body)] }),
+                _roots: egcl_rt::CrossThreadRoot::new(T2InstalledBodies {
+                    bodies: vec![Arc::clone(&body)],
+                }),
                 deopt_bodies: [(symbol, Arc::clone(&body))].into_iter().collect(),
             });
             (ir, Some(ordinary_ir), Some(metadata))
@@ -1129,7 +1198,16 @@ impl TransferCode {
             (ir, None, None)
         };
         let call_cells = named_call_cells(&body);
-        Self::try_emit_prepared_with_ordinary(body, roots, &ir, ordinary_ir.as_ref(), deopt_metadata, &call_cells, allow_recursion, CompilationTier::T1)
+        Self::try_emit_prepared_with_ordinary(
+            body,
+            roots,
+            &ir,
+            ordinary_ir.as_ref(),
+            deopt_metadata,
+            &call_cells,
+            allow_recursion,
+            CompilationTier::T1,
+        )
     }
 
     /// Emit the existing mapped ABI from prepared IR. The ordinary worker path
@@ -1143,7 +1221,16 @@ impl TransferCode {
         allow_recursion: bool,
         tier: CompilationTier,
     ) -> Option<Self> {
-        Self::emit_prepared_with_ordinary(body, roots, ir, None, deopt_metadata, call_cells, allow_recursion, tier)
+        Self::emit_prepared_with_ordinary(
+            body,
+            roots,
+            ir,
+            None,
+            deopt_metadata,
+            call_cells,
+            allow_recursion,
+            tier,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1187,7 +1274,13 @@ impl TransferCode {
     ) -> Result<Self, EmitDecline> {
         let context = EmissionContext::capture(&body, allow_recursion);
         let artifact = EmittedTransfer::try_emit_prepared_with_ordinary(
-            &body, ir, ordinary_ir, deopt_metadata.is_some(), call_cells, &context, tier,
+            &body,
+            ir,
+            ordinary_ir,
+            deopt_metadata.is_some(),
+            call_cells,
+            &context,
+            tier,
         )?;
         artifact.install(body, roots, deopt_metadata)
     }
@@ -1206,8 +1299,12 @@ impl TransferCode {
         *self.last_callable.borrow_mut() = Some(Arc::clone(&root));
         // Recorded with the root, never separately: the bits name the object
         // only while this root keeps it alive.
-        self.last_callable_pinned.set(
-            if egcl_rt::function::is_interpreted_function(*function) { function.0 } else { 0 });
+        self.last_callable_pinned
+            .set(if egcl_rt::function::is_interpreted_function(*function) {
+                function.0
+            } else {
+                0
+            });
         root
     }
 
@@ -1227,7 +1324,9 @@ impl TransferCode {
         if pinned != 0 && pinned == function.0 {
             return Some(previous);
         }
-        previous.with_gc_stable_mutator(|value| *value == *function).then_some(previous)
+        previous
+            .with_gc_stable_mutator(|value| *value == *function)
+            .then_some(previous)
     }
 
     /// Apply `inspect` to the previous activation's callable root, without
@@ -1257,26 +1356,39 @@ impl TransferCode {
     pub(super) fn run(&self, args: &[EgclVal], env: &mut Env) -> Result<EgclVal, EgclError> {
         // Diagnostic/cached entries resolve once. Ordinary dispatch supplies its
         // already selected callable through run_callable instead.
-        let function = self.installed_symbol.or(self.recursive_symbol)
+        let function = self
+            .installed_symbol
+            .or(self.recursive_symbol)
             .filter(|symbol| recursive_definition_matches(*symbol, Arc::as_ptr(&self.body)))
             .and_then(egcl_rt::symbols::symbol_function)
             .unwrap_or(NIL);
         self.run_callable(function, args, env)
     }
 
-    pub(super) fn run_callable(&self, function: EgclVal, args: &[EgclVal], env: &mut Env) -> Result<EgclVal, EgclError> {
+    pub(super) fn run_callable(
+        &self,
+        function: EgclVal,
+        args: &[EgclVal],
+        env: &mut Env,
+    ) -> Result<EgclVal, EgclError> {
         // A cached native target can bypass call_registered entirely. Its
         // lambda-list initforms still have the callee's lexical declaration
         // scope, never the caller's local SPECIAL declarations.
         if env.locally_specials.is_empty() {
             self.run_callable_in_definition_scope(function, args, env)
         } else {
-            super::super::with_special_declarations(env, Vec::new(), |env|
-                self.run_callable_in_definition_scope(function, args, env))
+            super::super::with_special_declarations(env, Vec::new(), |env| {
+                self.run_callable_in_definition_scope(function, args, env)
+            })
         }
     }
 
-    fn run_callable_in_definition_scope(&self, function: EgclVal, args: &[EgclVal], env: &mut Env) -> Result<EgclVal, EgclError> {
+    fn run_callable_in_definition_scope(
+        &self,
+        function: EgclVal,
+        args: &[EgclVal],
+        env: &mut Env,
+    ) -> Result<EgclVal, EgclError> {
         if let Some(offset) = self.lean_root_entry() {
             return self.run_ordinary_root(offset, function, args, env);
         }
@@ -1295,7 +1407,9 @@ impl TransferCode {
         // Tags remain in the rooted Env; the payload owns their exact tokens.
         let mut frame_guard = FrameGuard(osr.as_ref().map(|resume| resume.frame));
         let _catch_guard = CatchScopeGuard {
-            base: osr.as_ref().map_or(env.catch_stack.len(), |resume| resume.state.catch_base),
+            base: osr
+                .as_ref()
+                .map_or(env.catch_stack.len(), |resume| resume.state.catch_base),
             env,
         };
         // Nothing collects before every value below is rooted in `roots`.
@@ -1309,22 +1423,27 @@ impl TransferCode {
         if osr_offset.is_none() {
             validate_declared_args(&self.body, args)?;
         }
-        let mut state = activation::PooledActivation::new(self, match osr {
-            Some(resume) => resume.state,
-            None => ActivationState::prepare_reusing(self, env)?,
-        });
+        let mut state = activation::PooledActivation::new(
+            self,
+            match osr {
+                Some(resume) => resume.state,
+                None => ActivationState::prepare_reusing(self, env)?,
+            },
+        );
         let mut children = SegmentActivations::default();
         // One host root for the callable, a copy of the actuals (inline for
         // common arities), the Env, the state, the child ledger and the
         // enclosing pending error, instead of a link for each (GitHub #487).
-        egcl_rt::rooted!(roots = lean_root::EntryRoots {
-            function,
-            args: EntryArgs::new(args),
-            env,
-            state: &mut *state,
-            children: &mut children,
-            entry: None,
-        });
+        egcl_rt::rooted!(
+            roots = lean_root::EntryRoots {
+                function,
+                args: EntryArgs::new(args),
+                env,
+                state: &mut *state,
+                children: &mut children,
+                entry: None,
+            }
+        );
         // The rooted copy stays in place; the collector updates it there.
         let args: &[EgclVal] = unsafe { &*std::ptr::from_ref(roots.args.as_slice()) };
         let _depth = osr_offset.is_none().then(|| {
@@ -1338,7 +1457,8 @@ impl TransferCode {
         let frame_function = if egcl_rt::function::is_interpreted_function(roots.function) {
             roots.function
         } else {
-            self.deopt_metadata.as_ref()
+            self.deopt_metadata
+                .as_ref()
                 .and_then(|metadata| metadata.deopt_bodies.keys().next().copied())
                 .or(self.installed_symbol)
                 .map(EgclVal::from_symbol_index)
@@ -1351,16 +1471,20 @@ impl TransferCode {
             // collect, or fail: only switch the now-inactive frame's map.
             assert_eq!(stack.fp(), state.top_frame(frame));
             assert!(unsafe { (*frame).num_locals } >= self.slots);
-            unsafe { (*frame).code_info = self.code_info; }
+            unsafe {
+                (*frame).code_info = self.code_info;
+            }
             frame
-        } else { stack
-            .push_frame(frame_function, self.code_info, self.slots, FLAG_CALL)
-            .ok_or_else(|| {
-                EgclError::StackOverflow(
-                    egcl_rt::current_fiber_id()
-                        .unwrap_or_else(|| egcl_rt::FiberId(egcl_rt::current_thread_id().0)),
-                )
-            })? };
+        } else {
+            stack
+                .push_frame(frame_function, self.code_info, self.slots, FLAG_CALL)
+                .ok_or_else(|| {
+                    EgclError::StackOverflow(
+                        egcl_rt::current_fiber_id()
+                            .unwrap_or_else(|| egcl_rt::FiberId(egcl_rt::current_thread_id().0)),
+                    )
+                })?
+        };
         frame_guard.0 = Some(frame);
         if osr_offset.is_none() && (self.body.has_env || self.body.variadic) {
             // The interpreter's environment, as in `run_with_binding`: a
@@ -1370,7 +1494,9 @@ impl TransferCode {
             // inherits it with the rest of the state (bliss-shih7.27).
             let closure_env = closure_captured_env(roots.function);
             state.env_frame = if self.body.has_env {
-                let parent = closure_env.clone().unwrap_or_else(|| Arc::clone(&env.frame));
+                let parent = closure_env
+                    .clone()
+                    .unwrap_or_else(|| Arc::clone(&env.frame));
                 make_env_frame(&self.body, parent).or(closure_env)
             } else {
                 closure_env
@@ -1426,8 +1552,14 @@ impl TransferCode {
         // through normal transfer handling, rather than skipping their cleanup.
         let _ordinary_segment = super::call_table::enter_ordinary_segment();
         let _ordinary_root = if self.needs_callable_identity() {
-            Some(_ordinary_segment.retain_root(self, roots.function).ok_or_else(invalid_capture)?)
-        } else { None };
+            Some(
+                _ordinary_segment
+                    .retain_root(self, roots.function)
+                    .ok_or_else(invalid_capture)?,
+            )
+        } else {
+            None
+        };
         // A `&key` body was bound into its frame above; enter past binding
         // with those slots as the fixed arguments. The frame stays scanned.
         let bound_args;
@@ -1436,7 +1568,8 @@ impl TransferCode {
                 // Every bound slot, including for a leaf body, which keeps no
                 // native argument homes.
                 let count = self.ordinary_parameter_count();
-                bound_args = unsafe { std::slice::from_raw_parts(frame.add(1).cast::<EgclVal>(), count) };
+                bound_args =
+                    unsafe { std::slice::from_raw_parts(frame.add(1).cast::<EgclVal>(), count) };
                 (Some(offset), bound_args)
             }
             None => (self.ordinary_entry, args),
@@ -1483,8 +1616,12 @@ impl TransferCode {
         // The common outcome: a plain return. Nothing remains to unwind and
         // nothing below allocates before the value is returned, so it needs
         // neither root nor the checks below (GitHub #487).
-        if outcome.exit == NativeExit::Returned && error.is_none() && context.failure.is_none()
-            && context.osr.is_none() && context.selected.is_none() && state.is_quiescent()
+        if outcome.exit == NativeExit::Returned
+            && error.is_none()
+            && context.failure.is_none()
+            && context.osr.is_none()
+            && context.selected.is_none()
+            && state.is_quiescent()
         {
             return Ok(primary);
         }
@@ -1494,8 +1631,10 @@ impl TransferCode {
             return Err(invalid_capture());
         }
         if let Some((next, offset)) = context.osr.take() {
-            if outcome.exit != NativeExit::Transfer || error.is_some()
-                || context.selected.is_some() || !state.can_osr()
+            if outcome.exit != NativeExit::Transfer
+                || error.is_some()
+                || context.selected.is_some()
+                || !state.can_osr()
             {
                 return Err(invalid_capture());
             }
@@ -1600,37 +1739,38 @@ impl TransferCode {
                     && saved.locals.len() == usize::from(self.body.n_locals)
                     && saved.stack.len() <= usize::from(self.body.max_stack)
                     && self.body.code.get(saved.resume_pc as usize).is_some()
-                    && (bounded_loop_poll || matches!(
-                        self.body.code.get(saved.resume_pc as usize),
-                        Some(
-                            Instr::CallNamed { .. }
-                                | Instr::EvalHost(_)
-                                | Instr::LoadFunction(_)
-                                | Instr::ValuesToList
-                                | Instr::MakeClosure { .. }
-                                | Instr::LoadEnvVar(_)
-                                | Instr::StoreEnvVar(_)
-                                | Instr::DefineEnvVar(_)
-                                | Instr::PushEnvChild
-                                | Instr::PopEnvChild
-                                | Instr::AllocCons
-                                | Instr::CleanupReturn
-                                | Instr::SetValues(_)
-                                | Instr::Throw
-                                | Instr::PushCatch { .. }
-                                | Instr::PopHandler
-                                | Instr::PushHandlerCase { .. }
-                                | Instr::PopHandlerCase
-                                | Instr::PushHandlerBind { .. }
-                                | Instr::PopHandlerBind
-                                | Instr::PushRestartCase { .. }
-                                | Instr::PopRestartCase
-                                | Instr::BindSpecial(_)
-                                | Instr::UnbindSpecial(_)
-                                | Instr::LoadGlobal(_)
-                                | Instr::StoreGlobal(_)
-                        )
-                    ))
+                    && (bounded_loop_poll
+                        || matches!(
+                            self.body.code.get(saved.resume_pc as usize),
+                            Some(
+                                Instr::CallNamed { .. }
+                                    | Instr::EvalHost(_)
+                                    | Instr::LoadFunction(_)
+                                    | Instr::ValuesToList
+                                    | Instr::MakeClosure { .. }
+                                    | Instr::LoadEnvVar(_)
+                                    | Instr::StoreEnvVar(_)
+                                    | Instr::DefineEnvVar(_)
+                                    | Instr::PushEnvChild
+                                    | Instr::PopEnvChild
+                                    | Instr::AllocCons
+                                    | Instr::CleanupReturn
+                                    | Instr::SetValues(_)
+                                    | Instr::Throw
+                                    | Instr::PushCatch { .. }
+                                    | Instr::PopHandler
+                                    | Instr::PushHandlerCase { .. }
+                                    | Instr::PopHandlerCase
+                                    | Instr::PushHandlerBind { .. }
+                                    | Instr::PopHandlerBind
+                                    | Instr::PushRestartCase { .. }
+                                    | Instr::PopRestartCase
+                                    | Instr::BindSpecial(_)
+                                    | Instr::UnbindSpecial(_)
+                                    | Instr::LoadGlobal(_)
+                                    | Instr::StoreGlobal(_)
+                            )
+                        ))
             })
             .ok_or_else(invalid_capture)?;
         let running = site.map().control_scopes.iter().filter_map(|scope| {
@@ -1673,7 +1813,9 @@ impl TransferCode {
         // Reconstructed locals can omit dead arguments, so discard native
         // original-argument recipes before installing bytecode state. T0
         // scans all tagged slots without a native stack map.
-        unsafe { (*frame).code_info = std::ptr::null(); }
+        unsafe {
+            (*frame).code_info = std::ptr::null();
+        }
         for (index, value) in saved.locals.iter().chain(&saved.stack).enumerate() {
             unsafe { slot_set(frame, index as u16, *value) };
         }
@@ -1686,10 +1828,19 @@ impl TransferCode {
             .iter()
             // Each handler resumes in the frame it was established in, not in
             // a child frame entered natively after it (bliss-uhsp5).
-            .zip(scope_env_frames(&site.map().control_scopes, &site_env_frame))
+            .zip(scope_env_frames(
+                &site.map().control_scopes,
+                &site_env_frame,
+            ))
             // A lexical environment is the activation's EnvFrame, not a handler.
-            .filter(|(scope, _)| !matches!(scope.kind, ScopeKind::Cleanup { .. }
-                | ScopeKind::SpecialBinding { .. } | ScopeKind::LexicalEnvironment))
+            .filter(|(scope, _)| {
+                !matches!(
+                    scope.kind,
+                    ScopeKind::Cleanup { .. }
+                        | ScopeKind::SpecialBinding { .. }
+                        | ScopeKind::LexicalEnvironment
+                )
+            })
             .map(|(scope, scope_env)| match scope.kind {
                 ScopeKind::Block {
                     id,
@@ -1813,9 +1964,13 @@ fn invalid_capture() -> EgclError {
 /// entry pads an omitted one with the unsupplied marker (bliss-6m6ca).
 fn ordinary_entry_parameters(body: &BytecodeFunction) -> bool {
     fixed_tagged_parameters(body)
-        || (positional_tagged_parameters(body) && body.min_args < body.arity && body.arity <= 3
+        || (positional_tagged_parameters(body)
+            && body.min_args < body.arity
+            && body.arity <= 3
             && body.param_types.iter().all(|ty| ty.is_any()))
-        || (body.variadic && !body.has_env && body.param_types.iter().all(|ty| ty.is_any())
+        || (body.variadic
+            && !body.has_env
+            && body.param_types.iter().all(|ty| ty.is_any())
             && super::variadic_plan::VariadicPlan::native_keywords(body).is_some())
 }
 
@@ -1914,13 +2069,21 @@ pub(super) fn captured_environment_decline(body: &BytecodeFunction) -> Option<&'
             next_slot += 1;
         }
     }
-    let boxed = || body.param_layout.iter().filter(|(_, location)| matches!(location, VarLoc::Boxed));
+    let boxed = || {
+        body.param_layout
+            .iter()
+            .filter(|(_, location)| matches!(location, VarLoc::Boxed))
+    };
     // Declared types align with parameters, not slots; T2 would check the
     // wrong slot once a boxed parameter shifts the prefix.
     if boxed().next().is_some() && body.param_types.iter().any(|ty| !ty.is_any()) {
         return Some("a declared parameter type beside a captured parameter");
     }
-    if body.code.iter().any(|op| matches!(op, Instr::MakeClosureEnv(_))) {
+    if body
+        .code
+        .iter()
+        .any(|op| matches!(op, Instr::MakeClosureEnv(_)))
+    {
         return Some("builds a closure from source (MakeClosureEnv)");
     }
     None
@@ -1959,8 +2122,7 @@ fn scope_free_native_body(body: &BytecodeFunction, allow_values: bool) -> bool {
 /// specialization removes the binder, as `packed_f64_native_body` relies on;
 /// `ordinary_primary_transport_eliminated` checks that it did (bliss-z4dlm).
 pub(super) fn ordinary_native_body(body: &BytecodeFunction) -> bool {
-    !body.has_env && slot_parameters(body, false)
-        && body.code.iter().all(ordinary_native_op)
+    !body.has_env && slot_parameters(body, false) && body.code.iter().all(ordinary_native_op)
 }
 
 fn ordinary_native_op(op: &Instr) -> bool {
@@ -1974,35 +2136,49 @@ fn ordinary_native_op(op: &Instr) -> bool {
 
 pub(super) fn ordinary_function_designators_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var_os("EGCL_DISABLE_ORDINARY_FUNCTION_DESIGNATORS").is_none()
-    })
+    *ENABLED
+        .get_or_init(|| std::env::var_os("EGCL_DISABLE_ORDINARY_FUNCTION_DESIGNATORS").is_none())
 }
 
 /// Whether specialization removed every primary-value binder the body's
 /// bytecode contains, so the ordinary entry never needs multiple values.
 fn ordinary_primary_transport_eliminated(ir: &egcl_compiler::t2::ir::Function) -> bool {
-    ir.block_order().iter().all(|&block| ir.block(block).insts.iter().all(|&inst| {
-        ir.inst(inst).opcode != egcl_compiler::t2::ir::Opcode::TakeValuesToLocals
-    }))
+    ir.block_order().iter().all(|&block| {
+        ir.block(block)
+            .insts
+            .iter()
+            .all(|&inst| ir.inst(inst).opcode != egcl_compiler::t2::ir::Opcode::TakeValuesToLocals)
+    })
 }
 
 /// The first instruction `ordinary_native_body` refuses, for its decline log.
 fn first_refused_ordinary_op(body: &BytecodeFunction) -> Option<String> {
     let op = body.code.iter().find(|op| !ordinary_native_op(op))?;
     let full = format!("{op:?}");
-    Some(full.find(['(', ' ', '{']).map_or(full.clone(), |i| full[..i].to_string()))
+    Some(
+        full.find(['(', ' ', '{'])
+            .map_or(full.clone(), |i| full[..i].to_string()),
+    )
 }
 
 /// Whether a body uses the TAGBODY extension `ordinary_native_body` admits.
 fn has_local_tagbody(body: &BytecodeFunction) -> bool {
-    body.code.iter().any(|op| matches!(op, Instr::PushTag { .. }))
+    body.code
+        .iter()
+        .any(|op| matches!(op, Instr::PushTag { .. }))
 }
 
 /// Retained self expansion reconstructs only local BLOCKs in nested logical
 /// frames. A tagbody body is admitted only while every guard owns one frame.
-fn ordinary_single_frame_states(body: &BytecodeFunction, ir: &egcl_compiler::t2::ir::Function) -> bool {
-    !has_local_tagbody(body) || ir.frame_states.iter().all(|(_, state)| state.scopes.len() == 1)
+fn ordinary_single_frame_states(
+    body: &BytecodeFunction,
+    ir: &egcl_compiler::t2::ir::Function,
+) -> bool {
+    !has_local_tagbody(body)
+        || ir
+            .frame_states
+            .iter()
+            .all(|(_, state)| state.scopes.len() == 1)
 }
 
 // Raw numeric locals use the existing managed activation's local control scopes.
@@ -2015,36 +2191,71 @@ fn packed_f64_native_body(body: &BytecodeFunction, ir: &egcl_compiler::t2::ir::F
 // Fixnum boxing is a nonallocating tag shift; tagged multiple-value transport
 // can therefore share its existing mapped contract after explicit conversion.
 fn raw_numeric_native_body(body: &BytecodeFunction, ir: &egcl_compiler::t2::ir::Function) -> bool {
-    let allow_values = (0..ir.num_values()).all(|index|
+    let allow_values = (0..ir.num_values()).all(|index| {
         ir.value(egcl_compiler::t2::ir::Value(index as u32)).repr
-            != egcl_compiler::t2::ir::ValueRepresentation::UnboxedF64);
+            != egcl_compiler::t2::ir::ValueRepresentation::UnboxedF64
+    });
     numeric_native_body(body, ir, allow_values)
 }
 
-fn numeric_native_body(body: &BytecodeFunction, ir: &egcl_compiler::t2::ir::Function, allow_values: bool) -> bool {
+fn numeric_native_body(
+    body: &BytecodeFunction,
+    ir: &egcl_compiler::t2::ir::Function,
+    allow_values: bool,
+) -> bool {
     // The original boot SETF bytecode retains its primary-value binder. Admit
     // that transport only when specialization eliminated every live binder.
     // Tagged multiple values are admitted for scalar fixnum candidates.
-    let normalized = ir.block_order().iter().all(|&block| ir.block(block).insts.iter().all(|&inst| {
-        ir.inst(inst).opcode != egcl_compiler::t2::ir::Opcode::TakeValuesToLocals
-    }));
-    normalized && local_control_native_body(body, allow_values, true, true)
-        && !body.code.iter().any(|op| matches!(op,
-            Instr::PushCatch { .. } | Instr::Throw
-                | Instr::PushUnwind { .. } | Instr::EnterCleanupNormal { .. } | Instr::CleanupReturn
-                | Instr::PushHandlerCase { .. } | Instr::PopHandlerCase
-                | Instr::PushHandlerBind { .. } | Instr::PopHandlerBind
-                | Instr::PushRestartCase { .. } | Instr::PopRestartCase
-                | Instr::BindSpecial(_) | Instr::UnbindSpecial(_)
-                | Instr::LoadFunction(_)
-                | Instr::MakeClosure { .. }
-                | Instr::LoadEnvVar(_) | Instr::StoreEnvVar(_) | Instr::DefineEnvVar(_)
-                | Instr::PushEnvChild | Instr::PopEnvChild))
+    let normalized = ir.block_order().iter().all(|&block| {
+        ir.block(block)
+            .insts
+            .iter()
+            .all(|&inst| ir.inst(inst).opcode != egcl_compiler::t2::ir::Opcode::TakeValuesToLocals)
+    });
+    normalized
+        && local_control_native_body(body, allow_values, true, true)
+        && !body.code.iter().any(|op| {
+            matches!(
+                op,
+                Instr::PushCatch { .. }
+                    | Instr::Throw
+                    | Instr::PushUnwind { .. }
+                    | Instr::EnterCleanupNormal { .. }
+                    | Instr::CleanupReturn
+                    | Instr::PushHandlerCase { .. }
+                    | Instr::PopHandlerCase
+                    | Instr::PushHandlerBind { .. }
+                    | Instr::PopHandlerBind
+                    | Instr::PushRestartCase { .. }
+                    | Instr::PopRestartCase
+                    | Instr::BindSpecial(_)
+                    | Instr::UnbindSpecial(_)
+                    | Instr::LoadFunction(_)
+                    | Instr::MakeClosure { .. }
+                    | Instr::LoadEnvVar(_)
+                    | Instr::StoreEnvVar(_)
+                    | Instr::DefineEnvVar(_)
+                    | Instr::PushEnvChild
+                    | Instr::PopEnvChild
+            )
+        })
 }
 
-fn local_control_native_body(body: &BytecodeFunction, allow_values: bool, allow_local_scopes: bool, allow_primary_transport: bool) -> bool {
+fn local_control_native_body(
+    body: &BytecodeFunction,
+    allow_values: bool,
+    allow_local_scopes: bool,
+    allow_primary_transport: bool,
+) -> bool {
     slot_parameters(body, allow_local_scopes)
-        && body.code.iter().all(|op| local_control_op(op, allow_values, allow_local_scopes, allow_primary_transport))
+        && body.code.iter().all(|op| {
+            local_control_op(
+                op,
+                allow_values,
+                allow_local_scopes,
+                allow_primary_transport,
+            )
+        })
 }
 
 fn slot_parameters(body: &BytecodeFunction, allow_local_scopes: bool) -> bool {
@@ -2060,13 +2271,33 @@ fn slot_parameters(body: &BytecodeFunction, allow_local_scopes: bool) -> bool {
 
 /// The first instruction `local_control_native_body` refuses under the same
 /// flags, named by its variant, for decline logs (bliss-s5r0c).
-pub(super) fn first_refused_local_control_op(body: &BytecodeFunction, allow_values: bool, allow_local_scopes: bool, allow_primary_transport: bool) -> Option<String> {
-    let op = body.code.iter().find(|op| !local_control_op(op, allow_values, allow_local_scopes, allow_primary_transport))?;
+pub(super) fn first_refused_local_control_op(
+    body: &BytecodeFunction,
+    allow_values: bool,
+    allow_local_scopes: bool,
+    allow_primary_transport: bool,
+) -> Option<String> {
+    let op = body.code.iter().find(|op| {
+        !local_control_op(
+            op,
+            allow_values,
+            allow_local_scopes,
+            allow_primary_transport,
+        )
+    })?;
     let full = format!("{op:?}");
-    Some(full.find(['(', ' ', '{']).map_or(full.clone(), |i| full[..i].to_string()))
+    Some(
+        full.find(['(', ' ', '{'])
+            .map_or(full.clone(), |i| full[..i].to_string()),
+    )
 }
 
-fn local_control_op(op: &Instr, allow_values: bool, allow_local_scopes: bool, allow_primary_transport: bool) -> bool {
+fn local_control_op(
+    op: &Instr,
+    allow_values: bool,
+    allow_local_scopes: bool,
+    allow_primary_transport: bool,
+) -> bool {
     // Nested tagged callees support MV; optimized/direct-recursive
     // admission retains its existing restriction.
     (allow_values && matches!(op,
@@ -2133,11 +2364,16 @@ fn closure_code_matches(symbol: u32, function: EgclVal, body: *const BytecodeFun
         && super::registry_get(symbol).is_some_and(|owned| std::ptr::eq(Arc::as_ptr(&owned), body))
 }
 
-fn callable_definition_matches(symbol: u32, function: EgclVal, body: *const BytecodeFunction) -> bool {
+fn callable_definition_matches(
+    symbol: u32,
+    function: EgclVal,
+    body: *const BytecodeFunction,
+) -> bool {
     egcl_rt::function::is_interpreted_function(function)
         && replacement_function_value(symbol, function).is_none()
-        && bytecode_for_callable(symbol, function).is_some_and(|(owner, current)|
-            owner == symbol && std::ptr::eq(Arc::as_ptr(&current), body))
+        && bytecode_for_callable(symbol, function).is_some_and(|(owner, current)| {
+            owner == symbol && std::ptr::eq(Arc::as_ptr(&current), body)
+        })
 }
 
 /// Prepare a distinct precise activation, then return before generated code
@@ -2176,14 +2412,20 @@ unsafe fn recursive_target_matches(context: *mut CaptureContext, symbol: u32) ->
     {
         return false;
     }
-    unsafe { (*context).recursive_generation = generation; }
+    unsafe {
+        (*context).recursive_generation = generation;
+    }
     true
 }
 
 /// Cold, sampled scheduling runs while the suspended caller is precisely
 /// published and before a child frame exists. The actual admission is counted
 /// later; a cap, changed definition or failed frame push counts via fallback.
-unsafe fn schedule_recursive_promotion(context: *mut CaptureContext, symbol: u32, count: u32) -> Result<EgclVal, EgclError> {
+unsafe fn schedule_recursive_promotion(
+    context: *mut CaptureContext,
+    symbol: u32,
+    count: u32,
+) -> Result<EgclVal, EgclError> {
     let function = unsafe { (*(*context).frame).function };
     if !t2_enabled() || egcl_rt::function::tier(function) == 2 {
         return Ok(NIL);
@@ -2199,12 +2441,16 @@ unsafe fn schedule_recursive_promotion(context: *mut CaptureContext, symbol: u32
     poll_t2_completions();
     let needs_t2 = NATIVE_REGISTRY.with(|registry| {
         registry.borrow().get(&symbol).is_some_and(|installed| {
-            !installed.is_t2 && installed.body.as_ref().is_some_and(|body|
-                std::ptr::eq(Arc::as_ptr(body), unsafe { (*context).body }))
+            !installed.is_t2
+                && installed
+                    .body
+                    .as_ref()
+                    .is_some_and(|body| std::ptr::eq(Arc::as_ptr(body), unsafe { (*context).body }))
         })
     });
     if needs_t2 {
-        let priority = (u64::from(egcl_rt::function::back_edge_count(*function)) << 32) | u64::from(count);
+        let priority =
+            (u64::from(egcl_rt::function::back_edge_count(*function)) << 32) | u64::from(count);
         request_t2_compilation(symbol, priority);
         poll_t2_completions();
     }
@@ -2221,27 +2467,42 @@ unsafe fn prepare_recursive_unpublished(request: *mut u8, out: *mut NativeOutcom
     request.reserved = 0;
     // Entry polling also covers recursion without a loop back-edge. This is
     // root-safe because no argument exists only in an unscanned register.
-    unsafe { poll_or_transfer_unpublished(std::ptr::null_mut(), out); }
-    if unsafe { (*out).exit } != NativeExit::Returned { return; }
+    unsafe {
+        poll_or_transfer_unpublished(std::ptr::null_mut(), out);
+    }
+    if unsafe { (*out).exit } != NativeExit::Returned {
+        return;
+    }
     let context = CAPTURE.with(Cell::get);
     let symbol = request.call.symbol as u32;
     if !unsafe { recursive_target_matches(context, symbol) } {
-        unsafe { c2i_call_legacy_v2(std::ptr::from_mut(&mut request.call).cast(), out); }
+        unsafe {
+            c2i_call_legacy_v2(std::ptr::from_mut(&mut request.call).cast(), out);
+        }
         return;
     }
     let here = std::ptr::from_ref(&request) as usize as u64;
     let limit = egcl_rt::stack::current_native_stack_limit();
     if NATIVE_DEPTH.with(|depth| depth.get() >= native_depth_cap()) || here <= limit {
-        unsafe { c2i_call_legacy_v2(std::ptr::from_mut(&mut request.call).cast(), out); }
+        unsafe {
+            c2i_call_legacy_v2(std::ptr::from_mut(&mut request.call).cast(), out);
+        }
         return;
     }
     if unsafe { (*context).recursive_profile && !(*(*context).owner).is_t2 } {
         let function = unsafe { (*(*context).frame).function };
         let count = egcl_rt::function::invoke_count(function).saturating_add(1);
         if count % t2_invoke_threshold().max(1) == 0 {
-            if let Err(error) = guard_c2i(|| unsafe { schedule_recursive_promotion(context, symbol, count) }) {
+            if let Err(error) =
+                guard_c2i(|| unsafe { schedule_recursive_promotion(context, symbol, count) })
+            {
                 NATIVE_ERROR.with(|slot| slot.set_first(error));
-                unsafe { out.write(NativeOutcome { value: NIL, exit: NativeExit::Transfer }); }
+                unsafe {
+                    out.write(NativeOutcome {
+                        value: NIL,
+                        exit: NativeExit::Transfer,
+                    });
+                }
                 return;
             }
         }
@@ -2249,7 +2510,9 @@ unsafe fn prepare_recursive_unpublished(request: *mut u8, out: *mut NativeOutcom
     // Publication may change linkage or collect. Reload the traced callable
     // from the owning frame and revalidate before committing any child state.
     if !unsafe { recursive_target_matches(context, symbol) } {
-        unsafe { c2i_call_legacy_v2(std::ptr::from_mut(&mut request.call).cast(), out); }
+        unsafe {
+            c2i_call_legacy_v2(std::ptr::from_mut(&mut request.call).cast(), out);
+        }
         return;
     }
     let context = unsafe { &mut *context };
@@ -2260,7 +2523,12 @@ unsafe fn prepare_recursive_unpublished(request: *mut u8, out: *mut NativeOutcom
         let value = unsafe { request.call.args.add(index).read() };
         if let Err(error) = validate_declared_value(ty, value) {
             NATIVE_ERROR.with(|slot| slot.set_first(error));
-            unsafe { out.write(NativeOutcome { value: NIL, exit: NativeExit::Transfer }); }
+            unsafe {
+                out.write(NativeOutcome {
+                    value: NIL,
+                    exit: NativeExit::Transfer,
+                });
+            }
             return;
         }
     }
@@ -2272,14 +2540,24 @@ unsafe fn prepare_recursive_unpublished(request: *mut u8, out: *mut NativeOutcom
         context.slots as u16,
         FLAG_CALL,
     ) else {
-        unsafe { c2i_call_legacy_v2(std::ptr::from_mut(&mut request.call).cast(), out); }
+        unsafe {
+            c2i_call_legacy_v2(std::ptr::from_mut(&mut request.call).cast(), out);
+        }
         return;
     };
     for (index, (_, location)) in body.param_layout.iter().enumerate() {
-        let VarLoc::Slot(slot) = location else { unreachable!("admitted slot parameter") };
-        unsafe { slot_set(frame, *slot, request.call.args.add(index).read()); }
+        let VarLoc::Slot(slot) = location else {
+            unreachable!("admitted slot parameter")
+        };
+        unsafe {
+            slot_set(frame, *slot, request.call.args.add(index).read());
+        }
     }
-    request.activation = RecursiveActivation { previous: context.recursive, frame, stack };
+    request.activation = RecursiveActivation {
+        previous: context.recursive,
+        frame,
+        stack,
+    };
     context.recursive = std::ptr::from_mut(&mut request.activation);
     #[cfg(test)]
     RECURSIVE_ENTRIES.with(|count| count.set(count.get() + 1));
@@ -2289,9 +2567,12 @@ unsafe fn prepare_recursive_unpublished(request: *mut u8, out: *mut NativeOutcom
     }
     c2i_clear_mv();
     // The untagged activation address goes straight to the generated entry.
-    unsafe { out.write(NativeOutcome {
-        value: EgclVal(frame.add(1) as u64), exit: NativeExit::Returned,
-    }); }
+    unsafe {
+        out.write(NativeOutcome {
+            value: EgclVal(frame.add(1) as u64),
+            exit: NativeExit::Returned,
+        });
+    }
 }
 
 /// Nonallocating retirement shared by normal returns and cold chain exits.
@@ -2345,7 +2626,11 @@ impl EntryArgs {
         } else {
             args.to_vec()
         };
-        Self { inline, len: args.len(), spill }
+        Self {
+            inline,
+            len: args.len(),
+            spill,
+        }
     }
 
     /// The actuals `first` followed by `rest`, as one argument list.
@@ -2366,7 +2651,11 @@ impl EntryArgs {
     }
 
     pub(super) fn as_slice(&self) -> &[EgclVal] {
-        if self.len <= self.inline.len() { &self.inline[..self.len] } else { &self.spill }
+        if self.len <= self.inline.len() {
+            &self.inline[..self.len]
+        } else {
+            &self.spill
+        }
     }
 }
 
@@ -2696,7 +2985,7 @@ unsafe fn lexical_environment_leaf(
     request: *mut u8,
     image: *mut SysvTransferCapture,
 ) -> Option<EgclVal> {
-    use egcl_compiler::t2::emit::{TransferCallRequest, TRANSFER_LEXICAL_ENVIRONMENT_REQUEST};
+    use egcl_compiler::t2::emit::{TRANSFER_LEXICAL_ENVIRONMENT_REQUEST, TransferCallRequest};
     let call = unsafe { &*request.cast::<TransferCallRequest>() };
     static ENABLED: OnceLock<bool> = OnceLock::new();
     if call.symbol & !u64::from(u32::MAX) != TRANSFER_LEXICAL_ENVIRONMENT_REQUEST
@@ -2706,15 +2995,22 @@ unsafe fn lexical_environment_leaf(
         return None;
     }
     let context = unsafe { CAPTURE.with(Cell::get).as_ref() }?;
-    if context.selected.is_some() || context.failure.is_some() || context.osr.is_some()
-        || context.recursive_escape || context.owner.is_null() || context.env_frame.is_null()
+    if context.selected.is_some()
+        || context.failure.is_some()
+        || context.osr.is_some()
+        || context.recursive_escape
+        || context.owner.is_null()
+        || context.env_frame.is_null()
     {
         return None;
     }
     let owner = unsafe { &*context.owner };
     let pc = unsafe { (*image).return_pc } as usize;
-    if !pc.checked_sub(owner.code.as_ptr() as usize).is_some_and(|offset|
-        offset < owner.code_len && owner._native_calls.value_map(offset).is_some())
+    if !pc
+        .checked_sub(owner.code.as_ptr() as usize)
+        .is_some_and(|offset| {
+            offset < owner.code_len && owner._native_calls.value_map(offset).is_some()
+        })
         || !std::ptr::eq(context.body, Arc::as_ptr(&owner.body))
     {
         // A direct child can belong to a different retained code owner. Its
@@ -2732,7 +3028,9 @@ unsafe fn lexical_environment_leaf(
     let value = if lexical_identity::encoded(name) {
         if store {
             let value = unsafe { *call.args };
-            if !Env::set_lexical_frame(frame, name, value) { return None; }
+            if !Env::set_lexical_frame(frame, name, value) {
+                return None;
+            }
             NIL
         } else {
             Env::lookup_lexical_frame(frame, name)?
@@ -2743,7 +3041,9 @@ unsafe fn lexical_environment_leaf(
         let symbol = egcl_rt::symbols::find_index(name);
         if store {
             let value = unsafe { *call.args };
-            if !Env::set_resolved_frame_var(frame, name, symbol, value) { return None; }
+            if !Env::set_resolved_frame_var(frame, name, symbol, value) {
+                return None;
+            }
             NIL
         } else {
             // Missing bindings must signal with the full published native stack.
@@ -2763,12 +3063,19 @@ unsafe extern "C" fn call_or_throw(
     #[cfg(test)]
     lexical_leaf_tests::before_request(request);
     if let Some(value) = unsafe { lexical_environment_leaf(request, image) } {
-        unsafe { out.write(NativeOutcome { value, exit: NativeExit::Returned }); }
+        unsafe {
+            out.write(NativeOutcome {
+                value,
+                exit: NativeExit::Returned,
+            });
+        }
         return;
     }
     unsafe {
         root_publication::published(image, || {
-            use egcl_compiler::t2::emit::{TransferCallRequest, TRANSFER_LEXICAL_ENVIRONMENT_REQUEST};
+            use egcl_compiler::t2::emit::{
+                TRANSFER_LEXICAL_ENVIRONMENT_REQUEST, TransferCallRequest,
+            };
             let kind = (*request.cast::<TransferCallRequest>()).symbol & !u64::from(u32::MAX);
             if kind == TRANSFER_LEXICAL_ENVIRONMENT_REQUEST {
                 #[cfg(test)]
@@ -2777,7 +3084,9 @@ unsafe extern "C" fn call_or_throw(
                 // armed request while every native frame is precisely visible.
                 if !current_poll_idle() {
                     poll_or_transfer_unpublished(std::ptr::null_mut(), out);
-                    if (*out).exit != NativeExit::Returned { return; }
+                    if (*out).exit != NativeExit::Returned {
+                        return;
+                    }
                 }
                 #[cfg(test)]
                 lexical_leaf_tests::inside_published(request);
@@ -2800,15 +3109,23 @@ unsafe fn lexical_environment_request(
 ) -> Result<EgclVal, EgclError> {
     let context = unsafe { &*CAPTURE.with(Cell::get) };
     let body = unsafe { &*context.body };
-    let instruction = *body.code.get(call.symbol as u32 as usize).ok_or_else(invalid_capture)?;
-    let name = |index: u16| body.names.get(usize::from(index)).ok_or_else(invalid_capture);
+    let instruction = *body
+        .code
+        .get(call.symbol as u32 as usize)
+        .ok_or_else(invalid_capture)?;
+    let name = |index: u16| {
+        body.names
+            .get(usize::from(index))
+            .ok_or_else(invalid_capture)
+    };
     let current = || unsafe { (*context.env_frame).clone() }.ok_or_else(invalid_capture);
     match instruction {
         Instr::LoadEnvVar(index) => {
             assert_eq!(call.nargs, 0);
             let name = name(index)?;
-            Env::lookup_lexical_frame(&current()?, name)
-                .ok_or_else(|| EgclError::UnboundVariable(lexical_identity::resolve(name).unwrap_or(NIL)))
+            Env::lookup_lexical_frame(&current()?, name).ok_or_else(|| {
+                EgclError::UnboundVariable(lexical_identity::resolve(name).unwrap_or(NIL))
+            })
         }
         Instr::StoreEnvVar(index) | Instr::DefineEnvVar(index) => {
             assert_eq!(call.nargs, 1);
@@ -2830,12 +3147,21 @@ unsafe fn lexical_environment_request(
             pop_env_child(unsafe { &mut *context.env_frame });
             Ok(NIL)
         }
-        Instr::MakeClosure { func, capture_env: true } => {
-            let nested = Arc::clone(body.nested_functions.get(func as usize).ok_or_else(invalid_capture)?);
+        Instr::MakeClosure {
+            func,
+            capture_env: true,
+        } => {
+            let nested = Arc::clone(
+                body.nested_functions
+                    .get(func as usize)
+                    .ok_or_else(invalid_capture)?,
+            );
             let captured = unsafe { (*context.env_frame).clone() };
             // As for a non-capturing closure: nothing allocates between its
             // creation and the outcome write.
-            let closure = super::make_template_closure(&nested, captured, unsafe { &*NATIVE_ENV.with(Cell::get) });
+            let closure = super::make_template_closure(&nested, captured, unsafe {
+                &*NATIVE_ENV.with(Cell::get)
+            });
             Ok(closure)
         }
         _ => Err(invalid_capture()),
@@ -2847,19 +3173,26 @@ unsafe fn call_or_throw_unpublished(
     out: *mut egcl_rt::native_transfer::NativeOutcome,
 ) {
     use egcl_compiler::t2::emit::{
-        TransferCallRequest, TRANSFER_CATCH_ENTER_REQUEST, TRANSFER_CATCH_LEAVE_REQUEST,
-        TRANSFER_THROW_REQUEST,
+        TRANSFER_CATCH_ENTER_REQUEST, TRANSFER_CATCH_LEAVE_REQUEST, TRANSFER_THROW_REQUEST,
+        TransferCallRequest,
     };
     use egcl_rt::native_transfer::NativeOutcome;
     let call = unsafe { &*request.cast::<TransferCallRequest>() };
     let request_kind = call.symbol & !u64::from(u32::MAX);
     use egcl_compiler::t2::emit::{
-        TRANSFER_SPECIAL_BIND_REQUEST, TRANSFER_SPECIAL_UNBIND_REQUEST,
-        TRANSFER_GLOBAL_LOAD_REQUEST, TRANSFER_GLOBAL_STORE_REQUEST,
+        TRANSFER_GLOBAL_LOAD_REQUEST, TRANSFER_GLOBAL_STORE_REQUEST, TRANSFER_SPECIAL_BIND_REQUEST,
+        TRANSFER_SPECIAL_UNBIND_REQUEST,
     };
-    if matches!(request_kind, TRANSFER_SPECIAL_BIND_REQUEST | TRANSFER_SPECIAL_UNBIND_REQUEST
-        | TRANSFER_GLOBAL_LOAD_REQUEST | TRANSFER_GLOBAL_STORE_REQUEST) {
-        let result = if native_error_pending() { Ok(NIL) } else {
+    if matches!(
+        request_kind,
+        TRANSFER_SPECIAL_BIND_REQUEST
+            | TRANSFER_SPECIAL_UNBIND_REQUEST
+            | TRANSFER_GLOBAL_LOAD_REQUEST
+            | TRANSFER_GLOBAL_STORE_REQUEST
+    ) {
+        let result = if native_error_pending() {
+            Ok(NIL)
+        } else {
             guard_c2i(|| unsafe { special_request(call) })
         };
         let value = match result {
@@ -2869,19 +3202,25 @@ unsafe fn call_or_throw_unpublished(
                 NIL
             }
         };
-        unsafe { out.write(NativeOutcome {
-            value,
-            exit: if native_error_pending() { NativeExit::Transfer } else { NativeExit::Returned },
-        }); }
+        unsafe {
+            out.write(NativeOutcome {
+                value,
+                exit: if native_error_pending() {
+                    NativeExit::Transfer
+                } else {
+                    NativeExit::Returned
+                },
+            });
+        }
         return;
     }
     use egcl_compiler::t2::emit::{
-        TRANSFER_HANDLER_BIND_ENTER_REQUEST, TRANSFER_HANDLER_BIND_LEAVE_REQUEST,
-        TRANSFER_HANDLER_ENTER_REQUEST, TRANSFER_HANDLER_LEAVE_REQUEST,
+        TRANSFER_FUNCTION_LOOKUP_REQUEST, TRANSFER_HANDLER_BIND_ENTER_REQUEST,
+        TRANSFER_HANDLER_BIND_LEAVE_REQUEST, TRANSFER_HANDLER_ENTER_REQUEST,
+        TRANSFER_HANDLER_LEAVE_REQUEST, TRANSFER_HOST_EVAL_REQUEST,
+        TRANSFER_LEXICAL_ENVIRONMENT_REQUEST, TRANSFER_MAKE_CLOSURE_REQUEST,
         TRANSFER_RESTART_CASE_ENTER_REQUEST, TRANSFER_RESTART_CASE_LEAVE_REQUEST,
-        TRANSFER_HOST_EVAL_REQUEST, TRANSFER_FUNCTION_LOOKUP_REQUEST,
         TRANSFER_VALUES_TO_LIST_REQUEST,
-        TRANSFER_MAKE_CLOSURE_REQUEST, TRANSFER_LEXICAL_ENVIRONMENT_REQUEST,
     };
     if request_kind == TRANSFER_LEXICAL_ENVIRONMENT_REQUEST {
         let mut value = NIL;
@@ -2914,7 +3253,11 @@ unsafe fn call_or_throw_unpublished(
                 let env = unsafe { &mut *NATIVE_ENV.with(Cell::get) };
                 let primary = unsafe { *call.args };
                 egcl_rt::rooted!(
-                    vals = if env.mv_active { env.mv.clone() } else { vec![primary] }
+                    vals = if env.mv_active {
+                        env.mv.clone()
+                    } else {
+                        vec![primary]
+                    }
                 );
                 let list = vec_to_list(&vals);
                 env.clear_mv();
@@ -2939,7 +3282,9 @@ unsafe fn call_or_throw_unpublished(
     }
     if matches!(
         request_kind,
-        TRANSFER_HOST_EVAL_REQUEST | TRANSFER_FUNCTION_LOOKUP_REQUEST | TRANSFER_MAKE_CLOSURE_REQUEST
+        TRANSFER_HOST_EVAL_REQUEST
+            | TRANSFER_FUNCTION_LOOKUP_REQUEST
+            | TRANSFER_MAKE_CLOSURE_REQUEST
     ) {
         let mut value = NIL;
         if !native_error_pending() {
@@ -2949,7 +3294,8 @@ unsafe fn call_or_throw_unpublished(
                 let env = unsafe { &mut *NATIVE_ENV.with(Cell::get) };
                 if request_kind == TRANSFER_HOST_EVAL_REQUEST {
                     let body = unsafe { &*context.body };
-                    let form = *body.constants
+                    let form = *body
+                        .constants
                         .get(call.symbol as u32 as usize)
                         .ok_or_else(invalid_capture)?;
                     eval_form(form, env)
@@ -2959,9 +3305,11 @@ unsafe fn call_or_throw_unpublished(
                     // allocating; the closure is not rooted, so nothing may
                     // allocate between its creation and the outcome write.
                     let body = unsafe { &*context.body };
-                    let nested = Arc::clone(body.nested_functions
-                        .get(call.symbol as u32 as usize)
-                        .ok_or_else(invalid_capture)?);
+                    let nested = Arc::clone(
+                        body.nested_functions
+                            .get(call.symbol as u32 as usize)
+                            .ok_or_else(invalid_capture)?,
+                    );
                     let closure = super::make_template_closure(&nested, None, env);
                     Ok(closure)
                 } else {
@@ -3116,9 +3464,8 @@ unsafe fn call_or_throw_unpublished(
                             .try_reserve(info.restarts.len())
                             .map_err(|_| EgclError::Oom)?;
                         for restart in &info.restarts {
-                            restart_symbols.push(
-                                resolve_sym(&restart.name).ok_or_else(invalid_capture)?,
-                            );
+                            restart_symbols
+                                .push(resolve_sym(&restart.name).ok_or_else(invalid_capture)?);
                         }
                         let templates = unsafe { &*context.restart_templates };
                         let Some(function_templates) = templates.0.get(*rc as usize) else {
@@ -3334,17 +3681,17 @@ unsafe fn call_or_throw_unpublished(
                     assert!(catches.len() < catches.capacity());
                     let tag = unsafe { call.args.read() };
                     let token = try_control_token("__THROW__")?;
-                    env.catch_stack
-                        .push((tag, try_clone_string(&token)?));
+                    env.catch_stack.push((tag, try_clone_string(&token)?));
                     catches.push(SavedCatch { push_bcp, token });
                 } else {
                     assert_eq!(call.nargs, 0);
                     let saved = catches.last().expect("live native catch");
                     assert_eq!(saved.push_bcp, push_bcp);
-                    assert!(env
-                        .catch_stack
-                        .last()
-                        .is_some_and(|(_, token)| token == &saved.token));
+                    assert!(
+                        env.catch_stack
+                            .last()
+                            .is_some_and(|(_, token)| token == &saved.token)
+                    );
                     env.catch_stack.pop();
                     catches.pop();
                 }
@@ -3427,10 +3774,17 @@ unsafe extern "C" fn box_double(
 ) {
     let bits = request as u64;
     let value = unsafe {
-        root_publication::published(image, || egcl_rt::gc::alloc_double_float(f64::from_bits(bits)))
+        root_publication::published(image, || {
+            egcl_rt::gc::alloc_double_float(f64::from_bits(bits))
+        })
     };
     // Nothing collects between the allocation and the veneer's return.
-    unsafe { out.write(NativeOutcome { value, exit: NativeExit::Returned }) };
+    unsafe {
+        out.write(NativeOutcome {
+            value,
+            exit: NativeExit::Returned,
+        })
+    };
 }
 
 /// Install the process-lifetime box veneer used by raw double code
@@ -3439,13 +3793,16 @@ unsafe extern "C" fn box_double(
 pub(super) fn install_box_double_veneer() {
     static VENEER: OnceLock<usize> = OnceLock::new();
     let address = *VENEER.get_or_init(|| {
-        let Some(capture) = JitBuffer::new(&emit_capture_stub(prepare, dispatch as *const u8)) else {
+        let Some(capture) = JitBuffer::new(&emit_capture_stub(prepare, dispatch as *const u8))
+        else {
             return 0;
         };
-        let Some(veneer) = JitBuffer::new(&egcl_compiler::t2::native_transfer::emit_published_helper_veneer(
-            box_double,
-            capture.as_ptr(),
-        )) else {
+        let Some(veneer) = JitBuffer::new(
+            &egcl_compiler::t2::native_transfer::emit_published_helper_veneer(
+                box_double,
+                capture.as_ptr(),
+            ),
+        ) else {
             return 0;
         };
         let address = veneer.as_ptr() as usize;
@@ -3467,7 +3824,12 @@ unsafe extern "C" fn poll_t2_or_transfer(
             let (idle, published) = counts.get();
             counts.set((idle + 1, published));
         });
-        unsafe { out.write(NativeOutcome { value: NIL, exit: NativeExit::Returned }) };
+        unsafe {
+            out.write(NativeOutcome {
+                value: NIL,
+                exit: NativeExit::Returned,
+            })
+        };
         native_poll::refresh();
         return;
     }
@@ -3560,30 +3922,46 @@ pub(super) fn force_next_osr_frame_growth_for_test(extra: u16) {
 /// Reconstruct only on this cold route, through the poll's exact native homes.
 unsafe fn prepare_osr(image: *const SysvTransferCapture) -> bool {
     let context = CAPTURE.with(Cell::get);
-    let Some(context) = (unsafe { context.as_mut() }) else { return false };
+    let Some(context) = (unsafe { context.as_mut() }) else {
+        return false;
+    };
     let code = unsafe { &*context.owner };
     if code.is_t2 || !context.recursive.is_null() {
         return false;
     }
-    let Some(symbol) = code.installed_symbol else { return false };
-    let Some(offset) = (unsafe { (*image).return_pc as usize }).checked_sub(context.code_base) else {
+    let Some(symbol) = code.installed_symbol else {
         return false;
     };
-    let Some(header) = code.osr_polls.get(&offset) else { return false };
-    let Some(next) = NATIVE_REGISTRY.with(|registry| registry.borrow().get(&symbol).cloned()) else {
+    let Some(offset) = (unsafe { (*image).return_pc as usize }).checked_sub(context.code_base)
+    else {
+        return false;
+    };
+    let Some(header) = code.osr_polls.get(&offset) else {
+        return false;
+    };
+    let Some(next) = NATIVE_REGISTRY.with(|registry| registry.borrow().get(&symbol).cloned())
+    else {
         return false;
     };
     let running = unsafe { (*context.frame).function };
-    if !next.is_t2 || next.body.as_ref().is_none_or(|body| !Arc::ptr_eq(body, &code.body))
+    if !next.is_t2
+        || next
+            .body
+            .as_ref()
+            .is_none_or(|body| !Arc::ptr_eq(body, &code.body))
         || !(recursive_definition_matches(symbol, Arc::as_ptr(&code.body))
             || closure_code_matches(symbol, running, Arc::as_ptr(&code.body)))
         || !matches!(&next._storage, NativeCodeStorage::Mapped(_))
     {
         return false;
     }
-    let NativeCodeStorage::Mapped(destination) = &next._storage else { return false };
+    let NativeCodeStorage::Mapped(destination) = &next._storage else {
+        return false;
+    };
     let destination = destination.osr_destination();
-    let Some(entry) = destination.osr_entries.get(header).copied() else { return false };
+    let Some(entry) = destination.osr_entries.get(header).copied() else {
+        return false;
+    };
     // Scan body admission only once a replacement is ready, not on every
     // baseline loop poll while the optimizing worker is still compiling.
     if !local_control_native_body(&code.body, true, true, false) {
@@ -3591,31 +3969,47 @@ unsafe fn prepare_osr(image: *const SysvTransferCapture) -> bool {
     }
     // An OSR jump keeps this activation's registrations, not new copies.
     // Validate exact lexical provenance against every live runtime ledger.
-    let Some(scopes) = code.control_scopes.before(*header) else { return false };
-    if scopes.iter().any(|scope| scope.ownership != Ownership::Local
-        || !matches!(scope.kind, ScopeKind::Block { register: false, .. }
+    let Some(scopes) = code.control_scopes.before(*header) else {
+        return false;
+    };
+    if scopes.iter().any(|scope| {
+        scope.ownership != Ownership::Local
+            || !matches!(
+                scope.kind,
+                ScopeKind::Block { register: false, .. }
             | ScopeKind::Tagbody { .. } | ScopeKind::Catch { .. }
             | ScopeKind::Unwind { .. } | ScopeKind::Cleanup { .. }
             | ScopeKind::HandlerCase { .. } | ScopeKind::HandlerBind { .. }
             | ScopeKind::RestartCase { .. } | ScopeKind::SpecialBinding { .. }
             // The state's EnvFrame moves with the OSR hand-off.
-            | ScopeKind::LexicalEnvironment))
-    {
+            | ScopeKind::LexicalEnvironment
+            )
+    }) {
         return false;
     }
     let env = unsafe { &*NATIVE_ENV.with(Cell::get) };
-    if !unsafe { validate_condition_clusters(context, scopes, env)
-        && validate_special_bindings(context, scopes) } { return false; }
+    if !unsafe {
+        validate_condition_clusters(context, scopes, env)
+            && validate_special_bindings(context, scopes)
+    } {
+        return false;
+    }
     let cleanups = unsafe { &*context.cleanups };
     let mut saved_cleanups = cleanups.iter();
     let mut handler_depth = 0;
     for scope in scopes {
         if let ScopeKind::Cleanup { cleanup_bcp } = scope.kind {
-            let Some(saved) = saved_cleanups.next() else { return false };
-            if saved.cleanup_bcp != cleanup_bcp || saved.continuation.handler_depth != handler_depth {
+            let Some(saved) = saved_cleanups.next() else {
+                return false;
+            };
+            if saved.cleanup_bcp != cleanup_bcp || saved.continuation.handler_depth != handler_depth
+            {
                 return false;
             }
-        } else if !matches!(scope.kind, ScopeKind::SpecialBinding { .. } | ScopeKind::LexicalEnvironment) {
+        } else if !matches!(
+            scope.kind,
+            ScopeKind::SpecialBinding { .. } | ScopeKind::LexicalEnvironment
+        ) {
             handler_depth += 1;
         }
     }
@@ -3624,20 +4018,35 @@ unsafe fn prepare_osr(image: *const SysvTransferCapture) -> bool {
     }
     let catches = unsafe { &*context.catches };
     let env = unsafe { &*NATIVE_ENV.with(Cell::get) };
-    if !scopes.iter().filter(|scope| matches!(scope.kind, ScopeKind::Catch { .. }))
-        .map(|scope| scope.push_bcp).eq(catches.iter().map(|saved| saved.push_bcp))
+    if !scopes
+        .iter()
+        .filter(|scope| matches!(scope.kind, ScopeKind::Catch { .. }))
+        .map(|scope| scope.push_bcp)
+        .eq(catches.iter().map(|saved| saved.push_bcp))
         || env.catch_stack.len() != context.catch_base + catches.len()
-        || !env.catch_stack[context.catch_base..].iter().map(|(_, token)| token)
+        || !env.catch_stack[context.catch_base..]
+            .iter()
+            .map(|(_, token)| token)
             .eq(catches.iter().map(|saved| &saved.token))
     {
         return false;
     }
-    let Some(index) = code.sites.sites().position(|site| site.return_offset() as usize == offset) else {
+    let Some(index) = code
+        .sites
+        .sites()
+        .position(|site| site.return_offset() as usize == offset)
+    else {
         return false;
     };
     let snapshot = unsafe { &mut *context.snapshots.cast::<SysvSiteSnapshot>().add(index) };
-    if unsafe { snapshot.capture_from_activation(context.code_base, &*image,
-        std::slice::from_raw_parts(context.activation, context.slots)) }.is_err()
+    if unsafe {
+        snapshot.capture_from_activation(
+            context.code_base,
+            &*image,
+            std::slice::from_raw_parts(context.activation, context.slots),
+        )
+    }
+    .is_err()
     {
         return false;
     }
@@ -3645,10 +4054,15 @@ unsafe fn prepare_osr(image: *const SysvTransferCapture) -> bool {
         return false;
     };
     egcl_rt::rooted!(frames = frames);
-    let [frame] = frames.as_slice() else { return false };
-    if frame.resume_pc != *header || frame.locals.len() != usize::from(code.body.n_locals)
+    let [frame] = frames.as_slice() else {
+        return false;
+    };
+    if frame.resume_pc != *header
+        || frame.locals.len() != usize::from(code.body.n_locals)
         || !frame.stack.is_empty()
-        || !destination.osr_imports_admit(*header, |slot| frame.locals.get(usize::from(slot)).copied().unwrap_or(NIL))
+        || !destination.osr_imports_admit(*header, |slot| {
+            frame.locals.get(usize::from(slot)).copied().unwrap_or(NIL)
+        })
     {
         return false;
     }
@@ -3659,14 +4073,18 @@ unsafe fn prepare_osr(image: *const SysvTransferCapture) -> bool {
         return false;
     }
     let env = unsafe { &mut *NATIVE_ENV.with(Cell::get) };
-    let Ok(prepared) = ActivationState::prepare(destination, env) else { return false };
+    let Ok(prepared) = ActivationState::prepare(destination, env) else {
+        return false;
+    };
     let mut prepared = Box::new(prepared);
     egcl_rt::rooted_ref!(_prepared = &mut *prepared);
     let stack = egcl_rt::current_stack();
     if !native_transfer::is_supported() {
         return false;
     }
-    let slots = destination.slots.max(unsafe { (*context.frame).num_locals });
+    let slots = destination
+        .slots
+        .max(unsafe { (*context.frame).num_locals });
     #[cfg(test)]
     let slots = {
         let extra = FORCE_OSR_FRAME_GROWTH.with(|slots| slots.replace(0));
@@ -3680,17 +4098,23 @@ unsafe fn prepare_osr(image: *const SysvTransferCapture) -> bool {
     // suffix and every ledger pointer is repaired before a safepoint.
     // Failure changes neither stack bounds nor its map. After success there
     // is no allocation, safepoint, or fallible step before the commit below.
-    let Some(delta) = (unsafe { stack.grow_frame_with_special_suffix(context.frame, slots, code.code_info) }) else {
+    let Some(delta) =
+        (unsafe { stack.grow_frame_with_special_suffix(context.frame, slots, code.code_info) })
+    else {
         return false;
     };
-    unsafe { relocate_condition_clusters(context, delta); }
+    unsafe {
+        relocate_condition_clusters(context, delta);
+    }
     for (slot, value) in frame.locals.iter().enumerate() {
         unsafe { slot_set(context.frame, slot as u16, *value) };
     }
     // End the local root before moving the box; the source activation now
     // owns and traces the prepared state's exact payload slots.
     drop(_prepared);
-    unsafe { *context.ready_osr = Some(prepared); }
+    unsafe {
+        *context.ready_osr = Some(prepared);
+    }
     context.osr = Some((next, entry));
     true
 }
@@ -3732,7 +4156,12 @@ pub(in crate::cli::bytecode) unsafe fn poll_or_transfer_unpublished(
     use egcl_rt::native_transfer::{NativeExit, NativeOutcome};
     // Most helper polls find nothing to do; skip the drain (GitHub #487).
     if request as usize & 1 == 0 && current_poll_idle() {
-        unsafe { out.write(NativeOutcome { value: NIL, exit: NativeExit::Returned }); }
+        unsafe {
+            out.write(NativeOutcome {
+                value: NIL,
+                exit: NativeExit::Returned,
+            });
+        }
         return;
     }
     // Clear before inspecting authoritative sources. An arrival during this
@@ -3782,7 +4211,11 @@ fn record_loop_heat() {
     }
     let (symbol, body, function) = unsafe {
         let code = &*(*capture).owner;
-        (code.installed_symbol, Arc::as_ptr(&code.body), (*(*capture).frame).function)
+        (
+            code.installed_symbol,
+            Arc::as_ptr(&code.body),
+            (*(*capture).frame).function,
+        )
     };
     let Some(symbol) = symbol else {
         return;
@@ -3804,7 +4237,9 @@ fn record_loop_heat() {
     }
     #[cfg(test)]
     AFTER_HEAT_VALIDATION.with(|hook| {
-        if let Some(observe) = hook.get() { observe(); }
+        if let Some(observe) = hook.get() {
+            observe();
+        }
     });
     let count = egcl_rt::function::record_back_edges(*function, 1);
     let threshold = t2_backedge_threshold().max(1);
@@ -3830,9 +4265,7 @@ unsafe extern "C" fn complete_cleanup(
     out: *mut egcl_rt::native_transfer::NativeOutcome,
     image: *mut SysvTransferCapture,
 ) {
-    unsafe {
-        root_publication::published(image, || complete_cleanup_unpublished(request, out))
-    }
+    unsafe { root_publication::published(image, || complete_cleanup_unpublished(request, out)) }
 }
 
 unsafe fn complete_cleanup_unpublished(
@@ -3978,7 +4411,11 @@ static CAPTURE: egcl_rt::execution_local::ExecutionLocal<Cell<*mut CaptureContex
 #[cfg(test)]
 pub(super) fn condition_capture_for_test() -> Option<(usize, bool, *mut Frame)> {
     let context = unsafe { CAPTURE.with(Cell::get).as_ref() }?;
-    Some((context.owner as usize, !context.nested.is_null(), context.frame))
+    Some((
+        context.owner as usize,
+        !context.nested.is_null(),
+        context.frame,
+    ))
 }
 
 #[cfg(test)]
@@ -4022,7 +4459,8 @@ pub(super) unsafe fn invoke_outer_callable(
     let _ordinary_segment = super::call_table::enter_ordinary_segment();
     let outcome = unsafe {
         native_transfer::invoke_native_segment(code, invocation, egcl_rt::current_stack())
-    }.map_err(|_| EgclError::Internal("published native callable boundary is unavailable".into()))?;
+    }
+    .map_err(|_| EgclError::Internal("published native callable boundary is unavailable".into()))?;
     egcl_rt::rooted!(primary = outcome.value);
     egcl_rt::rooted!(error = NATIVE_ERROR.with(|slot| slot.take()));
     match outcome.exit {
@@ -4055,15 +4493,28 @@ pub(super) unsafe fn invoke_outer_ordinary(
     let _ordinary_segment = super::call_table::enter_ordinary_segment();
     let execution = egcl_rt::thread::current_execution_context_for_native()
         .ok_or_else(|| EgclError::Internal("ordinary callable has no execution".into()))?;
-    let overflow_bytes = args.len().saturating_sub(3).checked_mul(8)
-        .and_then(|bytes| bytes.checked_add(15)).map(|bytes| bytes & !15)
+    let overflow_bytes = args
+        .len()
+        .saturating_sub(3)
+        .checked_mul(8)
+        .and_then(|bytes| bytes.checked_add(15))
+        .map(|bytes| bytes & !15)
         .ok_or_else(invalid_capture)?;
-    let required = overflow_bytes.checked_add(8192).ok_or_else(invalid_capture)?;
+    let required = overflow_bytes
+        .checked_add(8192)
+        .ok_or_else(invalid_capture)?;
     let sp: usize;
-    unsafe { std::arch::asm!("mov {}, rsp", out(reg) sp, options(nomem, nostack, preserves_flags)); }
-    if sp.checked_sub(required).is_none_or(|bottom| (bottom as u64) <= egcl_rt::stack::current_native_stack_limit()) {
-        return Err(EgclError::StackOverflow(egcl_rt::current_fiber_id()
-            .unwrap_or_else(|| egcl_rt::FiberId(egcl_rt::current_thread_id().0))));
+    unsafe {
+        std::arch::asm!("mov {}, rsp", out(reg) sp, options(nomem, nostack, preserves_flags));
+    }
+    if sp
+        .checked_sub(required)
+        .is_none_or(|bottom| (bottom as u64) <= egcl_rt::stack::current_native_stack_limit())
+    {
+        return Err(EgclError::StackOverflow(
+            egcl_rt::current_fiber_id()
+                .unwrap_or_else(|| egcl_rt::FiberId(egcl_rt::current_thread_id().0)),
+        ));
     }
     // Rust callers can retain an earlier zero/many-value tuple. The callable
     // and actuals already have independent roots; establish the ordinary entry
@@ -4071,9 +4522,14 @@ pub(super) unsafe fn invoke_outer_ordinary(
     env.clear_mv();
     let returned = unsafe {
         native_transfer::invoke_ordinary_native_segment(
-            code, &*execution, function, args, egcl_rt::current_stack(),
+            code,
+            &*execution,
+            function,
+            args,
+            egcl_rt::current_stack(),
         )
-    }.map_err(|_| EgclError::Internal("ordinary callable boundary is unavailable".into()))?;
+    }
+    .map_err(|_| EgclError::Internal("ordinary callable boundary is unavailable".into()))?;
     egcl_rt::rooted!(primary = returned.outcome.value);
     egcl_rt::rooted!(error = NATIVE_ERROR.with(|slot| slot.take()));
     match returned.outcome.exit {
@@ -4295,12 +4751,11 @@ unsafe fn prepare_transfer(
     // End the mutable snapshot borrow before live signaling can allocate or
     // reenter Lisp. The execution-owned snapshot vector remains rooted.
     unsafe {
-        (&mut *context.snapshots.cast::<SysvSiteSnapshot>().add(index))
-            .capture_from_activation(
-                context.code_base,
-                capture,
-                std::slice::from_raw_parts(context.activation, context.slots),
-            )?;
+        (&mut *context.snapshots.cast::<SysvSiteSnapshot>().add(index)).capture_from_activation(
+            context.code_base,
+            capture,
+            std::slice::from_raw_parts(context.activation, context.slots),
+        )?;
     }
     context.selected = Some(index);
     if let Some(completed) = context.completed_cleanup {
@@ -4320,10 +4775,7 @@ unsafe fn prepare_transfer(
     // Signal before retiring dynamic state. Returning handlers and restart
     // searches see the original context; only selected transfers start unwind.
     if let Some(error) = NATIVE_ERROR.with(|slot| slot.take()) {
-        let selected = if matches!(
-            error,
-            EgclError::Internal(_) | EgclError::Signalled(_)
-        ) {
+        let selected = if matches!(error, EgclError::Internal(_) | EgclError::Signalled(_)) {
             error
         } else {
             signal_raw_error_in_context(env, error)
@@ -4515,10 +4967,14 @@ unsafe fn prepare_transfer(
     // Live signaling above saw every binding. Only now, after selecting and
     // validating a destination, restore the crossed lexical suffix before
     // executing its cleanup or selected clause.
-    let keep_specials = scopes[..scope_index].iter()
-        .filter(|scope| matches!(scope.kind, ScopeKind::SpecialBinding { .. })).count();
+    let keep_specials = scopes[..scope_index]
+        .iter()
+        .filter(|scope| matches!(scope.kind, ScopeKind::SpecialBinding { .. }))
+        .count();
     let specials = unsafe { &mut *context.specials };
-    while specials.len() > keep_specials { specials.pop(); }
+    while specials.len() > keep_specials {
+        specials.pop();
+    }
     match scopes[scope_index].kind {
         ScopeKind::Unwind { cleanup_bcp } => {
             assert!(cleanups.len() < cleanups.capacity());
@@ -4603,11 +5059,14 @@ thread_local! {
 
 #[cfg(test)]
 pub(in crate::cli::bytecode) fn with_ordinary_entry_hook_for_test<R>(
-    observe: fn(), body: impl FnOnce() -> R,
+    observe: fn(),
+    body: impl FnOnce() -> R,
 ) -> R {
     struct Restore(Option<fn()>);
     impl Drop for Restore {
-        fn drop(&mut self) { ORDINARY_ENTRY_HOOK.with(|hook| hook.set(self.0)); }
+        fn drop(&mut self) {
+            ORDINARY_ENTRY_HOOK.with(|hook| hook.set(self.0));
+        }
     }
     let _restore = Restore(ORDINARY_ENTRY_HOOK.with(|hook| hook.replace(Some(observe))));
     body()
@@ -4617,54 +5076,133 @@ pub(in crate::cli::bytecode) fn with_ordinary_entry_hook_for_test<R>(
 mod ordinary_osr_companion_tests {
     use super::*;
     use egcl_compiler::t2::frame_state::{FrameScope, FrameState, ValueSource};
-    use egcl_compiler::t2::ir::{AuxData, Function, IRType, InstData, InstFlags, Opcode, OsrEntry, ValueRepresentation};
+    use egcl_compiler::t2::ir::{
+        AuxData, Function, IRType, InstData, InstFlags, Opcode, OsrEntry, ValueRepresentation,
+    };
 
     #[test]
     fn ordinary_full_entry_retains_executable_mapped_osr_import() {
         let _lock = super::super::super::heap_test_lock()
-            .lock().unwrap_or_else(|error| error.into_inner());
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let mut env = Env::new(false);
         egcl_rt::rooted_ref!(_env = &mut env);
         egcl_rt::rooted!(params = reader::read_from_string("(x)").unwrap().0);
         egcl_rt::rooted!(forms = reader::read_from_string("(x)").unwrap().0);
         let symbol = egcl_rt::symbols::intern("ORDINARY-OSR-COMPANION");
-        let body = Arc::new(compile_function("ORDINARY-OSR-COMPANION", *params, *forms,
-            &env, false, false).unwrap());
+        let body = Arc::new(
+            compile_function(
+                "ORDINARY-OSR-COMPANION",
+                *params,
+                *forms,
+                &env,
+                false,
+                false,
+            )
+            .unwrap(),
+        );
         // Model the two entry protocols directly: the full call binds X from
         // RDI, while an OSR import reads X from the retained activation local.
         let mut ir = Function::new("ordinary-osr-companion");
         let entry = ir.entry();
         let value = ir.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
         let state = ir.frame_states.add(FrameState {
-            scopes: vec![FrameScope { function: symbol, bcp: 0,
-                locals: vec![ValueSource::Value { value, repr: ValueRepresentation::Tagged }],
-                stack: vec![] }], remat: vec![],
+            scopes: vec![FrameScope {
+                function: symbol,
+                bcp: 0,
+                locals: vec![ValueSource::Value {
+                    value,
+                    repr: ValueRepresentation::Tagged,
+                }],
+                stack: vec![],
+            }],
+            remat: vec![],
         });
-        ir.set_terminator(entry, InstData { opcode: Opcode::Return,
-            args: vec![value], results: vec![], aux: AuxData::None,
-            flags: InstFlags::default(), targets: vec![], frame_state: Some(state), source_pos: 0 });
-        ir.osr_entries.push(OsrEntry { control_scopes: vec![], bcp: 0,
-            block: entry, frame_state: state, checks: vec![] });
+        ir.set_terminator(
+            entry,
+            InstData {
+                opcode: Opcode::Return,
+                args: vec![value],
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags::default(),
+                targets: vec![],
+                frame_state: Some(state),
+                source_pos: 0,
+            },
+        );
+        ir.osr_entries.push(OsrEntry {
+            control_scopes: vec![],
+            bcp: 0,
+            block: entry,
+            frame_state: state,
+            checks: vec![],
+        });
         egcl_compiler::t2::verify::verify(&ir).unwrap();
-        let mut code = TransferCode::emit_prepared_with_ordinary(Arc::clone(&body),
-            retain_native_body(&body), &ir, Some(&ir), None, &[], false,
-            CompilationTier::T2).expect("both entry protocols emit");
+        let mut code = TransferCode::emit_prepared_with_ordinary(
+            Arc::clone(&body),
+            retain_native_body(&body),
+            &ir,
+            Some(&ir),
+            None,
+            &[],
+            false,
+            CompilationTier::T2,
+        )
+        .expect("both entry protocols emit");
         code.set_installed_symbol(symbol);
-        assert!(code.ordinary_entry.is_some(), "full calls use the register ABI");
-        assert!(code.osr_entries.is_empty(), "primary offsets describe only primary code");
+        assert!(
+            code.ordinary_entry.is_some(),
+            "full calls use the register ABI"
+        );
+        assert!(
+            code.osr_entries.is_empty(),
+            "primary offsets describe only primary code"
+        );
         let destination = code.osr_destination();
-        assert!(destination.ordinary_entry.is_none(), "OSR retains mapped entry ABI");
+        assert!(
+            destination.ordinary_entry.is_none(),
+            "OSR retains mapped entry ABI"
+        );
         assert_eq!(destination.installed_symbol, Some(symbol));
-        let offset = *destination.osr_entries.get(&0).expect("retain the original OSR header");
+        let offset = *destination
+            .osr_entries
+            .get(&0)
+            .expect("retain the original OSR header");
         assert!(offset < destination.code_len);
-        assert_eq!(code.run(&[EgclVal::from_fixnum(41)], &mut env).unwrap(), EgclVal::from_fixnum(41));
+        assert_eq!(
+            code.run(&[EgclVal::from_fixnum(41)], &mut env).unwrap(),
+            EgclVal::from_fixnum(41)
+        );
         let state = Box::new(ActivationState::prepare(destination, &mut env).unwrap());
         let stack = egcl_rt::current_stack();
-        let frame = stack.push_frame(EgclVal::from_symbol_index(symbol), destination.code_info,
-            destination.slots, FLAG_CALL).unwrap();
-        unsafe { slot_set(frame, 0, EgclVal::from_fixnum(73)); }
-        let result = destination.run_activation(&[], &mut env,
-            Some(OsrResume { frame, offset, state }), NIL).unwrap();
-        assert_eq!(result, EgclVal::from_fixnum(73), "OSR imports the live activation local");
+        let frame = stack
+            .push_frame(
+                EgclVal::from_symbol_index(symbol),
+                destination.code_info,
+                destination.slots,
+                FLAG_CALL,
+            )
+            .unwrap();
+        unsafe {
+            slot_set(frame, 0, EgclVal::from_fixnum(73));
+        }
+        let result = destination
+            .run_activation(
+                &[],
+                &mut env,
+                Some(OsrResume {
+                    frame,
+                    offset,
+                    state,
+                }),
+                NIL,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            EgclVal::from_fixnum(73),
+            "OSR imports the live activation local"
+        );
     }
 }

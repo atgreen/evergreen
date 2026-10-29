@@ -204,15 +204,24 @@ fn t2_calls_stop_before_later_side_effects() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stderr.contains("T2-SELF: optimized worker result installed with ordinary x86-64 Lisp T2 ABI;"),
-            "recursive function must publish ordinary register T2 code: {stderr}");
+        assert!(
+            stderr.contains(
+                "T2-SELF: optimized worker result installed with ordinary x86-64 Lisp T2 ABI;"
+            ),
+            "recursive function must publish ordinary register T2 code: {stderr}"
+        );
         assert!(stdout.contains("Ordinary x86-64 Lisp ABI"), "{stdout}");
-        assert!(!stdout.contains("native recursive entry veneer"), "{stdout}");
+        assert!(
+            !stdout.contains("native recursive entry veneer"),
+            "{stdout}"
+        );
     } else {
         let self_entry = stderr
             .lines()
             .find(|line| line.contains("T2-SELF: T2 EMITTED"))
-            .unwrap_or_else(|| panic!("recursive function must emit register-entry metadata:\n{stderr}"));
+            .unwrap_or_else(|| {
+                panic!("recursive function must emit register-entry metadata:\n{stderr}")
+            });
         assert!(
             !self_entry.contains("compiled_entry=+0,"),
             "recursive test must exercise the direct register entry: {self_entry}"

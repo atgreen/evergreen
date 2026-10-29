@@ -613,10 +613,7 @@ fn bignum_with_single_float_recovers_to_generic_t2() {
     "#;
     let (out, ok) = run(program, &[("EGCL_FORCE_TIER", "t2")]);
     assert!(ok, "mixed bignum/float result was incorrect: {out}");
-    assert!(
-        out.lines().any(|line| line == "float-bignum=2"),
-        "{out}"
-    );
+    assert!(out.lines().any(|line| line == "float-bignum=2"), "{out}");
 }
 
 /// The shipping dispatcher has two real transitions. With T2 enabled by
@@ -720,8 +717,7 @@ fn background_t2_loads_a_rooted_movable_literal_from_its_constant_slot() {
     );
     assert!(
         stderr.contains("ROOTED-LITERAL: background T2 result published")
-            || stderr
-                .contains("ROOTED-LITERAL: optimized worker result installed with "),
+            || stderr.contains("ROOTED-LITERAL: optimized worker result installed with "),
         "heap literal did not reach installed T2 code:\n{stderr}"
     );
     assert!(
@@ -2510,7 +2506,9 @@ fn t2_elides_unobservable_multiple_value_resets() {
     if MAPPED_LINUX {
         // A DOTIMES body gets the ordinary x86-64 Lisp entry (bliss-6m6ca).
         assert!(
-            stderr.contains("MV-LOOP: optimized worker result installed with ordinary x86-64 Lisp T2 ABI"),
+            stderr.contains(
+                "MV-LOOP: optimized worker result installed with ordinary x86-64 Lisp T2 ABI"
+            ),
             "MV-LOOP must have an installed ordinary T2 body: {stderr}"
         );
         assert!(
@@ -2604,7 +2602,10 @@ fn fresh_closures_of_a_declined_body_skip_tier_dispatch() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "egcl failed:\n{stdout}\n{stderr}");
-    assert!(stdout.contains("(2001000 2013000)"), "wrong result: {stdout}");
+    assert!(
+        stdout.contains("(2001000 2013000)"),
+        "wrong result: {stdout}"
+    );
     assert!(
         stderr.contains("CLOSURE: decline recorded"),
         "the probe's closure body must actually be declined by T1:\n{stderr}"

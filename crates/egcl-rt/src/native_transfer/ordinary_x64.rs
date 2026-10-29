@@ -3,7 +3,9 @@
 
 //! Ordinary Lisp register entry at the outer native segment boundary.
 
-use super::{with_native_segment, NativeOutcome, NativeReturnValues, NativeSegment, SegmentUnavailable};
+use super::{
+    NativeOutcome, NativeReturnValues, NativeSegment, SegmentUnavailable, with_native_segment,
+};
 use crate::exec_context::LispExecutionContext;
 use crate::stack::EgclStack;
 use crate::value::EgclVal;
@@ -46,22 +48,29 @@ pub unsafe fn invoke_ordinary_native_segment(
     arguments: &[EgclVal],
     stack: &EgclStack,
 ) -> Result<OrdinaryNativeOutcome, SegmentUnavailable> {
-    let overflow_bytes = arguments.len().saturating_sub(3).checked_mul(8)
+    let overflow_bytes = arguments
+        .len()
+        .saturating_sub(3)
+        .checked_mul(8)
         .and_then(|bytes| bytes.checked_add(15))
         .map(|bytes| bytes & !15)
         .filter(|&bytes| bytes <= isize::MAX as usize)
         .ok_or(SegmentUnavailable)?;
     let mut request = Invocation {
-        entry, execution, closure,
+        entry,
+        execution,
+        closure,
         arguments: arguments.as_ptr(),
         nargs: arguments.len(),
         overflow_bytes,
         values: NativeReturnValues::SINGLE,
     };
-    let outcome = unsafe {
-        with_native_segment(stack, |anchor, out| enter(&mut request, anchor, out))
-    }?;
-    Ok(OrdinaryNativeOutcome { outcome, values: request.values })
+    let outcome =
+        unsafe { with_native_segment(stack, |anchor, out| enter(&mut request, anchor, out)) }?;
+    Ok(OrdinaryNativeOutcome {
+        outcome,
+        values: request.values,
+    })
 }
 
 #[unsafe(naked)]
@@ -154,7 +163,7 @@ unsafe extern "C" fn enter(
 mod tests {
     use super::*;
     use crate::exec_context::{ExecutionKind, LispExecutionContext};
-    use crate::native_transfer::{current_segment, NativeExit};
+    use crate::native_transfer::{NativeExit, current_segment};
     use crate::value::{EgclVal, NIL};
 
     // Exercise all three argument registers, the overflow word, closure/count,
@@ -190,7 +199,9 @@ mod tests {
         );
     }
 
-    extern "C" fn anchor_address() -> *mut NativeSegment { current_segment() }
+    extern "C" fn anchor_address() -> *mut NativeSegment {
+        current_segment()
+    }
 
     #[unsafe(naked)]
     unsafe extern "C" fn ordinary_cold_transfer() {
@@ -206,7 +217,9 @@ mod tests {
 
     #[unsafe(naked)]
     unsafe extern "C" fn preserved_register_probe(
-        _request: *mut Invocation, _anchor: *mut NativeSegment, _out: *mut NativeOutcome,
+        _request: *mut Invocation,
+        _anchor: *mut NativeSegment,
+        _out: *mut NativeOutcome,
     ) -> u64 {
         core::arch::naked_asm!(
             "push rbp", "push rbx", "push r12", "push r13", "push r14", "push r15",
@@ -225,12 +238,18 @@ mod tests {
         crate::gc::ensure_heap_initialized();
         crate::thread::current_thread_id();
         let execution = LispExecutionContext::new(ExecutionKind::Fiber, 77, 1);
-        for (entry, count) in [(ordinary_arguments as *const u8, 4),
-            (ordinary_many_arguments as *const u8, 17), (ordinary_cold_transfer as *const u8, 17)] {
+        for (entry, count) in [
+            (ordinary_arguments as *const u8, 4),
+            (ordinary_many_arguments as *const u8, 17),
+            (ordinary_cold_transfer as *const u8, 17),
+        ] {
             let arguments: Vec<_> = (1..=count).map(EgclVal::from_fixnum).collect();
             let mut request = Invocation {
-                entry, execution: &execution, closure: NIL,
-                arguments: arguments.as_ptr(), nargs: arguments.len(),
+                entry,
+                execution: &execution,
+                closure: NIL,
+                arguments: arguments.as_ptr(),
+                nargs: arguments.len(),
                 overflow_bytes: ((arguments.len() - 3) * 8 + 15) & !15,
                 values: NativeReturnValues::SINGLE,
             };
@@ -239,7 +258,8 @@ mod tests {
                 with_native_segment(crate::current_stack(), |anchor, out| {
                     mismatch = preserved_register_probe(&mut request, anchor, out);
                 })
-            }.unwrap();
+            }
+            .unwrap();
             assert_eq!(mismatch, 0);
         }
     }
@@ -266,14 +286,37 @@ mod tests {
     #[unsafe(naked)]
     unsafe extern "C" fn ordinary_many_arguments() {
         core::arch::naked_asm!(
-            "endbr64", "mov r10, rsp", "and r10, 15", "cmp r10, 8", "jne 4f",
-            "cmp qword ptr [r13 + 8], 77", "jne 4f",
-            "xor eax, eax", "test rcx, rcx", "jz 3f", "add rax, rdi",
-            "cmp rcx, 1", "je 3f", "add rax, rsi",
-            "cmp rcx, 2", "je 3f", "add rax, rdx",
-            "mov r10, 3", "2:", "cmp r10, rcx", "jae 3f",
-            "add rax, [rsp + r10 * 8 - 16]", "inc r10", "jmp 2b",
-            "3:", "clc", "ret", "4:", "mov rax, -1", "clc", "ret",
+            "endbr64",
+            "mov r10, rsp",
+            "and r10, 15",
+            "cmp r10, 8",
+            "jne 4f",
+            "cmp qword ptr [r13 + 8], 77",
+            "jne 4f",
+            "xor eax, eax",
+            "test rcx, rcx",
+            "jz 3f",
+            "add rax, rdi",
+            "cmp rcx, 1",
+            "je 3f",
+            "add rax, rsi",
+            "cmp rcx, 2",
+            "je 3f",
+            "add rax, rdx",
+            "mov r10, 3",
+            "2:",
+            "cmp r10, rcx",
+            "jae 3f",
+            "add rax, [rsp + r10 * 8 - 16]",
+            "inc r10",
+            "jmp 2b",
+            "3:",
+            "clc",
+            "ret",
+            "4:",
+            "mov rax, -1",
+            "clc",
+            "ret",
         );
     }
 
@@ -285,29 +328,59 @@ mod tests {
         for count in [0, 1, 2, 3, 4, 5, 6, 7, 8, 17, 1028] {
             let args: Vec<_> = (1..=count).map(EgclVal::from_fixnum).collect();
             let returned = unsafe {
-                invoke_ordinary_native_segment(ordinary_many_arguments as *const u8,
-                    &execution, NIL, &args, crate::current_stack())
-            }.expect("ordinary entry must accept all supplied arguments");
+                invoke_ordinary_native_segment(
+                    ordinary_many_arguments as *const u8,
+                    &execution,
+                    NIL,
+                    &args,
+                    crate::current_stack(),
+                )
+            }
+            .expect("ordinary entry must accept all supplied arguments");
             assert_eq!(returned.outcome.exit, NativeExit::Returned);
-            assert_eq!(returned.outcome.value, EgclVal::from_fixnum(count * (count + 1) / 2));
+            assert_eq!(
+                returned.outcome.value,
+                EgclVal::from_fixnum(count * (count + 1) / 2)
+            );
             assert_eq!(returned.values.count, 1);
             assert!(current_segment().is_null());
             let returned = unsafe {
-                invoke_ordinary_native_segment(ordinary_cold_transfer as *const u8,
-                    &execution, NIL, &args, crate::current_stack())
-            }.unwrap();
+                invoke_ordinary_native_segment(
+                    ordinary_cold_transfer as *const u8,
+                    &execution,
+                    NIL,
+                    &args,
+                    crate::current_stack(),
+                )
+            }
+            .unwrap();
             assert_eq!(returned.outcome.exit, NativeExit::Transfer);
             assert_eq!(returned.outcome.value, TUPLE[0]);
             assert!(current_segment().is_null());
             let anchor = unsafe {
-                invoke_ordinary_native_segment(ordinary_anchor as *const u8,
-                    &execution, NIL, &args, crate::current_stack())
-            }.unwrap();
-            assert_eq!(anchor.outcome.value.0, 1, "walker boundary must match the actual call SP");
+                invoke_ordinary_native_segment(
+                    ordinary_anchor as *const u8,
+                    &execution,
+                    NIL,
+                    &args,
+                    crate::current_stack(),
+                )
+            }
+            .unwrap();
+            assert_eq!(
+                anchor.outcome.value.0, 1,
+                "walker boundary must match the actual call SP"
+            );
             let many = unsafe {
-                invoke_ordinary_native_segment(ordinary_many_values as *const u8,
-                    &execution, NIL, &args, crate::current_stack())
-            }.unwrap();
+                invoke_ordinary_native_segment(
+                    ordinary_many_values as *const u8,
+                    &execution,
+                    NIL,
+                    &args,
+                    crate::current_stack(),
+                )
+            }
+            .unwrap();
             assert_eq!(many.outcome.value, TUPLE[0]);
             assert_eq!(many.values.count, 2);
             assert_eq!(many.values.payload, TUPLE.as_ptr());
@@ -323,41 +396,66 @@ mod tests {
         let args = [1, 2, 3, 4].map(EgclVal::from_fixnum);
         let single = unsafe {
             invoke_ordinary_native_segment(
-                ordinary_arguments as *const u8, &execution, NIL, &args, crate::current_stack(),
+                ordinary_arguments as *const u8,
+                &execution,
+                NIL,
+                &args,
+                crate::current_stack(),
             )
-        }.unwrap();
+        }
+        .unwrap();
         assert_eq!(single.outcome.value, EgclVal::from_fixnum(10));
         assert_eq!(single.outcome.exit, NativeExit::Returned);
         assert_eq!(single.values.count, 1);
         assert!(single.values.payload.is_null());
         let zero = unsafe {
             invoke_ordinary_native_segment(
-                ordinary_zero_values as *const u8, &execution, NIL, &[], crate::current_stack(),
+                ordinary_zero_values as *const u8,
+                &execution,
+                NIL,
+                &[],
+                crate::current_stack(),
             )
-        }.unwrap();
+        }
+        .unwrap();
         assert_eq!(zero.outcome.value, NIL);
         assert_eq!(zero.values.count, 0);
         assert!(zero.values.payload.is_null());
         let many = unsafe {
             invoke_ordinary_native_segment(
-                ordinary_many_values as *const u8, &execution, NIL, &[], crate::current_stack(),
+                ordinary_many_values as *const u8,
+                &execution,
+                NIL,
+                &[],
+                crate::current_stack(),
             )
-        }.unwrap();
+        }
+        .unwrap();
         assert_eq!(many.outcome.value, TUPLE[0]);
         assert_eq!(many.values.count, 2);
         assert_eq!(many.values.payload, TUPLE.as_ptr());
         let cold = unsafe {
             invoke_ordinary_native_segment(
-                ordinary_cold_transfer as *const u8, &execution, NIL, &[], crate::current_stack(),
+                ordinary_cold_transfer as *const u8,
+                &execution,
+                NIL,
+                &[],
+                crate::current_stack(),
             )
-        }.unwrap();
+        }
+        .unwrap();
         assert_eq!(cold.outcome.exit, NativeExit::Transfer);
         assert_eq!(cold.outcome.value, TUPLE[0]);
         let anchor = unsafe {
             invoke_ordinary_native_segment(
-                ordinary_anchor as *const u8, &execution, NIL, &[], crate::current_stack(),
+                ordinary_anchor as *const u8,
+                &execution,
+                NIL,
+                &[],
+                crate::current_stack(),
             )
-        }.unwrap();
+        }
+        .unwrap();
         assert_eq!(anchor.outcome.value.0, 1);
         assert!(current_segment().is_null());
     }

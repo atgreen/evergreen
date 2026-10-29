@@ -33,7 +33,11 @@ fn disassemble_follows_a_compiled_closure_object() {
     let section = |name: &str| -> String {
         let start = stdout.find(&format!("== {name}")).expect(name);
         let rest = &stdout[start + 3..];
-        rest[..rest.find("\n== ").or_else(|| rest.find("RESULT")).unwrap_or(rest.len())].to_string()
+        rest[..rest
+            .find("\n== ")
+            .or_else(|| rest.find("RESULT"))
+            .unwrap_or(rest.len())]
+            .to_string()
     };
     for name in ["LABELS", "LAMBDA"] {
         let listing = section(name);

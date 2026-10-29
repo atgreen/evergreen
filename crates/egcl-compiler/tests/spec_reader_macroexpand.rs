@@ -19,7 +19,7 @@ use egcl_compiler::reader::{
 };
 use egcl_rt::error::EgclError;
 use egcl_rt::object::{ObjectHeader, type_id};
-use egcl_rt::value::{NIL, T, EgclVal};
+use egcl_rt::value::{EgclVal, NIL, T};
 
 static MACRO_STATE_LOCK: Mutex<()> = Mutex::new(());
 static HOOK_CALLED: AtomicBool = AtomicBool::new(false);
@@ -481,10 +481,8 @@ fn macrolet_expander_can_select_generated_syntax_with_if() {
 fn macroexpand_environment_shadowing_and_declarations_are_visible() {
     // Per R4.14, the environment protocol MUST return accurate information for
     // bindings and declarations visible at macro-expansion time.
-    let base = Environment::null().augment_variable(
-        sym("X"),
-        VariableInfo::SymbolMacro(EgclVal::from_fixnum(7)),
-    );
+    let base = Environment::null()
+        .augment_variable(sym("X"), VariableInfo::SymbolMacro(EgclVal::from_fixnum(7)));
     let child = base.augment_environment(
         vec![(sym("X"), VariableInfo::Lexical)],
         vec![(sym("BLOCK"), FunctionInfo::SpecialOperator)],

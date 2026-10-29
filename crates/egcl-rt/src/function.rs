@@ -102,11 +102,16 @@ pub fn alloc_interpreted(
     crate::rooted!(body = body);
     crate::rooted!(env = env);
     crate::rooted!(name = name);
-    crate::rooted!(definition = if name.symbol_index().is_some_and(crate::symbols::is_uninterned) {
-        *name
-    } else {
-        crate::symbols::make_uninterned("FUNCTION-DEFINITION")
-    });
+    crate::rooted!(
+        definition = if name
+            .symbol_index()
+            .is_some_and(crate::symbols::is_uninterned)
+        {
+            *name
+        } else {
+            crate::symbols::make_uninterned("FUNCTION-DEFINITION")
+        }
+    );
     let body_ptr = crate::gc::alloc_pinned_typed(body_size(), type_id::FUNCTION_INTERPRETED)
         .or_else(|| {
             if std::env::var_os("EGCL_GC_DISABLE").is_some() {
@@ -311,9 +316,10 @@ mod tests {
         // An image can contain an address from another process, including the
         // old raw tier-body address. Never dereference it during repair.
         unsafe {
-            (*data(*function))
-                .native_entries
-                .store(std::ptr::dangling_mut::<NativeCallableEntries>(), Ordering::Release);
+            (*data(*function)).native_entries.store(
+                std::ptr::dangling_mut::<NativeCallableEntries>(),
+                Ordering::Release,
+            );
         }
         assert!(std::ptr::eq(native_entries(*function).unwrap(), &ENTRIES));
         unsafe { redefine(*function, NIL, EgclVal::from_fixnum(17), NIL) };

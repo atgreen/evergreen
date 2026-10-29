@@ -342,9 +342,8 @@ mod tests {
             );
             egcl_rt::rooted!(datum = arena_str("wrong datum"));
             env.set_var("PRIVATE-ERROR-DATUM", *datum);
-            let call = egcl_rt::debug_stack::CallFrame::enter_with_args(
-                "RAW-ERROR-OWNER", &[*datum],
-            );
+            let call =
+                egcl_rt::debug_stack::CallFrame::enter_with_args("RAW-ERROR-OWNER", &[*datum]);
             let before = datum.to_raw();
             egcl_rt::rooted!(result = eval_form(*form, &mut env));
             drop(call);
@@ -352,14 +351,22 @@ mod tests {
             let recovered = match &*result {
                 Err(EgclError::TypeError { datum, .. }) if speculative => *datum,
                 Err(EgclError::Signalled(error)) if !speculative => {
-                    assert!(condition_matches_handler(&env, error.condition, "TYPE-ERROR"));
-                    let frame = error.backtrace.iter()
+                    assert!(condition_matches_handler(
+                        &env,
+                        error.condition,
+                        "TYPE-ERROR"
+                    ));
+                    let frame = error
+                        .backtrace
+                        .iter()
                         .find(|frame| frame.function.as_deref() == Some("RAW-ERROR-OWNER"))
                         .expect("raw error snapshot retained the failing activation");
                     assert_eq!(frame.arguments.as_deref(), Some(&[*datum][..]));
                     read_slot_value(error.condition, datum_slot, &env).unwrap()
                 }
-                other => panic!("expected original type error, speculative={speculative}: {other:?}"),
+                other => {
+                    panic!("expected original type error, speculative={speculative}: {other:?}")
+                }
             };
             assert_eq!(recovered, *datum);
             assert_eq!(val_as_str(recovered), "wrong datum");
@@ -404,20 +411,10 @@ mod tests {
                 }
             )
         );
-        assert!(
-            matches!(&*error, EgclError::Signalled(_)),
-            "{:?}",
-            &*error
-        );
+        assert!(matches!(&*error, EgclError::Signalled(_)), "{:?}", &*error);
         assert_eq!(env.handlers.len(), 2);
-        assert_eq!(
-            env.lookup_var("*RAW-INNER*"),
-            Some(EgclVal::from_fixnum(1))
-        );
-        assert_eq!(
-            env.lookup_var("*RAW-OUTER*"),
-            Some(EgclVal::from_fixnum(1))
-        );
+        assert_eq!(env.lookup_var("*RAW-INNER*"), Some(EgclVal::from_fixnum(1)));
+        assert_eq!(env.lookup_var("*RAW-OUTER*"), Some(EgclVal::from_fixnum(1)));
         assert_eq!(
             env.lookup_var("*RAW-DATUM*"),
             Some(EgclVal::from_fixnum(27))

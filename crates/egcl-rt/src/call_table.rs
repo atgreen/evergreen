@@ -277,7 +277,12 @@ impl Table {
         self.publish_ordinary_with_heat(cell, descriptor, 0)
     }
 
-    fn publish_ordinary_with_heat(&self, cell: &CallCell, descriptor: &OrdinaryEntryDescriptor, heat: usize) -> bool {
+    fn publish_ordinary_with_heat(
+        &self,
+        cell: &CallCell,
+        descriptor: &OrdinaryEntryDescriptor,
+        heat: usize,
+    ) -> bool {
         if !descriptor.is_compatible()
             || self.bindings[cell.ordinal].revision != descriptor.revision
         {
@@ -412,9 +417,14 @@ pub fn invalidate(symbol: u32) {
 /// Both pointers must remain valid under the same execution segment lease;
 /// a nonzero heat pointer must identify this exact descriptor.
 pub unsafe fn publish_ordinary_with_heat(
-    cell: &CallCell, descriptor: &OrdinaryEntryDescriptor, heat: usize,
+    cell: &CallCell,
+    descriptor: &OrdinaryEntryDescriptor,
+    heat: usize,
 ) -> bool {
-    TABLE.get_or_init(Default::default).lock().unwrap()
+    TABLE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
         .publish_ordinary_with_heat(cell, descriptor, heat)
 }
 
@@ -541,7 +551,10 @@ mod tests {
         assert!(entry.accepts(4, ORDINARY_ENV_NONE));
         assert!(!entry.accepts(3, ORDINARY_ENV_NONE));
         assert!(!entry.accepts(4, ORDINARY_ENV_CLOSURE));
-        let binder = OrdinaryEntryDescriptor { arity: ORDINARY_ARITY_ANY, ..entry };
+        let binder = OrdinaryEntryDescriptor {
+            arity: ORDINARY_ARITY_ANY,
+            ..entry
+        };
         assert!(binder.accepts(0, ORDINARY_ENV_NONE));
         assert!(binder.accepts(19, ORDINARY_ENV_NONE));
         assert!(!binder.accepts(19, ORDINARY_ENV_CLOSURE));

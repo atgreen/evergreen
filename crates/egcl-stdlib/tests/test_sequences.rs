@@ -6,7 +6,7 @@
 
 use egcl_rt::error::EgclError;
 use egcl_rt::object::{ConsCell, ObjectHeader, type_id};
-use egcl_rt::value::{NIL, T, EgclVal};
+use egcl_rt::value::{EgclVal, NIL, T};
 use egcl_stdlib::sequences;
 
 // ── Helpers ───────────────────────────────────────────────────────────
@@ -245,7 +245,10 @@ fn subseq_vector_slice_is_fresh_and_handles_empty_tail() {
     assert_eq!(sequences::elt(slice, 1).unwrap(), EgclVal::from_fixnum(30));
     sequences::set_elt(slice, 0, EgclVal::from_fixnum(99)).unwrap();
     assert_eq!(sequences::elt(source, 1).unwrap(), EgclVal::from_fixnum(20));
-    assert_eq!(sequences::length(sequences::subseq(source, 4, None).unwrap()).unwrap(), 0);
+    assert_eq!(
+        sequences::length(sequences::subseq(source, 4, None).unwrap()).unwrap(),
+        0
+    );
     assert!(sequences::subseq(source, 3, Some(5)).is_err());
 }
 

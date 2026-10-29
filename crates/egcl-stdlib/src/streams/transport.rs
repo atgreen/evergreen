@@ -367,8 +367,8 @@ fn pipe_io<T: Send + 'static>(
     operation: &str,
     action: impl FnOnce() -> io::Result<T> + Send + 'static,
 ) -> io::Result<T> {
-    use std::sync::{Arc, Mutex};
     use egcl_rt::sync::{BlockingMode, EgclSemaphore, blocking_mode};
+    use std::sync::{Arc, Mutex};
     let as_io_error = |error: egcl_rt::error::EgclError| io::Error::other(error.to_string());
     match blocking_mode(operation).map_err(as_io_error)? {
         BlockingMode::Native => {
@@ -512,11 +512,11 @@ fn pipe_wait_readable(pipe: &PipeHandle, timeout_ms: Option<i32>) -> io::Result<
 #[cfg(test)]
 mod socket_tests {
     use super::*;
+    use egcl_rt::value::{EgclVal, T};
+    use egcl_rt::{SchedulerConfig, SchedulerGroup};
     use std::net::TcpListener;
     use std::sync::{Mutex, OnceLock, mpsc};
     use std::time::Duration;
-    use egcl_rt::value::{T, EgclVal};
-    use egcl_rt::{SchedulerConfig, SchedulerGroup};
 
     static SOCKET: Mutex<Option<StreamHandle>> = Mutex::new(None);
     static WRITING: AtomicBool = AtomicBool::new(false);

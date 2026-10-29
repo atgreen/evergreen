@@ -335,11 +335,14 @@ fn deopt_count_is_observable_and_precise() {
         (format t \" ~a~%\" (egcl-ext:deopt-count))";
     // Compile the warmed function before the measured calls, and keep this
     // test on the speculative baseline rather than asynchronously installing T2.
-    let out = eval(program, &[
-        ("EGCL_T1_THRESHOLD", "2"),
-        ("EGCL_LAZY_COMPILE", "0"),
-        ("EGCL_DISABLE_T2", "1"),
-    ]);
+    let out = eval(
+        program,
+        &[
+            ("EGCL_T1_THRESHOLD", "2"),
+            ("EGCL_LAZY_COMPILE", "0"),
+            ("EGCL_DISABLE_T2", "1"),
+        ],
+    );
     assert_eq!(
         out, "0 1 2",
         "fixnum calls deopt 0 times; a ratio arg then an overflow each add one"
@@ -525,7 +528,9 @@ fn cold_double_literal_branch_never_deopts() {
         ],
     );
     assert!(
-        !trace.lines().any(|line| line.starts_with("[T2] BR: native guard deopt #")),
+        !trace
+            .lines()
+            .any(|line| line.starts_with("[T2] BR: native guard deopt #")),
         "the double-literal branch takes no fixnum guess to disprove:\n{trace}"
     );
     assert!(

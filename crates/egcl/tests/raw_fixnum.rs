@@ -39,11 +39,16 @@ fn differential(program: &str, target: Option<&str>, force_t2: bool) {
                         && !line.ends_with(": 0")),
                     "raw pass did not produce machine values:\n{stderr}"
                 );
-                assert!(stderr.lines().any(|line| line.contains(&format!("{name}:"))
-                    && line.contains(" T2 emitted;")
-                    && line.split("raw_fixnum_values=").nth(1)
-                        .and_then(|count| count.parse::<usize>().ok()).is_some_and(|count| count > 0)),
-                    "raw candidate was not installed:\n{stderr}");
+                assert!(
+                    stderr.lines().any(|line| line.contains(&format!("{name}:"))
+                        && line.contains(" T2 emitted;")
+                        && line
+                            .split("raw_fixnum_values=")
+                            .nth(1)
+                            .and_then(|count| count.parse::<usize>().ok())
+                            .is_some_and(|count| count > 0)),
+                    "raw candidate was not installed:\n{stderr}"
+                );
             }
         }
         results.push(stdout);

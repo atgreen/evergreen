@@ -19,14 +19,14 @@ use egcl_compiler::t2::opt_licm::Licm;
 use egcl_compiler::t2::pass::PassManager;
 use egcl_compiler::t2::regalloc::allocate;
 use egcl_compiler::t2::verify::verify;
-use egcl_rt::bytecode::{BytecodeFunction, Instr};
 #[cfg(all(target_arch = "x86_64", unix))]
 use egcl_rt::bytecode::typep_class;
+use egcl_rt::bytecode::{BytecodeFunction, Instr};
 #[cfg(all(target_arch = "x86_64", unix))]
 use egcl_rt::object::{ConsCell, ObjectHeader, type_id};
-use egcl_rt::value::{NIL, EgclVal};
 #[cfg(all(target_arch = "x86_64", unix))]
 use egcl_rt::value::T;
+use egcl_rt::value::{EgclVal, NIL};
 
 #[cfg(all(target_arch = "x86_64", unix))]
 extern "C" fn clear_intrinsic_values(_primary: u64, _dst: *mut EgclVal, count: u64) {
@@ -70,7 +70,7 @@ fn bytecode_fn(
 #[cfg(all(target_arch = "x86_64", unix))]
 #[test]
 fn named_calls_reload_fixed_slots_without_resolving_symbols() {
-    use egcl_compiler::t2::emit::{emit_framed_with_direct_natives, NamedCallTarget};
+    use egcl_compiler::t2::emit::{NamedCallTarget, emit_framed_with_direct_natives};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     extern "C" fn first(cell: u64, n: u64, _: u64, _: u64, _: u64, profile: u64) -> u64 {
@@ -113,10 +113,27 @@ fn named_calls_reload_fixed_slots_without_resolving_symbols() {
         let body = bytecode_fn("slot-caller", instructions, vec![NIL], 0, nargs.max(1), 0);
         let ir = build_from_bytecode(&body).unwrap();
         let framed = emit_framed_with_direct_natives(
-            &ir, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            body.num_slots(), None, &[], 0, &[target], Default::default(),
+            &ir,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            body.num_slots(),
+            None,
+            &[],
+            0,
+            &[target],
+            Default::default(),
             &Default::default(),
-        ).unwrap();
+        )
+        .unwrap();
         let code = egcl_rt::jit::JitBuffer::new(&framed.code).unwrap();
         let run: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(code.as_ptr()) };
         let mut slots = vec![NIL.0; (body.num_slots() + framed.shadow_root_slots) as usize];
@@ -131,7 +148,7 @@ fn named_calls_reload_fixed_slots_without_resolving_symbols() {
 #[test]
 fn deoptimizing_native_entries_report_their_own_code_and_frame_kind() {
     use egcl_compiler::t2::emit::emit_framed_with_direct_natives;
-    use egcl_compiler::t2::speculate::{speculate, SpecType};
+    use egcl_compiler::t2::speculate::{SpecType, speculate};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static ENTRY: AtomicU64 = AtomicU64::new(0);
@@ -142,33 +159,70 @@ fn deoptimizing_native_entries_report_their_own_code_and_frame_kind() {
         ENTRY.store(entry, Ordering::Relaxed);
         EgclVal::from_fixnum(987).0
     }
-    extern "C" fn legacy_resume() -> u64 { EgclVal::from_fixnum(-1).0 }
+    extern "C" fn legacy_resume() -> u64 {
+        EgclVal::from_fixnum(-1).0
+    }
     let plus = egcl_rt::symbols::intern("+");
-    let body = bytecode_fn("native-deopt-callee", vec![
-        Instr::LoadLocal(0), Instr::Const(0),
-        Instr::CallNamed { sym: plus, nargs: 2 }, Instr::Return,
-    ], vec![EgclVal::from_fixnum(1)], 1, 2, 1);
+    let body = bytecode_fn(
+        "native-deopt-callee",
+        vec![
+            Instr::LoadLocal(0),
+            Instr::Const(0),
+            Instr::CallNamed {
+                sym: plus,
+                nargs: 2,
+            },
+            Instr::Return,
+        ],
+        vec![EgclVal::from_fixnum(1)],
+        1,
+        2,
+        1,
+    );
     let mut ir = build_from_bytecode(&body).unwrap();
     assert!(speculate(&mut ir, &|_| Some(SpecType::Fixnum)) > 0);
     let code_id = 0x1234;
     let framed = emit_framed_with_direct_natives(
-        &ir, legacy_resume as *const () as u64, resume as *const () as u64, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        body.num_slots(), None, &[], code_id, &[], Default::default(),
+        &ir,
+        legacy_resume as *const () as u64,
+        resume as *const () as u64,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        body.num_slots(),
+        None,
+        &[],
+        code_id,
+        &[],
+        Default::default(),
         &Default::default(),
-    ).unwrap();
+    )
+    .unwrap();
     let code = egcl_rt::jit::JitBuffer::new(&framed.code).unwrap();
     let run: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(code.as_ptr()) };
     let mut slots = vec![NIL.0; (body.num_slots() + framed.shadow_root_slots) as usize];
     assert_eq!(run(slots.as_mut_ptr()), EgclVal::from_fixnum(987).0);
-    assert_eq!(ENTRY.load(Ordering::Relaxed), code_id, "frame entry owns its callee frame");
+    assert_eq!(
+        ENTRY.load(Ordering::Relaxed),
+        code_id,
+        "frame entry owns its callee frame"
+    );
     assert_ne!(framed.compiled_entry, 0);
-    let registers: extern "C" fn(u64, u64, u64, u64) -> u64 = unsafe {
-        std::mem::transmute(code.as_ptr().add(framed.compiled_entry))
-    };
+    let registers: extern "C" fn(u64, u64, u64, u64) -> u64 =
+        unsafe { std::mem::transmute(code.as_ptr().add(framed.compiled_entry)) };
     // The existing compiled entry receives its first Lisp argument in RCX.
     assert_eq!(registers(0, 0, 0, NIL.0), EgclVal::from_fixnum(987).0);
-    assert_eq!(ENTRY.load(Ordering::Relaxed), code_id | (1 << 63),
-        "register entry asks the deoptimizer to materialize its own frame");
+    assert_eq!(
+        ENTRY.load(Ordering::Relaxed),
+        code_id | (1 << 63),
+        "register entry asks the deoptimizer to materialize its own frame"
+    );
 }
 
 #[cfg(all(target_arch = "x86_64", unix))]
@@ -212,33 +266,30 @@ fn native_transfer_check_covers_pure_self_recursion_and_mixed_calls() {
     let pure_ir = build_from_bytecode(&pure).expect("build pure self recursion");
     let mixed_ir = build_from_bytecode(&mixed).expect("build mixed call");
     let emit = |f: &egcl_compiler::t2::ir::Function, sym| {
-        emit_framed_with_activation_slots(
-            f,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0xfeed,
-            1,
-            1,
-            Some(sym),
-        )
-        .expect("emit transfer-check probe")
+        emit_framed_with_activation_slots(f, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xfeed, 1, 1, Some(sym))
+            .expect("emit transfer-check probe")
     };
 
     let pure_with_poll = emit(&pure_ir, self_sym);
     let pure_without_poll = emit_framed_with_activation_slots(
-        &pure_ir, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, Some(self_sym),
+        &pure_ir,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        Some(self_sym),
     )
     .expect("emit pure self without transfer poll");
     assert_ne!(
-        pure_with_poll.code,
-        pure_without_poll.code,
+        pure_with_poll.code, pure_without_poll.code,
         "pure self recursion must check transfers from its stack-limit fallback"
     );
 
@@ -261,8 +312,7 @@ fn native_transfer_check_covers_pure_self_recursion_and_mixed_calls() {
     )
     .expect("emit mixed call without transfer poll");
     assert_ne!(
-        mixed_with_poll.code,
-        mixed_without_poll.code,
+        mixed_with_poll.code, mixed_without_poll.code,
         "mixed calls must retain the transfer-status branch"
     );
 }
@@ -349,7 +399,10 @@ fn direct_self_call_stack_fallback_propagates_transfers() {
             Some(sym),
         )
         .expect("emit recursive function");
-        assert_ne!(framed.compiled_entry, 0, "exercise direct register recursion");
+        assert_ne!(
+            framed.compiled_entry, 0,
+            "exercise direct register recursion"
+        );
         let buffer = egcl_rt::jit::JitBuffer::new(&framed.code).unwrap();
         let run: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buffer.as_ptr()) };
         let mut frame = vec![EgclVal::from_fixnum(12).0; usize::from(bf.num_slots())];
@@ -367,16 +420,24 @@ fn direct_self_call_stack_fallback_propagates_transfers() {
                 let result = run(frame.as_mut_ptr());
                 egcl_rt::stack::NATIVE_STACK_LIMIT.store(0, Ordering::Release);
                 assert_eq!(
-                    CALLS.load(Ordering::Relaxed), 1,
+                    CALLS.load(Ordering::Relaxed),
+                    1,
                     "must reach the bounded fallback"
                 );
                 assert_eq!(
                     result,
-                    if transfer { NIL.0 } else { EgclVal::from_fixnum(99).0 },
+                    if transfer {
+                        NIL.0
+                    } else {
+                        EgclVal::from_fixnum(99).0
+                    },
                     "arity {arity}, nested {nested}, transfer {transfer}"
                 );
                 if nested && transfer {
-                    assert!(POLLS.load(Ordering::Relaxed) > 1, "unwind native callers too");
+                    assert!(
+                        POLLS.load(Ordering::Relaxed) > 1,
+                        "unwind native callers too"
+                    );
                 }
             }
         }
@@ -432,8 +493,7 @@ fn self_calls_through_activation_slices_stop_on_pending_transfers() {
         .expect("emit self-call slice");
         assert_eq!(framed.compiled_entry, 0, "slice call needs an activation");
         let buffer = egcl_rt::jit::JitBuffer::new(&framed.code).expect("executable memory");
-        let run: extern "C" fn(*mut u64) -> u64 =
-            unsafe { std::mem::transmute(buffer.as_ptr()) };
+        let run: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buffer.as_ptr()) };
         let mut frame = vec![NIL.0; usize::from(bf.num_slots() + framed.shadow_root_slots)];
         assert_eq!(
             run(frame.as_mut_ptr()),
@@ -472,11 +532,11 @@ fn emitted_heap_literal_is_loaded_from_its_constant_pool_slot() {
 #[cfg(all(target_arch = "x86_64", unix))]
 #[test]
 fn inlined_heap_literal_uses_the_saved_body_constant_slot() {
-    use std::sync::Arc;
     use egcl_compiler::t2::build::build_from_bytecode_with_inline_options;
     use egcl_compiler::t2::emit::emit_framed;
     use egcl_compiler::t2::inlining::InlineOptions;
     use egcl_compiler::t2::ir::Opcode;
+    use std::sync::Arc;
 
     let helper = egcl_rt::symbols::intern("INLINE-HEAP-LITERAL-HELPER");
     let caller = egcl_rt::symbols::intern("INLINE-HEAP-LITERAL-CALLER");
@@ -598,9 +658,19 @@ fn integerp_intrinsic_accepts_fixnums_and_bignums_without_a_call() {
             .any(|&i| typep_f.inst(i).opcode == Opcode::Call)
     }));
 
-    let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, 0,
-        clear_intrinsic_values as *const () as usize as u64, None)
-        .expect("emit INTEGERP intrinsic");
+    let framed = emit_framed(
+        &f,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        clear_intrinsic_values as *const () as usize as u64,
+        None,
+    )
+    .expect("emit INTEGERP intrinsic");
     let buf = egcl_rt::jit::JitBuffer::new(&framed.code).expect("mmap");
     let func: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
     let run = |value: EgclVal| {
@@ -663,7 +733,14 @@ fn bytecode_typep_boolean_executes_and_clears_multiple_values() {
     assert!(check.frame_state.is_none());
 
     let framed = emit_framed(
-        &f, 0, 0, 0, 0, 0, 0, 0,
+        &f,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
         clear_values as *const () as usize as u64,
         None,
     )
@@ -1094,9 +1171,9 @@ fn moving_gc_relocates_t2_roots_in_registers_and_native_spills() {
 #[cfg(all(target_arch = "x86_64", unix))]
 #[test]
 fn car_cdr_metadata_emit_guarded_field_loads_with_a_nil_arm() {
-    use std::sync::atomic::Ordering;
     use egcl_compiler::t2::emit::emit_framed;
     use egcl_compiler::t2::ir::{AuxData, Opcode, TypeBits};
+    use std::sync::atomic::Ordering;
 
     let car = egcl_rt::symbols::intern("CAR");
     let cdr = egcl_rt::symbols::intern("CDR");
@@ -1204,11 +1281,12 @@ fn car_cdr_metadata_emit_guarded_field_loads_with_a_nil_arm() {
             .flat_map(|&b| f.block(b).insts.iter())
             .filter(|&&i| {
                 let inst = f.inst(i);
-                inst.flags.guard && if binding {
-                    matches!(inst.aux, AuxData::BuiltinBinding { .. })
-                } else {
-                    matches!(inst.aux, AuxData::TypeTag(t) if t.bits == TypeBits::CONS)
-                }
+                inst.flags.guard
+                    && if binding {
+                        matches!(inst.aux, AuxData::BuiltinBinding { .. })
+                    } else {
+                        matches!(inst.aux, AuxData::TypeTag(t) if t.bits == TypeBits::CONS)
+                    }
             })
             .count()
     };
@@ -1227,7 +1305,11 @@ fn car_cdr_metadata_emit_guarded_field_loads_with_a_nil_arm() {
         1,
         "CAR and CDR share one dominating cons guard"
     );
-    assert_eq!(guard_count(&f, true), 0, "fixed bindings need no runtime binding guards");
+    assert_eq!(
+        guard_count(&f, true),
+        0,
+        "fixed bindings need no runtime binding guards"
+    );
     verify(&f).expect("optimized CAR/CDR IR verifies");
 
     let framed = emit_framed(
@@ -1409,10 +1491,16 @@ fn library_function_name_retains_its_call_and_deopt_state() {
         "first-char-caller",
         vec![
             Instr::LoadLocal(0),
-            Instr::CallNamed { sym: first_char, nargs: 1 },
+            Instr::CallNamed {
+                sym: first_char,
+                nargs: 1,
+            },
             Instr::Return,
         ],
-        vec![], 1, 1, 1,
+        vec![],
+        1,
+        1,
+        1,
     );
     let mut f = build_from_bytecode(&bf).expect("build ordinary library call");
     let mut pm = PassManager::new();
@@ -1420,20 +1508,27 @@ fn library_function_name_retains_its_call_and_deopt_state() {
     pm.add(Box::new(Dce));
     pm.run(&mut f);
     verify(&f).expect("library call retains valid SSA and deopt state");
-    let insts: Vec<_> = f.block_order().iter()
+    let insts: Vec<_> = f
+        .block_order()
+        .iter()
         .flat_map(|&b| f.block(b).insts.iter().copied())
-        .map(|i| f.inst(i)).collect();
+        .map(|i| f.inst(i))
+        .collect();
     let calls: Vec<_> = insts.iter().filter(|d| d.opcode == Opcode::Call).collect();
     assert_eq!(calls.len(), 1);
     let call = calls[0];
     assert!(matches!(call.aux, AuxData::CallTarget(sym) if sym == first_char));
     assert_eq!(call.args.len(), 1);
     assert!(call.flags.effectful && call.flags.safepoint);
-    let state = f.frame_states.get(call.frame_state.expect("call FrameState"));
+    let state = f
+        .frame_states
+        .get(call.frame_state.expect("call FrameState"));
     assert_eq!(state.scopes[0].bcp, 1);
     assert_eq!(state.scopes[0].stack.len(), 1);
-    assert!(!insts.iter().any(|d| matches!(d.opcode,
-        Opcode::StringByteLength | Opcode::StringAsciiCharAt)));
+    assert!(!insts.iter().any(|d| matches!(
+        d.opcode,
+        Opcode::StringByteLength | Opcode::StringAsciiCharAt
+    )));
 }
 
 #[cfg(all(target_arch = "x86_64", unix))]
@@ -1451,28 +1546,69 @@ fn constant_typep_operands_execute_in_native_code() {
     let typep = egcl_rt::symbols::intern("TYPEP");
     let symbol = EgclVal::from_symbol_index(egcl_rt::symbols::intern("PREDICATE-CONSTANT"));
     for (kind, values) in [
-        ("SYMBOL", vec![(NIL, true), (T, true), (symbol, true),
-            (EgclVal::from_fixnum(42), false), (EgclVal::from_char('a'), false)]),
-        ("INTEGER", vec![(NIL, false), (T, false), (symbol, false),
-            (EgclVal::from_fixnum(42), true), (EgclVal::from_char('a'), false)]),
+        (
+            "SYMBOL",
+            vec![
+                (NIL, true),
+                (T, true),
+                (symbol, true),
+                (EgclVal::from_fixnum(42), false),
+                (EgclVal::from_char('a'), false),
+            ],
+        ),
+        (
+            "INTEGER",
+            vec![
+                (NIL, false),
+                (T, false),
+                (symbol, false),
+                (EgclVal::from_fixnum(42), true),
+                (EgclVal::from_char('a'), false),
+            ],
+        ),
     ] {
         let type_name = EgclVal::from_symbol_index(egcl_rt::symbols::intern(kind));
         for (value, matches) in values {
-            let input = bytecode_fn("constant-typep", vec![
-                Instr::Const(0), Instr::Const(1),
-                Instr::CallNamed { sym: typep, nargs: 2 }, Instr::Return,
-            ], vec![value, type_name], 0, 2, 0);
+            let input = bytecode_fn(
+                "constant-typep",
+                vec![
+                    Instr::Const(0),
+                    Instr::Const(1),
+                    Instr::CallNamed {
+                        sym: typep,
+                        nargs: 2,
+                    },
+                    Instr::Return,
+                ],
+                vec![value, type_name],
+                0,
+                2,
+                0,
+            );
             let function = build_from_bytecode(&input).expect("build constant TYPEP");
             verify(&function).expect("constant predicate has valid operand state");
-            let native = emit_framed(&function, 0, 0, 0, 0, 0, 0, 0,
-                clear_values as *const () as usize as u64, None)
-                .expect("emit constant TYPEP");
+            let native = emit_framed(
+                &function,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                clear_values as *const () as usize as u64,
+                None,
+            )
+            .expect("emit constant TYPEP");
             let buffer = egcl_rt::jit::JitBuffer::new(&native.code).expect("mmap");
             let run: extern "C" fn(*mut u64) -> u64 =
                 unsafe { std::mem::transmute(buffer.as_ptr()) };
             let mut frame = [0; 4];
-            assert_eq!(EgclVal(run(frame.as_mut_ptr())), if matches { T } else { NIL },
-                "TYPEP {value:?} {kind}");
+            assert_eq!(
+                EgclVal(run(frame.as_mut_ptr())),
+                if matches { T } else { NIL },
+                "TYPEP {value:?} {kind}"
+            );
         }
     }
     assert_eq!(CLEARS.load(Ordering::Relaxed), 10);
@@ -1481,11 +1617,11 @@ fn constant_typep_operands_execute_in_native_code() {
 #[cfg(all(target_arch = "x86_64", unix))]
 #[test]
 fn post_inline_guard_elimination_keeps_callee_proofs_in_their_nil_arms() {
-    use std::sync::Arc;
     use egcl_compiler::t2::build::build_from_bytecode_with_inline_options;
     use egcl_compiler::t2::emit::emit_framed;
     use egcl_compiler::t2::inlining::InlineOptions;
     use egcl_compiler::t2::ir::{AuxData, Opcode, TypeBits};
+    use std::sync::Arc;
 
     let car = egcl_rt::symbols::intern("CAR");
     let helper = egcl_rt::symbols::intern("GENERAL-GUARDED-LEAF");
@@ -1494,10 +1630,7 @@ fn post_inline_guard_elimination_keeps_callee_proofs_in_their_nil_arms() {
         "GENERAL-GUARDED-LEAF",
         vec![
             Instr::LoadLocal(0),
-            Instr::CallNamed {
-                sym: car,
-                nargs: 1,
-            },
+            Instr::CallNamed { sym: car, nargs: 1 },
             Instr::Return,
         ],
         vec![],
@@ -1536,7 +1669,8 @@ fn post_inline_guard_elimination_keeps_callee_proofs_in_their_nil_arms() {
             .iter()
             .flat_map(|&b| f.block(b).insts.iter().copied())
             .filter(|&i| {
-                f.inst(i).opcode == Opcode::Guard && matches!(&f.inst(i).aux, AuxData::TypeTag(t) if t.bits == TypeBits::CONS)
+                f.inst(i).opcode == Opcode::Guard
+                    && matches!(&f.inst(i).aux, AuxData::TypeTag(t) if t.bits == TypeBits::CONS)
             })
             .count()
     };
@@ -1559,9 +1693,19 @@ fn post_inline_guard_elimination_keeps_callee_proofs_in_their_nil_arms() {
         "a proof inside one callee's cons arm cannot eliminate the other's"
     );
 
-    let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, 0,
-        clear_intrinsic_values as *const () as usize as u64, Some(caller))
-        .expect("emit caller after general guard elimination");
+    let framed = emit_framed(
+        &f,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        clear_intrinsic_values as *const () as usize as u64,
+        Some(caller),
+    )
+    .expect("emit caller after general guard elimination");
     let cell = Box::new(ConsCell {
         car: EgclVal::from_fixnum(17),
         cdr: EgclVal::from_fixnum(29),
@@ -1799,8 +1943,19 @@ fn branching_if_speculates_and_runs() {
     assert_eq!(n, 2, "both the comparison and the multiply are speculated");
     verify(&f).expect("speculated branching IR verifies");
 
-    let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, 0,
-        clear_intrinsic_values as *const () as usize as u64, None).expect("emit branching function");
+    let framed = emit_framed(
+        &f,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        clear_intrinsic_values as *const () as usize as u64,
+        None,
+    )
+    .expect("emit branching function");
     let buf = egcl_rt::jit::JitBuffer::new(&framed.code).expect("mmap");
     let func: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
 
@@ -2048,8 +2203,19 @@ fn bitwise_logand_speculates_and_runs() {
             .any(|&i| f.inst(i).opcode == Opcode::LogAnd)),
         "a LogAnd op must be present"
     );
-    let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, 0,
-        clear_intrinsic_values as *const () as usize as u64, None).expect("emit bitwise");
+    let framed = emit_framed(
+        &f,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        clear_intrinsic_values as *const () as usize as u64,
+        None,
+    )
+    .expect("emit bitwise");
     let buf = egcl_rt::jit::JitBuffer::new(&framed.code).expect("mmap");
     let func: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
     let mut frame = [EgclVal::from_fixnum(0x3E7).0, 0u64, 0u64];
@@ -2126,7 +2292,6 @@ fn backend_lowers_and_allocates_straight_line() {
     );
 }
 
-
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[test]
 fn backedge_to_bytecode_zero_preserves_parameters_and_osr_entry() {
@@ -2137,31 +2302,53 @@ fn backedge_to_bytecode_zero_preserves_parameters_and_osr_entry() {
         vec![
             Instr::LoadLocal(0),
             Instr::Const(0),
-            Instr::CallNamed { sym: egcl_rt::symbols::intern(">"), nargs: 2 },
+            Instr::CallNamed {
+                sym: egcl_rt::symbols::intern(">"),
+                nargs: 2,
+            },
             Instr::BrIfFalse(9),
             Instr::LoadLocal(0),
             Instr::Const(1),
-            Instr::CallNamed { sym: egcl_rt::symbols::intern("-"), nargs: 2 },
+            Instr::CallNamed {
+                sym: egcl_rt::symbols::intern("-"),
+                nargs: 2,
+            },
             Instr::StoreLocal(0),
             Instr::Br(0),
             Instr::LoadLocal(0),
             Instr::Return,
         ],
         vec![EgclVal::from_fixnum(0), EgclVal::from_fixnum(1)],
-        1, 2, 1,
+        1,
+        2,
+        1,
     );
     let transfer = build_from_bytecode_for_transfers(&bf).unwrap();
     verify(&transfer).unwrap();
     let mut function = build_from_bytecode(&bf).unwrap();
-    use egcl_compiler::t2::speculate::{speculate, SpecType};
-    assert_eq!(speculate(&mut function, &|bcp| {
-        (bcp == 2 || bcp == 6).then_some(SpecType::Fixnum)
-    }), 2);
+    use egcl_compiler::t2::speculate::{SpecType, speculate};
+    assert_eq!(
+        speculate(&mut function, &|bcp| {
+            (bcp == 2 || bcp == 6).then_some(SpecType::Fixnum)
+        }),
+        2
+    );
     verify(&function).unwrap();
     assert_eq!(function.osr_entries.len(), 1);
     assert_ne!(function.osr_entries[0].block, function.entry());
-    let framed = emit_framed(&function, 0, 0, 0, 0, 0, 0, 0,
-        clear_intrinsic_values as *const () as usize as u64, None).unwrap();
+    let framed = emit_framed(
+        &function,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        clear_intrinsic_values as *const () as usize as u64,
+        None,
+    )
+    .unwrap();
     assert_eq!(framed.osr_entries.len(), 1, "OSR entry must be emitted");
     assert_eq!(framed.osr_entries[0].0, 0);
     let code = egcl_rt::jit::JitBuffer::new(&framed.code).unwrap();
@@ -2172,8 +2359,11 @@ fn backedge_to_bytecode_zero_preserves_parameters_and_osr_entry() {
         for iterations in [0, 1, 254, 255, 256, 511, 1024, 10_000, 1] {
             let mut frame = vec![NIL.0; 3 + framed.shadow_root_slots as usize];
             frame[0] = EgclVal::from_fixnum(iterations).0;
-            assert_eq!(run(frame.as_mut_ptr()), EgclVal::from_fixnum(0).0,
-                "entry {offset}, iterations {iterations}");
+            assert_eq!(
+                run(frame.as_mut_ptr()),
+                EgclVal::from_fixnum(0).0,
+                "entry {offset}, iterations {iterations}"
+            );
         }
     }
 }
@@ -2185,18 +2375,40 @@ fn standard_intrinsic_identity_does_not_consume_shadowed_user_calls() {
         // Only bare CAR is the canonical runtime registry identity. The other
         // entries deliberately have the same print-name but distinct symbols.
         let symbol = egcl_rt::symbols::intern(spelling);
-        let body = bytecode_fn("binding-identity", vec![
-            Instr::LoadLocal(0), Instr::CallNamed { sym: symbol, nargs: 1 }, Instr::Return,
-        ], vec![], 1, 1, 1);
+        let body = bytecode_fn(
+            "binding-identity",
+            vec![
+                Instr::LoadLocal(0),
+                Instr::CallNamed {
+                    sym: symbol,
+                    nargs: 1,
+                },
+                Instr::Return,
+            ],
+            vec![],
+            1,
+            1,
+            1,
+        );
         let function = build_from_bytecode(&body).expect("build exact callable identity");
         verify(&function).expect("binding identity preserves valid IR");
-        let instructions: Vec<_> = function.block_order().iter()
+        let instructions: Vec<_> = function
+            .block_order()
+            .iter()
             .flat_map(|&block| function.block(block).insts.iter())
-            .map(|&instruction| function.inst(instruction)).collect();
+            .map(|&instruction| function.inst(instruction))
+            .collect();
         if spelling == "CAR" {
-            assert!(!instructions.iter().any(|instruction|
-                matches!(instruction.aux, AuxData::BuiltinBinding { .. })));
-            assert!(instructions.iter().any(|instruction| instruction.opcode == Opcode::Car));
+            assert!(
+                !instructions
+                    .iter()
+                    .any(|instruction| matches!(instruction.aux, AuxData::BuiltinBinding { .. }))
+            );
+            assert!(
+                instructions
+                    .iter()
+                    .any(|instruction| instruction.opcode == Opcode::Car)
+            );
         } else if spelling == "CL::CAR" {
             // A fabricated qualified registry entry is not the canonical
             // package symbol. If metadata expands it, the old guard is vital.
@@ -2208,7 +2420,11 @@ fn standard_intrinsic_identity_does_not_consume_shadowed_user_calls() {
         } else {
             let calls: Vec<_> = instructions.iter().filter(|instruction|
                 matches!(instruction.aux, AuxData::CallTarget(target) if target == symbol)).collect();
-            assert_eq!(calls.len(), 1, "{spelling} remains a dynamically resolved user call");
+            assert_eq!(
+                calls.len(),
+                1,
+                "{spelling} remains a dynamically resolved user call"
+            );
             assert_eq!(calls[0].opcode, Opcode::Call);
             assert!(calls[0].flags.effectful && calls[0].flags.safepoint);
             let state = function.frame_states.get(calls[0].frame_state.unwrap());
@@ -2242,7 +2458,11 @@ fn simple_string_char_runs_inline_and_calls_char_otherwise() {
         CLEARS.fetch_add(1, Ordering::Relaxed);
     }
     fn string(tid: u8, chars: &[char]) -> Vec<u64> {
-        let width = if tid == type_id::SIMPLE_CHARACTER_STRING { 4 } else { 1 };
+        let width = if tid == type_id::SIMPLE_CHARACTER_STRING {
+            4
+        } else {
+            1
+        };
         let words = (16 + chars.len() * width).div_ceil(8);
         let mut object = vec![0u64; words.max(3)];
         object[0] = ObjectHeader::new(tid, words as u16).0;
@@ -2259,65 +2479,139 @@ fn simple_string_char_runs_inline_and_calls_char_otherwise() {
         }
         object
     }
-    let tagged = |object: &Vec<u64>| EgclVal(object.as_ptr() as u64 | egcl_rt::value::TAG_HEAP_OBJECT);
+    let tagged =
+        |object: &Vec<u64>| EgclVal(object.as_ptr() as u64 | egcl_rt::value::TAG_HEAP_OBJECT);
     let char_sym = egcl_rt::symbols::intern("CHAR");
     let emit = |code: Vec<Instr>, constants: Vec<EgclVal>, arity: u16| {
         let input = bytecode_fn("inline-char", code, constants, arity, 2, arity);
         let function = build_from_bytecode(&input).expect("build CHAR");
         verify(&function).expect("split CHAR verifies");
-        assert!(function.block_order().iter().flat_map(|&b| function.block(b).insts.iter())
-            .any(|&inst| function.inst(inst).opcode == Opcode::StringCharOrNil));
-        let native = emit_framed(&function, 0, 0, call as *const () as u64, 0, 0, 0, 0,
-            clear as *const () as u64, None).expect("emit CHAR");
+        assert!(
+            function
+                .block_order()
+                .iter()
+                .flat_map(|&b| function.block(b).insts.iter())
+                .any(|&inst| function.inst(inst).opcode == Opcode::StringCharOrNil)
+        );
+        let native = emit_framed(
+            &function,
+            0,
+            0,
+            call as *const () as u64,
+            0,
+            0,
+            0,
+            0,
+            clear as *const () as u64,
+            None,
+        )
+        .expect("emit CHAR");
         egcl_rt::jit::JitBuffer::new(&native.code).expect("mmap")
     };
-    let general = emit(vec![
-        Instr::LoadLocal(0), Instr::LoadLocal(1),
-        Instr::CallNamed { sym: char_sym, nargs: 2 }, Instr::Return,
-    ], vec![], 2);
+    let general = emit(
+        vec![
+            Instr::LoadLocal(0),
+            Instr::LoadLocal(1),
+            Instr::CallNamed {
+                sym: char_sym,
+                nargs: 2,
+            },
+            Instr::Return,
+        ],
+        vec![],
+        2,
+    );
     let run: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(general.as_ptr()) };
     let base = string(type_id::SIMPLE_BASE_STRING, &['h', 'é', 'l', 'l', 'o']);
     let wide = string(type_id::SIMPLE_CHARACTER_STRING, &['a', 'λ', '😀']);
     let other = string(type_id::SIMPLE_VECTOR, &['a']);
     let fix = EgclVal::from_fixnum;
     let fast = [
-        (tagged(&base), fix(0), 'h'), (tagged(&base), fix(1), 'é'), (tagged(&base), fix(4), 'o'),
-        (tagged(&wide), fix(0), 'a'), (tagged(&wide), fix(1), 'λ'), (tagged(&wide), fix(2), '😀'),
+        (tagged(&base), fix(0), 'h'),
+        (tagged(&base), fix(1), 'é'),
+        (tagged(&base), fix(4), 'o'),
+        (tagged(&wide), fix(0), 'a'),
+        (tagged(&wide), fix(1), 'λ'),
+        (tagged(&wide), fix(2), '😀'),
     ];
     for (s, i, expected) in fast {
         let mut frame = [s.0, i.0, 0, 0];
-        assert_eq!(EgclVal(run(frame.as_mut_ptr())), EgclVal::from_char(expected), "{i:?}");
+        assert_eq!(
+            EgclVal(run(frame.as_mut_ptr())),
+            EgclVal::from_char(expected),
+            "{i:?}"
+        );
     }
-    assert_eq!(CALLS.swap(0, Ordering::Relaxed), 0, "every simple-string read stays inline");
-    assert_eq!(CLEARS.swap(0, Ordering::Relaxed), fast.len(), "each inline read resets values");
+    assert_eq!(
+        CALLS.swap(0, Ordering::Relaxed),
+        0,
+        "every simple-string read stays inline"
+    );
+    assert_eq!(
+        CLEARS.swap(0, Ordering::Relaxed),
+        fast.len(),
+        "each inline read resets values"
+    );
     let slow = [
-        (tagged(&base), fix(5)), (tagged(&base), fix(-1)), (tagged(&wide), fix(3)),
-        (tagged(&base), EgclVal::from_char('a')), (tagged(&base), NIL),
-        (tagged(&other), fix(0)), (fix(3), fix(0)), (NIL, fix(0)), (T, fix(0)),
+        (tagged(&base), fix(5)),
+        (tagged(&base), fix(-1)),
+        (tagged(&wide), fix(3)),
+        (tagged(&base), EgclVal::from_char('a')),
+        (tagged(&base), NIL),
+        (tagged(&other), fix(0)),
+        (fix(3), fix(0)),
+        (NIL, fix(0)),
+        (T, fix(0)),
         (EgclVal::from_char('a'), fix(0)),
     ];
     for (s, i) in slow {
         let mut frame = [s.0, i.0, 0, 0];
-        assert_eq!(EgclVal(run(frame.as_mut_ptr())), EgclVal::from_char('?'), "{s:?} {i:?}");
+        assert_eq!(
+            EgclVal(run(frame.as_mut_ptr())),
+            EgclVal::from_char('?'),
+            "{s:?} {i:?}"
+        );
     }
-    assert_eq!(CALLS.swap(0, Ordering::Relaxed), slow.len(), "everything else calls CHAR");
+    assert_eq!(
+        CALLS.swap(0, Ordering::Relaxed),
+        slow.len(),
+        "everything else calls CHAR"
+    );
     assert_eq!(CLEARS.swap(0, Ordering::Relaxed), 0);
 
     // A constant index and a constant (immediate) string.
-    let constant = emit(vec![
-        Instr::LoadLocal(0), Instr::Const(0),
-        Instr::CallNamed { sym: char_sym, nargs: 2 }, Instr::Return,
-    ], vec![fix(2)], 1);
+    let constant = emit(
+        vec![
+            Instr::LoadLocal(0),
+            Instr::Const(0),
+            Instr::CallNamed {
+                sym: char_sym,
+                nargs: 2,
+            },
+            Instr::Return,
+        ],
+        vec![fix(2)],
+        1,
+    );
     let run: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(constant.as_ptr()) };
     let mut frame = [tagged(&wide).0, 0, 0, 0];
     assert_eq!(EgclVal(run(frame.as_mut_ptr())), EgclVal::from_char('😀'));
     let mut frame = [tagged(&base).0, 0, 0, 0];
     assert_eq!(EgclVal(run(frame.as_mut_ptr())), EgclVal::from_char('l'));
     assert_eq!(CALLS.swap(0, Ordering::Relaxed), 0);
-    let immediate = emit(vec![
-        Instr::Const(0), Instr::LoadLocal(0),
-        Instr::CallNamed { sym: char_sym, nargs: 2 }, Instr::Return,
-    ], vec![NIL], 1);
+    let immediate = emit(
+        vec![
+            Instr::Const(0),
+            Instr::LoadLocal(0),
+            Instr::CallNamed {
+                sym: char_sym,
+                nargs: 2,
+            },
+            Instr::Return,
+        ],
+        vec![NIL],
+        1,
+    );
     let run: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(immediate.as_ptr()) };
     let mut frame = [fix(0).0, 0, 0, 0];
     assert_eq!(EgclVal(run(frame.as_mut_ptr())), EgclVal::from_char('?'));

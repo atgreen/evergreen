@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
 //! Owned TCP streams: R5.113, R5.121–R5.124, on Unix and Windows.
+use egcl_rt::value::{EOF, EgclVal, NIL};
+use egcl_stdlib::streams::*;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
-use egcl_rt::value::{EOF, NIL, EgclVal};
-use egcl_stdlib::streams::*;
 
 #[test]
 fn client_buffers_bytes_reports_readiness_and_closes_the_socket() {

@@ -238,7 +238,8 @@ fn documentation_generic_methods_survive_source_free_load_and_fresh_image() {
     let bytes = fs::read(&fasl).unwrap();
     let unit = egcl_rt::bfasl::load(&bytes).expect("valid compiled documentation library");
     assert!(
-        unit.section(egcl_rt::bfasl::section::TOPLEVEL_FORMS).is_none(),
+        unit.section(egcl_rt::bfasl::section::TOPLEVEL_FORMS)
+            .is_none(),
         "source-form fallback must not mask portable method loading"
     );
     assert!(

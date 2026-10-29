@@ -3,10 +3,10 @@
 
 //! Explicit library lifetime and global symbol lookup for the CFFI backend.
 #![cfg(target_os = "linux")]
-use std::process::Command;
 use egcl_rt::ffi::{
     close_foreign_library, foreign_symbol, foreign_symbol_global, load_foreign_library,
 };
+use std::process::Command;
 
 #[test]
 fn library_imports_real_host_math_symbols_with_global_pointer_identity() {

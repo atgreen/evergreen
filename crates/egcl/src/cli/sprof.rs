@@ -206,8 +206,7 @@ pub fn dump_on_exit() {
         return;
     }
     stop();
-    let path =
-        std::env::var("EGCL_SPROF_OUT").unwrap_or_else(|_| "egcl-sprof.folded".to_string());
+    let path = std::env::var("EGCL_SPROF_OUT").unwrap_or_else(|_| "egcl-sprof.folded".to_string());
     let folded = fold();
     match std::fs::write(&path, &folded) {
         Ok(()) => eprintln!(

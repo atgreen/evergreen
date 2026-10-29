@@ -184,9 +184,14 @@ fn base_char_is_the_element_type_of_an_8_bit_base_string_consistently() {
         "SUBTYPEP ((T T) (NIL T) (T T) (NIL T) (T T))",
         "UAET (BASE-CHAR BASE-CHAR CHARACTER)",
         // Tier 2 agrees with tier 1.
-        &format!("COMPILED ({BASE} {BASE} (NIL NIL T CHARACTER (SIMPLE-ARRAY CHARACTER (3))) NIL 5)"),
+        &format!(
+            "COMPILED ({BASE} {BASE} (NIL NIL T CHARACTER (SIMPLE-ARRAY CHARACTER (3))) NIL 5)"
+        ),
         "BASE-STRING-OK",
     ] {
-        assert!(stdout.contains(expected), "missing {expected:?} in:\n{stdout}");
+        assert!(
+            stdout.contains(expected),
+            "missing {expected:?} in:\n{stdout}"
+        );
     }
 }

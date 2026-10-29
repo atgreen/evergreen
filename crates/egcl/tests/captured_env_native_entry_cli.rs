@@ -321,7 +321,12 @@ fn installed_capturing_wrapper_runs_natively_with_its_own_binding() {
     let lazy_off = [("EGCL_LAZY_COMPILE", "0")];
     let mut low = THRESHOLDS.to_vec();
     low.extend(lazy_off);
-    for envs in [&low[..], &lazy_off[..], &[][..], &[("EGCL_FORCE_TIER", "interp")][..]] {
+    for envs in [
+        &low[..],
+        &lazy_off[..],
+        &[][..],
+        &[("EGCL_FORCE_TIER", "interp")][..],
+    ] {
         let output = egcl(program, envs);
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
@@ -441,7 +446,11 @@ fn closure_bodies_reading_enclosing_bindings_reach_t2_with_identical_results() {
     }
     for other in [
         &[("EGCL_FORCE_TIER", "interp")][..],
-        &[("EGCL_LAZY_COMPILE", "0"), ("EGCL_DISABLE_T2", "1"), ("EGCL_T0_T1_THRESHOLD", "2")][..],
+        &[
+            ("EGCL_LAZY_COMPILE", "0"),
+            ("EGCL_DISABLE_T2", "1"),
+            ("EGCL_T0_T1_THRESHOLD", "2"),
+        ][..],
         &[][..],
     ] {
         let (oracle, _) = results_and_tiers(&egcl(CLOSURE_PROGRAM, other));
@@ -535,8 +544,14 @@ fn closure_loop_osr_and_deopt_keep_the_instance_environment() {
     assert!(oracle.contains("R1 200004"), "{oracle}");
     assert!(oracle.contains("R3 200004"), "{oracle}");
     if MAPPED_LINUX {
-        assert!(tiered.contains("TIER 2"), "the loop must OSR into T2: {tiered}");
-        assert!(!tiered.contains("DEOPTS 0 "), "the overflow must deopt: {tiered}");
+        assert!(
+            tiered.contains("TIER 2"),
+            "the loop must OSR into T2: {tiered}"
+        );
+        assert!(
+            !tiered.contains("DEOPTS 0 "),
+            "the overflow must deopt: {tiered}"
+        );
     }
 }
 

@@ -57,17 +57,20 @@ fn a_built_in_class_is_disjoint_from_integer_and_symbol() {
           (format t "BUILTIN-OBJECTS-OK~%")
         "#,
     ]);
-    expect(&stdout, &[
-        "INTEGERP NIL",
-        "NUMBERP NIL",
-        "SYMBOLP NIL",
-        "EQL-14 NIL",
-        "NAME-OF-14 NIL",
-        "TYPE-OF-14 FIXNUM",
-        "DISPATCH-14 NO-APPLICABLE-METHOD",
-        "DISPATCH-CLASS BIC",
-        "BUILTIN-OBJECTS-OK",
-    ]);
+    expect(
+        &stdout,
+        &[
+            "INTEGERP NIL",
+            "NUMBERP NIL",
+            "SYMBOLP NIL",
+            "EQL-14 NIL",
+            "NAME-OF-14 NIL",
+            "TYPE-OF-14 FIXNUM",
+            "DISPATCH-14 NO-APPLICABLE-METHOD",
+            "DISPATCH-CLASS BIC",
+            "BUILTIN-OBJECTS-OK",
+        ],
+    );
 }
 
 /// The metaclass of every kind of class, which is what must NOT change.
@@ -102,42 +105,45 @@ fn every_kind_of_class_keeps_its_metaclass() {
           (format t "METACLASS-TABLE-OK~%")
         "#,
     ]);
-    expect(&stdout, &[
-        // user, struct and condition classes
-        "META UC STANDARD-CLASS",
-        "META ST STRUCTURE-CLASS",
-        "META CC STANDARD-CLASS",
-        // the ten AMOP metaobject classes are standard classes
-        "META STANDARD-OBJECT STANDARD-CLASS",
-        "META CLASS STANDARD-CLASS",
-        "META STANDARD-CLASS STANDARD-CLASS",
-        "META BUILT-IN-CLASS STANDARD-CLASS",
-        "META STRUCTURE-CLASS STANDARD-CLASS",
-        "META GENERIC-FUNCTION STANDARD-CLASS",
-        "META STANDARD-GENERIC-FUNCTION STANDARD-CLASS",
-        "META METHOD STANDARD-CLASS",
-        "META STANDARD-METHOD STANDARD-CLASS",
-        "META METHOD-COMBINATION STANDARD-CLASS",
-        // everything else built-in, STRUCTURE-OBJECT included
-        "META INTEGER BUILT-IN-CLASS",
-        "META FIXNUM BUILT-IN-CLASS",
-        "META STRING BUILT-IN-CLASS",
-        "META CONS BUILT-IN-CLASS",
-        "META SYMBOL BUILT-IN-CLASS",
-        "META T BUILT-IN-CLASS",
-        "META HASH-TABLE BUILT-IN-CLASS",
-        "META PACKAGE BUILT-IN-CLASS",
-        "META STREAM BUILT-IN-CLASS",
-        "META PATHNAME BUILT-IN-CLASS",
-        "META STRUCTURE-OBJECT BUILT-IN-CLASS",
-        "SO-IS-STRUCTURE-CLASS T",
-        "SO-IS-STANDARD-CLASS T",
-        "INT-IS-BUILTIN T",
-        "UC-IS-STANDARD T",
-        "ST-IS-STRUCTURE T",
-        "CLASSES-ARE-CLASSES T",
-        "METACLASS-TABLE-OK",
-    ]);
+    expect(
+        &stdout,
+        &[
+            // user, struct and condition classes
+            "META UC STANDARD-CLASS",
+            "META ST STRUCTURE-CLASS",
+            "META CC STANDARD-CLASS",
+            // the ten AMOP metaobject classes are standard classes
+            "META STANDARD-OBJECT STANDARD-CLASS",
+            "META CLASS STANDARD-CLASS",
+            "META STANDARD-CLASS STANDARD-CLASS",
+            "META BUILT-IN-CLASS STANDARD-CLASS",
+            "META STRUCTURE-CLASS STANDARD-CLASS",
+            "META GENERIC-FUNCTION STANDARD-CLASS",
+            "META STANDARD-GENERIC-FUNCTION STANDARD-CLASS",
+            "META METHOD STANDARD-CLASS",
+            "META STANDARD-METHOD STANDARD-CLASS",
+            "META METHOD-COMBINATION STANDARD-CLASS",
+            // everything else built-in, STRUCTURE-OBJECT included
+            "META INTEGER BUILT-IN-CLASS",
+            "META FIXNUM BUILT-IN-CLASS",
+            "META STRING BUILT-IN-CLASS",
+            "META CONS BUILT-IN-CLASS",
+            "META SYMBOL BUILT-IN-CLASS",
+            "META T BUILT-IN-CLASS",
+            "META HASH-TABLE BUILT-IN-CLASS",
+            "META PACKAGE BUILT-IN-CLASS",
+            "META STREAM BUILT-IN-CLASS",
+            "META PATHNAME BUILT-IN-CLASS",
+            "META STRUCTURE-OBJECT BUILT-IN-CLASS",
+            "SO-IS-STRUCTURE-CLASS T",
+            "SO-IS-STANDARD-CLASS T",
+            "INT-IS-BUILTIN T",
+            "UC-IS-STANDARD T",
+            "ST-IS-STRUCTURE T",
+            "CLASSES-ARE-CLASSES T",
+            "METACLASS-TABLE-OK",
+        ],
+    );
 }
 
 /// A built-in class must come back from a core as an object, and the class
@@ -177,11 +183,14 @@ fn built_in_classes_survive_a_saved_core() {
         "#,
     ]);
     let _ = std::fs::remove_dir_all(&dir);
-    expect(&restored, &[
-        "POST BUILT-IN-CLASS NIL",
-        "POST-TYPEP T",
-        "POST-NEW-CLASS 7",
-        "POST-REFUSES-BUILTIN REFUSED",
-        "RESTORE-OK",
-    ]);
+    expect(
+        &restored,
+        &[
+            "POST BUILT-IN-CLASS NIL",
+            "POST-TYPEP T",
+            "POST-NEW-CLASS 7",
+            "POST-REFUSES-BUILTIN REFUSED",
+            "RESTORE-OK",
+        ],
+    );
 }

@@ -46,7 +46,9 @@ fn ordinary_register_foreign_arguments_survive_gc_and_exceptional_retirement() {
         let NativeCodeStorage::Mapped(code) = &code._storage else {
             panic!("mapped owner")
         };
-        assert!(native_transfer_entry::installed_listing(code).contains("Ordinary x86-64 Lisp ABI"));
+        assert!(
+            native_transfer_entry::installed_listing(code).contains("Ordinary x86-64 Lisp ABI")
+        );
     }
     let warm = [11, 22, 33, 44].map(EgclVal::from_fixnum);
     for _ in 0..2 {
@@ -67,7 +69,10 @@ fn ordinary_register_foreign_arguments_survive_gc_and_exceptional_retirement() {
     // Warm the middle descriptor again using the nonthrowing scalar branch;
     // the measured heap-argument call must enter that middle frame directly.
     for _ in 0..2 {
-        assert_eq!(run_native(&outer, symbol, &warm, &mut env).unwrap(), warm[1]);
+        assert_eq!(
+            run_native(&outer, symbol, &warm, &mut env).unwrap(),
+            warm[1]
+        );
     }
     // Allocate after warming/redefinition so the failing call must cross a
     // moving collection. Stress may promote early values during construction.
@@ -88,8 +93,11 @@ fn ordinary_register_foreign_arguments_survive_gc_and_exceptional_retirement() {
     native_transfer_entry::ordinary_calls::take_cold_calls_for_test();
     native_transfer_entry::ordinary_calls::take_named_entries_for_test();
     egcl_rt::rooted!(error = run_native(&outer, symbol, &arguments, &mut env).unwrap_err());
-    assert_eq!(native_transfer_entry::ordinary_calls::take_cold_calls_for_test(), 0,
-        "all generated edges are admitted");
+    assert_eq!(
+        native_transfer_entry::ordinary_calls::take_cold_calls_for_test(),
+        0,
+        "all generated edges are admitted"
+    );
     assert_eq!(
         native_transfer_entry::ordinary_calls::take_named_entries_for_test(),
         1,
@@ -127,21 +135,28 @@ fn ordinary_register_foreign_arguments_survive_gc_and_exceptional_retirement() {
         })
         .collect();
     assert_eq!(frames.len(), 2, "{trace:?}");
-    for (position, (frame, (name, indices))) in frames.iter().zip([
-        ("ORDINARY-REGISTER-ROOTS-MIDDLE", [3, 2, 1, 0]),
-        ("ORDINARY-REGISTER-ROOTS-OUTER", [0, 1, 2, 3]),
-    ]).enumerate() {
+    for (position, (frame, (name, indices))) in frames
+        .iter()
+        .zip([
+            ("ORDINARY-REGISTER-ROOTS-MIDDLE", [3, 2, 1, 0]),
+            ("ORDINARY-REGISTER-ROOTS-OUTER", [0, 1, 2, 3]),
+        ])
+        .enumerate()
+    {
         assert!(
             frame.function.as_deref().unwrap().ends_with(name),
             "{trace:?}"
         );
         // The root call enriches its existing managed segment anchor. Only
         // the physical-only middle call inserts a new native-origin row.
-        assert_eq!(frame.origin, if position == 0 {
-            FrameOrigin::Native
-        } else {
-            FrameOrigin::Managed
-        });
+        assert_eq!(
+            frame.origin,
+            if position == 0 {
+                FrameOrigin::Native
+            } else {
+                FrameOrigin::Managed
+            }
+        );
         let actual = frame
             .arguments
             .as_ref()

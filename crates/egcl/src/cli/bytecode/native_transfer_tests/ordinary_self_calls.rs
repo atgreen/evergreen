@@ -14,16 +14,23 @@ thread_local! {
 }
 
 fn replace_and_collect() {
-    if REPLACED.with(|flag| flag.replace(true)) { return; }
+    if REPLACED.with(|flag| flag.replace(true)) {
+        return;
+    }
     let source = REPLACEMENT.with(|source| source.borrow().clone());
     let env = NATIVE_ENV.with(Cell::get);
     assert!(!env.is_null());
-    unsafe { super::super::super::read_eval_all_env(&source, &mut *env).unwrap(); }
+    unsafe {
+        super::super::super::read_eval_all_env(&source, &mut *env).unwrap();
+    }
     let marker = MARKER.with(Cell::get);
     let before = unsafe { (*marker).to_raw() };
     egcl_rt::gc::full_gc().unwrap();
     MOVED.with(|flag| flag.set(unsafe { (*marker).to_raw() } != before));
-    assert!(MOVED.with(Cell::get), "argument must relocate while caller is published");
+    assert!(
+        MOVED.with(Cell::get),
+        "argument must relocate while caller is published"
+    );
 }
 
 fn at_self_cold() {
@@ -32,7 +39,9 @@ fn at_self_cold() {
 }
 
 fn before_self_call() {
-    if DYNAMIC.with(Cell::get) { replace_and_collect(); }
+    if DYNAMIC.with(Cell::get) {
+        replace_and_collect();
+    }
     // Arrive after the helper's return poll so the generated self edge
     // must still publish its caller and take cold admission.
     ordinary_t2::request_yield_after_return();
@@ -41,7 +50,8 @@ fn before_self_call() {
 struct Reset;
 impl Drop for Reset {
     fn drop(&mut self) {
-        native_transfer_entry::ordinary_calls::YIELD_AFTER_RETURN_TO_OWNER.with(|target| target.set(0));
+        native_transfer_entry::ordinary_calls::YIELD_AFTER_RETURN_TO_OWNER
+            .with(|target| target.set(0));
         ordinary_t2::RECURSIVE_LEAF_OBSERVER.with(|hook| hook.set(None));
         native_transfer_entry::ordinary_calls::SELF_COLD_OBSERVER.with(|hook| hook.set(None));
         MARKER.with(|slot| slot.set(std::ptr::null_mut()));
@@ -49,30 +59,64 @@ impl Drop for Reset {
 }
 
 fn exercise(notinline: bool) {
-    let _lock = super::super::super::heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = super::super::super::heap_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let mut env = Env::new(false);
     egcl_rt::rooted_ref!(_env = &mut env);
-    let name = if notinline { "ORDINARY-DYNAMIC-SELF-GC" } else { "ORDINARY-DIRECT-SELF-GC" };
-    let declaration = if notinline { format!("(declare (notinline {name}))") } else { String::new() };
-    let forms = format!("({declaration} (if (= n 0) (car marker) (progn (self-cold-observer) (+ ({name} 0 marker) 0))))");
-    super::super::super::read_eval_all_env(&format!(
-        "(defun self-cold-observer () (%ordinary-t2-entry-for-test))
+    let name = if notinline {
+        "ORDINARY-DYNAMIC-SELF-GC"
+    } else {
+        "ORDINARY-DIRECT-SELF-GC"
+    };
+    let declaration = if notinline {
+        format!("(declare (notinline {name}))")
+    } else {
+        String::new()
+    };
+    let forms = format!(
+        "({declaration} (if (= n 0) (car marker) (progn (self-cold-observer) (+ ({name} 0 marker) 0))))"
+    );
+    super::super::super::read_eval_all_env(
+        &format!(
+            "(defun self-cold-observer () (%ordinary-t2-entry-for-test))
          (defun {name} (n marker) {declaration}
-           (if (= n 0) (car marker) (progn (self-cold-observer) (+ ({name} 0 marker) 0))))"), &mut env).unwrap();
+           (if (= n 0) (car marker) (progn (self-cold-observer) (+ ({name} 0 marker) 0))))"
+        ),
+        &mut env,
+    )
+    .unwrap();
     let (symbol, code) = ordinary_t2::install(name, "(n marker)", &forms, &mut env);
     assert!(code.is_t2);
     let body = code.body.as_ref().expect("installed bytecode body");
-    let self_sites: Vec<_> = body.code.iter().enumerate().filter_map(|(pc, instruction)| {
-        matches!(instruction, Instr::CallNamed { sym, .. } if *sym == symbol)
-            .then_some(pc as u32)
-    }).collect();
-    assert_eq!(self_sites.len(), 1, "fixture must retain a real non-tail self call");
+    let self_sites: Vec<_> = body
+        .code
+        .iter()
+        .enumerate()
+        .filter_map(|(pc, instruction)| {
+            matches!(instruction, Instr::CallNamed { sym, .. } if *sym == symbol)
+                .then_some(pc as u32)
+        })
+        .collect();
+    assert_eq!(
+        self_sites.len(),
+        1,
+        "fixture must retain a real non-tail self call"
+    );
     if notinline {
-        assert!(body.self_call_sites.is_empty(), "NOTINLINE must prohibit direct self binding");
+        assert!(
+            body.self_call_sites.is_empty(),
+            "NOTINLINE must prohibit direct self binding"
+        );
     } else {
-        assert_eq!(body.self_call_sites, self_sites, "source whitelist must select the actual self call");
+        assert_eq!(
+            body.self_call_sites, self_sites,
+            "source whitelist must select the actual self call"
+        );
     }
-    let NativeCodeStorage::Mapped(mapped) = &code._storage else { panic!("ordinary code owner") };
+    let NativeCodeStorage::Mapped(mapped) = &code._storage else {
+        panic!("ordinary code owner")
+    };
     assert!(mapped.ordinary_entry.is_some());
     ordinary_t2::expect_entry(&code);
     egcl_rt::rooted!(marker = super::super::super::arena_cons(EgclVal::from_fixnum(71), NIL));
@@ -85,10 +129,14 @@ fn exercise(notinline: bool) {
     DYNAMIC.with(|flag| flag.set(notinline));
     let _reset = Reset;
     ordinary_t2::RECURSIVE_LEAF_OBSERVER.with(|hook| hook.set(Some(before_self_call)));
-    native_transfer_entry::ordinary_calls::SELF_COLD_OBSERVER.with(|hook| hook.set(Some(at_self_cold)));
+    native_transfer_entry::ordinary_calls::SELF_COLD_OBSERVER
+        .with(|hook| hook.set(Some(at_self_cold)));
     native_transfer_entry::ordinary_calls::take_cold_calls_for_test();
     egcl_rt::rooted!(result = run_native(&code, symbol, &args, &mut env).unwrap());
-    assert!(ordinary_t2::observed_entry(), "fixture must execute the installed ordinary owner");
+    assert!(
+        ordinary_t2::observed_entry(),
+        "fixture must execute the installed ordinary owner"
+    );
     assert!(REPLACED.with(Cell::get));
     assert!(MOVED.with(Cell::get));
     assert_eq!(SELF_COLD.with(Cell::get), !notinline);
@@ -96,17 +144,28 @@ fn exercise(notinline: bool) {
         assert_eq!(*result, EgclVal::from_fixnum(99));
     } else {
         assert!(native_transfer_entry::ordinary_calls::take_cold_calls_for_test() > 0);
-        assert_eq!(*result, EgclVal::from_fixnum(71), "cold self-call must read the moved marker in the retained old definition");
+        assert_eq!(
+            *result,
+            EgclVal::from_fixnum(71),
+            "cold self-call must read the moved marker in the retained old definition"
+        );
     }
     egcl_rt::rooted!(replacement = egcl_rt::symbols::symbol_function(symbol).unwrap());
-    assert_eq!(super::super::super::apply_function(*replacement, &args, &mut env).unwrap(),
-        EgclVal::from_fixnum(99), "fresh external calls must see replacement");
+    assert_eq!(
+        super::super::super::apply_function(*replacement, &args, &mut env).unwrap(),
+        EgclVal::from_fixnum(99),
+        "fresh external calls must see replacement"
+    );
 }
 
 #[test]
 #[ignore = "requires a platform-supported native segment transition"]
-fn ordinary_self_cold_keeps_exact_definition_across_replacement_and_gc() { exercise(false); }
+fn ordinary_self_cold_keeps_exact_definition_across_replacement_and_gc() {
+    exercise(false);
+}
 
 #[test]
 #[ignore = "requires a platform-supported native segment transition"]
-fn ordinary_notinline_self_observes_replacement_across_gc() { exercise(true); }
+fn ordinary_notinline_self_observes_replacement_across_gc() {
+    exercise(true);
+}

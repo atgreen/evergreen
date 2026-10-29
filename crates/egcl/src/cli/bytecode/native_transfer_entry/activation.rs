@@ -170,15 +170,27 @@ impl ActivationState {
             cleanup_conts: Vec::new(),
             dyn_binds: Vec::new(),
         };
-        state.handlers.try_reserve(code.guard_handler_capacity).map_err(|_| EgclError::Oom)?;
-        state.cleanup_conts.try_reserve(code.cleanup_depths.len()).map_err(|_| EgclError::Oom)?;
-        state.dyn_binds.try_reserve(special_capacity).map_err(|_| EgclError::Oom)?;
+        state
+            .handlers
+            .try_reserve(code.guard_handler_capacity)
+            .map_err(|_| EgclError::Oom)?;
+        state
+            .cleanup_conts
+            .try_reserve(code.cleanup_depths.len())
+            .map_err(|_| EgclError::Oom)?;
+        state
+            .dyn_binds
+            .try_reserve(special_capacity)
+            .map_err(|_| EgclError::Oom)?;
         Ok(Some(state))
     }
 
     /// Boxed, like the pool, so taking a state out of it and handing it back
     /// moves a pointer rather than the whole state (bliss-nkzx6).
-    pub(super) fn prepare_reusing(code: &TransferCode, env: &mut Env) -> Result<Box<Self>, EgclError> {
+    pub(super) fn prepare_reusing(
+        code: &TransferCode,
+        env: &mut Env,
+    ) -> Result<Box<Self>, EgclError> {
         let pooled = code.state_pool.borrow_mut().pop();
         let Some(mut state) = pooled else {
             return Self::prepare(code, env).map(Box::new);
@@ -259,7 +271,9 @@ impl ActivationState {
         FRESH_PREPARES.with(|count| count.set(count.get() + 1));
         let special_capacity = code.special_binds;
         let mut specials = Vec::new();
-        specials.try_reserve(special_capacity).map_err(|_| EgclError::Oom)?;
+        specials
+            .try_reserve(special_capacity)
+            .map_err(|_| EgclError::Oom)?;
         let guard_resume = Self::reserve_guard_resume(code, special_capacity)?;
         Self::reserve_env(code, env)?;
         let snapshots = code
@@ -330,9 +344,13 @@ impl ActivationState {
     }
 
     pub(super) fn is_quiescent(&self) -> bool {
-        self.catches.is_empty() && self.cleanups.is_empty() && self.specials.is_empty()
-            && self.handlers.is_empty() && self.handler_binds.is_empty()
-            && self.restart_cases.is_empty() && self.dynamic_scopes.is_empty()
+        self.catches.is_empty()
+            && self.cleanups.is_empty()
+            && self.specials.is_empty()
+            && self.handlers.is_empty()
+            && self.handler_binds.is_empty()
+            && self.restart_cases.is_empty()
+            && self.dynamic_scopes.is_empty()
             && self.can_osr()
     }
 
@@ -345,7 +363,10 @@ impl ActivationState {
     /// Commit scope ownership while the prepared destination is still traced
     /// through this source owner. No allocation separates the take and entry.
     pub(super) fn take_osr_state(&mut self) -> Box<Self> {
-        let ready = self.ready_osr.as_mut().expect("OSR was prepared before commit");
+        let ready = self
+            .ready_osr
+            .as_mut()
+            .expect("OSR was prepared before commit");
         ready.catches = std::mem::take(&mut self.catches);
         ready.cleanups = std::mem::take(&mut self.cleanups);
         ready.specials = std::mem::take(&mut self.specials);
@@ -360,9 +381,11 @@ impl ActivationState {
 
     pub(super) fn top_frame(&self, frame: *mut Frame) -> *mut Frame {
         match self.dynamic_scopes.last() {
-            Some(DynamicScope::HandlerCase { cluster_frame, .. }
+            Some(
+                DynamicScope::HandlerCase { cluster_frame, .. }
                 | DynamicScope::HandlerBind { cluster_frame, .. }
-                | DynamicScope::RestartCase { cluster_frame, .. }) => *cluster_frame,
+                | DynamicScope::RestartCase { cluster_frame, .. },
+            ) => *cluster_frame,
             None => frame,
         }
     }
@@ -383,7 +406,8 @@ impl ActivationState {
             owner: code,
             completed_deopt: false,
             recursive_enabled: code.recursive_symbol.is_some(),
-            recursive_profile: !code.is_t2 && !profiling_disabled()
+            recursive_profile: !code.is_t2
+                && !profiling_disabled()
                 && egcl_rt::function::is_interpreted_function(unsafe { (*frame).function }),
             recursive_generation: code.recursive_generation,
             native_recursive: None,

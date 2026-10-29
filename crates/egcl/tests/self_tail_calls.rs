@@ -206,8 +206,11 @@ fn the_loop_keeps_its_roots_straight_under_gc_stress() {
         .expect("run egcl");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "{stdout}
-{stderr}");
+    assert!(
+        output.status.success(),
+        "{stdout}
+{stderr}"
+    );
     expect(&stdout, &stderr, &["GC 3000 1 3000"]);
 }
 

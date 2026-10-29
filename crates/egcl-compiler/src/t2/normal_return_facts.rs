@@ -26,8 +26,7 @@ pub(crate) fn visit_argument_facts(f: &Function, inst: Inst, mut visit: impl FnM
         || d.flags.safepoint
         || d.flags.terminator
         || !d.targets.is_empty()
-        || d
-            .frame_state
+        || d.frame_state
             .is_none_or(|id| (id.0 as usize) >= f.frame_states.len())
         || d.args
             .iter()

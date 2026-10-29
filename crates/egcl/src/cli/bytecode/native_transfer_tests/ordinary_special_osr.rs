@@ -322,8 +322,9 @@ fn exercise_special_osr(guard: bool, throws: bool, repeated: bool) {
         "real dynamically scoped numeric speculation required"
     );
     let next = install_t2_completion(T2Completion {
-                    panicked: false,
-                    _permit: None, dependencies: Vec::new(),
+        panicked: false,
+        _permit: None,
+        dependencies: Vec::new(),
         sym: symbol,
         generation,
         artifact: Some(artifact),

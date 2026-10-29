@@ -56,7 +56,9 @@ const PROGRAM: &str = r#"
 fn run(env: &[(&str, &str)], args: &[&str]) -> (String, bool) {
     let mut command = Command::new("timeout");
     command.args(["--kill-after=10", "600", BIN]).args(args);
-    command.env_remove("EGCL_GC_STRESS").env_remove("EGCL_GC_POISON");
+    command
+        .env_remove("EGCL_GC_STRESS")
+        .env_remove("EGCL_GC_POISON");
     for (k, v) in env {
         command.env(k, v);
     }

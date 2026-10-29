@@ -193,7 +193,6 @@ const REGISTER_ENTRY_ARGS_MAX: usize = 3;
 /// them. Re-exported rather than redefined so one call site fills both.
 pub use super::emit_s390x::RuntimeCalls;
 
-
 #[derive(Clone, Copy)]
 enum Home {
     Register(u8),
@@ -801,7 +800,8 @@ impl Emitter<'_> {
             self.asm.word(a64::eor(W0, T1, W1));
             self.compare_imm(W0, 0);
             self.asm.jcc(Cc::Ge, truncated);
-            self.asm.word(a64::sub_imm(T0, T0, 1).ok_or(unsupported!())?);
+            self.asm
+                .word(a64::sub_imm(T0, T0, 1).ok_or(unsupported!())?);
             self.asm.word(a64::add(T1, T1, W1));
             self.asm.bind(truncated);
         }
@@ -889,8 +889,7 @@ impl Emitter<'_> {
         self.asm.bind(loaded);
         self.asm.word(a64::lsl_imm(W0, W0, 3));
         self.asm.word(
-            a64::orr_imm(W0, W0, egcl_rt::value::TAG_CHARACTER)
-                .expect("a tag is three bits"),
+            a64::orr_imm(W0, W0, egcl_rt::value::TAG_CHARACTER).expect("a tag is three bits"),
         );
         self.asm.jmp(done);
         self.asm.bind(fail);
@@ -1103,11 +1102,19 @@ impl Emitter<'_> {
         self.asm.jcc(Cc::Ne, deopt);
         self.checked_index(8, deopt)?;
         self.asm.word(
-            a64::add_imm(ADDR, ADDR, u64::try_from(data_offset).map_err(|_| unsupported!())?)
-                .ok_or(unsupported!())?,
+            a64::add_imm(
+                ADDR,
+                ADDR,
+                u64::try_from(data_offset).map_err(|_| unsupported!())?,
+            )
+            .ok_or(unsupported!())?,
         );
-        self.asm
-            .word(a64::add_shifted(ADDR, ADDR, T1, a64::Shift::Lsl(log2_width)));
+        self.asm.word(a64::add_shifted(
+            ADDR,
+            ADDR,
+            T1,
+            a64::Shift::Lsl(log2_width),
+        ));
         Ok(())
     }
 
@@ -1301,12 +1308,7 @@ impl Emitter<'_> {
         if data.args.len() != 1 || data.results.len() != 2 || bits <= 0 {
             return Err(EmitError::UnsupportedOp(op_tag(data.opcode)));
         }
-        if self
-            .function
-            .value(data.args[0])
-            .repr
-            != ValueRepresentation::Tagged
-        {
+        if self.function.value(data.args[0]).repr != ValueRepresentation::Tagged {
             return Err(EmitError::UnsupportedOp(op_tag(data.opcode)));
         }
         let failed = self.asm.label();
@@ -1386,8 +1388,7 @@ impl Emitter<'_> {
         // Untag, then shift. Saturated at 63 because a 61-bit payload shifted
         // further only ever yields 0 or -1, which the shift already gives.
         self.asm.word(a64::asr_imm(W0, W0, 3));
-        self.asm
-            .word(a64::asr_imm(W0, W0, bits.min(63) as u32));
+        self.asm.word(a64::asr_imm(W0, W0, bits.min(63) as u32));
         self.asm.bind(success);
         self.asm.word(a64::lsl_imm(W0, W0, 3));
         self.imm(W1, T.0);
@@ -1422,7 +1423,7 @@ impl Emitter<'_> {
     /// is negated, which modulo 2^64 yields exactly the low two's-complement
     /// octets the store wants.
     fn try_store_integer_octets(&mut self, data: &InstData) -> Result<(), EmitError> {
-        use egcl_rt::object::{type_id, ElementTypeTag};
+        use egcl_rt::object::{ElementTypeTag, type_id};
         // `...1To8` admits a span of 1..=8 bytes; `...8` is exactly eight.
         let partial = data.opcode == Opcode::TryStoreIntegerOctets1To8;
         if !matches!(
@@ -1560,7 +1561,8 @@ impl Emitter<'_> {
             .word(a64::tst_imm(K_END, 7).expect("7 is a logical immediate"));
         self.asm.jcc(Cc::Ne, failed);
         // start + 8 in the TAGGED domain, overflow-checked as the x86 arm does.
-        self.asm.word(a64::adds_imm(T0, K_START, 8 << 3).ok_or(unsupported!())?);
+        self.asm
+            .word(a64::adds_imm(T0, K_START, 8 << 3).ok_or(unsupported!())?);
         self.asm.jcc(Cc::O, failed);
         self.compare(K_END, T0);
         self.asm.jcc(Cc::Ne, if partial { short } else { failed });
@@ -1609,7 +1611,8 @@ impl Emitter<'_> {
             self.asm.word(a64::extr(K_WORD, W1, K_WORD, 8));
             self.asm
                 .word(a64::add_imm(ADDR, ADDR, 1).expect("1 fits the immediate field"));
-            self.asm.word(a64::subs_imm(T0, T0, 8).ok_or(unsupported!())?);
+            self.asm
+                .word(a64::subs_imm(T0, T0, 8).ok_or(unsupported!())?);
             self.asm.jcc(Cc::Ne, again);
             // Any canonical one-limb integer shifted right by 8 fits a fixnum.
             self.asm.word(a64::lsl_imm(K_FINAL, K_WORD, 3));
@@ -2122,7 +2125,9 @@ impl Emitter<'_> {
             .ok_or(EmitError::UnsupportedOp(op_tag(data.opcode)))?;
         self.load(first, W0)?;
         match data.opcode {
-            Guard if matches!(&data.aux, AuxData::TypeTag(ty) if ty.bits == TypeBits::FIXNUM || ty.bits == TypeBits::SINGLE_FLOAT || ty.bits == TypeBits::CONS) || matches!(&data.aux, AuxData::EndpList) =>
+            Guard
+                if matches!(&data.aux, AuxData::TypeTag(ty) if ty.bits == TypeBits::FIXNUM || ty.bits == TypeBits::SINGLE_FLOAT || ty.bits == TypeBits::CONS)
+                    || matches!(&data.aux, AuxData::EndpList) =>
             {
                 // CONS matters as much as the numeric tags: build.rs emits a
                 // separate Guard(TypeTag(CONS)) ahead of every Car/Cdr, so
@@ -2144,9 +2149,7 @@ impl Emitter<'_> {
                         self.guard_fixnum_range(ty, deopt)?;
                     }
                     AuxData::TypeTag(ty) if ty.bits == TypeBits::CONS => self.guard_cons(W0, deopt),
-                    AuxData::EndpList => {
-                        self.guard_list(W0, deopt)?
-                    }
+                    AuxData::EndpList => self.guard_list(W0, deopt)?,
                     _ => self.guard_single_float(W0, deopt),
                 }
             }

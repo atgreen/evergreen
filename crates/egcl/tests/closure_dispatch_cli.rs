@@ -91,6 +91,9 @@ fn a_function_argument_dispatches_to_function_not_list() {
         "TEMPLATE-WRAPS T",
         "CLOSURE-DISPATCH-OK",
     ] {
-        assert!(stdout.contains(expected), "missing {expected:?} in:\n{stdout}");
+        assert!(
+            stdout.contains(expected),
+            "missing {expected:?} in:\n{stdout}"
+        );
     }
 }

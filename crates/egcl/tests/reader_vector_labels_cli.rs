@@ -18,8 +18,10 @@ fn checked(program: &str) -> String {
 
 #[test]
 fn circular_reader_labels_preserve_graph_identity() {
-    assert!(checked(include_str!("fixtures/reader-vector-labels.lisp"))
-        .contains("READER-VECTOR-LABELS-OK"));
+    assert!(
+        checked(include_str!("fixtures/reader-vector-labels.lisp"))
+            .contains("READER-VECTOR-LABELS-OK")
+    );
 }
 
 #[test]
@@ -48,8 +50,10 @@ fn circular_reader_labels_survive_source_free_compiled_files() {
         fasl.to_str().unwrap()
     ));
     std::fs::remove_file(source).unwrap();
-    assert!(checked(&format!("(load {:?})", fasl.to_str().unwrap()))
-        .contains("READER-VECTOR-LABELS-OK"));
+    assert!(
+        checked(&format!("(load {:?})", fasl.to_str().unwrap()))
+            .contains("READER-VECTOR-LABELS-OK")
+    );
     std::fs::remove_file(fasl).unwrap();
     std::fs::remove_dir(dir).unwrap();
 }

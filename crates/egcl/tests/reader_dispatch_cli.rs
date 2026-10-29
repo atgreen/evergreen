@@ -91,7 +91,8 @@ fn stream_read_executes_each_reader_macro_once() {
 fn file_read_executes_each_reader_macro_once() {
     let path = std::env::temp_dir().join(format!("egcl-reader-once-{}.lisp", std::process::id()));
     std::fs::write(&path, "(#h\"abc\" #h\"def\") 9").unwrap();
-    run(&format!(r##"
+    run(&format!(
+        r##"
       (let ((*readtable* (copy-readtable nil)) (calls 0))
         (set-dispatch-macro-character #\# #\h
           (lambda (s c n)
@@ -104,7 +105,9 @@ fn file_read_executes_each_reader_macro_once() {
           (assert (= (read s) 9))
           (assert (eq (read s nil :eof) :eof))))
       (format t "DISPATCH-OK~%")
-    "##, path.to_str().unwrap()));
+    "##,
+        path.to_str().unwrap()
+    ));
     std::fs::remove_file(path).unwrap();
 }
 

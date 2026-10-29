@@ -551,5 +551,4 @@ mod tests {
         let ash = resolve_sym("ASH").unwrap().as_symbol_index();
         assert!(matches!(compiled.code[pc], Instr::CallNamed { sym, .. } if sym == ash));
     }
-
 }

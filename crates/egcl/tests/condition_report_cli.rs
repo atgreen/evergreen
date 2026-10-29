@@ -177,8 +177,10 @@ fn a_subclass_report_outranks_the_builtin_shape() {
 #[test]
 fn conditions_without_a_report_are_unchanged() {
     reports(
-        &["(handler-case (error 'type-error :datum 7 :expected-type 'string) \
-             (error (e) (format t \"~a\" e)))"],
+        &[
+            "(handler-case (error 'type-error :datum 7 :expected-type 'string) \
+             (error (e) (format t \"~a\" e)))",
+        ],
         "The value 7 is not of type STRING.",
         false,
     );

@@ -34,19 +34,19 @@
 //! presented before it was found.
 
 use super::{
-    BytecodeFunction, DIRECT_CALL_GEN, FixnumOp, NativeEmission, NativeEnvNames, UnaryFixnumOp, c2i_alloc_cons,
-    c2i_call_builtin, c2i_call_slice, c2i_clear_mv, c2i_define_env, c2i_deopt_state, c2i_eval_host,
-    c2i_load_env, c2i_load_function, c2i_load_global, c2i_make_bytecode_closure,
-    c2i_make_closure, c2i_osr_backedge,
-    c2i_pop_env_child, c2i_push_env_child, c2i_store_env, c2i_store_global, c2i_t1_backedge,
-    c2i_take_values, c2i_transfer_pending, c2i_typep_class, c2i_values_to_list,
-    call_site_profile_token, inlinable_fixnum_op, inlinable_unary_fixnum_op, registry_get,
-    resolve_sym, t2_backedge_threshold, t2_log_write,
+    BytecodeFunction, DIRECT_CALL_GEN, FixnumOp, NativeEmission, NativeEnvNames, UnaryFixnumOp,
+    c2i_alloc_cons, c2i_call_builtin, c2i_call_slice, c2i_clear_mv, c2i_define_env,
+    c2i_deopt_state, c2i_eval_host, c2i_load_env, c2i_load_function, c2i_load_global,
+    c2i_make_bytecode_closure, c2i_make_closure, c2i_osr_backedge, c2i_pop_env_child,
+    c2i_push_env_child, c2i_store_env, c2i_store_global, c2i_t1_backedge, c2i_take_values,
+    c2i_transfer_pending, c2i_typep_class, c2i_values_to_list, call_site_profile_token,
+    inlinable_fixnum_op, inlinable_unary_fixnum_op, registry_get, resolve_sym,
+    t2_backedge_threshold, t2_log_write,
 };
-use egcl_rt::bytecode::VarLoc;
 use egcl_rt::asm::Cc;
 use egcl_rt::asm_ppc64le::{Asm, Label, frame};
 use egcl_rt::bytecode::Instr;
+use egcl_rt::bytecode::VarLoc;
 use egcl_rt::value::{EgclVal, NIL, T};
 
 /// Frame slots; local `i` lives at `[SLOTS + 8*i]`.
@@ -191,7 +191,8 @@ pub(super) fn emit_native_ppc64le(
     let eval_host_addr = c2i_eval_host as extern "C" fn(u64) -> u64 as usize as u64;
     let make_closure_addr = c2i_make_closure as extern "C" fn(u64) -> u64 as usize as u64;
     let make_bytecode_closure_addr = c2i_make_bytecode_closure
-        as extern "C" fn(*const std::sync::Arc<BytecodeFunction>, u64) -> u64 as usize as u64;
+        as extern "C" fn(*const std::sync::Arc<BytecodeFunction>, u64) -> u64
+        as usize as u64;
     let alloc_cons_addr = c2i_alloc_cons as extern "C" fn(u64, u64) -> u64 as usize as u64;
     let take_values_addr = c2i_take_values as extern "C" fn(u64, *mut EgclVal, u64) as usize as u64;
     let values_to_list_addr = c2i_values_to_list as extern "C" fn(u64) -> u64 as usize as u64;
@@ -608,9 +609,13 @@ fn emit_fixnum_template(
 ) -> Option<bool> {
     let supported = (nargs == 1 && inlinable_unary_fixnum_op(sym).is_some())
         || (nargs == 2 && inlinable_fixnum_op(sym).is_some_and(|op| !matches!(op, FixnumOp::Mul)));
-    if !supported { return Some(false); }
+    if !supported {
+        return Some(false);
+    }
     use egcl_compiler::t2::builtin_binding::{self, Binding};
-    let Some(binding) = builtin_binding::snapshot(sym) else { return Some(false); };
+    let Some(binding) = builtin_binding::snapshot(sym) else {
+        return Some(false);
+    };
     if let Binding::Guarded { address, expected } = binding {
         let deopt = *deopts.entry(bcp).or_insert_with(|| c.label());
         c.imm64(ACC, address as u64);

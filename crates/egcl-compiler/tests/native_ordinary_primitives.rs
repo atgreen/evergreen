@@ -68,7 +68,8 @@ fn global_value_read_compiles_through_the_ordinary_abi() {
         &f,
         OrdinaryLispEntryOptions {
             arity: 0,
-            arity_error_veneer: 1, binding: None,
+            arity_error_veneer: 1,
+            binding: None,
         },
         &targets,
         OrdinaryCallFlags {
@@ -187,7 +188,8 @@ fn semantic_store_keeps_its_continuation_and_discards_the_primary() {
         &f,
         OrdinaryLispEntryOptions {
             arity: 0,
-            arity_error_veneer: 1, binding: None,
+            arity_error_veneer: 1,
+            binding: None,
         },
         &targets,
         OrdinaryCallFlags {
@@ -259,25 +261,54 @@ fn dead_incoming_multiple_values_are_normalized_before_primitive_entry() {
     let entry = f.entry();
     let primitive = f.block(entry).insts[0];
     let return_inst = f.block_mut(entry).insts.pop().unwrap();
-    let (call, _) = f.push_inst(entry, InstData {
-        opcode: Opcode::Call, args: vec![], results: vec![],
-        aux: AuxData::CallTarget(99),
-        flags: InstFlags { call: true, safepoint: true, effectful: true, ..Default::default() },
-        targets: vec![], frame_state: None, source_pos: 0,
-    }, &[(IRType::TOP, ValueRepresentation::Tagged)]);
+    let (call, _) = f.push_inst(
+        entry,
+        InstData {
+            opcode: Opcode::Call,
+            args: vec![],
+            results: vec![],
+            aux: AuxData::CallTarget(99),
+            flags: InstFlags {
+                call: true,
+                safepoint: true,
+                effectful: true,
+                ..Default::default()
+            },
+            targets: vec![],
+            frame_state: None,
+            source_pos: 0,
+        },
+        &[(IRType::TOP, ValueRepresentation::Tagged)],
+    );
     let layout = &mut f.block_mut(entry).insts;
     assert_eq!(layout.pop(), Some(call));
     layout.insert(0, call);
-    f.push_inst(entry, InstData {
-        opcode: Opcode::ClearMv, args: vec![], results: vec![], aux: AuxData::None,
-        flags: InstFlags { call: true, safepoint: true, effectful: true, ..Default::default() },
-        targets: vec![], frame_state: None, source_pos: 1,
-    }, &[]);
+    f.push_inst(
+        entry,
+        InstData {
+            opcode: Opcode::ClearMv,
+            args: vec![],
+            results: vec![],
+            aux: AuxData::None,
+            flags: InstFlags {
+                call: true,
+                safepoint: true,
+                effectful: true,
+                ..Default::default()
+            },
+            targets: vec![],
+            frame_state: None,
+            source_pos: 1,
+        },
+        &[],
+    );
     f.block_mut(entry).insts.push(return_inst);
     egcl_compiler::t2::verify::verify(&f).unwrap();
     assert_eq!(lower_ordinary_primitives(&mut f, |_| Some(77)).unwrap(), 1);
     egcl_compiler::t2::verify::verify(&f).unwrap();
-    assert!(egcl_compiler::t2::opt_clear_mv::single_value_state(&f, true).contains(&primitive),
-        "the old tuple must be normalized before the ordinary adapter's entry");
+    assert!(
+        egcl_compiler::t2::opt_clear_mv::single_value_state(&f, true).contains(&primitive),
+        "the old tuple must be normalized before the ordinary adapter's entry"
+    );
     assert_eq!(f.inst(primitive).opcode, Opcode::Call);
 }

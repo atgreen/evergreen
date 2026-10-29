@@ -32,7 +32,10 @@ impl egcl_rt::gc::TraceHostRoots for ArityRoots {
 
 // The assembly request and every actual incoming word stay writable and live
 // throughout body. No references to those values cross a possible collection.
-pub(in crate::cli::bytecode) unsafe fn with_entry_roots<R>(request: *mut OrdinaryArityRequest, body: impl FnOnce() -> R) -> R {
+pub(in crate::cli::bytecode) unsafe fn with_entry_roots<R>(
+    request: *mut OrdinaryArityRequest,
+    body: impl FnOnce() -> R,
+) -> R {
     let mut roots = ArityRoots(request);
     egcl_rt::rooted_ref!(_roots = &mut roots);
     body()
@@ -54,8 +57,9 @@ static NAMED_ENTRIES: egcl_rt::execution_local::ExecutionLocal<Cell<usize>> =
 #[cfg(test)]
 type SelfColdObserver = Cell<Option<fn()>>;
 #[cfg(test)]
-pub(in crate::cli::bytecode) static SELF_COLD_OBSERVER: egcl_rt::execution_local::ExecutionLocal<SelfColdObserver> =
-    unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| const { Cell::new(None) }) };
+pub(in crate::cli::bytecode) static SELF_COLD_OBSERVER: egcl_rt::execution_local::ExecutionLocal<
+    SelfColdObserver,
+> = unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| const { Cell::new(None) }) };
 #[cfg(test)]
 pub(in crate::cli::bytecode) fn take_named_entries_for_test() -> usize {
     NAMED_ENTRIES.with(|count| count.replace(0))
@@ -83,19 +87,31 @@ unsafe fn refresh_control(control: *mut NativeRecursiveControl) {
 /// Return to generated code with notifications serviced and result roots live.
 ///
 /// The caller must retain its `root_publication::published` boundary.
-pub(in crate::cli::bytecode) unsafe fn finish(result: Result<EgclVal, EgclError>, out: *mut OrdinaryHelperOutcome) {
-    let result = result.and_then(|value| guard_c2i(|| {
-        egcl_rt::rooted!(value = value);
-        if !native_error_pending() && egcl_rt::thread::current_execution_poll_pending() {
-            #[cfg(test)]
-            if let Some(observe) = RETURN_ROOTED_OBSERVER.with(Cell::get) {
-                unsafe { observe(std::ptr::from_mut(&mut *value)); }
+pub(in crate::cli::bytecode) unsafe fn finish(
+    result: Result<EgclVal, EgclError>,
+    out: *mut OrdinaryHelperOutcome,
+) {
+    let result = result.and_then(|value| {
+        guard_c2i(|| {
+            egcl_rt::rooted!(value = value);
+            if !native_error_pending() && egcl_rt::thread::current_execution_poll_pending() {
+                #[cfg(test)]
+                if let Some(observe) = RETURN_ROOTED_OBSERVER.with(Cell::get) {
+                    unsafe {
+                        observe(std::ptr::from_mut(&mut *value));
+                    }
+                }
+                let mut poll = NativeOutcome {
+                    value: NIL,
+                    exit: NativeExit::Returned,
+                };
+                unsafe {
+                    poll_or_transfer_unpublished(std::ptr::null_mut(), &mut poll);
+                }
             }
-            let mut poll = NativeOutcome { value: NIL, exit: NativeExit::Returned };
-            unsafe { poll_or_transfer_unpublished(std::ptr::null_mut(), &mut poll); }
-        }
-        Ok(*value)
-    }));
+            Ok(*value)
+        })
+    });
     let value = match result {
         Ok(value) => value,
         Err(error) => {
@@ -162,7 +178,9 @@ pub(super) unsafe extern "C" fn cold_call(
                     0 => {}
                     1 => {
                         let boundary = root_publication::ACTIVE.with(Cell::get);
-                        if boundary.is_null() { return Err(invalid_capture()); }
+                        if boundary.is_null() {
+                            return Err(invalid_capture());
+                        }
                         let boundary = &*boundary;
                         if boundary.owner.is_null() || (*boundary.owner).ordinary_entry.is_none() {
                             return Err(invalid_capture());
@@ -171,7 +189,9 @@ pub(super) unsafe extern "C" fn cold_call(
                         // exact identity. Release the directory borrow before
                         // the GC gate can park; resolve before polling can
                         // replace the public definition.
-                        let retained = boundary.directory.callable_for_pc(boundary.cursor.pc)
+                        let retained = boundary
+                            .directory
+                            .callable_for_pc(boundary.cursor.pc)
                             .ok_or_else(invalid_capture)?;
                         retained.with_gc_stable_mutator(|value| *self_callable = *value);
                         if !egcl_rt::function::is_interpreted_function(*self_callable) {
@@ -189,7 +209,9 @@ pub(super) unsafe extern "C" fn cold_call(
                 #[cfg(test)]
                 if (*request).reserved == 1
                     && let Some(observe) = SELF_COLD_OBSERVER.with(Cell::get)
-                { observe(); }
+                {
+                    observe();
+                }
                 let mut poll = NativeOutcome {
                     value: NIL,
                     exit: NativeExit::Returned,
@@ -200,7 +222,9 @@ pub(super) unsafe extern "C" fn cold_call(
                 }
                 if (*request).reserved == 1 {
                     let env = NATIVE_ENV.with(Cell::get);
-                    if env.is_null() { return Err(invalid_capture()); }
+                    if env.is_null() {
+                        return Err(invalid_capture());
+                    }
                     apply_function(*self_callable, &args, &mut *env)
                 } else {
                     super::super::call_table::ordinary_call((*request).symbol as u32, &args)
@@ -234,7 +258,9 @@ pub(in crate::cli::bytecode) unsafe extern "C" fn named_entry(
                     .expect("ordinary named adapter owns an execution");
                 let control = (*execution).active_native_control() as *mut NativeRecursiveControl;
                 let result = guard_c2i(|| {
-                    if native_error_pending() { return Ok(NIL); }
+                    if native_error_pending() {
+                        return Ok(NIL);
+                    }
                     let count = (*request).nargs;
                     let registers = &(&(*request).register_args)[..count.min(3)];
                     let overflow = if count > 3 {
@@ -244,9 +270,14 @@ pub(in crate::cli::bytecode) unsafe extern "C" fn named_entry(
                     };
                     // Common arities need no heap buffer (GitHub #487).
                     egcl_rt::rooted!(args = EntryArgs::from_parts(registers, overflow));
-                    let mut poll = NativeOutcome { value: NIL, exit: NativeExit::Returned };
+                    let mut poll = NativeOutcome {
+                        value: NIL,
+                        exit: NativeExit::Returned,
+                    };
                     poll_or_transfer_unpublished(std::ptr::null_mut(), &mut poll);
-                    if poll.exit != NativeExit::Returned { return Ok(NIL); }
+                    if poll.exit != NativeExit::Returned {
+                        return Ok(NIL);
+                    }
                     super::super::call_table::ordinary_call_cell(cell, args.as_slice())
                 });
                 refresh_control(control);
@@ -277,7 +308,9 @@ pub(super) unsafe extern "C" fn keyword_decline(
                     .expect("ordinary keyword entry owns an execution");
                 let control = (*execution).active_native_control() as *mut NativeRecursiveControl;
                 let result = guard_c2i(|| {
-                    if native_error_pending() { return Ok(NIL); }
+                    if native_error_pending() {
+                        return Ok(NIL);
+                    }
                     // The retained code owns this body for as long as its
                     // entry can be called.
                     let body = (*request).entry_data as *const BytecodeFunction;
@@ -291,16 +324,30 @@ pub(super) unsafe extern "C" fn keyword_decline(
                         &[]
                     };
                     egcl_rt::rooted!(args = EntryArgs::from_parts(registers, overflow));
-                    let mut poll = NativeOutcome { value: NIL, exit: NativeExit::Returned };
+                    let mut poll = NativeOutcome {
+                        value: NIL,
+                        exit: NativeExit::Returned,
+                    };
                     poll_or_transfer_unpublished(std::ptr::null_mut(), &mut poll);
-                    if poll.exit != NativeExit::Returned { return Ok(NIL); }
+                    if poll.exit != NativeExit::Returned {
+                        return Ok(NIL);
+                    }
                     let env = NATIVE_ENV.with(Cell::get);
-                    if env.is_null() { return Err(invalid_capture()); }
+                    if env.is_null() {
+                        return Err(invalid_capture());
+                    }
                     let symbol = super::super::resolve_sym(&body.name)
-                        .map(EgclVal::as_symbol_index).ok_or_else(invalid_capture)?;
-                    egcl_rt::rooted!(function = egcl_rt::symbols::symbol_function(symbol).unwrap_or(NIL));
+                        .map(EgclVal::as_symbol_index)
+                        .ok_or_else(invalid_capture)?;
+                    egcl_rt::rooted!(
+                        function = egcl_rt::symbols::symbol_function(symbol).unwrap_or(NIL)
+                    );
                     if callable_definition_matches(symbol, *function, Arc::as_ptr(&body)) {
-                        super::super::super::apply_function_impl(*function, args.as_slice(), &mut *env)
+                        super::super::super::apply_function_impl(
+                            *function,
+                            args.as_slice(),
+                            &mut *env,
+                        )
                     } else {
                         super::super::run_with_sym(body, args.as_slice(), NIL, symbol, &mut *env)
                     }
@@ -322,7 +369,9 @@ pub(super) unsafe extern "C" fn guard(
         root_publication::published(image, || {
             let result = guard_c2i(|| deopt::resume_ordinary_guard(request));
             if result.is_ok() {
-                refresh_control((*request.cast::<egcl_compiler::t2::emit::OrdinaryGuardRequest>()).control);
+                refresh_control(
+                    (*request.cast::<egcl_compiler::t2::emit::OrdinaryGuardRequest>()).control,
+                );
             }
             finish(result, out);
         });
@@ -360,9 +409,15 @@ pub(super) unsafe extern "C" fn wrong_arguments(
                     if !super::super::arity_accepts(body, args.len()) {
                         let (min, max) = (usize::from(body.min_args), usize::from(body.arity));
                         return Err(EgclError::ProgramError(if min == max {
-                            format!("wrong number of arguments: expected {max}, got {}", args.len())
+                            format!(
+                                "wrong number of arguments: expected {max}, got {}",
+                                args.len()
+                            )
                         } else {
-                            format!("wrong number of arguments: expected {min} to {max}, got {}", args.len())
+                            format!(
+                                "wrong number of arguments: expected {min} to {max}, got {}",
+                                args.len()
+                            )
                         }));
                     }
                     validate_declared_args(body, &args)?;
@@ -378,7 +433,11 @@ pub(super) unsafe extern "C" fn wrong_arguments(
 /// The arity veneer's entry data for an entry accepting `min..=max`
 /// arguments: the count itself for a fixed entry, as before.
 pub(super) fn expected_arguments(min: u16, max: u16) -> usize {
-    if min == max { usize::from(max) } else { (usize::from(min) + 1) << 32 | usize::from(max) }
+    if min == max {
+        usize::from(max)
+    } else {
+        (usize::from(min) + 1) << 32 | usize::from(max)
+    }
 }
 
 fn expected_range(data: usize) -> (usize, usize) {
@@ -423,9 +482,15 @@ pub(super) unsafe extern "C" fn wrong_arity(
                     }
                     let (min, max) = expected_range((*request).entry_data);
                     Err(EgclError::ProgramError(if min == max {
-                        format!("wrong number of arguments: expected {max}, got {}", args.len())
+                        format!(
+                            "wrong number of arguments: expected {max}, got {}",
+                            args.len()
+                        )
                     } else {
-                        format!("wrong number of arguments: expected {min} to {max}, got {}", args.len())
+                        format!(
+                            "wrong number of arguments: expected {min} to {max}, got {}",
+                            args.len()
+                        )
                     }))
                 });
                 finish(result, out);
@@ -557,7 +622,8 @@ mod tests {
             &ir,
             egcl_compiler::t2::emit::OrdinaryLispEntryOptions {
                 arity: 1,
-                arity_error_veneer: code.as_ptr() as u64, binding: None,
+                arity_error_veneer: code.as_ptr() as u64,
+                binding: None,
             },
         )
         .unwrap();
@@ -645,17 +711,29 @@ mod tests {
         assert_eq!(unsafe { (*request).entry_data }, 1);
         let anchor = native_transfer::current_segment();
         assert!(!anchor.is_null());
-        assert_eq!(unsafe { (*request).overflow_args } as usize, unsafe { (*anchor).saved_sp });
+        assert_eq!(unsafe { (*request).overflow_args } as usize, unsafe {
+            (*anchor).saved_sp
+        });
         let before = OVERFLOW_BEFORE.with(Cell::get);
         // Stress allocation may already age these objects into Survivor.
         egcl_rt::HeapCollector::new().full_gc().unwrap();
         let request = unsafe { &*request };
-        for (index, value) in request.register_args.iter()
+        for (index, value) in request
+            .register_args
+            .iter()
             .chain(unsafe { std::slice::from_raw_parts(request.overflow_args, 4) })
-            .chain(std::iter::once(&request.closure)).enumerate()
+            .chain(std::iter::once(&request.closure))
+            .enumerate()
         {
-            assert_ne!(value.to_raw(), before[index], "incoming home {index} must relocate");
-            assert_eq!(crate::cli::cp(*value), (EgclVal::from_fixnum(index as i64), NIL));
+            assert_ne!(
+                value.to_raw(),
+                before[index],
+                "incoming home {index} must relocate"
+            );
+            assert_eq!(
+                crate::cli::cp(*value),
+                (EgclVal::from_fixnum(index as i64), NIL)
+            );
         }
         OVERFLOW_OBSERVED.with(|observed| observed.set(true));
     }
@@ -671,7 +749,8 @@ mod tests {
         for index in 0..8 {
             values.push(crate::cli::arena_cons(EgclVal::from_fixnum(index), NIL));
         }
-        OVERFLOW_BEFORE.with(|before| before.set(std::array::from_fn(|index| values[index].to_raw())));
+        OVERFLOW_BEFORE
+            .with(|before| before.set(std::array::from_fn(|index| values[index].to_raw())));
         OVERFLOW_OBSERVED.with(|moved| moved.set(false));
         struct RestoreObserver(Option<unsafe fn(*mut OrdinaryArityRequest)>);
         impl Drop for RestoreObserver {
@@ -679,9 +758,10 @@ mod tests {
                 ARITY_ROOTED_OBSERVER.with(|observe| observe.set(self.0));
             }
         }
-        let _observer = RestoreObserver(ARITY_ROOTED_OBSERVER.with(|observe| {
-            observe.replace(Some(collect_seven_in_arity_helper))
-        }));
+        let _observer = RestoreObserver(
+            ARITY_ROOTED_OBSERVER
+                .with(|observe| observe.replace(Some(collect_seven_in_arity_helper))),
+        );
         let code = JitBuffer::new(
             &egcl_compiler::t2::native_transfer::emit_ordinary_arity_veneer(wrong_arity, 1),
         )
@@ -709,7 +789,8 @@ mod tests {
             &ir,
             egcl_compiler::t2::emit::OrdinaryLispEntryOptions {
                 arity: 1,
-                arity_error_veneer: code.as_ptr() as u64, binding: None,
+                arity_error_veneer: code.as_ptr() as u64,
+                binding: None,
             },
         )
         .unwrap();
@@ -746,7 +827,9 @@ mod tests {
 
     #[test]
     fn ordinary_cold_self_requires_a_retained_native_owner() {
-        let _lock = crate::cli::heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::cli::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut env = Env::new(false);
         egcl_rt::rooted_ref!(_env = &mut env);
         let mut entry = EntryGuard {
@@ -757,21 +840,32 @@ mod tests {
         egcl_rt::rooted_ref!(_entry = &mut entry);
         let code = JitBuffer::new(
             &egcl_compiler::t2::native_transfer::emit_ordinary_published_veneer(cold_call),
-        ).unwrap();
+        )
+        .unwrap();
         for reserved in [1, 2] {
             let mut request = OrdinaryColdRequest {
                 symbol: u64::from(egcl_rt::symbols::intern("VALUES")),
-                nargs: 0, args: std::ptr::null_mut(), closure: NIL,
-                control: std::ptr::null_mut(), descriptor_slot: 0,
-                revision_address: 0, reserved,
+                nargs: 0,
+                args: std::ptr::null_mut(),
+                closure: NIL,
+                control: std::ptr::null_mut(),
+                descriptor_slot: 0,
+                revision_address: 0,
+                reserved,
             };
             let result = unsafe {
                 native_transfer::invoke_native_segment(
-                    code.as_ptr(), std::ptr::from_mut(&mut request).cast(), egcl_rt::current_stack(),
+                    code.as_ptr(),
+                    std::ptr::from_mut(&mut request).cast(),
+                    egcl_rt::current_stack(),
                 )
-            }.unwrap();
-            assert_eq!(result.exit, NativeExit::Transfer,
-                "self without an owner and unknown flags must not resolve the global VALUES cell");
+            }
+            .unwrap();
+            assert_eq!(
+                result.exit,
+                NativeExit::Transfer,
+                "self without an owner and unknown flags must not resolve the global VALUES cell"
+            );
             assert!(NATIVE_ERROR.with(|slot| slot.take()).is_some());
         }
     }

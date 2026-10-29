@@ -93,16 +93,29 @@ fn packed_sequences_preserve_storage_check_types_and_box_under_collection() {
 }
 
 fn packed_array_wrappers_preserve_roots_and_storage() {
-    egcl_rt::rooted!(array = sequences::build_double_float_complex_vector(2, 2, true, 1.5, true).unwrap());
+    egcl_rt::rooted!(
+        array = sequences::build_double_float_complex_vector(2, 2, true, 1.5, true).unwrap()
+    );
     let before = array.to_raw();
     assert_eq!(sequences::aref(*array, 1).unwrap().as_double_float(), 1.5);
     assert_ne!(before, array.to_raw(), "boxing must relocate the wrapper");
     egcl_rt::rooted!(value = egcl_rt::gc::alloc_double_float(7.25));
-    assert_eq!(sequences::vector_push_extend(*array, *value, Some(1)).unwrap().as_fixnum(), 2);
+    assert_eq!(
+        sequences::vector_push_extend(*array, *value, Some(1))
+            .unwrap()
+            .as_fixnum(),
+        2
+    );
     assert_eq!(sequences::cvec_capacity(*array), 3);
-    assert_eq!(sequences::vector_pop(*array).unwrap().as_double_float(), 7.25);
+    assert_eq!(
+        sequences::vector_pop(*array).unwrap().as_double_float(),
+        7.25
+    );
     assert_eq!(sequences::length(*array).unwrap(), 2);
-    egcl_rt::rooted!(view = sequences::build_double_float_displaced_vector(*array, 1, 2, 2, false, false).unwrap());
+    egcl_rt::rooted!(
+        view =
+            sequences::build_double_float_displaced_vector(*array, 1, 2, 2, false, false).unwrap()
+    );
     assert_eq!(sequences::double_float_array_element(*view, 1), Some(7.25));
     sequences::set_aref(*view, 0, *value).unwrap();
     assert_eq!(sequences::double_float_array_element(*array, 1), Some(7.25));
@@ -117,24 +130,40 @@ fn packed_array_wrappers_preserve_roots_and_storage() {
     assert!(sequences::set_aref(*view, 0, egcl_rt::value::NIL).is_err());
     assert!(sequences::aref(*view, 2).is_err());
     use egcl_stdlib::hashtable::{self, HashTest, MakeHashTableOptions};
-    egcl_rt::rooted!(table = hashtable::make_hash_table(&MakeHashTableOptions {
-        test: HashTest::Equalp, ..Default::default()
-    }).unwrap());
+    egcl_rt::rooted!(
+        table = hashtable::make_hash_table(&MakeHashTableOptions {
+            test: HashTest::Equalp,
+            ..Default::default()
+        })
+        .unwrap()
+    );
     egcl_rt::rooted!(zero = packed_f64::make(2, -0.0).unwrap());
     hashtable::set_gethash(*zero, *table, EgclVal::from_fixnum(91)).unwrap();
     egcl_rt::rooted!(same = packed_f64::make(2, 0.0).unwrap());
-    assert_eq!(hashtable::gethash(*same, *table, egcl_rt::value::NIL).unwrap(), (EgclVal::from_fixnum(91), true));
+    assert_eq!(
+        hashtable::gethash(*same, *table, egcl_rt::value::NIL).unwrap(),
+        (EgclVal::from_fixnum(91), true)
+    );
     egcl_rt::rooted!(general = egcl_stdlib::build_simple_vector(&[EgclVal::from_fixnum(0); 2]));
-    assert_eq!(hashtable::gethash(*general, *table, egcl_rt::value::NIL).unwrap(), (EgclVal::from_fixnum(91), true));
+    assert_eq!(
+        hashtable::gethash(*general, *table, egcl_rt::value::NIL).unwrap(),
+        (EgclVal::from_fixnum(91), true)
+    );
     egcl_rt::rooted!(double = egcl_rt::gc::alloc_double_float(0.0));
     *general = egcl_stdlib::build_simple_vector(&[*double; 2]);
-    assert_eq!(hashtable::gethash(*general, *table, egcl_rt::value::NIL).unwrap(), (EgclVal::from_fixnum(91), true));
+    assert_eq!(
+        hashtable::gethash(*general, *table, egcl_rt::value::NIL).unwrap(),
+        (EgclVal::from_fixnum(91), true)
+    );
     for dims in [vec![], vec![2, 3]] {
         egcl_rt::rooted!(matrix = sequences::build_double_float_md_array(&dims, -4.5).unwrap());
         assert!(sequences::is_double_float_array(*matrix));
         let size = dims.iter().product::<usize>();
         assert_eq!(sequences::array_total_size(*matrix), Some(size));
-        assert_eq!(sequences::double_float_array_element(*matrix, size - 1), Some(-4.5));
+        assert_eq!(
+            sequences::double_float_array_element(*matrix, size - 1),
+            Some(-4.5)
+        );
         let printed = egcl_stdlib::format::format(egcl_rt::value::NIL, "~S", &[*matrix]).unwrap();
         assert!(printed.as_string().contains("-4.5"));
     }

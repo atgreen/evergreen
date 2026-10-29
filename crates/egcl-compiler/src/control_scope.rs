@@ -69,8 +69,8 @@
 //! `before(bcp)`, `exit_at(bcp)`, and `cleanup_resumes(cleanup_bcp)`. An
 //! unwind continuation is chosen dynamically and is never in a resume list.
 
-use std::collections::{HashMap, HashSet, VecDeque};
 use egcl_rt::bytecode::{BytecodeFunction, Instr};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Ownership {

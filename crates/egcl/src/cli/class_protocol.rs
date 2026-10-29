@@ -283,8 +283,15 @@ pub(super) fn call(_name: &str, args: &[EgclVal], env: &mut Env) -> Result<EgclV
             for name in shared_names {
                 let owner = runtime_shared_cell_owner(env, class, &name);
                 let cells = egcl_stdlib::clos::class_runtime_shared_cells(owner)
-                    .or_else(|| runtime_class_definition(env, owner).map(|definition| definition.class_slot_values))
-                    .ok_or_else(|| EgclError::ProgramError("shared slot owner has no runtime definition".into()))?;
+                    .or_else(|| {
+                        runtime_class_definition(env, owner)
+                            .map(|definition| definition.class_slot_values)
+                    })
+                    .ok_or_else(|| {
+                        EgclError::ProgramError(
+                            "shared slot owner has no runtime definition".into(),
+                        )
+                    })?;
                 shared_cells.push((cells, name));
             }
             egcl_stdlib::clos::publish_class_protocol(

@@ -56,7 +56,11 @@ fn check_rebinding(name: &str, call: &str, initial: &str) {
 // captures, multiple values and native redefinition through user symbols.
 fn run_shadowed_tiers(name: &str, symbols: &[&str], program: &str) {
     let names = symbols.join(" ");
-    let canonical = symbols.iter().map(|name| format!("'cl:{name}")).collect::<Vec<_>>().join(" ");
+    let canonical = symbols
+        .iter()
+        .map(|name| format!("'cl:{name}"))
+        .collect::<Vec<_>>()
+        .join(" ");
     let setup = symbols.iter().map(|name| format!(
         "(assert (not (eq '{name} 'cl:{name}))) (setf (symbol-function '{name}) #'cl:{name})"
     )).collect::<Vec<_>>().join("\n");
@@ -64,10 +68,15 @@ fn run_shadowed_tiers(name: &str, symbols: &[&str], program: &str) {
     // User bindings have no such fallback, so restore their original callable.
     let mut program = program.to_owned();
     for symbol in symbols {
-        program = program.replace(&format!("(fmakunbound '{symbol})"),
-            &format!("(setf (symbol-function '{symbol}) #'cl:{symbol})"));
+        program = program.replace(
+            &format!("(fmakunbound '{symbol})"),
+            &format!("(setf (symbol-function '{symbol}) #'cl:{symbol})"),
+        );
     }
-    run_tiers(name, &format!(r#"
+    run_tiers(
+        name,
+        &format!(
+            r#"
       (defpackage :rebinding-user (:use :cl) (:shadow {names}))
       (in-package :rebinding-user)
       (defparameter *canonical-functions* (mapcar #'symbol-function (list {canonical})))
@@ -75,7 +84,9 @@ fn run_shadowed_tiers(name: &str, symbols: &[&str], program: &str) {
       {program}
       (mapc (lambda (symbol original) (assert (eq (symbol-function symbol) original)))
             (list {canonical}) *canonical-functions*)
-    "#));
+    "#
+        ),
+    );
 }
 
 fn run_tiers(name: &str, program: &str) {
@@ -114,25 +125,41 @@ fn run_tiers(name: &str, program: &str) {
 
 #[test]
 fn shadowed_ldb_observes_replacement() {
-    check_lowered_call_binding("LDB", "(ldb (byte 4 0) (progn (incf *effects*) 15))",
-        "(values 110 :replacement)", "'(110 :replacement)");
+    check_lowered_call_binding(
+        "LDB",
+        "(ldb (byte 4 0) (progn (incf *effects*) 15))",
+        "(values 110 :replacement)",
+        "'(110 :replacement)",
+    );
 }
 
 #[test]
 fn shadowed_byte_observes_replacement() {
-    check_lowered_call_binding("BYTE", "(ldb (byte 4 0) (progn (incf *effects*) 15))",
-        "(cons 2 1)", "'(3)");
+    check_lowered_call_binding(
+        "BYTE",
+        "(ldb (byte 4 0) (progn (incf *effects*) 15))",
+        "(cons 2 1)",
+        "'(3)",
+    );
 }
 
 #[test]
 fn shadowed_typep_observes_replacement() {
-    check_lowered_call_binding("TYPEP", "(typep (progn (incf *effects*) :value) 'symbol)",
-        "(values 110 :replacement)", "'(110 :replacement)");
+    check_lowered_call_binding(
+        "TYPEP",
+        "(typep (progn (incf *effects*) :value) 'symbol)",
+        "(values 110 :replacement)",
+        "'(110 :replacement)",
+    );
 }
 
 fn check_lowered_call_binding(name: &str, call: &str, replacement: &str, expected: &str) {
     let restore = format!("(setf (symbol-function '{name}) *saved-binding*)");
-    run_shadowed_tiers(name, &[name], &format!(r#"
+    run_shadowed_tiers(
+        name,
+        &[name],
+        &format!(
+            r#"
       (defparameter *effects* 0)
       (defparameter *replacement-calls* 0)
       (setq *saved-binding* (symbol-function '{name}))
@@ -152,12 +179,17 @@ fn check_lowered_call_binding(name: &str, call: &str, replacement: &str, expecte
       (assert (= *effects* 2))
       (assert (= *replacement-calls* 2))
       (format t "CALLABLE-REBINDING-OK~%")
-    "#));
+    "#
+        ),
+    );
 }
 
 #[test]
 fn lowered_call_ldb_preserves_lexical_byte_functions() {
-    run_shadowed_tiers("LDB lexical BYTE", &["BYTE"], r#"
+    run_shadowed_tiers(
+        "LDB lexical BYTE",
+        &["BYTE"],
+        r#"
       (defun local-byte-caller (x)
         (flet ((byte (size position) (declare (ignore size position)) (cons 2 1)))
           (ldb (byte 4 0) x)))
@@ -171,12 +203,15 @@ fn lowered_call_ldb_preserves_lexical_byte_functions() {
       (assert (= (egcl-ext:function-tier 'local-byte-caller) EXPECTED-TIER))
       (assert (= (egcl-ext:function-tier 'captured-byte-entry) EXPECTED-TIER))
       (format t "CALLABLE-REBINDING-OK~%")
-    "#);
+    "#,
+    );
 }
 
 #[test]
 fn library_function_name_preserves_the_installed_definition() {
-    run_tiers("FIRST-CHAR custom definition", r#"
+    run_tiers(
+        "FIRST-CHAR custom definition",
+        r#"
       (defpackage :uiop/utility (:use :cl) (:export :first-char))
       (defun uiop/utility:first-char (text) (declare (ignore text)) 110)
       (defun library-caller (text) (uiop/utility:first-char text))
@@ -187,12 +222,15 @@ fn library_function_name_preserves_the_installed_definition() {
       (assert (= (library-caller "abc") 210))
       (assert (= (funcall *saved-first-char* "abc") 110))
       (format t "CALLABLE-REBINDING-OK~%")
-    "#);
+    "#,
+    );
 }
 
 #[test]
 fn library_function_rebinding_preserves_effects_values_and_unbinding() {
-    run_tiers("FIRST-CHAR live replacement", r#"
+    run_tiers(
+        "FIRST-CHAR live replacement",
+        r#"
       (defpackage :uiop/utility (:use :cl) (:export :first-char))
       (defun uiop/utility:first-char (text)
         (if (plusp (length text)) (char text 0)))
@@ -219,7 +257,8 @@ fn library_function_rebinding_preserves_effects_values_and_unbinding() {
       (assert (handler-case (progn (library-caller "abc") nil)
                 (undefined-function () t)))
       (format t "CALLABLE-REBINDING-OK~%")
-    "#);
+    "#,
+    );
 }
 
 #[test]
@@ -231,7 +270,11 @@ fn shadowed_standard_names_preserve_interpreted_replacements() {
         ("LENGTH", "(length '(a b))"),
         ("FBOUNDP", "(fboundp 'format)"),
     ] {
-        run_shadowed_tiers(name, &[name], &format!(r#"
+        run_shadowed_tiers(
+            name,
+            &[name],
+            &format!(
+                r#"
           (defun warmed-caller () {call})
           (dotimes (i 40) (warmed-caller))
           (assert (= (egcl-ext:function-tier 'warmed-caller) EXPECTED-TIER))
@@ -244,13 +287,18 @@ fn shadowed_standard_names_preserve_interpreted_replacements() {
           (assert (eql *warm-result* 110))
           (assert (eql *cold-result* 110))
           (format t "CALLABLE-REBINDING-OK~%")
-        "#));
+        "#
+            ),
+        );
     }
 }
 
 #[test]
 fn values_replacements_preserve_captures_effects_and_multiple_values() {
-    run_shadowed_tiers("VALUES replacement state", &["VALUES"], r#"
+    run_shadowed_tiers(
+        "VALUES replacement state",
+        &["VALUES"],
+        r#"
       (defparameter *calls* 0)
       (defun values-caller (x) (values (progn (incf *calls*) x) 8))
       (dotimes (i 40) (values-caller i))
@@ -282,12 +330,16 @@ fn values_replacements_preserve_captures_effects_and_multiple_values() {
       (dotimes (i 40)
         (assert (equal (local-values-caller i) (list :local (list i 8)))))
       (format t "CALLABLE-REBINDING-OK~%")
-    "#);
+    "#,
+    );
 }
 
 #[test]
 fn shadowed_values_keeps_coherent_selection_and_observes_the_next_binding() {
-    run_shadowed_tiers("VALUES argument-time replacement", &["VALUES"], r#"
+    run_shadowed_tiers(
+        "VALUES argument-time replacement",
+        &["VALUES"],
+        r#"
       (defparameter *armed* nil)
       (defparameter *effects* 0)
       (defun values-argument ()
@@ -309,7 +361,8 @@ fn shadowed_values_keeps_coherent_selection_and_observes_the_next_binding() {
       (assert (equal *next-result* '(110)))
       (assert (= *effects* 2))
       (format t "CALLABLE-REBINDING-OK~%")
-    "#);
+    "#,
+    );
 }
 
 #[test]
@@ -372,7 +425,8 @@ fn callable_instance_aliases_preserve_identity_and_multiple_values() {
 #[test]
 fn shadowed_function_rebinding_during_a_native_activation_does_not_replay_effects() {
     run_shadowed_tiers(
-        "live replacement", &["CAR"],
+        "live replacement",
+        &["CAR"],
         r#"
       (defclass live-callable () () (:metaclass egcl-ext:funcallable-standard-class))
       (defparameter *live-replacement* (make-instance 'live-callable))
@@ -425,7 +479,8 @@ fn canonical_standard_function_designators_keep_builtin_dispatch() {
 #[test]
 fn replaced_error_returns_to_a_warmed_caller() {
     run_shadowed_tiers(
-        "returning ERROR", &["ERROR"],
+        "returning ERROR",
+        &["ERROR"],
         r#"
       (defun error-caller (fail)
         (if fail (progn (error "original") 42) 7))
@@ -444,7 +499,8 @@ fn replaced_error_returns_to_a_warmed_caller() {
 #[test]
 fn error_replaced_before_compilation_preserves_normal_values() {
     run_shadowed_tiers(
-        "preinstalled ERROR", &["ERROR"],
+        "preinstalled ERROR",
+        &["ERROR"],
         r#"
       (defclass returning-error () ()
         (:metaclass egcl-ext:funcallable-standard-class))
@@ -467,7 +523,8 @@ fn error_replaced_before_compilation_preserves_normal_values() {
 #[test]
 fn error_rebinding_inside_a_native_activation_preserves_effects_and_cleanup() {
     run_shadowed_tiers(
-        "live ERROR replacement", &["ERROR"],
+        "live ERROR replacement",
+        &["ERROR"],
         r#"
       (defparameter *armed* nil)
       (defparameter *before* 0)

@@ -11,13 +11,19 @@ thread_local! {
     static LEAF_DEPTH: Cell<Option<(u32, usize)>> = const { Cell::new(None) };
 }
 fn post_signal() {
-    let signal = SIGNAL_TO_POST.with(|slot| slot.take()).expect("one pending test request");
+    let signal = SIGNAL_TO_POST
+        .with(|slot| slot.take())
+        .expect("one pending test request");
     INJECTIONS.with(|count| count.set(count.get() + 1));
     egcl_rt::post_current_pending_signal(signal);
 }
 fn observe_depth() {
-    LEAF_DEPTH.with(|slot| slot.set(Some((NATIVE_DEPTH.with(Cell::get),
-        egcl_rt::current_stack().frame_depth()))));
+    LEAF_DEPTH.with(|slot| {
+        slot.set(Some((
+            NATIVE_DEPTH.with(Cell::get),
+            egcl_rt::current_stack().frame_depth(),
+        )))
+    });
 }
 struct RestoreObserver(Option<fn()>);
 impl Drop for RestoreObserver {
@@ -41,16 +47,32 @@ fn fixture(env: &mut Env) -> (u32, Rc<NativeCode>, Rc<NativeCode>, u32) {
            (setq *ordinary-lifecycle-effects* (+ *ordinary-lifecycle-effects* 1))
            (values a b c d))
          (defun ordinary-lifecycle-middle (a b c d)
-           (ordinary-lifecycle-terminal b d a c))", env).unwrap();
-    let (_, middle) = install("ORDINARY-LIFECYCLE-MIDDLE",
-        "((ordinary-lifecycle-terminal b d a c))", env);
-    let (symbol, outer) = install("ORDINARY-LIFECYCLE-OUTER",
-        "((ordinary-lifecycle-middle d c b a))", env);
+           (ordinary-lifecycle-terminal b d a c))",
+        env,
+    )
+    .unwrap();
+    let (_, middle) = install(
+        "ORDINARY-LIFECYCLE-MIDDLE",
+        "((ordinary-lifecycle-terminal b d a c))",
+        env,
+    );
+    let (symbol, outer) = install(
+        "ORDINARY-LIFECYCLE-OUTER",
+        "((ordinary-lifecycle-middle d c b a))",
+        env,
+    );
     for code in [&outer, &middle] {
-        let NativeCodeStorage::Mapped(mapped) = &code._storage else { panic!("mapped owner") };
-        assert!(native_transfer_entry::installed_listing(mapped).contains("Ordinary x86-64 Lisp ABI"));
-        assert_eq!(mapped.value_maps_for_test().iter().count(), 2,
-            "non-tail CALL retains direct and cold maps");
+        let NativeCodeStorage::Mapped(mapped) = &code._storage else {
+            panic!("mapped owner")
+        };
+        assert!(
+            native_transfer_entry::installed_listing(mapped).contains("Ordinary x86-64 Lisp ABI")
+        );
+        assert_eq!(
+            mapped.value_maps_for_test().iter().count(),
+            2,
+            "non-tail CALL retains direct and cold maps"
+        );
     }
     let args = [11, 22, 33, 44].map(EgclVal::from_fixnum);
     for iteration in 0..3 {
@@ -71,19 +93,26 @@ fn reset_effects(symbol: u32) {
 
 struct RestoreDepth(u32);
 impl Drop for RestoreDepth {
-    fn drop(&mut self) { NATIVE_DEPTH.with(|depth| depth.set(self.0)); }
+    fn drop(&mut self) {
+        NATIVE_DEPTH.with(|depth| depth.set(self.0));
+    }
 }
 
 #[test]
 #[ignore = "requires installed ordinary register entries"]
 fn ordinary_register_pending_signals_use_real_cold_delivery_and_restore_state() {
-    let _lock = crate::cli::heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = crate::cli::heap_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let mut env = Env::new(false);
     egcl_rt::rooted_ref!(_env = &mut env);
     let (symbol, outer, _middle, counter) = fixture(&mut env);
     let args = [11, 22, 33, 44].map(EgclVal::from_fixnum);
-    for signal in [egcl_rt::PendingSignal::Interrupt, egcl_rt::PendingSignal::Shutdown,
-        egcl_rt::PendingSignal::Timeout] {
+    for signal in [
+        egcl_rt::PendingSignal::Interrupt,
+        egcl_rt::PendingSignal::Shutdown,
+        egcl_rt::PendingSignal::Timeout,
+    ] {
         reset_effects(counter);
         let stack = egcl_rt::current_stack();
         let before = (stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get));
@@ -94,49 +123,94 @@ fn ordinary_register_pending_signals_use_real_cold_delivery_and_restore_state() 
         INJECTIONS.with(|count| count.set(0));
         native_transfer_entry::ordinary_calls::take_cold_calls_for_test();
         native_transfer_entry::ordinary_calls::take_named_entries_for_test();
-        let error = native_transfer_entry::with_ordinary_entry_hook_for_test(
-            post_signal,
-            || run_native(&outer, symbol, &args, &mut env),
-        ).unwrap_err();
-        assert_eq!(INJECTIONS.with(Cell::get), 1, "request posted after the root entry poll");
-        assert!(matches!((signal, error.without_backtrace()),
-            (egcl_rt::PendingSignal::Interrupt, EgclError::Interrupt)
-                | (egcl_rt::PendingSignal::Shutdown, EgclError::Shutdown)
-                | (egcl_rt::PendingSignal::Timeout, EgclError::Timeout)), "{error:?}");
-        assert_eq!(native_transfer_entry::ordinary_calls::take_cold_calls_for_test(), 1,
-            "the generated ordinary edge must invoke the production cold handler");
-        assert_eq!(native_transfer_entry::ordinary_calls::take_named_entries_for_test(), 0,
-            "pending transfer rejects the edge before entering any named adapter");
+        let error = native_transfer_entry::with_ordinary_entry_hook_for_test(post_signal, || {
+            run_native(&outer, symbol, &args, &mut env)
+        })
+        .unwrap_err();
+        assert_eq!(
+            INJECTIONS.with(Cell::get),
+            1,
+            "request posted after the root entry poll"
+        );
+        assert!(
+            matches!(
+                (signal, error.without_backtrace()),
+                (egcl_rt::PendingSignal::Interrupt, EgclError::Interrupt)
+                    | (egcl_rt::PendingSignal::Shutdown, EgclError::Shutdown)
+                    | (egcl_rt::PendingSignal::Timeout, EgclError::Timeout)
+            ),
+            "{error:?}"
+        );
+        assert_eq!(
+            native_transfer_entry::ordinary_calls::take_cold_calls_for_test(),
+            1,
+            "the generated ordinary edge must invoke the production cold handler"
+        );
+        assert_eq!(
+            native_transfer_entry::ordinary_calls::take_named_entries_for_test(),
+            0,
+            "pending transfer rejects the edge before entering any named adapter"
+        );
         if !matches!(signal, egcl_rt::PendingSignal::Shutdown) {
-            let frames = error.backtrace().expect("interrupt/timeout retain their native trace");
-            assert!(frames.iter().any(|frame| frame.function.as_deref()
-                .is_some_and(|name| name.ends_with("ORDINARY-LIFECYCLE-OUTER"))));
-            assert!(!frames.iter().any(|frame| frame.function.as_deref()
-                .is_some_and(|name| name.ends_with("ORDINARY-LIFECYCLE-MIDDLE"))),
-                "pending request must reject the first edge, before entering the middle owner");
+            let frames = error
+                .backtrace()
+                .expect("interrupt/timeout retain their native trace");
+            assert!(frames.iter().any(|frame| {
+                frame
+                    .function
+                    .as_deref()
+                    .is_some_and(|name| name.ends_with("ORDINARY-LIFECYCLE-OUTER"))
+            }));
+            assert!(
+                !frames.iter().any(|frame| frame
+                    .function
+                    .as_deref()
+                    .is_some_and(|name| name.ends_with("ORDINARY-LIFECYCLE-MIDDLE"))),
+                "pending request must reject the first edge, before entering the middle owner"
+            );
         }
-        assert_eq!(effects(counter), EgclVal::from_fixnum(0), "pending transfer must precede callee effects");
-        assert_eq!((stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get)), before);
+        assert_eq!(
+            effects(counter),
+            EgclVal::from_fixnum(0),
+            "pending transfer must precede callee effects"
+        );
+        assert_eq!(
+            (stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get)),
+            before
+        );
         assert_eq!(egcl_rt::native_transfer::current_segment(), segment);
         assert_eq!(unsafe { &*execution }.active_native_control(), control);
-        assert!(egcl_rt::take_current_pending_signal().is_none(), "signal consumed once");
-        assert_eq!(run_native(&outer, symbol, &args, &mut env).unwrap(), args[2]);
-        assert_eq!(effects(counter), EgclVal::from_fixnum(1), "later invocation remains usable");
+        assert!(
+            egcl_rt::take_current_pending_signal().is_none(),
+            "signal consumed once"
+        );
+        assert_eq!(
+            run_native(&outer, symbol, &args, &mut env).unwrap(),
+            args[2]
+        );
+        assert_eq!(
+            effects(counter),
+            EgclVal::from_fixnum(1),
+            "later invocation remains usable"
+        );
     }
 }
 
 #[test]
 #[ignore = "requires installed ordinary register entries"]
 fn ordinary_register_calls_do_not_consume_legacy_reentry_depth() {
-    let _lock = crate::cli::heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = crate::cli::heap_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let mut env = Env::new(false);
     egcl_rt::rooted_ref!(_env = &mut env);
     let (symbol, outer, _middle, counter) = fixture(&mut env);
     let args = [11, 22, 33, 44].map(EgclVal::from_fixnum);
     let cap = native_depth_cap();
     assert!(cap >= 4);
-    let _observer = RestoreObserver(super::ordinary_t2::RECURSIVE_LEAF_OBSERVER
-        .with(|hook| hook.replace(Some(observe_depth))));
+    let _observer = RestoreObserver(
+        super::ordinary_t2::RECURSIVE_LEAF_OBSERVER.with(|hook| hook.replace(Some(observe_depth))),
+    );
     let mut observations = Vec::new();
     for initial in [0, cap - 1] {
         let _depth = RestoreDepth(NATIVE_DEPTH.with(|depth| depth.replace(initial)));
@@ -149,22 +223,45 @@ fn ordinary_register_calls_do_not_consume_legacy_reentry_depth() {
         let segment = egcl_rt::native_transfer::current_segment();
         native_transfer_entry::ordinary_calls::take_cold_calls_for_test();
         native_transfer_entry::ordinary_calls::take_named_entries_for_test();
-        assert_eq!(run_native(&outer, symbol, &args, &mut env).unwrap(), args[2]);
+        assert_eq!(
+            run_native(&outer, symbol, &args, &mut env).unwrap(),
+            args[2]
+        );
         assert!(env.mv_active);
         assert_eq!(env.mv, [args[2], args[0], args[3], args[1]]);
-        assert_eq!(effects(counter), EgclVal::from_fixnum(1), "fallback must not replay the callee");
-        assert_eq!(native_transfer_entry::ordinary_calls::take_cold_calls_for_test(),
-            0, "ordinary machine calls do not use the legacy reentry depth cap");
-        assert_eq!(native_transfer_entry::ordinary_calls::take_named_entries_for_test(),
-            1, "both calls enter the terminal adapter through the same native chain");
-        let observed = LEAF_DEPTH.with(Cell::get).expect("actual terminal execution");
-        assert_eq!(observed.0, initial + 1,
-            "only the outer Rust/native boundary consumes reentry depth");
+        assert_eq!(
+            effects(counter),
+            EgclVal::from_fixnum(1),
+            "fallback must not replay the callee"
+        );
+        assert_eq!(
+            native_transfer_entry::ordinary_calls::take_cold_calls_for_test(),
+            0,
+            "ordinary machine calls do not use the legacy reentry depth cap"
+        );
+        assert_eq!(
+            native_transfer_entry::ordinary_calls::take_named_entries_for_test(),
+            1,
+            "both calls enter the terminal adapter through the same native chain"
+        );
+        let observed = LEAF_DEPTH
+            .with(Cell::get)
+            .expect("actual terminal execution");
+        assert_eq!(
+            observed.0,
+            initial + 1,
+            "only the outer Rust/native boundary consumes reentry depth"
+        );
         observations.push(observed);
-        assert_eq!((stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get)), before);
+        assert_eq!(
+            (stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get)),
+            before
+        );
         assert_eq!(egcl_rt::native_transfer::current_segment(), segment);
         assert_eq!(unsafe { &*execution }.active_native_control(), control);
     }
-    assert_eq!(observations[1].1, observations[0].1,
-        "ordinary calls remain native even at the legacy boundary depth cap");
+    assert_eq!(
+        observations[1].1, observations[0].1,
+        "ordinary calls remain native even at the legacy boundary depth cap"
+    );
 }

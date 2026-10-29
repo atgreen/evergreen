@@ -49,7 +49,10 @@ fn forced_compilation_evaluates_each_form_once() {
                      (disassemble 'ltv))"#
             ),
         );
-        assert!(stdout.contains("RESULT (1 T T T :SIGNALLED)"), "{tier}: {stdout}");
+        assert!(
+            stdout.contains("RESULT (1 T T T :SIGNALLED)"),
+            "{tier}: {stdout}"
+        );
         assert!(stdout.contains("LTV —"), "{tier}: {stdout}");
     }
 }
