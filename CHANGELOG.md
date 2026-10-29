@@ -12,6 +12,10 @@
   feature conditionals work beneath quote, backquote, and dispatch literals
   ([#815](https://github.com/atgreen/evergreen/pull/815)).
 
+- Structure copiers preserve the values of slots named `T` or `NIL` instead of
+  signaling `UNBOUND-SLOT`, and subsequent access to those slots no longer
+  panics the runtime ([#816](https://github.com/atgreen/evergreen/pull/816)).
+
 - `DEFSTRUCT` reuses inherited symbols for generated accessors, constructors,
   copiers, and predicates, preserving calls through exported package interfaces
   ([#775](https://github.com/atgreen/evergreen/pull/775)).
