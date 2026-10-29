@@ -20,6 +20,10 @@
   in other packages while retaining primitive checks for Common Lisp types
   ([#867](https://github.com/atgreen/evergreen/pull/867)).
 
+- Callable circular-label readers preserve custom readers in their operands,
+  including commas inside custom backquotes and shared or circular references
+  ([#876](https://github.com/atgreen/evergreen/pull/876)).
+
 - Methods retain their actual class specializers when class names are rebound,
   including retained calls and saved images. Core format 15 requires rebuilding
   earlier images
