@@ -22,6 +22,30 @@ fn mapped_typep(type_name: &str, env: &mut Env) -> native_transfer_entry::Transf
     assert!(body.code.iter().any(|instruction| matches!(instruction,
         Instr::CallNamed { sym, nargs: 2 }
             if egcl_rt::symbols::symbol_name(*sym).as_deref() == Some("TYPEP"))));
+    if type_name == "FIXNUM" {
+        let canonical_index = egcl_rt::symbols::find_index("FIXNUM").unwrap();
+        assert_eq!(
+            egcl_rt::symbols::registry_key(canonical_index).as_deref(),
+            Some("FIXNUM")
+        );
+        let call = body
+            .code
+            .iter()
+            .position(|instruction| {
+                matches!(instruction,
+            Instr::CallNamed { sym, nargs: 2 }
+                if egcl_rt::symbols::symbol_name(*sym).as_deref() == Some("TYPEP"))
+            })
+            .unwrap();
+        let Instr::Const(index) = body.code[call - 1] else {
+            panic!("canonical TYPEP fixture must have an exact constant type operand");
+        };
+        assert_eq!(
+            body.constants[index as usize],
+            EgclVal::from_symbol_index(canonical_index),
+            "the minimal-environment fixture must use the canonical symbol, not a qualified lookalike"
+        );
+    }
     egcl_rt::rooted!(_body = ActiveBytecodeRoot::new(&body));
     let code = native_transfer_entry::TransferCode::compile_mapped_for_test(body)
         .expect("admit and emit actual mapped T1 TYPEP checker");
@@ -106,7 +130,9 @@ fn mapped_native_typep_calls_public_fallback_for_foreign_type_symbols() {
     }
     // Canonical CL:FIXNUM still uses the native intrinsic. This also proves
     // that the observed call counter is not merely native activation setup.
-    let canonical = mapped_typep("cl:fixnum", &mut env);
+    // Verify the exact canonical constant in mapped_typep instead of relying
+    // on qualified-name resolution in this minimal environment fixture.
+    let canonical = mapped_typep("FIXNUM", &mut env);
     for alternative in 0..2 {
         let value = if alternative == 0 { small } else { *big };
         let expected = if alternative == 0 { T } else { NIL };
