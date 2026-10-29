@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- `DOCUMENTATION` and `(SETF DOCUMENTATION)` are standard generic functions,
+  allowing user methods and metaclass-specific documentation behavior
+  ([#871](https://github.com/atgreen/evergreen/pull/871)).
+
 - `PPRINT-TABULAR` preserves shared and circular references within one logical
   printing context, including print limits and callback cleanup
   ([#870](https://github.com/atgreen/evergreen/pull/870)).
