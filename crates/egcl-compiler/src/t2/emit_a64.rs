@@ -3133,6 +3133,82 @@ pub fn emit_framed_with_runtime(
 }
 
 #[cfg(test)]
+mod vector_store_barrier_tests {
+    use super::*;
+    use crate::t2::frame_state::{FrameScope, FrameState, ValueSource};
+    use crate::t2::ir::{IRType, InstFlags};
+
+    fn in_range_store() -> Function {
+        let mut function = Function::new("aarch64-in-range-vector-store");
+        let block = function.entry();
+        let operands: Vec<_> = (0..4)
+            .map(|_| {
+                function.add_block_param(block, IRType::TOP, ValueRepresentation::Tagged)
+            })
+            .collect();
+        let sources = operands
+            .iter()
+            .copied()
+            .map(|value| ValueSource::Value {
+                value,
+                repr: ValueRepresentation::Tagged,
+            })
+            .collect();
+        let state = function.frame_states.add(FrameState {
+            scopes: vec![FrameScope {
+                function: 0,
+                bcp: 0,
+                locals: sources,
+                stack: vec![],
+            }],
+            remat: vec![],
+        });
+        let (_, result) = function.push_inst(
+            block,
+            InstData {
+                opcode: Opcode::VecSetInRange,
+                args: operands,
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags {
+                    effectful: true,
+                    guard: true,
+                    ..Default::default()
+                },
+                targets: vec![],
+                frame_state: Some(state),
+                source_pos: 0,
+            },
+            &[(IRType::TOP, ValueRepresentation::Tagged)],
+        );
+        function.set_terminator(
+            block,
+            InstData {
+                opcode: Opcode::Return,
+                args: result,
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags::default(),
+                targets: vec![],
+                frame_state: None,
+                source_pos: 1,
+            },
+        );
+        function
+    }
+
+    #[test]
+    fn in_range_heap_store_calls_the_reference_barrier() {
+        let emitted = emit_framed(&in_range_store(), 0, 4).expect("emit AArch64 store");
+        let call = a64::blr(ADDR).to_le_bytes();
+        assert!(
+            emitted.code.windows(call.len()).any(|word| word == call),
+            "the call-free fixture emitted no BLR x16: VecSetInRange bypassed the reference barrier"
+        );
+    }
+}
+
+#[cfg(test)]
 mod cycle_poll_tests {
     use super::*;
     use crate::t2::frame_state::FrameScope;
