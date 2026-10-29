@@ -7,6 +7,11 @@ use std::cell::Cell;
 #[path = "ordinary_t2_poll_latency.rs"]
 mod poll_latency;
 
+#[path = "ordinary_slot_access.rs"]
+mod slot_access;
+#[path = "ordinary_generic_bindings.rs"]
+mod generic_bindings;
+
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[path = "ordinary_inline_u8_allocation.rs"]
 mod inline_u8_allocation;

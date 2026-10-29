@@ -1,0 +1,3 @@
+base, git+https://gitlab.common-lisp.net/gendl/gendl.git@5675eb3d8b08230476988adfc141423491b587e8#ref=5675eb3d8b08230476988adfc141423491b587e8, gendl-5675eb3/base/base.asd
+gendl-asdf, git+https://gitlab.common-lisp.net/gendl/gendl.git@5675eb3d8b08230476988adfc141423491b587e8#ref=5675eb3d8b08230476988adfc141423491b587e8, gendl-5675eb3/gendl-asdf/gendl-asdf.asd
+gendl-mop, git+https://gitlab.common-lisp.net/gendl/gendl.git@5675eb3d8b08230476988adfc141423491b587e8#ref=5675eb3d8b08230476988adfc141423491b587e8, gendl-5675eb3/gendl-mop/gendl-mop.asd

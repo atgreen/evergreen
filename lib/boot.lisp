@@ -5281,7 +5281,6 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
 ;;; effective one. EGCL answers them for both, which is a permissive superset
 ;;; rather than a different answer.
 ;;;
-;;; One honest limit: SLOT-DEFINITION-TYPE answers T for every slot, because
 (defpackage :egcl-mop
   (:use :common-lisp)
   ;; Only names this package OWNS.
@@ -5298,7 +5297,7 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
   ;; METHOD-SPECIALIZERS is still dispatched only by its bare name and has no
   ;; owner, so it keeps the old behaviour; the same treatment for the remaining
   ;; extension builtins is bliss-7l7cn.
-  (:export #:class-slots #:class-direct-slots #:class-precedence-list
+  (:export #:standard-class #:class-slots #:class-direct-slots #:class-precedence-list
            #:class-direct-superclasses #:class-direct-subclasses
            #:class-finalized-p #:finalize-inheritance
            ;; The metaclass of a class named as a superclass before it is
@@ -5322,7 +5321,14 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
            #:slot-definition-name #:slot-definition-initargs
            #:slot-definition-initform #:slot-definition-allocation
            #:slot-definition-readers #:slot-definition-writers
-           #:slot-definition-type))
+           #:slot-definition-type #:slot-definition-initfunction
+           #:slot-definition #:direct-slot-definition #:effective-slot-definition
+           #:standard-slot-definition #:standard-direct-slot-definition
+           #:standard-effective-slot-definition #:direct-slot-definition-class
+           #:effective-slot-definition-class #:compute-effective-slot-definition
+           #:compute-class-precedence-list #:compute-slots #:compute-default-initargs
+           #:class-default-initargs #:class-direct-default-initargs
+           #:ensure-class #:ensure-class-using-class))
 
 ;;; COMMON-LISP-USER uses it, so the names stay reachable without qualification
 ;;; where a person is typing -- and so closer-mop's EGCL arm, which is
@@ -5339,32 +5345,137 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
 ;;; closer-mop's (cl-user::class-slots ...) keep working, while a library
 ;;; package that only uses CL no longer inherits them.
 ;;;
-;;; DEFCLASS currently discards the :type option (bliss-52ze). T is the correct
-;;; default, and wrong for a slot that declared a type.
-(defclass egcl-mop::slot-definition ()
-  ((name :initarg :name :reader egcl-mop:slot-definition-name)
-   (initargs :initarg :initargs :reader egcl-mop:slot-definition-initargs)
-   (initform :initarg :initform :reader egcl-mop:slot-definition-initform)
-   (allocation :initarg :allocation :reader egcl-mop:slot-definition-allocation)
-   (readers :initarg :readers :reader egcl-mop:slot-definition-readers)
-   (writers :initarg :writers :reader egcl-mop:slot-definition-writers)))
+;;; Slot definition objects are stable, class-owned metadata.  The Lisp
+;;; protocol computes them; the private bridge publishes a validated layout.
+(defclass egcl-mop:slot-definition ()
+  ((egcl-mop::name :initarg :name)
+   (egcl-mop::initargs :initarg :initargs :initform nil)
+   (egcl-mop::initform :initarg :initform :initform nil)
+   (egcl-mop::initfunction :initarg :initfunction :initform nil)
+   (egcl-mop::type :initarg :type :initform t)
+   (egcl-mop::allocation :initarg :allocation :initform :instance)
+   (egcl-mop::readers :initarg :readers :initform nil)
+   (egcl-mop::writers :initarg :writers :initform nil)
+   (egcl-mop::documentation :initarg :documentation :initform nil)))
 
-(defun egcl-mop:class-slots (class)
-  "Effective slot definitions of CLASS, in class-precedence order."
-  (mapcar (lambda (descriptor)
-            (apply #'make-instance 'egcl-mop::slot-definition descriptor))
-          (egcl-internal::%class-slot-descriptors class)))
+(defgeneric egcl-mop:slot-definition-name (slot))
+(defmethod egcl-mop:slot-definition-name ((slot egcl-mop:slot-definition))
+  (egcl-internal::%raw-slot-value slot 'egcl-mop::name))
+(defgeneric egcl-mop:slot-definition-initargs (slot))
+(defmethod egcl-mop:slot-definition-initargs ((slot egcl-mop:slot-definition))
+  (egcl-internal::%raw-slot-value slot 'egcl-mop::initargs))
+(defgeneric egcl-mop:slot-definition-initform (slot))
+(defmethod egcl-mop:slot-definition-initform ((slot egcl-mop:slot-definition))
+  (egcl-internal::%raw-slot-value slot 'egcl-mop::initform))
+(defgeneric egcl-mop:slot-definition-initfunction (slot))
+(defmethod egcl-mop:slot-definition-initfunction ((slot egcl-mop:slot-definition))
+  (egcl-internal::%raw-slot-value slot 'egcl-mop::initfunction))
+(defgeneric egcl-mop:slot-definition-type (slot))
+(defmethod egcl-mop:slot-definition-type ((slot egcl-mop:slot-definition))
+  (egcl-internal::%raw-slot-value slot 'egcl-mop::type))
+(defgeneric egcl-mop:slot-definition-allocation (slot))
+(defmethod egcl-mop:slot-definition-allocation ((slot egcl-mop:slot-definition))
+  (egcl-internal::%raw-slot-value slot 'egcl-mop::allocation))
+(defgeneric egcl-mop:slot-definition-readers (slot))
+(defmethod egcl-mop:slot-definition-readers ((slot egcl-mop:slot-definition))
+  (egcl-internal::%raw-slot-value slot 'egcl-mop::readers))
+(defgeneric egcl-mop:slot-definition-writers (slot))
+(defmethod egcl-mop:slot-definition-writers ((slot egcl-mop:slot-definition))
+  (egcl-internal::%raw-slot-value slot 'egcl-mop::writers))
+
+(defclass egcl-mop:direct-slot-definition (egcl-mop:slot-definition) ())
+(defclass egcl-mop:effective-slot-definition (egcl-mop:slot-definition) ())
+(defclass egcl-mop:standard-slot-definition (egcl-mop:slot-definition) ())
+(defclass egcl-mop:standard-direct-slot-definition
+    (egcl-mop:standard-slot-definition egcl-mop:direct-slot-definition) ())
+(defclass egcl-mop:standard-effective-slot-definition
+    (egcl-mop:standard-slot-definition egcl-mop:effective-slot-definition) ())
+
+(defgeneric egcl-mop:direct-slot-definition-class (class &rest initargs))
+(defmethod egcl-mop:direct-slot-definition-class ((class standard-class) &rest initargs)
+  (declare (ignore class initargs))
+  (find-class 'egcl-mop:standard-direct-slot-definition))
+(defgeneric egcl-mop:effective-slot-definition-class (class &rest initargs))
+(defmethod egcl-mop:effective-slot-definition-class ((class standard-class) &rest initargs)
+  (declare (ignore class initargs))
+  (find-class 'egcl-mop:standard-effective-slot-definition))
 
 (defun egcl-mop:class-direct-slots (class)
-  "Slot definitions CLASS itself declares, excluding inherited slots."
-  (mapcar (lambda (descriptor)
-            (apply #'make-instance 'egcl-mop::slot-definition descriptor))
-          (egcl-internal::%class-slot-descriptors class t)))
+  (let ((cached (egcl-internal::%mop-class-protocol :direct class)))
+    (if cached (car cached)
+        (let ((slots
+                (mapcar (lambda (descriptor)
+                          (apply #'make-instance
+                                 (apply #'egcl-mop:direct-slot-definition-class class descriptor)
+                                 descriptor))
+                        (egcl-internal::%class-slot-descriptors class t))))
+          (egcl-internal::%mop-class-protocol :set-direct class slots)))))
 
-(defun egcl-mop:slot-definition-type (slot)
-  "Declared type of SLOT. Always T: DEFCLASS discards :type (bliss-52ze)."
-  (declare (ignore slot))
-  t)
+(defvar egcl-mop::*finalizing-class* nil)
+(defvar egcl-mop::*finalizing-cpl* nil)
+(defun egcl-mop:class-precedence-list (class)
+  (if (eq class egcl-mop::*finalizing-class*) egcl-mop::*finalizing-cpl*
+      (egcl-internal::%mop-class-protocol :cpl class)))
+(defgeneric egcl-mop:compute-class-precedence-list (class))
+(defmethod egcl-mop:compute-class-precedence-list ((class standard-class))
+  (egcl-internal::%mop-class-protocol :default-cpl class))
+
+(defgeneric egcl-mop:compute-effective-slot-definition (class name direct-slots))
+(defmethod egcl-mop:compute-effective-slot-definition
+    ((class standard-class) name direct-slots)
+  (let ((initargs nil) (types nil) (init nil) (form nil))
+    (dolist (slot direct-slots)
+      (dolist (arg (egcl-mop:slot-definition-initargs slot))
+        (unless (member arg initargs) (setq initargs (append initargs (list arg)))))
+      (unless (eq (egcl-mop:slot-definition-type slot) t)
+        (push (egcl-mop:slot-definition-type slot) types))
+      (when (and (null init) (egcl-mop:slot-definition-initfunction slot))
+        (setq init (egcl-mop:slot-definition-initfunction slot)
+              form (egcl-mop:slot-definition-initform slot))))
+    (let ((arguments (list :name name :initargs initargs :initform form
+                           :initfunction init :type (if (cdr types) (cons 'and (nreverse types)) (if types (car types) t))
+                           :allocation (egcl-mop:slot-definition-allocation (car direct-slots))
+                           :readers (egcl-mop:slot-definition-readers (car direct-slots))
+                           :writers (egcl-mop:slot-definition-writers (car direct-slots)))))
+      (apply #'make-instance
+             (apply #'egcl-mop:effective-slot-definition-class class arguments)
+             arguments))))
+
+(defgeneric egcl-mop:compute-slots (class))
+(defmethod egcl-mop:compute-slots ((class standard-class))
+  (let ((groups nil) (names nil) (result nil))
+    (dolist (parent (egcl-mop:class-precedence-list class))
+      (dolist (slot (egcl-mop:class-direct-slots parent))
+        (let* ((name (egcl-mop:slot-definition-name slot)) (entry (assoc name groups)))
+          (if entry (setf (cdr entry) (append (cdr entry) (list slot)))
+              (progn (push (cons name (list slot)) groups)
+                     (setq names (append names (list name))))))))
+    (dolist (name names)
+      (let ((slot (egcl-mop:compute-effective-slot-definition class name (cdr (assoc name groups)))))
+        (push slot result)))
+    (nreverse result)))
+
+(defun egcl-mop:class-direct-default-initargs (class)
+  (egcl-internal::%mop-class-protocol :direct-defaults class))
+(defgeneric egcl-mop:compute-default-initargs (class))
+(defmethod egcl-mop:compute-default-initargs ((class standard-class))
+  (let ((seen nil) (result nil))
+    (dolist (parent (egcl-mop:class-precedence-list class))
+      (dolist (entry (egcl-mop:class-direct-default-initargs parent))
+        (unless (member (car entry) seen)
+          (push (car entry) seen)
+          (push entry result))))
+    (nreverse result)))
+(defun egcl-mop:class-default-initargs (class)
+  (unless (egcl-mop:class-finalized-p class) (egcl-mop:finalize-inheritance class))
+  (egcl-internal::%mop-class-protocol :defaults class))
+
+(defun egcl-mop:class-slots (class)
+  (let ((cached (egcl-internal::%mop-class-protocol :effective class)))
+    (unless cached
+      (egcl-mop:finalize-inheritance class)
+      (setq cached (egcl-internal::%mop-class-protocol :effective class)))
+    (car cached)))
 
 ;;; ── EGCL-MOP ──────────────────────────────────────────────────────
 ;;;
@@ -5395,23 +5506,89 @@ takes."
   (egcl-internal::%generic-function-methods generic-function))
 
 (defun egcl-mop:class-finalized-p (class)
-  "Whether CLASS is finalized. Classes finalize eagerly here, so a defined class
-is always finalized and portable code that finalizes before reading the
-precedence list runs unchanged. A class is NOT finalized while it, or any class
-it inherits from, is only a forward reference -- named as a superclass and never
-defined -- because nothing has said yet what slots it has."
-  (null (egcl-internal::%forward-referenced-superclass class)))
+  (egcl-internal::%mop-class-protocol :finalized class))
 
-(defun egcl-mop:finalize-inheritance (class)
-  "Return CLASS. Classes finalize eagerly, so this is the no-op AMOP permits --
-except that a class cannot be finalized while it, or a class it inherits from,
-is still only a forward reference, which is an error (spec R9.39)."
+(defgeneric egcl-mop:finalize-inheritance (class))
+(defmethod egcl-mop:finalize-inheritance ((class standard-class))
+  (when (eq class egcl-mop::*finalizing-class*)
+    (error "Recursive finalization of ~s." class))
   (let ((pending (egcl-internal::%forward-referenced-superclass class)))
     (when pending
-      (error "FINALIZE-INHERITANCE: ~s cannot be finalized while ~s is only a ~
-              forward reference: it is named as a superclass but never defined."
-             class pending)))
+      (error "Cannot finalize ~s while ~s is a forward reference." class pending)))
+  ;; Validate the raw hierarchy before walking it, so cycles/forward references
+  ;; retain their existing errors. Ancestors publish before this class begins:
+  ;; a failed parent must never license a child's provisional migration.
+  (dolist (ancestor (reverse (cdr (egcl-internal::%mop-class-protocol :default-cpl class))))
+    (unless (egcl-mop:class-finalized-p ancestor)
+      (egcl-mop:finalize-inheritance ancestor)))
+  (egcl-internal::%mop-class-protocol :begin class)
+  (let* ((egcl-mop::*finalizing-class* class)
+         (egcl-mop::*finalizing-cpl* (egcl-mop:compute-class-precedence-list class))
+         (slots (egcl-mop:compute-slots class))
+         (defaults (egcl-mop:compute-default-initargs class)))
+    (egcl-internal::%mop-class-protocol
+     :publish class egcl-mop::*finalizing-cpl* slots defaults
+     (mapcar (lambda (entry) (list (car entry) (list 'funcall (third entry)))) defaults)))
   class)
+
+;;; DEFCLASS calls this only after the protocol's definitions are installed.
+(defun egcl-mop::%finalize-defined-class (class)
+  (when (and (typep class 'standard-class)
+             (not (egcl-internal::%forward-referenced-superclass class)))
+    (unless (egcl-mop:class-finalized-p class) (egcl-mop:finalize-inheritance class))
+    (dolist (subclass (egcl-mop:class-direct-subclasses class))
+      (egcl-mop::%finalize-defined-class subclass)))
+  class)
+
+(defun egcl-mop::%slot-plist-source (slot)
+  (let ((result nil))
+    (do ((tail slot (cddr tail))) ((null tail))
+      (let ((key (car tail)) (value (cadr tail)))
+        (case key
+          (:name nil)
+          (:initargs (dolist (arg value) (setq result (append result (list :initarg arg)))))
+          (:readers (dolist (reader value) (setq result (append result (list :reader reader)))))
+          (:writers (dolist (writer value) (setq result (append result (list :writer writer)))))
+          (otherwise (setq result (append result (list key value)))))))
+    (cons (getf slot :name) result)))
+
+(defgeneric egcl-mop:ensure-class-using-class (class name &rest initargs))
+(defun egcl-mop::%ensure-class-default (class name &rest initargs)
+  (let* ((metaclass (or (getf initargs :metaclass)
+                        (if (and class (not (typep class 'egcl-mop:forward-referenced-class)))
+                            (class-of class) (find-class 'standard-class))))
+         (superclasses (if (member :direct-superclasses initargs)
+                          (getf initargs :direct-superclasses)
+                          (if class (egcl-mop:class-direct-superclasses class) nil)))
+         (slots (if (member :direct-slots initargs) (getf initargs :direct-slots)
+                    (if class (egcl-internal::%class-slot-descriptors class t) nil)))
+         (defaults (if (member :direct-default-initargs initargs)
+                       (getf initargs :direct-default-initargs)
+                       (if class (egcl-mop:class-direct-default-initargs class) nil)))
+         (options (list (list :metaclass (if (symbolp metaclass) metaclass (class-name metaclass)))))
+         (default-forms nil)
+         (class-initargs nil))
+    (do ((tail initargs (cddr tail))) ((null tail))
+      (unless (member (car tail) '(:metaclass :direct-superclasses :direct-slots :direct-default-initargs))
+        (setq class-initargs (append class-initargs (list (car tail) (cadr tail))))))
+    (dolist (entry defaults)
+      (setq default-forms (append default-forms (list (first entry) (list 'funcall (third entry))))))
+    (when default-forms (push (cons :default-initargs default-forms) options))
+    (egcl-internal::%mop-class-protocol
+     :define name
+     (append (list name
+                   (mapcar (lambda (super) (if (symbolp super) super (class-name super))) superclasses)
+                   (mapcar #'egcl-mop::%slot-plist-source slots))
+             options)
+     defaults class-initargs)))
+(defmethod egcl-mop:ensure-class-using-class ((class null) name &rest initargs)
+  (apply #'egcl-mop::%ensure-class-default class name initargs))
+(defmethod egcl-mop:ensure-class-using-class ((class standard-class) name &rest initargs)
+  (apply #'egcl-mop::%ensure-class-default class name initargs))
+(defmethod egcl-mop:ensure-class-using-class ((class egcl-mop:forward-referenced-class) name &rest initargs)
+  (apply #'egcl-mop::%ensure-class-default class name initargs))
+(defun egcl-mop:ensure-class (name &rest initargs)
+  (apply #'egcl-mop:ensure-class-using-class (find-class name nil) name initargs))
 
 (defun egcl-mop:intern-eql-specializer (object)
   "The EQL specializer for OBJECT, in the shape METHOD-SPECIALIZERS answers it,
@@ -5579,6 +5756,27 @@ metaclass specializes this to accept a superclass of another metaclass."))
 (defmethod egcl-mop:validate-superclass (class superclass)
   (declare (ignore class superclass))
   t)
+
+;;; AMOP slot access. Declare these separately from the introspection interface
+;;; so every qualified reference is external before its definition is read.
+(export (mapcar (lambda (name) (intern name "EGCL-MOP"))
+                '("SLOT-VALUE-USING-CLASS" "SLOT-BOUNDP-USING-CLASS"
+                  "SLOT-MAKUNBOUND-USING-CLASS"))
+        "EGCL-MOP")
+
+(defgeneric egcl-mop:slot-value-using-class (class object slot))
+(defgeneric (setf egcl-mop:slot-value-using-class) (new class object slot))
+(defgeneric egcl-mop:slot-boundp-using-class (class object slot))
+(defgeneric egcl-mop:slot-makunbound-using-class (class object slot))
+
+(defmethod egcl-mop:slot-value-using-class ((class standard-class) object slot)
+  (egcl-internal::%standard-slot-value-using-class class object slot))
+(defmethod (setf egcl-mop:slot-value-using-class) (new (class standard-class) object slot)
+  (egcl-internal::%standard-set-slot-value-using-class new class object slot))
+(defmethod egcl-mop:slot-boundp-using-class ((class standard-class) object slot)
+  (egcl-internal::%standard-slot-boundp-using-class class object slot))
+(defmethod egcl-mop:slot-makunbound-using-class ((class standard-class) object slot)
+  (egcl-internal::%standard-slot-makunbound-using-class class object slot))
 
 ;;; Image lifecycle hooks belong to the implementation; libraries register here.
 (defvar egcl-ext::*init-hooks* nil

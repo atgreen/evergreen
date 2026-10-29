@@ -263,3 +263,8 @@ Cold CL-Unicode data generation exceeded the 600-second EGCL check limit
 (`bliss-ks0tt`). The audited CL-INTERPOL scenario supports `--prepare-unicode`
 to generate portable Unicode Lisp data with SBCL in a separate cache before
 EGCL compiles and tests it; that is distinct from a cold EGCL build.
+
+The [Gendl MOP scenario](../tests/gendl-mop/README.md) pins the unmodified
+public DEVO source and runs its 166-check kernel smoke test. It needs no
+compatibility fork at the pinned revision. Its README distinguishes prepared
+source/lock checks from completed runtime validation.

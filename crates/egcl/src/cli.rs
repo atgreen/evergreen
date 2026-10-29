@@ -30,6 +30,9 @@ pub mod events;
 mod native_runtime;
 mod python;
 mod reified_metadata;
+mod class_protocol;
+mod slot_access;
+mod generic_binding;
 pub mod sprof;
 use egcl_rt::object::{ComplexData, ConsCell, ObjectHeader, type_id};
 use egcl_rt::runtime::parse_cli as parse_runtime_cli;
@@ -1684,10 +1687,7 @@ fn setf_writer_function_object(env: &mut Env, place: EgclVal) -> Option<EgclVal>
         return None;
     }
     let symbol = resolve_sym(&setf_writer_symbol_name(&sym_name(place)))?;
-    if let Some(function) = egcl_rt::symbols::symbol_function(symbol.symbol_index()?)
-        && function != egcl_rt::value::UNBOUND
-        && egcl_rt::function::is_interpreted_function(function)
-    {
+    if let Some(function) = symbol.symbol_index().and_then(installed_function) {
         return Some(function);
     }
     // SETF generics (including DEFCLASS accessors) have methods, not a plain
@@ -1695,7 +1695,7 @@ fn setf_writer_function_object(env: &mut Env, place: EgclVal) -> Option<EgclVal>
     // generics so FUNCTION/FDEFINITION return a callable object and later
     // method changes still participate in dispatch (bliss-ksqc).
     let key = format!("(SETF {})", sym_name(place));
-    if env.generics.contains_key(&key) || env.methods.contains_key(&key) {
+    if generic_binding::current(&key) {
         let writer = EgclVal::from_symbol_index(reader::intern_symbol(&key));
         // A generic wrapper, so TYPEP GENERIC-FUNCTION and FIND-METHOD recognise
         // it (ansi class-04.5, class-26, defmethod.4).
@@ -1712,7 +1712,7 @@ fn setf_writer_function_object(env: &mut Env, place: EgclVal) -> Option<EgclVal>
 /// agree. Does not allocate on the Lisp heap.
 fn setf_writer_replacement(name: &str) -> Option<EgclVal> {
     let place = name.strip_prefix("(SETF ")?.strip_suffix(')')?;
-    global_fn(&setf_writer_symbol_name(place))
+    reader::find_symbol_index(&setf_writer_symbol_name(place)).and_then(installed_function)
 }
 
 pub(super) fn setf_writer_symbol_name(place_name: &str) -> String {
@@ -2972,6 +2972,7 @@ struct ClassDef {
     /// bare initarg name and its (unevaluated) default value form. Applied at
     /// MAKE-INSTANCE time for any initarg the caller did not supply (CLHS 7.1.4).
     default_initargs: Vec<(String, EgclVal)>,
+    direct_default_metadata: EgclVal,
 }
 
 #[derive(Clone)]
@@ -2984,6 +2985,9 @@ struct SlotDef {
     readers: Vec<String>,
     writers: Vec<String>,
     initform: Option<EgclVal>,
+    source_initform: Option<EgclVal>,
+    initfunction: Option<EgclVal>,
+    mop_options: Vec<EgclVal>,
     allocation: SlotAllocation,
 }
 
@@ -2992,9 +2996,10 @@ struct SlotDef {
 /// that Vec keeps each slot's initform precise across those GCs (bliss-wlf).
 impl egcl_rt::gc::TraceHostRoots for SlotDef {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
-        if let Some(form) = &mut self.initform {
-            visit(form);
-        }
+        if let Some(form) = &mut self.initform { visit(form); }
+        if let Some(form) = &mut self.source_initform { visit(form); }
+        if let Some(function) = &mut self.initfunction { visit(function); }
+        for value in &mut self.mop_options { visit(value); }
     }
 }
 
@@ -3973,7 +3978,7 @@ fn host_serialize_registries() -> Vec<u8> {
     // stdlib CLOS state block covers. Without them MAKE-INSTANCE of a restored
     // class silently skips every :initform (ASDF's session-cache slot, etc.).
     // Reads raw tagged words post-full-gc; no EGCL allocation — GC-safe.
-    out.extend_from_slice(b"CLSD");
+    out.extend_from_slice(b"CLS2");
     let class_recs: Vec<Vec<u8>> = SAVE_CLASSES.with(|c| {
         c.borrow().as_ref().map_or_else(Vec::new, |map| {
             map.borrow()
@@ -3990,6 +3995,7 @@ fn host_serialize_registries() -> Vec<u8> {
                         hr_put_str(&mut rec, n);
                         rec.extend_from_slice(&form.to_raw().to_le_bytes());
                     }
+                    rec.extend_from_slice(&cd.direct_default_metadata.to_raw().to_le_bytes());
                     let cells = match cd.class_slot_values.lock() {
                         Ok(c) => c,
                         Err(p) => p.into_inner(),
@@ -4039,6 +4045,14 @@ fn host_serialize_registries() -> Vec<u8> {
                                 rec.push(0);
                                 rec.extend_from_slice(&0u64.to_le_bytes());
                             }
+                        }
+                        for value in [slot.source_initform, slot.initfunction] {
+                            rec.push(u8::from(value.is_some()));
+                            rec.extend_from_slice(&value.unwrap_or(NIL).to_raw().to_le_bytes());
+                        }
+                        rec.extend_from_slice(&(slot.mop_options.len() as u32).to_le_bytes());
+                        for value in &slot.mop_options {
+                            rec.extend_from_slice(&value.to_raw().to_le_bytes());
                         }
                         rec.push(match slot.allocation {
                             SlotAllocation::Instance => 0,
@@ -4538,7 +4552,7 @@ fn host_restore_registries(data: &[u8]) -> Result<(), EgclError> {
     }
     // Interpreter class-definition block (egcl-x0f2.7c): stash remapped
     // ClassDefs for the post-Env::new drain, like the generic/method records.
-    if off + 4 <= data.len() && &data[off..off + 4] == b"CLSD" {
+    if off + 4 <= data.len() && &data[off..off + 4] == b"CLS2" {
         off += 4;
         let bad = || EgclError::InvalidImage("host registry: truncated (classes)".into());
         let n_classes = hr_get_u32(data, &mut off).ok_or_else(bad)? as usize;
@@ -4557,6 +4571,7 @@ fn host_restore_registries(data: &[u8]) -> Result<(), EgclError> {
                 let form = hr_get_u64(data, &mut off).ok_or_else(bad)?;
                 default_initargs.push((n, EgclVal::from_raw(remap(form))));
             }
+            let direct_default_metadata = EgclVal::from_raw(remap(hr_get_u64(data, &mut off).ok_or_else(bad)?));
             let n_cells = hr_get_u32(data, &mut off).ok_or_else(bad)? as usize;
             let mut cells: HashMap<String, Option<EgclVal>> = HashMap::with_capacity(n_cells);
             for _ in 0..n_cells {
@@ -4612,6 +4627,20 @@ fn host_restore_registries(data: &[u8]) -> Result<(), EgclError> {
                 off += 1;
                 let initform_raw = hr_get_u64(data, &mut off).ok_or_else(bad)?;
                 let initform = has_initform.then(|| EgclVal::from_raw(remap(initform_raw)));
+                let mut metadata = [None, None];
+                for field in &mut metadata {
+                    let present = *data.get(off).ok_or_else(bad)?;
+                    if present > 1 { return Err(bad()); }
+                    off += 1;
+                    let raw = hr_get_u64(data, &mut off).ok_or_else(bad)?;
+                    *field = (present == 1).then(|| EgclVal::from_raw(remap(raw)));
+                }
+                let n_options = hr_get_u32(data, &mut off).ok_or_else(bad)? as usize;
+                let mut mop_options = Vec::with_capacity(n_options);
+                for _ in 0..n_options {
+                    mop_options.push(EgclVal::from_raw(remap(hr_get_u64(data, &mut off).ok_or_else(bad)?)));
+                }
+
                 if data.len() < off + 1 {
                     return Err(bad());
                 }
@@ -4628,6 +4657,9 @@ fn host_restore_registries(data: &[u8]) -> Result<(), EgclError> {
                     readers,
                     writers,
                     initform,
+                    source_initform: metadata[0],
+                    initfunction: metadata[1],
+                    mop_options,
                     allocation,
                 });
             }
@@ -4639,6 +4671,7 @@ fn host_restore_registries(data: &[u8]) -> Result<(), EgclError> {
                     slots,
                     class_slot_values: Arc::new(Mutex::new(cells)),
                     default_initargs,
+                    direct_default_metadata,
                 },
             ));
         }
@@ -7426,6 +7459,9 @@ fn class_name_for_instance_class(class: EgclVal) -> String {
 }
 
 fn lookup_slot_def(env: &Env, class_name: &str, slot_name: &str) -> Option<SlotDef> {
+    if let Some(slots) = class_protocol::effective_slots(class_name) {
+        return slots.into_iter().find(|slot| symbol_bare_name_is(&slot.name, slot_name) || slot.name == slot_name);
+    }
     let class_def = env.classes.borrow().get(class_name).cloned()?;
     // Compare BARE names. `eval_defclass` stores whatever `sym_name` gave it,
     // which is package-qualified ("COMMON-LISP-USER::CS") for a symbol interned
@@ -7535,6 +7571,14 @@ fn class_slot_cell(env: &Env, class_name: &str, slot_bare: &str) -> Option<Class
 /// inheritance (bliss-lb6.14: ASDF's LOAD-OP inherits DOWNWARD-OPERATION's class
 /// slot through three superclasses).
 fn class_slot_owner(env: &Env, class_name: &str, slot_name: &str) -> Option<String> {
+    if let Some(slots) = class_protocol::effective_slots(class_name) {
+        if let Some(slot) = slots.iter().find(|slot| symbol_bare_name_is(&slot.name, slot_name)) {
+            if slot.allocation == SlotAllocation::Instance { return None; }
+            if env.classes.borrow().get(class_name).is_some_and(|definition| definition.class_slot_values.lock().unwrap().contains_key(slot_name)) {
+                return Some(class_name.to_owned());
+            }
+        }
+    }
     /// `None` = the slot was not found anywhere in the super graph, so the
     /// caller must fall back. `Some(answer)` = found, and `answer` is
     /// definitive: `Some(owner)` when class-allocated, `None` when it is an
@@ -7606,6 +7650,7 @@ fn class_slot_owner(env: &Env, class_name: &str, slot_name: &str) -> Option<Stri
 /// C supply a default, C precedes A in D's precedence list, so C's default
 /// wins (ansi class-0305).
 fn effective_default_initargs(env: &Env, class_name: &str) -> Vec<(String, EgclVal)> {
+    if let Some(defaults) = class_protocol::effective_defaults(class_name) { return defaults; }
     let mut out = Vec::new();
     let mut seen_initargs = HashSet::new();
     for name in class_precedence_names(env, class_name) {
@@ -7619,6 +7664,88 @@ fn effective_default_initargs(env: &Env, class_name: &str) -> Vec<(String, EgclV
         }
     }
     out
+}
+
+fn slot_value_or_signal(
+    instance: EgclVal,
+    slot: EgclVal,
+    env: &mut Env,
+) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted!(instance = instance);
+    egcl_rt::rooted!(slot = slot);
+    slot_access::prepare(*instance, env)?;
+    *instance = run_redefinition_update(*instance, env)?;
+    if let Some(answer) =
+        slot_access::dispatch(slot_access::Operation::Read, *instance, *slot, None, env)?
+    {
+        return Ok(answer);
+    }
+    slot_value_or_signal_raw(*instance, *slot, env)
+}
+
+fn slot_boundp_protocol(
+    instance: EgclVal,
+    slot: EgclVal,
+    env: &mut Env,
+) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted!(instance = instance);
+    egcl_rt::rooted!(slot = slot);
+    slot_access::prepare(*instance, env)?;
+    *instance = run_redefinition_update(*instance, env)?;
+    if let Some(answer) =
+        slot_access::dispatch(slot_access::Operation::Boundp, *instance, *slot, None, env)?
+    {
+        return Ok(if answer.is_nil() { NIL } else { T });
+    }
+    slot_boundp_protocol_raw(*instance, *slot, env)
+}
+
+fn slot_makunbound_protocol(
+    instance: EgclVal,
+    slot: EgclVal,
+    env: &mut Env,
+) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted!(instance = instance);
+    egcl_rt::rooted!(slot = slot);
+    slot_access::prepare(*instance, env)?;
+    egcl_rt::rooted!(current = run_redefinition_update(*instance, env)?);
+    if slot_access::dispatch(
+        slot_access::Operation::Makunbound,
+        *current,
+        *slot,
+        None,
+        env,
+    )?
+    .is_some()
+    {
+        return Ok(*instance);
+    }
+    slot_makunbound_protocol_raw(*instance, *slot, env)
+}
+
+fn store_slot_value(
+    instance: EgclVal,
+    slot: EgclVal,
+    value: EgclVal,
+    env: &mut Env,
+) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted!(instance = instance);
+    egcl_rt::rooted!(slot = slot);
+    egcl_rt::rooted!(value = value);
+    slot_access::prepare(*instance, env)?;
+    *instance = run_redefinition_update(*instance, env)?;
+    if slot_access::dispatch(
+        slot_access::Operation::Write,
+        *instance,
+        *slot,
+        Some(*value),
+        env,
+    )?
+    .is_some()
+    {
+        return Ok(*value);
+    }
+    store_slot_value_raw(*instance, *slot, *value, env)
 }
 
 fn read_slot_value(instance: EgclVal, slot: EgclVal, env: &Env) -> Result<EgclVal, EgclError> {
@@ -7708,18 +7835,20 @@ fn slot_is_missing(env: &Env, instance: EgclVal, slot: EgclVal) -> bool {
 fn invoke_slot_missing(
     env: &mut Env,
     instance: EgclVal,
-    slot: EgclVal,
+    mut slot: EgclVal,
     operation: &str,
-    new_value: Option<EgclVal>,
+    mut new_value: Option<EgclVal>,
 ) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted_ref!(_slot_root = &mut slot);
+    egcl_rt::rooted_ref!(_value_root = &mut new_value);
     let _call_depth = CallDepthGuard::enter()?;
     // `resolve_sym` interns, which allocates: root the instance across it
     // rather than building the argument vector out of a word the collector may
     // have moved (bliss-ch80h).
     egcl_rt::rooted!(instance = instance);
-    let class = egcl_stdlib::class_of(*instance);
+    egcl_rt::rooted!(class = egcl_stdlib::class_of(*instance));
     let operation = resolve_sym(operation).unwrap_or(NIL);
-    let mut values = vec![class, *instance, slot, operation];
+    let mut values = vec![*class, *instance, slot, operation];
     values.extend(new_value);
     let args = RootedVals::new(values);
     let result = invoke_generic_function("SLOT-MISSING", &args, env);
@@ -7729,11 +7858,12 @@ fn invoke_slot_missing(
 
 /// SLOT-BOUNDP through the SLOT-MISSING protocol: a missing slot answers with
 /// the generalized boolean SLOT-MISSING returns.
-fn slot_boundp_protocol(
+fn slot_boundp_protocol_raw(
     instance: EgclVal,
-    slot: EgclVal,
+    mut slot: EgclVal,
     env: &mut Env,
 ) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted_ref!(_slot_root = &mut slot);
     // As in `slot_value_or_signal`: a program may ask SLOT-BOUNDP before it
     // ever reads, and an added slot is bound once its initform has run
     // (bliss-oi5a6). Measured without this: NIL where SBCL answers T.
@@ -7746,11 +7876,12 @@ fn slot_boundp_protocol(
 }
 
 /// SLOT-MAKUNBOUND through the SLOT-MISSING protocol; returns the instance.
-fn slot_makunbound_protocol(
+fn slot_makunbound_protocol_raw(
     instance: EgclVal,
-    slot: EgclVal,
+    mut slot: EgclVal,
     env: &mut Env,
 ) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted_ref!(_slot_root = &mut slot);
     egcl_rt::rooted!(instance = instance);
     // Before unbinding, not after: the update protocol has to have run, or a
     // later read would notice the slot unbound and apply the initform the
@@ -7818,7 +7949,7 @@ fn run_redefinition_update(instance: EgclVal, env: &mut Env) -> Result<EgclVal, 
     Ok(*instance)
 }
 
-fn slot_value_or_signal(
+fn slot_value_or_signal_raw(
     instance: EgclVal,
     slot: EgclVal,
     env: &mut Env,
@@ -7955,6 +8086,7 @@ fn class_precedence_names(env: &Env, class_name: &str) -> Vec<String> {
 /// subclass that redeclares a slot without an initform does not shadow an
 /// inherited default — matching ANSI effective-slot computation.
 fn effective_slots_for_class(env: &Env, class_name: &str) -> Vec<SlotDef> {
+    if let Some(slots) = class_protocol::effective_slots(class_name) { return slots; }
     let mut result: Vec<SlotDef> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
     for cname in class_precedence_names(env, class_name) {
@@ -7965,6 +8097,8 @@ fn effective_slots_for_class(env: &Env, class_name: &str) -> Vec<SlotDef> {
             if let Some(&i) = index.get(&slot.name) {
                 if result[i].initform.is_none() && slot.initform.is_some() {
                     result[i].initform = slot.initform;
+                    result[i].source_initform = slot.source_initform;
+                    result[i].initfunction = slot.initfunction;
                 }
                 // CLHS 7.5.3: the initargs of an effective slot are the union
                 // of the initargs of its slot specifiers (ansi class-0215).
@@ -7999,6 +8133,8 @@ fn apply_class_initforms(
     // `:allocation :class` slot's value lives in its OWNING class's shared cell
     // (bliss-x4p), resolved per slot via `class_slot_cell`.
     let effective = effective_slots_for_class(env, class_name);
+    let mut initfunctions: Vec<EgclVal> = effective.iter().map(|s| s.initfunction.unwrap_or(NIL)).collect();
+    egcl_rt::rooted_ref!(_initfunctions_root = &mut initfunctions);
     let mut initforms: Vec<EgclVal> = effective
         .iter()
         .map(|s| s.initform.unwrap_or(NIL))
@@ -8034,7 +8170,11 @@ fn apply_class_initforms(
         // Read the (GC-current) rooted copy of the initform, not the plain
         // Vec-resident one captured before earlier iterations allocated.
         let _ = initform;
-        let value = eval_form(initforms[slot_index], env)?;
+        let value = if initfunctions[slot_index].is_nil() {
+            eval_form(initforms[slot_index], env)?
+        } else {
+            apply_function(initfunctions[slot_index], &[], env)?
+        };
         match slot.allocation {
             SlotAllocation::Class => {
                 if let Some(values) = class_cell.as_ref() {
@@ -8748,12 +8888,13 @@ fn method_context_has_next(context: &MethodContext) -> bool {
     }
 }
 
-fn store_slot_value(
+fn store_slot_value_raw(
     instance: EgclVal,
-    slot: EgclVal,
+    mut slot: EgclVal,
     value: EgclVal,
     env: &mut Env,
 ) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted_ref!(_slot_root = &mut slot);
     egcl_rt::rooted!(value = value);
     // Before `slot_is_missing`, which migrates: `write_slot_value` below uses
     // this word afterwards (bliss-ch80h).
@@ -9546,6 +9687,9 @@ fn names_accessor_generic(symbol: u32) -> bool {
         return false;
     }
     let name = sym_name_rc(EgclVal::from_symbol_index(symbol));
+    if !generic_binding::current(&name) {
+        return false;
+    }
     if setf_writer_replacement(&name).is_some() {
         return false;
     }
@@ -9683,6 +9827,17 @@ fn try_single_primary_fast(
     // (#202). An unbound, missing or class-allocated slot, or an obsolete
     // instance, falls through to the body for the full protocol.
     if let Some((slot, access)) = effective.accessor {
+        let args = RootedVals::new(args.to_vec());
+        let operation = match access {
+            SlotAccess::Read => slot_access::Operation::Read,
+            _ => slot_access::Operation::Write,
+        };
+        let instance = args.last().copied().unwrap_or(NIL);
+        if !slot_access::pristine(instance, operation, env) {
+            let id = effective.primary[0];
+            let callable = METHOD_COMPILED.borrow().get(&id.0).copied()?;
+            return Some(apply_function(callable, &args, env));
+        }
         let slot = EgclVal::from_symbol_index(slot);
         match access {
             SlotAccess::Write if args.len() == 2 => {
@@ -10432,13 +10587,12 @@ fn visit_class_def_roots(
     visit: &mut dyn FnMut(*mut EgclVal),
 ) {
     for slot in &mut class.slots {
-        if let Some(initform) = &mut slot.initform {
-            visit(initform);
-        }
+        egcl_rt::gc::TraceHostRoots::trace_host_roots(slot, visit);
     }
     // The (:default-initargs …) value FORMS are heap conses too — unvisited,
     // a moving GC leaves them stale and a later MAKE-INSTANCE evaluates a
     // dangling form (same class of bug as bliss-wlf's slot initforms).
+    visit(&mut class.direct_default_metadata);
     for (_, form) in &mut class.default_initargs {
         visit(form);
     }
@@ -20752,8 +20906,7 @@ fn mv_form_preserves_values(name: &str, env: &Env) -> bool {
     let bare = name.rsplit(':').next().unwrap_or(name);
     if fn_bound(env, name)
         || macro_defined(env, name)
-        || env.generics.contains_key(name)
-        || env.methods.contains_key(name)
+        || generic_binding::current(name)
         || fn_bound(env, bare)
     {
         return true;
@@ -20861,6 +21014,7 @@ fn mv_operator_preserves(name: &str) -> bool {
             | "EVAL"
             | "FUNCALL"
             | "APPLY"
+            | "EGCL::%APPLY-RETAINED-GENERIC"
             | "CALL-NEXT-METHOD"
             // The bytecode-lowered spelling of the same thing: a compiled method
             // body calls the next method through this, and CALL-NEXT-METHOD
@@ -21083,13 +21237,18 @@ fn generic_wrapper_cache() -> &'static SharedCell<GenericWrapperCache> {
     CACHE.get_or_init(|| SharedCell::new(GenericWrapperCache::default()))
 }
 
-fn named_apply_wrapper(env: &mut Env, name_sym: EgclVal) -> EgclVal {
-    // Build (&REST %args) and ((APPLY (QUOTE <name>) %args)), rooting each
+fn named_apply_wrapper(env: &mut Env, name_sym: EgclVal, retained_generic: bool) -> EgclVal {
+    // Build (&REST %args) and a named apply call, rooting each
     // intermediate across the allocating arena_cons calls (moving minor GC).
     egcl_rt::rooted!(name_sym = name_sym);
     let rest_kw = resolve_sym("&REST").unwrap_or(NIL);
     let args_sym = resolve_sym("EGCL::%BUILTIN-WRAPPER-ARGS").unwrap_or(NIL);
-    let apply_sym = resolve_sym("APPLY").unwrap_or(NIL);
+    let apply_sym = resolve_sym(if retained_generic {
+        "EGCL::%APPLY-RETAINED-GENERIC"
+    } else {
+        "APPLY"
+    })
+    .unwrap_or(NIL);
     let quote_sym = resolve_sym("QUOTE").unwrap_or(NIL);
     egcl_rt::rooted!(params_form = arena_cons(args_sym, NIL));
     *params_form = arena_cons(rest_kw, *params_form);
@@ -21143,7 +21302,7 @@ fn builtin_fn_wrapper(env: &mut Env, name_sym: EgclVal, bare: &str) -> EgclVal {
             return reference;
         }
     }
-    egcl_rt::rooted!(v = named_apply_wrapper(env, name_sym));
+    egcl_rt::rooted!(v = named_apply_wrapper(env, name_sym, false));
     // Reify once before exposing the function. Installing a saved builtin in
     // another symbol's cell must preserve EQ identity, not wrap it again.
     *v = coerce_installed_function(env, *v);
@@ -21158,6 +21317,8 @@ fn builtin_fn_wrapper(env: &mut Env, name_sym: EgclVal, bare: &str) -> EgclVal {
     winner
 }
 
+// The private operator makes retained dispatch explicit in the serialized body;
+// unlike an ordinary APPLY wrapper it survives public unbinding after restore.
 fn generic_fn_wrapper(env: &mut Env, name_sym: EgclVal, name: &str) -> EgclVal {
     {
         let cache = generic_wrapper_cache().borrow();
@@ -21165,7 +21326,7 @@ fn generic_fn_wrapper(env: &mut Env, name_sym: EgclVal, name: &str) -> EgclVal {
             return reference;
         }
     }
-    egcl_rt::rooted!(v = named_apply_wrapper(env, name_sym));
+    egcl_rt::rooted!(v = named_apply_wrapper(env, name_sym, true));
     let mut cache = generic_wrapper_cache().borrow_mut();
     let winner = *cache.values.entry(name.to_string()).or_insert(*v);
     cache
@@ -21299,6 +21460,9 @@ fn symbol_function_object_ex(
     if let Some(function) = name_sym.symbol_index().and_then(installed_function) {
         return Some(function);
     }
+    if generic_binding::undefined(&fn_name) {
+        return None;
+    }
     if is_builtin_function(&fn_name) {
         // Cached bare name too, and only on the branch that needs it.
         let bare = sym_bare_name_rc(name_sym);
@@ -21318,9 +21482,9 @@ fn symbol_function_object_ex(
     // env.generics/env.methods rather than in a function cell, so they reached
     // the `None` below and `#'gf` came back as the bare symbol, making
     // (functionp #'gf) NIL where SBCL says T. Reify the same apply-by-name
-    // wrapper used for builtins; dispatch still happens per call, so a method
-    // added later is still picked up.
-    let is_generic = env.generics.contains_key(&fn_name) || env.methods.contains_key(&fn_name);
+    // wrapper used for builtins; the native self-symbol marker validates the
+    // public binding, while retained wrappers keep their metadata dispatch.
+    let is_generic = generic_binding::current(&fn_name);
     if is_generic {
         // Key the wrapper by the FULL name, not the bare one: that is the
         // env.generics/env.methods key, so generic_wrapper_name() round-trips
@@ -21523,6 +21687,7 @@ fn fixed_arity_builtin(bare: &str) -> Option<(usize, usize)> {
         // argument as the function name and reported it undefined, pointing the
         // diagnostic somewhere unrelated to the mistake. ansi APPLY.ERROR.1.
         "APPLY" => Some((2, usize::MAX)),
+        "EGCL::%APPLY-RETAINED-GENERIC" => Some((2, 2)),
         // (find-symbol string &optional package) and the interning/using
         // functions all take one required argument and an optional package.
         "FIND-SYMBOL" | "INTERN" | "UNINTERN" | "USE-PACKAGE" | "UNUSE-PACKAGE" | "EXPORT"
@@ -22880,6 +23045,14 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             egcl_rt::rooted!(function = function);
             let args = eval_args(cdr, env)?;
             return apply_function(*function, &args, env);
+        }
+
+        if !shadowed_by_lexical_function
+            && generic_binding::undefined(&name)
+            && !builtin_fallback_active(&name)
+        {
+            let _args = eval_args(cdr, env)?;
+            return Err(EgclError::UndefinedFunction(generic_name_form_for_key(env, &name)));
         }
 
         // Fixed-arity builtin arg-count check: calling a function with the wrong
@@ -24550,6 +24723,8 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 let class = resolve_class_metaobject(env, class_input)?;
                 return Ok(egcl_stdlib::clos::class_metaclass(class));
             }
+            "EGCL-INTERNAL::%MOP-CLASS-PROTOCOL"
+            | "EGCL-INTERNAL:%MOP-CLASS-PROTOCOL" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL-INTERNAL::%CLASS-SLOT-DESCRIPTORS"
             | "EGCL-INTERNAL:%CLASS-SLOT-DESCRIPTORS"
             | "%CLASS-SLOT-DESCRIPTORS" => {
@@ -24637,7 +24812,9 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     entry.push(kw("INITARGS"));
                     entry.push(vec_to_list(&initargs));
                     entry.push(kw("INITFORM"));
-                    entry.push(slots[i].initform.unwrap_or(NIL));
+                    entry.push(slots[i].source_initform.or(slots[i].initform).unwrap_or(NIL));
+                    entry.push(kw("INITFUNCTION"));
+                    entry.push(slots[i].initfunction.unwrap_or(NIL));
                     entry.push(kw("ALLOCATION"));
                     entry.push(kw(match slots[i].allocation {
                         SlotAllocation::Instance => "INSTANCE",
@@ -24647,6 +24824,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     entry.push(vec_to_list(&readers));
                     entry.push(kw("WRITERS"));
                     entry.push(vec_to_list(&writers));
+                    entry.extend_from_slice(&slots[i].mop_options);
                     out.push(vec_to_list(&entry));
                 }
                 return Ok(vec_to_list(&out));
@@ -24698,12 +24876,12 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     // `(fdefinition '(setf place))` answers with the writer's
                     // function object for the same reason `#'(setf place)` does
                     // (bliss-sqvh).
-                    if spec.is_cons()
-                        && let (_setf, tail) = cp(spec)
-                        && tail.is_cons()
-                        && let Some(object) = setf_writer_function_object(env, cp(tail).0)
-                    {
-                        return Ok(object);
+                    if spec.is_cons() {
+                        let (_setf, tail) = cp(spec);
+                        if let Some(object) = setf_writer_function_object(env, cp(tail).0) {
+                            return Ok(object);
+                        }
+                        return Err(EgclError::UndefinedFunction(spec));
                     }
                 }
                 if spec.is_symbol() {
@@ -24724,10 +24902,9 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     let n = sym_name(spec);
                     let bare = symbol_bare_name(&n);
                     if fn_bound(env, &n)
-                        || env.methods.contains_key(&n)
-                        || env.generics.contains_key(&n)
+                        || generic_binding::current(&n)
                         || macro_defined(env, &n)
-                        || is_builtin_function(&n)
+                        || (!generic_binding::undefined(&n) && is_builtin_function(&n))
                         // Standard special operators and standard macros that the
                         // evaluator implements directly are fbound in the CL sense,
                         // so FDEFINITION must not signal (ansi FDEFINITION.2/.3 —
@@ -24785,10 +24962,9 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 let bound = cell_bound
                     || setf_writer_bound
                     || fn_bound(env, &name)
-                    || env.methods.contains_key(&name)
-                    || env.generics.contains_key(&name)
+                    || generic_binding::current(&name)
                     || macro_defined(env, &name)
-                    || is_builtin_function(&name)
+                    || (!generic_binding::undefined(&name) && is_builtin_function(&name))
                     // Standard special operators and standard macros that the
                     // evaluator implements directly are fbound in the CL sense.
                     // FDEFINITION already consults both — FBOUNDP did not, so the
@@ -26189,7 +26365,9 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                                     for v in eval_args(*aargs, env)?.iter() {
                                         args.push(*v);
                                     }
-                                    invoke_generic_function(&key, &args, env)?;
+                                    let function =
+                                        EgclVal::from_symbol_index(reader::intern_symbol(&key));
+                                    apply_function(function, &args, env)?;
                                 } else if let Some(slot_name) = accessor_slot_name(env, other) {
                                     egcl_rt::rooted!(tgt = eval_form(tgt_form, env)?);
                                     // Resolve on this instance: unrelated classes can
@@ -26336,7 +26514,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 // make-instance.1/2 and :around methods); the built-in
                 // instantiation is the fallback for other classes.
                 let fallback = take_builtin_fallback(&name);
-                if env.methods.contains_key(&name) && !fallback {
+                if generic_binding::current(&name) && !fallback {
                     let args = eval_args(cdr, env)?;
                     return invoke_generic_function(&name, &args, env);
                 }
@@ -26587,8 +26765,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     } else {
                         val_as_str(*name)
                     };
-                    let is_generic =
-                        env.generics.contains_key(&gname) || env.methods.contains_key(&gname);
+                    let is_generic = generic_binding::current(&gname);
                     if is_generic {
                         let primary = if name.is_nil() { NIL } else { *name };
                         env.set_mv(vec![primary, NIL, NIL]);
@@ -26609,10 +26786,9 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                             } else {
                                 val_as_str(*name)
                             };
-                            let fbound = env.generics.contains_key(&nm)
-                                || env.methods.contains_key(&nm)
+                            let fbound = generic_binding::current(&nm)
                                 || macro_defined(env, &nm)
-                                || is_builtin_function(&nm);
+                                || (!generic_binding::undefined(&nm) && is_builtin_function(&nm));
                             if fbound {
                                 let primary = if name.is_nil() { NIL } else { *name };
                                 env.set_mv(vec![primary, NIL, NIL]);
@@ -26697,6 +26873,9 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     }
                 }
                 return apply_function(*fn_val, &args, env);
+            }
+            "EGCL::%APPLY-RETAINED-GENERIC" => {
+                return eval_builtin_arguments(&name, cdr, env);
             }
             "LENGTH" => {
                 let (af, _) = cp(cdr);
@@ -27843,7 +28022,12 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             "SIGNAL" => return eval_builtin_arguments(&name, cdr, env),
             "WARN" => return eval_builtin_arguments(&name, cdr, env),
             "MAKE-CONDITION" => return eval_builtin_arguments(&name, cdr, env),
-            "SLOT-VALUE" => return eval_builtin_arguments(&name, cdr, env),
+            "EGCL-INTERNAL:%RAW-SLOT-VALUE"
+            | "EGCL-INTERNAL:%STANDARD-SLOT-VALUE-USING-CLASS"
+            | "EGCL-INTERNAL:%STANDARD-SET-SLOT-VALUE-USING-CLASS"
+            | "EGCL-INTERNAL:%STANDARD-SLOT-BOUNDP-USING-CLASS"
+            | "EGCL-INTERNAL:%STANDARD-SLOT-MAKUNBOUND-USING-CLASS"
+            | "SLOT-VALUE" => return eval_builtin_arguments(&name, cdr, env),
             "SLOT-BOUNDP" => return eval_builtin_arguments(&name, cdr, env),
             // (ALLOCATE-INSTANCE class &rest initargs) — CLHS 7.7.1. Returns a
             // new instance with EVERY slot unbound: no initforms, no initargs,
@@ -27915,7 +28099,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 // A user method on CLASS-NAME takes part in dispatch; the built-in
                 // behaviour is the fallback for classes without one (ansi class-name.2).
                 let fallback = take_builtin_fallback(&name);
-                if env.methods.contains_key(&name) && !fallback {
+                if generic_binding::current(&name) && !fallback {
                     let args = eval_args(cdr, env)?;
                     return invoke_generic_function(&name, &args, env);
                 }
@@ -29744,7 +29928,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         // Installed reader methods participate in ordinary generic dispatch,
         // including around methods and later method redefinitions. A slot-name
         // mapping alone cannot justify bypassing the applicable methods.
-        if (env.generics.contains_key(&name) || env.methods.contains_key(&name))
+        if generic_binding::current(&name)
             && !take_builtin_fallback(&name)
         {
             let args = eval_args(cdr, env)?;
@@ -39097,6 +39281,12 @@ fn is_constant_initform(form: EgclVal) -> bool {
 }
 
 fn eval_defclass(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
+    eval_defclass_with_defaults(cdr, env, None, None)
+}
+
+fn eval_defclass_with_defaults(cdr: EgclVal, env: &mut Env, mut provided_defaults: Option<EgclVal>, mut provided_initargs: Option<EgclVal>) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted_ref!(_provided_defaults = &mut provided_defaults);
+    egcl_rt::rooted_ref!(_provided_initargs = &mut provided_initargs);
     // A new/redefined class can change class-of results and precedence, so every
     // cached dispatch decision may be stale (bliss-x5y.20).
     invalidate_gf_dispatch_cache();
@@ -39169,6 +39359,7 @@ fn eval_defclass(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     // allocations below (accessor setf names, define_class …), so they are
     // kept in a rooted Vec parallel to the (unrooted) name Vec and re-paired
     // when the ClassDef is built (bliss-wlf).
+    egcl_rt::rooted!(class_initargs = Vec::<EgclVal>::new());
     let mut default_initarg_names: Vec<String> = Vec::new();
     egcl_rt::rooted!(default_initarg_forms = Vec::<EgclVal>::new());
     // (:metaclass funcallable-standard-class) makes every instance of the class a
@@ -39205,6 +39396,9 @@ fn eval_defclass(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             continue;
         }
         if sym_bare_name_rc(opt_key).as_ref() != "DEFAULT-INITARGS" {
+            if sym_bare_name_rc(opt_key).as_ref() != "DOCUMENTATION" {
+                class_initargs.extend_from_slice(&[opt_key, opt_rest]);
+            }
             continue;
         }
         let pairs = list_to_vec(opt_rest);
@@ -39218,6 +39412,10 @@ fn eval_defclass(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             default_initarg_forms.push(pairs[j + 1]);
             j += 2;
         }
+    }
+
+    if let Some(supplied) = provided_initargs {
+        *class_initargs = list_to_vec(supplied);
     }
 
     // Parse superclasses
@@ -39258,6 +39456,7 @@ fn eval_defclass(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             // Rooted: the initform is an arbitrary heap form held across the
             // setf-name allocation below (bliss-wlf).
             egcl_rt::rooted!(initform = None::<EgclVal>);
+            egcl_rt::rooted!(mop_options = Vec::<EgclVal>::new());
             let mut allocation = SlotAllocation::Instance;
             // Method-name symbols for this slot, captured verbatim (see above).
             let mut reader_syms: Vec<EgclVal> = Vec::new();
@@ -39337,10 +39536,11 @@ fn eval_defclass(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     } else {
                         i += 1;
                     }
-                } else if opt_bare == "TYPE" || opt_bare == "DOCUMENTATION" {
-                    i += 2;
                 } else {
-                    i += 1;
+                    if i + 1 < opts.len() {
+                        mop_options.extend_from_slice(&opts[i..i + 2]);
+                    }
+                    i += 2;
                 }
             }
 
@@ -39369,6 +39569,9 @@ fn eval_defclass(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 readers,
                 writers,
                 initform,
+                source_initform: initform,
+                initfunction: None,
+                mop_options: mop_options.iter().copied().collect(),
                 allocation,
             });
         } else if slot_form.is_symbol() {
@@ -39379,6 +39582,9 @@ fn eval_defclass(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 readers: Vec::new(),
                 writers: Vec::new(),
                 initform: None,
+                source_initform: None,
+                initfunction: None,
+                mop_options: Vec::new(),
                 allocation: SlotAllocation::Instance,
             });
         }
@@ -39402,6 +39608,9 @@ fn eval_defclass(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             readers: Vec::new(),
             writers: Vec::new(),
             initform: None,
+            source_initform: None,
+            initfunction: None,
+            mop_options: Vec::new(),
             allocation: SlotAllocation::Instance,
         });
     }
@@ -39411,6 +39620,12 @@ fn eval_defclass(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     // (ansi class-11/12/28, shared-initialize.2.*) therefore closes each form
     // over the current environment, and the stored form calls that closure.
     // A top-level DEFCLASS keeps the bare forms, which serialize into images.
+    class_protocol::capture_slot_initfunctions(&mut slots, env)?;
+    egcl_rt::rooted!(direct_default_metadata = match provided_defaults {
+        Some(defaults) => defaults,
+        None => class_protocol::capture_default_initargs(&default_initarg_names, &default_initarg_forms, env)?,
+    });
+
     let nested_in_lexical_environment = TOPLEVEL_FRAME_BASE.with(|s| {
         s.borrow()
             .last()
@@ -39465,6 +39680,7 @@ fn eval_defclass(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             slots: slots_vec,
             class_slot_values: Arc::new(Mutex::new(class_slot_values)),
             default_initargs,
+            direct_default_metadata: *direct_default_metadata,
         },
     );
     // Any class (re)definition invalidates the accessor slot cache (bliss-1qjmm).
@@ -39534,13 +39750,14 @@ fn eval_defclass(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             true,
         ),
     };
-    egcl_stdlib::clos::define_class_with_shared_slots(
-        name_form,
-        class,
-        &direct_supers,
-        &slot_names,
-        &shared_slot_names,
-    )?;
+    let protocol_ready = class_protocol::supports_protocol(class)
+        && reader::find_symbol_index("EGCL-MOP::%FINALIZE-DEFINED-CLASS")
+            .is_some_and(|index| fn_bound(env, &sym_name(EgclVal::from_symbol_index(index))));
+    if protocol_ready {
+        egcl_stdlib::clos::stage_class_with_shared_slots(name_form, class, &direct_supers, &slot_names, &shared_slot_names)?;
+    } else {
+        egcl_stdlib::clos::define_class_with_shared_slots(name_form, class, &direct_supers, &slot_names, &shared_slot_names)?;
+    }
 
     // Record the named metaclass now that the class exists, resolving the name
     // to its class metaobject. Deliberately AFTER define_class: the metaclass
@@ -39576,6 +39793,12 @@ fn eval_defclass(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         }
     }
 
+    if metaclass_name != NIL {
+        egcl_rt::rooted!(class_arguments = vec![egcl_stdlib::find_class(name_form).unwrap_or(class)]);
+        class_arguments.extend_from_slice(&class_initargs);
+        invoke_generic_function(if class_is_fresh { "INITIALIZE-INSTANCE" } else { "REINITIALIZE-INSTANCE" }, &class_arguments, env)?;
+    }
+
     // Install real generic methods for slot readers/writers/accessors so they
     // work as function values (`#'reader`, funcall/apply/map), not only in
     // operator position (bliss-aid). The accessor fast-path in `eval_list`
@@ -39585,6 +39808,13 @@ fn eval_defclass(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     for i in 0..method_specs.len() {
         let (slot_sym, method_name) = method_specs[i];
         install_slot_accessor_method(env, method_name, name_form, slot_sym, method_spec_writer[i])?;
+    }
+    if let Some(helper) = reader::find_symbol_index("EGCL-MOP::%FINALIZE-DEFINED-CLASS") {
+        let helper = EgclVal::from_symbol_index(helper);
+        if fn_bound(env, &sym_name(helper)) {
+            egcl_rt::rooted!(arguments = vec![egcl_stdlib::find_class(name_form).unwrap_or(name_form)]);
+            apply_function(helper, &arguments, env)?;
+        }
     }
     // DEFCLASS returns the CLASS, not its name (CLHS DEFCLASS). Returning the
     // name was indistinguishable while a class WAS its name symbol, and
@@ -41420,6 +41650,7 @@ fn eval_defgeneric(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     if let Some(generic) = env.generics.borrow_mut().get_mut(&name) {
         generic.option_methods = option_method_ids.clone();
     }
+    generic_binding::publish(&name, name_form.symbol_index(), true);
     // DEFGENERIC returns the generic function object (CLHS), as `#'name`
     // reifies it (ansi defgeneric.1-).
     egcl_rt::rooted!(function_form = vec_to_list(&[resolve_sym("FUNCTION").unwrap_or(NIL), name_form]));
@@ -41680,6 +41911,7 @@ fn eval_defmethod(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             }
         }
     }
+    generic_binding::publish(&name, name_form.symbol_index(), false);
     // DEFMETHOD returns the method object (CLHS), the handle every method
     // function understands (ansi defmethod.1/.2).
     Ok(method_id)
@@ -41860,6 +42092,10 @@ fn eval_make_instance(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError>
     egcl_rt::rooted_ref!(_initargs_root = &mut init_args);
     egcl_rt::rooted!(class_input = eval_form(class_form, env)?);
     egcl_rt::rooted!(class = resolve_class_metaobject(env, *class_input)?);
+    // Custom ancestor finalizers must run before CPL/layout checks or any
+    // allocation can inspect a staged class. The later evaluated entry sees
+    // the finalized state and does not invoke the hooks twice.
+    class_protocol::ensure_finalized(*class, env)?;
     // Finalizing the class orders its superclasses; an inconsistent hierarchy
     // must be reported here, where the caller can handle it, before the
     // initarg forms run, not later when something merely prints the instance
@@ -41910,6 +42146,7 @@ fn make_instance_of_class(
 ) -> Result<EgclVal, EgclError> {
     egcl_rt::rooted!(class = class);
     rooted_args!(initargs = initargs);
+    class_protocol::ensure_finalized(*class, env)?;
     let generation = GF_DISPATCH_GENERATION.load(AtomicOrdering::Acquire);
     if let Some(plan) = make_instance_plan_for(*class)
         && let Some(result) = make_instance_planned(*class, &plan, initargs, env)
@@ -43467,8 +43704,11 @@ fn apply_function_impl(
     // Uninstalled builtin/generic symbols retain their existing dispatch.
     if fn_val.is_symbol() {
         let name = sym_name_rc(fn_val);
-        if env.generics.contains_key(&name) || env.methods.contains_key(&name) {
+        if generic_binding::current(&name) {
             return invoke_generic_function(&name, args, env);
+        }
+        if generic_binding::undefined(&name) {
+            return Err(EgclError::UndefinedFunction(generic_name_form_for_key(env, &name)));
         }
         // Fixed-arity builtin arg-count check on EVERY dispatch path, not only the
         // tree-walker's eval_list: the direct/fast builtin dispatches below (the
@@ -43894,6 +44134,15 @@ fn is_builtin_function(name: &str) -> bool {
     if cfg!(egcl_no_dynamic_code) && crate::runtime_contract::opens_code_world(name) {
         return false;
     }
+    if matches!(
+        name,
+        "EGCL-INTERNAL:%MOP-CLASS-PROTOCOL" | "EGCL-INTERNAL::%MOP-CLASS-PROTOCOL"
+    ) {
+        return true;
+    }
+    if slot_access::builtin(name) {
+        return true;
+    }
     if name == "DISASSEMBLE" {
         return !cfg!(egcl_no_disassembly);
     }
@@ -43901,7 +44150,7 @@ fn is_builtin_function(name: &str) -> bool {
     if name == "PRINT-OBJECT" {
         return true;
     }
-    if matches!(name, "EGCL::%READ-STANDARD-MACRO" | "EGCL::%STANDARD-CHARACTER-READER" | "EGCL::SET-FILL-POINTER"
+    if matches!(name, "EGCL::%APPLY-RETAINED-GENERIC" | "EGCL::%READ-STANDARD-MACRO" | "EGCL::%STANDARD-CHARACTER-READER" | "EGCL::SET-FILL-POINTER"
         | "EGCL::%PPRINT-CIRCLE" | "EGCL::%PPRINT-NATIVE-COLUMN"
         | "EGCL::%PPRINT-RENDER-LAYOUT" | "EGCL::%FORMAT-CONSUMED"
         | "EGCL::%NATIVE-INTERACTIVE-STREAM-P") {
@@ -44321,10 +44570,9 @@ fn apply_builtin_fast(
         // Reachable through FUNCALL/APPLY/MAPCAR, not only operator position.
         "ALLOCATE-INSTANCE" if !args.is_empty() => {
             env.clear_mv();
-            match resolve_class_metaobject(env, args[0]) {
-                Ok(class) => Some(egcl_stdlib::clos::allocate_instance(class)),
-                Err(e) => Some(Err(e)),
-            }
+            // The shared evaluated handler roots the designator and finalizes
+            // ancestors before reaching the raw allocator.
+            evaluated_builtins::call(name, args, env)
         }
         "SLOT-MAKUNBOUND" if args.len() == 2 => {
             env.clear_mv();
@@ -48217,12 +48465,16 @@ mod class_slot_owner_tests {
                     readers: vec![],
                     writers: vec![],
                     initform: None,
+                    source_initform: None,
+                    initfunction: None,
+                    mop_options: Vec::new(),
                     allocation,
                 })
                 .into_iter()
                 .collect(),
             class_slot_values: Arc::new(Mutex::new(HashMap::new())),
             default_initargs: vec![],
+            direct_default_metadata: NIL,
         }
     }
 
@@ -48724,10 +48976,14 @@ mod env_gc_root_tests {
                     readers: Vec::new(),
                     writers: Vec::new(),
                     initform: Some(marker(12)),
+                    source_initform: None,
+                    initfunction: None,
+                    mop_options: Vec::new(),
                     allocation: SlotAllocation::Instance,
                 }],
                 class_slot_values: Arc::new(Mutex::new(class_values)),
                 default_initargs: Vec::new(),
+                direct_default_metadata: NIL,
             },
         );
         // Any class (re)definition invalidates the accessor slot cache (bliss-1qjmm).
