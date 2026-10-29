@@ -45,6 +45,15 @@ const SOURCE: &str = r#"
 (defclass raw-custom-class () ((z :initform 77)) (:metaclass raw-custom-meta))
 (unless (raw-mop "CLASS-FINALIZED-P" (find-class 'raw-custom-class))
   (raw-mop "FINALIZE-INHERITANCE" (find-class 'raw-custom-class)))
+;; Undefined superclass placeholders must not acquire raw empty slot caches.
+(defclass raw-forward-child (raw-forward-parent) ((local :initform 6)))
+(defvar *raw-forward-class* (find-class 'raw-forward-parent))
+(assert (handler-case (progn (raw-mop "CLASS-SLOTS" *raw-forward-class*) nil) (error () t)))
+(assert (null (raw-mop "CLASS-DIRECT-SLOTS" *raw-forward-class*)))
+(defclass raw-forward-parent () ((inherited :initform 5)))
+(assert (eq *raw-forward-class* (find-class 'raw-forward-parent)))
+(unless (raw-mop "CLASS-FINALIZED-P" (find-class 'raw-forward-child))
+  (raw-mop "FINALIZE-INHERITANCE" (find-class 'raw-forward-child)))
 (defun verify-raw-slot-introspection ()
   (assert (equal (sort (raw-slot-names (raw-mop "CLASS-SLOTS" (find-class 'raw-slot-child))) #'string<)
                  '("X" "Y")))
@@ -69,6 +78,11 @@ const SOURCE: &str = r#"
     (raw-mop "CLASS-SLOTS" (find-class 'raw-custom-class))
     (assert (= *raw-standard-hooks* count)))
   (assert (= (slot-value (make-instance 'raw-custom-class) 'z) 77))
+  (let ((instance (make-instance 'raw-forward-child)))
+    (assert (= (slot-value instance 'local) 6))
+    (assert (= (slot-value instance 'inherited) 5)))
+  (assert (equal (sort (raw-slot-names (raw-mop "CLASS-SLOTS" (find-class 'raw-forward-child))) #'string<)
+                 '("INHERITED" "LOCAL")))
   (write-line "RAW-SLOT-INTROSPECTION-OK"))
 "#;
 

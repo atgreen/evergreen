@@ -5410,13 +5410,13 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
          (cached (egcl-internal::%mop-class-protocol :direct class)))
     (if cached (car cached)
         (let ((slots
-                (if (typep class 'standard-class)
+                (if (typep class '(or structure-class built-in-class))
+                    (egcl-mop::%raw-slot-definition-objects class t)
                     (mapcar (lambda (descriptor)
                               (apply #'make-instance
                                      (apply #'egcl-mop:direct-slot-definition-class class descriptor)
                                      descriptor))
-                            (egcl-internal::%class-slot-descriptors class t))
-                    (egcl-mop::%raw-slot-definition-objects class t))))
+                            (egcl-internal::%class-slot-descriptors class t)))))
           (egcl-internal::%mop-class-protocol :set-direct class slots)))))
 
 (defvar egcl-mop::*finalizing-class* nil)
@@ -5482,13 +5482,13 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
   (let* ((class (if (symbolp class) (find-class class) class))
          (cached (egcl-internal::%mop-class-protocol :effective class)))
     (if cached (car cached)
-        (if (typep class 'standard-class)
-            (progn
-              (egcl-mop:finalize-inheritance class)
-              (car (egcl-internal::%mop-class-protocol :effective class)))
+        (if (typep class '(or structure-class built-in-class))
             (egcl-internal::%mop-class-protocol
              :set-raw-effective class
-             (egcl-mop::%raw-slot-definition-objects class nil))))))
+             (egcl-mop::%raw-slot-definition-objects class nil))
+            (progn
+              (egcl-mop:finalize-inheritance class)
+              (car (egcl-internal::%mop-class-protocol :effective class)))))))
 
 ;;; ── EGCL-MOP ──────────────────────────────────────────────────────
 ;;;
