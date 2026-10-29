@@ -65,8 +65,12 @@ system in the repository and discovers their unrelated dependencies.
 
 A fresh ocicl restore preserves the committed lockfile byte-for-byte. The
 scenario passes all 166 checks against the GNU/CFFI release built from
-`c66c4f465e870ebe0091d3d4990b9a875e0d8852` (binary SHA-256
-`c05a58e9bbd5d21a41dd72d3a56f37ff9e5d34266bcd0e15e3b0c83733374d54`).
+`513dfc83c76a456c8057e1ead50c81ff8eddd0c2` (binary SHA-256
+`ca5c3dfa7d16fedd54ef06fd38898bcb8bc181c926de2d5efa4b07fab3155c99`).
+A separate stress17/poison run restored an ASDF-only preload image and used
+an empty Gendl output cache. It hit its 1,200-second cap while compiling BASE;
+the 166 checks did not complete, so this is not a stress-suite pass. Focused
+moving-GC and class/slot protocol regressions provide separate validation.
 The independent SBCL command above remains unrun for this fresh scenario.
 Any later compatibility changes must live in an `atgreen` fork and be pinned
 here; never patch the downloaded tree.
