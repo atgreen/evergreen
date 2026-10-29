@@ -6,6 +6,7 @@
 //! See spec §5.9.
 
 mod control_validation;
+mod fill_normalization;
 
 use egcl_rt::error::EgclError;
 use egcl_rt::lock_order::{LockLevel, OrderedMutex};
@@ -3853,7 +3854,8 @@ pub fn format_to_layout_in_context(
     let mut args = args.to_vec();
     egcl_rt::rooted_ref!(_args_root = &mut args);
     validate_matching(control_string)?;
-    control_validation::validate(control_string)?;
+    let control_string = fill_normalization::normalize(control_string)?;
+    control_validation::validate(&control_string)?;
 
     let mut output = LayoutDoc {
         events: Vec::new(),
@@ -3862,7 +3864,7 @@ pub fn format_to_layout_in_context(
     };
     let mut arg_idx = 0;
     take_escape();
-    let result = format_impl(control_string, &args, &mut arg_idx, &mut output);
+    let result = format_impl(&control_string, &args, &mut arg_idx, &mut output);
     take_escape();
     if let Err(error) = &result {
         if std::env::var_os("EGCL_FMT_DBG").is_some() {
@@ -4924,6 +4926,7 @@ fn format_impl(
                     let sub_control = extract_egcl_string(ctrl_val).ok_or_else(|| {
                         EgclError::Internal("failed to extract format string".into())
                     })?;
+                    let sub_control = fill_normalization::normalize(&sub_control)?;
                     control_validation::validate(&sub_control)?;
                     if at_sign {
                         // ~@? — use the enclosing argument list from current position
@@ -5068,8 +5071,9 @@ fn format_impl(
                     *arg_idx += 1;
                     match extract_egcl_string(control) {
                         Some(text) => {
-                            control_validation::validate(&text)?;
-                            body = text;
+                            let normalized = fill_normalization::normalize(&text)?;
+                            control_validation::validate(&normalized)?;
+                            body = normalized.into_owned();
                         }
                         None => body_function = control,
                     }
