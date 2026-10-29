@@ -11,6 +11,11 @@
 
 ### Fixed
 
+- User-package `%DEFCONSTANT` and similar private-helper names retain their
+  own symbols instead of replacing bootstrap operations, including through
+  compiled-file loading
+  ([#889](https://github.com/atgreen/evergreen/pull/889)).
+
 - Eligible private closures retain shared compiled code while native calls and
   deoptimization use each actual instance's identity and captures. Captured
   lexical loads can reuse proven values within a basic block, reducing repeated

@@ -14949,6 +14949,16 @@ fn stdlib_print_object_hook(val: EgclVal, escape: bool) -> Option<String> {
     None
 }
 
+// Percent-prefixed bootstrap helpers are private to implementation packages.
+// Sharing their homeless identities into a user package lets a local DEFUN
+// replace the operation a boot macro retained (for example %DEFCONSTANT).
+// Present, inherited and explicitly imported symbols are resolved before this
+// compatibility fallback, and ordinary named bootstrap definitions retain their
+// existing behavior (including CALCULATE-C-EVEN during library #. reads).
+fn private_bootstrap_name_accessible(pkg_name: &str, name: &str) -> bool {
+    !name.starts_with('%') || matches!(pkg_name, "COMMON-LISP" | "EGCL-INTERNAL" | "EGCL-EXT")
+}
+
 /// Reader hook: resolve a symbol token to the canonical symbol already
 /// accessible in the reader's package context, so a bare read inside package P,
 /// the qualified spelling `P:NAME`, and `FIND-SYMBOL` all converge on ONE symbol
@@ -14961,10 +14971,10 @@ fn stdlib_print_object_hook(val: EgclVal, escape: bool) -> Option<String> {
 /// Lisp is read, so standard operators/macros always take the inherited path;
 /// an unknown bare token can therefore be homed at read time without mistaking
 /// an unseeded standard name for a new local symbol (bliss-55l8). Legacy runtime
-/// primitives are deliberately unhomed bare symbols; those retain their global
-/// identity in every package until the extension packages own the complete
-/// primitive surface. During the bootstrap prelude, unknown private helper names
-/// likewise retain the legacy bare identity expected by the Rust builtin table.
+/// primitives are deliberately unhomed bare symbols. Public legacy names retain
+/// their compatibility identity; percent-prefixed private names are limited to
+/// implementation packages after boot. During the bootstrap prelude, unknown
+/// private helpers retain the legacy bare identity expected by the Rust table.
 ///
 /// `None` is returned only when no load environment is active, resolution is
 /// already re-entered, the package is unknown, or package interning fails.
@@ -14991,6 +15001,9 @@ fn stdlib_print_object_hook(val: EgclVal, escape: bool) -> Option<String> {
 /// helper it had not emitted, and the musl static-pie link failed with an undefined
 /// `core::slice::sort::…::insert_tail`.
 fn homeless_identity_is_shareable(env: &Env, pkg_name: &str, name: &str, idx: u32) -> bool {
+    if !private_bootstrap_name_accessible(pkg_name, name) {
+        return false;
+    }
     let defined =
         |cell: Option<EgclVal>| cell.is_some_and(|v| v != egcl_rt::value::UNBOUND && !v.is_nil());
     pkg_name == "COMMON-LISP"
@@ -15169,16 +15182,18 @@ fn reader_symbol_resolver(pkg: Option<&str>, name: &str) -> Option<u32> {
                 // SWANK/BACKEND ends with `(export 'save-image :swank/backend)`,
                 // which reported "symbol SAVE-IMAGE is not accessible in package
                 // SWANK/BACKEND" while the bare read handed back CL-USER's
-                // (bliss-zfwfo). Other builtins still resolve bare from any
-                // package: that is how the interpreter dispatches them, and
-                // narrowing it is bliss-7l7cn.
+                // (bliss-zfwfo). Other public builtins retain their legacy bare
+                // fallback; private percent names stay in implementation packages.
+                // General legacy-name migration remains bliss-7l7cn.
                 let legacy_image_name = matches!(
                     name,
                     "SAVE-IMAGE" | "SAVE-LISP-AND-DIE" | "SAVE-IMAGE-AND-DIE" | "%SAVE-CORE"
                 );
                 (!cl_owns_name
                     && (pkg.is_none() || legacy_package)
-                    && (is_builtin_function(name) || (legacy_image_name && legacy_package)))
+                    && ((is_builtin_function(name)
+                        && private_bootstrap_name_accessible(&pkg_name, name))
+                        || (legacy_image_name && legacy_package)))
                     .then(|| EgclVal::from_symbol_index(egcl_rt::symbols::intern(name)))
             })
             .or_else(|| {
@@ -52219,6 +52234,8 @@ mod printer_error_gc_tests;
 #[cfg(test)]
 mod princ_binding_gc_tests;
 
+#[cfg(test)]
+mod private_bootstrap_reader_tests;
 #[cfg(test)]
 mod reader_sequence_gc_tests;
 
