@@ -385,8 +385,7 @@ fn resolve(name: &str) -> Option<Handler> {
 
             // (write object &key stream escape ...): render OBJECT honouring
             // :escape (default *PRINT-ESCAPE*) to :stream
-            // (default *standard-output*). Other keywords are accepted and
-            // ignored. Returns the object.
+            // (default *standard-output*). Returns the object.
 
             if args.is_empty() {
                 return Err(EgclError::ProgramError("WRITE requires an object".into()));
@@ -411,9 +410,16 @@ fn resolve(name: &str) -> Option<Handler> {
                 ],
             )?;
             let mut bindings: Vec<DynBind> = Vec::new();
+            let mut seen = std::collections::HashSet::new();
             let mut i = 1;
             while i + 1 < args.len() {
                 let key = sym_bare_name_rc(args[i]);
+                // Actuals were evaluated in source order. Validate the whole
+                // plist above, then bind only each leftmost pair, including NIL.
+                if !seen.insert(args[i]) {
+                    i += 2;
+                    continue;
+                }
                 let val = args[i + 1];
                 match key.as_ref() {
                     "STREAM" => stream_idx = Some(i + 1),
