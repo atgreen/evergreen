@@ -59,6 +59,11 @@
   portable FASLs explicitly reject unsupported captured function constants
   instead of retaining process-local closure IDs
   ([#848](https://github.com/atgreen/evergreen/pull/848)).
+
+- `DEFTYPE` aliases retain their package identity, so same-named types in
+  different packages remain independent and foreign aliases cannot recursively
+  replace Common Lisp types ([#838](https://github.com/atgreen/evergreen/pull/838)).
+
 - String and stream printers consistently honor `*PRINT-ARRAY*` for array
   layouts, and string printers render package objects through their print hook
   ([#830](https://github.com/atgreen/evergreen/pull/830)).
