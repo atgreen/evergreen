@@ -357,6 +357,12 @@
   a fixnum -- `(floor most-negative-fixnum -1)` -- still answers the bignum
   ([#853](https://github.com/atgreen/evergreen/pull/853)).
 
+- T2 type inference converges in a few passes for functions containing loops,
+  instead of always running 400, so hot loops reach optimized code sooner;
+  one large standard-library compile spent 540 ms in inference and now
+  spends 13 ms
+  ([#845](https://github.com/atgreen/evergreen/pull/845)).
+
 - On ppc64le, a hot comparison of single-floats (`<`, `<=`, `>`, `>=`, `=`) and
   a hot `MIN` or `MAX` of fixnums compile to native instructions instead of
   calling the runtime from the loop. Both specializations existed only for
