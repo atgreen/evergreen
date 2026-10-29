@@ -10544,9 +10544,14 @@ const BBU_MAGIC: &[u8; 4] = b"BBU\0";
 // 0x0204: packed U8 payloads (tag 23) and U8 multidimensional backing refs (tag 24).
 // 0x0205: full complex/MD storage graphs and fresh typed backing constants.
 // 0x0206: deferred MAKE-LOAD-FORM objects (tag 30; actions 13/14).
-const BBU_BYTECODE_VERSION: u16 = 0x0206;
+// 0x0300: opaque random-state constants (tag 31). Older bodies can construct
+// cons-shaped states, which cannot be distinguished from ordinary user lists.
+// Reject all earlier-major units before installing or executing anything.
+const BBU_BYTECODE_VERSION: u16 = 0x0300;
 mod array_constants;
 mod make_load_form;
+#[cfg(test)]
+mod random_state_persistence_tests;
 const BBU_VERIFIER_VERSION: u16 = 0x0100;
 const BBU_NO_INDEX: u32 = u32::MAX;
 /// Unit-flags bit: every load form is represented in `load_actions`, so the
@@ -11012,6 +11017,23 @@ impl BbuConstPool {
 
     fn value_leaf(&mut self, mut v: EgclVal) -> Option<u32> {
         egcl_rt::rooted_ref!(_v_root = &mut v);
+        if let Some(seed) = egcl_rt::random_state::snapshot(v) {
+            if self.saved_heap_refs {
+                let mut bytes = vec![21];
+                put_u64(&mut bytes, v.to_raw());
+                return Some(self.intern_encoded(bytes));
+            }
+            if let Some(index) = self.graph_values.iter().position(|value| *value == v) {
+                return Some(self.graph_refs[index]);
+            }
+            let mut bytes = vec![31];
+            put_u64(&mut bytes, seed);
+            let reference = u32::try_from(self.entries.len()).ok()?;
+            self.entries.push(bytes);
+            self.graph_values.push(v);
+            self.graph_refs.push(reference);
+            return Some(reference);
+        }
         if v.is_nil() {
             return Some(self.intern_encoded(vec![0]));
         }
@@ -13209,6 +13231,7 @@ enum BbuConstant {
     Fixnum(i64),
     SingleFloat(u32),
     DoubleFloat(u64),
+    RandomState { seed: u64 },
     Bignum {
         negative: bool,
         magnitude: Vec<u8>,
@@ -13399,6 +13422,10 @@ fn parse_bbu_constant(
         0 => BbuConstant::Nil,
         1 => BbuConstant::T,
         30 if bytecode_version >= 0x0206 => BbuConstant::LoadFormObject,
+        31 if bytecode_version >= 0x0300 => {
+            let seed = cursor.u64()?;
+            BbuConstant::RandomState { seed }
+        }
         2 => BbuConstant::Fixnum(cursor.i64()?),
         3 if bytecode_version >= 0x010a => {
             let negative = match cursor.u8()? {
@@ -13812,6 +13839,7 @@ fn allocate_bbu_constants(constants: &[BbuConstant]) -> Result<Vec<EgclVal>, Egc
                 }
                 EgclVal::from_fixnum(*value)
             }
+            BbuConstant::RandomState { seed } => egcl_rt::random_state::make(*seed)?,
             BbuConstant::SingleFloat(bits) => EgclVal::from_single_float(f32::from_bits(*bits)),
             BbuConstant::DoubleFloat(bits) => {
                 egcl_rt::gc::alloc_double_float(f64::from_bits(*bits))

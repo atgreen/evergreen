@@ -47,6 +47,11 @@
 - `WRITE` and `WRITE-TO-STRING` honor the leftmost duplicate printer keyword,
   including explicit `NIL` controls
   ([#829](https://github.com/atgreen/evergreen/pull/829)).
+- Random states are opaque atoms with independent copies and readable output,
+  and preserve their future sequences in compiled files and saved images.
+  Recompile older bytecode units and rebuild older core images for bytecode
+  major 3.0 and core format 13
+  ([#828](https://github.com/atgreen/evergreen/pull/828)).
 
 - Array literals accept adjustable, displaced, and fill-pointer vectors as
   initial contents, including nested and specialized vectors

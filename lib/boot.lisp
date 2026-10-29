@@ -1258,26 +1258,12 @@
 (defvar - nil)
 (defvar *break-on-signals* nil)
 
-;; A random state is (:RANDOM-STATE . seed); RANDOM advances the seed in place
-;; and seeds a NIL one from OS entropy on first use. Copying the cons copies
-;; the sequence, which is what MAKE-RANDOM-STATE promises (CLHS 12.2).
-(defvar *random-state* (cons :random-state nil))
+;; Opaque reference-free states; construction and generation belong to stdlib.
+(defvar *random-state* (egcl::%make-random-state t nil))
 (defun make-random-state (&optional state)
-  ;; CLHS: STATE is a RANDOM-STATE, T (a fresh, randomly seeded state), or
-  ;; NIL (a copy of the current state).
-  (unless (or (null state) (eq state t) (random-state-p state))
-    (error 'type-error
-           :datum state
-           :expected-type '(or (member nil t) random-state)))
-  (if (eq state t)
-      (cons :random-state nil)
-      (let ((source (or state *random-state*)))
-        ;; A state never drawn from has no seed yet; one draw fixes it so the
-        ;; copy and the original continue identically.
-        (unless (cdr source) (random 2 source))
-        (cons :random-state (cdr source)))))
+  (egcl::%make-random-state state *random-state*))
 (defun random-state-p (object)
-  (and (consp object) (eq (car object) :random-state)))
+  (egcl::%random-state-p object))
 (defun copy-readtable (&optional from-readtable to-readtable)
   ;; Real readtable objects with copied macro/dispatch registrations
   ;; (bliss-r4mk). (copy-readtable nil) per CLHS restores standard syntax —

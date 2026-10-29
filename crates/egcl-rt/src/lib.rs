@@ -39,6 +39,7 @@ pub mod syscall;
 pub mod types;
 pub mod packed_f64;
 pub mod packed_u8;
+pub mod random_state;
 pub mod value;
 
 // ── Memory / GC ───────────────────────────────────────────────────

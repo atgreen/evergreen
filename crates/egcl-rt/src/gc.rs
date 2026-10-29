@@ -1471,6 +1471,7 @@ unsafe fn trace_object(
         //    bodies are raw bits and must never be scanned for pointers. ──
         tid::BIGNUM
         | tid::DOUBLE_FLOAT
+        | tid::RANDOM_STATE
         | tid::FOREIGN_POINTER
         | tid::FOREIGN_LIBRARY
         | tid::FOREIGN_CALLBACK

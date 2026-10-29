@@ -316,7 +316,7 @@ fn adjustable_arrays_can_contain_themselves_without_a_storage_cycle() {
 }
 
 #[test]
-fn array_graph_version_accepts_legacy_minor_and_rejects_future_minor_before_install() {
+fn array_graph_version_rejects_future_minor_and_legacy_major_before_install() {
     let _lock = super::super::heap_test_lock()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -326,9 +326,11 @@ fn array_graph_version_accepts_legacy_minor_and_rejects_future_minor_before_inst
     let mut unit = assemble_bbu(&pool, &[], &[], BBU_NO_INDEX, b"array-version");
     let mut env = Env::new(false);
     egcl_rt::rooted_ref!(_env = &mut env);
-    unit[4..6].copy_from_slice(&0x0207u16.to_le_bytes());
+    unit[4..6].copy_from_slice(&0x0301u16.to_le_bytes());
     assert!(load_bbu_definitions(&unit, &mut env, false).is_err());
-    unit[4..6].copy_from_slice(&0x0204u16.to_le_bytes());
+    unit[4..6].copy_from_slice(&0x0206u16.to_le_bytes());
+    assert!(load_bbu_definitions(&unit, &mut env, false).is_err());
+    unit[4..6].copy_from_slice(&0x0300u16.to_le_bytes());
     assert_eq!(load_bbu_definitions(&unit, &mut env, false).unwrap(), NIL);
 }
 

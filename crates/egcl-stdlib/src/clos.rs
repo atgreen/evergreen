@@ -2507,7 +2507,9 @@ pub fn class_of(object: EgclVal) -> EgclVal {
     // name symbols by the bootstrap hierarchy. Decide the name here: the stream
     // state lock sits below the CLOS definitions lock, and interning (a lookup
     // for these bootstrap names) must not happen under with_state either.
-    let standard_name = if crate::hash_table_p(object) {
+    let standard_name = if crate::random_state::random_state_p(object) {
+        Some("RANDOM-STATE")
+    } else if crate::hash_table_p(object) {
         // Was a hardcoded `from_fixnum(-23)` that bypassed the registry
         // entirely; it is just another standard class (bliss-rj5o).
         Some("HASH-TABLE")
