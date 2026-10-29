@@ -138,6 +138,7 @@ fn leaf(arity: usize, selected: usize, permuted: bool) -> Function {
 
 fn options(arity: usize) -> OrdinaryLispEntryOptions {
     OrdinaryLispEntryOptions {
+        require_callable_home: false,
         arity,
         arity_error_veneer: ordinary_arity_observer as *const () as u64,
         binding: None,

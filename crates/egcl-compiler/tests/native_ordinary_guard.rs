@@ -108,6 +108,7 @@ fn emit(f: &Function, target: u32) -> Result<FramedCode, EmitError> {
     emit_framed_ordinary_guarded_call(
         f,
         OrdinaryLispEntryOptions {
+            require_callable_home: false,
             arity: 1,
             arity_error_veneer: 1,
             binding: None,
@@ -160,6 +161,7 @@ fn ordinary_general_entry_accepts_recursive_guarded_continuation() {
     let result = emit_framed_ordinary_function(
         &f,
         OrdinaryLispEntryOptions {
+            require_callable_home: false,
             arity: 1,
             arity_error_veneer: 1,
             binding: None,

@@ -40,6 +40,7 @@ impl FuncallProbe {
                 std::cell::UnsafeCell::new(
                     egcl_compiler::t2::native_transfer::OrdinaryFuncallProbeEntry {
                         function: NIL.0,
+                        selected_callable: NIL.0,
                         // No epoch reaches this value, so an empty entry never
                         // reads its revision word.
                         epoch: u64::MAX,
@@ -142,20 +143,47 @@ fn record_funcall_target(
     } else {
         function
     };
-    let Some((symbol, code)) =
+    let Some((symbol, code, selected, native_owner)) =
         super::super::native_transfer_entry::funcall_fast::native_target(callable, nargs)
     else {
         return false;
     };
-    if egcl_rt::symbols::symbol_function(symbol) != Some(callable) {
+    let captured = code.native_callable_slot.is_some();
+    if captured {
+        if !code.accepts_explicit_callable(selected) {
+            return false;
+        }
+    } else if egcl_rt::symbols::symbol_function(symbol) != Some(callable) {
         return false;
+    }
+    if captured {
+        let Some((descriptor, revision_address, revision)) =
+            super::ordinary::private_probe_target(Rc::clone(&code), native_owner)
+        else {
+            return false;
+        };
+        if super::super::native_transfer_entry::funcall_fast::collection_stamp() != collections {
+            return false;
+        }
+        probe.record(
+            egcl_compiler::t2::native_transfer::OrdinaryFuncallProbeEntry {
+                function: bits,
+                selected_callable: selected.0,
+                epoch,
+                collections,
+                revision_address: revision_address as u64,
+                revision,
+                descriptor: descriptor as u64,
+            },
+        );
+        return true;
     }
     let Some(cell) = resolve(symbol) else {
         return false;
     };
     let current = || {
         let pointer = unsafe { &*cell.ordinary_entry_address() }.load(Ordering::Acquire);
-        (pointer != 0 && !cell.is_cold())
+        (pointer != 0 && (captured || !cell.is_cold()))
             .then_some(pointer)
             .filter(|&pointer| {
                 let descriptor = unsafe { &*(pointer as *const OrdinaryEntryDescriptor) };
@@ -184,12 +212,26 @@ fn record_funcall_target(
         }
     };
     let descriptor = unsafe { &*(pointer as *const OrdinaryEntryDescriptor) };
-    if !descriptor.accepts(nargs, ORDINARY_ENV_NONE) {
+    if !descriptor.accepts(
+        nargs,
+        if captured {
+            linkage::ORDINARY_ENV_CLOSURE
+        } else {
+            ORDINARY_ENV_NONE
+        },
+    ) {
+        return false;
+    }
+    // Publication may retire a previous descriptor (or park at a GC gate in
+    // the legacy environment-free route). Never bless stale weak bits with a
+    // freshly read stamp: retry selection with current inputs on the next call.
+    if super::super::native_transfer_entry::funcall_fast::collection_stamp() != collections {
         return false;
     }
     probe.record(
         egcl_compiler::t2::native_transfer::OrdinaryFuncallProbeEntry {
             function: bits,
+            selected_callable: if captured { selected.0 } else { NIL.0 },
             epoch,
             collections,
             revision_address: cell.revision_address() as u64,

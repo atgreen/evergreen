@@ -176,6 +176,7 @@ fn nested_bounded_envelope_removes_only_implicit_intermediate_polls() {
     let code = emit_framed_ordinary_function_with_poll(
         &e.f,
         OrdinaryLispEntryOptions {
+            require_callable_home: false,
             arity: 4,
             arity_error_veneer: 1,
             binding: None,

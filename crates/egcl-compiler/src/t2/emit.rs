@@ -1072,6 +1072,9 @@ pub struct FramedCode {
     /// Raw word slots, relative to body RSP, never collector roots.
     pub native_entry_kind_slot: Option<u32>,
     pub native_control_slot: Option<u32>,
+    /// Tagged hidden callable, relative to body RSP. Unlike arguments this
+    /// word is live throughout the physical frame, including deoptimization.
+    pub native_callable_slot: Option<u32>,
     /// Immutable original arguments retained by this physical native frame.
     pub native_argument_base: Option<u32>,
     pub native_argument_count: u16,
@@ -7534,6 +7537,27 @@ fn emit_framed_inner(
         next_stack += f.block(entry).params.len() as u32;
         base
     });
+    let reads_callable = f.block_order().iter().any(|&block| {
+        f.block(block)
+            .insts
+            .iter()
+            .any(|&inst| f.inst(inst).opcode == Opcode::CurrentCallable)
+    });
+    if reads_callable && !ordinary_call_mode {
+        return Err(EmitError::UnsupportedOp(op_tag(Opcode::CurrentCallable)));
+    }
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let requires_callable_home = ordinary.is_some_and(|options| options.require_callable_home);
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+    let requires_callable_home = false;
+    if requires_callable_home && !ordinary_call_mode {
+        return Err(EmitError::UnsupportedOp(op_tag(Opcode::CurrentCallable)));
+    }
+    let native_callable_slot = (reads_callable || requires_callable_home).then(|| {
+        let slot = next_stack;
+        next_stack += 1;
+        slot
+    });
     let native_arguments: Vec<_> = native_argument_base
         .into_iter()
         .flat_map(|base| {
@@ -7615,6 +7639,7 @@ fn emit_framed_inner(
                     || matches!(
                         d.opcode,
                         Opcode::Call
+                            | Opcode::CurrentCallable
                             | Opcode::GenericEq
                             | Opcode::BoxFixnum
                             | Opcode::TypeCheck
@@ -8027,8 +8052,18 @@ fn emit_framed_inner(
         ordinary_bound_entry =
             matches!(options.binding, Some(OrdinaryArgumentBinding::Keywords(_))).then(|| a.here());
         a.bind(ordinary_self_entry);
-        ordinary_prefix::emit(&mut a, f, options.arity, &single_returns);
+        if native_callable_slot.is_some() && options.binding.is_some() {
+            return Err(EmitError::UnsupportedOp(op_tag(Opcode::CurrentCallable)));
+        }
+        if native_callable_slot.is_none() {
+            ordinary_prefix::emit(&mut a, f, options.arity, &single_returns);
+        }
         emit_prologue(&mut a);
+        if let Some(slot) = native_callable_slot {
+            // No poll/call or RAX-clobber precedes this publication. Count and
+            // declaration failures above still tail to the rooted arity adapter.
+            store_home(&mut a, FramedHome::Stack(slot), RAX, 0);
+        }
         let incoming = [7, 6, 2]; // RDI, RSI, RDX; overflow follows return PC.
         let incoming_stack = spill_bytes / 8 + usize::from(pad) + saved.len() + 1;
         let moves = f
@@ -8515,6 +8550,7 @@ fn emit_framed_inner(
                             inference: &inference,
                             outgoing: outgoing_area,
                             control_home: native_control_home.unwrap(),
+                            callable_home: native_callable_slot.map(FramedHome::Stack),
                             self_entry: ordinary_self_entry,
                             self_prefix: ordinary_self_prefix.as_ref(),
                             self_specializations: &ordinary_self_specializations,
@@ -8535,6 +8571,14 @@ fn emit_framed_inner(
                         a.bind(done);
                     }
                 }
+            } else if d.opcode == Opcode::CurrentCallable {
+                let slot =
+                    native_callable_slot.ok_or(EmitError::UnsupportedOp(op_tag(d.opcode)))?;
+                let result = *d.results.first().ok_or(EmitError::UnsupportedOp(0xF2))?;
+                let dst = *inst_reg
+                    .get(&result)
+                    .ok_or(EmitError::UnsupportedOp(0xF2))?;
+                load_home(&mut a, dst, FramedHome::Stack(slot), 0);
             } else if d.opcode == Opcode::ConstDouble {
                 let crate::t2::ir::AuxData::DoubleImm(bits) = d.aux else {
                     return Err(EmitError::UnsupportedOp(op_tag(d.opcode)));
@@ -11049,6 +11093,7 @@ fn emit_framed_inner(
             _ => None,
         }),
         native_argument_base,
+        native_callable_slot,
         native_argument_count: if native_frame_mode {
             f.block(entry).params.len() as u16
         } else {

@@ -107,7 +107,7 @@ fn note_segment_deopt(code: &TransferCode, guard_bcp: u32) {
                     .is_some_and(|current| Rc::ptr_eq(current, native))
             });
             if !still_installed {
-                code.recompile.set(true);
+                code.request_recompile();
             }
             return;
         }
@@ -131,7 +131,7 @@ fn note_segment_deopt(code: &TransferCode, guard_bcp: u32) {
     // original body; unsupported numeric phases then leave their calls generic.
     // An older suspended activation must not retire its replacement.
     if count >= deopt_blacklist_threshold() {
-        code.recompile.set(true);
+        code.request_recompile();
     }
 }
 
@@ -1127,6 +1127,7 @@ mod retained_guard_chain_tests {
             emit::emit_framed_ordinary_function_with_poll(
                 function,
                 emit::OrdinaryLispEntryOptions {
+                    require_callable_home: false,
                     arity: 2,
                     arity_error_veneer: 1,
                     binding: None,
@@ -1935,6 +1936,10 @@ unsafe fn resume_native_child_guard(
     arguments: Option<Vec<EgclVal>>,
     bcp: u32,
 ) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted!(
+        _active_code_owner =
+            super::super::ActiveCodeOwnerRoot(code.native_callable_slot.and(code.installed_symbol))
+    );
     let env = NATIVE_ENV.with(Cell::get);
     if env.is_null() {
         return Err(invalid_capture());
@@ -1949,6 +1954,14 @@ unsafe fn resume_native_child_guard(
     if !egcl_rt::function::is_interpreted_function(*callable) {
         return Err(invalid_capture());
     }
+    if code.native_callable_slot.is_some() && !code.accepts_explicit_callable(*callable) {
+        return Err(invalid_capture());
+    }
+    let captured_env = if code.native_callable_slot.is_some() && code.body.has_env {
+        Some(closure_captured_env(*callable).ok_or_else(invalid_capture)?)
+    } else {
+        None
+    };
     let mut state = OuterResumeState {
         debug_call: None,
         handlers: Vec::new(),
@@ -1973,14 +1986,14 @@ unsafe fn resume_native_child_guard(
                 token: String::new(),
                 resume_bcp,
                 sp_restore: scope.sp_restore,
-                env: None,
+                env: captured_env.clone(),
             },
             ScopeKind::Tagbody { id } if scope.ownership == Ownership::Local => Handler::Tag {
                 tagbody_id: id,
                 sp_restore: scope.sp_restore,
                 token: None,
                 tag_bcps: Vec::new(),
-                env: None,
+                env: captured_env.clone(),
             },
             _ => return Err(invalid_capture()),
         };
@@ -2026,7 +2039,9 @@ unsafe fn resume_native_child_guard(
             egcl_rt::debug_stack::CallFrame::enter_managed_at(&code.body.name, arguments, child)
         });
     }
-    resume_inlined_in_t0_with_state(scopes, metadata, None, state.take(), unsafe { &mut *env })
+    resume_inlined_in_t0_with_state(scopes, metadata, captured_env, state.take(), unsafe {
+        &mut *env
+    })
 }
 
 /// Complete one guarded ordinary activation while its native callers remain
@@ -2093,6 +2108,10 @@ pub(super) unsafe fn resume_ordinary_guard(request: *mut u8) -> Result<EgclVal, 
         return Err(invalid_capture());
     }
     let code = unsafe { &*boundary.owner };
+    egcl_rt::rooted!(
+        _active_code_owner =
+            super::super::ActiveCodeOwnerRoot(code.native_callable_slot.and(code.installed_symbol))
+    );
     if code.ordinary_entry.is_none() || !code.has_deopt || !ordinary_native_body(&code.body) {
         return Err(invalid_capture());
     }
@@ -2286,11 +2305,15 @@ pub(super) unsafe fn resume_ordinary_guard(request: *mut u8) -> Result<EgclVal, 
         return Ok(out.value); // the ordinary wrapper consumes any stashed error
     }
     egcl_rt::rooted!(callable = NIL);
-    let retained = boundary
-        .directory
-        .callable_for_pc(boundary.cursor.pc)
-        .ok_or_else(invalid_capture)?;
-    retained.with_gc_stable_mutator(|value| *callable = *value);
+    if code.native_callable_slot.is_some() {
+        *callable = root_publication::frame_callable(boundary).ok_or_else(invalid_capture)?;
+    } else {
+        let retained = boundary
+            .directory
+            .callable_for_pc(boundary.cursor.pc)
+            .ok_or_else(invalid_capture)?;
+        retained.with_gc_stable_mutator(|value| *callable = *value);
+    }
     #[cfg(test)]
     if let Some(observe) = ORDINARY_GUARD_OBSERVER.with(Cell::get) {
         observe(request.n_scopes);

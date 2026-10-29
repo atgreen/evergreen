@@ -45,8 +45,11 @@ mod lean_root;
 mod native_frames;
 #[cfg(test)]
 pub(super) use lean_root::take_lean_root_entries_for_test;
+mod callable_identity_cache;
 pub(super) mod ordinary_calls;
+pub(super) mod ordinary_closure_context;
 pub(super) mod ordinary_primitives;
+use callable_identity_cache::CallableIdentityCache;
 
 // Two-owner GC fixtures deliberately retain ordinary CALL frames. All other
 // tests use production tail selection; the override follows fiber execution.
@@ -216,6 +219,24 @@ fn ordinary_admission_suppressed() -> bool {
     false
 }
 
+// Capability tests deliberately exercise the full captured-entry protocol,
+// independently of the production cost policy. Serialize with heap_test_lock.
+#[cfg(test)]
+static FORCE_CAPTURED_ENTRY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+pub(super) fn with_forced_captured_entry_for_test<R>(body: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FORCE_CAPTURED_ENTRY.store(self.0, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let _restore = Restore(FORCE_CAPTURED_ENTRY.swap(true, std::sync::atomic::Ordering::SeqCst));
+    body()
+}
+
 #[cfg(test)]
 static RECURSIVE_ENTRIES: egcl_rt::execution_local::ExecutionLocal<Cell<usize>> =
     unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| Cell::new(0)) };
@@ -352,11 +373,14 @@ pub(super) struct TransferCode {
     deopt_metadata: Option<Arc<T2InstalledMetadata>>,
     deopts: Cell<u32>,
     recompile: Cell<bool>,
+    private_probe_revision: Arc<std::sync::atomic::AtomicU64>,
+    private_probe_published: Cell<bool>,
     recursive_symbol: Option<u32>,
     recursive_generation: u64,
     pub(super) native_entry_kind_slot: Option<u32>,
     native_control_slot: Option<u32>,
     native_argument_base: Option<u32>,
+    pub(super) native_callable_slot: Option<u32>,
     native_argument_count: u16,
     landing: JitBuffer,
     sites: SysvTransferTable,
@@ -375,19 +399,9 @@ pub(super) struct TransferCode {
     /// whole struct (bliss-nkzx6).
     #[allow(clippy::vec_box)]
     state_pool: std::cell::RefCell<Vec<Box<ActivationState>>>,
-    /// The callable root this code's ordinary segment last retained. Code runs
-    /// for the same function on nearly every call, so `callable_root` hands the
-    /// same root back instead of registering a fresh cross-thread root -- a
-    /// global lock and hash insert, then another to remove it -- per call.
-    last_callable: std::cell::RefCell<Option<Arc<egcl_rt::CrossThreadRoot<EgclVal>>>>,
-    /// Address bits of `last_callable`'s value when that value is an
-    /// interpreted function object, else 0. Those objects are pinned and the
-    /// root keeps this one alive, so the bits stay its identity and a matching
-    /// call needs no GC-gated read of the root.
-    last_callable_pinned: Cell<u64>,
-    /// The ordinary root identity the last activation of this code retained,
-    /// once its segment released it, for the next activation to reuse.
-    spare_root_identity: std::cell::RefCell<Option<Rc<super::call_table::RootIdentity>>>,
+    /// Cache state has no strong code edge. Dirty weak tokens cover current,
+    /// retired and externally retained code without a registry ownership cycle.
+    callable_cache: Rc<CallableIdentityCache>,
     #[cfg(test)]
     unavailable_catch: Option<u32>,
     #[cfg(test)]
@@ -773,7 +787,14 @@ unsafe fn call_lean_target(
         unsafe { std::slice::from_raw_parts(invocation.args, invocation.nargs) }
     };
     let result = guard_c2i(|| {
-        egcl_rt::rooted!(_active_callable_root = super::ActiveCallableRoot(symbol));
+        let instance = if code.native_callable_slot.is_some()
+            && egcl_rt::function::is_interpreted_function(function)
+        {
+            egcl_rt::function::definition_index(function)
+        } else {
+            symbol
+        };
+        egcl_rt::rooted!(_active_callable_root = super::ActiveCallableRoot(instance));
         code.run_ordinary_root(offset, function, args, unsafe { &mut *env })
     });
     let value = match result {
@@ -859,6 +880,17 @@ pub(super) fn take_nested_entries() -> usize {
     nested::take_nested_entries()
 }
 
+#[cfg(test)]
+pub(super) fn current_guard_callable_for_test() -> Option<EgclVal> {
+    let boundary = unsafe { root_publication::ACTIVE.with(Cell::get).as_ref() }?;
+    root_publication::frame_callable(boundary)
+}
+
+#[cfg(test)]
+pub(super) fn take_ordinary_lexical_leaf_hits_for_test() -> usize {
+    ordinary_closure_context::HITS.with(|hits| hits.replace(0))
+}
+
 impl TransferCode {
     pub(super) fn needs_callable_identity(&self) -> bool {
         self.ordinary_entry.is_some() && (self.has_deopt || !self.body.self_call_sites.is_empty())
@@ -889,13 +921,23 @@ impl TransferCode {
         Some((self.code.as_ptr() as usize, self.code_len))
     }
 
+    /// Shared code is safe for distinct closures only when every native frame
+    /// carries its own precise callable word and this object owns that body.
+    pub(super) fn accepts_explicit_callable(&self, function: EgclVal) -> bool {
+        self.native_callable_slot.is_some()
+            && egcl_rt::function::is_interpreted_function(function)
+            && (!self.body.has_env || closure_captured_env(function).is_some())
+            && registry_get(egcl_rt::function::definition_index(function))
+                .is_some_and(|body| Arc::ptr_eq(&body, &self.body))
+    }
+
     pub(super) fn ordinary_descriptor(
         &self,
         revision: u64,
     ) -> Option<egcl_rt::call_table::OrdinaryEntryDescriptor> {
         use egcl_rt::call_table::{
-            ORDINARY_ENV_NONE, ORDINARY_X64_LISP_KIND, ORDINARY_X64_LISP_VERSION,
-            OrdinaryEntryDescriptor,
+            ORDINARY_ENV_CLOSURE, ORDINARY_ENV_NONE, ORDINARY_X64_LISP_KIND,
+            ORDINARY_X64_LISP_VERSION, OrdinaryEntryDescriptor,
         };
         // Root ingress validates declared parameters before entering generated
         // code, and source-proven self calls preserve those established facts.
@@ -921,7 +963,11 @@ impl TransferCode {
             } else {
                 usize::from(self.body.arity)
             },
-            environment: ORDINARY_ENV_NONE,
+            environment: if self.native_callable_slot.is_some() {
+                ORDINARY_ENV_CLOSURE
+            } else {
+                ORDINARY_ENV_NONE
+            },
             owner: self as *const Self as usize,
             stack_required: self.ordinary_stack_required?,
         })
@@ -944,6 +990,25 @@ impl TransferCode {
         let before = self.state_pool.borrow().len();
         source.recycle(self);
         Ok(self.state_pool.borrow().len() - before)
+    }
+
+    /// Replace a zero-argument fixture entry with a noncollecting leaf/tail
+    /// sequence. The caller retains the old buffer for its diagnostic metadata.
+    ///
+    /// # Safety
+    /// The replacement preserves the ordinary ABI, cannot collect or
+    /// publish a frame, and must tail-retire before any collecting child runs.
+    #[cfg(test)]
+    pub(super) unsafe fn replace_nongc_tail_entry_for_test(
+        &mut self,
+        bytes: &[u8],
+    ) -> Option<JitBuffer> {
+        assert_eq!(self.body.arity, 0);
+        assert!(self.ordinary_entry.is_some() && self.native_callable_slot.is_none());
+        let code = JitBuffer::new(bytes)?;
+        self.code_len = bytes.len();
+        self.ordinary_entry = Some(0);
+        Some(std::mem::replace(&mut self.code, code))
     }
 
     #[cfg(test)]
@@ -1068,6 +1133,25 @@ impl TransferCode {
     #[cfg(test)]
     pub(super) fn osr_target_headers(&self) -> Vec<u32> {
         self.osr_destination().osr_entries.keys().copied().collect()
+    }
+
+    pub(super) fn private_entry_revision(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        self.private_probe_published.set(true);
+        Arc::clone(&self.private_probe_revision)
+    }
+
+    pub(super) fn retire_private_entries(&self) {
+        if self.private_probe_published.get() {
+            self.private_probe_revision
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            funcall_fast::retire_native_probes();
+        }
+    }
+
+    fn request_recompile(&self) {
+        if !self.recompile.replace(true) {
+            self.retire_private_entries();
+        }
     }
 
     pub(super) fn needs_recompile(&self) -> bool {
@@ -1285,6 +1369,15 @@ impl TransferCode {
         artifact.install(body, roots, deopt_metadata)
     }
 
+    fn queue_private_callable_cache(&self) {
+        if self
+            .installed_symbol
+            .is_some_and(egcl_rt::symbols::is_uninterned)
+        {
+            CallableIdentityCache::enqueue(&self.callable_cache);
+        }
+    }
+
     /// A root for `function` as this code's callable identity, reusing the one
     /// from the previous activation when it names the same function.
     pub(super) fn callable_root(
@@ -1296,15 +1389,22 @@ impl TransferCode {
             return root;
         }
         let root = Arc::new(egcl_rt::CrossThreadRoot::new(*function));
-        *self.last_callable.borrow_mut() = Some(Arc::clone(&root));
+        self.queue_private_callable_cache();
+        let old = self
+            .callable_cache
+            .last_callable
+            .borrow_mut()
+            .replace(Arc::clone(&root));
+        drop(old);
         // Recorded with the root, never separately: the bits name the object
         // only while this root keeps it alive.
-        self.last_callable_pinned
-            .set(if egcl_rt::function::is_interpreted_function(*function) {
+        self.callable_cache.last_callable_pinned.set(
+            if egcl_rt::function::is_interpreted_function(*function) {
                 function.0
             } else {
                 0
-            });
+            },
+        );
         root
     }
 
@@ -1316,11 +1416,11 @@ impl TransferCode {
         function: &EgclVal,
     ) -> Option<Arc<egcl_rt::CrossThreadRoot<EgclVal>>> {
         // Clone out of the cell before the GC-gated read, which may park.
-        let previous = self.last_callable.borrow().clone()?;
+        let previous = self.callable_cache.last_callable.borrow().clone()?;
         // An interpreted function object never moves, and `previous` holds it
         // alive, so equal bits are equal identity without the gate. That is
         // every steady-state call of a named function (GitHub #487).
-        let pinned = self.last_callable_pinned.get();
+        let pinned = self.callable_cache.last_callable_pinned.get();
         if pinned != 0 && pinned == function.0 {
             return Some(previous);
         }
@@ -1337,20 +1437,31 @@ impl TransferCode {
         function: EgclVal,
         inspect: impl FnOnce(&Arc<egcl_rt::CrossThreadRoot<EgclVal>>) -> R,
     ) -> Option<R> {
-        let pinned = self.last_callable_pinned.get();
+        let pinned = self.callable_cache.last_callable_pinned.get();
         if pinned == 0 || pinned != function.0 {
             return None;
         }
-        self.last_callable.borrow().as_ref().map(inspect)
+        self.callable_cache
+            .last_callable
+            .borrow()
+            .as_ref()
+            .map(inspect)
     }
 
     pub(super) fn take_spare_root_identity(&self) -> Option<Rc<super::call_table::RootIdentity>> {
-        self.spare_root_identity.borrow_mut().take()
+        self.callable_cache.spare_root_identity.borrow_mut().take()
     }
 
     pub(super) fn store_spare_root_identity(&self, identity: Rc<super::call_table::RootIdentity>) {
-        // Dropping a replaced spare frees host memory only; it runs no Lisp.
-        *self.spare_root_identity.borrow_mut() = Some(identity);
+        // A collection may have emptied this cache while the identity was
+        // active. Re-enqueue before caching it again after the frame retires.
+        self.queue_private_callable_cache();
+        let old = self
+            .callable_cache
+            .spare_root_identity
+            .borrow_mut()
+            .replace(identity);
+        drop(old);
     }
 
     pub(super) fn run(&self, args: &[EgclVal], env: &mut Env) -> Result<EgclVal, EgclError> {
@@ -1389,6 +1500,15 @@ impl TransferCode {
         args: &[EgclVal],
         env: &mut Env,
     ) -> Result<EgclVal, EgclError> {
+        let function = if self.native_callable_slot.is_some() {
+            let selected = funcall_fast::closure_carrier(function).ok_or_else(invalid_capture)?;
+            if !self.accepts_explicit_callable(selected) {
+                return Err(invalid_capture());
+            }
+            selected
+        } else {
+            function
+        };
         if let Some(offset) = self.lean_root_entry() {
             return self.run_ordinary_root(offset, function, args, env);
         }
@@ -1437,6 +1557,7 @@ impl TransferCode {
         egcl_rt::rooted!(
             roots = lean_root::EntryRoots {
                 function,
+                code_owner: self.installed_symbol,
                 args: EntryArgs::new(args),
                 env,
                 state: &mut *state,
@@ -1551,15 +1672,16 @@ impl TransferCode {
         // with the inherited scopes installed; deliver pending errors there,
         // through normal transfer handling, rather than skipping their cleanup.
         let _ordinary_segment = super::call_table::enter_ordinary_segment();
-        let _ordinary_root = if self.needs_callable_identity() {
-            Some(
-                _ordinary_segment
-                    .retain_root(self, roots.function)
-                    .ok_or_else(invalid_capture)?,
-            )
-        } else {
-            None
-        };
+        let _ordinary_root =
+            if self.needs_callable_identity() && self.native_callable_slot.is_none() {
+                Some(
+                    _ordinary_segment
+                        .retain_root(self, roots.function)
+                        .ok_or_else(invalid_capture)?,
+                )
+            } else {
+                None
+            };
         // A `&key` body was bound into its frame above; enter past binding
         // with those slots as the fixed arguments. The frame stays scanned.
         let bound_args;
@@ -1600,7 +1722,9 @@ impl TransferCode {
                     #[cfg(test)]
                     if let Some(observe) = ORDINARY_ENTRY_HOOK.with(|hook| hook.take()) { observe(); }
                     native_transfer::invoke_ordinary_native_segment(
-                        self.code.as_ptr().add(offset), execution, NIL, args, stack)
+                        self.code.as_ptr().add(offset), execution,
+                        if self.native_callable_slot.is_some() { roots.function } else { NIL },
+                        args, stack)
                 })
             }.map(|returned| returned.outcome)
         } else {
@@ -1964,6 +2088,7 @@ fn invalid_capture() -> EgclError {
 /// entry pads an omitted one with the unsupplied marker (bliss-6m6ca).
 fn ordinary_entry_parameters(body: &BytecodeFunction) -> bool {
     fixed_tagged_parameters(body)
+        || ordinary_outer_capture_body(body)
         || (positional_tagged_parameters(body)
             && body.min_args < body.arity
             && body.arity <= 3
@@ -2122,15 +2247,145 @@ fn scope_free_native_body(body: &BytecodeFunction, allow_values: bool) -> bool {
 /// specialization removes the binder, as `packed_f64_native_body` relies on;
 /// `ordinary_primary_transport_eliminated` checks that it did (bliss-z4dlm).
 pub(super) fn ordinary_native_body(body: &BytecodeFunction) -> bool {
-    !body.has_env && slot_parameters(body, false) && body.code.iter().all(ordinary_native_op)
+    (!body.has_env || ordinary_outer_capture_body(body))
+        && slot_parameters(body, false)
+        && body.code.iter().all(ordinary_native_op)
+}
+
+// Only a private owner selected before worker detachment may opt into the
+// explicit-callable NoEnv ABI. Keep binders, self/control exits and loops on
+// their existing paths; the optimized IR must additionally remain a leaf.
+fn private_noenv_callable_body(body: &BytecodeFunction) -> bool {
+    !body.has_env
+        && !body.variadic
+        && body.arity <= 3
+        && body.min_args == body.arity
+        && body.max_args == Some(body.arity)
+        && body.params_form.is_nil()
+        && body.self_call_sites.is_empty()
+        && body.param_layout.len() == usize::from(body.arity)
+        && body
+            .param_layout
+            .iter()
+            .all(|(_, location)| matches!(location, VarLoc::Slot(_)))
+        && body.load_time_values.is_empty()
+        && body.nested_functions.is_empty()
+        && body.restart_cases.is_empty()
+        && body.handler_cases.is_empty()
+        && body.handler_binds.is_empty()
+        && scope_free_native_body(body, false)
+        && !bf_has_free_control_exit(body)
+        && !body.code.iter().enumerate().any(|(bcp, op)| match op {
+            Instr::Br(target) | Instr::BrIfFalse(target) | Instr::BrIfTrue(target) => {
+                (*target as usize) <= bcp
+            }
+            Instr::Go { target_bcp, .. } => (*target_bcp as usize) <= bcp,
+            Instr::GoNamed { .. } => true,
+            _ => false,
+        })
+}
+
+fn private_noenv_leaf_ir(ir: &egcl_compiler::t2::ir::Function) -> bool {
+    use egcl_compiler::t2::ir::Opcode;
+    ir.osr_entries.is_empty()
+        && ir.block_order().iter().all(|&block| {
+            ir.block(block).insts.iter().all(|&inst| {
+                let data = ir.inst(inst);
+                !matches!(
+                    data.opcode,
+                    Opcode::Call | Opcode::Invoke | Opcode::TailCall | Opcode::CurrentCallable
+                ) && !data.flags.call
+                    && !data.flags.safepoint
+                    && (!data.flags.effectful || data.flags.guard || data.opcode == Opcode::ClearMv)
+            })
+        })
+}
+
+/// Bounded executable cohorts whose immutable template may own metadata
+/// independently of an otherwise dead closure instance.
+pub(super) fn ordinary_code_owner_body(body: &BytecodeFunction) -> bool {
+    ordinary_outer_capture_shape(body)
+        || (!body.has_env
+            && !body.variadic
+            && body.min_args == body.arity
+            && body.max_args == Some(body.arity)
+            && body.param_layout.len() == usize::from(body.arity)
+            && body
+                .param_layout
+                .iter()
+                .all(|(_, location)| matches!(location, VarLoc::Slot(_)))
+            && scope_free_native_body(body, false))
+}
+
+/// `has_env` covers both outer captures and newly defined lexical cells. This
+/// cohort has only the former: the interpreter's fresh child frame would stay
+/// empty, cannot escape, and can therefore be omitted by the native entry.
+pub(super) fn ordinary_outer_capture_body(body: &BytecodeFunction) -> bool {
+    ordinary_captured_callees_enabled() && ordinary_outer_capture_shape(body)
+}
+
+fn ordinary_outer_capture_shape(body: &BytecodeFunction) -> bool {
+    body.has_env
+        && !body.variadic
+        && body.min_args == body.arity
+        && body.max_args == Some(body.arity)
+        && body.param_layout.len() == usize::from(body.arity)
+        && body
+            .param_layout
+            .iter()
+            .all(|(_, location)| matches!(location, VarLoc::Slot(_)))
+        && body
+            .code
+            .iter()
+            .any(|op| matches!(op, Instr::LoadEnvVar(_) | Instr::StoreEnvVar(_)))
+        && body.code.iter().all(ordinary_native_op)
+}
+
+fn ordinary_captured_callees_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("EGCL_DISABLE_ORDINARY_CAPTURED_CALLEES").is_none())
+}
+
+/// Acyclic captured entries use noncollecting lexical helpers on successful
+/// accesses. Keep loops on the mapped entry until repeated-access costs have
+/// separate evidence; semantic admission remains an independent check.
+fn captured_entry_cost_permits(body: &BytecodeFunction) -> bool {
+    if !body.has_env {
+        return true;
+    }
+    let mut accesses = 0;
+    for (bcp, instruction) in body.code.iter().enumerate() {
+        match instruction {
+            Instr::LoadEnvVar(_) | Instr::StoreEnvVar(_) => {
+                accesses += 1;
+            }
+            Instr::Br(target) | Instr::BrIfFalse(target) | Instr::BrIfTrue(target)
+                if (*target as usize) <= bcp =>
+            {
+                return false;
+            }
+            Instr::Go { target_bcp, .. } if (*target_bcp as usize) <= bcp => return false,
+            Instr::GoNamed { .. } => return false,
+            _ => {}
+        }
+    }
+    accesses != 0
+}
+
+pub(super) fn ordinary_capture_entry_profitable(body: &BytecodeFunction) -> bool {
+    #[cfg(test)]
+    if FORCE_CAPTURED_ENTRY.load(std::sync::atomic::Ordering::SeqCst) {
+        return true;
+    }
+    captured_entry_cost_permits(body)
 }
 
 fn ordinary_native_op(op: &Instr) -> bool {
     local_control_op(op, false, false, true)
-        || matches!(op, Instr::PushTag { .. } | Instr::Go { .. })
-        // The ordinary semantic-primitive pass already lowers function
-        // lookup through a published, collecting helper. It does not need
-        // a mapped activation or lexical scope.
+        || matches!(
+            op,
+            Instr::PushTag { .. } | Instr::Go { .. } | Instr::LoadEnvVar(_) | Instr::StoreEnvVar(_)
+        )
         || (matches!(op, Instr::LoadFunction(_)) && ordinary_function_designators_enabled())
 }
 
@@ -2170,11 +2425,32 @@ fn has_local_tagbody(body: &BytecodeFunction) -> bool {
 
 /// Retained self expansion reconstructs only local BLOCKs in nested logical
 /// frames. A tagbody body is admitted only while every guard owns one frame.
+pub(super) fn ordinary_capture_protocol_present(
+    body: &BytecodeFunction,
+    ir: &egcl_compiler::t2::ir::Function,
+) -> bool {
+    use egcl_compiler::t2::ir::Opcode;
+    // Eliminating every lexical access must not accidentally turn a capturing
+    // callable into the environment-free directory's strong identity cache.
+    // Keep the checked/mapped fallback until there is an explicit carrier.
+    !body.has_env
+        || ir.block_order().iter().any(|&block| {
+            ir.block(block).insts.iter().any(|&inst| {
+                matches!(
+                    ir.inst(inst).opcode,
+                    Opcode::EnvironmentValue
+                        | Opcode::SetEnvironmentValue
+                        | Opcode::CurrentCallable
+                )
+            })
+        })
+}
+
 fn ordinary_single_frame_states(
     body: &BytecodeFunction,
     ir: &egcl_compiler::t2::ir::Function,
 ) -> bool {
-    !has_local_tagbody(body)
+    !(has_local_tagbody(body) || body.has_env)
         || ir
             .frame_states
             .iter()

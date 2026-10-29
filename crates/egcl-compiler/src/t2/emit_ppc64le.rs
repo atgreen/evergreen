@@ -1453,6 +1453,7 @@ pub fn emit_framed_with_runtime(
         native_entry_kind_slot: None,
         native_control_slot: None,
         native_argument_base: None,
+        native_callable_slot: None,
         native_argument_count: 0,
         native_calls: None,
         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]

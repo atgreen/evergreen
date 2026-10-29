@@ -21,6 +21,8 @@ pub enum OrdinaryPrimitive {
     Divide,
     Equal,
     MakeArray,
+    LoadEnvironment,
+    StoreEnvironment,
 }
 
 impl OrdinaryPrimitive {
@@ -30,7 +32,7 @@ impl OrdinaryPrimitive {
         format!("%EGCL-ORDINARY-{self:?}").to_ascii_uppercase()
     }
 
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 12] = [
         Self::LoadGlobal,
         Self::StoreGlobal,
         Self::LoadFunction,
@@ -41,6 +43,8 @@ impl OrdinaryPrimitive {
         Self::Divide,
         Self::Equal,
         Self::MakeArray,
+        Self::LoadEnvironment,
+        Self::StoreEnvironment,
     ];
 }
 
@@ -139,6 +143,33 @@ fn array_constructor_candidate(f: &Function, data: &InstData) -> bool {
 /// control-region operations cannot be lowered without their context protocol.
 /// SetCar/SetCdr stay unlowered until their IR operand order is made consistent.
 pub fn lower_ordinary_primitives(
+    f: &mut Function,
+    mut resolve: impl FnMut(OrdinaryPrimitive) -> Option<u32>,
+) -> Result<usize, EmitError> {
+    let captures = f.block_order().iter().any(|&block| {
+        f.block(block).insts.iter().any(|&inst| {
+            matches!(
+                f.inst(inst).opcode,
+                Opcode::EnvironmentValue | Opcode::SetEnvironmentValue
+            )
+        })
+    });
+    if !captures {
+        return lower_ordinary_primitives_inner(f, &mut resolve);
+    }
+    // Failure must leave the original mapped/checked candidate intact.
+    if crate::t2::verify::verify(f).is_err() {
+        return Err(EmitError::UnsupportedOp(0xFA));
+    }
+    let mut candidate = f.clone();
+    crate::t2::opt_lexical::forward(&mut candidate);
+    let count = lower_environment(&mut candidate, &mut resolve)?;
+    let count = count + lower_ordinary_primitives_inner(&mut candidate, &mut resolve)?;
+    *f = candidate;
+    Ok(count)
+}
+
+fn lower_ordinary_primitives_inner(
     f: &mut Function,
     mut resolve: impl FnMut(OrdinaryPrimitive) -> Option<u32>,
 ) -> Result<usize, EmitError> {
@@ -348,6 +379,139 @@ pub fn lower_ordinary_primitives(
     Ok(replacements.len() + constructors.len())
 }
 
+/// Only the full ordinary entry supplies this hidden argument. A mapped/OSR
+/// entry never executes the rewritten candidate. No captured value is frozen:
+/// the runtime adapter resolves the exact closure's shared frame each time.
+fn lower_environment(
+    f: &mut Function,
+    resolve: &mut impl FnMut(OrdinaryPrimitive) -> Option<u32>,
+) -> Result<usize, EmitError> {
+    let bad = || EmitError::UnsupportedOp(0xFA);
+    if !f.osr_entries.is_empty() {
+        return Err(bad());
+    }
+    let mut model = f.clone();
+    let mut sites = Vec::new();
+    for &block in f.block_order() {
+        for &inst in &f.block(block).insts {
+            let data = f.inst(inst);
+            let primitive = match data.opcode {
+                Opcode::EnvironmentValue => OrdinaryPrimitive::LoadEnvironment,
+                Opcode::SetEnvironmentValue => OrdinaryPrimitive::StoreEnvironment,
+                _ => continue,
+            };
+            let AuxData::EnvironmentName(index) = data.aux else {
+                return Err(bad());
+            };
+            let store = primitive == OrdinaryPrimitive::StoreEnvironment;
+            if data.args.len() != usize::from(store)
+                || data.results.len() != usize::from(!store)
+                || !data.targets.is_empty()
+                || data.frame_state.is_none()
+                || data
+                    .args
+                    .iter()
+                    .chain(&data.results)
+                    .any(|&value| f.value(value).repr != ValueRepresentation::Tagged)
+            {
+                return Err(bad());
+            }
+            sites.push((block, inst, index, resolve(primitive).ok_or_else(bad)?));
+            model.inst_mut(inst).flags.call = false;
+        }
+    }
+    let single = crate::t2::opt_clear_mv::single_value_state(&model, true);
+    let unobserved = crate::t2::opt_clear_mv::unobserved_multiple_value_state(&model);
+    if sites
+        .iter()
+        .any(|(_, inst, _, _)| !single.contains(inst) && !unobserved.contains(inst))
+    {
+        return Err(bad());
+    }
+    let entry = f.entry();
+    let (read, result) = f.push_inst(
+        entry,
+        InstData {
+            opcode: Opcode::CurrentCallable,
+            args: vec![],
+            results: vec![],
+            aux: AuxData::None,
+            flags: InstFlags::default(),
+            targets: vec![],
+            frame_state: None,
+            source_pos: Default::default(),
+        },
+        &[(IRType::TOP, ValueRepresentation::Tagged)],
+    );
+    let layout = &mut f.block_mut(entry).insts;
+    assert_eq!(layout.pop(), Some(read));
+    layout.insert(0, read);
+    let callable = result[0];
+    for &(block, inst, index, target) in &sites {
+        let source_pos = f.inst(inst).source_pos;
+        let (constant, result) = f.push_inst(
+            block,
+            InstData {
+                opcode: Opcode::ConstFixnum,
+                args: vec![],
+                results: vec![],
+                aux: AuxData::FixnumImm(i64::from(index)),
+                flags: InstFlags::default(),
+                targets: vec![],
+                frame_state: None,
+                source_pos,
+            },
+            &[(IRType::of(TypeBits::FIXNUM), ValueRepresentation::Tagged)],
+        );
+        let layout = &mut f.block_mut(block).insts;
+        assert_eq!(layout.pop(), Some(constant));
+        let position = layout.iter().position(|&site| site == inst).unwrap();
+        layout.insert(position, constant);
+        let data = f.inst_mut(inst);
+        data.args.splice(0..0, [callable, result[0]]);
+        data.opcode = Opcode::Call;
+        data.aux = AuxData::CallTarget(target);
+        data.flags = InstFlags {
+            call: true,
+            safepoint: true,
+            effectful: true,
+            ..Default::default()
+        };
+        // Like global-variable adapters, the semantic adapter returns exactly
+        // one primary. Clear an unobservable incoming tuple before entry and
+        // make the outgoing state explicit to later ordinary admission.
+        for before in [true, false] {
+            if before && single.contains(&inst) {
+                continue;
+            }
+            let (clear, _) = f.push_inst(
+                block,
+                InstData {
+                    opcode: Opcode::ClearMv,
+                    args: vec![],
+                    results: vec![],
+                    aux: AuxData::None,
+                    flags: InstFlags {
+                        call: true,
+                        safepoint: true,
+                        effectful: true,
+                        ..Default::default()
+                    },
+                    targets: vec![],
+                    frame_state: None,
+                    source_pos,
+                },
+                &[],
+            );
+            let layout = &mut f.block_mut(block).insts;
+            assert_eq!(layout.pop(), Some(clear));
+            let position = layout.iter().position(|&site| site == inst).unwrap();
+            layout.insert(position + usize::from(!before), clear);
+        }
+    }
+    Ok(sites.len())
+}
+
 #[cfg(test)]
 mod array_constructor_tests {
     use super::*;
@@ -517,3 +681,7 @@ mod array_constructor_tests {
         assert!(crate::t2::verify::verify(&f).is_ok());
     }
 }
+
+#[cfg(test)]
+#[path = "ordinary_closure_lowering_tests.rs"]
+mod closure_lowering_tests;

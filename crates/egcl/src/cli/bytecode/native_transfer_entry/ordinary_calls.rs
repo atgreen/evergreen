@@ -154,6 +154,37 @@ pub(in crate::cli::bytecode) unsafe fn finish(
     }
 }
 
+/// Common noncollecting prefix for both installed and still-cold adapters.
+/// All argument storage remains owned by the suspended machine request.
+unsafe fn try_lexical_leaf(
+    symbol: u32,
+    args: &[EgclVal],
+    out: *mut OrdinaryHelperOutcome,
+    image: *mut SysvTransferCapture,
+) -> bool {
+    let Some(value) = (unsafe { super::ordinary_closure_context::leaf(symbol, args, image) })
+    else {
+        return false;
+    };
+    let env = NATIVE_ENV.with(Cell::get);
+    if !env.is_null() {
+        unsafe {
+            (*env).clear_mv();
+        }
+    }
+    unsafe {
+        out.write(OrdinaryHelperOutcome {
+            outcome: NativeOutcome {
+                value,
+                exit: NativeExit::Returned,
+            },
+            values: NativeReturnValues::SINGLE,
+            anchor: native_transfer::current_segment(),
+        });
+    }
+    true
+}
+
 /// Complete a failed ordinary admission through a named cell or the exact
 /// callable retained by a directly recursive caller's native code owner.
 /// The caller maps own args; only the separate closure word is host-rooted
@@ -166,6 +197,19 @@ pub(super) unsafe extern "C" fn cold_call(
     #[cfg(test)]
     COLD_CALLS.with(|count| count.set(count.get() + 1));
     let request = request.cast::<OrdinaryColdRequest>();
+    // A private primitive may stay cold: ordinary_call handles it before
+    // warming its named cell. Share the exact same lexical success protocol.
+    if unsafe {
+        (*request).reserved == 0
+            && (*request).symbol <= u64::from(u32::MAX)
+            && matches!((*request).nargs, 2 | 3)
+            && !(*request).args.is_null()
+    } {
+        let args = unsafe { std::slice::from_raw_parts((*request).args, (*request).nargs) };
+        if unsafe { try_lexical_leaf((*request).symbol as u32, args, out, image) } {
+            return;
+        }
+    }
     egcl_rt::rooted_ref!(_closure = unsafe { &mut *std::ptr::addr_of_mut!((*request).closure) });
     unsafe {
         root_publication::published(image, || {
@@ -189,11 +233,16 @@ pub(super) unsafe extern "C" fn cold_call(
                         // exact identity. Release the directory borrow before
                         // the GC gate can park; resolve before polling can
                         // replace the public definition.
-                        let retained = boundary
-                            .directory
-                            .callable_for_pc(boundary.cursor.pc)
-                            .ok_or_else(invalid_capture)?;
-                        retained.with_gc_stable_mutator(|value| *self_callable = *value);
+                        if (*boundary.owner).native_callable_slot.is_some() {
+                            *self_callable = root_publication::frame_callable(boundary)
+                                .ok_or_else(invalid_capture)?;
+                        } else {
+                            let retained = boundary
+                                .directory
+                                .callable_for_pc(boundary.cursor.pc)
+                                .ok_or_else(invalid_capture)?;
+                            retained.with_gc_stable_mutator(|value| *self_callable = *value);
+                        }
                         if !egcl_rt::function::is_interpreted_function(*self_callable) {
                             return Err(invalid_capture());
                         }
@@ -247,6 +296,16 @@ pub(in crate::cli::bytecode) unsafe extern "C" fn named_entry(
     let request = request.cast::<OrdinaryArityRequest>();
     // The adapter's entry data is its call cell (call_table_adapter::ensure).
     let cell = unsafe { (*request).entry_data } as u64;
+    // Lexical adapter actuals all fit the captured register array. A hit
+    // cannot collect, signal or poll; every miss uses the original boundary.
+    let count = unsafe { (*request).nargs };
+    if count <= 3 {
+        let symbol = unsafe { super::super::call_table::cell_symbol(cell) };
+        let args = unsafe { &(&(*request).register_args)[..count] };
+        if unsafe { try_lexical_leaf(symbol, args, out, image) } {
+            return;
+        }
+    }
     #[cfg(test)]
     if !ordinary_primitives::is_private(unsafe { super::super::call_table::cell_symbol(cell) }) {
         NAMED_ENTRIES.with(|count| count.set(count.get() + 1));
@@ -621,6 +680,7 @@ mod tests {
         let framed = egcl_compiler::t2::emit::emit_framed_ordinary_leaf(
             &ir,
             egcl_compiler::t2::emit::OrdinaryLispEntryOptions {
+                require_callable_home: false,
                 arity: 1,
                 arity_error_veneer: code.as_ptr() as u64,
                 binding: None,
@@ -788,6 +848,7 @@ mod tests {
         let framed = egcl_compiler::t2::emit::emit_framed_ordinary_leaf(
             &ir,
             egcl_compiler::t2::emit::OrdinaryLispEntryOptions {
+                require_callable_home: false,
                 arity: 1,
                 arity_error_veneer: code.as_ptr() as u64,
                 binding: None,

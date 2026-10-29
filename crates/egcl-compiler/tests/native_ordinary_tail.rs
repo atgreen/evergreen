@@ -243,6 +243,7 @@ fn ordinary_tail_reuses_frame_and_preserves_moves_depth_and_result_descriptor() 
         let code = emit_framed_ordinary_tail_call(
             &forwarder(arity, &indices),
             OrdinaryLispEntryOptions {
+                require_callable_home: false,
                 arity,
                 arity_error_veneer: tail_cold_probe as *const () as u64,
                 binding: None,

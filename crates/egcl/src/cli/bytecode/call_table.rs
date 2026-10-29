@@ -21,6 +21,8 @@ pub(super) use ordinary::assert_guarded_callable_publication_for_test;
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 pub(super) use ordinary::ordinary_segment_depth_for_test;
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+pub(super) use ordinary::private_probe_target;
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 pub(super) use ordinary::take_root_identities_for_test;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub(super) use ordinary::{active_ordinary_directory, enter_ordinary_segment};
@@ -806,7 +808,7 @@ pub(super) unsafe fn lean_native_target(
 ///
 /// # Safety
 /// As for [`ordinary_call_cell`].
-#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub(super) unsafe fn cell_symbol(cell: u64) -> u32 {
     unsafe { state(cell) }.symbol
 }

@@ -220,6 +220,7 @@ fn ordinary(function: &Function) -> FramedCode {
     emit_framed_ordinary_function(
         function,
         OrdinaryLispEntryOptions {
+            require_callable_home: false,
             arity: 1,
             arity_error_veneer: 1,
             binding: None,

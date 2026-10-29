@@ -9,6 +9,10 @@ use crate::t2::ir::{Function, Opcode, ValueRepresentation};
 
 #[derive(Clone, Copy, Debug)]
 pub struct OrdinaryLispEntryOptions {
+    /// Carry the selected interpreted callable in a precise native frame home,
+    /// even when the body has no lexical reads. RAX is the incoming identity.
+    /// Requires the full ordinary frame protocol; the mini leaf declines it.
+    pub require_callable_home: bool,
     pub arity: usize,
     /// A machine entry using the ordinary Lisp ABI. Wrong arity tail-jumps
     /// here before changing any argument, count, closure, context or frame.
@@ -69,7 +73,8 @@ pub fn emit_framed_ordinary_leaf(
     options: OrdinaryLispEntryOptions,
 ) -> Result<FramedCode, EmitError> {
     let unsupported = || EmitError::UnsupportedOp(0xFA);
-    if options.arity > 4
+    if options.require_callable_home
+        || options.arity > 4
         || options.arity != f.block(f.entry()).params.len()
         || options.arity_error_veneer == 0
         || f.is_variadic()

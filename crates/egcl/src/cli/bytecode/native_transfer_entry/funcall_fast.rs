@@ -61,8 +61,11 @@ enum Target {
         /// The callable identity the general route hands to the entry. For a
         /// tree-walker closure this is its compiled object, not the wrapper.
         function: EgclVal,
-        /// The dispatch symbol whose private roots stay traced while it runs.
+        /// Dispatch/profiling identity, distinct from the selected instance.
         symbol: u32,
+        /// Immutable root choice captured after select validates the callable;
+        /// the entry's collection/invalidation guards bound this cached ID.
+        actual_instance: u32,
         /// Whether a mapped caller's FUNCALL enters this body as a child in
         /// its own segment (`call_table::mapped_callable` accepts it).
         child: bool,
@@ -120,7 +123,7 @@ pub(in crate::cli::bytecode) fn is_cached_for_test(function: EgclVal) -> bool {
 pub(in crate::cli::bytecode) unsafe fn clear_for_collection() {
     // Generated FUNCALL probes record this stamp with the raw object bits
     // they compare; a collection retires every such entry at once.
-    COLLECTION_STAMP.fetch_add(1, std::sync::atomic::Ordering::Release);
+    retire_native_probes();
     unsafe {
         TABLE.scan(|table| {
             table
@@ -139,7 +142,26 @@ pub(in crate::cli::bytecode) unsafe fn clear_for_collection() {
 /// Moved by every collection. See `collection_stamp_address`.
 static COLLECTION_STAMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// The current collection stamp.
+/// Invalidate weak generated probes before either heap movement or destruction
+/// of descriptors they may still name. No execution can yield between its
+/// checked hit and publishing the hidden callable in the callee's frame.
+pub(in crate::cli::bytecode) fn retire_native_probes() {
+    COLLECTION_STAMP.fetch_add(1, std::sync::atomic::Ordering::Release);
+    #[cfg(test)]
+    PROBE_RETIREMENTS.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(test)]
+thread_local! {
+    static PROBE_RETIREMENTS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(in crate::cli::bytecode) fn probe_retirements_for_test() -> usize {
+    PROBE_RETIREMENTS.with(Cell::get)
+}
+
+/// The collection/descriptor-lease stamp (not a collection counter).
 pub(in crate::cli::bytecode) fn collection_stamp() -> u64 {
     COLLECTION_STAMP.load(std::sync::atomic::Ordering::Acquire)
 }
@@ -156,14 +178,25 @@ pub(in crate::cli::bytecode) fn collection_stamp_address() -> usize {
 pub(in crate::cli::bytecode) fn native_target(
     function: EgclVal,
     nargs: usize,
-) -> Option<(u32, Rc<TransferCode>)> {
+) -> Option<(u32, Rc<TransferCode>, EgclVal, std::rc::Weak<NativeCode>)> {
     match lookup_or_fill(function, nargs)? {
         Target::Native {
+            native,
             code,
             function: callable,
             symbol,
+            owner,
             ..
-        } if callable == function => Some((symbol, code)),
+        } if callable == function || code.accepts_explicit_callable(callable) => {
+            // One descriptor/cell per shared compiled template, never one
+            // permanently published descriptor for each ephemeral instance.
+            let symbol = if code.native_callable_slot.is_some() {
+                owner
+            } else {
+                symbol
+            };
+            Some((symbol, code, callable, Rc::downgrade(&native)))
+        }
         _ => None,
     }
 }
@@ -219,6 +252,20 @@ fn closure_cons(function: EgclVal) -> Option<EgclVal> {
         return super::super::super::is_closure_cons(function).then_some(function);
     }
     super::super::super::reified_closure(function)
+}
+
+/// Normalize only already-selected identities; this never compiles, allocates
+/// Lisp objects, polls, or resolves the current body from a mutable registry.
+pub(in crate::cli::bytecode) fn closure_carrier(mut function: EgclVal) -> Option<EgclVal> {
+    if let Some(symbol) = function.symbol_index() {
+        function = egcl_rt::symbols::symbol_function(symbol)?;
+    }
+    if let Some(closure) = closure_cons(function) {
+        let id = cp(closure).1.as_fixnum() as u64;
+        super::super::super::settled_tree_closure(id)
+    } else {
+        Some(function)
+    }
 }
 
 fn select(function: EgclVal, nargs: usize) -> Option<Target> {
@@ -292,12 +339,19 @@ fn select(function: EgclVal, nargs: usize) -> Option<Target> {
     let child = code.mapped_entry().is_some()
         && closure_captured_env(callable).is_none()
         && egcl_rt::symbols::symbol_function(name) == Some(callable);
+    let actual_instance =
+        if code.native_callable_slot.is_some() || egcl_rt::symbols::is_uninterned(symbol) {
+            egcl_rt::function::definition_index(callable)
+        } else {
+            symbol
+        };
     Some(Target::Native {
         native: Rc::clone(&native),
         owner,
         code: Rc::clone(code),
         function: callable,
         symbol,
+        actual_instance,
         child,
     })
 }
@@ -347,14 +401,16 @@ fn run(target: Target, args: &[EgclVal], env: &mut Env) -> Option<Result<EgclVal
         Target::Native {
             code,
             function,
-            symbol,
+            actual_instance,
             ..
         } => {
             #[cfg(test)]
             FAST_CALLS.with(|count| count.set((count.get().0 + 1, count.get().1)));
             // Nothing has allocated since selection; the entry roots the
             // callable and its own copy of the actuals before anything can.
-            egcl_rt::rooted!(_active_callable_root = super::super::ActiveCallableRoot(symbol));
+            egcl_rt::rooted!(
+                _active_callable_root = super::super::ActiveCallableRoot(actual_instance)
+            );
             Some(code.run_callable(function, args, env))
         }
         Target::Builtin { symbol } => {

@@ -162,6 +162,9 @@ fn emit(helper: OrdinaryPublishedHelper, expected: Option<usize>) -> Vec<u8> {
 pub struct OrdinaryFuncallProbeEntry {
     /// Bits of the function object this entry selects for.
     pub function: u64,
+    /// Weak selected compiled callable, or NIL for ENV_NONE. Read only after
+    /// the collection/epoch checks commit a hit; the prologue then roots it.
+    pub selected_callable: u64,
     /// `egcl_rt::call_table::invalidation_epoch` when the entry was filled.
     pub epoch: u64,
     /// The runtime's collection stamp when the entry was filled.
@@ -276,8 +279,8 @@ pub fn emit_ordinary_funcall_probe(probe: OrdinaryFuncallProbe) -> Vec<u8> {
             field(offset_of!(OrdinaryFuncallProbeEntry, revision)),
         ); // cmp r11,[r10+]
         a.jcc(Cc::Ne, next);
-        // The revision is unchanged, so the cell still publishes, and its
-        // execution still retains, this descriptor.
+        // The revision is unchanged, so this installed lease still admits
+        // the descriptor retained by its owning execution.
         mem(
             &mut a,
             0x4d,
@@ -286,6 +289,12 @@ pub fn emit_ordinary_funcall_probe(probe: OrdinaryFuncallProbe) -> Vec<u8> {
             2,
             field(offset_of!(OrdinaryFuncallProbeEntry, descriptor)),
         ); // mov r11,[r10+]
+        // Preserve this raw entry's address in R10, not its weak heap word.
+        // Slot zero needs no move. After this hit R8's GC stamp is dead and
+        // becomes scratch; every miss still leaves incoming RAX intact.
+        if index != 0 {
+            mem(&mut a, 0x4d, 0x8d, 10, 2, field(0)); // lea r10,[r10+entry]
+        }
         a.jmp(hit);
         a.bind(next);
     }
@@ -293,15 +302,15 @@ pub fn emit_ordinary_funcall_probe(probe: OrdinaryFuncallProbe) -> Vec<u8> {
     a.bind(hit);
     // Arity: count-1 actuals, or a descriptor that checks its own count.
     let arity_ok = a.label();
-    a.extend_from_slice(&[0x4c, 0x8d, 0x51, 0xff]); // lea r10,[rcx-1]
+    a.extend_from_slice(&[0x4c, 0x8d, 0x41, 0xff]); // lea r8,[rcx-1]
     mem(
         &mut a,
         0x4d,
         0x3b,
-        10,
+        8,
         3,
         offset_of!(OrdinaryEntryDescriptor, arity) as i32,
-    ); // cmp r10,[r11+arity]
+    ); // cmp r8,[r11+arity]
     a.jcc(Cc::E, arity_ok);
     debug_assert_eq!(ORDINARY_ARITY_ANY, usize::MAX);
     a.extend_from_slice(&[0x49, 0x83, 0xbb]); // cmp qword [r11+arity], -1
@@ -311,8 +320,8 @@ pub fn emit_ordinary_funcall_probe(probe: OrdinaryFuncallProbe) -> Vec<u8> {
     a.bind(arity_ok);
     // The target runs on this frame's stack: its own bound must fit above
     // the execution's limit, as a named caller checks before its CALL.
-    mem(&mut a, 0x4d, 0x8b, 10, 5, probe.active_control); // mov r10,[r13+control]
-    a.extend_from_slice(&[0x4d, 0x85, 0xd2]); // test r10,r10
+    mem(&mut a, 0x4d, 0x8b, 8, 5, probe.active_control); // mov r8,[r13+control]
+    a.extend_from_slice(&[0x4d, 0x85, 0xc0]); // test r8,r8
     a.jcc(Cc::E, miss);
     a.extend_from_slice(&[0x49, 0x89, 0xe1]); // mov r9,rsp
     mem(
@@ -324,7 +333,7 @@ pub fn emit_ordinary_funcall_probe(probe: OrdinaryFuncallProbe) -> Vec<u8> {
         offset_of!(OrdinaryEntryDescriptor, stack_required) as i32,
     ); // sub r9,[r11+..]
     unsigned_branch(&mut a, 0x82, miss); // jb: wrapped
-    a.extend_from_slice(&[0x4d, 0x3b, 0x4a, probe.stack_limit]); // cmp r9,[r10+limit]
+    a.extend_from_slice(&[0x4d, 0x3b, 0x48, probe.stack_limit]); // cmp r9,[r8+limit]
     unsigned_branch(&mut a, 0x86, miss); // jbe
     // Commit: drop the function, shift the actuals into place.
     let no_overflow = a.label();
@@ -335,8 +344,15 @@ pub fn emit_ordinary_funcall_probe(probe: OrdinaryFuncallProbe) -> Vec<u8> {
     a.extend_from_slice(&[0x48, 0x8b, 0x54, 0x24, 0x08]); // mov rdx,[rsp+8]
     a.bind(no_overflow);
     a.extend_from_slice(&[0x48, 0xff, 0xc9]); // dec rcx
-    a.extend_from_slice(&[0x48, 0xb8]); // mov rax, NIL: no closure
-    a.extend_from_slice(&NIL.0.to_le_bytes());
+    mem(
+        &mut a,
+        0x49,
+        0x8b,
+        0,
+        2,
+        offset_of!(OrdinaryFuncallProbeEntry, selected_callable) as i32,
+    ); // mov rax,[r10+]
+
     let entry = offset_of!(OrdinaryEntryDescriptor, entry) as i32;
     a.extend_from_slice(&[0x41, 0xff, 0xa3]); // jmp [r11+entry]
     a.extend_from_slice(&entry.to_le_bytes());

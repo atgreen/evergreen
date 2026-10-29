@@ -907,6 +907,7 @@ pub fn emit_framed_ordinary_function_with_self_call_facts(
                 | Opcode::ConstSymbol
                 | Opcode::ConstChar
                 | Opcode::ClearMv
+                | Opcode::CurrentCallable
                 | Opcode::FixnumCmpEq
                 | Opcode::FixnumCmpLt
                 | Opcode::FixnumCmpLe
@@ -1078,6 +1079,7 @@ pub(super) struct OrdinaryCallFrame<'a> {
     pub inference: &'a crate::t2::infer::InferenceResult,
     pub outgoing: NativeValueArea,
     pub control_home: FramedHome,
+    pub callable_home: Option<FramedHome>,
     /// Must-state at this call, after actual return normalization and resets.
     /// Unknown tuples still require the runtime admission check.
     pub mv_known_empty: bool,
@@ -1111,18 +1113,25 @@ impl OrdinaryCallEmission<'_> {
     }
 
     pub(super) fn emit(
-        self,
+        mut self,
         a: &mut Asm,
         data: &InstData,
         homes: &HashMap<Value, FramedHome>,
         constants: &HashMap<Value, u64>,
         frame: OrdinaryCallFrame<'_>,
     ) -> Result<Vec<CallReturn>, EmitError> {
+        // Lexical semantic helpers recover their immutable names/identity from
+        // this physical frame. Keep it published until the helper returns;
+        // an ordinary tail jump would retire its hidden callable home early.
+        if frame.callable_home.is_some() {
+            self.tail = false;
+        }
         let OrdinaryCallFrame {
             function,
             inference,
             outgoing,
             control_home,
+            callable_home,
             mv_known_empty,
             self_entry,
             self_prefix,
@@ -1368,7 +1377,11 @@ impl OrdinaryCallEmission<'_> {
                 load_home(a, reg, FramedHome::Stack(base + index as u32), 0);
             }
             mov_imm64(a, 1, data.args.len() as i64);
-            mov_imm64(a, RAX, egcl_rt::value::NIL.0 as i64);
+            if let Some(home) = callable_home.filter(|_| self.direct_self) {
+                load_home(a, RAX, home, 0);
+            } else {
+                mov_imm64(a, RAX, egcl_rt::value::NIL.0 as i64);
+            }
             emit_epilogue(a);
             a.extend_from_slice(&[0x41, 0xff, 0xe3]); // jmp r11; original return PC
             None
@@ -1384,7 +1397,11 @@ impl OrdinaryCallEmission<'_> {
                 load_home(a, reg, FramedHome::Stack(base + index as u32), overflow);
             }
             mov_imm64(a, 1, data.args.len() as i64);
-            mov_imm64(a, RAX, egcl_rt::value::NIL.0 as i64);
+            if let Some(home) = callable_home.filter(|_| self.direct_self) {
+                load_home(a, RAX, home, overflow);
+            } else {
+                mov_imm64(a, RAX, egcl_rt::value::NIL.0 as i64);
+            }
             if self.direct_self {
                 a.call(self_entry);
             } else {

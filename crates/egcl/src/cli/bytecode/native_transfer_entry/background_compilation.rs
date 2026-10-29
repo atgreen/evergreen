@@ -37,6 +37,7 @@ pub(in crate::cli::bytecode) struct EmittedTransfer {
     native_entry_kind_slot: Option<u32>,
     native_control_slot: Option<u32>,
     native_argument_base: Option<u32>,
+    native_callable_slot: Option<u32>,
     native_argument_count: u16,
     landing: JitBuffer,
     sites: SysvTransferTable,
@@ -81,10 +82,10 @@ impl EmittedTransfer {
             deopt_metadata: metadata,
             deopts: Cell::new(0),
             recompile: Cell::new(false),
+            private_probe_revision: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            private_probe_published: Cell::new(false),
             state_pool: RefCell::new(Vec::new()),
-            last_callable: RefCell::new(None),
-            last_callable_pinned: Cell::new(0),
-            spare_root_identity: RefCell::new(None),
+            callable_cache: Rc::new(CallableIdentityCache::default()),
             #[cfg(test)]
             unavailable_catch: None,
             #[cfg(test)]
@@ -122,6 +123,7 @@ impl EmittedTransfer {
             native_entry_kind_slot: self.native_entry_kind_slot,
             native_control_slot: self.native_control_slot,
             native_argument_base: self.native_argument_base,
+            native_callable_slot: self.native_callable_slot,
             native_argument_count: self.native_argument_count,
             landing: self.landing,
             sites: self.sites,
@@ -384,6 +386,10 @@ impl EmittedTransfer {
             } else if !ordinary_native_body(body) {
                 Some(format!("instruction {} (ordinary_native_body)",
                     first_refused_ordinary_op(body).as_deref().unwrap_or("parameter slots")))
+            } else if !context.captured_entry_profitable {
+                Some("captured environment helper cost (keep mapped entry)".to_string())
+            } else if !ordinary_capture_protocol_present(body, ir) {
+                Some("captured body without an explicit callable protocol".to_string())
             } else if !ordinary_primary_transport_eliminated(ir) {
                 Some("a primary-value binder survived specialization (TakeValuesToLocals)".to_string())
             } else if !ordinary_single_frame_states(body, ir) {
@@ -450,6 +456,7 @@ impl EmittedTransfer {
                         ordinary_calls::expected_arguments(body.min_args, body.arity))
                 })?;
                 let options = OrdinaryLispEntryOptions {
+                    require_callable_home: context.private_noenv_callable_home && private_noenv_leaf_ir(&ir),
                     arity: entry_arity, arity_error_veneer: arity.as_ptr() as u64, binding,
                 };
                 let mut emitted = egcl_compiler::t2::emit::emit_framed_ordinary_leaf(&ir, options).ok()
@@ -810,6 +817,7 @@ impl EmittedTransfer {
             native_entry_kind_slot: emitted.native_entry_kind_slot,
             native_control_slot: emitted.native_control_slot,
             native_argument_base: emitted.native_argument_base,
+            native_callable_slot: emitted.native_callable_slot,
             native_argument_count: emitted.native_argument_count,
             landing,
             sites,
@@ -837,12 +845,38 @@ pub(in crate::cli::bytecode) struct EmissionContext {
     unsupplied: u64,
     ordinary_parameters: bool,
     ordinary_suppressed: bool,
+    captured_entry_profitable: bool,
+    private_noenv_callable_home: bool,
     primitives: ordinary_primitives::Bindings,
     #[cfg(test)]
     tail_emission: bool,
 }
 
 impl EmissionContext {
+    pub(in crate::cli::bytecode) fn capture_for_owner(
+        body: &Arc<BytecodeFunction>,
+        allow_recursion: bool,
+        owner: u32,
+    ) -> Self {
+        let mut context = Self::capture(body, allow_recursion);
+        // The actual publication identity is authoritative. A lambda's display
+        // name may resolve to an unrelated interned symbol and proves nothing.
+        context.private_noenv_callable_home = egcl_rt::symbols::is_uninterned(owner)
+            && registry_get(owner).is_some_and(|current| Arc::ptr_eq(&current, body))
+            && CLOSURE_COMPILATION.with(|cache| {
+                cache
+                    .borrow()
+                    .get(&(Arc::as_ptr(body) as usize))
+                    .is_some_and(|state| state.owner == owner)
+            })
+            && private_noenv_callable_body(body);
+        context
+    }
+
+    pub(in crate::cli::bytecode) fn captured_entry_profitable(&self) -> bool {
+        self.captured_entry_profitable
+    }
+
     pub(in crate::cli::bytecode) fn capture(
         body: &Arc<BytecodeFunction>,
         allow_recursion: bool,
@@ -883,6 +917,8 @@ impl EmissionContext {
             unsupplied: super::super::unsupplied_marker().0,
             ordinary_parameters: ordinary_entry_parameters(body),
             ordinary_suppressed: ordinary_admission_suppressed(),
+            captured_entry_profitable: ordinary_capture_entry_profitable(body),
+            private_noenv_callable_home: false,
             primitives: ordinary_primitives::Bindings::capture(),
             #[cfg(test)]
             tail_emission: ORDINARY_TAIL_EMISSION.with(Cell::get),

@@ -17,6 +17,7 @@ mod inline_specials;
 mod linkage;
 mod live_signaling;
 mod nested;
+mod ordinary_captured_context;
 pub(super) mod ordinary_catch_osr;
 pub(super) mod ordinary_cleanup_osr;
 pub(super) mod ordinary_condition_osr;
@@ -311,3 +312,7 @@ pub(super) fn pause_child_for_test() -> Result<EgclVal, EgclError> {
 }
 
 pub(in crate::cli) use nested::reentry::{NativeEvalProbe, native_reentry_event_for_test};
+
+mod ordinary_noenv_context;
+
+mod ordinary_lexical_leaf;

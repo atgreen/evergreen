@@ -1197,6 +1197,21 @@ pub fn symbol_function(idx: u32) -> Option<EgclVal> {
     read_cell(idx, |s| EgclVal(s.function.load(Ordering::Acquire)))
 }
 
+/// Whether a known uninterned symbol has no user-owned global cell edges.
+/// This ignores execution-local dynamic bindings. GC metadata may use this
+/// read-only predicate to avoid making an otherwise unreachable value/plist
+/// graph live merely by retaining a private compilation-owner identity.
+/// No allocation or callback occurs under the registry read lock.
+pub fn symbol_global_cells_are_pristine(idx: u32) -> bool {
+    read_cell(idx, |s| {
+        s.value.load(Ordering::Acquire) == UNBOUND.0
+            && s.function.load(Ordering::Acquire) == UNBOUND.0
+            && s.plist == NIL
+            && s.package == NIL
+    })
+    .unwrap_or(false)
+}
+
 /// Set the global function cell.
 pub fn set_symbol_function(idx: u32, function: EgclVal) {
     read_cell(idx, |s| s.function.store(function.0, Ordering::Release));

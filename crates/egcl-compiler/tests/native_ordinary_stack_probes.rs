@@ -83,6 +83,7 @@ fn large_ordinary_frames_and_outgoing_areas_touch_each_stack_page() {
     let code = emit_framed_ordinary_function(
         &f,
         OrdinaryLispEntryOptions {
+            require_callable_home: false,
             arity: 1,
             arity_error_veneer: 1,
             binding: None,

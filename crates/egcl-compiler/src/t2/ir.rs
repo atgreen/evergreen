@@ -314,6 +314,11 @@ pub enum Opcode {
     MemoryFence,
     Alloc,
     AllocCons,
+    /// The exact tagged callable supplied in the ordinary Lisp ABI's hidden
+    /// RAX argument. It is copied from a precise per-physical-frame home;
+    /// it is never inferred from a code address or the current function cell.
+    /// Only the ordinary x86-64 Linux entry admits this operation.
+    CurrentCallable,
     /// Reset the thread's multiple-values state (interpreter `ClearMv`, emitted
     /// after SETQ/SETF and in statement position). No operands, no result;
     /// lowers to a `c2i_clear_mv` call (bliss-mzp).
@@ -1140,6 +1145,7 @@ impl Function {
                     | AuxData::GlobalValue { .. }
                     | AuxData::FunctionLookup(_)
                     | AuxData::ValuesToList
+                    | AuxData::LexicalEnvironment { .. }
             )
             || !self.block_has_terminator(block)
         {

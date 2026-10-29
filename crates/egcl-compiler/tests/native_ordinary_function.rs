@@ -428,6 +428,7 @@ fn execute_with_self_stack_bound(
     let code = emit_framed_ordinary_function_with_self_calls(
         f,
         OrdinaryLispEntryOptions {
+            require_callable_home: false,
             arity,
             arity_error_veneer: rejected as *const () as u64,
             binding: None,
@@ -649,6 +650,7 @@ fn ordinary_entry_rejects_unpolled_cycles() {
     let result = emit_framed_ordinary_function(
         &f,
         OrdinaryLispEntryOptions {
+            require_callable_home: false,
             arity: 0,
             arity_error_veneer: 1,
             binding: None,
