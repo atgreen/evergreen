@@ -4547,9 +4547,15 @@ fn format_impl(
                 }
                 let c = val.as_char();
                 if colon {
-                    // ~:C spells out a non-graphic character's name; ~:@C adds
-                    // nothing here (no key-name information to give).
-                    output.text(&character_name(c));
+                    // Printing characters are graphic characters other than
+                    // Space. Unicode whitespace can still be graphic; reader
+                    // syntax uses names for it independently of this display.
+                    // ~:@C adds nothing (no keyboard attributes to describe).
+                    if c != ' ' && graphic_char_p(c) {
+                        output.character(c);
+                    } else {
+                        output.text(&character_name(c));
+                    }
                 } else if at_sign {
                     // ~@C prints the character as the reader would read it.
                     output.text("#\\");
