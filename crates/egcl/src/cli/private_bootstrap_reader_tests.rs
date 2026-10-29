@@ -113,12 +113,22 @@ fn reader_keeps_defined_ordinary_helpers_but_isolates_private_bootstrap_names() 
         egcl_rt::symbols::symbol_package(foreign_save_core),
         Some(*foreign)
     );
-    // An intentional import is a real package binding and must win before the
-    // private bootstrap compatibility rule. Import last: importing a homeless
-    // symbol can establish its first home package.
-    egcl_stdlib::import(&[EgclVal::from_symbol_index(indices[1])], *imports).unwrap();
+    // Import the properly owned user symbol created above. The deliberately
+    // homeless synthetic bootstrap identity is not a package-table entry.
+    // An intentional import must win before the private compatibility rule.
+    egcl_rt::rooted!(
+        imported = egcl_stdlib::intern("%PRIVATE-READER-FIXTURE", *foreign)
+            .unwrap()
+            .0
+    );
+    assert_ne!(*imported, EgclVal::from_symbol_index(indices[1]));
+    egcl_stdlib::import(&[*imported], *imports).unwrap();
     assert_eq!(
         reader_symbol_resolver(Some("PRIVATE-READER-IMPORTS"), "%PRIVATE-READER-FIXTURE"),
-        Some(indices[1])
+        imported.symbol_index()
+    );
+    assert_eq!(
+        egcl_rt::symbols::symbol_package(imported.as_symbol_index()),
+        Some(*foreign)
     );
 }
