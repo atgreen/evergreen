@@ -2820,7 +2820,10 @@ mod tests {
                 args: vec![i, bound],
                 ..inst(Opcode::FixnumCmpLt)
             },
-            &[(fixnum(), ValueRepresentation::Tagged)],
+            &[(
+                IRType::of(TypeBits::SYMBOL.join(TypeBits::NULL)),
+                ValueRepresentation::Tagged,
+            )],
         );
         f.set_terminator(
             header,
