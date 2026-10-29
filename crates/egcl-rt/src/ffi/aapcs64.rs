@@ -6,9 +6,11 @@
 //! The x86-64 path JITs one adapter per signature, because SysV placement
 //! depends on argument classification in a way that is awkward to do at
 //! runtime. AAPCS64 does not need that: integers and pointers fill `X0`–`X7` in
-//! order, floats and doubles fill `D0`–`D7` in order, and the remainder goes to
-//! the stack in eight-byte slots. One trampoline that loads all sixteen
-//! registers from two buffers therefore covers every scalar signature, and
+//! order, floats and doubles fill `D0`–`D7` in order, and remaining scalars spill
+//! to the stack. Generic AAPCS64 uses eight-byte slots; Apple's fixed spills
+//! pack at natural alignment and its anonymous arguments use stack slots.
+//! One trampoline loads all sixteen registers from two buffers, covering the
+//! supported scalar signatures without executable adapter allocation, and
 //! there is no A64 encoder to write, review, or keep correct.
 //!
 //! What this replaces: `legacy.rs` handles non-x86 targets by transmuting to a
@@ -67,44 +69,157 @@ impl Scalar {
     }
 }
 
-/// Where one argument goes.
-#[derive(Clone, Copy)]
+/// Apple retains the scalar register files but changes stack placement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Abi {
+    Aapcs64,
+    Apple,
+}
+
+impl Abi {
+    fn native() -> Self {
+        if cfg!(target_vendor = "apple") {
+            Self::Apple
+        } else {
+            Self::Aapcs64
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Slot {
     Integer(usize),
     Float(usize),
-    Stack(usize),
+    Stack { offset: usize, width: usize },
 }
 
-/// AAPCS64 placement.
-///
-/// Variadic note: on Linux and Android a variadic call places arguments in
-/// exactly the same registers as a fixed one, so `fixed_count` needs no special
-/// handling. Apple's arm64 ABI differs — every variadic argument goes on the
-/// stack — so a Darwin port must not reuse this unchanged.
-fn classify(arguments: &[Scalar]) -> Result<Vec<Slot>, EgclError> {
+struct Layout {
+    slots: Vec<Slot>,
+    stack_bytes: usize,
+}
+
+impl Scalar {
+    fn size(self) -> usize {
+        match self {
+            Self::Void => 0,
+            Self::Integer { bits, .. } => usize::from(bits) / 8,
+            Self::Float => 4,
+            Self::Double => 8,
+        }
+    }
+}
+
+fn aligned(value: usize, alignment: usize) -> Result<usize, EgclError> {
+    value
+        .checked_add(alignment - 1)
+        .map(|n| n & !(alignment - 1))
+        .ok_or_else(|| EgclError::FfiError("foreign stack layout overflow".into()))
+}
+
+/// Classify already-promoted scalar arguments. Apple anonymous arguments go
+/// directly to eight-byte stack slots; fixed spills occupy their natural size.
+/// Generic AAPCS64 preserves its existing eight-byte spill representation.
+fn classify(
+    arguments: &[Scalar],
+    abi: Abi,
+    fixed_count: Option<usize>,
+) -> Result<Layout, EgclError> {
+    if fixed_count.is_some_and(|count| count > arguments.len()) {
+        return Err(EgclError::FfiError(
+            "invalid variadic argument counts".into(),
+        ));
+    }
     let mut integers = 0usize;
     let mut floats = 0usize;
-    let mut stack = 0usize;
+    let mut stack_bytes = 0usize;
     let mut slots = Vec::with_capacity(arguments.len());
-    for scalar in arguments {
+    for (index, scalar) in arguments.iter().enumerate() {
         if matches!(scalar, Scalar::Void) {
             return Err(EgclError::FfiError("void is not an argument type".into()));
         }
-        if scalar.is_floating() {
-            if floats < ARGUMENT_REGISTERS {
-                slots.push(Slot::Float(floats));
-                floats += 1;
+        let anonymous = abi == Abi::Apple && fixed_count.is_some_and(|count| index >= count);
+        if !anonymous {
+            if scalar.is_floating() {
+                if floats < ARGUMENT_REGISTERS {
+                    slots.push(Slot::Float(floats));
+                    floats += 1;
+                    continue;
+                }
+            } else if integers < ARGUMENT_REGISTERS {
+                slots.push(Slot::Integer(integers));
+                integers += 1;
                 continue;
             }
-        } else if integers < ARGUMENT_REGISTERS {
-            slots.push(Slot::Integer(integers));
-            integers += 1;
-            continue;
         }
-        slots.push(Slot::Stack(stack));
-        stack += 1;
+        let (alignment, occupied, width) = if abi == Abi::Aapcs64 {
+            (8, 8, 8)
+        } else if anonymous {
+            (8, 8, scalar.size())
+        } else {
+            let size = scalar.size();
+            (size, size, size)
+        };
+        let offset = aligned(stack_bytes, alignment)?;
+        stack_bytes = offset
+            .checked_add(occupied)
+            .ok_or_else(|| EgclError::FfiError("foreign stack layout overflow".into()))?;
+        slots.push(Slot::Stack { offset, width });
     }
-    Ok(slots)
+    Ok(Layout { slots, stack_bytes })
+}
+
+/// Apple requires the caller to extend narrow integer register arguments to
+/// 32 bits. Stack fields still occupy their declared natural width.
+fn narrow_integer_bits(raw: u64, bits: u8, signed: bool) -> u64 {
+    let shift = 32 - u32::from(bits);
+    let low = (raw as u32) << shift;
+    u64::from(if signed {
+        ((low as i32) >> shift) as u32
+    } else {
+        low >> shift
+    })
+}
+
+struct Arguments {
+    integers: [u64; ARGUMENT_REGISTERS],
+    floats: [u64; ARGUMENT_REGISTERS],
+    stack: Vec<u64>,
+}
+
+fn pack_arguments(scalars: &[Scalar], args: &[u64], layout: &Layout, abi: Abi) -> Arguments {
+    let mut packed = Arguments {
+        integers: [0; ARGUMENT_REGISTERS],
+        floats: [0; ARGUMENT_REGISTERS],
+        // Every copied word, including the final partial word, is initialized.
+        stack: vec![0; layout.stack_bytes.div_ceil(8)],
+    };
+    for ((slot, scalar), raw) in layout.slots.iter().zip(scalars).zip(args) {
+        match *slot {
+            Slot::Integer(index) => {
+                packed.integers[index] = match *scalar {
+                    Scalar::Integer { bits, signed } if abi == Abi::Apple && bits < 32 => {
+                        narrow_integer_bits(*raw, bits, signed)
+                    }
+                    _ => *raw,
+                };
+            }
+            Slot::Float(index) => packed.floats[index] = *raw,
+            Slot::Stack { offset, width } => {
+                if abi == Abi::Aapcs64 {
+                    // Preserve the generic path's single native-word store.
+                    packed.stack[offset / 8] = *raw;
+                } else {
+                    // Natural alignment and widths <= 8 ensure a scalar never
+                    // straddles a word. Apple ARM64 stack data is little-endian.
+                    let start = offset % 8;
+                    let mut word = packed.stack[offset / 8].to_ne_bytes();
+                    word[start..start + width].copy_from_slice(&raw.to_le_bytes()[..width]);
+                    packed.stack[offset / 8] = u64::from_ne_bytes(word);
+                }
+            }
+        }
+    }
+    packed
 }
 
 // A single-precision argument occupies `S<n>` — the LOW 32 BITS of `V<n>`, as
@@ -143,14 +258,17 @@ pub unsafe fn ffi_call(
     arg_types: &[AlienType],
     args: &[u64],
 ) -> Result<u64, EgclError> {
-    // Darwin placement differs for narrow fixed spills and variadic arguments.
-    // Until an Apple ABI backend exists, the initial iOS profile must not call
-    // a native function with the Linux/Android placement implemented below.
-    if cfg!(target_os = "ios") {
-        return Err(EgclError::FfiError(
-            "scalar foreign calls are not supported by the initial iOS T0 profile".into(),
-        ));
-    }
+    // SAFETY: unchanged caller signature contract; no anonymous arguments.
+    unsafe { ffi_call_impl(fn_ptr, ret_type, arg_types, args, None) }
+}
+
+unsafe fn ffi_call_impl(
+    fn_ptr: *const (),
+    ret_type: &AlienType,
+    arg_types: &[AlienType],
+    args: &[u64],
+    fixed_count: Option<usize>,
+) -> Result<u64, EgclError> {
     if fn_ptr.is_null() {
         return Err(EgclError::FfiError("null function pointer".into()));
     }
@@ -173,25 +291,15 @@ pub unsafe fn ffi_call(
         .iter()
         .map(Scalar::from_type)
         .collect::<Result<Vec<_>, _>>()?;
-    let slots = classify(&scalars)?;
+    let abi = Abi::native();
+    let layout = classify(&scalars, abi, fixed_count)?;
     let t1 = t0.map(|_| std::time::Instant::now());
 
-    let mut integers = [0u64; ARGUMENT_REGISTERS];
-    let mut floats = [0u64; ARGUMENT_REGISTERS];
-    let mut stack: Vec<u64> = Vec::new();
-    for (slot, raw) in slots.iter().zip(args) {
-        let bits = *raw;
-        match *slot {
-            Slot::Integer(index) => integers[index] = bits,
-            Slot::Float(index) => floats[index] = bits,
-            Slot::Stack(index) => {
-                if stack.len() <= index {
-                    stack.resize(index + 1, 0);
-                }
-                stack[index] = bits;
-            }
-        }
-    }
+    let Arguments {
+        integers,
+        floats,
+        stack,
+    } = pack_arguments(&scalars, args, &layout, abi);
 
     // Publish Native state so a collection can proceed while foreign code runs,
     // exactly as the x86-64 path does.
@@ -266,25 +374,46 @@ pub unsafe fn ffi_call_variadic(
             "invalid variadic argument counts".into(),
         ));
     }
+    let (types, values) = promote_variadic(arg_types, args, fixed_count)?;
+    // SAFETY: default promotions only widen the caller's argument values.
+    unsafe { ffi_call_impl(fn_ptr, ret_type, &types, &values, Some(fixed_count)) }
+}
+
+fn promote_variadic(
+    arg_types: &[AlienType],
+    args: &[u64],
+    fixed_count: usize,
+) -> Result<(Vec<AlienType>, Vec<u64>), EgclError> {
+    if fixed_count > arg_types.len() || arg_types.len() != args.len() {
+        return Err(EgclError::FfiError(
+            "invalid variadic argument counts".into(),
+        ));
+    }
     let mut types = arg_types.to_vec();
     let mut values = args.to_vec();
     for index in fixed_count..arg_types.len() {
-        match &arg_types[index] {
+        // Reject unsupported widths rather than promoting an invalid type.
+        Scalar::from_type(&arg_types[index])?;
+        match arg_types[index] {
             AlienType::Float => {
                 types[index] = AlienType::Double;
-                values[index] = (f32::from_bits(args[index] as u32) as f64).to_bits();
+                values[index] = f64::from(f32::from_bits(args[index] as u32)).to_bits();
             }
-            AlienType::Int { bits, signed } if *bits < 32 => {
+            AlienType::Int {
+                bits: bits @ (8 | 16),
+                signed,
+            } => {
+                // Every u8/u16 value fits a C int on the supported targets.
                 types[index] = AlienType::Int {
                     bits: 32,
-                    signed: *signed,
+                    signed: true,
                 };
+                values[index] = narrow_integer_bits(args[index], bits, signed);
             }
             _ => {}
         }
     }
-    // SAFETY: forwarded caller contract; promotion only widens.
-    unsafe { ffi_call(fn_ptr, ret_type, &types, &values) }
+    Ok((types, values))
 }
 
 /// The trampoline body. Two declarations share it so that Rust reads the result
@@ -538,5 +667,286 @@ mod stack_input_tests {
             )
         };
         assert_eq!(result, 42);
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    const U64: Scalar = Scalar::Integer {
+        bits: 64,
+        signed: false,
+    };
+    const U8: Scalar = Scalar::Integer {
+        bits: 8,
+        signed: false,
+    };
+    const I8: Scalar = Scalar::Integer {
+        bits: 8,
+        signed: true,
+    };
+    const U16: Scalar = Scalar::Integer {
+        bits: 16,
+        signed: false,
+    };
+    const U32: Scalar = Scalar::Integer {
+        bits: 32,
+        signed: false,
+    };
+
+    fn bytes(words: &[u64]) -> Vec<u8> {
+        words.iter().flat_map(|word| word.to_ne_bytes()).collect()
+    }
+
+    #[test]
+    fn generic_register_files_and_eight_byte_spills_are_unchanged() {
+        let scalars = [U64; 10]
+            .into_iter()
+            .chain([Scalar::Float; 10])
+            .collect::<Vec<_>>();
+        for fixed in [None, Some(3)] {
+            let layout = classify(&scalars, Abi::Aapcs64, fixed).expect("layout");
+            assert_eq!(
+                &layout.slots[..8],
+                &(0..8).map(Slot::Integer).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                &layout.slots[10..18],
+                &(0..8).map(Slot::Float).collect::<Vec<_>>()
+            );
+            for (index, offset) in [(8, 0), (9, 8), (18, 16), (19, 24)] {
+                assert_eq!(layout.slots[index], Slot::Stack { offset, width: 8 });
+            }
+            let values = (1..=20).collect::<Vec<u64>>();
+            let packed = pack_arguments(&scalars, &values, &layout, Abi::Aapcs64);
+            assert_eq!(packed.stack, [9, 10, 19, 20]);
+            assert_eq!(layout.stack_bytes, 32);
+        }
+    }
+
+    #[test]
+    fn apple_fixed_narrow_spills_use_natural_width_and_alignment() {
+        let scalars = [U64; 8]
+            .into_iter()
+            .chain([U8, U8, U16, U32, U8, U64])
+            .collect::<Vec<_>>();
+        let layout = classify(&scalars, Abi::Apple, None).expect("layout");
+        for (index, offset, width) in [
+            (8, 0, 1),
+            (9, 1, 1),
+            (10, 2, 2),
+            (11, 4, 4),
+            (12, 8, 1),
+            (13, 16, 8),
+        ] {
+            assert_eq!(layout.slots[index], Slot::Stack { offset, width });
+        }
+        let mut values = vec![0; 8];
+        values.extend([0xa1, 0xb2, 0xc3d4, 0xe5f60718, 0x29, 0x3132333435363738]);
+        let packed = pack_arguments(&scalars, &values, &layout, Abi::Apple);
+        assert_eq!(
+            bytes(&packed.stack),
+            [
+                0xa1, 0xb2, 0xd4, 0xc3, 0x18, 0x07, 0xf6, 0xe5, 0x29, 0, 0, 0, 0, 0, 0, 0, 0x38,
+                0x37, 0x36, 0x35, 0x34, 0x33, 0x32, 0x31
+            ]
+        );
+    }
+
+    #[test]
+    fn apple_float_spills_pack_two_single_floats_into_one_word() {
+        let scalars = [Scalar::Float; 10];
+        let layout = classify(&scalars, Abi::Apple, None).expect("layout");
+        assert_eq!(
+            layout.slots[8],
+            Slot::Stack {
+                offset: 0,
+                width: 4
+            }
+        );
+        assert_eq!(
+            layout.slots[9],
+            Slot::Stack {
+                offset: 4,
+                width: 4
+            }
+        );
+        let mut values = vec![0; 8];
+        values.extend([u64::from(1.5f32.to_bits()), u64::from((-2.25f32).to_bits())]);
+        let packed = pack_arguments(&scalars, &values, &layout, Abi::Apple);
+        assert_eq!(
+            bytes(&packed.stack),
+            [1.5f32.to_le_bytes(), (-2.25f32).to_le_bytes()].concat()
+        );
+    }
+
+    #[test]
+    fn apple_mixed_spills_share_one_cursor_and_initialize_final_padding() {
+        let scalars = [U64; 8]
+            .into_iter()
+            .chain([Scalar::Double; 8])
+            .chain([U8, Scalar::Double, U16, Scalar::Float, U8])
+            .collect::<Vec<_>>();
+        let layout = classify(&scalars, Abi::Apple, None).expect("layout");
+        for (index, offset, width) in [
+            (16, 0, 1),
+            (17, 8, 8),
+            (18, 16, 2),
+            (19, 20, 4),
+            (20, 24, 1),
+        ] {
+            assert_eq!(layout.slots[index], Slot::Stack { offset, width });
+        }
+        assert_eq!(layout.stack_bytes, 25);
+        let packed = pack_arguments(&scalars, &[u64::MAX; 21], &layout, Abi::Apple);
+        let mut expected = vec![0; 32];
+        for (offset, width) in [(0, 1), (8, 8), (16, 2), (20, 4), (24, 1)] {
+            expected[offset..offset + width].fill(0xff);
+        }
+        assert_eq!(bytes(&packed.stack), expected);
+    }
+
+    #[test]
+    fn apple_anonymous_arguments_bypass_available_registers() {
+        let scalars = [U64, Scalar::Double, U32, Scalar::Double];
+        let layout = classify(&scalars, Abi::Apple, Some(2)).expect("layout");
+        assert_eq!(
+            layout.slots,
+            [
+                Slot::Integer(0),
+                Slot::Float(0),
+                Slot::Stack {
+                    offset: 0,
+                    width: 4
+                },
+                Slot::Stack {
+                    offset: 8,
+                    width: 8
+                }
+            ]
+        );
+        assert_eq!(layout.stack_bytes, 16);
+        let scalars = [U64; 8]
+            .into_iter()
+            .chain([U8, U32, Scalar::Double])
+            .collect::<Vec<_>>();
+        let layout = classify(&scalars, Abi::Apple, Some(9)).expect("layout");
+        assert_eq!(
+            &layout.slots[8..],
+            &[
+                Slot::Stack {
+                    offset: 0,
+                    width: 1
+                },
+                Slot::Stack {
+                    offset: 8,
+                    width: 4
+                },
+                Slot::Stack {
+                    offset: 16,
+                    width: 8
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn apple_narrow_registers_are_extended_by_declared_signedness() {
+        let scalars = [
+            I8,
+            U8,
+            Scalar::Integer {
+                bits: 16,
+                signed: true,
+            },
+            U16,
+        ];
+        let values = [0xdeadbeef80, 0xdeadbeef80, 0xdeadbeef8001, 0xdeadbeef8001];
+        let layout = classify(&scalars, Abi::Apple, None).expect("layout");
+        assert_eq!(
+            pack_arguments(&scalars, &values, &layout, Abi::Apple).integers[..4],
+            [0xffffff80, 0x80, 0xffff8001, 0x8001]
+        );
+        assert_eq!(
+            pack_arguments(&scalars, &values, &layout, Abi::Aapcs64).integers[..4],
+            values
+        );
+    }
+
+    #[test]
+    fn default_promotions_transform_bits_and_leave_fixed_arguments_untouched() {
+        let types = [
+            AlienType::Int {
+                bits: 8,
+                signed: true,
+            },
+            AlienType::Int {
+                bits: 8,
+                signed: true,
+            },
+            AlienType::Int {
+                bits: 16,
+                signed: true,
+            },
+            AlienType::Int {
+                bits: 8,
+                signed: false,
+            },
+            AlienType::Int {
+                bits: 16,
+                signed: false,
+            },
+            AlienType::Float,
+        ];
+        let values = [
+            0x80,
+            0x80,
+            0x8001,
+            0xdeadbeefff,
+            0xdeadbeefffff,
+            u64::from(1.5f32.to_bits()),
+        ];
+        let (promoted, raw) = promote_variadic(&types, &values, 1).expect("promotions");
+        assert!(matches!(
+            promoted[0],
+            AlienType::Int {
+                bits: 8,
+                signed: true
+            }
+        ));
+        for ty in &promoted[1..5] {
+            assert!(matches!(
+                ty,
+                AlienType::Int {
+                    bits: 32,
+                    signed: true
+                }
+            ));
+        }
+        assert!(matches!(promoted[5], AlienType::Double));
+        assert_eq!(
+            raw,
+            [0x80, 0xffffff80, 0xffff8001, 255, 65535, 1.5f64.to_bits()]
+        );
+    }
+
+    #[test]
+    fn invalid_counts_void_and_unsupported_widths_are_rejected() {
+        assert!(classify(&[U64], Abi::Apple, Some(2)).is_err());
+        assert!(classify(&[Scalar::Void], Abi::Apple, None).is_err());
+        assert!(promote_variadic(&[], &[], 1).is_err());
+        assert!(promote_variadic(&[AlienType::Float], &[], 0).is_err());
+        assert!(
+            promote_variadic(
+                &[AlienType::Int {
+                    bits: 7,
+                    signed: false
+                }],
+                &[0],
+                0
+            )
+            .is_err()
+        );
     }
 }

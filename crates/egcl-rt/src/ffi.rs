@@ -44,7 +44,14 @@ pub mod callback;
 pub mod callback;
 // AArch64 gets a real ABI backend rather than the legacy dispatcher's eighteen
 // hardcoded shapes (spec §4.7.5.2). Everything else non-x86 still falls back.
-#[cfg(all(target_arch = "aarch64", unix))]
+#[cfg(any(test, all(target_arch = "aarch64", unix)))]
+#[cfg_attr(
+    not(all(target_arch = "aarch64", unix)),
+    allow(
+        dead_code,
+        reason = "pure scalar ABI placement tests run on every host"
+    )
+)]
 mod aapcs64;
 // riscv64 likewise: one LP64D trampoline covers every scalar signature.
 /// ELFv2 foreign calls. Compiled on every host — the placement rules are pure
