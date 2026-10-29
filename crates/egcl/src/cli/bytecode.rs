@@ -175,6 +175,7 @@ mod call_table_funcall;
 #[path = "bytecode/call_table_native_s390x.rs"]
 mod call_table_native;
 mod closure_templates;
+mod method_context_use;
 mod quoted_funcall;
 use super::control_payload::ControlPayload;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -1670,10 +1671,10 @@ pub fn call_registered(
     // establishes this boundary; bytecode/native dispatch must do so too.
     // Keep the overwhelmingly common empty declaration path unchanged.
     if env.locally_specials.is_empty() {
-        call_registered_in_definition_scope(sym, args, fn_val, env)
+        call_registered_in_definition_scope(sym, args, fn_val, env, None)
     } else {
         super::with_special_declarations(env, Vec::new(), |env| {
-            call_registered_in_definition_scope(sym, args, fn_val, env)
+            call_registered_in_definition_scope(sym, args, fn_val, env, None)
         })
     }
 }
@@ -1683,6 +1684,7 @@ fn call_registered_in_definition_scope(
     args: &[EgclVal],
     fn_val: EgclVal,
     env: &mut Env,
+    expected_body: Option<&Arc<BytecodeFunction>>,
 ) -> Option<Result<EgclVal, EgclError>> {
     egcl_rt::rooted!(fn_val = fn_val);
     if debug_dispatch_enabled() {
@@ -1695,6 +1697,12 @@ fn call_registered_in_definition_scope(
     // Retired objects resolve their immutable body, never the replacement
     // installed under their public name. Source-free objects have no fallback.
     let (sym, callee) = bytecode_for_callable(sym, *fn_val)?;
+    // Validate and enter the same immutable selection. A failed proof never
+    // runs replacement bytecode or the unproved source fallback.
+    if expected_body.is_some_and(|expected| !Arc::ptr_eq(expected, &callee)) {
+        return None;
+    }
+
     if !arity_accepts(&callee, args.len()) {
         if cfg!(egcl_no_tree_walker) {
             return Some(Err(EgclError::ProgramError(format!(
@@ -2876,6 +2884,9 @@ fn constant_reference_folding_enabled() -> bool {
 
 /// Compiler state for lowering one function body.
 struct Lowerer<'e> {
+    method_context_initializer: Option<usize>,
+    method_context_initializing: bool,
+    method_context_helper_values: Vec<usize>,
     self_symbol: Option<u32>,
     self_call_sites: Vec<u32>,
     notinline_sites: Vec<u32>,
@@ -2988,6 +2999,7 @@ struct InlineLocal {
     closure_fns: std::collections::HashSet<String>,
     declared_special: HashMap<String, u32>,
     inline_policies: Vec<(u32, bool)>,
+    method_bindings: method_context_use::Bindings,
 }
 
 impl InlineLocal {
@@ -3129,6 +3141,9 @@ impl egcl_rt::gc::TraceHostRoots for Lowerer<'_> {
 impl<'e> Lowerer<'e> {
     fn new(env: &'e Env) -> Self {
         Lowerer {
+            method_context_initializer: None,
+            method_context_initializing: false,
+            method_context_helper_values: Vec::new(),
             self_symbol: None,
             self_call_sites: Vec::new(),
             notinline_sites: Vec::new(),
@@ -3187,6 +3202,23 @@ impl<'e> Lowerer<'e> {
     }
 
     fn emit(&mut self, i: Instr) {
+        if matches!(i, Instr::MakeClosure { .. }) && method_context_use::generated_helper() {
+            self.method_context_helper_values.push(self.code.len());
+        }
+        if matches!(i, Instr::EvalHost(_) | Instr::MakeClosureEnv(_)) {
+            method_context_use::unknown();
+        }
+        if self.method_context_initializing && method_context_use::initializer_instruction(&i) {
+            if self
+                .method_context_initializer
+                .replace(self.code.len())
+                .is_some()
+            {
+                method_context_use::unknown();
+            }
+        } else if let Instr::CallNamed { sym, .. } = i {
+            method_context_use::open_call(sym);
+        }
         if let Instr::CallNamed { sym, .. } = i
             && self_calls::notinline(sym, &self.inline_policies)
         {
@@ -3564,6 +3596,13 @@ impl<'e> Lowerer<'e> {
                 // evaluated-argument entry points instead. `invoke_method`
                 // publishes the context around a compiled body exactly as it
                 // does around a tree-walked one (bliss-ccso).
+                "CALL-NEXT-METHOD" | "NEXT-METHOD-P"
+                    if self.local_fns.contains_key(&name)
+                        || self.inline_local_fns.contains_key(&name)
+                        || self.closure_fns.contains(&name) =>
+                {
+                    self.lower_call(&name, op, rest)
+                }
                 "CALL-NEXT-METHOD" => self.lower_next_method_call(rest, true),
                 "NEXT-METHOD-P" => self.lower_next_method_call(rest, false),
                 "EGCL::QUASIQUOTE" => {
@@ -4128,7 +4167,14 @@ impl<'e> Lowerer<'e> {
             self.enter_scope();
             for bi in 0..binding_forms.len() {
                 let (name, init) = binding_name_init(binding_forms[bi])?;
-                self.lower_expr(init)?;
+                {
+                    let previous = self.method_context_initializing;
+                    self.method_context_initializing =
+                        method_context_use::initializer_binding(&name);
+                    let result = self.lower_expr(init);
+                    self.method_context_initializing = previous;
+                    result?;
+                }
                 if is_here_special(&name) {
                     let symbol = lexical_identity::resolve(&name)
                         .ok_or(Bail)?
@@ -4148,7 +4194,14 @@ impl<'e> Lowerer<'e> {
             let mut names = Vec::new();
             for bi in 0..binding_forms.len() {
                 let (name, init) = binding_name_init(binding_forms[bi])?;
-                self.lower_expr(init)?; // compiled against the *current* scope
+                {
+                    let previous = self.method_context_initializing;
+                    self.method_context_initializing =
+                        method_context_use::initializer_binding(&name);
+                    let result = self.lower_expr(init);
+                    self.method_context_initializing = previous;
+                    result?;
+                } // compiled against the *current* scope
                 names.push(name);
             }
             // Only now, with every init evaluated in the enclosing scope, does
@@ -4250,6 +4303,8 @@ impl<'e> Lowerer<'e> {
             self.pop_n(1);
         }
         let (_, body) = flet_def_forms(helper.definition);
+        let _method_bindings =
+            method_context_use::BindingScope::replace(helper.method_bindings.clone());
         let result = self.lower_progn(body);
         self.exit_scope(saved_next);
         self.scopes = scopes;
@@ -4336,6 +4391,12 @@ impl<'e> Lowerer<'e> {
         // lowered sibling args out from under a plain Vec.
         egcl_rt::rooted_ref!(_op_root = &mut op);
         egcl_rt::rooted_ref!(_rest_root = &mut rest);
+        if self.inline_local_fns.contains_key(name)
+            || self.local_fns.contains_key(name)
+            || self.closure_fns.contains(name)
+        {
+            method_context_use::reference(name);
+        }
         if let Some(helper) = self.inline_local_fns.get(name).cloned()
             && !self_calls::notinline(op.as_symbol_index(), &self.inline_policies)
             && helper.can_inline_in(self)
@@ -4708,6 +4769,10 @@ impl<'e> Lowerer<'e> {
     /// (CLHS 7.6.6.2); the primitive reads them from the saved context, so
     /// emitting zero arguments is exactly right rather than a special case.
     fn lower_next_method_call(&mut self, rest: EgclVal, call: bool) -> LowerResult<()> {
+        // Legacy runtime-context lowering is not an absence proof for an
+        // installed lexical continuation, even if a deferred namespace caused
+        // this fallback rather than the normal resolved FLET call.
+        method_context_use::unknown();
         let name = if call {
             "EGCL::%CALL-NEXT-METHOD"
         } else {
@@ -7866,6 +7931,9 @@ impl<'e> Lowerer<'e> {
                 target = EgclVal::from_symbol_index(reader::intern_symbol(&key));
             }
         }
+        if target.is_symbol() {
+            method_context_use::reference(&sym_name(target));
+        }
         // `#'localfn` for a capturing flet/labels function is the closure value
         // itself, held in a heap binding of its name in the FUNCTION namespace.
         if target.is_symbol() && self.closure_fns.contains(&sym_name(target)) {
@@ -8071,9 +8139,11 @@ impl<'e> Lowerer<'e> {
                             closure_fns: self.closure_fns.clone(),
                             declared_special: self.declared_special.clone(),
                             inline_policies: self.inline_policies.clone(),
+                            method_bindings: method_context_use::bindings(),
                         },
                     );
                 }
+                let _method_bindings = method_context_use::BindingScope::enter(&defs);
                 return self.lower_progn(body);
             }
         }
@@ -8146,6 +8216,7 @@ impl<'e> Lowerer<'e> {
         for i in 0..parsed.len() {
             let sym = parsed[i].1;
             let (params_form, fbody) = flet_def_block_forms(defs[i]);
+            let _generated_method_helper = method_context_use::GeneratedScope::enter(defs[i]);
             let bf = compile_local_function(
                 sym,
                 &self.inline_policies,
@@ -8188,6 +8259,7 @@ impl<'e> Lowerer<'e> {
         for (name, sym) in &parsed {
             self.local_fns.insert(name.clone(), *sym);
         }
+        let _method_bindings = method_context_use::BindingScope::enter(&defs);
         let r = self.lower_progn(body);
         self.local_fns = saved_local_fns.0;
         r
@@ -8233,6 +8305,7 @@ impl<'e> Lowerer<'e> {
                     closure_fns: self.closure_fns.clone(),
                     declared_special: self.declared_special.clone(),
                     inline_policies: self.inline_policies.clone(),
+                    method_bindings: method_context_use::bindings(),
                 },
             );
         }
@@ -8378,6 +8451,7 @@ impl<'e> Lowerer<'e> {
         let no_inline_helpers = HashMap::new();
         for i in 0..parsed.len() {
             let (params_form, fbody) = flet_def_block_forms(defs[i]);
+            let _generated_method_helper = method_context_use::GeneratedScope::enter(defs[i]);
             let bf = compile_capturing_local(
                 params_form,
                 fbody,
@@ -8430,6 +8504,7 @@ impl<'e> Lowerer<'e> {
         for (name, helper) in &inline_helpers.0 {
             self.inline_local_fns.insert(name.clone(), helper.clone());
         }
+        let _method_bindings = method_context_use::BindingScope::enter(defs);
         let r = self.lower_progn(body);
         self.closure_fns = saved_closure_fns;
         self.local_fns = saved_local_fns.0;
@@ -8525,6 +8600,9 @@ fn compile_local_function(
             required
         });
     let (param_names, min_args, max_args, variadic) = parse_lambda_list(params_form)?;
+    if variadic && optional_required.is_none() {
+        method_context_use::unknown();
+    }
     let mut lo = Lowerer::new(env);
     lo.self_symbol = Some(self_symbol);
     lo.inline_policies = inherited_policies.to_vec();
@@ -8622,6 +8700,9 @@ fn compile_capturing_local(
             required
         });
     let (param_names, min_args, max_args, variadic) = parse_lambda_list(params_form)?;
+    if variadic && optional_required.is_none() {
+        method_context_use::unknown();
+    }
     let mut lo = Lowerer::new(env);
     lo.declared_special = inherited_specials.clone();
     for name in &param_names {
@@ -10527,6 +10608,7 @@ fn compile_function_forcing_boxed(
 ) -> Option<BytecodeFunction> {
     egcl_rt::rooted!(params_form = params_form);
     egcl_rt::rooted!(body = body);
+    let _method_attempt = method_context_use::AttemptScope::enter(*body);
     // Required + &optional only: compile the defaults into an entry prologue and
     // bind positionally (optional_entry_prologue). The arguments' count may then
     // fall short of the arity, by the omitted optionals.
@@ -10644,6 +10726,9 @@ fn compile_function_forcing_boxed(
         }
     }
 
+    if variadic && optional_required.is_none() {
+        method_context_use::unknown();
+    }
     let mut lo = Lowerer::new(env);
     if !macro_lambda_list && name != "<lambda>" {
         lo.self_symbol = resolve_sym(name).map(|symbol| symbol.as_symbol_index());
@@ -10749,6 +10834,8 @@ fn compile_function_forcing_boxed(
         &lo.code,
         &mut lo.self_call_sites,
     );
+    let initializer = lo.method_context_initializer;
+    method_context_use::finish(initializer, &mut lo);
     let mut function = BytecodeFunction {
         self_call_sites: lo.self_call_sites,
         notinline_sites: lo.notinline_sites,
@@ -16802,7 +16889,70 @@ fn contains_host_eval(function: &BytecodeFunction) -> bool {
 /// (bliss-x5y.20): a method whose body compiles runs as native frames instead of
 /// `eval_progn`. The interpreted `body` is kept in the object as the fallback the
 /// dispatch path uses if the bytecode is ever invalidated.
+pub(super) type MethodNoContextBody = std::sync::Weak<BytecodeFunction>;
+pub(super) fn call_registered_method_if_body(
+    function: EgclVal,
+    proof: &MethodNoContextBody,
+    args: &[EgclVal],
+    env: &mut Env,
+) -> Option<Result<EgclVal, EgclError>> {
+    egcl_rt::rooted!(function = function);
+    egcl_rt::rooted!(args = args.to_vec());
+    let expected = proof.upgrade()?;
+    egcl_rt::rooted!(_proof_body = ActiveBytecodeRoot::new(&expected));
+    let symbol = egcl_rt::function::definition_index(*function);
+    if env.locally_specials.is_empty() {
+        call_registered_in_definition_scope(symbol, &args, *function, env, Some(&expected))
+    } else {
+        super::with_special_declarations(env, Vec::new(), |env| {
+            call_registered_in_definition_scope(symbol, &args, *function, env, Some(&expected))
+        })
+    }
+}
+pub(super) fn method_no_context_body_matches(
+    function: EgclVal,
+    proof: &MethodNoContextBody,
+) -> bool {
+    if !egcl_rt::function::is_interpreted_function(function) {
+        return false;
+    }
+    let Some(proved) = proof.upgrade() else {
+        return false;
+    };
+    bytecode_for_callable(egcl_rt::function::definition_index(function), function)
+        .is_some_and(|(_, current)| Arc::ptr_eq(&proved, &current))
+}
+
+pub(super) use method_context_use::Spec as MethodContextSpec;
+
 pub(super) fn compile_and_reify_lambda(
+    label: &str,
+    lambda_list: EgclVal,
+    body: EgclVal,
+    env: &super::Env,
+) -> Option<EgclVal> {
+    compile_and_reify_lambda_inner(label, lambda_list, body, env)
+}
+
+pub(super) fn compile_and_reify_method_lambda(
+    label: &str,
+    lambda_list: EgclVal,
+    body: EgclVal,
+    env: &super::Env,
+    spec: MethodContextSpec,
+) -> Option<(EgclVal, Option<MethodNoContextBody>)> {
+    let scope = method_context_use::Scope::enter(spec);
+    let function = compile_and_reify_lambda_inner(label, lambda_list, body, env)?;
+    let proof = if scope.unused() {
+        bytecode_for_callable(egcl_rt::function::definition_index(function), function)
+            .map(|(_, body)| Arc::downgrade(&body))
+    } else {
+        None
+    };
+    Some((function, proof))
+}
+
+fn compile_and_reify_lambda_inner(
     label: &str,
     mut lambda_list: EgclVal,
     mut body: EgclVal,
