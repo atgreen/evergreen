@@ -16,17 +16,16 @@ fn cached_wrapper_is(name: &str, function: EgclVal) -> bool {
 }
 
 fn name_index(name: &str) -> Option<u32> {
-    reader::find_symbol_index(name).or_else(|| {
-        // Gensym function names have no name-registry entry. The generic's
-        // recorded name still carries the actual symbol identity.
-        let generic = GENERIC_DEFINITIONS
-            .borrow()
-            .get(name)
-            .map(|g| g.generic_function);
-        generic
-            .and_then(egcl_stdlib::clos::generic_function_name)
-            .and_then(EgclVal::symbol_index)
-    })
+    // A display key can collide with an interned spelling. The recorded
+    // generic name owns the symbol identity, including a GENSYM's high ID.
+    let generic = GENERIC_DEFINITIONS
+        .borrow()
+        .get(name)
+        .map(|g| g.generic_function);
+    generic
+        .and_then(egcl_stdlib::clos::generic_function_name)
+        .and_then(EgclVal::symbol_index)
+        .or_else(|| reader::find_symbol_index(name))
 }
 
 /// No allocation or callback: this is safe on native accessor cache miss paths.

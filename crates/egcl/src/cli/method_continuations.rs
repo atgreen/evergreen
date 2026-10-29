@@ -98,8 +98,8 @@ pub(super) fn invocation_for_method(
     }
     let (name, _) = method_def_by_id(env, method.method_id).ok_or_else(bad)?;
     egcl_rt::rooted!(methods = env.methods.borrow().get(&name).cloned().unwrap_or_default());
-    let symbol = resolve_sym(&name).ok_or_else(bad)?;
-    let precedence = egcl_stdlib::clos::argument_precedence_order(symbol);
+    egcl_rt::rooted!(symbol = generic_name_form_for_key(env, &name));
+    let precedence = egcl_stdlib::clos::argument_precedence_order(*symbol);
     egcl_rt::rooted!(invocation = snapshot(&name, &methods, &[], &precedence, env)?);
     let expected = ordered(&invocation, args, env);
     invocation.expected = Arc::new(expected);
@@ -150,7 +150,9 @@ pub(super) fn snapshot(
     env: &mut Env,
 ) -> Result<Invocation, EgclError> {
     egcl_rt::rooted!(methods = methods.to_vec());
-    egcl_rt::rooted!(symbol = resolve_sym(name).ok_or_else(bad)?);
+    // Display keys cannot reconstruct an uninterned symbol or a SETF name.
+    // Keep the original name identity when retaining the callable wrapper.
+    egcl_rt::rooted!(symbol = generic_name_form_for_key(env, name));
     egcl_rt::rooted!(
         invocation = Invocation {
             gf: NIL,
@@ -662,6 +664,33 @@ static RELOCATE_NEXT_TAIL: egcl_rt::execution_local::ExecutionLocal<std::cell::C
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uninterned_generic_snapshot_retains_name_identity_across_calls() {
+        let _lock = heap_test_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env = &mut env);
+        let result = read_eval_all_env(
+            r#"
+(let ((name (gensym "PRIVATE-GENERIC")))
+  (eval `(defgeneric ,name (object)))
+  (eval `(defmethod ,name (object) (list object)))
+  (eval `(defmethod ,name :before (object) (declare (ignore object)) nil))
+  (let ((saved (fdefinition name)))
+    (and (equal (funcall name 1) '(1))
+         (equal (funcall name 2) '(2))
+         (equal (funcall (fdefinition name) 3) '(3))
+         (equal (funcall saved 4) '(4))
+         (fboundp name)
+         (eq (generic-function-name saved) name))))
+"#,
+            &mut env,
+        )
+        .unwrap();
+        assert_eq!(result, T);
+    }
 
     #[test]
     fn proved_constant_method_dispatch_has_no_invocation_encoding() {
