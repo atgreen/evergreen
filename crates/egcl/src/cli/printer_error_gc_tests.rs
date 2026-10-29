@@ -27,11 +27,14 @@ fn parked_printer_errors_relocate_datums_conditions_and_backtraces() {
     egcl_rt::rooted_ref!(_env_root = &mut env);
     egcl_rt::rooted!(class = ensure_condition_class_registered(&env, "SIMPLE-ERROR").unwrap());
     egcl_rt::collect_t0_minor().unwrap();
-    let datum = arena_cons(EgclVal::from_fixnum(123), NIL);
-    park_print_error(EgclError::TypeError {
-        datum,
-        expected: "STRING".into(),
-    });
+    let before_datum = {
+        egcl_rt::rooted!(datum = arena_cons(EgclVal::from_fixnum(123), NIL));
+        park_print_error(EgclError::TypeError {
+            datum: *datum,
+            expected: "STRING".into(),
+        });
+        datum.to_raw()
+    };
     park_print_error(EgclError::ProgramError(
         "later error must not replace the first".into(),
     ));
@@ -48,7 +51,8 @@ fn parked_printer_errors_relocate_datums_conditions_and_backtraces() {
             expected,
         } => {
             assert_ne!(
-                relocated, datum,
+                relocated.to_raw(),
+                before_datum,
                 "parked TypeError datum must physically move"
             );
             assert_eq!(cp(relocated), (EgclVal::from_fixnum(123), NIL));
@@ -58,7 +62,7 @@ fn parked_printer_errors_relocate_datums_conditions_and_backtraces() {
     }
     let (before_condition, before_argument) = {
         egcl_rt::rooted!(condition = egcl_stdlib::allocate_instance(*class).unwrap());
-        let argument = arena_cons(EgclVal::from_fixnum(456), NIL);
+        egcl_rt::rooted!(argument = arena_cons(EgclVal::from_fixnum(456), NIL));
         park_print_error(EgclError::Signalled(Box::new(
             egcl_rt::error::SignalledError {
                 condition: *condition,
@@ -66,24 +70,26 @@ fn parked_printer_errors_relocate_datums_conditions_and_backtraces() {
                 backtrace: vec![egcl_rt::debug_stack::LogicalFrame {
                     function: Some("PRINTER-CALLBACK".into()),
                     origin: egcl_rt::debug_stack::FrameOrigin::Entry,
-                    arguments: Some(vec![argument]),
+                    arguments: Some(vec![*argument]),
                 }],
             },
         )));
-        (*condition, argument)
+        (condition.to_raw(), argument.to_raw())
     };
     // Only the execution-local pending slot roots these objects now.
     egcl_rt::collect_t0_minor().unwrap();
     match resignal_print_error(Ok(NIL)).unwrap_err() {
         EgclError::Signalled(details) => {
             assert_ne!(
-                details.condition, before_condition,
+                details.condition.to_raw(),
+                before_condition,
                 "parked condition must physically move"
             );
             assert_eq!(egcl_stdlib::class_of(details.condition), *class);
             let argument = details.backtrace[0].arguments.as_ref().unwrap()[0];
             assert_ne!(
-                argument, before_argument,
+                argument.to_raw(),
+                before_argument,
                 "parked backtrace argument must physically move"
             );
             assert_eq!(cp(argument), (EgclVal::from_fixnum(456), NIL));
