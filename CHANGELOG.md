@@ -4,6 +4,13 @@
 
 ### Fixed
 
+- `(SETF CLASS-NAME)` renames or unnames classes without changing `FIND-CLASS`
+  registrations, existing instances, slots, or method specializers. Runtime
+  definitions follow class identity across compiled files and saved images.
+  Core format 16 requires rebuilding earlier images
+  ([#874](https://github.com/atgreen/evergreen/pull/874),
+  [#877](https://github.com/atgreen/evergreen/pull/877)).
+
 - FORMAT section tabs honor dynamic `*PRINT-PRETTY*` bindings, and mandatory
   pretty newlines remain inert on ordinary streams while logical-block callback
   columns stay consistent
