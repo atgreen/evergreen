@@ -29,6 +29,10 @@
   allowing user methods and metaclass-specific documentation behavior
   ([#871](https://github.com/atgreen/evergreen/pull/871)).
 
+- `SUBTYPEP` proves exclusions between unrelated raw structure classes and
+  combines these proofs in Boolean supertypes while preserving overlap
+  ([#872](https://github.com/atgreen/evergreen/pull/872)).
+
 - `PPRINT-TABULAR` preserves shared and circular references within one logical
   printing context, including print limits and callback cleanup
   ([#870](https://github.com/atgreen/evergreen/pull/870)).
