@@ -3004,7 +3004,10 @@ impl<'e> Lowerer<'e> {
             self.push_n(1);
             return Ok(());
         }
-        if form.is_character() || form.is_string() {
+        // Interpreter closures are physically conses, but their Lisp type is
+        // FUNCTION: a macro may splice one into an expression as a literal.
+        // Preserve the callable value before the cons/call dispatch below.
+        if form.is_character() || form.is_string() || super::is_closure_cons(form) {
             let c = self.add_const(form);
             self.emit(Instr::Const(c));
             self.push_n(1);
@@ -10619,6 +10622,8 @@ struct BbuConstPool {
     /// snapshot carries the object itself, and the restore remaps the
     /// reference, so the function keeps its exact constant.
     saved_heap_refs: bool,
+    /// Portable artifacts cannot retain interpreter closure registry IDs.
+    unsupported_function_literal: bool,
     /// Hash tables whose entries are being encoded, so one that contains itself
     /// is refused instead of recursing forever.
     open_tables: Vec<EgclVal>,
@@ -10747,6 +10752,16 @@ fn capture_bbu_graph(
 }
 
 impl BbuConstPool {
+    fn check_portable_function_literals(&self) -> Result<(), EgclError> {
+        if self.unsupported_function_literal {
+            Err(EgclError::ProgramError(
+                "COMPILE-FILE: cannot externalize captured function literal".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
     fn intern_encoded(&mut self, bytes: Vec<u8>) -> u32 {
         if let Some(&idx) = self.index.get(&bytes) {
             return idx;
@@ -10838,6 +10853,10 @@ impl BbuConstPool {
         }
         let (mut values, nodes) = capture_bbu_graph(v, &self.graph_values, &self.graph_refs)?;
         egcl_rt::rooted_ref!(_values_root = &mut values);
+        if !self.saved_heap_refs && values.iter().copied().any(super::is_closure_cons) {
+            self.unsupported_function_literal = true;
+            return None;
+        }
         let entry_count = self.entries.len();
         let graph_count = self.graph_values.len();
         let load_form_count = self.load_forms.len();
@@ -12440,6 +12459,7 @@ pub fn build_bbu_from_forms(
             );
         }
 
+        pool.check_portable_function_literals()?;
         if !done {
             if std::env::var_os("EGCL_BFASL_FORM").is_some() {
                 eprintln!(
@@ -12465,6 +12485,7 @@ pub fn build_bbu_from_forms(
                 done = true;
             }
         }
+        pool.check_portable_function_literals()?;
         if !done {
             // CLHS 3.2.3: COMPILE-FILE must always produce loadable output.
             // A form whose literals the portable pool cannot externalize —
@@ -12492,6 +12513,7 @@ pub fn build_bbu_from_forms(
         let deferred = make_load_form::plan(
             &mut pool, &functions, function_start, &load_actions[action_start..], env,
         )?;
+        pool.check_portable_function_literals()?;
         if let Some(index) = &mut explicit_result { *index += deferred.len(); }
         load_actions.splice(action_start..action_start, deferred);
         form_results.push(if let Some(index) = constant_result {
@@ -12504,6 +12526,9 @@ pub fn build_bbu_from_forms(
     }
 
     make_load_form::discard_unused(&mut pool);
+    // MAKE-LOAD-FORM planning can serialize additional creation/init literals
+    // after the per-form checks. Never emit an artifact after any rejection.
+    pool.check_portable_function_literals()?;
     let mut print_groups = Vec::with_capacity(source_group_ends.len());
     let mut previous_end = 0;
     for &end in source_group_ends {
@@ -32112,3 +32137,48 @@ mod compile_file_print_group_tests {
 }
 #[cfg(test)]
 mod adjustable_array_persistence_tests;
+
+#[cfg(test)]
+mod function_literal_tests {
+    use super::*;
+
+    #[test]
+    fn closure_literals_lower_to_constants_and_never_portable_cons_ids() {
+        let _lock = super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env = &mut env);
+        egcl_rt::rooted!(source = reader::read_from_string("(lambda () 42)").unwrap().0);
+        egcl_rt::rooted!(function = eval_form(*source, &mut env).unwrap());
+        assert!(super::super::is_closure_cons(*function));
+        let body = compile_thunk(*function, &env, false).expect("literal compiles");
+        assert!(matches!(
+            body.code.as_slice(),
+            [Instr::Const(0), Instr::Return]
+        ));
+        assert_eq!(body.constants.as_slice(), &[*function]);
+
+        // A nested closure must not escape detection through an aggregate.
+        egcl_rt::rooted!(aggregate = arena_cons(*function, NIL));
+        let mut portable = BbuConstPool::default();
+        egcl_rt::rooted_ref!(_portable = &mut portable);
+        assert!(portable.value(*aggregate).is_none());
+        assert!(portable.check_portable_function_literals().is_err());
+        assert!(
+            portable.entries.is_empty(),
+            "reject before reserving graph entries"
+        );
+        assert!(portable.graph_values.is_empty());
+        assert!(portable.graph_refs.is_empty());
+
+        // Core images intentionally retain the registry/heap representation.
+        let mut image = BbuConstPool {
+            saved_heap_refs: true,
+            ..BbuConstPool::default()
+        };
+        egcl_rt::rooted_ref!(_image = &mut image);
+        assert!(image.value(*aggregate).is_some());
+        assert!(image.check_portable_function_literals().is_ok());
+    }
+}
