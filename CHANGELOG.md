@@ -16,6 +16,10 @@
   closures, portable compiled files, and saved images
   ([#859](https://github.com/atgreen/evergreen/pull/859)).
 
+- Compiled `DEFSTRUCT` forms preserve slot names and type data while expanding
+  lexical macros in slot initializers and constructor defaults
+  ([#862](https://github.com/atgreen/evergreen/pull/862)).
+
 - `PRINC` and FORMAT aesthetic output expose the correct printer controls to
   callbacks and restore prior bindings across conditions and nonlocal transfers
   ([#836](https://github.com/atgreen/evergreen/pull/836)).
