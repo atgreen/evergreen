@@ -1221,7 +1221,7 @@ fn read_one_form_from_stream(
     stream: EgclVal,
     env: &mut Env,
 ) -> Result<Option<EgclVal>, EgclError> {
-    read_one_form_from_stream_ws(stream, env, false)
+    read_one_form_from_stream_ws(stream, env, false, false)
 }
 
 /// `preserve_whitespace = false` (plain READ) consumes the single whitespace
@@ -1231,6 +1231,7 @@ fn read_one_form_from_stream_ws(
     stream: EgclVal,
     env: &mut Env,
     preserve_whitespace: bool,
+    recursive: bool,
 ) -> Result<Option<EgclVal>, EgclError> {
     let mut stream = stream;
     egcl_rt::rooted_ref!(_stream_root = &mut stream);
@@ -1239,7 +1240,7 @@ fn read_one_form_from_stream_ws(
     {
         // Parse once: retrying after every input character repeats #. and
         // custom reader side effects, and is especially costly for #h vectors.
-        let (form, mut consumed) = read_chars_in_env(&chars, env)?;
+        let (form, mut consumed) = read_chars_in_env_recursive(&chars, env, recursive)?;
         egcl_rt::rooted!(form = form);
         if !preserve_whitespace && chars.get(consumed).is_some_and(|c| c.is_whitespace()) {
             consumed += 1;
@@ -1263,7 +1264,7 @@ fn read_one_form_from_stream_ws(
             .is_some_and(|v| !v.is_nil()),
     );
     let previous_env = READ_EVAL_ENV.with(|c| c.replace(env as *mut Env));
-    let result = reader::read_from_stream(
+    let result = reader::read_from_stream_recursive(
         &mut LispReaderStream {
             stream: &mut stream,
             env,
@@ -1271,6 +1272,7 @@ fn read_one_form_from_stream_ws(
         read_base,
         read_eval,
         preserve_whitespace,
+        recursive,
     );
     READ_EVAL_ENV.with(|c| c.set(previous_env));
     reader::set_read_suppress_flag(previous_suppress);
@@ -15340,6 +15342,14 @@ fn read_from_string_in_env(source: &str, env: &mut Env) -> Result<(EgclVal, usiz
 }
 
 fn read_chars_in_env(chars: &[char], env: &mut Env) -> Result<(EgclVal, usize), EgclError> {
+    read_chars_in_env_recursive(chars, env, false)
+}
+
+fn read_chars_in_env_recursive(
+    chars: &[char],
+    env: &mut Env,
+    recursive: bool,
+) -> Result<(EgclVal, usize), EgclError> {
     // Honour the reader specials. `*READ-EVAL*` defaults to T (so `#.` works in a
     // runtime READ, as in CL), and `*READ-BASE*` to 10.
     let read_eval = env
@@ -15360,7 +15370,7 @@ fn read_chars_in_env(chars: &[char], env: &mut Env) -> Result<(EgclVal, usize), 
         .unwrap_or(false);
     reader::set_read_suppress_flag(suppress);
     let prev = READ_EVAL_ENV.with(|c| c.replace(env as *mut Env));
-    let result = reader::read_form_at(chars, 0, read_base, read_eval);
+    let result = reader::read_form_at_recursive(chars, 0, read_base, read_eval, recursive);
     READ_EVAL_ENV.with(|c| c.set(prev));
     reader::set_read_suppress_flag(false);
     result
@@ -24065,7 +24075,8 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 let eof_error_p = if args.len() > 1 { args[1] } else { T };
                 let in_stream = resolve_input_stream(stream, env);
                 let preserve = name == "READ-PRESERVING-WHITESPACE";
-                match read_one_form_from_stream_ws(in_stream, env, preserve)? {
+                let recursive = args.get(3).is_some_and(|value| !value.is_nil());
+                match read_one_form_from_stream_ws(in_stream, env, preserve, recursive)? {
                     Some(form) => return Ok(form),
                     None => {
                         if eof_error_p.is_nil() {
