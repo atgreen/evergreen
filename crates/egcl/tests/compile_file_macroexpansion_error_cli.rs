@@ -122,15 +122,16 @@ fn toplevel_macroexpansion_error_signals_at_load_time() {
 }
 
 /// Macros that expand at compile time keep compiling cleanly, including one
-/// defined by a later EVAL-WHEN and one whose expander calls a function the
-/// file defined earlier.
+/// defined by a later EVAL-WHEN and one whose expander calls a function made
+/// available earlier in the compilation environment.
 #[test]
 fn successful_expansions_still_compile_cleanly() {
     let dir = scratch("compile-file-macroexpansion-clean");
     let source = dir.join("clean.lisp");
     std::fs::write(
         &source,
-        "(defun helper () 42)\n\
+        "(eval-when (:compile-toplevel :load-toplevel :execute)\n\
+           (defun helper () 42))\n\
          (defmacro uses-helper () (helper))\n\
          (defun calls-helper-macro () (uses-helper))\n\
          (eval-when (:compile-toplevel :load-toplevel :execute)\n\
