@@ -48,6 +48,10 @@
   initial contents, including nested and specialized vectors
   ([#827](https://github.com/atgreen/evergreen/pull/827)).
 
+- `TYPEP` preserves class-object membership after a class name is unregistered
+  or reused, including anonymous classes and saved images
+  ([#833](https://github.com/atgreen/evergreen/pull/833)).
+
 - `*PRINT-CIRCLE*` preserves shared arrays and uninterned symbols, and prints
   cycles through vectors and multidimensional arrays without runaway expansion
   ([#822](https://github.com/atgreen/evergreen/pull/822)).

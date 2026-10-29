@@ -2567,6 +2567,12 @@ pub fn class_of(object: EgclVal) -> EgclVal {
     })
 }
 
+/// Whether VALUE is a class metaobject, independently of its current name or
+/// registration in FIND-CLASS. Removing a name does not destroy the class.
+pub fn is_class_object(value: EgclVal) -> bool {
+    with_state(|st| st.class_meta.contains_key(&value))
+}
+
 /// Get the class name.
 pub fn class_name(class: EgclVal) -> EgclVal {
     with_state(|st| st.class_meta.get(&class).map(|m| m.name).unwrap_or(NIL))

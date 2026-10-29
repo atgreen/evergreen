@@ -17980,16 +17980,9 @@ fn is_built_in_class_metaobject(class: EgclVal) -> bool {
 }
 
 fn class_metaobject_of(object: EgclVal) -> Option<EgclVal> {
-    if object.is_symbol() && object != NIL && object != T {
-        // A DEFCLASS/DEFSTRUCT class is its own name symbol; the name of a
-        // built-in class is only a designator, not the metaobject (ansi
-        // type-of.1: (typep 'cons 'class) is false).
-        return egcl_stdlib::find_class(object).filter(|class| *class == object);
-    }
-    if !egcl_stdlib::class_name(object).is_nil() {
-        return Some(object);
-    }
-    None
+    // A class stays a class after its name is removed, changed, or reused.
+    // Ordinary symbols that merely name a class are not metaobjects.
+    egcl_stdlib::clos::is_class_object(object).then_some(object)
 }
 
 /// Whether `t` is a symbol naming a DEFSTRUCT structure class.
@@ -19341,52 +19334,51 @@ fn typep_matches(
     if type_spec.is_nil() {
         return Ok(false);
     }
-    // A class metaobject stands for the type it names (ansi the.9/10 with
-    // CLASS-OF). The CLOS core's catch-all HEAP-OBJECT class covers every heap
-    // object it does not file more precisely.
-    if let Some(name) = class_object_type_name(type_spec) {
-        type_spec = name;
-    }
     if type_spec.is_symbol() && sym_bare_name_rc(type_spec).as_ref() == "HEAP-OBJECT" {
         return Ok(object.is_heap_object());
     }
-    // Resolving DEFTYPEs and compound type specifiers can allocate.  These
-    // callee-local copies must therefore be roots in their own right; a root in
-    // the caller updates only the caller's slot when the nursery moves.
+    // Resolving DEFTYPEs, class refinements and compound specifiers can allocate.
+    // These copies need roots independent of the caller's argument slots.
     egcl_rt::rooted_ref!(_object_root = &mut object);
     egcl_rt::rooted_ref!(_type_spec_root = &mut type_spec);
-    if is_stream_type_specifier(type_spec) && is_gray_stream(object) {
-        return Ok(true);
-    }
-    // A class metaobject used directly as a type specifier — e.g.
-    // `(typep ht (find-class 'hash-table))` / `(typep cond (find-class 'foo))`.
-    // Class handles are neither symbols nor conses; `class_name` is non-NIL only
-    // for a registered class. OBJECT is of the type iff its class equals, or has
-    // as a precedence-list ancestor, that class (ansi-test hash-table.5,
-    // make-condition.2 — the CPL check covers condition instances too).
     if !type_spec.is_symbol()
         && !type_spec.is_cons()
-        && !type_spec.is_nil()
-        && !egcl_stdlib::class_name(type_spec).is_nil()
+        && egcl_stdlib::clos::is_class_object(type_spec)
     {
-        let obj_class = egcl_stdlib::class_of(object);
-        if obj_class == type_spec {
+        // A class object denotes itself, not whichever class its mutable name
+        // currently resolves to. Real CLOS instances carry their class in the
+        // wrapper even after the name is removed or reused.
+        let wrapped_instance = egcl_stdlib::is_instance(object);
+        egcl_rt::rooted!(actual_class = if wrapped_instance {
+            egcl_stdlib::class_of(object)
+        } else {
+            class_of_value(object)
+        });
+        if *actual_class == type_spec
+            || egcl_stdlib::compute_class_precedence_list(*actual_class)
+                .is_ok_and(|cpl| cpl.contains(&type_spec))
+        {
             return Ok(true);
         }
-        if let Ok(cpl) = egcl_stdlib::compute_class_precedence_list(obj_class) {
-            if cpl.contains(&type_spec) {
-                return Ok(true);
-            }
+        if wrapped_instance
+            && (egcl_stdlib::clos::class_inherits_standard_object(type_spec)
+                || egcl_stdlib::is_structure_class(type_spec))
+        {
+            return Ok(false);
         }
-        // A built-in class whose precedence list the registry does not model
-        // (FIXNUM under INTEGER, CONS under LIST, ...): decide by the class's
-        // NAME as a type specifier instead (ansi arrays array-as-class.*,
-        // make-array-with-checks' (typep a (find-class 'array))).
+        // Built-in classes and opaque runtime representations have predicates
+        // more precise than CLASS-OF (e.g. keyword symbols and Gray streams).
+        // Retain their existing named predicate fallback, but never use it to
+        // equate distinct ordinary instance classes with the same name.
         egcl_rt::rooted!(class_name = egcl_stdlib::class_name(type_spec));
-        if class_name.is_symbol() && !class_name.is_nil() {
-            return typep_matches(env, object, *class_name);
-        }
-        return Ok(false);
+        return if class_name.is_symbol() && !class_name.is_nil() {
+            typep_matches(env, object, *class_name)
+        } else {
+            Ok(false)
+        };
+    }
+    if is_stream_type_specifier(type_spec) && is_gray_stream(object) {
+        return Ok(true);
     }
     // A method object (a DEFMETHOD handle) is a STANDARD-METHOD; a generic
     // function object is a STANDARD-GENERIC-FUNCTION (ansi defmethod.1/.2).
@@ -51234,3 +51226,6 @@ mod princ_binding_gc_tests;
 
 #[cfg(test)]
 mod reader_sequence_gc_tests;
+
+#[cfg(test)]
+mod class_identity_tests;
