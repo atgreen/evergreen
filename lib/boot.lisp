@@ -5393,15 +5393,30 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
   (declare (ignore class initargs))
   (find-class 'egcl-mop:standard-effective-slot-definition))
 
+(defun egcl-mop::%raw-slot-definition-objects (class direct-p)
+  ;; Structure and built-in classes have runtime layouts without the
+  ;; STANDARD-CLASS computation protocol. Introspection must not finalize them
+  ;; through standard-class hooks or replace their existing runtime layouts.
+  (mapcar (lambda (descriptor)
+            (apply #'make-instance
+                   (if direct-p
+                       'egcl-mop:standard-direct-slot-definition
+                       'egcl-mop:standard-effective-slot-definition)
+                   descriptor))
+          (egcl-internal::%class-slot-descriptors class direct-p)))
+
 (defun egcl-mop:class-direct-slots (class)
-  (let ((cached (egcl-internal::%mop-class-protocol :direct class)))
+  (let* ((class (if (symbolp class) (find-class class) class))
+         (cached (egcl-internal::%mop-class-protocol :direct class)))
     (if cached (car cached)
         (let ((slots
-                (mapcar (lambda (descriptor)
-                          (apply #'make-instance
-                                 (apply #'egcl-mop:direct-slot-definition-class class descriptor)
-                                 descriptor))
-                        (egcl-internal::%class-slot-descriptors class t))))
+                (if (typep class '(or structure-class built-in-class))
+                    (egcl-mop::%raw-slot-definition-objects class t)
+                    (mapcar (lambda (descriptor)
+                              (apply #'make-instance
+                                     (apply #'egcl-mop:direct-slot-definition-class class descriptor)
+                                     descriptor))
+                            (egcl-internal::%class-slot-descriptors class t)))))
           (egcl-internal::%mop-class-protocol :set-direct class slots)))))
 
 (defvar egcl-mop::*finalizing-class* nil)
@@ -5464,11 +5479,16 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
   (egcl-internal::%mop-class-protocol :defaults class))
 
 (defun egcl-mop:class-slots (class)
-  (let ((cached (egcl-internal::%mop-class-protocol :effective class)))
-    (unless cached
-      (egcl-mop:finalize-inheritance class)
-      (setq cached (egcl-internal::%mop-class-protocol :effective class)))
-    (car cached)))
+  (let* ((class (if (symbolp class) (find-class class) class))
+         (cached (egcl-internal::%mop-class-protocol :effective class)))
+    (if cached (car cached)
+        (if (typep class '(or structure-class built-in-class))
+            (egcl-internal::%mop-class-protocol
+             :set-raw-effective class
+             (egcl-mop::%raw-slot-definition-objects class nil))
+            (progn
+              (egcl-mop:finalize-inheritance class)
+              (car (egcl-internal::%mop-class-protocol :effective class)))))))
 
 ;;; ── EGCL-MOP ──────────────────────────────────────────────────────
 ;;;

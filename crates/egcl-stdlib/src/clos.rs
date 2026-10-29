@@ -60,7 +60,7 @@ pub use class_protocol::{
     begin_class_finalization, class_protocol_default_initargs, class_protocol_finalized,
     class_protocol_runtime_defaults, class_protocol_runtime_slots, class_slot_metaobjects,
     compute_class_precedence_list_default, publish_class_protocol,
-    set_class_direct_slot_metaobjects,
+    set_class_direct_slot_metaobjects, set_class_raw_effective_slot_metaobjects,
 };
 
 // ── Internal data structures ──────────────────────────────────────
@@ -69,6 +69,8 @@ pub use class_protocol::{
 struct ClassProtocol {
     direct_slots: EgclVal,
     direct_ready: bool,
+    // Computed: effective slot list. Otherwise: optional one-element raw
+    // introspection cache, independent of runtime protocol/layout publication.
     effective_slots: EgclVal,
     default_initargs: EgclVal,
     runtime_default_initargs: EgclVal,

@@ -7,8 +7,20 @@ pub fn class_slot_metaobjects(class: EgclVal, direct: bool) -> (EgclVal, bool) {
         st.class_meta.get(&class).map_or((NIL, false), |meta| {
             if direct {
                 (meta.protocol.direct_slots, meta.protocol.direct_ready)
+            } else if meta.protocol.computed {
+                (meta.protocol.effective_slots, true)
+            } else if meta.protocol.effective_slots.is_cons() {
+                // Without computed protocol state this field contains a
+                // one-element raw introspection cache, including (NIL) for
+                // no slots. It never supplies runtime slots/defaults/layout.
+                let wrapper = meta.protocol.effective_slots;
+                // SAFETY: the checked cons is the bridge-owned cache wrapper.
+                (
+                    unsafe { (*(wrapper.as_ptr() as *const egcl_rt::object::ConsCell)).car },
+                    true,
+                )
             } else {
-                (meta.protocol.effective_slots, meta.protocol.computed)
+                (NIL, false)
             }
         })
     })
@@ -53,6 +65,32 @@ pub fn set_class_direct_slot_metaobjects(class: EgclVal, slots: EgclVal) -> Resu
             })?;
         meta.protocol.direct_slots = slots;
         meta.protocol.direct_ready = true;
+        Ok(())
+    })
+}
+
+/// Cache raw non-standard-class introspection without publishing a computed
+/// class protocol. The bridge allocates the one-element wrapper before taking
+/// this nonallocating metadata lock. Existing invalidation, tracing and image
+/// serialization of effective_slots also cover this alternate cache form.
+pub fn set_class_raw_effective_slot_metaobjects(
+    class: EgclVal,
+    wrapper: EgclVal,
+) -> Result<(), EgclError> {
+    with_state_mut(|st| {
+        let meta = st
+            .class_meta
+            .get_mut(&class)
+            .ok_or_else(|| EgclError::TypeError {
+                datum: class,
+                expected: "CLASS".into(),
+            })?;
+        if meta.protocol.computed || !wrapper.is_cons() {
+            return Err(EgclError::ProgramError(
+                "invalid raw class slot cache".into(),
+            ));
+        }
+        meta.protocol.effective_slots = wrapper;
         Ok(())
     })
 }

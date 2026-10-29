@@ -28,6 +28,7 @@
     "egcl:test:package_lifecycle_cli": [""],
     "egcl:test:mop_slot_access_cli": [""],
     "egcl:test:mop_slot_definition_protocol": [""],
+    "egcl:test:structure_slot_introspection_cli": [""],
     "egcl-stdlib:test:clos_class_protocol": [""],
     "egcl:test:generic_function_bindings_cli": [""],
     "egcl:test:defstruct_constant_slots_cli": [""],
