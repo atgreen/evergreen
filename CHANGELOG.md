@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- Class metadata fallback resolves symbol names before locking its source
+  table, avoiding lock-order panics during condition construction
+  ([#884](https://github.com/atgreen/evergreen/pull/884)).
+
 - FORMAT logical blocks ending in `~:@>` insert automatic fill newlines after
   literal body blanks, including nested blocks and per-line prefixes; logical
   block prefixes and suffixes require constant text
