@@ -167,7 +167,9 @@ pub const IMAGE_MAGIC: u64 = u64::from_be_bytes(*b"EGCLIMG\0");
 // length-only payload from other specialized arrays. Rebuild older images.
 // Version 15 stores live method class-specializer identities in the CLI host
 // registry. Older readers skip its subsection and would lose saved methods.
-const FORMAT_VERSION: u32 = 15;
+// Version 16 makes source views reference class-owned runtime definitions,
+// preserving class/shared-cell identity independently of mutable class names.
+const FORMAT_VERSION: u32 = 16;
 
 /// Image file header (128 bytes). D7.01.
 #[derive(Clone, Copy)]

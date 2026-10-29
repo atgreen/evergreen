@@ -5377,18 +5377,18 @@ fn resolve(name: &str) -> Option<Handler> {
             }
             check_initargs_valid(
                 env,
-                &class_name_for_instance_class(*class),
+                *class,
                 &args[2..],
                 &["UPDATE-INSTANCE-FOR-DIFFERENT-CLASS", "SHARED-INITIALIZE"],
             )?;
             egcl_rt::rooted!(previous =
                 egcl_stdlib::clos::copy_instance_for_class_change(args[0])?);
-            let old_name = class_name_for_instance_class(egcl_stdlib::class_of(args[0]));
-            let new_name = class_name_for_instance_class(*class);
-            let old_shared = effective_slots_for_class(env, &old_name).into_iter()
+            let old_class = egcl_stdlib::class_of(args[0]);
+            let new_class = *class;
+            let old_shared = runtime_class_slots(env, old_class).into_iter()
                 .filter(|slot| matches!(slot.allocation, SlotAllocation::Class))
                 .map(|slot| slot.name).collect::<std::collections::HashSet<_>>();
-            let inherited_shared = effective_slots_for_class(env, &new_name).into_iter()
+            let inherited_shared = runtime_class_slots(env, new_class).into_iter()
                 .filter(|slot| matches!(slot.allocation, SlotAllocation::Instance)
                     && old_shared.contains(&slot.name))
                 .map(|slot| slot.name).collect::<Vec<_>>();
@@ -5397,7 +5397,7 @@ fn resolve(name: &str) -> Option<Handler> {
                 let symbol = resolve_sym(&name)
                     .ok_or_else(|| EgclError::Internal("class-change slot symbol unavailable".into()))?;
                 let bare = symbol_bare_name(&name);
-                let value = class_slot_cell(env, &old_name, &bare)
+                let value = runtime_class_slot_cell(env, old_class, &bare)
                     .and_then(|cell| cell.lock().unwrap().get(&bare).copied().flatten());
                 if let Some(value) = value {
                     shared_values.push((symbol, value));
@@ -5423,12 +5423,12 @@ fn resolve(name: &str) -> Option<Handler> {
                     "class-change slot comparison requires two instances".into(),
                 ));
             }
-            let old_name = class_name_for_instance_class(egcl_stdlib::class_of(args[0]));
-            let new_name = class_name_for_instance_class(egcl_stdlib::class_of(args[1]));
+            let old_class = egcl_stdlib::class_of(args[0]);
+            let new_class = egcl_stdlib::class_of(args[1]);
             let old_slots: std::collections::HashSet<String> =
-                effective_slots_for_class(env, &old_name).into_iter()
+                runtime_class_slots(env, old_class).into_iter()
                     .map(|slot| slot.name).collect();
-            let added = effective_slots_for_class(env, &new_name).into_iter()
+            let added = runtime_class_slots(env, new_class).into_iter()
                 .filter(|slot| matches!(slot.allocation, SlotAllocation::Instance)
                     && !old_slots.contains(&slot.name))
                 .map(|slot| slot.name).collect::<Vec<_>>();
@@ -5465,13 +5465,13 @@ fn resolve(name: &str) -> Option<Handler> {
                         .collect::<Vec<_>>(),
                 )
             };
-            let class_name = class_name_for_instance_class(egcl_stdlib::class_of(args[0]));
+            let class = egcl_stdlib::class_of(args[0]);
             egcl_rt::rooted!(raw_initargs = list_to_vec(args[2]));
             // SHARED-INITIALIZE itself checks only the list's shape; initarg
             // validity belongs to its callers (CLHS 7.1.2; ansi
             // shared-initialize.6.8 passes :foo through).
             check_initarg_pairs(&raw_initargs)?;
-            egcl_rt::rooted!(initargs = resolved_initarg_values(&class_name, &raw_initargs, env)?);
+            egcl_rt::rooted!(initargs = resolved_initarg_values(class, &raw_initargs, env)?);
             // Explicit initargs apply regardless of SLOT-NAMES. That argument
             // only selects unbound slots whose initforms may run afterwards.
             reinitialize_instance_values(args[0], &initargs, env)?;
@@ -5479,7 +5479,7 @@ fn resolve(name: &str) -> Option<Handler> {
                 .map(|pair| sym_bare_name_rc(pair[0]).to_string())
                 .collect::<Vec<_>>();
             apply_class_initforms(
-                args[0], &class_name, env, eligible.as_deref(), &explicit_slots,
+                args[0], env, eligible.as_deref(), &explicit_slots,
             )?;
             Ok(args[0])
         }),
@@ -5612,11 +5612,11 @@ fn resolve(name: &str) -> Option<Handler> {
                     "EGCL-INTERNAL:%CHECK-INITARGS requires an instance and an initarg list".into(),
                 ));
             }
-            let class_name = class_name_for_instance_class(egcl_stdlib::class_of(args[0]));
+            let class = egcl_stdlib::class_of(args[0]);
             let initargs = list_to_vec(args[1]);
             check_initargs_valid(
                 env,
-                &class_name,
+                class,
                 &initargs,
                 &["REINITIALIZE-INSTANCE", "SHARED-INITIALIZE"],
             )?;
@@ -5635,14 +5635,14 @@ fn resolve(name: &str) -> Option<Handler> {
             }
             let instance = args[0];
             let raw_initargs = list_to_vec(args[1]);
-            let class_name = class_name_for_instance_class(egcl_stdlib::class_of(instance));
+            let class = egcl_stdlib::class_of(instance);
             check_initargs_valid(
                 env,
-                &class_name,
+                class,
                 &raw_initargs,
                 &["REINITIALIZE-INSTANCE", "SHARED-INITIALIZE"],
             )?;
-            let initargs = resolved_initarg_values(&class_name, &raw_initargs, env)?;
+            let initargs = resolved_initarg_values(class, &raw_initargs, env)?;
             reinitialize_instance_values(instance, &initargs, env)
         }),
 

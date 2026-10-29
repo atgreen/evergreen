@@ -16,6 +16,10 @@ use egcl_rt::lock_order::{LockLevel, OrderedMutex};
 use egcl_rt::object::type_id;
 use egcl_rt::value::{NIL, T, EgclVal, UNBOUND};
 
+mod runtime_definition;
+pub use runtime_definition::{RuntimeClassDefinition, RuntimeSlotDefinition, RuntimeClassSlotCells, SlotAllocation,
+    class_runtime_definition, class_runtime_shared_cells, set_class_runtime_definition};
+
 // ── Method combination ─────────────────────────────────────────────
 
 /// Method combination type.
@@ -111,6 +115,7 @@ impl ClassProtocol {
 
 #[derive(Clone)]
 struct ClassMeta {
+    runtime_definition: Option<RuntimeClassDefinition>,
     protocol: ClassProtocol,
     name: EgclVal,
     direct_supers: Vec<EgclVal>,
@@ -834,6 +839,10 @@ fn visit_clos_roots(visit: &mut dyn FnMut(*mut EgclVal), root_definitions: bool)
             );
         }
         for meta in state.class_meta.values_mut() {
+            if let Some(definition) = &mut meta.runtime_definition {
+                egcl_rt::gc::TraceHostRoots::trace_host_roots(definition, visit);
+            }
+
             visit(&mut meta.protocol.direct_slots);
             visit(&mut meta.protocol.effective_slots);
             visit(&mut meta.protocol.default_initargs);
@@ -1191,7 +1200,8 @@ pub fn serialize_clos_state() -> Vec<u8> {
         // Measured — a core from the previous commit's binary is rejected at
         // the header, not here.
         // 7 adds rooted class-protocol caches and computed layout/CPL state.
-        cs_put_u32(&mut out, 7);
+        // 8 adds identity-owned runtime source definitions and shared cells.
+        cs_put_u32(&mut out, 8);
         cs_put_u32(&mut out, st.class_registry.len() as u32);
         for (k, v) in &st.class_registry {
             cs_put_val(&mut out, *k);
@@ -1224,6 +1234,10 @@ pub fn serialize_clos_state() -> Vec<u8> {
             cs_put_vals(&mut out, meta.protocol.cpl.as_deref().unwrap_or(&[]));
             out.push(meta.protocol.instance_slots.is_some() as u8);
             cs_put_vals(&mut out, meta.protocol.instance_slots.as_deref().unwrap_or(&[]));
+            out.push(meta.runtime_definition.is_some() as u8);
+            if let Some(definition) = &meta.runtime_definition {
+                runtime_definition::snapshot_definition(&mut out, definition);
+            }
         }
         cs_put_u32(&mut out, st.generic_functions.len() as u32);
         for (gf, data) in &st.generic_functions {
@@ -1347,7 +1361,7 @@ pub fn restore_clos_state(data: &[u8], remap: &dyn Fn(u64) -> u64) -> Result<usi
     }
     let mut off = 4usize;
     let version = cs_get_u32(data, &mut off).ok_or_else(bad)?;
-    if version != 7 {
+    if version != 8 {
         return Err(EgclError::InvalidImage(format!(
             "CLOS state section: unsupported version {version}"
         )));
@@ -1387,12 +1401,22 @@ pub fn restore_clos_state(data: &[u8], remap: &dyn Fn(u64) -> u64) -> Result<usi
         let cpl = cs_get_vals(data, &mut off, remap).ok_or_else(bad)?;
         let has_slots = cs_get_u8(data, &mut off).ok_or_else(bad)? != 0;
         let instance_slots = cs_get_vals(data, &mut off, remap).ok_or_else(bad)?;
+        let runtime_definition = match cs_get_u8(data, &mut off).ok_or_else(bad)? {
+            0 => None,
+            1 => Some(runtime_definition::restore_definition(data, &mut off, remap)
+                .ok_or_else(bad)?),
+            _ => return Err(bad()),
+        };
+        if runtime_definition.as_ref().is_some_and(|definition| definition.owner != class) {
+            return Err(EgclError::InvalidImage("CLOS state section: mismatched runtime class owner".into()));
+        }
         let protocol = ClassProtocol { direct_slots, direct_ready, effective_slots,
             default_initargs, runtime_default_initargs, runtime_slots, computed, finalized, cpl: has_cpl.then_some(cpl),
             instance_slots: has_slots.then_some(instance_slots) };
         st.class_meta.insert(
             class,
             ClassMeta {
+                runtime_definition,
                 protocol,
                 shared_slots,
                 name,
@@ -1911,6 +1935,7 @@ fn initialize_clos(reset: bool) -> Result<(), EgclError> {
         st.class_meta.insert(
             t_cls,
             ClassMeta {
+                runtime_definition: None,
                 protocol: ClassProtocol::default(),
                 shared_slots: Vec::new(),
                 name: t_nm,
@@ -1928,6 +1953,7 @@ fn initialize_clos(reset: bool) -> Result<(), EgclError> {
         st.class_meta.insert(
             std_obj,
             ClassMeta {
+                runtime_definition: None,
                 protocol: ClassProtocol::default(),
                 shared_slots: Vec::new(),
                 name: std_nm,
@@ -1971,6 +1997,7 @@ fn initialize_clos(reset: bool) -> Result<(), EgclError> {
             st.class_meta.insert(
                 *cls,
                 ClassMeta {
+                    runtime_definition: None,
                     protocol: ClassProtocol::default(),
                     shared_slots: Vec::new(),
                     name: *nm,
@@ -2037,6 +2064,7 @@ fn initialize_clos(reset: bool) -> Result<(), EgclError> {
             st.class_meta.insert(
                 cls,
                 ClassMeta {
+                    runtime_definition: None,
                     protocol: ClassProtocol::default(),
                     shared_slots: Vec::new(),
                     name: nm,
@@ -2187,6 +2215,7 @@ pub fn set_find_class(name: EgclVal, class: EgclVal) -> Result<(), EgclError> {
             st.class_meta.insert(
                 class,
                 ClassMeta {
+                    runtime_definition: None,
                     protocol: ClassProtocol::default(),
                     shared_slots: Vec::new(),
                     name,
@@ -2348,6 +2377,7 @@ fn define_class_with_shared_slots_mode(
         st.class_meta.insert(
             class,
             ClassMeta {
+                runtime_definition: None,
                 protocol: ClassProtocol { finalized: !staged, ..ClassProtocol::default() },
                 shared_slots: shared_slots.to_vec(),
                 name,

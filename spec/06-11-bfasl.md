@@ -142,8 +142,9 @@ Version 3.2 adds length-only NIL-element array constants (tag 32), including
 positive-length uninitialized storage. Shared references retain object identity;
 no element references are encoded. Readers at 3.0 and 3.1 reject the newer minor
 before installation or load effects. NIL storage introduced core format 14.
-Current core format 15 also preserves exact method class-specializer identities;
-rebuild images from earlier formats, including format 14.
+Core format 15 added exact method class-specializer identities. Current format
+16 also preserves class-owned runtime definitions and shared cells; rebuild
+images from earlier formats, including format 15.
 Version-2 bodies can construct legacy cons-shaped states, which cannot be
 reinterpreted without conflating ordinary user lists with random states. All
 version-2 units are rejected before constants, definitions, or load actions are
