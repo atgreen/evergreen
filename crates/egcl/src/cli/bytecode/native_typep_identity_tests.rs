@@ -43,13 +43,28 @@ fn mapped_native_typep_calls_public_fallback_for_foreign_type_symbols() {
         r#"
       (defpackage "NATIVE-TYPEP-IDENTITY" (:use "COMMON-LISP")
         (:shadow "FIXNUM" "SYMBOL" "INTEGER"))
-      (deftype native-typep-identity::fixnum () '(signed-byte 63))
-      (deftype native-typep-identity::symbol () 'integer)
-      (deftype native-typep-identity::integer () 'symbol)
     "#,
         &mut env,
     )
     .unwrap();
+    // Env::new(false) deliberately omits boot Lisp, including DEFTYPE's macro.
+    // Install exact-name zero-argument aliases through the supported legacy
+    // registry fixture. Dynamic guards restore both registries on every exit;
+    // public TYPEP still performs its normal alias lookup at runtime.
+    egcl_rt::rooted!(
+        definitions = super::super::read_from_string_in_env(
+            "((native-typep-identity::fixnum (signed-byte 63)) \
+          (native-typep-identity::symbol integer) \
+          (native-typep-identity::integer symbol))",
+            &mut env,
+        )
+        .unwrap()
+        .0
+    );
+    let definitions_symbol = resolve_sym("*TYPE-DEFINITIONS*").unwrap();
+    let expanders_symbol = resolve_sym("*TYPE-EXPANDERS*").unwrap();
+    egcl_rt::rooted!(_definitions_binding = DynBind::establish(definitions_symbol, *definitions));
+    egcl_rt::rooted!(_expanders_binding = DynBind::establish(expanders_symbol, NIL));
     egcl_rt::rooted!(big = egcl_rt::bignum::alloc_bignum_cli(1, &[1u64 << 61]));
     assert!(
         !big.is_fixnum(),
@@ -65,6 +80,14 @@ fn mapped_native_typep_calls_public_fallback_for_foreign_type_symbols() {
     .into_iter()
     .enumerate()
     {
+        let type_symbol = super::super::read_from_string_in_env(type_name, &mut env)
+            .unwrap()
+            .0;
+        assert!(
+            super::super::typep_matches(&mut env, values[index][0], type_symbol).unwrap(),
+            "cold public TYPEP must resolve the fixture alias: {type_name}"
+        );
+        assert!(!super::super::typep_matches(&mut env, values[index][1], type_symbol).unwrap());
         let code = mapped_typep(type_name, &mut env);
         for alternative in 0..2 {
             let value = values[index][alternative];
