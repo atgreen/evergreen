@@ -3240,6 +3240,20 @@ pub fn reinitialize_instance(instance: EgclVal, initargs: &[EgclVal]) -> Result<
 
 // ── Slot access ────────────────────────────────────────────────────
 
+// NIL and T are legal slot symbols despite using the SPECIAL tag. Missing
+// layout diagnostics must never extract a TAG_SYMBOL index from either one.
+fn slot_name_for_error(name: EgclVal) -> String {
+    if name == NIL {
+        "NIL".into()
+    } else if name == T {
+        "T".into()
+    } else {
+        name.symbol_index()
+            .and_then(egcl_rt::symbols::symbol_name)
+            .unwrap_or_default()
+    }
+}
+
 /// Get a slot value (SLOT-VALUE). An unbound slot signals `UnboundVariable`
 /// (the CLI turns this into `unbound-slot`); a name outside the class layout is
 /// a `slot-missing`-style error.
@@ -3260,7 +3274,7 @@ pub fn slot_value(instance: EgclVal, slot_name: EgclVal) -> Result<EgclVal, Egcl
             }
             None => Err(EgclError::Internal(format!(
                 "slot not present in class layout: {}",
-                egcl_rt::symbols::symbol_name(slot_name.as_symbol_index()).unwrap_or_default()
+                slot_name_for_error(slot_name)
             ))),
         }
     }
@@ -3322,7 +3336,7 @@ pub fn set_slot_value(
             }
             None => Err(EgclError::Internal(format!(
                 "slot not present in class layout: {}",
-                egcl_rt::symbols::symbol_name(slot_name.as_symbol_index()).unwrap_or_default()
+                slot_name_for_error(slot_name)
             ))),
         }
     }
@@ -3451,7 +3465,7 @@ pub fn compare_exchange_slot_value(
         let Some(index) = instance_slot_index(instance, slot_name) else {
             return Err(EgclError::Internal(format!(
                 "slot not present in class layout: {}",
-                egcl_rt::symbols::symbol_name(slot_name.as_symbol_index()).unwrap_or_default()
+                slot_name_for_error(slot_name)
             )));
         };
         Ok(egcl_rt::sync::atomic::compare_exchange_ref(
@@ -3479,7 +3493,7 @@ pub fn atomic_update_slot_value(
         let Some(index) = instance_slot_index(instance, slot_name) else {
             return Err(EgclError::Internal(format!(
                 "slot not present in class layout: {}",
-                egcl_rt::symbols::symbol_name(slot_name.as_symbol_index()).unwrap_or_default()
+                slot_name_for_error(slot_name)
             )));
         };
         egcl_rt::sync::atomic::update_fixnum_ref(slot_cell(instance, index), delta, subtract)
@@ -4264,6 +4278,29 @@ mod cpl_tests {
         let value = class(id);
         define_class(value, value, supers, &[]).unwrap();
         value
+    }
+
+    #[test]
+    fn missing_constant_slot_names_report_errors_without_symbol_index_panics() {
+        let _guard = test_guard();
+        bootstrap_clos().unwrap();
+        let class = class(50501);
+        let ordinary_slot =
+            EgclVal::from_symbol_index(egcl_rt::symbols::intern("GH772-ORDINARY-SLOT"));
+        define_class(class, class, &[], &[ordinary_slot]).unwrap();
+        egcl_rt::rooted!(instance = allocate_instance(class).unwrap());
+        for slot in [T, NIL] {
+            let message = match slot_value(*instance, slot) {
+                Err(EgclError::Internal(message)) => message,
+                other => panic!("missing legal slot name should return an error: {other:?}"),
+            };
+            assert!(message.ends_with(if slot == T { "T" } else { "NIL" }));
+            assert!(set_slot_value(*instance, slot, NIL).is_err());
+            assert!(compare_exchange_slot_value(*instance, slot, NIL, T).is_err());
+            assert!(
+                atomic_update_slot_value(*instance, slot, EgclVal::from_fixnum(1), false).is_err()
+            );
+        }
     }
 
     #[test]

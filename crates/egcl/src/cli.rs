@@ -1831,10 +1831,9 @@ thread_local! {
 /// The symbol naming a class, when there is one — a stable key for the cache.
 fn class_name_symbol(class: EgclVal) -> Option<u32> {
     if class.is_symbol() {
-        return Some(class.as_symbol_index());
+        return class.symbol_index();
     }
-    let name = egcl_stdlib::class_name(class);
-    name.is_symbol().then(|| name.as_symbol_index())
+    egcl_stdlib::class_name(class).symbol_index()
 }
 
 /// [`accessor_slot_name_in_class_chain`] as a slot SYMBOL, memoized per
@@ -1854,10 +1853,8 @@ pub(in crate::cli) fn accessor_slot_symbol_cached(
     accessor: EgclVal,
 ) -> Option<EgclVal> {
     let class_sym = class_name_symbol(egcl_stdlib::class_of(instance))?;
-    if !accessor.is_symbol() {
-        return None;
-    }
-    let key = (class_sym, accessor.as_symbol_index());
+    let accessor_index = accessor.symbol_index()?;
+    let key = (class_sym, accessor_index);
     let generation = ACCESSOR_SLOT_GEN.load(std::sync::atomic::Ordering::Relaxed);
     if let Some(hit) = ACCESSOR_SLOT_CACHE.with(|c| {
         let mut c = c.borrow_mut();
@@ -1874,8 +1871,7 @@ pub(in crate::cli) fn accessor_slot_symbol_cached(
     let name = sym_name(accessor);
     let slot_name = accessor_slot_name_in_class_chain(env, instance, &name)?;
     let slot = resolve_sym(&slot_name)?;
-    if slot.is_symbol() {
-        let idx = slot.as_symbol_index();
+    if let Some(idx) = slot.symbol_index() {
         ACCESSOR_SLOT_CACHE.with(|c| {
             let mut c = c.borrow_mut();
             if c.0 == generation {
@@ -13276,6 +13272,13 @@ static LIVE_DEFINITIONAL_REGISTRIES: egcl_rt::execution_local::ExecutionLocal<
 > = unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| const { RefCell::new(None) }) };
 
 fn resolve_sym(name: &str) -> Option<EgclVal> {
+    // T and NIL have special-tag identities. A registry entry for their
+    // spelling must not turn either constant into a different TAG_SYMBOL.
+    match name {
+        "T" => return Some(T),
+        "NIL" => return Some(NIL),
+        _ => {}
+    }
     // An exact registry key resolves to that symbol directly. `name` is often
     // the `sym_name` of an already-interned symbol, and since bare reads
     // intern package-locally that spelling can be package-qualified
@@ -49736,6 +49739,25 @@ mod macro_stream_environment_tests {
 #[cfg(test)]
 mod symbol_bare_name_tests {
     use super::symbol_bare_name;
+
+    #[test]
+    fn constant_symbol_resolution_survives_registry_entries() {
+        let _lock = super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for (name, expected) in [("T", super::T), ("NIL", super::NIL)] {
+            let index = egcl_compiler::reader::intern_symbol(name);
+            assert_ne!(egcl_rt::EgclVal::from_symbol_index(index), expected);
+            assert_eq!(super::resolve_sym(name), Some(expected));
+        }
+        for name in ["GH772::T", "GH772::NIL", "GH772::t", "GH772::nil"] {
+            let index = egcl_compiler::reader::intern_symbol(name);
+            let expected = egcl_rt::EgclVal::from_symbol_index(index);
+            assert_eq!(super::resolve_sym(name), Some(expected));
+        }
+        assert_eq!(super::class_name_symbol(super::T), None);
+        assert_eq!(super::class_name_symbol(super::NIL), None);
+    }
 
     #[test]
     fn qualified_setf_function_keys_keep_the_complete_name_and_home() {
