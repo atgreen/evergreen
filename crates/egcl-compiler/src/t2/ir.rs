@@ -362,6 +362,10 @@ pub enum Opcode {
     /// Both are effectful helper calls; reads cannot be hoisted over mutation.
     EnvironmentValue,
     SetEnvironmentValue,
+    /// BIND a captured name in the current lexical frame, as `DefineEnvVar`
+    /// does -- distinct from `SetEnvironmentValue`, which assigns a binding
+    /// that already exists. Consumes the value and produces nothing.
+    DefineEnvironmentValue,
     /// `(CHAR string index)` when `string` is a simple string and every byte
     /// through `index` is ASCII: the character, or NIL for any other operand
     /// (a non-string, a complex string, a non-fixnum or out-of-range index, a
@@ -538,6 +542,22 @@ pub enum AuxData {
         bcp: u32,
         value: bool,
         result: bool,
+    },
+    /// Entering or leaving a child lexical `EnvFrame`, for a CHECKED-ABI
+    /// target.
+    ///
+    /// x86-64 reaches `PushEnvChild`/`PopEnvChild` through
+    /// [`AuxData::LexicalEnvironment`] and its mapped
+    /// `TRANSFER_LEXICAL_ENVIRONMENT_REQUEST`, where the runtime decodes the
+    /// instruction at the retained PC. A checked-ABI emitter has no mapped
+    /// entry to service that, so the builder lowers the pair to a plain
+    /// adapter call instead and this variant says WHICH of the two it is --
+    /// the `LexicalEnvironment` flags cannot, because both push and pop
+    /// present as `value: false, result: false`.
+    ///
+    /// Stack-neutral and valueless: no operand, no result.
+    EnvironmentScope {
+        enter: bool,
     },
     /// Binding operation identified by its exact retained bytecode PC. Exit
     /// decodes UnbindSpecial's count there; entry consumes one rooted value.

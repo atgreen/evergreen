@@ -258,6 +258,7 @@ pub(crate) fn calls_runtime(opcode: Opcode) -> bool {
             | Opcode::EnvironmentValue
             | Opcode::SetEnvironmentValue
             | Opcode::NativePoll
+            | Opcode::DefineEnvironmentValue
     )
 }
 
@@ -3064,6 +3065,9 @@ mod tests {
                     body: BODY,
                     load: load_env as *const () as u64,
                     store: store_env as *const () as u64,
+                    // This test covers only the load/store arms; a `define`
+                    // reaching it would decline rather than call zero.
+                    ..Default::default()
                 },
                 ..Default::default()
             };
@@ -3508,6 +3512,10 @@ mod tests {
                 values_to_list: values_to_list as *const () as u64,
                 make_closure: make_closure as *const () as u64,
                 nested_bodies: vec![BODY],
+                // This test exercises only the two portable Call arms System Z
+                // has; the scope adapters are left absent so a stray use would
+                // decline rather than jump to zero.
+                ..Default::default()
             },
             ..Default::default()
         };

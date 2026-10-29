@@ -29829,9 +29829,16 @@ fn compile_checked_t2_artifact(
             body: std::ptr::from_ref(&*env_names) as u64,
             load: c2i_load_env as extern "C" fn(*const NativeEnvNames, u64) -> u64 as usize as u64,
             store: c2i_store_env as extern "C" fn(*const NativeEnvNames, u64, u64) as usize as u64,
+            define: c2i_define_env as extern "C" fn(*const NativeEnvNames, u64, u64) as usize
+                as u64,
         },
         &egcl_compiler::t2::emit::PortableCalls {
             values_to_list: c2i_values_to_list as extern "C" fn(u64) -> u64 as usize as u64,
+            // Both are plain zero-argument adapters, so unlike `make_closure`
+            // there is nothing target-specific to gate: any checked-ABI
+            // emitter that grows the arm can call them.
+            push_env_child: c2i_push_env_child as extern "C" fn() as usize as u64,
+            pop_env_child: c2i_pop_env_child as extern "C" fn() as usize as u64,
             make_closure: make_bytecode_closure_address(),
             // Addresses INTO `input.body`: valid only because the caller pushes
             // that exact Arc onto `rooted_bodies` whenever the body creates a

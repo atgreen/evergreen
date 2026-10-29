@@ -1304,13 +1304,28 @@ impl<'a> Builder<'a> {
                     }
                     push(i + 1, d - 1, &mut depth_at, &mut work);
                 }
-                Instr::DefineEnvVar(_) if self.native_cleanups => {
+                // Consumes its value on every ABI. A `LET` that opens a scope
+                // emits PushEnvChild and then one of these per variable, so
+                // accepting the scope markers without this one just moved the
+                // decline from PushEnvChild to here -- measured, 7 of each in
+                // the tier corpus (bliss-9kci1).
+                Instr::DefineEnvVar(_) => {
                     if d < 1 {
                         return Err(BuildError::Unsupported("environment binding without value"));
                     }
                     push(i + 1, d - 1, &mut depth_at, &mut work);
                 }
-                Instr::PushEnvChild | Instr::PopEnvChild if self.native_cleanups => {
+                // Stack-neutral on EVERY ABI: entering or leaving a lexical
+                // scope moves no operand, so the depth walk has nothing
+                // ABI-specific to decide. The mapped path services these
+                // through TRANSFER_LEXICAL_ENVIRONMENT_REQUEST and a
+                // checked-ABI target through the plain adapters in
+                // `PortableCalls` -- see the `AuxData::EnvironmentScope` arm
+                // below -- so refusing them here cost a checked target the
+                // whole function for any body that opens a scope
+                // (bliss-9kci1). Same reasoning as the ungated
+                // `MakeClosure { capture_env: false }` arm above.
+                Instr::PushEnvChild | Instr::PopEnvChild => {
                     push(i + 1, d, &mut depth_at, &mut work);
                 }
                 Instr::MakeClosure {
@@ -2165,6 +2180,43 @@ impl<'a> Builder<'a> {
                         .pop()
                         .ok_or(BuildError::Unsupported("stack underflow (StoreLocal)"))?;
                     self.write_var(Var::Local(*s), block, v);
+                }
+                // Entering or leaving a child lexical EnvFrame. x86-64 services
+                // these through its mapped transfer protocol, which decodes the
+                // instruction at the retained PC; a checked-ABI target has no
+                // mapped entry, so lower them to a plain adapter call and let
+                // the aux say which of the two it is. Valueless and
+                // stack-neutral, so nothing is pushed or popped. The attached
+                // state is the pre-instruction recovery point, just as for the
+                // other runtime calls: a failed call resumes by retrying the
+                // scope operation rather than assuming it already happened.
+                Instr::PushEnvChild | Instr::PopEnvChild if !self.native_cleanups => {
+                    let fs = self.build_frame_state(block, &stack, i as u32);
+                    self.emit_effect(
+                        block,
+                        Opcode::Call,
+                        vec![],
+                        AuxData::EnvironmentScope {
+                            enter: matches!(instruction, Instr::PushEnvChild),
+                        },
+                        Some(fs),
+                    );
+                }
+                Instr::DefineEnvVar(index) if !self.native_cleanups => {
+                    if self.bf.names.get(*index as usize).is_none() {
+                        return Err(BuildError::Unsupported("invalid environment name index"));
+                    }
+                    let fs = self.build_frame_state(block, &stack, i as u32);
+                    let value = stack
+                        .pop()
+                        .ok_or(BuildError::Unsupported("stack underflow (DefineEnvVar)"))?;
+                    self.emit_effect(
+                        block,
+                        Opcode::DefineEnvironmentValue,
+                        vec![value],
+                        AuxData::EnvironmentName(*index),
+                        Some(fs),
+                    );
                 }
                 Instr::LoadEnvVar(index) | Instr::StoreEnvVar(index) => {
                     if self.bf.names.get(*index as usize).is_none() {
@@ -4227,6 +4279,128 @@ mod tests {
             assert_eq!(count(&ordinary, Opcode::CurrentCallable), 1);
             assert_eq!(count(&ordinary, Opcode::Invoke), 0);
             assert!(crate::t2::verify::verify(&ordinary).is_ok());
+        }
+    }
+
+    #[test]
+    fn checked_environment_scope_preserves_define_prestate_and_directions() {
+        let mut body = bf(
+            "CHECKED-ENVIRONMENT-SCOPE",
+            vec![
+                Instr::Const(0),
+                Instr::PushEnvChild,
+                Instr::Const(1),
+                Instr::DefineEnvVar(0),
+                Instr::PopEnvChild,
+                Instr::Return,
+            ],
+            vec![EgclVal::from_fixnum(41), EgclVal::from_fixnum(73)],
+            0,
+            0,
+            2,
+        );
+        body.names.push("CAPTURED-CELL".to_owned());
+
+        let function = build_from_bytecode(&body).expect("checked environment operations build");
+        crate::t2::verify::verify(&function).expect("checked environment IR verifies");
+        let instructions: Vec<_> = function
+            .block_order()
+            .iter()
+            .flat_map(|&block| function.block(block).insts.iter().copied())
+            .collect();
+        let value_for = |immediate| {
+            instructions
+                .iter()
+                .copied()
+                .find_map(|inst| {
+                    matches!(function.inst(inst).aux, AuxData::FixnumImm(value) if value == immediate)
+                        .then(|| function.inst(inst).results[0])
+                })
+                .expect("constant value")
+        };
+        let sentinel = value_for(41);
+        let defined = value_for(73);
+
+        let scope_calls: Vec<_> = instructions
+            .iter()
+            .copied()
+            .filter(|&inst| matches!(function.inst(inst).aux, AuxData::EnvironmentScope { .. }))
+            .collect();
+        assert_eq!(scope_calls.len(), 2);
+        for (&call, (enter, bcp)) in scope_calls.iter().zip([(true, 1), (false, 4)].iter()) {
+            let data = function.inst(call);
+            assert_eq!(data.opcode, Opcode::Call);
+            assert!(
+                matches!(data.aux, AuxData::EnvironmentScope { enter: actual } if actual == *enter)
+            );
+            assert!(data.args.is_empty());
+            assert!(data.results.is_empty());
+            assert!(data.flags.call && data.flags.effectful && data.flags.safepoint);
+            let state = function
+                .frame_states
+                .get(data.frame_state.expect("scope call prestate"));
+            assert_eq!(state.scopes[0].bcp, *bcp);
+            assert!(matches!(state.scopes[0].stack.as_slice(),
+                [ValueSource::Value { value, .. }] if *value == sentinel));
+        }
+
+        let define = instructions
+            .iter()
+            .copied()
+            .find(|&inst| function.inst(inst).opcode == Opcode::DefineEnvironmentValue)
+            .expect("checked DefineEnvVar lowering");
+        let data = function.inst(define);
+        assert_eq!(data.args, vec![defined]);
+        assert!(data.results.is_empty());
+        assert!(data.flags.call && data.flags.effectful && data.flags.safepoint);
+        assert!(matches!(data.aux, AuxData::EnvironmentName(0)));
+        let state = function
+            .frame_states
+            .get(data.frame_state.expect("DefineEnvVar prestate"));
+        assert_eq!(state.scopes[0].bcp, 3);
+        assert!(matches!(state.scopes[0].stack.as_slice(),
+            [
+                ValueSource::Value { value: first, .. },
+                ValueSource::Value { value: second, .. }
+            ] if *first == sentinel && *second == defined));
+
+        let returned = function.inst(function.terminator(function.entry()).expect("return"));
+        assert_eq!(returned.opcode, Opcode::Return);
+        assert_eq!(returned.args, vec![sentinel]);
+    }
+
+    #[test]
+    fn capturing_closure_after_checked_environment_setup_stays_fail_closed() {
+        let mut body = bf(
+            "CHECKED-CAPTURING-CLOSURE",
+            vec![
+                Instr::PushEnvChild,
+                Instr::Const(0),
+                Instr::DefineEnvVar(0),
+                Instr::MakeClosure {
+                    func: 0,
+                    capture_env: true,
+                },
+                Instr::Return,
+            ],
+            vec![EgclVal::from_fixnum(19)],
+            0,
+            0,
+            1,
+        );
+        body.names.push("CAPTURED-CELL".to_owned());
+        body.nested_functions.push(Arc::new(bf(
+            "CHECKED-CAPTURING-CLOSURE-CHILD",
+            vec![Instr::Const(0), Instr::Return],
+            vec![EgclVal::from_fixnum(23)],
+            0,
+            0,
+            1,
+        )));
+
+        match build_from_bytecode(&body) {
+            Err(BuildError::UnsupportedInstr(kind)) => assert_eq!(kind, "MakeClosure"),
+            other => panic!("capturing checked closure must stay fail-closed, got {other:?}"),
         }
     }
 
