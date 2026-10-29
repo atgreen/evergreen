@@ -746,9 +746,9 @@ impl Facts {
 /// never converges without widening, so the former 400-pass delay made every
 /// loop pay all 400 passes (97% of inference time under `EGCL_FORCE_TIER=t2`).
 const WIDEN_AFTER: usize = 2;
-/// Hard cap on ascending passes. Widening at every loop header bounds the
-/// chain well below this; reaching it means the facts are not a post-fixpoint,
-/// so narrowing is skipped.
+/// Work budget for ascending passes. Numeric range widening usually converges
+/// sooner, but type bits can require arbitrarily long phi chains. On exhaustion
+/// discard unfinished facts to TOP rather than narrowing or publishing them.
 const MAX_PASSES: usize = 64;
 /// Descending passes from the post-fixpoint, to recover bounds that widening
 /// discarded (`i ∈ [0, 10]` for `i < 10` rather than the widened fixnum range).
