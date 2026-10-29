@@ -4282,6 +4282,126 @@ mod tests {
     }
 
     #[test]
+    fn checked_environment_scope_preserves_define_prestate_and_directions() {
+        let mut body = bf(
+            "CHECKED-ENVIRONMENT-SCOPE",
+            vec![
+                Instr::Const(0),
+                Instr::PushEnvChild,
+                Instr::Const(1),
+                Instr::DefineEnvVar(0),
+                Instr::PopEnvChild,
+                Instr::Return,
+            ],
+            vec![EgclVal::from_fixnum(41), EgclVal::from_fixnum(73)],
+            0,
+            0,
+            2,
+        );
+        body.names.push("CAPTURED-CELL".to_owned());
+
+        let function = build_from_bytecode(&body).expect("checked environment operations build");
+        crate::t2::verify::verify(&function).expect("checked environment IR verifies");
+        let instructions: Vec<_> = function
+            .block_order()
+            .iter()
+            .flat_map(|&block| function.block(block).insts.iter().copied())
+            .collect();
+        let value_for = |immediate| {
+            instructions
+                .iter()
+                .copied()
+                .find_map(|inst| {
+                    matches!(function.inst(inst).aux, AuxData::FixnumImm(value) if value == immediate)
+                        .then(|| function.inst(inst).results[0])
+                })
+                .expect("constant value")
+        };
+        let sentinel = value_for(41);
+        let defined = value_for(73);
+
+        let scope_calls: Vec<_> = instructions
+            .iter()
+            .copied()
+            .filter(|&inst| matches!(function.inst(inst).aux, AuxData::EnvironmentScope { .. }))
+            .collect();
+        assert_eq!(scope_calls.len(), 2);
+        for (&call, (enter, bcp)) in scope_calls.iter().zip([(true, 1), (false, 4)].iter()) {
+            let data = function.inst(call);
+            assert_eq!(data.opcode, Opcode::Call);
+            assert!(matches!(data.aux, AuxData::EnvironmentScope { enter: actual } if actual == *enter));
+            assert!(data.args.is_empty());
+            assert!(data.results.is_empty());
+            assert!(data.flags.call && data.flags.effectful && data.flags.safepoint);
+            let state = function
+                .frame_states
+                .get(data.frame_state.expect("scope call prestate"));
+            assert_eq!(state.scopes[0].bcp, *bcp);
+            assert!(matches!(state.scopes[0].stack.as_slice(),
+                [ValueSource::Value { value, .. }] if *value == sentinel));
+        }
+
+        let define = instructions
+            .iter()
+            .copied()
+            .find(|&inst| function.inst(inst).opcode == Opcode::DefineEnvironmentValue)
+            .expect("checked DefineEnvVar lowering");
+        let data = function.inst(define);
+        assert_eq!(data.args, vec![defined]);
+        assert!(data.results.is_empty());
+        assert!(data.flags.call && data.flags.effectful && data.flags.safepoint);
+        assert!(matches!(data.aux, AuxData::EnvironmentName(0)));
+        let state = function
+            .frame_states
+            .get(data.frame_state.expect("DefineEnvVar prestate"));
+        assert_eq!(state.scopes[0].bcp, 3);
+        assert!(matches!(state.scopes[0].stack.as_slice(),
+            [
+                ValueSource::Value { value: first, .. },
+                ValueSource::Value { value: second, .. }
+            ] if *first == sentinel && *second == defined));
+
+        let returned = function.inst(function.terminator(function.entry()).expect("return"));
+        assert_eq!(returned.opcode, Opcode::Return);
+        assert_eq!(returned.args, vec![sentinel]);
+    }
+
+    #[test]
+    fn capturing_closure_after_checked_environment_setup_stays_fail_closed() {
+        let mut body = bf(
+            "CHECKED-CAPTURING-CLOSURE",
+            vec![
+                Instr::PushEnvChild,
+                Instr::Const(0),
+                Instr::DefineEnvVar(0),
+                Instr::MakeClosure {
+                    func: 0,
+                    capture_env: true,
+                },
+                Instr::Return,
+            ],
+            vec![EgclVal::from_fixnum(19)],
+            0,
+            0,
+            1,
+        );
+        body.names.push("CAPTURED-CELL".to_owned());
+        body.nested_functions.push(Arc::new(bf(
+            "CHECKED-CAPTURING-CLOSURE-CHILD",
+            vec![Instr::Const(0), Instr::Return],
+            vec![EgclVal::from_fixnum(23)],
+            0,
+            0,
+            1,
+        )));
+
+        match build_from_bytecode(&body) {
+            Err(BuildError::UnsupportedInstr(kind)) => assert_eq!(kind, "MakeClosureEnv"),
+            other => panic!("capturing checked closure must stay fail-closed, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn captured_constant_globals_fold_cached_bytecode_without_worker_cell_reads() {
         let root = egcl_rt::symbols::intern("T2-CACHED-CONSTANT-ROOT");
         let other_root = egcl_rt::symbols::intern("T2-CACHED-CONSTANT-OTHER");
