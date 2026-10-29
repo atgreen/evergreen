@@ -54,6 +54,11 @@
   custom reader macros and callable standard reader handlers
   ([#837](https://github.com/atgreen/evergreen/pull/837)).
 
+
+- Compiled function literals retain captured state and saved-core identity;
+  portable FASLs explicitly reject unsupported captured function constants
+  instead of retaining process-local closure IDs
+  ([#848](https://github.com/atgreen/evergreen/pull/848)).
 - String and stream printers consistently honor `*PRINT-ARRAY*` for array
   layouts, and string printers render package objects through their print hook
   ([#830](https://github.com/atgreen/evergreen/pull/830)).

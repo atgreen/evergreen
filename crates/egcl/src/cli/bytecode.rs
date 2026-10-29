@@ -3004,7 +3004,10 @@ impl<'e> Lowerer<'e> {
             self.push_n(1);
             return Ok(());
         }
-        if form.is_character() || form.is_string() {
+        // Interpreter closures are physically conses, but their Lisp type is
+        // FUNCTION: a macro may splice one into an expression as a literal.
+        // Preserve the callable value before the cons/call dispatch below.
+        if form.is_character() || form.is_string() || super::is_closure_cons(form) {
             let c = self.add_const(form);
             self.emit(Instr::Const(c));
             self.push_n(1);
@@ -10619,6 +10622,8 @@ struct BbuConstPool {
     /// snapshot carries the object itself, and the restore remaps the
     /// reference, so the function keeps its exact constant.
     saved_heap_refs: bool,
+    /// Portable artifacts cannot retain interpreter closure registry IDs.
+    unsupported_function_literal: bool,
     /// Hash tables whose entries are being encoded, so one that contains itself
     /// is refused instead of recursing forever.
     open_tables: Vec<EgclVal>,
@@ -10700,6 +10705,9 @@ fn capture_bbu_graph(
         let value = values[nodes.len()];
         let node = if let Some(&reference) = existing.get(&value) {
             BbuGraphNode::Existing(reference)
+        } else if super::is_closure_cons(value) {
+            // A logical FUNCTION atom must never be copied as a data cons.
+            BbuGraphNode::Leaf
         } else if value.is_cons() {
             let (car, cdr) = cp(value);
             BbuGraphNode::Cons(vec![
@@ -10747,6 +10755,16 @@ fn capture_bbu_graph(
 }
 
 impl BbuConstPool {
+    fn check_portable_function_literals(&self) -> Result<(), EgclError> {
+        if self.unsupported_function_literal {
+            Err(EgclError::ProgramError(
+                "COMPILE-FILE: cannot externalize captured function literal".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
     fn intern_encoded(&mut self, bytes: Vec<u8>) -> u32 {
         if let Some(&idx) = self.index.get(&bytes) {
             return idx;
@@ -10838,6 +10856,10 @@ impl BbuConstPool {
         }
         let (mut values, nodes) = capture_bbu_graph(v, &self.graph_values, &self.graph_refs)?;
         egcl_rt::rooted_ref!(_values_root = &mut values);
+        if !self.saved_heap_refs && values.iter().copied().any(super::is_closure_cons) {
+            self.unsupported_function_literal = true;
+            return None;
+        }
         let entry_count = self.entries.len();
         let graph_count = self.graph_values.len();
         let load_form_count = self.load_forms.len();
@@ -11168,7 +11190,7 @@ impl BbuConstPool {
         // Without this the function was left out of the image, and its restored
         // stub silently ran a NIL body — ironclad's MASSAGE-SYMBOL answered NIL
         // for every digest name in a saved executable.
-        if self.saved_heap_refs && v.is_heap_object() {
+        if self.saved_heap_refs && (v.is_heap_object() || super::is_closure_cons(v)) {
             let mut bytes = Vec::new();
             put_u8(&mut bytes, 21);
             put_u64(&mut bytes, v.0);
@@ -12440,6 +12462,7 @@ pub fn build_bbu_from_forms(
             );
         }
 
+        pool.check_portable_function_literals()?;
         if !done {
             if std::env::var_os("EGCL_BFASL_FORM").is_some() {
                 eprintln!(
@@ -12465,6 +12488,7 @@ pub fn build_bbu_from_forms(
                 done = true;
             }
         }
+        pool.check_portable_function_literals()?;
         if !done {
             // CLHS 3.2.3: COMPILE-FILE must always produce loadable output.
             // A form whose literals the portable pool cannot externalize —
@@ -12492,6 +12516,7 @@ pub fn build_bbu_from_forms(
         let deferred = make_load_form::plan(
             &mut pool, &functions, function_start, &load_actions[action_start..], env,
         )?;
+        pool.check_portable_function_literals()?;
         if let Some(index) = &mut explicit_result { *index += deferred.len(); }
         load_actions.splice(action_start..action_start, deferred);
         form_results.push(if let Some(index) = constant_result {
@@ -12504,6 +12529,9 @@ pub fn build_bbu_from_forms(
     }
 
     make_load_form::discard_unused(&mut pool);
+    // MAKE-LOAD-FORM planning can serialize additional creation/init literals
+    // after the per-form checks. Never emit an artifact after any rejection.
+    pool.check_portable_function_literals()?;
     let mut print_groups = Vec::with_capacity(source_group_ends.len());
     let mut previous_end = 0;
     for &end in source_group_ends {
@@ -32112,3 +32140,120 @@ mod compile_file_print_group_tests {
 }
 #[cfg(test)]
 mod adjustable_array_persistence_tests;
+
+#[cfg(test)]
+mod function_literal_tests {
+    use super::*;
+    use super::super::{Closure, closure_registry, register_tree_closure};
+    use std::collections::HashSet;
+
+    fn closure_id(identity: EgclVal) -> u64 {
+        cp(identity).1.as_fixnum() as u64
+    }
+
+    #[test]
+    fn expanded_literal_identity_moves_with_its_compiled_constant_owner() {
+        let _lock = super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env = &mut env);
+        egcl_rt::rooted!(body = reader::read_from_string("(held)").unwrap().0);
+        let captured = Arc::new(SharedCell::new(EnvFrame::default()));
+        captured
+            .borrow_mut()
+            .vars
+            .insert("HELD".into(), EgclVal::from_fixnum(42));
+        egcl_rt::gc::collect_t0_minor().unwrap();
+        let closure = || Closure {
+            params_form: NIL,
+            body: *body,
+            captured_frame: Arc::clone(&captured),
+            captured_specials: Vec::new(),
+            captured_blocks: Vec::new(),
+            captured_tags: Vec::new(),
+            captured_funs: Some(Arc::clone(&env.funs)),
+            captured_macros: None,
+        };
+        egcl_rt::rooted!(function = register_tree_closure(closure()));
+        let id: u64 = closure_id(*function);
+        let control = register_tree_closure(closure());
+        let control_id: u64 = closure_id(control);
+        egcl_rt::rooted!(
+            expanded =
+                super::super::macroexpand_all(*function, &mut env, 0, &HashSet::new(),).unwrap()
+        );
+        assert_eq!(
+            *expanded, *function,
+            "logical function atoms retain exact identity"
+        );
+        let compiled = Arc::new(compile_thunk(*expanded, &env, false).unwrap());
+        egcl_rt::rooted!(_compiled = ActiveBytecodeRoot::new(&compiled));
+        let before = (*function).to_raw();
+        drop(expanded);
+        drop(function);
+        // Only the compiled constant pool now owns the tracked identity.
+        egcl_rt::gc::collect_t0_minor().unwrap();
+        let retained = compiled.constants[0];
+        assert_ne!(
+            retained.to_raw(),
+            before,
+            "the function identity must actually move"
+        );
+        assert_eq!(
+            super::super::CLOSURE_IDENTITIES.borrow().get(&id),
+            Some(&retained)
+        );
+        assert!(closure_registry().borrow().contains_key(&id));
+        assert!(!closure_registry().borrow().contains_key(&control_id));
+        assert_eq!(
+            apply_function(retained, &[], &mut env).unwrap(),
+            EgclVal::from_fixnum(42)
+        );
+    }
+
+    #[test]
+    fn closure_literals_lower_to_constants_and_never_portable_cons_ids() {
+        let _lock = super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env = &mut env);
+        egcl_rt::rooted!(source = reader::read_from_string("(lambda () 42)").unwrap().0);
+        egcl_rt::rooted!(function = eval_form(*source, &mut env).unwrap());
+        assert!(super::super::is_closure_cons(*function));
+        let body = compile_thunk(*function, &env, false).expect("literal compiles");
+        assert!(matches!(
+            body.code.as_slice(),
+            [Instr::Const(0), Instr::Return]
+        ));
+        assert_eq!(body.constants.as_slice(), &[*function]);
+
+        // A nested closure must not escape detection through an aggregate.
+        egcl_rt::rooted!(aggregate = arena_cons(*function, NIL));
+        let mut portable = BbuConstPool::default();
+        egcl_rt::rooted_ref!(_portable = &mut portable);
+        assert!(portable.value(*aggregate).is_none());
+        assert!(portable.check_portable_function_literals().is_err());
+        assert!(
+            portable.entries.is_empty(),
+            "reject before reserving graph entries"
+        );
+        assert!(portable.graph_values.is_empty());
+        assert!(portable.graph_refs.is_empty());
+
+        // Core images intentionally retain the registry/heap representation.
+        let mut image = BbuConstPool {
+            saved_heap_refs: true,
+            ..BbuConstPool::default()
+        };
+        egcl_rt::rooted_ref!(_image = &mut image);
+        assert!(image.value(*aggregate).is_some());
+        assert!(image.check_portable_function_literals().is_ok());
+        let reference = image.value(*function).unwrap();
+        assert!(matches!(
+            parse_bbu_constant(&mut BbuCursor::new(&image.entries[reference as usize]), BBU_BYTECODE_VERSION).unwrap(),
+            BbuConstant::SavedHeapRef(raw) if raw == (*function).to_raw()
+        ));
+    }
+}

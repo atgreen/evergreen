@@ -38033,7 +38033,9 @@ fn macroexpand_all(
     depth: u32,
     local_functions: &HashSet<u32>,
 ) -> Result<EgclVal, EgclError> {
-    if depth >= MACROEXPAND_ALL_MAX_DEPTH || !form.is_cons() {
+    // A cons-backed function is a logical atom. Copying it also disconnects
+    // the callable from the weak identity that owns its closure metadata.
+    if depth >= MACROEXPAND_ALL_MAX_DEPTH || !form.is_cons() || is_closure_cons(form) {
         return Ok(form);
     }
     let d = depth + 1;
