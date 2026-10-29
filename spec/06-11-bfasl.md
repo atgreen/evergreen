@@ -128,7 +128,7 @@ abstract-interpretation rules for stack maps, type slots, and unwind metadata;
 a loader MAY reject an older verifier version if the unit lacks metadata needed
 by the current runtime's GC or deoptimizer.
 
-The current bytecode version is **3.0** (`0x0300`). Version 2.1 added bounded
+The current bytecode version is **3.1** (`0x0301`). Version 2.1 added bounded
 fixnum parameter metadata; version 2.2 added `CHECK_RESULT` (`0x45`), described
 below. Version 2.3 added package, saved-image, and hash-table constants; version 2.4 added packed
 U8 constants and their multidimensional backing references. Version 2.5 adds
@@ -144,6 +144,22 @@ version-2 units are rejected before constants, definitions, or load actions are
 installed. Recompile their original source; changing the stored version does
 not migrate old code. Core image version 13 likewise requires rebuilding older
 images rather than inferring random-state identities from cons contents.
+
+Version 3.1 preserves symbol identity in compiled lexical bindings. Parameter
+binding metadata and the variable-name operands of `LOAD_ENV`, `STORE_ENV`,
+and `DEFINE_ENV` may reference an uninterned-symbol constant as well as a
+string constant. Strings continue to denote ordinary symbol names, including
+names containing NUL; they are never interpreted as serialized identity tokens.
+An uninterned-symbol reference denotes that exact constant-pool symbol, so
+distinct symbols with equal names remain distinct and repeated references share
+the fresh identity created by a portable load. Version 3.0 units retain their
+string-only binding metadata. Invalid reference kinds are rejected before
+constant materialization or load actions.
+
+Saved cores preserve the identities of their existing symbol objects through
+saved-object references instead. Those references remain forbidden in portable
+compiled files. Function names, block names, and tag names retain their existing
+encodings.
 New opcodes and constant tags
 require their introducing minor version.
 Version-1 writers could
