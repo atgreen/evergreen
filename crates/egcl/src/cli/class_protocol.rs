@@ -171,6 +171,17 @@ pub(super) fn call(_name: &str, args: &[EgclVal], env: &mut Env) -> Result<EgclV
             egcl_stdlib::clos::set_class_direct_slot_metaobjects(class, args[2])?;
             Ok(args[2])
         }
+        "SET-RAW-EFFECTIVE" if args.len() == 3 => {
+            if supports_protocol(class) {
+                return Err(EgclError::ProgramError(
+                    "standard classes require protocol slot computation".into(),
+                ));
+            }
+            egcl_rt::rooted!(slots = args[2]);
+            egcl_rt::rooted!(wrapper = arena_cons(*slots, NIL));
+            egcl_stdlib::clos::set_class_raw_effective_slot_metaobjects(class, *wrapper)?;
+            Ok(*slots)
+        }
         "BEGIN" => {
             egcl_stdlib::clos::begin_class_finalization(class)?;
             Ok(class)

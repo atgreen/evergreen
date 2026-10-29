@@ -17,6 +17,16 @@ fn marker(value: i64) -> EgclVal {
     }
 }
 
+fn raw_wrapper(value: EgclVal) -> EgclVal {
+    egcl_rt::rooted!(value = value);
+    let body = egcl_rt::alloc_typed(16, type_id::CONS).unwrap();
+    unsafe {
+        body.cast::<EgclVal>().write(*value);
+        body.cast::<EgclVal>().add(1).write(NIL);
+        EgclVal::from_cons_ptr(body)
+    }
+}
+
 fn value(list: EgclVal) -> i64 {
     assert!(list.is_cons());
     unsafe { list.as_ptr().cast::<EgclVal>().read().as_fixnum() }
@@ -108,4 +118,44 @@ fn protocol_roots_move_survive_images_and_publish_only_validated_layouts() {
     );
     assert_eq!(class_protocol_runtime_slots(class), Some(*runtime_slots));
     assert_eq!(compute_class_precedence_list(class).unwrap(), cpl);
+
+    // Raw introspection is cached in the existing image/root field without
+    // publishing protocol runtime slots or changing the already valid layout.
+    let raw_class = symbol("RAW-PROTOCOL-CACHE-CLASS");
+    define_class(raw_class, raw_class, &[], &[kept]).unwrap();
+    egcl_rt::rooted!(raw_instance = allocate_instance(raw_class).unwrap());
+    set_slot_value(*raw_instance, kept, EgclVal::from_fixnum(82)).unwrap();
+    let layout = class_layout_key(raw_class);
+    gc::collect_t0_minor().unwrap();
+    egcl_rt::rooted!(raw_value = marker(61));
+    egcl_rt::rooted!(raw_cache = raw_wrapper(*raw_value));
+    assert!(set_class_raw_effective_slot_metaobjects(class, *raw_cache).is_err());
+    set_class_raw_effective_slot_metaobjects(raw_class, *raw_cache).unwrap();
+    let before_value = *raw_value;
+    let before_cache = *raw_cache;
+    gc::collect_t0_minor().unwrap();
+    assert_ne!(*raw_value, before_value, "raw slot metadata must move");
+    assert_ne!(*raw_cache, before_cache, "raw cache wrapper must move");
+    assert_eq!(class_slot_metaobjects(raw_class, false), (*raw_value, true));
+    assert_eq!(class_protocol_runtime_slots(raw_class), None);
+    assert_eq!(class_protocol_default_initargs(raw_class), None);
+    assert_eq!(class_layout_key(raw_class), layout);
+    let bytes = serialize_clos_state();
+    restore_clos_state(&bytes, &|raw| raw).unwrap();
+    assert_eq!(class_slot_metaobjects(raw_class, false), (*raw_value, true));
+    assert_eq!(class_protocol_runtime_slots(raw_class), None);
+    assert_eq!(value(class_slot_metaobjects(raw_class, false).0), 61);
+    assert_eq!(
+        slot_value(*raw_instance, kept).unwrap(),
+        EgclVal::from_fixnum(82)
+    );
+    define_class(raw_class, raw_class, &[], &[kept]).unwrap();
+    assert_eq!(class_slot_metaobjects(raw_class, false), (NIL, false));
+    egcl_rt::rooted!(empty_cache = raw_wrapper(NIL));
+    set_class_raw_effective_slot_metaobjects(raw_class, *empty_cache).unwrap();
+    assert_eq!(class_slot_metaobjects(raw_class, false), (NIL, true));
+    let bytes = serialize_clos_state();
+    restore_clos_state(&bytes, &|raw| raw).unwrap();
+    assert_eq!(class_slot_metaobjects(raw_class, false), (NIL, true));
+    assert_eq!(class_protocol_runtime_slots(raw_class), None);
 }
