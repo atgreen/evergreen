@@ -115,9 +115,7 @@ fn effective_slot(slot: EgclVal) -> Result<SlotDef, EgclError> {
     })
 }
 
-pub(super) fn effective_slots(class_name: &str) -> Option<Vec<SlotDef>> {
-    let name = reader::find_symbol_index(class_name)?;
-    let class = egcl_stdlib::find_class(EgclVal::from_symbol_index(name))?;
+pub(super) fn effective_slots_for_class(class: EgclVal) -> Option<Vec<SlotDef>> {
     let snapshot = egcl_stdlib::clos::class_protocol_runtime_slots(class)?;
     Some(
         list_to_vec(snapshot)
@@ -281,37 +279,26 @@ pub(super) fn call(_name: &str, args: &[EgclVal], env: &mut Env) -> Result<EgclV
             egcl_rt::rooted!(snapshot = vec_to_list(&snapshot));
             // Validate before publishing. Preserve existing shared owners/cells;
             // newly computed shared slots acquire a cell in this class.
-            let class_name = class_name_for_instance_class(class);
-            let missing_shared: Vec<_> = shared_names
-                .into_iter()
-                .filter(|name| class_slot_owner(env, &class_name, name).is_none())
-                .collect();
+            let mut shared_cells = Vec::new();
+            for name in shared_names {
+                let owner = runtime_shared_cell_owner(env, class, &name);
+                let cells = egcl_stdlib::clos::class_runtime_shared_cells(owner)
+                    .or_else(|| runtime_class_definition(env, owner).map(|definition| definition.class_slot_values))
+                    .ok_or_else(|| EgclError::ProgramError("shared slot owner has no runtime definition".into()))?;
+                shared_cells.push((cells, name));
+            }
             egcl_stdlib::clos::publish_class_protocol(
                 class, &cpl, &names, args[3], args[4], args[5], *snapshot,
             )?;
-            let shared_cells = env
-                .classes
-                .borrow()
-                .get(&class_name)
-                .map(|definition| Arc::clone(&definition.class_slot_values));
-            if let Some(shared_cells) = shared_cells {
-                let mut cells = shared_cells.lock().unwrap();
-                for name in missing_shared {
-                    cells.entry(name).or_insert(None);
-                }
+            for (cells, name) in shared_cells {
+                cells.lock().unwrap().entry(name).or_insert(None);
             }
             invalidate_gf_dispatch_cache();
             bump_accessor_slot_gen();
             Ok(class)
         }
-        "DIRECT-DEFAULTS" => {
-            let class_name = class_name_for_instance_class(class);
-            Ok(env
-                .classes
-                .borrow()
-                .get(&class_name)
-                .map_or(NIL, |c| c.direct_default_metadata))
-        }
+        "DIRECT-DEFAULTS" => Ok(runtime_class_definition(env, class)
+            .map_or(NIL, |definition| definition.direct_default_metadata)),
         "DEFAULTS" => Ok(egcl_stdlib::clos::class_protocol_default_initargs(class).unwrap_or(NIL)),
         _ => Err(EgclError::ProgramError(
             "invalid class protocol operation".into(),
@@ -336,9 +323,7 @@ pub(super) fn capture_default_initargs(
     Ok(vec_to_list(&out))
 }
 
-pub(super) fn effective_defaults(class_name: &str) -> Option<Vec<(String, EgclVal)>> {
-    let symbol = EgclVal::from_symbol_index(reader::find_symbol_index(class_name)?);
-    let class = egcl_stdlib::find_class(symbol)?;
+pub(super) fn effective_defaults_for_class(class: EgclVal) -> Option<Vec<(String, EgclVal)>> {
     let defaults = egcl_stdlib::clos::class_protocol_runtime_defaults(class)?;
     Some(
         list_to_vec(defaults)

@@ -663,6 +663,13 @@
 (defmethod shared-initialize ((instance standard-object) slot-names &rest initargs)
   (egcl-internal::%standard-shared-initialize instance slot-names initargs))
 
+(defgeneric (setf class-name) (new-name class))
+(defmethod (setf class-name) (new-name (class class))
+  (egcl-internal::%set-class-name new-name class))
+;; Give invalid class arguments the same precise type error as the primitive.
+(defmethod (setf class-name) (new-name (class t))
+  (egcl-internal::%set-class-name new-name class))
+
 (defmethod slot-unbound (class instance slot-name)
   (declare (ignore class))
   (error 'unbound-slot :name slot-name :instance instance))

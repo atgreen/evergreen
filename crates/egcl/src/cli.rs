@@ -1831,12 +1831,14 @@ thread_local! {
         RefCell::new((0, HashMap::new()));
 }
 
-/// The symbol naming a class, when there is one — a stable key for the cache.
+/// A name cache is usable only while that name still denotes this exact class.
+/// Unregistered/renamed/replaced classes use the identity-based uncached path.
 fn class_name_symbol(class: EgclVal) -> Option<u32> {
-    if class.is_symbol() {
-        return class.symbol_index();
+    let name = egcl_stdlib::class_name(class);
+    if name.is_nil() || egcl_stdlib::find_class(name) != Some(class) {
+        return None;
     }
-    egcl_stdlib::class_name(class).symbol_index()
+    name.symbol_index()
 }
 
 /// [`accessor_slot_name_in_class_chain`] as a slot SYMBOL, memoized per
@@ -1848,8 +1850,8 @@ fn class_name_symbol(class: EgclVal) -> Option<u32> {
 /// symbol it began as. The answer is identical for every instance of a class, so
 /// it is computed once. Measured 2370ns -> the numbers in bliss-1qjmm.
 ///
-/// Returns None when the class has no naming symbol, leaving the caller on the
-/// uncached path rather than guessing.
+/// Returns None when the name no longer denotes the exact class, leaving the
+/// caller on the identity-based uncached path rather than guessing.
 pub(in crate::cli) fn accessor_slot_symbol_cached(
     env: &Env,
     instance: EgclVal,
@@ -1911,11 +1913,11 @@ pub(in crate::cli) fn accessor_slot_name_in_class_chain(
     accessor: &str,
 ) -> Option<String> {
     let name_matches = |n: &str| n == accessor;
-    let class_name = class_name_for_instance_class(egcl_stdlib::class_of(instance));
+    let class = egcl_stdlib::class_of(instance);
     // Most-specific-first, so a subclass that renames the slot behind an
     // inherited accessor wins over its superclass.
-    for candidate in class_precedence_names(env, &class_name) {
-        let found = env.classes.borrow().get(&candidate).and_then(|class| {
+    for candidate in egcl_stdlib::compute_class_precedence_list(class).ok()? {
+        let found = runtime_class_definition(env, candidate).and_then(|class| {
             class.slots.iter().find_map(|slot| {
                 let matches = slot
                     .accessor
@@ -2964,53 +2966,9 @@ enum SetfExpander {
     },
 }
 
-#[allow(dead_code)]
-#[derive(Clone)]
-struct ClassDef {
-    name: String,
-    supers: Vec<String>,
-    slots: Vec<SlotDef>,
-    class_slot_values: Arc<Mutex<HashMap<String, Option<EgclVal>>>>,
-    /// `(:default-initargs initarg value-form …)` from the class options: the
-    /// bare initarg name and its (unevaluated) default value form. Applied at
-    /// MAKE-INSTANCE time for any initarg the caller did not supply (CLHS 7.1.4).
-    default_initargs: Vec<(String, EgclVal)>,
-    direct_default_metadata: EgclVal,
-}
-
-#[derive(Clone)]
-struct SlotDef {
-    name: String,
-    /// All `:initarg` names declared for this slot (a slot may declare several,
-    /// e.g. both `:licence` and `:license`). Bare names, no leading colon.
-    initargs: Vec<String>,
-    accessor: Option<String>,
-    readers: Vec<String>,
-    writers: Vec<String>,
-    initform: Option<EgclVal>,
-    source_initform: Option<EgclVal>,
-    initfunction: Option<EgclVal>,
-    mop_options: Vec<EgclVal>,
-    allocation: SlotAllocation,
-}
-
-/// Rooting support: `eval_defclass` accumulates SlotDefs in a Rust-local Vec
-/// while it keeps allocating (accessor setf names, define_class); HostRoot'ing
-/// that Vec keeps each slot's initform precise across those GCs (bliss-wlf).
-impl egcl_rt::gc::TraceHostRoots for SlotDef {
-    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
-        if let Some(form) = &mut self.initform { visit(form); }
-        if let Some(form) = &mut self.source_initform { visit(form); }
-        if let Some(function) = &mut self.initfunction { visit(function); }
-        for value in &mut self.mop_options { visit(value); }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SlotAllocation {
-    Instance,
-    Class,
-}
+use egcl_stdlib::clos::{
+    RuntimeClassDefinition as ClassDef, RuntimeSlotDefinition as SlotDef, SlotAllocation,
+};
 
 #[derive(Clone)]
 struct MethodDef {
@@ -3976,13 +3934,11 @@ fn host_serialize_registries() -> Vec<u8> {
             }
         }
     }
-    // Interpreter class definitions (egcl-x0f2.7c): env.classes carries slot
-    // :initform forms, :initarg names, accessor/reader/writer names,
-    // :default-initargs, allocation, and class-slot values — none of which the
-    // stdlib CLOS state block covers. Without them MAKE-INSTANCE of a restored
-    // class silently skips every :initform (ASDF's session-cache slot, etc.).
+    // Named source/compiler views retain their exact class owner. CLST stores
+    // canonical runtime definitions; restore relinks these views to that same
+    // model and shared-cell Arc rather than retargeting through FIND-CLASS.
     // Reads raw tagged words post-full-gc; no EGCL allocation — GC-safe.
-    out.extend_from_slice(b"CLS2");
+    out.extend_from_slice(b"CLS3");
     let class_recs: Vec<Vec<u8>> = SAVE_CLASSES.with(|c| {
         c.borrow().as_ref().map_or_else(Vec::new, |map| {
             map.borrow()
@@ -3990,6 +3946,7 @@ fn host_serialize_registries() -> Vec<u8> {
                 .map(|(name, cd)| {
                     let mut rec = Vec::new();
                     hr_put_str(&mut rec, name);
+                    rec.extend_from_slice(&cd.owner.to_raw().to_le_bytes());
                     rec.extend_from_slice(&(cd.supers.len() as u32).to_le_bytes());
                     for s in &cd.supers {
                         hr_put_str(&mut rec, s);
@@ -4565,12 +4522,21 @@ fn host_restore_registries(data: &[u8]) -> Result<(), EgclError> {
     // Interpreter class-definition block (egcl-x0f2.7c): stash remapped
     // ClassDefs for the post-Env::new drain, like the generic/method records.
     if off + 4 <= data.len() && &data[off..off + 4] == b"CLS2" {
+        return Err(EgclError::InvalidImage("host registry: obsolete name-owned class definitions".into()));
+    }
+    if off + 4 <= data.len() && &data[off..off + 4] == b"CLS3" {
         off += 4;
         let bad = || EgclError::InvalidImage("host registry: truncated (classes)".into());
         let n_classes = hr_get_u32(data, &mut off).ok_or_else(bad)? as usize;
         let mut classes: Vec<(String, ClassDef)> = Vec::with_capacity(n_classes);
         for _ in 0..n_classes {
             let name = hr_get_str(data, &mut off).ok_or_else(bad)?;
+            let owner = EgclVal::from_raw(remap(hr_get_u64(data, &mut off).ok_or_else(bad)?));
+            if !owner.is_nil() && (!egcl_stdlib::clos::is_class_object(owner)
+                || egcl_stdlib::clos::class_runtime_shared_cells(owner).is_none())
+            {
+                return Err(EgclError::InvalidImage("host registry: invalid class-definition owner".into()));
+            }
             let n_supers = hr_get_u32(data, &mut off).ok_or_else(bad)? as usize;
             let mut supers = Vec::with_capacity(n_supers);
             for _ in 0..n_supers {
@@ -4678,6 +4644,7 @@ fn host_restore_registries(data: &[u8]) -> Result<(), EgclError> {
             classes.push((
                 name.clone(),
                 ClassDef {
+                    owner,
                     name,
                     supers,
                     slots,
@@ -5117,7 +5084,11 @@ fn drain_pending_host_generics(env: &Env) {
     // bootstrap-seeded ClassDef of the same name is superseded by the saved one.
     let classes = PENDING_HOST_CLASSES.with(|p| std::mem::take(&mut *p.borrow_mut()));
     for (name, def) in classes {
-        env.classes.borrow_mut().insert(name, def);
+        let definition = if def.owner.is_nil() { def } else {
+            egcl_stdlib::clos::class_runtime_definition(def.owner)
+                .expect("validated class definition owner must retain runtime metadata")
+        };
+        env.classes.borrow_mut().insert(name, definition);
         // Any class (re)definition invalidates the accessor slot cache (bliss-1qjmm).
         bump_accessor_slot_gen();
     }
@@ -6107,8 +6078,7 @@ fn build_condition_instance_impl(
         .chunks_exact(2)
         .map(|pair| sym_bare_name_rc(pair[0]).to_string())
         .collect();
-    let cond_class_name = class_name_for_instance_class(class);
-    apply_class_initforms(*instance, &cond_class_name, env, None, &explicit_slots)?;
+    apply_class_initforms(*instance, env, None, &explicit_slots)?;
     Ok(*instance)
 }
 
@@ -7343,42 +7313,6 @@ fn method_class_specializer(
     }
 }
 
-/// Every slot of `class_name` (own and inherited, most specific class first)
-/// that declares `initarg`: CLHS 7.1.4 fills all of them from one initarg
-/// (ansi shared-initialize.6.*, class-21).
-fn slots_for_initarg(env: &Env, class_name: &str, initarg: &str) -> Vec<String> {
-    fn walk(
-        env: &Env,
-        class_name: &str,
-        initarg: &str,
-        seen: &mut Vec<String>,
-        out: &mut Vec<String>,
-    ) {
-        if seen.iter().any(|name| name == class_name) {
-            return;
-        }
-        seen.push(class_name.to_string());
-        let Some(class_def) = env.classes.borrow().get(class_name).cloned() else {
-            return;
-        };
-        for slot in &class_def.slots {
-            if slot.initargs.iter().any(|slot_initarg| slot_initarg == initarg)
-                && !out
-                    .iter()
-                    .any(|name| symbol_bare_name(name) == symbol_bare_name(&slot.name))
-            {
-                out.push(slot.name.clone());
-            }
-        }
-        for super_name in &class_def.supers {
-            walk(env, super_name, initarg, seen, out);
-        }
-    }
-    let mut out = Vec::new();
-    walk(env, class_name, initarg, &mut Vec::new(), &mut out);
-    out
-}
-
 /// CLHS 7.1.2 initargument validity for a user-defined class: the list must be
 /// keyword/value pairs with symbol keys, and each key must be a slot initarg or
 /// a &KEY parameter of a method on one of `generic_names` (any such method with
@@ -7405,12 +7339,12 @@ fn check_initarg_pairs(initargs: &[EgclVal]) -> Result<(), EgclError> {
 
 fn check_initargs_valid(
     env: &Env,
-    class_name: &str,
+    class: EgclVal,
     initargs: &[EgclVal],
     generic_names: &[&str],
 ) -> Result<(), EgclError> {
     check_initarg_pairs(initargs)?;
-    if !env.classes.borrow().contains_key(class_name) {
+    if runtime_class_definition(env, class).is_none() {
         return Ok(());
     }
     for pair in initargs.chunks_exact(2) {
@@ -7421,7 +7355,7 @@ fn check_initargs_valid(
             break;
         }
     }
-    let Some(valid) = valid_initarg_names(env, class_name, generic_names) else {
+    let Some(valid) = valid_initarg_names(env, class, generic_names) else {
         return Ok(());
     };
     for pair in initargs.chunks_exact(2) {
@@ -7430,7 +7364,7 @@ fn check_initargs_valid(
             return Err(EgclError::ProgramError(format!(
                 "{} is not a valid initialization argument for class {}",
                 format_val(pair[0]),
-                symbol_bare_name(class_name)
+                class_name_for_instance_class(class)
             )));
         }
     }
@@ -7441,8 +7375,8 @@ fn check_initargs_valid(
 /// `SlotDef::initargs` stores them: its effective slots' initargs plus the
 /// &KEY names of the applicable methods on `generic_names`. `None` when one of
 /// those methods has &ALLOW-OTHER-KEYS, which makes every name valid.
-fn valid_initarg_names(env: &Env, class_name: &str, generic_names: &[&str]) -> Option<Vec<String>> {
-    let mut valid: Vec<String> = effective_slots_for_class(env, class_name)
+fn valid_initarg_names(env: &Env, class: EgclVal, generic_names: &[&str]) -> Option<Vec<String>> {
+    let mut valid: Vec<String> = runtime_class_slots(env, class)
         .into_iter()
         .flat_map(|slot| slot.initargs)
         .collect();
@@ -7450,10 +7384,7 @@ fn valid_initarg_names(env: &Env, class_name: &str, generic_names: &[&str]) -> O
         // Only methods applicable to an instance of the class count: one whose
         // first parameter is unspecialized, or specialized on a class in the
         // precedence list. An EQL specializer is accepted as applicable.
-        let class = resolve_sym(class_name).and_then(egcl_stdlib::find_class);
-        let precedence = class
-            .and_then(|class| egcl_stdlib::compute_class_precedence_list(class).ok())
-            .unwrap_or_default();
+        let precedence = egcl_stdlib::compute_class_precedence_list(class).unwrap_or_default();
         let applies = |def: &MethodDef| match def.specializers.first() {
             None | Some(MethodSpecializer::Any) | Some(MethodSpecializer::Eql(_)) => true,
             Some(MethodSpecializer::Class { class, .. }) => precedence.contains(class),
@@ -7485,14 +7416,20 @@ fn valid_initarg_names(env: &Env, class_name: &str, generic_names: &[&str]) -> O
 
 /// The slot symbols an initarg fills, or the initarg's own symbol when no slot
 /// declares it (see `resolve_slot_symbol`).
+fn runtime_slots_for_initarg(env: &Env, class: EgclVal, initarg: &str) -> Vec<String> {
+    runtime_class_slots(env, class).into_iter()
+        .filter(|slot| slot.initargs.iter().any(|name| name == initarg))
+        .map(|slot| slot.name).collect()
+}
+
 fn resolve_slot_symbols(
-    class_name: &str,
+    class: EgclVal,
     key: EgclVal,
     env: &Env,
 ) -> Result<Vec<EgclVal>, EgclError> {
-    let names = slots_for_initarg(env, class_name, &sym_bare_name_rc(key));
+    let names = runtime_slots_for_initarg(env, class, &sym_bare_name_rc(key));
     if names.is_empty() {
-        return Ok(vec![resolve_slot_symbol(class_name, key, env)?]);
+        return Ok(vec![resolve_slot_symbol(class, key, env)?]);
     }
     Ok(names
         .iter()
@@ -7500,9 +7437,9 @@ fn resolve_slot_symbols(
         .collect())
 }
 
-fn resolve_slot_symbol(class_name: &str, key: EgclVal, env: &Env) -> Result<EgclVal, EgclError> {
+fn resolve_slot_symbol(class: EgclVal, key: EgclVal, env: &Env) -> Result<EgclVal, EgclError> {
     let key_name = sym_bare_name_rc(key);
-    if let Some(slot) = lookup_slot_by_initarg(env, class_name, &key_name) {
+    if let Some(slot) = runtime_slot_by_initarg(env, class, &key_name) {
         return Ok(resolve_sym(&slot.name).unwrap_or(NIL));
     }
     // An initarg that matches no slot :initarg is still valid if an applicable
@@ -7512,6 +7449,18 @@ fn resolve_slot_symbol(class_name: &str, key: EgclVal, env: &Env) -> Result<Egcl
     // rather than erroring: slot-filling skips it (no matching slot) while the
     // aux-method &key binding still receives it by name.
     Ok(resolve_sym(&key_name).unwrap_or(key))
+}
+
+/// Runtime metadata follows the class object. The named table is only a
+/// bootstrap/source fallback before the class has adopted its definition.
+fn runtime_class_definition(env: &Env, class: EgclVal) -> Option<ClassDef> {
+    egcl_stdlib::clos::class_runtime_definition(class).or_else(|| {
+        let name = egcl_stdlib::class_name(class);
+        if !name.is_symbol() || name.is_nil() { return None; }
+        let definition = env.classes.borrow().get(&sym_name(name)).cloned()?;
+        (definition.owner == class || (definition.owner.is_nil()
+            && egcl_stdlib::find_class(name) == Some(class))).then_some(definition)
+    })
 }
 
 fn class_name_for_instance_class(class: EgclVal) -> String {
@@ -7532,61 +7481,77 @@ fn class_name_for_instance_class(class: EgclVal) -> String {
     val_as_str(class)
 }
 
-fn lookup_slot_def(env: &Env, class_name: &str, slot_name: &str) -> Option<SlotDef> {
-    if let Some(slots) = class_protocol::effective_slots(class_name) {
-        return slots.into_iter().find(|slot| symbol_bare_name_is(&slot.name, slot_name) || slot.name == slot_name);
-    }
-    let class_def = env.classes.borrow().get(class_name).cloned()?;
-    // Compare BARE names. `eval_defclass` stores whatever `sym_name` gave it,
-    // which is package-qualified ("COMMON-LISP-USER::CS") for a symbol interned
-    // in a package, while callers pass a bare name ("CS") -- so an exact
-    // comparison silently missed every qualified slot. Class-allocated slots
-    // then took the instance-initarg path, the shared cell was never written,
-    // and the slot read back UNBOUND (bliss-x4p keys the value cells by bare
-    // name for exactly this reason; the lookup had not been brought along).
-    //
-    // This was masked by accident: it only bit slots whose name symbol was not
-    // already interned bare during boot, and boot.lisp happened to intern `cs`
-    // as a `&rest` parameter -- the very name the regression test uses.
-    let bare = symbol_bare_name(slot_name);
-    if let Some(slot) = class_def
-        .slots
-        .iter()
-        .find(|slot| slot.name == slot_name || symbol_bare_name(&slot.name) == bare)
-    {
-        return Some(slot.clone());
-    }
-    for super_name in &class_def.supers {
-        if let Some(slot) = lookup_slot_def(env, super_name, slot_name) {
-            return Some(slot);
-        }
-    }
-    None
+fn runtime_class_slots(env: &Env, class: EgclVal) -> Vec<SlotDef> {
+    if let Some(slots) = class_protocol::effective_slots_for_class(class) { return slots; }
+    let cpl = egcl_stdlib::compute_class_precedence_list(class).unwrap_or_else(|_| vec![class]);
+    merge_effective_slots(cpl.into_iter().filter_map(|owner| runtime_class_definition(env, owner)))
 }
 
-fn lookup_slot_by_initarg(env: &Env, class_name: &str, initarg: &str) -> Option<SlotDef> {
-    let class_def = env.classes.borrow().get(class_name).cloned()?;
-    if let Some(slot) = class_def.slots.iter().find(|slot| {
-        slot.initargs
-            .iter()
-            .any(|slot_initarg| slot_initarg == initarg)
-            || slot.name == initarg
-    }) {
-        return Some(slot.clone());
-    }
-    for super_name in &class_def.supers {
-        if let Some(slot) = lookup_slot_by_initarg(env, super_name, initarg) {
-            return Some(slot);
+fn runtime_slot_def(env: &Env, class: EgclVal, slot_name: &str) -> Option<SlotDef> {
+    runtime_class_slots(env, class).into_iter()
+        .find(|slot| symbol_bare_name_is(&slot.name, slot_name) || slot.name == slot_name)
+}
+
+fn runtime_slot_by_initarg(env: &Env, class: EgclVal, initarg: &str) -> Option<SlotDef> {
+    runtime_class_slots(env, class).into_iter().find(|slot|
+        slot.initargs.iter().any(|name| name == initarg) || slot.name == initarg)
+}
+
+fn runtime_shared_cell_owner(env: &Env, class: EgclVal, slot_name: &str) -> EgclVal {
+    let cpl = egcl_stdlib::compute_class_precedence_list(class).unwrap_or_else(|_| vec![class]);
+    for owner in cpl {
+        if let Some(definition) = runtime_class_definition(env, owner)
+            && let Some(slot) = definition.slots.iter().find(|slot| symbol_bare_name_is(&slot.name, slot_name))
+        {
+            // A custom effective-slot hook can change an instance slot into
+            // a shared slot; that new shared cell belongs to this class.
+            return if slot.allocation == SlotAllocation::Class { owner } else { class };
         }
     }
-    None
+    // Synthesized shared slots have no direct declaration to inherit from.
+    class
+}
+
+fn runtime_class_slot_owner(env: &Env, class: EgclVal, slot_name: &str) -> Option<EgclVal> {
+    (runtime_slot_def(env, class, slot_name)?.allocation == SlotAllocation::Class)
+        .then(|| runtime_shared_cell_owner(env, class, slot_name))
+}
+
+fn runtime_class_slot_cell(env: &Env, class: EgclVal, slot_name: &str) -> Option<ClassSlotCells> {
+    let owner = runtime_class_slot_owner(env, class, slot_name)?;
+    egcl_stdlib::clos::class_runtime_shared_cells(owner).or_else(||
+        runtime_class_definition(env, owner).map(|definition| definition.class_slot_values))
+}
+
+fn runtime_write_class_slot(env: &Env, class: EgclVal, slot_name: &str, value: Option<EgclVal>) {
+    let owner = runtime_class_slot_owner(env, class, slot_name).unwrap_or(class);
+    if let Some(cells) = egcl_stdlib::clos::class_runtime_shared_cells(owner).or_else(||
+        runtime_class_definition(env, owner).map(|definition| definition.class_slot_values))
+    {
+        cells.lock().unwrap().insert(symbol_bare_name(slot_name), value);
+    }
+}
+
+fn runtime_default_initargs(env: &Env, class: EgclVal) -> Vec<(String, EgclVal)> {
+    if let Some(defaults) = class_protocol::effective_defaults_for_class(class) { return defaults; }
+    let cpl = egcl_stdlib::compute_class_precedence_list(class).unwrap_or_else(|_| vec![class]);
+    let mut seen = HashSet::new();
+    let mut defaults = Vec::new();
+    for owner in cpl {
+        if let Some(definition) = runtime_class_definition(env, owner) {
+            for (name, form) in definition.default_initargs {
+                if seen.insert(name.clone()) { defaults.push((name, form)); }
+            }
+        }
+    }
+    defaults
 }
 
 fn split_initargs_for_class(
     env: &Env,
-    class_name: &str,
+    class: EgclVal,
     initargs: &[EgclVal],
-) -> (Vec<EgclVal>, Vec<(String, EgclVal)>) {
+) -> (Vec<EgclVal>, Vec<(EgclVal, EgclVal)>) {
     let mut instance_initargs = Vec::new();
     let mut class_initargs = Vec::new();
     let mut i = 0;
@@ -7595,10 +7560,10 @@ fn split_initargs_for_class(
         let value = initargs[i + 1];
         let slot_name = sym_bare_name_rc(slot_sym);
         if matches!(
-            lookup_slot_def(env, class_name, &slot_name).map(|slot| slot.allocation),
+            runtime_slot_def(env, class, &slot_name).map(|slot| slot.allocation),
             Some(SlotAllocation::Class)
         ) {
-            class_initargs.push((slot_name.to_string(), value));
+            class_initargs.push((slot_sym, value));
         } else {
             instance_initargs.push(slot_sym);
             instance_initargs.push(value);
@@ -7606,34 +7571,6 @@ fn split_initargs_for_class(
         i += 2;
     }
     (instance_initargs, class_initargs)
-}
-
-fn write_class_slot_value(env: &Env, class_name: &str, slot_name: &str, value: Option<EgclVal>) {
-    // A shared `:allocation :class` value lives in the OWNING class's cell so all
-    // subclass instances see it (bliss-x4p). Resolve the owner (idempotent when
-    // `class_name` already owns the slot); fall back to `class_name` if the slot
-    // is not found as class-allocated (e.g. transitional/bootstrap classes).
-    let bare = symbol_bare_name(slot_name);
-    let owner = class_slot_owner(env, class_name, &bare).unwrap_or_else(|| class_name.to_string());
-    if let Some(class_def) = env.classes.get_cloned(&owner) {
-        // Key by BARE slot name for consistency with reads (bliss-x4p).
-        class_def
-            .class_slot_values
-            .lock()
-            .unwrap()
-            .insert(bare, value);
-    }
-}
-
-/// The shared value cell for a `:allocation :class` slot named `slot_bare`
-/// reachable from `class_name` — the OWNING class's map, so all subclass
-/// instances read and write the one shared value (bliss-x4p).
-fn class_slot_cell(env: &Env, class_name: &str, slot_bare: &str) -> Option<ClassSlotCells> {
-    let owner = class_slot_owner(env, class_name, slot_bare)?;
-    env.classes
-        .borrow()
-        .get(&owner)
-        .map(|cd| Arc::clone(&cd.class_slot_values))
 }
 
 /// If `slot_name` names a `:allocation :class` slot reachable from `class_name`,
@@ -7644,102 +7581,6 @@ fn class_slot_cell(env: &Env, class_name: &str, slot_bare: &str) -> Option<Class
 /// which also papers over CLI/stdlib class-graph divergence for deep multiple
 /// inheritance (bliss-lb6.14: ASDF's LOAD-OP inherits DOWNWARD-OPERATION's class
 /// slot through three superclasses).
-fn class_slot_owner(env: &Env, class_name: &str, slot_name: &str) -> Option<String> {
-    if let Some(slots) = class_protocol::effective_slots(class_name) {
-        if let Some(slot) = slots.iter().find(|slot| symbol_bare_name_is(&slot.name, slot_name)) {
-            if slot.allocation == SlotAllocation::Instance { return None; }
-            if env.classes.borrow().get(class_name).is_some_and(|definition| definition.class_slot_values.lock().unwrap().contains_key(slot_name)) {
-                return Some(class_name.to_owned());
-            }
-        }
-    }
-    /// `None` = the slot was not found anywhere in the super graph, so the
-    /// caller must fall back. `Some(answer)` = found, and `answer` is
-    /// definitive: `Some(owner)` when class-allocated, `None` when it is an
-    /// ordinary instance slot.
-    ///
-    /// Distinguishing "not found" from "found, instance-allocated" is what
-    /// keeps the whole-image fallback off the hot path. Collapsing both to
-    /// `None` made EVERY ordinary slot access scan every class and every slot
-    /// in the image — measured at 8.9x slower slot reads after defining 300
-    /// unrelated classes, with a `String` allocated per slot compared.
-    fn walk<'a>(
-        classes: &'a HashMap<String, ClassDef>,
-        class_name: &'a str,
-        slot_name: &str,
-        seen: &mut HashSet<&'a str>,
-    ) -> Option<Option<&'a str>> {
-        if !seen.insert(class_name) {
-            return None;
-        }
-        let cd = classes.get(class_name)?;
-        // Slot names are stored as the full symbol name (possibly package-
-        // qualified); compare bare-to-bare since `slot_name` is already bare.
-        if let Some(slot) = cd
-            .slots
-            .iter()
-            .find(|s| symbol_bare_name_is(&s.name, slot_name))
-        {
-            // The most specific definition wins, so this answer is final even
-            // when the slot is instance-allocated.
-            return Some((slot.allocation == SlotAllocation::Class).then_some(class_name));
-        }
-        for sup in &cd.supers {
-            if let Some(found) = walk(classes, sup, slot_name, seen) {
-                return Some(found);
-            }
-        }
-        None
-    }
-    // This walk only reads Rust metadata; it never allocates on the Lisp heap
-    // or invokes user code. Keep one shared borrow and copy only the result,
-    // not every visited ClassDef (including all slot/default-initarg payloads).
-    let classes = env.classes.borrow();
-    let mut seen = HashSet::new();
-    if let Some(answer) = walk(&classes, class_name, slot_name, &mut seen) {
-        return answer.map(str::to_owned);
-    }
-    // Not reachable through the CLI super graph at all. Fall back to any class
-    // declaring it class-allocated, which papers over CLI/stdlib class-graph
-    // divergence for deep multiple inheritance (bliss-lb6.14: ASDF's LOAD-OP
-    // inherits DOWNWARD-OPERATION's class slot through three superclasses).
-    classes.iter().find_map(|(name, cd)| {
-        cd.slots
-            .iter()
-            .any(|s| {
-                symbol_bare_name_is(&s.name, slot_name) && s.allocation == SlotAllocation::Class
-            })
-            .then(|| name.clone())
-    })
-}
-
-/// The effective `:default-initargs` for `class_name`: the union over the
-/// class precedence list, keeping the first (most specific) default for each
-/// initarg name (CLHS 7.1.4). Each entry is `(bare-initarg-name, value-form)`;
-/// the form is evaluated at MAKE-INSTANCE time only when the caller did not
-/// supply that initarg.
-///
-/// The walk follows the precedence list, not a depth-first visit of the
-/// direct superclasses: with `(defclass d (b c))` where only A (above B) and
-/// C supply a default, C precedes A in D's precedence list, so C's default
-/// wins (ansi class-0305).
-fn effective_default_initargs(env: &Env, class_name: &str) -> Vec<(String, EgclVal)> {
-    if let Some(defaults) = class_protocol::effective_defaults(class_name) { return defaults; }
-    let mut out = Vec::new();
-    let mut seen_initargs = HashSet::new();
-    for name in class_precedence_names(env, class_name) {
-        let Some(cd) = env.classes.borrow().get(&name).cloned() else {
-            continue;
-        };
-        for (initarg, form) in &cd.default_initargs {
-            if seen_initargs.insert(initarg.clone()) {
-                out.push((initarg.clone(), *form));
-            }
-        }
-    }
-    out
-}
-
 fn slot_value_or_signal(
     instance: EgclVal,
     slot: EgclVal,
@@ -7854,15 +7695,15 @@ fn read_slot_value(instance: EgclVal, slot: EgclVal, env: &Env) -> Result<EgclVa
     if let Some(result) = egcl_stdlib::slot_value_if_present(instance, slot) {
         return result;
     }
-    let class_name = class_name_for_instance_class(egcl_stdlib::class_of(instance));
+    let class = egcl_stdlib::class_of(instance);
     let slot_name = sym_bare_name_rc(slot);
-    if let Some(owner) = class_slot_owner(env, &class_name, &slot_name) {
+    if let Some(cells) = runtime_class_slot_cell(env, class, &slot_name) {
         // A `:allocation :class` value is SHARED by every subclass, so it lives
         // in the OWNING class's cell — not the instance's own class. Reading it
         // from the instance class made an inherited class slot look unbound to
         // subclass instances (bliss-x4p: ASDF's selfward-operation).
-        if let Some(class_def) = env.classes.get_cloned(&owner) {
-            let values = class_def.class_slot_values.lock().unwrap();
+        {
+            let values = cells.lock().unwrap();
             // Keyed by BARE slot name so a package-qualified declaration and a
             // bare/differently-qualified read agree (bliss-x4p).
             if let Some(Some(value)) = values
@@ -7896,12 +7737,12 @@ fn slot_is_missing(env: &Env, instance: EgclVal, slot: EgclVal) -> bool {
     if !egcl_stdlib::is_instance(instance) || egcl_stdlib::slot_present_p(instance, slot) {
         return false;
     }
-    // `lookup_slot_def` walks the superclasses and covers class-allocated slots
-    // too. `class_slot_owner` is deliberately not consulted: its whole-image
+    // The runtime definition walks actual superclasses and includes shared
+    // slots. Unrelated named definitions must never supply a missing slot.
     // fallback would find a same-named class slot of an unrelated class and
     // report the slot present (ansi slot-missing.5 after slot-value.lsp).
-    let class_name = class_name_for_instance_class(egcl_stdlib::class_of(instance));
-    lookup_slot_def(env, &class_name, &sym_bare_name_rc(slot)).is_none()
+    let class = egcl_stdlib::class_of(instance);
+    runtime_slot_def(env, class, &sym_bare_name_rc(slot)).is_none()
 }
 
 /// Call the SLOT-MISSING generic function for `operation` (SLOT-VALUE, SETF,
@@ -7975,10 +7816,10 @@ fn slot_makunbound_protocol_raw(
     }
     // A `:allocation :class` slot lives in the owning class's cell, not in the
     // instance layout (ansi slot-makunbound.2).
-    let class_name = class_name_for_instance_class(egcl_stdlib::class_of(*instance));
+    let class = egcl_stdlib::class_of(*instance);
     let slot_name = sym_bare_name_rc(slot);
-    if let Some(owner) = class_slot_owner(env, &class_name, &slot_name) {
-        write_class_slot_value(env, &owner, &sym_name(slot), None);
+    if runtime_class_slot_owner(env, class, &slot_name).is_some() {
+        runtime_write_class_slot(env, class, &sym_name(slot), None);
         return Ok(*instance);
     }
     egcl_stdlib::slot_makunbound(*instance, slot)?;
@@ -8067,11 +7908,11 @@ fn slot_value_or_signal_raw(
 }
 
 fn slot_is_bound(instance: EgclVal, slot: EgclVal, env: &Env) -> Result<bool, EgclError> {
-    let class_name = class_name_for_instance_class(egcl_stdlib::class_of(instance));
+    let class = egcl_stdlib::class_of(instance);
     let slot_name = sym_bare_name_rc(slot);
-    if let Some(owner) = class_slot_owner(env, &class_name, &slot_name) {
-        if let Some(class_def) = env.classes.get_cloned(&owner) {
-            let values = class_def.class_slot_values.lock().unwrap();
+    if runtime_class_slot_owner(env, class, &slot_name).is_some() {
+        if let Some(cells) = runtime_class_slot_cell(env, class, &slot_name) {
+            let values = cells.lock().unwrap();
             return Ok(matches!(
                 values
                     .get(slot_name.as_ref())
@@ -8101,72 +7942,25 @@ fn write_slot_value(
     if egcl_stdlib::set_slot_value_if_present(instance, slot, value).is_some() {
         return Ok(());
     }
-    let class_name = class_name_for_instance_class(egcl_stdlib::class_of(instance));
+    let class = egcl_stdlib::class_of(instance);
     let slot_name = sym_bare_name_rc(slot);
-    if let Some(owner) = class_slot_owner(env, &class_name, &slot_name) {
+    if runtime_class_slot_owner(env, class, &slot_name).is_some() {
         // Write the shared value into the OWNING class's cell so all subclass
         // instances see it (bliss-x4p).
-        write_class_slot_value(env, &owner, &sym_name(slot), Some(value));
+        runtime_write_class_slot(env, class, &sym_name(slot), Some(value));
         return Ok(());
     }
     egcl_stdlib::set_slot_value(instance, slot, value)
-}
-
-/// Class precedence names for a class, most-specific-first, via preorder DFS
-/// over the `env.classes` superclass links (deduped). Used to compute effective
-/// slots so inherited slot definitions participate in instance initialization.
-fn class_precedence_names(env: &Env, class_name: &str) -> Vec<String> {
-    // The CLOS core's class precedence list decides which class's slot specifier is
-    // most specific (ansi class-0304..0311); the preorder walk below is the
-    // fallback for a class the core does not know.
-    if let Some(class_sym) = resolve_sym(class_name) {
-        if let Ok(cpl) = resolve_class_metaobject(env, class_sym)
-            .and_then(egcl_stdlib::compute_class_precedence_list)
-        {
-            let names: Vec<String> = cpl
-                .iter()
-                .map(|class| class_name_for_instance_class(*class))
-                .filter(|name| env.classes.borrow().contains_key(name))
-                .collect();
-            if !names.is_empty() {
-                return names;
-            }
-        }
-    }
-    fn visit(
-        env: &Env,
-        name: &str,
-        order: &mut Vec<String>,
-        seen: &mut std::collections::HashSet<String>,
-    ) {
-        if !seen.insert(name.to_string()) {
-            return;
-        }
-        order.push(name.to_string());
-        if let Some(class_def) = env.classes.get_cloned(name) {
-            for super_name in &class_def.supers {
-                visit(env, super_name, order, seen);
-            }
-        }
-    }
-    let mut order = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    visit(env, class_name, &mut order, &mut seen);
-    order
 }
 
 /// Effective slots for a class, most-specific-first, deduped by name. A slot's
 /// `:initform` is inherited from the most specific class that supplies one, so a
 /// subclass that redeclares a slot without an initform does not shadow an
 /// inherited default — matching ANSI effective-slot computation.
-fn effective_slots_for_class(env: &Env, class_name: &str) -> Vec<SlotDef> {
-    if let Some(slots) = class_protocol::effective_slots(class_name) { return slots; }
+fn merge_effective_slots(definitions: impl IntoIterator<Item = ClassDef>) -> Vec<SlotDef> {
     let mut result: Vec<SlotDef> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
-    for cname in class_precedence_names(env, class_name) {
-        let Some(class_def) = env.classes.borrow().get(&cname).cloned() else {
-            continue;
-        };
+    for class_def in definitions {
         for slot in &class_def.slots {
             if let Some(&i) = index.get(&slot.name) {
                 if result[i].initform.is_none() && slot.initform.is_some() {
@@ -8192,7 +7986,6 @@ fn effective_slots_for_class(env: &Env, class_name: &str) -> Vec<SlotDef> {
 
 fn apply_class_initforms(
     instance: EgclVal,
-    class_name: &str,
     env: &mut Env,
     eligible_slots: Option<&[String]>,
     explicit_slots: &[String],
@@ -8205,8 +7998,9 @@ fn apply_class_initforms(
     // Walk the full class precedence list so inherited slot initforms are
     // applied, not just those declared on the instance's own class. A
     // `:allocation :class` slot's value lives in its OWNING class's shared cell
-    // (bliss-x4p), resolved per slot via `class_slot_cell`.
-    let effective = effective_slots_for_class(env, class_name);
+    // (bliss-x4p), resolved per slot via `runtime_class_slot_cell`.
+    egcl_rt::rooted!(class = egcl_stdlib::class_of(*instance));
+    egcl_rt::rooted!(effective = runtime_class_slots(env, *class));
     let mut initfunctions: Vec<EgclVal> = effective.iter().map(|s| s.initfunction.unwrap_or(NIL)).collect();
     egcl_rt::rooted_ref!(_initfunctions_root = &mut initfunctions);
     let mut initforms: Vec<EgclVal> = effective
@@ -8228,7 +8022,7 @@ fn apply_class_initforms(
         };
         let slot_sym = resolve_sym(&slot.name).unwrap_or(NIL);
         let class_cell = matches!(slot.allocation, SlotAllocation::Class)
-            .then(|| class_slot_cell(env, class_name, &symbol_bare_name(&slot.name)))
+            .then(|| runtime_class_slot_cell(env, *class, &symbol_bare_name(&slot.name)))
             .flatten();
         let bare = symbol_bare_name(&slot.name);
         let already_bound = match slot.allocation {
@@ -8244,20 +8038,20 @@ fn apply_class_initforms(
         // Read the (GC-current) rooted copy of the initform, not the plain
         // Vec-resident one captured before earlier iterations allocated.
         let _ = initform;
-        let value = if initfunctions[slot_index].is_nil() {
+        egcl_rt::rooted!(value = if initfunctions[slot_index].is_nil() {
             eval_form(initforms[slot_index], env)?
         } else {
             apply_function(initfunctions[slot_index], &[], env)?
-        };
+        });
         match slot.allocation {
             SlotAllocation::Class => {
                 if let Some(values) = class_cell.as_ref() {
                     // Key by BARE slot name for read/write consistency (bliss-x4p).
-                    values.lock().unwrap().insert(bare, Some(value));
+                    values.lock().unwrap().insert(bare, Some(*value));
                 }
             }
             SlotAllocation::Instance => {
-                egcl_stdlib::set_slot_value(*instance, slot_sym, value)?;
+                egcl_stdlib::set_slot_value(*instance, slot_sym, *value)?;
             }
         }
     }
@@ -8276,7 +8070,7 @@ fn apply_class_initforms(
 /// and saw nothing (bliss-vhr6e). It must be rooted by the caller: the values
 /// pushed into it are heap objects that later allocations can relocate.
 fn evaluated_initargs(
-    class_name: &str,
+    class: EgclVal,
     init_args: EgclVal,
     env: &mut Env,
     mut supplied: Option<&mut Vec<EgclVal>>,
@@ -8291,7 +8085,7 @@ fn evaluated_initargs(
     while i + 1 < args_vec.len() {
         egcl_rt::rooted!(key = eval_form(args_vec[i], env)?);
         // Symbols are not relocated, so the slot-symbol list needs no root.
-        let resolved = resolve_slot_symbols(class_name, *key, env)?;
+        let resolved = resolve_slot_symbols(class, *key, env)?;
         let value = eval_form(args_vec[i + 1], env)?;
         for slot in &resolved {
             initargs.push(*slot);
@@ -8310,7 +8104,7 @@ fn evaluated_initargs(
 /// initarg's value once per slot it fills, or under the initarg's own name when
 /// it fills none. Duplicates are kept; the stdlib core lets the leftmost win.
 fn slot_keyed_initargs(
-    class_name: &str,
+    class: EgclVal,
     supplied: &[EgclVal],
     env: &Env,
 ) -> Result<Vec<EgclVal>, EgclError> {
@@ -8319,7 +8113,7 @@ fn slot_keyed_initargs(
     let mut i = 0;
     while i + 1 < supplied.len() {
         // Symbols are not relocated, so the slot-symbol list needs no root.
-        for slot in resolve_slot_symbols(class_name, supplied[i], env)? {
+        for slot in resolve_slot_symbols(class, supplied[i], env)? {
             initargs.push(slot);
             initargs.push(supplied[i + 1]);
         }
@@ -8333,14 +8127,15 @@ fn slot_keyed_initargs(
 /// counterpart of [`evaluated_initargs`]: the method binder has evaluated the
 /// values already, so evaluating them again would duplicate side effects.
 fn resolved_initarg_values(
-    class_name: &str,
+    class: EgclVal,
     initargs: &[EgclVal],
     env: &Env,
 ) -> Result<Vec<EgclVal>, EgclError> {
+    rooted_args!(initargs = initargs);
     egcl_rt::rooted!(resolved = Vec::<EgclVal>::with_capacity(initargs.len()));
     let mut i = 0;
     while i + 1 < initargs.len() {
-        for slot in resolve_slot_symbols(class_name, initargs[i], env)? {
+        for slot in resolve_slot_symbols(class, initargs[i], env)? {
             resolved.push(slot);
             resolved.push(initargs[i + 1]);
         }
@@ -8372,13 +8167,17 @@ fn reinitialize_instance_values(
     initargs: &[EgclVal],
     env: &Env,
 ) -> Result<EgclVal, EgclError> {
-    let class_name = class_name_for_instance_class(egcl_stdlib::class_of(instance));
-    let (instance_initargs, class_initargs) = split_initargs_for_class(env, &class_name, initargs);
-    egcl_stdlib::reinitialize_instance(instance, &instance_initargs)?;
-    for (slot_name, value) in class_initargs {
-        write_class_slot_value(env, &class_name, &slot_name, Some(value));
+    egcl_rt::rooted!(instance = instance);
+    rooted_args!(initargs = initargs);
+    let class = egcl_stdlib::class_of(*instance);
+    let (instance_initargs, class_initargs) = split_initargs_for_class(env, class, initargs);
+    egcl_rt::rooted!(instance_initargs = instance_initargs);
+    egcl_rt::rooted!(class_initargs = class_initargs);
+    egcl_stdlib::reinitialize_instance(*instance, &instance_initargs)?;
+    for (slot_name, value) in class_initargs.iter().copied() {
+        runtime_write_class_slot(env, class, &sym_name(slot_name), Some(value));
     }
-    Ok(instance)
+    Ok(*instance)
 }
 
 /// Specificity distance for a method specialized on a built-in CL type name when
@@ -10633,6 +10432,7 @@ fn visit_class_def_roots(
     state: &mut EnvRootVisitState,
     visit: &mut dyn FnMut(*mut EgclVal),
 ) {
+    visit(&mut class.owner);
     for slot in &mut class.slots {
         egcl_rt::gc::TraceHostRoots::trace_host_roots(slot, visit);
     }
@@ -22624,12 +22424,10 @@ fn type_of_value(v: EgclVal) -> Result<EgclVal, EgclError> {
     if egcl_stdlib::is_instance(v) {
         let class = egcl_stdlib::class_of(v);
         let name = egcl_stdlib::class_name(class);
-        if !name.is_nil() {
-            if egcl_stdlib::find_class(name) == Some(class) {
-                return Ok(name);
-            }
-            return Ok(class);
+        if !name.is_nil() && egcl_stdlib::find_class(name) == Some(class) {
+            return Ok(name);
         }
+        return Ok(class);
     }
     if egcl_stdlib::sequences::is_nil_array(v) {
         let complex = egcl_stdlib::sequences::array_adjustable(v) || egcl_stdlib::is_complex_vector(v);
@@ -24960,11 +24758,6 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 let (af, rest) = cp(cdr);
                 let class_input = eval_form(af, env)?;
                 let class = resolve_class_metaobject(env, class_input)?;
-                // The class's recorded name, not `sym_name` of the class value.
-                // Identical today (a DEFCLASS class is its name symbol) and the
-                // difference between working and silently answering an empty
-                // slot list once it is not (bliss-rj5o).
-                let class_name = class_name_for_instance_class(class);
                 // Optional second argument: non-NIL asks for this class's DIRECT
                 // slots only. AMOP draws a real distinction here — CLASS-SLOTS
                 // yields effective slot definitions, CLASS-DIRECT-SLOTS yields
@@ -24978,15 +24771,9 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     false
                 };
                 let mut slots = if direct_only {
-                    env.classes
-                        .borrow()
-                        .get(&class_name)
-                        .map(|c| c.slots.clone())
-                        .unwrap_or_default()
+                    runtime_class_definition(env, class).map(|definition| definition.slots).unwrap_or_default()
                 } else {
-                    // effective_slots_for_class already walks the class precedence
-                    // list and shadows by name, so this does not reimplement it.
-                    effective_slots_for_class(env, &class_name)
+                    runtime_class_slots(env, class)
                 };
                 // SlotDef::initform is a EgclVal and every list built below
                 // allocates, so root the whole Vec: SlotDef's TraceHostRoots impl
@@ -28251,6 +28038,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             "SIGNAL" => return eval_builtin_arguments(&name, cdr, env),
             "WARN" => return eval_builtin_arguments(&name, cdr, env),
             "MAKE-CONDITION" => return eval_builtin_arguments(&name, cdr, env),
+            "EGCL-INTERNAL:%SET-CLASS-NAME" | "EGCL-INTERNAL::%SET-CLASS-NAME" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL-INTERNAL:%RAW-SLOT-VALUE"
             | "EGCL-INTERNAL:%STANDARD-SLOT-VALUE-USING-CLASS"
             | "EGCL-INTERNAL:%STANDARD-SET-SLOT-VALUE-USING-CLASS"
@@ -28365,9 +28153,9 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 let (slot_form, _) = cp(rest);
                 let instance = eval_form(instance_form, env)?;
                 let slot = eval_form(slot_form, env)?;
-                let class_name = class_name_for_instance_class(egcl_stdlib::class_of(instance));
+                let class = egcl_stdlib::class_of(instance);
                 let slot_name = sym_bare_name_rc(slot);
-                let exists = lookup_slot_def(env, &class_name, &slot_name).is_some();
+                let exists = runtime_slot_def(env, class, &slot_name).is_some();
                 return Ok(if exists { T } else { NIL });
             }
             "NEXT-METHOD-P" => {
@@ -28380,21 +28168,23 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             }
             "INITIALIZE-INSTANCE" => {
                 let (instance_form, init_args) = cp(cdr);
-                let instance = eval_form(instance_form, env)?;
-                let class_name = class_name_for_instance_class(egcl_stdlib::class_of(instance));
-                let initargs = evaluated_initargs(&class_name, init_args, env, None)?;
+                egcl_rt::rooted!(instance = eval_form(instance_form, env)?);
+                let class = egcl_stdlib::class_of(*instance);
+                let initargs = evaluated_initargs(class, init_args, env, None)?;
                 let explicit_slots: Vec<String> = initargs
                     .chunks_exact(2)
                     .map(|pair| sym_bare_name_rc(pair[0]).to_string())
                     .collect();
                 let (instance_initargs, class_initargs) =
-                    split_initargs_for_class(env, &class_name, &initargs);
-                egcl_stdlib::initialize_instance(instance, &instance_initargs)?;
-                for (slot_name, value) in class_initargs {
-                    write_class_slot_value(env, &class_name, &slot_name, Some(value));
+                    split_initargs_for_class(env, class, &initargs);
+                egcl_rt::rooted!(instance_initargs = instance_initargs);
+                egcl_rt::rooted!(class_initargs = class_initargs);
+                egcl_stdlib::initialize_instance(*instance, &instance_initargs)?;
+                for (slot_name, value) in class_initargs.iter().copied() {
+                    runtime_write_class_slot(env, class, &sym_name(slot_name), Some(value));
                 }
-                apply_class_initforms(instance, &class_name, env, None, &explicit_slots)?;
-                return Ok(instance);
+                apply_class_initforms(*instance, env, None, &explicit_slots)?;
+                return Ok(*instance);
             }
             // REINITIALIZE-INSTANCE is the generic function boot.lisp defines, so
             // user :before/:after/:around methods take part (ansi
@@ -39916,6 +39706,7 @@ fn eval_defclass_with_defaults(cdr: EgclVal, env: &mut Env, mut provided_default
     env.classes.borrow_mut().insert(
         name.clone(),
         ClassDef {
+            owner: NIL,
             name: name.clone(),
             supers,
             slots: slots_vec,
@@ -39985,12 +39776,14 @@ fn eval_defclass_with_defaults(cdr: EgclVal, env: &mut Env, mut provided_default
         // `(find-class 'x)` before the definition its EQ identity
         // (bliss-qbz4o). `set_class_metaclass` below reports whether the layout
         // changed, which is what decides the initforms.
-        Some(existing) => (existing, false),
-        None => (
+        Some(existing) if egcl_stdlib::class_name(existing) == name_form
+            || egcl_stdlib::clos::is_forward_referenced(existing) => (existing, false),
+        _ => (
             egcl_stdlib::clos::new_class_metaobject(metaclass_for_layout)?,
             true,
         ),
     };
+    egcl_rt::rooted!(previous_runtime_definition = egcl_stdlib::clos::class_runtime_definition(class));
     let protocol_ready = class_protocol::supports_protocol(class)
         && reader::find_symbol_index("EGCL-MOP::%FINALIZE-DEFINED-CLASS")
             .is_some_and(|index| fn_bound(env, &sym_name(EgclVal::from_symbol_index(index))));
@@ -39998,6 +39791,28 @@ fn eval_defclass_with_defaults(cdr: EgclVal, env: &mut Env, mut provided_default
         egcl_stdlib::clos::stage_class_with_shared_slots(name_form, class, &direct_supers, &slot_names, &shared_slot_names)?;
     } else {
         egcl_stdlib::clos::define_class_with_shared_slots(name_form, class, &direct_supers, &slot_names, &shared_slot_names)?;
+    }
+
+    // Adopt a class-owned copy before any user finalization/metaclass hook.
+    // Shared slot cells remain the same Arc as the named source view.
+    egcl_rt::rooted!(runtime_definition = env.classes.borrow().get(&name).cloned().unwrap());
+    runtime_definition.owner = class;
+    if let Some(previous) = previous_runtime_definition.as_ref() {
+        runtime_definition.class_slot_values = Arc::clone(&previous.class_slot_values);
+        let mut cells = runtime_definition.class_slot_values.lock().unwrap();
+        for slot in &runtime_definition.slots {
+            if slot.allocation == SlotAllocation::Class {
+                cells.entry(symbol_bare_name(&slot.name)).or_insert(None);
+            }
+        }
+    }
+    egcl_stdlib::clos::set_class_runtime_definition(class, runtime_definition.clone())?;
+    {
+        let mut views = env.classes.borrow_mut();
+        for view in views.values_mut().filter(|view| view.owner == class) {
+            *view = runtime_definition.clone();
+        }
+        views.insert(name.clone(), runtime_definition.clone());
     }
 
     // Record the named metaclass now that the class exists, resolving the name
@@ -40029,8 +39844,7 @@ fn eval_defclass_with_defaults(cdr: EgclVal, env: &mut Env, mut provided_default
         // after it, has cells that did not exist a moment ago and they are
         // UNBOUND (bliss-fmhj5, bliss-qbz4o).
         if class_is_fresh || layout_changed {
-            let metaclass_name = class_name_for_instance_class(metaclass);
-            apply_class_initforms(class, &metaclass_name, env, None, &[])?;
+            apply_class_initforms(class, env, None, &[])?;
         }
     }
 
@@ -42428,7 +42242,6 @@ fn make_instance_general(
     env: &mut Env,
 ) -> Result<(EgclVal, bool), EgclError> {
     egcl_rt::rooted_ref!(_class_root = &mut class);
-    let class_name = class_name_for_instance_class(class);
     if supplied.len() % 2 != 0 {
         return Err(EgclError::ProgramError(
             "MAKE-INSTANCE: initialization arguments must come in keyword/value pairs".into(),
@@ -42437,7 +42250,7 @@ fn make_instance_general(
     // The initargs as the caller wrote them, for the initialization protocol
     // below; `initargs` itself is keyed by slot name, for filling slots.
     egcl_rt::rooted!(supplied_initargs = supplied.to_vec());
-    egcl_rt::rooted!(initargs = slot_keyed_initargs(&class_name, &supplied_initargs, env)?);
+    egcl_rt::rooted!(initargs = slot_keyed_initargs(class, &supplied_initargs, env)?);
 
     // Apply :default-initargs (CLHS 7.1.4): for each effective default whose
     // initarg the caller did NOT supply, evaluate its value form and append it
@@ -42445,7 +42258,7 @@ fn make_instance_general(
     // covers both instance- and class-allocated slots (e.g. ASDF's operation
     // classes default a :allocation :class selfward-operation slot, bliss-x4p).
     let (default_names, default_forms): (Vec<_>, Vec<_>) =
-        effective_default_initargs(env, &class_name).into_iter().unzip();
+        runtime_default_initargs(env, class).into_iter().unzip();
     egcl_rt::rooted!(default_forms = default_forms);
     if !default_names.is_empty() {
         // Each default's value form can trigger a relocating minor GC, so every
@@ -42473,7 +42286,7 @@ fn make_instance_general(
             // resolve_slot_symbol interns (allocates); root the slot symbol
             // before the value form's eval_form can GC.
             // Symbols are not relocated, so the slot-symbol list needs no root.
-            let slots = resolve_slot_symbols(&class_name, *initarg_kw_root, env)?;
+            let slots = resolve_slot_symbols(class, *initarg_kw_root, env)?;
             let value = eval_form(*form, env)?;
             // CLHS 7.1.4: the leftmost initarg that fills a slot wins, so a
             // default whose slot the caller, or an earlier default naming the
@@ -42499,14 +42312,13 @@ fn make_instance_general(
     // :default-initargs say :allow-other-keys t accepts anything (ansi class-24.2).
     check_initargs_valid(
         env,
-        &class_name,
+        class,
         &supplied_initargs,
         &["INITIALIZE-INSTANCE", "SHARED-INITIALIZE", "ALLOCATE-INSTANCE"],
     )?;
 
     make_instance_allocate_and_initialize(
         class,
-        &class_name,
         &initargs,
         &supplied_initargs,
         env,
@@ -42532,7 +42344,6 @@ fn make_instance_general(
 /// methods took part: the case a MAKE-INSTANCE plan reproduces.
 fn make_instance_allocate_and_initialize(
     mut class: EgclVal,
-    class_name: &str,
     initargs: &[EgclVal],
     protocol_initargs: &[EgclVal],
     env: &mut Env,
@@ -42582,13 +42393,14 @@ fn make_instance_allocate_and_initialize(
         .chunks_exact(2)
         .map(|pair| sym_bare_name_rc(pair[0]).to_string())
         .collect();
-    let (instance_initargs, class_initargs) = split_initargs_for_class(env, class_name, initargs);
+    let (instance_initargs, class_initargs) = split_initargs_for_class(env, class, initargs);
     egcl_rt::rooted!(instance_initargs = instance_initargs);
+    egcl_rt::rooted!(class_initargs = class_initargs);
     egcl_stdlib::initialize_instance(instance, &instance_initargs)?;
-    for (slot_name, value) in class_initargs {
-        write_class_slot_value(env, class_name, &slot_name, Some(value));
+    for (slot_name, value) in class_initargs.iter().copied() {
+        runtime_write_class_slot(env, class, &sym_name(slot_name), Some(value));
     }
-    apply_class_initforms(instance, class_name, env, None, &explicit_slots)?;
+    apply_class_initforms(instance, env, None, &explicit_slots)?;
     // Do not hold an iterator borrow while Lisp invokes a moving collection.
     #[allow(clippy::needless_range_loop)]
     for index in 0..shared_after.len() {
@@ -42667,7 +42479,6 @@ struct MakeInstanceDefault {
 
 struct MakeInstancePlan {
     generation: u64,
-    class_name: String,
     /// The valid initarg names; `None` when every name is valid.
     valid: Option<Vec<String>>,
     /// Supplied initargs met so far, filled on first use.
@@ -42846,8 +42657,8 @@ fn initarg_name_valid(valid: &Option<Vec<String>>, name: &str) -> bool {
 
 /// The slot symbols the initarg named `name` fills, as `resolve_slot_symbols`
 /// finds them, or `None` when it fills no slot.
-fn initarg_slot_symbols(env: &Env, class_name: &str, name: &str) -> Option<Box<[u32]>> {
-    let names = slots_for_initarg(env, class_name, name);
+fn initarg_slot_symbols(env: &Env, class: EgclVal, name: &str) -> Option<Box<[u32]>> {
+    let names = runtime_slots_for_initarg(env, class, name);
     if names.is_empty() {
         return None;
     }
@@ -42864,11 +42675,10 @@ fn make_instance_plan_parts(
     generation: u64,
     env: &mut Env,
 ) -> Option<MakeInstancePlan> {
-    let class_name = class_name_for_instance_class(class);
-    if !env.classes.borrow().contains_key(&class_name) {
+    if runtime_class_definition(env, class).is_none() {
         return None;
     }
-    let mut effective = effective_slots_for_class(env, &class_name);
+    let mut effective = runtime_class_slots(env, class);
     egcl_rt::rooted_ref!(_effective_root = &mut effective);
     if effective
         .iter()
@@ -42876,9 +42686,9 @@ fn make_instance_plan_parts(
     {
         return None;
     }
-    let valid = valid_initarg_names(env, &class_name, &MAKE_INSTANCE_INIT_GENERICS);
+    let valid = valid_initarg_names(env, class, &MAKE_INSTANCE_INIT_GENERICS);
     let (default_names, default_forms): (Vec<String>, Vec<EgclVal>) =
-        effective_default_initargs(env, &class_name).into_iter().unzip();
+        runtime_default_initargs(env, class).into_iter().unzip();
     egcl_rt::rooted!(default_forms = default_forms);
     if default_names.len() > 64 {
         return None;
@@ -42889,7 +42699,7 @@ fn make_instance_plan_parts(
             return None;
         }
         let keyword = resolve_sym(&format!(":{name}"))?.symbol_index()?;
-        let slots = initarg_slot_symbols(env, &class_name, name)?;
+        let slots = initarg_slot_symbols(env, class, name)?;
         defaults.push(MakeInstanceDefault { keyword, slots });
     }
     let mut initforms = Vec::new();
@@ -42919,7 +42729,6 @@ fn make_instance_plan_parts(
         .unzip();
     Some(MakeInstancePlan {
         generation,
-        class_name,
         valid,
         keys: Mutex::new(Vec::new()),
         defaults,
@@ -42934,6 +42743,7 @@ fn make_instance_plan_parts(
 /// Work out what initarg `key` (symbol `symbol`) does under `plan`, and
 /// remember it. `None` when the plan does not cover it. Can allocate (interning).
 fn learn_make_instance_key(
+    class: EgclVal,
     plan: &MakeInstancePlan,
     key: EgclVal,
     symbol: u32,
@@ -42943,7 +42753,7 @@ fn learn_make_instance_key(
     if !initarg_name_valid(&plan.valid, &name) {
         return None;
     }
-    let slots = initarg_slot_symbols(env, &plan.class_name, &name)?;
+    let slots = initarg_slot_symbols(env, class, &name)?;
     let mut covers = 0u64;
     for (index, default) in plan.defaults.iter().enumerate() {
         let default_name = sym_bare_name_rc(EgclVal::from_symbol_index(default.keyword));
@@ -43000,7 +42810,7 @@ fn make_instance_planned(
             }
         };
         if !known {
-            let (slots, covers) = learn_make_instance_key(plan, supplied[i], symbol, env)?;
+            let (slots, covers) = learn_make_instance_key(class, plan, supplied[i], symbol, env)?;
             for &slot in slots.iter() {
                 initargs.push(EgclVal::from_symbol_index(slot));
                 initargs.push(supplied[i + 1]);
@@ -43047,9 +42857,9 @@ fn make_instance_planned_run(
     // allocate and initialize the instance.
     if !make_instance_plan_current(plan) {
         egcl_rt::rooted!(all = [supplied, &defaulted[..]].concat());
-        check_initargs_valid(env, &plan.class_name, &all, &MAKE_INSTANCE_INIT_GENERICS)?;
+        check_initargs_valid(env, class, &all, &MAKE_INSTANCE_INIT_GENERICS)?;
         let (instance, _) =
-            make_instance_allocate_and_initialize(class, &plan.class_name, initargs, &all, env)?;
+            make_instance_allocate_and_initialize(class, initargs, &all, env)?;
         return Ok(instance);
     }
     // `egcl_stdlib::make_instance` without its built-in-class check, which
@@ -43076,7 +42886,7 @@ fn make_instance_planned_run(
             .chunks_exact(2)
             .map(|pair| sym_bare_name_rc(pair[0]).to_string())
             .collect();
-        apply_class_initforms(instance, &plan.class_name, env, None, &explicit_slots)?;
+        apply_class_initforms(instance, env, None, &explicit_slots)?;
     }
     // SHARED-INITIALIZE's :after methods run inside INITIALIZE-INSTANCE's
     // primary, so before INITIALIZE-INSTANCE's own.
@@ -44433,6 +44243,7 @@ fn is_builtin_function(name: &str) -> bool {
             | "EGCL-INTERNAL::%NAME-CHAR"
             | "EGCL-INTERNAL:%MAKE-MD-ARRAY-WITH-STORAGE"
             | "EGCL-INTERNAL::%MAKE-MD-ARRAY-WITH-STORAGE"
+            | "EGCL-INTERNAL:%SET-CLASS-NAME" | "EGCL-INTERNAL::%SET-CLASS-NAME"
             | "EGCL-INTERNAL:%STANDARD-SHARED-INITIALIZE"
             | "EGCL-INTERNAL::%STANDARD-SHARED-INITIALIZE"
             | "EGCL-INTERNAL:%CLASS-CHANGE-ADDED-SLOTS"
@@ -48665,64 +48476,34 @@ fn heap_test_lock() -> &'static std::sync::Mutex<()> {
 mod class_slot_owner_tests {
     use super::*;
 
-    fn class(supers: &[&str], allocation: Option<SlotAllocation>) -> ClassDef {
-        ClassDef {
-            name: String::new(),
-            supers: supers.iter().map(|s| s.to_string()).collect(),
-            slots: allocation
-                .map(|allocation| SlotDef {
-                    name: "PKG:SHARED".into(),
-                    initargs: vec![],
-                    accessor: None,
-                    readers: vec![],
-                    writers: vec![],
-                    initform: None,
-                    source_initform: None,
-                    initfunction: None,
-                    mop_options: Vec::new(),
-                    allocation,
-                })
-                .into_iter()
-                .collect(),
-            class_slot_values: Arc::new(Mutex::new(HashMap::new())),
-            default_initargs: vec![],
-            direct_default_metadata: NIL,
-        }
-    }
-
     #[test]
-    fn cycles_fallback_and_instance_shadowing_remain_distinct() {
+    fn actual_class_chain_preserves_shared_owners_and_instance_shadowing() {
         let _guard = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-        let env = Env::new(false);
-        env.classes.borrow_mut().extend([
-            ("A".into(), class(&["B"], None)),
-            ("B".into(), class(&["A"], None)),
-            ("OWNER".into(), class(&[], Some(SlotAllocation::Class))),
-        ]);
-        // A cycle/missing CLI edge still reaches the whole-image fallback.
-        assert_eq!(
-            class_slot_owner(&env, "A", "SHARED").as_deref(),
-            Some("OWNER")
-        );
-        assert_eq!(class_slot_owner(&env, "A", "MISSING"), None);
-        // A found instance slot is definitive: no fallback to OWNER.
-        env.classes.borrow_mut().insert(
-            "B".into(),
-            class(&["A", "OWNER"], Some(SlotAllocation::Instance)),
-        );
-        // Any class (re)definition invalidates the accessor slot cache (bliss-1qjmm).
-        bump_accessor_slot_gen();
-        assert_eq!(class_slot_owner(&env, "A", "SHARED"), None);
-        // Borrowed traversal must observe new metadata, not a cached answer.
-        env.classes.borrow_mut().insert(
-            "B".into(),
-            class(&["A", "OWNER"], Some(SlotAllocation::Class)),
-        );
-        // Any class (re)definition invalidates the accessor slot cache (bliss-1qjmm).
-        bump_accessor_slot_gen();
-        assert_eq!(class_slot_owner(&env, "A", "SHARED").as_deref(), Some("B"));
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env = &mut env);
+        read_eval_all_env(
+            "(defclass shared-owner-parent () ((shared :allocation :class)))
+             (defclass shared-owner-child (shared-owner-parent) ())
+             (defclass shared-owner-shadow (shared-owner-parent) ((shared :allocation :instance)))
+             (defclass shared-owner-unrelated () ((shared :allocation :class)))
+             (defclass shared-owner-missing () ())", &mut env,
+        ).unwrap();
+        let class = |name| egcl_stdlib::find_class(resolve_sym(name).unwrap()).unwrap();
+        let parent = class("SHARED-OWNER-PARENT");
+        let child = class("SHARED-OWNER-CHILD");
+        let shadow = class("SHARED-OWNER-SHADOW");
+        let missing = class("SHARED-OWNER-MISSING");
+        assert_eq!(runtime_class_slot_owner(&env, child, "SHARED"), Some(parent));
+        assert_eq!(runtime_class_slot_owner(&env, shadow, "SHARED"), None);
+        assert_eq!(runtime_class_slot_owner(&env, missing, "SHARED"), None,
+            "an unrelated named class must never supply a missing shared slot");
+        // A stale/cyclic source-name view cannot change the checked actual CPL.
+        env.classes.borrow_mut().get_mut("SHARED-OWNER-PARENT").unwrap().supers =
+            vec!["SHARED-OWNER-CHILD".into()];
+        assert_eq!(runtime_class_slot_owner(&env, child, "SHARED"), Some(parent));
     }
 }
+
 
 #[cfg(test)]
 mod host_registry_hook_tests {
@@ -49179,6 +48960,7 @@ mod env_gc_root_tests {
         env.classes.borrow_mut().insert(
             "ROOT-CLASS".into(),
             ClassDef {
+            owner: NIL,
                 name: "ROOT-CLASS".into(),
                 supers: Vec::new(),
                 slots: vec![SlotDef {
@@ -51363,11 +51145,10 @@ mod evaluator_error_boundary_rooting_tests {
                 .0
         );
         egcl_rt::rooted!(second = reader::read_from_string("(list 42)").unwrap().0);
-        env.classes
-            .borrow_mut()
-            .get_mut(&class_name)
-            .unwrap()
-            .default_initargs = vec![("A".into(), *first), ("B".into(), *second)];
+        let class = egcl_stdlib::find_class(resolve_sym(&class_name).unwrap()).unwrap();
+        egcl_rt::rooted!(definition = egcl_stdlib::clos::class_runtime_definition(class).unwrap());
+        definition.default_initargs = vec![("A".into(), *first), ("B".into(), *second)];
+        egcl_stdlib::clos::set_class_runtime_definition(class, definition.clone()).unwrap();
         let before = second.to_raw();
         egcl_rt::rooted!(instance = eval_form(*call, &mut env).unwrap());
         assert_ne!(
@@ -51410,3 +51191,6 @@ mod generic_wrapper_identity_tests;
 
 #[cfg(test)]
 mod method_class_identity_tests;
+
+#[cfg(test)]
+mod class_definition_owner_tests;
