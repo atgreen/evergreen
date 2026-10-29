@@ -209,6 +209,8 @@ pub mod type_id {
     /// ours; the reference is released when the collector finalizes the proxy,
     /// by queueing it rather than by calling CPython (see `python::PyRef`).
     pub const PYTHON_OBJECT: u8 = 0x1E;
+    /// Opaque PRNG seed and initialization flag: two untraced raw words.
+    pub const RANDOM_STATE: u8 = 0x1F;
 }
 
 /// Persistent flags in word 1 of a MUTEX body.

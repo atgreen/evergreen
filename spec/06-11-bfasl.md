@@ -128,12 +128,22 @@ abstract-interpretation rules for stack maps, type slots, and unwind metadata;
 a loader MAY reject an older verifier version if the unit lacks metadata needed
 by the current runtime's GC or deoptimizer.
 
-The current bytecode version is **2.6** (`0x0206`). Version 2.1 added bounded
+The current bytecode version is **3.0** (`0x0300`). Version 2.1 added bounded
 fixnum parameter metadata; version 2.2 added `CHECK_RESULT` (`0x45`), described
 below. Version 2.3 added package, saved-image, and hash-table constants; version 2.4 added packed
 U8 constants and their multidimensional backing references. Version 2.5 adds
 mutable array storage graphs, described below. Version 2.6 adds deferred
 `MAKE-LOAD-FORM` instance constants and ordered creation/initialization actions.
+Version 3.0 adds opaque random-state constants (tag 31: a raw 64-bit seed
+with no lazy initialization flag). States are seeded at creation, so even an
+undrawn state preserves its future sequence. The payload has no Lisp references.
+Repeated references retain state identity; independent states are not coalesced.
+Version-2 bodies can construct legacy cons-shaped states, which cannot be
+reinterpreted without conflating ordinary user lists with random states. All
+version-2 units are rejected before constants, definitions, or load actions are
+installed. Recompile their original source; changing the stored version does
+not migrate old code. Core image version 13 likewise requires rebuilding older
+images rather than inferring random-state identities from cons contents.
 New opcodes and constant tags
 require their introducing minor version.
 Version-1 writers could
@@ -191,6 +201,7 @@ payload : tag-specific bytes
 | 18 | `LoadTimeCell` | `u32 producing_action_index` |
 | 19 | `MdArray` | `u32 rank`, `u64 dimensions[rank]`, `u32 element_count`, `u32 row_major_element_refs[element_count]` |
 | 30 | `LoadFormObject` (version 2.6) | empty; identity reconstructed by creation/initialization load actions |
+| 31 | `RandomState` (version 3.0) | `u64 seed`; eagerly seeded, raw reference-free payload |
 
 `Symbol.symbol_kind` is `0 = interned`, `1 = uninterned`, `2 = gensym`,
 `3 = external`.  Interned and external symbols are reconstructed through their

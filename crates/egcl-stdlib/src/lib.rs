@@ -34,6 +34,7 @@ pub mod packages;
 pub mod characters;
 pub mod clos;
 pub mod numbers;
+pub mod random_state;
 
 // ── Condition system ──────────────────────────────────────────────
 pub mod conditions;

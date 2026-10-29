@@ -12589,6 +12589,10 @@ fn print_val_body(mut val: EgclVal, out: &mut String) {
         out.push_str(&text);
         return;
     }
+    if is_random_state_value(val) {
+        out.push_str(&egcl_stdlib::format::random_state_representation(val, PRINT_ESCAPE.with(|c| c.get())));
+        return;
+    }
     if val.is_nil() {
         out.push_str(&egcl_stdlib::format::print_symbol_name("NIL", PRINT_ESCAPE.with(|c| c.get())));
     } else if val == T {
@@ -17872,16 +17876,9 @@ fn resolve_against_dpd(v: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> 
     Ok(pn)
 }
 
-/// If `object` is a class metaobject, return its class value. egcl represents a
-/// user/struct class as its name symbol, so `(find-class 'foo)` yields the symbol
-/// FOO; built-in classes are handle values. Returns None for anything not
-/// registered as a class.
-/// A random state is the cons `(:RANDOM-STATE . seed)`.
+/// The opaque standard random-state representation, never a cons disguise.
 fn is_random_state_value(v: EgclVal) -> bool {
-    v.is_cons() && {
-        let (car, _) = cp(v);
-        is_keyword_arg(car) && sym_bare_name_rc(car).as_ref() == "RANDOM-STATE"
-    }
+    egcl_stdlib::random_state::random_state_p(v)
 }
 
 /// CLASS-OF as the user sees it: the CLOS core's answer, refined for values it
@@ -19116,12 +19113,40 @@ fn integer_range_within_bignum(t1: EgclVal) -> Option<(bool, bool)> {
     Some((below || above, true))
 }
 
+/// A conjunction containing two different standard disjoint system types is
+/// empty (CLHS 4.2.2). Match canonical symbols, never unrelated same-name types.
+fn builtin_disjoint_conjunction(spec: EgclVal) -> bool {
+    if !spec.is_cons() { return false; }
+    let (head, mut tail) = cp(spec);
+    if reader::find_symbol_index("AND").map(EgclVal::from_symbol_index) != Some(head) {
+        return false;
+    }
+    let mut first = None;
+    while tail.is_cons() {
+        let (part, rest) = cp(tail);
+        tail = rest;
+        if !part.is_symbol() { continue; }
+        let name = sym_bare_name_rc(part);
+        if !matches!(name.as_ref(), "ARRAY" | "CHARACTER" | "CONS" | "FUNCTION"
+            | "HASH-TABLE" | "NUMBER" | "PACKAGE" | "PATHNAME" | "RANDOM-STATE"
+            | "READTABLE" | "RESTART" | "STREAM" | "SYMBOL")
+            || reader::find_symbol_index(&name).map(EgclVal::from_symbol_index) != Some(part)
+        { continue; }
+        if first.is_some_and(|previous| previous != part) { return true; }
+        first = Some(part);
+    }
+    false
+}
+
 fn subtypep_relation(mut t1: EgclVal, mut t2: EgclVal) -> (bool, bool) {
     // Either integer canonicalization can allocate before the recursive call.
     // Root both callee-local operands before the first such allocation; roots
     // in the caller do not rewrite these copies.
     egcl_rt::rooted_ref!(_t1_root = &mut t1);
     egcl_rt::rooted_ref!(_t2_root = &mut t2);
+    if builtin_disjoint_conjunction(t1) {
+        return (true, true);
+    }
     // BASE-CHAR (code points below 256) is a proper subtype of CHARACTER and
     // EXTENDED-CHAR is the rest of it; the symbol hierarchy table carries both,
     // so neither needs a special case here. (EXTENDED-CHAR used to be the empty
@@ -19597,31 +19622,7 @@ fn typep_matches(
             "BIGNUM" => egcl_rt::types::integerp(object) && !object.is_fixnum(),
             "RATIO" => egcl_rt::types::rationalp(object) && !egcl_rt::types::integerp(object),
             "COMPLEX" => egcl_rt::types::complexp(object),
-            // A random state is egcl's placeholder `(:RANDOM-STATE)` list (see
-            // lib/boot.lisp, which documents the single-global-PRNG choice).
-            // RANDOM-STATE-P recognised it but TYPEP had no arm at all, so
-            // `(typep *random-state* 'random-state)` was NIL for egcl's OWN
-            // random state -- a type predicate disagreeing with the type it
-            // tests. ansi MAKE-RANDOM-STATE.ERROR.4 sees it as the mismatch it
-            // is: its TYPEF says the value is not a RANDOM-STATE and so expects
-            // MAKE-RANDOM-STATE to reject it, while MAKE-RANDOM-STATE accepts
-            // it via RANDOM-STATE-P.
-            //
-            // This makes the two agree. That the representation is a plain list
-            // -- so any `(:RANDOM-STATE)` list IS one -- is a separate design
-            // question (bliss-0ju0).
-            // GC: compare the car by NAME rather than calling resolve_sym.
-            // resolve_sym INTERNS, which can allocate and relocate `object`,
-            // and holding `object` across it is exactly the unrooted-across-
-            // allocation smell scripts/gc-root-lint.sh flags (it flagged this).
-            // sym_name_rc/symbol_bare_name touch no Lisp heap, so nothing can
-            // move here.
-            "RANDOM-STATE" => {
-                object.is_cons() && {
-                    let car = cp(object).0;
-                    is_keyword_arg(car) && sym_bare_name_rc(car).as_ref() == "RANDOM-STATE"
-                }
-            }
+            "RANDOM-STATE" => is_random_state_value(object),
             // UNSIGNED-BYTE with no size == (integer 0 *); SIGNED-BYTE with no
             // size == any integer; BIT == (integer 0 1). UNSIGNED-BYTE must accept
             // a POSITIVE BIGNUM, not just a non-negative fixnum — else e.g.
@@ -22711,8 +22712,7 @@ fn type_of_value(v: EgclVal) -> Result<EgclVal, EgclError> {
         // TYPE-OF answers that (ansi type-of.1); SBCL does the same.
         "COMPILED-FUNCTION"
     } else if is_random_state_value(v) {
-        // Represented as a cons, but its type is RANDOM-STATE, as CLASS-OF
-        // already answers; this must precede the `is_cons` check.
+        // Opaque random states retain their public standard type.
         "RANDOM-STATE"
     } else if v.is_cons() {
         "CONS"
@@ -22823,10 +22823,17 @@ fn random_values(args: &[EgclVal], env: &mut Env) -> Result<EgclVal, EgclError> 
     egcl_rt::rooted!(
         state = match args.get(1) {
             Some(&state) => state,
-            None => env.lookup_var("*RANDOM-STATE*").unwrap_or(NIL),
+            None => dynamic_standard_variable(env, "*RANDOM-STATE*").unwrap_or(NIL),
         }
     );
-    let draw = || random_state_draw(*state);
+    if !is_random_state_value(*state) {
+        return Err(EgclError::TypeError {
+            datum: *state,
+            expected: "RANDOM-STATE".into(),
+        });
+    }
+    // The rooted state cannot change its type, and drawing does not allocate.
+    let draw = || egcl_stdlib::random_state::draw(*state).expect("validated random state");
     let limit = *limit_r;
     if limit.is_fixnum() {
         let bound = limit.as_fixnum();
@@ -23520,6 +23527,9 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                         }
                     }
                 }
+            }
+            "EGCL::%MAKE-RANDOM-STATE" | "EGCL::%RANDOM-STATE-P" | "EGCL::%RANDOM-STATE-FROM-SEED" => {
+                return eval_builtin_arguments(&name, cdr, env);
             }
             "PRINT" => return eval_builtin_arguments(&name, cdr, env),
             "PRINC" => return eval_builtin_arguments(&name, cdr, env),
@@ -44217,7 +44227,7 @@ fn is_builtin_function(name: &str) -> bool {
     if name == "PRINT-OBJECT" {
         return true;
     }
-    if matches!(name, "EGCL::%APPLY-RETAINED-GENERIC" | "EGCL::%VALIDATE-SEQUENCE-RESULT-TYPE" | "EGCL::%READ-STANDARD-MACRO" | "EGCL::%STANDARD-CHARACTER-READER" | "EGCL::SET-FILL-POINTER"
+    if matches!(name, "EGCL::%APPLY-RETAINED-GENERIC" | "EGCL::%MAKE-RANDOM-STATE" | "EGCL::%RANDOM-STATE-P" | "EGCL::%RANDOM-STATE-FROM-SEED" | "EGCL::%VALIDATE-SEQUENCE-RESULT-TYPE" | "EGCL::%READ-STANDARD-MACRO" | "EGCL::%STANDARD-CHARACTER-READER" | "EGCL::SET-FILL-POINTER"
         | "EGCL::%PPRINT-CIRCLE" | "EGCL::%PPRINT-NATIVE-COLUMN"
         | "EGCL::%PPRINT-RENDER-LAYOUT" | "EGCL::%FORMAT-CONSUMED"
         | "EGCL::%NATIVE-INTERACTIVE-STREAM-P") {
@@ -47308,54 +47318,6 @@ fn path_designator_to_string(v: EgclVal) -> Result<String, EgclError> {
         return Ok(val_as_str(egcl_stdlib::namestring(v)?));
     }
     Ok(val_as_str(v))
-}
-
-/// Draw the next 64 random bits from a per-thread SplitMix64 generator, seeded
-/// once from OS entropy via `RandomState` (no external RNG dependency). Backs the
-/// RANDOM builtin; a fresh, unreproducible sequence per process, like a default
-/// CL *RANDOM-STATE*.
-/// One SplitMix64 draw from a RANDOM-STATE object `(:random-state . seed)`,
-/// advancing the seed kept as a fixnum in its cdr. A state whose seed is NIL
-/// (the initial *RANDOM-STATE*, or one made with (make-random-state t)) is
-/// seeded from OS entropy on its first use. Anything that is not such an
-/// object falls back to the per-thread generator.
-fn random_state_draw(state: EgclVal) -> u64 {
-    if !state.is_cons() {
-        return next_random_u64();
-    }
-    let cell = unsafe { state.as_ptr() as *mut ConsCell };
-    let seed = unsafe { (*cell).cdr };
-    let mut s: u64 = if seed.is_fixnum() {
-        seed.as_fixnum() as u64
-    } else {
-        next_random_u64() >> 3
-    };
-    // 61 bits keep the seed a fixnum; the mix below runs on the full word.
-    s = s.wrapping_add(0x9E37_79B9_7F4A_7C15) & ((1u64 << 61) - 1);
-    // A fixnum is an immediate, so storing it needs no GC write barrier.
-    unsafe {
-        (*cell).cdr = EgclVal::from_fixnum(s as i64);
-    }
-    let mut z = s;
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
-}
-
-fn next_random_u64() -> u64 {
-    use std::cell::Cell;
-    use std::collections::hash_map::RandomState;
-    use std::hash::{BuildHasher, Hasher};
-    thread_local! {
-        static STATE: Cell<u64> = Cell::new(RandomState::new().build_hasher().finish() | 1);
-    }
-    STATE.with(|s| {
-        let mut z = s.get().wrapping_add(0x9E37_79B9_7F4A_7C15);
-        s.set(z);
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    })
 }
 
 /// Whether `v` is a bit vector — a simple SIMPLE-BIT-VECTOR or a

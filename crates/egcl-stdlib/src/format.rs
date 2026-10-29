@@ -829,6 +829,7 @@ impl CircleTable {
             let array = circle_array_length(value);
             if !value.is_cons() && array.is_none()
                 && !(circle_uninterned_symbol(value))
+                && !egcl_rt::random_state::is_random_state(value)
             {
                 continue;
             }
@@ -1848,6 +1849,9 @@ fn egclval_to_print_body(mut v: EgclVal, escapep: bool) -> String {
     }
     if let Some(text) = u8_readable_representation(v) {
         return text;
+    }
+    if crate::random_state::random_state_p(v) {
+        return random_state_representation(v, escapep);
     }
     if v.is_nil() {
         return print_symbol_name("NIL", escapep);
@@ -6297,5 +6301,15 @@ pub fn copy_pprint_dispatch(table: Option<EgclVal>) -> Result<EgclVal, EgclError
             *((base as *mut f64).add(2)) = *prio;
         }
         Ok(EgclVal::from_heap_ptr(ptr))
+    }
+}
+
+/// The opaque random-state printer, shared with the evaluator.
+pub fn random_state_representation(value: EgclVal, escapep: bool) -> String {
+    if escapep || print_readably_active() {
+        let seed = egcl_rt::random_state::snapshot(value).expect("random-state printer type");
+        format!("#.(EGCL::%RANDOM-STATE-FROM-SEED #10r{seed})")
+    } else {
+        dispatch_print_object(value, escapep).unwrap_or_else(|| "#<RANDOM-STATE>".into())
     }
 }

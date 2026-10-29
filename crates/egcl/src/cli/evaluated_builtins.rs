@@ -1979,6 +1979,24 @@ fn resolve(name: &str) -> Option<Handler> {
                 None => Err(EgclError::UnboundVariable(sym)),
             }
         }),
+        "EGCL::%MAKE-RANDOM-STATE" => Some(|_, args, _| {
+            if args.len() != 2 {
+                return Err(EgclError::ProgramError("%MAKE-RANDOM-STATE requires two arguments".into()));
+            }
+            egcl_stdlib::random_state::make_random_state(args[0], args[1])
+        }),
+        "EGCL::%RANDOM-STATE-FROM-SEED" => Some(|_, args, _| {
+            if args.len() != 1 {
+                return Err(EgclError::ProgramError("%RANDOM-STATE-FROM-SEED requires one argument".into()));
+            }
+            egcl_stdlib::random_state::from_seed(args[0])
+        }),
+        "EGCL::%RANDOM-STATE-P" => Some(|_, args, _| {
+            if args.len() != 1 {
+                return Err(EgclError::ProgramError("%RANDOM-STATE-P requires one argument".into()));
+            }
+            Ok(if egcl_stdlib::random_state::random_state_p(args[0]) { T } else { NIL })
+        }),
         "RANDOM" => Some(|_operator, args, env| super::random_values(args, env)),
         "MAKE-STRING-OUTPUT-STREAM" => Some(|_operator, args, _env| {
             // (make-string-output-stream &key element-type): the keywords are
