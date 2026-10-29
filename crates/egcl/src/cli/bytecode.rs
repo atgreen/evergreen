@@ -34825,3 +34825,6 @@ mod ios_tier_profile_tests {
         assert_eq!(super::t1_threshold(), u32::MAX);
     }
 }
+
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+mod native_ash_selection_tests;
