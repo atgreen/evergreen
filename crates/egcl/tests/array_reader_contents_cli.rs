@@ -10,6 +10,12 @@ const PROGRAM: &str = r##"
   (let ((array (read-array-contents rank form)))
     (assert (= (array-rank array) rank))
     (assert (equalp array expected))))
+(dotimes (i 80) (read-array-contents 1 '(vector 1 2)))
+(when *array-required-tier*
+  (loop repeat 100
+        until (= *array-required-tier* (egcl-ext:function-tier 'read-array-contents))
+        do (read-array-contents 1 '(vector 1 2)) (sleep 0.01))
+  (assert (= *array-required-tier* (egcl-ext:function-tier 'read-array-contents))))
 (check-array-contents 1 '(make-array 8 :fill-pointer 3 :initial-element 17) #(17 17 17))
 (check-array-contents 1 '(make-array 3 :adjustable t :initial-element 19) #(19 19 19))
 (check-array-contents 1 '(make-array '(3) :adjustable t :initial-contents '(21 22 23))
@@ -84,8 +90,15 @@ fn array_reader_accepts_non_simple_vectors_at_each_contents_level() {
                 .env("EGCL_GC_STRESS_AFTER_INIT", "1")
                 .env("EGCL_GC_POISON", "1");
         }
+        command.env("EGCL_T2_LAZY", "0").env("EGCL_T2_THREADS", "1");
+        let required = match tier {
+            "t1" => "1",
+            "t2" => "2",
+            _ => "nil",
+        };
+        let program = format!("(defparameter *array-required-tier* {required}){PROGRAM}");
         let output = command
-            .args(["--no-init", "--eval", PROGRAM])
+            .args(["--no-init", "--eval", &program])
             .output()
             .expect("run array contents regression");
         assert!(
