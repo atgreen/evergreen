@@ -1501,6 +1501,81 @@ impl Emitter<'_> {
         Ok(())
     }
 
+    /// `MIN`/`MAX` on two guarded fixnums, by compare and branch.
+    ///
+    /// Not a conditional select: `LOCGR` needs the load-store-on-cond facility
+    /// (z196), and this emitter targets z10 — `multiply_fixnums` says so, and
+    /// asm_s390x has a test pinning its encodings to that baseline. The
+    /// existing `FixnumCmp` arm branches for the same reason.
+    ///
+    /// The comparison is on the TAGGED words, which is exact: tagging is a
+    /// left shift by three and fixnums are small enough that it never
+    /// overflows, so it preserves order and sign.
+    fn select_fixnum(&mut self, take_larger: bool) {
+        self.asm.compare(2, 3);
+        let keep = self.asm.label();
+        // CC0 equal, CC1 low, CC2 high. Keeping the left operand means
+        // equal-or-high for MAX and equal-or-low for MIN; either way an equal
+        // answer is the same value, so which side wins a tie does not matter.
+        self.asm.branch(if take_larger { 10 } else { 12 }, keep);
+        self.asm.mov(2, 3);
+        self.asm.bind(keep);
+    }
+
+    /// The `TRUNCATE`/`FLOOR` quotient and `REM`/`MOD` remainder families on
+    /// two guarded fixnums, leaving the answer tagged in r2.
+    ///
+    /// Dividing two tagged operands cancels the tags, so the quotient comes
+    /// out RAW and needs reshifting while the remainder is already tagged --
+    /// the same arithmetic emit.rs and emit_a64 rely on.
+    fn divide_fixnums(&mut self, opcode: Opcode, deopt: Label) -> Result<(), EmitError> {
+        use Opcode::*;
+        // DSGR reads its dividend from the odd half of an even/odd pair and
+        // writes the remainder to the even half and the quotient to the odd
+        // one, so the divisor has to sit outside the pair. Stage it in r4
+        // first: r2 and r3 are the pair, and r3 still holds the divisor on
+        // entry.
+        self.asm.mov(4, 3);
+        self.asm.mov(3, 2);
+        // A zero divisor would raise a fixed-point-divide exception rather
+        // than produce a value, so it must exit before the instruction runs.
+        // Nothing homed has been written yet, so the deopt still sees both
+        // operands as the interpreter left them.
+        self.asm.compare_imm(4, 0);
+        self.asm.branch(8, deopt);
+        self.asm.divide_signed(2, 4);
+        if matches!(opcode, FixnumMod | FixnumFloor) {
+            // FLOOR and MOD differ from TRUNCATE and REM only when the
+            // division is inexact AND the remainder disagrees in sign with the
+            // divisor: the floored quotient is then one lower and the floored
+            // remainder one divisor higher.
+            let truncated = self.asm.label();
+            self.asm.compare_imm(2, 0);
+            self.asm.branch(8, truncated);
+            self.asm.mov(5, 2);
+            self.asm.xor(5, 4);
+            self.asm.compare_imm(5, 0);
+            self.asm.branch(10, truncated);
+            self.asm.add_imm(3, -1);
+            self.asm.add(2, 4);
+            self.asm.bind(truncated);
+        }
+        if matches!(opcode, FixnumMod | FixnumRem) {
+            // The remainder is already tagged, and r2 is where the result is
+            // read from.
+            return Ok(());
+        }
+        // Only the positive end can overflow. |quotient| <= |dividend| for any
+        // divisor of magnitude at least one, and min-fixnum is itself a
+        // fixnum, so a one-sided check is exact -- the single case it catches
+        // is min-fixnum / -1, whose quotient is 2^60, one past the maximum.
+        self.asm.imm64(0, ((1_i64 << 60) - 1) as u64);
+        self.asm.compare(3, 0);
+        self.asm.branch(2, deopt);
+        self.asm.shift_left(2, 3, 3);
+        Ok(())
+    }
+
     fn multiply_fixnums(&mut self, deopt: Label) {
         // Multiply a signed untagged lhs by the tagged rhs. MLGR supplies
         // the full unsigned 128-bit product on every z10-compatible CPU.
@@ -1774,6 +1849,18 @@ impl Emitter<'_> {
                 self.asm.bind(yes);
                 self.asm.imm64(2, T.0);
                 self.asm.bind(done);
+                return self.store(result, 2);
+            }
+            FixnumMin | FixnumMax | FixnumDiv | FixnumFloor | FixnumRem | FixnumMod => {
+                let deopt = self.deopt_label(data)?;
+                self.guard_fixnum(2, deopt);
+                self.load(*data.args.get(1).ok_or(unsupported!())?, 3)?;
+                self.guard_fixnum(3, deopt);
+                match data.opcode {
+                    FixnumMin => self.select_fixnum(false),
+                    FixnumMax => self.select_fixnum(true),
+                    other => self.divide_fixnums(other, deopt)?,
+                }
                 return self.store(result, 2);
             }
             FixnumAdd | FixnumSub | FixnumMul | FixnumNeg | FixnumCmpEq | FixnumCmpLt
@@ -4351,6 +4438,192 @@ mod tests {
                 assert!(run(f32::NAN, 1.5).1, "{opcode:?}: NaN on the left");
                 assert!(run(1.5, f32::NAN).1, "{opcode:?}: NaN on the right");
                 assert!(run(f32::NAN, f32::NAN).1, "{opcode:?}: NaN vs NaN");
+            }
+        }
+    }
+
+    /// The fixnum division family and MIN/MAX, executed on hardware.
+    ///
+    /// Three things here are specific to this target rather than ported
+    /// reasoning. `DSGR` divides over an even/odd register pair and puts the
+    /// REMAINDER in the even half and the QUOTIENT in the odd one, so a
+    /// swapped pair is a silent wrong answer -- the sign cases below pin the
+    /// direction. It FAULTS on a zero divisor instead of returning a value,
+    /// so that case is a `SIGFPE` rather than a wrong result if the guard is
+    /// missing. And MIN/MAX branch rather than conditionally select, because
+    /// `LOCGR` needs z196 and this emitter targets z10.
+    #[test]
+    fn fixnum_division_and_selection_match_the_interpreter_on_hardware() {
+        use crate::t2::frame_state::{FrameScope, FrameState, ValueSource};
+
+        thread_local! {
+            static DEOPTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        }
+        extern "C" fn deopt(_: u64, _: u64, _: *const u64, _: u64) -> u64 {
+            DEOPTED.with(|flag| flag.set(true));
+            NIL.0
+        }
+
+        fn binop(opcode: Opcode) -> Function {
+            let mut f = Function::new("z-fixnum-div");
+            let block = f.entry();
+            let a = f.add_block_param(block, IRType::TOP, ValueRepresentation::Tagged);
+            let b = f.add_block_param(block, IRType::TOP, ValueRepresentation::Tagged);
+            let state = f.frame_states.add(FrameState {
+                scopes: vec![FrameScope {
+                    function: 0,
+                    bcp: 0,
+                    locals: vec![
+                        ValueSource::Value { value: a, repr: ValueRepresentation::Tagged },
+                        ValueSource::Value { value: b, repr: ValueRepresentation::Tagged },
+                    ],
+                    stack: vec![],
+                }],
+                remat: vec![],
+            });
+            let (_, out) = f.push_inst(
+                block,
+                InstData {
+                    opcode,
+                    args: vec![a, b],
+                    results: vec![],
+                    aux: AuxData::None,
+                    flags: InstFlags::default(),
+                    targets: vec![],
+                    frame_state: Some(state),
+                    source_pos: 0,
+                },
+                &[(IRType::TOP, ValueRepresentation::Tagged)],
+            );
+            f.set_terminator(
+                block,
+                InstData {
+                    opcode: Opcode::Return,
+                    args: vec![out[0]],
+                    results: vec![],
+                    aux: AuxData::None,
+                    flags: InstFlags::default(),
+                    targets: vec![],
+                    frame_state: None,
+                    source_pos: 0,
+                },
+            );
+            f
+        }
+
+        // Independent of the emitted algorithm: the Common Lisp definitions.
+        // Gated with its callers -- only the hardware block consults it, so on
+        // any other host it is dead code that `-D warnings` rejects.
+        #[cfg(all(target_arch = "s390x", unix))]
+        fn expect(opcode: Opcode, a: i64, b: i64) -> i64 {
+            // MIN/MAX take no divisor, so they must not compute one -- `b` is
+            // legitimately zero for them.
+            match opcode {
+                Opcode::FixnumMin => return a.min(b),
+                Opcode::FixnumMax => return a.max(b),
+                _ => {}
+            }
+            let tq = a / b;
+            let tr = a % b;
+            let adjust = tr != 0 && ((tr < 0) != (b < 0));
+            let fq = if adjust { tq - 1 } else { tq };
+            match opcode {
+                Opcode::FixnumDiv => tq,
+                Opcode::FixnumRem => tr,
+                Opcode::FixnumFloor => fq,
+                Opcode::FixnumMod => a - fq * b,
+                _ => unreachable!(),
+            }
+        }
+
+        let ops = [
+            Opcode::FixnumDiv,
+            Opcode::FixnumRem,
+            Opcode::FixnumFloor,
+            Opcode::FixnumMod,
+            Opcode::FixnumMin,
+            Opcode::FixnumMax,
+        ];
+        // All four sign combinations, exact and inexact, plus zero dividends.
+        let pairs: [(i64, i64); 12] = [
+            (47, 5), (-47, 5), (47, -5), (-47, -5),
+            (50, 5), (-50, 5), (50, -5), (-50, -5),
+            (0, 7), (0, -7), (3, 100), (-3, 100),
+        ];
+        for opcode in ops {
+            let compiled = emit_framed(&binop(opcode), deopt as *const () as u64, 2)
+                .expect("the division family emits");
+            assert!(!compiled.code.is_empty());
+            let _ = &pairs;
+            #[cfg(all(target_arch = "s390x", unix))]
+            {
+                let code = egcl_rt::jit::JitBuffer::new(&compiled.code).unwrap();
+                // SAFETY: the buffer owns the generated C-ABI activation entry.
+                let entry: unsafe extern "C" fn(*mut u64) -> u64 =
+                    unsafe { std::mem::transmute(code.as_ptr()) };
+                let run = |a: i64, b: i64| {
+                    DEOPTED.with(|flag| flag.set(false));
+                    let mut slots =
+                        vec![EgclVal::from_fixnum(a).0, EgclVal::from_fixnum(b).0, 0, 0];
+                    let answer = unsafe { entry(slots.as_mut_ptr()) };
+                    (answer, DEOPTED.with(std::cell::Cell::get))
+                };
+                for (a, b) in pairs {
+                    let want = expect(opcode, a, b);
+                    assert_eq!(
+                        run(a, b),
+                        (EgclVal::from_fixnum(want).0, false),
+                        "{opcode:?}({a}, {b}) should be {want}"
+                    );
+                }
+                // A zero divisor must take the deopt. On this target DSGR
+                // faults, so a missing guard is a SIGFPE, not a wrong answer.
+                if !matches!(opcode, Opcode::FixnumMin | Opcode::FixnumMax) {
+                    assert!(run(47, 0).1, "{opcode:?}: zero divisor must deopt");
+                    assert!(run(0, 0).1, "{opcode:?}: 0/0 must deopt");
+                }
+                // MIN/MAX have no divisor, so zero is an ordinary operand.
+                if matches!(opcode, Opcode::FixnumMin | Opcode::FixnumMax) {
+                    let want = expect(opcode, 47, 0);
+                    assert_eq!(run(47, 0), (EgclVal::from_fixnum(want).0, false));
+                }
+            }
+        }
+
+        // min-fixnum / -1 is the one quotient that leaves the fixnum range:
+        // 2^60, exactly one past the maximum. The remainder forms are fine
+        // there (it is zero), so only the quotient families deopt.
+        #[cfg(all(target_arch = "s390x", unix))]
+        {
+            const MIN_FIXNUM: i64 = -(1 << 60);
+            for (opcode, should_deopt) in [
+                (Opcode::FixnumDiv, true),
+                (Opcode::FixnumFloor, true),
+                (Opcode::FixnumRem, false),
+                (Opcode::FixnumMod, false),
+            ] {
+                let compiled =
+                    emit_framed(&binop(opcode), deopt as *const () as u64, 2).unwrap();
+                let code = egcl_rt::jit::JitBuffer::new(&compiled.code).unwrap();
+                // SAFETY: as above.
+                let entry: unsafe extern "C" fn(*mut u64) -> u64 =
+                    unsafe { std::mem::transmute(code.as_ptr()) };
+                DEOPTED.with(|flag| flag.set(false));
+                let mut slots = vec![
+                    EgclVal::from_fixnum(MIN_FIXNUM).0,
+                    EgclVal::from_fixnum(-1).0,
+                    0,
+                    0,
+                ];
+                let answer = unsafe { entry(slots.as_mut_ptr()) };
+                let deopted = DEOPTED.with(std::cell::Cell::get);
+                assert_eq!(
+                    deopted, should_deopt,
+                    "{opcode:?}(min-fixnum, -1): deopt expectation"
+                );
+                if !should_deopt {
+                    assert_eq!(answer, EgclVal::from_fixnum(0).0, "{opcode:?} remainder");
+                }
             }
         }
     }
