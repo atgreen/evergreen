@@ -23,6 +23,8 @@ pub(super) use egcl_rt::bignum::{
 use egcl_rt::lock_order::{LockLevel, OrderedMutex};
 
 mod bytecode;
+mod structure_subtype;
+use structure_subtype::raw_structure_boolean_subtypep;
 mod class_protocol;
 mod control_payload;
 mod evaluated_builtins;
@@ -19359,6 +19361,9 @@ fn subtypep_relation(mut t1: EgclVal, mut t2: EgclVal) -> (bool, bool) {
     // in the caller do not rewrite these copies.
     egcl_rt::rooted_ref!(_t1_root = &mut t1);
     egcl_rt::rooted_ref!(_t2_root = &mut t2);
+    if let Some(answer) = raw_structure_boolean_subtypep(t1, t2) {
+        return answer;
+    }
     if builtin_disjoint_conjunction(t1) {
         return (true, true);
     }
@@ -51939,3 +51944,6 @@ mod method_class_identity_tests;
 
 #[cfg(test)]
 mod class_definition_owner_tests;
+
+#[cfg(test)]
+mod raw_structure_subtype_tests;
