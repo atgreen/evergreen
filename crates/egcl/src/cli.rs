@@ -38878,6 +38878,19 @@ fn expand_load_source_form(form: EgclVal, env: &Env) -> Result<EgclVal, EgclErro
     macroexpand_all(form, &mut walk_env, 0, &HashSet::new())
 }
 
+/// Freeze a compiled file's retained DEFUN in its compilation environment.
+/// Walk the whole definition so lambda-list bindings, declarations, local
+/// functions and local macros stay in scope together. The legacy source walk
+/// deliberately leaves MACROLET/SYMBOL-MACROLET bodies for interpretation;
+/// doing that in a compiled file expands them later in the caller's package.
+fn expand_load_source_function(form: EgclVal, env: &Env) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted!(form = form);
+    egcl_rt::rooted!(macro_env = macroexpand_environment_from_cli(env));
+    with_macroexpand_dynamic_context(env, || {
+        compiler_macroexpand::macroexpand_all(*form, &macro_env)
+    })
+}
+
 /// Expand the bodies of RESTART-CASE or HANDLER-CASE clauses, preserving each
 /// clause's head and lambda list and, for RESTART-CASE, its leading
 /// `:report`/`:interactive`/`:test` options. A clause too short to have a body
@@ -52385,3 +52398,6 @@ mod raw_structure_subtype_tests;
 
 #[cfg(test)]
 mod generic_dispatch_cache_tests;
+
+#[cfg(test)]
+mod fallback_function_expansion_tests;
