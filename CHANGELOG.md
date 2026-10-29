@@ -8,6 +8,10 @@
   callbacks and restore prior bindings across conditions and nonlocal transfers
   ([#836](https://github.com/atgreen/evergreen/pull/836)).
 
+- Readable pathname printing signals `PRINT-NOT-READABLE` when its namestring
+  would lose components, preserving the original object in the condition
+  ([#858](https://github.com/atgreen/evergreen/pull/858)).
+
 - Compiled printer calls preserve callback conditions, restarts, and nonlocal
   transfers without leaking errors into later operations
   ([#835](https://github.com/atgreen/evergreen/pull/835)).
