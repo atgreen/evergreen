@@ -1833,9 +1833,10 @@ impl Emitter<'_> {
                 // arm System Z carries (bliss-3pw4m).
                 // Entering or leaving a child lexical `EnvFrame`. Both
                 // adapters take no argument and return nothing, so there is
-                // nothing to stage -- but the root synchronisation around the
-                // call still matters, because the adapter allocates the new
-                // frame and so can collect.
+                // nothing to stage. The push currently allocates only a Rust
+                // `Arc`, not an EGCL heap object; it still uses the ordinary
+                // rooted safepoint convention so later adapter changes cannot
+                // silently strand live tagged values.
                 //
                 // x86-64 reaches these through its mapped
                 // TRANSFER_LEXICAL_ENVIRONMENT_REQUEST, which decodes the
@@ -3254,6 +3255,262 @@ mod vector_store_barrier_tests {
         assert!(
             emitted.code.windows(call.len()).any(|word| word == call),
             "the call-free fixture emitted no BLR x16: VecSetInRange bypassed the reference barrier"
+        );
+    }
+}
+
+#[cfg(test)]
+mod environment_call_tests {
+    use super::*;
+    use crate::t2::emit::{EnvironmentCalls, PortableCalls};
+    use crate::t2::ir::{IRType, InstFlags};
+
+    fn call(opcode: Opcode, args: Vec<Value>, aux: AuxData) -> InstData {
+        InstData {
+            opcode,
+            args,
+            results: vec![],
+            aux,
+            flags: InstFlags {
+                call: true,
+                safepoint: true,
+                effectful: true,
+                ..Default::default()
+            },
+            targets: vec![],
+            frame_state: None,
+            source_pos: 0,
+        }
+    }
+
+    fn environment_scope(enter: bool) -> Function {
+        let mut function = Function::new("aarch64-environment-scope");
+        let block = function.entry();
+        let survivor =
+            function.add_block_param(block, IRType::TOP, ValueRepresentation::Tagged);
+        function.push_inst(
+            block,
+            call(
+                Opcode::Call,
+                vec![],
+                AuxData::EnvironmentScope { enter },
+            ),
+            &[],
+        );
+        function.set_terminator(
+            block,
+            InstData {
+                opcode: Opcode::Return,
+                args: vec![survivor],
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags::default(),
+                targets: vec![],
+                frame_state: None,
+                source_pos: 1,
+            },
+        );
+        function
+    }
+
+    fn environment_definition() -> Function {
+        let mut function = Function::new("aarch64-environment-definition");
+        let block = function.entry();
+        let value = function.add_block_param(block, IRType::TOP, ValueRepresentation::Tagged);
+        function.push_inst(
+            block,
+            call(
+                Opcode::DefineEnvironmentValue,
+                vec![value],
+                AuxData::EnvironmentName(3),
+            ),
+            &[],
+        );
+        function.set_terminator(
+            block,
+            InstData {
+                opcode: Opcode::Return,
+                args: vec![value],
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags::default(),
+                targets: vec![],
+                frame_state: None,
+                source_pos: 1,
+            },
+        );
+        function
+    }
+
+    fn environment_sequence() -> Function {
+        let mut function = Function::new("aarch64-environment-sequence");
+        let block = function.entry();
+        let value = function.add_block_param(block, IRType::TOP, ValueRepresentation::Tagged);
+        function.push_inst(
+            block,
+            call(
+                Opcode::Call,
+                vec![],
+                AuxData::EnvironmentScope { enter: true },
+            ),
+            &[],
+        );
+        function.push_inst(
+            block,
+            call(
+                Opcode::DefineEnvironmentValue,
+                vec![value],
+                AuxData::EnvironmentName(3),
+            ),
+            &[],
+        );
+        function.push_inst(
+            block,
+            call(
+                Opcode::Call,
+                vec![],
+                AuxData::EnvironmentScope { enter: false },
+            ),
+            &[],
+        );
+        function.set_terminator(
+            block,
+            InstData {
+                opcode: Opcode::Return,
+                args: vec![value],
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags::default(),
+                targets: vec![],
+                frame_state: None,
+                source_pos: 3,
+            },
+        );
+        function
+    }
+
+    fn assert_one_rooted_call(emitted: &FramedCode) {
+        assert_eq!(emitted.emitted_safepoints, 1);
+        assert_eq!(emitted.root_sync_sites.len(), 1);
+    }
+
+    #[test]
+    fn environment_scope_selects_the_exact_portable_adapter() {
+        const PUSH: u64 = 0x1111;
+        const POP: u64 = 0x2222;
+        for (enter, push_env_child, pop_env_child) in
+            [(true, PUSH, 0), (false, 0, POP)]
+        {
+            let emitted = emit_framed_with_runtime(
+                &environment_scope(enter),
+                0,
+                1,
+                RuntimeCalls {
+                    portable: PortableCalls {
+                        push_env_child,
+                        pop_env_child,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .expect("emit AArch64 lexical-scope adapter call");
+            assert_one_rooted_call(&emitted);
+
+            assert!(matches!(
+                emit_framed_with_runtime(
+                    &environment_scope(enter),
+                    0,
+                    1,
+                    RuntimeCalls {
+                        portable: PortableCalls {
+                            push_env_child: pop_env_child,
+                            pop_env_child: push_env_child,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                ),
+                Err(EmitError::UnsupportedOp(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn environment_definition_requires_the_define_adapter() {
+        const BODY: u64 = 0x3333;
+        const DEFINE: u64 = 0x4444;
+        let emitted = emit_framed_with_runtime(
+            &environment_definition(),
+            0,
+            1,
+            RuntimeCalls {
+                environment: EnvironmentCalls {
+                    body: BODY,
+                    define: DEFINE,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .expect("emit AArch64 lexical-definition adapter call");
+        assert_one_rooted_call(&emitted);
+
+        for environment in [
+            EnvironmentCalls {
+                body: BODY,
+                store: DEFINE,
+                ..Default::default()
+            },
+            EnvironmentCalls {
+                define: DEFINE,
+                ..Default::default()
+            },
+        ] {
+            assert!(matches!(
+                emit_framed_with_runtime(
+                    &environment_definition(),
+                    0,
+                    1,
+                    RuntimeCalls {
+                        environment,
+                        ..Default::default()
+                    },
+                ),
+                Err(EmitError::UnsupportedOp(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn environment_sequence_roots_the_live_definition_at_each_call() {
+        let emitted = emit_framed_with_runtime(
+            &environment_sequence(),
+            0,
+            1,
+            RuntimeCalls {
+                environment: EnvironmentCalls {
+                    body: 0x3333,
+                    define: 0x4444,
+                    ..Default::default()
+                },
+                portable: PortableCalls {
+                    push_env_child: 0x1111,
+                    pop_env_child: 0x2222,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .expect("emit AArch64 push, define, and pop sequence");
+        assert_eq!(emitted.emitted_safepoints, 3);
+        assert_eq!(emitted.root_sync_sites.len(), 3);
+        assert!(
+            emitted
+                .root_sync_sites
+                .iter()
+                .all(|site| site.live_roots == 1),
+            "the unknown tagged definition must stay shadow-rooted across all three calls"
         );
     }
 }

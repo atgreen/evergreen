@@ -156,3 +156,40 @@ fn native_names_preserve_shadowing_late_interning_and_renames() {
     assert_eq!(c2i_load_env(&*names, 1), EgclVal::from_fixnum(59).0);
     assert!(!native_error_pending());
 }
+
+#[test]
+fn native_scope_adapters_shadow_and_restore_the_parent_binding() {
+    let _lock = super::super::heap_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    let key = "NATIVE-SCOPE-SHADOW";
+    env.frame
+        .borrow_mut()
+        .vars
+        .insert(key.into(), EgclVal::from_fixnum(11));
+    egcl_rt::rooted!(form = reader::read_from_string("(nil)").unwrap().0);
+    let mut body = compile_function("NATIVE-SCOPE-ADAPTERS", NIL, *form, &env, false, false)
+        .unwrap();
+    body.names = vec![key.into()];
+    let names = NativeEnvNames::new(&body);
+    let _restore =
+        RestoreFrame(NATIVE_ENV_FRAME.with(|slot| slot.replace(Some(Arc::clone(&env.frame)))));
+
+    assert_eq!(c2i_load_env(&*names, 0), EgclVal::from_fixnum(11).0);
+    c2i_push_env_child();
+    c2i_define_env(&*names, 0, EgclVal::from_fixnum(29).0);
+    assert_eq!(
+        c2i_load_env(&*names, 0),
+        EgclVal::from_fixnum(29).0,
+        "the child definition must shadow its parent"
+    );
+    c2i_pop_env_child();
+    assert_eq!(
+        c2i_load_env(&*names, 0),
+        EgclVal::from_fixnum(11).0,
+        "leaving the child must restore the parent binding"
+    );
+    assert!(!native_error_pending());
+}

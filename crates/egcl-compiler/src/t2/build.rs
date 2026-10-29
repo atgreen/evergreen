@@ -2186,9 +2186,10 @@ impl<'a> Builder<'a> {
                 // instruction at the retained PC; a checked-ABI target has no
                 // mapped entry, so lower them to a plain adapter call and let
                 // the aux say which of the two it is. Valueless and
-                // stack-neutral, so nothing is pushed or popped -- but the
-                // frame state still matters, because the scope change is
-                // observable to a deopt that resumes after it.
+                // stack-neutral, so nothing is pushed or popped. The attached
+                // state is the pre-instruction recovery point, just as for the
+                // other runtime calls: a failed call resumes by retrying the
+                // scope operation rather than assuming it already happened.
                 Instr::PushEnvChild | Instr::PopEnvChild if !self.native_cleanups => {
                     let fs = self.build_frame_state(block, &stack, i as u32);
                     self.emit_effect(
@@ -4396,7 +4397,7 @@ mod tests {
         )));
 
         match build_from_bytecode(&body) {
-            Err(BuildError::UnsupportedInstr(kind)) => assert_eq!(kind, "MakeClosureEnv"),
+            Err(BuildError::UnsupportedInstr(kind)) => assert_eq!(kind, "MakeClosure"),
             other => panic!("capturing checked closure must stay fail-closed, got {other:?}"),
         }
     }
