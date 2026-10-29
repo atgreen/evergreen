@@ -11,6 +11,11 @@
 
 ### Fixed
 
+- FORMAT slash directives look up internal functions with either `~/pkg:name/`
+  or `~/pkg::name/`, treating the remaining name literally instead of applying
+  reader export and escape rules
+  ([#896](https://github.com/atgreen/evergreen/pull/896)).
+
 - Methods bind first-class lexical `CALL-NEXT-METHOD` and `NEXT-METHOD-P`
   functions, retain their original continuation across redefinition, and check
   the complete applicable-method order when replacement arguments are supplied.
