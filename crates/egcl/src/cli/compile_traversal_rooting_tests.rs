@@ -4,17 +4,24 @@ use super::*;
 
 #[test]
 fn top_level_processing_follows_a_relocated_tail() {
-    check_relocated_tail(false);
+    check_relocated_tail(false, false);
 }
 
 #[test]
 fn definition_seeding_follows_a_relocated_tail() {
-    check_relocated_tail(true);
+    check_relocated_tail(true, false);
 }
 
-fn check_relocated_tail(seed: bool) {
+#[test]
+fn retained_load_form_follows_sibling_compile_effect_relocation() {
+    check_relocated_tail(false, true);
+}
+
+fn check_relocated_tail(seed: bool, retained: bool) {
     const CHILD: &str = "EGCL_COMPILE_TRAVERSAL_ROOT_CHILD";
-    let name = if seed {
+    let name = if retained {
+        "retained_load_form_follows_sibling_compile_effect_relocation"
+    } else if seed {
         "definition_seeding_follows_a_relocated_tail"
     } else {
         "top_level_processing_follows_a_relocated_tail"
@@ -43,7 +50,12 @@ fn check_relocated_tail(seed: bool) {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        assert!(String::from_utf8_lossy(&output.stdout).contains("COMPILE-TAIL-RELOCATED"));
+        let marker = if retained {
+            "COMPILE-RESIDUAL-RELOCATED"
+        } else {
+            "COMPILE-TAIL-RELOCATED"
+        };
+        assert!(String::from_utf8_lossy(&output.stdout).contains(marker));
         return;
     }
     egcl_rt::init_heap(&egcl_rt::GcConfig {
@@ -60,7 +72,12 @@ fn check_relocated_tail(seed: bool) {
     })
     .unwrap();
     egcl_rt::rooted!(env = Env::new(false));
-    let (first, second) = if seed {
+    let (first, second) = if retained {
+        (
+            "(quote (42 73))",
+            "(eval-when (:compile-toplevel) (%force-minor-gc-for-test))",
+        )
+    } else if seed {
         (
             "(defconstant +traversal-first+ (progn (%force-minor-gc-for-test) 41))",
             "(defconstant +traversal-next+ 73)",
@@ -79,8 +96,13 @@ fn check_relocated_tail(seed: bool) {
     egcl_rt::rooted!(body = arena_cons(*first, *tail));
     egcl_rt::rooted!(form = arena_cons(progn, *body));
     let before = *tail;
+    let before_residual = *first;
+    egcl_rt::rooted!(emitted = Vec::<EgclVal>::new());
     with_eval_context(&mut env, EvalContext::CompileFile, |env| {
-        if seed {
+        if retained {
+            *emitted =
+                compile_file_load_forms(*form, env).map_err(CompileToplevelError::into_error)?;
+        } else if seed {
             seed_compile_time_definitions(*form, env)?;
         } else {
             process_compile_toplevel_form(*form, env)?;
@@ -92,9 +114,30 @@ fn check_relocated_tail(seed: bool) {
         *tail, before,
         "the tail must actually move during recursion"
     );
-    assert_eq!(
-        env.lookup_var_symbol(marker),
-        Some(EgclVal::from_fixnum(73))
-    );
-    println!("COMPILE-TAIL-RELOCATED");
+    if retained {
+        assert_ne!(
+            *first, before_residual,
+            "the retained form must actually move"
+        );
+        assert_eq!(emitted.len(), 2);
+        assert_eq!(
+            emitted[0], *first,
+            "the emitted vector must follow the retained expansion"
+        );
+        assert!(
+            emitted[1].is_nil(),
+            "the discarded final source form still contributes NIL"
+        );
+        println!(
+            "COMPILE-RESIDUAL-RELOCATED {:#x}->{:#x}",
+            before_residual.to_raw(),
+            first.to_raw()
+        );
+    } else {
+        assert_eq!(
+            env.lookup_var_symbol(marker),
+            Some(EgclVal::from_fixnum(73))
+        );
+        println!("COMPILE-TAIL-RELOCATED");
+    }
 }

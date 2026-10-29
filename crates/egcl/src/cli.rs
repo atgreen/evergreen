@@ -15561,7 +15561,8 @@ fn read_forms_for_compile(
                 // evaluation below. Wrapping it reported the token itself as
                 // a read failure and, worse, downgraded the file to a
                 // source-only artifact that the caller's clause never saw.
-                Err(e) if matches!(&e, EgclError::Internal(message) if message.starts_with("__")) => {
+                Err(e) if matches!(&e, EgclError::Internal(message) if message.starts_with("__")) =>
+                {
                     return Err(e);
                 }
                 Err(e) => {
@@ -15582,7 +15583,9 @@ fn read_forms_for_compile(
             // the package in which the expander was defined.
             let definition_package = env.current_package.clone();
             if dynamic_standard_variable(env, "*COMPILE-PRINT*").is_some_and(|v| v != NIL) {
-                egcl_rt::rooted!(output = dynamic_standard_variable(env, "*STANDARD-OUTPUT*").unwrap_or(T));
+                egcl_rt::rooted!(
+                    output = dynamic_standard_variable(env, "*STANDARD-OUTPUT*").unwrap_or(T)
+                );
                 let previous = PRINT_ENV.with(|slot| slot.replace(env as *mut Env));
                 let printed = egcl_stdlib::format(*output, "; ~S~%", &[val]);
                 PRINT_ENV.with(|slot| slot.set(previous));
@@ -15611,23 +15614,32 @@ fn read_forms_for_compile(
             // Measured before changing this: a full ironclad build plus
             // alexandria, cl-ppcre, babel and iterate swallow ZERO compile-time
             // errors between them, so nothing relied on the tolerance.
-            if let Err(e) = process_compile_toplevel_form(val, env) {
-                *compile_time_failure = Some(());
-                // A control transfer (a HANDLER-CASE clause, an invoked restart,
-                // a RETURN-FROM) established around COMPILE-FILE travels as an
-                // Internal error carrying a `__NAME__:id` token; it must reach
-                // its frame unchanged.  Wrapping it reported the token itself as
-                // the failure -- "internal error: __HANDLER_CASE__:36229" -- and
-                // hid the condition the clause was handling.
-                if matches!(&e, EgclError::Internal(message) if message.starts_with("__")) {
-                    return Err(e);
+            let load_forms = match compile_file_load_forms(val, env) {
+                Ok(forms) => forms,
+                Err(failure) => {
+                    let effect_error = matches!(&failure, CompileToplevelError::Effects(_));
+                    let e = failure.into_error();
+                    if effect_error {
+                        *compile_time_failure = Some(());
+                    }
+                    // A control transfer (a HANDLER-CASE clause, an invoked restart,
+                    // a RETURN-FROM) established around COMPILE-FILE travels as an
+                    // Internal error carrying a `__NAME__:id` token; it must reach
+                    // its frame unchanged.  Wrapping it reported the token itself as
+                    // the failure -- "internal error: __HANDLER_CASE__:36229" -- and
+                    // hid the condition the clause was handling.
+                    if matches!(&e, EgclError::Internal(message) if message.starts_with("__")) {
+                        return Err(e);
+                    }
+                    if !effect_error {
+                        return Err(e);
+                    }
+                    let line = chars[..pos].iter().filter(|&&ch| ch == '\n').count() + 1;
+                    return Err(EgclError::FileError(format!(
+                        "{src_path}: compile-time evaluation failed near line {line}: {e}"
+                    )));
                 }
-                let line = chars[..pos].iter().filter(|&&ch| ch == '\n').count() + 1;
-                return Err(EgclError::FileError(format!(
-                    "{src_path}: compile-time evaluation failed near line {line}: {e}"
-                )));
-            }
-            let load_forms = compile_file_load_forms(val, env)?;
+            };
             let mut effective_package = definition_package;
             for load_form in &load_forms {
                 definition_packages.push(effective_package.clone());
@@ -15642,7 +15654,6 @@ fn read_forms_for_compile(
         Ok((forms, definition_packages, source_group_ends))
     })
 }
-
 /// Best-effort seeding precedes actual compile-time execution. Raw probe
 /// failures remain ordinary Err results; actual evaluation signals normally.
 /// The mode travels with Env (and its children), including across fiber yields.
@@ -15985,123 +15996,275 @@ fn format_compile_note_date(unix_secs: u64) -> String {
     )
 }
 
-fn compile_file_load_forms(form: EgclVal, env: &mut Env) -> Result<Vec<EgclVal>, EgclError> {
-    egcl_rt::rooted!(form = form);
-    // DEFINE-CONDITION has a dedicated structural BFASL lowering. Expanding it
-    // here would flatten the boot macro into SETQ/DEFCLASS source forms and
-    // discard the boundary the portable load action needs.
-    if form.is_cons() {
-        let (op, _) = cp(*form);
-        if op.is_symbol() && symbol_leaf_name(&sym_name(op)) == "DEFINE-CONDITION" {
-            return Ok(vec![*form]);
-        }
+#[derive(Clone, Copy)]
+enum CompileToplevelMode {
+    NotCompileTime,
+    CompileTimeToo,
+}
+
+// Retain the existing distinction between a failed compile-time effect and a
+// residual lexical expansion that cannot be pre-read into portable load forms.
+enum CompileToplevelError {
+    Effects(EgclError),
+    Residual(EgclError),
+}
+impl From<EgclError> for CompileToplevelError {
+    fn from(error: EgclError) -> Self {
+        Self::Effects(error)
     }
-    *form = expand_compile_toplevel_form(*form, env)?;
-    if !form.is_cons() {
-        return Ok(vec![*form]);
-    }
-    let (op, cdr) = cp(*form);
-    if !op.is_symbol() {
-        return Ok(vec![*form]);
-    }
-    let op_name = sym_name(op);
-    match symbol_leaf_name(&op_name) {
-        "PROGN" => {
-            egcl_rt::rooted!(nested_forms = list_to_vec(cdr));
-            let mut result = Vec::new();
-            egcl_rt::rooted_ref!(_result_root = &mut result);
-            for index in 0..nested_forms.len() {
-                let expanded = compile_file_load_forms(nested_forms[index], env)?;
-                if index + 1 == nested_forms.len() && expanded.is_empty() {
-                    result.push(NIL);
-                } else {
-                    result.extend(expanded);
-                }
-            }
-            if result.is_empty() {
-                result.push(NIL);
-            }
-            Ok(result)
+}
+impl CompileToplevelError {
+    fn into_error(self) -> EgclError {
+        match self {
+            Self::Effects(error) | Self::Residual(error) => error,
         }
-        "EVAL-WHEN" => {
-            // What COMPILE-FILE emits for LOAD time: a top-level eval-when's body
-            // is a load-time action iff :LOAD-TOPLEVEL is present (CLHS 3.2.3.1).
-            // An :EXECUTE-only top-level eval-when has NO load-time effect and must
-            // NOT be emitted — emitting it made a loaded fasl run :execute-only
-            // situations, which ansi eval-when.1 flags (bliss-pmox). The compile-
-            // time (:compile-toplevel) evaluation happens separately, via
-            // process_compile_toplevel_form under EvalContext::CompileFile.
-            let (situations, body) = cp(cdr);
-            if eval_when_has_situation(situations, EvalWhenSituation::LoadToplevel)? {
-                egcl_rt::rooted!(nested_forms = list_to_vec(body));
-                let mut result = Vec::new();
-                egcl_rt::rooted_ref!(_result_root = &mut result);
-                for index in 0..nested_forms.len() {
-                    let expanded = compile_file_load_forms(nested_forms[index], env)?;
-                    if index + 1 == nested_forms.len() && expanded.is_empty() {
-                        result.push(NIL);
-                    } else {
-                        result.extend(expanded);
-                    }
-                }
-                if result.is_empty() {
-                    result.push(NIL);
-                }
-                Ok(result)
-            } else {
-                Ok(Vec::new())
-            }
-        }
-        // A top-level MACROLET establishes local macros for its body, which are
-        // then processed as top-level forms (CLHS 3.2.3.1). Register the local
-        // macros lexically, expand/splice the body through the same pipeline, then
-        // restore the previous bindings so the macros do not leak past the form.
-        "MACROLET" => {
-            let (defs_form, body) = cp(cdr);
-            let mut saved_names = Vec::new();
-            let mut saved_definitions = Vec::<Option<MacroDef>>::new();
-            // A shadowed definition is removed from Env::macros while the body
-            // recursively expands. Keep its forms, optional function, bytecode,
-            // and captured frame rooted until it is restored.
-            egcl_rt::rooted_ref!(_saved_definitions_root = &mut saved_definitions);
-            bind_toplevel_macrolet(defs_form, env, &mut saved_names, &mut saved_definitions);
-            egcl_rt::rooted!(nested_forms = list_to_vec(body));
-            let mut result = Vec::new();
-            egcl_rt::rooted_ref!(_result_root = &mut result);
-            let nested_result = (|| {
-                for index in 0..nested_forms.len() {
-                    let expanded = compile_file_load_forms(nested_forms[index], env)?;
-                    if index + 1 == nested_forms.len() && expanded.is_empty() {
-                        result.push(NIL);
-                    } else {
-                        result.extend(expanded);
-                    }
-                }
-                // Flattening removes this MACROLET from the load actions.
-                // Expand uses inside emitted definitions before restoring the
-                // outer environment, or their bodies retain orphaned calls to
-                // local macros (for example Ironclad's MODE-LAMBDA).
-                let mut menv = macroexpand_environment_from_cli(env);
-                egcl_rt::rooted_ref!(_menv_root = &mut menv);
-                // macroexpand_all may relocate the rooted vector's values.
-                // Do not retain an iterator's mutable element borrow across it.
-                #[allow(clippy::needless_range_loop)]
-                for index in 0..result.len() {
-                    result[index] = compiler_macroexpand::macroexpand_all(result[index], &menv)?;
-                }
-                Ok::<(), EgclError>(())
-            })();
-            restore_toplevel_macrolet(env, &mut saved_names, &mut saved_definitions);
-            nested_result?;
-            if result.is_empty() {
-                result.push(NIL);
-            }
-            Ok(result)
-        }
-        _ => Ok(vec![*form]),
     }
 }
 
+/// Expand executable condition fields without expanding away the structural
+/// definition itself. Names, parent types and non-executable slot options are
+/// syntax, so a local symbol macro must not rewrite them.
+fn compile_file_condition_lexical_fields(form: EgclVal, env: &Env) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted!(parts = list_to_vec(form));
+    if parts.len() < 4 {
+        return Ok(form);
+    }
+    egcl_rt::rooted!(menv = macroexpand_environment_from_cli(env));
+    egcl_rt::rooted!(slots = list_to_vec(parts[3]));
+    for index in 0..slots.len() {
+        if !slots[index].is_cons() {
+            continue;
+        }
+        egcl_rt::rooted!(slot = list_to_vec(slots[index]));
+        for option in (1..slot.len().saturating_sub(1)).step_by(2) {
+            if is_keyword_arg(slot[option]) && sym_bare_name_rc(slot[option]).as_ref() == "INITFORM"
+            {
+                slot[option + 1] = compiler_macroexpand::macroexpand_all(slot[option + 1], &menv)?;
+            }
+        }
+        slots[index] = vec_to_list(&slot);
+    }
+    parts[3] = vec_to_list(&slots);
+    for index in 4..parts.len() {
+        if !parts[index].is_cons() {
+            continue;
+        }
+        egcl_rt::rooted!(option = list_to_vec(parts[index]));
+        if option.len() < 2 || !is_keyword_arg(option[0]) {
+            continue;
+        }
+        match sym_bare_name_rc(option[0]).as_ref() {
+            "REPORT"
+                if option[1].is_cons()
+                    && sym_bare_name_rc(cp(option[1]).0).as_ref() == "LAMBDA" =>
+            {
+                option[1] = compiler_macroexpand::macroexpand_all(option[1], &menv)?;
+            }
+            "DEFAULT-INITARGS" => {
+                for value in (2..option.len()).step_by(2) {
+                    option[value] = compiler_macroexpand::macroexpand_all(option[value], &menv)?;
+                }
+            }
+            _ => {}
+        }
+        parts[index] = vec_to_list(&option);
+    }
+    Ok(vec_to_list(&parts))
+}
+
+/// Process the computed expansion in source order, retaining its load forms.
+/// No second pass may re-expand the original after its compile-time effects.
+fn compile_file_load_forms(
+    form: EgclVal,
+    env: &mut Env,
+) -> Result<Vec<EgclVal>, CompileToplevelError> {
+    compile_file_process_form(form, env, CompileToplevelMode::NotCompileTime, false, 0)
+}
+
+fn compile_file_process_body(
+    body: EgclVal,
+    env: &mut Env,
+    mode: CompileToplevelMode,
+    lexical: bool,
+    depth: u32,
+) -> Result<Vec<EgclVal>, CompileToplevelError> {
+    egcl_rt::rooted!(children = list_to_vec(body));
+    egcl_rt::rooted!(result = Vec::<EgclVal>::new());
+    for index in 0..children.len() {
+        let emitted = compile_file_process_form(children[index], env, mode, lexical, depth + 1)?;
+        if index + 1 == children.len() && emitted.is_empty() {
+            result.push(NIL);
+        } else {
+            result.extend(emitted);
+        }
+    }
+    if result.is_empty() {
+        result.push(NIL);
+    }
+    Ok((*result).clone())
+}
+
+/// LOCALLY, MACROLET and SYMBOL-MACROLET declarations remain in force while
+/// effects and lexical expansions run, and around every retained load form.
+fn compile_file_process_scope(
+    body: EgclVal,
+    env: &mut Env,
+    mode: CompileToplevelMode,
+    depth: u32,
+) -> Result<Vec<EgclVal>, CompileToplevelError> {
+    egcl_rt::rooted!(body = body);
+    let saved_locally = env.locally_specials.clone();
+    env.locally_specials.extend(let_body_special_decls(*body));
+    let mark = enter_body_declarations(env, *body);
+    egcl_rt::rooted!(declarations = Vec::<EgclVal>::new());
+    while body.is_cons() {
+        let declaration = cp(*body).0;
+        if !declaration.is_cons() || sym_bare_name_rc(cp(declaration).0).as_ref() != "DECLARE" {
+            break;
+        }
+        declarations.push(declaration);
+        *body = cp(*body).1;
+    }
+    let outcome = compile_file_process_body(*body, env, mode, true, depth);
+    env.locally_specials = saved_locally;
+    leave_body_declarations(env, mark);
+    egcl_rt::rooted!(result = outcome?);
+    if !declarations.is_empty() {
+        let locally = resolve_sym("CL:LOCALLY").unwrap_or(NIL);
+        for index in 0..result.len() {
+            egcl_rt::rooted!(parts = vec![locally]);
+            parts.extend(declarations.iter().copied());
+            parts.push(result[index]);
+            result[index] = vec_to_list(&parts);
+        }
+    }
+    Ok((*result).clone())
+}
+
+fn compile_file_process_form(
+    form: EgclVal,
+    env: &mut Env,
+    mode: CompileToplevelMode,
+    lexical: bool,
+    depth: u32,
+) -> Result<Vec<EgclVal>, CompileToplevelError> {
+    egcl_rt::rooted_ref!(_env_root = &mut *env);
+    egcl_rt::rooted!(form = form);
+    if depth > 100 {
+        return Ok(vec![*form]);
+    }
+    if form.is_cons() {
+        let (op, cdr) = cp(*form);
+        if op.is_symbol() {
+            let name = sym_name(op);
+            match symbol_leaf_name(&name) {
+                "PROGN" => return compile_file_process_body(cdr, env, mode, lexical, depth),
+                "EVAL-WHEN" => {
+                    let (situations, body) = cp(cdr);
+                    let ct =
+                        eval_when_has_situation(situations, EvalWhenSituation::CompileToplevel)?;
+                    let lt = eval_when_has_situation(situations, EvalWhenSituation::LoadToplevel)?;
+                    let execute = eval_when_has_situation(situations, EvalWhenSituation::Execute)?;
+                    if lt {
+                        let next = if ct
+                            || (execute && matches!(mode, CompileToplevelMode::CompileTimeToo))
+                        {
+                            CompileToplevelMode::CompileTimeToo
+                        } else {
+                            CompileToplevelMode::NotCompileTime
+                        };
+                        return compile_file_process_body(body, env, next, lexical, depth);
+                    }
+                    if ct || (execute && matches!(mode, CompileToplevelMode::CompileTimeToo)) {
+                        // An Evaluate row uses ordinary evaluation, so nested
+                        // compile-only EVAL-WHENs do not become top-level forms.
+                        with_eval_context(env, EvalContext::Eval, |env| eval_progn(body, env))?;
+                    }
+                    return Ok(Vec::new());
+                }
+                "LOCALLY" => return compile_file_process_scope(cdr, env, mode, depth),
+                "MACROLET" => {
+                    let (definitions, body) = cp(cdr);
+                    egcl_rt::rooted!(body = body);
+                    let mut names = Vec::new();
+                    egcl_rt::rooted!(saved = Vec::<Option<MacroDef>>::new());
+                    bind_toplevel_macrolet(definitions, env, &mut names, &mut saved);
+                    let outcome = compile_file_process_scope(*body, env, mode, depth);
+                    restore_toplevel_macrolet(env, &mut names, &mut saved);
+                    return outcome;
+                }
+                "SYMBOL-MACROLET" => {
+                    check_symbol_macrolet_bindings(cdr)?;
+                    let (bindings, body) = cp(cdr);
+                    egcl_rt::rooted!(body = body);
+                    egcl_rt::rooted!(bindings = list_to_vec(bindings));
+                    // Keep the old lexical table scanned after copy-on-write
+                    // removes it from the live Env. Restore it on every exit.
+                    egcl_rt::rooted!(saved = env.clone());
+                    for index in 0..bindings.len() {
+                        let (symbol, rest) = cp(bindings[index]);
+                        env.define_symbol_macro(symbol, cp(rest).0);
+                    }
+                    let outcome = compile_file_process_scope(*body, env, mode, depth);
+                    env.symbol_macros = Rc::clone(&saved.symbol_macros);
+                    return outcome;
+                }
+                "DEFVAR" | "DEFPARAMETER"
+                    if egcl_stdlib::find_package("COMMON-LISP").is_some_and(|package| {
+                        egcl_stdlib::find_present_symbol(package, symbol_leaf_name(&name))
+                            == Some(op)
+                    }) =>
+                {
+                    proclaim_special(cp(cdr).0);
+                }
+                "DEFINE-PACKAGE" if bootstrap_define_package_operator(op, env) => {
+                    eval_defpackage(cdr, env)?;
+                    return Ok(vec![*form]);
+                }
+                "DEFINE-CONDITION" => {
+                    // Preserve the structural BFASL definition boundary. Its
+                    // computed expansion supplies only the compile-time effects.
+                    if lexical {
+                        *form = compile_file_condition_lexical_fields(*form, env)
+                            .map_err(CompileToplevelError::Residual)?;
+                    }
+                    if let Some(definition) = lookup_macro(env, &name) {
+                        let expansion = match expand_macro(&definition, cp(*form).1, env, *form) {
+                            Ok(expansion) => expansion,
+                            Err(error) if must_escape_best_effort(&error) => {
+                                return Err(error.into());
+                            }
+                            // Keep the structural definition for its existing
+                            // lowering/error-report path after failed expansion.
+                            Err(_) => return Ok(vec![*form]),
+                        };
+                        egcl_rt::rooted!(expanded = expansion);
+                        compile_file_process_form(*expanded, env, mode, false, depth + 1)?;
+                        return Ok(vec![*form]);
+                    }
+                }
+                _ => {}
+            }
+            let expanded = expand_compile_toplevel_form(*form, env)?;
+            if expanded != *form {
+                return compile_file_process_form(expanded, env, mode, lexical, depth + 1);
+            }
+        }
+    }
+    // Resolve local uses before the scope disappears and before a later sibling
+    // mutates the compilation environment. Retain this exact residual for LOAD.
+    if lexical {
+        egcl_rt::rooted!(menv = macroexpand_environment_from_cli(env));
+        *form = compiler_macroexpand::macroexpand_all(*form, &menv)
+            .map_err(CompileToplevelError::Residual)?;
+    }
+    if matches!(mode, CompileToplevelMode::CompileTimeToo)
+        || compile_toplevel_form_has_effect(*form, env)
+    {
+        with_eval_context(env, EvalContext::Eval, |env| eval_form(*form, env))?;
+    }
+    Ok(vec![*form])
+}
 /// Establish a top-level MACROLET's local macros in `env`, recording each
 /// name and the definition it shadows in `saved_names`/`saved_definitions`
 /// for `restore_toplevel_macrolet`. The caller roots `saved_definitions`.
@@ -16162,6 +16325,24 @@ fn compile_file_in_package_name(form: EgclVal) -> Option<String> {
         return None;
     }
     let (op, cdr) = cp(form);
+    if op.is_symbol() && symbol_leaf_name(&sym_name(op)) == "LOCALLY" {
+        let mut body = cdr;
+        while body.is_cons() {
+            let (first, tail) = cp(body);
+            if first.is_cons() && sym_bare_name_rc(cp(first).0).as_ref() == "DECLARE" {
+                body = tail;
+            } else {
+                // The traversal wraps each residual separately. Recognizing
+                // only a single executable child also keeps the BBU package
+                // action from discarding unrelated work in a larger LOCALLY.
+                return tail
+                    .is_nil()
+                    .then(|| compile_file_in_package_name(first))
+                    .flatten();
+            }
+        }
+        return None;
+    }
     if !op.is_symbol() || symbol_leaf_name(&sym_name(op)) != "IN-PACKAGE" {
         return None;
     }
@@ -16179,7 +16360,6 @@ fn compile_file_in_package_name(form: EgclVal) -> Option<String> {
             .to_uppercase(),
     )
 }
-
 /// The legacy unqualified DEFINE-PACKAGE spelling is a bootstrap convenience.
 /// Package-local macros with that name must go through ordinary expansion.
 fn bootstrap_define_package_operator(op: EgclVal, env: &Env) -> bool {
@@ -16247,152 +16427,9 @@ fn compile_toplevel_form_has_effect(form: EgclVal, env: &Env) -> bool {
     )
 }
 
+#[cfg(test)]
 fn process_compile_toplevel_form(form: EgclVal, env: &mut Env) -> Result<(), EgclError> {
-    process_compile_toplevel_form_at(form, env, 0)
-}
-
-/// Process one top-level form for its COMPILE-time effects (CLHS 3.2.3.1).
-///
-/// The three recursive cases are what make this more than a table lookup:
-///
-///   - PROGN: its subforms are themselves top-level forms, so they are processed
-///     INDIVIDUALLY. Evaluating the whole PROGN would run its ordinary forms at
-///     compile time — the same defect as the macro case below.
-///   - a macro call: MACROEXPAND it and process the expansion, so a macro that
-///     expands into an EVAL-WHEN or a definition still has its compile-time
-///     effect, while one that merely computes does not run (bliss-t4qs).
-///   - everything else: evaluated only if it is on the R3.2.3.1 list.
-fn process_compile_toplevel_form_at(
-    form: EgclVal,
-    env: &mut Env,
-    depth: u32,
-) -> Result<(), EgclError> {
-    // Macro expansion is bounded like every other expansion path here; a macro
-    // that expands to itself must not spin during compilation.
-    if depth > 100 {
-        return Ok(());
-    }
-    if form.is_cons() {
-        let (op, cdr) = cp(form);
-        if op.is_symbol() {
-            let name = sym_name(op);
-            match symbol_leaf_name(&name) {
-                "DEFVAR" | "DEFPARAMETER"
-                    if egcl_stdlib::find_package("COMMON-LISP").is_some_and(|package| {
-                        egcl_stdlib::find_present_symbol(package, symbol_leaf_name(&name))
-                            == Some(op)
-                    }) =>
-                {
-                    // This declaration is needed by subsequent forms, including
-                    // definitions introduced by a top-level macro expansion.
-                    // Proclaiming a symbol does not allocate Lisp objects.
-                    proclaim_special(cp(cdr).0);
-                    return Ok(());
-                }
-                "DEFINE-PACKAGE" if bootstrap_define_package_operator(op, env) => {
-                    eval_defpackage(cdr, env)?;
-                    return Ok(());
-                }
-                // A top-level MACROLET's body forms are top-level forms
-                // processed with its local macros in effect (CLHS 3.2.3.1), so
-                // an EVAL-WHEN (:COMPILE-TOPLEVEL) one of them expands into
-                // runs now, as at plain top level (GH #527).
-                "MACROLET" => {
-                    let (defs_form, body) = cp(cdr);
-                    let mut saved_names = Vec::new();
-                    let mut saved_definitions = Vec::<Option<MacroDef>>::new();
-                    egcl_rt::rooted_ref!(_saved_definitions_root = &mut saved_definitions);
-                    bind_toplevel_macrolet(defs_form, env, &mut saved_names, &mut saved_definitions);
-                    let mut rest = body;
-                    egcl_rt::rooted_ref!(_rest_root = &mut rest);
-                    let mut outcome = Ok(());
-                    while rest.is_cons() {
-                        let sub = cp(rest).0;
-                        outcome = process_compile_toplevel_form_at(sub, env, depth + 1);
-                        if outcome.is_err() {
-                            break;
-                        }
-                        rest = cp(rest).1;
-                    }
-                    restore_toplevel_macrolet(env, &mut saved_names, &mut saved_definitions);
-                    return outcome;
-                }
-                // So are a top-level LOCALLY's; its declarations have no
-                // compile-time effect here.
-                "LOCALLY" => {
-                    let mut rest = cdr;
-                    egcl_rt::rooted_ref!(_rest_root = &mut rest);
-                    while rest.is_cons() {
-                        let sub = cp(rest).0;
-                        process_compile_toplevel_form_at(sub, env, depth + 1)?;
-                        rest = cp(rest).1;
-                    }
-                    return Ok(());
-                }
-                // A top-level PROGN's subforms are top-level forms.
-                "PROGN" => {
-                    let mut rest = cdr;
-                    egcl_rt::rooted_ref!(_rest_root = &mut rest);
-                    while rest.is_cons() {
-                        let sub = cp(rest).0;
-                        process_compile_toplevel_form_at(sub, env, depth + 1)?;
-                        rest = cp(rest).1;
-                    }
-                    return Ok(());
-                }
-                // A top-level EVAL-WHEN (CLHS 3.2.3.1): with :COMPILE-TOPLEVEL
-                // its body is evaluated now (compile-time-too mode, the EVAL-WHEN
-                // arm of eval_form). WITHOUT it but with :LOAD-TOPLEVEL, the body
-                // forms are still top-level forms, processed in not-compile-time
-                // mode -- so a nested (:compile-toplevel ...) EVAL-WHEN, a
-                // DEFMACRO or a DEFPACKAGE among them keeps its compile-time
-                // effect. Evaluating the whole form instead asked
-                // eval_when_should_run, which answers NIL for the outer form and
-                // never reaches the inner one: cl-store's DEFBACKEND expands to
-                // exactly that nest around its DEFSTORE-/DEFRESTORE- macros, so
-                // every later use in the file compiled as a function call and
-                // the fasl died loading with "STREAM is unbound". An
-                // :EXECUTE-only top-level EVAL-WHEN has no compile-time effect.
-                "EVAL-WHEN" => {
-                    let (situations, body) = cp(cdr);
-                    if eval_when_has_situation(situations, EvalWhenSituation::CompileToplevel)? {
-                        eval_form(form, env)?;
-                    } else if eval_when_has_situation(situations, EvalWhenSituation::LoadToplevel)? {
-                        let mut rest = body;
-                        egcl_rt::rooted_ref!(_rest_root = &mut rest);
-                        while rest.is_cons() {
-                            let sub = cp(rest).0;
-                            process_compile_toplevel_form_at(sub, env, depth + 1)?;
-                            rest = cp(rest).1;
-                        }
-                    }
-                    return Ok(());
-                }
-                _ => {}
-            }
-            // A macro call is expanded, then its expansion processed.
-            if let Some(mdef) = lookup_macro(env, &name) {
-                match expand_macro(&mdef, cdr, env, form) {
-                    Ok(mut expanded) => {
-                        egcl_rt::rooted_ref!(_expanded_root = &mut expanded);
-                        return process_compile_toplevel_form_at(expanded, env, depth + 1);
-                    }
-                    // A handler's non-local exit (or a request to stop) leaving
-                    // the expander is not a failed expansion.
-                    Err(error) if must_escape_best_effort(&error) => return Err(error),
-                    // An expander that fails here has no compile-time effect
-                    // to process. The form stays in the file, and the file
-                    // compiler reports the error when it lowers the form,
-                    // compiling it to code that signals instead (GitHub #514).
-                    Err(_) => return Ok(()),
-                }
-            }
-        }
-    }
-    if compile_toplevel_form_has_effect(form, env) {
-        eval_form(form, env)?;
-    }
-    Ok(())
+    compile_file_load_forms(form, env).map(|_| ()).map_err(CompileToplevelError::into_error)
 }
 
 /// The on-disk ASDF that REQUIRE loads, if there is one: EGCL_ASDF_FILE when
