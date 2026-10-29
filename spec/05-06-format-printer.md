@@ -145,6 +145,13 @@ struct CircularityDetector {
 
 Recursive descent over the format string producing `Vec<FormatOp>`.
 
+Closing `~:@>` inserts fill-style conditional newlines after groups of literal
+body blanks before compatibility validation. This is lexical: nested bodies
+inherit the insertion, while argument text and separately supplied controls
+remain opaque. Retained indentation after a tilde-newline is exempt. Prefixes
+and suffixes must be constant text; an enclosing block's insertion can make
+nested metadata or nested ordinary justification invalid.
+
 Validate directive compatibility before consuming argument-dependent parameters.
 Ordinary justification cannot contain `~W`, `~I`, `~_`, section tabs (`~:T`
 or `~:@T`), or logical blocks. Overflow justification (`~<...~:;...~>`)
