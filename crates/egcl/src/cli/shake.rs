@@ -604,9 +604,10 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
                 }
                 if !is_keyword_arg(value)
                     && symbols::symbol_name(index).is_some_and(|name| {
-                        crate::runtime_contract::opens_code_world(
-                            name.rsplit(':').next().unwrap_or(&name),
-                        )
+                        // Dispatch uses the complete key. Foreign functions
+                        // named READ/EVAL/etc. are not the CL builtin. Actual
+                        // aliases retain their callable's source/code edges.
+                        crate::runtime_contract::opens_code_world(&name)
                     })
                 {
                     if capabilities.insert("dynamic-code".into()) {
