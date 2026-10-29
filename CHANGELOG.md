@@ -11,6 +11,9 @@
   including `NIL` and `T`, and preserves their case and readtable settings
   across stream and string output
   ([#831](https://github.com/atgreen/evergreen/pull/831)).
+- `GENSYM` uses decimal suffixes independently of printer controls and avoids
+  recursive pretty-printer calls while generating symbol names
+  ([#834](https://github.com/atgreen/evergreen/pull/834)).
 
 - `*PRINT-CIRCLE*` preserves shared arrays and uninterned symbols, and prints
   cycles through vectors and multidimensional arrays without runaway expansion
