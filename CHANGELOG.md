@@ -9,6 +9,10 @@
   retention while preserving actual builtin aliases
   ([#886](https://github.com/atgreen/evergreen/pull/886)).
 
+- `EGCL-EXT:FUNCTION-TIER` and `EGCL-EXT:FUNCTION-OSR-COUNT` are available
+  as function objects for `FUNCALL`, `MAPCAR`, and other higher-order calls
+  ([#885](https://github.com/atgreen/evergreen/pull/885)).
+
 - Class metadata fallback resolves symbol names before locking its source
   table, avoiding lock-order panics during condition construction
   ([#884](https://github.com/atgreen/evergreen/pull/884)).
