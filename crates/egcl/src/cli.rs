@@ -9901,8 +9901,14 @@ fn try_single_primary_fast(
                 egcl_rt::rooted!(value = args[0]);
                 egcl_rt::rooted!(object = args[1]);
                 egcl_rt::rooted!(typespec = struct_slot_typespec(*object, slot));
-                let admitted =
-                    *typespec == T || matches!(typep_matches(env, *value, *typespec), Ok(true));
+                let admitted = if *typespec == T {
+                    true
+                } else {
+                    match declaration_typep_matches(env, *value, *typespec, false, 0) {
+                        Ok(admitted) => admitted,
+                        Err(error) => return Some(Err(error)),
+                    }
+                };
                 if admitted
                     && egcl_stdlib::set_slot_value_if_present(*object, slot, *value).is_some()
                 {
@@ -23764,6 +23770,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             | "EGCL::%VECTOR-SEARCH"
             | "EGCL::%VECTOR-FILL"
             | "EGCL::%STRUCT-SLOT-TYPESPEC"
+            | "EGCL::%DECLARATION-TYPEP"
             | "EGCL::%MAKE-SIMPLE-ARRAY"
             | "EGCL::%MEMORY-FENCE"
             | "EGCL::%PROGV"
@@ -40042,8 +40049,64 @@ fn checked_struct_slot_form(form: EgclVal, slot_type: EgclVal) -> EgclVal {
     let sym = |name: &str| resolve_sym(name).unwrap_or(NIL);
     egcl_rt::rooted!(binding = vec_to_list(&[value, *form]));
     egcl_rt::rooted!(bindings = vec_to_list(&[*binding]));
-    egcl_rt::rooted!(check = vec_to_list(&[sym("CHECK-TYPE"), value, *slot_type]));
+    egcl_rt::rooted!(check = vec_to_list(&[sym("EGCL::%CHECK-STRUCTURE-TYPE"), value, *slot_type]));
     vec_to_list(&[sym("LET"), *bindings, *check, value])
+}
+
+/// A checkable approximation of a declaration, rather than public TYPEP's
+/// membership question. A function signature constrains calls; it cannot be
+/// discriminated by TYPEP. Its upper bound is FUNCTION and its lower bound NIL.
+/// Complementing a type swaps these bounds, preserving checkable restrictions
+/// even under NOT without pretending to inspect unknown function signatures.
+fn declaration_typep_matches(
+    env: &mut Env,
+    object: EgclVal,
+    spec: EgclVal,
+    lower_bound: bool,
+    depth: usize,
+) -> Result<bool, EgclError> {
+    if depth == 64 {
+        return Err(EgclError::ProgramError("circular declaration type".into()));
+    }
+    egcl_rt::rooted!(object = object);
+    egcl_rt::rooted!(spec = resolve_type_spec(env, spec)?);
+    if !spec.is_cons() {
+        return typep_matches(env, *object, *spec);
+    }
+    let (head, tail) = cp(*spec);
+    if !head.is_symbol() || symbol_home_package_name(head) != "COMMON-LISP" {
+        return typep_matches(env, *object, *spec);
+    }
+    let name = sym_bare_name_rc(head);
+    if name.as_ref() == "FUNCTION" {
+        return Ok(!lower_bound && is_function_value(*object));
+    }
+    if !matches!(name.as_ref(), "OR" | "AND" | "NOT") {
+        return typep_matches(env, *object, *spec);
+    }
+    egcl_rt::rooted!(operands = list_to_vec(tail));
+    match name.as_ref() {
+        "NOT" if operands.len() == 1 => Ok(!declaration_typep_matches(
+            env, *object, operands[0], !lower_bound, depth + 1,
+        )?),
+        "NOT" => Err(EgclError::ProgramError("NOT type takes one argument".into())),
+        "OR" => {
+            for index in 0..operands.len() {
+                if declaration_typep_matches(env, *object, operands[index], lower_bound, depth + 1)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        _ => {
+            for index in 0..operands.len() {
+                if !declaration_typep_matches(env, *object, operands[index], lower_bound, depth + 1)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+    }
 }
 
 // Convert the existing positional structure constructor into a sequence
@@ -44426,6 +44489,7 @@ fn is_builtin_function(name: &str) -> bool {
             | "EGCL::%VECTOR-SEARCH"
             | "EGCL::%VECTOR-FILL"
             | "EGCL::%STRUCT-SLOT-TYPESPEC"
+            | "EGCL::%DECLARATION-TYPEP"
             | "EGCL::%MAKE-SIMPLE-ARRAY"
             | "EGCL::%MEMORY-FENCE"
             | "EGCL::%PROGV"
