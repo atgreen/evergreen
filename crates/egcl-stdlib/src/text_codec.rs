@@ -38,11 +38,13 @@ pub fn call(args: &[EgclVal]) -> Result<EgclVal, EgclError> {
             if !terminate.is_nil() {
                 bytes.push(0);
             }
-            let values: Vec<_> = bytes
-                .into_iter()
-                .map(|byte| EgclVal::from_fixnum(i64::from(byte)))
-                .collect();
-            Ok(crate::sequences::build_simple_vector(&values))
+            // An (unsigned-byte 8) vector, so OCTETS-TO-STRING and other
+            // octet consumers accept the result.
+            let octets = egcl_rt::packed_u8::make(bytes.len(), 0)?;
+            for (index, byte) in bytes.into_iter().enumerate() {
+                egcl_rt::packed_u8::set(octets, index, byte);
+            }
+            Ok(octets)
         }
         "DECODE" => {
             egcl_rt::rooted!(source = *source);
