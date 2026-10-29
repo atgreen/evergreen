@@ -39696,6 +39696,11 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     home_defined_symbol(env, name_sym);
     let name_str = sym_bare_name_rc(name_sym);
     let definition_package = resolve_package_name_cow(env, &env.current_package).into_owned();
+    egcl_rt::rooted!(
+        definition_package_object = egcl_stdlib::find_package(&definition_package).ok_or_else(|| {
+            EgclError::PackageError(format!("package not found: {definition_package}"))
+        })?
+    );
 
     // Parse DEFSTRUCT options from the `(name option...)` head. Supported:
     // :conc-name (accessor prefix), :constructor (custom / BOA / suppressed),
@@ -39905,7 +39910,11 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         let accessor = match &conc_name {
             None => slot_sym,
             Some(prefix) => {
-                resolve_sym(&format!("{definition_package}::{prefix}{slot_str}")).unwrap_or(NIL)
+                // A generated name may already be inherited from a used package.
+                // INTERN preserves that symbol, including its exported identity,
+                // instead of manufacturing a private qualified lookalike.
+                let accessor_name = format!("{prefix}{slot_str}");
+                egcl_stdlib::intern(&accessor_name, *definition_package_object)?.0
             }
         };
         let initarg = resolve_sym(&format!(":{slot_str}")).unwrap_or(NIL);
@@ -40007,7 +40016,8 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             let accessor = match &conc_name {
                 None => slot_sym,
                 Some(prefix) => {
-                    resolve_sym(&format!("{definition_package}::{prefix}{bare_sname}")).unwrap_or(NIL)
+                    let accessor_name = format!("{prefix}{bare_sname}");
+                    egcl_stdlib::intern(&accessor_name, *definition_package_object)?.0
                 }
             };
             // A `(slot … :read-only t)` override makes the inherited slot
@@ -40142,7 +40152,10 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     // MAKE-INSTANCE (so inherited slots Just Work); a BOA constructor maps its
     // positional lambda list to slot initargs by name.
     if (constructors.is_empty() || explicit_default_ctor) && !suppress_default_ctor {
-        constructors.push((sym(&format!("{definition_package}::MAKE-{name_str}")), None));
+        let constructor = egcl_stdlib::intern(
+            &format!("MAKE-{name_str}"), *definition_package_object,
+        )?.0;
+        constructors.push((constructor, None));
     }
     for (ctor_name, boa) in &constructors {
         let ctor_defun = match boa {
@@ -40353,7 +40366,9 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     // intermediates so a minor GC while a later element allocates cannot stale
     // them (bliss-bjue).
     let pred_name = match predicate_spec {
-        NameSpec::Default => Some(sym(&format!("{definition_package}::{name_str}-P"))),
+        NameSpec::Default => Some(egcl_stdlib::intern(
+            &format!("{name_str}-P"), *definition_package_object,
+        )?.0),
         NameSpec::Custom(n) => Some(n),
         NameSpec::Suppressed => None,
     };
@@ -40373,7 +40388,9 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     // The copier is COPY-NAME by default, a caller-chosen name for
     // `(:copier name)`, or omitted for `(:copier nil)` (ansi-test struct-test-20/21).
     let copy_name = match copier_spec {
-        NameSpec::Default => Some(sym(&format!("{definition_package}::COPY-{name_str}"))),
+        NameSpec::Default => Some(egcl_stdlib::intern(
+            &format!("COPY-{name_str}"), *definition_package_object,
+        )?.0),
         NameSpec::Custom(n) => Some(n),
         NameSpec::Suppressed => None,
     };
