@@ -2005,6 +2005,10 @@ fn skip_whitespace_and_comments(
             if code == 1 {
                 pos += 1;
             } else if code == 2 && delegate == ';' {
+                // Consume the macro character before looking for the comment's
+                // terminating newline: the opening character may itself be a
+                // newline given semicolon syntax by SET-SYNTAX-FROM-CHAR.
+                pos += 1;
                 while chars.has(pos)? && chars.at(pos)? != '\n' {
                     pos += 1;
                 }
@@ -4667,6 +4671,22 @@ pub fn copy_readtable(from: EgclVal, to: Option<EgclVal>) -> Result<EgclVal, Egc
     };
     let src_key = readtable_key(from);
     let dst_key = readtable_key(dest);
+    // Character syntax includes the standard-reader delegate installed by
+    // SET-SYNTAX-FROM-CHAR, even when no custom Lisp handler is registered.
+    // Snapshot first so copying a table onto itself preserves its overrides.
+    {
+        let mut guard = CHAR_SYNTAX.lock().unwrap();
+        let table = guard.get_or_insert_with(HashMap::new);
+        let copies: Vec<_> = table
+            .iter()
+            .filter(|&(&(key, _), _)| key == src_key)
+            .map(|(&(_, ch), &syntax)| (ch, syntax))
+            .collect();
+        table.retain(|&(key, _), _| key != dst_key);
+        for (ch, syntax) in copies {
+            table.insert((dst_key, ch), syntax);
+        }
+    }
     let mut guard = MACRO_CHARS.lock().unwrap();
     let table = guard.get_or_insert_with(HashMap::new);
     let copies: Vec<_> = table
