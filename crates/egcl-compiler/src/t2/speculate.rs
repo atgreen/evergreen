@@ -1371,16 +1371,31 @@ fn speculate_selected(
                 if name == "MOD" && let Some(mask) = mod_mask_of(f, &data.args, &consts) {
                     work.push((inst, Opcode::LogAnd, result_type(spec),
                         ExtraArg::ReplaceSecondWithFixnum(mask)));
-                } else if target_support::fixnum_division() {
+                } else {
+                    // Two families, because a port reaches the select first:
+                    // ppc64le encodes MIN/MAX with `isel` but has no arm for
+                    // the division sequence. Selecting an opcode the host
+                    // emitter refuses would cost the whole function its T2
+                    // code, which is worse than the call being replaced.
                     let opcode = match name.as_str() {
-                        "MIN" => Opcode::FixnumMin,
-                        "MAX" => Opcode::FixnumMax,
-                        "MOD" => Opcode::FixnumMod,
-                        "REM" => Opcode::FixnumRem,
+                        "MIN" if target_support::fixnum_select() => Opcode::FixnumMin,
+                        "MAX" if target_support::fixnum_select() => Opcode::FixnumMax,
+                        "MOD" if target_support::fixnum_division() => Opcode::FixnumMod,
+                        "REM" if target_support::fixnum_division() => Opcode::FixnumRem,
                         // The quotient-only form is valid only when all normal
                         // successor paths discard the secondary remainder.
-                        "FLOOR" if discarded_values.contains(&inst) => Opcode::FixnumFloor,
-                        "TRUNCATE" if discarded_values.contains(&inst) => Opcode::FixnumDiv,
+                        "FLOOR"
+                            if target_support::fixnum_division()
+                                && discarded_values.contains(&inst) =>
+                        {
+                            Opcode::FixnumFloor
+                        }
+                        "TRUNCATE"
+                            if target_support::fixnum_division()
+                                && discarded_values.contains(&inst) =>
+                        {
+                            Opcode::FixnumDiv
+                        }
                         _ => continue,
                     };
                     work.push((inst, opcode, result_type(spec), ExtraArg::None));
