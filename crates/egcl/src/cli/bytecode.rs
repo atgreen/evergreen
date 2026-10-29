@@ -11271,10 +11271,7 @@ fn compile_thunk(form: EgclVal, env: &Env, portable: bool) -> Option<BytecodeFun
         // Do not move expansion across EVAL-WHEN/defining/load-time boundaries.
         // Ordinary top-level processing/fallback retains their phase ordering.
         Ok(None) => return None,
-        Err(error) => match file_expansion_failure(*form, &error) {
-            Some(replacement) => replacement,
-            None => return None,
-        },
+        Err(error) => file_expansion_failure(*form, &error)?,
     };
     // The snapshot is one scope-aware WALK, not an EQ cache: two occurrences
     // sharing an input cons can expand under different MACROLET/declaration
