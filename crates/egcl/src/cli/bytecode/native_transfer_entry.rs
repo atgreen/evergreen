@@ -9,7 +9,7 @@
 
 use super::*;
 use super::native_segment_cache::SegmentCacheEntry;
-use super::super::CONTROL_COUNTER;
+use super::super::{CONTROL_COUNTER, lexical_identity};
 use egcl_compiler::control_scope::{Ownership, ScopeKind};
 use egcl_compiler::t2::emit::{RecursiveActivation, RecursiveCallRequest, RecursiveTransfer};
 use egcl_compiler::native_unwind::{next_unwind_step, NativeUnwindStep, SelectedTarget};
@@ -2729,14 +2729,26 @@ unsafe fn lexical_environment_leaf(
         _ => return None,
     };
     let name = owner.body.names.get(usize::from(index))?;
-    let symbol = egcl_rt::symbols::find_index(name);
-    let value = if store {
-        let value = unsafe { *call.args };
-        if !Env::set_resolved_frame_var(frame, name, symbol, value) { return None; }
-        NIL
+    let value = if lexical_identity::encoded(name) {
+        if store {
+            let value = unsafe { *call.args };
+            if !Env::set_lexical_frame(frame, name, value) { return None; }
+            NIL
+        } else {
+            Env::lookup_lexical_frame(frame, name)?
+        }
     } else {
-        // Missing bindings must signal with the full published native stack.
-        Env::lookup_resolved_frame(frame, name, symbol)?
+        // Preserve the resolved ordinary-name fast path. Encoded identity keys
+        // must never be treated as names to intern or resolve in that registry.
+        let symbol = egcl_rt::symbols::find_index(name);
+        if store {
+            let value = unsafe { *call.args };
+            if !Env::set_resolved_frame_var(frame, name, symbol, value) { return None; }
+            NIL
+        } else {
+            // Missing bindings must signal with the full published native stack.
+            Env::lookup_resolved_frame(frame, name, symbol)?
+        }
     };
     #[cfg(test)]
     lexical_leaf_tests::record_hit(store);
@@ -2795,8 +2807,8 @@ unsafe fn lexical_environment_request(
         Instr::LoadEnvVar(index) => {
             assert_eq!(call.nargs, 0);
             let name = name(index)?;
-            Env::lookup_frame(&current()?, name)
-                .ok_or_else(|| EgclError::UnboundVariable(resolve_sym(name).unwrap_or(NIL)))
+            Env::lookup_lexical_frame(&current()?, name)
+                .ok_or_else(|| EgclError::UnboundVariable(lexical_identity::resolve(name).unwrap_or(NIL)))
         }
         Instr::StoreEnvVar(index) | Instr::DefineEnvVar(index) => {
             assert_eq!(call.nargs, 1);
@@ -2804,7 +2816,7 @@ unsafe fn lexical_environment_request(
             // The argument area stays rooted; neither store allocates Lisp.
             let value = unsafe { *call.args };
             if matches!(instruction, Instr::StoreEnvVar(_)) {
-                Env::set_frame_var(&frame, name, value);
+                Env::set_lexical_frame(&frame, name, value);
             } else {
                 bind_boxed_param(&frame, name, value);
             }
