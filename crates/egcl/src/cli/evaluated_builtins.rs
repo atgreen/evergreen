@@ -1798,7 +1798,7 @@ fn resolve(name: &str) -> Option<Handler> {
             env.set_mv(vec![NIL, EgclVal::from_fixnum(0)]);
             Ok(NIL)
         }),
-        "BOUNDP" => Some(|_operator, args, env| {
+        "BOUNDP" => Some(|_operator, args, _env| {
             let sym = args.first().copied().unwrap_or(NIL);
             // NIL and T are constant variables — always bound. Keywords are
             // constant variables bound to themselves (CLHS 11.1.2.3.1).
@@ -1812,12 +1812,10 @@ fn resolve(name: &str) -> Option<Handler> {
                     expected: "SYMBOL".to_string(),
                 });
             }
-            // Resolve the symbol by INDEX (the same resolution an evaluated
-            // variable reference uses), not by name string: a package-interned
-            // symbol's heap name cell holds its BARE name while the registry
-            // key is qualified, so the name-based lookup missed every
-            // qualified global (bliss-o2da).
-            Ok(if env.lookup_var_symbol(sym).is_some() { T } else { NIL })
+            // Like SYMBOL-VALUE, inspect only this symbol's dynamic cell.
+            // Lexical frames and qualified-to-bare fallback do not establish
+            // a binding for BOUNDP and can hide an unbound shadowing symbol.
+            Ok(if sym.symbol_index().and_then(global_value_cell).is_some() { T } else { NIL })
         }),
         "FIND-CLASS" => Some(|_operator, args, env| {
             // (find-class name &optional (errorp t) environment) — the class
