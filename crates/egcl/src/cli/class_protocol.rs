@@ -542,8 +542,8 @@ mod tests {
         egcl_rt::rooted!(
             saved = egcl_stdlib::clos::class_protocol_default_initargs(*class).unwrap()
         );
-        let saved_function = cp(cp(cp(*saved).0).1).1;
-        assert_eq!(cp(saved_function).0, *function);
+        egcl_rt::rooted!(saved_function = cp(cp(cp(*saved).0).1).1);
+        assert_eq!(cp(*saved_function).0, *function);
         assert_eq!(
             apply_function(*function, &[], &mut env).unwrap(),
             EgclVal::from_fixnum(73)
