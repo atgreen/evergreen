@@ -311,3 +311,32 @@ fn make_load_form_uses_standard_hook_when_current_package_shadows_its_name() {
     run(&program, true);
     fixture.finish();
 }
+
+#[test]
+fn make_load_form_restores_literals_in_nested_functions_and_restart_clauses() {
+    let source = format!(
+        "{SHARED_SOURCE}\n{}",
+        r#"
+(defun mlf-nested-result ()
+  (labels ((nested () '#1=#.(make-mlf-node :value 73)))
+    (list (nested)
+          (restart-case (invoke-restart 'use-node)
+            (use-node () '#1#)))))
+"#
+    );
+    let fixture = Fixture::new("nested", &source);
+    fixture.compile(2);
+    fixture.delete_source();
+    let program = format!(
+        "(progn
+           (load {artifact:?})
+           (let ((nodes (mlf-nested-result)))
+             (assert (= (mlf-node-value (first nodes)) 73))
+             (assert (eq (first nodes) (second nodes))))
+           (write-line \"MAKE-LOAD-FORM-OK\"))",
+        artifact = fixture.artifact
+    );
+    run(&program, false);
+    run(&program, true);
+    fixture.finish();
+}
