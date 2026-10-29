@@ -18,20 +18,20 @@
 //!
 //!   * **A full eight-byte span and a partial one take different paths.** The
 //!     partial path walks bytes while streaming the sign extension in from
-//!     above (`EXTR` on AArch64, `SHRD` on x86), so spans of 1..=7 are checked
-//!     individually, not just the 8 case.
+//!     above (`EXTR` on AArch64, `SHRD` on x86). This fixture samples widths
+//!     1, 3 and 7 in addition to the full eight-byte case.
 //!   * **Negative integers are the delicate half.** A negative one-limb bignum
 //!     is negated, which modulo 2^64 gives the low two's-complement octets; a
 //!     negative fixnum sign-extends. Both must write the same bytes `LDB`
-//!     would, so negative values are checked across every span width.
+//!     would; negative values are checked in the sampled cases.
 //!   * **A bignum magnitude must be CANONICAL.** A positive one is at least
 //!     2^60 and a negative one strictly greater than `abs(MIN-FIXNUM)`, because
 //!     anything smaller would have been a fixnum. Values straddling that
 //!     boundary are included.
 //!   * **A multi-limb bignum must take the NIL exit** and still write correctly
 //!     through the retained scalar loop.
-//!   * **Out-of-bounds and short arrays must not be written past.** The end of
-//!     the span may equal the length but not exceed it.
+//!   * Valid spans exercise exact-length and nonzero-start boundaries.
+//!     Out-of-bounds and short-array failure cases need separate coverage.
 
 use std::process::Command;
 
@@ -80,11 +80,10 @@ fn agrees_at_every_tier(program: &str, expected: &[&str]) {
     }
 }
 
-/// The fused kernel must actually be reached, or this file proves nothing about
-/// it — the lesson from #760, where a test passed on hardware while the arm it
-/// covered was never executed.
+/// Assert candidate recognition. This diagnostic precedes final emission and
+/// does not independently prove native installation or kernel execution.
 #[test]
-fn the_octet_kernel_is_reached() {
+fn octet_loop_is_recognized_for_fusion() {
     let program = format!(
         "{DRIVER}
          (dotimes (i 4000) (run 16 0 8 123456789))
@@ -101,8 +100,7 @@ fn the_octet_kernel_is_reached() {
     assert!(out.status.success(), "{stdout}\n{stderr}");
     assert!(
         stderr.lines().any(|l| l.contains("octet word stores:")),
-        "the loop was never fused, so the wide-store kernel was never emitted \
-         and the rest of this file proves nothing:\n{stderr}"
+        "the loop was not recognized for octet word fusion:\n{stderr}"
     );
 }
 
@@ -117,7 +115,7 @@ fn octet_spans_agree_at_every_tier() {
       (format t "FULL8- ~a~%" (run 8 0 8 -123456789))
       (format t "BIG8+ ~a~%" (run 8 0 8 (+ (expt 2 62) 12345)))
       (format t "BIG8- ~a~%" (run 8 0 8 (- (+ (expt 2 62) 12345))))
-      ;; Every partial width, where the sign extension streams in from above.
+      ;; Sampled partial widths, where sign extension streams in from above.
       (format t "P1 ~a~%" (run 8 0 1 -1))
       (format t "P3 ~a~%" (run 8 0 3 -123456789))
       (format t "P7 ~a~%" (run 8 0 7 -123456789))
