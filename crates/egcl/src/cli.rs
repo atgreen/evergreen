@@ -21447,7 +21447,9 @@ fn fixed_arity_builtin(bare: &str) -> Option<(usize, usize)> {
         | "METHOD-GENERIC-FUNCTION" => Some((1, 1)),
         "MAKE-INSTANCE" => Some((1, usize::MAX)),
         "CLOSE" => Some((1, 3)),
-        "FILE-POSITION" | "UNREAD-CHAR" | "WRITE-CHAR" => Some((1, 2)),
+        "FILE-POSITION" | "UNREAD-CHAR" | "WRITE-CHAR" | "PRIN1" | "PRINC" | "PRINT" => {
+            Some((1, 2))
+        }
         "READ-BYTE" => Some((1, 3)),
         "PEEK-CHAR" => Some((0, 5)),
         "READ-CHAR" | "READ-CHAR-NO-HANG" | "READ-LINE" | "READ-PRESERVING-WHITESPACE" | "READ" => {
