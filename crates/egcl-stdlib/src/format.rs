@@ -874,6 +874,10 @@ impl CircleTable {
     /// particular, generic ELT can box packed floats and cannot run while the
     /// new table and pending graph are not registered as GC roots.
     fn scan(&mut self, root: EgclVal) {
+        if let Some(limit) = print_length() {
+            self.scan_limited(root, limit);
+            return;
+        }
         let mut pending = vec![root];
         while let Some(value) = pending.pop() {
             let array = circle_array_length(value);
@@ -907,6 +911,111 @@ impl CircleTable {
         }
     }
 
+    /// Count visible edges once, including a labelled tail's fresh list budget.
+    /// A later reference can make a previously abbreviated cdr into its own
+    /// labelled list. Propagate its larger budget without recounting its car.
+    /// All work and dimension snapshots allocate only Rust storage, never Lisp
+    /// objects, and invoke no user or pretty-printer callbacks.
+    fn scan_limited(&mut self, root: EgclVal, limit: usize) {
+        let mut pending = vec![(root, limit, true)];
+        let mut spine_budgets = std::collections::HashMap::<u64, usize>::new();
+        while let Some((value, remaining, reference)) = pending.pop() {
+            let array = circle_array_length(value);
+            if !value.is_cons() && array.is_none() && !circle_uninterned_symbol(value)
+                && !egcl_rt::random_state::is_random_state(value)
+                && !crate::sequences::is_nil_array(value)
+            {
+                continue;
+            }
+            let count = self.counts.entry(value.0).or_insert(0);
+            if reference {
+                *count += 1;
+            }
+            if value.is_cons() {
+                let budget = if *count > 1 { limit } else { remaining };
+                let previous = spine_budgets.get(&value.0).copied();
+                if previous.is_some_and(|old| old >= budget) {
+                    continue;
+                }
+                spine_budgets.insert(value.0, budget);
+                if budget == 0 {
+                    continue;
+                }
+                let old = previous.unwrap_or(0);
+                let (car, cdr) = unsafe {
+                    let cell = &*(value.as_ptr() as *const egcl_rt::object::ConsCell);
+                    (cell.car, cell.cdr)
+                };
+                if cdr.is_cons() {
+                    if budget > 1 {
+                        pending.push((cdr, budget - 1, old <= 1));
+                    }
+                } else if old == 0 {
+                    // Dotted atoms precede the length test in PPRINT-POP and
+                    // remain visible after the last permitted list element.
+                    pending.push((cdr, limit, true));
+                }
+                if old == 0 {
+                    pending.push((car, limit, true));
+                }
+            } else if *count == 1
+                && let Some(length) = array
+            {
+                Self::scan_limited_array(value, length, limit, &mut pending);
+            }
+        }
+    }
+
+    fn scan_limited_array(
+        value: EgclVal,
+        length: usize,
+        limit: usize,
+        pending: &mut Vec<(EgclVal, usize, bool)>,
+    ) {
+        if length == 0 {
+            return;
+        }
+        let Some(dimensions) = egcl_rt::types::md_array_dims(value) else {
+            for index in (0..length.min(limit)).rev() {
+                if let Some(element) = circle_array_reference(value, index) {
+                    pending.push((element, limit, true));
+                } else {
+                    break;
+                }
+            }
+            return;
+        };
+        // MD dimensions are a simple vector of fixnums (build_md_array_with_storage).
+        // Reuse the nonallocating reference reader rather than general ELT.
+        let rank = egcl_rt::types::md_array_rank(value).unwrap().as_fixnum() as usize;
+        let dimensions = (0..rank)
+            .map(|index| {
+                circle_array_reference(dimensions, index)
+                    .unwrap()
+                    .as_fixnum() as usize
+            })
+            .collect::<Vec<_>>();
+        let mut strides = vec![1; rank];
+        for axis in (1..rank).rev() {
+            strides[axis - 1] = strides[axis] * dimensions[axis];
+        }
+        let mut positions = vec![(0, 0)];
+        while let Some((axis, start)) = positions.pop() {
+            if axis == rank {
+                if let Some(element) = circle_array_reference(value, start) {
+                    pending.push((element, limit, true));
+                } else {
+                    break;
+                }
+            } else {
+                // Push forward so the final pending references are processed
+                // in row-major order by the outer LIFO scan.
+                for index in 0..dimensions[axis].min(limit) {
+                    positions.push((axis + 1, start + index * strides[axis]));
+                }
+            }
+        }
+    }
     fn is_shared(&self, value: EgclVal) -> bool {
         self.counts.get(&value.0).is_some_and(|count| *count >= 2)
     }
@@ -2297,19 +2406,19 @@ fn format_cons(v: EgclVal, escapep: bool) -> String {
     let mut first = true;
     loop {
         if current.is_cons() {
+            if limit.is_some_and(|n| count >= n) {
+                if count > 0 {
+                    out.push(' ');
+                }
+                out.push_str("...");
+                break;
+            }
             // A shared/circular cons reached in the cdr position prints as a
             // dotted tail so its own #N=/#N# label appears (the head cons,
             // `first`, was already labelled above).
             if !first && circle && circle_is_shared(*current) {
                 out.push_str(" . ");
                 out.push_str(&egclval_to_print_string(*current, escapep));
-                break;
-            }
-            if limit.is_some_and(|n| count >= n) {
-                if count > 0 {
-                    out.push(' ');
-                }
-                out.push_str("...");
                 break;
             }
             unsafe {
