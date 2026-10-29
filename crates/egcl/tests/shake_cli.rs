@@ -57,6 +57,107 @@ fn ok(output: Output) -> String {
 const BIN: &str = env!("CARGO_BIN_EXE_egcl");
 
 #[test]
+fn native_shake_distinguishes_qualified_operations_and_actual_builtin_aliases() {
+    let fixture = Fixture::new();
+    for (label, entry, opens_world) in [
+        (
+            "foreign",
+            "(defun main () (+ (read) (read-preserving-whitespace) (read-from-string)
+                               (read-delimited-list) (eval) (load) (require)
+                               (compile) (compile-file)))",
+            false,
+        ),
+        (
+            "canonical",
+            "(defun main () (cl:eval '(cl:quote :ok)))",
+            true,
+        ),
+        (
+            "imported",
+            "(defpackage :qualified-import (:use :cl) (:import-from :cl :read-from-string))
+             (defun main () (qualified-import::read-from-string \"1\"))",
+            true,
+        ),
+        (
+            "aliased",
+            "(setf (symbol-function 'read) (symbol-function 'cl:read))
+             (defun main () (read))",
+            true,
+        ),
+        (
+            "foreign-calls-eval",
+            "(defun eval () (cl:eval '(cl:quote :ok))) (defun main () (eval))",
+            true,
+        ),
+    ] {
+        // Each case saves a fresh world: positive builtin-wrapper caches must
+        // not become unrelated roots of the negative case.
+        let core = fixture.path(&format!("{label}.core"));
+        ok(run(
+            BIN,
+            &[
+                "--no-bootstrap",
+                "--eval",
+                &format!(
+                    r#"
+                    (defpackage :qualified-shake (:use :cl)
+                      (:shadow read read-preserving-whitespace read-from-string
+                               read-delimited-list eval load require compile compile-file))
+                    (in-package :qualified-shake)
+                    (defun read () 1)
+                    (defun read-preserving-whitespace () 1)
+                    (defun read-from-string () 1)
+                    (defun read-delimited-list () 1)
+                    (defun eval () 1)
+                    (defun load () 1)
+                    (defun require () 1)
+                    (defun compile () 1)
+                    (defun compile-file () 1)
+                    (defun dead-helper () :unreachable)
+                    {entry}
+                    (egcl-ext:save-lisp-and-die {core:?})"#
+                ),
+            ],
+        ));
+        let spec = fixture.path(&format!("{label}.shake"));
+        fs::write(
+            &spec,
+            "version = 1\nentry = QUALIFIED-SHAKE::MAIN\nprune-package = QUALIFIED-SHAKE\nruntime = specialized\ndynamic = explicit\n",
+        )
+        .unwrap();
+        let report = ok(run(
+            BIN,
+            &[
+                "--image",
+                &core,
+                "--shake",
+                &spec,
+                "--output",
+                &fixture.path(label),
+                "--dry-run",
+            ],
+        ));
+        let capabilities = report
+            .lines()
+            .find(|line| line.starts_with("capabilities="))
+            .unwrap();
+        assert_eq!(
+            capabilities.contains("dynamic-code"),
+            opens_world,
+            "{label}: {report}"
+        );
+        assert!(
+            report.contains(if opens_world {
+                "keep QUALIFIED-SHAKE::DEAD-HELPER"
+            } else {
+                "remove QUALIFIED-SHAKE::DEAD-HELPER"
+            }),
+            "{label}: {report}"
+        );
+    }
+}
+
+#[test]
 #[ignore = "bliss-mihqk: shake retains every candidate function since the ANSI series; the shaker is conservative, not wrong, so binaries are correct but unpruned"]
 fn shake_prunes_unused_bootstrap_definitions() {
     check_bootstrap_shake(false, false);
