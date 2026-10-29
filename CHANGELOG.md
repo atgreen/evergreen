@@ -76,6 +76,9 @@
 - `TYPEP` preserves class-object membership after a class name is unregistered
   or reused, including anonymous classes and saved images
   ([#833](https://github.com/atgreen/evergreen/pull/833)).
+- Readable printing preserves the dimensions, element type, and adjustability
+  of empty multidimensional arrays, including dimensions following a zero axis
+  ([#832](https://github.com/atgreen/evergreen/pull/832)).
 
 - `*PRINT-CIRCLE*` preserves shared arrays and uninterned symbols, and prints
   cycles through vectors and multidimensional arrays without runaway expansion
