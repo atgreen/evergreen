@@ -30,6 +30,10 @@
   and method-congruence checks use the same metadata as ordinary generics
   ([#847](https://github.com/atgreen/evergreen/pull/847)).
 
+- Generic functions report consistent standard-object and compiled-function
+  type membership across interpreted and compiled representations
+  ([#843](https://github.com/atgreen/evergreen/pull/843)).
+
 - String and stream printers consistently honor `*PRINT-ARRAY*` for array
   layouts, and string printers render package objects through their print hook
   ([#830](https://github.com/atgreen/evergreen/pull/830)).
