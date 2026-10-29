@@ -2955,7 +2955,7 @@ unsafe fn call_or_throw_unpublished(
                 } else {
                     let symbol = EgclVal::from_symbol_index(call.symbol as u32);
                     super::super::symbol_function_object(env, symbol)
-                        .ok_or(EgclError::UndefinedFunction(symbol))
+                        .ok_or_else(|| super::undefined_function_lookup_error(env, symbol))
                 }
             });
             match result {

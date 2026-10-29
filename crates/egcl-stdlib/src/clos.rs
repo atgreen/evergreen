@@ -55,10 +55,61 @@ impl MethodCombinationType {
     }
 }
 
+mod class_protocol;
+pub use class_protocol::{
+    begin_class_finalization, class_protocol_default_initargs, class_protocol_finalized,
+    class_protocol_runtime_defaults, class_protocol_runtime_slots, class_slot_metaobjects,
+    compute_class_precedence_list_default, publish_class_protocol,
+    set_class_direct_slot_metaobjects,
+};
+
 // ── Internal data structures ──────────────────────────────────────
 
 #[derive(Clone)]
+struct ClassProtocol {
+    direct_slots: EgclVal,
+    direct_ready: bool,
+    effective_slots: EgclVal,
+    default_initargs: EgclVal,
+    runtime_default_initargs: EgclVal,
+    runtime_slots: EgclVal,
+    cpl: Option<Vec<EgclVal>>,
+    instance_slots: Option<Vec<EgclVal>>,
+    computed: bool,
+    finalized: bool,
+}
+impl Default for ClassProtocol {
+    fn default() -> Self {
+        Self {
+            direct_slots: NIL,
+            direct_ready: false,
+            effective_slots: NIL,
+            default_initargs: NIL,
+            runtime_default_initargs: NIL,
+            runtime_slots: NIL,
+            cpl: None,
+            instance_slots: None,
+            computed: false,
+            finalized: true,
+        }
+    }
+}
+impl ClassProtocol {
+    fn invalidate_computed(&mut self) {
+        self.effective_slots = NIL;
+        self.default_initargs = NIL;
+        self.runtime_default_initargs = NIL;
+        self.runtime_slots = NIL;
+        self.cpl = None;
+        self.instance_slots = None;
+        self.computed = false;
+        self.finalized = false;
+    }
+}
+
+#[derive(Clone)]
 struct ClassMeta {
+    protocol: ClassProtocol,
     name: EgclVal,
     direct_supers: Vec<EgclVal>,
     direct_subs: Vec<EgclVal>,
@@ -781,6 +832,17 @@ fn visit_clos_roots(visit: &mut dyn FnMut(*mut EgclVal), root_definitions: bool)
             );
         }
         for meta in state.class_meta.values_mut() {
+            visit(&mut meta.protocol.direct_slots);
+            visit(&mut meta.protocol.effective_slots);
+            visit(&mut meta.protocol.default_initargs);
+            visit(&mut meta.protocol.runtime_default_initargs);
+            visit(&mut meta.protocol.runtime_slots);
+            if let Some(cpl) = &mut meta.protocol.cpl {
+                for value in cpl { visit(value); }
+            }
+            if let Some(slots) = &mut meta.protocol.instance_slots {
+                for value in slots { visit(value); }
+            }
             visit(&mut meta.name);
             for value in &mut meta.direct_supers {
                 visit(value);
@@ -1126,7 +1188,8 @@ pub fn serialize_clos_state() -> Vec<u8> {
         // core written by any other build never reaches this version check.
         // Measured — a core from the previous commit's binary is rejected at
         // the header, not here.
-        cs_put_u32(&mut out, 6);
+        // 7 adds rooted class-protocol caches and computed layout/CPL state.
+        cs_put_u32(&mut out, 7);
         cs_put_u32(&mut out, st.class_registry.len() as u32);
         for (k, v) in &st.class_registry {
             cs_put_val(&mut out, *k);
@@ -1147,6 +1210,18 @@ pub fn serialize_clos_state() -> Vec<u8> {
             cs_put_val(&mut out, meta.metaclass);
             cs_put_vals(&mut out, &meta.shared_slots);
             out.push(meta.forward_referenced as u8);
+            out.push(meta.protocol.direct_ready as u8);
+            cs_put_val(&mut out, meta.protocol.direct_slots);
+            cs_put_val(&mut out, meta.protocol.effective_slots);
+            cs_put_val(&mut out, meta.protocol.default_initargs);
+            cs_put_val(&mut out, meta.protocol.runtime_default_initargs);
+            cs_put_val(&mut out, meta.protocol.runtime_slots);
+            out.push(meta.protocol.computed as u8);
+            out.push(meta.protocol.finalized as u8);
+            out.push(meta.protocol.cpl.is_some() as u8);
+            cs_put_vals(&mut out, meta.protocol.cpl.as_deref().unwrap_or(&[]));
+            out.push(meta.protocol.instance_slots.is_some() as u8);
+            cs_put_vals(&mut out, meta.protocol.instance_slots.as_deref().unwrap_or(&[]));
         }
         cs_put_u32(&mut out, st.generic_functions.len() as u32);
         for (gf, data) in &st.generic_functions {
@@ -1270,7 +1345,7 @@ pub fn restore_clos_state(data: &[u8], remap: &dyn Fn(u64) -> u64) -> Result<usi
     }
     let mut off = 4usize;
     let version = cs_get_u32(data, &mut off).ok_or_else(bad)?;
-    if version != 6 {
+    if version != 7 {
         return Err(EgclError::InvalidImage(format!(
             "CLOS state section: unsupported version {version}"
         )));
@@ -1298,9 +1373,25 @@ pub fn restore_clos_state(data: &[u8], remap: &dyn Fn(u64) -> u64) -> Result<usi
         let metaclass = cs_get_val(data, &mut off, remap).ok_or_else(bad)?;
         let shared_slots = cs_get_vals(data, &mut off, remap).ok_or_else(bad)?;
         let forward_referenced = cs_get_u8(data, &mut off).ok_or_else(bad)? != 0;
+        let direct_ready = cs_get_u8(data, &mut off).ok_or_else(bad)? != 0;
+        let direct_slots = cs_get_val(data, &mut off, remap).ok_or_else(bad)?;
+        let effective_slots = cs_get_val(data, &mut off, remap).ok_or_else(bad)?;
+        let default_initargs = cs_get_val(data, &mut off, remap).ok_or_else(bad)?;
+        let runtime_default_initargs = cs_get_val(data, &mut off, remap).ok_or_else(bad)?;
+        let runtime_slots = cs_get_val(data, &mut off, remap).ok_or_else(bad)?;
+        let computed = cs_get_u8(data, &mut off).ok_or_else(bad)? != 0;
+        let finalized = cs_get_u8(data, &mut off).ok_or_else(bad)? != 0;
+        let has_cpl = cs_get_u8(data, &mut off).ok_or_else(bad)? != 0;
+        let cpl = cs_get_vals(data, &mut off, remap).ok_or_else(bad)?;
+        let has_slots = cs_get_u8(data, &mut off).ok_or_else(bad)? != 0;
+        let instance_slots = cs_get_vals(data, &mut off, remap).ok_or_else(bad)?;
+        let protocol = ClassProtocol { direct_slots, direct_ready, effective_slots,
+            default_initargs, runtime_default_initargs, runtime_slots, computed, finalized, cpl: has_cpl.then_some(cpl),
+            instance_slots: has_slots.then_some(instance_slots) };
         st.class_meta.insert(
             class,
             ClassMeta {
+                protocol,
                 shared_slots,
                 name,
                 direct_supers,
@@ -1818,6 +1909,7 @@ fn initialize_clos(reset: bool) -> Result<(), EgclError> {
         st.class_meta.insert(
             t_cls,
             ClassMeta {
+                protocol: ClassProtocol::default(),
                 shared_slots: Vec::new(),
                 name: t_nm,
                 direct_supers: vec![],
@@ -1834,6 +1926,7 @@ fn initialize_clos(reset: bool) -> Result<(), EgclError> {
         st.class_meta.insert(
             std_obj,
             ClassMeta {
+                protocol: ClassProtocol::default(),
                 shared_slots: Vec::new(),
                 name: std_nm,
                 direct_supers: vec![t_cls],
@@ -1876,6 +1969,7 @@ fn initialize_clos(reset: bool) -> Result<(), EgclError> {
             st.class_meta.insert(
                 *cls,
                 ClassMeta {
+                    protocol: ClassProtocol::default(),
                     shared_slots: Vec::new(),
                     name: *nm,
                     direct_supers: supers,
@@ -1941,6 +2035,7 @@ fn initialize_clos(reset: bool) -> Result<(), EgclError> {
             st.class_meta.insert(
                 cls,
                 ClassMeta {
+                    protocol: ClassProtocol::default(),
                     shared_slots: Vec::new(),
                     name: nm,
                     direct_supers: supers,
@@ -2090,6 +2185,7 @@ pub fn set_find_class(name: EgclVal, class: EgclVal) -> Result<(), EgclError> {
             st.class_meta.insert(
                 class,
                 ClassMeta {
+                    protocol: ClassProtocol::default(),
                     shared_slots: Vec::new(),
                     name,
                     direct_supers: default_supers,
@@ -2163,6 +2259,29 @@ pub fn define_class_with_shared_slots(
     slots: &[EgclVal],
     shared_slots: &[EgclVal],
 ) -> Result<(), EgclError> {
+    define_class_with_shared_slots_mode(name, class, direct_supers, slots, shared_slots, false)
+}
+
+/// Record new direct metadata without publishing an intermediate instance
+/// wrapper. The class protocol must validate and publish its computed layout.
+pub fn stage_class_with_shared_slots(
+    name: EgclVal,
+    class: EgclVal,
+    direct_supers: &[EgclVal],
+    slots: &[EgclVal],
+    shared_slots: &[EgclVal],
+) -> Result<(), EgclError> {
+    define_class_with_shared_slots_mode(name, class, direct_supers, slots, shared_slots, true)
+}
+
+fn define_class_with_shared_slots_mode(
+    name: EgclVal,
+    class: EgclVal,
+    direct_supers: &[EgclVal],
+    slots: &[EgclVal],
+    shared_slots: &[EgclVal],
+    staged: bool,
+) -> Result<(), EgclError> {
     let key = class_name_key(name);
     let (was_forward_referenced, standard_class) = with_state_mut(|st| -> Result<(bool, EgclVal), EgclError> {
         // Track handle-id registration order (for diamond-hierarchy inference)
@@ -2227,12 +2346,13 @@ pub fn define_class_with_shared_slots(
         st.class_meta.insert(
             class,
             ClassMeta {
+                protocol: ClassProtocol { finalized: !staged, ..ClassProtocol::default() },
                 shared_slots: shared_slots.to_vec(),
                 name,
                 direct_supers: supers,
                 direct_subs: prev_subs,
                 slots: slots.to_vec(),
-                wrapper: None,
+                wrapper: if staged && !prev_wrapper.is_null() { Some(unsafe { &*prev_wrapper }) } else { None },
                 metaclass: NIL,
                 forward_referenced: false,
             },
@@ -2242,8 +2362,8 @@ pub fn define_class_with_shared_slots(
         // redefinition, mark the previous wrapper obsolete so instances created
         // against it take the slow path on next access (they keep working
         // against their frozen layout). See bliss-xyo / spec §5.3.4.
-        finalize_class_layout(st, class);
-        if !prev_wrapper.is_null() {
+        if !staged { finalize_class_layout(st, class); }
+        if !staged && !prev_wrapper.is_null() {
             unsafe {
                 (*prev_wrapper)
                     .state
@@ -2280,7 +2400,11 @@ pub fn define_class_with_shared_slots(
                 None => continue,
             };
             queue.extend(subs);
-            if !had_wrapper {
+            if let Some(meta) = st.class_meta.get_mut(&sub) {
+                meta.protocol.invalidate_computed();
+                if !staged { meta.protocol.finalized = true; }
+            }
+            if staged || !had_wrapper {
                 continue;
             }
             let stale = st
@@ -2291,6 +2415,7 @@ pub fn define_class_with_shared_slots(
                 .unwrap_or(std::ptr::null_mut());
             if let Some(meta) = st.class_meta.get_mut(&sub) {
                 meta.wrapper = None;
+                meta.protocol.finalized = true;
             }
             finalize_class_layout(st, sub);
             if !stale.is_null() {
@@ -2315,6 +2440,7 @@ pub fn define_class_with_shared_slots(
 /// `ClassWrapper` referencing a leaked, frozen `SlotLayout`. Built-in classes
 /// (never instantiated) are skipped and keep a null wrapper.
 fn finalize_class_layout(st: &mut ClosState, class: EgclVal) {
+    if st.class_meta.get(&class).is_some_and(|meta| !meta.protocol.finalized) { return; }
     if is_builtin_class(st, class) {
         return;
     }
@@ -2324,7 +2450,9 @@ fn finalize_class_layout(st: &mut ClosState, class: EgclVal) {
     // A slot a more specific class declares :allocation :class shadows the
     // instance slot of the same name in a less specific class (CLHS 7.5.3).
     let mut shadowed: HashSet<EgclVal> = HashSet::new();
-    for c in &cpl {
+    if let Some(names) = st.class_meta.get(&class).and_then(|meta| meta.protocol.instance_slots.as_ref()) {
+        for &name in names { index.insert(name, order.len()); order.push(name); }
+    } else { for c in &cpl {
         if let Some(meta) = st.class_meta.get(c) {
             for &slot_name in &meta.slots {
                 if shadowed.contains(&slot_name) {
@@ -2337,7 +2465,7 @@ fn finalize_class_layout(st: &mut ClosState, class: EgclVal) {
             }
             shadowed.extend(meta.shared_slots.iter().copied());
         }
-    }
+    } }
     let slot_count = order.len() as u32;
     let layout = Box::leak(Box::new(SlotLayout { order, index }));
     let wrapper: &'static ClassWrapper = Box::leak(Box::new(ClassWrapper {
@@ -2852,6 +2980,13 @@ fn collect_hierarchy(
 /// list decides method order, so code ported from them must see the same
 /// order here.
 fn linearize_class_precedence(st: &ClosState, class: EgclVal) -> Result<Vec<EgclVal>, EgclError> {
+    if let Some(cpl) = st.class_meta.get(&class).and_then(|meta| meta.protocol.cpl.as_ref()) {
+        return Ok(cpl.clone());
+    }
+    compute_class_precedence_default(st, class)
+}
+
+fn compute_class_precedence_default(st: &ClosState, class: EgclVal) -> Result<Vec<EgclVal>, EgclError> {
     #[cfg(test)]
     cpl_tests::LINEARIZATIONS.with(|count| count.set(count.get() + 1));
     let mut classes: Vec<(EgclVal, Vec<EgclVal>)> = Vec::new();
@@ -2922,6 +3057,9 @@ fn linearize_class_precedence(st: &ClosState, class: EgclVal) -> Result<Vec<Egcl
 /// bound value `0`). The object is leaked, matching the other tree-walker heap
 /// objects. See spec §5.3.4 / issue bliss-xyo.
 pub fn allocate_instance(class: EgclVal) -> Result<EgclVal, EgclError> {
+    if !class_protocol_finalized(class) {
+        return Err(EgclError::ProgramError("class must be finalized before allocation".into()));
+    }
     // A class that exists only because another class named it as a superclass
     // is not finalized: nobody has said what slots it has, so an instance of it
     // would be a standard object with a layout the definition is going to

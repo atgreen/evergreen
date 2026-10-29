@@ -818,7 +818,7 @@ class name.
 | `class-slots`, `class-direct-slots` | Effective / direct slot-definition objects |
 | `class-finalized-p`, `finalize-inheritance` | Finalization state; finalizing |
 | `slot-definition-name`, `-initargs`, `-initform`, `-allocation`, `-readers`, `-writers` | The slot-definition's property |
-| `slot-definition-type` | Always `T`: `DEFCLASS` does not record `:type` yet |
+| `slot-definition-type`, `-initfunction` | Declared type and captured initialization function (or `NIL`) |
 | `validate-superclass` | Generic function; `T` by default |
 | `forward-referenced-class` | Metaclass of a class named as a superclass before it is defined |
 
@@ -871,6 +871,21 @@ it, including `(SETF name)`; other functions still print as `#<FUNCTION>`.
 | `class-default-initargs`, `class-direct-default-initargs` | Default initarg triples |
 | `class-finalized-p` | Finalization state |
 | `class-prototype` | Lazily allocated prototype instance |
+
+Class finalization calls the customizable `compute-class-precedence-list`,
+`compute-slots`, `compute-effective-slot-definition`, and
+`compute-default-initargs` generic functions. `class-direct-slots` and
+`class-slots` retain the actual direct and effective slot metaobjects, including
+custom subclasses selected by the slot-definition-class protocol.
+`ensure-class` accepts canonical direct-slot plists and default-initarg triples.
+
+If a computation method signals before publication, the direct definition
+remains recorded and the class remains unfinalized. Its previous instance wrapper is
+retained; no provisional layout migrates existing instances. A successful retry
+publishes the computed layout and initialization metadata together. Unfinalized
+ancestors finish before descendant computation begins; a rejected ancestor also
+keeps descendant wrappers unchanged and fast access disabled. This does
+not provide transactional rollback of the direct class definition.
 
 The metaclass/slot-definition classes are `FUNCALLABLE-STANDARD-CLASS`,
 `FORWARD-REFERENCED-CLASS`, `STANDARD-DIRECT-SLOT-DEFINITION`, and

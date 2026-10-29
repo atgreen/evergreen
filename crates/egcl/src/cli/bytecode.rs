@@ -18506,7 +18506,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                     acts[top_idx].push_op(value);
                 } else {
                     initiate_unwind(acts, stack, env,
-                        Pending::Propagate(EgclError::UndefinedFunction(name_sym)))?;
+                        Pending::Propagate(undefined_function_lookup_error(env, name_sym)))?;
                 }
             }
             Instr::BindSpecial(sym) => {
@@ -20063,6 +20063,55 @@ extern "C" fn c2i_load_global(sym: u64) -> u64 {
     }
 }
 
+fn undefined_function_lookup_error(env: &Env, name: EgclVal) -> EgclError {
+    // SETF functions are stored under an internal symbol key, but conditions
+    // expose their public list-shaped name. Ordinary symbols (including
+    // uninterned symbols) must retain their original identity.
+    let key = super::sym_name(name);
+    let known_generic = env.generics.borrow().contains_key(&key)
+        || env.methods.borrow().contains_key(&key);
+    let public_name = if known_generic
+        && !egcl_rt::symbols::is_uninterned(name.as_symbol_index())
+        && key.starts_with("(SETF ")
+        && key.ends_with(')')
+    {
+        super::generic_name_form_for_key(env, &key)
+    } else {
+        name
+    };
+    EgclError::UndefinedFunction(public_name)
+}
+
+#[cfg(test)]
+mod function_lookup_error_tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_function_names_keep_identity_even_when_their_text_resembles_setf() {
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env = &mut env);
+        for text in ["MISSING-FUNCTION", "(SETF MISSING-FUNCTION)"] {
+            let name = egcl_rt::symbols::make_uninterned(text);
+            assert!(matches!(undefined_function_lookup_error(&env, name),
+                EgclError::UndefinedFunction(actual) if actual == name));
+        }
+        let text = "(SETF COMMON-LISP-USER::MOP-ORDINARY-LOOKUP-IDENTITY-CONTROL)";
+        let package = egcl_stdlib::packages::find_package("COMMON-LISP-USER").unwrap();
+        let (name, _) = egcl_stdlib::packages::intern(text, package).unwrap();
+        assert!(!egcl_rt::symbols::is_uninterned(name.as_symbol_index()));
+        // Package INTERN produces a qualified ordinary symbol, distinct from
+        // the synthetic unqualified SETF lookup key. Matching method metadata
+        // must not change that symbol's condition-name identity.
+        let ordinary_key = sym_name(name);
+        env.methods.borrow_mut().insert(text.to_owned(), Vec::new());
+        env.methods.borrow_mut().insert(ordinary_key.clone(), Vec::new());
+        assert!(matches!(undefined_function_lookup_error(&env, name),
+            EgclError::UndefinedFunction(actual) if actual == name));
+        env.methods.borrow_mut().remove(text);
+        env.methods.borrow_mut().remove(&ordinary_key);
+    }
+}
+
 /// `#'f` from T2 code: read the symbol's FUNCTION cell (bliss-m285). Mirrors
 /// the T0 `Instr::LoadFunction` semantics exactly — the heap function object
 /// when the symbol names a function (so it is FUNCTIONP and CLOS dispatches
@@ -20078,7 +20127,7 @@ extern "C" fn c2i_load_function(sym: u64) -> u64 {
     // — the same contract as every other c2i helper here.
     let env = unsafe { &mut *env_ptr };
     match guard_c2i(|| super::symbol_function_object(env, name_sym)
-        .ok_or(EgclError::UndefinedFunction(name_sym))) {
+        .ok_or_else(|| undefined_function_lookup_error(env, name_sym))) {
         Ok(value) => value.0,
         Err(error) => { stash_native_error(error); NIL.0 }
     }

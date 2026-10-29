@@ -190,6 +190,27 @@ fn resolved(name: &str) -> (Option<Handler>, bool) {
 #[egcl_shake_macros::builtin_dispatch(name)]
 fn resolve(name: &str) -> Option<Handler> {
     match name {
+        "EGCL-INTERNAL:%MOP-CLASS-PROTOCOL" | "%MOP-CLASS-PROTOCOL" => Some(class_protocol::call),
+        // Explicit retained-object dispatch. Unlike APPLY of a public symbol,
+        // this saved wrapper body intentionally keeps using legacy GF metadata
+        // after FMAKUNBOUND or rebinding the public function cell.
+        "EGCL::%APPLY-RETAINED-GENERIC" => Some(|_operator, args, env| {
+            let args = RootedVals::new(args.to_vec());
+            if args.len() != 2 {
+                return Err(EgclError::ProgramError(
+                    "%APPLY-RETAINED-GENERIC requires a name and argument list".into(),
+                ));
+            }
+            if !args[0].is_symbol() {
+                return Err(EgclError::TypeError {
+                    datum: args[0],
+                    expected: "SYMBOL".into(),
+                });
+            }
+            let name = sym_name(args[0]);
+            egcl_rt::rooted!(values = apply_spread_list(args[1])?);
+            invoke_generic_function(&name, &values, env)
+        }),
         // Ironclad's EGCL block primitives (egcl_stdlib::crypto).
         "EGCL-EXT:CRYPTO-AES-ENCRYPT-BLOCK"
         | "EGCL-EXT:CRYPTO-AES-DECRYPT-BLOCK"
@@ -3872,6 +3893,13 @@ fn resolve(name: &str) -> Option<Handler> {
             Ok(plist)
         }),
 
+        "EGCL-INTERNAL:%RAW-SLOT-VALUE"
+        | "EGCL-INTERNAL:%STANDARD-SLOT-VALUE-USING-CLASS"
+        | "EGCL-INTERNAL:%STANDARD-SET-SLOT-VALUE-USING-CLASS"
+        | "EGCL-INTERNAL:%STANDARD-SLOT-BOUNDP-USING-CLASS"
+        | "EGCL-INTERNAL:%STANDARD-SLOT-MAKUNBOUND-USING-CLASS" =>
+            Some(slot_access::raw),
+
         "EGCL::SET-SLOT-VALUE" => Some(|_operator, args, env| {
             let args = RootedVals::new(args.to_vec());
 
@@ -3899,9 +3927,15 @@ fn resolve(name: &str) -> Option<Handler> {
             // — an EQL-specialized method, a user method on another class, a
             // non-instance argument — and real dispatch has to run. Guessing a
             // slot by name would read the wrong one silently.
+            let name = sym_name(accessor);
+            if (GENERIC_DEFINITIONS.contains_key(&name) || METHOD_DEFINITIONS.contains_key(&name))
+                && !generic_binding::current(&name)
+            {
+                return apply_function(args[1], &[args[0]], env);
+            }
             match accessor_slot_symbol_cached(env, instance, accessor) {
                 Some(slot) => slot_value_or_signal(args[0], slot, env),
-                None => invoke_generic_function(&sym_name(args[1]), &[args[0]], env),
+                None => apply_function(args[1], &[args[0]], env),
             }
         }),
 
@@ -3921,6 +3955,14 @@ fn resolve(name: &str) -> Option<Handler> {
             let instance = args.first().copied().unwrap_or(NIL);
             let accessor = args.get(1).copied().unwrap_or(NIL);
             let val = args.get(2).copied().unwrap_or(NIL);
+            let writer_name = format!("(SETF {})", sym_name(accessor));
+            if (GENERIC_DEFINITIONS.contains_key(&writer_name)
+                || METHOD_DEFINITIONS.contains_key(&writer_name))
+                && !generic_binding::current(&writer_name)
+            {
+                let writer = EgclVal::from_symbol_index(reader::intern_symbol(&writer_name));
+                return apply_function(writer, &[args[2], args[0]], env);
+            }
             // Resolved against THIS instance's class, not by name alone: two
             // classes may give the same accessor name to differently-named
             // slots, and the name-only search returns an arbitrary one of them
@@ -4944,8 +4986,9 @@ fn resolve(name: &str) -> Option<Handler> {
             // so rejecting symbols here would reject the only thing a caller
             // can obtain. Tightening this is bliss-rj5o, and belongs with
             // real class metaobjects rather than here.
-            let class = resolve_class_metaobject(env, class_input)?;
-            egcl_stdlib::clos::allocate_instance(class)
+            egcl_rt::rooted!(class = resolve_class_metaobject(env, class_input)?);
+            class_protocol::ensure_finalized(*class, env)?;
+            egcl_stdlib::clos::allocate_instance(*class)
         }),
 
         "METHOD-QUALIFIERS" | "METHOD-SPECIALIZERS" | "METHOD-LAMBDA-LIST"
