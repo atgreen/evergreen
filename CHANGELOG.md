@@ -357,6 +357,11 @@
   a fixnum -- `(floor most-negative-fixnum -1)` -- still answers the bignum
   ([#853](https://github.com/atgreen/evergreen/pull/853)).
 
+- T2 type inference widens loop-carried ranges earlier and refines loop bounds
+  afterward, reducing optimization delay for functions with growing loop
+  accumulators
+  ([#845](https://github.com/atgreen/evergreen/pull/845)).
+
 - On ppc64le, a hot comparison of single-floats (`<`, `<=`, `>`, `>=`, `=`) and
   a hot `MIN` or `MAX` of fixnums compile to native instructions instead of
   calling the runtime from the loop. Both specializations existed only for
