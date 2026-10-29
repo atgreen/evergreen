@@ -264,6 +264,22 @@ fn resolve(name: &str) -> Option<Handler> {
                 )),
             }
         }),
+        "EGCL::%MAKE-FORMATTER" => Some(|_operator, args, env| {
+            if args.len() != 1 {
+                return Err(EgclError::ProgramError(
+                    "%MAKE-FORMATTER requires one control string".into(),
+                ));
+            }
+            super::make_formatter(args[0], env)
+        }),
+        "EGCL::%FORMATTER-ENTRY" => Some(|_operator, args, env| {
+            if args.len() != 4 {
+                return Err(EgclError::ProgramError(
+                    "%FORMATTER-ENTRY requires self, stream, control and rest arguments".into(),
+                ));
+            }
+            super::formatter_entry_values(args, env)
+        }),
         "EGCL::%FORMAT-CONSUMED" => Some(|_operator, args, _env| {
             if !args.is_empty() {
                 return Err(EgclError::ProgramError(

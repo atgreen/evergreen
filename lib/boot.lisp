@@ -819,16 +819,12 @@
 (defun package-error-package (c) (slot-value c 'package))
 (defun stream-error-stream (c) (slot-value c 'stream))
 
-;; FORMATTER (CLHS 22.3.9.3) — return a function equivalent to the control
-;; string, callable as (fn stream &rest args). FORMAT accepts such a function as
-;; its control string. The function returns the arguments the control string
-;; did not consume; the directive interpreter records that count for the last
-;; completed FORMAT call.
+;; FORMATTER (CLHS 22.3.9.3). The private constructor owns a fresh
+;; exact-self descriptor, so nested logical controls can forward an original
+;; shared/circular argument continuation before any finite APPLY snapshot.
 (defmacro formatter (control-string)
   (check-type control-string string)
-  `(lambda (%formatter-stream &rest %formatter-args)
-     (apply #'format %formatter-stream ,control-string %formatter-args)
-     (nthcdr (egcl::%format-consumed) %formatter-args)))
+  `(egcl::%make-formatter ,control-string))
 
 ;; INVOKE-DEBUGGER (CLHS 9.1). *DEBUGGER-HOOK*, when bound to a function, is
 ;; called with the condition and the hook function itself, with *DEBUGGER-HOOK*

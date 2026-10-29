@@ -657,7 +657,10 @@ fn sweep_function_captures(names: &[EgclVal]) {
     use std::sync::atomic::Ordering;
     sweep_dead_function_captures(names);
     // Rearm the major-collection request from this sweep's survivors.
-    let live = closure_bodies().borrow().len();
+    let live = closure_bodies()
+        .borrow()
+        .len()
+        .max(closure_envs().borrow().len());
     PRIVATE_CLOSURE_MAJOR_BUDGET.store(
         live.max(MIN_PRIVATE_CLOSURE_MAJOR_BUDGET),
         Ordering::Relaxed,
@@ -15437,6 +15440,21 @@ pub(super) fn closure_captured_env(fn_val: EgclVal) -> Option<Arc<SharedCell<Env
 pub(super) fn register_closure_env(sym_idx: u32, frame: Arc<SharedCell<EnvFrame>>) {
     install_bytecode_root_scanner();
     closure_envs().borrow_mut().insert(sym_idx, frame);
+}
+
+/// Prepare an independently constructed private heap callable before allocating
+/// its identity. The caller roots its fields; this may collect a prior budget.
+pub(super) fn prepare_private_closure_allocation() {
+    collect_requested_major_before_closure();
+}
+
+/// Publish captures owned by an already rooted heap function, without binding
+/// its private symbol's global function cell. The normal callable-root bridge
+/// traces this frame and releases it when the callable (including self cycles)
+/// dies. Account for bodyless interpreted closures in the same host budget.
+pub(super) fn register_private_closure_env(function: EgclVal, frame: Arc<SharedCell<EnvFrame>>) {
+    register_closure_env(egcl_rt::function::definition_index(function), frame);
+    note_private_closure_published();
 }
 
 /// Drop captures when delivery removes an unreachable private definition.

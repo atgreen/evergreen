@@ -15492,6 +15492,7 @@ fn read_eval_all_env(source: &str, env: &mut Env) -> Result<EgclVal, EgclError> 
     egcl_stdlib::format::set_pprint_dispatch_hook(Some(stdlib_pprint_dispatch_hook));
     egcl_stdlib::format::set_format_apply_hook(Some(stdlib_format_apply_hook));
     egcl_stdlib::format::set_format_layout_apply_hook(Some(stdlib_format_layout_apply_hook));
+    egcl_stdlib::format::set_formatter_control_hook(Some(stdlib_formatter_control_hook));
     egcl_stdlib::format::set_function_print_hook(Some(generic_function_print_hook));
     let chars: Vec<char> = source.chars().collect();
     register_declared_packages(&chars);
@@ -22139,6 +22140,35 @@ fn form_arg_count(mut v: EgclVal) -> usize {
     n
 }
 
+/// The global FDEFINITION lookup shared by evaluated public calls and COMPILE.
+/// SYMBOL-FUNCTION keeps its stricter symbol-only check at its own caller.
+fn global_function_definition(env: &mut Env, spec: EgclVal) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted!(spec = spec);
+    check_function_name(*spec)?;
+    if spec.is_cons() {
+        let (_, tail) = cp(*spec);
+        if let Some(object) = setf_writer_function_object(env, cp(tail).0) {
+            return Ok(object);
+        }
+        return Err(EgclError::UndefinedFunction(*spec));
+    }
+    if let Some(function) = symbol_global_function_object(env, *spec) {
+        return Ok(function);
+    }
+    let name = sym_name(*spec);
+    let bare = symbol_bare_name(&name);
+    if fn_bound(env, &name)
+        || generic_binding::current(&name)
+        || macro_defined(env, &name)
+        || (!generic_binding::undefined(&name) && is_builtin_function(&name))
+        || is_special_operator_name(&name)
+        || is_ansi_standard_macro(&bare)
+    {
+        return Ok(*spec);
+    }
+    Err(EgclError::UndefinedFunction(*spec))
+}
+
 /// A valid function-name designator per CLHS is a symbol, or a two-element
 /// list `(SETF symbol)`. `FBOUNDP`/`FDEFINITION`/`FMAKUNBOUND` must signal a
 /// TYPE-ERROR (naming the offending datum) on anything else — a fixnum, a
@@ -24030,7 +24060,9 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             | "EGCL::%PPRINT-CIRCLE"
             | "EGCL::%PPRINT-NATIVE-COLUMN"
             | "EGCL::%PPRINT-RENDER-LAYOUT"
-            | "EGCL::%FORMAT-CONSUMED" => return eval_builtin_arguments(&name, cdr, env),
+            | "EGCL::%FORMAT-CONSUMED"
+            | "EGCL::%FORMATTER-ENTRY"
+            | "EGCL::%MAKE-FORMATTER" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::%SYM-BY-INDEX" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::%TIME-START" | "EGCL::%TIME-REPORT" => {
                 return eval_builtin_arguments(&name, cdr, env);
@@ -25304,52 +25336,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                         expected: "SYMBOL".to_string(),
                     });
                 }
-                if name == "FDEFINITION" {
-                    check_function_name(spec)?;
-                    // `(fdefinition '(setf place))` answers with the writer's
-                    // function object for the same reason `#'(setf place)` does
-                    // (bliss-sqvh).
-                    if spec.is_cons() {
-                        let (_setf, tail) = cp(spec);
-                        if let Some(object) = setf_writer_function_object(env, cp(tail).0) {
-                            return Ok(object);
-                        }
-                        return Err(EgclError::UndefinedFunction(spec));
-                    }
-                }
-                if spec.is_symbol() {
-                    // GLOBAL definition: both operators name the symbol's global
-                    // function, so an enclosing FLET/LABELS of that name must not
-                    // be returned (bliss-c1dr).
-                    // Return the SAME first-class function object `#'name` yields
-                    // (bliss-dnst): a builtin is reified to its FUNCTIONP wrapper,
-                    // not the bare symbol, so (functionp (fdefinition 'car)) is T
-                    // and it behaves like #'car. symbol_function_object covers
-                    // local flet/labels closures, global functions, and builtins.
-                    if let Some(f) = symbol_global_function_object(env, spec) {
-                        return Ok(f);
-                    }
-                    // Generic functions, methods, and macros are fbound but have
-                    // no plain function object here; return the name designator
-                    // (funcall/apply accept it), preserving prior behaviour.
-                    let n = sym_name(spec);
-                    let bare = symbol_bare_name(&n);
-                    if fn_bound(env, &n)
-                        || generic_binding::current(&n)
-                        || macro_defined(env, &n)
-                        || (!generic_binding::undefined(&n) && is_builtin_function(&n))
-                        // Standard special operators and standard macros that the
-                        // evaluator implements directly are fbound in the CL sense,
-                        // so FDEFINITION must not signal (ansi FDEFINITION.2/.3 —
-                        // (fdefinition 'cond) / (fdefinition 'setq)).
-                        || is_special_operator_name(&n)
-                        || is_ansi_standard_macro(&bare)
-                    {
-                        return Ok(spec);
-                    }
-                    return Err(EgclError::UndefinedFunction(spec));
-                }
-                return Ok(spec);
+                return global_function_definition(env, spec);
             }
             "FBOUNDP" => {
                 let argc = form_arg_count(cdr);
@@ -27132,7 +27119,9 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 // (values result nil nil): the function when NAME is nil, else
                 // NAME. GC-safe: name/def/func are rooted across the evals and the
                 // (possibly allocating) install.
-                let args = list_to_vec(cdr);
+                // Evaluating the name may allocate before the optional
+                // definition form is read; retain every source form precisely.
+                let args = RootedVals::new(list_to_vec(cdr));
                 if args.is_empty() {
                     return Err(EgclError::Internal(
                         "COMPILE requires a name argument".into(),
@@ -27191,18 +27180,24 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     // chapter that loads universe.lsp — it does exactly
                     // `(compile 'a-defgeneric)` (bliss-30be). SBCL leaves the
                     // generic intact and returns (values NAME nil nil).
-                    let gname = if name.is_symbol() {
-                        sym_name(*name)
-                    } else {
-                        val_as_str(*name)
-                    };
+                    check_function_name(*name)?;
+                    let gname = function_name_key(*name);
                     let is_generic = generic_binding::current(&gname);
                     if is_generic {
                         let primary = if name.is_nil() { NIL } else { *name };
                         env.set_mv(vec![primary, NIL, NIL]);
                         return Ok(primary);
                     }
-                    match symbol_function_object(env, *name) {
+                    let existing = if name.is_cons() {
+                        match global_function_definition(env, *name) {
+                            Ok(function) => Some(function),
+                            Err(EgclError::UndefinedFunction(_)) => None,
+                            Err(error) => return Err(error),
+                        }
+                    } else {
+                        symbol_function_object(env, *name)
+                    };
+                    match existing {
                         Some(f) => f,
                         None => {
                             // A generic function / macro / builtin is already
@@ -27233,6 +27228,23 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     }
                 };
                 egcl_rt::rooted!(func = func);
+                if formatter_owned_state(*func).is_some() {
+                    check_function_name(*name)?;
+                }
+                if let Some(compiled) = compile_owned_formatter(*func, env)? {
+                    *func = compiled;
+                    if !name.is_nil() {
+                        // Reuse the authoritative function-name setter for
+                        // ordinary and SETF names, including generation guards.
+                        evaluated_builtins::call("EGCL::SET-FDEFINITION", &[*name, *func], env)
+                            .ok_or_else(|| {
+                            EgclError::Internal("missing FDEFINITION setter adapter".into())
+                        })??;
+                    }
+                    let primary = if name.is_nil() { *func } else { *name };
+                    env.set_mv(vec![primary, NIL, NIL]);
+                    return Ok(primary);
+                }
                 // (compile 'name) of a global interpreted function compiles it
                 // now, as reaching the lazy-compile threshold would, keeping the
                 // same function object. It used to return success and leave the
@@ -27242,6 +27254,9 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     && !name.is_nil()
                     && egcl_rt::function::is_interpreted_function(*func)
                     && reified_closure(*func).is_none()
+                    // A body with an owned captured frame cannot be compiled
+                    // as a global DEFUN in the caller's lexical environment.
+                    && bytecode::closure_captured_env(*func).is_none()
                     && !egcl_rt::function::body(*func).is_nil()
                 {
                     let index = name.as_symbol_index();
@@ -44863,6 +44878,8 @@ fn is_builtin_function(name: &str) -> bool {
             | "EGCL::%PPRINT-NATIVE-COLUMN"
             | "EGCL::%PPRINT-RENDER-LAYOUT"
             | "EGCL::%FORMAT-CONSUMED"
+            | "EGCL::%FORMATTER-ENTRY"
+            | "EGCL::%MAKE-FORMATTER"
             | "EGCL::%NATIVE-INTERACTIVE-STREAM-P"
     ) {
         return true;
@@ -47860,6 +47877,276 @@ fn layout_events_to_lisp(events: Vec<egcl_stdlib::format::LayoutEvent>) -> EgclV
     *result
 }
 
+#[cfg(test)]
+mod formatter_protocol_tests;
+
+// Ordinary lexical variable names are escaped by lexical_identity::ordinary
+// when they start with this prefix. Only the constructor directly inserts this
+// host key; a source LET (even a NUL-containing symbol) cannot forge it.
+const FORMATTER_PROTOCOL_KEY: &str = "\0egcl-lexical:formatter-protocol";
+
+/// Inspect ONLY constructor-owned direct state and both exact self witnesses.
+/// The descriptor is (self . (raw-control . private-self-symbol)); it is ordinary
+/// traced frame data, not a source/template marker or globally owned registry.
+fn formatter_owned_state(function: EgclVal) -> Option<(Arc<SharedCell<EnvFrame>>, EgclVal, u32)> {
+    if !egcl_rt::function::is_interpreted_function(function) {
+        return None;
+    }
+    let frame = bytecode::closure_captured_env(function)?;
+    let (descriptor, parentless) = {
+        let state = frame.borrow();
+        (
+            state.vars.get(FORMATTER_PROTOCOL_KEY).copied()?,
+            state.parent.is_none(),
+        )
+    };
+    if !parentless || !descriptor.is_cons() {
+        return None;
+    }
+    let (owner, fields) = cp(descriptor);
+    if owner != function || !fields.is_cons() {
+        return None;
+    }
+    let (control, self_symbol) = cp(fields);
+    let self_index = self_symbol
+        .symbol_index()
+        .filter(|&index| egcl_rt::symbols::is_uninterned(index))?;
+    if frame.borrow().symbol_vars.get(&self_index).copied() != Some(function)
+        || !egcl_rt::types::stringp(control)
+    {
+        return None;
+    }
+    Some((frame, control, self_index))
+}
+
+/// This nonallocating hook exports only the raw control of the exact owned
+/// callable. The private engine normalizes it once, at each independent entry.
+fn stdlib_formatter_control_hook(function: EgclVal) -> Option<EgclVal> {
+    formatter_owned_state(function).map(|(_, control, _)| control)
+}
+
+/// Explicit COMPILE may return a different function object. Compile in a fresh
+/// copy of the constructor-owned frame and republish BOTH self witnesses for
+/// the exact result, preserving the old function and its captured frame.
+fn compile_owned_formatter(function: EgclVal, env: &Env) -> Result<Option<EgclVal>, EgclError> {
+    egcl_rt::rooted!(function = function);
+    let Some((original_frame, control, self_index)) = formatter_owned_state(*function) else {
+        return Ok(None);
+    };
+    egcl_rt::rooted!(control = control);
+    let frame = {
+        let original = original_frame.borrow();
+        Arc::new(SharedCell::new(EnvFrame {
+            vars: original.vars.clone(),
+            symbol_vars: original.symbol_vars.clone(),
+            parent: None,
+        }))
+    };
+    let mut compile_env = env.clone();
+    compile_env.frame = Arc::clone(&frame);
+    compile_env.funs = Arc::new(SharedCell::new(HashMap::new()));
+    compile_env.macros = Rc::new(RefCell::new(HashMap::new()));
+    compile_env.symbol_macros = Rc::new(RefCell::new(HashMap::new()));
+    compile_env.locally_specials.clear();
+    compile_env.block_stack.clear();
+    compile_env.tag_stack.clear();
+    egcl_rt::rooted_ref!(_compile_env_root = &mut compile_env);
+    egcl_rt::rooted!(
+        compiled = bytecode::compile_tree_closure(
+            "<formatter>",
+            egcl_rt::function::lambda_list(*function),
+            egcl_rt::function::body(*function),
+            &compile_env,
+            Arc::clone(&frame),
+            &[],
+            &[],
+        )
+        .ok_or_else(|| EgclError::ProgramError(
+            "unable to compile FORMATTER in its captured environment".into()
+        ))?
+    );
+    if !bytecode::closure_captured_env(*compiled).is_some_and(|owned| Arc::ptr_eq(&owned, &frame)) {
+        return Err(EgclError::Internal(
+            "compiled FORMATTER lost its direct owned capture frame".into(),
+        ));
+    }
+    egcl_rt::rooted!(fields = arena_cons(*control, EgclVal::from_symbol_index(self_index)));
+    egcl_rt::rooted!(descriptor = arena_cons(*compiled, *fields));
+    {
+        let mut state = frame.borrow_mut();
+        state.symbol_vars.insert(self_index, *compiled);
+        state
+            .vars
+            .insert(FORMATTER_PROTOCOL_KEY.into(), *descriptor);
+    }
+    Ok(Some(*compiled))
+}
+
+/// Build the protocol as ordinary owned heap-function/frame data. The frame is fresh
+/// and has no parent, so neither unrelated lexical siblings nor descendant
+/// closures inherit authorization. Existing frame tracing/image encoding owns
+/// the descriptor, its self cycle, control string and lexical variables.
+fn make_formatter(control: EgclVal, _env: &mut Env) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted!(control = control);
+    if !egcl_rt::types::stringp(*control) {
+        return Err(EgclError::TypeError {
+            datum: *control,
+            expected: "STRING".into(),
+        });
+    }
+    egcl_stdlib::format::validate_formatter_control(&val_as_str(*control))?;
+    egcl_rt::rooted!(symbols = Vec::<EgclVal>::new());
+    for name in [
+        "FORMATTER-SELF",
+        "FORMATTER-CONTROL",
+        "FORMATTER-STREAM",
+        "FORMATTER-ARGS",
+    ] {
+        symbols.push(egcl_rt::symbols::make_uninterned(name));
+    }
+    egcl_rt::rooted!(
+        rest = resolve_sym("&REST")
+            .ok_or_else(|| { EgclError::Internal("missing &REST for FORMATTER".into()) })?
+    );
+    egcl_rt::rooted!(
+        entry = resolve_sym("EGCL::%FORMATTER-ENTRY")
+            .ok_or_else(|| { EgclError::Internal("missing private FORMATTER entry".into()) })?
+    );
+    egcl_rt::rooted!(params = vec_to_list(&[symbols[2], *rest, symbols[3]]));
+    egcl_rt::rooted!(call = vec_to_list(&[*entry, symbols[0], symbols[2], symbols[1], symbols[3]]));
+    egcl_rt::rooted!(body = arena_cons(*call, NIL));
+    let frame = Arc::new(SharedCell::new(EnvFrame::default()));
+    egcl_rt::rooted!(_frame_root = SuspendedFrameRoot(Arc::clone(&frame)));
+    {
+        let mut state = frame.borrow_mut();
+        state.symbol_vars.insert(symbols[0].as_symbol_index(), NIL);
+        state
+            .symbol_vars
+            .insert(symbols[1].as_symbol_index(), *control);
+    }
+    // Collect any prior private-publication budget before minting this owned
+    // function. All Lisp fields are rooted and no frame borrow is held.
+    bytecode::prepare_private_closure_allocation();
+    egcl_rt::rooted!(identity = egcl_rt::symbols::make_uninterned("FORMATTER"));
+    egcl_rt::rooted!(
+        function = egcl_rt::function::alloc_interpreted(*params, *body, NIL, *identity)
+    );
+    bytecode::register_private_closure_env(*function, Arc::clone(&frame));
+    egcl_rt::rooted!(fields = arena_cons(*control, symbols[0]));
+    egcl_rt::rooted!(descriptor = arena_cons(*function, *fields));
+    {
+        let mut state = frame.borrow_mut();
+        state
+            .symbol_vars
+            .insert(symbols[0].as_symbol_index(), *function);
+        state
+            .vars
+            .insert(FORMATTER_PROTOCOL_KEY.into(), *descriptor);
+    }
+    Ok(*function)
+}
+
+/// Emit a semantic formatter result without reinterpreting its arguments.
+/// Queued pretty streams preserve block events; other Gray streams receive the
+/// same rendered string as ordinary FORMAT, through their public write method.
+fn emit_format_layout(
+    destination: EgclVal,
+    doc: egcl_stdlib::format::LayoutDoc,
+    env: &mut Env,
+) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted!(destination = destination);
+    if let Some(error) = PENDING_PRINT_ERROR.with(|slot| slot.borrow_mut().take()) {
+        return Err(error);
+    }
+    let gray = is_gray_stream(*destination);
+    if gray && is_pprint_queue_stream(*destination) {
+        egcl_rt::rooted!(events = layout_events_to_lisp(doc.into_events()));
+        let enqueue = resolve_sym("EGCL-PPRINT::%PP-ENQUEUE-EVENTS")
+            .ok_or_else(|| EgclError::Internal("missing pprint event bridge".into()))?;
+        apply_function(enqueue, &[*destination, *events], env)?;
+        return Ok(NIL);
+    }
+    let result = egcl_stdlib::format::write_layout(if gray { NIL } else { *destination }, &doc);
+    egcl_rt::rooted!(rendered = resignal_print_error(result)?);
+    if gray {
+        invoke_generic_function(
+            "STREAM-WRITE-STRING",
+            &[*destination, *rendered, EgclVal::from_fixnum(0), NIL],
+            env,
+        )?;
+        Ok(NIL)
+    } else {
+        Ok(*rendered)
+    }
+}
+
+/// The generated FORMATTER calls only this private entry. Exact self identity
+/// lets it claim its directly applied invocation, never an unrelated nested
+/// formatter's continuation. All forwarded state is owned and scope-rooted.
+fn formatter_entry_values(args: &[EgclVal], env: &mut Env) -> Result<EgclVal, EgclError> {
+    let args = RootedVals::new(args.to_vec());
+    egcl_rt::rooted!(
+        destination = if args[1] == T {
+            env.lookup_var("*STANDARD-OUTPUT*").unwrap_or(NIL)
+        } else {
+            args[1]
+        }
+    );
+    if !egcl_rt::types::stringp(args[2]) {
+        return Err(EgclError::TypeError {
+            datum: args[2],
+            expected: "STRING".into(),
+        });
+    }
+    let control = val_as_str(args[2]);
+    let entry =
+        if let Some((activation, expected)) = egcl_stdlib::format::pending_formatter_callable() {
+            // Both normalizations only read the original closure retained by the
+            // actual heap function object. Template/code/owner identity is unused.
+            egcl_rt::rooted!(expected = expected);
+            let expected_source = reified_closure(*expected).unwrap_or(*expected);
+            let actual_source = reified_closure(args[0]).unwrap_or(args[0]);
+            if expected_source == actual_source {
+                egcl_stdlib::format::claim_formatter_entry(activation)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+    egcl_rt::rooted!(entry = entry);
+    let previous = PRINT_ENV.with(|slot| slot.replace(env as *mut Env));
+    let result = (|| {
+        let gray = is_gray_stream(*destination);
+        let logical_body = gray && is_pprint_queue_stream(*destination);
+        let start_column = if gray {
+            let column = invoke_generic_function("STREAM-LINE-COLUMN", &[*destination], env)?;
+            if column.is_fixnum() && column.as_fixnum() >= 0 {
+                column.as_fixnum() as usize
+            } else {
+                0
+            }
+        } else {
+            egcl_stdlib::streams::stream_line_column(*destination).unwrap_or(0) as usize
+        };
+        egcl_stdlib::format::formatter_entry_to_layout(
+            &control,
+            args[3],
+            (*entry).clone(),
+            start_column,
+            logical_body,
+        )
+    })();
+    PRINT_ENV.with(|slot| slot.set(previous));
+    let rendered = match result {
+        Ok(rendered) => rendered,
+        Err(error) => return resignal_print_error(Err(error)),
+    };
+    egcl_rt::rooted!(remaining = rendered.remaining);
+    emit_format_layout(*destination, rendered.layout, env)?;
+    Ok(*remaining)
+}
+
 /// FORMAT on an evaluated destination (a `t` already resolved to the current
 /// *STANDARD-OUTPUT*), control and arguments. Shared by operator position and
 /// compiled calls, which reached it only by synthesizing and re-evaluating a
@@ -47920,14 +48207,7 @@ fn format_values(
             Ok(doc) => doc,
             Err(error) => return resignal_print_error(Err(error)),
         };
-        if let Some(error) = PENDING_PRINT_ERROR.with(|cell| cell.borrow_mut().take()) {
-            return Err(error);
-        }
-        egcl_rt::rooted!(events = layout_events_to_lisp(doc.into_events()));
-        let enqueue = resolve_sym("EGCL-PPRINT::%PP-ENQUEUE-EVENTS")
-            .ok_or_else(|| EgclError::Internal("missing pprint event bridge".into()))?;
-        apply_function(enqueue, &[*dest, *events], env)?;
-        return Ok(NIL);
+        return emit_format_layout(*dest, doc, env);
     }
     let result = egcl_stdlib::format(if gray { NIL } else { *dest }, &fs, &av);
     PRINT_ENV.with(|c| c.set(prev_env));
@@ -48504,6 +48784,7 @@ pub fn run(args: &[String]) -> Result<i32, EgclError> {
     egcl_stdlib::format::set_pprint_dispatch_hook(Some(stdlib_pprint_dispatch_hook));
     egcl_stdlib::format::set_format_apply_hook(Some(stdlib_format_apply_hook));
     egcl_stdlib::format::set_format_layout_apply_hook(Some(stdlib_format_layout_apply_hook));
+    egcl_stdlib::format::set_formatter_control_hook(Some(stdlib_formatter_control_hook));
     egcl_stdlib::format::set_function_print_hook(Some(generic_function_print_hook));
     // Looked up once: it decides how the arguments parse, then loads below.
     let embedded = embedded_core();
@@ -51831,6 +52112,9 @@ mod error_backtrace_rooting_tests {
                 egcl_stdlib::format::set_format_apply_hook(Some(stdlib_format_apply_hook));
                 egcl_stdlib::format::set_format_layout_apply_hook(Some(
                     stdlib_format_layout_apply_hook,
+                ));
+                egcl_stdlib::format::set_formatter_control_hook(Some(
+                    stdlib_formatter_control_hook,
                 ));
             }
         }
