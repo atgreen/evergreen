@@ -20,6 +20,10 @@
   and copied readtables retain character syntax overrides
   ([#824](https://github.com/atgreen/evergreen/pull/824)).
 
+- `SUBTYPEP` preserves numeric bounds when comparing complex part types with
+  different upgraded representations
+  ([#821](https://github.com/atgreen/evergreen/pull/821)).
+
 - Compiled class literals preserve their named class identity, and dependent
   load-form objects initialize in the required order
   ([#818](https://github.com/atgreen/evergreen/pull/818)).

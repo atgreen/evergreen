@@ -8,6 +8,7 @@
     "egcl-stdlib:test:test_packages": ["package_lifecycle_retires_owned_keys_and_preserves_retained_symbol_cells"],
     "egcl:test:package_lifecycle_cli": [""],
     "egcl:test:defstruct_constant_slots_cli": [""],
+    "egcl:test:complex_subtype_bounds_cli": [""],
     "egcl:test:make_load_form_cli": [""],
     "egcl:test:reader_skipped_operands_cli": [""],
     "egcl:test:standard_comment_reader_cli": [""],
