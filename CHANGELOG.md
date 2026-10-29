@@ -16,6 +16,10 @@
 
 ### Fixed
 
+- Generic functions named by uninterned symbols retain their original name
+  identity across repeated calls and method-continuation snapshots
+  ([#905](https://github.com/atgreen/evergreen/pull/905)).
+
 - Callbacks created inside compiled top-level FLET/LABELS forms retain their
   lexical function bindings, including callbacks introduced by macros and
   helpers sharing mutable captured variables
