@@ -147,6 +147,7 @@
     "egcl:test:loop_arithmetic_once": [""],
     "egcl:test:integer_extraction": [""],
     "egcl:test:make_array_fast_path_cli": [""],
+    "egcl-stdlib:test:filled_bit_vector_gc": [""],
     "egcl:test:native_array_constructor": [""],
     "egcl:test:write_to_string_bootstrap": [""],
     "egcl:test:vector_ranges_cli": [""],

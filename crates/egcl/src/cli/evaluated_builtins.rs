@@ -1629,6 +1629,7 @@ fn resolve(name: &str) -> Option<Handler> {
             let initial_element_key = resolve_sym(":INITIAL-ELEMENT").unwrap_or(NIL);
             let initial_contents_key = resolve_sym(":INITIAL-CONTENTS").unwrap_or(NIL);
             let types = SimpleVectorTypes::resolve();
+            let bit_type = egcl_rt::symbols::find_index("BIT").map(EgclVal::from_symbol_index);
             let [length, options] = args else {
                 return Err(EgclError::ProgramError(
                     "%MAKE-SIMPLE-ARRAY takes two arguments".into(),
@@ -1678,7 +1679,16 @@ fn resolve(name: &str) -> Option<Handler> {
                 rest = next;
             }
             let packed_u8 = element_type.is_some_and(|v| upgrade_elt(v) == EltU::U8);
-            let default = if packed_u8 {
+            let packed_bit = element_type.is_some() && element_type == bit_type;
+            // Preserve full option/type handling for contents and out-of-range
+            // dimensions. Only canonical BIT enters this filled-vector path;
+            // foreign same-named types and aliases retain DEFTYPE expansion.
+            if packed_bit
+                && (initial_contents.is_some() || length.as_fixnum() == egcl_rt::bignum::FIXNUM_MAX)
+            {
+                return Ok(NIL);
+            }
+            let default = if packed_u8 || packed_bit {
                 EgclVal::from_fixnum(0)
             } else {
                 let Some(default) = types.default_element(element_type.unwrap_or(T)) else {
@@ -1688,6 +1698,12 @@ fn resolve(name: &str) -> Option<Handler> {
             };
             let length = length.as_fixnum() as usize;
             let Some(contents) = initial_contents else {
+                if packed_bit {
+                    return egcl_stdlib::sequences::build_filled_bit_vector(
+                        length,
+                        initial_element.unwrap_or(default),
+                    );
+                }
                 if packed_u8 {
                     let fill =
                         egcl_stdlib::sequences::u8_value(initial_element.unwrap_or(default))?;
