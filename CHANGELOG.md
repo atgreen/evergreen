@@ -173,6 +173,11 @@
 
 ### Added
 
+- Custom metaclasses can select slot-definition classes, customize class
+  finalization, and intercept slot operations through `EGCL-MOP`. Slot metadata
+  and lexical initfunctions survive saved images
+  ([#826](https://github.com/atgreen/evergreen/pull/826)).
+
 - x86 T2 allocates small packed-byte arrays directly from a native TLAB window,
   supporting scalar and singleton-list dimensions while preserving collecting
   fallback and mutable element-type checks
