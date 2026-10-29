@@ -1452,6 +1452,13 @@
         (t (error "~S is not a feature expression" expression))))
 (defun egcl::%standard-dispatch-reader-macro (stream sub-char arg)
   (case sub-char
+    ((#\= #\#)
+     ;; A callable reader function must signal a Lisp condition itself: it
+     ;; need not be invoked inside READ's native-error conversion boundary.
+     ;; Native circular labels use the same unsigned 64-bit limit.
+     (unless (and (integerp arg) (<= 0 arg 18446744073709551615))
+       (error 'reader-error :stream stream))
+     (egcl::%read-standard-macro stream #\# sub-char arg))
     (#\'
      ;; FUNCTION's operand is read recursively in the caller's readtable.
      ;; Re-reading a synthesized #' prefix with the standard readtable would

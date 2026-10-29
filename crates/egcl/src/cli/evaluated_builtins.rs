@@ -1096,7 +1096,8 @@ fn resolve(name: &str) -> Option<Handler> {
 
         "EGCL::%READ-STANDARD-MACRO" => Some(|_operator, args, env| {
             let args = RootedVals::new(args.to_vec());
-            if args.len() != 3 || !args[1].is_character() || !args[2].is_character() {
+            if !(3..=4).contains(&args.len()) || !args[1].is_character() || !args[2].is_character()
+            {
                 return Err(EgclError::ProgramError(
                     "standard reader requires stream, source and invocation characters".into(),
                 ));
@@ -1111,16 +1112,45 @@ fn resolve(name: &str) -> Option<Handler> {
             let read_eval = dynamic_standard_variable(env, "*READ-EVAL*").is_none_or(|v| v != NIL);
             sync_reader_float_format(env);
             let previous_env = READ_EVAL_ENV.with(|slot| slot.replace(env as *mut Env));
-            let result = reader::read_standard_macro_from_stream(
-                &mut LispReaderStream {
-                    stream: &mut stream,
-                    env,
-                },
-                args[1].as_char(),
-                args[2].as_char(),
-                read_base,
-                read_eval,
-            );
+            let result = if args[1].as_char() == '#' {
+                let parameter = args.get(3).copied().unwrap_or(NIL);
+                let nonnegative = if parameter.is_fixnum() {
+                    parameter.as_fixnum() >= 0
+                } else {
+                    bigint_from_val(parameter).is_some_and(|n| n.sign >= 0)
+                };
+                let label = if nonnegative {
+                    gensym_integer_suffix(parameter).parse::<u64>().ok()
+                } else {
+                    None
+                };
+                match label.filter(|_| matches!(args[2].as_char(), '=' | '#')) {
+                    Some(label) => reader::read_standard_label_from_stream(
+                        &mut LispReaderStream {
+                            stream: &mut stream,
+                            env,
+                        },
+                        args[2].as_char(),
+                        label,
+                        read_base,
+                        read_eval,
+                    ),
+                    None => Err(EgclError::StreamError(
+                        "invalid circular reader label".into(),
+                    )),
+                }
+            } else {
+                reader::read_standard_macro_from_stream(
+                    &mut LispReaderStream {
+                        stream: &mut stream,
+                        env,
+                    },
+                    args[1].as_char(),
+                    args[2].as_char(),
+                    read_base,
+                    read_eval,
+                )
+            };
             READ_EVAL_ENV.with(|slot| slot.set(previous_env));
             let values = result?;
             let primary = values.first().copied().unwrap_or(NIL);
