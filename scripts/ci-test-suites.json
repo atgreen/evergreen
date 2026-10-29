@@ -1,5 +1,7 @@
 {
   "fast": {
+    "egcl:test:definition_function_scope_cli": [""],
+    "egcl:test:lambda_init_declaration_scope_cli": [""],
     "egcl-stdlib:test:test_packages": ["package_lifecycle_retires_owned_keys_and_preserves_retained_symbol_cells"],
     "egcl:test:package_lifecycle_cli": [""],
     "egcl:test:defstruct_constant_slots_cli": [""],
