@@ -157,7 +157,7 @@ fn proper_count(head: EgclVal) -> Result<usize, EgclError> {
             EgclError::ControlError("FORMAT argument count exceeds host range".into())
         })?;
         *cursor = cons_fields(*cursor).1;
-        if count.is_multiple_of(256) {
+        if count % 256 == 0 {
             egcl_rt::poll_safepoint();
         }
     }
@@ -514,7 +514,7 @@ impl Arguments {
             let (value, next) = cons_fields(*cursor);
             values.push(value);
             *cursor = next;
-            if values.len().is_multiple_of(256) {
+            if values.len() % 256 == 0 {
                 egcl_rt::poll_safepoint();
             }
         }
@@ -569,7 +569,7 @@ impl Arguments {
                 });
             }
             *cursor = cons_fields(*cursor).1;
-            if index.is_multiple_of(256) {
+            if index % 256 == 0 {
                 egcl_rt::poll_safepoint();
             }
         }
@@ -606,7 +606,7 @@ impl Arguments {
         while advanced < amount && cursor.is_cons() {
             *cursor = cons_fields(*cursor).1;
             advanced += 1;
-            if advanced.is_multiple_of(256) {
+            if advanced % 256 == 0 {
                 egcl_rt::poll_safepoint();
             }
         }
@@ -685,7 +685,7 @@ impl Arguments {
         while position < requested && cursor.is_cons() {
             *cursor = cons_fields(*cursor).1;
             position += 1;
-            if position.is_multiple_of(256) {
+            if position % 256 == 0 {
                 egcl_rt::poll_safepoint();
             }
         }
