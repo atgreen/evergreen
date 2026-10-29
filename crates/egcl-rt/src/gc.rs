@@ -625,6 +625,35 @@ impl Allocator for HeapAllocator {
         // TLAB / 1 MiB region defaults (egcl-medobj). A fresh TLAB is exactly
         // tlab_size, so route on the object's total footprint vs tlab_size.
         if object_footprint(size).0 > self.tlab_size {
+            match self.alloc_large(size) {
+                Ok(body) => return Ok(body),
+                Err(EgclError::Oom) => {}
+                Err(error) => return Err(error),
+            }
+            // The failed attempt released the heap lock. An object larger than
+            // the entire heap cannot fit after collection either.
+            let fits_heap = {
+                let guard = heap_state().lock().unwrap();
+                guard.as_ref().is_some_and(|state| {
+                    object_footprint(size).0.div_ceil(self.region_size) <= state.regions.len()
+                })
+            };
+            if !fits_heap {
+                return Err(EgclError::Oom);
+            }
+            // Large allocations can exhaust Free regions without filling the
+            // nursery, so the ordinary TLAB-refill trigger may never run.
+            // Retire this borrowed allocator ourselves: the collector's T0
+            // safepoint hook cannot borrow it again. Publish the tail filler
+            // before any heap walk and invalidate pointers before movement.
+            self.retire_tlab();
+            self.tlab.cursor = std::ptr::null_mut();
+            self.tlab.limit = std::ptr::null();
+            // Minor GC already retries through KeepNursery major collection
+            // when no evacuation space is available. Full GC also reclaims
+            // dead large objects when the nursery itself is nearly empty.
+            HeapCollector::new().full_gc()?;
+            // One bounded retry; genuinely retained/fragmented heaps still OOM.
             return self.alloc_large(size);
         }
 

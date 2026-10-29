@@ -12,6 +12,10 @@
   would lose components, preserving the original object in the condition
   ([#858](https://github.com/atgreen/evergreen/pull/858)).
 
+- Large allocations reclaim unreachable objects before reporting heap exhaustion,
+  so repeated discarded strings can reuse the configured heap
+  ([#857](https://github.com/atgreen/evergreen/pull/857)).
+
 - Compiled printer calls preserve callback conditions, restarts, and nonlocal
   transfers without leaking errors into later operations
   ([#835](https://github.com/atgreen/evergreen/pull/835)).
