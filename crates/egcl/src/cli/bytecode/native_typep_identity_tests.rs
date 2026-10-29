@@ -3,7 +3,7 @@
 
 use super::*;
 
-fn mapped_typep(type_name: &str, env: &mut Env) -> native_transfer_entry::TransferCode {
+fn native_typep(type_name: &str, env: &mut Env) -> native_transfer_entry::TransferCode {
     egcl_rt::rooted!(
         params = super::super::read_from_string_in_env("(value)", env)
             .unwrap()
@@ -47,17 +47,27 @@ fn mapped_typep(type_name: &str, env: &mut Env) -> native_transfer_entry::Transf
         );
     }
     egcl_rt::rooted!(_body = ActiveBytecodeRoot::new(&body));
-    let code = native_transfer_entry::TransferCode::compile_mapped_for_test(body)
-        .expect("admit and emit actual mapped T1 TYPEP checker");
+    // The cleanup-protocol test builder deliberately disables all intrinsics;
+    // use production scope-free compilation so this exercises TYPEP selection.
+    let code = native_transfer_entry::TransferCode::compile(body)
+        .expect("admit and emit intrinsic-enabled native T1 TYPEP checker");
     assert!(
-        code.mapped_entry().is_some(),
-        "fixture must have generated native code"
+        code.mapped_entry().is_some() || code.ordinary_entry.is_some(),
+        "fixture must have an actual generated entry"
     );
     code
 }
 
+// Production emission may choose ordinary or mapped entry ABI. Both counters
+// observe calls leaving actual generated code, not activation preparation.
+fn take_native_outcalls() -> usize {
+    native_transfer_entry::take_published_checked_calls_for_test()
+        + native_transfer_entry::ordinary_calls::take_named_entries_for_test()
+        + native_transfer_entry::ordinary_calls::take_cold_calls_for_test()
+}
+
 #[test]
-fn mapped_native_typep_calls_public_fallback_for_foreign_type_symbols() {
+fn native_typep_calls_public_fallback_for_foreign_type_symbols() {
     let _lock = super::super::heap_test_lock()
         .lock()
         .unwrap_or_else(|error| error.into_inner());
@@ -112,34 +122,44 @@ fn mapped_native_typep_calls_public_fallback_for_foreign_type_symbols() {
             "cold public TYPEP must resolve the fixture alias: {type_name}"
         );
         assert!(!super::super::typep_matches(&mut env, values[index][1], type_symbol).unwrap());
-        let code = mapped_typep(type_name, &mut env);
+        let code = native_typep(type_name, &mut env);
         for alternative in 0..2 {
             let value = values[index][alternative];
             let expected = if alternative == 0 { T } else { NIL };
-            native_transfer_entry::take_published_checked_calls_for_test();
+            take_native_outcalls();
             assert_eq!(
                 code.run(&[value], &mut env).unwrap(),
                 expected,
                 "{type_name}"
             );
+            assert_eq!(
+                code.deopt_count(),
+                0,
+                "foreign checker must not deopt to the interpreter"
+            );
             assert!(
-                native_transfer_entry::take_published_checked_calls_for_test() > 0,
-                "foreign TYPEP must execute the generated-code checked-call boundary: {type_name}"
+                take_native_outcalls() > 0,
+                "foreign TYPEP must execute a generated-code public-call boundary: {type_name}"
             );
         }
     }
     // Canonical CL:FIXNUM still uses the native intrinsic. This also proves
     // that the observed call counter is not merely native activation setup.
-    // Verify the exact canonical constant in mapped_typep instead of relying
+    // Verify the exact canonical constant in native_typep instead of relying
     // on qualified-name resolution in this minimal environment fixture.
-    let canonical = mapped_typep("FIXNUM", &mut env);
+    let canonical = native_typep("FIXNUM", &mut env);
     for alternative in 0..2 {
         let value = if alternative == 0 { small } else { *big };
         let expected = if alternative == 0 { T } else { NIL };
-        native_transfer_entry::take_published_checked_calls_for_test();
+        take_native_outcalls();
         assert_eq!(canonical.run(&[value], &mut env).unwrap(), expected);
         assert_eq!(
-            native_transfer_entry::take_published_checked_calls_for_test(),
+            canonical.deopt_count(),
+            0,
+            "canonical checker must execute without interpreter deoptimization"
+        );
+        assert_eq!(
+            take_native_outcalls(),
             0,
             "canonical FIXNUM must retain its inline native type test"
         );
