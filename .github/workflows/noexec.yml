@@ -1,0 +1,83 @@
+# SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+# SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+name: No executable memory (experimental)
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  noexec:
+    # This evidence lane is deliberately outside required CI aggregation until
+    # its kernel/seccomp and runtime behavior has been established as reliable.
+    continue-on-error: true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Select the repository toolchain
+        run: |
+          rustup show active-toolchain
+          rustup target add x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: noexec-gnu
+      - name: Start memory-capped runner session
+        run: |
+          sudo loginctl enable-linger "$USER"
+          sudo systemctl start "user@$(id -u).service"
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus" >> "$GITHUB_ENV"
+      - name: Build only the standalone harness once
+        env:
+          EGCL_MEM_MAX: 6G
+          EGCL_TIMEOUT: 1800
+          CARGO_BUILD_JOBS: 2
+        run: |
+          mkdir -p target/noexec-evidence
+          git rev-parse HEAD > target/noexec-evidence/revision.txt
+          git status --porcelain=v1 > target/noexec-evidence/status.txt
+          rustc -Vv > target/noexec-evidence/toolchain.txt
+          uname -a > target/noexec-evidence/kernel.txt
+          sha256sum Cargo.lock rust-toolchain.toml crates/egcl/tests/noexec_memory_cli.rs > target/noexec-evidence/inputs.sha256
+          scripts/egcl-limited.sh cargo test --locked -p egcl --test noexec_memory_cli --no-run --profile release --target x86_64-unknown-linux-gnu --message-format=json > target/noexec-evidence/cargo.jsonl 2> target/noexec-evidence/build.log
+          python3 - <<'PY'
+          import json, os, pathlib
+          records = [json.loads(line) for line in pathlib.Path('target/noexec-evidence/cargo.jsonl').read_text().splitlines()]
+          paths = {r['executable'] for r in records if r.get('reason') == 'compiler-artifact' and r.get('target', {}).get('name') == 'noexec_memory_cli' and r.get('profile', {}).get('test') and r.get('executable')}
+          if len(paths) != 1:
+              raise SystemExit(f'Expected one exact noexec harness, found {paths}')
+          binary = pathlib.Path(paths.pop()).resolve()
+          with open(os.environ['GITHUB_ENV'], 'a') as output:
+              output.write(f'NOEXEC_BINARY={binary}\n')
+          pathlib.Path('target/noexec-evidence/artifact.txt').write_text(str(binary) + '\n')
+          PY
+          sha256sum "$(cat target/noexec-evidence/artifact.txt)" > target/noexec-evidence/artifact.sha256
+      - name: Run exact artifact with live denial controls and T0 workloads
+        shell: bash
+        env:
+          EGCL_MEM_MAX: 4G
+          EGCL_TIMEOUT: 900
+        run: |
+          set +e
+          scripts/egcl-limited.sh "$NOEXEC_BINARY" --nocapture --test-threads=1 2>&1 | tee target/noexec-evidence/results.log
+          noexec_statuses=("${PIPESTATUS[@]}")
+          set -e
+          sha256sum "$NOEXEC_BINARY" > target/noexec-evidence/artifact-after.sha256
+          cmp target/noexec-evidence/artifact.sha256 target/noexec-evidence/artifact-after.sha256
+          if (( noexec_statuses[0] != 0 )); then
+            exit "${noexec_statuses[0]}"
+          fi
+          exit "${noexec_statuses[1]}"
+      - name: Preserve source, artifact and failure evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: noexec-x86_64-linux-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/noexec-evidence/
+          if-no-files-found: warn
