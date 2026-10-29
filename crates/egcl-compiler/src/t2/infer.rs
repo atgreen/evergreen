@@ -86,8 +86,9 @@
 //! * Range tracking covers add, sub, mul and neg only.
 //! * Class ids are propagated but never derived here.
 //! * Fixed iteration budget (`WIDEN_AFTER` = 400, then 8 widened passes);
-//!   a function that has not converged by then keeps its last facts, which
-//!   are still sound over-approximations.
+//!   a function that has not converged by then discards unfinished facts to
+//!   TOP before representation selection or scoped replay. An ascending prefix
+//!   is not necessarily a sound final over-approximation.
 //!
 //! # Debugging
 //!
@@ -908,8 +909,8 @@ pub fn infer(f: &Function) -> InferenceResult {
 }
 
 /// Run inference once and capture operand facts only at the requested sites.
-/// Scoped facts are replayed against the frozen final global solution, never
-/// copied from an intermediate/widening iteration or recomputed per site.
+/// Scoped facts are replayed against the frozen conservative global solution
+/// (converged facts or the TOP fallback), never an unfinished ascending prefix.
 pub fn infer_for_sites(f: &Function, sites: &[Inst]) -> InferenceResult {
     let mut timings = InferenceTimings::new();
     let setup_start = timings.clock();
@@ -967,6 +968,7 @@ pub fn infer_for_sites(f: &Function, sites: &[Inst]) -> InferenceResult {
     timings.checks_ns = InferenceTimings::elapsed(checks_start);
     let fixpoint_start = timings.clock();
 
+    let mut converged = false;
     for pass in 0..MAX_PASSES {
         if timings.start.is_some() { timings.passes += 1; }
         let widen = pass >= WIDEN_AFTER;
@@ -1075,7 +1077,25 @@ pub fn infer_for_sites(f: &Function, sites: &[Inst]) -> InferenceResult {
         }
 
         if !changed {
+            converged = true;
             break;
+        }
+    }
+
+    if !converged {
+        // Numeric range widening does not finish arbitrary type-bit chains.
+        // An unfinished ascending iterate can exclude reachable values, so do
+        // not expose it to guard removal, representation choice or site facts.
+        // Include values still absent/BOTTOM, not only existing map entries.
+        for &block in &rpo {
+            for &parameter in &f.block(block).params {
+                g.0.insert(parameter, IRType::TOP);
+            }
+            for &inst in &f.block(block).insts {
+                for &result in &f.inst(inst).results {
+                    g.0.insert(result, IRType::TOP);
+                }
+            }
         }
     }
 
@@ -1291,8 +1311,9 @@ fn capture_site_facts(
         let Some(last) = instructions.iter().rposition(|inst| requested.contains(inst)) else {
             continue;
         };
-        // Each replay starts from converged global facts and the complete
-        // edge/check maps. Other blocks' local environments do not feed it.
+        // Each replay starts from conservative global facts (the converged
+        // solution or TOP fallback) and complete edge/check maps. Other blocks'
+        // local environments do not feed it.
         let mut env = entry_environment(block, g, dom, structural, &edges, checks, timings);
         if timings.start.is_some() { timings.replay_blocks += 1; }
         for &inst in &instructions[..=last] {
@@ -2692,6 +2713,183 @@ mod tests {
         assert_eq!(r.range(i1[0]), Some(Range { lo: 1, hi: 10 }));
         assert_eq!(r.repr(i), Some(ValueRepresentation::UnboxedFixnum));
     }
+    #[test]
+    fn exhausted_ascent_discards_long_phi_type_guesses() {
+        use crate::t2::frame_state::{FrameScope, FrameState, ValueSource};
+        use crate::t2::pass::{Analyses, Pass};
+        // Ascending parameter order propagates the last parameter's double
+        // bit only one position left per pass. After COUNT-1 actual rotations
+        // the first parameter contains DOUBLE, even when analysis stops early.
+        // The short control converges normally and retains useful precision.
+        for count in [3, MAX_PASSES + 3] {
+            let mut f = Function::new("rotating-phi-types");
+            let entry = f.entry();
+            let double = f.add_block_param(
+                entry,
+                IRType::of(TypeBits::DOUBLE_FLOAT),
+                ValueRepresentation::Tagged,
+            );
+            let zero = const_fixnum(&mut f, entry, 0);
+            let (_, tagged_zero) = f.push_inst(
+                entry,
+                InstData {
+                    aux: AuxData::FixnumImm(0),
+                    ..inst(Opcode::ConstFixnum)
+                },
+                &[(fixnum(), ValueRepresentation::Tagged)],
+            );
+            let bound = const_fixnum(&mut f, entry, (count - 1) as i64);
+            let header = f.make_block();
+            let body = f.make_block();
+            let exit = f.make_block();
+            let parameters: Vec<_> = (0..count)
+                .map(|_| f.add_block_param(header, IRType::TOP, ValueRepresentation::Tagged))
+                .collect();
+            let counter = f.add_block_param(header, fixnum(), ValueRepresentation::UnboxedFixnum);
+            let mut initial = vec![tagged_zero[0]; count];
+            initial[count - 1] = double;
+            initial.push(zero);
+            f.set_terminator(
+                entry,
+                InstData {
+                    targets: vec![BlockCall {
+                        block: header,
+                        args: initial,
+                    }],
+                    ..inst(Opcode::Jump)
+                },
+            );
+            let (_, condition) = f.push_inst(
+                header,
+                InstData {
+                    args: vec![counter, bound],
+                    ..inst(Opcode::FixnumCmpLt)
+                },
+                &[(
+                    IRType::of(TypeBits::SYMBOL.join(TypeBits::NULL)),
+                    ValueRepresentation::Tagged,
+                )],
+            );
+            f.set_terminator(
+                header,
+                InstData {
+                    args: vec![condition[0]],
+                    targets: vec![
+                        BlockCall {
+                            block: body,
+                            args: vec![],
+                        },
+                        BlockCall {
+                            block: exit,
+                            args: vec![],
+                        },
+                    ],
+                    ..inst(Opcode::Brif)
+                },
+            );
+            let one = const_fixnum(&mut f, body, 1);
+            let (_, next_counter) = f.push_inst(
+                body,
+                InstData {
+                    args: vec![counter, one],
+                    ..inst(Opcode::FixnumAdd)
+                },
+                &[(fixnum(), ValueRepresentation::UnboxedFixnum)],
+            );
+            let mut rotated = parameters[1..].to_vec();
+            rotated.push(parameters[0]);
+            rotated.push(next_counter[0]);
+            f.set_terminator(
+                body,
+                InstData {
+                    targets: vec![BlockCall {
+                        block: header,
+                        args: rotated,
+                    }],
+                    ..inst(Opcode::Jump)
+                },
+            );
+            let state = f.frame_states.add(FrameState {
+                scopes: vec![FrameScope {
+                    function: 0,
+                    bcp: 1,
+                    locals: vec![],
+                    stack: vec![ValueSource::Value {
+                        value: parameters[0],
+                        repr: ValueRepresentation::Tagged,
+                    }],
+                }],
+                remat: vec![],
+            });
+            let (guard, checked) = f.push_inst(
+                exit,
+                InstData {
+                    args: vec![parameters[0]],
+                    aux: AuxData::TypeTag(fixnum()),
+                    flags: InstFlags {
+                        effectful: true,
+                        guard: true,
+                        ..Default::default()
+                    },
+                    frame_state: Some(state),
+                    ..inst(Opcode::Guard)
+                },
+                &[(fixnum(), ValueRepresentation::Tagged)],
+            );
+            let (_, used) = f.push_inst(
+                exit,
+                InstData {
+                    args: vec![checked[0], tagged_zero[0]],
+                    ..inst(Opcode::GenericAdd)
+                },
+                &[(IRType::TOP, ValueRepresentation::Tagged)],
+            );
+            f.set_terminator(
+                exit,
+                InstData {
+                    args: vec![used[0]],
+                    ..ret()
+                },
+            );
+            crate::t2::verify::verify(&f).unwrap();
+            let result = infer_for_sites(&f, &[guard]);
+            let expected = if count > MAX_PASSES {
+                IRType::TOP
+            } else {
+                IRType::of(TypeBits::FIXNUM.join(TypeBits::DOUBLE_FLOAT))
+            };
+            assert_eq!(result.ty(parameters[0]), expected, "count={count}");
+            assert_eq!(
+                result.ty_before(guard, parameters[0]),
+                expected,
+                "count={count}"
+            );
+            assert_eq!(
+                result.repr(parameters[0]),
+                Some(ValueRepresentation::Tagged)
+            );
+            // Exercise the actual downstream consumer: a result used only by
+            // an instruction must not let an unfinished FIXNUM guess erase
+            // the runtime check. Its pre-narrowing recovery source stays live.
+            let original = f.inst(guard).clone();
+            crate::t2::opt_guard::GuardElim.run(&mut f, &mut Analyses::default());
+            assert!(f.block(exit).insts.contains(&guard), "count={count}");
+            assert_eq!(f.inst(guard).args, original.args);
+            assert_eq!(f.inst(guard).flags, original.flags);
+            assert_eq!(f.inst(guard).frame_state, original.frame_state);
+            let recovery = f.frame_states.get(state);
+            assert!(recovery.remat.is_empty());
+            assert_eq!(recovery.scopes.len(), 1);
+            let scope = &recovery.scopes[0];
+            assert_eq!((scope.function, scope.bcp), (0, 1));
+            assert!(scope.locals.is_empty());
+            assert!(matches!(scope.stack.as_slice(),
+                [ValueSource::Value { value, repr: ValueRepresentation::Tagged }]
+                    if *value == parameters[0]));
+            crate::t2::verify::verify(&f).unwrap();
+        }
+    }
+
     #[test]
     fn heap_double_literal_fact_requires_declared_type_and_immutable_snapshot() {
         // The address is an opaque pool-slot identity. Inference must use only
