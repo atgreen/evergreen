@@ -271,12 +271,10 @@ fn native_filled_bit_constructor_reaches_public_fast_storage_under_gc() {
         assert!(stdout.contains("NATIVE-FILLED-BIT-OK"), "{stdout}");
         assert!(stderr.lines().any(|line| line.contains("NATIVE-FILLED-BIT-ARRAY: optimized worker result installed with ordinary x86-64 Lisp T2 ABI")), "{stderr}");
         assert!(
-            stderr
-                .lines()
-                .any(|line| {
-                    line.contains("[native-array-constructor] lowered ")
-                        && line.ends_with("NATIVE-FILLED-BIT-ARRAY sites=1")
-                }),
+            stderr.lines().any(|line| {
+                line.contains("[native-array-constructor] lowered ")
+                    && line.ends_with("NATIVE-FILLED-BIT-ARRAY sites=1")
+            }),
             "native BIT constructor site was not emitted: {stderr}"
         );
         assert!(
