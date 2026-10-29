@@ -8,6 +8,10 @@
   their value forms, so compound type assertions accept valid arguments
   ([#860](https://github.com/atgreen/evergreen/pull/860)).
 
+- Type inference discards unfinished facts when its analysis budget expires,
+  preserving guards for values whose reachable types have not yet propagated
+  ([#861](https://github.com/atgreen/evergreen/pull/861)).
+
 - `PRINC` and FORMAT aesthetic output expose the correct printer controls to
   callbacks and restore prior bindings across conditions and nonlocal transfers
   ([#836](https://github.com/atgreen/evergreen/pull/836)).
