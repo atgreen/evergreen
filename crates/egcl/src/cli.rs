@@ -12550,9 +12550,9 @@ fn print_val_body(mut val: EgclVal, out: &mut String) {
         return;
     }
     if val.is_nil() {
-        out.push_str("NIL");
+        out.push_str(&egcl_stdlib::format::print_symbol_name("NIL", PRINT_ESCAPE.with(|c| c.get())));
     } else if val == T {
-        out.push('T');
+        out.push_str(&egcl_stdlib::format::print_symbol_name("T", PRINT_ESCAPE.with(|c| c.get())));
     } else if val == EOF {
         out.push_str("#<EOF>");
     } else if let Some(name) = package_object_name(val) {

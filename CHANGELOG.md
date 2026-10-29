@@ -7,6 +7,10 @@
 - String and stream printers consistently honor `*PRINT-ARRAY*` for array
   layouts, and string printers render package objects through their print hook
   ([#830](https://github.com/atgreen/evergreen/pull/830)).
+- Symbol printing escapes numeric-looking names in the selected output base,
+  including `NIL` and `T`, and preserves their case and readtable settings
+  across stream and string output
+  ([#831](https://github.com/atgreen/evergreen/pull/831)).
 
 - `*PRINT-CIRCLE*` preserves shared arrays and uninterned symbols, and prints
   cycles through vectors and multidimensional arrays without runaway expansion

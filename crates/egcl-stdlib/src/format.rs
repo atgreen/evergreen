@@ -339,12 +339,20 @@ pub fn apply_print_case(name: &str) -> String {
 /// Would `name` read back as a number rather than a symbol? Such a name must be
 /// printed inside bars (CLHS 2.3.4). Recognises integer, ratio and float syntax
 /// — `123`, `-7.`, `1/2`, `1.5`, `1E5` — but not names that merely contain
-/// digits or exponent markers, so `E5`, `ABC1` and `A-B` stay unescaped.
+/// digits or exponent markers. Integer and ratio digits use *PRINT-BASE*;
+/// decimal points and float syntax remain decimal regardless of that base.
 fn reads_as_number(name: &str) -> bool {
     let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let radix = print_base();
+    let radix_digits = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_digit(radix));
     let body = name.strip_prefix(['+', '-']).unwrap_or(name);
     if body.is_empty() {
         return false;
+    }
+    // Recognize syntax without parsing a machine integer: a long name can
+    // read as a bignum too. In high bases exponent letters are digits first.
+    if radix_digits(body) {
+        return true;
     }
     // Integer, with CLHS's optional trailing decimal point: 123 or 123.
     if digits(body.strip_suffix('.').unwrap_or(body)) {
@@ -352,7 +360,10 @@ fn reads_as_number(name: &str) -> bool {
     }
     // Ratio: digits / digits.
     if let Some((num, den)) = body.split_once('/') {
-        return digits(num) && digits(den);
+        // The reader also accepts a sign on its denominator. Escape that
+        // spelling conservatively so it cannot change a symbol into a ratio.
+        return (radix_digits(num) && radix_digits(den.strip_prefix(['+', '-']).unwrap_or(den)))
+            || (digits(num) && digits(den));
     }
     // Float: split a trailing exponent off first, then check the mantissa. An
     // exponent alone is not enough (`E5` is a symbol); the mantissa must be
