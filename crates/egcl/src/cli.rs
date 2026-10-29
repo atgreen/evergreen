@@ -31,6 +31,7 @@ mod evaluated_builtins;
 pub mod events;
 mod generic_binding;
 mod lexical_identity;
+mod method_continuations;
 mod native_runtime;
 mod python;
 mod reified_metadata;
@@ -2558,6 +2559,7 @@ struct Env {
     /// Tags visible for GO: (tag-name, tagbody-token)
     tag_stack: Vec<(String, String)>,
     method_context: Vec<MethodContext>,
+    method_invocations: Vec<method_continuations::Invocation>,
     eval_context: EvalContext,
     /// Compiler seeding probes may fail before their helpers are defined.
     /// Keep raw probe failures out of the caller's live condition handlers.
@@ -2782,6 +2784,27 @@ static METHOD_COMPILED: LazyLock<DefinitionTable<HashMap<u64, EgclVal>>> = LazyL
         HashMap::new(),
     ))
 });
+
+/// Derived from final scoped lowering, never serialized or guessed from source.
+static METHOD_CONTEXT_UNUSED: LazyLock<
+    DefinitionTable<HashMap<u64, bytecode::MethodNoContextBody>>,
+> = LazyLock::new(|| {
+    DefinitionTable(OrderedMutex::new(
+        LockLevel::GcWorld,
+        24,
+        "method context proofs",
+        HashMap::new(),
+    ))
+});
+fn method_context_unused(id: EgclVal) -> bool {
+    let Some(function) = METHOD_COMPILED.borrow().get(&id.0).copied() else {
+        return false;
+    };
+    let Some(proof) = METHOD_CONTEXT_UNUSED.borrow().get(&id.0).cloned() else {
+        return false;
+    };
+    bytecode::method_no_context_body_matches(function, &proof)
+}
 
 /// How the dispatch fast path may run a DEFCLASS-generated slot accessor. A
 /// typed structure's writer is `CheckedWrite`: its value must satisfy the slot's
@@ -3045,6 +3068,8 @@ enum MethodSpecializer {
 struct MethodContext {
     args: Vec<EgclVal>,
     next: NextMethod,
+    method: EgclVal,
+    invocation: Option<method_continuations::Invocation>,
 }
 
 #[derive(Clone)]
@@ -4985,6 +5010,8 @@ fn host_restore_registries(data: &[u8]) -> Result<(), EgclError> {
         set_compiled_method_cell(callable, true);
     }
     *METHOD_COMPILED.borrow_mut() = compiled_methods;
+    METHOD_CONTEXT_UNUSED.borrow_mut().clear();
+    invalidate_gf_dispatch_cache();
     // Older images lack MACC; their accessors run their method bodies.
     let mut accessor_methods = HashMap::new();
     if data.get(off..off + 4) == Some(b"MACC") {
@@ -8553,58 +8580,58 @@ fn bind_method_params(
 
 fn invoke_method(
     env: &mut Env,
-    method: &MethodDef,
-    args: &[EgclVal],
+    input_method: &MethodDef,
+    input_args: &[EgclVal],
     next: Option<NextMethod>,
 ) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted!(method_root = input_method.clone());
+    egcl_rt::rooted!(args_root = input_args.to_vec());
+    egcl_rt::rooted!(next = next);
+    let method = &*method_root;
+    let args = &args_root[..];
     if method.method_id.is_nil() && method.body.is_symbol() {
         let name = sym_name(method.body);
         return builtin_generic_fallback(&name, args, env)
             .unwrap_or_else(|| Err(no_applicable_method_error(env, &name)));
     }
-    // If the body compiled to bytecode (no captured lexicals, no
-    // call-next-method — bliss-x5y.20), dispatch it through apply_function so it
-    // runs as tiered bytecode/native. The compiled body binds its own params and
-    // never consults env.method_context, so `next` is irrelevant here.
+    let compiled = METHOD_COMPILED.borrow().get(&method.method_id.0).copied();
+    if let Some(callable) = compiled {
+        let proof = METHOD_CONTEXT_UNUSED
+            .borrow()
+            .get(&method.method_id.0)
+            .cloned();
+        if let Some(proof) = proof
+            && let Some(result) =
+                bytecode::call_registered_method_if_body(callable, &proof, args, env)
+        {
+            return result;
+        }
+    }
+    // A context belongs to this method even when no successor exists. Before
+    // and after methods must not accidentally inherit a caller's continuation.
+    let invocation = method_continuations::invocation_for_method(env, method, args)?;
+    let _invocation_scope = method_continuations::InvocationScope::enter(env, invocation);
+    let context = MethodContext {
+        args: args.to_vec(),
+        next: next.clone().unwrap_or(NextMethod::Primary {
+            primary: Vec::new(),
+        }),
+        method: method.method_id,
+        invocation: env.method_invocations.last().cloned(),
+    };
+    egcl_rt::rooted!(context = context);
     let callable = METHOD_COMPILED.borrow().get(&method.method_id.0).copied();
     if let Some(callable) = callable {
-        // A compiled body binds its own parameters, but it may still contain
-        // CALL-NEXT-METHOD / NEXT-METHOD-P, which read env.method_context —
-        // so publish the context here exactly as the tree-walked path does,
-        // including only pushing it when there IS a next method (bliss-ccso).
-        let Some(mut next) = next else {
-            return apply_function(callable, args, env);
-        };
-        egcl_rt::rooted_ref!(_next_root = &mut next);
-        env.method_context.push(MethodContext {
-            args: args.to_vec(),
-            next: next.clone(),
-        });
-        let result = apply_function(callable, args, env);
-        env.method_context.pop();
-        return result;
+        let _context_scope = method_continuations::MethodScope::enter(env, context.clone());
+        return apply_function(callable, args, env);
     }
-    // A method defined inside a user binding form runs its body against that
-    // captured lexical environment, not the caller's frame (bliss-sdd).
     let parent = method
         .captured_frame
         .clone()
         .unwrap_or_else(|| Arc::clone(&env.frame));
-    if let Some(mut next) = next {
-        egcl_rt::rooted_ref!(_next_root = &mut next);
-        return with_child_frame(env, parent, |env| {
-            bind_method_params(env, method, args)?;
-            env.method_context.push(MethodContext {
-                args: args.to_vec(),
-                next: next.clone(),
-            });
-            let result = eval_progn(method.body, env);
-            env.method_context.pop();
-            result
-        });
-    }
     with_child_frame(env, parent, |env| {
         bind_method_params(env, method, args)?;
+        let _context_scope = method_continuations::MethodScope::enter(env, context.clone());
         eval_progn(method.body, env)
     })
 }
@@ -8924,6 +8951,16 @@ fn call_next_method_values(
     context: &MethodContext,
     args: &[EgclVal],
 ) -> Result<EgclVal, EgclError> {
+    if !args.is_empty() {
+        method_continuations::validate_changed(context, args, env)?;
+    }
+    if !method_context_has_next(context) {
+        return method_continuations::no_next(
+            context,
+            if args.is_empty() { &context.args } else { args },
+            env,
+        );
+    }
     // No replacement arguments means reuse the original arguments, including
     // all keyword pairs. A next method may allocate or produce multiple values.
     if args.is_empty() {
@@ -9327,6 +9364,8 @@ fn calltrace_note(name: &str, e: &EgclError) {
 /// single refcount, not four `Vec`s (bliss-fy37). The ids are `from_meta_handle`
 /// immediates, so the `Rc` holds no movable GC pointers and needs no tracing.
 struct GfEffective {
+    /// Full specificity order, before splitting by qualifiers. Immediate IDs.
+    ordered: Vec<EgclVal>,
     around: Vec<EgclVal>,
     before: Vec<EgclVal>,
     primary: Vec<EgclVal>,
@@ -9559,6 +9598,9 @@ fn method_specializer_matches_designator(ms: &MethodSpecializer, arg: EgclVal) -
 /// list, cloning only those (not the whole vector). Returns None if any id is
 /// missing (a stale cache entry), so the caller recomputes.
 fn methods_by_ids(env: &Env, name: &str, ids: &[EgclVal]) -> Option<Vec<MethodDef>> {
+    if let Some(methods) = method_continuations::retained_methods(env, name, ids) {
+        return Some(methods);
+    }
     let methods = env.methods.borrow();
     let list = methods.get(name)?;
     let mut out = Vec::with_capacity(ids.len());
@@ -9806,7 +9848,7 @@ fn accessor_call_miss(symbol: u32, args: &[EgclVal], env: &mut Env) -> Result<Eg
 /// that method's body is compiled — which only happens if it has no
 /// call-next-method and no captured lexicals (bliss-x5y.20) — it neither reads
 /// `env.method_context` nor needs a next-method chain, so it can be invoked
-/// directly through `apply_function`, skipping the four `methods_by_ids`
+/// through a checked registered-body entry or callback-free accessor, skipping the four `methods_by_ids`
 /// name-lookups, the empty-list plumbing in `invoke_standard_methods` /
 /// `invoke_primary_chain`, and the `MethodContext` push/pop. Works from the
 /// cached method-ids alone (METHOD_COMPILED is keyed by method-id), so it never
@@ -9826,12 +9868,9 @@ fn try_single_primary_fast(
     {
         return None;
     }
-    // A DEFCLASS accessor is the whole effective method: read or store the slot
-    // here rather than enter its body, whose SLOT-VALUE would cost another full
-    // call. This runs only after dispatch chose that method, so a user's
-    // :AROUND/:BEFORE/:AFTER method or replacement method still takes over
-    // (#202). An unbound, missing or class-allocated slot, or an obsolete
-    // instance, falls through to the body for the full protocol.
+    // This branch is authoritative generated accessor metadata, independent
+    // of whether its source body has a compiled no-context proof. Nothing on
+    // a declining leaf path may run user code before the snapshot is created.
     if let Some((slot, access)) = effective.accessor {
         let args = RootedVals::new(args.to_vec());
         let operation = match access {
@@ -9840,12 +9879,19 @@ fn try_single_primary_fast(
         };
         let instance = args.last().copied().unwrap_or(NIL);
         if !slot_access::pristine(instance, operation, env) {
-            let id = effective.primary[0];
-            let callable = METHOD_COMPILED.borrow().get(&id.0).copied()?;
-            return Some(apply_function(callable, &args, env));
+            return None;
         }
         let slot = EgclVal::from_symbol_index(slot);
         match access {
+            SlotAccess::Read if args.len() == 1 => {
+                if let Some(Ok(value)) = egcl_stdlib::slot_value_if_present(args[0], slot) {
+                    if fill {
+                        record_accessor_fill(args[0], slot, false, CachedSlotCheck::Any);
+                    }
+                    env.clear_mv();
+                    return Some(Ok(value));
+                }
+            }
             SlotAccess::Write if args.len() == 2 => {
                 if egcl_stdlib::set_slot_value_if_present(args[1], slot, args[0]).is_some() {
                     if fill {
@@ -9856,55 +9902,29 @@ fn try_single_primary_fast(
                 }
             }
             SlotAccess::CheckedWrite if args.len() == 2 => {
-                // A checked store needs a value the slot's type admits. TYPEP
-                // can expand a DEFTYPE and so collect, which this caller's ARGS
-                // would not survive, so once it may run the call finishes here,
-                // from rooted copies: a value the type rejects runs the writer
-                // body, which signals the correctable TYPE-ERROR. Fetch that
-                // body first, while declining still leaves ARGS valid.
-                let id = effective.primary[0];
-                let callable = METHOD_COMPILED.borrow().get(&id.0).copied()?;
-                egcl_rt::rooted!(callable = callable);
-                egcl_rt::rooted!(value = args[0]);
-                egcl_rt::rooted!(object = args[1]);
-                egcl_rt::rooted!(typespec = struct_slot_typespec(*object, slot));
-                let admitted = if *typespec == T {
-                    true
-                } else {
-                    match declaration_typep_matches(env, *value, *typespec, false, 0) {
-                        Ok(admitted) => admitted,
-                        Err(error) => return Some(Err(error)),
-                    }
-                };
-                if admitted
-                    && egcl_stdlib::set_slot_value_if_present(*object, slot, *value).is_some()
-                {
-                    if fill
-                        && let Some(check) = CachedSlotCheck::for_typespec(*typespec)
-                        && check.admits(*value)
-                    {
-                        record_accessor_fill(*object, slot, true, check);
-                    }
-                    env.clear_mv();
-                    return Some(Ok(*value));
+                let typespec = struct_slot_typespec(args[1], slot);
+                // A general TYPEP can invoke DEFTYPE/user code. Only an
+                // existing callback-free built-in check is a pre-snapshot leaf.
+                let check = CachedSlotCheck::for_typespec(typespec)?;
+                if !check.admits(args[0]) {
+                    return None;
                 }
-                return Some(apply_function(*callable, &[*value, *object], env));
-            }
-            SlotAccess::Read if args.len() == 1 => {
-                if let Some(Ok(value)) = egcl_stdlib::slot_value_if_present(args[0], slot) {
+                if egcl_stdlib::set_slot_value_if_present(args[1], slot, args[0]).is_some() {
                     if fill {
-                        record_accessor_fill(args[0], slot, false, CachedSlotCheck::Any);
+                        record_accessor_fill(args[1], slot, true, check);
                     }
                     env.clear_mv();
-                    return Some(Ok(value));
+                    return Some(Ok(args[0]));
                 }
             }
             _ => {}
         }
+        return None;
     }
     let id = effective.primary[0];
     let callable = METHOD_COMPILED.borrow().get(&id.0).copied()?;
-    Some(apply_function(callable, args, env))
+    let proof = METHOD_CONTEXT_UNUSED.borrow().get(&id.0).cloned()?;
+    bytecode::call_registered_method_if_body(callable, &proof, args, env)
 }
 
 fn run_standard_from_ids(
@@ -9924,6 +9944,10 @@ fn run_standard_from_ids(
     ) else {
         return Ok(None);
     };
+    egcl_rt::rooted_ref!(_around_root = &mut around);
+    egcl_rt::rooted_ref!(_before_root = &mut before);
+    egcl_rt::rooted_ref!(_primary_root = &mut primary);
+    egcl_rt::rooted_ref!(_after_root = &mut after);
     // A built-in generic's own behaviour is the least specific primary method:
     // CALL-NEXT-METHOD from the last user method reaches it, as it reaches the
     // standard method in other implementations (bliss-y3tk7).
@@ -9932,10 +9956,6 @@ fn run_standard_from_ids(
             primary.push(builtin_next_method(symbol));
         }
     }
-    egcl_rt::rooted_ref!(_around_root = &mut around);
-    egcl_rt::rooted_ref!(_before_root = &mut before);
-    egcl_rt::rooted_ref!(_primary_root = &mut primary);
-    egcl_rt::rooted_ref!(_after_root = &mut after);
     invoke_standard_methods(env, &around, &before, &primary, &after, args).map(Some)
 }
 
@@ -10034,9 +10054,11 @@ fn generic_specialized_positions(env: &Env, name: &str) -> u8 {
 
 fn invoke_generic_function(
     name: &str,
-    args: &[EgclVal],
+    input_args: &[EgclVal],
     env: &mut Env,
 ) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted!(args_root = input_args.to_vec());
+    let args = &args_root[..];
     let res = invoke_generic_function_inner(name, args, env);
     if let Err(e) = &res {
         calltrace_note(name, e);
@@ -10228,15 +10250,29 @@ fn invoke_generic_function_inner(
                         .copied(),
                 ),
             )?;
-            // Single-primary fast path (bliss-fy37 #2): the common case skips the
-            // general standard-combination machinery entirely.
-            if let Some(fast) = try_single_primary_fast(env, &m, args, fill) {
-                return fast;
-            }
-            if let Some(result) =
-                run_standard_from_ids(env, &m.around, &m.before, &m.primary, &m.after, name, args)?
-            {
-                return Ok(result);
+            egcl_rt::rooted!(
+                candidates = env.methods.borrow().get(name).cloned().unwrap_or_default()
+            );
+            // Keep the current candidate universe owned before any entry. A
+            // concurrent new publication discards this cached decision.
+            if GF_DISPATCH_GENERATION.load(AtomicOrdering::Acquire) == generation {
+                if let Some(fast) = try_single_primary_fast(env, &m, args, fill) {
+                    return fast;
+                }
+                let invocation = method_continuations::snapshot(
+                    name,
+                    &candidates,
+                    &m.ordered,
+                    &precedence,
+                    env,
+                )?;
+                let _invocation_scope =
+                    method_continuations::InvocationScope::enter(env, Some(invocation));
+                if let Some(result) = run_standard_from_ids(
+                    env, &m.around, &m.before, &m.primary, &m.after, name, args,
+                )? {
+                    return Ok(result);
+                }
             }
             // A cached id no longer resolves (method redefined without a
             // generation bump would be a bug, but tolerate it): recompute below.
@@ -10326,11 +10362,9 @@ fn invoke_generic_function_inner(
             };
             let single_primary_direct = primary_ids.len() == 1
                 && !is_builtin_function(&symbol_bare_name(name))
-                && !ordered
-                    .iter()
-                    .find(|method| method.method_id == primary_ids[0])
-                    .is_some_and(|method| mentions_next_method(method.body));
+                && (accessor.is_some() || method_context_unused(primary_ids[0]));
             let effective = Rc::new(GfEffective {
+                ordered: method_ids.clone(),
                 around: around_ids,
                 before: before_ids,
                 primary: primary_ids,
@@ -10354,6 +10388,10 @@ fn invoke_generic_function_inner(
             if let Some(fast) = try_single_primary_fast(env, &effective, args, fill) {
                 return fast;
             }
+            let invocation =
+                method_continuations::snapshot(name, &methods, &method_ids, &precedence, env)?;
+            let _invocation_scope =
+                method_continuations::InvocationScope::enter(env, Some(invocation));
             match run_standard_from_ids(
                 env,
                 &effective.around,
@@ -10371,7 +10409,7 @@ fn invoke_generic_function_inner(
             }
         }
         other => {
-            let Some((short_combination, method_ids)) =
+            let Some((short_combination, short_method_ids)) =
                 egcl_stdlib::clos::get_short_form_method(effective)
             else {
                 return Err(EgclError::Internal(
@@ -10385,7 +10423,7 @@ fn invoke_generic_function_inner(
                 .get(name)
                 .is_some_and(|generic| generic.most_specific_last);
             let mut primary: Vec<MethodDef> = Vec::new();
-            for method_id in method_ids {
+            for method_id in short_method_ids {
                 let method = ordered
                     .iter()
                     .find(|method| method.method_id == method_id)
@@ -10402,6 +10440,10 @@ fn invoke_generic_function_inner(
                 .collect();
             egcl_rt::rooted_ref!(_primary_root = &mut primary);
             egcl_rt::rooted_ref!(_around_root = &mut around);
+            let invocation =
+                method_continuations::snapshot(name, &methods, &method_ids, &precedence, env)?;
+            let _invocation_scope =
+                method_continuations::InvocationScope::enter(env, Some(invocation));
             invoke_short_form_methods(env, &around, short_combination, &primary, args)
         }
     }
@@ -10415,6 +10457,7 @@ fn invoke_generic_function_inner(
 pub(crate) struct EnvRootVisitState {
     frames: HashSet<usize>,
     class_slot_cells: HashSet<usize>,
+    method_invocations: HashSet<usize>,
 }
 
 thread_local! {
@@ -10440,6 +10483,7 @@ pub(crate) fn with_env_visit_state<R>(f: impl FnOnce(&mut EnvRootVisitState) -> 
             c.0 = pass;
             c.1.frames.clear();
             c.1.class_slot_cells.clear();
+            c.1.method_invocations.clear();
         }
         f(&mut c.1)
     })
@@ -10712,10 +10756,16 @@ impl egcl_rt::gc::TraceHostRoots for NextMethod {
 
 impl egcl_rt::gc::TraceHostRoots for MethodContext {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
-        for arg in &mut self.args {
-            visit(arg);
-        }
-        with_env_visit_state(|state| visit_next_method_roots(&mut self.next, state, visit));
+        with_env_visit_state(|state| {
+            visit(&mut self.method);
+            if let Some(invocation) = &mut self.invocation {
+                invocation.trace_with(state, visit);
+            }
+            for arg in &mut self.args {
+                visit(arg);
+            }
+            visit_next_method_roots(&mut self.next, state, visit);
+        });
     }
 }
 
@@ -11292,7 +11342,14 @@ impl Env {
                 }
             }
         }
+        for invocation in &mut self.method_invocations {
+            invocation.trace_with(state, visit);
+        }
         for context in &mut self.method_context {
+            visit(&mut context.method);
+            if let Some(invocation) = &mut context.invocation {
+                invocation.trace_with(state, visit);
+            }
             for arg in &mut context.args {
                 visit(arg);
             }
@@ -11395,6 +11452,7 @@ impl Env {
             catch_stack: Vec::new(),
             tag_stack: Vec::new(),
             method_context: Vec::new(),
+            method_invocations: Vec::new(),
             eval_context: EvalContext::Repl,
             speculative_evaluation: false,
             locally_specials: Vec::new(),
@@ -11705,6 +11763,7 @@ impl Env {
             catch_stack: self.catch_stack.clone(),
             tag_stack: self.tag_stack.clone(),
             method_context: self.method_context.clone(),
+            method_invocations: self.method_invocations.clone(),
             eval_context: self.eval_context,
             speculative_evaluation: self.speculative_evaluation,
             locally_specials: self.locally_specials.clone(),
@@ -11738,6 +11797,7 @@ impl Env {
             catch_stack: self.catch_stack.clone(),
             tag_stack: self.tag_stack.clone(),
             method_context: self.method_context.clone(),
+            method_invocations: self.method_invocations.clone(),
             eval_context: self.eval_context,
             speculative_evaluation: self.speculative_evaluation,
             locally_specials: self.locally_specials.clone(),
@@ -11757,6 +11817,7 @@ impl Env {
         child.locally_specials.clear();
         child.active_declarations.clear();
         child.method_context.clear();
+        child.method_invocations.clear();
         child.clear_mv();
         child
     }
@@ -21255,6 +21316,7 @@ fn mv_operator_preserves(name: &str) -> bool {
         name,
         // ── genuine multiple-value producers ──
         "VALUES"
+            | "EGCL-INTERNAL:%METHOD-CONTINUE" | "EGCL-INTERNAL::%METHOD-CONTINUE"
             | "VALUES-LIST"
             | "GETHASH"
             | "FLOOR"
@@ -28678,6 +28740,12 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 let args = eval_args(cdr, env)?;
                 return call_next_method_values(env, &context, &args);
             }
+            "EGCL-INTERNAL:%METHOD-CONTEXT"
+            | "EGCL-INTERNAL::%METHOD-CONTEXT"
+            | "EGCL-INTERNAL:%METHOD-CONTINUE"
+            | "EGCL-INTERNAL::%METHOD-CONTINUE"
+            | "EGCL-INTERNAL:%METHOD-NEXT-P"
+            | "EGCL-INTERNAL::%METHOD-NEXT-P" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::%NEXT-METHOD-P" => {
                 let has_next = env
                     .method_context
@@ -42423,6 +42491,8 @@ fn eval_defmethod(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     // DEFUN does. Methods can outlive an enclosing MACROLET; saving only its
     // unexpanded body loses those macros before the method is invoked.
     body = mx_each(body, env, 0)?;
+    let mut method_context_spec = None;
+    body = method_continuations::wrap_body(body, &mut method_context_spec)?;
     let method_id = next_stdlib_class_id();
 
     // Parse the specialized lambda list. Required parameters (before any
@@ -42599,10 +42669,20 @@ fn eval_defmethod(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             bytecode::log_not_compiled(&label, "method defined inside a lexical binding");
         } else {
             let compile_ll = method_lambda_list_for_compile(*lambda_list);
-            if let Some(callable) =
-                bytecode::compile_and_reify_lambda(&label, compile_ll, body, env)
-            {
+            if let Some((callable, proof)) = bytecode::compile_and_reify_method_lambda(
+                &label,
+                compile_ll,
+                body,
+                env,
+                method_context_spec.expect("generated method context metadata"),
+            ) {
                 METHOD_COMPILED.borrow_mut().insert(method_id.0, callable);
+                if let Some(proof) = proof {
+                    METHOD_CONTEXT_UNUSED
+                        .borrow_mut()
+                        .insert(method_id.0, proof);
+                }
+                invalidate_gf_dispatch_cache();
             }
         }
     }
@@ -42668,6 +42748,8 @@ fn set_compiled_method_cell(callable: EgclVal, installed: bool) {
 
 /// Drop method `id`'s compiled body, if it has one.
 fn forget_compiled_method(id: u64) {
+    METHOD_CONTEXT_UNUSED.borrow_mut().remove(&id);
+    invalidate_gf_dispatch_cache();
     ACCESSOR_METHODS.borrow_mut().remove(&id);
     let retired = METHOD_COMPILED.borrow_mut().remove(&id);
     if let Some(callable) = retired {
@@ -45174,6 +45256,8 @@ fn is_builtin_function(name: &str) -> bool {
             // Misc
             | "ERROR" | "WARN" | "SIGNAL" | "CERROR" | "MAKE-CONDITION" | "MUFFLE-WARNING"
             | "INVOKE-RESTART" | "FIND-RESTART" | "COMPUTE-RESTARTS" | "ABORT" | "CONTINUE"
+            | "EGCL-INTERNAL:%METHOD-CONTEXT" | "EGCL-INTERNAL::%METHOD-CONTEXT" | "EGCL-INTERNAL:%METHOD-CONTINUE" | "EGCL-INTERNAL::%METHOD-CONTINUE"
+            | "EGCL-INTERNAL:%METHOD-NEXT-P" | "EGCL-INTERNAL::%METHOD-NEXT-P"
             | "CLASS-OF" | "CLASS-NAME" | "FIND-CLASS" | "FIND-METHOD" | "SLOT-VALUE" | "SLOT-BOUNDP"
             | "REMOVE-METHOD" | "ADD-METHOD" | "METHOD-QUALIFIERS" | "METHOD-SPECIALIZERS"
             | "METHOD-LAMBDA-LIST" | "METHOD-GENERIC-FUNCTION" | "COMPUTE-APPLICABLE-METHODS"
@@ -50129,6 +50213,8 @@ mod env_gc_root_tests {
             },
         );
         env.method_context.push(MethodContext {
+            method: NIL,
+            invocation: None,
             args: vec![marker(27)],
             next: NextMethod::Standard {
                 around: vec![method(28)],
@@ -50138,6 +50224,8 @@ mod env_gc_root_tests {
             },
         });
         env.method_context.push(MethodContext {
+            method: NIL,
+            invocation: None,
             args: Vec::new(),
             next: NextMethod::Primary {
                 primary: vec![method(32)],

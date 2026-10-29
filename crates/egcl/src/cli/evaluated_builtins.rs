@@ -4206,6 +4206,14 @@ fn resolve(name: &str) -> Option<Handler> {
             Ok(plist)
         }),
 
+        "EGCL-INTERNAL:%METHOD-CONTEXT"
+        | "EGCL-INTERNAL::%METHOD-CONTEXT"
+        | "EGCL-INTERNAL:%METHOD-CONTINUE"
+        | "EGCL-INTERNAL::%METHOD-CONTINUE"
+        | "EGCL-INTERNAL:%METHOD-NEXT-P"
+        | "EGCL-INTERNAL::%METHOD-NEXT-P" => {
+            Some(|operator, args, env| method_continuations::call(operator, args, env))
+        }
         "EGCL-INTERNAL:%SET-CLASS-NAME" | "EGCL-INTERNAL::%SET-CLASS-NAME" => {
             Some(|_, args, env| {
                 if args.len() != 2 {
