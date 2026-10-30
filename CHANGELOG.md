@@ -26,6 +26,10 @@
 
 ### Fixed
 
+- Preserve inherited symbol-macro expansions across garbage collection inside
+  BLOCK, TAGBODY, LET and LET* compilation
+  ([#927](https://github.com/atgreen/evergreen/pull/927)).
+
 - Keep variable and oversized ASH counts on the generic call path so they no
   longer prevent T2 optimization of the containing function
   ([#921](https://github.com/atgreen/evergreen/pull/921)).

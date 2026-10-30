@@ -1892,7 +1892,8 @@ fn expand_block(mut form: EgclVal, env: &Environment) -> Result<EgclVal, EgclErr
     egcl_rt::rooted_ref!(_body_root = &mut body);
 
     // Augment env with block name
-    let new_env = env.augment_block(block_name);
+    let mut new_env = env.augment_block(block_name);
+    egcl_rt::rooted_ref!(_new_env_root = &mut new_env);
     let expanded_body = expand_body(body, &new_env)?;
 
     if expanded_body == body {
@@ -1948,6 +1949,7 @@ fn expand_tagbody(mut form: EgclVal, env: &Environment) -> Result<EgclVal, EgclE
 
     // First pass: register all tags in the environment
     let mut new_env = env.clone();
+    egcl_rt::rooted_ref!(_new_env_root = &mut new_env);
     egcl_rt::rooted!(items = cons_to_vec(body));
     for i in 0..items.len() {
         // Tags are symbols or integers (atoms that are not cons)
@@ -2851,6 +2853,7 @@ fn expand_let(
     egcl_rt::rooted!(expanded_bindings = Vec::<EgclVal>::with_capacity(bindings.len()));
     let mut bindings_changed = false;
     let mut current_env = env.clone();
+    egcl_rt::rooted_ref!(_current_env_root = &mut current_env);
 
     for idx in 0..bindings.len() {
         let binding = bindings[idx];
@@ -2890,8 +2893,11 @@ fn expand_let(
         }
     }
 
+    // Transfer the derived environment to its rooted body owner without allocating.
+    drop(_current_env_root);
     // Build augmented env for the body
     let mut body_env = if sequential { current_env } else { env.clone() };
+    egcl_rt::rooted_ref!(_body_env_root = &mut body_env);
     if !sequential {
         for idx in 0..bindings.len() {
             let binding = bindings[idx];
