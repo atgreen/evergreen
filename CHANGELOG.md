@@ -26,6 +26,10 @@
 
 ### Fixed
 
+- Avoid repeated scans of retained callable roots during ordinary native entry
+  checks while preserving code-version and callable-identity guards
+  ([#933](https://github.com/atgreen/evergreen/pull/933)).
+
 - Avoid scanning retained ordinary call-adapter histories after binding
   invalidations, preserving suspended native calls across redefinition
   ([#932](https://github.com/atgreen/evergreen/pull/932)).
