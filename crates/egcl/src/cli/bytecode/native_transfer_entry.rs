@@ -26,6 +26,7 @@ use std::sync::OnceLock;
 mod activation;
 mod condition_osr;
 pub(super) mod interpreter_osr;
+pub(super) mod local_exits;
 pub(super) mod root_publication;
 mod special_bindings;
 use activation::ActivationState;
@@ -3456,9 +3457,30 @@ unsafe fn call_or_throw_unpublished(
     let call = unsafe { &*request.cast::<TransferCallRequest>() };
     let request_kind = call.symbol & !u64::from(u32::MAX);
     use egcl_compiler::t2::emit::{
-        TRANSFER_GLOBAL_LOAD_REQUEST, TRANSFER_GLOBAL_STORE_REQUEST, TRANSFER_SPECIAL_BIND_REQUEST,
-        TRANSFER_SPECIAL_UNBIND_REQUEST,
+        TRANSFER_DIRECT_EXIT_REQUEST, TRANSFER_GLOBAL_LOAD_REQUEST, TRANSFER_GLOBAL_STORE_REQUEST,
+        TRANSFER_SPECIAL_BIND_REQUEST, TRANSFER_SPECIAL_UNBIND_REQUEST,
     };
+    if request_kind == TRANSFER_DIRECT_EXIT_REQUEST {
+        let result = if native_error_pending() {
+            Ok(NIL)
+        } else {
+            guard_c2i(|| unsafe { local_exits::request(call) })
+        };
+        if let Err(error) = result {
+            NATIVE_ERROR.with(|slot| slot.set_first(error));
+        }
+        unsafe {
+            out.write(NativeOutcome {
+                value: NIL,
+                exit: if native_error_pending() {
+                    NativeExit::Transfer
+                } else {
+                    NativeExit::Returned
+                },
+            });
+        }
+        return;
+    }
     if matches!(
         request_kind,
         TRANSFER_SPECIAL_BIND_REQUEST

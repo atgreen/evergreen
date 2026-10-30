@@ -203,6 +203,7 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                             | AuxData::HandlerBindScope { .. }
                             | AuxData::RestartCaseScope { .. }
                             | AuxData::SpecialBinding { .. }
+                            | AuxData::DirectExit { .. }
                             | AuxData::GlobalValue { .. }
                             | AuxData::CleanupContinuation { .. }
                     ))
@@ -247,6 +248,17 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                     "V11 invoke-shape",
                     "multiple-value list collection requires one primary and one result",
                 ));
+            }
+            if let AuxData::DirectExit { bcp } = data.aux {
+                let identity_matches = data
+                    .frame_state
+                    .filter(|id| (id.0 as usize) < f.frame_states.len())
+                    .and_then(|id| f.frame_states.get(id).scopes.last())
+                    .is_some_and(|scope| scope.bcp == bcp);
+                if data.opcode != Opcode::Invoke || !data.args.is_empty() || !identity_matches {
+                    errors.push(VerifyError::new("V11 invoke-shape",
+                        "direct exit requires an argument-free Invoke at its original bytecode position"));
+                }
             }
             if let AuxData::SpecialBinding { bcp, enter } = data.aux {
                 let identity_matches = data

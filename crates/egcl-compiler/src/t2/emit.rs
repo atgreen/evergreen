@@ -2857,6 +2857,9 @@ fn emit_invoke_call(
             0,
             false,
         ),
+        crate::t2::ir::AuxData::DirectExit { bcp } => {
+            (TRANSFER_DIRECT_EXIT_REQUEST | u64::from(bcp), 0, false)
+        }
         crate::t2::ir::AuxData::SpecialBinding { bcp, enter } => (
             (if enter {
                 TRANSFER_SPECIAL_BIND_REQUEST
@@ -4909,6 +4912,8 @@ pub const TRANSFER_MAKE_CLOSURE_REQUEST: u64 = 16_u64 << 32;
 /// Low word is the retained root body's PC of a captured-variable instruction,
 /// applied to the executing activation's heap EnvFrame.
 pub const TRANSFER_LEXICAL_ENVIRONMENT_REQUEST: u64 = 17_u64 << 32;
+/// Low word is the retained RETURN-FROM/GO BCP and its immutable ScopeExit.
+pub const TRANSFER_DIRECT_EXIT_REQUEST: u64 = 18_u64 << 32;
 
 /// Helper-v2 call request, live in the generated caller's temporary frame until
 /// normal return or completion of cold preparation. The args slice resides in
@@ -6171,6 +6176,7 @@ fn emit_transfer_function_with_storage(
                             | AuxData::HandlerBindScope { .. }
                             | AuxData::RestartCaseScope { .. }
                             | AuxData::SpecialBinding { .. }
+                            | AuxData::DirectExit { .. }
                             | AuxData::GlobalValue { .. }
                     )
                     || data.opcode == Opcode::NlxTransfer && !data.targets.is_empty())
@@ -8640,6 +8646,7 @@ fn emit_framed_inner(
                         | AuxData::HandlerBindScope { .. }
                         | AuxData::RestartCaseScope { .. }
                         | AuxData::SpecialBinding { .. }
+                        | AuxData::DirectExit { .. }
                         | AuxData::GlobalValue { .. } => transfer.veneer,
                         AuxData::CleanupContinuation { .. } => match transfer.cleanup {
                             Some(CleanupEmission::Native { complete, .. }) => complete,

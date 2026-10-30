@@ -942,6 +942,51 @@ impl<'a> Builder<'a> {
         }
     }
 
+    fn native_direct_exit(&self, bcp: u32) -> Result<bool, BuildError> {
+        if !self.native_cleanups
+            || !matches!(
+                self.bf.code.get(bcp as usize),
+                Some(Instr::ReturnFrom { .. } | Instr::Go { .. })
+            )
+        {
+            return Ok(false);
+        }
+        let Some(exit) = self
+            .control_scopes
+            .as_ref()
+            .and_then(|scopes| scopes.exit_at(bcp))
+        else {
+            // Unreachable bytecodes need no invoke edge. A reachable exit
+            // without a scope still fails the ordinary direct-exit check.
+            return Ok(false);
+        };
+        let dynamic = exit.removed.iter().any(|scope| {
+            !matches!(
+                scope.kind,
+                ScopeKind::Block { .. } | ScopeKind::Tagbody { .. }
+            )
+        });
+        if dynamic
+            && exit.removed.iter().any(|scope| {
+                scope.ownership != crate::control_scope::Ownership::Local
+                    || !matches!(
+                        scope.kind,
+                        ScopeKind::Block {
+                            register: false,
+                            ..
+                        } | ScopeKind::Tagbody { .. }
+                            | ScopeKind::SpecialBinding { .. }
+                            | ScopeKind::Catch { .. }
+                    )
+            })
+        {
+            return Err(BuildError::Unsupported(
+                "direct exit requires dynamic unwinding",
+            ));
+        }
+        Ok(dynamic)
+    }
+
     fn check_direct_exit(&self, bcp: u32) -> Result<(), BuildError> {
         let exit = self
             .control_scopes
@@ -1241,7 +1286,8 @@ impl<'a> Builder<'a> {
                     }
                 };
             if self.native_cleanups
-                && (self.catch_transition(i).is_some()
+                && (self.native_direct_exit(i as u32)?
+                    || self.catch_transition(i).is_some()
                     || self.handler_transition(i).is_some()
                     || self.handler_bind_transition(i).is_some()
                     || self.special_or_global_access(i).is_some()
@@ -1513,7 +1559,8 @@ impl<'a> Builder<'a> {
                 }
             };
             if self.native_cleanups
-                && (self.catch_transition(i).is_some()
+                && (self.native_direct_exit(i as u32)?
+                    || self.catch_transition(i).is_some()
                     || self.handler_transition(i).is_some()
                     || self.handler_bind_transition(i).is_some()
                     || self.special_or_global_access(i).is_some()
@@ -1744,6 +1791,24 @@ impl<'a> Builder<'a> {
                 ))
         };
         for (offset, instr) in code[start..end].iter().enumerate() {
+            let bcp = (start + offset) as u32;
+            if self.native_direct_exit(bcp)? {
+                // The normal invoke edge jumps to the lexical destination,
+                // while validation failure retains the original catch/handler
+                // landings. Count every edge before sealing any destination.
+                let exit = self.control_scopes.as_ref().unwrap().exit_at(bcp).unwrap();
+                let mut successors = vec![blk(exit.target_bcp as usize)?];
+                for target in self.exceptional_handlers(bcp) {
+                    successors.push(blk(target.body_bcp as usize)?);
+                }
+                for (_, resume, _) in self.exceptional_catches(bcp) {
+                    successors.push(blk(resume as usize)?);
+                }
+                if let Some((cleanup, _)) = self.exceptional_cleanup(bcp) {
+                    successors.push(blk(cleanup as usize)?);
+                }
+                return Ok(successors);
+            }
             if self.catch_transition(start + offset).is_some()
                 || self.handler_transition(start + offset).is_some()
                 || self.handler_bind_transition(start + offset).is_some()
@@ -1982,6 +2047,42 @@ impl<'a> Builder<'a> {
         let code = &self.bf.code;
         for (offset, instruction) in code[start..end].iter().enumerate() {
             let i = start + offset;
+            if self.native_direct_exit(i as u32)? {
+                // Keep the original pre-exit state available until the helper
+                // has validated all ledgers. Only the normal edge changes the
+                // operand stack and jumps to the retained exit destination.
+                let fs = self.build_frame_state(block, &stack, i as u32);
+                let target = self
+                    .control_scopes
+                    .as_ref()
+                    .unwrap()
+                    .exit_at(i as u32)
+                    .unwrap()
+                    .target_bcp;
+                let (inst, results) = self.f.push_inst(
+                    block,
+                    InstData {
+                        opcode: Opcode::Call,
+                        args: vec![],
+                        results: vec![],
+                        aux: AuxData::DirectExit { bcp: i as u32 },
+                        flags: runtime_call_flags(),
+                        targets: vec![],
+                        frame_state: Some(fs),
+                        source_pos: 0,
+                    },
+                    &[(IRType::TOP, ValueRepresentation::Tagged)],
+                );
+                self.finish_native_invoke(
+                    block,
+                    inst,
+                    stack,
+                    results[0],
+                    i as u32,
+                    Some(target as usize),
+                )?;
+                return Ok(());
+            }
             if let Some(aux) = self.special_or_global_access(i) {
                 // The cold state is BEFORE consuming a binding/store operand.
                 // The runtime commits only after all fallible preparation.
@@ -3000,7 +3101,31 @@ impl<'a> Builder<'a> {
             });
             handler_edges.push((landing, target));
         }
-        if !matches!(
+        if let AuxData::DirectExit { bcp: exit_bcp } = self.f.inst(call).aux {
+            let exit = self
+                .control_scopes
+                .as_ref()
+                .unwrap()
+                .exit_at(exit_bcp)
+                .ok_or(BuildError::Unsupported("direct exit without active scope"))?;
+            let restore = usize::from(exit.sp_restore);
+            let value = if matches!(self.bf.code[exit_bcp as usize], Instr::ReturnFrom { .. }) {
+                Some(
+                    stack
+                        .pop()
+                        .ok_or(BuildError::Unsupported("stack underflow (ReturnFrom)"))?,
+                )
+            } else {
+                None
+            };
+            if stack.len() < restore {
+                return Err(BuildError::Unsupported("direct exit below sp_restore"));
+            }
+            stack.truncate(restore);
+            if let Some(value) = value {
+                stack.push(value);
+            }
+        } else if !matches!(
             self.f.inst(call).aux,
             AuxData::CatchScope { .. }
                 | AuxData::HandlerScope { .. }
