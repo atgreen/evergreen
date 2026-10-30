@@ -152,6 +152,8 @@ Version 3.2 and older units whose same-named local functions were collapsed
 must be recompiled; missing identities cannot be recovered from their strings.
 Core format 17 adds separate captured function-cell maps; it reads format 16
 frames with empty new maps and preserves their legacy string-key behavior.
+The CLI still checks runtime source identity before restoring a core; this
+low-level format compatibility does not permit loading cores from other builds.
 Core format 15 added exact method class-specializer identities. Format
 16 added class-owned runtime definitions and shared cells; rebuild
 images from earlier formats, including format 15.

@@ -449,6 +449,10 @@ fn spec_image_version_16_heap_and_entry_remain_readable() {
     // additional function namespace and handles old frames independently.
     let mut bytes = fs::read(&path).unwrap();
     bytes[8..12].copy_from_slice(&16u32.to_ne_bytes());
+    // Updating the version changes the checksummed header. Keep the fixture
+    // valid so this tests version compatibility rather than corruption.
+    let checksum = egcl_rt::digest::sha256(&bytes[..96]);
+    bytes[96..128].copy_from_slice(&checksum);
     fs::write(&path, bytes).unwrap();
     assert_eq!(
         validate_image_header(path.to_str().unwrap())

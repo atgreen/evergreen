@@ -2684,6 +2684,10 @@ impl<K: PartialEq, V> VecMap<K, V> {
     fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
         self.entries.iter().map(|(k, v)| (k, v))
     }
+    #[inline]
+    fn iter_mut(&mut self) -> impl Iterator<Item = (&K, &mut V)> {
+        self.entries.iter_mut().map(|(key, value)| (&*key, value))
+    }
 }
 
 impl<'a, K, V> IntoIterator for &'a VecMap<K, V> {

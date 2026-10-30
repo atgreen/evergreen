@@ -9608,11 +9608,7 @@ fn collect_variable_names(form: EgclVal, out: &mut std::collections::HashSet<Str
     collect_symbol_names_qq(form, out, 0, true);
 }
 
-fn collect_symbol_names(form: EgclVal, out: &mut std::collections::HashSet<String>) {
-    collect_symbol_names_qq(form, out, 0, false);
-}
-
-/// [`collect_symbol_names`] with quasiquote awareness (bliss-t9o1). `qq` is the
+/// [`collect_variable_names`] with quasiquote awareness (bliss-t9o1). `qq` is the
 /// quasiquote nesting depth. At depth 0 a QUOTE is opaque data — but inside a
 /// quasiquote template QUOTE does NOT stop substitution: `',x` reads as
 /// `(QUOTE (UNQUOTE X))`, and skipping it hid X from the free-variable scan.

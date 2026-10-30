@@ -3874,7 +3874,7 @@ fn incompatible_bytecode_versions_are_rejected_before_load_effects() {
     let bytes = fs::read(&good).unwrap();
     let image = egcl_rt::bfasl::load(&bytes).unwrap();
     for version in [
-        0x0100u16, 0x010e, 0x010f, 0x0200, 0x0206, 0x0207, 0x0303, 0x0400,
+        0x0100u16, 0x010e, 0x010f, 0x0200, 0x0206, 0x0207, 0x0304, 0x0400,
     ] {
         let bad = dir.join(format!("version-{version:04x}.bfasl"));
         let mut builder = egcl_rt::bfasl::BfaslBuilder::new();

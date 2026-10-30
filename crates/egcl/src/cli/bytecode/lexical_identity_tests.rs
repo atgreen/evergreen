@@ -216,12 +216,18 @@ fn captured_function_cell_value_moves_without_aliasing_same_symbol_variable() {
     let function = lexical_identity::function(&variable);
     env.define_lexical_local(&variable, EgclVal::from_fixnum(3));
     egcl_rt::gc::collect_t0_minor().unwrap();
-    let before = arena_cons(EgclVal::from_fixnum(4), NIL);
-    env.define_lexical_local(&function, before);
+    let before = {
+        egcl_rt::rooted!(value = arena_cons(EgclVal::from_fixnum(4), NIL));
+        env.define_lexical_local(&function, *value);
+        value.to_raw()
+    };
+    // Only the environment owns the payload during collection. Retain its old
+    // address as raw bits solely to prove relocation, never to dereference it.
     egcl_rt::gc::collect_t0_minor().unwrap();
     let after = Env::lookup_lexical_frame(&env.frame, &function).unwrap();
     assert_ne!(
-        before, after,
+        before,
+        after.to_raw(),
         "captured FUNCTION-cell payload must actually relocate"
     );
     assert_eq!(cp(after).0, EgclVal::from_fixnum(4));
