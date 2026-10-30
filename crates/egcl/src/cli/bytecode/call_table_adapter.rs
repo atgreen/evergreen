@@ -18,6 +18,53 @@ pub(super) struct NamedAdapter {
     descriptor: OrdinaryEntryDescriptor,
 }
 
+/// Retain immutable descriptors for suspended callers, while keeping lookup
+/// independent of the number of binding revisions accumulated by a segment.
+/// The indices contain only Rust metadata; boxes still own all code and probes.
+#[derive(Default)]
+pub(super) struct AdapterHistory {
+    #[allow(clippy::vec_box)] // machine callers borrow immutable descriptor addresses
+    entries: Vec<Box<NamedAdapter>>,
+    by_revision: HashMap<u64, usize, egcl_rt::fxhash::FxBuildHasher>,
+    descriptors: std::collections::HashSet<usize, egcl_rt::fxhash::FxBuildHasher>,
+}
+
+impl std::ops::Deref for AdapterHistory {
+    type Target = [Box<NamedAdapter>];
+
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
+
+impl AdapterHistory {
+    fn for_revision(&self, revision: u64) -> Option<&NamedAdapter> {
+        self.by_revision
+            .get(&revision)
+            .map(|&index| self.entries[index].as_ref())
+    }
+
+    fn contains_descriptor(&self, address: usize) -> bool {
+        self.descriptors.contains(&address)
+    }
+
+    fn push(&mut self, adapter: Box<NamedAdapter>) {
+        // Match the former forward search even if revisions eventually wrap.
+        self.by_revision
+            .entry(adapter.descriptor.revision)
+            .or_insert(self.entries.len());
+        self.descriptors
+            .insert(std::ptr::from_ref(&adapter.descriptor) as usize);
+        self.entries.push(adapter);
+    }
+
+    fn clear(&mut self) {
+        self.by_revision.clear();
+        self.descriptors.clear();
+        self.entries.clear();
+    }
+}
+
 /// The table a FUNCALL cell's ordinary entry probes before its runtime
 /// veneer (bliss-6m6ca): which function objects run which named cell's
 /// ordinary entry. Only this execution writes it, between generated reads.
@@ -279,8 +326,7 @@ pub(super) fn ensure(state: &State) {
             || state
                 .ordinary_adapters
                 .borrow()
-                .iter()
-                .any(|adapter| std::ptr::from_ref(&adapter.descriptor) as usize == current)
+                .contains_descriptor(current)
         {
             return;
         }
@@ -289,10 +335,7 @@ pub(super) fn ensure(state: &State) {
     // A revision can be republished after invalidation without mutating any
     // descriptor that a suspended native caller might still hold.
     let mut adapters = state.ordinary_adapters.borrow_mut();
-    if let Some(adapter) = adapters
-        .iter()
-        .find(|entry| entry.descriptor.revision == revision)
-    {
+    if let Some(adapter) = adapters.for_revision(revision) {
         unsafe {
             linkage::publish_ordinary(&state.cell, &adapter.descriptor);
         }
@@ -353,6 +396,80 @@ pub(super) fn ensure(state: &State) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn named_adapter_indexes_aged_history_and_clears_retired_indices() {
+        use std::sync::atomic::Ordering;
+
+        let _lock = crate::cli::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        egcl_rt::rooted!(_env = Env::new(false));
+        let symbol = egcl_rt::symbols::intern("ORDINARY-ADAPTER-AGED-HISTORY");
+        let cell = resolve(symbol).unwrap();
+        let state = unsafe { super::super::state(Arc::as_ptr(&cell) as u64) };
+        let lease = super::super::ordinary::enter_ordinary_segment();
+        let original = std::ptr::from_ref(&state.ordinary_adapters.borrow()[0].descriptor);
+        let original_revision = unsafe { (*original).revision };
+        let original_entry = unsafe { (*original).entry };
+        let original_owner = unsafe { (*original).owner };
+
+        const REVISIONS: usize = 4096;
+        for _ in 0..REVISIONS {
+            linkage::invalidate(symbol);
+            ensure(state);
+        }
+        let current = unsafe { &*cell.ordinary_entry_address() };
+        let published = current.load(Ordering::Acquire);
+        {
+            let history = state.ordinary_adapters.borrow();
+            assert_eq!(history.len(), REVISIONS + 1);
+            assert_eq!(history.by_revision.len(), history.len());
+            assert_eq!(history.descriptors.len(), history.len());
+            for adapter in history.iter() {
+                let descriptor = std::ptr::from_ref(&adapter.descriptor);
+                assert!(history.contains_descriptor(descriptor as usize));
+                assert!(std::ptr::eq(
+                    &history
+                        .for_revision(adapter.descriptor.revision)
+                        .unwrap()
+                        .descriptor,
+                    descriptor,
+                ));
+                assert_eq!(adapter.descriptor.entry, original_entry);
+            }
+            assert!(!history.contains_descriptor(0));
+            assert!(
+                history
+                    .for_revision(linkage::revision(cell.ordinal()).wrapping_add(1))
+                    .is_none()
+            );
+        }
+
+        // Exercise the real ensure revision-hit path, not just the index API.
+        // A cleared publication at the same revision must reuse its descriptor.
+        for _ in 0..32 {
+            current.store(0, Ordering::Release);
+            ensure(state);
+            assert_eq!(current.load(Ordering::Acquire), published);
+            ensure(state); // an already-published entry is also unchanged
+        }
+        assert_eq!(state.ordinary_adapters.borrow().len(), REVISIONS + 1);
+        assert_eq!(unsafe { (*original).revision }, original_revision);
+        assert_eq!(unsafe { (*original).owner }, original_owner);
+        assert_eq!(unsafe { (*original).entry }, original_entry);
+
+        drop(lease);
+        linkage::invalidate(symbol);
+        ensure(state);
+        let history = state.ordinary_adapters.borrow();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history.by_revision.len(), 1);
+        assert_eq!(history.descriptors.len(), 1);
+        assert!(history.for_revision(original_revision).is_none());
+        assert_eq!(history[0].descriptor.entry, original_entry);
+        assert!(history.contains_descriptor(current.load(Ordering::Acquire)));
+    }
 
     #[test]
     fn named_adapter_reuses_code_and_keeps_live_revision_descriptors() {

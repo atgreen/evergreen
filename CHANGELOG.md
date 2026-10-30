@@ -26,6 +26,10 @@
 
 ### Fixed
 
+- Avoid scanning retained ordinary call-adapter histories after binding
+  invalidations, preserving suspended native calls across redefinition
+  ([#932](https://github.com/atgreen/evergreen/pull/932)).
+
 - Include published native Lisp frames and their actual tiers in statistical
   profiles, and sample call-free bytecode and native loops at cooperative polls
   ([#931](https://github.com/atgreen/evergreen/pull/931)).
