@@ -26,6 +26,10 @@
 
 ### Fixed
 
+- Speed up simple raw-slot reader methods, including MOP slot-definition
+  readers, while preserving dynamic method and slot-access behavior
+  ([#942](https://github.com/atgreen/evergreen/pull/942)).
+
 - Reduce repeated-call overhead from mapped native code to eligible ordinary
   T2 functions with generated calls and reusable state held by the caller
   ([#939](https://github.com/atgreen/evergreen/pull/939)).
