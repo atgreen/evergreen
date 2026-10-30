@@ -619,7 +619,7 @@ pub(super) fn refresh_installed(expected: &NativeCode) -> Option<Rc<NativeCode>>
     // Retire only the exact current publication. Its running activations keep
     // their owner, while subsequent calls execute T0 until replacement arrives.
     NATIVE_REGISTRY.with(|registry| registry.borrow_mut().remove(&symbol));
-    bump_direct_call_gen();
+    bump_direct_call_gen_for(symbol);
     if let Some(function) = *function {
         egcl_rt::function::set_tier(function, 0);
     }

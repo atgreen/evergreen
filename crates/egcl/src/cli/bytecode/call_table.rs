@@ -1053,6 +1053,90 @@ mod tests {
 
     #[test]
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    fn unrelated_definition_changes_preserve_active_adapter_revision() {
+        use std::sync::atomic::Ordering;
+        let _lock = crate::cli::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        egcl_rt::rooted!(env = Env::new(false));
+        crate::cli::read_eval_all_env(
+            "(defun INVALIDATION-RETAINED-A () 11) (defun INVALIDATION-CHANGED-B () 29)",
+            &mut env,
+        )
+        .unwrap();
+        let a = crate::cli::resolve_sym("INVALIDATION-RETAINED-A")
+            .unwrap()
+            .as_symbol_index();
+        let b = crate::cli::resolve_sym("INVALIDATION-CHANGED-B")
+            .unwrap()
+            .as_symbol_index();
+        egcl_rt::rooted!(function = egcl_rt::symbols::symbol_function(b).unwrap());
+        egcl_rt::rooted!(forms = reader::read_from_string("(29)").unwrap().0);
+        let body = Arc::new(
+            compile_function("INVALIDATION-CHANGED-B", NIL, *forms, &env, false, false).unwrap(),
+        );
+        egcl_rt::rooted!(_body = ActiveBytecodeRoot::new(&body));
+        registry_put(b, Arc::clone(&body));
+        let a_cell = resolve(a).unwrap();
+        let b_cell = resolve(b).unwrap();
+        let a_state = unsafe { state(Arc::as_ptr(&a_cell) as u64) };
+        let lease = ordinary::enter_ordinary_segment();
+        let a_revision = linkage::revision(a_cell.ordinal());
+        let a_descriptor = unsafe { &*a_cell.ordinary_entry_address() }.load(Ordering::Acquire);
+        assert_ne!(a_descriptor, 0, "A must publish a real ordinary adapter");
+        let a_history = a_state.ordinary_adapters.borrow().len();
+
+        for iteration in 0..32 {
+            resolve(b).unwrap();
+            let old_b = unsafe { &*b_cell.ordinary_entry_address() }.load(Ordering::Acquire);
+            assert_ne!(old_b, 0, "B must publish a real ordinary adapter");
+            let old_b = unsafe { &*(old_b as *const linkage::OrdinaryEntryDescriptor) };
+            let old_revision = old_b.revision;
+            let generation = direct_call_gen();
+            match iteration % 4 {
+                0 => assert!(publish_bytecode(b, Arc::clone(&body), None, *function)),
+                1 => registry_remove(b),
+                2 => profile_pin(b),
+                _ => profile_unpin(b),
+            }
+            if iteration % 4 != 3 {
+                assert_ne!(
+                    direct_call_gen(),
+                    generation,
+                    "baked-call guards must change"
+                );
+            }
+            assert_ne!(linkage::revision(b_cell.ordinal()), old_revision);
+            assert!(!unsafe { linkage::publish_ordinary(&b_cell, old_b) });
+            assert_eq!(
+                old_b.revision, old_revision,
+                "retained descriptor is immutable"
+            );
+            resolve(a).unwrap();
+            assert_eq!(linkage::revision(a_cell.ordinal()), a_revision);
+            assert_eq!(
+                unsafe { &*a_cell.ordinary_entry_address() }.load(Ordering::Acquire),
+                a_descriptor,
+            );
+            assert_eq!(a_state.ordinary_adapters.borrow().len(), a_history);
+        }
+        // Receiving a shared definition locally is a refresh, not another
+        // global mutation. It must not age either execution's binding revision.
+        assert!(publish_bytecode(b, Arc::clone(&body), None, *function));
+        let b_revision = linkage::revision(b_cell.ordinal());
+        let generation = direct_call_gen();
+        REGISTRY_GENERATION.with(|generations| generations.borrow_mut().remove(&b));
+        assert!(Arc::ptr_eq(&registry_get(b).unwrap(), &body));
+        assert_eq!(linkage::revision(b_cell.ordinal()), b_revision);
+        assert_eq!(linkage::revision(a_cell.ordinal()), a_revision);
+        assert_eq!(direct_call_gen(), generation);
+        drop(lease);
+        registry_remove(a);
+        registry_remove(b);
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     fn private_primitive_keeps_its_adapter_after_public_callable_warming() {
         use std::sync::atomic::Ordering;
         let _lock = crate::cli::heap_test_lock()
