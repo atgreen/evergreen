@@ -63,6 +63,8 @@ use background_compile_tests::pause as compiler_test_pause;
 fn compiler_test_pause(_symbol: u32, _t2: bool) {}
 #[cfg(all(target_arch = "s390x", target_os = "linux"))]
 mod background_osr;
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+mod native_local_exit_tests;
 #[cfg(any(
     all(target_arch = "x86_64", target_os = "linux"),
     all(
@@ -96,8 +98,6 @@ mod native_transfer_entry_riscv64;
 mod native_transfer_entry_s390x;
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 mod native_transfer_tests;
-#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
-mod native_local_exit_tests;
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 pub(super) fn pause_native_child_for_test() -> Result<EgclVal, EgclError> {
     native_transfer_tests::pause_child_for_test()
