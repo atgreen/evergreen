@@ -30,6 +30,10 @@
   longer prevent T2 optimization of the containing function
   ([#921](https://github.com/atgreen/evergreen/pull/921)).
 
+- Preserve rewritten macro bodies across moving garbage collection, preventing
+  local macros in source `LOOP` bodies from becoming undefined function calls
+  ([#926](https://github.com/atgreen/evergreen/pull/926)).
+
 - Native closures preserve captured gensym identity, preventing unbound-variable
   errors in macro-generated closures and functions loaded from compiled files
   ([#920](https://github.com/atgreen/evergreen/pull/920)).

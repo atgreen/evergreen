@@ -1344,6 +1344,7 @@ fn fingerprint_into(form: EgclVal, depth: usize, hasher: &mut DefaultHasher) {
 }
 
 /// Expand a list of forms, returning a new list.
+#[allow(clippy::needless_range_loop)] // Re-read rooted elements after collecting callbacks.
 fn expand_body(mut forms: EgclVal, env: &Environment) -> Result<EgclVal, EgclError> {
     // Root across the allocating expand recursion (moving GC; bliss-noh).
     egcl_rt::rooted_ref!(_forms_root = &mut forms);
@@ -1356,15 +1357,29 @@ fn expand_body(mut forms: EgclVal, env: &Environment) -> Result<EgclVal, EgclErr
     // the same lexical declarations as the compiler.  The optional leading
     // string accounts for function/macro docstrings.
     let (declaration_end, declarations) = collect_body_declarations(&items);
-    let changed = if declarations.is_empty() {
-        expand_body_items(&items, declaration_end, env, &mut expanded_items)?
-    } else {
-        let mut body_env = env.augment_declarations(declarations);
-        // Custom declaration payloads are raw source conses.  They must move
-        // with the nursery while a later macro expansion allocates.
-        egcl_rt::rooted_ref!(_body_env_root = &mut body_env);
-        expand_body_items(&items, declaration_end, &body_env, &mut expanded_items)?
-    };
+    egcl_rt::rooted!(
+        body_env = if declarations.is_empty() {
+            None
+        } else {
+            // Custom declaration payloads are raw source conses.  They must move
+            // with the nursery while a later macro expansion allocates.
+            Some(env.augment_declarations(declarations))
+        }
+    );
+    let mut changed = false;
+    for index in 0..items.len() {
+        let expanded = if index < declaration_end {
+            items[index]
+        } else {
+            walk_macroexpand_all(items[index], body_env.as_ref().unwrap_or(env))?
+        };
+        // Keep this traversal with its rooted owner. Passing an immutable
+        // slice to a helper lets LLVM retain the pre-collection element across
+        // expansion, even though the collector updates the owner's slot. A
+        // rebuilt form can reuse that old address and falsely appear unchanged.
+        changed |= expanded != items[index];
+        expanded_items.push(expanded);
+    }
     if !changed {
         Ok(forms)
     } else {
@@ -1399,29 +1414,6 @@ fn collect_body_declarations(items: &[EgclVal]) -> (usize, Vec<DeclInfo>) {
     }
 
     (index, declarations)
-}
-
-// Index rather than iterate: `macroexpand_all` can collect, and the caller
-// keeps `items` rooted, so each `items[index]` read after it sees the
-// relocated value. An iterator's copy would be stale by the comparison.
-#[allow(clippy::needless_range_loop)]
-fn expand_body_items(
-    items: &[EgclVal],
-    declaration_end: usize,
-    env: &Environment,
-    expanded_items: &mut Vec<EgclVal>,
-) -> Result<bool, EgclError> {
-    let mut changed = false;
-    for index in 0..items.len() {
-        let expanded = if index < declaration_end {
-            items[index]
-        } else {
-            walk_macroexpand_all(items[index], env)?
-        };
-        changed |= expanded != items[index];
-        expanded_items.push(expanded);
-    }
-    Ok(changed)
 }
 
 /// Check if operator is a lambda expression: (LAMBDA params body...)
