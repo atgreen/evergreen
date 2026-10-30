@@ -14,10 +14,6 @@ fn native_entry_is_mapped(code: &NativeCode) -> bool {
     };
     native.ordinary_entry.is_none()
 }
-fn request_ordinary_poll() {
-    let execution = egcl_rt::thread::current_execution_context_for_native().unwrap();
-    unsafe { &*execution }.request_yield();
-}
 fn observe() {
     if root_publication::published_frame_has_owner_for_test(OWNER.with(Cell::get)) {
         VISITS.with(|count| count.set(count.get() + 1));
@@ -27,6 +23,8 @@ struct Recording;
 impl Drop for Recording {
     fn drop(&mut self) {
         root_publication::OBSERVE.with(|hook| hook.set(None));
+        native_transfer_entry::ordinary_calls::YIELD_AFTER_RETURN_TO_OWNER
+            .with(|target| target.set(0));
     }
 }
 
@@ -71,21 +69,30 @@ fn generic_variable_ash_executes_in_ordinary_and_mapped_t2_without_deopt() {
         let _recording = Recording;
         root_publication::OBSERVE.with(|hook| hook.set(Some(observe)));
         for (index, &(value, count)) in cases.iter().enumerate() {
+            if !mapped {
+                // The ASH adapter services an entry notification before its
+                // call. Request the real yield after it returns to this exact
+                // owner, so the following native poll publishes the frame.
+                native_transfer_entry::ordinary_calls::YIELD_AFTER_RETURN_TO_OWNER
+                    .with(|target| target.set(OWNER.with(Cell::get)));
+            }
             egcl_rt::rooted!(
-                result = native_transfer_entry::with_ordinary_entry_hook_for_test(
-                    request_ordinary_poll,
-                    || run_native(
-                        &code,
-                        symbol,
-                        &[
-                            EgclVal::from_fixnum(value),
-                            EgclVal::from_fixnum(count),
-                            *marker
-                        ],
-                        &mut env,
-                    ),
+                result = run_native(
+                    &code,
+                    symbol,
+                    &[
+                        EgclVal::from_fixnum(value),
+                        EgclVal::from_fixnum(count),
+                        *marker
+                    ],
+                    &mut env,
                 )
                 .unwrap()
+            );
+            assert_eq!(
+                native_transfer_entry::ordinary_calls::YIELD_AFTER_RETURN_TO_OWNER.with(Cell::get),
+                0,
+                "the exact ordinary owner must consume the return notification"
             );
             assert!(result.is_cons());
             let (shifted, saved_marker) = crate::cli::cp(*result);
@@ -98,7 +105,7 @@ fn generic_variable_ash_executes_in_ordinary_and_mapped_t2_without_deopt() {
         }
         assert!(
             VISITS.with(Cell::get) > 0,
-            "the post-ASH poll must publish this actual T2 owner"
+            "the post-ASH poll must publish this actual T2 owner (mapped={mapped})"
         );
         assert_eq!(native.deopt_count(), 0);
         for (name, form, large) in [
