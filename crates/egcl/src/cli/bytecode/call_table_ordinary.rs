@@ -97,6 +97,14 @@ struct PcRange {
     members: Vec<usize>,
 }
 
+struct OwnerEntries {
+    indices: Vec<usize>,
+    // A non-owning Arc allocation identity, never a Lisp value. The indexed
+    // entries keep every root alive until the index is rebuilt by sweep.
+    // None means a missing root or conflicting identities prevent the proof.
+    sole_callable: Option<usize>,
+}
+
 struct RetainedEntries<C> {
     segments: usize,
     // Descriptor addresses are embedded in atomic slots and stay fixed while
@@ -106,7 +114,7 @@ struct RetainedEntries<C> {
     by_descriptor: HashMap<RetainedKey, usize>,
     // Metadata only: entries retain the Rc owners, so keys cannot be reused
     // while indexed. Preserve insertion order among aliases of one owner.
-    by_owner: HashMap<usize, Vec<usize>>,
+    by_owner: HashMap<usize, OwnerEntries>,
     by_pc: BTreeMap<usize, PcRange>,
     #[cfg(test)]
     lookup_candidates: std::cell::Cell<usize>,
@@ -241,7 +249,20 @@ impl<C> RetainedEntries<C> {
         let entry = &self.entries[index];
         let d = entry.descriptor;
         self.by_descriptor.insert(entry.lease.key(d), index);
-        self.by_owner.entry(d.owner).or_default().push(index);
+        let callable = entry
+            .callable
+            .as_ref()
+            .map(|root| Arc::as_ptr(root) as usize);
+        self.by_owner
+            .entry(d.owner)
+            .and_modify(|owner| {
+                owner.indices.push(index);
+                owner.sole_callable = owner.sole_callable.filter(|&root| Some(root) == callable);
+            })
+            .or_insert_with(|| OwnerEntries {
+                indices: vec![index],
+                sole_callable: callable,
+            });
         let mut start = d.code_start;
         let mut end = start
             .checked_add(d.code_len)
@@ -347,7 +368,7 @@ impl<C> RetainedEntries<C> {
         self.by_owner
             .get(&(owner as usize))
             .into_iter()
-            .flatten()
+            .flat_map(|owner| &owner.indices)
             .map(|&index| {
                 #[cfg(test)]
                 self.owner_candidates.set(self.owner_candidates.get() + 1);
@@ -360,12 +381,9 @@ impl<C> RetainedEntries<C> {
         owner: *const C,
         callable: &Arc<egcl_rt::CrossThreadRoot<egcl_rt::value::EgclVal>>,
     ) -> bool {
-        self.entries_for_owner(owner).all(|entry| {
-            entry
-                .callable
-                .as_ref()
-                .is_some_and(|root| Arc::ptr_eq(root, callable))
-        })
+        self.by_owner
+            .get(&(owner as usize))
+            .is_none_or(|entries| entries.sole_callable == Some(Arc::as_ptr(callable) as usize))
     }
 
     fn code_for_pc(&self, pc: usize) -> Option<Rc<C>> {
@@ -1101,7 +1119,7 @@ mod tests {
         );
         let before = retained.owner_candidates.get();
         assert!(retained.held_only_by(Rc::as_ptr(&owner), &callable));
-        assert_eq!(retained.owner_candidates.get() - before, 1);
+        assert_eq!(retained.owner_candidates.get(), before);
         let mut alias = d;
         alias.revision += 1;
         retained
@@ -1114,7 +1132,7 @@ mod tests {
             .unwrap();
         let before = retained.owner_candidates.get();
         assert!(retained.held_only_by(Rc::as_ptr(&owner), &callable));
-        assert_eq!(retained.owner_candidates.get() - before, 2);
+        assert_eq!(retained.owner_candidates.get(), before);
         // Equal Lisp values in distinct root handles still disagree on the
         // lock-free identity proof; the existing gated fallback decides them.
         alias.revision += 1;
@@ -1148,7 +1166,157 @@ mod tests {
             .unwrap();
         let before = retained.owner_candidates.get();
         assert!(!retained.held_only_by(Rc::as_ptr(&unconstrained), &callable));
-        assert_eq!(retained.owner_candidates.get() - before, 1);
+        assert_eq!(retained.owner_candidates.get(), before);
+    }
+
+    #[test]
+    fn ordinary_owner_identity_proof_does_not_scan_same_owner_history() {
+        use egcl_rt::value::NIL;
+        let _lock = crate::cli::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        egcl_rt::rooted!(_env = crate::cli::Env::new(false));
+        const COUNT: usize = 4_096;
+        let mut retained = RetainedEntries::default();
+        let owner = Rc::new(());
+        let cell = Arc::new(CallCell::new(0, 11, 12));
+        let callable = Arc::new(egcl_rt::CrossThreadRoot::new(NIL));
+        let other = Arc::new(egcl_rt::CrossThreadRoot::new(NIL));
+        retained.begin_segment();
+        for revision in 0..COUNT {
+            retained
+                .retain_with_callable(
+                    Arc::clone(&cell),
+                    descriptor(&owner, revision as u64, 0x1000),
+                    Rc::clone(&owner),
+                    Some(Arc::clone(&callable)),
+                )
+                .unwrap();
+        }
+        let first = std::ptr::from_ref(&retained.entries[0].descriptor);
+        assert_eq!(
+            retained.entries_for_owner(Rc::as_ptr(&owner)).count(),
+            COUNT
+        );
+        assert_eq!(Arc::strong_count(&callable), COUNT + 1);
+        let before = retained.owner_candidates.get();
+        for _ in 0..COUNT {
+            assert!(retained.held_only_by(Rc::as_ptr(&owner), &callable));
+            assert!(!retained.held_only_by(Rc::as_ptr(&owner), &other));
+        }
+        assert_eq!(
+            retained.owner_candidates.get(),
+            before,
+            "identity queries must not revisit any of the retained revisions"
+        );
+        retained.sweep();
+        assert_eq!(retained.entries.len(), COUNT);
+        assert_eq!(std::ptr::from_ref(&retained.entries[0].descriptor), first);
+        assert!(retained.held_only_by(Rc::as_ptr(&owner), &callable));
+        retained.finish_segment();
+        assert!(retained.entries.is_empty());
+        assert!(retained.by_owner.is_empty());
+        assert_eq!(Arc::strong_count(&callable), 1);
+        assert!(retained.held_only_by(Rc::as_ptr(&owner), &other));
+    }
+
+    #[test]
+    fn ordinary_owner_identity_summary_recovers_after_sweep_and_new_insertions() {
+        use egcl_rt::value::NIL;
+        let _lock = crate::cli::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        egcl_rt::rooted!(_env = crate::cli::Env::new(false));
+        let mut retained = RetainedEntries::default();
+        let owner = Rc::new(());
+        let first_cell = Arc::new(CallCell::new(0, 11, 12));
+        let other_cell = Arc::new(CallCell::new(1, 11, 12));
+        let missing_cell = Arc::new(CallCell::new(2, 11, 12));
+        let first_root = Arc::new(egcl_rt::CrossThreadRoot::new(NIL));
+        let other_root = Arc::new(egcl_rt::CrossThreadRoot::new(NIL));
+        let first_descriptor = descriptor(&owner, 1, 0x1000);
+        let first = retained
+            .retain_with_callable(
+                Arc::clone(&first_cell),
+                first_descriptor,
+                Rc::clone(&owner),
+                Some(Arc::clone(&first_root)),
+            )
+            .unwrap();
+        unsafe { &*first_cell.ordinary_entry_address() }.store(first as usize, Ordering::Release);
+        retained.begin_segment();
+        retained
+            .retain_with_callable(
+                Arc::clone(&other_cell),
+                descriptor(&owner, 2, 0x1000),
+                Rc::clone(&owner),
+                Some(Arc::clone(&other_root)),
+            )
+            .unwrap();
+        retained
+            .retain(
+                Arc::clone(&missing_cell),
+                descriptor(&owner, 3, 0x1000),
+                Rc::clone(&owner),
+            )
+            .unwrap();
+        assert!(!retained.held_only_by(Rc::as_ptr(&owner), &first_root));
+        retained.sweep();
+        assert_eq!(
+            retained.entries.len(),
+            3,
+            "active lease keeps old constraints"
+        );
+        retained.finish_segment();
+        assert_eq!(retained.entries.len(), 1);
+        assert!(retained.held_only_by(Rc::as_ptr(&owner), &first_root));
+        assert!(!retained.held_only_by(Rc::as_ptr(&owner), &other_root));
+        assert_eq!(Arc::strong_count(&other_root), 1);
+        // An existing descriptor keeps its original root, even if a duplicate
+        // retention request supplies a different root with the same Lisp value.
+        assert_eq!(
+            retained.retain_with_callable(
+                Arc::clone(&first_cell),
+                first_descriptor,
+                Rc::clone(&owner),
+                Some(Arc::clone(&other_root)),
+            ),
+            Some(first)
+        );
+        assert!(retained.held_only_by(Rc::as_ptr(&owner), &first_root));
+        assert_eq!(Arc::strong_count(&other_root), 1);
+        retained
+            .retain(
+                missing_cell,
+                descriptor(&owner, 4, 0x1000),
+                Rc::clone(&owner),
+            )
+            .unwrap();
+        assert!(!retained.held_only_by(Rc::as_ptr(&owner), &first_root));
+        retained.sweep();
+        assert!(retained.held_only_by(Rc::as_ptr(&owner), &first_root));
+        let other = retained
+            .retain_with_callable(
+                Arc::clone(&other_cell),
+                descriptor(&owner, 5, 0x1000),
+                Rc::clone(&owner),
+                Some(Arc::clone(&other_root)),
+            )
+            .unwrap();
+        unsafe { &*other_cell.ordinary_entry_address() }.store(other as usize, Ordering::Release);
+        retained.sweep();
+        assert!(!retained.held_only_by(Rc::as_ptr(&owner), &first_root));
+        assert!(!retained.held_only_by(Rc::as_ptr(&owner), &other_root));
+        unsafe { &*first_cell.ordinary_entry_address() }.store(0, Ordering::Release);
+        retained.sweep();
+        assert!(retained.held_only_by(Rc::as_ptr(&owner), &other_root));
+        assert!(!retained.held_only_by(Rc::as_ptr(&owner), &first_root));
+        unsafe { &*other_cell.ordinary_entry_address() }.store(0, Ordering::Release);
+        retained.sweep();
+        assert!(retained.by_owner.is_empty());
+        assert_eq!(Arc::strong_count(&first_root), 1);
+        assert_eq!(Arc::strong_count(&other_root), 1);
+        assert!(retained.held_only_by(Rc::as_ptr(&owner), &first_root));
     }
 
     #[test]
@@ -1178,7 +1346,10 @@ mod tests {
         assert_eq!(retained.by_owner.len(), 1);
         assert_eq!(retained.entries_for_owner(Rc::as_ptr(&live)).count(), 1);
         assert_eq!(
-            retained.by_owner.get(&(Rc::as_ptr(&live) as usize)),
+            retained
+                .by_owner
+                .get(&(Rc::as_ptr(&live) as usize))
+                .map(|owner| &owner.indices),
             Some(&vec![0])
         );
         assert_eq!(retained.first_index_for_pc(0x2010), Some(0));
