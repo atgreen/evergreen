@@ -153,6 +153,69 @@ class RunnerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "missing"):
             runner.validate_expected({"egcl:lib:egcl"}, [])
 
+    def test_binary_inventory_requires_cargo_test_eligibility(self):
+        runner = self.load()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            configuration = {"fast": {"egcl:lib:egcl": ["library::"],
+                                      "egcl:bin:egcl": ["host_memory_tests::"]}, "areas": {}}
+            (root / "ci-test-suites.json").write_text(json.dumps(configuration))
+            binary = {"kind": ["bin"], "name": "egcl", "test": False}
+            metadata = {"workspace_members": ["package"], "packages": [{
+                "id": "package", "name": "egcl", "manifest_path": str(root / "Cargo.toml"),
+                "targets": [{"kind": ["lib"], "name": "egcl", "test": True}, binary,
+                            {"kind": ["bin"], "name": "not-tested", "test": False}]}]}
+            args = SimpleNamespace(suite="fast", area=[])
+            with patch.object(runner, "HERE", root), patch.object(
+                    runner, "checked", side_effect=lambda *a, **k: json.dumps(metadata)):
+                with self.assertRaisesRegex(ValueError, "egcl:bin:egcl"):
+                    runner.inventory(root, args)
+                binary["test"] = True
+                _, targets, selected = runner.inventory(root, args)
+                self.assertEqual(set(targets), {"egcl:lib:egcl", "egcl:bin:egcl"})
+                self.assertEqual(selected, configuration["fast"])
+                args.suite = "full"
+                self.assertEqual(runner.inventory(root, args)[2],
+                                 {"egcl:lib:egcl": [""], "egcl:bin:egcl": [""]})
+
+    def test_build_invocation_includes_selected_binary_without_changing_full_flags(self):
+        runner = self.load()
+        # Intercept prepare's actual subprocess boundary before any build. This
+        # checks the command used by CI rather than a separate command replica.
+        class BuildIntercept(Exception):
+            pass
+        for suite, include_binary in (("fast", True), ("fast", False), ("full", True)):
+            with self.subTest(suite=suite, binary=include_binary), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                args = SimpleNamespace(root=str(root), command="build", suite=suite,
+                    artifacts=str(root / "artifacts.jsonl"), profile="release",
+                    target="x86_64-unknown-linux-musl", features="alloc-count")
+                selected = {"egcl:lib:egcl": ["library::"],
+                            "egcl:test:host_pressure_closure_cli": [""]}
+                if include_binary:
+                    selected["egcl:bin:egcl"] = ["host_memory_tests::"]
+                targets = {name: ({"name": "egcl"}, {}) for name in selected}
+                targets["egcl:bin:not-selected"] = ({"name": "egcl"}, {})
+                with patch.object(runner, "identity", return_value={}), patch.object(
+                        runner, "inventory", return_value=({}, targets, selected)), patch.object(
+                        runner.subprocess, "run", side_effect=BuildIntercept) as build:
+                    with self.assertRaises(BuildIntercept):
+                        runner.prepare(args)
+                expected = ["cargo", "test", "--locked", "--no-run", "--message-format=json",
+                            "--profile", "release", "--target", args.target,
+                            "--features", "alloc-count"]
+                if suite == "full":
+                    expected += ["--workspace", "--lib", "--tests"]
+                else:
+                    expected += ["-p", "egcl", "--lib"]
+                    if include_binary:
+                        expected += ["--bin", "egcl"]
+                    expected += ["--test", "host_pressure_closure_cli"]
+                build.assert_called_once()
+                self.assertEqual(build.call_args.args[0], expected)
+                self.assertEqual(build.call_args.kwargs["cwd"], root)
+                self.assertTrue(build.call_args.kwargs["check"])
+
     def test_host_rust_libraries_reach_discovery_and_test_processes(self):
         runner = self.load()
         for target in ("x86_64-unknown-linux-musl", "x86_64-unknown-linux-gnu"):

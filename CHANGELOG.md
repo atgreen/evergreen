@@ -26,6 +26,10 @@
 
 ### Fixed
 
+- Schedule private-closure reclamation from tracked live Rust allocation growth,
+  with pressure diagnostics and a fallback for untracked hosts
+  ([#935](https://github.com/atgreen/evergreen/pull/935)).
+
 - Keep unrelated named call entries warm when a function definition or native
   version changes, preserving cross-execution updates and redefinition checks
   ([#934](https://github.com/atgreen/evergreen/pull/934)).

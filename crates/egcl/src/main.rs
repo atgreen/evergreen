@@ -5,6 +5,78 @@
 
 use egcl::cli;
 
+/// Account at the caller-facing allocator boundary. Inner allocators may use
+/// alloc/dealloc to implement realloc or zeroing; those internal operations
+/// must not count as additional live Rust requests.
+struct HostTracked<A, R = HostAccounting>(A, R);
+
+trait AllocationAccounting {
+    fn alloc(&self, size: usize);
+    fn dealloc(&self, size: usize);
+    fn resize(&self, old: usize, new: usize);
+}
+
+struct HostAccounting;
+
+impl AllocationAccounting for HostAccounting {
+    #[inline]
+    fn alloc(&self, size: usize) {
+        egcl_rt::host_memory::record_alloc(size);
+    }
+
+    #[inline]
+    fn dealloc(&self, size: usize) {
+        egcl_rt::host_memory::record_dealloc(size);
+    }
+
+    #[inline]
+    fn resize(&self, old: usize, new: usize) {
+        egcl_rt::host_memory::record_resize(old, new);
+    }
+}
+
+unsafe impl<A: std::alloc::GlobalAlloc, R: AllocationAccounting> std::alloc::GlobalAlloc
+    for HostTracked<A, R>
+{
+    #[inline]
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let pointer = unsafe { self.0.alloc(layout) };
+        if !pointer.is_null() {
+            self.1.alloc(layout.size());
+        }
+        pointer
+    }
+
+    #[inline]
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let pointer = unsafe { self.0.alloc_zeroed(layout) };
+        if !pointer.is_null() {
+            self.1.alloc(layout.size());
+        }
+        pointer
+    }
+
+    #[inline]
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: std::alloc::Layout) {
+        unsafe { self.0.dealloc(pointer, layout) };
+        self.1.dealloc(layout.size());
+    }
+
+    #[inline]
+    unsafe fn realloc(
+        &self,
+        pointer: *mut u8,
+        layout: std::alloc::Layout,
+        new_size: usize,
+    ) -> *mut u8 {
+        let resized = unsafe { self.0.realloc(pointer, layout, new_size) };
+        if !resized.is_null() {
+            self.1.resize(layout.size(), new_size);
+        }
+        resized
+    }
+}
+
 #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "musl"))]
 mod short_copy;
 
@@ -277,7 +349,8 @@ mod tcache {
     not(feature = "alloc-count")
 ))]
 #[global_allocator]
-static GLOBAL_ALLOC: tcache::ThreadCached = tcache::ThreadCached;
+static GLOBAL_ALLOC: HostTracked<tcache::ThreadCached> =
+    HostTracked(tcache::ThreadCached, HostAccounting);
 
 /// Rust-side allocation counting, behind the `alloc-count` cargo feature.
 ///
@@ -348,9 +421,19 @@ mod alloc_probe {
 }
 #[cfg(feature = "alloc-count")]
 #[global_allocator]
-static COUNTING_ALLOC: alloc_probe::Counting = alloc_probe::Counting;
+static COUNTING_ALLOC: HostTracked<alloc_probe::Counting> =
+    HostTracked(alloc_probe::Counting, HostAccounting);
+
+#[cfg(not(any(
+    feature = "alloc-count",
+    all(feature = "thread-cache-alloc", target_env = "musl")
+)))]
+#[global_allocator]
+static SYSTEM_ALLOC: HostTracked<std::alloc::System> =
+    HostTracked(std::alloc::System, HostAccounting);
 
 fn main() {
+    egcl_rt::host_memory::enable_tracking();
     #[cfg(feature = "alloc-count")]
     if let Ok(n) = std::env::var("EGCL_PROBE_ALLOC_SAMPLE") {
         if let Ok(n) = n.parse::<u64>() {
@@ -395,5 +478,149 @@ fn main() {
             eprintln!("egcl: {}", cli::describe_err(&e));
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod host_memory_tests {
+    use super::*;
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    // Each fixture owns its accounting, independent of allocations by libtest
+    // or concurrently running tests. Production uses only HostAccounting.
+    #[derive(Default)]
+    struct Recording {
+        live: Cell<usize>,
+        operations: Cell<usize>,
+    }
+
+    impl AllocationAccounting for Recording {
+        fn alloc(&self, size: usize) {
+            self.live.set(self.live.get() + size);
+            self.operations.set(self.operations.get() + 1);
+        }
+
+        fn dealloc(&self, size: usize) {
+            self.live.set(self.live.get() - size);
+            self.operations.set(self.operations.get() + 1);
+        }
+
+        fn resize(&self, old: usize, new: usize) {
+            self.live.set(self.live.get() - old + new);
+            self.operations.set(self.operations.get() + 1);
+        }
+    }
+
+    struct SplitRealloc {
+        fail: Cell<bool>,
+    }
+
+    unsafe impl GlobalAlloc for SplitRealloc {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            if self.fail.get() {
+                std::ptr::null_mut()
+            } else {
+                unsafe { System.alloc(layout) }
+            }
+        }
+
+        unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(pointer, layout) };
+        }
+
+        unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+            let new_layout = Layout::from_size_align(size, layout.align()).unwrap();
+            let resized = unsafe { self.alloc(new_layout) };
+            if !resized.is_null() {
+                unsafe { std::ptr::copy_nonoverlapping(pointer, resized, size.min(layout.size())) };
+                unsafe { self.dealloc(pointer, layout) };
+            }
+            resized
+        }
+    }
+
+    #[test]
+    fn failed_alloc_and_resize_preserve_live_requested_bytes() {
+        let allocator = HostTracked(
+            SplitRealloc {
+                fail: Cell::new(true),
+            },
+            Recording::default(),
+        );
+        let layout = Layout::from_size_align(9, 8).unwrap();
+        assert!(unsafe { allocator.alloc(layout) }.is_null());
+        assert_eq!(allocator.1.live.get(), 0);
+        assert_eq!(allocator.1.operations.get(), 0);
+        allocator.0.fail.set(false);
+        let pointer = unsafe { allocator.alloc(layout) };
+        assert!(!pointer.is_null());
+        unsafe { std::ptr::write_bytes(pointer, 0xab, layout.size()) };
+        allocator.0.fail.set(true);
+        assert!(unsafe { allocator.realloc(pointer, layout, 19) }.is_null());
+        assert_eq!(allocator.1.live.get(), 9);
+        assert_eq!(allocator.1.operations.get(), 1);
+        assert_eq!(unsafe { *pointer }, 0xab, "failed realloc retains old data");
+        allocator.0.fail.set(false);
+        let pointer = unsafe { allocator.realloc(pointer, layout, 19) };
+        assert!(!pointer.is_null());
+        assert_eq!(allocator.1.live.get(), 19);
+        assert_eq!(allocator.1.operations.get(), 2, "one net resize operation");
+        assert_eq!(unsafe { *pointer.add(8) }, 0xab);
+        let layout = Layout::from_size_align(19, 8).unwrap();
+        let pointer = unsafe { allocator.realloc(pointer, layout, 5) };
+        assert!(!pointer.is_null());
+        assert_eq!(allocator.1.live.get(), 5);
+        assert_eq!(allocator.1.operations.get(), 3);
+        unsafe { allocator.dealloc(pointer, Layout::from_size_align(5, 8).unwrap()) };
+        assert_eq!(allocator.1.live.get(), 0);
+        assert_eq!(allocator.1.operations.get(), 4);
+    }
+
+    #[test]
+    fn zeroed_allocation_records_only_the_outer_requested_size() {
+        let allocator = HostTracked(
+            SplitRealloc {
+                fail: Cell::new(false),
+            },
+            Recording::default(),
+        );
+        let layout = Layout::from_size_align(13, 8).unwrap();
+        let pointer = unsafe { allocator.alloc_zeroed(layout) };
+        assert!(!pointer.is_null());
+        assert_eq!(unsafe { std::slice::from_raw_parts(pointer, 13) }, &[0; 13]);
+        assert_eq!(allocator.1.live.get(), 13);
+        assert_eq!(allocator.1.operations.get(), 1);
+        unsafe { allocator.dealloc(pointer, layout) };
+        assert_eq!(allocator.1.live.get(), 0);
+        assert_eq!(allocator.1.operations.get(), 2);
+        allocator.0.fail.set(true);
+        assert!(unsafe { allocator.alloc_zeroed(layout) }.is_null());
+        assert_eq!(allocator.1.operations.get(), 2);
+    }
+
+    #[test]
+    #[cfg(all(
+        feature = "thread-cache-alloc",
+        target_env = "musl",
+        not(feature = "alloc-count")
+    ))]
+    fn thread_cache_counts_requests_instead_of_retained_size_classes() {
+        let allocator = HostTracked(tcache::ThreadCached, Recording::default());
+        let layout = Layout::from_size_align(9, 8).unwrap();
+        let pointer = unsafe { allocator.alloc_zeroed(layout) };
+        assert!(!pointer.is_null());
+        assert_eq!(allocator.1.live.get(), 9, "not the 16-byte cache class");
+        let pointer = unsafe { allocator.realloc(pointer, layout, 13) };
+        assert!(!pointer.is_null());
+        assert_eq!(allocator.1.live.get(), 13);
+        assert_eq!(allocator.1.operations.get(), 2);
+        unsafe { allocator.dealloc(pointer, Layout::from_size_align(13, 8).unwrap()) };
+        assert_eq!(
+            allocator.1.live.get(),
+            0,
+            "cached blocks are not live requests"
+        );
+        assert_eq!(allocator.1.operations.get(), 3);
     }
 }

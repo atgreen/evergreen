@@ -42,7 +42,10 @@ const PROGRAM: &str = r#"
 (egcl-ext:events-json)
 (format t "CHURN-CHILD-EVIDENCE-END~%")
 (format t "CHURN-READY __MAKER__ TIER2~%") (finish-output)
-(churn-phase 40 t)
+;; Cover measured host-memory pressure as well as the legacy closure-count
+;; trigger. Keep the major-GC event assertion: a collection before this window
+;; does not prove that warmed child code survives reclamation during churn.
+(churn-phase 400 t)
 (assert (= 2 (egcl-ext:function-tier '__MAKER__)))
 (format t "CHURN-SEMANTIC-PASS __MAKER__~%")
 "#;
@@ -123,7 +126,7 @@ fn original_closure_loops_retain_compiled_children_across_major_gc() {
             "actual child T2 representation missing before window: {name}\n{stdout}\n{stderr}"
         );
         assert!(
-            stdout.contains("CHURN-CHECKSUM 20020000"),
+            stdout.contains("CHURN-CHECKSUM 200200000"),
             "{name}\n{stdout}"
         );
         assert!(
