@@ -26,6 +26,10 @@
 
 ### Fixed
 
+- Report stack guard origins and available scalar state on stderr when
+  `EGCL_STACK_OVERFLOW_DIAGNOSTICS=1`, preserving normal overflow handling
+  and stack limits ([#944](https://github.com/atgreen/evergreen/pull/944)).
+
 - Reduce allocation in eligible compiled methods by omitting unused lexical
   continuation helpers while preserving runtime method context and callbacks
   ([#943](https://github.com/atgreen/evergreen/pull/943)).
