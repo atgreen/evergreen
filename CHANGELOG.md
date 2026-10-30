@@ -26,6 +26,10 @@
 
 ### Fixed
 
+- Make `NSUBST`, `NSUBST-IF`, and `NSUBST-IF-NOT` modify existing tree cells,
+  preserving retained aliases used by compiler passes and other callers
+  ([#929](https://github.com/atgreen/evergreen/pull/929)).
+
 - Preserve inherited symbol-macro expansions across garbage collection inside
   BLOCK, TAGBODY, LET and LET* compilation
   ([#927](https://github.com/atgreen/evergreen/pull/927)).
