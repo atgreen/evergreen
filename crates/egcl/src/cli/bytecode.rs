@@ -765,7 +765,7 @@ fn sweep_dead_function_captures(names: &[EgclVal]) {
         CALL_SITE_PROFILE.scan(|registry| {
             registry
                 .borrow_mut()
-                .retain(|(body, _), _| traced.contains(body))
+                .retain(|body, _| traced.contains(body))
         });
         FUNCTION_SAMPLE_PROFILE.scan(|registry| {
             registry
@@ -24402,11 +24402,15 @@ fn snapshot_receiver_profiles_for_t2() -> Vec<(String, Vec<ReceiverTypeProfileEn
 fn call_site_counter(func_ptr: usize, bcp: u32) -> &'static RuntimeCallSiteProfile {
     CALL_SITE_PROFILE.with(|m| {
         let mut profiles = m.borrow_mut();
-        *profiles.entry((func_ptr, bcp)).or_insert_with(|| {
-            Box::leak(Box::new(RuntimeCallSiteProfile {
-                calls: std::sync::atomic::AtomicU32::new(0),
-            }))
-        })
+        *profiles
+            .entry(func_ptr)
+            .or_default()
+            .entry(bcp)
+            .or_insert_with(|| {
+                Box::leak(Box::new(RuntimeCallSiteProfile {
+                    calls: std::sync::atomic::AtomicU32::new(0),
+                }))
+            })
     })
 }
 
@@ -24438,21 +24442,26 @@ fn call_site_profile_snapshot(func_ptr: usize) -> (u32, Vec<(u32, u32)>) {
         FUNCTION_SAMPLE_PROFILE.with(|m| m.borrow().get(&func_ptr).copied().unwrap_or(0));
     let sites = CALL_SITE_PROFILE.with(|m| {
         m.borrow()
-            .iter()
-            .filter_map(|(&(fp, bcp), profile)| {
-                (fp == func_ptr).then_some((
-                    bcp,
-                    profile.calls.load(std::sync::atomic::Ordering::Relaxed),
-                ))
+            .get(&func_ptr)
+            .map(|sites| {
+                sites
+                    .iter()
+                    .map(|(&bcp, profile)| {
+                        (
+                            bcp,
+                            profile.calls.load(std::sync::atomic::Ordering::Relaxed),
+                        )
+                    })
+                    .collect()
             })
-            .collect()
+            .unwrap_or_default()
     });
     (invocations, sites)
 }
 
 fn clear_bytecode_profiles(func_ptr: usize) {
     TYPE_PROFILE.with(|m| m.borrow_mut().retain(|(fp, _), _| *fp != func_ptr));
-    CALL_SITE_PROFILE.with(|m| m.borrow_mut().retain(|(fp, _), _| *fp != func_ptr));
+    CALL_SITE_PROFILE.with(|m| m.borrow_mut().remove(&func_ptr));
     FUNCTION_SAMPLE_PROFILE.with(|m| {
         m.borrow_mut().remove(&func_ptr);
     });
@@ -24467,9 +24476,12 @@ static TYPE_PROFILE: egcl_rt::execution_local::ExecutionLocal<RefCell<SiteProfil
 static FUNCTION_SAMPLE_PROFILE: egcl_rt::execution_local::ExecutionLocal<
     RefCell<HashMap<usize, u32, egcl_rt::fxhash::FxBuildHasher>>,
 > = unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(HashMap::default())) };
-/// Executions per `(saved bytecode body, CallNamed bcp)`.
+/// Executions per saved body, then CallNamed bcp. Native code retains the
+/// counter's stable token; compiler snapshots visit only the requested body.
+type BodyCallSiteProfiles =
+    HashMap<u32, &'static RuntimeCallSiteProfile, egcl_rt::fxhash::FxBuildHasher>;
 static CALL_SITE_PROFILE: egcl_rt::execution_local::ExecutionLocal<
-    RefCell<SiteProfiles<&'static RuntimeCallSiteProfile>>,
+    RefCell<HashMap<usize, BodyCallSiteProfiles, egcl_rt::fxhash::FxBuildHasher>>,
 > = unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(HashMap::default())) };
 /// Receiver class/type profiles keyed by generic function name.
 static GENERIC_RECEIVER_PROFILE: egcl_rt::execution_local::ExecutionLocal<
@@ -25696,8 +25708,7 @@ fn snapshot_t2_input(sym: u32, priority: u64) -> Option<T2CompileInput> {
     // A never-invoked function cannot be the target of a hot call site: if the
     // function being compiled reaches it, it ran, so its count is non-zero.
     // Skipping the cold ones therefore costs no inlining the compiler would
-    // have performed, and also skips `call_site_profile_snapshot`, which scans
-    // the whole CALL_SITE_PROFILE map per body.
+    // have performed. Call-site snapshots are indexed by saved body.
     //
     // Guarded on profiling being enabled: with EGCL_PROFILING_DISABLED every
     // count is zero, and filtering on it would drop every candidate and disable
@@ -25742,8 +25753,7 @@ fn snapshot_t2_input(sym: u32, priority: u64) -> Option<T2CompileInput> {
                 let ptr = Arc::as_ptr(body) as usize;
                 let (invocations, call_sites) = call_site_profile_snapshot(ptr);
                 // A never-invoked function cannot be the target of a hot call
-                // site, and skipping it also skips `call_site_profile_snapshot`
-                // scanning the whole CALL_SITE_PROFILE map for it (bliss-nzbi).
+                // site, so it cannot contribute useful inlining feedback.
                 if trust_invocation_counts && invocations == 0 {
                     return None;
                 }
@@ -33330,6 +33340,9 @@ mod jtc4_stack_map_tests {
 
     #[test]
     fn native_call_site_token_updates_the_shared_frequency_window() {
+        let _lock = super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let func_ptr = 0x5a17_0000usize;
         record_profiled_invocation(func_ptr);
         record_profiled_invocation(func_ptr);
@@ -33341,6 +33354,41 @@ mod jtc4_stack_map_tests {
         assert_eq!(invocations, 2);
         assert_eq!(sites, vec![(9, 2)]);
         clear_bytecode_profiles(func_ptr);
+    }
+
+    #[test]
+    fn native_call_site_snapshots_keep_bodies_and_retired_tokens_separate() {
+        let _lock = super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let first = 0x5a18_0000usize;
+        let second = 0x5a19_0000usize;
+        let old = call_site_profile_token(first, 9);
+        let sibling_site = call_site_profile_token(first, 10);
+        let other = call_site_profile_token(second, 9);
+        record_native_call_site(old);
+        record_native_call_site(sibling_site);
+        record_native_call_site(other);
+        record_native_call_site(other);
+        let mut sites = call_site_profile_snapshot(first).1;
+        sites.sort_unstable();
+        assert_eq!(sites, vec![(9, 1), (10, 1)]);
+        assert_eq!(call_site_profile_snapshot(second).1, vec![(9, 2)]);
+
+        clear_bytecode_profiles(first);
+        // Retained native code may still increment its detached counter. A
+        // replacement at the same body address must get a fresh sample window.
+        let replacement = call_site_profile_token(first, 9);
+        assert_ne!(replacement, old);
+        record_native_call_site(old);
+        assert_eq!(call_site_profile_snapshot(first).1, vec![(9, 0)]);
+        record_native_call_site(replacement);
+        assert_eq!(call_site_profile_snapshot(first).1, vec![(9, 1)]);
+        assert_eq!(call_site_profile_snapshot(second).1, vec![(9, 2)]);
+        clear_bytecode_profiles(first);
+        clear_bytecode_profiles(second);
+        assert!(call_site_profile_snapshot(first).1.is_empty());
+        assert!(call_site_profile_snapshot(second).1.is_empty());
     }
 
     #[test]
@@ -34101,7 +34149,7 @@ mod active_bytecode_root_tests {
             .unwrap_or_else(|e| e.into_inner());
         let mut env = Env::new(false);
         egcl_rt::rooted_ref!(_env_root = &mut env);
-        let (profile_key, template) = {
+        let (profile_key, template, call_token) = {
             egcl_rt::rooted!(form = super::super::vec_to_list(&[NIL]));
             let body = Arc::new(
                 compile_function("PROFILE-TEMPLATE", NIL, *form, &env, false, false).unwrap(),
@@ -34111,12 +34159,15 @@ mod active_bytecode_root_tests {
             let symbol = egcl_rt::function::name(*closure).as_symbol_index();
             let profile_key = Arc::as_ptr(&body) as usize;
             record_type_profile(profile_key, 0, &[EgclVal::from_fixnum(1)]);
+            let call_token = call_site_profile_token(profile_key, 7);
+            record_native_call_site(call_token);
             drop(closure);
             env.mv.clear();
             egcl_rt::gc::full_gc().unwrap();
             assert!(!is_registered(symbol));
             assert_eq!(type_profile_at(profile_key, 0).unwrap().fixnum, 1);
-            (profile_key, Arc::downgrade(&body))
+            assert_eq!(call_site_profile_snapshot(profile_key).1, vec![(7, 1)]);
+            (profile_key, Arc::downgrade(&body), call_token)
         };
         assert!(
             template.upgrade().is_none(),
@@ -34132,6 +34183,11 @@ mod active_bytecode_root_tests {
         assert!(
             type_profile_at(profile_key, 0).is_none(),
             "dead template left address-keyed feedback"
+        );
+        record_native_call_site(call_token);
+        assert!(
+            call_site_profile_snapshot(profile_key).1.is_empty(),
+            "a retained native token must not resurrect a dead body's feedback"
         );
         assert!(
             !live_bytecode_bodies().borrow().contains_key(&profile_key),
