@@ -9,8 +9,8 @@ operation.
 ## Runtime and ABI requirements
 
 Registered static archives work without a dynamic loader; see
-[Static builds and native libraries](../static-build.md). Default x86-64 and
-AArch64 Unix builds also have a Rust ELF loader for compatible shared objects
+[Static builds and native libraries](https://github.com/atgreen/evergreen/blob/main/docs/static-build.md).
+Default x86-64 and AArch64 Unix builds also have a Rust ELF loader for compatible shared objects
 with a limited host symbol surface. System dynamic loading uses `egcl-rt/c-ffi`;
 embedded shared objects currently require that backend.
 Foreign call and callback support are architecture-specific; ordinary Lisp

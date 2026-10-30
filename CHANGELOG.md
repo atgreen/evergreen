@@ -26,6 +26,9 @@
 
 ### Fixed
 
+- Repair the FFI manual link to the static-build instructions
+  ([#938](https://github.com/atgreen/evergreen/pull/938)).
+
 - Compile local `RETURN-FROM` and `GO` exits across catches and special
   bindings natively while preserving multiple values and outer dynamic scopes
   ([#936](https://github.com/atgreen/evergreen/pull/936)).
