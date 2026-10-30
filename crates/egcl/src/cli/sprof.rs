@@ -52,10 +52,12 @@ static SAMPLES: Mutex<Vec<Box<[u32]>>> = Mutex::new(Vec::new());
 pub(crate) type NativeFrames = Vec<(usize, Vec<(String, u8)>)>;
 static NATIVE_FRAMES: OnceLock<fn() -> NativeFrames> = OnceLock::new();
 
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub(crate) fn install_native_frames(provider: fn() -> NativeFrames) {
     let _ = NATIVE_FRAMES.set(provider);
 }
 
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[inline]
 pub(crate) fn pending() -> bool {
     enabled() && PENDING.load(Ordering::Relaxed)
@@ -63,6 +65,7 @@ pub(crate) fn pending() -> bool {
 
 /// Integer-only insertion point for a published native segment. No lookup or
 /// name allocation occurs on a normal native helper entry.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[inline]
 pub(crate) fn shadow_depth() -> usize {
     if enabled() {
@@ -268,14 +271,14 @@ pub fn stop() {
     ON.store(false, Ordering::Relaxed);
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 pub(crate) fn begin_for_test() {
     SAMPLES.lock().unwrap().clear();
     PENDING.store(false, Ordering::Relaxed);
     ON.store(true, Ordering::Relaxed);
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 pub(crate) fn request_for_test() {
     PENDING.store(true, Ordering::Relaxed);
     egcl_rt::execution_poll::request_all();
