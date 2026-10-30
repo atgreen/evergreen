@@ -51,8 +51,8 @@
 //! * On x86-64, binary fixnum `MIN MAX MOD REM` use guarded native templates.
 //!   `FLOOR TRUNCATE` use quotient templates only when normal continuations
 //!   discard secondary values; observed tuples retain the ordinary call.
-//! * `ASH` with two arguments (fixnum) → `FixnumShl`; the emitter checks the
-//!   constant shift amount and handles right shifts.
+//! * `ASH` with two arguments (fixnum) and a supported constant count →
+//!   `FixnumShl`; variable and oversized counts retain the generic call.
 //! * `NOT` / `NULL` → pure `GenericEq(x, NIL)`, no profile, no guard, no
 //!   safepoint; correct for every argument type.
 //! * `EGCL::%MEMORY-FENCE` with a constant fence keyword → effectful
@@ -1626,9 +1626,16 @@ fn speculate_selected(
                     work.push((inst, opcode, result_type(spec), ExtraArg::None));
                 }
             } else if egcl_rt::symbols::symbol_name(sym).as_deref() == Some("ASH") {
-                // Arithmetic shift by a (constant, checked at emit) amount: left is a
-                // multiply by 2^n (overflow-checked), right is an untag/sar/retag.
-                if spec == SpecType::Fixnum && argc == 2 {
+                // Both tagged and raw emitters require a constant count. Keep
+                // unsupported counts generic rather than declining the whole
+                // artifact after speculation. Counts through 60 are supported
+                // by both paths; negative counts retain arithmetic right shift.
+                if spec == SpecType::Fixnum
+                    && argc == 2
+                    && consts
+                        .get(&f.inst(inst).args[1])
+                        .is_some_and(|&n| (egcl_rt::bignum::FIXNUM_MIN..=60).contains(&n))
+                {
                     work.push((
                         inst,
                         Opcode::FixnumShl,
@@ -2615,6 +2622,60 @@ mod tests {
             },
         );
         (f, call)
+    }
+
+    #[test]
+    fn ash_keeps_unsupported_counts_and_recovery_state_generic() {
+        for count in [None, Some(61), Some(62), Some(100)] {
+            let (mut f, call) = build_call("ASH", 2);
+            if let Some(count) = count {
+                set_ash_count(&mut f, call, count);
+            }
+            let before = f.inst(call).clone();
+            assert_eq!(speculate(&mut f, &|_| Some(SpecType::Fixnum)), 0);
+            let after = f.inst(call);
+            assert_eq!(after.opcode, Opcode::Call);
+            assert_eq!(after.args, before.args);
+            assert_eq!(after.results, before.results);
+            assert!(matches!((&after.aux, &before.aux),
+                (AuxData::CallTarget(a), AuxData::CallTarget(b)) if a == b));
+            assert_eq!(after.frame_state, before.frame_state);
+            assert_eq!(after.flags, before.flags);
+            assert!(crate::t2::verify::verify(&f).is_ok());
+        }
+    }
+
+    fn set_ash_count(f: &mut Function, call: Inst, count: i64) {
+        let entry = f.entry();
+        let (constant, values) = f.push_inst(
+            entry,
+            crate::t2::ir::InstData {
+                opcode: Opcode::ConstFixnum,
+                args: vec![],
+                results: vec![],
+                aux: AuxData::FixnumImm(count),
+                flags: InstFlags::default(),
+                targets: vec![],
+                frame_state: None,
+                source_pos: 0,
+            },
+            &[(IRType::of(TypeBits::FIXNUM), ValueRepresentation::Tagged)],
+        );
+        assert_eq!(f.block_mut(entry).insts.pop(), Some(constant));
+        f.block_mut(entry).insts.insert(0, constant);
+        f.inst_mut(call).args[1] = values[0];
+    }
+
+    #[test]
+    fn ash_still_specializes_supported_constant_counts() {
+        for count in [-100, -1, 0, 1, 60] {
+            let (mut f, call) = build_call("ASH", 2);
+            set_ash_count(&mut f, call, count);
+            assert_eq!(speculate(&mut f, &|_| Some(SpecType::Fixnum)), 1, "{count}");
+            assert_eq!(f.inst(call).opcode, Opcode::FixnumShl);
+            assert!(f.inst(call).frame_state.is_some());
+            assert!(crate::t2::verify::verify(&f).is_ok());
+        }
     }
 
     #[cfg(target_arch = "x86_64")]

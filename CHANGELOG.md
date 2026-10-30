@@ -26,6 +26,10 @@
 
 ### Fixed
 
+- Keep variable and oversized ASH counts on the generic call path so they no
+  longer prevent T2 optimization of the containing function
+  ([#921](https://github.com/atgreen/evergreen/pull/921)).
+
 - Native closures preserve captured gensym identity, preventing unbound-variable
   errors in macro-generated closures and functions loaded from compiled files
   ([#920](https://github.com/atgreen/evergreen/pull/920)).
