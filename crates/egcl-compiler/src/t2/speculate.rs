@@ -1634,7 +1634,7 @@ fn speculate_selected(
                     && argc == 2
                     && consts
                         .get(&f.inst(inst).args[1])
-                        .is_some_and(|&n| n >= egcl_rt::bignum::FIXNUM_MIN && n <= 60)
+                        .is_some_and(|&n| (egcl_rt::bignum::FIXNUM_MIN..=60).contains(&n))
                 {
                     work.push((
                         inst,
