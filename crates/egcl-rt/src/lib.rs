@@ -48,6 +48,7 @@ pub mod value;
 pub mod gc;
 pub(crate) mod gc_async_wp;
 pub(crate) mod gc_soft_dirty;
+pub mod host_memory;
 pub mod jit;
 pub mod jit_debug;
 pub mod lock_order;
