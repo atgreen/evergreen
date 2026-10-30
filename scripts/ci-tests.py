@@ -13,6 +13,7 @@ import sys
 import time
 
 NATIVE = "cli::bytecode::native_transfer_tests::"
+GENERATED_NATIVE = "cli::bytecode::native_transfer_entry::mapped_generated_fiber_tests::"
 HERE = Path(__file__).resolve().parent
 NESTED_REGRESSIONS = {
     "EGCL_CI_TEST_EGCL_RT_SPEC_MEMORY_GC": "egcl-rt:test:spec_memory_gc",
@@ -107,7 +108,7 @@ def discover(root, harness, native, env=None):
     return [{**harness, "id": harness["name"] + "::" + name, "test": name,
              "ignored": name in ignored}
             for name in sorted(all_names)
-            if name not in ignored or (native and name.startswith(NATIVE))]
+            if name not in ignored or (native and name.startswith((NATIVE, GENERATED_NATIVE)))]
 
 
 def validate_expected(expected, harnesses):

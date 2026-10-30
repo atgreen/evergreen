@@ -72,7 +72,12 @@
 //! The ppc64le equivalents are in native_transfer_ppc64le.rs; AArch64 and
 //! s390x have no transfer stubs yet and stay on the checked ABI.
 
+mod generated_call;
 mod mapped_call;
+pub use generated_call::{
+    GeneratedActivation, GeneratedCallHelpers, GeneratedCallRecord, GeneratedLane,
+    GeneratedPublication, GeneratedScopeStorage,
+};
 #[path = "native_transfer_ordinary.rs"]
 mod ordinary;
 pub use ordinary::{
@@ -85,7 +90,8 @@ pub use ordinary::{
 };
 
 pub use mapped_call::{
-    ADAPTER_FRAME_BYTES, MappedCallRecord, PublishedCallEntry, emit_published_call_entry,
+    ADAPTER_FRAME_BYTES, MappedCallRecord, PublishedCallEntry,
+    emit_generated_published_call_entry_descriptor, emit_published_call_entry,
     emit_published_call_entry_descriptor, emit_published_call_veneer,
 };
 

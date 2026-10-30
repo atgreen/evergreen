@@ -23,6 +23,14 @@ use crate::value::NIL;
 use std::cell::Cell;
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+mod generated;
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub use generated::{
+    GENERATED_SEGMENT_LAYOUT, GeneratedSegmentBindings, generated_segment_bindings,
+    initialize_generated_segment,
+};
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 mod ordinary_x64;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub use ordinary_x64::{OrdinaryNativeOutcome, invoke_ordinary_native_segment};

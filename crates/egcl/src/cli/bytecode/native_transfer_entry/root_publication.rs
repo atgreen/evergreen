@@ -86,6 +86,14 @@ pub(super) struct PublishedBoundary {
 pub(super) static ACTIVE: egcl_rt::execution_local::ExecutionLocal<Cell<*mut PublishedBoundary>> =
     unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| Cell::new(std::ptr::null_mut())) };
 
+/// Find a native-only fixture root at an actual helper publication. The
+/// existing oracle checks every linked boundary and excludes managed/MV copies.
+#[cfg(test)]
+pub(in crate::cli::bytecode) fn native_only_root_for_test(marker: i64) -> Option<*mut EgclVal> {
+    let published = unsafe { ACTIVE.with(Cell::get).as_ref() }?;
+    tests::native_only_slot_for(published, marker)
+}
+
 /// Test hook fired inside a published poll, after linking and before the real
 /// safepoint, so a test can reenter Lisp or force a collection at that point.
 #[cfg(test)]
@@ -1206,8 +1214,9 @@ unsafe fn copy_native_backtrace(
                                 .expect("validated ordinary unwind");
                             let segment = &*published.segment;
                             usize::from(
-                                (step.caller.call_sp, step.caller.pc)
-                                    != (segment.saved_sp, segment.return_pc()),
+                                (*context).ordinary_bridge
+                                    || (step.caller.call_sp, step.caller.pc)
+                                        != (segment.saved_sp, segment.return_pc()),
                             )
                         } else {
                             word(code.native_entry_kind_slot.unwrap())
@@ -3166,3 +3175,53 @@ mod tests {
 #[cfg(test)]
 #[path = "root_publication_owner_tests.rs"]
 mod owner_tests;
+
+/// Parent publication storage retained by one mapped activation. Generated
+/// code updates only the exported scalar homes; Rust container layouts remain
+/// private. The slot is linked only while its adapter record is live.
+pub(super) struct PreparedMappedPublication {
+    _boundary: Box<PublishedBoundary>,
+    pub(super) binding: egcl_compiler::t2::native_transfer::GeneratedPublication,
+}
+
+pub(super) unsafe fn prepare_mapped_publication(
+    context: *mut CaptureContext,
+) -> PreparedMappedPublication {
+    use egcl_compiler::t2::native_transfer::GeneratedPublication;
+    let owner = unsafe { (*context).owner };
+    let mut boundary = Box::new(PublishedBoundary {
+        owner,
+        root_owner: owner,
+        directory: super::super::call_table::active_ordinary_directory(),
+        context,
+        cursor: NativeFrameCursor {
+            pc: 0,
+            call_sp: 0,
+            registers: [Some(0); 6],
+        },
+        bounds: 0..0,
+        segment: std::ptr::null_mut(),
+        stack: egcl_rt::current_stack(),
+        previous: std::ptr::null_mut(),
+        profile_shadow_depth: crate::cli::sprof::shadow_depth(),
+        #[cfg(test)]
+        visited: Cell::new(0),
+    });
+    let binding = GeneratedPublication {
+        active: ACTIVE.with(Cell::as_ptr).cast(),
+        boundary: std::ptr::from_mut(&mut *boundary) as usize,
+        previous: std::ptr::from_mut(&mut boundary.previous).cast(),
+        pc: &mut boundary.cursor.pc,
+        sp: &mut boundary.cursor.call_sp,
+        registers: std::array::from_fn(|i| {
+            boundary.cursor.registers[i].as_mut().unwrap() as *mut usize
+        }),
+        low: &mut boundary.bounds.start,
+        high: &mut boundary.bounds.end,
+        segment: &mut boundary.segment,
+    };
+    PreparedMappedPublication {
+        _boundary: boundary,
+        binding,
+    }
+}

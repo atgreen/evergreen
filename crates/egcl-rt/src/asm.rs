@@ -44,6 +44,14 @@ pub struct Label(usize);
 /// near jump. Only the codes the emitter needs are listed; add as required.
 #[derive(Clone, Copy, Debug)]
 pub enum Cc {
+    /// Unsigned below (CF=1 after an x86 comparison).
+    B,
+    /// Unsigned above-or-equal (CF=0 after an x86 comparison).
+    Ae,
+    /// Unsigned below-or-equal (CF=1 or ZF=1).
+    Be,
+    /// Unsigned above (CF=0 and ZF=0).
+    A,
     /// ZF=1 (equal / zero).
     E,
     /// ZF=0 (not equal / nonzero).
@@ -70,6 +78,10 @@ impl Cc {
     /// counterpart; `O` is AArch64's `VS`.
     pub(crate) fn a64_cond(self) -> u32 {
         match self {
+            Cc::B => 0b0011,  // LO
+            Cc::Ae => 0b0010, // HS
+            Cc::Be => 0b1001, // LS
+            Cc::A => 0b1000,  // HI
             Cc::E => 0b0000,  // EQ
             Cc::Ne => 0b0001, // NE
             Cc::O => 0b0110,  // VS
@@ -123,6 +135,10 @@ impl Cc {
     )]
     pub(crate) fn ppc_condition(self) -> (u32, bool) {
         match self {
+            Cc::B => (0, true), // unsigned compare must have populated CR
+            Cc::Ae => (0, false),
+            Cc::Be => (1, false),
+            Cc::A => (1, true),
             Cc::L => (0, true),
             Cc::Ge => (0, false),
             Cc::G => (1, true),
@@ -138,6 +154,10 @@ impl Cc {
     #[cfg(not(target_arch = "aarch64"))]
     fn opcode2(self) -> u8 {
         match self {
+            Cc::B => 0x82,
+            Cc::Ae => 0x83,
+            Cc::Be => 0x86,
+            Cc::A => 0x87,
             Cc::E => 0x84,
             Cc::Ne => 0x85,
             Cc::O => 0x80,
@@ -153,6 +173,10 @@ impl Cc {
     /// the fall-through/taken split of a two-way branch.
     pub fn inverse(self) -> Cc {
         match self {
+            Cc::B => Cc::Ae,
+            Cc::Ae => Cc::B,
+            Cc::Be => Cc::A,
+            Cc::A => Cc::Be,
             Cc::E => Cc::Ne,
             Cc::Ne => Cc::E,
             Cc::O => Cc::No,
@@ -515,14 +539,27 @@ mod tests {
     /// encoding rests on both halves of that, so both are pinned here.
     #[test]
     fn ppc_conditions_are_four_bits_times_two_senses() {
-        let all = [Cc::E, Cc::Ne, Cc::L, Cc::Ge, Cc::G, Cc::Le, Cc::O, Cc::No];
+        let all = [
+            Cc::E,
+            Cc::Ne,
+            Cc::L,
+            Cc::Ge,
+            Cc::G,
+            Cc::Le,
+            Cc::O,
+            Cc::No,
+            Cc::B,
+            Cc::Ae,
+            Cc::Be,
+            Cc::A,
+        ];
         let mut seen: Vec<(u32, bool)> = all.iter().map(|cc| cc.ppc_condition()).collect();
         seen.sort_unstable();
         seen.dedup();
         assert_eq!(
             seen.len(),
             8,
-            "every condition must be a distinct (bit, sense)"
+            "the signed and unsigned aliases must cover exactly eight (bit, sense) pairs"
         );
         assert!(
             seen.iter().all(|(bit, _)| *bit < 4),
@@ -543,6 +580,43 @@ mod tests {
         assert_eq!(Cc::L.ppc_condition(), (0, true), "blt is bt 0");
         assert_eq!(Cc::G.ppc_condition(), (1, true), "bgt is bt 1");
         assert_eq!(Cc::O.ppc_condition(), (3, true), "bso is bt 3");
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
+    fn unsigned_branches_execute_across_the_sign_boundary() {
+        for cc in [Cc::B, Cc::Ae, Cc::Be, Cc::A] {
+            let mut a = Asm::new();
+            let yes = a.label();
+            a.extend_from_slice(&[0xf3, 0x0f, 0x1e, 0xfa, 0x48, 0x39, 0xf7]); // cmp rdi,rsi
+            a.jcc(cc, yes);
+            a.extend_from_slice(&[0xb8, 0, 0, 0, 0, 0xc3]);
+            a.bind(yes);
+            a.extend_from_slice(&[0xb8, 1, 0, 0, 0, 0xc3]);
+            let code = crate::jit::JitBuffer::new(&a.finish().unwrap()).unwrap();
+            let branch: unsafe extern "C" fn(u64, u64) -> u32 =
+                unsafe { std::mem::transmute(code.as_ptr()) };
+            for (left, right) in [
+                (0, u64::MAX),
+                (u64::MAX, 0),
+                (0, 0),
+                (1 << 63, (1 << 63) - 1),
+                (7, 9),
+            ] {
+                let expected = match cc {
+                    Cc::B => left < right,
+                    Cc::Ae => left >= right,
+                    Cc::Be => left <= right,
+                    Cc::A => left > right,
+                    _ => unreachable!(),
+                };
+                assert_eq!(
+                    unsafe { branch(left, right) },
+                    u32::from(expected),
+                    "{cc:?}: {left} versus {right}"
+                );
+            }
+        }
     }
 
     #[test]

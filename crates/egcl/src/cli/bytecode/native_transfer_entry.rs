@@ -78,6 +78,16 @@ pub(super) use background_compilation::{
     CompiledT1, EmissionContext, PreparedT1, compile_background_t1, install_background_t1,
     prepare_background_t1,
 };
+mod mapped_generated;
+#[cfg(test)]
+mod mapped_generated_fiber_tests;
+#[cfg(test)]
+mod mapped_generated_tests;
+pub(super) mod mapped_ordinary;
+#[cfg(test)]
+mod mapped_ordinary_parent_tests;
+#[cfg(test)]
+mod mapped_ordinary_tests;
 mod ordinary_t2;
 pub(super) use ordinary_t2::{PreparedT2, install_ordinary_t2, prepare_ordinary_t2};
 mod nested;
@@ -796,7 +806,13 @@ unsafe fn call_lean_target(
             symbol
         };
         egcl_rt::rooted!(_active_callable_root = super::ActiveCallableRoot(instance));
-        code.run_ordinary_root(offset, function, args, unsafe { &mut *env })
+        if let Some(result) =
+            unsafe { mapped_ordinary::call(&code, offset, function, args, &mut *env, cell) }
+        {
+            result
+        } else {
+            code.run_ordinary_root(offset, function, args, unsafe { &mut *env })
+        }
     });
     let value = match result {
         Ok(value) => value,
@@ -851,17 +867,18 @@ fn mapped_adapter(pc: usize) -> Option<&'static root_publication::PublishedAdapt
         .find(|entry| entry.contains_return(pc))
 }
 
-pub(super) fn published_entries() -> Option<[usize; 2]> {
+fn unbound_published_entries() -> Option<[usize; 2]> {
     PUBLISHED_ENTRIES
         .get_or_init(|| {
             let entry = |slice| {
                 root_publication::PublishedAdapter::new(
-                    egcl_compiler::t2::native_transfer::emit_published_call_entry_descriptor(
+                    egcl_compiler::t2::native_transfer::emit_generated_published_call_entry_descriptor(
                         slice,
                         prepare_nested,
                         finish_nested,
                         resume_nested,
                         checked_call_published,
+                        Some(mapped_generated::helpers()),
                     ),
                 )
             };
@@ -869,6 +886,37 @@ pub(super) fn published_entries() -> Option<[usize; 2]> {
         })
         .as_ref()
         .map(|entries| std::array::from_fn(|i| entries[i].code.as_ptr() as usize))
+}
+
+// These two tail shims belong to one execution and embed only the stable
+// execution-local capture-cell address. They introduce no return PC/frame.
+static GENERATED_ENTRY_BINDINGS: egcl_rt::execution_local::ExecutionLocal<
+    RefCell<Option<[JitBuffer; 2]>>,
+> = unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(None)) };
+
+pub(super) fn published_entries() -> Option<[usize; 2]> {
+    let entries = unbound_published_entries()?;
+    GENERATED_ENTRY_BINDINGS.with(|slot| {
+        if slot.borrow().is_none() {
+            let capture = CAPTURE.with(Cell::as_ptr) as usize;
+            let mut buffers = Vec::new();
+            for entry in entries {
+                let mut bytes = vec![0xf3, 0x0f, 0x1e, 0xfa, 0x49, 0xbb]; // mov r11,capture
+                bytes.extend_from_slice(&(capture as u64).to_le_bytes());
+                bytes.extend_from_slice(&[0x48, 0xb8]);
+                bytes.extend_from_slice(&(entry as u64).to_le_bytes());
+                bytes.extend_from_slice(&[0xff, 0xe0]);
+                buffers.push(JitBuffer::new(&bytes)?);
+            }
+            *slot.borrow_mut() = Some(buffers.try_into().ok()?);
+        }
+        Some(
+            slot.borrow()
+                .as_ref()
+                .map(|buffers| std::array::from_fn(|i| buffers[i].as_ptr() as usize))
+                .unwrap(),
+        )
+    })
 }
 
 #[cfg(test)]
@@ -4510,6 +4558,11 @@ fn record_loop_heat() {
     if capture.is_null() {
         return;
     }
+    // A bridge has no managed callee frame; its installed T2 body needs no
+    // lower-tier loop heat. The physical native maps own its callable.
+    if unsafe { (*capture).ordinary_bridge } {
+        return;
+    }
     let (symbol, body, function) = unsafe {
         let code = &*(*capture).owner;
         (
@@ -4659,7 +4712,13 @@ pub(super) fn take_native_handler_count() -> usize {
     NATIVE_HANDLER_COUNT.with(|count| count.replace(0))
 }
 
+#[repr(C)]
 struct CaptureContext {
+    // Explicit C machine prefix. No other Rust field is decoded by assembly.
+    generated: *mut egcl_compiler::t2::native_transfer::GeneratedActivation,
+    generated_owner: Option<Box<mapped_generated::Prepared>>,
+    ordinary_bridge: bool,
+    mapped_ordinary: *mut mapped_ordinary::Lanes,
     osr: Option<(Rc<NativeCode>, usize)>,
     ready_osr: *mut Option<Box<ActivationState>>,
     guard_resume: *mut Option<OuterResumeState>,

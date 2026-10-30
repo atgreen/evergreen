@@ -162,6 +162,17 @@ impl LispExecutionContext {
         self.poll_slot.begin()
     }
 
+    /// Aligned atomic slot for an execution-owned generated native boundary.
+    ///
+    /// The address is stable only while this context stays at its current
+    /// address. Access through it must use atomic operations; generated entry
+    /// and retirement use an acquire-release exchange, as
+    /// [`Self::swap_active_native_control`] does. Obtaining the address grants
+    /// no permission to publish a control owned by another execution.
+    pub fn native_control_word(&self) -> *const AtomicU64 {
+        &self.active_native_control
+    }
+
     /// Read the active segment control address without dereferencing it.
     /// Reading an address grants no access to the execution-owned pointee.
     pub fn active_native_control(&self) -> u64 {
