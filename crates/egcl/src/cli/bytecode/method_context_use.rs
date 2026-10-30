@@ -6,6 +6,8 @@
 use super::*;
 use std::collections::HashSet;
 
+pub(super) mod helper_values;
+
 #[derive(Clone)]
 pub(in crate::cli) struct Spec {
     pub context_key: String,
@@ -19,6 +21,7 @@ struct Attempt {
     bindings: Bindings,
     used: bool,
     unknown: bool,
+    lexical_opaque: bool,
     generated: usize,
     saw_bindings: bool,
 }
@@ -27,6 +30,7 @@ struct Session {
     attempt: Option<Attempt>,
     unused: bool,
     raw_reader: Option<RawReaderSpec>,
+    helper_sites: Option<helper_values::Sites>,
 }
 static SESSION: egcl_rt::execution_local::ExecutionLocal<RefCell<Option<Session>>> =
     unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| const { RefCell::new(None) }) };
@@ -86,6 +90,7 @@ impl Scope {
                 attempt: None,
                 unused: false,
                 raw_reader: None,
+                helper_sites: None,
             }))
         }))
     }
@@ -155,6 +160,13 @@ impl AttemptScope {
             pending.push(head);
             pending.push(tail);
         }
+        if !found {
+            with_attempt(|_, attempt| {
+                if attempt.generated == 0 {
+                    attempt.lexical_opaque = true;
+                }
+            });
+        }
         let owned = found
             && SESSION.with(|slot| {
                 let mut slot = slot.borrow_mut();
@@ -163,11 +175,13 @@ impl AttemptScope {
                 };
                 if let Some(a) = s.attempt.as_mut() {
                     a.unknown = true;
+                    a.lexical_opaque = true;
                     false
                 } else {
                     s.attempt = Some(Attempt::default());
                     s.unused = false;
                     s.raw_reader = None;
+                    s.helper_sites = None;
                     true
                 }
             });
@@ -277,6 +291,25 @@ pub(super) fn open_call(symbol: u32) {
                 && egcl_rt::symbols::find_index(&name) == Some(symbol)
         });
     if private || !closed {
+        // Open calls need the dynamic method context. They do not by themselves
+        // export the activation's typed lexical function slots to ordinary Env.
+        with_attempt(|_, attempt| {
+            if attempt.generated == 0 {
+                attempt.unknown = true;
+            }
+        });
+    }
+    if [
+        "EVAL",
+        "COMPILE",
+        "MACROEXPAND",
+        "MACROEXPAND-1",
+        "MACROEXPAND-ALL",
+        "GET-SETF-EXPANSION",
+    ]
+    .iter()
+    .any(|name| reader::find_symbol_index(name) == Some(symbol))
+    {
         unknown();
     }
 }
@@ -287,6 +320,7 @@ pub(super) fn unknown() {
     with_attempt(|_, a| {
         if a.generated == 0 {
             a.unknown = true;
+            a.lexical_opaque = true;
         }
     });
 }
@@ -415,6 +449,12 @@ fn raw_reader(initializer: Option<usize>, lo: &Lowerer<'_>) -> Option<RawReaderS
 
 pub(super) fn finish(initializer: Option<usize>, lo: &mut Lowerer<'_>) {
     let raw_reader = raw_reader(initializer, lo);
+    let helper_sites = initializer.and_then(|initializer| {
+        Some(helper_values::Sites {
+            initializer,
+            creations: lo.method_context_helper_values.as_slice().try_into().ok()?,
+        })
+    });
     #[cfg(test)]
     if std::env::var_os("EGCL_RAW_READER_PROOF_DIAGNOSTICS").is_some() {
         let primitive = reader::find_symbol_index("EGCL-INTERNAL::%RAW-SLOT-VALUE");
@@ -445,6 +485,7 @@ pub(super) fn finish(initializer: Option<usize>, lo: &mut Lowerer<'_>) {
     SESSION.with(|slot| {
         if let Some(session) = slot.borrow_mut().as_mut() {
             session.raw_reader = raw_reader;
+            session.helper_sites = helper_sites;
         }
     });
     let unused =
@@ -477,6 +518,34 @@ pub(super) fn finish(initializer: Option<usize>, lo: &mut Lowerer<'_>) {
                 s.unused = true;
             }
         });
+    }
+}
+
+pub(super) fn elide_helper_values(body: &mut BytecodeFunction) {
+    let candidate = SESSION.with(|slot| {
+        let slot = slot.borrow();
+        let session = slot.as_ref()?;
+        let attempt = session.attempt.as_ref()?;
+        #[cfg(test)]
+        if std::env::var_os("EGCL_METHOD_HELPER_PROOF_DIAGNOSTICS").is_some() {
+            eprintln!(
+                "[method-helper-proof] {} unused={} raw_reader={} used={} opaque={} generated={} bindings={} sites={:?} variadic={} nested={} names={:?} prefix={:?}",
+                body.name, session.unused, session.raw_reader.is_some(), attempt.used,
+                attempt.lexical_opaque, attempt.generated, attempt.saw_bindings,
+                session.helper_sites.as_ref().map(|sites| (sites.initializer, sites.creations)),
+                body.variadic, body.nested_functions.len(), body.names,
+                &body.code[..body.code.len().min(9)]
+            );
+        }
+        (!session.unused
+            && session.raw_reader.is_none()
+            && !attempt.used
+            && !attempt.lexical_opaque
+            && attempt.saw_bindings)
+            .then(|| (session.spec.clone(), session.helper_sites.clone()))
+    });
+    if let Some((spec, Some(sites))) = candidate {
+        helper_values::elide(body, &spec, &sites);
     }
 }
 
@@ -526,6 +595,91 @@ mod tests {
             );
         }
         crate::cli::set_compiled_method_cell(*function, false);
+    }
+
+    fn helper_case(source: &str, expected_elided: bool, setup: Option<&str>) {
+        let _lock = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env = &mut env);
+        if let Some(setup) = setup {
+            read_eval_all_env(setup, &mut env).unwrap();
+        }
+        egcl_rt::rooted!(expression = reader::read_from_string(source).unwrap().0);
+        egcl_rt::rooted!(body = arena_cons(*expression, NIL));
+        egcl_rt::rooted!(params = reader::read_from_string("(object)").unwrap().0);
+        let mut metadata = None;
+        *body = method_continuations::wrap_body(*body, &mut metadata).unwrap();
+        let metadata = metadata.unwrap();
+        let initializer = metadata.initializer;
+        let (function, context_proof, _) = compile_and_reify_method_lambda(
+            "(METHOD LEXICAL-HELPERS)",
+            *params,
+            *body,
+            &env,
+            metadata,
+        )
+        .unwrap();
+        egcl_rt::rooted!(function = function);
+        let (_, body) =
+            bytecode_for_callable(egcl_rt::function::definition_index(*function), *function)
+                .unwrap();
+        assert!(
+            context_proof.is_none(),
+            "open/opaque calls must retain dynamic context: {source}"
+        );
+        assert!(
+            body.code.iter().any(|instruction| matches!(instruction,
+            Instr::CallNamed { sym, nargs: 0 } if *sym == initializer)),
+            "initializer retained: {source}"
+        );
+        let creations = body
+            .code
+            .iter()
+            .filter(|i| matches!(i, Instr::MakeClosure { .. }))
+            .count();
+        if expected_elided {
+            assert_eq!(creations, 0, "{source}: {:?}", body.code);
+        } else {
+            assert!(
+                creations >= 2,
+                "opaque/reference case retains helpers: {source}"
+            );
+        }
+        crate::cli::set_compiled_method_cell(*function, false);
+    }
+
+    #[test]
+    fn open_calls_drop_only_unused_lexical_values_not_dynamic_context() {
+        helper_case(
+            "(elide-open object)",
+            true,
+            Some("(defun elide-open (object) object)"),
+        );
+        helper_case(
+            "(elide-foreign:call-next-method object)",
+            true,
+            Some(
+                "(defpackage :elide-foreign (:use :cl) (:shadow :call-next-method) (:export :call-next-method)) (defun elide-foreign:call-next-method (x) x)",
+            ),
+        );
+    }
+
+    #[test]
+    fn opaque_host_nested_and_first_class_continuations_keep_values() {
+        helper_case("(eval '(function cl:call-next-method))", false, None);
+        helper_case(
+            "(compile nil '(lambda () #'cl:call-next-method))",
+            false,
+            None,
+        );
+        helper_case("(funcall #'cl:call-next-method)", false, None);
+        helper_case("#'(lambda () (cl:call-next-method))", false, None);
+        helper_case("(funcall #'(lambda (x) x) object)", false, None);
+        helper_case(
+            "(hidden-continuation)",
+            false,
+            Some("(defmacro hidden-continuation () '(function cl:call-next-method))"),
+        );
     }
 
     #[test]
