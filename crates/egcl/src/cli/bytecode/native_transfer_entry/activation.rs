@@ -8,6 +8,7 @@ use super::*;
 pub(super) struct ActivationState {
     // Prepared while the source machine frame is still published. Trace it
     // through this existing owner until the handoff moves it to the next entry.
+    pub(super) mapped_ordinary: mapped_ordinary::Lanes,
     pub(super) ready_osr: Option<Box<ActivationState>>,
     // A nonrecursive guard consumes its activation exactly once. Reserve its
     // handler and cleanup buffers before executing any protected form.
@@ -77,6 +78,9 @@ impl Drop for PooledActivation<'_> {
 
 impl egcl_rt::gc::TraceHostRoots for ActivationState {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
+        for bridge in &mut self.mapped_ordinary {
+            bridge.as_mut().get_mut().trace_host_roots(visit);
+        }
         if let Some(ready) = &mut self.ready_osr {
             ready.trace_host_roots(visit);
         }
@@ -212,6 +216,8 @@ impl ActivationState {
     /// and its snapshots are cleared first, so nothing in the pool holds a
     /// Lisp value that the collector would need to trace.
     pub(super) fn recycle(mut self: Box<Self>, code: &TransferCode) {
+        // A bridge is an activation lease, never an idle code-pool root.
+        self.mapped_ordinary.clear();
         let guard_idle = self.guard_resume.as_ref().is_none_or(|guard| {
             guard.debug_call.is_none()
                 && guard.handlers.is_empty()
@@ -324,6 +330,7 @@ impl ActivationState {
         let prepared_catch = None::<PreparedCatch>;
 
         Ok(Self {
+            mapped_ordinary: Vec::new(),
             ready_osr: None,
             guard_resume,
             snapshots,
@@ -398,6 +405,8 @@ impl ActivationState {
         nested: *mut egcl_compiler::t2::native_transfer::MappedCallRecord,
     ) -> CaptureContext {
         CaptureContext {
+            ordinary_bridge: false,
+            mapped_ordinary: &mut self.mapped_ordinary,
             osr: None,
             ready_osr: &mut self.ready_osr,
             guard_resume: &mut self.guard_resume,

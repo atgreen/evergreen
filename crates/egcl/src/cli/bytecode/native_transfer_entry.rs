@@ -78,6 +78,11 @@ pub(super) use background_compilation::{
     CompiledT1, EmissionContext, PreparedT1, compile_background_t1, install_background_t1,
     prepare_background_t1,
 };
+pub(super) mod mapped_ordinary;
+#[cfg(test)]
+mod mapped_ordinary_parent_tests;
+#[cfg(test)]
+mod mapped_ordinary_tests;
 mod ordinary_t2;
 pub(super) use ordinary_t2::{PreparedT2, install_ordinary_t2, prepare_ordinary_t2};
 mod nested;
@@ -796,7 +801,13 @@ unsafe fn call_lean_target(
             symbol
         };
         egcl_rt::rooted!(_active_callable_root = super::ActiveCallableRoot(instance));
-        code.run_ordinary_root(offset, function, args, unsafe { &mut *env })
+        if let Some(result) =
+            unsafe { mapped_ordinary::call(&code, offset, function, args, &mut *env) }
+        {
+            result
+        } else {
+            code.run_ordinary_root(offset, function, args, unsafe { &mut *env })
+        }
     });
     let value = match result {
         Ok(value) => value,
@@ -4510,6 +4521,11 @@ fn record_loop_heat() {
     if capture.is_null() {
         return;
     }
+    // A bridge has no managed callee frame; its installed T2 body needs no
+    // lower-tier loop heat. The physical native maps own its callable.
+    if unsafe { (*capture).ordinary_bridge } {
+        return;
+    }
     let (symbol, body, function) = unsafe {
         let code = &*(*capture).owner;
         (
@@ -4660,6 +4676,8 @@ pub(super) fn take_native_handler_count() -> usize {
 }
 
 struct CaptureContext {
+    ordinary_bridge: bool,
+    mapped_ordinary: *mut mapped_ordinary::Lanes,
     osr: Option<(Rc<NativeCode>, usize)>,
     ready_osr: *mut Option<Box<ActivationState>>,
     guard_resume: *mut Option<OuterResumeState>,

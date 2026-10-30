@@ -86,6 +86,14 @@ pub(super) struct PublishedBoundary {
 pub(super) static ACTIVE: egcl_rt::execution_local::ExecutionLocal<Cell<*mut PublishedBoundary>> =
     unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| Cell::new(std::ptr::null_mut())) };
 
+/// Find a native-only fixture root at an actual helper publication. The
+/// existing oracle checks every linked boundary and excludes managed/MV copies.
+#[cfg(test)]
+pub(in crate::cli::bytecode) fn native_only_root_for_test(marker: i64) -> Option<*mut EgclVal> {
+    let published = unsafe { ACTIVE.with(Cell::get).as_ref() }?;
+    tests::native_only_slot_for(published, marker)
+}
+
 /// Test hook fired inside a published poll, after linking and before the real
 /// safepoint, so a test can reenter Lisp or force a collection at that point.
 #[cfg(test)]
@@ -1206,8 +1214,9 @@ unsafe fn copy_native_backtrace(
                                 .expect("validated ordinary unwind");
                             let segment = &*published.segment;
                             usize::from(
-                                (step.caller.call_sp, step.caller.pc)
-                                    != (segment.saved_sp, segment.return_pc()),
+                                (*context).ordinary_bridge
+                                    || (step.caller.call_sp, step.caller.pc)
+                                        != (segment.saved_sp, segment.return_pc()),
                             )
                         } else {
                             word(code.native_entry_kind_slot.unwrap())

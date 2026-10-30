@@ -203,20 +203,38 @@ fn a_lean_root_entry_deoptimizes_and_signals_like_the_interpreter() {
     assert_eq!(lean, 1, "the failing call took the lean root entry");
 }
 
+fn assert_mapped_bridge_backtrace() {
+    let rows = egcl_rt::debug_stack::capture_current(32);
+    let entries: Vec<_> = rows
+        .iter()
+        .filter(|row| {
+            row.function
+                .as_deref()
+                .is_some_and(|name| name.ends_with("T0-T2-INNER"))
+        })
+        .collect();
+    assert_eq!(entries.len(), 1, "{rows:?}");
+    assert_eq!(entries[0].origin, egcl_rt::debug_stack::FrameOrigin::Native);
+}
+
 #[test]
-fn a_mapped_caller_enters_an_ordinary_t2_callee_through_its_lean_root() {
+fn a_mapped_caller_enters_an_ordinary_t2_callee_through_reused_bridge() {
     let _lock = super::super::super::heap_test_lock()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let mut env = Env::new(false);
     egcl_rt::rooted_ref!(_env = &mut env);
     super::super::super::read_eval_all_env(
-        "(defun t0-t2-inner (a b) (+ a b)) (defun t0-t2-kw (a &key (b (1+ 0))) (t0-t2-inner a b))",
+        "(defun t0-t2-observe () (%ordinary-t2-entry-for-test)) (defun t0-t2-inner (a b) (t0-t2-observe) (+ a b)) (defun t0-t2-kw (a &key (b (1+ 0))) (t0-t2-inner a b))",
         &mut env,
     )
     .unwrap();
-    let (inner, inner_code) =
-        super::ordinary_t2::install("T0-T2-INNER", "(a b)", "((+ a b))", &mut env);
+    let (inner, inner_code) = super::ordinary_t2::install(
+        "T0-T2-INNER",
+        "(a b)",
+        "((t0-t2-observe) (+ a b))",
+        &mut env,
+    );
     let NativeCodeStorage::Mapped(mapped) = &inner_code._storage else {
         panic!("the callee needs mapped T2 code")
     };
@@ -237,6 +255,29 @@ fn a_mapped_caller_enters_an_ordinary_t2_callee_through_its_lean_root() {
         mapped.ordinary_entry.is_none(),
         "a &key body with an evaluated default keeps the mapped ABI"
     );
+    let _observer_pin = super::ordinary_t2::RecursiveFixturePins::new(&["T0-T2-OBSERVE"]);
+    super::ordinary_t2::expect_entry(&inner_code);
+    // Cold linkage may still enter the callee through its managed root. Warm
+    // it before the observer that requires the measured bridge's native frame.
+    run_caller(
+        "T0-T2-KW-BRIDGE-WARMUP",
+        "((let ((s 0)) (dotimes (i n s) (setq s (t0-t2-kw s :b 2)))))",
+        1,
+        &mut env,
+    )
+    .unwrap();
+    super::ordinary_t2::expect_entry(&inner_code);
+    struct RestoreTrace(Option<fn()>);
+    impl Drop for RestoreTrace {
+        fn drop(&mut self) {
+            super::ordinary_t2::RECURSIVE_LEAF_OBSERVER.with(|hook| hook.set(self.0));
+        }
+    }
+    let _trace = RestoreTrace(
+        super::ordinary_t2::RECURSIVE_LEAF_OBSERVER
+            .with(|hook| hook.replace(Some(assert_mapped_bridge_backtrace))),
+    );
+    super::super::native_transfer_entry::mapped_ordinary::take_entries_for_test();
     let calls = 100;
     super::super::native_transfer_entry::take_nested_entries();
     super::super::native_transfer_entry::take_lean_target_calls_for_test();
@@ -247,6 +288,11 @@ fn a_mapped_caller_enters_an_ordinary_t2_callee_through_its_lean_root() {
         &mut env,
     )
     .unwrap();
+    let bridges = super::super::native_transfer_entry::mapped_ordinary::take_entries_for_test();
+    assert!(
+        super::ordinary_t2::observed_entry(),
+        "actual ordinary machine callee must execute"
+    );
     let lean = super::super::native_transfer_entry::take_lean_root_entries_for_test();
     let children = super::super::native_transfer_entry::take_nested_entries();
     let direct = super::super::native_transfer_entry::take_lean_target_calls_for_test();
@@ -255,9 +301,13 @@ fn a_mapped_caller_enters_an_ordinary_t2_callee_through_its_lean_root() {
         registry_remove(symbol);
     }
     assert_eq!(result, EgclVal::from_fixnum(2 * calls));
+    assert_eq!(
+        lean, 0,
+        "bridge calls must not create lean root activations"
+    );
     assert!(
-        lean >= calls as usize,
-        "only {lean} of {calls} inner calls took the lean root entry"
+        bridges >= calls as usize,
+        "every hot mapped call uses the bridge"
     );
     assert_eq!(
         children, 0,

@@ -2278,7 +2278,8 @@ pub(super) unsafe fn resume_ordinary_guard(request: *mut u8) -> Result<EgclVal, 
     }
     // Equal code owners can occur in different physical activations. Only the
     // actual root frame is allowed to reuse the managed anchor's callable/state.
-    let is_root = boundary.owner == unsafe { (*context).owner }
+    let is_root = !unsafe { (*context).ordinary_bridge }
+        && boundary.owner == unsafe { (*context).owner }
         && (step.caller.call_sp, step.caller.pc)
             == unsafe { ((*segment).saved_sp, (*segment).return_pc()) };
     if is_root {
