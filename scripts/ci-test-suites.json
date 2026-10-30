@@ -49,6 +49,7 @@
     "egcl:test:canonical_symbol_properties_cli": [""],
     "egcl-rt:test:canonical_symbol_properties": [""],
     "egcl-rt:test:nil_array_storage": [""],
+    "egcl-rt:test:bigrat_integer_arithmetic": [""],
     "egcl-stdlib:test:nil_arrays": [""],
     "egcl:test:nil_element_arrays_cli": [""],
     "egcl-rt:test:random_state_leaf": [""],
