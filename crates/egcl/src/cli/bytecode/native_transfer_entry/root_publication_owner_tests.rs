@@ -118,6 +118,7 @@ fn heterogeneous_owners_preserve_composed_register_home_addresses() {
         segment: std::ptr::null_mut(),
         stack: egcl_rt::current_stack(),
         previous: std::ptr::null_mut(),
+        profile_shadow_depth: 0,
         visited: Cell::new(0),
     };
     let mut owners = Vec::new();

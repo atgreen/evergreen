@@ -19277,8 +19277,8 @@ fn pop_condition_cluster_frame(stack: &egcl_rt::EgclStack, frame: *mut Frame) {
 /// hot loops simply go uncounted here rather than costing an atomic per edge.
 #[inline]
 fn record_back_edge_if_backward(act: &Activation, target: u32) {
-    // (Bytecode loop bodies are sampled at their CallNamed instructions, which
-    // see the full `acts` chain; a shadow-only sample here would misattribute.)
+    // Sampling stays at the branch/CallNamed sites, which see the full
+    // `acts` chain; a shadow-only sample here would misattribute it.
     if profiling_disabled() {
         return;
     }
@@ -20259,12 +20259,22 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                 act.push_op(v);
             }
             Instr::Br(target) => {
+                if (target as usize) < acts[top_idx].bcp {
+                    super::sprof::maybe_sample_stack(
+                        acts.iter().map(|a| a.sym).filter(|&s| s != u32::MAX),
+                    );
+                }
                 record_back_edge_if_backward(&acts[top_idx], target);
                 acts[top_idx].bcp = target as usize;
             }
             Instr::BrIfFalse(target) => {
                 let v = acts[top_idx].pop_op();
                 if v.is_nil() {
+                    if (target as usize) < acts[top_idx].bcp {
+                        super::sprof::maybe_sample_stack(
+                            acts.iter().map(|a| a.sym).filter(|&s| s != u32::MAX),
+                        );
+                    }
                     record_back_edge_if_backward(&acts[top_idx], target);
                     acts[top_idx].bcp = target as usize;
                 }
@@ -20272,18 +20282,21 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
             Instr::BrIfTrue(target) => {
                 let v = acts[top_idx].pop_op();
                 if !v.is_nil() {
+                    if (target as usize) < acts[top_idx].bcp {
+                        super::sprof::maybe_sample_stack(
+                            acts.iter().map(|a| a.sym).filter(|&s| s != u32::MAX),
+                        );
+                    }
                     record_back_edge_if_backward(&acts[top_idx], target);
                     acts[top_idx].bcp = target as usize;
                 }
             }
             Instr::CallNamed { sym, nargs } => {
-                // Lisp-aware profiler (bliss-sc4t): a bytecode call is a
-                // consistent sampling point where the live Lisp call chain is
-                // exactly `acts` (the interpreter inlines callee activations here
-                // rather than recursing, so this is the only place to see them).
-                super::sprof::maybe_sample_stack(
+                let _profile_caller = super::sprof::BytecodeCall::enter(
                     acts.iter().map(|a| a.sym).filter(|&s| s != u32::MAX),
                 );
+                // The scoped caller guard samples the live bytecode chain and
+                // retains it if this instruction enters native or Rust code.
                 // Collect arguments (pushed left-to-right, so arg0 is deepest).
                 //
                 // A fresh `Vec` here was one malloc/free on EVERY bytecode call
@@ -20814,6 +20827,11 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                 // enclosing activation; attributing that edge to the current
                 // frame is a harmless profiling approximation, never a
                 // correctness issue.
+                if (target_bcp as usize) < acts[top_idx].bcp {
+                    super::sprof::maybe_sample_stack(
+                        acts.iter().map(|a| a.sym).filter(|&s| s != u32::MAX),
+                    );
+                }
                 record_back_edge_if_backward(&acts[top_idx], target_bcp);
                 // OSR (bliss-izt.1): once this loop is hot and the operand stack
                 // is empty, finish the activation in native code instead of
@@ -34863,6 +34881,9 @@ mod function_literal_tests {
 
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 mod native_typep_identity_tests;
+
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+mod native_sprof_tests;
 
 #[cfg(test)]
 mod aux_entry_prologue_tests;
