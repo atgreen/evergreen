@@ -1367,6 +1367,10 @@
       
         
       
+        
+      
+        
+      
     
     
     
@@ -1567,6 +1571,62 @@
     
   
     Android project dictionary
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../user/how-to/ios/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Experimental iOS applications
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../user/reference/ios/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    iOS project dictionary
   
 
     
@@ -2271,9 +2331,11 @@ from Lisp; the old extension inventory's “not installed” label is obsolete.
 They are EGCL interfaces, not drop-in substitutes for every CFFI or SB-ALIEN
 operation.</p>
 <h2 id="runtime-and-abi-requirements">Runtime and ABI requirements<a class="headerlink" href="#runtime-and-abi-requirements" title="Permanent link">&para;</a></h2>
-<p>Dynamic library loading requires a dynamic EGCL build with <code>egcl-rt/c-ffi</code>.
-The Fedora native RPM and Android APK runtime provide dynamic builds. The
-static Android CLI and default static musl CLI do not dynamically load libraries.
+<p>Registered static archives work without a dynamic loader; see
+<a href="https://github.com/atgreen/evergreen/blob/main/docs/static-build.md">Static builds and native libraries</a>.
+Default x86-64 and AArch64 Unix builds also have a Rust ELF loader for compatible shared objects
+with a limited host symbol surface. System dynamic loading uses <code>egcl-rt/c-ffi</code>;
+embedded shared objects currently require that backend.
 Foreign call and callback support are architecture-specific; ordinary Lisp
 execution on a target does not establish FFI parity.</p>
 <p>The caller supplies the exact C signature. The runtime cannot infer a prototype
@@ -2348,7 +2410,11 @@ promise to pin the Lisp vector in place. Cleanup also runs on nonlocal exit.</p>
 <a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="p">(</span><span class="nv">egcl-ffi:foreign-symbol-pointer</span><span class="w"> </span><span class="nv">name</span><span class="w"> </span><span class="k">&amp;optional</span><span class="w"> </span><span class="nv">library</span><span class="p">)</span>
 <a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a><span class="p">(</span><span class="nv">egcl-ffi:close-foreign-library</span><span class="w"> </span><span class="nv">library</span><span class="p">)</span>
 </code></pre></div>
-<p>Supply a pathname understood by the platform's dynamic loader. A library object
+<p>Supply a registered static-library name or alias, or a pathname understood by
+the selected loader. Static providers take precedence under their registered
+names. Closing a static handle invalidates it but does not unload linked code.
+Look up foreign symbol pointers again after image restore; saved pointers are
+cleared, while saved library handles are reopened. A library object
 is distinct from a foreign pointer. Supplying the library to symbol lookup
 makes the lookup scope explicit; omitting it uses the default lookup scope.
 Close the library only when no code can call its symbols or use its data.
