@@ -26,6 +26,10 @@
 
 ### Fixed
 
+- Native closures preserve captured gensym identity, preventing unbound-variable
+  errors in macro-generated closures and functions loaded from compiled files
+  ([#920](https://github.com/atgreen/evergreen/pull/920)).
+
 - Expand macro and symbol-macro places in `GET-SETF-EXPANSION` using the supplied
   lexical environment, preserving explicit SETF expanders and nested byte-field
   updates ([#916](https://github.com/atgreen/evergreen/pull/916)).
