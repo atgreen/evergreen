@@ -26,6 +26,7 @@ struct Session {
     spec: Spec,
     attempt: Option<Attempt>,
     unused: bool,
+    raw_reader: Option<RawReaderSpec>,
 }
 static SESSION: egcl_rt::execution_local::ExecutionLocal<RefCell<Option<Session>>> =
     unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| const { RefCell::new(None) }) };
@@ -84,8 +85,12 @@ impl Scope {
                 spec,
                 attempt: None,
                 unused: false,
+                raw_reader: None,
             }))
         }))
+    }
+    pub fn raw_reader(&self) -> Option<RawReaderSpec> {
+        SESSION.with(|slot| slot.borrow().as_ref().and_then(|s| s.raw_reader.clone()))
     }
     pub fn unused(&self) -> bool {
         SESSION.with(|slot| slot.borrow().as_ref().is_some_and(|s| s.unused))
@@ -162,6 +167,7 @@ impl AttemptScope {
                 } else {
                     s.attempt = Some(Attempt::default());
                     s.unused = false;
+                    s.raw_reader = None;
                     true
                 }
             });
@@ -294,7 +300,153 @@ pub(super) fn initializer_instruction(instruction: &Instr) -> bool {
     })
     .unwrap_or(false)
 }
+/// Compiler-owned sites are kept only until final immutable-body verification.
+#[derive(Clone)]
+pub(super) struct RawReaderSpec {
+    pub slot: u32,
+    pub primitive: u32,
+    pub helpers: [u32; 3],
+    initializer: usize,
+    helper_values: [usize; 2],
+    bindings: [String; 3],
+}
+
+impl RawReaderSpec {
+    pub fn matches(&self, body: &BytecodeFunction) -> bool {
+        self.read_slot(&body.code, &body.constants, &body.names) == Some(self.slot)
+    }
+
+    fn read_slot(&self, code: &[Instr], constants: &[EgclVal], names: &[String]) -> Option<u32> {
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Value {
+            Argument,
+            Symbol(u32),
+            Generated,
+            Result,
+        }
+        let mut stack = Vec::new();
+        let mut result = None;
+        let mut depth = 0usize;
+        let mut blocks = Vec::new();
+        for (pc, instruction) in code.iter().enumerate() {
+            match *instruction {
+                Instr::CallNamed { sym, nargs: 0 }
+                    if pc == self.initializer && sym == self.helpers[0] =>
+                {
+                    stack.push(Value::Generated)
+                }
+                Instr::MakeClosure { .. } if self.helper_values.contains(&pc) => {
+                    stack.push(Value::Generated)
+                }
+                Instr::Const(index) => stack.push(Value::Symbol(
+                    constants.get(index as usize)?.symbol_index()?,
+                )),
+                Instr::LoadLocal(0) => stack.push(Value::Argument),
+                Instr::DefineEnvVar(index)
+                    if depth != 0 && self.bindings.contains(names.get(index as usize)?) =>
+                {
+                    if stack.pop()? != Value::Generated {
+                        return None;
+                    }
+                }
+                Instr::PushEnvChild => depth += 1,
+                Instr::PopEnvChild => depth = depth.checked_sub(1)?,
+                Instr::PushBlock {
+                    resume_bcp,
+                    sp_restore,
+                    register: false,
+                    ..
+                } if usize::from(sp_restore) == stack.len() => blocks.push(resume_bcp),
+                Instr::PopHandler if blocks.pop()? as usize == pc + 1 => {}
+                Instr::ClearMv => {}
+                Instr::CallNamed { sym, nargs: 2 } if sym == self.primitive && result.is_none() => {
+                    let Value::Symbol(slot) = stack.pop()? else {
+                        return None;
+                    };
+                    if stack.pop()? != Value::Argument {
+                        return None;
+                    }
+                    result = Some(slot);
+                    stack.push(Value::Result);
+                }
+                Instr::Return if pc + 1 == code.len() && depth == 0 && blocks.is_empty() => {
+                    if stack.pop()? != Value::Result || !stack.is_empty() {
+                        return None;
+                    }
+                    return result;
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+}
+
+fn raw_reader(initializer: Option<usize>, lo: &Lowerer<'_>) -> Option<RawReaderSpec> {
+    let (spec, saw_bindings) = with_attempt(|spec, attempt| (spec.clone(), attempt.saw_bindings))?;
+    if !saw_bindings {
+        return None;
+    }
+    // During cold boot the reader can create the exact canonical registry
+    // identity before the package's present-symbol table adopts it. Do not
+    // require that later adoption, and never accept a single-colon lookalike.
+    let primitive = reader::find_symbol_index("EGCL-INTERNAL::%RAW-SLOT-VALUE")?;
+    let package = egcl_stdlib::find_package("EGCL-INTERNAL")?;
+    if egcl_stdlib::find_present_symbol(package, "%RAW-SLOT-VALUE")
+        .is_some_and(|symbol| symbol.symbol_index() != Some(primitive))
+    {
+        return None;
+    }
+    let mut proof = RawReaderSpec {
+        slot: 0,
+        primitive,
+        helpers: spec.helpers,
+        initializer: initializer?,
+        helper_values: lo.method_context_helper_values.as_slice().try_into().ok()?,
+        bindings: [
+            spec.context_key,
+            closure_fn_binding_key("CALL-NEXT-METHOD"),
+            closure_fn_binding_key("NEXT-METHOD-P"),
+        ],
+    };
+    proof.slot = proof.read_slot(&lo.code, &lo.constants, &lo.names)?;
+    Some(proof)
+}
+
 pub(super) fn finish(initializer: Option<usize>, lo: &mut Lowerer<'_>) {
+    let raw_reader = raw_reader(initializer, lo);
+    #[cfg(test)]
+    if std::env::var_os("EGCL_RAW_READER_PROOF_DIAGNOSTICS").is_some() {
+        let primitive = reader::find_symbol_index("EGCL-INTERNAL::%RAW-SLOT-VALUE");
+        if lo.code.iter().any(|instruction| {
+            matches!(instruction,
+            Instr::CallNamed { sym, .. } if Some(*sym) == primitive)
+        }) {
+            let metadata = with_attempt(|spec, attempt| {
+                (
+                    spec.context_key.clone(),
+                    spec.helpers,
+                    attempt.saw_bindings,
+                    attempt.used,
+                    attempt.unknown,
+                )
+            });
+            eprintln!(
+                "[raw-reader-proof] owner {:?} primitive {:?} initializer {:?} helper-sites {:?} metadata {:?} candidate-slot {:?}",
+                lo.self_symbol,
+                primitive,
+                initializer,
+                lo.method_context_helper_values,
+                metadata,
+                raw_reader.as_ref().map(|proof| proof.slot)
+            );
+        }
+    }
+    SESSION.with(|slot| {
+        if let Some(session) = slot.borrow_mut().as_mut() {
+            session.raw_reader = raw_reader;
+        }
+    });
     let unused =
         with_attempt(|_, a| !a.used && !a.unknown && a.saw_bindings && initializer.is_some())
             .unwrap_or(false);
@@ -349,7 +501,7 @@ mod tests {
         *body = method_continuations::wrap_body(*body, &mut metadata).unwrap();
         let metadata = metadata.unwrap();
         let initializer = metadata.initializer;
-        let (function, proof) = compile_and_reify_method_lambda(
+        let (function, proof, _) = compile_and_reify_method_lambda(
             "(METHOD CONTEXT-PROOF)",
             *params,
             *body,

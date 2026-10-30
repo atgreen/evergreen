@@ -2803,6 +2803,18 @@ static METHOD_COMPILED: LazyLock<DefinitionTable<HashMap<u64, EgclVal>>> = LazyL
     ))
 });
 
+mod raw_slot_reader;
+
+static METHOD_RAW_READERS: LazyLock<DefinitionTable<HashMap<u64, bytecode::RawSlotReader>>> =
+    LazyLock::new(|| {
+        DefinitionTable(OrderedMutex::new(
+            LockLevel::GcWorld,
+            24,
+            "raw slot reader proofs",
+            HashMap::new(),
+        ))
+    });
+
 /// Derived from final scoped lowering, never serialized or guessed from source.
 static METHOD_CONTEXT_UNUSED: LazyLock<
     DefinitionTable<HashMap<u64, bytecode::MethodNoContextBody>>,
@@ -5059,6 +5071,7 @@ fn host_restore_registries(data: &[u8]) -> Result<(), EgclError> {
     }
     *METHOD_COMPILED.borrow_mut() = compiled_methods;
     METHOD_CONTEXT_UNUSED.borrow_mut().clear();
+    METHOD_RAW_READERS.borrow_mut().clear();
     invalidate_gf_dispatch_cache();
     // Older images lack MACC; their accessors run their method bodies.
     let mut accessor_methods = HashMap::new();
@@ -9438,6 +9451,7 @@ struct GfEffective {
     /// When the effective method is a single DEFCLASS-generated accessor:
     /// its slot's symbol index and how it accesses it. See ACCESSOR_METHODS.
     accessor: Option<(u32, SlotAccess)>,
+    raw_reader: Option<bytecode::RawSlotReader>,
     /// Whether `try_single_primary_fast` may call the single primary method's
     /// compiled body directly, with no next-method context. Not when the body
     /// mentions CALL-NEXT-METHOD or NEXT-METHOD-P, which read that context (the
@@ -9929,9 +9943,12 @@ fn try_single_primary_fast(
         && effective.before.is_empty()
         && effective.after.is_empty()
         && effective.primary.len() == 1
-        && effective.single_primary_direct)
+        && (effective.single_primary_direct || effective.raw_reader.is_some()))
     {
         return None;
+    }
+    if let Some(proof) = &effective.raw_reader {
+        return raw_slot_reader::try_read(effective.primary[0], proof, args, env).map(Ok);
     }
     // This branch is authoritative generated accessor metadata, independent
     // of whether its source body has a compiled no-context proof. Nothing on
@@ -10399,6 +10416,17 @@ fn invoke_generic_function_inner(
             let single_primary_direct = primary_ids.len() == 1
                 && !is_builtin_function(&symbol_bare_name(name))
                 && (accessor.is_some() || method_context_unused(primary_ids[0]));
+            let raw_reader = if accessor.is_none()
+                && around_ids.is_empty()
+                && before_ids.is_empty()
+                && after_ids.is_empty()
+                && primary_ids.len() == 1
+                && !is_builtin_function(&symbol_bare_name(name))
+            {
+                METHOD_RAW_READERS.borrow().get(&primary_ids[0].0).cloned()
+            } else {
+                None
+            };
             let effective = Rc::new(GfEffective {
                 ordered: method_ids.clone(),
                 around: around_ids,
@@ -10406,6 +10434,7 @@ fn invoke_generic_function_inner(
                 primary: primary_ids,
                 after: after_ids,
                 accessor,
+                raw_reader,
                 single_primary_direct,
             });
             if let Some(key) = dispatch_key {
@@ -42888,7 +42917,7 @@ fn eval_defmethod(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             bytecode::log_not_compiled(&label, "method defined inside a lexical binding");
         } else {
             let compile_ll = method_lambda_list_for_compile(*lambda_list);
-            if let Some((callable, proof)) = bytecode::compile_and_reify_method_lambda(
+            if let Some((callable, proof, raw_reader)) = bytecode::compile_and_reify_method_lambda(
                 &label,
                 compile_ll,
                 body,
@@ -42896,6 +42925,11 @@ fn eval_defmethod(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 method_context_spec.expect("generated method context metadata"),
             ) {
                 METHOD_COMPILED.borrow_mut().insert(method_id.0, callable);
+                if let Some(raw_reader) = raw_reader {
+                    METHOD_RAW_READERS
+                        .borrow_mut()
+                        .insert(method_id.0, raw_reader);
+                }
                 if let Some(proof) = proof {
                     METHOD_CONTEXT_UNUSED
                         .borrow_mut()
@@ -42968,6 +43002,7 @@ fn set_compiled_method_cell(callable: EgclVal, installed: bool) {
 /// Drop method `id`'s compiled body, if it has one.
 fn forget_compiled_method(id: u64) {
     METHOD_CONTEXT_UNUSED.borrow_mut().remove(&id);
+    METHOD_RAW_READERS.borrow_mut().remove(&id);
     invalidate_gf_dispatch_cache();
     ACCESSOR_METHODS.borrow_mut().remove(&id);
     let retired = METHOD_COMPILED.borrow_mut().remove(&id);
