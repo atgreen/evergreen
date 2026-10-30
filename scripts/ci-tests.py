@@ -154,6 +154,8 @@ def prepare(args):
                 command += ["-p", package]
             if any(name.split(":")[1] == "lib" for name in selected):
                 command.append("--lib")
+            for target in sorted({name.split(":")[2] for name in selected if name.split(":")[1] == "bin"}):
+                command += ["--bin", target]
             for target in sorted({name.split(":")[2] for name in selected if name.split(":")[1] == "test"}):
                 command += ["--test", target]
         artifact_path.parent.mkdir(parents=True, exist_ok=True)

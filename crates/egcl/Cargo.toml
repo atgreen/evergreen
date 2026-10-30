@@ -12,7 +12,7 @@ name = "egcl"
 [[bin]]
 name = "egcl"
 path = "src/main.rs"
-test = false
+test = true
 
 [features]
 # Opt-in fault injection for cross-crate native continuation tests.
