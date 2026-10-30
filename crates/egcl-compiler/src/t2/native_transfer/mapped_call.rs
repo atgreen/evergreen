@@ -26,6 +26,7 @@ pub struct MappedCallRecord {
     /// Materialized by the returning Rust callback from its canonical rooted
     /// environment. Never a root or a descriptor that may span a safepoint.
     pub return_values: egcl_rt::native_transfer::NativeReturnValues,
+    pub generated: super::GeneratedCallRecord,
 }
 
 pub type PrepareMappedCall = unsafe extern "C" fn(u64, *mut MappedCallRecord);
@@ -38,7 +39,7 @@ pub type FinishMappedCall = unsafe extern "C" fn(*mut MappedCallRecord);
 /// `record + ADAPTER_FRAME_BYTES + 8`, and the writable save words the adapter
 /// reloads before returning are `preserved`. The published call veneer only
 /// tail-jumps here, so that return address is the original generated caller's.
-pub const ADAPTER_FRAME_BYTES: usize = std::mem::size_of::<MappedCallRecord>() + 8;
+pub const ADAPTER_FRAME_BYTES: usize = ((std::mem::size_of::<MappedCallRecord>() + 15) & !15) + 8;
 
 /// Permanent published native entry. Preparation selects a mapped activation
 /// or completes the checked compatibility call. Helpers return through Rust
@@ -74,10 +75,25 @@ pub fn emit_published_call_entry_descriptor(
     resume: FinishMappedCall,
     checked: PrepareMappedCall,
 ) -> PublishedCallEntry {
+    emit_generated_published_call_entry_descriptor(slice, prepare, finish, resume, checked, None)
+}
+
+pub fn emit_generated_published_call_entry_descriptor(
+    slice: bool,
+    prepare: PrepareMappedCall,
+    finish: FinishMappedCall,
+    resume: FinishMappedCall,
+    checked: PrepareMappedCall,
+    generated: Option<super::GeneratedCallHelpers>,
+) -> PublishedCallEntry {
     const SIZE: u32 = ADAPTER_FRAME_BYTES as u32; // SysV call alignment
     const {
-        assert!(SIZE == 152);
-        assert!(std::mem::size_of::<MappedCallRecord>() == 144);
+        assert!(SIZE % 16 == 8);
+        assert!(
+            SIZE <= 1024,
+            "adapter must fit existing 4096-byte emergency margin"
+        );
+        assert!(std::mem::offset_of!(MappedCallRecord, generated) == 144);
         assert!(std::mem::offset_of!(MappedCallRecord, preserved) == 8);
         assert!(std::mem::offset_of!(MappedCallRecord, entry) == 56);
         assert!(std::mem::offset_of!(MappedCallRecord, activation) == 64);
@@ -112,6 +128,15 @@ pub fn emit_published_call_entry_descriptor(
     let child_return = a.label();
     a.extend_from_slice(&[0xf3, 0x0f, 0x1e, 0xfa, 0x48, 0x81, 0xec]);
     a.extend_from_slice(&SIZE.to_le_bytes());
+    if generated.is_some() {
+        capture_stack_word(
+            &mut a,
+            false,
+            11,
+            (std::mem::offset_of!(MappedCallRecord, generated)
+                + std::mem::offset_of!(super::GeneratedCallRecord, capture_slot)),
+        );
+    }
     capture_stack_word(&mut a, false, if slice { 1 } else { 9 }, 104);
     capture_stack_word(&mut a, false, 7, 112);
     // Copy the context request, then publish incoming arguments in scanned
@@ -147,6 +172,9 @@ pub fn emit_published_call_entry_descriptor(
     let cold_displacement = a.len();
     a.extend_from_slice(&[0; 4]);
     capture_stack_word(&mut a, false, 0, 80);
+    if let Some(helpers) = generated {
+        super::generated_call::emit_hot_branch(&mut a, helpers, returned, escape);
+    }
     a.extend_from_slice(&[0x48, 0x89, 0xe6]); // rsi=record
     target(&mut a, prepare as usize);
     a.extend_from_slice(&[0xff, 0xd0]);

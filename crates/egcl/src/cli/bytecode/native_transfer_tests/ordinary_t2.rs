@@ -110,7 +110,10 @@ pub(in crate::cli::bytecode) fn install(
     install_body(symbol, body)
 }
 
-fn install_body(symbol: u32, body: Arc<BytecodeFunction>) -> (u32, Rc<NativeCode>) {
+pub(in crate::cli::bytecode) fn install_body(
+    symbol: u32,
+    body: Arc<BytecodeFunction>,
+) -> (u32, Rc<NativeCode>) {
     registry_put(symbol, body);
     let input = snapshot_t2_input(symbol, 0).expect("ordinary T2 snapshot");
     let generation = input.generation;

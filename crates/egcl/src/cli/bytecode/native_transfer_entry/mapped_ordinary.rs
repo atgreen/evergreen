@@ -17,15 +17,17 @@ pub(super) type Lanes = Vec<std::pin::Pin<Box<Bridge>>>;
 /// code pool. Its self-referential context points only into separately boxed
 /// state/children, which never move while the parent is rooted.
 pub(super) struct Bridge {
-    code: Rc<TransferCode>,
-    body: super::super::ActiveBytecodeRoot,
-    state: Option<Box<ActivationState>>,
-    children: Box<SegmentActivations>,
-    context: Box<CaptureContext>,
-    function: EgclVal,
-    args: EntryArgs,
-    instance: u32,
-    busy: bool,
+    pub(super) code: Rc<TransferCode>,
+    pub(super) body: super::super::ActiveBytecodeRoot,
+    pub(super) state: Option<Box<ActivationState>>,
+    pub(super) children: Box<SegmentActivations>,
+    pub(super) context: Box<CaptureContext>,
+    pub(super) function: EgclVal,
+    pub(super) args: EntryArgs,
+    pub(super) instance: u32,
+    pub(super) busy: bool,
+    pub(super) generated: Option<egcl_compiler::t2::native_transfer::GeneratedLane>,
+    pub(super) dispatch_function: EgclVal,
 }
 
 impl TraceHostRoots for Bridge {
@@ -36,6 +38,7 @@ impl TraceHostRoots for Bridge {
         }
         self.children.trace_host_roots(visit);
         visit(&mut self.function);
+        visit(&mut self.dispatch_function);
         self.args.trace_host_roots(visit);
         if self.busy {
             super::super::ActiveCallableRoot(self.instance).trace_host_roots(visit);
@@ -50,7 +53,7 @@ impl Bridge {
         frame: *mut Frame,
     ) -> Result<Box<Self>, EgclError> {
         // Rust-only reservations, on the mapped caller's published side.
-        let mut state = ActivationState::prepare_reusing(&code, env)?;
+        let mut state = ActivationState::native_child(env);
         let mut children = Box::<SegmentActivations>::default();
         let mut context =
             Box::new(state.context(&code, frame, &mut *children, std::ptr::null_mut()));
@@ -72,6 +75,8 @@ impl Bridge {
             args: EntryArgs::new(&[]),
             instance: u32::MAX,
             busy: false,
+            generated: None,
+            dispatch_function: NIL,
         }))
     }
 }
@@ -87,10 +92,22 @@ impl Drop for Bridge {
 }
 
 #[cfg(test)]
-thread_local! {
-    static ENTRIES: Cell<usize> = const { Cell::new(0) };
-    static PREPARES: Cell<usize> = const { Cell::new(0) };
+static ENTRIES: egcl_rt::execution_local::ExecutionLocal<Cell<usize>> =
+    unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| Cell::new(0)) };
+#[cfg(test)]
+static PREPARES: egcl_rt::execution_local::ExecutionLocal<Cell<usize>> =
+    unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| Cell::new(0)) };
+pub(super) fn entry_counter() -> *mut usize {
+    #[cfg(test)]
+    {
+        ENTRIES.with(Cell::as_ptr)
+    }
+    #[cfg(not(test))]
+    {
+        std::ptr::null_mut()
+    }
 }
+
 #[cfg(test)]
 pub(in crate::cli::bytecode) fn take_entries_for_test() -> usize {
     ENTRIES.with(|count| count.replace(0))
@@ -131,6 +148,7 @@ pub(super) unsafe fn call(
     function: EgclVal,
     args: &[EgclVal],
     env: &mut Env,
+    cell: u64,
 ) -> Option<Result<EgclVal, EgclError>> {
     let parent = CAPTURE.with(Cell::get);
     if parent.is_null() || !current_poll_idle() || native_error_pending() {
@@ -182,7 +200,11 @@ pub(super) unsafe fn call(
     let bridge = unsafe { (&mut *slot)[index].as_mut().get_mut() as *mut Bridge };
     // OSR may replace/grow the parent managed extent between calls.
     unsafe { (*bridge).context.frame = (*parent).frame };
-    Some(unsafe { run(bridge, offset, function, args, env, execution) })
+    let result = unsafe { run(bridge, offset, function, args, env, execution) };
+    if result.is_ok() {
+        unsafe { mapped_generated::bind(parent, bridge, cell, offset) };
+    }
+    Some(result)
 }
 
 unsafe fn run(
@@ -198,6 +220,7 @@ unsafe fn run(
     // Caller publication owns input words; copy while no Lisp can allocate.
     unsafe {
         (*bridge).function = function;
+        (*bridge).dispatch_function = function;
         (*bridge).args = EntryArgs::new(args);
         (*bridge).instance = if code.native_callable_slot.is_some()
             && egcl_rt::function::is_interpreted_function(function)

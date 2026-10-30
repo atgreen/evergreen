@@ -3,17 +3,22 @@
 use super::super::native_transfer_tests::ordinary_t2;
 use super::*;
 
-fn install(env: &mut Env, name: &str, params: &str, body: &str) -> (u32, Rc<NativeCode>) {
+pub(super) fn install(
+    env: &mut Env,
+    name: &str,
+    params: &str,
+    body: &str,
+) -> (u32, Rc<NativeCode>) {
     crate::cli::read_eval_all_env(&format!("(defun {name} {params} {body})"), env).unwrap();
     ordinary_t2::install(name, params, &format!("({body})"), env)
 }
-fn owner(native: &NativeCode) -> &Rc<TransferCode> {
+pub(super) fn owner(native: &NativeCode) -> &Rc<TransferCode> {
     let NativeCodeStorage::Mapped(code) = &native._storage else {
         panic!("native owner")
     };
     code
 }
-fn run_mapped(
+pub(super) fn run_mapped(
     symbol: u32,
     native: &NativeCode,
     args: &[EgclVal],
@@ -134,7 +139,7 @@ fn mapped_bridge_child_guard_does_not_replay_effects_or_mutate_parent_scopes() {
         &mut env,
         "BRIDGE-GUARD-PARENT",
         "(x &key (seed (1+ 0)))",
-        "(let ((*bridge-special* 17)) (declare (special *bridge-special*)) (catch 'bridge-outer (bridge-guard-child x)))",
+        "(let ((*bridge-special* 17)) (declare (special *bridge-special*)) (catch 'bridge-outer (bridge-guard-child 0) (setq *bridge-effects* 0) (bridge-guard-child x)))",
     );
     run_mapped(symbol, &parent, &[EgclVal::from_fixnum(2)], &mut env).unwrap();
     crate::cli::read_eval_all_env("(setq *bridge-effects* 0)", &mut env).unwrap();
@@ -149,12 +154,17 @@ fn mapped_bridge_child_guard_does_not_replay_effects_or_mutate_parent_scopes() {
             .0
     );
     let before = owner(&child).deopt_count();
+    mapped_generated::take_fast_entries_for_test();
     mapped_ordinary::take_entries_for_test();
     egcl_rt::rooted!(result = run_mapped(symbol, &parent, &[*wide], &mut env).unwrap());
     assert!(mapped_ordinary::take_entries_for_test() > 0);
     assert!(
         owner(&child).deopt_count() > before,
         "the physical child guard really failed"
+    );
+    assert!(
+        mapped_generated::take_fast_entries_for_test() > 0,
+        "guard failure must follow a generated hot call"
     );
     assert_eq!(
         egcl_rt::bignum::big_cmp(
@@ -197,15 +207,20 @@ fn mapped_bridge_propagates_throw_to_real_parent_and_rechecks_redefinitions() {
         &mut env,
         "BRIDGE-THROW-PARENT",
         "(flag x &key (seed (1+ 0)))",
-        "(let ((*bridge-special* 17)) (declare (special *bridge-special*)) (catch 'bridge-outer (bridge-throw-child flag x)))",
+        "(let ((*bridge-special* 17)) (declare (special *bridge-special*)) (catch 'bridge-outer (bridge-throw-child nil nil) (bridge-throw-child flag x)))",
     );
     egcl_rt::rooted!(payload = crate::cli::arena_cons(EgclVal::from_fixnum(59), NIL));
     run_mapped(symbol, &parent, &[NIL, *payload], &mut env).unwrap();
     mapped_ordinary::take_entries_for_test();
+    mapped_generated::take_fast_entries_for_test();
     egcl_rt::rooted!(
         result = run_mapped(symbol, &parent, &[egcl_rt::value::T, *payload], &mut env).unwrap()
     );
     assert_eq!(*result, *payload);
+    assert!(
+        mapped_generated::take_fast_entries_for_test() > 0,
+        "THROW must escape generated hot call"
+    );
     assert!(mapped_ordinary::take_entries_for_test() > 0);
     assert_eq!(
         env.lookup_var("*BRIDGE-SPECIAL*"),
@@ -218,7 +233,7 @@ fn mapped_bridge_propagates_throw_to_real_parent_and_rechecks_redefinitions() {
         &mut env,
         "BRIDGE-REDEFINE-PARENT",
         "(x &key (seed (1+ 0)))",
-        "(let ((first (bridge-version x))) (bridge-change) (+ first (bridge-version x)))",
+        "(progn (bridge-version x) (let ((first (bridge-version x))) (bridge-change) (+ first (bridge-version x))))",
     );
     assert_eq!(
         run_mapped(symbol, &parent, &[EgclVal::from_fixnum(5)], &mut env).unwrap(),

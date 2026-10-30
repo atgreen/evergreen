@@ -20,7 +20,10 @@ thread_local! {
 
 fn collect_with_only_the_suspended_parent_holding_the_marker() {
     let probe = PARENT_PROBE.with(Cell::get);
-    if probe.is_null() || unsafe { (*probe).observed } {
+    if probe.is_null()
+        || unsafe { (*probe).observed }
+        || mapped_generated::fast_entries_for_test() == 0
+    {
         return;
     }
     if !root_publication::published_frame_has_owner_for_test(unsafe { (*probe).child_owner }) {
@@ -54,6 +57,7 @@ fn mapped_parent_native_only_root_moves_during_an_ordinary_bridge_call() {
         "(defun bridge-parent-poll-child (limit)
            (if (= (logxor limit limit limit) limit) 42 0))
          (defun bridge-parent-root-caller (&key (limit (1+ 1999)))
+           (bridge-parent-poll-child 1)
            (let ((marker (cons 716239 nil)))
              (values nil)
              (bridge-parent-poll-child limit)
@@ -70,7 +74,7 @@ fn mapped_parent_native_only_root_moves_during_an_ordinary_bridge_call() {
     let (parent_symbol, parent) = ordinary_t2::install(
         "BRIDGE-PARENT-ROOT-CALLER",
         "(&key (limit (1+ 1999)))",
-        "((let ((marker (cons 716239 nil))) (values nil) (bridge-parent-poll-child limit) marker))",
+        "((bridge-parent-poll-child 1) (let ((marker (cons 716239 nil))) (values nil) (bridge-parent-poll-child limit) marker))",
         &mut env,
     );
     let NativeCodeStorage::Mapped(child_code) = &child._storage else {
@@ -93,6 +97,8 @@ fn mapped_parent_native_only_root_moves_during_an_ordinary_bridge_call() {
         after: 0,
     };
     mapped_ordinary::take_entries_for_test();
+    mapped_ordinary::take_prepares_for_test();
+    mapped_generated::take_fast_entries_for_test();
     PARENT_PROBE.with(|slot| slot.set(&mut probe));
     let previous = root_publication::PROFILE_OBSERVE.with(|hook| {
         hook.replace(Some(
@@ -103,6 +109,11 @@ fn mapped_parent_native_only_root_moves_during_an_ordinary_bridge_call() {
     root_publication::PROFILE_OBSERVE.with(|hook| hook.set(previous));
     PARENT_PROBE.with(|slot| slot.set(std::ptr::null_mut()));
     let entries = mapped_ordinary::take_entries_for_test();
+    assert!(
+        mapped_generated::take_fast_entries_for_test() > 0,
+        "second call site must really use generated entry"
+    );
+    assert_eq!(mapped_ordinary::take_prepares_for_test(), 1);
     egcl_rt::rooted!(result = result.unwrap());
     for symbol in [child_symbol, parent_symbol] {
         egcl_rt::symbols::set_symbol_function(symbol, NIL);

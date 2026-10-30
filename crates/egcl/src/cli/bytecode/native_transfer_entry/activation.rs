@@ -272,6 +272,30 @@ impl ActivationState {
             && guard_reserved
     }
 
+    /// Native ordinary children reconstruct from physical homes on cold exits.
+    /// They own no managed transfer snapshots, registrations or guard state.
+    pub(super) fn native_child(env: &Env) -> Box<Self> {
+        Box::new(Self {
+            mapped_ordinary: Vec::new(),
+            ready_osr: None,
+            guard_resume: None,
+            snapshots: Vec::new(),
+            cleanups: Vec::new(),
+            specials: Vec::new(),
+            catches: Vec::new(),
+            handlers: Vec::new(),
+            handler_binds: Vec::new(),
+            restart_cases: Vec::new(),
+            restart_templates: RestartFunctionTemplates(Vec::new()),
+            dynamic_scopes: Vec::new(),
+            cluster_frames: Vec::new(),
+            prepared_handler: None,
+            prepared_catch: None,
+            catch_base: env.catch_stack.len(),
+            env_frame: None,
+        })
+    }
+
     pub(super) fn prepare(code: &TransferCode, env: &mut Env) -> Result<Self, EgclError> {
         #[cfg(test)]
         FRESH_PREPARES.with(|count| count.set(count.get() + 1));
@@ -405,6 +429,8 @@ impl ActivationState {
         nested: *mut egcl_compiler::t2::native_transfer::MappedCallRecord,
     ) -> CaptureContext {
         CaptureContext {
+            generated: std::ptr::null_mut(),
+            generated_owner: None,
             ordinary_bridge: false,
             mapped_ordinary: &mut self.mapped_ordinary,
             osr: None,
