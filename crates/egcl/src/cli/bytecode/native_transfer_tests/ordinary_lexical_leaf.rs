@@ -394,3 +394,110 @@ fn ordinary_lexical_bootstrapped_funcall_cold_after_major_uses_leaf() {
     // remaining calls must be generated children of the real compiled loop.
     assert!(native_transfer_entry::funcall_fast::take_fast_calls_for_test().0 <= 1);
 }
+
+#[test]
+fn ordinary_encoded_capture_keys_preserve_identity_and_move_published_store() {
+    let _lock = crate::cli::heap_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    egcl_rt::rooted!(env = Env::new(false));
+    for escaped in [false, true] {
+        egcl_rt::rooted!(
+            target = if escaped {
+                EgclVal::from_symbol_index(egcl_rt::symbols::intern("\0egcl-lexical:symbol:999"))
+            } else {
+                egcl_rt::symbols::make_uninterned("ENCODED-CAPTURE")
+            }
+        );
+        egcl_rt::rooted!(
+            other = egcl_rt::symbols::make_uninterned(
+                &egcl_rt::symbols::symbol_name(target.as_symbol_index()).unwrap()
+            )
+        );
+        assert_ne!(*target, *other);
+        let key = lexical_identity::key(*target);
+        let other_key = lexical_identity::key(*other);
+        assert!(lexical_identity::encoded(&key));
+        egcl_rt::rooted!(params = reader::read_from_string("(next)").unwrap().0);
+        egcl_rt::rooted!(
+            assignment = crate::cli::vec_to_list(&[
+                resolve_sym("SETQ").unwrap(),
+                *target,
+                resolve_sym("NEXT").unwrap()
+            ])
+        );
+        egcl_rt::rooted!(forms = crate::cli::vec_to_list(&[*assignment, *target]));
+        let empty = std::collections::HashSet::new();
+        let captures = std::collections::HashSet::from([key.clone()]);
+        let body = Arc::new(
+            compile_function_in(
+                "ORDINARY-ENCODED-CAPTURE",
+                *params,
+                *forms,
+                &env,
+                &HashMap::new(),
+                false,
+                false,
+                &empty,
+                &empty,
+                &empty,
+                &captures,
+                None,
+            )
+            .unwrap(),
+        );
+        egcl_rt::rooted!(_body = ActiveBytecodeRoot::new(&body));
+        let mut construction = env.child();
+        construction.frame = Arc::new(SharedCell::new(EnvFrame {
+            vars: crate::cli::VecMap::default(),
+            symbol_vars: crate::cli::VecMap::default(),
+            parent: None,
+        }));
+        egcl_rt::rooted_ref!(_construction = &mut construction);
+        bind_boxed_param(&construction.frame, &key, NIL);
+        bind_boxed_param(&construction.frame, &other_key, EgclVal::from_fixnum(99));
+        egcl_rt::rooted!(
+            function = make_bytecode_closure(&body, Some(Arc::clone(&construction.frame)))
+        );
+        let code = install_automatic(*function);
+        let NativeCodeStorage::Mapped(owner) = &code._storage else {
+            panic!("native owner");
+        };
+        assert!(owner.ordinary_entry.is_some() && owner.native_callable_slot.is_some());
+        lexical::HITS.with(|count| count.set(0));
+        lexical::PUBLISHED.with(|count| count.set(0));
+        assert_eq!(
+            owner.run_callable(*function, &[NIL], &mut env).unwrap(),
+            NIL
+        );
+        assert!(
+            lexical::HITS.with(Cell::get) > 0,
+            "encoded keys must execute actual native lexical leaves"
+        );
+        assert_eq!(lexical::PUBLISHED.with(Cell::get), 0);
+        egcl_rt::gc::collect_t0_minor().unwrap();
+        egcl_rt::rooted!(value = crate::cli::arena_cons(EgclVal::from_fixnum(89), NIL));
+        MOVED.with(|slot| slot.set(None));
+        lexical::BEFORE_LEAF.with(|hook| hook.set(Some(poll_at_store)));
+        lexical::STORE_OBSERVER.with(|hook| hook.set(Some(collect_outgoing)));
+        let _reset = Reset;
+        egcl_rt::rooted!(result = owner.run_callable(*function, &[*value], &mut env).unwrap());
+        let (before, after, ok) = MOVED
+            .with(Cell::get)
+            .expect("published encoded store observed");
+        assert!(ok);
+        assert_ne!(before, after, "outgoing value must actually relocate");
+        assert_eq!(result.to_raw(), after);
+        assert_eq!(*result, *value);
+        assert_eq!(
+            Env::lookup_lexical_frame(&construction.frame, &key),
+            Some(*value)
+        );
+        assert_eq!(
+            Env::lookup_lexical_frame(&construction.frame, &other_key),
+            Some(EgclVal::from_fixnum(99))
+        );
+        assert!(lexical::PUBLISHED.with(Cell::get) >= 1);
+        assert_eq!(owner.deopt_count(), 0);
+    }
+}

@@ -43,11 +43,21 @@ pub(super) fn access(args: &[EgclVal], store: bool) -> Result<EgclVal, EgclError
         // The existing Env mutation protocol owns the write barrier and shared
         // lexical-cell semantics. It performs no Lisp allocation and no borrow
         // of the frame remains live when the adapter next polls/returns.
-        Env::set_frame_var(&frame, name, args[2]);
+        if lexical_identity::encoded(name) {
+            Env::set_lexical_frame(&frame, name, args[2]);
+        } else {
+            Env::set_frame_var(&frame, name, args[2]);
+        }
         Ok(NIL)
     } else {
-        Env::lookup_resolved_frame(&frame, name, symbol)
-            .ok_or_else(|| EgclError::UnboundVariable(resolve_sym(name).unwrap_or(NIL)))
+        let value = if lexical_identity::encoded(name) {
+            Env::lookup_lexical_frame(&frame, name)
+        } else {
+            Env::lookup_resolved_frame(&frame, name, symbol)
+        };
+        value.ok_or_else(|| {
+            EgclError::UnboundVariable(lexical_identity::resolve(name).unwrap_or(NIL))
+        })
     }
 }
 
@@ -87,10 +97,17 @@ pub(super) unsafe fn leaf(
             let frame = closure_captured_env(callable)?;
             let symbol = egcl_rt::symbols::find_index(name);
             let answer = if store {
-                if !Env::set_resolved_frame_var(&frame, name, symbol, args[2]) {
+                let updated = if lexical_identity::encoded(name) {
+                    Env::set_lexical_frame(&frame, name, args[2])
+                } else {
+                    Env::set_resolved_frame_var(&frame, name, symbol, args[2])
+                };
+                if !updated {
                     return None;
                 }
                 NIL
+            } else if lexical_identity::encoded(name) {
+                Env::lookup_lexical_frame(&frame, name)?
             } else {
                 Env::lookup_resolved_frame(&frame, name, symbol)?
             };
