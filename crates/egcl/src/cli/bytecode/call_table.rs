@@ -116,8 +116,7 @@ struct State {
     symbol: u32,
     cell: Arc<CallCell>,
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    #[allow(clippy::vec_box)] // machine callers borrow immutable descriptor addresses
-    ordinary_adapters: RefCell<Vec<Box<adapter::NamedAdapter>>>,
+    ordinary_adapters: RefCell<adapter::AdapterHistory>,
     target: RefCell<Option<Target>>,
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     mapped: RefCell<MappedCode>,
@@ -200,7 +199,7 @@ pub(super) fn resolve(symbol: u32) -> Option<Arc<CallCell>> {
                 symbol,
                 cell,
                 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-                ordinary_adapters: RefCell::new(Vec::new()),
+                ordinary_adapters: RefCell::new(adapter::AdapterHistory::default()),
                 target: RefCell::new(None),
                 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
                 mapped: RefCell::new(None),
