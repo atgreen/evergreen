@@ -1,5 +1,6 @@
 {
   "fast": {
+    "egcl:test:nsubst_alias_cli": [""],
     "egcl:test:macrolet_loop_gc_cli": [""],
     "egcl-compiler:test:macroexpand_body_gc": [""],
     "egcl:test:compiled_fallback_macro_context_cli": [""],

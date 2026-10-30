@@ -38,7 +38,10 @@ const DEFINITIONS: &str = r#"
     (assert (equal tree '(:keep . :new))))
   (assert (handler-case
               (progn (invoke-nsubst-options (list :test #'eql :test-not #'eql)) nil)
-            (error () t)))
+            (program-error () t)))
+  (assert (handler-case
+              (progn (invoke-nsubst-options (list :test nil :test-not nil)) nil)
+            (program-error () t)))
   (let* ((child (cons 2 3)) (tree (list 1 child 4)))
     (assert (eq (nsubst-if :odd (lambda (x) (and (integerp x) (oddp x))) tree) tree))
     (assert (eq (cadr tree) child))
@@ -141,6 +144,8 @@ fn destructive_substitution_preserves_aliases_in_source_free_calls() {
             offset += size;
         }
         assert!(bytecode, "expected portable bytecode");
+    } else {
+        assert!(bytes.starts_with(b"BBU\0"), "expected portable bytecode");
     }
     fs::remove_file(source).unwrap();
     let program = format!("(load {artifact:?}) {CHECKS}");

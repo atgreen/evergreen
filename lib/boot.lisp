@@ -3515,13 +3515,31 @@ Returns NIL."
 (defun subst-if-not (new pred tree &key key)
   (subst-if new (lambda (x) (not (funcall pred x))) tree :key key))
 
-;; NSUBST may reuse structure; delegating to SUBST is conforming — but it must
-;; forward :key/:test/:test-not (they were dropped, so nsubst ignored the test;
-;; ansi-test cons/nsubst.lsp).
-(defun nsubst (new old tree &rest keys)
-  (apply (function subst) new old tree keys))
-(defun nsubst-if (new pred tree &rest keys) (apply (function subst-if) new pred tree keys))
-(defun nsubst-if-not (new pred tree &rest keys) (apply (function subst-if-not) new pred tree keys))
+;; Mutate existing cons cells so aliases into TREE observe replacements.
+;; Matching the root itself returns NEW without descending into it.
+(defun %nsubst-walk (new predicate tree key)
+  (labels ((walk (node)
+             (cond ((funcall predicate (if key (funcall key node) node)) new)
+                   ((consp node)
+                    (setf (car node) (walk (car node)))
+                    (setf (cdr node) (walk (cdr node)))
+                    node)
+                   (t node))))
+    (walk tree)))
+
+(defun nsubst (new old tree &key key (test #'eql test-p) (test-not nil test-not-p))
+  (when (and test-p test-not-p) (error 'program-error))
+  (%nsubst-walk new
+                (if test-not-p
+                    (lambda (item) (not (funcall test-not old item)))
+                    (lambda (item) (funcall test old item)))
+                tree key))
+
+(defun nsubst-if (new predicate tree &key key)
+  (%nsubst-walk new predicate tree key))
+
+(defun nsubst-if-not (new predicate tree &key key)
+  (%nsubst-walk new (lambda (item) (not (funcall predicate item))) tree key))
 
 ;; Build a new sequence replacing chosen positions with NEW.
 (defun %substitute-list (new items chosen)
