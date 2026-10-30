@@ -22,7 +22,8 @@ fn cons(car: EgclVal, cdr: EgclVal) -> EgclVal {
             cdr: *cdr,
         });
     }
-    EgclVal::from_cons_ptr(body)
+    // SAFETY: `body` points to the initialized CONS payload written above.
+    unsafe { EgclVal::from_cons_ptr(body) }
 }
 
 fn nth(mut form: EgclVal, index: usize) -> EgclVal {
