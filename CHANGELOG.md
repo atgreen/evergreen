@@ -26,6 +26,10 @@
 
 ### Fixed
 
+- Keep unrelated named call entries warm when a function definition or native
+  version changes, preserving cross-execution updates and redefinition checks
+  ([#934](https://github.com/atgreen/evergreen/pull/934)).
+
 - Avoid repeated scans of retained callable roots during ordinary native entry
   checks while preserving code-version and callable-identity guards
   ([#933](https://github.com/atgreen/evergreen/pull/933)).
