@@ -350,6 +350,28 @@ pub(super) fn bump_direct_call_gen() {
     egcl_rt::call_table::invalidate_all();
 }
 
+/// Keep the global baked-call guard, but redirect only known changed bindings.
+/// The RT table broadcasts each binding revision to every execution's cell.
+pub(super) fn bump_direct_call_gen_for(sym: u32) {
+    bump_direct_call_gen_for_symbols([sym]);
+}
+
+fn bump_direct_call_gen_for_symbols(symbols: impl IntoIterator<Item = u32>) {
+    DIRECT_CALL_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    for symbol in symbols {
+        egcl_rt::call_table::invalidate(symbol);
+    }
+    invalidate_funcall_cell();
+}
+
+fn invalidate_funcall_cell() {
+    // FUNCALL independently retains callable/code selections. A change to any
+    // named callee must retire that cache as well as the callee's own slot.
+    if let Some(funcall) = egcl_rt::symbols::find_index("FUNCALL") {
+        egcl_rt::call_table::invalidate(funcall);
+    }
+}
+
 // Captured lexical locations are process-wide, just like function identities.
 type ClosureEnvironments =
     SharedCell<HashMap<u32, Arc<SharedCell<EnvFrame>>, egcl_rt::fxhash::FxBuildHasher>>;
@@ -940,7 +962,7 @@ fn sweep_dead_function_captures(names: &[EgclVal]) {
                 .retain(|symbol| !dead.contains(symbol))
         });
     }
-    bump_direct_call_gen();
+    bump_direct_call_gen_for_symbols(dead.iter().copied());
 }
 
 /// Exact anonymous code-owner provenance, read only during the stopped-world
@@ -1536,7 +1558,7 @@ fn publish_bytecode(
         }
         // Fresh private closures cannot replace a baked target.
         if REGISTRY.with(|r| r.borrow().contains_key(&sym)) {
-            bump_direct_call_gen();
+            bump_direct_call_gen_for(sym);
         }
         current.wrapping_add(1)
     } else {
@@ -1548,7 +1570,7 @@ fn publish_bytecode(
         let generation = current.wrapping_add(1);
         // Invalidate baked targets before exposing the replacement, under the
         // same lock observed by registry_get.
-        bump_direct_call_gen();
+        bump_direct_call_gen_for(sym);
         if egcl_rt::function::is_interpreted_function(function) {
             // This association belongs to the callable, not its mutable public
             // binding. Retired definitions stay reachable only through their
@@ -1597,7 +1619,7 @@ fn registry_remove(sym: u32) {
         generation
     };
     install_local_definition(sym, None, generation);
-    bump_direct_call_gen(); // invalidate baked direct-call targets (bliss-zhvn)
+    bump_direct_call_gen_for(sym); // invalidate baked direct-call targets (bliss-zhvn)
     closure_controls().borrow_mut().remove(&sym);
 }
 
@@ -2336,7 +2358,7 @@ static SOURCE_TEXT: egcl_rt::execution_local::ExecutionLocal<RefCell<HashMap<u32
 pub fn profile_pin(sym: u32) {
     PROFILE_PIN.with(|s| s.borrow_mut().insert(sym));
     NATIVE_REGISTRY.with(|r| r.borrow_mut().remove(&sym));
-    bump_direct_call_gen(); // invalidate baked direct-call targets (bliss-zhvn)
+    bump_direct_call_gen_for(sym); // invalidate baked direct-call targets (bliss-zhvn)
     if let Some(f) = egcl_rt::symbols::symbol_function(sym)
         .filter(|&v| egcl_rt::function::is_interpreted_function(v))
     {
@@ -25491,9 +25513,7 @@ fn publish_native(sym: u32, fn_obj: Option<EgclVal>, nc: &NativeCode) {
     egcl_rt::call_table::invalidate(sym);
     // Native FUNCALL holds a bounded cache of code versions independently of
     // the callee's named slot. Publication must retire that dispatch too.
-    if let Some(funcall) = egcl_rt::symbols::find_index("FUNCALL") {
-        egcl_rt::call_table::invalidate(funcall);
-    }
+    invalidate_funcall_cell();
     // Pinned to T0 for deterministic profiling (bliss-xgr5): never install native
     // code, so the interpreter counts every call. Catches the T2 install path too
     // (both tiers publish here).
@@ -26686,7 +26706,7 @@ fn note_native_deopt(sym: u32, code: Option<&NativeCode>, guard_bcp: Option<u32>
             // Ported backends retain T0 execution while replacement compiles;
             // later dispatch can request a profile-led T2 version.
             NATIVE_REGISTRY.with(|r| r.borrow_mut().remove(&sym));
-            bump_direct_call_gen(); // invalidate baked direct-call targets (bliss-zhvn)
+            bump_direct_call_gen_for(sym); // invalidate baked direct-call targets (bliss-zhvn)
             T2_DECLINED.with(|s| s.borrow_mut().remove(&sym));
             DEOPT_COUNTS.with(|m| m.borrow_mut().insert(sym, 0));
             PROMOTED_FRESH.with(|s| s.borrow_mut().remove(&sym));
@@ -26719,7 +26739,7 @@ fn note_native_deopt(sym: u32, code: Option<&NativeCode>, guard_bcp: Option<u32>
             }
         } else if threshold_hit {
             NATIVE_REGISTRY.with(|r| r.borrow_mut().remove(&sym));
-            bump_direct_call_gen(); // invalidate baked direct-call targets (bliss-zhvn)
+            bump_direct_call_gen_for(sym); // invalidate baked direct-call targets (bliss-zhvn)
             DEOPT_BLACKLIST.with(|s| s.borrow_mut().insert(sym));
             if let Some(function) = egcl_rt::symbols::symbol_function(sym)
                 .filter(|&value| egcl_rt::function::is_interpreted_function(value))
@@ -30623,7 +30643,7 @@ fn decay_changed_phase_sites(body: &Arc<BytecodeFunction>, failed: &NativeCode) 
 fn retire_for_reosr(sym: u32, fn_obj: Option<EgclVal>) {
     // The failed version stays alive in the suspended activations using it.
     NATIVE_REGISTRY.with(|r| r.borrow_mut().remove(&sym));
-    bump_direct_call_gen();
+    bump_direct_call_gen_for(sym);
     T2_DECLINED.with(|s| s.borrow_mut().remove(&sym));
     DEOPT_COUNTS.with(|m| m.borrow_mut().insert(sym, 0));
     PROMOTED_FRESH.with(|s| s.borrow_mut().remove(&sym));
@@ -31396,7 +31416,7 @@ impl Drop for ToplevelLoopOwner {
     fn drop(&mut self) {
         // As `remove_shake_closure` does, without `registry_remove`'s
         // direct-call generation bump: nothing could have baked a call to a
-        // symbol no code can name, and the bump invalidates every call cell.
+        // symbol no code can name.
         egcl_rt::symbols::set_symbol_function(self.sym, egcl_rt::value::UNBOUND);
         closure_bodies().borrow_mut().remove(&self.sym);
         let generation = REGISTRY_GENERATION.with(|g| {

@@ -83,5 +83,5 @@ pub(super) fn publish(name: &str, symbol: Option<u32>, force: bool) {
     }
     let index = symbol.unwrap_or_else(|| reader::intern_symbol(name));
     egcl_rt::symbols::set_symbol_function(index, EgclVal::from_symbol_index(index));
-    bytecode::bump_direct_call_gen();
+    bytecode::bump_direct_call_gen_for(index);
 }
