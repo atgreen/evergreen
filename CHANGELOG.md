@@ -29,6 +29,10 @@
 - Repair the FFI manual link to the static-build instructions
   ([#938](https://github.com/atgreen/evergreen/pull/938)).
 
+- Preserve distinct same-named local functions in `FLET` and `LABELS` across
+  compiled files and saved cores; regenerate previously collapsed compiled files
+  ([#937](https://github.com/atgreen/evergreen/pull/937)).
+
 - Compile local `RETURN-FROM` and `GO` exits across catches and special
   bindings natively while preserving multiple values and outer dynamic scopes
   ([#936](https://github.com/atgreen/evergreen/pull/936)).
