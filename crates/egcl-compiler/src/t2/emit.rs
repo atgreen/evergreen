@@ -9145,16 +9145,43 @@ fn emit_framed_inner(
                     if let Some(&bits) = const_tagged.get(&d.args[0]) {
                         mov_imm64(&mut a, RAX, bits as i64);
                     }
+                    let not_u8 = a.label();
                     packed_u8_element_address(
                         &mut a,
                         array,
                         index,
                         const_tagged.get(&d.args[1]).copied(),
-                        label,
+                        not_u8,
                     );
                     a.extend_from_slice(&[0x0f, 0xb6, 0x02]); // movzx eax,byte [rdx]
                     shl_imm(&mut a, RAX, 3);
                     mov_rr(&mut a, inst_reg[&d.results[0]], RAX);
+                    a.jmp(stored);
+                    a.bind(not_u8);
+                    // AREF also accepts simple byte and wide-character strings.
+                    // Reuse CHAR's nonallocating, bounds-checked character load.
+                    // RAX/RDX are reserved scratch; operand homes (including
+                    // deopt sources) must survive a rejected string probe.
+                    debug_assert!(d.args.iter().all(|arg| inst_reg.get(arg) != Some(&RAX)));
+                    let result = d.results[0];
+                    let destination = inst_reg[&result];
+                    inst_reg.insert(result, RAX);
+                    let mut probe = d.clone();
+                    probe.opcode = Opcode::StringCharOrNil;
+                    probe.aux = AuxData::None;
+                    probe.flags = crate::t2::ir::InstFlags::default();
+                    probe.frame_state = None;
+                    emit_string_char_or_nil(
+                        &mut a,
+                        &probe,
+                        &mut inst_reg,
+                        &mut inst_pool,
+                        &const_tagged,
+                    )?;
+                    inst_reg.insert(result, destination);
+                    alu_r_imm(&mut a, 7, RAX, egcl_rt::value::NIL.0 as i32);
+                    a.jcc(Cc::E, label);
+                    mov_rr(&mut a, destination, RAX);
                     a.jmp(stored);
                 }
                 if d.opcode == Opcode::VecSet && !matches!(d.aux, AuxData::SimpleVectorStore) {

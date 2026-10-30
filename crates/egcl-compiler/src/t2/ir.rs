@@ -271,7 +271,8 @@ pub enum Opcode {
     Load,
     Car,
     Cdr,
-    /// Tagged general-vector load. ArrayRef also admits packed U8;
+    /// Tagged general-vector load. ArrayRef also admits packed U8 and, on
+    /// x86-64, simple byte/wide character strings;
     /// AuxData::None retains the SIMPLE_VECTOR-only SVREF contract.
     VecRef,
     /// Ordered type/bounds check for an AREF/SVREF whose result is fully dead.

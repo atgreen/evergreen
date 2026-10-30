@@ -34884,3 +34884,6 @@ mod ios_tier_profile_tests {
 
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 mod native_ash_selection_tests;
+
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+mod native_string_aref_tests;
