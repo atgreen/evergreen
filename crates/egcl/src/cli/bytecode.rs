@@ -17216,13 +17216,21 @@ pub(super) fn compile_and_reify_lambda(
     compile_and_reify_lambda_inner(label, lambda_list, body, env)
 }
 
+#[derive(Clone)]
+pub(super) struct RawSlotReader {
+    pub body: MethodNoContextBody,
+    pub slot: u32,
+    pub primitive: u32,
+    pub helpers: [u32; 3],
+}
+
 pub(super) fn compile_and_reify_method_lambda(
     label: &str,
     lambda_list: EgclVal,
     body: EgclVal,
     env: &super::Env,
     spec: MethodContextSpec,
-) -> Option<(EgclVal, Option<MethodNoContextBody>)> {
+) -> Option<(EgclVal, Option<MethodNoContextBody>, Option<RawSlotReader>)> {
     let scope = method_context_use::Scope::enter(spec);
     let function = compile_and_reify_lambda_inner(label, lambda_list, body, env)?;
     let proof = if scope.unused() {
@@ -17231,7 +17239,30 @@ pub(super) fn compile_and_reify_method_lambda(
     } else {
         None
     };
-    Some((function, proof))
+    let raw_reader = scope.raw_reader().and_then(|spec| {
+        let (_, body) =
+            bytecode_for_callable(egcl_rt::function::definition_index(function), function)?;
+        // Default argument binders, dynamic parameters and checked declarations
+        // are observable even when the straight-line body itself is a raw read.
+        if body.variadic
+            || body.arity != 1
+            || body.min_args != 1
+            || body.max_args != Some(1)
+            || body.param_layout.len() != 1
+            || !matches!(body.param_layout[0].1, VarLoc::Slot(0))
+            || body.param_types.iter().any(|ty| !ty.is_any())
+            || !spec.matches(&body)
+        {
+            return None;
+        }
+        Some(RawSlotReader {
+            body: Arc::downgrade(&body),
+            slot: spec.slot,
+            primitive: spec.primitive,
+            helpers: spec.helpers,
+        })
+    });
+    Some((function, proof, raw_reader))
 }
 
 fn compile_and_reify_lambda_inner(
@@ -35083,3 +35114,6 @@ mod native_ash_selection_tests;
 
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 mod native_string_aref_tests;
+
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+mod raw_slot_reader_tests;
