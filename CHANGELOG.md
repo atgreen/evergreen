@@ -407,6 +407,10 @@
 
 ### Changed
 
+- Avoid redundant rational normalization and unit-denominator arithmetic for
+  exact integer addition, subtraction, multiplication and comparison
+  ([#930](https://github.com/atgreen/evergreen/pull/930)).
+
 - Read each function's call-site counters directly when preparing T2 compilation,
   avoiding scans of unrelated profiles
   ([#925](https://github.com/atgreen/evergreen/pull/925)).
