@@ -22,7 +22,7 @@ fn cons(car: EgclVal, cdr: EgclVal) -> EgclVal {
             cdr: *cdr,
         });
     }
-    // SAFETY: `body` points to the initialized CONS payload written above.
+    // SAFETY: the typed CONS allocation was initialized immediately above.
     unsafe { EgclVal::from_cons_ptr(body) }
 }
 
