@@ -232,3 +232,56 @@ fn native_constructor_mixed_live_heap_values_survive_gc_stress_and_fallback() {
     }
     assert_eq!(results[0], results[1]);
 }
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn native_filled_bit_constructor_reaches_public_fast_storage_under_gc() {
+    let program = r#"(progn
+      (declaim (notinline native-filled-bit-array))
+      (defun native-filled-bit-array (n)
+        (let ((array (make-array n :element-type 'bit))) array))
+      (dotimes (i 150)
+        (let ((array (native-filled-bit-array 64)))
+          (assert (typep array 'simple-bit-vector))
+          (assert (= (length array) 64))
+          (assert (every #'zerop array))))
+      (assert (egcl::%make-simple-array 64 '(:element-type bit :initial-element 0)))
+      (write-line "NATIVE-FILLED-BIT-OK"))"#;
+    let mut results = Vec::new();
+    for stress in [false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_egcl"));
+        command
+            .env("EGCL_LAZY_COMPILE", "0")
+            .env("EGCL_FORCE_TIER", "t2")
+            .env("EGCL_T2_THREADS", "1")
+            .env("EGCL_T2_LOG", "stderr")
+            .env("EGCL_NATIVE_ARRAY_CONSTRUCTOR_STATS", "1")
+            .env_remove("EGCL_DISABLE_NATIVE_ARRAY_CONSTRUCTOR")
+            .args(["--no-init", "--eval", program]);
+        if stress {
+            command
+                .env("EGCL_GC_STRESS", "17")
+                .env("EGCL_GC_STRESS_AFTER_INIT", "1")
+                .env("EGCL_GC_POISON", "1");
+        }
+        let output = command.output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        assert!(stdout.contains("NATIVE-FILLED-BIT-OK"), "{stdout}");
+        assert!(stderr.lines().any(|line| line.contains("NATIVE-FILLED-BIT-ARRAY: optimized worker result installed with ordinary x86-64 Lisp T2 ABI")), "{stderr}");
+        assert!(
+            stderr.lines().any(|line| {
+                line.contains("[native-array-constructor] lowered ")
+                    && line.ends_with("NATIVE-FILLED-BIT-ARRAY sites=1")
+            }),
+            "native BIT constructor site was not emitted: {stderr}"
+        );
+        assert!(
+            stderr.contains("[native-array-constructor] fallback count=1"),
+            "the actual native adapter must reach the public BIT constructor: {stderr}"
+        );
+        results.push(stdout);
+    }
+    assert_eq!(results[0], results[1]);
+}

@@ -2593,7 +2593,8 @@ Returns NIL."
 
 (defun make-array (dimensions &rest keys)
   ;; A vector of fixnum length with at most :ELEMENT-TYPE and :INITIAL-ELEMENT,
-  ;; whose element type upgrades to T, is built natively without the option
+  ;; whose element type upgrades to T/U8, or is canonical BIT with a fill,
+  ;; is built natively without the option
   ;; parsing below; %MAKE-SIMPLE-ARRAY returns NIL for every other request.
   (let ((vector (egcl::%make-simple-array dimensions keys)))
     (when vector

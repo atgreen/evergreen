@@ -433,6 +433,24 @@ pub fn build_filled_simple_vector(len: usize, fill: EgclVal) -> EgclVal {
     build_vector(&vals)
 }
 
+/// Build simple bit storage with a validated uniform initializer.
+pub fn build_filled_bit_vector(len: usize, fill: EgclVal) -> Result<EgclVal, EgclError> {
+    let bit = if fill.is_fixnum() && matches!(fill.as_fixnum(), 0 | 1) {
+        fill.as_fixnum() as u8
+    } else {
+        return Err(EgclError::TypeError {
+            datum: fill,
+            expected: "BIT".into(),
+        });
+    };
+    // Only the scalar bit survives the final Lisp allocation. Avoid the
+    // temporary Lisp list formerly constructed by MAKE-ARRAY for each bit.
+    let mut bits = Vec::new();
+    bits.try_reserve_exact(len).map_err(|_| EgclError::Oom)?;
+    bits.resize(len, bit);
+    Ok(egcl_rt::types::make_bit_vector(&bits))
+}
+
 /// Build fresh bit storage from validated portable bit values.
 pub fn build_bit_vector_from_bits(bits: &[u8]) -> Result<EgclVal, EgclError> {
     if let Some(&bit) = bits.iter().find(|&&bit| bit > 1) {

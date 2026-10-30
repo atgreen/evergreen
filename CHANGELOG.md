@@ -383,6 +383,10 @@
 
 ### Changed
 
+- Construct filled simple bit vectors through the MAKE-ARRAY fast path, avoiding
+  repeated keyword scans and temporary lists of bits
+  ([#919](https://github.com/atgreen/evergreen/pull/919)).
+
 - AArch64 T2 right-shifts a one-limb bignum natively instead of calling the
   runtime, so `(ASH x -n)` over bignums costs 15x less — down from 48x the
   price of a fixnum shift to 3x
