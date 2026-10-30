@@ -26,6 +26,10 @@
 
 ### Fixed
 
+- Compile local `RETURN-FROM` and `GO` exits across catches and special
+  bindings natively while preserving multiple values and outer dynamic scopes
+  ([#936](https://github.com/atgreen/evergreen/pull/936)).
+
 - Schedule private-closure reclamation from tracked live Rust allocation growth,
   with pressure diagnostics and a fallback for untracked hosts
   ([#935](https://github.com/atgreen/evergreen/pull/935)).
