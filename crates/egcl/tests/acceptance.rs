@@ -968,8 +968,8 @@ fn copy_seq_and_subseq_of_string_are_fresh_and_mutable() {
 #[test]
 fn get_properties_and_nsubst_keywords() {
     // GET-PROPERTIES returns (indicator value tail) for the first PLIST indicator
-    // EQ to one in the list, else (nil nil nil). NSUBST must forward
-    // :key/:test/:test-not to SUBST (it dropped them). ansi-test CONS; bliss-30be.
+    // EQ to one in the list, else (nil nil nil). NSUBST must honor
+    // :key/:test/:test-not. ansi-test CONS; bliss-30be.
     let expr = "(princ (list
                   (multiple-value-list (get-properties '(a b c d) '(c)))
                   (multiple-value-list (get-properties '(a b) '(x)))
