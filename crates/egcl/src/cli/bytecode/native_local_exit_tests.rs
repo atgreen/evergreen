@@ -51,7 +51,7 @@ fn observe() {
 struct Recording;
 impl Drop for Recording {
     fn drop(&mut self) {
-        root_publication::OBSERVE.with(|hook| hook.set(None));
+        root_publication::PROFILE_OBSERVE.with(|hook| hook.set(None));
         ROOTS.with(|roots| roots.set(None));
         OWNER.with(|owner| owner.set(0));
     }
@@ -77,7 +77,7 @@ fn return_source(values: &str) -> String {
                 (catch tag
                   (let ((*native-local-state* inner))
                     (if throwp (throw tag {values}) (return-from done {values})))))
-            (throw tag (cons (+ number 1) (list a b c *native-local-state*)))))))"
+            (throw tag (cons (+ (car number) 1) (list a b c *native-local-state*)))))))"
     )
 }
 
@@ -94,7 +94,7 @@ fn local_exit_ir_retains_original_scope_identity_and_refuses_other_unwinds() {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     egcl_rt::rooted!(env = Env::new(false));
-    crate::cli::read_eval_all_env("(defvar *native-local-state* nil)", &mut env).unwrap();
+    crate::cli::read_eval_all_env("(setq *native-local-state* nil)", &mut env).unwrap();
     let body = fixture_body(
         &env,
         "LOCAL-EXIT-IR",
@@ -174,7 +174,7 @@ fn mapped_local_return_restores_catches_bindings_and_values_after_actual_gc_and_
         .unwrap_or_else(|e| e.into_inner());
     assert!(egcl_rt::native_transfer::is_supported());
     egcl_rt::rooted!(env = Env::new(false));
-    crate::cli::read_eval_all_env("(defvar *native-local-state* nil)", &mut env).unwrap();
+    crate::cli::read_eval_all_env("(setq *native-local-state* nil)", &mut env).unwrap();
     let state = resolve_sym("*NATIVE-LOCAL-STATE*")
         .unwrap()
         .as_symbol_index();
@@ -204,17 +204,11 @@ fn mapped_local_return_restores_catches_bindings_and_values_after_actual_gc_and_
             };
             assert_eq!(code.is_t2, tier2);
             // Initialize entry/call storage before creating the moving payload.
+            egcl_rt::rooted!(warm_number = crate::cli::arena_cons(EgclVal::from_fixnum(7), NIL));
             run_native(
                 &code,
                 symbol,
-                &[
-                    NIL,
-                    NIL,
-                    NIL,
-                    EgclVal::from_fixnum(991),
-                    NIL,
-                    EgclVal::from_fixnum(7),
-                ],
+                &[NIL, NIL, NIL, EgclVal::from_fixnum(991), NIL, *warm_number],
                 &mut env,
             )
             .unwrap();
@@ -227,6 +221,7 @@ fn mapped_local_return_restores_catches_bindings_and_values_after_actual_gc_and_
             egcl_rt::rooted!(marker = crate::cli::arena_cons(EgclVal::from_fixnum(701), NIL));
             egcl_rt::rooted!(outer = crate::cli::arena_cons(EgclVal::from_fixnum(702), NIL));
             egcl_rt::rooted!(inner = crate::cli::arena_cons(EgclVal::from_fixnum(703), NIL));
+            egcl_rt::rooted!(number_cell = crate::cli::arena_cons(EgclVal::from_fixnum(7), NIL));
             egcl_rt::symbols::set_symbol_value(state, *marker);
             OWNER.with(|v| v.set(owner(&code)));
             STATE.with(|v| v.set(state));
@@ -234,7 +229,7 @@ fn mapped_local_return_restores_catches_bindings_and_values_after_actual_gc_and_
             MOVED.with(|v| v.set(false));
             VISITS.with(|v| v.set(0));
             let _recording = Recording;
-            root_publication::OBSERVE.with(|hook| hook.set(Some(observe)));
+            root_publication::PROFILE_OBSERVE.with(|hook| hook.set(Some(observe)));
             for throwing in [false, true] {
                 native_transfer_entry::local_exits::COMPLETED.with(|v| v.set(0));
                 let before_deopts = deopt_count();
@@ -248,7 +243,7 @@ fn mapped_local_return_restores_catches_bindings_and_values_after_actual_gc_and_
                             *inner,
                             EgclVal::from_fixnum(991),
                             if throwing { T } else { NIL },
-                            EgclVal::from_fixnum(7)
+                            *number_cell
                         ],
                         &mut env
                     )
@@ -291,10 +286,12 @@ fn mapped_local_return_restores_catches_bindings_and_values_after_actual_gc_and_
                 "physical owner publication required"
             );
             if tier2 {
-                // Disprove only the arithmetic after the committed local exit.
+                // The arithmetic operand comes from a heap read after the
+                // committed exit, so its numeric guard cannot move to entry.
                 // Recovery must not execute that exit twice or revive its catch.
                 egcl_rt::rooted!(wide = egcl_rt::bignum::alloc_bignum_cli(1, &[0, 1 << 36]));
                 egcl_rt::rooted!(expected = egcl_rt::bignum::alloc_bignum_cli(1, &[1, 1 << 36]));
+                egcl_rt::rooted!(wide_cell = crate::cli::arena_cons(*wide, NIL));
                 let before = deopt_count();
                 native_transfer_entry::local_exits::COMPLETED.with(|v| v.set(0));
                 egcl_rt::rooted!(
@@ -307,7 +304,7 @@ fn mapped_local_return_restores_catches_bindings_and_values_after_actual_gc_and_
                             *inner,
                             EgclVal::from_fixnum(991),
                             NIL,
-                            *wide
+                            *wide_cell
                         ],
                         &mut env
                     )
@@ -337,7 +334,7 @@ fn mapped_local_go_removes_inner_catch_and_special_without_losing_outer_scopes()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     egcl_rt::rooted!(env = Env::new(false));
-    crate::cli::read_eval_all_env("(defvar *native-local-state* nil)", &mut env).unwrap();
+    crate::cli::read_eval_all_env("(setq *native-local-state* nil)", &mut env).unwrap();
     let _mapped = native_transfer_entry::MappedOnlyForTest::new();
     let source = "((declare (special *native-local-state*))
       (catch tag
@@ -375,7 +372,7 @@ fn mapped_local_go_removes_inner_catch_and_special_without_losing_outer_scopes()
         ROOTS.with(|v| v.set(None));
         VISITS.with(|v| v.set(0));
         let _recording = Recording;
-        root_publication::OBSERVE.with(|hook| hook.set(Some(observe)));
+        root_publication::PROFILE_OBSERVE.with(|hook| hook.set(Some(observe)));
         native_transfer_entry::local_exits::COMPLETED.with(|v| v.set(0));
         let before = deopt_count();
         egcl_rt::rooted!(
