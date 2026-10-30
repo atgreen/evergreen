@@ -143,6 +143,7 @@ fn lexical_leaf_native_reads_writes_and_shadowing() {
     env.frame = Arc::new(SharedCell::new(EnvFrame {
         vars: super::super::super::VecMap::default(),
         symbol_vars: super::super::super::VecMap::default(),
+        function_vars: super::super::super::VecMap::default(),
         parent: Some(Arc::clone(&parent)),
     }));
     env.define_local_symbol(symbol, EgclVal::from_fixnum(22));
@@ -340,6 +341,7 @@ fn lexical_identity_keys_preserve_native_leaf_and_published_store_semantics() {
     env.frame = Arc::new(SharedCell::new(EnvFrame {
         vars: super::super::super::VecMap::default(),
         symbol_vars: super::super::super::VecMap::default(),
+        function_vars: super::super::super::VecMap::default(),
         parent: Some(Arc::clone(&parent)),
     }));
     env.define_local_symbol(*left, EgclVal::from_fixnum(33));

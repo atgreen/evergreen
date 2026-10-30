@@ -206,6 +206,29 @@ pub(super) fn restore(
             }
             let params_form = EgclVal::from_raw(remap(reader.u64()?));
             let body = EgclVal::from_raw(remap(reader.u64()?));
+            // Older source closures stored a printed function name. Their
+            // implicit BLOCK retains the original symbol, so migrate only that
+            // exact definition-site spelling, never a runtime lookup alias.
+            let name = if body.is_cons() {
+                let first = cp(body).0;
+                if first.is_cons() {
+                    let (operator, tail) = cp(first);
+                    if operator.is_symbol() && sym_name(operator) == "BLOCK" && tail.is_cons() {
+                        let original = cp(tail).0;
+                        if original.is_symbol() && name == sym_name(original) {
+                            lexical_function_name_key(original)
+                        } else {
+                            name
+                        }
+                    } else {
+                        name
+                    }
+                } else {
+                    name
+                }
+            } else {
+                name
+            };
             let def_funs = reference(&scopes, reader.u32()?)?;
             let defining_frame = reference(frames, reader.u32()?)?;
             let closure_ref = if reader.flag()? {

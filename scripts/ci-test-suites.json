@@ -41,6 +41,7 @@
     "egcl-compiler:test:defstruct_macroexpand_gc": [""],
     "egcl-compiler:test:derived_environment_gc": [""],
     "egcl:test:octet_word_store_tiers": [""],
+    "egcl:test:same_named_local_functions_cli": [""],
     "egcl:test:same_named_uninterned_cli": [""],
     "egcl:test:struct_function_declaration_cli": [""],
     "egcl:test:deftype_symbol_identity_cli": [""],

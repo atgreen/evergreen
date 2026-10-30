@@ -453,6 +453,7 @@ mod tests {
         let frame = Arc::new(SharedCell::new(EnvFrame {
             vars: Default::default(),
             symbol_vars: Default::default(),
+            function_vars: Default::default(),
             parent: None,
         }));
         frame

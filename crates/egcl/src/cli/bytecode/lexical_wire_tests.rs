@@ -206,3 +206,106 @@ fn portable_control_names_require_strings_without_lexical_key_decoding() {
         }
     }
 }
+
+#[test]
+fn function_name_wire_remaps_symbols_and_preserves_namespace_separation() {
+    let _lock = super::super::heap_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    egcl_rt::rooted!(first = egcl_rt::symbols::make_uninterned("MATCH-BODY"));
+    egcl_rt::rooted!(second = egcl_rt::symbols::make_uninterned("MATCH-BODY"));
+    let mut pool = BbuConstPool::default();
+    egcl_rt::rooted_ref!(_pool = &mut pool);
+    let variable_ref = pool.lexical_name(&var_name(*first)).unwrap();
+    let first_ref = pool
+        .lexical_name(&closure_fn_binding_key(&var_name(*first)))
+        .unwrap();
+    let second_ref = pool
+        .lexical_name(&closure_fn_binding_key(&var_name(*second)))
+        .unwrap();
+    assert_eq!(first_ref & !BBU_FUNCTION_NAME_REF, variable_ref);
+    assert_ne!(first_ref, second_ref);
+    let constants = parsed(&pool);
+    egcl_rt::rooted!(values = materialize_bbu_constants(&constants).unwrap());
+    let variable = bbu_lexical_key_from_values(&values, variable_ref, 0x0303).unwrap();
+    let function = bbu_lexical_key_from_values(&values, first_ref, 0x0303).unwrap();
+    assert_eq!(
+        lexical_identity::function_base(&function),
+        Some(variable.as_str())
+    );
+    assert_ne!(lexical_identity::owned_symbol(&function), Some(*first));
+    assert!(lexical_identity::symbol_index(&function).is_none());
+    assert!(validate_bbu_lexical_name(&constants, first_ref, 0x0302).is_err());
+    assert!(validate_bbu_parameter_name(&constants, first_ref, 0x0303).is_err());
+    assert!(validate_bbu_parameter_name(&constants, variable_ref, 0x0303).is_ok());
+    for bad in [BBU_FUNCTION_NAME_REF | constants.len() as u32, u32::MAX] {
+        assert!(validate_bbu_lexical_name(&constants, bad, 0x0303).is_err());
+    }
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    env.define_lexical_local(&variable, EgclVal::from_fixnum(3));
+    env.define_lexical_local(&function, EgclVal::from_fixnum(4));
+    assert!(env.funs.borrow().is_empty());
+    let macro_env = super::super::macroexpand_environment_from_cli(&env);
+    assert!(matches!(
+        macro_env.function_information(lexical_identity::owned_symbol(&function).unwrap()),
+        Some(compiler_macroexpand::FunctionInfo::Lexical)
+    ));
+    assert!(
+        macro_env
+            .function_information(values[(second_ref & !BBU_FUNCTION_NAME_REF) as usize])
+            .is_none()
+    );
+    assert_eq!(
+        Env::lookup_lexical_frame(&env.frame, &variable),
+        Some(EgclVal::from_fixnum(3))
+    );
+    assert_eq!(
+        Env::lookup_lexical_frame(&env.frame, &function),
+        Some(EgclVal::from_fixnum(4))
+    );
+    assert!(Env::set_lexical_frame(
+        &env.frame,
+        &function,
+        EgclVal::from_fixnum(5)
+    ));
+    assert_eq!(
+        Env::lookup_lexical_frame(&env.frame, &variable),
+        Some(EgclVal::from_fixnum(3))
+    );
+}
+
+#[test]
+fn reserved_function_namespace_spelling_is_an_ordinary_variable_on_wire() {
+    let _lock = super::super::heap_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let spelling = "\0egcl-lexical:function:G";
+    let variable = lexical_identity::ordinary(spelling);
+    let function = lexical_identity::function("G");
+    assert_ne!(variable, function);
+    let mut pool = BbuConstPool::default();
+    egcl_rt::rooted_ref!(_pool = &mut pool);
+    let reference = pool.lexical_name(&variable).unwrap();
+    assert_eq!(reference & BBU_FUNCTION_NAME_REF, 0);
+    let constants = parsed(&pool);
+    egcl_rt::rooted!(values = materialize_bbu_constants(&constants).unwrap());
+    assert_eq!(
+        bbu_lexical_key_from_values(&values, reference, 0x0303).unwrap(),
+        variable
+    );
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    env.define_lexical_local(&variable, EgclVal::from_fixnum(11));
+    env.define_lexical_local(&function, EgclVal::from_fixnum(22));
+    let frozen = super::super::freeze_env_frame(&env.frame);
+    let thawed = super::super::thaw_env_frame(&frozen);
+    assert_eq!(
+        Env::lookup_lexical_frame(&thawed, &variable),
+        Some(EgclVal::from_fixnum(11))
+    );
+    assert_eq!(
+        Env::lookup_lexical_frame(&thawed, &function),
+        Some(EgclVal::from_fixnum(22))
+    );
+}

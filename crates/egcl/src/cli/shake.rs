@@ -181,7 +181,7 @@ fn bytecode_references_with_params(
     }
     refs.extend(function.load_time_values.iter().map(|(_, value)| *value));
     for (key, _) in &function.param_layout {
-        if let Some(symbol) = super::lexical_identity::symbol(key) {
+        if let Some(symbol) = super::lexical_identity::owned_symbol(key) {
             refs.push(symbol);
         }
     }
@@ -192,7 +192,7 @@ fn bytecode_references_with_params(
             if let Some(symbol) = function
                 .names
                 .get(*index as usize)
-                .and_then(|key| super::lexical_identity::symbol(key))
+                .and_then(|key| super::lexical_identity::owned_symbol(key))
             {
                 refs.push(symbol);
             }

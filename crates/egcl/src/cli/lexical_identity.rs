@@ -7,6 +7,18 @@ use super::*;
 const PREFIX: &str = "\0egcl-lexical:";
 const SYMBOL: &str = "\0egcl-lexical:symbol:";
 const NAME: &str = "\0egcl-lexical:name:";
+const FUNCTION: &str = "\0egcl-lexical:function:";
+
+/// A function cell is distinct from the variable denoted by the same symbol.
+/// The inner key keeps exactly the existing symbol/name identity encoding.
+/// Ordinary names that resemble this namespace are escaped by `ordinary`.
+pub(super) fn function(key: &str) -> String {
+    format!("{FUNCTION}{key}")
+}
+
+pub(super) fn function_base(key: &str) -> Option<&str> {
+    key.strip_prefix(FUNCTION)
+}
 
 /// Escape ordinary names that overlap the private encoding, including names
 /// containing NUL. Global function/operator names never pass through this API.
@@ -49,8 +61,16 @@ pub(super) fn symbol(key: &str) -> Option<EgclVal> {
     symbol_index(key).map(EgclVal::from_symbol_index)
 }
 
+/// Symbol ownership for either namespace; never use for variable lookup.
+pub(super) fn owned_symbol(key: &str) -> Option<EgclVal> {
+    symbol(function_base(key).unwrap_or(key))
+}
+
 pub(super) fn trace(key: &str, visit: &mut dyn FnMut(*mut EgclVal)) {
-    if let Some(index) = symbol_index(key) {
+    // Runtime variable lookup intentionally does not unwrap function keys.
+    // Only the ownership/wire paths may inspect their inner symbol identity.
+    let base = function_base(key).unwrap_or(key);
+    if let Some(index) = symbol_index(base) {
         egcl_rt::symbols::trace_symbol_index(index, visit);
     }
 }
@@ -64,5 +84,6 @@ pub(super) fn index(key: &str) -> Option<u32> {
 }
 
 pub(super) fn resolve(key: &str) -> Option<EgclVal> {
-    symbol(key).or_else(|| resolve_sym(name(key)))
+    let base = function_base(key).unwrap_or(key);
+    symbol(base).or_else(|| resolve_sym(name(base)))
 }
