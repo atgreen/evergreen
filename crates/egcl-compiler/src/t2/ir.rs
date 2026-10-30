@@ -566,6 +566,13 @@ pub enum AuxData {
         bcp: u32,
         enter: bool,
     },
+    /// A local RETURN-FROM/GO whose original ScopeExit removes only local
+    /// special bindings and catches beside unregistered blocks/tagbodies.
+    /// The published helper commits the removals before the native branch;
+    /// the retained BCP and its cold FrameState remain unchanged.
+    DirectExit {
+        bcp: u32,
+    },
     /// Execution-local symbol value access through the published bridge.
     GlobalValue {
         symbol: u32,
