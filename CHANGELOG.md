@@ -26,6 +26,10 @@
 
 ### Fixed
 
+- Keep simple base and wide string `AREF` reads in x86-64 native code,
+  avoiding repeated deoptimization in string-heavy functions
+  ([#928](https://github.com/atgreen/evergreen/pull/928)).
+
 - Make `NSUBST`, `NSUBST-IF`, and `NSUBST-IF-NOT` modify existing tree cells,
   preserving retained aliases used by compiler passes and other callers
   ([#929](https://github.com/atgreen/evergreen/pull/929)).
