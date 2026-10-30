@@ -50,6 +50,7 @@
     "egcl-rt:test:canonical_symbol_properties": [""],
     "egcl-rt:test:nil_array_storage": [""],
     "egcl-rt:test:bigrat_integer_arithmetic": [""],
+    "egcl-rt:test:bignum_ratio_gc": [""],
     "egcl-stdlib:test:nil_arrays": [""],
     "egcl:test:nil_element_arrays_cli": [""],
     "egcl-rt:test:random_state_leaf": [""],
