@@ -1313,6 +1313,7 @@ The most user-relevant environment variables are:
 | --- | --- |
 | `EGCL_WORKERS` | Default scheduler-group carrier count |
 | `EGCL_STACK_SIZE` | Per-fiber CL stack size |
+| `EGCL_STACK_OVERFLOW_DIAGNOSTICS` | `1` enables failure-only stack-guard origin and scalar diagnostics on stderr |
 | `EGCL_MAX_FIBERS` | Fiber limit; legacy `EGCL_MAX_THREADS` is accepted |
 | `EGCL_PINNED_BLOCKING_ACTION` | `WARN`, `ERROR`, or `NIL`/`NATIVE` policy |
 | `EGCL_T0_T1_THRESHOLD` | T0 to T1 invocation threshold |

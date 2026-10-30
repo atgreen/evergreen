@@ -1931,6 +1931,12 @@ impl BootEvalDepthGuard {
         BOOT_EVAL_DEPTH.with(|depth| {
             let next = depth.get() + 1;
             if next > MAX_BOOT_EVAL_DEPTH {
+                crate::stack::report_stack_overflow(
+                    "bootstrap-evaluator-depth",
+                    0,
+                    Some(next),
+                    None,
+                );
                 let execution = crate::thread::current_fiber_id().unwrap_or_else(|| {
                     crate::thread::FiberId(crate::thread::current_thread_id().0)
                 });

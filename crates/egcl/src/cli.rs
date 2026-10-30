@@ -1146,10 +1146,13 @@ fn pending_signal_error_for_current_execution() -> Option<EgclError> {
             datum: NIL,
             expected: "non-null object reference".into(),
         }),
-        egcl_rt::PendingSignal::StackGuard => Some(EgclError::StackOverflow(
-            egcl_rt::current_fiber_id()
-                .unwrap_or_else(|| egcl_rt::FiberId(egcl_rt::current_thread_id().0)),
-        )),
+        egcl_rt::PendingSignal::StackGuard => {
+            egcl_rt::stack::report_stack_overflow("stack-guard-signal-cli", 0, None, None);
+            Some(EgclError::StackOverflow(
+                egcl_rt::current_fiber_id()
+                    .unwrap_or_else(|| egcl_rt::FiberId(egcl_rt::current_thread_id().0)),
+            ))
+        }
         egcl_rt::PendingSignal::Pipe => Some(EgclError::StreamError("broken pipe".into())),
         egcl_rt::PendingSignal::Interrupt => Some(EgclError::Interrupt),
         egcl_rt::PendingSignal::Timeout => Some(EgclError::Timeout),
@@ -44648,6 +44651,7 @@ struct CallDepthGuard;
 impl CallDepthGuard {
     fn enter() -> Result<Self, EgclError> {
         if egcl_rt::host_stack_budget_exhausted() {
+            egcl_rt::stack::report_stack_overflow("host-budget", 0, None, None);
             return Err(EgclError::StackOverflow(
                 egcl_rt::current_fiber_id()
                     .unwrap_or_else(|| egcl_rt::FiberId(egcl_rt::current_thread_id().0)),
@@ -44657,6 +44661,7 @@ impl CallDepthGuard {
         if limit != 0 {
             let depth = CALL_DEPTH.with(|d| d.get()) + 1;
             if depth > limit {
+                egcl_rt::stack::report_stack_overflow("numeric-call-depth", 0, Some(depth), None);
                 return Err(EgclError::StackOverflow(
                     egcl_rt::current_fiber_id()
                         .unwrap_or_else(|| egcl_rt::FiberId(egcl_rt::current_thread_id().0)),

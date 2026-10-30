@@ -179,6 +179,12 @@ impl EgclStack {
         let frame_bytes = header + num_slots as usize * std::mem::size_of::<EgclVal>();
         let end = start.checked_add(frame_bytes)?;
         if end > self.capacity {
+            report_stack_overflow(
+                "managed-frame",
+                frame_bytes,
+                None,
+                Some((self.used(), self.capacity())),
+            );
             return None;
         }
 
@@ -529,6 +535,38 @@ pub fn host_stack_budget_exhausted() -> bool {
             .unwrap_or(budget);
         recorded - probe > budget
     })
+}
+
+/// Opt-in diagnostics from an already-failed stack guard, in normal Rust
+/// context only. Never call from a signal handler or a successful admission.
+/// This does not allocate Lisp objects, walk frames, change limits, or capture
+/// a backtrace. `depth` is supplied only when that guard owns an exact counter.
+#[cold]
+pub fn report_stack_overflow(
+    origin: &'static str,
+    requested_bytes: usize,
+    depth: Option<usize>,
+    managed: Option<(usize, usize)>,
+) {
+    if std::env::var_os("EGCL_STACK_OVERFLOW_DIAGNOSTICS").as_deref()
+        != Some(std::ffi::OsStr::new("1"))
+    {
+        return;
+    }
+    use std::io::Write;
+    let probe = 0usize;
+    let address = std::hint::black_box(&probe) as *const usize as usize;
+    let host_used = HOST_STACK_BASE.with(|base| {
+        let base = base.get();
+        (base != 0).then(|| base.saturating_sub(address))
+    });
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "[stack-overflow] origin={origin} managed_used={:?} managed_capacity={:?} requested_bytes={requested_bytes} depth={depth:?} host_used_approx={host_used:?} configured_host_budget={}",
+        managed.map(|snapshot| snapshot.0),
+        managed.map(|snapshot| snapshot.1),
+        eval_stack_budget()
+    );
 }
 
 /// Round `n` up to the next multiple of `align` (a power of two).
