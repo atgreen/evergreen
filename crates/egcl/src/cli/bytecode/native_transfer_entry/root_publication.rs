@@ -72,6 +72,9 @@ pub(super) struct PublishedBoundary {
     /// chains and cannot ask them for their current stack.
     pub(super) stack: *const egcl_rt::stack::EgclStack,
     pub(super) previous: *mut PublishedBoundary,
+    /// Where this native segment belongs among tree-walked/T0 caller guards.
+    /// Integers only; sampling resolves code names after the physical walk.
+    profile_shadow_depth: usize,
     /// Root slots the collector reached through this boundary's own frames.
     #[cfg(test)]
     pub(super) visited: Cell<usize>,
@@ -90,6 +93,13 @@ pub(in super::super) type ObserveHook = Option<fn()>;
 #[cfg(test)]
 pub(in super::super) static OBSERVE: egcl_rt::execution_local::ExecutionLocal<Cell<ObserveHook>> =
     unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| Cell::new(None)) };
+
+/// Profiler fixture hook at every actual publication, including ordinary
+/// helpers whose generated loop polls do not consult the mapped-only observer.
+#[cfg(test)]
+pub(in super::super) static PROFILE_OBSERVE: egcl_rt::execution_local::ExecutionLocal<
+    Cell<ObserveHook>,
+> = unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| Cell::new(None)) };
 
 /// Test observer after runtime poll work drains, while native roots remain
 /// published and before OSR preparation or generated-request refresh.
@@ -397,6 +407,7 @@ unsafe fn publish_with<R>(
     SCANNER.call_once(|| {
         egcl_rt::gc::register_root_scanner(scan_published_roots);
         egcl_rt::debug_stack::install_native_backtrace_provider(copy_native_backtrace);
+        crate::cli::sprof::install_native_frames(copy_profile_frames);
     });
     let context = context.unwrap_or_else(|| CAPTURE.with(Cell::get));
     let segment = native_transfer::current_segment();
@@ -453,6 +464,7 @@ unsafe fn publish_with<R>(
         code._native_calls.value_map(offset).is_some(),
         "native publication PC must have an exact value map"
     );
+    let profile_depth = crate::cli::sprof::enabled().then(crate::cli::sprof::shadow_depth);
     let mut boundary = PublishedBoundary {
         owner,
         root_owner,
@@ -463,6 +475,7 @@ unsafe fn publish_with<R>(
         segment,
         stack: egcl_rt::current_stack(),
         previous: ACTIVE.with(Cell::get),
+        profile_shadow_depth: profile_depth.unwrap_or(0),
         #[cfg(test)]
         visited: Cell::new(0),
     };
@@ -472,6 +485,13 @@ unsafe fn publish_with<R>(
     );
     ACTIVE.with(|slot| slot.set(&mut boundary));
     let _linked = Linked(&mut boundary);
+    #[cfg(test)]
+    if let Some(observe) = PROFILE_OBSERVE.with(Cell::get) {
+        observe();
+    }
+    if profile_depth.is_some() {
+        crate::cli::sprof::maybe_sample();
+    }
     let result = body();
     #[cfg(test)]
     ordinary_calls::YIELD_AFTER_RETURN_TO_OWNER.with(|target| {
@@ -1067,6 +1087,43 @@ unsafe fn walk_boundary_frames_to(
         }
         cursor = step.caller;
     }
+}
+
+/// Copy immutable owners through the same bounded physical-frame walker used
+/// by GC/backtraces. The mutator is at a published boundary: no Lisp allocation,
+/// safepoint or callback runs while native pointers are inspected. Strings are
+/// Rust-owned copies; interning them happens after every directory borrow ends.
+fn copy_profile_frames() -> crate::cli::sprof::NativeFrames {
+    const LIMIT: usize = 256;
+    let mut groups = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut boundary = ACTIVE.with(Cell::get);
+    while !boundary.is_null() && seen.len() < LIMIT {
+        let published = unsafe { &*boundary };
+        let mut frames = Vec::new();
+        unsafe {
+            walk_boundary_frames(published, false, &mut |code, _, _, _, body_sp, _| {
+                if seen.len() < LIMIT
+                    && let Some(body_sp) = body_sp
+                    && seen.insert(body_sp)
+                {
+                    frames.push((
+                        code.body.name.clone(),
+                        if code.is_t2 {
+                            crate::cli::sprof::T2
+                        } else {
+                            crate::cli::sprof::T1
+                        },
+                    ));
+                }
+                0
+            });
+        }
+        frames.reverse();
+        groups.push((published.profile_shadow_depth, frames));
+        boundary = published.previous;
+    }
+    groups
 }
 
 /// Copy logical calls only while exact native publications are live. This shares
@@ -2985,6 +3042,7 @@ mod tests {
             // visit nothing, but GC must still relocate the native aliases
             // this test's executing frame will compare and reload later.
             previous: real,
+            profile_shadow_depth: 0,
             visited: Cell::new(0),
         };
         let past_the_code = code.code.as_ptr() as usize + code.code_len;

@@ -19,8 +19,8 @@
 //! or touches GC state.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 /// Execution tier a shadow frame was entered at (low 3 bits of a packed frame).
 pub const TREEWALK: u8 = 0;
@@ -45,6 +45,92 @@ static NAMES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static NAME_IDS: Mutex<Option<HashMap<String, u32>>> = Mutex::new(None);
 /// Each recorded sample is a bottom→top stack of packed frames.
 static SAMPLES: Mutex<Vec<Box<[u32]>>> = Mutex::new(Vec::new());
+
+/// Native frames are copied only at a cooperative sampling point. Each group
+/// starts at its boundary's shadow depth and lists native calls outermost first.
+/// The provider copies immutable code metadata, never Lisp values or arguments.
+pub(crate) type NativeFrames = Vec<(usize, Vec<(String, u8)>)>;
+static NATIVE_FRAMES: OnceLock<fn() -> NativeFrames> = OnceLock::new();
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub(crate) fn install_native_frames(provider: fn() -> NativeFrames) {
+    let _ = NATIVE_FRAMES.set(provider);
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[inline]
+pub(crate) fn pending() -> bool {
+    enabled() && PENDING.load(Ordering::Relaxed)
+}
+
+/// Integer-only insertion point for a published native segment. No lookup or
+/// name allocation occurs on a normal native helper entry.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[inline]
+pub(crate) fn shadow_depth() -> usize {
+    if enabled() {
+        SHADOW.with(|s| s.borrow().len())
+    } else {
+        0
+    }
+}
+
+/// Preserve the T0 caller while a CallNamed instruction enters Rust/native
+/// code. Its inline bytecode activations otherwise have no shadow guards.
+pub(crate) struct BytecodeCall(usize);
+impl BytecodeCall {
+    #[inline]
+    pub(crate) fn enter(symbols: impl Iterator<Item = u32>) -> Self {
+        if !enabled() {
+            return Self(0);
+        }
+        let frames: Vec<_> = symbols
+            .map(|sym| (name_id_for_sym(sym) << 3) | u32::from(T0))
+            .collect();
+        let count = frames.len();
+        SHADOW.with(|s| s.borrow_mut().extend(frames));
+        let call = Self(count);
+        maybe_sample();
+        call
+    }
+}
+impl Drop for BytecodeCall {
+    fn drop(&mut self) {
+        if self.0 != 0 {
+            SHADOW.with(|s| {
+                let mut s = s.borrow_mut();
+                let len = s.len();
+                s.truncate(len - self.0);
+            });
+        }
+    }
+}
+
+fn record(mut stack: Vec<u32>) {
+    if let Some(provider) = NATIVE_FRAMES.get() {
+        let mut groups = provider();
+        // Provider visits inner boundaries first. Stable sorting after reversal
+        // retains physical call order when two boundaries share a shadow depth.
+        groups.reverse();
+        groups.sort_by_key(|(depth, _)| *depth);
+        let shadow_len = stack.len();
+        let mut inserted = 0;
+        for (depth, frames) in groups {
+            let at = depth.min(shadow_len) + inserted;
+            let packed: Vec<_> = frames
+                .into_iter()
+                .map(|(name, tier)| (intern(&name) << 3) | u32::from(tier))
+                .collect();
+            inserted += packed.len();
+            stack.splice(at..at, packed);
+        }
+    }
+    if !stack.is_empty()
+        && let Ok(mut samples) = SAMPLES.lock()
+    {
+        samples.push(stack.into_boxed_slice());
+    }
+}
 
 /// The active Lisp call chain, bottom→top; each entry is `(name_id<<3)|tier`.
 static SHADOW: egcl_rt::execution_local::ExecutionLocal<std::cell::RefCell<Vec<u32>>> = unsafe {
@@ -132,14 +218,8 @@ pub fn maybe_sample() {
     if !enabled() || !PENDING.swap(false, Ordering::Relaxed) {
         return;
     }
-    SHADOW.with(|s| {
-        let s = s.borrow();
-        if !s.is_empty() {
-            if let Ok(mut samples) = SAMPLES.lock() {
-                samples.push(s.clone().into_boxed_slice());
-            }
-        }
-    });
+    let stack = SHADOW.with(|s| s.borrow().clone());
+    record(stack);
 }
 
 /// Sample when due, combining the tree-walked prefix (the shadow stack) with the
@@ -157,11 +237,7 @@ pub fn maybe_sample_stack(bytecode_syms: impl Iterator<Item = u32>) {
     for sym in bytecode_syms {
         stack.push((name_id_for_sym(sym) << 3) | u32::from(T0));
     }
-    if !stack.is_empty() {
-        if let Ok(mut samples) = SAMPLES.lock() {
-            samples.push(stack.into_boxed_slice());
-        }
-    }
+    record(stack);
 }
 
 /// Begin recording at `hz` samples/second (clamped to a sane range). Clears any
@@ -178,7 +254,14 @@ pub fn start(hz: u32) {
     std::thread::spawn(move || {
         while ON.load(Ordering::Relaxed) {
             std::thread::sleep(period);
+            if !ON.load(Ordering::Relaxed) {
+                break;
+            }
             PENDING.store(true, Ordering::Relaxed);
+            // Generated native polls can skip Rust entirely when idle. Publish
+            // the sample request before arming their existing execution slots;
+            // no execution pointer, signal, GC request or new JIT flag is needed.
+            egcl_rt::execution_poll::request_all();
         }
     });
 }
@@ -186,6 +269,19 @@ pub fn start(hz: u32) {
 /// Stop recording (the sampler thread exits on its next tick).
 pub fn stop() {
     ON.store(false, Ordering::Relaxed);
+}
+
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+pub(crate) fn begin_for_test() {
+    SAMPLES.lock().unwrap().clear();
+    PENDING.store(false, Ordering::Relaxed);
+    ON.store(true, Ordering::Relaxed);
+}
+
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+pub(crate) fn request_for_test() {
+    PENDING.store(true, Ordering::Relaxed);
+    egcl_rt::execution_poll::request_all();
 }
 
 /// `EGCL_SPROF=<hz>` begins recording at startup (default 1000 Hz if the value

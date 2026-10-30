@@ -26,6 +26,10 @@
 
 ### Fixed
 
+- Include published native Lisp frames and their actual tiers in statistical
+  profiles, and sample call-free bytecode and native loops at cooperative polls
+  ([#931](https://github.com/atgreen/evergreen/pull/931)).
+
 - Keep simple base and wide string `AREF` reads in x86-64 native code,
   avoiding repeated deoptimization in string-heavy functions
   ([#928](https://github.com/atgreen/evergreen/pull/928)).

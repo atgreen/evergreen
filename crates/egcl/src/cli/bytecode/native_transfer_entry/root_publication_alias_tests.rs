@@ -80,6 +80,7 @@ fn observe_aliases() {
         segment: original.segment,
         stack: original.stack,
         previous: current,
+        profile_shadow_depth: original.profile_shadow_depth,
         visited: Cell::new(0),
     };
     ACTIVE.with(|slot| slot.set(&mut alias));

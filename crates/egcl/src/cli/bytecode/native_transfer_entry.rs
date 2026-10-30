@@ -4143,6 +4143,9 @@ unsafe extern "C" fn poll_or_transfer(
 /// A read-only preflight: all work that can park, yield, allocate, deliver a
 /// signal, or prepare OSR stays behind the existing root publication.
 fn idle_t2_poll(request: *mut u8) -> bool {
+    if crate::cli::sprof::pending() {
+        return false;
+    }
     // Preserve loop heat and every T1 OSR opportunity, including test hooks
     // that deliberately collect only after the native homes are published.
     if request as usize & 1 != 0 {
