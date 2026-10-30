@@ -4658,6 +4658,18 @@ impl<'e> Lowerer<'e> {
             || super::global_fn(name).is_some();
         let is_builtin = super::is_builtin_function(&bare) || PRIMITIVE_ALLOWLIST.contains(&name);
         if !is_user_fn && !is_builtin {
+            // The marker-owned initializer is deliberately retained. It is a
+            // qualified private builtin, not an opaque user/source evaluation;
+            // match its exact identity and zero-argument emitted instruction.
+            if !(self.method_context_initializing
+                && rest.is_nil()
+                && method_context_use::initializer_instruction(&Instr::CallNamed {
+                    sym: op.as_symbol_index(),
+                    nargs: 0,
+                }))
+            {
+                method_context_use::unknown();
+            }
             // Portable (BFASL) compilation represents a forward reference to a
             // not-yet-defined function directly: emit a named call that resolves
             // against the symbol's function cell at load/run time. Special
@@ -11046,6 +11058,8 @@ fn compile_function_forcing_boxed(
         }
     }
 
+    method_context_use::elide_helper_values(&mut function);
+
     Some(function)
 }
 
@@ -16207,6 +16221,9 @@ fn make_prepared_bytecode_closure(
         closure_envs().borrow_mut().insert(sym_idx, frame);
     }
     let closure = egcl_rt::function::alloc_interpreted(*lambda_list, NIL, NIL, *sym);
+    #[cfg(test)]
+    method_context_use::helper_values::record_creation(nested);
+
     closure_templates::remember(
         nested,
         closure_templates::Prepared {
@@ -35117,3 +35134,6 @@ mod native_string_aref_tests;
 
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 mod raw_slot_reader_tests;
+
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+mod method_helper_elision_tests;

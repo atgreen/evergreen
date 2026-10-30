@@ -26,6 +26,10 @@
 
 ### Fixed
 
+- Reduce allocation in eligible compiled methods by omitting unused lexical
+  continuation helpers while preserving runtime method context and callbacks
+  ([#943](https://github.com/atgreen/evergreen/pull/943)).
+
 - Speed up simple raw-slot reader methods, including MOP slot-definition
   readers, while preserving dynamic method and slot-access behavior
   ([#942](https://github.com/atgreen/evergreen/pull/942)).
