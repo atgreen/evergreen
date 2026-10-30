@@ -1,5 +1,6 @@
 {
   "fast": {
+    "egcl:test:thread_stack_size_cli": ["stack_origin_diagnostic_"],
     "egcl:bin:egcl": ["host_memory_tests::"],
     "egcl:test:host_pressure_closure_cli": [""],
     "egcl:test:string_aref_native_cli": [""],

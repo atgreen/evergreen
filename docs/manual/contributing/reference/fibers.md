@@ -201,10 +201,24 @@ The current Rust states are `Created`, `Runnable`, `Running`, `Suspended`,
 but does not replace synchronization. Joining removes the fiber's registry entry.
 
 `EGCL_STACK_SIZE` selects stack bytes (also accepting `k`, `m`, or `g` suffixes);
-the default is 4 MiB on Linux x86-64 and s390x, and 512 KiB elsewhere.
+the default is 4 MiB on Linux x86-64 and AArch64, and on s390x; it is
+512 KiB elsewhere.
 Linux x86-64 mapped native frames use this managed stack; s390x's larger native
 frames exhaust the machine stack reserve sooner and fall back to it.
 Unused pages are reserved virtually, not committed to resident memory.
+
+Set `EGCL_STACK_OVERFLOW_DIAGNOSTICS=1` to write a `[stack-overflow]` record
+to standard error when an existing stack guard fails. It identifies the guard
+and reports available usage, capacity, requested bytes, and depth snapshots.
+The flag preserves the normal error and `STORAGE-CONDITION` handling and does
+not change stack limits. Other values leave these diagnostics disabled.
+
+Managed usage and capacity come from the failing guard when available; missing
+snapshots print `None`. `host_used_approx` is an approximate recorded host-stack
+reference delta, not a frame count. `configured_host_budget` is the configured
+OS/environment budget before fiber-specific bounds and clamps, rather than the
+effective remaining stack space. Reporting runs outside signal handlers.
+
 Fibers have no automatic CPU time slice or CPU budget. Explicit yield requests
 are observed at runtime polls. CPU-bound fibers must cooperate if other fibers
 are to share their carriers; cancellation is a request, not forced termination.

@@ -20087,10 +20087,18 @@ fn pending_signal_error_for_current_execution() -> Option<EgclError> {
             datum: NIL,
             expected: "non-null object reference".into(),
         }),
-        egcl_rt::PendingSignal::StackGuard => Some(EgclError::StackOverflow(
-            egcl_rt::current_fiber_id()
-                .unwrap_or_else(|| egcl_rt::FiberId(egcl_rt::current_thread_id().0)),
-        )),
+        egcl_rt::PendingSignal::StackGuard => {
+            egcl_rt::stack::report_stack_overflow(
+                "stack-guard-signal-bytecode",
+                0,
+                Some(NATIVE_DEPTH.with(|depth| depth.get()) as usize),
+                None,
+            );
+            Some(EgclError::StackOverflow(
+                egcl_rt::current_fiber_id()
+                    .unwrap_or_else(|| egcl_rt::FiberId(egcl_rt::current_thread_id().0)),
+            ))
+        }
         egcl_rt::PendingSignal::Pipe => Some(EgclError::StreamError("broken pipe".into())),
         egcl_rt::PendingSignal::Interrupt => Some(EgclError::Interrupt),
         egcl_rt::PendingSignal::Timeout => Some(EgclError::Timeout),

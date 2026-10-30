@@ -84,3 +84,67 @@ fn rust_min_stack_still_raises_a_threads_stack() {
         "RUST_MIN_STACK=64 MiB left a thread at {large} deep (default {default})"
     );
 }
+
+// A deterministic small numeric limit exercises the real failure branch without
+// depending on the host frame size or exhausting its emergency stack reserve.
+const DIAGNOSTIC_PROGRAM: &str = r#"
+(defun origin-deep (n) (if (zerop n) 0 (1+ (origin-deep (1- n)))))
+(handler-case (progn (origin-deep 100000) (error "overflow did not fire"))
+  (storage-condition () (write-line "STACK-ORIGIN-CAUGHT")))
+"#;
+
+fn overflow_diagnostic(enabled: Option<&str>, managed: bool) -> String {
+    let mut command = Command::new("timeout");
+    command.args(["--kill-after=5", "60", env!("CARGO_BIN_EXE_egcl")]);
+    command.args(["--no-init", "--eval", DIAGNOSTIC_PROGRAM]);
+    command.env_remove("EGCL_STACK_OVERFLOW_DIAGNOSTICS");
+    command.env_remove("EGCL_MAX_EVAL_STACK_BYTES");
+    command.env_remove("EGCL_NATIVE_DEPTH_CAP");
+    command.env("EGCL_FORCE_TIER", if managed { "t0" } else { "interp" });
+    if managed {
+        command.env("EGCL_STACK_SIZE", "64k");
+        command.env_remove("EGCL_MAX_CALL_DEPTH");
+    } else {
+        command.env("EGCL_MAX_CALL_DEPTH", "32");
+        command.env_remove("EGCL_STACK_SIZE");
+    }
+    if let Some(value) = enabled {
+        command.env("EGCL_STACK_OVERFLOW_DIAGNOSTICS", value);
+    }
+    let output = command.output().expect("run actual overflow diagnostic");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert!(stdout.contains("STACK-ORIGIN-CAUGHT"), "{stdout}\n{stderr}");
+    stderr.into_owned()
+}
+
+#[test]
+fn stack_origin_diagnostic_reports_real_numeric_failure_only_when_enabled() {
+    let stderr = overflow_diagnostic(Some("1"), false);
+    assert!(
+        stderr.contains("[stack-overflow] origin=numeric-call-depth"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("depth=Some(33)"), "{stderr}");
+    assert!(stderr.contains("managed_capacity="), "{stderr}");
+    assert!(stderr.contains("host_budget="), "{stderr}");
+}
+
+#[test]
+fn stack_origin_diagnostic_is_silent_unless_explicitly_enabled() {
+    for flag in [None, Some("true"), Some("0")] {
+        let stderr = overflow_diagnostic(flag, false);
+        assert!(!stderr.contains("[stack-overflow]"), "{flag:?}: {stderr}");
+    }
+}
+
+#[test]
+fn stack_origin_diagnostic_reports_real_managed_frame_exhaustion() {
+    let stderr = overflow_diagnostic(Some("1"), true);
+    assert!(
+        stderr.contains("[stack-overflow] origin=managed-frame"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("managed_capacity=Some(65536)"), "{stderr}");
+}

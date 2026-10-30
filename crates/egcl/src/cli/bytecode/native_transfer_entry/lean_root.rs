@@ -209,6 +209,12 @@ impl TransferCode {
             .checked_sub(required)
             .is_none_or(|bottom| bottom as u64 <= unsafe { (*control).stack_limit })
         {
+            egcl_rt::stack::report_stack_overflow(
+                "native-admission",
+                required,
+                Some(NATIVE_DEPTH.with(|depth| depth.get()) as usize),
+                None,
+            );
             return Err(EgclError::StackOverflow(
                 egcl_rt::current_fiber_id()
                     .unwrap_or_else(|| egcl_rt::FiberId(egcl_rt::current_thread_id().0)),
