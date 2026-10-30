@@ -399,6 +399,10 @@
 
 ### Changed
 
+- Reduce ordinary native-call overhead by indexing retained callable checks by
+  code owner instead of scanning every retained descriptor
+  ([#922](https://github.com/atgreen/evergreen/pull/922)).
+
 - Construct filled simple bit vectors through the MAKE-ARRAY fast path, avoiding
   repeated keyword scans and temporary lists of bits
   ([#919](https://github.com/atgreen/evergreen/pull/919)).
