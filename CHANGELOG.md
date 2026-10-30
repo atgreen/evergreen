@@ -399,6 +399,10 @@
 
 ### Changed
 
+- Read each function's call-site counters directly when preparing T2 compilation,
+  avoiding scans of unrelated profiles
+  ([#925](https://github.com/atgreen/evergreen/pull/925)).
+
 - Reduce ordinary native-call overhead by indexing retained callable checks by
   code owner instead of scanning every retained descriptor
   ([#922](https://github.com/atgreen/evergreen/pull/922)).
