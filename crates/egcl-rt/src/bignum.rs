@@ -753,6 +753,11 @@ impl BigRat {
                 den: BigInt::one(),
             };
         }
+        // Integer arithmetic uses this rational representation too. A positive
+        // unit denominator is already reduced; avoid a multi-limb GCD/division.
+        if den.sign == 1 && den.mag == [1] {
+            return BigRat { num, den };
+        }
         let g = big_gcd(&num, &den);
         if big_cmp(&g, &BigInt::one()) != Ordering::Equal {
             num = big_divexact(&num, &g);
@@ -762,7 +767,7 @@ impl BigRat {
     }
 
     pub fn is_integer(&self) -> bool {
-        big_cmp(&self.den, &BigInt::one()) == Ordering::Equal
+        self.den.sign == 1 && self.den.mag == [1]
     }
 
     pub fn to_f64(&self) -> f64 {
@@ -863,16 +868,25 @@ pub fn bigrat_neg(a: &BigRat) -> BigRat {
     }
 }
 pub fn bigrat_add(a: &BigRat, b: &BigRat) -> BigRat {
+    if a.is_integer() && b.is_integer() {
+        return BigRat::from_bigint(big_add(&a.num, &b.num));
+    }
     let num = big_add(&big_mul(&a.num, &b.den), &big_mul(&b.num, &a.den));
     let den = big_mul(&a.den, &b.den);
     BigRat::new(num, den)
 }
 pub fn bigrat_sub(a: &BigRat, b: &BigRat) -> BigRat {
+    if a.is_integer() && b.is_integer() {
+        return BigRat::from_bigint(big_sub(&a.num, &b.num));
+    }
     let num = big_sub(&big_mul(&a.num, &b.den), &big_mul(&b.num, &a.den));
     let den = big_mul(&a.den, &b.den);
     BigRat::new(num, den)
 }
 pub fn bigrat_mul(a: &BigRat, b: &BigRat) -> BigRat {
+    if a.is_integer() && b.is_integer() {
+        return BigRat::from_bigint(big_mul(&a.num, &b.num));
+    }
     BigRat::new(big_mul(&a.num, &b.num), big_mul(&a.den, &b.den))
 }
 /// `a / b`; `b` must be nonzero (the caller checks for zero divisors).
@@ -880,6 +894,9 @@ pub fn bigrat_div(a: &BigRat, b: &BigRat) -> BigRat {
     BigRat::new(big_mul(&a.num, &b.den), big_mul(&a.den, &b.num))
 }
 pub fn bigrat_cmp(a: &BigRat, b: &BigRat) -> Ordering {
+    if a.is_integer() && b.is_integer() {
+        return big_cmp(&a.num, &b.num);
+    }
     // Denominators are positive, so comparing cross-products is order-preserving.
     big_cmp(&big_mul(&a.num, &b.den), &big_mul(&b.num, &a.den))
 }
