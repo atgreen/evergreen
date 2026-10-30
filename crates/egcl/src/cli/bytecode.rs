@@ -733,20 +733,93 @@ static PRIVATE_CLOSURE_MAJOR_BUDGET: std::sync::atomic::AtomicUsize =
 /// About 15 MB of side-table state at the ~0.9 KB a captured FLET costs.
 const MIN_PRIVATE_CLOSURE_MAJOR_BUDGET: usize = 16 * 1024;
 
+/// Net live Rust allocation growth allowed between host-pressure collections.
+/// The floor amortizes a collection over meaningful growth; the cap bounds
+/// additional requested bytes even when the existing host world is large.
+/// These are pressure heuristics, not limits on the Lisp heap or process RSS.
+const MIN_PRIVATE_HOST_GROWTH: usize = 16 * 1024 * 1024;
+const MAX_PRIVATE_HOST_GROWTH: usize = 128 * 1024 * 1024;
+
+struct PrivateHostPressure {
+    baseline: std::sync::atomic::AtomicUsize,
+}
+
+impl PrivateHostPressure {
+    const fn new() -> Self {
+        Self {
+            baseline: std::sync::atomic::AtomicUsize::new(usize::MAX),
+        }
+    }
+
+    fn reset_after_major(&self, live_bytes: usize) {
+        self.baseline
+            .store(live_bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn growth_requests_major(&self, live_bytes: usize) -> bool {
+        // A sweep still owns temporary collector storage, and background JIT
+        // allocations can disappear afterwards. Lower the watermark before
+        // checking growth, so such a spike cannot hide subsequent pressure.
+        let previous = self
+            .baseline
+            .fetch_min(live_bytes, std::sync::atomic::Ordering::Relaxed);
+        let baseline = previous.min(live_bytes);
+        let budget = (baseline / 2).clamp(MIN_PRIVATE_HOST_GROWTH, MAX_PRIVATE_HOST_GROWTH);
+        live_bytes.saturating_sub(baseline) >= budget
+    }
+
+    fn requests_major(
+        &self,
+        tracking_active: bool,
+        live_bytes: usize,
+        minted: usize,
+        count_budget: usize,
+    ) -> bool {
+        if tracking_active {
+            self.growth_requests_major(live_bytes)
+        } else {
+            // Library users need not install the CLI's tracking allocator.
+            minted >= count_budget
+        }
+    }
+}
+
+static PRIVATE_HOST_PRESSURE: PrivateHostPressure = PrivateHostPressure::new();
+
+#[cfg(test)]
+mod private_host_pressure_tests;
+
 /// Account for one newly published private closure identity (bliss-5ndk).
 ///
-/// Its function object is pinned, so minor collections promote it rather than
-/// free it, and its side-table entries are released only by
-/// [`sweep_function_captures`] during a major collection. Nothing else
-/// triggers that collection for host-side growth, so request one once the
-/// closures minted since the last sweep reach the budget. The budget tracks
-/// the survivors of the previous sweep, so a program that keeps many closures
-/// alive pays for each major collection with as many new ones.
+/// Private callable metadata is released by a major sweep. With the CLI host
+/// allocation ledger active, request that sweep from net live Rust requested
+/// bytes, rather than the number of callable identities. The count remains a
+/// diagnostic and the legacy pressure fallback for untracked library users.
+/// This only requests collection; the existing rooted preparation path decides
+/// when it is safe to collect. No allocator callback performs collection.
 fn note_private_closure_published() {
     use std::sync::atomic::Ordering;
     let minted = PRIVATE_CLOSURES_SINCE_MAJOR.fetch_add(1, Ordering::Relaxed) + 1;
-    if minted >= PRIVATE_CLOSURE_MAJOR_BUDGET.load(Ordering::Relaxed) {
+    let tracking_active = egcl_rt::host_memory::tracking_active();
+    let live_bytes = egcl_rt::host_memory::live_bytes();
+    let count_budget = PRIVATE_CLOSURE_MAJOR_BUDGET.load(Ordering::Relaxed);
+    if PRIVATE_HOST_PRESSURE.requests_major(tracking_active, live_bytes, minted, count_budget) {
         egcl_rt::gc::request_major_gc();
+        // Census output is diagnostic only. No logging or formatting occurs
+        // on the ordinary non-request path, and collection remains deferred.
+        if std::env::var_os("EGCL_GC_CENSUS").is_some() {
+            if tracking_active {
+                let baseline = PRIVATE_HOST_PRESSURE.baseline.load(Ordering::Relaxed);
+                let budget = (baseline / 2).clamp(MIN_PRIVATE_HOST_GROWTH, MAX_PRIVATE_HOST_GROWTH);
+                eprintln!(
+                    "[GC-CENSUS] request-major reason=host-bytes live={live_bytes} baseline={baseline} growth-budget={budget}"
+                );
+            } else {
+                eprintln!(
+                    "[GC-CENSUS] request-major reason=legacy-count minted={minted} count-budget={count_budget}"
+                );
+            }
+        }
     }
 }
 
@@ -763,6 +836,9 @@ fn sweep_function_captures(names: &[EgclVal]) {
         Ordering::Relaxed,
     );
     PRIVATE_CLOSURES_SINCE_MAJOR.store(0, Ordering::Relaxed);
+    if egcl_rt::host_memory::tracking_active() {
+        PRIVATE_HOST_PRESSURE.reset_after_major(egcl_rt::host_memory::live_bytes());
+    }
 }
 
 fn sweep_dead_function_captures(names: &[EgclVal]) {
