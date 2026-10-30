@@ -14,6 +14,10 @@ fn native_entry_is_mapped(code: &NativeCode) -> bool {
     };
     native.ordinary_entry.is_none()
 }
+fn request_ordinary_poll() {
+    let execution = egcl_rt::thread::current_execution_context_for_native().unwrap();
+    unsafe { &*execution }.request_yield();
+}
 fn observe() {
     if root_publication::published_frame_has_owner_for_test(OWNER.with(Cell::get)) {
         VISITS.with(|count| count.set(count.get() + 1));
@@ -22,7 +26,7 @@ fn observe() {
 struct Recording;
 impl Drop for Recording {
     fn drop(&mut self) {
-        root_publication::PROFILE_OBSERVE.with(|hook| hook.set(None));
+        root_publication::OBSERVE.with(|hook| hook.set(None));
     }
 }
 
@@ -50,7 +54,11 @@ fn generic_variable_ash_executes_in_ordinary_and_mapped_t2_without_deopt() {
             "NATIVE-VARIABLE-ASH",
             "(value count marker)",
             "((declare (type fixnum value count))
-              (let ((shifted (ash value count))) (cons shifted marker)))",
+              (let ((shifted (ash value count)) (n 0))
+                (tagbody again
+                  (setq n (+ n 1))
+                  (if (< n 2) (go again)))
+                (cons shifted marker)))",
             &mut env,
         );
         assert!(code.is_t2);
@@ -61,18 +69,21 @@ fn generic_variable_ash_executes_in_ordinary_and_mapped_t2_without_deopt() {
         OWNER.with(|owner| owner.set(Rc::as_ptr(native) as usize));
         VISITS.with(|count| count.set(0));
         let _recording = Recording;
-        root_publication::PROFILE_OBSERVE.with(|hook| hook.set(Some(observe)));
+        root_publication::OBSERVE.with(|hook| hook.set(Some(observe)));
         for (index, &(value, count)) in cases.iter().enumerate() {
             egcl_rt::rooted!(
-                result = run_native(
-                    &code,
-                    symbol,
-                    &[
-                        EgclVal::from_fixnum(value),
-                        EgclVal::from_fixnum(count),
-                        *marker
-                    ],
-                    &mut env
+                result = native_transfer_entry::with_ordinary_entry_hook_for_test(
+                    request_ordinary_poll,
+                    || run_native(
+                        &code,
+                        symbol,
+                        &[
+                            EgclVal::from_fixnum(value),
+                            EgclVal::from_fixnum(count),
+                            *marker
+                        ],
+                        &mut env,
+                    ),
                 )
                 .unwrap()
             );
@@ -87,7 +98,7 @@ fn generic_variable_ash_executes_in_ordinary_and_mapped_t2_without_deopt() {
         }
         assert!(
             VISITS.with(Cell::get) > 0,
-            "the retained ASH call must publish this actual T2 owner"
+            "the post-ASH poll must publish this actual T2 owner"
         );
         assert_eq!(native.deopt_count(), 0);
         for (name, form, large) in [
