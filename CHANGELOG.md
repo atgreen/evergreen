@@ -26,6 +26,10 @@
 
 ### Fixed
 
+- Reduce setup for repeated calls from mapped native code to eligible ordinary
+  T2 functions by reusing call state held by the caller
+  ([#939](https://github.com/atgreen/evergreen/pull/939)).
+
 - Repair the FFI manual link to the static-build instructions
   ([#938](https://github.com/atgreen/evergreen/pull/938)).
 
