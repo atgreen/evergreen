@@ -1921,6 +1921,7 @@ mod tests {
             let capture = Arc::new(SharedCell::new(EnvFrame {
                 vars: Default::default(),
                 symbol_vars: Default::default(),
+                function_vars: Default::default(),
                 parent: None,
             }));
             bind_boxed_param(&capture, "SEED", EgclVal::from_fixnum(1));

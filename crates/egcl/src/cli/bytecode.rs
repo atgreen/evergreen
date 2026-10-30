@@ -3156,6 +3156,9 @@ impl egcl_rt::gc::TraceHostRoots for InlineLocal {
             lexical_identity::trace(key, visit);
         }
         let mut seen = std::collections::HashSet::new();
+        for key in self.local_fns.keys().chain(self.closure_fns.iter()) {
+            lexical_identity::trace(key, visit);
+        }
         for &symbol in self.local_fns.values() {
             trace_private_function_roots(symbol, visit, &mut seen);
         }
@@ -3166,6 +3169,9 @@ struct PrivateFunctionRoots(HashMap<String, u32>);
 impl egcl_rt::gc::TraceHostRoots for PrivateFunctionRoots {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
         let mut seen = std::collections::HashSet::new();
+        for key in self.0.keys() {
+            lexical_identity::trace(key, visit);
+        }
         for &symbol in self.0.values() {
             trace_private_function_roots(symbol, visit, &mut seen);
         }
@@ -3175,6 +3181,9 @@ impl egcl_rt::gc::TraceHostRoots for PrivateFunctionRoots {
 struct InlineLocalRoots(HashMap<String, InlineLocal>);
 impl egcl_rt::gc::TraceHostRoots for InlineLocalRoots {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
+        for key in self.0.keys() {
+            lexical_identity::trace(key, visit);
+        }
         for helper in self.0.values_mut() {
             egcl_rt::gc::TraceHostRoots::trace_host_roots(helper, visit);
         }
@@ -3212,8 +3221,14 @@ impl egcl_rt::gc::TraceHostRoots for Lowerer<'_> {
         {
             lexical_identity::trace(key, visit);
         }
+        for key in self.local_fns.keys().chain(self.closure_fns.iter()) {
+            lexical_identity::trace(key, visit);
+        }
         for &symbol in self.local_fns.values() {
             trace_private_function_roots(symbol, visit, &mut seen);
+        }
+        for key in self.inline_local_fns.keys() {
+            lexical_identity::trace(key, visit);
         }
         for helper in self.inline_local_fns.values_mut() {
             egcl_rt::gc::TraceHostRoots::trace_host_roots(helper, visit);
@@ -3600,6 +3615,13 @@ impl<'e> Lowerer<'e> {
                 return Err(Bail);
             }
             let name = sym_name(op);
+            let lexical = super::lexical_function_name_key(op);
+            if self.local_fns.contains_key(&lexical)
+                || self.closure_fns.contains(&lexical)
+                || self.inline_local_fns.contains_key(&lexical)
+            {
+                return self.lower_call(&name, op, rest);
+            }
             match name.as_str() {
                 "QUOTE" => {
                     let (datum, _) = cp(rest);
@@ -4492,13 +4514,15 @@ impl<'e> Lowerer<'e> {
         // lowered sibling args out from under a plain Vec.
         egcl_rt::rooted_ref!(_op_root = &mut op);
         egcl_rt::rooted_ref!(_rest_root = &mut rest);
-        if self.inline_local_fns.contains_key(name)
-            || self.local_fns.contains_key(name)
-            || self.closure_fns.contains(name)
+        let lexical_name = super::lexical_function_name_key(op);
+        let local_name = lexical_name.as_str();
+        if self.inline_local_fns.contains_key(local_name)
+            || self.local_fns.contains_key(local_name)
+            || self.closure_fns.contains(local_name)
         {
             method_context_use::reference(name);
         }
-        if let Some(helper) = self.inline_local_fns.get(name).cloned()
+        if let Some(helper) = self.inline_local_fns.get(local_name).cloned()
             && !self_calls::notinline(op.as_symbol_index(), &self.inline_policies)
             && helper.can_inline_in(self)
         {
@@ -4506,7 +4530,7 @@ impl<'e> Lowerer<'e> {
         }
         // A lexically-visible local function (flet/labels): call its compiled
         // body directly by the gensym it is registered under.
-        if let Some(&sym) = self.local_fns.get(name) {
+        if let Some(&sym) = self.local_fns.get(local_name) {
             egcl_rt::rooted!(args = list_to_vec(rest));
             let nargs = args.len();
             if nargs > u16::MAX as usize {
@@ -4531,13 +4555,13 @@ impl<'e> Lowerer<'e> {
         // A capturing local function is a closure value in a boxed binding of its
         // name: `(fn args…)` calls it through `funcall`, which dispatches the
         // closure's registered bytecode (with its captured environment installed).
-        if self.closure_fns.contains(name) {
+        if self.closure_fns.contains(local_name) {
             // Load the closure from its FUNCTION-namespace binding and apply it.
             // Synthesizing `(funcall name …)` instead would resolve `name` as a
             // VARIABLE, which since bliss-7ex8 correctly looks past this binding
             // to the variable of the same name.
             let funcall = resolve_sym("FUNCALL").ok_or(Bail)?.as_symbol_index();
-            let ni = self.intern_name(&closure_fn_binding_key(name));
+            let ni = self.intern_name(&closure_fn_binding_key(local_name));
             self.emit(Instr::LoadEnvVar(ni));
             self.push_n(1);
             egcl_rt::rooted!(args = list_to_vec(rest));
@@ -7838,12 +7862,10 @@ impl<'e> Lowerer<'e> {
             self.scopes.iter().flat_map(|s| s.keys()).collect();
         let mut captured = Vec::new();
         for name in used {
-            if params.contains(&name) {
-                continue;
-            }
-            if enclosing.contains(&name) {
-                captured.push(name);
-                continue;
+            // A parameter shadows the variable, never the independent function
+            // cell denoted by the same symbol.
+            if !params.contains(&name) && enclosing.contains(&name) {
+                captured.push(name.clone());
             }
             // A visible local FUNCTION this closure calls is captured too — the
             // closure reaches it through the same heap frame. Its binding is keyed
@@ -8046,8 +8068,14 @@ impl<'e> Lowerer<'e> {
         }
         // `#'localfn` for a capturing flet/labels function is the closure value
         // itself, held in a heap binding of its name in the FUNCTION namespace.
-        if target.is_symbol() && self.closure_fns.contains(&sym_name(target)) {
-            let ni = self.intern_name(&closure_fn_binding_key(&sym_name(target)));
+        if target.is_symbol()
+            && self
+                .closure_fns
+                .contains(&super::lexical_function_name_key(target))
+        {
+            let ni = self.intern_name(&closure_fn_binding_key(&super::lexical_function_name_key(
+                target,
+            )));
             self.emit(Instr::LoadEnvVar(ni));
             self.push_n(1);
             return Ok(());
@@ -8109,12 +8137,12 @@ impl<'e> Lowerer<'e> {
         if inline_local_group(&list_to_vec(definitions), body) {
             let mut used = std::collections::HashSet::new();
             for definition in list_to_vec(definitions) {
-                collect_symbol_names(flet_def_forms(definition).1, &mut used);
+                collect_variable_names(flet_def_forms(definition).1, &mut used);
             }
             // Body macros can introduce escaping lambdas too. Reuse this
             // expansion for lowering before deciding that no runtime local
             // function binding is needed.
-            collect_symbol_names(body, &mut used);
+            collect_variable_names(body, &mut used);
             if used
                 .iter()
                 .any(|name| inline_local_macro_reference(self.env, name))
@@ -8148,7 +8176,8 @@ impl<'e> Lowerer<'e> {
         egcl_rt::rooted_ref!(_saved = &mut saved);
         for def in list_to_vec(cp(*rest).0) {
             if def.is_cons() && cp(def).0.is_symbol() {
-                self.inline_local_fns.remove(&sym_name(cp(def).0));
+                self.inline_local_fns
+                    .remove(&super::lexical_function_name_key(cp(def).0));
             }
         }
         let result = self.lower_flet_inner(*rest, is_labels);
@@ -8177,7 +8206,7 @@ impl<'e> Lowerer<'e> {
                 return Err(record_bail(|| "flet:non-symbol-name".to_string()));
             }
             // Capture the name before the allocating gensym below.
-            let name = sym_name(name_form);
+            let name = super::lexical_function_name_key(name_form);
             // A colon would be read as a package separator, so keep the gensym
             // name colon-free and unique.
             let gname = next_control_token("__FLET__").replace(':', "_");
@@ -8234,7 +8263,7 @@ impl<'e> Lowerer<'e> {
                 .collect();
             let mut used = std::collections::HashSet::new();
             for i in 0..defs.len() {
-                collect_symbol_names(flet_def_forms(defs[i]).1, &mut used);
+                collect_variable_names(flet_def_forms(defs[i]).1, &mut used);
             }
             // An existing boxed capture is addressed by name at runtime. A
             // call-site heap frame could shadow it, so preserve its definition
@@ -8394,7 +8423,7 @@ impl<'e> Lowerer<'e> {
     ) -> InlineLocalRoots {
         let mut helpers = HashMap::new();
         let mut body_names = std::collections::HashSet::new();
-        collect_symbol_names(body, &mut body_names);
+        collect_variable_names(body, &mut body_names);
         if body_names.contains("NOTINLINE") {
             return InlineLocalRoots(helpers);
         }
@@ -8406,7 +8435,7 @@ impl<'e> Lowerer<'e> {
                 continue;
             }
             let mut used = std::collections::HashSet::new();
-            collect_symbol_names(flet_def_forms(defs[index]).1, &mut used);
+            collect_variable_names(flet_def_forms(defs[index]).1, &mut used);
             if used.iter().any(|name| {
                 inline_local_macro_reference(self.env, name)
                     || self.closure_fns.contains(name)
@@ -8495,10 +8524,7 @@ impl<'e> Lowerer<'e> {
                 collect_variable_names(f, &mut used);
             }
             slot_captured.extend(used.into_iter().filter(|u| {
-                enclosing_slots.contains(u)
-                    && !enclosing_boxed.contains(u)
-                    && !params.contains(u)
-                    && !local_names.contains(u)
+                enclosing_slots.contains(u) && !enclosing_boxed.contains(u) && !params.contains(u)
             }));
         }
         if !slot_captured.is_empty() {
@@ -9582,11 +9608,7 @@ fn collect_variable_names(form: EgclVal, out: &mut std::collections::HashSet<Str
     collect_symbol_names_qq(form, out, 0, true);
 }
 
-fn collect_symbol_names(form: EgclVal, out: &mut std::collections::HashSet<String>) {
-    collect_symbol_names_qq(form, out, 0, false);
-}
-
-/// [`collect_symbol_names`] with quasiquote awareness (bliss-t9o1). `qq` is the
+/// [`collect_variable_names`] with quasiquote awareness (bliss-t9o1). `qq` is the
 /// quasiquote nesting depth. At depth 0 a QUOTE is opaque data — but inside a
 /// quasiquote template QUOTE does NOT stop substitution: `',x` reads as
 /// `(QUOTE (UNQUOTE X))`, and skipping it hid X from the free-variable scan.
@@ -9647,7 +9669,7 @@ fn references_local_fn_value(form: EgclVal, names: &std::collections::HashSet<St
     let (head, rest) = cp(form);
     if head.is_symbol() && sym_name(head) == "FUNCTION" && rest.is_cons() {
         let (arg, _) = cp(rest);
-        if arg.is_symbol() && names.contains(&sym_name(arg)) {
+        if arg.is_symbol() && names.contains(&super::lexical_function_name_key(arg)) {
             return true;
         }
     }
@@ -9666,13 +9688,16 @@ fn references_local_fn_value(form: EgclVal, names: &std::collections::HashSet<St
 /// bindings are keyed by variable name. Sharing the plain name let the closure
 /// OVERWRITE a variable of that name in that frame — `(flet ((f (x) (funcall f
 /// x))) …)` then funcalled itself instead of the variable, recursing until the
-/// control stack died. The `#'` prefix cannot be produced by a variable
-/// reference, so the two namespaces stay apart (bliss-7ex8).
+/// control stack died. The typed key addresses the separate function-cell
+/// namespace, including when a variable uses the same original symbol.
 fn closure_fn_binding_key(name: &str) -> String {
-    format!("#'{name}")
+    lexical_identity::function(name)
 }
 
 fn is_special_name(name: &str) -> bool {
+    if lexical_identity::function_base(name).is_some() {
+        return false;
+    }
     if let Some(symbol) = lexical_identity::symbol(name) {
         return super::is_special_var(symbol);
     }
@@ -10863,6 +10888,11 @@ fn compile_function_forcing_boxed(
     for name in captures {
         lo.scopes[0].insert(name.clone(), VarLoc::Boxed);
     }
+    lo.closure_fns.extend(
+        captures
+            .iter()
+            .filter_map(|key| lexical_identity::function_base(key).map(str::to_owned)),
+    );
     lo.has_env = !captures.is_empty();
     lo.captured_names = compute_captured_names(*body);
     // Names a previous attempt discovered were captured by a macro-revealed
@@ -11155,7 +11185,7 @@ fn inline_local_definition(def: EgclVal, names: &std::collections::HashSet<Strin
         return false;
     }
     let mut used = std::collections::HashSet::new();
-    collect_symbol_names(fbody, &mut used);
+    collect_variable_names(fbody, &mut used);
     if !names.is_disjoint(&used) {
         return false;
     }
@@ -11176,14 +11206,15 @@ fn inline_local_group(defs: &[EgclVal], body: EgclVal) -> bool {
         .iter()
         .filter_map(|&def| {
             let (name, _) = cp(def);
-            name.is_symbol().then(|| sym_name(name))
+            name.is_symbol()
+                .then(|| super::lexical_function_name_key(name))
         })
         .collect();
     if names.len() != defs.len() || references_local_fn_value(body, &names) {
         return false;
     }
     let mut used = std::collections::HashSet::new();
-    collect_symbol_names(body, &mut used);
+    collect_variable_names(body, &mut used);
     !used.contains("NOTINLINE") && defs.iter().all(|&def| inline_local_definition(def, &names))
 }
 
@@ -11483,7 +11514,9 @@ const BBU_MAGIC: &[u8; 4] = b"BBU\0";
 // 0x0301: variable environment operands/parameter keys may reference pooled
 // uninterned symbols, reconstructed with fresh identities on portable load.
 // 0x0302: length-only NIL array storage (tag 32).
-const BBU_BYTECODE_VERSION: u16 = 0x0302;
+// 0x0303: typed FUNCTION-namespace lexical-name references.
+const BBU_BYTECODE_VERSION: u16 = 0x0303;
+const BBU_FUNCTION_NAME_REF: u32 = 1 << 31;
 mod array_constants;
 mod make_load_form;
 #[cfg(test)]
@@ -11710,11 +11743,24 @@ impl BbuConstPool {
     }
 
     fn lexical_name(&mut self, key: &str) -> Option<u32> {
-        if let Some(symbol) = lexical_identity::symbol(key) {
-            self.value(symbol)
+        let function = lexical_identity::function_base(key);
+        let base = function.unwrap_or(key);
+        let reference = if let Some(symbol) = lexical_identity::symbol(base) {
+            self.value(symbol)?
         } else {
-            Some(self.string(lexical_identity::name(key)))
+            self.string(lexical_identity::name(base))
+        };
+        if reference >= BBU_FUNCTION_NAME_REF {
+            return None;
         }
+        Some(
+            reference
+                | if function.is_some() {
+                    BBU_FUNCTION_NAME_REF
+                } else {
+                    0
+                },
+        )
     }
 
     fn intern_encoded(&mut self, bytes: Vec<u8>) -> u32 {
@@ -14576,11 +14622,31 @@ fn bbu_string(constants: &[BbuConstant], index: u32) -> Result<&str, EgclError> 
     }
 }
 
+fn bbu_lexical_reference(reference: u32, version: u16) -> Result<(u32, bool), EgclError> {
+    let function = reference & BBU_FUNCTION_NAME_REF != 0;
+    if function && version < 0x0303 {
+        return Err(bbu_error("function namespace requires bytecode 3.3"));
+    }
+    Ok((reference & !BBU_FUNCTION_NAME_REF, function))
+}
+
+fn validate_bbu_parameter_name(
+    constants: &[BbuConstant],
+    reference: u32,
+    version: u16,
+) -> Result<(), EgclError> {
+    if bbu_lexical_reference(reference, version)?.1 {
+        return Err(bbu_error("parameter name has function namespace"));
+    }
+    validate_bbu_lexical_name(constants, reference, version)
+}
+
 fn validate_bbu_lexical_name(
     constants: &[BbuConstant],
     reference: u32,
     version: u16,
 ) -> Result<(), EgclError> {
+    let (reference, _) = bbu_lexical_reference(reference, version)?;
     match &constants[bbu_index(reference, constants.len(), "lexical name")?] {
         BbuConstant::String(_) => Ok(()),
         BbuConstant::UninternedSymbol(name) if version >= 0x0301 => {
@@ -15495,18 +15561,24 @@ fn bbu_lexical_key_from_values(
     reference: u32,
     version: u16,
 ) -> Result<String, EgclError> {
+    let (reference, function) = bbu_lexical_reference(reference, version)?;
     let value = constants[bbu_index(reference, constants.len(), "lexical name")?];
-    if value.is_string() {
-        return Ok(lexical_identity::ordinary(&val_as_str(value)));
-    }
-    if version >= 0x0301
+    let base = if value.is_string() {
+        lexical_identity::ordinary(&val_as_str(value))
+    } else if version >= 0x0301
         && value
             .symbol_index()
             .is_some_and(egcl_rt::symbols::is_uninterned)
     {
-        return Ok(var_name(value));
-    }
-    Err(bbu_error("invalid lexical name constant"))
+        var_name(value)
+    } else {
+        return Err(bbu_error("invalid lexical name constant"));
+    };
+    Ok(if function {
+        lexical_identity::function(&base)
+    } else {
+        base
+    })
 }
 
 fn decode_bbu_function(
@@ -16795,6 +16867,7 @@ fn frame_capture_names(frame: Arc<SharedCell<EnvFrame>>) -> std::collections::Ha
                 .map(|&index| var_name(EgclVal::from_symbol_index(index)))
                 .filter(|name| !is_special_name(name)),
         );
+        captures.extend(frame.function_vars.keys().cloned());
         current = frame.parent.clone();
     }
     captures
@@ -16815,7 +16888,7 @@ fn closure_expansion_ignores_functions(lambda_list: EgclVal, body: EgclVal, env:
     let mut pending = vec![(lambda_list, true, false), (body, false, false)];
     let mut seen = std::collections::HashSet::new();
     while let Some((form, datum, expression)) = pending.pop() {
-        if form.is_symbol() && names.contains(&sym_name(form)) {
+        if form.is_symbol() && names.contains(&super::lexical_function_name_key(form)) {
             return false;
         }
         if form.is_cons() && seen.insert((form.0, datum, expression)) {
@@ -18320,7 +18393,7 @@ fn load_bbu_definitions(
                 return Err(bbu_error("macro function has no lambda-list metadata"));
             }
             for &(name_ref, location, _) in &metadata.params {
-                validate_bbu_lexical_name(&encoded_constants, name_ref, bytecode_version)?;
+                validate_bbu_parameter_name(&encoded_constants, name_ref, bytecode_version)?;
                 match location {
                     VarLoc::Slot(slot) if slot < function.n_locals => {}
                     VarLoc::Boxed if metadata.has_env => {}
@@ -19305,6 +19378,7 @@ fn make_env_frame(
     let frame = Arc::new(SharedCell::new(EnvFrame {
         vars: super::VecMap::default(),
         symbol_vars: super::VecMap::default(),
+        function_vars: super::VecMap::default(),
         parent: Some(parent),
     }));
     Some(frame)
@@ -19317,6 +19391,7 @@ fn push_env_child(env_frame: &mut Option<Arc<SharedCell<EnvFrame>>>) {
     *env_frame = Some(Arc::new(SharedCell::new(EnvFrame {
         vars: super::VecMap::default(),
         symbol_vars: super::VecMap::default(),
+        function_vars: super::VecMap::default(),
         parent,
     })));
 }
@@ -22191,6 +22266,7 @@ extern "C" fn c2i_push_env_child() {
         *slot.borrow_mut() = Some(Arc::new(SharedCell::new(EnvFrame {
             vars: super::VecMap::default(),
             symbol_vars: super::VecMap::default(),
+            function_vars: super::VecMap::default(),
             parent,
         })));
     });
@@ -34217,6 +34293,7 @@ mod active_bytecode_root_tests {
         let captured = Arc::new(SharedCell::new(EnvFrame {
             vars: Default::default(),
             symbol_vars: Default::default(),
+            function_vars: Default::default(),
             parent: None,
         }));
         let weak_capture = Arc::downgrade(&captured);

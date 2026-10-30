@@ -33,6 +33,7 @@ pub(super) fn closure(body: &Arc<BytecodeFunction>, value: EgclVal, env: &mut En
     construction.frame = Arc::new(SharedCell::new(EnvFrame {
         vars: crate::cli::VecMap::default(),
         symbol_vars: crate::cli::VecMap::default(),
+        function_vars: crate::cli::VecMap::default(),
         parent: None,
     }));
     egcl_rt::rooted_ref!(_construction = &mut construction);

@@ -90,6 +90,7 @@ fn native_names_preserve_shadowing_late_interning_and_renames() {
     env.frame = Arc::new(SharedCell::new(EnvFrame {
         vars: super::super::VecMap::default(),
         symbol_vars: super::super::VecMap::default(),
+        function_vars: super::super::VecMap::default(),
         parent: Some(Arc::clone(&outer)),
     }));
     env.frame

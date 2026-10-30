@@ -401,7 +401,7 @@ fn ordinary_encoded_capture_keys_preserve_identity_and_move_published_store() {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     egcl_rt::rooted!(env = Env::new(false));
-    for escaped in [false, true] {
+    for (escaped, function_namespace) in [(false, false), (true, false), (false, true)] {
         egcl_rt::rooted!(
             target = if escaped {
                 EgclVal::from_symbol_index(egcl_rt::symbols::intern("\0egcl-lexical:symbol:999"))
@@ -415,8 +415,17 @@ fn ordinary_encoded_capture_keys_preserve_identity_and_move_published_store() {
             )
         );
         assert_ne!(*target, *other);
-        let key = lexical_identity::key(*target);
-        let other_key = lexical_identity::key(*other);
+        let variable_key = lexical_identity::key(*target);
+        let key = if function_namespace {
+            lexical_identity::function(&variable_key)
+        } else {
+            variable_key.clone()
+        };
+        let other_key = if function_namespace {
+            lexical_identity::function(&lexical_identity::key(*other))
+        } else {
+            lexical_identity::key(*other)
+        };
         assert!(lexical_identity::encoded(&key));
         egcl_rt::rooted!(params = reader::read_from_string("(next)").unwrap().0);
         egcl_rt::rooted!(
@@ -428,29 +437,38 @@ fn ordinary_encoded_capture_keys_preserve_identity_and_move_published_store() {
         );
         egcl_rt::rooted!(forms = crate::cli::vec_to_list(&[*assignment, *target]));
         let empty = std::collections::HashSet::new();
-        let captures = std::collections::HashSet::from([key.clone()]);
-        let body = Arc::new(
-            compile_function_in(
-                "ORDINARY-ENCODED-CAPTURE",
-                *params,
-                *forms,
-                &env,
-                &HashMap::new(),
-                false,
-                false,
-                &empty,
-                &empty,
-                &empty,
-                &captures,
-                None,
-            )
-            .unwrap(),
-        );
+        let captures = std::collections::HashSet::from([variable_key.clone()]);
+        let mut compiled = compile_function_in(
+            "ORDINARY-ENCODED-CAPTURE",
+            *params,
+            *forms,
+            &env,
+            &HashMap::new(),
+            false,
+            false,
+            &empty,
+            &empty,
+            &empty,
+            &captures,
+            None,
+        )
+        .unwrap();
+        if function_namespace {
+            // Exercise the identical generated Env load/store instructions with
+            // the typed FUNCTION-cell operand used by capturing FLET/LABELS.
+            for name in &mut compiled.names {
+                if name == &variable_key {
+                    *name = key.clone();
+                }
+            }
+        }
+        let body = Arc::new(compiled);
         egcl_rt::rooted!(_body = ActiveBytecodeRoot::new(&body));
         let mut construction = env.child();
         construction.frame = Arc::new(SharedCell::new(EnvFrame {
             vars: crate::cli::VecMap::default(),
             symbol_vars: crate::cli::VecMap::default(),
+            function_vars: crate::cli::VecMap::default(),
             parent: None,
         }));
         egcl_rt::rooted_ref!(_construction = &mut construction);

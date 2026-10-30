@@ -1700,6 +1700,16 @@ fn local_setf_writer(env: &Env, place_name: &str) -> Option<(EgclVal, EgclVal)> 
         .map(|(_, fdef)| (fdef.params_form, fdef.body))
 }
 
+/// Identity for lexical function bindings only. Global DEFUN/GF/SETF tables
+/// retain their existing public name keys and symbol-cell lookup behavior.
+fn lexical_function_name_key(name_form: EgclVal) -> String {
+    if name_form.is_symbol() {
+        lexical_identity::key(name_form)
+    } else {
+        lexical_identity::ordinary(&function_name_key(name_form))
+    }
+}
+
 fn function_name_key(name_form: EgclVal) -> String {
     if name_form.is_cons() {
         let (head, tail) = cp(name_form);
@@ -2056,7 +2066,11 @@ fn named_call_target(
     // lexical FLET/LABELS locals, and a symbol designator must not see them
     // (bliss-c1dr). Globals live in the symbol table and GLOBAL_SETF_FNS below,
     // so skipping this map loses nothing else.
-    if !skip_lexical && let Some(fdef) = env.funs.borrow().get(name) {
+    let lexical_name = sym_idx
+        .map(EgclVal::from_symbol_index)
+        .map(lexical_function_name_key)
+        .unwrap_or_else(|| name.to_owned());
+    if !skip_lexical && let Some(fdef) = env.funs.borrow().get(&lexical_name) {
         return Some(NamedCallTarget::Body {
             params: fdef.params_form,
             body: fdef.body,
@@ -2670,6 +2684,10 @@ impl<K: PartialEq, V> VecMap<K, V> {
     fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
         self.entries.iter().map(|(k, v)| (k, v))
     }
+    #[inline]
+    fn iter_mut(&mut self) -> impl Iterator<Item = (&K, &mut V)> {
+        self.entries.iter_mut().map(|(key, value)| (&*key, value))
+    }
 }
 
 impl<'a, K, V> IntoIterator for &'a VecMap<K, V> {
@@ -2854,6 +2872,7 @@ impl<T> SharedCell<T> {
 struct EnvFrame {
     vars: VecMap<String, EgclVal>,
     symbol_vars: VecMap<u32, EgclVal>,
+    function_vars: VecMap<String, EgclVal>,
     parent: Option<Arc<SharedCell<EnvFrame>>>,
 }
 
@@ -2868,6 +2887,7 @@ struct EnvFrame {
 struct FrozenEnvFrame {
     vars: Mutex<VecMap<String, EgclVal>>,
     symbol_vars: Mutex<VecMap<u32, EgclVal>>,
+    function_vars: Mutex<VecMap<String, EgclVal>>,
     parent: Option<Arc<FrozenEnvFrame>>,
 }
 
@@ -3767,7 +3787,7 @@ type HostMacroRecord = (String, u64, u64, u32);
 
 fn host_serialize_registries() -> Vec<u8> {
     let mut out = Vec::new();
-    out.extend_from_slice(b"HREG");
+    out.extend_from_slice(b"HRG2");
     // Assign the CLSR frame ids HERE rather than inside the CLSR block below,
     // because the macro and method records are written first and each needs the
     // id of the frame it captured. Root sources: tree-walker closures, the
@@ -4128,6 +4148,11 @@ fn host_serialize_registries() -> Vec<u8> {
                 out.extend_from_slice(&idx.to_le_bytes());
                 out.extend_from_slice(&v.to_raw().to_le_bytes());
             }
+            out.extend_from_slice(&(fb.function_vars.len() as u32).to_le_bytes());
+            for (key, value) in &fb.function_vars {
+                hr_put_str(&mut out, key);
+                out.extend_from_slice(&value.to_raw().to_le_bytes());
+            }
             let parent_id = fb
                 .parent
                 .as_ref()
@@ -4418,11 +4443,14 @@ fn u8_to_method_combination(b: u8) -> Option<egcl_stdlib::MethodCombinationType>
 /// Rust `Vec`s (no EGCL allocation), so it is GC-safe. The CLI later drains the
 /// buffers against the fresh root frame.
 fn host_restore_registries(data: &[u8]) -> Result<(), EgclError> {
-    if data.len() < 4 || &data[..4] != b"HREG" {
+    if data.len() < 4 || !matches!(&data[..4], b"HREG" | b"HRG2") {
         return Err(EgclError::InvalidImage(
             "host registry section: bad marker".into(),
         ));
     }
+    // Image16 HREG frames have no separate function namespace. Their old
+    // bytecode string keys still use vars; do not reinterpret those strings.
+    let has_function_vars = &data[..4] == b"HRG2";
     let mut off = 4usize;
     let remap = egcl_rt::gc::remap_saved_pointer;
     // Macros count (u32).
@@ -4767,6 +4795,7 @@ fn host_restore_registries(data: &[u8]) -> Result<(), EgclError> {
                 Arc::new(SharedCell::new(EnvFrame {
                     vars: VecMap::default(),
                     symbol_vars: VecMap::default(),
+                    function_vars: VecMap::default(),
                     parent: None,
                 }))
             })
@@ -4785,6 +4814,23 @@ fn host_restore_registries(data: &[u8]) -> Result<(), EgclError> {
                 let idx = hr_get_u32(data, &mut off).ok_or_else(bad)?;
                 let v = hr_get_u64(data, &mut off).ok_or_else(bad)?;
                 fb.symbol_vars.insert(idx, EgclVal::from_raw(remap(v)));
+            }
+            if has_function_vars {
+                let count = hr_get_u32(data, &mut off).ok_or_else(bad)? as usize;
+                for _ in 0..count {
+                    let key = hr_get_str(data, &mut off).ok_or_else(bad)?;
+                    if !lexical_identity::function_base(&key).is_some_and(|base| {
+                        lexical_identity::symbol_index(base).is_some()
+                            || lexical_identity::ordinary(lexical_identity::name(base)) == base
+                    }) {
+                        return Err(EgclError::InvalidImage(
+                            "invalid lexical function key".into(),
+                        ));
+                    }
+                    let value = hr_get_u64(data, &mut off).ok_or_else(bad)?;
+                    fb.function_vars
+                        .insert(key, EgclVal::from_raw(remap(value)));
+                }
             }
             drop(fb);
             parent_ids.push(hr_get_u32(data, &mut off).ok_or_else(bad)?);
@@ -4827,6 +4873,7 @@ fn host_restore_registries(data: &[u8]) -> Result<(), EgclError> {
                 Arc::new(SharedCell::new(EnvFrame {
                     vars: VecMap::default(),
                     symbol_vars: VecMap::default(),
+                    function_vars: VecMap::default(),
                     parent: None,
                 }))
             });
@@ -4913,6 +4960,7 @@ fn host_restore_registries(data: &[u8]) -> Result<(), EgclError> {
                     Arc::new(SharedCell::new(EnvFrame {
                         vars: VecMap::default(),
                         symbol_vars: VecMap::default(),
+                        function_vars: VecMap::default(),
                         parent: None,
                     }))
                 });
@@ -5661,17 +5709,19 @@ fn store_control_value(token: &str, value: EgclVal) {
 /// Only the global macro/compiler-macro registry bridge needs this; see
 /// [`FrozenEnvFrame`].
 fn freeze_env_frame(frame: &Arc<SharedCell<EnvFrame>>) -> Arc<FrozenEnvFrame> {
-    let (vars, symbol_vars, parent) = {
+    let (vars, symbol_vars, function_vars, parent) = {
         let borrowed = frame.borrow();
         (
             borrowed.vars.clone(),
             borrowed.symbol_vars.clone(),
+            borrowed.function_vars.clone(),
             borrowed.parent.clone(),
         )
     };
     Arc::new(FrozenEnvFrame {
         vars: Mutex::new(vars),
         symbol_vars: Mutex::new(symbol_vars),
+        function_vars: Mutex::new(function_vars),
         parent: parent.as_ref().map(freeze_env_frame),
     })
 }
@@ -5685,6 +5735,11 @@ fn thaw_env_frame(frame: &Arc<FrozenEnvFrame>) -> Arc<SharedCell<EnvFrame>> {
             .clone(),
         symbol_vars: frame
             .symbol_vars
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone(),
+        function_vars: frame
+            .function_vars
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone(),
@@ -10485,6 +10540,10 @@ fn visit_env_frame_roots(
         for value in frame.vars.values_mut() {
             visit(value as *mut EgclVal);
         }
+        for (key, value) in frame.function_vars.iter_mut() {
+            lexical_identity::trace(key, visit);
+            visit(value as *mut EgclVal);
+        }
         for &index in frame.symbol_vars.keys() {
             egcl_rt::symbols::trace_symbol_index(index, visit);
         }
@@ -10556,7 +10615,8 @@ fn visit_shared_fun_map_roots(
         if fun_map_scan_claimed(Arc::as_ptr(funs) as usize) {
             return;
         }
-        for def in map.values_mut() {
+        for (key, def) in map.iter_mut() {
+            lexical_identity::trace(key, visit);
             visit_fun_def_roots(def, state, visit);
         }
     }
@@ -10879,6 +10939,16 @@ fn visit_frozen_env_frame_roots(
             visit(value);
         }
     }
+    {
+        let mut functions = frame
+            .function_vars
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (key, value) in functions.iter_mut() {
+            lexical_identity::trace(key, visit);
+            visit(value);
+        }
+    }
     if let Some(parent) = &frame.parent {
         visit_frozen_env_frame_roots(parent, visited, visit);
     }
@@ -11074,7 +11144,8 @@ fn scan_evaluator_roots(visit: &mut dyn FnMut(*mut EgclVal), root_definitions: b
             visit(&mut capture.params_form);
             visit(&mut capture.body);
             visit_frozen_env_frame_roots(&capture.captured_frame, &mut frozen_frames, visit);
-            for definition in capture.funs.values_mut() {
+            for (key, definition) in capture.funs.iter_mut() {
+                lexical_identity::trace(key, visit);
                 visit_fun_def_roots(definition, state, visit);
             }
             for (&index, expansion) in capture.symbol_macros.iter_mut() {
@@ -11725,6 +11796,7 @@ impl Env {
             frame: Arc::new(SharedCell::new(EnvFrame {
                 vars: VecMap::default(),
                 symbol_vars: VecMap::default(),
+                function_vars: VecMap::default(),
                 parent: Some(Arc::clone(&self.frame)),
             })),
             funs: Arc::clone(&self.funs),
@@ -11759,6 +11831,7 @@ impl Env {
             frame: Arc::new(SharedCell::new(EnvFrame {
                 vars: VecMap::default(),
                 symbol_vars: VecMap::default(),
+                function_vars: VecMap::default(),
                 parent: Some(parent),
             })),
             funs: Arc::clone(&self.funs),
@@ -11992,6 +12065,13 @@ impl Env {
     }
 
     fn define_lexical_local(&mut self, key: &str, value: EgclVal) {
+        if lexical_identity::function_base(key).is_some() {
+            self.frame
+                .borrow_mut()
+                .function_vars
+                .insert(key.to_owned(), value);
+            return;
+        }
         if let Some(symbol) = lexical_identity::symbol(key) {
             self.define_local_symbol(symbol, value);
         } else {
@@ -12000,6 +12080,17 @@ impl Env {
     }
 
     fn lookup_lexical_frame(frame: &Arc<SharedCell<EnvFrame>>, key: &str) -> Option<EgclVal> {
+        if lexical_identity::function_base(key).is_some() {
+            let mut current = Some(Arc::clone(frame));
+            while let Some(frame) = current {
+                let frame = frame.borrow();
+                if let Some(value) = frame.function_vars.get(key) {
+                    return Some(*value);
+                }
+                current = frame.parent.clone();
+            }
+            return None;
+        }
         if let Some(index) = lexical_identity::symbol_index(key) {
             Self::lookup_symbol_frame(frame, index)
         } else {
@@ -12008,6 +12099,18 @@ impl Env {
     }
 
     fn set_lexical_frame(frame: &Arc<SharedCell<EnvFrame>>, key: &str, value: EgclVal) -> bool {
+        if lexical_identity::function_base(key).is_some() {
+            let mut current = Some(Arc::clone(frame));
+            while let Some(frame) = current {
+                let mut frame = frame.borrow_mut();
+                if frame.function_vars.contains_key(key) {
+                    frame.function_vars.insert(key.to_owned(), value);
+                    return true;
+                }
+                current = frame.parent.clone();
+            }
+            return false;
+        }
         if let Some(index) = lexical_identity::symbol_index(key) {
             Self::set_symbol_frame_var(frame, index, value)
         } else {
@@ -12016,6 +12119,13 @@ impl Env {
     }
 
     fn define_lexical_frame(frame: &Arc<SharedCell<EnvFrame>>, key: &str, value: EgclVal) {
+        if lexical_identity::function_base(key).is_some() {
+            frame
+                .borrow_mut()
+                .function_vars
+                .insert(key.to_owned(), value);
+            return;
+        }
         let index = lexical_identity::symbol_index(key);
         let name = lexical_identity::name(key);
         let ordinary_index = index.or_else(|| egcl_rt::symbols::find_index(name));
@@ -12270,6 +12380,7 @@ fn with_child_frame<T>(
     env.frame = Arc::new(SharedCell::new(EnvFrame {
         vars: VecMap::default(),
         symbol_vars: VecMap::default(),
+        function_vars: VecMap::default(),
         parent: Some(parent),
     }));
     let result = f(env);
@@ -21838,8 +21949,11 @@ fn symbol_function_object_ex(
     // `sym_name` called from this function (bliss-fyofj). Every helper below
     // takes `&str`, so nothing needs the copy.
     let fn_name = sym_name_rc(name_sym);
-    if !skip_lexical && let Some(c) = local_fn_closure(env, &fn_name) {
-        return Some(c);
+    if !skip_lexical {
+        let key = lexical_function_name_key(name_sym);
+        if let Some(c) = local_fn_closure(env, &key) {
+            return Some(c);
+        }
     }
     // Bytecode represents FUNCTION (SETF name) with the same synthetic name
     // used by generic writer calls. Ordinary writers keep their function cell
@@ -23490,8 +23604,9 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         // instead of resolving to a distinct undefined symbol (bliss-lb6).
         let name = {
             let raw = sym_name(car);
-            if env.funs.borrow().contains_key(&raw) {
-                raw
+            let lexical = lexical_function_name_key(car);
+            if env.funs.borrow().contains_key(&lexical) {
+                lexical
             } else if let Some(rest) = raw.strip_prefix("EGCL-EXT::") {
                 format!("EGCL-EXT:{rest}")
             } else if let Some(rest) = raw.strip_prefix("EGCL-INTERNAL::") {
@@ -23512,14 +23627,10 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         // A MACROLET macro lives in that same lexical namespace, so it still
         // wins — only a global macro yields to the binding.
         let shadowed_by_lexical_function = {
-            let raw = sym_name_rc(car);
-            let bare = sym_bare_name_rc(car);
-            let funs = env.funs.borrow();
-            let macros = env.macros.borrow();
-            (funs.contains_key(&name) || funs.contains_key(&*raw) || funs.contains_key(&*bare))
-                && !(macros.contains_key(&name)
-                    || macros.contains_key(&*raw)
-                    || macros.contains_key(&*bare))
+            let lexical = lexical_function_name_key(car);
+            env.funs.borrow().contains_key(&lexical)
+                && (egcl_rt::symbols::is_uninterned(car.as_symbol_index())
+                    || !env.macros.borrow().contains_key(&sym_name(car)))
         };
         if is_atomic_update_operator(car) {
             return eval_atomic_update_form(&name, cdr, env);
@@ -36209,7 +36320,7 @@ fn eval_flet(cdr: EgclVal, env: &mut Env, recursive: bool) -> Result<EgclVal, Eg
             // consults `env.funs` before that global table, so a local writer
             // now shadows a global one of the same name — which is what lexical
             // scoping requires.
-            let name = function_name_key(name_form);
+            let name = lexical_function_name_key(name_form);
             let params = extract_params(params_form);
             // A local function's body is wrapped in an implicit block named after
             // the function (ANSI 3.1.2.1 / 6.1 flet-labels), so `(return-from
@@ -36242,7 +36353,11 @@ fn eval_flet(cdr: EgclVal, env: &mut Env, recursive: bool) -> Result<EgclVal, Eg
             // MACRO of that name, and eval_macrolet does the converse. Without
             // it `(macrolet ((%f () :bad)) (flet ((%f () :good)) (%f)))` expanded
             // the outer macro (ansi MACROLET.37; bliss-9pqw).
-            child_env.macros_mut().remove(&name);
+            if name_form.is_symbol()
+                && !egcl_rt::symbols::is_uninterned(name_form.as_symbol_index())
+            {
+                child_env.macros_mut().remove(&sym_name(name_form));
+            }
             bound_names.push(name.clone());
             child_env.funs_mut().insert(
                 name,
@@ -39262,10 +39377,23 @@ fn macroexpand_environment_from_cli(env: &Env) -> MacroexpandEnv {
         augment(&mut macro_env, symbol_macros);
     }
 
+    let binding_symbol = |key: &str| {
+        lexical_identity::symbol(key).or_else(|| {
+            egcl_rt::symbols::find_index(lexical_identity::name(key))
+                .map(EgclVal::from_symbol_index)
+        })
+    };
+    let mut frame_functions = Vec::new();
     let mut frames = Vec::new();
     collect_frames(&env.frame, &mut frames);
     for frame in frames {
         let borrowed = frame.borrow();
+        frame_functions.extend(
+            borrowed
+                .function_vars
+                .keys()
+                .filter_map(|key| lexical_identity::function_base(key).and_then(binding_symbol)),
+        );
         let mut variables = Vec::new();
         for &symbol_index in borrowed.symbol_vars.keys() {
             variables.push((
@@ -39282,6 +39410,20 @@ fn macroexpand_environment_from_cli(env: &Env) -> MacroexpandEnv {
     let macro_env = macro_env.unwrap_or_else(|| {
         MacroexpandEnv::child_of(Arc::clone(&base), Vec::new(), Vec::new(), Vec::new())
     });
+
+    // A lexical function shadows a global macro of exactly that symbol.
+    // Recover original symbol identities without interning encoded/printed keys.
+    let functions: Vec<_> = env
+        .funs
+        .borrow()
+        .keys()
+        .filter_map(|key| binding_symbol(key))
+        .chain(frame_functions)
+        .collect();
+    let mut macro_env = macro_env;
+    for symbol in functions {
+        macro_env = macro_env.augment_function(symbol, FunctionInfo::Lexical);
+    }
 
     // Only lexical MACROLET macros remain to fold in (globals are in the base).
     let macro_env = if env.macros.borrow().is_empty() {
@@ -39685,7 +39827,9 @@ fn eval_macrolet(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         let name = sym_name(name_form);
         // The converse of eval_flet's removal: an inner MACROLET shadows an outer
         // FLET/LABELS binding of the same name (bliss-9pqw).
-        child_env.funs_mut().remove(&name);
+        child_env
+            .funs_mut()
+            .remove(&lexical_function_name_key(name_form));
         child_env.macros_mut().insert(
             name,
             MacroDef {
@@ -48113,6 +48257,7 @@ fn compile_owned_formatter(function: EgclVal, env: &Env) -> Result<Option<EgclVa
         Arc::new(SharedCell::new(EnvFrame {
             vars: original.vars.clone(),
             symbol_vars: original.symbol_vars.clone(),
+            function_vars: original.function_vars.clone(),
             parent: None,
         }))
     };

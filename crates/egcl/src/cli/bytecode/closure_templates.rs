@@ -154,6 +154,7 @@ mod tests {
         let frame = Arc::new(SharedCell::new(EnvFrame {
             vars: Default::default(),
             symbol_vars: Default::default(),
+            function_vars: Default::default(),
             parent: None,
         }));
         egcl_rt::rooted!(captured_a = make_template_closure(&body, Some(Arc::clone(&frame)), &env));

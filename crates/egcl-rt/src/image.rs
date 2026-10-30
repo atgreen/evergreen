@@ -177,7 +177,9 @@ pub const IMAGE_MAGIC: u64 = u64::from_be_bytes(*b"EGCLIMG\0");
 // registry. Older readers skip its subsection and would lose saved methods.
 // Version 16 makes source views reference class-owned runtime definitions,
 // preserving class/shared-cell identity independently of mutable class names.
-const FORMAT_VERSION: u32 = 16;
+// Version17 adds distinct captured lexical function cells in the host section.
+// Heap representation is unchanged; version16 host frames remain readable.
+const FORMAT_VERSION: u32 = 17;
 
 /// Image file header (128 bytes). D7.01.
 #[derive(Clone, Copy)]
@@ -938,7 +940,7 @@ fn load_image_contents(
         )));
     }
 
-    if header.format_version != FORMAT_VERSION {
+    if !matches!(header.format_version, 16 | FORMAT_VERSION) {
         return Err(EgclError::InvalidImage(format!(
             "unsupported format version: image has {}, runtime requires {}; rebuild the image from source with this EGCL runtime",
             header.format_version, FORMAT_VERSION
@@ -1231,7 +1233,7 @@ pub fn validate_image_header(path: &str) -> Result<ImageHeader, EgclError> {
         )));
     }
 
-    if header.format_version != FORMAT_VERSION {
+    if !matches!(header.format_version, 16 | FORMAT_VERSION) {
         return Err(EgclError::InvalidImage(format!(
             "unsupported format version: image has {}, runtime requires {}; rebuild the image from source with this EGCL runtime",
             header.format_version, FORMAT_VERSION

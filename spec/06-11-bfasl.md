@@ -128,7 +128,7 @@ abstract-interpretation rules for stack maps, type slots, and unwind metadata;
 a loader MAY reject an older verifier version if the unit lacks metadata needed
 by the current runtime's GC or deoptimizer.
 
-The current bytecode version is **3.2** (`0x0302`). Version 2.1 added bounded
+The current bytecode version is **3.3** (`0x0303`). Version 2.1 added bounded
 fixnum parameter metadata; version 2.2 added `CHECK_RESULT` (`0x45`), described
 below. Version 2.3 added package, saved-image, and hash-table constants; version 2.4 added packed
 U8 constants and their multidimensional backing references. Version 2.5 adds
@@ -142,8 +142,20 @@ Version 3.2 adds length-only NIL-element array constants (tag 32), including
 positive-length uninitialized storage. Shared references retain object identity;
 no element references are encoded. Readers at 3.0 and 3.1 reject the newer minor
 before installation or load effects. NIL storage introduced core format 14.
-Core format 15 added exact method class-specializer identities. Current format
-16 also preserves class-owned runtime definitions and shared cells; rebuild
+Version 3.3 distinguishes lexical FUNCTION cells from variable cells: bit 31
+of a lexical-name reference (only ENV operands; parameter names reject this flag) marks
+the FUNCTION namespace. The remaining 31 bits index the existing typed
+string/uninterned-symbol constant. Readers validate the version, masked bounds
+and constant kind before materialization or load effects. Symbol references
+remap to the restored identity; process-local IDs are never persisted as names.
+Version 3.2 and older units whose same-named local functions were collapsed
+must be recompiled; missing identities cannot be recovered from their strings.
+Core format 17 adds separate captured function-cell maps; it reads format 16
+frames with empty new maps and preserves their legacy string-key behavior.
+The CLI still checks runtime source identity before restoring a core; this
+low-level format compatibility does not permit loading cores from other builds.
+Core format 15 added exact method class-specializer identities. Format
+16 added class-owned runtime definitions and shared cells; rebuild
 images from earlier formats, including format 15.
 Version-2 bodies can construct legacy cons-shaped states, which cannot be
 reinterpreted without conflating ordinary user lists with random states. All
