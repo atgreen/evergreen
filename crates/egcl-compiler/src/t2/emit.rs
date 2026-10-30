@@ -1298,6 +1298,10 @@ fn fixnum_cmp_cc(op: crate::t2::ir::Opcode) -> Option<Cc> {
 /// The condition for the same comparison with its operands swapped (`a<b` ≡ `b>a`).
 fn cc_swapped(cc: Cc) -> Cc {
     match cc {
+        Cc::B => Cc::A,
+        Cc::A => Cc::B,
+        Cc::Be => Cc::Ae,
+        Cc::Ae => Cc::Be,
         Cc::L => Cc::G,
         Cc::G => Cc::L,
         Cc::Le => Cc::Ge,
