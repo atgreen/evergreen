@@ -617,6 +617,12 @@
 
 ### Performance
 
+- Compiled closures read their captured variables faster (a FUNCALL of such a
+  closure from a warmed caller takes about 0.48 us instead of 0.74 us), and
+  `#'FUNCALL`, `#'APPLY` and `#'VECTOR` passed as function values no longer
+  go through the interpreter
+  ([#951](https://github.com/atgreen/evergreen/pull/951)).
+
 - Compiled calls to common builtins (EQ, EQL, EQUAL, EQUALP, CAR, CDR, LENGTH,
   ELT, AREF, SVREF, GETHASH, integer comparison and arithmetic, LOGAND, ASH,
   LOGBITP and others) and reads of special variables are answered without
