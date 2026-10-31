@@ -41574,12 +41574,31 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 egcl_rt::rooted!(params = Vec::<EgclVal>::new());
                 egcl_rt::rooted!(call = vec![sym("EGCL::%MAKE-STRUCT"), quote(name_sym)]);
                 params.push(sym("&KEY"));
+                // A default that is not a literal is evaluated in the body,
+                // behind a supplied-p test, so the lambda list itself stays
+                // within the compiled keyword binder (bliss-gg3i1.7.2). The
+                // initforms still run left to right, only for omitted keys,
+                // and cannot see the uninterned argument variables.
                 for slot in &slots {
                     egcl_rt::rooted!(dflt = slot.default);
                     let var = reader::make_uninterned_symbol(&sym_bare_name_rc(slot.slot_sym));
                     egcl_rt::rooted!(keyform = vec_to_list(&[slot.initarg, var]));
-                    params.push(vec_to_list(&[*keyform, *dflt]));
-                    call.push(checked_struct_slot_form(var, slot.slot_type));
+                    let literal = dflt.is_nil()
+                        || *dflt == T
+                        || dflt.is_fixnum()
+                        || (dflt.is_symbol() && sym_name(*dflt).starts_with(':'));
+                    if literal {
+                        params.push(vec_to_list(&[*keyform, *dflt]));
+                        call.push(checked_struct_slot_form(var, slot.slot_type));
+                    } else {
+                        let supplied = reader::make_uninterned_symbol(&format!(
+                            "{}-P",
+                            sym_bare_name_rc(slot.slot_sym)
+                        ));
+                        params.push(vec_to_list(&[*keyform, NIL, supplied]));
+                        egcl_rt::rooted!(value = vec_to_list(&[sym("IF"), supplied, var, *dflt]));
+                        call.push(checked_struct_slot_form(*value, slot.slot_type));
+                    }
                 }
                 egcl_rt::rooted!(kw_lambda = vec_to_list(&params));
                 egcl_rt::rooted!(kw_body = vec_to_list(&call));

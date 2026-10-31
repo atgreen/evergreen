@@ -3517,8 +3517,20 @@ pub fn make_struct(class: EgclVal, values: &[EgclVal]) -> Result<EgclVal, EgclEr
     // allocate_instance allocates and can relocate; the caller's values may be
     // in an unrooted Rust Vec, so root a copy and write from THAT (bliss-334).
     egcl_rt::rooted!(values = values.to_vec());
-    let order = struct_slot_order(class);
     let inst = allocate_instance(class)?;
+    // A prefix-laid-out structure's layout IS the constructor's value order
+    // (DEFSTRUCT order, :INCLUDE slots first), so write positionally.
+    if let Some((wrapper, _)) = current_struct_wrapper(inst)
+        && wrapper.layout.order.len() >= values.len()
+    {
+        for (i, &value) in values.iter().enumerate() {
+            unsafe {
+                *slot_cell(inst, i) = value;
+            }
+        }
+        return Ok(inst);
+    }
+    let order = struct_slot_order(class);
     for (i, &slot) in order.iter().enumerate() {
         if i >= values.len() {
             break;
