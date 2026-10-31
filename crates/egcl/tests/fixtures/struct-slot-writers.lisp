@@ -13,8 +13,10 @@
   (assert (= 3 (writer-parent-x object))))
 (let ((object (make-writer-child)))
   (assert (= 4 (setf (writer-parent-x object) 4)))
-  #+egcl
-  (assert (rejected-writer-value #'(setf writer-parent-x) object 6))
+  ;; As in SBCL, the parent's writer checks the type the parent declared,
+  ;; not the child's narrower one (bliss-gg3i1.7.2).
+  (assert (= 6 (funcall #'(setf writer-parent-x) 6 object)))
+  (assert (= 4 (setf (writer-parent-x object) 4)))
   (assert (rejected-writer-value #'(setf writer-child-x) object 6))
   (assert (rejected-writer-value #'(setf writer-child-x) object :bad))
   (assert (= 4 (writer-child-x object))))

@@ -1901,11 +1901,41 @@ fn class_name_symbol(class: EgclVal) -> Option<u32> {
 ///
 /// Returns None when the name no longer denotes the exact class, leaving the
 /// caller on the identity-based uncached path rather than guessing.
+/// DEFSTRUCT accessor symbol -> (structure name, slot symbol). Structure
+/// accessors are ordinary functions, not class-slot metadata, so the atomic
+/// and CAS place operators find their slot here (bliss-gg3i1.7.2). Holds only
+/// symbols, which never move.
+static STRUCT_ACCESSOR_SLOTS: LazyLock<std::sync::RwLock<HashMap<u32, (EgclVal, EgclVal)>>> =
+    LazyLock::new(|| std::sync::RwLock::new(HashMap::new()));
+
+fn register_struct_accessor(accessor: EgclVal, structure: EgclVal, slot: EgclVal) {
+    if let Some(index) = accessor.symbol_index() {
+        STRUCT_ACCESSOR_SLOTS
+            .write()
+            .unwrap()
+            .insert(index, (structure, slot));
+    }
+}
+
+/// The slot a DEFSTRUCT accessor names, when `instance` is of its structure.
+fn struct_accessor_slot(instance: EgclVal, accessor: EgclVal) -> Option<EgclVal> {
+    let (structure, slot) = *STRUCT_ACCESSOR_SLOTS
+        .read()
+        .unwrap()
+        .get(&accessor.symbol_index()?)?;
+    egcl_stdlib::struct_typep_fast(instance, structure)
+        .unwrap_or(false)
+        .then_some(slot)
+}
+
 pub(in crate::cli) fn accessor_slot_symbol_cached(
     env: &Env,
     instance: EgclVal,
     accessor: EgclVal,
 ) -> Option<EgclVal> {
+    if let Some(slot) = struct_accessor_slot(instance, accessor) {
+        return Some(slot);
+    }
     let class_sym = class_name_symbol(egcl_stdlib::class_of(instance))?;
     let accessor_index = accessor.symbol_index()?;
     let key = (class_sym, accessor_index);
@@ -41486,6 +41516,7 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             );
             egcl_rt::rooted!(reader = vec_to_list(&[sym("DEFUN"), slot.accessor, *params, *body]));
             eval_form(*reader, env)?;
+            register_struct_accessor(slot.accessor, *name_sym_r, slot.slot_sym);
             if !slot.read_only {
                 egcl_rt::rooted!(writer_name = vec_to_list(&[sym("SETF"), slot.accessor]));
                 egcl_rt::rooted!(writer_params = vec_to_list(&[value, obj]));

@@ -2663,7 +2663,7 @@ fn resolve(name: &str) -> Option<Handler> {
                     expected: format_val(args[1]),
                 });
             }
-            egcl_stdlib::slot_value(args[0], args[2])
+            slot_value_or_signal(args[0], args[2], env)
         }),
         "EGCL::%STRUCT-SET" => Some(|_operator, args, env| {
             let [value, object, name, slot, hint] = *args else {

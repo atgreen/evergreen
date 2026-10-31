@@ -4086,32 +4086,17 @@ pub fn struct_set_fast(
     true
 }
 
-/// Lock-free structure predicate for the structure named `name`, as DEFSTRUCT
-/// defines it: true for a current instance of it or of a structure including
-/// it, false for anything that is not an instance or is a current non-structure
-/// instance. None (obsolete or unlaid-out instance) defers to TYPEP. Does not
-/// allocate.
+/// Lock-free `(typep object 'name)` for a structure name: true for a current
+/// structure instance with `name` in its ancestry, false for one without it
+/// and for anything that is not an instance. Any other instance, and an
+/// obsolete one, defers to TYPEP (None): if `name` were later redefined as a
+/// standard class, only such an instance could be of it. Does not allocate.
 pub fn struct_typep_fast(object: EgclVal, name: EgclVal) -> Option<bool> {
     if egcl_rt::gc::heap_object_type_id(object) != Some(type_id::STANDARD_OBJECT) {
         return Some(false);
     }
-    unsafe {
-        let w = instance_wrapper(object);
-        if w.is_null() || (*w).state.load(Ordering::Acquire) != WRAPPER_CURRENT {
-            return None;
-        }
-        let info = (*w).struct_info.load(Ordering::Acquire);
-        if info.is_null() {
-            // A structure class always has info unless its layout failed the
-            // prefix check; only then can this instance still be a structure.
-            return if is_structure_class((*w).class) {
-                None
-            } else {
-                Some(false)
-            };
-        }
-        Some((*info).names.contains(&name))
-    }
+    let (_, info) = current_struct_wrapper(object)?;
+    Some(info.names.contains(&name))
 }
 
 /// Make a slot unbound (SLOT-MAKUNBOUND).

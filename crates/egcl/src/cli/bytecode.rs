@@ -4503,34 +4503,50 @@ impl<'e> Lowerer<'e> {
         lowered
     }
 
+    /// The symbol `form` quotes, when it is `(QUOTE <non-NIL symbol>)`.
+    fn quoted_symbol(quote: EgclVal, form: EgclVal) -> Option<EgclVal> {
+        let items = form.is_cons().then(|| list_to_vec(form))?;
+        (items.len() == 2 && items[0] == quote && items[1].is_symbol() && !items[1].is_nil())
+            .then_some(items[1])
+    }
+
     /// DEFSTRUCT's accessor, writer and predicate bodies (bliss-gg3i1.7.2):
     /// `(%struct-ref obj 'name 'slot index)`, `(%struct-set value obj 'name
     /// 'slot index)` and `(%struct-typep obj 'name)` with literal operands
     /// lower to their structure opcodes. Any other shape stays a call.
     fn lower_structure_primitive(&mut self, name: &str, rest: EgclVal) -> LowerResult<Option<()>> {
         let (evaluated, literals) = match name {
+            // `(typep x 'K)` for a K that names a structure class now: the
+            // opcode answers structure instances and non-instances itself and
+            // sends every other instance to TYPEP, so a later redefinition of
+            // K as a standard class still answers correctly.
+            "TYPEP" => (1, 1),
             "EGCL::%STRUCT-REF" => (1, 3),
             "EGCL::%STRUCT-SET" => (2, 3),
             "EGCL::%STRUCT-TYPEP" => (1, 1),
             _ => return Ok(None),
         };
+        // Resolve before reading any form: interning can allocate.
+        let Some(quote) = resolve_sym("QUOTE") else {
+            return Ok(None);
+        };
         egcl_rt::rooted!(args = list_to_vec(rest));
         if args.len() != evaluated + literals {
             return Ok(None);
         }
-        let quoted = |form: EgclVal| -> Option<EgclVal> {
-            let items = form.is_cons().then(|| list_to_vec(form))?;
-            (items.len() == 2
-                && items[0] == resolve_sym("QUOTE")?
-                && items[1].is_symbol()
-                && !items[1].is_nil())
-            .then_some(items[1])
-        };
-        let Some(struct_name) = quoted(args[evaluated]) else {
+        let Some(struct_name) = Self::quoted_symbol(quote, args[evaluated]) else {
             return Ok(None);
         };
+        if name == "TYPEP"
+            && !egcl_stdlib::find_class(struct_name).is_some_and(egcl_stdlib::is_structure_class)
+        {
+            return Ok(None);
+        }
         let slot_and_hint = if literals == 3 {
-            let (Some(slot), hint) = (quoted(args[evaluated + 1]), args[evaluated + 2]) else {
+            let (Some(slot), hint) = (
+                Self::quoted_symbol(quote, args[evaluated + 1]),
+                args[evaluated + 2],
+            ) else {
                 return Ok(None);
             };
             if !hint.is_fixnum() || !(0..=u16::MAX as i64).contains(&hint.as_fixnum()) {
@@ -4545,7 +4561,7 @@ impl<'e> Lowerer<'e> {
         }
         let name_const = self.add_const(struct_name);
         let instr = match (name, slot_and_hint) {
-            ("EGCL::%STRUCT-TYPEP", None) => Instr::StructTypeP { name: name_const },
+            ("EGCL::%STRUCT-TYPEP" | "TYPEP", None) => Instr::StructTypeP { name: name_const },
             ("EGCL::%STRUCT-REF", Some((slot, hint))) => Instr::StructRef {
                 name: name_const,
                 slot: self.add_const(slot),
@@ -5312,7 +5328,17 @@ impl<'e> Lowerer<'e> {
         }
         // Nothing above allocates; the forms are not used after interning.
         let writer = reader::intern_symbol(&key);
-        super::names_accessor_generic(writer).then_some(writer)
+        if super::names_accessor_generic(writer) {
+            return Some(writer);
+        }
+        // An ordinary `(defun (setf ACC) ...)` writer, such as a DEFSTRUCT
+        // writer (bliss-gg3i1.7.2), lives under its mangled writer symbol,
+        // the one `user_setf_writer_place` calls.
+        let accessor_name = sym_name(accessor);
+        if !super::env_has_setf_writer(&accessor_name) {
+            return None;
+        }
+        resolve_sym(&super::setf_writer_symbol_name(&accessor_name)).map(|s| s.as_symbol_index())
     }
 
     /// Recognise a `(f a b …)` place whose accessor `f` has a user
