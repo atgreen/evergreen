@@ -142,6 +142,19 @@ pub enum Instr {
     /// of tag-checkable types to avoid a c2i `CallNamed` to TYPEP on the hot
     /// package-machinery path (bliss-gq5).
     TypeP(u16),
+    /// DEFSTRUCT accessor body: pop an instance, push its `slot` when it is a
+    /// current instance of the structure named by constant `name` (or of one
+    /// including it). `slot` is a constant-pool symbol and `hint` the slot's
+    /// expected layout index. Anything else takes the general path, which
+    /// signals the TYPE-ERROR or unbound-slot error (bliss-gg3i1.7.2).
+    StructRef { name: u16, slot: u16, hint: u16 },
+    /// DEFSTRUCT writer body: pop the instance and then the (already
+    /// type-checked) value, store it as [`Instr::StructRef`] would read it, and
+    /// push the value.
+    StructSet { name: u16, slot: u16, hint: u16 },
+    /// DEFSTRUCT predicate body: pop one operand, push T when it is an instance
+    /// of the structure named by constant `name` or of one including it.
+    StructTypeP { name: u16 },
     /// Check the primary result without consuming it or changing the pending
     /// multiple-value tuple. Failure signals TYPE-ERROR, even at safety zero.
     CheckResult(DeclaredType),

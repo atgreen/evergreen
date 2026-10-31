@@ -2637,6 +2637,74 @@ fn resolve(name: &str) -> Option<Handler> {
             super::gensym_value(env, args.first().copied())
         }),
 
+        // (%struct-ref object 'name 'slot hint), (%struct-set value object
+        // 'name 'slot hint) and (%struct-typep object 'name): the bodies of
+        // DEFSTRUCT's accessors and predicate. The lock-free fast paths answer
+        // a current instance; everything else takes TYPEP and SLOT-VALUE, which
+        // signal the TYPE-ERROR or unbound-slot error (bliss-gg3i1.7.2).
+        "EGCL::%STRUCT-REF" => Some(|_operator, args, env| {
+            let [object, name, slot, hint] = *args else {
+                return Err(EgclError::ProgramError(
+                    "%struct-ref: expected object, name, slot and index".into(),
+                ));
+            };
+            let hint = if hint.is_fixnum() {
+                hint.as_fixnum().max(0) as usize
+            } else {
+                0
+            };
+            if let Some(value) = egcl_stdlib::struct_ref_fast(object, name, slot, hint) {
+                return Ok(value);
+            }
+            let args = RootedVals::new(args.to_vec());
+            if !super::typep_matches(env, args[0], args[1])? {
+                return Err(EgclError::TypeError {
+                    datum: args[0],
+                    expected: format_val(args[1]),
+                });
+            }
+            egcl_stdlib::slot_value(args[0], args[2])
+        }),
+        "EGCL::%STRUCT-SET" => Some(|_operator, args, env| {
+            let [value, object, name, slot, hint] = *args else {
+                return Err(EgclError::ProgramError(
+                    "%struct-set: expected value, object, name, slot and index".into(),
+                ));
+            };
+            let hint = if hint.is_fixnum() {
+                hint.as_fixnum().max(0) as usize
+            } else {
+                0
+            };
+            if egcl_stdlib::struct_set_fast(object, name, slot, hint, value) {
+                return Ok(value);
+            }
+            let args = RootedVals::new(args.to_vec());
+            if !super::typep_matches(env, args[1], args[2])? {
+                return Err(EgclError::TypeError {
+                    datum: args[1],
+                    expected: format_val(args[2]),
+                });
+            }
+            egcl_stdlib::set_slot_value(args[1], args[3], args[0])?;
+            Ok(args[0])
+        }),
+        "EGCL::%STRUCT-TYPEP" => Some(|_operator, args, env| {
+            let [object, name] = *args else {
+                return Err(EgclError::ProgramError(
+                    "%struct-typep: expected object and name".into(),
+                ));
+            };
+            let matches = match egcl_stdlib::struct_typep_fast(object, name) {
+                Some(matches) => matches,
+                None => {
+                    let args = RootedVals::new(args.to_vec());
+                    super::typep_matches(env, args[0], args[1])?
+                }
+            };
+            Ok(if matches { T } else { NIL })
+        }),
+
         "EGCL::%MAKE-STRUCT" => Some(|_operator, args, _env| {
             let args = RootedVals::new(args.to_vec());
 

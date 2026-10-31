@@ -208,6 +208,17 @@ struct ClassWrapper {
     class: EgclVal,
     slot_count: u32,
     layout: &'static SlotLayout,
+    /// Structure ancestry when this is a structure class's layout, else null.
+    /// Published once, after the wrapper exists (see [`install_struct_info`]).
+    struct_info: std::sync::atomic::AtomicPtr<StructInfo>,
+}
+
+/// What the lock-free structure fast paths need from a structure layout:
+/// the class names of its structure ancestry, root first and own class last.
+/// Only built when every ancestor's current layout is a prefix of this one, so
+/// a slot an accessor of any ancestor names sits at that ancestor's index.
+struct StructInfo {
+    names: Box<[EgclVal]>,
 }
 
 /// Follow the forwarding chain to the live object. When `change-class` needs a
@@ -460,6 +471,7 @@ fn leak_empty_wrapper(class: EgclVal) -> *mut ClassWrapper {
         class,
         slot_count: 0,
         layout,
+        struct_info: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
     }));
     wrapper as *const ClassWrapper as *mut ClassWrapper
 }
@@ -1579,6 +1591,7 @@ pub fn restore_clos_state(data: &[u8], remap: &dyn Fn(u64) -> u64) -> Result<usi
             class,
             slot_count,
             layout,
+            struct_info: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
         }));
         wrapper_map.insert(old_addr, wrapper as *const ClassWrapper as usize);
     }
@@ -1603,7 +1616,13 @@ pub fn restore_clos_state(data: &[u8], remap: &dyn Fn(u64) -> u64) -> Result<usi
             meta.wrapper = Some(unsafe { &*(new_addr as *const ClassWrapper) });
         }
     }
-    with_state_mut(|state| *state = st);
+    with_state_mut(|state| {
+        *state = st;
+        let structs: Vec<EgclVal> = state.structure_classes.iter().copied().collect();
+        for class in structs {
+            install_struct_info(state, class);
+        }
+    });
     install_clos_state_root_scanner();
     // Rewrite every restored instance's wrapper word through the map. An
     // unmatched (impossible unless the image is inconsistent) or null word is
@@ -2243,6 +2262,7 @@ pub fn find_class(name: EgclVal) -> Option<EgclVal> {
 pub fn set_structure_class(class: EgclVal) {
     let structure_class = with_state_mut(|st| {
         st.structure_classes.insert(class);
+        install_struct_info(st, class);
         st.structure_class
     });
     // A DEFSTRUCT class is an instance of STRUCTURE-CLASS, so CLASS-OF must
@@ -2604,10 +2624,53 @@ fn finalize_class_layout(st: &mut ClosState, class: EgclVal) {
         class,
         slot_count,
         layout,
+        struct_info: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
     }));
     if let Some(meta) = st.class_meta.get_mut(&class) {
         meta.wrapper = Some(wrapper);
     }
+    if st.structure_classes.contains(&class) {
+        install_struct_info(st, class);
+    }
+}
+
+/// Publish [`StructInfo`] on `class`'s current wrapper when it is a structure
+/// class whose ancestors' layouts are prefixes of its own. Pure Rust; the
+/// leaked info lives as long as the (leaked) wrapper that points at it.
+fn install_struct_info(st: &ClosState, class: EgclVal) {
+    let Some(wrapper) = st.class_meta.get(&class).and_then(|meta| meta.wrapper) else {
+        return;
+    };
+    if !wrapper.struct_info.load(Ordering::Acquire).is_null() {
+        return;
+    }
+    let Ok(cpl) = linearize_class_precedence(st, class) else {
+        return;
+    };
+    let own = &wrapper.layout.order;
+    let mut names = Vec::new();
+    for ancestor in cpl.iter().rev() {
+        if !st.structure_classes.contains(ancestor) {
+            continue;
+        }
+        let Some(meta) = st.class_meta.get(ancestor) else {
+            return;
+        };
+        if *ancestor != class {
+            let Some(parent) = meta.wrapper else {
+                return;
+            };
+            let order = &parent.layout.order;
+            if order.len() > own.len() || own[..order.len()] != order[..] {
+                return;
+            }
+        }
+        names.push(meta.name);
+    }
+    let info = Box::leak(Box::new(StructInfo {
+        names: names.into_boxed_slice(),
+    }));
+    wrapper.struct_info.store(info, Ordering::Release);
 }
 
 /// Return true if `object` is a live CLOS standard-object instance. Uses the
@@ -3945,6 +4008,110 @@ pub fn structure_instance_typep(object: EgclVal, name: EgclVal) -> Option<bool> 
             .get(&actual)
             .map(|cpl| cpl.contains(&expected))
     })
+}
+
+/// The current structure wrapper of `object` and its [`StructInfo`], or None
+/// when `object` is not an instance, its wrapper is obsolete or absent, or its
+/// class is not a (prefix-laid-out) structure class. Does not allocate.
+#[inline]
+fn current_struct_wrapper(object: EgclVal) -> Option<(&'static ClassWrapper, &'static StructInfo)> {
+    if egcl_rt::gc::heap_object_type_id(object) != Some(type_id::STANDARD_OBJECT) {
+        return None;
+    }
+    unsafe {
+        let w = instance_wrapper(object);
+        if w.is_null() || (*w).state.load(Ordering::Acquire) != WRAPPER_CURRENT {
+            return None;
+        }
+        let info = (*w).struct_info.load(Ordering::Acquire);
+        if info.is_null() {
+            return None;
+        }
+        Some((&*w, &*info))
+    }
+}
+
+/// The inline index of `slot` in `wrapper`'s layout, trying `hint` first.
+#[inline]
+fn struct_slot_index(wrapper: &ClassWrapper, slot: EgclVal, hint: usize) -> Option<usize> {
+    let order = &wrapper.layout.order;
+    if order.get(hint) == Some(&slot) {
+        return Some(hint);
+    }
+    order.iter().position(|&s| s == slot)
+}
+
+/// Lock-free `(name-slot object)` for a structure accessor: `object` is a
+/// current instance of the structure named `name` or of one that includes it,
+/// and its bound `slot` (expected at `hint`) is returned. None sends the caller
+/// to the general path, which signals the TYPE-ERROR or unbound-slot error.
+/// Does not allocate.
+pub fn struct_ref_fast(
+    object: EgclVal,
+    name: EgclVal,
+    slot: EgclVal,
+    hint: usize,
+) -> Option<EgclVal> {
+    let (wrapper, info) = current_struct_wrapper(object)?;
+    if !info.names.contains(&name) {
+        return None;
+    }
+    let idx = struct_slot_index(wrapper, slot, hint)?;
+    let v = unsafe { *slot_cell(resolve_forwarding(object), idx) };
+    (v != UNBOUND).then_some(v)
+}
+
+/// Lock-free store for a structure writer; see [`struct_ref_fast`]. The caller
+/// has already checked `value` against the slot's declared type. Returns
+/// whether it stored. Does not allocate.
+pub fn struct_set_fast(
+    object: EgclVal,
+    name: EgclVal,
+    slot: EgclVal,
+    hint: usize,
+    value: EgclVal,
+) -> bool {
+    let Some((wrapper, info)) = current_struct_wrapper(object) else {
+        return false;
+    };
+    if !info.names.contains(&name) {
+        return false;
+    }
+    let Some(idx) = struct_slot_index(wrapper, slot, hint) else {
+        return false;
+    };
+    unsafe {
+        *slot_cell(resolve_forwarding(object), idx) = value;
+    }
+    true
+}
+
+/// Lock-free structure predicate for the structure named `name`, as DEFSTRUCT
+/// defines it: true for a current instance of it or of a structure including
+/// it, false for anything that is not an instance or is a current non-structure
+/// instance. None (obsolete or unlaid-out instance) defers to TYPEP. Does not
+/// allocate.
+pub fn struct_typep_fast(object: EgclVal, name: EgclVal) -> Option<bool> {
+    if egcl_rt::gc::heap_object_type_id(object) != Some(type_id::STANDARD_OBJECT) {
+        return Some(false);
+    }
+    unsafe {
+        let w = instance_wrapper(object);
+        if w.is_null() || (*w).state.load(Ordering::Acquire) != WRAPPER_CURRENT {
+            return None;
+        }
+        let info = (*w).struct_info.load(Ordering::Acquire);
+        if info.is_null() {
+            // A structure class always has info unless its layout failed the
+            // prefix check; only then can this instance still be a structure.
+            return if is_structure_class((*w).class) {
+                None
+            } else {
+                Some(false)
+            };
+        }
+        Some((*info).names.contains(&name))
+    }
 }
 
 /// Make a slot unbound (SLOT-MAKUNBOUND).
