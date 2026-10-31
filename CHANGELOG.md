@@ -617,6 +617,12 @@
 
 ### Performance
 
+- Compiled AREF and SVREF reads and stores on adjustable, fill-pointer and bit
+  vectors call the general accessor instead of falling back to the
+  interpreter, and functions whose BLOCK or TAGBODY sits in an argument
+  position, or that access structures inside an UNWIND-PROTECT or handler,
+  now compile natively. A loop over adjustable and bit vectors runs about 45
+  times faster ([#955](https://github.com/atgreen/evergreen/pull/955)).
 - On x86-64 Linux, small pieces of compiled native code now share executable
   pages instead of each taking its own memory mapping. A long-running build of
   SBCL hosted on EGCL uses about half the memory (2.66 GB → 1.29 GB peak by
