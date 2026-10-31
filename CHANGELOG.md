@@ -612,6 +612,11 @@
 
 ### Performance
 
+- Structure predicates and `TYPEP`/`TYPECASE` over structure types no longer
+  compare slot names as strings on every call: a warmed structure predicate
+  drops from 4.1 us to 1.6 us and a structure `TYPECASE` from 8.0 us to 3.6 us
+  ([#946](https://github.com/atgreen/evergreen/pull/946)).
+
 - On ppc64le, a hot `MOD`, `REM`, `FLOOR` or `TRUNCATE` of fixnums compiles to
   a native divide instead of calling the runtime from the loop. A
   2,000,000-iteration `(mod i 7)` loop drops from 0.99 us to 0.044 us per
