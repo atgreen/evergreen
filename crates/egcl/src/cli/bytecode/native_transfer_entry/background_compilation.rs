@@ -86,6 +86,7 @@ impl EmittedTransfer {
             private_probe_published: Cell::new(false),
             state_pool: RefCell::new(Vec::new()),
             callable_cache: Rc::new(CallableIdentityCache::default()),
+            leaf_names: std::cell::OnceCell::new(),
             #[cfg(test)]
             unavailable_catch: None,
             #[cfg(test)]
