@@ -2662,6 +2662,10 @@ fn local_control_op(
             // A result assertion preserves the primary and MV tuple;
             // unsupported assertion types still decline in T2 lowering.
             | Instr::CheckResult(_)
+            // DEFSTRUCT opcodes: leaf helper calls that deopt on a miss.
+            | Instr::StructRef { .. }
+            | Instr::StructSet { .. }
+            | Instr::StructTypeP { .. }
             | Instr::Br(_)
             | Instr::BrIfFalse(_)
             | Instr::BrIfTrue(_)

@@ -22933,6 +22933,16 @@ pub(super) fn install_direct_builtin_hooks() {
         c2i_call_slice_rooted as extern "C" fn(u64, u64, *const EgclVal, u64) -> u64 as usize
             as u64,
     );
+    // DEFSTRUCT accessors compile through T2 with these leaf helpers
+    // (bliss-gg3i1.7.2).
+    #[cfg(not(egcl_no_t2))]
+    egcl_compiler::t2::emit::install_struct_access_helpers(
+        egcl_compiler::t2::emit::StructAccessHelpers {
+            reference: c2i_struct_ref as extern "C" fn(u64, u64, u64) -> u64 as usize as u64,
+            set: c2i_struct_set as extern "C" fn(u64, u64, u64, u64) -> u64 as usize as u64,
+            typep: c2i_struct_typep as extern "C" fn(u64, u64) -> u64 as usize as u64,
+        },
+    );
     #[cfg(not(egcl_no_t2))]
     egcl_compiler::t2::emit::install_direct_builtin_hooks(
         egcl_compiler::t2::emit::DirectBuiltinHooks {

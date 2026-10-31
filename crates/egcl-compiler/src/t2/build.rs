@@ -1425,8 +1425,14 @@ impl<'a> Builder<'a> {
                 | Instr::Dup => {
                     push(i + 1, d + 1, &mut depth_at, &mut work);
                 }
-                Instr::TypeP(_) | Instr::CheckResult(_) => {
+                Instr::TypeP(_)
+                | Instr::CheckResult(_)
+                | Instr::StructRef { .. }
+                | Instr::StructTypeP { .. } => {
                     push(i + 1, d, &mut depth_at, &mut work);
+                }
+                Instr::StructSet { .. } => {
+                    push(i + 1, d - 1, &mut depth_at, &mut work); // value, obj -> value
                 }
                 Instr::MemoryFence(_) => {
                     push(i + 1, d + 1, &mut depth_at, &mut work);
@@ -2893,6 +2899,65 @@ impl<'a> Builder<'a> {
                         .ok_or(BuildError::Unsupported("TypeP has a result"))?;
                     stack.push(result);
                 }
+                Instr::StructRef { name, slot, hint } | Instr::StructSet { name, slot, hint } => {
+                    let aux = AuxData::StructSlot {
+                        name: self.constant_symbol(*name)?,
+                        slot: self.constant_symbol(*slot)?,
+                        hint: *hint,
+                    };
+                    let store = matches!(instruction, Instr::StructSet { .. });
+                    // Recovery resumes T0 at this opcode with its operands
+                    // still on the stack; T0 then takes the general path.
+                    let fs = self.build_frame_state(block, &stack, i as u32);
+                    self.emit_effect(block, Opcode::ClearMv, vec![], AuxData::None, Some(fs));
+                    let object = stack
+                        .pop()
+                        .ok_or(BuildError::Unsupported("stack underflow (StructRef)"))?;
+                    let (opcode, args) = if store {
+                        let value = stack
+                            .pop()
+                            .ok_or(BuildError::Unsupported("stack underflow (StructSet)"))?;
+                        (Opcode::StructSet, vec![value, object])
+                    } else {
+                        (Opcode::StructRef, vec![object])
+                    };
+                    let result = self
+                        .emit(
+                            block,
+                            opcode,
+                            args,
+                            aux,
+                            struct_access_flags(),
+                            Some(fs),
+                            IRType::TOP,
+                        )
+                        .ok_or(BuildError::Unsupported("StructRef has a result"))?;
+                    stack.push(result);
+                }
+                Instr::StructTypeP { name } => {
+                    let aux = AuxData::StructSlot {
+                        name: self.constant_symbol(*name)?,
+                        slot: 0,
+                        hint: 0,
+                    };
+                    let fs = self.build_frame_state(block, &stack, i as u32);
+                    self.emit_effect(block, Opcode::ClearMv, vec![], AuxData::None, Some(fs));
+                    let object = stack
+                        .pop()
+                        .ok_or(BuildError::Unsupported("stack underflow (StructTypeP)"))?;
+                    let result = self
+                        .emit(
+                            block,
+                            Opcode::StructTypeP,
+                            vec![object],
+                            aux,
+                            struct_access_flags(),
+                            Some(fs),
+                            IRType::of(TypeBits::SYMBOL.join(TypeBits::NULL)),
+                        )
+                        .ok_or(BuildError::Unsupported("StructTypeP has a result"))?;
+                    stack.push(result);
+                }
                 Instr::MemoryFence(kind) => {
                     let result = self
                         .emit(
@@ -3857,6 +3922,17 @@ impl<'a> Builder<'a> {
     }
 
     /// Classify a constant-pool `EgclVal` and emit the matching `Const*`.
+    /// The symbol index of constant `idx`, which a structure opcode requires
+    /// to be a symbol (its structure or slot name).
+    fn constant_symbol(&self, idx: u16) -> Result<u32, BuildError> {
+        match self.constants.get(idx as usize) {
+            Some(super::constants::ConstantDescription::Symbol { index, .. }) => Ok(*index),
+            _ => Err(BuildError::Unsupported(
+                "structure opcode name is not a symbol",
+            )),
+        }
+    }
+
     fn emit_const(&mut self, block: Block, idx: u16) -> Result<Value, BuildError> {
         use super::constants::ConstantDescription as Constant;
         let constant = self
@@ -3920,6 +3996,17 @@ enum Term {
 }
 
 // ── Free helpers for terminator InstData ────────────────────────────
+
+/// A structure opcode: an ordered, noncollecting leaf helper call whose miss
+/// deoptimizes (bliss-gg3i1.7.2). Not a safepoint, since the helper never
+/// allocates or signals; the guard keeps it ordered and unfoldable.
+fn struct_access_flags() -> InstFlags {
+    InstFlags {
+        effectful: true,
+        guard: true,
+        ..InstFlags::default()
+    }
+}
 
 fn runtime_call_flags() -> InstFlags {
     InstFlags {
@@ -5786,6 +5873,77 @@ mod tests {
             .expect("TypeP must clear stale multiple values even if its check is optimized away");
         assert!(clear.flags.effectful);
         assert!(clear.frame_state.is_some());
+    }
+
+    #[test]
+    fn structure_opcodes_become_guarded_helper_ops_with_pre_operand_state() {
+        let name = egcl_rt::symbols::intern("T2-STRUCT-OPCODE-FIXTURE");
+        let slot = egcl_rt::symbols::intern("T2-STRUCT-OPCODE-FIXTURE-SLOT");
+        let input = bf(
+            "struct-opcodes",
+            vec![
+                Instr::LoadLocal(1),
+                Instr::LoadLocal(0),
+                Instr::StructSet {
+                    name: 0,
+                    slot: 1,
+                    hint: 2,
+                },
+                Instr::Pop,
+                Instr::LoadLocal(0),
+                Instr::StructTypeP { name: 0 },
+                Instr::Pop,
+                Instr::LoadLocal(0),
+                Instr::StructRef {
+                    name: 0,
+                    slot: 1,
+                    hint: 2,
+                },
+                Instr::Return,
+            ],
+            vec![
+                EgclVal::from_symbol_index(name),
+                EgclVal::from_symbol_index(slot),
+            ],
+            2,
+            2,
+            2,
+        );
+        let f = build_from_bytecode(&input).expect("structure opcodes must reach T2");
+        let expected_depth = [
+            (Opcode::StructSet, 2, 2usize),
+            (Opcode::StructTypeP, 5, 1),
+            (Opcode::StructRef, 8, 1),
+        ];
+        for (opcode, bcp, depth) in expected_depth {
+            let data = f
+                .block(f.entry())
+                .insts
+                .iter()
+                .map(|&i| f.inst(i))
+                .find(|d| d.opcode == opcode)
+                .unwrap_or_else(|| panic!("{opcode:?} must survive building"));
+            assert!(data.flags.effectful && data.flags.guard, "{opcode:?}");
+            assert!(!data.flags.safepoint, "{opcode:?} helpers never collect");
+            let AuxData::StructSlot {
+                name: aux_name,
+                slot: aux_slot,
+                hint,
+            } = data.aux
+            else {
+                panic!("{opcode:?} must carry its structure operands");
+            };
+            assert_eq!(aux_name, name);
+            if opcode != Opcode::StructTypeP {
+                assert_eq!((aux_slot, hint), (slot, 2));
+            }
+            // Recovery re-executes the opcode, so its operands are still
+            // on the reconstructed operand stack.
+            let state = f.frame_states.get(data.frame_state.expect("deopt state"));
+            let scope = state.scopes.last().unwrap();
+            assert_eq!(scope.bcp, bcp, "{opcode:?}");
+            assert_eq!(scope.stack.len(), depth, "{opcode:?}");
+        }
     }
 
     #[test]

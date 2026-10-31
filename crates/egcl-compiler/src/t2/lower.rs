@@ -739,7 +739,11 @@ fn lower_inst(lo: &mut Lowering, inst: Inst) {
         | SetSymbolValue
         | EnvironmentValue
         | SetEnvironmentValue
-        | DefineEnvironmentValue => {
+        | DefineEnvironmentValue
+        // Structure opcodes are leaf helper calls (bliss-gg3i1.7.2).
+        | StructRef
+        | StructSet
+        | StructTypeP => {
             lo.emit_annotated(inst, op::CALL_RUNTIME, defs, uses);
         }
 

@@ -2541,6 +2541,107 @@ pub fn install_direct_builtin_hooks(hooks: DirectBuiltinHooks) {
     let _ = DIRECT_BUILTIN.set(hooks);
 }
 
+/// Leaf helpers for the DEFSTRUCT opcodes (bliss-gg3i1.7.2), installed by the
+/// runtime, which owns structure layouts. Each is noncollecting and
+/// nonsignalling and returns UNBOUND on a miss without side effects:
+///
+/// * `reference(object, name, slot << 16 | hint) -> value`
+/// * `set(object, value, name, slot << 16 | hint) -> value`
+/// * `typep(object, name) -> T | NIL`
+///
+/// `name` is the tagged structure-name symbol; `slot` is a symbol index.
+#[derive(Clone, Copy, Debug)]
+pub struct StructAccessHelpers {
+    pub reference: u64,
+    pub set: u64,
+    pub typep: u64,
+}
+
+static STRUCT_ACCESS: std::sync::OnceLock<StructAccessHelpers> = std::sync::OnceLock::new();
+
+/// Install the structure-opcode helpers. Idempotent; later calls are ignored.
+/// Without them, functions using the structure opcodes are declined.
+pub fn install_struct_access_helpers(helpers: StructAccessHelpers) {
+    let _ = STRUCT_ACCESS.set(helpers);
+}
+
+#[cfg_attr(windows, allow(dead_code))]
+fn struct_access_helpers() -> Option<StructAccessHelpers> {
+    STRUCT_ACCESS.get().copied()
+}
+
+/// Emit a structure opcode as a direct call to its leaf helper, then deopt to
+/// `deopt` (the instruction's own pre-operand recovery state) when the helper
+/// reports a miss. The helper cannot allocate, collect or signal, so it needs
+/// no call-site map; its caller-saved clobbers are modelled by CALL_RUNTIME.
+#[cfg(not(windows))]
+fn emit_struct_access(
+    a: &mut Asm,
+    data: &crate::t2::ir::InstData,
+    reg: &std::collections::HashMap<crate::t2::ir::Value, u8>,
+    const_tagged: &std::collections::HashMap<crate::t2::ir::Value, u64>,
+    deopt: egcl_rt::asm::Label,
+) -> Result<(), EmitError> {
+    use crate::t2::ir::{AuxData, Opcode};
+    let unsupported = || EmitError::UnsupportedOp(op_tag(data.opcode));
+    let helpers = struct_access_helpers().ok_or_else(unsupported)?;
+    let AuxData::StructSlot { name, slot, hint } = data.aux else {
+        return Err(unsupported());
+    };
+    let name = egcl_rt::value::EgclVal::from_symbol_index(name).0;
+    let slot_hint = (u64::from(slot) << 16) | u64::from(hint);
+    // Load `value` into `dst` from its register or constant. RAX and RDX are
+    // reserved scratch, so no operand lives in either.
+    let load = |a: &mut Asm, dst: u8, value: crate::t2::ir::Value| -> Result<(), EmitError> {
+        if let Some(&bits) = const_tagged.get(&value) {
+            mov_imm64(a, dst, bits as i64);
+        } else {
+            let src = *reg.get(&value).ok_or(EmitError::UnsupportedOp(0xF2))?;
+            debug_assert!(src != RAX && src != SCRATCH);
+            mov_rr(a, dst, src);
+        }
+        Ok(())
+    };
+    let helper = match data.opcode {
+        Opcode::StructRef => {
+            load(a, 7, *data.args.first().ok_or_else(unsupported)?)?; // rdi = object
+            mov_imm64(a, 6, name as i64); // rsi = name
+            mov_imm64(a, 2, slot_hint as i64); // rdx = slot << 16 | hint
+            helpers.reference
+        }
+        Opcode::StructSet => {
+            let [value, object] = data.args[..] else {
+                return Err(unsupported());
+            };
+            // Read the value first: the object load may overwrite its register.
+            load(a, RAX, value)?;
+            load(a, 7, object)?; // rdi = object
+            mov_rr(a, 6, RAX); // rsi = value
+            mov_imm64(a, 2, name as i64); // rdx = name
+            mov_imm64(a, 1, slot_hint as i64); // rcx = slot << 16 | hint
+            helpers.set
+        }
+        Opcode::StructTypeP => {
+            load(a, 7, *data.args.first().ok_or_else(unsupported)?)?; // rdi = object
+            mov_imm64(a, 6, name as i64); // rsi = name
+            helpers.typep
+        }
+        _ => return Err(unsupported()),
+    };
+    if helper == 0 {
+        return Err(unsupported());
+    }
+    mov_imm64(a, RAX, helper as i64);
+    a.extend_from_slice(&[0xFF, 0xD0]); // call rax
+    mov_imm64(a, SCRATCH, egcl_rt::value::UNBOUND.0 as i64);
+    cmp_rr(a, RAX, SCRATCH);
+    a.jcc(egcl_rt::asm::Cc::E, deopt);
+    let result = *data.results.first().ok_or_else(unsupported)?;
+    let dst = *reg.get(&result).ok_or(EmitError::UnsupportedOp(0xF2))?;
+    mov_rr(a, dst, RAX);
+    Ok(())
+}
+
 /// The published helper veneer that boxes a raw double (bliss-thcbb).
 static BOX_DOUBLE_VENEER: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
@@ -6217,6 +6318,18 @@ fn emit_transfer_function_with_storage(
             {
                 continue;
             }
+            // Structure opcodes are leaf helper calls whose miss resumes T0
+            // through the precise deopt veneer at their own opcode
+            // (bliss-gg3i1.7.2).
+            if deopt_veneer.is_some()
+                && matches!(
+                    data.opcode,
+                    Opcode::StructRef | Opcode::StructSet | Opcode::StructTypeP
+                )
+                && data.frame_state.is_some()
+            {
+                continue;
+            }
             // Tagged single-float arithmetic and comparisons guard their operands
             // and resume through the same precise deopt veneer (bliss-9bw59).
             // Raw double arithmetic was admitted above.
@@ -6598,6 +6711,9 @@ fn emit_framed_inner(
                 | Opcode::CleanupRestore
                 | Opcode::CatchLanding
                 | Opcode::HandlerLanding
+                | Opcode::StructRef
+                | Opcode::StructSet
+                | Opcode::StructTypeP
         )
     };
     let has_ir_calls = f.block_order().iter().any(|&b| {
@@ -8357,11 +8473,18 @@ fn emit_framed_inner(
             }
             // Catch delivery consumes a rooted payload without allocating,
             // collecting or yielding. It is a register-clobbering call, but
-            // does not have (or need) a safepoint synchronization map.
+            // does not have (or need) a safepoint synchronization map. The
+            // structure helpers are noncollecting leaves in the same sense.
             let roots = if activation_slots.is_some()
                 && is_call_like(d.opcode)
-                && !matches!(d.opcode, Opcode::CatchLanding | Opcode::HandlerLanding)
-            {
+                && !matches!(
+                    d.opcode,
+                    Opcode::CatchLanding
+                        | Opcode::HandlerLanding
+                        | Opcode::StructRef
+                        | Opcode::StructSet
+                        | Opcode::StructTypeP
+                ) {
                 emitted_safepoints += 1;
                 Some(
                     safepoint_roots
@@ -9719,6 +9842,20 @@ fn emit_framed_inner(
                         .ok_or(EmitError::UnsupportedOp(0xF2))?;
                     mov_rr(&mut a, dst, 0);
                 }
+            } else if matches!(
+                d.opcode,
+                Opcode::StructRef | Opcode::StructSet | Opcode::StructTypeP
+            ) {
+                #[cfg(not(windows))]
+                emit_struct_access(
+                    &mut a,
+                    &d,
+                    &inst_reg,
+                    &const_tagged,
+                    inst_deopt.get(&inst).copied().unwrap_or(deopt),
+                )?;
+                #[cfg(windows)]
+                return Err(EmitError::UnsupportedOp(op_tag(d.opcode)));
             } else if d.opcode == Opcode::SymbolValue {
                 inst_calls.push(emit_symbol_value(
                     &mut a,
