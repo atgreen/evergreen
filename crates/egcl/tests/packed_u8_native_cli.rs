@@ -56,10 +56,10 @@ fn packed_u8_native_producers_recover_errors_and_preserve_svref_contract() {
           (assert (eq (u8-native-read general 1) token))
           (assert (eq (svref general 1) token))
           (assert (= before (egcl-ext:deopt-count))))
-        ;; Argument evaluation occurs once before the native access. A guard
-        ;; must recover the original call's state without replaying arguments,
-        ;; and the invalid byte must never be truncated into the payload.
-        (let ((store-deopts-before (egcl-ext:deopt-count)))
+        ;; Argument evaluation occurs once before the native access. An
+        ;; invalid access either deoptimizes or calls the general accessor
+        ;; (bliss-gg3i1.7.8); neither may replay arguments, and the invalid
+        ;; byte must never be truncated into the payload.
         (dolist (bad-byte (list -1 256 'not-a-byte))
           (setf (aref small 3) 73 *u8-native-argument-effects* 0)
           (assert
@@ -71,10 +71,7 @@ fn packed_u8_native_producers_recover_errors_and_preserve_svref_contract() {
                   (progn (incf *u8-native-argument-effects*) bad-byte)))))
           (assert (= *u8-native-argument-effects* 3))
           (assert (= (aref small 3) 73)))
-        (assert (> (egcl-ext:deopt-count) store-deopts-before)))
-        (let ((before (egcl-ext:deopt-count)))
-          (assert (u8-native-type-error-p (lambda () (u8-native-read large -1))))
-          (assert (> (egcl-ext:deopt-count) before)))
+        (assert (u8-native-type-error-p (lambda () (u8-native-read large -1))))
         (dolist (bad-index (list -1 8 'not-an-index))
           (let ((contents-before (copy-seq small)))
           (setf *u8-native-argument-effects* 0)
@@ -93,9 +90,7 @@ fn packed_u8_native_producers_recover_errors_and_preserve_svref_contract() {
         ;; SVREF stores retain a distinct vector-only native contract, including
         ;; after an ordinary AREF store has accepted the same packed object.
         (setf (aref small 0) 61)
-        (let ((before (egcl-ext:deopt-count)))
-          (assert (u8-native-type-error-p (lambda () (u8-native-svstore small 0 99))))
-          (assert (> (egcl-ext:deopt-count) before)))
+        (assert (u8-native-type-error-p (lambda () (u8-native-svstore small 0 99))))
         (assert (= (aref small 0) 61))
         (assert (u8-native-type-error-p (lambda () (u8-native-svstore doubles 0 token))))
         (assert (= (aref doubles 0) 1.25d0))
