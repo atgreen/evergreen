@@ -2208,6 +2208,10 @@ fn named_call_symbol(instruction: &Instr) -> Option<u32> {
         Instr::AllocCons => Some(egcl_rt::symbols::intern("CONS")),
         // A structure constructor is built as its %MAKE-STRUCT call.
         Instr::MakeStruct { .. } => Some(egcl_rt::symbols::intern("EGCL::%MAKE-STRUCT")),
+        // A scoped body's structure opcodes are built as their general calls.
+        Instr::StructRef { .. } => Some(egcl_rt::symbols::intern("EGCL::%STRUCT-REF")),
+        Instr::StructSet { .. } => Some(egcl_rt::symbols::intern("EGCL::%STRUCT-SET")),
+        Instr::StructTypeP { .. } => Some(egcl_rt::symbols::intern("EGCL::%STRUCT-TYPEP")),
         _ => None,
     }
 }

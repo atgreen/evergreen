@@ -228,6 +228,7 @@ pub fn build_from_bytecode_for_native_cleanups_snapshot(
     let mut builder = Builder::new(&snapshot.body, options);
     builder.transfer_mode = true;
     builder.native_cleanups = true;
+    builder.structure_calls = true;
     let mut function = builder.run()?;
     legalize_transfer_calls(&mut function, &scopes)?;
     Ok(function)
@@ -261,6 +262,7 @@ fn build_transfer_cfg(
     let mut builder = Builder::new(bf, InlineOptions::default());
     builder.transfer_mode = true;
     builder.native_cleanups = native_cleanups;
+    builder.structure_calls = native_cleanups;
     let mut f = builder.run()?;
     legalize_transfer_calls(&mut f, &scopes)?;
     Ok(f)
@@ -748,6 +750,9 @@ struct Builder<'a> {
     /// Build exceptional cleanup predecessors before SSA sealing. Kept behind
     /// its own entry while native landing maps and cursor dispatch are wired.
     native_cleanups: bool,
+    /// Build structure opcodes as their general calls: the IR is for code
+    /// without deopt metadata, which cannot recover a leaf helper's miss.
+    structure_calls: bool,
     /// `CHAR`/`SCHAR`/`ELT` calls that receive an inline simple-string path
     /// once the CFG is complete (`string_char::admit_string_char_calls`).
     string_char_calls: HashSet<Inst>,
@@ -987,6 +992,12 @@ impl<'a> Builder<'a> {
         Ok(dynamic)
     }
 
+    /// The operand-stack depth a local RETURN-FROM or GO at `bcp` resumes
+    /// with, before RETURN-FROM pushes its value.
+    fn exit_depth(&self, bcp: u32) -> Option<u16> {
+        Some(self.control_scopes.as_ref()?.exit_at(bcp)?.sp_restore)
+    }
+
     fn check_direct_exit(&self, bcp: u32) -> Result<(), BuildError> {
         let exit = self
             .control_scopes
@@ -1036,6 +1047,7 @@ impl<'a> Builder<'a> {
             root_symbol,
             transfer_mode: false,
             native_cleanups: false,
+            structure_calls: false,
             string_char_calls: HashSet::new(),
         }
     }
@@ -1223,6 +1235,11 @@ impl<'a> Builder<'a> {
                         set.insert(i + 1);
                     }
                 }
+                instruction if self.structure_calls && is_structure_opcode(instruction) => {
+                    if i + 1 < code.len() {
+                        set.insert(i + 1);
+                    }
+                }
                 Instr::EnterCleanupNormal {
                     cleanup_bcp,
                     resume_bcp,
@@ -1308,7 +1325,8 @@ impl<'a> Builder<'a> {
                             | Instr::MakeStruct { .. }
                             | Instr::CleanupReturn
                             | Instr::Throw
-                    ))
+                    )
+                    || self.structure_calls && is_structure_opcode(&code[i]))
             {
                 if let Some((cleanup, depth)) = self.exceptional_cleanup(i as u32) {
                     push(cleanup as usize, i32::from(depth), &mut depth_at, &mut work);
@@ -1479,7 +1497,10 @@ impl<'a> Builder<'a> {
                     push(*t as usize, d, &mut depth_at, &mut work);
                 }
                 Instr::Go { target_bcp, .. } => {
-                    push(*target_bcp as usize, d, &mut depth_at, &mut work);
+                    // GO resets the operand stack to its TAGBODY's
+                    // `sp_restore`, as RETURN-FROM does for its BLOCK.
+                    let depth = self.exit_depth(i as u32).map_or(d, i32::from);
+                    push(*target_bcp as usize, depth, &mut depth_at, &mut work);
                 }
                 Instr::BrIfFalse(t) | Instr::BrIfTrue(t) => {
                     push(*t as usize, d - 1, &mut depth_at, &mut work);
@@ -1591,7 +1612,8 @@ impl<'a> Builder<'a> {
                             | Instr::MakeStruct { .. }
                             | Instr::CleanupReturn
                             | Instr::Throw
-                    ))
+                    )
+                    || self.structure_calls && is_structure_opcode(&code[i]))
             {
                 opaque[i] = true;
             }
@@ -1792,6 +1814,38 @@ impl<'a> Builder<'a> {
     /// the same block. Reading the last instruction would then miscount edges and
     /// mis-seal loop headers (bliss-fe8). Only the successor multiset matters here
     /// (for predecessor counting); the real edge order comes from `finish_block`.
+    /// Successors of a native-cleanup call at `bcp` ending its block at `end`:
+    /// its exceptional landings and, unless it is a THROW, normal completion.
+    fn call_successors(
+        &self,
+        instr: &Instr,
+        bcp: u32,
+        end: usize,
+    ) -> Result<Vec<Block>, BuildError> {
+        let blk = |t: usize| -> Result<Block, BuildError> {
+            self.block_of
+                .get(&t)
+                .copied()
+                .ok_or(BuildError::Unsupported(
+                    "branch target is not a block leader",
+                ))
+        };
+        let mut successors = Vec::new();
+        for target in self.exceptional_handlers(bcp) {
+            successors.push(blk(target.body_bcp as usize)?);
+        }
+        for (_, resume, _) in self.exceptional_catches(bcp) {
+            successors.push(blk(resume as usize)?);
+        }
+        if !matches!(instr, Instr::Throw) {
+            successors.push(blk(end)?);
+        }
+        if let Some((cleanup, _)) = self.exceptional_cleanup(bcp) {
+            successors.push(blk(cleanup as usize)?);
+        }
+        Ok(successors)
+    }
+
     fn structural_succs(&self, start: usize, end: usize) -> Result<Vec<Block>, BuildError> {
         let code = &self.bf.code;
         let blk = |t: usize| -> Result<Block, BuildError> {
@@ -1851,20 +1905,10 @@ impl<'a> Builder<'a> {
                 | Instr::MakeClosure {
                     capture_env: false, ..
                 } if self.native_cleanups => {
-                    let mut successors = Vec::new();
-                    for target in self.exceptional_handlers((start + offset) as u32) {
-                        successors.push(blk(target.body_bcp as usize)?);
-                    }
-                    for (_, resume, _) in self.exceptional_catches((start + offset) as u32) {
-                        successors.push(blk(resume as usize)?);
-                    }
-                    if !matches!(instr, Instr::Throw) {
-                        successors.push(blk(end)?);
-                    }
-                    if let Some((cleanup, _)) = self.exceptional_cleanup((start + offset) as u32) {
-                        successors.push(blk(cleanup as usize)?);
-                    }
-                    return Ok(successors);
+                    return self.call_successors(instr, (start + offset) as u32, end);
+                }
+                instruction if self.structure_calls && is_structure_opcode(instruction) => {
+                    return self.call_successors(instr, (start + offset) as u32, end);
                 }
                 Instr::EnterCleanupNormal { cleanup_bcp, .. } if self.transfer_mode => {
                     return Ok(vec![blk(*cleanup_bcp as usize)?]);
@@ -2707,11 +2751,10 @@ impl<'a> Builder<'a> {
                     );
                     stack.push(results[0]);
                 }
-                Instr::PushBlock { sp_restore, .. } | Instr::PushTag { sp_restore, .. } => {
-                    if *sp_restore != 0 {
-                        return Err(BuildError::Unsupported("handler with non-empty sp_restore"));
-                    }
-                }
+                // A BLOCK or TAGBODY may be entered with values already on
+                // the operand stack, as in (f x (loop ...)): RETURN-FROM and GO
+                // truncate the stack to the scope's `sp_restore`.
+                Instr::PushBlock { .. } | Instr::PushTag { .. } => {}
                 Instr::PopHandler => {}
                 Instr::PushUnwind { .. } if self.transfer_mode => {}
                 Instr::EnterCleanupNormal {
@@ -2963,6 +3006,76 @@ impl<'a> Builder<'a> {
                         .ok_or(BuildError::Unsupported("TypeP has a result"))?;
                     stack.push(result);
                 }
+                Instr::StructRef { .. } | Instr::StructSet { .. } | Instr::StructTypeP { .. }
+                    if self.structure_calls =>
+                {
+                    // Code without deopt metadata (a scoped body's T1) cannot
+                    // recover a leaf helper's miss, so the mapped emitter
+                    // refused these opcodes and the whole function stayed in
+                    // T0 (bliss-gg3i1.7.11).
+                    // Build the opcode as the general call T0 makes on a miss,
+                    // as MakeStruct is built as %MAKE-STRUCT.
+                    let (target, operands, constants): (&str, usize, Vec<u16>) = match instruction {
+                        Instr::StructRef { name, slot, .. } => {
+                            ("EGCL::%STRUCT-REF", 1, vec![*name, *slot])
+                        }
+                        Instr::StructSet { name, slot, .. } => {
+                            ("EGCL::%STRUCT-SET", 2, vec![*name, *slot])
+                        }
+                        Instr::StructTypeP { name } => ("EGCL::%STRUCT-TYPEP", 1, vec![*name]),
+                        _ => unreachable!(),
+                    };
+                    let hint = match instruction {
+                        Instr::StructRef { hint, .. } | Instr::StructSet { hint, .. } => {
+                            Some(i64::from(*hint))
+                        }
+                        _ => None,
+                    };
+                    if stack.len() < operands {
+                        return Err(BuildError::Unsupported("stack underflow (structure call)"));
+                    }
+                    for &constant in &constants {
+                        self.constant_symbol(constant)?;
+                    }
+                    let target = egcl_rt::symbols::find_index(target)
+                        .ok_or(BuildError::Unsupported("no structure accessor function"))?;
+                    let fs = self.build_frame_state(block, &stack, i as u32);
+                    let split = stack.len() - operands;
+                    let mut args = stack.split_off(split);
+                    for constant in constants {
+                        args.push(self.emit_const(block, constant)?);
+                    }
+                    if let Some(hint) = hint {
+                        args.push(
+                            self.emit(
+                                block,
+                                Opcode::ConstFixnum,
+                                vec![],
+                                AuxData::FixnumImm(hint),
+                                InstFlags::default(),
+                                None,
+                                IRType::of(TypeBits::FIXNUM),
+                            )
+                            .expect("ConstFixnum has a result"),
+                        );
+                    }
+                    let (inst, results) = self.f.push_inst(
+                        block,
+                        InstData {
+                            opcode: Opcode::Call,
+                            args,
+                            results: vec![],
+                            aux: AuxData::CallTarget(target),
+                            flags: runtime_call_flags(),
+                            targets: vec![],
+                            frame_state: Some(fs),
+                            source_pos: 0,
+                        },
+                        &[(IRType::TOP, ValueRepresentation::Tagged)],
+                    );
+                    self.finish_native_invoke(block, inst, stack, results[0], i as u32, Some(end))?;
+                    return Ok(());
+                }
                 Instr::StructRef { name, slot, hint } | Instr::StructSet { name, slot, hint } => {
                     let aux = AuxData::StructSlot {
                         name: self.constant_symbol(*name)?,
@@ -3046,6 +3159,15 @@ impl<'a> Builder<'a> {
                 }
                 Instr::Go { target_bcp, .. } => {
                     self.check_direct_exit(i as u32)?;
+                    // A TAGBODY entered with values on the operand stack (an
+                    // argument position) resumes with just those values.
+                    if let Some(restore) = self.exit_depth(i as u32) {
+                        let restore = usize::from(restore);
+                        if stack.len() < restore {
+                            return Err(BuildError::Unsupported("GO below sp_restore"));
+                        }
+                        stack.truncate(restore);
+                    }
                     let s = self.block_of[&(*target_bcp as usize)];
                     term = Some(Term::Jump(s));
                     break;
@@ -4064,6 +4186,14 @@ enum Term {
 /// A structure opcode: an ordered, noncollecting leaf helper call whose miss
 /// deoptimizes (bliss-gg3i1.7.2). Not a safepoint, since the helper never
 /// allocates or signals; the guard keeps it ordered and unfoldable.
+/// A DEFSTRUCT accessor or predicate opcode.
+fn is_structure_opcode(instruction: &Instr) -> bool {
+    matches!(
+        instruction,
+        Instr::StructRef { .. } | Instr::StructSet { .. } | Instr::StructTypeP { .. }
+    )
+}
+
 fn struct_access_flags() -> InstFlags {
     InstFlags {
         effectful: true,
