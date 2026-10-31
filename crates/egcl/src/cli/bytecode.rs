@@ -22986,6 +22986,7 @@ extern "C" fn c2i_struct_set(object: u64, value: u64, name: u64, slot_hint: u64)
 /// helper call. Any case the fast constructor does not cover returns UNBOUND
 /// before allocating anything; the caller deopts to T0 at the same opcode,
 /// whose general path finds the class and signals.
+#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 extern "C" fn c2i_make_struct(name: u64, n: u64, args: *const EgclVal) -> u64 {
     let count = n as usize;
     if count != 0 && args.is_null() {
