@@ -1079,6 +1079,16 @@ pub(in crate::cli::bytecode) fn compile_background_t1(input: PreparedT1) -> Opti
     };
     let (emitted, speculations, cold_guesses, has_metadata) = build(input.allow_speculation)
         .or_else(|_| build(false))
+        .inspect_err(|decline| {
+            // The owner reports only that the compilation was declined; name
+            // the step that refused it here, where the reason is known.
+            egcl_rt::blog!(
+                "compile",
+                egcl_rt::log::TRACE,
+                "[T1] {}: background compilation refused: {decline}",
+                sym_label(input.symbol)
+            )
+        })
         .ok()?;
     Some(CompiledT1 {
         emitted,

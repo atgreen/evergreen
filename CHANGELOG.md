@@ -617,6 +617,12 @@
 
 ### Performance
 
+- Compiled AREF and SVREF reads and stores on adjustable, fill-pointer and bit
+  vectors call the general accessor instead of falling back to the
+  interpreter, and functions whose BLOCK or TAGBODY sits in an argument
+  position, or that access structures inside an UNWIND-PROTECT or handler,
+  now compile natively. A loop over adjustable and bit vectors runs about 45
+  times faster ([#955](https://github.com/atgreen/evergreen/pull/955)).
 - `--heap-size` is honored again, typed DEFSTRUCT constructors and writers
   compile natively instead of staying interpreted, and a function whose native
   code keeps failing the same guard stays at T1 instead of being recompiled

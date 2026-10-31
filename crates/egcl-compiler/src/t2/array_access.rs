@@ -222,6 +222,175 @@ pub fn specialize(f: &mut Function, raw: bool, options: &super::inlining::Inline
     count
 }
 
+/// Give each remaining guarded element access a slow path through its original
+/// call instead of a deopt (bliss-gg3i1.7.8). An AREF that meets an adjustable
+/// or fill-pointer vector, or a SETF of SBIT on a bit vector, failed its guard on
+/// every call: the function deoptimized each time and, after two retired
+/// versions, was declined T2 for good. The access becomes a success-only probe
+/// with a Brif to the retained AREF/SVREF/SET-AREF/SET-SVREF call, which
+/// handles every other array and signals every error, exactly as before
+/// specialization.
+///
+/// Run last, after `vector_ranges`: its counted-store proof matches the guarded
+/// `VecSet`, and its checked fallback loop then gets this treatment too. A
+/// later transfer legalization gives the retained calls their usual edges.
+pub fn call_fallbacks(f: &mut Function) -> usize {
+    use super::ir::BlockCall;
+    use std::collections::HashMap;
+    if !super::target_support::vector_element_call_fallback() {
+        return 0;
+    }
+    let sites: Vec<_> = f
+        .block_order()
+        .iter()
+        .flat_map(|&b| f.block(b).insts.clone())
+        .filter(|&i| matches!(f.inst(i).opcode, Opcode::VecRef | Opcode::VecSet))
+        .collect();
+    let mut count = 0;
+    for site in sites {
+        let old = f.inst(site).clone();
+        let store = old.opcode == Opcode::VecSet;
+        let target = match (old.opcode, &old.aux) {
+            (Opcode::VecRef, AuxData::ArrayRef) => "AREF",
+            (Opcode::VecRef, AuxData::None) => "SVREF",
+            (Opcode::VecSet, AuxData::None) => "EGCL::SET-AREF",
+            (Opcode::VecSet, AuxData::SimpleVectorStore) => "EGCL::SET-SVREF",
+            _ => continue,
+        };
+        let Some(symbol) = egcl_rt::symbols::find_index(target) else {
+            continue;
+        };
+        if old.frame_state.is_none()
+            || old.args.len() != if store { 3 } else { 2 }
+            || old.results.len() != 1
+            || old
+                .args
+                .iter()
+                .chain(&old.results)
+                .any(|&v| f.value(v).repr != Repr::Tagged)
+        {
+            continue;
+        }
+        let block = f
+            .block_order()
+            .iter()
+            .copied()
+            .find(|&b| f.block(b).insts.contains(&site))
+            .unwrap();
+        let position = f
+            .block(block)
+            .insts
+            .iter()
+            .position(|&i| i == site)
+            .unwrap();
+        let tail = f.block_mut(block).insts.split_off(position);
+        let join = f.make_block_after(block);
+        let slow = f.make_block_after(block);
+        let fast = f.make_block_after(block);
+        f.block_mut(join).insts = tail[1..].to_vec();
+        // The access keeps its own result as the slow call's; the join's
+        // parameter replaces it everywhere else, frame states included.
+        let result = old.results[0];
+        let joined = f.add_block_param(join, f.value(result).ty, Repr::Tagged);
+        f.replace_values(&HashMap::from([(result, joined)]));
+        for entry in &mut f.osr_entries {
+            for (value, _) in &mut entry.checks {
+                if *value == result {
+                    *value = joined;
+                }
+            }
+        }
+        let mut types = vec![(
+            IRType::of(TypeBits::SYMBOL.join(TypeBits::NULL)),
+            Repr::Tagged,
+        )];
+        if !store {
+            types.push((f.value(result).ty, Repr::Tagged));
+        }
+        let (_, probe) = f.push_inst(
+            block,
+            InstData {
+                opcode: if store {
+                    Opcode::TryVecSet
+                } else {
+                    Opcode::TryVecRef
+                },
+                args: old.args.clone(),
+                results: vec![],
+                aux: old.aux.clone(),
+                flags: InstFlags {
+                    effectful: true,
+                    ..InstFlags::default()
+                },
+                targets: vec![],
+                frame_state: None,
+                source_pos: old.source_pos,
+            },
+            &types,
+        );
+        let terminator = |targets| InstData {
+            opcode: Opcode::Jump,
+            args: vec![],
+            results: vec![],
+            aux: AuxData::None,
+            flags: InstFlags {
+                terminator: true,
+                ..InstFlags::default()
+            },
+            targets,
+            frame_state: None,
+            source_pos: old.source_pos,
+        };
+        f.set_terminator(
+            block,
+            InstData {
+                opcode: Opcode::Brif,
+                args: vec![probe[0]],
+                ..terminator(vec![
+                    BlockCall {
+                        block: fast,
+                        args: vec![],
+                    },
+                    BlockCall {
+                        block: slow,
+                        args: vec![],
+                    },
+                ])
+            },
+        );
+        // A store's result is the stored value; a read's is the element.
+        let fast_value = if store { old.args[2] } else { probe[1] };
+        f.set_terminator(
+            fast,
+            terminator(vec![BlockCall {
+                block: join,
+                args: vec![fast_value],
+            }]),
+        );
+        // The retained call: the access's operands, result and pre-call
+        // recovery state, as `specialize` found it.
+        let call = f.inst_mut(site);
+        call.opcode = Opcode::Call;
+        call.aux = AuxData::CallTarget(symbol);
+        call.flags = InstFlags {
+            effectful: true,
+            call: true,
+            safepoint: true,
+            ..InstFlags::default()
+        };
+        f.block_mut(slow).insts.push(site);
+        f.set_terminator(
+            slow,
+            terminator(vec![BlockCall {
+                block: join,
+                args: vec![result],
+            }]),
+        );
+        count += 1;
+    }
+    count
+}
+
 /// Delay a store-only escape box until the destination actually needs tagged
 /// elements. The packed arm consumes raw bits and does not allocate at all.
 fn specialize_raw_stores(f: &mut Function) -> usize {
@@ -619,6 +788,47 @@ mod tests {
         assert!(access.flags.guard && access.flags.effectful);
         assert!(matches!(access.aux, AuxData::ArrayRef));
         assert_eq!(access.frame_state, Some(state));
+
+        // The guarded read then becomes a probe in front of the original call
+        // (bliss-gg3i1.7.8), whose result reaches the return through a join.
+        let site = f
+            .block(block)
+            .insts
+            .iter()
+            .copied()
+            .find(|&i| f.inst(i).opcode == Opcode::VecRef)
+            .unwrap();
+        if !super::super::target_support::vector_element_call_fallback() {
+            assert_eq!(call_fallbacks(&mut f), 0);
+            return;
+        }
+        assert_eq!(call_fallbacks(&mut f), 1);
+        super::super::verify::verify(&f).unwrap();
+        let probe = f
+            .block(block)
+            .insts
+            .iter()
+            .map(|&i| f.inst(i))
+            .find(|d| d.opcode == Opcode::TryVecRef)
+            .expect("probe in the original block");
+        assert!(matches!(probe.aux, AuxData::ArrayRef));
+        assert_eq!(probe.results.len(), 2);
+        assert!(probe.frame_state.is_none() && !probe.flags.guard);
+        let branch = f.inst(f.terminator(block).unwrap());
+        assert_eq!(branch.opcode, Opcode::Brif);
+        assert_eq!(branch.args, vec![probe.results[0]]);
+        let slow = branch.targets[1].block;
+        assert_eq!(f.block(slow).insts.first(), Some(&site));
+        let call = f.inst(site);
+        assert_eq!(call.opcode, Opcode::Call);
+        assert!(matches!(call.aux, AuxData::CallTarget(s) if s == symbol));
+        assert!(call.flags.call && call.flags.safepoint && !call.flags.guard);
+        assert_eq!(call.frame_state, Some(state));
+        // No guarded access remains to deoptimize.
+        assert!((0..f.num_insts()).all(|i| !matches!(
+            f.inst(Inst(i as u32)).opcode,
+            Opcode::VecRef | Opcode::VecSet
+        )));
     }
     #[test]
     fn simple_vector_store_does_not_select_raw_packed_double_store() {

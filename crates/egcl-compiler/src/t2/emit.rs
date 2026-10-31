@@ -6377,6 +6377,8 @@ fn emit_transfer_function_with_storage(
                     | Opcode::VecSet
                     | Opcode::VecSetInRange
                     | Opcode::ArrayReadDiscarded
+                    | Opcode::TryVecRef
+                    | Opcode::TryVecSet
                     | Opcode::PackedF64P
                     | Opcode::MemoryFence
                     | Opcode::TryIntegerShr
@@ -7813,6 +7815,8 @@ fn emit_framed_inner(
                             | Opcode::NativePoll
                             | Opcode::SmallVectorRangeP | Opcode::PackedU8Layout | Opcode::PackedU8AllocationLayout | Opcode::PackedU8AllocationExtent
                             | Opcode::TryPackedF64Set
+                            | Opcode::TryVecRef
+                            | Opcode::TryVecSet
                             | Opcode::PackedF64P
                     )
                 {
@@ -9265,11 +9269,60 @@ fn emit_framed_inner(
                 vector_range::emit(&mut a, f, &d, &mut inst_reg, &mut inst_pool, &const_tagged)?;
             } else if matches!(
                 d.opcode,
-                Opcode::VecRef | Opcode::VecSet | Opcode::VecSetInRange
+                Opcode::VecRef
+                    | Opcode::VecSet
+                    | Opcode::VecSetInRange
+                    | Opcode::TryVecRef
+                    | Opcode::TryVecSet
             ) {
-                let label = *inst_deopt
-                    .get(&inst)
-                    .ok_or(EmitError::UnsupportedOp(op_tag(d.opcode)))?;
+                // A success-only probe is its guarded access with every
+                // failure branch sent to a local NIL answer instead of the
+                // deopt stub (bliss-gg3i1.7.8). Its results are (flag, value);
+                // the access below writes only the value. A store's value result
+                // is its operand, so TryVecSet has the flag alone; the store's
+                // final copy of it lands in the flag register and is then
+                // overwritten, as is a dead TryVecRef element.
+                let probe = matches!(d.opcode, Opcode::TryVecRef | Opcode::TryVecSet);
+                let probe_failed = a.label();
+                let probe_flag = if probe {
+                    let flag = *d
+                        .results
+                        .first()
+                        .and_then(|value| inst_reg.get(value))
+                        .ok_or(EmitError::UnsupportedOp(op_tag(d.opcode)))?;
+                    let element = if d.opcode == Opcode::TryVecRef {
+                        let element = *d
+                            .results
+                            .get(1)
+                            .ok_or(EmitError::UnsupportedOp(op_tag(d.opcode)))?;
+                        *inst_reg.entry(element).or_insert(flag)
+                    } else {
+                        flag
+                    };
+                    Some((flag, element))
+                } else {
+                    None
+                };
+                let d = if probe {
+                    let mut access = d.clone();
+                    if d.opcode == Opcode::TryVecRef {
+                        access.opcode = Opcode::VecRef;
+                        access.results = vec![d.results[1]];
+                    } else {
+                        access.opcode = Opcode::VecSet;
+                        access.results = vec![d.results[0]];
+                    }
+                    access
+                } else {
+                    d.clone()
+                };
+                let label = if probe {
+                    probe_failed
+                } else {
+                    *inst_deopt
+                        .get(&inst)
+                        .ok_or(EmitError::UnsupportedOp(op_tag(d.opcode)))?
+                };
                 let array = if let Some(&bits) = const_tagged.get(&d.args[0]) {
                     mov_imm64(&mut a, RAX, bits as i64);
                     RAX
@@ -9510,6 +9563,17 @@ fn emit_framed_inner(
                     }
                 }
                 a.bind(stored);
+                if let Some((flag, value)) = probe_flag {
+                    // Every operand is dead once the access has run; write
+                    // the flag last so it may share an operand's register.
+                    let done = a.label();
+                    mov_imm64(&mut a, flag, egcl_rt::value::T.0 as i64);
+                    a.jmp(done);
+                    a.bind(probe_failed);
+                    mov_imm64(&mut a, value, egcl_rt::value::NIL.0 as i64);
+                    mov_imm64(&mut a, flag, egcl_rt::value::NIL.0 as i64);
+                    a.bind(done);
+                }
             } else if matches!(
                 d.opcode,
                 Opcode::PackedF64Ref | Opcode::VecF64Ref | Opcode::PackedF64Set

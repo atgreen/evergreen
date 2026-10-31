@@ -174,6 +174,20 @@ pub const fn vector_element_access() -> bool {
     ))
 }
 
+/// Whether the host emitter encodes `TryVecRef` and `TryVecSet`, the
+/// success-only forms of `VecRef` and `VecSet` that `array_access::call_fallbacks`
+/// puts in front of the retained AREF/SVREF call.
+///
+/// A layout the native access does not cover -- an adjustable or
+/// fill-pointer vector, a bit vector -- then takes the general call instead of
+/// a deopt. Without it, a function whose AREF keeps meeting such an array
+/// deopts on every call and is retired from T2 (bliss-gg3i1.7.8). The probes
+/// share the guarded accesses' layout and bounds checks; a target claiming
+/// this needs both arms, each writing nothing and answering NIL on any miss.
+pub const fn vector_element_call_fallback() -> bool {
+    cfg!(all(target_arch = "x86_64", target_os = "linux"))
+}
+
 /// Whether the host emitter encodes `TryIntegerShr`, the success-only
 /// `(ash x -n)` probe over a fixnum or a ONE-LIMB bignum.
 ///

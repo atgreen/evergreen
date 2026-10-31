@@ -621,7 +621,9 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                 // provenance. Clones retain it; unknown metadata cannot widen
                 // SIMPLE_VECTOR-only SVREF into an AREF byte-array operation.
                 let array_read = matches!(data.opcode, Opcode::VecRef | Opcode::ArrayReadDiscarded);
-                if matches!(data.aux, AuxData::ArrayRef) && !array_read
+                if matches!(data.aux, AuxData::ArrayRef)
+                    && !array_read
+                    && data.opcode != Opcode::TryVecRef
                     || array_read && !matches!(data.aux, AuxData::None | AuxData::ArrayRef)
                     || array_read
                         && (data.args.len() != 2
@@ -644,7 +646,46 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                     ));
                 }
 
-                if matches!(data.aux, AuxData::SimpleVectorStore) && data.opcode != Opcode::VecSet
+                // Success-only probes (bliss-gg3i1.7.8) keep the accesses'
+                // layout contracts but own no recovery: a miss answers NIL.
+                let probe_results = match data.opcode {
+                    Opcode::TryVecRef => 2,
+                    _ => 1,
+                };
+                if matches!(data.opcode, Opcode::TryVecRef | Opcode::TryVecSet)
+                    && (!matches!(
+                        (data.opcode, &data.aux),
+                        (Opcode::TryVecRef, AuxData::None | AuxData::ArrayRef)
+                            | (
+                                Opcode::TryVecSet,
+                                AuxData::None | AuxData::SimpleVectorStore
+                            )
+                    ) || data.args.len()
+                        != if data.opcode == Opcode::TryVecRef {
+                            2
+                        } else {
+                            3
+                        }
+                        || data.results.len() != probe_results
+                        || data.flags
+                            != (crate::t2::ir::InstFlags {
+                                effectful: true,
+                                ..Default::default()
+                            })
+                        || data.frame_state.is_some()
+                        || data.args.iter().chain(&data.results).any(|v| {
+                            valid_values.contains(&v.0)
+                                && f.value(*v).repr != super::ir::ValueRepresentation::Tagged
+                        }))
+                {
+                    errors.push(VerifyError::new(
+                        "V8 array-probe-contract",
+                        format!("block{bi} malformed {:?} array-probe contract", data.opcode),
+                    ));
+                }
+
+                if matches!(data.aux, AuxData::SimpleVectorStore)
+                    && !matches!(data.opcode, Opcode::VecSet | Opcode::TryVecSet)
                     || data.opcode == Opcode::VecSet
                         && (!matches!(data.aux, AuxData::None | AuxData::SimpleVectorStore)
                             || data.args.len() != 3

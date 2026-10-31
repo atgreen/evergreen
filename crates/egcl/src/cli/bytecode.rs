@@ -30575,6 +30575,17 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
         }
     }
 
+    // An array access on a layout the native code does not cover calls the
+    // general accessor instead of deoptimizing (bliss-gg3i1.7.8).
+    if std::env::var_os("EGCL_DISABLE_ARRAY_CALL_FALLBACK").is_none() {
+        for function in std::iter::once(&mut f).chain(packed.iter_mut()) {
+            let fallbacks = egcl_compiler::t2::array_access::call_fallbacks(function);
+            if fallbacks != 0 {
+                t2_log!("{name}: array access call fallbacks: {fallbacks}");
+            }
+        }
+    }
+
     if let Err(e) = egcl_compiler::t2::verify::verify(&f) {
         t2_log!("{name}: post-mid-end verify failed: {e:?} => stay T1");
         return None;
