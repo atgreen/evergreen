@@ -1035,6 +1035,7 @@ fn sweep_dead_function_captures(names: &[EgclVal]) {
                 .borrow_mut()
                 .retain(|symbol| !dead.contains(symbol))
         });
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
         T2_GUARD_RETIREMENTS.scan(|registry| {
             registry
                 .borrow_mut()
@@ -1724,6 +1725,7 @@ fn install_local_definition(sym: u32, body: Option<Arc<BytecodeFunction>>, gener
     OSR_REGISTRY.with(|r| r.borrow_mut().remove(&sym));
     LAZY_DECLINED.with(|s| s.borrow_mut().remove(&sym));
     T2_DECLINED.with(|s| s.borrow_mut().remove(&sym));
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     T2_GUARD_RETIREMENTS.with(|s| s.borrow_mut().remove(&sym));
     T1_DECLINED.with(|s| s.borrow_mut().remove(&sym));
     T2_QUEUED.with(|s| s.borrow_mut().remove(&sym));
@@ -25426,16 +25428,19 @@ static T2_DECLINED: egcl_rt::execution_local::ExecutionLocal<
 /// same guard: without a limit a function whose AREF meets an adjustable
 /// vector was recompiled at T1 and T2 every few dozen calls, for good
 /// (bliss-gg3i1.7.6). Redefining the function clears its entry.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 static T2_GUARD_RETIREMENTS: egcl_rt::execution_local::ExecutionLocal<
     RefCell<HashMap<u32, (usize, u32)>>,
 > = unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(HashMap::new())) };
 
 /// Retired T2 versions of one body after which T2 is declined and the function
 /// stays at T1 until it is redefined.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 const T2_GUARD_RETIREMENT_LIMIT: u32 = 2;
 
 /// Count a T2 version of `body`, installed for `sym`, retired by a non-numeric
 /// guard failure; past the limit, stop compiling T2 for it.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub(super) fn note_t2_guard_retirement(sym: u32, body: &Arc<BytecodeFunction>) {
     let key = Arc::as_ptr(body) as usize;
     let count = T2_GUARD_RETIREMENTS.with(|retirements| {

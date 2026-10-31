@@ -5,8 +5,9 @@ use std::process::Command;
 
 /// A typed structure's writers store through the dispatch fast path once the
 /// value satisfies the slot's type in the instance's own class. Anything else
-/// still runs the writer body: a correctable TYPE-ERROR with STORE-VALUE, and
-/// an inherited writer honors a type the :INCLUDE narrowed.
+/// still runs the writer body: a correctable TYPE-ERROR with STORE-VALUE. As in
+/// SBCL, a parent's writer checks only the parent's declared slot type, not a
+/// type the :INCLUDE narrowed.
 #[test]
 fn typed_structure_writers_check_the_instance_class_type() {
     let program = r#"
@@ -47,7 +48,7 @@ fn typed_structure_writers_check_the_instance_class_type() {
     );
     assert!(
         stdout.contains(
-            r#"RESULT:(:STORED 5 (:TYPE-ERROR "x" FIXNUM) 5 :STORED :STORED (:TYPE-ERROR NOT-A-STRING (OR NULL STRING)) "ok" 42)"#
+            r#"RESULT:(:STORED 5 (:TYPE-ERROR "x" FIXNUM) 5 :STORED :STORED :STORED NOT-A-STRING 42)"#
         ),
         "{stdout}"
     );
