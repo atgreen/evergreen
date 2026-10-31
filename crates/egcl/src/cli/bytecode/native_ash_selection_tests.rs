@@ -69,7 +69,10 @@ fn generic_variable_ash_executes_in_ordinary_and_mapped_t2_without_deopt() {
         let _recording = Recording;
         root_publication::OBSERVE.with(|hook| hook.set(Some(observe)));
         for (index, &(value, count)) in cases.iter().enumerate() {
-            if !mapped {
+            // A fixnum result is answered by ASH's leaf helper before the
+            // adapter (bliss-gg3i1.7.3); only the bignum result crosses it.
+            let crosses_adapter = !mapped && !expected_values[index].is_fixnum();
+            if crosses_adapter {
                 // The ASH adapter services an entry notification before its
                 // call. Request the real yield after it returns to this exact
                 // owner, so the following native poll publishes the frame.

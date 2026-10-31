@@ -3906,6 +3906,49 @@ pub fn result_type_is_u8_vector(result_type: EgclVal) -> bool {
 }
 
 /// SVREF is restricted to a general simple vector, unlike AREF.
+/// [`elt`] for compiled leaf calls (bliss-gg3i1.7.3): the element when the
+/// sequence is a list, a simple vector, a simple string, a bit vector or an
+/// octet vector and the index is in bounds -- the cases whose element needs
+/// no allocation -- and `None` for anything else, including every error.
+pub fn elt_leaf(sequence: EgclVal, index: usize) -> Option<EgclVal> {
+    if sequence.is_cons() || leaf_vector(sequence) {
+        elt(sequence, index).ok()
+    } else {
+        None
+    }
+}
+
+/// [`aref`] on a rank-1 array for compiled leaf calls: as [`elt_leaf`]
+/// without lists, whose AREF is an error.
+pub fn aref_leaf(array: EgclVal, index: usize) -> Option<EgclVal> {
+    if leaf_vector(array) {
+        aref(array, index).ok()
+    } else {
+        None
+    }
+}
+
+/// [`svref`] for compiled leaf calls.
+pub fn svref_leaf(vector: EgclVal, index: usize) -> Option<EgclVal> {
+    if is_vector(vector) {
+        svref(vector, index).ok()
+    } else {
+        None
+    }
+}
+
+/// Simple vectors whose element read allocates nothing. Complex vectors and
+/// packed double-float vectors are excluded.
+fn leaf_vector(v: EgclVal) -> bool {
+    v.is_heap_object()
+        && !is_nil_array(v)
+        && !is_complex_vector(v)
+        && (is_vector(v)
+            || v.is_string()
+            || egcl_rt::types::bit_vector_p(v)
+            || egcl_rt::packed_u8::is_vector(v))
+}
+
 pub fn svref(vector: EgclVal, index: usize) -> Result<EgclVal, EgclError> {
     if !is_vector(vector) {
         return Err(EgclError::TypeError {

@@ -135,6 +135,7 @@ mod call_table;
 #[cfg(test)]
 #[path = "bytecode/declined_dispatch_tests.rs"]
 mod declined_dispatch_tests;
+mod leaf_builtins;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 mod native_callable;
 #[cfg(all(target_arch = "x86_64", windows))]
@@ -23110,6 +23111,7 @@ extern "C" fn c2i_call_builtin_regs(
 /// lives in this crate, which depends on egcl-compiler, so the compiler cannot
 /// reach it directly (bliss-x5y.27).
 pub(super) fn install_direct_builtin_hooks() {
+    leaf_builtins::install();
     // Raw double-float code boxes escaping values through this veneer.
     #[cfg(all(not(egcl_no_t2), target_arch = "x86_64", target_os = "linux"))]
     native_transfer_entry::install_box_double_veneer();

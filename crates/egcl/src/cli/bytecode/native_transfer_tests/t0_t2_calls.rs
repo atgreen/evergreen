@@ -104,7 +104,7 @@ fn run_caller(name: &str, forms: &str, n: i64, env: &mut Env) -> Result<EgclVal,
 }
 
 #[test]
-fn a_t2_leaf_reaches_a_builtin_through_its_cell_without_resolving_it() {
+fn a_t2_leaf_calls_a_builtin_without_resolving_it() {
     let _lock = super::super::super::heap_test_lock()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -137,9 +137,11 @@ fn a_t2_leaf_reaches_a_builtin_through_its_cell_without_resolving_it() {
         lean >= calls as usize,
         "only {lean} of {calls} calls took the lean root entry"
     );
-    assert!(
-        named >= calls as usize,
-        "only {named} of {calls} ELT calls used the named adapter"
+    // ELT of a list is answered by its leaf helper in front of the call
+    // (bliss-gg3i1.7.3): neither the named adapter nor a resolution runs.
+    assert_eq!(
+        named, 0,
+        "{named} of {calls} ELT calls used the named adapter"
     );
     assert_eq!(
         resolves, 0,
@@ -386,7 +388,8 @@ fn t2_elt_reads_simple_strings_inline_and_calls_elt_for_anything_else() {
             "{callee} called out for a simple string"
         );
     }
-    // A list, a vector, an index past the end and a non-sequence reach ELT.
+    // An index past the end and a non-sequence reach ELT. A list or a simple vector is answered by ELT's leaf helper in front
+    // of the ordinary or mapped call (bliss-gg3i1.7.3).
     let mut outcalls = 0;
     for (callee, expected) in [
         ("(t0-t2-str-elt '(1 2 3) 1)", 2),
@@ -410,8 +413,8 @@ fn t2_elt_reads_simple_strings_inline_and_calls_elt_for_anything_else() {
         registry_remove(symbol);
     }
     assert!(
-        outcalls >= 6 * 50,
-        "only {outcalls} of 300 other operands called ELT"
+        outcalls >= 3 * 50,
+        "only {outcalls} of 150 other operands called ELT"
     );
 }
 

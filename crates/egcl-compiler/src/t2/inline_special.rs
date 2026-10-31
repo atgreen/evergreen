@@ -123,11 +123,15 @@ fn ordinary_access(data: &InstData, constants: &HashMap<Value, u64>) -> Option<(
 /// primary result in RAX (the value read, or NIL after an assignment, as the
 /// adapter returns) with CF clear and jump to the returned label, which the
 /// caller binds where the call's own result arrives. On failure fall through
-/// to the call. Writes only RAX and RDX (neither is a value home).
+/// to the call. Writes only RAX and RDX (neither is a value home) outside the
+/// leaf helper call, which preserves the call's argument homes.
 ///
 /// `mv_empty` says the multiple-value buffer is known to be empty on entry:
 /// the adapter empties it, and a CF-clear ordinary return promises an empty
-/// buffer, so without it nothing is emitted.
+/// buffer, so without it the inline cell access is not emitted. A read whose
+/// guard fails (a dynamic binding exists somewhere) or whose buffer is not
+/// known to be empty then asks the leaf global-read helper
+/// (bliss-gg3i1.7.3), which reads the current binding and empties the buffer.
 pub(super) fn emit_ordinary_fast_path(
     a: &mut Asm,
     data: &InstData,
@@ -135,11 +139,16 @@ pub(super) fn emit_ordinary_fast_path(
     constants: &HashMap<Value, u64>,
     mv_empty: bool,
 ) -> Option<egcl_rt::asm::Label> {
-    if !mv_empty {
+    let (store, symbol) = ordinary_access(data, constants)?;
+    let leaf = if store {
+        None
+    } else {
+        super::inline_leaf::load_global_helper()
+    };
+    let object = if mv_empty { object(symbol) } else { None };
+    if object.is_none() && leaf.is_none() {
         return None;
     }
-    let (store, symbol) = ordinary_access(data, constants)?;
-    let object = object(symbol)?;
     // Resolve the stored operand before emitting anything.
     let source = if store {
         let value = data.args[1];
@@ -152,18 +161,34 @@ pub(super) fn emit_ordinary_fast_path(
     };
     let slow = a.label();
     let done = a.label();
-    if let Some(source) = source {
-        match source {
-            Err(bits) => mov_imm64(a, SCRATCH, bits as i64),
-            Ok(home) => load_home(a, SCRATCH, home, 0),
+    if let Some(object) = object {
+        let inline_slow = if leaf.is_some() { a.label() } else { slow };
+        if let Some(source) = source {
+            match source {
+                Err(bits) => mov_imm64(a, SCRATCH, bits as i64),
+                Ok(home) => load_home(a, SCRATCH, home, 0),
+            }
+            emit_store(a, object, SCRATCH, inline_slow);
+            mov_imm64(a, RAX, egcl_rt::value::NIL.0 as i64);
+        } else {
+            emit_load(a, object, inline_slow);
         }
-        emit_store(a, object, SCRATCH, slow);
-        mov_imm64(a, RAX, egcl_rt::value::NIL.0 as i64);
-    } else {
-        emit_load(a, object, slow);
+        a.push(0xf8); // clc: one value, MV buffer untouched (and empty)
+        a.jmp(done);
+        if leaf.is_some() {
+            a.bind(inline_slow);
+        }
     }
-    a.push(0xf8); // clc: one value, MV buffer untouched (and empty)
-    a.jmp(done);
+    if let Some(helper) = leaf {
+        super::inline_leaf::emit_call(
+            a,
+            helper,
+            &[super::inline_leaf::LeafArg::Immediate(u64::from(symbol))],
+            slow,
+        )?;
+        a.push(0xf8); // clc: one value; the helper emptied the MV buffer
+        a.jmp(done);
+    }
     a.bind(slow);
     Some(done)
 }
