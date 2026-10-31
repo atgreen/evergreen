@@ -30,6 +30,7 @@ mod control_payload;
 mod evaluated_builtins;
 pub mod events;
 mod generic_binding;
+mod generic_call;
 mod lexical_identity;
 mod method_continuations;
 mod native_runtime;
@@ -3444,8 +3445,8 @@ thread_local! {
     /// Per-generic dispatch metadata memo (bliss-fy37 #3), keyed by the generic's
     /// interned symbol index and stamped with the same GF_DISPATCH_GENERATION as
     /// the effective-method cache. Avoids recomputing `(combination, cacheable)`
-    /// per call — the `cacheable` check ran `generic_has_eql_specializer`, which
-    /// iterates every method of the generic, on every dispatch.
+    /// per call — the `cacheable` check scanned every method of the generic for
+    /// EQL specializers on every dispatch.
     static GF_META_CACHE: RefCell<HashMap<u32, GfMeta, egcl_rt::fxhash::FxBuildHasher>> =
         RefCell::new(HashMap::default());
 
@@ -9506,12 +9507,29 @@ struct GfEffective {
     /// its slot's symbol index and how it accesses it. See ACCESSOR_METHODS.
     accessor: Option<(u32, SlotAccess)>,
     raw_reader: Option<bytecode::RawSlotReader>,
-    /// Whether `try_single_primary_fast` may call the single primary method's
-    /// compiled body directly, with no next-method context. Not when the body
-    /// mentions CALL-NEXT-METHOD or NEXT-METHOD-P, which read that context (the
-    /// enclosing method's, otherwise), nor for a built-in generic, whose
-    /// built-in behaviour is the method's next method (bliss-y3tk7).
+    /// Whether `try_single_primary_fast` may call the most specific primary
+    /// method's compiled body directly, with no next-method context: the only
+    /// primary method, or one proved never to reach its method context, with
+    /// no auxiliary methods. Not when the body mentions CALL-NEXT-METHOD or
+    /// NEXT-METHOD-P, which read that context (the enclosing method's,
+    /// otherwise), nor for a built-in generic, whose built-in behaviour is the
+    /// method's next method (bliss-y3tk7).
     single_primary_direct: bool,
+    /// Whether the generic is a built-in one, whose own behaviour is its least
+    /// specific primary method (see `run_standard_from_ids`).
+    builtin: bool,
+}
+
+impl GfEffective {
+    /// Every applicable method's id, in role order.
+    fn all_ids(&self) -> impl Iterator<Item = EgclVal> + '_ {
+        self.around
+            .iter()
+            .chain(self.before.iter())
+            .chain(self.primary.iter())
+            .chain(self.after.iter())
+            .copied()
+    }
 }
 
 struct GfDispatchEntry {
@@ -9522,7 +9540,7 @@ struct GfDispatchEntry {
 /// Memoized per-generic dispatch metadata (bliss-fy37 #3). `combination` and
 /// `cacheable` depend only on the generic's definition and method set, both
 /// gen-invalidated; caching them avoids the per-call `env.generics` lookup and
-/// the `generic_has_eql_specializer` method scan.
+/// the per-call method scan for EQL specializers.
 #[derive(Clone)]
 struct GfMeta {
     generation: u64,
@@ -9544,6 +9562,15 @@ struct GfMeta {
     /// dispatch key leaves them out rather than computing their classes -- for
     /// a writer, the class of the value being stored.
     specialized: u8,
+    /// Every `(EQL value)` specializer as `(argument position, value bits)`.
+    /// Only immediate values are keyable: their bits are their identity and
+    /// never move. A generic with an EQL specializer on a heap object is not
+    /// `cacheable`.
+    eql_values: Rc<[(u8, u64)]>,
+    /// Whether a call must still check its keyword arguments against the
+    /// applicable methods (CLHS 7.6.5): the generic's lambda list has &KEY and
+    /// does not itself accept every keyword.
+    keyword_check: bool,
 }
 
 /// Allocation-free dispatch-cache key (bliss-fy37): the generic's interned
@@ -9577,19 +9604,6 @@ struct GfKey {
 /// a method or class (re)definition could change applicability or ordering.
 fn invalidate_gf_dispatch_cache() {
     GF_DISPATCH_GENERATION.fetch_add(1, AtomicOrdering::Release);
-}
-
-/// True if any method on `name` specializes a parameter with `(eql value)` —
-/// then dispatch depends on argument VALUES, not just classes, so the class-keyed
-/// cache is unsound and must be bypassed.
-fn generic_has_eql_specializer(env: &Env, name: &str) -> bool {
-    env.methods.borrow().get(name).is_some_and(|methods| {
-        methods.iter().any(|m| {
-            m.specializers
-                .iter()
-                .any(|s| matches!(s, MethodSpecializer::Eql(_)))
-        })
-    })
 }
 
 /// True if any method on `name` specializes a parameter on a metaclass — the
@@ -9993,10 +10007,13 @@ fn try_single_primary_fast(
     args: &[EgclVal],
     fill: bool,
 ) -> Option<Result<EgclVal, EgclError>> {
+    // `single_primary_direct` and `raw_reader` are only ever set for this
+    // shape: no auxiliary methods, and a most specific primary that is the
+    // whole effective method (see where `GfEffective` is built).
     if !(effective.around.is_empty()
         && effective.before.is_empty()
         && effective.after.is_empty()
-        && effective.primary.len() == 1
+        && !effective.primary.is_empty()
         && (effective.single_primary_direct || effective.raw_reader.is_some()))
     {
         return None;
@@ -10065,18 +10082,15 @@ fn try_single_primary_fast(
 
 fn run_standard_from_ids(
     env: &mut Env,
-    around_ids: &[EgclVal],
-    before_ids: &[EgclVal],
-    primary_ids: &[EgclVal],
-    after_ids: &[EgclVal],
+    effective: &GfEffective,
     name: &str,
     args: &[EgclVal],
 ) -> Result<Option<EgclVal>, EgclError> {
     let (Some(mut around), Some(mut before), Some(mut primary), Some(mut after)) = (
-        methods_by_ids(env, name, around_ids),
-        methods_by_ids(env, name, before_ids),
-        methods_by_ids(env, name, primary_ids),
-        methods_by_ids(env, name, after_ids),
+        methods_by_ids(env, name, &effective.around),
+        methods_by_ids(env, name, &effective.before),
+        methods_by_ids(env, name, &effective.primary),
+        methods_by_ids(env, name, &effective.after),
     ) else {
         return Ok(None);
     };
@@ -10087,7 +10101,7 @@ fn run_standard_from_ids(
     // A built-in generic's own behaviour is the least specific primary method:
     // CALL-NEXT-METHOD from the last user method reaches it, as it reaches the
     // standard method in other implementations (bliss-y3tk7).
-    if is_builtin_function(&symbol_bare_name(name)) {
+    if effective.builtin {
         if let Some(symbol) = resolve_sym(name) {
             primary.push(builtin_next_method(symbol));
         }
@@ -10159,6 +10173,188 @@ fn generic_specialized_positions(env: &Env, name: &str) -> u8 {
     mask
 }
 
+/// `GfMeta` for the generic `name` at `generation`, memoized per interned
+/// generic (bliss-fy37 #3). An un-interned name (which should not happen for a
+/// defined generic) is computed per call without memoizing.
+fn gf_meta(env: &Env, name: &str, gf_idx: Option<u32>, generation: u64) -> GfMeta {
+    if let Some(idx) = gf_idx {
+        let hit = GF_META_CACHE.with(|c| {
+            c.borrow()
+                .get(&idx)
+                .filter(|m| m.generation == generation)
+                .cloned()
+        });
+        if let Some(meta) = hit {
+            return meta;
+        }
+    }
+    let combination = env
+        .generics
+        .borrow()
+        .get(name)
+        .map(|generic| generic.combination)
+        .unwrap_or(egcl_stdlib::MethodCombinationType::Standard);
+    let mut eql_values = Vec::new();
+    let mut eql_keyable = true;
+    if let Some(methods) = env.methods.borrow().get(name) {
+        for method in methods {
+            for (position, specializer) in method.specializers.iter().enumerate() {
+                if let MethodSpecializer::Eql(value) = specializer {
+                    if value.is_heap_object() || position >= GF_KEY_MAX_ARGS {
+                        eql_keyable = false;
+                    } else {
+                        eql_values.push((position as u8, value.0));
+                    }
+                }
+            }
+        }
+    }
+    eql_values.sort_unstable();
+    eql_values.dedup();
+    let cacheable =
+        matches!(combination, egcl_stdlib::MethodCombinationType::Standard) && eql_keyable;
+    let metaclass_sensitive = generic_dispatches_on_a_metaclass(env, name);
+    let precedence: Rc<[usize]> = match gf_idx {
+        Some(idx) => {
+            egcl_stdlib::clos::argument_precedence_order(EgclVal::from_symbol_index(idx)).into()
+        }
+        None => Rc::from(&[][..]),
+    };
+    let slot_reader = generic_is_slot_reader(env, name);
+    let specialized = generic_specialized_positions(env, name);
+    let keyword_check = generic_keyword_check_needed(env, gf_idx, name);
+    let meta = GfMeta {
+        generation,
+        combination,
+        cacheable,
+        metaclass_sensitive,
+        precedence,
+        slot_reader,
+        specialized,
+        eql_values: eql_values.into(),
+        keyword_check,
+    };
+    if let Some(idx) = gf_idx {
+        GF_META_CACHE.with(|c| {
+            c.borrow_mut().insert(idx, meta.clone());
+        });
+    }
+    meta
+}
+
+/// Whether `check_generic_call_arguments` can reject a call for its keyword
+/// arguments once the arity is known to fit: false when the generic's lambda
+/// list has no &KEY, or accepts every keyword itself.
+fn generic_keyword_check_needed(env: &Env, gf_idx: Option<u32>, name: &str) -> bool {
+    let generic_symbol = match gf_idx {
+        Some(idx) if !reader::is_uninterned(idx) => Some(EgclVal::from_symbol_index(idx)),
+        _ => {
+            let generic_function = env
+                .generics
+                .borrow()
+                .get(name)
+                .map(|generic| generic.generic_function);
+            generic_function.and_then(egcl_stdlib::clos::generic_function_name)
+        }
+    };
+    let Some(lambda_list) = generic_symbol.and_then(stored_generic_lambda_list) else {
+        return false;
+    };
+    let generic = lambda_list_key_info(lambda_list);
+    generic.has_key && !generic.allow_other_keys && !standard_generic_allows_other_keys(name)
+}
+
+/// `builtin` bit marking an argument keyed by its own identity because it is
+/// the value of an `(EQL value)` specializer at its position. The class and
+/// type bits use 0..=23.
+const DISPATCH_BIT_EQL_VALUE: u32 = 1 << 24;
+
+/// The dispatch-cache key for calling generic `gf` on `args`, or `None` when
+/// such a call bypasses the cache: an uncacheable generic, or more arguments
+/// than the inline key holds (truncating would be unsound).
+///
+/// Every position some method specializes is keyed on what decides its
+/// applicability: an argument that is an EQL specializer's (immediate) value
+/// on itself, any other on its class identity and built-in type bits, which
+/// are immediates too (a class metaobject is its name symbol or a fixnum).
+/// The key therefore holds no movable reference and needs no GC tracing.
+#[inline]
+fn gf_dispatch_key(gf: u32, args: &[EgclVal], meta: &GfMeta) -> Option<GfKey> {
+    if !meta.cacheable || args.len() > GF_KEY_MAX_ARGS {
+        return None;
+    }
+    let mut classes = [0u64; GF_KEY_MAX_ARGS];
+    let mut builtin = [0u32; GF_KEY_MAX_ARGS];
+    for (position, ((slot, bits), a)) in classes
+        .iter_mut()
+        .zip(builtin.iter_mut())
+        .zip(args.iter())
+        .enumerate()
+    {
+        // An argument no method specializes cannot change which methods
+        // apply; leave its entry zero.
+        if meta.specialized & (1 << position) == 0 {
+            continue;
+        }
+        if meta
+            .eql_values
+            .iter()
+            .any(|&(p, value)| usize::from(p) == position && value == a.0)
+        {
+            (*slot, *bits) = (a.0, DISPATCH_BIT_EQL_VALUE);
+            continue;
+        }
+        // `dispatch_key_entry` costs a class-registry lookup per argument, so
+        // it is used only for the generics that need it: one whose methods
+        // specialize on a metaclass, where two class metaobjects would
+        // otherwise share a key (bliss-xv37u).
+        if meta.metaclass_sensitive {
+            (*slot, *bits) = dispatch_key_entry(*a);
+        } else {
+            *slot = egcl_stdlib::class_of(*a).0;
+            *bits = dispatch_builtin_discriminator(*a);
+        }
+    }
+    Some(GfKey {
+        gf,
+        n: args.len() as u8,
+        classes,
+        builtin,
+    })
+}
+
+/// Run a cached standard effective method. `None` when one of its method ids
+/// no longer resolves, or the dispatch generation moved on: recompute.
+fn run_cached_effective(
+    env: &mut Env,
+    name: &str,
+    args: &[EgclVal],
+    m: &GfEffective,
+    precedence: &[usize],
+    generation: u64,
+    fill: bool,
+) -> Option<Result<EgclVal, EgclError>> {
+    if let Some(fast) = try_single_primary_fast(env, m, args, fill) {
+        return Some(fast);
+    }
+    // A concurrent new publication discards this cached decision.
+    if GF_DISPATCH_GENERATION.load(AtomicOrdering::Acquire) != generation {
+        return None;
+    }
+    let invocation = match method_continuations::cached_snapshot(
+        name, &m.ordered, precedence, generation, env,
+    ) {
+        Ok(invocation) => invocation,
+        Err(error) => return Some(Err(error)),
+    };
+    let _invocation_scope = method_continuations::InvocationScope::enter(env, Some(invocation));
+    match run_standard_from_ids(env, m, name, args) {
+        Ok(Some(result)) => Some(Ok(result)),
+        Ok(None) => None,
+        Err(error) => Some(Err(error)),
+    }
+}
+
 fn invoke_generic_function(
     name: &str,
     input_args: &[EgclVal],
@@ -10185,99 +10381,41 @@ fn invoke_generic_function_inner(
         .with(std::cell::Cell::take)
         .is_some_and(|gf| Some(gf) == gf_idx);
     let generation = GF_DISPATCH_GENERATION.load(AtomicOrdering::Acquire);
-    // Per-generic metadata memo (bliss-fy37 #3): (combination, cacheable) is a
-    // pure function of the generic's definition + its method set, both of which
-    // bump GF_DISPATCH_GENERATION when they change (defgeneric at ~28390,
-    // defmethod at ~28586). Computing it per call meant an env.generics lookup
-    // AND generic_has_eql_specializer iterating EVERY method on every dispatch —
-    // O(methods) per call, measurable on many-method generics (asdf). Memoize it,
-    // gen-stamped, keyed by the generic's interned symbol index.
-    let (combination, cacheable, metaclass_sensitive, precedence, slot_reader, specialized) =
-        match gf_idx {
-            Some(idx) => {
-                let hit = GF_META_CACHE.with(|c| {
-                    c.borrow()
-                        .get(&idx)
-                        .filter(|m| m.generation == generation)
-                        .map(|m| {
-                            (
-                                m.combination,
-                                m.cacheable,
-                                m.metaclass_sensitive,
-                                Rc::clone(&m.precedence),
-                                m.slot_reader,
-                                m.specialized,
-                            )
-                        })
-                });
-                hit.unwrap_or_else(|| {
-                    let combination = env
-                        .generics
-                        .borrow()
-                        .get(name)
-                        .map(|generic| generic.combination)
-                        .unwrap_or(egcl_stdlib::MethodCombinationType::Standard);
-                    let cacheable =
-                        matches!(combination, egcl_stdlib::MethodCombinationType::Standard)
-                            && !generic_has_eql_specializer(env, name);
-                    let metaclass_sensitive = generic_dispatches_on_a_metaclass(env, name);
-                    let precedence: Rc<[usize]> = egcl_stdlib::clos::argument_precedence_order(
-                        EgclVal::from_symbol_index(idx),
-                    )
-                    .into();
-                    let slot_reader = generic_is_slot_reader(env, name);
-                    let specialized = generic_specialized_positions(env, name);
-                    GF_META_CACHE.with(|c| {
-                        c.borrow_mut().insert(
-                            idx,
-                            GfMeta {
-                                generation,
-                                combination,
-                                cacheable,
-                                metaclass_sensitive,
-                                precedence: Rc::clone(&precedence),
-                                slot_reader,
-                                specialized,
-                            },
-                        );
-                    });
-                    (
-                        combination,
-                        cacheable,
-                        metaclass_sensitive,
-                        precedence,
-                        slot_reader,
-                        specialized,
-                    )
-                })
-            }
-            None => {
-                // Un-interned generic name (shouldn't happen for a defined GF): fall
-                // back to the per-call computation without memoizing.
-                let combination = env
-                    .generics
-                    .borrow()
-                    .get(name)
-                    .map(|generic| generic.combination)
-                    .unwrap_or(egcl_stdlib::MethodCombinationType::Standard);
-                let cacheable = matches!(combination, egcl_stdlib::MethodCombinationType::Standard)
-                    && !generic_has_eql_specializer(env, name);
-                // No key is built on this path (it needs `gf_idx`), so the flag is
-                // unused here — computed anyway rather than hardcoded, so that
-                // building a key here later cannot silently inherit a wrong value.
-                let metaclass_sensitive = generic_dispatches_on_a_metaclass(env, name);
-                let slot_reader = generic_is_slot_reader(env, name);
-                let specialized = generic_specialized_positions(env, name);
-                (
-                    combination,
-                    cacheable,
-                    metaclass_sensitive,
-                    Rc::from(&[][..]),
-                    slot_reader,
-                    specialized,
-                )
-            }
-        };
+    let meta = gf_meta(env, name, gf_idx, generation);
+    let combination = meta.combination;
+    let precedence = Rc::clone(&meta.precedence);
+    let slot_reader = meta.slot_reader;
+    // Build the allocation-free dispatch key (bliss-fy37). `None` (bypass the
+    // cache) if not cacheable, if the GF name is somehow un-interned, or if there
+    // are more args than the inline key holds (truncating would be unsound).
+    let dispatch_key = gf_idx.and_then(|gf| gf_dispatch_key(gf, args, &meta));
+    // A cached decision was recorded only after this argument count passed the
+    // checks below, so a hit (same generation, same count) needs neither the
+    // accessor arity check nor the lambda-list arity check again.
+    let cached = dispatch_key.and_then(|key| {
+        GF_DISPATCH_CACHE.with(|c| {
+            c.borrow()
+                .get(&key)
+                .filter(|e| e.generation == generation)
+                .map(|e| Rc::clone(&e.methods))
+        })
+    });
+    if let Some(receiver) = args.first() {
+        let receiver_class = egcl_stdlib::class_of(*receiver);
+        bytecode::record_generic_receiver_profile(name, receiver_class.0);
+    }
+    if let Some(m) = cached {
+        if meta.keyword_check {
+            check_generic_call_arguments(env, gf_idx, name, args, Some(&mut m.all_ids()))?;
+        }
+        if let Some(result) =
+            run_cached_effective(env, name, args, &m, &precedence, generation, fill)
+        {
+            return result;
+        }
+        // A cached id no longer resolves (method redefined without a
+        // generation bump would be a bug, but tolerate it): recompute below.
+    }
     // Reader calls share this path with FUNCALL/APPLY and compiled callers.
     // Reject wrong arity before method applicability can turn a missing
     // receiver into NO-APPLICABLE-METHOD instead of PROGRAM-ERROR.
@@ -10287,104 +10425,7 @@ fn invoke_generic_function_inner(
             args.len()
         )));
     }
-    if let Some(receiver) = args.first() {
-        let receiver_class = egcl_stdlib::class_of(*receiver);
-        bytecode::record_generic_receiver_profile(name, receiver_class.0);
-    }
     check_generic_call_arguments(env, gf_idx, name, args, None)?;
-    // Build the allocation-free dispatch key (bliss-fy37): interned GF symbol
-    // index + up to GF_KEY_MAX_ARGS `class_of` identity bits. `None` (bypass the
-    // cache) if not cacheable, if the GF name is somehow un-interned, or if there
-    // are more args than the inline key holds (truncating would be unsound).
-    let dispatch_key = if cacheable && args.len() <= GF_KEY_MAX_ARGS {
-        gf_idx.map(|gf| {
-            let mut classes = [0u64; GF_KEY_MAX_ARGS];
-            let mut builtin = [0u32; GF_KEY_MAX_ARGS];
-            for (position, ((slot, bits), a)) in classes
-                .iter_mut()
-                .zip(builtin.iter_mut())
-                .zip(args.iter())
-                .enumerate()
-            {
-                // An argument no method specializes cannot change which
-                // methods apply; leave its entry zero.
-                if specialized & (1 << position) == 0 {
-                    continue;
-                }
-                // `dispatch_key_entry` costs a class-registry lookup per
-                // argument, so it is used only for the generics that need it:
-                // one whose methods specialize on a metaclass, where two class
-                // metaobjects would otherwise share a key (bliss-xv37u).
-                if metaclass_sensitive {
-                    (*slot, *bits) = dispatch_key_entry(*a);
-                } else {
-                    *slot = egcl_stdlib::class_of(*a).0;
-                    *bits = dispatch_builtin_discriminator(*a);
-                }
-            }
-            GfKey {
-                gf,
-                n: args.len() as u8,
-                classes,
-                builtin,
-            }
-        })
-    } else {
-        None
-    };
-    if let Some(key) = dispatch_key {
-        // Cache HIT clones a single Rc (a refcount bump), not the four method-id
-        // Vecs the old (String, Vec) entry cloned on every call.
-        let cached = GF_DISPATCH_CACHE.with(|c| {
-            c.borrow()
-                .get(&key)
-                .filter(|e| e.generation == generation)
-                .map(|e| Rc::clone(&e.methods))
-        });
-        if let Some(m) = cached {
-            check_generic_call_arguments(
-                env,
-                gf_idx,
-                name,
-                args,
-                Some(
-                    &mut m
-                        .around
-                        .iter()
-                        .chain(m.before.iter())
-                        .chain(m.primary.iter())
-                        .chain(m.after.iter())
-                        .copied(),
-                ),
-            )?;
-            egcl_rt::rooted!(
-                candidates = env.methods.borrow().get(name).cloned().unwrap_or_default()
-            );
-            // Keep the current candidate universe owned before any entry. A
-            // concurrent new publication discards this cached decision.
-            if GF_DISPATCH_GENERATION.load(AtomicOrdering::Acquire) == generation {
-                if let Some(fast) = try_single_primary_fast(env, &m, args, fill) {
-                    return fast;
-                }
-                let invocation = method_continuations::snapshot(
-                    name,
-                    &candidates,
-                    &m.ordered,
-                    &precedence,
-                    env,
-                )?;
-                let _invocation_scope =
-                    method_continuations::InvocationScope::enter(env, Some(invocation));
-                if let Some(result) = run_standard_from_ids(
-                    env, &m.around, &m.before, &m.primary, &m.after, name, args,
-                )? {
-                    return Ok(result);
-                }
-            }
-            // A cached id no longer resolves (method redefined without a
-            // generation bump would be a bug, but tolerate it): recompute below.
-        }
-    }
 
     let mut methods = env.methods.borrow().get(name).cloned().unwrap_or_default();
     if methods.is_empty() {
@@ -10438,11 +10479,12 @@ fn invoke_generic_function_inner(
     // `run_standard_from_ids`), so :around, :before or :after methods alone
     // still have a primary to run: a MAKE-INSTANCE :around method's
     // CALL-NEXT-METHOD reaches the built-in instantiation (bliss-agqzs).
+    let builtin = is_builtin_function(&symbol_bare_name(name));
     let effective = egcl_stdlib::clos::compute_effective_method_with_standard_primary(
         NIL,
         combination,
         &method_ids,
-        is_builtin_function(&symbol_bare_name(name)),
+        builtin,
     )?;
     match combination {
         egcl_stdlib::MethodCombinationType::Standard => {
@@ -10467,15 +10509,23 @@ fn invoke_generic_function_inner(
             } else {
                 None
             };
-            let single_primary_direct = primary_ids.len() == 1
-                && !is_builtin_function(&symbol_bare_name(name))
-                && (accessor.is_some() || method_context_unused(primary_ids[0]));
+            // A most specific primary method proved never to reach its method
+            // context, lexically or dynamically, cannot call its next method:
+            // with no auxiliary methods it is the whole effective method, however
+            // many less specific primaries apply.
+            let single_primary_direct = !primary_ids.is_empty()
+                && !builtin
+                && ((primary_ids.len() == 1 && accessor.is_some())
+                    || (around_ids.is_empty()
+                        && before_ids.is_empty()
+                        && after_ids.is_empty()
+                        && method_context_unused(primary_ids[0])));
             let raw_reader = if accessor.is_none()
                 && around_ids.is_empty()
                 && before_ids.is_empty()
                 && after_ids.is_empty()
                 && primary_ids.len() == 1
-                && !is_builtin_function(&symbol_bare_name(name))
+                && !builtin
             {
                 METHOD_RAW_READERS.borrow().get(&primary_ids[0].0).cloned()
             } else {
@@ -10490,6 +10540,7 @@ fn invoke_generic_function_inner(
                 accessor,
                 raw_reader,
                 single_primary_direct,
+                builtin,
             });
             if let Some(key) = dispatch_key {
                 GF_DISPATCH_CACHE.with(|c| {
@@ -10511,15 +10562,7 @@ fn invoke_generic_function_inner(
                 method_continuations::snapshot(name, &methods, &method_ids, &precedence, env)?;
             let _invocation_scope =
                 method_continuations::InvocationScope::enter(env, Some(invocation));
-            match run_standard_from_ids(
-                env,
-                &effective.around,
-                &effective.before,
-                &effective.primary,
-                &effective.after,
-                name,
-                args,
-            )? {
+            match run_standard_from_ids(env, &effective, name, args)? {
                 Some(result) => Ok(result),
                 // The ids came from `ordered` just now, so they must resolve.
                 None => Err(EgclError::Internal(
@@ -42567,6 +42610,9 @@ fn store_generic_lambda_list(name_form: EgclVal, lambda_list: EgclVal) {
     // SETF function names are lists, so their metadata must use the same
     // synthetic symbol holder as every other generic-function option.
     store_generic_option(name_form, GENERIC_LAMBDA_LIST_PROPERTY, lambda_list);
+    // A cached dispatch decision stands for calls whose arity this lambda list
+    // admitted; see `invoke_generic_function_inner`.
+    invalidate_gf_dispatch_cache();
 }
 
 /// DEFGENERIC's `(:method-class name)`, NIL when it gave none (GitHub #508).

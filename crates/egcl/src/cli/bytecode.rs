@@ -17384,6 +17384,21 @@ pub(super) fn call_registered_method_if_body(
     args: &[EgclVal],
     env: &mut Env,
 ) -> Option<Result<EgclVal, EgclError>> {
+    // Installed T2 code for the proved body: enter it through the cached
+    // FUNCALL target, as `apply_function` would, skipping the per-call
+    // registry and tier lookups below. Allocation-free until it runs.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    if env.locally_specials.is_empty()
+        && method_no_context_body_matches(function, proof)
+        && let Some(result) = native_transfer_entry::funcall_fast::apply(
+            function,
+            args,
+            env,
+            native_transfer_entry::funcall_fast::Admit::Native,
+        )
+    {
+        return Some(result);
+    }
     egcl_rt::rooted!(function = function);
     egcl_rt::rooted!(args = args.to_vec());
     let expected = proof.upgrade()?;
@@ -17432,13 +17447,46 @@ pub(super) struct RawSlotReader {
 
 pub(super) fn compile_and_reify_method_lambda(
     label: &str,
-    lambda_list: EgclVal,
-    body: EgclVal,
+    mut lambda_list: EgclVal,
+    mut body: EgclVal,
     env: &super::Env,
     spec: MethodContextSpec,
 ) -> Option<(EgclVal, Option<MethodNoContextBody>, Option<RawSlotReader>)> {
+    // Compilation allocates; a second compile below reads these again.
+    egcl_rt::rooted_ref!(_lambda_list_root = &mut lambda_list);
+    egcl_rt::rooted_ref!(_body_root = &mut body);
     let scope = method_context_use::Scope::enter(spec);
     let function = compile_and_reify_lambda_inner(label, lambda_list, body, env)?;
+    if scope.lexically_unused() && scope.raw_reader().is_none() {
+        // Nothing reads the generated method-context binding or its helper
+        // functions, so the source body without them is the same method minus
+        // a method-context encoding and two environment frames per call. The
+        // dynamic context that open calls may consult is established by the
+        // caller (`invoke_method`) either way, and the complete proof still
+        // covers the plain body, which makes exactly the same calls.
+        let unused = scope.unused();
+        drop(scope);
+        egcl_rt::rooted!(function = function);
+        let plain = super::method_continuations::unwrapped_body(body);
+        if plain != body
+            && let Some(direct) = compile_and_reify_lambda_inner(label, lambda_list, plain, env)
+        {
+            let proof = if unused {
+                bytecode_for_callable(egcl_rt::function::definition_index(direct), direct)
+                    .map(|(_, body)| Arc::downgrade(&body))
+            } else {
+                None
+            };
+            return Some((direct, proof, None));
+        }
+        let proof = if unused {
+            bytecode_for_callable(egcl_rt::function::definition_index(*function), *function)
+                .map(|(_, body)| Arc::downgrade(&body))
+        } else {
+            None
+        };
+        return Some((*function, proof, None));
+    }
     let proof = if scope.unused() {
         bytecode_for_callable(egcl_rt::function::definition_index(function), function)
             .map(|(_, body)| Arc::downgrade(&body))
@@ -25040,7 +25088,7 @@ impl ReceiverTypeProfile {
     }
 }
 
-fn generic_receiver_profile(name: &str) -> &'static ReceiverTypeProfile {
+pub(super) fn generic_receiver_profile(name: &str) -> &'static ReceiverTypeProfile {
     // Look up by &str FIRST (bliss-jtc.9 perf). `entry()` needs an owned key, so
     // the previous `entry(name.to_string())` allocated — and freed — a String on
     // EVERY generic dispatch, including the overwhelmingly common case where the
