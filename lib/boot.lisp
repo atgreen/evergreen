@@ -520,11 +520,33 @@
        (setf ,place (%check-type-fail ,place ',typespec)))
      nil))
 
+(defun egcl::%fast-slot-type-test (place typespec)
+  ;; A test form equivalent to (%DECLARATION-TYPEP PLACE 'TYPESPEC) for the
+  ;; slot types structures commonly declare, built from tests compiled code
+  ;; answers inline; NIL when the declaration needs %DECLARATION-TYPEP.
+  ;; PLACE is a variable, so repeating it is safe (bliss-gg3i1.7.2).
+  (cond ((and (symbolp typespec) typespec
+              (not (member typespec '(function compiled-function))))
+         `(typep ,place ',typespec))
+        ((atom typespec) nil)
+        ((and (eq (car typespec) 'or) (consp (cdr typespec)))
+         (let ((tests (mapcar (lambda (spec) (egcl::%fast-slot-type-test place spec))
+                              (cdr typespec))))
+           (unless (member nil tests) `(or ,@tests))))
+        ;; Only two fixnum bounds confine the integer to a fixnum.
+        ((and (eq (car typespec) 'integer) (= (length typespec) 3)
+              (typep (second typespec) 'fixnum)
+              (typep (third typespec) 'fixnum))
+         `(and (typep ,place 'fixnum)
+               (<= ,(second typespec) ,place ,(third typespec))))
+        (t nil)))
+
 (defmacro egcl::%check-structure-type (place typespec)
   ;; Slot declarations can contain FUNCTION signatures, which public TYPEP
   ;; cannot discriminate. Keep the original declaration in failure conditions.
   `(progn
-     (unless (egcl::%declaration-typep ,place ',typespec)
+     (unless ,(or (egcl::%fast-slot-type-test place typespec)
+                  `(egcl::%declaration-typep ,place ',typespec))
        (setf ,place (%check-type-fail ,place ',typespec
                                      #'egcl::%declaration-typep)))
      nil))
