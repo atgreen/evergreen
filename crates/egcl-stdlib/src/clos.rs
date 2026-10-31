@@ -3544,6 +3544,68 @@ pub fn make_struct(class: EgclVal, values: &[EgclVal]) -> Result<EgclVal, EgclEr
     Ok(inst)
 }
 
+/// A structure constructor's allocation plan: the current wrapper of the
+/// structure named by a constant, for `count` positional values. Plain Rust
+/// data, so it can be held across the allocation it describes.
+#[derive(Clone, Copy)]
+pub struct StructAllocation {
+    wrapper: &'static ClassWrapper,
+    count: usize,
+}
+
+/// The fast plan for `(%make-struct 'name v1..vcount)`: `name` currently names
+/// a finalized, defined structure class whose current layout lists its slots in
+/// constructor order (DEFSTRUCT order, :INCLUDEd slots first), with at least
+/// `count` slots. Anything else -- no such class, a forward reference, an
+/// unfinalized or non-prefix layout, too many values -- is None, and the caller
+/// takes [`make_struct`] through FIND-CLASS, which signals as before. One
+/// shared-state read; no allocation (bliss-gg3i1.7.2).
+pub fn struct_allocation(name: EgclVal, count: usize) -> Option<StructAllocation> {
+    with_state(|st| {
+        let class = *st.class_registry.get(&name)?;
+        let meta = st.class_meta.get(&class)?;
+        if meta.forward_referenced || !meta.protocol.finalized {
+            return None;
+        }
+        let wrapper = meta.wrapper?;
+        (wrapper.state.load(Ordering::Acquire) == WRAPPER_CURRENT
+            && !wrapper.struct_info.load(Ordering::Acquire).is_null()
+            && wrapper.layout.order.len() >= count
+            && wrapper.slot_count as usize >= count)
+            .then_some(StructAllocation { wrapper, count })
+    })
+}
+
+/// Allocate the instance `plan` describes, every slot unbound. May collect:
+/// the caller keeps its values in GC-scanned storage and stores them
+/// afterwards with [`struct_init_slot`].
+pub fn allocate_struct(plan: StructAllocation) -> Result<EgclVal, EgclError> {
+    let slot_count = plan.wrapper.slot_count as usize;
+    let mut storage = alloc_slot_storage(slot_count, false)
+        .ok_or_else(|| EgclError::Internal("GC heap unavailable for instance slots".into()))?;
+    egcl_rt::rooted_ref!(_storage_root = &mut storage);
+    let body = egcl_rt::gc::alloc_typed(SLOT_STORAGE_OFFSET, type_id::STANDARD_OBJECT)
+        .ok_or_else(|| EgclError::Internal("GC heap unavailable for instance".into()))?;
+    unsafe {
+        let inst = EgclVal::from_heap_ptr(body.sub(8));
+        set_instance_storage(inst, storage);
+        set_instance_wrapper(
+            inst,
+            plan.wrapper as *const ClassWrapper as *mut ClassWrapper,
+        );
+        Ok(inst)
+    }
+}
+
+/// Store constructor value `index` (< the plan's `count`) into a fresh
+/// instance from [`allocate_struct`]. Does not allocate.
+pub fn struct_init_slot(plan: StructAllocation, instance: EgclVal, index: usize, value: EgclVal) {
+    assert!(index < plan.count);
+    unsafe {
+        *slot_cell(instance, index) = value;
+    }
+}
+
 pub fn make_instance(class: EgclVal, initargs: &[EgclVal]) -> Result<EgclVal, EgclError> {
     with_state(|st| {
         if is_builtin_class(st, class) {

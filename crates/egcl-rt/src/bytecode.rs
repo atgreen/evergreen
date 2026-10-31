@@ -155,6 +155,11 @@ pub enum Instr {
     /// DEFSTRUCT predicate body: pop one operand, push T when it is an instance
     /// of the structure named by constant `name` or of one including it.
     StructTypeP { name: u16 },
+    /// DEFSTRUCT constructor body: pop `nargs` slot values (pushed in
+    /// constructor order) and push a fresh instance of the structure named by
+    /// constant `name`, as `(egcl::%make-struct 'name v1 .. vn)` does. The
+    /// values stay on the operand stack, rooted, until the instance exists.
+    MakeStruct { name: u16, nargs: u16 },
     /// Check the primary result without consuming it or changing the pending
     /// multiple-value tuple. Failure signals TYPE-ERROR, even at safety zero.
     CheckResult(DeclaredType),

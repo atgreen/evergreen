@@ -1212,6 +1212,7 @@ impl<'a> Builder<'a> {
                 | Instr::SetValues(_)
                 | Instr::ValuesToList
                 | Instr::AllocCons
+                | Instr::MakeStruct { .. }
                 | Instr::Throw
                 | Instr::EvalHost(_)
                 | Instr::LoadFunction(_)
@@ -1304,6 +1305,7 @@ impl<'a> Builder<'a> {
                             | Instr::SetValues(_)
                             | Instr::ValuesToList
                             | Instr::AllocCons
+                            | Instr::MakeStruct { .. }
                             | Instr::CleanupReturn
                             | Instr::Throw
                     ))
@@ -1459,6 +1461,9 @@ impl<'a> Builder<'a> {
                 Instr::AllocCons => {
                     push(i + 1, d - 1, &mut depth_at, &mut work); // car, cdr -> cons
                 }
+                Instr::MakeStruct { nargs, .. } => {
+                    push(i + 1, d - (*nargs as i32) + 1, &mut depth_at, &mut work);
+                }
                 Instr::ClearMv => {
                     push(i + 1, d, &mut depth_at, &mut work); // no operand-stack effect
                 }
@@ -1583,6 +1588,7 @@ impl<'a> Builder<'a> {
                             | Instr::SetValues(_)
                             | Instr::ValuesToList
                             | Instr::AllocCons
+                            | Instr::MakeStruct { .. }
                             | Instr::CleanupReturn
                             | Instr::Throw
                     ))
@@ -1838,6 +1844,7 @@ impl<'a> Builder<'a> {
                 | Instr::SetValues(_)
                 | Instr::ValuesToList
                 | Instr::AllocCons
+                | Instr::MakeStruct { .. }
                 | Instr::Throw
                 | Instr::EvalHost(_)
                 | Instr::LoadFunction(_)
@@ -2558,6 +2565,63 @@ impl<'a> Builder<'a> {
                             args,
                             results: vec![],
                             aux: AuxData::CallTarget(cons_sym),
+                            flags: runtime_call_flags(),
+                            targets: vec![],
+                            frame_state: Some(fs),
+                            source_pos: 0,
+                        },
+                        &[(IRType::TOP, ValueRepresentation::Tagged)],
+                    );
+                    if self.native_cleanups {
+                        self.finish_native_invoke(
+                            block,
+                            inst,
+                            stack,
+                            results[0],
+                            i as u32,
+                            Some(end),
+                        )?;
+                        return Ok(());
+                    }
+                    stack.push(results[0]);
+                }
+                Instr::MakeStruct { name, nargs } => {
+                    // A DEFSTRUCT constructor (bliss-gg3i1.7.2). It allocates,
+                    // so it is built as the `(%make-struct 'name v...)` call it
+                    // came from, as AllocCons is built as a call to CONS: the
+                    // collecting call keeps its safepoint, root publication and
+                    // exceptional edges, and its cold state keeps the values on
+                    // the stack so T0 re-executes MAKE-STRUCT. The runtime
+                    // answers this call target with its constructor fast path.
+                    let n = *nargs as usize;
+                    if stack.len() < n {
+                        return Err(BuildError::Unsupported("stack underflow (MakeStruct)"));
+                    }
+                    let struct_name = self.constant_symbol(*name)?;
+                    let target = egcl_rt::symbols::find_index("EGCL::%MAKE-STRUCT")
+                        .ok_or(BuildError::Unsupported("no structure constructor"))?;
+                    let fs = self.build_frame_state(block, &stack, i as u32);
+                    let name_value = self
+                        .emit(
+                            block,
+                            Opcode::ConstSymbol,
+                            vec![],
+                            AuxData::SymbolRef(struct_name),
+                            InstFlags::default(),
+                            None,
+                            IRType::of(TypeBits::SYMBOL),
+                        )
+                        .expect("ConstSymbol has a result");
+                    let split = stack.len() - n;
+                    let mut args = vec![name_value];
+                    args.extend(stack.split_off(split));
+                    let (inst, results) = self.f.push_inst(
+                        block,
+                        InstData {
+                            opcode: Opcode::Call,
+                            args,
+                            results: vec![],
+                            aux: AuxData::CallTarget(target),
                             flags: runtime_call_flags(),
                             targets: vec![],
                             frame_state: Some(fs),
@@ -5944,6 +6008,45 @@ mod tests {
             assert_eq!(scope.bcp, bcp, "{opcode:?}");
             assert_eq!(scope.stack.len(), depth, "{opcode:?}");
         }
+    }
+
+    #[test]
+    fn structure_constructor_is_built_as_its_collecting_call() {
+        let target = egcl_rt::symbols::intern("EGCL::%MAKE-STRUCT");
+        let name = egcl_rt::symbols::intern("T2-MAKE-STRUCT-FIXTURE");
+        let input = bf(
+            "make-struct-opcode",
+            vec![
+                Instr::LoadLocal(0),
+                Instr::LoadLocal(1),
+                Instr::MakeStruct { name: 0, nargs: 2 },
+                Instr::Return,
+            ],
+            vec![EgclVal::from_symbol_index(name)],
+            2,
+            2,
+            2,
+        );
+        let f = build_from_bytecode(&input).expect("MakeStruct bytecode must reach T2");
+        let call = f
+            .block(f.entry())
+            .insts
+            .iter()
+            .map(|&i| f.inst(i))
+            .find(|d| d.opcode == Opcode::Call)
+            .expect("MakeStruct must become a call");
+        assert!(matches!(call.aux, AuxData::CallTarget(symbol) if symbol == target));
+        assert!(call.flags.call && call.flags.safepoint && call.flags.effectful);
+        assert_eq!(call.args.len(), 3);
+        let name_def = f.value(call.args[0]).def;
+        let crate::t2::ir::ValueDef::Result { inst, .. } = name_def else {
+            panic!("the structure name is a constant operand");
+        };
+        assert!(matches!(f.inst(inst).aux, AuxData::SymbolRef(symbol) if symbol == name));
+        // Recovery re-executes MAKE-STRUCT with its values still stacked.
+        let state = f.frame_states.get(call.frame_state.expect("call state"));
+        let scope = state.scopes.last().unwrap();
+        assert_eq!((scope.bcp, scope.stack.len()), (2, 2));
     }
 
     #[test]
