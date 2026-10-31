@@ -617,6 +617,14 @@
 
 ### Performance
 
+- Generic-function calls from compiled code use a per-generic dispatch cache
+  and skip argument checks already proven by the cached decision; methods that
+  never call CALL-NEXT-METHOD no longer build a method continuation, and
+  SLOT-VALUE in methods no longer takes the full MOP path. A warm monomorphic
+  generic call takes about 4.8 us instead of 34 us, and an `:accessor` reader
+  0.75 us instead of 394 us
+  ([#952](https://github.com/atgreen/evergreen/pull/952)).
+
 - Compiled closures read their captured variables faster (a FUNCALL of such a
   closure from a warmed caller takes about 0.48 us instead of 0.74 us), and
   `#'FUNCALL`, `#'APPLY` and `#'VECTOR` passed as function values no longer
