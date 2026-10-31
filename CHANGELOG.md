@@ -454,6 +454,11 @@
 
 ### Changed
 
+- DEFSTRUCT accessors are ordinary functions, as in SBCL: calling one on an
+  object of the wrong type signals TYPE-ERROR, DEFMETHOD no longer extends it,
+  and an included structure's writer checks the slot type the included
+  structure declared ([#948](https://github.com/atgreen/evergreen/pull/948)).
+
 - Avoid redundant rational normalization and unit-denominator arithmetic for
   exact integer addition, subtraction, multiplication and comparison
   ([#930](https://github.com/atgreen/evergreen/pull/930)).
@@ -611,6 +616,16 @@
   ([#638](https://github.com/atgreen/evergreen/pull/638)).
 
 ### Performance
+
+- DEFSTRUCT accessors, writers, predicates and constructors compile to native
+  structure operations instead of generic-function calls and MAKE-INSTANCE-style
+  dispatch, and BIT-AND and the other bit-array functions work bytewise. A
+  warmed structure read and write loop runs 8.6x faster, a structure predicate
+  about 20x, TYPECASE over structure types 38x and a keyword constructor about
+  6x; compiling SBCL's `show.lisp` with the EGCL-hosted cross-compiler takes
+  9.5 s warm instead of about 18 s
+  ([#948](https://github.com/atgreen/evergreen/pull/948)).
+
 
 - Structure predicates and `TYPEP`/`TYPECASE` over structure types no longer
   compare slot names as strings on every call: a warmed structure predicate
