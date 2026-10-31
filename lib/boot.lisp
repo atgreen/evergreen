@@ -525,8 +525,11 @@
   ;; slot types structures commonly declare, built from tests compiled code
   ;; answers inline; NIL when the declaration needs %DECLARATION-TYPEP.
   ;; PLACE is a variable, so repeating it is safe (bliss-gg3i1.7.2).
+  ;; A DEFTYPE name can expand to a FUNCTION signature, which public TYPEP
+  ;; cannot discriminate, so it takes %DECLARATION-TYPEP as well.
   (cond ((and (symbolp typespec) typespec
-              (not (member typespec '(function compiled-function))))
+              (not (member typespec '(function compiled-function)))
+              (not (assoc typespec *type-expanders*)))
          `(typep ,place ',typespec))
         ((atom typespec) nil)
         ((and (eq (car typespec) 'or) (consp (cdr typespec)))
@@ -541,14 +544,21 @@
                (<= ,(second typespec) ,place ,(third typespec))))
         (t nil)))
 
+(defun egcl::%structure-type-fail (value typespec)
+  ;; The failure path of %CHECK-STRUCTURE-TYPE, kept out of line: the
+  ;; #'%DECLARATION-TYPEP reference and the multiple-value store of an inline
+  ;; failure made every typed DEFSTRUCT constructor and writer ineligible for
+  ;; native structure access, so they stayed interpreted (bliss-gg3i1.7.6).
+  (%check-type-fail value typespec #'egcl::%declaration-typep))
+
 (defmacro egcl::%check-structure-type (place typespec)
   ;; Slot declarations can contain FUNCTION signatures, which public TYPEP
   ;; cannot discriminate. Keep the original declaration in failure conditions.
   `(progn
      (unless ,(or (egcl::%fast-slot-type-test place typespec)
                   `(egcl::%declaration-typep ,place ',typespec))
-       (setf ,place (%check-type-fail ,place ',typespec
-                                     #'egcl::%declaration-typep)))
+       (,(if (symbolp place) 'setq 'setf) ,place
+        (egcl::%structure-type-fail ,place ',typespec)))
      nil))
 
 (defun egcl::%checked-structure-slot-value (value object slot)

@@ -630,6 +630,11 @@ pub(super) fn refresh_installed(expected: &NativeCode) -> Option<Rc<NativeCode>>
         return None;
     }
     egcl_rt::rooted!(function = function);
+    // A replacement T2 would speculate from the same profile and fail the
+    // same guard; count the retirement so a repeating failure stays at T1.
+    if expected.is_t2 {
+        note_t2_guard_retirement(symbol, &body);
+    }
     // Retire only the exact current publication. Its running activations keep
     // their owner, while subsequent calls execute T0 until replacement arrives.
     NATIVE_REGISTRY.with(|registry| registry.borrow_mut().remove(&symbol));

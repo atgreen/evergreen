@@ -49367,10 +49367,6 @@ pub fn run(args: &[String]) -> Result<i32, EgclError> {
     // simply sits below the real bottom and never triggers, which is the
     // behaviour that existed before this guard — never worse.
     egcl_rt::stack::set_native_stack_limit(6 * 1024 * 1024);
-    // Let compiled code call builtins directly instead of resolving them by
-    // name through apply_function on every call (bliss-x5y.27). The table lives
-    // in this crate, so the T2 emitter cannot reach it without being told.
-    bytecode::install_direct_builtin_hooks();
     // A restored entry point can run without reading any source. Its formatter
     // still needs to dispatch saved PRINT-OBJECT methods and condition reports.
     egcl_stdlib::format::set_print_object_hook(Some(stdlib_print_object_hook));
@@ -49401,6 +49397,12 @@ pub fn run(args: &[String]) -> Result<i32, EgclError> {
             eprintln!("egcl: warning: --heap-size arrived after the heap was initialized; ignored");
         }
     }
+    // Let compiled code call builtins directly instead of resolving them by
+    // name through apply_function on every call (bliss-x5y.27). The table lives
+    // in this crate, so the T2 emitter cannot reach it without being told.
+    // Installing interns symbols, which allocates and so initializes the heap:
+    // it must follow `--heap-size`, or the heap is built at its default size.
+    bytecode::install_direct_builtin_hooks();
     if ca.runtime_info {
         print!("{}", native_runtime::contract().encode());
         return Ok(0);

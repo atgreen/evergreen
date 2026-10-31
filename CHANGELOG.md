@@ -617,6 +617,11 @@
 
 ### Performance
 
+- `--heap-size` is honored again, typed DEFSTRUCT constructors and writers
+  compile natively instead of staying interpreted, and a function whose native
+  code keeps failing the same guard stays at T1 instead of being recompiled
+  without end. On the EGCL-hosted SBCL build this cuts peak memory by about
+  28% ([#953](https://github.com/atgreen/evergreen/pull/953)).
 - Generic-function calls from compiled code use a per-generic dispatch cache
   and skip argument checks already proven by the cached decision; methods that
   never call CALL-NEXT-METHOD no longer build a method continuation, and
