@@ -617,6 +617,12 @@
 
 ### Performance
 
+- On x86-64 Linux, small pieces of compiled native code now share executable
+  pages instead of each taking its own memory mapping. A long-running build of
+  SBCL hosted on EGCL uses about half the memory (2.66 GB → 1.29 GB peak by
+  its 24th file) and roughly 1/16th the executable memory, and no longer
+  approaches the kernel's mapping limit
+  ([#956](https://github.com/atgreen/evergreen/pull/956)).
 - `--heap-size` is honored again, typed DEFSTRUCT constructors and writers
   compile natively instead of staying interpreted, and a function whose native
   code keeps failing the same guard stays at T1 instead of being recompiled

@@ -8,12 +8,92 @@
 //! read+execute) so the process never holds a simultaneously writable+executable
 //! mapping. Installed native code owns its buffer until its last activation or
 //! compiled caller releases it. Process-lifetime trampolines may leak a buffer.
+//!
+//! On x86-64 Linux, buffers up to 256 KiB are instead packed into a shared
+//! code arena (`jit/arena.rs`) whose pages have separate never-executable
+//! writable and never-writable executable views. Such a buffer starts on a
+//! 64-byte boundary rather than a page boundary.
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64", not(egcl_tsan)))]
+mod arena;
+
+/// Process-wide executable-code accounting, reported by `ROOM`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CodeMemoryStats {
+    /// Code buffers currently owned (including leaked process-lifetime ones).
+    pub live_buffers: usize,
+    /// Machine-code bytes in those buffers.
+    pub live_code_bytes: usize,
+    /// Executable bytes those buffers occupy, after allocation rounding.
+    pub live_reserved_bytes: usize,
+    /// Buffers ever installed.
+    pub total_buffers: u64,
+    /// Buffers released.
+    pub freed_buffers: u64,
+    /// Buffers deliberately kept for the life of the process.
+    pub leaked_buffers: u64,
+    /// Shared code-arena chunks mapped (see `jit/arena.rs`).
+    pub arena_chunks: usize,
+    /// Executable bytes those chunks span.
+    pub arena_bytes: usize,
+    /// Arena pages returned to the kernel after their code was released.
+    pub arena_released_pages: u64,
+}
+
+mod stats {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+    pub(super) static LIVE_BUFFERS: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static LIVE_CODE: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static LIVE_RESERVED: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static TOTAL: AtomicU64 = AtomicU64::new(0);
+    pub(super) static FREED: AtomicU64 = AtomicU64::new(0);
+    pub(super) static LEAKED: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn allocated(code: usize, reserved: usize) {
+        LIVE_BUFFERS.fetch_add(1, Relaxed);
+        LIVE_CODE.fetch_add(code, Relaxed);
+        LIVE_RESERVED.fetch_add(reserved, Relaxed);
+        TOTAL.fetch_add(1, Relaxed);
+    }
+
+    pub(super) fn freed(code: usize, reserved: usize) {
+        LIVE_BUFFERS.fetch_sub(1, Relaxed);
+        LIVE_CODE.fetch_sub(code, Relaxed);
+        LIVE_RESERVED.fetch_sub(reserved, Relaxed);
+        FREED.fetch_add(1, Relaxed);
+    }
+}
+
+/// Snapshot the executable-code accounting.
+pub fn code_memory_stats() -> CodeMemoryStats {
+    use std::sync::atomic::Ordering::Relaxed;
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(egcl_tsan)))]
+    let (arena_chunks, arena_bytes, arena_released_pages) = arena::stats();
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64", not(egcl_tsan))))]
+    let (arena_chunks, arena_bytes, arena_released_pages) = (0, 0, 0);
+    CodeMemoryStats {
+        live_buffers: stats::LIVE_BUFFERS.load(Relaxed),
+        live_code_bytes: stats::LIVE_CODE.load(Relaxed),
+        live_reserved_bytes: stats::LIVE_RESERVED.load(Relaxed),
+        total_buffers: stats::TOTAL.load(Relaxed),
+        freed_buffers: stats::FREED.load(Relaxed),
+        leaked_buffers: stats::LEAKED.load(Relaxed),
+        arena_chunks,
+        arena_bytes,
+        arena_released_pages,
+    }
+}
 
 /// A block of executable machine code.
 pub struct JitBuffer {
     ptr: *mut u8,
     len: usize,
     code_len: usize,
+    /// Bytes copied into the buffer (code plus any trailing metadata).
+    image_len: usize,
+    /// Whether the code lives in the shared code arena rather than its own
+    /// mapping.
+    in_arena: bool,
     debug_registration: Option<crate::jit_debug::Registration>,
     #[cfg(all(windows, target_arch = "x86_64"))]
     unwind:
@@ -46,6 +126,20 @@ impl JitBuffer {
         // The iOS profile never asks the OS for generated executable memory.
         if cfg!(target_os = "ios") || code.is_empty() {
             return None;
+        }
+        #[cfg(all(target_os = "linux", target_arch = "x86_64", not(egcl_tsan)))]
+        if let Some((ptr, len)) = arena::alloc(code) {
+            // x86-64 instruction fetch is coherent with the stores made through
+            // the arena's writable view; no flush is required.
+            stats::allocated(code.len(), len);
+            return Some(JitBuffer {
+                ptr,
+                len,
+                code_len: code.len(),
+                image_len: code.len(),
+                in_arena: true,
+                debug_registration: None,
+            });
         }
         let page = crate::syscall::page_size();
         let len = code.len().checked_add(page - 1)? & !(page - 1);
@@ -88,10 +182,13 @@ impl JitBuffer {
             // x86-64, which has coherent caches).
             #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
             flush_instruction_cache(ptr, code.len());
+            stats::allocated(code.len(), len);
             Some(JitBuffer {
                 ptr,
                 len,
                 code_len: code.len(),
+                image_len: code.len(),
+                in_arena: false,
                 debug_registration: None,
                 #[cfg(all(windows, target_arch = "x86_64"))]
                 unwind: None,
@@ -230,6 +327,7 @@ impl JitBuffer {
     /// (reserved for process-lifetime code such as recovery trampolines).
     pub fn leak(self) -> *const u8 {
         let ptr = self.ptr;
+        stats::LEAKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         std::mem::forget(self);
         ptr
     }
@@ -339,6 +437,7 @@ unsafe fn flush_instruction_cache(ptr: *const u8, len: usize) {
 
 impl Drop for JitBuffer {
     fn drop(&mut self) {
+        stats::freed(self.image_len, self.len);
         // Field destruction would happen AFTER munmap. Unregister explicitly,
         // even when a debugger reader still holds an Arc to the immutable bytes.
         drop(self.debug_registration.take());
@@ -356,6 +455,12 @@ impl Drop for JitBuffer {
                 return;
             }
         }
+        #[cfg(all(target_os = "linux", target_arch = "x86_64", not(egcl_tsan)))]
+        if self.in_arena {
+            arena::free(self.ptr, self.len);
+            return;
+        }
+        debug_assert!(!self.in_arena);
         #[cfg(any(unix, windows))]
         // SAFETY: `ptr`/`len` came from a successful mmap in `new`.
         unsafe {

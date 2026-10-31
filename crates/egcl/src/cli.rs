@@ -28263,6 +28263,25 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     g.regions_total,
                     g.regions_free,
                 );
+                let code = egcl_rt::jit::code_memory_stats();
+                let report = format!(
+                    "{report}  native code:    {} buffers, {} code bytes in {} executable bytes \
+                     ({} installed, {} freed, {} permanent)\n",
+                    code.live_buffers,
+                    code.live_code_bytes,
+                    code.live_reserved_bytes,
+                    code.total_buffers,
+                    code.freed_buffers,
+                    code.leaked_buffers,
+                );
+                let report = if code.arena_chunks == 0 {
+                    report
+                } else {
+                    format!(
+                        "{report}  code arena:     {} chunks spanning {} bytes, {} pages released\n",
+                        code.arena_chunks, code.arena_bytes, code.arena_released_pages
+                    )
+                };
                 // CLHS ROOM: the report goes to *STANDARD-OUTPUT* (ansi room.1).
                 egcl_rt::rooted!(out = resolve_output_stream(NIL, env));
                 write_str_to(*out, &report, env)?;
