@@ -12374,6 +12374,14 @@ impl Env {
         self.mv_active = true;
     }
 
+    /// `set_mv(vec![primary, second])` reusing the buffer's storage, so a
+    /// two-valued builtin such as GETHASH allocates nothing per call.
+    fn set_mv2(&mut self, primary: EgclVal, second: EgclVal) {
+        self.mv.clear();
+        self.mv.extend_from_slice(&[primary, second]);
+        self.mv_active = true;
+    }
+
     /// Materialize successful native-return metadata without allocating. The
     /// primary is already in a native register or an explicitly rooted caller
     /// slot. Normalize VALUES-of-one so no duplicate root survives that return.
@@ -46222,7 +46230,7 @@ fn apply_builtin_fast(
             let default = if args.len() >= 3 { args[2] } else { NIL };
             Some(
                 egcl_stdlib::gethash(args[0], args[1], default).map(|(val, present)| {
-                    env.set_mv(vec![val, if present { T } else { NIL }]);
+                    env.set_mv2(val, if present { T } else { NIL });
                     val
                 }),
             )

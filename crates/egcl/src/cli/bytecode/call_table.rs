@@ -543,6 +543,16 @@ fn publish_target(state: &State, revision: u64, target: Option<Target>) {
         } else {
             [entries[2], entries[3]]
         };
+        // A builtin with leaf helpers answers checked (T1) and mapped native
+        // calls before their bridges (bliss-gg3i1.7.3).
+        #[cfg(all(target_arch = "x86_64", unix))]
+        if let Some(Target::Builtin { .. }) = target.as_ref()
+            && let Some(entry) = super::leaf_builtins::register_stub(state.symbol, entries[4])
+        {
+            native[0] = entry;
+            #[cfg(target_os = "linux")]
+            super::leaf_builtins::front_native_entry(&state.cell, state.symbol);
+        }
         #[cfg(any(
             all(target_arch = "x86_64", unix),
             all(target_arch = "s390x", target_os = "linux")

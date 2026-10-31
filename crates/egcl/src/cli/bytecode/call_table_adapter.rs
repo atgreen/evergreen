@@ -355,10 +355,18 @@ pub(super) fn ensure(state: &State) {
         // owns both, so the helper need not resolve the symbol per call.
         let bytes = match &probe {
             Some(probe) => funcall_adapter_code(state, probe),
-            None => egcl_compiler::t2::native_transfer::emit_ordinary_entry_veneer(
-                super::super::native_transfer_entry::ordinary_calls::named_entry,
-                Arc::as_ptr(&state.cell) as usize,
-            ),
+            None => {
+                // A builtin with leaf helpers answers them before the veneer
+                // (bliss-gg3i1.7.3); the stub falls through into it.
+                let mut bytes = super::super::leaf_builtins::ordinary_stub(state.symbol);
+                bytes.extend_from_slice(
+                    &egcl_compiler::t2::native_transfer::emit_ordinary_entry_veneer(
+                        super::super::native_transfer_entry::ordinary_calls::named_entry,
+                        Arc::as_ptr(&state.cell) as usize,
+                    ),
+                );
+                bytes
+            }
         };
         let Some(code) = egcl_rt::jit::JitBuffer::new(&bytes) else {
             return;

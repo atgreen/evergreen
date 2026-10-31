@@ -380,6 +380,12 @@ mod shared_deopt;
 #[path = "inline_special.rs"]
 mod inline_special;
 
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[path = "inline_leaf.rs"]
+mod inline_leaf;
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub use inline_leaf::{LeafBuiltin, LeafHelpers, install_leaf_helpers};
+
 /// The CLI's test for a globally special variable (bliss-csc8v). Proclamations
 /// live above this crate; the test must stay true once it is true.
 static SPECIAL_VARIABLE_TEST: std::sync::OnceLock<fn(u32) -> bool> = std::sync::OnceLock::new();
@@ -8688,6 +8694,16 @@ fn emit_framed_inner(
                                 &d,
                                 &homes,
                                 &const_tagged,
+                                inline_alloc_single.contains(&inst),
+                            )
+                        })
+                        .or_else(|| {
+                            inline_leaf::emit_ordinary_fast_path(
+                                &mut a,
+                                &d,
+                                &homes,
+                                &const_tagged,
+                                normalized_calls.contains(&inst),
                                 inline_alloc_single.contains(&inst),
                             )
                         })

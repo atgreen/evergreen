@@ -401,13 +401,15 @@ fn ordinary_tail_long_chain_retires_owners_and_relocates_error_arguments() {
         );
         // All 65 forwarding edges still tail-jump and every edge is still
         // admitted (cold calls stay 0, asserted above). Three named-adapter
-        // entries reach the boundary rather than one since #420: the terminal's
-        // own IF arms are the shape it newly admits, so the chain's boundary
-        // accounting changed with it. bliss-mmnhf confirms where the two extra
-        // entries come from and whether they can be folded back into a jump.
+        // entries reached the boundary rather than one since #420: the
+        // terminal's own IF arms are the shape it newly admits, so the chain's
+        // boundary accounting changed with it. One of them was the terminal's
+        // CONSP, which the builtin's leaf stub now answers before the adapter's
+        // veneer (bliss-gg3i1.7.3), leaving two. bliss-mmnhf confirms where the
+        // extra entries come from and whether they can be folded into a jump.
         assert_eq!(
             native_transfer_entry::ordinary_calls::take_named_entries_for_test(),
-            3,
+            2,
             "repeat {repeat}: forwarding edges tail-jump; only the terminal boundary uses the named adapter"
         );
         assert!(

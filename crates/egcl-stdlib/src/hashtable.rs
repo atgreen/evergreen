@@ -1513,6 +1513,26 @@ pub fn gethash(
     Ok((default, false))
 }
 
+/// GETHASH for compiled leaf calls (bliss-gg3i1.7.3): the same lookup as
+/// [`gethash`] for an unsynchronized EQ or EQL table, `None` for anything else
+/// (another test, a synchronized table, or not a hash table). Takes no lock,
+/// allocates nothing and cannot signal.
+pub fn gethash_leaf(key: EgclVal, table: EgclVal, default: EgclVal) -> Option<(EgclVal, bool)> {
+    if table.tag() != TAG_HEAP_OBJECT {
+        return None;
+    }
+    let ptr = unsafe { table.as_ptr() } as *mut HashTableInner;
+    if ptr.is_null() || unsafe { (*ptr).header.type_id() } != type_id::HASH_TABLE {
+        return None;
+    }
+    // Safety: a live hash table; `synchronized` and `test` never change.
+    let inner = unsafe { &*ptr };
+    if inner.synchronized || !matches!(inner.test, HashTest::Eq | HashTest::Eql) {
+        return None;
+    }
+    gethash(key, table, default).ok()
+}
+
 /// Does the string KEY stored in a table hold exactly `text`? Allocation-free
 /// for a real simple string; a registry-backed sentinel (whose bits are not a
 /// pointer) is resolved through the registry, as [`extract_string_bytes`] does.
