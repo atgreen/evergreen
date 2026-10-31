@@ -413,6 +413,9 @@ pub(super) struct TransferCode {
     /// Cache state has no strong code edge. Dirty weak tokens cover current,
     /// retired and externally retained code without a registry ownership cycle.
     callable_cache: Rc<CallableIdentityCache>,
+    /// Lock-free symbol snapshots of `body.names`, built on the first captured
+    /// variable access through the ordinary lexical leaf (bliss-gg3i1.7.3).
+    leaf_names: std::cell::OnceCell<Box<[egcl_rt::symbols::ResolvedSymbolName]>>,
     #[cfg(test)]
     unavailable_catch: Option<u32>,
     #[cfg(test)]
@@ -968,6 +971,22 @@ impl TransferCode {
         self.ordinary_entry
             .filter(|offset| *offset < self.code_len)?;
         Some((self.code.as_ptr() as usize, self.code_len))
+    }
+
+    /// `symbols::find_index` of `body.names[index]`, from a lock-free
+    /// snapshot that a rename or image restore refreshes. A name with no
+    /// symbol looks again on every use, exactly as `find_index` does.
+    pub(super) fn leaf_symbol(&self, index: usize) -> Option<u32> {
+        self.leaf_names
+            .get_or_init(|| {
+                self.body
+                    .names
+                    .iter()
+                    .map(|name| egcl_rt::symbols::ResolvedSymbolName::new(name))
+                    .collect()
+            })
+            .get(index)
+            .and_then(egcl_rt::symbols::ResolvedSymbolName::index)
     }
 
     /// Shared code is safe for distinct closures only when every native frame
@@ -3377,7 +3396,7 @@ unsafe fn lexical_environment_leaf(
     } else {
         // Preserve the resolved ordinary-name fast path. Encoded identity keys
         // must never be treated as names to intern or resolve in that registry.
-        let symbol = egcl_rt::symbols::find_index(name);
+        let symbol = owner.leaf_symbol(usize::from(index));
         if store {
             let value = unsafe { *call.args };
             if !Env::set_resolved_frame_var(frame, name, symbol, value) {

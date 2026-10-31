@@ -23311,6 +23311,13 @@ fn c2i_call_result(sym: u64, args: &[EgclVal], profile_site: u64) -> Result<Egcl
     // catchable condition rather than aborting across this `extern "C"` frame.
     guard_c2i(|| {
         let env = unsafe { &mut *env_ptr };
+        // FUNCALL of the builtin applies its first argument, as the general
+        // route below eventually does through FUNCALL's own designator
+        // (bliss-gg3i1.7.3). The callee entry roots what it needs.
+        #[cfg(all(target_arch = "x86_64", unix))]
+        if n != 0 && call_table_funcall::is_builtin(sym32) {
+            return super::apply_function(args[0], &args[1..], env);
+        }
         egcl_rt::rooted!(function = egcl_rt::symbols::symbol_function(sym32).unwrap_or(fn_val));
         // Dispatch a compiled (bytecode) callee through the T0 path `run()`, whose
         // run_loop dispatches ITS calls flatly on the EgclStack (bliss-x5y.4). This
@@ -23355,15 +23362,19 @@ fn c2i_call_result(sym: u64, args: &[EgclVal], profile_site: u64) -> Result<Egcl
                     None => run_with_sym(callee, args, *function, callee_sym, env),
                 }
             }
-            _ => apply_function(
-                if *function == NIL || *function == egcl_rt::value::UNBOUND {
-                    fn_val
-                } else {
-                    *function
-                },
-                args,
-                env,
-            ),
+            // A designator with no function object -- a builtin such as
+            // VALUES or VECTOR, a generic, or an undefined name -- dispatches by
+            // name in `apply_function_impl`. Entering it through the published
+            // callable adapter first only to have it decline a symbol cost
+            // several microseconds a call (bliss-gg3i1.7.3); any Lisp the
+            // builtin calls back still owns its own segment via apply_function.
+            _ if *function == NIL
+                || *function == egcl_rt::value::UNBOUND
+                || *function == fn_val =>
+            {
+                super::apply_function_impl(fn_val, args, env)
+            }
+            _ => apply_function(*function, args, env),
         }
     })
 }

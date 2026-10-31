@@ -14116,6 +14116,22 @@ fn apply_spread_list(val: EgclVal) -> Result<Vec<EgclVal>, EgclError> {
     Ok(items)
 }
 
+/// `(apply f a ... list)` on already-evaluated arguments, as the APPLY
+/// operator arm runs it. The caller roots `args`.
+fn apply_spread_call(args: &[EgclVal], env: &mut Env) -> Result<EgclVal, EgclError> {
+    let Some((&last, middle)) = args[1..].split_last() else {
+        return Err(EgclError::ProgramError(
+            "APPLY requires at least 2 arguments".into(),
+        ));
+    };
+    // Reading the spread list does not allocate; root the result before the
+    // callee can.
+    let mut spread: Vec<EgclVal> = middle.to_vec();
+    spread.extend(apply_spread_list(last)?);
+    egcl_rt::rooted_ref!(_spread = &mut spread);
+    apply_function(args[0], &spread, env)
+}
+
 fn list_to_vec_with_tail(val: EgclVal) -> (Vec<EgclVal>, EgclVal) {
     let mut result = Vec::new();
     let mut c = val;
@@ -45745,6 +45761,18 @@ fn apply_builtin_fast(
         }
         "VALUES" => Some(Ok(env.return_values(args.to_vec()))),
         "VALUES-LIST" if args.len() == 1 => Some(return_list_values(args[0], env)),
+        // FUNCALL, APPLY and VECTOR reached as function values -- `#'funcall`
+        // passed around, or a compiled caller whose call fell back to the
+        // designator -- run exactly as their operator-position arms do, instead
+        // of synthesizing `(FUNCALL 'f 'a ...)` and tree-walking it, which cost
+        // ~50us a call (bliss-gg3i1.7.3). An empty FUNCALL or a one-argument
+        // APPLY keeps the general path and its PROGRAM-ERROR.
+        "FUNCALL" if !args.is_empty() => Some(apply_function(args[0], &args[1..], env)),
+        "APPLY" if args.len() >= 2 => Some(apply_spread_call(args, env)),
+        "VECTOR" => {
+            env.clear_mv();
+            Some(Ok(egcl_stdlib::build_simple_vector(args)))
+        }
         "REVERSE" if args.len() == 1 => {
             env.clear_mv();
             Some(egcl_stdlib::reverse(args[0]))

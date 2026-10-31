@@ -89,13 +89,13 @@ pub(super) unsafe fn leaf(
     }
     unsafe {
         root_publication::with_leaf_callable(image, |owner, callable| {
-            if callable != args[0] || !owner.accepts_explicit_callable(callable) {
+            if callable != args[0] {
                 return None;
             }
+            let frame = captured_frame(owner, callable)?;
             let index = usize::try_from(args[1].as_fixnum()).ok()?;
             let name = owner.body.names.get(index)?;
-            let frame = closure_captured_env(callable)?;
-            let symbol = egcl_rt::symbols::find_index(name);
+            let symbol = owner.leaf_symbol(index);
             let answer = if store {
                 let updated = if lexical_identity::encoded(name) {
                     Env::set_lexical_frame(&frame, name, args[2])
@@ -116,6 +116,91 @@ pub(super) unsafe fn leaf(
             Some(answer)
         })
     }
+}
+
+/// One validated (callable, code) pair and the frame it captured.
+struct FrameEntry {
+    callable: Cell<u64>,
+    owner: Cell<usize>,
+    body: Cell<usize>,
+    epoch: Cell<u64>,
+    stamp: Cell<u64>,
+    /// Weak: the cache must never keep a dead closure's frame alive.
+    frame: std::cell::RefCell<std::sync::Weak<SharedCell<EnvFrame>>>,
+}
+
+struct FrameCache {
+    entries: [FrameEntry; 4],
+    next: Cell<usize>,
+}
+
+/// Captured frames of recently accessed closures (bliss-gg3i1.7.3). An entry
+/// names its callable by raw bits without rooting it: the collection stamp
+/// moves on every collection (and on descriptor destruction), so an entry can
+/// neither outlive nor be confused with a successor of the object it names.
+/// The invalidation epoch moves on every redefinition, publication and tier
+/// change, as for the FUNCALL caches. Only the stamp-free answer of
+/// `accepts_explicit_callable` and `closure_captured_env` is remembered; both
+/// depend only on the callable's definition identity and the code's body.
+static FRAMES: egcl_rt::execution_local::ExecutionLocal<FrameCache> = unsafe {
+    egcl_rt::execution_local::ExecutionLocal::new(|| FrameCache {
+        entries: std::array::from_fn(|_| FrameEntry {
+            callable: Cell::new(NIL.0),
+            owner: Cell::new(0),
+            body: Cell::new(0),
+            epoch: Cell::new(u64::MAX),
+            stamp: Cell::new(u64::MAX),
+            frame: std::cell::RefCell::new(std::sync::Weak::new()),
+        }),
+        next: Cell::new(0),
+    })
+};
+
+/// `closure_captured_env(callable)` once `owner` accepts `callable` as its
+/// explicit callable. Never allocates Lisp objects or collects.
+fn captured_frame(owner: &TransferCode, callable: EgclVal) -> Option<Arc<SharedCell<EnvFrame>>> {
+    let epoch = egcl_rt::call_table::invalidation_epoch();
+    let stamp = super::funcall_fast::collection_stamp();
+    let owner_address = std::ptr::from_ref(owner) as usize;
+    let body = Arc::as_ptr(&owner.body) as usize;
+    let hit = FRAMES.with(|cache| {
+        cache
+            .entries
+            .iter()
+            .find(|entry| {
+                entry.callable.get() == callable.0
+                    && entry.owner.get() == owner_address
+                    && entry.body.get() == body
+                    && entry.epoch.get() == epoch
+                    && entry.stamp.get() == stamp
+            })
+            .and_then(|entry| entry.frame.borrow().upgrade())
+    });
+    if hit.is_some() {
+        return hit;
+    }
+    if !owner.accepts_explicit_callable(callable) {
+        return None;
+    }
+    let frame = closure_captured_env(callable)?;
+    // Selection reads Rust registries only; a change during it misses.
+    if egcl_rt::call_table::invalidation_epoch() != epoch
+        || super::funcall_fast::collection_stamp() != stamp
+    {
+        return Some(frame);
+    }
+    FRAMES.with(|cache| {
+        let index = cache.next.get();
+        cache.next.set((index + 1) % cache.entries.len());
+        let entry = &cache.entries[index];
+        entry.callable.set(callable.0);
+        entry.owner.set(owner_address);
+        entry.body.set(body);
+        entry.epoch.set(epoch);
+        entry.stamp.set(stamp);
+        *entry.frame.borrow_mut() = Arc::downgrade(&frame);
+    });
+    Some(frame)
 }
 
 #[cfg(test)]
