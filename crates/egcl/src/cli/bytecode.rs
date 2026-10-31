@@ -1035,6 +1035,11 @@ fn sweep_dead_function_captures(names: &[EgclVal]) {
                 .borrow_mut()
                 .retain(|symbol| !dead.contains(symbol))
         });
+        T2_GUARD_RETIREMENTS.scan(|registry| {
+            registry
+                .borrow_mut()
+                .retain(|symbol, _| !dead.contains(symbol))
+        });
         T1_DECLINED.scan(|registry| {
             registry
                 .borrow_mut()
@@ -1719,6 +1724,7 @@ fn install_local_definition(sym: u32, body: Option<Arc<BytecodeFunction>>, gener
     OSR_REGISTRY.with(|r| r.borrow_mut().remove(&sym));
     LAZY_DECLINED.with(|s| s.borrow_mut().remove(&sym));
     T2_DECLINED.with(|s| s.borrow_mut().remove(&sym));
+    T2_GUARD_RETIREMENTS.with(|s| s.borrow_mut().remove(&sym));
     T1_DECLINED.with(|s| s.borrow_mut().remove(&sym));
     T2_QUEUED.with(|s| s.borrow_mut().remove(&sym));
     INVOKE_COUNTS.with(|m| m.borrow_mut().remove(&sym));
@@ -25414,6 +25420,41 @@ static T2_DECLINED: egcl_rt::execution_local::ExecutionLocal<
 > = unsafe {
     egcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(std::collections::HashSet::new()))
 };
+/// T2 versions of a body retired because a non-numeric guard kept failing,
+/// keyed by symbol with the body they were compiled from. A replacement is
+/// compiled from the same profile, so it speculates the same way and fails the
+/// same guard: without a limit a function whose AREF meets an adjustable
+/// vector was recompiled at T1 and T2 every few dozen calls, for good
+/// (bliss-gg3i1.7.6). Redefining the function clears its entry.
+static T2_GUARD_RETIREMENTS: egcl_rt::execution_local::ExecutionLocal<
+    RefCell<HashMap<u32, (usize, u32)>>,
+> = unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(HashMap::new())) };
+
+/// Retired T2 versions of one body after which T2 is declined and the function
+/// stays at T1 until it is redefined.
+const T2_GUARD_RETIREMENT_LIMIT: u32 = 2;
+
+/// Count a T2 version of `body`, installed for `sym`, retired by a non-numeric
+/// guard failure; past the limit, stop compiling T2 for it.
+pub(super) fn note_t2_guard_retirement(sym: u32, body: &Arc<BytecodeFunction>) {
+    let key = Arc::as_ptr(body) as usize;
+    let count = T2_GUARD_RETIREMENTS.with(|retirements| {
+        let mut retirements = retirements.borrow_mut();
+        let entry = retirements.entry(sym).or_insert((key, 0));
+        if entry.0 != key {
+            *entry = (key, 0);
+        }
+        entry.1 += 1;
+        entry.1
+    });
+    if count >= T2_GUARD_RETIREMENT_LIMIT {
+        T2_DECLINED.with(|declined| declined.borrow_mut().insert(sym));
+        t2_log_write(format_args!(
+            "{}: T2 declined after {count} versions retired by guard failures; keeping T1",
+            sym_label(sym)
+        ));
+    }
+}
 /// Symbols whose T1 compilation was declined for a STRUCTURAL reason — an
 /// unsupported opcode, a non-local GO/RETURN-FROM target, or an arity past
 /// the activation slots. Those are properties of the compiled bytecode and
