@@ -1901,11 +1901,65 @@ fn class_name_symbol(class: EgclVal) -> Option<u32> {
 ///
 /// Returns None when the name no longer denotes the exact class, leaving the
 /// caller on the identity-based uncached path rather than guessing.
+/// DEFSTRUCT accessor symbol -> (structure name, slot symbol). Structure
+/// accessors are ordinary functions, not class-slot metadata, so the atomic
+/// and CAS place operators find their slot here (bliss-gg3i1.7.2). Holds only
+/// symbols, which never move.
+static STRUCT_ACCESSOR_SLOTS: LazyLock<std::sync::RwLock<HashMap<u32, (EgclVal, EgclVal)>>> =
+    LazyLock::new(|| std::sync::RwLock::new(HashMap::new()));
+
+fn register_struct_accessor(accessor: EgclVal, structure: EgclVal, slot: EgclVal) {
+    if let Some(index) = accessor.symbol_index() {
+        STRUCT_ACCESSOR_SLOTS
+            .write()
+            .unwrap()
+            .insert(index, (structure, slot));
+    }
+}
+
+/// Whether `accessor` is already a DEFSTRUCT accessor for `slot` of a
+/// structure `class` includes (other than `structure` itself).
+fn inherited_struct_accessor(
+    accessor: EgclVal,
+    slot: EgclVal,
+    structure: EgclVal,
+    class: EgclVal,
+) -> bool {
+    let Some(index) = accessor.symbol_index() else {
+        return false;
+    };
+    let Some((owner, owner_slot)) = STRUCT_ACCESSOR_SLOTS.read().unwrap().get(&index).copied()
+    else {
+        return false;
+    };
+    if owner == structure || owner_slot != slot {
+        return false;
+    }
+    let Some(owner_class) = egcl_stdlib::find_class(owner) else {
+        return false;
+    };
+    egcl_stdlib::compute_class_precedence_list(class).is_ok_and(|cpl| cpl.contains(&owner_class))
+}
+
+/// The slot a DEFSTRUCT accessor names, when `instance` is of its structure.
+fn struct_accessor_slot(instance: EgclVal, accessor: EgclVal) -> Option<EgclVal> {
+    let (structure, slot) = *STRUCT_ACCESSOR_SLOTS
+        .read()
+        .unwrap()
+        .get(&accessor.symbol_index()?)?;
+    egcl_stdlib::struct_typep_fast(instance, structure)
+        .unwrap_or(false)
+        .then_some(slot)
+}
+
 pub(in crate::cli) fn accessor_slot_symbol_cached(
     env: &Env,
     instance: EgclVal,
     accessor: EgclVal,
 ) -> Option<EgclVal> {
+    if let Some(slot) = struct_accessor_slot(instance, accessor) {
+        return Some(slot);
+    }
     let class_sym = class_name_symbol(egcl_stdlib::class_of(instance))?;
     let accessor_index = accessor.symbol_index()?;
     let key = (class_sym, accessor_index);
@@ -24400,6 +24454,10 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             "EGCL::%STREAM-LISTEN" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::%STREAM-EXTERNAL-FORMAT" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::%MAKE-STRUCT" => return eval_builtin_arguments(&name, cdr, env),
+            "EGCL::%BIT-VECTOR-OP" => return eval_builtin_arguments(&name, cdr, env),
+            "EGCL::%STRUCT-REF" | "EGCL::%STRUCT-SET" | "EGCL::%STRUCT-TYPEP" => {
+                return eval_builtin_arguments(&name, cdr, env);
+            }
             "GETF" => return eval_builtin_arguments(&name, cdr, env),
             "WRITE-BYTE" => return eval_builtin_arguments(&name, cdr, env),
             "READ-BYTE" => return eval_builtin_arguments(&name, cdr, env),
@@ -41432,20 +41490,17 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         // already-built sub-form) that sits unrooted while the next allocating
         // sym()/vec_to_list() call fires a minor GC would go stale, corrupting the
         // DEFCLASS form so its accessors never register (bliss-bjue).
+        // The DEFCLASS declares no :ACCESSOR: DEFSTRUCT's accessors are the
+        // ordinary functions defined below, as in SBCL.
         egcl_rt::rooted!(slot_clauses = Vec::<EgclVal>::new());
         for s in &slots {
             egcl_rt::rooted!(default = s.default);
-            // A read-only slot gets only a :READER (no writer), so `(setf accessor)`
-            // is unbound as CLHS requires (ansi-test struct-test-NN/12).
-            let accessor_kw = if s.read_only { ":READER" } else { ":ACCESSOR" };
             let clause = vec_to_list(&[
                 s.slot_sym,
                 sym(":INITARG"),
                 s.initarg,
                 sym(":INITFORM"),
                 *default,
-                sym(accessor_kw),
-                s.accessor,
             ]);
             slot_clauses.push(clause);
         }
@@ -41463,6 +41518,58 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         // holds for a plain DEFCLASS standard-object (bliss-rup1/ta0a/i1i9).
         if let Some(class) = egcl_stdlib::find_class(*name_sym_r) {
             egcl_stdlib::set_structure_class(class);
+        }
+        // Accessors are ordinary functions over the layout, as in SBCL: no
+        // generic dispatch, a TYPE-ERROR for a non-instance, and a writer that
+        // checks the slot type this DEFSTRUCT declared (bliss-gg3i1.7.2).
+        // `index` is the slot's position in the layout, where the :INCLUDE
+        // prefix puts it; the run-time fast path verifies it.
+        let value = sym("%STRUCT-VALUE%");
+        let own_class = egcl_stdlib::find_class(*name_sym_r);
+        for (index, slot) in slots.iter().enumerate() {
+            // As in SBCL, an :INCLUDE whose conc-name regenerates an included
+            // structure's own accessor for the same slot (SB-C's
+            // MULTIPLE-SUCCESSORS-NODE with :CONC-NAME NODE-) keeps that
+            // accessor, which already accepts this subtype; redefining it
+            // would reject every other instance of the parent.
+            if own_class.is_some_and(|class| {
+                inherited_struct_accessor(slot.accessor, slot.slot_sym, *name_sym_r, class)
+            }) {
+                continue;
+            }
+            egcl_rt::rooted!(params = vec_to_list(&[obj]));
+            egcl_rt::rooted!(quoted_name = quote(*name_sym_r));
+            egcl_rt::rooted!(quoted_slot = quote(slot.slot_sym));
+            let index = EgclVal::from_fixnum(index as i64);
+            egcl_rt::rooted!(
+                body = vec_to_list(&[
+                    sym("EGCL::%STRUCT-REF"),
+                    obj,
+                    *quoted_name,
+                    *quoted_slot,
+                    index,
+                ])
+            );
+            egcl_rt::rooted!(reader = vec_to_list(&[sym("DEFUN"), slot.accessor, *params, *body]));
+            eval_form(*reader, env)?;
+            register_struct_accessor(slot.accessor, *name_sym_r, slot.slot_sym);
+            if !slot.read_only {
+                egcl_rt::rooted!(writer_name = vec_to_list(&[sym("SETF"), slot.accessor]));
+                egcl_rt::rooted!(writer_params = vec_to_list(&[value, obj]));
+                egcl_rt::rooted!(checked = checked_struct_slot_form(value, slot.slot_type));
+                egcl_rt::rooted!(
+                    body = vec_to_list(&[
+                        sym("EGCL::%STRUCT-SET"),
+                        *checked,
+                        obj,
+                        *quoted_name,
+                        *quoted_slot,
+                        index,
+                    ])
+                );
+                let writer = vec_to_list(&[sym("DEFUN"), *writer_name, *writer_params, *body]);
+                eval_form(writer, env)?;
+            }
         }
     }
 
@@ -41503,12 +41610,31 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 egcl_rt::rooted!(params = Vec::<EgclVal>::new());
                 egcl_rt::rooted!(call = vec![sym("EGCL::%MAKE-STRUCT"), quote(name_sym)]);
                 params.push(sym("&KEY"));
+                // A default that is not a literal is evaluated in the body,
+                // behind a supplied-p test, so the lambda list itself stays
+                // within the compiled keyword binder (bliss-gg3i1.7.2). The
+                // initforms still run left to right, only for omitted keys,
+                // and cannot see the uninterned argument variables.
                 for slot in &slots {
                     egcl_rt::rooted!(dflt = slot.default);
                     let var = reader::make_uninterned_symbol(&sym_bare_name_rc(slot.slot_sym));
                     egcl_rt::rooted!(keyform = vec_to_list(&[slot.initarg, var]));
-                    params.push(vec_to_list(&[*keyform, *dflt]));
-                    call.push(checked_struct_slot_form(var, slot.slot_type));
+                    let literal = dflt.is_nil()
+                        || *dflt == T
+                        || dflt.is_fixnum()
+                        || (dflt.is_symbol() && sym_name(*dflt).starts_with(':'));
+                    if literal {
+                        params.push(vec_to_list(&[*keyform, *dflt]));
+                        call.push(checked_struct_slot_form(var, slot.slot_type));
+                    } else {
+                        let supplied = reader::make_uninterned_symbol(&format!(
+                            "{}-P",
+                            sym_bare_name_rc(slot.slot_sym)
+                        ));
+                        params.push(vec_to_list(&[*keyform, NIL, supplied]));
+                        egcl_rt::rooted!(value = vec_to_list(&[sym("IF"), supplied, var, *dflt]));
+                        call.push(checked_struct_slot_form(*value, slot.slot_type));
+                    }
                 }
                 egcl_rt::rooted!(kw_lambda = vec_to_list(&params));
                 egcl_rt::rooted!(kw_body = vec_to_list(&call));
@@ -41704,7 +41830,12 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     if let Some(pred_name) = pred_name {
         egcl_rt::rooted!(pred_name_r = pred_name);
         egcl_rt::rooted!(pred_params = vec_to_list(&[obj]));
-        egcl_rt::rooted!(pred_body = vec_to_list(&[sym("TYPEP"), obj, quote(name_sym)]));
+        let test = if representation.is_some() {
+            sym("TYPEP")
+        } else {
+            sym("EGCL::%STRUCT-TYPEP")
+        };
+        egcl_rt::rooted!(pred_body = vec_to_list(&[test, obj, quote(name_sym)]));
         let pred_defun = vec_to_list(&[sym("DEFUN"), *pred_name_r, *pred_params, *pred_body]);
         eval_form(pred_defun, env)?;
     }

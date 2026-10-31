@@ -84,8 +84,9 @@ pub use clos::{
     reinitialize_instance, set_find_class, set_method_specializers, set_slot_value,
     set_slot_value_if_present, set_structure_class, shared_initialize, shared_initialize_with_list,
     slot_boundp, slot_makunbound, slot_present_p, slot_value, slot_value_if_present,
-    structure_instance_typep,
+    struct_ref_fast, struct_set_fast, struct_typep_fast, structure_instance_typep,
 };
+pub use clos::{StructAllocation, allocate_struct, struct_allocation, struct_init_slot};
 pub use conditions::{
     HandlerBinding, RestartSpec, acquire_preallocated_storage_condition, clear_funcall_hook,
     compute_restarts, error_condition, find_restart, handler_bind, handler_bind_fn, handler_case,

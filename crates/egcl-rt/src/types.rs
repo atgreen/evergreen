@@ -152,6 +152,50 @@ pub fn bit_vector_ref(v: EgclVal, i: usize) -> Option<u8> {
     Some((byte >> (i % 8)) & 1)
 }
 
+/// `dst := op(a, b)` over three simple bit-vectors of one length, a byte at a
+/// time, for the CLHS 15.2 bit-array functions. `op` selects AND, IOR, XOR,
+/// EQV, NAND, NOR, ANDC1, ANDC2, ORC1, ORC2 (0-9) or NOT of `a` (10). Any of
+/// the vectors may be the same object. Bits past the length are cleared.
+/// Returns `false`, touching nothing, when the operands do not qualify. No
+/// allocation — GC-safe anywhere.
+pub fn bit_vector_bool_op(op: u8, a: EgclVal, b: EgclVal, dst: EgclVal) -> bool {
+    let (Some(len), Some(len_b), Some(len_dst)) =
+        (bit_vector_len(a), bit_vector_len(b), bit_vector_len(dst))
+    else {
+        return false;
+    };
+    if len != len_b || len != len_dst || op > 10 {
+        return false;
+    }
+    let bytes = len.div_ceil(8);
+    unsafe {
+        let pa = a.as_ptr().add(24);
+        let pb = b.as_ptr().add(24);
+        let pd = dst.as_ptr().add(24);
+        for i in 0..bytes {
+            let (x, y) = (*pa.add(i), *pb.add(i));
+            let r = match op {
+                0 => x & y,
+                1 => x | y,
+                2 => x ^ y,
+                3 => !(x ^ y),
+                4 => !(x & y),
+                5 => !(x | y),
+                6 => !x & y,
+                7 => x & !y,
+                8 => !x | y,
+                9 => x | !y,
+                _ => !x,
+            };
+            *pd.add(i) = r;
+        }
+        if len % 8 != 0 {
+            *pd.add(bytes - 1) &= (1u8 << (len % 8)) - 1;
+        }
+    }
+    true
+}
+
 /// Store bit `i` of a bit-vector in place (bliss-27f5). Returns `false` if
 /// `v` is not a bit-vector or `i` is out of bounds. `bit` is stored as 0 for
 /// zero, 1 otherwise. No allocation — GC-safe anywhere.

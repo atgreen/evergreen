@@ -1932,6 +1932,7 @@ impl TransferCode {
                                     | Instr::PushEnvChild
                                     | Instr::PopEnvChild
                                     | Instr::AllocCons
+                                    | Instr::MakeStruct { .. }
                                     | Instr::CleanupReturn
                                     | Instr::SetValues(_)
                                     | Instr::Throw
@@ -2181,6 +2182,8 @@ fn named_call_symbol(instruction: &Instr) -> Option<u32> {
     match instruction {
         Instr::CallNamed { sym, .. } => Some(*sym),
         Instr::AllocCons => Some(egcl_rt::symbols::intern("CONS")),
+        // A structure constructor is built as its %MAKE-STRUCT call.
+        Instr::MakeStruct { .. } => Some(egcl_rt::symbols::intern("EGCL::%MAKE-STRUCT")),
         _ => None,
     }
 }
@@ -2662,6 +2665,12 @@ fn local_control_op(
             // A result assertion preserves the primary and MV tuple;
             // unsupported assertion types still decline in T2 lowering.
             | Instr::CheckResult(_)
+            // DEFSTRUCT opcodes: leaf helper calls that deopt on a miss,
+            // and the constructor, built as its %MAKE-STRUCT call.
+            | Instr::StructRef { .. }
+            | Instr::StructSet { .. }
+            | Instr::StructTypeP { .. }
+            | Instr::MakeStruct { .. }
             | Instr::Br(_)
             | Instr::BrIfFalse(_)
             | Instr::BrIfTrue(_)

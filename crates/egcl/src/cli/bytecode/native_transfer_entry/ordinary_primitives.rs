@@ -191,6 +191,9 @@ pub(in crate::cli::bytecode) fn invoke(
     symbol: u32,
     args: &[EgclVal],
 ) -> Option<Result<EgclVal, EgclError>> {
+    if let Some(result) = super::super::make_struct_call(symbol, args) {
+        return Some(result);
+    }
     // Do not initialize private symbols during normal named-call dispatch.
     // Lowering creates them before it publishes any primitive call sites.
     let primitive = SYMBOLS.get()?.iter().find(|(_, id)| *id == symbol)?.0;

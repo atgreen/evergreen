@@ -4503,6 +4503,117 @@ impl<'e> Lowerer<'e> {
         lowered
     }
 
+    /// The symbol `form` quotes, when it is `(QUOTE <non-NIL symbol>)`.
+    fn quoted_symbol(quote: EgclVal, form: EgclVal) -> Option<EgclVal> {
+        let items = form.is_cons().then(|| list_to_vec(form))?;
+        (items.len() == 2 && items[0] == quote && items[1].is_symbol() && !items[1].is_nil())
+            .then_some(items[1])
+    }
+
+    /// DEFSTRUCT's accessor, writer and predicate bodies (bliss-gg3i1.7.2):
+    /// `(%struct-ref obj 'name 'slot index)`, `(%struct-set value obj 'name
+    /// 'slot index)` and `(%struct-typep obj 'name)` with literal operands
+    /// lower to their structure opcodes. Any other shape stays a call.
+    fn lower_structure_primitive(&mut self, name: &str, rest: EgclVal) -> LowerResult<Option<()>> {
+        if name == "EGCL::%MAKE-STRUCT" {
+            return self.lower_make_struct(rest);
+        }
+        let (evaluated, literals) = match name {
+            // `(typep x 'K)` for a K that names a structure class now: the
+            // opcode answers structure instances and non-instances itself and
+            // sends every other instance to TYPEP, so a later redefinition of
+            // K as a standard class still answers correctly.
+            "TYPEP" => (1, 1),
+            "EGCL::%STRUCT-REF" => (1, 3),
+            "EGCL::%STRUCT-SET" => (2, 3),
+            "EGCL::%STRUCT-TYPEP" => (1, 1),
+            _ => return Ok(None),
+        };
+        // Resolve before reading any form: interning can allocate.
+        let Some(quote) = resolve_sym("QUOTE") else {
+            return Ok(None);
+        };
+        egcl_rt::rooted!(args = list_to_vec(rest));
+        if args.len() != evaluated + literals {
+            return Ok(None);
+        }
+        let Some(struct_name) = Self::quoted_symbol(quote, args[evaluated]) else {
+            return Ok(None);
+        };
+        if name == "TYPEP"
+            && !egcl_stdlib::find_class(struct_name).is_some_and(egcl_stdlib::is_structure_class)
+        {
+            return Ok(None);
+        }
+        let slot_and_hint = if literals == 3 {
+            let (Some(slot), hint) = (
+                Self::quoted_symbol(quote, args[evaluated + 1]),
+                args[evaluated + 2],
+            ) else {
+                return Ok(None);
+            };
+            if !hint.is_fixnum() || !(0..=u16::MAX as i64).contains(&hint.as_fixnum()) {
+                return Ok(None);
+            }
+            Some((slot, hint.as_fixnum() as u16))
+        } else {
+            None
+        };
+        for i in 0..evaluated {
+            self.lower_expr(args[i])?;
+        }
+        let name_const = self.add_const(struct_name);
+        let instr = match (name, slot_and_hint) {
+            ("EGCL::%STRUCT-TYPEP" | "TYPEP", None) => Instr::StructTypeP { name: name_const },
+            ("EGCL::%STRUCT-REF", Some((slot, hint))) => Instr::StructRef {
+                name: name_const,
+                slot: self.add_const(slot),
+                hint,
+            },
+            ("EGCL::%STRUCT-SET", Some((slot, hint))) => Instr::StructSet {
+                name: name_const,
+                slot: self.add_const(slot),
+                hint,
+            },
+            _ => return Err(Bail),
+        };
+        self.emit(instr);
+        self.pop_n(evaluated as u16);
+        self.push_n(1);
+        Ok(Some(()))
+    }
+
+    /// A DEFSTRUCT constructor's `(%make-struct 'name v1 .. vn)` with a
+    /// literal structure name lowers to MAKE-STRUCT. Any other shape stays a
+    /// call.
+    fn lower_make_struct(&mut self, rest: EgclVal) -> LowerResult<Option<()>> {
+        // Resolve before reading any form: interning can allocate.
+        let Some(quote) = resolve_sym("QUOTE") else {
+            return Ok(None);
+        };
+        egcl_rt::rooted!(args = list_to_vec(rest));
+        let Some((&name_form, values)) = args.split_first() else {
+            return Ok(None);
+        };
+        let Some(struct_name) = Self::quoted_symbol(quote, name_form) else {
+            return Ok(None);
+        };
+        let Ok(nargs) = u16::try_from(values.len()) else {
+            return Ok(None);
+        };
+        let name_const = self.add_const(struct_name);
+        for i in 1..args.len() {
+            self.lower_expr(args[i])?;
+        }
+        self.emit(Instr::MakeStruct {
+            name: name_const,
+            nargs,
+        });
+        self.pop_n(nargs);
+        self.push_n(1);
+        Ok(Some(()))
+    }
+
     fn lower_call(&mut self, name: &str, mut op: EgclVal, mut rest: EgclVal) -> LowerResult<()> {
         // Root `op`/`rest` for the whole function: the branches below allocate
         // (arena_cons, building the macro env, compiler-macroexpand) before
@@ -4550,6 +4661,11 @@ impl<'e> Lowerer<'e> {
             });
             self.pop_n(nargs as u16);
             self.push_n(1);
+            return Ok(());
+        }
+        if !self.closure_fns.contains(local_name)
+            && let Some(()) = self.lower_structure_primitive(name, rest)?
+        {
             return Ok(());
         }
         // A capturing local function is a closure value in a boxed binding of its
@@ -5246,7 +5362,17 @@ impl<'e> Lowerer<'e> {
         }
         // Nothing above allocates; the forms are not used after interning.
         let writer = reader::intern_symbol(&key);
-        super::names_accessor_generic(writer).then_some(writer)
+        if super::names_accessor_generic(writer) {
+            return Some(writer);
+        }
+        // An ordinary `(defun (setf ACC) ...)` writer, such as a DEFSTRUCT
+        // writer (bliss-gg3i1.7.2), lives under its mangled writer symbol,
+        // the one `user_setf_writer_place` calls.
+        let accessor_name = sym_name(accessor);
+        if !super::env_has_setf_writer(&accessor_name) {
+            return None;
+        }
+        resolve_sym(&super::setf_writer_symbol_name(&accessor_name)).map(|s| s.as_symbol_index())
     }
 
     /// Recognise a `(f a b …)` place whose accessor `f` has a user
@@ -11529,7 +11655,8 @@ const BBU_MAGIC: &[u8; 4] = b"BBU\0";
 // uninterned symbols, reconstructed with fresh identities on portable load.
 // 0x0302: length-only NIL array storage (tag 32).
 // 0x0303: typed FUNCTION-namespace lexical-name references.
-const BBU_BYTECODE_VERSION: u16 = 0x0303;
+// 0x0304: structure slot, predicate and constructor opcodes 0x48-0x4b.
+const BBU_BYTECODE_VERSION: u16 = 0x0304;
 const BBU_FUNCTION_NAME_REF: u32 = 1 << 31;
 mod array_constants;
 mod make_load_form;
@@ -12305,6 +12432,11 @@ fn bbu_instr_len(i: &Instr) -> Option<usize> {
         Instr::MakeClosure { .. } => 7,
         Instr::AllocCons => 1,
         Instr::TypeP(_) => 3, // opcode byte + u16 type-class
+        // opcode + u32 name literal + u32 slot literal + u16 index hint.
+        Instr::StructRef { .. } | Instr::StructSet { .. } => 11,
+        Instr::StructTypeP { .. } => 5,
+        // opcode + u32 name literal + u16 value count.
+        Instr::MakeStruct { .. } => 7,
         Instr::CheckResult(DeclaredType::FixnumRange { .. }) => 18,
         Instr::CheckResult(_) => 2,
         Instr::MemoryFence(_) => 2,
@@ -12492,6 +12624,28 @@ fn serialize_bbu_function(
             Instr::TypeP(class) => {
                 put_u8(&mut code, 0x42);
                 put_u16(&mut code, *class);
+            }
+            Instr::StructRef { name, slot, hint } | Instr::StructSet { name, slot, hint } => {
+                put_u8(
+                    &mut code,
+                    if matches!(instr, Instr::StructRef { .. }) {
+                        0x48
+                    } else {
+                        0x49
+                    },
+                );
+                put_u32(&mut code, *name as u32);
+                put_u32(&mut code, *slot as u32);
+                put_u16(&mut code, *hint);
+            }
+            Instr::StructTypeP { name } => {
+                put_u8(&mut code, 0x4a);
+                put_u32(&mut code, *name as u32);
+            }
+            Instr::MakeStruct { name, nargs } => {
+                put_u8(&mut code, 0x4b);
+                put_u32(&mut code, *name as u32);
+                put_u16(&mut code, *nargs);
             }
             Instr::CheckResult(ty) => {
                 put_u8(&mut code, 0x45);
@@ -14703,6 +14857,9 @@ fn validate_bbu_lexical_operands(
             0x1e | 0x43 => 14,
             0x23 | 0x25 | 0x41 => 8,
             0x2c => 10,
+            0x48 | 0x49 => 10,
+            0x4a => 4,
+            0x4b => 6,
             0x44 => 1,
             0x45 => match cursor.u8()? {
                 0..=2 => 0,
@@ -15745,6 +15902,37 @@ fn decode_bbu_function(
             0x27 => Instr::PopHandler,
             0x30 => Instr::AllocCons,
             0x42 => Instr::TypeP(cursor.u16()?),
+            0x4b if bytecode_version >= 0x0304 => {
+                let name = cursor.u32()?;
+                if name > u16::MAX as u32 || name as usize >= encoded.literal_refs.len() {
+                    return Err(bbu_error("structure operand out of bounds"));
+                }
+                Instr::MakeStruct {
+                    name: name as u16,
+                    nargs: cursor.u16()?,
+                }
+            }
+            0x48..=0x4a if bytecode_version >= 0x0304 => {
+                let literal = |value: u32| {
+                    if value > u16::MAX as u32 || value as usize >= encoded.literal_refs.len() {
+                        Err(bbu_error("structure operand out of bounds"))
+                    } else {
+                        Ok(value as u16)
+                    }
+                };
+                let name = literal(cursor.u32()?)?;
+                if opcode == 0x4a {
+                    Instr::StructTypeP { name }
+                } else {
+                    let slot = literal(cursor.u32()?)?;
+                    let hint = cursor.u16()?;
+                    if opcode == 0x48 {
+                        Instr::StructRef { name, slot, hint }
+                    } else {
+                        Instr::StructSet { name, slot, hint }
+                    }
+                }
+            }
             0x45 if bytecode_version >= 0x0202 => Instr::CheckResult(match cursor.u8()? {
                 0 => DeclaredType::Any,
                 1 => DeclaredType::Fixnum,
@@ -17726,6 +17914,9 @@ fn eliminate_self_tail_calls(func: &mut BytecodeFunction, self_sym: u32) -> bool
             Instr::ClearMv => (0, 0),
             Instr::Dup => (1, 2),
             Instr::TypeP(_) | Instr::CheckResult(_) => (1, 1),
+            Instr::StructRef { .. } | Instr::StructTypeP { .. } => (1, 1),
+            Instr::StructSet { .. } => (2, 1),
+            Instr::MakeStruct { nargs, .. } => (*nargs as u32, 1),
             Instr::MemoryFence(_) => (0, 1),
             Instr::AllocCons => (2, 1),
             Instr::SetValues(nvals) => (*nvals as u32, 1),
@@ -17958,6 +18149,9 @@ fn verified_operand_stack_depths(func: &BytecodeFunction) -> Result<Vec<Option<u
             | Instr::PopRestartCase => Some((0, 0)),
             Instr::ValuesToList => Some((1, 1)),
             Instr::TypeP(_) | Instr::CheckResult(_) => Some((1, 1)),
+            Instr::StructRef { .. } | Instr::StructTypeP { .. } => Some((1, 1)),
+            Instr::StructSet { .. } => Some((2, 1)),
+            Instr::MakeStruct { nargs, .. } => Some((*nargs as u32, 1)),
             Instr::MemoryFence(_) => Some((0, 1)),
             Instr::SetValues(nvals) => Some((*nvals as u32, 1)),
             Instr::AllocCons => Some((2, 1)),
@@ -20465,6 +20659,146 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                     NIL
                 });
             }
+            Instr::MakeStruct { name, nargs } => {
+                let act = &mut acts[top_idx];
+                let name = act.func.constants[name as usize];
+                let count = nargs as usize;
+                let base = act.n_locals + act.sp_top - nargs;
+                env.clear_mv();
+                // The values stay in the scanned operand slots while the
+                // instance is allocated, and are read back only afterwards.
+                let fast = egcl_stdlib::struct_allocation(name, count).and_then(|plan| {
+                    egcl_stdlib::allocate_struct(plan)
+                        .ok()
+                        .map(|instance| (plan, instance))
+                });
+                if let Some((plan, instance)) = fast {
+                    let act = &mut acts[top_idx];
+                    for index in 0..nargs {
+                        let value = unsafe { slot_get(act.frame, base + index) };
+                        egcl_stdlib::struct_init_slot(plan, instance, index as usize, value);
+                    }
+                    act.sp_top -= nargs;
+                    act.push_op(instance);
+                } else {
+                    // The general path finds the class and signals its errors.
+                    // Its handler roots its own copy of the arguments; the
+                    // values also remain on the operand stack until it returns.
+                    let mut args = Vec::with_capacity(count + 1);
+                    args.push(name);
+                    for index in 0..nargs {
+                        args.push(unsafe { slot_get(act.frame, base + index) });
+                    }
+                    match super::evaluated_builtins::call("EGCL::%MAKE-STRUCT", &args, env)
+                        .expect("structure constructor has an evaluated handler")
+                    {
+                        Ok(instance) => {
+                            let act = &mut acts[top_idx];
+                            act.sp_top -= nargs;
+                            act.push_op(instance);
+                        }
+                        Err(error) => {
+                            let pending = error_to_pending(error, env);
+                            initiate_unwind(acts, stack, env, pending)?;
+                        }
+                    }
+                }
+            }
+            Instr::StructRef { name, slot, hint } => {
+                let act = &mut acts[top_idx];
+                let name = act.func.constants[name as usize];
+                let slot = act.func.constants[slot as usize];
+                let object = act.pop_op();
+                env.clear_mv();
+                match egcl_stdlib::struct_ref_fast(object, name, slot, hint as usize) {
+                    Some(value) => act.push_op(value),
+                    None => {
+                        // The general path allocates (TYPEP, the condition);
+                        // the instance stays rooted on the operand stack.
+                        act.push_op(object);
+                        let hint = EgclVal::from_fixnum(hint as i64);
+                        match super::evaluated_builtins::call(
+                            "EGCL::%STRUCT-REF",
+                            &[object, name, slot, hint],
+                            env,
+                        )
+                        .expect("structure reader has an evaluated handler")
+                        {
+                            Ok(value) => {
+                                let act = &mut acts[top_idx];
+                                act.pop_op();
+                                act.push_op(value);
+                            }
+                            Err(error) => {
+                                let pending = error_to_pending(error, env);
+                                initiate_unwind(acts, stack, env, pending)?;
+                            }
+                        }
+                    }
+                }
+            }
+            Instr::StructSet { name, slot, hint } => {
+                let act = &mut acts[top_idx];
+                let name = act.func.constants[name as usize];
+                let slot = act.func.constants[slot as usize];
+                let object = act.pop_op();
+                let value = act.pop_op();
+                env.clear_mv();
+                if egcl_stdlib::struct_set_fast(object, name, slot, hint as usize, value) {
+                    act.push_op(value);
+                } else {
+                    act.push_op(value);
+                    act.push_op(object);
+                    let hint = EgclVal::from_fixnum(hint as i64);
+                    match super::evaluated_builtins::call(
+                        "EGCL::%STRUCT-SET",
+                        &[value, object, name, slot, hint],
+                        env,
+                    )
+                    .expect("structure writer has an evaluated handler")
+                    {
+                        Ok(value) => {
+                            let act = &mut acts[top_idx];
+                            act.pop_op();
+                            act.pop_op();
+                            act.push_op(value);
+                        }
+                        Err(error) => {
+                            let pending = error_to_pending(error, env);
+                            initiate_unwind(acts, stack, env, pending)?;
+                        }
+                    }
+                }
+            }
+            Instr::StructTypeP { name } => {
+                let act = &mut acts[top_idx];
+                let name = act.func.constants[name as usize];
+                let object = act.pop_op();
+                env.clear_mv();
+                match egcl_stdlib::struct_typep_fast(object, name) {
+                    Some(matches) => act.push_op(if matches { T } else { NIL }),
+                    None => {
+                        act.push_op(object);
+                        match super::evaluated_builtins::call(
+                            "EGCL::%STRUCT-TYPEP",
+                            &[object, name],
+                            env,
+                        )
+                        .expect("structure predicate has an evaluated handler")
+                        {
+                            Ok(value) => {
+                                let act = &mut acts[top_idx];
+                                act.pop_op();
+                                act.push_op(value);
+                            }
+                            Err(error) => {
+                                let pending = error_to_pending(error, env);
+                                initiate_unwind(acts, stack, env, pending)?;
+                            }
+                        }
+                    }
+                }
+            }
             Instr::CheckResult(ty) => {
                 let value = acts[top_idx].pop_op();
                 // Keep the primary rooted in the activation while constructing
@@ -22617,6 +22951,103 @@ extern "C" fn c2i_typep_class(v: u64, class: u64) -> u64 {
     }
 }
 
+/// c2i leaf helpers for the structure opcodes on the native (T1) path
+/// (bliss-gg3i1.7.2). `slot_hint` packs the slot symbol's index above a
+/// 16-bit layout-index hint. A miss returns UNBOUND without side effects, and
+/// the caller deopts to T0 at the same opcode, which takes the general path.
+/// None of them allocates, so no GC can fire inside.
+extern "C" fn c2i_struct_ref(object: u64, name: u64, slot_hint: u64) -> u64 {
+    let slot = EgclVal::from_symbol_index((slot_hint >> 16) as u32);
+    let hint = (slot_hint & 0xffff) as usize;
+    match egcl_stdlib::struct_ref_fast(EgclVal(object), EgclVal(name), slot, hint) {
+        Some(value) => {
+            c2i_clear_mv();
+            value.0
+        }
+        None => egcl_rt::value::UNBOUND.0,
+    }
+}
+
+extern "C" fn c2i_struct_set(object: u64, value: u64, name: u64, slot_hint: u64) -> u64 {
+    let slot = EgclVal::from_symbol_index((slot_hint >> 16) as u32);
+    let hint = (slot_hint & 0xffff) as usize;
+    if egcl_stdlib::struct_set_fast(EgclVal(object), EgclVal(name), slot, hint, EgclVal(value)) {
+        c2i_clear_mv();
+        value
+    } else {
+        egcl_rt::value::UNBOUND.0
+    }
+}
+
+/// c2i helper for MAKE-STRUCT on the native paths (bliss-gg3i1.7.2): build
+/// the structure named by tagged symbol `name` from the `n` values at `args`,
+/// which lie in GC-scanned storage (the activation's operand area) and are read
+/// only after the instance is allocated. Allocates, so it is a collecting
+/// helper call. Any case the fast constructor does not cover returns UNBOUND
+/// before allocating anything; the caller deopts to T0 at the same opcode,
+/// whose general path finds the class and signals.
+extern "C" fn c2i_make_struct(name: u64, n: u64, args: *const EgclVal) -> u64 {
+    let count = n as usize;
+    if count != 0 && args.is_null() {
+        return egcl_rt::value::UNBOUND.0;
+    }
+    let Some(plan) = egcl_stdlib::struct_allocation(EgclVal(name), count) else {
+        return egcl_rt::value::UNBOUND.0;
+    };
+    let Ok(instance) = egcl_stdlib::allocate_struct(plan) else {
+        return egcl_rt::value::UNBOUND.0;
+    };
+    for index in 0..count {
+        // SAFETY: the caller passes `count` live, scanned slots; the
+        // collector updated them in place during the allocation above.
+        let value = unsafe { args.add(index).read() };
+        egcl_stdlib::struct_init_slot(plan, instance, index, value);
+    }
+    c2i_clear_mv();
+    instance.0
+}
+
+/// The `EGCL::%MAKE-STRUCT` symbol, captured at startup so call dispatch can
+/// recognise a compiled MAKE-STRUCT without interning.
+static MAKE_STRUCT_SYMBOL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
+/// A compiled call `(%make-struct 'name v...)` -- what T2 builds MAKE-STRUCT
+/// as -- answered by the constructor fast path, skipping by-name builtin
+/// dispatch. `args` is the call's scanned argument storage, so the values are
+/// read only after the allocation. None (no allocation has happened) leaves the
+/// call to ordinary dispatch, which finds the class and signals.
+pub(super) fn make_struct_call(
+    symbol: u32,
+    args: &[EgclVal],
+) -> Option<Result<EgclVal, EgclError>> {
+    if MAKE_STRUCT_SYMBOL.get() != Some(&symbol) || super::installed_function(symbol).is_some() {
+        return None;
+    }
+    let (&name, values) = args.split_first()?;
+    let plan = egcl_stdlib::struct_allocation(name, values.len())?;
+    let count = values.len();
+    let values = values.as_ptr();
+    let instance = egcl_stdlib::allocate_struct(plan).ok()?;
+    for index in 0..count {
+        // SAFETY: `values` names `count` live scanned argument slots, which
+        // the collector updated in place during the allocation.
+        let value = unsafe { values.add(index).read() };
+        egcl_stdlib::struct_init_slot(plan, instance, index, value);
+    }
+    c2i_clear_mv();
+    Some(Ok(instance))
+}
+
+extern "C" fn c2i_struct_typep(object: u64, name: u64) -> u64 {
+    match egcl_stdlib::struct_typep_fast(EgclVal(object), EgclVal(name)) {
+        Some(matches) => {
+            c2i_clear_mv();
+            if matches { T.0 } else { NIL.0 }
+        }
+        None => egcl_rt::value::UNBOUND.0,
+    }
+}
+
 /// `ValuesToList`: collect the current multiple-values into a fresh list. When
 /// `mv_active`, the values are `env.mv`; otherwise the single `primary` value.
 /// Mirrors the T0 `Instr::ValuesToList` arm exactly (bliss-rwiv) so the compiled
@@ -22685,6 +23116,17 @@ pub(super) fn install_direct_builtin_hooks() {
     egcl_compiler::t2::emit::install_call_slice_rooted(
         c2i_call_slice_rooted as extern "C" fn(u64, u64, *const EgclVal, u64) -> u64 as usize
             as u64,
+    );
+    let _ = MAKE_STRUCT_SYMBOL.set(egcl_rt::symbols::intern("EGCL::%MAKE-STRUCT"));
+    // DEFSTRUCT accessors compile through T2 with these leaf helpers
+    // (bliss-gg3i1.7.2).
+    #[cfg(not(egcl_no_t2))]
+    egcl_compiler::t2::emit::install_struct_access_helpers(
+        egcl_compiler::t2::emit::StructAccessHelpers {
+            reference: c2i_struct_ref as extern "C" fn(u64, u64, u64) -> u64 as usize as u64,
+            set: c2i_struct_set as extern "C" fn(u64, u64, u64, u64) -> u64 as usize as u64,
+            typep: c2i_struct_typep as extern "C" fn(u64, u64) -> u64 as usize as u64,
+        },
     );
     #[cfg(not(egcl_no_t2))]
     egcl_compiler::t2::emit::install_direct_builtin_hooks(
@@ -22854,6 +23296,10 @@ fn c2i_call_result(sym: u64, args: &[EgclVal], profile_site: u64) -> Result<Egcl
     // of the native call, and native code only calls this synchronously within
     // that window.
     record_native_call_site(profile_site);
+    // A compiled MAKE-STRUCT is this call; answer it without name dispatch.
+    if let Some(result) = make_struct_call(sym as u32, args) {
+        return result;
+    }
     let n = args.len();
     let sym32 = sym as u32;
     let fn_val = EgclVal::from_symbol_index(sym32);
@@ -26052,6 +26498,9 @@ fn snapshot_t2_input(sym: u32, priority: u64) -> Option<T2CompileInput> {
                 let sym = match instruction {
                     Instr::CallNamed { sym, .. } => Some(*sym),
                     Instr::AllocCons => Some(egcl_rt::symbols::intern("CONS")),
+                    Instr::MakeStruct { .. } => {
+                        Some(egcl_rt::symbols::intern("EGCL::%MAKE-STRUCT"))
+                    }
                     _ => None,
                 };
                 if let Some(sym) = sym
@@ -27810,6 +28259,12 @@ fn emit_native(
     let take_values_addr = c2i_take_values as extern "C" fn(u64, *mut EgclVal, u64) as usize as u64;
     let values_to_list_addr = c2i_values_to_list as extern "C" fn(u64) -> u64 as usize as u64;
     let typep_class_addr = c2i_typep_class as extern "C" fn(u64, u64) -> u64 as usize as u64;
+    let struct_ref_addr = c2i_struct_ref as extern "C" fn(u64, u64, u64) -> u64 as usize as u64;
+    let struct_set_addr =
+        c2i_struct_set as extern "C" fn(u64, u64, u64, u64) -> u64 as usize as u64;
+    let struct_typep_addr = c2i_struct_typep as extern "C" fn(u64, u64) -> u64 as usize as u64;
+    let make_struct_addr =
+        c2i_make_struct as extern "C" fn(u64, u64, *const EgclVal) -> u64 as usize as u64;
     let deopt_state_addr = c2i_deopt_state as extern "C" fn(u64, u64) as usize as u64;
     let t2_backedge_addr = c2i_t1_backedge
         as extern "C" fn(u64, u64, *mut u64, *const BytecodeFunction) -> u64
@@ -28715,6 +29170,82 @@ fn emit_native(
                 c.extend_from_slice(&typep_class_addr.to_le_bytes());
                 emit_c2i_helper_call(&mut c);
                 push_rax(&mut c);
+            }
+            Instr::StructRef { name, slot, hint } | Instr::StructSet { name, slot, hint } => {
+                // Leaf helper with the operands left in place: a miss deopts
+                // to T0 at this opcode with the stack exactly as it found it.
+                let name = bf.constants[*name as usize];
+                let slot = bf.constants[*slot as usize];
+                let Some(slot_index) = slot.symbol_index() else {
+                    decline_t1!("structure slot operand is not a symbol");
+                };
+                let slot_hint = ((slot_index as u64) << 16) | *hint as u64;
+                let set = matches!(instr, Instr::StructSet { .. });
+                c.extend_from_slice(&[0x49, 0x8B, 0x7F, 0xF8]); // mov rdi, [r15-8] (object)
+                if set {
+                    c.extend_from_slice(&[0x49, 0x8B, 0x77, 0xF0]); // mov rsi, [r15-16] (value)
+                    c.extend_from_slice(&[0x48, 0xBA]); // mov rdx, name
+                    c.extend_from_slice(&name.0.to_le_bytes());
+                    c.extend_from_slice(&[0x48, 0xB9]); // mov rcx, slot/hint
+                    c.extend_from_slice(&slot_hint.to_le_bytes());
+                    c.extend_from_slice(&[0x48, 0xB8]);
+                    c.extend_from_slice(&struct_set_addr.to_le_bytes());
+                } else {
+                    c.extend_from_slice(&[0x48, 0xBE]); // mov rsi, name
+                    c.extend_from_slice(&name.0.to_le_bytes());
+                    c.extend_from_slice(&[0x48, 0xBA]); // mov rdx, slot/hint
+                    c.extend_from_slice(&slot_hint.to_le_bytes());
+                    c.extend_from_slice(&[0x48, 0xB8]);
+                    c.extend_from_slice(&struct_ref_addr.to_le_bytes());
+                }
+                emit_c2i_helper_call(&mut c);
+                c.extend_from_slice(&[0x49, 0xBB]); // mov r11, UNBOUND
+                c.extend_from_slice(&egcl_rt::value::UNBOUND.0.to_le_bytes());
+                c.extend_from_slice(&[0x4C, 0x39, 0xD8]); // cmp rax, r11
+                let l = *deopt_labels.entry(bcp).or_insert_with(|| c.label());
+                c.jcc(Cc::E, l);
+                if set {
+                    c.extend_from_slice(&[0x49, 0x83, 0xEF, 0x08]); // sub r15, 8
+                }
+                c.extend_from_slice(&[0x49, 0x89, 0x47, 0xF8]); // mov [r15-8], rax
+            }
+            Instr::MakeStruct { name, nargs } => {
+                // Collecting helper with the values left in their scanned
+                // operand slots; a miss deopts to T0 at this opcode with the
+                // stack exactly as it found it.
+                let name = bf.constants[*name as usize];
+                c.extend_from_slice(&[0x48, 0xBF]); // mov rdi, name
+                c.extend_from_slice(&name.0.to_le_bytes());
+                c.extend_from_slice(&[0x48, 0xBE]); // mov rsi, nargs
+                c.extend_from_slice(&u64::from(*nargs).to_le_bytes());
+                c.extend_from_slice(&[0x49, 0x8D, 0x97]); // lea rdx,[r15 - 8*nargs]
+                c.extend_from_slice(&(-8_i32 * i32::from(*nargs)).to_le_bytes());
+                c.extend_from_slice(&[0x48, 0xB8]);
+                c.extend_from_slice(&make_struct_addr.to_le_bytes());
+                emit_c2i_helper_call(&mut c);
+                c.extend_from_slice(&[0x49, 0xBB]); // mov r11, UNBOUND
+                c.extend_from_slice(&egcl_rt::value::UNBOUND.0.to_le_bytes());
+                c.extend_from_slice(&[0x4C, 0x39, 0xD8]); // cmp rax, r11
+                let l = *deopt_labels.entry(bcp).or_insert_with(|| c.label());
+                c.jcc(Cc::E, l);
+                c.extend_from_slice(&[0x49, 0x81, 0xEF]); // sub r15, 8*nargs
+                c.extend_from_slice(&(8_i32 * i32::from(*nargs)).to_le_bytes());
+                push_rax(&mut c);
+            }
+            Instr::StructTypeP { name } => {
+                let name = bf.constants[*name as usize];
+                c.extend_from_slice(&[0x49, 0x8B, 0x7F, 0xF8]); // mov rdi, [r15-8]
+                c.extend_from_slice(&[0x48, 0xBE]); // mov rsi, name
+                c.extend_from_slice(&name.0.to_le_bytes());
+                c.extend_from_slice(&[0x48, 0xB8]);
+                c.extend_from_slice(&struct_typep_addr.to_le_bytes());
+                emit_c2i_helper_call(&mut c);
+                c.extend_from_slice(&[0x49, 0xBB]); // mov r11, UNBOUND
+                c.extend_from_slice(&egcl_rt::value::UNBOUND.0.to_le_bytes());
+                c.extend_from_slice(&[0x4C, 0x39, 0xD8]); // cmp rax, r11
+                let l = *deopt_labels.entry(bcp).or_insert_with(|| c.label());
+                c.jcc(Cc::E, l);
+                c.extend_from_slice(&[0x49, 0x89, 0x47, 0xF8]); // mov [r15-8], rax
             }
             Instr::MemoryFence(kind) => {
                 match kind {
@@ -35112,6 +35643,9 @@ mod function_literal_tests {
 
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 mod native_typep_identity_tests;
+
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+mod native_make_struct_tests;
 
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 mod native_sprof_tests;

@@ -520,11 +520,33 @@
        (setf ,place (%check-type-fail ,place ',typespec)))
      nil))
 
+(defun egcl::%fast-slot-type-test (place typespec)
+  ;; A test form equivalent to (%DECLARATION-TYPEP PLACE 'TYPESPEC) for the
+  ;; slot types structures commonly declare, built from tests compiled code
+  ;; answers inline; NIL when the declaration needs %DECLARATION-TYPEP.
+  ;; PLACE is a variable, so repeating it is safe (bliss-gg3i1.7.2).
+  (cond ((and (symbolp typespec) typespec
+              (not (member typespec '(function compiled-function))))
+         `(typep ,place ',typespec))
+        ((atom typespec) nil)
+        ((and (eq (car typespec) 'or) (consp (cdr typespec)))
+         (let ((tests (mapcar (lambda (spec) (egcl::%fast-slot-type-test place spec))
+                              (cdr typespec))))
+           (unless (member nil tests) `(or ,@tests))))
+        ;; Only two fixnum bounds confine the integer to a fixnum.
+        ((and (eq (car typespec) 'integer) (= (length typespec) 3)
+              (typep (second typespec) 'fixnum)
+              (typep (third typespec) 'fixnum))
+         `(and (typep ,place 'fixnum)
+               (<= ,(second typespec) ,place ,(third typespec))))
+        (t nil)))
+
 (defmacro egcl::%check-structure-type (place typespec)
   ;; Slot declarations can contain FUNCTION signatures, which public TYPEP
   ;; cannot discriminate. Keep the original declaration in failure conditions.
   `(progn
-     (unless (egcl::%declaration-typep ,place ',typespec)
+     (unless ,(or (egcl::%fast-slot-type-test place typespec)
+                  `(egcl::%declaration-typep ,place ',typespec))
        (setf ,place (%check-type-fail ,place ',typespec
                                      #'egcl::%declaration-typep)))
      nil))
@@ -2860,40 +2882,44 @@ Returns NIL."
 ;; (CLHS 15.2: bit-and etc. take bit-arrays); the result goes into OPT-RESULT
 ;; when that is a bit array, into the first operand for T, else into a fresh
 ;; array of the same dimensions (ansi arrays bit-and.* on rank 0 and rank 2).
-(defun %bit-op-2 (fn bv1 bv2 &optional opt-result)
+;; Simple bit-vectors take the native byte-wise %BIT-VECTOR-OP (CODE selects
+;; the operation); other bit arrays use the element loop (bliss-gg3i1.7).
+(defun %bit-op-2 (code fn bv1 bv2 &optional opt-result)
   (let ((result (cond ((eq opt-result t) bv1)
                       ((arrayp opt-result) opt-result)
                       (t (make-array (array-dimensions bv1) :element-type 'bit)))))
-    (dotimes (i (array-total-size bv1))
-      (setf (row-major-aref result i)
-            (funcall fn (row-major-aref bv1 i) (row-major-aref bv2 i))))
+    (unless (egcl::%bit-vector-op code bv1 bv2 result)
+      (dotimes (i (array-total-size bv1))
+        (setf (row-major-aref result i)
+              (funcall fn (row-major-aref bv1 i) (row-major-aref bv2 i)))))
     result))
 (defun bit-and (bv1 bv2 &optional opt-result)
-  (%bit-op-2 (lambda (a b) (logand a b)) bv1 bv2 opt-result))
+  (%bit-op-2 0 (lambda (a b) (logand a b)) bv1 bv2 opt-result))
 (defun bit-ior (bv1 bv2 &optional opt-result)
-  (%bit-op-2 (lambda (a b) (logior a b)) bv1 bv2 opt-result))
+  (%bit-op-2 1 (lambda (a b) (logior a b)) bv1 bv2 opt-result))
 (defun bit-xor (bv1 bv2 &optional opt-result)
-  (%bit-op-2 (lambda (a b) (logxor a b)) bv1 bv2 opt-result))
+  (%bit-op-2 2 (lambda (a b) (logxor a b)) bv1 bv2 opt-result))
 (defun bit-eqv (bv1 bv2 &optional opt-result)
-  (%bit-op-2 (lambda (a b) (- 1 (logxor a b))) bv1 bv2 opt-result))
+  (%bit-op-2 3 (lambda (a b) (- 1 (logxor a b))) bv1 bv2 opt-result))
 (defun bit-nand (bv1 bv2 &optional opt-result)
-  (%bit-op-2 (lambda (a b) (- 1 (logand a b))) bv1 bv2 opt-result))
+  (%bit-op-2 4 (lambda (a b) (- 1 (logand a b))) bv1 bv2 opt-result))
 (defun bit-nor (bv1 bv2 &optional opt-result)
-  (%bit-op-2 (lambda (a b) (- 1 (logior a b))) bv1 bv2 opt-result))
+  (%bit-op-2 5 (lambda (a b) (- 1 (logior a b))) bv1 bv2 opt-result))
 (defun bit-andc1 (bv1 bv2 &optional opt-result)
-  (%bit-op-2 (lambda (a b) (logand (- 1 a) b)) bv1 bv2 opt-result))
+  (%bit-op-2 6 (lambda (a b) (logand (- 1 a) b)) bv1 bv2 opt-result))
 (defun bit-andc2 (bv1 bv2 &optional opt-result)
-  (%bit-op-2 (lambda (a b) (logand a (- 1 b))) bv1 bv2 opt-result))
+  (%bit-op-2 7 (lambda (a b) (logand a (- 1 b))) bv1 bv2 opt-result))
 (defun bit-orc1 (bv1 bv2 &optional opt-result)
-  (%bit-op-2 (lambda (a b) (logior (- 1 a) b)) bv1 bv2 opt-result))
+  (%bit-op-2 8 (lambda (a b) (logior (- 1 a) b)) bv1 bv2 opt-result))
 (defun bit-orc2 (bv1 bv2 &optional opt-result)
-  (%bit-op-2 (lambda (a b) (logior a (- 1 b))) bv1 bv2 opt-result))
+  (%bit-op-2 9 (lambda (a b) (logior a (- 1 b))) bv1 bv2 opt-result))
 (defun bit-not (bv &optional opt-result)
   (let ((result (cond ((eq opt-result t) bv)
                       ((arrayp opt-result) opt-result)
                       (t (make-array (array-dimensions bv) :element-type 'bit)))))
-    (dotimes (i (array-total-size bv))
-      (setf (row-major-aref result i) (- 1 (row-major-aref bv i))))
+    (unless (egcl::%bit-vector-op 10 bv bv result)
+      (dotimes (i (array-total-size bv))
+        (setf (row-major-aref result i) (- 1 (row-major-aref bv i)))))
     result))
 
 ;; MAKE-SEQUENCE result-type size &key initial-element — a fresh sequence of the

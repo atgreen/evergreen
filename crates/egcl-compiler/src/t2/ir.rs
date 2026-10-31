@@ -434,6 +434,19 @@ pub enum Opcode {
     /// AllocationExtentInBounds omits the capacity comparison only with a
     /// verifier-reconstructed upper-bound proof; all other checks remain.
     TryStoreIntegerOctets1To8Extent,
+    /// DEFSTRUCT reader (bliss-gg3i1.7.2): tagged instance -> slot value, for
+    /// the structure and slot in `AuxData::StructSlot`. A noncollecting leaf
+    /// helper call; any miss (wrong type, obsolete layout, unbound slot)
+    /// deoptimizes to T0 at this instruction, which signals. Reads mutable
+    /// memory, so it is effectful and never folded or hoisted.
+    StructRef,
+    /// DEFSTRUCT writer: (value, instance) -> value. Same helper/deopt contract
+    /// as `StructRef`; a miss writes nothing before deoptimizing.
+    StructSet,
+    /// DEFSTRUCT predicate: tagged operand -> T/NIL for the structure named in
+    /// `AuxData::StructSlot` (slot unused). Deoptimizes only when the operand's
+    /// layout cannot be answered without the general path.
+    StructTypeP,
 }
 
 impl Opcode {
@@ -653,6 +666,13 @@ pub enum AuxData {
     BoundedPoll {
         exit: bool,
         scope: BoundedPollScope,
+    },
+    /// Structure opcodes: symbol indices of the structure name and (for
+    /// readers/writers) the slot name, plus the slot's expected layout index.
+    StructSlot {
+        name: u32,
+        slot: u32,
+        hint: u16,
     },
 }
 

@@ -91,7 +91,7 @@ fn struct_reads_writes_and_typed_slots() {
                   (handler-case (dsa-read nil) (error () :error))))))
 "#,
         "RESULT (17997000 2999 5998 30 (2999) (:NEW) :NEW 2999 :TYPE-ERROR :TYPE-ERROR \
-         :TYPE-ERROR 2.5 2999 NIL)",
+         :TYPE-ERROR 2.5 2999 :ERROR)",
     );
 }
 

@@ -2637,6 +2637,89 @@ fn resolve(name: &str) -> Option<Handler> {
             super::gensym_value(env, args.first().copied())
         }),
 
+        // (%struct-ref object 'name 'slot hint), (%struct-set value object
+        // 'name 'slot hint) and (%struct-typep object 'name): the bodies of
+        // DEFSTRUCT's accessors and predicate. The lock-free fast paths answer
+        // a current instance; everything else takes TYPEP and SLOT-VALUE, which
+        // signal the TYPE-ERROR or unbound-slot error (bliss-gg3i1.7.2).
+        "EGCL::%STRUCT-REF" => Some(|_operator, args, env| {
+            let [object, name, slot, hint] = *args else {
+                return Err(EgclError::ProgramError(
+                    "%struct-ref: expected object, name, slot and index".into(),
+                ));
+            };
+            let hint = if hint.is_fixnum() {
+                hint.as_fixnum().max(0) as usize
+            } else {
+                0
+            };
+            if let Some(value) = egcl_stdlib::struct_ref_fast(object, name, slot, hint) {
+                return Ok(value);
+            }
+            let args = RootedVals::new(args.to_vec());
+            if !super::typep_matches(env, args[0], args[1])? {
+                return Err(EgclError::TypeError {
+                    datum: args[0],
+                    expected: format_val(args[1]),
+                });
+            }
+            slot_value_or_signal(args[0], args[2], env)
+        }),
+        "EGCL::%STRUCT-SET" => Some(|_operator, args, env| {
+            let [value, object, name, slot, hint] = *args else {
+                return Err(EgclError::ProgramError(
+                    "%struct-set: expected value, object, name, slot and index".into(),
+                ));
+            };
+            let hint = if hint.is_fixnum() {
+                hint.as_fixnum().max(0) as usize
+            } else {
+                0
+            };
+            if egcl_stdlib::struct_set_fast(object, name, slot, hint, value) {
+                return Ok(value);
+            }
+            let args = RootedVals::new(args.to_vec());
+            if !super::typep_matches(env, args[1], args[2])? {
+                return Err(EgclError::TypeError {
+                    datum: args[1],
+                    expected: format_val(args[2]),
+                });
+            }
+            egcl_stdlib::set_slot_value(args[1], args[3], args[0])?;
+            Ok(args[0])
+        }),
+        "EGCL::%STRUCT-TYPEP" => Some(|_operator, args, env| {
+            let [object, name] = *args else {
+                return Err(EgclError::ProgramError(
+                    "%struct-typep: expected object and name".into(),
+                ));
+            };
+            let matches = match egcl_stdlib::struct_typep_fast(object, name) {
+                Some(matches) => matches,
+                None => {
+                    let args = RootedVals::new(args.to_vec());
+                    super::typep_matches(env, args[0], args[1])?
+                }
+            };
+            Ok(if matches { T } else { NIL })
+        }),
+
+        // (%bit-vector-op code a b dst): DST := code(A, B) for simple
+        // bit-vectors of one length, or NIL (nothing stored) when they do not
+        // qualify and the caller must take the general path.
+        "EGCL::%BIT-VECTOR-OP" => Some(|_operator, args, _env| {
+            let [code, a, b, dst] = *args else {
+                return Err(EgclError::ProgramError(
+                    "%bit-vector-op: expected code, two operands and a destination".into(),
+                ));
+            };
+            let stored = code.is_fixnum()
+                && (0..=10).contains(&code.as_fixnum())
+                && egcl_rt::types::bit_vector_bool_op(code.as_fixnum() as u8, a, b, dst);
+            Ok(if stored { dst } else { NIL })
+        }),
+
         "EGCL::%MAKE-STRUCT" => Some(|_operator, args, _env| {
             let args = RootedVals::new(args.to_vec());
 

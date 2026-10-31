@@ -556,7 +556,7 @@ fn eval(opcode: Opcode, aux: &AuxData, ops: &[IRType]) -> IRType {
         | InstanceOf => boolean(),
 
         // A predicate produces a Boolean; it never establishes its truth.
-        TypeCheck => boolean(),
+        TypeCheck | StructTypeP => boolean(),
         // Only successful guards refine their operand and passed-through value.
         Guard => ty_meet(
             ops.first().copied().unwrap_or(IRType::TOP),

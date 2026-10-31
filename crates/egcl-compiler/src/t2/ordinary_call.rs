@@ -872,7 +872,13 @@ pub fn emit_framed_ordinary_function_with_self_call_facts(
                         return Err(declined("invalid tagged array-store layout contract"));
                     }
                 }
-                Opcode::UnboxFixnum | Opcode::IntegerLowBits | Opcode::VecSetInRange => {
+                Opcode::UnboxFixnum
+                | Opcode::IntegerLowBits
+                | Opcode::VecSetInRange
+                // Structure leaf helpers deopt at their own opcode on a miss.
+                | Opcode::StructRef
+                | Opcode::StructSet
+                | Opcode::StructTypeP => {
                     if data.frame_state.is_none() {
                         return Err(declined("guarded numeric or array operation without state"));
                     }
