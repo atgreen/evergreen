@@ -447,6 +447,18 @@ pub enum Opcode {
     /// `AuxData::StructSlot` (slot unused). Deoptimizes only when the operand's
     /// layout cannot be answered without the general path.
     StructTypeP,
+    /// Success-only `VecRef` (bliss-gg3i1.7.8): (array, index) -> (T/NIL,
+    /// element). The same layouts and bounds as `VecRef` with the same aux;
+    /// any other array or index answers NIL (and a NIL element) with no
+    /// effect, and the caller branches to the retained AREF/SVREF call. Never
+    /// allocates, signals or deoptimizes; effectful only to stay ordered
+    /// after stores.
+    TryVecRef,
+    /// Success-only `VecSet`: (array, index, value) -> T/NIL. The same
+    /// layouts, value checks and aux as `VecSet`; a hit stored the value, which
+    /// is the store's result, and a miss writes nothing and the caller
+    /// branches to the retained store call.
+    TryVecSet,
 }
 
 impl Opcode {
