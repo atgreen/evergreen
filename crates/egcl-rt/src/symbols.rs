@@ -989,6 +989,7 @@ struct DynamicValues {
 
 impl Drop for DynamicValues {
     fn drop(&mut self) {
+        NATIVE_BINDINGS_LIVE.fetch_sub(self.native.len(), Ordering::Relaxed);
         for &idx in self.map.keys() {
             adjust_binding_guard(idx, false);
         }
@@ -1083,6 +1084,12 @@ pub fn restore_symbol_binding(idx: u32, previous: Option<EgclVal>) {
     }
 }
 
+/// Native bindings held by every execution together. While it is zero, no
+/// execution has any, so a segment boundary or activation needs neither to
+/// read its own depth nor to unwind: the common case costs one load.
+static NATIVE_BINDINGS_LIVE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// One binding on an execution's native binding stack.
 struct NativeBinding {
     idx: u32,
@@ -1124,6 +1131,7 @@ pub fn native_bind_symbol_value(idx: u32, value: EgclVal, object: usize) {
             previous,
             object,
         });
+        NATIVE_BINDINGS_LIVE.fetch_add(1, Ordering::Relaxed);
         previous.is_none()
     });
     if fresh {
@@ -1141,6 +1149,7 @@ fn restore_native_bindings(depth: usize, limit: usize) -> usize {
         let mut restored = 0;
         while restored < limit && values.native.len() > depth {
             let binding = values.native.pop().expect("nonempty native binding stack");
+            NATIVE_BINDINGS_LIVE.fetch_sub(1, Ordering::Relaxed);
             let released = match binding.previous {
                 Some(previous) => {
                     values.map.insert(binding.idx, previous);
@@ -1170,12 +1179,19 @@ pub fn native_unbind_symbol_values(count: usize) -> bool {
 
 /// How many native bindings this execution holds.
 pub fn native_binding_depth() -> usize {
+    // This execution's own updates are ordered before this load.
+    if NATIVE_BINDINGS_LIVE.load(Ordering::Relaxed) == 0 {
+        return 0;
+    }
     DYNAMIC_VALUES.with(|values| values.borrow().native.len())
 }
 
 /// Restore every native binding above `depth`, newest first: the native
 /// frames that made them were abandoned by a nonlocal exit.
 pub fn unwind_native_bindings(depth: usize) {
+    if NATIVE_BINDINGS_LIVE.load(Ordering::Relaxed) == 0 {
+        return;
+    }
     restore_native_bindings(depth, usize::MAX);
 }
 
@@ -1185,11 +1201,10 @@ pub fn unwind_native_bindings(depth: usize) {
 /// caller must root it before anything can collect.
 pub fn pop_native_binding() -> Option<(u32, Option<EgclVal>)> {
     DYNAMIC_VALUES.with(|values| {
-        values
-            .borrow_mut()
-            .native
-            .pop()
-            .map(|binding| (binding.idx, binding.previous))
+        values.borrow_mut().native.pop().map(|binding| {
+            NATIVE_BINDINGS_LIVE.fetch_sub(1, Ordering::Relaxed);
+            (binding.idx, binding.previous)
+        })
     })
 }
 
