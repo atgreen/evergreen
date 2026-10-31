@@ -29,6 +29,9 @@ struct Session {
     spec: Spec,
     attempt: Option<Attempt>,
     unused: bool,
+    /// The generated helper values were proved unreachable and elided: the
+    /// body never reads the method context or its helpers lexically.
+    helpers_elided: bool,
     raw_reader: Option<RawReaderSpec>,
     helper_sites: Option<helper_values::Sites>,
 }
@@ -89,6 +92,7 @@ impl Scope {
                 spec,
                 attempt: None,
                 unused: false,
+                helpers_elided: false,
                 raw_reader: None,
                 helper_sites: None,
             }))
@@ -99,6 +103,17 @@ impl Scope {
     }
     pub fn unused(&self) -> bool {
         SESSION.with(|slot| slot.borrow().as_ref().is_some_and(|s| s.unused))
+    }
+    /// Whether the compiled body is proved never to read the method context
+    /// or its CALL-NEXT-METHOD/NEXT-METHOD-P helpers lexically, either by the
+    /// complete [`Self::unused`] proof or by helper elision. The dynamic
+    /// context may still be needed by open calls.
+    pub fn lexically_unused(&self) -> bool {
+        SESSION.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .is_some_and(|s| s.unused || s.helpers_elided)
+        })
     }
 }
 impl Drop for Scope {
@@ -180,6 +195,7 @@ impl AttemptScope {
                 } else {
                     s.attempt = Some(Attempt::default());
                     s.unused = false;
+                    s.helpers_elided = false;
                     s.raw_reader = None;
                     s.helper_sites = None;
                     true
@@ -555,6 +571,19 @@ mod tests {
     use crate::cli::{heap_test_lock, method_continuations, read_eval_all_env};
 
     fn compiled_case(source: &str, expected_unused: bool, setup: Option<&str>) {
+        compiled_case_with(source, expected_unused, !expected_unused, setup);
+    }
+
+    /// `initializer_retained` is false both for a complete proof and for a body
+    /// that never reads the generated context or helpers lexically: that body
+    /// is compiled without them (its caller still establishes the dynamic
+    /// context), so neither the initializer nor the helpers remain.
+    fn compiled_case_with(
+        source: &str,
+        expected_unused: bool,
+        initializer_retained: bool,
+        setup: Option<&str>,
+    ) {
         let _lock = heap_test_lock()
             .lock()
             .unwrap_or_else(|error| error.into_inner());
@@ -583,9 +612,9 @@ mod tests {
             bytecode_for_callable(egcl_rt::function::definition_index(*function), *function)
                 .unwrap();
         assert_eq!(proof.is_some(), expected_unused, "{source}");
-        assert_eq!(bytecode.code.iter().any(|instruction| matches!(instruction, Instr::CallNamed { sym, nargs: 0 } if *sym == initializer)), !expected_unused,
+        assert_eq!(bytecode.code.iter().any(|instruction| matches!(instruction, Instr::CallNamed { sym, nargs: 0 } if *sym == initializer)), initializer_retained,
             "only the exact generated initializer may be removed: {source}");
-        if expected_unused {
+        if !initializer_retained {
             assert!(
                 !bytecode
                     .code
@@ -627,10 +656,13 @@ mod tests {
             context_proof.is_none(),
             "open/opaque calls must retain dynamic context: {source}"
         );
-        assert!(
+        // A body whose helper values are unreachable is compiled without the
+        // generated bindings at all; otherwise the initializer stays.
+        assert_eq!(
             body.code.iter().any(|instruction| matches!(instruction,
             Instr::CallNamed { sym, nargs: 0 } if *sym == initializer)),
-            "initializer retained: {source}"
+            !expected_elided,
+            "initializer retained exactly when helpers are: {source}"
         );
         let creations = body
             .code
@@ -721,15 +753,17 @@ mod tests {
     }
     #[test]
     fn mutable_foreign_calls_are_unknown_regardless_of_leaf_spelling() {
-        compiled_case(
+        compiled_case_with(
             "(method-context-foreign:eval object)",
+            false,
             false,
             Some(
                 "(defpackage :method-context-foreign (:use :cl) (:shadow :eval) (:export :eval)) (defun method-context-foreign:eval (object) object)",
             ),
         );
-        compiled_case(
+        compiled_case_with(
             "(method-context-plain object)",
+            false,
             false,
             Some("(defun method-context-plain (object) object)"),
         );

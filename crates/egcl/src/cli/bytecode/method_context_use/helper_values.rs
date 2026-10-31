@@ -102,6 +102,11 @@ pub(super) fn elide(body: &mut BytecodeFunction, spec: &Spec, sites: &Sites) {
     for pc in sites.creations {
         body.code[pc] = Instr::Const(nil);
     }
+    SESSION.with(|slot| {
+        if let Some(session) = slot.borrow_mut().as_mut() {
+            session.helpers_elided = true;
+        }
+    });
 }
 
 #[cfg(test)]

@@ -11,11 +11,36 @@ use super::*;
 pub(super) fn prepare(instance: EgclVal, env: &mut Env) -> Result<(), EgclError> {
     if egcl_stdlib::is_instance(instance) {
         let class = egcl_stdlib::class_of(instance);
-        if !egcl_stdlib::is_structure_class(class) {
+        if !finalized(class) && !egcl_stdlib::is_structure_class(class) {
             class_protocol::ensure_finalized(class, env)?;
         }
     }
     Ok(())
+}
+
+thread_local! {
+    /// Classes seen with a finalized protocol, stamped with the dispatch
+    /// generation. Only immediates and raw bits, never traced.
+    static FINALIZED: [std::cell::Cell<Option<(u64, u64)>>; 64] =
+        const { [const { std::cell::Cell::new(None) }; 64] };
+}
+
+/// `class_protocol_finalized`, which computes the class precedence list to
+/// look for a forward-referenced superclass, memoized per dispatch generation:
+/// every class definition or redefinition, and every change to a class's
+/// protocol, moves that generation. Only a positive answer is remembered.
+/// Allocation-free on a hit.
+fn finalized(class: EgclVal) -> bool {
+    let generation = GF_DISPATCH_GENERATION.load(AtomicOrdering::Acquire);
+    let slot = ((class.0 >> 3) ^ (class.0 >> 11)) as usize % 64;
+    if FINALIZED.with(|memo| memo[slot].get()) == Some((class.0, generation)) {
+        return true;
+    }
+    let yes = egcl_stdlib::clos::class_protocol_finalized(class);
+    if yes && GF_DISPATCH_GENERATION.load(AtomicOrdering::Acquire) == generation {
+        FINALIZED.with(|memo| memo[slot].set(Some((class.0, generation))));
+    }
+    yes
 }
 
 #[derive(Clone, Copy)]
@@ -89,7 +114,9 @@ fn standard_delegate(method: &MethodDef, operation: Operation, env: &Env) -> boo
     if params.len() != required || params.iter().any(|p| !p.is_symbol()) {
         return false;
     }
-    let body = list_to_vec(method.body);
+    // DEFMETHOD wraps every body in its next-method helpers; the delegate is
+    // the source body inside them.
+    let body = list_to_vec(method_continuations::unwrapped_body(method.body));
     if body.len() != 1 {
         return false;
     }
@@ -126,9 +153,7 @@ pub(super) fn pristine(instance: EgclVal, operation: Operation, env: &Env) -> bo
     if egcl_stdlib::is_structure_class(class) {
         return true;
     }
-    if BOOT_COMPLETE.with(|ready| ready.get())
-        && !egcl_stdlib::clos::class_protocol_finalized(class)
-    {
+    if BOOT_COMPLETE.with(|ready| ready.get()) && !finalized(class) {
         return false;
     }
     let Some(layout) = egcl_stdlib::clos::class_layout_key(class) else {

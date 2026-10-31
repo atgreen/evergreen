@@ -170,6 +170,121 @@ pub(super) fn snapshot(
     Ok(invocation.clone())
 }
 
+/// Invocation snapshots shared by every call of a generic that selects the
+/// same applicable methods in one dispatch generation (bliss-gg3i1.7.5).
+///
+/// A snapshot depends only on the generic's method set, its applicable
+/// methods in order and its definition, and every change to those bumps the
+/// dispatch generation, which empties this cache. Sharing one snapshot also
+/// shares its encoded Lisp form, so CALL-NEXT-METHOD's context is encoded once
+/// per decision instead of once per call, and decoding a context finds the
+/// snapshot it came from instead of rebuilding every candidate method.
+///
+/// The snapshots hold Lisp references; the registered root scanner traces
+/// them like any active invocation. No borrow of the cache is held across an
+/// allocation.
+struct CachedInvocations {
+    generation: u64,
+    by_name: HashMap<Arc<str>, Vec<Invocation>, egcl_rt::fxhash::FxBuildHasher>,
+}
+
+/// Snapshots kept per generic and generation before new decisions stop being
+/// cached; they are only an optimization.
+const CACHED_INVOCATIONS_PER_GENERIC: usize = 16;
+
+static INVOCATIONS: egcl_rt::execution_local::ExecutionLocal<RefCell<CachedInvocations>> = unsafe {
+    egcl_rt::execution_local::ExecutionLocal::new(|| {
+        RefCell::new(CachedInvocations {
+            generation: u64::MAX,
+            by_name: HashMap::default(),
+        })
+    })
+};
+
+fn scan_cached_invocations(visit: &mut dyn FnMut(*mut EgclVal)) {
+    // SAFETY: root scanners run with every execution stopped.
+    unsafe {
+        INVOCATIONS.scan(|cache| {
+            let mut cache = cache.borrow_mut();
+            with_env_visit_state(|state| {
+                for invocations in cache.by_name.values_mut() {
+                    for invocation in invocations.iter_mut() {
+                        invocation.trace_with(state, visit);
+                    }
+                }
+            });
+        });
+    }
+}
+
+fn install_invocation_scanner() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| egcl_rt::gc::register_root_scanner(scan_cached_invocations));
+}
+
+/// [`snapshot`] of `name`'s current candidate methods for the applicable
+/// methods `expected`, shared with every other call that made the same
+/// decision at dispatch generation `generation`.
+pub(super) fn cached_snapshot(
+    name: &str,
+    expected: &[EgclVal],
+    precedence: &[usize],
+    generation: u64,
+    env: &mut Env,
+) -> Result<Invocation, EgclError> {
+    install_invocation_scanner();
+    let hit = INVOCATIONS.with(|cache| {
+        let cache = cache.borrow();
+        if cache.generation != generation {
+            return None;
+        }
+        cache
+            .by_name
+            .get(name)?
+            .iter()
+            .find(|invocation| invocation.expected.as_slice() == expected)
+            .cloned()
+    });
+    if let Some(invocation) = hit {
+        return Ok(invocation);
+    }
+    egcl_rt::rooted!(candidates = env.methods.borrow().get(name).cloned().unwrap_or_default());
+    egcl_rt::rooted!(invocation = snapshot(name, &candidates, expected, precedence, env)?);
+    if GF_DISPATCH_GENERATION.load(AtomicOrdering::Acquire) == generation {
+        INVOCATIONS.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if cache.generation != generation {
+                cache.by_name.clear();
+                cache.generation = generation;
+            }
+            let invocations = cache.by_name.entry(Arc::from(name)).or_default();
+            if invocations.len() < CACHED_INVOCATIONS_PER_GENERIC {
+                invocations.push(invocation.clone());
+            }
+        });
+    }
+    Ok(invocation.clone())
+}
+
+/// The cached snapshot whose encoded form is `value`, if any. Allocates no
+/// Lisp objects.
+fn cached_decoded_invocation(value: EgclVal) -> Option<Invocation> {
+    let entry = fields(value, 6).ok()?;
+    if !is_string_value(entry[1]) {
+        return None;
+    }
+    let name = val_as_str(entry[1]);
+    INVOCATIONS.with(|cache| {
+        cache
+            .borrow()
+            .by_name
+            .get(name.as_str())?
+            .iter()
+            .find(|invocation| *invocation.encoded.borrow() == value)
+            .cloned()
+    })
+}
+
 /// Every method body gets these local functions, including bodies whose macros
 /// introduce their references. Raw source spelling cannot prove absence.
 /// Only the method body gets these local functions. Lambda-list initforms
@@ -225,6 +340,67 @@ pub(super) fn wrap_body(
         ],
     });
     Ok(*wrapped)
+}
+
+/// The source body forms that [`wrap_body`] wrapped, or `body` itself when it
+/// does not have exactly that shape. Allocation-free.
+pub(super) fn unwrapped_body(body: EgclVal) -> EgclVal {
+    fn is(symbol: EgclVal, names: &[&str]) -> bool {
+        symbol.is_symbol() && names.contains(&sym_name_rc(symbol).as_ref())
+    }
+    fn is_cl(symbol: EgclVal, name: &str) -> bool {
+        symbol.is_symbol()
+            && sym_bare_name_rc(symbol).as_ref() == name
+            && is(symbol, &[name, &format!("COMMON-LISP:{name}")])
+    }
+    fn items(list: EgclVal, count: usize) -> Option<Vec<EgclVal>> {
+        let values = proper_values(list).ok()?;
+        (values.len() == count).then_some(values)
+    }
+    let unwrap = || -> Option<EgclVal> {
+        let [let_form] = items(body, 1)?[..] else {
+            return None;
+        };
+        let [let_op, bindings, flet] = items(let_form, 3)?[..] else {
+            return None;
+        };
+        let [binding] = items(bindings, 1)?[..] else {
+            return None;
+        };
+        let [_, init] = items(binding, 2)?[..] else {
+            return None;
+        };
+        let [initializer] = items(init, 1)?[..] else {
+            return None;
+        };
+        if !is_cl(let_op, "LET")
+            || !is(
+                initializer,
+                &[
+                    "EGCL-INTERNAL::%METHOD-CONTEXT",
+                    "EGCL-INTERNAL:%METHOD-CONTEXT",
+                ],
+            )
+            || !flet.is_cons()
+            || !is_cl(cp(flet).0, "FLET")
+        {
+            return None;
+        }
+        let rest = cp(flet).1;
+        if !rest.is_cons() {
+            return None;
+        }
+        let (functions, forms) = cp(rest);
+        let [cnm, nmp] = items(functions, 2)?[..] else {
+            return None;
+        };
+        (cnm.is_cons()
+            && nmp.is_cons()
+            && is_cl(cp(cnm).0, "CALL-NEXT-METHOD")
+            && is_cl(cp(nmp).0, "NEXT-METHOD-P"))
+        .then_some(forms)
+    };
+    unwrap().unwrap_or(body)
 }
 
 fn bad() -> EgclError {
@@ -406,6 +582,9 @@ fn encode_invocation(invocation: &Invocation, env: &mut Env) -> EgclVal {
     *encoded
 }
 fn decode_invocation(value: EgclVal, env: &Env) -> Result<Invocation, EgclError> {
+    if let Some(invocation) = cached_decoded_invocation(value) {
+        return Ok(invocation);
+    }
     let entry = fields(value, 6)?;
     Ok(Invocation {
         gf: entry[0],

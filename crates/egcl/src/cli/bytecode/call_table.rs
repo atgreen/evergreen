@@ -53,6 +53,9 @@ enum Target {
     /// the class's instance plan and falls back to the full call itself
     /// (bliss-ih7pa). Any argument count; it too has no callable object.
     MakeInstance,
+    /// Any other generic function: `generic_call` with its dispatch cache,
+    /// which falls back to the full call itself (bliss-gg3i1.7.5).
+    Generic,
     Function(EgclVal),
 }
 
@@ -62,6 +65,7 @@ enum BridgeCall {
     Builtin(u32),
     Accessor,
     MakeInstance,
+    Generic,
 }
 
 impl Target {
@@ -70,7 +74,9 @@ impl Target {
             Self::Native { function, .. }
             | Self::Bytecode { function, .. }
             | Self::Function(function) => *function,
-            Self::Builtin { .. } | Self::Accessor { .. } | Self::MakeInstance => NIL,
+            Self::Builtin { .. } | Self::Accessor { .. } | Self::MakeInstance | Self::Generic => {
+                NIL
+            }
         }
     }
 
@@ -79,14 +85,14 @@ impl Target {
             Self::Native { function, .. }
             | Self::Bytecode { function, .. }
             | Self::Function(function) => visit(function),
-            Self::Builtin { .. } | Self::Accessor { .. } | Self::MakeInstance => {}
+            Self::Builtin { .. } | Self::Accessor { .. } | Self::MakeInstance | Self::Generic => {}
         }
     }
 
     fn is_bridge(&self) -> bool {
         matches!(
             self,
-            Self::Builtin { .. } | Self::Accessor { .. } | Self::MakeInstance
+            Self::Builtin { .. } | Self::Accessor { .. } | Self::MakeInstance | Self::Generic
         )
     }
 
@@ -97,6 +103,7 @@ impl Target {
             Self::Builtin { slot, nargs: n } if n == nargs => Some(BridgeCall::Builtin(slot)),
             Self::Accessor { nargs: n } if n == nargs => Some(BridgeCall::Accessor),
             Self::MakeInstance => Some(BridgeCall::MakeInstance),
+            Self::Generic => Some(BridgeCall::Generic),
             _ => None,
         }
     }
@@ -354,6 +361,10 @@ fn select_target(symbol: u32, nargs: usize) -> Option<Target> {
     // CL:MAKE-INSTANCE. `make_instance_call` revalidates per call.
     if nargs >= 1 && super::super::names_builtin_make_instance(symbol) {
         return Some(Target::MakeInstance);
+    }
+    // Any other generic function. `generic_call` revalidates per call.
+    if super::super::generic_call::names_dispatchable_generic(symbol) {
+        return Some(Target::Generic);
     }
     egcl_rt::function::is_interpreted_function(function).then_some(Target::Function(function))
 }
@@ -762,6 +773,7 @@ fn run_bridge_call(
         },
         BridgeCall::Accessor => super::super::accessor_call(state.symbol, args, env),
         BridgeCall::MakeInstance => super::super::make_instance_call(state.symbol, args, env),
+        BridgeCall::Generic => super::super::generic_call::generic_call(state.symbol, args, env),
     }
 }
 
@@ -841,7 +853,7 @@ pub(super) unsafe fn mapped_callee_declines(cell: u64) -> bool {
         Some(Target::Builtin { .. }) => {
             !super::call_table_funcall::names_funcall_or_apply(state.symbol)
         }
-        Some(Target::Accessor { .. } | Target::MakeInstance) => true,
+        Some(Target::Accessor { .. } | Target::MakeInstance | Target::Generic) => true,
         Some(Target::Native { code, .. }) => match &code._storage {
             NativeCodeStorage::Mapped(mapped) => mapped.mapped_entry().is_none(),
             _ => false,
@@ -907,12 +919,13 @@ fn warm(state: &State, args: &[EgclVal]) -> Result<EgclVal, EgclError> {
             }
             run_with_sym(body, args, *function, state.symbol, env)
         }
-        Target::Builtin { .. } | Target::Accessor { .. } | Target::MakeInstance => {
-            match target.bridge_call(args.len()) {
-                Some(call) => run_bridge_call(call, state, args, env),
-                None => cold(state, args),
-            }
-        }
+        Target::Builtin { .. }
+        | Target::Accessor { .. }
+        | Target::MakeInstance
+        | Target::Generic => match target.bridge_call(args.len()) {
+            Some(call) => run_bridge_call(call, state, args, env),
+            None => cold(state, args),
+        },
         Target::Function(_) => apply_function(*function, args, env),
     }
 }
