@@ -1917,6 +1917,30 @@ fn register_struct_accessor(accessor: EgclVal, structure: EgclVal, slot: EgclVal
     }
 }
 
+/// Whether `accessor` is already a DEFSTRUCT accessor for `slot` of a
+/// structure `class` includes (other than `structure` itself).
+fn inherited_struct_accessor(
+    accessor: EgclVal,
+    slot: EgclVal,
+    structure: EgclVal,
+    class: EgclVal,
+) -> bool {
+    let Some(index) = accessor.symbol_index() else {
+        return false;
+    };
+    let Some((owner, owner_slot)) = STRUCT_ACCESSOR_SLOTS.read().unwrap().get(&index).copied()
+    else {
+        return false;
+    };
+    if owner == structure || owner_slot != slot {
+        return false;
+    }
+    let Some(owner_class) = egcl_stdlib::find_class(owner) else {
+        return false;
+    };
+    egcl_stdlib::compute_class_precedence_list(class).is_ok_and(|cpl| cpl.contains(&owner_class))
+}
+
 /// The slot a DEFSTRUCT accessor names, when `instance` is of its structure.
 fn struct_accessor_slot(instance: EgclVal, accessor: EgclVal) -> Option<EgclVal> {
     let (structure, slot) = *STRUCT_ACCESSOR_SLOTS
@@ -41500,7 +41524,18 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         // `index` is the slot's position in the layout, where the :INCLUDE
         // prefix puts it; the run-time fast path verifies it.
         let value = sym("%STRUCT-VALUE%");
+        let own_class = egcl_stdlib::find_class(*name_sym_r);
         for (index, slot) in slots.iter().enumerate() {
+            // As in SBCL, an :INCLUDE whose conc-name regenerates an included
+            // structure's own accessor for the same slot (SB-C's
+            // MULTIPLE-SUCCESSORS-NODE with :CONC-NAME NODE-) keeps that
+            // accessor, which already accepts this subtype; redefining it
+            // would reject every other instance of the parent.
+            if own_class.is_some_and(|class| {
+                inherited_struct_accessor(slot.accessor, slot.slot_sym, *name_sym_r, class)
+            }) {
+                continue;
+            }
             egcl_rt::rooted!(params = vec_to_list(&[obj]));
             egcl_rt::rooted!(quoted_name = quote(*name_sym_r));
             egcl_rt::rooted!(quoted_slot = quote(slot.slot_sym));
