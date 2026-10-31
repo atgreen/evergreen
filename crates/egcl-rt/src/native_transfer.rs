@@ -476,7 +476,15 @@ unsafe fn with_native_segment(
         value: NIL,
         exit: NativeExit::Returned,
     };
+    // Ordinary native frames keep their special bindings on the execution's
+    // native binding stack, not in Rust guards. A frame that returns normally
+    // has removed its own; one abandoned by a transfer or deoptimization exit
+    // has not, and nothing but this segment boundary knows which entries
+    // belong to the frames it discarded (bliss-gg3i1.7.4). Restore them here,
+    // before any Rust frame below the segment can observe the variables.
+    let bindings = crate::symbols::native_binding_depth();
     enter(anchor, &mut outcome);
+    crate::symbols::unwind_native_bindings(bindings);
     Ok(outcome)
 }
 

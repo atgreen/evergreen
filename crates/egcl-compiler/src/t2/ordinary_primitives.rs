@@ -23,6 +23,16 @@ pub enum OrdinaryPrimitive {
     MakeArray,
     LoadEnvironment,
     StoreEnvironment,
+    /// `(symbol value)`: establish a special binding on the execution's
+    /// native binding stack (bliss-gg3i1.7.4).
+    BindSpecial,
+    /// `(count)`: restore the `count` newest native special bindings.
+    UnbindSpecial,
+    /// `BindSpecial` leaving the multiple values alone, where the incoming
+    /// tuple may still be read: the interpreter's binding never touches it.
+    BindSpecialPreservingValues,
+    /// `UnbindSpecial` leaving the multiple values alone.
+    UnbindSpecialPreservingValues,
 }
 
 impl OrdinaryPrimitive {
@@ -32,7 +42,7 @@ impl OrdinaryPrimitive {
         format!("%EGCL-ORDINARY-{self:?}").to_ascii_uppercase()
     }
 
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 16] = [
         Self::LoadGlobal,
         Self::StoreGlobal,
         Self::LoadFunction,
@@ -45,6 +55,10 @@ impl OrdinaryPrimitive {
         Self::MakeArray,
         Self::LoadEnvironment,
         Self::StoreEnvironment,
+        Self::BindSpecial,
+        Self::UnbindSpecial,
+        Self::BindSpecialPreservingValues,
+        Self::UnbindSpecialPreservingValues,
     ];
 }
 
@@ -167,6 +181,261 @@ pub fn lower_ordinary_primitives(
     let count = count + lower_ordinary_primitives_inner(&mut candidate, &mut resolve)?;
     *f = candidate;
     Ok(count)
+}
+
+/// `lower_ordinary_primitives`, first lowering every plain `SpecialBinding`
+/// call (bliss-gg3i1.7.4) to the BindSpecial/UnbindSpecial adapters.
+/// `operand(bcp, enter)` names the binding's symbol index for an entry, or
+/// the number of bindings an exit restores; the bytecode at `bcp` owns both.
+/// All-or-nothing: on failure `f` is unchanged.
+pub fn lower_ordinary_primitives_with_specials(
+    f: &mut Function,
+    mut resolve: impl FnMut(OrdinaryPrimitive) -> Option<u32>,
+    operand: impl Fn(u32, bool) -> Option<u32>,
+) -> Result<usize, EmitError> {
+    if !has_special_bindings(f) {
+        return lower_ordinary_primitives(f, resolve);
+    }
+    let mut candidate = f.clone();
+    let specials = lower_special_bindings(&mut candidate, &mut resolve, &operand)?;
+    let others = lower_ordinary_primitives(&mut candidate, resolve)?;
+    *f = candidate;
+    Ok(specials + others)
+}
+
+fn has_special_bindings(f: &Function) -> bool {
+    f.block_order().iter().any(|&block| {
+        f.block(block)
+            .insts
+            .iter()
+            .any(|&inst| matches!(f.inst(inst).aux, AuxData::SpecialBinding { .. }))
+    })
+}
+
+/// Whether `inst` is an unbinding exit that only forwards the complete result
+/// of the call before it to the function's return: the block ends
+/// `call, unbind..., return call-result`. The ordinary emitter restores those
+/// bindings between the call and the return without touching the call's
+/// multiple values (`forwarded_unbinds`).
+fn forwarded_unbind(f: &Function, block: crate::t2::ir::Block, inst: crate::t2::ir::Inst) -> bool {
+    let unbind = |site: crate::t2::ir::Inst| {
+        let data = f.inst(site);
+        data.opcode == Opcode::Call
+            && matches!(data.aux, AuxData::SpecialBinding { enter: false, .. })
+    };
+    let insts = &f.block(block).insts;
+    let Some(position) = insts.iter().position(|&site| site == inst) else {
+        return false;
+    };
+    let mut first = position;
+    while first > 0 && unbind(insts[first - 1]) {
+        first -= 1;
+    }
+    let mut last = position;
+    while last + 1 < insts.len() && unbind(insts[last + 1]) {
+        last += 1;
+    }
+    let (Some(&call), Some(&ret)) = (
+        first.checked_sub(1).and_then(|index| insts.get(index)),
+        insts.get(last + 1),
+    ) else {
+        return false;
+    };
+    let call = f.inst(call);
+    let ret = f.inst(ret);
+    last + 2 == insts.len()
+        && call.opcode == Opcode::Call
+        && matches!(
+            call.aux,
+            AuxData::CallTarget(_) | AuxData::OpaqueCallTarget(_)
+        )
+        && call.results.len() == 1
+        && ret.opcode == Opcode::Return
+        && ret.args == call.results
+}
+
+fn insert_before(
+    f: &mut Function,
+    block: crate::t2::ir::Block,
+    anchor: crate::t2::ir::Inst,
+    data: InstData,
+    results: &[(IRType, ValueRepresentation)],
+) -> Vec<crate::t2::ir::Value> {
+    let (inst, values) = f.push_inst(block, data, results);
+    let layout = &mut f.block_mut(block).insts;
+    assert_eq!(layout.pop(), Some(inst));
+    let position = layout.iter().position(|&site| site == anchor).unwrap();
+    layout.insert(position, inst);
+    values
+}
+
+/// How one special-binding call treats the multiple values it receives.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BindingValues {
+    /// The incoming tuple is empty (`normalize` false) or never read again
+    /// (`normalize` true, cleared first): the adapter returns one value, as
+    /// an ordinary call, and a reset records it.
+    Single { normalize: bool },
+    /// An exit between a call and the return of its complete result.
+    Forwarded,
+    /// The tuple may still be read: the binding leaves it alone, as the
+    /// interpreter's does, and what follows sees it unchanged.
+    Preserved,
+}
+
+fn lower_special_bindings(
+    f: &mut Function,
+    resolve: &mut impl FnMut(OrdinaryPrimitive) -> Option<u32>,
+    operand: &impl Fn(u32, bool) -> Option<u32>,
+) -> Result<usize, EmitError> {
+    // A binding leaves the multiple values alone in the interpreter. Model
+    // the bindings as transparent to find where their incoming tuple matters.
+    let mut model = f.clone();
+    for &block in f.block_order() {
+        for &inst in &f.block(block).insts {
+            if matches!(f.inst(inst).aux, AuxData::SpecialBinding { .. }) {
+                let data = model.inst_mut(inst);
+                data.opcode = Opcode::ConstNil;
+                data.flags = InstFlags::default();
+            }
+        }
+    }
+    let single = crate::t2::opt_clear_mv::single_value_state(&model, true);
+    let unobserved = crate::t2::opt_clear_mv::unobserved_multiple_value_state(&model);
+    let mut sites = Vec::new();
+    for &block in f.block_order() {
+        for &inst in &f.block(block).insts {
+            let data = f.inst(inst);
+            let AuxData::SpecialBinding { bcp, enter } = data.aux else {
+                continue;
+            };
+            if data.opcode != Opcode::Call
+                || !data.results.is_empty()
+                || data.args.len() != usize::from(enter)
+                || data
+                    .args
+                    .iter()
+                    .any(|&value| f.value(value).repr != ValueRepresentation::Tagged)
+            {
+                return Err(EmitError::Declined("special binding call shape"));
+            }
+            let operand = operand(bcp, enter).ok_or(EmitError::Declined(
+                "special binding without a bytecode operand",
+            ))?;
+            let values = if single.contains(&inst) {
+                BindingValues::Single { normalize: false }
+            } else if unobserved.contains(&inst) {
+                BindingValues::Single { normalize: true }
+            } else if !enter && forwarded_unbind(f, block, inst) {
+                BindingValues::Forwarded
+            } else {
+                BindingValues::Preserved
+            };
+            let primitive = match (enter, values) {
+                (true, BindingValues::Preserved) => OrdinaryPrimitive::BindSpecialPreservingValues,
+                (false, BindingValues::Preserved) => {
+                    OrdinaryPrimitive::UnbindSpecialPreservingValues
+                }
+                (true, _) => OrdinaryPrimitive::BindSpecial,
+                (false, _) => OrdinaryPrimitive::UnbindSpecial,
+            };
+            sites.push((
+                block,
+                inst,
+                enter,
+                operand,
+                resolve(primitive).ok_or(EmitError::Declined("special binding adapter"))?,
+                values,
+            ));
+        }
+    }
+    let clear = |source_pos| InstData {
+        opcode: Opcode::ClearMv,
+        args: vec![],
+        results: vec![],
+        aux: AuxData::None,
+        flags: InstFlags {
+            call: true,
+            safepoint: true,
+            effectful: true,
+            ..Default::default()
+        },
+        targets: vec![],
+        frame_state: None,
+        source_pos,
+    };
+    for &(block, inst, enter, operand, target, values) in &sites {
+        let source_pos = f.inst(inst).source_pos;
+        // A forwarded exit keeps the call, its unbinds and the return
+        // adjacent: its operand goes before the whole sequence.
+        let mut anchor = inst;
+        if values == BindingValues::Forwarded {
+            // Earlier unbinds of the same run may already be lowered.
+            let unbind = |site: crate::t2::ir::Inst| match f.inst(site).aux {
+                AuxData::SpecialBinding { enter: false, .. } => true,
+                AuxData::CallTarget(symbol) => symbol == target,
+                _ => false,
+            };
+            let insts = &f.block(block).insts;
+            let mut position = insts.iter().position(|&site| site == inst).unwrap();
+            while position > 0 && unbind(insts[position - 1]) {
+                position -= 1;
+            }
+            anchor = insts[position
+                .checked_sub(1)
+                .ok_or(EmitError::Declined("forwarded special-binding exit"))?];
+        }
+        let (opcode, aux, ty) = if enter {
+            (
+                Opcode::ConstSymbol,
+                AuxData::SymbolRef(operand),
+                IRType::of(TypeBits::SYMBOL),
+            )
+        } else {
+            (
+                Opcode::ConstFixnum,
+                AuxData::FixnumImm(i64::from(operand)),
+                IRType::of(TypeBits::FIXNUM),
+            )
+        };
+        let constant = insert_before(
+            f,
+            block,
+            anchor,
+            InstData {
+                opcode,
+                args: vec![],
+                results: vec![],
+                aux,
+                flags: InstFlags::default(),
+                targets: vec![],
+                frame_state: None,
+                source_pos,
+            },
+            &[(ty, ValueRepresentation::Tagged)],
+        );
+        if values == (BindingValues::Single { normalize: true }) {
+            insert_before(f, block, inst, clear(source_pos), &[]);
+        }
+        let data = f.inst_mut(inst);
+        data.args.insert(0, constant[0]);
+        data.aux = AuxData::CallTarget(target);
+        data.flags = InstFlags {
+            call: true,
+            safepoint: true,
+            effectful: true,
+            ..Default::default()
+        };
+        if matches!(values, BindingValues::Single { .. }) {
+            // The adapter returns one value, as an ordinary call; record it.
+            let (reset, _) = f.push_inst(block, clear(source_pos), &[]);
+            let layout = &mut f.block_mut(block).insts;
+            assert_eq!(layout.pop(), Some(reset));
+            let position = layout.iter().position(|&site| site == inst).unwrap();
+            layout.insert(position + 1, reset);
+        }
+    }
+    Ok(sites.len())
 }
 
 fn lower_ordinary_primitives_inner(

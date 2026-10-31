@@ -410,8 +410,8 @@ impl EmittedTransfer {
                 // retain separate descriptors and cannot constrain that proof.
                 ir.osr_entries.clear();
                 let mut call_cells = call_cells.to_vec();
-                if context.primitives.lower(&mut ir, &mut call_cells).is_none() {
-                    ordinary_declined(&"primitive lowering (ordinary_primitives::lower)");
+                if let Err(error) = context.primitives.lower(body, &mut ir, &mut call_cells) {
+                    ordinary_declined(&format!("primitive lowering (ordinary_primitives::lower): {error:?}"));
                     return None;
                 }
                 if std::env::var_os("EGCL_DISABLE_ARRAY_LAYOUT_FACTS").is_none() {

@@ -644,7 +644,30 @@ pub(super) fn install() {
     install_leaf_helpers(LeafHelpers {
         builtins,
         load_global: load_global as Helper1 as usize as u64,
+        bind_special: bind_special::<true> as Helper3 as usize as u64,
+        bind_special_keep_values: bind_special::<false> as Helper3 as usize as u64,
+        unbind_special: unbind_special::<true> as Helper1 as usize as u64,
+        unbind_special_keep_values: unbind_special::<false> as Helper1 as usize as u64,
     });
+}
+
+/// Establish a special binding owned by an ordinary native frame
+/// (bliss-gg3i1.7.4). The segment the frame runs in restores it if the frame
+/// is abandoned; see `egcl_rt::symbols::native_bind_symbol_value`. `C`
+/// false leaves the multiple values alone, as the interpreter's binding does.
+/// `object` is the symbol's pinned object, or 0.
+extern "C" fn bind_special<const C: bool>(symbol: u64, value: u64, object: u64) -> u64 {
+    egcl_rt::symbols::native_bind_symbol_value(symbol as u32, EgclVal(value), object as usize);
+    single::<C>(NIL)
+}
+
+/// Restore the `count` newest native special bindings. `C` false leaves the
+/// multiple values alone: the exit forwards a call's complete result. The
+/// compiled frame holds every binding it unbinds.
+extern "C" fn unbind_special<const C: bool>(count: u64) -> u64 {
+    let restored = egcl_rt::symbols::native_unbind_symbol_values(count as usize);
+    debug_assert!(restored, "unbinding more native bindings than are held");
+    single::<C>(NIL)
 }
 
 #[cfg(not(all(target_arch = "x86_64", target_os = "linux", not(egcl_no_t2))))]

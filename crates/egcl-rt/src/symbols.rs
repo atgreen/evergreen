@@ -975,6 +975,16 @@ struct DynamicValues {
     // Symbol indices are dense small integers: FxHash, not SipHash. Every
     // access to a bound special looks here.
     map: HashMap<u32, EgclVal, FxBuildHasher>,
+    /// Bindings established by ordinary-ABI native frames (bliss-gg3i1.7.4),
+    /// newest last: the symbol and the overlay value it had before the
+    /// binding, which restoring writes back. Native frames own no Rust guard,
+    /// so a frame abandoned by a nonlocal exit cannot restore its own
+    /// bindings; the native segment it ran in restores every entry above the
+    /// depth it recorded at entry (`unwind_native_bindings`), before any Rust
+    /// frame below the segment runs a handler or a cleanup. Deoptimizing a
+    /// frame instead hands its entries to the interpreter's guards
+    /// (`pop_native_binding`). The saved values are roots.
+    native: Vec<NativeBinding>,
 }
 
 impl Drop for DynamicValues {
@@ -1022,22 +1032,33 @@ fn resync_binding_guards() {
     }
 }
 
-/// Bind locally; the returned previous local value must be rooted until restored.
-pub fn bind_symbol_value(idx: u32, value: EgclVal) -> Option<EgclVal> {
+fn install_dynamic_value_scanner() {
     static INSTALL: std::sync::Once = std::sync::Once::new();
     INSTALL.call_once(|| {
         crate::gc::register_root_scanner(|visit| {
             // SAFETY: root scanners execute under the stop-the-world handshake.
             unsafe {
                 DYNAMIC_VALUES.scan(|values| {
-                    for (&index, value) in values.borrow_mut().map.iter_mut() {
+                    let mut values = values.borrow_mut();
+                    for (&index, value) in values.map.iter_mut() {
                         trace_symbol_index(index, visit);
                         visit(value);
+                    }
+                    for binding in values.native.iter_mut() {
+                        trace_symbol_index(binding.idx, visit);
+                        if let Some(saved) = binding.previous.as_mut() {
+                            visit(saved);
+                        }
                     }
                 })
             };
         })
     });
+}
+
+/// Bind locally; the returned previous local value must be rooted until restored.
+pub fn bind_symbol_value(idx: u32, value: EgclVal) -> Option<EgclVal> {
+    install_dynamic_value_scanner();
     let previous = DYNAMIC_VALUES.with(|values| values.borrow_mut().map.insert(idx, value));
     if previous.is_none() {
         // This execution's overlay gained the symbol: inline accesses must stop
@@ -1060,6 +1081,126 @@ pub fn restore_symbol_binding(idx: u32, previous: Option<EgclVal>) {
     if released {
         adjust_binding_guard(idx, false);
     }
+}
+
+/// One binding on an execution's native binding stack.
+struct NativeBinding {
+    idx: u32,
+    /// The overlay value restoring writes back; `None` removes the entry.
+    previous: Option<EgclVal>,
+    /// The symbol's pinned object when the binding's maker knew it (an
+    /// interned symbol), so the guard word needs no registry lookup; else 0.
+    object: usize,
+}
+
+/// Adjust a symbol's binding guard, through its pinned object when known.
+fn adjust_binding_guard_at(idx: u32, object: usize, gained: bool) {
+    if object == 0 {
+        adjust_binding_guard(idx, gained);
+        return;
+    }
+    // SAFETY: `object` is the pinned object of an interned symbol, which is
+    // never moved or freed (`inline_access_object`).
+    let guard = unsafe { &(*(object as *const SymbolData)).binding_guard };
+    if gained {
+        guard.fetch_add(1, Ordering::SeqCst);
+    } else {
+        guard.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Establish a dynamic binding owned by an ordinary-ABI native frame: bind
+/// `idx` to `value` and record what restoring it writes back on this
+/// execution's native binding stack. `object` is the symbol's pinned object
+/// from `inline_access_object`, or 0. Never allocates on the Lisp heap,
+/// collects or signals, so native code calls it as a leaf.
+pub fn native_bind_symbol_value(idx: u32, value: EgclVal, object: usize) {
+    install_dynamic_value_scanner();
+    let fresh = DYNAMIC_VALUES.with(|values| {
+        let mut values = values.borrow_mut();
+        let previous = values.map.insert(idx, value);
+        values.native.push(NativeBinding {
+            idx,
+            previous,
+            object,
+        });
+        previous.is_none()
+    });
+    if fresh {
+        // This execution's overlay gained the symbol: inline accesses must
+        // stop using the value cell before the binding's body runs.
+        adjust_binding_guard_at(idx, object, true);
+    }
+}
+
+/// Restore the newest native bindings above `depth`, newest first, at most
+/// `limit` of them. Returns how many were restored.
+fn restore_native_bindings(depth: usize, limit: usize) -> usize {
+    DYNAMIC_VALUES.with(|values| {
+        let mut values = values.borrow_mut();
+        let mut restored = 0;
+        while restored < limit && values.native.len() > depth {
+            let binding = values.native.pop().expect("nonempty native binding stack");
+            let released = match binding.previous {
+                Some(previous) => {
+                    values.map.insert(binding.idx, previous);
+                    false
+                }
+                None => values.map.remove(&binding.idx).is_some(),
+            };
+            if released {
+                // Neither touches this execution's overlay.
+                adjust_binding_guard_at(binding.idx, binding.object, false);
+            }
+            restored += 1;
+        }
+        restored
+    })
+}
+
+/// Restore the `count` newest native bindings, newest first. False, having
+/// restored nothing, when fewer than `count` are held.
+pub fn native_unbind_symbol_values(count: usize) -> bool {
+    let depth = native_binding_depth();
+    if depth < count {
+        return false;
+    }
+    restore_native_bindings(depth - count, count) == count
+}
+
+/// How many native bindings this execution holds.
+pub fn native_binding_depth() -> usize {
+    DYNAMIC_VALUES.with(|values| values.borrow().native.len())
+}
+
+/// Restore every native binding above `depth`, newest first: the native
+/// frames that made them were abandoned by a nonlocal exit.
+pub fn unwind_native_bindings(depth: usize) {
+    restore_native_bindings(depth, usize::MAX);
+}
+
+/// Remove the newest native binding without restoring it, handing its
+/// restoration to the caller (a deoptimizing frame's interpreter guard). The
+/// binding stays in effect. The returned saved value is no longer a root: the
+/// caller must root it before anything can collect.
+pub fn pop_native_binding() -> Option<(u32, Option<EgclVal>)> {
+    DYNAMIC_VALUES.with(|values| {
+        values
+            .borrow_mut()
+            .native
+            .pop()
+            .map(|binding| (binding.idx, binding.previous))
+    })
+}
+
+/// The symbol of the native binding `from_top` entries below the newest.
+pub fn native_binding_symbol(from_top: usize) -> Option<u32> {
+    DYNAMIC_VALUES.with(|values| {
+        let values = values.borrow();
+        let len = values.native.len();
+        len.checked_sub(from_top + 1)
+            .map(|index| values.native[index].idx)
+    })
 }
 
 /// Read the current dynamic binding, or the global cell when not bound locally.

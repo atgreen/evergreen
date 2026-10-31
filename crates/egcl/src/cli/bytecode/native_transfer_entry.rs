@@ -2472,6 +2472,42 @@ fn ordinary_native_op(op: &Instr) -> bool {
             Instr::PushTag { .. } | Instr::Go { .. } | Instr::LoadEnvVar(_) | Instr::StoreEnvVar(_)
         )
         || (matches!(op, Instr::LoadFunction(_)) && ordinary_function_designators_enabled())
+        || (matches!(op, Instr::BindSpecial(_) | Instr::UnbindSpecial(_))
+            && ordinary_special_bindings_enabled())
+}
+
+/// Ordinary entries run special bindings on the execution's native binding
+/// stack (bliss-gg3i1.7.4). `EGCL_DISABLE_ORDINARY_SPECIALS` keeps such bodies
+/// on the mapped entry, for comparison and bisection.
+pub(super) fn ordinary_special_bindings_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("EGCL_DISABLE_ORDINARY_SPECIALS").is_none())
+}
+
+/// A body whose only dynamic scopes are special bindings: the T2 worker builds
+/// it with plain binding calls, which the ordinary entry can lower.
+pub(in crate::cli::bytecode) fn special_binding_body(body: &BytecodeFunction) -> bool {
+    ordinary_special_bindings_enabled()
+        && body
+            .code
+            .iter()
+            .any(|op| matches!(op, Instr::BindSpecial(_)))
+        && !body.code.iter().any(|op| {
+            matches!(
+                op,
+                Instr::PushCatch { .. }
+                    | Instr::PushUnwind { .. }
+                    | Instr::PushHandlerCase { .. }
+                    | Instr::PushHandlerBind { .. }
+                    | Instr::PushRestartCase { .. }
+                    | Instr::MakeClosure { .. }
+                    | Instr::LoadEnvVar(_)
+                    | Instr::StoreEnvVar(_)
+                    | Instr::DefineEnvVar(_)
+                    | Instr::PushEnvChild
+                    | Instr::PopEnvChild
+            )
+        })
 }
 
 pub(super) fn ordinary_function_designators_enabled() -> bool {
@@ -3217,6 +3253,7 @@ unsafe extern "C" fn deliver_handler(
     _unused: EgclVal,
 ) -> EgclVal {
     let context = unsafe { &mut *CAPTURE.with(Cell::get) };
+    egcl_rt::symbols::unwind_native_bindings(context.native_bindings);
     let prepared = unsafe { &mut *context.prepared_handler }
         .take()
         .expect("prepared native handler payload");
@@ -3260,6 +3297,7 @@ impl egcl_rt::gc::TraceHostRoots for PreparedCatch {
 // stored in its generated-code home.
 unsafe extern "C" fn deliver_catch(push_bcp: u32, resume_bcp: u32, _unused: EgclVal) -> EgclVal {
     let context = unsafe { &mut *CAPTURE.with(Cell::get) };
+    egcl_rt::symbols::unwind_native_bindings(context.native_bindings);
     let prepared = unsafe { &mut *context.prepared_catch }
         .take()
         .expect("prepared native catch payload");
@@ -3295,6 +3333,7 @@ impl egcl_rt::gc::TraceHostRoots for SavedCleanup {
 // storage exhaustion is still an installation gate for the entire opt-in ABI.
 unsafe extern "C" fn save_cleanup(cleanup_bcp: u32, resume_bcp: u32, value: EgclVal) -> EgclVal {
     let context = unsafe { &mut *CAPTURE.with(Cell::get) };
+    egcl_rt::symbols::unwind_native_bindings(context.native_bindings);
     let env = unsafe { &*NATIVE_ENV.with(Cell::get) };
     let cleanups = unsafe { &mut *context.cleanups };
     let depths = unsafe { &*context.cleanup_depths };
@@ -4807,6 +4846,13 @@ struct CaptureContext {
     slots: usize,
     selected: Option<usize>,
     failure: Option<TransferSiteError>,
+    /// The execution's native special-binding depth when this activation
+    /// began (bliss-gg3i1.7.4). A mapped frame keeps its own bindings in
+    /// `specials`, never on the native stack, so every native entry above this
+    /// depth belongs to an ordinary frame called from it. A transfer delivered
+    /// to one of its landings abandoned those frames: the delivery restores
+    /// their bindings before the handler, catch or cleanup body runs.
+    native_bindings: usize,
 }
 static CAPTURE: egcl_rt::execution_local::ExecutionLocal<Cell<*mut CaptureContext>> =
     unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| Cell::new(std::ptr::null_mut())) };
