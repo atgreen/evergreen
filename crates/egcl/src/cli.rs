@@ -6610,17 +6610,14 @@ const FUNCALLABLE_FUNCTION_SLOT: &str = "%FUNCALLABLE-FUNCTION";
 /// such an instance a FUNCTION either way, and `iparse` (via closer-mop) builds
 /// one and then installs its function in a second step.
 fn is_funcallable_instance(v: EgclVal) -> bool {
-    resolve_sym(FUNCALLABLE_FUNCTION_SLOT).is_some_and(|slot| egcl_stdlib::slot_present_p(v, slot))
+    egcl_stdlib::funcallable_slot_index(v, FUNCALLABLE_FUNCTION_SLOT).is_some()
 }
 
 /// The function installed in a funcallable instance, or None when this is not a
 /// funcallable instance or nothing has been installed yet.
 fn funcallable_instance_function(v: EgclVal) -> Option<EgclVal> {
-    let slot = resolve_sym(FUNCALLABLE_FUNCTION_SLOT)?;
-    if !egcl_stdlib::slot_present_p(v, slot) {
-        return None;
-    }
-    egcl_stdlib::slot_value(v, slot).ok()
+    let idx = egcl_stdlib::funcallable_slot_index(v, FUNCALLABLE_FUNCTION_SLOT)?;
+    egcl_stdlib::instance_slot_at(v, idx)
 }
 
 /// A retained generic-function value: the cached `(EGCL::CLOSURE . id)` wrapper
@@ -19831,6 +19828,11 @@ fn typep_matches(
     // NIL names the empty type: nothing is of type NIL (ansi type-of.1).
     if type_spec.is_nil() {
         return Ok(false);
+    }
+    // Structure predicates and TYPECASE over structure types are the hottest
+    // TYPEP shape in SBCL's compiler; answer them before any name rendering.
+    if let Some(matches) = egcl_stdlib::structure_instance_typep(object, type_spec) {
+        return Ok(matches);
     }
     if type_spec.is_symbol() && sym_bare_name_rc(type_spec).as_ref() == "HEAP-OBJECT" {
         return Ok(object.is_heap_object());

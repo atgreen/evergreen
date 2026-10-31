@@ -181,6 +181,20 @@ struct SlotLayout {
     order: Vec<EgclVal>,
     /// slot name → index into the inline slot vector.
     index: HashMap<EgclVal, usize>,
+    /// Index of the hidden funcallable-function slot, found by bare name the
+    /// first time anyone asks. FUNCTIONP/TYPEP ask about every instance they
+    /// see, and the by-name scan used to repeat on each call.
+    funcallable_slot: std::sync::OnceLock<Option<usize>>,
+}
+
+impl SlotLayout {
+    fn new(order: Vec<EgclVal>, index: HashMap<EgclVal, usize>) -> Self {
+        SlotLayout {
+            order,
+            index,
+            funcallable_slot: std::sync::OnceLock::new(),
+        }
+    }
 }
 
 /// Lightweight, immutable per-class descriptor (D5.04) pointed to from each
@@ -438,10 +452,8 @@ unsafe fn set_instance_wrapper(inst: EgclVal, w: *mut ClassWrapper) {
 /// `ClassMeta`, not in Lisp-visible slots), so an empty layout is the whole
 /// story. `finalize_class_layout` builds the same shape for ordinary classes.
 fn leak_empty_wrapper(class: EgclVal) -> *mut ClassWrapper {
-    let layout: &'static SlotLayout = Box::leak(Box::new(SlotLayout {
-        order: Vec::new(),
-        index: HashMap::new(),
-    }));
+    let layout: &'static SlotLayout =
+        Box::leak(Box::new(SlotLayout::new(Vec::new(), HashMap::new())));
     let wrapper: &'static ClassWrapper = Box::leak(Box::new(ClassWrapper {
         stamp: next_stamp(),
         state: AtomicU8::new(WRAPPER_CURRENT),
@@ -1560,7 +1572,7 @@ pub fn restore_clos_state(data: &[u8], remap: &dyn Fn(u64) -> u64) -> Result<usi
         for (i, name) in order.iter().enumerate() {
             index.insert(*name, i);
         }
-        let layout = Box::leak(Box::new(SlotLayout { order, index }));
+        let layout = Box::leak(Box::new(SlotLayout::new(order, index)));
         let wrapper: &'static ClassWrapper = Box::leak(Box::new(ClassWrapper {
             stamp,
             state: AtomicU8::new(state),
@@ -2585,7 +2597,7 @@ fn finalize_class_layout(st: &mut ClosState, class: EgclVal) {
         }
     }
     let slot_count = order.len() as u32;
-    let layout = Box::leak(Box::new(SlotLayout { order, index }));
+    let layout = Box::leak(Box::new(SlotLayout::new(order, index)));
     let wrapper: &'static ClassWrapper = Box::leak(Box::new(ClassWrapper {
         stamp: next_stamp(),
         state: AtomicU8::new(WRAPPER_CURRENT),
@@ -3862,6 +3874,77 @@ pub fn slot_present_p(instance: EgclVal, slot_name: EgclVal) -> bool {
         let instance = update_if_obsolete(instance);
         instance_slot_index(instance, slot_name).is_some()
     }
+}
+
+/// The inline index of `instance`'s slot whose bare name is `bare_name`, cached
+/// per layout. Only for the one hidden funcallable-function slot: the cache
+/// does not record which name it was computed for.
+pub fn funcallable_slot_index(instance: EgclVal, bare_name: &str) -> Option<usize> {
+    if !is_instance(instance) {
+        return None;
+    }
+    unsafe {
+        let instance = update_if_obsolete(instance);
+        let w = instance_wrapper(instance);
+        if w.is_null() {
+            return None;
+        }
+        let layout = (*w).layout;
+        *layout.funcallable_slot.get_or_init(|| {
+            layout
+                .order
+                .iter()
+                .position(|&s| bare_symbol_name(s).as_deref() == Some(bare_name))
+        })
+    }
+}
+
+/// The value in inline slot `idx` of `instance`, or None when it is unbound.
+/// `idx` must come from [`funcallable_slot_index`] for this same instance.
+pub fn instance_slot_at(instance: EgclVal, idx: usize) -> Option<EgclVal> {
+    if !is_instance(instance) {
+        return None;
+    }
+    unsafe {
+        let instance = update_if_obsolete(instance);
+        let v = *slot_cell(instance, idx);
+        (v != UNBOUND).then_some(v)
+    }
+}
+
+/// `(typep object 'NAME)` for a structure instance and a structure class name,
+/// answered under one lock with no allocation. None defers to the general
+/// TYPEP path: not a current structure instance, NAME not registered under
+/// this exact symbol, NAME not a structure class, or no cached precedence list
+/// yet. Neither a structure instance nor a structure class can be a stream,
+/// funcallable instance or class metaobject, so whenever this answers, the
+/// general path would reach the same precedence-list test.
+pub fn structure_instance_typep(object: EgclVal, name: EgclVal) -> Option<bool> {
+    if !name.is_symbol()
+        || egcl_rt::gc::heap_object_type_id(object) != Some(type_id::STANDARD_OBJECT)
+    {
+        return None;
+    }
+    let actual = unsafe {
+        let w = instance_wrapper(object);
+        if w.is_null() || (*w).state.load(Ordering::Acquire) != WRAPPER_CURRENT {
+            return None;
+        }
+        (*w).class
+    };
+    with_state(|st| {
+        let expected = *st.class_registry.get(&name)?;
+        if !st.structure_classes.contains(&actual) || !st.structure_classes.contains(&expected) {
+            return None;
+        }
+        if actual == expected {
+            return Some(true);
+        }
+        st.cpl_cache
+            .borrow()
+            .get(&actual)
+            .map(|cpl| cpl.contains(&expected))
+    })
 }
 
 /// Make a slot unbound (SLOT-MAKUNBOUND).
