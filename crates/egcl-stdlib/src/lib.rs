@@ -79,11 +79,12 @@ pub use clos::{
     change_class, class_direct_subclasses, class_direct_superclasses, class_name, class_of,
     class_slots, compute_applicable_methods, compute_class_precedence_list,
     compute_effective_method, define_class, effective_slots, ensure_clos_bootstrapped, find_class,
-    generic_function_name, initialize_instance, is_instance, is_structure_class,
-    make_generic_function, make_instance, make_struct, reinitialize_instance, set_find_class,
-    set_method_specializers, set_slot_value, set_slot_value_if_present, set_structure_class,
-    shared_initialize, shared_initialize_with_list, slot_boundp, slot_makunbound, slot_present_p,
-    slot_value, slot_value_if_present,
+    funcallable_slot_index, generic_function_name, initialize_instance, instance_slot_at,
+    is_instance, is_structure_class, make_generic_function, make_instance, make_struct,
+    reinitialize_instance, set_find_class, set_method_specializers, set_slot_value,
+    set_slot_value_if_present, set_structure_class, shared_initialize, shared_initialize_with_list,
+    slot_boundp, slot_makunbound, slot_present_p, slot_value, slot_value_if_present,
+    structure_instance_typep,
 };
 pub use conditions::{
     HandlerBinding, RestartSpec, acquire_preallocated_storage_condition, clear_funcall_hook,

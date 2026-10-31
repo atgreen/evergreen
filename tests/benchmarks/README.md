@@ -45,6 +45,12 @@ implementations, where the sum fits a fixnum; a 32-bit implementation may box
 the accumulation. The two reported minima come from separate runs, so their
 difference is an estimate rather than an exact per-call latency.
 
+`struct-access`, `struct-predicate`, `struct-typecase` and `struct-constructor`
+time DEFSTRUCT accessors (through an `:include`d parent), predicates, TYPECASE
+over structure types and keyword constructors from warmed callers. These are
+the operations EGCL-hosted SBCL compilation spends its time on
+(bliss-gg3i1.7), so they track that work's progress directly.
+
 Still to come (tracked on bliss-jpd0): the rest of the Gabriel core (boyer,
 browse, puzzle, triangle, …) as stdlib coverage allows, cl-bench proper,
 `thresholds.toml` (R10.62) once numbers stabilize, and archived trend results
