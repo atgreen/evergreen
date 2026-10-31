@@ -30,7 +30,7 @@ pub(super) struct ActivationState {
     /// as the interpreter's `Activation::env_frame`: created at entry for a
     /// capturing body and moved by its PushEnvChild/PopEnvChild. Resumption,
     /// OSR and closure creation all read this one frame (bliss-shih7.27).
-    pub(super) env_frame: Option<Arc<SharedCell<EnvFrame>>>,
+    pub(super) env_frame: Option<Arc<FrameCell>>,
 }
 
 /// An outer activation's state, handed back to its code's pool when the

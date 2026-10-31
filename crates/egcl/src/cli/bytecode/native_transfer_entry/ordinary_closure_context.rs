@@ -126,7 +126,7 @@ struct FrameEntry {
     epoch: Cell<u64>,
     stamp: Cell<u64>,
     /// Weak: the cache must never keep a dead closure's frame alive.
-    frame: std::cell::RefCell<std::sync::Weak<SharedCell<EnvFrame>>>,
+    frame: std::cell::RefCell<std::sync::Weak<FrameCell>>,
 }
 
 struct FrameCache {
@@ -158,7 +158,7 @@ static FRAMES: egcl_rt::execution_local::ExecutionLocal<FrameCache> = unsafe {
 
 /// `closure_captured_env(callable)` once `owner` accepts `callable` as its
 /// explicit callable. Never allocates Lisp objects or collects.
-fn captured_frame(owner: &TransferCode, callable: EgclVal) -> Option<Arc<SharedCell<EnvFrame>>> {
+fn captured_frame(owner: &TransferCode, callable: EgclVal) -> Option<Arc<FrameCell>> {
     let epoch = egcl_rt::call_table::invalidation_epoch();
     let stamp = super::funcall_fast::collection_stamp();
     let owner_address = std::ptr::from_ref(owner) as usize;

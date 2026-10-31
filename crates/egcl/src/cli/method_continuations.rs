@@ -460,7 +460,7 @@ fn encode_method(method: &MethodDef, _env: &mut Env) -> EgclVal {
                     captured_frame: method
                         .captured_frame
                         .clone()
-                        .unwrap_or_else(|| Arc::new(SharedCell::new(EnvFrame::default()))),
+                        .unwrap_or_else(|| FrameCell::new_arc(EnvFrame::default())),
                     captured_specials: Vec::new(),
                     captured_blocks: Vec::new(),
                     captured_tags: Vec::new(),
@@ -1087,7 +1087,7 @@ mod tests {
             .unwrap_or_else(|error| error.into_inner());
         let mut env = Env::new(false);
         egcl_rt::rooted_ref!(_env = &mut env);
-        let frame = Arc::new(SharedCell::new(EnvFrame::default()));
+        let frame = FrameCell::new_arc(EnvFrame::default());
         let weak = Arc::downgrade(&frame);
         let method = MethodDef {
             method_id: EgclVal::from_fixnum(1),

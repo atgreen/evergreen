@@ -240,7 +240,7 @@ impl VariadicPlan {
         func: &BytecodeFunction,
         frame: *mut Frame,
         args: &[EgclVal],
-        env_frame: Option<&Arc<SharedCell<EnvFrame>>>,
+        env_frame: Option<&Arc<FrameCell>>,
     ) -> bool {
         #[cfg(test)]
         if PLANS_DISABLED.with(std::cell::Cell::get) {

@@ -105,10 +105,10 @@ fn formatter_descriptor_is_exact_collectible_and_relocates_its_control() {
     // Neither can an ordinary child inherit protocol authority from a parent.
     egcl_rt::rooted!(child_name = egcl_rt::symbols::make_uninterned("CHILD-CALLABLE"));
     egcl_rt::rooted!(child = egcl_rt::function::alloc_interpreted(NIL, NIL, NIL, *child_name));
-    let child_frame = Arc::new(SharedCell::new(EnvFrame {
+    let child_frame = FrameCell::new_arc(EnvFrame {
         parent: Some(frame),
         ..EnvFrame::default()
-    }));
+    });
     bytecode::register_private_closure_env(*child, child_frame);
     assert!(stdlib_formatter_control_hook(*child).is_none());
     drop(other);

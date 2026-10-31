@@ -35,7 +35,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
 
-struct RestoreFrame(Option<Arc<SharedCell<EnvFrame>>>);
+struct RestoreFrame(Option<Arc<FrameCell>>);
 impl Drop for RestoreFrame {
     fn drop(&mut self) {
         NATIVE_ENV_FRAME.with(|slot| *slot.borrow_mut() = self.0.take());
@@ -87,12 +87,12 @@ fn native_names_preserve_shadowing_late_interning_and_renames() {
     let symbol = egcl_rt::symbols::intern(key);
     env.define_local_symbol(EgclVal::from_symbol_index(symbol), EgclVal::from_fixnum(11));
     let outer = Arc::clone(&env.frame);
-    env.frame = Arc::new(SharedCell::new(EnvFrame {
+    env.frame = FrameCell::new_arc(EnvFrame {
         vars: super::super::VecMap::default(),
         symbol_vars: super::super::VecMap::default(),
         function_vars: super::super::VecMap::default(),
         parent: Some(Arc::clone(&outer)),
-    }));
+    });
     env.frame
         .borrow_mut()
         .vars

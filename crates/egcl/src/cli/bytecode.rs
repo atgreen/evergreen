@@ -199,7 +199,7 @@ use egcl_rt::value::{EgclVal, NIL, T};
 use egcl_rt::{CodeInfo, Frame, FrameType};
 
 use super::{
-    DynBind, Env, EnvFrame, HandlerCluster, HandlerEntry, HandlerImpl, RestartEntry,
+    DynBind, Env, EnvFrame, FrameCell, HandlerCluster, HandlerEntry, HandlerImpl, RestartEntry,
     RestartFunction, SharedCell, apply_function, arena_cons, arena_str, condition_matches_handler,
     cp, egcl_error_to_condition, eval_form, handler_case_token, list_to_vec, next_control_token,
     resolve_sym, run_handler_bind_handlers, signal_raw_error_in_context, store_control_value,
@@ -376,8 +376,7 @@ fn invalidate_funcall_cell() {
 }
 
 // Captured lexical locations are process-wide, just like function identities.
-type ClosureEnvironments =
-    SharedCell<HashMap<u32, Arc<SharedCell<EnvFrame>>, egcl_rt::fxhash::FxBuildHasher>>;
+type ClosureEnvironments = SharedCell<HashMap<u32, Arc<FrameCell>, egcl_rt::fxhash::FxBuildHasher>>;
 
 fn closure_envs() -> &'static ClosureEnvironments {
     static ENVS: std::sync::OnceLock<ClosureEnvironments> = std::sync::OnceLock::new();
@@ -397,12 +396,53 @@ fn closure_controls()
 /// Private closure symbols have immutable executable bodies. Keep the same
 /// body allocation alive and GC-visible when another thread calls the closure;
 /// its heap function object intentionally has no source body to fall back to.
-fn closure_bodies()
--> &'static SharedCell<HashMap<u32, Arc<BytecodeFunction>, egcl_rt::fxhash::FxBuildHasher>> {
-    static BODIES: std::sync::OnceLock<
-        SharedCell<HashMap<u32, Arc<BytecodeFunction>, egcl_rt::fxhash::FxBuildHasher>>,
-    > = std::sync::OnceLock::new();
-    BODIES.get_or_init(|| SharedCell::new(HashMap::default()))
+fn closure_bodies() -> &'static ClosureBodies {
+    static BODIES: std::sync::OnceLock<ClosureBodies> = std::sync::OnceLock::new();
+    BODIES.get_or_init(|| ClosureBodies(SharedCell::new(HashMap::default())))
+}
+
+type ClosureBodyMap = HashMap<u32, Arc<BytecodeFunction>, egcl_rt::fxhash::FxBuildHasher>;
+
+/// The private closure-body table. An old function object reaches its body
+/// only through this table, so every insertion is recorded for the next minor
+/// collection (bliss-gg3i1.7.9); reads get no mutable access.
+struct ClosureBodies(SharedCell<ClosureBodyMap>);
+
+struct ClosureBodiesRead<'a>(std::sync::MutexGuard<'a, ClosureBodyMap>);
+
+impl std::ops::Deref for ClosureBodiesRead<'_> {
+    type Target = ClosureBodyMap;
+    fn deref(&self) -> &ClosureBodyMap {
+        &self.0
+    }
+}
+
+impl ClosureBodies {
+    fn borrow(&self) -> ClosureBodiesRead<'_> {
+        ClosureBodiesRead(self.0.borrow())
+    }
+
+    fn insert(&self, symbol: u32, body: Arc<BytecodeFunction>) {
+        super::remembered_captures::note_published_body(&body);
+        self.0.borrow_mut().insert(symbol, body);
+    }
+
+    /// Insert `body` unless `symbol` already has one.
+    fn insert_if_absent(&self, symbol: u32, body: &Arc<BytecodeFunction>) {
+        let mut bodies = self.0.borrow_mut();
+        if let std::collections::hash_map::Entry::Vacant(entry) = bodies.entry(symbol) {
+            super::remembered_captures::note_published_body(body);
+            entry.insert(Arc::clone(body));
+        }
+    }
+
+    fn remove(&self, symbol: &u32) {
+        self.0.borrow_mut().remove(symbol);
+    }
+
+    fn retain(&self, keep: impl FnMut(&u32, &mut Arc<BytecodeFunction>) -> bool) {
+        self.0.borrow_mut().retain(keep);
+    }
 }
 
 /// Canonical named definitions outlive the execution that loaded them. A
@@ -436,6 +476,7 @@ fn live_bytecode_bodies() -> &'static SharedCell<HashMap<usize, std::sync::Weak<
 
 fn register_bytecode_roots(function: &Arc<BytecodeFunction>) {
     install_bytecode_root_scanner();
+    super::remembered_captures::note_published_body(function);
     live_bytecode_bodies()
         .borrow_mut()
         .entry(Arc::as_ptr(function) as usize)
@@ -689,6 +730,15 @@ fn scan_bytecode_roots(visit: &mut dyn FnMut(*mut EgclVal)) {
     // objects still need this source-free definition. Trace its exact owner.
     for definition in named_definitions().borrow_mut().values_mut() {
         visit(&mut definition.function);
+    }
+
+    // A minor collection with remembered captures visits every body registered
+    // since the last one (`remembered_captures`); older bodies are immutable
+    // and refer to no nursery object. Semantic marking is for major sweeps.
+    if egcl_rt::gc::external_root_scan_kind() != egcl_rt::gc::ExternalRootScanKind::Full
+        && egcl_rt::gc::function_captures_remembered()
+    {
+        return;
     }
 
     // Snapshot metadata owners once across all stopped executions. The symbol
@@ -945,9 +995,7 @@ fn sweep_dead_function_captures(names: &[EgclVal]) {
         .filter(|(symbol, _)| dead.contains(*symbol))
         .map(|(&symbol, body)| (symbol, Arc::as_ptr(body) as usize))
         .collect();
-    closure_bodies()
-        .borrow_mut()
-        .retain(|symbol, _| !dead.contains(symbol));
+    closure_bodies().retain(|symbol, _| !dead.contains(symbol));
     // Instance state above follows actual callable reachability. Metadata
     // below may instead be owned by another live instance of the same body.
     dead.retain(|symbol| !preserve_code.contains(symbol));
@@ -1274,7 +1322,7 @@ pub(super) fn remove_shake_closure(symbol: u32) {
     // A compiled method keeps its callable in this cell (#413); a pruned one
     // must not carry it into the saved image.
     egcl_rt::symbols::set_symbol_function(symbol, egcl_rt::value::UNBOUND);
-    closure_bodies().borrow_mut().remove(&symbol);
+    closure_bodies().remove(&symbol);
     clear_lazy_state(symbol);
     clear_closure_env(symbol);
 }
@@ -1288,6 +1336,7 @@ fn install_bytecode_root_scanner() {
     INSTALL.call_once(|| {
         egcl_rt::gc::register_root_scanner(scan_bytecode_roots);
         egcl_rt::gc::set_function_capture_trace_fn(trace_function_captures);
+        super::remembered_captures::install();
         egcl_rt::gc::set_function_capture_sweep_fn(sweep_function_captures);
     });
 }
@@ -1660,10 +1709,7 @@ fn publish_bytecode(
             // This association belongs to the callable, not its mutable public
             // binding. Retired definitions stay reachable only through their
             // objects or active code and are swept with private callable bodies.
-            closure_bodies()
-                .borrow_mut()
-                .entry(egcl_rt::function::definition_index(function))
-                .or_insert_with(|| Arc::clone(&f));
+            closure_bodies().insert_if_absent(egcl_rt::function::definition_index(function), &f);
         }
         // A concurrent setter may change the cell before its registry
         // invalidation. Never attach this body to whichever object won that
@@ -16228,7 +16274,7 @@ fn closure_captured_control(fn_val: EgclVal) -> Option<super::LexicalExitNames> 
 }
 
 /// The heap environment an env-capturing closure was created in, if any.
-pub(super) fn closure_captured_env(fn_val: EgclVal) -> Option<Arc<SharedCell<EnvFrame>>> {
+pub(super) fn closure_captured_env(fn_val: EgclVal) -> Option<Arc<FrameCell>> {
     // Native call adapters and whole-function deoptimization can enter with
     // a symbol designator; ordinary dispatch passes the function object.
     let symbol = if let Some(symbol) = fn_val.symbol_index() {
@@ -16253,7 +16299,7 @@ pub(super) fn closure_captured_env(fn_val: EgclVal) -> Option<Arc<SharedCell<Env
 /// (symbol-function s) (lambda …))` that captures enclosing lexicals): the object
 /// then reaches those lexicals through the same `CLOSURE_ENV` channel the
 /// bytecode `MakeClosure` path uses (bliss-jtc.23.3).
-pub(super) fn register_closure_env(sym_idx: u32, frame: Arc<SharedCell<EnvFrame>>) {
+pub(super) fn register_closure_env(sym_idx: u32, frame: Arc<FrameCell>) {
     install_bytecode_root_scanner();
     closure_envs().borrow_mut().insert(sym_idx, frame);
 }
@@ -16268,7 +16314,7 @@ pub(super) fn prepare_private_closure_allocation() {
 /// its private symbol's global function cell. The normal callable-root bridge
 /// traces this frame and releases it when the callable (including self cycles)
 /// dies. Account for bodyless interpreted closures in the same host budget.
-pub(super) fn register_private_closure_env(function: EgclVal, frame: Arc<SharedCell<EnvFrame>>) {
+pub(super) fn register_private_closure_env(function: EgclVal, frame: Arc<FrameCell>) {
     register_closure_env(egcl_rt::function::definition_index(function), frame);
     note_private_closure_published();
 }
@@ -16280,7 +16326,7 @@ pub(super) fn clear_closure_env(sym_idx: u32) {
 }
 
 /// Snapshot the CLOSURE_ENV table for core-image serialization (bliss-zz6w).
-pub(super) fn closure_env_entries() -> Vec<(u32, Arc<SharedCell<EnvFrame>>)> {
+pub(super) fn closure_env_entries() -> Vec<(u32, Arc<FrameCell>)> {
     closure_envs()
         .borrow()
         .iter()
@@ -16330,7 +16376,7 @@ fn collect_requested_major_before_closure() {
 /// read and write the enclosing lexical bindings (portable `flet`/`labels`).
 pub(super) fn make_bytecode_closure(
     nested: &Arc<BytecodeFunction>,
-    captured_env: Option<Arc<SharedCell<EnvFrame>>>,
+    captured_env: Option<Arc<FrameCell>>,
 ) -> EgclVal {
     make_prepared_bytecode_closure(nested, captured_env, false).0
 }
@@ -16340,7 +16386,7 @@ pub(super) fn make_bytecode_closure(
 /// above remains available to callers that explicitly require a new identity.
 fn make_template_closure(
     nested: &Arc<BytecodeFunction>,
-    captured_env: Option<Arc<SharedCell<EnvFrame>>>,
+    captured_env: Option<Arc<FrameCell>>,
     env: &Env,
 ) -> EgclVal {
     let (closure, control_free) = if captured_env.is_some() {
@@ -16356,7 +16402,7 @@ fn make_template_closure(
 
 fn make_prepared_bytecode_closure(
     nested: &Arc<BytecodeFunction>,
-    captured_env: Option<Arc<SharedCell<EnvFrame>>>,
+    captured_env: Option<Arc<FrameCell>>,
     reuse: bool,
 ) -> (EgclVal, bool) {
     egcl_rt::rooted!(_nested_roots = ActiveBytecodeRoot::new(nested));
@@ -16411,9 +16457,7 @@ fn make_prepared_bytecode_closure(
     let sym_idx = sym.as_symbol_index();
     egcl_rt::rooted!(_callable_root = ActiveCallableRoot(sym_idx));
     registry_put(sym_idx, Arc::clone(nested));
-    closure_bodies()
-        .borrow_mut()
-        .insert(sym_idx, Arc::clone(nested));
+    closure_bodies().insert(sym_idx, Arc::clone(nested));
     if let Some(frame) = captured_env {
         closure_envs().borrow_mut().insert(sym_idx, frame);
     }
@@ -17062,7 +17106,7 @@ fn compile_defun(
 
 /// The lexical (non-special) names visible through a captured heap frame chain:
 /// a body compiled against that frame reaches each of them through the frame.
-fn frame_capture_names(frame: Arc<SharedCell<EnvFrame>>) -> std::collections::HashSet<String> {
+fn frame_capture_names(frame: Arc<FrameCell>) -> std::collections::HashSet<String> {
     let mut captures = std::collections::HashSet::new();
     let mut current = Some(frame);
     while let Some(frame) = current {
@@ -17155,7 +17199,7 @@ pub(super) fn compile_tree_closure(
     mut lambda_list: EgclVal,
     mut body: EgclVal,
     compile_env: &Env,
-    frame: Arc<SharedCell<EnvFrame>>,
+    frame: Arc<FrameCell>,
     blocks: &[(String, String)],
     tags: &[(String, String)],
 ) -> Option<EgclVal> {
@@ -17293,9 +17337,7 @@ pub(super) fn compile_tree_closure(
     collect_requested_major_before_closure();
     let sym = egcl_rt::symbols::make_uninterned("CLOSURE");
     let sym_idx = sym.as_symbol_index();
-    closure_bodies()
-        .borrow_mut()
-        .insert(sym_idx, Arc::clone(&bf));
+    closure_bodies().insert(sym_idx, Arc::clone(&bf));
     registry_put(sym_idx, Arc::clone(&bf));
     closure_envs().borrow_mut().insert(sym_idx, frame);
     if !blocks.is_empty() || !tags.is_empty() {
@@ -17573,9 +17615,7 @@ fn compile_and_reify_lambda_inner(
     // Reified method functions are shared definitions, just like escaping
     // compiled closures. Preserve the original body for callers on other
     // executions, including after the defining thread exits.
-    closure_bodies()
-        .borrow_mut()
-        .insert(sym_idx, Arc::clone(&bf));
+    closure_bodies().insert(sym_idx, Arc::clone(&bf));
     registry_put(sym_idx, Arc::clone(&bf));
     let function = egcl_rt::function::alloc_interpreted(lambda_list, body, NIL, sym);
     // Install the callable in its own uninterned symbol's function cell. The
@@ -19149,7 +19189,7 @@ fn load_bbu_definitions(
                     // DEFUN's would: native publication records a tier on the
                     // object only when this entry is the installed code's body
                     // (GitHub #466). Replace, never keep, any earlier entry.
-                    closure_bodies().borrow_mut().insert(
+                    closure_bodies().insert(
                         egcl_rt::function::definition_index(fn_obj),
                         Arc::clone(&function),
                     );
@@ -19227,9 +19267,7 @@ fn load_bbu_definitions(
                 // including dispatch from workers started after restoration.
                 let body = live_function.as_ref().unwrap();
                 registry_put(action.arg1, Arc::clone(body));
-                closure_bodies()
-                    .borrow_mut()
-                    .insert(action.arg1, Arc::clone(body));
+                closure_bodies().insert(action.arg1, Arc::clone(body));
             }
             _ => unreachable!("load actions were verified above"),
         }
@@ -19340,7 +19378,7 @@ enum Handler {
 /// The recorded frame is always an ancestor of (or equal to) the activation's
 /// current frame while the handler is live, so tracing the current chain
 /// already reaches it; `Activation` traces it explicitly anyway.
-type HandlerEnv = Option<Arc<SharedCell<EnvFrame>>>;
+type HandlerEnv = Option<Arc<FrameCell>>;
 
 impl Handler {
     /// The `EnvFrame` recorded when this handler was established, for the
@@ -19593,7 +19631,7 @@ struct Activation {
     /// Heap `EnvFrame` chain holding this activation's captured (boxed) locals,
     /// shared with any closure it creates. `None` when the function has no
     /// captured locals (the common, fast, slot-only case).
-    env_frame: Option<Arc<SharedCell<EnvFrame>>>,
+    env_frame: Option<Arc<FrameCell>>,
     /// The tiered function object (FnMeta) this activation is executing, when
     /// one exists. Present for named functions dispatched through `CallNamed`;
     /// `None` for anonymous/gensym lambdas and toplevel wrappers with no
@@ -19667,36 +19705,33 @@ impl Drop for Activation {
 /// values are populated by [`bind_params`] or [`bind_variadic`], after the
 /// lambda-list binder has resolved defaults, supplied-p variables, and rest/key
 /// arguments. Returns `None` for the slot-only case.
-fn make_env_frame(
-    func: &BytecodeFunction,
-    parent: Arc<SharedCell<EnvFrame>>,
-) -> Option<Arc<SharedCell<EnvFrame>>> {
+fn make_env_frame(func: &BytecodeFunction, parent: Arc<FrameCell>) -> Option<Arc<FrameCell>> {
     if !func.has_env {
         return None;
     }
-    let frame = Arc::new(SharedCell::new(EnvFrame {
+    let frame = FrameCell::new_arc(EnvFrame {
         vars: super::VecMap::default(),
         symbol_vars: super::VecMap::default(),
         function_vars: super::VecMap::default(),
         parent: Some(parent),
-    }));
+    });
     Some(frame)
 }
 
 /// Enter a fresh child heap `EnvFrame` (`PushEnvChild`). The interpreter and
 /// mapped native code both move an activation's frame through these two.
-fn push_env_child(env_frame: &mut Option<Arc<SharedCell<EnvFrame>>>) {
+fn push_env_child(env_frame: &mut Option<Arc<FrameCell>>) {
     let parent = env_frame.take();
-    *env_frame = Some(Arc::new(SharedCell::new(EnvFrame {
+    *env_frame = Some(FrameCell::new_arc(EnvFrame {
         vars: super::VecMap::default(),
         symbol_vars: super::VecMap::default(),
         function_vars: super::VecMap::default(),
         parent,
-    })));
+    }));
 }
 
 /// Leave the current child heap `EnvFrame` (`PopEnvChild`).
-fn pop_env_child(env_frame: &mut Option<Arc<SharedCell<EnvFrame>>>) {
+fn pop_env_child(env_frame: &mut Option<Arc<FrameCell>>) {
     let parent = env_frame
         .as_ref()
         .and_then(|frame| frame.borrow().parent.clone());
@@ -19705,7 +19740,7 @@ fn pop_env_child(env_frame: &mut Option<Arc<SharedCell<EnvFrame>>>) {
 
 /// Define a captured parameter in an activation's heap environment. Keep the
 /// name and symbol-index maps in sync, just like `DefineEnvVar`.
-fn bind_boxed_param(env_frame: &Arc<SharedCell<EnvFrame>>, name: &str, value: EgclVal) {
+fn bind_boxed_param(env_frame: &Arc<FrameCell>, name: &str, value: EgclVal) {
     Env::define_lexical_frame(env_frame, name, value);
 }
 
@@ -19819,7 +19854,7 @@ fn bind_params(
     func: &BytecodeFunction,
     frame: *mut Frame,
     args: &[EgclVal],
-    env_frame: Option<&Arc<SharedCell<EnvFrame>>>,
+    env_frame: Option<&Arc<FrameCell>>,
 ) {
     // An optional-range function's omitted trailing arguments bind the
     // unsupplied marker; its entry prologue computes their defaults.
@@ -19848,7 +19883,7 @@ fn bind_variadic(
     func: &BytecodeFunction,
     frame: *mut Frame,
     args: &[EgclVal],
-    env_frame: Option<&Arc<SharedCell<EnvFrame>>>,
+    env_frame: Option<&Arc<FrameCell>>,
     env: &mut Env,
 ) -> Result<(), EgclError> {
     // The common shapes bind from a plan cached on the body; any call it does
@@ -19934,7 +19969,7 @@ fn bind_macro_variadic(
     func: &BytecodeFunction,
     frame: *mut Frame,
     args: &[EgclVal],
-    env_frame: Option<&Arc<SharedCell<EnvFrame>>>,
+    env_frame: Option<&Arc<FrameCell>>,
     env: &mut Env,
     context: MacroCallContext<'_>,
 ) -> Result<(), EgclError> {
@@ -22187,9 +22222,8 @@ static NATIVE_ENV: egcl_rt::execution_local::ExecutionLocal<std::cell::Cell<*mut
 };
 /// Captured lexical environment for the currently executing native
 /// activation. Nested native calls save/restore this just like NATIVE_ENV.
-static NATIVE_ENV_FRAME: egcl_rt::execution_local::ExecutionLocal<
-    RefCell<Option<Arc<SharedCell<EnvFrame>>>>,
-> = unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| const { RefCell::new(None) }) };
+static NATIVE_ENV_FRAME: egcl_rt::execution_local::ExecutionLocal<RefCell<Option<Arc<FrameCell>>>> =
+    unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| const { RefCell::new(None) }) };
 /// Metadata owner of the executing code, including a T1-to-T2 OSR entry.
 static ACTIVE_NATIVE_CODE: egcl_rt::execution_local::ExecutionLocal<
     std::cell::Cell<*const NativeCode>,
@@ -22710,12 +22744,12 @@ extern "C" fn c2i_define_env(names: *const NativeEnvNames, name_index: u64, valu
 extern "C" fn c2i_push_env_child() {
     NATIVE_ENV_FRAME.with(|slot| {
         let parent = slot.borrow().clone();
-        *slot.borrow_mut() = Some(Arc::new(SharedCell::new(EnvFrame {
+        *slot.borrow_mut() = Some(FrameCell::new_arc(EnvFrame {
             vars: super::VecMap::default(),
             symbol_vars: super::VecMap::default(),
             function_vars: super::VecMap::default(),
             parent,
-        })));
+        }));
     });
 }
 
@@ -27859,7 +27893,7 @@ fn resume_in_t0(
     bcp: u32,
     sp_top: u16,
     sym: u32,
-    env_frame: Option<Arc<SharedCell<EnvFrame>>>,
+    env_frame: Option<Arc<FrameCell>>,
     env: &mut Env,
 ) -> Result<EgclVal, EgclError> {
     let stack = egcl_rt::current_stack();
@@ -28000,7 +28034,7 @@ fn rebuild_resume_handlers(
 fn resume_inlined_in_t0(
     scopes: Vec<InlinedResumeScope>,
     _metadata: Arc<T2InstalledMetadata>,
-    outer_env_frame: Option<Arc<SharedCell<EnvFrame>>>,
+    outer_env_frame: Option<Arc<FrameCell>>,
     env: &mut Env,
 ) -> Result<EgclVal, EgclError> {
     resume_inlined_in_t0_with_state(scopes, _metadata, outer_env_frame, None, env)
@@ -28037,7 +28071,7 @@ impl egcl_rt::gc::TraceHostRoots for OuterResumeState {
 fn resume_inlined_in_t0_with_state(
     scopes: Vec<InlinedResumeScope>,
     _metadata: Arc<T2InstalledMetadata>,
-    outer_env_frame: Option<Arc<SharedCell<EnvFrame>>>,
+    outer_env_frame: Option<Arc<FrameCell>>,
     mut outer_state: Option<OuterResumeState>,
     env: &mut Env,
 ) -> Result<EgclVal, EgclError> {
@@ -31281,7 +31315,7 @@ enum OsrOutcome {
     Deopt {
         bcp: u32,
         sp_top: u16,
-        env_frame: Option<Arc<SharedCell<EnvFrame>>>,
+        env_frame: Option<Arc<FrameCell>>,
     },
 }
 
@@ -31295,7 +31329,7 @@ fn run_native_osr(
     osr: &OsrCode,
     stub_off: usize,
     frame: *mut Frame,
-    env_frame: Option<Arc<SharedCell<EnvFrame>>>,
+    env_frame: Option<Arc<FrameCell>>,
     env: &mut Env,
 ) -> Result<OsrOutcome, EgclError> {
     NATIVE_DEPTH.with(|d| d.set(d.get() + 1));
@@ -32283,9 +32317,7 @@ impl ToplevelLoopOwner {
         egcl_rt::rooted!(_body_root = ActiveBytecodeRoot::new(body));
         egcl_rt::rooted!(sym = egcl_rt::symbols::make_uninterned("TOPLEVEL"));
         let sym_idx = sym.as_symbol_index();
-        closure_bodies()
-            .borrow_mut()
-            .insert(sym_idx, Arc::clone(body));
+        closure_bodies().insert(sym_idx, Arc::clone(body));
         registry_put(sym_idx, Arc::clone(body));
         let function = egcl_rt::function::alloc_interpreted(NIL, NIL, NIL, *sym);
         // The tiering counters are found through the function cell, as for a
@@ -32306,7 +32338,7 @@ impl Drop for ToplevelLoopOwner {
         // direct-call generation bump: nothing could have baked a call to a
         // symbol no code can name.
         egcl_rt::symbols::set_symbol_function(self.sym, egcl_rt::value::UNBOUND);
-        closure_bodies().borrow_mut().remove(&self.sym);
+        closure_bodies().remove(&self.sym);
         let generation = REGISTRY_GENERATION.with(|g| {
             g.borrow()
                 .get(&self.sym)
@@ -35024,12 +35056,12 @@ mod active_bytecode_root_tests {
         let body =
             Arc::new(compile_function("SHARED-LIVENESS", NIL, *form, &env, false, false).unwrap());
         egcl_rt::rooted!(live = make_bytecode_closure(&body, None));
-        let captured = Arc::new(SharedCell::new(EnvFrame {
+        let captured = FrameCell::new_arc(EnvFrame {
             vars: Default::default(),
             symbol_vars: Default::default(),
             function_vars: Default::default(),
             parent: None,
-        }));
+        });
         let weak_capture = Arc::downgrade(&captured);
         egcl_rt::rooted!(dead = make_bytecode_closure(&body, Some(captured)));
         let live_symbol = egcl_rt::function::name(*live).as_symbol_index();
@@ -35038,9 +35070,7 @@ mod active_bytecode_root_tests {
         // whether MakeClosure already retains or copies its template.
         for symbol in [live_symbol, dead_symbol] {
             registry_put(symbol, Arc::clone(&body));
-            closure_bodies()
-                .borrow_mut()
-                .insert(symbol, Arc::clone(&body));
+            closure_bodies().insert(symbol, Arc::clone(&body));
         }
         let profile_key = Arc::as_ptr(&body) as usize;
         record_type_profile(profile_key, 0, &[EgclVal::from_fixnum(1)]);
@@ -35689,7 +35719,7 @@ mod function_literal_tests {
         let mut env = Env::new(false);
         egcl_rt::rooted_ref!(_env = &mut env);
         egcl_rt::rooted!(body = reader::read_from_string("(held)").unwrap().0);
-        let captured = Arc::new(SharedCell::new(EnvFrame::default()));
+        let captured = FrameCell::new_arc(EnvFrame::default());
         captured
             .borrow_mut()
             .vars

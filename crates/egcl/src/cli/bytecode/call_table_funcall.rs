@@ -306,7 +306,7 @@ fn fallback(function: EgclVal, args: &[EgclVal]) -> u64 {
 /// The linked scanner retains the caller's environment while it is suspended.
 pub(super) struct Context {
     previous: *mut Context,
-    saved_environment: Option<Arc<SharedCell<EnvFrame>>>,
+    saved_environment: Option<Arc<FrameCell>>,
     saved_blocks: Vec<(String, String)>,
     saved_tags: Vec<(String, String)>,
 }
@@ -450,12 +450,12 @@ mod tests {
         // reference really moves rather than sharing a retained nursery region.
         egcl_rt::rooted!(original = arena_cons(EgclVal::from_fixnum(73), NIL));
         let original_bits = original.0;
-        let frame = Arc::new(SharedCell::new(EnvFrame {
+        let frame = FrameCell::new_arc(EnvFrame {
             vars: Default::default(),
             symbol_vars: Default::default(),
             function_vars: Default::default(),
             parent: None,
-        }));
+        });
         frame
             .borrow_mut()
             .vars

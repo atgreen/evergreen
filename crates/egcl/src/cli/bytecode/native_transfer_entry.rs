@@ -4822,7 +4822,7 @@ struct CaptureContext {
     cluster_frames: *mut Vec<(u32, *mut Frame)>,
     prepared_handler: *mut Option<PreparedHandler>,
     /// The owning `ActivationState::env_frame`.
-    env_frame: *mut Option<Arc<SharedCell<EnvFrame>>>,
+    env_frame: *mut Option<Arc<FrameCell>>,
     #[cfg(test)]
     unavailable_catch: Option<u32>,
     #[cfg(test)]

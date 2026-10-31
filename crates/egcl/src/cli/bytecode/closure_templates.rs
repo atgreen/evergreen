@@ -151,12 +151,12 @@ mod tests {
         egcl_rt::rooted!(second = make_template_closure(&body, None, &env));
         assert_ne!(*first, *second);
         assert!(!lookup(&body).unwrap().control_free);
-        let frame = Arc::new(SharedCell::new(EnvFrame {
+        let frame = FrameCell::new_arc(EnvFrame {
             vars: Default::default(),
             symbol_vars: Default::default(),
             function_vars: Default::default(),
             parent: None,
-        }));
+        });
         egcl_rt::rooted!(captured_a = make_template_closure(&body, Some(Arc::clone(&frame)), &env));
         egcl_rt::rooted!(captured_b = make_template_closure(&body, Some(Arc::clone(&frame)), &env));
         assert_ne!(*captured_a, *captured_b);
@@ -181,7 +181,7 @@ mod tests {
             compile_function("TEMPLATE-SOLE-CAPTURE", NIL, *form, &env, false, false).unwrap(),
         );
         egcl_rt::gc::collect_t0_minor().unwrap();
-        let frame = Arc::new(SharedCell::new(EnvFrame::default()));
+        let frame = FrameCell::new_arc(EnvFrame::default());
         egcl_rt::rooted!(payload = crate::cli::arena_cons(EgclVal::from_fixnum(73), NIL));
         frame.borrow_mut().vars.insert("HELD".into(), *payload);
         drop(payload);

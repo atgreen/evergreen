@@ -117,7 +117,7 @@ pub(in crate::cli::bytecode) fn enter(
     frame: *mut Frame,
     handlers: &[Handler],
     bindings: &mut Vec<ScopedDynBind>,
-    env_frame: Option<Arc<SharedCell<EnvFrame>>>,
+    env_frame: Option<Arc<FrameCell>>,
     env: &mut Env,
 ) -> InterpreterOsr {
     let NativeCodeStorage::Mapped(code) = &native._storage else {
