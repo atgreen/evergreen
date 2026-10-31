@@ -2705,6 +2705,21 @@ fn resolve(name: &str) -> Option<Handler> {
             Ok(if matches { T } else { NIL })
         }),
 
+        // (%bit-vector-op code a b dst): DST := code(A, B) for simple
+        // bit-vectors of one length, or NIL (nothing stored) when they do not
+        // qualify and the caller must take the general path.
+        "EGCL::%BIT-VECTOR-OP" => Some(|_operator, args, _env| {
+            let [code, a, b, dst] = *args else {
+                return Err(EgclError::ProgramError(
+                    "%bit-vector-op: expected code, two operands and a destination".into(),
+                ));
+            };
+            let stored = code.is_fixnum()
+                && (0..=10).contains(&code.as_fixnum())
+                && egcl_rt::types::bit_vector_bool_op(code.as_fixnum() as u8, a, b, dst);
+            Ok(if stored { dst } else { NIL })
+        }),
+
         "EGCL::%MAKE-STRUCT" => Some(|_operator, args, _env| {
             let args = RootedVals::new(args.to_vec());
 

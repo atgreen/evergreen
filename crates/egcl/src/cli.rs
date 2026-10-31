@@ -24454,6 +24454,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             "EGCL::%STREAM-LISTEN" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::%STREAM-EXTERNAL-FORMAT" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::%MAKE-STRUCT" => return eval_builtin_arguments(&name, cdr, env),
+            "EGCL::%BIT-VECTOR-OP" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::%STRUCT-REF" | "EGCL::%STRUCT-SET" | "EGCL::%STRUCT-TYPEP" => {
                 return eval_builtin_arguments(&name, cdr, env);
             }
