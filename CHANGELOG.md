@@ -617,6 +617,14 @@
 
 ### Performance
 
+- Compiled calls to common builtins (EQ, EQL, EQUAL, EQUALP, CAR, CDR, LENGTH,
+  ELT, AREF, SVREF, GETHASH, integer comparison and arithmetic, LOGAND, ASH,
+  LOGBITP and others) and reads of special variables are answered without
+  crossing the full runtime call boundary when their arguments need no
+  allocation: a warmed EQUAL or LENGTH call takes about 40 ns instead of over
+  600 ns, and a dynamically bound special read 63 ns instead of 672 ns
+  ([#950](https://github.com/atgreen/evergreen/pull/950)).
+
 - DEFSTRUCT accessors, writers, predicates and constructors compile to native
   structure operations instead of generic-function calls and MAKE-INSTANCE-style
   dispatch, and BIT-AND and the other bit-array functions work bytewise. A
