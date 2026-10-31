@@ -3919,13 +3919,86 @@ pub fn elt_leaf(sequence: EgclVal, index: usize) -> Option<EgclVal> {
 }
 
 /// [`aref`] on a rank-1 array for compiled leaf calls: as [`elt_leaf`]
-/// without lists, whose AREF is an error.
+/// without lists, whose AREF is an error. A fill-pointer or adjustable vector
+/// that is not displaced reads its backing storage, bounded by its capacity as
+/// AREF is (bliss-gg3i1.7.8): compiled code sends exactly these arrays here
+/// when its inline access does not cover them.
 pub fn aref_leaf(array: EgclVal, index: usize) -> Option<EgclVal> {
     if leaf_vector(array) {
         aref(array, index).ok()
+    } else if is_complex_vector(array) && cvec_displacement(array).is_none() {
+        let storage = cvec_storage(array);
+        // The storage's own bounds are the vector's capacity.
+        if leaf_vector(storage) {
+            elt(storage, index).ok()
+        } else {
+            None
+        }
     } else {
         None
     }
+}
+
+/// [`set_aref`] for compiled leaf calls (bliss-gg3i1.7.8): store `value` and
+/// answer true when `array` is a simple vector, an octet vector or a bit
+/// vector -- or a non-displaced element-type T fill-pointer or adjustable
+/// vector over one -- the index is in bounds and the value fits the element type.
+/// Answer false, having changed nothing, for anything else, including every
+/// error. Never allocates on the Lisp heap.
+pub fn set_aref_leaf(array: EgclVal, index: usize, value: EgclVal) -> bool {
+    let storage = if is_complex_vector(array) {
+        // Only an element-type T vector: a string or bit vector keeps its
+        // element checks on the general path.
+        if cvec_displacement(array).is_some()
+            || cvec_is_string(array)
+            || cvec_is_bit(array)
+            || is_nil_array(array)
+        {
+            return false;
+        }
+        cvec_storage(array)
+    } else {
+        array
+    };
+    store_leaf(storage, index, value)
+}
+
+/// [`set_svref`] for compiled leaf calls.
+pub fn set_svref_leaf(vector: EgclVal, index: usize, value: EgclVal) -> bool {
+    is_vector(vector) && store_leaf(vector, index, value)
+}
+
+fn store_leaf(storage: EgclVal, index: usize, value: EgclVal) -> bool {
+    if !storage.is_heap_object() || is_nil_array(storage) {
+        return false;
+    }
+    if is_vector(storage) {
+        if index >= vector_length(storage) {
+            return false;
+        }
+        let ptr = unsafe { storage.as_ptr() };
+        let off = vector_payload_offset(ptr);
+        // SAFETY: an in-bounds element slot of a live simple vector; the
+        // barrier records the overwritten referent as compiled stores do.
+        unsafe { egcl_rt::gc::store_ref(ptr.add(off + 8 + index * 8) as *mut EgclVal, value) };
+        return true;
+    }
+    if egcl_rt::packed_u8::is_vector(storage) {
+        return value.is_fixnum()
+            && (0..=255).contains(&value.as_fixnum())
+            && egcl_rt::packed_u8::set(storage, index, value.as_fixnum() as u8);
+    }
+    if egcl_rt::types::bit_vector_p(storage) {
+        if index >= egcl_rt::types::bit_vector_len(storage).unwrap_or(0)
+            || !value.is_fixnum()
+            || !matches!(value.as_fixnum(), 0 | 1)
+        {
+            return false;
+        }
+        egcl_rt::types::bit_vector_set(storage, index, value.as_fixnum() as u8);
+        return true;
+    }
+    false
 }
 
 /// [`svref`] for compiled leaf calls.

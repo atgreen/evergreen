@@ -935,6 +935,9 @@ pub fn emit_framed_ordinary_function_with_self_call_facts(
                 | Opcode::StringCharOrNil
                 | Opcode::MemoryFence
                 | Opcode::TryIntegerShr
+                // The verifier checks the probes' layout contract.
+                | Opcode::TryVecRef
+                | Opcode::TryVecSet
                 | Opcode::SmallVectorRangeP
                 | Opcode::TryStoreIntegerOctets8
                 | Opcode::TryStoreIntegerOctets1To8

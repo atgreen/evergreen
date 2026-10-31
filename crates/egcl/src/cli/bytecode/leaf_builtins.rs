@@ -210,6 +210,30 @@ extern "C" fn svref<const C: bool>(vector: u64, i: u64) -> u64 {
     })
 }
 
+/// `(setf (aref array i) value)`, compiled as EGCL::SET-AREF: the value.
+extern "C" fn set_aref<const C: bool>(array: u64, i: u64, value: u64) -> u64 {
+    guarded(|| {
+        match index(i).is_some_and(|i| {
+            egcl_stdlib::sequences::set_aref_leaf(EgclVal(array), i, EgclVal(value))
+        }) {
+            true => single::<C>(EgclVal(value)),
+            false => MISS,
+        }
+    })
+}
+
+/// `(setf (svref vector i) value)`, compiled as EGCL::SET-SVREF: the value.
+extern "C" fn set_svref<const C: bool>(vector: u64, i: u64, value: u64) -> u64 {
+    guarded(|| {
+        match index(i).is_some_and(|i| {
+            egcl_stdlib::sequences::set_svref_leaf(EgclVal(vector), i, EgclVal(value))
+        }) {
+            true => single::<C>(EgclVal(value)),
+            false => MISS,
+        }
+    })
+}
+
 /// `(gethash key table)` where the second value is discarded.
 extern "C" fn gethash2<const C: bool>(key: u64, table: u64) -> u64 {
     guarded(
@@ -372,6 +396,8 @@ fn table() -> Vec<(&'static str, u8, Entry, bool)> {
         ("ELT", 2, entry!(elt, Helper2), false),
         ("AREF", 2, entry!(aref, Helper2), false),
         ("SVREF", 2, entry!(svref, Helper2), false),
+        ("EGCL::SET-AREF", 3, entry!(set_aref, Helper3), false),
+        ("EGCL::SET-SVREF", 3, entry!(set_svref, Helper3), false),
         ("GETHASH", 2, entry!(gethash2, Helper2), true),
         ("GETHASH", 3, entry!(gethash3, Helper3), true),
         ("=", 2, entry!(num_eq, Helper2), false),
