@@ -541,14 +541,21 @@
                (<= ,(second typespec) ,place ,(third typespec))))
         (t nil)))
 
+(defun egcl::%structure-type-fail (value typespec)
+  ;; The failure path of %CHECK-STRUCTURE-TYPE, kept out of line: the
+  ;; #'%DECLARATION-TYPEP reference and the multiple-value store of an inline
+  ;; failure made every typed DEFSTRUCT constructor and writer ineligible for
+  ;; native structure access, so they stayed interpreted (bliss-gg3i1.7.6).
+  (%check-type-fail value typespec #'egcl::%declaration-typep))
+
 (defmacro egcl::%check-structure-type (place typespec)
   ;; Slot declarations can contain FUNCTION signatures, which public TYPEP
   ;; cannot discriminate. Keep the original declaration in failure conditions.
   `(progn
      (unless ,(or (egcl::%fast-slot-type-test place typespec)
                   `(egcl::%declaration-typep ,place ',typespec))
-       (setf ,place (%check-type-fail ,place ',typespec
-                                     #'egcl::%declaration-typep)))
+       (,(if (symbolp place) 'setq 'setf) ,place
+        (egcl::%structure-type-fail ,place ',typespec)))
      nil))
 
 (defun egcl::%checked-structure-slot-value (value object slot)
