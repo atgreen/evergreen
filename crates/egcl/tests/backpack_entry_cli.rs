@@ -90,7 +90,11 @@ fn both(label: &str, program: &str, marker: &str, envs: &[(&str, &str)]) -> Stri
     for lean in ["1", "0"] {
         let mut envs = envs.to_vec();
         envs.push(("EGCL_LEAN_CALLS", lean));
-        let out = egcl(&dir, &["--eval", r#"(load "defs.lisp")"#, "--eval", program], &envs);
+        let out = egcl(
+            &dir,
+            &["--eval", r#"(load "defs.lisp")"#, "--eval", program],
+            &envs,
+        );
         lines.push(line(&out, marker).to_owned());
     }
     assert_eq!(lines[0], lines[1], "lean and descriptor calls agree");
