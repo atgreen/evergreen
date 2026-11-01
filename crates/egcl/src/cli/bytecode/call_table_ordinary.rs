@@ -720,6 +720,9 @@ pub(in crate::cli::bytecode) unsafe fn publish_ordinary_with_heat(
         } else {
             Some(code.callable_root(*function))
         };
+        let claim = callable
+            .as_ref()
+            .and_then(|root| entry_claim(&descriptor, &code, *function, heat.is_some(), root));
         let pointer = directory.retained.borrow_mut().retain_with_callable(
             Arc::clone(&state.cell),
             descriptor,
@@ -743,11 +746,44 @@ pub(in crate::cli::bytecode) unsafe fn publish_ordinary_with_heat(
                 0
             }
         };
-        let published =
-            unsafe { linkage::publish_ordinary_with_heat(&state.cell, &*pointer, heat_pointer) };
+        let published = unsafe {
+            linkage::publish_ordinary_claiming_entry(&state.cell, &*pointer, heat_pointer, claim)
+        };
         directory.retained.borrow_mut().sweep();
         published
     })
+}
+
+/// The entry-word claim accompanying an ordinary publication, when lean
+/// named callers may enter this code (bliss-gg3i1.7.15.10.1): a lean entry
+/// for one plain global function with a fixed arity, taking no closure
+/// environment and needing no caller-side heat accounting. Everything else
+/// keeps the descriptor admission.
+fn entry_claim(
+    descriptor: &OrdinaryEntryDescriptor,
+    code: &TransferCode,
+    function: egcl_rt::value::EgclVal,
+    profiled: bool,
+    root: &Arc<egcl_rt::CrossThreadRoot<egcl_rt::value::EgclVal>>,
+) -> Option<egcl_rt::call_table::EntryClaimRequest> {
+    if profiled
+        || descriptor.environment != linkage::ORDINARY_ENV_NONE
+        || descriptor.arity == linkage::ORDINARY_ARITY_ANY
+        || !egcl_rt::function::is_interpreted_function(function)
+        || egcl_rt::function::is_closure_instance(function)
+        || egcl_rt::function::env(function) != egcl_rt::value::NIL
+    {
+        return None;
+    }
+    let entry = code.ordinary_lean_entry_address()?;
+    if !descriptor.contains_pc(entry) {
+        return None;
+    }
+    let execution = egcl_rt::thread::current_execution_context_for_native()?;
+    let owner = unsafe { &*execution }.code_owner();
+    // The root is the directory's own identity root for this code.
+    let claim = unsafe { egcl_rt::call_table::EntryClaim::new(function, owner, Arc::clone(root)) };
+    Some(egcl_rt::call_table::EntryClaimRequest { claim, entry })
 }
 
 /// A collectable compilation owner has no global named ordinal. Its private

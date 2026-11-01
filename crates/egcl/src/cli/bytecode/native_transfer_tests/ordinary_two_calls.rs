@@ -73,8 +73,8 @@ fn ordinary_two_calls_normalize_zero_and_relocate_a_live_argument_before_second_
     };
     assert_eq!(
         mapped.value_maps_for_test().iter().count(),
-        4,
-        "two actual direct/cold CALL pairs"
+        6,
+        "two actual lean/direct/cold CALL triples"
     );
     // Retire unrelated closures before warming the measured cells. The
     // collector invalidates all call descriptors when it sweeps a dead closure;

@@ -437,6 +437,7 @@ fn ordinary_call_crosses_code_owners_with_exact_native_maps() {
         descriptor_slot: &slot as *const _ as u64,
         revision_address: &revision as *const _ as u64,
         heat_slot: 0,
+        function_cell: 0,
     };
     let f = ordinary_caller(4, false);
     let caller = emit_framed_ordinary_call(
@@ -829,6 +830,7 @@ fn ordinary_two_calls_normalize_zero_before_distinct_second_target_and_forward_t
         descriptor_slot: slots[i].as_ptr() as u64,
         revision_address: revisions[i].as_ptr() as u64,
         heat_slot: 0,
+        function_cell: 0,
     });
     let byte = AtomicU8::new(0);
     let word = AtomicU64::new(0);
@@ -924,6 +926,7 @@ fn ordinary_two_calls_reject_missing_reset_targets_and_other_shapes() {
         descriptor_slot: 1,
         revision_address: 1,
         heat_slot: 0,
+        function_cell: 0,
     });
     let compile =
         |f: &Function, targets| emit_framed_ordinary_two_calls(f, options(4), targets, flags, 1, 1);

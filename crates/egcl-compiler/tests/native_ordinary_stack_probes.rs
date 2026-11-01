@@ -95,6 +95,7 @@ fn large_ordinary_frames_and_outgoing_areas_touch_each_stack_page() {
                 descriptor_slot: 1,
                 revision_address: 1,
                 heat_slot: 0,
+                function_cell: 0,
             },
         )],
         OrdinaryCallFlags {

@@ -118,6 +118,7 @@ fn emit(f: &Function, target: u32) -> Result<FramedCode, EmitError> {
             descriptor_slot: 1,
             revision_address: 1,
             heat_slot: 0,
+            function_cell: 0,
         },
         OrdinaryCallFlags {
             gc_requested: 1,
@@ -173,6 +174,7 @@ fn ordinary_general_entry_accepts_recursive_guarded_continuation() {
                 descriptor_slot: 1,
                 revision_address: 1,
                 heat_slot: 0,
+                function_cell: 0,
             },
         )],
         OrdinaryCallFlags {

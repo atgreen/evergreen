@@ -78,7 +78,7 @@ fn spec_image_round_trip_restores_heap_and_entry_state() {
     save_image(path.to_str().unwrap(), &image_opts()).expect("save_image");
     let header = validate_image_header(path.to_str().unwrap()).expect("validate header");
     assert_eq!(header.entry_continuation, entry.to_raw());
-    assert_eq!(header.format_version, 18);
+    assert_eq!(header.format_version, 19);
     assert!(header.heap_size >= 4096);
     assert_eq!(header.heap_size % 4096, 0);
 
@@ -367,10 +367,10 @@ fn spec_image_header_validation_rejects_corrupt_or_incompatible_images() {
     let mut bytes = fs::read(&path).expect("read image");
     assert_eq!(
         u32::from_ne_bytes(bytes[8..12].try_into().unwrap()),
-        18,
-        "closure-state words in function objects require image format version 18"
+        19,
+        "entry words in function objects require image format version 19"
     );
-    for version in [1u32, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 19] {
+    for version in [1u32, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20] {
         let mut incompatible = bytes.clone();
         incompatible[8..12].copy_from_slice(&version.to_ne_bytes());
         let incompatible_path = temp_path(&format!("header-version-{version}.bimg"));

@@ -416,6 +416,7 @@ fn execute_with_self_stack_bound(
                     descriptor_slot: slot.as_ptr() as u64,
                     revision_address: revision.as_ptr() as u64,
                     heat_slot: heat_slot.as_ptr() as u64,
+                    function_cell: 0,
                 },
             )
         })

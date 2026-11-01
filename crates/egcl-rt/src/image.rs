@@ -182,7 +182,10 @@ pub const IMAGE_MAGIC: u64 = u64::from_be_bytes(*b"EGCLIMG\0");
 // Version 18 grows interpreted function objects by a raw closure-state word and
 // keys the host section's bytecode-closure captures by function object rather
 // than by a per-instance symbol. Older function bodies are too short to read.
-const FORMAT_VERSION: u32 = 18;
+// Version 19 grows interpreted function objects by a native entry word and its
+// owner key (bliss-gg3i1.7.15.10.1); both are saved as zero and re-derived when
+// the restored process publishes code. Older function bodies are too short.
+const FORMAT_VERSION: u32 = 19;
 
 /// Image file header (128 bytes). D7.01.
 #[derive(Clone, Copy)]
@@ -1204,7 +1207,14 @@ pub fn find_appended_image() -> Option<String> {
         if data[offset..offset + 8] == magic_bytes {
             // Validate that this looks like a real header (check version range).
             if let Some(candidate) = bytes_to_struct::<ImageHeader>(&data[offset..]) {
-                if candidate.format_version >= 1 && candidate.format_version <= FORMAT_VERSION {
+                // A header literal in the executable's own data can carry the
+                // magic and a plausible version; only a saved header also
+                // carries its own checksum.
+                if candidate.format_version >= 1
+                    && candidate.format_version <= FORMAT_VERSION
+                    && candidate.header_sha256
+                        == compute_header_checksum(&data[offset..offset + header_size])
+                {
                     return Some(exe_path.to_string_lossy().into_owned());
                 }
             }

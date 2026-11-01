@@ -2,6 +2,31 @@
 
 use super::*;
 
+/// A named ordinary call through `cell`. The lean path (bliss-gg3i1.7.15.10.1)
+/// reads the symbol's function cell, so it is off for the private semantic
+/// primitives, whose compiled callers must keep primitive meaning even when a
+/// user rebinds the name, and for names without a pinned symbol object.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn ordinary_call_target(
+    symbol: u32,
+    cell: &egcl_rt::call_table::CallCell,
+) -> egcl_compiler::t2::emit::OrdinaryCallTarget {
+    let function_cell = if super::lean_calls_enabled() && !ordinary_primitives::is_private(symbol) {
+        egcl_rt::symbols::symbol_object_ptr(symbol).map_or(0, |object| {
+            (object + std::mem::offset_of!(egcl_rt::object::SymbolData, function)) as u64
+        })
+    } else {
+        0
+    };
+    egcl_compiler::t2::emit::OrdinaryCallTarget {
+        symbol,
+        descriptor_slot: cell.ordinary_entry_address() as u64,
+        heat_slot: cell.ordinary_heat_address() as u64,
+        revision_address: cell.revision_address() as u64,
+        function_cell,
+    }
+}
+
 pub(in crate::cli::bytecode) struct EmittedTransfer {
     installed_symbol: Option<u32>,
     is_t2: bool,
@@ -10,6 +35,7 @@ pub(in crate::cli::bytecode) struct EmittedTransfer {
     code_len: usize,
     frame_entry: Option<usize>,
     ordinary_entry: Option<usize>,
+    ordinary_lean_entry: Option<usize>,
     allocation_extent_counts: (usize, usize, usize),
     ordinary_stack_required: Option<usize>,
     ordinary_bound_entry: Option<usize>,
@@ -99,6 +125,7 @@ impl EmittedTransfer {
             code_len: self.code_len,
             frame_entry: self.frame_entry,
             ordinary_entry: self.ordinary_entry,
+            ordinary_lean_entry: self.ordinary_lean_entry,
             ordinary_stack_required: self.ordinary_stack_required,
             ordinary_bound_entry: self.ordinary_bound_entry,
             ordinary_checks_params: self.ordinary_checks_params,
@@ -406,7 +433,9 @@ impl EmittedTransfer {
             reason.is_none()
         })
             .and_then(|ir| {
-                use egcl_compiler::t2::emit::{OrdinaryLispEntryOptions, OrdinaryCallTarget, OrdinaryCallFlags};
+                use egcl_compiler::t2::emit::{OrdinaryLispEntryOptions, OrdinaryCallFlags};
+                // Installs the lean entries' overflow veneer before emission.
+                super::lean_calls_enabled();
                 let mut ir = ir.clone();
                 // Full calls start with inactive multiple values. OSR imports
                 // retain separate descriptors and cannot constrain that proof.
@@ -491,10 +520,7 @@ impl EmittedTransfer {
                                 .map(|inst| {
                                     let symbol = ir.inst(inst).aux.named_call_target()?;
                                     let (_, cell) = call_cells.iter().find(|(name, _)| *name == symbol)?;
-                                    Some((inst, OrdinaryCallTarget { symbol,
-                                        descriptor_slot: cell.ordinary_entry_address() as u64,
-                                        heat_slot: cell.ordinary_heat_address() as u64,
-                                    revision_address: cell.revision_address() as u64 }))
+                                    Some((inst, ordinary_call_target(symbol, cell)))
                                 }).collect::<Option<Vec<_>>>()?;
                             egcl_compiler::t2::emit::emit_framed_ordinary_function_with_self_call_facts(
                                 &ir, options, &targets, call_flags, cold.as_ptr() as u64,
@@ -523,10 +549,7 @@ impl EmittedTransfer {
                             emit_general()
                         } else {
                         call_cells.iter().find_map(|(symbol, cell)| {
-                            let target = OrdinaryCallTarget { symbol: *symbol,
-                                    descriptor_slot: cell.ordinary_entry_address() as u64,
-                                    heat_slot: cell.ordinary_heat_address() as u64,
-                                    revision_address: cell.revision_address() as u64 };
+                            let target = ordinary_call_target(*symbol, cell);
                             emit_call(&ir, options, target, call_flags, cold.as_ptr() as u64).ok()
                                 .or_else(|| egcl_compiler::t2::emit::emit_framed_ordinary_guarded_call(
                                     &ir, options, target, call_flags, cold.as_ptr() as u64,
@@ -544,10 +567,7 @@ impl EmittedTransfer {
                             let target = |inst| {
                                 let symbol = ir.inst(inst).aux.named_call_target()?;
                                 let (_, cell) = call_cells.iter().find(|(name, _)| *name == symbol)?;
-                                Some(OrdinaryCallTarget { symbol,
-                                    descriptor_slot: cell.ordinary_entry_address() as u64,
-                                    heat_slot: cell.ordinary_heat_address() as u64,
-                                    revision_address: cell.revision_address() as u64 })
+                                Some(ordinary_call_target(symbol, cell))
                             };
                             egcl_compiler::t2::emit::emit_framed_ordinary_two_calls(
                                 &ir, options, [target(*calls[0])?, target(*calls[1])?], call_flags,
@@ -792,6 +812,7 @@ impl EmittedTransfer {
             code_len: emitted.code.len(),
             frame_entry: emitted.frame_entry,
             ordinary_entry: emitted.ordinary_entry,
+            ordinary_lean_entry: emitted.ordinary_lean_entry,
             allocation_extent_counts: if emitted.ordinary_entry.is_some() {
                 allocation_extent_counts
             } else {

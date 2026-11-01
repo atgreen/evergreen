@@ -182,6 +182,7 @@ fn exercise(clear_between: bool) {
                     descriptor_slot: slots[i].as_ptr() as u64,
                     revision_address: revisions[i].as_ptr() as u64,
                     heat_slot: 0,
+                    function_cell: 0,
                 },
             )
         })
