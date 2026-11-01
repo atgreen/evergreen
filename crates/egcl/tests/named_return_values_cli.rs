@@ -40,9 +40,9 @@ const SOURCE: &str = r#"
   (assert (equal '(9 :throw) (multiple-value-list (nrm-throw 9)))))
 (dotimes (i 100) (nrm-warm))
 "#;
-// Creators of free lexical-control closures are deliberately pinned to T0 by
-// native_would_lose_captured_control. Exercise them from a real native caller;
-// dynamic THROW has no such lexical-token restriction and is native itself.
+// Creators of free lexical-control closures leave T0 since bliss-gg3i1.7.11:
+// native code registers their named BLOCKs like CATCHes. Exercise them from a
+// real native caller as well; dynamic THROW is native itself.
 const READY: &str = r#"
 (loop repeat 150 until
  (every (lambda (s) (= 2 (egcl-ext:function-tier s))) '(nrm-warm nrm-throw))
@@ -51,7 +51,7 @@ const READY: &str = r#"
   (unless (eql 2 (egcl-ext:function-tier s))
     (error "Expected native driver ~S, got tier ~S" s (egcl-ext:function-tier s))))
 (dolist (s '(nrm-exit nrm-nested nrm-stale))
-  (assert (eql 0 (egcl-ext:function-tier s))))
+  (assert (plusp (egcl-ext:function-tier s))))
 "#;
 const CHECK: &str = r#"
 (setq *nrm-effects* 0 *nrm-cleanups* nil)
