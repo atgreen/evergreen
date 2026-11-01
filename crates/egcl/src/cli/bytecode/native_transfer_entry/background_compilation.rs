@@ -47,6 +47,7 @@ pub(in crate::cli::bytecode) struct EmittedTransfer {
     guard_handler_capacity: usize,
     special_binds: usize,
     catch_pushes: usize,
+    inherits_control: bool,
     arguments: Option<egcl_rt::jit_debug::NativeArguments>,
 }
 
@@ -134,6 +135,7 @@ impl EmittedTransfer {
             guard_handler_capacity: self.guard_handler_capacity,
             special_binds: self.special_binds,
             catch_pushes: self.catch_pushes,
+            inherits_control: self.inherits_control,
         })
     }
     /// `emit_prepared_with_ordinary`, naming the step that refused the body
@@ -645,10 +647,9 @@ impl EmittedTransfer {
                 scope.ownership != Ownership::Local
                     || !matches!(
                         scope.kind,
-                        ScopeKind::Block {
-                            register: false,
-                            ..
-                        } | ScopeKind::Tagbody { .. }
+                        // A registered BLOCK uses the catch ledger (bliss-gg3i1.7.11).
+                        ScopeKind::Block { .. }
+                            | ScopeKind::Tagbody { .. }
                             | ScopeKind::Unwind { .. }
                             | ScopeKind::Cleanup { .. }
                             | ScopeKind::Catch { .. }
@@ -772,10 +773,16 @@ impl EmittedTransfer {
             .iter()
             .filter(|op| matches!(op, Instr::BindSpecial(_)))
             .count();
+        // Registered BLOCKs share the catch ledger (bliss-gg3i1.7.11).
         let catch_pushes = body
             .code
             .iter()
-            .filter(|op| matches!(op, Instr::PushCatch { .. }))
+            .filter(|op| {
+                matches!(
+                    op,
+                    Instr::PushCatch { .. } | Instr::PushBlock { register: true, .. }
+                )
+            })
             .count();
         Ok(Self {
             installed_symbol: None,
@@ -828,6 +835,9 @@ impl EmittedTransfer {
             guard_handler_capacity,
             special_binds,
             catch_pushes,
+            // A closure's named exits, and those of closures it creates,
+            // resolve against the control it captured (bliss-gg3i1.7.11).
+            inherits_control: super::super::bf_has_free_control_exit(body),
         })
     }
 }
@@ -955,12 +965,10 @@ pub(in crate::cli::bytecode) fn prepare_background_t1(
     if !native_transfer::is_supported()
         || !activation_bound_parameters(&body)
         || captured_environment_decline(&body).is_some()
-        || body.code.iter().any(|op| {
-            matches!(
-                op,
-                Instr::PushBlock { register: true, .. } | Instr::NamedTag { .. }
-            )
-        })
+        || body
+            .code
+            .iter()
+            .any(|op| matches!(op, Instr::NamedTag { .. }))
     {
         return None;
     }

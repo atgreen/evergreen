@@ -403,10 +403,7 @@ impl SysvTransferTable {
             let end = start.checked_add(4).ok_or_else(invalid)?;
             if candidates.next().is_some()
                 || scope.ownership != Ownership::Local
-                || scope.kind
-                    != (ScopeKind::Catch {
-                        resume_bcp: landing.resume_bcp,
-                    })
+                || scope.kind.token_destination() != Some(landing.resume_bcp)
                 || site.map.control_scopes[scope_index + 1..].iter().any(|s| {
                     s.ownership != Ownership::Local || matches!(s.kind, ScopeKind::Unwind { .. })
                 })

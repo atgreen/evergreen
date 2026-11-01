@@ -41,33 +41,18 @@ pub(super) unsafe fn request(call: &TransferCallRequest) -> Result<EgclVal, Egcl
         scope.ownership != Ownership::Local
             || !matches!(
                 scope.kind,
-                ScopeKind::Block {
-                    register: false,
-                    ..
-                } | ScopeKind::Tagbody { .. }
+                ScopeKind::Block { .. }
+                    | ScopeKind::Tagbody { .. }
                     | ScopeKind::SpecialBinding { .. }
                     | ScopeKind::Catch { .. }
+                    | ScopeKind::LexicalEnvironment
             )
     }) || !unsafe { validate_special_bindings(context, before) }
     {
         return Err(invalid_capture());
     }
     let catches = unsafe { &*context.catches };
-    let env_ref = unsafe { &*env };
-    let tail = env_ref
-        .catch_stack
-        .get(context.catch_base..)
-        .ok_or_else(invalid_capture)?;
-    if !before
-        .iter()
-        .filter_map(|scope| matches!(scope.kind, ScopeKind::Catch { .. }).then_some(scope.push_bcp))
-        .eq(catches.iter().map(|saved| saved.push_bcp))
-        || tail.len() != catches.len()
-        || !tail
-            .iter()
-            .zip(catches)
-            .all(|((_, token), saved)| token == &saved.token)
-    {
+    if !catch_ledger_matches(before, catches, context.catch_base, unsafe { &*env }) {
         return Err(invalid_capture());
     }
     // The scope map is an immutable property of the retained owner. Its
@@ -82,6 +67,16 @@ pub(super) unsafe fn request(call: &TransferCallRequest) -> Result<EgclVal, Egcl
             ScopeKind::Catch { .. } => {
                 unsafe { &mut *env }.catch_stack.pop();
                 unsafe { &mut *context.catches }.pop();
+            }
+            // A registered BLOCK left by its own or an outer RETURN-FROM
+            // (bliss-gg3i1.7.11).
+            ScopeKind::Block { register: true, .. } => {
+                unsafe { &mut *env }.block_stack.pop();
+                unsafe { &mut *context.catches }.pop();
+            }
+            // Leave a captured binding's child frame, as PopEnvChild does.
+            ScopeKind::LexicalEnvironment => {
+                pop_env_child(unsafe { &mut *context.env_frame });
             }
             ScopeKind::Block {
                 register: false, ..

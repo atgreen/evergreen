@@ -457,11 +457,15 @@ fn eval_traced(program: &str, envs: &[(&str, &str)]) -> (String, String) {
 /// that native code is unprofitable: the function recompiles from the profile
 /// gathered since and reaches T2, rather than being blacklisted to T0. Since
 /// bliss-9bw59 it does so once the site is profiled, not after the threshold.
+/// The recompile shares the background worker with whatever else the run
+/// promotes (the LOOP expander, since bliss-gg3i1.7.11), so wait for it.
 #[test]
 fn disproved_cold_double_guess_recompiles_to_t2() {
     let program = "\
         (defun s-double (a b) (declare (double-float a b)) (+ (* a b) 1d0)) \
         (dotimes (i 200) (s-double 1.5d0 2d0)) \
+        (loop repeat 100 until (= 2 (egcl-ext:function-tier (quote s-double))) \
+              do (s-double 1.5d0 2d0) (sleep 0.01)) \
         (format t \"~a ~a~%\" (egcl-ext:function-tier (quote s-double)) \
                 (s-double 1.5d0 2d0))";
     let (out, trace) = eval_traced(

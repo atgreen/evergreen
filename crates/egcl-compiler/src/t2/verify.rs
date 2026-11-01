@@ -198,6 +198,7 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                             | AuxData::NestedClosure(_)
                             | AuxData::LexicalEnvironment { .. }
                             | AuxData::TransferThrow
+                            | AuxData::NamedExit { .. }
                             | AuxData::CatchScope { .. }
                             | AuxData::HandlerScope { .. }
                             | AuxData::HandlerBindScope { .. }
@@ -210,6 +211,19 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
             {
                 errors.push(VerifyError::new("V11 invoke-shape",
                     format!("block{bi} Invoke requires distinct normal/exceptional edges and call effects")));
+            }
+            if let AuxData::NamedExit { bcp } = data.aux {
+                let identity_matches = data
+                    .frame_state
+                    .filter(|id| (id.0 as usize) < f.frame_states.len())
+                    .and_then(|id| f.frame_states.get(id).scopes.last())
+                    .is_some_and(|scope| scope.bcp == bcp);
+                if data.opcode != Opcode::Invoke || data.args.len() > 1 || !identity_matches {
+                    errors.push(VerifyError::new(
+                        "V11 invoke-shape",
+                        "a named exit requires an Invoke at its original bytecode position",
+                    ));
+                }
             }
             if matches!(data.aux, AuxData::TransferThrow)
                 && (data.opcode != Opcode::Invoke || data.args.len() != 2)
@@ -330,18 +344,20 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                         .and_then(|id| f.frame_states.get(id).scopes.last())
                         .is_some_and(|scope| scope.bcp == push_bcp)
                 } else {
-                    data.targets.get(1).and_then(|edge| {
-                        ((edge.block.0 as usize) < n_blocks).then_some(edge.block)
-                    }).and_then(|block| f.terminator(block)).is_some_and(|cold| {
-                        matches!(&f.inst(cold).aux, AuxData::TransferSite { scopes, .. }
+                    data.targets
+                        .get(1)
+                        .and_then(|edge| ((edge.block.0 as usize) < n_blocks).then_some(edge.block))
+                        .and_then(|block| f.terminator(block))
+                        .is_some_and(|cold| {
+                            matches!(&f.inst(cold).aux, AuxData::TransferSite { scopes, .. }
                             if scopes.last().is_some_and(|scope|
                                 scope.push_bcp == push_bcp
                                 && scope.ownership == crate::control_scope::Ownership::Local
-                                && matches!(scope.kind, crate::control_scope::ScopeKind::Catch { .. })))
-                    })
+                                && scope.kind.is_token_destination()))
+                        })
                 };
                 if data.opcode != Opcode::Invoke
-                    || data.args.len() != usize::from(enter)
+                    || data.args.len() > usize::from(enter)
                     || !identity_matches
                 {
                     errors.push(VerifyError::new("V11 invoke-shape", "CATCH registration requires Invoke with one tag on entry and no arguments on exit"));
@@ -1448,7 +1464,7 @@ fn verify_cleanup_continuations(f: &Function, errors: &mut Vec<VerifyError>) {
                                 .find(|(_, scope)| scope.push_bcp == push_bcp)
                                 .filter(|(index, scope)| {
                                     scope.ownership == crate::control_scope::Ownership::Local
-                                        && scope.kind == (ScopeKind::Catch { resume_bcp })
+                                        && scope.kind.token_destination() == Some(resume_bcp)
                                         && !scopes[index + 1..]
                                             .iter()
                                             .any(|s| matches!(s.kind, ScopeKind::Unwind { .. }))

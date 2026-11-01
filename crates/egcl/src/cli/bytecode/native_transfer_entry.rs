@@ -401,8 +401,13 @@ pub(super) struct TransferCode {
     guard_handler_capacity: usize,
     /// `BindSpecial` instructions in `body` (sizes each activation's specials).
     special_binds: usize,
-    /// `PushCatch` instructions in `body` (sizes each activation's catches).
+    /// `PushCatch` and registered `PushBlock` instructions in `body` (sizes
+    /// each activation's catches).
     catch_pushes: usize,
+    /// The body, or a closure it creates, exits by name to a block or tag it
+    /// does not establish: an activation installs its callable's captured
+    /// lexical control instead of an empty one (bliss-gg3i1.7.11).
+    inherits_control: bool,
     /// Buffers of finished activations, reused by later calls of this code so
     /// a call does not rebuild them. Only quiescent states with no Lisp value
     /// left in them are kept; see `ActivationState::recycle`. Each state is
@@ -540,12 +545,11 @@ pub(super) fn mapped_t1_decline_reason(symbol: u32, body: &Arc<BytecodeFunction>
             "a parameter is special or boxed, not a plain slot".into()
         };
     }
-    if let Some(op) = body.code.iter().find(|op| {
-        matches!(
-            op,
-            Instr::PushBlock { register: true, .. } | Instr::NamedTag { .. }
-        )
-    }) {
+    if let Some(op) = body
+        .code
+        .iter()
+        .find(|op| matches!(op, Instr::NamedTag { .. }))
+    {
         return format!("{} needs an executing identity", kind(op));
     }
     if let Err(error) = egcl_compiler::t2::build::build_from_bytecode_for_native_cleanups(body) {
@@ -1256,12 +1260,11 @@ impl TransferCode {
         }
         // These scopes need executing identity, dynamic values or inherited
         // state. Do not invent fresh tokens during recovery for live closures.
-        if body.code.iter().any(|instruction| {
-            matches!(
-                instruction,
-                Instr::PushBlock { register: true, .. } | Instr::NamedTag { .. }
-            )
-        }) {
+        if body
+            .code
+            .iter()
+            .any(|instruction| matches!(instruction, Instr::NamedTag { .. }))
+        {
             return Err(EmitDecline::ExecutingIdentity);
         }
         let roots = retain_native_body(&body);
@@ -1711,10 +1714,26 @@ impl TransferCode {
             scopes: &mut state.dynamic_scopes,
         };
         let mut context = state.context(self, frame, &mut children, std::ptr::null_mut());
-        let _scope = BlockScopeGuard {
-            env,
-            blocks: std::mem::take(&mut env.block_stack),
-            tags: std::mem::take(&mut env.tag_stack),
+        // A fresh activation sees its closure's captured BLOCK/TAGBODY scope
+        // when it, or a closure it creates, can exit by name through it, and
+        // otherwise none; the guard restores the caller's. An OSR destination
+        // continues the source activation's scope, which may hold blocks the
+        // source registered (bliss-gg3i1.7.11).
+        let _scope = if osr_offset.is_some() {
+            let blocks = try_clone_control_stack(&env.block_stack)?;
+            let tags = try_clone_control_stack(&env.tag_stack)?;
+            BlockScopeGuard { env, blocks, tags }
+        } else {
+            let captured = self
+                .inherits_control
+                .then(|| closure_captured_control(roots.function))
+                .flatten();
+            let (blocks, tags) = captured.unwrap_or_default();
+            BlockScopeGuard {
+                env,
+                blocks: std::mem::replace(&mut env.block_stack, blocks),
+                tags: std::mem::replace(&mut env.tag_stack, tags),
+            }
         };
         if osr_offset.is_none() {
             env.clear_mv();
@@ -1960,7 +1979,10 @@ impl TransferCode {
                                     | Instr::CleanupReturn
                                     | Instr::SetValues(_)
                                     | Instr::Throw
+                                    | Instr::ReturnFromNamed { .. }
+                                    | Instr::GoNamed { .. }
                                     | Instr::PushCatch { .. }
+                                    | Instr::PushBlock { register: true, .. }
                                     | Instr::PopHandler
                                     | Instr::PushHandlerCase { .. }
                                     | Instr::PopHandlerCase
@@ -1986,9 +2008,11 @@ impl TransferCode {
         if !running.eq(cleanups.iter().map(|saved| saved.cleanup_bcp)) {
             return Err(invalid_capture());
         }
-        let live_catches = site.map().control_scopes.iter().filter_map(|scope| {
-            matches!(scope.kind, ScopeKind::Catch { .. }).then_some(scope.push_bcp)
-        });
+        let live_catches = site
+            .map()
+            .control_scopes
+            .iter()
+            .filter_map(|scope| scope.kind.is_token_destination().then_some(scope.push_bcp));
         if !live_catches.eq(catches.iter().map(|saved| saved.push_bcp)) {
             return Err(invalid_capture());
         }
@@ -2109,6 +2133,24 @@ impl TransferCode {
                         .iter()
                         .find(|saved| saved.push_bcp == scope.push_bcp)
                         .expect("checked catch identity")
+                        .token
+                        .clone(),
+                    resume_bcp,
+                    sp_restore: scope.sp_restore,
+                    env: scope_env,
+                },
+                // The registration stays on the block stack under the same
+                // token, which the interpreter's PopHandler removes.
+                ScopeKind::Block {
+                    id,
+                    resume_bcp,
+                    register: true,
+                } => Handler::Block {
+                    block_id: id,
+                    token: catches
+                        .iter()
+                        .find(|saved| saved.push_bcp == scope.push_bcp)
+                        .expect("checked block identity")
                         .token
                         .clone(),
                     resume_bcp,
@@ -2616,6 +2658,9 @@ fn numeric_native_body(
                 op,
                 Instr::PushCatch { .. }
                     | Instr::Throw
+                    | Instr::PushBlock { register: true, .. }
+                    | Instr::ReturnFromNamed { .. }
+                    | Instr::GoNamed { .. }
                     | Instr::PushUnwind { .. }
                     | Instr::EnterCleanupNormal { .. }
                     | Instr::CleanupReturn
@@ -2708,6 +2753,10 @@ fn local_control_op(
         | Instr::PushEnvChild | Instr::PopEnvChild))
     || (allow_local_scopes && matches!(op,
         Instr::PushTag { .. } | Instr::Go { .. } | Instr::PushCatch { .. } | Instr::Throw
+            // A registered BLOCK is a catch-like record; a closure's named
+            // RETURN-FROM or GO starts a transfer as THROW does (bliss-gg3i1.7.11).
+            | Instr::PushBlock { register: true, .. }
+            | Instr::ReturnFromNamed { .. } | Instr::GoNamed { .. }
             | Instr::PushUnwind { .. } | Instr::EnterCleanupNormal { .. } | Instr::CleanupReturn
             | Instr::PushHandlerCase { .. } | Instr::PopHandlerCase
             | Instr::PushHandlerBind { .. } | Instr::PopHandlerBind
@@ -3278,6 +3327,49 @@ struct OsrResume {
 struct SavedCatch {
     push_bcp: u32,
     token: String,
+    /// A BLOCK registered by name on `env.block_stack` for a closure's
+    /// RETURN-FROM, rather than a CATCH tag on `env.catch_stack`
+    /// (bliss-gg3i1.7.11). Both are delivered through the catch landing.
+    block: bool,
+}
+
+/// Whether the activation's catch ledger is exactly the CATCH and registered
+/// BLOCK scopes of `scopes`, in order, and owns the innermost entries of
+/// `env.catch_stack` (above `catch_base`) and of `env.block_stack`.
+fn catch_ledger_matches(
+    scopes: &[egcl_compiler::control_scope::ControlScope],
+    catches: &[SavedCatch],
+    catch_base: usize,
+    env: &Env,
+) -> bool {
+    let mut live = scopes
+        .iter()
+        .filter(|scope| scope.kind.is_token_destination());
+    let order = catches.iter().all(|saved| {
+        live.next().is_some_and(|scope| {
+            scope.push_bcp == saved.push_bcp
+                && saved.block == matches!(scope.kind, ScopeKind::Block { .. })
+        })
+    }) && live.next().is_none();
+    let tags = catches.iter().filter(|saved| !saved.block);
+    let blocks = catches.iter().filter(|saved| saved.block);
+    let block_count = blocks.clone().count();
+    order
+        && env.catch_stack.get(catch_base..).is_some_and(|tail| {
+            tail.iter()
+                .map(|(_, token)| token)
+                .eq(tags.map(|saved| &saved.token))
+        })
+        && env
+            .block_stack
+            .len()
+            .checked_sub(block_count)
+            .and_then(|start| env.block_stack.get(start..))
+            .is_some_and(|tail| {
+                tail.iter()
+                    .map(|(_, token)| token)
+                    .eq(blocks.map(|saved| &saved.token))
+            })
 }
 
 struct PreparedCatch {
@@ -3505,6 +3597,58 @@ unsafe extern "C" fn call_or_throw(
 #[cfg(test)]
 mod lexical_leaf_tests;
 
+/// A closure's RETURN-FROM or GO to a block or tag of an enclosing function
+/// (bliss-gg3i1.7.11), exactly as the interpreter's `ReturnFromNamed` and
+/// `GoNamed` arms: resolve the name in this activation's lexical control,
+/// which its entry installed from the closure's captured scope, store the
+/// transfer's values under the destination's token and start the unwind.
+/// Always returns an error; the transfer machinery delivers it.
+unsafe fn named_exit_request(
+    call: &egcl_compiler::t2::emit::TransferCallRequest,
+) -> Result<EgclVal, EgclError> {
+    let context = unsafe { &*CAPTURE.with(Cell::get) };
+    let body = unsafe { &*context.body };
+    let env = unsafe { &mut *NATIVE_ENV.with(Cell::get) };
+    let (name_idx, return_from) = match body.code.get(call.symbol as u32 as usize) {
+        Some(Instr::ReturnFromNamed { name_idx }) => (*name_idx, true),
+        Some(Instr::GoNamed { name_idx }) => (*name_idx, false),
+        _ => return Err(invalid_capture()),
+    };
+    let name = body
+        .names
+        .get(name_idx as usize)
+        .ok_or_else(invalid_capture)?;
+    let stack = if return_from {
+        &env.block_stack
+    } else {
+        &env.tag_stack
+    };
+    let token = stack
+        .iter()
+        .rev()
+        .find(|(live, _)| live == name)
+        .map(|(_, token)| try_clone_string(token))
+        .transpose()?;
+    match (token, return_from) {
+        (Some(token), true) => {
+            assert_eq!(call.nargs, 1);
+            // The argument area stays rooted until this helper returns.
+            let value = unsafe { call.args.read() };
+            super::super::store_control_mv(&token, value, env);
+            Err(EgclError::Internal(token))
+        }
+        (Some(token), false) => {
+            assert_eq!(call.nargs, 0);
+            super::super::store_control_value(&token, super::super::arena_str(name));
+            Err(EgclError::Internal(token))
+        }
+        (None, true) => Err(EgclError::ControlError(format!(
+            "RETURN-FROM: no visible block {name}"
+        ))),
+        (None, false) => Err(EgclError::ControlError(format!("GO: no such tag {name}"))),
+    }
+}
+
 /// Run the captured-variable instruction at the request's PC against the
 /// executing activation's heap EnvFrame, exactly as the interpreter's arm for
 /// it does (bliss-shih7.27). The frame lives in the rooted activation state;
@@ -3589,6 +3733,21 @@ unsafe fn call_or_throw_unpublished(
         TRANSFER_DIRECT_EXIT_REQUEST, TRANSFER_GLOBAL_LOAD_REQUEST, TRANSFER_GLOBAL_STORE_REQUEST,
         TRANSFER_SPECIAL_BIND_REQUEST, TRANSFER_SPECIAL_UNBIND_REQUEST,
     };
+    if request_kind == egcl_compiler::t2::emit::TRANSFER_NAMED_EXIT_REQUEST {
+        if !native_error_pending() {
+            let result = guard_c2i(|| unsafe { named_exit_request(call) });
+            if let Err(error) = result {
+                NATIVE_ERROR.with(|slot| slot.set_first(error));
+            }
+        }
+        unsafe {
+            out.write(NativeOutcome {
+                value: NIL,
+                exit: NativeExit::Transfer,
+            });
+        }
+        return;
+    }
     if request_kind == TRANSFER_DIRECT_EXIT_REQUEST {
         let result = if native_error_pending() {
             Ok(NIL)
@@ -4099,27 +4258,65 @@ unsafe fn call_or_throw_unpublished(
                 let catches = unsafe { &mut *context.catches };
                 let push_bcp = call.symbol as u32;
                 let body = unsafe { &*context.body };
-                assert!(matches!(
-                    body.code.get(push_bcp as usize),
-                    Some(Instr::PushCatch { .. })
-                ));
+                // A registered BLOCK publishes its name on the block stack for
+                // a closure's RETURN-FROM, as the interpreter's PushBlock does
+                // (bliss-gg3i1.7.11).
+                let block_name = match body.code.get(push_bcp as usize) {
+                    Some(Instr::PushCatch { .. }) => None,
+                    Some(Instr::PushBlock {
+                        register: true,
+                        name_idx,
+                        ..
+                    }) => Some(
+                        body.names
+                            .get(*name_idx as usize)
+                            .ok_or_else(invalid_capture)?,
+                    ),
+                    _ => return Err(invalid_capture()),
+                };
                 if request_kind == TRANSFER_CATCH_ENTER_REQUEST {
-                    assert_eq!(call.nargs, 1);
                     assert!(catches.len() < catches.capacity());
-                    let tag = unsafe { call.args.read() };
-                    let token = try_control_token("__THROW__")?;
-                    env.catch_stack.push((tag, try_clone_string(&token)?));
-                    catches.push(SavedCatch { push_bcp, token });
+                    if let Some(name) = block_name {
+                        assert_eq!(call.nargs, 0);
+                        let token = try_control_token("__RETURN_FROM__")?;
+                        env.block_stack
+                            .push((try_clone_string(name)?, try_clone_string(&token)?));
+                        catches.push(SavedCatch {
+                            push_bcp,
+                            token,
+                            block: true,
+                        });
+                    } else {
+                        assert_eq!(call.nargs, 1);
+                        let tag = unsafe { call.args.read() };
+                        let token = try_control_token("__THROW__")?;
+                        env.catch_stack.push((tag, try_clone_string(&token)?));
+                        catches.push(SavedCatch {
+                            push_bcp,
+                            token,
+                            block: false,
+                        });
+                    }
                 } else {
                     assert_eq!(call.nargs, 0);
                     let saved = catches.last().expect("live native catch");
                     assert_eq!(saved.push_bcp, push_bcp);
-                    assert!(
-                        env.catch_stack
-                            .last()
-                            .is_some_and(|(_, token)| token == &saved.token)
-                    );
-                    env.catch_stack.pop();
+                    assert_eq!(saved.block, block_name.is_some());
+                    if saved.block {
+                        assert!(
+                            env.block_stack
+                                .last()
+                                .is_some_and(|(_, token)| token == &saved.token)
+                        );
+                        env.block_stack.pop();
+                    } else {
+                        assert!(
+                            env.catch_stack
+                                .last()
+                                .is_some_and(|(_, token)| token == &saved.token)
+                        );
+                        env.catch_stack.pop();
+                    }
                     catches.pop();
                 }
                 Ok(NIL)
@@ -4406,7 +4603,7 @@ unsafe fn prepare_osr(image: *const SysvTransferCapture) -> bool {
         scope.ownership != Ownership::Local
             || !matches!(
                 scope.kind,
-                ScopeKind::Block { register: false, .. }
+                ScopeKind::Block { .. }
             | ScopeKind::Tagbody { .. } | ScopeKind::Catch { .. }
             | ScopeKind::Unwind { .. } | ScopeKind::Cleanup { .. }
             | ScopeKind::HandlerCase { .. } | ScopeKind::HandlerBind { .. }
@@ -4448,17 +4645,7 @@ unsafe fn prepare_osr(image: *const SysvTransferCapture) -> bool {
     }
     let catches = unsafe { &*context.catches };
     let env = unsafe { &*NATIVE_ENV.with(Cell::get) };
-    if !scopes
-        .iter()
-        .filter(|scope| matches!(scope.kind, ScopeKind::Catch { .. }))
-        .map(|scope| scope.push_bcp)
-        .eq(catches.iter().map(|saved| saved.push_bcp))
-        || env.catch_stack.len() != context.catch_base + catches.len()
-        || !env.catch_stack[context.catch_base..]
-            .iter()
-            .map(|(_, token)| token)
-            .eq(catches.iter().map(|saved| &saved.token))
-    {
+    if !catch_ledger_matches(scopes, catches, context.catch_base, env) {
         return false;
     }
     let Some(index) = code
@@ -5264,7 +5451,10 @@ unsafe fn prepare_transfer(
                 }
                 handler_token = Some(token);
             } else if let EgclError::Internal(token) = error {
-                selected_transfer = env.catch_stack.iter().any(|(_, live)| live == token);
+                // A THROW names a live catch; a RETURN-FROM a live block of
+                // this activation's lexical control (bliss-gg3i1.7.11).
+                selected_transfer = env.catch_stack.iter().any(|(_, live)| live == token)
+                    || env.block_stack.iter().any(|(_, live)| live == token);
                 if let Some(saved) = unsafe { &*context.catches }.iter().find(|saved| &saved.token == token) {
                     selected_target = SelectedTarget::Scope { push_bcp: saved.push_bcp };
                 }
@@ -5304,7 +5494,7 @@ unsafe fn prepare_transfer(
         }
         NativeUnwindStep::EnterTarget { scope_index } => {
             let landing = match scopes[scope_index].kind {
-                ScopeKind::Catch { .. } => {
+                ScopeKind::Catch { .. } | ScopeKind::Block { register: true, .. } => {
                     #[cfg(test)]
                     if context.unavailable_catch == Some(scopes[scope_index].push_bcp) {
                         return Ok(());
@@ -5359,19 +5549,30 @@ unsafe fn prepare_transfer(
     let retiring = scopes[scope_index..]
         .iter()
         .rev()
-        .filter(|scope| matches!(scope.kind, ScopeKind::Catch { .. }));
+        .filter(|scope| scope.kind.is_token_destination());
     let catches = unsafe { &mut *context.catches };
     let mut saved = catches.iter().rev();
-    let mut live = env.catch_stack.iter().rev();
+    let mut live_tags = env.catch_stack.iter().rev().map(|(_, token)| token);
+    let mut live_blocks = env.block_stack.iter().rev().map(|(_, token)| token);
     let mut retire_count = 0;
+    let mut retire_tags = 0;
+    let mut retire_blocks = 0;
     for scope in retiring {
         let Some(record) = saved.next() else {
             return Ok(());
         };
-        let Some((_, token)) = live.next() else {
+        let block = matches!(scope.kind, ScopeKind::Block { .. });
+        let live = if block {
+            retire_blocks += 1;
+            live_blocks.next()
+        } else {
+            retire_tags += 1;
+            live_tags.next()
+        };
+        let Some(token) = live else {
             return Ok(());
         };
-        if record.push_bcp != scope.push_bcp || &record.token != token {
+        if record.push_bcp != scope.push_bcp || record.block != block || &record.token != token {
             return Ok(());
         }
         retire_count += 1;
@@ -5445,7 +5646,12 @@ unsafe fn prepare_transfer(
             #[cfg(test)]
             NATIVE_CLEANUP_COUNT.with(|count| count.set(count.get() + 1));
         }
-        ScopeKind::Catch { resume_bcp } => {
+        ScopeKind::Catch { resume_bcp }
+        | ScopeKind::Block {
+            register: true,
+            resume_bcp,
+            ..
+        } => {
             let EgclError::Internal(token) = error else {
                 unreachable!("selected catch token");
             };
@@ -5487,7 +5693,9 @@ unsafe fn prepare_transfer(
     }
     catches.truncate(catches.len() - retire_count);
     env.catch_stack
-        .truncate(env.catch_stack.len() - retire_count);
+        .truncate(env.catch_stack.len() - retire_tags);
+    env.block_stack
+        .truncate(env.block_stack.len() - retire_blocks);
     // The rooted continuation owns the pending transfer before generated
     // cleanup code can allocate or suspend. Clear any helper's secondary values.
     env.clear_mv();

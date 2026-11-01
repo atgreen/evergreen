@@ -37,8 +37,9 @@
 //!   caller validates the native landing and restores or removes the dynamic
 //!   record (GO retains its TAGBODY) before entering, or materialises
 //!   fallback.
-//! * An unselected local `HandlerCase` or `Catch` → `RetireHandler` /
-//!   `RetireCatch`, since crossing it requires retiring its live record.
+//! * An unselected local `HandlerCase`, `Catch` or registered `Block` →
+//!   `RetireHandler` / `RetireCatch`, since crossing it requires retiring its
+//!   live record.
 //! * An `Unwind` → `RunCleanup`, with `handler_depth` counting installed
 //!   handler-like records outside it (running `Cleanup` continuations are not
 //!   handlers) so the dispatcher can retire superseded continuations at that
@@ -48,7 +49,7 @@
 //! * A local `SpecialBinding` → `RetireSpecial`, requiring the caller to
 //!   validate and restore its original binding before entering an outer scope.
 //! * Anything else that is registered or binds state (
-//!   `LexicalEnvironment`, registered `Block`, `Tagbody`, `HandlerBind`,
+//!   `LexicalEnvironment`, `Tagbody`, `HandlerBind`,
 //!   `RestartCase`, `PendingCleanup`) → `Fallback`, because native support
 //!   must not silently erase such a record and tagbody metadata cannot tell a
 //!   local lexical use from a NamedTag registration for an escaping closure.
@@ -147,7 +148,9 @@ pub fn next_unwind_step(scopes: &[ControlScope], target: SelectedTarget) -> Nati
             ScopeKind::HandlerCase { .. } => {
                 return NativeUnwindStep::RetireHandler { scope_index: index };
             }
-            ScopeKind::Catch { .. } => {
+            // A registered BLOCK is retired exactly as a CATCH is: its name
+            // registration is a runtime record (bliss-gg3i1.7.11).
+            ScopeKind::Catch { .. } | ScopeKind::Block { register: true, .. } => {
                 return NativeUnwindStep::RetireCatch { scope_index: index };
             }
             ScopeKind::Unwind { .. } => {
