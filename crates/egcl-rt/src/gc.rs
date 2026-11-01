@@ -1594,6 +1594,13 @@ unsafe fn trace_object(
             visit_word(3); // lambda_list
             visit_word(5); // constants
         }
+        // ── Heap lexical environment: raw count, parent, then the slots. ──
+        tid::LEXENV => {
+            let n = if words >= 1 { word(0).0 as usize } else { 0 };
+            for i in 1..(n + 2).min(words) {
+                visit_word(i);
+            }
+        }
         // ── Closure: function slot + the trailing closed-over variables. ──
         tid::CLOSURE => {
             for i in 0..words {
