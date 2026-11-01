@@ -44,6 +44,7 @@ use remembered_captures::{FrameCell, FrameWrite};
 mod shake;
 mod slot_access;
 pub mod sprof;
+pub mod tw_census;
 use egcl_rt::object::{ComplexData, ConsCell, ObjectHeader, type_id};
 use egcl_rt::runtime::parse_cli as parse_runtime_cli;
 use egcl_rt::value::{EOF, EgclVal, NIL, T};
@@ -12649,6 +12650,12 @@ fn eval_named_call_ex(
     let _fiber_frame = egcl_rt::thread::FiberCallFrame::enter_with_args(name, args);
     let _sf = sprof::Frame::name(name, sprof::TREEWALK);
     sprof::maybe_sample();
+    if tw_census::enabled() {
+        tw_census::note(format!(
+            "named-{} {name}",
+            if is_local { "local" } else { "global" }
+        ));
+    }
     // Take the FLET function's captured scope (a shared handle, so this is a
     // refcount bump and not a copy of the map) out from under the env.funs
     // borrow, and if present run the body with env.funs pointing at it,
@@ -14448,6 +14455,12 @@ impl egcl_rt::gc::TraceHostRoots for Closure {
 /// concurrent prune must never see an entry whose identity cons is still being
 /// allocated; the construction root preserves its captures until publication.
 fn register_tree_closure(mut closure: Closure) -> EgclVal {
+    if tw_census::enabled() {
+        tw_census::note(format!(
+            "closure-created {}",
+            tw_census::sketch(closure.body)
+        ));
+    }
     egcl_rt::rooted_ref!(_construction_root = &mut closure);
     let id = next_closure_id();
     let marker = resolve_sym("EGCL::CLOSURE").unwrap_or(NIL);
@@ -45386,6 +45399,12 @@ fn apply_function_impl(
                         .as_ref()
                         .and_then(|macros| install_lexical_macros(env, macros))
                 );
+                if tw_census::enabled() {
+                    tw_census::note(format!(
+                        "closure-instance {}",
+                        tw_census::sketch(closure.body)
+                    ));
+                }
                 let result =
                     with_special_declarations(env, closure.captured_specials.clone(), |env| {
                         eval_lambda_call_ex(
@@ -45416,6 +45435,9 @@ fn apply_function_impl(
                 ));
             }
             let (params_form, body) = cp(lr);
+            if tw_census::enabled() {
+                tw_census::note(format!("raw-lambda {}", tw_census::sketch(body)));
+            }
             return eval_lambda_call(env, params_form, body, args, Arc::clone(&env.frame));
         }
     }
@@ -45476,6 +45498,30 @@ fn apply_function_impl(
         };
         let params_form = egcl_rt::function::lambda_list(fn_val);
         let body = egcl_rt::function::body(fn_val);
+        if tw_census::enabled() {
+            let fname = egcl_rt::function::name(fn_val);
+            let why = if !fname.is_symbol() || fname.is_nil() {
+                "anonymous"
+            } else if egcl_rt::symbols::symbol_function(fname.as_symbol_index()) != Some(fn_val) {
+                "not-its-symbol's-definition"
+            } else if egcl_rt::function::invoke_count(fn_val) < bytecode::lazy_compile_threshold() {
+                "below-lazy-threshold"
+            } else {
+                "compile-declined"
+            };
+            let reason = if fname.is_symbol() && !fname.is_nil() {
+                tw_census::declined_reason(fname.as_symbol_index())
+                    .map(|r| format!(" <{r}>"))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            tw_census::note(format!(
+                "heap-fn [{why}]{reason} {} {}",
+                sym_name(fname),
+                tw_census::sketch(body)
+            ));
+        }
         // A reified capturing closure runs its interpreted body against the
         // captured environment, not the caller's frame (bliss-jtc.23.3). Its
         // BLOCK/TAGBODY exit scope is fresh: a heap interpreted-function is a
