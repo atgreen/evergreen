@@ -434,6 +434,8 @@ fn ordinary_shared_code_survives_first_instance_without_retaining_its_frame() {
     egcl_rt::rooted!(second = closure(&body, EgclVal::from_fixnum(22), &mut env));
     let first_id = egcl_rt::function::definition_index(*first);
     let second_id = egcl_rt::function::definition_index(*second);
+    // Instances of one template share its code identity (bliss-gg3i1.7.15.3).
+    assert_eq!(first_id, second_id);
     let first_frame = Arc::downgrade(&closure_captured_env(*first).unwrap());
     let second_frame = Arc::downgrade(&closure_captured_env(*second).unwrap());
     let code = install(*first);
@@ -464,10 +466,9 @@ fn ordinary_shared_code_survives_first_instance_without_retaining_its_frame() {
         first_frame.upgrade().is_none(),
         "native metadata must not retain the first instance's captured payload"
     );
-    assert!(!closure_envs().borrow().contains_key(&first_id));
     assert!(
-        !closure_bodies().borrow().contains_key(&first_id),
-        "instance records and code ownership are separate"
+        closure_bodies().borrow().contains_key(&first_id),
+        "the template's code outlives one of its instances"
     );
     assert!(registry_get(first_id).is_some_and(|saved| Arc::ptr_eq(&saved, &body)));
     let (selected_owner, selected_code, selected, _) =

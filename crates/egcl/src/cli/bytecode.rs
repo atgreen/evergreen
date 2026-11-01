@@ -378,23 +378,8 @@ fn invalidate_funcall_cell() {
     }
 }
 
-// Captured lexical locations are process-wide, just like function identities.
-type ClosureEnvironments = SharedCell<HashMap<u32, Arc<FrameCell>, egcl_rt::fxhash::FxBuildHasher>>;
-
-fn closure_envs() -> &'static ClosureEnvironments {
-    static ENVS: std::sync::OnceLock<ClosureEnvironments> = std::sync::OnceLock::new();
-    ENVS.get_or_init(|| SharedCell::new(HashMap::default()))
-}
-
-type ClosureControl = (Vec<(String, String)>, Vec<(String, String)>);
-
-fn closure_controls()
--> &'static SharedCell<HashMap<u32, ClosureControl, egcl_rt::fxhash::FxBuildHasher>> {
-    static CONTROLS: std::sync::OnceLock<
-        SharedCell<HashMap<u32, ClosureControl, egcl_rt::fxhash::FxBuildHasher>>,
-    > = std::sync::OnceLock::new();
-    CONTROLS.get_or_init(|| SharedCell::new(HashMap::default()))
-}
+// A closure's captured frame and exit scope live on its function object
+// (`closure_templates::ClosureState`), not in tables keyed by identity.
 
 /// Private closure symbols have immutable executable bodies. Keep the same
 /// body allocation alive and GC-visible when another thread calls the closure;
@@ -649,6 +634,13 @@ unsafe fn trace_bytecode_graph(
             trace_bytecode_graph(Arc::as_ptr(nested) as *mut BytecodeFunction, visit, seen);
         }
     }
+    // A live body keeps the code identity of the template it is: the symbol
+    // reaches its prototype, which owns the compiled code and tiering state.
+    // Only a cell validated in this pinned-function epoch names a prototype
+    // that is certainly still allocated.
+    if let Some((_, symbol)) = function.closure_template.current() {
+        egcl_rt::symbols::trace_symbol_index(symbol, visit);
+    }
     trace_lexical_keys(&function.code, &function.names, visit);
     for (key, _) in &function.param_layout {
         lexical_identity::trace(key, visit);
@@ -696,13 +688,10 @@ fn trace_private_function_roots(
     });
     egcl_rt::symbols::trace_symbol_index(symbol, visit);
     // Named definitions have ordinary global owners. Private calls can
-    // outlive the heap function object from which they were compiled.
+    // outlive the heap function object from which they were compiled. A
+    // captured frame belongs to that object, which the activation retains.
     let body = closure_bodies().borrow().get(&symbol).cloned();
     if let Some(body) = body {
-        let frame = closure_envs().borrow().get(&symbol).cloned();
-        if let Some(frame) = frame {
-            super::visit_env_frame_roots(&frame, &mut super::EnvRootVisitState::default(), visit);
-        }
         unsafe { trace_bytecode_graph(Arc::as_ptr(&body) as *mut BytecodeFunction, visit, seen) };
     }
 }
@@ -710,7 +699,6 @@ fn trace_private_function_roots(
 fn scan_bytecode_roots(visit: &mut dyn FnMut(*mut EgclVal)) {
     // SAFETY: the collector stopped every execution, including suspended fibers.
     unsafe {
-        closure_templates::clear_for_collection();
         call_table::scan(visit);
         #[cfg(all(target_arch = "x86_64", unix))]
         call_table_funcall::scan_contexts(visit);
@@ -886,14 +874,50 @@ fn note_private_closure_published() {
     }
 }
 
+/// Account for a closure instance that owns host state (bliss-gg3i1.7.15.3).
+/// Instances publish no identity, but a dead one keeps its captured frame
+/// until the major collection that frees it, so sample the host-memory
+/// ledger every few hundred instances and request that collection on the
+/// same growth budget as published identities. Pinned function regions
+/// request it by heap occupancy as well (`gc::alloc_pinned_typed`).
+fn note_closure_instance_state() {
+    use std::sync::atomic::Ordering;
+    static INSTANCES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    if INSTANCES.fetch_add(1, Ordering::Relaxed) % 256 != 255 {
+        return;
+    }
+    if !egcl_rt::host_memory::tracking_active() {
+        return;
+    }
+    let live_bytes = private_host_live_bytes();
+    if PRIVATE_HOST_PRESSURE.growth_requests_major(live_bytes) {
+        egcl_rt::gc::request_major_gc();
+        if std::env::var_os("EGCL_GC_CENSUS").is_some() {
+            let baseline = PRIVATE_HOST_PRESSURE.baseline.load(Ordering::Relaxed);
+            let budget = (baseline / 2).clamp(MIN_PRIVATE_HOST_GROWTH, MAX_PRIVATE_HOST_GROWTH);
+            eprintln!(
+                "[GC-CENSUS] request-major reason=host-bytes live={live_bytes} baseline={baseline} growth-budget={budget} source=closure-instances"
+            );
+        }
+    }
+}
+
 fn sweep_function_captures(names: &[EgclVal]) {
     use std::sync::atomic::Ordering;
     sweep_dead_function_captures(names);
+    // The collection may have freed pinned functions and advanced the epoch.
+    // A template that survived it keeps a live prototype: revalidate its
+    // cell, so its live body keeps tracing the template (and its compiled
+    // code) even if no instance is made before the next collection.
+    for (&symbol, body) in closure_bodies().borrow().iter() {
+        if let Some((prototype, template)) = body.closure_template.candidate()
+            && template == symbol
+        {
+            body.closure_template.publish(prototype, symbol);
+        }
+    }
     // Rearm the major-collection request from this sweep's survivors.
-    let live = closure_bodies()
-        .borrow()
-        .len()
-        .max(closure_envs().borrow().len());
+    let live = closure_bodies().borrow().len();
     PRIVATE_CLOSURE_MAJOR_BUDGET.store(
         live.max(MIN_PRIVATE_CLOSURE_MAJOR_BUDGET),
         Ordering::Relaxed,
@@ -945,7 +969,9 @@ fn sweep_dead_function_captures(names: &[EgclVal]) {
                         // The original instance may have been removed during
                         // an earlier major. Remember its code ID explicitly;
                         // closure_bodies no longer necessarily contains it.
-                        if !callables.contains(&state.owner) {
+                        if !callables.contains(&state.owner)
+                            && !is_closure_template_symbol(state.owner)
+                        {
                             retire_code.insert(state.owner);
                         }
                         false
@@ -990,12 +1016,6 @@ fn sweep_dead_function_captures(names: &[EgclVal]) {
     if dead.is_empty() && retire_code.is_empty() {
         return;
     }
-    closure_envs()
-        .borrow_mut()
-        .retain(|symbol, _| !dead.contains(symbol));
-    closure_controls()
-        .borrow_mut()
-        .retain(|symbol, _| !dead.contains(symbol));
     // Named definitions are invalidated by FMAKUNBOUND/redefinition. Only
     // private closure code is owned solely by the collected function objects.
     dead.retain(|&symbol| egcl_rt::symbols::is_uninterned(symbol));
@@ -1217,10 +1237,35 @@ fn closure_body_has_acyclic_owner_lease(body: &BytecodeFunction) -> bool {
     })
 }
 
-fn trace_function_captures(name: EgclVal, visit: &mut dyn FnMut(*mut EgclVal)) {
-    let Some(symbol) = name.symbol_index() else {
+/// The collector's hook for one live interpreted function object: its own
+/// closure state, then (except for a closure instance) the bytecode its name
+/// and definition symbol own. An instance reaches its template's body through
+/// the prototype, so a template body is traced once per collection however
+/// many instances are live (bliss-gg3i1.7.15.3).
+fn trace_function_captures(function: EgclVal, visit: &mut dyn FnMut(*mut EgclVal)) {
+    // SAFETY: the collector passes a live FUNCTION_INTERPRETED object.
+    let word = unsafe { egcl_rt::function::closure_state(function) };
+    if word != 0 {
+        // SAFETY: a nonzero word is the object's live closure state.
+        let state = unsafe { &*(word as *const closure_templates::ClosureState) };
+        if let Some(frame) = &state.frame {
+            super::visit_env_frame_roots(frame, &mut super::EnvRootVisitState::default(), visit);
+        }
+    }
+    if egcl_rt::function::is_closure_instance(function) {
         return;
-    };
+    }
+    let name = egcl_rt::function::name(function).symbol_index();
+    let definition = egcl_rt::function::definition_index(function);
+    if let Some(name) = name {
+        trace_definition_captures(name, visit);
+    }
+    if definition != 0 && Some(definition) != name {
+        trace_definition_captures(definition, visit);
+    }
+}
+
+fn trace_definition_captures(symbol: u32, visit: &mut dyn FnMut(*mut EgclVal)) {
     with_traced_callables(|traced| {
         traced.insert(symbol);
     });
@@ -1228,10 +1273,6 @@ fn trace_function_captures(name: EgclVal, visit: &mut dyn FnMut(*mut EgclVal)) {
     if let Some(body) = body {
         mark_semantic_bytecode_body(&body);
         unsafe { trace_bytecode_function(Arc::as_ptr(&body) as *mut BytecodeFunction, visit) };
-    }
-    let frame = closure_envs().borrow().get(&symbol).cloned();
-    if let Some(frame) = frame {
-        super::visit_env_frame_roots(&frame, &mut super::EnvRootVisitState::default(), visit);
     }
 }
 
@@ -1266,17 +1307,26 @@ pub(super) fn shake_dependencies() -> HashMap<u32, Vec<(EgclVal, bool)>> {
         );
         edges.insert(symbol, refs);
     }
-    for (&symbol, frame) in closure_envs().borrow().iter() {
-        // A shared frame contributes an edge to EACH owner. Deduplicating
-        // across owners would lose the captures if the first owner is dead.
-        let mut state = super::EnvRootVisitState::default();
-        let refs = edges.entry(symbol).or_default();
-        super::visit_env_frame_roots(frame, &mut state, &mut |slot| {
-            // SAFETY: the frame visitor supplies live slots under the snapshot.
-            refs.push((unsafe { *slot }, true));
-        });
-    }
+    // Captured frames belong to function objects; the shake walk reaches them
+    // through `closure_state_values` when it visits each callable.
     edges
+}
+
+/// The values a function object's captured frame holds, as shake edges.
+/// Only in a heap snapshot, without Lisp allocation.
+pub(super) fn closure_state_values(function: EgclVal, mut edge: impl FnMut(EgclVal)) {
+    closure_templates::with_state(function, |state| {
+        if let Some(frame) = &state.frame {
+            super::visit_env_frame_roots(
+                frame,
+                &mut super::EnvRootVisitState::default(),
+                &mut |slot| {
+                    // SAFETY: the frame visitor supplies live slots.
+                    edge(unsafe { *slot });
+                },
+            );
+        }
+    });
 }
 
 /// A saved callable is independent of source evaluation only if its entire
@@ -1331,10 +1381,12 @@ pub(super) fn remove_shake_closure(symbol: u32) {
     debug_assert!(egcl_rt::symbols::is_uninterned(symbol));
     // A compiled method keeps its callable in this cell (#413); a pruned one
     // must not carry it into the saved image.
+    if let Some(function) = egcl_rt::symbols::symbol_function(symbol) {
+        closure_templates::clear_state(function);
+    }
     egcl_rt::symbols::set_symbol_function(symbol, egcl_rt::value::UNBOUND);
     closure_bodies().remove(&symbol);
     clear_lazy_state(symbol);
-    clear_closure_env(symbol);
 }
 
 pub(super) fn shake_root_scanner() -> egcl_rt::gc::RootScanner {
@@ -1346,6 +1398,7 @@ fn install_bytecode_root_scanner() {
     INSTALL.call_once(|| {
         egcl_rt::gc::register_root_scanner(scan_bytecode_roots);
         egcl_rt::gc::set_function_capture_trace_fn(trace_function_captures);
+        egcl_rt::gc::set_closure_state_release_fn(closure_templates::release_state);
         super::remembered_captures::install();
         egcl_rt::gc::set_function_capture_sweep_fn(sweep_function_captures);
     });
@@ -1826,7 +1879,6 @@ fn registry_remove(sym: u32) {
     };
     install_local_definition(sym, None, generation);
     bump_direct_call_gen_for(sym); // invalidate baked direct-call targets (bliss-zhvn)
-    closure_controls().borrow_mut().remove(&sym);
 }
 
 /// Refresh only the receiving execution. Reading a shared definition must not
@@ -9166,6 +9218,7 @@ fn compile_local_function(
         max_args,
         variadic,
         binder_cache: Default::default(),
+        closure_template: Default::default(),
     })
 }
 
@@ -9292,6 +9345,7 @@ fn compile_capturing_local(
         max_args,
         variadic,
         binder_cache: Default::default(),
+        closure_template: Default::default(),
     })
 }
 
@@ -9993,6 +10047,7 @@ fn compile_restart_clause(
         max_args,
         variadic,
         binder_cache: Default::default(),
+        closure_template: Default::default(),
     })
 }
 
@@ -11408,6 +11463,7 @@ fn compile_function_forcing_boxed(
         max_args,
         variadic,
         binder_cache: Default::default(),
+        closure_template: Default::default(),
     };
 
     // Turn a self-tail call into a jump back to the entry (bliss-ieajy.3). Done
@@ -11877,6 +11933,7 @@ fn compile_thunk_forcing_boxed(
         max_args: Some(0),
         variadic: false,
         binder_cache: Default::default(),
+        closure_template: Default::default(),
     })
 }
 
@@ -16436,6 +16493,7 @@ fn decode_bbu_function(
         max_args: (encoded.arity_max != u16::MAX).then_some(encoded.arity_max),
         variadic,
         binder_cache: Default::default(),
+        closure_template: Default::default(),
     })
 }
 
@@ -16450,71 +16508,54 @@ fn installed_lambda_list(arity: u16) -> EgclVal {
     vec_to_list(&params)
 }
 
-/// Snapshot the lexical block/tag scope for a freshly-created bytecode closure so
-/// its non-local exits resolve lexically (bliss-4u5u). `closure` is the
-/// interpreted-function object returned by [`make_bytecode_closure`]; its name is
-/// the closure's private uninterned symbol. Only records a non-empty scope.
-fn register_closure_control(closure: EgclVal, env: &Env) {
-    if env.block_stack.is_empty() && env.tag_stack.is_empty() {
-        return;
-    }
-    let name = egcl_rt::function::name(closure);
-    if !name.is_symbol() {
-        return;
-    }
-    let sym_idx = name.as_symbol_index();
-    let blocks = env.block_stack.clone();
-    let tags = env.tag_stack.clone();
-    closure_controls()
-        .borrow_mut()
-        .insert(sym_idx, (blocks, tags));
-}
-
 /// The captured lexical block/tag scope for a closure, if any. Callers install it
 /// as the callee's `env.block_stack`/`env.tag_stack` on entry.
 fn closure_captured_control(fn_val: EgclVal) -> Option<super::LexicalExitNames> {
-    if !fn_val.is_heap_object() || !egcl_rt::function::is_interpreted_function(fn_val) {
-        return None;
-    }
-    let name = egcl_rt::function::name(fn_val);
-    if !name.is_symbol() {
-        return None;
-    }
-    closure_controls()
-        .borrow()
-        .get(&name.as_symbol_index())
-        .cloned()
+    closure_templates::with_state(fn_val, |state| state.control.clone()).flatten()
 }
 
-/// The heap environment an env-capturing closure was created in, if any.
+/// Whether a closure carries a captured block/tag scope.
+fn has_captured_control(fn_val: EgclVal) -> bool {
+    closure_templates::with_state(fn_val, |state| state.control.is_some()).unwrap_or(false)
+}
+
+/// The heap environment an env-capturing closure was created in, if any: a
+/// field of the function object (bliss-gg3i1.7.15.3).
 pub(super) fn closure_captured_env(fn_val: EgclVal) -> Option<Arc<FrameCell>> {
     // Native call adapters and whole-function deoptimization can enter with
     // a symbol designator; ordinary dispatch passes the function object.
-    let symbol = if let Some(symbol) = fn_val.symbol_index() {
-        if let Some(function) = egcl_rt::symbols::symbol_function(symbol)
-            .filter(|&f| egcl_rt::function::is_interpreted_function(f))
-        {
-            egcl_rt::function::definition_index(function)
-        } else {
-            symbol
-        }
-    } else if fn_val.is_heap_object() && egcl_rt::function::is_interpreted_function(fn_val) {
-        egcl_rt::function::definition_index(fn_val)
-    } else {
-        return None;
+    let function = match fn_val.symbol_index() {
+        Some(symbol) => egcl_rt::symbols::symbol_function(symbol)?,
+        None => fn_val,
     };
-    closure_envs().borrow().get(&symbol).cloned()
+    closure_templates::with_state(function, |state| state.frame.clone()).flatten()
 }
 
-/// Record the captured heap frame owned by a function's private definition
-/// identity `sym_idx`. Used when a tree-walker closure `(EGCL::CLOSURE . id)`
-/// is reified into an interpreted-function object (e.g. installed via `(setf
-/// (symbol-function s) (lambda …))` that captures enclosing lexicals): the object
-/// then reaches those lexicals through the same `CLOSURE_ENV` channel the
-/// bytecode `MakeClosure` path uses (bliss-jtc.23.3).
-pub(super) fn register_closure_env(sym_idx: u32, frame: Arc<FrameCell>) {
-    install_bytecode_root_scanner();
-    closure_envs().borrow_mut().insert(sym_idx, frame);
+/// Whether `sym` is a closure template's symbol: its function cell holds the
+/// template prototype.
+fn is_closure_template_symbol(sym: u32) -> bool {
+    egcl_rt::symbols::is_uninterned(sym)
+        && egcl_rt::symbols::symbol_function(sym)
+            .is_some_and(egcl_rt::function::is_closure_template)
+}
+
+/// Whether a direct call to `sym` could enter an object with closure state:
+/// its current function owns one, or it is a closure template whose
+/// instances may. Such a callee needs the callable on entry.
+fn callee_may_own_closure_state(sym: u32) -> bool {
+    egcl_rt::symbols::symbol_function(sym).is_some_and(|function| {
+        egcl_rt::function::is_closure_template(function)
+            || closure_templates::with_state(function, |_| ()).is_some()
+    })
+}
+
+/// Record the captured heap frame of a function object made outside
+/// `MakeClosure`: a tree-walker closure reified into an interpreted-function
+/// object (e.g. installed via `(setf (symbol-function s) (lambda …))`), or a
+/// DEFUN nested in a binding form. The object then reaches those lexicals
+/// through the same channel bytecode closures use (bliss-jtc.23.3).
+pub(super) fn register_closure_env(function: EgclVal, frame: Arc<FrameCell>) {
+    closure_templates::attach_state(function, Some(frame), None);
 }
 
 /// Prepare an independently constructed private heap callable before allocating
@@ -16523,50 +16564,35 @@ pub(super) fn prepare_private_closure_allocation() {
     collect_requested_major_before_closure();
 }
 
-/// Publish captures owned by an already rooted heap function, without binding
-/// its private symbol's global function cell. The normal callable-root bridge
-/// traces this frame and releases it when the callable (including self cycles)
-/// dies. Account for bodyless interpreted closures in the same host budget.
+/// Attach captures to an already rooted heap function, without binding its
+/// private symbol's global function cell. The object owns the frame and
+/// releases it when it dies. Account for bodyless interpreted closures in the
+/// same host budget.
 pub(super) fn register_private_closure_env(function: EgclVal, frame: Arc<FrameCell>) {
-    register_closure_env(egcl_rt::function::definition_index(function), frame);
+    register_closure_env(function, frame);
     note_private_closure_published();
 }
 
-/// Drop captures when delivery removes an unreachable private definition.
-pub(super) fn clear_closure_env(sym_idx: u32) {
-    closure_envs().borrow_mut().remove(&sym_idx);
-    closure_controls().borrow_mut().remove(&sym_idx);
-}
-
-/// Snapshot the CLOSURE_ENV table for core-image serialization (bliss-zz6w).
-pub(super) fn closure_env_entries() -> Vec<(u32, Arc<FrameCell>)> {
-    closure_envs()
-        .borrow()
-        .iter()
-        .map(|(k, v)| (*k, Arc::clone(v)))
-        .collect()
-}
-
-/// Snapshot the CLOSURE_CONTROL table for core-image serialization.
+/// Every function object's captured frame and exit scope, for core-image
+/// serialization (bliss-zz6w). Mutators must be stopped.
 #[allow(clippy::type_complexity)]
-pub(super) fn closure_control_entries() -> Vec<(u32, (Vec<(String, String)>, Vec<(String, String)>))>
-{
-    closure_controls()
-        .borrow()
-        .iter()
-        .map(|(k, v)| (*k, v.clone()))
-        .collect()
+pub(super) fn closure_state_entries() -> Vec<(
+    EgclVal,
+    Option<Arc<FrameCell>>,
+    Option<super::LexicalExitNames>,
+)> {
+    closure_templates::state_entries()
 }
 
-/// Install a restored block/tag scope snapshot for a closure (core restore).
-pub(super) fn install_closure_control(
-    sym_idx: u32,
-    blocks: Vec<(String, String)>,
-    tags: Vec<(String, String)>,
+/// Reattach a restored function object's captured frame and exit scope.
+pub(super) fn restore_closure_state(
+    function: EgclVal,
+    frame: Option<Arc<FrameCell>>,
+    control: Option<super::LexicalExitNames>,
 ) {
-    closure_controls()
-        .borrow_mut()
-        .insert(sym_idx, (blocks, tags));
+    if egcl_rt::function::is_interpreted_function(function) {
+        closure_templates::attach_state(function, frame, control);
+    }
 }
 
 /// Run the major collection a previous allocation requested, if any, before
@@ -16579,115 +16605,40 @@ fn collect_requested_major_before_closure() {
     let _ = egcl_rt::gc::collect_if_major_requested();
 }
 
-/// Materialize a callable value for a nested-lambda `MakeClosure`. Each
-/// evaluation yields a distinct function identity: a fresh uninterned symbol
-/// whose bytecode body is registered, wrapped in an interpreted-function object.
-/// The tree-walker's `apply_function` then dispatches it through the ordinary
-/// registered-bytecode path, so the closure is callable by
-/// `funcall`/`apply`/`mapcar`/`reduce` exactly like any global. When
-/// `captured_env` is `Some`, the closure records that heap frame so its body can
-/// read and write the enclosing lexical bindings (portable `flet`/`labels`).
+/// Materialize a fresh callable value for nested lambda `nested`: an instance
+/// of its closure template (see `closure_templates`). The tree-walker's
+/// `apply_function` dispatches it through the ordinary registered-bytecode
+/// path, so it is callable by `funcall`/`apply`/`mapcar`/`reduce` exactly like
+/// any global. When `captured_env` is `Some`, the closure owns that heap frame
+/// so its body can read and write the enclosing lexical bindings (portable
+/// `flet`/`labels`). Always a distinct object.
 pub(super) fn make_bytecode_closure(
     nested: &Arc<BytecodeFunction>,
     captured_env: Option<Arc<FrameCell>>,
 ) -> EgclVal {
-    make_prepared_bytecode_closure(nested, captured_env, false, false).0
+    closure_templates::make_instance(nested, captured_env, None, false)
 }
 
-/// Production MakeClosure may share a function only when neither lexical cells
-/// nor lexical control tokens belong to the creating activation. The fresh API
-/// above remains available to callers that explicitly require a new identity.
+/// Production MakeClosure. A closure that owns no lexical cells and no lexical
+/// control tokens of the creating activation is the template's shared
+/// prototype; any other is a fresh instance owning exactly that state.
 fn make_template_closure(
     nested: &Arc<BytecodeFunction>,
     captured_env: Option<Arc<FrameCell>>,
     env: &Env,
 ) -> EgclVal {
-    let reuse = captured_env.is_none();
-    let (closure, control_free) = make_prepared_bytecode_closure(nested, captured_env, reuse, true);
     // A body with no free control exit (bliss-uebgs) never consults the
     // block/tag scope it was created in, whether or not it captures lexical
     // cells: the snapshot only resolves its own ReturnFromNamed/GoNamed and
-    // those of closures it creates. Capturing closures used to snapshot it
-    // unconditionally, cloning the creator's whole scope on every creation
-    // and keeping the instance off the native call fast paths, which refuse
-    // a callable with captured control (bliss-gg3i1.7.12).
-    if !control_free {
-        register_closure_control(closure, env);
-    }
-    closure
-}
-
-fn make_prepared_bytecode_closure(
-    nested: &Arc<BytecodeFunction>,
-    captured_env: Option<Arc<FrameCell>>,
-    reuse: bool,
-    analyze_control: bool,
-) -> (EgclVal, bool) {
-    egcl_rt::rooted!(_nested_roots = ActiveBytecodeRoot::new(nested));
-    // The caller need not expose this frame through an active activation yet.
-    // Own a precise root before pending-major or preparation allocations.
-    egcl_rt::rooted!(
-        _capture_root = captured_env
-            .as_ref()
-            .map(|frame| { super::SuspendedFrameRoot(Arc::clone(frame)) })
-    );
-    #[cfg(test)]
-    closure_templates::collect_during_preparation_for_test();
-    // MakeClosure remains a cooperation opportunity even on allocation-free
-    // hits: native loop polling may count this helper as its safepoint. Native
-    // callers already publish precise roots here for the allocating path.
-    egcl_rt::safepoint::poll_safepoint();
-    collect_requested_major_before_closure();
-    let cached = closure_templates::lookup(nested);
-    // Fresh construction needs no control analysis. Keep the uncached
-    // comparison free of work introduced solely to justify reuse or to skip
-    // the control snapshot; a template caller asks for it explicitly.
-    let control_free = cached
-        .and_then(|p| p.control_free)
-        .or_else(|| analyze_control.then(|| !bf_has_free_control_exit(nested)));
-    let reusable = reuse && captured_env.is_none() && control_free == Some(true);
-    if reusable && let Some(callable) = cached.and_then(|p| p.callable) {
-        let name = egcl_rt::function::name(callable);
-        let index = name.as_symbol_index();
-        if registry_get(index).is_some_and(|body| Arc::ptr_eq(&body, nested))
-            && egcl_rt::symbols::symbol_function(index)
-                .is_none_or(|value| value == callable || value == egcl_rt::value::UNBOUND)
-        {
-            return (callable, true);
-        }
-    }
-    egcl_rt::rooted!(lambda_list = cached.map_or(NIL, |p| p.lambda_list));
-    egcl_rt::rooted!(name = cached.map_or(NIL, |p| p.name));
-    if cached.is_none() {
-        *lambda_list = if nested.variadic {
-            nested.params_form
-        } else {
-            installed_lambda_list(nested.arity)
-        };
-        *name = arena_str("CLOSURE");
-    }
-    egcl_rt::rooted!(sym = egcl_rt::symbols::make_uninterned_with_name(*name));
-    let sym_idx = sym.as_symbol_index();
-    egcl_rt::rooted!(_callable_root = ActiveCallableRoot(sym_idx));
-    publish_fresh_private_bytecode(sym_idx, Arc::clone(nested));
-    closure_bodies().insert(sym_idx, Arc::clone(nested));
-    if let Some(frame) = captured_env {
-        closure_envs().borrow_mut().insert(sym_idx, frame);
-    }
-    let closure = egcl_rt::function::alloc_interpreted(*lambda_list, NIL, NIL, *sym);
-    #[cfg(test)]
-    method_context_use::helper_values::record_creation(nested);
-
-    closure_templates::remember(
-        nested,
-        closure_templates::Prepared {
-            lambda_list: *lambda_list,
-            name: *name,
-            control_free,
-            callable: reusable.then_some(closure),
-        },
-    );
-    (closure, control_free == Some(true))
+    // those of closures it creates. Snapshotting it unconditionally cloned
+    // the creator's whole scope on every creation and kept the instance off
+    // the native call fast paths, which refuse a callable with captured
+    // control (bliss-gg3i1.7.12).
+    let control_free = closure_templates::control_free(nested);
+    let scope_empty = env.block_stack.is_empty() && env.tag_stack.is_empty();
+    let control =
+        (!control_free && !scope_empty).then(|| (env.block_stack.clone(), env.tag_stack.clone()));
+    closure_templates::make_instance(nested, captured_env, control, control_free)
 }
 
 /// Lazy (deferred) compilation of top-level DEFUNs (bliss-x5y). Eagerly
@@ -17558,19 +17509,19 @@ pub(super) fn compile_tree_closure(
     egcl_rt::rooted!(_bytecode_root = ActiveBytecodeRoot::new(&bf));
     // Short-lived closures only die in a major collection (bliss-5ndk).
     collect_requested_major_before_closure();
+    egcl_rt::rooted!(_frame_root = super::SuspendedFrameRoot(Arc::clone(&frame)));
     let sym = egcl_rt::symbols::make_uninterned("CLOSURE");
     let sym_idx = sym.as_symbol_index();
     closure_bodies().insert(sym_idx, Arc::clone(&bf));
     registry_put(sym_idx, Arc::clone(&bf));
-    closure_envs().borrow_mut().insert(sym_idx, frame);
-    if !blocks.is_empty() || !tags.is_empty() {
-        closure_controls()
-            .borrow_mut()
-            .insert(sym_idx, (blocks.to_vec(), tags.to_vec()));
-    }
     // Keep the source as the object's fallback body, as a reified method does.
     let function =
         egcl_rt::function::alloc_interpreted(*source_lambda_list, *source_body, NIL, sym);
+    closure_templates::attach_state(
+        function,
+        Some(frame),
+        (!blocks.is_empty() || !tags.is_empty()).then(|| (blocks.to_vec(), tags.to_vec())),
+    );
     // The tiering counters are found through the private symbol's function
     // cell (see compile_and_reify_lambda); nothing can name the symbol.
     egcl_rt::symbols::set_symbol_function(sym_idx, function);
@@ -25584,7 +25535,9 @@ static CLOSURE_COMPILATION: egcl_rt::execution_local::ExecutionLocal<
 /// Select a live, unpinned instance to own this execution's compiled version.
 /// Callers still enter run_native with the actual instance identity.
 fn closure_compilation_owner(sym: u32, count: u32) -> (u32, u32) {
-    if !egcl_rt::symbols::is_uninterned(sym) {
+    if !egcl_rt::symbols::is_uninterned(sym) || is_closure_template_symbol(sym) {
+        // A closure template's symbol owns its code for every instance, and
+        // the instances' counters are its prototype's (bliss-gg3i1.7.15.3).
         return (sym, count);
     }
     let Some(body) = closure_bodies().borrow().get(&sym).cloned() else {
@@ -26960,9 +26913,7 @@ fn direct_native_targets(
             .param_types
             .iter()
             .all(|t| matches!(t, DeclaredType::Any));
-        let not_closure = !cbf.has_env
-            && closure_captured_env(EgclVal::from_symbol_index(callee)).is_none()
-            && !closure_controls().borrow().contains_key(&callee);
+        let not_closure = !cbf.has_env && !callee_may_own_closure_state(callee);
         if replacement_function(callee).is_none()
             && native_transfer_abi_compatible(&cnc)
             // A deopting T2 callee resumes T0 inline on s390x and returns a
@@ -27436,7 +27387,16 @@ fn native_for_dispatch(
     }
     egcl_rt::rooted!(fn_obj = fn_obj);
     let caller_sym = sym;
-    let (owner, invoke_count) = closure_compilation_owner(sym, invoke_count);
+    // Every instance of a closure template names the template symbol, and
+    // their counters are the prototype's: the template owns its compilation.
+    let (owner, invoke_count) = if fn_obj.is_some_and(|function| {
+        egcl_rt::function::is_closure_instance(function)
+            || egcl_rt::function::is_closure_template(function)
+    }) {
+        (sym, invoke_count)
+    } else {
+        closure_compilation_owner(sym, invoke_count)
+    };
     // A private representative has no public function cell to publish into.
     if owner != sym {
         *fn_obj = None;
@@ -27918,9 +27878,9 @@ fn run_native_callable(
     }
     // Install this callee's lexical BLOCK/TAGBODY scope (fresh for a top-level
     // defun; the captured scope for a closure) and restore the caller's on every
-    // exit via the guard (bliss-4u5u). Mirrors `run_with_binding`; closure scope
-    // is keyed by the closure's own symbol, this activation's `sym`.
-    let (saved_blocks, saved_tags) = match closure_controls().borrow().get(&sym).cloned() {
+    // exit via the guard (bliss-4u5u). Mirrors `run_with_binding`; the scope
+    // belongs to the callable object itself.
+    let (saved_blocks, saved_tags) = match closure_captured_control(*function) {
         Some((blocks, tags)) => (
             std::mem::replace(&mut env.block_stack, blocks),
             std::mem::replace(&mut env.tag_stack, tags),
@@ -29120,9 +29080,7 @@ fn emit_native(
                             .param_types
                             .iter()
                             .all(|t| matches!(t, DeclaredType::Any));
-                        let not_closure = !cbf.has_env
-                            && closure_captured_env(EgclVal::from_symbol_index(*sym)).is_none()
-                            && !closure_controls().borrow().contains_key(sym);
+                        let not_closure = !cbf.has_env && !callee_may_own_closure_state(*sym);
                         // !has_deopt: a callee with no speculation-guard deopt
                         // point never mid-flight resumes to T0, so a direct call
                         // needs no post-call deopt handling. Pending errors are
@@ -31895,15 +31853,10 @@ fn maybe_mapped_osr(
         return decline();
     }
     egcl_rt::rooted!(fn_obj = Some(fn_obj));
-    // A closure instance a `(lambda ...)` evaluation made has a private symbol
-    // whose function cell stays empty; its registry entry alone names its body
-    // (bliss-of682). Instances of one template share one compiled version,
-    // installed under the template's compilation owner, which may be another
-    // instance -- the code `native_for_dispatch` would run this call in.
+    // A closure instance names its template's private symbol, whose function
+    // cell holds the template prototype rather than this instance; the
+    // registry names the shared body (bliss-of682, bliss-gg3i1.7.15.3).
     let closure = egcl_rt::symbols::is_uninterned(sym)
-        && egcl_rt::symbols::symbol_function(sym)
-            .filter(|&value| egcl_rt::function::is_interpreted_function(value))
-            .is_none()
         && egcl_rt::function::definition_index(fn_obj.unwrap()) == sym
         && closure_bodies()
             .borrow()
@@ -33493,7 +33446,10 @@ mod direct_call_invalidation_tests {
         })
         .expect("install callback T2");
         assert!(native.is_t2);
-        let mut invoke = |argument| run_native(&native, symbol, &[argument], &mut env);
+        // Captures live on the instance, so enter with the callable itself.
+        let callable = *callback;
+        let mut invoke =
+            |argument| run_native_callable(&native, symbol, callable, &[argument], &mut env);
         assert_eq!(
             invoke(EgclVal::from_fixnum(2)).unwrap(),
             EgclVal::from_fixnum(12)
@@ -35207,18 +35163,18 @@ mod active_bytecode_root_tests {
         let old = background_t1::wait(a).unwrap();
         let shared = native_for_dispatch(b, None, 1, &body).unwrap();
         assert!(Rc::ptr_eq(&old, &shared));
+        // Instances share the template's identity (bliss-gg3i1.7.15.3), so a
+        // profiler pin covers every instance of the template.
+        assert_eq!(a, b);
+        // Pinning retires the installed version for every instance.
         profile_pin(b);
-        assert!(native_for_dispatch(b, None, 1, &body).is_none());
-        assert!(Rc::ptr_eq(
-            &old,
-            &native_for_dispatch(a, None, 1, &body).unwrap()
-        ));
-        profile_pin(a);
+        assert!(native_for_dispatch(a, None, u32::MAX, &body).is_none());
         profile_unpin(b);
+        // Recompile; a deopt of the obsolete version must not decay the
+        // replacement's feedback.
         native_for_dispatch(b, None, t1_threshold(), &body);
         let replacement = background_t1::wait(b).unwrap();
         assert!(!Rc::ptr_eq(&old, &replacement));
-        assert!(native_for_dispatch(a, None, u32::MAX, &body).is_none());
         assert!(PROMOTED_FRESH.with(|set| set.borrow().contains(&b)));
         note_native_deopt(b, Some(&old), None);
         assert!(
@@ -35230,7 +35186,6 @@ mod active_bytecode_root_tests {
             Some(0)
         );
         assert!(NATIVE_REGISTRY.with(|codes| Rc::ptr_eq(&replacement, &codes.borrow()[&b])));
-        profile_unpin(a);
         assert!(Rc::ptr_eq(
             &replacement,
             &native_for_dispatch(a, None, 1, &body).unwrap()
@@ -35295,23 +35250,14 @@ mod active_bytecode_root_tests {
         egcl_rt::rooted!(dead = make_bytecode_closure(&body, Some(captured)));
         let live_symbol = egcl_rt::function::name(*live).as_symbol_index();
         let dead_symbol = egcl_rt::function::name(*dead).as_symbol_index();
-        // Construct the shared ownership graph explicitly, independently of
-        // whether MakeClosure already retains or copies its template.
-        for symbol in [live_symbol, dead_symbol] {
-            registry_put(symbol, Arc::clone(&body));
-            closure_bodies().insert(symbol, Arc::clone(&body));
-        }
+        // Instances share their template's code identity (bliss-gg3i1.7.15.3).
+        assert_eq!(live_symbol, dead_symbol);
         let profile_key = Arc::as_ptr(&body) as usize;
         record_type_profile(profile_key, 0, &[EgclVal::from_fixnum(1)]);
         drop(dead);
         env.mv.clear();
         egcl_rt::gc::full_gc().unwrap();
         assert!(is_registered(live_symbol));
-        assert!(
-            !is_registered(dead_symbol),
-            "a sibling's live code is not an instance root"
-        );
-        assert!(!closure_envs().borrow().contains_key(&dead_symbol));
         assert!(
             weak_capture.upgrade().is_none(),
             "the dead environment must be released"
@@ -35350,11 +35296,16 @@ mod active_bytecode_root_tests {
             drop(closure);
             env.mv.clear();
             egcl_rt::gc::full_gc().unwrap();
-            assert!(!is_registered(symbol));
+            // A live template body keeps its code identity, though no
+            // instance survives (bliss-gg3i1.7.15.3).
+            assert!(is_registered(symbol));
             assert_eq!(type_profile_at(profile_key, 0).unwrap().fixnum, 1);
             assert_eq!(call_site_profile_snapshot(profile_key).1, vec![(7, 1)]);
             (profile_key, Arc::downgrade(&body), call_token)
         };
+        // Nothing traces the body any longer: its template dies, releasing
+        // the registrations that held it.
+        egcl_rt::gc::full_gc().unwrap();
         assert!(
             template.upgrade().is_none(),
             "the template allocation must actually die"

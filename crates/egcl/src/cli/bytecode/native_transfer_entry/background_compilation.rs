@@ -872,14 +872,18 @@ impl EmissionContext {
         let mut context = Self::capture(body, allow_recursion);
         // The actual publication identity is authoritative. A lambda's display
         // name may resolve to an unrelated interned symbol and proves nothing.
+        // A closure template's symbol owns its code for every instance; any
+        // other private owner must be its body's recorded compilation owner.
         context.private_noenv_callable_home = egcl_rt::symbols::is_uninterned(owner)
             && registry_get(owner).is_some_and(|current| Arc::ptr_eq(&current, body))
-            && CLOSURE_COMPILATION.with(|cache| {
-                cache
-                    .borrow()
-                    .get(&(Arc::as_ptr(body) as usize))
-                    .is_some_and(|state| state.owner == owner)
-            })
+            && (egcl_rt::symbols::symbol_function(owner)
+                .is_some_and(egcl_rt::function::is_closure_template)
+                || CLOSURE_COMPILATION.with(|cache| {
+                    cache
+                        .borrow()
+                        .get(&(Arc::as_ptr(body) as usize))
+                        .is_some_and(|state| state.owner == owner)
+                }))
             && private_noenv_callable_body(body);
         context
     }

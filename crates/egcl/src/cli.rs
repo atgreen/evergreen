@@ -1460,25 +1460,23 @@ fn coerce_installed_function(env: &Env, val: EgclVal) -> EgclVal {
             if let Some(closure) = closure {
                 egcl_rt::rooted!(original = val);
                 egcl_rt::rooted!(closure = closure);
-                // Give the object a fresh private name and record the closure's
-                // captured frame under it, mirroring the bytecode MakeClosure
+                // Give the object a fresh private name and attach the closure's
+                // captured frame to it, mirroring the bytecode MakeClosure
                 // path: the tree-walker call sites reparent the body's frame to
                 // this captured environment so a capturing closure installed via
                 // setf reaches its enclosing lexicals (bliss-jtc.23.3). A
                 // non-capturing closure simply never reads that frame.
                 let fresh = egcl_rt::symbols::make_uninterned("CLOSURE");
-                bytecode::register_closure_env(
-                    fresh.as_symbol_index(),
-                    Arc::clone(&closure.captured_frame),
-                );
                 // Symbol-name allocation may move the copied lambda list/body.
                 // The construction root above keeps this clone updated too.
-                return egcl_rt::function::alloc_interpreted(
+                let function = egcl_rt::function::alloc_interpreted(
                     closure.params_form,
                     closure.body,
                     *original,
                     fresh,
                 );
+                bytecode::register_closure_env(function, Arc::clone(&closure.captured_frame));
+                return function;
             }
         }
     }
@@ -3898,7 +3896,7 @@ fn host_serialize_registries() -> Vec<u8> {
     let (frame_ids, clsr_frames) = {
         let reg = closure_registry();
         let reg = reg.borrow();
-        let bc_env = bytecode::closure_env_entries();
+        let bc_env = bytecode::closure_state_entries();
         let method_frames: Vec<Arc<FrameCell>> = SAVE_METHODS.with(|m| {
             m.borrow().as_ref().map_or_else(Vec::new, |map| {
                 map.borrow()
@@ -3927,7 +3925,7 @@ fn host_serialize_registries() -> Vec<u8> {
             .values()
             .map(|c| Arc::clone(&c.captured_frame))
             .chain(captured_macro_frames)
-            .chain(bc_env.iter().map(|(_, f)| Arc::clone(f)))
+            .chain(bc_env.iter().filter_map(|(_, f, _)| f.clone()))
             .chain(method_frames)
             .chain(macro_frames)
             .chain(function_scopes.frames())
@@ -4203,7 +4201,7 @@ fn host_serialize_registries() -> Vec<u8> {
     {
         let reg = closure_registry();
         let reg = reg.borrow();
-        let bc_env = bytecode::closure_env_entries();
+        let bc_env = bytecode::closure_state_entries();
         // Ids and the frame list were assigned above the method block, which is
         // written earlier and needs them; reuse that single assignment so a frame
         // shared by a closure and a method gets ONE id (bliss-mxjr).
@@ -4254,23 +4252,30 @@ fn host_serialize_registries() -> Vec<u8> {
                 hr_put_str(&mut out, b);
             }
         }
-        // Bytecode-closure captured environments (CLOSURE_ENV): the frame the
-        // registered bytecode body reaches its enclosing lexicals through,
-        // keyed by the closure's image-stable uninterned symbol index.
-        out.extend_from_slice(&(bc_env.len() as u32).to_le_bytes());
-        for (sym, frame) in &bc_env {
-            out.extend_from_slice(&sym.to_le_bytes());
+        // Function-object closure state (bliss-gg3i1.7.15.3): the frame a
+        // closure's body reaches its enclosing lexicals through, keyed by the
+        // function object itself (a saved heap reference, remapped on load).
+        let bc_frames: Vec<_> = bc_env
+            .iter()
+            .filter_map(|(function, frame, _)| frame.as_ref().map(|frame| (function, frame)))
+            .collect();
+        out.extend_from_slice(&(bc_frames.len() as u32).to_le_bytes());
+        for (function, frame) in &bc_frames {
+            out.extend_from_slice(&function.to_raw().to_le_bytes());
             let fid = frame_ids
                 .get(&(Arc::as_ptr(frame) as usize))
                 .copied()
                 .unwrap_or(u32::MAX);
             out.extend_from_slice(&fid.to_le_bytes());
         }
-        // Bytecode-closure lexical block/tag scopes (CLOSURE_CONTROL).
-        let bc_ctl = bytecode::closure_control_entries();
+        // Each closure object's lexical block/tag scope.
+        let bc_ctl: Vec<_> = bc_env
+            .iter()
+            .filter_map(|(function, _, control)| control.as_ref().map(|c| (function, c)))
+            .collect();
         out.extend_from_slice(&(bc_ctl.len() as u32).to_le_bytes());
-        for (sym, (blocks, tags)) in &bc_ctl {
-            out.extend_from_slice(&sym.to_le_bytes());
+        for (function, (blocks, tags)) in &bc_ctl {
+            out.extend_from_slice(&function.to_raw().to_le_bytes());
             out.extend_from_slice(&(blocks.len() as u32).to_le_bytes());
             for (a, b) in blocks {
                 hr_put_str(&mut out, a);
@@ -4965,18 +4970,19 @@ fn host_restore_registries(data: &[u8]) -> Result<(), EgclError> {
                 },
             );
         }
-        // Bytecode-closure captured environments + block/tag scopes.
+        // Function-object closure state: captured frames + block/tag scopes,
+        // keyed by the saved function object.
         let n_bce = hr_get_u32(data, &mut off).ok_or_else(bad)? as usize;
         for _ in 0..n_bce {
-            let sym = hr_get_u32(data, &mut off).ok_or_else(bad)?;
+            let function = EgclVal::from_raw(remap(hr_get_u64(data, &mut off).ok_or_else(bad)?));
             let fid = hr_get_u32(data, &mut off).ok_or_else(bad)?;
             if let Some(frame) = frames.get(fid as usize) {
-                bytecode::register_closure_env(sym, Arc::clone(frame));
+                bytecode::restore_closure_state(function, Some(Arc::clone(frame)), None);
             }
         }
         let n_bcc = hr_get_u32(data, &mut off).ok_or_else(bad)? as usize;
         for _ in 0..n_bcc {
-            let sym = hr_get_u32(data, &mut off).ok_or_else(bad)?;
+            let function = EgclVal::from_raw(remap(hr_get_u64(data, &mut off).ok_or_else(bad)?));
             let n_blocks = hr_get_u32(data, &mut off).ok_or_else(bad)? as usize;
             let mut blocks = Vec::with_capacity(n_blocks);
             for _ in 0..n_blocks {
@@ -4991,7 +4997,7 @@ fn host_restore_registries(data: &[u8]) -> Result<(), EgclError> {
                 let b = hr_get_str(data, &mut off).ok_or_else(bad)?;
                 tags.push((a, b));
             }
-            bytecode::install_closure_control(sym, blocks, tags);
+            bytecode::restore_closure_state(function, None, Some((blocks, tags)));
         }
         NEXT_CLOSURE_ID.fetch_max(saved_next, std::sync::atomic::Ordering::Relaxed);
     }
@@ -36298,10 +36304,7 @@ fn eval_defun(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 .is_some_and(|&base| base != frame_addr(&env.frame))
         });
         if nested_in_binding {
-            bytecode::register_closure_env(
-                egcl_rt::function::definition_index(*f),
-                Arc::clone(&env.frame),
-            );
+            bytecode::register_closure_env(*f, Arc::clone(&env.frame));
         }
     } else {
         // Non-symbol names, e.g. `(setf foo)`: store GLOBALLY under the canonical
@@ -50446,6 +50449,7 @@ mod env_gc_root_tests {
             max_args: Some(1),
             variadic: false,
             binder_cache: Default::default(),
+            closure_template: Default::default(),
         };
         let nested = Arc::new(nested);
         for _ in 0..128 {
@@ -52388,6 +52392,14 @@ mod compiled_closure_lifetime_tests {
                 NIL
             }
         );
+        if shared {
+            // Captures belong to function objects (bliss-gg3i1.7.15.3): a
+            // sibling sharing the identity shares the frame by owning it too.
+            bytecode::register_closure_env(
+                *sibling,
+                bytecode::closure_captured_env(*closure).unwrap(),
+            );
+        }
         let mut weak_capture = Box::new(egcl_rt::gc::WeakPointer::new(
             egcl_rt::gc::finalizer_key(*held).unwrap(),
         ));
@@ -52410,7 +52422,7 @@ mod compiled_closure_lifetime_tests {
         egcl_rt::gc::full_gc().unwrap();
         let shared_survived = !shared
             || (!weak_capture.is_broken()
-                && bytecode::closure_captured_env(closure_name).is_some()
+                && bytecode::closure_captured_env(*sibling).is_some()
                 && bytecode::is_registered(closure_name.as_symbol_index())
                 && egcl_rt::gc::finalizer_key(apply_function(*sibling, &[], &mut env).unwrap())
                     .unwrap()
@@ -52432,13 +52444,12 @@ mod compiled_closure_lifetime_tests {
         assert!(live_answer, "live closure must return its capture");
         assert!(closure_dead, "discarded callable must be collected");
         assert!(capture_dead, "dead closure's capture must be collected");
+        // The template's code identity lives as long as its body does, here
+        // the loaded LIFETIME-MAKER (bliss-gg3i1.7.15.3); only the dead
+        // instances' captures go.
         assert!(
             bytecode::closure_captured_env(closure_name).is_none(),
-            "dead closure's host frame must be removed"
-        );
-        assert!(
-            !bytecode::is_registered(closure_name.as_symbol_index()),
-            "dead closure's code must be removed"
+            "a template symbol names no instance's frame"
         );
     }
 

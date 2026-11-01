@@ -15,7 +15,12 @@ const PROGRAM: &str = r#"
 ;; LOOP warmup in the window creates unrelated private helper compilations.
 (defun churn-phase (n measure)
   (when measure (egcl-ext:events-reset) (egcl-ext:events-start))
-  (let ((answer (__MAKER__ n)))
+  ;; Collect in the middle of the measured window: closure creation itself
+  ;; no longer forces major collections (bliss-gg3i1.7.15.3).
+  (let ((answer (if measure
+                    (+ (__MAKER__ (floor n 2))
+                       (progn (egcl-ext:gc :full t) (__MAKER__ (- n (floor n 2)))))
+                    (__MAKER__ n))))
     (when measure (egcl-ext:events-stop))
     (assert (= answer (* n 500500)))
     (when measure

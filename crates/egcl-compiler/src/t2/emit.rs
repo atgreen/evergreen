@@ -12303,6 +12303,7 @@ mod tests {
             max_args: Some(1),
             variadic: false,
             binder_cache: Default::default(),
+            closure_template: Default::default(),
         };
         let mut f = crate::t2::build::build_from_bytecode(&bf).expect("build");
         speculate(&mut f, &|bcp| {

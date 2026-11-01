@@ -391,9 +391,7 @@ fn prepare_native(
                     .param_types
                     .iter()
                     .all(|t| matches!(t, DeclaredType::Any));
-                let not_closure = !cbf.has_env
-                    && closure_captured_env(EgclVal::from_symbol_index(callee)).is_none()
-                    && !closure_controls().borrow().contains_key(&callee);
+                let not_closure = !cbf.has_env && !callee_may_own_closure_state(callee);
                 if replacement_function(callee).is_none()
                     && native_transfer_abi_compatible(&cnc)
                     && (!cnc.has_deopt || cnc.is_t2)

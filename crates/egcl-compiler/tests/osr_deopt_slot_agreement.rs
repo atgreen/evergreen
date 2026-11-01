@@ -48,6 +48,7 @@ fn bf(name: &str, code: Vec<Instr>, constants: Vec<EgclVal>, n_locals: u16) -> B
         max_args: Some(0),
         variadic: false,
         binder_cache: Default::default(),
+        closure_template: Default::default(),
     }
 }
 

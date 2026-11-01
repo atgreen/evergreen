@@ -280,8 +280,9 @@ fn active_shared_code_survives_owner_collection_and_replacement() {
             .lines()
             .filter(|line| is_closure_t2_publication(line))
             .count(),
-        2,
-        "the collected owner must be replaced while its code is active: {trace}"
+        1,
+        "the template owns its code: collecting its first instance neither \
+         retires nor recompiles it (bliss-gg3i1.7.15.3): {trace}"
     );
     if MAPPED_LINUX {
         // The active sibling's activation retains the obsolete mapped code and

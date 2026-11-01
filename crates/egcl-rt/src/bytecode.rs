@@ -338,6 +338,109 @@ pub struct BytecodeFunction {
     /// The call-time variadic binder's parsed form of `params_form`, built on
     /// first use. Opaque to the runtime; see [`BinderCache`].
     pub binder_cache: BinderCache,
+    /// The closure-template identity of this body when `MakeClosure` uses it
+    /// as a lambda template; see [`ClosureTemplateCell`].
+    pub closure_template: ClosureTemplateCell,
+}
+
+/// The code identity shared by every closure made from one nested body
+/// (Backpack stage 2, bliss-gg3i1.7.15.3): a pinned prototype function object
+/// whose definition symbol owns the template's bytecode registration, native
+/// code and tiering state. Closure instances name the same symbol and carry
+/// only their captured state.
+///
+/// The cell holds the prototype's raw address, so it is valid only while the
+/// prototype lives. A collection frees pinned functions only when it also
+/// advances `gc::pinned_function_epoch`, and the cell records the epoch it was
+/// last validated in: [`ClosureTemplateCell::current`] answers only within
+/// that epoch, and a stale entry must be revalidated against its template
+/// symbol's function cell (uninterned symbol indices are never reused).
+/// A clone is a different body, so it starts empty, as [`BinderCache`] does.
+#[derive(Default)]
+pub struct ClosureTemplateCell {
+    /// The prototype's tagged value, or 0.
+    prototype: core::sync::atomic::AtomicU64,
+    /// `(template symbol << 32) | (validation epoch as u32)`, or 0 while
+    /// empty or being republished.
+    stamp: core::sync::atomic::AtomicU64,
+    /// Whether the body has a free lexical control exit: 0 not yet analyzed,
+    /// 1 none, 2 at least one.
+    control: core::sync::atomic::AtomicU8,
+}
+
+impl ClosureTemplateCell {
+    fn read(&self) -> Option<(crate::value::EgclVal, u32, u32)> {
+        use core::sync::atomic::Ordering;
+        let stamp = self.stamp.load(Ordering::Acquire);
+        if stamp == 0 {
+            return None;
+        }
+        let prototype = self.prototype.load(Ordering::Acquire);
+        (self.stamp.load(Ordering::Acquire) == stamp && prototype != 0).then_some((
+            crate::value::EgclVal::from_raw(prototype),
+            (stamp >> 32) as u32,
+            stamp as u32,
+        ))
+    }
+
+    /// The prototype and template symbol, if validated in the current
+    /// pinned-function epoch. The prototype is then a live pinned object until
+    /// the next collection that frees pinned functions; root it before
+    /// allocating.
+    #[inline]
+    pub fn current(&self) -> Option<(crate::value::EgclVal, u32)> {
+        let (prototype, symbol, epoch) = self.read()?;
+        (epoch == crate::gc::pinned_function_epoch() as u32).then_some((prototype, symbol))
+    }
+
+    /// The last published prototype and symbol regardless of epoch. The
+    /// address may be stale: dereference it only after confirming the symbol
+    /// is live and its function cell still holds this exact value.
+    pub fn candidate(&self) -> Option<(crate::value::EgclVal, u32)> {
+        self.read()
+            .map(|(prototype, symbol, _)| (prototype, symbol))
+    }
+
+    /// Publish (or revalidate) `prototype` for `symbol` in the current epoch.
+    /// Concurrent publishers must be serialized by the caller.
+    pub fn publish(&self, prototype: crate::value::EgclVal, symbol: u32) {
+        use core::sync::atomic::Ordering;
+        let stamp =
+            (u64::from(symbol) << 32) | u64::from(crate::gc::pinned_function_epoch() as u32);
+        self.stamp.store(0, Ordering::Release);
+        self.prototype.store(prototype.to_raw(), Ordering::Release);
+        self.stamp.store(stamp, Ordering::Release);
+    }
+
+    /// The cached free-control analysis, if computed.
+    #[inline]
+    pub fn control_free(&self) -> Option<bool> {
+        match self.control.load(core::sync::atomic::Ordering::Relaxed) {
+            1 => Some(true),
+            2 => Some(false),
+            _ => None,
+        }
+    }
+
+    /// Cache the free-control analysis. It depends only on the immutable body.
+    pub fn set_control_free(&self, free: bool) {
+        self.control.store(
+            if free { 1 } else { 2 },
+            core::sync::atomic::Ordering::Relaxed,
+        );
+    }
+}
+
+impl Clone for ClosureTemplateCell {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl std::fmt::Debug for ClosureTemplateCell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ClosureTemplateCell")
+    }
 }
 
 /// A lazily built, per-body cache owned by the call-time lambda-list binder.

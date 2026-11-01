@@ -549,6 +549,12 @@ pub struct FunctionData {
     /// Immutable private symbol owning this definition's compiled body. Traced
     /// through the function-capture hook; distinct from the public name.
     pub definition_index: u32,
+    /// Raw, never-traced owner of this object's host-side closure state (the
+    /// captured lexical frame and exit scope), or 0. The evaluator owns the
+    /// representation (see `function::set_closure_state`); the collector only
+    /// releases it through the registered hook when the object dies, and an
+    /// image snapshot stores 0 (bliss-gg3i1.7.15.3).
+    pub closure_state: core::sync::atomic::AtomicUsize,
 }
 
 // ── Cons cell ──────────────────────────────────────────────────────

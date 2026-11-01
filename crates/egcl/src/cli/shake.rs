@@ -488,6 +488,12 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
                 if !body.is_nil() {
                     queue.push_back((body, reason.clone(), true));
                 }
+                // Captured lexicals can be called, as the frame's owner
+                // could call them (bliss-gg3i1.7.15.3: captures live on the
+                // function object rather than in a symbol-keyed table).
+                bytecode::closure_state_values(value, |child| {
+                    queue.push_back((child, reason.clone(), true));
+                });
             }
             if spec.specialized {
                 if let Some(reason) = generic_definitions.source_methods.get(&value.0) {
@@ -1038,7 +1044,6 @@ pub(super) fn run(args: &CliArgs, env: &mut Env) -> Result<i32, EgclError> {
     {
         symbols::set_symbol_function(index, egcl_rt::value::UNBOUND);
         bytecode::clear_lazy_state(index);
-        bytecode::clear_closure_env(index);
     }
     for &symbol in &plan.unreachable_closures {
         bytecode::remove_shake_closure(symbol);

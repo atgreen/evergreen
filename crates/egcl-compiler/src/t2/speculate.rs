@@ -3444,6 +3444,7 @@ mod tests {
             max_args: Some(1),
             variadic: false,
             binder_cache: Default::default(),
+            closure_template: Default::default(),
         };
         // No live heap inspection on the builder side: capture the rooted literals
         // first, exactly as the compilation owner does for a worker.
@@ -3595,6 +3596,7 @@ mod tests {
             max_args: Some(1),
             variadic: false,
             binder_cache: Default::default(),
+            closure_template: Default::default(),
         };
         let f = crate::t2::build::build_from_bytecode(&body).unwrap();
         crate::t2::verify::verify(&f).unwrap();
@@ -3796,6 +3798,7 @@ mod tests {
                 max_args: Some(1),
                 variadic: false,
                 binder_cache: Default::default(),
+                closure_template: Default::default(),
             };
             let mut f = crate::t2::build::build_from_bytecode(&body).unwrap();
             assert_eq!(speculate(&mut f, &|_| Some(SpecType::Fixnum)), 1);

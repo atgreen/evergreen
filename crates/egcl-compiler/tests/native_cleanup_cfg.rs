@@ -33,6 +33,7 @@ fn cleanup_body() -> BytecodeFunction {
         max_args: Some(1),
         variadic: false,
         binder_cache: Default::default(),
+        closure_template: Default::default(),
     };
     body.code = vec![
         Instr::PushUnwind {

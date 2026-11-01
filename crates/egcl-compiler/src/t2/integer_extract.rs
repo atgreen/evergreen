@@ -589,6 +589,7 @@ mod tests {
             max_args: Some(1),
             variadic: false,
             binder_cache: Default::default(),
+            closure_template: Default::default(),
         };
         for transfer in [false, true] {
             let mut f = if transfer {
