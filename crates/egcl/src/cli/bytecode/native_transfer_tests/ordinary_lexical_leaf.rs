@@ -465,12 +465,12 @@ fn ordinary_encoded_capture_keys_preserve_identity_and_move_published_store() {
         let body = Arc::new(compiled);
         egcl_rt::rooted!(_body = ActiveBytecodeRoot::new(&body));
         let mut construction = env.child();
-        construction.frame = Arc::new(SharedCell::new(EnvFrame {
+        construction.frame = FrameCell::new_arc(EnvFrame {
             vars: crate::cli::VecMap::default(),
             symbol_vars: crate::cli::VecMap::default(),
             function_vars: crate::cli::VecMap::default(),
             parent: None,
-        }));
+        });
         egcl_rt::rooted_ref!(_construction = &mut construction);
         bind_boxed_param(&construction.frame, &key, NIL);
         bind_boxed_param(&construction.frame, &other_key, EgclVal::from_fixnum(99));

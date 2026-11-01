@@ -140,12 +140,12 @@ fn lexical_leaf_native_reads_writes_and_shadowing() {
     let symbol = resolve_sym("LEXICAL-LEAF-CAPTURE").unwrap();
     env.define_local_symbol(symbol, EgclVal::from_fixnum(11));
     let parent = Arc::clone(&env.frame);
-    env.frame = Arc::new(SharedCell::new(EnvFrame {
+    env.frame = FrameCell::new_arc(EnvFrame {
         vars: super::super::super::VecMap::default(),
         symbol_vars: super::super::super::VecMap::default(),
         function_vars: super::super::super::VecMap::default(),
         parent: Some(Arc::clone(&parent)),
-    }));
+    });
     env.define_local_symbol(symbol, EgclVal::from_fixnum(22));
     let native = code(
         "((setq lexical-leaf-capture next) lexical-leaf-capture)",
@@ -338,12 +338,12 @@ fn lexical_identity_keys_preserve_native_leaf_and_published_store_semantics() {
     env.define_local_symbol(*left, EgclVal::from_fixnum(11));
     env.define_local_symbol(*right, EgclVal::from_fixnum(22));
     let parent = Arc::clone(&env.frame);
-    env.frame = Arc::new(SharedCell::new(EnvFrame {
+    env.frame = FrameCell::new_arc(EnvFrame {
         vars: super::super::super::VecMap::default(),
         symbol_vars: super::super::super::VecMap::default(),
         function_vars: super::super::super::VecMap::default(),
         parent: Some(Arc::clone(&parent)),
-    }));
+    });
     env.define_local_symbol(*left, EgclVal::from_fixnum(33));
     let left_key = lexical_identity::key(*left);
     let right_key = lexical_identity::key(*right);

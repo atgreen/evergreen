@@ -30,12 +30,12 @@ pub(super) fn template(forms: &str, env: &Env) -> Arc<BytecodeFunction> {
 
 pub(super) fn closure(body: &Arc<BytecodeFunction>, value: EgclVal, env: &mut Env) -> EgclVal {
     let mut construction = env.child();
-    construction.frame = Arc::new(SharedCell::new(EnvFrame {
+    construction.frame = FrameCell::new_arc(EnvFrame {
         vars: crate::cli::VecMap::default(),
         symbol_vars: crate::cli::VecMap::default(),
         function_vars: crate::cli::VecMap::default(),
         parent: None,
-    }));
+    });
     egcl_rt::rooted_ref!(_construction = &mut construction);
     let name = body
         .names
@@ -142,7 +142,7 @@ fn ordinary_captured_instances_share_code_without_sharing_lexical_cells() {
 }
 
 thread_local! {
-    static FRAME: RefCell<Option<Arc<SharedCell<EnvFrame>>>> = const { RefCell::new(None) };
+    static FRAME: RefCell<Option<Arc<FrameCell>>> = const { RefCell::new(None) };
     static MOVED: Cell<Option<(u64, u64, bool)>> = const { Cell::new(None) };
     static MAJOR_RESULT: Cell<Option<bool>> = const { Cell::new(None) };
 }
@@ -995,7 +995,7 @@ fn private_probe_lease_keeps_physical_maps_but_not_native_installation_alive() {
 }
 
 thread_local! {
-    static EPHEMERAL_FRAME: RefCell<std::sync::Weak<SharedCell<EnvFrame>>> = const { RefCell::new(std::sync::Weak::new()) };
+    static EPHEMERAL_FRAME: RefCell<std::sync::Weak<FrameCell>> = const { RefCell::new(std::sync::Weak::new()) };
     static EPHEMERAL_FACTORY_SLOT: Cell<u32> = const { Cell::new(0) };
     static EPHEMERAL_CHILD: Cell<usize> = const { Cell::new(0) };
     static EPHEMERAL_PARENT: Cell<usize> = const { Cell::new(0) };

@@ -36,6 +36,8 @@ mod method_continuations;
 mod native_runtime;
 mod python;
 mod reified_metadata;
+mod remembered_captures;
+use remembered_captures::{FrameCell, FrameWrite};
 mod shake;
 mod slot_access;
 pub mod sprof;
@@ -1502,7 +1504,7 @@ mod reified_closure_rooting_tests {
         let mut env = Env::new(false);
         egcl_rt::rooted_ref!(_env = &mut env);
         egcl_rt::rooted!(body = reader::read_from_string("(held)").unwrap().0);
-        let captured = Arc::new(SharedCell::new(EnvFrame::default()));
+        let captured = FrameCell::new_arc(EnvFrame::default());
         captured
             .borrow_mut()
             .vars
@@ -1560,7 +1562,7 @@ mod closure_identity_gc_tests {
         let mut env = Env::new(false);
         egcl_rt::rooted_ref!(_env = &mut env);
         egcl_rt::rooted!(body = reader::read_from_string("(held)").unwrap().0);
-        let captured = Arc::new(SharedCell::new(EnvFrame::default()));
+        let captured = FrameCell::new_arc(EnvFrame::default());
         // The captured frame is the only owner of the payload.
         captured
             .borrow_mut()
@@ -1613,7 +1615,7 @@ mod closure_identity_gc_tests {
         let young = register_tree_closure(Closure {
             params_form: NIL,
             body: *body,
-            captured_frame: Arc::new(SharedCell::new(EnvFrame::default())),
+            captured_frame: FrameCell::new_arc(EnvFrame::default()),
             captured_specials: Vec::new(),
             captured_blocks: Vec::new(),
             captured_tags: Vec::new(),
@@ -2485,7 +2487,7 @@ struct Closure {
     /// Raw lambda list, for full &optional/&rest/&key binding.
     params_form: EgclVal,
     body: EgclVal,
-    captured_frame: Arc<SharedCell<EnvFrame>>,
+    captured_frame: Arc<FrameCell>,
     /// Local SPECIAL declarations active at the closure's definition site.
     captured_specials: Vec<u32>,
     /// The lexically-enclosing BLOCK and TAGBODY exit points, captured at
@@ -2586,7 +2588,7 @@ enum EvalContext {
 // retain copy-on-write isolation, with mutable slots for GC relocation.
 #[derive(Clone)]
 struct Env {
-    frame: Arc<SharedCell<EnvFrame>>,
+    frame: Arc<FrameCell>,
     funs: Arc<SharedCell<HashMap<String, FunDef>>>,
     macros: Rc<RefCell<HashMap<String, MacroDef>>>,
     /// User SETF-expanders (DEFINE-SETF-EXPANDER / DEFSETF), keyed by access-fn
@@ -2943,7 +2945,7 @@ struct EnvFrame {
     vars: VecMap<String, EgclVal>,
     symbol_vars: VecMap<u32, EgclVal>,
     function_vars: VecMap<String, EgclVal>,
-    parent: Option<Arc<SharedCell<EnvFrame>>>,
+    parent: Option<Arc<FrameCell>>,
 }
 
 /// An owned, thread-safe (`Arc`-based) deep-copy snapshot of a lexical
@@ -3023,7 +3025,7 @@ struct FunDef {
     defining_blocks: Option<LexicalExitNames>,
     /// Variable bindings and declarations belong to the definition site,
     /// independently of the frame in which this name is called or referenced.
-    defining_frame: Option<Arc<SharedCell<EnvFrame>>>,
+    defining_frame: Option<Arc<FrameCell>>,
     defining_specials: Vec<u32>,
     /// The lexical MACROLET definitions visible where this local function was
     /// written (see `Closure::captured_macros`; bliss-9uimd). `None` for a
@@ -3070,7 +3072,7 @@ impl FunDef {
 struct MacroDef {
     params_form: EgclVal,
     body: EgclVal,
-    captured_frame: Arc<SharedCell<EnvFrame>>,
+    captured_frame: Arc<FrameCell>,
     /// Source-free BFASL macros execute this pre-lowered expander. Source and
     /// lexical MACROLET definitions retain the ordinary body representation.
     bytecode: Option<Arc<Mutex<egcl_rt::bytecode::BytecodeFunction>>>,
@@ -3103,7 +3105,7 @@ enum SetfExpander {
         /// (,z ,y) ,v)))` must see Z. Evaluating the body in the CALLER's
         /// environment instead made Z unbound (ansi DEFSETF.6A; bliss-30i6).
         /// MacroDef captures `captured_frame` for the same reason.
-        captured_frame: Arc<SharedCell<EnvFrame>>,
+        captured_frame: Arc<FrameCell>,
     },
 }
 
@@ -3116,7 +3118,7 @@ struct MethodDef {
     method_id: EgclVal,
     /// The original lexical locations travel with the method, including an
     /// in-flight method retained after another thread replaces its definition.
-    captured_frame: Option<Arc<SharedCell<EnvFrame>>>,
+    captured_frame: Option<Arc<FrameCell>>,
     /// Specializers for the required parameters only (parameters before any
     /// lambda-list keyword). Their count is the number of required parameters.
     specializers: Vec<MethodSpecializer>,
@@ -3239,11 +3241,11 @@ enum RestartFunction {
         // Share the LIVE lexical frame (like closures/macros) so a setf/setq
         // inside the restart function persists to the establishing scope.
         // Frozen snapshots dropped writes (bliss-gd4).
-        captured_frame: Arc<SharedCell<EnvFrame>>,
+        captured_frame: Arc<FrameCell>,
     },
     Bytecode {
         function: Rc<RefCell<egcl_rt::bytecode::BytecodeFunction>>,
-        captured_frame: Arc<SharedCell<EnvFrame>>,
+        captured_frame: Arc<FrameCell>,
     },
     ContinueNil,
 }
@@ -3322,7 +3324,7 @@ enum HandlerImpl {
         var_name: Option<String>,
         body: EgclVal,
         // Live lexical frame of the HANDLER-CASE form (shared, not snapshotted).
-        captured_frame: Arc<SharedCell<EnvFrame>>,
+        captured_frame: Arc<FrameCell>,
     },
 }
 
@@ -3559,7 +3561,7 @@ fn remember_macro_expansion(form: EgclVal, expansion: EgclVal) {
 
 /// Address-identity of an `EnvFrame`, for comparing whether the current frame is
 /// the top-level base or a genuinely nested binding frame (bliss-sdd).
-fn frame_addr(frame: &Arc<SharedCell<EnvFrame>>) -> usize {
+fn frame_addr(frame: &Arc<FrameCell>) -> usize {
     Arc::as_ptr(frame) as usize
 }
 
@@ -3792,7 +3794,7 @@ thread_local! {
     /// Arcs keeps identity: two methods that closed over one LET resolve to the
     /// SAME frame, which is what makes a shared counter keep counting rather than
     /// restart per method (bliss-mxjr).
-    static PENDING_CLSR_FRAMES: RefCell<Vec<Arc<SharedCell<EnvFrame>>>> =
+    static PENDING_CLSR_FRAMES: RefCell<Vec<Arc<FrameCell>>> =
         const { RefCell::new(Vec::new()) };
     static PENDING_HOST_METHODS: RefCell<Vec<(String, Vec<MethodRec>)>> =
         const { RefCell::new(Vec::new()) };
@@ -3884,7 +3886,7 @@ fn host_serialize_registries() -> Vec<u8> {
             .unwrap_or_default()
     });
     // Drop the lock before the table walk below, which locks GLOBAL_MACROS again.
-    let macro_frames: Vec<Arc<SharedCell<EnvFrame>>> = GLOBAL_MACROS
+    let macro_frames: Vec<Arc<FrameCell>> = GLOBAL_MACROS
         .lock()
         .unwrap()
         .values()
@@ -3896,7 +3898,7 @@ fn host_serialize_registries() -> Vec<u8> {
         let reg = closure_registry();
         let reg = reg.borrow();
         let bc_env = bytecode::closure_env_entries();
-        let method_frames: Vec<Arc<SharedCell<EnvFrame>>> = SAVE_METHODS.with(|m| {
+        let method_frames: Vec<Arc<FrameCell>> = SAVE_METHODS.with(|m| {
             m.borrow().as_ref().map_or_else(Vec::new, |map| {
                 map.borrow()
                     .values()
@@ -3906,9 +3908,9 @@ fn host_serialize_registries() -> Vec<u8> {
             })
         });
         let mut frame_ids: HashMap<usize, u32> = HashMap::new();
-        let mut frames: Vec<Arc<SharedCell<EnvFrame>>> = Vec::new();
+        let mut frames: Vec<Arc<FrameCell>> = Vec::new();
         // The frames of closures' captured MACROLET definitions (bliss-q5acx).
-        let captured_macro_frames: Vec<Arc<SharedCell<EnvFrame>>> = reg
+        let captured_macro_frames: Vec<Arc<FrameCell>> = reg
             .values()
             .filter_map(|c| c.captured_macros.as_ref())
             .flat_map(|macros| {
@@ -3920,7 +3922,7 @@ fn host_serialize_registries() -> Vec<u8> {
                     .collect::<Vec<_>>()
             })
             .collect();
-        let roots: Vec<Arc<SharedCell<EnvFrame>>> = reg
+        let roots: Vec<Arc<FrameCell>> = reg
             .values()
             .map(|c| Arc::clone(&c.captured_frame))
             .chain(captured_macro_frames)
@@ -3955,7 +3957,7 @@ fn host_serialize_registries() -> Vec<u8> {
         }
         (frame_ids, frames)
     };
-    let frame_id_of = |f: Option<&Arc<SharedCell<EnvFrame>>>| -> u32 {
+    let frame_id_of = |f: Option<&Arc<FrameCell>>| -> u32 {
         f.and_then(|f| frame_ids.get(&(Arc::as_ptr(f) as usize)).copied())
             .unwrap_or(u32::MAX)
     };
@@ -4860,14 +4862,14 @@ fn host_restore_registries(data: &[u8]) -> Result<(), EgclError> {
         let bad = || EgclError::InvalidImage("host registry: truncated (closures)".into());
         let saved_next = hr_get_u64(data, &mut off).ok_or_else(bad)?;
         let n_frames = hr_get_u32(data, &mut off).ok_or_else(bad)? as usize;
-        let frames: Vec<Arc<SharedCell<EnvFrame>>> = (0..n_frames)
+        let frames: Vec<Arc<FrameCell>> = (0..n_frames)
             .map(|_| {
-                Arc::new(SharedCell::new(EnvFrame {
+                FrameCell::new_arc(EnvFrame {
                     vars: VecMap::default(),
                     symbol_vars: VecMap::default(),
                     function_vars: VecMap::default(),
                     parent: None,
-                }))
+                })
             })
             .collect();
         let mut parent_ids: Vec<u32> = Vec::with_capacity(n_frames);
@@ -4940,12 +4942,12 @@ fn host_restore_registries(data: &[u8]) -> Result<(), EgclError> {
                 captured_tags.push((a, b));
             }
             let captured_frame = frames.get(fid as usize).cloned().unwrap_or_else(|| {
-                Arc::new(SharedCell::new(EnvFrame {
+                FrameCell::new_arc(EnvFrame {
                     vars: VecMap::default(),
                     symbol_vars: VecMap::default(),
                     function_vars: VecMap::default(),
                     parent: None,
-                }))
+                })
             });
             registry.borrow_mut().insert(
                 id,
@@ -5027,12 +5029,12 @@ fn host_restore_registries(data: &[u8]) -> Result<(), EgclError> {
                 let body = hr_get_u64(data, &mut off).ok_or_else(bad)?;
                 let fid = hr_get_u32(data, &mut off).ok_or_else(bad)?;
                 let captured_frame = frames.get(fid as usize).cloned().unwrap_or_else(|| {
-                    Arc::new(SharedCell::new(EnvFrame {
+                    FrameCell::new_arc(EnvFrame {
                         vars: VecMap::default(),
                         symbol_vars: VecMap::default(),
                         function_vars: VecMap::default(),
                         parent: None,
-                    }))
+                    })
                 });
                 defs.insert(
                     name,
@@ -5230,7 +5232,7 @@ fn host_restore_registries(data: &[u8]) -> Result<(), EgclError> {
 /// macro/setf-fn to the fresh root frame. Called by the CLI once the top-level
 /// `Env` exists after an image load. GC-safe: no EGCL allocation (only
 /// `from_raw`, `Rc::clone`, and map inserts).
-fn drain_pending_host_registries(root_frame: &Arc<SharedCell<EnvFrame>>) {
+fn drain_pending_host_registries(root_frame: &Arc<FrameCell>) {
     let macros = PENDING_HOST_MACROS.with(|p| std::mem::take(&mut *p.borrow_mut()));
     for (name, params_raw, body_raw, frame_id) in macros {
         // A macro defined inside a LET captured that frame, not the root shell.
@@ -5779,7 +5781,7 @@ fn store_control_value(token: &str, value: EgclVal) {
 /// Deep-copy a live lexical frame chain into an owned, `Send + Sync` snapshot.
 /// Only the global macro/compiler-macro registry bridge needs this; see
 /// [`FrozenEnvFrame`].
-fn freeze_env_frame(frame: &Arc<SharedCell<EnvFrame>>) -> Arc<FrozenEnvFrame> {
+fn freeze_env_frame(frame: &Arc<FrameCell>) -> Arc<FrozenEnvFrame> {
     let (vars, symbol_vars, function_vars, parent) = {
         let borrowed = frame.borrow();
         (
@@ -5797,8 +5799,8 @@ fn freeze_env_frame(frame: &Arc<SharedCell<EnvFrame>>) -> Arc<FrozenEnvFrame> {
     })
 }
 
-fn thaw_env_frame(frame: &Arc<FrozenEnvFrame>) -> Arc<SharedCell<EnvFrame>> {
-    Arc::new(SharedCell::new(EnvFrame {
+fn thaw_env_frame(frame: &Arc<FrozenEnvFrame>) -> Arc<FrameCell> {
+    FrameCell::new_arc(EnvFrame {
         vars: frame
             .vars
             .lock()
@@ -5815,7 +5817,7 @@ fn thaw_env_frame(frame: &Arc<FrozenEnvFrame>) -> Arc<SharedCell<EnvFrame>> {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone(),
         parent: frame.parent.as_ref().map(thaw_env_frame),
-    }))
+    })
 }
 
 fn take_control_value(token: &str) -> EgclVal {
@@ -10652,7 +10654,7 @@ pub(crate) fn with_env_visit_state<R>(f: impl FnOnce(&mut EnvRootVisitState) -> 
 }
 
 fn visit_env_frame_roots(
-    frame: &Arc<SharedCell<EnvFrame>>,
+    frame: &Arc<FrameCell>,
     state: &mut EnvRootVisitState,
     visit: &mut dyn FnMut(*mut EgclVal),
 ) {
@@ -10662,24 +10664,29 @@ fn visit_env_frame_roots(
     }
 
     let parent = {
-        let mut frame = frame.borrow_mut();
-        for value in frame.vars.values_mut() {
-            visit(value as *mut EgclVal);
-        }
-        for (key, value) in frame.function_vars.iter_mut() {
-            lexical_identity::trace(key, visit);
-            visit(value as *mut EgclVal);
-        }
-        for &index in frame.symbol_vars.keys() {
-            egcl_rt::symbols::trace_symbol_index(index, visit);
-        }
-        for value in frame.symbol_vars.values_mut() {
-            visit(value as *mut EgclVal);
-        }
+        let mut frame = frame.gc_borrow();
+        visit_env_frame_slots(&mut frame, visit);
         frame.parent.clone()
     };
     if let Some(parent) = parent {
         visit_env_frame_roots(&parent, state, visit);
+    }
+}
+
+/// Visit one frame's own reference slots, not its parents'.
+fn visit_env_frame_slots(frame: &mut EnvFrame, visit: &mut dyn FnMut(*mut EgclVal)) {
+    for value in frame.vars.values_mut() {
+        visit(value as *mut EgclVal);
+    }
+    for (key, value) in frame.function_vars.iter_mut() {
+        lexical_identity::trace(key, visit);
+        visit(value as *mut EgclVal);
+    }
+    for &index in frame.symbol_vars.keys() {
+        egcl_rt::symbols::trace_symbol_index(index, visit);
+    }
+    for value in frame.symbol_vars.values_mut() {
+        visit(value as *mut EgclVal);
     }
 }
 
@@ -11610,7 +11617,7 @@ impl Env {
         egcl_stdlib::initialize_condition_runtime_support()
             .expect("initialize condition runtime support (STORAGE-CONDITION pool) at startup");
         let mut env = Env {
-            frame: Arc::new(SharedCell::new(EnvFrame::default())),
+            frame: FrameCell::new_arc(EnvFrame::default()),
             funs: Arc::new(SharedCell::new(HashMap::new())),
             macros: Rc::new(RefCell::new(HashMap::new())),
             setf_expanders: Rc::new(RefCell::new(HashMap::new())),
@@ -11919,12 +11926,12 @@ impl Env {
     /// detaches them through the copy-on-write mutation helpers above.
     fn child(&self) -> Self {
         Env {
-            frame: Arc::new(SharedCell::new(EnvFrame {
+            frame: FrameCell::new_arc(EnvFrame {
                 vars: VecMap::default(),
                 symbol_vars: VecMap::default(),
                 function_vars: VecMap::default(),
                 parent: Some(Arc::clone(&self.frame)),
-            })),
+            }),
             funs: Arc::clone(&self.funs),
             macros: Rc::clone(&self.macros),
             setf_expanders: Rc::clone(&self.setf_expanders),
@@ -11952,14 +11959,14 @@ impl Env {
         }
     }
 
-    fn child_with_parent(&self, parent: Arc<SharedCell<EnvFrame>>) -> Self {
+    fn child_with_parent(&self, parent: Arc<FrameCell>) -> Self {
         Env {
-            frame: Arc::new(SharedCell::new(EnvFrame {
+            frame: FrameCell::new_arc(EnvFrame {
                 vars: VecMap::default(),
                 symbol_vars: VecMap::default(),
                 function_vars: VecMap::default(),
                 parent: Some(parent),
-            })),
+            }),
             funs: Arc::clone(&self.funs),
             macros: Rc::clone(&self.macros),
             setf_expanders: Rc::clone(&self.setf_expanders),
@@ -11990,7 +11997,7 @@ impl Env {
     /// Retain dynamic state and global definitions, but no enclosing lexical
     /// variables, local functions/macros, declarations, or exit targets.
     fn null_lexical_child(&self) -> Self {
-        let mut child = self.child_with_parent(Arc::new(SharedCell::new(EnvFrame::default())));
+        let mut child = self.child_with_parent(FrameCell::new_arc(EnvFrame::default()));
         child.funs = Arc::new(SharedCell::new(HashMap::new()));
         child.macros = Rc::new(RefCell::new(HashMap::new()));
         child.symbol_macros = Rc::new(RefCell::new(HashMap::new()));
@@ -12205,7 +12212,7 @@ impl Env {
         }
     }
 
-    fn lookup_lexical_frame(frame: &Arc<SharedCell<EnvFrame>>, key: &str) -> Option<EgclVal> {
+    fn lookup_lexical_frame(frame: &Arc<FrameCell>, key: &str) -> Option<EgclVal> {
         if lexical_identity::function_base(key).is_some() {
             let mut current = Some(Arc::clone(frame));
             while let Some(frame) = current {
@@ -12224,7 +12231,7 @@ impl Env {
         }
     }
 
-    fn set_lexical_frame(frame: &Arc<SharedCell<EnvFrame>>, key: &str, value: EgclVal) -> bool {
+    fn set_lexical_frame(frame: &Arc<FrameCell>, key: &str, value: EgclVal) -> bool {
         if lexical_identity::function_base(key).is_some() {
             let mut current = Some(Arc::clone(frame));
             while let Some(frame) = current {
@@ -12244,7 +12251,7 @@ impl Env {
         }
     }
 
-    fn define_lexical_frame(frame: &Arc<SharedCell<EnvFrame>>, key: &str, value: EgclVal) {
+    fn define_lexical_frame(frame: &Arc<FrameCell>, key: &str, value: EgclVal) {
         if lexical_identity::function_base(key).is_some() {
             frame
                 .borrow_mut()
@@ -12283,7 +12290,7 @@ impl Env {
         egcl_rt::symbols::set_symbol_value(idx, val);
     }
 
-    fn lookup_frame(frame: &Arc<SharedCell<EnvFrame>>, name: &str) -> Option<EgclVal> {
+    fn lookup_frame(frame: &Arc<FrameCell>, name: &str) -> Option<EgclVal> {
         // Resolve the name ONCE, then check both maps at EACH frame, symbol
         // first. Walking symbol_vars through the whole chain and only then the
         // name map would let an OUTER symbol binding win over an INNER
@@ -12302,7 +12309,7 @@ impl Env {
     }
 
     fn lookup_resolved_frame(
-        frame: &Arc<SharedCell<EnvFrame>>,
+        frame: &Arc<FrameCell>,
         name: &str,
         idx: Option<u32>,
     ) -> Option<EgclVal> {
@@ -12324,10 +12331,7 @@ impl Env {
         None
     }
 
-    fn lookup_symbol_frame(
-        frame: &Arc<SharedCell<EnvFrame>>,
-        symbol_index: u32,
-    ) -> Option<EgclVal> {
+    fn lookup_symbol_frame(frame: &Arc<FrameCell>, symbol_index: u32) -> Option<EgclVal> {
         let borrowed = frame.borrow();
         if let Some(val) = borrowed.symbol_vars.get(&symbol_index) {
             return Some(*val);
@@ -12337,13 +12341,13 @@ impl Env {
         parent.and_then(|parent| Self::lookup_symbol_frame(&parent, symbol_index))
     }
 
-    fn set_frame_var(frame: &Arc<SharedCell<EnvFrame>>, name: &str, val: EgclVal) -> bool {
+    fn set_frame_var(frame: &Arc<FrameCell>, name: &str, val: EgclVal) -> bool {
         let symbol_index = egcl_rt::symbols::find_index(name);
         Self::set_resolved_frame_var(frame, name, symbol_index, val)
     }
 
     fn set_resolved_frame_var(
-        frame: &Arc<SharedCell<EnvFrame>>,
+        frame: &Arc<FrameCell>,
         name: &str,
         symbol_index: Option<u32>,
         val: EgclVal,
@@ -12367,11 +12371,7 @@ impl Env {
         false
     }
 
-    fn set_symbol_frame_var(
-        frame: &Arc<SharedCell<EnvFrame>>,
-        symbol_index: u32,
-        val: EgclVal,
-    ) -> bool {
+    fn set_symbol_frame_var(frame: &Arc<FrameCell>, symbol_index: u32, val: EgclVal) -> bool {
         {
             let mut borrowed = frame.borrow_mut();
             // `sym_name_rc` is the cached Rc<str> accessor: no allocation, where
@@ -12467,7 +12467,7 @@ impl egcl_rt::gc::TraceHostRoots for Env {
 /// A caller frame temporarily displaced by a callee's captured environment.
 /// Use the intrusive root list: a TLS-only scanner misses this frame when a
 /// different native thread collects while the caller is suspended.
-struct SuspendedFrameRoot(Arc<SharedCell<EnvFrame>>);
+struct SuspendedFrameRoot(Arc<FrameCell>);
 
 impl egcl_rt::gc::TraceHostRoots for SuspendedFrameRoot {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
@@ -12504,19 +12504,19 @@ impl egcl_rt::gc::TraceHostRoots for SuspendedMacrosRoot {
 
 fn with_child_frame<T>(
     env: &mut Env,
-    parent: Arc<SharedCell<EnvFrame>>,
+    parent: Arc<FrameCell>,
     f: impl FnOnce(&mut Env) -> Result<T, EgclError>,
 ) -> Result<T, EgclError> {
     egcl_rt::rooted!(saved_frame = SuspendedFrameRoot(Arc::clone(&env.frame)));
     // Keep the swapped-out caller frame rooted for the extent of `f`: a function
     // call reparents `env.frame` to the callee's captured frame, so without this
     // the caller's locals would be unscanned during the call (bliss-6b2 #2).
-    env.frame = Arc::new(SharedCell::new(EnvFrame {
+    env.frame = FrameCell::new_arc(EnvFrame {
         vars: VecMap::default(),
         symbol_vars: VecMap::default(),
         function_vars: VecMap::default(),
         parent: Some(parent),
-    }));
+    });
     let result = f(env);
     env.frame = Arc::clone(&saved_frame.0);
     result
@@ -12564,7 +12564,7 @@ fn eval_lambda_call(
     params_form: EgclVal,
     body: EgclVal,
     args: &[EgclVal],
-    parent: Arc<SharedCell<EnvFrame>>,
+    parent: Arc<FrameCell>,
 ) -> Result<EgclVal, EgclError> {
     egcl_rt::rooted!(params_form = params_form);
     egcl_rt::rooted!(body = body);
@@ -12617,7 +12617,7 @@ fn eval_named_call_ex(
     params_form: EgclVal,
     body: EgclVal,
     args: &[EgclVal],
-    parent: Arc<SharedCell<EnvFrame>>,
+    parent: Arc<FrameCell>,
     control: LexicalControl,
 ) -> Result<EgclVal, EgclError> {
     // Lisp-aware statistical profiler (bliss-sc4t): this is the tree-walked call
@@ -12682,7 +12682,7 @@ fn eval_lambda_call_ex(
     params_form: EgclVal,
     body: EgclVal,
     args: &[EgclVal],
-    parent: Arc<SharedCell<EnvFrame>>,
+    parent: Arc<FrameCell>,
     control: LexicalControl,
 ) -> Result<EgclVal, EgclError> {
     let _call_depth = CallDepthGuard::enter()?;
@@ -30784,7 +30784,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                         (Arc::clone(&env.frame), LexicalControl::Inherit)
                     } else {
                         (
-                            Arc::new(SharedCell::new(EnvFrame::default())),
+                            FrameCell::new_arc(EnvFrame::default()),
                             LexicalControl::Fresh,
                         )
                     };
@@ -39506,10 +39506,7 @@ fn expand_macro(
 }
 
 fn macroexpand_environment_from_cli(env: &Env) -> MacroexpandEnv {
-    fn collect_frames(
-        frame: &Arc<SharedCell<EnvFrame>>,
-        frames: &mut Vec<Arc<SharedCell<EnvFrame>>>,
-    ) {
+    fn collect_frames(frame: &Arc<FrameCell>, frames: &mut Vec<Arc<FrameCell>>) {
         let parent = frame.borrow().parent.clone();
         if let Some(parent) = parent {
             collect_frames(&parent, frames);
@@ -44973,7 +44970,7 @@ fn apply_function_impl(
                         *params,
                         *body,
                         args,
-                        Arc::new(SharedCell::new(EnvFrame::default())),
+                        FrameCell::new_arc(EnvFrame::default()),
                         LexicalControl::Fresh,
                     );
                     if let Err(error) = &result {
@@ -45343,7 +45340,7 @@ fn apply_function_impl(
         // named function created inside a lexical binding has an explicit
         // captured environment; otherwise use the null lexical environment.
         let parent = bytecode::closure_captured_env(fn_val)
-            .unwrap_or_else(|| Arc::new(SharedCell::new(EnvFrame::default())));
+            .unwrap_or_else(|| FrameCell::new_arc(EnvFrame::default()));
         return with_special_declarations(env, Vec::new(), |env| {
             eval_lambda_call_ex(env, params_form, body, args, parent, LexicalControl::Fresh)
         });
@@ -47029,7 +47026,7 @@ fn eval_handler_case(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> 
     // presence is what says a :no-error clause was seen.
     egcl_rt::rooted!(no_error_params = NIL);
     egcl_rt::rooted!(no_error_body = NIL);
-    let mut no_error_frame: Option<Arc<SharedCell<EnvFrame>>> = None;
+    let mut no_error_frame: Option<Arc<FrameCell>> = None;
     let mut c = clauses;
     while c.is_cons() {
         let (clause, rest) = cp(c);
@@ -47336,7 +47333,7 @@ fn restart_designator_form(form: EgclVal) -> EgclVal {
 
 fn parse_restart_options(
     option_forms: EgclVal,
-    captured_frame: &Arc<SharedCell<EnvFrame>>,
+    captured_frame: &Arc<FrameCell>,
 ) -> (Option<RestartFunction>, Option<RestartFunction>, EgclVal) {
     let options = list_to_vec(option_forms);
     let mut interactive_function = None;
@@ -48487,7 +48484,7 @@ const FORMATTER_PROTOCOL_KEY: &str = "\0egcl-lexical:formatter-protocol";
 /// Inspect ONLY constructor-owned direct state and both exact self witnesses.
 /// The descriptor is (self . (raw-control . private-self-symbol)); it is ordinary
 /// traced frame data, not a source/template marker or globally owned registry.
-fn formatter_owned_state(function: EgclVal) -> Option<(Arc<SharedCell<EnvFrame>>, EgclVal, u32)> {
+fn formatter_owned_state(function: EgclVal) -> Option<(Arc<FrameCell>, EgclVal, u32)> {
     if !egcl_rt::function::is_interpreted_function(function) {
         return None;
     }
@@ -48535,12 +48532,12 @@ fn compile_owned_formatter(function: EgclVal, env: &Env) -> Result<Option<EgclVa
     egcl_rt::rooted!(control = control);
     let frame = {
         let original = original_frame.borrow();
-        Arc::new(SharedCell::new(EnvFrame {
+        FrameCell::new_arc(EnvFrame {
             vars: original.vars.clone(),
             symbol_vars: original.symbol_vars.clone(),
             function_vars: original.function_vars.clone(),
             parent: None,
-        }))
+        })
     };
     let mut compile_env = env.clone();
     compile_env.frame = Arc::clone(&frame);
@@ -48615,7 +48612,7 @@ fn make_formatter(control: EgclVal, _env: &mut Env) -> Result<EgclVal, EgclError
     egcl_rt::rooted!(params = vec_to_list(&[symbols[2], *rest, symbols[3]]));
     egcl_rt::rooted!(call = vec_to_list(&[*entry, symbols[0], symbols[2], symbols[1], symbols[3]]));
     egcl_rt::rooted!(body = arena_cons(*call, NIL));
-    let frame = Arc::new(SharedCell::new(EnvFrame::default()));
+    let frame = FrameCell::new_arc(EnvFrame::default());
     egcl_rt::rooted!(_frame_root = SuspendedFrameRoot(Arc::clone(&frame)));
     {
         let mut state = frame.borrow_mut();
@@ -50256,7 +50253,7 @@ mod host_registry_hook_tests {
         let name = "HOST-HOOK-TEST-MAC";
         // Defined as if inside (LET ((HELD 42)) ...), so the round trip has a
         // captured binding to keep.
-        let captured = Arc::new(SharedCell::new(EnvFrame::default()));
+        let captured = FrameCell::new_arc(EnvFrame::default());
         captured
             .borrow_mut()
             .vars
@@ -50300,7 +50297,7 @@ mod host_registry_hook_tests {
         );
 
         host_restore_registries(&bytes).expect("restore host registries");
-        let fresh_frame = Arc::new(SharedCell::new(EnvFrame::default()));
+        let fresh_frame = FrameCell::new_arc(EnvFrame::default());
         drain_pending_host_registries(&fresh_frame);
 
         // Macro is back with the same params/body objects.
@@ -50574,7 +50571,7 @@ mod env_gc_root_tests {
     fn env_root_visitor_rewrites_all_retained_value_slots() {
         let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let mut env = Env::new(false);
-        let parent = Arc::new(SharedCell::new(EnvFrame::default()));
+        let parent = FrameCell::new_arc(EnvFrame::default());
 
         env.frame.borrow_mut().vars.insert("ROOT".into(), marker(0));
         env.frame.borrow_mut().symbol_vars.insert(1, marker(1));
@@ -50725,7 +50722,7 @@ mod env_gc_root_tests {
                         defining_frame: Some({
                             let mut frame = EnvFrame::default();
                             frame.vars.insert("definition-only".into(), marker(41));
-                            Arc::new(SharedCell::new(frame))
+                            FrameCell::new_arc(frame)
                         }),
                         defining_specials: Vec::new(),
                         defining_macros: None,
@@ -50983,7 +50980,7 @@ mod transient_shadow_root_tests {
         const NAME: &str = "GC-RETAINED-GLOBAL-MACRO";
         let marker = |offset| EgclVal::from_fixnum(GLOBAL_BASE + offset);
         let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-        let frame = Arc::new(SharedCell::new(EnvFrame::default()));
+        let frame = FrameCell::new_arc(EnvFrame::default());
         frame.borrow_mut().vars.insert("CAPTURED".into(), marker(2));
         {
             GLOBAL_MACROS.lock().unwrap().insert(

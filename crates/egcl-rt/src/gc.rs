@@ -1562,7 +1562,7 @@ unsafe fn trace_object(
 
         // ── Interpreted function: lambda_list/body/env/name (§1.11.1). ──
         tid::FUNCTION_INTERPRETED => {
-            for i in 0..4 {
+            for i in 0..FUNCTION_HEAP_REFERENCE_WORDS {
                 visit_word(i);
             }
             if words >= 4 {
@@ -1663,6 +1663,26 @@ unsafe fn trace_object(
 // off-heap storage (a stream's state block, an interpreted function's captured
 // environment) can change without a heap write, so they are traced on every
 // collection from a per-region list kept between collections.
+
+/// Leading body words of an interpreted function that hold heap references
+/// (lambda_list, body, env, name); the rest are counters and raw metadata.
+const FUNCTION_HEAP_REFERENCE_WORDS: usize = 4;
+
+/// Visit only the heap reference words of an interpreted function, leaving its
+/// off-heap captures to the remembered-capture scanner (bliss-gg3i1.7.9).
+///
+/// # Safety
+/// `body` must be the body of a live FUNCTION_INTERPRETED object of
+/// `body_len` bytes.
+unsafe fn trace_function_heap_words(
+    body: *mut u8,
+    body_len: usize,
+    mut visit: impl FnMut(*mut EgclVal),
+) {
+    for i in 0..FUNCTION_HEAP_REFERENCE_WORDS.min(body_len / 8) {
+        visit(unsafe { (body as *mut EgclVal).add(i) });
+    }
+}
 
 /// Whether `trace_object` reaches slots outside the object's own heap words for
 /// this type — storage whose changes no heap page records.
@@ -1980,8 +2000,15 @@ impl HeapCollector {
     fn scan_dirty_old_generation(
         state: &HeapState,
         scan: &mut OldGenScan,
+        captures_remembered: bool,
         mut visit: impl FnMut(*mut EgclVal, &mut OldGenScan),
     ) {
+        // With remembered captures, an old interpreted function on a clean
+        // page has nothing to visit: its heap words are unwritten and the
+        // evaluator's scanner covers every capture written this epoch.
+        let skip_off_heap = |type_id: u8| {
+            captures_remembered && type_id == crate::object::type_id::FUNCTION_INTERPRETED
+        };
         let dirty = std::mem::take(&mut scan.dirty);
         for (idx, region) in state.regions.iter().enumerate() {
             let kind = region.header.kind;
@@ -1998,6 +2025,9 @@ impl HeapCollector {
                     let header_ptr = scan.off_heap[idx][i] as *const u8;
                     // SAFETY: recorded live object headers in an unwritten region.
                     let (type_id, body_size) = unsafe { read_object_header(header_ptr) };
+                    if skip_off_heap(type_id) {
+                        continue;
+                    }
                     let body = unsafe { header_ptr.add(body_offset(header_ptr)) } as *mut u8;
                     unsafe {
                         trace_object(body, type_id, body_size as usize, |slot| visit(slot, scan))
@@ -2029,9 +2059,22 @@ impl HeapCollector {
                             scan.stubs.push(cursor);
                         }
                     }
+                } else if written && skip_off_heap(type_id) {
+                    // Its captures are the remembered scanner's; only the
+                    // written heap words can hold a new young reference.
+                    scan.note_object(idx, cursor, type_id);
+                    scan.traced_objects += 1;
+                    let body = unsafe { header_ptr.add(body_offset(header_ptr)) } as *mut u8;
+                    unsafe {
+                        trace_function_heap_words(body, body_size as usize, |slot| {
+                            if dirty.is_dirty(slot as usize) {
+                                visit(slot, scan);
+                            }
+                        })
+                    };
                 } else {
                     scan.note_object(idx, cursor, type_id);
-                    let off_heap = traces_off_heap(type_id);
+                    let off_heap = traces_off_heap(type_id) && !skip_off_heap(type_id);
                     if written || off_heap {
                         scan.traced_objects += 1;
                         let body = unsafe { header_ptr.add(body_offset(header_ptr)) } as *mut u8;
@@ -2379,6 +2422,9 @@ impl HeapCollector {
             .ok_or_else(|| EgclError::Internal("heap not initialized".into()))?;
 
         let promotion_threshold = self.promotion_threshold;
+        // Before any root scan: both external-root passes and the old scan
+        // below must agree on who visits old functions' captures.
+        let (_captures_scope, captures_remembered) = CapturesRememberedScope::enter();
 
         // Phase 1: Ensure we have a survivor region to copy into.
         let mut survivor_idx = Self::find_or_create_target_region(
@@ -2548,20 +2594,25 @@ impl HeapCollector {
             old_scan_tests::DIRTY_SCANS.with(|count| count.set(count.get() + 1));
         }
         if dirty_scan {
-            Self::scan_dirty_old_generation(state, &mut old_scan, |slot, scan| {
-                // SAFETY: the scan hands out live, readable reference slots.
-                let v = unsafe { *slot };
-                if !is_heap_ref(v) {
-                    return;
-                }
-                let target = ref_body_addr(resolve_forwarded(v));
-                if nursery_index.position(target).is_some() {
-                    scan.slots.push(slot as usize);
-                    if nursery_index.mark(target) {
-                        mark_worklist.push(target);
+            Self::scan_dirty_old_generation(
+                state,
+                &mut old_scan,
+                captures_remembered,
+                |slot, scan| {
+                    // SAFETY: the scan hands out live, readable reference slots.
+                    let v = unsafe { *slot };
+                    if !is_heap_ref(v) {
+                        return;
                     }
-                }
-            });
+                    let target = ref_body_addr(resolve_forwarded(v));
+                    if nursery_index.position(target).is_some() {
+                        scan.slots.push(slot as usize);
+                        if nursery_index.mark(target) {
+                            mark_worklist.push(target);
+                        }
+                    }
+                },
+            );
         }
         for (region_idx, region) in state.regions.iter().enumerate() {
             if dirty_scan {
@@ -3197,6 +3248,9 @@ impl HeapCollector {
         // Update local stats copy.
         self.gc_stats = state.stats.clone();
         GC_MOVE_EPOCH.fetch_add(1, Ordering::Release);
+        // The nursery is empty: everything written before this point now
+        // refers to older objects only (bliss-gg3i1.7.9).
+        MINOR_EPOCH.fetch_add(1, Ordering::Release);
 
         // Return the scratch to the thread-local with its capacity retained
         // (bliss-5i3f). No early exit runs between the takes above and here.
@@ -7410,6 +7464,74 @@ static FUNCTION_CAPTURE_SWEEP_FN: OnceLock<FunctionCaptureSweepFn> = OnceLock::n
 /// Function objects are pinned, so nursery collection cannot end their lifetime.
 pub fn set_function_capture_sweep_fn(sweep: FunctionCaptureSweepFn) {
     let _ = FUNCTION_CAPTURE_SWEEP_FN.set(sweep);
+}
+
+// ── Remembered function captures (bliss-gg3i1.7.9) ────────────────
+//
+// A minor collection leaves nothing in the nursery: every survivor is copied
+// out or its region is promoted in place. So off-heap storage that has not been
+// written since the last completed minor collection cannot refer into the
+// nursery, and re-tracing it is wasted work. Tracing every old interpreted
+// function's captures (its bytecode body and captured frames) on every minor
+// collection made each one cost time proportional to the number of live
+// functions. The evaluator instead records which captured frames and bodies
+// were written or published in each epoch, scans exactly those as minor
+// roots, and tells this collector so through the hook below; the collector
+// then skips the captures of old FUNCTION_INTERPRETED objects on clean pages.
+// Major collections and every non-minor walk always trace captures in full.
+
+/// Count of completed minor collections; the "epoch" writers stamp.
+static MINOR_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// The number of minor collections that have completed. Off-heap storage
+/// written while this reads `e` may refer into the nursery until minor
+/// collection `e + 1` completes; storage last written at an earlier epoch was
+/// visited by a completed minor collection and refers to no nursery object.
+#[inline]
+pub fn minor_epoch() -> u64 {
+    MINOR_EPOCH.load(Ordering::Acquire)
+}
+
+type FunctionCapturesRememberedFn = fn() -> bool;
+static FUNCTION_CAPTURES_REMEMBERED_FN: OnceLock<FunctionCapturesRememberedFn> = OnceLock::new();
+/// The decision for the minor collection in progress (false outside one).
+static FUNCTION_CAPTURES_REMEMBERED: AtomicBool = AtomicBool::new(false);
+
+/// Install the evaluator's answer to "does a registered root scanner visit, as
+/// minor roots, every captured frame and bytecode body written since the last
+/// completed minor collection?". Asked once at the start of each minor
+/// collection, with the world stopped; the answer holds for that whole
+/// collection.
+pub fn set_function_captures_remembered_fn(remembered: FunctionCapturesRememberedFn) {
+    let _ = FUNCTION_CAPTURES_REMEMBERED_FN.set(remembered);
+}
+
+/// True during a minor collection that skips the off-heap captures of old
+/// interpreted functions, because the evaluator's remembered-capture scanner
+/// visits every capture written since the last completed minor collection.
+/// That scanner must visit them exactly when this is true.
+pub fn function_captures_remembered() -> bool {
+    FUNCTION_CAPTURES_REMEMBERED.load(Ordering::Acquire)
+}
+
+/// Publishes the remembered-capture decision for one minor collection and
+/// withdraws it on every exit path.
+struct CapturesRememberedScope;
+
+impl CapturesRememberedScope {
+    fn enter() -> (Self, bool) {
+        let remembered = FUNCTION_CAPTURES_REMEMBERED_FN
+            .get()
+            .is_some_and(|remembered| remembered());
+        FUNCTION_CAPTURES_REMEMBERED.store(remembered, Ordering::Release);
+        (Self, remembered)
+    }
+}
+
+impl Drop for CapturesRememberedScope {
+    fn drop(&mut self) {
+        FUNCTION_CAPTURES_REMEMBERED.store(false, Ordering::Release);
+    }
 }
 
 /// Set by [`request_major_gc`]; consumed by the next minor collection.

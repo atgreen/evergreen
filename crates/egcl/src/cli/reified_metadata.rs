@@ -58,7 +58,7 @@ impl FunctionScopes {
             .map_or(u32::MAX, |scope| self.ids[&(Arc::as_ptr(scope) as usize)])
     }
 
-    pub(super) fn frames(&self) -> Vec<Arc<SharedCell<EnvFrame>>> {
+    pub(super) fn frames(&self) -> Vec<Arc<FrameCell>> {
         self.scopes
             .iter()
             .flat_map(|scope| {
@@ -186,7 +186,7 @@ pub(super) fn restore(
     data: &[u8],
     offset: &mut usize,
     remap: &impl Fn(u64) -> u64,
-    frames: &[Arc<SharedCell<EnvFrame>>],
+    frames: &[Arc<FrameCell>],
     restored_closure_ids: &HashSet<u64>,
 ) -> Result<(), EgclError> {
     let mut reader = Reader { data, offset };

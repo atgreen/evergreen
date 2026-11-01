@@ -1941,12 +1941,12 @@ mod tests {
                 compile_function("OBJECT-CAPTURE-FACTORY", *params, *form, &env, true, false)
                     .unwrap();
             let body = Arc::clone(&factory.nested_functions[0]);
-            let capture = Arc::new(SharedCell::new(EnvFrame {
+            let capture = FrameCell::new_arc(EnvFrame {
                 vars: Default::default(),
                 symbol_vars: Default::default(),
                 function_vars: Default::default(),
                 parent: None,
-            }));
+            });
             bind_boxed_param(&capture, "SEED", EgclVal::from_fixnum(1));
             *function = make_bytecode_closure(&body, Some(capture));
             let symbol = egcl_rt::function::name(*function).as_symbol_index();
