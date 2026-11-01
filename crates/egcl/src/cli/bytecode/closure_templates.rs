@@ -512,6 +512,37 @@ mod tests {
         assert!(registry_get(symbol).is_some_and(|code| Arc::ptr_eq(&code, &body)));
     }
 
+    /// A collection that frees pinned functions advances the epoch, and the
+    /// revalidation hook (run in every major mode) keeps a surviving template
+    /// current without a new instance, so its body keeps tracing it.
+    #[test]
+    fn surviving_template_stays_current_across_pinned_reclamation() {
+        let _lock = crate::cli::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env_root = &mut env);
+        let body = template_body("TEMPLATE-REVALIDATE", &env);
+        egcl_rt::rooted!(
+            kept =
+                make_template_closure(&body, Some(FrameCell::new_arc(EnvFrame::default())), &env)
+        );
+        let (prototype, symbol) = body.closure_template.current().unwrap();
+        let epoch = egcl_rt::gc::pinned_function_epoch();
+        // Dead pinned functions for the collection to free.
+        for _ in 0..16 {
+            make_bytecode_closure(&body, Some(FrameCell::new_arc(EnvFrame::default())));
+        }
+        egcl_rt::gc::full_gc().unwrap();
+        assert_ne!(
+            egcl_rt::gc::pinned_function_epoch(),
+            epoch,
+            "pinned functions were freed"
+        );
+        assert_eq!(body.closure_template.current(), Some((prototype, symbol)));
+        assert_eq!(egcl_rt::function::definition_index(*kept), symbol);
+    }
+
     /// A captured payload reachable only through an old instance's state is
     /// traced and relocated by a minor collection.
     #[test]

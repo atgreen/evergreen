@@ -3825,6 +3825,13 @@ impl HeapCollector {
             dead_functions.retain(|name| !live_functions.contains(name));
             sweep(&dead_functions.into_iter().collect::<Vec<_>>());
         }
+        // In either mode, let caches of surviving pinned functions revalidate
+        // against the advanced epoch before mutators run again.
+        if !dead_function_slots.is_empty()
+            && let Some(revalidate) = PINNED_FUNCTIONS_REVALIDATE_FN.get()
+        {
+            revalidate();
+        }
         // A dead object's own state dies with it in either mode: its storage
         // is erased below. Release runs host destructors only.
         if !dead_closure_states.is_empty() {
@@ -7588,6 +7595,18 @@ pub fn set_closure_state_release_fn(release: ClosureStateReleaseFn) {
 /// recorded with an earlier value may since have been reused, so callers that
 /// cache a function object's address outside the heap revalidate it then.
 static PINNED_FUNCTION_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+type PinnedFunctionsRevalidateFn = fn();
+static PINNED_FUNCTIONS_REVALIDATE_FN: OnceLock<PinnedFunctionsRevalidateFn> = OnceLock::new();
+
+/// Install the evaluator's revalidation of caches that hold pinned function
+/// addresses. A major collection that frees pinned functions advances
+/// [`pinned_function_epoch`] and then calls it, in every major mode, with the
+/// world stopped and dead uninterned symbols already removed from the symbol
+/// registry. It must not allocate Lisp objects.
+pub fn set_pinned_functions_revalidate_fn(revalidate: PinnedFunctionsRevalidateFn) {
+    let _ = PINNED_FUNCTIONS_REVALIDATE_FN.set(revalidate);
+}
 
 /// The current pinned-function reclamation epoch (see [`PINNED_FUNCTION_EPOCH`]).
 #[inline]

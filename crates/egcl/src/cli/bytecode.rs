@@ -902,20 +902,27 @@ fn note_closure_instance_state() {
     }
 }
 
-fn sweep_function_captures(names: &[EgclVal]) {
-    use std::sync::atomic::Ordering;
-    sweep_dead_function_captures(names);
-    // The collection may have freed pinned functions and advanced the epoch.
-    // A template that survived it keeps a live prototype: revalidate its
-    // cell, so its live body keeps tracing the template (and its compiled
-    // code) even if no instance is made before the next collection.
+/// The collection freed pinned functions and advanced the epoch (in any
+/// major mode, including one that keeps the nursery and skips the capture
+/// sweep). A template whose symbol survived keeps its prototype in that
+/// symbol's function cell: revalidate its cell, so its live body keeps
+/// tracing the template, and with it the compiled code, even if no instance
+/// is made before the next collection. Dead uninterned symbols are already
+/// gone from the registry, so a dead template fails the check.
+fn revalidate_closure_templates() {
     for (&symbol, body) in closure_bodies().borrow().iter() {
         if let Some((prototype, template)) = body.closure_template.candidate()
             && template == symbol
+            && egcl_rt::symbols::symbol_function(symbol) == Some(prototype)
         {
             body.closure_template.publish(prototype, symbol);
         }
     }
+}
+
+fn sweep_function_captures(names: &[EgclVal]) {
+    use std::sync::atomic::Ordering;
+    sweep_dead_function_captures(names);
     // Rearm the major-collection request from this sweep's survivors.
     let live = closure_bodies().borrow().len();
     PRIVATE_CLOSURE_MAJOR_BUDGET.store(
@@ -1399,6 +1406,7 @@ fn install_bytecode_root_scanner() {
         egcl_rt::gc::register_root_scanner(scan_bytecode_roots);
         egcl_rt::gc::set_function_capture_trace_fn(trace_function_captures);
         egcl_rt::gc::set_closure_state_release_fn(closure_templates::release_state);
+        egcl_rt::gc::set_pinned_functions_revalidate_fn(revalidate_closure_templates);
         super::remembered_captures::install();
         egcl_rt::gc::set_function_capture_sweep_fn(sweep_function_captures);
     });
