@@ -3523,7 +3523,6 @@ unsafe fn lexical_environment_leaf(
         || context.osr.is_some()
         || context.recursive_escape
         || context.owner.is_null()
-        || context.env_frame.is_null()
     {
         return None;
     }
@@ -3541,6 +3540,42 @@ unsafe fn lexical_environment_leaf(
         return None;
     }
     let instruction = owner.body.code.get(call.symbol as u32 as usize)?;
+    // Heap-environment reads and writes (Backpack) never allocate or reenter
+    // Lisp either; a missing binding takes the published path to signal.
+    let args = |count: usize| {
+        (call.nargs == count && !call.args.is_null())
+            .then(|| unsafe { std::slice::from_raw_parts(call.args, count) })
+    };
+    match *instruction {
+        Instr::EnvRef { depth, idx, .. } => {
+            let [environment] = *args(1)? else {
+                return None;
+            };
+            let value = egcl_rt::lexenv::load(environment, depth, idx)
+                .filter(|value| *value != egcl_rt::value::UNBOUND)?;
+            super::heap_env::count_access(depth);
+            return Some(value);
+        }
+        Instr::EnvSet { depth, idx, .. } => {
+            let [value, environment] = *args(2)? else {
+                return None;
+            };
+            if !egcl_rt::lexenv::store(environment, depth, idx, value) {
+                return None;
+            }
+            super::heap_env::count_access(depth);
+            return Some(NIL);
+        }
+        Instr::ClosureEnv if call.nargs == 0 && !context.env_frame.is_null() => {
+            return Some(super::heap_env::captured_env(
+                unsafe { &*context.env_frame }.as_ref(),
+            ));
+        }
+        _ => {}
+    }
+    if context.env_frame.is_null() {
+        return None;
+    }
     let frame = unsafe { &*context.env_frame }.as_ref()?;
     let (index, store) = match instruction {
         Instr::LoadEnvVar(index) if call.nargs == 0 => (*index, false),

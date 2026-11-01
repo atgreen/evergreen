@@ -98,6 +98,20 @@ fn every_binding_shape_agrees_at_every_tier() {
     }
 }
 
+/// Recursive LABELS functions stay on the name-keyed frames by default (see
+/// `heap_env::labels_enabled`); their heap layout must still be right.
+#[test]
+fn recursive_labels_on_heap_environments_agree_at_every_tier() {
+    let fixture = fixture();
+    let fixture = fixture.to_str().unwrap();
+    for tier in ["t0", "t1", "t2"] {
+        assert_expected(
+            &run(&["--load", fixture], tier, &[("EGCL_HEAP_ENV_LABELS", "1")]),
+            &format!("{tier} with heap LABELS"),
+        );
+    }
+}
+
 /// A collection on every allocation after start-up, with the freed nursery
 /// poisoned: a heap environment or a captured value held anywhere the
 /// collector cannot see would be read stale. Output must not change.
