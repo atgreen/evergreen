@@ -1995,11 +1995,30 @@ unsafe fn resume_native_child_guard(
                 tag_bcps: Vec::new(),
                 env: captured_env.clone(),
             },
+            // An ordinary frame's own special binding: adopted below from
+            // the native binding stack (bliss-gg3i1.7.4).
+            ScopeKind::SpecialBinding { .. } if scope.ownership == Ownership::Local => continue,
             _ => return Err(invalid_capture()),
         };
         state.handlers.push(handler);
     }
     egcl_rt::rooted!(state = Some(state));
+    if active
+        .iter()
+        .any(|scope| matches!(scope.kind, ScopeKind::SpecialBinding { .. }))
+    {
+        // Nothing collects between removing the entries and the rooted state
+        // owning their guards.
+        let adopted = super::special_bindings::adopt_native_bindings(active)?;
+        let owner = state.as_mut().ok_or_else(invalid_capture)?;
+        owner
+            .dyn_binds
+            .try_reserve_exact(adopted.len())
+            .map_err(|_| EgclError::Oom)?;
+        owner
+            .dyn_binds
+            .extend(adopted.into_iter().map(|(_, binding)| binding));
+    }
     let _capture_pause = CapturePause(CAPTURE.with(|slot| slot.replace(std::ptr::null_mut())));
     let _retire = RetireNativeDeoptFrame {
         fp: stack.fp(),
@@ -2288,6 +2307,26 @@ pub(super) unsafe fn resume_ordinary_guard(request: *mut u8) -> Result<EgclVal, 
             return Err(invalid_capture());
         }
         adapted.activation = unsafe { frame.add(1).cast() };
+        let active = code
+            .control_scopes
+            .before(bcp)
+            .ok_or_else(invalid_capture)?;
+        if active
+            .iter()
+            .any(|scope| matches!(scope.kind, ScopeKind::SpecialBinding { .. }))
+        {
+            // The managed resumption validates and takes the root frame's
+            // bindings from the mapped ledger, which this ordinary frame
+            // never used: its bindings are on the native binding stack.
+            let specials = unsafe { &mut *(*context).specials };
+            let adopted = super::special_bindings::adopt_native_bindings(active)?;
+            if !specials.is_empty() || specials.capacity() < adopted.len() {
+                return Err(invalid_capture());
+            }
+            specials.extend(adopted.into_iter().map(|(push_bcp, binding)| {
+                super::special_bindings::SavedSpecial { push_bcp, binding }
+            }));
+        }
         let mut out = NativeOutcome {
             value: NIL,
             exit: NativeExit::Returned,

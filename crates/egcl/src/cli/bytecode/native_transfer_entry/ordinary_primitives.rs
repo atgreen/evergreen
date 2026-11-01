@@ -202,12 +202,19 @@ pub(in crate::cli::bytecode) fn invoke(
         if env.is_null() {
             return Err(invalid_capture());
         }
-        unsafe {
-            (*env).clear_mv();
-        }
         use OrdinaryPrimitive::*;
+        // A value-preserving binding leaves the tuple for what follows; the
+        // ordinary return then reports it, as after any call.
+        if !matches!(
+            primitive,
+            BindSpecialPreservingValues | UnbindSpecialPreservingValues
+        ) {
+            unsafe {
+                (*env).clear_mv();
+            }
+        }
         let expected = match primitive {
-            LoadGlobal | LoadFunction => 1,
+            LoadGlobal | LoadFunction | UnbindSpecial | UnbindSpecialPreservingValues => 1,
             MakeArray | StoreEnvironment => 3,
             _ => 2,
         };
@@ -225,6 +232,29 @@ pub(in crate::cli::bytecode) fn invoke(
             MakeArray => make_array(args, env)?,
             LoadEnvironment => super::ordinary_closure_context::access(args, false)?,
             StoreEnvironment => super::ordinary_closure_context::access(args, true)?,
+            // The leaf helpers' general path (bliss-gg3i1.7.4): the same
+            // native binding-stack operations, reached only without them.
+            BindSpecial | BindSpecialPreservingValues => {
+                if !args[0].is_symbol() {
+                    return Err(invalid_capture());
+                }
+                let symbol = args[0].as_symbol_index();
+                egcl_rt::symbols::native_bind_symbol_value(
+                    symbol,
+                    args[1],
+                    egcl_rt::symbols::inline_access_object(symbol).unwrap_or(0),
+                );
+                NIL
+            }
+            UnbindSpecial | UnbindSpecialPreservingValues => {
+                if !args[0].is_fixnum()
+                    || args[0].as_fixnum() < 0
+                    || !egcl_rt::symbols::native_unbind_symbol_values(args[0].as_fixnum() as usize)
+                {
+                    return Err(invalid_capture());
+                }
+                NIL
+            }
             _ => {
                 let name = match primitive {
                     Add => "+",
@@ -267,19 +297,29 @@ impl Bindings {
         )
     }
 
+    /// `body` is the bytecode the IR was built from: a special binding's
+    /// symbol, and the number of bindings an exit restores, are its operands.
     pub(super) fn lower(
         &self,
+        body: &BytecodeFunction,
         ir: &mut egcl_compiler::t2::ir::Function,
         cells: &mut Vec<(u32, Arc<egcl_rt::call_table::CallCell>)>,
-    ) -> Option<()> {
-        egcl_compiler::t2::emit::lower_ordinary_primitives(ir, |primitive| {
-            let (_, symbol, cell) = self.0.iter().find(|(kind, _, _)| *kind == primitive)?;
-            if !cells.iter().any(|(existing, _)| existing == symbol) {
-                cells.push((*symbol, Arc::clone(cell)));
-            }
-            Some(*symbol)
-        })
-        .ok()?;
-        Some(())
+    ) -> Result<(), egcl_compiler::t2::emit::EmitError> {
+        egcl_compiler::t2::emit::lower_ordinary_primitives_with_specials(
+            ir,
+            |primitive| {
+                let (_, symbol, cell) = self.0.iter().find(|(kind, _, _)| *kind == primitive)?;
+                if !cells.iter().any(|(existing, _)| existing == symbol) {
+                    cells.push((*symbol, Arc::clone(cell)));
+                }
+                Some(*symbol)
+            },
+            |bcp, enter| match (enter, body.code.get(bcp as usize)?) {
+                (true, Instr::BindSpecial(symbol)) => Some(*symbol),
+                (false, Instr::UnbindSpecial(count)) => Some(u32::from(*count)),
+                _ => None,
+            },
+        )?;
+        Ok(())
     }
 }

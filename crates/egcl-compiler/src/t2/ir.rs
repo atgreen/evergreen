@@ -1206,6 +1206,7 @@ impl Function {
                     | AuxData::FunctionLookup(_)
                     | AuxData::ValuesToList
                     | AuxData::LexicalEnvironment { .. }
+                    | AuxData::SpecialBinding { .. }
             )
             || !self.block_has_terminator(block)
         {

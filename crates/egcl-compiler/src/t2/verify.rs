@@ -266,7 +266,10 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                     .filter(|id| (id.0 as usize) < f.frame_states.len())
                     .and_then(|id| f.frame_states.get(id).scopes.last())
                     .is_some_and(|scope| scope.bcp == bcp);
-                if data.opcode != Opcode::Invoke
+                // A plain `Call` before transfer legalization (bliss-gg3i1.7.4),
+                // without results either way.
+                if !matches!(data.opcode, Opcode::Invoke | Opcode::Call)
+                    || (data.opcode == Opcode::Call && !data.results.is_empty())
                     || data.args.len() != usize::from(enter)
                     || !identity_matches
                 {

@@ -738,11 +738,13 @@ pub fn emit_framed_ordinary_function_with_self_call_facts(
                     {
                         return Err(declined("call site shape"));
                     }
-                    if position + 2 == insts.len() {
-                        let ret = f.inst(insts[position + 1]);
-                        if ret.opcode == Opcode::Return && ret.args == data.results {
-                            returns.push(inst);
-                        }
+                    // The call's complete result reaches the return, directly
+                    // or across the special-binding exits restored between
+                    // them (bliss-gg3i1.7.4).
+                    if super::inline_special::forwarded_unbind_counts(f, insts, position, None)
+                        .is_some()
+                    {
+                        returns.push(inst);
                     }
                 }
                 Opcode::Return => {
@@ -753,9 +755,15 @@ pub fn emit_framed_ordinary_function_with_self_call_facts(
                     {
                         return Err(declined("raw ordinary return"));
                     }
+                    let mut call = position;
+                    while call > 0
+                        && super::inline_special::is_unbind_call(f.inst(insts[call - 1]))
+                    {
+                        call -= 1;
+                    }
                     if data.args.len() != 1
                         || (!single.contains(&inst)
-                            && (position == 0 || !returns.contains(&insts[position - 1])))
+                            && (call == 0 || !returns.contains(&insts[call - 1])))
                     {
                         return Err(declined("return of possibly multiple values"));
                     }

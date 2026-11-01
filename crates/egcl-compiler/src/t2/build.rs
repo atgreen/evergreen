@@ -288,6 +288,55 @@ pub fn build_for_transfer_optimization_with_inline_options(
     builder.run()
 }
 
+/// Build scope-aware SSA for a body whose only dynamic scopes are special
+/// bindings, keeping BIND-SPECIAL/UNBIND-SPECIAL as plain `SpecialBinding`
+/// calls (bliss-gg3i1.7.4). The ordinary entry lowers them to native
+/// binding-stack operations; the mapped clone gets its exceptional edges
+/// from `legalize_transfer_calls`. A body with any other dynamic scope, or a
+/// direct exit that would have to unwind a binding, is refused.
+pub fn build_for_special_binding_optimization_with_inline_options(
+    bf: &BytecodeFunction,
+    symbol: u32,
+    options: InlineOptions,
+) -> Result<Function, BuildError> {
+    if bf.code.iter().any(|op| {
+        matches!(
+            op,
+            Instr::PushCatch { .. }
+                | Instr::PushUnwind { .. }
+                | Instr::PushHandlerCase { .. }
+                | Instr::PushHandlerBind { .. }
+                | Instr::PushRestartCase { .. }
+                | Instr::MakeClosure { .. }
+                | Instr::LoadEnvVar(_)
+                | Instr::StoreEnvVar(_)
+                | Instr::DefineEnvVar(_)
+                | Instr::PushEnvChild
+                | Instr::PopEnvChild
+        )
+    }) {
+        return Err(BuildError::Unsupported(
+            "special-binding build admits no other dynamic scope",
+        ));
+    }
+    let mut builder = Builder::new(bf, options.constant_globals_only(symbol));
+    builder.transfer_mode = true;
+    builder.plain_specials = true;
+    builder.run()
+}
+
+pub fn build_for_special_binding_optimization_snapshot_with_inline_options(
+    snapshot: &super::constants::BytecodeSnapshot,
+    symbol: u32,
+    options: InlineOptions,
+) -> Result<Function, BuildError> {
+    build_for_special_binding_optimization_with_inline_options(
+        &snapshot.body,
+        symbol,
+        options.with_constant_snapshot(snapshot),
+    )
+}
+
 /// Build native registered-scope edges before SSA sealing while preserving
 /// the root definition identity used by optimization and deoptimization.
 pub fn build_for_native_scope_optimization(
@@ -753,6 +802,13 @@ struct Builder<'a> {
     /// Build structure opcodes as their general calls: the IR is for code
     /// without deopt metadata, which cannot recover a leaf helper's miss.
     structure_calls: bool,
+    /// Build BIND-SPECIAL/UNBIND-SPECIAL as plain `SpecialBinding` calls with
+    /// no exceptional successor (bliss-gg3i1.7.4). The ordinary entry lowers
+    /// them to native binding-stack operations; a mapped clone gets its
+    /// transfer edges from `legalize_transfer_calls`, as every other call.
+    /// Only meaningful without `native_cleanups`, whose builder already models
+    /// them with their exceptional edges.
+    plain_specials: bool,
     /// `CHAR`/`SCHAR`/`ELT` calls that receive an inline simple-string path
     /// once the CFG is complete (`string_char::admit_string_char_calls`).
     string_char_calls: HashSet<Inst>,
@@ -1048,6 +1104,7 @@ impl<'a> Builder<'a> {
             transfer_mode: false,
             native_cleanups: false,
             structure_calls: false,
+            plain_specials: false,
             string_char_calls: HashSet::new(),
         }
     }
@@ -1364,7 +1421,7 @@ impl<'a> Builder<'a> {
                 } => {
                     push(i + 1, d + 1, &mut depth_at, &mut work); // -> closure
                 }
-                Instr::BindSpecial(_) if self.native_cleanups => {
+                Instr::BindSpecial(_) if self.native_cleanups || self.plain_specials => {
                     if d < 1 {
                         return Err(BuildError::Unsupported("special binding without value"));
                     }
@@ -1399,7 +1456,7 @@ impl<'a> Builder<'a> {
                 } if self.native_cleanups => {
                     push(i + 1, d + 1, &mut depth_at, &mut work);
                 }
-                Instr::UnbindSpecial(_) if self.native_cleanups => {
+                Instr::UnbindSpecial(_) if self.native_cleanups || self.plain_specials => {
                     push(i + 1, d, &mut depth_at, &mut work);
                 }
                 Instr::PushHandlerBind { hb } if self.native_cleanups => {
@@ -2139,6 +2196,42 @@ impl<'a> Builder<'a> {
                     Some(target as usize),
                 )?;
                 return Ok(());
+            }
+            if self.plain_specials
+                && !self.native_cleanups
+                && matches!(instruction, Instr::BindSpecial(_) | Instr::UnbindSpecial(_))
+            {
+                // Same identity, operands and pre-operation state as the
+                // native-cleanups builder's invoke, without its edges.
+                let enter = matches!(instruction, Instr::BindSpecial(_));
+                let fs = self.build_frame_state(block, &stack, i as u32);
+                let args = if enter {
+                    vec![
+                        stack
+                            .pop()
+                            .ok_or(BuildError::Unsupported("special binding without value"))?,
+                    ]
+                } else {
+                    vec![]
+                };
+                self.f.push_inst(
+                    block,
+                    InstData {
+                        opcode: Opcode::Call,
+                        args,
+                        results: vec![],
+                        aux: AuxData::SpecialBinding {
+                            bcp: i as u32,
+                            enter,
+                        },
+                        flags: runtime_call_flags(),
+                        targets: vec![],
+                        frame_state: Some(fs),
+                        source_pos: 0,
+                    },
+                    &[],
+                );
+                continue;
             }
             if let Some(aux) = self.special_or_global_access(i) {
                 // The cold state is BEFORE consuming a binding/store operand.

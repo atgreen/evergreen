@@ -30264,6 +30264,10 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
             .is_some_and(|context| context.captured_entry_profitable());
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
     let ordinary_outer_capture = false;
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let special_binding_body = native_transfer_entry::special_binding_body(bf);
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+    let special_binding_body = false;
     let built = if ordinary_outer_capture {
         // Keep lexical operations semantic for the explicit-callable ordinary
         // adapter. prepare_ordinary_t2 legalizes a separate mapped clone using
@@ -30281,6 +30285,30 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
                 inline_options,
             )
         }
+    } else if let Some(Ok(ir)) = special_binding_body.then(|| {
+        // Special bindings are the body's only dynamic scopes: keep them plain
+        // so the ordinary entry can run them on the native binding stack
+        // (bliss-gg3i1.7.4). A refusal (e.g. a RETURN-FROM out of a binding)
+        // takes the native-scope builder below, exactly as before.
+        let built = if let Some(snapshot) = &input.snapshot {
+            egcl_compiler::t2::build::build_for_special_binding_optimization_snapshot_with_inline_options(
+                snapshot,
+                sym,
+                inline_options.clone(),
+            )
+        } else {
+            egcl_compiler::t2::build::build_for_special_binding_optimization_with_inline_options(
+                bf,
+                sym,
+                inline_options.clone(),
+            )
+        };
+        if let Err(error) = &built {
+            t2_log!("{name}: plain special-binding build refused ({error:?}); native-scope build");
+        }
+        built
+    }) {
+        Ok(ir)
     } else if cfg!(all(target_arch = "x86_64", target_os = "linux"))
         && bf.code.iter().any(|op| {
             matches!(

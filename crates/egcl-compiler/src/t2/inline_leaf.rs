@@ -56,6 +56,47 @@ pub struct LeafHelpers {
     /// `load_global(symbol_index) -> value | UNBOUND`: the current dynamic
     /// binding or global value of a symbol, UNBOUND when it has none.
     pub load_global: u64,
+    /// `bind_special(symbol_index, value, symbol_object) -> NIL`: establish a
+    /// special binding on the execution's native binding stack and empty the
+    /// multiple-value buffer (bliss-gg3i1.7.4). `symbol_object` is the pinned
+    /// object of an interned symbol, or 0. Never fails.
+    pub bind_special: u64,
+    /// `bind_special` leaving the multiple-value buffer alone.
+    pub bind_special_keep_values: u64,
+    /// `unbind_special(count) -> NIL`: restore the `count` newest native
+    /// bindings and empty the multiple-value buffer. Never fails.
+    pub unbind_special: u64,
+    /// `unbind_special` leaving the multiple-value buffer alone.
+    pub unbind_special_keep_values: u64,
+}
+
+/// The native special-binding leaf helpers.
+#[derive(Clone, Copy)]
+pub(super) struct SpecialBindingHelpers {
+    pub bind: u64,
+    pub bind_keep_values: u64,
+    pub unbind: u64,
+    pub unbind_keep_values: u64,
+}
+
+/// The native special-binding helpers, if all are installed.
+pub(super) fn special_binding_helpers() -> Option<SpecialBindingHelpers> {
+    let leaf = LEAF.get()?;
+    let helpers = SpecialBindingHelpers {
+        bind: leaf.bind_special,
+        bind_keep_values: leaf.bind_special_keep_values,
+        unbind: leaf.unbind_special,
+        unbind_keep_values: leaf.unbind_special_keep_values,
+    };
+    [
+        helpers.bind,
+        helpers.bind_keep_values,
+        helpers.unbind,
+        helpers.unbind_keep_values,
+    ]
+    .iter()
+    .all(|&helper| helper != 0)
+    .then_some(helpers)
 }
 
 static LEAF: std::sync::OnceLock<LeafHelpers> = std::sync::OnceLock::new();

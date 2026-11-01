@@ -418,7 +418,7 @@ pub(crate) use ordinary_primitives::packed_u8_adapter;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub use ordinary_primitives::{
     OrdinaryPrimitive, PackedU8AdapterSymbols, lower_ordinary_primitives,
-    register_packed_u8_adapter,
+    lower_ordinary_primitives_with_specials, register_packed_u8_adapter,
 };
 
 #[cfg(all(test, target_arch = "x86_64"))]
@@ -8422,7 +8422,17 @@ fn emit_framed_inner(
         };
         proven.extend(declared_fixnums.iter().copied());
         proven.extend(fixnum_valued.iter().copied());
+        // Set once a call's forwarded return has restored the bindings the
+        // rest of its block unbinds: those instructions are unreachable.
+        #[cfg_attr(
+            not(all(target_arch = "x86_64", target_os = "linux")),
+            allow(unused_mut)
+        )]
+        let mut forwarded_return = false;
         for &inst in &f.block(b).insts {
+            if forwarded_return {
+                continue;
+            }
             let d = f.inst(inst).clone();
             #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
             if straight_poll_sources.contains(&inst) {
@@ -8690,6 +8700,14 @@ fn emit_framed_inner(
                                 &homes,
                                 &const_tagged,
                                 inline_alloc_single.contains(&inst),
+                            )
+                        })
+                        .or_else(|| {
+                            inline_special::emit_ordinary_binding_fast_path(
+                                &mut a,
+                                &d,
+                                &homes,
+                                &const_tagged,
                             )
                         })
                         .or_else(|| {
@@ -10086,9 +10104,24 @@ fn emit_framed_inner(
             if ordinary_call_mode && d.opcode == Opcode::Call {
                 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
                 if ordinary_call.unwrap().returns_at(inst) {
-                    // Forward the complete tuple without clobbering CF.
+                    // Restore the special bindings an intervening exit
+                    // unbinds, then forward the complete tuple without
+                    // clobbering CF (bliss-gg3i1.7.4). The exit's own calls
+                    // and the return after it are never reached.
+                    let insts = &f.block(b).insts;
+                    let position = insts.iter().position(|&site| site == inst).unwrap();
+                    let counts = inline_special::forwarded_unbind_counts(
+                        f,
+                        insts,
+                        position,
+                        Some(&const_tagged),
+                    )
+                    .ok_or(EmitError::UnsupportedOp(0xFA))?;
+                    inline_special::emit_forwarded_unbinds(&mut a, &counts)
+                        .ok_or(EmitError::UnsupportedOp(0xFA))?;
                     emit_epilogue(&mut a);
                     a.push(0xc3);
+                    forwarded_return = !counts.is_empty();
                     continue;
                 }
                 // An intermediate or guarded continuation consumes the primary. Preserve it

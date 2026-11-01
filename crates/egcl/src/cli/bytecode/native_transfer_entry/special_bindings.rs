@@ -144,3 +144,63 @@ pub(super) unsafe fn special_request(call: &TransferCallRequest) -> Result<EgclV
     }
     Ok(NIL)
 }
+
+/// The special bindings an ordinary-ABI frame holds at a deoptimization point,
+/// handed from the execution's native binding stack to interpreter guards
+/// (bliss-gg3i1.7.4). `active` is the frame's exact scope map at the resumed
+/// bytecode position; its bindings are the newest native entries, oldest
+/// first, because every frame above this one has returned and restored its
+/// own. Each binding stays in effect: the returned guard restores it when the
+/// interpreter leaves its scope. The handler depth counts the scopes before
+/// it that the resumed activation owns as handlers, as `special_request`
+/// records it for a mapped frame.
+///
+/// Validates every symbol before removing anything. The saved values are not
+/// roots once returned: the caller must store them in a rooted owner before
+/// anything can collect. This function neither allocates on the Lisp heap
+/// nor collects.
+pub(super) fn adopt_native_bindings(
+    active: &[ControlScope],
+) -> Result<Vec<(u32, ScopedDynBind)>, EgclError> {
+    let bindings: Vec<(u32, u32, usize)> = active
+        .iter()
+        .enumerate()
+        .filter_map(|(index, scope)| match scope.kind {
+            ScopeKind::SpecialBinding { symbol } => Some((
+                scope.push_bcp,
+                symbol,
+                active[..index].iter().filter(|s| handler_scope(s)).count(),
+            )),
+            _ => None,
+        })
+        .collect();
+    let count = bindings.len();
+    for (index, &(_, symbol, _)) in bindings.iter().enumerate() {
+        if egcl_rt::symbols::native_binding_symbol(count - 1 - index) != Some(symbol) {
+            return Err(invalid_capture());
+        }
+    }
+    let mut adopted = Vec::new();
+    adopted
+        .try_reserve_exact(count)
+        .map_err(|_| EgclError::Oom)?;
+    let mut popped = Vec::new();
+    popped
+        .try_reserve_exact(count)
+        .map_err(|_| EgclError::Oom)?;
+    for _ in 0..count {
+        popped.push(egcl_rt::symbols::pop_native_binding().ok_or_else(invalid_capture)?);
+    }
+    for ((push_bcp, _, handler_depth), (symbol, saved)) in
+        bindings.into_iter().zip(popped.into_iter().rev())
+    {
+        adopted.push((
+            push_bcp,
+            ScopedDynBind {
+                guard: DynBind::adopt(symbol, saved),
+                handler_depth,
+            },
+        ));
+    }
+    Ok(adopted)
+}

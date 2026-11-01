@@ -254,3 +254,166 @@ pub(super) fn emit_transfer_fast_path(
     a.bind(slow);
     Some(done)
 }
+
+/// Which native special-binding adapter an ordinary call targets, as
+/// `(bind, preserving_values)` (bliss-gg3i1.7.4).
+fn binding_adapter(target: u32) -> Option<(bool, bool)> {
+    use super::OrdinaryPrimitive;
+    [
+        (OrdinaryPrimitive::BindSpecial, (true, false)),
+        (OrdinaryPrimitive::UnbindSpecial, (false, false)),
+        (OrdinaryPrimitive::BindSpecialPreservingValues, (true, true)),
+        (
+            OrdinaryPrimitive::UnbindSpecialPreservingValues,
+            (false, true),
+        ),
+    ]
+    .into_iter()
+    .find(|(primitive, _)| egcl_rt::symbols::find_index(&primitive.adapter_name()) == Some(target))
+    .map(|(_, kind)| kind)
+}
+
+/// An ordinary call to the (value-clearing) unbinding adapter, with its one
+/// count operand: the form a forwarded exit takes.
+pub(super) fn is_unbind_call(data: &InstData) -> bool {
+    matches!(data.aux, AuxData::CallTarget(target) if binding_adapter(target) == Some((false, false)))
+        && data.opcode == crate::t2::ir::Opcode::Call
+        && data.args.len() == 1
+        && data.results.is_empty()
+}
+
+/// Ordinary call to a special-binding adapter: call its leaf helper, which
+/// never fails, and jump to the returned label with NIL in RAX, as the
+/// adapter returns. A value-clearing adapter returns one value (CF clear). A
+/// value-preserving one leaves the incoming tuple alone and reports CF set,
+/// "values unknown": the caller's normalization of a discarded result then
+/// clears them, exactly as after any call; RDX and RCX are not read for a
+/// call that is not returned. The unchanged call after the label's
+/// fall-through point is never reached; it stays as the general path should
+/// the helpers be absent, in which case nothing is emitted.
+pub(super) fn emit_ordinary_binding_fast_path(
+    a: &mut Asm,
+    data: &InstData,
+    homes: &HashMap<Value, FramedHome>,
+    constants: &HashMap<Value, u64>,
+) -> Option<egcl_rt::asm::Label> {
+    let AuxData::CallTarget(target) = data.aux else {
+        return None;
+    };
+    let (bind, preserve) = binding_adapter(target)?;
+    let helpers = super::inline_leaf::special_binding_helpers()?;
+    if data.args.len() != if bind { 2 } else { 1 } || !data.results.is_empty() {
+        return None;
+    }
+    let mut args = Vec::with_capacity(data.args.len());
+    for value in &data.args {
+        args.push(match constants.get(value) {
+            Some(&bits) => super::inline_leaf::LeafArg::Immediate(bits),
+            None => super::inline_leaf::LeafArg::Home(*homes.get(value)?),
+        });
+    }
+    // The symbol and the count are immediates; the helpers take them untagged.
+    match args[0] {
+        super::inline_leaf::LeafArg::Immediate(bits) => {
+            let operand = egcl_rt::value::EgclVal(bits);
+            args[0] = super::inline_leaf::LeafArg::Immediate(if bind {
+                if !operand.is_symbol() {
+                    return None;
+                }
+                u64::from(operand.as_symbol_index())
+            } else {
+                if !operand.is_fixnum() || operand.as_fixnum() < 0 {
+                    return None;
+                }
+                operand.as_fixnum() as u64
+            });
+        }
+        super::inline_leaf::LeafArg::Home(_) => return None,
+    }
+    if bind {
+        // The pinned symbol object spares the guard update a registry lookup.
+        let super::inline_leaf::LeafArg::Immediate(symbol) = args[0] else {
+            return None;
+        };
+        let object = egcl_rt::symbols::inline_access_object(symbol as u32).unwrap_or(0);
+        args.push(super::inline_leaf::LeafArg::Immediate(object as u64));
+    }
+    if args.iter().any(|arg| {
+        matches!(arg, super::inline_leaf::LeafArg::Home(FramedHome::Reg(reg)) if matches!(*reg, RAX | SCRATCH | 7 | 4 | 5))
+    }) {
+        return None;
+    }
+    let helper = match (bind, preserve) {
+        (true, false) => helpers.bind,
+        (true, true) => helpers.bind_keep_values,
+        (false, false) => helpers.unbind,
+        (false, true) => helpers.unbind_keep_values,
+    };
+    let slow = a.label();
+    let done = a.label();
+    super::inline_leaf::emit_call(a, helper, &args, slow)?;
+    a.push(if preserve { 0xf9 } else { 0xf8 }); // stc: values unknown / clc: one value
+    a.jmp(done);
+    a.bind(slow);
+    Some(done)
+}
+
+/// The counts of the unbinding calls that follow a call whose complete result
+/// the function returns (`call, unbind..., return`), in order; empty when the
+/// return follows the call directly. `None` when `insts[position]` is not
+/// followed by such a sequence or a count is not an immediate.
+pub(super) fn forwarded_unbind_counts(
+    f: &crate::t2::ir::Function,
+    insts: &[crate::t2::ir::Inst],
+    position: usize,
+    constants: Option<&HashMap<Value, u64>>,
+) -> Option<Vec<u64>> {
+    let call = f.inst(insts[position]);
+    let mut counts = Vec::new();
+    let mut next = position + 1;
+    while next < insts.len() && is_unbind_call(f.inst(insts[next])) {
+        if let Some(constants) = constants {
+            let count = egcl_rt::value::EgclVal(*constants.get(&f.inst(insts[next]).args[0])?);
+            if !count.is_fixnum() || count.as_fixnum() < 0 {
+                return None;
+            }
+            counts.push(count.as_fixnum() as u64);
+        } else {
+            counts.push(0);
+        }
+        next += 1;
+    }
+    if !counts.is_empty() && super::inline_leaf::special_binding_helpers().is_none() {
+        return None;
+    }
+    let ret = f.inst(*insts.get(next)?);
+    (next + 1 == insts.len()
+        && ret.opcode == crate::t2::ir::Opcode::Return
+        && ret.args == call.results)
+        .then_some(counts)
+}
+
+/// Restore `counts` native bindings between a call and the return that
+/// forwards its complete result: RAX, RDX, RCX and CF (the ordinary return
+/// tuple) survive, and the multiple-value buffer is left alone. RSP must be
+/// 16-byte aligned, as at a call.
+pub(super) fn emit_forwarded_unbinds(a: &mut Asm, counts: &[u64]) -> Option<()> {
+    if counts.is_empty() {
+        return Some(());
+    }
+    let keep_values = super::inline_leaf::special_binding_helpers()?.unbind_keep_values;
+    super::push_reg(a, RAX);
+    super::push_reg(a, SCRATCH);
+    super::push_reg(a, 1); // rcx
+    a.push(0x9c); // pushfq: CF
+    for &count in counts {
+        mov_imm64(a, 7, count as i64); // rdi
+        mov_imm64(a, RAX, keep_values as i64);
+        a.extend_from_slice(&[0xFF, 0xD0]); // call rax
+    }
+    a.push(0x9d); // popfq
+    super::pop_reg(a, 1);
+    super::pop_reg(a, SCRATCH);
+    super::pop_reg(a, RAX);
+    Some(())
+}

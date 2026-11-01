@@ -486,6 +486,7 @@ impl ActivationState {
             slots: usize::from(code.slots),
             selected: None,
             failure: None,
+            native_bindings: egcl_rt::symbols::native_binding_depth(),
         }
     }
 }
