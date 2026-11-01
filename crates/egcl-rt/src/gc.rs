@@ -1576,8 +1576,15 @@ unsafe fn trace_object(
                 let index = unsafe { *body.add(offset).cast::<u32>() };
                 if index != 0 {
                     crate::symbols::trace_symbol_index(index, &mut visit);
-                    if let Some(trace) = FUNCTION_CAPTURE_TRACE_FN.get() {
-                        trace(EgclVal::from_symbol_index(index), &mut visit);
+                    // A private closure's definition symbol is its name, whose
+                    // captures the call above has just traced: tracing them
+                    // again visited every captured frame and body twice
+                    // (bliss-gg3i1.7.12).
+                    let definition = EgclVal::from_symbol_index(index);
+                    if words < 4 || word(3) != definition {
+                        if let Some(trace) = FUNCTION_CAPTURE_TRACE_FN.get() {
+                            trace(definition, &mut visit);
+                        }
                     }
                 }
             }
@@ -2104,6 +2111,7 @@ impl HeapCollector {
         pinned: &[usize],
         heap_base: usize,
         heap_end: usize,
+        captures_remembered: bool,
     ) {
         for &slot in &scan.slots {
             // SAFETY: slots recorded by this collection's scan; the world is
@@ -2133,10 +2141,26 @@ impl HeapCollector {
                 let total = unsafe { header_total_bytes(header_ptr) };
                 if !unsafe { header_is_forwarded(header_ptr) } {
                     let body = unsafe { header_ptr.add(body_offset(header_ptr)) };
-                    unsafe {
-                        trace_object(body, type_id, body_size as usize, |slot| {
-                            relocate_slot(slot, heap_base, heap_end);
-                        });
+                    if captures_remembered
+                        && type_id == crate::object::type_id::FUNCTION_INTERPRETED
+                    {
+                        // As in the scan: the remembered-capture scanner
+                        // relocates every capture written this epoch, and an
+                        // older one refers to no nursery object. Tracing the
+                        // captures here as well walked the frames and bodies
+                        // of every function in a retained or newly filled
+                        // region on each minor collection (bliss-gg3i1.7.12).
+                        unsafe {
+                            trace_function_heap_words(body, body_size as usize, |slot| {
+                                relocate_slot(slot, heap_base, heap_end);
+                            });
+                        }
+                    } else {
+                        unsafe {
+                            trace_object(body, type_id, body_size as usize, |slot| {
+                                relocate_slot(slot, heap_base, heap_end);
+                            });
+                        }
                     }
                 }
                 cursor += total;
@@ -2165,7 +2189,17 @@ impl HeapCollector {
     /// object. Forwarded (stale) originals are skipped; their storage is about to
     /// be reclaimed. Must run after all copying installs forwarding and before
     /// any region is freed, so no live field is left pointing at a stale location.
-    fn relocate_object_fields(state: &HeapState, heap_base: usize, heap_end: usize) {
+    /// `skip_remembered_captures`: a minor collection whose remembered-capture
+    /// scanner relocates every capture written this epoch (an older capture
+    /// refers to no nursery object) relocates only interpreted functions' heap
+    /// words, as its old-generation scan marks only them. A major collection
+    /// moves older objects too and must pass `false`.
+    fn relocate_object_fields(
+        state: &HeapState,
+        heap_base: usize,
+        heap_end: usize,
+        skip_remembered_captures: bool,
+    ) {
         for region in state.regions.iter() {
             if !matches!(
                 region.header.kind,
@@ -2186,10 +2220,20 @@ impl HeapCollector {
                 if !unsafe { header_is_forwarded(header_ptr) } {
                     // SAFETY: a valid live object header at `header_ptr`.
                     let body = unsafe { header_ptr.add(body_offset(header_ptr)) };
-                    unsafe {
-                        trace_object(body, type_id, body_size as usize, |slot| {
-                            relocate_slot(slot, heap_base, heap_end);
-                        });
+                    if skip_remembered_captures
+                        && type_id == crate::object::type_id::FUNCTION_INTERPRETED
+                    {
+                        unsafe {
+                            trace_function_heap_words(body, body_size as usize, |slot| {
+                                relocate_slot(slot, heap_base, heap_end);
+                            });
+                        }
+                    } else {
+                        unsafe {
+                            trace_object(body, type_id, body_size as usize, |slot| {
+                                relocate_slot(slot, heap_base, heap_end);
+                            });
+                        }
                     }
                 }
                 cursor += total;
@@ -2644,13 +2688,28 @@ impl HeapCollector {
                 if !unsafe { header_is_forwarded(header_ptr) } {
                     old_scan.note_object(region_idx, cursor, type_id);
                     let body_off = unsafe { body_offset(header_ptr) };
-                    unsafe {
-                        trace_object(
-                            (cursor + body_off) as *mut u8,
-                            type_id,
-                            body_size as usize,
-                            |slot| mark_ref(*slot, &mut nursery_index, &mut mark_worklist),
-                        );
+                    let body = (cursor + body_off) as *mut u8;
+                    if captures_remembered
+                        && type_id == crate::object::type_id::FUNCTION_INTERPRETED
+                    {
+                        // The remembered-capture scanner marks every capture
+                        // written this epoch; an older capture refers to no
+                        // nursery object. Tracing every old function's
+                        // captures here made each minor collection walk the
+                        // frames and bodies of every live function
+                        // (bliss-gg3i1.7.12), which the dirty-page scan
+                        // already avoids.
+                        unsafe {
+                            trace_function_heap_words(body, body_size as usize, |slot| {
+                                mark_ref(*slot, &mut nursery_index, &mut mark_worklist)
+                            });
+                        }
+                    } else {
+                        unsafe {
+                            trace_object(body, type_id, body_size as usize, |slot| {
+                                mark_ref(*slot, &mut nursery_index, &mut mark_worklist)
+                            });
+                        }
                     }
                 }
                 cursor += total_size;
@@ -2924,9 +2983,10 @@ impl HeapCollector {
                 &pinned_indices,
                 heap_base_addr,
                 heap_end,
+                captures_remembered,
             );
         } else {
-            Self::relocate_object_fields(state, heap_base_addr, heap_end);
+            Self::relocate_object_fields(state, heap_base_addr, heap_end, captures_remembered);
         }
 
         phases.mark(MinorPhase::HeapRelocate);
@@ -3904,7 +3964,7 @@ impl HeapCollector {
         // thread (nmq.3), and the entry-continuation root. After this pass no
         // reachable slot points at a stale, about-to-be-freed location.
         let heap_end = heap_base_addr + heap_size;
-        Self::relocate_object_fields(state, heap_base_addr, heap_end);
+        Self::relocate_object_fields(state, heap_base_addr, heap_end, false);
         Self::relocate_cl_stack_refs(heap_base_addr, heap_size);
         relocate_entry_continuation(heap_base_addr, heap_end);
         // Symbol-table roots (bliss-jtc.6 Stage C): rewrite any symbol cell that

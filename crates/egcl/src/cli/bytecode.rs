@@ -1676,6 +1676,27 @@ pub(super) fn is_registered(sym: u32) -> bool {
     registry_get(sym).is_some()
 }
 
+/// [`registry_put`] for a private closure identity minted by the caller just
+/// now. Uninterned symbol indices come from a counter and are never reused, so
+/// no registry, profile or tiering table can hold an entry for `sym` yet:
+/// installing the definition is two insertions instead of the generation
+/// check and the dozen removals [`install_local_definition`] performs for a
+/// redefinition. Closure creation paid those on every instance
+/// (bliss-gg3i1.7.12).
+fn publish_fresh_private_bytecode(sym: u32, f: Arc<BytecodeFunction>) {
+    debug_assert!(egcl_rt::symbols::is_uninterned(sym));
+    debug_assert!(REGISTRY.with(|r| !r.borrow().contains_key(&sym)));
+    debug_assert!(REGISTRY_GENERATION.with(|g| !g.borrow().contains_key(&sym)));
+    register_bytecode_roots(&f);
+    note_private_closure_published();
+    REGISTRY_GENERATION.with(|g| {
+        g.borrow_mut().insert(sym, 1);
+    });
+    REGISTRY.with(|r| {
+        r.borrow_mut().insert(sym, f);
+    });
+}
+
 fn registry_put(sym: u32, f: Arc<BytecodeFunction>) {
     let function = egcl_rt::symbols::symbol_function(sym).unwrap_or(NIL);
     publish_bytecode(sym, f, None, function);
@@ -16387,7 +16408,7 @@ pub(super) fn make_bytecode_closure(
     nested: &Arc<BytecodeFunction>,
     captured_env: Option<Arc<FrameCell>>,
 ) -> EgclVal {
-    make_prepared_bytecode_closure(nested, captured_env, false).0
+    make_prepared_bytecode_closure(nested, captured_env, false, false).0
 }
 
 /// Production MakeClosure may share a function only when neither lexical cells
@@ -16398,11 +16419,15 @@ fn make_template_closure(
     captured_env: Option<Arc<FrameCell>>,
     env: &Env,
 ) -> EgclVal {
-    let (closure, control_free) = if captured_env.is_some() {
-        (make_bytecode_closure(nested, captured_env), false)
-    } else {
-        make_prepared_bytecode_closure(nested, None, true)
-    };
+    let reuse = captured_env.is_none();
+    let (closure, control_free) = make_prepared_bytecode_closure(nested, captured_env, reuse, true);
+    // A body with no free control exit (bliss-uebgs) never consults the
+    // block/tag scope it was created in, whether or not it captures lexical
+    // cells: the snapshot only resolves its own ReturnFromNamed/GoNamed and
+    // those of closures it creates. Capturing closures used to snapshot it
+    // unconditionally, cloning the creator's whole scope on every creation
+    // and keeping the instance off the native call fast paths, which refuse
+    // a callable with captured control (bliss-gg3i1.7.12).
     if !control_free {
         register_closure_control(closure, env);
     }
@@ -16413,6 +16438,7 @@ fn make_prepared_bytecode_closure(
     nested: &Arc<BytecodeFunction>,
     captured_env: Option<Arc<FrameCell>>,
     reuse: bool,
+    analyze_control: bool,
 ) -> (EgclVal, bool) {
     egcl_rt::rooted!(_nested_roots = ActiveBytecodeRoot::new(nested));
     // The caller need not expose this frame through an active activation yet.
@@ -16430,18 +16456,13 @@ fn make_prepared_bytecode_closure(
     egcl_rt::safepoint::poll_safepoint();
     collect_requested_major_before_closure();
     let cached = closure_templates::lookup(nested);
-    // Disabled/fresh construction needs no identity-sharing analysis. Keep the
-    // uncached comparison free of work introduced solely to justify reuse.
-    let control_free = cached.map_or_else(
-        || {
-            reuse
-                && closure_templates::enabled()
-                && captured_env.is_none()
-                && !bf_has_free_control_exit(nested)
-        },
-        |p| p.control_free,
-    );
-    let reusable = reuse && captured_env.is_none() && control_free;
+    // Fresh construction needs no control analysis. Keep the uncached
+    // comparison free of work introduced solely to justify reuse or to skip
+    // the control snapshot; a template caller asks for it explicitly.
+    let control_free = cached
+        .and_then(|p| p.control_free)
+        .or_else(|| analyze_control.then(|| !bf_has_free_control_exit(nested)));
+    let reusable = reuse && captured_env.is_none() && control_free == Some(true);
     if reusable && let Some(callable) = cached.and_then(|p| p.callable) {
         let name = egcl_rt::function::name(callable);
         let index = name.as_symbol_index();
@@ -16465,7 +16486,7 @@ fn make_prepared_bytecode_closure(
     egcl_rt::rooted!(sym = egcl_rt::symbols::make_uninterned_with_name(*name));
     let sym_idx = sym.as_symbol_index();
     egcl_rt::rooted!(_callable_root = ActiveCallableRoot(sym_idx));
-    registry_put(sym_idx, Arc::clone(nested));
+    publish_fresh_private_bytecode(sym_idx, Arc::clone(nested));
     closure_bodies().insert(sym_idx, Arc::clone(nested));
     if let Some(frame) = captured_env {
         closure_envs().borrow_mut().insert(sym_idx, frame);
@@ -16483,7 +16504,7 @@ fn make_prepared_bytecode_closure(
             callable: reusable.then_some(closure),
         },
     );
-    (closure, control_free)
+    (closure, control_free == Some(true))
 }
 
 /// Lazy (deferred) compilation of top-level DEFUNs (bliss-x5y). Eagerly

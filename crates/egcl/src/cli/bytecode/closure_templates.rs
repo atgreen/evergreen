@@ -16,7 +16,9 @@ const CAPACITY: usize = 32;
 pub(super) struct Prepared {
     pub lambda_list: EgclVal,
     pub name: EgclVal,
-    pub control_free: bool,
+    /// Whether the body has no free control exit; `None` when no caller has
+    /// needed the analysis yet.
+    pub control_free: Option<bool>,
     pub callable: Option<EgclVal>,
 }
 
@@ -57,7 +59,9 @@ pub(super) fn lookup(body: &Arc<BytecodeFunction>) -> Option<Prepared> {
             cache.entries.clear();
             cache.epoch = epoch;
         }
-        cache.entries.retain(|entry| entry.body.strong_count() != 0);
+        // An entry's Weak reserves its body's allocation, so no other body can
+        // share the address of an entry, dead or alive: the address alone
+        // identifies `body`. Pruning dead entries is `remember`'s job.
         cache
             .entries
             .iter()
@@ -77,9 +81,17 @@ pub(super) fn remember(body: &Arc<BytecodeFunction>, prepared: Prepared) {
             cache.entries.clear();
             cache.epoch = epoch;
         }
-        cache
+        // Every creation remembers its preparation. Refreshing an entry in
+        // place keeps that from rewriting the queue each time.
+        if let Some(entry) = cache
             .entries
-            .retain(|entry| entry.body.strong_count() != 0 && entry.body.as_ptr() != identity);
+            .iter_mut()
+            .find(|entry| entry.body.as_ptr() == identity)
+        {
+            entry.prepared = prepared;
+            return;
+        }
+        cache.entries.retain(|entry| entry.body.strong_count() != 0);
         if cache.entries.len() == CAPACITY {
             cache.entries.pop_front();
         }
@@ -150,7 +162,7 @@ mod tests {
         egcl_rt::rooted!(first = make_template_closure(&body, None, &env));
         egcl_rt::rooted!(second = make_template_closure(&body, None, &env));
         assert_ne!(*first, *second);
-        assert!(!lookup(&body).unwrap().control_free);
+        assert_eq!(lookup(&body).unwrap().control_free, Some(false));
         let frame = FrameCell::new_arc(EnvFrame {
             vars: Default::default(),
             symbol_vars: Default::default(),
@@ -236,7 +248,7 @@ mod tests {
             Prepared {
                 lambda_list: *young,
                 name: NIL,
-                control_free: true,
+                control_free: Some(true),
                 callable: None,
             },
         );

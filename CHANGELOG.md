@@ -617,6 +617,12 @@
 
 ### Performance
 
+- Creating a closure is about 30% cheaper. Minor garbage collections no
+  longer re-trace the captured variables of every live closure (pauses with
+  ~50k closures alive fell from 150-170 ms to 27-45 ms), and each new closure
+  is registered with less bookkeeping. Compiling SBCL's SHOW test sources is
+  about 3% faster.
+  ([#964](https://github.com/atgreen/evergreen/pull/964))
 - Functions whose closures RETURN-FROM an enclosing BLOCK, and the closures
   themselves, now compile to native code instead of staying in the bytecode
   interpreter, as do functions whose local RETURN or GO leaves a LET binding
