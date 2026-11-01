@@ -138,6 +138,8 @@ fn every_binding_shape_survives_gc_stress() {
 /// `(egcl::%env-access-counts)` is (name-ops name-hops slot-ops slot-hops
 /// fallbacks). An eligible unit's closures read and write their captured
 /// state with slot operations only, at every tier.
+// Only x86-64 Linux rewrites; other targets keep the name-keyed frames.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[test]
 fn eligible_units_do_no_name_operations() {
     let program = r#"

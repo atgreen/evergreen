@@ -621,8 +621,19 @@ fn within_bisect_limit() -> bool {
     }
 }
 
+/// Whether this target's native tiers execute heap environments.
+const NATIVE_SUPPORT: bool = cfg!(all(target_arch = "x86_64", target_os = "linux"));
+
 /// `EGCL_HEAP_ENV=0` keeps every unit on the name-keyed frames.
+///
+/// Only targets whose native tiers serve the heap-environment instructions
+/// rewrite: elsewhere the units keep the name-keyed frames, and with them the
+/// tiers they reach today. A BFASL compiled on x86-64 still loads and runs
+/// everywhere; another target's native tiers decline its heap units to T0.
 pub(super) fn enabled() -> bool {
+    if !NATIVE_SUPPORT {
+        return false;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         !matches!(

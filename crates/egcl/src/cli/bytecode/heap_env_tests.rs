@@ -57,6 +57,8 @@ fn heap_environment_and_its_slot_values_relocate() {
 /// instruction survives, no function keeps a base frame, a captured but
 /// unassigned variable is copied into the closure, and a captured, assigned
 /// one lives in an environment slot whose name the debugger table reports.
+// Only x86-64 Linux rewrites (`heap_env::enabled`).
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[test]
 fn eligible_unit_is_rewritten_to_heap_environments() {
     let _lock = super::super::heap_test_lock()
