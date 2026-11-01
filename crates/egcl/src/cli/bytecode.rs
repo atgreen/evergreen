@@ -1400,6 +1400,50 @@ fn typep_class_matches(class: u16, v: EgclVal) -> bool {
     }
 }
 
+/// `((lambda (p*) . body) a*)` with only required parameters and a matching
+/// argument count is `(let ((p a)*) . body)` (CLHS 3.1.2.1.2.4): the arguments
+/// are evaluated left to right and the body, declarations included, runs in a
+/// scope binding them. Any other operator form -- lambda-list keywords, an
+/// argument-count mismatch, a non-LAMBDA compound operator -- returns `None`
+/// and the caller still bails. (Rewriting those to `(funcall (lambda …) …)`
+/// exposed a closure-lowering fault on a `(declare (special …))` lambda calling
+/// an FLET function: ansi LAMBDA.64's shape in lambda_special_params_cli.)
+/// Without this, one inline lambda application kept its whole function
+/// tree-walked (SBCL's CALC-…-HASH functions and PARSE-<FUNCTION>;
+/// bliss-gg3i1.7.16).
+fn lambda_form_application(op: EgclVal, args: EgclVal) -> LowerResult<Option<EgclVal>> {
+    // Root the operator and arguments before anything here can allocate; the
+    // head is matched by name so nothing allocates until all parts are rooted.
+    egcl_rt::rooted!(op = op);
+    egcl_rt::rooted!(args = list_to_vec(args));
+    let (head, tail) = cp(*op);
+    if !head.is_symbol() || sym_name(head) != "LAMBDA" || !tail.is_cons() {
+        return Ok(None);
+    }
+    let (params, body) = cp(tail);
+    if !(params.is_nil() || params.is_cons()) {
+        return Ok(None);
+    }
+    egcl_rt::rooted!(params = list_to_vec(params));
+    egcl_rt::rooted!(body = body);
+    let simple = params.len() == args.len()
+        && params
+            .iter()
+            .all(|p| p.is_symbol() && !p.is_nil() && *p != T && !sym_name(*p).starts_with('&'));
+    if !simple {
+        return Ok(None);
+    }
+    let let_sym = resolve_sym("LET").ok_or(Bail)?;
+    egcl_rt::rooted!(bindings = Vec::<EgclVal>::new());
+    for i in 0..params.len() {
+        let binding = form_list(&[params[i], args[i]]);
+        bindings.push(binding);
+    }
+    egcl_rt::rooted!(binding_list = form_list(&bindings));
+    egcl_rt::rooted!(rest = arena_cons(*binding_list, *body));
+    Ok(Some(arena_cons(let_sym, *rest)))
+}
+
 /// Build a proper list `(items...)` in the arena, for synthesising macro-style
 /// expansions during lowering (bliss-jtc.28, e.g. DOTIMES → block/tagbody).
 fn form_list(items: &[EgclVal]) -> EgclVal {
@@ -3697,7 +3741,9 @@ impl<'e> Lowerer<'e> {
         if form.is_cons() {
             let (op, rest) = cp(form);
             if !op.is_symbol() {
-                // ((lambda ...) ...) etc. — not lowered in slice 1.
+                if let Some(rewritten) = lambda_form_application(op, rest)? {
+                    return self.lower_expr(rewritten);
+                }
                 return Err(Bail);
             }
             let name = sym_name(op);
@@ -3834,6 +3880,7 @@ impl<'e> Lowerer<'e> {
                 "ASSERT" => self.lower_assert(rest),
                 "MULTIPLE-VALUE-CALL" => self.lower_multiple_value_call(rest),
                 "MULTIPLE-VALUE-BIND" => self.lower_mvb(rest),
+                "MULTIPLE-VALUE-SETQ" => self.lower_mv_setq(rest),
                 "MULTIPLE-VALUE-LIST" => self.lower_mvlist(rest),
                 "MULTIPLE-VALUE-PROG1" => self.lower_mvprog1(rest),
                 "PROGV" => self.lower_progv(rest),
@@ -5199,6 +5246,32 @@ impl<'e> Lowerer<'e> {
                 self.emit(Instr::CallNamed { sym, nargs: 3 });
                 self.pop_n(3);
                 self.push_n(1); // result: the stored value
+                if !last {
+                    self.emit(Instr::Pop);
+                    self.pop_n(1);
+                }
+            } else if let Some(mut subforms) = get_setf_place(place) {
+                // `(setf (get symbol indicator [default]) value)` ->
+                // EGCL::PUT-SYMBOL-PROPERTY (symbol, indicator, value). The place
+                // subforms run left to right, DEFAULT only for effect, then the
+                // value (CLHS 5.1.1.1); the primitive returns the value.
+                // UPDATE-SYMBOL-INFO in SBCL's cross-compiler stores globaldb
+                // info this way (bliss-gg3i1.7.16).
+                egcl_rt::rooted_ref!(_subforms_root = &mut subforms);
+                let sym = resolve_sym("EGCL::PUT-SYMBOL-PROPERTY")
+                    .ok_or(Bail)?
+                    .as_symbol_index();
+                self.lower_expr(subforms[0])?; // symbol
+                self.lower_expr(subforms[1])?; // indicator
+                if subforms.len() == 3 {
+                    self.lower_expr(subforms[2])?; // default: effect only
+                    self.emit(Instr::Pop);
+                    self.pop_n(1);
+                }
+                self.lower_expr(items[2 * i + 1])?; // value
+                self.emit(Instr::CallNamed { sym, nargs: 3 });
+                self.pop_n(3);
+                self.push_n(1);
                 if !last {
                     self.emit(Instr::Pop);
                     self.pop_n(1);
@@ -7242,10 +7315,12 @@ impl<'e> Lowerer<'e> {
         // yet-processed clause conses (moving GC; bliss-wlf).
         for i in 0..clauses.len() {
             let (type_form, clause_rest) = cp(clauses[i]);
-            if !type_form.is_symbol() && !type_form.is_nil() {
-                return Err(Bail); // compound type specifiers not yet handled
-            }
-            let type_name = sym_name(type_form);
+            // A symbol, or `(or symbol*)`: an OR clause becomes one table entry
+            // per alternative, all landing on the same body, which keeps the
+            // first-matching-clause order (MAYBE-REPARSE-SPECIFIER's
+            // `((or error parse-unknown-type) ...)`; bliss-gg3i1.7.16). Any
+            // other compound type specifier still bails.
+            let type_names = handler_clause_type_names(type_form).ok_or(Bail)?;
             let (bind_list, body) = cp(clause_rest);
             let saved_next_local = self.next_local;
             self.enter_scope();
@@ -7300,11 +7375,13 @@ impl<'e> Lowerer<'e> {
             self.emit(Instr::Br(0));
             clause_brs.push(self.code.len() - 1);
 
-            clause_infos.push(ClauseInfo {
-                type_name,
-                body_bcp,
-                var_slot,
-            });
+            for type_name in type_names {
+                clause_infos.push(ClauseInfo {
+                    type_name,
+                    body_bcp,
+                    var_slot,
+                });
+            }
         }
 
         let after = self.code.len() as u32;
@@ -7763,6 +7840,52 @@ impl<'e> Lowerer<'e> {
     }
 
     /// `(multiple-value-bind (vars...) values-form body...)`.
+    /// `(multiple-value-setq (var*) form)` lowers as
+    /// `(multiple-value-bind (g*) form (setq var1 g1 … varN gN) g1)` with fresh
+    /// uninterned temporaries, which is CLHS's `(values (setf (values var*)
+    /// form))` for variables: every value is taken before any assignment and the
+    /// result is the primary value. A var that names a symbol macro still bails
+    /// through SETQ's own symbol-macro check, so those places keep the
+    /// tree-walker's semantics. Bailing on the whole operator left every
+    /// function containing one interpreted for good (SBCL's GET-INFO-VALUE and
+    /// PACKED-INFO-VALUE-INDEX, called ~100k times per file; bliss-gg3i1.7.16).
+    fn lower_mv_setq(&mut self, rest: EgclVal) -> LowerResult<()> {
+        let (vars_form, tail) = cp(rest);
+        let (values_form, extra) = cp(tail);
+        if !tail.is_cons() || !extra.is_nil() || !(vars_form.is_nil() || vars_form.is_cons()) {
+            return Err(Bail);
+        }
+        egcl_rt::rooted!(vars = list_to_vec(vars_form));
+        egcl_rt::rooted!(values_form = values_form);
+        for i in 0..vars.len() {
+            if !vars[i].is_symbol() || vars[i].is_nil() {
+                return Err(Bail);
+            }
+        }
+        if vars.is_empty() {
+            // Only the primary value is returned; nothing is assigned.
+            let values = resolve_sym("VALUES").ok_or(Bail)?;
+            egcl_rt::rooted!(form = form_list(&[values, *values_form]));
+            return self.lower_expr(*form);
+        }
+        let mvb = resolve_sym("MULTIPLE-VALUE-BIND").ok_or(Bail)?;
+        let setq = resolve_sym("SETQ").ok_or(Bail)?;
+        egcl_rt::rooted!(temps = Vec::<EgclVal>::new());
+        egcl_rt::rooted!(pairs = vec![setq]);
+        for i in 0..vars.len() {
+            egcl_rt::rooted!(
+                temp = egcl_rt::symbols::make_uninterned(&format!("%EGCL-MV-SETQ-{i}"))
+            );
+            temps.push(*temp);
+            pairs.push(vars[i]);
+            pairs.push(*temp);
+        }
+        egcl_rt::rooted!(temp_list = form_list(&temps));
+        egcl_rt::rooted!(assign = form_list(&pairs));
+        egcl_rt::rooted!(form = form_list(&[mvb, *temp_list, *values_form, *assign, temps[0]]));
+        self.lower_expr(*form)
+    }
+
     fn lower_mvb(&mut self, rest: EgclVal) -> LowerResult<()> {
         let (vars_form, r2) = cp(rest);
         let (values_form, mut body) = cp(r2);
@@ -9220,6 +9343,38 @@ fn aref_setf_place(place: EgclVal) -> Option<(&'static str, EgclVal, EgclVal)> {
     }
 }
 
+/// The condition type names a HANDLER-CASE clause matches: a symbol, or an
+/// `(or symbol*)` of them in order. `None` for any other type specifier.
+fn handler_clause_type_names(type_form: EgclVal) -> Option<Vec<String>> {
+    if type_form.is_symbol() || type_form.is_nil() {
+        return Some(vec![sym_name(type_form)]);
+    }
+    let items = list_to_vec(type_form);
+    let (head, alternatives) = items.split_first()?;
+    if !head.is_symbol() || sym_bare_name_rc(*head).as_ref() != "OR" || alternatives.is_empty() {
+        return None;
+    }
+    alternatives
+        .iter()
+        .map(|alt| (alt.is_symbol() || alt.is_nil()).then(|| sym_name(*alt)))
+        .collect()
+}
+
+/// `(get symbol indicator [default])` as a SETF place: its subforms, in order.
+fn get_setf_place(place: EgclVal) -> Option<Vec<EgclVal>> {
+    if !place.is_cons() {
+        return None;
+    }
+    let items = list_to_vec(place);
+    if !(3..=4).contains(&items.len())
+        || !items[0].is_symbol()
+        || sym_bare_name_rc(items[0]).as_ref() != "GET"
+    {
+        return None;
+    }
+    Some(items[1..].to_vec())
+}
+
 fn slot_value_setf_place(place: EgclVal) -> Option<(EgclVal, EgclVal)> {
     if !place.is_cons() {
         return None;
@@ -9999,9 +10154,9 @@ fn is_bail_special(name: &str) -> bool {
             | "MULTIPLE-VALUE-CALL"
             // Absent, its variable list `(a b)` was lowered as a CallNamed and
             // the form died with "undefined function: A" under every bytecode
-            // tier while the tree-walker ran it correctly (bliss-h7e0). The
-            // tree-walker owns the semantics — including symbol-macro places —
-            // so bailing is the fix, not a second implementation here.
+            // tier (bliss-h7e0). lower_expr now lowers it through
+            // `lower_mv_setq` before reaching a call; this entry keeps any other
+            // route from ever treating it as a function call.
             | "MULTIPLE-VALUE-SETQ"
             | "TYPECASE"
             | "ECASE"
