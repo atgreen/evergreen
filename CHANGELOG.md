@@ -621,6 +621,12 @@
 
 ### Performance
 
+- Functions using DESTRUCTURING-BIND with `&whole`, `&key` or `&aux`,
+  `(setf (getf place key) ...)`, HANDLER-CASE with a `:no-error` clause, or
+  HANDLER-BIND on an `(or ...)` or `(satisfies ...)` type now compile instead
+  of running in the interpreter on every call. A compiled DESTRUCTURING-BIND
+  now signals PROGRAM-ERROR for an unknown or malformed keyword list.
+  ([#970](https://github.com/atgreen/evergreen/pull/970))
 - Closures are cheaper to create, call and collect. Every closure made from
   one LAMBDA shares a single compiled body and tiering record, and carries
   its captured variables on the function object itself, so creating one is a
