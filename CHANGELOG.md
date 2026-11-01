@@ -621,6 +621,18 @@
 
 ### Performance
 
+- More functions that create closures now compile instead of running in the
+  interpreter: a closure over a MULTIPLE-VALUE-BIND variable, a HANDLER-CASE
+  clause variable, or a local function's parameter no longer forces its whole
+  function onto the tree-walker. Compiling SBCL's `sset.lisp` under EGCL makes
+  a quarter as many interpreted calls (81,239 → 20,209) and takes about 25%
+  less time. On x86-64 Linux, optimized code now reads a closure's captured
+  variables directly from the closure, so recursive LABELS functions over
+  captured variables run about 28x faster at T2 and a deep captured read takes
+  4.5 ns instead of 18. `EGCL_HEAP_ENV_LABELS=0` keeps recursive LABELS
+  functions on the previous representation. The image format is now version
+  20; images saved by earlier versions must be saved again.
+  ([#NNN](https://github.com/atgreen/evergreen/pull/NNN))
 - On x86-64 Linux, a compiled call from one optimized function to another
   named, fixed-arity, optimized function is cheaper. The function object now
   carries its own native entry, so the caller loads the name's current
