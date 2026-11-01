@@ -630,16 +630,20 @@ unsafe fn trace_bytecode_graph(
         }
     }
     for nested in &mut function.nested_functions {
+        // A live body keeps the code identity of each template it creates
+        // closures from: the symbol reaches the prototype, which owns the
+        // compiled code and tiering state. Only an enclosing body does so,
+        // never the template's own body: that body is also rooted by the
+        // template's installed code and registrations, and would otherwise
+        // keep them alive forever. Only a cell validated in this
+        // pinned-function epoch names a prototype that is certainly still
+        // allocated.
+        if let Some((_, symbol)) = nested.closure_template.current() {
+            egcl_rt::symbols::trace_symbol_index(symbol, visit);
+        }
         unsafe {
             trace_bytecode_graph(Arc::as_ptr(nested) as *mut BytecodeFunction, visit, seen);
         }
-    }
-    // A live body keeps the code identity of the template it is: the symbol
-    // reaches its prototype, which owns the compiled code and tiering state.
-    // Only a cell validated in this pinned-function epoch names a prototype
-    // that is certainly still allocated.
-    if let Some((_, symbol)) = function.closure_template.current() {
-        egcl_rt::symbols::trace_symbol_index(symbol, visit);
     }
     trace_lexical_keys(&function.code, &function.names, visit);
     for (key, _) in &function.param_layout {
@@ -35312,16 +35316,13 @@ mod active_bytecode_root_tests {
             drop(closure);
             env.mv.clear();
             egcl_rt::gc::full_gc().unwrap();
-            // A live template body keeps its code identity, though no
-            // instance survives (bliss-gg3i1.7.15.3).
-            assert!(is_registered(symbol));
+            // The template's own body does not keep its code identity alive:
+            // only an enclosing body or an instance does (bliss-gg3i1.7.15.3).
+            assert!(!is_registered(symbol));
             assert_eq!(type_profile_at(profile_key, 0).unwrap().fixnum, 1);
             assert_eq!(call_site_profile_snapshot(profile_key).1, vec![(7, 1)]);
             (profile_key, Arc::downgrade(&body), call_token)
         };
-        // Nothing traces the body any longer: its template dies, releasing
-        // the registrations that held it.
-        egcl_rt::gc::full_gc().unwrap();
         assert!(
             template.upgrade().is_none(),
             "the template allocation must actually die"

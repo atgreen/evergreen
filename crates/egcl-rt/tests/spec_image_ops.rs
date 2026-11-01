@@ -78,7 +78,7 @@ fn spec_image_round_trip_restores_heap_and_entry_state() {
     save_image(path.to_str().unwrap(), &image_opts()).expect("save_image");
     let header = validate_image_header(path.to_str().unwrap()).expect("validate header");
     assert_eq!(header.entry_continuation, entry.to_raw());
-    assert_eq!(header.format_version, 17);
+    assert_eq!(header.format_version, 18);
     assert!(header.heap_size >= 4096);
     assert_eq!(header.heap_size % 4096, 0);
 
@@ -367,10 +367,10 @@ fn spec_image_header_validation_rejects_corrupt_or_incompatible_images() {
     let mut bytes = fs::read(&path).expect("read image");
     assert_eq!(
         u32::from_ne_bytes(bytes[8..12].try_into().unwrap()),
-        17,
-        "separate lexical function cells require image format version 17"
+        18,
+        "closure-state words in function objects require image format version 18"
     );
-    for version in [1u32, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 18] {
+    for version in [1u32, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 19] {
         let mut incompatible = bytes.clone();
         incompatible[8..12].copy_from_slice(&version.to_ne_bytes());
         let incompatible_path = temp_path(&format!("header-version-{version}.bimg"));
@@ -438,28 +438,34 @@ fn spec_image_save_is_atomic_and_preserves_previous_file_on_failure() {
 }
 
 #[test]
-fn spec_image_version_16_heap_and_entry_remain_readable() {
+fn spec_image_versions_before_function_state_word_are_rejected_with_valid_headers() {
     let _guard = test_lock().lock().unwrap_or_else(|e| e.into_inner());
     init_test_heap();
-    let path = temp_path("version-16-compatible.bimg");
+    let path = temp_path("version-17-incompatible.bimg");
     let entry = EgclVal::from_fixnum(271);
     set_entry_continuation(entry);
     save_image(path.to_str().unwrap(), &image_opts()).unwrap();
-    // The runtime heap layout is unchanged; the new host section owns the
-    // additional function namespace and handles old frames independently.
-    let mut bytes = fs::read(&path).unwrap();
-    bytes[8..12].copy_from_slice(&16u32.to_ne_bytes());
-    // Updating the version changes the checksummed header. Keep the fixture
-    // valid so this tests version compatibility rather than corruption.
-    let checksum = egcl_rt::digest::sha256(&bytes[..96]);
-    bytes[96..128].copy_from_slice(&checksum);
-    fs::write(&path, bytes).unwrap();
-    assert_eq!(
-        validate_image_header(path.to_str().unwrap())
-            .unwrap()
-            .format_version,
-        16
-    );
+    // Version 18 grew interpreted function objects by a closure-state word
+    // (bliss-gg3i1.7.15.3); version 16 and 17 heaps hold shorter function
+    // bodies and must be rejected even when their header is otherwise valid,
+    // rather than misread.
+    for version in [16u32, 17] {
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[8..12].copy_from_slice(&version.to_ne_bytes());
+        // Keep the header checksum valid so this tests version compatibility
+        // rather than corruption.
+        let checksum = egcl_rt::digest::sha256(&bytes[..96]);
+        bytes[96..128].copy_from_slice(&checksum);
+        let old_path = temp_path(&format!("version-{version}-valid-header.bimg"));
+        fs::write(&old_path, bytes).unwrap();
+        for result in [
+            validate_image_header(old_path.to_str().unwrap()).map(|_| ()),
+            load_image(old_path.to_str().unwrap()).map(|_| ()),
+        ] {
+            let message = format!("{}", result.expect_err("older layout must be rejected"));
+            assert!(message.contains("unsupported format version"), "{message}");
+        }
+    }
     init_test_heap();
     assert_eq!(load_image(path.to_str().unwrap()).unwrap(), entry);
 }

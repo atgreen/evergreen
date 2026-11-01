@@ -44,7 +44,7 @@ fn raw_random_state_bits_move_without_becoming_gc_edges() {
     assert_eq!(random_state::snapshot(*undrawn), Some(saved));
     let next = random_state::draw(*undrawn).unwrap();
     let mut old_bytes = std::fs::read(&path).unwrap();
-    assert_eq!(u32::from_ne_bytes(old_bytes[8..12].try_into().unwrap()), 17);
+    assert_eq!(u32::from_ne_bytes(old_bytes[8..12].try_into().unwrap()), 18);
     old_bytes[8..12].copy_from_slice(&12_u32.to_ne_bytes());
     std::fs::write(&old_path, old_bytes).unwrap();
     let error = egcl_rt::image::load_image(old_path.to_str().unwrap()).unwrap_err();
