@@ -26,6 +26,10 @@
 
 ### Fixed
 
+- MAPCAN and MAPCON now join their results destructively with NCONC, as the
+  standard requires, instead of copying them with APPEND.
+  ([#965](https://github.com/atgreen/evergreen/pull/965))
+
 - Report stack guard origins and available scalar state on stderr when
   `EGCL_STACK_OVERFLOW_DIAGNOSTICS=1`, preserving normal overflow handling
   and stack limits ([#944](https://github.com/atgreen/evergreen/pull/944)).
@@ -617,6 +621,13 @@
 
 ### Performance
 
+- MAPC, MAPCAR, MAPCAN, MAPL, MAPLIST, MAPCON, SOME, EVERY, NOTANY and
+  NOTEVERY over up to four lists are compiled into inline loops: a literal
+  LAMBDA argument runs without creating a closure, and a call over a short
+  list is up to several hundred times cheaper (about 37 us down to under 1 us
+  for three elements). Compiled `(setf (car x) ...)` and `(setf (cdr x) ...)`
+  are faster too.
+  ([#965](https://github.com/atgreen/evergreen/pull/965))
 - Creating a closure is about 30% cheaper. Minor garbage collections no
   longer re-trace the captured variables of every live closure (pauses with
   ~50k closures alive fell from 150-170 ms to 27-45 ms), and each new closure
