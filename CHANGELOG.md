@@ -621,6 +621,12 @@
 
 ### Performance
 
+- Functions containing MULTIPLE-VALUE-SETQ, an inline `((lambda (x) ...) arg)`
+  application, `(setf (get ...))`, or a HANDLER-CASE clause typed
+  `(or a b)` now compile instead of running in the interpreter on every
+  call. SBCL's cross-compiler kept its globaldb lookups interpreted this way;
+  compiling `src/compiler/sset` under EGCL is about 20% faster.
+  ([#967](https://github.com/atgreen/evergreen/pull/967))
 - MAPC, MAPCAR, MAPCAN, MAPL, MAPLIST, MAPCON, SOME, EVERY, NOTANY and
   NOTEVERY over up to four lists are compiled into inline loops: a literal
   LAMBDA argument runs without creating a closure, and a call over a short
