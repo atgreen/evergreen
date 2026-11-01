@@ -32,6 +32,7 @@ mod evaluated_builtins;
 pub mod events;
 mod generic_binding;
 mod generic_call;
+pub mod handoff_census;
 mod lexical_identity;
 mod method_continuations;
 mod native_runtime;
@@ -8767,6 +8768,14 @@ fn invoke_method(
         let _context_scope = method_continuations::MethodScope::enter(env, context.clone());
         return apply_function(callable, args, env);
     }
+    if handoff_census::enabled() {
+        let kind = if method.captured_frame.is_some() {
+            "nested-in-binding"
+        } else {
+            "uncompiled"
+        };
+        handoff_census::note(format!("call:method:{kind}"));
+    }
     let parent = method
         .captured_frame
         .clone()
@@ -14626,6 +14635,9 @@ fn tree_closure_tier_up(id: u64, env: &Env) -> Option<EgclVal> {
             egcl_rt::log::TRACE,
             "closure {id}: tiering declined: no captured function namespace"
         );
+        if handoff_census::enabled() {
+            handoff_census::note("tier-closure:declined:no-captured-funs".into());
+        }
         return None;
     };
     if !closure.captured_specials.is_empty() {
@@ -14636,6 +14648,9 @@ fn tree_closure_tier_up(id: u64, env: &Env) -> Option<EgclVal> {
             closure.captured_specials.len(),
             funs.borrow().len()
         );
+        if handoff_census::enabled() {
+            handoff_census::note("tier-closure:declined:captured-specials".into());
+        }
         return None;
     }
     let mut compile_env = env.clone();
@@ -14654,17 +14669,29 @@ fn tree_closure_tier_up(id: u64, env: &Env) -> Option<EgclVal> {
     compile_env.symbol_macros = Rc::new(RefCell::new(HashMap::new()));
     compile_env.block_stack = closure.captured_blocks.clone();
     compile_env.tag_stack = closure.captured_tags.clone();
-    egcl_rt::rooted!(
-        compiled = bytecode::compile_tree_closure(
-            "<lambda>",
-            closure.params_form,
-            closure.body,
-            &compile_env,
-            Arc::clone(&closure.captured_frame),
-            &closure.captured_blocks,
-            &closure.captured_tags,
-        )?
+    let compiled = bytecode::compile_tree_closure(
+        "<lambda>",
+        closure.params_form,
+        closure.body,
+        &compile_env,
+        Arc::clone(&closure.captured_frame),
+        &closure.captured_blocks,
+        &closure.captured_tags,
     );
+    if handoff_census::enabled() {
+        let origin = if handoff_census::from_handoff(id) {
+            "handoff"
+        } else {
+            "tree-walker"
+        };
+        let outcome = if compiled.is_some() {
+            "compiled"
+        } else {
+            "declined:compile"
+        };
+        handoff_census::note(format!("tier-closure:{origin}:{outcome}"));
+    }
+    egcl_rt::rooted!(compiled = compiled?);
     if let Some(entry) = TREE_CLOSURE_TIERS.borrow_mut().get_mut(&id) {
         entry.compiled = *compiled;
     }
@@ -43175,6 +43202,9 @@ fn eval_defmethod(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             // Tree-walked for good: say so, as every other decline does
             // (bliss-75b8v).
             bytecode::log_not_compiled(&label, "method defined inside a lexical binding");
+            if handoff_census::enabled() {
+                handoff_census::note("define:method:nested-in-binding".into());
+            }
         } else {
             let compile_ll = method_lambda_list_for_compile(*lambda_list);
             if let Some((callable, proof, raw_reader)) = bytecode::compile_and_reify_method_lambda(
@@ -45237,10 +45267,25 @@ fn apply_function_impl(
             if builtin_sym.is_none()
                 && let Some(compiled) = tree_closure_tier_up(id, env)
             {
+                if handoff_census::enabled() && handoff_census::from_handoff(id) {
+                    handoff_census::note("call:handoff-closure:compiled".into());
+                }
                 return apply_function_impl(compiled, args, env);
             }
             let closure = { env.closures.borrow().get(&id).cloned() };
             if let Some(closure) = closure {
+                if handoff_census::enabled() && builtin_sym.is_none() {
+                    let origin = if handoff_census::from_handoff(id) {
+                        "handoff"
+                    } else {
+                        "tree-walker"
+                    };
+                    handoff_census::note(format!("call:{origin}-closure:interpreted"));
+                    handoff_census::note(format!(
+                        "call:{origin}-closure:interpreted {}",
+                        handoff_census::sketch(closure.body)
+                    ));
+                }
                 egcl_rt::rooted!(closure = closure);
                 let _debug_call = egcl_rt::debug_stack::CallFrame::enter_anonymous_with_args(args);
                 // Run the body against the closure's LEXICAL block/tagbody exit

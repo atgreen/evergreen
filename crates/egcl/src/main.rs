@@ -470,6 +470,7 @@ fn main() {
     // Lisp-aware statistical profiler (bliss-sc4t): dump folded stacks if
     // EGCL_SPROF was set.
     cli::sprof::dump_on_exit();
+    cli::handoff_census::dump_on_exit();
     match result {
         Ok(code) => std::process::exit(code),
         Err(e) => {

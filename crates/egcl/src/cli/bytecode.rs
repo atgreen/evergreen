@@ -2910,7 +2910,9 @@ fn record_bail(reason: impl FnOnce() -> String) -> Bail {
 /// keep it when EGCL_T2_LOG or the compile trace will print that decline
 /// (bliss-75b8v). Both checks are cached, and bails are compile-time only.
 fn bail_reason_wanted() -> bool {
-    t2_log_target().is_some() || egcl_rt::log::enabled("compile", egcl_rt::log::TRACE)
+    t2_log_target().is_some()
+        || egcl_rt::log::enabled("compile", egcl_rt::log::TRACE)
+        || super::handoff_census::enabled()
 }
 
 fn reset_last_bail_reason() {
@@ -3063,6 +3065,9 @@ pub fn bail_report() -> Vec<(String, u32)> {
 /// operator masquerading as a call.
 #[allow(dead_code)] // retained as documentation of the original slice-1 surface
 const PRIMITIVE_ALLOWLIST: &[&str] = &[
+    // `lower_progv`'s own expansion: without it a PROGV in opportunistic code
+    // (and so every lambda containing one) bailed on its generated call.
+    "EGCL::%PROGV",
     "+",
     "-",
     "*",
@@ -8413,7 +8418,12 @@ impl<'e> Lowerer<'e> {
     /// (captures this activation's heap frame) provided every captured local is
     /// boxed; if any is a plain frame slot (e.g. a `multiple-value-bind` var),
     /// bail so the enclosing function runs on the tree-walker.
-    fn emit_closure(&mut self, form: EgclVal, captured: &[String]) -> LowerResult<()> {
+    fn emit_closure(
+        &mut self,
+        form: EgclVal,
+        captured: &[String],
+        reason: &str,
+    ) -> LowerResult<()> {
         egcl_rt::rooted!(form = form);
         // LOCALLY declarations are compile-time state. Restore that lexical
         // context while the host evaluator creates the closure, so its snapshot
@@ -8428,6 +8438,18 @@ impl<'e> Lowerer<'e> {
             *form = form_list(&[resolve_sym("LOCALLY").ok_or(Bail)?, *declaration, *form]);
         }
         let c = self.add_const(*form);
+        if super::handoff_census::enabled() {
+            let kind = if captured.is_empty() {
+                "EvalHost"
+            } else {
+                "MakeClosureEnv"
+            };
+            super::handoff_census::note(format!("lower:{kind}:{reason}"));
+            super::handoff_census::note(format!(
+                "lower:{kind}:{reason} {}",
+                super::handoff_census::sketch(*form)
+            ));
+        }
         if captured.is_empty() {
             self.emit(Instr::EvalHost(c));
         } else {
@@ -8555,6 +8577,59 @@ impl<'e> Lowerer<'e> {
         Ok(())
     }
 
+    /// Opportunistic (non-portable) lowering of a `(lambda …)`: compile it as
+    /// a nested bytecode function behind `MakeClosure`, exactly as portable
+    /// lowering does, so compiled code never hands the lambda to the
+    /// tree-walker with its bytecode frame installed (bliss-gg3i1.7.15.7).
+    ///
+    /// Only when the nested body itself cannot be lowered does this fall back
+    /// to the host handoff (`EvalHost`/`MakeClosureEnv`) built from `rebuild`,
+    /// which keeps the enclosing function compiled rather than bailing all of
+    /// it. A capture of a slot-allocated binding still bails, after requesting
+    /// a recompile with that binding boxed: the handoff could not capture a
+    /// slot either.
+    fn emit_opportunistic_closure(
+        &mut self,
+        lambda_tail: EgclVal,
+        captured: &[String],
+        rebuild: impl FnOnce(EgclVal) -> LowerResult<EgclVal>,
+    ) -> LowerResult<()> {
+        egcl_rt::rooted!(lambda_tail = lambda_tail);
+        // Diagnostic A/B switch: restore the old host handoff for every
+        // opportunistic lambda, to compare against it in one binary.
+        static HOST_HANDOFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *HOST_HANDOFF.get_or_init(|| std::env::var_os("EGCL_LAMBDA_HOST_HANDOFF").is_some()) {
+            let form = rebuild(*lambda_tail)?;
+            return self.emit_closure(form, captured, "nonportable");
+        }
+        let slot_captured = captured
+            .iter()
+            .any(|n| matches!(self.lookup_local(n), Some(VarLoc::Slot(_))));
+        // Keep the enclosing function's first bail reason: this attempt is
+        // recovered, so its own reason must not displace one recorded earlier.
+        let outer_reason = LAST_BAIL_REASON.with(|last| last.borrow_mut().take());
+        let (params_form, body) = cp(*lambda_tail);
+        let attempt = self.emit_portable_closure(params_form, body, captured);
+        let reason = LAST_BAIL_REASON.with(|last| {
+            let mut last = last.borrow_mut();
+            let reason = last.take();
+            *last = outer_reason;
+            reason
+        });
+        match attempt {
+            Ok(()) => Ok(()),
+            Err(bail) if slot_captured => Err(bail),
+            Err(_) => {
+                let reason = format!(
+                    "nested-bail:{}",
+                    reason.as_deref().unwrap_or("no reason recorded")
+                );
+                let form = rebuild(*lambda_tail)?;
+                self.emit_closure(form, captured, &reason)
+            }
+        }
+    }
+
     /// `(lambda params body...)` — a closure value (capturing or not).
     fn lower_lambda(&mut self, op: EgclVal, rest: EgclVal) -> LowerResult<()> {
         let (params_form, body) = cp(rest);
@@ -8566,8 +8641,7 @@ impl<'e> Lowerer<'e> {
         {
             return self.emit_portable_closure(params_form, body, &captured);
         }
-        egcl_rt::rooted!(form = arena_cons(op, rest));
-        self.emit_closure(*form, &captured)
+        self.emit_opportunistic_closure(rest, &captured, |rest| Ok(arena_cons(op, rest)))
     }
 
     /// `(function name)` / `#'(lambda …)` — a function designator or a closure.
@@ -8634,7 +8708,16 @@ impl<'e> Lowerer<'e> {
                             let _ = record_bail(|| "function:portable-closure".to_string());
                         });
                 }
-                captured
+                // `rest` is `((lambda …))`; rebuild `(function (lambda …))`
+                // from the rooted tail if the nested compile is declined.
+                return self.emit_opportunistic_closure(t_rest, &captured, move |t_rest| {
+                    egcl_rt::rooted!(t_rest = t_rest);
+                    let lambda = resolve_sym("LAMBDA").ok_or(Bail)?;
+                    egcl_rt::rooted!(target = arena_cons(lambda, *t_rest));
+                    egcl_rt::rooted!(rest = arena_cons(*target, NIL));
+                    let function_sym = resolve_sym("FUNCTION").ok_or(Bail)?;
+                    Ok(arena_cons(function_sym, *rest))
+                });
             } else {
                 return Err(record_bail(|| {
                     format!("function:non-lambda-cons:{}", sym_name(t_op))
@@ -8647,7 +8730,7 @@ impl<'e> Lowerer<'e> {
         };
         let function_sym = resolve_sym("FUNCTION").ok_or(Bail)?;
         egcl_rt::rooted!(form = arena_cons(function_sym, rest));
-        self.emit_closure(*form, &captured)
+        self.emit_closure(*form, &captured, "nonportable")
     }
 
     /// `(flet ((name params body...)...) body...)` / `(labels (...) body...)`.
@@ -17660,6 +17743,9 @@ fn compile_defun(
     let mut compile_env = env.clone();
     let mut captures = std::collections::HashSet::new();
     if let Some(frame) = closure_captured_env(*function) {
+        if super::handoff_census::enabled() {
+            super::handoff_census::note("compile:defun-against-runtime-frame".into());
+        }
         compile_env.frame = Arc::clone(&frame);
         captures = frame_capture_names(frame);
     }
@@ -21327,7 +21413,15 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
             }
             Instr::EvalHost(idx) => {
                 let form = acts[top_idx].func.constants[idx as usize];
-                match eval_form(form, env) {
+                let result = eval_form(form, env);
+                if super::handoff_census::enabled() {
+                    super::handoff_census::note_runtime(
+                        "EvalHost",
+                        acts[top_idx].func.constants[idx as usize],
+                        result.as_ref().ok().copied(),
+                    );
+                }
+                match result {
                     Ok(v) => acts[top_idx].push_op(v),
                     Err(e) => {
                         let pending = error_to_pending(e, env);
@@ -21388,6 +21482,13 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                 let saved = std::mem::replace(&mut env.frame, ef);
                 let result = eval_form(form, env);
                 env.frame = saved;
+                if super::handoff_census::enabled() {
+                    super::handoff_census::note_runtime(
+                        "MakeClosureEnv",
+                        acts[top_idx].func.constants[idx as usize],
+                        result.as_ref().ok().copied(),
+                    );
+                }
                 match result {
                     Ok(v) => acts[top_idx].push_op(v),
                     Err(e) => {
@@ -23619,13 +23720,25 @@ fn c2i_eval_form_with_frame(form: EgclVal, capture_native_frame: bool) -> u64 {
     // Guard the interpreter reentry: a panic here (not just an Err) must not
     // abort across this `extern "C"` boundary (bliss-011). The frame is restored
     // afterwards on BOTH the ok and panic paths.
+    egcl_rt::rooted!(form = form);
     let result = guard_c2i(|| {
         let env = unsafe { &mut *env_ptr };
-        eval_form(form, env)
+        eval_form(*form, env)
     });
     if let Some(saved) = saved_frame {
         let env = unsafe { &mut *env_ptr };
         env.frame = saved;
+    }
+    if super::handoff_census::enabled() {
+        super::handoff_census::note_runtime(
+            if capture_native_frame {
+                "native:MakeClosureEnv"
+            } else {
+                "native:EvalHost"
+            },
+            *form,
+            result.as_ref().ok().copied(),
+        );
     }
     match result {
         Ok(value) => value.0,
