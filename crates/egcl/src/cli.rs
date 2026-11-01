@@ -27970,6 +27970,8 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             "EGCL::SET-SYMBOL-FUNCTION" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::SET-SYMBOL-PLIST" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::PUT-SYMBOL-PROPERTY" => return eval_builtin_arguments(&name, cdr, env),
+            "EGCL::%DBIND-CHECK-KEYS" => return eval_builtin_arguments(&name, cdr, env),
+            "EGCL::PUT-PLIST" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::SET-SLOT-VALUE" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::GET-ACCESSOR-SLOT" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::SET-ACCESSOR-SLOT" => return eval_builtin_arguments(&name, cdr, env),
