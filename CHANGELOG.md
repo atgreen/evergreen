@@ -621,6 +621,12 @@
 
 ### Performance
 
+- A `(lambda ...)` inside code compiled for speed (for example a
+  `compile-file`d top-level form) is now compiled as a closure instead of
+  being handed to the interpreter each time it is created, so the enclosing
+  function stays compiled. `EGCL_LAMBDA_HOST_HANDOFF=1` restores the old
+  behaviour for comparison.
+  ([#969](https://github.com/atgreen/evergreen/pull/969))
 - On x86-64 Linux, closures that read or assign captured variables run
   faster in native code. A variable a closure captures but never assigns is
   copied into the closure, and one it assigns lives in a heap environment

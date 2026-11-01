@@ -157,9 +157,14 @@ fn native_v2_handler_bind_retains_host_forms_between_invocations() {
             .unwrap()
             .0
         );
+        // Opportunistic lambdas now compile to MakeClosure (bliss-gg3i1.7.15.7);
+        // this test exercises the host-form fallback, so force the handler lambda
+        // back to EvalHost for this compile only.
+        let host_handoff = super::super::ForceLambdaHostHandoff::enter();
         let body = Arc::new(
             compile_function("NATIVE-RETAINED-HANDLER", NIL, *forms, &env, false, false).unwrap(),
         );
+        drop(host_handoff);
         egcl_rt::rooted!(_body = ActiveBytecodeRoot::new(&body));
         let index = body
             .code
@@ -230,6 +235,10 @@ fn native_v2_handler_bind_initializers_keep_captures_live() {
         .unwrap()
         .0
     );
+    // Opportunistic lambdas now compile to MakeClosure (bliss-gg3i1.7.15.7);
+    // this test exercises the host-form fallback, so force the handler lambda
+    // back to EvalHost for this compile only.
+    let host_handoff = super::super::ForceLambdaHostHandoff::enter();
     let mut body = compile_function(
         "NATIVE-HANDLER-CAPTURES",
         *params,
@@ -239,6 +248,7 @@ fn native_v2_handler_bind_initializers_keep_captures_live() {
         false,
     )
     .unwrap();
+    drop(host_handoff);
     let index = body
         .code
         .iter()
@@ -268,6 +278,95 @@ fn native_v2_handler_bind_initializers_keep_captures_live() {
     assert!(env.handlers.is_empty());
 }
 
+/// The same cluster with the handler lambdas compiled, as opportunistic
+/// lowering now produces them (bliss-gg3i1.7.15.7): no host form, the inline
+/// handler a `MakeClosure` that collects while the capturing handler's closure
+/// is live, both handlers run from native code, the captured cons survives
+/// relocation, and the cluster is gone afterwards on every invocation. (The
+/// uninstalled segment harness admits no capturing environment of its own,
+/// so the inline handler captures nothing; installed entries cover that.)
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
+fn native_v2_handler_bind_compiled_closures_keep_captures_live() {
+    use super::super::native_transfer_entry::{TransferCode, take_native_fallback_count};
+    let _lock = super::super::super::heap_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    super::super::super::read_eval_all_env(
+        "(defun native-compiled-capturing-handler (cell)
+           (lambda (condition)
+             (declare (ignore condition))
+             (setf (car cell) (+ 1 (car cell)))))
+         (defun native-compiled-handler-collect () (%force-minor-gc-for-test))",
+        &mut env,
+    )
+    .unwrap();
+    egcl_rt::rooted!(params = reader::read_from_string("(x)").unwrap().0);
+    egcl_rt::rooted!(
+        forms = reader::read_from_string(
+            "((handler-bind
+             ((simple-condition (native-compiled-capturing-handler x))
+              (simple-condition (lambda (condition)
+                                  (declare (ignore condition))
+                                  (native-compiled-handler-collect)
+                                  nil)))
+           (signal 'simple-condition)
+           :ok))"
+        )
+        .unwrap()
+        .0
+    );
+    let body = compile_function(
+        "NATIVE-COMPILED-HANDLER-CAPTURES",
+        *params,
+        *forms,
+        &env,
+        false,
+        false,
+    )
+    .unwrap();
+    assert!(
+        !body
+            .code
+            .iter()
+            .any(|op| matches!(op, Instr::EvalHost(_) | Instr::MakeClosureEnv(_))),
+        "handler lambda must not be a host form: {:?}",
+        body.code
+    );
+    assert!(
+        body.code
+            .iter()
+            .any(|op| matches!(op, Instr::MakeClosure { .. })),
+        "inline handler is a compiled closure: {:?}",
+        body.code
+    );
+    let code = TransferCode::compile(Arc::new(body)).expect("native compiled handler closures");
+    egcl_rt::rooted!(
+        args = vec![super::super::super::arena_cons(
+            EgclVal::from_fixnum(0),
+            NIL
+        )]
+    );
+    egcl_rt::rooted!(ok = reader::read_from_string(":ok").unwrap().0);
+    for round in 1..=2 {
+        let before = args[0].to_raw();
+        take_native_fallback_count();
+        egcl_rt::rooted!(result = code.run(&args, &mut env));
+        assert_eq!(*result.as_ref().unwrap(), *ok);
+        if round == 1 {
+            // A nursery cons relocates at the handler's collection; promoted
+            // by then, it stays put on the second round.
+            assert_ne!(args[0].to_raw(), before, "captured cons must actually move");
+        }
+        assert_eq!(cp(args[0]).0, EgclVal::from_fixnum(round));
+        assert_eq!(take_native_fallback_count(), 0);
+        assert!(env.handlers.is_empty());
+        HeapCollector::new().minor_gc().unwrap();
+    }
+}
+
 #[test]
 #[ignore = "requires a platform-supported native segment transition"]
 fn native_v2_handler_bind_host_initializer_error_does_not_install_cluster() {
@@ -293,6 +392,10 @@ fn native_v2_handler_bind_host_initializer_error_does_not_install_cluster() {
             .unwrap()
             .0
     );
+    // Opportunistic lambdas now compile to MakeClosure (bliss-gg3i1.7.15.7);
+    // this test exercises the host-form fallback, so force the handler lambda
+    // back to EvalHost for this compile only.
+    let host_handoff = super::super::ForceLambdaHostHandoff::enter();
     let mut body = compile_function(
         "NATIVE-HANDLER-INIT-ERROR",
         *params,
@@ -302,6 +405,7 @@ fn native_v2_handler_bind_host_initializer_error_does_not_install_cluster() {
         false,
     )
     .unwrap();
+    drop(host_handoff);
     let index = body
         .code
         .iter()
