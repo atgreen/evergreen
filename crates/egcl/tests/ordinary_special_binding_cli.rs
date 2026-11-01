@@ -192,6 +192,9 @@ fn deoptimizing_inside_a_binding_keeps_and_then_restores_it() {
     let program = format!(
         r#"(progn {DEFINITIONS}
   (dotimes (i 3000) (sb-arith i))
+  ;; T2 compiles on a shared background worker; wait (bounded) for SB-ARITH.
+  (loop repeat 200 until (= 2 (egcl-ext:function-tier 'sb-arith))
+        do (sb-arith 1) (sleep 0.01))
   (let ((before (egcl-ext:deopt-count)))
     (format t "RESULT ~S ~S ~S ~S ~S~%"
             (sb-arith 1.5) (list *sb-x* *sb-y*) (sb-arith 7)

@@ -20,8 +20,10 @@ const READY: &str = r#"
   (every (lambda (s) (= 2 (egcl-ext:function-tier s))) '(ct-free ct-captured))
   do (ct-warm) (sleep 0.01))
 (dolist (s '(ct-free ct-captured)) (assert (= 2 (egcl-ext:function-tier s))))
-;; A creator of a free lexical RETURN-FROM must keep the existing safe T0 path.
-(assert (eql 0 (egcl-ext:function-tier 'ct-control)))
+;; A creator of a closure that RETURN-FROMs its block now leaves T0: the
+;; mapped tiers publish the registered block (bliss-gg3i1.7.11). CHECK below
+;; still requires each activation to receive its own exit.
+(assert (plusp (egcl-ext:function-tier 'ct-control)))
 "#;
 const CHECK: &str = r#"
 (let ((a (ct-captured 10)) (b (ct-captured 100)))

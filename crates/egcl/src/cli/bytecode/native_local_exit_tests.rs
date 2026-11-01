@@ -156,7 +156,6 @@ fn local_exit_ir_retains_original_scope_identity_and_refuses_other_unwinds() {
         "((block done (handler-bind ((error (lambda (e) (declare (ignore e)) nil))) (return-from done marker))))",
         "((block done (handler-case (return-from done marker) (error () nil))))",
         "((block done (restart-case (return-from done marker) (retry () nil))))",
-        "((block done (let ((captured marker)) (flet ((escape () captured)) (return-from done #'escape)))))",
     ] {
         let unsupported = fixture_body(&env, "UNSUPPORTED-LOCAL-EXIT", source);
         let _unsupported_root = ActiveBytecodeRoot::new(&unsupported);
@@ -165,6 +164,22 @@ fn local_exit_ir_retains_original_scope_identity_and_refuses_other_unwinds() {
             "{source}"
         );
     }
+    // Leaving a captured binding's child frame is a local record the exit
+    // helper pops itself (bliss-gg3i1.7.11).
+    let captured = fixture_body(
+        &env,
+        "CAPTURED-LOCAL-EXIT",
+        "((block done (let ((captured marker)) (flet ((escape () captured)) (return-from done #'escape)))))",
+    );
+    let _captured_root = ActiveBytecodeRoot::new(&captured);
+    let ir = build::build_from_bytecode_for_native_cleanups(&captured).unwrap();
+    verify::verify(&ir).unwrap();
+    assert!(ir.block_order().iter().any(|&b| {
+        ir.block(b)
+            .insts
+            .iter()
+            .any(|&i| matches!(ir.inst(i).aux, AuxData::DirectExit { .. }))
+    }));
 }
 
 #[test]

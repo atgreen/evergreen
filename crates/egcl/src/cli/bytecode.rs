@@ -16852,6 +16852,16 @@ fn bf_may_reach_control(bf: &BytecodeFunction, blocks: &[&str], tags: &[&str]) -
             .any(|restart| bf_may_reach_control(&restart.function, blocks, tags))
 }
 
+/// `native_would_lose_captured_control` for a T1 promotion. The x86-64 Linux
+/// mapped tiers publish a registered BLOCK on the block stack like a CATCH,
+/// and an activation installs its closure's captured BLOCK/TAGBODY scope, so
+/// only their own admission (which still refuses a TAGBODY's `NamedTag`)
+/// decides (bliss-gg3i1.7.11). Other targets keep the conservative gate.
+fn t1_would_lose_captured_control(bf: &BytecodeFunction) -> bool {
+    !cfg!(all(target_arch = "x86_64", target_os = "linux"))
+        && native_would_lose_captured_control(bf)
+}
+
 /// True if compiling `bf` to native (T1/T2) would break a closure's non-local
 /// exit. Native lowers `PushBlock`/`PushTag` to no-ops (local returns become
 /// jumps), so a block/tag this function establishes is never published on
@@ -29896,7 +29906,7 @@ fn try_promote_to_t1_with_speculation(sym: u32, allow_speculation: bool) -> Opti
     // at T0: native no-ops PushBlock/PushTag, so the captured block/tag would
     // never be published for the closure's `return-from`/`go` to find (bliss-4u5u,
     // the ASDF traverse-action plan truncation).
-    if native_would_lose_captured_control(&bf) {
+    if t1_would_lose_captured_control(&bf) {
         egcl_rt::blog!(
             "compile",
             egcl_rt::log::TRACE,

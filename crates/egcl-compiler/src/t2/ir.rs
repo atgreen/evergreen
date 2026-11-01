@@ -605,6 +605,13 @@ pub enum AuxData {
     },
     /// Invoke a THROW with rooted tag and primary arguments; no normal result.
     TransferThrow,
+    /// Invoke the RETURN-FROM (one primary argument) or GO (no argument) at
+    /// `bcp` that a closure makes to a block or tag of an enclosing function,
+    /// resolved by name in the activation's captured lexical control. Like
+    /// THROW it has no normal result (bliss-gg3i1.7.11).
+    NamedExit {
+        bcp: u32,
+    },
     /// Establish/retire a dynamic CATCH binding in the owning activation.
     /// The helper-v2 request preserves the existing multiple-value state.
     CatchScope {

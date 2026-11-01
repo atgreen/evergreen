@@ -229,7 +229,7 @@ unsafe fn take_guard_resume_state(
         scope.ownership != Ownership::Local
             || !matches!(
                 scope.kind,
-                ScopeKind::Block { register: false, .. }
+                ScopeKind::Block { .. }
                     | ScopeKind::Tagbody { .. }
                     | ScopeKind::Catch { .. }
                     | ScopeKind::Unwind { .. }
@@ -271,20 +271,7 @@ unsafe fn take_guard_resume_state(
     }
     let specials = unsafe { &mut *context.specials };
     let catches = unsafe { &mut *context.catches };
-    let expected_catches = active.iter().filter_map(|scope| {
-        matches!(scope.kind, ScopeKind::Catch { .. }).then_some(scope.push_bcp)
-    });
-    let tail = env
-        .catch_stack
-        .get(context.catch_base..)
-        .ok_or_else(invalid_capture)?;
-    if !expected_catches.eq(catches.iter().map(|saved| saved.push_bcp))
-        || tail.len() != catches.len()
-        || !tail
-            .iter()
-            .zip(catches.iter())
-            .all(|((_, token), saved)| *token == saved.token)
-    {
+    if !catch_ledger_matches(active, catches, context.catch_base, env) {
         return Err(invalid_capture());
     }
     // Complete every fallible step before taking the native ledger. The
@@ -323,6 +310,7 @@ unsafe fn take_guard_resume_state(
                     ScopeKind::Unwind { .. }
                         | ScopeKind::Cleanup { .. }
                         | ScopeKind::Catch { .. }
+                        | ScopeKind::Block { register: true, .. }
                         | ScopeKind::HandlerCase { .. }
                         | ScopeKind::HandlerBind { .. }
                         | ScopeKind::RestartCase { .. }
@@ -390,6 +378,18 @@ unsafe fn take_guard_resume_state(
             | ScopeKind::LexicalEnvironment => continue,
             ScopeKind::Catch { resume_bcp } => Handler::Catch {
                 token: saved_catches.next().expect("validated catch order").token,
+                resume_bcp,
+                sp_restore: scope.sp_restore,
+                env: scope_env,
+            },
+            // The name stays registered under the same token (bliss-gg3i1.7.11).
+            ScopeKind::Block {
+                id,
+                resume_bcp,
+                register: true,
+            } => Handler::Block {
+                block_id: id,
+                token: saved_catches.next().expect("validated block order").token,
                 resume_bcp,
                 sp_restore: scope.sp_restore,
                 env: scope_env,

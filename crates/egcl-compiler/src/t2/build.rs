@@ -967,10 +967,17 @@ impl<'a> Builder<'a> {
             return None;
         }
         match self.bf.code.get(bcp)? {
-            Instr::PushCatch { .. } => Some((bcp as u32, true)),
+            // A registered BLOCK is published by name for a closure's
+            // RETURN-FROM exactly as a CATCH publishes its tag (bliss-gg3i1.7.11).
+            Instr::PushCatch { .. } | Instr::PushBlock { register: true, .. } => {
+                Some((bcp as u32, true))
+            }
             Instr::PopHandler => {
                 let scope = self.control_scopes.as_ref()?.before(bcp as u32)?.last()?;
-                matches!(scope.kind, ScopeKind::Catch { .. }).then_some((scope.push_bcp, false))
+                scope
+                    .kind
+                    .is_token_destination()
+                    .then_some((scope.push_bcp, false))
             }
             _ => None,
         }
@@ -1021,31 +1028,52 @@ impl<'a> Builder<'a> {
             // without a scope still fails the ordinary direct-exit check.
             return Ok(false);
         };
+        // A registered BLOCK is published by name: leaving it, even by a
+        // local RETURN-FROM, unregisters it like a crossed CATCH.
         let dynamic = exit.removed.iter().any(|scope| {
             !matches!(
                 scope.kind,
-                ScopeKind::Block { .. } | ScopeKind::Tagbody { .. }
+                ScopeKind::Block {
+                    register: false,
+                    ..
+                } | ScopeKind::Tagbody { .. }
             )
         });
-        if dynamic
-            && exit.removed.iter().any(|scope| {
-                scope.ownership != crate::control_scope::Ownership::Local
-                    || !matches!(
-                        scope.kind,
-                        ScopeKind::Block {
-                            register: false,
-                            ..
-                        } | ScopeKind::Tagbody { .. }
-                            | ScopeKind::SpecialBinding { .. }
-                            | ScopeKind::Catch { .. }
-                    )
-            })
-        {
-            return Err(BuildError::Unsupported(
-                "direct exit requires dynamic unwinding",
-            ));
+        if !dynamic {
+            return Ok(false);
         }
-        Ok(dynamic)
+        // The helper retires these records itself; anything else needs the
+        // unwinder. Name the first such scope in the decline (bliss-gg3i1.7.11).
+        for scope in &exit.removed {
+            let reason = match scope.kind {
+                _ if scope.ownership != crate::control_scope::Ownership::Local => {
+                    "direct exit requires dynamic unwinding (inherited scope)"
+                }
+                ScopeKind::Block { .. }
+                | ScopeKind::Tagbody { .. }
+                | ScopeKind::SpecialBinding { .. }
+                | ScopeKind::Catch { .. }
+                // A captured binding's child EnvFrame is popped, as the
+                // interpreter restores the destination's frame.
+                | ScopeKind::LexicalEnvironment => continue,
+                ScopeKind::Unwind { .. }
+                | ScopeKind::Cleanup { .. }
+                | ScopeKind::PendingCleanup { .. } => {
+                    "direct exit requires dynamic unwinding (UNWIND-PROTECT)"
+                }
+                ScopeKind::HandlerCase { .. } => {
+                    "direct exit requires dynamic unwinding (HANDLER-CASE)"
+                }
+                ScopeKind::HandlerBind { .. } => {
+                    "direct exit requires dynamic unwinding (HANDLER-BIND)"
+                }
+                ScopeKind::RestartCase { .. } => {
+                    "direct exit requires dynamic unwinding (RESTART-CASE)"
+                }
+            };
+            return Err(BuildError::Unsupported(reason));
+        }
+        Ok(true)
     }
 
     /// The operand-stack depth a local RETURN-FROM or GO at `bcp` resumes
@@ -1283,6 +1311,8 @@ impl<'a> Builder<'a> {
                 | Instr::AllocCons
                 | Instr::MakeStruct { .. }
                 | Instr::Throw
+                | Instr::ReturnFromNamed { .. }
+                | Instr::GoNamed { .. }
                 | Instr::EvalHost(_)
                 | Instr::LoadFunction(_)
                 | Instr::MakeClosure {
@@ -1382,6 +1412,8 @@ impl<'a> Builder<'a> {
                             | Instr::MakeStruct { .. }
                             | Instr::CleanupReturn
                             | Instr::Throw
+                            | Instr::ReturnFromNamed { .. }
+                            | Instr::GoNamed { .. }
                     )
                     || self.structure_calls && is_structure_opcode(&code[i]))
             {
@@ -1520,7 +1552,8 @@ impl<'a> Builder<'a> {
                 | Instr::Pop => {
                     push(i + 1, d - 1, &mut depth_at, &mut work);
                 }
-                Instr::Throw if self.native_cleanups => {}
+                Instr::Throw | Instr::ReturnFromNamed { .. } | Instr::GoNamed { .. }
+                    if self.native_cleanups => {}
                 Instr::CallNamed { nargs, .. } => {
                     push(i + 1, d - (*nargs as i32) + 1, &mut depth_at, &mut work);
                 }
@@ -1669,6 +1702,8 @@ impl<'a> Builder<'a> {
                             | Instr::MakeStruct { .. }
                             | Instr::CleanupReturn
                             | Instr::Throw
+                            | Instr::ReturnFromNamed { .. }
+                            | Instr::GoNamed { .. }
                     )
                     || self.structure_calls && is_structure_opcode(&code[i]))
             {
@@ -1701,7 +1736,9 @@ impl<'a> Builder<'a> {
                     push(resume_bcp as usize, &mut succs);
                 }
                 Instr::Return => {}
-                Instr::Throw => opaque[i] = true,
+                Instr::Throw | Instr::ReturnFromNamed { .. } | Instr::GoNamed { .. } => {
+                    opaque[i] = true
+                }
                 Instr::EvalHost(_) | Instr::PushUnwind { .. } => {
                     opaque[i] = true;
                     push(i + 1, &mut succs);
@@ -1894,7 +1931,10 @@ impl<'a> Builder<'a> {
         for (_, resume, _) in self.exceptional_catches(bcp) {
             successors.push(blk(resume as usize)?);
         }
-        if !matches!(instr, Instr::Throw) {
+        if !matches!(
+            instr,
+            Instr::Throw | Instr::ReturnFromNamed { .. } | Instr::GoNamed { .. }
+        ) {
             successors.push(blk(end)?);
         }
         if let Some((cleanup, _)) = self.exceptional_cleanup(bcp) {
@@ -1957,6 +1997,8 @@ impl<'a> Builder<'a> {
                 | Instr::AllocCons
                 | Instr::MakeStruct { .. }
                 | Instr::Throw
+                | Instr::ReturnFromNamed { .. }
+                | Instr::GoNamed { .. }
                 | Instr::EvalHost(_)
                 | Instr::LoadFunction(_)
                 | Instr::MakeClosure {
@@ -2391,7 +2433,7 @@ impl<'a> Builder<'a> {
             }
             if let Some((push_bcp, enter)) = self.catch_transition(i) {
                 let fs = self.build_frame_state(block, &stack, i as u32);
-                let args = if enter {
+                let args = if enter && matches!(instruction, Instr::PushCatch { .. }) {
                     vec![
                         stack
                             .pop()
@@ -2611,6 +2653,42 @@ impl<'a> Builder<'a> {
                     for (offset, result) in results.into_iter().enumerate() {
                         self.write_var(Var::Local(*slot_base + offset as u16), block, result);
                     }
+                }
+                Instr::ReturnFromNamed { .. } | Instr::GoNamed { .. } if self.native_cleanups => {
+                    // A closure's RETURN-FROM or GO to an enclosing function's
+                    // block or tag: the helper resolves the name in this
+                    // activation's captured lexical control and starts the
+                    // transfer, as THROW does (bliss-gg3i1.7.11).
+                    let fs = self.build_frame_state(block, &stack, i as u32);
+                    let args =
+                        if matches!(instruction, Instr::ReturnFromNamed { .. }) {
+                            vec![stack.pop().ok_or(BuildError::Unsupported(
+                                "stack underflow (ReturnFromNamed)",
+                            ))?]
+                        } else {
+                            vec![]
+                        };
+                    let (inst, results) = self.f.push_inst(
+                        block,
+                        InstData {
+                            opcode: Opcode::Call,
+                            args,
+                            results: vec![],
+                            aux: AuxData::NamedExit { bcp: i as u32 },
+                            flags: InstFlags {
+                                effectful: true,
+                                call: true,
+                                safepoint: true,
+                                ..InstFlags::default()
+                            },
+                            targets: vec![],
+                            frame_state: Some(fs),
+                            source_pos: 0,
+                        },
+                        &[(IRType::TOP, ValueRepresentation::Tagged)],
+                    );
+                    self.finish_native_invoke(block, inst, stack, results[0], i as u32, None)?;
+                    return Ok(());
                 }
                 Instr::Throw if self.native_cleanups => {
                     if stack.len() < 2 {
@@ -3356,11 +3434,11 @@ impl<'a> Builder<'a> {
             .flatten()
             .rev()
             .take_while(|scope| !matches!(scope.kind, ScopeKind::Unwind { .. }))
-            .filter_map(|scope| match scope.kind {
-                ScopeKind::Catch { resume_bcp } => {
-                    Some((scope.push_bcp, resume_bcp, scope.sp_restore))
-                }
-                _ => None,
+            .filter_map(|scope| {
+                scope
+                    .kind
+                    .token_destination()
+                    .map(|resume_bcp| (scope.push_bcp, resume_bcp, scope.sp_restore))
             })
             .collect()
     }

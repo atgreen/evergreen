@@ -617,6 +617,12 @@
 
 ### Performance
 
+- Functions whose closures RETURN-FROM an enclosing BLOCK, and the closures
+  themselves, now compile to native code instead of staying in the bytecode
+  interpreter, as do functions whose local RETURN or GO leaves a LET binding
+  that a closure captures. A closure that GOes to an enclosing TAGBODY also
+  compiles natively; the function it jumps back into still runs interpreted.
+  ([#963](https://github.com/atgreen/evergreen/pull/963))
 - Minor garbage collections no longer rescan the captured variables of every
   live interpreted closure. Each collection visits only the lexical frames and
   function bodies written since the last one, which cuts minor-collection

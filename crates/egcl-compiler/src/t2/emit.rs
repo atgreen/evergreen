@@ -2932,13 +2932,19 @@ fn emit_invoke_call(
             (u64::from(symbol), data.args.len() as u64, false)
         }
         crate::t2::ir::AuxData::TransferThrow => (TRANSFER_THROW_REQUEST, 2, false),
+        crate::t2::ir::AuxData::NamedExit { bcp } => (
+            TRANSFER_NAMED_EXIT_REQUEST | u64::from(bcp),
+            data.args.len() as u64,
+            false,
+        ),
         crate::t2::ir::AuxData::CatchScope { push_bcp, enter } => (
             (if enter {
                 TRANSFER_CATCH_ENTER_REQUEST
             } else {
                 TRANSFER_CATCH_LEAVE_REQUEST
             }) | u64::from(push_bcp),
-            u64::from(enter),
+            // A CATCH enters with its tag; a registered BLOCK with nothing.
+            data.args.len() as u64,
             false,
         ),
         crate::t2::ir::AuxData::HandlerScope { push_bcp, enter } => (
@@ -5025,6 +5031,9 @@ pub const TRANSFER_MAKE_CLOSURE_REQUEST: u64 = 16_u64 << 32;
 pub const TRANSFER_LEXICAL_ENVIRONMENT_REQUEST: u64 = 17_u64 << 32;
 /// Low word is the retained RETURN-FROM/GO BCP and its immutable ScopeExit.
 pub const TRANSFER_DIRECT_EXIT_REQUEST: u64 = 18_u64 << 32;
+/// Low word is the retained `ReturnFromNamed`/`GoNamed` BCP. RETURN-FROM
+/// supplies its rooted primary; GO supplies nothing. Never returns normally.
+pub const TRANSFER_NAMED_EXIT_REQUEST: u64 = 19_u64 << 32;
 
 /// Helper-v2 call request, live in the generated caller's temporary frame until
 /// normal return or completion of cold preparation. The args slice resides in
@@ -6282,6 +6291,7 @@ fn emit_transfer_function_with_storage(
                             | AuxData::NestedClosure(_)
                             | AuxData::LexicalEnvironment { .. }
                             | AuxData::TransferThrow
+                            | AuxData::NamedExit { .. }
                             | AuxData::CatchScope { .. }
                             | AuxData::HandlerScope { .. }
                             | AuxData::HandlerBindScope { .. }
@@ -7383,7 +7393,7 @@ fn emit_framed_inner(
             scope.ownership == crate::control_scope::Ownership::Local
                 && matches!(
                     scope.kind,
-                    crate::control_scope::ScopeKind::Block { register: false, .. }
+                    crate::control_scope::ScopeKind::Block { .. }
                 | crate::control_scope::ScopeKind::Tagbody { .. }
                 | crate::control_scope::ScopeKind::Catch { .. }
                 | crate::control_scope::ScopeKind::Unwind { .. }
@@ -8806,6 +8816,7 @@ fn emit_framed_inner(
                         | AuxData::NestedClosure(_)
                         | AuxData::LexicalEnvironment { .. }
                         | AuxData::TransferThrow
+                        | AuxData::NamedExit { .. }
                         | AuxData::CatchScope { .. }
                         | AuxData::HandlerScope { .. }
                         | AuxData::HandlerBindScope { .. }

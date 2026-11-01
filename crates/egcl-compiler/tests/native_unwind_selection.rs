@@ -151,11 +151,6 @@ fn crossing_dynamic_state_requires_explicit_restoration() {
             table_index: 0,
             resume_bcp: 80,
         },
-        ScopeKind::Block {
-            id: 1,
-            resume_bcp: 80,
-            register: true,
-        },
         ScopeKind::PendingCleanup { cleanup_bcp: 70 },
         // ScopeKind does not say whether NamedTag made this tagbody visible
         // to a closure, so a local ownership bit alone cannot erase it.
@@ -170,6 +165,35 @@ fn crossing_dynamic_state_requires_explicit_restoration() {
             NativeUnwindStep::Fallback
         );
     }
+}
+
+#[test]
+fn crossed_registered_block_retires_like_a_catch() {
+    // A BLOCK registered for a closure's RETURN-FROM is a runtime record,
+    // retired through the catch ledger when a transfer crosses it
+    // (bliss-gg3i1.7.11).
+    let scopes = [
+        scope(1, ScopeKind::Unwind { cleanup_bcp: 90 }),
+        scope(
+            2,
+            ScopeKind::Block {
+                id: 1,
+                resume_bcp: 80,
+                register: true,
+            },
+        ),
+    ];
+    assert_eq!(
+        next_unwind_step(&scopes, SelectedTarget::OutsideFrame),
+        NativeUnwindStep::RetireCatch { scope_index: 1 }
+    );
+    assert_eq!(
+        next_unwind_step(&scopes[..1], SelectedTarget::OutsideFrame),
+        NativeUnwindStep::RunCleanup {
+            scope_index: 0,
+            handler_depth: 0
+        }
+    );
 }
 
 #[test]

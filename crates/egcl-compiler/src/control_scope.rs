@@ -123,6 +123,30 @@ pub enum ScopeKind {
     },
 }
 
+impl ScopeKind {
+    /// The resume BCP of a destination selected by a runtime control token:
+    /// a CATCH, or a BLOCK registered by name for a closure's RETURN-FROM
+    /// (bliss-gg3i1.7.11). Native code registers both through the same
+    /// enter/leave requests and receives both at a catch landing, which
+    /// delivers the transfer's values to `resume_bcp`.
+    pub fn token_destination(&self) -> Option<u32> {
+        match *self {
+            ScopeKind::Catch { resume_bcp }
+            | ScopeKind::Block {
+                register: true,
+                resume_bcp,
+                ..
+            } => Some(resume_bcp),
+            _ => None,
+        }
+    }
+
+    /// True for a CATCH or a registered BLOCK; see [`Self::token_destination`].
+    pub fn is_token_destination(&self) -> bool {
+        self.token_destination().is_some()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ControlScope {
     pub push_bcp: u32,

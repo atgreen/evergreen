@@ -185,7 +185,13 @@ pub(super) fn request_with_speculation(sym: u32, allow_speculation: bool) -> boo
     }
     static TICKETS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let ticket = TICKETS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if native_would_lose_captured_control(&body) {
+    if t1_would_lose_captured_control(&body) {
+        egcl_rt::blog!(
+            "compile",
+            egcl_rt::log::TRACE,
+            "[T1] {}: declined: a closure it creates needs captured block/tag control; retain interpreter",
+            sym_label(sym)
+        );
         T1_DECLINED.with(|s| s.borrow_mut().insert(sym));
         return false;
     }
