@@ -4434,6 +4434,91 @@ fn emit_cons_field_load(
     Ok(())
 }
 
+/// Heap lexical environment slot access (Backpack): strip the tag, follow
+/// `depth` parent words, then load or store the slot. The compile-time rewrite
+/// fixed the layout and orders every binding before its reads, so there is no
+/// type, bounds or unbound check. A store skips the barrier leaf only for
+/// fixnum over fixnum, exactly as a simple-vector store does.
+fn emit_env_slot(
+    a: &mut Asm,
+    data: &crate::t2::ir::InstData,
+    reg: &mut std::collections::HashMap<crate::t2::ir::Value, u8>,
+    pool: &mut Vec<u8>,
+    const_tagged: &std::collections::HashMap<crate::t2::ir::Value, u64>,
+) -> Result<(), EmitError> {
+    use crate::t2::ir::{AuxData, Opcode};
+    let AuxData::EnvSlot { depth, idx } = data.aux else {
+        return Err(EmitError::UnsupportedOp(op_tag(data.opcode)));
+    };
+    let store = data.opcode == Opcode::EnvSlotSet;
+    if data.args.len() != 1 + usize::from(store)
+        || data.results.len() != usize::from(!store)
+        || data.frame_state.is_some()
+    {
+        return Err(EmitError::UnsupportedOp(op_tag(data.opcode)));
+    }
+    let environment = *reg
+        .get(&data.args[usize::from(store)])
+        .ok_or(EmitError::UnsupportedOp(0xF2))?;
+    mov_rr(a, SCRATCH, environment);
+    alu_r_imm(a, 4 /* AND */, SCRATCH, -8);
+    for _ in 0..depth {
+        load_mem64_disp(a, SCRATCH, SCRATCH, egcl_rt::lexenv::PARENT_OFFSET as i32);
+        alu_r_imm(a, 4 /* AND */, SCRATCH, -8);
+    }
+    let offset = (egcl_rt::lexenv::SLOT0_OFFSET + 8 * usize::from(idx)) as i32;
+    if !store {
+        let dst = framed_alloc(reg, pool, data.results[0])?;
+        load_mem64_disp(a, dst, SCRATCH, offset);
+        return Ok(());
+    }
+    // SCRATCH = the slot's address.
+    alu_r_imm(a, 0 /* ADD */, SCRATCH, offset);
+    let value = data.args[0];
+    let stored = a.label();
+    let barrier = a.label();
+    if const_tagged.get(&value).is_none_or(|bits| bits & 7 == 0) {
+        if !const_tagged.contains_key(&value) {
+            guard_fixnum(a, reg[&value], barrier);
+        }
+        load_mem64_disp(a, RAX, SCRATCH, 0);
+        guard_fixnum(a, RAX, barrier);
+        if let Some(&bits) = const_tagged.get(&value) {
+            mov_imm64(a, RAX, bits as i64);
+        } else {
+            mov_rr(a, RAX, reg[&value]);
+        }
+        store_mem64_disp(a, SCRATCH, 0, RAX);
+        a.jmp(stored);
+    }
+    a.bind(barrier);
+    // Preserve every caller-save home around the noncollecting barrier leaf.
+    let volatile = [RAX, 1, 2, 6, 7, 8, 9, 10, 11];
+    for &r in &volatile {
+        push_reg(a, r);
+    }
+    a.extend_from_slice(&[0x48, 0x83, 0xec, 8]);
+    mov_rr(a, 7, SCRATCH);
+    if let Some(&bits) = const_tagged.get(&value) {
+        mov_imm64(a, 6, bits as i64);
+    } else {
+        let r = reg[&value];
+        if let Some(pos) = volatile.iter().position(|&v| v == r) {
+            load_from_rsp(a, 6, (8 + (8 - pos) * 8) as i32);
+        } else {
+            mov_rr(a, 6, r);
+        }
+    }
+    mov_imm64(a, RAX, store_vector_element as *const () as i64);
+    a.extend_from_slice(&[0xff, 0xd0]);
+    a.extend_from_slice(&[0x48, 0x83, 0xc4, 8]);
+    for &r in volatile.iter().rev() {
+        pop_reg(a, r);
+    }
+    a.bind(stored);
+    Ok(())
+}
+
 /// Raw UTF-8 byte-length load from an explicitly layout-guarded string.  The
 /// result is a tagged non-negative fixnum. This is intentionally below
 /// CL:LENGTH: byte length is useful for emptiness/bounds checks, but is not
@@ -6384,6 +6469,8 @@ fn emit_transfer_function_with_storage(
                     | Opcode::TypeCheck
                     | Opcode::Car
                     | Opcode::Cdr
+                    | Opcode::EnvSlotRef
+                    | Opcode::EnvSlotSet
                     | Opcode::StringCharOrNil
                     | Opcode::VecRef
                     | Opcode::VecSet
@@ -7810,6 +7897,8 @@ fn emit_framed_inner(
                             | Opcode::TypeCheck
                             | Opcode::Car
                             | Opcode::Cdr
+                            | Opcode::EnvSlotRef
+                            | Opcode::EnvSlotSet
                             // The explicit layout guard owns recovery; this
                             // dependent raw length load cannot deopt itself.
                             | Opcode::StringByteLength
@@ -9889,6 +9978,8 @@ fn emit_framed_inner(
                 }
             } else if matches!(d.opcode, Opcode::Car | Opcode::Cdr) {
                 emit_cons_field_load(&mut a, &d, &mut inst_reg, &mut inst_pool)?;
+            } else if matches!(d.opcode, Opcode::EnvSlotRef | Opcode::EnvSlotSet) {
+                emit_env_slot(&mut a, &d, &mut inst_reg, &mut inst_pool, &const_tagged)?;
             } else if d.opcode == Opcode::StringByteLength {
                 emit_string_byte_length(&mut a, &d, &mut inst_reg, &mut inst_pool)?;
             } else if d.opcode == Opcode::StringCharOrNil {

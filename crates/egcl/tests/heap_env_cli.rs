@@ -166,10 +166,14 @@ fn eligible_units_do_no_name_operations() {
             .find_map(|line| line.trim().strip_prefix("SLOT-OPS="))
             .and_then(|count| count.parse().ok())
             .unwrap_or_else(|| panic!("tier={tier}: no slot count in {out}"));
-        assert!(
-            slot_ops >= 300,
-            "tier={tier}: {slot_ops} slot operations\n{out}"
-        );
+        // Native code reads and writes slots inline, uncounted; T0 counts
+        // every one.
+        if tier == "t0" {
+            assert!(
+                slot_ops >= 300,
+                "tier={tier}: {slot_ops} slot operations\n{out}"
+            );
+        }
     }
 }
 

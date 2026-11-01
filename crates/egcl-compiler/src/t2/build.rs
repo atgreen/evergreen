@@ -919,10 +919,9 @@ impl<'a> Builder<'a> {
                     result,
                 })
             }
-            instruction @ (Instr::MakeEnv(_)
-            | Instr::EnvRef { .. }
-            | Instr::EnvSet { .. }
-            | Instr::ClosureEnv) => {
+            // EnvRef/EnvSet are inline loads and stores (`Opcode::EnvSlotRef`
+            // and `EnvSlotSet`), never runtime requests.
+            instruction @ (Instr::MakeEnv(_) | Instr::ClosureEnv) => {
                 let (operands, result) = heap_env_operands(instruction)?;
                 Some(AuxData::LexicalEnvironment {
                     bcp: bcp as u32,
@@ -1561,11 +1560,23 @@ impl<'a> Builder<'a> {
                     let (_, resume) = self.normal_cleanup_return(i as u32)?;
                     push(resume as usize, d + 1, &mut depth_at, &mut work);
                 }
-                Instr::MakeEnv(_)
-                | Instr::EnvRef { .. }
-                | Instr::EnvSet { .. }
-                | Instr::ClosureEnv
-                | Instr::MakeEnvClosure { .. }
+                Instr::EnvRef { .. } => {
+                    if d < 1 {
+                        return Err(BuildError::Unsupported(
+                            "heap environment operand underflow",
+                        ));
+                    }
+                    push(i + 1, d, &mut depth_at, &mut work);
+                }
+                Instr::EnvSet { .. } => {
+                    if d < 2 {
+                        return Err(BuildError::Unsupported(
+                            "heap environment operand underflow",
+                        ));
+                    }
+                    push(i + 1, d - 2, &mut depth_at, &mut work);
+                }
+                Instr::MakeEnv(_) | Instr::ClosureEnv | Instr::MakeEnvClosure { .. }
                     if self.native_cleanups =>
                 {
                     let (operands, result) =
@@ -2818,6 +2829,59 @@ impl<'a> Builder<'a> {
                         return Ok(());
                     }
                     stack.push(results[0]);
+                }
+                // Heap lexical environments (Backpack): a slot is a load chain
+                // from the environment value, in every build mode.
+                Instr::EnvRef { depth, idx, .. } => {
+                    let environment = stack
+                        .pop()
+                        .ok_or(BuildError::Unsupported("stack underflow (EnvRef)"))?;
+                    let value = self
+                        .emit(
+                            block,
+                            Opcode::EnvSlotRef,
+                            vec![environment],
+                            AuxData::EnvSlot {
+                                depth: *depth,
+                                idx: *idx,
+                            },
+                            InstFlags {
+                                effectful: true,
+                                ..InstFlags::default()
+                            },
+                            None,
+                            IRType::TOP,
+                        )
+                        .expect("environment slot read has a result");
+                    stack.push(value);
+                }
+                Instr::EnvSet { depth, idx, .. } => {
+                    let environment = stack
+                        .pop()
+                        .ok_or(BuildError::Unsupported("stack underflow (EnvSet)"))?;
+                    let value = stack
+                        .pop()
+                        .ok_or(BuildError::Unsupported("stack underflow (EnvSet)"))?;
+                    self.f.push_inst(
+                        block,
+                        InstData {
+                            opcode: Opcode::EnvSlotSet,
+                            args: vec![value, environment],
+                            results: vec![],
+                            aux: AuxData::EnvSlot {
+                                depth: *depth,
+                                idx: *idx,
+                            },
+                            flags: InstFlags {
+                                effectful: true,
+                                ..InstFlags::default()
+                            },
+                            targets: vec![],
+                            frame_state: None,
+                            source_pos: 0,
+                        },
+                        &[],
+                    );
                 }
                 Instr::AllocCons => {
                     // Backquote templates build their conses with AllocCons;
