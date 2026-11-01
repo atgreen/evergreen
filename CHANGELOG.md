@@ -629,7 +629,7 @@
   A LAMBDA that captures nothing now returns the same function object every
   time it is evaluated, so such closures are `eq`. The image format is now
   version 18; images saved by earlier versions must be saved again.
-  ([#NNN](https://github.com/atgreen/evergreen/pull/NNN))
+  ([#968](https://github.com/atgreen/evergreen/pull/968))
 - Functions containing MULTIPLE-VALUE-SETQ, an inline `((lambda (x) ...) arg)`
   application, `(setf (get ...))`, or a HANDLER-CASE clause typed
   `(or a b)` now compile instead of running in the interpreter on every
