@@ -55,3 +55,12 @@ Still to come (tracked on bliss-jpd0): the rest of the Gabriel core (boyer,
 browse, puzzle, triangle, …) as stdlib coverage allows, cl-bench proper,
 `thresholds.toml` (R10.62) once numbers stabilize, and archived trend results
 (R10.10).
+
+`closure-env.sh` times closure creation and captured-variable access
+(Backpack, bliss-gg3i1.7.15): closure creation, a closure incrementing a
+captured counter, LABELS recursion over captured variables, nested LETs whose
+variables are captured, and reads of a variable three frames up. It pins each
+tier with `EGCL_FORCE_TIER` (`TIERS="interp t0 t1 t2 default"`) and prints the
+minimum ns/op of N runs. `(egcl::%env-access-counts t)` enables per-thread
+counts of compiled environment operations and frame hops, which show whether a
+workload resolves its captures by name or by compile-time slot.
