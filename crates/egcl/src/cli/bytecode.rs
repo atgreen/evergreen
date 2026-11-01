@@ -2890,17 +2890,17 @@ thread_local! {
 /// handoff (`EvalHost`/`MakeClosureEnv`) again, as `EGCL_LAMBDA_HOST_HANDOFF`
 /// does process-wide. For unit tests of that still-reachable fallback path,
 /// which need a host form at a known constant index.
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 pub(super) struct ForceLambdaHostHandoff(bool);
 
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 impl ForceLambdaHostHandoff {
     pub(super) fn enter() -> Self {
         Self(FORCE_LAMBDA_HOST_HANDOFF.with(|forced| forced.replace(true)))
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 impl Drop for ForceLambdaHostHandoff {
     fn drop(&mut self) {
         FORCE_LAMBDA_HOST_HANDOFF.with(|forced| forced.set(self.0));
