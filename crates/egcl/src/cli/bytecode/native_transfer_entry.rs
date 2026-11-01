@@ -3752,7 +3752,7 @@ unsafe fn lexical_environment_request(
             let args = if call.nargs == 0 {
                 &[][..]
             } else {
-                unsafe { std::slice::from_raw_parts(call.args, call.nargs as usize) }
+                unsafe { std::slice::from_raw_parts(call.args, call.nargs) }
             };
             match instruction {
                 Instr::MakeEnv(size) => {

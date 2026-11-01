@@ -2129,6 +2129,14 @@ fn format_bytecode_listing(sym: u32, bf: &Arc<BytecodeFunction>) -> String {
     let mut out = disasm_header(sym, bf);
     out.push_str("; T0 — tree-walked forms compiled to stack bytecode; call sites show the\n");
     out.push_str("; runtime operand-type profile (fix/float/other) that drives tier-up.\n");
+    // The compile-time name table of the heap environments this body reaches
+    // (Backpack): which variable each (environment, depth, slot) holds.
+    for (local, depth, idx, name) in heap_env::slot_names(bf) {
+        let _ = writeln!(
+            out,
+            "; heap environment in local {local}, depth {depth}, slot {idx}: {name}"
+        );
+    }
     let func_ptr = Arc::as_ptr(bf) as usize;
     for (pc, instr) in bf.code.iter().enumerate() {
         // Render the instruction with symbol NAMES substituted for the raw sym
@@ -2167,6 +2175,11 @@ fn format_bytecode_listing(sym: u32, bf: &Arc<BytecodeFunction>) -> String {
                 .unwrap_or_default(),
             Instr::Br(t) | Instr::BrIfFalse(t) | Instr::BrIfTrue(t) => format!("→ {t}"),
             Instr::Go { target_bcp, .. } => format!("→ {target_bcp}"),
+            Instr::EnvRef { name, .. } | Instr::EnvSet { name, .. } => bf
+                .names
+                .get(usize::from(*name))
+                .map(|name| lexical_identity::name(name).to_owned())
+                .unwrap_or_default(),
             _ => String::new(),
         };
         if ann.is_empty() {

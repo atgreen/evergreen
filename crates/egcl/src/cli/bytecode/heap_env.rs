@@ -1066,15 +1066,18 @@ pub(super) fn count_access(depth: u8) {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 /// Pack `EnvRef`/`EnvSet` operands into one immediate word.
 pub(super) fn pack(depth: u8, idx: u16, name: u16) -> u64 {
     (u64::from(name) << 32) | (u64::from(depth) << 16) | u64::from(idx)
 }
 
+#[cfg(target_arch = "x86_64")]
 fn unpack(packed: u64) -> (u8, u16, u64) {
     ((packed >> 16) as u8, packed as u16, (packed >> 32) & 0xffff)
 }
 
+#[cfg(target_arch = "x86_64")]
 fn unbound(names: *const NativeEnvNames, name: u64) -> EgclError {
     // SAFETY: emitted code retains its name table through its code owner.
     let symbol = (!names.is_null())
@@ -1085,6 +1088,7 @@ fn unbound(names: *const NativeEnvNames, name: u64) -> EgclError {
     EgclError::UnboundVariable(symbol)
 }
 
+#[cfg(target_arch = "x86_64")]
 /// `MakeEnv`: allocates, so it is a c2i helper whose inputs are rooted here.
 pub(super) extern "C" fn c2i_heap_make_env(parent: u64, size: u64) -> u64 {
     match guard_c2i(|| {
@@ -1102,6 +1106,7 @@ pub(super) extern "C" fn c2i_heap_make_env(parent: u64, size: u64) -> u64 {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 /// `EnvRef`: no allocation, no lock, no name lookup.
 pub(super) extern "C" fn c2i_heap_env_ref(
     env: u64,
@@ -1119,6 +1124,7 @@ pub(super) extern "C" fn c2i_heap_env_ref(
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 /// `EnvSet`: a barriered store; no allocation.
 pub(super) extern "C" fn c2i_heap_env_set(
     env: u64,
@@ -1133,12 +1139,14 @@ pub(super) extern "C" fn c2i_heap_env_set(
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 /// `ClosureEnv`: the running closure's environment, from the frame the native
 /// entry installed for its activation (see [`carrier`]).
 pub(super) extern "C" fn c2i_heap_closure_env() -> u64 {
     NATIVE_ENV_FRAME.with(|slot| captured_env(slot.borrow().as_ref()).0)
 }
 
+#[cfg(target_arch = "x86_64")]
 /// `MakeEnvClosure`: `operands` addresses the parent followed by `nflat`
 /// values, still on the (scanned) native operand stack.
 pub(super) extern "C" fn c2i_heap_make_env_closure(
