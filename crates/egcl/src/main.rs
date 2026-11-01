@@ -472,6 +472,7 @@ fn main() {
     // EGCL_SPROF was set.
     cli::sprof::dump_on_exit();
     cli::handoff_census::dump_on_exit();
+    cli::tw_census::dump_on_exit();
     match result {
         Ok(code) => std::process::exit(code),
         Err(e) => {

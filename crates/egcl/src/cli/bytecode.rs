@@ -2951,6 +2951,7 @@ fn bail_reason_wanted() -> bool {
     t2_log_target().is_some()
         || egcl_rt::log::enabled("compile", egcl_rt::log::TRACE)
         || super::handoff_census::enabled()
+        || super::tw_census::enabled()
 }
 
 fn reset_last_bail_reason() {
@@ -18133,6 +18134,12 @@ fn compile_defun(
                     .as_deref()
                     .unwrap_or("bytecode lowering bailed; no reason recorded"),
             );
+            if super::tw_census::enabled() {
+                super::tw_census::note_declined(
+                    sym,
+                    reason.as_deref().unwrap_or("no reason recorded"),
+                );
+            }
             LAZY_DECLINED.with(|s| s.borrow_mut().insert(sym));
             false
         }

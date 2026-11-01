@@ -291,6 +291,27 @@ pub fn init_from_env() {
     if let Ok(v) = std::env::var("EGCL_SPROF") {
         let hz = v.trim().parse::<u32>().unwrap_or(1000).max(1);
         start(hz);
+        // `EGCL_SPROF_DUMP_SECS=<n>` also rewrites `EGCL_SPROF_OUT` every n
+        // seconds, so a run that never finishes (or is killed by a timeout)
+        // still leaves a profile. The writer only reads the integer sample
+        // store; it touches no Lisp value or GC state.
+        if let Some(secs) = std::env::var("EGCL_SPROF_DUMP_SECS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|&s| s > 0)
+        {
+            let path =
+                std::env::var("EGCL_SPROF_OUT").unwrap_or_else(|_| "egcl-sprof.folded".to_string());
+            std::thread::spawn(move || {
+                let tmp = format!("{path}.tmp");
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(secs));
+                    if std::fs::write(&tmp, fold()).is_ok() {
+                        let _ = std::fs::rename(&tmp, &path);
+                    }
+                }
+            });
+        }
     }
 }
 
