@@ -621,6 +621,15 @@
 
 ### Performance
 
+- Closures are cheaper to create, call and collect. Every closure made from
+  one LAMBDA shares a single compiled body and tiering record, and carries
+  its captured variables on the function object itself, so creating one is a
+  single allocation: creating a capturing closure is 2.5–3x faster, and
+  garbage-collection time in loops that create closures drops by about 80%.
+  A LAMBDA that captures nothing now returns the same function object every
+  time it is evaluated, so such closures are `eq`. The image format is now
+  version 18; images saved by earlier versions must be saved again.
+  ([#NNN](https://github.com/atgreen/evergreen/pull/NNN))
 - Functions containing MULTIPLE-VALUE-SETQ, an inline `((lambda (x) ...) arg)`
   application, `(setf (get ...))`, or a HANDLER-CASE clause typed
   `(or a b)` now compile instead of running in the interpreter on every
