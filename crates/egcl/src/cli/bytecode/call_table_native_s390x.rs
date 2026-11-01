@@ -57,7 +57,7 @@ impl NativeEntry {
                 .any(|ty| !matches!(ty, DeclaredType::Any))
             || replacement_function(symbol).is_some()
             || closure_captured_env(function).is_some()
-            || closure_controls().borrow().contains_key(&symbol)
+            || has_captured_control(function)
         {
             return None;
         }

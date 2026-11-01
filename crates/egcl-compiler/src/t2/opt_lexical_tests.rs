@@ -356,6 +356,7 @@ fn captured_update_bytecode() -> egcl_rt::bytecode::BytecodeFunction {
         max_args: Some(1),
         variadic: false,
         binder_cache: Default::default(),
+        closure_template: Default::default(),
     }
 }
 

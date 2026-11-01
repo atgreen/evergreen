@@ -60,6 +60,16 @@ pub const FLAG_QUEUED_FOR_T2: u16 = 1 << 0;
 pub const FLAG_T2_FAILED: u16 = 1 << 1;
 /// FnMeta flag: never attempt to compile (unsupported construct).
 pub const FLAG_NEVER_COMPILE: u16 = 1 << 2;
+/// Object flag: an instance of a closure template (bliss-gg3i1.7.15.3). Its
+/// `env` cell holds the template's prototype function, which owns the shared
+/// tiering metadata (counters, tier, FnMeta flags) and, through its definition
+/// symbol, the compiled code. Set at allocation and never cleared.
+pub const FLAG_CLOSURE_INSTANCE: u16 = 1 << 3;
+/// Object flag: the prototype of a closure template, installed in its template
+/// symbol's function cell. Set before publication and never cleared.
+pub const FLAG_CLOSURE_TEMPLATE: u16 = 1 << 4;
+/// Flags owned by the object itself rather than by its metadata owner.
+const OBJECT_FLAGS: u16 = FLAG_CLOSURE_INSTANCE | FLAG_CLOSURE_TEMPLATE;
 
 fn body_size() -> usize {
     std::mem::size_of::<FunctionData>() - std::mem::size_of::<ObjectHeader>()
@@ -90,6 +100,42 @@ unsafe fn data(f: EgclVal) -> *mut FunctionData {
     unsafe { f.as_ptr() as *mut FunctionData }
 }
 
+/// The object holding `f`'s tiering metadata: a closure instance shares its
+/// template prototype's, every other function holds its own.
+///
+/// # Safety
+/// `f` must be an interpreted-function object.
+#[inline]
+unsafe fn meta(f: EgclVal) -> *mut FunctionData {
+    // SAFETY: caller guarantees `f` is live. An instance's `env` cell is its
+    // pinned prototype, which the instance keeps reachable.
+    unsafe {
+        let d = data(f);
+        if (*d).flags.load(Ordering::Relaxed) & FLAG_CLOSURE_INSTANCE != 0 {
+            data((*d).env)
+        } else {
+            d
+        }
+    }
+}
+
+/// Allocate one pinned FUNCTION_INTERPRETED body, collecting once and retrying
+/// when the pinned space is exhausted. The caller must root every value it
+/// stores afterwards, including any frame its closure state will own.
+fn alloc_function_body() -> *mut u8 {
+    crate::gc::alloc_pinned_typed(body_size(), type_id::FUNCTION_INTERPRETED)
+        .or_else(|| {
+            if std::env::var_os("EGCL_GC_DISABLE").is_some() {
+                return None;
+            }
+            // Collect outside the allocator's heap lock, then retry slots
+            // reclaimed from dead functions.
+            crate::gc::full_gc().expect("GC failed while allocating interpreted function");
+            crate::gc::alloc_pinned_typed(body_size(), type_id::FUNCTION_INTERPRETED)
+        })
+        .expect("OOM allocating interpreted function object")
+}
+
 /// Allocate a pinned interpreted function object with all cells set and the
 /// tiering metadata zeroed and the current process's native dispatcher pair.
 pub fn alloc_interpreted(
@@ -112,17 +158,8 @@ pub fn alloc_interpreted(
             crate::symbols::make_uninterned("FUNCTION-DEFINITION")
         }
     );
-    let body_ptr = crate::gc::alloc_pinned_typed(body_size(), type_id::FUNCTION_INTERPRETED)
-        .or_else(|| {
-            if std::env::var_os("EGCL_GC_DISABLE").is_some() {
-                return None;
-            }
-            // All fields are rooted above. Collect outside the allocator's
-            // heap lock, then retry slots reclaimed from dead functions.
-            crate::gc::full_gc().expect("GC failed while allocating interpreted function");
-            crate::gc::alloc_pinned_typed(body_size(), type_id::FUNCTION_INTERPRETED)
-        })
-        .expect("OOM allocating interpreted function object");
+    // All fields are rooted above.
+    let body_ptr = alloc_function_body();
     // SAFETY: fresh FUNCTION_INTERPRETED body; header precedes it and its start
     // coincides with FunctionData's first field.
     unsafe {
@@ -138,9 +175,95 @@ pub fn alloc_interpreted(
         (*d).tier = 0.into();
         (*d).flags = 0.into();
         (*d).definition_index = definition.as_symbol_index();
+        (*d).closure_state = 0.into();
 
         EgclVal::from_heap_ptr(header)
     }
+}
+
+/// Allocate an instance of the closure template whose prototype is
+/// `prototype`: its lambda list, name and definition symbol, the prototype in
+/// its `env` cell, and `state` (0 or an evaluator-owned closure state) in its
+/// raw state word. No symbol, registry or code-table work.
+///
+/// The caller must keep alive (root) whatever `state` owns, such as the
+/// captured frame, until this returns: the allocation can collect.
+pub fn alloc_closure_instance(prototype: EgclVal, state: usize) -> EgclVal {
+    debug_assert!(is_interpreted_function(prototype));
+    crate::rooted!(prototype = prototype);
+    let body_ptr = alloc_function_body();
+    // SAFETY: fresh FUNCTION_INTERPRETED body, as in `alloc_interpreted`; the
+    // rooted prototype is pinned and live.
+    unsafe {
+        let header = body_ptr.sub(header_size());
+        let d = header as *mut FunctionData;
+        let p = data(*prototype);
+        (*d).lambda_list = (*p).lambda_list;
+        (*d).body = crate::value::NIL;
+        (*d).env = *prototype;
+        (*d).name = (*p).name;
+        (*d).invoke_count = 0.into();
+        (*d).back_edge_count = 0.into();
+        (*d).native_entries = AtomicPtr::new(native_entries_pointer());
+        (*d).tier = 0.into();
+        (*d).flags = FLAG_CLOSURE_INSTANCE.into();
+        (*d).definition_index = (*p).definition_index;
+        (*d).closure_state = state.into();
+        EgclVal::from_heap_ptr(header)
+    }
+}
+
+/// Mark `f` as the prototype of a closure template.
+///
+/// # Safety
+/// `f` must be an interpreted-function object not yet published to another
+/// thread.
+pub unsafe fn mark_closure_template(f: EgclVal) {
+    unsafe {
+        (*data(f))
+            .flags
+            .fetch_or(FLAG_CLOSURE_TEMPLATE, Ordering::AcqRel);
+    }
+}
+
+/// Whether `f` is an instance of a closure template.
+pub fn is_closure_instance(f: EgclVal) -> bool {
+    is_interpreted_function(f) && own_flags(f) & FLAG_CLOSURE_INSTANCE != 0
+}
+
+/// Whether `f` is the prototype of a closure template.
+pub fn is_closure_template(f: EgclVal) -> bool {
+    is_interpreted_function(f) && own_flags(f) & FLAG_CLOSURE_TEMPLATE != 0
+}
+
+/// The template prototype of a closure instance.
+pub fn closure_prototype(f: EgclVal) -> Option<EgclVal> {
+    is_closure_instance(f).then(|| env(f))
+}
+
+/// The flags stored in `f` itself, without delegation to a prototype.
+fn own_flags(f: EgclVal) -> u16 {
+    unsafe { (*data(f)).flags.load(Ordering::Acquire) }
+}
+
+/// The raw closure-state word: 0, or a value the evaluator stored with
+/// [`set_closure_state`]. The collector never traces it.
+///
+/// # Safety
+/// `f` must be an interpreted-function object.
+pub unsafe fn closure_state(f: EgclVal) -> usize {
+    unsafe { (*data(f)).closure_state.load(Ordering::Acquire) }
+}
+
+/// Replace the raw closure-state word, returning the previous one. The
+/// evaluator owns both values; a nonzero word left in a dead object is passed
+/// to the collector's closure-state release hook (see
+/// `gc::set_closure_state_release_fn`).
+///
+/// # Safety
+/// `f` must be an interpreted-function object.
+pub unsafe fn set_closure_state(f: EgclVal, state: usize) -> usize {
+    unsafe { (*data(f)).closure_state.swap(state, Ordering::AcqRel) }
 }
 
 /// Redefine `f` in place: update its lambda list / body / env and reset tiering
@@ -161,7 +284,7 @@ pub unsafe fn redefine(f: EgclVal, lambda_list: EgclVal, body: EgclVal, env: Egc
         (*d).native_entries
             .store(native_entries_pointer(), Ordering::Release);
         (*d).tier.store(0, Ordering::Release);
-        (*d).flags.store(0, Ordering::Release);
+        (*d).flags.fetch_and(OBJECT_FLAGS, Ordering::AcqRel);
     }
 }
 
@@ -204,23 +327,23 @@ pub fn invocation_counter_address(f: EgclVal) -> Option<*const core::sync::atomi
     }
     // SAFETY: the kind check established a live pinned FunctionData object;
     // taking its field address neither reads the counter nor allocates.
-    Some(unsafe { std::ptr::addr_of!((*data(f)).invoke_count) })
+    Some(unsafe { std::ptr::addr_of!((*meta(f)).invoke_count) })
 }
 
 /// Record an invocation (T0/T1 prologue): atomically bump and return the new
 /// invocation count. Lock-free (R4.53).
 pub fn record_invocation(f: EgclVal) -> u32 {
-    unsafe { (*data(f)).invoke_count.fetch_add(1, Ordering::Relaxed) + 1 }
+    unsafe { (*meta(f)).invoke_count.fetch_add(1, Ordering::Relaxed) + 1 }
 }
 
 /// The current invocation count.
 pub fn invoke_count(f: EgclVal) -> u32 {
-    unsafe { (*data(f)).invoke_count.load(Ordering::Relaxed) }
+    unsafe { (*meta(f)).invoke_count.load(Ordering::Relaxed) }
 }
 
 /// Record a loop back-edge; returns the new count.
 pub fn record_back_edge(f: EgclVal) -> u32 {
-    unsafe { (*data(f)).back_edge_count.fetch_add(1, Ordering::Relaxed) + 1 }
+    unsafe { (*meta(f)).back_edge_count.fetch_add(1, Ordering::Relaxed) + 1 }
 }
 
 /// Add a sampled batch of back-edges. Native tiers poll only periodically, so
@@ -228,7 +351,7 @@ pub fn record_back_edge(f: EgclVal) -> u32 {
 /// a runtime call on every loop iteration.
 pub fn record_back_edges(f: EgclVal, count: u32) -> u32 {
     unsafe {
-        (*data(f))
+        (*meta(f))
             .back_edge_count
             .fetch_add(count, Ordering::Relaxed)
             .saturating_add(count)
@@ -238,13 +361,13 @@ pub fn record_back_edges(f: EgclVal, count: u32) -> u32 {
 /// The current loop back-edge count — the hot-loop profiling signal read by the
 /// tier scheduler alongside `invoke_count` (bliss-jtc.10).
 pub fn back_edge_count(f: EgclVal) -> u32 {
-    unsafe { (*data(f)).back_edge_count.load(Ordering::Relaxed) }
+    unsafe { (*meta(f)).back_edge_count.load(Ordering::Relaxed) }
 }
 
 /// Stable address of the pinned callable's loop counter. The caller must
 /// retain a traced root, as for `invocation_counter_address`.
 pub fn back_edge_counter_address(f: EgclVal) -> Option<*const core::sync::atomic::AtomicU32> {
-    is_interpreted_function(f).then(|| unsafe { std::ptr::addr_of!((*data(f)).back_edge_count) })
+    is_interpreted_function(f).then(|| unsafe { std::ptr::addr_of!((*meta(f)).back_edge_count) })
 }
 
 /// Reset the loop back-edge count to zero. Used as OSR-deopt backoff (bliss-izt.2):
@@ -252,17 +375,17 @@ pub fn back_edge_counter_address(f: EgclVal) -> Option<*const core::sync::atomic
 /// the loop must run another full threshold of interpreted iterations before it is
 /// re-promoted, bounding OSR-enter/deopt thrash on a loop that keeps overflowing.
 pub fn reset_back_edge_count(f: EgclVal) {
-    unsafe { (*data(f)).back_edge_count.store(0, Ordering::Relaxed) }
+    unsafe { (*meta(f)).back_edge_count.store(0, Ordering::Relaxed) }
 }
 
 /// The current tier (0/1/2).
 pub fn tier(f: EgclVal) -> u8 {
-    unsafe { (*data(f)).tier.load(Ordering::Acquire) }
+    unsafe { (*meta(f)).tier.load(Ordering::Acquire) }
 }
 
 /// Set the current tier.
 pub fn set_tier(f: EgclVal, tier: u8) {
-    unsafe { (*data(f)).tier.store(tier, Ordering::Release) }
+    unsafe { (*meta(f)).tier.store(tier, Ordering::Release) }
 }
 
 /// Publish this process's callable contract, repairing functions allocated
@@ -281,13 +404,15 @@ pub fn native_entries(f: EgclVal) -> Option<&'static NativeCallableEntries> {
 
 /// The FnMeta flags word.
 pub fn flags(f: EgclVal) -> u16 {
-    unsafe { (*data(f)).flags.load(Ordering::Acquire) }
+    unsafe { (*meta(f)).flags.load(Ordering::Acquire) & !OBJECT_FLAGS }
 }
 
 /// Set FnMeta flag bits.
 pub fn set_flags(f: EgclVal, bits: u16) {
     unsafe {
-        (*data(f)).flags.fetch_or(bits, Ordering::AcqRel);
+        (*meta(f))
+            .flags
+            .fetch_or(bits & !OBJECT_FLAGS, Ordering::AcqRel);
     }
 }
 
@@ -326,9 +451,10 @@ mod tests {
         assert!(std::ptr::eq(native_entries(*function).unwrap(), &ENTRIES));
         let fresh = alloc_interpreted(NIL, NIL, NIL, NIL);
         assert!(std::ptr::eq(native_entries(fresh).unwrap(), &ENTRIES));
-        assert_eq!(std::mem::size_of::<FunctionData>(), 64);
+        assert_eq!(std::mem::size_of::<FunctionData>(), 72);
         assert_eq!(std::mem::offset_of!(FunctionData, native_entries), 48);
         assert_eq!(std::mem::offset_of!(FunctionData, definition_index), 60);
+        assert_eq!(std::mem::offset_of!(FunctionData, closure_state), 64);
     }
 
     #[test]

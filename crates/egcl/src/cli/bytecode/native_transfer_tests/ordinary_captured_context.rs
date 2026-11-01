@@ -434,6 +434,8 @@ fn ordinary_shared_code_survives_first_instance_without_retaining_its_frame() {
     egcl_rt::rooted!(second = closure(&body, EgclVal::from_fixnum(22), &mut env));
     let first_id = egcl_rt::function::definition_index(*first);
     let second_id = egcl_rt::function::definition_index(*second);
+    // Instances of one template share its code identity (bliss-gg3i1.7.15.3).
+    assert_eq!(first_id, second_id);
     let first_frame = Arc::downgrade(&closure_captured_env(*first).unwrap());
     let second_frame = Arc::downgrade(&closure_captured_env(*second).unwrap());
     let code = install(*first);
@@ -464,10 +466,9 @@ fn ordinary_shared_code_survives_first_instance_without_retaining_its_frame() {
         first_frame.upgrade().is_none(),
         "native metadata must not retain the first instance's captured payload"
     );
-    assert!(!closure_envs().borrow().contains_key(&first_id));
     assert!(
-        !closure_bodies().borrow().contains_key(&first_id),
-        "instance records and code ownership are separate"
+        closure_bodies().borrow().contains_key(&first_id),
+        "the template's code outlives one of its instances"
     );
     assert!(registry_get(first_id).is_some_and(|saved| Arc::ptr_eq(&saved, &body)));
     let (selected_owner, selected_code, selected, _) =
@@ -702,7 +703,9 @@ fn mutated_owner_cells_do_not_turn_code_cache_into_a_closure_root() {
         let owner = egcl_rt::function::definition_index(*first);
         let frame = Arc::downgrade(&closure_captured_env(*first).unwrap());
         let code = install(*first);
-        assert!(egcl_rt::symbols::symbol_global_cells_are_pristine(owner));
+        // A template symbol's only global edge is its prototype in the
+        // function cell (bliss-gg3i1.7.15.3).
+        assert!(is_closure_template_symbol(owner));
         if plist {
             egcl_rt::rooted!(properties = crate::cli::arena_cons(*first, NIL));
             egcl_rt::symbols::set_symbol_plist(owner, *properties);
@@ -727,20 +730,21 @@ fn mutated_owner_cells_do_not_turn_code_cache_into_a_closure_root() {
             frame.upgrade().is_some(),
             "active code temporarily owns its mutated symbol graph"
         );
+        // The template symbol is a real owner while an instance names it, so
+        // its mutated cell keeps that graph alive; once the last instance
+        // dies, the whole cycle (symbol, cell, instance, frame) is garbage,
+        // and installed code does not keep the template alive.
+        *second = NIL;
         egcl_rt::gc::full_gc().unwrap();
         assert!(
             frame.upgrade().is_none(),
-            "cache-only owner symbol must not root its value/plist cycle"
+            "a template symbol's value/plist cycle must not outlive its instances"
         );
         assert!(registry_get(owner).is_none());
         assert!(!NATIVE_REGISTRY.with(|registry| registry.borrow().contains_key(&owner)));
         assert!(
             !CLOSURE_COMPILATION
                 .with(|cache| cache.borrow().contains_key(&(Arc::as_ptr(&body) as usize)))
-        );
-        assert!(
-            native_transfer_entry::funcall_fast::native_target(*second, 1).is_none(),
-            "a contaminated metadata lease falls back to recompilation"
         );
         assert!(
             code.is_t2,
@@ -768,7 +772,8 @@ fn late_owner_contamination_retires_metadata_after_instance_records_are_gone() {
     let code = install(*first);
     *first = NIL;
     egcl_rt::gc::full_gc().unwrap();
-    assert!(!closure_bodies().borrow().contains_key(&owner));
+    // The surviving instance keeps the template, which owns the code.
+    assert!(closure_bodies().borrow().contains_key(&owner));
     assert!(NATIVE_REGISTRY.with(|registry| registry.borrow().contains_key(&owner)));
     egcl_rt::symbols::set_symbol_value(owner, *second);
     *second = NIL;
@@ -800,28 +805,38 @@ fn late_function_cell_change_retires_old_code_without_removing_current_binding()
     egcl_rt::rooted!(second = closure(&body, EgclVal::from_fixnum(2), &mut env));
     let owner = egcl_rt::function::definition_index(*first);
     let replacement_id = egcl_rt::function::definition_index(*second);
+    // Instances share the template's identity (bliss-gg3i1.7.15.3).
+    assert_eq!(replacement_id, owner);
     let code = install(*first);
     *first = NIL;
     egcl_rt::gc::full_gc().unwrap();
-    assert!(!closure_bodies().borrow().contains_key(&owner));
+    assert!(closure_bodies().borrow().contains_key(&owner));
     assert!(NATIVE_REGISTRY.with(|registry| registry.borrow().contains_key(&owner)));
-    // A genuinely retained user symbol owns its new function binding. Only
-    // the former compilation-owner cache is eligible for eviction.
+    // A genuinely retained user symbol owns its new function binding: here
+    // an instance replaces the prototype in the template symbol's cell.
     egcl_rt::rooted!(_name = EgclVal::from_symbol_index(owner));
     egcl_rt::symbols::set_symbol_function(owner, *second);
     *second = NIL;
     egcl_rt::gc::full_gc().unwrap();
-    assert!(!REGISTRY.with(|registry| registry.borrow().contains_key(&owner)));
-    assert!(!NATIVE_REGISTRY.with(|registry| registry.borrow().contains_key(&owner)));
-    assert!(
-        !CLOSURE_COMPILATION
-            .with(|cache| cache.borrow().contains_key(&(Arc::as_ptr(&body) as usize)))
-    );
+    // The binding keeps that instance, and with it its template: the code
+    // and the captures stay, and the instance stays callable.
     let current = egcl_rt::symbols::symbol_function(owner).unwrap();
-    assert!(egcl_rt::function::is_interpreted_function(current));
+    assert!(egcl_rt::function::is_closure_instance(current));
     assert_eq!(egcl_rt::function::definition_index(current), replacement_id);
     assert!(registry_get(replacement_id).is_some_and(|current| Arc::ptr_eq(&current, &body)));
     assert!(closure_captured_env(current).is_some());
+    assert_eq!(
+        run_native_callable(&code, owner, current, &[EgclVal::from_fixnum(5)], &mut env).unwrap(),
+        EgclVal::from_fixnum(5)
+    );
+    // A new instance of the body still runs this body, whichever code
+    // identity it is given once the prototype has left the cell.
+    egcl_rt::rooted!(fresh = closure(&body, EgclVal::from_fixnum(6), &mut env));
+    assert!(
+        registry_get(egcl_rt::function::definition_index(*fresh))
+            .is_some_and(|current| Arc::ptr_eq(&current, &body))
+    );
+    assert!(closure_captured_env(*fresh).is_some());
     assert!(code.is_t2);
     egcl_rt::symbols::set_symbol_function(owner, egcl_rt::value::UNBOUND);
 }
@@ -1175,9 +1190,11 @@ fn named_factory_keeps_flat_noenv_code_but_not_its_first_instance_alive() {
     assert!(code.is_t2);
     *first = NIL;
     egcl_rt::gc::full_gc().unwrap();
+    // The live factory's body keeps its template, not the dead first
+    // instance: the code identity survives every instance (bliss-gg3i1.7.15.3).
     assert!(
-        !closure_bodies().borrow().contains_key(&owner),
-        "dead instance records must disappear"
+        closure_bodies().borrow().contains_key(&owner),
+        "the live factory must keep the template's code identity"
     );
     assert!(registry_get(owner).is_some_and(|current| Arc::ptr_eq(&current, &body)));
     assert!(NATIVE_REGISTRY.with(|registry| {

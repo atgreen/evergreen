@@ -471,6 +471,7 @@ mod tests {
             max_args: Some(0),
             variadic: false,
             binder_cache: Default::default(),
+            closure_template: Default::default(),
         });
         note_published_body(&body);
         drop(constant);
@@ -517,6 +518,7 @@ mod tests {
             max_args: Some(0),
             variadic: false,
             binder_cache: Default::default(),
+            closure_template: Default::default(),
         });
         let frame = FrameCell::new_arc(EnvFrame::default());
         egcl_rt::rooted!(

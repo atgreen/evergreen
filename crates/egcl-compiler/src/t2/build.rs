@@ -4780,6 +4780,7 @@ mod tests {
             max_args: Some(arity),
             variadic: false,
             binder_cache: Default::default(),
+            closure_template: Default::default(),
         }
     }
 

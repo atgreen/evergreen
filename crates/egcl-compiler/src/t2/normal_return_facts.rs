@@ -406,6 +406,7 @@ mod tests {
             max_args: Some(1),
             variadic: false,
             binder_cache: Default::default(),
+            closure_template: Default::default(),
         };
         let f = crate::t2::build::build_from_bytecode(&body).unwrap();
         let calls: Vec<_> = f

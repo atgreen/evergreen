@@ -114,7 +114,8 @@ fn private_noenv_probe_shares_code_and_preserves_distinct_actual_identities() {
     );
     *first = NIL;
     egcl_rt::gc::full_gc().unwrap();
-    assert!(!closure_bodies().borrow().contains_key(&first_id));
+    // The surviving instance keeps the shared template (bliss-gg3i1.7.15.3).
+    assert!(closure_bodies().borrow().contains_key(&first_id));
     assert!(NATIVE_REGISTRY.with(|codes| {
         codes
             .borrow()

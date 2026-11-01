@@ -1560,15 +1560,11 @@ unsafe fn trace_object(
             }
         }
 
-        // ── Interpreted function: lambda_list/body/env/name (§1.11.1). ──
+        // ── Interpreted function: lambda_list/body/env/name (§1.11.1); the
+        //    counters, definition index and raw closure-state word follow. ──
         tid::FUNCTION_INTERPRETED => {
             for i in 0..FUNCTION_HEAP_REFERENCE_WORDS {
                 visit_word(i);
-            }
-            if words >= 4 {
-                if let Some(trace) = FUNCTION_CAPTURE_TRACE_FN.get() {
-                    trace(word(3), &mut visit);
-                }
             }
             if words >= 7 {
                 let offset = core::mem::offset_of!(crate::object::FunctionData, definition_index)
@@ -1576,18 +1572,20 @@ unsafe fn trace_object(
                 let index = unsafe { *body.add(offset).cast::<u32>() };
                 if index != 0 {
                     crate::symbols::trace_symbol_index(index, &mut visit);
-                    // A private closure's definition symbol is its name, whose
-                    // captures the call above has just traced: tracing them
-                    // again visited every captured frame and body twice
-                    // (bliss-gg3i1.7.12).
-                    let definition = EgclVal::from_symbol_index(index);
-                    if words < 4 || word(3) != definition {
-                        if let Some(trace) = FUNCTION_CAPTURE_TRACE_FN.get() {
-                            trace(definition, &mut visit);
-                        }
-                    }
                 }
             }
+            // The evaluator traces what the object owns off the heap: its
+            // closure state, and (for a definition) its bytecode body. The
+            // raw state word itself is never visited as a reference.
+            if words * 8 >= FUNCTION_BODY_BYTES {
+                if let Some(trace) = FUNCTION_CAPTURE_TRACE_FN.get() {
+                    // SAFETY: a FUNCTION_INTERPRETED object is never large, so
+                    // its header immediately precedes the body.
+                    let function = unsafe { EgclVal::from_heap_ptr(body.sub(OBJECT_HEADER_SIZE)) };
+                    trace(function, &mut visit);
+                }
+            }
+            let _ = word;
         }
         // ── Compiled function (§1.11.2): entry_point and code_size are raw;
         //    name/lambda_list/constants are references. ──
@@ -1674,6 +1672,15 @@ unsafe fn trace_object(
 /// Leading body words of an interpreted function that hold heap references
 /// (lambda_list, body, env, name); the rest are counters and raw metadata.
 const FUNCTION_HEAP_REFERENCE_WORDS: usize = 4;
+
+/// Body bytes of a current interpreted function object.
+const FUNCTION_BODY_BYTES: usize =
+    core::mem::size_of::<crate::object::FunctionData>() - core::mem::size_of::<ObjectHeader>();
+
+/// Body offset of an interpreted function's raw closure-state word.
+const FUNCTION_CLOSURE_STATE_OFFSET: usize =
+    core::mem::offset_of!(crate::object::FunctionData, closure_state)
+        - core::mem::size_of::<ObjectHeader>();
 
 /// Visit only the heap reference words of an interpreted function, leaving its
 /// off-heap captures to the remembered-capture scanner (bliss-gg3i1.7.9).
@@ -3706,6 +3713,7 @@ impl HeapCollector {
         // Also run finalizers for dead objects and break their weak pointers.
         let mut dead_object_vals: Vec<EgclVal> = Vec::new();
         let mut dead_function_slots = Vec::new();
+        let mut dead_closure_states = Vec::new();
         let mut dead_functions = std::collections::HashSet::new();
         let mut live_functions = std::collections::HashSet::new();
         for (idx, region) in state.regions.iter_mut().enumerate() {
@@ -3764,6 +3772,19 @@ impl HeapCollector {
                                 } else {
                                     dead_functions.insert(name);
                                     dead_functions.extend(definition);
+                                    if body_size as usize >= FUNCTION_BODY_BYTES {
+                                        // Take the dead object's closure state
+                                        // before its storage is erased below.
+                                        let state = unsafe {
+                                            &*payload
+                                                .add(FUNCTION_CLOSURE_STATE_OFFSET)
+                                                .cast::<core::sync::atomic::AtomicUsize>()
+                                        }
+                                        .swap(0, Ordering::AcqRel);
+                                        if state != 0 {
+                                            dead_closure_states.push(state);
+                                        }
+                                    }
                                     if unsafe { header_is_pinned(header_ptr) } {
                                         dead_function_slots.push((cursor, unsafe {
                                             header_exact_body_len(header_ptr)
@@ -3795,9 +3816,31 @@ impl HeapCollector {
         // Function names are counted live only from older regions, so with a
         // nursery that may hold the live definition the sweep waits for the
         // next ordinary major collection.
+        // Storage of the dead functions is reused from here on. Advance the
+        // epoch before the sweep hook, which revalidates surviving caches.
+        if !dead_function_slots.is_empty() {
+            PINNED_FUNCTION_EPOCH.fetch_add(1, Ordering::AcqRel);
+        }
         if !keep_nursery && let Some(sweep) = FUNCTION_CAPTURE_SWEEP_FN.get() {
             dead_functions.retain(|name| !live_functions.contains(name));
             sweep(&dead_functions.into_iter().collect::<Vec<_>>());
+        }
+        // In either mode, let caches of surviving pinned functions revalidate
+        // against the advanced epoch before mutators run again.
+        if !dead_function_slots.is_empty()
+            && let Some(revalidate) = PINNED_FUNCTIONS_REVALIDATE_FN.get()
+        {
+            revalidate();
+        }
+        // A dead object's own state dies with it in either mode: its storage
+        // is erased below. Release runs host destructors only.
+        if !dead_closure_states.is_empty() {
+            let release = CLOSURE_STATE_RELEASE_FN
+                .get()
+                .expect("closure state stored without a release hook");
+            for state in dead_closure_states {
+                release(state);
+            }
         }
 
         // Run finalizers for dead objects (R3.12).
@@ -7086,8 +7129,20 @@ pub fn alloc_pinned_typed(body_size: usize, type_id: u8) -> Option<*mut u8> {
     // symbol + a pinned name) landed in whatever region had space, until
     // hundreds of regions were unreclaimable and evacuation ran out of space.
     // Packing bounds the poisoned area to ceil(total pinned bytes / region).
-    let mut target_idx = None;
+    let fits = |state: &HeapState, idx: usize| {
+        let region = &state.regions[idx];
+        region.header.kind == RegionKind::OldGen
+            && state.pinned_hosts.contains(&idx)
+            && (region.header.alloc_limit as usize).saturating_sub(region.header.alloc_top as usize)
+                >= total_size
+    };
+    let mut target_idx = state
+        .pinned_alloc_hint
+        .filter(|&idx| idx < state.regions.len() && fits(state, idx));
     for &idx in state.pinned_hosts.iter() {
+        if target_idx.is_some() {
+            break;
+        }
         let region = &state.regions[idx];
         if region.header.kind != RegionKind::OldGen {
             continue;
@@ -7129,9 +7184,22 @@ pub fn alloc_pinned_typed(body_size: usize, type_id: u8) -> Option<*mut u8> {
             target_idx = Some(idx);
             break;
         }
+        // A workload whose allocations are all pinned functions (closure
+        // instances) never fills the nursery, so the occupancy check after a
+        // minor collection never runs. Ask for the major collection that
+        // reclaims dead functions when a new function region crosses the
+        // trigger; closure creation honors the request at its next safe point.
+        if type_id == crate::object::type_id::FUNCTION_INTERPRETED && target_idx.is_some() {
+            let total = state.regions.len();
+            let non_free = total.saturating_sub(state.stats.regions_free as usize);
+            if total != 0 && (non_free as f64 / total as f64) > state.config.old_occupancy_trigger {
+                MAJOR_GC_REQUESTED.store(true, Ordering::Release);
+            }
+        }
     }
 
     let idx = target_idx?;
+    state.pinned_alloc_hint = Some(idx);
     let region = &mut state.regions[idx];
     let ptr = region.header.alloc_top;
     let body_off = unsafe { write_object_header(ptr, type_id, header_body_size) };
@@ -7506,9 +7574,45 @@ pub fn set_finalizer_dispatch(dispatch: fn(EgclVal, EgclVal)) {
     let _ = FINALIZER_DISPATCH.set(dispatch);
 }
 
-/// Trace off-heap captured lexical bindings owned by a live function object.
+/// Trace off-heap state owned by a live interpreted function object: its
+/// captured lexical bindings and its bytecode. Receives the function object.
 type FunctionCaptureTraceFn = fn(EgclVal, &mut dyn FnMut(*mut EgclVal));
 static FUNCTION_CAPTURE_TRACE_FN: OnceLock<FunctionCaptureTraceFn> = OnceLock::new();
+
+/// Release one nonzero closure-state word left in a dead function object.
+type ClosureStateReleaseFn = fn(usize);
+static CLOSURE_STATE_RELEASE_FN: OnceLock<ClosureStateReleaseFn> = OnceLock::new();
+
+/// Install the evaluator's release for the raw closure-state words it stores
+/// in function objects (`function::set_closure_state`). Called during a major
+/// collection, with the world stopped, once per dead object holding a state;
+/// it must not allocate Lisp objects or reach the collector.
+pub fn set_closure_state_release_fn(release: ClosureStateReleaseFn) {
+    let _ = CLOSURE_STATE_RELEASE_FN.set(release);
+}
+
+/// Advanced whenever a collection frees pinned function storage. An address
+/// recorded with an earlier value may since have been reused, so callers that
+/// cache a function object's address outside the heap revalidate it then.
+static PINNED_FUNCTION_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+type PinnedFunctionsRevalidateFn = fn();
+static PINNED_FUNCTIONS_REVALIDATE_FN: OnceLock<PinnedFunctionsRevalidateFn> = OnceLock::new();
+
+/// Install the evaluator's revalidation of caches that hold pinned function
+/// addresses. A major collection that frees pinned functions advances
+/// [`pinned_function_epoch`] and then calls it, in every major mode, with the
+/// world stopped and dead uninterned symbols already removed from the symbol
+/// registry. It must not allocate Lisp objects.
+pub fn set_pinned_functions_revalidate_fn(revalidate: PinnedFunctionsRevalidateFn) {
+    let _ = PINNED_FUNCTIONS_REVALIDATE_FN.set(revalidate);
+}
+
+/// The current pinned-function reclamation epoch (see [`PINNED_FUNCTION_EPOCH`]).
+#[inline]
+pub fn pinned_function_epoch() -> u64 {
+    PINNED_FUNCTION_EPOCH.load(Ordering::Acquire)
+}
 
 /// Install the evaluator's function-owned reference tracer. Called for marking,
 /// relocation, and heap snapshots; it must not allocate Lisp objects.
@@ -7943,6 +8047,10 @@ struct HeapState {
     /// pins was turning every OldGen region unreclaimable one gensym at a time
     /// until the heap ran out of regions.
     pinned_hosts: std::collections::HashSet<usize>,
+    /// The pinned host region the last pinned allocation used. Checked before
+    /// scanning `pinned_hosts`, whose full regions a pinned-allocation-heavy
+    /// workload (closure instances) would otherwise rescan on every object.
+    pinned_alloc_hint: Option<usize>,
     /// Dead pinned function/symbol slots, recorded after major-GC reachability.
     /// Each slot remains a walkable filler until reused; live objects never move.
     free_pinned_slots: Vec<(usize, usize)>,
@@ -8095,6 +8203,7 @@ fn allocate_heap_state(config: &GcConfig) -> Result<HeapState, EgclError> {
     // changes across processes, which is exactly what the image format needs.
     let state = HeapState {
         pinned_hosts: std::collections::HashSet::new(),
+        pinned_alloc_hint: None,
         free_pinned_slots: Vec::new(),
         nursery_pin_candidates: std::collections::HashSet::new(),
         config: config.clone(),
@@ -8516,6 +8625,11 @@ pub unsafe fn snapshot_heap_regions(
                 region.bytes[body_offset..body_offset + len].fill(0);
             } else if matches!(kind, tid::STREAM | tid::MUTEX | tid::CONDITION_VARIABLE) {
                 region.bytes[body_offset..body_offset + len.min(8)].fill(0);
+            } else if kind == tid::FUNCTION_INTERPRETED && len >= FUNCTION_BODY_BYTES {
+                // A closure state is process-local host memory; the image
+                // host registry re-attaches it on restore.
+                let state = body_offset + FUNCTION_CLOSURE_STATE_OFFSET;
+                region.bytes[state..state + 8].fill(0);
             }
             unsafe {
                 trace_object(body as *mut u8, kind, len, |slot| {
@@ -8664,6 +8778,14 @@ fn serialize_heap_objects_matching(mut retain: impl FnMut(*const u8) -> bool) ->
             if size > 8 {
                 out.extend_from_slice(&data[8..]);
             }
+        } else if type_id == crate::object::type_id::FUNCTION_INTERPRETED
+            && size >= FUNCTION_BODY_BYTES
+        {
+            // Never serialize a process-local closure-state word.
+            let start = out.len();
+            out.extend_from_slice(data);
+            let state = start + FUNCTION_CLOSURE_STATE_OFFSET;
+            out[state..state + 8].fill(0);
         } else {
             out.extend_from_slice(data);
         }

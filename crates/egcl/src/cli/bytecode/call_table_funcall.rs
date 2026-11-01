@@ -330,13 +330,8 @@ pub(super) unsafe fn scan_contexts(visit: &mut dyn FnMut(*mut EgclVal)) {
     }
 }
 pub(super) extern "C" fn enter_context(context: *mut Context, function: u64) {
-    let symbol = egcl_rt::function::name(EgclVal(function)).as_symbol_index();
     let capture = closure_captured_env(EgclVal(function));
-    let (blocks, tags) = closure_controls()
-        .borrow()
-        .get(&symbol)
-        .cloned()
-        .unwrap_or_default();
+    let (blocks, tags) = closure_captured_control(EgclVal(function)).unwrap_or_default();
     let env = NATIVE_ENV.with(|slot| slot.get());
     // The caller has published its frame and retained this code before entry.
     unsafe {

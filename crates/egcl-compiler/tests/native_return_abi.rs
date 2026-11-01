@@ -175,6 +175,7 @@ fn call_body() -> Function {
         max_args: Some(0),
         variadic: false,
         binder_cache: Default::default(),
+        closure_template: Default::default(),
     };
     build_from_bytecode_for_native_cleanups(&body).unwrap()
 }

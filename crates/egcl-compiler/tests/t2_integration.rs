@@ -64,6 +64,7 @@ fn bytecode_fn(
         max_args: Some(arity),
         variadic: false,
         binder_cache: Default::default(),
+        closure_template: Default::default(),
     }
 }
 
@@ -1862,6 +1863,7 @@ fn fixnum_profile_speculates_the_call() {
         max_args: Some(1),
         variadic: false,
         binder_cache: Default::default(),
+        closure_template: Default::default(),
     };
 
     let mut f = build_from_bytecode(&bf).expect("build");

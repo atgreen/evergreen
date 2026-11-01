@@ -2696,10 +2696,13 @@ fn ordinary_t2_shared_closures_pause_heat_until_native_code_is_removed() {
     assert_eq!(closure_compilation_owner(a, 1).0, a);
     let (_, code) = install_body(a, Arc::clone(&body));
     assert_mapped_t2(&code);
+    // Every instance reports its template's installed tier: they share one
+    // tiering record (bliss-gg3i1.7.15.3).
+    assert_eq!(a, b);
     assert_eq!(
         egcl_rt::function::tier(*second),
-        0,
-        "sibling metadata is not installed-code authority"
+        2,
+        "instances share the template's tier"
     );
     let aggregate = closure_compilation_owner(b, 0).1;
     let anonymous = dispatch_invoke_count(b, None);
