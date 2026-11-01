@@ -629,7 +629,7 @@
   such calls runs about 15% faster per iteration. Redefining a function
   still takes effect at the next call. Saved images
   from earlier versions must be rebuilt (image format 19).
-  ([#NNN](https://github.com/atgreen/evergreen/pull/NNN))
+  ([#972](https://github.com/atgreen/evergreen/pull/972))
 - A `(lambda ...)` inside code compiled for speed (for example a
   `compile-file`d top-level form) is now compiled as a closure instead of
   being handed to the interpreter each time it is created, so the enclosing
