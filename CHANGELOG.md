@@ -617,6 +617,11 @@
 
 ### Performance
 
+- Compiled functions that bind special variables with LET or LAMBDA, and use
+  no other dynamic scope, stay in the fastest native tier instead of the
+  slower mapped one. Binding a special variable and reading it in a callee
+  takes about 150 ns per call instead of about 7.8 us.
+  ([#961](https://github.com/atgreen/evergreen/pull/961))
 - Compiled AREF and SVREF reads and stores on adjustable, fill-pointer and bit
   vectors call the general accessor instead of falling back to the
   interpreter, and functions whose BLOCK or TAGBODY sits in an argument
