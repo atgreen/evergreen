@@ -1683,7 +1683,10 @@ impl TransferCode {
                 })?
         };
         frame_guard.0 = Some(frame);
-        if osr_offset.is_none() && (self.body.has_env || self.body.variadic) {
+        // A heap-environment closure body (Backpack) opens with `ClosureEnv`,
+        // which reads its captured environment from this frame.
+        let reads_closure_env = matches!(self.body.code.first(), Some(Instr::ClosureEnv));
+        if osr_offset.is_none() && (self.body.has_env || self.body.variadic || reads_closure_env) {
             // The interpreter's environment, as in `run_with_binding`: a
             // capturing body gets a fresh heap frame under the callable's
             // captured one (or the caller's), shared with every closure it
@@ -1974,6 +1977,11 @@ impl TransferCode {
                                     | Instr::DefineEnvVar(_)
                                     | Instr::PushEnvChild
                                     | Instr::PopEnvChild
+                                    | Instr::MakeEnv(_)
+                                    | Instr::EnvRef { .. }
+                                    | Instr::EnvSet { .. }
+                                    | Instr::ClosureEnv
+                                    | Instr::MakeEnvClosure { .. }
                                     | Instr::AllocCons
                                     | Instr::MakeStruct { .. }
                                     | Instr::CleanupReturn
@@ -2201,6 +2209,9 @@ impl TransferCode {
 }
 
 fn invalid_capture() -> EgclError {
+    if std::env::var_os("EGCL_DEBUG_INVALID_CAPTURE").is_some() {
+        eprintln!("{}", std::backtrace::Backtrace::force_capture());
+    }
     EgclError::Internal("invalid native transfer capture".into())
 }
 
@@ -2548,6 +2559,11 @@ pub(in crate::cli::bytecode) fn special_binding_body(body: &BytecodeFunction) ->
                     | Instr::DefineEnvVar(_)
                     | Instr::PushEnvChild
                     | Instr::PopEnvChild
+                    | Instr::MakeEnv(_)
+                    | Instr::EnvRef { .. }
+                    | Instr::EnvSet { .. }
+                    | Instr::ClosureEnv
+                    | Instr::MakeEnvClosure { .. }
             )
         })
 }
@@ -2679,6 +2695,11 @@ fn numeric_native_body(
                     | Instr::DefineEnvVar(_)
                     | Instr::PushEnvChild
                     | Instr::PopEnvChild
+                    | Instr::MakeEnv(_)
+                    | Instr::EnvRef { .. }
+                    | Instr::EnvSet { .. }
+                    | Instr::ClosureEnv
+                    | Instr::MakeEnvClosure { .. }
             )
         })
 }
@@ -2751,6 +2772,10 @@ fn local_control_op(
     || (allow_local_scopes && matches!(op, Instr::MakeClosure { .. }
         | Instr::LoadEnvVar(_) | Instr::StoreEnvVar(_) | Instr::DefineEnvVar(_)
         | Instr::PushEnvChild | Instr::PopEnvChild))
+    // Heap lexical environments (Backpack) are the same decode-at-PC
+    // requests, addressing slots by (depth, index).
+    || (allow_local_scopes && matches!(op, Instr::MakeEnv(_) | Instr::EnvRef { .. }
+        | Instr::EnvSet { .. } | Instr::ClosureEnv | Instr::MakeEnvClosure { .. }))
     || (allow_local_scopes && matches!(op,
         Instr::PushTag { .. } | Instr::Go { .. } | Instr::PushCatch { .. } | Instr::Throw
             // A registered BLOCK is a catch-like record; a closure's named
@@ -3716,6 +3741,71 @@ unsafe fn lexical_environment_request(
                 &*NATIVE_ENV.with(Cell::get)
             });
             Ok(closure)
+        }
+        // Heap lexical environments (Backpack): operands are values, slots are
+        // (depth, index). The argument area stays rooted until this returns.
+        Instr::MakeEnv(_)
+        | Instr::EnvRef { .. }
+        | Instr::EnvSet { .. }
+        | Instr::ClosureEnv
+        | Instr::MakeEnvClosure { .. } => {
+            let args = if call.nargs == 0 {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(call.args, call.nargs as usize) }
+            };
+            match instruction {
+                Instr::MakeEnv(size) => {
+                    let [parent] = *args else {
+                        return Err(invalid_capture());
+                    };
+                    egcl_rt::lexenv::make(parent, usize::from(size)).ok_or_else(|| {
+                        EgclError::Internal(egcl_rt::gc::allocation_failure_message(
+                            "a lexical environment",
+                        ))
+                    })
+                }
+                Instr::EnvRef { depth, idx, name } => {
+                    let [environment] = *args else {
+                        return Err(invalid_capture());
+                    };
+                    match egcl_rt::lexenv::load(environment, depth, idx) {
+                        Some(value) if value != egcl_rt::value::UNBOUND => Ok(value),
+                        _ => Err(super::heap_env_unbound(body, name)),
+                    }
+                }
+                Instr::EnvSet { depth, idx, name } => {
+                    let [value, environment] = *args else {
+                        return Err(invalid_capture());
+                    };
+                    if egcl_rt::lexenv::store(environment, depth, idx, value) {
+                        Ok(NIL)
+                    } else {
+                        Err(super::heap_env_unbound(body, name))
+                    }
+                }
+                Instr::ClosureEnv if context.env_frame.is_null() => Ok(NIL),
+                Instr::ClosureEnv => Ok(super::heap_env::captured_env(unsafe {
+                    (*context.env_frame).as_ref()
+                })),
+                Instr::MakeEnvClosure { func, .. } => {
+                    let (&parent, values) = args.split_first().ok_or_else(invalid_capture)?;
+                    let nested = Arc::clone(
+                        body.nested_functions
+                            .get(func as usize)
+                            .ok_or_else(invalid_capture)?,
+                    );
+                    super::heap_env::make_closure(&nested, parent, values, unsafe {
+                        &*NATIVE_ENV.with(Cell::get)
+                    })
+                    .ok_or_else(|| {
+                        EgclError::Internal(egcl_rt::gc::allocation_failure_message(
+                            "a closure environment",
+                        ))
+                    })
+                }
+                _ => unreachable!(),
+            }
         }
         _ => Err(invalid_capture()),
     }

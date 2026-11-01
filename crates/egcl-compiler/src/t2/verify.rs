@@ -293,12 +293,11 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                     ));
                 }
             }
-            if let AuxData::LexicalEnvironment { value, result, .. } = data.aux {
-                // No captured-variable operation both consumes and produces.
-                if data.opcode != Opcode::Invoke
-                    || data.args.len() != usize::from(value)
-                    || (value && result)
-                {
+            if let AuxData::LexicalEnvironment { value, .. } = data.aux {
+                // `value` says whether the operation consumes operands: one for
+                // a captured-variable store, one or more for a heap-environment
+                // operation (Backpack), which may also produce a result.
+                if data.opcode != Opcode::Invoke || data.args.is_empty() == value {
                     errors.push(VerifyError::new(
                         "V11 invoke-shape",
                         "lexical environment access has invalid operands",

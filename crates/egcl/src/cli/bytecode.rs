@@ -18893,6 +18893,10 @@ fn verified_operand_stack_depths(func: &BytecodeFunction) -> Result<Vec<Option<u
             Instr::MemoryFence(_) => Some((0, 1)),
             Instr::SetValues(nvals) => Some((*nvals as u32, 1)),
             Instr::AllocCons => Some((2, 1)),
+            Instr::MakeEnv(_) | Instr::EnvRef { .. } => Some((1, 1)),
+            Instr::EnvSet { .. } => Some((2, 0)),
+            Instr::ClosureEnv => Some((0, 1)),
+            Instr::MakeEnvClosure { nflat, .. } => Some((u32::from(*nflat) + 1, 1)),
             Instr::Dup => Some((1, 2)),
             Instr::CallNamed { nargs, .. } => Some((*nargs as u32, 1)),
             Instr::PushHandlerBind { hb } => {
@@ -29842,6 +29846,84 @@ fn emit_native(
                 emit_c2i_helper_call(&mut c);
                 push_rax(&mut c);
             }
+            // Heap lexical environments (Backpack): helper calls taking the
+            // environment value and (depth, idx); no name work.
+            Instr::MakeEnv(size) => {
+                pop_into(&mut c, 7, false); // parent -> rdi
+                c.extend_from_slice(&[0x48, 0xBE]); // mov rsi, size
+                c.extend_from_slice(&u64::from(*size).to_le_bytes());
+                c.extend_from_slice(&[0x48, 0xB8]);
+                c.extend_from_slice(
+                    &(heap_env::c2i_heap_make_env as extern "C" fn(u64, u64) -> u64 as usize
+                        as u64)
+                        .to_le_bytes(),
+                );
+                emit_c2i_helper_call(&mut c);
+                push_rax(&mut c);
+            }
+            Instr::EnvRef { depth, idx, name } => {
+                pop_into(&mut c, 7, false); // environment -> rdi
+                c.extend_from_slice(&[0x48, 0xBE]); // mov rsi, packed operands
+                c.extend_from_slice(&heap_env::pack(*depth, *idx, *name).to_le_bytes());
+                c.extend_from_slice(&[0x48, 0xBA]); // mov rdx, retained names
+                c.extend_from_slice(&(std::ptr::from_ref(&*env_names) as u64).to_le_bytes());
+                c.extend_from_slice(&[0x48, 0xB8]);
+                c.extend_from_slice(
+                    &(heap_env::c2i_heap_env_ref
+                        as extern "C" fn(u64, u64, *const NativeEnvNames) -> u64
+                        as usize as u64)
+                        .to_le_bytes(),
+                );
+                emit_c2i_helper_call(&mut c);
+                push_rax(&mut c);
+            }
+            Instr::EnvSet { depth, idx, name } => {
+                pop_into(&mut c, 7, false); // environment -> rdi
+                pop_into(&mut c, 6, false); // value -> rsi
+                c.extend_from_slice(&[0x48, 0xBA]); // mov rdx, packed operands
+                c.extend_from_slice(&heap_env::pack(*depth, *idx, *name).to_le_bytes());
+                c.extend_from_slice(&[0x48, 0xB9]); // mov rcx, retained names
+                c.extend_from_slice(&(std::ptr::from_ref(&*env_names) as u64).to_le_bytes());
+                c.extend_from_slice(&[0x48, 0xB8]);
+                c.extend_from_slice(
+                    &(heap_env::c2i_heap_env_set
+                        as extern "C" fn(u64, u64, u64, *const NativeEnvNames)
+                        as usize as u64)
+                        .to_le_bytes(),
+                );
+                emit_c2i_helper_call(&mut c);
+            }
+            Instr::ClosureEnv => {
+                c.extend_from_slice(&[0x48, 0xB8]);
+                c.extend_from_slice(
+                    &(heap_env::c2i_heap_closure_env as extern "C" fn() -> u64 as usize as u64)
+                        .to_le_bytes(),
+                );
+                emit_c2i_helper_call(&mut c);
+                push_rax(&mut c);
+            }
+            Instr::MakeEnvClosure { func, nflat } => {
+                let nested =
+                    bf.nested_functions.get(*func as usize)? as *const Arc<BytecodeFunction>;
+                let operands = 8 * (i32::from(*nflat) + 1);
+                c.extend_from_slice(&[0x48, 0xBF]); // mov rdi, retained nested body
+                c.extend_from_slice(&(nested as u64).to_le_bytes());
+                c.extend_from_slice(&[0x49, 0x8D, 0xB7]); // lea rsi, [r15 - operands]
+                c.extend_from_slice(&(-operands).to_le_bytes());
+                c.extend_from_slice(&[0x48, 0xBA]); // mov rdx, nflat
+                c.extend_from_slice(&u64::from(*nflat).to_le_bytes());
+                c.extend_from_slice(&[0x48, 0xB8]);
+                c.extend_from_slice(
+                    &(heap_env::c2i_heap_make_env_closure
+                        as extern "C" fn(*const Arc<BytecodeFunction>, *const u64, u64) -> u64
+                        as usize as u64)
+                        .to_le_bytes(),
+                );
+                emit_c2i_helper_call(&mut c);
+                c.extend_from_slice(&[0x49, 0x81, 0xEF]); // sub r15, operands
+                c.extend_from_slice(&operands.to_le_bytes());
+                push_rax(&mut c);
+            }
             Instr::EvalHost(index) | Instr::MakeClosureEnv(index) => {
                 // Like Const: the form is a movable heap cons — load it through
                 // the GC-rewritten constants slot, never as a baked immediate.
@@ -31087,6 +31169,11 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
                     | Instr::DefineEnvVar(_)
                     | Instr::PushEnvChild
                     | Instr::PopEnvChild
+                    | Instr::MakeEnv(_)
+                    | Instr::EnvRef { .. }
+                    | Instr::EnvSet { .. }
+                    | Instr::ClosureEnv
+                    | Instr::MakeEnvClosure { .. }
             )
         })
     {

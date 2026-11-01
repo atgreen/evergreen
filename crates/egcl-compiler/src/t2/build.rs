@@ -135,6 +135,18 @@ pub enum BuildError {
 /// The `Instr` variant name, for diagnostics. `Debug` renders the whole
 /// instruction including operands; the discriminant alone is what identifies
 /// the missing builder case.
+/// Operand count and whether a result is produced, for the heap-environment
+/// instructions (Backpack) built as mapped lexical-environment requests.
+fn heap_env_operands(instr: &Instr) -> Option<(usize, bool)> {
+    Some(match instr {
+        Instr::MakeEnv(_) | Instr::EnvRef { .. } => (1, true),
+        Instr::EnvSet { .. } => (2, false),
+        Instr::ClosureEnv => (0, true),
+        Instr::MakeEnvClosure { nflat, .. } => (usize::from(*nflat) + 1, true),
+        _ => return None,
+    })
+}
+
 fn instr_kind(instr: &Instr) -> String {
     let full = format!("{instr:?}");
     match full.find(['(', ' ', '{']) {
@@ -895,6 +907,29 @@ impl<'a> Builder<'a> {
                     result: true,
                 })
             }
+            // Heap lexical environments (Backpack): the same decode-at-PC
+            // request, with however many operands the instruction takes. The
+            // runtime addresses slots by (depth, index); no name is involved.
+            Instr::MakeEnvClosure { func, .. } => {
+                self.bf.nested_functions.get(*func as usize)?;
+                let (operands, result) = heap_env_operands(&self.bf.code[bcp])?;
+                Some(AuxData::LexicalEnvironment {
+                    bcp: bcp as u32,
+                    value: operands != 0,
+                    result,
+                })
+            }
+            instruction @ (Instr::MakeEnv(_)
+            | Instr::EnvRef { .. }
+            | Instr::EnvSet { .. }
+            | Instr::ClosureEnv) => {
+                let (operands, result) = heap_env_operands(instruction)?;
+                Some(AuxData::LexicalEnvironment {
+                    bcp: bcp as u32,
+                    value: operands != 0,
+                    result,
+                })
+            }
             _ => None,
         }
     }
@@ -1525,6 +1560,23 @@ impl<'a> Builder<'a> {
                 Instr::CleanupReturn if self.transfer_mode => {
                     let (_, resume) = self.normal_cleanup_return(i as u32)?;
                     push(resume as usize, d + 1, &mut depth_at, &mut work);
+                }
+                Instr::MakeEnv(_)
+                | Instr::EnvRef { .. }
+                | Instr::EnvSet { .. }
+                | Instr::ClosureEnv
+                | Instr::MakeEnvClosure { .. }
+                    if self.native_cleanups =>
+                {
+                    let (operands, result) =
+                        heap_env_operands(&code[i]).expect("heap environment instruction");
+                    let after = d - operands as i32 + i32::from(result);
+                    if d < operands as i32 {
+                        return Err(BuildError::Unsupported(
+                            "heap environment operand underflow",
+                        ));
+                    }
+                    push(i + 1, after, &mut depth_at, &mut work);
                 }
                 Instr::Const(_)
                 | Instr::LoadLocal(_)
@@ -2279,7 +2331,15 @@ impl<'a> Builder<'a> {
                 // The cold state is BEFORE consuming a binding/store operand.
                 // The runtime commits only after all fallible preparation.
                 let fs = self.build_frame_state(block, &stack, i as u32);
-                let args = if matches!(
+                let args = if let Some((operands, _)) = heap_env_operands(instruction) {
+                    if stack.len() < operands {
+                        return Err(BuildError::Unsupported(
+                            "heap environment operand underflow",
+                        ));
+                    }
+                    let split = stack.len() - operands;
+                    stack.split_off(split)
+                } else if matches!(
                     aux,
                     AuxData::SpecialBinding { enter: true, .. }
                         | AuxData::GlobalValue { store: true, .. }

@@ -535,6 +535,12 @@ pub(super) fn rewrite_unit(root: &mut BytecodeFunction) -> bool {
     if !enabled() || !unit_uses_env(root) {
         return false;
     }
+    if !within_bisect_limit()
+        || std::env::var("EGCL_HEAP_ENV_SKIP")
+            .is_ok_and(|skip| skip.split(',').any(|name| root.name.contains(name)))
+    {
+        return false;
+    }
     let Some(analysis) = analyze(root) else {
         if std::env::var_os("EGCL_HEAP_ENV_TRACE").is_some() {
             eprintln!("[heap-env]   ... unit {}", root.name);
@@ -585,6 +591,21 @@ fn unit_uses_env(root: &BytecodeFunction) -> bool {
         })
 }
 
+/// `EGCL_HEAP_ENV_LIMIT=N` rewrites only the first N candidate units, to
+/// bisect a misbehaving rewrite to one unit.
+fn within_bisect_limit() -> bool {
+    static LIMIT: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    static SEEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    match LIMIT.get_or_init(|| {
+        std::env::var("EGCL_HEAP_ENV_LIMIT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+    }) {
+        None => true,
+        Some(limit) => SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < *limit,
+    }
+}
+
 /// `EGCL_HEAP_ENV=0` keeps every unit on the name-keyed frames.
 pub(super) fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -604,6 +625,7 @@ struct NewBody {
     extra_names: Vec<String>,
     param_layout: Vec<(String, VarLoc)>,
     handler_pcs: Vec<Vec<u32>>,
+    var_slots: Vec<Vec<Option<u16>>>,
     self_call_sites: Vec<u32>,
     notinline_sites: Vec<u32>,
 }
@@ -624,6 +646,11 @@ impl NewBody {
         for (info, pcs) in function.handler_cases.iter_mut().zip(self.handler_pcs) {
             for (clause, pc) in info.clauses.iter_mut().zip(pcs) {
                 clause.body_bcp = pc;
+            }
+        }
+        for (info, slots) in function.handler_cases.iter_mut().zip(self.var_slots) {
+            for (clause, slot) in info.clauses.iter_mut().zip(slots) {
+                clause.var_slot = slot;
             }
         }
         function.self_call_sites = self.self_call_sites;
@@ -826,7 +853,64 @@ fn rewrite_function(
         .iter()
         .map(|&pc| target(pc))
         .collect::<Option<Vec<_>>>()?;
+    // Every tier binds parameter i to local slot i, so renumber the locals:
+    // the parameters first, in order, then every other local in its old order
+    // (which keeps each MULTIPLE-VALUE-BIND range contiguous).
+    let mut order: Vec<u16> = Vec::with_capacity(usize::from(layout.n_locals));
+    for (_, location) in &param_layout {
+        let VarLoc::Slot(slot) = location else {
+            return None;
+        };
+        if order.contains(slot) {
+            return None;
+        }
+        order.push(*slot);
+    }
+    for slot in 0..layout.n_locals {
+        if !order.contains(&slot) {
+            order.push(slot);
+        }
+    }
+    let mut renumber = vec![0u16; usize::from(layout.n_locals)];
+    for (new, &old) in order.iter().enumerate() {
+        renumber[usize::from(old)] = u16::try_from(new).ok()?;
+    }
+    let local = |slot: u16| renumber.get(usize::from(slot)).copied();
+    for instr in &mut code {
+        match instr {
+            Instr::LoadLocal(slot) | Instr::StoreLocal(slot) => *slot = local(*slot)?,
+            Instr::TakeValuesToLocals { nvars, slot_base } => {
+                let base = local(*slot_base)?;
+                for k in 0..*nvars {
+                    if local(slot_base.checked_add(k)?)? != base.checked_add(k)? {
+                        return None;
+                    }
+                }
+                *slot_base = base;
+            }
+            _ => {}
+        }
+    }
+    for (_, location) in &mut param_layout {
+        if let VarLoc::Slot(slot) = location {
+            *slot = local(*slot)?;
+        }
+    }
+    let var_slots = function
+        .handler_cases
+        .iter()
+        .map(|info| {
+            info.clauses
+                .iter()
+                .map(|clause| match clause.var_slot {
+                    Some(slot) => local(slot).map(Some),
+                    None => Some(None),
+                })
+                .collect::<Option<Vec<_>>>()
+        })
+        .collect::<Option<Vec<_>>>()?;
     Some(NewBody {
+        var_slots,
         code,
         constants_nil: nil_added,
         n_locals: layout.n_locals,
@@ -961,4 +1045,118 @@ pub(super) fn slot_names(function: &BytecodeFunction) -> Vec<(u16, u8, u16, Stri
         }
     }
     names
+}
+
+// ── Native helpers (T1 and T2) ──────────────────────────────────────────
+//
+// Every native tier reaches the heap-environment instructions through these
+// for now: they take the environment value and `(depth, index)`, never a
+// name. (The packed `name` is read only to name the variable in the
+// UNBOUND-VARIABLE error of a slot read before its binding was made.) Inline
+// two-to-three-load access in the emitters is the follow-up.
+
+/// Pack `EnvRef`/`EnvSet` operands into one immediate word.
+pub(super) fn pack(depth: u8, idx: u16, name: u16) -> u64 {
+    (u64::from(name) << 32) | (u64::from(depth) << 16) | u64::from(idx)
+}
+
+fn unpack(packed: u64) -> (u8, u16, u64) {
+    ((packed >> 16) as u8, packed as u16, (packed >> 32) & 0xffff)
+}
+
+fn unbound(names: *const NativeEnvNames, name: u64) -> EgclError {
+    // SAFETY: emitted code retains its name table through its code owner.
+    let symbol = (!names.is_null())
+        .then(|| unsafe { &*names }.get(name))
+        .flatten()
+        .and_then(|resolved| lexical_identity::resolve(resolved.name()))
+        .unwrap_or(NIL);
+    EgclError::UnboundVariable(symbol)
+}
+
+/// `MakeEnv`: allocates, so it is a c2i helper whose inputs are rooted here.
+pub(super) extern "C" fn c2i_heap_make_env(parent: u64, size: u64) -> u64 {
+    match guard_c2i(|| {
+        egcl_rt::lexenv::make(EgclVal(parent), size as usize).ok_or_else(|| {
+            EgclError::Internal(egcl_rt::gc::allocation_failure_message(
+                "a lexical environment",
+            ))
+        })
+    }) {
+        Ok(value) => value.0,
+        Err(error) => {
+            stash_native_error(error);
+            NIL.0
+        }
+    }
+}
+
+/// `EnvRef`: no allocation, no lock, no name lookup.
+pub(super) extern "C" fn c2i_heap_env_ref(
+    env: u64,
+    packed: u64,
+    names: *const NativeEnvNames,
+) -> u64 {
+    let (depth, idx, name) = unpack(packed);
+    match egcl_rt::lexenv::load(EgclVal(env), depth, idx) {
+        Some(value) if value != egcl_rt::value::UNBOUND => value.0,
+        _ => {
+            stash_native_error(unbound(names, name));
+            NIL.0
+        }
+    }
+}
+
+/// `EnvSet`: a barriered store; no allocation.
+pub(super) extern "C" fn c2i_heap_env_set(
+    env: u64,
+    value: u64,
+    packed: u64,
+    names: *const NativeEnvNames,
+) {
+    let (depth, idx, name) = unpack(packed);
+    if !egcl_rt::lexenv::store(EgclVal(env), depth, idx, EgclVal(value)) {
+        stash_native_error(unbound(names, name));
+    }
+}
+
+/// `ClosureEnv`: the running closure's environment, from the frame the native
+/// entry installed for its activation (see [`carrier`]).
+pub(super) extern "C" fn c2i_heap_closure_env() -> u64 {
+    NATIVE_ENV_FRAME.with(|slot| captured_env(slot.borrow().as_ref()).0)
+}
+
+/// `MakeEnvClosure`: `operands` addresses the parent followed by `nflat`
+/// values, still on the (scanned) native operand stack.
+pub(super) extern "C" fn c2i_heap_make_env_closure(
+    nested: *const Arc<BytecodeFunction>,
+    operands: *const u64,
+    nflat: u64,
+) -> u64 {
+    match guard_c2i(|| {
+        let env = NATIVE_ENV.with(|slot| slot.get());
+        if nested.is_null() || env.is_null() || operands.is_null() {
+            return Err(EgclError::Internal(
+                "native closure has no body or environment".into(),
+            ));
+        }
+        // SAFETY: `operands` addresses `nflat + 1` live operand words.
+        let words = unsafe { std::slice::from_raw_parts(operands, nflat as usize + 1) };
+        let values: Vec<EgclVal> = words[1..].iter().map(|&word| EgclVal(word)).collect();
+        // SAFETY: the executing code retains its body and this nested template.
+        make_closure(unsafe { &*nested }, EgclVal(words[0]), &values, unsafe {
+            &*env
+        })
+        .ok_or_else(|| {
+            EgclError::Internal(egcl_rt::gc::allocation_failure_message(
+                "a closure environment",
+            ))
+        })
+    }) {
+        Ok(value) => value.0,
+        Err(error) => {
+            stash_native_error(error);
+            NIL.0
+        }
+    }
 }

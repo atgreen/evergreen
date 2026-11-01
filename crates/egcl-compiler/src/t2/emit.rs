@@ -3007,9 +3007,11 @@ fn emit_invoke_call(
         crate::t2::ir::AuxData::NestedClosure(index) => {
             (TRANSFER_MAKE_CLOSURE_REQUEST | u64::from(index), 0, false)
         }
+        // A captured-variable operation takes at most one operand; a heap
+        // environment one (Backpack) can take several, so pass the count.
         crate::t2::ir::AuxData::LexicalEnvironment { bcp, value, .. } => (
             TRANSFER_LEXICAL_ENVIRONMENT_REQUEST | u64::from(bcp),
-            u64::from(value),
+            if value { data.args.len() as u64 } else { 0 },
             false,
         ),
         crate::t2::ir::AuxData::CleanupContinuation {
