@@ -149,7 +149,11 @@ fn lean_named_call_is_emitted_and_enters_the_owned_entry_word() {
         code.windows(needle.len()).any(|window| window == needle),
         "the caller loads the leaf's function cell"
     );
-    assert_eq!(entry_word(fixture.leaf), (0, 0), "T0 publication owns no entry");
+    assert_eq!(
+        entry_word(fixture.leaf),
+        (0, 0),
+        "T0 publication owns no entry"
+    );
     warm(&fixture, &mut env);
     assert_eq!(
         entry_word(fixture.leaf),
@@ -169,7 +173,11 @@ fn lean_named_call_is_emitted_and_enters_the_owned_entry_word() {
     assert_eq!(cold_calls(), 0, "every call entered the leaf's entry word");
     drop(stale);
     egcl_rt::call_table::invalidate(fixture.leaf);
-    assert_eq!(entry_word(fixture.leaf), (0, 0), "invalidation releases the word");
+    assert_eq!(
+        entry_word(fixture.leaf),
+        (0, 0),
+        "invalidation releases the word"
+    );
 }
 
 #[test]
@@ -242,12 +250,20 @@ fn tier_transitions_and_redefinition_update_the_entry_word() {
 
     // Profiling pins the function to T0 the way the deopt blacklist does.
     profile_pin(fixture.leaf);
-    assert_eq!(entry_word(fixture.leaf), (0, 0), "a T0 pin releases the word");
+    assert_eq!(
+        entry_word(fixture.leaf),
+        (0, 0),
+        "a T0 pin releases the word"
+    );
     let args = [1, 2, 40].map(EgclVal::from_fixnum);
     for _ in 0..3 {
         let result = call(&fixture, &args, &mut env).unwrap();
         assert_eq!(crate::cli::cp(result).0, EgclVal::from_fixnum(41));
-        assert_eq!(entry_word(fixture.leaf), (0, 0), "a pinned function stays T0");
+        assert_eq!(
+            entry_word(fixture.leaf),
+            (0, 0),
+            "a pinned function stays T0"
+        );
     }
     profile_unpin(fixture.leaf);
 
@@ -255,12 +271,7 @@ fn tier_transitions_and_redefinition_update_the_entry_word() {
     // definition's own, so publication leaves the tier the pin reset; record
     // the final tier as a normal promotion does, or the code keeps its
     // caller-side heat accounting and no claim.
-    let (_, leaf_code) = install(
-        "BACKPACK-TIER-LEAF",
-        "(a b c)",
-        "((+ c 1))",
-        &mut env,
-    );
+    let (_, leaf_code) = install("BACKPACK-TIER-LEAF", "(a b c)", "((+ c 1))", &mut env);
     egcl_rt::function::set_tier(function(fixture.leaf), 2);
     egcl_rt::call_table::invalidate(fixture.leaf);
     let refreshed = Fixture {
@@ -282,11 +293,8 @@ fn tier_transitions_and_redefinition_update_the_entry_word() {
     egcl_rt::rooted!(old = old);
     for i in 0..10 {
         if i == 5 {
-            crate::cli::read_eval_all_env(
-                "(defun backpack-tier-leaf (a b c) (- c 1))",
-                &mut env,
-            )
-            .unwrap();
+            crate::cli::read_eval_all_env("(defun backpack-tier-leaf (a b c) (- c 1))", &mut env)
+                .unwrap();
             assert_eq!(
                 egcl_rt::function::entry_word(*old),
                 Some((0, 0)),

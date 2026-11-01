@@ -296,12 +296,11 @@ pub unsafe fn redefine(f: EgclVal, lambda_list: EgclVal, body: EgclVal, env: Egc
 }
 
 /// Byte offset of the native entry word from a tagged function pointer.
-pub const ENTRY_TAGGED_OFFSET: i32 = core::mem::offset_of!(FunctionData, entry) as i32
-    - crate::value::TAG_HEAP_OBJECT as i32;
+pub const ENTRY_TAGGED_OFFSET: i32 =
+    core::mem::offset_of!(FunctionData, entry) as i32 - crate::value::TAG_HEAP_OBJECT as i32;
 /// Byte offset of the entry owner key from a tagged function pointer.
-pub const ENTRY_OWNER_TAGGED_OFFSET: i32 = core::mem::offset_of!(FunctionData, entry_owner)
-    as i32
-    - crate::value::TAG_HEAP_OBJECT as i32;
+pub const ENTRY_OWNER_TAGGED_OFFSET: i32 =
+    core::mem::offset_of!(FunctionData, entry_owner) as i32 - crate::value::TAG_HEAP_OBJECT as i32;
 /// Byte offset of the header's type-id byte from a tagged heap pointer.
 pub const TYPE_ID_TAGGED_OFFSET: i32 = 7 - crate::value::TAG_HEAP_OBJECT as i32;
 
@@ -548,7 +547,11 @@ mod tests {
             assert!(!claim_entry(*function, 8, 0x5678), "one owner at a time");
             assert!(claim_entry(*function, 7, 0x2345), "the owner may move it");
             release_entry(*function, 8);
-            assert_eq!(entry_word(*function), Some((0x2345, 7)), "not 8's to release");
+            assert_eq!(
+                entry_word(*function),
+                Some((0x2345, 7)),
+                "not 8's to release"
+            );
         }
         let body = unsafe { function.as_ptr().add(header_size()) } as u64;
         let entry = core::mem::offset_of!(FunctionData, entry) - header_size();
@@ -569,11 +572,10 @@ mod tests {
         }
         assert!(found, "the function object was serialized");
         // Region snapshots.
-        let snapshot = crate::gc::with_heap_snapshot(|| unsafe {
-            crate::gc::snapshot_heap_regions(false)
-        })
-        .unwrap()
-        .unwrap();
+        let snapshot =
+            crate::gc::with_heap_snapshot(|| unsafe { crate::gc::snapshot_heap_regions(false) })
+                .unwrap()
+                .unwrap();
         let region = snapshot
             .regions
             .iter()

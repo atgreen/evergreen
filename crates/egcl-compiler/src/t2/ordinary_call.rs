@@ -1542,7 +1542,9 @@ fn emit_lean_named_call(
     emit_epilogue: &dyn Fn(&mut Asm),
     done: egcl_rt::asm::Label,
 ) -> Option<CallReturn> {
-    use egcl_rt::function::{ENTRY_OWNER_TAGGED_OFFSET, ENTRY_TAGGED_OFFSET, TYPE_ID_TAGGED_OFFSET};
+    use egcl_rt::function::{
+        ENTRY_OWNER_TAGGED_OFFSET, ENTRY_TAGGED_OFFSET, TYPE_ID_TAGGED_OFFSET,
+    };
     let legacy = a.label();
     a.extend_from_slice(&[0x48, 0xa1]); // movabs rax, [function cell]
     a.extend_from_slice(&emission.target.function_cell.to_le_bytes());
@@ -1559,12 +1561,7 @@ fn emit_lean_named_call(
     a.jcc(Cc::Ne, legacy);
     // Entry first, then owner: see `egcl_rt::function::claim_entry`.
     load_mem64_disp(a, 11, RAX, ENTRY_TAGGED_OFFSET);
-    load_mem64_disp(
-        a,
-        10,
-        13,
-        egcl_rt::exec_context::offsets::CODE_OWNER as i32,
-    );
+    load_mem64_disp(a, 10, 13, egcl_rt::exec_context::offsets::CODE_OWNER as i32);
     cmp_mem64_disp8(a, 10, RAX, ENTRY_OWNER_TAGGED_OFFSET as u8);
     a.jcc(Cc::Ne, legacy);
     // Arguments move exactly as the descriptor path below moves them; only

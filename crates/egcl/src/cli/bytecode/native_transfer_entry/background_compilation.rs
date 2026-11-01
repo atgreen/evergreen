@@ -11,9 +11,7 @@ fn ordinary_call_target(
     symbol: u32,
     cell: &egcl_rt::call_table::CallCell,
 ) -> egcl_compiler::t2::emit::OrdinaryCallTarget {
-    let function_cell = if super::lean_calls_enabled()
-        && !ordinary_primitives::is_private(symbol)
-    {
+    let function_cell = if super::lean_calls_enabled() && !ordinary_primitives::is_private(symbol) {
         egcl_rt::symbols::symbol_object_ptr(symbol).map_or(0, |object| {
             (object + std::mem::offset_of!(egcl_rt::object::SymbolData, function)) as u64
         })

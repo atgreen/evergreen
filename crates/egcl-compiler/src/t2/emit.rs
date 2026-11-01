@@ -8192,9 +8192,8 @@ fn emit_framed_inner(
             mov_imm64(&mut a, 11, lean_overflow as i64);
             a.extend_from_slice(&[0x41, 0xFF, 0xE3]); // jmp r11, all incoming values intact
             ordinary_lean_entry = Some(a.here());
-            ordinary_lean_stack_fixup = Some(ordinary_call::emit_lean_entry_prologue(
-                &mut a, overflow,
-            ));
+            ordinary_lean_stack_fixup =
+                Some(ordinary_call::emit_lean_entry_prologue(&mut a, overflow));
         }
         let offset = a.here();
         let accepted = a.label();

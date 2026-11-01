@@ -621,6 +621,13 @@
 
 ### Performance
 
+- On x86-64 Linux, a compiled call from one optimized function to another
+  named, fixed-arity, optimized function is cheaper. The function object now
+  carries its own native entry, so the caller loads the name's current
+  definition and calls that entry directly; the callee checks its own stack.
+  Redefining a function still takes effect at the next call. Saved images
+  from earlier versions must be rebuilt (image format 19).
+  ([#NNN](https://github.com/atgreen/evergreen/pull/NNN))
 - A `(lambda ...)` inside code compiled for speed (for example a
   `compile-file`d top-level form) is now compiled as a closure instead of
   being handed to the interpreter each time it is created, so the enclosing
