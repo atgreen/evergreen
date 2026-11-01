@@ -178,6 +178,7 @@ mod call_table_funcall;
 #[path = "bytecode/call_table_native_s390x.rs"]
 mod call_table_native;
 mod closure_templates;
+mod mapping_transforms;
 mod method_context_use;
 mod quoted_funcall;
 use super::control_payload::ControlPayload;
@@ -3850,6 +3851,20 @@ impl<'e> Lowerer<'e> {
                 // form is interpreted.
                 "TIME" => self.lower_time(rest),
                 "ROOM" => Err(Bail),
+                _ if mapping_transforms::is_primary_value_marker(op) => {
+                    self.lower_primary_value(rest)
+                }
+                // MAPCAR, MAPC, SOME, ... over a few lists open-code into a
+                // loop in this function (bliss-gg3i1.7.13).
+                mapper if mapping_transforms::is_mapping_operator(mapper) => {
+                    let (mut op, mut rest) = (op, rest);
+                    egcl_rt::rooted_ref!(_op_root = &mut op);
+                    egcl_rt::rooted_ref!(_rest_root = &mut rest);
+                    match self.mapping_expansion(&name, op, rest)? {
+                        Some(expansion) => self.lower_expr(expansion),
+                        None => self.lower_call(&name, op, rest),
+                    }
+                }
                 _ => self.lower_call(&name, op, rest),
             }
         } else {
@@ -11455,6 +11470,19 @@ fn compute_captured_names(body: EgclVal) -> std::collections::HashSet<String> {
         let (car, cdr) = cp(form);
         if car.is_symbol() {
             let n = sym_name(car);
+            // A literal lambda that a mapping call inlines is not a closure
+            // (mapping_transforms): its body runs in this function.
+            if mapping_transforms::is_mapping_operator(&n)
+                && let Some((lambda_body, lists)) = mapping_transforms::inlined_lambda_parts(form)
+            {
+                for f in list_to_vec(lambda_body) {
+                    walk(f, out);
+                }
+                for f in lists {
+                    walk(f, out);
+                }
+                return;
+            }
             if n == "LAMBDA" {
                 let (params_form, lbody) = cp(cdr);
                 let params: std::collections::HashSet<String> = list_to_vec(params_form)

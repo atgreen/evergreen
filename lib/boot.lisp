@@ -2353,11 +2353,19 @@ Returns NIL."
 (defun eighth (list) (nth 7 list))
 (defun ninth (list) (nth 8 list))
 (defun tenth (list) (nth 9 list))
+;; The compiler open-codes MAPC, MAPCAR, SOME, ... over a few lists
+;; (bytecode/mapping_transforms.rs) and wraps each MAPCAR element in this
+;; marker, which it lowers as "primary value only". Defined here too so that
+;; an expansion reaching the evaluator means the same thing.
+(defmacro egcl-internal::%map-primary-value (form)
+  (list 'values form))
 (defun mapc (fn &rest lists)
   (apply (function mapcar) fn lists)
   (car lists))
+;; MAPCAN/MAPCON join the results with NCONC (CLHS 14.2), as the open-coded
+;; forms the compiler emits for them do (bliss-gg3i1.7.13).
 (defun mapcan (fn &rest lists)
-  (apply (function append) (apply (function mapcar) fn lists)))
+  (apply (function nconc) (apply (function mapcar) fn lists)))
 ;; MAP-INTO (CLHS 17.3): destructively store into RESULT-SEQUENCE the results of
 ;; applying FUNCTION to successive elements of the argument SEQUENCES, up to the
 ;; shortest length (or the whole result when there are no sequences). Returns
@@ -3538,7 +3546,7 @@ Returns NIL."
     first))
 
 (defun mapcon (fn &rest lists)
-  (apply (function append) (apply (function maplist) fn lists)))
+  (apply (function nconc) (apply (function maplist) fn lists)))
 
 ;;; --- SUBST / SUBSTITUTE families -------------------------------------------
 
