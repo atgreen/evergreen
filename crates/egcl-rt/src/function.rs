@@ -178,6 +178,7 @@ pub fn alloc_interpreted(
         (*d).closure_state = 0.into();
         (*d).entry = 0.into();
         (*d).entry_owner = 0.into();
+        (*d).closure_env = crate::value::NIL;
 
         EgclVal::from_heap_ptr(header)
     }
@@ -213,6 +214,7 @@ pub fn alloc_closure_instance(prototype: EgclVal, state: usize) -> EgclVal {
         (*d).closure_state = state.into();
         (*d).entry = 0.into();
         (*d).entry_owner = 0.into();
+        (*d).closure_env = crate::value::NIL;
         EgclVal::from_heap_ptr(header)
     }
 }
@@ -248,6 +250,28 @@ pub fn closure_prototype(f: EgclVal) -> Option<EgclVal> {
 /// The flags stored in `f` itself, without delegation to a prototype.
 fn own_flags(f: EgclVal) -> u16 {
     unsafe { (*data(f)).flags.load(Ordering::Acquire) }
+}
+
+/// Byte offset of the traced heap-environment word from a function value's
+/// header pointer (Backpack): native code loads it from the callable.
+pub const CLOSURE_ENV_OFFSET: usize = core::mem::offset_of!(FunctionData, closure_env);
+
+/// The heap lexical environment `f` captured, or NIL (Backpack).
+pub fn closure_env(f: EgclVal) -> EgclVal {
+    if !is_interpreted_function(f) {
+        return crate::value::NIL;
+    }
+    // SAFETY: a validated interpreted-function object.
+    unsafe { (*data(f)).closure_env }
+}
+
+/// Attach the heap environment a fresh closure captured, before any other
+/// thread can call it. The store runs the write barrier.
+///
+/// # Safety
+/// `f` must be an interpreted-function object not yet published.
+pub unsafe fn set_closure_env(f: EgclVal, env: EgclVal) {
+    unsafe { crate::gc::store_ref(core::ptr::addr_of_mut!((*data(f)).closure_env), env) };
 }
 
 /// The raw closure-state word: 0, or a value the evaluator stored with
@@ -526,7 +550,8 @@ mod tests {
         assert!(std::ptr::eq(native_entries(*function).unwrap(), &ENTRIES));
         let fresh = alloc_interpreted(NIL, NIL, NIL, NIL);
         assert!(std::ptr::eq(native_entries(fresh).unwrap(), &ENTRIES));
-        assert_eq!(std::mem::size_of::<FunctionData>(), 88);
+        assert_eq!(std::mem::size_of::<FunctionData>(), 96);
+        assert_eq!(std::mem::offset_of!(FunctionData, closure_env), 88);
         assert_eq!(std::mem::offset_of!(FunctionData, native_entries), 48);
         assert_eq!(std::mem::offset_of!(FunctionData, definition_index), 60);
         assert_eq!(std::mem::offset_of!(FunctionData, closure_state), 64);

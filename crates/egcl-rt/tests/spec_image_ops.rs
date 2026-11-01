@@ -78,7 +78,7 @@ fn spec_image_round_trip_restores_heap_and_entry_state() {
     save_image(path.to_str().unwrap(), &image_opts()).expect("save_image");
     let header = validate_image_header(path.to_str().unwrap()).expect("validate header");
     assert_eq!(header.entry_continuation, entry.to_raw());
-    assert_eq!(header.format_version, 19);
+    assert_eq!(header.format_version, 20);
     assert!(header.heap_size >= 4096);
     assert_eq!(header.heap_size % 4096, 0);
 

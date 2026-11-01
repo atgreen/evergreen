@@ -1010,47 +1010,22 @@ fn retarget(instr: &mut Instr, target: &impl Fn(u32) -> Option<u32>) -> Option<(
     Some(())
 }
 
-// ── Closure attachment (TEMPORARY interface for the stage-2 merge) ─────
+// ── Closure attachment ──────────────────────────────────────────────────
 //
-// A heap-environment closure carries exactly one value: its captured
-// environment. Until closure instances own their state (Backpack stage 2,
-// bliss-gg3i1.7.15.3: `ClosureState` on the function object), it rides in a
-// *carrier* frame passed where a captured `EnvFrame` goes today. Every tier
-// already installs a closure's captured frame as its activation's frame
-// (`Activation::env_frame`, `NATIVE_ENV_FRAME`), so `ClosureEnv` reads it back
-// from there with one indexed read: no name is compared. At the merge, replace
-// `carrier`/`captured_env` with a traced environment field on the closure
-// state, and nothing else changes.
+// A heap-environment closure is one function object whose traced
+// `closure_env` word holds the environment it captured
+// (`egcl_rt::function::closure_env`). Every tier finds it from the callable:
+// the activation's EgclStack frame records the function it runs (T0 and the
+// mapped entries), and the ordinary native entry receives it as its hidden
+// argument (`Opcode::CurrentCallable`).
 
-/// Key of the carrier frame's only entry. Never a Lisp-visible name.
-const CARRIER_KEY: &str = "\0egcl-backpack-environment";
-
-/// A carrier frame holding `env` (TEMPORARY; see above).
-pub(super) fn carrier(env: EgclVal) -> Arc<FrameCell> {
-    let mut vars = super::super::VecMap::default();
-    vars.insert(CARRIER_KEY.to_string(), env);
-    FrameCell::new_arc(EnvFrame {
-        vars,
-        symbol_vars: super::super::VecMap::default(),
-        function_vars: super::super::VecMap::default(),
-        parent: None,
-    })
-}
-
-/// The environment a heap-environment closure captured, given the frame its
-/// activation runs with: NIL when there is none.
-pub(super) fn captured_env(frame: Option<&Arc<FrameCell>>) -> EgclVal {
-    let Some(frame) = frame else {
+/// The environment the closure running in `frame` captured, or NIL.
+pub(super) fn frame_closure_env(frame: *mut egcl_rt::Frame) -> EgclVal {
+    if frame.is_null() {
         return NIL;
-    };
-    let frame = frame.borrow();
-    // Only a closure the rewrite made reaches `ClosureEnv`, so its frame is
-    // always a carrier. Anything else answers NIL rather than a foreign
-    // binding (this runs inside `extern "C"` helpers, which must not panic).
-    match frame.vars.iter().next() {
-        Some((key, value)) if key == CARRIER_KEY && frame.vars.len() == 1 => *value,
-        _ => NIL,
     }
+    // SAFETY: a live activation frame; its function word is a traced root.
+    egcl_rt::function::closure_env(unsafe { (*frame).function })
 }
 
 /// Make the closure `MakeEnvClosure` describes: `values` (already popped,
@@ -1062,18 +1037,21 @@ pub(super) fn make_closure(
     env: &Env,
 ) -> Option<EgclVal> {
     egcl_rt::rooted!(values = values.to_vec());
+    egcl_rt::rooted!(parent = parent);
     let captured = if values.is_empty() {
-        parent
+        *parent
     } else {
-        let layer = egcl_rt::lexenv::make(parent, values.len())?;
+        let layer = egcl_rt::lexenv::make(*parent, values.len())?;
         for (index, value) in values.iter().enumerate() {
             egcl_rt::lexenv::store(layer, 0, index as u16, *value);
         }
         layer
     };
     egcl_rt::rooted!(captured = captured);
-    let frame = carrier(*captured);
-    Some(make_template_closure(nested, Some(frame), env))
+    let closure = make_heap_closure_instance(nested, env);
+    // SAFETY: a fresh instance no other thread can call yet.
+    unsafe { egcl_rt::function::set_closure_env(closure, *captured) };
+    Some(closure)
 }
 
 /// The variable names of every heap-environment slot `function` addresses,
@@ -1193,13 +1171,6 @@ pub(super) extern "C" fn c2i_heap_env_set(
     if !egcl_rt::lexenv::store(EgclVal(env), depth, idx, EgclVal(value)) {
         stash_native_error(unbound(names, name));
     }
-}
-
-#[cfg(target_arch = "x86_64")]
-/// `ClosureEnv`: the running closure's environment, from the frame the native
-/// entry installed for its activation (see [`carrier`]).
-pub(super) extern "C" fn c2i_heap_closure_env() -> u64 {
-    NATIVE_ENV_FRAME.with(|slot| captured_env(slot.borrow().as_ref()).0)
 }
 
 #[cfg(target_arch = "x86_64")]

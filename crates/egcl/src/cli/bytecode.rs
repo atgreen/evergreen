@@ -17342,6 +17342,18 @@ fn make_template_closure(
     closure_templates::make_instance(nested, captured_env, control, control_free)
 }
 
+/// A fresh instance of `nested` for a heap-environment closure (Backpack):
+/// it owns no lexical frame, only the control scope a free exit needs, and
+/// never shares the template prototype, since its caller attaches the
+/// captured environment to it.
+fn make_heap_closure_instance(nested: &Arc<BytecodeFunction>, env: &Env) -> EgclVal {
+    let control_free = closure_templates::control_free(nested);
+    let scope_empty = env.block_stack.is_empty() && env.tag_stack.is_empty();
+    let control =
+        (!control_free && !scope_empty).then(|| (env.block_stack.clone(), env.tag_stack.clone()));
+    closure_templates::make_instance(nested, None, control, false)
+}
+
 /// Lazy (deferred) compilation of top-level DEFUNs (bliss-x5y). Eagerly
 /// compiling every defun at load time costs more than it saves for a big library
 /// load (asdf) whose functions are mostly never hot — the bytecode backend loads
@@ -21677,7 +21689,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                 }
             }
             Instr::ClosureEnv => {
-                let captured = heap_env::captured_env(acts[top_idx].env_frame.as_ref());
+                let captured = heap_env::frame_closure_env(acts[top_idx].frame);
                 acts[top_idx].push_op(captured);
             }
             Instr::MakeEnvClosure { func, nflat } => {
@@ -30158,15 +30170,6 @@ fn emit_native(
                         .to_le_bytes(),
                 );
                 emit_c2i_helper_call(&mut c);
-            }
-            Instr::ClosureEnv => {
-                c.extend_from_slice(&[0x48, 0xB8]);
-                c.extend_from_slice(
-                    &(heap_env::c2i_heap_closure_env as extern "C" fn() -> u64 as usize as u64)
-                        .to_le_bytes(),
-                );
-                emit_c2i_helper_call(&mut c);
-                push_rax(&mut c);
             }
             Instr::MakeEnvClosure { func, nflat } => {
                 let nested =

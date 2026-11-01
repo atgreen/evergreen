@@ -1574,6 +1574,9 @@ unsafe fn trace_object(
                     crate::symbols::trace_symbol_index(index, &mut visit);
                 }
             }
+            if words * 8 >= FUNCTION_BODY_BYTES {
+                visit(unsafe { body.add(FUNCTION_CLOSURE_ENV_OFFSET).cast::<EgclVal>() });
+            }
             // The evaluator traces what the object owns off the heap: its
             // closure state, and (for a definition) its bytecode body. The
             // raw state word itself is never visited as a reference.
@@ -1712,7 +1715,15 @@ unsafe fn trace_function_heap_words(
     for i in 0..FUNCTION_HEAP_REFERENCE_WORDS.min(body_len / 8) {
         visit(unsafe { (body as *mut EgclVal).add(i) });
     }
+    if body_len >= FUNCTION_BODY_BYTES {
+        visit(unsafe { body.add(FUNCTION_CLOSURE_ENV_OFFSET).cast::<EgclVal>() });
+    }
 }
+
+/// Body offset of an interpreted function's traced heap-environment word.
+const FUNCTION_CLOSURE_ENV_OFFSET: usize =
+    core::mem::offset_of!(crate::object::FunctionData, closure_env)
+        - core::mem::size_of::<ObjectHeader>();
 
 /// Whether `trace_object` reaches slots outside the object's own heap words for
 /// this type — storage whose changes no heap page records.

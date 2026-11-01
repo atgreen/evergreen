@@ -1723,10 +1723,7 @@ impl TransferCode {
                 })?
         };
         frame_guard.0 = Some(frame);
-        // A heap-environment closure body (Backpack) opens with `ClosureEnv`,
-        // which reads its captured environment from this frame.
-        let reads_closure_env = matches!(self.body.code.first(), Some(Instr::ClosureEnv));
-        if osr_offset.is_none() && (self.body.has_env || self.body.variadic || reads_closure_env) {
+        if osr_offset.is_none() && (self.body.has_env || self.body.variadic) {
             // The interpreter's environment, as in `run_with_binding`: a
             // capturing body gets a fresh heap frame under the callable's
             // captured one (or the caller's), shared with every closure it
@@ -3606,10 +3603,8 @@ unsafe fn lexical_environment_leaf(
             super::heap_env::count_access(depth);
             return Some(NIL);
         }
-        Instr::ClosureEnv if call.nargs == 0 && !context.env_frame.is_null() => {
-            return Some(super::heap_env::captured_env(
-                unsafe { &*context.env_frame }.as_ref(),
-            ));
+        Instr::ClosureEnv if call.nargs == 0 => {
+            return Some(super::heap_env::frame_closure_env(context.frame));
         }
         _ => {}
     }
@@ -3861,10 +3856,7 @@ unsafe fn lexical_environment_request(
                         Err(super::heap_env_unbound(body, name))
                     }
                 }
-                Instr::ClosureEnv if context.env_frame.is_null() => Ok(NIL),
-                Instr::ClosureEnv => Ok(super::heap_env::captured_env(unsafe {
-                    (*context.env_frame).as_ref()
-                })),
+                Instr::ClosureEnv => Ok(super::heap_env::frame_closure_env(context.frame)),
                 Instr::MakeEnvClosure { func, .. } => {
                     let (&parent, values) = args.split_first().ok_or_else(invalid_capture)?;
                     let nested = Arc::clone(
