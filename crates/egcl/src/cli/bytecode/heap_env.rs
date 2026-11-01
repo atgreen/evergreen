@@ -1055,6 +1055,17 @@ pub(super) fn slot_names(function: &BytecodeFunction) -> Vec<(u16, u8, u16, Stri
 // UNBOUND-VARIABLE error of a slot read before its binding was made.) Inline
 // two-to-three-load access in the emitters is the follow-up.
 
+/// Count one heap-environment slot access `depth` links away in
+/// `(egcl::%env-access-counts)`. A disabled counter costs one relaxed load.
+#[inline]
+pub(super) fn count_access(depth: u8) {
+    use crate::cli::env_counts::{self, Counter};
+    env_counts::bump(Counter::SlotOps, 1);
+    if depth != 0 {
+        env_counts::bump(Counter::SlotHops, u64::from(depth));
+    }
+}
+
 /// Pack `EnvRef`/`EnvSet` operands into one immediate word.
 pub(super) fn pack(depth: u8, idx: u16, name: u16) -> u64 {
     (u64::from(name) << 32) | (u64::from(depth) << 16) | u64::from(idx)
@@ -1098,6 +1109,7 @@ pub(super) extern "C" fn c2i_heap_env_ref(
     names: *const NativeEnvNames,
 ) -> u64 {
     let (depth, idx, name) = unpack(packed);
+    count_access(depth);
     match egcl_rt::lexenv::load(EgclVal(env), depth, idx) {
         Some(value) if value != egcl_rt::value::UNBOUND => value.0,
         _ => {
@@ -1115,6 +1127,7 @@ pub(super) extern "C" fn c2i_heap_env_set(
     names: *const NativeEnvNames,
 ) {
     let (depth, idx, name) = unpack(packed);
+    count_access(depth);
     if !egcl_rt::lexenv::store(EgclVal(env), depth, idx, EgclVal(value)) {
         stash_native_error(unbound(names, name));
     }

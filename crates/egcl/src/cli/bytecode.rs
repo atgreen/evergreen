@@ -179,6 +179,8 @@ mod call_table_funcall;
 mod call_table_native;
 mod closure_templates;
 mod heap_env;
+#[cfg(test)]
+mod heap_env_tests;
 mod mapping_transforms;
 mod method_context_use;
 mod quoted_funcall;
@@ -15610,6 +15612,15 @@ fn validate_bbu_lexical_operands(
                 validate_bbu_lexical_name(constants, cursor.u32()?, version)?;
                 0
             }
+            // Heap environments (0x0305): depth u8 + index u16 + a debug name.
+            0x4d | 0x4e if version >= 0x0305 => {
+                cursor.take(3)?;
+                validate_bbu_lexical_name(constants, cursor.u32()?, version)?;
+                0
+            }
+            0x4c if version >= 0x0305 => 2,
+            0x4f if version >= 0x0305 => 0,
+            0x50 if version >= 0x0305 => 6,
             0x01 | 0x07 | 0x08 | 0x09 | 0x1c | 0x15 | 0x18 | 0x19 | 0x1a | 0x1f | 0x3f | 0x40
             | 0x2a | 0x46 | 0x47 => 4,
             0x02 | 0x03 | 0x1d | 0x13 | 0x10 | 0x42 => 2,
@@ -21406,6 +21417,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
             }
             Instr::EnvRef { depth, idx, name } => {
                 let environment = acts[top_idx].pop_op();
+                heap_env::count_access(depth);
                 match egcl_rt::lexenv::load(environment, depth, idx) {
                     Some(value) if value != egcl_rt::value::UNBOUND => acts[top_idx].push_op(value),
                     _ => {
@@ -21416,6 +21428,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
             }
             Instr::EnvSet { depth, idx, name } => {
                 let environment = acts[top_idx].pop_op();
+                heap_env::count_access(depth);
                 let value = acts[top_idx].pop_op();
                 if !egcl_rt::lexenv::store(environment, depth, idx, value) {
                     let error = heap_env_unbound(&acts[top_idx].func, name);

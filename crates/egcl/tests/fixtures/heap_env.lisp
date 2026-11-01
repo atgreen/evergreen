@@ -142,5 +142,6 @@
     (hv-report "counters" (mapcar #'funcall cs))))
 
 ;; Run enough times for the invocation-threshold tiers to promote.
-(dotimes (i 30) (let ((*standard-output* (make-broadcast-stream))) (hv-run)))
+(defvar *hv-warm* 30)
+(dotimes (i *hv-warm*) (let ((*standard-output* (make-broadcast-stream))) (hv-run)))
 (hv-run)

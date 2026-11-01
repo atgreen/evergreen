@@ -3769,6 +3769,7 @@ unsafe fn lexical_environment_request(
                     let [environment] = *args else {
                         return Err(invalid_capture());
                     };
+                    super::heap_env::count_access(depth);
                     match egcl_rt::lexenv::load(environment, depth, idx) {
                         Some(value) if value != egcl_rt::value::UNBOUND => Ok(value),
                         _ => Err(super::heap_env_unbound(body, name)),
@@ -3778,6 +3779,7 @@ unsafe fn lexical_environment_request(
                     let [value, environment] = *args else {
                         return Err(invalid_capture());
                     };
+                    super::heap_env::count_access(depth);
                     if egcl_rt::lexenv::store(environment, depth, idx, value) {
                         Ok(NIL)
                     } else {

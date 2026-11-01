@@ -14,16 +14,16 @@ use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 #[derive(Clone, Copy)]
-#[allow(dead_code)] // the slot counters arrive with Backpack stage 1
+#[allow(dead_code)] // SlotFallbacks: heap environments never fall back
 pub(super) enum Counter {
     /// Compiled environment operations resolved by name.
     NameOps = 0,
     /// Parent-frame hops taken by any name-based lexical lookup or assignment,
     /// including the tree-walker's.
     NameHops = 1,
-    /// Compiled environment operations that used a compile-time slot.
+    /// Heap-environment slot operations (`EnvRef`/`EnvSet`, every tier).
     SlotOps = 2,
-    /// Parent-frame hops taken to reach a slot's frame.
+    /// Parent-environment links followed to reach a slot.
     SlotHops = 3,
     /// Slot operations whose frame did not hold the expected binding and so
     /// fell back to the name path (also counted in `NameOps`).
