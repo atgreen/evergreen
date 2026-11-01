@@ -485,6 +485,70 @@ mod tests {
         assert_eq!(cp(moved), (fixnum(7), NIL), "the moved constant is intact");
     }
 
+    /// A minor collection no longer traces an interpreted function's captures
+    /// through the function (bliss-gg3i1.7.12). A closure that has survived
+    /// collections and whose captured frame then receives a young object must
+    /// still see that object relocated: the frame's write log is the only
+    /// path left from the collector to it.
+    #[test]
+    fn old_closure_frame_written_later_moves_through_the_log() {
+        let _lock = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        remembered_mode();
+        let body = Arc::new(BytecodeFunction {
+            self_call_sites: Vec::new(),
+            notinline_sites: Vec::new(),
+            code: Vec::new(),
+            constants: Vec::new(),
+            load_time_values: Vec::new(),
+            handler_cases: Vec::new(),
+            handler_binds: Vec::new(),
+            names: Vec::new(),
+            restart_cases: Vec::new(),
+            nested_functions: Vec::new(),
+            param_layout: Vec::new(),
+            param_types: Vec::new(),
+            has_env: true,
+            n_locals: 0,
+            max_stack: 1,
+            arity: 0,
+            name: "REMEMBERED-CLOSURE".into(),
+            params_form: NIL,
+            min_args: 0,
+            max_args: Some(0),
+            variadic: false,
+            binder_cache: Default::default(),
+        });
+        let frame = FrameCell::new_arc(EnvFrame::default());
+        egcl_rt::rooted!(
+            closure = super::super::bytecode::make_bytecode_closure(&body, Some(frame))
+        );
+        // Promote the closure and let its frame's creation record retire.
+        egcl_rt::gc::collect_t0_minor().unwrap();
+        egcl_rt::gc::collect_t0_minor().unwrap();
+        assert!(captures_remembered(), "the next collection uses the logs");
+
+        let captured = super::super::bytecode::closure_captured_env(*closure).unwrap();
+        egcl_rt::rooted!(fresh = arena_cons(fixnum(5), fixnum(6)));
+        captured.borrow_mut().vars.insert("LATE".into(), *fresh);
+        drop(fresh);
+        let unrooted = captured.gc_borrow().vars["LATE"];
+        egcl_rt::gc::collect_t0_minor().unwrap();
+        let held = super::super::bytecode::closure_captured_env(*closure)
+            .unwrap()
+            .gc_borrow()
+            .vars["LATE"];
+        assert_ne!(
+            held.to_raw(),
+            unrooted.to_raw(),
+            "the capture must actually move"
+        );
+        assert_eq!(
+            cp(held),
+            (fixnum(5), fixnum(6)),
+            "the moved capture is intact"
+        );
+    }
+
     #[test]
     fn a_log_gives_up_only_on_live_entries_and_recovers_next_epoch() {
         let log: WriteLog<u32> = WriteLog::new();
