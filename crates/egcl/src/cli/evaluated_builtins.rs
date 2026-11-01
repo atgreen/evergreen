@@ -4306,6 +4306,89 @@ fn resolve(name: &str) -> Option<Handler> {
             Ok(plist)
         }),
 
+        "EGCL::%DBIND-CHECK-KEYS" => Some(|_operator, args, _env| {
+            // Keyword check for bytecode-lowered DESTRUCTURING-BIND `&key`
+            // (bliss-gg3i1.7.17): KEYS must be an even-length plist whose
+            // indicators are all in ALLOWED, unless it carries a true
+            // :ALLOW-OTHER-KEYS. Reads only; allocates nothing on the Lisp heap.
+            // Intern before reading the arguments: nothing after this allocates.
+            let allow_other = egcl_compiler::reader::intern_keyword_symbol("ALLOW-OTHER-KEYS");
+            let keys = args.first().copied().unwrap_or(NIL);
+            let allowed = args.get(1).copied().unwrap_or(NIL);
+            let mut pairs = Vec::new();
+            let mut cursor = keys;
+            while cursor.is_cons() {
+                let (key, rest) = cp(cursor);
+                if !rest.is_cons() {
+                    return Err(EgclError::ProgramError(
+                        "odd number of elements in keyword argument list".into(),
+                    ));
+                }
+                let (value, next) = cp(rest);
+                pairs.push((key, value));
+                cursor = next;
+            }
+            if !cursor.is_nil() {
+                return Err(EgclError::ProgramError(
+                    "keyword argument list is not a proper list".into(),
+                ));
+            }
+            // The first :ALLOW-OTHER-KEYS occurrence decides (CLHS 3.4.1.4.1).
+            if pairs
+                .iter()
+                .find(|(key, _)| *key == allow_other)
+                .is_some_and(|(_, value)| !value.is_nil())
+            {
+                return Ok(NIL);
+            }
+            for (key, _) in &pairs {
+                let mut known = *key == allow_other;
+                let mut cursor = allowed;
+                while !known && cursor.is_cons() {
+                    let (candidate, next) = cp(cursor);
+                    known = candidate == *key;
+                    cursor = next;
+                }
+                if !known {
+                    return Err(EgclError::ProgramError(format!(
+                        "unknown keyword argument {} in destructuring lambda list",
+                        sym_name(*key)
+                    )));
+                }
+            }
+            Ok(NIL)
+        }),
+
+        "EGCL::PUT-PLIST" => Some(|_operator, args, _env| {
+            // `(setf getf)` store for bytecode-lowered SETF GETF
+            // (bliss-gg3i1.7.17): (plist indicator value) -> the plist to store
+            // back into the place. An existing INDICATOR (compared with EQ, as
+            // GETF does) has its value cell updated in place and PLIST is
+            // returned; otherwise INDICATOR and VALUE are consed on the front.
+            // Same behaviour as the tree-walker's SETF GETF arm.
+            egcl_rt::rooted!(plist = args.first().copied().unwrap_or(NIL));
+            egcl_rt::rooted!(key = args.get(1).copied().unwrap_or(NIL));
+            egcl_rt::rooted!(val = args.get(2).copied().unwrap_or(NIL));
+            let mut cursor = *plist;
+            // No allocation in this scan, so the raw cursor stays valid.
+            while cursor.is_cons() {
+                let (indicator, after_key) = cp(cursor);
+                if !after_key.is_cons() {
+                    break;
+                }
+                if indicator == *key {
+                    unsafe {
+                        let cell = after_key.as_ptr() as *mut egcl_rt::object::ConsCell;
+                        egcl_rt::gc::store_ref(std::ptr::addr_of_mut!((*cell).car), *val);
+                    }
+                    return Ok(*plist);
+                }
+                cursor = cp(after_key).1;
+            }
+            egcl_rt::rooted!(tail = arena_cons(*val, *plist));
+            Ok(arena_cons(*key, *tail))
+        }),
+
         "EGCL::PUT-SYMBOL-PROPERTY" => Some(|_operator, args, _env| {
             // Store primitive for bytecode-lowered `(setf (get symbol indicator
             // [default]) value)` (bliss-gg3i1.7.16). Arguments arrive evaluated

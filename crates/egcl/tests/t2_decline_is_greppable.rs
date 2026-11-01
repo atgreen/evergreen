@@ -184,13 +184,12 @@ fn a_function_not_compiled_to_bytecode_explains_itself_in_the_t2_log() {
             "{name} must explain itself once:\n{log}"
         );
     }
-    // DESTRUCTURING-BIND's &key used to bail without recording a reason, which
-    // is why ASDF's NORMALIZE-VERSION and PARSE-COMPONENT-FORM logged nothing.
-    assert_eq!(
-        log.matches("[T2] DBKEY: not compiled to bytecode (destructuring-bind:&KEY)")
-            .count(),
-        1,
-        "the destructuring-bind decline must name its lambda-list keyword:\n{log}"
+    // DESTRUCTURING-BIND's &key used to bail (first without a reason, which is
+    // why ASDF's NORMALIZE-VERSION and PARSE-COMPONENT-FORM logged nothing). It
+    // compiles since bliss-gg3i1.7.17, so DBKEY has nothing to explain.
+    assert!(
+        !log.contains("[T2] DBKEY: not compiled to bytecode"),
+        "DBKEY compiles now:\n{log}"
     );
     assert!(
         log.contains(
@@ -200,7 +199,7 @@ fn a_function_not_compiled_to_bytecode_explains_itself_in_the_t2_log() {
     );
     assert_eq!(
         out.trim(),
-        "7 (1 2 3) 5 (1 2) (0 0 0 0)",
+        "7 (1 2 3) 5 (1 2) (0 0 0 1)",
         "results and tiers:\n{log}"
     );
     let (tree, _) = run(program, &[("EGCL_BACKEND", "tree-walker")]);
@@ -317,19 +316,18 @@ fn a_method_not_compiled_to_bytecode_explains_itself_in_the_t2_log() {
         !log.contains("[T2] (METHOD COMMON-LISP-USER::GM2): not compiled to bytecode"),
         "GM2 compiles now:\n{log}"
     );
-    for (name, reason) in [
-        ("GM", "destructuring-bind:&KEY"),
-        ("GM3", "method defined inside a lexical binding"),
-    ] {
-        let line = format!(
-            "[T2] (METHOD COMMON-LISP-USER::{name}): not compiled to bytecode ({reason}); T1 and T2 need bytecode"
-        );
-        assert_eq!(
-            log.matches(&line).count(),
-            1,
-            "{name} must explain itself once:\n{log}"
-        );
-    }
+    // GM's DESTRUCTURING-BIND &key method compiles since bliss-gg3i1.7.17.
+    assert!(
+        !log.contains("[T2] (METHOD COMMON-LISP-USER::GM): not compiled to bytecode"),
+        "GM compiles now:\n{log}"
+    );
+    let line = "[T2] (METHOD COMMON-LISP-USER::GM3): not compiled to bytecode \
+                (method defined inside a lexical binding); T1 and T2 need bytecode";
+    assert_eq!(
+        log.matches(line).count(),
+        1,
+        "GM3 must explain itself once:\n{log}"
+    );
     assert_eq!(out.trim(), "3 11 4", "{log}");
     let (tree, _) = run(program, &[("EGCL_BACKEND", "tree-walker")]);
     assert_eq!(tree, out);

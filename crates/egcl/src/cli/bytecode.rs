@@ -5257,6 +5257,58 @@ impl<'e> Lowerer<'e> {
         Ok(())
     }
 
+    /// The rewrite of `(setf (getf plist-place indicator [default]) value)`
+    /// described at its use in `lower_setf`, or `None` when PLACE is not such
+    /// a GETF place or its plist place is not a variable or an accessor call
+    /// on effect-free arguments.
+    fn getf_setf_rewrite(&self, place: EgclVal, value: EgclVal) -> LowerResult<Option<EgclVal>> {
+        if !place.is_cons() {
+            return Ok(None);
+        }
+        egcl_rt::rooted!(items = list_to_vec(place));
+        if !(3..=4).contains(&items.len())
+            || !items[0].is_symbol()
+            || sym_bare_name_rc(items[0]).as_ref() != "GETF"
+        {
+            return Ok(None);
+        }
+        let plist_place = items[1];
+        let simple_place = if plist_place.is_symbol() {
+            !plist_place.is_nil()
+                && plist_place != T
+                && !self.env.has_symbol_macro(plist_place.as_symbol_index())
+        } else if plist_place.is_cons() {
+            let (head, args) = cp(plist_place);
+            head.is_symbol()
+                && list_to_vec(args)
+                    .into_iter()
+                    .all(|arg| effect_free_place_subform(arg, self.env))
+        } else {
+            false
+        };
+        if !simple_place {
+            return Ok(None);
+        }
+        egcl_rt::rooted!(value = value);
+        let let_star = resolve_sym("LET*").ok_or(Bail)?;
+        let setf = resolve_sym("SETF").ok_or(Bail)?;
+        let put = resolve_sym("EGCL::PUT-PLIST").ok_or(Bail)?;
+        egcl_rt::rooted!(key = egcl_rt::symbols::make_uninterned("%EGCL-GETF-INDICATOR"));
+        egcl_rt::rooted!(val = egcl_rt::symbols::make_uninterned("%EGCL-GETF-VALUE"));
+        egcl_rt::rooted!(bindings = vec![form_list(&[*key, items[2]])]);
+        if items.len() == 4 {
+            let default = egcl_rt::symbols::make_uninterned("%EGCL-GETF-DEFAULT");
+            let binding = form_list(&[default, items[3]]);
+            bindings.push(binding);
+        }
+        let binding = form_list(&[*val, *value]);
+        bindings.push(binding);
+        egcl_rt::rooted!(binding_list = form_list(&bindings));
+        egcl_rt::rooted!(updated = form_list(&[put, items[1], *key, *val]));
+        egcl_rt::rooted!(store = form_list(&[setf, items[1], *updated]));
+        Ok(Some(form_list(&[let_star, *binding_list, *store, *val])))
+    }
+
     fn lower_setf(&mut self, rest: EgclVal) -> LowerResult<()> {
         // Root the pair list across the allocating resolve_sym/lower_expr
         // recursion (moving GC; bliss-wlf); re-read `items[..]` for the value and
@@ -5310,6 +5362,24 @@ impl<'e> Lowerer<'e> {
                 self.emit(Instr::CallNamed { sym, nargs: 3 });
                 self.pop_n(3);
                 self.push_n(1); // result: the stored value
+                if !last {
+                    self.emit(Instr::Pop);
+                    self.pop_n(1);
+                }
+            } else if let Some(mut rewritten) = self.getf_setf_rewrite(place, items[2 * i + 1])? {
+                // `(setf (getf plist-place indicator [default]) value)` over a
+                // plist place whose subforms are variables or constants:
+                //   (let* ((k indicator) [(d default)] (v value))
+                //     (setf plist-place (egcl::put-plist plist-place k v))
+                //     v)
+                // PUT-PLIST updates an existing indicator's value cell in place
+                // or conses a new pair on the front, like the tree-walker's SETF
+                // GETF; the place is always written back, as SBCL's expander
+                // does. Re-reading the place for the store is unobservable
+                // because its subforms have no effects (bliss-gg3i1.7.17:
+                // RECORD-XREF, %DEFKNOWN, IR1-CONVERT-LAMBDA).
+                egcl_rt::rooted_ref!(_rewritten_root = &mut rewritten);
+                self.lower_expr(rewritten)?;
                 if !last {
                     self.emit(Instr::Pop);
                     self.pop_n(1);
@@ -7348,15 +7418,20 @@ impl<'e> Lowerer<'e> {
     /// condition signalled during `protected`, unwind into the clause body with
     /// the condition bound to `var`.
     fn lower_handler_case(&mut self, rest: EgclVal) -> LowerResult<()> {
-        let (protected, clauses_form) = cp(rest);
+        let (mut protected, clauses_form) = cp(rest);
+        egcl_rt::rooted_ref!(_protected_root = &mut protected);
         // Root the clause conses: they are live across the allocating
         // lower_expr(protected) and lower_progn calls below (moving GC; bliss-wlf).
         egcl_rt::rooted!(clauses = list_to_vec(clauses_form));
-        // `:no-error` clauses are a different protocol — bail if present.
-        for clause in clauses.iter() {
-            let (type_form, _) = cp(*clause);
+        // A `:no-error` clause is lowered through its CLHS expansion.
+        for index in 0..clauses.len() {
+            let (type_form, _) = cp(clauses[index]);
             if type_form.is_symbol() && sym_name(type_form).ends_with("NO-ERROR") {
-                return Err(Bail);
+                if index + 1 != clauses.len() {
+                    return Err(Bail); // it must be the last clause
+                }
+                let rewritten = handler_case_without_no_error(protected, &clauses)?;
+                return self.lower_expr(rewritten);
             }
         }
 
@@ -7481,16 +7556,21 @@ impl<'e> Lowerer<'e> {
                 return Err(Bail);
             }
             let (type_form, handler_rest) = cp(binding);
-            if !type_form.is_symbol() && !type_form.is_nil() {
-                return Err(Bail);
-            }
             let handler_form = if handler_rest.is_cons() {
                 cp(handler_rest).0
             } else {
                 return Err(Bail);
             };
-            types.push(sym_name(type_form));
-            self.lower_expr(handler_form)?;
+            if type_form.is_symbol() || type_form.is_nil() {
+                types.push(sym_name(type_form));
+                self.lower_expr(handler_form)?;
+            } else {
+                // A compound condition type: bind a CONDITION handler that
+                // declines (returns) unless the condition is of the type.
+                let wrapper = compound_type_handler(type_form, handler_form)?;
+                types.push("CONDITION".to_string());
+                self.lower_expr(wrapper)?;
+            }
         }
 
         let hb = self.handler_binds.len() as u32;
@@ -9409,6 +9489,126 @@ fn aref_setf_place(place: EgclVal) -> Option<(&'static str, EgclVal, EgclVal)> {
     }
 }
 
+/// `(handler-case form clause* (:no-error lambda-list . body))` as
+///
+///   (block #b
+///     (destructuring-bind lambda-list
+///         (handler-case (multiple-value-list form)
+///           (type (var) decl* (return-from #b (progn . forms))) ...)
+///       . body))
+///
+/// which is CLHS's expansion with the :NO-ERROR lambda applied through
+/// DESTRUCTURING-BIND instead of a closure: a clause's values leave through
+/// RETURN-FROM, and the protected form's values reach BODY bound to the
+/// lambda list (STRIP-LAMBDA-LIST, CAREFUL-CALL; bliss-gg3i1.7.17).
+fn handler_case_without_no_error(protected: EgclVal, clauses: &[EgclVal]) -> LowerResult<EgclVal> {
+    egcl_rt::rooted!(protected = protected);
+    egcl_rt::rooted!(clauses = clauses.to_vec());
+    let last = clauses.len() - 1;
+    // The :NO-ERROR clause's lambda list and body, taken before anything here
+    // allocates.
+    let (_, no_error_rest) = cp(clauses[last]);
+    if !no_error_rest.is_cons() {
+        return Err(Bail);
+    }
+    let (lambda_list, no_error_body) = cp(no_error_rest);
+    egcl_rt::rooted!(tail = vec![lambda_list, no_error_body]);
+    let block = resolve_sym("BLOCK").ok_or(Bail)?;
+    let return_from = resolve_sym("RETURN-FROM").ok_or(Bail)?;
+    let progn = resolve_sym("PROGN").ok_or(Bail)?;
+    let handler_case = resolve_sym("HANDLER-CASE").ok_or(Bail)?;
+    let mv_list = resolve_sym("MULTIPLE-VALUE-LIST").ok_or(Bail)?;
+    let dbind = resolve_sym("DESTRUCTURING-BIND").ok_or(Bail)?;
+    egcl_rt::rooted!(name = egcl_rt::symbols::make_uninterned("%EGCL-HANDLER-CASE-NO-ERROR"));
+    egcl_rt::rooted!(rewritten_clauses = Vec::<EgclVal>::new());
+    for index in 0..last {
+        let (type_form, after_type) = cp(clauses[index]);
+        let (bind_list, body) = if after_type.is_cons() {
+            cp(after_type)
+        } else {
+            return Err(Bail);
+        };
+        egcl_rt::rooted!(head = vec![type_form, bind_list]);
+        egcl_rt::rooted!(forms = list_to_vec(body));
+        // Leading declarations stay on the clause, where they scope its variable.
+        let declarations = forms
+            .iter()
+            .take_while(|form| {
+                form.is_cons() && {
+                    let op = cp(**form).0;
+                    op.is_symbol() && sym_bare_name_rc(op).as_ref() == "DECLARE"
+                }
+            })
+            .count();
+        for d in 0..declarations {
+            let decl = forms[d];
+            head.push(decl);
+        }
+        egcl_rt::rooted!(progn_items = vec![progn]);
+        for f in declarations..forms.len() {
+            let form = forms[f];
+            progn_items.push(form);
+        }
+        egcl_rt::rooted!(body_form = form_list(&progn_items));
+        let exit = form_list(&[return_from, *name, *body_form]);
+        head.push(exit);
+        let clause = form_list(&head);
+        rewritten_clauses.push(clause);
+    }
+    egcl_rt::rooted!(values = form_list(&[mv_list, *protected]));
+    egcl_rt::rooted!(inner_items = vec![handler_case, *values]);
+    for c in 0..rewritten_clauses.len() {
+        let clause = rewritten_clauses[c];
+        inner_items.push(clause);
+    }
+    egcl_rt::rooted!(source = form_list(&inner_items));
+    // (destructuring-bind lambda-list source . body)
+    egcl_rt::rooted!(after_source = arena_cons(*source, tail[1]));
+    egcl_rt::rooted!(after_ll = arena_cons(tail[0], *after_source));
+    egcl_rt::rooted!(dbind_form = arena_cons(dbind, *after_ll));
+    Ok(form_list(&[block, *name, *dbind_form]))
+}
+
+/// The handler for a HANDLER-BIND binding whose condition type is compound:
+///
+///   (lambda (#c) (when (typep #c 'type) (funcall handler-form #c)))
+///
+/// bound to CONDITION. A handler that returns declines, so the binding acts
+/// exactly as one on TYPE. HANDLER-FORM is evaluated when the handler runs
+/// rather than when HANDLER-BIND is entered, which is only equivalent when
+/// that evaluation has no effects and cannot see a different value: so it
+/// must be a `(function …)`, `(quote …)` or `(lambda …)` form, and anything
+/// else still bails (%CHECK-DEPRECATED-TYPE, SUB-COMPILE-FILE;
+/// bliss-gg3i1.7.17).
+fn compound_type_handler(type_form: EgclVal, handler_form: EgclVal) -> LowerResult<EgclVal> {
+    egcl_rt::rooted!(parts = [type_form, handler_form]);
+    let stable = parts[1].is_cons() && {
+        let op = cp(parts[1]).0;
+        op.is_symbol()
+            && matches!(
+                sym_bare_name_rc(op).as_ref(),
+                "FUNCTION" | "QUOTE" | "LAMBDA"
+            )
+    };
+    if !stable {
+        return Err(record_bail(|| {
+            "handler-bind:compound-type-with-evaluated-handler".into()
+        }));
+    }
+    let lambda = resolve_sym("LAMBDA").ok_or(Bail)?;
+    let when = resolve_sym("WHEN").ok_or(Bail)?;
+    let typep = resolve_sym("TYPEP").ok_or(Bail)?;
+    let quote = resolve_sym("QUOTE").ok_or(Bail)?;
+    let funcall = resolve_sym("FUNCALL").ok_or(Bail)?;
+    egcl_rt::rooted!(condition = egcl_rt::symbols::make_uninterned("%EGCL-HANDLER-CONDITION"));
+    egcl_rt::rooted!(quoted_type = form_list(&[quote, parts[0]]));
+    egcl_rt::rooted!(test = form_list(&[typep, *condition, *quoted_type]));
+    egcl_rt::rooted!(call = form_list(&[funcall, parts[1], *condition]));
+    egcl_rt::rooted!(body = form_list(&[when, *test, *call]));
+    egcl_rt::rooted!(params = form_list(&[*condition]));
+    Ok(form_list(&[lambda, *params, *body]))
+}
+
 /// The condition type names a HANDLER-CASE clause matches: a symbol, or an
 /// `(or symbol*)` of them in order. `None` for any other type specifier.
 fn handler_clause_type_names(type_form: EgclVal) -> Option<Vec<String>> {
@@ -9424,6 +9624,24 @@ fn handler_clause_type_names(type_form: EgclVal) -> Option<Vec<String>> {
         .iter()
         .map(|alt| (alt.is_symbol() || alt.is_nil()).then(|| sym_name(*alt)))
         .collect()
+}
+
+/// True for a form whose evaluation has no effects and whose value cannot be
+/// changed by evaluating sibling subforms that are themselves effect-free: a
+/// self-evaluating atom, a quoted datum, or a variable that is not a symbol
+/// macro.
+fn effect_free_place_subform(form: EgclVal, env: &super::Env) -> bool {
+    if form.is_cons() {
+        let (head, rest) = cp(form);
+        return head.is_symbol()
+            && sym_bare_name_rc(head).as_ref() == "QUOTE"
+            && rest.is_cons()
+            && cp(rest).1.is_nil();
+    }
+    if form.is_symbol() && !form.is_nil() && form != T {
+        return !env.has_symbol_macro(form.as_symbol_index());
+    }
+    true
 }
 
 /// `(get symbol indicator [default])` as a SETF place: its subforms, in order.
@@ -9846,12 +10064,84 @@ fn body_uses_return_from(body: EgclVal, block: &str) -> bool {
     list_to_vec(body).into_iter().any(|form| walk(form, block))
 }
 
+/// One `&key` parameter of a destructuring pattern, read from the plist held in
+/// the symbol `keys`: `var`, `(var [default [supplied-p]])` or
+/// `((keyword var) [default [supplied-p]])`. The value is looked up once with a
+/// unique marker as GETF's default, so a supplied NIL is told apart from an
+/// absent key and DEFAULT runs only when the key is absent. Returns the
+/// parameter's keyword.
+fn destructure_key_parameter(
+    spec: EgclVal,
+    keys: EgclVal,
+    bindings: &mut Vec<EgclVal>,
+) -> LowerResult<EgclVal> {
+    egcl_rt::rooted!(spec = spec);
+    let (var_spec, default, supplied) = if spec.is_symbol() {
+        (*spec, NIL, NIL)
+    } else if spec.is_cons() {
+        let (v, rest) = cp(*spec);
+        let (default, after_default) = if rest.is_cons() { cp(rest) } else { (NIL, NIL) };
+        let (supplied, extra) = if after_default.is_cons() {
+            cp(after_default)
+        } else {
+            (NIL, NIL)
+        };
+        if !extra.is_nil() || !(supplied.is_nil() || supplied.is_symbol()) {
+            return Err(Bail);
+        }
+        (v, default, supplied)
+    } else {
+        return Err(Bail);
+    };
+    egcl_rt::rooted!(parts = [var_spec, default, supplied]);
+    let (keyword, var) = if parts[0].is_symbol() && !parts[0].is_nil() && parts[0] != T {
+        let keyword = egcl_compiler::reader::intern_keyword_symbol(&sym_bare_name_rc(parts[0]));
+        (keyword, parts[0])
+    } else if parts[0].is_cons() {
+        let (keyword, var_rest) = cp(parts[0]);
+        let (var, extra) = if var_rest.is_cons() {
+            cp(var_rest)
+        } else {
+            (NIL, NIL)
+        };
+        if !keyword.is_symbol() || !var.is_symbol() || var.is_nil() || !extra.is_nil() {
+            return Err(Bail);
+        }
+        (keyword, var)
+    } else {
+        return Err(Bail);
+    };
+    egcl_rt::rooted!(names = [keyword, var]);
+    let quote = resolve_sym("QUOTE").ok_or(Bail)?;
+    let getf = resolve_sym("GETF").ok_or(Bail)?;
+    let eq = resolve_sym("EQ").ok_or(Bail)?;
+    let not = resolve_sym("NOT").ok_or(Bail)?;
+    let if_sym = resolve_sym("IF").ok_or(Bail)?;
+    egcl_rt::rooted!(marker = egcl_rt::symbols::make_uninterned("%EGCL-DBIND-NO-KEY"));
+    egcl_rt::rooted!(quoted_marker = form_list(&[quote, *marker]));
+    egcl_rt::rooted!(quoted_key = form_list(&[quote, names[0]]));
+    let name = next_control_token("__DBIND_KEY__").replace(':', "_");
+    let raw = resolve_sym(&name).ok_or(Bail)?;
+    egcl_rt::rooted!(lookup = form_list(&[getf, keys, *quoted_key, *quoted_marker]));
+    bindings.push(form_list(&[raw, *lookup]));
+    egcl_rt::rooted!(absent = form_list(&[eq, raw, *quoted_marker]));
+    egcl_rt::rooted!(value = form_list(&[if_sym, *absent, parts[1], raw]));
+    bindings.push(form_list(&[names[1], *value]));
+    if !parts[2].is_nil() {
+        let present = form_list(&[not, *absent]);
+        bindings.push(form_list(&[parts[2], present]));
+    }
+    Ok(names[0])
+}
+
 /// Append `let*` bindings that destructure `pattern` against the value held in
-/// the symbol `source`, using `nth`/`nthcdr`. Handles required, `&optional`
-/// (with defaults and supplied-p), `&rest`/`&body`, a dotted tail, and nested list
-/// sub-patterns (recursively, each through a fresh temporary). `&key`, `&aux`,
-/// `&whole`, and `&environment` bail. Positions are indexed from `source`, so
-/// optional defaults and supplied-p bindings retain their lambda-list order.
+/// the symbol `source`, using `nth`/`nthcdr`. Handles `&whole` (first),
+/// required, `&optional` (with defaults and supplied-p), `&rest`/`&body`, a
+/// dotted tail, `&key` (with `&allow-other-keys`), `&aux`, and nested list
+/// sub-patterns (recursively, each through a fresh temporary). `&environment`
+/// bails. Like the rest of this lowering it does not re-check list length or
+/// unknown keywords; positions are indexed from `source`, so defaults and
+/// supplied-p bindings retain their lambda-list order.
 fn destructure_pattern(
     pattern: EgclVal,
     source: EgclVal,
@@ -9867,9 +10157,14 @@ fn destructure_pattern(
     let nthcdr_at = |i: i64| form_list(&[nthcdr_sym, EgclVal::from_fixnum(i), source]);
 
     let mut index: i64 = 0;
-    // 0 = required, 1 = &optional, 2 = &rest/&body
+    // 0 = required, 1 = &optional, 2 = &rest/&body, 3 = &key, 4 = &aux
     let mut mode = 0u8;
     let mut rest_bound = false;
+    let bindings_at_entry = bindings.len();
+    let mut key_source = NIL;
+    let mut key_check_at = None;
+    let mut allow_other_keys = false;
+    egcl_rt::rooted!(allowed_keys = Vec::<EgclVal>::new());
     loop {
         if cur.is_nil() {
             break;
@@ -9896,11 +10191,73 @@ fn destructure_pattern(
                     mode = 2;
                     continue;
                 }
-                keyword @ ("&KEY" | "&AUX" | "&WHOLE" | "&ENVIRONMENT") => {
+                "&WHOLE" if index == 0 && mode == 0 && bindings_at_entry == bindings.len() => {
+                    // `&whole var` (or a sub-pattern) names the entire list and
+                    // must come first (CLHS 3.4.4).
+                    if !cur.is_cons() {
+                        return Err(Bail);
+                    }
+                    let (whole, after_whole) = cp(*cur);
+                    *cur = after_whole;
+                    if whole.is_symbol() && !whole.is_nil() {
+                        bindings.push(form_list(&[whole, source]));
+                    } else if whole.is_cons() {
+                        destructure_pattern(whole, source, bindings)?;
+                    } else {
+                        return Err(Bail);
+                    }
+                    continue;
+                }
+                "&KEY" if mode < 3 => {
+                    // Keyword arguments are read from the list after the
+                    // positional ones, held once in a temporary.
+                    let name = next_control_token("__DBIND_KEYS__").replace(':', "_");
+                    let keys = resolve_sym(&name).ok_or(Bail)?;
+                    let tail = nthcdr_at(index);
+                    bindings.push(form_list(&[keys, tail]));
+                    key_source = keys;
+                    key_check_at = Some(bindings.len());
+                    mode = 3;
+                    continue;
+                }
+                "&ALLOW-OTHER-KEYS" if mode == 3 => {
+                    allow_other_keys = true;
+                    continue;
+                }
+                "&AUX" if mode < 4 => {
+                    mode = 4;
+                    continue;
+                }
+                keyword @ ("&KEY" | "&AUX" | "&WHOLE" | "&ENVIRONMENT" | "&ALLOW-OTHER-KEYS") => {
                     return Err(record_bail(|| format!("destructuring-bind:{keyword}")));
                 }
                 _ => {}
             }
+        }
+        if mode == 3 {
+            let keyword = destructure_key_parameter(*elem, key_source, bindings)?;
+            allowed_keys.push(keyword);
+            continue;
+        }
+        if mode == 4 {
+            // `&aux var` / `&aux (var [init])`: a plain sequential binding.
+            if elem.is_symbol() && !elem.is_nil() {
+                bindings.push(form_list(&[*elem, NIL]));
+            } else if elem.is_cons() {
+                let (var, init_rest) = cp(*elem);
+                if !var.is_symbol() || var.is_nil() || !cp(init_rest).1.is_nil() {
+                    return Err(Bail);
+                }
+                let init = if init_rest.is_cons() {
+                    cp(init_rest).0
+                } else {
+                    NIL
+                };
+                bindings.push(form_list(&[var, init]));
+            } else {
+                return Err(Bail);
+            }
+            continue;
         }
         match mode {
             0 => {
@@ -9973,6 +10330,22 @@ fn destructure_pattern(
                 rest_bound = true;
             }
         }
+    }
+    // Unknown or odd keyword arguments are an error unless &ALLOW-OTHER-KEYS
+    // (or a true :ALLOW-OTHER-KEYS argument) permits them. Checked right after
+    // the keyword list is taken, before any &key default runs.
+    if let Some(at) = key_check_at
+        && !allow_other_keys
+    {
+        let check = resolve_sym("EGCL::%DBIND-CHECK-KEYS").ok_or(Bail)?;
+        let quote = resolve_sym("QUOTE").ok_or(Bail)?;
+        egcl_rt::rooted!(allowed = form_list(&allowed_keys));
+        egcl_rt::rooted!(quoted = form_list(&[quote, *allowed]));
+        egcl_rt::rooted!(call = form_list(&[check, key_source, *quoted]));
+        let name = next_control_token("__DBIND_CHECK__").replace(':', "_");
+        let ignored = resolve_sym(&name).ok_or(Bail)?;
+        let binding = form_list(&[ignored, *call]);
+        bindings.insert(at, binding);
     }
     Ok(())
 }
