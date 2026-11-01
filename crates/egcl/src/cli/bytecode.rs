@@ -31438,10 +31438,9 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
                     | Instr::DefineEnvVar(_)
                     | Instr::PushEnvChild
                     | Instr::PopEnvChild
-                    | Instr::MakeEnv(_)
-                    | Instr::EnvRef { .. }
-                    | Instr::EnvSet { .. }
-                    | Instr::ClosureEnv
+                    // A heap-environment closure creator still needs the
+                    // mapped protocol; the other heap-environment
+                    // instructions also lower for the ordinary entry.
                     | Instr::MakeEnvClosure { .. }
             )
         })

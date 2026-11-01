@@ -2720,6 +2720,26 @@ fn resolve(name: &str) -> Option<Handler> {
             Ok(if stored { dst } else { NIL })
         }),
 
+        // (%lexenv-make parent size): a fresh heap lexical environment, the
+        // non-mapped native tiers' MakeEnv adapter (Backpack).
+        "EGCL::%LEXENV-MAKE" => Some(|_operator, args, _env| {
+            let [parent, size] = *args else {
+                return Err(EgclError::ProgramError(
+                    "%lexenv-make: expected a parent and a size".into(),
+                ));
+            };
+            if !size.is_fixnum() || size.as_fixnum() < 0 || !egcl_rt::lexenv::valid_parent(parent) {
+                return Err(EgclError::ProgramError(
+                    "%lexenv-make: invalid parent or size".into(),
+                ));
+            }
+            egcl_rt::lexenv::make(parent, size.as_fixnum() as usize).ok_or_else(|| {
+                EgclError::Internal(egcl_rt::gc::allocation_failure_message(
+                    "a lexical environment",
+                ))
+            })
+        }),
+
         "EGCL::%MAKE-STRUCT" => Some(|_operator, args, _env| {
             let args = RootedVals::new(args.to_vec());
 

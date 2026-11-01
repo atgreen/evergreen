@@ -728,7 +728,11 @@ fn lower_inst(lo: &mut Lowering, inst: Inst) {
             un_or_bin(lo, inst, op::LOAD, defs, uses)
         }
         StringByteLength | StringAsciiCharAt | StringCharOrNil | ArrayReadDiscarded
-        | PackedF64P | TryVecRef | EnvSlotRef => lo.emit_annotated(inst, op::LOAD, defs, uses),
+        | PackedF64P | TryVecRef | EnvSlotRef | CallableClosureEnv => {
+            lo.emit_annotated(inst, op::LOAD, defs, uses)
+        }
+        // Lowered away before emission (ordinary entry or mapped request).
+        ClosureEnvironment => lo.emit_annotated(inst, op::CALL_RUNTIME, defs, uses),
         // A global read/write is emitted as a c2i helper CALL
         // (c2i_load_global / c2i_store_global), which clobbers every
         // caller-saved register — modelling it as a plain load/store let the

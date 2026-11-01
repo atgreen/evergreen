@@ -6475,6 +6475,7 @@ fn emit_transfer_function_with_storage(
                     | Opcode::Cdr
                     | Opcode::EnvSlotRef
                     | Opcode::EnvSlotSet
+                    | Opcode::CallableClosureEnv
                     | Opcode::StringCharOrNil
                     | Opcode::VecRef
                     | Opcode::VecSet
@@ -7903,6 +7904,7 @@ fn emit_framed_inner(
                             | Opcode::Cdr
                             | Opcode::EnvSlotRef
                             | Opcode::EnvSlotSet
+                            | Opcode::CallableClosureEnv
                             // The explicit layout guard owns recovery; this
                             // dependent raw length load cannot deopt itself.
                             | Opcode::StringByteLength
@@ -10001,6 +10003,20 @@ fn emit_framed_inner(
                 }
             } else if matches!(d.opcode, Opcode::Car | Opcode::Cdr) {
                 emit_cons_field_load(&mut a, &d, &mut inst_reg, &mut inst_pool)?;
+            } else if d.opcode == Opcode::CallableClosureEnv {
+                // The callable's traced closure_env word (Backpack).
+                let callable = *inst_reg
+                    .get(&d.args[0])
+                    .ok_or(EmitError::UnsupportedOp(0xF2))?;
+                mov_rr(&mut a, SCRATCH, callable);
+                alu_r_imm(&mut a, 4 /* AND */, SCRATCH, -8);
+                let dst = framed_alloc(&mut inst_reg, &mut inst_pool, d.results[0])?;
+                load_mem64_disp(
+                    &mut a,
+                    dst,
+                    SCRATCH,
+                    egcl_rt::function::CLOSURE_ENV_OFFSET as i32,
+                );
             } else if matches!(d.opcode, Opcode::EnvSlotRef | Opcode::EnvSlotSet) {
                 emit_env_slot(&mut a, &d, &mut inst_reg, &mut inst_pool, &const_tagged)?;
             } else if d.opcode == Opcode::StringByteLength {

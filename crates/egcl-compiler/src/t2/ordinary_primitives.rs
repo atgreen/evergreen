@@ -158,6 +158,71 @@ fn array_constructor_candidate(f: &Function, data: &InstData) -> bool {
 /// SetCar/SetCdr stay unlowered until their IR operand order is made consistent.
 pub fn lower_ordinary_primitives(
     f: &mut Function,
+    resolve: impl FnMut(OrdinaryPrimitive) -> Option<u32>,
+) -> Result<usize, EmitError> {
+    if !has_closure_environment(f) {
+        return lower_ordinary_primitives_body(f, resolve);
+    }
+    // All or nothing: a failure must leave the mapped candidate intact.
+    let mut candidate = f.clone();
+    let count = lower_closure_environment(&mut candidate)?;
+    let count = count + lower_ordinary_primitives_body(&mut candidate, resolve)?;
+    *f = candidate;
+    Ok(count)
+}
+
+fn has_closure_environment(f: &Function) -> bool {
+    f.block_order().iter().any(|&block| {
+        f.block(block)
+            .insts
+            .iter()
+            .any(|&inst| f.inst(inst).opcode == Opcode::ClosureEnvironment)
+    })
+}
+
+/// A heap-environment closure body (Backpack) reads its captured environment
+/// from the callable the ordinary entry receives as its hidden argument: one
+/// load of the callable's traced `closure_env` word.
+fn lower_closure_environment(f: &mut Function) -> Result<usize, EmitError> {
+    if !f.osr_entries.is_empty() {
+        return Err(EmitError::UnsupportedOp(0xFA));
+    }
+    let sites: Vec<_> = f
+        .block_order()
+        .iter()
+        .flat_map(|&block| f.block(block).insts.clone())
+        .filter(|&inst| f.inst(inst).opcode == Opcode::ClosureEnvironment)
+        .collect();
+    let entry = f.entry();
+    let (read, result) = f.push_inst(
+        entry,
+        InstData {
+            opcode: Opcode::CurrentCallable,
+            args: vec![],
+            results: vec![],
+            aux: AuxData::None,
+            flags: InstFlags::default(),
+            targets: vec![],
+            frame_state: None,
+            source_pos: Default::default(),
+        },
+        &[(IRType::TOP, ValueRepresentation::Tagged)],
+    );
+    let layout = &mut f.block_mut(entry).insts;
+    assert_eq!(layout.pop(), Some(read));
+    layout.insert(0, read);
+    for &inst in &sites {
+        let data = f.inst_mut(inst);
+        data.opcode = Opcode::CallableClosureEnv;
+        data.args = vec![result[0]];
+        data.frame_state = None;
+        data.flags = InstFlags::default();
+    }
+    Ok(sites.len())
+}
+
+fn lower_ordinary_primitives_body(
+    f: &mut Function,
     mut resolve: impl FnMut(OrdinaryPrimitive) -> Option<u32>,
 ) -> Result<usize, EmitError> {
     let captures = f.block_order().iter().any(|&block| {

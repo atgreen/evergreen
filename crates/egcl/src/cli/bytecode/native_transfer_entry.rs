@@ -2561,6 +2561,13 @@ fn ordinary_native_op(op: &Instr) -> bool {
             op,
             Instr::PushTag { .. } | Instr::Go { .. } | Instr::LoadEnvVar(_) | Instr::StoreEnvVar(_)
         )
+        // Heap environments (Backpack): slots are inline loads and stores,
+        // the closure's environment one load from the hidden callable, and a
+        // scope environment a call to its allocating adapter.
+        || matches!(
+            op,
+            Instr::EnvRef { .. } | Instr::EnvSet { .. } | Instr::ClosureEnv | Instr::MakeEnv(_)
+        )
         || (matches!(op, Instr::LoadFunction(_)) && ordinary_function_designators_enabled())
         || (matches!(op, Instr::BindSpecial(_) | Instr::UnbindSpecial(_))
             && ordinary_special_bindings_enabled())

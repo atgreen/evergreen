@@ -349,21 +349,20 @@ fn analyze(root: &BytecodeFunction) -> Option<Analysis> {
         }
     }
     // A LABELS function a closure reaches before its definition is a
-    // recursive local function. Its body then needs `ClosureEnv`, which only
-    // the mapped native entry serves today; the name-keyed body reaches the
-    // much cheaper ordinary entry, so recursion through it measured 8x slower
-    // at T2 on the heap representation. Keep such units on the frames until
-    // ordinary entries read heap environments (inline native access, the
-    // follow-up); `EGCL_HEAP_ENV_LABELS=1` rewrites them anyway.
+    // recursive local function. Its body reads its environment with
+    // `ClosureEnv`; since the ordinary native entry serves that from its
+    // hidden callable, LABELS recursion runs far faster on heap environments
+    // than on the frames (T2: 1043 -> 37 ns per call). `EGCL_HEAP_ENV_LABELS=0`
+    // keeps such units on the frames.
     if analysis.bindings.iter().any(|binding| binding.late) && !labels_enabled() {
-        return reject("recursive LABELS function (ordinary native entry)");
+        return reject("recursive LABELS function (EGCL_HEAP_ENV_LABELS=0)");
     }
     Some(analysis)
 }
 
 fn labels_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("EGCL_HEAP_ENV_LABELS").is_ok_and(|value| value == "1"))
+    *ON.get_or_init(|| std::env::var("EGCL_HEAP_ENV_LABELS").map_or(true, |value| value != "0"))
 }
 
 /// The binding `name` denotes at `pc` of `node`, and whether it was found as
