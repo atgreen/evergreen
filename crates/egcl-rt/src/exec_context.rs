@@ -356,14 +356,14 @@ mod tests {
         assert_eq!(first.active_native_control(), 0);
         assert_eq!(second.active_native_control(), 0);
         assert_eq!(offsets::ACTIVE_NATIVE_CONTROL, 32);
-        assert_eq!(std::mem::size_of::<LispExecutionContext>(), 48);
+        assert_eq!(std::mem::size_of::<LispExecutionContext>(), 56);
     }
 
     /// Every field is one machine word, so generated code can load any of them
     /// with a single `mov` at a fixed displacement.
     #[test]
     fn every_field_is_one_machine_word() {
-        assert_eq!(std::mem::size_of::<LispExecutionContext>(), 48);
+        assert_eq!(std::mem::size_of::<LispExecutionContext>(), 56);
         assert_eq!(std::mem::align_of::<LispExecutionContext>(), 8);
     }
 

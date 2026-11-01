@@ -1207,7 +1207,14 @@ pub fn find_appended_image() -> Option<String> {
         if data[offset..offset + 8] == magic_bytes {
             // Validate that this looks like a real header (check version range).
             if let Some(candidate) = bytes_to_struct::<ImageHeader>(&data[offset..]) {
-                if candidate.format_version >= 1 && candidate.format_version <= FORMAT_VERSION {
+                // A header literal in the executable's own data can carry the
+                // magic and a plausible version; only a saved header also
+                // carries its own checksum.
+                if candidate.format_version >= 1
+                    && candidate.format_version <= FORMAT_VERSION
+                    && candidate.header_sha256
+                        == compute_header_checksum(&data[offset..offset + header_size])
+                {
                     return Some(exe_path.to_string_lossy().into_owned());
                 }
             }

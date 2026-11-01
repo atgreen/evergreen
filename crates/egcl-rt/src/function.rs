@@ -538,6 +538,59 @@ mod tests {
     }
 
     #[test]
+    fn entry_claims_are_exclusive_and_images_store_them_as_zero() {
+        let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        crate::gc::ensure_heap_initialized();
+        crate::rooted!(function = alloc_interpreted(NIL, NIL, NIL, NIL));
+        assert_eq!(entry_word(*function), Some((0, 0)));
+        unsafe {
+            assert!(claim_entry(*function, 7, 0x1234));
+            assert!(!claim_entry(*function, 8, 0x5678), "one owner at a time");
+            assert!(claim_entry(*function, 7, 0x2345), "the owner may move it");
+            release_entry(*function, 8);
+            assert_eq!(entry_word(*function), Some((0x2345, 7)), "not 8's to release");
+        }
+        let body = unsafe { function.as_ptr().add(header_size()) } as u64;
+        let entry = core::mem::offset_of!(FunctionData, entry) - header_size();
+        // Per-object serialization.
+        let saved = crate::gc::serialize_heap_objects();
+        let mut offset = 0;
+        let mut found = false;
+        while offset < saved.len() {
+            let address = u64::from_le_bytes(saved[offset..offset + 8].try_into().unwrap());
+            let size =
+                u32::from_le_bytes(saved[offset + 9..offset + 13].try_into().unwrap()) as usize;
+            if address == body {
+                let data = &saved[offset + 13..offset + 13 + size];
+                assert_eq!(&data[entry..entry + 16], &[0; 16]);
+                found = true;
+            }
+            offset += 13 + size;
+        }
+        assert!(found, "the function object was serialized");
+        // Region snapshots.
+        let snapshot = crate::gc::with_heap_snapshot(|| unsafe {
+            crate::gc::snapshot_heap_regions(false)
+        })
+        .unwrap()
+        .unwrap();
+        let region = snapshot
+            .regions
+            .iter()
+            .find(|region| {
+                (region.saved_start as u64) <= body
+                    && body < (region.saved_start + region.bytes.len()) as u64
+            })
+            .expect("the function's region was saved");
+        let at = body as usize - region.saved_start + entry;
+        assert_eq!(&region.bytes[at..at + 16], &[0; 16]);
+        // The live object keeps its claim.
+        assert_eq!(entry_word(*function), Some((0x2345, 7)));
+        unsafe { release_entry(*function, 7) };
+        assert_eq!(entry_word(*function), Some((0, 0)));
+    }
+
+    #[test]
     fn interpreted_function_carries_cells_and_zeroed_fnmeta() {
         let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let ll = EgclVal::from_fixnum(1);
